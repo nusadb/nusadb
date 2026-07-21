@@ -1,0 +1,43 @@
+[package]
+name         = "nusadb-server"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "NusaDB server binary — launches L2 (wire) + L3 (SQL engine) and serves clients"
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nusadb-server"
+path = "src/main.rs"
+
+[features]
+# Opt-in global allocator. Off by default (uses the system allocator); enable with
+# `--features mimalloc` to swap in mimalloc for the whole process — a faster, lower-
+# fragmentation general-purpose allocator for the engine's allocation-heavy hot paths
+# (per-tuple `Vec<u8>`, ordered-map churn, decode buffers).
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+nusadb-core = { workspace = true }
+nusadb-sql  = { workspace = true }
+nusadb-btree = { workspace = true }
+nusadb-wire = { workspace = true }
+# `signal` (unioned onto the workspace tokio features) for graceful Ctrl-C shutdown.
+tokio       = { workspace = true, features = ["signal"] }
+clap        = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+mimalloc    = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion   = { workspace = true }
+tempfile    = { workspace = true }
+
+[[bench]]
+name    = "alloc"
+harness = false

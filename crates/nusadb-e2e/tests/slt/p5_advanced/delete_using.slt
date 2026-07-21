@@ -1,0 +1,52 @@
+# p5_advanced/delete_using — DELETE ... USING <table>.
+#
+# A single USING table joins into the DELETE: the WHERE may reference its columns. A target row is
+# deleted if it matches the WHERE over `target ++ using` for any USING row. Covers: delete-by-join,
+# no-match-survives, multi-row, and the derived-USING rejection.
+
+statement ok
+CREATE TABLE t (id INT, name TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')
+
+statement ok
+CREATE TABLE dead (id INT)
+
+statement ok
+INSERT INTO dead VALUES (2), (4)
+
+# Delete every t row whose id appears in `dead`.
+statement ok
+DELETE FROM t USING dead WHERE t.id = dead.id
+
+query IT
+SELECT id, name FROM t ORDER BY id
+----
+1 a
+3 c
+
+# A predicate combining target + using columns.
+statement ok
+CREATE TABLE thr (cut INT)
+
+statement ok
+INSERT INTO thr VALUES (1)
+
+# Delete rows whose id is <= the threshold from `thr`.
+statement ok
+DELETE FROM t USING thr WHERE t.id <= thr.cut
+
+query IT
+SELECT id, name FROM t ORDER BY id
+----
+3 c
+
+# A derived USING source — `(SELECT ...)` / `(VALUES ...)` — is supported: it deletes the
+# matching target row (id 3), leaving the table empty.
+statement ok
+DELETE FROM t USING (SELECT 3 AS id) AS s WHERE t.id = s.id
+
+query IT
+SELECT id, name FROM t ORDER BY id
+----

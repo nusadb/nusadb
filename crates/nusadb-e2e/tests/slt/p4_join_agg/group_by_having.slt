@@ -1,0 +1,70 @@
+# p4_join_agg/group_by_having — grouped aggregation and HAVING.
+
+statement ok
+CREATE TABLE sales (
+  region   TEXT,
+  product  TEXT,
+  amount   INT
+)
+
+statement ok
+INSERT INTO sales VALUES
+  ('north', 'x',  10),
+  ('north', 'y',  20),
+  ('north', 'x',  30),
+  ('south', 'x',  40),
+  ('south', 'y',  50),
+  ('south', 'y',  60),
+  ('east',  'x',  70)
+
+# Single-key GROUP BY
+query TI rowsort
+SELECT region, SUM(amount) FROM sales GROUP BY region
+----
+east   70
+north  60
+south  150
+
+# Multi-key GROUP BY — (region, product) groups
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY region, product
+----
+east   x  70
+north  x  40
+north  y  20
+south  x  40
+south  y  110
+
+# HAVING on the aggregate appearing in the projection
+query TI rowsort
+SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 100
+----
+south  150
+
+# HAVING with a non-projected aggregate
+query T rowsort
+SELECT region FROM sales GROUP BY region HAVING COUNT(*) >= 3
+----
+north
+south
+
+# Non-grouped, non-aggregated column in projection is rejected
+statement error
+SELECT region, product FROM sales GROUP BY region
+
+# HAVING without any aggregate (and without GROUP BY) is rejected
+statement error
+SELECT region FROM sales HAVING SUM(amount) > 0
+
+# Group key with NULLs: all NULLs collapse into a single group
+statement ok
+CREATE TABLE n (k TEXT, v INT)
+
+statement ok
+INSERT INTO n VALUES ('a', 1), (NULL, 2), (NULL, 3), ('a', 4)
+
+query TI rowsort
+SELECT k, SUM(v) FROM n GROUP BY k
+----
+NULL  5
+a     5

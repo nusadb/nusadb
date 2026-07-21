@@ -1,0 +1,117 @@
+# p8_cte/cte_and_subquery — WITH / WITH RECURSIVE and correlated
+# subqueries (B2.16b) end-to-end through the SQL pipeline.
+
+statement ok
+CREATE TABLE emp (id INT NOT NULL, dept INT, salary INT)
+
+statement ok
+INSERT INTO emp VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)
+
+statement ok
+CREATE TABLE dept (id INT NOT NULL, name TEXT)
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'empty')
+
+# --- non-recursive CTE: referenced as the FROM base ---
+query I
+WITH hi AS (SELECT id FROM emp WHERE salary >= 100) SELECT id FROM hi ORDER BY id
+----
+1
+2
+
+# --- WITH RECURSIVE counter: UNION ALL fixpoint ---
+query I
+WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums ORDER BY n
+----
+1
+2
+3
+4
+5
+
+# --- WITH RECURSIVE transitive closure over an adjacency table ---
+statement ok
+CREATE TABLE edge (parent INT, child INT)
+
+statement ok
+INSERT INTO edge VALUES (1, 2), (1, 3), (2, 4), (3, 5), (4, 6)
+
+query I
+WITH RECURSIVE reach AS (SELECT child AS node FROM edge WHERE parent = 1 UNION ALL SELECT e.child FROM edge AS e JOIN reach ON e.parent = reach.node) SELECT node FROM reach ORDER BY node
+----
+2
+3
+4
+5
+6
+
+# --- WITH RECURSIVE over a CYCLIC graph: UNION (DISTINCT) must terminate via dedup ---
+# (the same query with UNION ALL would loop until the 10k-iteration guard fires).
+statement ok
+CREATE TABLE cyc (parent INT, child INT)
+
+statement ok
+INSERT INTO cyc VALUES (1, 2), (2, 3), (3, 1)
+
+query I
+WITH RECURSIVE reach AS (SELECT child AS node FROM cyc WHERE parent = 1 UNION SELECT c.child FROM cyc AS c JOIN reach ON c.parent = reach.node) SELECT node FROM reach ORDER BY node
+----
+1
+2
+3
+
+# --- correlated scalar subquery (B2.16b): per-department average ---
+query I
+SELECT id FROM emp e WHERE salary > (SELECT AVG(salary) FROM emp WHERE dept = e.dept) ORDER BY id
+----
+2
+
+# --- correlated EXISTS / NOT EXISTS ---
+query T rowsort
+SELECT name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept = d.id)
+----
+eng
+sales
+
+query T
+SELECT name FROM dept d WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept = d.id)
+----
+empty
+
+# --- correlated scalar subquery in the SELECT list: per-department count ---
+query TI
+SELECT name, (SELECT COUNT(*) FROM emp e WHERE e.dept = d.id) FROM dept d ORDER BY name
+----
+empty 0
+eng 2
+sales 1
+
+# --- A CTE referencing an earlier sibling CTE ---
+# `b` reads from `a`, defined earlier in the same WITH.
+query II
+WITH a AS (SELECT id, salary FROM emp WHERE salary >= 100),
+     b AS (SELECT id, salary FROM a WHERE id < 3)
+SELECT id, salary FROM b ORDER BY id
+----
+1 100
+2 200
+
+# An earlier CTE used inside a JOIN within a later CTE.
+query II
+WITH a AS (SELECT id, salary FROM emp),
+     b AS (SELECT a.id, a.salary FROM a JOIN emp e ON a.id = e.id)
+SELECT id, salary FROM b ORDER BY id, salary
+----
+1 100
+2 200
+3 50
+
+# --- Deep WITH RECURSIVE past the former 10k-round cap (Q-RECCTE-ITERCAP-FALSE-NONTERMINATION) ---
+# A valid linear recursion 12000 deep must run to completion: the recursion is bounded by work_mem
+# (its rows fit the budget), not an arbitrary round count. The old 10_000-iteration cap false-rejected
+# this as "non-terminating recursion"; PostgreSQL runs it.
+query II
+WITH RECURSIVE deep AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM deep WHERE n < 12000) SELECT count(*), max(n) FROM deep
+----
+12000 12000

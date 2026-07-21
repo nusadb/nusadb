@@ -1,0 +1,80 @@
+# p4_join_agg/scalar_aggregate — COUNT/SUM/AVG/MIN/MAX without GROUP BY.
+
+statement ok
+CREATE TABLE nums (id INT NOT NULL, v INT, label TEXT)
+
+statement ok
+INSERT INTO nums VALUES
+  (1, 10,   'a'),
+  (2, 20,   'b'),
+  (3, 30,   'a'),
+  (4, NULL, 'c')
+
+# COUNT(*) counts every row, NULLs included.
+# COUNT(v) skips NULL.
+# SUM(Int) → Int. AVG(Int) → exact NUMERIC (not lossy f64). MIN/MAX keep the column's type.
+query III?II
+SELECT COUNT(*), COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM nums
+----
+4  3  60  20.0000000000000000  10  30
+
+# MIN / MAX on TEXT use lexicographic order
+query TT
+SELECT MIN(label), MAX(label) FROM nums
+----
+a  c
+
+# Aggregate over an empty input
+statement ok
+CREATE TABLE empty (id INT NOT NULL, v INT)
+
+# COUNT(*) of empty is 0; every other aggregate of empty is NULL.
+query II?
+SELECT COUNT(*), COUNT(v), SUM(v) FROM empty
+----
+0  0  NULL
+
+# Arithmetic over aggregate results (no GROUP BY) is allowed.
+# Int/Int stays Int (SQL truncation semantics): SUM(v)=60, COUNT(v)=3 → 20.
+query I
+SELECT SUM(v) / COUNT(v) FROM nums
+----
+20
+
+# Forcing a Float divisor promotes the result to FLOAT (unlike AVG(Int), which is exact NUMERIC).
+# CAST may wrap the aggregate itself (SUM(v)=60 → 60.0, then Float/Int → Float)…
+query R
+SELECT CAST(SUM(v) AS FLOAT) / COUNT(v) FROM nums
+----
+20.000
+
+# …or sit inside the aggregate's argument — both forms agree.
+query R
+SELECT SUM(CAST(v AS FLOAT)) / COUNT(v) FROM nums
+----
+20.000
+
+# COALESCE wrapping an aggregate turns an all-NULL SUM into a default.
+query I
+SELECT COALESCE(SUM(v), 0) FROM empty
+----
+0
+
+# Mixing an aggregate with a bare column without GROUP BY is rejected
+statement error
+SELECT id, COUNT(*) FROM nums
+
+# AVG(Int) accumulates the exact i128 sum and divides once (G22 / V1). With x = {2^53, 1, 1} the
+# exact sum is 9007199254740994 and the mean ≈ 3002399751580331.33 (> ...331). A naive f64 running
+# sum would drop both 1s when added to 2^53 (→ 9007199254740992) and give ≈ ...330.67 (< ...331),
+# so this boolean pins the accurate path without asserting an exact float.
+statement ok
+CREATE TABLE bigavg (x BIGINT NOT NULL)
+
+statement ok
+INSERT INTO bigavg VALUES (9007199254740992), (1), (1)
+
+query I
+SELECT AVG(x) > 3002399751580331.0 FROM bigavg
+----
+1

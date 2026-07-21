@@ -1,0 +1,295 @@
+//! RAM-aware auto-tuning of the engine's memory knobs (model + derivation).
+//!
+//! NusaDB's defaults are permissive — `work_mem = 0` (unbounded) and spill off — which is fine on a
+//! big host but makes a large analytic query OOM-prone on a small one (the cloud free-tier 1 vCPU /
+//! 1 GB target). The spill-to-disk machinery is the cure, but only if it is *on by default*
+//! and the per-query budget is *bounded*. This module turns one input — a total **memory budget** —
+//! into safe knob values so graceful degradation is the out-of-the-box behaviour.
+//!
+//! # The allocation model
+//!
+//! The budget must cover everything resident at once. The worst case is every connection running a
+//! blocking operator (sort / aggregate / join) at its `work_mem` cap simultaneously, on top of the
+//! engine's resident pages and MVCC version metadata. We keep the part this module controls
+//! comfortably under the budget and reserve the rest for the engine and process overhead:
+//!
+//! ```text
+//!   work_mem × max_connections   ≤  40% budget   (all queries spilling at their cap at once)
+//!   ── reserved (not derived here) ──
+//!   engine pages + version store + overhead   ≈  remaining ≥ 60% budget
+//! ```
+//!
+//! The split is deliberately conservative for a 1 GB box. Spill is enabled with the per-query
+//! `work_mem` as its threshold, so a query exceeding its share streams to disk instead of failing.
+//! (The removed predecessor engine also took a write-buffer flush threshold and a footprint cap from this
+//! budget; the btree engine has no such knobs — its version-store reclamation is the purge
+//! scheduler, wired at the composition root.)
+//!
+//! All arithmetic is integer (`budget / 100 * pct`) so there is no float rounding or cast in the
+//! derivation.
+
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "this is a private module of the server binary; its items are `pub(crate)` so the \
+              crate root (main.rs) can use them, which `unreachable_pub` requires — the two lints \
+              are mutually exclusive here"
+)]
+
+/// Knob values derived from a memory budget. Bytes throughout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DerivedKnobs {
+    /// Per-query work-memory cap (also the spill threshold). A blocking operator over this spills.
+    pub(crate) work_mem: usize,
+    /// Default per-transaction uncommitted-write ceiling (`--max-txn-write-bytes`): a single
+    /// transaction whose buffered writes exceed this is failed loudly instead of growing the
+    /// process until the host OOM-kills every client. Derived as 25% of the budget, floored at
+    /// [`TXN_WRITE_FLOOR`], so one runaway bulk transaction cannot take the server down. This is a
+    /// *per-transaction* bound, not a global one; an explicit `--max-txn-write-bytes` overrides it.
+    pub(crate) max_txn_write_bytes: usize,
+    /// Default global resident-memory ceiling (`--max-resident-bytes`) for the in-memory page store:
+    /// once its total footprint reaches this, a row insert is failed loudly instead of the store
+    /// growing until the host OOM-kills the server. Unlike [`max_txn_write_bytes`](Self::max_txn_write_bytes)
+    /// (one in-flight transaction) this bounds *committed-resident* data across the whole store —
+    /// the streamed-bulk-load case that accumulates past the per-transaction ceiling. Derived as 60%
+    /// of the budget (the engine's page share in the allocation model), floored at
+    /// [`RESIDENT_FLOOR`], so the query work pool + version store + process overhead keep their
+    /// headroom; an explicit `--max-resident-bytes` overrides it.
+    pub(crate) max_resident_bytes: usize,
+}
+
+/// Floor for the per-query work-memory cap: below this, sort/agg/join become impractically spill-
+/// bound, so a very small budget × many connections clamps here (and over-commits the work pool —
+/// the caller logs a warning when that happens).
+const WORK_MEM_FLOOR: usize = 1 << 20; // 1 MiB
+
+/// Floor for the derived per-transaction write ceiling: below this a legitimate medium transaction
+/// (a moderate bulk load) would be rejected, so a small budget clamps the ceiling up to here rather
+/// than throttling normal work. 128 MiB leaves comfortable room while still bounding the multi-GB
+/// runaways the ceiling exists to stop.
+const TXN_WRITE_FLOOR: usize = 128 << 20; // 128 MiB
+
+/// Floor for the derived global resident-memory ceiling: below this a legitimate small dataset would
+/// be rejected, so a small budget clamps the ceiling up to here rather than throttling normal work.
+/// 256 MiB holds a comfortably large in-memory dataset while still bounding the multi-GB runaway a
+/// bulk load can become on a memory-constrained host.
+const RESIDENT_FLOOR: usize = 256 << 20; // 256 MiB
+
+/// Derive the memory knobs from `budget` (bytes) and the configured `max_connections`.
+///
+/// `max_connections` is treated as at least 1. Uses the percentages in the module-level allocation
+/// model; the per-query `work_mem` is `40% budget / max_connections`, floored at [`WORK_MEM_FLOOR`],
+/// and the per-transaction write ceiling is `25% budget`, floored at [`TXN_WRITE_FLOOR`].
+#[must_use]
+pub(crate) fn derive(budget: usize, max_connections: usize) -> DerivedKnobs {
+    let conns = max_connections.max(1);
+    let work_pool = budget / 100 * 40;
+    let work_mem = (work_pool / conns).max(WORK_MEM_FLOOR);
+    // The per-transaction write ceiling is a flat 25% of the budget (not divided per connection —
+    // it bounds any *one* transaction), floored so a small budget does not reject normal work.
+    let max_txn_write_bytes = (budget / 100 * 25).max(TXN_WRITE_FLOOR);
+    // The global resident ceiling is 60% of the budget — the page share of the engine's ≥60%
+    // allocation — floored so a small budget does not reject normal work. It bounds committed data
+    // across the whole store, complementing the per-transaction ceiling above.
+    let max_resident_bytes = (budget / 100 * 60).max(RESIDENT_FLOOR);
+    DerivedKnobs {
+        work_mem,
+        max_txn_write_bytes,
+        max_resident_bytes,
+    }
+}
+
+/// Whether the derived per-query `work_mem` was forced up to the floor, so the worst-case work pool
+/// (`work_mem × max_connections`) over-commits its 40% share of `budget`. The caller warns when this
+/// holds: on a tiny budget with many connections, concurrent large queries can still exceed the
+/// budget — the operator should lower `--max-connections` or raise `--mem-budget`.
+#[must_use]
+pub(crate) fn work_pool_overcommits(
+    knobs: DerivedKnobs,
+    budget: usize,
+    max_connections: usize,
+) -> bool {
+    let conns = max_connections.max(1);
+    knobs.work_mem.saturating_mul(conns) > budget / 100 * 40
+}
+
+/// Detect the memory budget available to this process, in bytes.
+///
+/// On Linux this is `min(host RAM, cgroup memory limit)` — the cgroup limit is what actually bounds a
+/// container, and on a cloud free-tier it is usually far below host RAM, so ignoring it would
+/// over-commit and invite the OOM killer. Returns `None` when no budget can be determined (a
+/// non-Linux host, or `/proc`/`/sys` unreadable); the caller then leaves auto-tuning off and honours
+/// only explicit flags.
+#[must_use]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "reads /proc/meminfo + cgroup files on Linux (not const); the lint only fires on the \
+              non-Linux stub, which trivially returns None"
+)]
+pub(crate) fn detect_budget() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let host = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| parse_meminfo_total(&s));
+        let cgroup = detect_cgroup_limit();
+        match (host, cgroup) {
+            (Some(h), Some(c)) => Some(h.min(c)),
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The cgroup memory limit (v2 `memory.max`, then v1 `memory.limit_in_bytes`), or `None` if neither
+/// is present or both are "unlimited".
+#[cfg(target_os = "linux")]
+fn detect_cgroup_limit() -> Option<usize> {
+    const V2: &str = "/sys/fs/cgroup/memory.max";
+    const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+    for path in [V2, V1] {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Some(limit) = parse_cgroup_limit(&contents)
+        {
+            return Some(limit);
+        }
+    }
+    None
+}
+
+/// Parse `MemTotal:` (in kB) from `/proc/meminfo` contents into bytes.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_total(contents: &str) -> Option<usize> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Parse a cgroup memory-limit file. `"max"` (v2) or an implausibly huge sentinel (v1's
+/// `PAGE_COUNTER_MAX`-derived value, ≥ 2^53) means "unlimited" → `None`; otherwise the byte value.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_limit(contents: &str) -> Option<usize> {
+    let trimmed = contents.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    let value: usize = trimmed.parse().ok()?;
+    // v1 reports a near-`u64::MAX` value when unlimited; treat anything ≥ 2^53 as no real cap.
+    if value >= 1 << 53 { None } else { Some(value) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_meminfo_total() {
+        let sample = "MemTotal:        1024000 kB\nMemFree:          512000 kB\n";
+        assert_eq!(parse_meminfo_total(sample), Some(1_024_000 * 1024));
+        assert_eq!(parse_meminfo_total("MemFree: 1 kB"), None);
+        assert_eq!(parse_meminfo_total("garbage"), None);
+    }
+
+    #[test]
+    fn parses_cgroup_limit() {
+        assert_eq!(parse_cgroup_limit("1073741824\n"), Some(1_073_741_824));
+        assert_eq!(parse_cgroup_limit("max\n"), None); // v2 unlimited
+        assert_eq!(parse_cgroup_limit("9223372036854771712"), None); // v1 ~unlimited sentinel
+        assert_eq!(parse_cgroup_limit("not-a-number"), None);
+    }
+
+    #[test]
+    fn derivation_respects_the_allocation_model() {
+        // At 1 GiB / 25 connections the controllable resident total stays within budget and work_mem
+        // is small enough that large queries spill.
+        let budget = 1 << 30; // 1 GiB
+        let k = derive(budget, 25);
+        assert!(k.work_mem >= WORK_MEM_FLOOR);
+        // Worst case (all connections at their cap) must stay within the work pool's budget share.
+        let worst = k.work_mem * 25;
+        assert!(
+            worst <= budget / 100 * 40,
+            "worst-case work pool {worst} exceeds its share of budget {budget}"
+        );
+        assert!(!work_pool_overcommits(k, budget, 25));
+    }
+
+    #[test]
+    fn large_budget_does_not_starve_work_mem() {
+        // On a big host the per-query budget scales up (no regression: queries are not over-throttled).
+        let k = derive(64usize << 30, 25); // 64 GiB
+        assert!(
+            k.work_mem > 100 << 20,
+            "work_mem should be generous on a big host"
+        );
+    }
+
+    #[test]
+    fn tiny_budget_clamps_and_flags_overcommit() {
+        // 128 MiB / 200 connections: 40% / 200 ≈ 256 KiB < floor, so work_mem clamps up to the floor
+        // and the worst-case pool (floor × 200) over-commits its 40% share — which must be flagged.
+        let budget = 128 << 20;
+        let k = derive(budget, 200);
+        assert_eq!(k.work_mem, WORK_MEM_FLOOR);
+        assert!(work_pool_overcommits(k, budget, 200));
+    }
+
+    #[test]
+    fn zero_connections_is_treated_as_one() {
+        let k = derive(1 << 30, 0);
+        assert!(k.work_mem >= WORK_MEM_FLOOR);
+    }
+
+    #[test]
+    fn derives_the_per_transaction_write_ceiling_at_25_percent_with_a_floor() {
+        let ceiling = |budget: usize| derive(budget, 25).max_txn_write_bytes;
+        // ~25% of the budget once above the floor (integer arithmetic, like work_mem's 40%): the
+        // directive's 8 GiB→2 GiB, 64 GiB→16 GiB shape, allowing for `budget / 100 * 25` rounding.
+        for &gib in &[2usize, 8, 64] {
+            let budget = gib << 30;
+            assert_eq!(
+                ceiling(budget),
+                budget / 100 * 25,
+                "25% of a {gib} GiB budget"
+            );
+            assert!(
+                ceiling(budget) > TXN_WRITE_FLOOR,
+                "a {gib} GiB budget derives above the floor"
+            );
+        }
+        // A small budget clamps up to the 128 MiB floor rather than rejecting normal work.
+        assert_eq!(ceiling(512 << 20), TXN_WRITE_FLOOR, "512 MiB → floor");
+        assert_eq!(ceiling(128 << 20), TXN_WRITE_FLOOR, "tiny budget → floor");
+        // The ceiling bounds one transaction, so it does not depend on the connection count.
+        assert_eq!(ceiling(8 << 30), derive(8 << 30, 200).max_txn_write_bytes);
+    }
+
+    #[test]
+    fn derives_the_global_resident_ceiling_at_60_percent_with_a_floor() {
+        let ceiling = |budget: usize| derive(budget, 25).max_resident_bytes;
+        // ~60% of the budget once above the floor — the engine's page share of the allocation model.
+        for &gib in &[2usize, 8, 64] {
+            let budget = gib << 30;
+            assert_eq!(
+                ceiling(budget),
+                budget / 100 * 60,
+                "60% of a {gib} GiB budget"
+            );
+            assert!(
+                ceiling(budget) > RESIDENT_FLOOR,
+                "a {gib} GiB budget derives above the floor"
+            );
+        }
+        // A small budget clamps up to the 256 MiB floor rather than rejecting normal work.
+        assert_eq!(ceiling(256 << 20), RESIDENT_FLOOR, "small budget → floor");
+        // The resident ceiling bounds the whole store, so it does not depend on the connection count.
+        assert_eq!(ceiling(8 << 30), derive(8 << 30, 200).max_resident_bytes);
+    }
+}

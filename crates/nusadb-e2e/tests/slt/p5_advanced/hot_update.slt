@@ -1,0 +1,137 @@
+# p5_advanced/hot_update — heap-only-tuple fast path for UPDATE.
+#
+# An UPDATE whose SET columns touch no PRIMARY KEY / UNIQUE column skips the whole-table uniqueness
+# check, and one touching no index column skips that index's maintenance. Because a row keeps its
+# address (row-id) across MVCC versions, the unchanged keys still map to the same live row, so every
+# access path — clustered PK, secondary index, unique index — must still see the updated value. These
+# tests pin that correctness; the optimization must be invisible to results.
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE, category TEXT, amount INT CHECK (amount >= 0))
+
+statement ok
+CREATE INDEX idx_category ON t (category)
+
+statement ok
+INSERT INTO t VALUES (1, 'a@x', 'red', 10), (2, 'b@x', 'red', 20), (3, 'c@x', 'blue', 30)
+
+# --- A non-key UPDATE (amount only): touches no PK/UNIQUE/index column ---
+statement ok
+UPDATE t SET amount = amount + 100 WHERE category = 'red'
+
+# Found with the new value via the clustered PK.
+query I
+SELECT amount FROM t WHERE id = 1
+----
+110
+
+# Found with the new value via the UNIQUE index (point lookup on email) — the entry still maps to
+# the live row after the non-key update.
+query I
+SELECT amount FROM t WHERE email = 'b@x'
+----
+120
+
+# Found with the new value via the secondary index on the (unchanged) category.
+query II
+SELECT id, amount FROM t WHERE category = 'red' ORDER BY id
+----
+1 110
+2 120
+
+# The blue row is untouched.
+query I
+SELECT amount FROM t WHERE category = 'blue'
+----
+30
+
+# --- Uniqueness is STILL enforced when the SET touches a unique/PK column ---
+statement error
+UPDATE t SET id = 2 WHERE id = 1
+
+statement error
+UPDATE t SET email = 'b@x' WHERE id = 1
+
+# --- CHECK is STILL enforced on a non-key UPDATE ---
+statement error
+UPDATE t SET amount = -1 WHERE id = 3
+
+# --- A touched-index UPDATE (category changes): the index must reflect the move ---
+statement ok
+UPDATE t SET category = 'green' WHERE id = 1
+
+# The row is now found under the new category value and gone from the old one.
+query I
+SELECT id FROM t WHERE category = 'green'
+----
+1
+
+query I
+SELECT id FROM t WHERE category = 'red'
+----
+2
+
+# The whole table is consistent after the mixed updates.
+query ITTI
+SELECT id, email, category, amount FROM t ORDER BY id
+----
+1 a@x green 110
+2 b@x red 120
+3 c@x blue 30
+
+# --- Idempotent re-run of the same non-key UPDATE keeps results correct (version churn) ---
+statement ok
+UPDATE t SET amount = amount + 1 WHERE category = 'red'
+
+statement ok
+UPDATE t SET amount = amount + 1 WHERE category = 'red'
+
+query I
+SELECT amount FROM t WHERE id = 2
+----
+122
+
+# --- Generated columns: an assignment to a dependency changes a STORED generated column even though
+#     it is not in the SET list, so a generated column backing a UNIQUE constraint or an index must
+#     NOT be treated as untouched (the whole-table check / index maintenance still runs). ---
+statement ok
+CREATE TABLE gu (a INT, g INT GENERATED ALWAYS AS (a) STORED UNIQUE)
+
+statement ok
+INSERT INTO gu (a) VALUES (1), (2)
+
+# Setting a=2 recomputes g to 2, which collides with the existing g=2 row — must be rejected, not
+# silently accepted (the generated column is a unique key even though only `a` was assigned).
+statement error
+UPDATE gu SET a = 2 WHERE a = 1
+
+# The rejected update left the table unchanged.
+query II
+SELECT a, g FROM gu ORDER BY a
+----
+1 1
+2 2
+
+# A generated column that backs an index must stay findable under its new value after a dependency
+# UPDATE (the index entry is maintained because the generated key changed).
+statement ok
+CREATE TABLE gi (a INT, g INT GENERATED ALWAYS AS (a * 10) STORED)
+
+statement ok
+CREATE INDEX idx_gi ON gi (g)
+
+statement ok
+INSERT INTO gi (a) VALUES (1), (2)
+
+statement ok
+UPDATE gi SET a = 3 WHERE a = 1
+
+# The generated key moved from 10 to 30: found under 30, gone from 10.
+query I
+SELECT a FROM gi WHERE g = 30
+----
+3
+
+query I
+SELECT a FROM gi WHERE g = 10
+----

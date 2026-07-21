@@ -1,0 +1,56 @@
+# p6_setops/setops_null_dup — set-operation edge semantics: NULLs compare
+# EQUAL for set-op dedup/membership (unlike WHERE's 3VL), and duplicate handling
+# differs between UNION / UNION ALL / INTERSECT / EXCEPT.
+
+statement ok
+CREATE TABLE l (x INT)
+
+statement ok
+INSERT INTO l VALUES (1), (1), (2), (NULL), (NULL)
+
+statement ok
+CREATE TABLE r (x INT)
+
+statement ok
+INSERT INTO r VALUES (2), (3), (NULL)
+
+# UNION dedups, and the two NULLs collapse to one (set-op equality treats NULL = NULL)
+query I
+SELECT x FROM l UNION SELECT x FROM r ORDER BY x
+----
+1
+2
+3
+NULL
+
+# UNION ALL keeps every duplicate, including both NULLs from the left
+query I
+SELECT x FROM l UNION ALL SELECT x FROM r ORDER BY x
+----
+1
+1
+2
+2
+3
+NULL
+NULL
+NULL
+
+# INTERSECT: NULL is a member of both sides (set-op equality), 2 likewise
+query I
+SELECT x FROM l INTERSECT SELECT x FROM r ORDER BY x
+----
+2
+NULL
+
+# EXCEPT: left rows minus right membership; the left's NULLs are removed by the right's NULL
+query I
+SELECT x FROM l EXCEPT SELECT x FROM r ORDER BY x
+----
+1
+
+# EXCEPT in the other direction
+query I
+SELECT x FROM r EXCEPT SELECT x FROM l ORDER BY x
+----
+3

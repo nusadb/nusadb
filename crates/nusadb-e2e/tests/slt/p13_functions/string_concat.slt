@@ -1,0 +1,50 @@
+# p13_functions/string_concat — `||` string concatenation operator.
+# Covers: literal concat, left-associative chaining, column concat, NULL propagation,
+# concat with a bare NULL, use in a projection, and rejection of non-text operands.
+
+statement ok
+CREATE TABLE people (id INT NOT NULL, first TEXT, last TEXT)
+
+statement ok
+INSERT INTO people VALUES (1, 'Ada', 'Lovelace'), (2, 'Alan', 'Turing'), (3, 'Grace', NULL)
+
+# Literal concatenation.
+query T
+SELECT 'foo' || 'bar'
+----
+foobar
+
+# Left-associative chaining of three operands.
+query T
+SELECT 'a' || 'b' || 'c'
+----
+abc
+
+# Column concatenation with a literal separator.
+query T
+SELECT first || ' ' || last FROM people WHERE id = 1
+----
+Ada Lovelace
+
+# NULL propagates: a NULL column operand yields NULL.
+query T
+SELECT first || ' ' || last FROM people WHERE id = 3
+----
+NULL
+
+# Concatenating with a bare NULL is NULL.
+query T
+SELECT 'x' || NULL
+----
+NULL
+
+# Result usable in a projection alongside other columns.
+query IT
+SELECT id, first || last FROM people WHERE id <> 3 ORDER BY id
+----
+1  AdaLovelace
+2  AlanTuring
+
+# Non-text operands are rejected (no implicit cast to text).
+statement error
+SELECT 1 || 2

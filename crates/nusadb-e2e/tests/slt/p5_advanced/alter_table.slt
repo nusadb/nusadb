@@ -1,0 +1,185 @@
+# p5_advanced/alter_table — ALTER TABLE column operations end-to-end (B-ddl.01).
+#
+# Exercises every operation the AlterOp treaty models: ADD / DROP / RENAME
+# COLUMN, ALTER COLUMN TYPE, SET / DROP NOT NULL — including the row rewrites
+# that keep existing tuples decodable under the new schema, the IF [NOT] EXISTS
+# guards, ADD/DROP CONSTRAINT (PRIMARY KEY/UNIQUE), and SET DEFAULT
+# (fuller coverage in column_default.slt).
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT)
+
+statement ok
+INSERT INTO t (id, name) VALUES (1, 'alice'), (2, 'bob')
+
+# --- ADD COLUMN (nullable) backfills existing rows with NULL ---
+statement ok
+ALTER TABLE t ADD COLUMN age INT
+
+# Existing rows now carry the new (NULL) slot and still decode.
+query I rowsort
+SELECT id FROM t WHERE age IS NULL
+----
+1
+2
+
+# New rows can populate the added column.
+statement ok
+INSERT INTO t (id, name, age) VALUES (3, 'carol', 30)
+
+query II
+SELECT id, age FROM t WHERE age IS NOT NULL
+----
+3  30
+
+# ADD COLUMN with an existing name is rejected.
+statement error
+ALTER TABLE t ADD COLUMN age INT
+
+# ADD COLUMN NOT NULL on a non-empty table is rejected — there is no default to
+# backfill the existing rows with.
+statement error
+ALTER TABLE t ADD COLUMN flag BOOL NOT NULL
+
+# --- RENAME COLUMN (catalog-only, no row rewrite) ---
+statement ok
+ALTER TABLE t RENAME COLUMN name TO full_name
+
+query IT
+SELECT id, full_name FROM t ORDER BY id
+----
+1  alice
+2  bob
+3  carol
+
+# The old name no longer resolves.
+statement error
+SELECT name FROM t
+
+# Renaming onto an existing column name is rejected.
+statement error
+ALTER TABLE t RENAME COLUMN full_name TO age
+
+# --- ALTER COLUMN TYPE rewrites stored values through a cast ---
+statement ok
+ALTER TABLE t ALTER COLUMN age SET DATA TYPE TEXT
+
+query T
+SELECT age FROM t WHERE id = 3
+----
+30
+
+# --- SET / DROP NOT NULL ---
+# age still holds NULLs, so SET NOT NULL must fail.
+statement error
+ALTER TABLE t ALTER COLUMN age SET NOT NULL
+
+# id has no NULLs, so the validating scan passes.
+statement ok
+ALTER TABLE t ALTER COLUMN id SET NOT NULL
+
+statement ok
+ALTER TABLE t ALTER COLUMN id DROP NOT NULL
+
+# --- DROP COLUMN removes the slot from every row ---
+statement ok
+ALTER TABLE t DROP COLUMN age
+
+query IT
+SELECT id, full_name FROM t ORDER BY id
+----
+1  alice
+2  bob
+3  carol
+
+# Dropping a missing column errors; IF EXISTS makes it a no-op.
+statement error
+ALTER TABLE t DROP COLUMN age
+
+statement ok
+ALTER TABLE t DROP COLUMN IF EXISTS age
+
+# --- empty-table path: ADD COLUMN NOT NULL is allowed with no rows to backfill ---
+statement ok
+CREATE TABLE e (id INT NOT NULL)
+
+statement ok
+DELETE FROM e
+
+statement ok
+ALTER TABLE e ADD COLUMN c INT NOT NULL
+
+statement ok
+INSERT INTO e (id, c) VALUES (1, 7)
+
+query II
+SELECT id, c FROM e
+----
+1  7
+
+# --- SET DEFAULT is now supported; full coverage in column_default.slt ---
+statement ok
+ALTER TABLE t ALTER COLUMN id SET DEFAULT 0
+
+# --- ADD / DROP CONSTRAINT: existing rows (distinct id) validate, then it enforces ---
+statement ok
+ALTER TABLE t ADD CONSTRAINT uq UNIQUE (id)
+
+# the unique constraint now rejects a duplicate id
+statement error
+INSERT INTO t (id) VALUES (1)
+
+# dropping the constraint releases it — the duplicate then inserts
+statement ok
+ALTER TABLE t DROP CONSTRAINT uq
+
+statement ok
+INSERT INTO t (id) VALUES (1)
+
+# --- CHECK constraints: CREATE TABLE column-level + table-level, then ADD CHECK ---
+statement ok
+CREATE TABLE chk (id INT, qty INT CHECK (qty > 0), CHECK (id >= 0))
+
+statement ok
+INSERT INTO chk VALUES (1, 5)
+
+# column-level CHECK (qty > 0) rejects a non-positive qty
+statement error
+INSERT INTO chk VALUES (2, 0)
+
+# table-level CHECK (id >= 0) rejects a negative id
+statement error
+INSERT INTO chk VALUES (-1, 5)
+
+# a CHECK predicate that evaluates to NULL passes (only FALSE fails)
+statement ok
+INSERT INTO chk (id) VALUES (3)
+
+# ADD CHECK validates the existing rows, then enforces it on later writes
+statement ok
+ALTER TABLE chk ADD CONSTRAINT id_small CHECK (id < 100)
+
+statement error
+INSERT INTO chk VALUES (200, 1)
+
+statement ok
+ALTER TABLE chk DROP CONSTRAINT id_small
+
+statement ok
+INSERT INTO chk VALUES (200, 1)
+
+statement ok
+DROP TABLE chk
+
+# --- table-level IF EXISTS guard ---
+statement error
+ALTER TABLE missing ADD COLUMN x INT
+
+statement ok
+ALTER TABLE IF EXISTS missing ADD COLUMN x INT
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE e

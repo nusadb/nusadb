@@ -1,0 +1,6 @@
+# Shell scripts must use LF endings on every platform. A CRLF shebang (`#!/bin/sh\r`)
+# makes the Linux loader look for an interpreter literally named "/bin/sh\r", so the
+# script fails with `exec: no such file or directory` — this silently breaks the Docker
+# entrypoint (and any container/CI shell) when the image is built from a Windows checkout
+# with core.autocrlf=true. Pin LF regardless of the contributor's autocrlf setting.
+*.sh text eol=lf

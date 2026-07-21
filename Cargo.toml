@@ -1,0 +1,150 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nusadb-core",
+    "crates/nusadb-storage",
+    "crates/nusadb-wal",
+    "crates/nusadb-btree",
+    "crates/nusadb-sql",
+    "crates/nusadb-wire",
+    "crates/nusadb-libnusa",
+    "crates/nusadb-capi",
+    "crates/nusadb-server",
+    "crates/nusadb-cli",
+    "crates/nusadb-sim",
+    "crates/nusadb-test-utils",
+    "crates/nusadb-e2e",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+license      = "Apache-2.0"
+authors      = ["NusaDB Authors"]
+rust-version = "1.95.0"
+repository   = "https://github.com/nusadb/nusadb"
+description  = "A relational database engine built from scratch in Rust"
+readme       = "README.md"
+
+[workspace.dependencies]
+# === Internal crates (path deps; explicit version keeps the dep non-wildcard) ===
+nusadb-core       = { path = "crates/nusadb-core", version = "0.1.0" }
+nusadb-storage    = { path = "crates/nusadb-storage", version = "0.1.0" }
+nusadb-wal        = { path = "crates/nusadb-wal", version = "0.1.0" }
+nusadb-btree      = { path = "crates/nusadb-btree", version = "0.1.0" }
+nusadb-sql        = { path = "crates/nusadb-sql", version = "0.1.0" }
+nusadb-wire       = { path = "crates/nusadb-wire", version = "0.1.0" }
+nusadb-libnusa    = { path = "crates/nusadb-libnusa", version = "0.1.0" }
+nusadb-sim        = { path = "crates/nusadb-sim", version = "0.1.0" }
+nusadb-test-utils = { path = "crates/nusadb-test-utils", version = "0.1.0" }
+
+# === Core types / utilities ===
+thiserror      = "2"
+bytes          = "1"
+parking_lot    = { version = "0.12", features = ["arc_lock"] }
+crossbeam      = "0.8"
+dashmap        = "6"
+ahash          = "0.8"
+smallvec       = "1"
+bytemuck       = { version = "1", features = ["derive"] }
+
+# === Storage / WAL ===
+crc32fast      = "1.4"
+lz4_flex       = "0.11"
+zstd           = "0.13"
+
+# === SQL ===
+sqlparser      = "0.62"
+# Regular-expression engine for REGEXP_* / regex match / SIMILAR TO. Already in the
+# tree transitively; linear-time RE (no catastrophic backtracking), MIT/Apache-2.0, deny.toml-compliant.
+regex          = "1"
+
+# === Networking / Async (L2 only) ===
+tokio          = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+rustls         = "0.23"
+tokio-rustls   = "0.26"
+
+# === Security ===
+# NOTE: SCRAM-SHA-256 (nusadb-wire::auth) is not yet implemented. When it is, use
+# `ring` 0.17 (pbkdf2/hmac) or a maintained SCRAM crate — NOT `scram` 0.6, which pins
+# the unmaintained, vulnerable ring 0.16 (RUSTSEC-2025-0009 / -0010).
+subtle         = "2"
+zeroize        = { version = "1", features = ["derive"] }
+ring           = "0.17"
+# Column-level encryption (B-enc.01): deterministic, nonce-misuse-resistant AEAD
+# (RustCrypto, pure-Rust — deny.toml-compliant) + SHA-256 KDF for the key string.
+aes-gcm-siv    = "0.11"
+sha2           = "0.10"
+# CSPRNG for data-key + key-wrap nonce generation (A-enc.03). Already in the tree
+# transitively; pure-OS-entropy interface, deny.toml-compliant.
+getrandom      = "0.3"
+# JSON / JSONB value type + operators. Already in the tree transitively;
+# ubiquitous, deny.toml-compliant. Default features (BTreeMap maps => canonical sorted keys).
+serde_json     = "1"
+
+# === Allocator (opt-in, feature-gated in nusadb-server) ===
+mimalloc       = { version = "0.1", default-features = false }
+
+# === Observability ===
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# === CLI ===
+clap           = { version = "4", features = ["derive"] }
+rustyline      = "15"
+
+# === Dev-only ===
+criterion      = { version = "0.5", features = ["html_reports"] }
+pprof          = { version = "0.13", features = ["criterion", "flamegraph"] }
+sqllogictest   = "0.21"
+proptest       = "1"
+tokio-test     = "0.4"
+tempfile       = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn        = "deny"
+missing_debug_implementations = "warn"
+missing_docs                  = "warn"
+unreachable_pub               = "warn"
+trivial_casts                 = "warn"
+trivial_numeric_casts         = "warn"
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+
+# Project-specific elevations
+unwrap_used         = "deny"
+expect_used         = "warn"
+panic               = "warn"
+todo                = "warn"
+unimplemented       = "deny"
+indexing_slicing    = "warn"
+
+# Mute noisy pedantic lints that don't fit DB code
+module_name_repetitions  = "allow"
+missing_errors_doc       = "allow"
+must_use_candidate       = "allow"
+similar_names            = "allow"
+cast_possible_truncation = "allow"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = "line-tables-only"  # symbols for flamegraphs without full debug bloat
+# Trap integer overflow in release too (P1-R2): for a database, a silently wrapped index/length/id
+# is a correctness/corruption hazard far worse than the small arithmetic cost. Intentional wraps use
+# `wrapping_*`/`checked_*`, which are unaffected.
+overflow-checks = true
+
+[profile.bench]
+inherits = "release"
+
+[profile.dev]
+opt-level = 1                       # storage perf in tests; debugger still works
+debug     = true
+
+[profile.dev.package."*"]
+opt-level = 3                       # always optimize deps in dev for faster test runs

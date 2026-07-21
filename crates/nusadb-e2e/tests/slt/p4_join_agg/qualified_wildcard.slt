@@ -1,0 +1,40 @@
+# p4_join_agg/qualified_wildcard — `table.*` projection.
+# Covers: t.* selecting one table's columns from a join, alias qualifier,
+# mixing t.* with a scalar column, and rejecting an unknown qualifier.
+
+statement ok
+CREATE TABLE emp (id INT NOT NULL, name TEXT, dept_id INT)
+
+statement ok
+CREATE TABLE dept (id INT NOT NULL, dname TEXT)
+
+statement ok
+INSERT INTO emp VALUES (1, 'Ada', 10), (2, 'Bob', 20)
+
+statement ok
+INSERT INTO dept VALUES (10, 'Eng'), (20, 'Sales')
+
+# `dept.*` selects only that table's columns out of a joined row.
+query IT
+SELECT dept.* FROM emp JOIN dept ON emp.dept_id = dept.id ORDER BY dept.id
+----
+10  Eng
+20  Sales
+
+# Works with a table alias as the qualifier.
+query ITI
+SELECT e.* FROM emp e ORDER BY e.id
+----
+1  Ada  10
+2  Bob  20
+
+# `t.*` composes with a trailing scalar column.
+query ITIT
+SELECT e.*, dept.dname FROM emp e JOIN dept ON e.dept_id = dept.id ORDER BY e.id
+----
+1  Ada  10  Eng
+2  Bob  20  Sales
+
+# An unknown table qualifier is rejected.
+statement error
+SELECT nosuch.* FROM emp

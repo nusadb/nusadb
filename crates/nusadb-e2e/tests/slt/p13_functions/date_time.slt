@@ -1,0 +1,370 @@
+# p13_functions/date_time — date/time built-ins (-52): EXTRACT, DATE_TRUNC,
+# AGE, TO_CHAR, TO_DATE, TO_TIMESTAMP.
+#
+# All functions here are deterministic (no NOW/CURRENT_TIMESTAMP which
+# vary per run).
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, ts TIMESTAMP, d DATE, tz TIMESTAMPTZ)
+
+statement ok
+INSERT INTO t VALUES (1, '2024-06-15 14:30:45', '2024-06-15', '2024-06-15 14:30:45+00'),
+                     (2, '2023-01-01 00:00:00', '2023-01-01', '2023-01-01 00:00:00+00')
+
+# --- EXTRACT: year, month, day ---
+query IR
+SELECT id, EXTRACT(YEAR FROM ts) FROM t ORDER BY id
+----
+1 2024.000
+2 2023.000
+
+query IR
+SELECT id, EXTRACT(MONTH FROM ts) FROM t ORDER BY id
+----
+1 6.000
+2 1.000
+
+query IR
+SELECT id, EXTRACT(DAY FROM ts) FROM t ORDER BY id
+----
+1 15.000
+2 1.000
+
+# --- EXTRACT: hour, minute, second ---
+query R
+SELECT EXTRACT(HOUR FROM TIMESTAMP '2024-06-15 14:30:45')
+----
+14.000
+
+query R
+SELECT EXTRACT(MINUTE FROM TIMESTAMP '2024-06-15 14:30:45')
+----
+30.000
+
+query R
+SELECT EXTRACT(SECOND FROM TIMESTAMP '2024-06-15 14:30:45')
+----
+45.000
+
+# --- EXTRACT: day of week (dow: Sunday=0..Saturday=6) ---
+query R
+SELECT EXTRACT(DOW FROM DATE '2024-06-15')
+----
+6.000
+
+# --- EXTRACT: day of year (doy) ---
+query R
+SELECT EXTRACT(DOY FROM DATE '2024-06-15')
+----
+167.000
+
+# --- EXTRACT: quarter ---
+query R
+SELECT EXTRACT(QUARTER FROM DATE '2024-06-15')
+----
+2.000
+
+# --- EXTRACT: epoch (seconds since 1970-01-01) ---
+query R
+SELECT EXTRACT(EPOCH FROM TIMESTAMP '1970-01-01 00:00:00')
+----
+0.000
+
+query R
+SELECT EXTRACT(EPOCH FROM TIMESTAMP '1970-01-02 00:00:00')
+----
+86400.000
+
+# --- DATE_TRUNC: truncate to year, month, day ---
+query T
+SELECT DATE_TRUNC('year', TIMESTAMP '2024-06-15 14:30:45')
+----
+2024-01-01 00:00:00
+
+query T
+SELECT DATE_TRUNC('month', TIMESTAMP '2024-06-15 14:30:45')
+----
+2024-06-01 00:00:00
+
+query T
+SELECT DATE_TRUNC('day', TIMESTAMP '2024-06-15 14:30:45')
+----
+2024-06-15 00:00:00
+
+# --- DATE_TRUNC: truncate to hour, minute ---
+query T
+SELECT DATE_TRUNC('hour', TIMESTAMP '2024-06-15 14:30:45')
+----
+2024-06-15 14:00:00
+
+query T
+SELECT DATE_TRUNC('minute', TIMESTAMP '2024-06-15 14:30:45')
+----
+2024-06-15 14:30:00
+
+# --- AGE: difference between two timestamps ---
+query T
+SELECT AGE(TIMESTAMP '2024-06-15 00:00:00', TIMESTAMP '2023-01-01 00:00:00')
+----
+1 year 5 mons 14 days
+
+# --- TO_CHAR: format a timestamp ---
+query T
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 14:30:45', 'YYYY-MM-DD')
+----
+2024-06-15
+
+query T
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 14:30:45', 'HH24:MI:SS')
+----
+14:30:45
+
+query T
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 14:30:45', 'Mon DD, YYYY')
+----
+Jun 15, 2024
+
+# The full month name (`Month`) is blank-padded to 9 characters (the width of "September"), like PG;
+# the result below is `June` followed by five spaces. The abbreviation `Mon` is not padded.
+query T
+SELECT TO_CHAR(DATE '2024-06-15', 'Month') || '|'
+----
+June     |
+
+# --- TO_CHAR: format a number through a digit picture (`9`/`0`/`.`) ---
+# Digits fit exactly; the fraction is rounded/padded to the picture; the sign is a leading column.
+query T
+SELECT TO_CHAR(1234.5, '9999.99')
+----
+ 1234.50
+
+# Leading `9` positions with no digit are suppressed to spaces (the sign column included).
+query T
+SELECT TO_CHAR(12, '9999.99')
+----
+   12.00
+
+# A negative number floats the sign next to the first digit.
+query T
+SELECT TO_CHAR(-1234.5, '9999.99')
+----
+-1234.50
+
+# A value below 1 suppresses the integer part; the sign floats to the decimal point.
+query T
+SELECT TO_CHAR(-0.1, '99.99')
+----
+  -.10
+
+# `0` positions force a zero digit.
+query T
+SELECT TO_CHAR(12, '0000')
+----
+ 0012
+
+# A value wider than the integer positions renders as `#` fill.
+query T
+SELECT TO_CHAR(1234, '99')
+----
+ ##
+
+# Exactly zero under a `9` picture suppresses the integer part (no printed `0`); a `0` picture shows it.
+query T
+SELECT TO_CHAR(0, '9999.99')
+----
+     .00
+
+query T
+SELECT TO_CHAR(0, '0000.00')
+----
+ 0000.00
+
+# An unsupported numeric format character is rejected, not silently mis-formatted.
+statement error
+SELECT TO_CHAR(5, 'FM999')
+
+statement error
+SELECT TO_CHAR(5, '9,999')
+
+# --- TO_DATE: parse text to date ---
+query T
+SELECT TO_DATE('2024-06-15', 'YYYY-MM-DD')
+----
+2024-06-15
+
+# --- TO_TIMESTAMP: parse text to timestamp ---
+query T
+SELECT TO_TIMESTAMP('2024-06-15 14:30:45', 'YYYY-MM-DD HH24:MI:SS')
+----
+2024-06-15 14:30:45
+
+# --- TimestampTz variants ---
+query T
+SELECT DATE_TRUNC('month', TIMESTAMPTZ '2024-06-15 14:30:45+00')
+----
+2024-06-01 00:00:00+00
+
+# --- DATE_PART (function-call spelling of EXTRACT) ---
+query R
+SELECT DATE_PART('year', DATE '2024-06-15')
+----
+2024.000
+
+query R
+SELECT DATE_PART('MONTH', TIMESTAMP '2024-06-15 14:30:45')
+----
+6.000
+
+query R
+SELECT DATE_PART('hour', TIMESTAMP '2024-06-15 14:30:45')
+----
+14.000
+
+# --- MAKE_DATE ---
+query T
+SELECT MAKE_DATE(2024, 6, 15)
+----
+2024-06-15
+
+query T
+SELECT CAST(MAKE_DATE(1999, 12, 31) AS TEXT)
+----
+1999-12-31
+
+# MAKE_DATE arithmetic round-trips through EXTRACT.
+query R
+SELECT EXTRACT(YEAR FROM MAKE_DATE(2030, 1, 1))
+----
+2030.000
+
+# An impossible calendar day is rejected.
+statement error
+SELECT MAKE_DATE(2024, 2, 30)
+
+# --- NULL propagation ---
+query T
+SELECT EXTRACT(YEAR FROM CAST(NULL AS TIMESTAMP))
+----
+NULL
+
+query T
+SELECT DATE_PART('year', CAST(NULL AS TIMESTAMP))
+----
+NULL
+
+query T
+SELECT MAKE_DATE(NULL, 1, 1)
+----
+NULL
+
+query T
+SELECT DATE_TRUNC('month', CAST(NULL AS TIMESTAMP))
+----
+NULL
+
+query T
+SELECT TO_CHAR(CAST(NULL AS TIMESTAMP), 'YYYY')
+----
+NULL
+
+# --- MAKE_TIME / MAKE_TIMESTAMP ---
+query T
+SELECT MAKE_TIME(14, 30, 45)
+----
+14:30:45
+
+query T
+SELECT CAST(MAKE_TIME(0, 0, 0) AS TEXT)
+----
+00:00:00
+
+query T
+SELECT MAKE_TIMESTAMP(2024, 6, 15, 9, 5, 1)
+----
+2024-06-15 09:05:01
+
+# EXTRACT round-trips a constructed timestamp.
+query R
+SELECT EXTRACT(HOUR FROM MAKE_TIMESTAMP(2024, 1, 1, 23, 0, 0))
+----
+23.000
+
+# Out-of-range fields are rejected.
+statement error
+SELECT MAKE_TIME(25, 0, 0)
+
+statement error
+SELECT MAKE_TIMESTAMP(2024, 13, 1, 0, 0, 0)
+
+# NULL propagation.
+query T
+SELECT MAKE_TIME(NULL, 0, 0)
+----
+NULL
+
+# --- TIMESTAMP::DATE / ::TIME and DATE::TIMESTAMP casts (QA category-D) ---
+query T
+SELECT CAST(TIMESTAMP '2024-06-15 13:45:30' AS DATE)
+----
+2024-06-15
+
+query T
+SELECT CAST(TIMESTAMP '2024-06-15 13:45:30' AS TIME)
+----
+13:45:30
+
+query T
+SELECT CAST(DATE '2024-06-15' AS TIMESTAMP)
+----
+2024-06-15 00:00:00
+
+# A pre-epoch timestamp floors to the correct day with a non-negative time-of-day.
+query T
+SELECT CAST(TIMESTAMP '1969-12-31 18:00:00' AS DATE)
+----
+1969-12-31
+
+query T
+SELECT CAST(TIMESTAMP '1969-12-31 18:00:00' AS TIME)
+----
+18:00:00
+
+# --- timestamp - timestamp -> INTERVAL (whole days split out) ---
+query T
+SELECT TIMESTAMP '2024-06-15 12:00:00' - TIMESTAMP '2024-06-14 10:00:00'
+----
+1 day 02:00:00
+
+# --- to_timestamp(epoch seconds) -> TIMESTAMPTZ ---
+query T
+SELECT TO_TIMESTAMP(0)
+----
+1970-01-01 00:00:00+00
+
+query T
+SELECT TO_TIMESTAMP(86400)
+----
+1970-01-02 00:00:00+00
+
+# --- EXTRACT(WEEK) — ISO 8601 week number ---
+query R
+SELECT EXTRACT(WEEK FROM DATE '2024-06-15')
+----
+24.000
+
+# 2021-01-01 (Friday) is ISO week 53 of the prior year.
+query R
+SELECT EXTRACT(WEEK FROM DATE '2021-01-01')
+----
+53.000
+
+# --- EXTRACT(EPOCH FROM INTERVAL) ---
+query R
+SELECT EXTRACT(EPOCH FROM INTERVAL '1 day 02:00:00')
+----
+93600.000
+
+query R
+SELECT EXTRACT(DAY FROM INTERVAL '1 year 2 mons 10 days')
+----
+10.000

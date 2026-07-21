@@ -1,0 +1,46 @@
+# p5_advanced/analyze — ANALYZE recomputes table/column statistics end-to-end
+# (B-stat.01: sketch-based NDV/MCV/histogram).
+#
+# These assert the statement runs and is accepted by the surface; the numeric
+# accuracy + determinism of the sketches is covered by unit tests in
+# `nusadb-sql/src/executor/stats.rs`. ANALYZE produces no rows.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT, age INT)
+
+statement ok
+INSERT INTO t VALUES
+  (1, 'alice', 30),
+  (2, 'bob',   30),
+  (3, 'carol', 25),
+  (4, 'dave',  NULL)
+
+# Whole-table ANALYZE.
+statement ok
+ANALYZE TABLE t
+
+# Re-running is idempotent (overwrites the prior stats).
+statement ok
+ANALYZE TABLE t
+
+# Column-subset ANALYZE.
+statement ok
+ANALYZE TABLE t FOR COLUMNS id, age
+
+# Stats do not change query results.
+query IT
+SELECT id, name FROM t ORDER BY id LIMIT 2
+----
+1  alice
+2  bob
+
+# ANALYZE on a missing table errors.
+statement error
+ANALYZE TABLE ghost
+
+# Unknown column in the subset errors.
+statement error
+ANALYZE TABLE t FOR COLUMNS nope
+
+statement ok
+DROP TABLE t

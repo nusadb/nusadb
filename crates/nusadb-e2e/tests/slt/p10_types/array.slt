@@ -1,0 +1,131 @@
+# p10_types/array — INT[] / TEXT[] one-dimensional arrays.
+# Covers: array catalog type, `{...}` text-literal storage, canonical display, CAST text<->array,
+# equality + ORDER BY. The ARRAY[...] constructor, subscript, cardinality, and unnest are a
+# follow-up.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, nums INT[], tags TEXT[])
+
+statement ok
+INSERT INTO t VALUES (1, '{1,2,3}', '{a,b}'), (2, '{10,20}', '{x}'), (3, '{}', '{null,z}')
+
+# Canonical {…} display.
+query ITT
+SELECT id, nums, tags FROM t ORDER BY id
+----
+1  {1,2,3}  {a,b}
+2  {10,20}  {x}
+3  {}  {NULL,z}
+
+# Equality against a CAST array literal.
+query I
+SELECT id FROM t WHERE nums = CAST('{10,20}' AS INT[])
+----
+2
+
+# ORDER BY orders arrays lexicographically by element.
+query T
+SELECT nums FROM t ORDER BY nums
+----
+{}
+{1,2,3}
+{10,20}
+
+# CAST array -> text yields the {…} form.
+query T
+SELECT CAST(tags AS TEXT) FROM t WHERE id = 1
+----
+{a,b}
+
+# CAST text -> array round-trips through the canonical form.
+query T
+SELECT CAST('{7,8,9}' AS INT[])
+----
+{7,8,9}
+
+# A non-numeric element for an INT[] column is rejected.
+statement error
+INSERT INTO t VALUES (9, '{1,notanumber}', '{}')
+
+# --- Empty ARRAY[] takes its element type from an enclosing cast/hint (B-fn) ---
+query T
+SELECT CAST(ARRAY[] AS INT[])
+----
+{}
+
+query T
+SELECT ARRAY[]::TEXT[]
+----
+{}
+
+# Such an empty array has no first dimension (length NULL), like any empty array.
+query I
+SELECT ARRAY_LENGTH(CAST(ARRAY[] AS INT[]), 1)
+----
+NULL
+
+# A bare ARRAY[] with no hint is still rejected (its element type is unknowable).
+statement error
+SELECT ARRAY[]
+
+# --- Array slice a[i:j] (B-fn): 1-based, inclusive ---
+query T
+SELECT (ARRAY[10, 20, 30, 40, 50])[2:4]
+----
+{20,30,40}
+
+# An omitted upper bound runs to the end of the array.
+query T
+SELECT (ARRAY[10, 20, 30, 40, 50])[3:]
+----
+{30,40,50}
+
+# An omitted lower bound starts at the first element.
+query T
+SELECT (ARRAY[10, 20, 30, 40, 50])[:2]
+----
+{10,20}
+
+# Bounds are clamped to the array; a high upper bound stops at the last element.
+query T
+SELECT (ARRAY[10, 20, 30])[2:99]
+----
+{20,30}
+
+# A slice entirely past the end is the empty array.
+query T
+SELECT (ARRAY[1, 2, 3])[5:6]
+----
+{}
+
+# A NULL array operand yields NULL.
+query T
+SELECT CAST((CAST(NULL AS INT[]))[1:2] AS TEXT)
+----
+NULL
+
+# --- NUMERIC[] elements are exact decimals, not floats (numeric-array element type) ---
+statement ok
+CREATE TABLE narr (id INT, v NUMERIC[])
+
+statement ok
+INSERT INTO narr VALUES (1, ARRAY[1.5, 2.5, 3.25])
+
+# The declared element type round-trips as NUMERIC[].
+query TTI
+SHOW COLUMNS FROM narr
+----
+id INT 1
+v NUMERIC[] 1
+
+# Values round-trip exactly (no float rounding).
+query T
+SELECT v::text FROM narr
+----
+{1.5,2.5,3.25}
+
+# A NUMERIC[] literal types as numeric, exact past what f64 holds.
+query T
+SELECT (ARRAY[0.1, 0.2])::text
+----
+{0.1,0.2}

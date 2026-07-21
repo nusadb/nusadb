@@ -1,0 +1,64 @@
+# p12_txn/for_update — SELECT ... FOR UPDATE / FOR SHARE row locking (friend-QA R44 D2).
+#
+# FOR UPDATE/SHARE takes a row lock on each matched base row (the lost-update escape hatch). The
+# locking is transparent to the result: the SELECT returns its rows unchanged. Within an explicit
+# transaction the lock is held until COMMIT; the lock manager is no-wait, so a concurrent writer of a
+# locked row aborts with a serialization conflict rather than blocking.
+
+statement ok
+CREATE TABLE acct (id INT NOT NULL, bal INT)
+
+statement ok
+INSERT INTO acct VALUES (1, 100), (2, 200), (3, 300)
+
+# FOR UPDATE returns the selected rows (the lock is taken transparently).
+query II
+SELECT id, bal FROM acct WHERE id = 2 FOR UPDATE
+----
+2 200
+
+# FOR SHARE likewise, over all rows.
+query II
+SELECT id, bal FROM acct ORDER BY id FOR SHARE
+----
+1 100
+2 200
+3 300
+
+# The real escape-hatch usage: lock a row in an explicit transaction, then update it.
+statement ok
+BEGIN
+
+query II
+SELECT id, bal FROM acct WHERE id = 1 FOR UPDATE
+----
+1 100
+
+statement ok
+UPDATE acct SET bal = 150 WHERE id = 1
+
+statement ok
+COMMIT
+
+query I
+SELECT bal FROM acct WHERE id = 1
+----
+150
+
+# --- Unsupported shapes are rejected honestly (v1: single base table only) ---
+
+# Aggregate.
+statement error
+SELECT count(*) FROM acct FOR UPDATE
+
+# Join.
+statement error
+SELECT a.id FROM acct a JOIN acct b ON a.id = b.id FOR UPDATE
+
+# Subquery in the predicate.
+statement error
+SELECT id FROM acct WHERE id IN (SELECT id FROM acct) FOR UPDATE
+
+# NOWAIT / SKIP LOCKED not supported.
+statement error
+SELECT id FROM acct FOR UPDATE NOWAIT

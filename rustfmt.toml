@@ -1,0 +1,13 @@
+edition                    = "2024"
+max_width                  = 100
+hard_tabs                  = false
+tab_spaces                 = 4
+newline_style              = "Unix"
+use_field_init_shorthand   = true
+use_try_shorthand          = true
+reorder_imports            = true
+reorder_modules            = true
+match_block_trailing_comma = true
+# NOTE: imports_granularity / group_imports / trailing_comma=Vertical are nightly-only
+# rustfmt options. The toolchain is pinned to stable 1.95 (rust-toolchain.toml), so they
+# are ignored and only emit warnings — kept out to make `cargo fmt` deterministic on stable.

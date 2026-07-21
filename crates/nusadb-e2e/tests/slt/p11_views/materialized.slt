@@ -1,0 +1,73 @@
+# p11_views/materialized — CREATE / query / DROP MATERIALIZED VIEW (M6, snapshot semantics).
+
+statement ok
+CREATE TABLE sales (region TEXT, amt INT)
+
+statement ok
+INSERT INTO sales VALUES ('east', 10), ('east', 30), ('west', 20)
+
+# Materialize a per-region total into a backing table.
+statement ok
+CREATE MATERIALIZED VIEW region_totals AS SELECT region, SUM(amt) AS total FROM sales GROUP BY region
+
+# Querying the view is an ordinary scan of the stored snapshot.
+query TI
+SELECT region, total FROM region_totals ORDER BY region
+----
+east 40
+west 20
+
+# A filtered/joined query over the view works like any table.
+query T
+SELECT region FROM region_totals WHERE total > 25 ORDER BY region
+----
+east
+
+# The snapshot does not change when the base table changes — until a REFRESH.
+statement ok
+INSERT INTO sales VALUES ('east', 1000)
+
+query TI
+SELECT region, total FROM region_totals ORDER BY region
+----
+east 40
+west 20
+
+# REFRESH recomputes the stored rows from the current base table (M6).
+statement ok
+REFRESH MATERIALIZED VIEW region_totals
+
+query TI
+SELECT region, total FROM region_totals ORDER BY region
+----
+east 1040
+west 20
+
+# REFRESH of a non-view name is an error.
+statement error
+REFRESH MATERIALIZED VIEW sales
+
+# Explicit output column names.
+statement ok
+CREATE MATERIALIZED VIEW rt2 (r, t) AS SELECT region, SUM(amt) FROM sales GROUP BY region
+
+query TI
+SELECT r, t FROM rt2 ORDER BY r
+----
+east 1040
+west 20
+
+# DROP MATERIALIZED VIEW removes it (the plain DROP VIEW spelling works too).
+statement ok
+DROP MATERIALIZED VIEW region_totals
+
+statement error
+SELECT * FROM region_totals
+
+# DROP MATERIALIZED VIEW ... IF EXISTS is a no-op when absent.
+statement ok
+DROP MATERIALIZED VIEW IF EXISTS region_totals
+
+# The plain DROP VIEW spelling still works (rt2 was created above).
+statement ok
+DROP VIEW rt2

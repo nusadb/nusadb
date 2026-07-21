@@ -1,0 +1,71 @@
+# p6_setops/set_ops — UNION / UNION ALL / INTERSECT / EXCEPT (set semantics).
+
+statement ok
+CREATE TABLE a (x INT)
+
+statement ok
+INSERT INTO a VALUES (1), (2), (2), (3)
+
+statement ok
+CREATE TABLE b (x INT)
+
+statement ok
+INSERT INTO b VALUES (2), (3), (4)
+
+# UNION removes duplicates across both branches.
+query I
+SELECT x FROM a UNION SELECT x FROM b ORDER BY x
+----
+1
+2
+3
+4
+
+# UNION ALL keeps every row (a's four rows + b's three).
+query I
+SELECT x FROM a UNION ALL SELECT x FROM b ORDER BY x
+----
+1
+2
+2
+2
+3
+3
+4
+
+# INTERSECT: rows present in both (set semantics).
+query I
+SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x
+----
+2
+3
+
+# EXCEPT: rows in the left not in the right (set semantics).
+query I
+SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x
+----
+1
+
+# --- Set-operation column type unification (INT + NUMERIC/FLOAT widen) ---
+# A NUMERIC branch and an INT branch unify to NUMERIC rather than erroring.
+query T
+SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2.5) v ORDER BY x
+----
+1
+2.5
+
+# INT and FLOAT unify to FLOAT (assert the value via SUM so it is render-independent).
+query R
+SELECT SUM(x) FROM (SELECT CAST(3.0 AS FLOAT) AS x UNION ALL SELECT 4) v
+----
+7.000
+
+# UNION (dedup) across INT and NUMERIC: 1 and 1.0 are the same value -> one row.
+query T
+SELECT x FROM (SELECT 1 AS x UNION SELECT 1.0) v
+----
+1
+
+# Genuinely incompatible branches still error.
+statement error
+SELECT 1 UNION SELECT 'abc'

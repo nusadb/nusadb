@@ -1,0 +1,122 @@
+# p3_filter/null_handling — three-valued logic, IS NULL, COALESCE, CASE.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT, age INT)
+
+statement ok
+INSERT INTO t VALUES
+  (1, 'alice',   30),
+  (2, NULL,      25),
+  (3, 'carol', NULL),
+  (4, NULL,    NULL)
+
+# IS NULL keeps NULL rows
+query I rowsort
+SELECT id FROM t WHERE name IS NULL
+----
+2
+4
+
+# IS NOT NULL drops them
+query I rowsort
+SELECT id FROM t WHERE name IS NOT NULL
+----
+1
+3
+
+# A `<column> = NULL` comparison evaluates to NULL → row is filtered out.
+# Use IS NULL to actually match.
+query I
+SELECT id FROM t WHERE name = NULL
+----
+
+# COALESCE: first non-NULL argument wins
+query IT rowsort
+SELECT id, COALESCE(name, 'anonymous') FROM t
+----
+1  alice
+2  anonymous
+3  carol
+4  anonymous
+
+# Nested COALESCE
+query I rowsort
+SELECT COALESCE(age, 0) FROM t
+----
+0
+0
+25
+30
+
+# COALESCE with every argument NULL is NULL (an untyped NULL -> text), not an "ambiguous type" error.
+query T
+SELECT COALESCE(NULL, NULL)
+----
+NULL
+
+# A leading NULL still infers from a later typed argument.
+query I
+SELECT COALESCE(NULL, NULL, 7)
+----
+7
+
+# GREATEST / LEAST resolve a leading NULL from a later argument (a NULL argument is skipped).
+query II
+SELECT GREATEST(NULL, 5, 3), LEAST(NULL, 5, 3)
+----
+5  3
+
+# GREATEST / LEAST of every-NULL arguments is NULL (untyped NULL -> text), not an ambiguous-type error.
+query TT
+SELECT GREATEST(NULL, NULL), LEAST(NULL, NULL)
+----
+NULL  NULL
+
+# Two bare NULLs under a comparison resolve as unknown -> text and evaluate to NULL (not an error).
+# `NULL = NULL` is NULL, like any comparison involving a NULL.
+query TTT
+SELECT (NULL = NULL)::text, (NULL < NULL)::text, (NULL <> NULL)::text
+----
+NULL  NULL  NULL
+
+# Two bare NULLs under AND / OR / concatenation are also well-defined (evaluate to NULL).
+query TTT
+SELECT (NULL AND NULL)::text, (NULL OR NULL)::text, (NULL || NULL)
+----
+NULL  NULL  NULL
+
+# CASE searched form — first true branch wins; no match returns NULL
+query IT rowsort
+SELECT id, CASE WHEN age IS NULL THEN 'unknown'
+                WHEN age < 28   THEN 'young'
+                ELSE 'older' END
+FROM t
+----
+1  older
+2  young
+3  unknown
+4  unknown
+
+# CASE simple form
+query IT rowsort
+SELECT id, CASE name WHEN 'alice' THEN 'pioneer' ELSE 'other' END
+FROM t
+----
+1  pioneer
+2  other
+3  other
+4  other
+
+# AND with NULL: `TRUE AND NULL = NULL`, `FALSE AND NULL = FALSE`
+query I rowsort
+SELECT id FROM t WHERE age > 20 AND name IS NOT NULL
+----
+1
+
+# OR with NULL: `TRUE OR NULL = TRUE`
+query I rowsort
+SELECT id FROM t WHERE age = 30 OR age IS NULL
+----
+1
+3
+4

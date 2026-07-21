@@ -1,0 +1,70 @@
+# p3_filter/nulls_ordering — ORDER BY ... NULLS FIRST / NULLS LAST.
+# Explicit NULL placement is independent of ASC/DESC. A secondary key (id) breaks ties between the
+# two NULL rows so the order is deterministic; results are checked in order (no rowsort).
+
+statement ok
+CREATE TABLE t (id INT, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 30), (2, NULL), (3, 10), (4, 20), (5, NULL)
+
+# ASC, NULLs forced to the front.
+query II
+SELECT id, v FROM t ORDER BY v ASC NULLS FIRST, id
+----
+2  NULL
+5  NULL
+3  10
+4  20
+1  30
+
+# ASC, NULLs forced to the back.
+query II
+SELECT id, v FROM t ORDER BY v ASC NULLS LAST, id
+----
+3  10
+4  20
+1  30
+2  NULL
+5  NULL
+
+# DESC, NULLs forced to the front (NULLS FIRST overrides DESC's default of NULLs first anyway,
+# but the values still descend).
+query II
+SELECT id, v FROM t ORDER BY v DESC NULLS FIRST, id
+----
+2  NULL
+5  NULL
+1  30
+4  20
+3  10
+
+# DESC, NULLs forced to the back.
+query II
+SELECT id, v FROM t ORDER BY v DESC NULLS LAST, id
+----
+1  30
+4  20
+3  10
+2  NULL
+5  NULL
+
+# Default ASC places NULLs last (no explicit clause).
+query II
+SELECT id, v FROM t ORDER BY v, id
+----
+3  10
+4  20
+1  30
+2  NULL
+5  NULL
+
+# Default DESC places NULLs first.
+query II
+SELECT id, v FROM t ORDER BY v DESC, id
+----
+2  NULL
+5  NULL
+1  30
+4  20
+3  10

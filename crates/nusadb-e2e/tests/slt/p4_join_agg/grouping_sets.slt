@@ -1,0 +1,166 @@
+# p4_join_agg/grouping_sets — ROLLUP / CUBE / GROUPING SETS.
+# Rolled-up (inactive) grouping columns are NULL in their output row; the empty set () is the
+# grand total. rowsort is used throughout so the comparison is order-independent.
+
+statement ok
+CREATE TABLE sales (
+  region   TEXT,
+  product  TEXT,
+  amount   INT
+)
+
+statement ok
+INSERT INTO sales VALUES
+  ('north', 'x',  10),
+  ('north', 'y',  20),
+  ('north', 'x',  30),
+  ('south', 'x',  40),
+  ('south', 'y',  50),
+  ('south', 'y',  60),
+  ('east',  'x',  70)
+
+# ROLLUP(region, product) => grouping sets (region,product), (region), ().
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY ROLLUP(region, product)
+----
+NULL   NULL  280
+east   NULL  70
+east   x     70
+north  NULL  60
+north  x     40
+north  y     20
+south  NULL  150
+south  x     40
+south  y     110
+
+# CUBE(region, product) => every subset: (region,product), (region), (product), ().
+# Adds the product-only subtotals (region NULL) on top of the ROLLUP rows.
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY CUBE(region, product)
+----
+NULL   NULL  280
+NULL   x     150
+NULL   y     130
+east   NULL  70
+east   x     70
+north  NULL  60
+north  x     40
+north  y     20
+south  NULL  150
+south  x     40
+south  y     110
+
+# GROUPING SETS((region), (product)) => exactly two independent groupings, no grand total.
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY GROUPING SETS ((region), (product))
+----
+NULL   x     150
+NULL   y     130
+east   NULL  70
+north  NULL  60
+south  NULL  150
+
+# GROUPING SETS with the explicit empty set () yields only the grand total.
+query I rowsort
+SELECT SUM(amount) FROM sales GROUP BY GROUPING SETS (())
+----
+280
+
+# ROLLUP over a single key => (region), ().
+query TI rowsort
+SELECT region, COUNT(*) FROM sales GROUP BY ROLLUP(region)
+----
+NULL   7
+east   1
+north  3
+south  3
+
+# A grouping set may repeat a key across sets; each set is aggregated independently.
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY GROUPING SETS ((region, product), (region))
+----
+east   NULL  70
+east   x     70
+north  NULL  60
+north  x     40
+north  y     20
+south  NULL  150
+south  x     40
+south  y     110
+
+# GROUPING(col) reports, per super-aggregate row, whether a key was grouped away: 0 = present,
+# 1 = rolled up. Over ROLLUP(region, product) the per-key indicators are 0/0 on detail rows, 0/1 on the
+# region subtotals (product rolled up), and 1/1 on the grand total. GROUPING(region, product) packs both
+# bits (region = high bit): 0b00=0, 0b01=1, 0b11=3.
+query TTIIII rowsort
+SELECT region, product, SUM(amount),
+       GROUPING(region), GROUPING(product), GROUPING(region, product)
+FROM sales GROUP BY ROLLUP(region, product)
+----
+NULL   NULL  280  1  1  3
+east   NULL  70   0  1  1
+east   x     70   0  0  0
+north  NULL  60   0  1  1
+north  x     40   0  0  0
+north  y     20   0  0  0
+south  NULL  150  0  1  1
+south  x     40   0  0  0
+south  y     110  0  0  0
+
+# CUBE adds the product-only subtotals (region rolled up, product present): GROUPING(region, product)
+# = 0b10 = 2 there — the bit pattern ROLLUP never produces.
+query TTI rowsort
+SELECT region, product, GROUPING(region, product)
+FROM sales GROUP BY CUBE(region, product)
+----
+NULL   NULL  3
+NULL   x     2
+NULL   y     2
+east   NULL  1
+east   x     0
+north  NULL  1
+north  x     0
+north  y     0
+south  NULL  1
+south  x     0
+south  y     0
+
+# GROUPING_ID is an accepted alias of GROUPING.
+query TI rowsort
+SELECT region, GROUPING_ID(region) FROM sales GROUP BY ROLLUP(region)
+----
+NULL   1
+east   0
+north  0
+south  0
+
+# A plain GROUP BY never rolls anything up, so GROUPING(col) is always 0.
+query TI rowsort
+SELECT region, GROUPING(region) FROM sales GROUP BY region
+----
+east   0
+north  0
+south  0
+
+# The canonical use: a real NULL group (GROUPING = 0) is distinguishable from the rolled-up grand
+# total (GROUPING = 1), even though both render the key column as NULL.
+statement ok
+CREATE TABLE g (k TEXT, v INT)
+
+statement ok
+INSERT INTO g VALUES ('a', 1), (NULL, 2), ('a', 3)
+
+query TII rowsort
+SELECT k, GROUPING(k), SUM(v) FROM g GROUP BY ROLLUP(k)
+----
+NULL  0  2
+NULL  1  6
+a     0  4
+
+# GROUPING's argument must be one of the GROUP BY keys.
+statement error
+SELECT region, GROUPING(amount) FROM sales GROUP BY region
+
+# GROUPING is meaningless without GROUP BY.
+statement error
+SELECT GROUPING(region) FROM sales

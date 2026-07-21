@@ -1,0 +1,576 @@
+# p1_ddl/schema_qualified — schema-qualified table names end-to-end (NS3b-core).
+#
+# CREATE/SELECT/INSERT/UPDATE/DELETE/DROP against `schema.table`, plus coexistence of a same-named
+# table in two schemas with independent data and independent column DEFAULTs. Note (NS3b-core staged
+# limitation): the engine-global constraint/index namespace and SERIAL sequence names are still keyed
+# by bare table name, so two same-named tables in different schemas must not both declare PRIMARY KEY
+# / UNIQUE / SERIAL — that collides loudly ("... already exists", no silent-wrong). Column DEFAULTs ARE
+# schema-isolated (the default catalog is keyed by the schema-qualified name). Engine table identity
+# itself is fully (schema, name)-correct.
+
+statement ok
+CREATE SCHEMA app
+
+# CREATE TABLE in a non-public schema.
+statement ok
+CREATE TABLE app.users (id INT NOT NULL, name TEXT)
+
+# A same-named table in the default schema is a DISTINCT table (per-schema identity, NS2).
+statement ok
+CREATE TABLE users (id INT NOT NULL, name TEXT)
+
+# Independent data per table.
+statement ok
+INSERT INTO app.users VALUES (1, 'in_app')
+
+statement ok
+INSERT INTO users VALUES (2, 'in_public')
+
+query IT
+SELECT id, name FROM app.users
+----
+1  in_app
+
+query IT
+SELECT id, name FROM users
+----
+2  in_public
+
+# A `public.` qualifier denotes the same default-namespace table as the bare name.
+query IT
+SELECT id, name FROM public.users
+----
+2  in_public
+
+# UPDATE / DELETE resolve the qualifier too.
+statement ok
+UPDATE app.users SET name = 'changed' WHERE id = 1
+
+query T
+SELECT name FROM app.users WHERE id = 1
+----
+changed
+
+statement ok
+DELETE FROM app.users WHERE id = 1
+
+query I
+SELECT count(*) FROM app.users
+----
+0
+
+# Column DEFAULTs are schema-isolated: two same-named tables keep their own defaults (regression for
+# the default-catalog key, which must fold in a non-public schema).
+statement ok
+CREATE TABLE app.cfg (k INT NOT NULL, v INT DEFAULT 1)
+
+statement ok
+CREATE TABLE cfg (k INT NOT NULL, v INT DEFAULT 2)
+
+statement ok
+INSERT INTO app.cfg (k) VALUES (10)
+
+statement ok
+INSERT INTO cfg (k) VALUES (20)
+
+query II
+SELECT k, v FROM app.cfg
+----
+10  1
+
+query II
+SELECT k, v FROM cfg
+----
+20  2
+
+statement ok
+DROP TABLE app.cfg
+
+statement ok
+DROP TABLE cfg
+
+# UPDATE ... FROM resolves a qualified auxiliary table (NS3 aux-relation path; its columns are
+# qualified by the table's last name component, `src`).
+statement ok
+CREATE TABLE app.src (id INT, bonus INT)
+
+statement ok
+CREATE TABLE tgt (id INT, total INT)
+
+statement ok
+INSERT INTO app.src VALUES (1, 100)
+
+statement ok
+INSERT INTO tgt VALUES (1, 5)
+
+statement ok
+UPDATE tgt SET total = total + src.bonus FROM app.src AS src WHERE tgt.id = src.id
+
+query II
+SELECT id, total FROM tgt
+----
+1  105
+
+statement ok
+DROP TABLE app.src
+
+statement ok
+DROP TABLE tgt
+
+# CREATE TABLE into a namespace that does not exist is rejected (not silently landed in public).
+statement error
+CREATE TABLE ghost.tbl (id INT)
+
+# SELECT from a missing qualified table errors (it does not fall through to a public view/table).
+statement error
+SELECT * FROM ghost.tbl
+
+# Dropping the qualified table leaves the same-named default-schema table intact.
+statement ok
+DROP TABLE app.users
+
+statement error
+SELECT * FROM app.users
+
+query IT
+SELECT id, name FROM users
+----
+2  in_public
+
+statement ok
+DROP TABLE users
+
+# The now-empty schema drops cleanly.
+statement ok
+DROP SCHEMA app
+
+# --- search_path: SET search_path moves the current schema for unqualified names (NS3c) ---
+statement ok
+CREATE SCHEMA sp
+
+statement ok
+SET search_path = 'sp'
+
+# A bare CREATE now lands in the current schema `sp`.
+statement ok
+CREATE TABLE sp_tbl (id INT NOT NULL)
+
+statement ok
+INSERT INTO sp_tbl VALUES (1)
+
+# A bare reference resolves through the search path and finds it in `sp`.
+query I
+SELECT id FROM sp_tbl
+----
+1
+
+# It really lives in `sp`, not `public`.
+query I
+SELECT id FROM sp.sp_tbl
+----
+1
+
+statement error
+SELECT id FROM public.sp_tbl
+
+# A bare name still falls back to `public` when the current schema does not have it.
+statement ok
+SET search_path = 'public'
+
+statement ok
+CREATE TABLE pub_tbl (id INT NOT NULL)
+
+statement ok
+INSERT INTO pub_tbl VALUES (7)
+
+statement ok
+SET search_path = 'sp'
+
+# `pub_tbl` is not in `sp`, so the bare name resolves via the `public` fallback.
+query I
+SELECT id FROM pub_tbl
+----
+7
+
+# Cleanup: drop the sp table by qualifier, reset the path, drop the public table + schema.
+statement ok
+DROP TABLE sp.sp_tbl
+
+statement ok
+RESET search_path
+
+statement ok
+DROP TABLE pub_tbl
+
+statement ok
+DROP SCHEMA sp
+
+# --- CURRENT_SCHEMA() and EXECUTE honor search_path (NS3d) ---
+statement ok
+CREATE SCHEMA d
+
+statement ok
+SET search_path = 'd'
+
+# CURRENT_SCHEMA() reflects the search path, not a fixed default.
+query T
+SELECT current_schema()
+----
+d
+
+statement ok
+CREATE TABLE d_tbl (id INT NOT NULL)
+
+statement ok
+INSERT INTO d_tbl VALUES (42)
+
+# A prepared statement's bare name re-resolves through the session search path on EXECUTE.
+statement ok
+PREPARE q AS SELECT id FROM d_tbl
+
+query I
+EXECUTE q
+----
+42
+
+statement ok
+DEALLOCATE q
+
+statement ok
+DROP TABLE d.d_tbl
+
+statement ok
+RESET search_path
+
+# After RESET the current schema is back to the default.
+query T
+SELECT current_schema()
+----
+public
+
+statement ok
+DROP SCHEMA d
+
+# --- Multi-element search_path: a list resolved in order with a public fallback (NS3d) ---
+statement ok
+CREATE SCHEMA e1
+
+statement ok
+SET search_path TO e1, public
+
+# The current schema (where an unqualified CREATE lands) is the first list entry.
+query T
+SELECT current_schema()
+----
+e1
+
+statement ok
+CREATE TABLE only_e1 (id INT NOT NULL)
+
+statement ok
+INSERT INTO only_e1 VALUES (5)
+
+# A table created explicitly in public is reached via the second (fallback) list entry.
+statement ok
+CREATE TABLE public.only_pub (id INT NOT NULL)
+
+statement ok
+INSERT INTO public.only_pub VALUES (9)
+
+# Bare names walk the list: only_e1 is found in e1 (first), only_pub via the public fallback.
+query I
+SELECT id FROM only_e1
+----
+5
+
+query I
+SELECT id FROM only_pub
+----
+9
+
+statement ok
+DROP TABLE e1.only_e1
+
+statement ok
+DROP TABLE public.only_pub
+
+statement ok
+RESET search_path
+
+statement ok
+DROP SCHEMA e1
+
+# --- CREATE INDEX on a schema table — explicit qualifier and via search_path (NS3d) ---
+statement ok
+CREATE SCHEMA ix
+
+statement ok
+CREATE TABLE ix.t (id INT NOT NULL, email TEXT)
+
+# An index can now be created on a non-public table by qualifier (previously rejected).
+statement ok
+CREATE INDEX ix_t_email ON ix.t (email)
+
+statement ok
+INSERT INTO ix.t VALUES (1, 'a@x')
+
+query IT
+SELECT id, email FROM ix.t WHERE email = 'a@x'
+----
+1  a@x
+
+# CREATE INDEX on a missing qualified table errors (no silent fall-through to public).
+statement error
+CREATE INDEX bad_idx ON ghost.t (x)
+
+# CREATE INDEX also resolves a bare table through the search path.
+statement ok
+SET search_path TO ix
+
+statement ok
+CREATE INDEX ix_t_id ON t (id)
+
+statement ok
+RESET search_path
+
+# DROP TABLE cascades the indexes; the now-empty schema drops cleanly.
+statement ok
+DROP TABLE ix.t
+
+statement ok
+DROP SCHEMA ix
+
+# --- aux-catalog isolation: same-named tables in different schemas can BOTH have PRIMARY KEY /
+# UNIQUE / SERIAL — the auto-generated constraint/index/sequence names are schema-qualified, so they
+# no longer collide (NS3d). ---
+statement ok
+CREATE SCHEMA t1
+
+statement ok
+CREATE SCHEMA t2
+
+statement ok
+CREATE TABLE t1.acct (id SERIAL PRIMARY KEY, email TEXT UNIQUE)
+
+# Without schema-qualified auto-names this CREATE would fail ("index acct_pkey already exists").
+statement ok
+CREATE TABLE t2.acct (id SERIAL PRIMARY KEY, email TEXT UNIQUE)
+
+statement ok
+INSERT INTO t1.acct (email) VALUES ('a@x')
+
+statement ok
+INSERT INTO t2.acct (email) VALUES ('a@x')
+
+# The same PK value and the same UNIQUE value live independently in each table.
+query IT
+SELECT id, email FROM t1.acct
+----
+1  a@x
+
+query IT
+SELECT id, email FROM t2.acct
+----
+1  a@x
+
+# Each table's constraints are enforced independently: a duplicate email within t1 is rejected,
+# while the identical email already in t2 is irrelevant.
+statement error
+INSERT INTO t1.acct (email) VALUES ('a@x')
+
+statement ok
+DROP TABLE t1.acct
+
+statement ok
+DROP TABLE t2.acct
+
+statement ok
+DROP SCHEMA t1
+
+statement ok
+DROP SCHEMA t2
+
+# --- ALTER TABLE on a schema-qualified table — explicit qualifier and via search_path (NS3d). The
+# rename stays within the table's own schema, and auto-generated constraint names are schema-qualified
+# so same-named tables in different schemas can both ADD a constraint without colliding. ---
+statement ok
+CREATE SCHEMA al
+
+statement ok
+CREATE TABLE al.t (id INT NOT NULL, name TEXT)
+
+# A same-named public table is a distinct table; ALTER on the qualifier must not touch it.
+statement ok
+CREATE TABLE t (id INT NOT NULL)
+
+# ADD COLUMN by qualifier (previously rejected — ALTER could not name a non-public table).
+statement ok
+ALTER TABLE al.t ADD COLUMN email TEXT
+
+statement ok
+INSERT INTO al.t (id, name, email) VALUES (1, 'a', 'a@x')
+
+query ITT
+SELECT id, name, email FROM al.t
+----
+1  a  a@x
+
+# The public table is untouched by the qualified ALTER (still has only id).
+query TTI
+SHOW COLUMNS FROM t
+----
+id INT 0
+
+# RENAME COLUMN resolves the qualifier.
+statement ok
+ALTER TABLE al.t RENAME COLUMN name TO label
+
+query IT
+SELECT id, label FROM al.t
+----
+1  a
+
+# RENAME TO stays within the same schema: al.t becomes al.t2, never public.t2.
+statement ok
+ALTER TABLE al.t RENAME TO t2
+
+statement error
+SELECT * FROM al.t
+
+query IT
+SELECT id, label FROM al.t2
+----
+1  a
+
+statement error
+SELECT * FROM public.t2
+
+# ALTER on a bare name resolves through the search path.
+statement ok
+SET search_path TO al
+
+statement ok
+ALTER TABLE t2 ADD COLUMN note TEXT
+
+statement ok
+RESET search_path
+
+statement ok
+DROP TABLE al.t2
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP SCHEMA al
+
+# Schema-qualified auto-constraint names: two same-named tables in different schemas can BOTH
+# `ALTER ... ADD UNIQUE` on the same column — the generated index names (`a1.acc_id_key` /
+# `a2.acc_id_key`) are schema-qualified, so they no longer collide.
+statement ok
+CREATE SCHEMA a1
+
+statement ok
+CREATE SCHEMA a2
+
+statement ok
+CREATE TABLE a1.acc (id INT NOT NULL)
+
+statement ok
+CREATE TABLE a2.acc (id INT NOT NULL)
+
+statement ok
+ALTER TABLE a1.acc ADD UNIQUE (id)
+
+# Without schema-qualified auto-names this would fail ("index acc_id_key already exists").
+statement ok
+ALTER TABLE a2.acc ADD UNIQUE (id)
+
+statement ok
+INSERT INTO a1.acc VALUES (1)
+
+statement ok
+INSERT INTO a2.acc VALUES (1)
+
+# Each table's UNIQUE is enforced independently: a duplicate within a1 is rejected, the identical
+# value already in a2 is irrelevant.
+statement error
+INSERT INTO a1.acc VALUES (1)
+
+statement ok
+DROP TABLE a1.acc
+
+statement ok
+DROP TABLE a2.acc
+
+statement ok
+DROP SCHEMA a1
+
+statement ok
+DROP SCHEMA a2
+
+# --- TRUNCATE on a schema-qualified table — explicit qualifier and via search_path (NS3d). A
+# qualified TRUNCATE empties exactly that table and never the same-named public one. ---
+statement ok
+CREATE SCHEMA tr
+
+statement ok
+CREATE TABLE tr.t (id INT NOT NULL)
+
+statement ok
+CREATE TABLE t (id INT NOT NULL)
+
+statement ok
+INSERT INTO tr.t VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO t VALUES (9)
+
+# TRUNCATE by qualifier empties tr.t only (previously rejected — TRUNCATE could not name a
+# non-public table).
+statement ok
+TRUNCATE tr.t
+
+query I
+SELECT count(*) FROM tr.t
+----
+0
+
+# The same-named public table is untouched.
+query I
+SELECT count(*) FROM t
+----
+1
+
+# TRUNCATE resolves a bare name through the search path.
+statement ok
+INSERT INTO tr.t VALUES (4), (5)
+
+statement ok
+SET search_path TO tr
+
+statement ok
+TRUNCATE t
+
+query I
+SELECT count(*) FROM tr.t
+----
+0
+
+statement ok
+RESET search_path
+
+# The public table is still intact (the bare TRUNCATE resolved to tr.t under the search path).
+query I
+SELECT count(*) FROM t
+----
+1
+
+statement ok
+DROP TABLE tr.t
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP SCHEMA tr

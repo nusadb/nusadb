@@ -1,0 +1,20 @@
+[package]
+name         = "nusadb-e2e"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "End-to-end integration tests: the SQL surface running over the storage spine"
+repository   = { workspace = true }
+publish      = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+nusadb-core  = { workspace = true }
+nusadb-sql   = { workspace = true }
+nusadb-btree = { workspace = true }
+tempfile     = { workspace = true }
+sqllogictest = { workspace = true }

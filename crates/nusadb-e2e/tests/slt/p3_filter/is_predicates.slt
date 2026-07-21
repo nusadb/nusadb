@@ -1,0 +1,109 @@
+# p3_filter/is_predicates — `IS [NOT] DISTINCT FROM` and
+# `IS [NOT] {TRUE|FALSE|UNKNOWN}`. Both always yield a non-NULL boolean.
+
+# --- IS [NOT] DISTINCT FROM -----------------------------------------
+
+statement ok
+CREATE TABLE pairs (id INT NOT NULL, a INT, b INT)
+
+statement ok
+INSERT INTO pairs VALUES (1, 1, 2), (2, 1, 1), (3, NULL, 1), (4, NULL, NULL)
+
+# NULL is treated as a comparable value: two NULLs are not distinct, one NULL is.
+query II
+SELECT id, a IS DISTINCT FROM b FROM pairs ORDER BY id
+----
+1  1
+2  0
+3  1
+4  0
+
+# IS NOT DISTINCT FROM is the negation (and is NULL-safe equality).
+query II
+SELECT id, a IS NOT DISTINCT FROM b FROM pairs ORDER BY id
+----
+1  0
+2  1
+3  0
+4  1
+
+# Usable as a NULL-safe equality predicate in WHERE.
+query I
+SELECT id FROM pairs WHERE a IS NOT DISTINCT FROM b ORDER BY id
+----
+2
+4
+
+# Compared against a literal: only the NULL rows are distinct from 1 (1 is not).
+query I
+SELECT id FROM pairs WHERE a IS DISTINCT FROM 1 ORDER BY id
+----
+3
+4
+
+# Two bare NULL literals: well-defined (NULLs are never distinct), not an ambiguous-type
+# error (G9). The plain form is FALSE, the negated form TRUE.
+query II
+SELECT NULL IS DISTINCT FROM NULL, NULL IS NOT DISTINCT FROM NULL
+----
+0  1
+
+# Incomparable operand types are rejected.
+statement error
+SELECT 1 IS DISTINCT FROM 'x'
+
+# --- IS [NOT] TRUE / FALSE / UNKNOWN --------------------------------
+
+statement ok
+CREATE TABLE flags (id INT NOT NULL, b BOOL)
+
+statement ok
+INSERT INTO flags VALUES (1, TRUE), (2, FALSE), (3, NULL)
+
+# IS TRUE / IS FALSE / IS UNKNOWN: NULL matches only UNKNOWN.
+query III
+SELECT b IS TRUE, b IS FALSE, b IS UNKNOWN FROM flags ORDER BY id
+----
+1  0  0
+0  1  0
+0  0  1
+
+# The negated forms (NULL counts as "not true" and "not false").
+query III
+SELECT b IS NOT TRUE, b IS NOT FALSE, b IS NOT UNKNOWN FROM flags ORDER BY id
+----
+0  1  1
+1  0  1
+1  1  0
+
+# Works on a comparison expression, not just a column.
+query I
+SELECT id FROM flags WHERE (id = 2) IS TRUE
+----
+2
+
+# A non-boolean operand is rejected.
+statement error
+SELECT 1 IS TRUE
+
+# --- Untyped NULL (B-fn) ---
+# IS [NOT] NULL only inspects nullness, so a bare NULL operand needs no type context.
+query T
+SELECT NULL IS NULL
+----
+1
+
+query T
+SELECT NULL IS NOT NULL
+----
+0
+
+# A bare SELECT NULL defaults its column to the "unknown" (TEXT) type rather than erroring.
+query T
+SELECT NULL
+----
+NULL
+
+# A genuinely untypable composite NULL is still rejected.
+statement error
+SELECT NULL + NULL

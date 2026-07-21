@@ -1,0 +1,173 @@
+# p11_views/plain — non-materialized views (M6): the body re-evaluates on every read.
+
+statement ok
+CREATE TABLE emp (id INT NOT NULL, dept INT, salary INT)
+
+statement ok
+INSERT INTO emp VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)
+
+statement ok
+CREATE VIEW high_earners AS SELECT id, salary FROM emp WHERE salary >= 100
+
+query II
+SELECT id, salary FROM high_earners ORDER BY id
+----
+1 100
+2 200
+
+# Unlike a materialized view, a plain view reflects base-table changes immediately (no REFRESH).
+statement ok
+INSERT INTO emp VALUES (4, 2, 300)
+
+query II
+SELECT id, salary FROM high_earners ORDER BY id
+----
+1 100
+2 200
+4 300
+
+# The view can be queried with further filtering/projection.
+query I
+SELECT id FROM high_earners WHERE salary > 150 ORDER BY id
+----
+2
+4
+
+# A view over an aggregate.
+statement ok
+CREATE VIEW dept_totals AS SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept
+
+query II
+SELECT dept, total FROM dept_totals ORDER BY dept
+----
+1 300
+2 350
+
+# DROP VIEW removes it; querying it afterward errors.
+statement ok
+DROP VIEW high_earners
+
+statement error
+SELECT * FROM high_earners
+
+# OR REPLACE redefines an existing view.
+statement ok
+CREATE OR REPLACE VIEW dept_totals AS SELECT dept FROM emp GROUP BY dept
+
+query I
+SELECT dept FROM dept_totals ORDER BY dept
+----
+1
+2
+
+# DROP VIEW IF EXISTS is a no-op when absent.
+statement ok
+DROP VIEW IF EXISTS nope
+
+# --- Explicit column list: CREATE VIEW name (cols) AS ... renames output columns positionally. ---
+
+statement ok
+CREATE VIEW renamed (worker, pay) AS SELECT id, salary FROM emp WHERE salary >= 100
+
+query II
+SELECT worker, pay FROM renamed ORDER BY worker
+----
+1 100
+2 200
+4 300
+
+# The renamed columns are usable in WHERE/projection like any base column.
+query I
+SELECT worker FROM renamed WHERE pay > 150 ORDER BY worker
+----
+2
+4
+
+# An explicit list works over a wildcard body (positional rename of every column).
+statement ok
+CREATE VIEW star_named (a, b, c) AS SELECT * FROM emp WHERE id = 1
+
+query III
+SELECT a, b, c FROM star_named
+----
+1 1 100
+
+# An explicit list works over an aggregate body, renaming the computed column.
+statement ok
+CREATE VIEW totals_named (d, amount) AS SELECT dept, SUM(salary) FROM emp GROUP BY dept
+
+query II
+SELECT d, amount FROM totals_named ORDER BY d
+----
+1 300
+2 350
+
+# A column count that disagrees with the body's projection is rejected at CREATE.
+statement error
+CREATE VIEW bad_arity (only_one) AS SELECT id, salary FROM emp
+
+# OR REPLACE back to a plain view drops the explicit rename (old column names no longer resolve).
+statement ok
+CREATE OR REPLACE VIEW renamed AS SELECT id, salary FROM emp WHERE salary >= 100
+
+statement error
+SELECT worker FROM renamed
+
+query II
+SELECT id, salary FROM renamed ORDER BY id
+----
+1 100
+2 200
+4 300
+
+# Dropping a column-list view forgets its rename; recreating it without a list is plain again.
+statement ok
+DROP VIEW star_named
+
+statement error
+SELECT a FROM star_named
+
+# CREATE [MATERIALIZED] VIEW IF NOT EXISTS: an existing name (view or table) makes the
+# statement a no-op — the original definition survives; a fresh name creates normally.
+statement ok
+CREATE VIEW IF NOT EXISTS ine_v AS SELECT id FROM emp WHERE id = 1
+
+statement ok
+CREATE VIEW IF NOT EXISTS ine_v AS SELECT id FROM emp
+
+query I
+SELECT * FROM ine_v
+----
+1
+
+statement ok
+CREATE VIEW IF NOT EXISTS emp AS SELECT 1
+
+query I
+SELECT COUNT(*) FROM emp
+----
+4
+
+statement error
+CREATE OR REPLACE VIEW IF NOT EXISTS ine_v AS SELECT 1
+
+statement ok
+CREATE MATERIALIZED VIEW IF NOT EXISTS ine_m AS SELECT id FROM emp WHERE id = 2
+
+statement ok
+CREATE MATERIALIZED VIEW IF NOT EXISTS ine_m AS SELECT id FROM emp
+
+query I
+SELECT * FROM ine_m
+----
+2
+
+# Matview IF NOT EXISTS over an existing PLAIN view must also no-op — a backing table would
+# otherwise silently shadow the view (audit catch).
+statement ok
+CREATE MATERIALIZED VIEW IF NOT EXISTS ine_v AS SELECT id FROM emp
+
+query I
+SELECT * FROM ine_v
+----
+1

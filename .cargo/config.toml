@@ -1,0 +1,37 @@
+# NusaDB cargo aliases and build profile flags.
+
+[alias]
+# Per-crate test shortcuts
+test-core       = "test -p nusadb-core"
+test-storage    = "test -p nusadb-storage"
+test-wal        = "test -p nusadb-wal"
+test-btree      = "test -p nusadb-btree"
+test-sql        = "test -p nusadb-sql"
+test-wire       = "test -p nusadb-wire"
+
+# Combined checks
+ck              = "check --workspace --all-targets"
+lint            = "clippy --workspace --all-targets -- -D warnings"
+fmt-check       = "fmt --all -- --check"
+audit           = "deny check"
+
+# Common operations
+test-all        = "test --workspace --all-targets"
+bench-all       = "bench --workspace"
+docs            = "doc --workspace --no-deps --open"
+# Mini-Jepsen concurrency sweep: >=200 seeded concurrent histories; SERIALIZABLE must
+# serialize each into an acyclic Elle DSG.
+jepsen-sweep    = "test -p nusadb-btree --release --test test_elle_dsg jepsen_sweep_full -- --ignored --nocapture"
+# DST recovery-invariant sweep: replay the engine WAL from fine-grained byte prefixes;
+# every cut must recover to a committed-history prefix (see test_dst_invariants.rs).
+dst-invariants  = "test -p nusadb-btree --release --test test_dst_invariants wal_prefix_replay_full_sweep -- --ignored --nocapture"
+# TPC-C throughput baseline: timed spec-mix workload across storage x isolation x
+# workers; record the numbers (with the hardware spec).
+tpcc-bench      = "test -p nusadb-btree --release --test test_tpcc tpcc_perf_baseline -- --ignored --nocapture"
+
+[target.x86_64-unknown-linux-gnu]
+# Use lld for faster link times on Linux dev/CI
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[net]
+git-fetch-with-cli = true

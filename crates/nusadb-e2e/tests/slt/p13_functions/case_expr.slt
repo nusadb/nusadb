@@ -1,0 +1,68 @@
+# p13_functions/case_expr — CASE expression: searched and simple forms.
+
+statement ok
+CREATE TABLE g (id INT, n INT)
+
+statement ok
+INSERT INTO g VALUES (1, -5), (2, 0), (3, 7)
+
+# Searched CASE: first matching WHEN wins, ELSE otherwise.
+query IT
+SELECT id, CASE WHEN n < 0 THEN 'neg' WHEN n = 0 THEN 'zero' ELSE 'pos' END FROM g ORDER BY id
+----
+1 neg
+2 zero
+3 pos
+
+# Simple CASE: compares the operand against each WHEN value.
+query IT
+SELECT id, CASE n WHEN 0 THEN 'z' ELSE 'nz' END FROM g ORDER BY id
+----
+1 nz
+2 z
+3 nz
+
+# CASE with no ELSE yields NULL when nothing matches.
+query IT
+SELECT id, CASE WHEN n > 0 THEN 'pos' END FROM g ORDER BY id
+----
+1 NULL
+2 NULL
+3 pos
+
+# --- A bare NULL branch takes the type unified from the other branches (Q-CASE-NULL-INFER). A first
+# THEN of NULL must not make the CASE an "ambiguous NULL" error when a later branch is typed. ---
+
+# THEN NULL with a typed ELSE: the result type comes from ELSE, the value is NULL.
+query I
+SELECT CASE WHEN false THEN NULL ELSE 1 END
+----
+1
+
+# The unified type is usable downstream (it is INT, not an error): the CASE participates in arithmetic.
+query I
+SELECT CASE WHEN false THEN NULL ELSE 1 END + 10
+----
+11
+
+# A NULL THEN over a real column unifies with the typed ELSE column (INT); rows with n > 0 are NULL.
+query II
+SELECT id, CASE WHEN n > 0 THEN NULL ELSE n END FROM g ORDER BY id
+----
+1 -5
+2 0
+3 NULL
+
+# Every branch NULL: the CASE is an untyped NULL (materialized as text), value NULL — not an error.
+query T
+SELECT CASE WHEN true THEN NULL ELSE NULL END
+----
+NULL
+
+# A NULL THEN earlier than the typed branch still unifies (deferred until the type is known).
+query T
+SELECT CASE WHEN n < 0 THEN NULL WHEN n = 0 THEN 'zero' ELSE 'pos' END FROM g ORDER BY id
+----
+NULL
+zero
+pos

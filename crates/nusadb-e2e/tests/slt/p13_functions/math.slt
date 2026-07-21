@@ -1,0 +1,626 @@
+# p13_functions/math — math built-ins (-56): numeric arithmetic, trig, random.
+#
+# Covers: ABS, ROUND, CEIL, FLOOR, SIGN, MOD, POWER, SQRT, LN, LOG, EXP,
+#         SIN, COS, TAN, RANDOM/SETSEED.
+# Integer, Float, and NUMERIC forms where applicable.
+
+# --- ABS ---
+query I
+SELECT ABS(-5)
+----
+5
+
+query I
+SELECT ABS(3)
+----
+3
+
+query T
+SELECT CAST(ABS(-3.5) AS TEXT)
+----
+3.5
+
+# --- ROUND ---
+query I
+SELECT ROUND(42)
+----
+42
+
+query T
+SELECT ROUND(3.756, 2)
+----
+3.76
+
+# --- CEIL / FLOOR (integer input preserves integer type) ---
+query I
+SELECT CEIL(5)
+----
+5
+
+query I
+SELECT FLOOR(4)
+----
+4
+
+query I
+SELECT CEIL(-3)
+----
+-3
+
+query I
+SELECT FLOOR(-4)
+----
+-4
+
+# --- SIGN ---
+query I
+SELECT SIGN(5)
+----
+1
+
+query I
+SELECT SIGN(0)
+----
+0
+
+query I
+SELECT SIGN(-8)
+----
+-1
+
+# --- MOD ---
+query I
+SELECT MOD(10, 3)
+----
+1
+
+query I
+SELECT MOD(7, 2)
+----
+1
+
+# --- POWER ---
+query R
+SELECT POWER(2, 3)
+----
+8.000
+
+query R
+SELECT POWER(9, 0.5)
+----
+3.000
+
+# --- SQRT ---
+query R
+SELECT SQRT(25)
+----
+5.000
+
+query R
+SELECT SQRT(2)
+----
+1.414
+
+# A negative argument is out of domain — raised, not a silent NaN (B-fn).
+statement error
+SELECT SQRT(-1)
+
+# LN / LOG of a non-positive value, and ASIN/ACOS outside [-1, 1], also raise.
+statement error
+SELECT LN(0)
+
+statement error
+SELECT LN(-5)
+
+statement error
+SELECT LOG(0)
+
+statement error
+SELECT ASIN(2)
+
+statement error
+SELECT ACOS(-3)
+
+# --- LN / LOG ---
+query R
+SELECT LN(1)
+----
+0.000
+
+query R
+SELECT LOG(100)
+----
+2.000
+
+query R
+SELECT LN(2.71828)
+----
+1.000
+
+# --- EXP ---
+query R
+SELECT EXP(0)
+----
+1.000
+
+query R
+SELECT EXP(1)
+----
+2.718
+
+# --- SIN / COS / TAN ---
+query R
+SELECT SIN(0)
+----
+0.000
+
+query R
+SELECT COS(0)
+----
+1.000
+
+query R
+SELECT TAN(0)
+----
+0.000
+
+# --- CBRT ---
+query R
+SELECT CBRT(27)
+----
+3.000
+
+query R
+SELECT CBRT(8)
+----
+2.000
+
+# --- PI (niladic constant) ---
+query R
+SELECT PI()
+----
+3.142
+
+# --- DEGREES / RADIANS (round-trip via PI) ---
+query R
+SELECT DEGREES(PI())
+----
+180.000
+
+query R
+SELECT RADIANS(180)
+----
+3.142
+
+# --- TRUNC (truncates toward zero, preserves the numeric type) ---
+query I
+SELECT TRUNC(15)
+----
+15
+
+query T
+SELECT CAST(TRUNC(42.987) AS TEXT)
+----
+42
+
+query T
+SELECT CAST(TRUNC(42.987, 2) AS TEXT)
+----
+42.98
+
+query T
+SELECT CAST(TRUNC(-42.987) AS TEXT)
+----
+-42
+
+# --- RANDOM / SETSEED (check SETSEED returns success) ---
+statement ok
+SELECT SETSEED(0.5)
+
+# --- NULL propagation ---
+query T
+SELECT ABS(NULL)
+----
+NULL
+
+query T
+SELECT ROUND(NULL)
+----
+NULL
+
+query T
+SELECT SQRT(NULL)
+----
+NULL
+
+query T
+SELECT SIGN(NULL)
+----
+NULL
+
+query T
+SELECT MOD(NULL, 1)
+----
+NULL
+
+query T
+SELECT POWER(NULL, 2)
+----
+NULL
+
+query T
+SELECT LN(NULL)
+----
+NULL
+
+query T
+SELECT SIN(NULL)
+----
+NULL
+
+query T
+SELECT CBRT(NULL)
+----
+NULL
+
+query T
+SELECT TRUNC(NULL)
+----
+NULL
+
+# --- SINH / COSH / TANH ---
+query R
+SELECT SINH(0)
+----
+0.000
+
+query R
+SELECT COSH(0)
+----
+1.000
+
+query R
+SELECT TANH(0)
+----
+0.000
+
+# --- COT / ASINH / ACOSH / ATANH ---
+# COT(pi/4) = 1.
+query R
+SELECT COT(PI() / 4)
+----
+1.000
+
+# Inverse hyperbolics invert their counterparts at 0 / 1.
+query R
+SELECT ASINH(0)
+----
+0.000
+
+query R
+SELECT ACOSH(1)
+----
+0.000
+
+query R
+SELECT ATANH(0)
+----
+0.000
+
+# ASINH(SINH(x)) round-trips back to x.
+query R
+SELECT ASINH(SINH(2))
+----
+2.000
+
+# --- GCD / LCM ---
+query I
+SELECT GCD(12, 18)
+----
+6
+
+query I
+SELECT GCD(-12, 18)
+----
+6
+
+query I
+SELECT LCM(4, 6)
+----
+12
+
+query I
+SELECT LCM(0, 5)
+----
+0
+
+query T
+SELECT GCD(NULL, 6)
+----
+NULL
+
+# --- DIV / TO_HEX ---
+# DIV truncates toward zero.
+query I
+SELECT DIV(17, 5)
+----
+3
+
+query I
+SELECT DIV(-17, 5)
+----
+-3
+
+# A zero divisor is an error.
+statement error
+SELECT DIV(1, 0)
+
+# TO_HEX renders the integer in lowercase hexadecimal.
+query T
+SELECT TO_HEX(255)
+----
+ff
+
+query T
+SELECT TO_HEX(4096)
+----
+1000
+
+# NULL propagates.
+query T
+SELECT DIV(NULL, 2)
+----
+NULL
+
+# --- WIDTH_BUCKET ---
+# Five equi-width buckets over [0, 10): 5 lands in bucket 3.
+query I
+SELECT WIDTH_BUCKET(5, 0, 10, 5)
+----
+3
+
+# Below the range yields 0.
+query I
+SELECT WIDTH_BUCKET(-1, 0, 10, 5)
+----
+0
+
+# At/above the high bound yields count + 1.
+query I
+SELECT WIDTH_BUCKET(10, 0, 10, 5)
+----
+6
+
+# Descending bounds are supported.
+query I
+SELECT WIDTH_BUCKET(5, 10, 0, 5)
+----
+3
+
+# A non-positive bucket count is an error.
+statement error
+SELECT WIDTH_BUCKET(5, 0, 10, 0)
+
+# NULL propagates.
+query T
+SELECT WIDTH_BUCKET(NULL, 0, 10, 5)
+----
+NULL
+
+# --- Bitwise & | ---
+# 12 = 1100b, 10 = 1010b: AND = 1000b = 8.
+query I
+SELECT 12 & 10
+----
+8
+
+# OR = 1110b = 14.
+query I
+SELECT 12 | 10
+----
+14
+
+# Bitwise operators propagate NULL.
+query T
+SELECT NULL & 1
+----
+NULL
+
+# A non-integer operand is rejected.
+statement error
+SELECT 1.5 & 2
+
+# --- Bit-shifts << / >> (B-fn) ---
+# 1 << 4 = 16; 255 >> 4 = 15 (arithmetic right shift).
+query I
+SELECT 1 << 4
+----
+16
+
+query I
+SELECT 255 >> 4
+----
+15
+
+# A right shift is sign-preserving (arithmetic): -8 >> 1 = -4.
+query I
+SELECT -8 >> 1
+----
+-4
+
+# Shifts propagate NULL and reject a non-integer operand.
+query T
+SELECT NULL << 2
+----
+NULL
+
+statement error
+SELECT 1.5 << 2
+
+# --- Array overlap && (B-fn) ---
+# Shares the element 2 -> TRUE (renders 1); disjoint -> FALSE (renders 0).
+query T
+SELECT ARRAY[1, 2, 3] && ARRAY[3, 4]
+----
+1
+
+query T
+SELECT ARRAY[1, 2] && ARRAY[8, 9]
+----
+0
+
+# A NULL array operand propagates NULL.
+query T
+SELECT CAST(ARRAY[1, 2] && CAST(NULL AS INT[]) AS TEXT)
+----
+NULL
+
+# --- FACTORIAL ---
+query I
+SELECT FACTORIAL(5)
+----
+120
+
+query I
+SELECT FACTORIAL(0)
+----
+1
+
+# 20! is the largest factorial that fits in a 64-bit integer.
+query I
+SELECT FACTORIAL(20)
+----
+2432902008176640000
+
+# A negative argument is undefined.
+statement error
+SELECT FACTORIAL(-1)
+
+# 21! overflows i64.
+statement error
+SELECT FACTORIAL(21)
+
+# NULL propagates.
+query T
+SELECT FACTORIAL(NULL)
+----
+NULL
+
+# --- BIT_COUNT (population count) ---
+# 7 = 0b111 has 3 set bits.
+query I
+SELECT BIT_COUNT(7)
+----
+3
+
+query I
+SELECT BIT_COUNT(0)
+----
+0
+
+# A power of two has a single set bit.
+query I
+SELECT BIT_COUNT(1024)
+----
+1
+
+# -1 is all ones in two's complement: 64 set bits.
+query I
+SELECT BIT_COUNT(-1)
+----
+64
+
+query T
+SELECT CAST(BIT_COUNT(NULL) AS TEXT)
+----
+NULL
+
+# --- SCALE / MIN_SCALE / TRIM_SCALE (B-fn) ---
+# SCALE reports the declared fractional-digit count; MIN_SCALE the fewest digits actually needed.
+query I
+SELECT SCALE(CAST(12.340 AS NUMERIC(6,3)))
+----
+3
+
+query I
+SELECT MIN_SCALE(CAST(12.340 AS NUMERIC(6,3)))
+----
+2
+
+# A whole number needs scale 0.
+query I
+SELECT MIN_SCALE(CAST(120 AS NUMERIC(6,3)))
+----
+0
+
+# TRIM_SCALE drops the trailing fractional zeros, denoting the same number.
+query T
+SELECT TRIM_SCALE(CAST(12.340 AS NUMERIC(6,3)))
+----
+12.34
+
+query T
+SELECT CAST(SCALE(NULL) AS TEXT)
+----
+NULL
+
+# --- ISFINITE (B-fn) — every representable NUMERIC / temporal value is finite ---
+query T
+SELECT ISFINITE(CAST(1.5 AS NUMERIC))
+----
+1
+
+query T
+SELECT ISFINITE(TIMESTAMP '2024-06-15 00:00:00')
+----
+1
+
+query T
+SELECT ISFINITE(INTERVAL '1 day')
+----
+1
+
+query T
+SELECT CAST(ISFINITE(CAST(NULL AS TIMESTAMP)) AS TEXT)
+----
+NULL
+
+# --- TO_NUMBER (B-fn) — read digits/sign/decimal, ignore group separators + padding ---
+query T
+SELECT TO_NUMBER('12,345.67', '99G999D99')
+----
+12345.67
+
+# Currency, spaces, and padding are ignored; the trailing fractional zero is kept.
+query T
+SELECT TO_NUMBER('$1,234.50', 'L9G999D99')
+----
+1234.50
+
+# A leading sign makes the result negative.
+query T
+SELECT TO_NUMBER('-42', 'S99')
+----
+-42
+
+# The angle-bracket PR form is also negative.
+query T
+SELECT TO_NUMBER('<12>', '99PR')
+----
+-12
+
+# A plain integer with no decimal.
+query T
+SELECT TO_NUMBER('48', '99')
+----
+48
+
+# Text with no digits is rejected.
+statement error
+SELECT TO_NUMBER('abc', '99')
+
+# NULL propagates.
+query T
+SELECT CAST(TO_NUMBER(NULL, '99') AS TEXT)
+----
+NULL

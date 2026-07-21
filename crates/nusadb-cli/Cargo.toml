@@ -1,0 +1,29 @@
+[package]
+name         = "nusadb-cli"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "nusa-cli — interactive SQL shell for NusaDB"
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nusa-cli"
+path = "src/main.rs"
+
+[dependencies]
+nusadb-wire  = { workspace = true }
+clap         = { workspace = true }
+rustyline    = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+rustls       = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[dev-dependencies]
+nusadb-core = { workspace = true }
+nusadb-btree = { workspace = true }

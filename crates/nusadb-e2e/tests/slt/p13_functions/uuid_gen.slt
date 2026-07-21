@@ -1,0 +1,35 @@
+# uuid_generate_v4()
+# Niladic function returning a random UUID v4 per call.
+# SLT format: expected values must be literals, not regex patterns.
+
+# Basic: returns a non-NULL UUID (IS NOT NULL → true → 1)
+query I
+SELECT uuid_generate_v4() IS NOT NULL
+----
+1
+
+# Two consecutive calls produce different UUIDs
+query I
+SELECT uuid_generate_v4() <> uuid_generate_v4()
+----
+1
+
+# Can be cast to text; length check (36 chars for 8-4-4-4-12 format)
+query I
+SELECT length(CAST(uuid_generate_v4() AS TEXT)) = 36
+----
+1
+
+# The ~ (regex match) operator confirms the UUID v4 format:
+# 8 hex chars, 4 hex chars, 4-hex-char-with-4-version, 4-hex-char, 12 hex chars
+query I
+SELECT uuid_generate_v4()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+----
+1
+
+# gen_random_uuid() is an alias for the same function (the modern built-in name)
+# and must produce the same v4 format.
+query I
+SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+----
+1

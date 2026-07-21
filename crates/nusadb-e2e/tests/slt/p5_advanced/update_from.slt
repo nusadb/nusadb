@@ -1,0 +1,90 @@
+# p5_advanced/update_from — UPDATE ... FROM <table>.
+#
+# A single FROM table joins into the UPDATE: the SET values and WHERE may reference its columns. A
+# target row with no matching FROM row is left unchanged. Covers: copy-from-source, expression over
+# target+from, aliasing, no-match, and multi-row.
+
+statement ok
+CREATE TABLE t (id INT, name TEXT, score INT)
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)
+
+statement ok
+CREATE TABLE src (id INT, bonus INT)
+
+statement ok
+INSERT INTO src VALUES (1, 10), (2, 20)
+
+# Copy a value from the matching FROM row; the unmatched row (id 3) is untouched.
+statement ok
+UPDATE t SET score = src.bonus FROM src WHERE t.id = src.id
+
+query ITI
+SELECT id, name, score FROM t ORDER BY id
+----
+1 a 10
+2 b 20
+3 c 3
+
+# An expression over both the target and the FROM row.
+statement ok
+UPDATE t SET score = score + src.bonus FROM src WHERE t.id = src.id
+
+query ITI
+SELECT id, name, score FROM t ORDER BY id
+----
+1 a 20
+2 b 40
+3 c 3
+
+# A derived FROM source — `(SELECT ...)` / `(VALUES ...)` — is supported: it updates the
+# matching target row (id 1 -> name 'X'); other rows are untouched.
+statement ok
+UPDATE t SET name = s.tag FROM (SELECT 1 AS id, 'X' AS tag) AS s WHERE t.id = s.id
+
+query ITI
+SELECT id, name, score FROM t ORDER BY id
+----
+1 X 20
+2 b 40
+3 c 3
+
+# A self-referential FROM via an alias.
+statement ok
+CREATE TABLE u (id INT, v INT)
+
+statement ok
+INSERT INTO u VALUES (1, 5), (2, 7)
+
+statement ok
+UPDATE u SET v = u2.v FROM u u2 WHERE u.id = 1 AND u2.id = 2
+
+query II
+SELECT id, v FROM u ORDER BY id
+----
+1 7
+2 7
+
+# --- UPDATE with an aliased target table (UPDATE t AS x ... WHERE x.col ...) ---
+statement ok
+CREATE TABLE ut (id INT, n INT)
+
+statement ok
+CREATE TABLE us (id INT, n INT)
+
+statement ok
+INSERT INTO ut VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO us VALUES (1, 100), (2, 200)
+
+# The target is referenced by its alias `x` (which shadows the table name).
+statement ok
+UPDATE ut AS x SET n = us.n FROM us WHERE x.id = us.id
+
+query II
+SELECT id, n FROM ut ORDER BY id
+----
+1 100
+2 200

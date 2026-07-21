@@ -1,0 +1,22 @@
+[package]
+name         = "nusadb-sim"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "Deterministic Simulation Testing (DST) infrastructure: SimStorage, SimClock, SimRng, fault injection"
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+nusadb-core = { workspace = true }
+thiserror   = { workspace = true }
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+proptest    = { workspace = true }

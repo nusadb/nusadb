@@ -1,0 +1,156 @@
+# name: CI
+
+# on:
+#   push:
+#     branches: [master]
+#   pull_request:
+#     branches: [master]
+#   workflow_dispatch: # allow manual trigger from GitHub UI
+
+# concurrency:
+#   group: ${{ github.workflow }}-${{ github.ref }}
+#   cancel-in-progress: true
+
+# # Least-privilege default; individual jobs widen if needed.
+# permissions:
+#   contents: read
+
+# env:
+#   CARGO_TERM_COLOR: always
+#   RUSTFLAGS: "-D warnings"
+#   RUSTDOCFLAGS: "-D warnings"
+#   RUST_BACKTRACE: 1
+
+# jobs:
+#   fmt:
+#     name: Format check
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#         with:
+#           components: rustfmt
+#       - run: cargo fmt --all -- --check
+
+#   clippy:
+#     name: Clippy lint
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#         with:
+#           components: clippy
+#       - uses: Swatinem/rust-cache@v2
+#       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+#   build:
+#     name: Build (release)
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#       - uses: Swatinem/rust-cache@v2
+#       - name: Build project
+#         run: cargo build --workspace --release --verbose
+
+#   test:
+#     name: Test (${{ matrix.os }})
+#     runs-on: ${{ matrix.os }}
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         os: [ubuntu-latest, windows-latest, macos-latest]
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#       - uses: Swatinem/rust-cache@v2
+#       # --all-targets does NOT run doctests, so run them separately.
+#       - name: Run tests (lib, bins, integration)
+#         run: cargo test --workspace --all-targets --all-features --no-fail-fast
+#       - name: Run doctests
+#         run: cargo test --workspace --doc --all-features
+
+#   # Verifies the crate compiles against the supported compiler (the toolchain the project pins
+#   # in rust-toolchain.toml / Cargo `rust-version`). The codebase uses 1.95 features (let-else,
+#   # is_multiple_of, edition 2024), so 1.95 is the real MSRV — not an older floor.
+#   msrv:
+#     name: MSRV check
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#       - uses: Swatinem/rust-cache@v2
+#       - run: cargo check --workspace --all-features
+
+#   audit:
+#     name: Dependency audit
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: EmbarkStudios/cargo-deny-action@v2
+#         with:
+#           command: check all
+
+#   docs:
+#     name: Doc build
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#       - uses: Swatinem/rust-cache@v2
+#       - run: cargo doc --workspace --no-deps --all-features
+#         # RUSTDOCFLAGS is set globally above so warnings fail the build.
+
+#   dst-regressions:
+#     name: DST known-bad seed replay
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.95
+#       - uses: Swatinem/rust-cache@v2
+#       # The DST harness lives in nusadb-btree; it replays the checked-in known-bad seeds.
+#       - name: Replay known-bad seeds
+#         run: cargo test -p nusadb-btree --release --test test_dst_invariants
+
+#   # Builds the production image and proves the container actually starts and serves. A `cargo`-only
+#   # gate misses Dockerfile / entrypoint breaks (a wrong binary name, or a CRLF shebang from a Windows
+#   # checkout that makes `exec docker-entrypoint.sh` fail) — exactly the kind that has reached master.
+#   docker:
+#     name: Docker image smoke
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Build image
+#         run: docker build -t nusadb:ci .
+#       - name: Start container and run a query
+#         run: |
+#           docker run -d --name nusadb-ci -p 5433:5433 nusadb:ci
+#           ok=0
+#           for _ in $(seq 1 30); do
+#             if docker exec nusadb-ci nusa-cli --host 127.0.0.1:5433 --command "SELECT 1" >/dev/null 2>&1; then
+#               ok=1; break
+#             fi
+#             sleep 1
+#           done
+#           docker logs nusadb-ci
+#           docker rm -f nusadb-ci >/dev/null 2>&1 || true
+#           if [ "$ok" != "1" ]; then
+#             echo "::error::container did not serve a query within 30s (entrypoint/server broken)"
+#             exit 1
+#           fi
+#           echo "docker image starts and serves SELECT 1"
+
+#   # Aggregate gate so branch protection only needs one required check.
+#   ci-success:
+#     name: CI success
+#     if: always()
+#     needs: [fmt, clippy, build, test, msrv, audit, docs, dst-regressions, docker]
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Verify all jobs succeeded
+#         run: |
+#           if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+#             echo "One or more CI jobs failed."
+#             exit 1
+#           fi
+#           echo "All CI jobs passed."

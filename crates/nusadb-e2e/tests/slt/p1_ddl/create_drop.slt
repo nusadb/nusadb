@@ -1,0 +1,191 @@
+# p1_ddl/create_drop — CREATE TABLE and DROP TABLE basics.
+
+# Plain CREATE TABLE
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT)
+
+# Duplicate without IF NOT EXISTS is rejected
+statement error
+CREATE TABLE t (id INT)
+
+# IF NOT EXISTS lets the redundant CREATE pass
+statement ok
+CREATE TABLE IF NOT EXISTS t (id INT)
+
+# Catalog actually has the table
+statement ok
+INSERT INTO t (id, name) VALUES (1, 'x')
+
+query IT
+SELECT id, name FROM t
+----
+1  x
+
+# Plain DROP TABLE
+statement ok
+DROP TABLE t
+
+# Dropping again without IF EXISTS errors
+statement error
+DROP TABLE t
+
+# IF EXISTS makes the redundant DROP a no-op
+statement ok
+DROP TABLE IF EXISTS t
+
+# Querying a dropped table errors
+statement error
+SELECT id FROM t
+
+# DDL with several columns of every supported scalar type
+statement ok
+CREATE TABLE every_type (
+  i  INT NOT NULL,
+  f  FLOAT,
+  s  TEXT,
+  b  BOOL
+)
+
+statement ok
+INSERT INTO every_type VALUES (1, 1.5, 'hello', TRUE)
+
+query IRTI
+SELECT i, f, s, b FROM every_type
+----
+1  1.500  hello  1
+
+statement ok
+DROP TABLE every_type
+
+# --- DROP TABLE cascade-drops the table's RLS policies + enabled marker (Q15-ORPHAN) ---
+statement ok
+CREATE TABLE rp (id INT, owner TEXT)
+
+statement ok
+ALTER TABLE rp ENABLE ROW LEVEL SECURITY
+
+statement ok
+CREATE POLICY p1 ON rp USING (owner = current_user)
+
+statement ok
+DROP TABLE rp
+
+# A same-named table can re-create the same policy — the old one was not orphaned.
+statement ok
+CREATE TABLE rp (id INT, owner TEXT)
+
+statement ok
+CREATE POLICY p1 ON rp USING (owner = current_user)
+
+statement ok
+DROP TABLE rp
+
+# --- CREATE / ALTER DATABASE: single-database compatibility no-op (accepted so ecosystem scripts run)
+statement ok
+CREATE DATABASE app
+
+# Repeating it is fine (no-op), with or without IF NOT EXISTS.
+statement ok
+CREATE DATABASE app
+
+statement ok
+CREATE DATABASE IF NOT EXISTS app
+
+# ALTER DATABASE is accepted and ignored (no database-level options in a single-database engine).
+statement ok
+ALTER DATABASE app OWNER TO someone
+
+# CREATE DATABASE creates no real database/relation, so the name is not a table.
+statement error
+SELECT * FROM app
+
+# --- DROP DATABASE: empties the single database's tables (NusaDB extension) — but ONLY when the
+# dropped name matches the current database (`nusadb`). Dropping any other name is a no-op (parity
+# with a multi-database server). (The backup table name carries a datetime, so its exact name is
+# asserted in the Rust e2e test rather than here.)
+statement ok
+CREATE TABLE keep_me (id INT NOT NULL)
+
+statement ok
+INSERT INTO keep_me VALUES (1)
+
+# A non-current database name is a no-op — the table survives.
+statement ok
+DROP DATABASE app
+
+query I
+SELECT id FROM keep_me
+----
+1
+
+# Dropping the current database empties its tables (keep_me is backed up first).
+statement ok
+DROP DATABASE nusadb
+
+statement error
+SELECT * FROM keep_me
+
+# DROP DATABASE nusadb FORCE (canonical) drops permanently, without a backup.
+statement ok
+CREATE TABLE temp_t (id INT NOT NULL)
+
+statement ok
+DROP DATABASE nusadb FORCE
+
+statement error
+SELECT * FROM temp_t
+
+# The FIX DROP DATABASE alias is also accepted (same no-backup behavior).
+statement ok
+CREATE TABLE temp_u (id INT NOT NULL)
+
+statement ok
+FIX DROP DATABASE nusadb
+
+statement error
+SELECT * FROM temp_u
+
+# --- DROP SCHEMA RESTRICT / CASCADE (NS3) ---
+statement ok
+CREATE SCHEMA s1
+
+# Plain DROP SCHEMA (RESTRICT default) drops an empty schema.
+statement ok
+DROP SCHEMA s1
+
+# Dropping a missing schema without IF EXISTS errors; IF EXISTS makes it a no-op.
+statement error
+DROP SCHEMA s1
+
+statement ok
+DROP SCHEMA IF EXISTS s1
+
+# CASCADE and explicit RESTRICT are both accepted on a schema.
+statement ok
+CREATE SCHEMA s2
+
+statement ok
+DROP SCHEMA s2 CASCADE
+
+statement ok
+CREATE SCHEMA s3
+
+statement ok
+DROP SCHEMA s3 RESTRICT
+
+# DROP TABLE ... CASCADE is now supported (Q-DROP-CASCADE — see drop_cascade.slt for the FK
+# semantics); CASCADE stays rejected for object kinds that track no dependencies.
+statement ok
+CREATE TABLE casc (id INT)
+
+statement ok
+DROP TABLE casc CASCADE
+
+statement ok
+CREATE TABLE casc2 (id INT)
+
+statement error
+DROP VIEW casc2 CASCADE
+
+statement ok
+DROP TABLE casc2

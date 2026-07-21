@@ -1,0 +1,169 @@
+# p1_ddl/varchar_length — VARCHAR(n) / CHAR(n) length is enforced (D3, friend-QA R44) and the
+# declared type round-trips in DDL.
+#
+# VARCHAR(n)/CHAR(n) are stored as TEXT but keep n so `SHOW COLUMNS` reports the declared type; the
+# length is enforced by a desugared CHECK (length(col) <= n). A present value over the limit is
+# rejected; NULL is allowed; an unbounded VARCHAR (no length) imposes no limit and reports as TEXT.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, s VARCHAR(5))
+
+# The declared character type round-trips in catalog introspection (not collapsed to TEXT).
+# SHOW COLUMNS reports (column, type, nullable) in declaration order; nullable renders 1/0.
+query TTI
+SHOW COLUMNS FROM t
+----
+id INT 0
+s VARCHAR(5) 1
+
+# Within the limit (and exactly at it) — accepted.
+statement ok
+INSERT INTO t VALUES (1, 'abc')
+
+statement ok
+INSERT INTO t VALUES (2, 'abcde')
+
+# NULL is allowed (CHECK is not violated by NULL).
+statement ok
+INSERT INTO t VALUES (3, NULL)
+
+# Over the limit — rejected.
+statement error
+INSERT INTO t VALUES (4, 'abcdef')
+
+# UPDATE that would exceed the limit is also rejected.
+statement error
+UPDATE t SET s = 'waytoolong' WHERE id = 1
+
+# Only the rows that satisfied the constraint are present.
+query IT
+SELECT id, s FROM t ORDER BY id
+----
+1 abc
+2 abcde
+3 NULL
+
+# --- CHAR(n): blank-padded (bpchar) — trailing blanks are insignificant for length, equality, and
+# the length limit (a value overflowing only by trailing blanks is accepted; non-blank overflow is
+# rejected). Stored in canonical form (trailing blanks stripped). ---
+statement ok
+CREATE TABLE c (k CHAR(3))
+
+# CHAR(n) round-trips as CHAR(n), not TEXT.
+query TTI
+SHOW COLUMNS FROM c
+----
+k CHAR(3) 1
+
+statement ok
+INSERT INTO c VALUES ('ab')
+
+# A value that fits after trimming trailing blanks is accepted (blank-padded: char(3) 'abc ' -> 'abc').
+statement ok
+INSERT INTO c VALUES ('abc ')
+
+# Trailing blanks do not count toward the limit: 'ab   ' trims to 'ab' (2 <= 3).
+statement ok
+INSERT INTO c VALUES ('ab   ')
+
+# Non-blank overflow is still rejected.
+statement error
+INSERT INTO c VALUES ('abcd')
+
+# Stored canonically (trailing blanks stripped): length() ignores them and equality trims.
+# The 'ab' and 'ab   ' rows both store 'ab', so both match `k = 'ab'`, each with length 2.
+query I
+SELECT length(k) FROM c WHERE k = 'ab' ORDER BY k
+----
+2
+2
+
+query I
+SELECT count(*) FROM c WHERE k = 'ab'
+----
+2
+
+# --- CHAR(n) column bpchar end-to-end: length / equality / DISTINCT / GROUP BY all see the canonical
+# (trimmed) value, so trailing blanks never split a group or inflate a distinct count (QA pin
+# Q-CHAR-COLUMN-BPCHAR). 'ab', 'ab ', 'ab   ' all store 'ab'; 'cd' is the only other value. ---
+statement ok
+CREATE TABLE cb (k CHAR(5))
+
+statement ok
+INSERT INTO cb VALUES ('ab'), ('ab '), ('ab   '), ('cd')
+
+# Every stored CHAR value is trimmed, so length() ignores the trailing blanks of the source literal.
+query I
+SELECT length(k) FROM cb ORDER BY k
+----
+2
+2
+2
+2
+
+# DISTINCT folds the three 'ab' spellings into one value (PARITY: 2 distinct, not 4).
+query I
+SELECT count(DISTINCT k) FROM cb
+----
+2
+
+# Equality matches all three 'ab' rows (PARITY: 3, not 1).
+query I
+SELECT count(*) FROM cb WHERE k = 'ab'
+----
+3
+
+# GROUP BY buckets by the canonical value: {ab, cd} = 2 groups (not 4), with the 'ab' bucket = 3 rows.
+query TI
+SELECT k, count(*) FROM cb GROUP BY k ORDER BY k
+----
+ab  3
+cd  1
+
+# --- CHAR(n) / bpchar CAST: trailing blanks are insignificant for length + equality (QA re-surface).
+# `x::char(n)` truncates to n then trims trailing spaces (its canonical form), so length() ignores
+# trailing blanks and two values comparing equal after trimming are equal — the blank-padded
+# semantics. VARCHAR(n) keeps trailing blanks (varying). ---
+query I
+SELECT length('ab '::char(5))
+----
+2
+
+query I
+SELECT length('x'::char(5))
+----
+1
+
+query I
+SELECT 'x  '::char(5) = 'x'::char(5)
+----
+1
+
+query I
+SELECT 'ab'::char(5) = 'ab   '::char(5)
+----
+1
+
+# A VARCHAR(n) cast preserves trailing blanks (varying semantics), so its length counts them.
+query I
+SELECT length('ab '::varchar(5))
+----
+3
+
+# --- Unbounded VARCHAR (no length) imposes no limit and reports as TEXT ---
+statement ok
+CREATE TABLE u (s VARCHAR)
+
+# A bare VARCHAR (no length) has nothing to round-trip, so it reports as plain TEXT.
+query TTI
+SHOW COLUMNS FROM u
+----
+s TEXT 1
+
+statement ok
+INSERT INTO u VALUES ('a string far longer than any fixed character limit would allow')
+
+query I
+SELECT count(*) FROM u
+----
+1

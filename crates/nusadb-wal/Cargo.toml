@@ -1,0 +1,37 @@
+[package]
+name         = "nusadb-wal"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "L6 — Write-ahead log: append-only segments, CRC32, lz4, crash recovery"
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+nusadb-core = { workspace = true }
+thiserror   = { workspace = true }
+bytes       = { workspace = true }
+bytemuck    = { workspace = true }
+crc32fast   = { workspace = true }
+lz4_flex    = { workspace = true }
+aes-gcm-siv = { workspace = true }
+parking_lot = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+nusadb-test-utils = { workspace = true }
+criterion         = { workspace = true }
+proptest          = { workspace = true }
+tempfile          = { workspace = true }
+
+[[bench]]
+name    = "group_commit"
+harness = false
+
+[[bench]]
+name    = "wal_append"
+harness = false

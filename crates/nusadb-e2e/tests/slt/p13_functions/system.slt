@@ -1,0 +1,37 @@
+# p13_functions/system — System functions.
+# Covers: VERSION(), CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_USER()
+# (CURRENT_USER is already tested in scalar.slt; this file covers it too for completeness.)
+
+# VERSION() returns a non-empty text string.
+query T
+SELECT VERSION()
+----
+NusaDB 0.1.0
+
+# CURRENT_DATABASE() returns the current database name.
+query T
+SELECT CURRENT_DATABASE()
+----
+nusadb
+
+# CURRENT_SCHEMA() returns the current schema name.
+query T
+SELECT CURRENT_SCHEMA()
+----
+public
+
+# CURRENT_USER returns the current session user (bare keyword, no parens — sqlparser keyword).
+query T
+SELECT CURRENT_USER
+----
+nusa-root
+
+# Nested calls are fine: concat with version.
+query T
+SELECT CONCAT('db: ', CURRENT_DATABASE())
+----
+db: nusadb
+
+# All four are niladic (zero arguments); extra arguments are rejected.
+statement error
+SELECT VERSION('extra')

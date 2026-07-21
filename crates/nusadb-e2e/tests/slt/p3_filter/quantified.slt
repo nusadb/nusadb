@@ -1,0 +1,84 @@
+# p3_filter/quantified — quantified comparison over an array literal (B3.11c):
+# x <op> ANY(ARRAY[...]) and x <op> ALL(ARRAY[...]).
+
+statement ok
+CREATE TABLE t (id INT, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 5), (2, 15), (3, 25)
+
+# = ANY: equals some element (membership).
+query I
+SELECT id FROM t WHERE v = ANY(ARRAY[5, 25]) ORDER BY id
+----
+1
+3
+
+# > ALL: greater than every element.
+query I
+SELECT id FROM t WHERE v > ALL(ARRAY[1, 10]) ORDER BY id
+----
+2
+3
+
+# < ANY: less than some element.
+query I
+SELECT id FROM t WHERE v < ANY(ARRAY[10, 20]) ORDER BY id
+----
+1
+2
+
+# <> ALL: distinct from every element.
+query I
+SELECT id FROM t WHERE v <> ALL(ARRAY[5, 15]) ORDER BY id
+----
+3
+
+# Subquery operand (B3.11c): `= ANY((subquery))` is IN, `<> ALL((subquery))` is NOT IN.
+# (sqlparser needs the double parens for a subquery operand.)
+statement ok
+CREATE TABLE nums (n INT)
+
+statement ok
+INSERT INTO nums VALUES (5), (15)
+
+query I
+SELECT id FROM t WHERE v = ANY((SELECT n FROM nums)) ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM t WHERE v <> ALL((SELECT n FROM nums)) ORDER BY id
+----
+3
+
+# Ordering operators over a subquery (B3.11c general form; nums = {5, 15}).
+query I
+SELECT id FROM t WHERE v > ALL((SELECT n FROM nums)) ORDER BY id
+----
+3
+
+query I
+SELECT id FROM t WHERE v > ANY((SELECT n FROM nums)) ORDER BY id
+----
+2
+3
+
+query I
+SELECT id FROM t WHERE v <= ANY((SELECT n FROM nums)) ORDER BY id
+----
+1
+2
+
+# Empty subquery: `> ALL` is vacuously true for every row; `> ANY` is false for every row.
+query I
+SELECT id FROM t WHERE v > ALL((SELECT n FROM nums WHERE n > 100)) ORDER BY id
+----
+1
+2
+3
+
+query I
+SELECT id FROM t WHERE v > ANY((SELECT n FROM nums WHERE n > 100)) ORDER BY id
+----

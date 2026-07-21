@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target
+**/target
+Cargo.lock.bak
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Benchmark outputs
+/criterion
+**/criterion
+
+# Profiling
+*.flamegraph
+*.svg.tmp
+perf.data*
+*.prof
+
+# Logs
+*.log
+logs/
+
+# Local environment
+.env
+.env.local
+*.local.toml
+
+# Local secrets / credentials — never commit
+*.secret
+secrets/

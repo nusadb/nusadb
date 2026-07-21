@@ -1,0 +1,62 @@
+# p3_filter/distinct_on — SELECT DISTINCT ON (cols).
+# Keeps the first row of each distinct (cols) tuple in the ORDER BY ordering. These queries pin the
+# ORDER BY so the surviving row is deterministic; results are checked in order (no rowsort).
+
+statement ok
+CREATE TABLE events (user_id INT, ts INT, action TEXT)
+
+statement ok
+INSERT INTO events VALUES
+  (1, 100, 'login'),
+  (1, 200, 'click'),
+  (1, 150, 'view'),
+  (2, 50,  'login'),
+  (2, 80,  'logout'),
+  (3, 300, 'login')
+
+# Earliest event per user (ORDER BY user_id, ts ASC keeps the smallest ts).
+query IIT
+SELECT DISTINCT ON (user_id) user_id, ts, action FROM events ORDER BY user_id, ts
+----
+1  100  login
+2  50   login
+3  300  login
+
+# Latest event per user (ts DESC keeps the largest ts).
+query IIT
+SELECT DISTINCT ON (user_id) user_id, ts, action FROM events ORDER BY user_id, ts DESC
+----
+1  200  click
+2  80   logout
+3  300  login
+
+# DISTINCT ON over two keys keeps the first row of each (user_id, action) pair.
+query IIT
+SELECT DISTINCT ON (user_id, action) user_id, action, ts
+FROM events ORDER BY user_id, action, ts
+----
+1  click   200
+1  login   100
+1  view    150
+2  login   50
+2  logout  80
+3  login   300
+
+# The number of surviving rows equals the number of distinct keys, regardless of ordering.
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT ON (user_id) user_id FROM events ORDER BY user_id) t
+----
+3
+
+# DISTINCT ON with NULL keys: all NULLs are one group (NULL is not distinct from NULL here).
+statement ok
+CREATE TABLE g (k INT, v INT)
+
+statement ok
+INSERT INTO g VALUES (1, 10), (NULL, 20), (NULL, 30), (1, 5)
+
+query II
+SELECT DISTINCT ON (k) k, v FROM g ORDER BY k, v
+----
+1     5
+NULL  20

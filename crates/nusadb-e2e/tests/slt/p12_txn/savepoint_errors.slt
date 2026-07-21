@@ -1,0 +1,58 @@
+# p12_txn/savepoint_errors — error paths for savepoints (feature).
+# Savepoints require an active explicit transaction; rolling back to / releasing an unknown
+# savepoint is an honest error, not a silent no-op. A failed savepoint op leaves the
+# transaction usable so the client can still COMMIT or ROLLBACK.
+
+statement ok
+CREATE TABLE t (v INT)
+
+# --- savepoint statements outside any transaction are rejected ---
+statement error
+SAVEPOINT sp
+
+statement error
+ROLLBACK TO SAVEPOINT sp
+
+statement error
+RELEASE SAVEPOINT sp
+
+# --- an unknown savepoint name inside a transaction is an error ---
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement error
+ROLLBACK TO SAVEPOINT nope
+
+statement error
+RELEASE SAVEPOINT nope
+
+# the transaction survives the failed savepoint ops; the insert is committed
+statement ok
+COMMIT
+
+query I
+SELECT v FROM t
+----
+1
+
+# --- RELEASE drops the savepoint: releasing / rolling back to the same name then errors ---
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT sp
+
+statement ok
+RELEASE SAVEPOINT sp
+
+statement error
+RELEASE SAVEPOINT sp
+
+statement error
+ROLLBACK TO SAVEPOINT sp
+
+statement ok
+ROLLBACK

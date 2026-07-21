@@ -1,0 +1,22 @@
+# p4_join_agg/sum_bigint_precision — SUM(Int) is exact past 2^53 (R37 E10 regression).
+# Before the fix SUM accumulated in f64, so values above 2^53 (9007199254740992) lost
+# precision and the sum was silently wrong.
+
+statement ok
+CREATE TABLE big (v BIGINT)
+
+# 9007199254740993 = 2^53 + 1 (not representable exactly as f64).
+statement ok
+INSERT INTO big VALUES (9007199254740993), (9007199254740993), (1)
+
+# Exact integer sum = 18014398509481987. An f64 accumulator would round to ...984/...986.
+query I
+SELECT SUM(v) FROM big
+----
+18014398509481987
+
+# Sum of a single large value round-trips exactly.
+query I
+SELECT SUM(v) FROM big WHERE v > 1
+----
+18014398509481986

@@ -1,0 +1,105 @@
+# p12_txn/savepoints_nested — savepoint breadth: nested savepoints,
+# ROLLBACK TO an outer savepoint discarding inner work, RELEASE keeping work,
+# and resuming a transaction after ROLLBACK TO before COMMIT.
+
+statement ok
+CREATE TABLE t (v INT)
+
+# --- nested savepoints: rolling back to the OUTER savepoint discards inner work ---
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+SAVEPOINT outer_sp
+
+statement ok
+INSERT INTO t VALUES (2)
+
+statement ok
+SAVEPOINT inner_sp
+
+statement ok
+INSERT INTO t VALUES (3)
+
+# rollback to the inner savepoint: only (3) is undone
+statement ok
+ROLLBACK TO SAVEPOINT inner_sp
+
+query I
+SELECT v FROM t ORDER BY v
+----
+1
+2
+
+# rollback to the outer savepoint: (2) goes too, (1) stays
+statement ok
+ROLLBACK TO SAVEPOINT outer_sp
+
+query I
+SELECT v FROM t ORDER BY v
+----
+1
+
+statement ok
+COMMIT
+
+query I
+SELECT v FROM t ORDER BY v
+----
+1
+
+# --- RELEASE keeps the work done since the savepoint ---
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT sp
+
+statement ok
+INSERT INTO t VALUES (10)
+
+statement ok
+RELEASE SAVEPOINT sp
+
+statement ok
+COMMIT
+
+query I
+SELECT v FROM t ORDER BY v
+----
+1
+10
+
+# --- ROLLBACK TO SAVEPOINT lets the transaction continue and still COMMIT ---
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (20)
+
+statement ok
+SAVEPOINT sp2
+
+statement ok
+INSERT INTO t VALUES (99)
+
+statement ok
+ROLLBACK TO SAVEPOINT sp2
+
+statement ok
+INSERT INTO t VALUES (21)
+
+statement ok
+COMMIT
+
+# (20) and (21) survive; the savepoint-discarded (99) does not
+query I
+SELECT v FROM t ORDER BY v
+----
+1
+10
+20
+21

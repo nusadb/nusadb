@@ -1,0 +1,285 @@
+# p13_functions/pattern_match — pattern matching functions.
+#
+# Covers: REGEXP_REPLACE, REGEXP_MATCH, LIKE with ESCAPE,
+#         SIMILAR TO, and regex operators ~ / !~.
+
+# --- REGEXP_REPLACE ---
+query T
+SELECT REGEXP_REPLACE('abc123', '[0-9]+', 'X')
+----
+abcX
+
+query T
+SELECT REGEXP_REPLACE('a1b2c3', '[0-9]', '', 'g')
+----
+abc
+
+query T
+SELECT REGEXP_REPLACE('hello world', 'hello', 'HELLO')
+----
+HELLO world
+
+# --- REGEXP_MATCH ---
+query T
+SELECT REGEXP_MATCH('abc', 'a(b)c')
+----
+{b}
+
+query T
+SELECT REGEXP_MATCH('abc', '(a)(b)(c)')
+----
+{a,b,c}
+
+# No match returns NULL
+query T
+SELECT REGEXP_MATCH('abc', '(x)')
+----
+NULL
+
+# --- LIKE with ESCAPE ---
+query T
+SELECT '100%' LIKE '100#%' ESCAPE '#'
+----
+1
+
+query T
+SELECT '100x' LIKE '100#%' ESCAPE '#'
+----
+0
+
+query T
+SELECT 'hello_world' LIKE 'hello#_world' ESCAPE '#'
+----
+1
+
+query T
+SELECT 'hello_world' LIKE 'hello_world'
+----
+1
+
+query T
+SELECT 'helloworld' LIKE 'hello_world'
+----
+0
+
+# --- ILIKE (case-insensitive LIKE) ---
+query T
+SELECT 'Hello' ILIKE 'hello'
+----
+1
+
+query T
+SELECT 'HELLO WORLD' ILIKE 'hello%'
+----
+1
+
+query T
+SELECT 'Hello' ILIKE 'h_llo'
+----
+1
+
+query T
+SELECT 'Hello' ILIKE 'xyz'
+----
+0
+
+query T
+SELECT 'Hello' NOT ILIKE 'world'
+----
+1
+
+query T
+SELECT NULL ILIKE 'abc'
+----
+NULL
+
+# A single `_` matches exactly one character even when a letter's lowercase form has a different
+# length — `'İ'` (U+0130) lowercases to two code points, which a LOWER()-based ILIKE would break
+# (deep-gate #12).
+query T
+SELECT 'İ' ILIKE '_'
+----
+1
+
+# An alphabetic ESCAPE keeps its case under ILIKE: `X` escapes the next char (a literal `z`), and the
+# letters still match case-insensitively — a LOWER()-based ILIKE would lose the escape (deep-gate #12).
+query T
+SELECT 'AZ' ILIKE 'aXz' ESCAPE 'X'
+----
+1
+
+query T
+SELECT 'ay' ILIKE 'aXz' ESCAPE 'X'
+----
+0
+
+# --- SIMILAR TO ---
+query T
+SELECT 'abc' SIMILAR TO 'a%'
+----
+1
+
+query T
+SELECT 'abc' SIMILAR TO 'd%'
+----
+0
+
+query T
+SELECT 'hello' SIMILAR TO 'h(ello|i)'
+----
+1
+
+query T
+SELECT 'hi' SIMILAR TO 'h(ello|i)'
+----
+1
+
+# --- ~ (regex match) ---
+query T
+SELECT 'abc' ~ 'a.c'
+----
+1
+
+query T
+SELECT 'abc' ~ '^x'
+----
+0
+
+query T
+SELECT 'ABC' ~* 'abc'
+----
+1
+
+# --- NULL propagation ---
+query T
+SELECT REGEXP_REPLACE(NULL, '[0-9]+', 'X')
+----
+NULL
+
+query T
+SELECT REGEXP_MATCH(NULL, 'a(b)c')
+----
+NULL
+
+query T
+SELECT NULL LIKE 'abc' ESCAPE '#'
+----
+NULL
+
+query T
+SELECT 'abc' SIMILAR TO NULL
+----
+NULL
+
+query T
+SELECT NULL ~ 'pattern'
+----
+NULL
+
+# --- REGEXP_LIKE / REGEXP_COUNT / REGEXP_INSTR / REGEXP_SUBSTR ---
+# REGEXP_LIKE renders as 0/1 in the harness.
+query T
+SELECT REGEXP_LIKE('abc123', '[0-9]+')
+----
+1
+
+query T
+SELECT REGEXP_LIKE('abcdef', '[0-9]+')
+----
+0
+
+# Case-insensitive flag.
+query T
+SELECT REGEXP_LIKE('ABC', 'abc', 'i')
+----
+1
+
+# REGEXP_COUNT counts non-overlapping matches.
+query I
+SELECT REGEXP_COUNT('a1b2c3', '[0-9]')
+----
+3
+
+query I
+SELECT REGEXP_COUNT('hello', '[0-9]')
+----
+0
+
+# REGEXP_INSTR is the 1-based position of the first match (0 if none).
+query I
+SELECT REGEXP_INSTR('abc123', '[0-9]+')
+----
+4
+
+query I
+SELECT REGEXP_INSTR('abcdef', '[0-9]+')
+----
+0
+
+# REGEXP_SUBSTR returns the first matched substring, or NULL.
+query T
+SELECT REGEXP_SUBSTR('phone: 555-1234', '[0-9]+-[0-9]+')
+----
+555-1234
+
+query T
+SELECT REGEXP_SUBSTR('no digits here', '[0-9]+')
+----
+NULL
+
+# NULL propagates.
+query T
+SELECT REGEXP_COUNT(NULL, '[0-9]')
+----
+NULL
+
+# --- REGEXP_SPLIT_TO_ARRAY ---
+query T
+SELECT ARRAY_TO_STRING(REGEXP_SPLIT_TO_ARRAY('a1b22c333d', '[0-9]+'), ',')
+----
+a,b,c,d
+
+# A non-matching pattern yields a single-element array with the original string.
+query I
+SELECT ARRAY_LENGTH(REGEXP_SPLIT_TO_ARRAY('hello', ','), 1)
+----
+1
+
+# Splitting on whitespace.
+query T
+SELECT ARRAY_TO_STRING(REGEXP_SPLIT_TO_ARRAY('the quick  brown', '\s+'), '-')
+----
+the-quick-brown
+
+query T
+SELECT CAST(REGEXP_SPLIT_TO_ARRAY(NULL, ',') AS TEXT)
+----
+NULL
+
+# --- REGEXP_SPLIT_TO_TABLE (set-returning) ---
+query T
+SELECT REGEXP_SPLIT_TO_TABLE('a1b22c333d', '[0-9]+')
+----
+a
+b
+c
+d
+
+# Splitting on whitespace with a flag argument.
+query T
+SELECT REGEXP_SPLIT_TO_TABLE('the quick  brown', '\s+')
+----
+the
+quick
+brown
+
+# A non-matching pattern yields a single row with the whole string.
+query T
+SELECT REGEXP_SPLIT_TO_TABLE('hello', ',')
+----
+hello
+
+# A NULL argument yields no rows.
+query T
+SELECT REGEXP_SPLIT_TO_TABLE(NULL, ',')
+----

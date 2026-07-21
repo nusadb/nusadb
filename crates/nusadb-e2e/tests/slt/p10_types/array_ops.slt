@@ -1,0 +1,182 @@
+# p10_types/array_ops — array operators and functions:
+# cardinality, `||` concatenation, ARRAY_AGG, and UNNEST end-to-end.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, tags INT[])
+
+statement ok
+INSERT INTO t VALUES (1, '{10,20,30}'), (2, '{}'), (3, NULL)
+
+# --- cardinality: element count; NULL array -> NULL ---
+query II
+SELECT id, cardinality(tags) FROM t ORDER BY id
+----
+1 3
+2 0
+3 NULL
+
+# --- `||` concatenation: merge, append, prepend (curly-brace array rendering) ---
+query T
+SELECT tags || tags FROM t WHERE id = 1
+----
+{10,20,30,10,20,30}
+
+query T
+SELECT tags || 40 FROM t WHERE id = 1
+----
+{10,20,30,40}
+
+query T
+SELECT 5 || tags FROM t WHERE id = 1
+----
+{5,10,20,30}
+
+# --- UNNEST: one row per element; the scalar column repeats ---
+query II
+SELECT id, unnest(tags) FROM t WHERE id = 1
+----
+1 10
+1 20
+1 30
+
+# --- ARRAY_AGG: collect into an array, NULLs included, empty group -> NULL ---
+statement ok
+CREATE TABLE g (grp INT NOT NULL, v INT)
+
+statement ok
+INSERT INTO g VALUES (1, 10), (1, 20), (1, NULL), (2, 30)
+
+query IT
+SELECT grp, array_agg(v) FROM g GROUP BY grp ORDER BY grp
+----
+1 {10,20,NULL}
+2 {30}
+
+# --- GENERATE_SERIES ---
+query I
+SELECT generate_series(1, 5)
+----
+1
+2
+3
+4
+5
+
+# A custom step.
+query I
+SELECT generate_series(1, 10, 3)
+----
+1
+4
+7
+10
+
+# A negative step counts down.
+query I
+SELECT generate_series(5, 1, -1)
+----
+5
+4
+3
+2
+1
+
+# start past stop yields no rows.
+query I
+SELECT generate_series(5, 1)
+----
+
+# A zero step is an error.
+statement error
+SELECT generate_series(1, 5, 0)
+
+# --- generate_series over a DATE/TIMESTAMP range stepped by an INTERVAL (Q-GENSERIES-DATE) ---
+# A date range steps by the interval, yielding one timestamp per row (a date bound is midnight).
+query T
+SELECT generate_series(DATE '2024-01-01', DATE '2024-01-03', INTERVAL '1 day')
+----
+2024-01-01 00:00:00
+2024-01-02 00:00:00
+2024-01-03 00:00:00
+
+# A timestamp range with a sub-day step.
+query T
+SELECT generate_series(TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2024-01-01 06:00:00', INTERVAL '2 hours')
+----
+2024-01-01 00:00:00
+2024-01-01 02:00:00
+2024-01-01 04:00:00
+2024-01-01 06:00:00
+
+# A month step (non-uniform) walks calendar months.
+query T
+SELECT generate_series(DATE '2024-01-15', DATE '2024-03-15', INTERVAL '1 month')
+----
+2024-01-15 00:00:00
+2024-02-15 00:00:00
+2024-03-15 00:00:00
+
+# A negative step counts down.
+query T
+SELECT generate_series(DATE '2024-01-03', DATE '2024-01-01', INTERVAL '-1 day')
+----
+2024-01-03 00:00:00
+2024-01-02 00:00:00
+2024-01-01 00:00:00
+
+# A zero interval step is an error.
+statement error
+SELECT generate_series(DATE '2024-01-01', DATE '2024-01-03', INTERVAL '0 days')
+
+# --- STRING_TO_TABLE (set-returning) ---
+query T
+SELECT string_to_table('a,b,c', ',')
+----
+a
+b
+c
+
+# A separator absent from the string yields one row (the whole string).
+query T
+SELECT string_to_table('hello', ',')
+----
+hello
+
+# A NULL argument yields no rows.
+query T
+SELECT string_to_table(NULL, ',')
+----
+
+# --- WITH ORDINALITY: a FROM set-returning function gains a 1-based row-number column ---
+# UNNEST WITH ORDINALITY pairs each element with its position.
+query TI
+SELECT x, n FROM unnest(ARRAY['a', 'b', 'c']) WITH ORDINALITY AS u(x, n) ORDER BY n
+----
+a  1
+b  2
+c  3
+
+# generate_series WITH ORDINALITY (the ordinal is the row count, independent of the value).
+query II
+SELECT v, n FROM generate_series(10, 30, 10) WITH ORDINALITY AS g(v, n) ORDER BY n
+----
+10  1
+20  2
+30  3
+
+# With no column alias list, the appended column is named `ordinality` by default.
+query II
+SELECT ordinality, generate_series FROM generate_series(5, 7) WITH ORDINALITY ORDER BY ordinality
+----
+1  5
+2  6
+3  7
+
+# An empty input set produces no rows (and so no ordinals).
+query TI
+SELECT x, n FROM unnest(ARRAY[]::INT[]) WITH ORDINALITY AS u(x, n)
+----
+
+# WITH ORDINALITY on a non-set-returning FROM function is rejected, not silently dropped.
+statement error
+SELECT * FROM abs(5) WITH ORDINALITY AS t(a, b)

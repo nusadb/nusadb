@@ -1,0 +1,88 @@
+# p9_window/window — window functions (-46): ranking, partitioned aggregates, LAG/LEAD.
+
+statement ok
+CREATE TABLE sales (region TEXT, amt INT)
+
+statement ok
+INSERT INTO sales VALUES ('east', 10), ('east', 30), ('west', 5), ('west', 20), ('west', 25)
+
+# ROW_NUMBER within each region, ordered by amount.
+query TII
+SELECT region, amt, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amt) FROM sales ORDER BY region, amt
+----
+east 10 1
+east 30 2
+west 5 1
+west 20 2
+west 25 3
+
+# Partitioned SUM / COUNT (no frame) repeat the partition total on every row.
+query TIII
+SELECT region, amt, SUM(amt) OVER (PARTITION BY region), COUNT(*) OVER (PARTITION BY region) FROM sales ORDER BY region, amt
+----
+east 10 40 2
+east 30 40 2
+west 5 50 3
+west 20 50 3
+west 25 50 3
+
+# LAG / LEAD within a region ordered by amount; NULL at the partition boundary.
+query TIII
+SELECT region, amt, LAG(amt) OVER (PARTITION BY region ORDER BY amt), LEAD(amt) OVER (PARTITION BY region ORDER BY amt) FROM sales ORDER BY region, amt
+----
+east 10 NULL 30
+east 30 10 NULL
+west 5 NULL 20
+west 20 5 25
+west 25 20 NULL
+
+# RANK leaves gaps after ties; DENSE_RANK does not.
+statement ok
+CREATE TABLE scores (player TEXT, pts INT)
+
+statement ok
+INSERT INTO scores VALUES ('a', 100), ('b', 100), ('c', 90), ('d', 80)
+
+query TIII
+SELECT player, pts, RANK() OVER (ORDER BY pts DESC), DENSE_RANK() OVER (ORDER BY pts DESC) FROM scores ORDER BY pts DESC, player
+----
+a 100 1 1
+b 100 1 1
+c 90 3 2
+d 80 4 3
+
+# Running aggregate over an ORDER BY (default RANGE … CURRENT ROW): a cumulative sum/count that grows
+# with the ordered position. Peers with equal ORDER BY keys share the running value THROUGH their peer
+# group (Q-WINDOW-RUNNING-FRAME-QUADRATIC — the incremental accumulator must match the old whole-frame
+# fold: 100+100=200 for both `a` and `b`, then +90, then +80).
+query TIII
+SELECT player, pts, SUM(pts) OVER (ORDER BY pts DESC), COUNT(*) OVER (ORDER BY pts DESC) FROM scores ORDER BY pts DESC, player
+----
+a 100 200 2
+b 100 200 2
+c 90 290 3
+d 80 370 4
+
+# Swinging explicit ROWS frame (`x PRECEDING … y FOLLOWING`): SUM/MIN/MAX/AVG over a window that
+# slides as the current row advances. The O(n) sliding accumulator (add the entering row, remove the
+# leaving one; a monotonic deque for MIN/MAX) must equal the from-scratch fold exactly, including at
+# the clamped ends (Q-WINDOW-RUNNING-FRAME-QUADRATIC, swinging-frame case per Leis'15).
+statement ok
+CREATE TABLE seq5 (id INT, v INT)
+
+statement ok
+INSERT INTO seq5 VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+query IIIII
+SELECT id,
+       SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+       MIN(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+       MAX(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+       COUNT(*) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM seq5 ORDER BY id
+----
+1 30 10 20 2
+2 60 10 30 3
+3 90 20 40 3
+4 120 30 50 3
+5 90 40 50 2

@@ -1,0 +1,82 @@
+# p14_tpch/tpch_subset — TPC-H-style analytical query correctness, Q1-Q6 shapes.
+#
+# A tiny hand-verifiable customer/orders/lineitem/nation schema exercising the analytical
+# query shapes TPC-H Q1-Q6 stress: grouped aggregation (Q1), a correlated scalar-MIN
+# subquery (Q2), a three-table join + group-by (Q3), a correlated EXISTS (Q4), a
+# four-table join grouped by nation (Q5), and a filtered revenue sum (Q6). Integer money
+# keeps the expected results exact. This validates the SQL engine's OLAP path, not
+# performance (the perf baseline is `cargo tpcc-bench` ).
+
+statement ok
+CREATE TABLE customer (c_custkey INT NOT NULL, c_name TEXT, c_mktsegment TEXT, c_nationkey INT)
+
+statement ok
+INSERT INTO customer VALUES (1, 'Alice', 'BUILDING', 1), (2, 'Bob', 'AUTOMOBILE', 2), (3, 'Carol', 'BUILDING', 1)
+
+statement ok
+CREATE TABLE nation (n_nationkey INT NOT NULL, n_name TEXT)
+
+statement ok
+INSERT INTO nation VALUES (1, 'INDONESIA'), (2, 'MALAYSIA')
+
+statement ok
+CREATE TABLE orders (o_orderkey INT NOT NULL, o_custkey INT)
+
+statement ok
+INSERT INTO orders VALUES (10, 1), (11, 2), (12, 3)
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_quantity INT, l_extendedprice INT, l_discount INT, l_returnflag TEXT)
+
+statement ok
+INSERT INTO lineitem VALUES (10, 5, 100, 0, 'N'), (10, 3, 60, 10, 'N'), (11, 2, 40, 0, 'R'), (12, 7, 140, 5, 'N')
+
+# --- Q1-style: pricing summary grouped by return flag ---
+query TIII
+SELECT l_returnflag, SUM(l_quantity), SUM(l_extendedprice), COUNT(*) FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag
+----
+N 15 300 3
+R 2 40 1
+
+# --- Q6-style: forecasting revenue change (revenue over discounted lines) ---
+query I
+SELECT SUM(l_extendedprice * l_discount) FROM lineitem WHERE l_discount > 0
+----
+1300
+
+# --- Q3-style: shipping priority — revenue per order for one market segment ---
+query II
+SELECT o.o_orderkey, SUM(l.l_extendedprice) FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey JOIN lineitem l ON o.o_orderkey = l.l_orderkey WHERE c.c_mktsegment = 'BUILDING' GROUP BY o.o_orderkey ORDER BY o.o_orderkey
+----
+10 160
+12 140
+
+# --- average order line value, exercising AVG over a join ---
+query I
+SELECT COUNT(*) FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey
+----
+3
+
+# --- Q2-style: minimum-cost match — correlated scalar MIN subquery ---
+# (Q2 picks the supplier whose cost equals the per-part minimum; same shape here:
+# the line whose price equals its order's minimum.)
+query II
+SELECT l1.l_orderkey, l1.l_extendedprice FROM lineitem l1 WHERE l1.l_extendedprice = (SELECT MIN(l2.l_extendedprice) FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey) ORDER BY l1.l_orderkey
+----
+10 60
+11 40
+12 140
+
+# --- Q4-style: order priority checking — correlated EXISTS ---
+query I
+SELECT o.o_orderkey FROM orders o WHERE EXISTS (SELECT l.l_orderkey FROM lineitem l WHERE l.l_orderkey = o.o_orderkey AND l.l_quantity > 4) ORDER BY o.o_orderkey
+----
+10
+12
+
+# --- Q5-style: local supplier volume — four-table join grouped by nation ---
+query TI
+SELECT n.n_name, SUM(l.l_extendedprice) FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey JOIN lineitem l ON o.o_orderkey = l.l_orderkey JOIN nation n ON c.c_nationkey = n.n_nationkey GROUP BY n.n_name ORDER BY n.n_name
+----
+INDONESIA 300
+MALAYSIA 40

@@ -1,0 +1,51 @@
+# p5_advanced/encryption — column-level encrypt()/decrypt() (B-enc.01).
+#
+# Values are encrypted in the SQL layer and stored as opaque hex ciphertext;
+# the engine never sees plaintext (ADR 003). The cipher is deterministic AEAD
+# (AES-256-GCM-SIV), so values round-trip and equal plaintexts encrypt equally.
+
+statement ok
+CREATE TABLE users (id INT NOT NULL, ssn TEXT)
+
+statement ok
+INSERT INTO users VALUES
+  (1, encrypt('111-22-3333', 'master-key')),
+  (2, encrypt('999-88-7777', 'master-key'))
+
+# decrypt() with the right key recovers the plaintext.
+query IT
+SELECT id, decrypt(ssn, 'master-key') FROM users ORDER BY id
+----
+1  111-22-3333
+2  999-88-7777
+
+# At rest the column holds ciphertext, not the plaintext.
+query I
+SELECT COUNT(*) FROM users WHERE ssn = '111-22-3333'
+----
+0
+
+# Deterministic: the same plaintext + key encrypts to the same ciphertext.
+statement ok
+INSERT INTO users VALUES (3, encrypt('111-22-3333', 'master-key'))
+
+query T
+SELECT decrypt(ssn, 'master-key') FROM users WHERE id = 3
+----
+111-22-3333
+
+# A NULL plaintext encrypts to NULL.
+statement ok
+INSERT INTO users VALUES (4, NULL)
+
+query I
+SELECT id FROM users WHERE encrypt(ssn, 'master-key') IS NULL
+----
+4
+
+# The wrong key fails the authentication tag rather than returning garbage.
+statement error
+SELECT decrypt(ssn, 'wrong-key') FROM users WHERE id = 1
+
+statement ok
+DROP TABLE users

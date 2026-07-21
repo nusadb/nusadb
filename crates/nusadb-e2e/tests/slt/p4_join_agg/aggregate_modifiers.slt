@@ -1,0 +1,125 @@
+# p4_join_agg/aggregate_modifiers — aggregate FILTER, DISTINCT inside aggregates,
+# and ordered-set aggregates WITHIN GROUP (PERCENTILE_CONT / PERCENTILE_DISC / MODE).
+# NULLs are skipped by aggregates; FILTER restricts the rows fed to one aggregate only.
+
+statement ok
+CREATE TABLE m (grp TEXT, v INT)
+
+statement ok
+INSERT INTO m VALUES
+  ('a', 10),
+  ('a', 10),
+  ('a', 20),
+  ('a', NULL),
+  ('b', 30),
+  ('b', 40),
+  ('b', 40)
+
+# --- FILTER (WHERE ...) ------------------------------------------------------
+
+# COUNT(*) FILTER counts only rows passing the predicate (NULL v fails v > 15).
+query I
+SELECT COUNT(*) FILTER (WHERE v > 15) FROM m
+----
+4
+
+# Two aggregates with different FILTERs in one query, each scoped independently.
+query II
+SELECT SUM(v) FILTER (WHERE v >= 30), COUNT(*) FILTER (WHERE v = 40) FROM m
+----
+110  2
+
+# FILTER combined with GROUP BY: applied per group.
+query TI rowsort
+SELECT grp, COUNT(*) FILTER (WHERE v > 15) FROM m GROUP BY grp
+----
+a  1
+b  3
+
+# --- DISTINCT inside aggregates ---------------------------------------------
+
+# COUNT(DISTINCT) / SUM(DISTINCT) ignore duplicates and NULLs.
+query II
+SELECT COUNT(DISTINCT v), SUM(DISTINCT v) FROM m
+----
+4  100
+
+# Per group.
+query TII rowsort
+SELECT grp, COUNT(DISTINCT v), SUM(DISTINCT v) FROM m GROUP BY grp
+----
+a  2  30
+b  2  70
+
+# DISTINCT dedup is consistent with comparison (A-perf hash bucket): different NUMERIC scales of the
+# same value count once (1.0 == 1.00 == 1; 2.5 == 2.50) -> 2 distinct, summing to 3.5.
+statement ok
+CREATE TABLE dn (x NUMERIC)
+
+statement ok
+INSERT INTO dn VALUES (1.0), (1.00), (1), (2.5), (2.50)
+
+query I
+SELECT COUNT(DISTINCT x) FROM dn
+----
+2
+
+query T
+SELECT CAST(SUM(DISTINCT x) AS TEXT) FROM dn
+----
+3.5
+
+# High-precision regression: the same value past 2^53 with different trailing-zero scales is ONE
+# distinct value (an exact decimal key, not a lossy f64, keeps them in the same bucket).
+statement ok
+CREATE TABLE dh (x NUMERIC)
+
+statement ok
+INSERT INTO dh VALUES (123456789012345678), (123456789012345678.00), (123456789012345679)
+
+query I
+SELECT COUNT(DISTINCT x) FROM dh
+----
+2
+
+# Signed zero: -0.0 and 0.0 are the same FLOAT value -> one distinct.
+statement ok
+CREATE TABLE dz (f FLOAT)
+
+statement ok
+INSERT INTO dz VALUES (0.0), (-0.0), (1.5)
+
+query I
+SELECT COUNT(DISTINCT f) FROM dz
+----
+2
+
+# --- Ordered-set aggregates (WITHIN GROUP) ----------------------------------
+# Non-NULL values, sorted: 10, 10, 20, 30, 40, 40 (n = 6).
+
+# PERCENTILE_DISC(0.5) returns an actual data point: the 3rd value (ceil(0.5*6)) = 20.
+query I
+SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v) FROM m
+----
+20
+
+# MODE() returns the most frequent value; ties resolve to the smallest (10 and 40 both appear twice).
+query I
+SELECT MODE() WITHIN GROUP (ORDER BY v) FROM m
+----
+10
+
+# PERCENTILE_DISC(0) is the minimum, PERCENTILE_DISC(1) is the maximum.
+query II
+SELECT PERCENTILE_DISC(0) WITHIN GROUP (ORDER BY v),
+       PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY v)
+FROM m
+----
+10  40
+
+# Array-of-fractions: PERCENTILE_DISC(ARRAY[...]) returns one data point per fraction, as an array.
+# d0 = 10 (min), d0.5 = ceil(0.5*6) = 3rd = 20, d1 = 40 (max).
+query T
+SELECT PERCENTILE_DISC(ARRAY[0, 0.5, 1]) WITHIN GROUP (ORDER BY v) FROM m
+----
+{10,20,40}

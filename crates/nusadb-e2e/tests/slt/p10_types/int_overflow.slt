@@ -1,0 +1,89 @@
+# p10_types/int_overflow — integer width is enforced in expressions and casts, not just at column
+# storage (Q-INT4-OVERFLOW). An INT (int4) value overflowing 2^31 in arithmetic or a cast errors like
+# PG, integer literals are typed by magnitude (int4 if they fit, else bigint), and mixed int4/int8
+# arithmetic promotes to bigint. This mirrors the int4 range the storage layer already enforces
+# (see p1_ddl/int_range), so the engine is internally consistent.
+
+# --- INT (int4) cast: in range OK, out of range errors ---
+query I
+SELECT 2147483647::int
+----
+2147483647
+
+query I
+SELECT (-2147483648)::int
+----
+-2147483648
+
+# A value past int4 cast to int errors (PG: integer out of range) rather than returning it.
+statement error
+SELECT 9999999999::int
+
+# --- INT (int4) arithmetic overflows at 2^31 ---
+statement error
+SELECT 2147483647::int + 1
+
+statement error
+SELECT 100000::int * 100000::int
+
+statement error
+SELECT (-2147483648)::int - 1
+
+# Two int4-typed literals whose sum overflows int4 also error (literals fit i32, so they are int4).
+statement error
+SELECT 2000000000 + 2000000000
+
+# In-range int4 arithmetic is unaffected.
+query I
+SELECT 2147483646::int + 1
+----
+2147483647
+
+# --- BIGINT (int8): the full 64-bit range, no false int4 bound ---
+query I
+SELECT 9999999999::bigint
+----
+9999999999
+
+query I
+SELECT 9999999999::bigint + 1
+----
+10000000000
+
+# A literal that needs more than 32 bits is typed bigint, so its arithmetic is not bounded at int4.
+query I
+SELECT 5000000000 + 1
+----
+5000000001
+
+# Mixed int4 + int8 promotes to int8 (no overflow): the int4 operand does not cap the result.
+query I
+SELECT 2147483647::int + 1::bigint
+----
+2147483648
+
+# --- SMALLINT (int2): [-32768, 32767] enforced in casts + arithmetic ---
+query I
+SELECT 30000::smallint
+----
+30000
+
+statement error
+SELECT 100000::smallint
+
+statement error
+SELECT 30000::smallint + 30000::smallint
+
+# --- A BIGINT column is not falsely bounded at int4 in expressions ---
+statement ok
+CREATE TABLE bc (b BIGINT)
+
+statement ok
+INSERT INTO bc VALUES (5000000000), (9223372036854775806)
+
+# b + 1 stays bigint (the column carries int8 width), so neither row overflows.
+query I
+SELECT b + 1 FROM bc ORDER BY b
+----
+5000000001
+9223372036854775807

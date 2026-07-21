@@ -1,0 +1,117 @@
+# p13_functions/json_set_returning — JSON set-returning functions (B4.58b/c):
+# json_array_elements and jsonb_path_query (a jsonpath subset) end-to-end.
+
+statement ok
+CREATE TABLE j (id INT NOT NULL, doc JSON)
+
+statement ok
+INSERT INTO j VALUES (1, '[10,20,30]')
+
+statement ok
+INSERT INTO j VALUES (2, '{"items":[{"n":1},{"n":2}],"k":"v"}')
+
+# --- json_array_elements: one row per array element (as JSON) ---
+query T
+SELECT json_array_elements(doc) FROM j WHERE id = 1
+----
+10
+20
+30
+
+# A non-array document yields no rows.
+query T
+SELECT json_array_elements(doc) FROM j WHERE id = 2
+----
+
+# --- jsonb_path_query: one row per jsonpath match ---
+query T
+SELECT jsonb_path_query(doc, '$.items[*].n') FROM j WHERE id = 2
+----
+1
+2
+
+# A member access returns the (quoted) JSON scalar.
+query T
+SELECT jsonb_path_query(doc, '$.k') FROM j WHERE id = 2
+----
+"v"
+
+# A valid path that matches nothing yields no rows.
+query T
+SELECT jsonb_path_query(doc, '$.nope') FROM j WHERE id = 2
+----
+
+# --- jsonb_path_exists: whether the jsonpath matches anywhere (renders as 0/1) ---
+query T
+SELECT jsonb_path_exists(doc, '$.items[*].n') FROM j WHERE id = 2
+----
+1
+
+# A member that exists.
+query T
+SELECT jsonb_path_exists(doc, '$.k') FROM j WHERE id = 2
+----
+1
+
+# A path that matches nothing.
+query T
+SELECT jsonb_path_exists(doc, '$.nope') FROM j WHERE id = 2
+----
+0
+
+# NULL propagates.
+query T
+SELECT CAST(jsonb_path_exists(CAST(NULL AS JSON), '$.k') AS TEXT)
+----
+NULL
+
+# --- jsonb_path_query_first: the first jsonpath match as a scalar JSON ---
+query T
+SELECT jsonb_path_query_first(doc, '$.items[*].n') FROM j WHERE id = 2
+----
+1
+
+query T
+SELECT jsonb_path_query_first(doc, '$.k') FROM j WHERE id = 2
+----
+"v"
+
+# A path that matches nothing yields NULL.
+query T
+SELECT CAST(jsonb_path_query_first(doc, '$.nope') AS TEXT) FROM j WHERE id = 2
+----
+NULL
+
+# NULL document propagates.
+query T
+SELECT CAST(jsonb_path_query_first(CAST(NULL AS JSON), '$.k') AS TEXT)
+----
+NULL
+
+# --- jsonb_array_elements_text: each element as unquoted TEXT ---
+# String elements lose their quotes (unlike json_array_elements).
+statement ok
+INSERT INTO j VALUES (4, '["a","b","c"]')
+
+query T
+SELECT jsonb_array_elements_text(doc) FROM j WHERE id = 4
+----
+a
+b
+c
+
+# Numbers render as their text; a JSON null becomes a SQL NULL row.
+statement ok
+INSERT INTO j VALUES (5, '[1,null,3]')
+
+query T
+SELECT jsonb_array_elements_text(doc) FROM j WHERE id = 5
+----
+1
+NULL
+3
+
+# A non-array document yields no rows.
+query T
+SELECT jsonb_array_elements_text(doc) FROM j WHERE id = 2
+----

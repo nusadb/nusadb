@@ -1,0 +1,74 @@
+# p1_ddl/create_table_as — CREATE TABLE ... AS SELECT.
+
+statement ok
+CREATE TABLE src (id INT NOT NULL, name TEXT, score INT)
+
+statement ok
+INSERT INTO src (id, name, score) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)
+
+# Basic CTAS: schema + rows derived from the query.
+statement ok
+CREATE TABLE dst AS SELECT id, name FROM src WHERE score >= 20
+
+query IT rowsort
+SELECT id, name FROM dst
+----
+2  b
+3  c
+
+# The derived table is independent: inserting into it does not touch src.
+statement ok
+INSERT INTO dst (id, name) VALUES (9, 'z')
+
+query I
+SELECT COUNT(*) FROM src
+----
+3
+
+# Column aliases in the SELECT name the derived columns.
+statement ok
+CREATE TABLE renamed AS SELECT id AS k, name AS label FROM src WHERE id = 1
+
+query IT
+SELECT k, label FROM renamed
+----
+1  a
+
+# An explicit column list on a CTAS is rejected (alias the SELECT columns instead).
+statement error
+CREATE TABLE listed (k INT, label TEXT) AS SELECT id, name FROM src
+
+# CTAS over an expression projection derives the computed column's type.
+statement ok
+CREATE TABLE doubled AS SELECT id, score * 2 AS twice FROM src WHERE id = 3
+
+query II
+SELECT id, twice FROM doubled
+----
+3  60
+
+# A name clash without IF NOT EXISTS is rejected.
+statement error
+CREATE TABLE dst AS SELECT id FROM src
+
+# IF NOT EXISTS makes an existing target a no-op (rows are not re-inserted).
+statement ok
+CREATE TABLE IF NOT EXISTS dst AS SELECT id, name FROM src
+
+query I
+SELECT COUNT(*) FROM dst
+----
+3
+
+# A duplicate output column name without a rename list is rejected.
+statement error
+CREATE TABLE dup AS SELECT id, id FROM src
+
+# An empty source yields an empty table with the derived schema.
+statement ok
+CREATE TABLE empty_dst AS SELECT id, name FROM src WHERE id < 0
+
+query I
+SELECT COUNT(*) FROM empty_dst
+----
+0

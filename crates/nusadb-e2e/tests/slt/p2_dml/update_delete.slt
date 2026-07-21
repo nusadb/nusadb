@@ -1,0 +1,67 @@
+# p2_dml/update_delete — UPDATE and DELETE with/without WHERE.
+
+statement ok
+CREATE TABLE inv (sku INT NOT NULL, qty INT, label TEXT)
+
+statement ok
+INSERT INTO inv VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')
+
+# UPDATE with WHERE
+statement ok
+UPDATE inv SET qty = 999 WHERE sku = 2
+
+query II rowsort
+SELECT sku, qty FROM inv
+----
+1  10
+2  999
+3  30
+4  40
+
+# UPDATE without WHERE rewrites every row
+statement ok
+UPDATE inv SET label = 'X'
+
+query IT rowsort
+SELECT sku, label FROM inv
+----
+1  X
+2  X
+3  X
+4  X
+
+# UPDATE that touches no rows is still ok
+statement ok
+UPDATE inv SET qty = 0 WHERE sku = 99
+
+query II rowsort
+SELECT sku, qty FROM inv WHERE qty = 0
+----
+
+# DELETE with WHERE
+statement ok
+DELETE FROM inv WHERE sku = 1
+
+query I rowsort
+SELECT sku FROM inv
+----
+2
+3
+4
+
+# DELETE without WHERE empties the table
+statement ok
+DELETE FROM inv
+
+query I
+SELECT sku FROM inv
+----
+
+# Schema still exists — INSERT after the empty DELETE works
+statement ok
+INSERT INTO inv VALUES (10, 100, 'z')
+
+query IIT
+SELECT sku, qty, label FROM inv
+----
+10  100  z

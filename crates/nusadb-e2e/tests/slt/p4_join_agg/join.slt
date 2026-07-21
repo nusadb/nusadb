@@ -1,0 +1,232 @@
+# p4_join_agg/join — INNER, LEFT, RIGHT, FULL joins + aliases and ON predicates.
+
+statement ok
+CREATE TABLE customer (id INT NOT NULL, name TEXT)
+
+statement ok
+INSERT INTO customer VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')
+
+statement ok
+CREATE TABLE orders (oid INT NOT NULL, cust INT, amount INT)
+
+# Note: cust=4 has no matching customer; customer id=3 has no order.
+statement ok
+INSERT INTO orders VALUES
+  (100, 1, 50),
+  (101, 1, 25),
+  (102, 2, 75),
+  (103, 4, 99)
+
+# INNER JOIN — only matching pairs
+query ITI rowsort
+SELECT c.id, c.name, o.amount
+FROM customer c INNER JOIN orders o ON c.id = o.cust
+----
+1  alice  25
+1  alice  50
+2  bob    75
+
+# LEFT JOIN — every customer, even orderless ones
+query IT? rowsort
+SELECT c.id, c.name, o.amount
+FROM customer c LEFT JOIN orders o ON c.id = o.cust
+----
+1  alice  25
+1  alice  50
+2  bob    75
+3  carol  NULL
+
+# RIGHT JOIN — every order, even orphan ones
+query ?II rowsort
+SELECT c.name, o.oid, o.amount
+FROM customer c RIGHT JOIN orders o ON c.id = o.cust
+----
+NULL   103  99
+alice  100  50
+alice  101  25
+bob    102  75
+
+# FULL JOIN — orphans on both sides
+query ?? rowsort
+SELECT c.name, o.oid
+FROM customer c FULL JOIN orders o ON c.id = o.cust
+----
+NULL   103
+alice  100
+alice  101
+bob    102
+carol  NULL
+
+# Aliases + WHERE on top of a JOIN
+query ITI rowsort
+SELECT c.id, c.name, o.amount
+FROM customer c INNER JOIN orders o ON c.id = o.cust
+WHERE o.amount >= 50
+----
+1  alice  50
+2  bob    75
+
+# JOIN feeding into GROUP BY (total spend per customer)
+query TI rowsort
+SELECT c.name, SUM(o.amount)
+FROM customer c INNER JOIN orders o ON c.id = o.cust
+GROUP BY c.name
+----
+alice  75
+bob    75
+
+# Ambiguous unqualified column reference across joined tables is rejected.
+# (customer and orders both have an `id`-shaped column; here `id` exists on
+# both sides as either `id` or `oid`/`cust` — pick a name that's truly
+# present on both. We add a join with two `id` columns by self-joining
+# customer.)
+statement ok
+CREATE TABLE other_customer (id INT NOT NULL, tag TEXT)
+
+statement ok
+INSERT INTO other_customer VALUES (1, 'gold')
+
+statement error
+SELECT id FROM customer JOIN other_customer ON customer.id = other_customer.id
+
+# --- USING / NATURAL coalesce the join column into one output column (Q-JOIN-USING-COALESCE) ---
+statement ok
+CREATE TABLE aa (k INT, x TEXT)
+
+statement ok
+CREATE TABLE bb (k INT, y TEXT)
+
+statement ok
+INSERT INTO aa VALUES (1, 'a1'), (2, 'a2')
+
+statement ok
+INSERT INTO bb VALUES (1, 'b1')
+
+# SELECT * yields ONE k column (merged), not two: k, x, y.
+query ITT
+SELECT * FROM aa JOIN bb USING (k)
+----
+1  a1  b1
+
+# A bare reference to the join column is unambiguous (it is the single merged column).
+query I
+SELECT k FROM aa JOIN bb USING (k)
+----
+1
+
+query ITT
+SELECT k, x, y FROM aa JOIN bb USING (k)
+----
+1  a1  b1
+
+# The qualified names on both sides still resolve (the right copy is hidden, not removed).
+query II
+SELECT aa.k, bb.k FROM aa JOIN bb USING (k)
+----
+1  1
+
+# `bb.*` still includes bb's own join column.
+query IT
+SELECT bb.* FROM aa JOIN bb USING (k)
+----
+1  b1
+
+# LEFT JOIN: the merged column is the (always-present) left value; an unmatched row keeps its left k.
+query ITT
+SELECT k, x, y FROM aa LEFT JOIN bb USING (k) ORDER BY k
+----
+1  a1  b1
+2  a2  NULL
+
+# NATURAL JOIN merges every common column (here k) the same way.
+query ITT
+SELECT * FROM aa NATURAL JOIN bb
+----
+1  a1  b1
+
+# RIGHT/FULL JOIN with USING/NATURAL merges the join column as a real coalesce(left, right): an
+# unmatched right row has a NULL-padded left, so the merged k surfaces the right value (not NULL).
+# Add an orphan right row (k=3 has no match in aa) to exercise the coalesce.
+statement ok
+INSERT INTO bb VALUES (3, 'b3')
+
+# RIGHT JOIN: the matched row reads k from either side; the right-orphan row's merged k is its right
+# value (3), NOT NULL. SELECT * yields one k column.
+query ITT
+SELECT k, x, y FROM aa RIGHT JOIN bb USING (k) ORDER BY k
+----
+1  a1  b1
+3  NULL  b3
+
+# A bare reference to the merged column on a right-orphan row is the right value, never NULL.
+query I
+SELECT k FROM aa RIGHT JOIN bb USING (k) ORDER BY k
+----
+1
+3
+
+# FULL JOIN: left-orphan (k=2) keeps its left k, right-orphan (k=3) takes its right k, match (k=1)
+# reads either — every merged k is non-NULL.
+query ITT
+SELECT k, x, y FROM aa FULL JOIN bb USING (k) ORDER BY k
+----
+1  a1  b1
+2  a2  NULL
+3  NULL  b3
+
+# NATURAL RIGHT JOIN merges the common column the same way.
+query ITT
+SELECT k, x, y FROM aa NATURAL RIGHT JOIN bb ORDER BY k
+----
+1  a1  b1
+3  NULL  b3
+
+# The qualified right copy still resolves for an orphan row (it is hidden from `*`, not removed).
+query II
+SELECT k, bb.k FROM aa RIGHT JOIN bb USING (k) ORDER BY k
+----
+1  1
+3  3
+
+# Two-sided predicate pushdown must stay result-preserving. A right-side WHERE on a
+# LEFT join must NOT be pushed below the join — the right side is NULL-extended, so `y = 'b1'` filters
+# the unmatched aa row (k=2, y=NULL) ABOVE the join (NULL fails the predicate). Pushing it onto bb
+# would wrongly keep (2, a2, NULL).
+query ITT
+SELECT aa.k, x, y FROM aa LEFT JOIN bb ON aa.k = bb.k WHERE y = 'b1' ORDER BY aa.k
+----
+1  a1  b1
+
+# The same right-side WHERE on an INNER join (pushed onto the right input) yields the same result.
+query ITT
+SELECT aa.k, x, y FROM aa JOIN bb ON aa.k = bb.k WHERE y = 'b1' ORDER BY aa.k
+----
+1  a1  b1
+
+# SOUNDNESS on a MULTI-join chain (the audit counterexample): a right-side WHERE on the INNER join
+# must NOT be pushed below it when a DOWNSTREAM FULL join null-extends that table. j1⋈j2 = (1,x1,y1);
+# FULL JOIN j3 emits that row plus j3's orphan (2,z2) with a NULL-extended left; `j2.y='y1'` filters
+# the NULL row ABOVE the FULL join → exactly one result row. (Pushing y='y1' below the inner join
+# would drop the residual and wrongly keep the NULL row.)
+statement ok
+CREATE TABLE j1 (a INT, x TEXT)
+
+statement ok
+CREATE TABLE j2 (a INT, y TEXT)
+
+statement ok
+CREATE TABLE j3 (a INT, z TEXT)
+
+statement ok
+INSERT INTO j1 VALUES (1, 'x1'), (2, 'x2')
+
+statement ok
+INSERT INTO j2 VALUES (1, 'y1')
+
+statement ok
+INSERT INTO j3 VALUES (2, 'z2')
+
+query IT
+SELECT j1.a, j2.y FROM j1 JOIN j2 ON j1.a = j2.a FULL JOIN j3 ON j1.a = j3.a WHERE j2.y = 'y1' ORDER BY j1.a
+----
+1  y1

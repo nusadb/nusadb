@@ -1,0 +1,144 @@
+# p10_types/temporal — DATE / TIME / TIMESTAMP / TIMESTAMP WITH TIME ZONE.
+# Covers: catalog types, typed-string literals, implicit string coercion on INSERT,
+# canonical display, equality + range predicates, ORDER BY, and CAST in both directions.
+
+statement ok
+CREATE TABLE events (id INT NOT NULL, d DATE, t TIME, ts TIMESTAMP, tz TIMESTAMP WITH TIME ZONE)
+
+# Typed-string literals.
+statement ok
+INSERT INTO events VALUES (1, DATE '2024-01-15', TIME '09:30:00', TIMESTAMP '2024-01-15 09:30:00', TIMESTAMP WITH TIME ZONE '2024-01-15 09:30:00+02:00')
+
+# Implicit string coercion ("unknown literal" rule) — parsed at encode time.
+statement ok
+INSERT INTO events VALUES (2, '2024-03-01', '23:59:59', '2024-03-01 23:59:59', '2024-03-01 00:00:00Z')
+
+# Canonical display. The timestamptz of row 1 (+02:00) normalizes to 07:30:00 UTC.
+query ITTTT rowsort
+SELECT id, d, t, ts, tz FROM events
+----
+1  2024-01-15  09:30:00  2024-01-15 09:30:00  2024-01-15 07:30:00+00
+2  2024-03-01  23:59:59  2024-03-01 23:59:59  2024-03-01 00:00:00+00
+
+# Equality predicate against a typed literal.
+query I
+SELECT id FROM events WHERE d = DATE '2024-01-15'
+----
+1
+
+# Range predicate (proves real temporal ordering, not string compare).
+query I
+SELECT id FROM events WHERE d > DATE '2024-02-01'
+----
+2
+
+# ORDER BY on a temporal column, ascending and descending.
+query IT
+SELECT id, d FROM events ORDER BY d
+----
+1  2024-01-15
+2  2024-03-01
+
+query I
+SELECT id FROM events ORDER BY ts DESC
+----
+2
+1
+
+# CAST temporal -> TEXT yields the canonical form.
+query T
+SELECT CAST(d AS TEXT) FROM events WHERE id = 1
+----
+2024-01-15
+
+# CAST TEXT -> temporal (no FROM).
+query T
+SELECT CAST('2024-12-25' AS DATE) AS xmas
+----
+2024-12-25
+
+# Fractional seconds round-trip.
+statement ok
+INSERT INTO events VALUES (3, '2024-06-01', '12:00:00.500000', '2024-06-01 12:00:00.250000', '2024-06-01 12:00:00Z')
+
+query T
+SELECT t FROM events WHERE id = 3
+----
+12:00:00.500000
+
+# A malformed value is rejected at execution time.
+statement error
+INSERT INTO events VALUES (4, '2024-99-99', NULL, NULL, NULL)
+
+# --- A timestamp literal with no time part is midnight (PG parity); this also makes age() work on
+# date-only timestamp literals (Q deep-probe #5: age(TIMESTAMP '…') no longer errors). ---
+query T
+SELECT TIMESTAMP '2024-03-15'
+----
+2024-03-15 00:00:00
+
+query T
+SELECT (TIMESTAMP '2024-03-15' = TIMESTAMP '2024-03-15 00:00:00')::text
+----
+true
+
+# age() over date-only timestamp literals computes the calendar interval (was "invalid Timestamp").
+query T
+SELECT age(TIMESTAMP '2024-03-15', TIMESTAMP '2020-01-10')::text
+----
+4 years 2 mons 5 days
+
+# --- AT TIME ZONE: TIMESTAMP<->TIMESTAMPTZ conversion for UTC and fixed offsets (Q-AT-TIME-ZONE).
+# A fixed-offset *string* follows PG's POSIX sign convention — `'+05:00'` names a zone five hours
+# WEST of UTC (UTC-5), the opposite of ISO 8601 (Q-AT-TZ-OFFSET-SIGN). A named DST zone is rejected. ---
+
+# TIMESTAMP AT TIME ZONE 'UTC' reads the wall clock as UTC -> the same instant as a timestamptz.
+query T
+SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE 'UTC')::text
+----
+2024-01-01 12:00:00+00
+
+# '+05:00' is UTC-5 (POSIX), so wall 12:00 there is 17:00 UTC (matches PG, not the ISO 07:00).
+query T
+SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE '+05:00')::text
+----
+2024-01-01 17:00:00+00
+
+# '-05:00' is UTC+5 (POSIX), so wall 12:00 there is 07:00 UTC.
+query T
+SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE '-05:00')::text
+----
+2024-01-01 07:00:00+00
+
+# A UTC instant rendered as wall clock in '+05:00' (UTC-5) is 07:00 (a plain timestamp).
+query T
+SELECT (TIMESTAMPTZ '2024-01-01 12:00:00Z' AT TIME ZONE '+05:00')::text
+----
+2024-01-01 07:00:00
+
+# An INTERVAL zone is a fixed offset with the ISO sign (the OPPOSITE of the text form): `INTERVAL
+# '5 hours'` is UTC+5, so wall 12:00 there is 07:00 UTC (= the text form '-05:00').
+query T
+SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE INTERVAL '5 hours')::text
+----
+2024-01-01 07:00:00+00
+
+# A negative INTERVAL offset: `INTERVAL '-5 hours'` is UTC-5, so wall 12:00 is 17:00 UTC.
+query T
+SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE INTERVAL '-5 hours')::text
+----
+2024-01-01 17:00:00+00
+
+# A UTC instant rendered as wall clock in INTERVAL '5 hours' (UTC+5) is 17:00 (a plain timestamp).
+query T
+SELECT (TIMESTAMPTZ '2024-01-01 12:00:00Z' AT TIME ZONE INTERVAL '5 hours')::text
+----
+2024-01-01 17:00:00
+
+# An INTERVAL offset with a months component has no fixed length and is rejected, not guessed.
+statement error
+SELECT TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE INTERVAL '1 month'
+
+# A named (DST-bearing) zone is rejected rather than silently mishandled.
+statement error
+SELECT TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE 'America/New_York'

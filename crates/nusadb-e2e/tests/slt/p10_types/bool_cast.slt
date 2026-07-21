@@ -1,0 +1,27 @@
+# p10_types/bool_cast — text→BOOL accepts the full PG set of boolean string inputs, case-insensitive
+# with surrounding whitespace ignored: true/false, t/f, yes/no, y/n, on/off, 1/0 (Q-BOOL-STRING-REPS).
+
+# Truthy spellings.
+query T
+SELECT ('true'::bool)::text, ('t'::bool)::text, ('yes'::bool)::text, ('y'::bool)::text, ('on'::bool)::text, ('1'::bool)::text
+----
+true true true true true true
+
+# Falsy spellings.
+query T
+SELECT ('false'::bool)::text, ('f'::bool)::text, ('no'::bool)::text, ('n'::bool)::text, ('off'::bool)::text, ('0'::bool)::text
+----
+false false false false false false
+
+# Case-insensitive and surrounding whitespace ignored.
+query T
+SELECT ('YES'::bool)::text, ('  Off '::bool)::text, ('On'::bool)::text
+----
+true false true
+
+# An unrecognised string is still rejected (no silent default).
+statement error
+SELECT 'maybe'::bool
+
+statement error
+SELECT 'yep'::bool

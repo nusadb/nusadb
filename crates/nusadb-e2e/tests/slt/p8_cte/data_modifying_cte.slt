@@ -1,0 +1,87 @@
+# p8_cte/data_modifying_cte — WITH x AS (INSERT/UPDATE … RETURNING …) … (Q-CTE-DML).
+#
+# A data-modifying CTE runs once; its RETURNING rows form the CTE's relation, which the outer query
+# reads. The statement's writes persist. The modified table may NOT be read elsewhere in the same
+# statement (the outer query must not observe the CTE's writes) — that is loud-rejected.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+# INSERT … RETURNING as a CTE: the outer query reads the inserted rows.
+query II
+WITH ins AS (INSERT INTO t VALUES (2, 20), (3, 30) RETURNING id, v)
+SELECT id, v FROM ins ORDER BY id
+----
+2  20
+3  30
+
+# The writes persisted: t now holds all three rows.
+query II
+SELECT id, v FROM t ORDER BY id
+----
+1  10
+2  20
+3  30
+
+# UPDATE … RETURNING as a CTE: the outer query reads the updated rows.
+query II
+WITH upd AS (UPDATE t SET v = v + 100 WHERE id <= 2 RETURNING id, v)
+SELECT id, v FROM upd ORDER BY id
+----
+1  110
+2  120
+
+# The update persisted.
+query II
+SELECT id, v FROM t ORDER BY id
+----
+1  110
+2  120
+3  30
+
+# A column alias list renames the CTE's RETURNING columns.
+query II
+WITH ins(a, b) AS (INSERT INTO t VALUES (4, 40) RETURNING id, v)
+SELECT a, b FROM ins
+----
+4  40
+
+# Another INSERT CTE, read back through the relation.
+query II
+WITH ins AS (INSERT INTO t VALUES (5, 50) RETURNING id, v)
+SELECT id, v FROM ins
+----
+5  50
+
+# Aggregating the RETURNING rows.
+query I
+WITH d AS (UPDATE t SET v = v WHERE id >= 4 RETURNING id)
+SELECT count(*) FROM d
+----
+2
+
+# GUARD: the modified table may not be read elsewhere in the same statement — the outer query and
+# the data-modifying CTE would otherwise disagree on whether the writes are visible (snapshot
+# semantics). Rejected loudly, never silently divergent.
+statement error
+WITH ins AS (INSERT INTO t VALUES (6, 60) RETURNING id) SELECT * FROM t
+
+# The guard also catches a schema-qualified read of the target, and a read in a subquery.
+statement error
+WITH ins AS (INSERT INTO t VALUES (7, 70) RETURNING id) SELECT * FROM public.t
+
+statement error
+WITH ins AS (INSERT INTO t VALUES (8, 80) RETURNING id) SELECT (SELECT count(*) FROM t)
+
+# A data-modifying CTE without RETURNING has no columns to expose, so it is rejected.
+statement error
+WITH x AS (INSERT INTO t VALUES (9, 90)) SELECT 1
+
+# The rejected statements above did not run their INSERTs (analysis failed first): t is unchanged.
+query I
+SELECT count(*) FROM t
+----
+5

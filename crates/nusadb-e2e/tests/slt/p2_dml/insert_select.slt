@@ -1,0 +1,46 @@
+# p2_dml/insert_select — INSERT (single, multi, partial column list) + SELECT.
+
+statement ok
+CREATE TABLE users (id INT NOT NULL, name TEXT, score INT)
+
+# Single-row INSERT, all columns
+statement ok
+INSERT INTO users VALUES (1, 'alice', 100)
+
+# Multi-row INSERT
+statement ok
+INSERT INTO users VALUES (2, 'bob', 80), (3, 'carol', 95)
+
+# INSERT with explicit column list (different order than declaration)
+statement ok
+INSERT INTO users (name, id) VALUES ('dave', 4)
+
+# SELECT *
+query ITI rowsort
+SELECT * FROM users
+----
+1  alice  100
+2  bob    80
+3  carol  95
+4  dave   NULL
+
+# SELECT specific columns
+query IT rowsort
+SELECT id, name FROM users
+----
+1  alice
+2  bob
+3  carol
+4  dave
+
+# Projection expression: arithmetic + alias
+query II rowsort
+SELECT id, score + 10 AS bumped FROM users WHERE score IS NOT NULL
+----
+1  110
+2  90
+3  105
+
+# NOT NULL violation is rejected at INSERT time
+statement error
+INSERT INTO users (name) VALUES ('eve')

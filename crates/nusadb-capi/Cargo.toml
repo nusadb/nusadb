@@ -1,0 +1,21 @@
+[package]
+name         = "nusadb-capi"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "C ABI (libnusa.h) over libnusa — the native bridge for FFI-capable languages"
+repository   = { workspace = true }
+
+[lib]
+name = "nusadb_capi"
+# cdylib for runtime loading (dlopen/LoadLibrary); staticlib for direct linking.
+crate-type = ["cdylib", "staticlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+nusadb-libnusa = { workspace = true }
+tokio          = { workspace = true }

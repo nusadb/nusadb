@@ -1,0 +1,118 @@
+# p5_advanced/sequences — nextval / currval / setval sequence value functions.
+#
+# A user CREATE SEQUENCE can now be advanced and read from SQL expressions. nextval/setval are
+# side-effecting and only valid where the expression is evaluated exactly once (a SELECT with no
+# FROM, or a VALUES tuple); a per-row scan context rejects an advancing call rather than
+# under-advancing. currval is a read-only session read.
+
+statement ok
+CREATE SEQUENCE seq
+
+# nextval advances from the start value (default 1) on each call.
+query I
+SELECT nextval('seq')
+----
+1
+
+query I
+SELECT nextval('seq')
+----
+2
+
+# currval returns the value the last nextval handed out in this session (no advance).
+query I
+SELECT currval('seq')
+----
+2
+
+query I
+SELECT currval('seq')
+----
+2
+
+# Two nextval calls in one row advance twice.
+query II
+SELECT nextval('seq'), nextval('seq')
+----
+3 4
+
+# setval jumps the sequence; the next nextval returns value + increment.
+query I
+SELECT setval('seq', 100)
+----
+100
+
+query I
+SELECT nextval('seq')
+----
+101
+
+# --- nextval inside INSERT ... VALUES advances once per tuple ---
+statement ok
+CREATE SEQUENCE order_seq
+
+statement ok
+CREATE TABLE orders (id INT, label TEXT)
+
+statement ok
+INSERT INTO orders (id, label) VALUES (nextval('order_seq'), 'a'), (nextval('order_seq'), 'b'), (nextval('order_seq'), 'c')
+
+query IT
+SELECT id, label FROM orders ORDER BY id
+----
+1 a
+2 b
+3 c
+
+# currval reflects the last advance across the multi-row insert.
+query I
+SELECT currval('order_seq')
+----
+3
+
+# nextval in a scalar arithmetic expression resolves (single-row, no FROM).
+query I
+SELECT nextval('order_seq') + 10
+----
+14
+
+# --- Error: an advancing call over a multi-row scan is rejected (not silently under-advanced) ---
+statement ok
+CREATE TABLE t3 (x INT)
+
+statement ok
+INSERT INTO t3 (x) VALUES (1), (2), (3)
+
+statement error
+SELECT nextval('seq') FROM t3
+
+# --- Error: currval before nextval in a fresh session sequence ---
+statement ok
+CREATE SEQUENCE fresh_seq
+
+statement error
+SELECT currval('fresh_seq')
+
+# --- Error: nextval on a sequence that does not exist ---
+statement error
+SELECT nextval('no_such_sequence')
+
+# --- Error: setval with the is_called = false form is not supported ---
+statement error
+SELECT setval('seq', 5, false)
+
+# --- Any sequence function in a per-row scan context is loud-rejected (uniform rule), including the
+#     read-only currval — sequence functions are supported only where evaluated exactly once. ---
+statement error
+SELECT currval('order_seq') FROM t3
+
+# setval in a no-FROM SELECT still works (single evaluation).
+query I
+SELECT setval('order_seq', 50)
+----
+50
+
+query I
+SELECT currval('order_seq')
+----
+50

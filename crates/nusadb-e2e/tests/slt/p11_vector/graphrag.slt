@@ -1,0 +1,121 @@
+# GraphRAG traversal: BFS and DFS over an entity/edge knowledge graph via
+# recursive CTEs — the reference query shape from the AI-workload research: vector-relevance
+# anchor (ORDER BY <=> LIMIT), an ARRAY path with `||` append, an `= ANY(path)` cycle guard,
+# JOINs in the recursive term, and a DISTINCT final select.
+
+statement ok
+CREATE TABLE kg_entities (id INT, name TEXT, embedding VECTOR(3))
+
+statement ok
+CREATE TABLE kg_edges (from_id INT, to_id INT, relation TEXT)
+
+# A small graph with a cycle (1 -> 2 -> 3 -> 1) and a branch (2 -> 4 -> 5):
+#   1 (query-closest) -> 2 -> 3 -> 1 (cycle back)
+#                        2 -> 4 -> 5
+statement ok
+INSERT INTO kg_entities VALUES
+  (1, 'alpha',   '[1,0,0]'),
+  (2, 'beta',    '[0.8,0.2,0]'),
+  (3, 'gamma',   '[0,1,0]'),
+  (4, 'delta',   '[0,0.5,0.5]'),
+  (5, 'epsilon', '[0,0,1]')
+
+statement ok
+INSERT INTO kg_edges VALUES
+  (1, 2, 'related_to'),
+  (2, 3, 'related_to'),
+  (3, 1, 'cycles_back'),
+  (2, 4, 'branches'),
+  (4, 5, 'leads_to')
+
+# BFS from the entity closest to the query vector [1,0,0] (= entity 1), depth <= 3.
+# The path array is the cycle guard: 3 -> 1 is not followed because 1 is already on the path.
+# Rows: depth 0: 1; depth 1: 2; depth 2: 3, 4; depth 3: 5 (3 -> 1 pruned).
+query ITI
+WITH RECURSIVE traverse AS (
+  (SELECT e.id, e.name, 0 AS depth, ARRAY[e.id] AS path
+   FROM kg_entities e
+   ORDER BY e.embedding <=> '[1,0,0]'::VECTOR(3)
+   LIMIT 1)
+  UNION ALL
+  SELECT e2.id, e2.name, t.depth + 1, t.path || e2.id
+  FROM traverse t
+  JOIN kg_edges edge ON edge.from_id = t.id
+  JOIN kg_entities e2 ON e2.id = edge.to_id
+  WHERE t.depth < 3
+    AND NOT (e2.id = ANY(t.path))
+)
+SELECT id, name, depth FROM traverse ORDER BY depth, id
+----
+1 alpha 0
+2 beta 1
+3 gamma 2
+4 delta 2
+5 epsilon 3
+
+# The path column itself renders as an array — the branch to 5 carries its full lineage.
+query T
+WITH RECURSIVE traverse AS (
+  SELECT e.id, ARRAY[e.id] AS path
+  FROM kg_entities e WHERE e.id = 1
+  UNION ALL
+  SELECT e2.id, t.path || e2.id
+  FROM traverse t
+  JOIN kg_edges edge ON edge.from_id = t.id
+  JOIN kg_entities e2 ON e2.id = edge.to_id
+  WHERE NOT (e2.id = ANY(t.path))
+)
+SELECT path FROM traverse WHERE id = 5
+----
+{1,2,4,5}
+
+# DISTINCT over the traversal: multiple anchor seeds (LIMIT 2: entities 1 and 2) reach shared
+# nodes; DISTINCT id collapses them.
+query I
+WITH RECURSIVE traverse AS (
+  (SELECT e.id, ARRAY[e.id] AS path
+   FROM kg_entities e
+   ORDER BY e.embedding <=> '[1,0,0]'::VECTOR(3)
+   LIMIT 2)
+  UNION ALL
+  SELECT e2.id, t.path || e2.id
+  FROM traverse t
+  JOIN kg_edges edge ON edge.from_id = t.id
+  JOIN kg_entities e2 ON e2.id = edge.to_id
+  WHERE NOT (e2.id = ANY(t.path))
+)
+SELECT DISTINCT id FROM traverse ORDER BY id
+----
+1
+2
+3
+4
+5
+
+# DFS variant: depth-first order = lexicographic order of the path text. From entity 2
+# the deep branch 2-3-... sorts before 2-4-... — children fully explored before siblings.
+query TI
+WITH RECURSIVE traverse AS (
+  SELECT e.id, e.name, 0 AS depth, CAST(e.id AS TEXT) AS path
+  FROM kg_entities e WHERE e.id = 2
+  UNION ALL
+  SELECT e2.id, e2.name, t.depth + 1, t.path || '.' || CAST(e2.id AS TEXT)
+  FROM traverse t
+  JOIN kg_edges edge ON edge.from_id = t.id
+  JOIN kg_entities e2 ON e2.id = edge.to_id
+  WHERE t.depth < 5
+    AND POSITION(CAST(e2.id AS TEXT) IN t.path) = 0
+)
+SELECT name, depth FROM traverse ORDER BY path
+----
+beta 0
+gamma 1
+alpha 2
+delta 1
+epsilon 2
+
+statement ok
+DROP TABLE kg_edges
+
+statement ok
+DROP TABLE kg_entities

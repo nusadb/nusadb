@@ -1,0 +1,47 @@
+# p1_ddl/information_schema_constraints — table_constraints / key_column_usage / statistics
+#. These views surface PK/UNIQUE/FK/CHECK constraints and indexes from the catalog so
+# JDBC getPrimaryKeys / getIndexInfo (and DataGrip's schema tree) can introspect them.
+
+statement ok
+CREATE TABLE dept (id INT NOT NULL PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE emp (id INT NOT NULL PRIMARY KEY, dept_id INT, email TEXT UNIQUE, age INT, FOREIGN KEY (dept_id) REFERENCES dept (id), CHECK (age >= 0))
+
+statement ok
+CREATE INDEX idx_emp_age ON emp (age)
+
+# table_constraints: one row per declared constraint, by type.
+query T
+SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 'emp' ORDER BY constraint_type
+----
+CHECK
+FOREIGN KEY
+PRIMARY KEY
+UNIQUE
+
+# key_column_usage: one row per key column (CHECK has none). PK=id, UNIQUE=email, FK=dept_id.
+query T
+SELECT column_name FROM information_schema.key_column_usage WHERE table_name = 'emp' ORDER BY column_name
+----
+dept_id
+email
+id
+
+# The exact pattern JDBC getPrimaryKeys uses: key columns of the PRIMARY KEY constraint.
+query T
+SELECT column_name FROM information_schema.key_column_usage
+WHERE table_name = 'emp'
+  AND constraint_name IN (
+    SELECT constraint_name FROM information_schema.table_constraints
+    WHERE table_name = 'emp' AND constraint_type = 'PRIMARY KEY'
+  )
+----
+id
+
+# statistics: the named secondary index over a non-unique column.
+query IIT
+SELECT non_unique, seq_in_index, column_name FROM information_schema.statistics
+WHERE table_name = 'emp' AND index_name = 'idx_emp_age'
+----
+1 1 age

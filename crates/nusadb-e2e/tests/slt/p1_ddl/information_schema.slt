@@ -1,0 +1,103 @@
+# p1_ddl/information_schema — read-only catalog introspection views.
+#
+# These views back driver/ORM reflection (DatabaseMetaData / getTables / getColumns).
+# They are queryable like any table, so WHERE / ORDER BY apply on top, and they are
+# readable without superuser privilege (unlike the reserved nusadb_* system catalog).
+
+statement ok
+CREATE TABLE emp (id INT NOT NULL, name TEXT, salary NUMERIC(10,2))
+
+statement ok
+CREATE TABLE dept (id INT NOT NULL)
+
+# --- information_schema.tables: user tables appear as BASE TABLE; system tables excluded ---
+query T
+SELECT table_name FROM information_schema.tables ORDER BY table_name
+----
+dept
+emp
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_name = 'emp'
+----
+BASE TABLE
+
+query TT
+SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_name = 'emp'
+----
+nusadb public
+
+# --- information_schema.columns: one row per column, with ordinal / type / nullability ---
+# data_type uses the standard SQL spelling (integer/text/numeric) so driver/ORM reflection maps
+# the type correctly (K2) — not the short SHOW COLUMNS form.
+query TITT
+SELECT column_name, ordinal_position, data_type, is_nullable
+FROM information_schema.columns WHERE table_name = 'emp' ORDER BY ordinal_position
+----
+id 1 integer NO
+name 2 text YES
+salary 3 numeric YES
+
+# Reflection columns (K2): character_maximum_length for VARCHAR/CHAR; numeric_precision/scale for
+# NUMERIC; NULL otherwise.
+statement ok
+CREATE TABLE reflect (a VARCHAR(20), b NUMERIC(10,2), c INT, d CHAR(5))
+
+query TIII
+SELECT column_name, character_maximum_length, numeric_precision, numeric_scale
+FROM information_schema.columns WHERE table_name = 'reflect' ORDER BY ordinal_position
+----
+a 20 NULL NULL
+b NULL 10 2
+c NULL NULL NULL
+d 5 NULL NULL
+
+# column_default (K7): the DEFAULT expression as SQL text; NULL when the column has none; a SERIAL
+# column reports its nextval('<sequence>') default.
+statement ok
+CREATE TABLE defs (id SERIAL, status TEXT DEFAULT 'active', n INT)
+
+query TT
+SELECT column_name, column_default
+FROM information_schema.columns WHERE table_name = 'defs' ORDER BY ordinal_position
+----
+id nextval('defs_id_seq')
+status 'active'
+n NULL
+
+# The pipeline applies on top of the view: filter columns down to one table + one column.
+query I
+SELECT ordinal_position FROM information_schema.columns
+WHERE table_name = 'emp' AND column_name = 'name'
+----
+2
+
+# --- information_schema.schemata: public + the synthetic information_schema + every CREATE SCHEMA
+# namespace (NS3), sorted by name ---
+query TT
+SELECT catalog_name, schema_name FROM information_schema.schemata ORDER BY schema_name
+----
+nusadb information_schema
+nusadb public
+
+statement ok
+CREATE SCHEMA analytics
+
+query TT
+SELECT catalog_name, schema_name FROM information_schema.schemata ORDER BY schema_name
+----
+nusadb analytics
+nusadb information_schema
+nusadb public
+
+statement ok
+DROP SCHEMA analytics
+
+# --- information_schema.views: non-materialized views with their name ---
+statement ok
+CREATE VIEW active_emp AS SELECT id FROM emp
+
+query T
+SELECT table_name FROM information_schema.views ORDER BY table_name
+----
+active_emp

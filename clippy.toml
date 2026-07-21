@@ -1,0 +1,21 @@
+avoid-breaking-exported-api    = false
+msrv                            = "1.95.0"
+cognitive-complexity-threshold  = 15
+type-complexity-threshold       = 250
+
+# Tests may use unwrap/expect/indexing/panic freely — they are assertions, not production code.
+allow-unwrap-in-tests           = true
+allow-expect-in-tests           = true
+allow-panic-in-tests            = true
+allow-indexing-slicing-in-tests = true
+
+# NusaDB own product/tech names that appear in doc comments. Without this,
+# clippy::doc_markdown (pedantic) demands backticks around every "NusaDB",
+# which is pure churn. We deliberately do NOT keep names of existing
+# third-party databases here — NusaDB is its own product, and referencing
+# competing databases in source comments is forbidden (plagiarism risk).
+# ".." keeps clippy's built-in default list (GitHub, etc.).
+doc-valid-idents = [
+    "NusaDB", "NusaScript", "SQLLogicTest",
+    "DoS", "MVCC", "..",
+]

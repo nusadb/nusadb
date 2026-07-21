@@ -1,0 +1,149 @@
+# p13_functions/scalar — string, conditional, and cast built-ins.
+
+query T
+SELECT UPPER('abc')
+----
+ABC
+
+query T
+SELECT LOWER('ABC')
+----
+abc
+
+query I
+SELECT LENGTH('hello')
+----
+5
+
+query T
+SELECT SUBSTRING('hello' FROM 2 FOR 3)
+----
+ell
+
+query T
+SELECT REPLACE('aXbXc', 'X', '-')
+----
+a-b-c
+
+query T
+SELECT CONCAT('a', 'b', 'c')
+----
+abc
+
+# Conditional built-ins. COALESCE takes the first non-NULL; a column gives NULL its type.
+statement ok
+CREATE TABLE c (a INT, b INT)
+
+statement ok
+INSERT INTO c VALUES (NULL, 3), (5, 6)
+
+query I
+SELECT COALESCE(a, b) FROM c ORDER BY b
+----
+3
+5
+
+# A leading bare NULL infers its type from a later argument.
+query I
+SELECT COALESCE(NULL, 7)
+----
+7
+
+# NVL / IFNULL are the two-argument aliases of COALESCE.
+query I
+SELECT NVL(a, b) FROM c ORDER BY b
+----
+3
+5
+
+query I
+SELECT IFNULL(NULL, 7)
+----
+7
+
+query I
+SELECT IFNULL(4, 7)
+----
+4
+
+# NVL / IFNULL require exactly two arguments.
+statement error
+SELECT NVL(1, 2, 3)
+
+query I
+SELECT NULLIF(5, 6)
+----
+5
+
+query I
+SELECT NULLIF(5, 5)
+----
+NULL
+
+query I
+SELECT GREATEST(1, 7, 3)
+----
+7
+
+query I
+SELECT LEAST(1, 7, 3)
+----
+1
+
+# NUM_NONNULLS / NUM_NULLS count arguments by NULL-ness across mixed types.
+query I
+SELECT NUM_NONNULLS(1, NULL, 'x', NULL, TRUE)
+----
+3
+
+query I
+SELECT NUM_NULLS(1, NULL, 'x', NULL, TRUE)
+----
+2
+
+# All-NULL and no-NULL extremes.
+query I
+SELECT NUM_NONNULLS(NULL, NULL)
+----
+0
+
+query I
+SELECT NUM_NULLS(1, 2, 3)
+----
+0
+
+# CAST in both directions.
+query I
+SELECT CAST('42' AS INTEGER)
+----
+42
+
+query T
+SELECT CAST(42 AS TEXT)
+----
+42
+
+# TRY_CAST / SAFE_CAST: a failed conversion yields NULL instead of erroring.
+query I
+SELECT TRY_CAST('42' AS INTEGER)
+----
+42
+
+query T
+SELECT TRY_CAST('not a number' AS INTEGER)
+----
+NULL
+
+query I
+SELECT SAFE_CAST('7' AS INTEGER)
+----
+7
+
+query T
+SELECT SAFE_CAST('xyz' AS INTEGER)
+----
+NULL
+
+# A failing hard CAST is still an error.
+statement error
+SELECT CAST('not a number' AS INTEGER)

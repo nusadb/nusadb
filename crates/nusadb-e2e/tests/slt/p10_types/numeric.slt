@@ -1,0 +1,98 @@
+# p10_types/numeric — NUMERIC / DECIMAL exact decimal.
+# Covers: NUMERIC(p,s) catalog type, display at declared scale, exact +/*/SUM/AVG/division,
+# numeric (not string) comparison + ORDER BY, negation, and precision-overflow rejection.
+
+statement ok
+CREATE TABLE prices (id INT NOT NULL, amount NUMERIC(10,2), qty NUMERIC(10,3))
+
+# Implicit string coercion, rescaled to each column's declared scale.
+statement ok
+INSERT INTO prices VALUES (1, '19.99', '2.000'), (2, '100.00', '0.500'), (3, '0.01', '3.333')
+
+# Display at the declared scale (amount -> 2 dp, qty -> 3 dp).
+query ITT
+SELECT id, amount, qty FROM prices ORDER BY id
+----
+1  19.99  2.000
+2  100.00  0.500
+3  0.01  3.333
+
+# Exact addition (no float drift): 0.01 + 0.01 = 0.02, not 0.0199999...
+query T
+SELECT amount + amount FROM prices ORDER BY id
+----
+39.98
+200.00
+0.02
+
+# Exact multiplication — scales add (2 + 3 = 5).
+query T
+SELECT amount * qty FROM prices WHERE id = 1
+----
+39.98000
+
+# Exact SUM stays NUMERIC.
+query T
+SELECT SUM(amount) FROM prices
+----
+120.00
+
+# AVG of NUMERIC stays exact NUMERIC (sum / count; division carries ~16+ sig digits, P0-R2-1).
+query T
+SELECT AVG(amount) FROM prices
+----
+40.000000000000000000
+
+# MIN keeps the exact value.
+query T
+SELECT MIN(amount) FROM prices
+----
+0.01
+
+# Division rounds half-away-from-zero, keeping ~16+ significant digits (P0-R2-1).
+query T
+SELECT CAST('10' AS NUMERIC) / CAST('3' AS NUMERIC) AS third
+----
+3.3333333333333333
+
+# Numeric comparison (not lexicographic) + ORDER BY.
+query I
+SELECT id FROM prices WHERE amount > CAST('20.00' AS NUMERIC) ORDER BY amount
+----
+2
+
+# Negation.
+query T
+SELECT -amount FROM prices WHERE id = 1
+----
+-19.99
+
+# A value exceeding the column precision is rejected.
+statement error
+INSERT INTO prices VALUES (9, '12345678901.00', '1.0')
+
+# --- NaN total ordering (Q18-NAN) ---
+# NaN sorts greater than every number (last in an ascending ORDER BY), consistently.
+query T
+SELECT x FROM (VALUES (CAST(1.0 AS FLOAT)), (CAST('NaN' AS FLOAT)), (CAST(2.0 AS FLOAT))) v(x) ORDER BY x
+----
+1.000
+2.000
+NaN
+
+# MAX is NaN (the greatest), MIN is the smallest real value.
+query T
+SELECT CAST(MAX(x) AS TEXT) FROM (VALUES (CAST(1.0 AS FLOAT)), (CAST('NaN' AS FLOAT)), (CAST(2.0 AS FLOAT))) v(x)
+----
+NaN
+
+query R
+SELECT MIN(x) FROM (VALUES (CAST(1.0 AS FLOAT)), (CAST('NaN' AS FLOAT)), (CAST(2.0 AS FLOAT))) v(x)
+----
+1.000
+
+# All NaN are one distinct value, distinct from the numbers.
+query I
+SELECT COUNT(DISTINCT x) FROM (VALUES (CAST('NaN' AS FLOAT)), (CAST('NaN' AS FLOAT)), (CAST(5.0 AS FLOAT))) v(x)
+----
+2

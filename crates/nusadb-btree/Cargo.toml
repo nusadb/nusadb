@@ -1,0 +1,26 @@
+[package]
+name         = "nusadb-btree"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "L5/L4 — clustered B-link/B+tree storage engine (second StorageEngine implementation, built beside the LSM; ADR 008, phases E0-E7)"
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+# DST fault points (deterministic simulation testing). Never enabled by production
+# dependents; the self dev-dependency below turns it on for this crate's own tests, so
+# `cargo test -p nusadb-btree` exercises the fail-stop pins with no extra flags.
+dst-fault = []
+
+[dependencies]
+nusadb-core = { workspace = true }
+nusadb-wal  = { workspace = true }
+
+[dev-dependencies]
+nusadb-btree = { path = ".", features = ["dst-fault"] }
+tempfile     = { workspace = true }

@@ -1,0 +1,49 @@
+# p10_types/timetz — TIME WITH TIME ZONE keeps its zone (P-TIMETZ, PG-faithful): a value renders
+# back with the offset it was entered with, comparison is by the UTC-equivalent instant
+# (un-normalized, like PG) tie-broken by zone, and equality requires BOTH instant and zone equal.
+
+statement ok
+CREATE TABLE t (id INT, tz TIME WITH TIME ZONE)
+
+statement ok
+INSERT INTO t VALUES (1, TIME WITH TIME ZONE '12:00:00+00'), (2, TIME WITH TIME ZONE '12:00:00+05:00'), (3, TIME WITH TIME ZONE '23:30:00-02:00')
+
+# Each value keeps its entered offset (a whole-hour offset renders short, like PG: +05, -02).
+query IT
+SELECT id, tz FROM t ORDER BY id
+----
+1 12:00:00+00
+2 12:00:00+05
+3 23:30:00-02
+
+# Ordering is by the UTC-equivalent instant, NOT normalized into one day (PG): 12:00+05 -> 07:00,
+# 12:00+00 -> 12:00, 23:30-02 -> 25:30 (not wrapped to 01:30).
+query I
+SELECT id FROM t ORDER BY tz
+----
+2
+1
+3
+
+# PG equality quirk: the same instant at a different zone is NOT equal (zone tie-break) ...
+query I
+SELECT id FROM t WHERE tz = TIME WITH TIME ZONE '07:00:00+00'
+----
+
+# ... equality needs the same zone ...
+query I
+SELECT id FROM t WHERE tz = TIME WITH TIME ZONE '12:00:00+05:00'
+----
+2
+
+# ... and at the same instant the more-westerly zone compares greater (PG timetz_cmp).
+query I
+SELECT id FROM t WHERE tz < TIME WITH TIME ZONE '07:00:00+00'
+----
+2
+
+# A half-hour offset renders with its minutes.
+query T
+SELECT TIME WITH TIME ZONE '09:15:00+05:30'
+----
+09:15:00+05:30

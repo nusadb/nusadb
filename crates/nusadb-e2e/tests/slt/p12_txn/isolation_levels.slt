@@ -1,0 +1,144 @@
+# p12_txn/isolation_levels — transaction isolation levels + access modes (feature-64).
+# The SLT connection keeps one Session across statements, so these exercise the SQL surface: every
+# isolation level is accepted at BEGIN and a single connection always sees its own writes; READ ONLY
+# rejects data-modifying statements; SET TRANSACTION only configures a not-yet-started transaction.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+# --- every isolation level is accepted at BEGIN; a single connection sees its own write ---
+statement ok
+BEGIN ISOLATION LEVEL READ UNCOMMITTED
+
+statement ok
+UPDATE t SET v = 11 WHERE id = 1
+
+query I
+SELECT v FROM t WHERE id = 1
+----
+11
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN ISOLATION LEVEL READ COMMITTED
+
+statement ok
+UPDATE t SET v = 12 WHERE id = 1
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN ISOLATION LEVEL REPEATABLE READ
+
+statement ok
+UPDATE t SET v = 13 WHERE id = 1
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN ISOLATION LEVEL SERIALIZABLE
+
+query I
+SELECT v FROM t WHERE id = 1
+----
+13
+
+statement ok
+COMMIT
+
+# --- SET TRANSACTION sets the session default for later transactions (outside any txn) ---
+statement ok
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
+
+statement ok
+BEGIN
+
+statement ok
+COMMIT
+
+# --- SET TRANSACTION inside an active transaction is rejected (characteristics fixed at BEGIN) ---
+statement ok
+BEGIN
+
+statement error
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+
+statement ok
+ROLLBACK
+
+# --- READ ONLY transaction: reads succeed, data-modifying statements are rejected ---
+statement ok
+BEGIN READ ONLY
+
+query I
+SELECT v FROM t WHERE id = 1
+----
+13
+
+statement error
+UPDATE t SET v = 99 WHERE id = 1
+
+statement error
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+ROLLBACK
+
+# the read-only-rejected writes left no trace
+query II rowsort
+SELECT id, v FROM t
+----
+1 13
+
+# --- READ WRITE transaction allows writes ---
+statement ok
+BEGIN READ WRITE
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+COMMIT
+
+query II rowsort
+SELECT id, v FROM t
+----
+1 13
+2 20
+
+# --- combined isolation level + access mode parses and runs ---
+statement ok
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+statement ok
+COMMIT
+
+# --- transaction-control well-formedness errors ---
+# nested BEGIN is rejected; the original transaction stays open
+statement ok
+BEGIN
+
+statement error
+BEGIN
+
+statement ok
+ROLLBACK
+
+# COMMIT / ROLLBACK with no active transaction are errors
+statement error
+COMMIT
+
+statement error
+ROLLBACK

@@ -1,0 +1,159 @@
+# p10_types/interval — INTERVAL + timestamp arithmetic.
+# Covers: INTERVAL catalog type, INTERVAL '…' literal + `{text}` coercion, canonical display,
+# interval ± interval, timestamp ± interval (calendar-aware month + day clamp), comparison/ORDER BY
+# (canonical estimate, so 1 day = 24h), and rejection of an invalid literal.
+
+statement ok
+CREATE TABLE bookings (id INT NOT NULL, span INTERVAL, starts TIMESTAMP)
+
+statement ok
+INSERT INTO bookings VALUES (1, INTERVAL '1 day', TIMESTAMP '2024-01-15 10:00:00')
+
+# Bare text coerces to INTERVAL.
+statement ok
+INSERT INTO bookings VALUES (2, '2 hours', TIMESTAMP '2024-03-01 09:00:00')
+
+statement ok
+INSERT INTO bookings VALUES (3, INTERVAL '1 year 2 months', TIMESTAMP '2024-01-31 12:00:00')
+
+# Canonical display.
+query IT
+SELECT id, span FROM bookings ORDER BY id
+----
+1  1 day
+2  02:00:00
+3  1 year 2 mons
+
+# TIMESTAMP + INTERVAL.
+query T
+SELECT starts + span FROM bookings WHERE id = 1
+----
+2024-01-16 10:00:00
+
+# Calendar-aware month add with day clamp: 2024-01-31 + 1 month -> 2024-02-29 (leap year).
+query T
+SELECT starts + INTERVAL '1 month' FROM bookings WHERE id = 3
+----
+2024-02-29 12:00:00
+
+# INTERVAL + INTERVAL.
+query T
+SELECT INTERVAL '1 day' + INTERVAL '2 hours' AS total
+----
+1 day 02:00:00
+
+# TIMESTAMP - INTERVAL.
+query T
+SELECT starts - INTERVAL '1 day' FROM bookings WHERE id = 1
+----
+2024-01-14 10:00:00
+
+# Comparison + ORDER BY by canonical estimate (1 day = 24 h, 1 month ≈ 30 days).
+query I
+SELECT id FROM bookings WHERE span > INTERVAL '3 hours' ORDER BY id
+----
+1
+3
+
+# Equality: 1 day == 24:00:00.
+query T
+SELECT CASE WHEN INTERVAL '1 day' = INTERVAL '24:00:00' THEN 'eq' ELSE 'ne' END
+----
+eq
+
+# An invalid interval literal is rejected.
+statement error
+INSERT INTO bookings VALUES (9, 'not an interval', TIMESTAMP '2024-01-01 00:00:00')
+
+# --- MAKE_INTERVAL (positional fields, each defaulting to 0) ---
+query T
+SELECT MAKE_INTERVAL(1, 2)
+----
+1 year 2 mons
+
+# Weeks fold into days (1 week = 7 days).
+query T
+SELECT MAKE_INTERVAL(0, 0, 1)
+----
+7 days
+
+query T
+SELECT MAKE_INTERVAL(0, 0, 0, 5)
+----
+5 days
+
+# Hours and minutes fold into the clock component.
+query T
+SELECT MAKE_INTERVAL(0, 0, 0, 0, 2, 30)
+----
+02:30:00
+
+# No arguments yields the zero interval.
+query T
+SELECT MAKE_INTERVAL()
+----
+00:00:00
+
+# A fractional seconds field.
+query T
+SELECT MAKE_INTERVAL(0, 0, 0, 0, 0, 0, 1.5)
+----
+00:00:01.500000
+
+# --- DATE_BIN (snap a timestamp to a stride-aligned bin) ---
+# 10:37 in 1-hour bins from midnight → 10:00.
+query T
+SELECT DATE_BIN(INTERVAL '1 hour', TIMESTAMP '2024-01-15 10:37:00', TIMESTAMP '2024-01-15 00:00:00')
+----
+2024-01-15 10:00:00
+
+# 15-minute bins → 10:30.
+query T
+SELECT DATE_BIN(INTERVAL '15 minutes', TIMESTAMP '2024-01-15 10:37:00', TIMESTAMP '2024-01-15 00:00:00')
+----
+2024-01-15 10:30:00
+
+# 1-day bins from a Jan 1 origin → start of the day.
+query T
+SELECT DATE_BIN(INTERVAL '1 day', TIMESTAMP '2024-01-15 10:37:00', TIMESTAMP '2024-01-01 00:00:00')
+----
+2024-01-15 00:00:00
+
+# A month/year stride is not a fixed duration and is rejected.
+statement error
+SELECT DATE_BIN(INTERVAL '1 month', TIMESTAMP '2024-01-15 10:00:00', TIMESTAMP '2024-01-01 00:00:00')
+
+# A zero stride is rejected.
+statement error
+SELECT DATE_BIN(INTERVAL '0 seconds', TIMESTAMP '2024-01-15 10:00:00', TIMESTAMP '2024-01-01 00:00:00')
+
+# NULL propagates.
+query T
+SELECT CAST(DATE_BIN(INTERVAL '1 hour', CAST(NULL AS TIMESTAMP), TIMESTAMP '2024-01-01 00:00:00') AS TEXT)
+----
+NULL
+
+# --- JUSTIFY_DAYS / JUSTIFY_HOURS / JUSTIFY_INTERVAL (B-fn) ---
+# JUSTIFY_DAYS rolls every 30 days into a month.
+query T
+SELECT JUSTIFY_DAYS(INTERVAL '35 days')
+----
+1 mon 5 days
+
+# JUSTIFY_HOURS rolls every 24 hours into a day.
+query T
+SELECT JUSTIFY_HOURS(INTERVAL '49 hours')
+----
+2 days 01:00:00
+
+# JUSTIFY_INTERVAL applies both: 49 h -> 2 days (carried into the 35 -> 37 days), then 37 -> 1 mon 7 days.
+query T
+SELECT JUSTIFY_INTERVAL(INTERVAL '35 days 49 hours')
+----
+1 mon 7 days 01:00:00
+
+# NULL propagates.
+query T
+SELECT CAST(JUSTIFY_DAYS(CAST(NULL AS INTERVAL)) AS TEXT)
+----
+NULL

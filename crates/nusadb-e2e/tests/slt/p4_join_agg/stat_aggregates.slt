@@ -1,0 +1,290 @@
+# p4_join_agg/stat_aggregates — BOOL_AND / BOOL_OR / STDDEV / VARIANCE aggregates.
+#
+# Boolean and statistical aggregates over a group, including NULL-skip and small-group behavior.
+
+statement ok
+CREATE TABLE t (g INT, flag BOOL, n INT)
+
+statement ok
+INSERT INTO t VALUES (1, TRUE, 2), (1, TRUE, 4), (1, FALSE, 6), (2, TRUE, 10), (2, TRUE, 10)
+
+# --- BOOL_AND / BOOL_OR (a BOOL renders as 0/1 in the test harness) ---
+query III
+SELECT g, BOOL_AND(flag), BOOL_OR(flag) FROM t GROUP BY g ORDER BY g
+----
+1 0 1
+2 1 1
+
+# Scalar (whole-table) booleans.
+query I
+SELECT BOOL_OR(flag) FROM t
+----
+1
+
+# EVERY is the SQL-standard alias for BOOL_AND.
+query III
+SELECT g, EVERY(flag), BOOL_AND(flag) FROM t GROUP BY g ORDER BY g
+----
+1 0 0
+2 1 1
+
+# NULLs are skipped.
+statement ok
+INSERT INTO t VALUES (3, NULL, 1)
+
+query T
+SELECT CAST(BOOL_AND(flag) AS TEXT) FROM t WHERE g = 3
+----
+NULL
+
+# --- VARIANCE / STDDEV (sample) ---
+# Group 1 has n = {2, 4, 6}: mean 4, sample variance = ((4+0+4))/2 = 4, stddev = 2.
+query R
+SELECT VARIANCE(n) FROM t WHERE g = 1
+----
+4.000
+
+query R
+SELECT STDDEV(n) FROM t WHERE g = 1
+----
+2.000
+
+# Group 2 has n = {10, 10}: variance 0, stddev 0.
+query R
+SELECT STDDEV(n) FROM t WHERE g = 2
+----
+0.000
+
+# A single value gives NULL sample variance/stddev.
+query T
+SELECT CAST(VARIANCE(n) AS TEXT) FROM t WHERE g = 3
+----
+NULL
+
+# STDDEV_SAMP / VAR_SAMP aliases.
+query R
+SELECT VAR_SAMP(n) FROM t WHERE g = 1
+----
+4.000
+
+# --- VAR_POP / STDDEV_POP (population, divisor n) ---
+# Group 1 n = {2, 4, 6}: population variance = (4+0+4)/3 = 8/3, stddev = sqrt(8/3).
+query R
+SELECT VAR_POP(n) FROM t WHERE g = 1
+----
+2.667
+
+query R
+SELECT STDDEV_POP(n) FROM t WHERE g = 1
+----
+1.633
+
+# Unlike the sample form, a single value has a defined population variance of 0 (not NULL).
+query R
+SELECT VAR_POP(n) FROM t WHERE g = 3
+----
+0.000
+
+# --- STRING_AGG(expr, separator) ---
+statement ok
+CREATE TABLE names (g INT, name TEXT)
+
+statement ok
+INSERT INTO names VALUES (1, 'a'), (1, 'b'), (1, 'c'), (2, 'x')
+
+query IT
+SELECT g, STRING_AGG(name, ',') FROM names GROUP BY g ORDER BY g
+----
+1 a,b,c
+2 x
+
+# Scalar over every row, in input order.
+query T
+SELECT STRING_AGG(name, '-') FROM names
+----
+a-b-c-x
+
+# NULLs are skipped.
+statement ok
+INSERT INTO names VALUES (3, NULL), (3, 'z')
+
+query T
+SELECT STRING_AGG(name, ',') FROM names WHERE g = 3
+----
+z
+
+# A non-constant separator is rejected.
+statement error
+SELECT STRING_AGG(name, name) FROM names
+
+# --- GROUP_CONCAT (an alternate spelling of STRING_AGG; separator defaults to ',') ---
+query IT
+SELECT g, GROUP_CONCAT(name) FROM names WHERE g <= 2 GROUP BY g ORDER BY g
+----
+1 a,b,c
+2 x
+
+# An explicit separator is honored, exactly like STRING_AGG.
+query T
+SELECT GROUP_CONCAT(name, '|') FROM names WHERE g <= 2
+----
+a|b|c|x
+
+# --- BIT_AND / BIT_OR ---
+# Group 1 n = {2, 4, 6}: 010 & 100 & 110 = 000 = 0; 010 | 100 | 110 = 110 = 6.
+query I
+SELECT BIT_AND(n) FROM t WHERE g = 1
+----
+0
+
+query I
+SELECT BIT_OR(n) FROM t WHERE g = 1
+----
+6
+
+# Group 2 n = {10, 10}: AND = OR = 10.
+query I
+SELECT BIT_AND(n) FROM t WHERE g = 2
+----
+10
+
+# An empty group yields NULL.
+query T
+SELECT CAST(BIT_OR(n) AS TEXT) FROM t WHERE g = 99
+----
+NULL
+
+# --- BIT_XOR (B-fn) ---
+# Group 1 n = {2, 4, 6}: 010 ^ 100 ^ 110 = 000 = 0.
+query I
+SELECT BIT_XOR(n) FROM t WHERE g = 1
+----
+0
+
+# Group 2 n = {10, 10}: a value XORed with itself cancels to 0.
+query I
+SELECT BIT_XOR(n) FROM t WHERE g = 2
+----
+0
+
+# An empty group yields NULL.
+query T
+SELECT CAST(BIT_XOR(n) AS TEXT) FROM t WHERE g = 99
+----
+NULL
+
+# --- CORR / COVAR_POP / COVAR_SAMP ---
+statement ok
+CREATE TABLE xy (g INT, y INT, x INT)
+
+statement ok
+INSERT INTO xy VALUES (1, 1, 1), (1, 2, 2), (1, 3, 3), (2, 5, 5), (3, 1, 7), (3, 2, 7)
+
+# Group 1: y = x exactly, so correlation is 1, COVAR_SAMP = 1, COVAR_POP = 2/3.
+query R
+SELECT CORR(y, x) FROM xy WHERE g = 1
+----
+1.000
+
+query R
+SELECT COVAR_SAMP(y, x) FROM xy WHERE g = 1
+----
+1.000
+
+query R
+SELECT COVAR_POP(y, x) FROM xy WHERE g = 1
+----
+0.667
+
+# Group 2 has a single pair: sample covariance is NULL, population covariance is 0.
+query T
+SELECT CAST(COVAR_SAMP(y, x) AS TEXT) FROM xy WHERE g = 2
+----
+NULL
+
+query R
+SELECT COVAR_POP(y, x) FROM xy WHERE g = 2
+----
+0.000
+
+# Group 3 has constant x (zero variance), so correlation is undefined (NULL).
+query T
+SELECT CAST(CORR(y, x) AS TEXT) FROM xy WHERE g = 3
+----
+NULL
+
+# A pair with a NULL on either side is skipped entirely.
+statement ok
+INSERT INTO xy VALUES (4, 1, 1), (4, 2, 2), (4, NULL, 3), (4, 4, NULL)
+
+query R
+SELECT CORR(y, x) FROM xy WHERE g = 4
+----
+1.000
+
+# --- REGR_* linear regression family ---
+# Group 5 follows y = 2x + 1 exactly: (1,3), (2,5), (3,7).
+statement ok
+INSERT INTO xy VALUES (5, 3, 1), (5, 5, 2), (5, 7, 3)
+
+# REGR_COUNT is the pair count (INT).
+query I
+SELECT REGR_COUNT(y, x) FROM xy WHERE g = 5
+----
+3
+
+# Slope = 2, intercept = 1 for the line y = 2x + 1.
+query R
+SELECT REGR_SLOPE(y, x) FROM xy WHERE g = 5
+----
+2.000
+
+query R
+SELECT REGR_INTERCEPT(y, x) FROM xy WHERE g = 5
+----
+1.000
+
+# A perfect linear fit has R^2 = 1.
+query R
+SELECT REGR_R2(y, x) FROM xy WHERE g = 5
+----
+1.000
+
+# Means and sums of squares over group 1 (1,1),(2,2),(3,3): avgx=avgy=2, Sxx=Syy=Sxy=2.
+query R
+SELECT REGR_AVGX(y, x) FROM xy WHERE g = 1
+----
+2.000
+
+query R
+SELECT REGR_SXY(y, x) FROM xy WHERE g = 1
+----
+2.000
+
+# REGR_COUNT counts only non-NULL pairs: group 4 has 4 rows but 2 complete pairs.
+query I
+SELECT REGR_COUNT(y, x) FROM xy WHERE g = 4
+----
+2
+
+# Constant x (zero Sxx) leaves slope / intercept / R^2 undefined (NULL), but REGR_COUNT is defined.
+query I
+SELECT REGR_COUNT(y, x) FROM xy WHERE g = 3
+----
+2
+
+query T
+SELECT CAST(REGR_SLOPE(y, x) AS TEXT) FROM xy WHERE g = 3
+----
+NULL
+
+# An empty group: REGR_COUNT is 0, the rest are NULL.
+query I
+SELECT REGR_COUNT(y, x) FROM xy WHERE g = 99
+----
+0
+
+query T
+SELECT CAST(REGR_AVGX(y, x) AS TEXT) FROM xy WHERE g = 99
+----
+NULL

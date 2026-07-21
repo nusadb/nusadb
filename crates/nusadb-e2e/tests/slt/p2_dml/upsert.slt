@@ -1,0 +1,86 @@
+# INSERT ... ON CONFLICT: DO NOTHING skips a conflicting row; DO UPDATE upserts the
+# existing row from the proposed EXCLUDED row.
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, v TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'a'), (2, 'b')
+
+# DO NOTHING with a conflict target skips id=1, inserts id=3.
+statement ok
+INSERT INTO t VALUES (1, 'x'), (3, 'c') ON CONFLICT (id) DO NOTHING
+
+query IT
+SELECT id, v FROM t ORDER BY id
+----
+1  a
+2  b
+3  c
+
+# DO UPDATE: id=2 conflicts -> v becomes EXCLUDED.v; id=4 inserts.
+statement ok
+INSERT INTO t VALUES (2, 'B2'), (4, 'd') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+
+query IT
+SELECT id, v FROM t ORDER BY id
+----
+1  a
+2  B2
+3  c
+4  d
+
+# A bare column is the existing row; EXCLUDED the proposed one. WHERE gates the update — here the
+# values are equal, so nothing changes.
+statement ok
+INSERT INTO t VALUES (2, 'B2') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE t.v <> EXCLUDED.v
+
+# An accumulating upsert: keep the existing id, append the proposed value.
+statement ok
+INSERT INTO t VALUES (1, 'Z') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+
+query IT
+SELECT id, v FROM t WHERE id = 1
+----
+1  Z
+
+# RETURNING projects the final affected row.
+query IT
+INSERT INTO t VALUES (4, 'D4') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v RETURNING id, v
+----
+4  D4
+
+# DO UPDATE requires a conflict target.
+statement error
+INSERT INTO t VALUES (1, 'z') ON CONFLICT DO UPDATE SET v = 'z'
+
+# The target columns must match a UNIQUE / PRIMARY KEY constraint.
+statement error
+INSERT INTO t VALUES (1, 'z') ON CONFLICT (v) DO UPDATE SET v = 'z'
+
+statement ok
+DROP TABLE t
+
+# A DO UPDATE that moves a secondary UNIQUE column onto another row's value is rejected, exactly as
+# a plain UPDATE would be (B2.09f).
+statement ok
+CREATE TABLE u (id INT PRIMARY KEY, k INT, UNIQUE (k))
+
+statement ok
+INSERT INTO u VALUES (1, 10), (2, 20)
+
+statement error
+INSERT INTO u VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET k = EXCLUDED.k
+
+# A non-colliding update still works.
+statement ok
+INSERT INTO u VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET k = EXCLUDED.k
+
+query II
+SELECT id, k FROM u ORDER BY id
+----
+1  99
+2  20
+
+statement ok
+DROP TABLE u

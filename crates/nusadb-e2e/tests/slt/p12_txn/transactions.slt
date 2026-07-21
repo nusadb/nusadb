@@ -1,0 +1,62 @@
+# p12_txn/transactions — explicit transaction control: BEGIN / COMMIT / ROLLBACK / SAVEPOINT.
+# The SLT connection keeps one Session across statements, so BEGIN ... COMMIT behaves as a client's.
+
+statement ok
+CREATE TABLE acct (id INT, bal INT)
+
+statement ok
+INSERT INTO acct VALUES (1, 100)
+
+# ROLLBACK discards the transaction's changes.
+statement ok
+BEGIN
+
+statement ok
+UPDATE acct SET bal = 999 WHERE id = 1
+
+statement ok
+ROLLBACK
+
+query I
+SELECT bal FROM acct WHERE id = 1
+----
+100
+
+# COMMIT persists them.
+statement ok
+BEGIN
+
+statement ok
+UPDATE acct SET bal = 200 WHERE id = 1
+
+statement ok
+COMMIT
+
+query I
+SELECT bal FROM acct WHERE id = 1
+----
+200
+
+# SAVEPOINT + ROLLBACK TO undoes work after the savepoint, keeping work before it.
+statement ok
+BEGIN
+
+statement ok
+UPDATE acct SET bal = 300 WHERE id = 1
+
+statement ok
+SAVEPOINT sp1
+
+statement ok
+UPDATE acct SET bal = 400 WHERE id = 1
+
+statement ok
+ROLLBACK TO SAVEPOINT sp1
+
+statement ok
+COMMIT
+
+query I
+SELECT bal FROM acct WHERE id = 1
+----
+300

@@ -1,0 +1,617 @@
+# p13_functions/string_extra — string padding, trimming, and extraction functions.
+#
+# Covers: LPAD, RPAD, LTRIM, RTRIM, BTRIM, LEFT, RIGHT, SPLIT_PART, REVERSE,
+#         POSITION, and CARDINALITY.
+
+# --- LPAD / RPAD ---
+query T
+SELECT LPAD('hi', 5)
+----
+   hi
+
+query T
+SELECT LPAD('hi', 5, 'xy')
+----
+xyxhi
+
+query T
+SELECT RPAD('hi', 5)
+----
+hi
+
+query T
+SELECT RPAD('hi', 5, 'xy')
+----
+hixyx
+
+query T
+SELECT LPAD('hello', 3)
+----
+hel
+
+# --- TRIM family ---
+query T
+SELECT LTRIM('  hello')
+----
+hello
+
+query T
+SELECT RTRIM('hello  ')
+----
+hello
+
+query T
+SELECT BTRIM('  hello  ')
+----
+hello
+
+query T
+SELECT LTRIM('xxhelloxx', 'x')
+----
+helloxx
+
+query T
+SELECT RTRIM('xxhelloxx', 'x')
+----
+xxhello
+
+query T
+SELECT BTRIM('xxhelloxx', 'x')
+----
+hello
+
+# --- LEFT / RIGHT ---
+query T
+SELECT LEFT('abcdef', 3)
+----
+abc
+
+query T
+SELECT RIGHT('abcdef', 3)
+----
+def
+
+query T
+SELECT LEFT('abcdef', -2)
+----
+abcd
+
+query T
+SELECT RIGHT('abcdef', -2)
+----
+cdef
+
+# --- SPLIT_PART ---
+query T
+SELECT SPLIT_PART('a,b,c', ',', 2)
+----
+b
+
+query T
+SELECT SPLIT_PART('one|two|three', '|', 3)
+----
+three
+
+query T
+SELECT SPLIT_PART('hello', ',', 1)
+----
+hello
+
+# --- REVERSE ---
+query T
+SELECT REVERSE('abc')
+----
+cba
+
+query T
+SELECT REVERSE('')
+----
+(empty)
+
+# --- POSITION (POSITION(sub IN str)) ---
+query I
+SELECT POSITION('bc' IN 'abcdef')
+----
+2
+
+query I
+SELECT POSITION('x' IN 'abcdef')
+----
+0
+
+query I
+SELECT POSITION('' IN 'abc')
+----
+1
+
+# --- ASCII / CHR (round-trip) ---
+query I
+SELECT ASCII('A')
+----
+65
+
+query I
+SELECT ASCII('abc')
+----
+97
+
+query I
+SELECT ASCII('')
+----
+0
+
+query T
+SELECT CHR(65)
+----
+A
+
+query T
+SELECT CHR(97)
+----
+a
+
+# --- INITCAP ---
+query T
+SELECT INITCAP('hello world')
+----
+Hello World
+
+query T
+SELECT INITCAP('hi-THERE, friend')
+----
+Hi-There, Friend
+
+# --- REPEAT ---
+query T
+SELECT REPEAT('ab', 3)
+----
+ababab
+
+query T
+SELECT REPEAT('x', 0)
+----
+(empty)
+
+# --- STRPOS (haystack-first, vs POSITION's needle-first) ---
+query I
+SELECT STRPOS('abcdef', 'cd')
+----
+3
+
+query I
+SELECT STRPOS('abcdef', 'z')
+----
+0
+
+# --- TRANSLATE ---
+query T
+SELECT TRANSLATE('hello', 'el', 'ip')
+----
+hippo
+
+query T
+SELECT TRANSLATE('abcdef', 'bdf', 'x')
+----
+axce
+
+# --- NULL propagation ---
+query T
+SELECT ASCII(NULL)
+----
+NULL
+
+query T
+SELECT INITCAP(NULL)
+----
+NULL
+
+query T
+SELECT TRANSLATE(NULL, 'a', 'b')
+----
+NULL
+
+# --- CARDINALITY ---
+query I
+SELECT CARDINALITY(ARRAY[1, 2, 3])
+----
+3
+
+query I
+SELECT CARDINALITY(ARRAY[1])
+----
+1
+
+query T
+SELECT CAST(NULL AS INT[])
+----
+NULL
+
+# --- OCTET_LENGTH / BIT_LENGTH ---
+query I
+SELECT OCTET_LENGTH('abc')
+----
+3
+
+query I
+SELECT BIT_LENGTH('abc')
+----
+24
+
+# A multi-byte UTF-8 character counts its bytes, not characters.
+query I
+SELECT OCTET_LENGTH('é')
+----
+2
+
+query I
+SELECT LENGTH('é')
+----
+1
+
+query T
+SELECT OCTET_LENGTH(NULL)
+----
+NULL
+
+# --- STARTS_WITH ---
+query T
+SELECT STARTS_WITH('hello world', 'hello')
+----
+1
+
+query T
+SELECT STARTS_WITH('hello', 'world')
+----
+0
+
+query T
+SELECT STARTS_WITH('abc', '')
+----
+1
+
+query T
+SELECT STARTS_WITH(NULL, 'x')
+----
+NULL
+
+# --- ARRAY_LENGTH / ARRAY_TO_STRING / STRING_TO_ARRAY ---
+query I
+SELECT ARRAY_LENGTH(ARRAY[10, 20, 30], 1)
+----
+3
+
+# An empty array has no dimension -> NULL; a second dimension -> NULL.
+query T
+SELECT CAST(ARRAY_LENGTH(ARRAY[5], 2) AS TEXT)
+----
+NULL
+
+# ARRAY_LOWER is 1 and ARRAY_UPPER is the length for a non-empty 1-D array.
+query I
+SELECT ARRAY_LOWER(ARRAY[10, 20, 30], 1)
+----
+1
+
+query I
+SELECT ARRAY_UPPER(ARRAY[10, 20, 30], 1)
+----
+3
+
+# A dimension other than 1 yields NULL.
+query T
+SELECT CAST(ARRAY_UPPER(ARRAY[1, 2], 2) AS TEXT)
+----
+NULL
+
+query T
+SELECT ARRAY_TO_STRING(ARRAY[1, 2, 3], '-')
+----
+1-2-3
+
+query T
+SELECT ARRAY_TO_STRING(ARRAY['a', 'b'], ', ')
+----
+a, b
+
+# STRING_TO_ARRAY round-trips with ARRAY_TO_STRING.
+query I
+SELECT ARRAY_LENGTH(STRING_TO_ARRAY('a,b,c', ','), 1)
+----
+3
+
+query T
+SELECT ARRAY_TO_STRING(STRING_TO_ARRAY('x|y|z', '|'), '-')
+----
+x-y-z
+
+query T
+SELECT ARRAY_TO_STRING(CAST(NULL AS INT[]), ',')
+----
+NULL
+
+# --- ARRAY_APPEND / ARRAY_PREPEND / ARRAY_CAT ---
+query T
+SELECT ARRAY_TO_STRING(ARRAY_APPEND(ARRAY[1, 2], 3), ',')
+----
+1,2,3
+
+query T
+SELECT ARRAY_TO_STRING(ARRAY_PREPEND(0, ARRAY[1, 2]), ',')
+----
+0,1,2
+
+query T
+SELECT ARRAY_TO_STRING(ARRAY_CAT(ARRAY[1, 2], ARRAY[3, 4]), ',')
+----
+1,2,3,4
+
+# Appending to a NULL array yields a one-element array (NULL array = empty).
+query I
+SELECT ARRAY_LENGTH(ARRAY_APPEND(CAST(NULL AS INT[]), 9), 1)
+----
+1
+
+# An appended NULL element is kept.
+query I
+SELECT ARRAY_LENGTH(ARRAY_APPEND(ARRAY[1, 2], NULL), 1)
+----
+3
+
+# --- ARRAY_POSITION / ARRAY_REMOVE ---
+# ARRAY_POSITION returns the 1-based index of the first matching element.
+query I
+SELECT ARRAY_POSITION(ARRAY[10, 20, 30], 20)
+----
+2
+
+# A missing element yields NULL.
+query I
+SELECT ARRAY_POSITION(ARRAY[10, 20, 30], 99)
+----
+NULL
+
+# ARRAY_REMOVE drops every matching element.
+query T
+SELECT ARRAY_TO_STRING(ARRAY_REMOVE(ARRAY[1, 2, 3, 2], 2), ',')
+----
+1,3
+
+# Removing from an array without the element leaves it unchanged.
+query I
+SELECT ARRAY_LENGTH(ARRAY_REMOVE(ARRAY[1, 2, 3], 9), 1)
+----
+3
+
+# --- ARRAY_REPLACE / ARRAY_POSITIONS / ARRAY_NDIMS (B-fn) ---
+# ARRAY_REPLACE swaps every matching element for the replacement.
+query T
+SELECT ARRAY_TO_STRING(ARRAY_REPLACE(ARRAY[1, 2, 3, 2], 2, 9), ',')
+----
+1,9,3,9
+
+# ARRAY_POSITIONS lists every 1-based index of the element.
+query T
+SELECT ARRAY_TO_STRING(ARRAY_POSITIONS(ARRAY[10, 20, 30, 20], 20), ',')
+----
+2,4
+
+# No match yields an empty array (length NULL per array semantics).
+query I
+SELECT ARRAY_LENGTH(ARRAY_POSITIONS(ARRAY[1, 2, 3], 9), 1)
+----
+NULL
+
+# ARRAY_NDIMS is 1 for a non-empty array.
+query I
+SELECT ARRAY_NDIMS(ARRAY[1, 2, 3])
+----
+1
+
+# An empty array has no dimensions.
+query I
+SELECT ARRAY_NDIMS(CAST(ARRAY_REMOVE(ARRAY[1], 1) AS INT[]))
+----
+NULL
+
+# NULL array propagates.
+query I
+SELECT ARRAY_NDIMS(CAST(NULL AS INT[]))
+----
+NULL
+
+# --- SHA256 / SHA512 — known test vectors ---
+query T
+SELECT SHA256('abc')
+----
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+
+query T
+SELECT SHA256('')
+----
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+query T
+SELECT SHA512('abc')
+----
+ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
+
+# Hash functions propagate NULL.
+query T
+SELECT SHA256(NULL)
+----
+NULL
+
+# --- MD5 — RFC 1321 vectors; non-security fingerprint ---
+query T
+SELECT MD5('abc')
+----
+900150983cd24fb0d6963f7d28e17f72
+
+query T
+SELECT MD5('')
+----
+d41d8cd98f00b204e9800998ecf8427e
+
+# Spans multiple 64-byte blocks.
+query T
+SELECT MD5('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789')
+----
+d174ab98d277d9f5a5611c2c9f419d9f
+
+query T
+SELECT MD5(NULL)
+----
+NULL
+
+# --- ENCODE / DECODE base64 (B-fn) — RFC 4648 round-trip ---
+# ENCODE renders raw bytes as base64; the tail-padding cases ('f' → one byte, 'fo' → two) exercise
+# the '=' padding.
+query T
+SELECT ENCODE(DECODE('foobar', 'escape'), 'base64')
+----
+Zm9vYmFy
+
+query T
+SELECT ENCODE(DECODE('f', 'escape'), 'base64')
+----
+Zg==
+
+# DECODE inverts ENCODE: base64 text back to the original bytes, rendered here via escape.
+query T
+SELECT ENCODE(DECODE('Zm9vYmFy', 'base64'), 'escape')
+----
+foobar
+
+# --- QUOTE_LITERAL / QUOTE_IDENT ---
+# A plain string is wrapped in single quotes.
+query T
+SELECT QUOTE_LITERAL('hello')
+----
+'hello'
+
+# Embedded single quotes are doubled.
+query T
+SELECT QUOTE_LITERAL('it''s')
+----
+'it''s'
+
+# A safe lowercase identifier is returned unquoted.
+query T
+SELECT QUOTE_IDENT('foo')
+----
+foo
+
+# A name needing quoting is double-quoted.
+query T
+SELECT QUOTE_IDENT('Foo Bar')
+----
+"Foo Bar"
+
+# Embedded double quotes are doubled.
+query T
+SELECT QUOTE_IDENT('a"b')
+----
+"a""b"
+
+# An empty identifier becomes an empty quoted identifier.
+query T
+SELECT QUOTE_IDENT('')
+----
+""
+
+# Both propagate NULL.
+query T
+SELECT QUOTE_LITERAL(NULL)
+----
+NULL
+
+query T
+SELECT QUOTE_IDENT(NULL)
+----
+NULL
+
+# --- FORMAT (B-fn) ---
+# %s substitutes the plain text of each argument, in order.
+query T
+SELECT FORMAT('Hello, %s!', 'World')
+----
+Hello, World!
+
+# %s renders a non-text argument via its text form; %% is a literal percent.
+query T
+SELECT FORMAT('%s has %s items (%s%%)', 'cart', 3, 50)
+----
+cart has 3 items (50%)
+
+# %I quotes an identifier (a space forces double quotes); %L quotes a literal (doubling the quote).
+query T
+SELECT FORMAT('%I = %L', 'col name', 'va''lue')
+----
+"col name" = 'va''lue'
+
+# %s of NULL is the empty string; %L of NULL is the unquoted word NULL.
+query T
+SELECT FORMAT('[%s]', NULL)
+----
+[]
+
+query T
+SELECT FORMAT('%L', NULL)
+----
+NULL
+
+# Too few arguments for the specifiers is an error.
+statement error
+SELECT FORMAT('%s %s', 'only one')
+
+# An unknown specifier is rejected.
+statement error
+SELECT FORMAT('%q', 'x')
+
+# --- OVERLAY ---
+# Replace 4 characters starting at position 2 with 'hom': 'Txxxxas' -> 'Thomas'.
+query T
+SELECT OVERLAY('Txxxxas' PLACING 'hom' FROM 2 FOR 4)
+----
+Thomas
+
+# Without FOR, the removed length defaults to the replacement's length.
+query T
+SELECT OVERLAY('abcdef' PLACING 'XY' FROM 3)
+----
+abXYef
+
+# FOR 0 inserts without removing.
+query T
+SELECT OVERLAY('abc' PLACING '-' FROM 2 FOR 0)
+----
+a-bc
+
+# A start past the end appends.
+query T
+SELECT OVERLAY('abc' PLACING 'Z' FROM 99)
+----
+abcZ
+
+# NULL propagates.
+query T
+SELECT OVERLAY(NULL PLACING 'x' FROM 1)
+----
+NULL
+
+# --- ARRAY_DIMS ---
+query T
+SELECT ARRAY_DIMS(ARRAY[10, 20, 30])
+----
+[1:3]
+
+query T
+SELECT ARRAY_DIMS(ARRAY['x'])
+----
+[1:1]
+
+# An empty array (here produced by removing the only element) has no dimensions.
+query T
+SELECT ARRAY_DIMS(ARRAY_REMOVE(ARRAY[1], 1))
+----
+NULL

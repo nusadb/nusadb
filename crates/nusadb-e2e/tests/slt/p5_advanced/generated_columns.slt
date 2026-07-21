@@ -1,0 +1,106 @@
+# p5_advanced/generated_columns — GENERATED ALWAYS AS (<expr>) STORED computed columns.
+
+# A STORED generated column is computed from the row's other columns on INSERT.
+statement ok
+CREATE TABLE line (qty INT, price INT, total INT GENERATED ALWAYS AS (qty * price) STORED)
+
+statement ok
+INSERT INTO line (qty, price) VALUES (3, 5), (2, 10)
+
+query III
+SELECT qty, price, total FROM line ORDER BY qty
+----
+2 10 20
+3 5 15
+
+# Updating a column the generated expression depends on recomputes it.
+statement ok
+UPDATE line SET qty = 4 WHERE price = 5
+
+query I
+SELECT total FROM line WHERE price = 5
+----
+20
+
+# An explicit value for a generated column is rejected on INSERT.
+statement error
+INSERT INTO line (qty, price, total) VALUES (1, 1, 999)
+
+# ...and on UPDATE.
+statement error
+UPDATE line SET total = 0 WHERE price = 5
+
+# A NULL dependency yields NULL (the column is nullable here).
+statement ok
+INSERT INTO line (qty) VALUES (7)
+
+query I
+SELECT total FROM line WHERE qty = 7
+----
+NULL
+
+# VIRTUAL (the default when STORED is omitted) is not supported — declare STORED.
+statement error
+CREATE TABLE v (a INT, b INT GENERATED ALWAYS AS (a + 1))
+
+# A generated column may not reference another generated column (reference-engine parity).
+statement error
+CREATE TABLE g2 (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED, c INT GENERATED ALWAYS AS (b + 1) STORED)
+
+# A generated expression may not contain a subquery.
+statement error
+CREATE TABLE gsub (a INT, b INT GENERATED ALWAYS AS ((SELECT 1)) STORED)
+
+# A NOT NULL generated column whose expression computes NULL is a violation.
+statement ok
+CREATE TABLE nn (a INT, b INT NOT NULL GENERATED ALWAYS AS (a + 1) STORED)
+
+statement error
+INSERT INTO nn (a) VALUES (NULL)
+
+statement ok
+INSERT INTO nn (a) VALUES (10)
+
+query I
+SELECT b FROM nn
+----
+11
+
+# ON CONFLICT DO UPDATE recomputes the generated column from the updated dependency, and may not SET it.
+statement ok
+CREATE TABLE up (id INT NOT NULL, qty INT, total INT GENERATED ALWAYS AS (qty * 2) STORED, PRIMARY KEY (id))
+
+statement ok
+INSERT INTO up (id, qty) VALUES (1, 5)
+
+statement ok
+INSERT INTO up (id, qty) VALUES (1, 8) ON CONFLICT (id) DO UPDATE SET qty = 8
+
+query I
+SELECT total FROM up WHERE id = 1
+----
+16
+
+statement error
+INSERT INTO up (id, qty) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET total = 99
+
+# MERGE ... WHEN MATCHED THEN UPDATE recomputes the generated column too.
+statement ok
+CREATE TABLE mt (id INT NOT NULL, qty INT, total INT GENERATED ALWAYS AS (qty * 3) STORED, PRIMARY KEY (id))
+
+statement ok
+INSERT INTO mt (id, qty) VALUES (1, 2)
+
+statement ok
+CREATE TABLE msrc (id INT, qty INT)
+
+statement ok
+INSERT INTO msrc (id, qty) VALUES (1, 10)
+
+statement ok
+MERGE INTO mt USING msrc ON mt.id = msrc.id WHEN MATCHED THEN UPDATE SET qty = msrc.qty
+
+query I
+SELECT total FROM mt WHERE id = 1
+----
+30

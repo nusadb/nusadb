@@ -1,0 +1,39 @@
+# p10_types/uuid — UUID type.
+# Covers: catalog type, implicit string coercion, CAST, canonical (lowercase, hyphenated)
+# display incl. normalization of bare-hex/uppercase input, and equality predicates.
+
+statement ok
+CREATE TABLE u (id INT NOT NULL, guid UUID)
+
+# Implicit string coercion.
+statement ok
+INSERT INTO u VALUES (1, '550e8400-e29b-41d4-a716-446655440000')
+
+# Explicit CAST.
+statement ok
+INSERT INTO u VALUES (2, CAST('6ba7b810-9dad-11d1-80b4-00c04fd430c8' AS UUID))
+
+# Uppercase + a value given without hyphens both normalize to canonical lowercase hyphenated form.
+statement ok
+INSERT INTO u VALUES (3, '00112233-4455-6677-8899-AABBCCDDEEFF')
+
+statement ok
+INSERT INTO u VALUES (4, 'a0b1c2d3e4f5a6b7c8d9eafbacfdaeff')
+
+query IT rowsort
+SELECT id, guid FROM u
+----
+1  550e8400-e29b-41d4-a716-446655440000
+2  6ba7b810-9dad-11d1-80b4-00c04fd430c8
+3  00112233-4455-6677-8899-aabbccddeeff
+4  a0b1c2d3-e4f5-a6b7-c8d9-eafbacfdaeff
+
+# Equality predicate against a CAST literal.
+query I
+SELECT id FROM u WHERE guid = CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID)
+----
+1
+
+# A malformed UUID is rejected at execution time.
+statement error
+INSERT INTO u VALUES (5, 'not-a-uuid')

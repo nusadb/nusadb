@@ -1,0 +1,374 @@
+# p10_types/json — JSON / JSONB.
+# Covers: JSON catalog type, canonical (sorted-key) storage, spaced display/text form, the `->`,
+# `->>`, `@>` operators, CAST text<->json, and rejection of invalid JSON.
+
+statement ok
+CREATE TABLE docs (id INT NOT NULL, body JSON)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"name": "alice", "age": 30, "tags": ["a","b"]}')
+
+# Unordered keys + extra whitespace normalize to the canonical (sorted) form; stored compact, the
+# displayed/cast-to-text form is spaced after each colon and comma (standard jsonb output).
+statement ok
+INSERT INTO docs VALUES (2, '{ "b": 2, "a": 1 }')
+
+query IT
+SELECT id, body FROM docs ORDER BY id
+----
+1  {"age": 30, "name": "alice", "tags": ["a", "b"]}
+2  {"a": 1, "b": 2}
+
+# `->` fetches a field as JSON.
+query T
+SELECT body -> 'tags' FROM docs WHERE id = 1
+----
+["a", "b"]
+
+# `->>` fetches a field as text (a JSON string is unquoted).
+query T
+SELECT body ->> 'name' FROM docs WHERE id = 1
+----
+alice
+
+# `->` array indexing chained with `->>` (0-based; element returned as text).
+query T
+SELECT (body -> 'tags') ->> 0 FROM docs WHERE id = 1
+----
+a
+
+# A missing field yields NULL.
+query T
+SELECT body ->> 'missing' FROM docs WHERE id = 1
+----
+NULL
+
+# `@>` containment in a predicate (right side given as text, parsed as JSON).
+query I
+SELECT id FROM docs WHERE body @> '{"a":1}'
+----
+2
+
+# CAST text -> JSON canonicalizes; JSON typed literal.
+query T
+SELECT CAST('[3, 1, 2]' AS JSON)
+----
+[3, 1, 2]
+
+query T
+SELECT JSON '{"z":1,"a":2}'
+----
+{"a": 2, "z": 1}
+
+# Invalid JSON is rejected on store.
+statement error
+INSERT INTO docs VALUES (9, 'not json')
+
+# --- JSON_TYPEOF / JSON_ARRAY_LENGTH ---
+query T
+SELECT JSON_TYPEOF(JSON '{"a":1}')
+----
+object
+
+query T
+SELECT JSON_TYPEOF(JSON '[1,2,3]')
+----
+array
+
+query T
+SELECT JSON_TYPEOF(JSON '42')
+----
+number
+
+query T
+SELECT JSON_TYPEOF(CAST('"hi"' AS JSON))
+----
+string
+
+query T
+SELECT JSONB_TYPEOF(JSON 'true')
+----
+boolean
+
+query I
+SELECT JSON_ARRAY_LENGTH(JSON '[10, 20, 30]')
+----
+3
+
+query I
+SELECT JSON_ARRAY_LENGTH(JSON '[]')
+----
+0
+
+# Array length of a non-array is NULL.
+query T
+SELECT CAST(JSON_ARRAY_LENGTH(JSON '{"a":1}') AS TEXT)
+----
+NULL
+
+# NULL propagation.
+query T
+SELECT JSON_TYPEOF(CAST(NULL AS JSON))
+----
+NULL
+
+# --- TO_JSON / JSON_BUILD_OBJECT ---
+query T
+SELECT TO_JSON(42)
+----
+42
+
+query T
+SELECT TO_JSON('hi')
+----
+"hi"
+
+query T
+SELECT TO_JSON(CAST(NULL AS INT))
+----
+null
+
+# JSON_BUILD_OBJECT: keys sorted (JSONB canonical form), values typed.
+query T
+SELECT JSON_BUILD_OBJECT('b', 2, 'a', 'x')
+----
+{"a": "x", "b": 2}
+
+# A NULL value becomes JSON null; the embedded JSON is preserved.
+query T
+SELECT JSONB_BUILD_OBJECT('k', CAST(NULL AS INT), 'nested', JSON '[1,2]')
+----
+{"k": null, "nested": [1, 2]}
+
+# A NULL key is rejected.
+statement error
+SELECT JSON_BUILD_OBJECT(CAST(NULL AS TEXT), 1)
+
+# An odd argument count is rejected.
+statement error
+SELECT JSON_BUILD_OBJECT('a')
+
+# JSON_TYPEOF over a built object confirms it is an object.
+query T
+SELECT JSON_TYPEOF(JSON_BUILD_OBJECT('a', 1))
+----
+object
+
+# --- ROW_TO_JSON ---
+# A ROW(...) constructor serializes to an object with positional field names f1, f2, ….
+query T
+SELECT ROW_TO_JSON(ROW(1, 'a', true))
+----
+{"f1": 1, "f2": "a", "f3": true}
+
+# A NULL element becomes JSON null (it does not propagate NULL); nested JSON is preserved.
+query T
+SELECT ROW_TO_JSON(ROW(1, CAST(NULL AS INT), JSON '[1,2]'))
+----
+{"f1": 1, "f2": null, "f3": [1, 2]}
+
+# Field names stay in positional order past nine fields (f10 must not sort before f2).
+query T
+SELECT ROW_TO_JSON(ROW(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11))
+----
+{"f1": 1, "f2": 2, "f3": 3, "f4": 4, "f5": 5, "f6": 6, "f7": 7, "f8": 8, "f9": 9, "f10": 10, "f11": 11}
+
+# ROW_TO_JSON produces a JSON object.
+query T
+SELECT JSON_TYPEOF(ROW_TO_JSON(ROW(1, 2)))
+----
+object
+
+# A non-row argument is rejected rather than silently mis-serialized.
+statement error
+SELECT ROW_TO_JSON(42)
+
+# ROW_TO_JSON over a table/alias keys the object by real column names, in column order.
+statement ok
+CREATE TABLE rj_demo (id INT, name TEXT, active BOOL)
+
+statement ok
+INSERT INTO rj_demo VALUES (1, 'alice', true), (2, NULL, false)
+
+# Whole-table-row: real column names, declared order preserved, NULL column → JSON null.
+query T
+SELECT ROW_TO_JSON(rj_demo) FROM rj_demo ORDER BY id
+----
+{"id": 1, "name": "alice", "active": true}
+{"id": 2, "name": null, "active": false}
+
+# A table alias resolves the same way.
+query T
+SELECT ROW_TO_JSON(t) FROM rj_demo AS t ORDER BY t.id
+----
+{"id": 1, "name": "alice", "active": true}
+{"id": 2, "name": null, "active": false}
+
+# A name that is neither a ROW(...) nor a relation in scope is rejected.
+statement error
+SELECT ROW_TO_JSON(no_such_table)
+
+# --- JSONB_SET ---
+# Replace an existing object key.
+query T
+SELECT JSONB_SET(JSON '{"a":1,"b":2}', ARRAY['a'], JSON '99')
+----
+{"a": 99, "b": 2}
+
+# A nested path.
+query T
+SELECT JSONB_SET(JSON '{"a":{"b":1}}', ARRAY['a','b'], JSON '7')
+----
+{"a": {"b": 7}}
+
+# An array element by index.
+query T
+SELECT JSONB_SET(JSON '[10,20,30]', ARRAY['1'], JSON '99')
+----
+[10, 99, 30]
+
+# A negative array index counts from the end.
+query T
+SELECT JSONB_SET(JSON '[10,20,30]', ARRAY['-1'], JSON '0')
+----
+[10, 20, 0]
+
+# By default a missing key is created; with create_missing=false it is left unchanged.
+query T
+SELECT JSONB_SET(JSON '{"a":1}', ARRAY['c'], JSON '3')
+----
+{"a": 1, "c": 3}
+
+query T
+SELECT JSONB_SET(JSON '{"a":1}', ARRAY['c'], JSON '3', FALSE)
+----
+{"a": 1}
+
+# NULL target propagates.
+query T
+SELECT CAST(JSONB_SET(CAST(NULL AS JSON), ARRAY['a'], JSON '1') AS TEXT)
+----
+NULL
+
+# --- JSONB_STRIP_NULLS / JSONB_PRETTY ---
+# Object members with a null value are dropped (recursively); array nulls are kept.
+query T
+SELECT JSONB_STRIP_NULLS(JSON '{"a":1,"b":null,"c":2}')
+----
+{"a": 1, "c": 2}
+
+query T
+SELECT JSONB_STRIP_NULLS(JSON '{"a":{"b":null,"c":3},"d":[1,null,2]}')
+----
+{"a": {"c": 3}, "d": [1, null, 2]}
+
+# JSONB_PRETTY round-trips to the same document once all whitespace is collapsed.
+query T
+SELECT REGEXP_REPLACE(JSONB_PRETTY(JSON '{"a":1,"b":[2,3]}'), '\s+', '', 'g')
+----
+{"a":1,"b":[2,3]}
+
+# Pretty output spans multiple lines.
+query T
+SELECT REGEXP_LIKE(JSONB_PRETTY(JSON '{"a":1}'), CHR(10))
+----
+1
+
+# NULL propagates.
+query T
+SELECT CAST(JSONB_STRIP_NULLS(CAST(NULL AS JSON)) AS TEXT)
+----
+NULL
+
+# --- JSONB_OBJECT_KEYS (set-returning) ---
+# One row per top-level key, in canonical (sorted) order.
+query T
+SELECT JSONB_OBJECT_KEYS(JSON '{"b":1,"a":2,"c":3}')
+----
+a
+b
+c
+
+# A non-object document yields no rows.
+query T
+SELECT JSONB_OBJECT_KEYS(JSON '[1,2,3]')
+----
+
+# An empty object yields no rows.
+query T
+SELECT JSONB_OBJECT_KEYS(JSON '{}')
+----
+
+# --- JSONB_INSERT (insert without overwriting) ---
+# A new object key is inserted.
+query T
+SELECT JSONB_INSERT(JSON '{"a":1}', ARRAY['b'], JSON '2')
+----
+{"a": 1, "b": 2}
+
+# An existing object key is left untouched (unlike JSONB_SET).
+query T
+SELECT JSONB_INSERT(JSON '{"a":1}', ARRAY['a'], JSON '9')
+----
+{"a": 1}
+
+# Into an array: insert before the indexed element by default.
+query T
+SELECT JSONB_INSERT(JSON '[0,1,2]', ARRAY['1'], JSON '9')
+----
+[0, 9, 1, 2]
+
+# With insert_after = TRUE, insert after the indexed element.
+query T
+SELECT JSONB_INSERT(JSON '[0,1,2]', ARRAY['1'], JSON '9', TRUE)
+----
+[0, 1, 9, 2]
+
+# NULL target propagates.
+query T
+SELECT CAST(JSONB_INSERT(CAST(NULL AS JSON), ARRAY['a'], JSON '1') AS TEXT)
+----
+NULL
+
+# --- JSONB_EXISTS(json, key): the `?` operator as a function (the tokenizer reserves `?` for
+# parameters, so the operator form is unavailable). Renders as 0/1. ---
+# A top-level object key that exists.
+query T
+SELECT JSONB_EXISTS(JSON '{"a": 1, "b": 2}', 'a')
+----
+1
+
+# A top-level object key that is absent.
+query T
+SELECT JSONB_EXISTS(JSON '{"a": 1}', 'c')
+----
+0
+
+# A nested key is NOT a top-level key.
+query T
+SELECT JSONB_EXISTS(JSON '{"a": {"b": 1}}', 'b')
+----
+0
+
+# An array contains a string element.
+query T
+SELECT JSONB_EXISTS(JSON '["x", "y"]', 'x')
+----
+1
+
+query T
+SELECT JSONB_EXISTS(JSON '["x", "y"]', 'z')
+----
+0
+
+# A scalar JSON string equals the key.
+query T
+SELECT JSONB_EXISTS(JSON '"foo"', 'foo')
+----
+1
+
+# NULL json propagates to NULL.
+query T
+SELECT CAST(JSONB_EXISTS(CAST(NULL AS JSON), 'a') AS TEXT)
+----
+NULL

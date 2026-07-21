@@ -1,0 +1,48 @@
+[package]
+name         = "nusadb-storage"
+version      = { workspace = true }
+edition      = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+rust-version = { workspace = true }
+description  = "L7 — Physical storage: 8 KiB page format, disk manager, B-tree, catalog"
+repository   = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+# Open the data file unbuffered (O_DIRECT / FILE_FLAG_NO_BUFFERING) and route page I/O through
+# 4 KiB-aligned bounce buffers, bypassing the OS page cache. Off by default (buffered I/O). See
+# the `disk` module docs. Benchmark with:
+#   cargo bench -p nusadb-storage --bench disk_io            (buffered)
+#   cargo bench -p nusadb-storage --bench disk_io --features direct-io
+direct-io = []
+
+[dependencies]
+nusadb-core = { workspace = true }
+thiserror   = { workspace = true }
+bytes       = { workspace = true }
+bytemuck    = { workspace = true }
+crc32fast   = { workspace = true }
+parking_lot = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+nusadb-test-utils = { workspace = true }
+nusadb-sim        = { workspace = true }
+criterion         = { workspace = true }
+proptest          = { workspace = true }
+tempfile          = { workspace = true }
+
+[[bench]]
+name    = "disk_io"
+harness = false
+
+[[bench]]
+name    = "buffer_pool"
+harness = false
+
+[[bench]]
+name    = "page_insert"
+harness = false

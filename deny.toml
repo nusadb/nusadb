@@ -1,0 +1,51 @@
+# cargo-deny config — format v2 is the default for cargo-deny >= 0.16 / cargo-deny-action@v2.
+# No top-level `version` key: it was removed from the schema (the only remnant is the
+# per-section `version` under [licenses], which is also unnecessary on v2 defaults).
+
+[graph]
+all-features = false
+no-default-features = false
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "BSL-1.0", # Boost Software License — permissive, OSI-approved (rustyline deps: error-code, clipboard-win)
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+highlight         = "all"
+deny = [
+    { name = "openssl",    reason = "Use rustls — memory-safe TLS" },
+    { name = "native-tls", reason = "Use rustls — memory-safe TLS" },
+    # Ban every published spelling of the broken hashes — `cargo-deny` matches the exact package
+    # name, and the standalone (`md5`/`sha1`) and RustCrypto (`md-5`/`sha-1`) crates differ; listing
+    # only one spelling left the others un-guarded (P1-R2). `md-5` is pulled transitively by the
+    # `sqllogictest` dev-dependency for non-security result hashing, so it is allowed *only* via that
+    # wrapper — direct/production use is still blocked.
+    { name = "md5",        reason = "Cryptographically broken; use sha2 or blake3" },
+    { name = "md-5",       wrappers = ["sqllogictest"], reason = "Cryptographically broken; only the SLT test harness's non-security hashing may pull it" },
+    { name = "sha1",       reason = "Deprecated; use sha2" },
+    { name = "sha-1",      reason = "Deprecated; use sha2" },
+]
+
+[advisories]
+# db-path / db-urls dihapus di cargo-deny 0.16; advisory DB di-fetch otomatis oleh action.
+yanked = "deny"
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

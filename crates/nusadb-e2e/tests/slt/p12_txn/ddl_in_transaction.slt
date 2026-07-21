@@ -1,0 +1,118 @@
+# p12_txn/ddl_in_transaction — DDL inside an explicit transaction.
+#
+# A table created inside a BEGIN block must be visible to later statements in the SAME
+# transaction (CREATE then INSERT/SELECT), and a ROLLBACK must undo the whole thing —
+# table and rows — so the name is free again afterwards. This works only because schema
+# resolution runs under the session's open-transaction snapshot; before that fix
+# the INSERT below failed to analyze ("table not found") even though the CREATE succeeded.
+
+# --- CREATE + INSERT + SELECT in one transaction, then COMMIT ---
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE made_in_txn (a INT)
+
+# the just-created table is visible to a later statement in the same transaction
+statement ok
+INSERT INTO made_in_txn VALUES (1), (2)
+
+query I
+SELECT a FROM made_in_txn ORDER BY a
+----
+1
+2
+
+statement ok
+COMMIT
+
+# survives the commit
+query I
+SELECT a FROM made_in_txn ORDER BY a
+----
+1
+2
+
+# --- catalog introspection sees a table created earlier in the SAME transaction ---
+# information_schema.tables and SHOW TABLES enumerate under the transaction's snapshot, so a
+# table created in this open transaction is listed before COMMIT — matching INSERT/SELECT resolution.
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE catalog_in_txn (a INT)
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'catalog_in_txn'
+----
+1
+
+statement ok
+COMMIT
+
+statement ok
+DROP TABLE catalog_in_txn
+
+# --- ROLLBACK undoes a CREATE + its rows; the name is free again ---
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE rolled_back (a INT)
+
+statement ok
+INSERT INTO rolled_back VALUES (99)
+
+statement ok
+ROLLBACK
+
+# the table is gone — recreating under the same name succeeds (no "already exists")
+statement ok
+CREATE TABLE rolled_back (a INT)
+
+# and it is empty (the rolled-back INSERT left nothing behind)
+query I
+SELECT COUNT(*) FROM rolled_back
+----
+0
+
+statement ok
+DROP TABLE rolled_back
+
+# --- ROLLBACK TO SAVEPOINT undoes a CREATE done after the savepoint ---
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE keep_me (a INT)
+
+statement ok
+SAVEPOINT sp
+
+statement ok
+CREATE TABLE drop_me (a INT)
+
+statement ok
+ROLLBACK TO SAVEPOINT sp
+
+# drop_me (created after the savepoint) is undone; keep_me (before it) survives the commit
+statement ok
+INSERT INTO keep_me VALUES (7)
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM keep_me ORDER BY a
+----
+7
+
+# drop_me must not exist — recreating it succeeds
+statement ok
+CREATE TABLE drop_me (a INT)
+
+statement ok
+DROP TABLE drop_me
+
+statement ok
+DROP TABLE keep_me
