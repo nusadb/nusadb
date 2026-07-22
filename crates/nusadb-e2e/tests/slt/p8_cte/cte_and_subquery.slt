@@ -110,7 +110,7 @@ SELECT id, salary FROM b ORDER BY id, salary
 # --- Deep WITH RECURSIVE past the former 10k-round cap (Q-RECCTE-ITERCAP-FALSE-NONTERMINATION) ---
 # A valid linear recursion 12000 deep must run to completion: the recursion is bounded by work_mem
 # (its rows fit the budget), not an arbitrary round count. The old 10_000-iteration cap false-rejected
-# this as "non-terminating recursion"; PostgreSQL runs it.
+# this as "non-terminating recursion", even though it terminates normally.
 query II
 WITH RECURSIVE deep AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM deep WHERE n < 12000) SELECT count(*), max(n) FROM deep
 ----

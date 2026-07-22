@@ -37,10 +37,9 @@ This covers the on-wire byte format and message exchange:
 It does not specify SQL semantics (that is the engine's surface) nor TLS internals beyond the
 handshake ordering (rustls / TLS 1.3, see §5.1).
 
-This is a native protocol — it is not PostgreSQL's wire protocol. Several type bytes and
-sub-codes deliberately echo PostgreSQL's *numbering* (e.g. SASL auth sub-codes `10/11/12`) for
-implementor familiarity, but the magic, version negotiation, startup payload, and field framing
-are NusaDB's own. Do not assume a PostgreSQL driver will interoperate.
+This is a native protocol — NusaDB's own format, not a re-implementation of any other database's
+wire protocol. The magic, version negotiation, startup payload, message framing, and every type
+byte and sub-code are NusaDB's own. Do not assume a third-party database driver will interoperate.
 
 ## 2. Versioning
 
@@ -100,7 +99,7 @@ complement.
 ```
 [ len : u32 ] [ bytes : len ]     // UTF-8, NOT null-terminated
 ```
-A length-prefixed UTF-8 byte run. There is no trailing `\0` (unlike PostgreSQL's C-strings).
+A length-prefixed UTF-8 byte run. There is no trailing `\0`; the length prefix delimits it.
 A decoder MUST validate UTF-8 and reject invalid sequences (`InvalidString`). The encoder MUST
 error rather than truncate if `len > u32::MAX` (`FieldTooLarge`).
 

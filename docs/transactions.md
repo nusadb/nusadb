@@ -59,7 +59,7 @@ SET default_transaction_isolation = 'serializable';                   -- session
 ```
 
 `SET TRANSACTION ISOLATION LEVEL` after the transaction has already run a query is refused with
-`25001`, matching PostgreSQL's "must be called before any query". `BEGIN READ ONLY` /
+`25001`: it must be set before the transaction runs any query. `BEGIN READ ONLY` /
 `SET TRANSACTION READ ONLY` are refused loudly over the wire for now (the wire layer does not yet
 enforce access modes; an error is safer than silently granting a writable "read-only"
 transaction).
