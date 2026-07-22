@@ -61,11 +61,26 @@ Run a single test while iterating:
 cargo test -p nusadb-storage btree::tests::insert_split
 ```
 
-## Commit & PR
+## Branching & pull requests
 
-- Keep PRs scoped to one concern.
-- Describe what changed and why, and how it was tested, in the PR description.
-- Green `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test` are the minimum bar for review.
+`master` is the stable, always-releasable trunk. Releases are tagged from it (`vX.Y.Z`), which
+triggers the binary + GitHub Release build. Don't commit directly to `master`.
+
+For an external contribution:
+
+1. Fork the repo and branch off `master` with a short topic name: `feat/<topic>`, `fix/<topic>`,
+   `docs/<topic>`, or `chore/<topic>`.
+2. Make focused commits (one concern per PR). Keep the branch rebased on the latest `master`.
+3. Open a pull request against `master`. CI runs `fmt` + `clippy -D warnings` + the test suite; all
+   must be green.
+4. A maintainer reviews and merges. Larger or architectural changes: open a discussion / issue first.
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org): `feat:`, `fix:`,
+`docs:`, `chore:`, `test:`, `perf:`, `refactor:` — a concise imperative summary, details in the body.
+Don't put internal tracker IDs or issue codenames in messages or code; describe the change itself.
+
+Green `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace` are the minimum bar for review.
 
 ## Where things go
 
