@@ -1,7 +1,7 @@
 # Contributing to NusaDB
 
-Thanks for contributing. NusaDB is a database engine — **correctness is non-negotiable**, so the
-contribution bar is higher than a typical app. Read this before opening a PR.
+Thanks for contributing. NusaDB is a database engine, so correctness matters more than in a typical
+app and the contribution bar is a bit higher. Please read this before opening a PR.
 
 ## Getting started
 
@@ -20,33 +20,35 @@ cargo deny check all          # if cargo-deny is installed
 Toolchain is pinned to **Rust 1.95.0, edition 2024** (`rust-toolchain.toml`). Don't bump it in a
 feature PR.
 
-## The rules that get PRs rejected
+## What gets a PR rejected
 
-1. **Dependency direction.** Crates form a layered graph (`cli → … → storage → core`). An inner
-   crate must never import an outer one. If two crates need a shared type, it goes in
-   `nusadb-core`. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the layer/crate map.
-2. **No async below L2.** `tokio` is allowed only in `nusadb-wire`, `nusadb-server`, `nusadb-cli`.
-   Storage/WAL/LSM/txn stay synchronous so they run under deterministic simulation.
-3. **No hidden I/O, time, or randomness in engine code.** Take `&dyn PageStore` / `&dyn Clock` /
-   `&impl Rng` (defined in `nusadb-core`). Direct `std::time::now()`, `rand`, or filesystem calls
-   break DST and will be rejected.
-4. **No `.unwrap()` / `unimplemented!()` in non-test code.** These are `deny` clippy lints. Return
-   `Result` and use `?`.
-5. **No third-party database protocol libraries.** The wire protocol is NusaDB's own original format.
+A handful of hard rules, mostly there to keep the engine testable and the layering honest:
+
+- Respect the dependency direction. The crates form a layered graph (`cli → … → storage → core`);
+  an inner crate must never import an outer one. Shared types go in `nusadb-core`. The full map is in
+  [`ARCHITECTURE.md`](ARCHITECTURE.md).
+- No async below L2. `tokio` is allowed only in `nusadb-wire`, `nusadb-server`, and `nusadb-cli`. The
+  storage, WAL, and transaction layers stay synchronous so they run under deterministic simulation.
+- No hidden I/O, time, or randomness in engine code. Take `&dyn PageStore`, `&dyn Clock`, and
+  `&impl Rng` (all from `nusadb-core`). A direct `std::time::now()`, `rand`, or filesystem call breaks
+  DST and will be rejected.
+- No `.unwrap()` or `unimplemented!()` in non-test code — they are `deny` clippy lints. Return a
+  `Result` and use `?`.
+- No third-party database protocol libraries. The wire protocol is NusaDB's own original format.
 
 ## Test placement convention
 
-Tests go in a crate's **`tests/` directory** (sibling of `src/`), one file per source module,
-named **`test_<module>.rs`** (e.g. `src/memtable.rs` → `tests/test_memtable.rs`). These are
-integration tests: a separate crate that exercises only the **public API** — so they double as a
-check that the public surface is usable. Add `#![allow(clippy::unwrap_used, ...)]` at the top
-since the in-tests clippy carve-outs do not apply to a separate test crate.
+Tests go in a crate's `tests/` directory (a sibling of `src/`), one file per source module, named
+`test_<module>.rs` — for example `src/page.rs` gets `tests/test_page.rs`. These are integration
+tests: a separate crate that exercises only the public API, so they double as a check that the
+public surface is actually usable. Put `#![allow(clippy::unwrap_used, ...)]` at the top, since the
+in-test clippy carve-outs don't apply to a separate test crate.
 
-The **only** exception is a true white-box unit test that must reach a module's *private*
-internals (e.g. `page.rs` checksum math, `btree` node split). Those stay inline as
-`#[cfg(test)] mod tests` — we do **not** make internals `pub` just to relocate a test, because
-loosening encapsulation on storage internals is an integrity risk for a database. Everything that
-can be expressed against the public API lives in `tests/`.
+The one exception is a true white-box unit test that has to reach a module's private internals —
+`page.rs` checksum math, or a `btree` node split. Those stay inline as `#[cfg(test)] mod tests`. We
+don't make internals `pub` just to move a test out, because loosening encapsulation on storage
+internals is an integrity risk for a database. Anything that can be written against the public API
+lives in `tests/`.
 
 ## Tests are part of the change, not a follow-up
 
@@ -88,7 +90,7 @@ Green `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warning
 |---|---|
 | A type used by 3+ crates | `nusadb-core` |
 | Layer-specific code | `nusadb-{that-layer}` |
-| Cross-crate integration test | `tests/integration/` |
+| Cross-crate / end-to-end test | `crates/nusadb-e2e` |
 | Architectural decision | `ARCHITECTURE.md` |
 
 When in doubt about placement, see [`ARCHITECTURE.md`](ARCHITECTURE.md) or open a discussion.
