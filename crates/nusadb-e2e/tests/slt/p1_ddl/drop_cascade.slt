@@ -1,4 +1,4 @@
-# Q-DROP-CASCADE (QA Q50): DROP TABLE ... CASCADE drops the FOREIGN KEYs on other tables that
+# DROP TABLE ... CASCADE drops the FOREIGN KEYs on other tables that
 # reference it — the standard's semantics: the dependent CONSTRAINT goes, never the child table
 # or its rows. Plain DROP still refuses (RESTRICT).
 

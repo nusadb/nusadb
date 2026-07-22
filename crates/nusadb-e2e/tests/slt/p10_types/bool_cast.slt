@@ -1,5 +1,5 @@
 # p10_types/bool_cast — text→BOOL accepts the full PG set of boolean string inputs, case-insensitive
-# with surrounding whitespace ignored: true/false, t/f, yes/no, y/n, on/off, 1/0 (Q-BOOL-STRING-REPS).
+# with surrounding whitespace ignored: true/false, t/f, yes/no, y/n, on/off, 1/0.
 
 # Truthy spellings.
 query T

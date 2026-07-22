@@ -89,7 +89,7 @@ INSERT INTO other_customer VALUES (1, 'gold')
 statement error
 SELECT id FROM customer JOIN other_customer ON customer.id = other_customer.id
 
-# --- USING / NATURAL coalesce the join column into one output column (Q-JOIN-USING-COALESCE) ---
+# --- USING / NATURAL coalesce the join column into one output column ---
 statement ok
 CREATE TABLE aa (k INT, x TEXT)
 

@@ -30,7 +30,7 @@ SELECT id, CASE WHEN n > 0 THEN 'pos' END FROM g ORDER BY id
 2 NULL
 3 pos
 
-# --- A bare NULL branch takes the type unified from the other branches (Q-CASE-NULL-INFER). A first
+# --- A bare NULL branch takes the type unified from the other branches. A first
 # THEN of NULL must not make the CASE an "ambiguous NULL" error when a later branch is typed. ---
 
 # THEN NULL with a typed ELSE: the result type comes from ELSE, the value is NULL.

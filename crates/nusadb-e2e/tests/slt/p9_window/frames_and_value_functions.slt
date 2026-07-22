@@ -166,7 +166,7 @@ SELECT id, ROW_NUMBER() OVER (ORDER BY id) + RANK() OVER (ORDER BY v) FROM t ORD
 5 10
 
 # --- GROUPS frame: the offset counts peer groups (rows sharing the ORDER BY value), not physical
-# rows (Q-RANGE-OFFSET-FRAME). A RANGE value offset stays unsupported. ---
+# rows. A RANGE value offset stays unsupported. ---
 statement ok
 CREATE TABLE gw (grp INT, x INT)
 
@@ -214,7 +214,7 @@ SELECT grp, x, SUM(x) OVER (ORDER BY grp RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWI
 3  50  120
 
 # --- RANGE value-offset frames: the frame is by ORDER BY VALUE, not row position, so a gap in the
-# values matters (Q-RANGE-OFFSET-FRAME). v1: single ASC integer/temporal ordering column. ---
+# values matters. v1: single ASC integer/temporal ordering column. ---
 statement ok
 CREATE TABLE rw (id INT, v INT)
 
@@ -303,7 +303,7 @@ statement error
 SELECT SUM(v) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM fr
 
 # --- RANGE value-offset over a DESC ordering: the frame is still by ORDER BY VALUE, but "preceding"
-# rows now have LARGER keys, so the boundary direction reverses (Q-RANGE-DESC-FRAME). Reuses rw
+# rows now have LARGER keys, so the boundary direction reverses. Reuses rw
 # (id,v) = (1,10)(2,20)(3,30)(5,40)(6,50) with the gap at id=4. ---
 
 # DESC, RANGE BETWEEN 2 PRECEDING AND CURRENT ROW: PRECEDING rows are larger, so the frame is the

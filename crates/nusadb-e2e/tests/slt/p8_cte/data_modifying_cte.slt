@@ -1,4 +1,4 @@
-# p8_cte/data_modifying_cte — WITH x AS (INSERT/UPDATE … RETURNING …) … (Q-CTE-DML).
+# p8_cte/data_modifying_cte — WITH x AS (INSERT/UPDATE … RETURNING …) ….
 #
 # A data-modifying CTE runs once; its RETURNING rows form the CTE's relation, which the outer query
 # reads. The statement's writes persist. The modified table may NOT be read elsewhere in the same

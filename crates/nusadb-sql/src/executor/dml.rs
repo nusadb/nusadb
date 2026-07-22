@@ -1109,7 +1109,7 @@ pub(super) fn run_copy_from(
         .collect();
 
     // Stream the payload in INSERT_SELECT_BATCH-row batches rather than materializing every parsed
-    // row up front (Q-LARGE-TXN-COPY-OOM): a multi-million-row COPY otherwise builds a Vec holding
+    // row up front: a multi-million-row COPY otherwise builds a Vec holding
     // every row's decoded `ast::Value`s — gigabytes — and OOM-kills the whole server before the
     // engine's per-transaction write ceiling can reject it. Per-batch insertion keeps executor
     // memory at O(batch), and each insert is charged against that ceiling, so an oversized COPY now

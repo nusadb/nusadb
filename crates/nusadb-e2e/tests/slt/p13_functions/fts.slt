@@ -152,7 +152,7 @@ SELECT ts_rank(to_tsvector('simple', 'fox'), to_tsquery('simple', 'fox'))
 0.061
 
 # Two adjacent default-weight terms AND together: sqrt(0.1*0.1*word_distance(1)) = 0.09910322,
-# the value measured on PG16 (Q-TSRANK-AND-PROXIMITY).
+# the value measured on PG16.
 query R
 SELECT ts_rank(to_tsvector('simple', 'a b'), to_tsquery('simple', 'a & b'))
 ----

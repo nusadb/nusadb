@@ -85,7 +85,7 @@ SELECT count(*) FROM c WHERE k = 'ab'
 
 # --- CHAR(n) column bpchar end-to-end: length / equality / DISTINCT / GROUP BY all see the canonical
 # (trimmed) value, so trailing blanks never split a group or inflate a distinct count (QA pin
-# Q-CHAR-COLUMN-BPCHAR). 'ab', 'ab ', 'ab   ' all store 'ab'; 'cd' is the only other value. ---
+# ). 'ab', 'ab ', 'ab   ' all store 'ab'; 'cd' is the only other value. ---
 statement ok
 CREATE TABLE cb (k CHAR(5))
 

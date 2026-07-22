@@ -88,9 +88,9 @@ SELECT age(TIMESTAMP '2024-03-15', TIMESTAMP '2020-01-10')::text
 ----
 4 years 2 mons 5 days
 
-# --- AT TIME ZONE: TIMESTAMP<->TIMESTAMPTZ conversion for UTC and fixed offsets (Q-AT-TIME-ZONE).
+# --- AT TIME ZONE: TIMESTAMP<->TIMESTAMPTZ conversion for UTC and fixed offsets.
 # A fixed-offset *string* follows PG's POSIX sign convention — `'+05:00'` names a zone five hours
-# WEST of UTC (UTC-5), the opposite of ISO 8601 (Q-AT-TZ-OFFSET-SIGN). A named DST zone is rejected. ---
+# WEST of UTC (UTC-5), the opposite of ISO 8601. A named DST zone is rejected. ---
 
 # TIMESTAMP AT TIME ZONE 'UTC' reads the wall clock as UTC -> the same instant as a timestamptz.
 query T

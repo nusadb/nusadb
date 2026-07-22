@@ -1,5 +1,5 @@
 # p10_types/int_overflow — integer width is enforced in expressions and casts, not just at column
-# storage (Q-INT4-OVERFLOW). An INT (int4) value overflowing 2^31 in arithmetic or a cast errors like
+# storage. An INT (int4) value overflowing 2^31 in arithmetic or a cast errors like
 # PG, integer literals are typed by magnitude (int4 if they fit, else bigint), and mixed int4/int8
 # arithmetic promotes to bigint. This mirrors the int4 range the storage layer already enforces
 # (see p1_ddl/int_range), so the engine is internally consistent.

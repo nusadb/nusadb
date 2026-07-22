@@ -57,7 +57,7 @@ SELECT i, f, s, b FROM every_type
 statement ok
 DROP TABLE every_type
 
-# --- DROP TABLE cascade-drops the table's RLS policies + enabled marker (Q15-ORPHAN) ---
+# --- DROP TABLE cascade-drops the table's RLS policies + enabled marker ---
 statement ok
 CREATE TABLE rp (id INT, owner TEXT)
 
@@ -173,7 +173,7 @@ CREATE SCHEMA s3
 statement ok
 DROP SCHEMA s3 RESTRICT
 
-# DROP TABLE ... CASCADE is now supported (Q-DROP-CASCADE — see drop_cascade.slt for the FK
+# DROP TABLE ... CASCADE is now supported (see drop_cascade.slt for the FK
 # semantics); CASCADE stays rejected for object kinds that track no dependencies.
 statement ok
 CREATE TABLE casc (id INT)

@@ -53,7 +53,7 @@ d 80 4 3
 
 # Running aggregate over an ORDER BY (default RANGE … CURRENT ROW): a cumulative sum/count that grows
 # with the ordered position. Peers with equal ORDER BY keys share the running value THROUGH their peer
-# group (Q-WINDOW-RUNNING-FRAME-QUADRATIC — the incremental accumulator must match the old whole-frame
+# group (the incremental accumulator must match the old whole-frame
 # fold: 100+100=200 for both `a` and `b`, then +90, then +80).
 query TIII
 SELECT player, pts, SUM(pts) OVER (ORDER BY pts DESC), COUNT(*) OVER (ORDER BY pts DESC) FROM scores ORDER BY pts DESC, player
@@ -66,7 +66,7 @@ d 80 370 4
 # Swinging explicit ROWS frame (`x PRECEDING … y FOLLOWING`): SUM/MIN/MAX/AVG over a window that
 # slides as the current row advances. The O(n) sliding accumulator (add the entering row, remove the
 # leaving one; a monotonic deque for MIN/MAX) must equal the from-scratch fold exactly, including at
-# the clamped ends (Q-WINDOW-RUNNING-FRAME-QUADRATIC, swinging-frame case per Leis'15).
+# the clamped ends.
 statement ok
 CREATE TABLE seq5 (id INT, v INT)
 

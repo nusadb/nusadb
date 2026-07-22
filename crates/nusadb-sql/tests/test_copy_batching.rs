@@ -1,4 +1,4 @@
-//! `COPY ... FROM STDIN` streams its payload in bounded batches (Q-LARGE-TXN-COPY-OOM): rather than
+//! `COPY ... FROM STDIN` streams its payload in bounded batches: rather than
 //! materializing every parsed row up front — gigabytes of `ast::Value` for a multi-million-row load,
 //! which OOM-killed the server before the per-transaction write ceiling could reject it — it inserts
 //! in `INSERT_SELECT_BATCH`-row batches. These pins prove the batching preserves semantics:
