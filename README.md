@@ -57,6 +57,43 @@ cargo run -p nusadb-server -- --listen 127.0.0.1:5678 --data-dir ./data
 cargo run -p nusadb-cli -- --host 127.0.0.1:5678
 ```
 
+## Docker
+
+Prebuilt server images are published to Docker Hub as
+[`nusadb/nusadb`](https://hub.docker.com/r/nusadb/nusadb) (linux/amd64). Use `latest` to track the
+current release, or pin a version tag such as `0.1.0.Beta` for a reproducible deployment.
+
+```bash
+# Start the server; the volume keeps the database across container restarts
+docker run -d --name nusadb \
+  -p 5678:5678 \
+  -v nusadb-data:/var/lib/nusadb \
+  nusadb/nusadb:latest
+
+# Connect with the interactive shell shipped in the same image
+docker exec -it nusadb nusa-cli
+```
+
+The image keeps its durable state in `/var/lib/nusadb`, so mount a volume there or the database
+dies with the container. Setting both `NUSADB_USER` and `NUSADB_PASSWORD` makes the server require
+SCRAM-SHA-256 for that user; with neither set it runs trust-on-startup — any client accepted, no
+password — which is fine for local work only. SQL files mounted into `/docker-entrypoint-initdb.d`
+run once, on the first startup against an empty data directory.
+
+```bash
+docker run -d --name nusadb \
+  -p 5678:5678 \
+  -v nusadb-data:/var/lib/nusadb \
+  -v ./init:/docker-entrypoint-initdb.d:ro \
+  -e NUSADB_USER=nusa-root \
+  -e NUSADB_PASSWORD=change-me \
+  -e RUST_LOG=info \
+  nusadb/nusadb:latest
+```
+
+Server flags go after the image name (`... nusadb/nusadb:latest --metrics-listen 0.0.0.0:9100`).
+See [`docs/deployment.md`](docs/deployment.md) for the full flag reference, TLS, and metrics.
+
 ## Architecture
 
 NusaDB is organized as seven layers: client, protocol, SQL engine, transactions, storage, WAL, and
