@@ -886,6 +886,114 @@ async fn extended_query_prepared_statement() {
     handle.await.unwrap().unwrap();
 }
 
+/// Re-executing one prepared statement with different parameters returns each parameter's own rows.
+/// The per-connection plan cache keys on the SQL text, and a parameterized statement has its `$1`
+/// substituted with the bound value before planning; if such a plan were served from that cache, a
+/// second execution would return the first parameter's rows. Each execution here fetches every row
+/// (`max_rows = 0`), the path that plans and streams the result inline.
+#[tokio::test]
+async fn reused_prepared_statement_returns_each_parameters_rows() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+    query(&mut conn, "CREATE TABLE t (id INT NOT NULL)").await;
+    assert!(matches!(
+        next(&mut conn).await,
+        BackendMessage::CommandComplete { .. }
+    ));
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::ReadyForQuery(TxnStatus::Idle)
+    );
+    query(&mut conn, "INSERT INTO t VALUES (1), (2), (3)").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 3"));
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::ReadyForQuery(TxnStatus::Idle)
+    );
+
+    // Parse the parameterized statement once.
+    conn.write_frame(
+        &FrontendMessage::Parse {
+            name: "s".to_owned(),
+            sql: "SELECT id FROM t WHERE id = $1".to_owned(),
+            param_types: vec![],
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::ParseComplete);
+
+    // Re-bind the same portal with a fresh parameter each round; every round must return only the
+    // row matching that round's value, never a cached plan from an earlier value.
+    for id in 1..=3_i64 {
+        let bytes = id.to_string().into_bytes();
+        conn.write_frame(
+            &FrontendMessage::Bind {
+                portal: "p".to_owned(),
+                statement: "s".to_owned(),
+                params: vec![Some(bytes.clone())],
+                result_formats: vec![],
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::BindComplete);
+
+        conn.write_frame(
+            &FrontendMessage::Execute {
+                portal: "p".to_owned(),
+                max_rows: 0,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next(&mut conn).await,
+            BackendMessage::DataRow {
+                values: vec![Some(bytes)]
+            }
+        );
+        assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+
+        conn.write_frame(&FrontendMessage::Sync.encode().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut conn).await,
+            BackendMessage::ReadyForQuery(TxnStatus::Idle)
+        );
+    }
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
 /// G6: `Describe(Portal)` must report row metadata WITHOUT executing the statement — a mutating
 /// statement must not take effect until `Execute`.
 #[tokio::test]

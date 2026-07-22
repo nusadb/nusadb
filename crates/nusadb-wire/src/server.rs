@@ -2077,8 +2077,10 @@ fn stream_command_tag(outcome: &StreamOutcome) -> String {
 /// success. Runs on a blocking thread; `tx` is dropped on return, closing the channel.
 #[allow(
     clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
     reason = "per-connection context (engine, cluster, database, statement text, params, user, the \
-              row channel, txn state, the typed flag, and the move-in/move-out plan cache)"
+              row channel, txn state, and the move-in/move-out plan cache) plus independent output \
+              and gating flags (typed, array-elements, point-get gate, plan-cache bypass)"
 )]
 fn run_query_streaming(
     engine: &dyn StorageEngine,
@@ -2094,6 +2096,7 @@ fn run_query_streaming(
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &std::sync::Mutex<HashMap<String, String>>,
     point_get_gate: bool,
+    bypass_cache: bool,
 ) -> StreamedRun {
     use nusadb_sql::ast::Statement;
     // Parsed (and parameter-bound) by the caller on the reactor — a parse error never reaches
@@ -2185,11 +2188,13 @@ fn run_query_streaming(
         &mut plan_cache,
         &snapshot,
         point_get_gate,
+        bypass_cache,
     );
     let (outcome, new_state) = match run {
         StmtRun::Done(outcome, new_state) => (outcome, new_state),
-        // The gate refused before execution: the sink is untouched (nothing buffered), state
-        // is unchanged, and the plan is now cached for the pool's re-plan.
+        // The gate refused before execution: the sink is untouched (nothing buffered) and state is
+        // unchanged. A cacheable statement left its plan in the cache for the pool's re-plan; a
+        // parameterized one bypasses the cache and the pool simply re-plans it fresh.
         StmtRun::Punt => return StreamedRun::Punt(plan_cache),
     };
     StreamedRun::Done((
@@ -2262,9 +2267,33 @@ enum StmtRun {
     Punt,
 }
 
+/// Plan a streamed statement, consulting the per-connection plan cache only when it is safe.
+///
+/// The cache keys on the SQL text. A statement carrying bound parameters has had its `$n`
+/// placeholders replaced with the supplied values before it reaches the planner, so two executions
+/// of one prepared statement share the same text yet require different plans. Serving the second
+/// from the first's cache entry would return the first parameter set's rows. Such a statement plans
+/// fresh (`bypass_cache`), matching how the pooled path has always run parameterized work. A simple
+/// query carries no parameters, so its text fully determines its plan and it caches normally.
+fn plan_streamed_stmt(
+    bypass_cache: bool,
+    plan_cache: &mut nusadb_sql::PlanCache,
+    sql: &str,
+    stmt: nusadb_sql::ast::Statement,
+    catalog: &dyn nusadb_sql::Catalog,
+    engine: &dyn StorageEngine,
+) -> Result<nusadb_sql::PhysicalPlan, nusadb_sql::Error> {
+    if bypass_cache {
+        Ok(nusadb_sql::plan(nusadb_sql::analyze(stmt, catalog)?))
+    } else {
+        nusadb_sql::plan_cached(plan_cache, sql, stmt, catalog, engine)
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "threads the per-statement transaction context plus the inline point-get gate flag;               each is a distinct concern"
+    reason = "threads the per-statement transaction context, the inline point-get gate flag, and \
+              the plan-cache bypass for parameterized statements; each is a distinct concern"
 )]
 fn stream_stmt_in_state(
     engine: &dyn StorageEngine,
@@ -2276,6 +2305,7 @@ fn stream_stmt_in_state(
     plan_cache: &mut nusadb_sql::PlanCache,
     snapshot: &HashMap<String, String>,
     point_get_gate: bool,
+    bypass_cache: bool,
 ) -> StmtRun {
     match state {
         TxnState::Failed { .. } => StmtRun::Done(
@@ -2291,7 +2321,8 @@ fn stream_stmt_in_state(
             // identically for the simple- and extended-query paths, so no protocol can drift onto a
             // stale snapshot. Planning below reads the catalog under the
             // transaction's current view, matching the simple-query path which also plans pre-refresh.
-            let physical = match nusadb_sql::plan_cached(
+            let physical = match plan_streamed_stmt(
+                bypass_cache,
                 plan_cache,
                 sql,
                 stmt,
@@ -2329,7 +2360,8 @@ fn stream_stmt_in_state(
                 Ok(txn) => txn,
                 Err(e) => return StmtRun::Done(Err(e.into()), TxnState::Auto),
             };
-            let physical = match nusadb_sql::plan_cached(
+            let physical = match plan_streamed_stmt(
+                bypass_cache,
                 plan_cache,
                 sql,
                 stmt,
@@ -2434,8 +2466,13 @@ where
     // gates are default-deny. A point-get candidate is admitted INSIDE the execution path, where
     // its plan exists anyway (`plan_is_inline_point_get` — a unique-index point bound): an
     // admitted statement pays zero extra work over the pool path, and a refused one PUNTS
-    // side-effect-free back to the pool below with its plan already cached.
+    // side-effect-free back to the pool below (its plan cached when cacheable; a parameterized
+    // statement re-plans fresh).
     let mut stmt = stmt;
+    // Bound parameters were substituted into `stmt` above, so this plan is specific to these values
+    // and must not be cached under the shared SQL text (a reused prepared statement would then get
+    // the previous parameter set's rows). The simple-query path passes no parameters and caches.
+    let bypass_plan_cache = !params.is_empty();
     let from_less = nusadb_sql::ast::from_less_pure_select(&stmt);
     let point_get = !from_less && nusadb_sql::ast::point_get_candidate(&stmt);
     if from_less || point_get {
@@ -2458,6 +2495,7 @@ where
                 plan_cache,
                 settings,
                 point_get,
+                bypass_plan_cache,
             )
         };
         match run {
@@ -2519,6 +2557,7 @@ where
             plan_cache,
             &settings,
             false,
+            bypass_plan_cache,
         ) {
             StreamedRun::Done(outcome) => outcome,
             // Structurally unreachable: only the point-get gate punts, and the pool path runs
