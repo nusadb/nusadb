@@ -258,6 +258,10 @@ fn extract_windows(
 /// `NTH_VALUE`), and distribution (`NTILE`/`CUME_DIST`/`PERCENT_RANK`), with an
 /// optional explicit frame: `ROWS` with offsets, or peer-based
 /// `RANGE`/`GROUPS` with `UNBOUNDED`/`CURRENT ROW` bounds.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear branch per window-function shape sharing the same frame/argument validation; splitting would scatter that shared logic"
+)]
 pub(super) fn resolve_window(
     wf: ast::WindowFunction,
     scope: &[ScopedColumn],
