@@ -15,7 +15,7 @@
 //! 8192    end
 //! ```
 //!
-//! See [`ARCHITECTURE.md`] for design rationale.
+//! See `ARCHITECTURE.md` for design rationale.
 
 // This module is a byte-level page codec: offset arithmetic and slicing are inherent, and
 // every range is bounded by the 8 KiB page-format invariants. `indexing_slicing` would
