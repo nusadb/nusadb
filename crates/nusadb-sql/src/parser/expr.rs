@@ -1365,6 +1365,8 @@ pub(super) fn aggregate_func(name: &str) -> Option<ast::AggregateFunc> {
         "min" => Some(Min),
         "max" => Some(Max),
         "array_agg" => Some(ast::AggregateFunc::ArrayAgg),
+        // JSON_AGG and JSONB_AGG both collect into a JSON array (our JSON type is binary-backed).
+        "jsonb_agg" | "json_agg" => Some(ast::AggregateFunc::JsonAgg),
         // EVERY is the SQL-standard alias for BOOL_AND.
         "bool_and" | "every" => Some(ast::AggregateFunc::BoolAnd),
         "bool_or" => Some(ast::AggregateFunc::BoolOr),
@@ -1431,11 +1433,13 @@ pub(super) fn convert_aggregate(
     if !order_by.is_empty()
         && !matches!(
             func,
-            ast::AggregateFunc::ArrayAgg | ast::AggregateFunc::StringAgg
+            ast::AggregateFunc::ArrayAgg
+                | ast::AggregateFunc::JsonAgg
+                | ast::AggregateFunc::StringAgg
         )
     {
         return unsupported(
-            "ORDER BY inside an aggregate is only supported for ARRAY_AGG / STRING_AGG",
+            "ORDER BY inside an aggregate is only supported for ARRAY_AGG / JSONB_AGG / STRING_AGG",
         );
     }
     let is_wildcard = matches!(

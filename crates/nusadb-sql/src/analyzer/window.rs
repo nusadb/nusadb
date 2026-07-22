@@ -42,6 +42,7 @@ pub(super) fn window_default_name(func: &ast::WindowFunc) -> String {
         // ARRAY_AGG and the statistical aggregates are not wired as window functions; named
         // defensively (the parser's OVER path never produces them).
         W::Aggregate(A::ArrayAgg) => "array_agg",
+        W::Aggregate(A::JsonAgg) => "jsonb_agg",
         W::Aggregate(A::BoolAnd) => "bool_and",
         W::Aggregate(A::BoolOr) => "bool_or",
         W::Aggregate(A::Stddev) => "stddev",
@@ -81,6 +82,7 @@ pub(super) fn rewrite_window_items(
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
     windows: &mut Vec<WindowExpr>,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<Vec<ast::SelectItem>, Error> {
     let mut rewritten = Vec::with_capacity(items.len());
     for item in items {
@@ -91,7 +93,12 @@ pub(super) fn rewrite_window_items(
                 alias,
             } => {
                 let name = alias.unwrap_or_else(|| window_default_name(&wf.func));
-                windows.push(resolve_window(*wf, scope, catalog)?);
+                windows.push(resolve_window(
+                    *wf,
+                    scope,
+                    catalog,
+                    aggregates.as_deref_mut(),
+                )?);
                 rewritten.push(ast::SelectItem::Expr {
                     expr: ast::Expr::Column(window_col_name(windows.len() - 1)),
                     alias: Some(name),
@@ -100,7 +107,13 @@ pub(super) fn rewrite_window_items(
             // Any other projection expression may CONTAIN window calls nested inside it; extract them
             // in place (its name is resolved later by the projection, like any composite expression).
             ast::SelectItem::Expr { mut expr, alias } => {
-                extract_windows(&mut expr, scope, catalog, windows)?;
+                extract_windows(
+                    &mut expr,
+                    scope,
+                    catalog,
+                    windows,
+                    aggregates.as_deref_mut(),
+                )?;
                 rewritten.push(ast::SelectItem::Expr { expr, alias });
             },
             other => rewritten.push(other),
@@ -122,6 +135,7 @@ fn extract_windows(
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
     windows: &mut Vec<WindowExpr>,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<(), Error> {
     use ast::Expr as E;
     if matches!(expr, E::WindowFunction(_)) {
@@ -130,27 +144,35 @@ fn extract_windows(
         let E::WindowFunction(wf) = taken else {
             unreachable!("guarded by the matches! above")
         };
-        windows.push(resolve_window(*wf, scope, catalog)?);
+        windows.push(resolve_window(
+            *wf,
+            scope,
+            catalog,
+            aggregates.as_deref_mut(),
+        )?);
         *expr = E::Column(window_col_name(windows.len() - 1));
         return Ok(());
     }
-    // Borrow a child mutably and recurse.
-    let mut rec = |e: &mut ast::Expr| extract_windows(e, scope, catalog, windows);
+    // Borrow a child mutably and recurse, threading the aggregate sink so a grouping aggregate inside
+    // a nested window's PARTITION/ORDER/args is extracted into it.
+    let mut rec = |e: &mut ast::Expr, aggs: Option<&mut Vec<AggregateCall>>| {
+        extract_windows(e, scope, catalog, windows, aggs)
+    };
     match expr {
         E::Binary { left, right, .. } | E::IsDistinctFrom { left, right, .. } => {
-            rec(left)?;
-            rec(right)?;
+            rec(left, aggregates.as_deref_mut())?;
+            rec(right, aggregates.as_deref_mut())?;
         },
         E::Unary { expr: inner, .. }
         | E::IsNull { expr: inner, .. }
         | E::IsBool { expr: inner, .. }
-        | E::Cast { expr: inner, .. } => rec(inner)?,
+        | E::Cast { expr: inner, .. } => rec(inner, aggregates.as_deref_mut())?,
         E::InList {
             expr: inner, list, ..
         } => {
-            rec(inner)?;
+            rec(inner, aggregates.as_deref_mut())?;
             for e in list {
-                rec(e)?;
+                rec(e, aggregates.as_deref_mut())?;
             }
         },
         E::Between {
@@ -159,9 +181,9 @@ fn extract_windows(
             high,
             ..
         } => {
-            rec(inner)?;
-            rec(low)?;
-            rec(high)?;
+            rec(inner, aggregates.as_deref_mut())?;
+            rec(low, aggregates.as_deref_mut())?;
+            rec(high, aggregates.as_deref_mut())?;
         },
         E::Like {
             expr: inner,
@@ -178,8 +200,8 @@ fn extract_windows(
             pattern,
             ..
         } => {
-            rec(inner)?;
-            rec(pattern)?;
+            rec(inner, aggregates.as_deref_mut())?;
+            rec(pattern, aggregates.as_deref_mut())?;
         },
         E::Case {
             operand,
@@ -187,31 +209,31 @@ fn extract_windows(
             default,
         } => {
             if let Some(op) = operand {
-                rec(op)?;
+                rec(op, aggregates.as_deref_mut())?;
             }
             for b in branches {
-                rec(&mut b.when)?;
-                rec(&mut b.then)?;
+                rec(&mut b.when, aggregates.as_deref_mut())?;
+                rec(&mut b.then, aggregates.as_deref_mut())?;
             }
             if let Some(d) = default {
-                rec(d)?;
+                rec(d, aggregates.as_deref_mut())?;
             }
         },
         E::Encrypt { value, key } | E::Decrypt { value, key } => {
-            rec(value)?;
-            rec(key)?;
+            rec(value, aggregates.as_deref_mut())?;
+            rec(key, aggregates.as_deref_mut())?;
         },
         E::Subscript { base, index } => {
-            rec(base)?;
-            rec(index)?;
+            rec(base, aggregates.as_deref_mut())?;
+            rec(index, aggregates.as_deref_mut())?;
         },
         E::ArraySlice { base, lower, upper } => {
-            rec(base)?;
+            rec(base, aggregates.as_deref_mut())?;
             if let Some(l) = lower {
-                rec(l)?;
+                rec(l, aggregates.as_deref_mut())?;
             }
             if let Some(u) = upper {
-                rec(u)?;
+                rec(u, aggregates.as_deref_mut())?;
             }
         },
         E::Coalesce(items)
@@ -221,7 +243,7 @@ fn extract_windows(
         | E::SetReturning { args: items, .. }
         | E::FunctionCall { args: items, .. } => {
             for e in items {
-                rec(e)?;
+                rec(e, aggregates.as_deref_mut())?;
             }
         },
         // Leaves, separate query blocks (subqueries), aggregate calls (a window there is invalid),
@@ -240,6 +262,7 @@ pub(super) fn resolve_window(
     wf: ast::WindowFunction,
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<WindowExpr, Error> {
     use ast::WindowFunc as W;
 
@@ -254,17 +277,28 @@ pub(super) fn resolve_window(
             "a GROUPS window frame requires an ORDER BY clause".to_owned(),
         ));
     }
+    // `PARTITION BY` / `ORDER BY` keys may reference a grouping aggregate when the query also
+    // aggregates (`rank() OVER (ORDER BY sum(x)) … GROUP BY …`): analyze them with the shared
+    // aggregate sink so such an aggregate is extracted into it (and rebased onto the post-aggregation
+    // row later). Without a sink (a window with no aggregation), an aggregate here is rejected as
+    // before.
     let partition = wf
         .partition
         .iter()
-        .map(|e| analyze_expr(e, scope, catalog, None))
+        .map(|e| analyze_expr_agg(e, scope, catalog, None, aggregates.as_deref_mut()))
         .collect::<Result<Vec<_>, _>>()?;
     let order = wf
         .order
         .iter()
         .map(|item| {
             Ok(OrderByKey {
-                expr: analyze_expr(&item.expr, scope, catalog, None)?,
+                expr: analyze_expr_agg(
+                    &item.expr,
+                    scope,
+                    catalog,
+                    None,
+                    aggregates.as_deref_mut(),
+                )?,
                 ascending: item.ascending,
                 nulls: item.nulls,
             })
@@ -283,15 +317,23 @@ pub(super) fn resolve_window(
     // NULL, and a literal of an assignable type is coerced downstream.
     let typed_args = match (&wf.func, wf.args.as_slice()) {
         (W::Lag | W::Lead, [value_expr, offset_expr, default_expr]) => {
-            let value = analyze_expr(value_expr, scope, catalog, None)?;
-            let offset = analyze_expr(offset_expr, scope, catalog, None)?;
-            let default = analyze_expr(default_expr, scope, catalog, Some(value.ty))?;
+            let value =
+                analyze_expr_agg(value_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+            let offset =
+                analyze_expr_agg(offset_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+            let default = analyze_expr_agg(
+                default_expr,
+                scope,
+                catalog,
+                Some(value.ty),
+                aggregates.as_deref_mut(),
+            )?;
             vec![value, offset, default]
         },
         _ => wf
             .args
             .iter()
-            .map(|e| analyze_expr(e, scope, catalog, None))
+            .map(|e| analyze_expr_agg(e, scope, catalog, None, aggregates.as_deref_mut()))
             .collect::<Result<Vec<_>, _>>()?,
     };
 

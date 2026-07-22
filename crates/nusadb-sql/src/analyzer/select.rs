@@ -1057,11 +1057,23 @@ fn analyze_select_scoped(
         },
     }
 
+    // Aggregate sink — shared across the whole query block. Populated first by the window pass (a
+    // grouping aggregate inside a window's PARTITION/ORDER, e.g. `rank() OVER (ORDER BY sum(x))`) and
+    // then by the projection; both extract into the same sink so every aggregate has a stable slot.
+    let mut aggregates: Vec<AggregateCall> = Vec::new();
+
     // Window functions: extract them from the projection, resolving each against the
     // source scope, and rewrite each occurrence to reference a synthetic appended column. The
-    // executor's Window operator appends one column per window after the source columns.
+    // executor's Window operator appends one column per window after the source (or, when the query
+    // also aggregates, the post-aggregation) columns.
     let mut windows: Vec<WindowExpr> = Vec::new();
-    let projection_items = rewrite_window_items(sel.projection, scope, catalog, &mut windows)?;
+    let projection_items = rewrite_window_items(
+        sel.projection,
+        scope,
+        catalog,
+        &mut windows,
+        Some(&mut aggregates),
+    )?;
     // Project against the source scope extended with one synthetic column per window (so the
     // rewritten references resolve to the appended ordinals). `*` still expands source columns only.
     let source_len = scope.len();
@@ -1080,8 +1092,7 @@ fn analyze_select_scoped(
         .collect();
 
     // Projection. As a side effect, aggregate calls are extracted into
-    // `aggregates` and replaced with `AggregateRef(idx)`.
-    let mut aggregates: Vec<AggregateCall> = Vec::new();
+    // `aggregates` (already seeded by the window pass above) and replaced with `AggregateRef(idx)`.
     let mut projection = analyze_projection(
         projection_items,
         &projection_scope,
@@ -1120,13 +1131,18 @@ fn analyze_select_scoped(
         ));
     }
 
-    // A `SELECT` aggregates when it has `GROUP BY` keys (incl. grouping sets) or aggregate calls.
+    // A `SELECT` aggregates when it has `GROUP BY` keys (incl. grouping sets) or aggregate calls
+    // (the sink may already hold aggregates a window's PARTITION/ORDER pulled in above).
     let aggregated = !group_keys.is_empty() || !aggregates.is_empty() || !grouping_sets.is_empty();
-    // Window functions don't compose with aggregation in v1 (a window over aggregate results would
-    // need a second evaluation phase).
-    if !windows.is_empty() && aggregated {
+    // A window function over aggregated rows runs after the GROUP BY / scalar-aggregate stage
+    // (`rank() OVER (ORDER BY sum(x)) … GROUP BY …`): the planner places the Window operator above
+    // the aggregate and its expressions are rebased onto the post-aggregation row below. Grouping
+    // sets (ROLLUP/CUBE/GROUPING SETS) grow the aggregate sink during rebase (each GROUPING(...)
+    // appends a slot), which would shift the window-column base — so that rarer combination stays
+    // unsupported for now.
+    if !windows.is_empty() && !grouping_sets.is_empty() {
         return Err(Error::Unsupported(
-            "window functions together with GROUP BY / aggregation are not supported yet"
+            "window functions together with GROUPING SETS / ROLLUP / CUBE are not supported yet"
                 .to_owned(),
         ));
     }
@@ -1192,11 +1208,18 @@ fn analyze_select_scoped(
     // `AggregateRef(k)`, aggregate refs shift past the group keys, and any
     // other bare column is rejected (it is neither grouped nor aggregated).
     if aggregated {
+        // The post-aggregation row width `[group keys ++ aggregates]`. A plain GROUP BY / scalar
+        // aggregate never grows the sink during rebase (only grouping sets do, and those are rejected
+        // with windows), so this is the final width — the base at which the Window operator appends
+        // its output columns.
+        let post_agg_width = group_keys.len() + aggregates.len();
         let mut ctx = AggRebase {
             group_keys: &group_keys,
             num_group_keys: group_keys.len(),
             grouping_sets: &grouping_sets,
             aggregates: &mut aggregates,
+            source_len,
+            post_agg_width,
         };
         for proj in &mut projection {
             rebase_onto_aggregation(&mut proj.expr, &mut ctx)?;
@@ -1206,6 +1229,20 @@ fn analyze_select_scoped(
         }
         for key in &mut order_by {
             rebase_onto_aggregation(&mut key.expr, &mut ctx)?;
+        }
+        // A window over aggregated rows runs on the post-aggregation row, so its PARTITION / ORDER /
+        // argument expressions rebase onto it too — a grouped column becomes its key slot and a
+        // grouping aggregate its shifted `AggregateRef`, exactly as the projection's do.
+        for window in &mut windows {
+            for part in &mut window.partition {
+                rebase_onto_aggregation(part, &mut ctx)?;
+            }
+            for key in &mut window.order {
+                rebase_onto_aggregation(&mut key.expr, &mut ctx)?;
+            }
+            for arg in &mut window.args {
+                rebase_onto_aggregation(arg, &mut ctx)?;
+            }
         }
     }
 
@@ -1853,6 +1890,13 @@ pub(super) struct AggRebase<'a> {
     pub grouping_sets: &'a [Vec<usize>],
     /// The aggregate sink; a `GROUPING(...)` call appends one synthetic [`AggregateCall`] here.
     pub aggregates: &'a mut Vec<AggregateCall>,
+    /// The source-row width. A projection column reference at or above this ordinal is a synthetic
+    /// window-output column (not a base column), remapped onto the post-aggregation row rather than
+    /// rejected. `0` when there are no windows.
+    pub source_len: usize,
+    /// The post-aggregation row width `[group keys ++ aggregates]` — the base at which the Window
+    /// operator appends its output columns, so window-column references remap to `post_agg_width + i`.
+    pub post_agg_width: usize,
 }
 
 #[allow(
@@ -1889,7 +1933,13 @@ pub(super) fn rebase_onto_aggregation(
 
     match &mut expr.kind {
         TypedExprKind::AggregateRef(idx) => *idx += ctx.num_group_keys,
-        // A bare column that is not (part of) a GROUP BY key is neither grouped nor aggregated.
+        // A synthetic window-output column (ordinal at or above the source width): the Window operator
+        // runs above the aggregate and appends its columns after `[group keys ++ aggregates]`, so
+        // remap the reference from its source-relative ordinal onto the post-aggregation base.
+        TypedExprKind::Column(ord) if *ord >= ctx.source_len => {
+            *ord = ctx.post_agg_width + (*ord - ctx.source_len);
+        },
+        // A bare (base) column that is not (part of) a GROUP BY key is neither grouped nor aggregated.
         TypedExprKind::Column(_) => {
             return Err(Error::Unsupported(
                 "column must appear in GROUP BY or inside an aggregate function".to_owned(),
@@ -2325,6 +2375,9 @@ fn analyze_set_returning(
     let mut typed_args = Vec::with_capacity(args.len());
     for (arg, want) in args.iter().zip(expected) {
         let typed = analyze_expr(arg, scope, catalog, Some(*want))?;
+        // A bare string literal for a JSON argument is coerced to that type (the unknown-literal
+        // rule), so `jsonb_object_keys('{...}')` type-checks like `'...'::json`.
+        let typed = coerce_text_literal_to(typed, *want);
         if typed.ty != *want && !is_null_literal(&typed) {
             return Err(Error::TypeMismatch {
                 context: format!("{}() argument", func.name()),
@@ -2425,6 +2478,13 @@ pub(super) fn analyze_aggregate(
                     ))
                 })?;
             Ok((Some(typed), ColumnType::Array(elem)))
+        },
+        // JSONB_AGG(expr) — collect every value (NULLs become JSON null) into a JSON array. The
+        // argument may be any type (the executor serializes each element to JSON), so no element-type
+        // restriction applies; result is JSON.
+        (ast::AggregateFunc::JsonAgg, Some(arg)) => {
+            let typed = analyze_expr(arg, scope, catalog, None)?;
+            Ok((Some(typed), ColumnType::Json))
         },
         // BOOL_AND(expr) / BOOL_OR(expr) — boolean argument; result BOOL. A bare NULL argument types
         // as BOOL via the hint, so the empty/NULL-only group still yields a BOOL NULL.

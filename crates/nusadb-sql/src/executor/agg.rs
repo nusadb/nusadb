@@ -354,6 +354,21 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
                 ast::Value::Null
             }
         },
+        // JSONB_AGG: the collected values serialized into a JSON array (a NULL element becomes JSON
+        // `null`); an empty group → NULL. `ORDER BY` reorders the elements before serialization.
+        F::JsonAgg => {
+            if acc.any_seen {
+                let items = if call.order_by.is_empty() {
+                    acc.array_items
+                } else {
+                    sort_agg_values(acc.array_items, acc.agg_sort_keys, &call.order_by)
+                };
+                let json = items.iter().map(crate::json::value_to_json).collect();
+                ast::Value::Json(crate::json::build_array(json))
+            } else {
+                ast::Value::Null
+            }
+        },
         // STRING_AGG: the collected text values joined by the separator; NULL for an empty group.
         // An `ORDER BY` clause reorders the values before they are joined.
         F::StringAgg => {
@@ -1111,12 +1126,14 @@ pub(super) fn accumulate_row(
                 // grouping set, written by `run_grouping_sets_aggregate_streamed` after this fold. Finalizing
                 // yields the `0` placeholder ("nothing grouped away") for any other path.
                 F::Grouping => {},
-                // ARRAY_AGG collects every value in input order, NULLs included — so it must
-                // run before the NULL-skip below. DISTINCT drops duplicates ("not distinct" equality,
-                // so a single NULL is kept).
-                F::ArrayAgg => {
+                // ARRAY_AGG / JSONB_AGG collect every value in input order, NULLs included — so they
+                // must run before the NULL-skip below (the finalize differs: an array vs a JSON array).
+                // DISTINCT drops duplicates ("not distinct" equality, so a single NULL is kept).
+                F::ArrayAgg | F::JsonAgg => {
                     let arg = call.arg.as_ref().ok_or_else(|| {
-                        Error::Unsupported("internal: array_agg requires an argument".to_owned())
+                        Error::Unsupported(
+                            "internal: array_agg / jsonb_agg requires an argument".to_owned(),
+                        )
                     })?;
                     let value = eval_arg(arg, row)?;
                     if call.distinct {
@@ -1311,9 +1328,11 @@ pub(crate) fn fold_value(
         F::PercentileCont | F::PercentileDisc | F::Mode => {
             acc.ordered_values.push(value);
         },
-        // ARRAY_AGG is handled in accumulate_row's outer match (it keeps NULLs, so it runs
-        // before the NULL-skip above) and never reaches this non-NULL value path.
-        F::ArrayAgg => unreachable!("array_agg is folded in the outer match arm"),
+        // ARRAY_AGG / JSONB_AGG are handled in accumulate_row's outer match (they keep NULLs, so they
+        // run before the NULL-skip above) and never reach this non-NULL value path.
+        F::ArrayAgg | F::JsonAgg => {
+            unreachable!("array_agg / jsonb_agg is folded in the outer match arm")
+        },
         // The two-argument statistical aggregates (CORR/COVAR_*/REGR_*) fold over
         // (y, x) pairs in accumulate_row's outer match (the pair is skipped when either
         // side is NULL) and never reach this single-value path.

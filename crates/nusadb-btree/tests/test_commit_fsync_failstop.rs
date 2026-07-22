@@ -9,8 +9,8 @@
 //! while the data is already lost).
 //!
 //! Black-box fault injection cannot time this: a device-level error (dm-error, full disk)
-//! always breaks the marker *append* first, which takes the recoverable self-heal path — QA
-//! verified that path and routed this one to an in-repo DST pin (lane A). The `dst-fault`
+//! always breaks the marker *append* first, which takes the recoverable self-heal path, so this
+//! one is routed to an in-repo DST pin. The `dst-fault`
 //! feature arms a one-shot fault point that fails the group-leader fsync AFTER its flush, and
 //! since `process::abort` kills the test process, the scenario runs in a re-exec'd CHILD:
 //!

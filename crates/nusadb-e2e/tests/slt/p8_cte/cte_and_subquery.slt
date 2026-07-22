@@ -1,5 +1,5 @@
 # p8_cte/cte_and_subquery — WITH / WITH RECURSIVE and correlated
-# subqueries (B2.16b) end-to-end through the SQL pipeline.
+# subqueries end-to-end through the SQL pipeline.
 
 statement ok
 CREATE TABLE emp (id INT NOT NULL, dept INT, salary INT)
@@ -61,7 +61,7 @@ WITH RECURSIVE reach AS (SELECT child AS node FROM cyc WHERE parent = 1 UNION SE
 2
 3
 
-# --- correlated scalar subquery (B2.16b): per-department average ---
+# --- correlated scalar subquery: per-department average ---
 query I
 SELECT id FROM emp e WHERE salary > (SELECT AVG(salary) FROM emp WHERE dept = e.dept) ORDER BY id
 ----

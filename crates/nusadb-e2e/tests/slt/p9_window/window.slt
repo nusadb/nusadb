@@ -1,4 +1,4 @@
-# p9_window/window — window functions (-46): ranking, partitioned aggregates, LAG/LEAD.
+# p9_window/window — window functions: ranking, partitioned aggregates, LAG/LEAD.
 
 statement ok
 CREATE TABLE sales (region TEXT, amt INT)
@@ -86,3 +86,33 @@ FROM seq5 ORDER BY id
 3 90 20 40 3
 4 120 30 50 3
 5 90 40 50 2
+
+# --- Window functions OVER GROUP BY (the OLAP "rank groups by an aggregate" shape) --------------
+# The window runs on the post-aggregation rows; its ORDER BY may name a grouping aggregate.
+# GROUP BY region -> sums east=40, west=50; RANK by the sum descending: west=1, east=2.
+query TII
+SELECT region, SUM(amt), RANK() OVER (ORDER BY SUM(amt) DESC) FROM sales GROUP BY region ORDER BY region
+----
+east 40 2
+west 50 1
+
+# The window ORDER BY may also be a group key.
+query TI
+SELECT region, RANK() OVER (ORDER BY region) FROM sales GROUP BY region ORDER BY region
+----
+east 1
+west 2
+
+# A scalar aggregate (no GROUP BY) is one group: the window runs over that single row.
+query I
+SELECT ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM sales
+----
+1
+
+# PARTITION BY a group key, ORDER BY a grouping aggregate: each region is its own partition, so
+# ROW_NUMBER restarts at 1 per region.
+query TII
+SELECT region, COUNT(*), ROW_NUMBER() OVER (PARTITION BY region ORDER BY COUNT(*)) FROM sales GROUP BY region ORDER BY region
+----
+east 2 1
+west 3 1

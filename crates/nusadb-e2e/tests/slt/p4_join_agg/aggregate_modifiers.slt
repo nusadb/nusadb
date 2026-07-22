@@ -1,5 +1,5 @@
 # p4_join_agg/aggregate_modifiers — aggregate FILTER, DISTINCT inside aggregates,
-# and ordered-set aggregates WITHIN GROUP (PERCENTILE_CONT / PERCENTILE_DISC / MODE).
+# and ordered-set aggregates WITHIN GROUP.
 # NULLs are skipped by aggregates; FILTER restricts the rows fed to one aggregate only.
 
 statement ok
@@ -123,3 +123,23 @@ query T
 SELECT PERCENTILE_DISC(ARRAY[0, 0.5, 1]) WITHIN GROUP (ORDER BY v) FROM m
 ----
 {10,20,40}
+
+# --- jsonb_agg: collect values into a JSON array (B) ---------------------------
+# Non-NULL values in sorted order form a JSON array.
+query T
+SELECT jsonb_agg(v ORDER BY v) FROM m WHERE v IS NOT NULL
+----
+[10, 10, 20, 30, 40, 40]
+
+# NULLs are kept as JSON null (unlike the NULL-skipping numeric aggregates).
+query T
+SELECT jsonb_agg(v ORDER BY v) FROM m WHERE grp = 'a'
+----
+[10, 10, 20, null]
+
+# Grouped: one JSON array per group.
+query TT rowsort
+SELECT grp, jsonb_agg(v ORDER BY v) FROM m WHERE v IS NOT NULL GROUP BY grp
+----
+a  [10, 10, 20]
+b  [30, 40, 40]

@@ -1,4 +1,4 @@
-# p3_filter/quantified — quantified comparison over an array literal (B3.11c):
+# p3_filter/quantified — quantified comparison over an array literal:
 # x <op> ANY(ARRAY[...]) and x <op> ALL(ARRAY[...]).
 
 statement ok
@@ -34,7 +34,7 @@ SELECT id FROM t WHERE v <> ALL(ARRAY[5, 15]) ORDER BY id
 ----
 3
 
-# Subquery operand (B3.11c): `= ANY((subquery))` is IN, `<> ALL((subquery))` is NOT IN.
+# Subquery operand: `= ANY((subquery))` is IN, `<> ALL((subquery))` is NOT IN.
 # (sqlparser needs the double parens for a subquery operand.)
 statement ok
 CREATE TABLE nums (n INT)
@@ -53,7 +53,7 @@ SELECT id FROM t WHERE v <> ALL((SELECT n FROM nums)) ORDER BY id
 ----
 3
 
-# Ordering operators over a subquery (B3.11c general form; nums = {5, 15}).
+# Ordering operators over a subquery.
 query I
 SELECT id FROM t WHERE v > ALL((SELECT n FROM nums)) ORDER BY id
 ----

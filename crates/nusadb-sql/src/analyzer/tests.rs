@@ -1473,7 +1473,7 @@ fn grouping_of_a_non_group_key_is_rejected() {
 
 #[test]
 fn cube_with_too_many_elements_is_rejected() {
-    // Regression (the design #11): a wide CUBE would overflow `1 << n` / explode memory — reject it
+    // Regression: a wide CUBE would overflow `1 << n` / explode memory — reject it
     // before expansion instead of panicking.
     let elements = (0..17)
         .map(|i| vec![crate::ast::Expr::Column(format!("c{i}"))])
@@ -1522,11 +1522,28 @@ fn window_aggregate_keeps_argument_type() {
 }
 
 #[test]
-fn window_with_aggregation_is_rejected() {
-    // A window function alongside GROUP BY / aggregation is out of scope for v1.
+fn window_over_aggregation_type_checks() {
+    // A window function runs over the post-aggregation rows: a bare window alongside GROUP BY, a
+    // window whose ORDER BY names a grouping aggregate, and one over a scalar aggregate all resolve.
+    for sql in [
+        "SELECT id, COUNT(*), ROW_NUMBER() OVER () FROM users GROUP BY id",
+        "SELECT id, RANK() OVER (ORDER BY COUNT(*) DESC) FROM users GROUP BY id",
+        "SELECT ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM users",
+    ] {
+        assert!(plan(sql, &catalog()).is_ok(), "should type-check: {sql}");
+    }
+    // Grouping sets with a window remain unsupported (they grow the aggregate sink during rebase).
     assert!(matches!(
         plan(
-            "SELECT id, COUNT(*), ROW_NUMBER() OVER () FROM users GROUP BY id",
+            "SELECT id, ROW_NUMBER() OVER () FROM users GROUP BY ROLLUP (id)",
+            &catalog(),
+        ),
+        Err(Error::Unsupported(_)),
+    ));
+    // A projected bare column that is neither grouped nor aggregated is still rejected.
+    assert!(matches!(
+        plan(
+            "SELECT name, ROW_NUMBER() OVER () FROM users GROUP BY id",
             &catalog(),
         ),
         Err(Error::Unsupported(_)),
@@ -2409,7 +2426,7 @@ fn b458a_json_path_operators() {
 // --- System-catalog namespace guard ------------------------------
 
 /// `users` plus mock `nusadb_policies` / `nusadb_rls` system-catalog tables — the shape of the
-/// the design adversarial probe (a non-superuser rewriting the RLS catalogs with plain SQL).
+/// Adversarial probe (a non-superuser rewriting the RLS catalogs with plain SQL).
 fn system_catalogs() -> MockCatalog {
     catalog()
         .with(TableSchema {

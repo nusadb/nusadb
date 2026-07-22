@@ -1096,6 +1096,10 @@ pub enum AggregateFunc {
     /// `ARRAY_AGG(expr)` — collect every input value (including `NULL`s) of `expr` into an array, in
     /// input order; an empty group yields `NULL`. Result type is an array of `expr`'s type.
     ArrayAgg,
+    /// `JSONB_AGG(expr)` / `JSON_AGG(expr)` — collect every input value (a `NULL` becomes JSON `null`)
+    /// into a JSON array, in input order; an empty group yields `NULL`. The argument may be any type
+    /// (serialized to JSON per element). Result `JSON`.
+    JsonAgg,
     /// `BOOL_AND(expr)` — `TRUE` iff every non-`NULL` boolean input is `TRUE`; `NULL` for an empty
     /// group. Result `BOOL`.
     BoolAnd,

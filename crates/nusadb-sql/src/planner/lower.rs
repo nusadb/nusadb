@@ -380,17 +380,6 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             predicate,
         };
     }
-    // Window functions annotate the (WHERE-filtered) rows with appended columns
-    // before projection. Mutually exclusive with aggregation, so it sits beside
-    // (not above) the aggregate; placing it here keeps its appended ordinals
-    // aligned with the source-row width the projection was resolved against.
-    if !select.windows.is_empty() {
-        op = PhysicalOperator::Window {
-            input: Box::new(op),
-            windows: select.windows,
-            top_n: window_top_n_hint,
-        };
-    }
     // Aggregation folds the (WHERE-filtered) input stream. `GROUP BY` partitions
     // it into groups (one output row each); a bare aggregate is one global
     // group. The output row is `[group keys ++ aggregate results]`.
@@ -421,6 +410,19 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
         op = PhysicalOperator::Filter {
             input: Box::new(op),
             predicate,
+        };
+    }
+    // Window functions annotate the (WHERE-filtered, and — when the query aggregates — grouped and
+    // HAVING-filtered) rows with appended columns before projection. The operator runs here, ABOVE
+    // any aggregate: for a non-aggregated query its input is the filtered scan (columns at their
+    // source ordinals); for an aggregated one its input is the post-aggregation row `[group keys ++
+    // aggregates]`, which the analyzer rebased the windows' expressions and the projection's
+    // window-column references onto. It appends one column per window after the input width.
+    if !select.windows.is_empty() {
+        op = PhysicalOperator::Window {
+            input: Box::new(op),
+            windows: select.windows,
+            top_n: window_top_n_hint,
         };
     }
     if let Some((table, column_ordinal, query, k, filter)) = vector_knn {
@@ -585,6 +587,15 @@ fn top_n_cap(select: &SelectPlan) -> Option<u64> {
 fn window_top_n_cap(select: &SelectPlan) -> Option<u64> {
     use crate::ast::WindowFunc as W;
     if select.limit_with_ties || select.distinct || !select.distinct_on.is_empty() {
+        return None;
+    }
+    // A window over aggregated rows sits ABOVE the GROUP BY / scalar-aggregate stage, not a plain
+    // ordered scan, so the top-N-into-window rewrite (which assumes the window reads the sorted input
+    // directly) does not apply — compute the window fully.
+    if !select.group_keys.is_empty()
+        || !select.aggregates.is_empty()
+        || !select.grouping_sets.is_empty()
+    {
         return None;
     }
     let limit = select.limit?;

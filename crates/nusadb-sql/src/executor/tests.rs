@@ -933,6 +933,153 @@ fn any_with_text_array_literal_filters_end_to_end() {
 }
 
 #[test]
+fn window_function_over_group_by_ranks_aggregated_rows() {
+    // A window function runs over the post-aggregation rows: its ORDER BY / PARTITION BY may name a
+    // grouping aggregate (`rank() OVER (ORDER BY sum(x))`) or a group key, exactly the OLAP
+    // "rank-groups-by-aggregate" shape. Previously rejected as "window functions together with
+    // GROUP BY".
+    let engine = MockEngine::new();
+    run("CREATE TABLE emp (dept TEXT, sal INT)", &engine).unwrap();
+    for (d, s) in [("a", 100), ("a", 200), ("b", 50), ("b", 50), ("c", 300)] {
+        run(&format!("INSERT INTO emp VALUES ('{d}', {s})"), &engine).unwrap();
+    }
+    // rank() OVER (ORDER BY sum(sal) DESC): sums a=300, b=100, c=300 → 300s tie at rank 1, 100 at 3.
+    assert_eq!(
+        rows_of(
+            run(
+                "SELECT dept, sum(sal), rank() OVER (ORDER BY sum(sal) DESC) \
+                 FROM emp GROUP BY dept ORDER BY dept",
+                &engine
+            )
+            .unwrap()
+        )
+        .1,
+        vec![
+            vec![Value::Text("a".to_owned()), Value::Int(300), Value::Int(1)],
+            vec![Value::Text("b".to_owned()), Value::Int(100), Value::Int(3)],
+            vec![Value::Text("c".to_owned()), Value::Int(300), Value::Int(1)],
+        ]
+    );
+    // Window ORDER BY a group key.
+    assert_eq!(
+        rows_of(
+            run(
+                "SELECT dept, rank() OVER (ORDER BY dept) FROM emp GROUP BY dept ORDER BY dept",
+                &engine
+            )
+            .unwrap()
+        )
+        .1,
+        vec![
+            vec![Value::Text("a".to_owned()), Value::Int(1)],
+            vec![Value::Text("b".to_owned()), Value::Int(2)],
+            vec![Value::Text("c".to_owned()), Value::Int(3)],
+        ]
+    );
+    // A scalar aggregate (no GROUP BY) is one group: the window runs over that single row.
+    assert_eq!(
+        rows_of(
+            run(
+                "SELECT row_number() OVER (ORDER BY count(*)) FROM emp",
+                &engine
+            )
+            .unwrap()
+        )
+        .1,
+        vec![vec![Value::Int(1)]]
+    );
+    // PARTITION BY a grouping aggregate: {a,b} share count 2, {c} is count 1.
+    assert_eq!(
+        rows_of(
+            run(
+                "SELECT dept, row_number() OVER (PARTITION BY count(*) ORDER BY dept) \
+                 FROM emp GROUP BY dept ORDER BY dept",
+                &engine
+            )
+            .unwrap()
+        )
+        .1,
+        vec![
+            vec![Value::Text("a".to_owned()), Value::Int(1)],
+            vec![Value::Text("b".to_owned()), Value::Int(2)],
+            vec![Value::Text("c".to_owned()), Value::Int(1)],
+        ]
+    );
+    // A projected bare column that is neither grouped nor aggregated is still rejected.
+    assert!(
+        run(
+            "SELECT sal, rank() OVER (ORDER BY count(*)) FROM emp GROUP BY dept",
+            &engine
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn jsonb_agg_collects_values_into_a_json_array() {
+    // JSONB_AGG collects every input value into a JSON array in input order, a NULL becoming JSON
+    // `null` (unlike the NULL-skipping numeric aggregates); an empty group yields NULL; and an
+    // in-aggregate ORDER BY reorders the elements before serialization.
+    let engine = MockEngine::new();
+    run("CREATE TABLE t (g INT, v INT)", &engine).unwrap();
+    for (g, v) in [(1, "10"), (1, "20"), (1, "NULL"), (2, "30")] {
+        run(&format!("INSERT INTO t VALUES ({g}, {v})"), &engine).unwrap();
+    }
+    let one = |sql: &str| rows_of(run(sql, &engine).unwrap()).1;
+    // Input order, NULL kept as JSON null.
+    assert_eq!(
+        one("SELECT jsonb_agg(v) FROM t WHERE g = 1"),
+        vec![vec![Value::Json("[10,20,null]".to_owned())]]
+    );
+    // ORDER BY v DESC: NULLs sort first (the DESC default), then 20, 10.
+    assert_eq!(
+        one("SELECT jsonb_agg(v ORDER BY v DESC) FROM t WHERE g = 1"),
+        vec![vec![Value::Json("[null,20,10]".to_owned())]]
+    );
+    // An empty group is NULL, not an empty array.
+    assert_eq!(
+        one("SELECT jsonb_agg(v) FROM t WHERE g = 99"),
+        vec![vec![Value::Null]]
+    );
+    // Per group, and the `json_agg` spelling is the same aggregate.
+    assert_eq!(
+        one("SELECT json_agg(v) FROM t WHERE g = 2"),
+        vec![vec![Value::Json("[30]".to_owned())]]
+    );
+}
+
+#[test]
+fn jsonb_functions_accept_bare_string_literals() {
+    // A bare string literal for a JSON (or `text[]` path) argument is the unknown-literal form an
+    // ad-hoc query and many drivers use: `jsonb_object_keys('{...}')`, `jsonb_set('{...}', '{a}',
+    // '9')`. It must type-check like the explicit `'...'::json` / `'{a}'::text[]` cast, not raise
+    // `TypeMismatch: expected Json, found Text`.
+    let engine = MockEngine::new();
+    let rows = |sql: &str| rows_of(run(sql, &engine).unwrap()).1;
+
+    // jsonb_object_keys (set-returning) — one row per top-level key.
+    assert_eq!(
+        rows(r#"SELECT jsonb_object_keys('{"a":1,"b":2}')"#),
+        vec![
+            vec![Value::Text("a".to_owned())],
+            vec![Value::Text("b".to_owned())],
+        ]
+    );
+    // jsonb_set (scalar, text path + text new-value literals) — mutate the value at the path.
+    assert_eq!(
+        rows(r#"SELECT jsonb_set('{"a":1,"b":2}', '{a}', '9')"#),
+        vec![vec![Value::Json(r#"{"a":9,"b":2}"#.to_owned())]]
+    );
+    // The optional 4th (create-missing) argument still binds.
+    assert_eq!(
+        rows(r#"SELECT jsonb_set('{"a":1}', '{c}', '3', true)"#),
+        vec![vec![Value::Json(r#"{"a":1,"c":3}"#.to_owned())]]
+    );
+    // An unparseable JSON literal loud-rejects at evaluation — never a silent wrong row.
+    assert!(run("SELECT jsonb_object_keys('not json')", &engine).is_err());
+}
+
+#[test]
 fn percentile_within_group_array_of_fractions_returns_an_array() {
     // `PERCENTILE_CONT(ARRAY[f1, f2, ...]) WITHIN GROUP (ORDER BY x)` returns one percentile per
     // fraction, as an array — the multi-quantile form a dashboard asks for in a single scan. It
@@ -1872,7 +2019,7 @@ fn distinct_then_limit_caps_deduped_rows() {
 fn vacuum_executes_as_recognized_statement() {
     let engine = MockEngine::new();
     // The SQL pathway is complete; the count is 0 until the storage engine
-    // exposes reclamation through the treaty (handled in the engine layer).
+    // exposes reclamation through the treaty.
     assert!(matches!(
         run("VACUUM", &engine).unwrap(),
         ExecutionResult::Vacuumed(0),
@@ -2572,7 +2719,7 @@ fn vectorized_path_falls_back_for_unsupported_shapes() {
 
 #[test]
 fn vectorized_routing_uses_plan_time_scan_estimate() {
-    // Selective routing (the design recommendation): the planner annotates a single-table SELECT with
+    // Selective routing: the planner annotates a single-table SELECT with
     // the scanned-row estimate from ANALYZE stats, and the executor routes to the batch path only
     // at/above the threshold — with no run-time stats fetch.
     let engine = seeded_users();
@@ -3100,7 +3247,7 @@ fn parallel_filtered_and_scalar_aggregate_match_sequential() {
     assert_eq!(sequential, row_path, "fallback mismatch for `{sql}`");
 }
 
-/// SQL-surface batch: `SUBSTRING(s FOR n)` defaults
+/// SQL-surface batch (user directive "impl sintaks yang belum"): `SUBSTRING(s FOR n)` defaults
 /// its start to 1; `CREATE [MATERIALIZED] VIEW IF NOT EXISTS` is accepted (no-op contract
 /// pinned end-to-end in `p11_views/plain.slt`); explicit `UNIQUE ... NULLS DISTINCT` (the
 /// default semantic) and `TRUNCATE ... RESTRICT` are accepted.

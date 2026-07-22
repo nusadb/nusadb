@@ -1,4 +1,4 @@
-# p13_functions/json_set_returning — JSON set-returning functions (B4.58b/c):
+# p13_functions/json_set_returning — JSON set-returning functions:
 # json_array_elements and jsonb_path_query (a jsonpath subset) end-to-end.
 
 statement ok
@@ -41,7 +41,7 @@ query T
 SELECT jsonb_path_query(doc, '$.nope') FROM j WHERE id = 2
 ----
 
-# --- jsonb_path_exists: whether the jsonpath matches anywhere (renders as 0/1) ---
+# --- jsonb_path_exists: whether the jsonpath matches anywhere ---
 query T
 SELECT jsonb_path_exists(doc, '$.items[*].n') FROM j WHERE id = 2
 ----
@@ -115,3 +115,24 @@ NULL
 query T
 SELECT jsonb_array_elements_text(doc) FROM j WHERE id = 2
 ----
+
+# --- jsonb_object_keys: one row per top-level key. A bare JSON string literal is accepted (the
+# unknown-literal rule) — it need not be an explicit `'...'::json` cast.
+query T rowsort
+SELECT jsonb_object_keys('{"a":1,"b":2}')
+----
+a
+b
+
+# --- jsonb_set: mutate the value at a text[] path. The document, the `{a}` path, and the new value
+# are all bare string literals here — each coerces to its declared type (JSON / text[] / JSON).
+query T
+SELECT jsonb_set('{"a":1,"b":2}', '{a}', '9')
+----
+{"a": 9, "b": 2}
+
+# The optional 4th argument (create-missing) inserts a new key.
+query T
+SELECT jsonb_set('{"a":1}', '{c}', '3', true)
+----
+{"a": 1, "c": 3}

@@ -17,7 +17,7 @@
 //! scalar — a SIMD `f64` SUM reorders the (non-associative) adds and `_mm256_min_pd` mishandles
 //! `NaN`, either of which would make a query's result depend on the host's instruction set.
 //! Bit-exact batch=row results are a correctness/determinism invariant for the engine
-//! (the design, 2026-06-14).
+//! (2026-06-14).
 
 use std::sync::Arc;
 
@@ -246,7 +246,7 @@ pub(super) fn columnar_call_shape(call: &AggregateCall) -> Option<ColumnarShape>
     if call.filter.is_some() || call.arg2.is_some() || !call.order_by.is_empty() {
         return None;
     }
-    if matches!(call.func, F::Grouping | F::ArrayAgg) || call.func.is_two_arg() {
+    if matches!(call.func, F::Grouping | F::ArrayAgg | F::JsonAgg) || call.func.is_two_arg() {
         return None;
     }
     let Some(arg) = call.arg.as_ref() else {

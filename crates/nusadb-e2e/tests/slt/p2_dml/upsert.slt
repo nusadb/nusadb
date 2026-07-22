@@ -62,7 +62,7 @@ statement ok
 DROP TABLE t
 
 # A DO UPDATE that moves a secondary UNIQUE column onto another row's value is rejected, exactly as
-# a plain UPDATE would be (B2.09f).
+# a plain UPDATE would be.
 statement ok
 CREATE TABLE u (id INT PRIMARY KEY, k INT, UNIQUE (k))
 

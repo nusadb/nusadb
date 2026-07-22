@@ -1382,6 +1382,10 @@ pub(super) fn analyze_scalar_function(
             Some(expected),
             aggregates.as_deref_mut(),
         )?;
+        // A bare string literal for a JSON / array / temporal / … parameter is coerced to that type
+        // (the unknown-literal rule), so `jsonb_set('{...}', '{a}', '9')` type-checks like its
+        // explicit-cast form. A no-op for a TEXT parameter or a non-literal argument.
+        let typed = coerce_text_literal_to(typed, expected);
         // A FLOAT parameter also accepts an INT or NUMERIC argument (coerced to f64 at eval) — the
         // same widening `assignable` allows, and needed since a plain decimal literal now types as
         // NUMERIC, e.g. `SETSEED(0.5)`. An unconstrained NUMERIC parameter likewise accepts
@@ -2949,6 +2953,31 @@ fn coerce_unknown_literal(operand: TypedExpr, anchor: ColumnType) -> TypedExpr {
         }
     } else {
         operand
+    }
+}
+
+/// Coerce a bare `TEXT` literal argument to a function's declared parameter type when the reference
+/// engine's implicit unknown-literal rule allows it (`assignable(expected, TEXT)`: `JSON`, arrays,
+/// temporal/UUID, interval, vector, bytea, numeric). A string literal is "unknown"-typed, so
+/// `jsonb_object_keys('{...}')` / `jsonb_set('{...}', '{a}', '9')` must type-check like the explicit
+/// `'...'::json` / `'{a}'::text[]` forms rather than raising `TypeMismatch: expected Json, found
+/// Text`. The re-typed cast parses the literal at evaluation and a bad value still loud-rejects.
+///
+/// Only a bare `TEXT` *literal* is coerced — a genuinely `TEXT`-typed column or expression stays a
+/// real mismatch (the reference engine treats only string literals as unknown). A `TEXT`-expecting
+/// parameter, or a type that does not accept a text value, returns `typed` unchanged.
+pub(super) fn coerce_text_literal_to(typed: TypedExpr, expected: ColumnType) -> TypedExpr {
+    let want = expected.physical();
+    if want != ColumnType::Text
+        && matches!(&typed.kind, TypedExprKind::Literal(ast::Value::Text(_)))
+        && assignable(want, ColumnType::Text)
+    {
+        TypedExpr {
+            kind: TypedExprKind::Cast(Box::new(typed), false),
+            ty: super::expr_type(expected),
+        }
+    } else {
+        typed
     }
 }
 
