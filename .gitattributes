@@ -4,3 +4,6 @@
 # entrypoint (and any container/CI shell) when the image is built from a Windows checkout
 # with core.autocrlf=true. Pin LF regardless of the contributor's autocrlf setting.
 *.sh text eol=lf
+
+# Normalize all text files to LF in the repo (public repo convention).
+* text=auto eol=lf
