@@ -37,7 +37,7 @@ use std::path::Path;
 #[cfg(feature = "dst-fault")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nusadb_core::engine::{
     AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, SequenceDef, SharedTuple, TableDef,
@@ -87,10 +87,12 @@ pub(crate) const PER_ROW_WRITE_OVERHEAD: u64 = mvcc::META as u64 + 40;
 pub(crate) const PURGE_ROW_BATCH: usize = 4096;
 
 /// The durable-log handle: the framing writer plus a second handle to the same file for the
-/// commit-point fsync (the writer owns its handle exclusively).
+/// commit-point fsync (the writer owns its handle exclusively). The fsync handle is shared behind an
+/// `Arc` so a committer can take it out to fsync outside the writer lock with a cheap reference-count
+/// bump, rather than duplicating the file descriptor (a syscall pair) on every commit.
 struct Wal {
     writer: WalWriter<File>,
-    sync: File,
+    sync: Arc<File>,
 }
 
 impl std::fmt::Debug for Wal {
@@ -1058,7 +1060,9 @@ impl BtreeEngine {
             .open(path)?;
         file.set_len(last_good)?;
         file.sync_all()?;
-        let sync = file.try_clone()?;
+        // Duplicate the file descriptor once here, at open, and share it behind an `Arc`; each
+        // commit then clones the `Arc` (a reference-count bump) instead of the descriptor.
+        let sync = Arc::new(file.try_clone()?);
         let mut writer_file = file;
         writer_file.seek(std::io::SeekFrom::End(0))?;
         let writer = WalWriter::resume(writer_file, nusadb_core::Lsn(last_lsn + 1));
@@ -1548,7 +1552,7 @@ impl BtreeEngine {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             (
                 wal.writer.next_lsn().0.saturating_sub(1),
-                wal.sync.try_clone()?,
+                Arc::clone(&wal.sync),
             )
         };
         // DST fault point: fail AFTER the flush above so the record is in the file (and can
