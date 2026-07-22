@@ -1,40 +1,30 @@
 # NusaDB
 
-NusaDB is a relational database engine written from scratch in Rust. It's a single-node engine
-that handles both transactional and analytical work: MVCC transactions, a clustered B-link/B+tree
-storage engine, write-ahead logging with crash recovery, an SQL engine, and its own binary wire
-protocol.
+NusaDB is a relational database engine written from scratch in Rust. It runs on a single node and
+handles both transactional and analytical queries.
 
-The same engine code runs against real disk in production and against an in-memory simulation
-harness with fault injection in tests, so concurrency and crash-recovery bugs can be reproduced
-from a single seed.
+What it has today:
 
-Status: pre-1.0 (`0.1.0.Beta`). The core engine, transactions, SQL, and wire protocol work today,
-but APIs and on-disk formats may still change before 1.0.
+- MVCC transactions with Serializable Snapshot Isolation, plus all four standard isolation levels,
+  savepoints, and rollback
+- a clustered B-link/B+tree storage engine: 8 KB pages, a clock-eviction buffer pool, rows in the
+  leaves keyed by an engine-minted row id, and no-wait row locks
+- write-ahead logging with crash recovery (CRC32 per record, lz4-compressed); on restart the engine
+  replays the durable tail of the log
+- a cost-based SQL engine (parser on top of `sqlparser-rs`, analyzer, planner with histogram/MCV
+  statistics and predicate/projection pushdown, and an executor)
+- window functions, recursive CTEs, subqueries, set operations, `MERGE`, views, sequences, and a
+  numeric/temporal/JSON/array/UUID type system with exact base-10 `NUMERIC`
+- a binary wire protocol over TCP with TLS (`rustls`) and SCRAM-SHA-256, both simple and
+  extended (prepared-statement) queries, and `COPY`
 
-## What's inside
+One design choice worth calling out: the same engine code runs on real disk in production and
+against an in-memory simulation with fault injection in the tests. That means a concurrency or
+crash-recovery bug can be replayed from a single seed. Alongside it there's a SQLLogicTest corpus,
+isolation and crash-recovery suites, and fuzz targets.
 
-Storage: 8 KB pages, a buffer pool with clock eviction, and a clustered B-link/B+tree engine. Rows
-live in the leaves keyed by an engine-minted row id, carry MVCC stamps, and use no-wait row locks.
-
-Transactions: MVCC with per-row `xmin`/`xmax` and lock-free reads, Serializable Snapshot Isolation,
-the four standard isolation levels, savepoints and rollback, and a background worker that purges old
-row versions.
-
-Durability: an append-only WAL (CRC32 per record, lz4-compressed) written ahead of every data-page
-change. Recovery replays the durable prefix of the log.
-
-SQL: a parser built on `sqlparser-rs`, an analyzer that resolves scope and checks types, a
-cost-based planner (histogram/MCV statistics, predicate and projection pushdown, join selection),
-and an executor. It covers DDL and DML, joins, subqueries, recursive CTEs, window functions, set
-operations, `MERGE`, sequences, views, a numeric/temporal/JSON/array/UUID type system, and exact
-base-10 `NUMERIC` arithmetic.
-
-Wire protocol: a binary protocol over TCP with TLS (`rustls`) and SCRAM-SHA-256 auth, both a simple
-and an extended (prepared-statement) query path, and `COPY`.
-
-Testing: deterministic simulation testing, a SQLLogicTest corpus, isolation and crash-recovery
-suites, and fuzz targets.
+Status: pre-1.0 (`0.1.0`). The engine, transactions, SQL, and the wire protocol all work, but the
+APIs and the on-disk format may still change before 1.0.
 
 ## Build
 
@@ -61,7 +51,7 @@ cargo run -p nusadb-cli -- --host 127.0.0.1:5678
 
 Prebuilt server images are published to Docker Hub as
 [`nusadb/nusadb`](https://hub.docker.com/r/nusadb/nusadb) (linux/amd64). Use `latest` to track the
-current release, or pin a version tag such as `0.1.0.Beta` for a reproducible deployment.
+current release, or pin a version tag such as `0.1.0` for a reproducible deployment.
 
 ```bash
 # Start the server; the volume keeps the database across container restarts
