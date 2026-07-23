@@ -418,12 +418,11 @@ pub(super) fn run_create_index(
         dml::schema_by_id(engine, plan.def.table)?,
     ) && let Some(target) = dml::build_index_target(id, &table, &plan.def)
     {
-        // Backfill through the same maintenance path DML writes take, so a functional/expression
-        // key is evaluated and a partial predicate skips non-matching rows exactly as on later
-        // inserts.
-        for (tid, row) in scan_table(&table, engine, txn)? {
-            dml::insert_into_indexes(std::slice::from_ref(&target), &row, tid, engine, txn)?;
-        }
+        // Backfill through the same maintenance path DML writes take (a functional/expression key
+        // is evaluated and a partial predicate skips non-matching rows exactly as on later inserts),
+        // but as one key-sorted batch so building the index over an existing table drives sequential
+        // index writes instead of a random one per row.
+        dml::backfill_index_batched(&target, scan_table(&table, engine, txn)?, engine, txn)?;
     }
     Ok(ExecutionResult::IndexCreated)
 }

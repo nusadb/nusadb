@@ -200,3 +200,60 @@ fn copy_rejects_a_duplicate_on_a_secondary_unique_index() {
         "a rejected COPY leaves the table empty (error was: {err:?})"
     );
 }
+
+/// `CREATE INDEX` on an already-populated table backfills every existing row through the batched,
+/// key-sorted path, so the new index is complete even though the rows are not stored in key order.
+#[test]
+fn create_index_backfills_a_populated_table_completely() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    // Load the rows first (no secondary index yet), with v in the reverse of key order.
+    let mut data = String::new();
+    for i in 0..N {
+        writeln!(data, "{i}\t{}", N - i).unwrap();
+    }
+    copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap();
+
+    // Build the index over the existing rows — the batched backfill.
+    exec(engine, &mut session, "CREATE INDEX t_v ON t (v)");
+    assert_eq!(
+        count_index_entries(engine, "t_v"),
+        N,
+        "the backfill built an entry for every existing row"
+    );
+}
+
+/// `CREATE UNIQUE INDEX` on a column that already holds a duplicate value is rejected by the
+/// batched backfill's uniqueness check (the sorted build places the equal keys adjacent).
+#[test]
+fn create_unique_index_rejects_an_existing_duplicate() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    // Two rows share v = 7, so a unique index over v cannot be built.
+    exec(
+        engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 7), (2, 7), (3, 9)",
+    );
+    let logical = analyze(
+        parse("CREATE UNIQUE INDEX t_v_uniq ON t (v)").unwrap(),
+        &Cat(engine),
+    )
+    .unwrap();
+    let err = session.execute(plan(logical)).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("duplicate"),
+        "CREATE UNIQUE INDEX over duplicate data is rejected: {err}"
+    );
+}

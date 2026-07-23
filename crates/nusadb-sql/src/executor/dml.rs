@@ -2477,6 +2477,30 @@ pub(super) fn insert_into_indexes(
     Ok(())
 }
 
+/// Build one index over already-scanned `rows` (a `CREATE INDEX` backfill) by collecting every
+/// indexed row's entry and applying them in a single key-sorted batch, so the build's index writes
+/// are sequential rather than a random one per row. A partial index's predicate skips non-matching
+/// rows and a functional/expression key is evaluated, exactly as [`insert_into_indexes`] does per
+/// row; a `unique` index still rejects a duplicate (the batch places equal keys adjacent). The rows
+/// are consumed as their keys are read — each row's contents free while the entry buffer (only key
+/// bytes plus a tid, smaller than the row) grows — so the peak footprint stays on par with the
+/// per-row scan it replaces rather than adding a second full copy.
+pub(super) fn backfill_index_batched(
+    target: &IndexTarget,
+    rows: impl IntoIterator<Item = (Tid, Row)>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let mut entries: Vec<(Vec<u8>, Tid)> = Vec::new();
+    for (tid, row) in rows {
+        if row_is_indexed(target, &row)? {
+            entries.push((index_key_for(&row, &target.keys)?, tid));
+        }
+    }
+    engine.index_insert_batch(txn, target.id, entries)?;
+    Ok(())
+}
+
 /// On UPDATE, remove a row's entry from every **partial** index it is leaving — it was indexed
 /// (`old` satisfied the predicate) but its new version is not.
 ///
