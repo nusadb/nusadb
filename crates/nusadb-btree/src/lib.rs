@@ -2587,6 +2587,106 @@ mod tests {
         engine.commit(txn).unwrap();
     }
 
+    /// A batched index build inserts every entry and scans back in key order, identical to feeding
+    /// the same entries one at a time through `index_insert`. The batch path applies them sorted for
+    /// locality, so the resulting index is the same set of entries in the same order.
+    #[test]
+    fn index_insert_batch_matches_the_per_row_path() {
+        let engine = BtreeEngine::new();
+        let txn = engine.begin(RC).unwrap();
+        let table = engine.create_table(txn, &table_def("t")).unwrap();
+        let per_row = engine
+            .create_index(txn, &index_def("per_row", table, false))
+            .unwrap();
+        let batched = engine
+            .create_index(txn, &index_def("batched", table, false))
+            .unwrap();
+
+        // Insert rows with keys in a shuffled (non-sorted) order and record the batch entries.
+        let order = [5u8, 2, 8, 1, 9, 0, 7, 3, 6, 4];
+        let mut entries = Vec::new();
+        for &key in &order {
+            let tid = engine.insert(txn, table, &[key]).unwrap();
+            engine.index_insert(txn, per_row, &[key], tid).unwrap();
+            entries.push((vec![key], tid));
+        }
+        engine.index_insert_batch(txn, batched, entries).unwrap();
+
+        let per_row_scan = collect_index(&engine, txn, per_row, Bound::Unbounded, Bound::Unbounded);
+        let batched_scan = collect_index(&engine, txn, batched, Bound::Unbounded, Bound::Unbounded);
+        assert_eq!(
+            per_row_scan, batched_scan,
+            "batch build equals per-row build"
+        );
+        let keys: Vec<u8> = batched_scan.iter().map(|(_, t)| t[0]).collect();
+        assert_eq!(
+            keys,
+            (0u8..10).collect::<Vec<_>>(),
+            "ascending key order regardless of insert order"
+        );
+        engine.commit(txn).unwrap();
+    }
+
+    /// A batch carrying two entries for one key on a UNIQUE index is a genuine duplicate and is
+    /// rejected — the sorted apply puts the pair adjacent and the second sees the first's live
+    /// entry — exactly as two separate `index_insert` calls would collide.
+    #[test]
+    fn index_insert_batch_rejects_a_duplicate_on_a_unique_index() {
+        let engine = BtreeEngine::new();
+        let txn = engine.begin(RC).unwrap();
+        let table = engine.create_table(txn, &table_def("t")).unwrap();
+        let uniq = engine
+            .create_index(txn, &index_def("u", table, true))
+            .unwrap();
+
+        let a = engine.insert(txn, table, &[1]).unwrap();
+        let b = engine.insert(txn, table, &[2]).unwrap();
+        // Two different rows carrying the same unique key.
+        let entries = vec![(b"dup".to_vec(), a), (b"dup".to_vec(), b)];
+        let err = engine
+            .index_insert_batch(txn, uniq, entries)
+            .expect_err("duplicate unique key within one batch");
+        assert!(err.to_string().contains("unique index u"));
+        engine.rollback(txn).unwrap();
+    }
+
+    /// The batch is buffered with the transaction: a rollback undoes every entry it added, so a
+    /// crash before commit leaves none of them — the "fully-indexed or not-at-all" invariant the
+    /// bulk path relies on comes free from transaction atomicity, no new recovery path.
+    #[test]
+    fn index_insert_batch_is_undone_by_rollback() {
+        let engine = BtreeEngine::new();
+        // Table + index in a committed txn so they survive the rolled-back one below.
+        let setup = engine.begin(RC).unwrap();
+        let table = engine.create_table(setup, &table_def("t")).unwrap();
+        let idx = engine
+            .create_index(setup, &index_def("i", table, false))
+            .unwrap();
+        engine.commit(setup).unwrap();
+
+        let txn = engine.begin(RC).unwrap();
+        let mut entries = Vec::new();
+        for key in 0u8..8 {
+            let tid = engine.insert(txn, table, &[key]).unwrap();
+            entries.push((vec![key], tid));
+        }
+        engine.index_insert_batch(txn, idx, entries).unwrap();
+        assert_eq!(
+            collect_index(&engine, txn, idx, Bound::Unbounded, Bound::Unbounded).len(),
+            8,
+            "entries visible within the transaction before rollback"
+        );
+        engine.rollback(txn).unwrap();
+
+        // A fresh transaction sees none of them — the batch was fully undone.
+        let after = engine.begin(RC).unwrap();
+        assert!(
+            collect_index(&engine, after, idx, Bound::Unbounded, Bound::Unbounded).is_empty(),
+            "rollback undid every batched entry"
+        );
+        engine.commit(after).unwrap();
+    }
+
     /// MVCC: an index entry is only a pointer — a scan resolves it at the heap under the
     /// caller's read view, so another transaction's uncommitted row stays invisible through the
     /// index, and a pinned snapshot keeps seeing its version through the chain.

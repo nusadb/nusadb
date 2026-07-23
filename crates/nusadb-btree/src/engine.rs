@@ -3380,6 +3380,27 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         Ok(())
     }
 
+    fn index_insert_batch(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        mut entries: Vec<(Vec<u8>, Tid)>,
+    ) -> Result<()> {
+        // Apply the entries in key order rather than the caller's row order. The index is a sorted
+        // map keyed by these bytes, so a key-ordered batch turns the random node descents a bulk
+        // load's row order would cause into sequential, cache-warm inserts. Ordering changes neither
+        // the final index state nor the uniqueness outcome (two entries for one key still collide
+        // once both are seen). Each entry goes through the same per-entry check + apply + undo + WAL
+        // as `index_insert`, and the latch is released between entries, so a large batch stays
+        // cooperative with concurrent readers and a crash mid-batch rolls back with the transaction —
+        // fully indexed or not at all — exactly as the per-row path.
+        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        for (key, tid) in entries {
+            self.index_insert(txn, index, &key, tid)?;
+        }
+        Ok(())
+    }
+
     fn index_delete(&self, txn: TxnId, index: IndexId, key: &[u8], tid: Tid) -> Result<()> {
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {

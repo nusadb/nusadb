@@ -943,6 +943,30 @@ pub trait StorageEngine: Send + Sync {
         Err(unsupported("index_insert"))
     }
 
+    /// Add many `(key, tid)` entries to one index in a single call, for a bulk load (`COPY` or a
+    /// large `INSERT ... SELECT`) that would otherwise call [`index_insert`](StorageEngine::index_insert)
+    /// once per row per index.
+    ///
+    /// Semantically identical to calling `index_insert` for each entry in turn: every entry is
+    /// added, a `unique` index rejects a duplicate key with [`Error::ConstraintViolation`], and the
+    /// whole batch is buffered with the transaction — undone on rollback, durable on commit — so a
+    /// crash mid-batch leaves the transaction fully indexed or not at all, exactly as the per-row
+    /// path does. The engine MAY apply the entries in any order: a bulk load presents them in row
+    /// order, but applying them in key order turns the random index writes into sequential ones,
+    /// and neither the final index state nor the uniqueness outcome depends on order. The default
+    /// applies them as given via `index_insert`; the production engine overrides it to sort first.
+    fn index_insert_batch(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        entries: Vec<(Vec<u8>, Tid)>,
+    ) -> Result<()> {
+        for (key, tid) in entries {
+            self.index_insert(txn, index, &key, tid)?;
+        }
+        Ok(())
+    }
+
     /// Remove the index entry mapping `key` to `tid`. Buffered with the transaction.
     /// Default returns `Unsupported`.
     fn index_delete(&self, txn: TxnId, index: IndexId, key: &[u8], tid: Tid) -> Result<()> {
