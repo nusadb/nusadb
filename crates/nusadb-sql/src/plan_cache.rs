@@ -225,6 +225,19 @@ fn build_fingerprint(engine: &dyn StorageEngine, ids: &[TableId]) -> Option<Vec<
     Some(fingerprint)
 }
 
+/// Whether `sql` contains a positional parameter placeholder (`$1`, `$2`, …): a `$` immediately
+/// followed by an ASCII digit. Used to keep parameter-substituted plans out of the by-SQL-text
+/// cache, whose key still carries the placeholders while the planned statement carries the bound
+/// literals. Conservative: a `$<digit>` inside a string literal reads as a placeholder here and only
+/// forces a fresh plan, which is harmless.
+fn sql_has_parameter_placeholder(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'$' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+}
+
 /// Analyze and lower `stmt`, reusing a cached plan when the same `sql` was planned before and none of
 /// the tables it references have changed schema.
 ///
@@ -245,6 +258,15 @@ pub fn plan_cached(
     engine: &dyn StorageEngine,
 ) -> Result<PhysicalPlan, Error> {
     if !is_cacheable(&stmt) {
+        return Ok(crate::plan(crate::analyze(stmt, catalog)?));
+    }
+    // A prepared / extended-query statement reaches here already parameter-substituted (its `$n`
+    // placeholders replaced with the bound literals), but `sql` — the cache key — still holds the
+    // placeholders. Caching this substituted plan under the placeholder key would serve one
+    // execution's literals to a later reuse of the *same* prepared statement with *different*
+    // parameters, i.e. a stale, wrong result. Plan such statements fresh every time. (A `$<digit>`
+    // that only appears inside a string literal costs a cache bypass, never a wrong answer.)
+    if sql_has_parameter_placeholder(sql) {
         return Ok(crate::plan(crate::analyze(stmt, catalog)?));
     }
     // The session search path is part of a plan's identity: the same SQL text
