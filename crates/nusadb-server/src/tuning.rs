@@ -55,6 +55,15 @@ pub(crate) struct DerivedKnobs {
     /// [`RESIDENT_FLOOR`], so the query work pool + version store + process overhead keep their
     /// headroom; an explicit `--max-resident-bytes` overrides it.
     pub(crate) max_resident_bytes: usize,
+    /// Default cap on the bytes the wire layer buffers for one `COPY ... FROM STDIN` before loading
+    /// it (`--copy-max-bytes` when left unset). That buffer is transient and, unlike the two write
+    /// ceilings above, is not charged against the store, so a fixed cap plus a near-full resident
+    /// store can together exceed RAM on a memory-constrained host and get the process OOM-killed
+    /// before the load's own inserts are rejected. Derived as 20% of the budget so it scales with the
+    /// host, capped at [`COPY_MAX_CEILING`] (the historical fixed default, kept for roomy hosts) and
+    /// floored at [`COPY_MAX_FLOOR`] so a small host still accepts a routine load; an explicit
+    /// `--copy-max-bytes` (including `0` for unbounded) overrides it.
+    pub(crate) max_copy_bytes: usize,
 }
 
 /// Floor for the per-query work-memory cap: below this, sort/agg/join become impractically spill-
@@ -74,6 +83,14 @@ const TXN_WRITE_FLOOR: usize = 128 << 20; // 128 MiB
 /// bulk load can become on a memory-constrained host.
 const RESIDENT_FLOOR: usize = 256 << 20; // 256 MiB
 
+/// Upper bound for the derived single-`COPY` buffer cap: the historical fixed default. A host with
+/// ample RAM keeps this cap; only a smaller budget derives a lower one.
+const COPY_MAX_CEILING: usize = 1 << 30; // 1 GiB
+
+/// Floor for the derived single-`COPY` buffer cap: below this a routine bulk load would be split
+/// needlessly, so a small budget clamps up to here rather than throttling normal loads.
+const COPY_MAX_FLOOR: usize = 64 << 20; // 64 MiB
+
 /// Derive the memory knobs from `budget` (bytes) and the configured `max_connections`.
 ///
 /// `max_connections` is treated as at least 1. Uses the percentages in the module-level allocation
@@ -91,10 +108,15 @@ pub(crate) fn derive(budget: usize, max_connections: usize) -> DerivedKnobs {
     // allocation — floored so a small budget does not reject normal work. It bounds committed data
     // across the whole store, complementing the per-transaction ceiling above.
     let max_resident_bytes = (budget / 100 * 60).max(RESIDENT_FLOOR);
+    // The single-COPY buffer cap is 20% of the budget so it scales down on a small host, then bounded
+    // to [`COPY_MAX_FLOOR`, `COPY_MAX_CEILING`]: the ceiling keeps the historical 1 GiB on a roomy
+    // host, the floor keeps a routine load working on a small one.
+    let max_copy_bytes = (budget / 100 * 20).clamp(COPY_MAX_FLOOR, COPY_MAX_CEILING);
     DerivedKnobs {
         work_mem,
         max_txn_write_bytes,
         max_resident_bytes,
+        max_copy_bytes,
     }
 }
 
@@ -291,5 +313,37 @@ mod tests {
         assert_eq!(ceiling(256 << 20), RESIDENT_FLOOR, "small budget → floor");
         // The resident ceiling bounds the whole store, so it does not depend on the connection count.
         assert_eq!(ceiling(8 << 30), derive(8 << 30, 200).max_resident_bytes);
+    }
+
+    #[test]
+    fn derives_the_copy_buffer_cap_scaled_to_the_budget() {
+        let copy = |budget: usize| derive(budget, 25).max_copy_bytes;
+        // A roomy host keeps the historical 1 GiB cap (20% of the budget would exceed it).
+        assert_eq!(
+            copy(64 << 30),
+            COPY_MAX_CEILING,
+            "big host keeps the 1 GiB cap"
+        );
+        assert_eq!(copy(8 << 30), COPY_MAX_CEILING, "8 GiB: 20% > 1 GiB → cap");
+        // A mid host scales the cap down to ~20% of the budget, below the fixed 1 GiB.
+        let mid = 3usize << 30; // 3 GiB
+        assert_eq!(copy(mid), mid / 100 * 20, "3 GiB → ~20% of the budget");
+        assert!(copy(mid) < COPY_MAX_CEILING);
+        // A tiny budget clamps up to the floor rather than rejecting a routine load.
+        assert_eq!(copy(128 << 20), COPY_MAX_FLOOR, "tiny budget → floor");
+        // The reason for scaling: the transient COPY buffer plus the resident-store ceiling must
+        // leave headroom under the budget, so a bulk COPY on a constrained host is rejected
+        // gracefully instead of pushing the process past the limit and being OOM-killed. (Checked on
+        // budgets large enough that neither derivation hits its floor.)
+        for &gib in &[2usize, 3, 4, 8] {
+            let budget = gib << 30;
+            let k = derive(budget, 25);
+            assert!(
+                k.max_copy_bytes + k.max_resident_bytes <= budget,
+                "copy {} + resident {} exceeds a {gib} GiB budget",
+                k.max_copy_bytes,
+                k.max_resident_bytes
+            );
+        }
     }
 }

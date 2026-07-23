@@ -128,11 +128,13 @@ struct Args {
     handshake_timeout: u64,
 
     /// Maximum cumulative bytes buffered for a single `COPY ... FROM STDIN`; a larger load is
-    /// aborted with an error rather than buffered without bound (which could OOM the server)
-    /// (0 = unbounded, not recommended). Defaults to 1 GiB; raise it on a larger host or split the
-    /// load.
-    #[arg(long, default_value_t = 1 << 30)]
-    copy_max_bytes: usize,
+    /// aborted with an error rather than buffered without bound (which could OOM the server). Left
+    /// unset, it auto-derives from the memory budget (about 20%, capped at 1 GiB) so the transient
+    /// buffer plus the resident store cannot exceed RAM on a constrained host; with no budget it
+    /// falls back to 1 GiB. Pass an explicit value to pin it (raise it on a larger host or split the
+    /// load), or `0` for unbounded (not recommended).
+    #[arg(long)]
+    copy_max_bytes: Option<usize>,
 
     /// Maximum cumulative bytes one transaction may buffer for its uncommitted writes before it is
     /// failed with an honest out-of-memory error (SQLSTATE XX000) instead of being allowed to grow
@@ -305,9 +307,28 @@ async fn serve_metrics(listener: TcpListener, metrics: std::sync::Arc<Metrics>) 
 /// The resolved engine memory ceilings the composition root hands every database's engine: the
 /// per-transaction write ceiling and the global resident-memory ceiling. `None` on either means
 /// unlimited (no budget and no explicit flag).
+#[allow(
+    clippy::struct_field_names,
+    reason = "each field carries a byte cap and mirrors the name of the `--*-bytes` flag it resolves; \
+              the shared suffix is the point, not noise"
+)]
 struct MemoryCeilings {
     max_txn_write_bytes: Option<u64>,
     max_resident_bytes: Option<u64>,
+    /// Cap for one `COPY ... FROM STDIN` wire buffer: `None` = unbounded (explicit `0`), else the
+    /// byte cap. Auto-derived from the budget when the flag is unset (see [`tuning::DerivedKnobs`]).
+    copy_max_bytes: Option<u64>,
+}
+
+/// Resolve the single-`COPY` buffer cap from the flag and an optional budget-derived default. An
+/// explicit `--copy-max-bytes` wins verbatim (`Some(0)` = unbounded → `None`); when the flag is unset
+/// the derived value applies, and with no budget it falls back to the historical 1 GiB.
+fn resolve_copy_max_bytes(flag: Option<usize>, derived: Option<u64>) -> Option<u64> {
+    match flag {
+        Some(0) => None, // explicit opt-out: unbounded (not recommended)
+        Some(explicit) => Some(explicit as u64), // explicit cap wins, even over a derived default
+        None => derived.or(Some(1 << 30)), // unset: budget-derived, else the historical 1 GiB
+    }
 }
 
 fn apply_memory_config(args: &Args) -> Result<MemoryCeilings, Box<dyn std::error::Error>> {
@@ -345,6 +366,8 @@ fn apply_memory_config(args: &Args) -> Result<MemoryCeilings, Box<dyn std::error
             max_txn_write_bytes: (args.max_txn_write_bytes != 0)
                 .then_some(args.max_txn_write_bytes),
             max_resident_bytes: (args.max_resident_bytes != 0).then_some(args.max_resident_bytes),
+            // No budget to derive from: honour an explicit flag, else the historical 1 GiB fallback.
+            copy_max_bytes: resolve_copy_max_bytes(args.copy_max_bytes, None),
         });
     };
 
@@ -404,16 +427,23 @@ fn apply_memory_config(args: &Args) -> Result<MemoryCeilings, Box<dyn std::error
     } else {
         knobs.max_resident_bytes as u64
     };
+    // Single-COPY buffer cap: an explicit flag wins; otherwise the derived value scaled to the budget
+    // (about 20%, capped at 1 GiB), so the transient wire buffer plus the resident store leave RAM
+    // headroom instead of together overrunning a constrained host.
+    let copy_max_bytes =
+        resolve_copy_max_bytes(args.copy_max_bytes, Some(knobs.max_copy_bytes as u64));
     tracing::info!(
         budget,
         work_mem,
         max_txn_write_bytes,
         max_resident_bytes,
+        copy_max_bytes = copy_max_bytes.unwrap_or(0),
         "RAM-aware auto-tuning applied"
     );
     Ok(MemoryCeilings {
         max_txn_write_bytes: Some(max_txn_write_bytes),
         max_resident_bytes: Some(max_resident_bytes),
+        copy_max_bytes,
     })
 }
 
@@ -506,7 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         statement_timeout: secs(args.statement_timeout),
         handshake_timeout: secs(args.handshake_timeout),
-        copy_from_max_bytes: (args.copy_max_bytes > 0).then_some(args.copy_max_bytes),
+        copy_from_max_bytes: ceilings.copy_max_bytes.map(|b| b as usize),
     };
 
     // Optional Prometheus scrape endpoint; aborted when the server stops.
