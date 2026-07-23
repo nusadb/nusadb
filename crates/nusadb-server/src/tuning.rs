@@ -50,10 +50,11 @@ pub(crate) struct DerivedKnobs {
     /// once its total footprint reaches this, a row insert is failed loudly instead of the store
     /// growing until the host OOM-kills the server. Unlike [`max_txn_write_bytes`](Self::max_txn_write_bytes)
     /// (one in-flight transaction) this bounds *committed-resident* data across the whole store —
-    /// the streamed-bulk-load case that accumulates past the per-transaction ceiling. Derived as 60%
-    /// of the budget (the engine's page share in the allocation model), floored at
-    /// [`RESIDENT_FLOOR`], so the query work pool + version store + process overhead keep their
-    /// headroom; an explicit `--max-resident-bytes` overrides it.
+    /// the streamed-bulk-load case that accumulates past the per-transaction ceiling. Derived from
+    /// the engine's ~60% page share of the budget divided by [`RESIDENT_RSS_FACTOR`] (the meter
+    /// counts logical page bytes, but the real footprint runs larger), floored at [`RESIDENT_FLOOR`],
+    /// so the ceiling trips while the real footprint is still within budget rather than after the OS
+    /// kills the process; an explicit `--max-resident-bytes` overrides it.
     pub(crate) max_resident_bytes: usize,
     /// Default cap on the bytes the wire layer buffers for one `COPY ... FROM STDIN` before loading
     /// it (`--copy-max-bytes` when left unset). That buffer is transient and, unlike the two write
@@ -83,6 +84,13 @@ const TXN_WRITE_FLOOR: usize = 128 << 20; // 128 MiB
 /// bulk load can become on a memory-constrained host.
 const RESIDENT_FLOOR: usize = 256 << 20; // 256 MiB
 
+/// How much larger the real resident-memory footprint runs than the logical page bytes the engine
+/// meters when it decides whether to accept a write: allocator overhead, MVCC version chains, index
+/// nodes, and fragmentation the logical count does not see. The derived resident ceiling is divided
+/// by this so the logical ceiling trips while the real footprint is still within the budget — a
+/// graceful reject beats an out-of-memory kill. Measured at roughly 2x on a bulk load.
+const RESIDENT_RSS_FACTOR: usize = 2;
+
 /// Upper bound for the derived single-`COPY` buffer cap: the historical fixed default. A host with
 /// ample RAM keeps this cap; only a smaller budget derives a lower one.
 const COPY_MAX_CEILING: usize = 1 << 30; // 1 GiB
@@ -104,10 +112,13 @@ pub(crate) fn derive(budget: usize, max_connections: usize) -> DerivedKnobs {
     // The per-transaction write ceiling is a flat 25% of the budget (not divided per connection —
     // it bounds any *one* transaction), floored so a small budget does not reject normal work.
     let max_txn_write_bytes = (budget / 100 * 25).max(TXN_WRITE_FLOOR);
-    // The global resident ceiling is 60% of the budget — the page share of the engine's ≥60%
-    // allocation — floored so a small budget does not reject normal work. It bounds committed data
-    // across the whole store, complementing the per-transaction ceiling above.
-    let max_resident_bytes = (budget / 100 * 60).max(RESIDENT_FLOOR);
+    // The global resident ceiling bounds committed data across the whole store. The engine's page
+    // share of the budget is ~60%, but it meters *logical* page bytes while the OS limits real
+    // resident memory, which runs about [`RESIDENT_RSS_FACTOR`]x larger — so the logical ceiling is
+    // that share divided by the factor. The ceiling then trips (a graceful reject) while the real
+    // footprint is still within budget, instead of the OS killing the process first. Floored so a
+    // small budget does not reject normal work.
+    let max_resident_bytes = (budget / 100 * 60 / RESIDENT_RSS_FACTOR).max(RESIDENT_FLOOR);
     // The single-COPY buffer cap is 20% of the budget so it scales down on a small host, then bounded
     // to [`COPY_MAX_FLOOR`, `COPY_MAX_CEILING`]: the ceiling keeps the historical 1 GiB on a roomy
     // host, the floor keeps a routine load working on a small one.
@@ -294,19 +305,25 @@ mod tests {
     }
 
     #[test]
-    fn derives_the_global_resident_ceiling_at_60_percent_with_a_floor() {
+    fn derives_the_global_resident_ceiling_from_the_rss_adjusted_page_share() {
         let ceiling = |budget: usize| derive(budget, 25).max_resident_bytes;
-        // ~60% of the budget once above the floor — the engine's page share of the allocation model.
+        // The ~60% page share divided by the RSS factor, once above the floor — the logical ceiling
+        // trips before the real footprint (which runs larger) reaches the budget.
         for &gib in &[2usize, 8, 64] {
             let budget = gib << 30;
             assert_eq!(
                 ceiling(budget),
-                budget / 100 * 60,
-                "60% of a {gib} GiB budget"
+                budget / 100 * 60 / RESIDENT_RSS_FACTOR,
+                "RSS-adjusted page share of a {gib} GiB budget"
             );
             assert!(
                 ceiling(budget) > RESIDENT_FLOOR,
                 "a {gib} GiB budget derives above the floor"
+            );
+            // The real footprint (~factor x the logical ceiling) still leaves the budget headroom.
+            assert!(
+                ceiling(budget) * RESIDENT_RSS_FACTOR <= budget,
+                "the RSS-adjusted ceiling keeps the real footprint within a {gib} GiB budget"
             );
         }
         // A small budget clamps up to the 256 MiB floor rather than rejecting normal work.

@@ -155,9 +155,11 @@ struct Args {
     /// `--max-txn-write-bytes` (one in-flight transaction) this bounds *committed-resident* data
     /// across the whole store — the streamed bulk load that accumulates past the per-transaction
     /// ceiling. `DELETE`/`TRUNCATE` stay available at the ceiling so space can be freed. `0` (the
-    /// default) derives a protective ceiling of 60% of the memory budget (floor 256 MiB) when a
-    /// budget is known, and is unlimited only when no budget can be determined (a non-Linux host
-    /// with no `--mem-budget`). A non-zero value overrides the derived default.
+    /// default) derives a protective ceiling from the memory budget (floor 256 MiB) when a budget is
+    /// known — the engine's page share, reduced because the meter counts logical page bytes while the
+    /// real footprint runs larger, so the ceiling trips before the OS out-of-memory killer would —
+    /// and is unlimited only when no budget can be determined (a non-Linux host with no
+    /// `--mem-budget`). A non-zero value overrides the derived default.
     #[arg(long, default_value_t = 0)]
     max_resident_bytes: u64,
 
@@ -419,9 +421,10 @@ fn apply_memory_config(args: &Args) -> Result<MemoryCeilings, Box<dyn std::error
     } else {
         knobs.max_txn_write_bytes as u64
     };
-    // Global resident ceiling: an explicit flag wins; otherwise the protective derived default (60%
-    // of budget). The engine fails a row insert that would grow the store past this loudly, so a
-    // bulk load bigger than RAM degrades to an error instead of an OS OOM-kill of the whole server.
+    // Global resident ceiling: an explicit flag wins; otherwise the protective derived default (the
+    // page share of the budget, reduced for the real-vs-logical footprint gap). The engine fails a
+    // row insert that would grow the store past this loudly, so a bulk load bigger than RAM degrades
+    // to an error instead of an OS OOM-kill of the whole server.
     let max_resident_bytes = if args.max_resident_bytes != 0 {
         args.max_resident_bytes
     } else {
