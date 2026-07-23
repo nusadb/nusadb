@@ -196,8 +196,33 @@ impl DatabaseManager {
     }
 }
 
-/// How often the background scheduler purges a btree database.
+/// Base purge cadence: the wait after a pass that reclaimed only a modest backlog. Under sustained
+/// churn a single pass reclaims far more, and [`next_purge_delay`] shortens the wait toward
+/// [`PURGE_MIN_INTERVAL`] so the version store stays bounded between passes instead of growing.
 const PURGE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Shortest wait between purge passes, held while a pass keeps reclaiming a large backlog. It is a
+/// floor, not a busy-loop: the batched, latch-dropping purge is cooperative with foreground work, and
+/// the floor bounds purge's CPU/latch share.
+const PURGE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A pass reclaiming at least this many versions-plus-rows is read as "still under churn", so the
+/// next pass follows promptly rather than after the full base interval. One purge row-batch, so the
+/// fast cadence engages only when there is genuinely a batch-plus of work to keep up with.
+const PURGE_BACKLOG_HIGH_WATER: usize = 4096;
+
+/// Pick the wait before the next purge pass from how much the last pass reclaimed. A large reclaim
+/// means the backlog is still building under churn, so check back soon; otherwise use the base
+/// cadence. The result is always within `[PURGE_MIN_INTERVAL, PURGE_INTERVAL]` — the cadence can only
+/// shorten the wait, never lengthen it past the base, so it never delays reclamation relative to the
+/// old fixed schedule. A pure function of the reclaim count, kept separate for testing.
+const fn next_purge_delay(reclaimed: usize) -> Duration {
+    if reclaimed >= PURGE_BACKLOG_HIGH_WATER {
+        PURGE_MIN_INTERVAL
+    } else {
+        PURGE_INTERVAL
+    }
+}
 
 /// Run purge for one btree database on a cadence (scheduling wired at the composition
 /// root): a detached thread holding only a weak reference, so it exits when the engine drops
@@ -210,12 +235,22 @@ fn spawn_purge_scheduler(engine: &Arc<BtreeEngine>, db: &str) {
         .name(thread_name)
         .spawn(move || {
             while let Some(engine) = weak.upgrade() {
-                match engine.purge() {
-                    Ok(stats) => tracing::trace!(?stats, db = %db, "purge pass"),
-                    Err(e) => tracing::warn!(error = %e, db = %db, "purge pass failed"),
-                }
+                let delay = match engine.purge() {
+                    // Follow the backlog: a pass that reclaimed a batch-plus keeps the fast cadence
+                    // so churn cannot outrun purge; a quiet pass falls back to the base.
+                    Ok(stats) => {
+                        let delay = next_purge_delay(stats.versions_reclaimed + stats.rows_removed);
+                        tracing::trace!(?stats, ?delay, db = %db, "purge pass");
+                        delay
+                    },
+                    // On a failed pass, wait the base interval before retrying rather than spinning.
+                    Err(e) => {
+                        tracing::warn!(error = %e, db = %db, "purge pass failed");
+                        PURGE_INTERVAL
+                    },
+                };
                 drop(engine);
-                std::thread::sleep(PURGE_INTERVAL);
+                std::thread::sleep(delay);
             }
         });
     if let Err(e) = spawned {
@@ -466,6 +501,32 @@ mod tests {
 
     fn manager(dir: &Path) -> DatabaseManager {
         DatabaseManager::open(dir, "nusadb", None, None, NO_AUTOANALYZE).expect("open cluster")
+    }
+
+    #[test]
+    fn purge_cadence_speeds_up_under_backlog_but_never_slower_than_the_base() {
+        // A pass that reclaimed a batch-plus of work keeps the fast cadence so churn cannot outrun
+        // purge.
+        assert_eq!(
+            next_purge_delay(PURGE_BACKLOG_HIGH_WATER),
+            PURGE_MIN_INTERVAL
+        );
+        assert_eq!(
+            next_purge_delay(PURGE_BACKLOG_HIGH_WATER + 1_000_000),
+            PURGE_MIN_INTERVAL
+        );
+        // A quiet or modest pass falls back to the base cadence.
+        assert_eq!(next_purge_delay(0), PURGE_INTERVAL);
+        assert_eq!(
+            next_purge_delay(PURGE_BACKLOG_HIGH_WATER - 1),
+            PURGE_INTERVAL
+        );
+        // Key safety property: the adaptive delay only ever shortens the wait — it stays within
+        // [MIN, base], so it can never delay reclamation relative to the old fixed schedule.
+        for reclaimed in [0usize, 1, 100, 4095, 4096, 4097, 1_000_000] {
+            let delay = next_purge_delay(reclaimed);
+            assert!(delay >= PURGE_MIN_INTERVAL && delay <= PURGE_INTERVAL);
+        }
     }
 
     #[test]
