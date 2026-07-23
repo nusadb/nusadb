@@ -828,6 +828,20 @@ pub(super) fn analyze_set_operation(
     so: ast::SetOperation,
     catalog: &dyn Catalog,
 ) -> Result<SetOpPlan, Error> {
+    // A `WITH` on a set operation scopes over every branch. Resolve it (against any enclosing visible
+    // CTEs) and make it the visible frame while the body is analyzed, so each branch's `FROM` resolves
+    // the CTE. A recursive / data-modifying CTE has no place to carry its def on the set-operation
+    // envelope, so reject it loudly rather than drop it; a plain inline CTE inlines into each branch.
+    let outer = visible_ctes();
+    let (own_ctes, recursive, modifying) = analyze_ctes(&so.with, catalog, &outer)?;
+    if !recursive.is_empty() || !modifying.is_empty() {
+        return Err(Error::Unsupported(
+            "a recursive or data-modifying WITH on a UNION / INTERSECT / EXCEPT is not yet supported"
+                .to_owned(),
+        ));
+    }
+    let ctes = combine_ctes(own_ctes, &outer);
+    let _cte_guard = push_visible_ctes(&ctes);
     let (tree, cols) = analyze_set_body(so.body, catalog)?;
     // The combined result's scope: one (unqualified) column per output column, so ORDER BY can
     // reference output columns by name.
@@ -973,8 +987,43 @@ fn resolve_view(name: &str, catalog: &dyn Catalog) -> Result<SelectPlan, Error> 
     result
 }
 
+thread_local! {
+    /// The CTEs lexically visible at the current point, one frame per enclosing query block. A
+    /// subquery (scalar / `IN` / `EXISTS` / quantified) or a set-operation branch has no `WITH` of its
+    /// own, so it inherits the enclosing block's CTEs from the top frame here — making
+    /// `WITH a AS (…) SELECT … WHERE x IN (SELECT … FROM a)` resolve `a`.
+    static VISIBLE_CTES: std::cell::RefCell<Vec<Vec<ResolvedCte>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Make `ctes` the visible CTE frame for the duration of the returned guard, so any subquery /
+/// set-operation branch analyzed within the current block inherits them. Popped on drop.
+#[must_use]
+fn push_visible_ctes(ctes: &[ResolvedCte]) -> VisibleCtesGuard {
+    VISIBLE_CTES.with(|s| s.borrow_mut().push(ctes.to_vec()));
+    VisibleCtesGuard
+}
+
+struct VisibleCtesGuard;
+
+impl Drop for VisibleCtesGuard {
+    fn drop(&mut self) {
+        VISIBLE_CTES.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// The CTEs lexically visible at the current point (the top [`VISIBLE_CTES`] frame); empty at the top
+/// level. A nested `analyze_select` (a subquery, or a set-operation branch) inherits these.
+fn visible_ctes() -> Vec<ResolvedCte> {
+    VISIBLE_CTES.with(|s| s.borrow().last().cloned().unwrap_or_default())
+}
+
 pub(super) fn analyze_select(sel: ast::Select, catalog: &dyn Catalog) -> Result<SelectPlan, Error> {
-    analyze_select_scoped(sel, catalog, &[])
+    // A subquery inherits the enclosing block's visible CTEs (pushed by `analyze_select_scoped`); the
+    // top-level call sees an empty frame.
+    analyze_select_scoped(sel, catalog, &visible_ctes())
 }
 
 /// Like [`analyze_select`] but with `outer_ctes` — the CTEs of any enclosing `WITH` clause already
@@ -1019,6 +1068,9 @@ fn analyze_select_scoped(
     // The CTEs visible to this block's FROM: its own (which shadow same-named enclosing ones), then
     // the enclosing `outer_ctes`.
     let ctes = combine_ctes(own_ctes, outer_ctes);
+    // Make them the visible frame for any subquery in this block's projection / WHERE / HAVING /
+    // ORDER BY (and FROM-derived tables), so a subquery with no `WITH` of its own still resolves them.
+    let _cte_guard = push_visible_ctes(&ctes);
     // Resolve FROM (base + joins) and the column scope; ordinals throughout
     // index the concatenated joined row.
     let ResolvedFrom {
@@ -1467,6 +1519,7 @@ fn analyze_ctes(
             },
             set_op @ ast::SelectBody::SetOp { .. } => {
                 let so = ast::SetOperation {
+                    with: Vec::new(),
                     body: set_op.clone(),
                     order_by: Vec::new(),
                     limit: None,

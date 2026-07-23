@@ -115,3 +115,28 @@ query II
 WITH RECURSIVE deep AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM deep WHERE n < 12000) SELECT count(*), max(n) FROM deep
 ----
 12000 12000
+
+# --- A CTE is visible inside a subquery (not just the top-level FROM) ---
+# The `IN (subquery)` reads the CTE `hi`.
+query I
+WITH hi AS (SELECT id FROM emp WHERE salary >= 100)
+SELECT id FROM emp WHERE id IN (SELECT id FROM hi) ORDER BY id
+----
+1
+2
+
+# A scalar subquery reads the CTE.
+query I
+WITH one AS (SELECT id FROM emp WHERE id = 1) SELECT (SELECT id FROM one)
+----
+1
+
+# --- A CTE scopes over every branch of a set operation ---
+# The right branch of the UNION ALL references the CTE `hi`.
+query I
+WITH hi AS (SELECT id FROM emp WHERE salary >= 100)
+SELECT id FROM emp WHERE id = 3 UNION ALL SELECT id FROM hi ORDER BY id
+----
+1
+2
+3

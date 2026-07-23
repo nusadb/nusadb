@@ -35,16 +35,16 @@ pub(super) fn convert_query(query: sql::Query) -> Result<ast::Statement, Error> 
         }
         return convert_top_level_values(query);
     }
-    if !with.is_empty() {
-        return unsupported("WITH ... UNION/INTERSECT/EXCEPT is not yet supported");
-    }
     reject_query_envelope(&query, false)?;
     let body = convert_set_expr(*query.body)?;
     let order_by = convert_order_by(query.order_by)?;
     // The envelope guard already rejected an OFFSET / `LIMIT ... BY` here, so only LIMIT remains.
     let (raw_limit, _, _) = split_limit_clause(query.limit_clause)?;
     let limit = convert_limit(raw_limit)?;
+    // A `WITH` in front of a set operation scopes over every branch; carry it on the envelope so the
+    // analyzer resolves it once and makes the CTEs visible to each branch.
     Ok(ast::Statement::SetOperation(ast::SetOperation {
+        with,
         body,
         order_by,
         limit,

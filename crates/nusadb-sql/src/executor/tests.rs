@@ -1125,6 +1125,54 @@ fn percentile_within_group_array_of_fractions_returns_an_array() {
 }
 
 #[test]
+fn cte_is_visible_inside_subqueries_and_set_operation_branches() {
+    // A `WITH` CTE scopes over the whole statement, not just the top-level FROM: a subquery (scalar /
+    // IN / EXISTS) and every branch of a UNION/INTERSECT/EXCEPT can reference it. Previously each of
+    // these raised "table a not found" (subqueries) or was rejected outright (set operations).
+    let engine = MockEngine::new();
+    run("CREATE TABLE t (x INT)", &engine).unwrap();
+    run("INSERT INTO t VALUES (1), (2), (3)", &engine).unwrap();
+    let ids = |sql: &str| -> Vec<Value> {
+        rows_of(run(sql, &engine).unwrap())
+            .1
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect()
+    };
+    // Scalar subquery references the CTE.
+    assert_eq!(
+        ids("WITH a AS (SELECT x FROM t WHERE x = 1) SELECT (SELECT x FROM a)"),
+        vec![Value::Int(1)]
+    );
+    // IN (subquery) references the CTE.
+    assert_eq!(
+        ids(
+            "WITH a AS (SELECT x FROM t WHERE x < 3) SELECT x FROM t WHERE x IN (SELECT x FROM a) ORDER BY x"
+        ),
+        vec![Value::Int(1), Value::Int(2)]
+    );
+    // EXISTS (correlated subquery) references the CTE.
+    assert_eq!(
+        ids(
+            "WITH a AS (SELECT x FROM t WHERE x = 2) SELECT x FROM t WHERE EXISTS (SELECT 1 FROM a WHERE a.x = t.x)"
+        ),
+        vec![Value::Int(2)]
+    );
+    // The CTE scopes over a set-operation branch (here the right branch of a UNION ALL).
+    assert_eq!(
+        ids(
+            "WITH a AS (SELECT x FROM t WHERE x < 3) SELECT x FROM t WHERE x = 3 UNION ALL SELECT x FROM a ORDER BY x"
+        ),
+        vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+    );
+    // The CTE is visible to both branches; UNION (distinct) dedups the two identical branches.
+    assert_eq!(
+        ids("WITH a AS (SELECT x FROM t WHERE x = 2) SELECT x FROM a UNION SELECT x FROM a"),
+        vec![Value::Int(2)]
+    );
+}
+
+#[test]
 fn alter_add_not_null_column_on_nonempty_table_is_rejected() {
     let engine = seeded_users();
     assert!(matches!(

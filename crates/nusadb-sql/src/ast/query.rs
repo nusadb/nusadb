@@ -122,6 +122,9 @@ pub enum LockWait {
 /// `ORDER BY` and `LIMIT` bind to the whole set-operation result, not to any single branch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetOperation {
+    /// A `WITH` clause whose CTEs scope over *every* branch of the set operation
+    /// (`WITH a AS (…) SELECT … FROM a UNION ALL SELECT … FROM a`); empty when there is none.
+    pub with: Vec<Cte>,
     /// The set-operation tree (left-associative).
     pub body: SelectBody,
     /// `ORDER BY` applied to the combined result, in priority order.

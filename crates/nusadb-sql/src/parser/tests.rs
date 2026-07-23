@@ -1394,12 +1394,17 @@ fn with_set_op_body_in_non_recursive_is_accepted() {
 }
 
 #[test]
-fn with_union_at_top_level_is_rejected() {
-    // WITH ... outer-UNION is still not supported (only covers CTE body, not outer set-op).
-    assert!(matches!(
-        parse("WITH cte AS (SELECT 1) SELECT * FROM cte UNION SELECT 2"),
-        Err(Error::Unsupported(_)),
-    ));
+fn with_before_a_set_operation_carries_onto_the_envelope() {
+    // A `WITH` in front of a UNION/INTERSECT/EXCEPT scopes over the whole set operation: it parses
+    // into the `SetOperation` envelope's `with`, so every branch can reference the CTE.
+    let ast::Statement::SetOperation(so) =
+        parse("WITH cte AS (SELECT 1) SELECT * FROM cte UNION SELECT 2").unwrap()
+    else {
+        panic!("expected a SetOperation");
+    };
+    assert_eq!(so.with.len(), 1);
+    assert_eq!(so.with[0].name, "cte");
+    assert!(matches!(so.body, ast::SelectBody::SetOp { .. }));
 }
 
 // --- WITH RECURSIVE -------------------------------------------
