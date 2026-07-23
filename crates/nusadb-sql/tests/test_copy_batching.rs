@@ -17,9 +17,10 @@
 )]
 
 use std::fmt::Write as _;
+use std::ops::Bound;
 
 use nusadb_btree::BtreeEngine;
-use nusadb_core::{StorageEngine, TableSchema};
+use nusadb_core::{IsolationLevel, StorageEngine, TableSchema};
 use nusadb_sql::ast::{Statement, Value};
 use nusadb_sql::{
     Catalog, Error, ExecutionResult, IndexInfo, Row, Session, analyze, copy_from, parse, plan,
@@ -54,6 +55,25 @@ fn copy(engine: &dyn StorageEngine, sql: &str, data: &str) -> Result<usize, Erro
         panic!("not a COPY statement: {sql}");
     };
     copy_from(engine, &copy, data)
+}
+
+/// Count the live entries in a secondary index by scanning it directly through the engine — used to
+/// prove a bulk load left the index complete rather than partial.
+fn count_index_entries(engine: &dyn StorageEngine, index_name: &str) -> usize {
+    let txn = engine.begin(IsolationLevel::default()).unwrap();
+    let id = engine
+        .lookup_index(index_name)
+        .unwrap()
+        .expect("index exists");
+    let mut scan = engine
+        .index_scan(txn, id, Bound::Unbounded, Bound::Unbounded)
+        .unwrap();
+    let mut count = 0;
+    while scan.try_next().unwrap().is_some() {
+        count += 1;
+    }
+    engine.commit(txn).unwrap();
+    count
 }
 
 /// 2500 rows > one 1024-row batch, so the load flushes three times (two full batches + a remainder)
@@ -112,6 +132,68 @@ fn copy_rejects_a_duplicate_key_spanning_two_batches() {
     let err = copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap_err();
 
     // The whole COPY rolled back atomically — a failed load commits nothing.
+    assert_eq!(
+        rows(engine, &mut session, "SELECT id FROM t").len(),
+        0,
+        "a rejected COPY leaves the table empty (error was: {err:?})"
+    );
+}
+
+/// A `COPY` into a table with a secondary index builds that index through the batched, key-sorted
+/// path. Every loaded row must have an index entry across the batch boundary — a complete index,
+/// not a partial one. The rows are loaded in the opposite of key order so the build must sort.
+#[test]
+fn copy_builds_a_complete_secondary_index() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    exec(engine, &mut session, "CREATE INDEX t_v ON t (v)");
+
+    let mut data = String::new();
+    for i in 0..N {
+        // Descending v: the row order is the reverse of key order, so the sorted build reorders.
+        writeln!(data, "{i}\t{}", N - i).unwrap();
+    }
+    let inserted = copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap();
+    assert_eq!(inserted, N);
+
+    assert_eq!(
+        count_index_entries(engine, "t_v"),
+        N,
+        "the secondary index has an entry for every loaded row"
+    );
+}
+
+/// A `COPY` whose data duplicates a key on a UNIQUE secondary index — the pair split across two
+/// batches — is rejected by the batched build's uniqueness enforcement, and the whole load rolls
+/// back. The second batch's build must see the first batch's already-applied entry.
+#[test]
+fn copy_rejects_a_duplicate_on_a_secondary_unique_index() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    exec(
+        engine,
+        &mut session,
+        "CREATE UNIQUE INDEX t_v_uniq ON t (v)",
+    );
+
+    // Every row has a distinct v = i except row 2000, which reuses v = 7 (loaded in the first
+    // batch) — a unique-index duplicate that spans the batch boundary.
+    let mut data = String::new();
+    for i in 0..N {
+        let v = if i == 2000 { 7 } else { i };
+        writeln!(data, "{i}\t{v}").unwrap();
+    }
+    let err = copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap_err();
     assert_eq!(
         rows(engine, &mut session, "SELECT id FROM t").len(),
         0,

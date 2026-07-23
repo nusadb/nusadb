@@ -748,13 +748,38 @@ fn insert_rows_with_unique(
     enforce_check_on_write(table, &full_rows, engine)?;
 
     let index_targets = secondary_index_targets(table, engine)?;
+    // A bulk insert — COPY or a streamed INSERT ... SELECT, the callers that pass a cross-batch
+    // uniqueness collector — builds each secondary index by handing all of the batch's entries to
+    // `index_insert_batch`, which applies them in key order (sequential index writes) rather than a
+    // random one per row. The flush runs below, before the serial bump / AFTER-row triggers / view
+    // maintenance, so each of those sees the index exactly as the per-row path would leave it. A
+    // plain insert keeps the immediate per-row maintenance.
+    let defer_index_build = deferred.is_some();
+    let mut deferred_tids: Vec<Tid> = Vec::new();
     for full in &full_rows {
         let bytes = row::encode(full, &schema)?;
         let tid = engine.insert(txn, table.id, &bytes)?;
         if let Some(collector) = deferred.as_deref_mut() {
             collector.record_inserted(tid);
         }
-        insert_into_indexes(&index_targets, full, tid, engine, txn)?;
+        if defer_index_build {
+            deferred_tids.push(tid);
+        } else {
+            insert_into_indexes(&index_targets, full, tid, engine, txn)?;
+        }
+    }
+    if defer_index_build {
+        // Group by index, matching `insert_into_indexes`'s per-row filtering (partial-index
+        // predicate, functional-key evaluation), then apply each index's entries in one sorted call.
+        for target in &index_targets {
+            let mut entries: Vec<(Vec<u8>, Tid)> = Vec::with_capacity(deferred_tids.len());
+            for (full, &tid) in full_rows.iter().zip(&deferred_tids) {
+                if row_is_indexed(target, full)? {
+                    entries.push((index_key_for(full, &target.keys)?, tid));
+                }
+            }
+            engine.index_insert_batch(txn, target.id, entries)?;
+        }
     }
     // A row that supplied an explicit value for a SERIAL column must push its sequence forward so a
     // later auto-generated value cannot collide (deep-gate #9b). A `DEFAULT` cell is not explicit —
