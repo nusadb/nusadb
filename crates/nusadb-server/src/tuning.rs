@@ -51,12 +51,12 @@ pub(crate) struct DerivedKnobs {
     /// growing until the host OOM-kills the server. Unlike [`max_txn_write_bytes`](Self::max_txn_write_bytes)
     /// (one in-flight transaction) this bounds *committed-resident* data across the whole store —
     /// the streamed-bulk-load case that accumulates past the per-transaction ceiling. Derived from
-    /// the engine's ~60% page share of the budget divided by [`RESIDENT_RSS_FACTOR`] (the meter
-    /// counts logical page bytes, but the real footprint runs larger), then reduced by the parse
-    /// buffer a bulk load holds alongside the store ([`max_copy_bytes`](Self::max_copy_bytes)) and
-    /// floored at [`RESIDENT_FLOOR`], so committed pages plus that transient stay within budget and
-    /// the ceiling trips before the OS kills the process; an explicit `--max-resident-bytes`
-    /// overrides it.
+    /// the engine's ~60% page share of the budget by first reserving the parse buffer a bulk load
+    /// holds alongside the store ([`max_copy_bytes`](Self::max_copy_bytes)), then dividing what's left
+    /// by [`RESIDENT_RSS_FACTOR`] (the meter counts logical page bytes, but the real footprint runs
+    /// larger), floored at [`RESIDENT_FLOOR`]. So the committed real footprint plus the parse buffer
+    /// stay within the share and the ceiling trips before the OS kills the process, while leaving
+    /// non-bulk workloads room; an explicit `--max-resident-bytes` overrides it.
     pub(crate) max_resident_bytes: usize,
     /// Default cap on the bytes the wire layer buffers for one `COPY ... FROM STDIN` before loading
     /// it (`--copy-max-bytes` when left unset). That buffer is transient and, unlike the two write
@@ -120,15 +120,17 @@ pub(crate) fn derive(budget: usize, max_connections: usize) -> DerivedKnobs {
     // to [`COPY_MAX_FLOOR`, `COPY_MAX_CEILING`]: the ceiling keeps the historical 1 GiB on a roomy
     // host, the floor keeps a routine load working on a small one.
     let max_copy_bytes = (budget / 100 * 20).clamp(COPY_MAX_FLOOR, COPY_MAX_CEILING);
-    // The global resident ceiling bounds committed data across the whole store. The engine's page
-    // share of the budget is ~60%, but it meters *logical* page bytes while the OS limits real
-    // resident memory, which runs about [`RESIDENT_RSS_FACTOR`]x larger — so start from that share
-    // divided by the factor. Then reserve the one large transient a bulk load holds *alongside* the
-    // store, its parse buffer (`max_copy_bytes`): subtracting that known cap keeps committed pages
-    // plus the parse buffer within budget, so the ceiling trips (a graceful reject) before the OS
-    // kills the process. Floored so a small budget does not reject normal work.
-    let max_resident_bytes = (budget / 100 * 60 / RESIDENT_RSS_FACTOR)
-        .saturating_sub(max_copy_bytes)
+    // The global resident ceiling bounds committed data across the whole store. Its ~60% page share
+    // of the budget is spent on real resident memory: the parse buffer a bulk load holds *alongside*
+    // the store (`max_copy_bytes`), which is byte-for-byte real, plus the committed pages, whose real
+    // footprint runs about [`RESIDENT_RSS_FACTOR`]x the logical bytes the engine meters. So reserve
+    // the parse buffer out of the share first, then divide what's left by the factor to get the
+    // logical ceiling: committed real footprint (`ceiling * factor`) plus the parse buffer then fits
+    // the share, so the ceiling trips (a graceful reject) before the OS kills the process — while
+    // still leaving normal non-bulk workloads room. Floored so a small budget does not reject normal
+    // work.
+    let max_resident_bytes = ((budget / 100 * 60).saturating_sub(max_copy_bytes)
+        / RESIDENT_RSS_FACTOR)
         .max(RESIDENT_FLOOR);
     DerivedKnobs {
         work_mem,
@@ -315,11 +317,11 @@ mod tests {
     fn derives_the_resident_ceiling_reserving_the_copy_buffer() {
         let ceiling = |budget: usize| derive(budget, 25).max_resident_bytes;
         let copy = |budget: usize| derive(budget, 25).max_copy_bytes;
-        // Above the floor, the ceiling is the RSS-adjusted page share minus the reserved parse buffer.
+        // Above the floor, the ceiling reserves the parse buffer out of the page share, then divides
+        // what's left by the RSS factor.
         for &gib in &[8usize, 64] {
             let budget = gib << 30;
-            let expected = (budget / 100 * 60 / RESIDENT_RSS_FACTOR)
-                .saturating_sub(copy(budget))
+            let expected = ((budget / 100 * 60).saturating_sub(copy(budget)) / RESIDENT_RSS_FACTOR)
                 .max(RESIDENT_FLOOR);
             assert_eq!(
                 ceiling(budget),
