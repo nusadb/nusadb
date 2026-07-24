@@ -201,8 +201,13 @@ fn copy_rejects_a_duplicate_on_a_secondary_unique_index() {
     );
 }
 
-/// `CREATE INDEX` on an already-populated table backfills every existing row through the batched,
-/// key-sorted path, so the new index is complete even though the rows are not stored in key order.
+/// More rows than one backfill chunk (`BACKFILL_INDEX_CHUNK` = 8192), so a `CREATE INDEX` build
+/// streams and flushes several chunks — exercising the chunk boundary the way `N` does for COPY.
+const BACKFILL_ROWS: usize = 20_000;
+
+/// `CREATE INDEX` on an already-populated table streams the rows and backfills every one through the
+/// chunked, key-sorted path, so the new index is complete across chunk boundaries even though the
+/// rows are not stored in key order.
 #[test]
 fn create_index_backfills_a_populated_table_completely() {
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
@@ -214,22 +219,23 @@ fn create_index_backfills_a_populated_table_completely() {
     );
     // Load the rows first (no secondary index yet), with v in the reverse of key order.
     let mut data = String::new();
-    for i in 0..N {
-        writeln!(data, "{i}\t{}", N - i).unwrap();
+    for i in 0..BACKFILL_ROWS {
+        writeln!(data, "{i}\t{}", BACKFILL_ROWS - i).unwrap();
     }
     copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap();
 
-    // Build the index over the existing rows — the batched backfill.
+    // Build the index over the existing rows — the streaming, chunked backfill.
     exec(engine, &mut session, "CREATE INDEX t_v ON t (v)");
     assert_eq!(
         count_index_entries(engine, "t_v"),
-        N,
-        "the backfill built an entry for every existing row"
+        BACKFILL_ROWS,
+        "the backfill built an entry for every existing row, across chunk boundaries"
     );
 }
 
-/// `CREATE UNIQUE INDEX` on a column that already holds a duplicate value is rejected by the
-/// batched backfill's uniqueness check (the sorted build places the equal keys adjacent).
+/// `CREATE UNIQUE INDEX` on a column that already holds a duplicate is rejected by the backfill's
+/// uniqueness check — even when the duplicate pair straddles two streamed chunks, since each chunk is
+/// applied before the next is read.
 #[test]
 fn create_unique_index_rejects_an_existing_duplicate() {
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
@@ -239,12 +245,15 @@ fn create_unique_index_rejects_an_existing_duplicate() {
         &mut session,
         "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
     );
-    // Two rows share v = 7, so a unique index over v cannot be built.
-    exec(
-        engine,
-        &mut session,
-        "INSERT INTO t VALUES (1, 7), (2, 7), (3, 9)",
-    );
+    // Distinct v = i for every row except id 15000, which reuses id 5's value — a duplicate whose
+    // two rows fall in different backfill chunks.
+    let mut data = String::new();
+    for i in 0..BACKFILL_ROWS {
+        let v = if i == 15_000 { 5 } else { i };
+        writeln!(data, "{i}\t{v}").unwrap();
+    }
+    copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap();
+
     let logical = analyze(
         parse("CREATE UNIQUE INDEX t_v_uniq ON t (v)").unwrap(),
         &Cat(engine),

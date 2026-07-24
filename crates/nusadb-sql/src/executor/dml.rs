@@ -2477,27 +2477,46 @@ pub(super) fn insert_into_indexes(
     Ok(())
 }
 
-/// Build one index over already-scanned `rows` (a `CREATE INDEX` backfill) by collecting every
-/// indexed row's entry and applying them in a single key-sorted batch, so the build's index writes
-/// are sequential rather than a random one per row. A partial index's predicate skips non-matching
-/// rows and a functional/expression key is evaluated, exactly as [`insert_into_indexes`] does per
-/// row; a `unique` index still rejects a duplicate (the batch places equal keys adjacent). The rows
-/// are consumed as their keys are read — each row's contents free while the entry buffer (only key
-/// bytes plus a tid, smaller than the row) grows — so the peak footprint stays on par with the
-/// per-row scan it replaces rather than adding a second full copy.
-pub(super) fn backfill_index_batched(
+/// Rows a `CREATE INDEX` backfill buffers before flushing a key-sorted batch. It bounds the build's
+/// memory to one chunk of entries rather than the whole table's, so building an index on a table
+/// larger than memory does not exhaust it. Each chunk is applied before the next is read, so a unique
+/// index rejects a duplicate that spans a chunk boundary exactly as one within a chunk.
+const BACKFILL_INDEX_CHUNK: usize = 8192;
+
+/// Build one index over `table` (a `CREATE INDEX` backfill) by streaming its rows and applying their
+/// entries in key-sorted chunks via `index_insert_batch`, so the build drives sequential index writes
+/// without materializing the whole table or all of its entries at once. A partial index's predicate
+/// skips non-matching rows and a functional/expression key is evaluated, exactly as
+/// [`insert_into_indexes`] does per row; a `unique` index still rejects a duplicate — each chunk is
+/// applied before the next is read, so a later chunk sees an earlier one's keys.
+pub(super) fn backfill_index_streaming(
     target: &IndexTarget,
-    rows: impl IntoIterator<Item = (Tid, Row)>,
+    table: &TableSchema,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let mut entries: Vec<(Vec<u8>, Tid)> = Vec::new();
-    for (tid, row) in rows {
+    let schema = column_types(table);
+    let mut scan = engine.scan(txn, table.id)?;
+    let mut entries: Vec<(Vec<u8>, Tid)> = Vec::with_capacity(BACKFILL_INDEX_CHUNK);
+    while let Some((tid, tuple)) = scan.try_next()? {
+        // Honor a statement timeout / cancel at row granularity on a long build, and skip a row a
+        // concurrent transaction holds locked — matching the scan the per-row backfill used.
+        crate::cancel::check()?;
+        if super::lock_skip::skipped(table.id, tid) {
+            continue;
+        }
+        let row = row::decode(&tuple, &schema)?;
         if row_is_indexed(target, &row)? {
             entries.push((index_key_for(&row, &target.keys)?, tid));
         }
+        if entries.len() >= BACKFILL_INDEX_CHUNK {
+            engine.index_insert_batch(txn, target.id, std::mem::take(&mut entries))?;
+            entries.reserve(BACKFILL_INDEX_CHUNK);
+        }
     }
-    engine.index_insert_batch(txn, target.id, entries)?;
+    if !entries.is_empty() {
+        engine.index_insert_batch(txn, target.id, entries)?;
+    }
     Ok(())
 }
 

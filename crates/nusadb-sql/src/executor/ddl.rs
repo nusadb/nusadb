@@ -420,9 +420,9 @@ pub(super) fn run_create_index(
     {
         // Backfill through the same maintenance path DML writes take (a functional/expression key
         // is evaluated and a partial predicate skips non-matching rows exactly as on later inserts),
-        // but as one key-sorted batch so building the index over an existing table drives sequential
-        // index writes instead of a random one per row.
-        dml::backfill_index_batched(&target, scan_table(&table, engine, txn)?, engine, txn)?;
+        // streaming the table and applying key-sorted chunks so building the index drives sequential
+        // index writes without materializing the whole table's rows or entries at once.
+        dml::backfill_index_streaming(&target, &table, engine, txn)?;
     }
     Ok(ExecutionResult::IndexCreated)
 }
