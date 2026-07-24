@@ -86,6 +86,13 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     work_mem: usize,
 
+    /// Maintenance-memory budget in bytes for building an index: how many bytes of index entries a
+    /// `CREATE INDEX` buffers before flushing a sorted batch, so a build on a large table stays
+    /// bounded rather than materializing all its entries. `0` (the default) uses a built-in bound.
+    /// Raise it on a larger host to build fewer, larger sorted batches (better locality).
+    #[arg(long, default_value_t = 0)]
+    maintenance_work_mem: usize,
+
     /// Directory for transient spill-to-disk files (external sort / hash join). When set, blocking
     /// operators over more than the spill threshold stream the overflow to this directory instead of
     /// failing; unset (the default) keeps the in-memory `work_mem` behavior. Stale files from a prior
@@ -462,6 +469,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Apply process-global memory config once (per-query work_mem + spill-to-disk), and resolve the
     // per-transaction and global resident write ceilings every database's engine will enforce.
     let ceilings = apply_memory_config(&args)?;
+    // The DDL maintenance budget bounds a `CREATE INDEX` build's buffered entries; `0` keeps the
+    // engine's built-in default.
+    nusadb_sql::set_maintenance_work_mem(args.maintenance_work_mem);
     // Auto-analyze keeps the planner's statistics fresh on a live database (0 interval = off).
     let autoanalyze = database_manager::AutoAnalyzeConfig {
         interval: secs(args.autoanalyze_interval),

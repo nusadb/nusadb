@@ -2477,18 +2477,14 @@ pub(super) fn insert_into_indexes(
     Ok(())
 }
 
-/// Rows a `CREATE INDEX` backfill buffers before flushing a key-sorted batch. It bounds the build's
-/// memory to one chunk of entries rather than the whole table's, so building an index on a table
-/// larger than memory does not exhaust it. Each chunk is applied before the next is read, so a unique
-/// index rejects a duplicate that spans a chunk boundary exactly as one within a chunk.
-const BACKFILL_INDEX_CHUNK: usize = 8192;
-
 /// Build one index over `table` (a `CREATE INDEX` backfill) by streaming its rows and applying their
 /// entries in key-sorted chunks via `index_insert_batch`, so the build drives sequential index writes
-/// without materializing the whole table or all of its entries at once. A partial index's predicate
-/// skips non-matching rows and a functional/expression key is evaluated, exactly as
-/// [`insert_into_indexes`] does per row; a `unique` index still rejects a duplicate — each chunk is
-/// applied before the next is read, so a later chunk sees an earlier one's keys.
+/// without materializing the whole table or all of its entries at once. A chunk is flushed once its
+/// buffered entries reach the maintenance-memory budget ([`maintenance_work_mem`](super::ops::maintenance_work_mem)),
+/// so the footprint is bounded in bytes regardless of row width. A partial index's predicate skips
+/// non-matching rows and a functional/expression key is evaluated, exactly as [`insert_into_indexes`]
+/// does per row; a `unique` index still rejects a duplicate — each chunk is applied before the next
+/// is read, so a later chunk sees an earlier one's keys.
 pub(super) fn backfill_index_streaming(
     target: &IndexTarget,
     table: &TableSchema,
@@ -2496,8 +2492,10 @@ pub(super) fn backfill_index_streaming(
     txn: TxnId,
 ) -> Result<(), Error> {
     let schema = column_types(table);
+    let budget = super::ops::maintenance_work_mem();
     let mut scan = engine.scan(txn, table.id)?;
-    let mut entries: Vec<(Vec<u8>, Tid)> = Vec::with_capacity(BACKFILL_INDEX_CHUNK);
+    let mut entries: Vec<(Vec<u8>, Tid)> = Vec::new();
+    let mut buffered = 0usize;
     while let Some((tid, tuple)) = scan.try_next()? {
         // Honor a statement timeout / cancel at row granularity on a long build, and skip a row a
         // concurrent transaction holds locked — matching the scan the per-row backfill used.
@@ -2507,11 +2505,14 @@ pub(super) fn backfill_index_streaming(
         }
         let row = row::decode(&tuple, &schema)?;
         if row_is_indexed(target, &row)? {
-            entries.push((index_key_for(&row, &target.keys)?, tid));
-        }
-        if entries.len() >= BACKFILL_INDEX_CHUNK {
-            engine.index_insert_batch(txn, target.id, std::mem::take(&mut entries))?;
-            entries.reserve(BACKFILL_INDEX_CHUNK);
+            let key = index_key_for(&row, &target.keys)?;
+            buffered += key.len() + std::mem::size_of::<(Vec<u8>, Tid)>();
+            entries.push((key, tid));
+            // Flush once the buffered entries reach the budget, so the build stays bounded in bytes.
+            if buffered >= budget {
+                engine.index_insert_batch(txn, target.id, std::mem::take(&mut entries))?;
+                buffered = 0;
+            }
         }
     }
     if !entries.is_empty() {

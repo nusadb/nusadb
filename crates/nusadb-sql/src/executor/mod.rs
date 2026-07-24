@@ -83,7 +83,9 @@ use ops::*;
 use scan::*;
 
 pub use function::lookup_function_definition;
-pub use ops::{parse_work_mem, set_work_mem, work_mem};
+pub use ops::{
+    maintenance_work_mem, parse_work_mem, set_maintenance_work_mem, set_work_mem, work_mem,
+};
 pub use row::Row;
 pub use spill::{SpillConfig, set_spill_config};
 

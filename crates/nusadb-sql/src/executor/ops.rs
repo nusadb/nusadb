@@ -1079,6 +1079,32 @@ pub fn work_mem() -> usize {
     WORK_MEM.load(Ordering::Relaxed)
 }
 
+/// Fallback for [`maintenance_work_mem`] when it is not set: bounds a `CREATE INDEX` backfill's
+/// buffered entries so the build stays within a modest footprint on any host.
+const DEFAULT_MAINTENANCE_WORK_MEM: usize = 64 << 20; // 64 MiB
+
+/// The maintenance-memory budget in bytes, the DDL analogue of [`work_mem`]: how many bytes of index
+/// entries a `CREATE INDEX` backfill buffers before flushing a sorted batch, so building an index on
+/// a large table stays bounded. Set via [`set_maintenance_work_mem`]; the server exposes it as
+/// `--maintenance-work-mem`. Unlike `work_mem`, this never means "unlimited" — an unset value uses a
+/// built-in bound so a bulk index build cannot exhaust memory.
+static MAINTENANCE_WORK_MEM: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the process-default DDL maintenance-memory budget in bytes; `0` restores the built-in bound.
+pub fn set_maintenance_work_mem(bytes: usize) {
+    MAINTENANCE_WORK_MEM.store(bytes, Ordering::Relaxed);
+}
+
+/// The DDL maintenance-memory budget in bytes: an explicit [`set_maintenance_work_mem`] value, else
+/// a built-in default. Never zero, so a bulk index build is always bounded.
+#[must_use]
+pub fn maintenance_work_mem() -> usize {
+    match MAINTENANCE_WORK_MEM.load(Ordering::Relaxed) {
+        0 => DEFAULT_MAINTENANCE_WORK_MEM,
+        set => set,
+    }
+}
+
 /// Parse a `work_mem` setting value into bytes.
 ///
 /// Follows the conventional memory-GUC form: a bare integer is **kilobytes**; an integer with a

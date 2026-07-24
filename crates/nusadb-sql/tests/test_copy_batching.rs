@@ -24,6 +24,7 @@ use nusadb_core::{IsolationLevel, StorageEngine, TableSchema};
 use nusadb_sql::ast::{Statement, Value};
 use nusadb_sql::{
     Catalog, Error, ExecutionResult, IndexInfo, Row, Session, analyze, copy_from, parse, plan,
+    set_maintenance_work_mem,
 };
 
 struct Cat<'a>(&'a dyn StorageEngine);
@@ -201,15 +202,20 @@ fn copy_rejects_a_duplicate_on_a_secondary_unique_index() {
     );
 }
 
-/// More rows than one backfill chunk (`BACKFILL_INDEX_CHUNK` = 8192), so a `CREATE INDEX` build
-/// streams and flushes several chunks — exercising the chunk boundary the way `N` does for COPY.
+/// Enough rows that, under the small maintenance budget the `CREATE INDEX` tests set, the build
+/// buffers past it several times — exercising the chunk boundary the way `N` does for COPY.
 const BACKFILL_ROWS: usize = 20_000;
+
+/// A deliberately small maintenance-memory budget so `BACKFILL_ROWS` entries span several backfill
+/// chunks (the default budget would hold them all in one).
+const SMALL_MAINTENANCE_BUDGET: usize = 128 << 10; // 128 KiB
 
 /// `CREATE INDEX` on an already-populated table streams the rows and backfills every one through the
 /// chunked, key-sorted path, so the new index is complete across chunk boundaries even though the
 /// rows are not stored in key order.
 #[test]
 fn create_index_backfills_a_populated_table_completely() {
+    set_maintenance_work_mem(SMALL_MAINTENANCE_BUDGET);
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
     exec(
@@ -238,6 +244,7 @@ fn create_index_backfills_a_populated_table_completely() {
 /// applied before the next is read.
 #[test]
 fn create_unique_index_rejects_an_existing_duplicate() {
+    set_maintenance_work_mem(SMALL_MAINTENANCE_BUDGET);
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
     exec(
