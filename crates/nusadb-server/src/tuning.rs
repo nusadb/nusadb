@@ -86,10 +86,12 @@ const RESIDENT_FLOOR: usize = 256 << 20; // 256 MiB
 
 /// How much larger the real resident-memory footprint runs than the logical page bytes the engine
 /// meters when it decides whether to accept a write: allocator overhead, MVCC version chains, index
-/// nodes, and fragmentation the logical count does not see. The derived resident ceiling is divided
-/// by this so the logical ceiling trips while the real footprint is still within the budget — a
-/// graceful reject beats an out-of-memory kill. Measured at roughly 2x on a bulk load.
-const RESIDENT_RSS_FACTOR: usize = 2;
+/// nodes, and fragmentation the logical count does not see, plus the transient buffers a bulk load
+/// holds alongside the store (its parse buffer and per-batch index entries). The derived resident
+/// ceiling is divided by this so the logical ceiling trips while the real footprint is still within
+/// the budget — a graceful reject beats an out-of-memory kill. Bulk loads of wide rows were measured
+/// near 3x, so err toward that: over-reserving costs some headroom, under-reserving costs the process.
+const RESIDENT_RSS_FACTOR: usize = 3;
 
 /// Upper bound for the derived single-`COPY` buffer cap: the historical fixed default. A host with
 /// ample RAM keeps this cap; only a smaller budget derives a lower one.
