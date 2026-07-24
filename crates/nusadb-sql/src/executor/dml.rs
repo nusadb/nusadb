@@ -2521,6 +2521,198 @@ pub(super) fn backfill_index_streaming(
     Ok(())
 }
 
+/// Build one index over `table` (a `CREATE INDEX` backfill), choosing the strategy by whether
+/// spill-to-disk is configured. With spill, an external merge sort applies the entries in one global
+/// key order for sequential index writes across the whole build; without it, the in-memory chunked
+/// path ([`backfill_index_streaming`]) keeps the build bounded with per-chunk order. Both are bounded
+/// by the maintenance-memory budget and produce the same complete, uniqueness-enforced index.
+pub(super) fn backfill_index(
+    target: &IndexTarget,
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    super::spill::spill_config().map_or_else(
+        || backfill_index_streaming(target, table, engine, txn),
+        |config| backfill_index_external_sort(target, table, engine, txn, &config),
+    )
+}
+
+/// Monotonic id for index-build spill-run file names (process-local; not persisted).
+static INDEX_SORT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The fixed tid suffix of a spilled entry: `page` (`u64`) then `slot` (`u16`), little-endian.
+const SPILLED_TID_BYTES: usize = 8 + 2;
+
+/// A merged run's current head: the key drives the min-heap; the tid rides along.
+struct EntryHead {
+    key: Vec<u8>,
+    tid: Tid,
+    run: usize,
+}
+
+impl PartialEq for EntryHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.run == other.run
+    }
+}
+impl Eq for EntryHead {}
+impl Ord for EntryHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.run.cmp(&other.run))
+    }
+}
+impl PartialOrd for EntryHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Encode one `(key, tid)` entry for a spill run: the key bytes followed by the fixed tid suffix.
+fn encode_entry(key: &[u8], tid: Tid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + SPILLED_TID_BYTES);
+    out.extend_from_slice(key);
+    out.extend_from_slice(&tid.page.0.to_le_bytes());
+    out.extend_from_slice(&tid.slot.0.to_le_bytes());
+    out
+}
+
+/// Decode a spilled entry record back into `(key, tid)` — the key is everything before the fixed
+/// tid suffix.
+fn decode_entry(record: &[u8]) -> Result<(Vec<u8>, Tid), Error> {
+    let corrupt = || {
+        Error::Core(nusadb_core::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt spilled index entry",
+        )))
+    };
+    let split = record
+        .len()
+        .checked_sub(SPILLED_TID_BYTES)
+        .ok_or_else(corrupt)?;
+    let key = record.get(..split).ok_or_else(corrupt)?.to_vec();
+    let page: [u8; 8] = record
+        .get(split..split + 8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(corrupt)?;
+    let slot: [u8; 2] = record
+        .get(split + 8..)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(corrupt)?;
+    Ok((
+        key,
+        Tid {
+            page: nusadb_core::PageId(u64::from_le_bytes(page)),
+            slot: nusadb_core::SlotIdx(u16::from_le_bytes(slot)),
+        },
+    ))
+}
+
+/// Sort `buf` by key and write it as one on-disk run, then clear `buf`.
+fn spill_entry_run(
+    buf: &mut Vec<(Vec<u8>, Tid)>,
+    config: &super::spill::SpillConfig,
+    seq: u64,
+    run: usize,
+    runs: &mut Vec<super::spill::SpillReader>,
+) -> Result<(), Error> {
+    buf.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    let path = config.dir.join(format!(
+        "nusadb-spill-index-{}-{seq}-{run}.tmp",
+        std::process::id()
+    ));
+    let mut writer = super::spill::SpillWriter::create(path)?;
+    for (key, tid) in buf.drain(..) {
+        writer.write_bytes(&encode_entry(&key, tid))?;
+    }
+    runs.push(writer.into_reader()?);
+    Ok(())
+}
+
+/// Build one index by external merge sort: stream the table into sorted runs on disk (a run whenever
+/// the buffer fills the maintenance-memory budget), then k-way merge the runs and apply the entries
+/// in one global key order via `index_insert_batch`. That drives sequential index writes across the
+/// whole build while bounding memory to one run buffer plus the merge heads. Semantics match the
+/// chunked path (partial-index predicate, functional key, uniqueness). The runs are transient
+/// scratch, deleted on drop; a crash mid-build rolls back with the transaction, so the index ends up
+/// complete or absent.
+fn backfill_index_external_sort(
+    target: &IndexTarget,
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    config: &super::spill::SpillConfig,
+) -> Result<(), Error> {
+    let schema = column_types(table);
+    let budget = super::ops::maintenance_work_mem();
+    let seq = INDEX_SORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut scan = engine.scan(txn, table.id)?;
+    let mut buf: Vec<(Vec<u8>, Tid)> = Vec::new();
+    let mut buffered = 0usize;
+    let mut runs: Vec<super::spill::SpillReader> = Vec::new();
+
+    // Phase 1: stream the table, generating a sorted run each time the buffer fills the budget.
+    while let Some((tid, tuple)) = scan.try_next()? {
+        crate::cancel::check()?;
+        if super::lock_skip::skipped(table.id, tid) {
+            continue;
+        }
+        let row = row::decode(&tuple, &schema)?;
+        if row_is_indexed(target, &row)? {
+            let key = index_key_for(&row, &target.keys)?;
+            buffered += key.len() + std::mem::size_of::<(Vec<u8>, Tid)>();
+            buf.push((key, tid));
+            if buffered >= budget {
+                spill_entry_run(&mut buf, config, seq, runs.len(), &mut runs)?;
+                buffered = 0;
+            }
+        }
+    }
+
+    // The whole set fit the budget — apply it as one sorted batch (whole-table order, no spill).
+    if runs.is_empty() {
+        engine.index_insert_batch(txn, target.id, buf)?;
+        return Ok(());
+    }
+    if !buf.is_empty() {
+        spill_entry_run(&mut buf, config, seq, runs.len(), &mut runs)?;
+    }
+
+    // Phase 2: k-way merge the runs, applying entries in global key order in budget-sized batches.
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<EntryHead>> =
+        std::collections::BinaryHeap::new();
+    for (run, reader) in runs.iter_mut().enumerate() {
+        if let Some(record) = reader.read_bytes()? {
+            let (key, tid) = decode_entry(&record)?;
+            heap.push(std::cmp::Reverse(EntryHead { key, tid, run }));
+        }
+    }
+    let mut out: Vec<(Vec<u8>, Tid)> = Vec::new();
+    let mut out_bytes = 0usize;
+    while let Some(std::cmp::Reverse(head)) = heap.pop() {
+        crate::cancel::check()?;
+        let run = head.run;
+        out_bytes += head.key.len() + std::mem::size_of::<(Vec<u8>, Tid)>();
+        out.push((head.key, head.tid));
+        if out_bytes >= budget {
+            engine.index_insert_batch(txn, target.id, std::mem::take(&mut out))?;
+            out_bytes = 0;
+        }
+        if let Some(reader) = runs.get_mut(run)
+            && let Some(record) = reader.read_bytes()?
+        {
+            let (key, tid) = decode_entry(&record)?;
+            heap.push(std::cmp::Reverse(EntryHead { key, tid, run }));
+        }
+    }
+    if !out.is_empty() {
+        engine.index_insert_batch(txn, target.id, out)?;
+    }
+    Ok(())
+}
+
 /// On UPDATE, remove a row's entry from every **partial** index it is leaving — it was indexed
 /// (`old` satisfied the predicate) but its new version is not.
 ///

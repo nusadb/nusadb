@@ -61,6 +61,25 @@ impl SpillWriter {
         Ok(())
     }
 
+    /// Append one opaque length-prefixed record (bytes the caller already encoded — e.g. a sorted
+    /// index-build entry), bypassing the row codec.
+    ///
+    /// # Errors
+    /// [`Error::Core`] wrapping the underlying I/O error, or if the record exceeds 4 GiB.
+    pub(in crate::executor) fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            Error::Core(nusadb_core::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "spilled record exceeds 4 GiB",
+            )))
+        })?;
+        self.writer
+            .write_all(&len.to_le_bytes())
+            .map_err(io_error)?;
+        self.writer.write_all(bytes).map_err(io_error)?;
+        Ok(())
+    }
+
     /// Flush the buffered writes and reopen the file for reading. The returned [`SpillReader`] takes
     /// over deletion of the file.
     ///
@@ -115,6 +134,24 @@ impl SpillReader {
         let mut bytes = vec![0u8; len];
         self.reader.read_exact(&mut bytes).map_err(io_error)?;
         Ok(Some(codec::decode_row(&bytes)?))
+    }
+
+    /// Read the next opaque record written by [`SpillWriter::write_bytes`], or `Ok(None)` at end of
+    /// file. The caller decodes the bytes; this does not go through the row codec.
+    ///
+    /// # Errors
+    /// [`Error::Core`] for an I/O error.
+    pub(in crate::executor) fn read_bytes(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let mut len_buf = [0u8; 4];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {},
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(io_error(e)),
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut bytes = vec![0u8; len];
+        self.reader.read_exact(&mut bytes).map_err(io_error)?;
+        Ok(Some(bytes))
     }
 }
 
