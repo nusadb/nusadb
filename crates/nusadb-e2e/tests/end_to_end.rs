@@ -1165,6 +1165,12 @@ fn numeric_precision_out_of_range_is_rejected_not_clamped() {
     let engine = BtreeEngine::new();
     assert!(run_try(&engine, "CREATE TABLE a (n NUMERIC(300, 5))").is_err());
     assert!(run_try(&engine, "CREATE TABLE b (n NUMERIC(10, 300))").is_err());
+    // A precision beyond 38 significant digits cannot fit the i128 mantissa, so it is rejected rather
+    // than accepted only to overflow on a wide value.
+    assert!(run_try(&engine, "CREATE TABLE d (n NUMERIC(39))").is_err());
+    assert!(run_try(&engine, "CREATE TABLE e (n NUMERIC(50, 2))").is_err());
+    // The maximum supported precision (38) is accepted.
+    run(&engine, "CREATE TABLE f (n NUMERIC(38, 4))");
     // In-range precision/scale still work.
     run(&engine, "CREATE TABLE c (n NUMERIC(10, 2))");
     run(&engine, "INSERT INTO c VALUES (123.456)");

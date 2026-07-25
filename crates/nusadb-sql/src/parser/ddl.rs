@@ -564,8 +564,21 @@ pub(super) fn exact_numeric_type(info: &sql::ExactNumberInfo) -> Result<ColumnTy
             (checked(*p, "precision")?, checked(scale, "scale")?)
         },
     };
+    // A NUMERIC value is stored as an `i128` mantissa, which holds at most 38 significant decimal
+    // digits, so a larger declared precision could not be represented without overflow. Reject it
+    // loudly here rather than accept a declaration whose wider values would fail (or corrupt) on
+    // write. Precision `0` means "unconstrained" and is unaffected.
+    if precision > NUMERIC_MAX_PRECISION {
+        return Err(Error::Unsupported(format!(
+            "NUMERIC precision {precision} exceeds the maximum supported ({NUMERIC_MAX_PRECISION})"
+        )));
+    }
     Ok(ColumnType::Numeric { precision, scale })
 }
+
+/// The largest `NUMERIC` precision the engine can represent: an `i128` mantissa holds up to 38
+/// significant decimal digits (`i128::MAX` has 39 digits, but not every 39-digit value fits).
+const NUMERIC_MAX_PRECISION: u8 = 38;
 
 // === CREATE INDEX =========================================================
 
