@@ -284,19 +284,30 @@ fn advance_serials_past_explicit(
 /// the executor's vectorized batch size, bounding the statement's memory to O(batch).
 const INSERT_SELECT_BATCH: usize = 1024;
 
-/// Deferred `PRIMARY KEY`/`UNIQUE` enforcement for the streaming `INSERT ... SELECT` path (the
-/// PK/UNIQUE-target residual). Auxiliary state is linear in the inserted row count, but holds
-/// only each row's **key values + tid** — key-width instead of the full row width the removed
-/// materialize-and-bail path buffered (and none of the source's intermediate rows).
+/// Deferred `PRIMARY KEY`/`UNIQUE` enforcement for the streaming `INSERT ... SELECT` / `COPY` paths
+/// (the PK/UNIQUE-target residual), with two strategies chosen once at [`load`](Self::load):
 ///
-/// Per batch, [`admit_batch`](Self::admit_batch) takes the no-wait key locks (serializing every
-/// concurrent same-key writer, exactly like the immediate path) and checks the batch against the
-/// keys this statement already inserted (an intra-statement duplicate fails loudly right there).
-/// After the last batch, [`finish`](Self::finish) runs **one** latest-committed scan — with every
-/// key lock still held — excluding the statement's own rows by tid: any other committed row
-/// holding one of our keys is a duplicate.
+/// **Index-probe path (`eligible`)** — every constraint has a backing index and only
+/// index-equality-safe key columns. [`admit_batch`](Self::admit_batch) is then exactly the immediate
+/// `INSERT` check per batch: lock the keys, probe each backing index in O(log n). The probe's fresh
+/// view sees this statement's own still-uncommitted entries from earlier batches (`sees(own)`), so a
+/// cross-batch duplicate surfaces there just like an intra-batch or committed one, and the held key
+/// locks close the concurrent-writer race. Memory is O(batch): no per-statement key state, and
+/// [`finish`](Self::finish) is a no-op. This is the common case (integer/text keys) and the reason a
+/// multi-million-row bulk load no longer accumulates every key.
 ///
-/// Soundness of the single end-of-stream check: a concurrent writer of key `K` either
+/// **Accumulating path (ineligible)** — a `Float`/`NUMERIC` key (whose values encode inconsistently,
+/// so a byte-exact probe could miss a compare-equal duplicate) or a constraint without a backing
+/// index. Auxiliary state is then linear in the inserted row count, but holds only each row's **key
+/// values + tid** — key-width, not full-row-width. Per batch, [`admit_batch`](Self::admit_batch)
+/// takes the no-wait key locks and checks the batch against the keys this statement already inserted
+/// (an intra-statement duplicate fails loudly right there). After the last batch,
+/// [`finish`](Self::finish) runs **one** latest-committed scan — with every key lock still held —
+/// excluding the statement's own rows by tid: any other committed row holding one of our keys is a
+/// duplicate. (An ineligible probe would degrade to an O(table) scan *per batch* — quadratic — so
+/// accumulating the keys and scanning once is the cheaper bound here.)
+///
+/// Soundness of the single end-of-stream check (accumulating path): a concurrent writer of key `K` either
 /// (a) committed *before* this statement locked `K` — then the final committed scan sees its row
 /// and the statement fails with the honest duplicate error, or (b) tried to lock `K` *after* us —
 /// then it aborted on our held lock (`40001`). There is no in-between: the lock is taken before
@@ -307,8 +318,17 @@ struct DeferredUnique {
     /// Per constraint (same order), the statement's inserted keys, bucketed by the shared
     /// [`unique_key_hash`] (collisions only cost a comparison, never correctness).
     seen: Vec<HashMap<u64, Vec<Vec<ast::Value>>>>,
-    /// Every tid this statement inserted — excluded from the final committed re-check.
+    /// Every tid this statement inserted — excluded from the final committed re-check. Empty on the
+    /// index-probe path (`eligible`), which needs no end-of-stream scan.
     inserted: HashSet<Tid>,
+    /// Whether every constraint is index-probe-eligible: it has a backing index and all its key
+    /// columns hold only index-equality-safe values ([`super::ops::is_hash_safe_key_type`]). When set, each batch
+    /// is checked in O(log n) by probing the backing index — whose fresh view sees this statement's
+    /// own still-uncommitted entries from earlier batches — so `seen`/`inserted` stay empty and
+    /// [`finish`](Self::finish) is a no-op (O(batch) memory). When clear (a `Float`/`NUMERIC` key, or
+    /// a constraint without a backing index), the O(N) key set + one end-of-stream scan below is used
+    /// instead, because an ineligible probe would degrade to an O(table) scan *per batch* — quadratic.
+    eligible: bool,
 }
 
 impl DeferredUnique {
@@ -330,11 +350,31 @@ impl DeferredUnique {
                 constraint_ordinals(table, &columns).map(|ordinals| (name, kind, columns, ordinals))
             })
             .collect::<Result<_, _>>()?;
+        // Index-probe eligibility: every constraint must have a backing index (named after the
+        // constraint) and only index-equality-safe key columns. When all qualify, `admit_batch` leans
+        // on the backing index per batch (O(batch) memory) instead of accumulating the whole
+        // statement's keys; otherwise the O(N) `seen`/`inserted` path is kept (an ineligible probe
+        // would fall back to an O(table) scan per batch — quadratic — so accumulation is cheaper).
+        let mut eligible = !constraints.is_empty();
+        for (name, _, _, ordinals) in &constraints {
+            let has_backing = engine.lookup_index(name)?.is_some();
+            let keys_safe = ordinals.iter().all(|&o| {
+                table
+                    .columns
+                    .get(o)
+                    .is_some_and(|c| super::ops::is_hash_safe_key_type(c.ty))
+            });
+            if !has_backing || !keys_safe {
+                eligible = false;
+                break;
+            }
+        }
         let seen = constraints.iter().map(|_| HashMap::new()).collect();
         Ok(Self {
             constraints,
             seen,
             inserted: HashSet::new(),
+            eligible,
         })
     }
 
@@ -349,6 +389,15 @@ impl DeferredUnique {
     ) -> Result<(), Error> {
         if self.constraints.is_empty() {
             return Ok(());
+        }
+        if self.eligible {
+            // Lean on the backing index: this is exactly the immediate `INSERT` path — lock the
+            // batch's keys, then probe each backing index in O(log n). The probe's fresh view sees
+            // this statement's own still-uncommitted entries from earlier batches (`sees(own)`), so a
+            // cross-batch duplicate is caught here just like an intra-batch or committed one; the
+            // held key locks close the concurrent-writer race. No per-statement key state is retained
+            // and `finish` has nothing left to do.
+            return enforce_unique_on_insert(table, rows, engine, txn);
         }
         lock_unique_keys(table, rows, engine, txn)?;
         for row in rows {
@@ -373,7 +422,9 @@ impl DeferredUnique {
     /// Record a written row's tid so [`finish`](Self::finish) does not count the statement's own
     /// rows as duplicates.
     fn record_inserted(&mut self, tid: Tid) {
-        if !self.constraints.is_empty() {
+        // Only the end-of-stream scan (the ineligible path) needs to exclude our own rows by tid; the
+        // index-probe path runs no such scan, so it records nothing (keeping its memory O(batch)).
+        if !self.constraints.is_empty() && !self.eligible {
             self.inserted.insert(tid);
         }
     }
@@ -386,7 +437,9 @@ impl DeferredUnique {
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
-        if self.constraints.is_empty() {
+        // The index-probe path (`eligible`) checked every batch against the backing index as it
+        // streamed, so there is nothing left to verify; only the accumulating path needs this scan.
+        if self.constraints.is_empty() || self.eligible {
             return Ok(());
         }
         for (tid, row) in scan_table_committed(table, engine, txn)? {

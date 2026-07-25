@@ -202,6 +202,69 @@ fn copy_rejects_a_duplicate_on_a_secondary_unique_index() {
     );
 }
 
+/// The index-probe uniqueness path (integer/text keys) keeps no per-statement key state, checking
+/// each batch against the backing index. A duplicate against a row committed *before* the COPY must
+/// still be rejected — the probe's latest-committed view sees it — and the pre-existing row survives.
+#[test]
+fn copy_rejects_a_duplicate_against_a_precommitted_row() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+    );
+    // A committed row the COPY will collide with (id = 5), in its own transaction.
+    exec(engine, &mut session, "INSERT INTO t VALUES (5, 999)");
+
+    let mut data = String::new();
+    for i in 0..N {
+        writeln!(data, "{i}\t{i}").unwrap();
+    }
+    let err = copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap_err();
+
+    // The COPY rolled back atomically, leaving exactly the one pre-committed row untouched.
+    let ids = rows(engine, &mut session, "SELECT id FROM t");
+    assert_eq!(
+        ids,
+        vec![vec![Value::Int(5)]],
+        "a rejected COPY leaves only the pre-committed row (error was: {err:?})"
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT v FROM t WHERE id = 5"),
+        vec![vec![Value::Int(999)]],
+        "the pre-committed row keeps its original value"
+    );
+}
+
+/// A `NUMERIC` key is *not* index-probe-eligible (its values encode inconsistently), so the COPY
+/// uses the accumulating fallback: per-statement key state plus one end-of-stream scan. A duplicate
+/// key spanning two batches must still be rejected atomically through that path.
+#[test]
+fn copy_rejects_a_cross_batch_duplicate_on_a_numeric_pk() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id NUMERIC PRIMARY KEY, v INT)",
+    );
+
+    // Row 2000 reuses id = 5 from the first batch — a cross-batch duplicate the accumulating path
+    // catches against the keys it has already seen this statement.
+    let mut data = String::new();
+    for i in 0..N {
+        let id = if i == 2000 { 5 } else { i };
+        writeln!(data, "{id}\t{i}").unwrap();
+    }
+    let err = copy(engine, "COPY t (id, v) FROM STDIN", &data).unwrap_err();
+    assert_eq!(
+        rows(engine, &mut session, "SELECT id FROM t").len(),
+        0,
+        "a rejected COPY on a NUMERIC PK leaves the table empty (error was: {err:?})"
+    );
+}
+
 /// Enough rows that, under the small maintenance budget the `CREATE INDEX` tests set, the build
 /// buffers past it several times — exercising the chunk boundary the way `N` does for COPY.
 const BACKFILL_ROWS: usize = 20_000;

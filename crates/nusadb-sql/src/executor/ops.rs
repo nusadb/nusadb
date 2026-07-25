@@ -255,6 +255,41 @@ pub(super) const fn is_hash_safe_value(value: &ast::Value) -> bool {
     )
 }
 
+/// Whether every value of a column of this type is [`is_hash_safe_value`] — i.e. the type can only
+/// hold index-equality-safe values, so a uniqueness check over the column may lean on a byte-exact
+/// backing-index probe for the whole statement (never a `Float`/`NUMERIC` value that a probe could
+/// miss). The exhaustive match mirrors [`is_hash_safe_value`]'s value set and forces a decision when
+/// a new [`ColumnType`] is added. Value-independent (a column has one type), so a probe that is safe
+/// for the first row is safe for every row — the property a streaming bulk load relies on to keep its
+/// per-batch check equivalent to a whole-statement one.
+pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
+    use nusadb_core::ColumnType as T;
+    match ty {
+        T::Bool
+        | T::Int
+        | T::SmallInt
+        | T::BigInt
+        | T::Text
+        | T::VarChar(_)
+        | T::Char(_)
+        | T::Date
+        | T::Time
+        | T::Timestamp
+        | T::TimestampTz
+        | T::Uuid => true,
+        T::Float
+        | T::Real
+        | T::Numeric { .. }
+        | T::Bytes
+        | T::TimeTz
+        | T::Json
+        | T::Jsonb
+        | T::Interval
+        | T::Array(_)
+        | T::Vector(_) => false,
+    }
+}
+
 /// Pre-resolve every uncorrelated subquery in `expr` to a subquery-free node,
 /// running each subquery's plan once against the same engine/txn snapshot. After this returns,
 /// [`eval::eval`] sees only ordinary expressions:
