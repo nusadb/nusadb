@@ -3978,7 +3978,7 @@ fn apply_arithmetic(
 /// `i64`, already guarded against overflow by `int_op`) and any non-integer type. `SMALLINT`/`INT`
 /// expressions enforce the same 16-/32-bit bounds the reference engine applies in arithmetic and casts — the bound the
 /// storage layer already enforces on write.
-fn int_value_bounds(ty: ColumnType) -> Option<(i64, i64)> {
+pub(crate) fn int_value_bounds(ty: ColumnType) -> Option<(i64, i64)> {
     match ty {
         ColumnType::SmallInt => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
         ColumnType::Int => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
@@ -4057,7 +4057,7 @@ const fn float_op(op: ast::BinaryOp, l: f64, r: f64) -> Result<f64, Error> {
     })
 }
 
-fn int_op(op: ast::BinaryOp, l: i64, r: i64) -> Result<i64, Error> {
+pub(crate) fn int_op(op: ast::BinaryOp, l: i64, r: i64) -> Result<i64, Error> {
     use ast::BinaryOp as Op;
     // Integer arithmetic errors on overflow rather than wrapping silently — a wrapped
     // counter/financial value is catastrophic-but-silent. `checked_div`/`checked_rem` also catch
