@@ -1225,6 +1225,29 @@ fn numeric_past_38_digits_is_a_loud_out_of_range() {
 }
 
 #[test]
+fn runtime_data_exceptions_carry_class_22_sqlstates() {
+    // A value error the query itself produces is a data exception (class 22), not an internal fault
+    // (XX000) — a driver must be able to tell them apart. Each carries its standard code.
+    let engine = BtreeEngine::new();
+    let code = |sql: &str| {
+        run_try(&engine, sql)
+            .expect_err("expected an error")
+            .sqlstate()
+    };
+    assert_eq!(code("SELECT 1 / 0"), "22012", "division by zero");
+    assert_eq!(
+        code("SELECT 'x' ~ '['"),
+        "2201B",
+        "invalid regular expression"
+    );
+    assert_eq!(
+        code("SELECT DATE 'not-a-date'"),
+        "22P02",
+        "malformed literal for its type"
+    );
+}
+
+#[test]
 fn timetz_literal_insert_cast_and_round_trip() {
     // K3 — TIME WITH TIME ZONE was DDL-only: a text literal would not insert and `timetz::text`
     // was unsupported. A timetz value now stores from a text literal and casts both directions.

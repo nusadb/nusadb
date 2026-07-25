@@ -304,7 +304,10 @@ impl Error {
     /// serialization conflict / deadlock / constraint violation) carry their standard codes via
     /// [`nusadb_core::Error::sqlstate`]; a `NOT NULL` assignment gets `23502`; a cancelled
     /// statement (timeout / cancel request) gets the standard `57014` so drivers that branch on
-    /// `query_canceled` recognise it; every other SQL-layer error uses the generic `XX000`.
+    /// `query_canceled` recognise it. A runtime **data exception** — a value the query itself
+    /// produced that the type cannot represent — gets its standard class-`22` code so a driver can
+    /// tell a user data error from an engine fault; every other SQL-layer error uses the generic
+    /// `XX000`.
     #[must_use]
     pub fn sqlstate(&self) -> &'static str {
         match self {
@@ -312,6 +315,12 @@ impl Error {
             Self::Coded { sqlstate, .. } => sqlstate,
             Self::NotNullViolation { .. } => "23502",
             Self::Cancelled => "57014", // query_canceled
+            // Class 22 — data exception: a runtime value error, not an internal fault.
+            Self::DivisionByZero => "22012", // division_by_zero
+            // numeric_value_out_of_range — an overflow or a value outside a function's domain.
+            Self::IntegerOutOfRange | Self::ArgumentOutOfDomain(_) => "22003",
+            Self::InvalidValue { .. } => "22P02", // invalid_text_representation
+            Self::InvalidRegex(_) => "2201B",     // invalid_regular_expression
             _ => "XX000",
         }
     }
