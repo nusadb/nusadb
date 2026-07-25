@@ -471,7 +471,8 @@ pub enum ScalarFunc {
     /// is carried as a lowercase text-literal first argument; `source` is the temporal value.
     Extract,
     /// `DATE_TRUNC(field, source)` — `source` truncated down to the precision named by the text
-    /// `field`, returning the same temporal type.
+    /// `field`, returning the same temporal type. A `DATE` source widens to `TIMESTAMPTZ` at
+    /// midnight first, so the call is always `TIMESTAMP`- or `TIMESTAMPTZ`-typed.
     DateTrunc,
     /// `AGE(end, start)` / `AGE(value)` — the calendar interval between two instants (or between
     /// the statement date and `value`), as `INTERVAL`.

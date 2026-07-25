@@ -2264,6 +2264,26 @@ fn analyze_temporal_function(
             }
             let source =
                 analyze_expr_agg(source_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+            // DATE_TRUNC has no DATE form, so a DATE source widens to midnight and the call is
+            // TIMESTAMPTZ-typed. The convention being followed: where a conversion is needed and
+            // both the naive and the time-zone-aware form would serve, the time-zone-aware one
+            // wins, being the preferred type of the date/time category. `DATE_TRUNC('month',
+            // d::timestamp)` is how a caller asks for a naive result instead. Note this
+            // deliberately differs from `DATE + INTERVAL`, which widens to the naive TIMESTAMP —
+            // there no conversion is needed, so the preference never comes up.
+            //
+            // Widening to midnight *UTC* is only right while DATE_TRUNC of a TIMESTAMPTZ also
+            // truncates in UTC: the two cancel. Should a session time zone ever drive conversion,
+            // both halves have to become session-relative together, or a month bucket taken from
+            // a DATE column reads as the previous month west of UTC.
+            let source = if func == F::DateTrunc && source.ty == Date {
+                TypedExpr {
+                    kind: TypedExprKind::Cast(Box::new(source), false),
+                    ty: TimestampTz,
+                }
+            } else {
+                source
+            };
             // EXTRACT accepts any temporal source; DATE_TRUNC truncates a timestamp.
             let ok_source = match func {
                 // EXTRACT also reads the fields of an INTERVAL (e.g. `epoch`, `day`, `hour`).

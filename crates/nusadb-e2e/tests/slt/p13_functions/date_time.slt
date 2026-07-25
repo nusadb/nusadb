@@ -91,6 +91,28 @@ SELECT DATE_TRUNC('day', TIMESTAMP '2024-06-15 14:30:45')
 ----
 2024-06-15 00:00:00
 
+# --- DATE_TRUNC: a DATE source widens to midnight in the time-zone-aware type ---
+query T
+SELECT DATE_TRUNC('month', DATE '2024-06-15')
+----
+2024-06-01 00:00:00+00
+
+query T
+SELECT DATE_TRUNC('day', DATE '2024-06-15')
+----
+2024-06-15 00:00:00+00
+
+query T
+SELECT DATE_TRUNC('hour', DATE '2024-06-15')
+----
+2024-06-15 00:00:00+00
+
+# An explicit cast pins the naive form.
+query T
+SELECT DATE_TRUNC('month', CAST(DATE '2024-06-15' AS TIMESTAMP))
+----
+2024-06-01 00:00:00
+
 # --- DATE_TRUNC: truncate to hour, minute ---
 query T
 SELECT DATE_TRUNC('hour', TIMESTAMP '2024-06-15 14:30:45')

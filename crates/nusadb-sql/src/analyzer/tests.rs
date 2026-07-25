@@ -2138,13 +2138,23 @@ fn clock_functions_reject_arguments() {
 
 #[test]
 fn temporal_functions_resolve_result_types() {
-    // EXTRACT → Float, DATE_TRUNC → source temporal type, AGE → Interval.
+    // EXTRACT → Float, DATE_TRUNC → the (possibly widened) source's temporal type, AGE → Interval.
     for (sql, ty) in [
         (
             "SELECT EXTRACT(YEAR FROM CURRENT_TIMESTAMP)",
             ColumnType::Float,
         ),
         ("SELECT DATE_TRUNC('month', NOW())", ColumnType::TimestampTz),
+        // A DATE source widens to the preferred TIMESTAMPTZ, never staying DATE. Casting the
+        // source explicitly is what pins the naive form.
+        (
+            "SELECT DATE_TRUNC('month', DATE '2024-06-15')",
+            ColumnType::TimestampTz,
+        ),
+        (
+            "SELECT DATE_TRUNC('month', CAST(DATE '2024-06-15' AS TIMESTAMP))",
+            ColumnType::Timestamp,
+        ),
         ("SELECT AGE(NOW(), NOW())", ColumnType::Interval),
         ("SELECT AGE(NOW())", ColumnType::Interval),
     ] {
@@ -2169,6 +2179,15 @@ fn temporal_functions_reject_bad_field_and_type_and_arity() {
     // Non-temporal source.
     assert!(matches!(
         plan("SELECT EXTRACT(YEAR FROM name) FROM users", &catalog()),
+        Err(Error::TypeMismatch { .. }),
+    ));
+    // Only DATE widens for DATE_TRUNC: a TIME source has no date part to truncate to and stays
+    // a loud type error rather than silently becoming an epoch-dated timestamp.
+    assert!(matches!(
+        plan(
+            "SELECT DATE_TRUNC('hour', CURRENT_TIME)",
+            &MockCatalog::new()
+        ),
         Err(Error::TypeMismatch { .. }),
     ));
     // AGE arity (0 or >2).

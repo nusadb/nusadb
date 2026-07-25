@@ -19,3 +19,25 @@ sort and index comparison. Consequences to design for:
 
 Per-column `COLLATE` support (locale/ICU collations) is a tracked future unit; today a
 `COLLATE` clause is rejected loudly rather than silently ignored.
+
+## Truncating a DATE
+
+`DATE_TRUNC` takes a timestamp, so a `DATE` argument is widened to midnight and the call
+returns `TIMESTAMPTZ` — never `DATE`. This follows the reference engine, which picks the
+time-zone-aware form whenever a conversion is needed and both forms would serve:
+
+```sql
+SELECT DATE_TRUNC('month', DATE '2024-06-15');   -- 2024-06-01 00:00:00+00
+```
+
+NusaDB compares and assigns temporal values only between matching types, so feeding that
+result to a `TIMESTAMP` column or comparing it against a `TIMESTAMP` value needs an explicit
+cast on either side:
+
+```sql
+INSERT INTO report (month_start)                 -- month_start TIMESTAMP
+SELECT DATE_TRUNC('month', CAST(d AS TIMESTAMP)) FROM sales;
+```
+
+Comparing against a bare string literal needs no cast — `WHERE DATE_TRUNC('month', d) =
+'2024-06-01'` reads the literal as the column's type.

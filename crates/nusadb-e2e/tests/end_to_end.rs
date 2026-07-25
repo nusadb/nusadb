@@ -6613,6 +6613,76 @@ fn b451_date_time_functions_end_to_end() {
 }
 
 #[test]
+fn date_trunc_over_a_date_column_yields_a_timestamptz() {
+    // DATE_TRUNC has no DATE form: the source widens to midnight in the time-zone-aware type, so
+    // the date-bucket idiom (`GROUP BY DATE_TRUNC('month', d)`) works on a DATE column.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, d DATE)");
+    run(
+        &engine,
+        "INSERT INTO t VALUES (1, DATE '2024-06-15'), (2, DATE '2024-06-02'), \
+         (3, DATE '2024-07-09'), (4, NULL)",
+    );
+
+    match run(
+        &engine,
+        "SELECT DATE_TRUNC('month', d), COUNT(*) FROM t WHERE d IS NOT NULL \
+         GROUP BY DATE_TRUNC('month', d) ORDER BY 1",
+    ) {
+        ExecutionResult::Rows { rows, .. } => {
+            let month_start =
+                |s| Value::TimestampTz(nusadb_sql::temporal::parse_timestamptz(s).unwrap());
+            assert_eq!(
+                rows,
+                vec![
+                    vec![month_start("2024-06-01 00:00:00"), Value::Int(2)],
+                    vec![month_start("2024-07-01 00:00:00"), Value::Int(1)],
+                ]
+            );
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // Truncating below the widened source's precision keeps midnight rather than erroring, and a
+    // NULL date stays NULL through the widening instead of becoming the epoch.
+    match run(
+        &engine,
+        "SELECT DATE_TRUNC('hour', d) FROM t WHERE id IN (1, 4) ORDER BY id",
+    ) {
+        ExecutionResult::Rows { rows, .. } => {
+            let midnight = nusadb_sql::temporal::parse_timestamptz("2024-06-15 00:00:00").unwrap();
+            assert_eq!(
+                rows,
+                vec![vec![Value::TimestampTz(midnight)], vec![Value::Null]]
+            );
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // An explicit cast is how a caller pins the naive form.
+    match run(
+        &engine,
+        "SELECT DATE_TRUNC('month', CAST(d AS TIMESTAMP)) FROM t WHERE id = 1",
+    ) {
+        ExecutionResult::Rows { rows, .. } => {
+            let month_start = nusadb_sql::temporal::parse_timestamp("2024-06-01 00:00:00").unwrap();
+            assert_eq!(rows, vec![vec![Value::Timestamp(month_start)]]);
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // Comparing the bucket against a bare string literal needs no cast: the literal adopts the
+    // widened type. This is the form the documented date-bucket filter relies on.
+    match run(
+        &engine,
+        "SELECT COUNT(*) FROM t WHERE DATE_TRUNC('month', d) = '2024-06-01'",
+    ) {
+        ExecutionResult::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(2)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn b452_to_char_to_date_to_timestamp_end_to_end() {
     // TO_CHAR formats; TO_DATE / TO_TIMESTAMP parse, round-tripping a timestamp.
     let engine = BtreeEngine::new();
