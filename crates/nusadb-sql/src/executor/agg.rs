@@ -222,6 +222,51 @@ pub(crate) struct Acc {
     sum_xy: f64,
 }
 
+impl Acc {
+    /// Fold a kernel-computed integer partial sum into this `SUM(Int)` accumulator — the vectorized
+    /// counterpart of [`fold_value`]'s `SUM` arm. `int_sum` is a `wrapping_add` (identical to the
+    /// per-value fold, which is associative mod 2^128) and `any_seen` is set so a non-empty group is
+    /// not finalized to `NULL`. `sum`/`count` are intentionally not touched: `finalize_aggregate`
+    /// reads only `int_sum`/`any_seen` for an integer-typed `SUM`, so they are dead for this call.
+    pub(crate) const fn fold_int_sum_partial(&mut self, partial: i128) {
+        self.int_sum = self.int_sum.wrapping_add(partial);
+        self.any_seen = true;
+    }
+
+    /// Add `n` to this `COUNT` accumulator (a per-group non-null / row count from the vectorized
+    /// path). Matches [`fold_value`]'s `acc.count += 1` per counted row.
+    pub(crate) const fn add_count(&mut self, n: i64) {
+        self.count += n;
+    }
+
+    /// Fold a kernel-computed integer group minimum into this `MIN(Int)` accumulator — identical to
+    /// [`fold_value`]'s `MIN` arm (`eval::compare` decides the keep, so cross-batch merge order is
+    /// irrelevant for the total minimum).
+    pub(crate) fn fold_min_int(&mut self, m: i64) {
+        let v = ast::Value::Int(m);
+        if self
+            .min
+            .as_ref()
+            .is_none_or(|cur| eval::compare(&v, cur) == std::cmp::Ordering::Less)
+        {
+            self.min = Some(v);
+        }
+    }
+
+    /// Fold a kernel-computed integer group maximum into this `MAX(Int)` accumulator — identical to
+    /// [`fold_value`]'s `MAX` arm.
+    pub(crate) fn fold_max_int(&mut self, m: i64) {
+        let v = ast::Value::Int(m);
+        if self
+            .max
+            .as_ref()
+            .is_none_or(|cur| eval::compare(&v, cur) == std::cmp::Ordering::Greater)
+        {
+            self.max = Some(v);
+        }
+    }
+}
+
 /// Finalize one `REGR_*` linear-regression aggregate from the `(y, x)` pair moments. All but
 /// `REGR_COUNT` are `NULL` for an empty group; the slope/intercept/R² are additionally `NULL` when
 /// `Sxx` is `0` (a vertical fit), and `REGR_R2` is `1` when `Syy` is `0`.
@@ -933,6 +978,11 @@ impl GroupIndex {
 
     pub(crate) fn accs_at(&mut self, at: usize) -> Option<&mut Vec<Acc>> {
         self.states.get_mut(at).map(|(_, accs)| accs)
+    }
+
+    /// The number of distinct groups seen so far (group ids are dense in `0..len`).
+    pub(crate) const fn len(&self) -> usize {
+        self.states.len()
     }
 
     /// Consume the index into its `(key, accumulators)` states, in first-seen order.

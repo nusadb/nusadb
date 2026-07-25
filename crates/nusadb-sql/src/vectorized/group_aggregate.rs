@@ -21,13 +21,58 @@ use std::sync::Arc;
 use crate::Field;
 use crate::ast;
 use crate::batch::convert::{rows_to_batch, value_at};
-use crate::batch::{RecordBatch, Schema};
+use crate::batch::{Int64Array, RecordBatch, Schema};
 use crate::error::Error;
 use crate::executor::agg::{GroupIndex, finalize_aggregate, fold_count_star, fold_value};
 use crate::executor::row::Row;
 use crate::planner::{AggregateCall, TypedExpr, TypedExprKind};
 use crate::vectorized::Operator;
 use crate::vectorized::aggregate::{ColumnarShape, columnar_call_shape};
+use crate::vectorized::simd::{max_i64, min_i64, sum_i128};
+use nusadb_core::ColumnType;
+
+/// The columnar-kernel plan for a call the SIMD reduction can handle directly (integer
+/// `SUM`/`MIN`/`MAX`, or any `COUNT`). Everything else folds through the scalar row path.
+#[derive(Debug, Clone, Copy)]
+enum FastAgg {
+    /// `COUNT(*)` — the number of rows in the group.
+    CountStar,
+    /// `COUNT(col)` — the number of non-null values of the column.
+    CountCol(usize),
+    /// `SUM(col)` over an integer column, reduced with [`sum_i128`].
+    SumInt(usize),
+    /// `MIN(col)` over an integer column, reduced with [`min_i64`].
+    MinInt(usize),
+    /// `MAX(col)` over an integer column, reduced with [`max_i64`].
+    MaxInt(usize),
+}
+
+/// Classify a call for the SIMD kernel path, or `None` to fold it scalar. `DISTINCT` (needs dedup)
+/// and a `FILTER` (needs the predicate) always fall back; `SUM`/`MIN`/`MAX` need an integer
+/// argument (and `SUM` an integer result, so the exact `i128` accumulator is what finalize reads).
+fn fast_kind(call: &AggregateCall, shape: &ColumnarShape) -> Option<FastAgg> {
+    use ast::AggregateFunc as F;
+    if call.distinct || call.filter.is_some() {
+        return None;
+    }
+    let is_int = |ty: ColumnType| matches!(ty.physical(), ColumnType::Int);
+    match (call.func, shape) {
+        (F::Count, ColumnarShape::CountStar) => Some(FastAgg::CountStar),
+        (F::Count, ColumnarShape::Column(c)) => Some(FastAgg::CountCol(*c)),
+        (F::Sum, ColumnarShape::Column(c))
+            if call.arg.as_ref().is_some_and(|a| is_int(a.ty)) && is_int(call.result_ty) =>
+        {
+            Some(FastAgg::SumInt(*c))
+        },
+        (F::Min, ColumnarShape::Column(c)) if call.arg.as_ref().is_some_and(|a| is_int(a.ty)) => {
+            Some(FastAgg::MinInt(*c))
+        },
+        (F::Max, ColumnarShape::Column(c)) if call.arg.as_ref().is_some_and(|a| is_int(a.ty)) => {
+            Some(FastAgg::MaxInt(*c))
+        },
+        _ => None,
+    }
+}
 
 /// A hash `GROUP BY` aggregate over a child [`Operator`]'s batch stream: one output row per
 /// distinct key tuple (key columns first, one column per call after), groups emitted in
@@ -40,6 +85,8 @@ pub struct GroupedAggregate {
     calls: Vec<AggregateCall>,
     /// How each call folds: `COUNT(*)` or a single-value fold over its argument column.
     arg_shapes: Vec<ColumnarShape>,
+    /// Per call: the SIMD-kernel plan, or `None` to fold it through the scalar row path.
+    fast: Vec<Option<FastAgg>>,
     schema: Arc<Schema>,
     /// Finalized output rows, produced on the first pull; drained in `BATCH_SIZE` chunks.
     out: Option<std::vec::IntoIter<Row>>,
@@ -66,6 +113,11 @@ impl GroupedAggregate {
             .iter()
             .map(columnar_call_shape)
             .collect::<Option<Vec<_>>>()?;
+        let fast = calls
+            .iter()
+            .zip(&arg_shapes)
+            .map(|(call, shape)| fast_kind(call, shape))
+            .collect();
         // Output layout mirrors the row path's group-aggregate rows: key values, then one
         // finalized value per call.
         let fields = group_keys
@@ -84,6 +136,7 @@ impl GroupedAggregate {
             key_indices,
             calls,
             arg_shapes,
+            fast,
             schema: Arc::new(Schema::new(fields)),
             out: None,
         })
@@ -91,12 +144,27 @@ impl GroupedAggregate {
 
     /// Drain the child stream into per-group accumulators and finalize every group, in first-seen
     /// order — the columnar counterpart of `run_group_aggregate_streamed`'s loop.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a two-pass columnar fold: per-batch partition (Pass A) then per-call kernel reduction (Pass B)"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "group ids from find_or_create are dense in 0..ngroups, and every scratch buffer (counts/buckets) is sized to ngroups; a call index c is < calls.len() and accs has one slot per call"
+    )]
     fn fold_child(&mut self) -> Result<Vec<Row>, Error> {
         let mut groups = GroupIndex::new();
         // Only a `STRING_AGG … ORDER BY`'s sort keys would read the row, and `columnar_call_shape`
         // excludes `ORDER BY`, so an empty row satisfies `fold_value`'s contract.
         let empty_row: Row = Vec::new();
+        // Scratch reused across batches: the group id per row (Pass A), and per-group counters /
+        // dense value buckets for the kernel reduction (Pass B). Bounded to the group count and one
+        // batch's values, cleared and refilled each batch.
+        let mut row_gid: Vec<usize> = Vec::new();
+        let mut counts: Vec<i64> = Vec::new();
+        let mut buckets: Vec<Vec<i64>> = Vec::new();
         while let Some(batch) = self.child.next_batch()? {
+            let n = batch.num_rows();
             // Resolve the key/argument columns once per batch. A missing column mirrors the row
             // path's malformed-tuple error for an out-of-range column reference.
             let key_cols = self
@@ -115,16 +183,26 @@ impl GroupedAggregate {
                         .ok_or(Error::MalformedTuple { offset: *c }),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            for i in 0..batch.num_rows() {
+            // Pass A — partition: hash each row to its group id (stored in `row_gid`), and fold the
+            // calls that stay on the scalar path per row. The SIMD-eligible calls are skipped here
+            // and reduced columnar in Pass B.
+            row_gid.clear();
+            for i in 0..n {
                 let key: Vec<ast::Value> = key_cols
                     .iter()
                     .map(|col| value_at(col.as_ref(), i))
                     .collect();
                 let at = groups.find_or_create(key, self.calls.len());
+                row_gid.push(at);
                 let Some(accs) = groups.accs_at(at) else {
                     continue;
                 };
-                for ((acc, call), col) in accs.iter_mut().zip(&self.calls).zip(&arg_cols) {
+                for (c, ((acc, call), col)) in
+                    accs.iter_mut().zip(&self.calls).zip(&arg_cols).enumerate()
+                {
+                    if self.fast[c].is_some() {
+                        continue; // reduced with a kernel in Pass B
+                    }
                     match col {
                         // COUNT(*): every row counts, NULLs included.
                         None => fold_count_star(acc),
@@ -132,6 +210,98 @@ impl GroupedAggregate {
                             fold_value(acc, call, value_at(col.as_ref(), i), &empty_row)?;
                         },
                     }
+                }
+            }
+            // Pass B — reduce each SIMD-eligible call with its kernel over the group's dense values.
+            // The reductions are associative (SUM add / MIN·MAX compare / COUNT add), so merging a
+            // per-batch partial into the accumulator is bit-identical to the scalar per-row fold.
+            let ngroups = groups.len();
+            for (c, plan) in self.fast.iter().enumerate() {
+                let Some(plan) = plan else { continue };
+                match plan {
+                    FastAgg::CountStar => {
+                        counts.clear();
+                        counts.resize(ngroups, 0);
+                        for &g in &row_gid {
+                            counts[g] += 1;
+                        }
+                        for (g, &cnt) in counts.iter().enumerate() {
+                            if cnt > 0
+                                && let Some(accs) = groups.accs_at(g)
+                            {
+                                accs[c].add_count(cnt);
+                            }
+                        }
+                    },
+                    FastAgg::CountCol(col) => {
+                        let arr = batch
+                            .column(*col)
+                            .ok_or(Error::MalformedTuple { offset: *col })?;
+                        counts.clear();
+                        counts.resize(ngroups, 0);
+                        for (i, &g) in row_gid.iter().enumerate() {
+                            if !arr.is_null(i) {
+                                counts[g] += 1;
+                            }
+                        }
+                        for (g, &cnt) in counts.iter().enumerate() {
+                            if cnt > 0
+                                && let Some(accs) = groups.accs_at(g)
+                            {
+                                accs[c].add_count(cnt);
+                            }
+                        }
+                    },
+                    FastAgg::SumInt(col) | FastAgg::MinInt(col) | FastAgg::MaxInt(col) => {
+                        let arr = batch
+                            .column(*col)
+                            .ok_or(Error::MalformedTuple { offset: *col })?;
+                        let Some(ints) = arr.as_ref().as_any().downcast_ref::<Int64Array>() else {
+                            // Not the expected integer layout — fold this call scalar for the batch.
+                            for (i, &g) in row_gid.iter().enumerate() {
+                                let v = value_at(arr.as_ref(), i);
+                                if let Some(accs) = groups.accs_at(g) {
+                                    fold_value(&mut accs[c], &self.calls[c], v, &empty_row)?;
+                                }
+                            }
+                            continue;
+                        };
+                        if buckets.len() < ngroups {
+                            buckets.resize_with(ngroups, Vec::new);
+                        }
+                        for b in buckets.iter_mut().take(ngroups) {
+                            b.clear();
+                        }
+                        // NULLs are skipped (SUM/MIN/MAX ignore them); `get` is null-aware.
+                        for (i, &g) in row_gid.iter().enumerate() {
+                            if let Some(v) = ints.get(i) {
+                                buckets[g].push(v);
+                            }
+                        }
+                        for (g, bucket) in buckets.iter().enumerate().take(ngroups) {
+                            if bucket.is_empty() {
+                                continue;
+                            }
+                            let Some(accs) = groups.accs_at(g) else {
+                                continue;
+                            };
+                            let acc = &mut accs[c];
+                            match plan {
+                                FastAgg::SumInt(_) => acc.fold_int_sum_partial(sum_i128(bucket)),
+                                FastAgg::MinInt(_) => {
+                                    if let Some(m) = min_i64(bucket) {
+                                        acc.fold_min_int(m);
+                                    }
+                                },
+                                FastAgg::MaxInt(_) => {
+                                    if let Some(m) = max_i64(bucket) {
+                                        acc.fold_max_int(m);
+                                    }
+                                },
+                                _ => unreachable!("only integer SUM/MIN/MAX reach the bucket path"),
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -335,6 +505,79 @@ mod tests {
                 "group {g}"
             );
         }
+    }
+
+    /// The SIMD kernel path (integer SUM/MIN/MAX/COUNT) is bit-identical to an independent scalar
+    /// reference over deterministic data with NULL values, low-cardinality keys, and > `BATCH_SIZE`
+    /// rows (so the associative cross-batch merge is exercised).
+    #[test]
+    #[allow(
+        clippy::type_complexity,
+        reason = "a compact per-group (count*, count(v), sum, min, max) reference tuple in a test"
+    )]
+    fn simd_fast_path_matches_reference_over_min_max_sum_count() {
+        use ast::AggregateFunc::{Count, Max, Min, Sum};
+        use ast::Value as V;
+        let n = i64::try_from(crate::BATCH_SIZE).unwrap() * 2 + 137;
+        let rows: Vec<(V, V)> = (0..n)
+            .map(|i| {
+                let v = if i % 5 == 0 {
+                    V::Null // skipped by SUM/MIN/MAX and COUNT(v)
+                } else {
+                    V::Int((i * 7) % 101 - 50)
+                };
+                (V::Int(i % 4), v)
+            })
+            .collect();
+        let calls = vec![
+            call(Count, None, ColumnType::Int),                  // COUNT(*)
+            call(Count, Some(ColumnType::Int), ColumnType::Int), // COUNT(v)
+            call(Sum, Some(ColumnType::Int), ColumnType::Int),
+            call(Min, Some(ColumnType::Int), ColumnType::Int),
+            call(Max, Some(ColumnType::Int), ColumnType::Int),
+        ];
+        let got = run(
+            two_col_scan(&rows, [ColumnType::Int, ColumnType::Int]),
+            &[key(ColumnType::Int)],
+            calls,
+        );
+        // Independent reference: fold each group directly, tracking first-seen key order.
+        let mut order: Vec<i64> = Vec::new();
+        let mut agg: std::collections::HashMap<i64, (i64, i64, i128, Option<i64>, Option<i64>)> =
+            std::collections::HashMap::new();
+        for (k, v) in &rows {
+            let V::Int(k) = k else { unreachable!() };
+            let e = agg.entry(*k).or_insert_with(|| {
+                order.push(*k);
+                (0, 0, 0, None, None)
+            });
+            e.0 += 1; // COUNT(*)
+            if let V::Int(v) = v {
+                e.1 += 1; // COUNT(v)
+                e.2 += i128::from(*v);
+                e.3 = Some(e.3.map_or(*v, |m| m.min(*v)));
+                e.4 = Some(e.4.map_or(*v, |m| m.max(*v)));
+            }
+        }
+        let want: Vec<Vec<V>> = order
+            .iter()
+            .map(|k| {
+                let (count_star, count_v, sum, min, max) = agg[k];
+                vec![
+                    V::Int(*k),
+                    V::Int(count_star),
+                    V::Int(count_v),
+                    if count_v > 0 {
+                        V::Int(i64::try_from(sum).unwrap())
+                    } else {
+                        V::Null
+                    },
+                    min.map_or(V::Null, V::Int),
+                    max.map_or(V::Null, V::Int),
+                ]
+            })
+            .collect();
+        assert_eq!(got, want);
     }
 
     /// More groups than `BATCH_SIZE` drain over multiple output batches, preserving first-seen
