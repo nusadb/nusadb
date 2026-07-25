@@ -81,6 +81,22 @@ pub(super) fn type_name(ty: ColumnType) -> String {
 
 // === DDL ==================================================================
 
+/// The predicate SQL for an ENUM column's membership CHECK: `"col" IN ('label', ...)`, with the
+/// column name double-quoted and each label single-quoted (each quote style escaped by doubling).
+/// `None` for a label-less set (an enum always has at least one label; guarded defensively so a
+/// malformed `IN ()` is never emitted).
+fn enum_membership_predicate(col: &str, labels: &[String]) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    let list = labels
+        .iter()
+        .map(|l| format!("'{}'", l.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("\"{}\" IN ({list})", col.replace('"', "\"\"")))
+}
+
 pub(super) fn run_create_table(
     plan: CreateTablePlan,
     engine: &dyn StorageEngine,
@@ -96,13 +112,17 @@ pub(super) fn run_create_table(
     }
     // Resolve any deferred user-defined column type (B-ENUM): it must name a registered ENUM, which
     // is stored as its `TEXT` placeholder. An unresolved name is a loud error (caught here, not at
-    // parse time, because only the executor can read the type catalog).
+    // parse time, because only the executor can read the type catalog). The enum's label set is
+    // captured so a membership CHECK can be registered below (the column stores as TEXT, so without
+    // it any string would be accepted).
     let mut columns = Vec::with_capacity(plan.columns.len());
+    let mut enum_checks: Vec<(String, Vec<String>)> = Vec::new();
     for c in plan.columns {
-        if let Some(udt) = &c.udt_name
-            && super::lookup_enum(engine, txn, udt)?.is_none()
-        {
-            return Err(Error::Unsupported(format!("type \"{udt}\" does not exist")));
+        if let Some(udt) = &c.udt_name {
+            match super::lookup_enum(engine, txn, udt)? {
+                Some(labels) => enum_checks.push((c.name.clone(), labels)),
+                None => return Err(Error::Unsupported(format!("type \"{udt}\" does not exist"))),
+            }
         }
         columns.push(ColumnDef {
             name: c.name,
@@ -135,6 +155,16 @@ pub(super) fn run_create_table(
     // INSERT/UPDATE/COPY can re-parse and evaluate it per row.
     for chk in &plan.check_constraints {
         engine.add_check_constraint(txn, id, &chk.name, chk.predicate_sql.as_bytes())?;
+    }
+    // An ENUM column stores as TEXT, so its type does not itself restrict the value. Enforce the
+    // declared label set with a synthetic membership CHECK — reusing the same machinery as the
+    // `VARCHAR(n)` length check, and named with the synthetic prefix so introspection hides it. A
+    // `NULL` passes (the CHECK is not false); anything outside the labels is rejected on write.
+    for (col, labels) in &enum_checks {
+        if let Some(predicate_sql) = enum_membership_predicate(col, labels) {
+            let name = format!("{}{col}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+            engine.add_check_constraint(txn, id, &name, predicate_sql.as_bytes())?;
+        }
     }
     // Create the backing sequence for each SERIAL column before persisting its sentinel
     // default, so INSERT's `lookup_sequence` resolves.

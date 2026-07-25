@@ -1058,6 +1058,24 @@ fn create_type_enum_and_use_as_a_column() {
         ]
     );
 
+    // A value outside the enum's label set is rejected on write (the membership CHECK), on both
+    // INSERT and UPDATE — never silently stored; NULL and valid labels still pass.
+    assert!(
+        run_try(&engine, "INSERT INTO t VALUES (4, 'banana')").is_err(),
+        "an out-of-set enum value must be rejected"
+    );
+    assert!(run_try(&engine, "UPDATE t SET m = 'banana' WHERE id = 1").is_err());
+    run(&engine, "INSERT INTO t VALUES (4, 'ok')");
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+
     // Re-declaring an existing type, and empty/duplicate labels, are rejected.
     assert!(run_try(&engine, "CREATE TYPE mood_enum AS ENUM ('x')").is_err());
     assert!(run_try(&engine, "CREATE TYPE e1 AS ENUM ('a', 'a')").is_err());
