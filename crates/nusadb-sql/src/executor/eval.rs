@@ -2632,35 +2632,24 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Bool(b), ColumnType::Text) => Ok(ast::Value::Text(b.to_string())),
         (ast::Value::Int(i), ColumnType::Text) => Ok(ast::Value::Text(i.to_string())),
         (ast::Value::Float(f), ColumnType::Text) => Ok(ast::Value::Text(f.to_string())),
-        // From Text — parsing failures become a typed error.
+        // From Text — a value that does not parse as the target is a data exception (a runtime value
+        // error), not a static type mismatch, so it carries the invalid-representation code.
         (ast::Value::Text(s), ColumnType::Int) => s
             .trim()
             .parse::<i64>()
             .map(ast::Value::Int)
-            .map_err(|_| Error::TypeMismatch {
-                context: format!("CAST `{s}` AS INT"),
-                expected: ColumnType::Int,
-                found: ColumnType::Text,
-            }),
+            .map_err(|_| invalid_cast(s, ColumnType::Int)),
         (ast::Value::Text(s), ColumnType::Float) => s
             .trim()
             .parse::<f64>()
             .map(ast::Value::Float)
-            .map_err(|_| Error::TypeMismatch {
-                context: format!("CAST `{s}` AS FLOAT"),
-                expected: ColumnType::Float,
-                found: ColumnType::Text,
-            }),
+            .map_err(|_| invalid_cast(s, ColumnType::Float)),
         // The full set of the reference engine's boolean string inputs (case-insensitive, surrounding whitespace ignored):
         // true/false, t/f, yes/no, y/n, on/off, 1/0.
         (ast::Value::Text(s), ColumnType::Bool) => match s.trim().to_ascii_lowercase().as_str() {
             "true" | "t" | "yes" | "y" | "on" | "1" => Ok(ast::Value::Bool(true)),
             "false" | "f" | "no" | "n" | "off" | "0" => Ok(ast::Value::Bool(false)),
-            _ => Err(Error::TypeMismatch {
-                context: format!("CAST `{s}` AS BOOL"),
-                expected: ColumnType::Bool,
-                found: ColumnType::Text,
-            }),
+            _ => Err(invalid_cast(s, ColumnType::Bool)),
         },
         // Parse from text (`'2024-01-15'::DATE`, `CAST('…' AS UUID)`, …)
         (ast::Value::Text(s), ColumnType::Date) => crate::temporal::parse_date(s)
@@ -2851,7 +2840,8 @@ fn check_vector_dim(got: usize, dim: u32) -> Result<(), Error> {
     }
 }
 
-/// Build the error for a text value that does not parse as a temporal / UUID `target`.
+/// Build the error for a text value that does not parse as `target` (a temporal, UUID, numeric,
+/// integer, float, or boolean cast) — an invalid-representation data exception.
 fn invalid_cast(s: &str, target: ColumnType) -> Error {
     Error::InvalidValue {
         ty: target,
@@ -2866,15 +2856,18 @@ fn cast_to_numeric(
     precision: u8,
     scale: u8,
 ) -> Result<crate::numeric::Decimal, Error> {
-    let ty = ColumnType::Numeric { precision, scale };
     if precision == 0 {
         return Ok(d);
     }
-    let rescaled = d
-        .rescale(scale)
-        .ok_or_else(|| invalid_cast(&d.format(), ty))?;
+    // A value that parses but does not fit the declared precision/scale is *out of range*, not an
+    // invalid representation — the standard numeric-range code, matching arithmetic overflow.
+    let overflow = || Error::Coded {
+        message: format!("numeric field overflow: value exceeds NUMERIC({precision}, {scale})"),
+        sqlstate: "22003", // numeric_value_out_of_range
+    };
+    let rescaled = d.rescale(scale).ok_or_else(overflow)?;
     if rescaled.required_precision() > u32::from(precision) {
-        return Err(invalid_cast(&d.format(), ty));
+        return Err(overflow());
     }
     Ok(rescaled)
 }

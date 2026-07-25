@@ -319,9 +319,25 @@ impl Error {
             Self::DivisionByZero => "22012", // division_by_zero
             // numeric_value_out_of_range — an overflow or a value outside a function's domain.
             Self::IntegerOutOfRange | Self::ArgumentOutOfDomain(_) => "22003",
-            Self::InvalidValue { .. } => "22P02", // invalid_text_representation
-            Self::InvalidRegex(_) => "2201B",     // invalid_regular_expression
+            // A text value that does not parse as its target type: a bad date/time is
+            // invalid_datetime_format (22007), everything else is invalid_text_representation (22P02).
+            Self::InvalidValue { ty, .. } if is_datetime(*ty) => "22007",
+            Self::InvalidValue { .. } => "22P02",
+            Self::InvalidRegex(_) => "2201B", // invalid_regular_expression
             _ => "XX000",
         }
     }
+}
+
+/// Whether a column type is a date/time type, whose malformed text form is
+/// `invalid_datetime_format` (`22007`) rather than the generic `invalid_text_representation`.
+const fn is_datetime(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Date
+            | ColumnType::Time
+            | ColumnType::TimeTz
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+    )
 }

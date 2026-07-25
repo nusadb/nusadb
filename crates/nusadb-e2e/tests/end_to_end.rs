@@ -1258,10 +1258,25 @@ fn runtime_data_exceptions_carry_class_22_sqlstates() {
         "2201B",
         "invalid regular expression"
     );
+    // A malformed date/time is invalid_datetime_format; a text value that does not parse as a
+    // non-temporal type is invalid_text_representation.
+    assert_eq!(code("SELECT DATE 'not-a-date'"), "22007", "malformed date");
+    assert_eq!(code("SELECT 'x'::date"), "22007", "malformed date cast");
     assert_eq!(
-        code("SELECT DATE 'not-a-date'"),
+        code("SELECT 'abc'::int"),
         "22P02",
-        "malformed literal for its type"
+        "non-numeric text to INT"
+    );
+    assert_eq!(
+        code("SELECT 'abc'::bool"),
+        "22P02",
+        "non-boolean text to BOOL"
+    );
+    // A value that parses but overflows the declared NUMERIC precision is out of range, not invalid.
+    assert_eq!(
+        code("SELECT 123456.0::numeric(4, 1)"),
+        "22003",
+        "numeric field overflow"
     );
 }
 
