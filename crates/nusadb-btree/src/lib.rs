@@ -747,6 +747,84 @@ mod tests {
     }
 
     #[test]
+    fn resident_bytes_counts_index_entries_and_rollback_frees_them() {
+        // The resident footprint includes the in-memory index maps, and the counter is maintained
+        // symmetrically — a transaction that builds many index entries and then rolls back frees
+        // every byte it counted (no drift). Entries are added to one already-committed row (no heap
+        // growth), so the whole delta is the index, isolating the accounting.
+        let engine = BtreeEngine::new();
+        let setup = engine.begin(RC).unwrap();
+        let table = engine.create_table(setup, &table_def("t")).unwrap();
+        let idx = engine
+            .create_index(setup, &index_def("i", table, false))
+            .unwrap();
+        let tid = engine.insert(setup, table, &[1]).unwrap();
+        engine.commit(setup).unwrap();
+
+        let baseline = engine.resident_bytes().unwrap();
+
+        let t = engine.begin(RC).unwrap();
+        for i in 0..1000i64 {
+            engine.index_insert(t, idx, &i.to_le_bytes(), tid).unwrap();
+        }
+        assert!(
+            engine.resident_bytes().unwrap() > baseline,
+            "index entries add to the resident footprint"
+        );
+        engine.rollback(t).unwrap();
+        assert_eq!(
+            engine.resident_bytes().unwrap(),
+            baseline,
+            "rolling the index build back frees every counted byte"
+        );
+    }
+
+    #[test]
+    fn resident_ceiling_counts_the_index_but_does_not_gate_an_index_build() {
+        // The resident ceiling counts index memory, so a bulk load into an indexed table reaches it
+        // and rejects gracefully — but a CREATE INDEX-shaped build (`index_insert`, never `insert`)
+        // is deliberately NOT gated, so a large index can be built past the ceiling and only a
+        // subsequent row INSERT is refused.
+        let engine = BtreeEngine::new();
+        let setup = engine.begin(RC).unwrap();
+        let table = engine.create_table(setup, &table_def("t")).unwrap();
+        let idx = engine
+            .create_index(setup, &index_def("i", table, false))
+            .unwrap();
+        let tid = engine.insert(setup, table, &[1]).unwrap();
+        engine.commit(setup).unwrap();
+
+        let ceiling = engine.resident_bytes().unwrap() + 4 * nusadb_core::PAGE_SIZE as u64;
+        let engine = engine.with_max_total_resident_bytes(Some(ceiling));
+
+        // Build an index far past the ceiling through `index_insert` alone: every entry is accepted
+        // (an index build is not gated), even once the index has pushed resident over the ceiling.
+        let build = engine.begin(RC).unwrap();
+        for i in 0..5000i64 {
+            engine
+                .index_insert(build, idx, &i.to_le_bytes(), tid)
+                .expect("an index build is never refused by the resident ceiling");
+        }
+        engine.commit(build).unwrap();
+        assert!(
+            engine.resident_bytes().unwrap() > ceiling,
+            "the index alone pushed the resident footprint past the ceiling"
+        );
+
+        // A row INSERT now sees that footprint (heap + index) and rejects gracefully — the graceful
+        // path a bulk COPY into an indexed table relies on instead of an OOM.
+        let t = engine.begin(RC).unwrap();
+        assert!(
+            matches!(
+                engine.insert(t, table, &[2]),
+                Err(nusadb_core::Error::OutOfMemory(_))
+            ),
+            "an insert is gated by the resident ceiling that now counts the index"
+        );
+        engine.rollback(t).unwrap();
+    }
+
+    #[test]
     fn resident_memory_ceiling_does_not_block_crash_recovery() {
         // Recovery replays committed data through `replay_op`, NOT `insert`, so a resident ceiling
         // set below the recovered data size must never abort recovery — the durably committed rows

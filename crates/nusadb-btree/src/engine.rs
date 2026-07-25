@@ -679,6 +679,23 @@ struct IndexData {
     /// The one alive (not dead-stamped) key per row — the reverse map `index_insert` consults to
     /// stamp a row's previous key in O(1).
     alive: HashMap<u64, Vec<u8>>,
+    /// A running estimate of this index's resident heap footprint, maintained by the mutation
+    /// methods ([`index_entry_bytes`] added on each range pushed, subtracted on each removed) so
+    /// [`BtreeEngine::resident_bytes`] can fold indexes into the global ceiling without walking the
+    /// map. Held here (not a global atomic) so it travels with the index across drop / rollback.
+    bytes: u64,
+}
+
+/// Estimated resident bytes one index range (a `(key, row_id)` entry plus its reverse-map slot)
+/// retains: the key is held twice — in the sorted map and in the `alive` reverse map — plus a fixed
+/// per-range structural cost (Vec headers, tree/hash nodes, the MVCC stamps). A deliberately
+/// conservative over-estimate: the resident ceiling should fire a little early (safe) rather than
+/// late (OOM). The precise figure does not matter — the ceiling *share* is what calibrates the
+/// bound; this only has to be maintained symmetrically so the counter never drifts.
+const PER_INDEX_ENTRY_BYTES: u64 = 128;
+
+const fn index_entry_bytes(key_len: usize) -> u64 {
+    key_len as u64 * 2 + PER_INDEX_ENTRY_BYTES
 }
 
 /// One visibility range of an index entry: the transaction that created it and (if dead-stamped)
@@ -745,6 +762,7 @@ impl IndexData {
                 xmax: mvcc::NO_XMAX,
             });
         self.alive.insert(row_id, key.to_vec());
+        self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
         AppliedInsert::Inserted { stamped }
     }
 
@@ -758,6 +776,7 @@ impl IndexData {
                     .rposition(|m| m.xmin == txn && m.xmax == mvcc::NO_XMAX)
                 {
                     metas.remove(pos);
+                    self.bytes = self.bytes.saturating_sub(index_entry_bytes(key.len()));
                 }
                 if metas.is_empty() {
                     rows.remove(&row_id);
@@ -785,6 +804,9 @@ impl IndexData {
             }
             Some(meta)
         });
+        if removed.is_some() {
+            self.bytes = self.bytes.saturating_sub(index_entry_bytes(key.len()));
+        }
         if self.entries.get(key).is_some_and(BTreeMap::is_empty) {
             self.entries.remove(key);
         }
@@ -805,6 +827,21 @@ impl IndexData {
         {
             meta.xmax = mvcc::NO_XMAX;
             self.alive.insert(row_id, key.to_vec());
+        }
+    }
+
+    /// Push a previously removed range back — the inverse of [`apply_delete`], used when a physical
+    /// entry removal rolls back. Re-earns the reverse-map slot only for an alive range.
+    fn restore_deleted(&mut self, key: Vec<u8>, row_id: u64, meta: EntryMeta) {
+        self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
+        self.entries
+            .entry(key.clone())
+            .or_default()
+            .entry(row_id)
+            .or_default()
+            .push(meta);
+        if meta.xmax == mvcc::NO_XMAX {
+            self.alive.insert(row_id, key);
         }
     }
 }
@@ -980,14 +1017,23 @@ impl BtreeEngine {
         self
     }
 
-    /// Current resident footprint (bytes) of the in-memory page store — the metric the global
-    /// resident-memory ceiling ([`with_max_total_resident_bytes`](Self::with_max_total_resident_bytes))
-    /// bounds. Observability for monitoring and tests.
+    /// Current resident footprint (bytes) the global resident-memory ceiling
+    /// ([`with_max_total_resident_bytes`](Self::with_max_total_resident_bytes)) bounds: the
+    /// in-memory page store **plus** the secondary/backing indexes, whose entries live in memory
+    /// too. Counting the indexes is what lets a bulk load into an indexed
+    /// table reach the ceiling and reject gracefully instead of growing the index maps until the OS
+    /// OOM-kills the server. Observability for monitoring and tests.
     ///
     /// # Errors
-    /// Fails only on a poisoned store lock.
+    /// Fails only on a poisoned store or catalog lock.
     pub fn resident_bytes(&self) -> Result<u64> {
-        self.store.resident_bytes()
+        let mut total = self.store.resident_bytes()?;
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        for idx in cat.indexes.values() {
+            let bytes = idx.data.read().map_err(|_| poisoned())?.bytes;
+            total = total.saturating_add(bytes);
+        }
+        Ok(total)
     }
 
     /// Open (or create) a **durable** engine over the WAL file at `path`.
@@ -4208,18 +4254,21 @@ impl BtreeEngine {
         Ok(())
     }
 
-    /// Reject a row `insert` when the in-memory page store has grown to the configured global
+    /// Reject a row `insert` when the resident footprint has grown to the configured global
     /// resident-memory ceiling, **before** the write mutates anything — so a rejection leaves no
     /// partial state and the transaction aborts through the ordinary undo path. `None` limit (the
     /// default) takes no lock and never rejects, keeping the common bulk-write path at its exact
-    /// prior cost. The check is `resident >= limit` rather than a precise per-row projection: the
-    /// store grows one 8 KiB page at a time, so it can only overshoot the ceiling by a page or so
-    /// before the next `insert` is refused — negligible against a ceiling sized with headroom.
+    /// prior cost. The footprint is the page store **plus the in-memory indexes**
+    /// ([`resident_bytes`](Self::resident_bytes)): a bulk load into a table with a `PRIMARY
+    /// KEY`/`UNIQUE`/secondary index grows those maps too, and counting them here is what turns that
+    /// growth into a graceful reject rather than an OOM. Only `insert` (a row write) consults the
+    /// ceiling, so a `CREATE INDEX` — which builds through `index_insert`, not `insert` — is
+    /// deliberately not gated by it and keeps its prior behavior.
     fn check_resident_memory(&self) -> Result<()> {
         let Some(limit) = self.max_total_resident_bytes else {
             return Ok(());
         };
-        let resident = self.store.resident_bytes()?;
+        let resident = self.resident_bytes()?;
         if resident >= limit {
             return Err(resident_memory_exceeded(limit, resident));
         }
@@ -4619,16 +4668,7 @@ impl BtreeEngine {
                 } => {
                     if let Some(idx) = cat.get().indexes.get(&index) {
                         let mut data = idx.data.write().map_err(|_| poisoned())?;
-                        data.entries
-                            .entry(key.clone())
-                            .or_default()
-                            .entry(row_id)
-                            .or_default()
-                            .push(meta);
-                        // Only an alive range re-earns the reverse-map slot.
-                        if meta.xmax == mvcc::NO_XMAX {
-                            data.alive.insert(row_id, key);
-                        }
+                        data.restore_deleted(key, row_id, meta);
                     }
                 },
                 UndoOp::AddedConstraint { table, name } => {
@@ -4840,7 +4880,9 @@ impl BtreeEngine {
             }
             for idx in cat.indexes.values().filter(|i| i.def.table.0 == table) {
                 let mut data = idx.data.write().map_err(|_| poisoned())?;
-                data.entries.retain(|_, rows| {
+                let mut removed_bytes = 0_u64;
+                data.entries.retain(|key, rows| {
+                    let cost = index_entry_bytes(key.len());
                     rows.retain(|r, metas| {
                         // A range is reclaimed with its removed row, or once its dead-stamp is
                         // settled (every present and future view sees the supersession — nobody
@@ -4850,11 +4892,14 @@ impl BtreeEngine {
                             !(removed_rows.contains(r)
                                 || (m.xmax != mvcc::NO_XMAX && settled(m.xmax)))
                         });
-                        stats.index_entries_removed += before - metas.len();
+                        let removed = before - metas.len();
+                        stats.index_entries_removed += removed;
+                        removed_bytes = removed_bytes.saturating_add(removed as u64 * cost);
                         !metas.is_empty()
                     });
                     !rows.is_empty()
                 });
+                data.bytes = data.bytes.saturating_sub(removed_bytes);
                 data.alive.retain(|r, _| !removed_rows.contains(r));
             }
         }
