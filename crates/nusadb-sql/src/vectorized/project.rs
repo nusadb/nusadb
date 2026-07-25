@@ -30,7 +30,7 @@ use nusadb_core::ColumnType;
 /// fast-path). Reusing [`int_op`] (overflow-checked) and [`int_value_bounds`] makes the result
 /// bit-identical to [`eval`] by construction.
 #[derive(Debug)]
-enum ColumnarInt {
+pub(super) enum ColumnarInt {
     Column(usize),
     Literal(i64),
     Binary {
@@ -45,7 +45,7 @@ enum ColumnarInt {
 impl ColumnarInt {
     /// Compile a `TypedExpr` into an integer-arithmetic plan, or `None` when any part is outside the
     /// supported shape (non-integer type, non-arithmetic op, or a non-`Int` literal).
-    fn compile(expr: &TypedExpr) -> Option<Self> {
+    pub(super) fn compile(expr: &TypedExpr) -> Option<Self> {
         use ast::BinaryOp as Op;
         if !matches!(expr.ty.physical(), ColumnType::Int) {
             return None;
@@ -76,7 +76,11 @@ impl ColumnarInt {
         clippy::indexing_slicing,
         reason = "every operand/output vector is sized to n and r ranges over 0..n"
     )]
-    fn eval(&self, batch: &RecordBatch, n: usize) -> Result<(Vec<i64>, Vec<bool>), Error> {
+    pub(super) fn eval(
+        &self,
+        batch: &RecordBatch,
+        n: usize,
+    ) -> Result<(Vec<i64>, Vec<bool>), Error> {
         match self {
             Self::Literal(v) => Ok((vec![*v; n], vec![true; n])),
             Self::Column(i) => {

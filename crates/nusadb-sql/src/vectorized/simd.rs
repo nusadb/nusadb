@@ -62,7 +62,7 @@ impl CmpOp {
     }
 
     /// Evaluate `value <op> scalar`.
-    const fn apply(self, value: i64, scalar: i64) -> bool {
+    pub(super) const fn apply(self, value: i64, scalar: i64) -> bool {
         match self {
             Self::Eq => value == scalar,
             Self::Ne => value != scalar,
