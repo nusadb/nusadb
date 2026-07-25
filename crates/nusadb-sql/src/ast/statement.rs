@@ -226,6 +226,11 @@ pub enum Statement {
     CreateEnum(CreateEnum),
     /// `DROP TYPE [IF EXISTS] name` (B-ENUM). Custom-parsed.
     DropType(DropType),
+    /// `CREATE DOMAIN name AS base_type [NOT NULL] [CHECK (VALUE …)]` — a constrained base type.
+    /// Recognized by a custom parser pass.
+    CreateDomain(CreateDomain),
+    /// `DROP DOMAIN [IF EXISTS] name`. Custom-parsed.
+    DropDomain(DropDomain),
     /// `CREATE [OR REPLACE] TRIGGER ...` — a triggered SQL action. Recognized by a custom
     /// parser pass (sqlparser 0.51 only models the `EXECUTE FUNCTION` trigger form).
     CreateTrigger(CreateTrigger),

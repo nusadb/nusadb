@@ -265,6 +265,14 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_drop_type(sql) {
         return result;
     }
+    // `CREATE DOMAIN ...` / `DROP DOMAIN ...` — sqlparser's grammar for these is narrow, so drive
+    // them ourselves (the base type + constraints).
+    if let Some(result) = recognize_create_domain(sql) {
+        return result;
+    }
+    if let Some(result) = recognize_drop_domain(sql) {
+        return result;
+    }
     // `CREATE [OR REPLACE] PROCEDURE ...` / `DROP PROCEDURE ...` / `CALL ...` —
     // drive these ourselves so the procedure body (a `$$…$$` / `'…'` SQL block) is captured verbatim.
     if let Some(result) = recognize_create_procedure(sql) {
@@ -1178,6 +1186,153 @@ fn parse_drop_type(sql: &str) -> Result<ast::Statement, Error> {
     let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
     let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
     Ok(ast::Statement::DropType(ast::DropType { name, if_exists }))
+}
+
+/// Recognize `CREATE DOMAIN name [AS] base_type [constraints]`.
+fn recognize_create_domain(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    starts_with_two(sql, "create", "domain").then(|| parse_create_domain(sql))
+}
+
+/// Recognize `DROP DOMAIN [IF EXISTS] name`.
+fn recognize_drop_domain(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    starts_with_two(sql, "drop", "domain").then(|| parse_drop_domain(sql))
+}
+
+/// Drive `CREATE DOMAIN name [AS] base_type [ [CONSTRAINT c] { NOT NULL | NULL | CHECK (expr) } ]*`.
+/// The base type must be a built-in type; a `CHECK` predicate uses the `VALUE` placeholder for the
+/// column value (substituted when a column of the domain is created). `DEFAULT` / `COLLATE` are not
+/// modelled yet and are rejected rather than silently ignored.
+fn parse_create_domain(sql: &str) -> Result<ast::Statement, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::parser::ParserError;
+
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+    parser.expect_keyword(Keyword::CREATE).map_err(syntax)?;
+    parser.expect_keyword(Keyword::DOMAIN).map_err(syntax)?;
+    let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+    let _ = parser.parse_keyword(Keyword::AS); // `AS` is optional
+    let base = parser.parse_data_type().map_err(syntax)?;
+    // The base must be a built-in type — resolve it now so an unknown/unsupported one is a loud
+    // parse error rather than a broken domain.
+    ddl::convert_data_type(&base)?;
+    let base_type_sql = base.to_string();
+
+    let mut not_null = false;
+    let mut checks = Vec::new();
+    loop {
+        if parser.parse_keyword(Keyword::CONSTRAINT) {
+            let _ = parser.parse_identifier().map_err(syntax)?; // a name we do not persist
+        }
+        if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
+            not_null = true;
+        } else if parser.parse_keyword(Keyword::NULL) {
+            not_null = false;
+        } else if parser.parse_keyword(Keyword::CHECK) {
+            parser.expect_token(&Token::LParen).map_err(syntax)?;
+            let expr = parser.parse_expr().map_err(syntax)?;
+            parser.expect_token(&Token::RParen).map_err(syntax)?;
+            checks.push(expr.to_string());
+        } else if parser.parse_keyword(Keyword::DEFAULT) {
+            return unsupported("CREATE DOMAIN with a DEFAULT is not supported yet");
+        } else if parser.parse_keyword(Keyword::COLLATE) {
+            return unsupported("CREATE DOMAIN with COLLATE is not supported");
+        } else {
+            break;
+        }
+    }
+    // No trailing content (keeps the surface single-statement).
+    match parser.next_token().token {
+        Token::EOF | Token::SemiColon => {},
+        other => {
+            return Err(Error::Syntax(format!(
+                "unexpected trailing token in CREATE DOMAIN: {other}"
+            )));
+        },
+    }
+    Ok(ast::Statement::CreateDomain(ast::CreateDomain {
+        name,
+        base_type_sql,
+        not_null,
+        checks,
+    }))
+}
+
+/// Drive `DROP DOMAIN [IF EXISTS] name`.
+fn parse_drop_domain(sql: &str) -> Result<ast::Statement, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::parser::ParserError;
+
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+    parser.expect_keyword(Keyword::DROP).map_err(syntax)?;
+    parser.expect_keyword(Keyword::DOMAIN).map_err(syntax)?;
+    let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+    let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+    Ok(ast::Statement::DropDomain(ast::DropDomain {
+        name,
+        if_exists,
+    }))
+}
+
+/// Parse a single column type from its canonical SQL text (e.g. a domain's stored base type) into a
+/// [`ColumnType`]. The text must be exactly one built-in type.
+pub fn parse_column_type(text: &str) -> Result<nusadb_core::ColumnType, Error> {
+    use sqlparser::parser::ParserError;
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect).try_with_sql(text).map_err(syntax)?;
+    let dt = parser.parse_data_type().map_err(syntax)?;
+    ddl::convert_data_type(&dt)
+}
+
+/// Rewrite a domain `CHECK` predicate for a specific column.
+///
+/// Every unquoted `VALUE` identifier is replaced with `column`, double-quoted. Only `Word` tokens
+/// are substituted, so a `VALUE` inside a string literal or a quoted identifier is left untouched
+/// (the tokenizer keeps those as distinct token kinds), and the surrounding text — including
+/// spacing — is preserved verbatim so the result re-parses identically.
+pub fn substitute_check_value(predicate_sql: &str, column: &str) -> Result<String, Error> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = NusaParserDialect;
+    let tokens = Tokenizer::new(&dialect, predicate_sql)
+        .tokenize()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    let quoted_col = format!("\"{}\"", column.replace('"', "\"\""));
+    let mut out = String::with_capacity(predicate_sql.len() + column.len());
+    for tok in tokens {
+        match &tok {
+            Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("value") => {
+                out.push_str(&quoted_col);
+            },
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod domain_rewrite_tests {
+    use super::substitute_check_value;
+
+    #[test]
+    fn value_identifier_is_replaced_but_not_inside_a_string() {
+        assert_eq!(
+            substitute_check_value("VALUE > 0 AND value < 150", "age").unwrap(),
+            "\"age\" > 0 AND \"age\" < 150"
+        );
+        // `VALUE` inside a string literal or as part of another identifier is left alone.
+        assert_eq!(
+            substitute_check_value("VALUE <> 'no VALUE here'", "v").unwrap(),
+            "\"v\" <> 'no VALUE here'"
+        );
+        assert_eq!(
+            substitute_check_value("my_value > 0", "c").unwrap(),
+            "my_value > 0"
+        );
+    }
 }
 
 /// Drive `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE}[ OR ...] ON table

@@ -201,6 +201,10 @@ pub enum LogicalPlan {
     CreateEnum(ast::CreateEnum),
     /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM).
     DropType(ast::DropType),
+    /// `CREATE DOMAIN ...` — persist a user-defined domain (base type + NOT NULL + CHECKs).
+    CreateDomain(ast::CreateDomain),
+    /// `DROP DOMAIN [IF EXISTS] name` — drop a user-defined domain.
+    DropDomain(ast::DropDomain),
     /// `CREATE [OR REPLACE] TRIGGER ...` — a triggered SQL action to persist.
     CreateTrigger(CreateTriggerPlan),
     /// `DROP TRIGGER [IF EXISTS] name ON table`.
@@ -1816,6 +1820,10 @@ pub enum PhysicalPlan {
     CreateEnum(ast::CreateEnum),
     /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM).
     DropType(ast::DropType),
+    /// `CREATE DOMAIN ...` — persist a user-defined domain (base type + NOT NULL + CHECKs).
+    CreateDomain(ast::CreateDomain),
+    /// `DROP DOMAIN [IF EXISTS] name` — drop a user-defined domain.
+    DropDomain(ast::DropDomain),
     /// `CREATE [OR REPLACE] TRIGGER ...` — a triggered SQL action to persist.
     CreateTrigger(CreateTriggerPlan),
     /// `DROP TRIGGER [IF EXISTS] name ON table`.

@@ -1090,6 +1090,57 @@ fn create_type_enum_and_use_as_a_column() {
 }
 
 #[test]
+fn create_domain_gives_a_column_its_base_type_not_null_and_checks() {
+    // CREATE DOMAIN — a column of the domain takes its base type, and the domain's NOT NULL and
+    // CHECK (over the VALUE placeholder) are enforced on that column on every write.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE DOMAIN age_t AS INT NOT NULL CHECK (VALUE >= 0 AND VALUE < 150)",
+    );
+    run(&engine, "CREATE TABLE p (id INT, age age_t)");
+
+    // A valid value inserts and reads back as the base type (INT).
+    run(&engine, "INSERT INTO p VALUES (1, 30)");
+    assert_eq!(
+        rows(run(&engine, "SELECT age FROM p")),
+        vec![vec![Value::Int(30)]]
+    );
+
+    // Values violating the CHECK, and NULL (the domain's NOT NULL), are rejected — on INSERT and
+    // UPDATE.
+    assert!(run_try(&engine, "INSERT INTO p VALUES (2, 200)").is_err());
+    assert!(run_try(&engine, "INSERT INTO p VALUES (3, -1)").is_err());
+    assert!(run_try(&engine, "INSERT INTO p VALUES (4, NULL)").is_err());
+    assert!(run_try(&engine, "UPDATE p SET age = 999 WHERE id = 1").is_err());
+    // The rejected writes left the one valid row intact.
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM p")),
+        vec![vec![Value::Int(1)]]
+    );
+
+    // A CHECK over a TEXT base type (string predicate) also works.
+    run(
+        &engine,
+        "CREATE DOMAIN email_t AS TEXT CHECK (VALUE LIKE '%@%')",
+    );
+    run(&engine, "CREATE TABLE u (e email_t)");
+    run(&engine, "INSERT INTO u VALUES ('a@b.com')");
+    assert!(run_try(&engine, "INSERT INTO u VALUES ('nope')").is_err());
+    // A TEXT domain has no NOT NULL, so NULL passes.
+    run(&engine, "INSERT INTO u VALUES (NULL)");
+
+    // An unknown type/domain on a column is a loud error, and DEFAULT/COLLATE are rejected in v1.
+    assert!(run_try(&engine, "CREATE TABLE bad (x nonexistent_t)").is_err());
+    assert!(run_try(&engine, "CREATE DOMAIN d1 AS INT DEFAULT 0").is_err());
+
+    // DROP DOMAIN removes it; a new table can no longer use it; IF EXISTS is a no-op.
+    run(&engine, "DROP DOMAIN email_t");
+    assert!(run_try(&engine, "CREATE TABLE w (e email_t)").is_err());
+    run(&engine, "DROP DOMAIN IF EXISTS email_t");
+}
+
+#[test]
 fn added_scalar_functions_justify_days_encode_decode_regexp_matches() {
     // B-fn — newly added scalar functions: justify_days, encode/decode (bytea), regexp_matches.
     let engine = BtreeEngine::new();

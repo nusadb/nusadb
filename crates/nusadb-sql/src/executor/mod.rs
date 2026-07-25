@@ -1419,6 +1419,8 @@ fn dispatch(
         PhysicalPlan::DropView(p) => run_drop_view(&p, engine, txn),
         PhysicalPlan::CreateEnum(p) => run_create_enum(&p, engine, txn),
         PhysicalPlan::DropType(p) => run_drop_type(&p, engine, txn),
+        PhysicalPlan::CreateDomain(p) => run_create_domain(&p, engine, txn),
+        PhysicalPlan::DropDomain(p) => run_drop_domain(&p, engine, txn),
         PhysicalPlan::CreateTrigger(p) => trigger::run_create_trigger(&p, engine, txn),
         PhysicalPlan::DropTrigger(p) => trigger::run_drop_trigger(&p, engine, txn),
         PhysicalPlan::AlterTrigger(p) => trigger::run_alter_trigger(&p, engine, txn),
@@ -1814,6 +1816,8 @@ fn format_plan(
         PhysicalPlan::DropView(p) => vec![format!("{indent}DropView: {}", p.name)],
         PhysicalPlan::CreateEnum(p) => vec![format!("{indent}CreateEnum: {}", p.name)],
         PhysicalPlan::DropType(p) => vec![format!("{indent}DropType: {}", p.name)],
+        PhysicalPlan::CreateDomain(p) => vec![format!("{indent}CreateDomain: {}", p.name)],
+        PhysicalPlan::DropDomain(p) => vec![format!("{indent}DropDomain: {}", p.name)],
         PhysicalPlan::CreateTrigger(p) => {
             vec![format!("{indent}CreateTrigger: {} ON {}", p.name, p.table)]
         },
@@ -3332,6 +3336,81 @@ pub(crate) fn lookup_enum(
 ) -> Result<Option<Vec<String>>, Error> {
     Ok(load_view_def(engine, txn, ENUM_CATALOG, name)?
         .map(|def| def.split(ENUM_LABEL_SEP).map(str::to_owned).collect()))
+}
+
+const DOMAIN_CATALOG: &str = "nusadb_domains";
+
+/// A user-defined domain resolved from [`DOMAIN_CATALOG`]: its base type (as SQL text), whether it
+/// forbids `NULL`, and its `CHECK` predicates (each over the `VALUE` placeholder).
+pub(crate) struct DomainDef {
+    /// The base type as canonical SQL text, re-parsed when a column resolves against the domain.
+    pub base_type_sql: String,
+    /// Whether the domain forbids `NULL`.
+    pub not_null: bool,
+    /// The domain's `CHECK` predicates (SQL text over `VALUE`).
+    pub checks: Vec<String>,
+}
+
+/// `CREATE DOMAIN name AS base_type [NOT NULL] [CHECK …]` — persist the domain. Rejects a name
+/// already taken by another domain, an enum, or a table (one type namespace).
+fn run_create_domain(
+    p: &ast::CreateDomain,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    if lookup_domain(engine, txn, &p.name)?.is_some()
+        || lookup_enum(engine, txn, &p.name)?.is_some()
+        || engine.lookup_table_as_of(txn, &p.name)?.is_some()
+    {
+        return Err(Error::Unsupported(format!(
+            "type {:?} already exists",
+            p.name
+        )));
+    }
+    // Encode `base_type`, then `not_null`, then each CHECK, separated by the unit separator.
+    let mut fields = Vec::with_capacity(2 + p.checks.len());
+    fields.push(p.base_type_sql.clone());
+    fields.push(if p.not_null { "1" } else { "0" }.to_owned());
+    fields.extend(p.checks.iter().cloned());
+    let encoded = fields.join(&ENUM_LABEL_SEP.to_string());
+    store_view_def(engine, txn, DOMAIN_CATALOG, &p.name, &encoded)?;
+    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+}
+
+/// `DROP DOMAIN [IF EXISTS] name` — forget a user-defined domain.
+fn run_drop_domain(
+    p: &ast::DropDomain,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    let removed = delete_view_def(engine, txn, DOMAIN_CATALOG, &p.name)?;
+    if !removed && !p.if_exists {
+        return Err(Error::Unsupported(format!(
+            "domain {:?} does not exist",
+            p.name
+        )));
+    }
+    Ok(ExecutionResult::Dropped)
+}
+
+/// The definition of a user-defined domain, or `None` if no such domain exists.
+pub(crate) fn lookup_domain(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<Option<DomainDef>, Error> {
+    let Some(def) = load_view_def(engine, txn, DOMAIN_CATALOG, name)? else {
+        return Ok(None);
+    };
+    let mut parts = def.split(ENUM_LABEL_SEP);
+    let base_type_sql = parts.next().unwrap_or_default().to_owned();
+    let not_null = parts.next() == Some("1");
+    let checks = parts.map(str::to_owned).collect();
+    Ok(Some(DomainDef {
+        base_type_sql,
+        not_null,
+        checks,
+    }))
 }
 
 // === Internal helpers =====================================================

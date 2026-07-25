@@ -117,17 +117,32 @@ pub(super) fn run_create_table(
     // it any string would be accepted).
     let mut columns = Vec::with_capacity(plan.columns.len());
     let mut enum_checks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut domain_checks: Vec<(String, String)> = Vec::new();
     for c in plan.columns {
+        let mut ty = c.ty;
+        let mut nullable = c.nullable;
         if let Some(udt) = &c.udt_name {
-            match super::lookup_enum(engine, txn, udt)? {
-                Some(labels) => enum_checks.push((c.name.clone(), labels)),
-                None => return Err(Error::Unsupported(format!("type \"{udt}\" does not exist"))),
+            if let Some(labels) = super::lookup_enum(engine, txn, udt)? {
+                // An ENUM is stored as its TEXT placeholder; membership is enforced below.
+                enum_checks.push((c.name.clone(), labels));
+            } else if let Some(domain) = super::lookup_domain(engine, txn, udt)? {
+                // A DOMAIN column takes the domain's base type; its NOT NULL and CHECKs are applied
+                // to this column (the CHECK's `VALUE` placeholder rewritten to the column name).
+                ty = crate::parser::parse_column_type(&domain.base_type_sql)?;
+                nullable = nullable && !domain.not_null;
+                for (i, check) in domain.checks.iter().enumerate() {
+                    let predicate = crate::parser::substitute_check_value(check, &c.name)?;
+                    let name = format!("{}{}_{i}", crate::SYNTHETIC_TYPE_CHECK_PREFIX, c.name);
+                    domain_checks.push((name, predicate));
+                }
+            } else {
+                return Err(Error::Unsupported(format!("type \"{udt}\" does not exist")));
             }
         }
         columns.push(ColumnDef {
             name: c.name,
-            ty: c.ty,
-            nullable: c.nullable,
+            ty,
+            nullable,
         });
     }
     let def = TableDef {
@@ -165,6 +180,11 @@ pub(super) fn run_create_table(
             let name = format!("{}{col}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
             engine.add_check_constraint(txn, id, &name, predicate_sql.as_bytes())?;
         }
+    }
+    // A DOMAIN column's CHECKs (already rewritten from `VALUE` to the column name) enforce on write
+    // through the same machinery; the synthetic prefix hides them from introspection.
+    for (name, predicate_sql) in &domain_checks {
+        engine.add_check_constraint(txn, id, name, predicate_sql.as_bytes())?;
     }
     // Create the backing sequence for each SERIAL column before persisting its sentinel
     // default, so INSERT's `lookup_sequence` resolves.

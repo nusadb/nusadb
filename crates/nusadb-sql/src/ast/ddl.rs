@@ -182,6 +182,31 @@ pub struct DropType {
     pub if_exists: bool,
 }
 
+/// `CREATE DOMAIN name AS base_type [NOT NULL] [CHECK (VALUE …)]` — a constrained base type.
+///
+/// Stored as a catalog object; a column of this type stores as the base type, and the executor
+/// injects the `NOT NULL` and `CHECK`s when such a column is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDomain {
+    /// Domain name (unique within the catalog).
+    pub name: String,
+    /// The underlying base type, as canonical SQL text (re-parsed when a column resolves against it).
+    pub base_type_sql: String,
+    /// Whether the domain forbids `NULL`.
+    pub not_null: bool,
+    /// Zero or more `CHECK` predicates, each as SQL text over the `VALUE` placeholder.
+    pub checks: Vec<String>,
+}
+
+/// `DROP DOMAIN [IF EXISTS] name` — drop a user-defined domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropDomain {
+    /// Domain name.
+    pub name: String,
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+}
+
 /// When a trigger fires relative to the triggering write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerTiming {

@@ -368,6 +368,11 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             Ok(LogicalPlan::CreateEnum(ce))
         },
         ast::Statement::DropType(dt) => Ok(LogicalPlan::DropType(dt)),
+        // CREATE DOMAIN: the base type + CHECK predicates were validated to parse in the parser; a
+        // predicate's meaning is checked against the base type when a column of the domain is created
+        // (the injected CHECK is analyzed then), mirroring the deferred ENUM resolution.
+        ast::Statement::CreateDomain(cd) => Ok(LogicalPlan::CreateDomain(cd)),
+        ast::Statement::DropDomain(dd) => Ok(LogicalPlan::DropDomain(dd)),
         // CREATE/DROP TRIGGER: validate the target table; the action + WHEN bodies
         // are kept as text and re-analyzed (with NEW/OLD bound) when the trigger fires.
         ast::Statement::CreateTrigger(ct) => analyze_create_trigger(ct, catalog),
