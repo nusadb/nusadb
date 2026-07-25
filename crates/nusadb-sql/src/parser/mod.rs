@@ -1864,54 +1864,103 @@ fn parse_copy_stmt(sql: &str) -> Result<ast::Statement, Error> {
     }))
 }
 
-/// Parse the optional `[WITH] ( FORMAT text, DELIMITER 'c', NULL 's', HEADER [bool] )` tail.
+/// Parse the optional `[WITH] ( FORMAT {text|csv}, DELIMITER 'c', NULL 's', HEADER [bool],
+/// QUOTE 'c', ESCAPE 'c' )` tail. Options may appear in any order; `DELIMITER`/`NULL` default to the
+/// chosen format's convention (`\t`/`\N` for text, `,`/empty for CSV) when omitted.
 fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::ParserError;
     use sqlparser::tokenizer::Token;
 
     let syntax = |e: ParserError| Error::Syntax(e.to_string());
-    let mut format = ast::CopyFormat::default();
+    let mut kind = ast::CopyFormatKind::Text;
+    let mut delimiter: Option<char> = None;
+    let mut null: Option<String> = None;
+    let mut header = false;
+    let mut quote: Option<char> = None;
+    let mut escape: Option<char> = None;
+
     let _ = parser.parse_keyword(Keyword::WITH);
-    if !parser.consume_token(&Token::LParen) {
-        return Ok(format); // no options
-    }
-    loop {
-        let key = match parser.next_token().token {
-            Token::Word(w) => w.value.to_ascii_uppercase(),
-            other => {
-                return Err(Error::Syntax(format!(
-                    "expected a COPY option, found {other}"
-                )));
-            },
-        };
-        match key.as_str() {
-            "FORMAT" => {
-                let name = match parser.next_token().token {
-                    Token::Word(w) => w.value,
-                    other => return Err(Error::Syntax(format!("expected a format name, {other}"))),
-                };
-                if !name.eq_ignore_ascii_case("text") {
-                    return unsupported(
-                        "only COPY WITH (FORMAT text) is supported (CSV/binary are follow-ups)",
-                    );
-                }
-            },
-            "DELIMITER" => format.delimiter = copy_single_char(parser)?,
-            "NULL" => format.null = copy_string(parser)?,
-            "HEADER" => format.header = copy_optional_bool(parser),
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "unsupported COPY option `{other}` (FORMAT text, DELIMITER, NULL, HEADER only)"
-                )));
-            },
+    if parser.consume_token(&Token::LParen) {
+        loop {
+            let key = match parser.next_token().token {
+                Token::Word(w) => w.value.to_ascii_uppercase(),
+                other => {
+                    return Err(Error::Syntax(format!(
+                        "expected a COPY option, found {other}"
+                    )));
+                },
+            };
+            match key.as_str() {
+                "FORMAT" => {
+                    let name = match parser.next_token().token {
+                        Token::Word(w) => w.value,
+                        other => {
+                            return Err(Error::Syntax(format!("expected a format name, {other}")));
+                        },
+                    };
+                    kind = if name.eq_ignore_ascii_case("text") {
+                        ast::CopyFormatKind::Text
+                    } else if name.eq_ignore_ascii_case("csv") {
+                        ast::CopyFormatKind::Csv
+                    } else {
+                        return unsupported(
+                            "COPY supports FORMAT text or csv (binary is a follow-up)",
+                        );
+                    };
+                },
+                "DELIMITER" => delimiter = Some(copy_single_char(parser)?),
+                "NULL" => null = Some(copy_string(parser)?),
+                "HEADER" => header = copy_optional_bool(parser),
+                "QUOTE" => quote = Some(copy_single_char(parser)?),
+                "ESCAPE" => escape = Some(copy_single_char(parser)?),
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "unsupported COPY option `{other}` (FORMAT, DELIMITER, NULL, HEADER, QUOTE, ESCAPE)"
+                    )));
+                },
+            }
+            if !parser.consume_token(&Token::Comma) {
+                break;
+            }
         }
-        if !parser.consume_token(&Token::Comma) {
-            break;
-        }
+        parser.expect_token(&Token::RParen).map_err(syntax)?;
     }
-    parser.expect_token(&Token::RParen).map_err(syntax)?;
-    Ok(format)
+
+    // QUOTE / ESCAPE describe CSV quoting; the text format has none.
+    if kind == ast::CopyFormatKind::Text && (quote.is_some() || escape.is_some()) {
+        return unsupported("COPY QUOTE / ESCAPE are only available with FORMAT csv");
+    }
+
+    match kind {
+        ast::CopyFormatKind::Text => Ok(ast::CopyFormat {
+            kind,
+            delimiter: delimiter.unwrap_or('\t'),
+            null: null.unwrap_or_else(|| "\\N".to_owned()),
+            header,
+            quote: '"',
+            escape: '"',
+        }),
+        ast::CopyFormatKind::Csv => {
+            let delimiter = delimiter.unwrap_or(',');
+            let quote = quote.unwrap_or('"');
+            let escape = escape.unwrap_or(quote);
+            // The field separator and the quote must be distinguishable.
+            if delimiter == quote {
+                return Err(Error::Syntax(
+                    "COPY delimiter and quote must be different".to_owned(),
+                ));
+            }
+            Ok(ast::CopyFormat {
+                kind,
+                delimiter,
+                null: null.unwrap_or_default(),
+                header,
+                quote,
+                escape,
+            })
+        },
+    }
 }
 
 /// Read a single-quoted string option value (e.g. `NULL '...'`).

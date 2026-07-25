@@ -4252,17 +4252,50 @@ fn copy_honors_text_format_options() {
 }
 
 #[test]
-fn copy_rejects_file_target_and_csv_format() {
+fn copy_rejects_file_target_and_binary_format() {
     // A file target, not STDIN/STDOUT.
     assert!(matches!(
         parse("COPY users FROM 'data.csv'"),
         Err(Error::Unsupported(_))
     ));
-    // CSV/binary formats are follow-ups.
+    // The binary format is still a follow-up.
     assert!(matches!(
-        parse("COPY users FROM STDIN WITH (FORMAT csv)"),
+        parse("COPY users FROM STDIN WITH (FORMAT binary)"),
         Err(Error::Unsupported(_))
     ));
+}
+
+#[test]
+fn copy_parses_csv_format_with_defaults_and_options() {
+    // Bare CSV: comma delimiter and empty-string NULL are the format defaults.
+    let ast::Statement::Copy(c) = ok("COPY users FROM STDIN WITH (FORMAT csv)") else {
+        panic!("expected Copy");
+    };
+    assert_eq!(c.format.kind, ast::CopyFormatKind::Csv);
+    assert_eq!(c.format.delimiter, ',');
+    assert_eq!(c.format.null, "");
+    assert_eq!(c.format.quote, '"');
+    assert_eq!(c.format.escape, '"');
+
+    // Explicit CSV options override the defaults, in any order (FORMAT last).
+    let ast::Statement::Copy(c) = ok(
+        "COPY users FROM STDIN WITH (HEADER true, DELIMITER ';', NULL 'NA', QUOTE '~', ESCAPE '^', FORMAT csv)",
+    ) else {
+        panic!("expected Copy");
+    };
+    assert_eq!(c.format.kind, ast::CopyFormatKind::Csv);
+    assert_eq!(c.format.delimiter, ';');
+    assert_eq!(c.format.null, "NA");
+    assert_eq!(c.format.quote, '~');
+    assert_eq!(c.format.escape, '^');
+    assert!(c.format.header);
+
+    // QUOTE / ESCAPE are CSV-only; a DELIMITER equal to the QUOTE character is rejected.
+    assert!(matches!(
+        parse("COPY users FROM STDIN WITH (FORMAT text, QUOTE '~')"),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(parse("COPY users FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE '|')").is_err());
 }
 
 // --- silent-wrong parser gaps closed ----------------------

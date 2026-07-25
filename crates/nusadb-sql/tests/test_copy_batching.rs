@@ -23,8 +23,8 @@ use nusadb_btree::BtreeEngine;
 use nusadb_core::{IsolationLevel, StorageEngine, TableSchema};
 use nusadb_sql::ast::{Statement, Value};
 use nusadb_sql::{
-    Catalog, Error, ExecutionResult, IndexInfo, Row, Session, analyze, copy_from, parse, plan,
-    set_maintenance_work_mem,
+    Catalog, Error, ExecutionResult, IndexInfo, Row, Session, analyze, copy_from, copy_to, parse,
+    plan, set_maintenance_work_mem,
 };
 
 struct Cat<'a>(&'a dyn StorageEngine);
@@ -56,6 +56,15 @@ fn copy(engine: &dyn StorageEngine, sql: &str, data: &str) -> Result<usize, Erro
         panic!("not a COPY statement: {sql}");
     };
     copy_from(engine, &copy, data)
+}
+
+/// Parse a `COPY <table> ... TO STDOUT` statement and render the table through `copy_to`, returning
+/// the payload the wire server would stream back.
+fn copy_out(engine: &dyn StorageEngine, sql: &str) -> String {
+    let Statement::Copy(copy) = parse(sql).unwrap() else {
+        panic!("not a COPY statement: {sql}");
+    };
+    copy_to(engine, &copy).unwrap().1
 }
 
 /// Count the live entries in a secondary index by scanning it directly through the engine — used to
@@ -262,6 +271,119 @@ fn copy_rejects_a_cross_batch_duplicate_on_a_numeric_pk() {
         rows(engine, &mut session, "SELECT id FROM t").len(),
         0,
         "a rejected COPY on a NUMERIC PK leaves the table empty (error was: {err:?})"
+    );
+}
+
+/// `COPY ... FROM STDIN WITH (FORMAT csv)` loads comma-delimited data, honoring quoted fields (which
+/// may carry the delimiter, a newline, or a doubled quote) and the CSV NULL rule: an unquoted empty
+/// field is NULL, while a quoted empty field is the empty string.
+#[test]
+fn copy_from_csv_honors_quoting_and_null_distinction() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, note TEXT)",
+    );
+
+    // id 1: a quoted field with an embedded comma.
+    // id 2: a quoted field with an embedded newline; trailing unquoted-empty note = NULL.
+    // id 3: unquoted-empty name = NULL; a quoted note with a doubled quote → a literal quote.
+    // id 4: a quoted empty note = the empty string (distinct from id 2's NULL).
+    let data =
+        "1,alice,\"hello, world\"\n2,\"bob\nsmith\",\n3,,\"literal \"\"q\"\"\"\n4,dan,\"\"\n";
+    assert_eq!(
+        copy(engine, "COPY t FROM STDIN WITH (FORMAT csv)", data).unwrap(),
+        4
+    );
+
+    assert_eq!(
+        rows(engine, &mut session, "SELECT note FROM t WHERE id = 1"),
+        vec![vec![Value::Text("hello, world".into())]],
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT name FROM t WHERE id = 2"),
+        vec![vec![Value::Text("bob\nsmith".into())]],
+        "a quoted field carries an embedded newline as one value",
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT id FROM t WHERE note IS NULL"),
+        vec![vec![Value::Int(2)]],
+        "only the unquoted-empty note is NULL",
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT id FROM t WHERE name IS NULL"),
+        vec![vec![Value::Int(3)]],
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT note FROM t WHERE id = 3"),
+        vec![vec![Value::Text("literal \"q\"".into())]],
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT note FROM t WHERE id = 4"),
+        vec![vec![Value::Text(String::new())]],
+        "a quoted empty field is the empty string, not NULL",
+    );
+}
+
+/// `COPY ... TO STDOUT WITH (FORMAT csv)` renders CSV that round-trips back through `FROM ... csv`:
+/// values needing it are quoted, and the NULL-vs-empty-string distinction survives the export/reload.
+#[test]
+fn copy_to_csv_round_trips_through_from_csv() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, note TEXT)",
+    );
+    // A value with a comma+quote, an empty string, and a NULL — the cases CSV must disambiguate.
+    exec(
+        engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 'a,b\"c', '')",
+    );
+    exec(
+        engine,
+        &mut session,
+        "INSERT INTO t VALUES (2, 'plain', NULL)",
+    );
+
+    let exported = copy_out(engine, "COPY t TO STDOUT WITH (FORMAT csv)");
+
+    // Reload into an identical table and compare — the round-trip must preserve every value,
+    // including the empty-string vs NULL distinction.
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE t2 (id INT PRIMARY KEY, name TEXT, note TEXT)",
+    );
+    assert_eq!(
+        copy(engine, "COPY t2 FROM STDIN WITH (FORMAT csv)", &exported).unwrap(),
+        2,
+    );
+    assert_eq!(
+        rows(
+            engine,
+            &mut session,
+            "SELECT id, name, note FROM t ORDER BY id"
+        ),
+        rows(
+            engine,
+            &mut session,
+            "SELECT id, name, note FROM t2 ORDER BY id"
+        ),
+        "CSV export reloads to an identical table",
+    );
+    // The empty string stayed an empty string and the NULL stayed NULL after the round-trip.
+    assert_eq!(
+        rows(engine, &mut session, "SELECT id FROM t2 WHERE note IS NULL"),
+        vec![vec![Value::Int(2)]],
+    );
+    assert_eq!(
+        rows(engine, &mut session, "SELECT note FROM t2 WHERE id = 1"),
+        vec![vec![Value::Text(String::new())]],
     );
 }
 

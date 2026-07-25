@@ -1216,13 +1216,44 @@ pub(super) fn run_copy_from(
         .len();
         Ok(())
     };
-    for (line_no, line) in copy_data_lines(data, copy.format.header).enumerate() {
+    // Records stream one at a time — text splits on newlines, CSV parses quote-aware (a quoted field
+    // may span newlines) — so a multi-million-row load never materializes every parsed row up front,
+    // preserving the bounded-memory batching below.
+    let records: Box<dyn Iterator<Item = Result<Vec<Option<String>>, Error>> + '_> =
+        match copy.format.kind {
+            ast::CopyFormatKind::Text => {
+                Box::new(copy_data_lines(data, copy.format.header).map(|line| {
+                    Ok(crate::copy::parse_text_row(
+                        line,
+                        copy.format.delimiter,
+                        &copy.format.null,
+                    ))
+                }))
+            },
+            ast::CopyFormatKind::Csv => Box::new(
+                crate::copy::CsvRecords::new(
+                    data,
+                    copy.format.delimiter,
+                    copy.format.quote,
+                    copy.format.escape,
+                    &copy.format.null,
+                )
+                .skip(usize::from(copy.format.header))
+                .map(|record| {
+                    record.map_err(|message| Error::Coded {
+                        message,
+                        sqlstate: "22P04", // bad_copy_file_format
+                    })
+                }),
+            ),
+        };
+    for (record_no, record) in records.enumerate() {
         // Honor a statement timeout / cancel request at row granularity on a long load.
         crate::cancel::check()?;
-        let fields = crate::copy::parse_text_row(line, copy.format.delimiter, &copy.format.null);
+        let fields = record?;
         if fields.len() != columns.len() {
             return Err(Error::ArityMismatch {
-                context: format!("COPY data line {}", line_no + 1),
+                context: format!("COPY data line {}", record_no + 1),
                 expected: columns.len(),
                 found: fields.len(),
             });
@@ -1266,15 +1297,28 @@ pub(super) fn run_copy_to(
     let columns = resolve_copy_columns(copy, &table)?;
     let rows = scan_rows(&table, engine, txn)?;
 
-    let delimiter = copy.format.delimiter;
-    let null = &copy.format.null;
+    // Render one row of fields in the requested format (text or CSV).
+    let format_row = |fields: &[Option<&str>]| -> String {
+        match copy.format.kind {
+            ast::CopyFormatKind::Text => {
+                crate::copy::format_text_row(fields, copy.format.delimiter, &copy.format.null)
+            },
+            ast::CopyFormatKind::Csv => crate::copy::format_csv_row(
+                fields,
+                copy.format.delimiter,
+                copy.format.quote,
+                copy.format.escape,
+                &copy.format.null,
+            ),
+        }
+    };
     let mut out = String::new();
     if copy.format.header {
         let names: Vec<Option<&str>> = columns
             .iter()
             .map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
             .collect();
-        out.push_str(&crate::copy::format_text_row(&names, delimiter, null));
+        out.push_str(&format_row(&names));
         out.push('\n');
     }
     for row in &rows {
@@ -1286,7 +1330,7 @@ pub(super) fn run_copy_to(
             })
             .collect();
         let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
-        out.push_str(&crate::copy::format_text_row(&refs, delimiter, null));
+        out.push_str(&format_row(&refs));
         out.push('\n');
     }
     Ok((rows.len(), out))

@@ -65,23 +65,47 @@ pub enum CopyDirection {
     To,
 }
 
-/// Text-format options for [`Copy`](struct@Copy) (the subset NusaDB honors today).
+/// Which on-the-wire encoding a [`Copy`](struct@Copy) stream uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyFormatKind {
+    /// The default `text` format: tab-delimited, `\N` for NULL, backslash escapes.
+    #[default]
+    Text,
+    /// `csv`: comma-delimited, `"`-quoted fields (doubled quote to embed one), empty unquoted field
+    /// for NULL. A quoted field may contain the delimiter, a newline, or a quote and is never NULL.
+    Csv,
+}
+
+/// Format options for [`Copy`](struct@Copy) (the subset NusaDB honors today).
+///
+/// `quote`/`escape` apply only to [`CopyFormatKind::Csv`]; the parser fills `delimiter`/`null` with
+/// the format's defaults (`\t`/`\N` for text, `,`/empty for CSV) when they are not given explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFormat {
-    /// Field separator (default tab).
+    /// The encoding: `text` (default) or `csv`.
+    pub kind: CopyFormatKind,
+    /// Field separator (default tab for text, comma for CSV).
     pub delimiter: char,
-    /// The token that represents SQL `NULL` (default `\N`).
+    /// The token that represents SQL `NULL` (default `\N` for text, empty string for CSV).
     pub null: String,
     /// Whether the first data line is a header to skip (FROM) / emit (TO). Default `false`.
     pub header: bool,
+    /// CSV quoting character (default `"`); ignored for the text format.
+    pub quote: char,
+    /// CSV escape character for a quote inside a quoted field (default: the same as `quote`, i.e.
+    /// doubled-quote escaping); ignored for the text format.
+    pub escape: char,
 }
 
 impl Default for CopyFormat {
     fn default() -> Self {
         Self {
+            kind: CopyFormatKind::Text,
             delimiter: '\t',
             null: "\\N".to_owned(),
             header: false,
+            quote: '"',
+            escape: '"',
         }
     }
 }
