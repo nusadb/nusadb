@@ -14,6 +14,7 @@
 
 mod aggregate;
 mod filter;
+mod fold_scan_aggregate;
 mod group_aggregate;
 mod hash_join;
 mod limit;
@@ -25,6 +26,7 @@ mod sort;
 
 pub use aggregate::ScalarAggregate;
 pub use filter::Filter;
+pub use fold_scan_aggregate::FoldScanAggregate;
 pub use group_aggregate::GroupedAggregate;
 pub use hash_join::HashJoin;
 pub use limit::Limit;
@@ -197,6 +199,17 @@ fn try_build(
                 try_parallel_aggregate(input, &[], calls, true, engine, txn, est_scan_rows)?
             {
                 return Ok(Some(par));
+            }
+            // Fused fold-during-scan: an integer COUNT/SUM/MIN/MAX scalar aggregate directly over a
+            // bare table scan folds each tuple's needed columns into the accumulator without ever
+            // building the column arrays (the row->column transpose the batch path pays). Only the
+            // supported integer shape is fused; everything else keeps the columnar aggregate below.
+            // Tried after the parallel attempt, so it never preempts the morsel-parallel fold.
+            if let PhysicalOperator::SeqScan { table, columns } = &**input
+                && let Some(fused) =
+                    FoldScanAggregate::try_open(engine, txn, table, columns, calls)?
+            {
+                return Ok(Some(Box::new(fused)));
             }
             let exprs_ok = calls.iter().all(|c| {
                 c.arg.as_ref().is_none_or(expr_is_vectorizable)

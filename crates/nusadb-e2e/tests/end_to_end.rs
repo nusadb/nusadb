@@ -2188,6 +2188,39 @@ fn vectorized_path_matches_row_path_end_to_end() {
 }
 
 #[test]
+fn fold_during_scan_matches_row_path() {
+    // With the batch flag on, an integer COUNT/SUM/MIN/MAX scalar aggregate over a bare table scan
+    // folds each tuple directly into the accumulator (no column build). It must return exactly the
+    // row path's rows against the real engine, including NULL handling and an unmatched (all-NULL)
+    // column.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (a INT, b INT, c TEXT)");
+    run(
+        &engine,
+        "INSERT INTO t VALUES (3, 100, 'x'), (1, NULL, 'y'), (NULL, -7, 'z'), \
+         (5, 2, 'w'), (-3, 2, NULL)",
+    );
+    // A never-populated table exercises the empty-scan fold (COUNT = 0, the rest NULL).
+    run(&engine, "CREATE TABLE empty (a INT, b INT)");
+    let queries = [
+        "SELECT COUNT(*) FROM t",
+        "SELECT SUM(a), MIN(a), MAX(a) FROM t",
+        // COUNT over an integer column and a text column (presence only) plus a wide mix.
+        "SELECT COUNT(*), COUNT(a), COUNT(b), COUNT(c), SUM(b), MIN(b), MAX(b) FROM t",
+        // An empty bare-scan table: aggregates are NULL except COUNT.
+        "SELECT COUNT(*), SUM(a), MIN(a), MAX(a) FROM empty",
+    ];
+    for sql in queries {
+        let row_path = rows(run(&engine, sql));
+        let batch_path = {
+            let _g = nusadb_sql::vectorized::scope(true);
+            rows(run(&engine, sql))
+        };
+        assert_eq!(row_path, batch_path, "fold-during-scan diverged: {sql}");
+    }
+}
+
+#[test]
 fn vectorized_narrowed_scan_matches_row_path() {
     // A projection-pushdown-narrowed scan (an aggregate over a strict subset of a wide table) now
     // vectorizes by decoding only the referenced columns. With the flag on it must return exactly the
