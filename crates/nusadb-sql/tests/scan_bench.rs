@@ -12,6 +12,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::cast_precision_loss,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
     reason = "manual perf probe, not a CI gate"
 )]
 
@@ -19,7 +21,7 @@ use std::time::Instant;
 
 use nusadb_btree::BtreeEngine;
 use nusadb_core::{IsolationLevel, StorageEngine, TableSchema};
-use nusadb_sql::{Catalog, Error, IndexInfo, Session, analyze, parse, plan};
+use nusadb_sql::{Catalog, Error, IndexInfo, Operator, SeqScan, Session, analyze, parse, plan};
 
 struct Cat<'a>(&'a dyn StorageEngine);
 impl Catalog for Cat<'_> {
@@ -102,6 +104,59 @@ fn scan_throughput_probe() {
             "{label}: {n} rows in {dt:?} ({:.0} ns/row; open {open:?} + drain {:?})",
             dt.as_nanos() as f64 / n as f64,
             t2.elapsed()
+        );
+        engine.commit(txn).unwrap();
+    }
+
+    // Decode-walk vs column-build isolation: three passes over the same tuples, each adding one
+    // stage. `scan-only` (above) rehydrates tuples but decodes nothing; `decode-discard` additionally
+    // walks every field and reads its value but builds no column; `decode-build` runs the vectorized
+    // SeqScan, which materializes the Int64Array columns (the row->column transpose). So
+    // (decode-discard − scan-only) is the per-field decode-walk cost and (decode-build −
+    // decode-discard) is the build/transpose cost. If build ≫ discard, a fused decode+accumulate scan
+    // that skips the column build is worth exploring; if they are close, the walk dominates and
+    // skipping the build would not help — measure before optimizing.
+    let table_schema = engine.lookup_table("t").unwrap().expect("table t");
+    for label in ["decode-discard warm1", "decode-discard warm2"] {
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let mut scan = engine.scan(txn, table).unwrap();
+        let t = Instant::now();
+        let (mut n, mut sink) = (0usize, 0i64);
+        while let Some((_, tuple)) = scan.try_next().unwrap() {
+            // t(id INT, val INT, grp INT): three fields, each a 1-byte present/null tag followed (when
+            // present) by an 8-byte little-endian i64 — the exact bytes `read_i64_field` reads.
+            let bytes: &[u8] = &tuple;
+            let mut pos = 0usize;
+            for _ in 0..3 {
+                let present = bytes[pos] != 0;
+                pos += 1;
+                if present {
+                    sink = sink
+                        .wrapping_add(i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()));
+                    pos += 8;
+                }
+            }
+            n += 1;
+        }
+        let dt = t.elapsed();
+        println!(
+            "{label}: {n} rows in {dt:?} ({:.0} ns/row) [walk+read, no build; sink {sink}]",
+            dt.as_nanos() as f64 / n as f64,
+        );
+        engine.commit(txn).unwrap();
+    }
+    for label in ["decode-build(SeqScan) warm1", "decode-build(SeqScan) warm2"] {
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let t = Instant::now();
+        let mut op = SeqScan::open(engine, txn, &table_schema).unwrap();
+        let mut n = 0usize;
+        while let Some(batch) = op.next_batch().unwrap() {
+            n += batch.num_rows();
+        }
+        let dt = t.elapsed();
+        println!(
+            "{label}: {n} rows in {dt:?} ({:.0} ns/row) [builds Int64Array columns]",
+            dt.as_nanos() as f64 / n as f64,
         );
         engine.commit(txn).unwrap();
     }
