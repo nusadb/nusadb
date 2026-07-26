@@ -17,6 +17,12 @@ pub(super) fn run_select(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let columns = output_columns(op);
+    // A join plan carries no single-table estimate (the analyzer sets it only for a lone base table),
+    // so derive one from the largest base-table scan under a join — the O(1) approx count already used
+    // for single-table routing. This lets a large `fact ⋈ dim` route to the vectorized hash join;
+    // `vectorized::execute` falls back for any unsupported join shape, so an over-eager route is at
+    // worst a wasted try. Non-join plans keep their existing estimate (the helper returns `None`).
+    let est_scan_rows = est_scan_rows.or_else(|| join_scan_estimate(op, engine));
     // Route to the vectorized batch path when it is force-enabled (the opt-in test/override flag) or
     // when the plan-time scanned-row estimate is large enough to amortize the batch overhead (
     // selective routing, the design recommendation: ≥ VECTORIZED_MIN_ROWS). Otherwise use the row-at-a-time
@@ -39,6 +45,47 @@ pub(super) fn run_select(
         execute_op(op, engine, txn)?
     };
     Ok(ExecutionResult::Rows { columns, rows })
+}
+
+/// A vectorized-routing estimate for a plan that contains a [`HashJoin`](PhysicalOperator::HashJoin):
+/// the largest `approx_row_count` over the base-table scans reachable through the vectorizable
+/// operators. `None` when the plan has no join (its single-table estimate, if any, already routed) or
+/// no scanned base table — so this only ever *adds* a route for join plans, never changes a non-join
+/// one. The walk mirrors the operators [`try_build`](crate::vectorized) descends, so it does not
+/// over-promise a plan the vectorized path cannot build.
+fn join_scan_estimate(op: &PhysicalOperator, engine: &dyn StorageEngine) -> Option<u64> {
+    fn walk(
+        op: &PhysicalOperator,
+        engine: &dyn StorageEngine,
+        has_join: &mut bool,
+        max_rows: &mut u64,
+    ) {
+        match op {
+            PhysicalOperator::SeqScan { table, .. } => {
+                if let Ok(n) = engine.approx_row_count(table.id) {
+                    *max_rows = (*max_rows).max(n);
+                }
+            },
+            PhysicalOperator::HashJoin { left, right, .. } => {
+                *has_join = true;
+                walk(left, engine, has_join, max_rows);
+                walk(right, engine, has_join, max_rows);
+            },
+            PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Sort { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::ScalarAggregate { input, .. }
+            | PhysicalOperator::GroupAggregate { input, .. } => {
+                walk(input, engine, has_join, max_rows);
+            },
+            _ => {},
+        }
+    }
+    let mut has_join = false;
+    let mut max_rows = 0_u64;
+    walk(op, engine, &mut has_join, &mut max_rows);
+    (has_join && max_rows > 0).then_some(max_rows)
 }
 
 /// The statistics-estimated in-memory hash-aggregation state for grouping `input` by

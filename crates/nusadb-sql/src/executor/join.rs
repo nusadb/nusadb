@@ -114,7 +114,7 @@ pub(super) fn merge_join_using_columns(mut rows: Vec<Row>, pairs: &[(usize, usiz
 /// side — identical results to [`run_nested_loop_join`] for the equivalent
 /// predicate. A `NULL` key value never matches (SQL `NULL = NULL` is unknown),
 /// so such rows are treated as unmatched.
-pub(super) fn run_hash_join(
+pub(crate) fn run_hash_join(
     left_rows: &[Row],
     right_rows: &[Row],
     keys: &[HashKey],
@@ -511,7 +511,7 @@ fn join_map<K>() -> JoinMap<K> {
 /// `i64` is match-for-match equivalent to the generic atoms — with no eval call, no per-row
 /// allocation, and no enum dispatch. Measured at 1M rows (release): build 883→339 ns/row,
 /// probe 674→193 ns/row.
-pub(super) enum JoinIndex {
+pub(crate) enum JoinIndex {
     /// The universal [`key_atoms`]-keyed index.
     Generic(JoinMap<Vec<KeyAtom>>),
     /// The single-int-column fast path.
@@ -560,7 +560,7 @@ fn int_key(row: &[ast::Value], col: usize) -> Option<i64> {
 
 impl JoinIndex {
     /// Build the index over the RIGHT rows (the default build side).
-    pub(super) fn build_right(
+    pub(crate) fn build_right(
         right_rows: &[Row],
         keys: &[HashKey],
         left_width: usize,
@@ -606,7 +606,7 @@ impl JoinIndex {
     }
 
     /// Probe with a bare LEFT row (the index was built over the right side).
-    pub(super) fn probe_left(
+    pub(crate) fn probe_left(
         &self,
         keys: &[HashKey],
         left_row: &Row,
@@ -741,7 +741,7 @@ pub(super) enum KeySide {
 /// The planner (`is_hashable_key_type`) admits only types where that holds; anything else
 /// (notably `NULL`) makes the key non-matching.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) enum KeyAtom {
+pub(crate) enum KeyAtom {
     Bool(bool),
     Int(i64),
     Text(String),

@@ -2188,6 +2188,43 @@ fn vectorized_path_matches_row_path_end_to_end() {
 }
 
 #[test]
+fn vectorized_hash_join_matches_row_path_end_to_end() {
+    // With the vectorized flag on, an inner equi-join — plain, with a non-equi residual, and
+    // feeding a GROUP BY — returns exactly the row path's rows against the real engine. The
+    // columnar hash join's output multiset is bit-identical to the row-path join.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE dim (k INT NOT NULL, label TEXT)");
+    run(&engine, "CREATE TABLE fact (k INT, amount INT)");
+    run(
+        &engine,
+        "INSERT INTO dim VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
+    run(
+        &engine,
+        "INSERT INTO fact VALUES (1, 10), (1, 5), (2, 20), (2, 7), (4, 99), (NULL, 1)",
+    );
+    let queries = [
+        // Plain inner equi-join (NULL and unmatched fact keys excluded).
+        "SELECT fact.k, amount, label FROM fact JOIN dim ON fact.k = dim.k \
+         ORDER BY fact.k, amount",
+        // Equi-join with a non-equi residual (the ON's `amount > 8` conjunct).
+        "SELECT fact.k, amount, label FROM fact JOIN dim ON fact.k = dim.k AND amount > 8 \
+         ORDER BY fact.k, amount",
+        // Join feeding a GROUP BY — the join output stays columnar into the aggregate.
+        "SELECT label, SUM(amount) FROM fact JOIN dim ON fact.k = dim.k \
+         GROUP BY label ORDER BY label",
+    ];
+    for sql in queries {
+        let row_path = rows(run(&engine, sql));
+        let batch_path = {
+            let _g = nusadb_sql::vectorized::scope(true);
+            rows(run(&engine, sql))
+        };
+        assert_eq!(row_path, batch_path, "vectorized join diverged: {sql}");
+    }
+}
+
+#[test]
 fn cost_based_index_vs_seq_scan_selection() {
     // With ANALYZE stats the planner compares costs: a selective equality on an indexed
     // column takes the index; a barely-selective range that keeps most rows takes a sequential scan.

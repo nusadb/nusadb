@@ -15,6 +15,7 @@
 mod aggregate;
 mod filter;
 mod group_aggregate;
+mod hash_join;
 mod limit;
 mod parallel;
 mod project;
@@ -25,6 +26,7 @@ mod sort;
 pub use aggregate::ScalarAggregate;
 pub use filter::Filter;
 pub use group_aggregate::GroupedAggregate;
+pub use hash_join::HashJoin;
 pub use limit::Limit;
 pub use parallel::{ParallelGroupedAggregate, fold_count, parallel_scope};
 pub use project::Project;
@@ -99,8 +101,12 @@ pub(crate) fn execute(
 
 /// Translate a physical SELECT subtree into a vectorized operator tree, or `Ok(None)` if any node or
 /// expression is outside what the vectorized operators support (then the caller uses the row path).
-/// Supported: `SeqScan`, `Filter`, `Project`, `Limit`, `Sort`, `ScalarAggregate`, and
-/// `GroupAggregate` over subquery-free expressions.
+/// Supported: `SeqScan`, `Filter`, `Project`, `Limit`, `Sort`, `ScalarAggregate`,
+/// `GroupAggregate`, and `HashJoin` (inner equi-join) over subquery-free expressions.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per supported physical operator; flatter than dispatching to per-op helpers"
+)]
 fn try_build(
     op: &PhysicalOperator,
     engine: &dyn StorageEngine,
@@ -234,8 +240,53 @@ fn try_build(
             };
             Box::new(grouped)
         },
-        // Everything else (IndexScan, OneRow, joins, grouping-sets aggregation, window, DISTINCT,
-        // set-returning, recursive CTE) has no vectorized operator yet → fall back to the row path.
+        // Vectorized INNER equi-join: build side materialized in memory, probe streamed per batch,
+        // output gathered by selection vector. Scope: `Inner` + `ON` keys. A configured spill budget
+        // (row path bounds the build via a grace join — don't preempt it), a `USING`/`NATURAL` column
+        // merge, a residual the shared predicate cannot evaluate (subquery/outer-ref/set-returning),
+        // or a non-vectorizable child all fall back to the mature row-path join. Output multiset is
+        // bit-identical to `run_hash_join`.
+        PhysicalOperator::HashJoin {
+            left,
+            right,
+            keys,
+            residual,
+            kind,
+            left_width,
+            right_width: _,
+            coalesce_pairs,
+        } => {
+            if !matches!(kind, crate::ast::JoinKind::Inner) || !coalesce_pairs.is_empty() {
+                return Ok(None);
+            }
+            if crate::executor::spill_is_configured() {
+                return Ok(None);
+            }
+            if residual.as_ref().is_some_and(|r| !expr_is_vectorizable(r)) {
+                return Ok(None);
+            }
+            if !keys
+                .iter()
+                .all(|k| expr_is_vectorizable(&k.left) && expr_is_vectorizable(&k.right))
+            {
+                return Ok(None);
+            }
+            let Some(left_op) = try_build(left, engine, txn, est_scan_rows)? else {
+                return Ok(None);
+            };
+            let Some(right_op) = try_build(right, engine, txn, est_scan_rows)? else {
+                return Ok(None);
+            };
+            Box::new(HashJoin::new(
+                left_op,
+                right_op,
+                keys.clone(),
+                residual.clone(),
+                *left_width,
+            ))
+        },
+        // Everything else (IndexScan, OneRow, outer/USING joins, grouping-sets aggregation, window,
+        // DISTINCT, set-returning, recursive CTE) has no vectorized operator yet → row-path fallback.
         _ => return Ok(None),
     };
     Ok(Some(built))
