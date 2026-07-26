@@ -68,6 +68,15 @@ impl<T: PrimitiveType> PrimitiveArray<T> {
         Self { values, validity }
     }
 
+    /// Build an array directly from a dense value vector (nulls hold a placeholder) and its
+    /// already-packed validity — the constructor a per-column builder uses to avoid materializing a
+    /// `Vec<Option<T>>` intermediate. `validity` must describe exactly `values.len()` elements (a
+    /// caller-side invariant); `None` means every element is present.
+    #[must_use]
+    pub(super) const fn from_parts(values: Vec<T>, validity: Option<NullBuffer>) -> Self {
+        Self { values, validity }
+    }
+
     /// The raw value slice. Entries at null positions hold a default placeholder;
     /// use [`PrimitiveArray::get`] for null-aware reads.
     #[must_use]

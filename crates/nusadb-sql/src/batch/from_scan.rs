@@ -17,7 +17,9 @@ use nusadb_core::engine::{ColumnDef, TupleScan};
 
 use crate::ast;
 use crate::batch::bytes::StringBuilder;
-use crate::batch::{BooleanArray, Field, Float64Array, Int64Array, RecordBatch, Schema};
+use crate::batch::primitive::{PrimitiveArray, PrimitiveType};
+use crate::batch::validity::NullBufferBuilder;
+use crate::batch::{Field, RecordBatch, Schema};
 use crate::error::Error;
 use crate::executor::row;
 
@@ -168,15 +170,49 @@ impl RecordBatchScan {
     }
 }
 
-/// One column's batch accumulator (R2 stage 2). The fixed-width variants hold exactly the
-/// `Vec<Option<T>>` their typed [`Array`](crate::batch::Array) constructor takes; `Values` is the
-/// fallback through the shared value codec + [`build_column`](super::convert::columns_to_batch)
-/// tail for every other type — so the fast path and the fallback cannot disagree on the format
-/// (both parse through `executor::row`'s single set of readers).
+/// A fixed-width column accumulator that builds its dense value vector and packed validity as it
+/// goes, so a scanned batch never materializes a `Vec<Option<T>>` intermediate (16 bytes/elem for an
+/// `i64`/`f64`) nor pays the second pass `from_options` would take to split it. A null pushes the
+/// type's default placeholder into `values` and a clear bit into `nulls` — exactly what
+/// [`from_options`](PrimitiveArray::from_options)'s `split_options` produces, so the resulting array
+/// is bit-identical.
+struct PrimitiveBuilder<T: PrimitiveType> {
+    values: Vec<T>,
+    nulls: NullBufferBuilder,
+}
+
+impl<T: PrimitiveType> PrimitiveBuilder<T> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            nulls: NullBufferBuilder::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, value: T) {
+        self.values.push(value);
+        self.nulls.push(true);
+    }
+
+    fn push_null(&mut self) {
+        self.values.push(T::default());
+        self.nulls.push(false);
+    }
+
+    fn finish(self) -> PrimitiveArray<T> {
+        PrimitiveArray::from_parts(self.values, self.nulls.finish())
+    }
+}
+
+/// One column's batch accumulator (R2 stage 2). The fixed-width variants build their value vector and
+/// validity directly ([`PrimitiveBuilder`]); `Values` is the fallback through the shared value codec +
+/// [`build_column`](super::convert::columns_to_batch) tail for every other type — so the fast path and
+/// the fallback cannot disagree on the format (both parse through `executor::row`'s single set of
+/// readers).
 enum ColumnBuilder {
-    Int(Vec<Option<i64>>),
-    Float(Vec<Option<f64>>),
-    Bool(Vec<Option<bool>>),
+    Int(PrimitiveBuilder<i64>),
+    Float(PrimitiveBuilder<f64>),
+    Bool(PrimitiveBuilder<bool>),
     /// Text-family columns (R2 stage 2b): bytes append straight into the offsets+data buffers —
     /// no per-value `String`.
     Text(StringBuilder),
@@ -190,10 +226,12 @@ impl ColumnBuilder {
     fn new(ty: ColumnType, capacity: usize) -> Self {
         match ty {
             ColumnType::Int | ColumnType::SmallInt | ColumnType::BigInt => {
-                Self::Int(Vec::with_capacity(capacity))
+                Self::Int(PrimitiveBuilder::with_capacity(capacity))
             },
-            ColumnType::Float | ColumnType::Real => Self::Float(Vec::with_capacity(capacity)),
-            ColumnType::Bool => Self::Bool(Vec::with_capacity(capacity)),
+            ColumnType::Float | ColumnType::Real => {
+                Self::Float(PrimitiveBuilder::with_capacity(capacity))
+            },
+            ColumnType::Bool => Self::Bool(PrimitiveBuilder::with_capacity(capacity)),
             // VARCHAR/CHAR are stored and built identically to TEXT (`ColumnType::physical`),
             // mirroring `build_column`'s mapping exactly.
             ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_) => {
@@ -211,28 +249,28 @@ impl ColumnBuilder {
         let (present, payload) = row::field_tag(bytes, pos)?;
         if !present {
             match self {
-                Self::Int(v) => v.push(None),
-                Self::Float(v) => v.push(None),
-                Self::Bool(v) => v.push(None),
+                Self::Int(b) => b.push_null(),
+                Self::Float(b) => b.push_null(),
+                Self::Bool(b) => b.push_null(),
                 Self::Text(b) => b.append_null(),
                 Self::Values { values, .. } => values.push(ast::Value::Null),
             }
             return Ok(payload);
         }
         match self {
-            Self::Int(v) => {
+            Self::Int(b) => {
                 let (value, next) = row::read_i64_field(bytes, payload)?;
-                v.push(Some(value));
+                b.push(value);
                 Ok(next)
             },
-            Self::Float(v) => {
+            Self::Float(b) => {
                 let (value, next) = row::read_f64_field(bytes, payload)?;
-                v.push(Some(value));
+                b.push(value);
                 Ok(next)
             },
-            Self::Bool(v) => {
+            Self::Bool(b) => {
                 let (value, next) = row::read_bool_field(bytes, payload)?;
-                v.push(Some(value));
+                b.push(value);
                 Ok(next)
             },
             Self::Text(b) => {
@@ -251,9 +289,9 @@ impl ColumnBuilder {
     /// Turn the accumulator into its typed column array.
     fn finish(self) -> Result<crate::batch::ArrayRef, Error> {
         Ok(match self {
-            Self::Int(v) => Arc::new(Int64Array::from_options(v)),
-            Self::Float(v) => Arc::new(Float64Array::from_options(v)),
-            Self::Bool(v) => Arc::new(BooleanArray::from_options(v)),
+            Self::Int(b) => Arc::new(b.finish()),
+            Self::Float(b) => Arc::new(b.finish()),
+            Self::Bool(b) => Arc::new(b.finish()),
             Self::Text(b) => Arc::new(b.finish()),
             Self::Values { ty, values } => super::convert::build_column(ty, values)?,
         })
@@ -291,7 +329,7 @@ impl Iterator for RecordBatchScan {
 mod tests {
     use super::{RecordBatchScan, schema_from_columns};
     use crate::ast::Value;
-    use crate::batch::{Array, Int64Array, ListArray, StringArray};
+    use crate::batch::{Array, BooleanArray, Float64Array, Int64Array, ListArray, StringArray};
     use crate::executor::row;
     use nusadb_core::engine::{ArrayElem, ColumnDef, SharedTuple, Tid, TupleScan};
     use nusadb_core::{ColumnType, PageId, Result as CoreResult, SlotIdx};
@@ -511,5 +549,66 @@ mod tests {
         assert_eq!(lists.value_len(0), Some(2));
         assert!(lists.is_null(1));
         assert_eq!(lists.value_len(2), Some(0));
+    }
+
+    /// The incremental [`PrimitiveBuilder`] must produce an array bit-for-bit identical to the
+    /// `from_options` path it replaces — same dense values (default placeholder at nulls) and the
+    /// same packed validity (`None` when every element is present).
+    #[test]
+    fn primitive_builder_matches_from_options_bit_for_bit() {
+        use super::PrimitiveBuilder;
+        // NULL-heavy and adversarial (first null mid-column, the i64 extremes, a 0 that is *present*
+        // and must not be confused with the null placeholder).
+        let items: Vec<Option<i64>> = vec![
+            Some(10),
+            None,
+            Some(-3),
+            Some(0),
+            None,
+            None,
+            Some(i64::MIN),
+            Some(i64::MAX),
+            Some(7),
+        ];
+        let mut builder = PrimitiveBuilder::<i64>::with_capacity(items.len());
+        for item in &items {
+            match item {
+                Some(v) => builder.push(*v),
+                None => builder.push_null(),
+            }
+        }
+        assert_eq!(builder.finish(), Int64Array::from_options(items));
+
+        // All-present → no validity buffer (the `from_values` shape), still equal to `from_options`.
+        let mut all_present = PrimitiveBuilder::<i64>::with_capacity(3);
+        all_present.push(1);
+        all_present.push(2);
+        all_present.push(3);
+        assert_eq!(
+            all_present.finish(),
+            Int64Array::from_options(vec![Some(1), Some(2), Some(3)])
+        );
+
+        // The float and bool instantiations share the generic path; only `T::default()` (0.0 / false)
+        // differs, so pin those too — a present 0.0 / false must stay distinct from the null slot.
+        let floats: Vec<Option<f64>> = vec![Some(1.5), None, Some(0.0), Some(-2.5)];
+        let mut fb = PrimitiveBuilder::<f64>::with_capacity(floats.len());
+        for item in &floats {
+            match item {
+                Some(v) => fb.push(*v),
+                None => fb.push_null(),
+            }
+        }
+        assert_eq!(fb.finish(), Float64Array::from_options(floats));
+
+        let bools: Vec<Option<bool>> = vec![Some(true), None, Some(false), Some(true)];
+        let mut bb = PrimitiveBuilder::<bool>::with_capacity(bools.len());
+        for item in &bools {
+            match item {
+                Some(v) => bb.push(*v),
+                None => bb.push_null(),
+            }
+        }
+        assert_eq!(bb.finish(), BooleanArray::from_options(bools));
     }
 }
