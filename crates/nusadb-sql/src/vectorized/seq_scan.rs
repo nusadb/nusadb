@@ -14,6 +14,7 @@ use nusadb_core::{StorageEngine, TxnId};
 use crate::batch::{RecordBatch, RecordBatchScan, Schema, schema_from_columns};
 use crate::error::Error;
 use crate::vectorized::Operator;
+use nusadb_core::ColumnType;
 
 /// A sequential scan of every row of a table visible to a transaction, produced as a
 /// stream of [`RecordBatch`]es.
@@ -46,6 +47,37 @@ impl SeqScan {
         let schema = Arc::new(schema_from_columns(&table.columns));
         let scan = engine.scan(txn, table.id)?;
         Ok(Self::new(scan, schema))
+    }
+
+    /// Open a **projection-pushdown-narrowed** scan: the tuple is decoded under the table's full
+    /// layout but only the ascending `keep` ordinals become batch columns (the unkept fields are
+    /// skipped without materializing). The output schema is exactly those kept columns, in `keep`
+    /// order — the narrowed layout the planner's remapped ordinals above the scan expect. Decoding
+    /// fewer columns is the payoff where the aggregate references a strict subset of a wide table.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from opening the storage [`scan`](StorageEngine::scan).
+    pub fn open_projected(
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        table: &TableSchema,
+        keep: &[usize],
+    ) -> Result<Self, Error> {
+        let source_types: Arc<[ColumnType]> = table.columns.iter().map(|c| c.ty).collect();
+        let kept_columns: Vec<_> = keep
+            .iter()
+            .filter_map(|&i| table.columns.get(i).cloned())
+            .collect();
+        let schema = Arc::new(schema_from_columns(&kept_columns));
+        let scan = engine.scan(txn, table.id)?;
+        let batches = RecordBatchScan::with_projection(
+            scan,
+            Arc::clone(&schema),
+            source_types,
+            Arc::from(keep),
+        );
+        Ok(Self { schema, batches })
     }
 }
 

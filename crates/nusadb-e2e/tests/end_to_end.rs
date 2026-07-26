@@ -2188,6 +2188,42 @@ fn vectorized_path_matches_row_path_end_to_end() {
 }
 
 #[test]
+fn vectorized_narrowed_scan_matches_row_path() {
+    // A projection-pushdown-narrowed scan (an aggregate over a strict subset of a wide table) now
+    // vectorizes by decoding only the referenced columns. With the flag on it must return exactly the
+    // row path's rows — the narrowed columnar decode mirrors the row path's projected decode.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE wide (a INT, b INT, c INT, d TEXT, e INT)",
+    );
+    run(
+        &engine,
+        "INSERT INTO wide VALUES (1, 10, 100, 'x', 5), (1, 20, 200, 'y', 6), \
+         (2, 30, 300, 'z', 7), (2, NULL, 400, 'w', 8), (3, 50, 500, 'v', 9)",
+    );
+    let queries = [
+        // References only `c` → scan narrows to a single column.
+        "SELECT SUM(c) FROM wide",
+        // References `a` (key) and `b` (arg) → narrows to two columns; NULL in `b` exercised.
+        "SELECT a, SUM(b), COUNT(b), MIN(b), MAX(b) FROM wide GROUP BY a ORDER BY a",
+        // A filter + aggregate over a subset (`b`, `c`).
+        "SELECT SUM(c) FROM wide WHERE b > 15",
+    ];
+    for sql in queries {
+        let row_path = rows(run(&engine, sql));
+        let batch_path = {
+            let _g = nusadb_sql::vectorized::scope(true);
+            rows(run(&engine, sql))
+        };
+        assert_eq!(
+            row_path, batch_path,
+            "narrowed vectorized scan diverged: {sql}"
+        );
+    }
+}
+
+#[test]
 fn vectorized_hash_join_matches_row_path_end_to_end() {
     // With the vectorized flag on, an inner equi-join — plain, with a non-equi residual, and
     // feeding a GROUP BY — returns exactly the row path's rows against the real engine. The

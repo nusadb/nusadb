@@ -114,14 +114,16 @@ fn try_build(
     est_scan_rows: Option<u64>,
 ) -> Result<Option<Box<dyn Operator>>, Error> {
     let built: Box<dyn Operator> = match op {
-        // A projection-pushdown-narrowed scan yields rows whose layout the row path's
-        // rewritten ordinals expect; the columnar scan decodes the full table width, so fall back
-        // to the row path rather than apply the projection here.
+        // A full-width scan decodes every column; a projection-pushdown-narrowed scan decodes only
+        // the kept columns into the narrowed layout the planner's remapped ordinals above expect
+        // (mirroring the row path's `decode_projected`). Narrowing is exactly the win where an
+        // aggregate references a strict subset of a wide table (the scan-decode bottleneck).
         PhysicalOperator::SeqScan { table, columns } => {
-            if !columns.is_empty() {
-                return Ok(None);
+            if columns.is_empty() {
+                Box::new(SeqScan::open(engine, txn, table)?)
+            } else {
+                Box::new(SeqScan::open_projected(engine, txn, table, columns)?)
             }
-            Box::new(SeqScan::open(engine, txn, table)?)
         },
         PhysicalOperator::Filter { input, predicate } => {
             if !expr_is_vectorizable(predicate) {
