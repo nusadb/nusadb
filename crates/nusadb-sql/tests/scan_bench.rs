@@ -295,6 +295,26 @@ fn parallel_group_by_probe() {
         );
         assert_eq!(rows, base, "parallel != row path for `{sql}`");
     }
+
+    // Scalar aggregate, fold-during-scan vs parallel: with the parallel fold disabled, a no-GROUP-BY
+    // integer aggregate over a bare scan takes the fused decode+accumulate path (no column build).
+    // Compared against the `parallel` line above for the same query, this is the routing question for
+    // a large scalar aggregate — does one thread without the transpose beat four workers with it.
+    {
+        let scalar_sql = "SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM p";
+        let _v = nusadb_sql::vectorized::scope(true);
+        let _p = nusadb_sql::vectorized::parallel_scope(false);
+        for round in 1..=2 {
+            let t = Instant::now();
+            let rows = rows_for(scalar_sql);
+            println!(
+                "scalar fold-during-scan (round {round}): {} rows in {:?} ({:.0} ns/row)",
+                rows.len(),
+                t.elapsed(),
+                t.elapsed().as_nanos() as f64 / N as f64
+            );
+        }
+    }
 }
 
 /// Split the per-statement cost of `SELECT 1` (the wire round-trip floor) into
