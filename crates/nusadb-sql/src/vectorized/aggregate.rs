@@ -159,6 +159,11 @@ fn simd_aggregate(
     if call.distinct || call.filter.is_some() || call.fraction.is_some() {
         return None;
     }
+    // A row-value COUNT folds a field tuple and also carries no `arg`; it is not COUNT(*) and has
+    // no kernel, so it belongs on the row path.
+    if !call.row_args.is_empty() {
+        return None;
+    }
     // COUNT(*) — every row, NULLs included.
     if matches!(call.func, F::Count) && call.arg.is_none() {
         let n: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -249,6 +254,12 @@ pub(super) fn columnar_call_shape(call: &AggregateCall) -> Option<ColumnarShape>
     if matches!(call.func, F::Grouping | F::ArrayAgg | F::JsonAgg) || call.func.is_two_arg() {
         return None;
     }
+    // A row-value COUNT reads several columns per row, so it has no single-column shape — and it
+    // must not fall into the argument-less arm below, which would count rows per group instead of
+    // composites.
+    if !call.row_args.is_empty() {
+        return None;
+    }
     let Some(arg) = call.arg.as_ref() else {
         return matches!(call.func, F::Count).then_some(ColumnarShape::CountStar);
     };
@@ -333,7 +344,7 @@ impl Operator for ScalarAggregate {
 
 #[cfg(test)]
 mod tests {
-    use super::ScalarAggregate;
+    use super::{ColumnarShape, ScalarAggregate, columnar_call_shape, simd_aggregate};
     use crate::ast;
     use crate::batch::{Float64Array, Int64Array};
     use crate::executor::row;
@@ -397,6 +408,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }
@@ -416,6 +428,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }
@@ -453,6 +466,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }
@@ -758,5 +772,34 @@ mod tests {
             .collect();
         let expected = crate::executor::agg::fold_aggregates(&[sum_call()], rows.iter()).unwrap();
         assert_eq!(simd_out, expected);
+    }
+
+    /// A row-value `COUNT` carries no `arg`, which is also how `COUNT(*)` looks. Both columnar
+    /// entry points must recognise the difference and decline it: claiming it as `COUNT(*)` would
+    /// tally rows instead of distinct composites — a wrong answer that looks like a plausible one.
+    #[test]
+    fn columnar_paths_decline_a_row_value_count() {
+        use ast::AggregateFunc::Count;
+        let field = |idx| crate::planner::TypedExpr {
+            kind: crate::planner::TypedExprKind::Column(idx),
+            ty: ColumnType::Int,
+        };
+        let mut composite = call(Count, ColumnType::Int);
+        composite.arg = None;
+        composite.row_args = vec![field(0), field(1)];
+        composite.distinct = true;
+
+        assert!(columnar_call_shape(&composite).is_none());
+        assert!(simd_aggregate(&composite, &[]).is_none());
+
+        // The same call without the fields is a real COUNT(*), which both paths still claim.
+        let mut count_star = composite;
+        count_star.row_args = Vec::new();
+        count_star.distinct = false;
+        assert!(matches!(
+            columnar_call_shape(&count_star),
+            Some(ColumnarShape::CountStar)
+        ));
+        assert!(simd_aggregate(&count_star, &[]).is_some());
     }
 }

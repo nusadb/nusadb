@@ -641,9 +641,14 @@ where
 
 /// Whether `call` is a plain `COUNT(*)` — the count-every-row aggregate with no argument, no
 /// `DISTINCT`, and no `FILTER`. Such a call needs only the row count, not any row's contents.
+///
+/// A row-value `COUNT` also carries no `arg`, so it is excluded explicitly: counting input rows
+/// would be a wrong answer the moment its fields are folded (`DISTINCT`), and a right one only by
+/// accident otherwise.
 const fn is_plain_count_star(call: &AggregateCall) -> bool {
     matches!(call.func, ast::AggregateFunc::Count)
         && call.arg.is_none()
+        && call.row_args.is_empty()
         && !call.distinct
         && call.filter.is_none()
 }
@@ -746,6 +751,9 @@ pub(super) fn sliding_window_aggregate(
 ) -> Result<bool, Error> {
     use crate::ast::AggregateFunc as F;
     let kind = match call.func {
+        // A row-value COUNT has no `arg` to slide over and is not a COUNT(*); it has no sliding
+        // form, so the caller keeps the general per-frame fold.
+        F::Count if !call.row_args.is_empty() => return Ok(false),
         F::Count if call.arg.is_none() => SlideKind::CountStar,
         F::Count => SlideKind::CountExpr,
         F::Min => SlideKind::Min,
@@ -1168,6 +1176,24 @@ pub(super) fn accumulate_row(
                 continue;
             }
             match call.func {
+                // COUNT over a row value: fold the fields as one composite. A row constructor
+                // always produces a value, so — unlike a scalar argument — no row is skipped;
+                // what DISTINCT dedupes is the field tuple.
+                F::Count if !call.row_args.is_empty() => {
+                    if call.distinct {
+                        let value = composite_key(&call.row_args, row)?;
+                        fold_value(acc, call, value, row)?;
+                    } else {
+                        // Every row counts, so the tuple would be built only to be dropped. The
+                        // fields are still evaluated: a failing one is the query's error whether
+                        // or not the value is wanted.
+                        for field in &call.row_args {
+                            eval_arg(field, row)?;
+                        }
+                        acc.count += 1;
+                        acc.any_seen = true;
+                    }
+                },
                 F::Count if call.arg.is_none() => {
                     acc.count += 1;
                     acc.any_seen = true;
@@ -1415,6 +1441,25 @@ pub(super) fn value_as_f64(v: &ast::Value) -> f64 {
         ast::Value::Numeric(d) => d.to_f64(),
         _ => 0.0,
     }
+}
+
+/// Evaluate a row-value `COUNT`'s fields into the composite the accumulator folds.
+///
+/// The tuple rides in an `Array` because that is the one existing value shape holding a value
+/// list, and both [`distinct_hash`] and [`eval::compare`] already walk it element-wise — which is
+/// all a composite needs to dedupe. It is never stored, encoded, or returned: `COUNT` yields a
+/// tally, so this value dies inside [`Acc::distinct_seen`]. Fields of unlike types are fine here
+/// (`compare` orders across variants by rank) even though a user-visible `ARRAY[…]` would demand
+/// one element type.
+///
+/// # Errors
+/// Propagates field evaluation errors.
+fn composite_key(fields: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
+    let mut values = Vec::with_capacity(fields.len());
+    for field in fields {
+        values.push(eval_arg(field, row)?);
+    }
+    Ok(ast::Value::Array(values))
 }
 
 /// A bucket hash for `DISTINCT` dedup that is consistent with [`eval::compare`]: two values that
@@ -1776,6 +1821,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }

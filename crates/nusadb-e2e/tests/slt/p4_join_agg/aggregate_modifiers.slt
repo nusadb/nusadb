@@ -143,3 +143,37 @@ SELECT grp, jsonb_agg(v ORDER BY v) FROM m WHERE v IS NOT NULL GROUP BY grp
 ----
 a  [10, 10, 20]
 b  [30, 40, 40]
+
+# --- COUNT over a row value: counts field tuples, not rows ---
+# (grp, v) pairs in `m`: (a,10) (a,10) (a,20) (a,NULL) (b,30) (b,40) (b,40)
+# → 5 distinct pairs, while `m` has 7 rows, 2 distinct grp and 4 distinct v.
+query I
+SELECT count(DISTINCT (grp, v)) FROM m
+----
+5
+
+# The ROW(...) spelling is the same call.
+query I
+SELECT count(DISTINCT ROW(grp, v)) FROM m
+----
+5
+
+# Same answer asked without the composite aggregate.
+query I
+SELECT count(*) FROM (SELECT DISTINCT grp, v FROM m) s
+----
+5
+
+# A row constructor is never NULL, so without DISTINCT every row counts — including the row
+# whose `v` is NULL and which `count(v)` skips.
+query II
+SELECT count((grp, v)), count(v) FROM m
+----
+7  6
+
+# Per group.
+query TI rowsort
+SELECT grp, count(DISTINCT (grp, v)) FROM m GROUP BY grp
+----
+a  3
+b  2

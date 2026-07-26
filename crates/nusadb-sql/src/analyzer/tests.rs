@@ -2563,3 +2563,39 @@ fn create_plain_view_column_list_arity_must_match_the_body() {
         Err(Error::ArityMismatch { .. })
     ));
 }
+
+/// `COUNT` over a row value resolves as a composite tally: `Int` result, the fields carried in
+/// `row_args` (not `arg`), for the bare-tuple and `ROW(...)` spellings alike.
+#[test]
+fn count_over_a_row_value_carries_its_fields() {
+    for sql in [
+        "SELECT count(DISTINCT (id, name)) FROM users",
+        "SELECT count(DISTINCT ROW(id, name)) FROM users",
+        "SELECT count((id, name)) FROM users",
+    ] {
+        let LogicalPlan::Select(p) = plan(sql, &catalog()).unwrap() else {
+            panic!("expected Select plan for `{sql}`");
+        };
+        let call = &p.aggregates[0];
+        assert_eq!(call.result_ty, ColumnType::Int, "for `{sql}`");
+        assert_eq!(call.row_args.len(), 2, "for `{sql}`");
+        assert!(call.arg.is_none(), "for `{sql}`");
+        assert_eq!(call.distinct, sql.contains("DISTINCT"), "for `{sql}`");
+    }
+}
+
+/// A row value stays unsupported for every aggregate that would need a composite *value* (there is
+/// no composite type to sum, order, or collect) — only COUNT's tally has a path.
+#[test]
+fn row_value_is_rejected_for_aggregates_other_than_count() {
+    for sql in [
+        "SELECT max((id, name)) FROM users",
+        "SELECT array_agg((id, name)) FROM users",
+        "SELECT sum((id, age)) FROM users",
+    ] {
+        assert!(
+            matches!(plan(sql, &catalog()), Err(Error::Unsupported(_))),
+            "expected `{sql}` to be rejected",
+        );
+    }
+}

@@ -412,6 +412,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }

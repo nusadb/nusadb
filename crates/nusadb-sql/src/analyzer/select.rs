@@ -2134,6 +2134,7 @@ fn rebase_grouping_call(
         separator: None,
         arg2: None,
         order_by: Vec::new(),
+        row_args: Vec::new(),
         grouping_args,
     });
     // The ref is relative to the aggregate sink; shift it past the leading key columns, exactly as

@@ -8194,3 +8194,121 @@ fn p0_4_numeric_value_through_vectorized_float_projection() {
         );
     }
 }
+
+#[test]
+fn count_over_a_row_value_counts_composites() {
+    // `COUNT(DISTINCT (a, b))` counts distinct field tuples, not rows and not either column
+    // alone. Columns sit either side of unread padding so projection pushdown has to narrow the
+    // scan and remap the composite's ordinals — reading a stale ordinal would score a different,
+    // silently plausible answer.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (id INT NOT NULL, pad TEXT, a INT, filler TEXT, b TEXT)",
+    );
+    run(
+        &engine,
+        "INSERT INTO t VALUES \
+         (1, 'x', 1, 'y', 'p'), \
+         (2, 'x', 1, 'y', 'p'), \
+         (3, 'x', 1, 'y', 'q'), \
+         (4, 'x', 2, 'y', 'p'), \
+         (5, 'x', 2, 'y', NULL), \
+         (6, 'x', 2, 'y', NULL), \
+         (7, 'x', NULL, 'y', NULL)",
+    );
+
+    // Pairs: (1,p) (1,q) (2,p) (2,NULL) (NULL,NULL) = 5 distinct, while either column alone has
+    // 2 and the table has 7 rows — no wrong reading coincides with the right answer.
+    let counts = rows(run(
+        &engine,
+        "SELECT count(DISTINCT (a, b)), count(DISTINCT a), count(DISTINCT b), count(*) FROM t",
+    ));
+    assert_eq!(
+        counts,
+        vec![vec![
+            Value::Int(5),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(7)
+        ]]
+    );
+
+    // Cross-check against the same question asked without the composite aggregate.
+    let oracle = rows(run(
+        &engine,
+        "SELECT count(*) FROM (SELECT DISTINCT a, b FROM t) s",
+    ));
+    assert_eq!(oracle, vec![vec![Value::Int(5)]]);
+
+    // The `ROW(...)` spelling is the same call.
+    assert_eq!(
+        rows(run(&engine, "SELECT count(DISTINCT ROW(a, b)) FROM t")),
+        vec![vec![Value::Int(5)]]
+    );
+
+    // Without DISTINCT a row constructor is never NULL, so every row counts — including the
+    // all-NULL tuple that `count(b)` skips.
+    assert_eq!(
+        rows(run(&engine, "SELECT count((a, b)) FROM t")),
+        vec![vec![Value::Int(7)]]
+    );
+
+    // Per group, through the grouped path (the columnar shape must decline this call rather than
+    // read it as COUNT(*), which would answer 3/3/1 here).
+    let grouped = rows(run(
+        &engine,
+        "SELECT a, count(DISTINCT (a, b)) FROM t GROUP BY a ORDER BY a",
+    ));
+    assert_eq!(
+        grouped,
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Null, Value::Int(1)],
+        ]
+    );
+
+    // Three fields, and an expression as a field.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT count(DISTINCT (a, b, id)), count(DISTINCT (a, upper(b))) FROM t",
+        )),
+        vec![vec![Value::Int(7), Value::Int(5)]]
+    );
+}
+
+#[test]
+fn correlated_subquery_sees_an_outer_column_inside_a_row_value_count() {
+    // The outer reference sits in a COUNT's row field, nowhere else. If the correlation walker
+    // misses it the subquery is run once and its answer reused for every outer row — the counts
+    // below are chosen so that mistake shows up (1, 2 correct vs 1, 1 reused).
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE outer_t (id INT NOT NULL)");
+    run(&engine, "CREATE TABLE inner_t (b INT NOT NULL)");
+    run(&engine, "INSERT INTO outer_t VALUES (5), (15)");
+    run(&engine, "INSERT INTO inner_t VALUES (10), (20)");
+
+    // Baseline: the same correlation carried in a plain scalar argument.
+    let via_arg = rows(run(
+        &engine,
+        "SELECT id, (SELECT count(DISTINCT CASE WHEN b > outer_t.id THEN 1 ELSE 0 END) \
+         FROM inner_t) FROM outer_t ORDER BY id",
+    ));
+    // Carried in a row field instead — must agree.
+    let via_row = rows(run(
+        &engine,
+        "SELECT id, (SELECT count(DISTINCT (CASE WHEN b > outer_t.id THEN 1 ELSE 0 END, 0)) \
+         FROM inner_t) FROM outer_t ORDER BY id",
+    ));
+
+    assert_eq!(
+        via_arg,
+        vec![
+            vec![Value::Int(5), Value::Int(1)],
+            vec![Value::Int(15), Value::Int(2)],
+        ]
+    );
+    assert_eq!(via_row, via_arg);
+}

@@ -196,9 +196,9 @@ fn find_aggregate_mut(op: &mut PhysicalOperator) -> Option<&mut PhysicalOperator
     }
 }
 
-/// Visit every input-space expression an aggregate operator owns: each call's argument(s) and
-/// `FILTER`, the in-aggregate `ORDER BY` keys, and the group keys. (`grouping_args` are indices
-/// into `group_keys`, not table ordinals — nothing to visit.)
+/// Visit every input-space expression an aggregate operator owns: each call's argument(s), the
+/// fields of a row-value `COUNT`, and `FILTER`, the in-aggregate `ORDER BY` keys, and the group
+/// keys. (`grouping_args` are indices into `group_keys`, not table ordinals — nothing to visit.)
 fn for_each_aggregate_expr(agg: &mut PhysicalOperator, f: &mut dyn FnMut(&mut TypedExpr)) {
     use PhysicalOperator as O;
     let (calls, group_keys) = match agg {
@@ -217,6 +217,11 @@ fn for_each_aggregate_expr(agg: &mut PhysicalOperator, f: &mut dyn FnMut(&mut Ty
         }
         if let Some(arg2) = &mut call.arg2 {
             f(arg2);
+        }
+        // A row-value COUNT reads its columns through these, not through `arg` — they need the
+        // same remapping, or the fold would read whatever now sits at the pre-pushdown ordinal.
+        for field in &mut call.row_args {
+            f(field);
         }
         if let Some(filter) = &mut call.filter {
             f(filter);
@@ -667,6 +672,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }

@@ -503,8 +503,29 @@ pub(super) fn analyze_expr_agg(
                     },
                     None => None,
                 };
-                let (typed_arg, result_ty) =
-                    analyze_aggregate(*func, arg.as_deref(), scope, catalog)?;
+                // A row value as the argument — `COUNT((a, b))`, `COUNT(DISTINCT ROW(a, b))` —
+                // folds its fields as one composite. Only COUNT has that path: its result is a
+                // tally, so it needs no composite type, no composite storage, and no composite
+                // comparison. Every other aggregate keeps rejecting a row value.
+                let row_args = match (*func, arg.as_deref()) {
+                    (ast::AggregateFunc::Count, Some(ast::Expr::Row(items))) => {
+                        if items.is_empty() {
+                            return Err(Error::Unsupported(
+                                "COUNT() over an empty row value has nothing to count".to_owned(),
+                            ));
+                        }
+                        items
+                            .iter()
+                            .map(|item| analyze_expr(item, scope, catalog, None))
+                            .collect::<Result<Vec<_>, _>>()?
+                    },
+                    _ => Vec::new(),
+                };
+                let (typed_arg, result_ty) = if row_args.is_empty() {
+                    analyze_aggregate(*func, arg.as_deref(), scope, catalog)?
+                } else {
+                    (None, ColumnType::Int)
+                };
                 // `ORDER BY` keys reference source rows (the pre-aggregation scope), not aggregates,
                 // so they are resolved against `scope` with no aggregate sink.
                 let mut order_keys = Vec::with_capacity(order_by.len());
@@ -527,6 +548,7 @@ pub(super) fn analyze_expr_agg(
                     separator,
                     arg2: typed_arg2,
                     order_by: order_keys,
+                    row_args,
                     grouping_args: Vec::new(),
                 });
                 Ok(TypedExpr {
@@ -2136,6 +2158,7 @@ fn analyze_within_group(
         separator: None,
         arg2: None,
         order_by: Vec::new(),
+        row_args: Vec::new(),
         grouping_args: Vec::new(),
     });
     Ok(TypedExpr {
@@ -2178,6 +2201,7 @@ fn analyze_percentile_array(
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         });
         refs.push(TypedExpr {

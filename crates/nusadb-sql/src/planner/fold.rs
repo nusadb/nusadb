@@ -52,6 +52,9 @@ fn fold_aggregate(agg: &mut AggregateCall) {
     if let Some(filter) = agg.filter.take() {
         agg.filter = Some(fold_expr(filter));
     }
+    for field in &mut agg.row_args {
+        fold_in_place(field);
+    }
 }
 
 fn fold_window(window: &mut WindowExpr) {

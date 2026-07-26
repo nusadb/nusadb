@@ -189,8 +189,9 @@ fn try_build(
             Box::new(Limit::new(child, offset, limit))
         },
         // Scalar aggregate (no GROUP BY): SIMD-reduces eligible COUNT/SUM/MIN/MAX over a plain
-        // column and folds the rest on the row path. Every call's argument and
-        // FILTER must be subquery-free so that row-path fallback can evaluate them.
+        // column and folds the rest on the row path. Every per-row expression a call owns — its
+        // argument, a row value's fields, and FILTER — must be subquery-free so that the row-path
+        // fallback can evaluate them.
         PhysicalOperator::ScalarAggregate { input, calls } => {
             // A scalar aggregate over a (filtered) table scan folds on parallel
             // workers under the same gates as the grouped form — one merged group, one output
@@ -214,6 +215,7 @@ fn try_build(
             let exprs_ok = calls.iter().all(|c| {
                 c.arg.as_ref().is_none_or(expr_is_vectorizable)
                     && c.filter.as_ref().is_none_or(expr_is_vectorizable)
+                    && c.row_args.iter().all(expr_is_vectorizable)
             });
             if !exprs_ok {
                 return Ok(None);

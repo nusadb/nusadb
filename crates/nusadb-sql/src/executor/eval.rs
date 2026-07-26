@@ -3396,9 +3396,11 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         // BYTEA orders lexicographically by raw byte.
         (ast::Value::Bytes(a), ast::Value::Bytes(b)) => a.cmp(b),
         (Interval(a), Interval(b)) => a.compare(b),
-        // Arrays order lexicographically by element, then by length. Elements are
-        // homogeneous (the column's element type), so element-wise `compare` is well-defined; a
-        // cross-type element pair falls to the type-rank arm below but cannot occur here.
+        // Arrays order lexicographically by element, then by length. A user-visible array is
+        // homogeneous (the column's element type), so element-wise `compare` is well-defined
+        // there; a row-value `COUNT`'s internal composite key is not, and a cross-type element
+        // pair reaches the type-rank arm below — which is why this must stay a full `compare`
+        // recursion rather than a same-variant shortcut.
         (Array(a), Array(b)) => a
             .iter()
             .zip(b)

@@ -1080,6 +1080,10 @@ fn plan_has_outer_column(plan: &crate::planner::SelectPlan) -> bool {
         .chain(plan.order_by.iter().map(|k| &k.expr))
         .chain(plan.joins.iter().map(|j| &j.on))
         .chain(plan.aggregates.iter().filter_map(|a| a.arg.as_ref()))
+        // A row-value COUNT reads its columns through `row_args`; missing them here would call a
+        // correlated subquery uncorrelated, evaluate it once, and reuse that answer for every
+        // outer row.
+        .chain(plan.aggregates.iter().flat_map(|a| a.row_args.iter()))
         .chain(plan.aggregates.iter().filter_map(|a| a.filter.as_ref()))
         .chain(plan.windows.iter().flat_map(|w| w.args.iter()))
         .chain(plan.windows.iter().flat_map(|w| w.partition.iter()))
@@ -3067,6 +3071,7 @@ pub(super) fn compute_window(rows: &[Row], window: &WindowExpr) -> Result<Vec<as
                     separator: None,
                     arg2: None,
                     order_by: Vec::new(),
+                    row_args: Vec::new(),
                     grouping_args: Vec::new(),
                 };
                 assign_window_aggregate(&ordered, rows, &call, window, &mut result)?;

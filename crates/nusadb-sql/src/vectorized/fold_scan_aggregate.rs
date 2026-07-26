@@ -73,6 +73,13 @@ fn classify(call: &AggregateCall, columns: &[usize], source_width: usize) -> Opt
     {
         return None;
     }
+    // A row-value COUNT carries no `arg` either, but it is not COUNT(*): its fields are evaluated
+    // per row, so folding it as a bare tally would swallow a field's error (`count((a, 1/0))`
+    // raises on the row path) and would bake in the "a row value is never NULL" rule this fold
+    // knows nothing about.
+    if !call.row_args.is_empty() {
+        return None;
+    }
     // `COUNT(*)` — every row, no argument.
     if matches!(call.func, F::Count) && call.arg.is_none() {
         return Some(ScanFold::CountStar);
@@ -298,7 +305,7 @@ impl Operator for FoldScanAggregate {
 
 #[cfg(test)]
 mod tests {
-    use super::FoldScanAggregate;
+    use super::{FoldScanAggregate, ScanFold, classify};
     use crate::ast;
     use crate::executor::agg::fold_aggregates;
     use crate::executor::row::{self, Row};
@@ -359,6 +366,7 @@ mod tests {
             separator: None,
             arg2: None,
             order_by: Vec::new(),
+            row_args: Vec::new(),
             grouping_args: Vec::new(),
         }
     }
@@ -471,5 +479,31 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A row-value `COUNT` looks like `COUNT(*)` (no `arg`) but is not one: the fused fold has no
+    /// way to evaluate its fields, so it must decline rather than tally rows — which would drop a
+    /// field's evaluation error and silently disagree with the row path.
+    #[test]
+    fn declines_a_row_value_count() {
+        use ast::AggregateFunc::Count;
+        let int = ColumnType::Int;
+        let mut composite = call(Count, None, int, int);
+        composite.row_args = vec![
+            TypedExpr {
+                kind: TypedExprKind::Column(0),
+                ty: int,
+            },
+            TypedExpr {
+                kind: TypedExprKind::Column(1),
+                ty: int,
+            },
+        ];
+        assert!(classify(&composite, &[], 2).is_none());
+        // The same call without the fields is a real COUNT(*), still claimed.
+        assert!(matches!(
+            classify(&call(Count, None, int, int), &[], 2),
+            Some(ScanFold::CountStar)
+        ));
     }
 }

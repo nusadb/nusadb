@@ -1705,6 +1705,17 @@ pub struct AggregateCall {
     /// applies to the collected values before producing the result. Only `ARRAY_AGG` / `STRING_AGG`
     /// populate this; empty for every other aggregate (and when the clause is absent).
     pub order_by: Vec<OrderByKey>,
+    /// The field expressions of a row-value `COUNT` argument — `COUNT([DISTINCT] (a, b, …))` and
+    /// its `ROW(a, b, …)` spelling — evaluated per row and folded as one composite. Empty for
+    /// every other call, and non-empty only for `COUNT`, whose result does not depend on the
+    /// argument's type (no other aggregate has a composite execution path).
+    ///
+    /// When this is non-empty [`arg`](Self::arg) is `None`, because a composite has no single
+    /// scalar expression to carry there. That combination would otherwise read as `COUNT(*)`, so
+    /// every `COUNT(*)` fast path tests this field before claiming a call: an unaware path would
+    /// count input rows instead of composites. A composite call therefore always takes the
+    /// general fold.
+    pub row_args: Vec<TypedExpr>,
     /// For the synthetic `GROUPING(...)` call ([`ast::AggregateFunc::Grouping`]): the indices
     /// into the query's `group_keys` that the `GROUPING` arguments name, leftmost = most-significant
     /// bit. The executor emits, per super-aggregate row, a bitmask whose bit is `1` when that key was
