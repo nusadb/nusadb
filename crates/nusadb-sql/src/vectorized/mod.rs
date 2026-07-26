@@ -240,12 +240,12 @@ fn try_build(
             };
             Box::new(grouped)
         },
-        // Vectorized INNER equi-join: build side materialized in memory, probe streamed per batch,
-        // output gathered by selection vector. Scope: `Inner` + `ON` keys. A configured spill budget
-        // (row path bounds the build via a grace join — don't preempt it), a `USING`/`NATURAL` column
-        // merge, a residual the shared predicate cannot evaluate (subquery/outer-ref/set-returning),
-        // or a non-vectorizable child all fall back to the mature row-path join. Output multiset is
-        // bit-identical to `run_hash_join`.
+        // Vectorized equi-join (INNER/LEFT/RIGHT/FULL): build side materialized in memory, probe
+        // streamed per batch, output gathered by selection vector (outer rows NULL-padded). Scope:
+        // `ON` keys. A configured spill budget (row path bounds the build via a grace join — don't
+        // preempt it), a `USING`/`NATURAL` column merge, a residual the shared predicate cannot
+        // evaluate (subquery/outer-ref/set-returning), or a non-vectorizable child all fall back to the
+        // mature row-path join. Output multiset is bit-identical to `run_hash_join`.
         PhysicalOperator::HashJoin {
             left,
             right,
@@ -256,10 +256,7 @@ fn try_build(
             right_width: _,
             coalesce_pairs,
         } => {
-            if !matches!(kind, crate::ast::JoinKind::Inner) || !coalesce_pairs.is_empty() {
-                return Ok(None);
-            }
-            if crate::executor::spill_is_configured() {
+            if !coalesce_pairs.is_empty() || crate::executor::spill_is_configured() {
                 return Ok(None);
             }
             if residual.as_ref().is_some_and(|r| !expr_is_vectorizable(r)) {
@@ -283,6 +280,7 @@ fn try_build(
                 keys.clone(),
                 residual.clone(),
                 *left_width,
+                *kind,
             ))
         },
         // Everything else (IndexScan, OneRow, outer/USING joins, grouping-sets aggregation, window,

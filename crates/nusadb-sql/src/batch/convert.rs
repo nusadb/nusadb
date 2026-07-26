@@ -208,7 +208,7 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
 /// Build the column array for `ty` from one batch's worth of values (one entry per row, in
 /// row order). `Null` becomes a null slot; a present value whose runtime type does not
 /// match `ty` is a defensive [`Error::TypeMismatch`].
-pub(super) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<ArrayRef, Error> {
+pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<ArrayRef, Error> {
     let array: ArrayRef = match ty {
         ColumnType::Bool => Arc::new(BooleanArray::from_options(collect(
             values,

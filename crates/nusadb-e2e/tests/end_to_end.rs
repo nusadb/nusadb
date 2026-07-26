@@ -2213,6 +2213,19 @@ fn vectorized_hash_join_matches_row_path_end_to_end() {
         // Join feeding a GROUP BY — the join output stays columnar into the aggregate.
         "SELECT label, SUM(amount) FROM fact JOIN dim ON fact.k = dim.k \
          GROUP BY label ORDER BY label",
+        // LEFT join: unmatched fact rows (k=4, k=NULL) kept with a NULL label.
+        "SELECT fact.k, amount, label FROM fact LEFT JOIN dim ON fact.k = dim.k \
+         ORDER BY fact.k NULLS FIRST, amount, label",
+        // RIGHT join: the unmatched dim row (k=3) kept with NULL fact columns.
+        "SELECT fact.k, amount, label FROM fact RIGHT JOIN dim ON fact.k = dim.k \
+         ORDER BY fact.k NULLS FIRST, amount, label",
+        // FULL join: unmatched rows from both sides.
+        "SELECT fact.k, amount, label FROM fact FULL JOIN dim ON fact.k = dim.k \
+         ORDER BY fact.k NULLS FIRST, amount, label",
+        // LEFT join with a residual: a fact row whose only match fails `amount > 8` still surfaces
+        // as an unmatched (NULL-label) row.
+        "SELECT fact.k, amount, label FROM fact LEFT JOIN dim ON fact.k = dim.k AND amount > 8 \
+         ORDER BY fact.k NULLS FIRST, amount, label",
     ];
     for sql in queries {
         let row_path = rows(run(&engine, sql));
