@@ -2436,6 +2436,38 @@ fn sum_bigint_promotes_to_exact_numeric() {
 }
 
 #[test]
+fn vectorized_scan_over_declared_metadata_types() {
+    // A column whose declared type differs from its physical type only as DDL metadata — BIGINT /
+    // SMALLINT (physical Int64), VARCHAR(n) / CHAR(n) (physical text) — must flow through the
+    // vectorized batch path, which materializes physical arrays. The batch result matches the row
+    // path across a projection, a filter, and a GROUP BY that all touch those columns.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE m (big BIGINT, small SMALLINT, name VARCHAR(10), code CHAR(4))",
+    );
+    run(
+        &engine,
+        "INSERT INTO m VALUES (5000000000, 10, 'alpha', 'aa'), \
+         (5000000000, 20, 'beta', 'bb'), (9000000000, 10, 'alpha', 'aa')",
+    );
+
+    for sql in [
+        "SELECT big, small, name, code FROM m ORDER BY big, small",
+        "SELECT name, code FROM m WHERE big > 6000000000",
+        "SELECT big, COUNT(*), SUM(small) FROM m GROUP BY big ORDER BY big",
+        "SELECT name, COUNT(*) FROM m GROUP BY name ORDER BY name",
+    ] {
+        let row_path = rows(run(&engine, sql));
+        let batch_path = {
+            let _g = nusadb_sql::vectorized::scope(true);
+            rows(run(&engine, sql))
+        };
+        assert_eq!(row_path, batch_path, "batch != row for {sql}");
+    }
+}
+
+#[test]
 fn cost_based_index_vs_seq_scan_selection() {
     // With ANALYZE stats the planner compares costs: a selective equality on an indexed
     // column takes the index; a barely-selective range that keeps most rows takes a sequential scan.

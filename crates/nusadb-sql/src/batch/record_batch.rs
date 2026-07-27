@@ -46,7 +46,11 @@ impl RecordBatch {
         let row_count = columns.first().map_or(0, |c| c.len());
 
         for (column, field) in columns.iter().zip(schema.fields()) {
-            if column.data_type() != field.data_type() {
+            // A column array is always the *physical* array (a `BIGINT`/`SMALLINT` field holds an
+            // `Int64` array, a `VARCHAR(n)`/`CHAR(n)` field a text array, …), so match by physical
+            // type: the declared/physical distinction is DDL metadata, not a batch-shape error, but
+            // a genuine wrong-type array (an `Int64` in a text field) still differs and is caught.
+            if column.data_type().physical() != field.data_type().physical() {
                 return Err(Error::TypeMismatch {
                     context: format!("record batch column `{}`", field.name()),
                     expected: field.data_type(),
@@ -203,6 +207,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn try_new_accepts_physical_equivalent_declared_types() {
+        // A `BIGINT`/`SMALLINT` field holds a physical `Int64` array, and a `VARCHAR`/`CHAR` field a
+        // physical text array — the declared/physical difference is DDL metadata, not a mismatch.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("big", ColumnType::BigInt, true),
+            Field::new("small", ColumnType::SmallInt, true),
+            Field::new("name", ColumnType::VarChar(10), true),
+            Field::new("code", ColumnType::Char(4), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                col(ColumnType::Int, 2),
+                col(ColumnType::Int, 2),
+                col(ColumnType::Text, 2),
+                col(ColumnType::Text, 2),
+            ],
+        )
+        .expect("physical-equivalent declared types line up");
     }
 
     #[test]

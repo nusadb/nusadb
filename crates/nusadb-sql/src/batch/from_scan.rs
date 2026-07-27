@@ -26,7 +26,10 @@ use crate::executor::row;
 /// Build the columnar [`Schema`] for a table from its catalog column definitions.
 ///
 /// The batch produced by a [`RecordBatchScan`] over that table has exactly these fields,
-/// in declaration order.
+/// in declaration order. Fields keep the declared type (`BIGINT`, `VARCHAR(n)`, …); the arrays a
+/// batch holds are always physical, and [`RecordBatch::try_new`] matches the two by *physical*
+/// type, so a declared type that only differs from its physical form as metadata (a 64-bit
+/// `BIGINT` array is the same `Int64` as `INT`) lines up.
 #[must_use]
 pub fn schema_from_columns(columns: &[ColumnDef]) -> Schema {
     Schema::new(
