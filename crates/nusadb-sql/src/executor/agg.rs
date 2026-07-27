@@ -345,8 +345,15 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
             if !acc.any_seen {
                 ast::Value::Null
             } else if matches!(call.result_ty, ColumnType::Numeric { .. }) {
-                // SUM(NUMERIC) is exact.
-                ast::Value::Numeric(acc.dec_sum.ok_or_else(numeric_overflow)?)
+                // A NUMERIC-typed SUM is exact. SUM(BIGINT) promotes to NUMERIC so a total past the
+                // 64-bit range is the exact large number, not an overflow error; it reads the exact
+                // i128 integer accumulator (like `AVG(int)`). SUM(NUMERIC) reads the exact decimal
+                // accumulator.
+                if call.arg.as_ref().is_some_and(|a| is_integer(a.ty)) {
+                    ast::Value::Numeric(crate::numeric::Decimal::from_i128(acc.int_sum))
+                } else {
+                    ast::Value::Numeric(acc.dec_sum.ok_or_else(numeric_overflow)?)
+                }
             } else if is_integer(call.result_ty) {
                 // SUM over any integer width returns an integer from the exact i128 accumulator;
                 // overflowing i64 is an error rather than a silent f64-truncated wrong answer.

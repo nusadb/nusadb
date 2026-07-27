@@ -2487,21 +2487,28 @@ pub(super) fn analyze_aggregate(
                     found: typed.ty,
                 });
             }
-            // SUM keeps the argument type (Int->Int, Float->Float, Numeric->Numeric). AVG over an
-            // exact type (Int / NUMERIC) is exact NUMERIC — `AVG(int)` must not lose precision in
-            // f64 (Temuan-4); only AVG of FLOAT stays FLOAT.
+            // SUM keeps the argument type (Int->Int, Float->Float, Numeric->Numeric), except
+            // SUM(BIGINT) promotes to NUMERIC: a total over 64-bit values can exceed the 64-bit
+            // range, and NUMERIC holds the exact large sum instead of overflowing. SUM(INT)/
+            // SUM(SMALLINT) stay integer — their sum's target is the wider 64-bit integer, which
+            // still errors on the (far rarer) overflow past it. AVG over an exact type (Int /
+            // NUMERIC) is exact NUMERIC — `AVG(int)` must not lose precision in f64; only AVG of
+            // FLOAT stays FLOAT.
             let unconstrained_numeric = ColumnType::Numeric {
                 precision: 0,
                 scale: 0,
             };
-            let result_ty = if matches!(func, ast::AggregateFunc::Avg) {
-                if typed.ty == ColumnType::Float {
-                    ColumnType::Float
-                } else {
-                    unconstrained_numeric
-                }
-            } else {
-                typed.ty
+            let result_ty = match func {
+                ast::AggregateFunc::Avg => {
+                    if typed.ty == ColumnType::Float {
+                        ColumnType::Float
+                    } else {
+                        unconstrained_numeric
+                    }
+                },
+                // Only SUM reaches these arms (AVG is handled above).
+                ast::AggregateFunc::Sum if typed.ty == ColumnType::BigInt => unconstrained_numeric,
+                _ => typed.ty,
             };
             Ok((Some(typed), result_ty))
         },

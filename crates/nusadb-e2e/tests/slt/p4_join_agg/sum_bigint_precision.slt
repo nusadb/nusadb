@@ -1,6 +1,7 @@
-# p4_join_agg/sum_bigint_precision — SUM(Int) is exact past 2^53 (R37 E10 regression).
-# Before the fix SUM accumulated in f64, so values above 2^53 (9007199254740992) lost
-# precision and the sum was silently wrong.
+# p4_join_agg/sum_bigint_precision — SUM(BIGINT) is exact past 2^53 and past the 64-bit range.
+# The exact integer total is accumulated in i128; SUM over a 64-bit column promotes to NUMERIC so a
+# total that outgrows 64 bits is the exact large number rather than an overflow error (and a value
+# above 2^53 never rounds the way an f64 accumulator once did).
 
 statement ok
 CREATE TABLE big (v BIGINT)
@@ -10,13 +11,27 @@ statement ok
 INSERT INTO big VALUES (9007199254740993), (9007199254740993), (1)
 
 # Exact integer sum = 18014398509481987. An f64 accumulator would round to ...984/...986.
-query I
+# SUM(BIGINT) is NUMERIC-typed (the `?` column), rendered without a fractional part.
+query ?
 SELECT SUM(v) FROM big
 ----
 18014398509481987
 
 # Sum of a single large value round-trips exactly.
-query I
+query ?
 SELECT SUM(v) FROM big WHERE v > 1
 ----
 18014398509481986
+
+# A total that exceeds the 64-bit range is the exact large number, not an overflow error:
+# 3 × 9223372036854775807 (i64::MAX) = 27670116110564327421.
+statement ok
+CREATE TABLE huge (v BIGINT)
+
+statement ok
+INSERT INTO huge VALUES (9223372036854775807), (9223372036854775807), (9223372036854775807)
+
+query ?
+SELECT SUM(v) FROM huge
+----
+27670116110564327421

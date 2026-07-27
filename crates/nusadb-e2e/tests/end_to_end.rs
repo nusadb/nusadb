@@ -2399,6 +2399,43 @@ fn multidimensional_arrays() {
 }
 
 #[test]
+fn sum_bigint_promotes_to_exact_numeric() {
+    let engine = BtreeEngine::new();
+    let scalar = |sql: &str| rows(run(&engine, sql)).pop().unwrap().pop().unwrap();
+    let num = |s: &str| Value::Numeric(nusadb_sql::numeric::Decimal::parse(s).expect("decimal"));
+
+    run(&engine, "CREATE TABLE t (b BIGINT, i INT)");
+    // Three i64::MAX values: their exact total, 27670116110564327421, overflows the 64-bit range.
+    run(
+        &engine,
+        "INSERT INTO t VALUES (9223372036854775807, 1), (9223372036854775807, 2), \
+         (9223372036854775807, 3)",
+    );
+
+    // SUM(BIGINT) promotes to NUMERIC and returns the exact large total, never an overflow error.
+    assert_eq!(scalar("SELECT SUM(b) FROM t"), num("27670116110564327421"));
+    // A bigint total inside the 64-bit range is still NUMERIC (promotion is by type, not magnitude),
+    // rendered without a fractional part.
+    assert_eq!(
+        scalar("SELECT SUM(b) FROM t WHERE i = 1"),
+        num("9223372036854775807")
+    );
+    // SUM(INT) is not promoted — it stays an integer.
+    assert_eq!(scalar("SELECT SUM(i) FROM t"), Value::Int(6));
+
+    // The vectorized path agrees with the row path (the integer fast-path declines for a NUMERIC
+    // result and folds through the same accumulator).
+    for sql in ["SELECT SUM(b) FROM t", "SELECT SUM(i) FROM t"] {
+        let row_path = rows(run(&engine, sql));
+        let batch_path = {
+            let _g = nusadb_sql::vectorized::scope(true);
+            rows(run(&engine, sql))
+        };
+        assert_eq!(row_path, batch_path, "batch != row for {sql}");
+    }
+}
+
+#[test]
 fn cost_based_index_vs_seq_scan_selection() {
     // With ANALYZE stats the planner compares costs: a selective equality on an indexed
     // column takes the index; a barely-selective range that keeps most rows takes a sequential scan.

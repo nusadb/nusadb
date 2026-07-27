@@ -97,7 +97,15 @@ fn classify(call: &AggregateCall, columns: &[usize], source_width: usize) -> Opt
     };
     match call.func {
         F::Count => Some(ScanFold::CountCol(source)),
-        F::Sum if is_integer(arg.ty) && is_integer(call.result_ty) => {
+        // SUM over an integer column: the exact i128 fold serves both an integer result and a
+        // NUMERIC result — SUM(BIGINT) promotes to NUMERIC, and `finalize_aggregate` reads the
+        // same i128 accumulator for either. Keeping it on this raw-tuple fold avoids materializing
+        // a column for the (integer) argument.
+        F::Sum
+            if is_integer(arg.ty)
+                && (is_integer(call.result_ty)
+                    || matches!(call.result_ty, ColumnType::Numeric { .. })) =>
+        {
             Some(ScanFold::SumInt(source))
         },
         F::Min if is_integer(arg.ty) => Some(ScanFold::MinInt(source)),
