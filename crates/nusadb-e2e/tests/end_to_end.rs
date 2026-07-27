@@ -2376,6 +2376,20 @@ fn multidimensional_arrays() {
     assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[1]"), Value::Null);
     assert_eq!(scalar("SELECT (ARRAY[10,20,30])[2]"), Value::Int(20));
 
+    // A chained subscript indexes one dimension per subscript, reaching the scalar element.
+    assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[1][2]"), Value::Int(2));
+    assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[2][1]"), Value::Int(3));
+    // Three dimensions: one subscript per level.
+    assert_eq!(
+        scalar("SELECT (ARRAY[[[10,20]],[[30,40]]])[2][1][2]"),
+        Value::Int(40)
+    );
+    // Too few subscripts still stops at a sub-array → NULL; an out-of-range level → NULL; too many
+    // subscripts (indexing past a scalar) → NULL — never an error, per the standard array rule.
+    assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[1][1][1]"), Value::Null);
+    assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[9][1]"), Value::Null);
+    assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[1][9]"), Value::Null);
+
     // The rectangular constraint: a ragged literal, or a mix of array and scalar, is a loud error.
     assert!(run_try(&engine, "SELECT ARRAY[[1,2],[3]]").is_err());
     assert!(run_try(&engine, "SELECT ARRAY[[1,2],3]").is_err());
@@ -2388,6 +2402,7 @@ fn multidimensional_arrays() {
         "SELECT cardinality(ARRAY[[1,2],[3,4]])",
         "SELECT array_to_string(ARRAY[[1,2],[3,4]], ',')",
         "SELECT (ARRAY[[1,2],[3,4]])[1]",
+        "SELECT (ARRAY[[1,2],[3,4]])[2][1]",
     ] {
         let row_path = rows(run(&engine, sql));
         let batch_path = {

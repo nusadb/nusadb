@@ -1986,12 +1986,21 @@ fn analyze_subscript(
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     let base_t = analyze_expr_agg(base, scope, catalog, None, aggregates.as_deref_mut())?;
-    let ColumnType::Array(elem) = base_t.ty else {
-        return Err(Error::TypeMismatch {
-            context: "array subscript base".to_owned(),
-            expected: ColumnType::Array(nusadb_core::engine::ArrayElem::Int),
-            found: base_t.ty,
-        });
+    // The result element type. A first subscript on an array yields its element type. A *chained*
+    // subscript (`a[i][j]`) indexes one dimension deeper into a multidimensional array: `a[i]` was
+    // already typed as the scalar element (dimensionality is a value property, not part of the
+    // type), and the further `[j]` still yields that scalar. Only a subscript base may chain, so a
+    // bare scalar (`(1)[2]`) is still rejected.
+    let elem_ty = match base_t.ty {
+        ColumnType::Array(elem) => elem.column_type(),
+        scalar if matches!(base, ast::Expr::Subscript { .. }) => scalar,
+        _ => {
+            return Err(Error::TypeMismatch {
+                context: "array subscript base".to_owned(),
+                expected: ColumnType::Array(nusadb_core::engine::ArrayElem::Int),
+                found: base_t.ty,
+            });
+        },
     };
     let index_t = analyze_expr_agg(index, scope, catalog, Some(ColumnType::Int), aggregates)?;
     if index_t.ty != ColumnType::Int && !is_null_literal(&index_t) {
@@ -2006,7 +2015,7 @@ fn analyze_subscript(
             base: Box::new(base_t),
             index: Box::new(index_t),
         },
-        ty: elem.column_type(),
+        ty: elem_ty,
     })
 }
 

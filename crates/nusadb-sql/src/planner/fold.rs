@@ -308,7 +308,17 @@ fn is_foldable_constant(expr: &TypedExpr) -> bool {
         | K::SimilarTo { expr, pattern, .. } => {
             is_foldable_constant(expr) && is_foldable_constant(pattern)
         },
-        K::Subscript { base, index } => is_foldable_constant(base) && is_foldable_constant(index),
+        // A subscript is never whole-folded (it could be constant, unlike the wildcard's cases, but
+        // deliberately is not). Folding is bottom-up, so a chained `a[i][j]` would fold the inner
+        // `a[i]` on its own — and a lone subscript that lands on a sub-array of a multidimensional
+        // array collapses to NULL (it did not reach a scalar), which would break the outer `[j]`.
+        // Its base literal and index still fold; the subscript itself evaluates at run time, where
+        // the chain is indexed one dimension at a time.
+        #[allow(
+            clippy::match_same_arms,
+            reason = "documents a deliberate non-fold, distinct from the wildcard's never-constant cases"
+        )]
+        K::Subscript { .. } => false,
         K::ArraySlice { base, lower, upper } => {
             is_foldable_constant(base)
                 && lower.as_deref().is_none_or(is_foldable_constant)

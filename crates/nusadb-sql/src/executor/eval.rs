@@ -2619,28 +2619,46 @@ fn array_dimensions(items: &[ast::Value]) -> Vec<usize> {
 /// Evaluate a 1-based array subscript `base[index]`. A `NULL` array or index yields `NULL`,
 /// and an out-of-range index (including `< 1`) yields `NULL` per SQL array semantics.
 fn eval_subscript(base: &TypedExpr, index: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
-    let base_v = eval(base, row)?;
-    let index_v = eval(index, row)?;
-    let (ast::Value::Array(items), ast::Value::Int(i)) = (&base_v, &index_v) else {
-        // NULL array / NULL index (or a non-array post-analyzer) → NULL.
-        return Ok(ast::Value::Null);
-    };
-    // SQL arrays are 1-based; index 0 or negative, or past the end, is NULL (not an error).
-    // `checked_sub` keeps `i == i64::MIN` from overflowing the 1-based → 0-based conversion.
-    let element = (*i)
-        .checked_sub(1)
-        .and_then(|j| usize::try_from(j).ok())
-        .and_then(|j| items.get(j))
-        .cloned()
-        .unwrap_or(ast::Value::Null);
-    // A single subscript on a multidimensional array selects a whole sub-array, but the analyzer
-    // typed this result as the scalar element (dimensionality is a value property, not a type). Match
-    // the standard array rule, which returns NULL for a subscript that does not reach a scalar element — so the
-    // value stays consistent with the declared scalar type instead of leaking an array.
+    let element = index_one_level(base, index, row)?;
+    // A subscript that does not reach a scalar element — too few subscripts for the array's
+    // dimensionality, e.g. a lone `a[i]` on a 2-D array — yields NULL, matching the standard array
+    // rule. The analyzer typed this result as the scalar element (dimensionality is a value
+    // property, not a type), so collapsing a still-array result to NULL keeps the value consistent
+    // with that type instead of leaking a sub-array. A chained `a[i][j]` reaches the scalar and
+    // returns it.
     if matches!(element, ast::Value::Array(_)) {
         return Ok(ast::Value::Null);
     }
     Ok(element)
+}
+
+/// Index one 1-based level of `base[index]`, returning the raw element — which may itself be a
+/// sub-array when `base` is multidimensional. When `base` is itself a subscript (an inner link of a
+/// chain like `a[i][j]`), it is indexed here too, letting the sub-array through so the outer level
+/// can index into it; the outermost [`eval_subscript`] applies the "no scalar reached → NULL" rule.
+fn index_one_level(base: &TypedExpr, index: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
+    // Evaluate the base one level down: recurse through an inner subscript (keeping a sub-array
+    // result), otherwise evaluate the array at the root of the chain normally.
+    let base_v = match &base.kind {
+        TypedExprKind::Subscript {
+            base: inner,
+            index: inner_index,
+        } => index_one_level(inner, inner_index, row)?,
+        _ => eval(base, row)?,
+    };
+    let index_v = eval(index, row)?;
+    let (ast::Value::Array(items), ast::Value::Int(i)) = (&base_v, &index_v) else {
+        // NULL array / NULL index, or a base that did not reach an array (too many subscripts) → NULL.
+        return Ok(ast::Value::Null);
+    };
+    // SQL arrays are 1-based; index 0 or negative, or past the end, is NULL (not an error).
+    // `checked_sub` keeps `i == i64::MIN` from overflowing the 1-based → 0-based conversion.
+    Ok((*i)
+        .checked_sub(1)
+        .and_then(|j| usize::try_from(j).ok())
+        .and_then(|j| items.get(j))
+        .cloned()
+        .unwrap_or(ast::Value::Null))
 }
 
 /// Evaluate a `base[lower:upper]` array slice (B-fn): a 1-based, inclusive sub-array. An omitted bound
