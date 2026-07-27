@@ -2468,6 +2468,27 @@ fn vectorized_scan_over_declared_metadata_types() {
 }
 
 #[test]
+fn vectorized_fallback_does_not_mask_genuine_errors() {
+    // The batch path degrades to the row path on a *runtime* error (defense in depth), but a genuine
+    // query error must still reach the client — integer division by zero errors on both paths, so
+    // the fallback re-raises it rather than masking it as a wrong result. A non-erroring query on
+    // the same forced-vectorized path still returns the correct rows.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (v INT NOT NULL)");
+    run(&engine, "INSERT INTO t VALUES (1), (2), (3)");
+    let _g = nusadb_sql::vectorized::scope(true);
+    assert!(run_try(&engine, "SELECT v / 0 FROM t").is_err());
+    assert_eq!(
+        rows(run(&engine, "SELECT v FROM t ORDER BY v")),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+        ]
+    );
+}
+
+#[test]
 fn cost_based_index_vs_seq_scan_selection() {
     // With ANALYZE stats the planner compares costs: a selective equality on an indexed
     // column takes the index; a barely-selective range that keeps most rows takes a sequential scan.

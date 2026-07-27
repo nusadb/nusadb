@@ -32,14 +32,25 @@ pub(super) fn run_select(
     let use_batch =
         crate::vectorized::is_enabled() || est_scan_rows.is_some_and(meets_vectorize_threshold);
     let rows = if use_batch {
-        match crate::vectorized::execute(op, engine, txn, est_scan_rows)? {
+        match crate::vectorized::execute(op, engine, txn, est_scan_rows) {
             // The batch path materializes its own result, so enforce the work-memory budget on it
             // too (the row path checks inside `execute_op`).
-            Some(rows) => {
+            Ok(Some(rows)) => {
                 enforce_work_mem(&rows)?;
                 rows
             },
-            None => execute_op(op, engine, txn)?,
+            // The plan shape is not vectorizable — use the row-at-a-time path.
+            Ok(None) => execute_op(op, engine, txn)?,
+            // Defense in depth: a runtime error from the batch path (distinct from a plan-shape
+            // decline, which is `Ok(None)`) degrades to the row path rather than failing the query.
+            // The batch path is read-only and materializes its whole result before returning, so
+            // nothing has been emitted yet; the row path recomputes the identical rows (batch ==
+            // row) and re-raises any genuine query error itself. The warn keeps the batch-path
+            // failure observable instead of silently always slow-pathing a latent bug.
+            Err(error) => {
+                tracing::warn!(error = %error, "vectorized batch execution failed; falling back to the row path");
+                execute_op(op, engine, txn)?
+            },
         }
     } else {
         execute_op(op, engine, txn)?
