@@ -41,3 +41,50 @@ SELECT DATE_TRUNC('month', CAST(d AS TIMESTAMP)) FROM sales;
 
 Comparing against a bare string literal needs no cast — `WHERE DATE_TRUNC('month', d) =
 '2024-06-01'` reads the literal as the column's type.
+
+## Fixed-width characters (`CHAR(n)`)
+
+`CHAR(n)` stores and compares text exactly as entered — NusaDB does **not** blank-pad a
+`CHAR` value out to its declared length. `'ab'` stored in a `CHAR(4)` stays `'ab'` (length 2),
+so `CHAR(n)` behaves like `VARCHAR(n)` with a declared maximum, and comparisons never ignore
+trailing spaces. This departs from the legacy blank-padding rule on purpose: padding is a
+surprising, storage-wasting wart, and a single consistent text semantics across `TEXT`,
+`VARCHAR`, and `CHAR` is easier to reason about. If an application needs a fixed-width,
+space-filled rendering, pad explicitly with `rpad(col, 4)`.
+
+## Summing 64-bit integers
+
+`SUM` over a `BIGINT` column returns `NUMERIC`, not `BIGINT`. A total over 64-bit values can
+exceed the 64-bit range, so the exact large sum is returned as `NUMERIC` rather than raised as
+an overflow error. `SUM` over `INT`/`SMALLINT` still returns a 64-bit integer (which errors on
+the far rarer overflow past that), and `SUM` over `NUMERIC` stays exact `NUMERIC`. The value is
+exact in every case — the accumulator is a 128-bit integer for integer inputs.
+
+## Inspecting a value's type
+
+`nusa_typeof(expr)` returns the static SQL type name of its argument as `TEXT` (`integer`,
+`text`, `numeric`, …). The type is known at analysis time, so the argument is never evaluated.
+
+## Array parameters to `ANY` / `ALL`
+
+A driver commonly binds a list as a single array parameter — `WHERE id = ANY($1)` with `$1`
+bound to `{1,2,3}`. The bound value arrives as its array text form (typed `TEXT`), and NusaDB
+coerces it to an array of the probe's element type, exactly as an explicit `$1::INT[]` would.
+The same works with an array text literal written inline:
+
+```sql
+SELECT id FROM t WHERE id = ANY('{1,3}');       -- id in (1, 3)
+SELECT id FROM t WHERE id <> ALL('{1,3}');       -- id not in (1, 3)
+```
+
+An unparseable member (`'{1,x}'` against an integer probe) is rejected loudly rather than
+silently dropping rows.
+
+## `NUMERIC` division precision
+
+`NUMERIC` division carries a fixed number of guard digits beyond its wider operand: the result
+scale is `min(max(left_scale, right_scale) + 16, MAX_SCALE)`. So `10 / 3` keeps ~16 fractional
+digits rather than truncating to the operands' scale. This is a fixed-scale rule (bounded,
+deterministic digits) rather than a significant-digit rule; every digit it returns is correct,
+and a computation needing a specific scale can `round(expr, n)` or cast to a declared
+`NUMERIC(p, s)`.

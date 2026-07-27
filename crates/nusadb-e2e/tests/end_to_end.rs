@@ -2489,6 +2489,47 @@ fn vectorized_fallback_does_not_mask_genuine_errors() {
 }
 
 #[test]
+fn any_over_a_text_array_parameter() {
+    // A driver binds an array parameter (`id = ANY($1)`) as its `{...}` text form, which types as
+    // TEXT; the analyzer coerces that bare text literal to an array of the probe's element type,
+    // exactly as an explicit `$1::int[]` would. Here the same shape is exercised with a text-array
+    // literal directly on the right of ANY.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, label TEXT)");
+    run(
+        &engine,
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    );
+
+    // Integer probe against a `{...}` text array: the members are matched after coercion to INT[].
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM t WHERE id = ANY('{1,3}') ORDER BY id"
+        )),
+        vec![vec![Value::Int(1)], vec![Value::Int(3)]]
+    );
+    // `<> ALL` (the negation) over the same text-array parameter form.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM t WHERE id <> ALL('{1,3}') ORDER BY id"
+        )),
+        vec![vec![Value::Int(2)], vec![Value::Int(4)]]
+    );
+    // A text probe against a text-array parameter.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM t WHERE label = ANY('{a,d}') ORDER BY id"
+        )),
+        vec![vec![Value::Int(1)], vec![Value::Int(4)]]
+    );
+    // An unparseable array member loud-rejects rather than silently dropping the row.
+    assert!(run_try(&engine, "SELECT id FROM t WHERE id = ANY('{1,x}')").is_err());
+}
+
+#[test]
 fn cost_based_index_vs_seq_scan_selection() {
     // With ANALYZE stats the planner compares costs: a selective equality on an indexed
     // column takes the index; a barely-selective range that keeps most rows takes a sequential scan.
