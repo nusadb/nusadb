@@ -1957,14 +1957,19 @@ fn analyze_array_literal(
                 "empty ARRAY[] has no inferable element type — add an explicit cast".to_owned(),
             )
         })?;
-    // Map the unified element type to a storable array element. NUMERIC is now a supported element
-    // type (exact decimals — `ARRAY[1, 2.0]` is `NUMERIC[]`), so only the genuinely
-    // non-element types (nested arrays, JSON, BYTES, …) are rejected here.
-    let elem = nusadb_core::engine::ArrayElem::from_column_type(elem_col_ty).ok_or_else(|| {
-        Error::Unsupported(format!(
-            "ARRAY of {elem_col_ty:?} elements is not supported"
-        ))
-    })?;
+    // Map the unified element type to a storable array element. NUMERIC is a supported element type
+    // (exact decimals — `ARRAY[1, 2.0]` is `NUMERIC[]`). A **nested** array element makes this a
+    // multidimensional array: the type stays the scalar element's array
+    // (`ARRAY[[1,2],[3,4]]` is `integer[]`, not `integer[][]`) — the extra dimension lives in the
+    // value — so one array level is peeled off here. The rectangular constraint (every sub-array the
+    // same length) is enforced at run time by the array constructor's evaluator. Other non-element
+    // types (JSON, BYTES, …) are still rejected.
+    let elem = match elem_col_ty {
+        ColumnType::Array(inner) => inner,
+        scalar => nusadb_core::engine::ArrayElem::from_column_type(scalar).ok_or_else(|| {
+            Error::Unsupported(format!("ARRAY of {scalar:?} elements is not supported"))
+        })?,
+    };
     Ok(TypedExpr {
         kind: TypedExprKind::ArrayLiteral(typed),
         ty: ColumnType::Array(elem),

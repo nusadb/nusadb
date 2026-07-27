@@ -170,6 +170,7 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
             for elem in elems {
                 values.push(eval(elem, row)?);
             }
+            check_rectangular_array(&values)?;
             Ok(ast::Value::Array(values))
         },
         TypedExprKind::Subscript { base, index } => eval_subscript(base, index, row),
@@ -231,6 +232,14 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
             let ast::Value::Array(elems) = eval(array, row)? else {
                 return Ok(ast::Value::Null);
             };
+            // A multidimensional array's `= ANY`/`= ALL` semantics (which leaves to compare) are not
+            // yet settled, so reject it loudly rather than risk a wrong membership result. A scalar
+            // probe is already rejected at analysis (its element type is the sub-array, not a scalar).
+            if array_is_multidim(&elems) {
+                return Err(Error::Unsupported(
+                    "ANY/ALL is not supported on multidimensional arrays".to_owned(),
+                ));
+            }
             let mut acc = ast::Value::Bool(*all);
             for elem in &elems {
                 let cmp = apply_comparison(*op, &probe, elem);
@@ -764,55 +773,73 @@ fn eval_scalar_function(
         (F::WidthBucket, [op, low, high, Int(count)]) => {
             width_bucket(to_f64(op), to_f64(low), to_f64(high), *count)?
         },
-        // CARDINALITY(arr) — element count. A NULL array already returned NULL above.
+        // CARDINALITY(arr) — the **total** element count across every dimension (the product of the
+        // dimension lengths): a 2-D `[[1,2],[3,4]]` is 4, not 2. An empty array is 0. A NULL array
+        // already returned NULL above.
         (F::Cardinality, [ast::Value::Array(items)]) => {
-            Int(i64::try_from(items.len()).unwrap_or(i64::MAX))
+            let total: usize = array_dimensions(items).iter().product();
+            Int(i64::try_from(total).unwrap_or(i64::MAX))
         },
-        // ARRAY_DIMS(arr): `[1:n]` for a non-empty 1-D array, NULL for an empty array.
+        // ARRAY_DIMS(arr): `[1:d1][1:d2]…` — one bracket per dimension (`[1:2][1:2]` for a 2×2 array).
+        // NULL for an empty array (which has no dimensions).
         (F::ArrayDims, [ast::Value::Array(items)]) => {
             if items.is_empty() {
                 ast::Value::Null
             } else {
-                Text(format!("[1:{}]", items.len()))
+                use std::fmt::Write as _;
+                let mut dims_text = String::new();
+                for d in array_dimensions(items) {
+                    let _ = write!(dims_text, "[1:{d}]");
+                }
+                Text(dims_text)
             }
         },
-        // ARRAY_NDIMS(arr): dimension count — 1 for a non-empty (1-D) array, NULL for an empty array
-        // (which has no dimensions); a NULL array already returned NULL above (B-fn).
+        // ARRAY_NDIMS(arr): the number of dimensions — 2 for `[[1,2],[3,4]]`, 1 for a flat array,
+        // NULL for an empty array (which has no dimensions); a NULL array already returned NULL above.
         (F::ArrayNdims, [ast::Value::Array(items)]) => {
             if items.is_empty() {
                 ast::Value::Null
             } else {
-                Int(1)
+                Int(i64::try_from(array_dimensions(items).len()).unwrap_or(i64::MAX))
             }
         },
-        // ARRAY_LENGTH(arr, dim): length along dimension `dim`; only 1-D arrays, and an empty array
-        // has no dimension (→ NULL) per the standard array semantics.
-        // ARRAY_LENGTH(arr, dim) and ARRAY_UPPER(arr, dim) both give the length of a non-empty 1-D
-        // array (the upper bound equals the length for 1-D); NULL otherwise.
+        // ARRAY_LENGTH(arr, dim) / ARRAY_UPPER(arr, dim): the length along dimension `dim` (1-based);
+        // the upper bound equals the length for a lower bound of 1. NULL when `dim` is outside the
+        // array's dimensionality (and for an empty array, which has none).
         (F::ArrayLength | F::ArrayUpper, [ast::Value::Array(items), Int(dim)]) => {
-            if *dim == 1 && !items.is_empty() {
-                Int(i64::try_from(items.len()).unwrap_or(i64::MAX))
-            } else {
-                ast::Value::Null
+            let dims = array_dimensions(items);
+            match usize::try_from(*dim)
+                .ok()
+                .and_then(|d| dims.get(d.checked_sub(1)?))
+            {
+                Some(&len) if !items.is_empty() => Int(i64::try_from(len).unwrap_or(i64::MAX)),
+                _ => ast::Value::Null,
             }
         },
-        // ARRAY_LOWER(arr, dim): the lower bound — always 1 for a non-empty 1-D array.
+        // ARRAY_LOWER(arr, dim): the lower bound — always 1 for an existing dimension, NULL otherwise.
         (F::ArrayLower, [ast::Value::Array(items), Int(dim)]) => {
-            if *dim == 1 && !items.is_empty() {
-                Int(1)
-            } else {
-                ast::Value::Null
+            let dims = array_dimensions(items);
+            match usize::try_from(*dim)
+                .ok()
+                .and_then(|d| dims.get(d.checked_sub(1)?))
+            {
+                Some(_) if !items.is_empty() => Int(1),
+                _ => ast::Value::Null,
             }
         },
-        // ARRAY_TO_STRING(arr, sep): join the non-NULL elements' text with `sep`.
-        (F::ArrayToString, [ast::Value::Array(items), Text(sep)]) => Text(
-            items
-                .iter()
-                .filter(|v| !matches!(v, ast::Value::Null))
-                .map(crate::display::value_text)
-                .collect::<Vec<_>>()
-                .join(sep),
-        ),
+        // ARRAY_TO_STRING(arr, sep): join the non-NULL elements' text with `sep`. A multidimensional
+        // array flattens in row-major order first, so `{{1,2},{3,4}}` joins as `1,2,3,4`.
+        (F::ArrayToString, [ast::Value::Array(items), Text(sep)]) => {
+            let mut flat = Vec::new();
+            flatten_array_into(items, &mut flat);
+            Text(
+                flat.iter()
+                    .filter(|v| !matches!(v, ast::Value::Null))
+                    .map(crate::display::value_text)
+                    .collect::<Vec<_>>()
+                    .join(sep),
+            )
+        },
         // STRING_TO_ARRAY(s, sep): split `s` on `sep` into a TEXT[]; an empty `sep` yields `{s}`.
         (F::StringToArray, [Text(s), Text(sep)]) => ast::Value::Array(
             split_on_literal(s, sep)
@@ -1593,6 +1620,17 @@ fn eval_array_mutate(
     };
     let a = eval(a_expr, row)?;
     let b = eval(b_expr, row)?;
+    // The standard does not define element append / search over multiple dimensions — raise rather
+    // than guess. Reject a multidimensional operand loudly instead of returning a silently wrong result.
+    for operand in [&a, &b] {
+        if let ast::Value::Array(items) = operand
+            && array_is_multidim(items)
+        {
+            return Err(Error::Unsupported(
+                "array append/search is not supported on multidimensional arrays".to_owned(),
+            ));
+        }
+    }
     // Decode an array operand into its element vector; a NULL array is an empty vector.
     let as_items = |v: ast::Value| match v {
         ast::Value::Array(items) => Some(items),
@@ -1658,6 +1696,13 @@ fn eval_array_replace(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error
     let arr = eval(arr_expr, row)?;
     let from = eval(from_expr, row)?;
     let to = eval(to_expr, row)?;
+    if let ast::Value::Array(items) = &arr
+        && array_is_multidim(items)
+    {
+        return Err(Error::Unsupported(
+            "ARRAY_REPLACE is not supported on multidimensional arrays".to_owned(),
+        ));
+    }
     Ok(match arr {
         ast::Value::Array(items) => ast::Value::Array(
             items
@@ -2489,6 +2534,88 @@ fn eval_coalesce(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     Ok(ast::Value::Null)
 }
 
+/// Enforce the standard rectangular-array rule on a freshly-built array's elements: a
+/// multidimensional array (some element is itself an array) must have **every** element be a
+/// non-null array of the **same** length, recursively. A ragged `ARRAY[[1,2],[3]]`, or a mix of
+/// array and scalar/NULL sub-arrays, is a loud error — never a silently jagged value. A plain scalar
+/// array (no element is an array) is unconstrained.
+fn check_rectangular_array(values: &[ast::Value]) -> Result<(), Error> {
+    if !values.iter().any(|v| matches!(v, ast::Value::Array(_))) {
+        return Ok(());
+    }
+    let ragged = |detail: &str| Error::InvalidValue {
+        ty: ColumnType::Array(nusadb_core::engine::ArrayElem::Int),
+        value: format!("multidimensional array {detail}"),
+    };
+    let mut expected: Option<usize> = None;
+    for v in values {
+        let ast::Value::Array(sub) = v else {
+            return Err(ragged("must not mix array and non-array elements"));
+        };
+        match expected {
+            None => expected = Some(sub.len()),
+            Some(n) if n != sub.len() => {
+                return Err(ragged("must have sub-arrays of matching length"));
+            },
+            Some(_) => {},
+        }
+        check_rectangular_array(sub)?;
+    }
+    Ok(())
+}
+
+/// Whether an array value is multidimensional (some element is itself an array). Used to loud-reject
+/// the array operations that are undefined over multiple dimensions (element search /
+/// append / overlap), rather than compute a silently wrong answer.
+fn array_is_multidim(items: &[ast::Value]) -> bool {
+    items.iter().any(|v| matches!(v, ast::Value::Array(_)))
+}
+
+/// Loud-reject a multidimensional array operand for an operation defined only over one
+/// dimension (or whose multidimensional result the engine does not yet keep rectangular). A
+/// non-array or one-dimensional operand passes through.
+fn reject_multidim_operand(left: &ast::Value, right: &ast::Value, op: &str) -> Result<(), Error> {
+    for v in [left, right] {
+        if let ast::Value::Array(items) = v
+            && array_is_multidim(items)
+        {
+            return Err(Error::Unsupported(format!(
+                "{op} is not supported on multidimensional arrays"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Append every scalar (leaf) element of a possibly-multidimensional array to `out`, in row-major
+/// order — the flattening `unnest` / `array_to_string` apply to a multidimensional array
+/// (`[[1,2],[3,4]]` flattens to `1,2,3,4`). NULL leaves are kept.
+pub(super) fn flatten_array_into(items: &[ast::Value], out: &mut Vec<ast::Value>) {
+    for v in items {
+        match v {
+            ast::Value::Array(inner) => flatten_array_into(inner, out),
+            other => out.push(other.clone()),
+        }
+    }
+}
+
+/// The dimension lengths of a rectangular (multidimensional) array value: `[[1,2],[3,4]]` → `[2, 2]`,
+/// `[1,2,3]` → `[3]`. Follows the first element down the nesting, which is exact because the
+/// constructor ([`check_rectangular_array`]) guarantees every sub-array at each level has the same
+/// length. An empty array has no dimensions (`[]`).
+fn array_dimensions(items: &[ast::Value]) -> Vec<usize> {
+    let mut dims = Vec::new();
+    let mut level = items;
+    loop {
+        dims.push(level.len());
+        match level.first() {
+            Some(ast::Value::Array(inner)) => level = inner,
+            _ => break,
+        }
+    }
+    dims
+}
+
 /// Evaluate a 1-based array subscript `base[index]`. A `NULL` array or index yields `NULL`,
 /// and an out-of-range index (including `< 1`) yields `NULL` per SQL array semantics.
 fn eval_subscript(base: &TypedExpr, index: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
@@ -2506,6 +2633,13 @@ fn eval_subscript(base: &TypedExpr, index: &TypedExpr, row: &Row) -> Result<ast:
         .and_then(|j| items.get(j))
         .cloned()
         .unwrap_or(ast::Value::Null);
+    // A single subscript on a multidimensional array selects a whole sub-array, but the analyzer
+    // typed this result as the scalar element (dimensionality is a value property, not a type). Match
+    // the standard array rule, which returns NULL for a subscript that does not reach a scalar element — so the
+    // value stays consistent with the declared scalar type instead of leaking an array.
+    if matches!(element, ast::Value::Array(_)) {
+        return Ok(ast::Value::Null);
+    }
     Ok(element)
 }
 
@@ -3497,10 +3631,22 @@ fn apply_binary(
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             Ok(apply_bitwise(op, left, right))
         },
-        Op::ArrayOverlap => Ok(apply_array_overlap(left, right)),
-        Op::Concat => apply_concat(left, right),
-        // `@>` / `<@` containment — over arrays or JSON (the analyzer picks the operand domain).
-        Op::JsonContains | Op::JsonContainedBy => Ok(containment_op(op, left, right)),
+        // Element-set operators (overlap `&&`, containment `@>`/`<@`) are defined over a
+        // single dimension; reject a multidimensional operand loudly rather than compute a wrong set.
+        Op::ArrayOverlap => {
+            reject_multidim_operand(left, right, "array overlap `&&`")?;
+            Ok(apply_array_overlap(left, right))
+        },
+        Op::Concat => {
+            // Array `||` over multidimensional operands could build a ragged result the metadata
+            // functions assume is rectangular; reject it loudly (string `||` is unaffected).
+            reject_multidim_operand(left, right, "array concatenation `||`")?;
+            apply_concat(left, right)
+        },
+        Op::JsonContains | Op::JsonContainedBy => {
+            reject_multidim_operand(left, right, "array containment `@>`/`<@`")?;
+            Ok(containment_op(op, left, right))
+        },
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             Ok(json_op(op, left, right))
         },

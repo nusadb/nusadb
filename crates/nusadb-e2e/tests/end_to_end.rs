@@ -2307,6 +2307,98 @@ fn vectorized_hash_join_matches_row_path_end_to_end() {
 }
 
 #[test]
+fn multidimensional_arrays() {
+    let engine = BtreeEngine::new();
+    let scalar = |sql: &str| rows(run(&engine, sql)).pop().unwrap().pop().unwrap();
+
+    // Metadata functions are dimension-aware: a 2×2 array has 4 total elements, 2 dimensions.
+    assert_eq!(
+        scalar("SELECT cardinality(ARRAY[[1,2],[3,4]])"),
+        Value::Int(4)
+    );
+    assert_eq!(
+        scalar("SELECT array_ndims(ARRAY[[1,2],[3,4]])"),
+        Value::Int(2)
+    );
+    assert_eq!(
+        scalar("SELECT array_dims(ARRAY[[1,2],[3,4]])"),
+        Value::Text("[1:2][1:2]".to_owned())
+    );
+    assert_eq!(
+        scalar("SELECT array_length(ARRAY[[1,2],[3,4]], 1)"),
+        Value::Int(2)
+    );
+    assert_eq!(
+        scalar("SELECT array_length(ARRAY[[1,2],[3,4]], 2)"),
+        Value::Int(2)
+    );
+    assert_eq!(
+        scalar("SELECT array_length(ARRAY[[1,2],[3,4]], 3)"),
+        Value::Null
+    );
+    assert_eq!(
+        scalar("SELECT array_lower(ARRAY[[1,2],[3,4]], 2)"),
+        Value::Int(1)
+    );
+
+    // Three dimensions.
+    assert_eq!(
+        scalar("SELECT array_ndims(ARRAY[[[1],[2]],[[3],[4]]])"),
+        Value::Int(3)
+    );
+    assert_eq!(
+        scalar("SELECT cardinality(ARRAY[[[1],[2]],[[3],[4]]])"),
+        Value::Int(4)
+    );
+
+    // Flatten in row-major order: array_to_string joins the leaves, unnest yields one row per leaf.
+    assert_eq!(
+        scalar("SELECT array_to_string(ARRAY[[1,2],[3,4]], ',')"),
+        Value::Text("1,2,3,4".to_owned())
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT n FROM unnest(ARRAY[[1,2],[3,4]]) AS t(n) ORDER BY n"
+        )),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+    // `= ANY`/`= ALL` over a multidimensional array is rejected loudly (never a wrong membership).
+    assert!(run_try(&engine, "SELECT 3 = ANY(ARRAY[[1,2],[3,4]])").is_err());
+
+    // A single subscript on a multidimensional array does not reach a scalar → NULL; a flat array's
+    // subscript still returns the element.
+    assert_eq!(scalar("SELECT (ARRAY[[1,2],[3,4]])[1]"), Value::Null);
+    assert_eq!(scalar("SELECT (ARRAY[10,20,30])[2]"), Value::Int(20));
+
+    // The rectangular constraint: a ragged literal, or a mix of array and scalar, is a loud error.
+    assert!(run_try(&engine, "SELECT ARRAY[[1,2],[3]]").is_err());
+    assert!(run_try(&engine, "SELECT ARRAY[[1,2],3]").is_err());
+    // Element append / search on a multidimensional array is rejected loudly, never wrong.
+    assert!(run_try(&engine, "SELECT array_append(ARRAY[[1,2],[3,4]], 5)").is_err());
+    assert!(run_try(&engine, "SELECT array_position(ARRAY[[1,2],[3,4]], 1)").is_err());
+
+    // The batch (vectorized) path agrees with the row path.
+    for sql in [
+        "SELECT cardinality(ARRAY[[1,2],[3,4]])",
+        "SELECT array_to_string(ARRAY[[1,2],[3,4]], ',')",
+        "SELECT (ARRAY[[1,2],[3,4]])[1]",
+    ] {
+        let row_path = rows(run(&engine, sql));
+        let batch_path = {
+            let _g = nusadb_sql::vectorized::scope(true);
+            rows(run(&engine, sql))
+        };
+        assert_eq!(row_path, batch_path, "batch != row for {sql}");
+    }
+}
+
+#[test]
 fn cost_based_index_vs_seq_scan_selection() {
     // With ANALYZE stats the planner compares costs: a selective equality on an indexed
     // column takes the index; a barely-selective range that keeps most rows takes a sequential scan.

@@ -2284,6 +2284,10 @@ fn run_vector_knn(
 
 /// Evaluate a set-returning function for one input row into its element list. `UNNEST(arr)`
 /// yields the array's elements in order; a `NULL` (or non-array, defensively) array yields nothing.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per set-returning function; flatter than dispatching to per-function helpers"
+)]
 fn eval_set_returning(
     func: ast::SetReturningFunc,
     args: &[TypedExpr],
@@ -2295,9 +2299,15 @@ fn eval_set_returning(
         .first()
         .map_or(Ok(ast::Value::Null), |a| eval::eval(a, row))?;
     match func {
-        // UNNEST(arr) → each element; a NULL/non-array yields no rows.
+        // UNNEST(arr) → each element as a row; a multidimensional array flattens to its leaf elements
+        // in row-major order (`unnest(ARRAY[[1,2],[3,4]])` yields 1,2,3,4). A NULL /
+        // non-array yields no rows.
         Srf::Unnest => Ok(match first {
-            ast::Value::Array(items) => items,
+            ast::Value::Array(items) => {
+                let mut flat = Vec::new();
+                eval::flatten_array_into(&items, &mut flat);
+                flat
+            },
             _ => Vec::new(),
         }),
         // JSON_ARRAY_ELEMENTS(json) → each element as JSON; a NULL/non-array yields no rows.
