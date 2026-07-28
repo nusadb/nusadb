@@ -1096,8 +1096,15 @@ pub(super) fn analyze_scalar_function(
     }
     // The vector distance functions take two same-dimension VECTORs and return FLOAT — the dimension
     // is part of the type, so this is not expressible with the fixed table.
-    if matches!(func, F::L2Distance | F::CosineDistance | F::InnerProduct) {
+    if matches!(
+        func,
+        F::L2Distance | F::CosineDistance | F::InnerProduct | F::L1Distance
+    ) {
         return analyze_vector_function(func, args, scope, catalog, aggregates);
+    }
+    // The unary vector functions take one VECTOR: VECTOR_DIMS → INT, VECTOR_NORM → FLOAT.
+    if matches!(func, F::VectorDims | F::VectorNorm) {
+        return analyze_vector_unary(func, args, scope, catalog, aggregates);
     }
     // TO_JSON / JSON_BUILD_OBJECT / JSON_BUILD_ARRAY take arguments of any type and return JSON — not
     // expressible with the fixed-type table.
@@ -1358,6 +1365,9 @@ pub(super) fn analyze_scalar_function(
         | F::L2Distance
         | F::CosineDistance
         | F::InnerProduct
+        | F::L1Distance
+        | F::VectorDims
+        | F::VectorNorm
         | F::ToJson
         | F::RowToJson
         | F::JsonBuildObject
@@ -1923,6 +1933,44 @@ fn analyze_vector_function(
             args: vec![a, b],
         },
         ty: ColumnType::Float,
+    })
+}
+
+/// Analyze a unary vector function: one `VECTOR` argument. `VECTOR_DIMS` returns `INT` (the
+/// dimension count), `VECTOR_NORM` returns `FLOAT` (the Euclidean norm). A bare `NULL` is allowed.
+fn analyze_vector_unary(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let name = func.name();
+    let [a_expr] = args else {
+        return Err(Error::Unsupported(format!(
+            "{name}() expects 1 argument, got {}",
+            args.len()
+        )));
+    };
+    let a = analyze_expr_agg(a_expr, scope, catalog, None, aggregates)?;
+    if !matches!(a.ty, ColumnType::Vector(_)) && !is_null_literal(&a) {
+        return Err(Error::TypeMismatch {
+            context: format!("{name}() argument"),
+            expected: ColumnType::Vector(0),
+            found: a.ty,
+        });
+    }
+    let ty = if matches!(func, ast::ScalarFunc::VectorDims) {
+        ColumnType::Int
+    } else {
+        ColumnType::Float
+    };
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: vec![a],
+        },
+        ty,
     })
 }
 

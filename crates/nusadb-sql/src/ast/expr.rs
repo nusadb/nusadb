@@ -685,9 +685,14 @@ pub enum ScalarFunc {
     /// `COSINE_DISTANCE(a, b)` — cosine distance `1 − cosθ` between two `VECTOR(n)`s, as `FLOAT`;
     /// the metric bound to the `<=>` operator.
     CosineDistance,
-    /// `INNER_PRODUCT(a, b)` — the negative dot product `−(a · b)` of two `VECTOR(n)`s, as `FLOAT`,
-    /// so a smaller value is a closer match (the `<#>` operator).
+    /// `INNER_PRODUCT(a, b)` — the raw (positive) dot product `a · b` of two `VECTOR(n)`s, as `FLOAT`.
     InnerProduct,
+    /// `L1_DISTANCE(a, b)` — Manhattan distance `Σ |aᵢ − bᵢ|` between two `VECTOR(n)`s, as `FLOAT`.
+    L1Distance,
+    /// `VECTOR_DIMS(a)` — the number of dimensions of a `VECTOR(n)`, as `INT`.
+    VectorDims,
+    /// `VECTOR_NORM(a)` — the Euclidean norm `‖a‖₂` of a `VECTOR(n)`, as `FLOAT`.
+    VectorNorm,
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
@@ -919,6 +924,9 @@ impl ScalarFunc {
             Self::L2Distance => "l2_distance",
             Self::CosineDistance => "cosine_distance",
             Self::InnerProduct => "inner_product",
+            Self::L1Distance => "l1_distance",
+            Self::VectorDims => "vector_dims",
+            Self::VectorNorm => "vector_norm",
             Self::UuidGenerateV4 => "uuid_generate_v4",
             Self::Version => "version",
             Self::NusaTypeof => "nusa_typeof",

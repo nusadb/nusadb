@@ -1209,6 +1209,9 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "l2_distance" => F::L2Distance,
         "cosine_distance" => F::CosineDistance,
         "inner_product" => F::InnerProduct,
+        "l1_distance" => F::L1Distance,
+        "vector_dims" => F::VectorDims,
+        "vector_norm" => F::VectorNorm,
         // UUID generation: both the modern built-in name and the alternative spelling.
         "gen_random_uuid" | "uuid_generate_v4" => F::UuidGenerateV4,
         // System functions.

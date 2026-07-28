@@ -848,9 +848,14 @@ fn eval_scalar_function(
                 .collect(),
         ),
         // Vector distance functions. NULL operands already returned NULL above.
-        (F::L2Distance | F::CosineDistance | F::InnerProduct, args) => {
+        (F::L2Distance | F::CosineDistance | F::InnerProduct | F::L1Distance, args) => {
             eval_vector_distance(func, args)?
         },
+        // Unary vector functions: dimension count (INT) and Euclidean norm (FLOAT).
+        (F::VectorDims, [ast::Value::Vector(v)]) => {
+            ast::Value::Int(i64::try_from(v.len()).unwrap_or(i64::MAX))
+        },
+        (F::VectorNorm, [ast::Value::Vector(v)]) => ast::Value::Float(crate::vector::norm(v)),
         // Arity/type mismatch is impossible after analysis — fall back to NULL defensively.
         _ => ast::Value::Null,
     })
@@ -3791,6 +3796,7 @@ fn eval_vector_distance(func: ast::ScalarFunc, args: &[ast::Value]) -> Result<as
     let metric = match func {
         F::L2Distance => crate::vector::l2_distance,
         F::CosineDistance => crate::vector::cosine_distance,
+        F::L1Distance => crate::vector::l1_distance,
         // The `inner_product()` function is the raw *positive* dot product `a · b`; only the `<#>`
         // operator negates it (for "smaller = closer" ordering).
         _ => crate::vector::dot,

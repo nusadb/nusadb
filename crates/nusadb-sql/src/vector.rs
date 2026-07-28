@@ -62,6 +62,29 @@ pub fn dot(a: &[f32], b: &[f32]) -> Option<f64> {
     )
 }
 
+/// Manhattan (taxicab) distance `Σ |aᵢ − bᵢ|`, or `None` if the dimensions differ.
+#[must_use]
+pub fn l1_distance(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    Some(
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
+            .sum(),
+    )
+}
+
+/// The Euclidean norm (magnitude) `‖a‖₂ = √(Σ aᵢ²)`.
+#[must_use]
+pub fn norm(a: &[f32]) -> f64 {
+    a.iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        .sqrt()
+}
+
 /// Euclidean distance `‖a − b‖₂`, or `None` if the dimensions differ.
 #[must_use]
 pub fn l2_distance(a: &[f32], b: &[f32]) -> Option<f64> {
@@ -166,5 +189,15 @@ mod tests {
     #[test]
     fn zero_vector_cosine_is_max_distance() {
         assert_eq!(cosine_distance(&[0.0, 0.0], &[1.0, 1.0]), Some(1.0));
+    }
+
+    #[test]
+    fn l1_distance_and_norm_match_hand_computed() {
+        // L1 of [1,2,3] and [4,6,8] = 3 + 4 + 5 = 12.
+        assert!((l1_distance(&[1.0, 2.0, 3.0], &[4.0, 6.0, 8.0]).unwrap() - 12.0).abs() < 1e-9);
+        assert_eq!(l1_distance(&[1.0], &[1.0, 2.0]), None); // dimension mismatch
+        // Norm of [3,4] = 5; the empty vector has norm 0.
+        assert!((norm(&[3.0, 4.0]) - 5.0).abs() < 1e-9);
+        assert!(norm(&[]).abs() < 1e-9);
     }
 }

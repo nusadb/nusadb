@@ -78,6 +78,27 @@ SELECT inner_product(embedding, '[2,3,0]'::VECTOR(3)) FROM items ORDER BY id
 3.000
 5.000
 
+# l1_distance() is the Manhattan distance Σ|aᵢ−bᵢ|.
+query R
+SELECT l1_distance('[1,2,3]'::VECTOR(3), '[4,6,8]'::VECTOR(3))
+----
+12.000
+
+# vector_dims() returns the dimension count as INT; vector_norm() the Euclidean magnitude.
+query I
+SELECT vector_dims('[1,2,3,4]'::VECTOR(4))
+----
+4
+
+query R
+SELECT vector_norm('[3,4]'::VECTOR(2))
+----
+5.000
+
+# A dimension mismatch in l1_distance is a type error.
+statement error
+SELECT l1_distance('[1,2,3]'::VECTOR(3), '[1,2]'::VECTOR(2))
+
 # A NULL operand propagates NULL through the operator.
 query T
 SELECT NULL <=> '[1,0,0]'::VECTOR(3)
