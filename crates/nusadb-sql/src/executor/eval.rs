@@ -2764,11 +2764,13 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         // Numeric widening / narrowing.
         (ast::Value::Int(i), ColumnType::Float) => Ok(ast::Value::Float(*i as f64)),
         (ast::Value::Float(f), ColumnType::Int) => {
-            // Round half-away-from-zero, then bounds-check. A bare `*f as i64` saturates —
-            // NaN→0, ±inf/overflow→i64::MIN/MAX — yielding a *wrong value as success*; SQL requires a
-            // non-finite or out-of-range float→int cast to error. `[i64::MIN, 2^63)` is the exact
-            // representable range; `2^63` itself (the rounded-up `i64::MAX as f64`) is out of range.
-            let rounded = f.round();
+            // Round half-to-even (banker's rounding: `2.5`→2, `3.5`→4), then bounds-check. This is
+            // how a floating-point value casts to an integer under the reference engine, and matches
+            // IEEE-754's default rounding. A bare `*f as i64` saturates — NaN→0, ±inf/overflow→
+            // i64::MIN/MAX — yielding a *wrong value as success*; SQL requires a non-finite or
+            // out-of-range float→int cast to error. `[i64::MIN, 2^63)` is the exact representable
+            // range; `2^63` itself (the rounded-up `i64::MAX as f64`) is out of range.
+            let rounded = f.round_ties_even();
             if !rounded.is_finite()
                 || rounded < i64::MIN as f64
                 || rounded >= 9_223_372_036_854_775_808.0

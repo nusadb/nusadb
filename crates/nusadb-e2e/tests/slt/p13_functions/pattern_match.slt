@@ -52,6 +52,34 @@ SELECT 'hello_world' LIKE 'hello#_world' ESCAPE '#'
 ----
 1
 
+# With no ESCAPE clause the default escape character is backslash (SQL-standard), so `\%` and `\_`
+# match a literal `%`/`_`.
+query T
+SELECT '100%' LIKE '100\%'
+----
+1
+
+query T
+SELECT '100x' LIKE '100\%'
+----
+0
+
+query T
+SELECT 'a_b' LIKE 'a\_b'
+----
+1
+
+query T
+SELECT 'axb' LIKE 'a\_b'
+----
+0
+
+# An explicit empty ESCAPE disables the escape character, so a backslash is literal.
+query T
+SELECT '100\x' LIKE '100\%' ESCAPE ''
+----
+1
+
 query T
 SELECT 'hello_world' LIKE 'hello_world'
 ----

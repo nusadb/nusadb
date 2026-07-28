@@ -1027,28 +1027,29 @@ pub(super) fn convert_function_call(function: sql::Function) -> Result<ast::Expr
     }
 }
 
-/// Extract the single `LIKE`/`ILIKE` `ESCAPE 'c'` character from sqlparser's string model, rejecting
-/// a multi-character or empty escape.
+/// Resolve the `LIKE`/`ILIKE` escape character: the explicit `ESCAPE 'c'` if given, else the
+/// default backslash. `None` means no escape character (an explicit `ESCAPE ''`); a multi-character
+/// escape is rejected.
 fn like_escape_char(escape_char: Option<sql::ValueWithSpan>) -> Result<Option<char>, Error> {
-    escape_char
-        .map(|v| {
-            let s = match v.value {
-                sql::Value::SingleQuotedString(s)
-                | sql::Value::DoubleQuotedString(s)
-                | sql::Value::EscapedStringLiteral(s)
-                | sql::Value::UnicodeStringLiteral(s) => s,
-                other => return unsupported(&format!("LIKE ESCAPE value `{other}`")),
-            };
-            let mut chars = s.chars();
-            let ch = chars.next();
-            if ch.is_some() && chars.next().is_some() {
-                return unsupported("LIKE ESCAPE must be a single character");
-            }
-            ch.ok_or_else(|| {
-                Error::Unsupported("LIKE ESCAPE must be a non-empty character".to_owned())
-            })
-        })
-        .transpose()
+    // With no `ESCAPE` clause the default escape character is backslash, so `\%` and `\_` match a
+    // literal `%`/`_` (SQL-standard).
+    let Some(v) = escape_char else {
+        return Ok(Some('\\'));
+    };
+    let s = match v.value {
+        sql::Value::SingleQuotedString(s)
+        | sql::Value::DoubleQuotedString(s)
+        | sql::Value::EscapedStringLiteral(s)
+        | sql::Value::UnicodeStringLiteral(s) => s,
+        other => return unsupported(&format!("LIKE ESCAPE value `{other}`")),
+    };
+    let mut chars = s.chars();
+    let ch = chars.next();
+    if ch.is_some() && chars.next().is_some() {
+        return unsupported("LIKE ESCAPE must be a single character");
+    }
+    // An explicit empty `ESCAPE ''` disables the escape character entirely.
+    Ok(ch)
 }
 
 /// Map a folded function name to its [`ast::ScalarFunc`] when it is a recognised scalar built-in

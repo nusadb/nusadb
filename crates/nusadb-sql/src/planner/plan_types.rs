@@ -1487,8 +1487,9 @@ pub enum TypedExprKind {
         pattern: Box<TypedExpr>,
         /// `true` for `NOT LIKE`.
         negated: bool,
-        /// `ESCAPE 'c'` character: in the pattern, `c` makes the next `%`/`_`/`c` a literal. `None`
-        /// (no `ESCAPE` clause) keeps the default — no escape, so `%`/`_` are always wildcards.
+        /// Escape character: in the pattern, `c` makes the next `%`/`_`/`c` a literal. Defaults to
+        /// backslash when there is no `ESCAPE` clause; `None` means escaping is disabled (an explicit
+        /// `ESCAPE ''`), so `%`/`_` are always wildcards.
         escape: Option<char>,
         /// `true` for `ILIKE`: letters match case-insensitively, per character in the matcher
         /// (deep-gate #12).

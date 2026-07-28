@@ -87,3 +87,35 @@ SELECT b + 1 FROM bc ORDER BY b
 ----
 5000000001
 9223372036854775807
+
+# --- FLOAT → INT cast rounds half-to-even (banker's rounding), matching IEEE-754 ---
+query I
+SELECT 2.5::FLOAT::INT
+----
+2
+
+query I
+SELECT 3.5::FLOAT::INT
+----
+4
+
+query I
+SELECT 0.5::FLOAT::INT
+----
+0
+
+query I
+SELECT (-2.5)::FLOAT::INT
+----
+-2
+
+# A non-tie rounds to the nearest as usual.
+query I
+SELECT 2.4::FLOAT::INT
+----
+2
+
+query I
+SELECT 2.6::FLOAT::INT
+----
+3

@@ -2218,8 +2218,21 @@ fn in_list_is_not_a_subquery() {
 // --- LIKE ... ESCAPE ------------------------------------------
 
 #[test]
-fn like_without_escape_has_none() {
+fn like_without_escape_defaults_to_backslash() {
+    // No ESCAPE clause → the SQL-standard default escape character, backslash.
     let ast::Statement::Select(s) = ok("SELECT * FROM t WHERE a LIKE 'x%'") else {
+        panic!("expected Select");
+    };
+    let ast::Expr::Like { escape, .. } = s.filter.unwrap() else {
+        panic!("expected Like in filter");
+    };
+    assert_eq!(escape, Some('\\'));
+}
+
+#[test]
+fn like_with_empty_escape_disables_escaping() {
+    // An explicit `ESCAPE ''` disables the escape character entirely.
+    let ast::Statement::Select(s) = ok("SELECT * FROM t WHERE a LIKE 'x%' ESCAPE ''") else {
         panic!("expected Select");
     };
     let ast::Expr::Like { escape, .. } = s.filter.unwrap() else {

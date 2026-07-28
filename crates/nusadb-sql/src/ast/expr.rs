@@ -98,8 +98,9 @@ pub enum Expr {
         pattern: Box<Self>,
         /// `true` for `NOT LIKE`, `false` for `LIKE`.
         negated: bool,
-        /// `ESCAPE 'c'` — a single character that escapes the next `%` or `_` in the
-        /// pattern; `None` when absent (default SQL escape semantics apply).
+        /// Escape character: a single character that escapes the next `%` or `_` in the pattern.
+        /// Defaults to backslash when there is no `ESCAPE` clause; `None` means escaping is disabled
+        /// (an explicit `ESCAPE ''`).
         escape: Option<char>,
         /// `true` for `ILIKE` — letters match case-insensitively. Done in the matcher (not by
         /// lower-casing both sides), so a single `_` still matches one source character even when a
