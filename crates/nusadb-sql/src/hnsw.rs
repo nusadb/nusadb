@@ -57,7 +57,7 @@ impl Metric {
         let d = match self {
             Self::L2 => crate::vector::l2_distance(a, b),
             Self::Cosine => crate::vector::cosine_distance(a, b),
-            Self::InnerProduct => crate::vector::inner_product(a, b),
+            Self::InnerProduct => crate::vector::neg_inner_product(a, b),
         };
         d.unwrap_or(f64::INFINITY)
     }

@@ -11,8 +11,9 @@
 //! Distance metrics (all return *distances* — smaller means more similar):
 //! - [`l2_distance`] — Euclidean distance `‖a − b‖₂`.
 //! - [`cosine_distance`] — `1 − cosθ`; the metric bound to the `<=>` operator.
-//! - [`inner_product`] — the *negative* dot product `−(a · b)`, so that, like the others, a smaller
-//!   value is a closer match (bound to the `<#>` operator). [`dot`] exposes the raw dot product.
+//! - [`neg_inner_product`] — the *negative* dot product `−(a · b)`, so that, like the others, a
+//!   smaller value is a closer match (the `<#>` distance form). [`dot`] exposes the raw dot product,
+//!   which is what the `inner_product()` function returns.
 
 /// Parse a bracketed text literal `[x, y, z]` into its component `f32`s.
 ///
@@ -104,9 +105,11 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> Option<f64> {
 /// The negative dot product `−(a · b)`, or `None` if the dimensions differ (the `<#>` operator).
 ///
 /// Negated so that — as with [`l2_distance`] and [`cosine_distance`] — a *smaller* value means a
-/// closer match, which is what a top-K nearest-neighbour `ORDER BY ... LIMIT k` wants.
+/// closer match, which is what a top-K nearest-neighbour `ORDER BY ... LIMIT k` wants. The
+/// `inner_product(a, b)` **function** returns the raw *positive* dot product ([`dot`]); only this
+/// operator form negates.
 #[must_use]
-pub fn inner_product(a: &[f32], b: &[f32]) -> Option<f64> {
+pub fn neg_inner_product(a: &[f32], b: &[f32]) -> Option<f64> {
     dot(a, b).map(|d| -d)
 }
 
@@ -139,20 +142,24 @@ mod tests {
         assert!((l2_distance(&a, &b).unwrap() - std::f64::consts::SQRT_2).abs() < 1e-9);
         // Orthogonal → cosine similarity 0 → cosine distance 1.
         assert!((cosine_distance(&a, &b).unwrap() - 1.0).abs() < 1e-9);
-        // Dot is 0 → inner_product (negated) is 0.
-        assert!(inner_product(&a, &b).unwrap().abs() < 1e-9);
+        // Dot is 0 → neg_inner_product is 0. The positive dot product is `dot`.
+        assert!(neg_inner_product(&a, &b).unwrap().abs() < 1e-9);
+        assert!(dot(&a, &b).unwrap().abs() < 1e-9);
         // Identical unit vectors → cosine distance 0, L2 0.
         assert!(cosine_distance(&a, &a).unwrap().abs() < 1e-9);
         assert!(l2_distance(&a, &a).unwrap().abs() < 1e-9);
-        // inner_product of [1,2,3]·[4,5,6] = 32 → negated −32.
-        assert!((inner_product(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() + 32.0).abs() < 1e-9);
+        // dot of [1,2,3]·[4,5,6] = 32 (the `inner_product()` function); the operator negates to −32.
+        assert!((dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() - 32.0).abs() < 1e-9);
+        assert!(
+            (neg_inner_product(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() + 32.0).abs() < 1e-9
+        );
     }
 
     #[test]
     fn dimension_mismatch_is_none() {
         assert_eq!(l2_distance(&[1.0], &[1.0, 2.0]), None);
         assert_eq!(cosine_distance(&[1.0], &[1.0, 2.0]), None);
-        assert_eq!(inner_product(&[1.0], &[1.0, 2.0]), None);
+        assert_eq!(neg_inner_product(&[1.0], &[1.0, 2.0]), None);
         assert_eq!(dot(&[1.0], &[1.0, 2.0]), None);
     }
 

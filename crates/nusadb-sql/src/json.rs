@@ -78,11 +78,13 @@ pub fn get_index(json: &str, index: i64) -> Option<String> {
     arr.get(idx).map(to_text)
 }
 
-/// `json ->> field` — like [`get_field`] but returns the member as **text**: a JSON string yields
-/// its raw contents (unquoted); anything else yields its canonical JSON text.
+/// `json ->> field` — like [`get_field`] but returns the member as **text**.
+///
+/// A JSON string yields its raw contents (unquoted); anything else yields its canonical JSON text;
+/// a JSON `null` member yields SQL `NULL`.
 #[must_use]
 pub fn get_field_text(json: &str, key: &str) -> Option<String> {
-    parse(json)?.get(key).map(scalar_text)
+    scalar_text_opt(parse(json)?.get(key)?)
 }
 
 /// `json ->> n` — like [`get_index`] but returns the element as text (see [`get_field_text`]).
@@ -91,7 +93,7 @@ pub fn get_index_text(json: &str, index: i64) -> Option<String> {
     let v = parse(json)?;
     let arr = v.as_array()?;
     let idx = resolve_index(index, arr.len())?;
-    arr.get(idx).map(scalar_text)
+    scalar_text_opt(arr.get(idx)?)
 }
 
 /// `a @> b` — does the JSON document `a` contain `b`? `None` if either side is invalid JSON.
@@ -120,9 +122,10 @@ pub fn get_path(json: &str, path: &[&str]) -> Option<String> {
 }
 
 /// `json #>> path` — like [`get_path`] but returns the final value as text (see [`get_field_text`]).
+/// A JSON `null` at the end of the path yields SQL `NULL`.
 #[must_use]
 pub fn get_path_text(json: &str, path: &[&str]) -> Option<String> {
-    navigate(parse(json)?, path).as_ref().map(scalar_text)
+    scalar_text_opt(navigate(parse(json)?, path).as_ref()?)
 }
 
 /// `json_array_elements(json)` — the elements of a JSON array, each as canonical JSON text.
@@ -509,6 +512,16 @@ fn scalar_text(v: &J) -> String {
     match v {
         J::String(s) => s.clone(),
         other => to_text(other),
+    }
+}
+
+/// Like [`scalar_text`], but a JSON `null` becomes SQL `NULL` (`None`) rather than the text
+/// `"null"`. The `->>` / `#>>` text accessors return SQL NULL for a JSON null, so an `IS NULL`
+/// test on an extracted-text value behaves as expected.
+fn scalar_text_opt(v: &J) -> Option<String> {
+    match v {
+        J::Null => None,
+        other => Some(scalar_text(other)),
     }
 }
 

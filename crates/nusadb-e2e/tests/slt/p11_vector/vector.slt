@@ -70,13 +70,13 @@ SELECT cosine_distance(embedding, '[1,0,0]'::VECTOR(3)) FROM items ORDER BY id
 1.000
 0.293
 
-# inner_product is the negative dot product (smaller = closer); query vector [2,3,0].
+# inner_product() is the raw (positive) dot product a·b; query vector [2,3,0].
 query R
 SELECT inner_product(embedding, '[2,3,0]'::VECTOR(3)) FROM items ORDER BY id
 ----
--2.000
--3.000
--5.000
+2.000
+3.000
+5.000
 
 # A NULL operand propagates NULL through the operator.
 query T

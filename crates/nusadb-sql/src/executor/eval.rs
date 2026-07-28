@@ -3789,7 +3789,9 @@ fn eval_vector_distance(func: ast::ScalarFunc, args: &[ast::Value]) -> Result<as
     let metric = match func {
         F::L2Distance => crate::vector::l2_distance,
         F::CosineDistance => crate::vector::cosine_distance,
-        _ => crate::vector::inner_product,
+        // The `inner_product()` function is the raw *positive* dot product `a · b`; only the `<#>`
+        // operator negates it (for "smaller = closer" ordering).
+        _ => crate::vector::dot,
     };
     metric(a, b)
         .map(ast::Value::Float)

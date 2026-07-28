@@ -372,3 +372,45 @@ query T
 SELECT CAST(JSONB_EXISTS(CAST(NULL AS JSON), 'a') AS TEXT)
 ----
 NULL
+
+# A JSON `null` fetched as text (`->>` / `#>>`) is SQL NULL, not the text 'null', so `IS NULL`
+# holds — while `->` keeps it as a JSON null value.
+statement ok
+CREATE TABLE jnull (id INT NOT NULL, body JSON)
+
+statement ok
+INSERT INTO jnull VALUES (1, '{"nn": null, "s": "null", "n": 5}')
+
+query T
+SELECT body ->> 'nn' FROM jnull WHERE id = 1
+----
+NULL
+
+query I
+SELECT id FROM jnull WHERE (body ->> 'nn') IS NULL
+----
+1
+
+# A JSON string that happens to be "null" is still the text 'null' (not SQL NULL).
+query T
+SELECT body ->> 's' FROM jnull WHERE id = 1
+----
+null
+
+# `->` keeps a JSON null as a JSON null value (rendered `null`), unlike `->>`.
+query T
+SELECT body -> 'nn' FROM jnull WHERE id = 1
+----
+null
+
+# `#>>` path text on a JSON null is also SQL NULL.
+query T
+SELECT body #>> '{nn}' FROM jnull WHERE id = 1
+----
+NULL
+
+# A non-null sibling still extracts as text.
+query T
+SELECT body ->> 'n' FROM jnull WHERE id = 1
+----
+5
