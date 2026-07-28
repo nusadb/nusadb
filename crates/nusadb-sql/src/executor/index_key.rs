@@ -90,20 +90,82 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         // Text / BYTEA: byte-stuffed and 0x00-terminated so a prefix sorts before its extensions.
         ast::Value::Text(s) => encode_ordered_bytes(s.as_bytes(), out),
         ast::Value::Bytes(b) => encode_ordered_bytes(b, out),
+        // NUMERIC: a fixed-width canonical decimal layout (see `encode_numeric`).
+        ast::Value::Numeric(d) => encode_numeric(d, out)?,
         // No v1 order-preserving form.
-        ast::Value::Numeric(_)
-        | ast::Value::Json(_)
+        ast::Value::Json(_)
         | ast::Value::Interval(_)
         | ast::Value::Array(_)
         | ast::Value::Vector(_) => {
             return Err(Error::Unsupported(
-                "NUMERIC / JSON / INTERVAL / ARRAY / VECTOR columns cannot yet be index keys"
-                    .to_owned(),
+                "JSON / INTERVAL / ARRAY / VECTOR columns cannot yet be index keys".to_owned(),
             ));
         },
         ast::Value::Null => {
             unreachable!("encode_field handles NULL before calling encode_non_null")
         },
+    }
+    Ok(())
+}
+
+/// The largest `i128` magnitude has 39 decimal digits, and the fractional scale is capped at
+/// [`numeric::MAX_SCALE`] (38), so every `NUMERIC` value fits in a fixed grid of 39 integer + 38
+/// fractional digit columns.
+const NUMERIC_INT_DIGITS: usize = 39;
+const NUMERIC_FRAC_DIGITS: usize = crate::numeric::MAX_SCALE as usize;
+
+/// Encode a `NUMERIC` order-preservingly as a **fixed-width canonical decimal**: a sign-class byte
+/// (negative sorts before non-negative), then 39 integer digit columns (left-padded with `0`) and
+/// 38 fractional digit columns (right-padded with `0`), each digit as its ASCII byte. Fixed-width
+/// columns make leading/trailing zeros align magnitudes, so byte order equals numeric order, and two
+/// spellings of the same value (`1.5` and `1.50`) produce identical bytes — the equality an index
+/// needs. For a negative value every digit is inverted (`9 − d`) so a larger magnitude sorts lower.
+fn encode_numeric(d: &crate::numeric::Decimal, out: &mut Vec<u8>) -> Result<(), Error> {
+    let scale = d.scale as usize;
+    if scale > NUMERIC_FRAC_DIGITS {
+        return Err(Error::Unsupported(
+            "NUMERIC scale beyond the index key limit".to_owned(),
+        ));
+    }
+    let negative = d.mantissa < 0;
+    // Sign class: negatives (0x00) sort before zero and positives (0x02); zero's all-`0` digits sort
+    // below any positive within the non-negative branch.
+    out.push(if negative { 0x00 } else { 0x02 });
+
+    // Decimal digits of the magnitude (no leading zeros; "0" for zero). `unsigned_abs` handles
+    // `i128::MIN`, whose magnitude does not fit in `i128`.
+    let digits = d.mantissa.unsigned_abs().to_string();
+    let dbytes = digits.as_bytes();
+    let dlen = dbytes.len();
+    // The last `scale` digits are fractional; the rest are the integer part. When the magnitude is
+    // below 1 (`dlen <= scale`), the integer part is empty and the fraction gets leading zeros.
+    let frac_padded;
+    let (int_part, frac_part): (&[u8], &[u8]) = if dlen > scale {
+        dbytes.split_at(dlen - scale)
+    } else {
+        frac_padded = {
+            let mut f = vec![b'0'; scale - dlen];
+            f.extend_from_slice(dbytes);
+            f
+        };
+        (b"", frac_padded.as_slice())
+    };
+
+    // Emit a digit column, inverting for negatives so a larger magnitude sorts lower.
+    let emit = |out: &mut Vec<u8>, c: u8| out.push(if negative { b'9' - (c - b'0') } else { c });
+    // Integer part, left-padded to 39 columns.
+    for _ in 0..NUMERIC_INT_DIGITS - int_part.len() {
+        emit(out, b'0');
+    }
+    for &c in int_part {
+        emit(out, c);
+    }
+    // Fractional part, right-padded to 38 columns.
+    for &c in frac_part {
+        emit(out, c);
+    }
+    for _ in 0..NUMERIC_FRAC_DIGITS - frac_part.len() {
+        emit(out, b'0');
     }
     Ok(())
 }
@@ -167,6 +229,76 @@ mod tests {
     #[test]
     fn nan_float_is_rejected() {
         assert!(encode_index_key(&[ast::Value::Float(f64::NAN)]).is_err());
+    }
+
+    #[test]
+    fn numeric_is_order_preserving_and_scale_canonical() {
+        use crate::numeric::Decimal;
+        let dec = |m: i128, s: u8| Decimal {
+            mantissa: m,
+            scale: s,
+        };
+        let key = |d: Decimal| encode_index_key(&[ast::Value::Numeric(d)]).unwrap();
+
+        // Explicit, hand-verified orderings — not relying on `Decimal::compare`.
+        assert!(key(dec(-15, 1)) < key(dec(0, 0))); // -1.5 < 0
+        assert!(key(dec(0, 0)) < key(dec(15, 1))); //  0  < 1.5
+        assert_eq!(key(dec(15, 1)), key(dec(150, 2))); // 1.5 == 1.50 (scale-canonical)
+        assert_eq!(key(dec(0, 0)), key(dec(0, 7))); //  0  == 0.0000000
+        assert!(key(dec(5, 2)) < key(dec(5, 1))); // 0.05 < 0.5
+        assert!(key(dec(-25, 1)) < key(dec(-15, 1))); // -2.5 < -1.5
+        assert!(key(dec(149, 2)) < key(dec(15, 1))); // 1.49 < 1.5
+        assert!(key(dec(15, 1)) < key(dec(151, 2))); // 1.5  < 1.51
+
+        // A diverse set plus a deterministic pseudo-random sweep, cross-compared against the exact
+        // `Decimal::compare`. Skip the rare extreme cross-scale pairs where `compare` itself takes a
+        // rescale-overflow fallback (it is not the oracle there); the fixed-width encoding is exact.
+        let mut values: Vec<Decimal> = vec![
+            dec(0, 0),
+            dec(1, 0),
+            dec(15, 1),
+            dec(150, 2),
+            dec(149, 2),
+            dec(151, 2),
+            dec(-15, 1),
+            dec(-150, 2),
+            dec(5, 2),
+            dec(5, 1),
+            dec(-5, 2),
+            dec(i128::MAX, 0),
+            dec(i128::MIN, 0),
+            dec(i128::MAX, 38),
+            dec(i128::MIN, 38),
+            dec(1, 38),
+            dec(-1, 38),
+        ];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        for _ in 0..400 {
+            let m = (u128::from(next()) | (u128::from(next()) << 64)).cast_signed();
+            let s = (next() % 39) as u8;
+            values.push(dec(m, s));
+        }
+
+        for &a in &values {
+            for &b in &values {
+                let common = a.scale.max(b.scale);
+                if a.rescale(common).is_none() || b.rescale(common).is_none() {
+                    continue; // `compare` is not exact for this pair; encoding still is.
+                }
+                let by_bytes = key(a).cmp(&key(b));
+                let by_value = a.compare(&b);
+                assert_eq!(
+                    by_bytes, by_value,
+                    "order mismatch: {a:?} vs {b:?} — value {by_value:?}, bytes {by_bytes:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2451,6 +2451,56 @@ fn sum_bigint_promotes_to_exact_numeric() {
 }
 
 #[test]
+fn index_on_numeric_column() {
+    // A NUMERIC column can be indexed: the index builds, equality and range predicates return the
+    // right rows, and two spellings of the same value (5.0 vs 5.00) match the same key.
+    let engine = BtreeEngine::new();
+    let num = |s: &str| Value::Numeric(nusadb_sql::numeric::Decimal::parse(s).expect("decimal"));
+    run(
+        &engine,
+        "CREATE TABLE accounts (id INT NOT NULL, balance NUMERIC(12,2))",
+    );
+    run(
+        &engine,
+        "CREATE INDEX accounts_balance ON accounts (balance)",
+    );
+    run(
+        &engine,
+        "INSERT INTO accounts VALUES (1, 5.00), (2, 100.50), (3, -20.25), (4, 5.0), (5, 1000000.99)",
+    );
+
+    // Equality: 5.0 and 5.00 are the same value, so both rows 1 and 4 match.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM accounts WHERE balance = 5.0 ORDER BY id"
+        )),
+        vec![vec![Value::Int(1)], vec![Value::Int(4)]]
+    );
+    // Range, including a negative bound — rows come back in value order.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, balance FROM accounts WHERE balance BETWEEN -50 AND 200 ORDER BY balance"
+        )),
+        vec![
+            vec![Value::Int(3), num("-20.25")],
+            vec![Value::Int(1), num("5.00")],
+            vec![Value::Int(4), num("5.00")],
+            vec![Value::Int(2), num("100.50")],
+        ]
+    );
+    // A greater-than predicate.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM accounts WHERE balance > 500 ORDER BY id"
+        )),
+        vec![vec![Value::Int(5)]]
+    );
+}
+
+#[test]
 fn vectorized_scan_over_declared_metadata_types() {
     // A column whose declared type differs from its physical type only as DDL metadata — BIGINT /
     // SMALLINT (physical Int64), VARCHAR(n) / CHAR(n) (physical text) — must flow through the

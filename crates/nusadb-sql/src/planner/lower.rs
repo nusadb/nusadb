@@ -718,13 +718,27 @@ pub(super) fn try_index_scan(
         // An equality bound on this (single-column, hence whole-key) index of a UNIQUE index
         // matches at most one row — the property the reactor-inline point-get gate requires.
         let unique_point = eq.is_some() && index.unique;
+        // The index-key encoding is per the column's type, so a bound value must be coerced to it
+        // (e.g. an integer bound on a NUMERIC column), or its bytes would not line up with the keys.
+        let col_ty = table.columns.get(col)?.ty;
         // Equality is the tightest bound (`lo == hi`, both inclusive). Otherwise use whatever
         // open/closed range bounds the predicate supplied; skip the index if it gave neither.
         let (lo_bound, hi_bound) = if let Some(value) = eq {
-            let key = vec![value.clone()];
+            // An equality bound must coerce exactly to the column type, or the index cannot serve it.
+            let Some(key_val) = coerce_index_bound(value, col_ty) else {
+                continue;
+            };
+            let key = vec![key_val];
             (Bound::Included(key.clone()), Bound::Included(key))
         } else if lo.is_some() || hi.is_some() {
-            (range_bound(lo), range_bound(hi))
+            // Coerce each range side; a side that cannot coerce becomes `Unbounded` (the retained
+            // filter still removes the extra rows — a superset scan, which is correctness-safe).
+            let lo_c = lo.and_then(|(v, inc)| coerce_index_bound(v, col_ty).map(|c| (c, inc)));
+            let hi_c = hi.and_then(|(v, inc)| coerce_index_bound(v, col_ty).map(|c| (c, inc)));
+            if lo_c.is_none() && hi_c.is_none() {
+                continue; // neither bound survived coercion → the index cannot serve this predicate
+            }
+            (range_bound(lo_c), range_bound(hi_c))
         } else {
             continue;
         };
@@ -795,26 +809,28 @@ const fn flip_comparison(op: ast::BinaryOp) -> Option<ast::BinaryOp> {
     })
 }
 
-/// Build a key bound from an optional `(value, inclusive)`; `None` → `Unbounded`.
-fn range_bound(bound: Option<(&ast::Value, bool)>) -> Bound<Vec<ast::Value>> {
+/// Build a key bound from an optional coerced `(value, inclusive)`; `None` → `Unbounded`.
+fn range_bound(bound: Option<(ast::Value, bool)>) -> Bound<Vec<ast::Value>> {
     match bound {
-        Some((value, true)) => Bound::Included(vec![value.clone()]),
-        Some((value, false)) => Bound::Excluded(vec![value.clone()]),
+        Some((value, true)) => Bound::Included(vec![value]),
+        Some((value, false)) => Bound::Excluded(vec![value]),
         None => Bound::Unbounded,
     }
 }
 
 /// Whether `value`'s order-preserving index-key bytes compare *exactly* like the value itself, so an
 /// index bound built from it neither misses nor mis-orders rows. This is the set whose
-/// `encode_index_key` byte-equality matches value-equality and whose byte-order matches value-order:
-/// `Float`/`Numeric` are excluded (e.g. `-0.0`/`+0.0` and unequal NUMERIC scales encode differently
-/// yet compare equal — an equality index probe would miss rows), as are the composite/opaque types
-/// the encoder rejects. Mirrors the executor's hash-safe set, minus `NULL` (never an equality match).
+/// `encode_index_key` byte-equality matches value-equality and whose byte-order matches value-order.
+/// `NUMERIC` qualifies: its key encoding is scale-canonical, so `1.5` and `1.50` produce identical
+/// bytes. `Float` is excluded (`-0.0`/`+0.0` encode differently yet compare equal — an equality probe
+/// would miss rows), as are the composite/opaque types the encoder rejects. Mirrors the executor's
+/// hash-safe set, minus `NULL` (never an equality match).
 const fn is_index_safe_value(value: &ast::Value) -> bool {
     matches!(
         value,
         ast::Value::Bool(_)
             | ast::Value::Int(_)
+            | ast::Value::Numeric(_)
             | ast::Value::Text(_)
             | ast::Value::Date(_)
             | ast::Value::Time(_)
@@ -822,6 +838,25 @@ const fn is_index_safe_value(value: &ast::Value) -> bool {
             | ast::Value::TimestampTz(_)
             | ast::Value::Uuid(_)
     )
+}
+
+/// Coerce a constant index-bound value to the index column's type so its order-preserving encoding
+/// matches the stored keys. A `NUMERIC` column accepts any `NUMERIC` bound (the encoding is
+/// scale-canonical) and widens an integer bound exactly; any other column accepts only a bound that
+/// already encodes as its type. `None` when no exact coercion applies — the caller then drops the
+/// bound and lets the retained filter handle the predicate on a sequential scan.
+fn coerce_index_bound(value: &ast::Value, target: ColumnType) -> Option<ast::Value> {
+    use ast::Value;
+    match (value, target.physical()) {
+        (Value::Numeric(_), ColumnType::Numeric { .. }) => Some(value.clone()),
+        (Value::Int(i), ColumnType::Numeric { .. }) => {
+            Some(Value::Numeric(crate::numeric::Decimal::from_i64(*i)))
+        },
+        (v, col) if crate::executor::row::runtime_type_of(v).physical() == col => {
+            Some(value.clone())
+        },
+        _ => None,
+    }
 }
 
 /// Detect the `ORDER BY col <=> q LIMIT k` shape over a plain single-table scan that lowers to a
