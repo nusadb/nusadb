@@ -1090,11 +1090,18 @@ fn plan_has_outer_column(plan: &crate::planner::SelectPlan) -> bool {
         .chain(plan.distinct_on.iter())
         .chain(plan.order_by.iter().map(|k| &k.expr))
         .chain(plan.joins.iter().map(|j| &j.on))
+        // Every per-row expression a call owns has to be here. Missing one calls a correlated
+        // subquery uncorrelated, so it is evaluated once and that answer is reused for every outer
+        // row: `array_agg(x ORDER BY <outer>)` then returns one fixed order, and a statistics
+        // pair reading an outer value returns NULL. Both look like ordinary answers.
         .chain(plan.aggregates.iter().filter_map(|a| a.arg.as_ref()))
-        // A row-value COUNT reads its columns through `row_args`; missing them here would call a
-        // correlated subquery uncorrelated, evaluate it once, and reuse that answer for every
-        // outer row.
+        .chain(plan.aggregates.iter().filter_map(|a| a.arg2.as_ref()))
         .chain(plan.aggregates.iter().flat_map(|a| a.row_args.iter()))
+        .chain(
+            plan.aggregates
+                .iter()
+                .flat_map(|a| a.order_by.iter().map(|k| &k.expr)),
+        )
         .chain(plan.aggregates.iter().filter_map(|a| a.filter.as_ref()))
         .chain(plan.windows.iter().flat_map(|w| w.args.iter()))
         .chain(plan.windows.iter().flat_map(|w| w.partition.iter()))

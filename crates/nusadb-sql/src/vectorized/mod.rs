@@ -214,8 +214,10 @@ fn try_build(
             }
             let exprs_ok = calls.iter().all(|c| {
                 c.arg.as_ref().is_none_or(expr_is_vectorizable)
+                    && c.arg2.as_ref().is_none_or(expr_is_vectorizable)
                     && c.filter.as_ref().is_none_or(expr_is_vectorizable)
                     && c.row_args.iter().all(expr_is_vectorizable)
+                    && c.order_by.iter().all(|k| expr_is_vectorizable(&k.expr))
             });
             if !exprs_ok {
                 return Ok(None);

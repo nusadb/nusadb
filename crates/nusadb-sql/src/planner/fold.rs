@@ -49,11 +49,17 @@ fn fold_aggregate(agg: &mut AggregateCall) {
     if let Some(arg) = agg.arg.take() {
         agg.arg = Some(fold_expr(arg));
     }
+    if let Some(arg2) = agg.arg2.take() {
+        agg.arg2 = Some(fold_expr(arg2));
+    }
     if let Some(filter) = agg.filter.take() {
         agg.filter = Some(fold_expr(filter));
     }
     for field in &mut agg.row_args {
         fold_in_place(field);
+    }
+    for key in &mut agg.order_by {
+        fold_in_place(&mut key.expr);
     }
 }
 

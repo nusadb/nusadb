@@ -8550,3 +8550,68 @@ fn correlated_subquery_sees_an_outer_column_inside_a_row_value_count() {
     );
     assert_eq!(via_row, via_arg);
 }
+
+#[test]
+fn correlated_subquery_sees_an_outer_column_in_every_aggregate_slot() {
+    // An aggregate carries per-row expressions in several slots, and an outer reference in any of
+    // them makes the subquery correlated. Miss one and the subquery runs once, its answer reused
+    // for every outer row — which reads as an ordinary result, not an error. Each case below is
+    // built so the outer value changes the answer; otherwise it would pass either way.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE ot (id INT NOT NULL)");
+    run(&engine, "CREATE TABLE it (b INT NOT NULL)");
+    run(&engine, "INSERT INTO ot VALUES (1), (2)");
+    run(&engine, "INSERT INTO it VALUES (10), (20)");
+
+    // Second argument of a two-argument statistic: covar_pop(b, b*id) = id * var_pop(b) = id * 25.
+    // Left uncorrelated the outer column reads NULL, every pair is skipped, and the answer is NULL.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, (SELECT covar_pop(b, b * ot.id) FROM it) FROM ot ORDER BY id",
+        )),
+        vec![
+            vec![Value::Int(1), Value::Float(25.0)],
+            vec![Value::Int(2), Value::Float(50.0)],
+        ]
+    );
+
+    // In-aggregate ORDER BY: nearest-first, so the order flips between the two outer rows.
+    run(&engine, "CREATE TABLE ot2 (id INT NOT NULL)");
+    run(&engine, "INSERT INTO ot2 VALUES (9), (21)");
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, (SELECT array_agg(b ORDER BY abs(b - ot2.id)) FROM it) \
+             FROM ot2 ORDER BY id",
+        )),
+        vec![
+            vec![
+                Value::Int(9),
+                Value::Array(vec![Value::Int(10), Value::Int(20)])
+            ],
+            vec![
+                Value::Int(21),
+                Value::Array(vec![Value::Int(20), Value::Int(10)])
+            ],
+        ]
+    );
+
+    // The slots already covered, kept alongside so a future rewrite of the walker has the whole
+    // set in one place: plain argument, FILTER, and a row value's fields. Each is written so the
+    // outer value changes its answer — a composite of the bare columns would count 2 either way
+    // and would stay green with the walker broken.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, (SELECT sum(b * ot.id) FROM it), \
+             (SELECT count(*) FILTER (WHERE b > ot.id * 10) FROM it), \
+             (SELECT count(DISTINCT (CASE WHEN b > ot.id * 10 THEN 1 ELSE 0 END, 0)) FROM it) \
+             FROM ot ORDER BY id",
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(30), Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(60), Value::Int(0), Value::Int(1)],
+        ]
+    );
+}
