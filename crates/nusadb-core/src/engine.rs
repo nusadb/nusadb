@@ -687,6 +687,19 @@ pub trait StorageEngine: Send + Sync {
         self.list_tables()
     }
 
+    /// Every visible table as a `(schema, name)` pair, sorted — the schema-qualified counterpart of
+    /// [`list_tables_as_of`](Self::list_tables_as_of), used by `information_schema` so each table
+    /// reports its real namespace instead of a blanket `public`. The default places every table in
+    /// [`PUBLIC_SCHEMA`] (correct for a single-namespace test double); the durable engine overrides
+    /// it to return each table's actual `(schema, name)`.
+    fn list_tables_qualified_as_of(&self, txn: TxnId) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .list_tables_as_of(txn)?
+            .into_iter()
+            .map(|name| (PUBLIC_SCHEMA.to_owned(), name))
+            .collect())
+    }
+
     /// A monotonic counter that increases whenever committed data changes, for result caching:
     /// a cached result computed at version `v` is still valid iff `data_version()` is still
     /// `v`. `None` means the engine does not track a version, so callers must not cache (the default,

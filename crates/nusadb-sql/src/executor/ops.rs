@@ -2683,16 +2683,18 @@ fn info_schema_statistics(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<
 
 /// `information_schema.tables`: one row per user table or view.
 fn info_schema_tables(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
-    let names = engine.list_tables_as_of(txn)?;
-    let mut rows = Vec::with_capacity(names.len());
-    for name in &names {
+    let tables = engine.list_tables_qualified_as_of(txn)?;
+    let mut rows = Vec::with_capacity(tables.len());
+    for (schema, name) in &tables {
         // Skip system tables (nusadb_* prefix) from the engine's list.
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
         rows.push(vec![
             ast::Value::Text("nusadb".to_owned()),
-            ast::Value::Text("public".to_owned()),
+            // The table's real namespace, not a blanket `public` — so a schema-qualified table
+            // (`dev.t`) reports `dev`, letting driver/GUI catalog introspection place it correctly.
+            ast::Value::Text(schema.clone()),
             ast::Value::Text(name.clone()),
             ast::Value::Text("BASE TABLE".to_owned()),
         ]);
@@ -2706,13 +2708,15 @@ fn info_schema_tables(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>
 
 /// `information_schema.columns`: one row per column of every user table.
 fn info_schema_columns(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
-    let names = engine.list_tables_as_of(txn)?;
+    let tables = engine.list_tables_qualified_as_of(txn)?;
     let mut rows = Vec::new();
-    for name in &names {
+    for (schema_name, name) in &tables {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
-        let Some(schema) = engine.lookup_table(name)? else {
+        // Resolve within the table's own namespace so a schema-qualified table's columns are read
+        // from that table (not a same-named one in `public`).
+        let Some(schema) = engine.lookup_table_as_of_in(txn, schema_name, name)? else {
             continue;
         };
         // The column DEFAULT expressions live in the `nusadb_column_defaults` catalog, keyed by
@@ -2737,7 +2741,7 @@ fn info_schema_columns(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row
             );
             rows.push(vec![
                 ast::Value::Text("nusadb".to_owned()),
-                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(schema_name.clone()),
                 ast::Value::Text(name.clone()),
                 ast::Value::Text(col.name.clone()),
                 ast::Value::Int(i64::try_from(pos + 1).unwrap_or(0)),

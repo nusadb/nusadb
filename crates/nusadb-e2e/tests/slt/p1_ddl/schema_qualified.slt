@@ -574,3 +574,39 @@ DROP TABLE t
 
 statement ok
 DROP SCHEMA tr
+
+# --- information_schema reports each table's REAL schema, not a blanket `public` (this is what let
+# a GUI show a `dev.t` under every schema/catalog — the metadata mislabel behind "ghost tables"). ---
+statement ok
+CREATE SCHEMA sch
+
+statement ok
+CREATE TABLE sch.book (id INT NOT NULL, title TEXT)
+
+statement ok
+CREATE TABLE book (id INT NOT NULL, title TEXT)
+
+# The qualified table reports schema `sch`; the default-namespace one reports `public`.
+query TT
+SELECT table_schema, table_name FROM information_schema.tables WHERE table_name = 'book' ORDER BY table_schema
+----
+public book
+sch book
+
+# information_schema.columns likewise reports the real schema and reads each table's own columns.
+query TT
+SELECT table_schema, column_name FROM information_schema.columns WHERE table_name = 'book' ORDER BY table_schema, column_name
+----
+public id
+public title
+sch id
+sch title
+
+statement ok
+DROP TABLE sch.book
+
+statement ok
+DROP TABLE book
+
+statement ok
+DROP SCHEMA sch

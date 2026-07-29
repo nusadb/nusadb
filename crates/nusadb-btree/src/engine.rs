@@ -2641,6 +2641,19 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         Ok(names)
     }
 
+    fn list_tables_qualified_as_of(&self, _txn: TxnId) -> Result<Vec<(String, String)>> {
+        // The btree catalog is not versioned (see `list_tables`), so the map already mirrors
+        // `lookup_table`'s visibility. Each table reports its real `(schema, name)`.
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        let mut pairs: Vec<(String, String)> = cat
+            .tables
+            .values()
+            .map(|t| (t.schema.schema.clone(), t.schema.name.clone()))
+            .collect();
+        pairs.sort();
+        Ok(pairs)
+    }
+
     fn lookup_table_in(&self, schema: &str, name: &str) -> Result<Option<TableSchema>> {
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         Ok(cat
