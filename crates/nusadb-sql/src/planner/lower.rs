@@ -12,6 +12,10 @@ use super::*;
 /// Infallible: the analyzer has already resolved and type-checked everything,
 /// so the lowering is a pure structural transformation.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat arm per LogicalPlan variant; length tracks the plan grammar, not complexity"
+)]
 pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
     match logical {
         LogicalPlan::LockTable { tables, mode } => PhysicalPlan::LockTable { tables, mode },
@@ -60,6 +64,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::CreateProcedure(p) => PhysicalPlan::CreateProcedure(p),
         LogicalPlan::DropProcedure(p) => PhysicalPlan::DropProcedure(p),
         LogicalPlan::Call(p) => PhysicalPlan::Call(p),
+        LogicalPlan::Do(body) => PhysicalPlan::Do(body),
         LogicalPlan::CreateFunction(p) => PhysicalPlan::CreateFunction(p),
         LogicalPlan::DropFunction(p) => PhysicalPlan::DropFunction(p),
         LogicalPlan::RefreshMaterializedView(name) => PhysicalPlan::RefreshMaterializedView(name),

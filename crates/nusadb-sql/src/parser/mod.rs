@@ -292,6 +292,10 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_drop_function(sql) {
         return result;
     }
+    // `DO [LANGUAGE ...] $$ body $$` — an anonymous code block, run once with no parameters.
+    if let Some(result) = recognize_do(sql) {
+        return result;
+    }
     // `LOCK TABLE t IN <mode> MODE` — the `IN <mode> MODE` form; sqlparser only models the
     // `LOCK TABLES … READ|WRITE` form, so recognize this syntax here.
     if let Some(result) = recognize_lock_table(sql) {
@@ -1708,6 +1712,56 @@ fn recognize_create_function(sql: &str) -> Option<Result<ast::Statement, Error>>
 /// Recognize `DROP FUNCTION [IF EXISTS] name`.
 fn recognize_drop_function(sql: &str) -> Option<Result<ast::Statement, Error>> {
     starts_with_two(sql, "drop", "function").then(|| parse_drop_function(sql))
+}
+
+/// Recognize an anonymous `DO [LANGUAGE ...] $$ body $$` block.
+fn recognize_do(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    let mut words = sql.split_whitespace();
+    words
+        .next()?
+        .eq_ignore_ascii_case("do")
+        .then(|| parse_do(sql))
+}
+
+/// Drive `DO [LANGUAGE lang] <body>` — an anonymous code block. The body is a quoted (usually
+/// dollar-quoted) string with the same grammar as a procedure body (a NusaScript `BEGIN ... END`
+/// block, or a plain statement sequence); it runs once with no parameters, so it cannot reference
+/// `$n`. `LANGUAGE` is accepted and ignored.
+fn parse_do(sql: &str) -> Result<ast::Statement, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::parser::ParserError;
+    use sqlparser::tokenizer::Token;
+
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+    // Consume the leading `DO` word (recognized above); it is not a reserved keyword.
+    let _do = parser.next_token();
+    if parser.parse_keyword(Keyword::LANGUAGE) {
+        let _lang = parser.parse_identifier().map_err(syntax)?;
+    }
+    let body = match parser.next_token().token {
+        Token::SingleQuotedString(s) => s,
+        Token::DollarQuotedString(dq) => dq.value,
+        other => {
+            return Err(Error::Syntax(format!(
+                "expected a quoted DO block body, found {other}"
+            )));
+        },
+    };
+    expect_statement_end(&mut parser)?;
+
+    // Validate the body parses (same grammar as a procedure body), so a syntax error surfaces at
+    // parse time rather than mid-execution.
+    if is_script(&body) {
+        parse_script(&body)?;
+    } else {
+        let statements = parse_statements(&body)?;
+        if statements.is_empty() {
+            return unsupported("a DO block body must contain at least one statement");
+        }
+    }
+    Ok(ast::Statement::Do(body))
 }
 
 /// Drive `CREATE [OR REPLACE] FUNCTION name(p type, ...) RETURNS type [LANGUAGE SQL] AS <body>`.

@@ -2451,6 +2451,44 @@ fn sum_bigint_promotes_to_exact_numeric() {
 }
 
 #[test]
+fn do_anonymous_block() {
+    // `DO $$ ... $$` runs an anonymous code block once, with no parameters — the same body grammar
+    // as a procedure (a plain statement sequence, or a NusaScript BEGIN ... END block).
+    let engine = BtreeEngine::new();
+    let count = |sql: &str| rows(run(&engine, sql)).pop().unwrap().pop().unwrap();
+    run(&engine, "CREATE TABLE do_log (n INT)");
+
+    // A plain-statement body runs the statement.
+    run(&engine, "DO $$ INSERT INTO do_log VALUES (1) $$");
+    // A NusaScript BEGIN ... END body runs through the interpreter.
+    run(
+        &engine,
+        "DO $$ BEGIN INSERT INTO do_log VALUES (2); INSERT INTO do_log VALUES (3); END $$",
+    );
+    // LANGUAGE is accepted and ignored.
+    run(
+        &engine,
+        "DO LANGUAGE sql $$ INSERT INTO do_log VALUES (4) $$",
+    );
+
+    assert_eq!(
+        rows(run(&engine, "SELECT n FROM do_log ORDER BY n")),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+    assert_eq!(count("SELECT count(*) FROM do_log"), Value::Int(4));
+
+    // An empty body is rejected loudly at parse time.
+    assert!(run_try(&engine, "DO $$   $$").is_err());
+    // A syntax error in the body surfaces at parse time, not mid-execution.
+    assert!(run_try(&engine, "DO $$ INSERT INTO $$").is_err());
+}
+
+#[test]
 fn index_on_numeric_column() {
     // A NUMERIC column can be indexed: the index builds, equality and range predicates return the
     // right rows, and two spellings of the same value (5.0 vs 5.00) match the same key.

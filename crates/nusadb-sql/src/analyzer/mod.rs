@@ -423,6 +423,9 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 args,
             }))
         },
+        // DO: an anonymous block. The body is kept as text and re-parsed + run by the executor's
+        // procedure module, like a procedure body but with no parameters.
+        ast::Statement::Do(body) => Ok(LogicalPlan::Do(body)),
         // CREATE/DROP FUNCTION: a SQL scalar function, inlined at call sites by the analyzer.
         ast::Statement::CreateFunction(cf) => {
             enforce_system_catalog(&cf.name, catalog)?;

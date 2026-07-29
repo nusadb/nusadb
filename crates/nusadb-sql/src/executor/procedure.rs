@@ -142,6 +142,27 @@ pub(super) fn run_call(
     }
 }
 
+/// Run an anonymous `DO` block: the same body grammar as a procedure, executed once with no
+/// parameters. A NusaScript `BEGIN ... END` body runs through the interpreter; a plain statement
+/// sequence runs each statement in order. Produces no result rows.
+pub(super) fn run_do(
+    body: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    let _guard = DepthGuard::enter()?;
+    if crate::parser::is_script(body) {
+        let block = crate::parser::parse_script(body)?;
+        super::script::run_block(&block, &[], engine, txn)?;
+    } else {
+        for stmt in crate::parser::parse_statements(body)? {
+            let logical = crate::analyze(stmt, &ExecCatalog { engine, txn })?;
+            super::dispatch(crate::plan(logical), engine, txn)?;
+        }
+    }
+    Ok(ExecutionResult::ProcedureCalled)
+}
+
 /// The result of a `CALL`: a one-row result of the `OUT` parameters, or `ProcedureCalled` when there
 /// are none.
 fn call_result(out_params: Vec<String>, values: Vec<ast::Value>) -> ExecutionResult {

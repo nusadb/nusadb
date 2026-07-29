@@ -217,6 +217,8 @@ pub enum LogicalPlan {
     DropProcedure(DropProcedurePlan),
     /// `CALL name(args)` — invoke a stored procedure with constant arguments.
     Call(CallPlan),
+    /// `DO $$ body $$` — run an anonymous code block (the raw body text) once, no parameters.
+    Do(String),
     /// `CREATE [OR REPLACE] FUNCTION ...` — a SQL scalar function to persist.
     CreateFunction(CreateFunctionPlan),
     /// `DROP FUNCTION [IF EXISTS] name`.
@@ -1848,6 +1850,8 @@ pub enum PhysicalPlan {
     DropProcedure(DropProcedurePlan),
     /// `CALL name(args)` — invoke a stored procedure with constant arguments.
     Call(CallPlan),
+    /// `DO $$ body $$` — run an anonymous code block (the raw body text) once, no parameters.
+    Do(String),
     /// `CREATE [OR REPLACE] FUNCTION ...` — a SQL scalar function to persist.
     CreateFunction(CreateFunctionPlan),
     /// `DROP FUNCTION [IF EXISTS] name`.

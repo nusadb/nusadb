@@ -1427,6 +1427,7 @@ fn dispatch(
         PhysicalPlan::CreateProcedure(p) => procedure::run_create_procedure(&p, engine, txn),
         PhysicalPlan::DropProcedure(p) => procedure::run_drop_procedure(&p, engine, txn),
         PhysicalPlan::Call(p) => procedure::run_call(&p, engine, txn),
+        PhysicalPlan::Do(body) => procedure::run_do(&body, engine, txn),
         PhysicalPlan::CreateFunction(p) => function::run_create_function(&p, engine, txn),
         PhysicalPlan::DropFunction(p) => function::run_drop_function(&p, engine, txn),
         PhysicalPlan::RefreshMaterializedView(name) => {
@@ -1835,6 +1836,7 @@ fn format_plan(
         },
         PhysicalPlan::DropProcedure(p) => vec![format!("{indent}DropProcedure: {}", p.name)],
         PhysicalPlan::Call(p) => vec![format!("{indent}Call: {}", p.name)],
+        PhysicalPlan::Do(_) => vec![format!("{indent}Do")],
         PhysicalPlan::CreateFunction(p) => vec![format!("{indent}CreateFunction: {}", p.name)],
         PhysicalPlan::DropFunction(p) => vec![format!("{indent}DropFunction: {}", p.name)],
         PhysicalPlan::RefreshMaterializedView(name) => {

@@ -244,6 +244,10 @@ pub enum Statement {
     DropProcedure(DropProcedure),
     /// `CALL name(args)` — invoke a stored procedure. Custom-parsed.
     Call(Call),
+    /// `DO [LANGUAGE ...] $$ body $$` — run an anonymous code block: the same body grammar as a
+    /// procedure (a NusaScript `BEGIN ... END` block, or a plain statement sequence), executed once
+    /// with no parameters. Custom-parsed; the body is the raw text.
+    Do(String),
     /// `CREATE [OR REPLACE] FUNCTION ...` — a SQL scalar function. Custom-parsed.
     CreateFunction(CreateFunction),
     /// `DROP FUNCTION [IF EXISTS] name`. Custom-parsed.
