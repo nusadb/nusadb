@@ -610,3 +610,73 @@ DROP TABLE book
 
 statement ok
 DROP SCHEMA sch
+
+# --- schema-qualified sequences: CREATE / nextval / DROP resolve the qualifier, like tables ---
+statement ok
+CREATE SCHEMA sq
+
+# A sequence can be created in a non-public schema (previously rejected outright).
+statement ok
+CREATE SEQUENCE sq.counter START 100
+
+# nextval by the qualified name advances it.
+query I
+SELECT nextval('sq.counter')
+----
+100
+
+query I
+SELECT nextval('sq.counter')
+----
+101
+
+# A same-named sequence in public is a distinct sequence with its own value.
+statement ok
+CREATE SEQUENCE counter START 5
+
+query I
+SELECT nextval('counter')
+----
+5
+
+# The qualified one is unaffected by the public one.
+query I
+SELECT nextval('sq.counter')
+----
+102
+
+# A bare CREATE lands in the current schema and is reached by its qualified name.
+statement ok
+SET search_path = 'sq'
+
+statement ok
+CREATE SEQUENCE in_sq START 1
+
+query I
+SELECT nextval('sq.in_sq')
+----
+1
+
+statement ok
+RESET search_path
+
+# DROP resolves the qualifier; the public sequence stays.
+statement ok
+DROP SEQUENCE sq.counter
+
+statement ok
+DROP SEQUENCE sq.in_sq
+
+statement error
+SELECT nextval('sq.counter')
+
+query I
+SELECT nextval('counter')
+----
+6
+
+statement ok
+DROP SEQUENCE counter
+
+statement ok
+DROP SCHEMA sq

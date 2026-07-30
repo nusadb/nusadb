@@ -574,6 +574,9 @@ pub struct AlterDatabase {
 /// options are kept in declaration order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateSequence {
+    /// Explicit schema qualifier: `Some(schema)` for `CREATE SEQUENCE schema.s`, `None` when
+    /// unqualified (created in the session's current schema).
+    pub schema: Option<String>,
     /// Sequence name.
     pub name: String,
     /// Whether `IF NOT EXISTS` was specified.
@@ -602,6 +605,9 @@ pub enum SequenceOption {
 /// `DROP SEQUENCE [IF EXISTS] name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSequence {
+    /// Explicit schema qualifier: `Some(schema)` for `DROP SEQUENCE schema.s`, `None` when
+    /// unqualified (resolved in the session's current schema).
+    pub schema: Option<String>,
     /// Sequence name.
     pub name: String,
     /// Whether `IF EXISTS` was specified.

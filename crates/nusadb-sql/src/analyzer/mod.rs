@@ -490,13 +490,28 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         })),
         // CREATE/DROP SEQUENCE: the engine path exists; fold the options into a
         // SequenceDef. The executor calls the engine (resolving name → id for DROP).
-        ast::Statement::CreateSequence(cs) => {
+        ast::Statement::CreateSequence(mut cs) => {
+            // The engine's sequence namespace is keyed by name, so a non-public schema qualifies the
+            // key (`dev.s`) — the same scheme a SERIAL column's auto-sequence in a non-public schema
+            // already uses. A `public` sequence keeps its bare name (unchanged). An unqualified name
+            // resolves through the session's current schema.
+            let schema = cs
+                .schema
+                .clone()
+                .unwrap_or_else(|| catalog.current_schema());
+            cs.name = qualified_display(&schema, &cs.name);
             analyze_create_sequence(cs).map(LogicalPlan::CreateSequence)
         },
-        ast::Statement::DropSequence(ds) => Ok(LogicalPlan::DropSequence(DropSequencePlan {
-            name: ds.name,
-            if_exists: ds.if_exists,
-        })),
+        ast::Statement::DropSequence(ds) => {
+            let schema = ds
+                .schema
+                .clone()
+                .unwrap_or_else(|| catalog.current_schema());
+            Ok(LogicalPlan::DropSequence(DropSequencePlan {
+                name: qualified_display(&schema, &ds.name),
+                if_exists: ds.if_exists,
+            }))
+        },
         // TRUNCATE: desugar to an unfiltered DELETE — the same MVCC delete path empties the
         // table (honouring FK references + maintaining secondary indexes). `RESTART IDENTITY` is
         // carried through so the executor resets the backing sequence of each SERIAL/IDENTITY column

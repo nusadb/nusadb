@@ -735,8 +735,10 @@ pub(super) fn convert_create_sequence(
     for opt in options {
         converted.push(convert_sequence_option(opt)?);
     }
+    let (schema, name) = table_ref_name(name)?;
     Ok(ast::CreateSequence {
-        name: object_name(name)?,
+        schema,
+        name,
         if_not_exists,
         options: converted,
     })
@@ -1281,10 +1283,14 @@ pub(super) fn convert_drop(
                 if_exists,
                 cascade,
             })),
-            sql::ObjectType::Sequence => Ok(ast::Statement::DropSequence(ast::DropSequence {
-                name: object_name(name)?,
-                if_exists,
-            })),
+            sql::ObjectType::Sequence => {
+                let (schema, name) = table_ref_name(name)?;
+                Ok(ast::Statement::DropSequence(ast::DropSequence {
+                    schema,
+                    name,
+                    if_exists,
+                }))
+            },
             _ => unsupported("DROP of an unsupported object kind"),
         }
     };
