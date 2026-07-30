@@ -482,6 +482,25 @@ SELECT ENCODE(DECODE('Zm9vYmFy', 'base64'), 'escape')
 ----
 foobar
 
+# --- text → BYTEA cast: escape form (plain text is its own bytes) and hex form (`\x...`) ---
+# A plain string casts to the bytes of its characters, rendered as hex (`abc` = 0x61,0x62,0x63).
+query T
+SELECT 'abc'::BYTEA
+----
+\x616263
+
+# The hex input form round-trips to the same bytes.
+query T
+SELECT '\x616263'::BYTEA
+----
+\x616263
+
+# A cast then length counts bytes.
+query I
+SELECT octet_length('abc'::BYTEA)
+----
+3
+
 # --- QUOTE_LITERAL / QUOTE_IDENT ---
 # A plain string is wrapped in single quotes.
 query T

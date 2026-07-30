@@ -2927,10 +2927,17 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             check_vector_dim(v.len(), dim).map(|()| ast::Value::Vector(v))
         },
         (ast::Value::Vector(v), ColumnType::Text) => Ok(ast::Value::Text(crate::vector::format(v))),
-        // BYTEA: text `\x<hex>` → bytes; bytes → `\x<hex>` text. (Identity handled above.)
-        (ast::Value::Text(s), ColumnType::Bytes) => parse_bytea(s)
-            .map(ast::Value::Bytes)
-            .ok_or_else(|| invalid_cast(s, target)),
+        // BYTEA input: `\x<hex>` is the hex form; anything else is the escape form (each character
+        // is its own bytes, `\\` is a literal backslash, `\ooo` an octal byte) — so `'abc'::BYTEA`
+        // is the three bytes `abc`, matching the standard bytea text input. Bytes → `\x<hex>` text.
+        (ast::Value::Text(s), ColumnType::Bytes) => {
+            let bytes = if s.starts_with("\\x") {
+                parse_bytea(s).ok_or_else(|| invalid_cast(s, target))?
+            } else {
+                decode_bytea(s, "escape")?
+            };
+            Ok(ast::Value::Bytes(bytes))
+        },
         (ast::Value::Bytes(b), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::display::bytea_hex(b)))
         },
