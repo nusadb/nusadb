@@ -339,14 +339,55 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE MATERIALIZED VIEW: analyze the body and derive its output schema; the executor
         // computes and stores the rows into a backing table. Plain (non-materialized) views still
         // re-evaluate on read and are not yet implemented.
-        ast::Statement::CreateView(cv) => analyze_create_materialized_view(cv, catalog),
+        ast::Statement::CreateView(mut cv) => {
+            if cv.materialized {
+                // A materialized view backs onto a table; keying its backing table by a schema is a
+                // later increment, so a non-public qualifier is rejected loudly (never silently
+                // placed in public). A bare/public matview keeps its bare name.
+                if cv
+                    .schema
+                    .as_deref()
+                    .is_some_and(|s| s != nusadb_core::PUBLIC_SCHEMA)
+                {
+                    return Err(Error::Unsupported(
+                        "schema-qualified MATERIALIZED VIEW".to_owned(),
+                    ));
+                }
+            } else {
+                // A plain view is keyed by name, like a sequence: a non-public schema qualifies the
+                // key (`dev.v`), a public one keeps the bare name, and an unqualified name resolves in
+                // the session's current schema.
+                let schema = cv
+                    .schema
+                    .clone()
+                    .unwrap_or_else(|| catalog.current_schema());
+                cv.name = qualified_display(&schema, &cv.name);
+            }
+            analyze_create_materialized_view(cv, catalog)
+        },
         // DROP [MATERIALIZED] VIEW drops the backing table (sqlparser does not distinguish the two).
         ast::Statement::DropView(dv) => {
+            // An explicit qualifier names that schema. A bare name resolves like a reference: the
+            // current schema if a view/matview exists there, else the bare (`public`) name — so a
+            // public-keyed materialized view stays droppable under a non-public search path.
+            let name = if let Some(schema) = &dv.schema {
+                qualified_display(schema, &dv.name)
+            } else {
+                let current = qualified_display(&catalog.current_schema(), &dv.name);
+                if current != dv.name
+                    && (catalog.lookup_view(&current)?.is_some()
+                        || catalog.lookup_table(&current)?.is_some())
+                {
+                    current
+                } else {
+                    dv.name.clone()
+                }
+            };
             // The backing store is an ordinary table, so a system-catalog name must not be
             // droppable through the view path either.
-            enforce_system_catalog(&dv.name, catalog)?;
+            enforce_system_catalog(&name, catalog)?;
             Ok(LogicalPlan::DropView(DropViewPlan {
-                name: dv.name,
+                name,
                 if_exists: dv.if_exists,
             }))
         },

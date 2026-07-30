@@ -885,8 +885,10 @@ pub(super) fn convert_create_view(
     }
     // Render the body back to canonical SQL before consuming it, so REFRESH can re-execute it.
     let definition_sql = query.to_string();
+    let (schema, name) = table_ref_name(name)?;
     Ok(ast::CreateView {
-        name: object_name(name)?,
+        schema,
+        name,
         or_replace,
         if_not_exists,
         materialized,
@@ -1274,10 +1276,14 @@ pub(super) fn convert_drop(
                 name: object_name(name)?,
                 if_exists,
             })),
-            sql::ObjectType::View => Ok(ast::Statement::DropView(ast::DropView {
-                name: object_name(name)?,
-                if_exists,
-            })),
+            sql::ObjectType::View => {
+                let (schema, name) = table_ref_name(name)?;
+                Ok(ast::Statement::DropView(ast::DropView {
+                    schema,
+                    name,
+                    if_exists,
+                }))
+            },
             sql::ObjectType::Schema => Ok(ast::Statement::DropSchema(ast::DropSchema {
                 name: object_name(name)?,
                 if_exists,

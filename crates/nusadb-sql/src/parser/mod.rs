@@ -802,6 +802,7 @@ fn recognize_drop_matview(sql: &str) -> Option<Result<ast::Statement, Error>> {
         raw.to_ascii_lowercase()
     };
     Some(Ok(ast::Statement::DropView(ast::DropView {
+        schema: None,
         name,
         if_exists,
     })))

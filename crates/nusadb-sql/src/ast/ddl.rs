@@ -135,6 +135,10 @@ pub struct DropIndex {
 /// any supported `SELECT`; re-evaluation semantics belong to the analyzer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateView {
+    /// Explicit schema qualifier: `Some(schema)` for `CREATE VIEW schema.v`, `None` when unqualified
+    /// (created in the session's current schema). Only plain (non-materialized) views may be
+    /// schema-qualified today.
+    pub schema: Option<String>,
     /// View name.
     pub name: String,
     /// Whether `OR REPLACE` was specified.
@@ -157,6 +161,9 @@ pub struct CreateView {
 /// `DROP VIEW [IF EXISTS] name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropView {
+    /// Explicit schema qualifier: `Some(schema)` for `DROP VIEW schema.v`, `None` when unqualified
+    /// (resolved in the session's current schema).
+    pub schema: Option<String>,
     /// View name.
     pub name: String,
     /// Whether `IF EXISTS` was specified.

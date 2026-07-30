@@ -680,3 +680,105 @@ DROP SEQUENCE counter
 
 statement ok
 DROP SCHEMA sq
+
+# --- schema-qualified plain views: CREATE / SELECT FROM / DROP resolve the qualifier, like tables ---
+statement ok
+CREATE SCHEMA vw
+
+statement ok
+CREATE TABLE vw.t (id INT NOT NULL, label TEXT)
+
+statement ok
+INSERT INTO vw.t VALUES (1, 'in_vw'), (2, 'two')
+
+# A plain view can be created in a non-public schema (previously the qualifier was rejected).
+statement ok
+CREATE VIEW vw.v AS SELECT id, label FROM vw.t WHERE id = 1
+
+# SELECT FROM the qualified view resolves it (previously errored as a missing table).
+query IT
+SELECT id, label FROM vw.v
+----
+1  in_vw
+
+# A same-named public view over a different table is a distinct view.
+statement ok
+CREATE TABLE pub_t (id INT NOT NULL, label TEXT)
+
+statement ok
+INSERT INTO pub_t VALUES (9, 'in_public')
+
+statement ok
+CREATE VIEW v AS SELECT id, label FROM pub_t
+
+query IT
+SELECT id, label FROM v
+----
+9  in_public
+
+# The qualified view is unaffected by the public one.
+query IT
+SELECT id, label FROM vw.v
+----
+1  in_vw
+
+# A bare CREATE VIEW under search_path lands in the current schema and is reached by its qualifier.
+statement ok
+SET search_path = 'vw'
+
+statement ok
+CREATE VIEW in_vw_view AS SELECT id FROM vw.t
+
+query I
+SELECT id FROM vw.in_vw_view ORDER BY id
+----
+1
+2
+
+statement ok
+RESET search_path
+
+# A schema-qualified MATERIALIZED view is rejected loudly (a later increment), not silently public.
+statement error
+CREATE MATERIALIZED VIEW vw.mv AS SELECT id FROM vw.t
+
+# A bare materialized view stays public-keyed even under a non-public search path, and is still
+# droppable there (a bare DROP falls back to the public name when the current schema has no such view).
+statement ok
+SET search_path = 'vw'
+
+statement ok
+CREATE MATERIALIZED VIEW bare_mv AS SELECT id FROM vw.t
+
+statement ok
+DROP MATERIALIZED VIEW bare_mv
+
+statement ok
+RESET search_path
+
+# DROP resolves the qualifier; the public view stays.
+statement ok
+DROP VIEW vw.v
+
+statement ok
+DROP VIEW vw.in_vw_view
+
+statement error
+SELECT id FROM vw.v
+
+query IT
+SELECT id, label FROM v
+----
+9  in_public
+
+statement ok
+DROP VIEW v
+
+statement ok
+DROP TABLE vw.t
+
+statement ok
+DROP TABLE pub_t
+
+statement ok
+DROP SCHEMA vw

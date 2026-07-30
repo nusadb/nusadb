@@ -364,12 +364,15 @@ pub(super) fn resolve_from(
             // Row-level security for the base table is applied by `apply_rls` once the WHERE
             // filter is built (single-table queries inject policy predicates; joins are refused).
             (schema, None)
-        } else if from.base.schema.is_none() {
-            // Not a CTE or base table — a non-materialized view inlines its body like a CTE.
-            // An explicit `CREATE VIEW name (cols)` list renames the body's columns positionally.
-            // (Views live in the default namespace; an explicit schema qualifier denotes a table.)
-            let plan = resolve_view(&from.base.name, catalog)?;
-            let explicit = catalog.lookup_view_columns(&from.base.name)?;
+        } else if let Some(view_key) =
+            view_lookup_key(from.base.schema.as_deref(), &from.base.name, catalog)?
+        {
+            // Not a CTE or base table — a non-materialized view inlines its body like a CTE. A plain
+            // view is keyed by name (the referenced schema qualifies the key, or the current schema
+            // for a bare name), the same scheme `CREATE VIEW` stores it under. An explicit
+            // `CREATE VIEW name (cols)` list renames the body's columns positionally.
+            let plan = resolve_view(&view_key, catalog)?;
+            let explicit = catalog.lookup_view_columns(&view_key)?;
             let schema = cte_schema(&from.base.name, &explicit, &plan)?;
             (schema, Some(plan))
         } else {
@@ -958,6 +961,27 @@ thread_local! {
     /// Recursion depth while inlining non-materialized views, to bound a pathological view cycle
     /// (e.g. one built via `CREATE OR REPLACE`) instead of overflowing the stack.
     static VIEW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The catalog key a `FROM` base looks a plain view up under, the same scheme `CREATE VIEW` stores it
+/// under. An explicit qualifier names that schema; a bare name resolves like a base table — the
+/// current schema first, then the bare (`public`) name. Returns `Some(key)` only when a view actually
+/// exists under the resolved key, so a non-view name falls through to the caller's `TableNotFound`.
+fn view_lookup_key(
+    schema: Option<&str>,
+    name: &str,
+    catalog: &dyn Catalog,
+) -> Result<Option<String>, Error> {
+    if let Some(schema) = schema {
+        let key = qualified_display(schema, name);
+        return Ok(catalog.lookup_view(&key)?.map(|_| key));
+    }
+    // Bare: try the current schema, then fall back to the bare (`public`) name.
+    let current = qualified_display(&catalog.current_schema(), name);
+    if current != name && catalog.lookup_view(&current)?.is_some() {
+        return Ok(Some(current));
+    }
+    Ok(catalog.lookup_view(name)?.map(|_| name.to_owned()))
 }
 
 /// Resolve a non-materialized view name to its analyzed body by parsing + analyzing its stored SQL,
