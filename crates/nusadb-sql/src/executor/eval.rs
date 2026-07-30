@@ -4128,6 +4128,32 @@ fn interval_arith(
     }
 }
 
+/// Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors), producing a vector.
+/// The analyzer guarantees the operator and that both operands are vectors; a runtime dimension
+/// mismatch is a typed error, like the vector distance operators.
+fn vector_arithmetic(op: ast::BinaryOp, a: &[f32], b: &[f32]) -> Result<ast::Value, Error> {
+    use ast::BinaryOp as Op;
+    if a.len() != b.len() {
+        return Err(Error::TypeMismatch {
+            context: "vector arithmetic".to_owned(),
+            expected: ColumnType::Vector(a.len() as u32),
+            found: ColumnType::Vector(b.len() as u32),
+        });
+    }
+    let out: Vec<f32> = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| match op {
+            Op::Plus => x + y,
+            Op::Minus => x - y,
+            Op::Multiply => x * y,
+            // The analyzer admits only `+`/`-`/`*` for vector operands.
+            _ => x,
+        })
+        .collect();
+    Ok(ast::Value::Vector(out))
+}
+
 fn apply_arithmetic(
     op: ast::BinaryOp,
     left: &ast::Value,
@@ -4136,6 +4162,10 @@ fn apply_arithmetic(
 ) -> Result<ast::Value, Error> {
     if matches!(left, ast::Value::Null) || matches!(right, ast::Value::Null) {
         return Ok(ast::Value::Null);
+    }
+    // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors).
+    if let (ast::Value::Vector(a), ast::Value::Vector(b)) = (left, right) {
+        return vector_arithmetic(op, a, b);
     }
     // INTERVAL / temporal arithmetic dispatches on operand types.
     if let Some(result) = interval_arith(op, left, right) {

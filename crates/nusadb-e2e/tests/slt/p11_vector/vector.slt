@@ -108,3 +108,33 @@ NULL
 # Comparing different dimensions is a type error.
 statement error
 SELECT embedding <=> '[1,0]'::VECTOR(2) FROM items
+
+# --- element-wise vector arithmetic: + - * over two same-dimension vectors, yielding a vector ---
+query T
+SELECT '[1,2,3]'::VECTOR(3) + '[4,5,6]'::VECTOR(3)
+----
+[5,7,9]
+
+query T
+SELECT '[4,5,6]'::VECTOR(3) - '[1,2,3]'::VECTOR(3)
+----
+[3,3,3]
+
+query T
+SELECT '[1,2,3]'::VECTOR(3) * '[2,3,4]'::VECTOR(3)
+----
+[2,6,12]
+
+# A NULL operand propagates NULL.
+query T
+SELECT NULL::VECTOR(3) + '[1,2,3]'::VECTOR(3)
+----
+NULL
+
+# A dimension mismatch is a type error.
+statement error
+SELECT '[1,2,3]'::VECTOR(3) + '[1,2]'::VECTOR(2)
+
+# Division / modulo are not defined on vectors.
+statement error
+SELECT '[1,2,3]'::VECTOR(3) / '[1,2,3]'::VECTOR(3)

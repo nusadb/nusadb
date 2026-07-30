@@ -3340,6 +3340,11 @@ pub(super) fn check_binary(
         Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => check_comparison(left, right),
         Op::And | Op::Or => check_logical(left, right),
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
+            // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors) is checked
+            // before the numeric rule (a vector operand is not numeric).
+            if let (ColumnType::Vector(x), ColumnType::Vector(y)) = (left, right) {
+                return check_vector_arithmetic(op, x, y);
+            }
             // INTERVAL / temporal arithmetic takes priority over numeric.
             check_interval_arith(op, left, right).map_or_else(|| check_arithmetic(left, right), Ok)
         },
@@ -3770,6 +3775,26 @@ pub(super) fn check_logical(left: ColumnType, right: ColumnType) -> Result<Colum
         }
     }
     Ok(ColumnType::Bool)
+}
+
+/// Type rule for element-wise vector arithmetic. `+`, `-`, and `*` combine two vectors of the same
+/// dimension into a vector of that dimension; `/` and `%` are not defined on vectors. A dimension
+/// mismatch is a loud error, like the vector distance functions.
+fn check_vector_arithmetic(op: ast::BinaryOp, x: u32, y: u32) -> Result<ColumnType, Error> {
+    use ast::BinaryOp as Op;
+    if !matches!(op, Op::Plus | Op::Minus | Op::Multiply) {
+        return Err(Error::Unsupported(
+            "vector arithmetic supports only `+`, `-`, and `*`".to_owned(),
+        ));
+    }
+    if x != y {
+        return Err(Error::TypeMismatch {
+            context: "vector arithmetic (dimensions differ)".to_owned(),
+            expected: ColumnType::Vector(x),
+            found: ColumnType::Vector(y),
+        });
+    }
+    Ok(ColumnType::Vector(x))
 }
 
 pub(super) fn check_arithmetic(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
