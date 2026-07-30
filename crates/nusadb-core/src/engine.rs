@@ -364,6 +364,21 @@ pub enum IndexKind {
     Brin,
 }
 
+/// The order a scan yields rows in.
+///
+/// A backward scan produces exactly the rows a forward scan would, in reverse **key** order — so
+/// an `ORDER BY … DESC LIMIT n` can read the index in descending order without a separate sort.
+/// Rows that share an index key (ties) keep their relative order in both directions, which is fine
+/// because SQL leaves equal-key order unspecified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanDirection {
+    /// Ascending key order (the default).
+    #[default]
+    Forward,
+    /// Descending key order.
+    Backward,
+}
+
 /// A secondary index's catalog definition.
 ///
 /// The engine treats indexes as opaque: the SQL layer encodes the indexed key into the bytes it
@@ -576,6 +591,19 @@ pub trait TupleScan: Send {
     /// read (lazy on-read), pairing with [`schema_for_version`](StorageEngine::schema_for_version).
     fn try_next_versioned(&mut self) -> Result<Option<(Tid, u32, SharedTuple)>> {
         Ok(self.try_next()?.map(|(tid, tuple)| (tid, 0, tuple)))
+    }
+}
+
+/// A [`TupleScan`] over an already-collected row vector. The default
+/// [`index_scan_directed`](StorageEngine::index_scan_directed) uses it to hand back a reversed
+/// forward scan for engines that do not override the backward case.
+struct MaterializedScan {
+    rows: std::vec::IntoIter<(Tid, SharedTuple)>,
+}
+
+impl TupleScan for MaterializedScan {
+    fn try_next(&mut self) -> Result<Option<(Tid, SharedTuple)>> {
+        Ok(self.rows.next())
     }
 }
 
@@ -1002,6 +1030,38 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<Box<dyn TupleScan>> {
         let _ = (txn, index, lo, hi);
         Err(unsupported("index_scan"))
+    }
+
+    /// Like [`index_scan`](Self::index_scan), but in the requested [`ScanDirection`]. A backward scan
+    /// yields the same rows a forward one would over `[lo, hi]`, in descending key order — so the SQL
+    /// layer can serve `ORDER BY <indexed col> DESC LIMIT n` directly from the index without a sort.
+    ///
+    /// The default is correct for any engine: a [`Forward`](ScanDirection::Forward) scan is
+    /// [`index_scan`](Self::index_scan) unchanged, and a [`Backward`](ScanDirection::Backward) scan
+    /// materializes that forward scan and reverses it. The durable engine overrides the backward case
+    /// to walk the index's ordered map in reverse directly (no intermediate materialization).
+    fn index_scan_directed(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+        direction: ScanDirection,
+    ) -> Result<Box<dyn TupleScan>> {
+        let mut forward = self.index_scan(txn, index, lo, hi)?;
+        match direction {
+            ScanDirection::Forward => Ok(forward),
+            ScanDirection::Backward => {
+                let mut rows = Vec::new();
+                while let Some(row) = forward.try_next()? {
+                    rows.push(row);
+                }
+                rows.reverse();
+                Ok(Box::new(MaterializedScan {
+                    rows: rows.into_iter(),
+                }))
+            },
+        }
     }
 
     /// Like [`index_scan`](Self::index_scan), but with **latest-committed** visibility (plus `txn`'s

@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nusadb_core::engine::{
-    AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, SequenceDef, SharedTuple, TableDef,
-    TableLockMode, TableStats, Tid, TupleScan,
+    AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, ScanDirection, SequenceDef,
+    SharedTuple, TableDef, TableLockMode, TableStats, Tid, TupleScan,
 };
 use nusadb_core::{
     Constraint, ConstraintKind, Error, FkAction, ForeignKeyDef, IndexId, PageStore, Result,
@@ -3502,6 +3502,17 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         lo: Bound<Vec<u8>>,
         hi: Bound<Vec<u8>>,
     ) -> Result<Box<dyn TupleScan>> {
+        self.index_scan_directed(txn, index, lo, hi, ScanDirection::Forward)
+    }
+
+    fn index_scan_directed(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+        direction: ScanDirection,
+    ) -> Result<Box<dyn TupleScan>> {
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let (view, serializable) = {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
@@ -3524,7 +3535,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .tables
             .get(&table_id)
             .ok_or_else(|| table_not_found(idx.def.table))?;
-        // Ascending key order over `[lo, hi]`. Two visibility hops per entry: the ENTRY's own
+        // Ordered key walk over `[lo, hi]` — ascending for a forward scan, descending (the same rows
+        // reversed) for a backward one. Two visibility hops per entry: the ENTRY's own
         // stamps first — the row keeps its address across versions, so only the stamps can tell
         // this reader whether its visible version carries this key (an `UPDATE` that moved the
         // row dead-stamps the old key's entry and its new key's entry is unseen by older
@@ -3537,10 +3549,15 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
             let tree = ClusteredTree::open(&self.store, t.root_id());
-            for (_key, entry_rows) in data
+            let range = data
                 .entries
-                .range::<[u8], _>((as_slice_bound(&lo), as_slice_bound(&hi)))
-            {
+                .range::<[u8], _>((as_slice_bound(&lo), as_slice_bound(&hi)));
+            // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed.
+            let entries: Box<dyn Iterator<Item = _>> = match direction {
+                ScanDirection::Forward => Box::new(range),
+                ScanDirection::Backward => Box::new(range.rev()),
+            };
+            for (_key, entry_rows) in entries {
                 for (&row_id, metas) in entry_rows {
                     if !IndexData::entry_visible(metas, &view) {
                         continue;
