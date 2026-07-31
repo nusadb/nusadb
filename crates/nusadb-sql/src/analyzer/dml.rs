@@ -630,7 +630,13 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
         .using
         .map(|u| resolve_update_from(u, catalog))
         .transpose()?;
-    let mut scope = scope_of(&table);
+    // When the target is aliased (`DELETE FROM t AS x`), the WHERE (and USING join) reference it by
+    // the alias, which shadows the table name — so build the target scope under the alias qualifier,
+    // exactly as `UPDATE t AS x` does.
+    let mut scope = del
+        .alias
+        .as_deref()
+        .map_or_else(|| scope_of(&table), |alias| scope_of_aliased(&table, alias));
     let mut using_table: Option<TableSchema> = None;
     let mut using_plan: Option<Box<SelectPlan>> = None;
     if let Some((schema, qualifier, plan)) = using {

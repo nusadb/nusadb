@@ -184,6 +184,9 @@ pub struct Delete {
     pub schema: Option<String>,
     /// Target table name.
     pub table: String,
+    /// Optional alias for the target table (`DELETE FROM t AS x`): when present, the `WHERE`
+    /// (and any `USING` join) references the target by this alias (which shadows the table name).
+    pub alias: Option<String>,
     /// `USING` join source — additional tables/joins the `WHERE` predicate can reference.
     /// `None` when the clause is absent.
     pub using: Option<FromClause>,

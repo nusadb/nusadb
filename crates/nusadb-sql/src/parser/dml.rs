@@ -217,13 +217,13 @@ pub(super) fn convert_delete(delete: sql::Delete) -> Result<ast::Delete, Error> 
     let tables = match delete.from {
         sql::FromTable::WithFromKeyword(tables) | sql::FromTable::WithoutKeyword(tables) => tables,
     };
-    let (schema, table) = match tables.as_slice() {
+    let (schema, table, alias) = match tables.as_slice() {
         [twj] => {
             if !twj.joins.is_empty() {
                 return unsupported("JOIN in DELETE");
             }
             let target = convert_table_ref(&twj.relation)?;
-            (target.schema, target.name)
+            (target.schema, target.name, target.alias)
         },
         _ => return unsupported("DELETE must target exactly one table"),
     };
@@ -247,6 +247,7 @@ pub(super) fn convert_delete(delete: sql::Delete) -> Result<ast::Delete, Error> 
     Ok(ast::Delete {
         schema,
         table,
+        alias,
         using,
         filter,
         returning,

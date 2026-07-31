@@ -50,3 +50,24 @@ DELETE FROM t USING (SELECT 3 AS id) AS s WHERE t.id = s.id
 query IT
 SELECT id, name FROM t ORDER BY id
 ----
+
+# --- an aliased target: DELETE FROM t AS a USING t AS b resolves the alias (self-join dedup) ---
+statement ok
+CREATE TABLE sm (id INT NOT NULL, grp INT NOT NULL)
+
+statement ok
+INSERT INTO sm VALUES (1, 10), (2, 10), (3, 20), (4, 20)
+
+# Delete every row that has a smaller id in the same group — keep the minimum id per group. The
+# target is aliased `a`, the USING source `b`; both reference the same table by distinct aliases.
+statement ok
+DELETE FROM sm AS a USING sm AS b WHERE a.grp = b.grp AND b.id < a.id
+
+query II
+SELECT id, grp FROM sm ORDER BY id
+----
+1  10
+3  20
+
+statement ok
+DROP TABLE sm

@@ -178,6 +178,29 @@ impl Dialect for NusaParserDialect {
                 }),
         )
     }
+
+    fn get_next_precedence(
+        &self,
+        parser: &Parser,
+    ) -> Option<Result<u8, sqlparser::parser::ParserError>> {
+        // The JSON operators — navigation `->` `->>` `#>` `#>>` and containment `@>` `<@` — bind
+        // tighter than every comparison, so `j ->> 'k' = 'v'` is `(j ->> 'k') = 'v'` and
+        // `j ->> 'k' IS NULL` is `(j ->> 'k') IS NULL`. sqlparser's default table puts them below
+        // `IS`/`=`/`LIKE` (16 vs 17/20/19), which would parse those as `j ->> ('k' = 'v')` and
+        // type-error. Give them a precedence above comparison but below the arithmetic `+`/`-`
+        // (default `PlusMinus` = 30) — matching where the standard operator class sits — so the
+        // common `col ->> 'k' = 'v'` / `IS NULL` idioms parse correctly. Every other token falls
+        // through to the default table (`None`).
+        match parser.peek_token().token {
+            Token::Arrow
+            | Token::LongArrow
+            | Token::HashArrow
+            | Token::HashLongArrow
+            | Token::AtArrow
+            | Token::ArrowAt => Some(Ok(25)),
+            _ => None,
+        }
+    }
 }
 
 /// Parse a single SQL statement into the internal [`ast::Statement`].

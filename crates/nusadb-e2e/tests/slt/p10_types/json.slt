@@ -414,3 +414,31 @@ query T
 SELECT body ->> 'n' FROM jnull WHERE id = 1
 ----
 5
+
+# `->>` binds tighter than `IS NULL`, so `body ->> 'k' IS NULL` is `(body ->> 'k') IS NULL`.
+statement ok
+CREATE TABLE jprec (id INT NOT NULL, body JSON)
+
+statement ok
+INSERT INTO jprec VALUES (1, '{"a": 5}'), (2, '{"b": 9}')
+
+# id 2 has no key `a`, so `body ->> 'a'` is NULL there — the IS NULL applies to the extraction.
+query I
+SELECT id FROM jprec WHERE body ->> 'a' IS NULL
+----
+2
+
+# The negation binds the same way.
+query I
+SELECT id FROM jprec WHERE body ->> 'a' IS NOT NULL
+----
+1
+
+# `->>` also binds tighter than `=`, so `body ->> 'a' = '5'` is `(body ->> 'a') = '5'`.
+query I
+SELECT id FROM jprec WHERE body ->> 'a' = '5'
+----
+1
+
+statement ok
+DROP TABLE jprec
