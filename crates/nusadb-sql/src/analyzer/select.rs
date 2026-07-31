@@ -79,10 +79,13 @@ fn analyze_values_table(
             });
         }
     }
-    // VALUES cells reference no columns (LATERAL VALUES is not modelled), so they resolve against an
-    // empty scope. Pass 1: infer each column's type, deferring a bare NULL (typed in pass 2 once the
+    // VALUES cells resolve against an empty scope, and against no enclosing scope either: an
+    // enclosing query's columns are reachable through a thread-local, and a cell that reaches one
+    // is refused (`hide_outer_scopes` carries the reasoning and what the refusal costs).
+    // Pass 1: infer each column's type, deferring a bare NULL (typed in pass 2 once the
     // column type is known from its other rows). Every row has `ncols` cells (checked above), so the
     // per-column accumulator is indexed by `enumerate` ordinal without bounds risk.
+    let _no_outer = super::hide_outer_scopes();
     let empty_scope: Vec<ScopedColumn> = Vec::new();
     let mut col_seen: Vec<Option<ColumnType>> = vec![None; ncols];
     for row in rows {
@@ -845,6 +848,10 @@ pub(super) fn analyze_set_operation(
     }
     let ctes = combine_ctes(own_ctes, &outer);
     let _cte_guard = push_visible_ctes(&ctes);
+    // A branch may not reach the enclosing query, for the reason (and at the cost) recorded on
+    // `hide_outer_scopes`. A branch's own subqueries still correlate normally: they push their own
+    // scope, which sits above the barrier.
+    let _no_outer = super::hide_outer_scopes();
     let (tree, cols) = analyze_set_body(so.body, catalog)?;
     // The combined result's scope: one (unqualified) column per output column, so ORDER BY can
     // reference output columns by name.

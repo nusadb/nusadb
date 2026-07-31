@@ -8703,3 +8703,152 @@ fn correlated_subquery_sees_an_outer_column_in_every_aggregate_slot() {
         ]
     );
 }
+
+/// Fixture shared by the two tests below: two outer rows and two inner rows.
+fn outer_inner_fixture() -> BtreeEngine {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE ot (id INT NOT NULL)");
+    run(&engine, "CREATE TABLE it (b INT NOT NULL)");
+    run(&engine, "INSERT INTO ot VALUES (1), (100)");
+    run(&engine, "INSERT INTO it VALUES (10), (20)");
+    engine
+}
+
+#[test]
+fn values_and_set_operations_refuse_an_enclosing_query_column() {
+    // These returned a wrong answer before: nothing else in the subquery was correlated, so it was
+    // planned as independent, evaluated once, and the reference read NULL — the same reply for
+    // every outer row. They are refused now.
+    let engine = outer_inner_fixture();
+    for (sql, was) in [
+        (
+            "SELECT id, (SELECT max(v) FROM (VALUES (ot.id * 10), (5)) AS t(v)) FROM ot",
+            "answered 5 for both rows instead of 10 and 1000",
+        ),
+        (
+            "SELECT id, (SELECT max(x) FROM (SELECT ot.id AS x UNION SELECT 0) s) FROM ot",
+            "answered 0 for both rows instead of 1 and 100",
+        ),
+        (
+            "SELECT id, EXISTS (SELECT 1 FROM (VALUES (ot.id)) t(v) WHERE v > 50) FROM ot",
+            "answered false for both rows instead of false and true",
+        ),
+        (
+            "SELECT id, 100 IN (SELECT v FROM (VALUES (ot.id)) AS t(v)) FROM ot",
+            "answered NULL for both rows instead of false and true",
+        ),
+        (
+            "SELECT id, (SELECT max(x) FROM (SELECT b AS x FROM it WHERE b > ot.id \
+             UNION SELECT 0) s) FROM ot",
+            "answered 0 for both rows instead of 20 and 0",
+        ),
+    ] {
+        let err = run_try(&engine, sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected a refusal for `{sql}` — it {was}"));
+        assert!(
+            err.to_string().contains("belongs to an enclosing query"),
+            "for `{sql}`: wanted the enclosing-query refusal, got `{err}`",
+        );
+    }
+}
+
+#[test]
+fn the_refusal_also_costs_shapes_that_used_to_answer_correctly() {
+    // Deliberately pinned, not incidental. A reference through a VALUES list or a set operation is
+    // evaluated correctly whenever the subplan happens to be re-run per outer row — because the
+    // subquery is correlated somewhere else too, or because LATERAL always re-runs it. Each query
+    // here produced the right answer before the refusal and is an error after it; the second
+    // column records what it used to return.
+    //
+    // This is the accepted price of refusing at the point the reference is made rather than
+    // teaching the correlation walker to visit those two slots. If that walker is ever taught,
+    // these become correct answers again and this test is what says so.
+    let engine = outer_inner_fixture();
+    for (sql, used_to_answer) in [
+        (
+            "SELECT id, (SELECT max(v.column1) FROM (VALUES (ot.id * 10)) v WHERE ot.id > 0) \
+             FROM ot",
+            "10 and 1000",
+        ),
+        (
+            "SELECT ot.id, s.c FROM ot, LATERAL (SELECT column1 AS c \
+             FROM (VALUES (ot.id * 10)) v) s",
+            "10 and 1000",
+        ),
+        (
+            "SELECT id, (SELECT count(*) FROM (VALUES (ot.id)) v WHERE v.column1 = ot.id) FROM ot",
+            "1 and 1",
+        ),
+        (
+            "SELECT id, (SELECT max(x) FROM (SELECT b AS x FROM it WHERE b > ot.id \
+             UNION SELECT 0) s WHERE ot.id > 0) FROM ot",
+            "20 and 0",
+        ),
+        (
+            "SELECT id, (SELECT max(s.x) FROM (SELECT ot.id AS x UNION SELECT 0) s \
+             WHERE ot.id > 0) FROM ot",
+            "1 and 100",
+        ),
+        (
+            "SELECT id, EXISTS (SELECT 1 FROM (VALUES (ot.id)) t(v) WHERE t.v = ot.id) FROM ot",
+            "true and true",
+        ),
+    ] {
+        let err = run_try(&engine, sql).err().unwrap_or_else(|| {
+            panic!("`{sql}` is expected to be refused; it used to answer {used_to_answer}")
+        });
+        assert!(
+            err.to_string().contains("belongs to an enclosing query"),
+            "for `{sql}`: wanted the enclosing-query refusal, got `{err}`",
+        );
+    }
+}
+
+#[test]
+fn the_refusal_leaves_ordinary_correlation_and_uncorrelated_forms_alone() {
+    // What the barrier must not cost: plain correlation, a VALUES list or set operation reading
+    // nothing outside itself, and a subquery *inside* a set-operation branch correlating to that
+    // branch's own FROM — which resolves above the barrier rather than through it.
+    let engine = outer_inner_fixture();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, (SELECT count(*) FROM it WHERE b > ot.id) FROM ot ORDER BY id",
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(100), Value::Int(0)],
+        ]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, (SELECT max(v) FROM (VALUES (7), (5)) AS t(v)) FROM ot ORDER BY id",
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(7)],
+            vec![Value::Int(100), Value::Int(7)],
+        ]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, (SELECT max(x) FROM (SELECT b AS x FROM it UNION SELECT 0) s) \
+             FROM ot ORDER BY id",
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(20)],
+            vec![Value::Int(100), Value::Int(20)],
+        ]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT max(x), min(x) FROM \
+             (SELECT (SELECT count(*) FROM it i2 WHERE i2.b > it.b) AS x FROM it \
+              UNION SELECT 0) s",
+        )),
+        vec![vec![Value::Int(1), Value::Int(0)]]
+    );
+}

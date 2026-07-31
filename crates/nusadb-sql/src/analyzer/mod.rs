@@ -1400,6 +1400,48 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// How many of [`OUTER_SCOPES`]' bottom frames are hidden from resolution — see
+    /// [`hide_outer_scopes`]. Frames pushed *after* the barrier stay visible, so a subquery nested
+    /// inside the hidden construct still correlates to its own enclosing rows.
+    static OUTER_BARRIER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Hide every enclosing scope for the duration of the returned guard: a construct analyzed within
+/// it may not reference the enclosing query, and one that tries is refused by name.
+///
+/// Taken for a `VALUES` list and for a set operation. **This is a deliberate narrowing of the
+/// accepted surface, not a limit of the executor** — an `OuterColumn` is read at evaluation time
+/// against whatever outer row is bound, so these constructs do evaluate correctly whenever their
+/// subplan is re-run per outer row (a `LATERAL` dependent join always re-runs; a plain subquery
+/// re-runs when a correlated reference is detected in some *other* slot).
+///
+/// The reason for the narrowing is the case where nothing else in the subquery is correlated:
+/// `plan_has_outer_column` does not inspect a plan's `values`/`set_op_source`, so it reports the
+/// subquery independent, the plan is evaluated once, and the reference reads NULL — one answer
+/// reused for every outer row. Refusing the reference here removes that wrong answer at the single
+/// point where an outer reference is *made*, which cannot drift the way a per-slot walker does.
+///
+/// The cost, accepted knowingly: shapes that correlate through a `VALUES`/set operation **and**
+/// are re-run for some other reason answered correctly before and are refused now — `LATERAL
+/// (SELECT … FROM (VALUES (outer.col)) v)` among them. Teaching `plan_has_outer_column` to walk
+/// those two slots would instead make every shape correct; that is the alternative to revisit if
+/// the refusal proves too blunt.
+#[must_use]
+fn hide_outer_scopes() -> OuterBarrierGuard {
+    let depth = OUTER_SCOPES.with(|stack| stack.borrow().len());
+    OuterBarrierGuard(OUTER_BARRIER.replace(depth))
+}
+
+/// Restores the previous barrier depth on drop.
+struct OuterBarrierGuard(usize);
+
+impl Drop for OuterBarrierGuard {
+    fn drop(&mut self) {
+        OUTER_BARRIER.set(self.0);
+    }
+}
+
 /// Push `scope` as the enclosing scope for the duration of the returned guard, so a subquery body
 /// analyzed within it can resolve correlated references to `scope`'s columns.
 #[must_use]
@@ -1432,16 +1474,28 @@ fn resolve_scoped_or_outer(
     match resolve_scoped(scope, qualifier, name) {
         Ok((ordinal, ty)) => Ok((TypedExprKind::Column(ordinal), ty)),
         Err(not_found @ Error::ColumnNotFound { .. }) => OUTER_SCOPES.with(|stack| {
-            for (depth, frame) in stack.borrow().iter().rev().enumerate() {
-                if let Ok((ordinal, ty)) = resolve_scoped(frame, qualifier, name) {
-                    return Ok((
-                        TypedExprKind::OuterColumn {
-                            level: depth + 1,
-                            ordinal,
-                        },
-                        ty,
-                    ));
+            let stack = stack.borrow();
+            let barrier = OUTER_BARRIER.get();
+            for (depth, frame) in stack.iter().enumerate().rev() {
+                let Ok((ordinal, ty)) = resolve_scoped(frame, qualifier, name) else {
+                    continue;
+                };
+                // Below the barrier the column does exist, and this reference is refused on
+                // purpose rather than because it could not be executed — say so, instead of
+                // reporting the column missing (see `hide_outer_scopes`).
+                if depth < barrier {
+                    return Err(Error::Unsupported(format!(
+                        "`{name}` belongs to an enclosing query; a VALUES list and a set operation \
+                         are not allowed to reference one"
+                    )));
                 }
+                return Ok((
+                    TypedExprKind::OuterColumn {
+                        level: stack.len() - depth,
+                        ordinal,
+                    },
+                    ty,
+                ));
             }
             Err(not_found)
         }),

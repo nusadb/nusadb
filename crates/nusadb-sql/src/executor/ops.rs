@@ -1076,9 +1076,16 @@ fn expr_has_outer_column(expr: &TypedExpr) -> bool {
 }
 
 /// Whether `plan`'s expressions reference any enclosing-query column. Used to decide
-/// whether a subquery must be re-run per outer row. Over-approximates safely: a subquery that is
+/// whether a subquery must be re-run per outer row. Over-approximating is safe: a subquery that is
 /// only *internally* correlated (to its own nested subquery) is also flagged, which merely re-runs
 /// it per outer row — never wrong, just not the minimal amount of work.
+///
+/// Under-approximating is not safe — it leaves the subquery evaluated once and that one answer
+/// reused for every outer row. Two plan slots are not walked, `values` and `set_op_source`; that
+/// is only sound because the analyzer refuses an enclosing-query reference inside either
+/// (`analyzer::hide_outer_scopes`), so neither can carry one. Walking them here instead would let
+/// that refusal be lifted. Any *new* slot able to hold a correlated expression belongs in the
+/// chain below.
 fn plan_has_outer_column(plan: &crate::planner::SelectPlan) -> bool {
     let exprs = plan
         .projection
