@@ -681,10 +681,13 @@ fn reject_index_key_modifiers(key: &sql::IndexColumn) -> Result<(), Error> {
     if key.operator_class.is_some() {
         return unsupported("CREATE INDEX with an operator class on a key column");
     }
-    if key.column.options.asc.is_some() {
+    // `ASC` is the default and exactly what an index builds, so it is accepted as a no-op. `DESC`
+    // is rejected loudly (never silently treated as ascending): a descending index needs the planner
+    // to scan the index backward for a descending-ordered query, which is not wired yet.
+    if key.column.options.asc == Some(false) {
         return unsupported(
-            "CREATE INDEX with ASC/DESC on a key column (only ascending indexes are built; \
-             ordered index scans are not implemented)",
+            "CREATE INDEX with DESC on a key column (indexes are built ascending; a descending \
+             ordered index scan is not implemented)",
         );
     }
     if key.column.options.nulls_first.is_some() {

@@ -413,11 +413,16 @@ fn create_index_accepts_functional_partial_and_rejects_asc_desc_udf_shapes() {
     assert_eq!(ci.columns, vec!["a".to_owned()]);
     assert!(ci.predicate.is_some());
 
-    // Still rejected: per-column ASC/DESC/NULLS (only ascending indexes are built; ordered index
-    // scans are not implemented, so accepting DESC would be a silent-lossy trap), USING <method>,
-    // qualified column key, operator class.
+    // `ASC` is the built default, so it is accepted as a no-op.
+    let ast::Statement::CreateIndex(ci) = ok("CREATE INDEX i ON t (a ASC)") else {
+        panic!("expected CreateIndex");
+    };
+    assert_eq!(ci.columns, vec!["a".to_owned()]);
+
+    // Still rejected: `DESC` (a descending ordered index scan is not wired, and treating DESC as
+    // ascending would be a silent-lossy trap), per-column `NULLS`, `USING <method>`, a qualified
+    // column key, and an operator class.
     for sql in [
-        "CREATE INDEX i ON t (a ASC)",
         "CREATE INDEX i ON t (a DESC)",
         "CREATE INDEX i ON t (a DESC NULLS LAST)",
         "CREATE INDEX i ON t (a NULLS FIRST)",
