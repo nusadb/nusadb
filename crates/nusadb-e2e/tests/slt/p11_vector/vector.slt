@@ -139,6 +139,12 @@ SELECT 5 < 3
 ----
 0
 
+# `< +` is a comparison against a unary-plus operand, never the `<+>` distance operator.
+query I
+SELECT 3 < +5
+----
+1
+
 # vector_dims() returns the dimension count as INT; vector_norm() the Euclidean magnitude.
 query I
 SELECT vector_dims('[1,2,3,4]'::VECTOR(4))

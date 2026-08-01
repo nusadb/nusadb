@@ -4330,6 +4330,11 @@ fn apply_unary(op: ast::UnaryOp, value: &ast::Value) -> Result<ast::Value, Error
             ast::Value::Numeric(d) => ast::Value::Numeric(d.neg()),
             _ => ast::Value::Null,
         },
+        // Unary plus returns a numeric operand unchanged (the analyzer already rejected non-numeric).
+        ast::UnaryOp::Plus => match value {
+            ast::Value::Int(_) | ast::Value::Float(_) | ast::Value::Numeric(_) => value.clone(),
+            _ => ast::Value::Null,
+        },
     })
 }
 
@@ -4622,6 +4627,11 @@ mod tests {
             )
             .unwrap(),
             Value::Int(-5),
+        );
+        // Unary plus returns a numeric operand unchanged.
+        assert_eq!(
+            eval(&unary(UnaryOp::Plus, lit_int(5), ColumnType::Int), &vec![]).unwrap(),
+            Value::Int(5),
         );
     }
 

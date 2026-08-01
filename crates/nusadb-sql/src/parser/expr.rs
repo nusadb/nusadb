@@ -1695,6 +1695,7 @@ pub(super) fn convert_unary_op(op: sql::UnaryOperator) -> Result<ast::UnaryOp, E
     match op {
         sql::UnaryOperator::Not => Ok(ast::UnaryOp::Not),
         sql::UnaryOperator::Minus => Ok(ast::UnaryOp::Negate),
+        sql::UnaryOperator::Plus => Ok(ast::UnaryOp::Plus),
         other => unsupported(&format!("unary operator `{other}`")),
     }
 }

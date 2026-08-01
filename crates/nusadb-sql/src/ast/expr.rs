@@ -1346,6 +1346,8 @@ pub enum UnaryOp {
     Not,
     /// Numeric negation, `-`.
     Negate,
+    /// Unary plus, `+` — a no-op on a numeric operand (returns it unchanged), rejected on others.
+    Plus,
 }
 
 /// The truth value tested by an [`Expr::IsBool`] (`IS [NOT] TRUE/FALSE/UNKNOWN`).

@@ -96,3 +96,24 @@ query I
 SELECT COUNT(DISTINCT x) FROM (VALUES (CAST('NaN' AS FLOAT)), (CAST('NaN' AS FLOAT)), (CAST(5.0 AS FLOAT))) v(x)
 ----
 2
+
+# Unary plus is a no-op on a numeric operand (like the reference engine): it returns the value
+# unchanged and keeps its type.
+query I
+SELECT +5
+----
+5
+
+query T
+SELECT +5.5
+----
+5.5
+
+query I
+SELECT +(-3)
+----
+-3
+
+# Unary plus on a non-numeric operand is a type error.
+statement error
+SELECT +'abc'

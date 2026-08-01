@@ -3890,7 +3890,7 @@ pub(super) fn analyze_unary(
     // `NOT NULL` is NULL, three-valued) instead of rejecting as untypeable.
     let hint = match op {
         ast::UnaryOp::Not => Some(ColumnType::Bool),
-        ast::UnaryOp::Negate => None,
+        ast::UnaryOp::Negate | ast::UnaryOp::Plus => None,
     };
     let operand = analyze_expr_agg(expr, scope, catalog, hint, aggregates)?;
     let ty = match op {
@@ -3902,10 +3902,17 @@ pub(super) fn analyze_unary(
                 found: operand.ty,
             });
         },
-        ast::UnaryOp::Negate if is_numeric(operand.ty) => operand.ty,
+        ast::UnaryOp::Negate | ast::UnaryOp::Plus if is_numeric(operand.ty) => operand.ty,
         ast::UnaryOp::Negate => {
             return Err(Error::TypeMismatch {
                 context: "negation".to_owned(),
+                expected: ColumnType::Int,
+                found: operand.ty,
+            });
+        },
+        ast::UnaryOp::Plus => {
+            return Err(Error::TypeMismatch {
+                context: "unary plus".to_owned(),
                 expected: ColumnType::Int,
                 found: operand.ty,
             });
