@@ -2086,15 +2086,23 @@ pub(super) fn warm_vector_index(
 }
 
 /// System catalog persisting each `USING hnsw` graph as a serialized blob, so a restart loads the
-/// graph instead of rebuilding it. Row shape `(name TEXT, data BYTEA)`, keyed by index name.
-const VECTOR_GRAPH_CATALOG: &str = "nusadb_vector_index_graphs";
-const VECTOR_GRAPH_SCHEMA: [ColumnType; 2] = [ColumnType::Text, ColumnType::Bytes];
+/// graph instead of rebuilding it. The blob is split across rows shaped `(name TEXT, chunk_no INT,
+/// data BYTEA)` — keyed by index name, ordered by `chunk_no` — because the btree stores each tuple in
+/// a single leaf (no overflow pages yet), so one row could not hold a realistic graph (a few hundred
+/// vectors at 128+ dimensions is well over the ~8 KB leaf capacity).
+// The chunked-format catalog uses a distinct name from any earlier single-tuple `…_graphs` table,
+// so a fresh 3-column table is always created and an old table (a different shape) is never touched.
+const VECTOR_GRAPH_CATALOG: &str = "nusadb_vector_index_graph_chunks";
+const VECTOR_GRAPH_SCHEMA: [ColumnType; 3] = [ColumnType::Text, ColumnType::Int, ColumnType::Bytes];
+/// Max bytes of graph blob per catalog row, chosen well under the btree single-leaf tuple capacity
+/// (~8 KB) to leave room for the row's name, chunk number, and encoding framing.
+const VECTOR_GRAPH_CHUNK: usize = 6000;
 /// Blob header magic (`"NVGX"` little-endian) and format version. An unrecognized magic or version
 /// makes the load fall back to a rebuild rather than misread an old or foreign blob.
 const VECTOR_GRAPH_MAGIC: u32 = 0x4E56_4758;
 const VECTOR_GRAPH_VERSION: u16 = 1;
 
-/// Look up the graph catalog, creating the `(name, data)` table lazily if it does not exist.
+/// Look up the graph catalog, creating the `(name, chunk_no, data)` table lazily if absent.
 fn ensure_graph_catalog(
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -2109,6 +2117,11 @@ fn ensure_graph_catalog(
             ColumnDef {
                 name: "name".to_owned(),
                 ty: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "chunk_no".to_owned(),
+                ty: ColumnType::Int,
                 nullable: false,
             },
             ColumnDef {
@@ -2171,6 +2184,11 @@ fn decode_graph_blob(blob: &[u8]) -> Option<(u64, &[u8], Vec<Tid>)> {
 
 /// Persist (or replace) the built graph for index `name`. Runs in the caller's txn, so the blob is
 /// written transactionally with whatever DDL/DML triggered it.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "the chunk count is bounded by blob_len/VECTOR_GRAPH_CHUNK, far below i64::MAX"
+)]
 fn persist_vector_graph(
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -2180,9 +2198,17 @@ fn persist_vector_graph(
     let cat = ensure_graph_catalog(engine, txn)?;
     delete_vector_graph(engine, txn, name)?;
     let blob = encode_graph_blob(cached);
-    let row = [ast::Value::Text(name.to_owned()), ast::Value::Bytes(blob)];
-    let bytes = row::encode(&row, &VECTOR_GRAPH_SCHEMA)?;
-    engine.insert(txn, cat, &bytes)?;
+    // Split the blob so no single tuple exceeds the btree leaf capacity; reassembled in `chunk_no`
+    // order on load. The blob always has a header, so there is at least one chunk.
+    for (chunk_no, chunk) in blob.chunks(VECTOR_GRAPH_CHUNK).enumerate() {
+        let row = [
+            ast::Value::Text(name.to_owned()),
+            ast::Value::Int(chunk_no as i64),
+            ast::Value::Bytes(chunk.to_vec()),
+        ];
+        let bytes = row::encode(&row, &VECTOR_GRAPH_SCHEMA)?;
+        engine.insert(txn, cat, &bytes)?;
+    }
     Ok(())
 }
 
@@ -2198,7 +2224,10 @@ pub(super) fn delete_vector_graph(
     let mut victims = Vec::new();
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((tid, bytes)) = scan.try_next()? {
-        let row = row::decode(&bytes, &VECTOR_GRAPH_SCHEMA)?;
+        // Skip a row that does not decode to this format rather than erroring the whole delete.
+        let Ok(row) = row::decode(&bytes, &VECTOR_GRAPH_SCHEMA) else {
+            continue;
+        };
         if matches!(row.first(), Some(ast::Value::Text(n)) if n == name) {
             victims.push(tid);
         }
@@ -2227,21 +2256,34 @@ fn load_vector_graph(
     let Some(cat) = engine.lookup_table_as_of(txn, VECTOR_GRAPH_CATALOG)? else {
         return Ok(None);
     };
-    let mut blob: Option<Vec<u8>> = None;
+    // Gather this index's chunks (scan order is not guaranteed), then reassemble in `chunk_no` order.
+    let mut chunks: Vec<(i64, Vec<u8>)> = Vec::new();
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((_, bytes)) = scan.try_next()? {
-        let row = row::decode(&bytes, &VECTOR_GRAPH_SCHEMA)?;
-        if let [ast::Value::Text(n), ast::Value::Bytes(data)] = row.as_slice()
+        // A row that does not decode to this format is ignored (the load falls back to a rebuild),
+        // never a hard error — this catalog is a rebuildable cache.
+        let Ok(row) = row::decode(&bytes, &VECTOR_GRAPH_SCHEMA) else {
+            continue;
+        };
+        if let [
+            ast::Value::Text(n),
+            ast::Value::Int(chunk_no),
+            ast::Value::Bytes(data),
+        ] = row.as_slice()
             && n == name
         {
-            blob = Some(data.clone());
-            break;
+            chunks.push((*chunk_no, data.clone()));
         }
     }
     drop(scan);
-    let Some(blob) = blob else {
+    if chunks.is_empty() {
         return Ok(None);
-    };
+    }
+    chunks.sort_by_key(|(chunk_no, _)| *chunk_no);
+    let mut blob = Vec::with_capacity(chunks.iter().map(|(_, d)| d.len()).sum());
+    for (_, data) in chunks {
+        blob.extend_from_slice(&data);
+    }
     let Some((signature, graph_bytes, node_tids)) = decode_graph_blob(&blob) else {
         return Ok(None);
     };
@@ -2355,6 +2397,73 @@ fn maintain_vector_index(
         id_to_row,
         tids,
     })
+}
+
+/// Refresh and re-persist every `USING hnsw` vector index on `base_table` after a statement changed
+/// its rows, so the persisted graph stays current and a restart still loads (rather than rebuilds)
+/// it. Called from the post-write hook in the statement's *write* txn, so the refreshed blob commits
+/// atomically with the data. The in-memory graph is updated incrementally where possible — a pure
+/// append inserts the new vectors; a delete or in-place update rebuilds — reusing the same staleness
+/// logic as the query path. The fast path (no vector index on the table) is a single catalog scan.
+///
+/// Cost note: the whole graph blob is rewritten (as chunk rows) on each call, so a batch write (one
+/// statement, many rows) pays one rewrite while a long run of single-row statements rewrites
+/// repeatedly. And because every write to a vector-indexed table now rewrites that table's shared
+/// graph rows, two concurrent writers to the same table conflict on them — under the no-wait locking
+/// one aborts with a serialization failure (safe and retryable, not a deadlock). Batching bulk
+/// ingestion and not writing one indexed table from many concurrent txns keep both costs low;
+/// incremental, page-level persistence (which would avoid the whole-blob rewrite and the shared-row
+/// contention) is a later optimization.
+pub(super) fn maintain_vector_indexes_on_change(
+    base_table: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let listings: Vec<_> = super::list_vector_indexes(engine, txn)?
+        .into_iter()
+        .filter(|listing| listing.table == base_table)
+        .collect();
+    if listings.is_empty() {
+        return Ok(());
+    }
+    let Some(table) = engine.lookup_table_as_of(txn, base_table)? else {
+        return Ok(());
+    };
+    let signature = scan_signature(&table, engine, txn)?;
+    for listing in listings {
+        let slot = hnsw_slot((engine_identity(engine), table.id, listing.column_ordinal));
+        let mut guard = slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refreshed = match guard.take() {
+            // Already current (e.g. an earlier maintain in this txn) — nothing to update.
+            Some(cached) if cached.signature == signature => cached,
+            // Bring the in-memory graph up to date for the delta (append, or rebuild on removal).
+            Some(cached) => maintain_vector_index(
+                cached,
+                &table,
+                listing.column_ordinal,
+                listing.dim,
+                signature,
+                engine,
+                txn,
+            )?,
+            // Cold slot (first change after a restart): the persisted blob predates this write, so
+            // it no longer matches the current signature; rebuild from the table. (A future step can
+            // load the blob and apply just the delta instead of a full rebuild.)
+            None => build_vector_index(
+                &table,
+                listing.column_ordinal,
+                listing.dim,
+                signature,
+                engine,
+                txn,
+            )?,
+        };
+        persist_vector_graph(engine, txn, &listing.name, &refreshed)?;
+        *guard = Some(refreshed);
+    }
+    Ok(())
 }
 
 /// Exact k-NN fallback when no HNSW index is declared: scan, compute cosine distance to `query` for
@@ -4540,11 +4649,11 @@ mod eager_build_tests {
     }
 
     #[test]
-    fn a_stale_persisted_graph_is_not_loaded() {
+    fn a_write_refreshes_the_persisted_graph() {
         let engine = BtreeEngine::new();
         let mut session = Session::new(&engine);
         let table = seed_indexed(&engine, &mut session);
-        // A write after CREATE INDEX makes the persisted blob (written at index time) stale.
+        // A write maintains the index and re-persists it, so the blob stays current with the table.
         exec(
             &engine,
             &mut session,
@@ -4554,10 +4663,35 @@ mod eager_build_tests {
 
         let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let sig = scan_signature(&table, &engine, txn).unwrap();
-        // The current signature no longer matches the persisted one → load declines, forcing a rebuild.
-        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig).unwrap();
+        // The persisted blob now matches the post-insert table, so a restart loads it (all 5 rows).
+        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig)
+            .unwrap()
+            .expect("the write should have re-persisted a current graph");
         engine.commit(txn).unwrap();
-        assert!(loaded.is_none(), "a stale blob must not be served");
+        assert_eq!(
+            loaded.index.len(),
+            5,
+            "the inserted vector is in the loaded graph"
+        );
+    }
+
+    #[test]
+    fn a_signature_mismatch_declines_the_persisted_graph() {
+        let engine = BtreeEngine::new();
+        let mut session = Session::new(&engine);
+        let table = seed_indexed(&engine, &mut session);
+        evict_cache(&engine, table.id);
+
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let sig = scan_signature(&table, &engine, txn).unwrap();
+        // A current signature that does not match the persisted one must decline (never serve stale).
+        let loaded =
+            load_vector_graph(&engine, txn, "items_emb", &table, 3, sig.wrapping_add(1)).unwrap();
+        engine.commit(txn).unwrap();
+        assert!(
+            loaded.is_none(),
+            "a non-matching signature must not be served"
+        );
     }
 
     #[test]
@@ -4575,6 +4709,55 @@ mod eager_build_tests {
         assert!(
             loaded.is_none(),
             "a dropped index leaves no persisted graph"
+        );
+    }
+
+    #[test]
+    fn create_index_and_reload_at_realistic_dimensions() {
+        // A realistic embedding width: the serialized graph is far larger than a single btree leaf
+        // (~8 KB), so CREATE INDEX only succeeds if the persisted blob is split across rows, and the
+        // reload only succeeds if the chunks reassemble. A VECTOR(3) toy index fits one row and would
+        // miss this entirely (which is exactly how the single-tuple bug slipped past earlier tests).
+        let engine = BtreeEngine::new();
+        let mut session = Session::new(&engine);
+        exec(
+            &engine,
+            &mut session,
+            "CREATE TABLE docs (id INT NOT NULL, emb VECTOR(128))",
+        );
+        for id in 0..20 {
+            let comps: Vec<String> = (0..128)
+                .map(|j| ((id * 128 + j) % 97).to_string())
+                .collect();
+            exec(
+                &engine,
+                &mut session,
+                &format!(
+                    "INSERT INTO docs VALUES ({id}, '[{}]'::VECTOR(128))",
+                    comps.join(",")
+                ),
+            );
+        }
+        // Must not error: a whole-graph single tuple would exceed the leaf capacity and roll back.
+        exec(
+            &engine,
+            &mut session,
+            "CREATE INDEX docs_emb ON docs USING hnsw (emb)",
+        );
+
+        let table = engine.lookup_table("docs").unwrap().unwrap();
+        evict_cache(&engine, table.id); // simulate a restart
+
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let sig = scan_signature(&table, &engine, txn).unwrap();
+        let loaded = load_vector_graph(&engine, txn, "docs_emb", &table, 128, sig)
+            .unwrap()
+            .expect("the chunked graph must reassemble and reload");
+        engine.commit(txn).unwrap();
+        assert_eq!(
+            loaded.index.len(),
+            20,
+            "all 20 vectors present after reload"
         );
     }
 }

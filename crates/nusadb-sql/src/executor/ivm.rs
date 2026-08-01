@@ -88,8 +88,10 @@ pub(super) fn unregister_ivm_view(
     Ok(removed)
 }
 
-/// Maintain every view registered over `base_table` for one statement's row delta. The fast
-/// path (no IVM catalog, or no view over this table) costs a single catalog lookup.
+/// Maintain the derived structures over `base_table` for one statement's row delta: every
+/// registered materialized view, then every `USING hnsw` vector index (whose persisted graph is
+/// refreshed so a restart still loads it). The fast path (no view and no vector index over this
+/// table) costs a catalog lookup each.
 pub(super) fn maintain_on_change(
     base_table: &str,
     inserted: &[Row],
@@ -104,6 +106,8 @@ pub(super) fn maintain_on_change(
     for view in views {
         maintain_one(&view, inserted, deleted, engine, txn)?;
     }
+    // Keep each vector index's graph (and its persisted blob) current with the same row change.
+    super::ops::maintain_vector_indexes_on_change(base_table, engine, txn)?;
     Ok(())
 }
 

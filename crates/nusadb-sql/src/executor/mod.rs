@@ -2500,6 +2500,8 @@ pub(super) struct VectorIndexListing {
     pub table: String,
     /// The indexed column's 0-based ordinal in the table.
     pub column_ordinal: usize,
+    /// The vector dimension `n`.
+    pub dim: usize,
 }
 
 /// Every `USING hnsw` vector index declared in the catalog, in catalog order.
@@ -2515,12 +2517,13 @@ pub(super) fn list_vector_indexes(
     while let Some((_, bytes)) = scan.try_next()? {
         let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
         if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice()
-            && let Some((table, column_ordinal, _dim)) = parse_vector_index_def(def)
+            && let Some((table, column_ordinal, dim)) = parse_vector_index_def(def)
         {
             out.push(VectorIndexListing {
                 name: name.clone(),
                 table,
                 column_ordinal,
+                dim,
             });
         }
     }
