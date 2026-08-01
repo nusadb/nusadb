@@ -191,6 +191,12 @@ pub enum ExecutionResult {
     FunctionCreated,
     /// `DROP FUNCTION` succeeded (or `IF EXISTS` made it a no-op).
     FunctionDropped,
+    /// `CREATE MATERIALIZED VIEW` succeeded (or `IF NOT EXISTS` made it a no-op) — its backing table
+    /// was populated from the defining query.
+    MaterializedViewCreated,
+    /// `REFRESH MATERIALIZED VIEW` recomputed the view — the number of rows the backing table now
+    /// holds.
+    MaterializedViewRefreshed(usize),
 }
 
 /// A push-based receiver for a streamed statement's output (Phase 2 streaming output).
@@ -3036,12 +3042,12 @@ fn run_create_materialized_view(
     // table lookup below cannot see it) — otherwise the new backing table would silently shadow
     // the view (audit catch: reads resolve tables before views).
     if p.if_not_exists && load_view_def(engine, txn, VIEW_CATALOG, &p.name)?.is_some() {
-        return Ok(ExecutionResult::Created(nusadb_core::TableId(0)));
+        return Ok(ExecutionResult::MaterializedViewCreated);
     }
     match engine.lookup_table_as_of(txn, &p.name)? {
         Some(existing) if p.or_replace => engine.drop_table(txn, existing.id)?,
-        Some(existing) if p.if_not_exists => {
-            return Ok(ExecutionResult::Created(existing.id));
+        Some(_) if p.if_not_exists => {
+            return Ok(ExecutionResult::MaterializedViewCreated);
         },
         Some(_) => return Err(Error::TableExists { name: p.name }),
         None => {},
@@ -3074,7 +3080,7 @@ fn run_create_materialized_view(
     } else {
         ivm::unregister_ivm_view(engine, txn, &p.name)?;
     }
-    Ok(ExecutionResult::Created(table_id))
+    Ok(ExecutionResult::MaterializedViewCreated)
 }
 
 /// `DROP DATABASE name [FORCE]` (or the `FIX DROP DATABASE name` alias): drop every user table in the
@@ -3255,7 +3261,7 @@ fn run_refresh_materialized_view(
     let rows = execute_op(&op, engine, txn)?;
     let schema = column_types(&table);
     replace_rows(engine, txn, table.id, &schema, &rows)?;
-    Ok(ExecutionResult::Updated(rows.len()))
+    Ok(ExecutionResult::MaterializedViewRefreshed(rows.len()))
 }
 
 /// `DROP [MATERIALIZED] VIEW` — drop the view's backing table and forget its definition (sqlparser

@@ -220,11 +220,13 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::Prepared
         | ExecutionResult::Deallocated
         | ExecutionResult::Reindexed
+        | ExecutionResult::MaterializedViewCreated
         | ExecutionResult::VariableSet => DBOutput::StatementComplete(0),
         ExecutionResult::Inserted(n)
         | ExecutionResult::Updated(n)
         | ExecutionResult::Deleted(n)
         | ExecutionResult::Merged(n)
+        | ExecutionResult::MaterializedViewRefreshed(n)
         | ExecutionResult::Vacuumed(n) => DBOutput::StatementComplete(n as u64),
         ExecutionResult::Rows { rows, .. } => {
             let types = rows

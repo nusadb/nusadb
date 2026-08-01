@@ -3673,6 +3673,8 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::ProcedureCalled => "CALL".to_owned(),
         ExecutionResult::FunctionCreated => "CREATE FUNCTION".to_owned(),
         ExecutionResult::FunctionDropped => "DROP FUNCTION".to_owned(),
+        ExecutionResult::MaterializedViewCreated => "CREATE MATERIALIZED VIEW".to_owned(),
+        ExecutionResult::MaterializedViewRefreshed(_) => "REFRESH MATERIALIZED VIEW".to_owned(),
     }
 }
 
@@ -3752,6 +3754,20 @@ fn error_response_coded(message: &str, code: &str) -> BackendMessage {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    /// A materialized view's DDL reports its own command tag, not the backing table's `CREATE
+    /// TABLE` / a plain `UPDATE n` (bug-report regression).
+    #[test]
+    fn materialized_view_command_tags() {
+        assert_eq!(
+            command_tag(&ExecutionResult::MaterializedViewCreated),
+            "CREATE MATERIALIZED VIEW"
+        );
+        assert_eq!(
+            command_tag(&ExecutionResult::MaterializedViewRefreshed(7)),
+            "REFRESH MATERIALIZED VIEW"
+        );
+    }
 
     fn settings_with(entries: &[(&str, &str)]) -> std::sync::Mutex<HashMap<String, String>> {
         std::sync::Mutex::new(
