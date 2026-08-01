@@ -27,7 +27,7 @@ use core::any::TypeId;
 use sqlparser::ast as sql;
 use sqlparser::dialect::{Dialect, GenericDialect};
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use nusadb_core::ColumnType;
 
@@ -159,6 +159,27 @@ impl Dialect for NusaParserDialect {
         expr: &sql::Expr,
         precedence: u8,
     ) -> Option<Result<sql::Expr, sqlparser::parser::ParserError>> {
+        // Vector distance operators `<->` (L2), `<#>` (negative inner product) and `<+>` (L1).
+        // With geometric types off (the surface this wrapper reports), the tokenizer never fuses
+        // these into single tokens: it emits `<` then `->`/`#>` (Arrow/HashArrow), or `<` `+` `>`.
+        // Recognize those *adjacent* sequences here — a plain `a < b` (Lt not followed by an
+        // adjacent Arrow/HashArrow/`+ >`) and `x<-5` (Lt then Minus) fall through untouched, so no
+        // existing comparison changes meaning. Emitting a `Custom` operator lets the converter map
+        // each to its distance op.
+        if let Some((symbol, tokens)) = recognize_vector_distance_op(parser) {
+            for _ in 0..tokens {
+                parser.next_token();
+            }
+            return Some(
+                parser
+                    .parse_subexpr(precedence)
+                    .map(|right| sql::Expr::BinaryOp {
+                        left: Box::new(expr.clone()),
+                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
+                        right: Box::new(right),
+                    }),
+            );
+        }
         // `#` — the reference engine's integer XOR. sqlparser's own infix table gates the Sharp
         // token behind a dialect TypeId this wrapper does not report (it must keep reporting
         // `GenericDialect`'s — see `dialect()`), so parse the operator here. The default precedence table
@@ -200,6 +221,38 @@ impl Dialect for NusaParserDialect {
             | Token::ArrowAt => Some(Ok(25)),
             _ => None,
         }
+    }
+}
+
+/// Recognize a vector distance operator at the current parser position, where the next token is a
+/// `<` (`Token::Lt`). Returns the operator's canonical symbol and the number of tokens it spans, or
+/// `None` when the tokens after `<` are not a fused distance operator.
+///
+/// With geometric types disabled — the surface [`NusaParserDialect`] reports — the tokenizer emits
+/// each of these as several tokens rather than one: `<->` is `<` + `->` (`Arrow`), `<#>` is `<` +
+/// `#>` (`HashArrow`), and `<+>` is `<` + `+` + `>`. A distance operator is only matched when the
+/// pieces are directly adjacent (no whitespace, compared via token spans), so a spaced comparison
+/// like `a < ->b` or `a < +b` — and `x<-5` (`<` then `-`) — never matches and keeps its meaning.
+fn recognize_vector_distance_op(parser: &Parser) -> Option<(&'static str, usize)> {
+    fn adjacent(left: &TokenWithSpan, right: &TokenWithSpan) -> bool {
+        left.span.end == right.span.start
+    }
+    let lt = parser.peek_token_ref();
+    if lt.token != Token::Lt {
+        return None;
+    }
+    let after = parser.peek_nth_token_ref(1);
+    if !adjacent(lt, after) {
+        return None;
+    }
+    match after.token {
+        Token::Arrow => Some(("<->", 2)),
+        Token::HashArrow => Some(("<#>", 2)),
+        Token::Plus => {
+            let gt = parser.peek_nth_token_ref(2);
+            (matches!(gt.token, Token::Gt) && adjacent(after, gt)).then_some(("<+>", 3))
+        },
+        _ => None,
     }
 }
 

@@ -3186,6 +3186,58 @@ fn string_concat_operator() {
 }
 
 #[test]
+fn vector_distance_operators_map_to_their_ops() {
+    // `<->` (L2), `<#>` (negative inner product) and `<+>` (L1) each map to a distinct op, even
+    // though the tokenizer emits them as several tokens (`<` `->` / `<` `#>` / `<` `+` `>`).
+    for (sql, want) in [
+        ("SELECT a <-> b FROM t", ast::BinaryOp::VectorL2Distance),
+        (
+            "SELECT a <#> b FROM t",
+            ast::BinaryOp::VectorNegInnerProduct,
+        ),
+        ("SELECT a <+> b FROM t", ast::BinaryOp::VectorL1Distance),
+    ] {
+        let ast::Statement::Select(s) = ok(sql) else {
+            panic!("expected Select for {sql}");
+        };
+        let ast::SelectItem::Expr { expr, .. } = &s.projection[0] else {
+            panic!("expected an expression for {sql}");
+        };
+        let ast::Expr::Binary { op, .. } = expr else {
+            panic!("expected a binary expression for {sql}");
+        };
+        assert_eq!(*op, want, "operator mapping for {sql}");
+    }
+}
+
+#[test]
+fn less_than_is_not_swallowed_by_vector_operators() {
+    // The vector-operator recognition must leave ordinary `<` comparisons intact: `a < -5`
+    // (spaced) and `a<-5` (the classic collision case) both stay a less-than, and a bare `a < b`
+    // is unchanged.
+    for sql in [
+        "SELECT a < -5 FROM t",
+        "SELECT a<-5 FROM t",
+        "SELECT a < b FROM t",
+    ] {
+        let ast::Statement::Select(s) = ok(sql) else {
+            panic!("expected Select for {sql}");
+        };
+        let ast::SelectItem::Expr { expr, .. } = &s.projection[0] else {
+            panic!("expected an expression for {sql}");
+        };
+        let ast::Expr::Binary { op, .. } = expr else {
+            panic!("expected a binary expression for {sql}");
+        };
+        assert_eq!(
+            *op,
+            ast::BinaryOp::Lt,
+            "`<` must stay a comparison for {sql}"
+        );
+    }
+}
+
+#[test]
 fn is_distinct_from_parses() {
     let ast::Statement::Select(s) = ok("SELECT a IS DISTINCT FROM b FROM t") else {
         panic!("expected Select");

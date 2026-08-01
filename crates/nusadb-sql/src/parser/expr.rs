@@ -1676,6 +1676,14 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
         B::HashLongArrow => ast::BinaryOp::JsonGetPathText,
         // Vector cosine distance `<=>` (sqlparser tokenizes it as `Spaceship`).
         B::Spaceship => ast::BinaryOp::VectorDistance,
+        // The remaining vector distance operators arrive as `Custom` from the dialect's infix hook,
+        // which fuses their multi-token forms (`<` `->` / `<` `#>` / `<` `+` `>`).
+        B::Custom(symbol) => match symbol.as_str() {
+            "<->" => ast::BinaryOp::VectorL2Distance,
+            "<#>" => ast::BinaryOp::VectorNegInnerProduct,
+            "<+>" => ast::BinaryOp::VectorL1Distance,
+            other => return unsupported(&format!("binary operator `{other}`")),
+        },
         // Full-text search match `@@` (F1).
         B::AtAt => ast::BinaryOp::TsMatch,
         other => return unsupported(&format!("binary operator `{other}`")),

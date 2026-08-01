@@ -3682,7 +3682,14 @@ fn apply_binary(
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             Ok(json_op(op, left, right))
         },
-        Op::VectorDistance => vector_distance_op(left, right),
+        Op::VectorDistance => {
+            vector_distance_op("<=>", crate::vector::cosine_distance, left, right)
+        },
+        Op::VectorL2Distance => vector_distance_op("<->", crate::vector::l2_distance, left, right),
+        Op::VectorNegInnerProduct => {
+            vector_distance_op("<#>", crate::vector::neg_inner_product, left, right)
+        },
+        Op::VectorL1Distance => vector_distance_op("<+>", crate::vector::l1_distance, left, right),
         Op::TsMatch => ts_match_op(left, right),
     }
 }
@@ -3778,14 +3785,19 @@ fn apply_array_overlap(left: &ast::Value, right: &ast::Value) -> ast::Value {
 /// Evaluate `a <=> b` — cosine distance between two vectors, as `FLOAT`. A `NULL` operand
 /// yields `NULL`; a dimension mismatch is a typed error (the analyzer rejects most cases earlier, but
 /// a runtime mismatch is still possible across rows of differently-sized literals).
-fn vector_distance_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+fn vector_distance_op(
+    operator: &str,
+    distance: fn(&[f32], &[f32]) -> Option<f64>,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
     match (left, right) {
         (ast::Value::Null, _) | (_, ast::Value::Null) => Ok(ast::Value::Null),
-        (ast::Value::Vector(a), ast::Value::Vector(b)) => crate::vector::cosine_distance(a, b)
+        (ast::Value::Vector(a), ast::Value::Vector(b)) => distance(a, b)
             .map(ast::Value::Float)
             .ok_or_else(|| vector_dim_mismatch(a.len(), b.len())),
         _ => Err(Error::TypeMismatch {
-            context: "`<=>` vector distance".to_owned(),
+            context: format!("`{operator}` vector distance"),
             expected: ColumnType::Vector(0),
             found: runtime_type(right),
         }),

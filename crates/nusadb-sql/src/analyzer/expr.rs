@@ -3358,7 +3358,10 @@ pub(super) fn check_binary(
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             check_json(op, left, right)
         },
-        Op::VectorDistance => check_vector_distance(left, right),
+        Op::VectorDistance => check_vector_distance("<=>", left, right),
+        Op::VectorL2Distance => check_vector_distance("<->", left, right),
+        Op::VectorNegInnerProduct => check_vector_distance("<#>", left, right),
+        Op::VectorL1Distance => check_vector_distance("<+>", left, right),
         Op::TsMatch => check_ts_match(left, right),
     }
 }
@@ -3390,16 +3393,18 @@ pub(super) fn check_ts_match(left: ColumnType, right: ColumnType) -> Result<Colu
     }
 }
 
-/// Type rule for `<=>`: both operands must be `VECTOR`s of the same dimension; the result
-/// is the `FLOAT` distance. A bare `NULL` operand is already typed from its sibling earlier.
+/// Type rule for the vector distance operators `<=>` / `<->` / `<#>` / `<+>`: both operands must
+/// be `VECTOR`s of the same dimension; the result is the `FLOAT` distance. A bare `NULL` operand is
+/// already typed from its sibling earlier.
 pub(super) fn check_vector_distance(
+    operator: &str,
     left: ColumnType,
     right: ColumnType,
 ) -> Result<ColumnType, Error> {
     match (left, right) {
         (ColumnType::Vector(a), ColumnType::Vector(b)) if a == b => Ok(ColumnType::Float),
         _ => Err(Error::TypeMismatch {
-            context: "`<=>` vector distance".to_owned(),
+            context: format!("`{operator}` vector distance"),
             expected: left,
             found: right,
         }),

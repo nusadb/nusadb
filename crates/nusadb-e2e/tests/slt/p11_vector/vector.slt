@@ -84,6 +84,61 @@ SELECT l1_distance('[1,2,3]'::VECTOR(3), '[4,6,8]'::VECTOR(3))
 ----
 12.000
 
+# `<->` is the Euclidean (L2) distance operator; matches l2_distance(). √(3²+4²+5²)=√50.
+query R
+SELECT '[1,2,3]'::VECTOR(3) <-> '[4,6,8]'::VECTOR(3)
+----
+7.071
+
+# `<#>` is the negative inner product operator (smaller = nearer); −(1·2+2·3+3·0)=−8.
+query R
+SELECT '[1,2,3]'::VECTOR(3) <#> '[2,3,0]'::VECTOR(3)
+----
+-8.000
+
+# `<+>` is the Manhattan (L1) distance operator; matches l1_distance(). |−3|+|−4|+|−5|=12.
+query R
+SELECT '[1,2,3]'::VECTOR(3) <+> '[4,6,8]'::VECTOR(3)
+----
+12.000
+
+# The operators are usable as a KNN ordering key, like `<=>`.
+query I
+SELECT id FROM items ORDER BY embedding <-> '[1,0,0]'::VECTOR(3), id
+----
+1
+3
+2
+
+# A NULL operand propagates NULL through each operator.
+query T
+SELECT '[1,2,3]'::VECTOR(3) <-> NULL
+----
+NULL
+
+# A dimension mismatch through an operator is a type error.
+statement error
+SELECT '[1,2,3]'::VECTOR(3) <#> '[1,2]'::VECTOR(2)
+
+# Regression: the new operators must not change how `<` parses. `<` immediately followed by a
+# negative number — the classic `x<-5` case — stays a comparison, never a distance operator (the
+# harness renders BOOL as 1/0).
+query I
+SELECT 3 < -5
+----
+0
+
+query I
+SELECT 3<-5
+----
+0
+
+# A plain less-than is unaffected.
+query I
+SELECT 5 < 3
+----
+0
+
 # vector_dims() returns the dimension count as INT; vector_norm() the Euclidean magnitude.
 query I
 SELECT vector_dims('[1,2,3,4]'::VECTOR(4))

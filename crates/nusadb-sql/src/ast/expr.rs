@@ -1324,6 +1324,16 @@ pub enum BinaryOp {
     /// Vector distance `<=>` — cosine distance between two `VECTOR(n)` operands, as `FLOAT`
     /// (the `<=>` operator). See [`crate::vector::cosine_distance`].
     VectorDistance,
+    /// Vector distance `<->` — Euclidean (L2) distance between two `VECTOR(n)` operands, as
+    /// `FLOAT`. See [`crate::vector::l2_distance`].
+    VectorL2Distance,
+    /// Vector distance `<#>` — negative inner product of two `VECTOR(n)` operands, as `FLOAT`
+    /// (negated so that smaller is nearer, matching the distance convention). See
+    /// [`crate::vector::neg_inner_product`].
+    VectorNegInnerProduct,
+    /// Vector distance `<+>` — Manhattan (L1, taxicab) distance between two `VECTOR(n)` operands,
+    /// as `FLOAT`. See [`crate::vector::l1_distance`].
+    VectorL1Distance,
     /// Full-text `@@` — does the left `tsvector` (canonical text form) match the right `tsquery`
     /// (text form), as `BOOL` (F1)? Either operand order is accepted, like the reference engine.
     TsMatch,
