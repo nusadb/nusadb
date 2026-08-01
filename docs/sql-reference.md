@@ -112,3 +112,19 @@ the trade-off is a small maintenance cost on each base-table write while such a 
 rely on a materialized view being a stable point-in-time snapshot, use a shape that is
 refresh-only (for example, wrap the projection in a grouping or join), or query a regular `VIEW`
 plus your own snapshot table.
+
+## Session configuration variables
+
+`SET name = value` records any variable name for the session — a built-in setting such as
+`search_path` or `work_mem`, or an application's own, whether dotted (`SET myapp.request_id = '42'`)
+or bare (`SET feature_flag = 'on'`). `SHOW name` and `current_setting('name')` read it back as text,
+and an unset variable reads back as the empty string. This is broader than the reference engine,
+which takes only dotted custom names and rejects an unqualified unknown one — NusaDB stores a bare
+custom name too, so an application-defined session variable needs no special spelling.
+
+A *value* that a built-in setting cannot use is still rejected loudly at `SET` time rather than
+stored and then silently ignored: `SET work_mem = 'huge'` or an unparseable `statement_timeout`
+fails immediately with an `invalid value for parameter` error. The trade-off of accepting any name
+is that a misspelled built-in name (`word_mem` for `work_mem`) is taken as a new custom variable
+rather than flagged, so the intended setting keeps its default — check `SHOW` if a setting does not
+seem to take effect.
