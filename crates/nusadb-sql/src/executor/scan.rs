@@ -177,9 +177,12 @@ pub(super) fn index_scan_rows(
     let schema = column_types(table);
     // Pass the row cap to the engine so it stops materializing after `limit` visible rows in key
     // order — the O(range) → O(limit) win for `ORDER BY … LIMIT`. The executor-side break below is a
-    // backstop for an engine whose limited scan falls back to the full directed scan. The ordered
-    // scan path never runs under `SKIP LOCKED` (that is a `LockRows` plan, not a plain scan), so a
-    // skipped row never makes the visible count fall short of `limit`.
+    // backstop for an engine whose limited scan falls back to the full directed scan. The planner
+    // disqualifies this capped ordered scan whenever `SKIP LOCKED` is in force (see
+    // `try_ordered_index_scan`), precisely because the engine caps on *visible* rows with no notion
+    // of locks — so a locked row skipped below could otherwise make the count fall short of `limit`.
+    // With that path excluded the skip set is never populated for this scan (a plain `FOR UPDATE`
+    // does not skip), so the `skipped` check below never fires and the cap is exact.
     let mut scan = engine.index_scan_directed_limited(
         txn,
         id,

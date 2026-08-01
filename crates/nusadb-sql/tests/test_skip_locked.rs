@@ -12,10 +12,11 @@
 )]
 
 use nusadb_btree::BtreeEngine;
-use nusadb_core::{IsolationLevel, StorageEngine, TableSchema};
+use nusadb_core::{IsolationLevel, StorageEngine, TableSchema, TxnId};
 use nusadb_sql::ast::Value;
 use nusadb_sql::{
-    Catalog, Error, ExecutionResult, IndexInfo, analyze, execute_in_txn, parse, plan,
+    Catalog, Error, ExecutionResult, IndexInfo, analyze, catalog_list_indexes, execute_in_txn,
+    parse, plan,
 };
 
 /// Minimal analyzer catalog over the engine's schema.
@@ -29,13 +30,32 @@ impl Catalog for Cat<'_> {
     }
 }
 
+/// Like [`Cat`], but reports the engine's real scannable indexes (as the production wire catalog
+/// does) so the planner can choose the same index scans a live query would — needed to exercise the
+/// ordered-index-scan path under a lock, which a masked-index catalog would hide.
+struct IndexedCat<'a>(&'a dyn StorageEngine, TxnId);
+impl Catalog for IndexedCat<'_> {
+    fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+        self.0.lookup_table(name).map_err(Into::into)
+    }
+    fn list_indexes(&self, name: &str) -> Result<Vec<IndexInfo>, Error> {
+        catalog_list_indexes(self.0, self.1, name)
+    }
+}
+
 /// Run one statement inside `txn`, returning its result (no commit/rollback here).
-fn run_in(
+fn run_in(engine: &dyn StorageEngine, txn: TxnId, sql: &str) -> Result<ExecutionResult, Error> {
+    let logical = analyze(parse(sql)?, &Cat(engine))?;
+    execute_in_txn(plan(logical), engine, txn)
+}
+
+/// Like [`run_in`], but analyzes against the index-exposing catalog so the plan uses real indexes.
+fn run_in_indexed(
     engine: &dyn StorageEngine,
-    txn: nusadb_core::TxnId,
+    txn: TxnId,
     sql: &str,
 ) -> Result<ExecutionResult, Error> {
-    let logical = analyze(parse(sql)?, &Cat(engine))?;
+    let logical = analyze(parse(sql)?, &IndexedCat(engine, txn))?;
     execute_in_txn(plan(logical), engine, txn)
 }
 
@@ -136,4 +156,58 @@ fn skip_locked_claims_disjoint_rows_without_blocking() {
     let _ = engine.rollback(worker2);
     let _ = engine.rollback(worker3);
     let _ = engine.rollback(worker4);
+}
+
+/// Regression: `ORDER BY <indexed NOT NULL col> LIMIT n FOR UPDATE SKIP LOCKED` must fill the LIMIT
+/// from *lockable* rows even when a locked row sorts *within* the first `n` — analyzed against a
+/// catalog that exposes the real `PRIMARY KEY` index, exactly as the live wire path does.
+///
+/// This closes the harness gap that let a silent wrong result ship: the ordered-index-scan
+/// sort-elimination caps the scan at `n` *visible* rows in the engine, which has no notion of locks,
+/// so a locked row inside the cap dropped the result below the LIMIT. Here job 1 is locked and sorts
+/// first, so the buggy plan capped the index scan at 1 row (job 1), the executor then skipped it as
+/// locked, and the query returned `[]` instead of the next lockable job. The fix disqualifies the
+/// ordered index scan under SKIP LOCKED, keeping the Sort+SeqScan path that skips locked rows mid
+/// scan. Load-bearing: with the guard removed this returns `[]`.
+#[test]
+fn skip_locked_limit_fills_past_a_locked_row_within_the_cap() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE jobs (id INT PRIMARY KEY, payload TEXT)",
+    );
+    run(
+        &engine,
+        "INSERT INTO jobs VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
+
+    // Worker 1 locks job 1 — the lowest id, which an ascending ORDER BY would return first.
+    let worker1 = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+    assert_eq!(
+        ids(run_in_indexed(
+            &engine,
+            worker1,
+            "SELECT id FROM jobs WHERE id = 1 FOR UPDATE"
+        )
+        .unwrap()),
+        vec![1]
+    );
+
+    // Worker 2 wants one claimable job in id order. Job 1 is locked and sorts first, but there are
+    // lockable jobs past it — the LIMIT must fill from job 2, not fall short because the first row
+    // in key order happened to be locked.
+    let worker2 = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+    assert_eq!(
+        ids(run_in_indexed(
+            &engine,
+            worker2,
+            "SELECT id FROM jobs ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+        )
+        .unwrap()),
+        vec![2],
+        "the LIMIT must skip the locked lowest id and take the next lockable job, not return empty"
+    );
+
+    let _ = engine.rollback(worker1);
+    let _ = engine.rollback(worker2);
 }

@@ -445,9 +445,17 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             filter,
         };
     } else if !select.order_by.is_empty() {
-        if let Some(ordered) =
-            try_ordered_index_scan(&op, &select.order_by, &select.indexes, top_n_hint)
-        {
+        // `FOR UPDATE ... SKIP LOCKED` fills its LIMIT from *lockable* rows — the executor skips a
+        // row another txn holds locked and keeps scanning. A capped ordered index scan can't honour
+        // that, so it is disqualified below; the Sort+SeqScan path is kept instead.
+        let skip_locked = matches!(row_lock, Some((_, true)));
+        if let Some(ordered) = try_ordered_index_scan(
+            &op,
+            &select.order_by,
+            &select.indexes,
+            top_n_hint,
+            skip_locked,
+        ) {
             // The ORDER BY is a prefix of a scannable index's key — the ordered scan provides the
             // order and stops at the LIMIT, so the Sort is dropped entirely.
             op = ordered;
@@ -791,8 +799,19 @@ fn try_ordered_index_scan(
     order_by: &[OrderByKey],
     indexes: &[IndexMeta],
     top_n_cap: Option<u64>,
+    skip_locked: bool,
 ) -> Option<PhysicalOperator> {
     use nusadb_core::engine::ScanDirection;
+    // `FOR UPDATE ... SKIP LOCKED` must fill its LIMIT from *lockable* rows: the executor skips a
+    // row another txn holds locked mid-scan and keeps going. A capped ordered index scan can't do
+    // that — the engine stops after `cap` *visible* rows in key order with no notion of locks, so a
+    // locked row inside the cap would drop the result below the LIMIT even though lockable rows
+    // remain past it. Keep the Sort+SeqScan path (which skips locked rows as it scans, then sorts
+    // and limits the survivors) whenever SKIP LOCKED is in force. Plain `FOR UPDATE` (no skip) is
+    // unaffected — with no rows skipped, the capped scan returns exactly the LIMIT rows in order.
+    if skip_locked {
+        return None;
+    }
     // A plain `SeqScan` here means nothing (filter/join/aggregate/window) wraps the base scan — the
     // order-by keys refer directly to the base row's columns.
     let PhysicalOperator::SeqScan { table, .. } = op else {

@@ -519,6 +519,7 @@ mod tests {
             PhysicalOperator::Project { input, .. }
             | PhysicalOperator::Limit { input, .. }
             | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::LockRows { input, .. }
             | PhysicalOperator::Distinct { input, .. } => plan_has_sort(input),
             _ => false,
         }
@@ -578,6 +579,31 @@ mod tests {
         };
         assert_eq!(direction, nusadb_core::engine::ScanDirection::Backward);
         assert_eq!(limit, Some(20));
+    }
+
+    #[test]
+    fn skip_locked_order_by_limit_keeps_sort() {
+        // `FOR UPDATE ... SKIP LOCKED` fills its LIMIT from *lockable* rows — the executor skips a
+        // row another txn holds locked mid-scan and keeps going. A capped ordered index scan caps
+        // on *visible* rows in the engine with no notion of locks, so a locked row inside the cap
+        // would drop the result below the LIMIT even though lockable rows remain past it. The
+        // elimination must be disqualified here so the Sort+SeqScan path (which skips locked rows as
+        // it scans, then sorts and limits the survivors) is kept. Load-bearing: without the guard
+        // this planned to a capped IndexScan and returned short of the LIMIT under a concurrent lock
+        // — a silent wrong result that breaks the SKIP LOCKED job-queue contract.
+        let root =
+            indexed_select_op("SELECT * FROM t ORDER BY a ASC LIMIT 20 FOR UPDATE SKIP LOCKED");
+        assert!(
+            plan_has_sort(&root),
+            "SKIP LOCKED must keep the Sort, not eliminate it into a capped IndexScan"
+        );
+        // Plain `FOR UPDATE` (no SKIP LOCKED) still gets the elimination: no rows are skipped, so the
+        // capped ordered scan returns exactly the LIMIT rows in order and stays correct there.
+        let plain = indexed_select_op("SELECT * FROM t ORDER BY a ASC LIMIT 20 FOR UPDATE");
+        assert!(
+            !plan_has_sort(&plain),
+            "plain FOR UPDATE keeps the sort-elimination win"
+        );
     }
 
     #[test]

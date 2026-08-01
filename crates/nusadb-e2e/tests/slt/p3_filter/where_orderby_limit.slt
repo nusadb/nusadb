@@ -114,20 +114,20 @@ b  2
 
 # --- ordered index scan + LIMIT (sort-elimination on an indexed NOT NULL column) ---
 statement ok
-CREATE TABLE t6 (id INT NOT NULL, payload TEXT)
+CREATE TABLE ord (id INT NOT NULL, payload TEXT)
 
 # 300 rows inserted in DESCENDING id order. The clustered key is the engine row-id (insert order),
 # not `id`, so a plain scan yields descending id — a correct ascending ORDER BY result therefore
 # proves the ordered index scan works, not merely insertion order.
 statement ok
-INSERT INTO t6 SELECT generate_series(299, 0, -1), 'p'
+INSERT INTO ord SELECT generate_series(299, 0, -1), 'p'
 
 statement ok
-CREATE INDEX t6_id ON t6 (id)
+CREATE INDEX ord_id ON ord (id)
 
 # ORDER BY id ASC LIMIT 5 → the five smallest ids, in order (plan is a forward, capped IndexScan).
 query I nosort
-SELECT id FROM t6 ORDER BY id ASC LIMIT 5
+SELECT id FROM ord ORDER BY id ASC LIMIT 5
 ----
 0
 1
@@ -137,7 +137,7 @@ SELECT id FROM t6 ORDER BY id ASC LIMIT 5
 
 # LIMIT + OFFSET over the ordered scan.
 query I nosort
-SELECT id FROM t6 ORDER BY id ASC LIMIT 3 OFFSET 2
+SELECT id FROM ord ORDER BY id ASC LIMIT 3 OFFSET 2
 ----
 2
 3
@@ -145,7 +145,7 @@ SELECT id FROM t6 ORDER BY id ASC LIMIT 3 OFFSET 2
 
 # A LIMIT larger than the table returns every row in order (cap never reached).
 query I nosort
-SELECT id FROM t6 WHERE id < 4 ORDER BY id ASC
+SELECT id FROM ord WHERE id < 4 ORDER BY id ASC
 ----
 0
 1
@@ -154,7 +154,7 @@ SELECT id FROM t6 WHERE id < 4 ORDER BY id ASC
 
 # DESC serves from a backward ordered scan of the same index (Sort also eliminated); order correct.
 query I nosort
-SELECT id FROM t6 ORDER BY id DESC LIMIT 4
+SELECT id FROM ord ORDER BY id DESC LIMIT 4
 ----
 299
 298
@@ -163,7 +163,7 @@ SELECT id FROM t6 ORDER BY id DESC LIMIT 4
 
 # DESC with OFFSET over the backward ordered scan.
 query I nosort
-SELECT id FROM t6 ORDER BY id DESC LIMIT 3 OFFSET 2
+SELECT id FROM ord ORDER BY id DESC LIMIT 3 OFFSET 2
 ----
 297
 296
