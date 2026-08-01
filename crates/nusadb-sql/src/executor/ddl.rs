@@ -455,6 +455,13 @@ pub(super) fn run_create_index(
             return Ok(ExecutionResult::IndexCreated);
         }
         super::store_vector_index(engine, txn, spec)?;
+        // Eager build: build the HNSW graph now, so the cost lands at `CREATE INDEX`
+        // (like a B-tree backfill) rather than on the first query, and a failed/cancelled build
+        // fails this statement instead of leaving a half-built graph for a query to hit. The graph
+        // is cached in-process; a fresh process still rebuilds on first use (persistence is separate).
+        if let Some(table) = engine.lookup_table_as_of(txn, &spec.table)? {
+            ops::warm_vector_index(&table, spec.column_ordinal, spec.dim, engine, txn)?;
+        }
         return Ok(ExecutionResult::IndexCreated);
     }
     if plan.if_not_exists && engine.lookup_index(&plan.def.name)?.is_some() {

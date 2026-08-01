@@ -2058,6 +2058,28 @@ fn build_vector_index(
     })
 }
 
+/// Eagerly build the HNSW graph for a just-created vector index and cache it, so the build cost
+/// lands at `CREATE INDEX ... USING hnsw` (where it is expected, as with a B-tree backfill) instead
+/// of ambushing the first KNN query. The cache is keyed and signed exactly as the query path, so a
+/// later query over the same visible rows serves this warm graph, and any change rebuilds through
+/// the normal staleness path. Building here also means a failed or cancelled build surfaces as a
+/// failed `CREATE INDEX` (rolled back with its txn) rather than a half-built graph seen mid-query.
+pub(super) fn warm_vector_index(
+    table: &TableSchema,
+    column_ordinal: usize,
+    dim: usize,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let signature = scan_signature(table, engine, txn)?;
+    let built = build_vector_index(table, column_ordinal, dim, signature, engine, txn)?;
+    let slot = hnsw_slot((engine_identity(engine), table.id, column_ordinal));
+    *slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
+    Ok(())
+}
+
 /// Bring a cached vector index up to date for the current snapshot. Diffs the live rows
 /// against the cache: if rows were only **added** (a pure append, the common vector-workload case),
 /// the new rows are inserted into the existing graph — avoiding an O(n log n) rebuild. Any
@@ -4149,4 +4171,93 @@ fn top_n_rows(
     let mut kept = heap.into_vec();
     kept.sort_unstable_by(|a, b| cmp_top_n(&a.keys, a.seq, &b.keys, b.seq, keys));
     Ok(kept.into_iter().map(|e| e.row).collect())
+}
+
+#[cfg(test)]
+mod eager_build_tests {
+    //! Eager build: `CREATE INDEX ... USING hnsw` must build and cache the HNSW graph
+    //! itself, so the cost lands there rather than ambushing the first KNN query.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::significant_drop_tightening,
+        reason = "unit test asserts via unwrap/panic; lock guards are short-lived here"
+    )]
+
+    use super::{HNSW_CACHE, engine_identity};
+    use crate::{Catalog, Error, IndexInfo, Session, analyze, parse, plan};
+    use nusadb_btree::BtreeEngine;
+    use nusadb_core::{StorageEngine, TableSchema};
+
+    struct Cat<'a>(&'a dyn StorageEngine);
+    impl Catalog for Cat<'_> {
+        fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+            self.0.lookup_table(name).map_err(Into::into)
+        }
+        fn list_indexes(&self, _: &str) -> Result<Vec<IndexInfo>, Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn exec(engine: &dyn StorageEngine, session: &mut Session, sql: &str) {
+        let logical = analyze(parse(sql).unwrap(), &Cat(engine)).unwrap();
+        session.execute(plan(logical)).unwrap();
+    }
+
+    #[test]
+    fn create_index_builds_graph_eagerly_before_any_query() {
+        let engine = BtreeEngine::new();
+        let mut session = Session::new(&engine);
+        exec(
+            &engine,
+            &mut session,
+            "CREATE TABLE items (id INT NOT NULL, embedding VECTOR(3))",
+        );
+        for (id, v) in [(1, "[1,0,0]"), (2, "[0,1,0]"), (3, "[0,0,1]")] {
+            exec(
+                &engine,
+                &mut session,
+                &format!("INSERT INTO items VALUES ({id}, '{v}'::VECTOR(3))"),
+            );
+        }
+        let table = engine.lookup_table("items").unwrap().unwrap();
+        let column_ordinal = 1; // `embedding`
+        let key = (engine_identity(&engine), table.id, column_ordinal);
+
+        // No query has run yet, so under the lazy behaviour the cache slot would be empty.
+        assert!(
+            HNSW_CACHE
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .is_none(),
+            "cache should be cold before CREATE INDEX",
+        );
+
+        exec(
+            &engine,
+            &mut session,
+            "CREATE INDEX items_emb ON items USING hnsw (embedding)",
+        );
+
+        // After CREATE INDEX — and still before any KNN query — the graph is built and cached.
+        let slot = HNSW_CACHE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .expect("CREATE INDEX should have created a cache slot");
+        let graphed = {
+            let guard = slot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = guard
+                .as_ref()
+                .expect("CREATE INDEX should have built the graph eagerly");
+            cached.id_to_row.len()
+        };
+        // All three non-NULL vectors are in the graph.
+        assert_eq!(graphed, 3);
+    }
 }
