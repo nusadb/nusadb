@@ -2470,6 +2470,8 @@ const VECTOR_INDEX_CATALOG: &str = "nusadb_vector_indexes";
 /// A vector-index declaration read back from [`VECTOR_INDEX_CATALOG`], for the table column
 /// the lookup matched on.
 pub(super) struct VectorIndexEntry {
+    /// The index name — the key under which its persisted graph is stored.
+    pub name: String,
     /// The vector dimension `n`.
     pub dim: usize,
 }
@@ -2549,12 +2551,15 @@ pub(super) fn vector_index_exists(
     Ok(load_view_def(engine, txn, VECTOR_INDEX_CATALOG, name)?.is_some())
 }
 
-/// Remove a vector index's declaration, returning whether one was deleted.
+/// Remove a vector index's declaration and its persisted graph, returning whether a declaration was
+/// deleted.
 pub(super) fn delete_vector_index(
     engine: &dyn StorageEngine,
     txn: TxnId,
     name: &str,
 ) -> Result<bool, Error> {
+    // Drop the persisted graph blob too, so a dropped index leaves nothing to reload.
+    ops::delete_vector_graph(engine, txn, name)?;
     delete_view_def(engine, txn, VECTOR_INDEX_CATALOG, name)
 }
 
@@ -2601,12 +2606,15 @@ pub(super) fn vector_index_for_column(
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((_, bytes)) = scan.try_next()? {
         let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
-        if let [ast::Value::Text(_), ast::Value::Text(def)] = row.as_slice()
+        if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice()
             && let Some((table, column_ordinal, dim)) = parse_vector_index_def(def)
             && table == table_name
             && column_ordinal == ordinal
         {
-            return Ok(Some(VectorIndexEntry { dim }));
+            return Ok(Some(VectorIndexEntry {
+                name: name.clone(),
+                dim,
+            }));
         }
     }
     Ok(None)

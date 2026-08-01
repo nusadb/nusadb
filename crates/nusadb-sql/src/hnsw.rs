@@ -156,6 +156,12 @@ impl HnswIndex {
         self.nodes.len()
     }
 
+    /// The dimension every indexed vector has.
+    #[must_use]
+    pub const fn dim(&self) -> usize {
+        self.dim
+    }
+
     /// Whether the index holds no points.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -416,6 +422,144 @@ impl HnswIndex {
         let found = self.search_layer(query, &[ep], beam, 0);
         Ok(found.into_iter().take(k).map(|c| (c.id, c.dist)).collect())
     }
+
+    /// Serialize the built graph to a compact little-endian byte blob (see [`Self::deserialize`]).
+    /// Captures every field needed to reconstruct an identical index without rebuilding: dimension,
+    /// metric, params, RNG state, entry point, and each node's vector and per-layer neighbour lists.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "dimension, param, and node/neighbour counts are far below u32::MAX for any real index"
+    )]
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.dim as u32).to_le_bytes());
+        out.push(match self.metric {
+            Metric::L2 => 0,
+            Metric::Cosine => 1,
+            Metric::InnerProduct => 2,
+        });
+        out.extend_from_slice(&(self.params.m as u32).to_le_bytes());
+        out.extend_from_slice(&(self.params.ef_construction as u32).to_le_bytes());
+        out.extend_from_slice(&self.rng.to_le_bytes());
+        match self.entry {
+            Some(e) => {
+                out.push(1);
+                out.extend_from_slice(&e.to_le_bytes());
+            },
+            None => out.push(0),
+        }
+        out.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for node in &self.nodes {
+            for &x in &node.vector {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out.extend_from_slice(&(node.neighbours.len() as u32).to_le_bytes());
+            for layer in &node.neighbours {
+                out.extend_from_slice(&(layer.len() as u32).to_le_bytes());
+                for &nb in layer {
+                    out.extend_from_slice(&nb.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Reconstruct an index from [`Self::serialize`] output, or `None` if the bytes are truncated,
+    /// carry trailing garbage, or name an unknown metric. The result is the exact index that was
+    /// serialized, so a search over it returns identical results without any rebuild.
+    #[must_use]
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+        let mut r = ByteReader::new(bytes);
+        let dim = r.u32()? as usize;
+        let metric = match r.u8()? {
+            0 => Metric::L2,
+            1 => Metric::Cosine,
+            2 => Metric::InnerProduct,
+            _ => return None,
+        };
+        let m = (r.u32()? as usize).max(2);
+        let ef_construction = r.u32()? as usize;
+        let rng = r.u64()?;
+        let entry = match r.u8()? {
+            0 => None,
+            1 => Some(r.u32()?),
+            _ => return None,
+        };
+        let node_count = r.u32()? as usize;
+        // Cap the pre-allocation by the remaining byte count so a corrupt count cannot request a
+        // pathological allocation (each node needs at least its vector + a layer count).
+        let mut nodes = Vec::with_capacity(node_count.min(bytes.len()));
+        for _ in 0..node_count {
+            let mut vector = Vec::with_capacity(dim.min(bytes.len()));
+            for _ in 0..dim {
+                vector.push(r.f32()?);
+            }
+            let layer_count = r.u32()? as usize;
+            let mut neighbours = Vec::with_capacity(layer_count.min(bytes.len()));
+            for _ in 0..layer_count {
+                let nb_count = r.u32()? as usize;
+                let mut layer = Vec::with_capacity(nb_count.min(bytes.len()));
+                for _ in 0..nb_count {
+                    layer.push(r.u32()?);
+                }
+                neighbours.push(layer);
+            }
+            nodes.push(Node { vector, neighbours });
+        }
+        if !r.at_end() {
+            return None;
+        }
+        Some(Self {
+            dim,
+            metric,
+            params: HnswParams { m, ef_construction },
+            level_mult: 1.0 / (m as f64).ln(),
+            nodes,
+            entry,
+            rng,
+        })
+    }
+}
+
+/// A bounds-checked little-endian cursor: every read returns `None` past the end rather than
+/// panicking, so a truncated blob is rejected cleanly. Shared with the vector-index graph
+/// persistence wrapper in the executor, which frames a graph blob with its own header.
+pub(crate) struct ByteReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    /// Start reading at the front of `bytes`.
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    /// Whether every byte has been consumed (used to reject trailing garbage).
+    pub(crate) const fn at_end(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    pub(crate) fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+    pub(crate) fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    pub(crate) fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +649,43 @@ mod tests {
         let got = index.search(&[0.1, 0.1], 3, 16).expect("search");
         let ids: Vec<u32> = got.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![0, 1, 2], "nearest three of (0.1,0.1)");
+    }
+
+    #[test]
+    fn serialize_round_trip_reproduces_search() {
+        let (n, dim, k) = (300, 12, 10);
+        let data = random_vectors(n, dim, 5);
+        let mut index = HnswIndex::new(dim, Metric::Cosine, HnswParams::default(), 99);
+        for v in &data {
+            index.insert(v.clone()).expect("insert");
+        }
+        let blob = index.serialize();
+        let restored = HnswIndex::deserialize(&blob).expect("deserialize a valid blob");
+        assert_eq!(restored.len(), index.len());
+
+        // A search over the restored graph is identical to the original — same ids, same distances.
+        for q in random_vectors(20, dim, 6) {
+            let before = index.search(&q, k, 64).expect("search original");
+            let after = restored.search(&q, k, 64).expect("search restored");
+            assert_eq!(before, after, "restored graph must search identically");
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_or_garbage_blobs() {
+        let mut index = HnswIndex::new(4, Metric::L2, HnswParams::default(), 3);
+        for v in [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]] {
+            index.insert(v.to_vec()).expect("insert");
+        }
+        let blob = index.serialize();
+        // A prefix (truncated) blob is rejected, not accepted as a smaller index.
+        assert!(HnswIndex::deserialize(&blob[..blob.len() - 1]).is_none());
+        // Trailing bytes are rejected.
+        let mut extra = blob;
+        extra.push(0xAB);
+        assert!(HnswIndex::deserialize(&extra).is_none());
+        // Empty input is rejected.
+        assert!(HnswIndex::deserialize(&[]).is_none());
     }
 
     #[test]

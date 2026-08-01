@@ -2065,6 +2065,7 @@ fn build_vector_index(
 /// the normal staleness path. Building here also means a failed or cancelled build surfaces as a
 /// failed `CREATE INDEX` (rolled back with its txn) rather than a half-built graph seen mid-query.
 pub(super) fn warm_vector_index(
+    name: &str,
     table: &TableSchema,
     column_ordinal: usize,
     dim: usize,
@@ -2073,11 +2074,212 @@ pub(super) fn warm_vector_index(
 ) -> Result<(), Error> {
     let signature = scan_signature(table, engine, txn)?;
     let built = build_vector_index(table, column_ordinal, dim, signature, engine, txn)?;
+    // Persist the graph so a restart loads it instead of paying the build cost again. This runs in
+    // the `CREATE INDEX` write txn, so the blob commits (or rolls back) atomically with the index
+    // declaration — a query never sees a declaration without its persisted graph.
+    persist_vector_graph(engine, txn, name, &built)?;
     let slot = hnsw_slot((engine_identity(engine), table.id, column_ordinal));
     *slot
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
     Ok(())
+}
+
+/// System catalog persisting each `USING hnsw` graph as a serialized blob, so a restart loads the
+/// graph instead of rebuilding it. Row shape `(name TEXT, data BYTEA)`, keyed by index name.
+const VECTOR_GRAPH_CATALOG: &str = "nusadb_vector_index_graphs";
+const VECTOR_GRAPH_SCHEMA: [ColumnType; 2] = [ColumnType::Text, ColumnType::Bytes];
+/// Blob header magic (`"NVGX"` little-endian) and format version. An unrecognized magic or version
+/// makes the load fall back to a rebuild rather than misread an old or foreign blob.
+const VECTOR_GRAPH_MAGIC: u32 = 0x4E56_4758;
+const VECTOR_GRAPH_VERSION: u16 = 1;
+
+/// Look up the graph catalog, creating the `(name, data)` table lazily if it does not exist.
+fn ensure_graph_catalog(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<nusadb_core::TableId, Error> {
+    if let Some(schema) = engine.lookup_table_as_of(txn, VECTOR_GRAPH_CATALOG)? {
+        return Ok(schema.id);
+    }
+    let def = TableDef {
+        schema: "public".to_owned(),
+        name: VECTOR_GRAPH_CATALOG.to_owned(),
+        columns: vec![
+            ColumnDef {
+                name: "name".to_owned(),
+                ty: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "data".to_owned(),
+                ty: ColumnType::Bytes,
+                nullable: false,
+            },
+        ],
+    };
+    Ok(engine.create_table(txn, &def)?)
+}
+
+/// Frame a built index into a persistable blob: header, build signature, the serialized graph, and
+/// the tid of every graph node (in node-id order) so the node→row mapping can be rebuilt on load.
+fn encode_graph_blob(cached: &CachedVectorIndex) -> Vec<u8> {
+    let graph = cached.index.serialize();
+    // One tid per graph node: node `i` was built from the row at `id_to_row[i]`. `get` keeps this
+    // panic-free; the two vectors are built together so the lookup always succeeds.
+    let node_tids: Vec<Tid> = cached
+        .id_to_row
+        .iter()
+        .filter_map(|&row_idx| cached.tids.get(row_idx).copied())
+        .collect();
+    let mut out = Vec::with_capacity(graph.len() + node_tids.len() * 10 + 32);
+    out.extend_from_slice(&VECTOR_GRAPH_MAGIC.to_le_bytes());
+    out.extend_from_slice(&VECTOR_GRAPH_VERSION.to_le_bytes());
+    out.extend_from_slice(&cached.signature.to_le_bytes());
+    out.extend_from_slice(&(graph.len() as u64).to_le_bytes());
+    out.extend_from_slice(&graph);
+    out.extend_from_slice(&(node_tids.len() as u64).to_le_bytes());
+    for tid in node_tids {
+        out.extend_from_slice(&tid.page.0.to_le_bytes());
+        out.extend_from_slice(&tid.slot.0.to_le_bytes());
+    }
+    out
+}
+
+/// Parse a blob written by [`encode_graph_blob`] into `(signature, graph bytes, per-node tids)`, or
+/// `None` if the header is unrecognized or the blob is truncated / has trailing bytes.
+fn decode_graph_blob(blob: &[u8]) -> Option<(u64, &[u8], Vec<Tid>)> {
+    let mut r = crate::hnsw::ByteReader::new(blob);
+    if r.u32()? != VECTOR_GRAPH_MAGIC || r.u16()? != VECTOR_GRAPH_VERSION {
+        return None;
+    }
+    let signature = r.u64()?;
+    let graph_len = usize::try_from(r.u64()?).ok()?;
+    let graph = r.take(graph_len)?;
+    let node_count = usize::try_from(r.u64()?).ok()?;
+    let mut tids = Vec::with_capacity(node_count.min(blob.len()));
+    for _ in 0..node_count {
+        let page = nusadb_core::PageId(r.u64()?);
+        let slot = nusadb_core::SlotIdx(r.u16()?);
+        tids.push(Tid { page, slot });
+    }
+    if !r.at_end() {
+        return None;
+    }
+    Some((signature, graph, tids))
+}
+
+/// Persist (or replace) the built graph for index `name`. Runs in the caller's txn, so the blob is
+/// written transactionally with whatever DDL/DML triggered it.
+fn persist_vector_graph(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+    cached: &CachedVectorIndex,
+) -> Result<(), Error> {
+    let cat = ensure_graph_catalog(engine, txn)?;
+    delete_vector_graph(engine, txn, name)?;
+    let blob = encode_graph_blob(cached);
+    let row = [ast::Value::Text(name.to_owned()), ast::Value::Bytes(blob)];
+    let bytes = row::encode(&row, &VECTOR_GRAPH_SCHEMA)?;
+    engine.insert(txn, cat, &bytes)?;
+    Ok(())
+}
+
+/// Remove the persisted graph for index `name`, if any. Called when the index is dropped.
+pub(super) fn delete_vector_graph(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, VECTOR_GRAPH_CATALOG)? else {
+        return Ok(());
+    };
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VECTOR_GRAPH_SCHEMA)?;
+        if matches!(row.first(), Some(ast::Value::Text(n)) if n == name) {
+            victims.push(tid);
+        }
+    }
+    drop(scan);
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(())
+}
+
+/// Try to load a persisted graph for index `name` and rehydrate a full [`CachedVectorIndex`] from
+/// it, avoiding the O(n·log n)+ rebuild after a restart. Returns `None` (so the caller rebuilds)
+/// when there is no blob, its header is unrecognized/corrupt, its build signature no longer matches
+/// the table (`current_signature`), the graph's dimension disagrees, or a persisted node's row is no
+/// longer present. On success the graph is deserialized straight from the blob and the row bag /
+/// tid list / id→row map are rebuilt from a single table scan (cheap, O(n)).
+fn load_vector_graph(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+    table: &TableSchema,
+    dim: usize,
+    current_signature: u64,
+) -> Result<Option<CachedVectorIndex>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, VECTOR_GRAPH_CATALOG)? else {
+        return Ok(None);
+    };
+    let mut blob: Option<Vec<u8>> = None;
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VECTOR_GRAPH_SCHEMA)?;
+        if let [ast::Value::Text(n), ast::Value::Bytes(data)] = row.as_slice()
+            && n == name
+        {
+            blob = Some(data.clone());
+            break;
+        }
+    }
+    drop(scan);
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+    let Some((signature, graph_bytes, node_tids)) = decode_graph_blob(&blob) else {
+        return Ok(None);
+    };
+    // A build against a different set of visible rows is stale — rebuild rather than serve it.
+    if signature != current_signature {
+        return Ok(None);
+    }
+    let Some(index) = crate::hnsw::HnswIndex::deserialize(graph_bytes) else {
+        return Ok(None);
+    };
+    if index.dim() != dim || index.len() != node_tids.len() {
+        return Ok(None);
+    }
+    // Rebuild the row bag / tids / id→row map from one scan; the expensive graph is loaded, not built.
+    let scanned = super::scan::scan_table(table, engine, txn)?;
+    let mut rows = Vec::with_capacity(scanned.len());
+    let mut tids = Vec::with_capacity(scanned.len());
+    let mut tid_to_row: HashMap<Tid, usize> = HashMap::with_capacity(scanned.len());
+    for (tid, row) in scanned {
+        tid_to_row.insert(tid, rows.len());
+        tids.push(tid);
+        rows.push(row);
+    }
+    let mut id_to_row = Vec::with_capacity(node_tids.len());
+    for tid in &node_tids {
+        match tid_to_row.get(tid) {
+            Some(&i) => id_to_row.push(i),
+            // A persisted node's row is gone though the signature matched — treat as corrupt, rebuild.
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(CachedVectorIndex {
+        signature: current_signature,
+        index,
+        rows,
+        id_to_row,
+        tids,
+    }))
 }
 
 /// Bring a cached vector index up to date for the current snapshot. Diffs the live rows
@@ -2312,7 +2514,24 @@ fn run_vector_knn(
                     engine,
                     txn,
                 )?,
-                None => build_vector_index(table, column_ordinal, entry.dim, current, engine, txn)?,
+                // Cold slot (e.g. a fresh process after a restart): load the persisted graph if it
+                // is still current, so the query pays an O(n) scan instead of the full rebuild. A
+                // missing/stale/corrupt blob falls back to a rebuild. Read-only, so it is safe in
+                // this query's txn; the rebuilt graph is not re-persisted here (that happens in the
+                // write txn that created the index).
+                None => {
+                    match load_vector_graph(engine, txn, &entry.name, table, entry.dim, current)? {
+                        Some(loaded) => loaded,
+                        None => build_vector_index(
+                            table,
+                            column_ordinal,
+                            entry.dim,
+                            current,
+                            engine,
+                            txn,
+                        )?,
+                    }
+                },
             };
             *guard = Some(built);
         }
@@ -4175,8 +4394,9 @@ fn top_n_rows(
 
 #[cfg(test)]
 mod eager_build_tests {
-    //! Eager build: `CREATE INDEX ... USING hnsw` must build and cache the HNSW graph
-    //! itself, so the cost lands there rather than ambushing the first KNN query.
+    //! Eager build + persistence: `CREATE INDEX ... USING hnsw` builds and caches the HNSW graph
+    //! itself (so the cost lands there, not on the first query) and persists it, so a restart loads
+    //! the graph instead of rebuilding it.
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -4185,10 +4405,10 @@ mod eager_build_tests {
         reason = "unit test asserts via unwrap/panic; lock guards are short-lived here"
     )]
 
-    use super::{HNSW_CACHE, engine_identity};
+    use super::{HNSW_CACHE, engine_identity, load_vector_graph, scan_signature};
     use crate::{Catalog, Error, IndexInfo, Session, analyze, parse, plan};
     use nusadb_btree::BtreeEngine;
-    use nusadb_core::{StorageEngine, TableSchema};
+    use nusadb_core::{IsolationLevel, StorageEngine, TableSchema};
 
     struct Cat<'a>(&'a dyn StorageEngine);
     impl Catalog for Cat<'_> {
@@ -4259,5 +4479,102 @@ mod eager_build_tests {
         };
         // All three non-NULL vectors are in the graph.
         assert_eq!(graphed, 3);
+    }
+
+    /// Seed a 4-row vector table and index it, returning the resolved schema.
+    fn seed_indexed(engine: &dyn StorageEngine, session: &mut Session) -> TableSchema {
+        exec(
+            engine,
+            session,
+            "CREATE TABLE items (id INT NOT NULL, embedding VECTOR(3))",
+        );
+        for (id, v) in [
+            (1, "[1,0,0]"),
+            (2, "[0,1,0]"),
+            (3, "[1,1,0]"),
+            (4, "[0.9,0.1,0]"),
+        ] {
+            exec(
+                engine,
+                session,
+                &format!("INSERT INTO items VALUES ({id}, '{v}'::VECTOR(3))"),
+            );
+        }
+        exec(
+            engine,
+            session,
+            "CREATE INDEX items_emb ON items USING hnsw (embedding)",
+        );
+        engine.lookup_table("items").unwrap().unwrap()
+    }
+
+    /// Drop the in-process cache slot — the effect a restart has (process memory lost, engine
+    /// storage kept), so the next load must come from the persisted blob rather than the cache.
+    fn evict_cache(engine: &dyn StorageEngine, table_id: nusadb_core::TableId) {
+        HNSW_CACHE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(engine_identity(engine), table_id, 1));
+    }
+
+    #[test]
+    fn restart_loads_persisted_graph_instead_of_rebuilding() {
+        let engine = BtreeEngine::new();
+        let mut session = Session::new(&engine);
+        let table = seed_indexed(&engine, &mut session);
+
+        // Simulate a restart: the process-global cache is gone, the engine's storage survives.
+        evict_cache(&engine, table.id);
+
+        // The persisted graph rehydrates from the blob (proving CREATE INDEX persisted it) — the
+        // load returns a full index without a rebuild.
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let sig = scan_signature(&table, &engine, txn).unwrap();
+        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig)
+            .unwrap()
+            .expect("restart must load the persisted graph, not None");
+        engine.commit(txn).unwrap();
+        assert_eq!(loaded.index.len(), 4, "all four vectors present after load");
+        assert_eq!(loaded.id_to_row.len(), 4);
+        assert_eq!(loaded.signature, sig);
+    }
+
+    #[test]
+    fn a_stale_persisted_graph_is_not_loaded() {
+        let engine = BtreeEngine::new();
+        let mut session = Session::new(&engine);
+        let table = seed_indexed(&engine, &mut session);
+        // A write after CREATE INDEX makes the persisted blob (written at index time) stale.
+        exec(
+            &engine,
+            &mut session,
+            "INSERT INTO items VALUES (5, '[0.5,0.5,0]'::VECTOR(3))",
+        );
+        evict_cache(&engine, table.id);
+
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let sig = scan_signature(&table, &engine, txn).unwrap();
+        // The current signature no longer matches the persisted one → load declines, forcing a rebuild.
+        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig).unwrap();
+        engine.commit(txn).unwrap();
+        assert!(loaded.is_none(), "a stale blob must not be served");
+    }
+
+    #[test]
+    fn dropping_the_index_removes_the_persisted_graph() {
+        let engine = BtreeEngine::new();
+        let mut session = Session::new(&engine);
+        let table = seed_indexed(&engine, &mut session);
+        exec(&engine, &mut session, "DROP INDEX items_emb");
+        evict_cache(&engine, table.id);
+
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let sig = scan_signature(&table, &engine, txn).unwrap();
+        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig).unwrap();
+        engine.commit(txn).unwrap();
+        assert!(
+            loaded.is_none(),
+            "a dropped index leaves no persisted graph"
+        );
     }
 }

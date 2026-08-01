@@ -460,7 +460,14 @@ pub(super) fn run_create_index(
         // fails this statement instead of leaving a half-built graph for a query to hit. The graph
         // is cached in-process; a fresh process still rebuilds on first use (persistence is separate).
         if let Some(table) = engine.lookup_table_as_of(txn, &spec.table)? {
-            ops::warm_vector_index(&table, spec.column_ordinal, spec.dim, engine, txn)?;
+            ops::warm_vector_index(
+                &spec.name,
+                &table,
+                spec.column_ordinal,
+                spec.dim,
+                engine,
+                txn,
+            )?;
         }
         return Ok(ExecutionResult::IndexCreated);
     }
