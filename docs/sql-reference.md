@@ -88,3 +88,27 @@ digits rather than truncating to the operands' scale. This is a fixed-scale rule
 deterministic digits) rather than a significant-digit rule; every digit it returns is correct,
 and a computation needing a specific scale can `round(expr, n)` or cast to a declared
 `NUMERIC(p, s)`.
+
+## Materialized views stay fresh automatically
+
+A materialized view whose body is a single-table projection with an optional `WHERE` filter is
+kept up to date incrementally: every insert, update, or delete on its base table also adjusts the
+view, so a query against the view always reflects the latest base rows without an explicit
+`REFRESH`. This differs from the common convention where a materialized view holds a frozen
+snapshot until refreshed — here that shape of view is never stale, and a `REFRESH` on it is a
+no-op that recomputes the same contents.
+
+Views whose body needs a join or an aggregate are **not** maintained incrementally: they hold the
+result captured at `CREATE`/`REFRESH` time and change only when you `REFRESH` them again. So the
+freshness of a materialized view depends on its shape:
+
+| View body                            | Freshness              | `REFRESH` needed? |
+| ------------------------------------ | ---------------------- | ----------------- |
+| single-table projection (+ `WHERE`)  | always current         | no (auto)         |
+| join / aggregate / grouped           | snapshot at last build | yes               |
+
+The incremental path writes only the rows that changed, so it avoids rescanning the base table;
+the trade-off is a small maintenance cost on each base-table write while such a view exists. If you
+rely on a materialized view being a stable point-in-time snapshot, use a shape that is
+refresh-only (for example, wrap the projection in a grouping or join), or query a regular `VIEW`
+plus your own snapshot table.
