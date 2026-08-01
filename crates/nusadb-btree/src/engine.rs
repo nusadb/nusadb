@@ -3513,87 +3513,19 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         hi: Bound<Vec<u8>>,
         direction: ScanDirection,
     ) -> Result<Box<dyn TupleScan>> {
-        let cat = self.catalog.read().map_err(|_| poisoned())?;
-        let (view, serializable) = {
-            let txns = self.txns.lock().map_err(|_| poisoned())?;
-            let level = txns
-                .txns
-                .get(&txn.0)
-                .map(|t| t.level)
-                .ok_or_else(|| unknown_txn(txn))?;
-            (
-                txns.view_for(txn.0)?,
-                matches!(level, IsolationLevel::Serializable),
-            )
-        };
-        let idx = cat
-            .indexes
-            .get(&index.0)
-            .ok_or_else(|| index_not_found(index))?;
-        let table_id = idx.def.table.0;
-        let t = cat
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| table_not_found(idx.def.table))?;
-        // Ordered key walk over `[lo, hi]` — ascending for a forward scan, descending (the same rows
-        // reversed) for a backward one. Two visibility hops per entry: the ENTRY's own
-        // stamps first — the row keeps its address across versions, so only the stamps can tell
-        // this reader whether its visible version carries this key (an `UPDATE` that moved the
-        // row dead-stamps the old key's entry and its new key's entry is unseen by older
-        // snapshots) — then the base row under the caller's view (a rolled-back or deleted row
-        // resolves to nothing). Entry iteration holds the index read latch; the base-row hop is
-        // a latch-free tree read under the reclamation gate.
-        let mut rows: Vec<(Tid, SharedTuple)> = Vec::new();
-        let mut read_ids: Vec<u64> = Vec::new();
-        {
-            let data = idx.data.read().map_err(|_| poisoned())?;
-            let undo = self.reclaim.read().map_err(|_| poisoned())?;
-            let tree = ClusteredTree::open(&self.store, t.root_id());
-            let range = data
-                .entries
-                .range::<[u8], _>((as_slice_bound(&lo), as_slice_bound(&hi)));
-            // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed.
-            let entries: Box<dyn Iterator<Item = _>> = match direction {
-                ScanDirection::Forward => Box::new(range),
-                ScanDirection::Backward => Box::new(range.rev()),
-            };
-            for (_key, entry_rows) in entries {
-                for (&row_id, metas) in entry_rows {
-                    if !IndexData::entry_visible(metas, &view) {
-                        continue;
-                    }
-                    let Some(value) = tree.get(row_id)? else {
-                        continue;
-                    };
-                    let (meta, tuple) =
-                        mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
-                    if let Some(visible) = mvcc::visible_tuple(meta, tuple, &undo.arena, &view) {
-                        rows.push((tid_of(row_id), SharedTuple::from(visible)));
-                        if serializable {
-                            read_ids.push(row_id);
-                        }
-                    }
-                }
-            }
-        }
-        // Record the read set for a SERIALIZABLE transaction: an
-        // index scan reads only the matching rows, so this is the narrower read set a
-        // PK/secondary-key predicate produces.
-        if !read_ids.is_empty()
-            && let Some(state) = self
-                .txns
-                .lock()
-                .map_err(|_| poisoned())?
-                .txns
-                .get_mut(&txn.0)
-        {
-            state
-                .reads
-                .extend(read_ids.into_iter().map(|row_id| (table_id, row_id)));
-        }
-        Ok(Box::new(VecScan {
-            rows: rows.into_iter(),
-        }))
+        self.index_scan_collect(txn, index, &lo, &hi, direction, None)
+    }
+
+    fn index_scan_directed_limited(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+        direction: ScanDirection,
+        limit: Option<usize>,
+    ) -> Result<Box<dyn TupleScan>> {
+        self.index_scan_collect(txn, index, &lo, &hi, direction, limit)
     }
 
     fn index_scan_committed(
@@ -4241,6 +4173,109 @@ impl nusadb_core::StorageEngine for BtreeEngine {
               discipline on the struct docs)"
 )]
 impl BtreeEngine {
+    /// Shared body of the directed index scan (both the plain and the `LIMIT`-capped forms). Walks
+    /// the index's ordered key range in `direction`, resolving each entry to its visible base row,
+    /// and — when `limit` is given — stops after that many visible rows, so an `ORDER BY … LIMIT`
+    /// served from the index does `O(limit)` work instead of `O(range)`. Under `SERIALIZABLE` the
+    /// read set records exactly the rows read (the first `limit` under a cap), the narrower read set
+    /// an index `LIMIT` scan produces.
+    fn index_scan_collect(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        lo: &Bound<Vec<u8>>,
+        hi: &Bound<Vec<u8>>,
+        direction: ScanDirection,
+        limit: Option<usize>,
+    ) -> Result<Box<dyn TupleScan>> {
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        let (view, serializable) = {
+            let txns = self.txns.lock().map_err(|_| poisoned())?;
+            let level = txns
+                .txns
+                .get(&txn.0)
+                .map(|t| t.level)
+                .ok_or_else(|| unknown_txn(txn))?;
+            (
+                txns.view_for(txn.0)?,
+                matches!(level, IsolationLevel::Serializable),
+            )
+        };
+        let idx = cat
+            .indexes
+            .get(&index.0)
+            .ok_or_else(|| index_not_found(index))?;
+        let table_id = idx.def.table.0;
+        let t = cat
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| table_not_found(idx.def.table))?;
+        // Ordered key walk over `[lo, hi]` — ascending for a forward scan, descending (the same rows
+        // reversed) for a backward one. Two visibility hops per entry: the ENTRY's own
+        // stamps first — the row keeps its address across versions, so only the stamps can tell
+        // this reader whether its visible version carries this key (an `UPDATE` that moved the
+        // row dead-stamps the old key's entry and its new key's entry is unseen by older
+        // snapshots) — then the base row under the caller's view (a rolled-back or deleted row
+        // resolves to nothing). Entry iteration holds the index read latch; the base-row hop is
+        // a latch-free tree read under the reclamation gate.
+        let mut rows: Vec<(Tid, SharedTuple)> = Vec::new();
+        let mut read_ids: Vec<u64> = Vec::new();
+        {
+            let data = idx.data.read().map_err(|_| poisoned())?;
+            let undo = self.reclaim.read().map_err(|_| poisoned())?;
+            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let range = data
+                .entries
+                .range::<[u8], _>((as_slice_bound(lo), as_slice_bound(hi)));
+            // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed.
+            let entries: Box<dyn Iterator<Item = _>> = match direction {
+                ScanDirection::Forward => Box::new(range),
+                ScanDirection::Backward => Box::new(range.rev()),
+            };
+            'walk: for (_key, entry_rows) in entries {
+                for (&row_id, metas) in entry_rows {
+                    if !IndexData::entry_visible(metas, &view) {
+                        continue;
+                    }
+                    let Some(value) = tree.get(row_id)? else {
+                        continue;
+                    };
+                    let (meta, tuple) =
+                        mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
+                    if let Some(visible) = mvcc::visible_tuple(meta, tuple, &undo.arena, &view) {
+                        rows.push((tid_of(row_id), SharedTuple::from(visible)));
+                        if serializable {
+                            read_ids.push(row_id);
+                        }
+                        // A `LIMIT`-capped ordered scan needs only the first `limit` visible rows in
+                        // key order — the rest cannot precede them — so stop the walk once collected.
+                        if limit.is_some_and(|cap| rows.len() >= cap) {
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+        // Record the read set for a SERIALIZABLE transaction: an
+        // index scan reads only the matching rows, so this is the narrower read set a
+        // PK/secondary-key predicate produces.
+        if !read_ids.is_empty()
+            && let Some(state) = self
+                .txns
+                .lock()
+                .map_err(|_| poisoned())?
+                .txns
+                .get_mut(&txn.0)
+        {
+            state
+                .reads
+                .extend(read_ids.into_iter().map(|row_id| (table_id, row_id)));
+        }
+        Ok(Box::new(VecScan {
+            rows: rows.into_iter(),
+        }))
+    }
+
     /// Whether `txn` is a known (begun, not yet ended) transaction — the guard every mutating
     /// call runs first.
     fn txn_exists(&self, txn: u64) -> Result<bool> {

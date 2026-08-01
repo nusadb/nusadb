@@ -155,11 +155,17 @@ pub(super) fn scan_rows_projected(
 /// reclaims its row version, and the engine's `index_scan` filters each entry by per-tid visibility
 /// against the transaction's snapshot — so a frozen REPEATABLE READ / SERIALIZABLE reader still finds
 /// the row versions visible to it (and only those). The sequential-scan fallback is gone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "index identity (table, index), key range (lo, hi), scan direction + row cap, and the (engine, txn) handle — each is an independent input to one ordered scan"
+)]
 pub(super) fn index_scan_rows(
     table: &TableSchema,
     index: &str,
     lo: &std::ops::Bound<Vec<ast::Value>>,
     hi: &std::ops::Bound<Vec<ast::Value>>,
+    direction: nusadb_core::engine::ScanDirection,
+    limit: Option<usize>,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
@@ -169,7 +175,19 @@ pub(super) fn index_scan_rows(
             name: index.to_owned(),
         })?;
     let schema = column_types(table);
-    let mut scan = engine.index_scan(txn, id, encode_key_bound(lo)?, encode_key_bound(hi)?)?;
+    // Pass the row cap to the engine so it stops materializing after `limit` visible rows in key
+    // order — the O(range) → O(limit) win for `ORDER BY … LIMIT`. The executor-side break below is a
+    // backstop for an engine whose limited scan falls back to the full directed scan. The ordered
+    // scan path never runs under `SKIP LOCKED` (that is a `LockRows` plan, not a plain scan), so a
+    // skipped row never makes the visible count fall short of `limit`.
+    let mut scan = engine.index_scan_directed_limited(
+        txn,
+        id,
+        encode_key_bound(lo)?,
+        encode_key_bound(hi)?,
+        direction,
+        limit,
+    )?;
     let mut out = Vec::new();
     while let Some((tid, tuple)) = scan.try_next()? {
         // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`).
@@ -177,6 +195,11 @@ pub(super) fn index_scan_rows(
             continue;
         }
         out.push(row::decode(&tuple, &schema)?);
+        if let Some(cap) = limit
+            && out.len() >= cap
+        {
+            break;
+        }
     }
     Ok(out)
 }

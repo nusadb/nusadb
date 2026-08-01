@@ -6832,6 +6832,8 @@ fn index_scan_operator_reads_in_key_order_with_backfill() {
                 lo,
                 hi,
                 unique_point: false,
+                direction: nusadb_core::engine::ScanDirection::Forward,
+                limit: None,
             },
             None,
         );
@@ -8900,5 +8902,18 @@ fn bench_order_by_limit_at_scale() {
         "ORDER BY id ASC LIMIT 20 OFFSET 100",
         "SELECT id FROM bench ORDER BY id ASC LIMIT 20 OFFSET 100",
         20,
+    );
+    // Limit-sensitivity: a small LIMIT must be far faster than a large one. Constant time across
+    // LIMIT would mean the scan reads the whole range regardless (no early-termination) — the
+    // signature of the reverted regression. This pair is the proof the cap actually bounds the work.
+    bench(
+        "ORDER BY id ASC LIMIT 20 (small)",
+        "SELECT id FROM bench ORDER BY id ASC LIMIT 20",
+        20,
+    );
+    bench(
+        "ORDER BY id ASC LIMIT 50000 (large)",
+        "SELECT id FROM bench ORDER BY id ASC LIMIT 50000",
+        50_000,
     );
 }

@@ -209,6 +209,83 @@ mod tests {
         );
     }
 
+    /// A `LIMIT`-capped ordered index scan (the `ORDER BY … LIMIT` pushdown) reads — and so records
+    /// under SERIALIZABLE — only the first `limit` rows in key order. So a concurrent write of a row
+    /// **within** the cap aborts the reader (it read that row), while a write of a row **beyond** the
+    /// cap does not (it was never read). This is the read-set the reference's index-`LIMIT` scan
+    /// produces — narrower and more precise than a full scan, which would over-read and false-conflict.
+    #[test]
+    fn capped_index_scan_records_only_the_rows_it_returns() {
+        use nusadb_core::engine::ScanDirection;
+        let engine = BtreeEngine::new();
+        let setup = engine.begin(RC).unwrap();
+        let table = engine.create_table(setup, &table_def("t")).unwrap();
+        let idx = engine
+            .create_index(setup, &index_def("i", table, false))
+            .unwrap();
+        let mut tids = Vec::new();
+        for key in 0u8..10 {
+            let tid = engine.insert(setup, table, &[key]).unwrap();
+            engine.index_insert(setup, idx, &[key], tid).unwrap();
+            tids.push((key, tid));
+        }
+        engine.commit(setup).unwrap();
+
+        let scan_first_three = |txn| {
+            let mut scan = engine
+                .index_scan_directed_limited(
+                    txn,
+                    idx,
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    ScanDirection::Forward,
+                    Some(3),
+                )
+                .unwrap();
+            let mut keys = Vec::new();
+            while let Some((_, tuple)) = scan.try_next().unwrap() {
+                keys.push(tuple[0]);
+            }
+            keys
+        };
+        let update = |tid, val: u8| {
+            let writer = engine.begin(RC).unwrap();
+            engine.update(writer, table, tid, &[val]).unwrap();
+            engine.commit(writer).unwrap();
+        };
+        let tid_of = |k: u8| tids.iter().find(|(key, _)| *key == k).unwrap().1;
+
+        // Reader scans the first 3 keys (0,1,2). A committed write of key 1 (within the cap) aborts it.
+        let reader = engine.begin(SER).unwrap();
+        assert_eq!(
+            scan_first_three(reader),
+            vec![0, 1, 2],
+            "capped to the first 3"
+        );
+        update(tid_of(1), 91);
+        assert!(
+            matches!(
+                engine.commit(reader),
+                Err(nusadb_core::Error::SerializationConflict { .. })
+            ),
+            "writing a row within the cap (read) must abort the reader"
+        );
+
+        // Same scan, but the write is of key 7 — beyond the cap, never read → the reader commits.
+        // (Key 1's row now reads back 91 from the update above; only the read *set* — the first 3 in
+        // key order — matters here, so assert the cap held rather than the mutated values.)
+        let reader = engine.begin(SER).unwrap();
+        assert_eq!(
+            scan_first_three(reader).len(),
+            3,
+            "still capped to the first 3 keys"
+        );
+        update(tid_of(7), 97);
+        engine
+            .commit(reader)
+            .expect("writing a row beyond the cap (unread) must not abort the reader");
+    }
+
     /// `get` after the zero-allocation rewrite (`descend_read` + `leaf_find`): every
     /// inserted key reads back its exact tuple and every absent probe — before the first key,
     /// between keys, past the last — reads `None`, across enough sparse keys to split leaves

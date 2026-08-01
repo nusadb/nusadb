@@ -1064,6 +1064,30 @@ pub trait StorageEngine: Send + Sync {
         }
     }
 
+    /// Like [`index_scan_directed`](Self::index_scan_directed), but yields **at most `limit`** visible
+    /// rows — for an `ORDER BY <indexed prefix> [ASC|DESC] LIMIT n` served straight from the index,
+    /// where only the first `limit` rows in key order are wanted. `None` means no cap (the full range).
+    ///
+    /// This is the difference between an ordered `LIMIT` scan that is `O(limit)` and one that is
+    /// `O(range)`: an engine that materializes its scan must stop after `limit` visible rows for the
+    /// `LIMIT` to actually bound the work. The default ignores the cap and returns the full directed
+    /// scan (correct, but not early-stopping) — an engine overrides it to stop early. A capped scan
+    /// under `SERIALIZABLE` records only the rows it actually read (the first `limit`), the narrower
+    /// read set an index-`LIMIT` produces, which is what a caller relying on ordered-scan pushdown
+    /// must expect.
+    fn index_scan_directed_limited(
+        &self,
+        txn: TxnId,
+        index: IndexId,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+        direction: ScanDirection,
+        limit: Option<usize>,
+    ) -> Result<Box<dyn TupleScan>> {
+        let _ = limit;
+        self.index_scan_directed(txn, index, lo, hi, direction)
+    }
+
     /// Like [`index_scan`](Self::index_scan), but with **latest-committed** visibility (plus `txn`'s
     /// own writes) rather than `txn`'s frozen snapshot — the index-probe counterpart of
     /// [`scan_committed`](Self::scan_committed). It lets a uniqueness check probe a backing index in

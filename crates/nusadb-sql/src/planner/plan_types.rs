@@ -2004,6 +2004,14 @@ pub enum PhysicalOperator {
         /// ([`crate::plan_is_inline_point_get`]) requires it to bound the work it
         /// admits onto the reactor.
         unique_point: bool,
+        /// Scan direction: `Forward` yields ascending key order, `Backward` descending. Set to
+        /// `Backward` only by order-by sort-elimination for a `DESC` scan; a plain predicate index
+        /// scan is `Forward`.
+        direction: nusadb_core::engine::ScanDirection,
+        /// Row cap for an `ORDER BY … LIMIT` ordered scan: stop after this many visible rows (the
+        /// index yields them in key order, so the first `limit` are exactly the answer). `None` for
+        /// a predicate scan, which reads its whole key range.
+        limit: Option<usize>,
     },
     /// `SELECT ... FOR UPDATE` / `FOR SHARE`: take a row lock on every base-table row that
     /// satisfies `predicate`, then yield `input`'s rows unchanged. Wraps the whole single-table
