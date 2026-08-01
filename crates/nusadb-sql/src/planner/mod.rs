@@ -512,6 +512,67 @@ mod tests {
         assert!(matches!(*input, PhysicalOperator::SeqScan { .. }));
     }
 
+    /// True if any node in the plan is a `Sort`.
+    fn plan_has_sort(op: &PhysicalOperator) -> bool {
+        match op {
+            PhysicalOperator::Sort { .. } => true,
+            PhysicalOperator::Project { input, .. }
+            | PhysicalOperator::Limit { input, .. }
+            | PhysicalOperator::Filter { input, .. }
+            | PhysicalOperator::Distinct { input, .. } => plan_has_sort(input),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn order_by_indexed_asc_limit_eliminates_sort() {
+        // `ORDER BY a ASC LIMIT 20` on the NOT NULL indexed column `a` — the index already
+        // yields ascending key order, so the Sort is dropped and the base becomes a forward,
+        // limit-capped IndexScan. This is the sort-elimination win; the assertions are load-bearing.
+        let root = indexed_select_op("SELECT * FROM t ORDER BY a ASC LIMIT 20");
+        assert!(!plan_has_sort(&root), "the Sort must be eliminated");
+        let PhysicalOperator::Limit { input, count, .. } = root else {
+            panic!("expected a Limit at the root");
+        };
+        assert_eq!(count, 20);
+        let PhysicalOperator::Project { input, .. } = *input else {
+            panic!("expected Project below Limit");
+        };
+        let PhysicalOperator::IndexScan {
+            index,
+            direction,
+            limit,
+            lo,
+            hi,
+            ..
+        } = *input
+        else {
+            panic!("expected the Sort replaced by an IndexScan base");
+        };
+        assert_eq!(index, "t_a_idx");
+        assert_eq!(direction, nusadb_core::engine::ScanDirection::Forward);
+        assert_eq!(limit, Some(20));
+        assert_eq!(lo, Bound::Unbounded); // a full ordered scan, not a predicate range
+        assert_eq!(hi, Bound::Unbounded);
+    }
+
+    #[test]
+    fn order_by_keeps_sort_when_not_eliminable() {
+        // Each of these must KEEP the Sort — the guards that make the elimination correctness-safe:
+        // a DESC key (backward scan is the follow-up), a nullable ordering column (index null
+        // placement may disagree), an unindexed column, and no bounding LIMIT.
+        for sql in [
+            "SELECT * FROM t ORDER BY a DESC LIMIT 20",
+            "SELECT * FROM t ORDER BY b ASC LIMIT 20",
+            "SELECT * FROM t ORDER BY a ASC",
+        ] {
+            assert!(
+                plan_has_sort(&indexed_select_op(sql)),
+                "expected the Sort to be kept for: {sql}"
+            );
+        }
+    }
+
     /// Inline point-get plan-shape pins: `plan_is_inline_point_get` admits exactly an equality bound
     /// on a UNIQUE single-column index (at most one row) under pass-through operators, and
     /// denies a non-unique index, a range bound, and a `SeqScan` — the bound that keeps inline
