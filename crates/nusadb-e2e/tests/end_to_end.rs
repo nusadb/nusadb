@@ -8852,3 +8852,53 @@ fn the_refusal_leaves_ordinary_correlation_and_uncorrelated_forms_alone() {
         vec![vec![Value::Int(1), Value::Int(0)]]
     );
 }
+
+/// Benchmark (ignored by default; run with `--ignored --nocapture`): the perf gate for the
+/// ordered-index-scan `ORDER BY … LIMIT` optimization. A plan-shape test cannot catch a scaling
+/// regression, so this measures the real query time at a realistic row count. Compare the printed
+/// median against the baseline before re-landing the optimization.
+#[test]
+#[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+fn bench_order_by_limit_at_scale() {
+    const N: i64 = 100_000;
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE bench (id INT NOT NULL, payload TEXT)",
+    );
+    // Insert N rows in DESCENDING id order (so the id order differs from the clustered row-id order).
+    run(
+        &engine,
+        &format!("INSERT INTO bench SELECT generate_series({N}, 1, -1), 'x'"),
+    );
+    run(&engine, "CREATE INDEX bench_id ON bench (id)");
+
+    let bench = |label: &str, sql: &str, want: usize| {
+        let _ = run(&engine, sql); // warm up
+        let mut times: Vec<std::time::Duration> = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let result = run(&engine, sql);
+            times.push(start.elapsed());
+            assert_eq!(rows(result).len(), want, "unexpected row count for {label}");
+        }
+        times.sort_unstable();
+        println!("[bench] {label}: median={:?} runs={times:?}", times[2]);
+    };
+
+    bench(
+        "ORDER BY id ASC LIMIT 20",
+        "SELECT id FROM bench ORDER BY id ASC LIMIT 20",
+        20,
+    );
+    bench(
+        "ORDER BY id DESC LIMIT 20",
+        "SELECT id FROM bench ORDER BY id DESC LIMIT 20",
+        20,
+    );
+    bench(
+        "ORDER BY id ASC LIMIT 20 OFFSET 100",
+        "SELECT id FROM bench ORDER BY id ASC LIMIT 20 OFFSET 100",
+        20,
+    );
+}
