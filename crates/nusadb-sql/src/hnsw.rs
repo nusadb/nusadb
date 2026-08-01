@@ -206,6 +206,17 @@ impl HnswIndex {
     /// # Errors
     /// [`Error::Unsupported`] if `vector`'s length differs from the index dimension.
     pub fn insert(&mut self, vector: Vec<f32>) -> Result<u32, Error> {
+        self.insert_reporting(vector).map(|(id, _)| id)
+    }
+
+    /// Insert `vector`, returning its node id **and** the ids of the existing nodes whose neighbour
+    /// lists this insert changed (its chosen neighbours, which are linked back and possibly pruned).
+    /// Together with the new id, that is exactly the set of nodes whose persisted adjacency is now
+    /// stale — so an incremental persister can rewrite only those rows instead of the whole graph.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] if `vector`'s length differs from the index dimension.
+    pub fn insert_reporting(&mut self, vector: Vec<f32>) -> Result<(u32, Vec<u32>), Error> {
         if vector.len() != self.dim {
             return Err(Error::Unsupported(format!(
                 "HNSW expects dimension {}, got {}",
@@ -224,7 +235,7 @@ impl HnswIndex {
         let Some(entry) = self.entry else {
             // First point becomes the entry point.
             self.entry = Some(id);
-            return Ok(id);
+            return Ok((id, Vec::new()));
         };
 
         let query = self.nodes[id as usize].vector.clone();
@@ -237,12 +248,14 @@ impl HnswIndex {
         }
 
         // Phase 2: from this node's top down to layer 0, beam-search, pick neighbours, link both ways.
+        let mut touched: Vec<u32> = Vec::new();
         let mut entry_points = vec![ep];
         for layer in (0..=level.min(top)).rev() {
             let found =
                 self.search_layer(&query, &entry_points, self.params.ef_construction, layer);
             let degree = self.max_degree(layer);
             let chosen = self.select_neighbours(&query, &found, degree);
+            touched.extend_from_slice(&chosen);
             self.connect(id, &chosen, layer);
             entry_points = found.into_iter().map(|c| c.id).collect();
             if entry_points.is_empty() {
@@ -254,7 +267,9 @@ impl HnswIndex {
         if level > top {
             self.entry = Some(id);
         }
-        Ok(id)
+        touched.sort_unstable();
+        touched.dedup();
+        Ok((id, touched))
     }
 
     /// The top layer index of the current entry point (0 if the index has a single layer).
@@ -520,6 +535,96 @@ impl HnswIndex {
             rng,
         })
     }
+
+    /// Serialize one node's per-layer neighbour lists to bytes, for storing that node on its own.
+    /// See [`Self::deserialize_adjacency`].
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a node's layer and neighbour counts are far below u32::MAX"
+    )]
+    pub fn serialize_adjacency(neighbours: &[Vec<u32>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(neighbours.len() as u32).to_le_bytes());
+        for layer in neighbours {
+            out.extend_from_slice(&(layer.len() as u32).to_le_bytes());
+            for &nb in layer {
+                out.extend_from_slice(&nb.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Parse bytes written by [`Self::serialize_adjacency`], or `None` if truncated / trailing.
+    #[must_use]
+    pub fn deserialize_adjacency(bytes: &[u8]) -> Option<Vec<Vec<u32>>> {
+        let mut r = ByteReader::new(bytes);
+        let layer_count = r.u32()? as usize;
+        let mut neighbours = Vec::with_capacity(layer_count.min(bytes.len()));
+        for _ in 0..layer_count {
+            let count = r.u32()? as usize;
+            let mut layer = Vec::with_capacity(count.min(bytes.len()));
+            for _ in 0..count {
+                layer.push(r.u32()?);
+            }
+            neighbours.push(layer);
+        }
+        if !r.at_end() {
+            return None;
+        }
+        Some(neighbours)
+    }
+
+    /// A node's per-layer neighbour lists, or `None` if `id` is out of range — to persist one node.
+    #[must_use]
+    pub fn node_neighbours(&self, id: usize) -> Option<&[Vec<u32>]> {
+        self.nodes.get(id).map(|node| node.neighbours.as_slice())
+    }
+
+    /// Reconstruct an index from its parts — each node as `(vector, per-layer neighbours)`, in node-id
+    /// order, as persisted per node. The entry point is recomputed as a highest-layer node and the RNG
+    /// is reset; neither affects search results, only the layer assignment of *future* inserts.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the node count is bounded by u32 (insert caps ids at u32::MAX)"
+    )]
+    pub fn from_parts(
+        dim: usize,
+        metric: Metric,
+        params: HnswParams,
+        nodes: Vec<(Vec<f32>, Vec<Vec<u32>>)>,
+    ) -> Self {
+        let m = params.m.max(2);
+        let mut index = Self {
+            dim,
+            metric,
+            params: HnswParams {
+                m,
+                ef_construction: params.ef_construction,
+            },
+            level_mult: 1.0 / (m as f64).ln(),
+            nodes: nodes
+                .into_iter()
+                .map(|(vector, neighbours)| Node { vector, neighbours })
+                .collect(),
+            entry: None,
+            // A fresh non-zero state (matching `new`'s fold constant) so future inserts advance
+            // reproducibly; the reloaded graph's own search does not depend on it.
+            rng: 0x9E37_79B9_7F4A_7C15,
+        };
+        // Recompute the entry as the *lowest-id* node on the highest layer — exactly the entry a
+        // fresh build ends with (a new node only becomes entry when strictly taller, so the first
+        // node to reach the top layer stays the entry). Matching it makes a reloaded graph search
+        // byte-identically, not merely correctly.
+        index.entry = index
+            .nodes
+            .iter()
+            .enumerate()
+            .max_by_key(|(id, node)| (node.neighbours.len(), std::cmp::Reverse(*id)))
+            .map(|(id, _)| id as u32);
+        index
+    }
 }
 
 /// A bounds-checked little-endian cursor: every read returns `None` past the end rather than
@@ -668,6 +773,55 @@ mod tests {
             let before = index.search(&q, k, 64).expect("search original");
             let after = restored.search(&q, k, 64).expect("search restored");
             assert_eq!(before, after, "restored graph must search identically");
+        }
+    }
+
+    #[test]
+    fn from_parts_round_trip_reproduces_search() {
+        let (n, dim, k) = (300, 12, 10);
+        let data = random_vectors(n, dim, 7);
+        let mut index = HnswIndex::new(dim, Metric::Cosine, HnswParams::default(), 55);
+        for v in &data {
+            index.insert(v.clone()).expect("insert");
+        }
+        // Persist each node as (vector, adjacency-bytes), then reconstruct via from_parts — the
+        // per-node persistence path. Vectors come from the (base-table stand-in) `data` by node id.
+        let mut parts = Vec::new();
+        for (id, vector) in data.iter().enumerate() {
+            let adjacency = index.node_neighbours(id).expect("node in range");
+            let bytes = HnswIndex::serialize_adjacency(adjacency);
+            let neighbours =
+                HnswIndex::deserialize_adjacency(&bytes).expect("adjacency round-trip");
+            parts.push((vector.clone(), neighbours));
+        }
+        let restored = HnswIndex::from_parts(dim, Metric::Cosine, HnswParams::default(), parts);
+        assert_eq!(restored.len(), index.len());
+        for q in random_vectors(20, dim, 8) {
+            let before = index.search(&q, k, 64).expect("search original");
+            let after = restored.search(&q, k, 64).expect("search restored");
+            assert_eq!(before, after, "from_parts must search identically");
+        }
+    }
+
+    #[test]
+    fn insert_reporting_touches_only_existing_neighbours() {
+        let mut index = HnswIndex::new(4, Metric::L2, HnswParams::default(), 3);
+        // The first insert has no neighbours to touch.
+        let (id0, touched0) = index
+            .insert_reporting(vec![0.0, 0.0, 0.0, 0.0])
+            .expect("insert");
+        assert_eq!(id0, 0);
+        assert!(touched0.is_empty());
+        // Later inserts only ever report ids below the new one (existing nodes), sorted and unique.
+        for step in 1..30u32 {
+            let v = vec![step as f32, 0.0, 0.0, 0.0];
+            let (id, touched) = index.insert_reporting(v).expect("insert");
+            assert_eq!(id, step);
+            assert!(
+                touched.iter().all(|&t| t < id),
+                "touched are existing nodes"
+            );
+            assert!(touched.windows(2).all(|w| w[0] < w[1]), "sorted + deduped");
         }
     }
 
