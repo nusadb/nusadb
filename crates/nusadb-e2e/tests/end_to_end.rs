@@ -6832,8 +6832,6 @@ fn index_scan_operator_reads_in_key_order_with_backfill() {
                 lo,
                 hi,
                 unique_point: false,
-                direction: nusadb_core::engine::ScanDirection::Forward,
-                limit: None,
             },
             None,
         );

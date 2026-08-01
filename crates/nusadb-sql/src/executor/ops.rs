@@ -1350,10 +1350,8 @@ fn execute_op_inner(
             index,
             lo,
             hi,
-            direction,
-            limit,
             ..
-        } => index_scan_rows(table, index, lo, hi, *direction, *limit, engine, txn),
+        } => index_scan_rows(table, index, lo, hi, engine, txn),
         PhysicalOperator::OneRow => Ok(vec![Vec::new()]),
         PhysicalOperator::Values { rows } => {
             // A `(VALUES ...) AS x` source: each row's cells reference no columns, so they evaluate
