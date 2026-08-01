@@ -699,7 +699,7 @@ pub enum ScalarFunc {
     /// `VERSION()` — the NusaDB server version string as `TEXT`. Niladic.
     Version,
     /// `NUSA_TYPEOF(expr)` — the SQL type name of `expr` as `TEXT` (e.g. `integer`, `text`,
-    /// `numeric`). NusaDB's spelling of the `pg_typeof` idiom. The type is known statically, so the
+    /// `numeric`). NusaDB's static type-introspection builtin. The type is known statically, so the
     /// analyzer folds this to a constant `TEXT` literal; it never reaches the executor.
     NusaTypeof,
     /// `CURRENT_DATABASE()` — the name of the current database as `TEXT`. Niladic; read from

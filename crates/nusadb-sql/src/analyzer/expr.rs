@@ -856,8 +856,9 @@ pub(super) fn analyze_scalar_function(
     // as a `ScalarFunction { Grouping, .. }` node. `rebase_onto_aggregation` later matches each
     // argument against the resolved `group_keys` and rewrites this node into the runtime bitmask
     // reference (or a constant `0` for a plain `GROUP BY`). Result is always `INT`.
-    // NUSA_TYPEOF(expr) — the static SQL type name of the argument (NusaDB's `pg_typeof`). The type
-    // is known here, so fold the call to a constant TEXT literal; the executor never sees this node.
+    // NUSA_TYPEOF(expr) — the static SQL type name of the argument (NusaDB's type-introspection
+    // builtin). The type is known here, so fold the call to a constant TEXT literal; the executor
+    // never sees this node.
     if matches!(func, F::NusaTypeof) {
         let [arg] = args else {
             return Err(Error::ArityMismatch {

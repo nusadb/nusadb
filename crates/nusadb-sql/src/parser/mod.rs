@@ -2398,7 +2398,8 @@ fn fold_part(part: &sql::ObjectNamePart) -> Result<String, Error> {
 /// NusaDB already does and changes nothing, while a locale collation (`"en_US"`, ICU, …) is refused
 /// with an honest error rather than silently ignored: silently applying byte order to a query that
 /// asked for locale order would be a wrong result with no signal. The final name component is used,
-/// so a `pg_catalog."C"` qualifier is tolerated. Case-insensitive so `"c"` and `C` are also accepted.
+/// so a schema-qualified collation name is tolerated (only its last part is matched).
+/// Case-insensitive so `"c"` and `C` are also accepted.
 fn require_byte_order_collation(name: &sql::ObjectName) -> Result<(), Error> {
     let ident = name
         .0
