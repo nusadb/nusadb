@@ -157,3 +157,52 @@ query T
 SELECT CAST(JUSTIFY_DAYS(CAST(NULL AS INTERVAL)) AS TEXT)
 ----
 NULL
+
+# --- fractional interval literals cascade to finer units (like the reference engine) ---
+# 1.5 hours = 90 minutes.
+query T
+SELECT CAST(INTERVAL '1.5 hours' AS TEXT)
+----
+01:30:00
+
+# A fractional day is 24h * frac.
+query T
+SELECT CAST(INTERVAL '1.5 days' AS TEXT)
+----
+1 day 12:00:00
+
+# A fractional month is 30-day * frac.
+query T
+SELECT CAST(INTERVAL '1.5 months' AS TEXT)
+----
+1 mon 15 days
+
+# --- INTERVAL * float scales fractionally and cascades ---
+query T
+SELECT CAST(INTERVAL '1 month' * 1.5 AS TEXT)
+----
+1 mon 15 days
+
+query T
+SELECT CAST(INTERVAL '2 hours' * 1.5 AS TEXT)
+----
+03:00:00
+
+# Commutative, and a fraction < 1 shrinks the interval.
+query T
+SELECT CAST(0.5 * INTERVAL '10 days' AS TEXT)
+----
+5 days
+
+# Integer scaling is unchanged (still exact).
+query T
+SELECT CAST(INTERVAL '1 hour' * 3 AS TEXT)
+----
+03:00:00
+
+# A non-finite field amount is a parse error, not a silent zero/saturated interval.
+statement error
+SELECT INTERVAL 'nan months'
+
+statement error
+SELECT INTERVAL 'inf months'

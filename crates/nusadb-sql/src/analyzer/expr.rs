@@ -3658,10 +3658,15 @@ pub(super) fn check_interval_arith(
             (Date, Date) => Some(Int),
             _ => None,
         },
-        // `interval * integer` scales each component (commutative) → INTERVAL.
-        ast::BinaryOp::Multiply => match (left, right) {
-            (Interval, Int) | (Int, Interval) => Some(Interval),
-            _ => None,
+        // `interval * number` scales each component (commutative) → INTERVAL. An INT factor is exact;
+        // a FLOAT or NUMERIC factor scales fractionally (`INTERVAL '1 month' * 1.5`).
+        ast::BinaryOp::Multiply => {
+            let numeric =
+                |t: ColumnType| matches!(t, Int | ColumnType::Float | ColumnType::Numeric { .. });
+            match (left, right) {
+                (Interval, t) | (t, Interval) if numeric(t) => Some(Interval),
+                _ => None,
+            }
         },
         _ => None,
     }

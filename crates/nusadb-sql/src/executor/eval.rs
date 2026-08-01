@@ -4021,11 +4021,18 @@ fn interval_arith(
 ) -> Option<Result<ast::Value, Error>> {
     use ast::Value::{Date, Int, Interval, Time, Timestamp, TimestampTz};
     let overflow = || Error::Unsupported("INTERVAL arithmetic overflow".to_owned());
-    // `interval * integer` (commutative) scales every component.
+    // `interval * number` (commutative) scales every component. An integer factor is exact; a float
+    // factor scales fractionally and cascades (`INTERVAL '1 month' * 1.5` → `1 mon 15 days`).
     if matches!(op, ast::BinaryOp::Multiply) {
         return match (left, right) {
             (Interval(iv), Int(n)) | (Int(n), Interval(iv)) => {
                 Some(iv.checked_mul(*n).map(Interval).ok_or_else(overflow))
+            },
+            (Interval(iv), ast::Value::Float(f)) | (ast::Value::Float(f), Interval(iv)) => {
+                Some(Ok(Interval(iv.scale(*f))))
+            },
+            (Interval(iv), ast::Value::Numeric(d)) | (ast::Value::Numeric(d), Interval(iv)) => {
+                Some(Ok(Interval(iv.scale(d.to_f64()))))
             },
             _ => None,
         };

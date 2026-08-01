@@ -76,6 +76,62 @@ impl Interval {
         }
     }
 
+    /// Build an interval from possibly-fractional month/day/microsecond amounts, cascading each
+    /// fraction down to the next-finer field the way the reference engine does: a fractional month is
+    /// `30 * frac` days, a fractional day is `24 h * frac` microseconds. So `1.5 months` is
+    /// `1 mon 15 days`, `1.5 days` is `1 day 12:00:00`, and `1.5 hours` (given as `micros`) is
+    /// `01:30:00`. The whole-field totals saturate into `i32`/`i64`, staying panic-free.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "fractional carries are rounded then saturatingly cast; the f64->int `as` saturates, and the small int consts (30, micros/day) lose no precision as f64"
+    )]
+    fn from_fractional(months: f64, days: f64, micros: f64) -> Self {
+        fn clamp_i32(v: f64) -> i32 {
+            if v >= f64::from(i32::MAX) {
+                i32::MAX
+            } else if v <= f64::from(i32::MIN) {
+                i32::MIN
+            } else {
+                v as i32
+            }
+        }
+        const fn clamp_i64(v: f64) -> i64 {
+            // `as` already saturates f64->i64 (and maps NaN to 0), which is the behaviour wanted.
+            v as i64
+        }
+        let whole_months = months.trunc();
+        let frac_months = months - whole_months;
+        // Carry the fractional month into days (30-day month), added to the day amount.
+        let days_total = frac_months.mul_add(DAYS_PER_MONTH_EST as f64, days);
+        let whole_days = days_total.trunc();
+        let frac_days = days_total - whole_days;
+        // Carry the fractional day into microseconds (24-hour day), added to the micro amount.
+        let micros_total = frac_days.mul_add(MICROS_PER_DAY as f64, micros);
+        Self {
+            months: clamp_i32(whole_months),
+            days: clamp_i32(whole_days),
+            micros: clamp_i64(micros_total.round()),
+        }
+    }
+
+    /// Scale every field by `factor`, cascading the fractional results the same way a fractional
+    /// literal does (`INTERVAL '1 month' * 1.5` is `1 mon 15 days`, `INTERVAL '2 hours' * 1.5` is
+    /// `03:00:00`).
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "micros as f64 for scaling; magnitudes beyond 2^53 lose sub-unit precision only, acceptable for a scaled interval"
+    )]
+    pub fn scale(&self, factor: f64) -> Self {
+        Self::from_fractional(
+            f64::from(self.months) * factor,
+            f64::from(self.days) * factor,
+            self.micros as f64 * factor,
+        )
+    }
+
     /// A canonical microsecond estimate used for comparison/equality only (not for date math).
     #[must_use]
     pub fn estimate_micros(&self) -> i128 {
@@ -194,24 +250,66 @@ impl Interval {
     /// accepted) and/or an `HH:MM:SS.ffffff` clock term. Examples: `1 day`, `2 hours`,
     /// `1 year 2 months`, `1 day 03:04:05`, `-1 mon`.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the whole part of a unit value is `trunc`ed then range-checked into i64 arithmetic; `per` is a small unit multiplier (micros/sec..micros/day) exact as f64"
+    )]
     pub fn parse(s: &str) -> Option<Self> {
-        let mut out = Self::ZERO;
+        // A `N unit` value may be fractional (`1.5 hours`). The *whole* part of a time value is kept
+        // in exact `i64` micros — so a huge `9223372036854 seconds` never loses precision through
+        // `f64` — while only the (bounded, sub-unit) fractional part and the always-small month/day
+        // amounts go through the `f64` cascade in `from_fractional`.
+        let mut months = 0.0f64;
+        let mut days = 0.0f64;
+        let mut micros_whole: i64 = 0;
+        let mut micros_frac = 0.0f64;
         let mut tokens = s.split_whitespace();
         let mut saw_any = false;
+        // Add `whole * per` exact micros, and `frac * per` to the fractional carry.
+        let mut add_time = |whole: f64, frac: f64, per: i64, micros_whole: &mut i64| {
+            *micros_whole = micros_whole.checked_add((whole as i64).checked_mul(per)?)?;
+            micros_frac += frac * per as f64;
+            Some(())
+        };
         while let Some(tok) = tokens.next() {
             if tok.contains(':') {
-                // Clock component HH:MM:SS[.ffffff], optionally signed.
-                out.micros = out.micros.checked_add(parse_clock(tok)?)?;
+                // Clock component HH:MM:SS[.ffffff], optionally signed — already exact micros.
+                micros_whole = micros_whole.checked_add(parse_clock(tok)?)?;
                 saw_any = true;
                 continue;
             }
-            // Otherwise a `N unit` pair.
-            let n: i64 = tok.parse().ok()?;
+            // Otherwise a `N unit` pair, where `N` may be fractional. `f64::from_str` accepts
+            // `nan`/`inf`; reject those so a degenerate literal is a parse error, not a silent
+            // zero/`i32::MAX` interval.
+            let n: f64 = tok.parse().ok()?;
+            if !n.is_finite() {
+                return None;
+            }
             let unit = tokens.next()?;
-            apply_unit(&mut out, n, unit)?;
+            let (whole, frac) = (n.trunc(), n.fract());
+            match unit.trim_end_matches('s').to_ascii_lowercase().as_str() {
+                "year" | "yr" => months += n * 12.0,
+                "mon" | "month" => months += n,
+                "week" | "wk" => days += n * 7.0,
+                "day" => days += n,
+                "hour" | "hr" => add_time(whole, frac, 3600 * MICROS_PER_SEC, &mut micros_whole)?,
+                "min" | "minute" => add_time(whole, frac, 60 * MICROS_PER_SEC, &mut micros_whole)?,
+                "sec" | "second" => add_time(whole, frac, MICROS_PER_SEC, &mut micros_whole)?,
+                _ => return None,
+            }
             saw_any = true;
         }
-        saw_any.then_some(out)
+        if !saw_any {
+            return None;
+        }
+        // Cascade the fractional month/day carries (and any fractional sub-second) into micros, then
+        // fold in the exact whole micros.
+        let cascade = Self::from_fractional(months, days, micros_frac);
+        Some(Self {
+            micros: cascade.micros.checked_add(micros_whole)?,
+            ..cascade
+        })
     }
 
     /// Render in a human-readable form, e.g. `1 year 2 mons 3 days 04:05:06`. Zero is `00:00:00`.
@@ -240,31 +338,6 @@ const fn plural(n: i64) -> &'static str {
     // Only exactly +1 is singular; -1 (and every other count) is plural — e.g. `-1 days`, matching
     // the conventional interval rendering rather than treating -1 as singular.
     if n == 1 { "" } else { "s" }
-}
-
-/// Add `n` of `unit` to `out`. Years/months fold into months; weeks/days into days; hour/min/sec
-/// into micros. Returns `None` on an unknown unit or arithmetic overflow.
-fn apply_unit(out: &mut Interval, n: i64, unit: &str) -> Option<()> {
-    let u = unit.trim_end_matches('s').to_ascii_lowercase();
-    // (months delta, days delta, micros delta) for one of `n` units.
-    let (months, days, micros): (i64, i64, i64) = match u.as_str() {
-        "year" | "yr" => (12, 0, 0),
-        "mon" | "month" => (1, 0, 0),
-        "week" | "wk" => (0, 7, 0),
-        "day" => (0, 1, 0),
-        "hour" | "hr" => (0, 0, 3600 * MICROS_PER_SEC),
-        "min" | "minute" => (0, 0, 60 * MICROS_PER_SEC),
-        "sec" | "second" => (0, 0, MICROS_PER_SEC),
-        _ => return None,
-    };
-    out.months = out
-        .months
-        .checked_add(i32::try_from(n.checked_mul(months)?).ok()?)?;
-    out.days = out
-        .days
-        .checked_add(i32::try_from(n.checked_mul(days)?).ok()?)?;
-    out.micros = out.micros.checked_add(n.checked_mul(micros)?)?;
-    Some(())
 }
 
 /// Parse `[-]HH:MM:SS[.ffffff]` (or `HH:MM`) into signed microseconds.
@@ -345,6 +418,10 @@ mod tests {
         assert_eq!(p("1 day 03:04:05").format(), "1 day 03:04:05");
         assert_eq!(p("90 minutes").format(), "01:30:00");
         assert!(Interval::parse("nonsense").is_none());
+        // `f64::from_str` accepts nan/inf; a field amount must be finite or the literal is invalid.
+        assert!(Interval::parse("nan months").is_none());
+        assert!(Interval::parse("inf months").is_none());
+        assert!(Interval::parse("infinity days").is_none());
     }
 
     #[test]
