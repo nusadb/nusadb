@@ -138,3 +138,21 @@ SELECT '[1,2,3]'::VECTOR(3) + '[1,2]'::VECTOR(2)
 # Division / modulo are not defined on vectors.
 statement error
 SELECT '[1,2,3]'::VECTOR(3) / '[1,2,3]'::VECTOR(3)
+
+# --- a USING hnsw vector index is visible in information_schema.statistics (catalog introspection) ---
+statement ok
+CREATE TABLE docs (id INT NOT NULL, emb VECTOR(3))
+
+statement ok
+CREATE INDEX docs_emb_hnsw ON docs USING hnsw (emb)
+
+# The vector index appears in the statistics catalog (non_unique=1, position 1, on the emb column) —
+# not only in EXPLAIN. Backs JDBC getIndexInfo, so a GUI/driver can see the index exists.
+query IIT
+SELECT non_unique, seq_in_index, column_name FROM information_schema.statistics
+WHERE table_name = 'docs' AND index_name = 'docs_emb_hnsw'
+----
+1 1 emb
+
+statement ok
+DROP TABLE docs

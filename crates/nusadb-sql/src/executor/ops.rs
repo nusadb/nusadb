@@ -2663,26 +2663,58 @@ fn info_schema_key_column_usage(engine: &dyn StorageEngine, txn: TxnId) -> Resul
 /// Backs JDBC `getIndexInfo`.
 fn info_schema_statistics(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
-    for name in &engine.list_tables_as_of(txn)? {
+    let stat_row =
+        |schema: &str, table: &str, non_unique: i64, index: &str, pos: usize, col: &str| {
+            vec![
+                ast::Value::Text("nusadb".to_owned()),
+                ast::Value::Text(schema.to_owned()),
+                ast::Value::Text(table.to_owned()),
+                ast::Value::Int(non_unique),
+                ast::Value::Text(index.to_owned()),
+                ast::Value::Int(i64::try_from(pos).unwrap_or(0)),
+                ast::Value::Text(col.to_owned()),
+            ]
+        };
+    for (schema_name, name) in &engine.list_tables_qualified_as_of(txn)? {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
-        let Some(schema) = engine.lookup_table(name)? else {
+        let Some(schema) = engine.lookup_table_as_of_in(txn, schema_name, name)? else {
             continue;
         };
         for idx in engine.list_indexes(schema.id)? {
             let non_unique = i64::from(!idx.unique);
             for (pos, col) in idx.columns.iter().enumerate() {
-                rows.push(vec![
-                    ast::Value::Text("nusadb".to_owned()),
-                    ast::Value::Text("public".to_owned()),
-                    ast::Value::Text(name.clone()),
-                    ast::Value::Int(non_unique),
-                    ast::Value::Text(idx.name.clone()),
-                    ast::Value::Int(i64::try_from(pos + 1).unwrap_or(0)),
-                    ast::Value::Text(col.clone()),
-                ]);
+                rows.push(stat_row(
+                    schema_name,
+                    name,
+                    non_unique,
+                    &idx.name,
+                    pos + 1,
+                    col,
+                ));
             }
+        }
+    }
+    // `USING hnsw` vector indexes live in their own catalog (their graph is rebuilt on demand), so
+    // enumerate them too — otherwise a vector index is invisible to catalog introspection, only
+    // showing up in `EXPLAIN`. A vector index is never unique. Its catalog records only the bare
+    // table name (vector indexes are created on the default namespace today), so its schema is
+    // reported as the default `public`; a schema-qualified vector index would need the catalog to
+    // persist the schema first.
+    for vidx in crate::executor::list_vector_indexes(engine, txn)? {
+        let Some(schema) = engine.lookup_table_as_of(txn, &vidx.table)? else {
+            continue;
+        };
+        if let Some(col) = schema.columns.get(vidx.column_ordinal) {
+            rows.push(stat_row(
+                nusadb_core::PUBLIC_SCHEMA,
+                &vidx.table,
+                1,
+                &vidx.name,
+                1,
+                &col.name,
+            ));
         }
     }
     Ok(rows)

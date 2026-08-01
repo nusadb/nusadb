@@ -2488,6 +2488,43 @@ fn parse_vector_index_def(def: &str) -> Option<(String, usize, usize)> {
     Some((table, ordinal, dim))
 }
 
+/// A vector index enumerated from the catalog: its name and its `(table, column ordinal, dimension)`
+/// declaration. Used by `information_schema.statistics` so a `USING hnsw` index is visible to catalog
+/// introspection, not just to `EXPLAIN`.
+pub(super) struct VectorIndexListing {
+    /// The index name.
+    pub name: String,
+    /// The table the index is on.
+    pub table: String,
+    /// The indexed column's 0-based ordinal in the table.
+    pub column_ordinal: usize,
+}
+
+/// Every `USING hnsw` vector index declared in the catalog, in catalog order.
+pub(super) fn list_vector_indexes(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<VectorIndexListing>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, VECTOR_INDEX_CATALOG)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+        if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice()
+            && let Some((table, column_ordinal, _dim)) = parse_vector_index_def(def)
+        {
+            out.push(VectorIndexListing {
+                name: name.clone(),
+                table,
+                column_ordinal,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Record (or replace) a `USING hnsw` vector index in the catalog.
 pub(super) fn store_vector_index(
     engine: &dyn StorageEngine,
