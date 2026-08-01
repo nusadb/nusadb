@@ -778,19 +778,21 @@ pub(super) fn try_index_scan(
     None
 }
 
-/// Sort-elimination: when the base is a plain table scan and the query's `ORDER BY … LIMIT`
-/// is a prefix of some scannable index's key columns — all ascending, over `NOT NULL` columns — the
-/// index already yields exactly that order. Emit a forward, `LIMIT`-capped ordered scan of it so the
-/// executor stops after `offset + limit` rows, and let the caller drop the `Sort`. Returns `None`
-/// (keep the `Sort`) for any shape not covered: a non-`SeqScan` base (a `WHERE`/join/aggregate/window
-/// sits between the scan and the sort), a `DESC` key, a nullable ordering column, no bounding `LIMIT`,
-/// a non-column sort key, or no matching index.
+/// Sort-elimination: when the base is a plain table scan and the query's `ORDER BY … LIMIT` is a
+/// prefix of some scannable index's key columns — all in the **same** direction, over `NOT NULL`
+/// columns — the index already yields exactly that order. Emit a `LIMIT`-capped ordered scan of it
+/// (forward for `ASC`, backward for `DESC`) so the executor stops after `offset + limit` rows, and
+/// let the caller drop the `Sort`. Returns `None` (keep the `Sort`) for any shape not covered: a
+/// non-`SeqScan` base (a `WHERE`/join/aggregate/window sits between the scan and the sort), a mix of
+/// `ASC` and `DESC` keys, a nullable ordering column, no bounding `LIMIT`, a non-column sort key, or
+/// no matching index.
 fn try_ordered_index_scan(
     op: &PhysicalOperator,
     order_by: &[OrderByKey],
     indexes: &[IndexMeta],
     top_n_cap: Option<u64>,
 ) -> Option<PhysicalOperator> {
+    use nusadb_core::engine::ScanDirection;
     // A plain `SeqScan` here means nothing (filter/join/aggregate/window) wraps the base scan — the
     // order-by keys refer directly to the base row's columns.
     let PhysicalOperator::SeqScan { table, .. } = op else {
@@ -799,10 +801,12 @@ fn try_ordered_index_scan(
     // The already-computed top-N cap is `Some(offset + limit)` only when a plain `LIMIT` (no
     // `WITH TIES`/`DISTINCT`/set-returning projection) bounds the rows — exactly the gate we need.
     let cap = usize::try_from(top_n_cap?).ok()?;
+    // The scan direction is the shared direction of every key: all ascending → forward, all
+    // descending → backward. A mix cannot be served by one ordered scan.
+    let ascending = order_by.first()?.ascending;
     let mut order_cols: Vec<usize> = Vec::with_capacity(order_by.len());
     for key in order_by {
-        // First cut: ascending only. A descending scan is the follow-up (needs `Backward`).
-        if !key.ascending {
+        if key.ascending != ascending {
             return None;
         }
         let TypedExprKind::Column(ordinal) = key.expr.kind else {
@@ -822,13 +826,18 @@ fn try_ordered_index_scan(
     let index = indexes
         .iter()
         .find(|meta| meta.columns.starts_with(&order_cols))?;
+    let direction = if ascending {
+        ScanDirection::Forward
+    } else {
+        ScanDirection::Backward
+    };
     Some(PhysicalOperator::IndexScan {
         table: table.clone(),
         index: index.name.clone(),
         lo: Bound::Unbounded,
         hi: Bound::Unbounded,
         unique_point: false,
-        direction: nusadb_core::engine::ScanDirection::Forward,
+        direction,
         limit: Some(cap),
     })
 }

@@ -152,7 +152,7 @@ SELECT id FROM t6 WHERE id < 4 ORDER BY id ASC
 2
 3
 
-# DESC still returns the correct order (kept on the Sort path for now — correctness unchanged).
+# DESC serves from a backward ordered scan of the same index (Sort also eliminated); order correct.
 query I nosort
 SELECT id FROM t6 ORDER BY id DESC LIMIT 4
 ----
@@ -160,3 +160,11 @@ SELECT id FROM t6 ORDER BY id DESC LIMIT 4
 298
 297
 296
+
+# DESC with OFFSET over the backward ordered scan.
+query I nosort
+SELECT id FROM t6 ORDER BY id DESC LIMIT 3 OFFSET 2
+----
+297
+296
+295

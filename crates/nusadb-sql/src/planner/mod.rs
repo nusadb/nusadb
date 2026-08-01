@@ -557,12 +557,35 @@ mod tests {
     }
 
     #[test]
+    fn order_by_indexed_desc_limit_eliminates_sort_backward() {
+        // A descending ordered scan of the same index: backward direction, still capped, no Sort.
+        let root = indexed_select_op("SELECT * FROM t ORDER BY a DESC LIMIT 20");
+        assert!(
+            !plan_has_sort(&root),
+            "the Sort must be eliminated for DESC"
+        );
+        let PhysicalOperator::Limit { input, .. } = root else {
+            panic!("expected a Limit at the root");
+        };
+        let PhysicalOperator::Project { input, .. } = *input else {
+            panic!("expected Project below Limit");
+        };
+        let PhysicalOperator::IndexScan {
+            direction, limit, ..
+        } = *input
+        else {
+            panic!("expected an IndexScan base");
+        };
+        assert_eq!(direction, nusadb_core::engine::ScanDirection::Backward);
+        assert_eq!(limit, Some(20));
+    }
+
+    #[test]
     fn order_by_keeps_sort_when_not_eliminable() {
         // Each of these must KEEP the Sort — the guards that make the elimination correctness-safe:
-        // a DESC key (backward scan is the follow-up), a nullable ordering column (index null
-        // placement may disagree), an unindexed column, and no bounding LIMIT.
+        // a nullable ordering column (the index's null placement may disagree with the default) and
+        // no bounding LIMIT (nothing lets the scan stop early).
         for sql in [
-            "SELECT * FROM t ORDER BY a DESC LIMIT 20",
             "SELECT * FROM t ORDER BY b ASC LIMIT 20",
             "SELECT * FROM t ORDER BY a ASC",
         ] {
