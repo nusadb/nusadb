@@ -779,6 +779,8 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
             out.extend_from_slice(&n.to_le_bytes());
         },
         ColumnType::Macaddr => out.push(22),
+        ColumnType::Inet => out.push(23),
+        ColumnType::Cidr => out.push(24),
     }
 }
 
@@ -823,6 +825,8 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
         },
         21 => ColumnType::Vector(read_u32(at)?),
         22 => ColumnType::Macaddr,
+        23 => ColumnType::Inet,
+        24 => ColumnType::Cidr,
         _ => return None,
     })
 }

@@ -158,6 +158,11 @@ pub enum ColumnType {
     /// MAC address (`MACADDR`) — six bytes in transmission order, stored as those 6 bytes. Compared
     /// and ordered by the six bytes as an unsigned big-endian integer.
     Macaddr,
+    /// IPv4/IPv6 host address with an optional network (`INET`). Host bits may be set.
+    Inet,
+    /// IPv4/IPv6 network specification (`CIDR`) — like `INET` but host bits below the mask must be
+    /// zero. Shares the runtime value representation with `INET` (distinguished by a flag).
+    Cidr,
     /// Exact decimal (`NUMERIC` / `DECIMAL`) with a declared precision + scale. A
     /// `precision` of `0` means unconstrained (`NUMERIC` with no arguments); `scale` is the number
     /// of fractional digits.
@@ -290,6 +295,8 @@ impl ArrayElem {
             | ColumnType::Jsonb
             | ColumnType::Interval
             | ColumnType::Macaddr
+            | ColumnType::Inet
+            | ColumnType::Cidr
             | ColumnType::Array(_)
             | ColumnType::Vector(_) => None,
         }

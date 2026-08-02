@@ -85,6 +85,7 @@ pub(super) fn analyze_expr_agg(
                 ast::Value::TimeTz(_) => ColumnType::TimeTz,
                 ast::Value::Uuid(_) => ColumnType::Uuid,
                 ast::Value::Macaddr(_) => ColumnType::Macaddr,
+                ast::Value::Inet(a) => a.column_type(),
                 // A numeric literal's declared precision/scale is unconstrained.
                 ast::Value::Numeric(_) => ColumnType::Numeric {
                     precision: 0,

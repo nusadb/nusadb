@@ -25,6 +25,7 @@ pub fn value_text(v: &Value) -> String {
         Value::TimeTz(t) => temporal::format_timetz(*t),
         Value::Uuid(u) => temporal::format_uuid(u),
         Value::Macaddr(m) => crate::macaddr::format(*m),
+        Value::Inet(a) => a.format(),
         Value::Numeric(d) => d.format(),
         Value::Interval(iv) => iv.format(),
         Value::Array(items) => array_text(items),

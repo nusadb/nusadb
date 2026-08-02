@@ -1251,6 +1251,8 @@ pub enum Value {
     Uuid([u8; 16]),
     /// MAC address — six bytes in transmission order.
     Macaddr([u8; 6]),
+    /// IPv4/IPv6 address for `INET` or `CIDR` — the `is_cidr` flag inside distinguishes the two.
+    Inet(crate::inet::InetAddr),
     /// Exact decimal (`NUMERIC` / `DECIMAL`) value.
     Numeric(crate::numeric::Decimal),
     /// JSON / JSONB document as canonical text.

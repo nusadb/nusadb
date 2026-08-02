@@ -70,6 +70,8 @@ pub(super) fn type_name(ty: ColumnType) -> String {
         ColumnType::TimeTz => "TIMETZ".to_owned(),
         ColumnType::Uuid => "UUID".to_owned(),
         ColumnType::Macaddr => "MACADDR".to_owned(),
+        ColumnType::Inet => "INET".to_owned(),
+        ColumnType::Cidr => "CIDR".to_owned(),
         ColumnType::Numeric { precision: 0, .. } => "NUMERIC".to_owned(),
         ColumnType::Numeric { precision, scale } => format!("NUMERIC({precision},{scale})"),
         ColumnType::Json => "JSON".to_owned(),

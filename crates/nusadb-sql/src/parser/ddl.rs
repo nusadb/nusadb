@@ -459,6 +459,9 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         D::Custom(name, modifiers) if is_vector_name(name) => return vector_type(modifiers),
         // `MACADDR` — a native 6-byte MAC address (not the text-backed alias below).
         D::Custom(name, _) if is_macaddr_name(name) => ColumnType::Macaddr,
+        // `INET` / `CIDR` — native IPv4/IPv6 address types (not the text-backed alias below).
+        D::Custom(name, _) if is_named(name, "inet") => ColumnType::Inet,
+        D::Custom(name, _) if is_named(name, "cidr") => ColumnType::Cidr,
         // A custom (named) type: a standard SQL type NusaDB does not model natively (currency,
         // object-id, network, bit-string, geometric, range, full-text, XML) maps onto a base storage
         // type so schemas using it still load (B-types); a genuinely unknown name is still rejected.
@@ -489,12 +492,12 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         },
         // Object identifier — an unsigned 32-bit integer.
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
-        // Stored as their canonical text form (no native operators yet): network addresses, bit
-        // strings, geometric, range, full-text, and XML types. (`macaddr` is now a native type,
-        // handled before this fallback.)
-        "xml" | "cidr" | "inet" | "macaddr8" | "bit" | "varbit" | "tsvector" | "tsquery"
-        | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" | "int4range"
-        | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange" => ColumnType::Text,
+        // Stored as their canonical text form (no native operators yet): bit strings, geometric,
+        // range, full-text, and XML types. (`macaddr`/`inet`/`cidr` are now native types, handled
+        // before this fallback.)
+        "xml" | "macaddr8" | "bit" | "varbit" | "tsvector" | "tsquery" | "point" | "line"
+        | "lseg" | "box" | "path" | "polygon" | "circle" | "int4range" | "int8range"
+        | "numrange" | "tsrange" | "tstzrange" | "daterange" => ColumnType::Text,
         _ => return None,
     })
 }
@@ -524,9 +527,15 @@ fn is_vector_name(name: &sql::ObjectName) -> bool {
 }
 
 fn is_macaddr_name(name: &sql::ObjectName) -> bool {
+    is_named(name, "macaddr")
+}
+
+/// Whether `name` is the single unqualified identifier `ident` (case-insensitive) — used to route a
+/// custom type name that `sqlparser` does not model to a native `ColumnType`.
+fn is_named(name: &sql::ObjectName, ident: &str) -> bool {
     matches!(
         name.0.as_slice(),
-        [part] if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case("macaddr"))
+        [part] if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(ident))
     )
 }
 

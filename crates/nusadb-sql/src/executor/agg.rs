@@ -1025,6 +1025,8 @@ pub(crate) const fn parallel_safe_ty(ty: ColumnType) -> bool {
             | ColumnType::TimestampTz
             | ColumnType::Uuid
             | ColumnType::Macaddr
+            | ColumnType::Inet
+            | ColumnType::Cidr
     )
 }
 
@@ -1527,6 +1529,7 @@ fn distinct_hash(v: &ast::Value) -> u64 {
         V::TimestampTz(t) => (11u8, t).hash(&mut h),
         V::Uuid(u) => (12u8, u).hash(&mut h),
         V::Macaddr(m) => (17u8, m).hash(&mut h),
+        V::Inet(a) => (18u8, a).hash(&mut h),
         V::Bytes(b) => (13u8, b).hash(&mut h),
         // INTERVAL compares by its canonical estimate (so `1 day` == `24:00:00`); hash that.
         V::Interval(iv) => (14u8, iv.estimate_micros()).hash(&mut h),

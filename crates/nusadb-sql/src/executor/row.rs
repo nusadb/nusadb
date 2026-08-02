@@ -222,6 +222,9 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         },
         (ast::Value::Uuid(u), ColumnType::Uuid) => out.extend_from_slice(u),
         (ast::Value::Macaddr(m), ColumnType::Macaddr) => out.extend_from_slice(m),
+        (ast::Value::Inet(a), ColumnType::Inet | ColumnType::Cidr) => {
+            out.extend_from_slice(&a.encode());
+        },
         // Implicit string coercion ("unknown literal" rule): a text value assigned to a
         // temporal/UUID column is parsed into the column's type at encode time.
         (ast::Value::Text(s), ColumnType::Date) => {
@@ -251,6 +254,14 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Text(s), ColumnType::Macaddr) => {
             let m = crate::macaddr::parse(s).ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&m);
+        },
+        (ast::Value::Text(s), ColumnType::Inet) => {
+            let v = crate::inet::parse_inet(s).ok_or_else(|| invalid(ty, s))?;
+            out.extend_from_slice(&v.encode());
+        },
+        (ast::Value::Text(s), ColumnType::Cidr) => {
+            let v = crate::inet::parse_cidr(s).ok_or_else(|| invalid(ty, s))?;
+            out.extend_from_slice(&v.encode());
         },
         // NUMERIC: the value (or a coercible Int/Float/Text) rescaled to the column's
         // declared scale, precision-checked, then mantissa(16) + scale(1).
@@ -594,6 +605,20 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
             let arr = read_array::<6>(bytes, pos)?;
             Ok((ast::Value::Macaddr(arr), pos + 6))
         },
+        // INET/CIDR are self-describing: the flags byte's family bit sets the total length (2-byte
+        // header + 4 or 16 address octets).
+        ColumnType::Inet | ColumnType::Cidr => {
+            let flags = *bytes
+                .get(pos)
+                .ok_or(Error::MalformedTuple { offset: pos })?;
+            let n = if flags & 2 != 0 { 18 } else { 6 };
+            let slice = bytes
+                .get(pos..pos + n)
+                .ok_or(Error::MalformedTuple { offset: pos })?;
+            let v = crate::inet::InetAddr::decode(slice)
+                .ok_or(Error::MalformedTuple { offset: pos })?;
+            Ok((ast::Value::Inet(v), pos + n))
+        },
         // JSON: length-prefixed canonical text.
         // JSONB decodes identically to JSON (stored as the same canonical text).
         ColumnType::Json | ColumnType::Jsonb => {
@@ -729,6 +754,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::TimeTz(_) => ColumnType::TimeTz,
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
+        ast::Value::Inet(a) => a.column_type(),
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,

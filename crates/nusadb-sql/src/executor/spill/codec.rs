@@ -50,6 +50,7 @@ const TAG_ARRAY: u8 = 14;
 const TAG_VECTOR: u8 = 15;
 const TAG_BYTES: u8 = 16;
 const TAG_MACADDR: u8 = 17;
+const TAG_INET: u8 = 18;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -111,6 +112,10 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             out.push(TAG_MACADDR);
             out.extend_from_slice(bytes);
         },
+        ast::Value::Inet(a) => {
+            out.push(TAG_INET);
+            out.extend_from_slice(&a.encode());
+        },
         ast::Value::Numeric(d) => {
             out.push(TAG_NUMERIC);
             out.extend_from_slice(&d.mantissa.to_le_bytes());
@@ -157,6 +162,20 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
         TAG_TIMETZ => ast::Value::TimeTz(c.i64()?),
         TAG_UUID => ast::Value::Uuid(c.arr::<16>()?),
         TAG_MACADDR => ast::Value::Macaddr(c.arr::<6>()?),
+        TAG_INET => {
+            let flags = c.u8()?;
+            let masklen = c.u8()?;
+            let addr = if flags & 2 != 0 {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(c.arr::<16>()?))
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(c.arr::<4>()?))
+            };
+            ast::Value::Inet(crate::inet::InetAddr {
+                addr,
+                masklen,
+                is_cidr: flags & 1 != 0,
+            })
+        },
         TAG_NUMERIC => ast::Value::Numeric(Decimal {
             mantissa: i128::from_le_bytes(c.arr::<16>()?),
             scale: c.u8()?,

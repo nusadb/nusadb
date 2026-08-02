@@ -1,0 +1,71 @@
+# p10_types/inet_cidr — INET and CIDR (IPv4/IPv6 addresses and networks).
+# Covers: catalog types, implicit string coercion, canonical display (INET omits a family-max mask,
+# CIDR always shows it), the ::text cast (which keeps the mask), network ordering (family, then
+# masked prefix, then mask, then address), equality, INET<->CIDR casts, IPv6, and loud rejection of
+# malformed input and of a CIDR with host bits set.
+
+statement ok
+CREATE TABLE n (id INT NOT NULL, a INET, c CIDR)
+
+statement ok
+INSERT INTO n VALUES (1, '192.168.1.5/24', '192.168.1.0/24')
+
+# A bare host address (implicit coercion). INET display omits the /32.
+statement ok
+INSERT INTO n VALUES (2, '10.0.0.1', '10.0.0.0/8')
+
+# IPv6, and a CAST.
+statement ok
+INSERT INTO n VALUES (3, CAST('2001:db8::1/64' AS INET), CAST('2001:db8::/32' AS CIDR))
+
+query ITT rowsort
+SELECT id, a, c FROM n
+----
+1  192.168.1.5/24  192.168.1.0/24
+2  10.0.0.1  10.0.0.0/8
+3  2001:db8::1/64  2001:db8::/32
+
+# Network ordering: IPv4 before IPv6; within a family by masked prefix, then mask, then address.
+statement ok
+CREATE TABLE ord (a INET)
+
+statement ok
+INSERT INTO ord VALUES ('10.0.0.0/8'), ('192.168.1.1'), ('255.255.255.255'), ('::/0'), ('::1')
+
+query T
+SELECT a FROM ord ORDER BY a
+----
+10.0.0.0/8
+192.168.1.1
+255.255.255.255
+::/0
+::1
+
+# The ::text cast keeps a family-maximum mask that the display omits.
+query T
+SELECT CAST(a AS TEXT) FROM n WHERE id = 2
+----
+10.0.0.1/32
+
+# Equality, and a text literal coerces to inet.
+query I
+SELECT id FROM n WHERE a = '192.168.1.5/24'
+----
+1
+
+# INET -> CIDR masks the host bits.
+query T
+SELECT CAST('192.168.1.5/24' AS INET)::CIDR
+----
+192.168.1.0/24
+
+# A malformed address is rejected at execution time.
+statement error
+INSERT INTO n VALUES (4, 'not-an-ip', '10.0.0.0/8')
+
+statement error
+INSERT INTO n VALUES (5, '10.0.0.1', '10.0.0.0/33')
+
+# A CIDR with host bits set below the mask is rejected (a network address must be canonical).
+statement error
+INSERT INTO n VALUES (6, '10.0.0.1', '192.168.1.5/24')

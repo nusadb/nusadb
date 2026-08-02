@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A parsed `INET`/`CIDR` value: an IP address, a mask length in bits, and whether it came from a
 /// `CIDR` column (which renders and validates as a network) or an `INET` column (a host address).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InetAddr {
     /// The host or network address.
     pub addr: IpAddr,
@@ -49,6 +49,58 @@ pub fn addr_octets(addr: IpAddr) -> Vec<u8> {
 }
 
 impl InetAddr {
+    /// The SQL column type this value belongs to: `CIDR` when `is_cidr`, else `INET`.
+    #[must_use]
+    pub const fn column_type(&self) -> nusadb_core::ColumnType {
+        if self.is_cidr {
+            nusadb_core::ColumnType::Cidr
+        } else {
+            nusadb_core::ColumnType::Inet
+        }
+    }
+
+    /// This value as a `CIDR` network — host bits below the mask zeroed and `is_cidr` set. Matches
+    /// the reference engine's `inet`→`cidr` cast (which masks rather than rejecting host bits).
+    #[must_use]
+    pub fn to_cidr(self) -> Self {
+        let mut octets = addr_octets(self.addr);
+        let bits = usize::from(self.masklen);
+        for (i, byte) in octets.iter_mut().enumerate() {
+            let bit_lo = i * 8;
+            if bit_lo >= bits {
+                *byte = 0;
+            } else if bit_lo + 8 > bits {
+                let host_bits = (bit_lo + 8) - bits;
+                *byte &= !((1u16 << host_bits) - 1) as u8;
+            }
+        }
+        let addr = match self.addr {
+            IpAddr::V4(_) => {
+                let a: [u8; 4] = octets.as_slice().try_into().unwrap_or([0; 4]);
+                IpAddr::V4(Ipv4Addr::from(a))
+            },
+            IpAddr::V6(_) => {
+                let a: [u8; 16] = octets.as_slice().try_into().unwrap_or([0; 16]);
+                IpAddr::V6(Ipv6Addr::from(a))
+            },
+        };
+        Self {
+            addr,
+            masklen: self.masklen,
+            is_cidr: true,
+        }
+    }
+
+    /// This value as a host address — `is_cidr` cleared, address and mask unchanged. The `cidr`→`inet` cast.
+    #[must_use]
+    pub const fn to_inet(self) -> Self {
+        Self {
+            is_cidr: false,
+            addr: self.addr,
+            masklen: self.masklen,
+        }
+    }
+
     /// Whether every host bit below `masklen` is zero — the `CIDR` validity rule.
     #[must_use]
     pub fn host_bits_zero(&self) -> bool {

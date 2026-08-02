@@ -94,13 +94,17 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         ast::Value::Bytes(b) => encode_ordered_bytes(b, out),
         // NUMERIC: a fixed-width canonical decimal layout (see `encode_numeric`).
         ast::Value::Numeric(d) => encode_numeric(d, out)?,
-        // No v1 order-preserving form.
+        // No v1 order-preserving form. INET/CIDR join here because their network order is not a
+        // byte order (the masked prefix is compared before the mask), so a lexicographic key would
+        // mis-order them; equality-only indexing is a follow-up.
         ast::Value::Json(_)
         | ast::Value::Interval(_)
         | ast::Value::Array(_)
-        | ast::Value::Vector(_) => {
+        | ast::Value::Vector(_)
+        | ast::Value::Inet(_) => {
             return Err(Error::Unsupported(
-                "JSON / INTERVAL / ARRAY / VECTOR columns cannot yet be index keys".to_owned(),
+                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR columns cannot yet be index keys"
+                    .to_owned(),
             ));
         },
         ast::Value::Null => {

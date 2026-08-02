@@ -1404,7 +1404,8 @@ fn create_table_accepts_extended_type_aliases() {
         )",
     );
     let dec = |s: &str| Value::Numeric(nusadb_sql::numeric::Decimal::parse(s).expect("decimal"));
-    // The schema loaded; a money value stores as its decimal and a network/geometric value as text.
+    // The schema loaded; a money value stores as its decimal, an INET as a native address, and a
+    // still-text-backed geometric value as text.
     run(
         &engine,
         r"INSERT INTO wide (id, col_money, col_inet, col_point) VALUES (1, 12.34, '192.168.0.1', '(1,2)')",
@@ -1416,7 +1417,7 @@ fn create_table_accepts_extended_type_aliases() {
         )),
         vec![vec![
             dec("12.34"),
-            Value::Text("192.168.0.1".to_owned()),
+            Value::Inet(nusadb_sql::inet::parse_inet("192.168.0.1").expect("inet")),
             Value::Text("(1,2)".to_owned()),
         ]]
     );

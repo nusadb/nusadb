@@ -188,10 +188,12 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
             .downcast_ref::<BinaryArray>()
             .and_then(|a| a.get(index))
             .map_or(ast::Value::Null, |b| ast::Value::Bytes(b.to_vec())),
-        // VECTOR and MACADDR have no Arrow representation in this columnar path — `build_column`
-        // refuses to materialize either — so they are handled only on the row path and only ever
-        // reach the null case here.
-        ColumnType::Vector(_) | ColumnType::Macaddr => ast::Value::Null,
+        // VECTOR, MACADDR, and INET/CIDR have no Arrow representation in this columnar path —
+        // `build_column` refuses to materialize them — so they are handled only on the row path and
+        // only ever reach the null case here.
+        ColumnType::Vector(_) | ColumnType::Macaddr | ColumnType::Inet | ColumnType::Cidr => {
+            ast::Value::Null
+        },
         ColumnType::Array(_) => {
             let Some(list) = any.downcast_ref::<ListArray>() else {
                 return ast::Value::Null;
@@ -209,6 +211,10 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
 /// Build the column array for `ty` from one batch's worth of values (one entry per row, in
 /// row order). `Null` becomes a null slot; a present value whose runtime type does not
 /// match `ty` is a defensive [`Error::TypeMismatch`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat one-arm-per-ColumnType builder; length tracks the type set, not branching"
+)]
 pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<ArrayRef, Error> {
     let array: ArrayRef = match ty {
         ColumnType::Bool => Arc::new(BooleanArray::from_options(collect(
@@ -315,9 +321,12 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
             Arc::new(BinaryArray::from_options(items))
         },
         ColumnType::Array(elem) => build_list_column(ty, elem, values)?,
-        // VECTOR and MACADDR have no Arrow array yet; refuse loudly rather than silently dropping a
-        // value if the (dormant) columnar path is ever wired over one — the row path is authoritative.
-        ColumnType::Vector(_) | ColumnType::Macaddr => return Err(unsupported_batch_type(ty)),
+        // VECTOR, MACADDR, and INET/CIDR have no Arrow array yet; refuse loudly rather than silently
+        // dropping a value if the (dormant) columnar path is ever wired over one — the row path is
+        // authoritative.
+        ColumnType::Vector(_) | ColumnType::Macaddr | ColumnType::Inet | ColumnType::Cidr => {
+            return Err(unsupported_batch_type(ty));
+        },
     };
     Ok(array)
 }
@@ -325,10 +334,11 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
 /// The error returned when the columnar batch path meets a type it has no Arrow array for (VECTOR,
 /// MACADDR). The row path is authoritative for those types.
 fn unsupported_batch_type(ty: ColumnType) -> Error {
-    let name = if matches!(ty, ColumnType::Macaddr) {
-        "MACADDR"
-    } else {
-        "VECTOR"
+    let name = match ty {
+        ColumnType::Macaddr => "MACADDR",
+        ColumnType::Inet => "INET",
+        ColumnType::Cidr => "CIDR",
+        _ => "VECTOR",
     };
     Error::Unsupported(format!(
         "{name} columns are not supported in the columnar batch path"
