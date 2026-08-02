@@ -247,6 +247,46 @@ pub enum ArrayElem {
     Uuid,
 }
 
+/// The element type of a range (`int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
+/// `daterange`). A `Copy` enum so [`ColumnType`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RangeKind {
+    /// `int4range` / `int8range` — integer bounds (both stored as `INT`; discrete).
+    Int,
+    /// `numrange` — exact-decimal bounds (continuous).
+    Num,
+    /// `daterange` — date bounds (discrete).
+    Date,
+    /// `tsrange` — timestamp bounds (continuous).
+    Ts,
+    /// `tstzrange` — timestamp-with-time-zone bounds (continuous).
+    TsTz,
+}
+
+impl RangeKind {
+    /// The bound (element) column type.
+    #[must_use]
+    pub const fn element_type(self) -> ColumnType {
+        match self {
+            Self::Int => ColumnType::Int,
+            Self::Num => ColumnType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+            Self::Date => ColumnType::Date,
+            Self::Ts => ColumnType::Timestamp,
+            Self::TsTz => ColumnType::TimestampTz,
+        }
+    }
+
+    /// Whether the element type is discrete (integer / date) — its ranges are canonicalized to the
+    /// half-open `[)` form; continuous kinds (numeric / timestamp) keep their bounds as given.
+    #[must_use]
+    pub const fn is_discrete(self) -> bool {
+        matches!(self, Self::Int | Self::Date)
+    }
+}
+
 impl ArrayElem {
     /// The scalar [`ColumnType`] of this element.
     #[must_use]

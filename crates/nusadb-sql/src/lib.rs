@@ -31,6 +31,7 @@ pub mod params;
 pub mod parser;
 pub mod plan_cache;
 pub mod planner;
+pub mod range;
 pub mod temporal;
 pub mod udf;
 pub mod vector;
