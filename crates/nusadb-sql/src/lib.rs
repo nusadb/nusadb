@@ -21,6 +21,7 @@ pub mod error;
 pub mod executor;
 pub mod fts;
 pub mod hnsw;
+pub mod inet;
 pub mod interval;
 pub mod json;
 pub mod macaddr;
