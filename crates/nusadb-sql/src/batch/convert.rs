@@ -188,9 +188,10 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
             .downcast_ref::<BinaryArray>()
             .and_then(|a| a.get(index))
             .map_or(ast::Value::Null, |b| ast::Value::Bytes(b.to_vec())),
-        // VECTOR has no Arrow representation in this columnar path — `build_column` refuses to
-        // materialize one — so it only ever yields the null case here.
-        ColumnType::Vector(_) => ast::Value::Null,
+        // VECTOR and MACADDR have no Arrow representation in this columnar path — `build_column`
+        // refuses to materialize either — so they are handled only on the row path and only ever
+        // reach the null case here.
+        ColumnType::Vector(_) | ColumnType::Macaddr => ast::Value::Null,
         ColumnType::Array(_) => {
             let Some(list) = any.downcast_ref::<ListArray>() else {
                 return ast::Value::Null;
@@ -314,17 +315,24 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
             Arc::new(BinaryArray::from_options(items))
         },
         ColumnType::Array(elem) => build_list_column(ty, elem, values)?,
-        // VECTOR has no Arrow array yet; refuse loudly rather than silently dropping components to
-        // NULL if the (dormant) columnar path is ever wired over a VECTOR column.
-        ColumnType::Vector(_) => return Err(vector_not_in_batch()),
+        // VECTOR and MACADDR have no Arrow array yet; refuse loudly rather than silently dropping a
+        // value if the (dormant) columnar path is ever wired over one — the row path is authoritative.
+        ColumnType::Vector(_) | ColumnType::Macaddr => return Err(unsupported_batch_type(ty)),
     };
     Ok(array)
 }
 
-/// The error returned when the columnar batch path meets a VECTOR column. The row path is
-/// authoritative for vectors; the Arrow path has no vector array yet.
-fn vector_not_in_batch() -> Error {
-    Error::Unsupported("VECTOR columns are not supported in the columnar batch path".to_owned())
+/// The error returned when the columnar batch path meets a type it has no Arrow array for (VECTOR,
+/// MACADDR). The row path is authoritative for those types.
+fn unsupported_batch_type(ty: ColumnType) -> Error {
+    let name = if matches!(ty, ColumnType::Macaddr) {
+        "MACADDR"
+    } else {
+        "VECTOR"
+    };
+    Error::Unsupported(format!(
+        "{name} columns are not supported in the columnar batch path"
+    ))
 }
 
 /// Build a nested [`ListArray`] column: flatten every row's elements into one child array

@@ -1249,6 +1249,8 @@ pub enum Value {
     TimeTz(i64),
     /// 128-bit UUID.
     Uuid([u8; 16]),
+    /// MAC address — six bytes in transmission order.
+    Macaddr([u8; 6]),
     /// Exact decimal (`NUMERIC` / `DECIMAL`) value.
     Numeric(crate::numeric::Decimal),
     /// JSON / JSONB document as canonical text.

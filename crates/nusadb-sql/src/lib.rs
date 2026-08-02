@@ -23,6 +23,7 @@ pub mod fts;
 pub mod hnsw;
 pub mod interval;
 pub mod json;
+pub mod macaddr;
 pub mod numeric;
 pub mod params;
 pub mod parser;

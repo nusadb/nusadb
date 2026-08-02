@@ -155,6 +155,9 @@ pub enum ColumnType {
     TimeTz,
     /// 128-bit UUID, stored as 16 bytes.
     Uuid,
+    /// MAC address (`MACADDR`) — six bytes in transmission order, stored as those 6 bytes. Compared
+    /// and ordered by the six bytes as an unsigned big-endian integer.
+    Macaddr,
     /// Exact decimal (`NUMERIC` / `DECIMAL`) with a declared precision + scale. A
     /// `precision` of `0` means unconstrained (`NUMERIC` with no arguments); `scale` is the number
     /// of fractional digits.
@@ -286,6 +289,7 @@ impl ArrayElem {
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Interval
+            | ColumnType::Macaddr
             | ColumnType::Array(_)
             | ColumnType::Vector(_) => None,
         }

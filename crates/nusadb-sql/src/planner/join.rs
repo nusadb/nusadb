@@ -213,6 +213,7 @@ pub(super) const fn is_hashable_key_type(ty: ColumnType) -> bool {
             | ColumnType::Timestamp
             | ColumnType::TimestampTz
             | ColumnType::Uuid
+            | ColumnType::Macaddr
             | ColumnType::Numeric { .. }
             | ColumnType::Bytes
     )

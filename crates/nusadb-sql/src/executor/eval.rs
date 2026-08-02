@@ -2762,6 +2762,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         | (ast::Value::Timestamp(_), ColumnType::Timestamp)
         | (ast::Value::TimestampTz(_), ColumnType::TimestampTz)
         | (ast::Value::Uuid(_), ColumnType::Uuid)
+        | (ast::Value::Macaddr(_), ColumnType::Macaddr)
         | (ast::Value::Json(_), ColumnType::Json)
         | (ast::Value::Interval(_), ColumnType::Interval)
         | (ast::Value::Bytes(_), ColumnType::Bytes)
@@ -2829,6 +2830,9 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Text(s), ColumnType::Uuid) => crate::temporal::parse_uuid(s)
             .map(ast::Value::Uuid)
             .ok_or_else(|| invalid_cast(s, ColumnType::Uuid)),
+        (ast::Value::Text(s), ColumnType::Macaddr) => crate::macaddr::parse(s)
+            .map(ast::Value::Macaddr)
+            .ok_or_else(|| invalid_cast(s, ColumnType::Macaddr)),
         // Render temporal + UUID back to their canonical text form.
         (ast::Value::Date(d), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::temporal::format_date(*d)))
@@ -2847,6 +2851,9 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         },
         (ast::Value::Uuid(u), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::temporal::format_uuid(u)))
+        },
+        (ast::Value::Macaddr(m), ColumnType::Text) => {
+            Ok(ast::Value::Text(crate::macaddr::format(*m)))
         },
         // Temporal narrowing/widening (QA category-D): a TIMESTAMP[TZ] splits into its DATE
         // (floor of whole days since the epoch) and TIME-of-day (micros within the day); a DATE
@@ -3232,6 +3239,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::TimestampTz(_) => ColumnType::TimestampTz,
         ast::Value::TimeTz(_) => ColumnType::TimeTz,
         ast::Value::Uuid(_) => ColumnType::Uuid,
+        ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,
@@ -3559,6 +3567,8 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         | (Timestamp(a), Timestamp(b))
         | (TimestampTz(a), TimestampTz(b)) => a.cmp(b),
         (Uuid(a), Uuid(b)) => a.cmp(b),
+        // MACADDR orders by its six bytes as a big-endian integer — the raw byte order.
+        (ast::Value::Macaddr(a), ast::Value::Macaddr(b)) => a.cmp(b),
         // BYTEA orders lexicographically by raw byte.
         (ast::Value::Bytes(a), ast::Value::Bytes(b)) => a.cmp(b),
         (Interval(a), Interval(b)) => a.compare(b),
@@ -3641,6 +3651,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         TimeTz(_) => 14,
         ast::Value::Vector(_) => 15,
         ast::Value::Bytes(_) => 16,
+        ast::Value::Macaddr(_) => 17,
     }
 }
 

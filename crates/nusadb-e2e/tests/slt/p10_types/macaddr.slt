@@ -1,0 +1,79 @@
+# p10_types/macaddr — MACADDR type (six-byte MAC address).
+# Covers: catalog type, implicit string coercion, CAST both directions, canonical (lowercase,
+# colon-separated) display incl. normalization of dash/dot/bare-hex/uppercase input, numeric
+# ordering, equality predicates, index lookup, and loud rejection of malformed input.
+
+statement ok
+CREATE TABLE m (id INT NOT NULL, mac MACADDR)
+
+# Implicit string coercion (the "unknown literal" rule).
+statement ok
+INSERT INTO m VALUES (1, '08:00:2b:01:02:03')
+
+# Explicit CAST.
+statement ok
+INSERT INTO m VALUES (2, CAST('00-11-22-33-44-55' AS MACADDR))
+
+# Cisco dotted form, bare hex, and upper-case all normalize to canonical lowercase colon form.
+statement ok
+INSERT INTO m VALUES (3, '0800.2b01.0299')
+
+statement ok
+INSERT INTO m VALUES (4, 'AABBCCDDEEFF')
+
+statement ok
+INSERT INTO m VALUES (5, 'ff:ee:dd:cc:bb:aa')
+
+query IT rowsort
+SELECT id, mac FROM m
+----
+1  08:00:2b:01:02:03
+2  00:11:22:33:44:55
+3  08:00:2b:01:02:99
+4  aa:bb:cc:dd:ee:ff
+5  ff:ee:dd:cc:bb:aa
+
+# Ordering is by the six bytes as a big-endian integer, not by text — 00:11:.. sorts before 08:00:..
+# which sorts before aa:.. and ff:.. (all lower than the text order would give for mixed case).
+query T
+SELECT mac FROM m ORDER BY mac
+----
+00:11:22:33:44:55
+08:00:2b:01:02:03
+08:00:2b:01:02:99
+aa:bb:cc:dd:ee:ff
+ff:ee:dd:cc:bb:aa
+
+# Equality predicate against a CAST literal.
+query I
+SELECT id FROM m WHERE mac = CAST('08:00:2b:01:02:03' AS MACADDR)
+----
+1
+
+# A text literal compared against the macaddr column coerces to macaddr.
+query I
+SELECT id FROM m WHERE mac = '00:11:22:33:44:55'
+----
+2
+
+# CAST macaddr -> text yields the canonical form.
+query T
+SELECT CAST(mac AS TEXT) FROM m WHERE id = 4
+----
+aa:bb:cc:dd:ee:ff
+
+# Index lookup on a macaddr column.
+statement ok
+CREATE INDEX m_mac ON m (mac)
+
+query I
+SELECT id FROM m WHERE mac = 'ff:ee:dd:cc:bb:aa'
+----
+5
+
+# A malformed MAC address is rejected at execution time (not silently stored).
+statement error
+INSERT INTO m VALUES (6, 'not-a-mac')
+
+statement error
+INSERT INTO m VALUES (7, '08:00:2b:01:02')

@@ -457,6 +457,8 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         D::Array(elem) => return array_type(elem),
         // `VECTOR(n)` parses as an unknown custom type with one numeric modifier.
         D::Custom(name, modifiers) if is_vector_name(name) => return vector_type(modifiers),
+        // `MACADDR` — a native 6-byte MAC address (not the text-backed alias below).
+        D::Custom(name, _) if is_macaddr_name(name) => ColumnType::Macaddr,
         // A custom (named) type: a standard SQL type NusaDB does not model natively (currency,
         // object-id, network, bit-string, geometric, range, full-text, XML) maps onto a base storage
         // type so schemas using it still load (B-types); a genuinely unknown name is still rejected.
@@ -488,12 +490,11 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         // Object identifier — an unsigned 32-bit integer.
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
         // Stored as their canonical text form (no native operators yet): network addresses, bit
-        // strings, geometric, range, full-text, and XML types.
-        "xml" | "cidr" | "inet" | "macaddr" | "macaddr8" | "bit" | "varbit" | "tsvector"
-        | "tsquery" | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
-        | "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange" => {
-            ColumnType::Text
-        },
+        // strings, geometric, range, full-text, and XML types. (`macaddr` is now a native type,
+        // handled before this fallback.)
+        "xml" | "cidr" | "inet" | "macaddr8" | "bit" | "varbit" | "tsvector" | "tsquery"
+        | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" | "int4range"
+        | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange" => ColumnType::Text,
         _ => return None,
     })
 }
@@ -519,6 +520,13 @@ fn is_vector_name(name: &sql::ObjectName) -> bool {
     matches!(
         name.0.as_slice(),
         [part] if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case("vector"))
+    )
+}
+
+fn is_macaddr_name(name: &sql::ObjectName) -> bool {
+    matches!(
+        name.0.as_slice(),
+        [part] if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case("macaddr"))
     )
 }
 

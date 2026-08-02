@@ -196,6 +196,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::TimeTz(_) => 14,
         ast::Value::Vector(_) => 15,
         ast::Value::Bytes(_) => 16,
+        ast::Value::Macaddr(_) => 17,
     }
 }
 

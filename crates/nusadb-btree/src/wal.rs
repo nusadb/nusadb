@@ -778,6 +778,7 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
             out.push(21);
             out.extend_from_slice(&n.to_le_bytes());
         },
+        ColumnType::Macaddr => out.push(22),
     }
 }
 
@@ -821,6 +822,7 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
             ColumnType::Array(elem)
         },
         21 => ColumnType::Vector(read_u32(at)?),
+        22 => ColumnType::Macaddr,
         _ => return None,
     })
 }

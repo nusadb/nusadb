@@ -49,6 +49,7 @@ const TAG_INTERVAL: u8 = 13;
 const TAG_ARRAY: u8 = 14;
 const TAG_VECTOR: u8 = 15;
 const TAG_BYTES: u8 = 16;
+const TAG_MACADDR: u8 = 17;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -106,6 +107,10 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             out.push(TAG_UUID);
             out.extend_from_slice(bytes);
         },
+        ast::Value::Macaddr(bytes) => {
+            out.push(TAG_MACADDR);
+            out.extend_from_slice(bytes);
+        },
         ast::Value::Numeric(d) => {
             out.push(TAG_NUMERIC);
             out.extend_from_slice(&d.mantissa.to_le_bytes());
@@ -151,6 +156,7 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
         TAG_TIMESTAMPTZ => ast::Value::TimestampTz(c.i64()?),
         TAG_TIMETZ => ast::Value::TimeTz(c.i64()?),
         TAG_UUID => ast::Value::Uuid(c.arr::<16>()?),
+        TAG_MACADDR => ast::Value::Macaddr(c.arr::<6>()?),
         TAG_NUMERIC => ast::Value::Numeric(Decimal {
             mantissa: i128::from_le_bytes(c.arr::<16>()?),
             scale: c.u8()?,

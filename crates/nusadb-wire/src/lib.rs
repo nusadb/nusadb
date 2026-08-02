@@ -90,6 +90,7 @@ pub const fn column_type_tag(ty: nusadb_core::ColumnType) -> u8 {
         ColumnType::Json | ColumnType::Jsonb => 0x0E,
         ColumnType::Array(_) => 0x0F,
         ColumnType::Vector(_) => 0x10,
+        ColumnType::Macaddr => 0x11,
     }
 }
 

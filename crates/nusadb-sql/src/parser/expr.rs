@@ -56,6 +56,7 @@ pub(super) fn convert_typed_literal(
         },
         ColumnType::TimeTz => crate::temporal::parse_timetz(&value).map(ast::Value::TimeTz),
         ColumnType::Uuid => crate::temporal::parse_uuid(&value).map(ast::Value::Uuid),
+        ColumnType::Macaddr => crate::macaddr::parse(&value).map(ast::Value::Macaddr),
         // `NUMERIC '…'` / `DECIMAL '…'` parse exactly.
         ColumnType::Numeric { .. } => {
             crate::numeric::Decimal::parse(&value).map(ast::Value::Numeric)

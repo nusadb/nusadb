@@ -66,6 +66,8 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
             buf
         },
         Value::Uuid(u) => u.to_vec(),
+        // MACADDR is its six raw bytes in transmission order.
+        Value::Macaddr(m) => m.to_vec(),
         Value::Interval(iv) => {
             let mut buf = Vec::with_capacity(16);
             buf.extend_from_slice(&iv.months.to_be_bytes());

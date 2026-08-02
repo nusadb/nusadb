@@ -310,6 +310,7 @@ pub(super) const fn is_hash_safe_value(value: &ast::Value) -> bool {
             | ast::Value::Timestamp(_)
             | ast::Value::TimestampTz(_)
             | ast::Value::Uuid(_)
+            | ast::Value::Macaddr(_)
     )
 }
 
@@ -334,7 +335,8 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         | T::Time
         | T::Timestamp
         | T::TimestampTz
-        | T::Uuid => true,
+        | T::Uuid
+        | T::Macaddr => true,
         T::Float
         | T::Real
         | T::Numeric { .. }
@@ -3170,6 +3172,7 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Time => "time without time zone",
         ColumnType::TimeTz => "time with time zone",
         ColumnType::Uuid => "uuid",
+        ColumnType::Macaddr => "macaddr",
         ColumnType::Numeric { .. } => "numeric",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",

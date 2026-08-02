@@ -375,6 +375,7 @@ const fn coltype_to_u8(t: ColumnType) -> u8 {
         // Tags 20/21; REAL stored as Float, JSONB as Json (declared type is metadata only).
         ColumnType::Real => 20,
         ColumnType::Jsonb => 21,
+        ColumnType::Macaddr => 22,
     }
 }
 fn u8_to_coltype(b: u8) -> Result<ColumnType> {
@@ -398,6 +399,7 @@ fn u8_to_coltype(b: u8) -> Result<ColumnType> {
         // REAL (stored as Float) / JSONB (stored as Json) carry no payload.
         20 => ColumnType::Real,
         21 => ColumnType::Jsonb,
+        22 => ColumnType::Macaddr,
         // An array's NUMERIC element is unconstrained (single tag byte, no precision/scale); a
         // column-level NUMERIC (tag 10) is decoded with its precision/scale before this fallback.
         10 => ColumnType::Numeric {

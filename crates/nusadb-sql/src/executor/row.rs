@@ -221,6 +221,7 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             out.extend_from_slice(&t.to_le_bytes());
         },
         (ast::Value::Uuid(u), ColumnType::Uuid) => out.extend_from_slice(u),
+        (ast::Value::Macaddr(m), ColumnType::Macaddr) => out.extend_from_slice(m),
         // Implicit string coercion ("unknown literal" rule): a text value assigned to a
         // temporal/UUID column is parsed into the column's type at encode time.
         (ast::Value::Text(s), ColumnType::Date) => {
@@ -246,6 +247,10 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Text(s), ColumnType::Uuid) => {
             let u = crate::temporal::parse_uuid(s).ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&u);
+        },
+        (ast::Value::Text(s), ColumnType::Macaddr) => {
+            let m = crate::macaddr::parse(s).ok_or_else(|| invalid(ty, s))?;
+            out.extend_from_slice(&m);
         },
         // NUMERIC: the value (or a coercible Int/Float/Text) rescaled to the column's
         // declared scale, precision-checked, then mantissa(16) + scale(1).
@@ -585,6 +590,10 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
             let arr = read_array::<16>(bytes, pos)?;
             Ok((ast::Value::Uuid(arr), pos + 16))
         },
+        ColumnType::Macaddr => {
+            let arr = read_array::<6>(bytes, pos)?;
+            Ok((ast::Value::Macaddr(arr), pos + 6))
+        },
         // JSON: length-prefixed canonical text.
         // JSONB decodes identically to JSON (stored as the same canonical text).
         ColumnType::Json | ColumnType::Jsonb => {
@@ -719,6 +728,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::TimestampTz(_) => ColumnType::TimestampTz,
         ast::Value::TimeTz(_) => ColumnType::TimeTz,
         ast::Value::Uuid(_) => ColumnType::Uuid,
+        ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,
