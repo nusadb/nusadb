@@ -1109,6 +1109,19 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::VectorDims | F::VectorNorm) {
         return analyze_vector_unary(func, args, scope, catalog, aggregates);
     }
+    // The INET/CIDR functions accept either network type (not expressible in the fixed table, which
+    // needs an exact argument type) and their result type varies (TEXT/INT/CIDR/INET/passthrough).
+    if matches!(
+        func,
+        F::InetHost
+            | F::InetMasklen
+            | F::InetFamily
+            | F::InetNetwork
+            | F::InetBroadcast
+            | F::InetSetMasklen
+    ) {
+        return analyze_inet_function(func, args, scope, catalog, aggregates);
+    }
     // TO_JSON / JSON_BUILD_OBJECT / JSON_BUILD_ARRAY take arguments of any type and return JSON — not
     // expressible with the fixed-type table.
     if matches!(func, F::ToJson | F::JsonBuildObject | F::JsonBuildArray) {
@@ -1371,6 +1384,12 @@ pub(super) fn analyze_scalar_function(
         | F::L1Distance
         | F::VectorDims
         | F::VectorNorm
+        | F::InetHost
+        | F::InetMasklen
+        | F::InetFamily
+        | F::InetNetwork
+        | F::InetBroadcast
+        | F::InetSetMasklen
         | F::ToJson
         | F::RowToJson
         | F::JsonBuildObject
@@ -1941,6 +1960,68 @@ fn analyze_vector_function(
 
 /// Analyze a unary vector function: one `VECTOR` argument. `VECTOR_DIMS` returns `INT` (the
 /// dimension count), `VECTOR_NORM` returns `FLOAT` (the Euclidean norm). A bare `NULL` is allowed.
+/// Analyze an `INET`/`CIDR` scalar function. The first argument must be a network type; `SET_MASKLEN`
+/// takes a second `INT`. The result type is per-function (`HOST`→`TEXT`, `MASKLEN`/`FAMILY`→`INT`,
+/// `NETWORK`→`CIDR`, `BROADCAST`→`INET`, `SET_MASKLEN`→the input's own type).
+fn analyze_inet_function(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    use ast::ScalarFunc as F;
+    let name = func.name();
+    let want = if func == F::InetSetMasklen { 2 } else { 1 };
+    if args.len() != want {
+        return Err(Error::Unsupported(format!(
+            "{name}() expects {want} argument(s), got {}",
+            args.len()
+        )));
+    }
+    let a_expr = args
+        .first()
+        .ok_or_else(|| Error::Unsupported(format!("{name}() argument")))?;
+    let a = analyze_expr_agg(a_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+    if !is_inet_type(a.ty) && !is_null_literal(&a) {
+        return Err(Error::TypeMismatch {
+            context: format!("{name}() argument"),
+            expected: ColumnType::Inet,
+            found: a.ty,
+        });
+    }
+    let mut typed_args = vec![a.clone()];
+    let ty = match func {
+        F::InetHost => ColumnType::Text,
+        F::InetMasklen | F::InetFamily => ColumnType::Int,
+        F::InetNetwork => ColumnType::Cidr,
+        F::InetBroadcast => ColumnType::Inet,
+        F::InetSetMasklen => {
+            let n_expr = args
+                .get(1)
+                .ok_or_else(|| Error::Unsupported(format!("{name}() mask length argument")))?;
+            let n = analyze_expr_agg(n_expr, scope, catalog, None, aggregates)?;
+            if !matches!(n.ty, ColumnType::Int) && !is_null_literal(&n) {
+                return Err(Error::TypeMismatch {
+                    context: format!("{name}() mask length"),
+                    expected: ColumnType::Int,
+                    found: n.ty,
+                });
+            }
+            typed_args.push(n);
+            a.ty // SET_MASKLEN keeps the input's INET/CIDR type.
+        },
+        _ => unreachable!("analyze_inet_function only handles the INET/CIDR functions"),
+    };
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: typed_args,
+        },
+        ty,
+    })
+}
+
 fn analyze_vector_unary(
     func: ast::ScalarFunc,
     args: &[ast::Expr],
@@ -3351,6 +3432,13 @@ pub(super) fn check_binary(
             // INTERVAL / temporal arithmetic takes priority over numeric.
             check_interval_arith(op, left, right).map_or_else(|| check_arithmetic(left, right), Ok)
         },
+        // INET/CIDR reuse `<<` / `>>` (contained-by / contains) and `&&` (overlaps) as network
+        // predicates, yielding `BOOL`, when both operands are network addresses.
+        Op::ShiftLeft | Op::ShiftRight | Op::ArrayOverlap
+            if is_inet_type(left) && is_inet_type(right) =>
+        {
+            Ok(ColumnType::Bool)
+        },
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             check_bitwise(op, left, right)
         },
@@ -3836,6 +3924,11 @@ pub(super) fn check_arithmetic(left: ColumnType, right: ColumnType) -> Result<Co
         // wider one (`int4 + int8 → int8`), matching the reference engine.
         Ok(wider_int(left, right))
     }
+}
+
+/// Whether `ty` is a network-address type (`INET` or `CIDR`).
+pub(super) const fn is_inet_type(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Inet | ColumnType::Cidr)
 }
 
 /// Type rule for the integer bitwise operators `&` / `|`: both operands must be `INT` and the

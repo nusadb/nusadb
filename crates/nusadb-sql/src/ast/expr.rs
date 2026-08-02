@@ -693,6 +693,18 @@ pub enum ScalarFunc {
     VectorDims,
     /// `VECTOR_NORM(a)` — the Euclidean norm `‖a‖₂` of a `VECTOR(n)`, as `FLOAT`.
     VectorNorm,
+    /// `HOST(inet)` — the host address without a mask, as `TEXT`.
+    InetHost,
+    /// `MASKLEN(inet)` — the network mask length in bits, as `INT`.
+    InetMasklen,
+    /// `FAMILY(inet)` — the address family (`4` or `6`), as `INT`.
+    InetFamily,
+    /// `NETWORK(inet)` — the network part (host bits zeroed), as `CIDR`.
+    InetNetwork,
+    /// `BROADCAST(inet)` — the broadcast address of the network, as `INET`.
+    InetBroadcast,
+    /// `SET_MASKLEN(inet, int)` — the address with a new mask length, as `INET`/`CIDR`.
+    InetSetMasklen,
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
@@ -927,6 +939,12 @@ impl ScalarFunc {
             Self::L1Distance => "l1_distance",
             Self::VectorDims => "vector_dims",
             Self::VectorNorm => "vector_norm",
+            Self::InetHost => "host",
+            Self::InetMasklen => "masklen",
+            Self::InetFamily => "family",
+            Self::InetNetwork => "network",
+            Self::InetBroadcast => "broadcast",
+            Self::InetSetMasklen => "set_masklen",
             Self::UuidGenerateV4 => "uuid_generate_v4",
             Self::Version => "version",
             Self::NusaTypeof => "nusa_typeof",

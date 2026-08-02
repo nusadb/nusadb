@@ -1215,6 +1215,12 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "l1_distance" => F::L1Distance,
         "vector_dims" => F::VectorDims,
         "vector_norm" => F::VectorNorm,
+        "host" => F::InetHost,
+        "masklen" => F::InetMasklen,
+        "family" => F::InetFamily,
+        "network" => F::InetNetwork,
+        "broadcast" => F::InetBroadcast,
+        "set_masklen" => F::InetSetMasklen,
         // UUID generation: both the modern built-in name and the alternative spelling.
         "gen_random_uuid" | "uuid_generate_v4" => F::UuidGenerateV4,
         // System functions.

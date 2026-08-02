@@ -63,32 +63,63 @@ impl InetAddr {
     /// the reference engine's `inet`→`cidr` cast (which masks rather than rejecting host bits).
     #[must_use]
     pub fn to_cidr(self) -> Self {
+        Self {
+            addr: self.masked_addr(false),
+            masklen: self.masklen,
+            is_cidr: true,
+        }
+    }
+
+    /// The broadcast address of this value's network — every host bit set — as an `INET`. `host()`
+    /// and `set_masklen` companions of the reference engine's `broadcast()` function.
+    #[must_use]
+    pub fn broadcast(self) -> Self {
+        Self {
+            addr: self.masked_addr(true),
+            masklen: self.masklen,
+            is_cidr: false,
+        }
+    }
+
+    /// The same address with a new mask length, or `None` if `masklen` exceeds the family maximum.
+    #[must_use]
+    pub fn with_masklen(self, masklen: u8) -> Option<Self> {
+        (masklen <= max_masklen(self.addr)).then_some(Self { masklen, ..self })
+    }
+
+    /// The host address alone, without any mask (`192.168.1.5`) — the reference engine's `host()`.
+    #[must_use]
+    pub fn host(self) -> String {
+        self.addr.to_string()
+    }
+
+    /// The address family as the reference engine reports it: `4` for IPv4, `6` for IPv6.
+    #[must_use]
+    pub const fn family(self) -> i64 {
+        if is_v6(self.addr) { 6 } else { 4 }
+    }
+
+    /// This address with the host bits below the mask either zeroed (`set` = false → network) or set
+    /// (`set` = true → broadcast).
+    fn masked_addr(self, set: bool) -> IpAddr {
         let mut octets = addr_octets(self.addr);
         let bits = usize::from(self.masklen);
         for (i, byte) in octets.iter_mut().enumerate() {
             let bit_lo = i * 8;
-            if bit_lo >= bits {
-                *byte = 0;
+            let host_mask: u8 = if bit_lo >= bits {
+                0xff
             } else if bit_lo + 8 > bits {
-                let host_bits = (bit_lo + 8) - bits;
-                *byte &= !((1u16 << host_bits) - 1) as u8;
+                ((1u16 << ((bit_lo + 8) - bits)) - 1) as u8
+            } else {
+                0
+            };
+            if set {
+                *byte |= host_mask;
+            } else {
+                *byte &= !host_mask;
             }
         }
-        let addr = match self.addr {
-            IpAddr::V4(_) => {
-                let a: [u8; 4] = octets.as_slice().try_into().unwrap_or([0; 4]);
-                IpAddr::V4(Ipv4Addr::from(a))
-            },
-            IpAddr::V6(_) => {
-                let a: [u8; 16] = octets.as_slice().try_into().unwrap_or([0; 16]);
-                IpAddr::V6(Ipv6Addr::from(a))
-            },
-        };
-        Self {
-            addr,
-            masklen: self.masklen,
-            is_cidr: true,
-        }
+        octets_to_addr(&octets, is_v6(self.addr))
     }
 
     /// This value as a host address — `is_cidr` cleared, address and mask unchanged. The `cidr`→`inet` cast.
@@ -224,6 +255,17 @@ impl InetAddr {
             return false;
         }
         network_prefix_eq(self.addr, other.addr, self.masklen)
+    }
+}
+
+/// Rebuild an [`IpAddr`] from big-endian octets (4 for IPv4 when `v6` is false, 16 for IPv6).
+fn octets_to_addr(octets: &[u8], v6: bool) -> IpAddr {
+    if v6 {
+        let a: [u8; 16] = octets.try_into().unwrap_or([0; 16]);
+        IpAddr::V6(Ipv6Addr::from(a))
+    } else {
+        let a: [u8; 4] = octets.try_into().unwrap_or([0; 4]);
+        IpAddr::V4(Ipv4Addr::from(a))
     }
 }
 

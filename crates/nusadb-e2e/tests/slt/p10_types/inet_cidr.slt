@@ -69,3 +69,71 @@ INSERT INTO n VALUES (5, '10.0.0.1', '10.0.0.0/33')
 # A CIDR with host bits set below the mask is rejected (a network address must be canonical).
 statement error
 INSERT INTO n VALUES (6, '10.0.0.1', '192.168.1.5/24')
+
+# --- network predicate operators (a boolean renders as 1/0) ---
+
+# << : left is strictly contained by right's network.
+query I
+SELECT CASE WHEN '192.168.1.5'::INET << '192.168.1.0/24'::INET THEN 1 ELSE 0 END
+----
+1
+
+# >> : left's network strictly contains right.
+query I
+SELECT CASE WHEN '192.168.1.0/24'::INET >> '192.168.1.5'::INET THEN 1 ELSE 0 END
+----
+1
+
+# && : the networks overlap.
+query I
+SELECT CASE WHEN '192.168.1.0/24'::INET && '192.168.1.128/25'::INET THEN 1 ELSE 0 END
+----
+1
+
+# Disjoint networks do not overlap; equal networks are not *strictly* contained.
+query I
+SELECT CASE WHEN '10.0.0.0/8'::INET && '192.168.0.0/16'::INET THEN 1 ELSE 0 END
+----
+0
+
+query I
+SELECT CASE WHEN '192.168.1.0/24'::INET << '192.168.1.0/24'::INET THEN 1 ELSE 0 END
+----
+0
+
+# --- functions ---
+
+query T
+SELECT HOST('192.168.1.5/24'::INET)
+----
+192.168.1.5
+
+query I
+SELECT MASKLEN('192.168.1.5/24'::INET)
+----
+24
+
+query I
+SELECT FAMILY('192.168.1.5'::INET)
+----
+4
+
+query I
+SELECT FAMILY('::1'::INET)
+----
+6
+
+query T
+SELECT NETWORK('192.168.1.5/24'::INET)
+----
+192.168.1.0/24
+
+query T
+SELECT BROADCAST('192.168.1.5/24'::INET)
+----
+192.168.1.255/24
+
+query T
+SELECT SET_MASKLEN('192.168.1.5/24'::INET, 16)
+----
+192.168.1.5/16

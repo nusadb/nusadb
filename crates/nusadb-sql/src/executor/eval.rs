@@ -856,6 +856,23 @@ fn eval_scalar_function(
             ast::Value::Int(i64::try_from(v.len()).unwrap_or(i64::MAX))
         },
         (F::VectorNorm, [ast::Value::Vector(v)]) => ast::Value::Float(crate::vector::norm(v)),
+        // INET/CIDR functions. NULL operands already returned NULL above.
+        (F::InetHost, [ast::Value::Inet(a)]) => ast::Value::Text(a.host()),
+        (F::InetMasklen, [ast::Value::Inet(a)]) => ast::Value::Int(i64::from(a.masklen)),
+        (F::InetFamily, [ast::Value::Inet(a)]) => ast::Value::Int(a.family()),
+        (F::InetNetwork, [ast::Value::Inet(a)]) => ast::Value::Inet(a.to_cidr()),
+        (F::InetBroadcast, [ast::Value::Inet(a)]) => ast::Value::Inet(a.broadcast()),
+        (F::InetSetMasklen, [ast::Value::Inet(a), ast::Value::Int(n)]) => {
+            match u8::try_from(*n).ok().and_then(|m| a.with_masklen(m)) {
+                Some(v) => ast::Value::Inet(v),
+                None => {
+                    return Err(Error::Coded {
+                        message: format!("invalid mask length for {}: {n}", a.format()),
+                        sqlstate: "22023",
+                    });
+                },
+            }
+        },
         // Arity/type mismatch is impossible after analysis — fall back to NULL defensively.
         _ => ast::Value::Null,
     })
@@ -3686,6 +3703,12 @@ fn apply_binary(
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
             apply_arithmetic(op, left, right, result_ty)
         },
+        // INET/CIDR network predicates share the `<<` / `>>` / `&&` operators.
+        Op::ShiftLeft | Op::ShiftRight | Op::ArrayOverlap
+            if matches!(left, ast::Value::Inet(_)) || matches!(right, ast::Value::Inet(_)) =>
+        {
+            Ok(apply_inet_predicate(op, left, right))
+        },
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             Ok(apply_bitwise(op, left, right))
         },
@@ -3793,6 +3816,23 @@ fn apply_bitwise(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> as
         _ => return ast::Value::Null,
     };
     ast::Value::Int(result)
+}
+
+/// Evaluate an `INET`/`CIDR` network predicate: `<<` (strictly contained by), `>>` (strictly
+/// contains), or `&&` (overlaps). Networks are hierarchical, so overlap means one contains the
+/// other. A non-network operand (e.g. a `NULL`) yields `NULL`.
+fn apply_inet_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> ast::Value {
+    use ast::BinaryOp as Op;
+    let (ast::Value::Inet(a), ast::Value::Inet(b)) = (left, right) else {
+        return ast::Value::Null;
+    };
+    let result = match op {
+        Op::ShiftLeft => b.contains_or_equal(a) && a.masklen > b.masklen,
+        Op::ShiftRight => a.contains_or_equal(b) && b.masklen > a.masklen,
+        Op::ArrayOverlap => a.contains_or_equal(b) || b.contains_or_equal(a),
+        _ => return ast::Value::Null,
+    };
+    ast::Value::Bool(result)
 }
 
 /// Evaluate array overlap `a && b` (B-fn): `TRUE` if the two arrays share at least one element. A
