@@ -705,6 +705,10 @@ pub enum ScalarFunc {
     InetBroadcast,
     /// `SET_MASKLEN(inet, int)` — the address with a new mask length, as `INET`/`CIDR`.
     InetSetMasklen,
+    /// `GET_BIT(bits, n)` — the `n`-th bit (0-based from the left) as `INT` (`0`/`1`).
+    BitGetBit,
+    /// `SET_BIT(bits, n, v)` — `bits` with its `n`-th bit set to `v` (`0`/`1`), as the same bit type.
+    BitSetBit,
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
@@ -945,6 +949,8 @@ impl ScalarFunc {
             Self::InetNetwork => "network",
             Self::InetBroadcast => "broadcast",
             Self::InetSetMasklen => "set_masklen",
+            Self::BitGetBit => "get_bit",
+            Self::BitSetBit => "set_bit",
             Self::UuidGenerateV4 => "uuid_generate_v4",
             Self::Version => "version",
             Self::NusaTypeof => "nusa_typeof",

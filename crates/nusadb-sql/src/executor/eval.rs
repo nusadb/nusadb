@@ -422,6 +422,13 @@ fn eval_scalar_function(
     }
     Ok(match (func, vals.as_slice()) {
         (F::Length, [Text(s)]) => Int(char_len(s)),
+        // Over a BIT string, LENGTH and BIT_LENGTH are the bit count; OCTET_LENGTH is the byte count.
+        (F::Length | F::BitLength, [ast::Value::Bit(b)]) => {
+            Int(i64::try_from(b.len()).unwrap_or(i64::MAX))
+        },
+        (F::OctetLength, [ast::Value::Bit(b)]) => {
+            Int(i64::try_from(crate::bit::packed_len(b.len())).unwrap_or(i64::MAX))
+        },
         // Over BYTEA, LENGTH == OCTET_LENGTH == the byte count; BIT_LENGTH is 8x.
         (F::Length | F::OctetLength, [ast::Value::Bytes(b)]) => {
             Int(i64::try_from(b.len()).unwrap_or(i64::MAX))
@@ -868,6 +875,32 @@ fn eval_scalar_function(
                 None => {
                     return Err(Error::Coded {
                         message: format!("invalid mask length for {}: {n}", a.format()),
+                        sqlstate: "22023",
+                    });
+                },
+            }
+        },
+        // BIT string functions. NULL operands already returned NULL above.
+        (F::BitGetBit, [ast::Value::Bit(b), ast::Value::Int(n)]) => {
+            match usize::try_from(*n).ok().and_then(|i| b.get(i)) {
+                Some(&bit) => ast::Value::Int(i64::from(bit)),
+                None => return Err(bit_index_out_of_range(*n, b.len())),
+            }
+        },
+        (F::BitSetBit, [ast::Value::Bit(b), ast::Value::Int(n), ast::Value::Int(v)]) => {
+            let idx = usize::try_from(*n).ok().filter(|&i| i < b.len());
+            match (idx, v) {
+                (Some(i), 0 | 1) => {
+                    let mut bits = b.clone();
+                    if let Some(slot) = bits.get_mut(i) {
+                        *slot = *v == 1;
+                    }
+                    ast::Value::Bit(bits)
+                },
+                (None, _) => return Err(bit_index_out_of_range(*n, b.len())),
+                (Some(_), _) => {
+                    return Err(Error::Coded {
+                        message: format!("new bit must be 0 or 1, got {v}"),
                         sqlstate: "22023",
                     });
                 },
@@ -3728,6 +3761,12 @@ fn apply_binary(
         {
             Ok(apply_inet_predicate(op, left, right))
         },
+        // BIT-string operators: `&`/`|`/`#`, `<<`/`>>` (shift), and `||` (concat).
+        Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight | Op::Concat
+            if matches!(left, ast::Value::Bit(_)) =>
+        {
+            apply_bit_op(op, left, right)
+        },
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             Ok(apply_bitwise(op, left, right))
         },
@@ -3835,6 +3874,67 @@ fn apply_bitwise(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> as
         _ => return ast::Value::Null,
     };
     ast::Value::Int(result)
+}
+
+/// The error for a `GET_BIT`/`SET_BIT` index outside `0..len`.
+fn bit_index_out_of_range(n: i64, len: usize) -> Error {
+    Error::Coded {
+        message: format!("bit index {n} out of valid range, 0..{len}"),
+        sqlstate: "22003",
+    }
+}
+
+/// Evaluate a `BIT`-string operator: `&`/`|`/`#` (bitwise, requiring equal lengths), `<<`/`>>`
+/// (shift by an integer, keeping the length), or `||` (concatenate). A non-bit or `NULL` operand
+/// yields `NULL`; mismatched lengths for a bitwise op raise a loud error.
+fn apply_bit_op(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    use ast::BinaryOp as Op;
+    let ast::Value::Bit(a) = left else {
+        return Ok(ast::Value::Null);
+    };
+    Ok(match op {
+        Op::BitAnd | Op::BitOr | Op::BitXor => {
+            let ast::Value::Bit(b) = right else {
+                return Ok(ast::Value::Null);
+            };
+            if a.len() != b.len() {
+                return Err(Error::Coded {
+                    message: "cannot apply a bitwise operator to bit strings of different sizes"
+                        .to_owned(),
+                    sqlstate: "22026",
+                });
+            }
+            let bits = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| match op {
+                    Op::BitAnd => x & y,
+                    Op::BitOr => x | y,
+                    _ => x ^ y,
+                })
+                .collect();
+            ast::Value::Bit(bits)
+        },
+        Op::ShiftLeft | Op::ShiftRight => {
+            let ast::Value::Int(n) = right else {
+                return Ok(ast::Value::Null);
+            };
+            ast::Value::Bit(crate::bit::shift(a, *n, op == Op::ShiftLeft))
+        },
+        Op::Concat => {
+            let ast::Value::Bit(b) = right else {
+                return Ok(ast::Value::Null);
+            };
+            let mut bits = a.clone();
+            bits.extend_from_slice(b);
+            ast::Value::Bit(bits)
+        },
+        _ => ast::Value::Null,
+    })
 }
 
 /// Evaluate an `INET`/`CIDR` network predicate: `<<` (strictly contained by), `>>` (strictly

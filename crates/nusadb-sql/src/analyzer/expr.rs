@@ -1123,6 +1123,11 @@ pub(super) fn analyze_scalar_function(
     ) {
         return analyze_inet_function(func, args, scope, catalog, aggregates);
     }
+    // GET_BIT/SET_BIT take a bit string (any width) and integer positions — not expressible in the
+    // fixed table, and SET_BIT's result type is the input's own bit type.
+    if matches!(func, F::BitGetBit | F::BitSetBit) {
+        return analyze_bit_function(func, args, scope, catalog, aggregates);
+    }
     // TO_JSON / JSON_BUILD_OBJECT / JSON_BUILD_ARRAY take arguments of any type and return JSON — not
     // expressible with the fixed-type table.
     if matches!(func, F::ToJson | F::JsonBuildObject | F::JsonBuildArray) {
@@ -1391,6 +1396,8 @@ pub(super) fn analyze_scalar_function(
         | F::InetNetwork
         | F::InetBroadcast
         | F::InetSetMasklen
+        | F::BitGetBit
+        | F::BitSetBit
         | F::ToJson
         | F::RowToJson
         | F::JsonBuildObject
@@ -1964,6 +1971,56 @@ fn analyze_vector_function(
 /// Analyze an `INET`/`CIDR` scalar function. The first argument must be a network type; `SET_MASKLEN`
 /// takes a second `INT`. The result type is per-function (`HOST`→`TEXT`, `MASKLEN`/`FAMILY`→`INT`,
 /// `NETWORK`→`CIDR`, `BROADCAST`→`INET`, `SET_MASKLEN`→the input's own type).
+/// Analyze `GET_BIT(bits, n)` → `INT` and `SET_BIT(bits, n, v)` → the input's bit type. The first
+/// argument must be a bit string; the remaining arguments are `INT` positions/values.
+fn analyze_bit_function(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    use ast::ScalarFunc as F;
+    let name = func.name();
+    let want = if func == F::BitSetBit { 3 } else { 2 };
+    if args.len() != want {
+        return Err(Error::Unsupported(format!(
+            "{name}() expects {want} argument(s), got {}",
+            args.len()
+        )));
+    }
+    let mut typed = Vec::with_capacity(want);
+    for (i, arg) in args.iter().enumerate() {
+        let t = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
+        let ok = if i == 0 {
+            is_bit_type(t.ty)
+        } else {
+            matches!(t.ty, ColumnType::Int)
+        };
+        if !ok && !is_null_literal(&t) {
+            return Err(Error::TypeMismatch {
+                context: format!("{name}() argument {}", i + 1),
+                expected: if i == 0 {
+                    ColumnType::VarBit(None)
+                } else {
+                    ColumnType::Int
+                },
+                found: t.ty,
+            });
+        }
+        typed.push(t);
+    }
+    let ty = if func == F::BitGetBit {
+        ColumnType::Int
+    } else {
+        typed.first().map_or(ColumnType::VarBit(None), |a| a.ty)
+    };
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction { func, args: typed },
+        ty,
+    })
+}
+
 fn analyze_inet_function(
     func: ast::ScalarFunc,
     args: &[ast::Expr],
@@ -3440,6 +3497,13 @@ pub(super) fn check_binary(
         {
             Ok(ColumnType::Bool)
         },
+        // BIT strings: `&`/`|`/`#` combine two (equal-length) bit strings, `<<`/`>>` shift by an
+        // `INT`, all yielding a bit string; `||` concatenates into a variable-length result.
+        Op::BitAnd | Op::BitOr | Op::BitXor if is_bit_type(left) && is_bit_type(right) => Ok(left),
+        Op::ShiftLeft | Op::ShiftRight if is_bit_type(left) && matches!(right, ColumnType::Int) => {
+            Ok(left)
+        },
+        Op::Concat if is_bit_type(left) && is_bit_type(right) => Ok(ColumnType::VarBit(None)),
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             check_bitwise(op, left, right)
         },
@@ -3548,6 +3612,7 @@ fn analyze_text_polymorphic(
         )?;
         let ok = if length_family {
             matches!(typed.ty.physical(), ColumnType::Text | ColumnType::Bytes)
+                || is_bit_type(typed.ty)
         } else if matches!(func, F::ConcatWs) && i == 0 {
             typed.ty.physical() == ColumnType::Text
         } else {
@@ -3930,6 +3995,11 @@ pub(super) fn check_arithmetic(left: ColumnType, right: ColumnType) -> Result<Co
 /// Whether `ty` is a network-address type (`INET` or `CIDR`).
 pub(super) const fn is_inet_type(ty: ColumnType) -> bool {
     matches!(ty, ColumnType::Inet | ColumnType::Cidr)
+}
+
+/// Whether `ty` is a bit-string type (`BIT` or `BIT VARYING`).
+pub(super) const fn is_bit_type(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Bit(_) | ColumnType::VarBit(_))
 }
 
 /// Type rule for the integer bitwise operators `&` / `|`: both operands must be `INT` and the

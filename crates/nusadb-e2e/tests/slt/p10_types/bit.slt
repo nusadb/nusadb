@@ -76,3 +76,67 @@ INSERT INTO b VALUES (10, '10x1', '1')
 # A BIT VARYING value longer than its declared maximum is rejected.
 statement error
 INSERT INTO b VALUES (11, '1111', '111100001')
+
+# --- bitwise operators (& | #), shifts (<< >>), and concatenation (||) ---
+
+query T
+SELECT '1100'::BIT(4) & '1010'::BIT(4)
+----
+1000
+
+query T
+SELECT '1100'::BIT(4) | '1010'::BIT(4)
+----
+1110
+
+query T
+SELECT '1100'::BIT(4) # '1010'::BIT(4)
+----
+0110
+
+# Bitwise ops require equal lengths.
+statement error
+SELECT '110'::BIT(3) & '1010'::BIT(4)
+
+# Shifts keep the length (bits fall off one end, zeros fill the other).
+query T
+SELECT '10010'::BIT(5) << 2
+----
+01000
+
+query T
+SELECT '10010'::BIT(5) >> 2
+----
+00100
+
+# Concatenation joins two bit strings.
+query T
+SELECT '101'::BIT(3) || '11'::BIT(2)
+----
+10111
+
+# --- functions ---
+
+query I
+SELECT LENGTH('10110'::BIT(5))
+----
+5
+
+query I
+SELECT GET_BIT('10110'::BIT(5), 0)
+----
+1
+
+query I
+SELECT GET_BIT('10110'::BIT(5), 1)
+----
+0
+
+query T
+SELECT SET_BIT('10110'::BIT(5), 0, 0)
+----
+00110
+
+# An out-of-range bit index is rejected.
+statement error
+SELECT GET_BIT('101'::BIT(3), 5)

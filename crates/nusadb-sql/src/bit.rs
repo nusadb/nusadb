@@ -47,6 +47,27 @@ pub fn truncate(bits: &[bool], max: Option<usize>) -> Vec<bool> {
     }
 }
 
+/// Shift `bits` by `amount` places, keeping the same length — the `<<` / `>>` operators.
+///
+/// A left shift moves bits toward index 0 (dropping the leading bits and zero-filling the trailing
+/// ones); a right shift is the mirror. A negative `amount` reverses the direction, matching the
+/// reference engine.
+#[must_use]
+pub fn shift(bits: &[bool], amount: i64, left: bool) -> Vec<bool> {
+    let toward_front = if amount < 0 { !left } else { left };
+    let k = usize::try_from(amount.unsigned_abs()).unwrap_or(usize::MAX);
+    (0..bits.len())
+        .map(|i| {
+            let src = if toward_front {
+                i.checked_add(k)
+            } else {
+                i.checked_sub(k)
+            };
+            src.and_then(|s| bits.get(s).copied()).unwrap_or(false)
+        })
+        .collect()
+}
+
 /// Render a bit string as its canonical text (`"1011"`).
 #[must_use]
 pub fn format(bits: &[bool]) -> String {
