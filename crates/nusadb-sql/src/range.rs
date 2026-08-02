@@ -189,6 +189,43 @@ impl RangeVal {
         }
     }
 
+    /// Whether this range covers every point of `other` (`@>`). The empty range is contained by
+    /// every range and contains only the empty one.
+    ///
+    /// Like [`RangeVal::overlaps`], this compares bounds only — the caller is responsible for the
+    /// two ranges being of the same element kind.
+    #[must_use]
+    pub fn contains_range(&self, other: &Self) -> bool {
+        if other.empty {
+            return true;
+        }
+        if self.empty {
+            return false;
+        }
+        // This range must start at or below `other` and end at or above it. An unbounded side here
+        // never fails; an unbounded side of `other` needs the same side unbounded here too.
+        let lower_ok = match (&self.lower, &other.lower) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => match compare(a, b) {
+                std::cmp::Ordering::Less => true,
+                // At the same value, an exclusive start here excludes an inclusive one there.
+                std::cmp::Ordering::Equal => self.lower_inc || !other.lower_inc,
+                std::cmp::Ordering::Greater => false,
+            },
+        };
+        lower_ok
+            && match (&self.upper, &other.upper) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => match compare(a, b) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => self.upper_inc || !other.upper_inc,
+                    std::cmp::Ordering::Less => false,
+                },
+            }
+    }
+
     /// Whether the two ranges share at least one point (`&&`).
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
@@ -699,5 +736,37 @@ mod tests {
         assert!(a.overlaps(&b));
         assert!(!a.overlaps(&c)); // [1,10) and [10,20) are adjacent, not overlapping
         assert!(!a.overlaps(&RangeVal::empty(RangeKind::Int)));
+    }
+
+    #[test]
+    fn contains_range_covers_bounds_emptiness_and_infinities() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        let outer = int("[1,10)");
+        assert!(outer.contains_range(&int("[2,5)")));
+        assert!(outer.contains_range(&outer)); // a range contains itself
+        assert!(!outer.contains_range(&int("[1,11)"))); // one past the upper bound
+        assert!(!outer.contains_range(&int("[0,5)"))); // one below the lower bound
+        // The empty range is contained by everything and contains only itself.
+        let empty = RangeVal::empty(RangeKind::Int);
+        assert!(outer.contains_range(&empty));
+        assert!(!empty.contains_range(&outer));
+        assert!(empty.contains_range(&empty));
+        // An unbounded side covers everything on that side, and only another unbounded side
+        // satisfies it.
+        assert!(int("(,)").contains_range(&outer));
+        assert!(int("[1,)").contains_range(&int("[5,)")));
+        assert!(!int("[1,)").contains_range(&int("(,5)")));
+        assert!(!outer.contains_range(&int("(,)")));
+        // Inclusivity at a shared bound decides the continuous cases a discrete range cannot show.
+        let num = |s: &str| parse(s, RangeKind::Num).expect("numrange");
+        assert!(num("(1.0,3.0]").contains_range(&num("(1.0,3.0)")));
+        assert!(!num("(1.0,3.0)").contains_range(&num("(1.0,3.0]")));
+        assert!(num("[1.0,3.0]").contains_range(&num("(1.0,3.0)")));
+        assert!(!num("(1.0,3.0]").contains_range(&num("[1.0,3.0]")));
+        // Containment agrees with overlap wherever both are defined: containing a non-empty range
+        // implies overlapping it.
+        for (a, b) in [("[1,10)", "[2,5)"), ("[1,)", "[5,)"), ("(,)", "[1,10)")] {
+            assert!(int(a).contains_range(&int(b)) && int(a).overlaps(&int(b)));
+        }
     }
 }

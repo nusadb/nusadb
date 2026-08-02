@@ -880,6 +880,31 @@ fn eval_scalar_function(
                 },
             }
         },
+        // Range accessors. NULL operands already returned NULL above. An empty range has no bounds,
+        // so every accessor reports the absent/false answer for it.
+        (F::RangeLower, [ast::Value::Range(r)]) => {
+            if r.empty {
+                ast::Value::Null
+            } else {
+                r.lower.clone().unwrap_or(ast::Value::Null)
+            }
+        },
+        (F::RangeUpper, [ast::Value::Range(r)]) => {
+            if r.empty {
+                ast::Value::Null
+            } else {
+                r.upper.clone().unwrap_or(ast::Value::Null)
+            }
+        },
+        (F::RangeIsEmpty, [ast::Value::Range(r)]) => ast::Value::Bool(r.empty),
+        (F::RangeLowerInc, [ast::Value::Range(r)]) => ast::Value::Bool(!r.empty && r.lower_inc),
+        (F::RangeUpperInc, [ast::Value::Range(r)]) => ast::Value::Bool(!r.empty && r.upper_inc),
+        (F::RangeLowerInf, [ast::Value::Range(r)]) => {
+            ast::Value::Bool(!r.empty && r.lower.is_none())
+        },
+        (F::RangeUpperInf, [ast::Value::Range(r)]) => {
+            ast::Value::Bool(!r.empty && r.upper.is_none())
+        },
         // BIT string functions. NULL operands already returned NULL above.
         (F::BitGetBit, [ast::Value::Bit(b), ast::Value::Int(n)]) => {
             match usize::try_from(*n).ok().and_then(|i| b.get(i)) {
@@ -3782,6 +3807,12 @@ fn apply_binary(
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             Ok(apply_bitwise(op, left, right))
         },
+        // Range predicates share `&&` (overlap) and `@>`/`<@` (containment) with the array forms.
+        Op::ArrayOverlap | Op::JsonContains | Op::JsonContainedBy
+            if matches!(left, ast::Value::Range(_)) || matches!(right, ast::Value::Range(_)) =>
+        {
+            apply_range_predicate(op, left, right)
+        },
         // Element-set operators (overlap `&&`, containment `@>`/`<@`) are defined over a
         // single dimension; reject a multidimensional operand loudly rather than compute a wrong set.
         Op::ArrayOverlap => {
@@ -4094,6 +4125,49 @@ const fn apply_is_bool(value: &ast::Value, truth: ast::TruthValue, negated: bool
         ast::TruthValue::Unknown => matches!(value, ast::Value::Null),
     };
     ast::Value::Bool(base ^ negated)
+}
+
+/// Evaluate a range predicate: `&&` (overlap) or `@>` / `<@` (containment). A NULL operand yields
+/// NULL. Containment takes either a range or a single element on the contained side; overlap takes
+/// two ranges. The analyzer requires a matching element kind on both sides, so a shape this does not
+/// recognize means the two layers disagree — report it rather than answer a question nobody asked.
+fn apply_range_predicate(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    if matches!(left, ast::Value::Null) || matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    let mismatch = || {
+        Err(Error::Unsupported(
+            "range predicate over operands of different element kinds".to_owned(),
+        ))
+    };
+    if op == ast::BinaryOp::ArrayOverlap {
+        return match (left, right) {
+            (ast::Value::Range(a), ast::Value::Range(b)) if a.kind == b.kind => {
+                Ok(ast::Value::Bool(a.overlaps(b)))
+            },
+            _ => mismatch(),
+        };
+    }
+    // Orient so `container` is the side expected to hold the other.
+    let (container, contained) = if op == ast::BinaryOp::JsonContains {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let ast::Value::Range(outer) = container else {
+        return mismatch();
+    };
+    match contained {
+        ast::Value::Range(inner) if inner.kind == outer.kind => {
+            Ok(ast::Value::Bool(outer.contains_range(inner)))
+        },
+        ast::Value::Range(_) => mismatch(),
+        elem => Ok(ast::Value::Bool(outer.contains_elem(elem))),
+    }
 }
 
 /// Evaluate `@>` (contains) / `<@` (contained-by) over arrays or JSON. A NULL operand yields NULL.

@@ -1124,6 +1124,53 @@ pub(super) fn analyze_scalar_function(
     ) {
         return analyze_inet_function(func, args, scope, catalog, aggregates);
     }
+    // The range accessors take any range kind and their result type follows the element kind, so
+    // they are not expressible in the fixed table either.
+    if matches!(
+        func,
+        F::RangeLower
+            | F::RangeUpper
+            | F::RangeIsEmpty
+            | F::RangeLowerInc
+            | F::RangeUpperInc
+            | F::RangeLowerInf
+            | F::RangeUpperInf
+    ) {
+        return analyze_range_function(func, args, scope, catalog, aggregates);
+    }
+    // `lower`/`upper` are overloaded: over a range they yield a bound, over text they fold case.
+    // The argument decides, so it is analyzed once here and handed to whichever form wins —
+    // re-analyzing to pick would double the work per call and square it for every nested one.
+    if matches!(func, F::Lower | F::Upper)
+        && let [arg] = args
+    {
+        let a = analyze_expr_agg(arg, scope, catalog, Some(Text), aggregates.as_deref_mut())?;
+        if let ColumnType::Range(kind) = a.ty {
+            let func = if func == F::Lower {
+                F::RangeLower
+            } else {
+                F::RangeUpper
+            };
+            return Ok(range_accessor(func, a, kind));
+        }
+        // Not a range, so this is the text form. Applying its `ScalarSig::Fixed(&[Text], &[], Text)`
+        // entry here keeps the already-analyzed argument instead of sending it back through the
+        // table below; the arity and type errors read the same either way.
+        if a.ty != Text && !is_null_literal(&a) {
+            return Err(Error::TypeMismatch {
+                context: format!("{}() argument 1", func.name()),
+                expected: Text,
+                found: a.ty,
+            });
+        }
+        return Ok(TypedExpr {
+            kind: TypedExprKind::ScalarFunction {
+                func,
+                args: vec![a],
+            },
+            ty: Text,
+        });
+    }
     // GET_BIT/SET_BIT take a bit string (any width) and integer positions — not expressible in the
     // fixed table, and SET_BIT's result type is the input's own bit type.
     if matches!(func, F::BitGetBit | F::BitSetBit) {
@@ -1399,6 +1446,13 @@ pub(super) fn analyze_scalar_function(
         | F::InetSetMasklen
         | F::BitGetBit
         | F::BitSetBit
+        | F::RangeLower
+        | F::RangeUpper
+        | F::RangeIsEmpty
+        | F::RangeLowerInc
+        | F::RangeUpperInc
+        | F::RangeLowerInf
+        | F::RangeUpperInf
         | F::ToJson
         | F::RowToJson
         | F::JsonBuildObject
@@ -2020,6 +2074,64 @@ fn analyze_bit_function(
         kind: TypedExprKind::ScalarFunction { func, args: typed },
         ty,
     })
+}
+
+/// Analyze a range accessor: one argument of any range kind. `LOWER`/`UPPER` yield the element
+/// type of that kind; the rest yield `BOOL`. A bare string literal argument is coerced to the range
+/// type only when the call already fixes the kind, which it never does — so a literal must be cast
+/// (`'[1,10)'::int4range`), keeping `lower('[1,10)')` from silently meaning the text function.
+fn analyze_range_function(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let name = func.name();
+    let [a_expr] = args else {
+        return Err(Error::Unsupported(format!(
+            "{name}() expects 1 argument, got {}",
+            args.len()
+        )));
+    };
+    // A bare NULL carries no element kind, so `LOWER`/`UPPER` would have no result type to report.
+    // Catch it here — analyzing it first would raise the generic no-type-context error instead.
+    if is_bare_null(a_expr) {
+        return Err(Error::AmbiguousNull {
+            context: format!("{name}() range argument"),
+        });
+    }
+    let a = analyze_expr_agg(a_expr, scope, catalog, None, aggregates)?;
+    let ColumnType::Range(kind) = a.ty else {
+        return Err(Error::TypeMismatch {
+            context: format!("{name}() argument"),
+            expected: ColumnType::Range(nusadb_core::engine::RangeKind::Int),
+            found: a.ty,
+        });
+    };
+    Ok(range_accessor(func, a, kind))
+}
+
+/// Build the typed call for a range accessor whose argument is already analyzed to `kind`.
+/// `LOWER`/`UPPER` yield the element type; the predicates yield `BOOL`.
+fn range_accessor(
+    func: ast::ScalarFunc,
+    arg: TypedExpr,
+    kind: nusadb_core::engine::RangeKind,
+) -> TypedExpr {
+    use ast::ScalarFunc as F;
+    let ty = if matches!(func, F::RangeLower | F::RangeUpper) {
+        kind.element_type()
+    } else {
+        ColumnType::Bool
+    };
+    TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: vec![arg],
+        },
+        ty,
+    }
 }
 
 fn analyze_inet_function(
@@ -3368,6 +3480,17 @@ pub(super) fn analyze_binary(
         right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
         left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
     }
+    // `&&` over ranges has only a range/range form, so a bare string literal next to a range
+    // operand is unambiguous and coerces the same way. (`@>`/`<@` do not: a literal there could be
+    // the range or one element, so it stays a mismatch until cast.)
+    if op == ast::BinaryOp::ArrayOverlap {
+        if is_range_type(left_typed.ty) {
+            right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
+        }
+        if is_range_type(right_typed.ty) {
+            left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
+        }
+    }
     let ty = check_binary(op, left_typed.ty, right_typed.ty)?;
     Ok(TypedExpr {
         kind: TypedExprKind::Binary {
@@ -3507,6 +3630,13 @@ pub(super) fn check_binary(
         Op::Concat if is_bit_type(left) && is_bit_type(right) => Ok(ColumnType::VarBit(None)),
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             check_bitwise(op, left, right)
+        },
+        // Ranges: `&&` overlap and `@>`/`<@` containment, of a range or of a single element.
+        Op::ArrayOverlap if is_range_type(left) || is_range_type(right) => {
+            check_range_overlap(left, right)
+        },
+        Op::JsonContains | Op::JsonContainedBy if is_range_type(left) || is_range_type(right) => {
+            check_range_containment(op, left, right)
         },
         Op::ArrayOverlap => check_array_overlap(left, right),
         Op::Concat => check_concat(left, right),
@@ -4001,6 +4131,76 @@ pub(super) const fn is_inet_type(ty: ColumnType) -> bool {
 /// Whether `ty` is a bit-string type (`BIT` or `BIT VARYING`).
 pub(super) const fn is_bit_type(ty: ColumnType) -> bool {
     matches!(ty, ColumnType::Bit(_) | ColumnType::VarBit(_))
+}
+
+/// Whether `ty` is a range type.
+pub(super) const fn is_range_type(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Range(_))
+}
+
+/// Whether a value of `ty` can be the element of a range of `kind` — the element type itself, plus
+/// the widening a bound comparison already tolerates (an `INT` against a numeric range, and any
+/// declared precision/scale of `NUMERIC`).
+///
+/// The comparison is on the *physical* type, so `SMALLINT`/`BIGINT` count as the integer element
+/// they are stored as — `int8range` is a spelling of the same integer kind, and rejecting a
+/// `BIGINT` against it would be a hole in the surface, not a safety check.
+const fn is_range_element(ty: ColumnType, kind: nusadb_core::engine::RangeKind) -> bool {
+    use nusadb_core::engine::RangeKind;
+    let ty = ty.physical();
+    match kind {
+        RangeKind::Int => matches!(ty, ColumnType::Int),
+        RangeKind::Num => matches!(ty, ColumnType::Int | ColumnType::Numeric { .. }),
+        RangeKind::Date => matches!(ty, ColumnType::Date),
+        RangeKind::Ts => matches!(ty, ColumnType::Timestamp),
+        RangeKind::TsTz => matches!(ty, ColumnType::TimestampTz),
+    }
+}
+
+/// Type rule for range `&&` (overlap): both operands are ranges of the same element kind, and the
+/// result is `BOOL`. Unlike containment there is no element form — two ranges or nothing.
+fn check_range_overlap(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    match (left, right) {
+        (ColumnType::Range(a), ColumnType::Range(b)) if a == b => Ok(ColumnType::Bool),
+        _ => Err(Error::TypeMismatch {
+            context: "range overlap `&&`".to_owned(),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for range `@>` / `<@` (containment): the container is a range, and the contained side
+/// is either a range of the same element kind or a single element of it. The result is `BOOL`.
+///
+/// A bare `TEXT` operand is *not* accepted: `r @> '5'` could mean either form, so it is rejected
+/// rather than guessed — the cast (`r @> '5'::int` / `r @> '[1,5)'::int4range`) says which.
+fn check_range_containment(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    let (container, contained) = if op == ast::BinaryOp::JsonContains {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let ColumnType::Range(kind) = container else {
+        return Err(Error::TypeMismatch {
+            context: "range `@>`/`<@` container".to_owned(),
+            expected: contained,
+            found: container,
+        });
+    };
+    if contained == container || is_range_element(contained, kind) {
+        return Ok(ColumnType::Bool);
+    }
+    Err(Error::TypeMismatch {
+        context: "range `@>`/`<@` contained operand (a range of the same kind, or one element)"
+            .to_owned(),
+        expected: kind.element_type(),
+        found: contained,
+    })
 }
 
 /// Type rule for the integer bitwise operators `&` / `|`: both operands must be `INT` and the

@@ -709,6 +709,25 @@ pub enum ScalarFunc {
     BitGetBit,
     /// `SET_BIT(bits, n, v)` — `bits` with its `n`-th bit set to `v` (`0`/`1`), as the same bit type.
     BitSetBit,
+    /// `LOWER(range)` — the lower bound, as the element type; `NULL` when empty or unbounded below.
+    /// Spelled `lower`, like the text-folding [`Self::Lower`]; the analyzer picks between them by
+    /// argument type.
+    RangeLower,
+    /// `UPPER(range)` — the upper bound, as the element type; `NULL` when empty or unbounded above.
+    /// Spelled `upper`, like the text-folding [`Self::Upper`]; resolved the same way.
+    RangeUpper,
+    /// `ISEMPTY(range)` — whether the range contains no points, as `BOOL`.
+    RangeIsEmpty,
+    /// `LOWER_INC(range)` — whether the lower bound is inclusive, as `BOOL` (false when empty or
+    /// unbounded below).
+    RangeLowerInc,
+    /// `UPPER_INC(range)` — whether the upper bound is inclusive, as `BOOL` (false when empty or
+    /// unbounded above).
+    RangeUpperInc,
+    /// `LOWER_INF(range)` — whether the range is unbounded below, as `BOOL` (false when empty).
+    RangeLowerInf,
+    /// `UPPER_INF(range)` — whether the range is unbounded above, as `BOOL` (false when empty).
+    RangeUpperInf,
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
@@ -812,8 +831,10 @@ impl ScalarFunc {
             Self::OctetLength => "octet_length",
             Self::BitLength => "bit_length",
             Self::Grouping => "grouping",
-            Self::Upper => "upper",
-            Self::Lower => "lower",
+            // The range accessors share their spelling with the text-folding pair; the analyzer
+            // tells them apart by argument type, and both render back to the same name.
+            Self::Upper | Self::RangeUpper => "upper",
+            Self::Lower | Self::RangeLower => "lower",
             Self::Substring => "substring",
             Self::Replace => "replace",
             Self::Position => "position",
@@ -951,6 +972,11 @@ impl ScalarFunc {
             Self::InetSetMasklen => "set_masklen",
             Self::BitGetBit => "get_bit",
             Self::BitSetBit => "set_bit",
+            Self::RangeIsEmpty => "isempty",
+            Self::RangeLowerInc => "lower_inc",
+            Self::RangeUpperInc => "upper_inc",
+            Self::RangeLowerInf => "lower_inf",
+            Self::RangeUpperInf => "upper_inf",
             Self::UuidGenerateV4 => "uuid_generate_v4",
             Self::Version => "version",
             Self::NusaTypeof => "nusa_typeof",

@@ -1231,6 +1231,13 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "set_masklen" => F::InetSetMasklen,
         "get_bit" => F::BitGetBit,
         "set_bit" => F::BitSetBit,
+        // Range accessors. `lower`/`upper` are not here: they share their spelling with the
+        // text-folding functions, so the analyzer resolves them by argument type.
+        "isempty" => F::RangeIsEmpty,
+        "lower_inc" => F::RangeLowerInc,
+        "upper_inc" => F::RangeUpperInc,
+        "lower_inf" => F::RangeLowerInf,
+        "upper_inf" => F::RangeUpperInf,
         // UUID generation: both the modern built-in name and the alternative spelling.
         "gen_random_uuid" | "uuid_generate_v4" => F::UuidGenerateV4,
         // System functions.

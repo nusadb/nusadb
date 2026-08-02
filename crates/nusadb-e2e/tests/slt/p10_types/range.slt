@@ -94,3 +94,207 @@ SELECT count(*) FROM nrng GROUP BY nr
 ----
 1
 2
+
+# ---------------------------------------------------------------------------
+# Containment `@>` / `<@` and overlap `&&`.
+# ---------------------------------------------------------------------------
+
+# `@>` against a single element: the half-open [1,10) holds 1 and 9, not 10 or 0.
+query IIII
+SELECT '[1,10)'::int4range @> 1, '[1,10)'::int4range @> 9,
+       '[1,10)'::int4range @> 10, '[1,10)'::int4range @> 0
+----
+1 1 0 0
+
+# `<@` is the mirror, with the element on the left.
+query II
+SELECT 5 <@ '[1,10)'::int4range, 10 <@ '[1,10)'::int4range
+----
+1 0
+
+# Range-in-range containment, including the bound-touching cases.
+query IIII
+SELECT '[1,10)'::int4range @> '[2,5)'::int4range, '[1,10)'::int4range @> '[1,10)'::int4range,
+       '[1,10)'::int4range @> '[1,11)'::int4range, '[1,10)'::int4range @> '[0,5)'::int4range
+----
+1 1 0 0
+
+# The empty range is contained by every range and contains only itself.
+query III
+SELECT '[1,10)'::int4range @> 'empty'::int4range, 'empty'::int4range @> '[1,10)'::int4range,
+       'empty'::int4range @> 'empty'::int4range
+----
+1 0 1
+
+# An unbounded side covers everything on that side.
+query III
+SELECT '(,)'::int4range @> '[1,10)'::int4range, '[1,)'::int4range @> '[5,)'::int4range,
+       '[1,)'::int4range @> '(,5)'::int4range
+----
+1 1 0
+
+# Overlap: adjacent ranges do not overlap, and the empty range overlaps nothing.
+query IIII
+SELECT '[1,10)'::int4range && '[5,20)'::int4range, '[1,10)'::int4range && '[10,20)'::int4range,
+       '[1,10)'::int4range && 'empty'::int4range, '(,)'::int4range && '[1,10)'::int4range
+----
+1 0 0 1
+
+# A continuous range keeps its inclusivity, so a shared exclusive endpoint is not an overlap.
+query II
+SELECT '(1.5,3.5]'::numrange && '[3.5,9.0)'::numrange,
+       '(1.5,3.5)'::numrange && '[3.5,9.0)'::numrange
+----
+1 0
+
+# The bound-touching containment cases a discrete range cannot express.
+query II
+SELECT '(1.0,3.0]'::numrange @> '(1.0,3.0)'::numrange,
+       '(1.0,3.0)'::numrange @> '(1.0,3.0]'::numrange
+----
+1 0
+
+# A NULL operand yields NULL, not false.
+query III
+SELECT NULL::int4range @> 5, '[1,10)'::int4range @> NULL::int4range,
+       NULL::int4range && '[1,10)'::int4range
+----
+NULL NULL NULL
+
+# Against a stored column, and as a WHERE predicate over the earlier table.
+query I rowsort
+SELECT id FROM r WHERE ir @> 5
+----
+1
+2
+
+query I
+SELECT id FROM r WHERE dr && '[2020-01-15,2020-03-01)'
+----
+1
+
+# A bare string literal beside `&&` is unambiguous (the operator has only a range/range form) and
+# coerces to the column's range type. Only row 2 matches: its stored [1,10] canonicalized to
+# [1,11), which reaches 10; row 1's [1,10) stops short of it.
+query I
+SELECT id FROM r WHERE ir && '[10,20)'
+----
+2
+
+# The same coercion with the literal on the left.
+query I
+SELECT id FROM r WHERE '[10,20)' && ir
+----
+2
+
+# int8range is the same integer element kind, so a BIGINT element is accepted against it.
+query II
+SELECT '[1,20000000000)'::int8range @> 15000000000, '[1,20000000000)'::int8range @> 0
+----
+1 0
+
+# An integer element against a numeric range is compared exactly, not through a float.
+query II
+SELECT '[1.5,10.5)'::numrange @> 2, '[1.5,10.5)'::numrange @> 11
+----
+1 0
+
+# `@>` with a bare literal could mean the range or one element, so it is rejected rather than
+# guessed — the cast says which.
+statement error
+SELECT id FROM r WHERE ir @> '5'
+
+# Mixing element kinds is a type error, not a silently-false answer.
+statement error
+SELECT '[1,10)'::int4range && '[1.5,3.5)'::numrange
+
+# ---------------------------------------------------------------------------
+# Accessors: lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
+# ---------------------------------------------------------------------------
+
+# The bounds come back as the element type, after canonicalization ([1,10] is [1,11)).
+query II
+SELECT lower('[1,10]'::int4range), upper('[1,10]'::int4range)
+----
+1  11
+
+# A numeric range keeps its bounds verbatim, so the accessors report them unchanged.
+query TT
+SELECT lower('(1.5,3.5]'::numrange), upper('(1.5,3.5]'::numrange)
+----
+1.5  3.5
+
+# An unbounded side has no bound value, so it reads back as NULL — on either end.
+query IIII
+SELECT lower('(,10)'::int4range), upper('(,10)'::int4range),
+       lower('[1,)'::int4range), upper('[1,)'::int4range)
+----
+NULL 10 1 NULL
+
+# The empty range has neither bound.
+query II
+SELECT lower('empty'::int4range), upper('empty'::int4range)
+----
+NULL NULL
+
+# isempty distinguishes the empty range from one that merely has no bounds.
+query II
+SELECT isempty('empty'::int4range), isempty('(,)'::int4range)
+----
+1 0
+
+# Inclusivity: a discrete range is always [lower,upper), a continuous one keeps what it was given.
+query IIII
+SELECT lower_inc('[1,10)'::int4range), upper_inc('[1,10)'::int4range),
+       lower_inc('(1.5,3.5]'::numrange), upper_inc('(1.5,3.5]'::numrange)
+----
+1 0 0 1
+
+# An infinite bound is never inclusive, and the empty range reports false for every flag.
+query IIII
+SELECT lower_inc('(,10)'::int4range), upper_inc('[1,)'::int4range),
+       lower_inc('empty'::int4range), upper_inc('empty'::int4range)
+----
+0 0 0 0
+
+# The `_inf` predicates say which side is unbounded — and report false for the empty range, which
+# is why they are needed to read a NULL from lower()/upper().
+query IIII
+SELECT lower_inf('(,10)'::int4range), upper_inf('(,10)'::int4range),
+       lower_inf('empty'::int4range), upper_inf('empty'::int4range)
+----
+1 0 0 0
+
+# NULL in, NULL out.
+query II
+SELECT lower(NULL::int4range), isempty(NULL::int4range)
+----
+NULL NULL
+
+# `lower`/`upper` keep their text meaning when the argument is not a range.
+query TT
+SELECT lower('ABC'), upper('abc')
+----
+abc  ABC
+
+# The overload is decided by the argument's type, so it also works over an aggregate — and the
+# aggregate is registered exactly once (a double registration would double-count the rows).
+query II
+SELECT lower(max(ir)), count(*) FROM r
+----
+1  2
+
+query T
+SELECT lower(max(name)) FROM (SELECT 'ZED' AS name UNION ALL SELECT 'ABE') s
+----
+zed
+
+# The accessors over a stored column, with the date element type coming back as a DATE.
+query IT
+SELECT id, lower(dr) FROM r WHERE id = 1
+----
+1  2020-01-01
+
+# A non-range argument to a range-only accessor is a type error.
+statement error
+SELECT isempty('abc')
