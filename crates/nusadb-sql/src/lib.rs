@@ -14,6 +14,7 @@
 pub mod analyzer;
 pub mod ast;
 pub mod batch;
+pub mod bit;
 pub mod cancel;
 pub mod copy;
 pub mod display;

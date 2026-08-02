@@ -101,9 +101,10 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         | ast::Value::Interval(_)
         | ast::Value::Array(_)
         | ast::Value::Vector(_)
-        | ast::Value::Inet(_) => {
+        | ast::Value::Inet(_)
+        | ast::Value::Bit(_) => {
             return Err(Error::Unsupported(
-                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR columns cannot yet be index keys"
+                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT columns cannot yet be index keys"
                     .to_owned(),
             ));
         },

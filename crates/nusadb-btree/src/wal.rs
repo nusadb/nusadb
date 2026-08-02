@@ -781,6 +781,20 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
         ColumnType::Macaddr => out.push(22),
         ColumnType::Inet => out.push(23),
         ColumnType::Cidr => out.push(24),
+        ColumnType::Bit(n) => {
+            out.push(25);
+            out.extend_from_slice(&n.to_le_bytes());
+        },
+        ColumnType::VarBit(opt) => {
+            out.push(26);
+            match opt {
+                Some(n) => {
+                    out.push(1);
+                    out.extend_from_slice(&n.to_le_bytes());
+                },
+                None => out.push(0),
+            }
+        },
     }
 }
 
@@ -827,6 +841,16 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
         22 => ColumnType::Macaddr,
         23 => ColumnType::Inet,
         24 => ColumnType::Cidr,
+        25 => ColumnType::Bit(read_u32(at)?),
+        26 => {
+            let present = *bytes.get(*at)?;
+            *at += 1;
+            ColumnType::VarBit(if present == 1 {
+                Some(read_u32(at)?)
+            } else {
+                None
+            })
+        },
         _ => return None,
     })
 }

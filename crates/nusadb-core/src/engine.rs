@@ -163,6 +163,10 @@ pub enum ColumnType {
     /// IPv4/IPv6 network specification (`CIDR`) — like `INET` but host bits below the mask must be
     /// zero. Shares the runtime value representation with `INET` (distinguished by a flag).
     Cidr,
+    /// Fixed-length bit string `BIT(n)` — every value has exactly `n` bits.
+    Bit(u32),
+    /// Variable-length bit string `BIT VARYING(n)` — at most `n` bits, or unbounded when `None`.
+    VarBit(Option<u32>),
     /// Exact decimal (`NUMERIC` / `DECIMAL`) with a declared precision + scale. A
     /// `precision` of `0` means unconstrained (`NUMERIC` with no arguments); `scale` is the number
     /// of fractional digits.
@@ -297,6 +301,8 @@ impl ArrayElem {
             | ColumnType::Macaddr
             | ColumnType::Inet
             | ColumnType::Cidr
+            | ColumnType::Bit(_)
+            | ColumnType::VarBit(_)
             | ColumnType::Array(_)
             | ColumnType::Vector(_) => None,
         }

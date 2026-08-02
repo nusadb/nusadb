@@ -1,0 +1,78 @@
+# p10_types/bit — BIT(n) and BIT VARYING(n) bit strings.
+# Covers: catalog types, implicit string coercion, canonical display, exact-length BIT(n) vs
+# at-most-length BIT VARYING(n) enforcement, the ::bit(n) cast (which pads/truncates), ordering
+# (left to right, then shorter first), equality, and loud rejection of a wrong-length assignment.
+
+statement ok
+CREATE TABLE b (id INT NOT NULL, f BIT(4), v BIT VARYING(8))
+
+statement ok
+INSERT INTO b VALUES (1, '1011', '101')
+
+statement ok
+INSERT INTO b VALUES (2, '0000', '11110000')
+
+statement ok
+INSERT INTO b VALUES (3, '1111', '1')
+
+# An empty bit-varying value is allowed (checked as a statement, not compared as a row value).
+statement ok
+INSERT INTO b VALUES (4, '0101', '')
+
+query ITT rowsort
+SELECT id, f, v FROM b WHERE id <= 3
+----
+1  1011  101
+2  0000  11110000
+3  1111  1
+
+# The ::bit(n) cast right-pads with zeros when shorter and truncates when longer.
+query T
+SELECT CAST('101' AS BIT(5))
+----
+10100
+
+query T
+SELECT CAST('10100' AS BIT(3))
+----
+101
+
+# BIT VARYING keeps its own length.
+query T
+SELECT CAST('1011' AS BIT VARYING(8))
+----
+1011
+
+# Ordering: left to right, then a shorter string first on a common prefix.
+statement ok
+CREATE TABLE ord (x BIT VARYING(8))
+
+statement ok
+INSERT INTO ord VALUES ('10'), ('11'), ('100'), ('1'), ('0')
+
+query T
+SELECT x FROM ord ORDER BY x
+----
+0
+1
+10
+100
+11
+
+# Equality against a text literal (coerced to the column's bit type).
+query I
+SELECT id FROM b WHERE f = '1011'
+----
+1
+
+# A wrong-length value for a fixed BIT(4) is rejected (not silently padded).
+statement error
+INSERT INTO b VALUES (9, '101', '1')
+
+# A non-binary character is rejected.
+statement error
+INSERT INTO b VALUES (10, '10x1', '1')
+
+# A BIT VARYING value longer than its declared maximum is rejected.
+statement error
+INSERT INTO b VALUES (11, '1111', '111100001')

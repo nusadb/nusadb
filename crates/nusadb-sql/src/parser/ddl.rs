@@ -412,14 +412,11 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         // Bit strings, full-text, and geometric types are also stored as their canonical text form
         // (no native operators yet) — the same mapping their 0.51 `Custom`-typed spellings got from
         // `aliased_type` below; sqlparser 0.62 models them as first-class data types.
-        D::Text
-        | D::String(_)
-        | D::Bit(_)
-        | D::BitVarying(_)
-        | D::VarBit(_)
-        | D::TsVector
-        | D::TsQuery
-        | D::GeometricType(_) => ColumnType::Text,
+        D::Text | D::String(_) | D::TsVector | D::TsQuery | D::GeometricType(_) => ColumnType::Text,
+        // `BIT(n)` — a fixed-length bit string; a bare `BIT` is `BIT(1)` (the reference-engine default).
+        D::Bit(n) => ColumnType::Bit(n.map_or(1, clamp_len)),
+        // `BIT VARYING(n)` / `VARBIT(n)` — a variable-length bit string, unbounded when `n` is omitted.
+        D::BitVarying(n) | D::VarBit(n) => ColumnType::VarBit(n.map(clamp_len)),
         D::Varchar(_) | D::CharVarying(_) | D::CharacterVarying(_) | D::Nvarchar(_) => {
             char_length_limit(ty).map_or(ColumnType::Text, |n| ColumnType::VarChar(clamp_len(n)))
         },
@@ -495,9 +492,9 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         // Stored as their canonical text form (no native operators yet): bit strings, geometric,
         // range, full-text, and XML types. (`macaddr`/`inet`/`cidr` are now native types, handled
         // before this fallback.)
-        "xml" | "macaddr8" | "bit" | "varbit" | "tsvector" | "tsquery" | "point" | "line"
-        | "lseg" | "box" | "path" | "polygon" | "circle" | "int4range" | "int8range"
-        | "numrange" | "tsrange" | "tstzrange" | "daterange" => ColumnType::Text,
+        "xml" | "macaddr8" | "tsvector" | "tsquery" | "point" | "line" | "lseg" | "box"
+        | "path" | "polygon" | "circle" | "int4range" | "int8range" | "numrange" | "tsrange"
+        | "tstzrange" | "daterange" => ColumnType::Text,
         _ => return None,
     })
 }

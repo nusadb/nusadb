@@ -2860,6 +2860,21 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Inet(a), ColumnType::Inet) => Ok(ast::Value::Inet(a.to_inet())),
         (ast::Value::Inet(a), ColumnType::Cidr) => Ok(ast::Value::Inet(a.to_cidr())),
         (ast::Value::Inet(a), ColumnType::Text) => Ok(ast::Value::Text(a.format_cast_text())),
+        // BIT casts pad/truncate (an explicit cast, unlike an assignment, adjusts the length).
+        (ast::Value::Text(s), ColumnType::Bit(n)) => crate::bit::parse(s)
+            .map(|b| ast::Value::Bit(crate::bit::fit(&b, n as usize)))
+            .ok_or_else(|| invalid_cast(s, ColumnType::Bit(n))),
+        (ast::Value::Text(s), ColumnType::VarBit(max)) => crate::bit::parse(s)
+            .map(|b| ast::Value::Bit(crate::bit::truncate(&b, max.map(|n| n as usize))))
+            .ok_or_else(|| invalid_cast(s, ColumnType::VarBit(max))),
+        (ast::Value::Bit(b), ColumnType::Bit(n)) => {
+            Ok(ast::Value::Bit(crate::bit::fit(b, n as usize)))
+        },
+        (ast::Value::Bit(b), ColumnType::VarBit(max)) => Ok(ast::Value::Bit(crate::bit::truncate(
+            b,
+            max.map(|n| n as usize),
+        ))),
+        (ast::Value::Bit(b), ColumnType::Text) => Ok(ast::Value::Text(crate::bit::format(b))),
         // Render temporal + UUID back to their canonical text form.
         (ast::Value::Date(d), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::temporal::format_date(*d)))
@@ -3268,6 +3283,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Inet(a) => a.column_type(),
+        ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,
@@ -3600,6 +3616,8 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         // INET/CIDR use the network comparison (family, masked prefix, mask, full address) — not a
         // plain byte order, so it cannot be an index key.
         (ast::Value::Inet(a), ast::Value::Inet(b)) => a.network_cmp(b),
+        // BIT strings compare left to right, then the shorter first — the natural `Vec<bool>` order.
+        (ast::Value::Bit(a), ast::Value::Bit(b)) => a.cmp(b),
         // BYTEA orders lexicographically by raw byte.
         (ast::Value::Bytes(a), ast::Value::Bytes(b)) => a.cmp(b),
         (Interval(a), Interval(b)) => a.compare(b),
@@ -3684,6 +3702,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Bytes(_) => 16,
         ast::Value::Macaddr(_) => 17,
         ast::Value::Inet(_) => 18,
+        ast::Value::Bit(_) => 19,
     }
 }
 

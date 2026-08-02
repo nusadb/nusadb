@@ -1271,6 +1271,8 @@ pub enum Value {
     Macaddr([u8; 6]),
     /// IPv4/IPv6 address for `INET` or `CIDR` — the `is_cidr` flag inside distinguishes the two.
     Inet(crate::inet::InetAddr),
+    /// A `BIT`/`BIT VARYING` bit string — index 0 is the leftmost bit.
+    Bit(Vec<bool>),
     /// Exact decimal (`NUMERIC` / `DECIMAL`) value.
     Numeric(crate::numeric::Decimal),
     /// JSON / JSONB document as canonical text.

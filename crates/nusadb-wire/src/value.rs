@@ -71,6 +71,8 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
         // INET/CIDR: the self-describing `[flags, masklen, octets]` encoding (the tag tells the
         // client it is a network address).
         Value::Inet(a) => a.encode(),
+        // BIT/BIT VARYING: the self-describing `[len, packed bytes]` encoding.
+        Value::Bit(b) => nusadb_sql::bit::encode(b),
         Value::Interval(iv) => {
             let mut buf = Vec::with_capacity(16);
             buf.extend_from_slice(&iv.months.to_be_bytes());

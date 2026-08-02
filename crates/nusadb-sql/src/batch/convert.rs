@@ -191,9 +191,12 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
         // VECTOR, MACADDR, and INET/CIDR have no Arrow representation in this columnar path —
         // `build_column` refuses to materialize them — so they are handled only on the row path and
         // only ever reach the null case here.
-        ColumnType::Vector(_) | ColumnType::Macaddr | ColumnType::Inet | ColumnType::Cidr => {
-            ast::Value::Null
-        },
+        ColumnType::Vector(_)
+        | ColumnType::Macaddr
+        | ColumnType::Inet
+        | ColumnType::Cidr
+        | ColumnType::Bit(_)
+        | ColumnType::VarBit(_) => ast::Value::Null,
         ColumnType::Array(_) => {
             let Some(list) = any.downcast_ref::<ListArray>() else {
                 return ast::Value::Null;
@@ -324,9 +327,12 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
         // VECTOR, MACADDR, and INET/CIDR have no Arrow array yet; refuse loudly rather than silently
         // dropping a value if the (dormant) columnar path is ever wired over one — the row path is
         // authoritative.
-        ColumnType::Vector(_) | ColumnType::Macaddr | ColumnType::Inet | ColumnType::Cidr => {
-            return Err(unsupported_batch_type(ty));
-        },
+        ColumnType::Vector(_)
+        | ColumnType::Macaddr
+        | ColumnType::Inet
+        | ColumnType::Cidr
+        | ColumnType::Bit(_)
+        | ColumnType::VarBit(_) => return Err(unsupported_batch_type(ty)),
     };
     Ok(array)
 }
@@ -338,6 +344,8 @@ fn unsupported_batch_type(ty: ColumnType) -> Error {
         ColumnType::Macaddr => "MACADDR",
         ColumnType::Inet => "INET",
         ColumnType::Cidr => "CIDR",
+        ColumnType::Bit(_) => "BIT",
+        ColumnType::VarBit(_) => "BIT VARYING",
         _ => "VECTOR",
     };
     Error::Unsupported(format!(

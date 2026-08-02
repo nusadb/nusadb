@@ -59,6 +59,11 @@ pub(super) fn convert_typed_literal(
         ColumnType::Macaddr => crate::macaddr::parse(&value).map(ast::Value::Macaddr),
         ColumnType::Inet => crate::inet::parse_inet(&value).map(ast::Value::Inet),
         ColumnType::Cidr => crate::inet::parse_cidr(&value).map(ast::Value::Inet),
+        ColumnType::Bit(n) => {
+            crate::bit::parse(&value).map(|b| ast::Value::Bit(crate::bit::fit(&b, n as usize)))
+        },
+        ColumnType::VarBit(max) => crate::bit::parse(&value)
+            .map(|b| ast::Value::Bit(crate::bit::truncate(&b, max.map(|n| n as usize)))),
         // `NUMERIC '…'` / `DECIMAL '…'` parse exactly.
         ColumnType::Numeric { .. } => {
             crate::numeric::Decimal::parse(&value).map(ast::Value::Numeric)

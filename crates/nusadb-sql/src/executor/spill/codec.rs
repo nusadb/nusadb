@@ -51,6 +51,7 @@ const TAG_VECTOR: u8 = 15;
 const TAG_BYTES: u8 = 16;
 const TAG_MACADDR: u8 = 17;
 const TAG_INET: u8 = 18;
+const TAG_BIT: u8 = 19;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -116,6 +117,10 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             out.push(TAG_INET);
             out.extend_from_slice(&a.encode());
         },
+        ast::Value::Bit(b) => {
+            out.push(TAG_BIT);
+            out.extend_from_slice(&crate::bit::encode(b));
+        },
         ast::Value::Numeric(d) => {
             out.push(TAG_NUMERIC);
             out.extend_from_slice(&d.mantissa.to_le_bytes());
@@ -175,6 +180,13 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
                 masklen,
                 is_cidr: flags & 1 != 0,
             })
+        },
+        TAG_BIT => {
+            let len = u32::from_le_bytes(c.arr::<4>()?) as usize;
+            let data = c.take(crate::bit::packed_len(len))?;
+            ast::Value::Bit(
+                crate::bit::unpack(len, data).ok_or(Error::MalformedTuple { offset: 0 })?,
+            )
         },
         TAG_NUMERIC => ast::Value::Numeric(Decimal {
             mantissa: i128::from_le_bytes(c.arr::<16>()?),

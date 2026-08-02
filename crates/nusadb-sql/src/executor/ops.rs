@@ -312,6 +312,7 @@ pub(super) const fn is_hash_safe_value(value: &ast::Value) -> bool {
             | ast::Value::Uuid(_)
             | ast::Value::Macaddr(_)
             | ast::Value::Inet(_)
+            | ast::Value::Bit(_)
     )
 }
 
@@ -339,7 +340,9 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         | T::Uuid
         | T::Macaddr
         | T::Inet
-        | T::Cidr => true,
+        | T::Cidr
+        | T::Bit(_)
+        | T::VarBit(_) => true,
         T::Float
         | T::Real
         | T::Numeric { .. }
@@ -3178,6 +3181,8 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Macaddr => "macaddr",
         ColumnType::Inet => "inet",
         ColumnType::Cidr => "cidr",
+        ColumnType::Bit(_) => "bit",
+        ColumnType::VarBit(_) => "bit varying",
         ColumnType::Numeric { .. } => "numeric",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",

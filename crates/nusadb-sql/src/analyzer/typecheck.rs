@@ -105,6 +105,8 @@ pub(super) const fn is_temporal_or_uuid(ty: ColumnType) -> bool {
             | ColumnType::Macaddr
             | ColumnType::Inet
             | ColumnType::Cidr
+            | ColumnType::Bit(_)
+            | ColumnType::VarBit(_)
     )
 }
 

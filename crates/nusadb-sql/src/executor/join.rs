@@ -753,6 +753,7 @@ pub(crate) enum KeyAtom {
     Uuid([u8; 16]),
     Macaddr([u8; 6]),
     Inet(crate::inet::InetAddr),
+    Bit(Vec<bool>),
     /// `(mantissa, scale)` of the **trimmed** exact decimal: `1.0` and `1.00` compare equal, so
     /// they must hash together — the same canonical-decimal rule `distinct_hash` uses. Also
     /// produced for an `Int` value under a NUMERIC-typed key expression (a mixed CASE/COALESCE
@@ -806,6 +807,7 @@ pub(super) fn key_atoms(
             ast::Value::Uuid(u) => atoms.push(KeyAtom::Uuid(u)),
             ast::Value::Macaddr(m) => atoms.push(KeyAtom::Macaddr(m)),
             ast::Value::Inet(a) => atoms.push(KeyAtom::Inet(a)),
+            ast::Value::Bit(b) => atoms.push(KeyAtom::Bit(b)),
             // A Numeric value under a non-NUMERIC declared type (defensive — coercions normally
             // keep the families apart; canonicalizing keeps the hash compare-compatible anyway).
             ast::Value::Numeric(d) => atoms.push(decimal_atom(d)),

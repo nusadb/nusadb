@@ -232,6 +232,15 @@ impl<'s, S: PageStore> Catalog<'s, S> {
                     ColumnType::VarChar(n) | ColumnType::Char(n) => {
                         buf.extend_from_slice(&n.to_le_bytes());
                     },
+                    // BIT(n) carries its length; BIT VARYING carries a present-flag then the length.
+                    ColumnType::Bit(n) => buf.extend_from_slice(&n.to_le_bytes()),
+                    ColumnType::VarBit(opt) => match opt {
+                        Some(n) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&n.to_le_bytes());
+                        },
+                        None => buf.push(0),
+                    },
                     _ => {},
                 }
                 buf.push(u8::from(c.nullable));
@@ -271,6 +280,16 @@ impl<'s, S: PageStore> Catalog<'s, S> {
                 } else if tag == 17 {
                     // CHAR (tag 17) stores its declared length as a u32.
                     ColumnType::Char(rd_u32(blob, &mut cur)?)
+                } else if tag == 25 {
+                    // BIT (tag 25) stores its length as a u32.
+                    ColumnType::Bit(rd_u32(blob, &mut cur)?)
+                } else if tag == 26 {
+                    // BIT VARYING (tag 26) stores a present-flag then, if set, the max length.
+                    ColumnType::VarBit(if rd_u8(blob, &mut cur)? == 1 {
+                        Some(rd_u32(blob, &mut cur)?)
+                    } else {
+                        None
+                    })
                 } else {
                     u8_to_coltype(tag)?
                 };
@@ -378,6 +397,9 @@ const fn coltype_to_u8(t: ColumnType) -> u8 {
         ColumnType::Macaddr => 22,
         ColumnType::Inet => 23,
         ColumnType::Cidr => 24,
+        // Tags 25/26; the declared length is serialized separately.
+        ColumnType::Bit(_) => 25,
+        ColumnType::VarBit(_) => 26,
     }
 }
 fn u8_to_coltype(b: u8) -> Result<ColumnType> {

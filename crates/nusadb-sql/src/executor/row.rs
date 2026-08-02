@@ -225,6 +225,19 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Inet(a), ColumnType::Inet | ColumnType::Cidr) => {
             out.extend_from_slice(&a.encode());
         },
+        // BIT(n) requires exactly n bits; BIT VARYING(n) at most n (unbounded when None).
+        (ast::Value::Bit(b), ColumnType::Bit(n)) => {
+            if b.len() != n as usize {
+                return Err(invalid(ty, &crate::bit::format(b)));
+            }
+            out.extend_from_slice(&crate::bit::encode(b));
+        },
+        (ast::Value::Bit(b), ColumnType::VarBit(max)) => {
+            if max.is_some_and(|n| b.len() > n as usize) {
+                return Err(invalid(ty, &crate::bit::format(b)));
+            }
+            out.extend_from_slice(&crate::bit::encode(b));
+        },
         // Implicit string coercion ("unknown literal" rule): a text value assigned to a
         // temporal/UUID column is parsed into the column's type at encode time.
         (ast::Value::Text(s), ColumnType::Date) => {
@@ -262,6 +275,20 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Text(s), ColumnType::Cidr) => {
             let v = crate::inet::parse_cidr(s).ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&v.encode());
+        },
+        (ast::Value::Text(s), ColumnType::Bit(n)) => {
+            let bits = crate::bit::parse(s).ok_or_else(|| invalid(ty, s))?;
+            if bits.len() != n as usize {
+                return Err(invalid(ty, s));
+            }
+            out.extend_from_slice(&crate::bit::encode(&bits));
+        },
+        (ast::Value::Text(s), ColumnType::VarBit(max)) => {
+            let bits = crate::bit::parse(s).ok_or_else(|| invalid(ty, s))?;
+            if max.is_some_and(|n| bits.len() > n as usize) {
+                return Err(invalid(ty, s));
+            }
+            out.extend_from_slice(&crate::bit::encode(&bits));
         },
         // NUMERIC: the value (or a coercible Int/Float/Text) rescaled to the column's
         // declared scale, precision-checked, then mantissa(16) + scale(1).
@@ -619,6 +646,12 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
                 .ok_or(Error::MalformedTuple { offset: pos })?;
             Ok((ast::Value::Inet(v), pos + n))
         },
+        // BIT/BIT VARYING are self-describing: a u32 bit-count then the packed bytes.
+        ColumnType::Bit(_) | ColumnType::VarBit(_) => {
+            let (bits, new_pos) =
+                crate::bit::decode(bytes, pos).ok_or(Error::MalformedTuple { offset: pos })?;
+            Ok((ast::Value::Bit(bits), new_pos))
+        },
         // JSON: length-prefixed canonical text.
         // JSONB decodes identically to JSON (stored as the same canonical text).
         ColumnType::Json | ColumnType::Jsonb => {
@@ -755,6 +788,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Inet(a) => a.column_type(),
+        ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,
