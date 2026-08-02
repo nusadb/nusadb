@@ -410,6 +410,11 @@ fn eval_scalar_function(
         // than propagating them, so they skip the NULL-strict collection below.
         F::NumNonNulls => return eval_num_nulls(args, row, false),
         F::NumNulls => return eval_num_nulls(args, row, true),
+        // A range constructor reads a NULL bound as "unbounded on that side", so it must see its
+        // arguments rather than propagate the first NULL away.
+        F::Int4Range | F::Int8Range | F::NumRange | F::DateRange | F::TsRange | F::TsTzRange => {
+            return eval_range_constructor(func, args, row);
+        },
         _ => {},
     }
     let mut vals = Vec::with_capacity(args.len());
@@ -1561,6 +1566,102 @@ fn text_output(value: ast::Value) -> Result<String, Error> {
             )),
         },
     }
+}
+
+/// `INT4RANGE(lo, hi [, bounds])` and its siblings — build a range from two bounds.
+///
+/// A `NULL` bound means unbounded on that side, so this does not propagate NULL the way a strict
+/// function would. `bounds` selects the inclusivity (`'[)'` by default); it must be one of the four
+/// bracket pairs and, unlike the bounds themselves, may not be `NULL` — there would be no default to
+/// fall back to that the caller did not already get by omitting it.
+fn eval_range_constructor(
+    func: ast::ScalarFunc,
+    args: &[TypedExpr],
+    row: &Row,
+) -> Result<ast::Value, Error> {
+    let name = func.name();
+    let kind = func
+        .range_kind()
+        .ok_or_else(|| Error::Unsupported(format!("{name}() is not a range constructor")))?;
+    let [lo_expr, hi_expr, rest @ ..] = args else {
+        return Err(Error::Unsupported(format!(
+            "{name}() expects 2..=3 argument(s), got {}",
+            args.len()
+        )));
+    };
+    let bound = |e: &TypedExpr| -> Result<Option<ast::Value>, Error> {
+        Ok(match eval(e, row)? {
+            ast::Value::Null => None,
+            v => Some(range_element(v, kind, name)?),
+        })
+    };
+    let lower = bound(lo_expr)?;
+    let upper = bound(hi_expr)?;
+    let (lower_inc, upper_inc) = match rest.first() {
+        None => (true, false), // the default `[)`
+        Some(e) => match eval(e, row)? {
+            ast::Value::Text(s) => match s.as_str() {
+                "[)" => (true, false),
+                "(]" => (false, true),
+                "[]" => (true, true),
+                "()" => (false, false),
+                other => {
+                    return Err(Error::Coded {
+                        message: format!("invalid range bound flags for {name}(): {other}"),
+                        sqlstate: "22P02",
+                    });
+                },
+            },
+            ast::Value::Null => {
+                return Err(Error::Coded {
+                    message: format!("{name}() bound flags must not be null"),
+                    sqlstate: "22004",
+                });
+            },
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "{name}() bound flags must be text, got {other:?}"
+                )));
+            },
+        },
+    };
+    let r =
+        crate::range::RangeVal::new(kind, lower, upper, lower_inc, upper_inc).ok_or_else(|| {
+            Error::Coded {
+                message: format!(
+                    "{name}() lower bound must be less than or equal to the upper bound"
+                ),
+                sqlstate: "22000",
+            }
+        })?;
+    Ok(ast::Value::Range(Box::new(r)))
+}
+
+/// Convert an evaluated bound to the value variant `kind` encodes. The analyzer already restricted
+/// the argument to the element type or a widening of it, so only that widening is applied here.
+fn range_element(
+    v: ast::Value,
+    kind: nusadb_core::engine::RangeKind,
+    name: &str,
+) -> Result<ast::Value, Error> {
+    use nusadb_core::engine::RangeKind;
+    Ok(match (v, kind) {
+        // An INT bound of a numeric range widens exactly, the way `compare` already treats it.
+        (ast::Value::Int(i), RangeKind::Num) => {
+            ast::Value::Numeric(crate::numeric::Decimal::from_i64(i))
+        },
+        (v @ ast::Value::Int(_), RangeKind::Int)
+        | (v @ ast::Value::Numeric(_), RangeKind::Num)
+        | (v @ ast::Value::Date(_), RangeKind::Date)
+        | (v @ ast::Value::Timestamp(_), RangeKind::Ts)
+        | (v @ ast::Value::TimestampTz(_), RangeKind::TsTz) => v,
+        (other, _) => {
+            return Err(Error::Unsupported(format!(
+                "{name}() bound is not a {} element: {other:?}",
+                kind.name()
+            )));
+        },
+    })
 }
 
 /// `NUM_NONNULLS(...)` / `NUM_NULLS(...)` — count the arguments that are (`count_nulls`) or are not

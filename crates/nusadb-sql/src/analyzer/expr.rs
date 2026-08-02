@@ -1138,6 +1138,11 @@ pub(super) fn analyze_scalar_function(
     ) {
         return analyze_range_function(func, args, scope, catalog, aggregates);
     }
+    // The range constructors take two element-typed bounds plus an optional bound-flags string, and
+    // their result type is the range they name — neither fits the fixed table.
+    if let Some(kind) = func.range_kind() {
+        return analyze_range_constructor(func, kind, args, scope, catalog, aggregates);
+    }
     // `lower`/`upper` are overloaded: over a range they yield a bound, over text they fold case.
     // The argument decides, so it is analyzed once here and handed to whichever form wins —
     // re-analyzing to pick would double the work per call and square it for every nested one.
@@ -1453,6 +1458,12 @@ pub(super) fn analyze_scalar_function(
         | F::RangeUpperInc
         | F::RangeLowerInf
         | F::RangeUpperInf
+        | F::Int4Range
+        | F::Int8Range
+        | F::NumRange
+        | F::DateRange
+        | F::TsRange
+        | F::TsTzRange
         | F::ToJson
         | F::RowToJson
         | F::JsonBuildObject
@@ -2110,6 +2121,65 @@ fn analyze_range_function(
         });
     };
     Ok(range_accessor(func, a, kind))
+}
+
+/// Analyze a range constructor: two bounds of the element type, plus an optional `TEXT` bound-flags
+/// argument (`'[)'`, `'(]'`, `'[]'`, `'()'`). A `NULL` bound is *unbounded on that side* rather than
+/// a `NULL` result, so a bare `NULL` argument is accepted and types from the element hint.
+fn analyze_range_constructor(
+    func: ast::ScalarFunc,
+    kind: nusadb_core::engine::RangeKind,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let name = func.name();
+    if args.len() < 2 || args.len() > 3 {
+        return Err(Error::Unsupported(format!(
+            "{name}() expects 2..=3 argument(s), got {}",
+            args.len()
+        )));
+    }
+    let elem = kind.element_type();
+    let mut typed_args = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().take(2).enumerate() {
+        let a = analyze_expr_agg(arg, scope, catalog, Some(elem), aggregates.as_deref_mut())?;
+        // A bare string literal takes the element type, as it would for any other parameter.
+        let a = coerce_text_literal_to(a, elem);
+        if !is_range_element(a.ty, kind) && !is_null_literal(&a) {
+            return Err(Error::TypeMismatch {
+                context: format!("{name}() argument {}", i + 1),
+                expected: elem,
+                found: a.ty,
+            });
+        }
+        typed_args.push(a);
+    }
+    if let Some(flags_expr) = args.get(2) {
+        let f = analyze_expr_agg(
+            flags_expr,
+            scope,
+            catalog,
+            Some(ColumnType::Text),
+            aggregates,
+        )?;
+        if f.ty != ColumnType::Text && !is_null_literal(&f) {
+            return Err(Error::TypeMismatch {
+                context: format!("{name}() bound flags"),
+                expected: ColumnType::Text,
+                found: f.ty,
+            });
+        }
+        typed_args.push(f);
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: typed_args,
+        },
+        ty: ColumnType::Range(kind),
+    })
 }
 
 /// Build the typed call for a range accessor whose argument is already analyzed to `kind`.

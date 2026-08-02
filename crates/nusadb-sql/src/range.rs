@@ -474,9 +474,23 @@ fn increment(v: &ast::Value) -> Option<ast::Value> {
     }
 }
 
-/// Format a single bound value as its canonical text.
+/// Format a single bound value as its canonical text, quoting it when its characters would
+/// otherwise be read as range punctuation. A timestamp bound contains a space, so it is quoted;
+/// integers and dates are not. Inside the quotes, `"` and `\` are backslash-escaped.
 fn fmt_bound(v: &ast::Value) -> String {
-    crate::display::value_text(v)
+    let s = crate::display::value_text(v);
+    if !s
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\\' | '(' | ')' | '[' | ']' | ','))
+    {
+        return s;
+    }
+    // No element type renders a quote or a backslash, so escaping is the rare path.
+    if s.contains(['"', '\\']) {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        return std::format!("\"{escaped}\"");
+    }
+    std::format!("\"{s}\"")
 }
 
 /// Parse a range literal of the given `kind`: `empty`, or `[lo,hi)` / `(lo,hi]` etc. with either end
@@ -502,20 +516,58 @@ pub fn parse(s: &str, kind: RangeKind) -> Option<RangeVal> {
         _ => return None,
     };
     let body = inner.get(..inner.len() - close.len_utf8())?;
-    let (lo_str, hi_str) = body.split_once(',')?;
+    let (lo_str, hi_str) = split_bounds(body)?;
     let lower = parse_bound(lo_str.trim(), kind).ok()?;
     let upper = parse_bound(hi_str.trim(), kind).ok()?;
     RangeVal::new(kind, lower, upper, lower_inc, upper_inc)
 }
 
+/// Split the body of a range literal at the separating comma, ignoring one inside a quoted bound
+/// (which [`fmt_bound`] writes whenever the value contains punctuation).
+fn split_bounds(body: &str) -> Option<(&str, &str)> {
+    let (mut quoted, mut escaped) = (false, false);
+    for (i, c) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quoted {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c == ',' && !quoted {
+            return Some((body.get(..i)?, body.get(i + 1..)?));
+        }
+    }
+    None
+}
+
 /// Parse a single bound: an empty string is infinite (`Ok(None)`); a value parses to `Ok(Some(v))`;
 /// a malformed value is `Err(())`. (The `Result` keeps the infinite case distinct from a failure.)
 fn parse_bound(s: &str, kind: RangeKind) -> Result<Option<ast::Value>, ()> {
-    // Strip optional surrounding quotes (the reference engine quotes bounds with special chars).
-    let s = s
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .unwrap_or(s);
+    // Undo the quoting [`fmt_bound`] applies to a value containing range punctuation.
+    let unquoted;
+    let s = match s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) if inner.contains('\\') => {
+            let mut out = String::with_capacity(inner.len());
+            let mut escaped = false;
+            for c in inner.chars() {
+                if escaped {
+                    out.push(c);
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else {
+                    out.push(c);
+                }
+            }
+            if escaped {
+                return Err(()); // a trailing backslash escapes nothing
+            }
+            unquoted = out;
+            unquoted.as_str()
+        },
+        Some(inner) => inner,
+        None => s,
+    };
     if s.is_empty() {
         return Ok(None);
     }
@@ -554,6 +606,30 @@ mod tests {
         assert_eq!(parse("[5,1)", RangeKind::Int), None);
         // A single-point inclusive range is valid.
         assert_eq!(parse("[5,5]", RangeKind::Int).unwrap().format(), "[5,6)");
+    }
+
+    #[test]
+    fn a_bound_containing_punctuation_is_quoted_and_reads_back() {
+        // A timestamp bound contains a space, so the canonical form quotes it.
+        let ts =
+            parse("[2024-01-01 00:00:00,2024-01-02 12:30:00)", RangeKind::Ts).expect("tsrange");
+        assert_eq!(
+            ts.format(),
+            "[\"2024-01-01 00:00:00\",\"2024-01-02 12:30:00\")"
+        );
+        // The quoted form round-trips, and the comma inside a bound does not split the literal.
+        assert_eq!(parse(&ts.format(), RangeKind::Ts), Some(ts));
+        // Bounds without punctuation stay bare.
+        assert_eq!(
+            parse("[1,10)", RangeKind::Int).expect("int").format(),
+            "[1,10)"
+        );
+        assert_eq!(
+            parse("[2024-01-01,2024-03-01)", RangeKind::Date)
+                .expect("date")
+                .format(),
+            "[2024-01-01,2024-03-01)"
+        );
     }
 
     #[test]
@@ -605,6 +681,20 @@ mod tests {
             let (back, pos) = decode(&padded, 2, r.kind).expect("decodes at an offset");
             assert_eq!(back, r);
             assert_eq!(pos, padded.len());
+        }
+    }
+
+    #[test]
+    fn format_parse_round_trips_every_kind_and_shape() {
+        // The text form is what a CAST and the display path go through, so it has to survive the
+        // same kind × shape matrix the byte form does — quoting included.
+        for r in all_kind_shapes() {
+            assert_eq!(
+                parse(&r.format(), r.kind),
+                Some(r.clone()),
+                "text round-trip changed {}",
+                r.format()
+            );
         }
     }
 

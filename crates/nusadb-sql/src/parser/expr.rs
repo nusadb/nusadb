@@ -1234,6 +1234,12 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         // Range accessors. `lower`/`upper` are not here: they share their spelling with the
         // text-folding functions, so the analyzer resolves them by argument type.
         "isempty" => F::RangeIsEmpty,
+        "int4range" => F::Int4Range,
+        "int8range" => F::Int8Range,
+        "numrange" => F::NumRange,
+        "daterange" => F::DateRange,
+        "tsrange" => F::TsRange,
+        "tstzrange" => F::TsTzRange,
         "lower_inc" => F::RangeLowerInc,
         "upper_inc" => F::RangeUpperInc,
         "lower_inf" => F::RangeLowerInf,

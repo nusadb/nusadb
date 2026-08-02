@@ -728,6 +728,20 @@ pub enum ScalarFunc {
     RangeLowerInf,
     /// `UPPER_INF(range)` — whether the range is unbounded above, as `BOOL` (false when empty).
     RangeUpperInf,
+    /// `INT4RANGE(lo, hi [, bounds])` — build an integer range. A `NULL` bound is unbounded on that
+    /// side (not a `NULL` result); `bounds` is `'[)'` (the default), `'(]'`, `'[]'`, or `'()'`.
+    Int4Range,
+    /// `INT8RANGE(lo, hi [, bounds])` — as [`Self::Int4Range`]; the same integer element kind, kept
+    /// apart only so the call renders back under the name it was written with.
+    Int8Range,
+    /// `NUMRANGE(lo, hi [, bounds])` — build an exact-decimal range.
+    NumRange,
+    /// `DATERANGE(lo, hi [, bounds])` — build a date range.
+    DateRange,
+    /// `TSRANGE(lo, hi [, bounds])` — build a timestamp range.
+    TsRange,
+    /// `TSTZRANGE(lo, hi [, bounds])` — build a timestamp-with-time-zone range.
+    TsTzRange,
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
@@ -819,6 +833,21 @@ pub enum ScalarFunc {
 }
 
 impl ScalarFunc {
+    /// The element kind this range constructor builds, or `None` if it is not one.
+    #[must_use]
+    pub const fn range_kind(self) -> Option<nusadb_core::engine::RangeKind> {
+        use nusadb_core::engine::RangeKind;
+        Some(match self {
+            // `int4range` and `int8range` build the same integer kind; only the spelling differs.
+            Self::Int4Range | Self::Int8Range => RangeKind::Int,
+            Self::NumRange => RangeKind::Num,
+            Self::DateRange => RangeKind::Date,
+            Self::TsRange => RangeKind::Ts,
+            Self::TsTzRange => RangeKind::TsTz,
+            _ => return None,
+        })
+    }
+
     /// The canonical (folded) name, used in diagnostics.
     #[must_use]
     #[allow(
@@ -973,6 +1002,12 @@ impl ScalarFunc {
             Self::BitGetBit => "get_bit",
             Self::BitSetBit => "set_bit",
             Self::RangeIsEmpty => "isempty",
+            Self::Int4Range => "int4range",
+            Self::Int8Range => "int8range",
+            Self::NumRange => "numrange",
+            Self::DateRange => "daterange",
+            Self::TsRange => "tsrange",
+            Self::TsTzRange => "tstzrange",
             Self::RangeLowerInc => "lower_inc",
             Self::RangeUpperInc => "upper_inc",
             Self::RangeLowerInf => "lower_inf",
