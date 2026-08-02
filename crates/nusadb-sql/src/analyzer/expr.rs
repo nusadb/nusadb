@@ -87,6 +87,7 @@ pub(super) fn analyze_expr_agg(
                 ast::Value::Macaddr(_) => ColumnType::Macaddr,
                 ast::Value::Inet(a) => a.column_type(),
                 ast::Value::Bit(b) => crate::bit::column_type(b),
+                ast::Value::Range(r) => ColumnType::Range(r.kind),
                 // A numeric literal's declared precision/scale is unconstrained.
                 ast::Value::Numeric(_) => ColumnType::Numeric {
                     precision: 0,

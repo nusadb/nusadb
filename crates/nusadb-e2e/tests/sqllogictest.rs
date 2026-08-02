@@ -256,6 +256,7 @@ const fn infer_column_type(v: &Value) -> DefaultColumnType {
         | Value::Macaddr(_)
         | Value::Inet(_)
         | Value::Bit(_)
+        | Value::Range(_)
         | Value::Numeric(_)
         | Value::Json(_)
         | Value::Interval(_)
@@ -288,6 +289,7 @@ fn format_value(v: &Value) -> String {
         Value::Macaddr(m) => nusadb_sql::macaddr::format(*m),
         Value::Inet(a) => a.format(),
         Value::Bit(b) => nusadb_sql::bit::format(b),
+        Value::Range(r) => r.format(),
         Value::Numeric(d) => d.format(),
         Value::Interval(iv) => iv.format(),
         Value::Array(items) => nusadb_sql::display::array_text(items),
@@ -512,6 +514,11 @@ fn slt_p10_inet_cidr() {
 #[test]
 fn slt_p10_bit() {
     run_slt("tests/slt/p10_types/bit.slt");
+}
+
+#[test]
+fn slt_p10_range() {
+    run_slt("tests/slt/p10_types/range.slt");
 }
 
 #[test]

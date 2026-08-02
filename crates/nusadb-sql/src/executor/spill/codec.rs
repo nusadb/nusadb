@@ -52,6 +52,7 @@ const TAG_BYTES: u8 = 16;
 const TAG_MACADDR: u8 = 17;
 const TAG_INET: u8 = 18;
 const TAG_BIT: u8 = 19;
+const TAG_RANGE: u8 = 20;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -121,6 +122,11 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             out.push(TAG_BIT);
             out.extend_from_slice(&crate::bit::encode(b));
         },
+        ast::Value::Range(r) => {
+            out.push(TAG_RANGE);
+            out.push(r.kind.tag());
+            out.extend_from_slice(&crate::range::encode(r));
+        },
         ast::Value::Numeric(d) => {
             out.push(TAG_NUMERIC);
             out.extend_from_slice(&d.mantissa.to_le_bytes());
@@ -187,6 +193,18 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
             ast::Value::Bit(
                 crate::bit::unpack(len, data).ok_or(Error::MalformedTuple { offset: 0 })?,
             )
+        },
+        TAG_RANGE => {
+            let kind = nusadb_core::engine::RangeKind::from_tag(c.u8()?)
+                .ok_or(Error::MalformedTuple { offset: 0 })?;
+            let flags = c.u8()?;
+            let data = c.take(crate::range::payload_len(flags, kind))?;
+            let mut buf = Vec::with_capacity(1 + data.len());
+            buf.push(flags);
+            buf.extend_from_slice(data);
+            let (r, _) =
+                crate::range::decode(&buf, 0, kind).ok_or(Error::MalformedTuple { offset: 0 })?;
+            ast::Value::Range(Box::new(r))
         },
         TAG_NUMERIC => ast::Value::Numeric(Decimal {
             mantissa: i128::from_le_bytes(c.arr::<16>()?),
@@ -294,6 +312,8 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use nusadb_core::engine::RangeKind;
+
     use super::*;
 
     fn all_variants_row() -> Vec<ast::Value> {
@@ -329,7 +349,27 @@ mod tests {
             // `Vector` (tag 15): empty + multi-component, incl. a non-finite f32 (bit-exact LE).
             ast::Value::Vector(vec![]),
             ast::Value::Vector(vec![1.5, -0.0, f32::INFINITY, 3.25]),
+            // `Range` (tag 20): the record is self-framing here, so cover every bound shape — two
+            // bounds, empty, and each infinite side — plus the widest and narrowest element kinds.
+            range("[1,10)", RangeKind::Int),
+            range("(1.50,3.5]", RangeKind::Num),
+            range("empty", RangeKind::Int),
+            range("[5,)", RangeKind::Int),
+            range("(,10)", RangeKind::Int),
+            range("(,)", RangeKind::Date),
+            range("[2024-01-01,2024-02-01)", RangeKind::Date),
+            range("[2024-01-01 00:00:00,2024-01-02 12:30:00)", RangeKind::Ts),
+            range(
+                "[2024-01-01 00:00:00+00,2024-01-02 12:30:00+00)",
+                RangeKind::TsTz,
+            ),
         ]
+    }
+
+    fn range(s: &str, kind: RangeKind) -> ast::Value {
+        ast::Value::Range(Box::new(
+            crate::range::parse(s, kind).expect("range literal"),
+        ))
     }
 
     #[test]

@@ -459,6 +459,8 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         // `INET` / `CIDR` — native IPv4/IPv6 address types (not the text-backed alias below).
         D::Custom(name, _) if is_named(name, "inet") => ColumnType::Inet,
         D::Custom(name, _) if is_named(name, "cidr") => ColumnType::Cidr,
+        // Range types (`int4range`/`numrange`/`daterange`/`tsrange`/`tstzrange`) → native ranges.
+        D::Custom(name, _) if let Some(kind) = range_kind_of_name(name) => ColumnType::Range(kind),
         // A custom (named) type: a standard SQL type NusaDB does not model natively (currency,
         // object-id, network, bit-string, geometric, range, full-text, XML) maps onto a base storage
         // type so schemas using it still load (B-types); a genuinely unknown name is still rejected.
@@ -489,12 +491,10 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         },
         // Object identifier — an unsigned 32-bit integer.
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
-        // Stored as their canonical text form (no native operators yet): bit strings, geometric,
-        // range, full-text, and XML types. (`macaddr`/`inet`/`cidr` are now native types, handled
-        // before this fallback.)
+        // Stored as their canonical text form (no native operators yet): geometric, full-text, and
+        // XML types. (`macaddr`/`inet`/`cidr` and the range types are now native, handled above.)
         "xml" | "macaddr8" | "tsvector" | "tsquery" | "point" | "line" | "lseg" | "box"
-        | "path" | "polygon" | "circle" | "int4range" | "int8range" | "numrange" | "tsrange"
-        | "tstzrange" | "daterange" => ColumnType::Text,
+        | "path" | "polygon" | "circle" => ColumnType::Text,
         _ => return None,
     })
 }
@@ -525,6 +525,23 @@ fn is_vector_name(name: &sql::ObjectName) -> bool {
 
 fn is_macaddr_name(name: &sql::ObjectName) -> bool {
     is_named(name, "macaddr")
+}
+
+/// Resolve a range type name (`int4range`/`int8range`/`numrange`/`daterange`/`tsrange`/`tstzrange`)
+/// to its element kind, or `None` for a non-range name. `int4range`/`int8range` share the `Int` kind.
+fn range_kind_of_name(name: &sql::ObjectName) -> Option<nusadb_core::engine::RangeKind> {
+    use nusadb_core::engine::RangeKind;
+    let [part] = name.0.as_slice() else {
+        return None;
+    };
+    Some(match part.as_ident()?.value.to_ascii_lowercase().as_str() {
+        "int4range" | "int8range" => RangeKind::Int,
+        "numrange" => RangeKind::Num,
+        "daterange" => RangeKind::Date,
+        "tsrange" => RangeKind::Ts,
+        "tstzrange" => RangeKind::TsTz,
+        _ => return None,
+    })
 }
 
 /// Whether `name` is the single unqualified identifier `ident` (case-insensitive) — used to route a

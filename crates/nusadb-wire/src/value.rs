@@ -73,6 +73,12 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
         Value::Inet(a) => a.encode(),
         // BIT/BIT VARYING: the self-describing `[len, packed bytes]` encoding.
         Value::Bit(b) => nusadb_sql::bit::encode(b),
+        // RANGE: the element-kind tag then the self-describing flags-and-bounds encoding.
+        Value::Range(r) => {
+            let mut out = vec![r.kind.tag()];
+            out.extend_from_slice(&nusadb_sql::range::encode(r));
+            out
+        },
         Value::Interval(iv) => {
             let mut buf = Vec::with_capacity(16);
             buf.extend_from_slice(&iv.months.to_be_bytes());

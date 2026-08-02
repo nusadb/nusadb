@@ -2893,6 +2893,14 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Inet(a), ColumnType::Inet) => Ok(ast::Value::Inet(a.to_inet())),
         (ast::Value::Inet(a), ColumnType::Cidr) => Ok(ast::Value::Inet(a.to_cidr())),
         (ast::Value::Inet(a), ColumnType::Text) => Ok(ast::Value::Text(a.format_cast_text())),
+        // RANGE casts: text ↔ range, and an identity same-kind range.
+        (ast::Value::Text(s), ColumnType::Range(kind)) => crate::range::parse(s, kind)
+            .map(|r| ast::Value::Range(Box::new(r)))
+            .ok_or_else(|| invalid_cast(s, ColumnType::Range(kind))),
+        (ast::Value::Range(r), ColumnType::Text) => Ok(ast::Value::Text(r.format())),
+        (ast::Value::Range(r), ColumnType::Range(k)) if r.kind == k => {
+            Ok(ast::Value::Range(r.clone()))
+        },
         // BIT casts pad/truncate (an explicit cast, unlike an assignment, adjusts the length).
         (ast::Value::Text(s), ColumnType::Bit(n)) => crate::bit::parse(s)
             .map(|b| ast::Value::Bit(crate::bit::fit(&b, n as usize)))
@@ -3317,6 +3325,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
+        ast::Value::Range(r) => ColumnType::Range(r.kind),
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,
@@ -3651,6 +3660,8 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         (ast::Value::Inet(a), ast::Value::Inet(b)) => a.network_cmp(b),
         // BIT strings compare left to right, then the shorter first — the natural `Vec<bool>` order.
         (ast::Value::Bit(a), ast::Value::Bit(b)) => a.cmp(b),
+        // Ranges order by empty-first, then lower bound, then upper bound.
+        (ast::Value::Range(a), ast::Value::Range(b)) => a.range_cmp(b),
         // BYTEA orders lexicographically by raw byte.
         (ast::Value::Bytes(a), ast::Value::Bytes(b)) => a.cmp(b),
         (Interval(a), Interval(b)) => a.compare(b),
@@ -3736,6 +3747,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Macaddr(_) => 17,
         ast::Value::Inet(_) => 18,
         ast::Value::Bit(_) => 19,
+        ast::Value::Range(_) => 20,
     }
 }
 

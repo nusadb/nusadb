@@ -225,6 +225,14 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Inet(a), ColumnType::Inet | ColumnType::Cidr) => {
             out.extend_from_slice(&a.encode());
         },
+        // The column's element kind sets the bound widths the reader will use, so a range of any
+        // other kind must not be written with its own widths.
+        (ast::Value::Range(r), ColumnType::Range(kind)) => {
+            if r.kind != kind {
+                return Err(invalid(ty, &r.format()));
+            }
+            out.extend_from_slice(&crate::range::encode(r));
+        },
         // BIT(n) requires exactly n bits; BIT VARYING(n) at most n (unbounded when None).
         (ast::Value::Bit(b), ColumnType::Bit(n)) => {
             if b.len() != n as usize {
@@ -275,6 +283,10 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Text(s), ColumnType::Cidr) => {
             let v = crate::inet::parse_cidr(s).ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&v.encode());
+        },
+        (ast::Value::Text(s), ColumnType::Range(kind)) => {
+            let r = crate::range::parse(s, kind).ok_or_else(|| invalid(ty, s))?;
+            out.extend_from_slice(&crate::range::encode(&r));
         },
         (ast::Value::Text(s), ColumnType::Bit(n)) => {
             let bits = crate::bit::parse(s).ok_or_else(|| invalid(ty, s))?;
@@ -652,6 +664,12 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
                 crate::bit::decode(bytes, pos).ok_or(Error::MalformedTuple { offset: pos })?;
             Ok((ast::Value::Bit(bits), new_pos))
         },
+        // A range is a flags byte then its finite bounds (sized by the element kind).
+        ColumnType::Range(kind) => {
+            let (r, new_pos) = crate::range::decode(bytes, pos, kind)
+                .ok_or(Error::MalformedTuple { offset: pos })?;
+            Ok((ast::Value::Range(Box::new(r)), new_pos))
+        },
         // JSON: length-prefixed canonical text.
         // JSONB decodes identically to JSON (stored as the same canonical text).
         ColumnType::Json | ColumnType::Jsonb => {
@@ -789,6 +807,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
+        ast::Value::Range(r) => ColumnType::Range(r.kind),
         ast::Value::Numeric(_) => ColumnType::Numeric {
             precision: 0,
             scale: 0,

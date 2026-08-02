@@ -1279,6 +1279,8 @@ pub enum Value {
     Inet(crate::inet::InetAddr),
     /// A `BIT`/`BIT VARYING` bit string — index 0 is the leftmost bit.
     Bit(Vec<bool>),
+    /// A range value (`int4range`, `numrange`, …); boxed since it holds its bound values.
+    Range(Box<crate::range::RangeVal>),
     /// Exact decimal (`NUMERIC` / `DECIMAL`) value.
     Numeric(crate::numeric::Decimal),
     /// JSON / JSONB document as canonical text.

@@ -343,7 +343,10 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         | T::Cidr
         | T::Bit(_)
         | T::VarBit(_) => true,
-        T::Float
+        // Range is excluded: a numrange bound is scale-dependent (byte-exact ≠ equality, like
+        // NUMERIC) and no range type has an order-preserving backing index to probe.
+        T::Range(_)
+        | T::Float
         | T::Real
         | T::Numeric { .. }
         | T::Bytes
@@ -3183,6 +3186,7 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Cidr => "cidr",
         ColumnType::Bit(_) => "bit",
         ColumnType::VarBit(_) => "bit varying",
+        ColumnType::Range(kind) => kind.name(),
         ColumnType::Numeric { .. } => "numeric",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",

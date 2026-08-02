@@ -795,6 +795,10 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
                 None => out.push(0),
             }
         },
+        ColumnType::Range(kind) => {
+            out.push(27);
+            out.push(kind.tag());
+        },
     }
 }
 
@@ -850,6 +854,11 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
             } else {
                 None
             })
+        },
+        27 => {
+            let kind = nusadb_core::engine::RangeKind::from_tag(*bytes.get(*at)?)?;
+            *at += 1;
+            ColumnType::Range(kind)
         },
         _ => return None,
     })

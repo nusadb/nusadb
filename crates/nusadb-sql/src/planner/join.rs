@@ -218,6 +218,7 @@ pub(super) const fn is_hashable_key_type(ty: ColumnType) -> bool {
             | ColumnType::Cidr
             | ColumnType::Bit(_)
             | ColumnType::VarBit(_)
+            | ColumnType::Range(_)
             | ColumnType::Numeric { .. }
             | ColumnType::Bytes
     )

@@ -190,14 +190,28 @@ fn sql_catalog_survives_reopen() {
             &engine,
             "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users)",
         );
+        // A column type whose catalog entry carries a payload byte (the range's element kind), so
+        // recovery has to read the payload back rather than the bare type tag.
+        run(
+            &engine,
+            "CREATE TABLE spans (id INT PRIMARY KEY, r INT4RANGE)",
+        );
         run(&engine, "INSERT INTO users VALUES (1, 'a@x', 30)");
         run(&engine, "INSERT INTO orders VALUES (10, 1)");
+        run(&engine, "INSERT INTO spans VALUES (1, '[1,10)')");
     } // crash: no shutdown.
 
     let engine = BtreeEngine::open(&path).unwrap();
     let got = rows(run(&engine, "SELECT email FROM users WHERE id = 1"));
     assert_eq!(got, vec![vec![Value::Text("a@x".to_owned())]]);
     assert_eq!(rows(run(&engine, "SELECT id FROM orders")).len(), 1);
+    // The range column decodes to its value, not to text or a differently-sized element.
+    assert_eq!(
+        rows(run(&engine, "SELECT r::TEXT FROM spans WHERE id = 1")),
+        vec![vec![Value::Text("[1,10)".to_owned())]]
+    );
+    run(&engine, "INSERT INTO spans VALUES (2, '[20,30)')");
+    assert_eq!(rows(run(&engine, "SELECT id FROM spans")).len(), 2);
 
     // Every constraint kind still enforces after recovery.
     assert!(run_try(&engine, "INSERT INTO users VALUES (1, 'z@x', 5)").is_err());

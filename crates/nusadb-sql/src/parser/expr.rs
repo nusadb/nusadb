@@ -64,6 +64,9 @@ pub(super) fn convert_typed_literal(
         },
         ColumnType::VarBit(max) => crate::bit::parse(&value)
             .map(|b| ast::Value::Bit(crate::bit::truncate(&b, max.map(|n| n as usize)))),
+        ColumnType::Range(kind) => {
+            crate::range::parse(&value, kind).map(|r| ast::Value::Range(Box::new(r)))
+        },
         // `NUMERIC '…'` / `DECIMAL '…'` parse exactly.
         ColumnType::Numeric { .. } => {
             crate::numeric::Decimal::parse(&value).map(ast::Value::Numeric)

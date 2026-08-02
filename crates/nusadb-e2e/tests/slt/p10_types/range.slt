@@ -1,0 +1,96 @@
+# p10_types/range — range types (int4range/int8range/numrange/daterange/tsrange/tstzrange).
+# Covers: catalog types, implicit string coercion, canonical display, discrete canonicalization
+# ([] and () normalized to half-open [) for int/date), continuous bounds kept verbatim, the empty
+# range, unbounded (infinite) bounds, the ::range cast, ordering (empty first, then by lower bound
+# with -infinity first, then by upper bound with +infinity last), equality, and loud rejection of a
+# lower bound greater than the upper bound.
+
+statement ok
+CREATE TABLE r (id INT NOT NULL, ir int4range, nr numrange, dr daterange)
+
+# Discrete int4range canonicalizes any inclusivity to half-open [); numrange keeps its bounds; the
+# daterange is discrete too. Row 2 exercises the closed form [1,10] -> [1,11) and the empty range.
+statement ok
+INSERT INTO r VALUES (1, '[1,10)', '(1.5,3.5]', '[2020-01-01,2020-02-01)')
+
+statement ok
+INSERT INTO r VALUES (2, '[1,10]', '[0,5)', 'empty')
+
+query ITTT rowsort
+SELECT id, ir, nr, dr FROM r
+----
+1  [1,10)  (1.5,3.5]  [2020-01-01,2020-02-01)
+2  [1,11)  [0,5)  empty
+
+# The ::int4range cast canonicalizes a closed bound to half-open.
+query T
+SELECT CAST('[1,5]' AS int4range)
+----
+[1,6)
+
+# numrange is continuous — its exclusive/inclusive bounds are preserved.
+query T
+SELECT CAST('(1.5,3.5]' AS numrange)
+----
+(1.5,3.5]
+
+# Ordering: the empty range sorts first, then by lower bound (-infinity first), then by upper bound
+# (+infinity last).
+statement ok
+CREATE TABLE ord (x int4range)
+
+statement ok
+INSERT INTO ord VALUES ('[1,10)'), ('[1,5)'), ('[5,10)'), ('empty'), ('(,3)'), ('[1,)')
+
+query T
+SELECT x FROM ord ORDER BY x
+----
+empty
+(,3)
+[1,5)
+[1,10)
+[1,)
+[5,10)
+
+# Equality against a text literal (coerced to the column's range type, after canonicalization).
+query I
+SELECT id FROM r WHERE ir = '[1,10)'
+----
+1
+
+# The closed literal [1,10] canonicalizes to the same [1,11) as row 2.
+query I
+SELECT id FROM r WHERE ir = '[1,11)'
+----
+2
+
+# A lower bound greater than the upper bound is rejected (not silently collapsed to empty).
+statement error
+INSERT INTO r VALUES (9, '[5,1)', NULL, NULL)
+
+# numrange equality/grouping is scale-independent: [1.5,3.5) and [1.50,3.50) are one value even
+# though their stored/displayed bounds keep the original scale.
+statement ok
+CREATE TABLE nrng (nr numrange)
+
+statement ok
+INSERT INTO nrng VALUES ('[1.5,3.5)'), ('[1.50,3.50)'), ('[2.0,4.0)')
+
+# Equality (comparison path) treats the scale-equal bounds as equal.
+query I
+SELECT count(*) FROM nrng WHERE nr = '[1.50,3.50)'
+----
+2
+
+# DISTINCT (linear not-distinct dedup) collapses the scale-equal pair to one row.
+query I
+SELECT count(*) FROM (SELECT DISTINCT nr FROM nrng) d
+----
+2
+
+# GROUP BY (hash grouping) keys on the scale-normalized bytes: one group of 2, one of 1.
+query I rowsort
+SELECT count(*) FROM nrng GROUP BY nr
+----
+1
+2

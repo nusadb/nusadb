@@ -754,6 +754,8 @@ pub(crate) enum KeyAtom {
     Macaddr([u8; 6]),
     Inet(crate::inet::InetAddr),
     Bit(Vec<bool>),
+    /// A range, keyed by its canonical serialized bytes (its bound values are not `Hash`/`Eq`).
+    Range(Vec<u8>),
     /// `(mantissa, scale)` of the **trimmed** exact decimal: `1.0` and `1.00` compare equal, so
     /// they must hash together — the same canonical-decimal rule `distinct_hash` uses. Also
     /// produced for an `Int` value under a NUMERIC-typed key expression (a mixed CASE/COALESCE
@@ -808,6 +810,8 @@ pub(super) fn key_atoms(
             ast::Value::Macaddr(m) => atoms.push(KeyAtom::Macaddr(m)),
             ast::Value::Inet(a) => atoms.push(KeyAtom::Inet(a)),
             ast::Value::Bit(b) => atoms.push(KeyAtom::Bit(b)),
+            // Scale-normalized so numrange bounds `1.5`/`1.50` join as equal, matching `=`.
+            ast::Value::Range(r) => atoms.push(KeyAtom::Range(crate::range::hash_bytes(&r))),
             // A Numeric value under a non-NUMERIC declared type (defensive — coercions normally
             // keep the families apart; canonicalizing keeps the hash compare-compatible anyway).
             ast::Value::Numeric(d) => atoms.push(decimal_atom(d)),

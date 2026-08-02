@@ -75,6 +75,7 @@ pub(super) fn type_name(ty: ColumnType) -> String {
         ColumnType::Bit(n) => format!("BIT({n})"),
         ColumnType::VarBit(Some(n)) => format!("BIT VARYING({n})"),
         ColumnType::VarBit(None) => "BIT VARYING".to_owned(),
+        ColumnType::Range(kind) => kind.name().to_owned(),
         ColumnType::Numeric { precision: 0, .. } => "NUMERIC".to_owned(),
         ColumnType::Numeric { precision, scale } => format!("NUMERIC({precision},{scale})"),
         ColumnType::Json => "JSON".to_owned(),

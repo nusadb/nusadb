@@ -167,6 +167,9 @@ pub enum ColumnType {
     Bit(u32),
     /// Variable-length bit string `BIT VARYING(n)` — at most `n` bits, or unbounded when `None`.
     VarBit(Option<u32>),
+    /// A range over an ordered element type (`int4range`, `numrange`, `daterange`, …). The
+    /// [`RangeKind`] fixes the element type.
+    Range(RangeKind),
     /// Exact decimal (`NUMERIC` / `DECIMAL`) with a declared precision + scale. A
     /// `precision` of `0` means unconstrained (`NUMERIC` with no arguments); `scale` is the number
     /// of fractional digits.
@@ -285,6 +288,44 @@ impl RangeKind {
     pub const fn is_discrete(self) -> bool {
         matches!(self, Self::Int | Self::Date)
     }
+
+    /// The SQL type name (`int4range`, `numrange`, `daterange`, `tsrange`, `tstzrange`). The `Int`
+    /// kind reports `int4range` (it also backs `int8range`, whose distinct spelling is not retained).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Int => "int4range",
+            Self::Num => "numrange",
+            Self::Date => "daterange",
+            Self::Ts => "tsrange",
+            Self::TsTz => "tstzrange",
+        }
+    }
+
+    /// A stable one-byte tag for on-disk / on-wire serialization. Never renumber an existing value.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Int => 0,
+            Self::Num => 1,
+            Self::Date => 2,
+            Self::Ts => 3,
+            Self::TsTz => 4,
+        }
+    }
+
+    /// Inverse of [`RangeKind::tag`]; `None` for an unknown tag.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Int),
+            1 => Some(Self::Num),
+            2 => Some(Self::Date),
+            3 => Some(Self::Ts),
+            4 => Some(Self::TsTz),
+            _ => None,
+        }
+    }
 }
 
 impl ArrayElem {
@@ -343,6 +384,7 @@ impl ArrayElem {
             | ColumnType::Cidr
             | ColumnType::Bit(_)
             | ColumnType::VarBit(_)
+            | ColumnType::Range(_)
             | ColumnType::Array(_)
             | ColumnType::Vector(_) => None,
         }

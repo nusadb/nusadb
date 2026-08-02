@@ -241,6 +241,8 @@ impl<'s, S: PageStore> Catalog<'s, S> {
                         },
                         None => buf.push(0),
                     },
+                    // RANGE carries its element-kind tag byte.
+                    ColumnType::Range(kind) => buf.push(kind.tag()),
                     _ => {},
                 }
                 buf.push(u8::from(c.nullable));
@@ -290,6 +292,12 @@ impl<'s, S: PageStore> Catalog<'s, S> {
                     } else {
                         None
                     })
+                } else if tag == 27 {
+                    // RANGE (tag 27) stores its element-kind tag.
+                    ColumnType::Range(
+                        nusadb_core::engine::RangeKind::from_tag(rd_u8(blob, &mut cur)?)
+                            .ok_or_else(corrupt)?,
+                    )
                 } else {
                     u8_to_coltype(tag)?
                 };
@@ -400,6 +408,8 @@ const fn coltype_to_u8(t: ColumnType) -> u8 {
         // Tags 25/26; the declared length is serialized separately.
         ColumnType::Bit(_) => 25,
         ColumnType::VarBit(_) => 26,
+        // Tag 27; the element-kind tag is serialized separately.
+        ColumnType::Range(_) => 27,
     }
 }
 fn u8_to_coltype(b: u8) -> Result<ColumnType> {

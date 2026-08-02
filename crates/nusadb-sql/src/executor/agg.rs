@@ -1029,6 +1029,7 @@ pub(crate) const fn parallel_safe_ty(ty: ColumnType) -> bool {
             | ColumnType::Cidr
             | ColumnType::Bit(_)
             | ColumnType::VarBit(_)
+            | ColumnType::Range(_)
     )
 }
 
@@ -1533,6 +1534,9 @@ fn distinct_hash(v: &ast::Value) -> u64 {
         V::Macaddr(m) => (17u8, m).hash(&mut h),
         V::Inet(a) => (18u8, a).hash(&mut h),
         V::Bit(b) => (19u8, b).hash(&mut h),
+        // A range hashes by its scale-normalized key bytes (its bound values are not `Hash`; the
+        // normalization keeps `1.5`/`1.50` numrange bounds in one group, matching `=`).
+        V::Range(r) => (20u8, crate::range::hash_bytes(r)).hash(&mut h),
         V::Bytes(b) => (13u8, b).hash(&mut h),
         // INTERVAL compares by its canonical estimate (so `1 day` == `24:00:00`); hash that.
         V::Interval(iv) => (14u8, iv.estimate_micros()).hash(&mut h),
