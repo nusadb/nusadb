@@ -16,6 +16,7 @@ pub mod ast;
 pub mod batch;
 pub mod bit;
 pub mod cancel;
+pub mod composite;
 pub mod copy;
 pub mod display;
 pub mod error;
