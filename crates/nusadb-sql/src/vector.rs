@@ -229,15 +229,34 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> Option<f64> {
 /// `NaN`, a conventional treatment of the zero vector.
 #[must_use]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> Option<f64> {
+    // Check the lengths before computing either norm: a mismatch answers `None` regardless, and
+    // reducing both operands first would make the rejected case the most expensive one.
     if a.len() != b.len() {
         return None;
     }
-    let norm_a = dot_sum(a, a).sqrt();
-    let norm_b = dot_sum(b, b).sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
+    cosine_distance_with_norms(a, norm(a), b, norm(b))
+}
+
+/// Cosine distance when both operands' norms are already known.
+///
+/// A vector's norm is a constant, but [`cosine_distance`] must recompute both of them on every call
+/// — three reductions where one would do. A caller that stores many vectors and compares them
+/// repeatedly (an index) can cache `norm(v)` per vector and reach the same value through here.
+///
+/// Given `a_norm == norm(a)` and `b_norm == norm(b)` the result is **bit-identical** to
+/// `cosine_distance(a, b)`: it is the same final expression over the same values, and
+/// [`cosine_distance`] is defined in terms of this function so the two cannot drift apart. Passing a
+/// norm that does not belong to its vector yields a correspondingly wrong distance — the caller owns
+/// keeping the cache in step with the data.
+#[must_use]
+pub fn cosine_distance_with_norms(a: &[f32], a_norm: f64, b: &[f32], b_norm: f64) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    if a_norm == 0.0 || b_norm == 0.0 {
         return Some(1.0);
     }
-    Some(1.0 - dot_sum(a, b) / (norm_a * norm_b))
+    Some(1.0 - dot_sum(a, b) / (a_norm * b_norm))
 }
 
 /// The negative dot product `−(a · b)`, or `None` if the dimensions differ (the `<#>` operator).

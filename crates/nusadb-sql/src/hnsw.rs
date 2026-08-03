@@ -34,8 +34,49 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::error::Error;
+
+/// Hasher for the `u32` node ids the beam search dedupes on.
+///
+/// [`HashSet`]'s default is `SipHash` — keyed and collision-resistant, priced for keys an attacker
+/// might choose. These keys are dense integers this module mints itself, and the set is hit once per
+/// node the search visits, which is the hottest thing a build does. A `splitmix64` finalizer spreads
+/// them across buckets just as evenly for a fraction of the work.
+///
+/// The set is only ever asked for membership, never iterated, so the bucket order this changes is not
+/// observable — the built graph is unaffected (pinned by
+/// `cosine_build_graph_matches_its_pinned_digest`).
+#[derive(Default)]
+struct NodeIdHasher(u64);
+
+impl Hasher for NodeIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        let mut z = u64::from(n).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        // Mix into the running state rather than replacing it, so a future composite key does not
+        // silently degenerate to "last field wins". For the single-`u32` key used here the state is
+        // still zero on entry, so this is the plain finalizer.
+        self.0 ^= z ^ (z >> 31);
+    }
+
+    /// Unreachable for a `u32` key (`Hash for u32` calls [`Self::write_u32`]), but a `Hasher` must
+    /// define it; fold the bytes so it stays a valid hash rather than a constant.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+/// A node-id set hashed by [`NodeIdHasher`].
+type NodeIdSet = HashSet<u32, BuildHasherDefault<NodeIdHasher>>;
 
 /// The distance metric an index is built and searched under. Every variant returns a *distance*
 /// (smaller is closer), matching the SQL operators: `<=>` (cosine), `<#>` (negative inner product),
@@ -60,6 +101,29 @@ impl Metric {
             Self::InnerProduct => crate::vector::neg_inner_product(a, b),
         };
         d.unwrap_or(f64::INFINITY)
+    }
+
+    /// The per-vector constant this metric would otherwise recompute on every comparison, cached on
+    /// the node at insert time. Only cosine has one (the norm); the others return `0.0`, which they
+    /// never read.
+    fn cached_term(self, v: &[f32]) -> f64 {
+        match self {
+            Self::Cosine => crate::vector::norm(v),
+            Self::L2 | Self::InnerProduct => 0.0,
+        }
+    }
+
+    /// [`Self::distance`] with both operands' [`Self::cached_term`] supplied.
+    ///
+    /// Bit-identical to `distance(a, b)` when the terms are the ones `cached_term` produces for `a`
+    /// and `b` — for cosine it is literally the same expression with the two norm reductions hoisted
+    /// out, and the other metrics ignore the terms and call straight through.
+    fn distance_cached(self, a: &[f32], a_term: f64, b: &[f32], b_term: f64) -> f64 {
+        match self {
+            Self::Cosine => crate::vector::cosine_distance_with_norms(a, a_term, b, b_term)
+                .unwrap_or(f64::INFINITY),
+            Self::L2 | Self::InnerProduct => self.distance(a, b),
+        }
     }
 }
 
@@ -87,7 +151,25 @@ impl Default for HnswParams {
 #[derive(Debug)]
 struct Node {
     vector: Vec<f32>,
+    /// [`Metric::cached_term`] of `vector` — for cosine, its norm. A build compares each node against
+    /// hundreds of others, and without this every one of those comparisons would recompute the norms
+    /// of *both* sides from scratch. Derived purely from `vector`, so it is recomputed on load rather
+    /// than persisted (see [`HnswIndex::deserialize`]) and the on-disk blob format is unchanged.
+    term: f64,
     neighbours: Vec<Vec<u32>>,
+}
+
+impl Node {
+    /// The only constructor — `term` is derived here and nowhere else, so it cannot be built out of
+    /// step with `vector`. Every site that materializes a node (a fresh insert, a deserialized blob,
+    /// a reload from persisted parts) goes through this, and `vector` is never mutated afterwards.
+    fn new(metric: Metric, vector: Vec<f32>, neighbours: Vec<Vec<u32>>) -> Self {
+        Self {
+            term: metric.cached_term(&vector),
+            vector,
+            neighbours,
+        }
+    }
 }
 
 /// A candidate during search/build: a node id tagged with its distance to the focus point. Ordered
@@ -188,8 +270,11 @@ impl HnswIndex {
         (r as usize).min(31)
     }
 
-    fn distance(&self, a: &[f32], b: &[f32]) -> f64 {
-        self.metric.distance(a, b)
+    /// Distance from `probe` (with its cached term) to the stored node `id`.
+    fn distance_to(&self, probe: &[f32], probe_term: f64, id: u32) -> f64 {
+        let node = &self.nodes[id as usize];
+        self.metric
+            .distance_cached(probe, probe_term, &node.vector, node.term)
     }
 
     /// The max neighbour degree for `layer` (`2·m` at layer 0, else `m`).
@@ -227,10 +312,8 @@ impl HnswIndex {
         let level = self.random_level();
         let id = u32::try_from(self.nodes.len())
             .map_err(|_| Error::Unsupported("HNSW index is full (u32 node ids)".to_owned()))?;
-        self.nodes.push(Node {
-            vector,
-            neighbours: vec![Vec::new(); level + 1],
-        });
+        let node = Node::new(self.metric, vector, vec![Vec::new(); level + 1]);
+        self.nodes.push(node);
 
         let Some(entry) = self.entry else {
             // First point becomes the entry point.
@@ -239,22 +322,28 @@ impl HnswIndex {
         };
 
         let query = self.nodes[id as usize].vector.clone();
+        let query_term = self.nodes[id as usize].term;
         let top = self.top_level();
 
         // Phase 1: greedily descend the layers above this node's top, narrowing to one entry point.
         let mut ep = entry;
         for layer in (level + 1..=top).rev() {
-            ep = self.greedy_nearest(&query, ep, layer);
+            ep = self.greedy_nearest(&query, query_term, ep, layer);
         }
 
         // Phase 2: from this node's top down to layer 0, beam-search, pick neighbours, link both ways.
         let mut touched: Vec<u32> = Vec::new();
         let mut entry_points = vec![ep];
         for layer in (0..=level.min(top)).rev() {
-            let found =
-                self.search_layer(&query, &entry_points, self.params.ef_construction, layer);
+            let found = self.search_layer(
+                &query,
+                query_term,
+                &entry_points,
+                self.params.ef_construction,
+                layer,
+            );
             let degree = self.max_degree(layer);
-            let chosen = self.select_neighbours(&query, &found, degree);
+            let chosen = self.select_neighbours(&found, degree);
             touched.extend_from_slice(&chosen);
             self.connect(id, &chosen, layer);
             entry_points = found.into_iter().map(|c| c.id).collect();
@@ -279,16 +368,16 @@ impl HnswIndex {
     }
 
     /// Walk greedily to the node nearest `query` on `layer`, starting from `from`.
-    fn greedy_nearest(&self, query: &[f32], from: u32, layer: usize) -> u32 {
+    fn greedy_nearest(&self, query: &[f32], query_term: f64, from: u32, layer: usize) -> u32 {
         let mut best = from;
-        let mut best_dist = self.distance(query, &self.nodes[from as usize].vector);
+        let mut best_dist = self.distance_to(query, query_term, from);
         loop {
             let mut improved = false;
             if let Some(node) = self.nodes.get(best as usize)
                 && let Some(neighbours) = node.neighbours.get(layer)
             {
                 for &n in neighbours {
-                    let d = self.distance(query, &self.nodes[n as usize].vector);
+                    let d = self.distance_to(query, query_term, n);
                     if d < best_dist {
                         best_dist = d;
                         best = n;
@@ -308,17 +397,18 @@ impl HnswIndex {
     fn search_layer(
         &self,
         query: &[f32],
+        query_term: f64,
         entry_points: &[u32],
         ef: usize,
         layer: usize,
     ) -> Vec<Candidate> {
-        let mut visited: HashSet<u32> = HashSet::new();
+        let mut visited = NodeIdSet::default();
         let mut candidates: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
         let mut result: BinaryHeap<Candidate> = BinaryHeap::new();
 
         for &ep in entry_points {
             if visited.insert(ep) {
-                let d = self.distance(query, &self.nodes[ep as usize].vector);
+                let d = self.distance_to(query, query_term, ep);
                 candidates.push(Reverse(Candidate { dist: d, id: ep }));
                 result.push(Candidate { dist: d, id: ep });
             }
@@ -333,17 +423,19 @@ impl HnswIndex {
             if current.dist > farthest && result.len() >= ef {
                 break; // every remaining candidate is farther than our worst keeper
             }
-            let neighbours = self
+            // Borrow the neighbour list in place. Everything in this loop — `distance_to`, the heaps,
+            // the visited set — reads `self` immutably or touches only locals, so there is no need to
+            // copy the list out; doing so would allocate once per node the search visits.
+            let neighbours: &[u32] = self
                 .nodes
                 .get(current.id as usize)
-                .map_or_else(Vec::new, |node| {
-                    node.neighbours.get(layer).cloned().unwrap_or_default()
-                });
-            for n in neighbours {
+                .and_then(|node| node.neighbours.get(layer))
+                .map_or(&[], Vec::as_slice);
+            for &n in neighbours {
                 if !visited.insert(n) {
                     continue;
                 }
-                let d = self.distance(query, &self.nodes[n as usize].vector);
+                let d = self.distance_to(query, query_term, n);
                 let worst = result.peek().map_or(f64::INFINITY, |c| c.dist);
                 if d < worst || result.len() < ef {
                     candidates.push(Reverse(Candidate { dist: d, id: n }));
@@ -364,17 +456,17 @@ impl HnswIndex {
     /// first), keep a node only if it is closer to the query than to every already-kept neighbour,
     /// up to `m`. This spreads links across directions instead of clumping on the nearest cluster,
     /// which is what gives HNSW its high recall.
-    fn select_neighbours(&self, query: &[f32], candidates: &[Candidate], m: usize) -> Vec<u32> {
-        let _ = query; // candidates already carry their distance to the query
+    fn select_neighbours(&self, candidates: &[Candidate], m: usize) -> Vec<u32> {
         let mut kept: Vec<Candidate> = Vec::with_capacity(m);
         for &cand in candidates {
             if kept.len() >= m {
                 break;
             }
-            let cand_vec = &self.nodes[cand.id as usize].vector;
+            let cand_node = &self.nodes[cand.id as usize];
+            let (cand_vec, cand_term) = (&cand_node.vector, cand_node.term);
             let closer_to_query_than_to_kept = kept
                 .iter()
-                .all(|k| cand.dist < self.distance(cand_vec, &self.nodes[k.id as usize].vector));
+                .all(|k| cand.dist < self.distance_to(cand_vec, cand_term, k.id));
             if closer_to_query_than_to_kept {
                 kept.push(cand);
             }
@@ -395,15 +487,16 @@ impl HnswIndex {
                 continue;
             }
             let n_vec = self.nodes[n as usize].vector.clone();
+            let n_term = self.nodes[n as usize].term;
             let mut cands: Vec<Candidate> = self.nodes[n as usize].neighbours[layer]
                 .iter()
                 .map(|&x| Candidate {
-                    dist: self.distance(&n_vec, &self.nodes[x as usize].vector),
+                    dist: self.distance_to(&n_vec, n_term, x),
                     id: x,
                 })
                 .collect();
             cands.sort_unstable(); // nearest first
-            let pruned = self.select_neighbours(&n_vec, &cands, degree);
+            let pruned = self.select_neighbours(&cands, degree);
             self.nodes[n as usize].neighbours[layer] = pruned;
         }
     }
@@ -428,13 +521,16 @@ impl HnswIndex {
             return Ok(Vec::new());
         }
 
+        // The query is external, so its term is computed once here and reused for every comparison
+        // this search makes — the same saving the stored nodes get from their cached `term`.
+        let query_term = self.metric.cached_term(query);
         let top = self.top_level();
         let mut ep = entry;
         for layer in (1..=top).rev() {
-            ep = self.greedy_nearest(query, ep, layer);
+            ep = self.greedy_nearest(query, query_term, ep, layer);
         }
         let beam = ef.max(k);
-        let found = self.search_layer(query, &[ep], beam, 0);
+        let found = self.search_layer(query, query_term, &[ep], beam, 0);
         Ok(found.into_iter().take(k).map(|c| (c.id, c.dist)).collect())
     }
 
@@ -520,7 +616,9 @@ impl HnswIndex {
                 }
                 neighbours.push(layer);
             }
-            nodes.push(Node { vector, neighbours });
+            // `term` is derived from `vector`, so it is recomputed here rather than stored — the blob
+            // format is untouched and an older blob loads unchanged.
+            nodes.push(Node::new(metric, vector, neighbours));
         }
         if !r.at_end() {
             return None;
@@ -606,7 +704,7 @@ impl HnswIndex {
             level_mult: 1.0 / (m as f64).ln(),
             nodes: nodes
                 .into_iter()
-                .map(|(vector, neighbours)| Node { vector, neighbours })
+                .map(|(vector, neighbours)| Node::new(metric, vector, neighbours))
                 .collect(),
             entry: None,
             // A fresh non-zero state (matching `new`'s fold constant) so future inserts advance
@@ -884,5 +982,94 @@ mod tests {
             build(),
             "same seed + insert order must reproduce the graph"
         );
+    }
+
+    /// A 64-bit FNV-1a digest — enough to pin an exact byte sequence without pulling in a hash crate.
+    fn digest(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The cached per-vector term must give a **bit**-identical distance to recomputing it, for every
+    /// metric — that identity is the entire justification for caching, so it is asserted rather than
+    /// assumed. Checked on values that are not round numbers, where any reassociation of the
+    /// arithmetic would surface in the low mantissa bits.
+    #[test]
+    fn cached_term_distance_is_bit_identical_to_recomputing() {
+        let data = random_vectors(64, 96, 0x1234);
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            for pair in data.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                let cached =
+                    metric.distance_cached(a, metric.cached_term(a), b, metric.cached_term(b));
+                assert_eq!(
+                    cached.to_bits(),
+                    metric.distance(a, b).to_bits(),
+                    "{metric:?} distance diverged once the per-vector term was cached"
+                );
+            }
+        }
+        // The zero vector has no direction: cosine answers 1.0 by convention, and the cached path
+        // must reach that same guard rather than dividing by a cached zero norm. The guard reads
+        // `a_norm == 0.0 || b_norm == 0.0`, so check the zero on *either* side.
+        let zero = vec![0.0_f32; 96];
+        let other = &data[0];
+        let m = Metric::Cosine;
+        for (a, b) in [(&zero, other), (other, &zero)] {
+            assert_eq!(
+                m.distance_cached(a, m.cached_term(a), b, m.cached_term(b))
+                    .to_bits(),
+                m.distance(a, b).to_bits(),
+                "zero-vector guard diverged"
+            );
+        }
+
+        // A dimension mismatch has no distance; both paths must reach `+∞` so such a pair is never
+        // chosen as a neighbour, rather than one of them producing a finite number.
+        let short = vec![1.0_f32; 8];
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            assert_eq!(
+                metric
+                    .distance_cached(
+                        other,
+                        metric.cached_term(other),
+                        &short,
+                        metric.cached_term(&short)
+                    )
+                    .to_bits(),
+                f64::INFINITY.to_bits(),
+                "{metric:?} dimension mismatch must be +∞"
+            );
+        }
+    }
+
+    /// Pins the exact graph a cosine build produces at a realistic dimension.
+    ///
+    /// Caching each vector's norm is an arithmetic identity, not an approximation, so it must leave
+    /// the built graph **byte-identical** — same links, same order, same distances, hence the same
+    /// recall. A digest states that in the bluntest available way: if any of it shifts, this fails.
+    /// Written against the public API only, so the same test can be checked out onto an earlier
+    /// revision to confirm the pinned value did not move.
+    ///
+    /// A dimension of 128 is deliberate: an earlier round of vector work shipped a regression that a
+    /// `VECTOR(3)`-sized test could not see.
+    ///
+    /// **If this fails, do not re-pin it.** A new number means the graph changed, and recall has to
+    /// be re-validated before the value moves. The one benign way it could shift is the platform's
+    /// `f64::ln`, which `random_level` uses and which libm does not guarantee bit-for-bit across
+    /// targets: a 1-ulp difference only changes a level when `-ln(u)·mL` lands within an ulp of an
+    /// integer, so on a different libc this is worth ruling out first — but the distance kernels
+    /// themselves are exact and host-independent, so nothing else here should drift.
+    #[test]
+    fn cosine_build_graph_matches_its_pinned_digest() {
+        let mut index = HnswIndex::new(128, Metric::Cosine, HnswParams::default(), 42);
+        for v in random_vectors(400, 128, 0xC057) {
+            index.insert(v).expect("insert");
+        }
+        assert_eq!(digest(&index.serialize()), 16_565_488_365_752_518_164);
     }
 }
