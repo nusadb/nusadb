@@ -1,7 +1,8 @@
 //! `CREATE INDEX ... USING hnsw` + `ORDER BY col <=> q LIMIT k` routed to a vector search.
 //! The planner emits a `VectorKnn` for the k-NN shape; the executor uses the declared HNSW index
-//! (cached, approximate) when present and an exact scan otherwise — both return the k nearest rows in
-//! ascending cosine-distance order. On a tiny index the HNSW search is exact, so the order is pinned.
+//! (cached, approximate) when it was built under that same metric and an exact scan otherwise — both
+//! return the k nearest rows in
+//! ascending distance order under the metric the query's operator names. On a tiny index the HNSW search is exact, so the order is pinned.
 
 #![allow(
     clippy::unwrap_used,
@@ -254,4 +255,207 @@ fn hnsw_index_creation_is_validated() {
         exec(engine, &mut session, "CREATE INDEX items_id ON items (id)"),
         ExecutionResult::IndexCreated
     ));
+}
+
+/// An index answers exactly the distance it was built under.
+///
+/// The nearest neighbours under L2 are not the nearest under cosine — cosine ignores magnitude, L2 is
+/// dominated by it. So a `<->` query must not be served from a cosine graph. This pins the behaviour
+/// on data engineered to tell the two apart: `far` points the same *direction* as the query (cosine
+/// distance 0, but a long way off in space), while `near` sits close in space but off-axis. Cosine
+/// ranks `far` first, L2 ranks `near` first.
+#[test]
+fn a_query_is_never_answered_from_another_metrics_graph() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE pts (id INT NOT NULL, v VECTOR(2))",
+    );
+    for (id, v) in [(1, "[10,0]"), (2, "[1,1]")] {
+        exec(
+            engine,
+            &mut session,
+            &format!("INSERT INTO pts VALUES ({id}, '{v}')"),
+        );
+    }
+    let cosine_first = "SELECT id FROM pts ORDER BY v <=> '[1,0]'::VECTOR(2) LIMIT 1";
+    let l2_first = "SELECT id FROM pts ORDER BY v <-> '[1,0]'::VECTOR(2) LIMIT 1";
+
+    // With no index at all, both are exact scans — this is the ground truth the index must not change.
+    assert_eq!(ids_in_order(engine, &mut session, cosine_first), vec![1]);
+    assert_eq!(ids_in_order(engine, &mut session, l2_first), vec![2]);
+
+    // Declaring a cosine index must leave the L2 answer alone. Before the metric was recorded, the
+    // `<->` query would have been handed the cosine graph and confidently returned id 1.
+    exec(
+        engine,
+        &mut session,
+        "CREATE INDEX pts_cos ON pts USING hnsw (v vector_cosine_ops)",
+    );
+    assert_eq!(ids_in_order(engine, &mut session, cosine_first), vec![1]);
+    assert_eq!(
+        ids_in_order(engine, &mut session, l2_first),
+        vec![2],
+        "an L2 query must not be answered from a cosine graph"
+    );
+}
+
+/// Each operator class selects its own metric, an unknown one is rejected rather than quietly
+/// treated as the default, and omitting it keeps the cosine an existing index already had.
+#[test]
+fn operator_class_selects_the_metric() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(
+        engine,
+        &mut session,
+        "CREATE TABLE v (id INT NOT NULL, e VECTOR(2))",
+    );
+    for name in [
+        "vector_l2_ops",
+        "vector_cosine_ops",
+        "vector_ip_ops",
+        "vector_l1_ops",
+    ] {
+        assert!(
+            matches!(
+                exec(
+                    engine,
+                    &mut session,
+                    &format!("CREATE INDEX i_{name} ON v USING hnsw (e {name})"),
+                ),
+                ExecutionResult::IndexCreated
+            ),
+            "{name} should select a metric"
+        );
+    }
+    // Omitting the operator class keeps the historical default.
+    assert!(matches!(
+        exec(
+            engine,
+            &mut session,
+            "CREATE INDEX i_def ON v USING hnsw (e)"
+        ),
+        ExecutionResult::IndexCreated
+    ));
+    // An unrecognized class is refused — accepting it and silently building a cosine graph is exactly
+    // the trap this whole change removes.
+    assert!(matches!(
+        try_analyze(engine, "CREATE INDEX i_bad ON v USING hnsw (e text_ops)"),
+        Err(Error::Unsupported(_))
+    ));
+    // An operator class on a plain B-tree index is still refused.
+    assert!(matches!(
+        try_analyze(engine, "CREATE INDEX i_bt ON v (id int4_ops)"),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+/// Two indexes on the *same* column under different metrics must each answer only their own queries.
+///
+/// This is the case that broke the first attempt at metric routing: the built-graph cache was keyed
+/// by `(engine, table, column)` alone, so both indexes shared one slot and whichever was created last
+/// silently answered for both. Checking the query's metric against the *catalog* entry was not
+/// enough — the catalog and the cached graph were independent. Both creation orders are exercised,
+/// because only the second index was previously wrong.
+#[test]
+fn two_metrics_on_one_column_do_not_share_a_graph() {
+    for cosine_first in [true, false] {
+        let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+        let mut session = Session::new(engine);
+        exec(
+            engine,
+            &mut session,
+            "CREATE TABLE pts (id INT NOT NULL, v VECTOR(2))",
+        );
+        for (id, v) in [(1, "[10,0]"), (2, "[1,1]")] {
+            exec(
+                engine,
+                &mut session,
+                &format!("INSERT INTO pts VALUES ({id}, '{v}')"),
+            );
+        }
+        let creates = [
+            "CREATE INDEX pts_cos ON pts USING hnsw (v vector_cosine_ops)",
+            "CREATE INDEX pts_l2 ON pts USING hnsw (v vector_l2_ops)",
+        ];
+        for sql in if cosine_first {
+            creates
+        } else {
+            [creates[1], creates[0]]
+        } {
+            exec(engine, &mut session, sql);
+        }
+        // An INSERT drives the incremental-maintenance path, which previously wrote one index's graph
+        // into the other's persisted blob.
+        exec(engine, &mut session, "INSERT INTO pts VALUES (3, '[9,0]')");
+
+        assert_eq!(
+            ids_in_order(
+                engine,
+                &mut session,
+                "SELECT id FROM pts ORDER BY v <=> '[1,0]'::VECTOR(2) LIMIT 1"
+            ),
+            vec![1],
+            "cosine query, cosine_first={cosine_first}"
+        );
+        assert_eq!(
+            ids_in_order(
+                engine,
+                &mut session,
+                "SELECT id FROM pts ORDER BY v <-> '[1,0]'::VECTOR(2) LIMIT 1"
+            ),
+            vec![2],
+            "L2 query must not be served from the cosine graph, cosine_first={cosine_first}"
+        );
+    }
+}
+
+/// A row whose vector is NULL has no distance, but `ORDER BY` puts it last rather than dropping it —
+/// so the k-NN operator that stands in for that `Sort` + `Limit` must do the same, for every
+/// operator, with and without an index.
+///
+/// This is a regression pin: widening the routing beyond `<=>` made three more operators reach the
+/// k-NN path, which had been silently discarding these rows.
+#[test]
+fn a_null_vector_row_is_ranked_last_not_dropped() {
+    for index_sql in [
+        None,
+        Some("CREATE INDEX p_l2 ON p USING hnsw (v vector_l2_ops)"),
+    ] {
+        let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+        let mut session = Session::new(engine);
+        exec(
+            engine,
+            &mut session,
+            "CREATE TABLE p (id INT NOT NULL, v VECTOR(2))",
+        );
+        exec(engine, &mut session, "INSERT INTO p VALUES (1, '[1,0]')");
+        exec(engine, &mut session, "INSERT INTO p VALUES (2, NULL)");
+        exec(engine, &mut session, "INSERT INTO p VALUES (3, '[0,1]')");
+        if let Some(sql) = index_sql {
+            exec(engine, &mut session, sql);
+        }
+        for op in ["<->", "<#>", "<+>", "<=>"] {
+            let got = ids_in_order(
+                engine,
+                &mut session,
+                &format!("SELECT id FROM p ORDER BY v {op} '[1,0]'::VECTOR(2) LIMIT 5"),
+            );
+            assert_eq!(
+                got.len(),
+                3,
+                "{op} dropped the NULL-vector row (indexed={})",
+                index_sql.is_some()
+            );
+            assert_eq!(
+                got[2],
+                2,
+                "{op} must rank the NULL-vector row last (indexed={})",
+                index_sql.is_some()
+            );
+        }
+    }
 }

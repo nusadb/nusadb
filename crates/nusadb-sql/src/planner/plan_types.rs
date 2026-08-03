@@ -411,6 +411,10 @@ pub struct VectorIndexSpec {
     pub column_ordinal: usize,
     /// The vector dimension `n` (every indexed value must match it).
     pub dim: usize,
+    /// The distance metric the graph is built under, chosen by the key's operator class (default
+    /// cosine). An index answers queries written with *this* metric's operator and no other — the
+    /// nearest neighbours under L2 are not the nearest under cosine.
+    pub metric: crate::hnsw::Metric,
 }
 
 /// `DROP INDEX [IF EXISTS] name`.
@@ -2284,6 +2288,9 @@ pub enum PhysicalOperator {
         column_ordinal: usize,
         /// The query vector expression (a constant — references no row column).
         query: TypedExpr,
+        /// The distance the query asked for, from its operator. The declared index is used only if it
+        /// was built under this same metric; otherwise the executor scans exactly.
+        metric: crate::hnsw::Metric,
         /// Number of nearest rows to return.
         k: u64,
         /// Optional `WHERE` predicate over the source row: only rows passing it are

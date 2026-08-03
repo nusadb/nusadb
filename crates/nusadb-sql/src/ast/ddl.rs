@@ -851,6 +851,11 @@ pub struct CreateIndex {
     /// `USING <method>` access method, folded to lowercase; `None` for the default
     /// (B-tree). Only `Some("hnsw")` is otherwise accepted — a vector index.
     pub using: Option<String>,
+    /// The key column's operator class, as written — for a vector index this selects the distance
+    /// metric (`vector_l2_ops`, `vector_cosine_ops`, `vector_ip_ops`, `vector_l1_ops`). `None` when
+    /// none was given, which defaults to cosine. Carried as raw text so the analyzer, not the
+    /// parser, decides which names are meaningful for the chosen access method.
+    pub operator_class: Option<String>,
     /// Whether `UNIQUE` was specified.
     pub unique: bool,
     /// Whether `IF NOT EXISTS` was specified.

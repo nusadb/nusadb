@@ -374,12 +374,24 @@ fn analyze_hnsw_index(
             "an hnsw index requires a VECTOR(n) column".to_owned(),
         ));
     };
+    // The operator class picks the distance metric the graph is built under. Defaulting to cosine
+    // keeps every index written before this was settable meaning what it already meant.
+    let metric = match &ci.operator_class {
+        None => crate::hnsw::Metric::Cosine,
+        Some(name) => crate::hnsw::Metric::from_operator_class(name).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "operator class `{name}` on an hnsw index (expected one of `vector_l2_ops`, \
+                 `vector_cosine_ops`, `vector_ip_ops`, `vector_l1_ops`)"
+            ))
+        })?,
+    };
     Ok(VectorIndexSpec {
         name: ci.name.clone(),
         table: table.name.clone(),
         column: column.clone(),
         column_ordinal,
         dim: dim as usize,
+        metric,
     })
 }
 

@@ -78,10 +78,14 @@ impl Hasher for NodeIdHasher {
 /// A node-id set hashed by [`NodeIdHasher`].
 type NodeIdSet = HashSet<u32, BuildHasherDefault<NodeIdHasher>>;
 
-/// The distance metric an index is built and searched under. Every variant returns a *distance*
-/// (smaller is closer), matching the SQL operators: `<=>` (cosine), `<#>` (negative inner product),
-/// and L2.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The distance metric an index is built and searched under.
+///
+/// Every variant returns a *distance* (smaller is closer), one per vector-distance operator: `<=>`
+/// (cosine), `<->` (L2), `<#>` (negative inner product), `<+>` (L1).
+///
+/// An index serves exactly the metric it was built under. Nearest neighbours differ between metrics,
+/// so a graph built for one cannot answer another's query — see [`Metric::for_operator`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
     /// Euclidean distance.
     L2,
@@ -89,18 +93,66 @@ pub enum Metric {
     Cosine,
     /// Negative inner product (so a larger dot product is a smaller distance).
     InnerProduct,
+    /// Manhattan (L1, taxicab) distance.
+    L1,
 }
 
 impl Metric {
-    /// Distance between two equal-length vectors. A dimension mismatch (which the index guards
-    /// against at insert time) maps to `+∞` so such a pair is never selected as a neighbour.
-    fn distance(self, a: &[f32], b: &[f32]) -> f64 {
-        let d = match self {
+    /// The metric an index must have been built under to answer a query written with `op`, or `None`
+    /// if `op` is not a vector-distance operator.
+    ///
+    /// Nearest neighbours are metric-specific: the closest vectors under L2 are not the closest under
+    /// cosine. So this is what lets the planner refuse to answer one distance's query from another
+    /// distance's graph — routing on the operator alone would return confidently wrong rows.
+    #[must_use]
+    pub const fn for_operator(op: crate::ast::BinaryOp) -> Option<Self> {
+        match op {
+            crate::ast::BinaryOp::VectorDistance => Some(Self::Cosine),
+            crate::ast::BinaryOp::VectorL2Distance => Some(Self::L2),
+            crate::ast::BinaryOp::VectorNegInnerProduct => Some(Self::InnerProduct),
+            crate::ast::BinaryOp::VectorL1Distance => Some(Self::L1),
+            _ => None,
+        }
+    }
+
+    /// The operator-class name that selects this metric in `CREATE INDEX ... USING hnsw (col <name>)`.
+    #[must_use]
+    pub const fn operator_class(self) -> &'static str {
+        match self {
+            Self::L2 => "vector_l2_ops",
+            Self::Cosine => "vector_cosine_ops",
+            Self::InnerProduct => "vector_ip_ops",
+            Self::L1 => "vector_l1_ops",
+        }
+    }
+
+    /// The metric an operator-class name selects, or `None` if the name is not one of them.
+    #[must_use]
+    pub fn from_operator_class(name: &str) -> Option<Self> {
+        [Self::L2, Self::Cosine, Self::InnerProduct, Self::L1]
+            .into_iter()
+            .find(|m| name.eq_ignore_ascii_case(m.operator_class()))
+    }
+
+    /// Distance between two vectors under this metric, or `None` if their dimensions differ.
+    ///
+    /// This is the metric's definition. The index's own internal wrapper turns the mismatch into
+    /// `+∞` so such a pair is never chosen as a neighbour; an exact scan wants the `None` instead, so
+    /// it can skip the row rather than rank it as infinitely far.
+    #[must_use]
+    pub fn exact_distance(self, a: &[f32], b: &[f32]) -> Option<f64> {
+        match self {
             Self::L2 => crate::vector::l2_distance(a, b),
             Self::Cosine => crate::vector::cosine_distance(a, b),
             Self::InnerProduct => crate::vector::neg_inner_product(a, b),
-        };
-        d.unwrap_or(f64::INFINITY)
+            Self::L1 => crate::vector::l1_distance(a, b),
+        }
+    }
+
+    /// Distance between two equal-length vectors. A dimension mismatch (which the index guards
+    /// against at insert time) maps to `+∞` so such a pair is never selected as a neighbour.
+    fn distance(self, a: &[f32], b: &[f32]) -> f64 {
+        self.exact_distance(a, b).unwrap_or(f64::INFINITY)
     }
 
     /// The per-vector constant this metric would otherwise recompute on every comparison, cached on
@@ -109,7 +161,7 @@ impl Metric {
     fn cached_term(self, v: &[f32]) -> f64 {
         match self {
             Self::Cosine => crate::vector::norm(v),
-            Self::L2 | Self::InnerProduct => 0.0,
+            Self::L2 | Self::InnerProduct | Self::L1 => 0.0,
         }
     }
 
@@ -122,7 +174,7 @@ impl Metric {
         match self {
             Self::Cosine => crate::vector::cosine_distance_with_norms(a, a_term, b, b_term)
                 .unwrap_or(f64::INFINITY),
-            Self::L2 | Self::InnerProduct => self.distance(a, b),
+            Self::L2 | Self::InnerProduct | Self::L1 => self.distance(a, b),
         }
     }
 }
@@ -242,6 +294,13 @@ impl HnswIndex {
     #[must_use]
     pub const fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The distance metric this graph was built under. A rebuild must reuse it, or the rebuilt graph
+    /// would answer a different question than the one the index was declared for.
+    #[must_use]
+    pub const fn metric(&self) -> Metric {
+        self.metric
     }
 
     /// Whether the index holds no points.
@@ -549,6 +608,7 @@ impl HnswIndex {
             Metric::L2 => 0,
             Metric::Cosine => 1,
             Metric::InnerProduct => 2,
+            Metric::L1 => 3,
         });
         out.extend_from_slice(&(self.params.m as u32).to_le_bytes());
         out.extend_from_slice(&(self.params.ef_construction as u32).to_le_bytes());
@@ -587,6 +647,7 @@ impl HnswIndex {
             0 => Metric::L2,
             1 => Metric::Cosine,
             2 => Metric::InnerProduct,
+            3 => Metric::L1,
             _ => return None,
         };
         let m = (r.u32()? as usize).max(2);
@@ -981,6 +1042,38 @@ mod tests {
             build(),
             build(),
             "same seed + insert order must reproduce the graph"
+        );
+    }
+
+    /// A blob round-trips under every metric, and the metric survives it — a graph reloaded as the
+    /// wrong distance would answer plausible-looking nonsense. Also pins that an unrecognized metric
+    /// byte is refused rather than mapped onto some default, so a blob from a future build that added
+    /// a metric is rebuilt instead of misread.
+    #[test]
+    fn every_metric_survives_a_blob_round_trip() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct, Metric::L1] {
+            let mut index = HnswIndex::new(8, metric, HnswParams::default(), 7);
+            for v in random_vectors(24, 8, 0xB10B) {
+                index.insert(v).expect("insert");
+            }
+            let blob = index.serialize();
+            let back = HnswIndex::deserialize(&blob).expect("round trip");
+            assert_eq!(back.metric(), metric, "metric lost in the blob");
+            let q = vec![0.25_f32; 8];
+            assert_eq!(
+                index.search(&q, 5, 32).expect("search"),
+                back.search(&q, 5, 32).expect("search"),
+                "{metric:?} reloaded graph answers differently"
+            );
+        }
+        // The metric is the 5th byte (u32 dim, then the metric tag). An unknown tag is refused.
+        let mut index = HnswIndex::new(4, Metric::L2, HnswParams::default(), 1);
+        index.insert(vec![1.0, 0.0, 0.0, 0.0]).expect("insert");
+        let mut blob = index.serialize();
+        blob[4] = 200;
+        assert!(
+            HnswIndex::deserialize(&blob).is_none(),
+            "an unknown metric tag must be refused, not defaulted"
         );
     }
 

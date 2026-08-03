@@ -472,6 +472,7 @@ pub(super) fn run_create_index(
                 &table,
                 spec.column_ordinal,
                 spec.dim,
+                spec.metric,
                 engine,
                 txn,
             )?;

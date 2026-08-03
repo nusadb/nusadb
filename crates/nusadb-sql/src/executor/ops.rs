@@ -1817,11 +1817,15 @@ fn execute_op_inner(
             table,
             column_ordinal,
             query,
+            metric,
             k,
             filter,
         } => run_vector_knn(
-            table,
-            *column_ordinal,
+            &KnnTarget {
+                table,
+                column_ordinal: *column_ordinal,
+                metric: *metric,
+            },
             query,
             *k,
             filter.as_ref(),
@@ -1953,13 +1957,20 @@ struct CachedVectorIndex {
     tids: Vec<Tid>,
 }
 
-/// Cache key for a built HNSW index: the engine instance, the table, and the column ordinal.
+/// Cache key for a built HNSW index: the engine instance, the table, the column ordinal, and the
+/// distance metric.
+///
 /// The engine's address disambiguates distinct engine instances that share a thread (e.g.
 /// two independent test engines): they reuse table ids and tid layouts, so without it their
 /// signatures could collide and one engine's cache could be served for another's query.
-type HnswCacheKey = (usize, nusadb_core::TableId, usize);
+///
+/// The metric is part of the key because one column may carry several indexes under different
+/// metrics. Keyed only by column, they would share a slot, the most recent build would win, and a
+/// query would be answered from whichever graph happened to be there — the right shape of answer
+/// under the wrong distance.
+type HnswCacheKey = (usize, nusadb_core::TableId, usize, crate::hnsw::Metric);
 
-/// One per-key cache slot: the built index for a given `(engine, table, column)`, or `None` before
+/// One per-key cache slot: the built index for a given `(engine, table, column, metric)`, or `None` before
 /// its first build. Each slot has its own lock, so a (re)build of one index never blocks queries on
 /// another — only the brief outer-map lookup is shared.
 type HnswSlot = std::sync::Arc<std::sync::RwLock<Option<CachedVectorIndex>>>;
@@ -2035,17 +2046,14 @@ fn build_vector_index(
     table: &TableSchema,
     column_ordinal: usize,
     dim: usize,
+    metric: crate::hnsw::Metric,
     signature: u64,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<CachedVectorIndex, Error> {
     let scanned = super::scan::scan_table(table, engine, txn)?;
-    let mut index = crate::hnsw::HnswIndex::new(
-        dim,
-        crate::hnsw::Metric::Cosine,
-        crate::hnsw::HnswParams::default(),
-        HNSW_SEED,
-    );
+    let mut index =
+        crate::hnsw::HnswIndex::new(dim, metric, crate::hnsw::HnswParams::default(), HNSW_SEED);
     // Insert only rows with a matching-dimension vector. The HNSW assigns sequential ids 0,1,2,…, so
     // `id_to_row[id]` recovers the row index (a NULL / wrong-dim vector is left out of the graph and
     // can never be returned — matching the exact path, which skips it too).
@@ -2082,16 +2090,17 @@ pub(super) fn warm_vector_index(
     table: &TableSchema,
     column_ordinal: usize,
     dim: usize,
+    metric: crate::hnsw::Metric,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
     let signature = scan_signature(table, engine, txn)?;
-    let built = build_vector_index(table, column_ordinal, dim, signature, engine, txn)?;
+    let built = build_vector_index(table, column_ordinal, dim, metric, signature, engine, txn)?;
     // Persist the graph so a restart loads it instead of paying the build cost again. This runs in
     // the `CREATE INDEX` write txn, so the blob commits (or rolls back) atomically with the index
     // declaration — a query never sees a declaration without its persisted graph.
     persist_vector_graph(engine, txn, name, &built)?;
-    let slot = hnsw_slot((engine_identity(engine), table.id, column_ordinal));
+    let slot = hnsw_slot((engine_identity(engine), table.id, column_ordinal, metric));
     *slot
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
@@ -2264,6 +2273,7 @@ fn load_vector_graph(
     name: &str,
     table: &TableSchema,
     dim: usize,
+    metric: crate::hnsw::Metric,
     current_signature: u64,
 ) -> Result<Option<CachedVectorIndex>, Error> {
     let Some(cat) = engine.lookup_table_as_of(txn, VECTOR_GRAPH_CATALOG)? else {
@@ -2307,7 +2317,10 @@ fn load_vector_graph(
     let Some(index) = crate::hnsw::HnswIndex::deserialize(graph_bytes) else {
         return Ok(None);
     };
-    if index.dim() != dim || index.len() != node_tids.len() {
+    // Reject a blob that does not describe the index being loaded — wrong dimension, wrong node
+    // count, or a graph built under a different distance. `None` means "rebuild", which is slow but
+    // right; serving another metric's graph would be fast and wrong.
+    if index.dim() != dim || index.metric() != metric || index.len() != node_tids.len() {
         return Ok(None);
     }
     // Rebuild the row bag / tids / id→row map from one scan; the expensive graph is loaded, not built.
@@ -2355,6 +2368,9 @@ fn maintain_vector_index(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<CachedVectorIndex, Error> {
+    // Any rebuild below must reuse the metric the cached graph was built under, not a default, or the
+    // index would quietly start answering a different distance than it was declared for.
+    let metric = cached.index.metric();
     let cached_rows: std::collections::HashMap<Tid, usize> = cached
         .tids
         .iter()
@@ -2376,14 +2392,22 @@ fn maintain_vector_index(
                 if cached.rows.get(i) != Some(&row::decode(&tuple, &schema)?) {
                     // A kept tid's content changed (an in-place UPDATE): the graph holds the old
                     // vector and cannot replace a node → rebuild.
-                    return build_vector_index(table, column_ordinal, dim, signature, engine, txn);
+                    return build_vector_index(
+                        table,
+                        column_ordinal,
+                        dim,
+                        metric,
+                        signature,
+                        engine,
+                        txn,
+                    );
                 }
             },
         }
     }
     // A cached tid no longer visible means a removal happened → rebuild (HNSW has no node delete).
     if cached.tids.iter().any(|t| !live.contains(t)) {
-        return build_vector_index(table, column_ordinal, dim, signature, engine, txn);
+        return build_vector_index(table, column_ordinal, dim, metric, signature, engine, txn);
     }
     // Pure append: extend the existing graph with the new rows.
     let CachedVectorIndex {
@@ -2444,7 +2468,12 @@ pub(super) fn maintain_vector_indexes_on_change(
     };
     let signature = scan_signature(&table, engine, txn)?;
     for listing in listings {
-        let slot = hnsw_slot((engine_identity(engine), table.id, listing.column_ordinal));
+        let slot = hnsw_slot((
+            engine_identity(engine),
+            table.id,
+            listing.column_ordinal,
+            listing.metric,
+        ));
         let mut guard = slot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2468,6 +2497,7 @@ pub(super) fn maintain_vector_indexes_on_change(
                 &table,
                 listing.column_ordinal,
                 listing.dim,
+                listing.metric,
                 signature,
                 engine,
                 txn,
@@ -2479,8 +2509,10 @@ pub(super) fn maintain_vector_indexes_on_change(
     Ok(())
 }
 
-/// Exact k-NN fallback when no HNSW index is declared: scan, compute cosine distance to `query` for
-/// each row, and return the `k` nearest in distance order — identical to `Sort(<=>) + Limit`.
+/// Exact k-NN fallback: scan, score every row against `query` under the requested metric, and
+/// return the `k` nearest in distance order — identical to the `Sort` + `Limit` it stands in for.
+/// Used when no index is declared, when the declared index was built under a different metric, and
+/// when a selective filter starves the index search.
 /// Candidate over-fetch factor for a filtered k-NN search: the HNSW search returns `k ×`
 /// this many candidates so that, after a `WHERE` filter removes some, enough survive to fill `k`.
 /// A more selective filter is handled by the exact fallback when even the over-fetch falls short.
@@ -2495,28 +2527,49 @@ fn row_passes(filter: Option<&TypedExpr>, row: &Row) -> Result<bool, Error> {
     }
 }
 
-fn exact_vector_knn(
-    table: &TableSchema,
+/// What a k-NN request is over: the table, its indexed vector column, and the distance the query
+/// asked for. The three always travel together — an index is only usable for the column *and* the
+/// metric it was built for — so they are passed as one thing rather than three parallel arguments
+/// that could drift out of step.
+struct KnnTarget<'a> {
+    table: &'a TableSchema,
     column_ordinal: usize,
+    metric: crate::hnsw::Metric,
+}
+
+fn exact_vector_knn(
+    target: &KnnTarget<'_>,
     query: &[f32],
     k: usize,
     filter: Option<&TypedExpr>,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
-    let rows = super::scan::scan_rows(table, engine, txn)?;
+    let rows = super::scan::scan_rows(target.table, engine, txn)?;
     let mut scored: Vec<(f64, Row)> = Vec::new();
+    // A row whose vector is NULL (or the wrong dimension) has no distance. `ORDER BY` puts such rows
+    // last rather than dropping them, and this operator stands in for exactly that `Sort` + `Limit` —
+    // so they are kept aside and used to fill `k` once every comparable row is placed.
+    let mut unscorable: Vec<Row> = Vec::new();
     for row in rows {
-        if let Some(ast::Value::Vector(v)) = row.get(column_ordinal)
-            && let Some(dist) = crate::vector::cosine_distance(query, v)
-            && row_passes(filter, &row)?
-        {
-            scored.push((dist, row));
+        if !row_passes(filter, &row)? {
+            continue;
+        }
+        match row.get(target.column_ordinal) {
+            Some(ast::Value::Vector(v)) => match target.metric.exact_distance(query, v) {
+                Some(dist) => scored.push((dist, row)),
+                None => unscorable.push(row),
+            },
+            _ => unscorable.push(row),
         }
     }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    scored.truncate(k);
-    Ok(scored.into_iter().map(|(_, row)| row).collect())
+    let mut out: Vec<Row> = scored.into_iter().map(|(_, row)| row).collect();
+    if out.len() < k {
+        out.extend(unscorable.into_iter().take(k - out.len()));
+    }
+    out.truncate(k);
+    Ok(out)
 }
 
 /// Search a cached HNSW index for the `k` nearest rows that pass the optional filter. The
@@ -2550,8 +2603,9 @@ fn search_cached(
 }
 
 /// Execute a [`PhysicalOperator::VectorKnn`]: return the `k` rows of `table` nearest to the
-/// query vector under cosine distance that also pass the optional `WHERE` filter. Uses the declared
-/// HNSW index (approximate, cached) when one exists, otherwise an exact scan. With a filter the
+/// query vector under the metric the query's operator asked for, that also pass the optional
+/// `WHERE` filter. Uses the declared HNSW index (approximate, cached) when one exists **and was built
+/// under that same metric**, otherwise an exact scan. With a filter the
 /// index search over-fetches and post-filters, falling back to an exact filtered scan if too few
 /// candidates survive — so a selective filter never under-returns. Either way the result is the `k`
 /// nearest matching rows in ascending-distance order.
@@ -2560,8 +2614,7 @@ fn search_cached(
     reason = "the cache lock guard must stay held while `search_cached` borrows the cached index"
 )]
 fn run_vector_knn(
-    table: &TableSchema,
-    column_ordinal: usize,
+    target: &KnnTarget<'_>,
     query: &TypedExpr,
     k: u64,
     filter: Option<&TypedExpr>,
@@ -2582,15 +2635,21 @@ fn run_vector_knn(
     let resolved_filter = filter.map(|f| resolved_expr(f, engine, txn)).transpose()?;
     let filter = resolved_filter.as_deref();
     // No HNSW index on this column → exact scan (still correct, just O(n)).
-    let Some(entry) = super::vector_index_for_column(engine, txn, &table.name, column_ordinal)?
+    let Some(entry) = super::vector_index_for_column(
+        engine,
+        txn,
+        &target.table.name,
+        target.column_ordinal,
+        target.metric,
+    )?
     else {
-        return exact_vector_knn(table, column_ordinal, &query_vec, k, filter, engine, txn);
+        return exact_vector_knn(target, &query_vec, k, filter, engine, txn);
     };
     // A query whose dimension does not match the index falls back to exact (which simply finds no
     // comparable rows); the analyzer already enforces matching dimensions for `<=>`, so this is a
     // defensive guard rather than an expected path.
     if entry.dim != query_vec.len() {
-        return exact_vector_knn(table, column_ordinal, &query_vec, k, filter, engine, txn);
+        return exact_vector_knn(target, &query_vec, k, filter, engine, txn);
     }
     // Over-fetch candidates when filtering so enough survive the post-filter to fill `k`.
     let want = if filter.is_some() {
@@ -2599,8 +2658,13 @@ fn run_vector_knn(
         k
     };
     let ef = resolve_ef_search(want);
-    let key = (engine_identity(engine), table.id, column_ordinal);
-    let current = scan_signature(table, engine, txn)?;
+    let key = (
+        engine_identity(engine),
+        target.table.id,
+        target.column_ordinal,
+        target.metric,
+    );
+    let current = scan_signature(target.table, engine, txn)?;
     let slot = hnsw_slot(key);
     // Warm path: the slot's shared read lock lets concurrent queries search a fresh index in parallel,
     // and a build of another key's slot does not block this one.
@@ -2629,8 +2693,8 @@ fn run_vector_knn(
             let built = match guard.take() {
                 Some(cached) => maintain_vector_index(
                     cached,
-                    table,
-                    column_ordinal,
+                    target.table,
+                    target.column_ordinal,
                     entry.dim,
                     current,
                     engine,
@@ -2642,12 +2706,21 @@ fn run_vector_knn(
                 // this query's txn; the rebuilt graph is not re-persisted here (that happens in the
                 // write txn that created the index).
                 None => {
-                    match load_vector_graph(engine, txn, &entry.name, table, entry.dim, current)? {
+                    match load_vector_graph(
+                        engine,
+                        txn,
+                        &entry.name,
+                        target.table,
+                        entry.dim,
+                        target.metric,
+                        current,
+                    )? {
                         Some(loaded) => loaded,
                         None => build_vector_index(
-                            table,
-                            column_ordinal,
+                            target.table,
+                            target.column_ordinal,
                             entry.dim,
+                            target.metric,
                             current,
                             engine,
                             txn,
@@ -2664,8 +2737,12 @@ fn run_vector_knn(
     };
     // A selective filter can starve the over-fetched candidate set; an exact filtered scan then
     // guarantees the true k nearest matching rows rather than under-returning.
-    if filter.is_some() && knn.len() < k {
-        return exact_vector_knn(table, column_ordinal, &query_vec, k, filter, engine, txn);
+    // A short result means the graph did not hold enough comparable rows: either a selective filter
+    // starved the over-fetched candidate set, or rows with a NULL / wrong-dimension vector were never
+    // indexed. The exact scan resolves both — it applies the filter itself and places the unindexable
+    // rows last, the way the `Sort` + `Limit` this replaces would have.
+    if knn.len() < k {
+        return exact_vector_knn(target, &query_vec, k, filter, engine, txn);
     }
     Ok(knn)
 }
@@ -4571,7 +4648,13 @@ mod eager_build_tests {
         }
         let table = engine.lookup_table("items").unwrap().unwrap();
         let column_ordinal = 1; // `embedding`
-        let key = (engine_identity(&engine), table.id, column_ordinal);
+        // The slot is keyed by metric too; this index is built under the default (cosine).
+        let key = (
+            engine_identity(&engine),
+            table.id,
+            column_ordinal,
+            crate::hnsw::Metric::Cosine,
+        );
 
         // No query has run yet, so under the lazy behaviour the cache slot would be empty.
         assert!(
@@ -4642,7 +4725,12 @@ mod eager_build_tests {
         HNSW_CACHE
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(engine_identity(engine), table_id, 1));
+            .remove(&(
+                engine_identity(engine),
+                table_id,
+                1,
+                crate::hnsw::Metric::Cosine,
+            ));
     }
 
     #[test]
@@ -4658,9 +4746,17 @@ mod eager_build_tests {
         // load returns a full index without a rebuild.
         let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let sig = scan_signature(&table, &engine, txn).unwrap();
-        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig)
-            .unwrap()
-            .expect("restart must load the persisted graph, not None");
+        let loaded = load_vector_graph(
+            &engine,
+            txn,
+            "items_emb",
+            &table,
+            3,
+            crate::hnsw::Metric::Cosine,
+            sig,
+        )
+        .unwrap()
+        .expect("restart must load the persisted graph, not None");
         engine.commit(txn).unwrap();
         assert_eq!(loaded.index.len(), 4, "all four vectors present after load");
         assert_eq!(loaded.id_to_row.len(), 4);
@@ -4683,9 +4779,17 @@ mod eager_build_tests {
         let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let sig = scan_signature(&table, &engine, txn).unwrap();
         // The persisted blob now matches the post-insert table, so a restart loads it (all 5 rows).
-        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig)
-            .unwrap()
-            .expect("the write should have re-persisted a current graph");
+        let loaded = load_vector_graph(
+            &engine,
+            txn,
+            "items_emb",
+            &table,
+            3,
+            crate::hnsw::Metric::Cosine,
+            sig,
+        )
+        .unwrap()
+        .expect("the write should have re-persisted a current graph");
         engine.commit(txn).unwrap();
         assert_eq!(
             loaded.index.len(),
@@ -4704,8 +4808,16 @@ mod eager_build_tests {
         let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let sig = scan_signature(&table, &engine, txn).unwrap();
         // A current signature that does not match the persisted one must decline (never serve stale).
-        let loaded =
-            load_vector_graph(&engine, txn, "items_emb", &table, 3, sig.wrapping_add(1)).unwrap();
+        let loaded = load_vector_graph(
+            &engine,
+            txn,
+            "items_emb",
+            &table,
+            3,
+            crate::hnsw::Metric::Cosine,
+            sig.wrapping_add(1),
+        )
+        .unwrap();
         engine.commit(txn).unwrap();
         assert!(
             loaded.is_none(),
@@ -4723,7 +4835,16 @@ mod eager_build_tests {
 
         let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let sig = scan_signature(&table, &engine, txn).unwrap();
-        let loaded = load_vector_graph(&engine, txn, "items_emb", &table, 3, sig).unwrap();
+        let loaded = load_vector_graph(
+            &engine,
+            txn,
+            "items_emb",
+            &table,
+            3,
+            crate::hnsw::Metric::Cosine,
+            sig,
+        )
+        .unwrap();
         engine.commit(txn).unwrap();
         assert!(
             loaded.is_none(),
@@ -4769,9 +4890,17 @@ mod eager_build_tests {
 
         let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let sig = scan_signature(&table, &engine, txn).unwrap();
-        let loaded = load_vector_graph(&engine, txn, "docs_emb", &table, 128, sig)
-            .unwrap()
-            .expect("the chunked graph must reassemble and reload");
+        let loaded = load_vector_graph(
+            &engine,
+            txn,
+            "docs_emb",
+            &table,
+            128,
+            crate::hnsw::Metric::Cosine,
+            sig,
+        )
+        .unwrap()
+        .expect("the chunked graph must reassemble and reload");
         engine.commit(txn).unwrap();
         assert_eq!(
             loaded.index.len(),

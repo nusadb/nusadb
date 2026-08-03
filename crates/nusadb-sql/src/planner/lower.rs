@@ -432,7 +432,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             top_n: window_top_n_hint,
         };
     }
-    if let Some((table, column_ordinal, query, k, filter)) = vector_knn {
+    if let Some((table, column_ordinal, query, metric, k, filter)) = vector_knn {
         // Replace the `Sort` (and its scan, and the `WHERE` Filter if any) with a vector-index search
         // returning the k nearest matching rows in distance order; the outer `Limit`/`Project` still
         // apply unchanged. The filter is applied inside the search, so the separately-built
@@ -441,6 +441,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             table,
             column_ordinal,
             query,
+            metric,
             k,
             filter,
         };
@@ -965,7 +966,14 @@ fn coerce_index_bound(value: &ast::Value, target: ColumnType) -> Option<ast::Val
 /// query, so the result is exactly the k nearest rows — the same as the Sort+Limit it replaces.
 fn vector_knn_plan(
     select: &SelectPlan,
-) -> Option<(TableSchema, usize, TypedExpr, u64, Option<TypedExpr>)> {
+) -> Option<(
+    TableSchema,
+    usize,
+    TypedExpr,
+    crate::hnsw::Metric,
+    u64,
+    Option<TypedExpr>,
+)> {
     let table = select.table.as_ref()?;
     // A `WHERE` filter is allowed — it is applied to the k-NN candidates. Everything else
     // that would change the row set or order disqualifies routing.
@@ -992,15 +1000,15 @@ fn vector_knn_plan(
     if !key.ascending {
         return None;
     }
-    let TypedExprKind::Binary {
-        left,
-        op: ast::BinaryOp::VectorDistance,
-        right,
-    } = &key.expr.kind
-    else {
+    let TypedExprKind::Binary { left, op, right } = &key.expr.kind else {
         return None;
     };
-    // One side is the indexed column, the other a constant query vector (cosine distance is symmetric).
+    // Each vector-distance operator names a different metric, and the query is only answerable from a
+    // graph built under that same one — the executor re-checks the declared index against this before
+    // it uses it.
+    let metric = crate::hnsw::Metric::for_operator(*op)?;
+    // One side is the indexed column, the other a constant query vector (each metric is symmetric in
+    // its two operands).
     let (ordinal, query) = match (&left.kind, &right.kind) {
         (TypedExprKind::Column(o), _) if is_constant_expr(right) => (*o, (**right).clone()),
         (_, TypedExprKind::Column(o)) if is_constant_expr(left) => (*o, (**left).clone()),
@@ -1019,7 +1027,14 @@ fn vector_knn_plan(
     {
         return None;
     }
-    Some((table.clone(), ordinal, query, k, select.filter.clone()))
+    Some((
+        table.clone(),
+        ordinal,
+        query,
+        metric,
+        k,
+        select.filter.clone(),
+    ))
 }
 
 /// Whether `expr` is a constant — references no row column — so it can serve as a fixed query vector.

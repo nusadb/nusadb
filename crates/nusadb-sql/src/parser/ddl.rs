@@ -635,6 +635,19 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
     if ci.columns.is_empty() {
         return unsupported("CREATE INDEX with no key columns");
     }
+    // A vector index takes its distance metric from the key's operator class, so capture it here and
+    // let the key converters accept it. Every other access method still rejects one.
+    let is_vector = using.as_deref() == Some("hnsw");
+    let operator_class = if is_vector {
+        match ci.columns.as_slice() {
+            [key] => key.operator_class.as_ref().map(ToString::to_string),
+            // More than one key is rejected later, with a message about the key count rather than
+            // about an operator class it never got to look at.
+            _ => None,
+        }
+    } else {
+        None
+    };
     let name = match ci.name {
         Some(n) => object_name(&n)?,
         None => return unsupported("CREATE INDEX without an index name"),
@@ -647,7 +660,7 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
     let mut columns = Vec::with_capacity(ci.columns.len());
     let mut any_expr = false;
     for key in &ci.columns {
-        match convert_index_key(key) {
+        match convert_index_key(key, is_vector) {
             Ok(col) => columns.push(col),
             Err(Error::Unsupported(_)) if is_expression_key(key) => {
                 any_expr = true;
@@ -678,6 +691,7 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
         predicate,
         include,
         using,
+        operator_class,
         unique: ci.unique,
         if_not_exists: ci.if_not_exists,
     })
@@ -697,7 +711,7 @@ const fn is_expression_key(key: &sql::IndexColumn) -> bool {
 /// operator class, `WITH FILL`, or a per-column `ASC`/`DESC`/`NULLS` annotation is rejected —
 /// see [`reject_index_key_modifiers`].
 fn convert_index_key_expr(key: &sql::IndexColumn) -> Result<String, Error> {
-    reject_index_key_modifiers(key)?;
+    reject_index_key_modifiers(key, false)?;
     Ok(key.column.expr.to_string())
 }
 
@@ -708,8 +722,14 @@ fn convert_index_key_expr(key: &sql::IndexColumn) -> Result<String, Error> {
 /// (`(a DESC)` indistinguishable from `(a ASC)`, `ORDER BY a DESC` still not accelerated, the
 /// catalog recording no direction). Rejecting loudly is honest; a plain
 /// `(a)` index still serves equality and range lookups. `NULLS DISTINCT` is handled by the caller.
-fn reject_index_key_modifiers(key: &sql::IndexColumn) -> Result<(), Error> {
-    if key.operator_class.is_some() {
+fn reject_index_key_modifiers(
+    key: &sql::IndexColumn,
+    allow_operator_class: bool,
+) -> Result<(), Error> {
+    // An operator class is meaningless for a B-tree here — the engine has one comparison order per
+    // type — but for a vector index it is how the distance metric is chosen, so that caller allows it
+    // and reads it separately.
+    if key.operator_class.is_some() && !allow_operator_class {
         return unsupported("CREATE INDEX with an operator class on a key column");
     }
     // `ASC` is the default and exactly what an index builds, so it is accepted as a no-op. `DESC`
@@ -732,8 +752,11 @@ fn reject_index_key_modifiers(key: &sql::IndexColumn) -> Result<(), Error> {
 
 /// Extract a plain column name from an index-key entry. Per-column `ASC`/`DESC`/`NULLS` and other
 /// key modifiers are rejected by [`reject_index_key_modifiers`].
-pub(super) fn convert_index_key(key: &sql::IndexColumn) -> Result<String, Error> {
-    reject_index_key_modifiers(key)?;
+pub(super) fn convert_index_key(
+    key: &sql::IndexColumn,
+    allow_operator_class: bool,
+) -> Result<String, Error> {
+    reject_index_key_modifiers(key, allow_operator_class)?;
     match &key.column.expr {
         sql::Expr::Identifier(ident) => Ok(fold_ident(ident)),
         sql::Expr::CompoundIdentifier(_) => {

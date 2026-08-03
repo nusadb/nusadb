@@ -2018,8 +2018,17 @@ fn format_op(
                 ));
             }
         },
-        PhysicalOperator::VectorKnn { table, k, .. } => {
-            lines.push(format!("{indent}VectorKnn: {} (k={k})", table.name));
+        PhysicalOperator::VectorKnn {
+            table, k, metric, ..
+        } => {
+            // Name the metric: with four of them, and a silent fall back to an exact scan when no
+            // index was built for the one asked for, the plan is otherwise indistinguishable from
+            // the case where the index is doing the work.
+            lines.push(format!(
+                "{indent}VectorKnn: {} (k={k}, metric={})",
+                table.name,
+                metric.operator_class()
+            ));
         },
         PhysicalOperator::IndexScan { table, index, .. } => {
             lines.push(format!("{indent}IndexScan: {} using {index}", table.name));
@@ -2476,18 +2485,41 @@ pub(super) struct VectorIndexEntry {
     pub dim: usize,
 }
 
-/// Encode a vector index's `def` column: tab-separated `table`, column ordinal, dimension.
+/// Encode a vector index's `def` column: tab-separated `table`, column ordinal, dimension, and the
+/// operator-class name of the distance metric.
 fn encode_vector_index_def(spec: &crate::planner::VectorIndexSpec) -> String {
-    format!("{}\t{}\t{}", spec.table, spec.column_ordinal, spec.dim)
+    format!(
+        "{}\t{}\t{}\t{}",
+        spec.table,
+        spec.column_ordinal,
+        spec.dim,
+        spec.metric.operator_class()
+    )
 }
 
-/// Parse a `def` string written by [`encode_vector_index_def`] into its `(table, ordinal, dim)`.
-fn parse_vector_index_def(def: &str) -> Option<(String, usize, usize)> {
+/// Parse a `def` string written by [`encode_vector_index_def`] into its
+/// `(table, ordinal, dim, metric)`.
+///
+/// The metric field was added after the first indexes shipped, so a three-field def — everything
+/// written before it existed — reads back as cosine, which is the only metric those indexes were
+/// ever built under. That keeps an already-persisted index loadable instead of silently rejected.
+fn parse_vector_index_def(def: &str) -> Option<(String, usize, usize, crate::hnsw::Metric)> {
     let mut parts = def.split('\t');
     let table = parts.next()?.to_owned();
     let ordinal = parts.next()?.parse().ok()?;
     let dim = parts.next()?.parse().ok()?;
-    Some((table, ordinal, dim))
+    let metric = match parts.next() {
+        None => crate::hnsw::Metric::Cosine,
+        Some(name) => crate::hnsw::Metric::from_operator_class(name)?,
+    };
+    // Refuse a def with fields beyond the ones understood here. One written by a later build that
+    // added something would otherwise be read as if that field did not exist — a downgrade would
+    // silently drop whatever it meant. `None` hides the index from queries (they scan exactly, which
+    // is right) and it stays droppable by name.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((table, ordinal, dim, metric))
 }
 
 /// A vector index enumerated from the catalog: its name and its `(table, column ordinal, dimension)`
@@ -2496,6 +2528,8 @@ fn parse_vector_index_def(def: &str) -> Option<(String, usize, usize)> {
 pub(super) struct VectorIndexListing {
     /// The index name.
     pub name: String,
+    /// The distance metric the graph is built under.
+    pub metric: crate::hnsw::Metric,
     /// The table the index is on.
     pub table: String,
     /// The indexed column's 0-based ordinal in the table.
@@ -2517,13 +2551,14 @@ pub(super) fn list_vector_indexes(
     while let Some((_, bytes)) = scan.try_next()? {
         let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
         if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice()
-            && let Some((table, column_ordinal, dim)) = parse_vector_index_def(def)
+            && let Some((table, column_ordinal, dim, metric)) = parse_vector_index_def(def)
         {
             out.push(VectorIndexListing {
                 name: name.clone(),
                 table,
                 column_ordinal,
                 dim,
+                metric,
             });
         }
     }
@@ -2583,7 +2618,7 @@ pub(super) fn delete_vector_indexes_for_table(
     while let Some((_, bytes)) = scan.try_next()? {
         let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
         if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice()
-            && parse_vector_index_def(def).is_some_and(|(table, _, _)| table == table_name)
+            && parse_vector_index_def(def).is_some_and(|(table, ..)| table == table_name)
         {
             names.push(name.clone());
         }
@@ -2595,13 +2630,18 @@ pub(super) fn delete_vector_indexes_for_table(
     Ok(())
 }
 
-/// Find an hnsw vector index declared on `table_name`'s column `ordinal`, if any. Used by
-/// the executor to decide whether `ORDER BY col <=> q LIMIT k` can use an HNSW search.
+/// Find an hnsw vector index declared on `table_name`'s column `ordinal` **and built under `metric`**,
+/// if any. Used by the executor to decide whether a k-NN query can use an HNSW search.
+///
+/// The metric is part of the search, not a property checked afterwards: a column may carry several
+/// indexes under different distances, and matching on the column alone would return an arbitrary one
+/// of them — leaving every other index permanently unused while still paying to maintain it.
 pub(super) fn vector_index_for_column(
     engine: &dyn StorageEngine,
     txn: TxnId,
     table_name: &str,
     ordinal: usize,
+    metric: crate::hnsw::Metric,
 ) -> Result<Option<VectorIndexEntry>, Error> {
     let Some(cat) = engine.lookup_table_as_of(txn, VECTOR_INDEX_CATALOG)? else {
         return Ok(None);
@@ -2610,10 +2650,13 @@ pub(super) fn vector_index_for_column(
     while let Some((_, bytes)) = scan.try_next()? {
         let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
         if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice()
-            && let Some((table, column_ordinal, dim)) = parse_vector_index_def(def)
+            && let Some((table, column_ordinal, dim, declared)) = parse_vector_index_def(def)
             && table == table_name
             && column_ordinal == ordinal
+            && declared == metric
         {
+            // No metric field: the lookup already matched on it, so the caller's own metric is the
+            // index's. Carrying a second copy would just be something to drift.
             return Ok(Some(VectorIndexEntry {
                 name: name.clone(),
                 dim,

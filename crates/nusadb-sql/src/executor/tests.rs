@@ -3624,3 +3624,28 @@ fn q52_substring_regex_and_null_type_infer() {
     // NOT over a non-BOOL operand is still rejected.
     assert!(run("SELECT NOT 'abc'", &engine).is_err());
 }
+
+/// The vector-index catalog `def` gained a metric field after indexes had already shipped. A def
+/// written before it existed carries three fields and must still load — as cosine, the only metric
+/// those indexes were ever built under. Rejecting it would make an existing index invisible to
+/// `DROP TABLE` cleanup and to catalog introspection.
+#[test]
+fn a_vector_index_def_written_before_metrics_reads_as_cosine() {
+    assert_eq!(
+        super::parse_vector_index_def("items\t1\t3"),
+        Some(("items".to_owned(), 1, 3, crate::hnsw::Metric::Cosine))
+    );
+    // A def that names a metric round-trips it.
+    assert_eq!(
+        super::parse_vector_index_def("items\t1\t3\tvector_l2_ops"),
+        Some(("items".to_owned(), 1, 3, crate::hnsw::Metric::L2))
+    );
+    // An unrecognized class is not quietly treated as the default.
+    assert_eq!(super::parse_vector_index_def("items\t1\t3\tnope"), None);
+    // Nor is a def carrying a field this build does not know about: reading it as if the field were
+    // absent would silently drop whatever a later build meant by it.
+    assert_eq!(
+        super::parse_vector_index_def("items\t1\t3\tvector_l2_ops\textra"),
+        None
+    );
+}
