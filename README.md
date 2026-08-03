@@ -1,4 +1,4 @@
-# NusaDB
+# Database Management System NusaDB
 
 NusaDB is a relational database engine written from scratch in Rust. It runs on a single node and
 handles both transactional and analytical queries.
