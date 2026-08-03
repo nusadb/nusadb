@@ -3005,7 +3005,7 @@ fn convert_set_variable(
     name: &sql::ObjectName,
     value: &[sql::Expr],
 ) -> Result<ast::Statement, Error> {
-    let name = object_name(name)?;
+    let name = guc_name(name)?;
     // `search_path` is a list: `SET search_path TO a, public` carries several values — render
     // each and join with commas so the session stores the ordered list. Other GUCs take one value.
     if name == "search_path" && value.len() > 1 {
@@ -3085,10 +3085,31 @@ fn show_columns_table(opts: &sql::ShowStatementOptions) -> Result<sql::ObjectNam
 
 /// Convert `SHOW name` into [`ast::Statement::Show`].
 fn convert_show_variable(variable: &[sql::Ident]) -> Result<ast::Statement, Error> {
-    let [name] = variable else {
-        return unsupported("SHOW with a multi-word or empty variable name");
-    };
-    Ok(ast::Statement::Show(fold_ident(name)))
+    // An application's own parameter arrives as its two parts, so join them back into the name it
+    // was set under — `SHOW myapp.tenant` has to read what `SET myapp.tenant` wrote.
+    match variable {
+        [name] => Ok(ast::Statement::Show(fold_ident(name))),
+        [class, setting] => Ok(ast::Statement::Show(format!(
+            "{}.{}",
+            fold_ident(class),
+            fold_ident(setting)
+        ))),
+        _ => unsupported("SHOW with a multi-word or empty variable name"),
+    }
+}
+
+/// Extract the name of a configuration parameter for `SET` / `SHOW`.
+///
+/// A parameter name is not an object name: a dot in it separates an extension class from a setting
+/// (`myapp.tenant`), not a schema from a table, so the two parts are joined back together rather
+/// than resolved as a qualifier. Only the one- and two-part forms exist; anything longer is not a
+/// parameter name at all.
+fn guc_name(name: &sql::ObjectName) -> Result<String, Error> {
+    match name.0.as_slice() {
+        [part] => fold_part(part),
+        [class, setting] => Ok(format!("{}.{}", fold_part(class)?, fold_part(setting)?)),
+        _ => unsupported("configuration parameter name with more than two parts"),
+    }
 }
 
 /// Extract a bare object name.

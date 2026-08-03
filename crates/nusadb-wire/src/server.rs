@@ -3066,6 +3066,25 @@ fn apply_set_variable(
     settings: &std::sync::Mutex<HashMap<String, String>>,
     sv: nusadb_sql::ast::SetVariable,
 ) -> Result<ExecutionResult, nusadb_sql::Error> {
+    // `RESET ALL` clears every parameter the connection set, rather than naming one.
+    if sv.value.is_none() && sv.name.eq_ignore_ascii_case("all") {
+        if let Ok(mut store) = settings.lock() {
+            // The reserved connection-database key is stamped by the server, not by the client,
+            // so it survives — resetting it would make `current_database()` lie.
+            store.retain(|k, _| k == nusadb_sql::CONNECTION_DATABASE_SETTING);
+        }
+        return Ok(ExecutionResult::VariableSet);
+    }
+    // A client sets parameters over this path rather than through `Session`, so the same
+    // recognition check has to run here — otherwise an unknown parameter would be stored and
+    // silently ignored for every real connection, which is exactly the case being fixed.
+    nusadb_sql::check_settable_parameter(&sv.name)?;
+    // A parameter name is case-insensitive; store it folded so it reaches the slot the engine
+    // reads (a quoted `"TimeZone"` keeps its case through the parser).
+    let sv = nusadb_sql::ast::SetVariable {
+        name: sv.name.to_ascii_lowercase(),
+        ..sv
+    };
     if sv
         .name
         .eq_ignore_ascii_case("default_transaction_isolation")
@@ -3780,6 +3799,59 @@ mod timeout_tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         )
+    }
+
+    /// A client sets parameters over this path rather than through `Session`, so the recognition
+    /// check has to bite here too: an unknown parameter stored on a real connection would never be
+    /// honoured, and would look like it had been. The two paths share one check, so they cannot
+    /// disagree about which parameters exist.
+    #[test]
+    fn set_over_the_wire_rejects_a_parameter_the_engine_does_not_read() {
+        let settings = settings_with(&[]);
+        let set = |name: &str, value: Option<&str>| {
+            apply_set_variable(
+                &settings,
+                nusadb_sql::ast::SetVariable {
+                    name: name.to_owned(),
+                    value: value.map(ToOwned::to_owned),
+                },
+            )
+        };
+        let code = |name: &str, value: Option<&str>| match set(name, value) {
+            Err(nusadb_sql::Error::Coded { sqlstate, .. }) => sqlstate,
+            other => panic!("expected a coded error for {name}, got {other:?}"),
+        };
+        // The reported trap: a near-miss of `hnsw_ef_search`, which the engine really does read.
+        assert_eq!(code("ef_search", Some("100")), "42704");
+        assert_eq!(code("totally_bogus_param", Some("1")), "42704");
+        assert_eq!(code("tenant", Some("acme")), "42704");
+        assert_eq!(code("server_version", Some("1")), "55P02");
+        // An application's own parameter carries a class prefix, and is stored.
+        set("myapp.tenant", Some("acme")).expect("a dotted parameter is accepted");
+        assert_eq!(
+            settings.lock().expect("settings").get("myapp.tenant"),
+            Some(&"acme".to_owned())
+        );
+        // Parameters the engine reads are still settable, in any case, and still value-checked.
+        set("hnsw_ef_search", Some("100")).expect("a parameter the engine reads is accepted");
+        set("TimeZone", Some("UTC")).expect("a parameter name is case-insensitive");
+        assert_eq!(code("work_mem", Some("banana")), "22023");
+        // A reset of an unknown parameter is refused for the same reason a set of one is.
+        assert_eq!(code("ef_search", None), "42704");
+        // `RESET ALL` names no parameter — it clears the ones this connection set, and must not be
+        // mistaken for a parameter called "all".
+        set("all", None).expect("RESET ALL is accepted");
+        assert!(
+            settings.lock().expect("settings").is_empty(),
+            "RESET ALL must clear the parameters the connection set"
+        );
+        // A quoted name keeps its case through the parser, so the stored key is folded to the one
+        // the engine reads.
+        set("HNSW_EF_SEARCH", Some("64")).expect("a quoted parameter name is accepted");
+        assert_eq!(
+            settings.lock().expect("settings").get("hnsw_ef_search"),
+            Some(&"64".to_owned())
+        );
     }
 
     /// A session `SET statement_timeout` must win over the server default, `0` must disable the

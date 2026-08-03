@@ -51,9 +51,9 @@ pub use batch::{
 pub use error::Error;
 pub use executor::{
     ExecutionResult, Row, RowSink, Session, SpillConfig, StreamOutcome, auto_analyze_stale_tables,
-    catalog_approx_row_count, catalog_list_indexes, catalog_table_stats, copy_from, copy_to,
-    describe_column_types, describe_columns, execute, execute_in_txn, execute_in_txn_as,
-    execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_settings,
+    catalog_approx_row_count, catalog_list_indexes, catalog_table_stats, check_settable_parameter,
+    copy_from, copy_to, describe_column_types, describe_columns, execute, execute_in_txn,
+    execute_in_txn_as, execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_settings,
     execute_in_txn_as_with_settings, lookup_function_definition, lookup_policies_for,
     lookup_view_columns, lookup_view_definition, maintenance_work_mem, parse_work_mem,
     rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_work_mem,

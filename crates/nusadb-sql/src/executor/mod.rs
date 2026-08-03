@@ -37,6 +37,7 @@ pub mod eval;
 mod rng;
 pub mod row;
 mod session_ctx;
+pub use session_ctx::check_settable_parameter;
 mod stats;
 
 // Operator submodules (ADR 007), glob-re-exported below. agg/join remain stubs whose operators
@@ -1115,12 +1116,23 @@ impl<'engine> Session<'engine> {
         }
     }
 
-    /// `SET name = value` stores the variable; `RESET name` (value `None`) clears it.
+    /// `SET name = value` stores the parameter; `RESET name` (value `None`) clears it, and
+    /// `RESET ALL` clears every parameter this session set.
     fn set_variable(
         &mut self,
         name: String,
         value: Option<String>,
     ) -> Result<ExecutionResult, Error> {
+        if value.is_none() && name.eq_ignore_ascii_case("all") {
+            self.variables.clear();
+            self.current_schema = crate::current_schema_for_search_path(None);
+            return Ok(ExecutionResult::VariableSet);
+        }
+        session_ctx::check_settable_parameter(&name)?;
+        // A parameter name is case-insensitive, so store it folded — the engine reads its own
+        // parameters by their lower-case names, and a quoted `"TimeZone"` must reach the same slot.
+        let mut name = name;
+        name.make_ascii_lowercase();
         // `work_mem` feeds the executor's budget checks, so an unparseable value is rejected here
         // at SET time instead of being stored and then silently ignored by
         // `effective_work_mem`'s fallback.

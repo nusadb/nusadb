@@ -8107,16 +8107,18 @@ fn p12_session_functions_end_to_end() {
         }
     }
 
-    // current_setting reads a SET variable within the same session; an unset name reads back NULL.
+    // current_setting reads a SET parameter within the same session; an unset name reads back NULL.
+    // An application's own parameter carries a class prefix — that prefix is what distinguishes it
+    // from a misspelled built-in, so a bare unknown name is reported rather than silently stored.
     {
         let mut session = Session::new(&engine);
         session
-            .execute(build_plan(&engine, "SET tenant = 'acme'"))
+            .execute(build_plan(&engine, "SET myapp.tenant = 'acme'"))
             .unwrap();
         match session
             .execute(build_plan(
                 &engine,
-                "SELECT current_setting('tenant'), current_setting('missing')",
+                "SELECT current_setting('myapp.tenant'), current_setting('myapp.missing')",
             ))
             .unwrap()
         {
@@ -8126,6 +8128,34 @@ fn p12_session_functions_end_to_end() {
             },
             other => panic!("expected rows, got {other:?}"),
         }
+        // SHOW reads back what SET wrote, under the same dotted name.
+        match session
+            .execute(build_plan(&engine, "SHOW myapp.tenant"))
+            .unwrap()
+        {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Text("acme".to_owned()));
+            },
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // The SQLSTATE is the contract, not the wording: 42704 for a name the engine does not
+        // recognize, 55P02 for one that describes the server rather than the session.
+        let mut code = |sql: &str| match session.execute(build_plan(&engine, sql)) {
+            Err(nusadb_sql::Error::Coded { sqlstate, .. }) => sqlstate,
+            other => panic!("expected a coded error for {sql}, got {other:?}"),
+        };
+        // A bare unknown name is rejected, so a typo cannot look like it took effect …
+        assert_eq!(code("SET tenant = 'acme'"), "42704");
+        // … including the near-miss of a parameter the engine really does read.
+        assert_eq!(code("SET ef_search = 100"), "42704");
+        assert_eq!(code("SET server_version = '1'"), "55P02");
+        // A parameter the engine reads is still settable, whatever case it is written in.
+        session
+            .execute(build_plan(&engine, "SET hnsw_ef_search = 100"))
+            .unwrap();
+        session
+            .execute(build_plan(&engine, "SET TimeZone = 'UTC'"))
+            .unwrap();
     }
 }
 

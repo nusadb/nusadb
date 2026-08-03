@@ -14,6 +14,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::error::Error;
+
 /// The database user reported by `CURRENT_USER`/`SESSION_USER` when no session has pinned one — the
 /// implicit user a bare [`execute`](super::execute) call or a direct evaluator unit test runs as.
 /// This is the bootstrap superuser; the wire server pins each connection's authenticated user via
@@ -119,6 +121,15 @@ pub(super) fn current_schema() -> String {
 /// honest built-in default (kept consistent with `SHOW name`). `current_setting(name)` maps `None`
 /// to SQL `NULL`.
 pub(super) fn setting(name: &str) -> Option<String> {
+    // Parameter names are case-insensitive and stored folded, so fold the lookup too — only when
+    // it would change anything, to keep the common all-lower-case call allocation-free.
+    let folded;
+    let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        folded = name.to_ascii_lowercase();
+        folded.as_str()
+    } else {
+        name
+    };
     SESSION_CONTEXT
         .with(|cell| {
             cell.borrow()
@@ -141,5 +152,58 @@ pub(super) fn builtin_guc_static_default(name: &str) -> Option<&'static str> {
         "datestyle" => "ISO, MDY",
         "timezone" => "UTC",
         _ => return None,
+    })
+}
+
+/// Check that `name` is a configuration parameter a session may `SET`.
+///
+/// A parameter this engine does not read cannot be honoured, so accepting one would store a value
+/// that never takes effect — the trap that makes `SET ef_search = 100` look like it tuned the beam
+/// width whose real name is `hnsw_ef_search`. A parameter carrying a dot is an application's own
+/// (`myapp.tenant`); that class prefix is exactly what separates it from a misspelled built-in, so
+/// it needs no fixed list. Names are matched case-insensitively, since a quoted `"TimeZone"` keeps
+/// its case but denotes the same parameter.
+///
+/// Both the embedded session and the wire server call this, so the two cannot drift apart.
+///
+/// # Errors
+/// [`Error::Coded`] `55P02` for a parameter that describes the server rather than the session, and
+/// `42704` for one this engine does not recognize.
+pub fn check_settable_parameter(name: &str) -> Result<(), Error> {
+    let folded = name.to_ascii_lowercase();
+    if matches!(
+        folded.as_str(),
+        "server_version" | "server_encoding" | "integer_datetimes"
+    ) {
+        return Err(Error::Coded {
+            message: format!("parameter \"{name}\" cannot be changed"),
+            sqlstate: "55P02", // cant_change_runtime_param
+        });
+    }
+    let recognized = folded.contains('.')
+        || matches!(
+            folded.as_str(),
+            // Parameters the engine reads.
+            "search_path"
+                | "work_mem"
+                | "statement_timeout"
+                | "hnsw_ef_search"
+                // Reported parameters a session may still set.
+                | "client_encoding"
+                | "standard_conforming_strings"
+                | "datestyle"
+                | "timezone"
+                | "transaction_isolation"
+                | "default_transaction_isolation"
+        );
+    if recognized {
+        return Ok(());
+    }
+    Err(Error::Coded {
+        message: format!(
+            "unrecognized configuration parameter \"{name}\" — an application's own parameter \
+             must carry a class prefix, as in \"myapp.{folded}\""
+        ),
+        sqlstate: "42704", // undefined_object
     })
 }
