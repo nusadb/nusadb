@@ -171,7 +171,7 @@ pub(super) fn run_create_table(
     }
     // Register each FOREIGN KEY.
     for fk in &plan.foreign_keys {
-        register_foreign_key(id, fk, engine, txn)?;
+        register_foreign_key(id, &def.schema, fk, engine, txn)?;
     }
     // Register each CHECK constraint: the canonical predicate SQL is persisted opaquely so
     // INSERT/UPDATE/COPY can re-parse and evaluate it per row.
@@ -225,19 +225,48 @@ pub(super) fn run_create_table(
 /// ALTER TABLE ADD CONSTRAINT). Resolves the parent table against the live catalog and declares the
 /// constraint — the engine validates the parent has a `PRIMARY KEY`. v1 references the parent's
 /// `PRIMARY KEY` only: an explicit `REFERENCES parent(cols)` that is not exactly the parent's PK, or
+/// Resolve the table a foreign key points at.
+///
+/// The name is tried whole first, so every target that resolved before resolves to the same table —
+/// a key already pointing at the default schema keeps pointing there, and a table whose own name
+/// contains a dot is still found. Only a name that would otherwise have been reported missing takes
+/// the two further steps: read a qualifier out of it, then look in the referencing table's own
+/// schema, so a table can reference a sibling without repeating the schema they share.
+fn resolve_parent_table(
+    child_schema: &str,
+    parent: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<TableSchema, Error> {
+    if let Some(t) = engine.lookup_table_as_of(txn, parent)? {
+        return Ok(t);
+    }
+    if let Some((schema, name)) = parent.split_once('.')
+        && let Some(t) = engine.lookup_table_as_of_in(txn, schema, name)?
+    {
+        return Ok(t);
+    }
+    engine
+        .lookup_table_as_of_in(txn, child_schema, parent)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: parent.to_owned(),
+        })
+}
+
+/// Register one `FOREIGN KEY` on child table `child_id` (shared by CREATE TABLE and
+/// ALTER TABLE ADD CONSTRAINT). Resolves the parent table against the live catalog and declares the
+/// constraint — the engine validates the parent has a `PRIMARY KEY`. v1 references the parent's
+/// `PRIMARY KEY` only: an explicit `REFERENCES parent(cols)` that is not exactly the parent's PK, or
 /// any arity mismatch, is rejected (silently redirecting to the PK would mis-enforce). This does NOT
 /// validate existing child rows — `ALTER TABLE ADD` does that separately.
 pub(super) fn register_foreign_key(
     child_id: nusadb_core::TableId,
+    child_schema: &str,
     fk: &crate::planner::ForeignKeySpec,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let parent = engine
-        .lookup_table_as_of(txn, &fk.parent_table)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: fk.parent_table.clone(),
-        })?;
+    let parent = resolve_parent_table(child_schema, &fk.parent_table, engine, txn)?;
     let parent_constraints = engine.list_constraints(parent.id)?;
     // The referenced parent columns: an explicit `REFERENCES parent (cols)` list, else the parent's
     // PRIMARY KEY (the unqualified `REFERENCES parent` form).
@@ -599,7 +628,7 @@ pub(super) fn run_alter_table(
         // ADD FOREIGN KEY: register it, then validate the table's existing rows reference
         // live parent rows. A violation errors and the rollback-aware DDL unwinds the registration.
         AlterTablePlan::AddForeignKey { table, fk } => {
-            register_foreign_key(table.id, &fk, engine, txn)?;
+            register_foreign_key(table.id, &table.schema, &fk, engine, txn)?;
             let existing = scan_rows(&table, engine, txn)?;
             dml::enforce_fk_on_child_write(&table, &existing, engine, txn)?;
             return Ok(ExecutionResult::Altered);

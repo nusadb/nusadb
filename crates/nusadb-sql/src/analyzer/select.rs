@@ -2734,10 +2734,23 @@ pub(super) fn analyze_aggregate(
     }
 }
 
+/// The name an un-aliased select-list expression reports as its output column.
+///
+/// A call names its column after the function, which is what tools reading result-set metadata —
+/// object mappers, reporting front-ends — key on; `count(*)` reporting `?column?` leaves them with
+/// nothing to bind to. A cast keeps the name of what it converts, and anything with no name of its
+/// own falls back to the placeholder.
 pub(super) fn projection_name(expr: &ast::Expr) -> String {
     match expr {
-        ast::Expr::Column(name) => name.clone(),
+        // A call to a function this engine does not know by name carries the name as written,
+        // in the same shape a column does.
+        ast::Expr::Column(name) | ast::Expr::FunctionCall { name, .. } => name.clone(),
         ast::Expr::QualifiedColumn { column, .. } => column.clone(),
+        ast::Expr::Aggregate { func, .. } => func.name().to_owned(),
+        ast::Expr::ScalarFunction { func, .. } => func.name().to_owned(),
+        ast::Expr::Cast { expr, .. } => projection_name(expr),
+        ast::Expr::Case { .. } => "case".to_owned(),
+        ast::Expr::Coalesce(_) => "coalesce".to_owned(),
         _ => "?column?".to_owned(),
     }
 }

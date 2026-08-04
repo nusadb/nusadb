@@ -182,7 +182,7 @@ pub(super) fn convert_column_def(
                 lifted.push(ast::TableConstraint::ForeignKey {
                     name: None,
                     columns: vec![name.clone()],
-                    foreign_table: object_name(&fk.foreign_table)?,
+                    foreign_table: referenced_table_name(&fk.foreign_table)?,
                     referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
                     on_delete: fk.on_delete.map(convert_referential_action),
                     on_update: fk.on_update.map(convert_referential_action),
@@ -1217,6 +1217,19 @@ pub(super) fn convert_column_change(
 /// Lower a table-level constraint. Only PRIMARY KEY / UNIQUE / FOREIGN KEY /
 /// CHECK are modelled; index hints (`USING`, `KEY`/`INDEX` display, index
 /// options) and deferrable-constraint characteristics are rejected.
+/// The table a `REFERENCES` clause points at, keeping any schema qualifier.
+///
+/// Unlike a name being *defined*, a referenced table may live in another schema, so the qualifier is
+/// carried through as `schema.table` and resolved when the key is registered. A bare name is left
+/// bare, to be resolved against the referencing table's own schema.
+fn referenced_table_name(name: &sql::ObjectName) -> Result<String, Error> {
+    match name.0.as_slice() {
+        [part] => fold_part(part),
+        [schema, table] => Ok(format!("{}.{}", fold_part(schema)?, fold_part(table)?)),
+        _ => unsupported("REFERENCES with a name of more than two parts"),
+    }
+}
+
 pub(super) fn convert_table_constraint(
     c: sql::TableConstraint,
 ) -> Result<ast::TableConstraint, Error> {
@@ -1266,7 +1279,7 @@ pub(super) fn convert_table_constraint(
             Ok(ast::TableConstraint::ForeignKey {
                 name: fk.name.as_ref().map(fold_ident),
                 columns: fk.columns.iter().map(fold_ident).collect(),
-                foreign_table: object_name(&fk.foreign_table)?,
+                foreign_table: referenced_table_name(&fk.foreign_table)?,
                 referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
                 on_delete: fk.on_delete.map(convert_referential_action),
                 on_update: fk.on_update.map(convert_referential_action),

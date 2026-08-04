@@ -332,6 +332,11 @@ fn slt_p1_schema_qualified() {
 }
 
 #[test]
+fn slt_p1_fk_cross_schema() {
+    run_slt("tests/slt/p1_ddl/fk_cross_schema.slt");
+}
+
+#[test]
 fn slt_p1_information_schema() {
     run_slt("tests/slt/p1_ddl/information_schema.slt");
 }

@@ -9314,3 +9314,38 @@ fn bench_order_by_limit_at_scale() {
         50_000,
     );
 }
+
+/// An un-aliased select-list expression names its output column after the function it calls.
+///
+/// Reporting `?column?` for every one of them leaves a client that binds results by column name —
+/// an object mapper, a reporting front-end — with nothing to key on. The names below are the ones
+/// the reference engine reports for the same query.
+#[test]
+fn projection_columns_are_named_after_their_function() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (a INT, s TEXT)");
+    run(&engine, "INSERT INTO t VALUES (1,'x'), (2,'y')");
+
+    let names = |sql: &str| match run(&engine, sql) {
+        ExecutionResult::Rows { columns, .. } => columns,
+        other => panic!("expected rows, got {other:?}"),
+    };
+
+    // Aggregates and scalar functions each report their own name.
+    assert_eq!(
+        names("SELECT count(*), sum(a), avg(a), min(a), max(a) FROM t"),
+        ["count", "sum", "avg", "min", "max"]
+    );
+    assert_eq!(
+        names("SELECT lower(s), upper(s), abs(a), coalesce(a,0) FROM t"),
+        ["lower", "upper", "abs", "coalesce"]
+    );
+    // A cast keeps the name of what it converts; an expression with no name of its own keeps the
+    // placeholder rather than borrowing one.
+    assert_eq!(names("SELECT a::BIGINT, a + 1 FROM t"), ["a", "?column?"]);
+    // An explicit alias always wins, and a plain column keeps its own name.
+    assert_eq!(
+        names("SELECT count(*) AS total, a FROM t GROUP BY a"),
+        ["total", "a"]
+    );
+}

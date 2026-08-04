@@ -1,0 +1,74 @@
+# p1_ddl/fk_cross_schema — a foreign key may point at a table in another schema.
+# CREATE TABLE and SELECT already accepted a schema-qualified name, but REFERENCES rejected it, and
+# a bare name written from inside a schema resolved only against the default one — so a foreign key
+# could not be declared between two tables that both lived outside `public`.
+
+statement ok
+CREATE SCHEMA sales
+
+statement ok
+CREATE TABLE sales.customers (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO sales.customers VALUES (1)
+
+# A qualified target, referenced from the default schema.
+statement ok
+CREATE TABLE ord (id INT PRIMARY KEY, cid INT REFERENCES sales.customers(id))
+
+statement ok
+INSERT INTO ord VALUES (10, 1)
+
+statement error
+INSERT INTO ord VALUES (11, 999)
+
+# A bare target, referenced from inside the schema that holds it.
+statement ok
+CREATE TABLE sales.invoices (id INT PRIMARY KEY, cid INT REFERENCES customers(id))
+
+statement ok
+INSERT INTO sales.invoices VALUES (20, 1)
+
+statement error
+INSERT INTO sales.invoices VALUES (21, 999)
+
+# The parent still refuses to leave dependents behind.
+statement error
+DELETE FROM sales.customers WHERE id = 1
+
+# A qualified target that does not exist is reported, not silently resolved elsewhere.
+statement error
+CREATE TABLE bad (id INT, cid INT REFERENCES sales.nosuch(id))
+
+# A bare target keeps binding where it already bound. With a table of the same name in the default
+# schema and in another, an unqualified reference written from inside the other schema still means
+# the default one — silently rebinding it would change which table integrity is enforced against.
+
+statement ok
+CREATE TABLE dup (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO dup VALUES (1)
+
+statement ok
+CREATE TABLE sales.dup (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO sales.dup VALUES (99)
+
+statement ok
+CREATE TABLE sales.uses_dup (id INT PRIMARY KEY, ref INT REFERENCES dup(id))
+
+# 1 lives in the default schema's table, 99 only in the other one.
+statement ok
+INSERT INTO sales.uses_dup VALUES (1, 1)
+
+statement error
+INSERT INTO sales.uses_dup VALUES (2, 99)
+
+# A table whose own name contains a dot is still found rather than read as a qualifier.
+statement ok
+CREATE TABLE "a.b" (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE dotted_child (id INT PRIMARY KEY, r INT REFERENCES "a.b"(id))

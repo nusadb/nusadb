@@ -2366,7 +2366,7 @@ fn cardinality_counts_array_elements() {
     let engine = seeded_arrays();
     let (cols, rows) =
         rows_of(run("SELECT id, cardinality(tags) FROM t ORDER BY id", &engine).unwrap());
-    assert_eq!(cols, ["id", "?column?"]);
+    assert_eq!(cols, ["id", "cardinality"]);
     assert_eq!(
         rows,
         vec![
@@ -2444,7 +2444,7 @@ fn array_agg_collects_values_per_group_including_nulls() {
         )
         .unwrap(),
     );
-    assert_eq!(cols, ["grp", "?column?"]);
+    assert_eq!(cols, ["grp", "array_agg"]);
     // Group 1 keeps input order and the NULL; group 2 has a single value.
     assert_eq!(
         rows,

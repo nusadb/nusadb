@@ -1300,6 +1300,47 @@ pub enum AggregateFunc {
 }
 
 impl AggregateFunc {
+    /// The canonical (folded) name, used as the default name of an output column that the query
+    /// did not alias — tools that read result-set column names expect the function's own name there.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::PercentileCont => "percentile_cont",
+            Self::PercentileDisc => "percentile_disc",
+            Self::Mode => "mode",
+            Self::ArrayAgg => "array_agg",
+            Self::JsonAgg => "json_agg",
+            Self::BoolAnd => "bool_and",
+            Self::BoolOr => "bool_or",
+            Self::Stddev => "stddev",
+            Self::Variance => "variance",
+            Self::Corr => "corr",
+            Self::CovarPop => "covar_pop",
+            Self::CovarSamp => "covar_samp",
+            Self::RegrCount => "regr_count",
+            Self::RegrAvgx => "regr_avgx",
+            Self::RegrAvgy => "regr_avgy",
+            Self::RegrSxx => "regr_sxx",
+            Self::RegrSyy => "regr_syy",
+            Self::RegrSxy => "regr_sxy",
+            Self::RegrSlope => "regr_slope",
+            Self::RegrIntercept => "regr_intercept",
+            Self::RegrR2 => "regr_r2",
+            Self::BitAnd => "bit_and",
+            Self::BitOr => "bit_or",
+            Self::BitXor => "bit_xor",
+            Self::StddevPop => "stddev_pop",
+            Self::VarPop => "var_pop",
+            Self::StringAgg => "string_agg",
+            Self::Grouping => "grouping",
+        }
+    }
+
     /// Whether this is a two-argument statistical aggregate over `(y, x)` pairs — `CORR`, the
     /// `COVAR_*` covariances, and the `REGR_*` linear-regression family. These carry a second
     /// per-row argument and fold a pair only when both sides are non-`NULL`.

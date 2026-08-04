@@ -82,6 +82,15 @@ fn history_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".nusa_history"))
 }
 
+/// Drop a leading byte-order mark from SQL text.
+///
+/// An editor on Windows normally writes one, and it is not SQL — left in place it fails on the very
+/// first character. Only offset zero is considered, and that position cannot be inside a string
+/// literal, so the same character appearing in a value is untouched.
+fn strip_bom(sql: &str) -> &str {
+    sql.strip_prefix('\u{feff}').unwrap_or(sql)
+}
+
 /// Run a batch of `;`-separated statements, printing each result in `format`. Server errors are
 /// printed and do not stop the batch.
 async fn run_batch<S>(
@@ -221,10 +230,10 @@ where
     }
 
     if let Some(command) = &args.command {
-        run_batch(&mut conn, command, args.format).await?;
+        run_batch(&mut conn, strip_bom(command), args.format).await?;
     } else if let Some(path) = &args.file {
         let body = std::fs::read_to_string(path)?;
-        run_batch(&mut conn, &body, args.format).await?;
+        run_batch(&mut conn, strip_bom(&body), args.format).await?;
     } else {
         repl(&mut conn, args.format, &args.database).await?;
     }
@@ -269,5 +278,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_session(Connection::new(stream), &args, interactive).await
     } else {
         run_session(Connection::new(tcp), &args, interactive).await
+    }
+}
+
+#[cfg(test)]
+mod bom_tests {
+    use super::strip_bom;
+
+    #[test]
+    fn a_leading_mark_goes_and_nothing_else_does() {
+        assert_eq!(strip_bom("\u{feff}SELECT 1"), "SELECT 1");
+        assert_eq!(strip_bom("SELECT 1"), "SELECT 1");
+        // Only the first one: a second is real text, and one inside a value is left alone.
+        assert_eq!(strip_bom("\u{feff}\u{feff}SELECT 1"), "\u{feff}SELECT 1");
+        assert_eq!(strip_bom("SELECT '\u{feff}'"), "SELECT '\u{feff}'");
+        assert_eq!(strip_bom(""), "");
     }
 }
