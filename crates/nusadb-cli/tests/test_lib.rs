@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use nusadb_btree::BtreeEngine;
 use nusadb_cli::{
-    OutputFormat, collect_result, format_result, handshake, render_data_row, run_query,
-    split_statements,
+    CopyIo, OutputFormat, collect_result, collect_result_with_copy, format_result, handshake,
+    render_data_row, run_query, split_statements,
 };
 use nusadb_core::StorageEngine;
 use nusadb_wire::{AuthStore, Connection, ServerConfig, serve, serve_with_shutdown};
@@ -151,6 +151,157 @@ async fn batch_collects_structured_results_and_formats_them() {
         format_result(&select, OutputFormat::Json),
         vec![r#"[{"id":"5","name":"alice"}]"#.to_owned()]
     );
+
+    server.abort();
+}
+
+/// `COPY … FROM STDIN` loads the bytes it is handed, and `COPY … TO STDOUT` writes the rows back.
+/// Before the client understood the COPY sub-protocol it ignored the server's `CopyInResponse` and
+/// waited for a `ReadyForQuery` that could not come while the server waited for data — the session
+/// hung until it was killed.
+#[tokio::test]
+async fn copy_streams_data_in_and_out() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let server = tokio::spawn(serve(listener, engine));
+    let mut conn = Connection::new(TcpStream::connect(addr).await.unwrap());
+    handshake(&mut conn, "u", "nusadb", None).await.unwrap();
+    collect_result(&mut conn, "CREATE TABLE t (id INT NOT NULL, s TEXT)")
+        .await
+        .unwrap();
+
+    // Server text format: tab-delimited, `\N` for NULL.
+    let mut source: &[u8] = b"1\talice\n2\t\\N\n3\tbob\n";
+    let loaded = collect_result_with_copy(
+        &mut conn,
+        "COPY t FROM STDIN",
+        CopyIo {
+            source: Some(&mut source),
+            sink: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded.error, None, "COPY FROM STDIN reported an error");
+    assert_eq!(loaded.tag.as_deref(), Some("COPY 3"));
+    // The flag a batch reads to know the single input stream is spent. Without it a second COPY in
+    // the same batch silently loads nothing.
+    assert!(loaded.copied_in, "the load consumed the source stream");
+
+    // The rows are really there, NULL included.
+    let rows = collect_result(&mut conn, "SELECT id, s FROM t ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"alice".to_vec())],
+            vec![Some(b"2".to_vec()), None],
+            vec![Some(b"3".to_vec()), Some(b"bob".to_vec())],
+        ]
+    );
+
+    // Export round-trips: what comes back out is what went in.
+    let mut sink: Vec<u8> = Vec::new();
+    let exported = collect_result_with_copy(
+        &mut conn,
+        "COPY t TO STDOUT",
+        CopyIo {
+            source: None,
+            sink: Some(&mut sink),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(exported.error, None);
+    assert_eq!(exported.tag.as_deref(), Some("COPY 3"));
+    // The flag that keeps the command tag off the data stream. Without it `COPY 3` is appended to
+    // the exported rows and the file no longer loads back.
+    assert!(exported.copied_out, "the export wrote to the sink");
+    assert_eq!(
+        String::from_utf8(sink).unwrap(),
+        "1\talice\n2\t\\N\n3\tbob\n"
+    );
+
+    server.abort();
+}
+
+/// A `COPY` with no stream to serve it is refused and the session stays usable. The failure mode
+/// this replaces was a client that waited forever, which no timeout in the CLI would have caught.
+#[tokio::test]
+async fn copy_without_a_stream_is_refused_not_hung() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let server = tokio::spawn(serve(listener, engine));
+    let mut conn = Connection::new(TcpStream::connect(addr).await.unwrap());
+    handshake(&mut conn, "u", "nusadb", None).await.unwrap();
+    collect_result(&mut conn, "CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
+
+    // `collect_result` attaches no streams. Bound the wait so a regression reports rather than
+    // wedging the suite.
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        collect_result(&mut conn, "COPY t FROM STDIN"),
+    )
+    .await
+    .expect("COPY without input must not hang")
+    .unwrap();
+    let err = refused.error.expect("expected a refusal");
+    assert!(
+        err.contains("needs input"),
+        "wanted the needs-input refusal, got `{err}`"
+    );
+
+    // The connection is still in protocol sync afterwards.
+    let after = collect_result(&mut conn, "SELECT count(*) FROM t")
+        .await
+        .unwrap();
+    assert_eq!(after.rows, vec![vec![Some(b"0".to_vec())]]);
+
+    server.abort();
+}
+
+/// `COPY … TO STDOUT` with nowhere to write is refused, and the rows the server already sent are
+/// discarded so the session stays in protocol sync. That direction never reads from the client, so
+/// the refusal cannot be a reply — it has to be a local error.
+#[tokio::test]
+async fn copy_out_without_a_sink_is_refused_and_drains() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let server = tokio::spawn(serve(listener, engine));
+    let mut conn = Connection::new(TcpStream::connect(addr).await.unwrap());
+    handshake(&mut conn, "u", "nusadb", None).await.unwrap();
+    collect_result(&mut conn, "CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
+    collect_result(&mut conn, "INSERT INTO t VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        collect_result(&mut conn, "COPY t TO STDOUT"),
+    )
+    .await
+    .expect("COPY TO STDOUT without a sink must not hang")
+    .unwrap();
+    let err = refused.error.expect("expected a refusal");
+    assert!(
+        err.contains("had no sink"),
+        "wanted the no-sink refusal, got `{err}`"
+    );
+    assert!(!refused.copied_out, "nothing was written anywhere");
+
+    // Still in sync: the discarded rows did not desynchronise the frame stream.
+    let after = collect_result(&mut conn, "SELECT count(*) FROM t")
+        .await
+        .unwrap();
+    assert_eq!(after.rows, vec![vec![Some(b"2".to_vec())]]);
 
     server.abort();
 }

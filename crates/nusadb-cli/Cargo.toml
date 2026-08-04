@@ -19,7 +19,8 @@ path = "src/main.rs"
 nusadb-wire  = { workspace = true }
 clap         = { workspace = true }
 rustyline    = { workspace = true }
-tokio        = { workspace = true }
+# `io-std` adds `tokio::io::stdin()`/`stdout()`, the streams a COPY reads from and writes to.
+tokio        = { workspace = true, features = ["io-std"] }
 tracing      = { workspace = true }
 rustls       = { workspace = true }
 tokio-rustls = { workspace = true }

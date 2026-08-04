@@ -205,15 +205,127 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
     /// `CommandComplete` tag (e.g. `SELECT 1`, `CREATE TABLE`), if the statement completed.
     pub tag: Option<String>,
-    /// The rendered error line (`ERROR <code>: <message>`) if the server rejected the statement.
+    /// The rendered error line if the statement failed: `ERROR <code>: <message>` when the server
+    /// rejected it, or `ERROR: <message>` for a refusal the client raised on its own.
     pub error: Option<String>,
+    /// Set when this statement streamed `COPY … TO STDOUT` rows into the caller's sink. The tag
+    /// then must not be written to that same stream — appending `COPY 3` to exported rows makes
+    /// the file fail to load back.
+    ///
+    /// A `COPY … TO STDOUT` with no sink leaves this `false` and sets [`error`](Self::error), but
+    /// the server counts the export a success, so [`tag`](Self::tag) is also set. A caller reading
+    /// the fields directly should test `error` first.
+    pub copied_out: bool,
+    /// Set when this statement read the caller's source stream to feed `COPY … FROM STDIN`. A
+    /// single stream serves one load, so a caller running a batch knows not to offer it again.
+    pub copied_in: bool,
+}
+
+/// Stream `source` to the server as `CopyData` frames, then `CopyDone`. A read failure sends
+/// `CopyFail` instead, which keeps the connection in protocol sync (the server rolls the load back
+/// and returns to ready) rather than leaving it mid-`COPY`.
+///
+/// No explicit flush is needed: frames below the write buffer's threshold stay buffered, and the
+/// caller's next `read_frame` flushes before it waits. A small payload would otherwise sit in the
+/// buffer while both sides waited for each other.
+async fn send_copy_data<S>(
+    conn: &mut Connection<S>,
+    source: &mut (dyn AsyncRead + Unpin + Send),
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match source.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = buf.get(..n).unwrap_or(&[]).to_vec();
+                conn.write_frame(&FrontendMessage::CopyData { data: chunk }.encode()?)
+                    .await?;
+            },
+            Err(e) => {
+                conn.write_frame(
+                    &FrontendMessage::CopyFail {
+                        message: format!("client read error during COPY: {e}"),
+                    }
+                    .encode()?,
+                )
+                .await?;
+                return Ok(());
+            },
+        }
+    }
+    conn.write_frame(&FrontendMessage::CopyDone.encode()?).await
+}
+
+/// Abandon a `COPY … FROM STDIN` the client cannot serve. `CopyFail` puts the server back in
+/// charge: it rolls the load back and echoes `message` inside its own `ErrorResponse`, which the
+/// collector records — so no client-side error is set here, or it would be overwritten anyway.
+async fn fail_copy_in<S>(conn: &mut Connection<S>, message: &str) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    conn.write_frame(
+        &FrontendMessage::CopyFail {
+            message: message.to_owned(),
+        }
+        .encode()?,
+    )
+    .await
+}
+
+/// The data streams a `COPY` statement needs.
+///
+/// `source` feeds `COPY … FROM STDIN`, `sink` receives `COPY … TO STDOUT`. Either may be absent,
+/// in which case a `COPY` needing it is failed with an explanatory error rather than left waiting
+/// — the server is mid-`COPY` and would otherwise block forever for data that is never coming.
+#[derive(Default)]
+#[expect(
+    missing_debug_implementations,
+    reason = "holds borrowed trait objects with no Debug bound; the streams have nothing to print"
+)]
+pub struct CopyIo<'a> {
+    /// Bytes to send as the `COPY … FROM STDIN` payload (server text format: tab-delimited,
+    /// `\N` for NULL, unless the statement's `WITH` options say otherwise).
+    pub source: Option<&'a mut (dyn AsyncRead + Unpin + Send)>,
+    /// Where to write the rows a `COPY … TO STDOUT` streams back.
+    pub sink: Option<&'a mut (dyn AsyncWrite + Unpin + Send)>,
 }
 
 /// Run one SQL statement and collect its result into a [`QueryResult`].
 ///
+/// A `COPY` that needs a data stream is refused (see [`collect_result_with_copy`], which this
+/// delegates to with no streams attached).
+///
 /// # Errors
 /// I/O errors or an early disconnect.
 pub async fn collect_result<S>(conn: &mut Connection<S>, sql: &str) -> io::Result<QueryResult>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    collect_result_with_copy(conn, sql, CopyIo::default()).await
+}
+
+/// Run one SQL statement, streaming a `COPY`'s data through `copy` if it turns out to be one.
+///
+/// The `COPY` sub-protocol is a mode switch, not a normal reply: after `CopyInResponse` the server
+/// reads `CopyData` frames until `CopyDone`, and after `CopyOutResponse` it writes them. A client
+/// that ignores those replies and waits for `ReadyForQuery` deadlocks against a server waiting for
+/// data. With no `source` to feed a `COPY … FROM STDIN` the load is abandoned with `CopyFail`; with
+/// no `sink` for a `COPY … TO STDOUT` the rows are read and discarded, since that direction never
+/// reads from the client. Either way the caller gets an error instead of a session that hangs.
+///
+/// # Errors
+/// I/O errors or an early disconnect. A `COPY` the server refuses, or one with no stream to serve
+/// it, is reported in [`QueryResult::error`] with the connection left ready for the next statement.
+pub async fn collect_result_with_copy<S>(
+    conn: &mut Connection<S>,
+    sql: &str,
+    mut copy: CopyIo<'_>,
+) -> io::Result<QueryResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -228,6 +340,46 @@ where
     loop {
         let frame = conn.read_frame().await?.ok_or_else(unexpected_eof)?;
         match BackendMessage::decode(&frame).map_err(io::Error::other)? {
+            // COPY … FROM STDIN: stream `source` up in 64 KiB chunks, then `CopyDone`. The server
+            // replies `CommandComplete` + `ReadyForQuery`, so the loop carries on from here.
+            BackendMessage::CopyInResponse { .. } => {
+                if let Some(source) = copy.source.as_deref_mut() {
+                    send_copy_data(conn, source).await?;
+                    result.copied_in = true;
+                } else {
+                    fail_copy_in(
+                        conn,
+                        "COPY … FROM STDIN needs input; redirect a file into the command (one \
+                         redirect feeds one load)",
+                    )
+                    .await?;
+                }
+            },
+            // COPY … TO STDOUT: the server writes `CopyData` frames and never reads back, so an
+            // absent sink is handled by discarding them below rather than by replying — a
+            // `CopyFail` here is a frame the server documents as a client bug and drops.
+            BackendMessage::CopyOutResponse { .. } => {
+                result.copied_out = copy.sink.is_some();
+                if copy.sink.is_none() {
+                    result.error = Some(
+                        "ERROR: COPY … TO STDOUT had no sink for the exported rows; they were \
+                         discarded"
+                            .to_owned(),
+                    );
+                }
+            },
+            BackendMessage::CopyData { data } => {
+                if let Some(sink) = copy.sink.as_deref_mut() {
+                    use tokio::io::AsyncWriteExt as _;
+                    sink.write_all(&data).await?;
+                }
+            },
+            BackendMessage::CopyDone => {
+                if let Some(sink) = copy.sink.as_deref_mut() {
+                    use tokio::io::AsyncWriteExt as _;
+                    sink.flush().await?;
+                }
+            },
             BackendMessage::RowDescription { columns } => result.columns = columns,
             // Protocol 1.1 typed metadata: take the names; the CLI renders untyped text.
             BackendMessage::RowDescriptionTyped { columns } => {
@@ -239,8 +391,7 @@ where
                 result.error = Some(format!("ERROR {code}: {message}"));
             },
             BackendMessage::ReadyForQuery(_) => return Ok(result),
-            // Auth, extended-query, and COPY replies do not drive this simple-query collector (the
-            // CLI does not render the COPY sub-protocol interactively yet — a follow-up). An
+            // Auth and extended-query replies do not drive this simple-query collector. An
             // asynchronous LISTEN/NOTIFY delivery is not part of a query's result stream (the server
             // sends it only between statements), so it is ignored here; surfacing it interactively is
             // a LISTEN/NOTIFY follow-up.
@@ -254,10 +405,6 @@ where
             | BackendMessage::ParameterDescription { .. }
             | BackendMessage::NoData
             | BackendMessage::PortalSuspended
-            | BackendMessage::CopyInResponse { .. }
-            | BackendMessage::CopyOutResponse { .. }
-            | BackendMessage::CopyData { .. }
-            | BackendMessage::CopyDone
             | BackendMessage::ParameterStatus { .. }
             | BackendMessage::NotificationResponse { .. }
             | BackendMessage::BackendKeyData { .. } => {},
@@ -649,6 +796,7 @@ mod tests {
             ],
             tag: Some("SELECT 2".to_owned()),
             error: None,
+            ..QueryResult::default()
         }
     }
 

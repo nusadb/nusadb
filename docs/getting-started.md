@@ -39,6 +39,27 @@ Connect to a specific database by name (each connection targets one database):
 ./target/release/nusa-cli --host 127.0.0.1:5678 --user nusa-root --database app
 ```
 
+## Bulk load and export
+
+`COPY` moves rows in and out in one streaming exchange rather than a round trip per row. The
+shell forms read as they look — the data travels on the command's own standard input and output:
+
+```bash
+# Load: tab-delimited, \N for NULL (the server's text format)
+nusa-cli --host 127.0.0.1:5678 -c "COPY t FROM STDIN" < rows.tsv
+
+# Export the same way
+nusa-cli --host 127.0.0.1:5678 -c "COPY t TO STDOUT" > rows.tsv
+
+# CSV, with a header line
+nusa-cli --host 127.0.0.1:5678 -c "COPY t FROM STDIN WITH (FORMAT csv, HEADER)" < rows.csv
+```
+
+The row count is reported on standard error during an export, so it never lands in the exported
+file. One redirect feeds one load: a batch holding two `COPY … FROM STDIN` statements refuses the
+second rather than reporting that it loaded nothing. A `COPY … FROM STDIN` typed at the interactive
+prompt is refused too — there the keyboard is already the session's input.
+
 ## Breaking change: the `lsm` storage engine was removed (2026-07-09)
 
 The clustered B-link/B+tree engine (`btree`) is now NusaDB's only storage engine.

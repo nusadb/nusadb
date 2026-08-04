@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use nusadb_cli::{
-    META_HELP, Meta, OutputFormat, collect_result, format_result, handshake, is_complete_statement,
-    parse_meta, split_statements, strip_terminator, tls_client_config,
+    CopyIo, META_HELP, Meta, OutputFormat, collect_result, collect_result_with_copy, format_result,
+    handshake, is_complete_statement, parse_meta, split_statements, strip_terminator,
+    tls_client_config,
 };
 use nusadb_wire::{Connection, FrontendMessage};
 use rustls::pki_types::ServerName;
@@ -93,6 +94,18 @@ fn strip_bom(sql: &str) -> &str {
 
 /// Run a batch of `;`-separated statements, printing each result in `format`. Server errors are
 /// printed and do not stop the batch.
+///
+/// A `COPY … FROM STDIN` reads the process's standard input, and a `COPY … TO STDOUT` writes to
+/// standard output, so the shell forms work as they read:
+///
+/// ```text
+/// nusa-cli -c "COPY t FROM STDIN" < rows.tsv
+/// nusa-cli -c "COPY t TO STDOUT"  > rows.tsv
+/// ```
+///
+/// Both batch forms read their SQL from elsewhere — the command line or a file — so standard input
+/// is free to carry the data either way. The interactive REPL is the exception: there stdin is the
+/// user's keyboard, so a `COPY` typed at the prompt is refused rather than fed the session itself.
 async fn run_batch<S>(
     conn: &mut Connection<S>,
     sql: &str,
@@ -101,9 +114,29 @@ async fn run_batch<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    // One redirect feeds one load: after a COPY has drained stdin to EOF, a later one in the same
+    // batch would read nothing and report `COPY 0` as if it had succeeded. Withhold the stream so
+    // it is refused out loud instead.
+    let mut stdin_unread = true;
     for stmt in split_statements(sql) {
-        for line in format_result(&collect_result(conn, &stmt).await?, format) {
-            println!("{line}");
+        let source: Option<&mut (dyn AsyncRead + Unpin + Send)> =
+            if stdin_unread { Some(&mut stdin) } else { None };
+        let copy = CopyIo {
+            source,
+            sink: Some(&mut stdout),
+        };
+        let result = collect_result_with_copy(conn, &stmt, copy).await?;
+        stdin_unread &= !result.copied_in;
+        for line in format_result(&result, format) {
+            // A statement that streamed rows to stdout must not have its tag land there too:
+            // `COPY 3` appended to the exported rows makes the file fail to load back.
+            if result.copied_out {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
         }
     }
     Ok(())
