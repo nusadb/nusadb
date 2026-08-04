@@ -26,6 +26,7 @@ pub mod hnsw;
 pub mod inet;
 pub mod interval;
 pub mod json;
+pub mod jsonb;
 pub mod macaddr;
 pub mod numeric;
 pub mod params;

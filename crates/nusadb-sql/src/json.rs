@@ -8,17 +8,50 @@
 
 use serde_json::Value as J;
 
-/// Parse + canonicalize `s`, or `None` if it is not valid JSON.
+/// Parse + canonicalize `s`, or `None` if it is not valid JSON. Goes through [`parse`], so numbers
+/// reach their canonical decimal form rather than being echoed as written.
 #[must_use]
 pub fn canonicalize(s: &str) -> Option<String> {
-    let v: J = serde_json::from_str(s).ok()?;
-    serde_json::to_string(&v).ok()
+    serde_json::to_string(&parse(s)?).ok()
 }
 
 /// Parse JSON text into a [`serde_json::Value`].
+///
+/// Numbers are normalized to canonical decimal on the way in, so `1e3` reads back as `1000` and a
+/// long decimal keeps every digit. `serde_json` is built with `arbitrary_precision`, so a number
+/// arrives as its source literal rather than a rounded `f64`; without the normalization it would
+/// then *print* as that literal (`1e+3`), which is neither the input nor the canonical form.
 #[must_use]
 pub fn parse(s: &str) -> Option<J> {
-    serde_json::from_str(s).ok()
+    let mut value: J = serde_json::from_str(s).ok()?;
+    normalize_numbers(&mut value);
+    Some(value)
+}
+
+/// Rewrite every number in `value` to its canonical decimal text (see
+/// [`crate::jsonb::normalize_number`]). A literal that does not fit is left exactly as written, so
+/// the transformation never loses a digit.
+fn normalize_numbers(value: &mut J) {
+    match value {
+        J::Number(n) => {
+            if let Some(canonical) = crate::jsonb::normalize_number(&n.to_string())
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Number>(&canonical)
+            {
+                *n = parsed;
+            }
+        },
+        J::Array(items) => {
+            for item in items {
+                normalize_numbers(item);
+            }
+        },
+        J::Object(map) => {
+            for val in map.values_mut() {
+                normalize_numbers(val);
+            }
+        },
+        _ => {},
+    }
 }
 
 /// Serialize a [`serde_json::Value`] back to canonical text.
@@ -914,6 +947,30 @@ mod tests {
         assert!(has_all_keys(obj, &["a", "b"]));
         assert!(!has_all_keys(obj, &["a", "z"]));
         assert!(has_all_keys(obj, &[]));
+    }
+
+    #[test]
+    fn numbers_keep_every_digit_and_normalize_the_exponent_form() {
+        // The exponent form expands, and a scale written in the source is kept — both the canonical
+        // decimal the reference engine prints. Neither goes through `f64`.
+        assert_eq!(canonicalize(r#"{"b":1e3}"#).unwrap(), r#"{"b":1000}"#);
+        assert_eq!(canonicalize(r#"{"b":1E3}"#).unwrap(), r#"{"b":1000}"#);
+        assert_eq!(canonicalize(r#"{"b":1.5e-2}"#).unwrap(), r#"{"b":0.015}"#);
+        assert_eq!(canonicalize(r#"{"a":1.0}"#).unwrap(), r#"{"a":1.0}"#);
+        assert_eq!(canonicalize(r#"{"c":1}"#).unwrap(), r#"{"c":1}"#);
+        assert_eq!(canonicalize(r#"{"n":-2.50}"#).unwrap(), r#"{"n":-2.50}"#);
+        // A decimal well past `f64`'s 17 significant digits survives intact — this is the silent
+        // truncation the old `f64` round trip caused.
+        let long = "0.12345678901234567890123456789";
+        assert_eq!(
+            canonicalize(&format!(r#"{{"d":{long}}}"#)).unwrap(),
+            format!(r#"{{"d":{long}}}"#)
+        );
+        // Nested positions are normalized too, not just top-level members.
+        assert_eq!(
+            canonicalize(r#"{"a":[1e2,{"b":2e1}]}"#).unwrap(),
+            r#"{"a":[100,{"b":20}]}"#
+        );
     }
 
     #[test]

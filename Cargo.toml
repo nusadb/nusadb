@@ -80,7 +80,7 @@ sha2           = "0.10"
 getrandom      = "0.3"
 # JSON / JSONB value type + operators. Already in the tree transitively;
 # ubiquitous, deny.toml-compliant. Default features (BTreeMap maps => canonical sorted keys).
-serde_json     = "1"
+serde_json     = { version = "1", features = ["arbitrary_precision"] }
 
 # === Allocator (opt-in, feature-gated in nusadb-server) ===
 mimalloc       = { version = "0.1", default-features = false }

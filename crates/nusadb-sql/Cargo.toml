@@ -39,3 +39,8 @@ criterion         = { workspace = true }
 [[bench]]
 name    = "vectorized_filter"
 harness = false
+
+# Bench: JSON operator cost against document width — the evidence gate for how JSON is stored.
+[[bench]]
+name    = "json_ops"
+harness = false
