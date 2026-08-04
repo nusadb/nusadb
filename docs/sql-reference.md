@@ -89,42 +89,131 @@ deterministic digits) rather than a significant-digit rule; every digit it retur
 and a computation needing a specific scale can `round(expr, n)` or cast to a declared
 `NUMERIC(p, s)`.
 
-## Materialized views stay fresh automatically
+## Materialized views are snapshots; maintenance is opt-in
 
-A materialized view whose body is a single-table projection with an optional `WHERE` filter is
-kept up to date incrementally: every insert, update, or delete on its base table also adjusts the
-view, so a query against the view always reflects the latest base rows without an explicit
-`REFRESH`. This differs from the common convention where a materialized view holds a frozen
-snapshot until refreshed — here that shape of view is never stale, and a `REFRESH` on it is a
-no-op that recomputes the same contents.
+A materialized view holds the rows computed when it was created, and they stay put until you
+`REFRESH MATERIALIZED VIEW` it — the point of materializing is to hold an expensive result still.
 
-Views whose body needs a join or an aggregate are **not** maintained incrementally: they hold the
-result captured at `CREATE`/`REFRESH` time and change only when you `REFRESH` them again. So the
-freshness of a materialized view depends on its shape:
+NusaDB can also keep such a view current, adjusting it on every insert, update or delete to its base
+table so it never needs a `REFRESH`. That is a per-view opt-in, because a view that quietly followed
+its base table would not be doing the job you materialized it for:
 
-| View body                            | Freshness              | `REFRESH` needed? |
-| ------------------------------------ | ---------------------- | ----------------- |
-| single-table projection (+ `WHERE`)  | always current         | no (auto)         |
-| join / aggregate / grouped           | snapshot at last build | yes               |
+```sql
+CREATE MATERIALIZED VIEW big_paid WITH (incremental = true) AS
+SELECT id, amount FROM orders WHERE status = 'paid' AND amount >= 100;
+```
 
-The incremental path writes only the rows that changed, so it avoids rescanning the base table;
-the trade-off is a small maintenance cost on each base-table write while such a view exists. If you
-rely on a materialized view being a stable point-in-time snapshot, use a shape that is
-refresh-only (for example, wrap the projection in a grouping or join), or query a regular `VIEW`
-plus your own snapshot table.
+Incremental maintenance is only possible for a body that is a single base table with a projection
+and an optional `WHERE` — no join, aggregate, `GROUP BY`, window, `DISTINCT`, `HAVING`,
+`LIMIT`/`OFFSET`, CTE or subquery, and no volatile expression (`age()`, `now()`, …), whose stored
+value would drift. Asking for it on any other body is an error rather than a silent downgrade to a
+snapshot, so `WITH (incremental = true)` always means what it says. `WITH (incremental = false)`
+spells out the default.
+
+| View                                    | Freshness              | `REFRESH` needed? |
+| --------------------------------------- | ---------------------- | ----------------- |
+| `CREATE MATERIALIZED VIEW …`            | snapshot at last build | yes               |
+| `… WITH (incremental = true)`           | always current         | no (automatic)    |
+
+The incremental path writes only the rows that changed, so it avoids rescanning the base table; the
+trade-off is a small maintenance cost on every base-table write while such a view exists.
+
+## Assigning between `TIMESTAMP` and `TIMESTAMPTZ`
+
+`CURRENT_TIMESTAMP` (and `now()`) is a `TIMESTAMPTZ`, so the near-universal column definition
+
+```sql
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+```
+
+needs a conversion. NusaDB applies it on assignment, in both directions: a `TIMESTAMPTZ` value
+stores into a `TIMESTAMP` column and vice versa, and `CAST(expr AS TIMESTAMP)` /
+`CAST(expr AS TIMESTAMPTZ)` spell the conversion out in a query. The session time zone is fixed at
+UTC, so the instant is preserved exactly — only the rendering changes (a `TIMESTAMPTZ` prints its
+`+00` offset, a `TIMESTAMP` does not).
+
+*Comparison* is unchanged: the two types still do not compare without an explicit cast, so a mixed
+`WHERE ts_col = tstz_col` is still rejected rather than answered from a guess.
+
+## JSON operators
+
+Beyond navigation (`->`, `->>`, `#>`, `#>>`) and containment (`@>`, `<@`), the `JSON` type supports:
+
+| Operator          | Meaning                                                                  |
+| ----------------- | ------------------------------------------------------------------------ |
+| `json \|\| json`  | merge two objects (the right side wins a shared key), concatenate two arrays, otherwise pair the operands into an array |
+| `json - text`     | delete an object member by name, or every equal string element of an array |
+| `json - int`      | delete an array element by position (negative counts from the end)        |
+| `json - text[]`   | delete several keys at once                                              |
+| `json ? text`     | does the key exist as a top-level object key, array string element, or scalar string? |
+| `json ?\| text[]` | does **any** of the keys exist?                                          |
+| `json ?& text[]`  | do **all** of the keys exist?                                            |
+
+```sql
+SELECT '{"a":1,"b":2}'::json || '{"b":3,"c":4}'::json;   -- {"a": 1, "b": 3, "c": 4}
+SELECT '{"a":1,"b":2}'::json - 'a';                      -- {"b": 2}
+SELECT '[10,20,30]'::json - (-1);                        -- [10, 20]
+SELECT doc ?& ARRAY['a','b'] FROM t;                     -- both keys present?
+```
+
+The merge is shallow: `{"a":{"x":1}} || {"a":{"y":2}}` is `{"a": {"y": 2}}`, not a recursive merge.
+Deleting from a scalar document, or by integer index from an object, is an error (SQLSTATE `22023`)
+rather than a silently unchanged document. A text operand next to a `JSON` one is parsed as JSON, so
+`doc || '{"c":3}'` needs no cast; text that is not valid JSON is rejected.
+
+## Walking a JSON object with `jsonb_each`
+
+`jsonb_each(json)` produces one row per top-level object member, as `(key, value)`;
+`jsonb_each_text(json)` is the same with the value as `TEXT` (a string member's raw contents, a JSON
+`null` as SQL `NULL`). Members come in canonical key order.
+
+```sql
+SELECT key, value FROM jsonb_each('{"b":2,"a":1}');    -- a|1 then b|2
+SELECT * FROM jsonb_each(doc) AS e(k, v);              -- rename both columns
+SELECT id, jsonb_each(doc) FROM t;                     -- id, key, value
+```
+
+Unlike every other set-returning function here it produces **two** columns, and the second is
+appended after the projection. So in a `SELECT` list it must be the **last** item — anywhere earlier
+the value column would be separated from its key by the items after it, and that shape is refused
+rather than emitted. In a `FROM` item there is nothing to separate them, so the ordinary form reads
+naturally. `WITH ORDINALITY` appends its counter after the value: `(key, value, ordinality)`.
+
+A `NULL` document yields no rows. A document that is valid JSON but not an object — an array or a
+scalar — is an error (SQLSTATE `22023`), not an empty result: the query asked for its members.
+
+A `FROM` table function cannot yet reference a column of a table to its left
+(`FROM t, jsonb_each(t.doc)`), so drive it from the `SELECT` list for that case.
+
+## `TO_CHAR` numeric formats
+
+The numeric picture accepts `9` (a digit position blanked when unused), `0` (a digit position that
+forces zero-fill from itself rightward), `.` or `D` (the decimal point), `,` or `G` (a group
+separator), and the `FM` prefix (fill mode, which drops the padding: the leading blanks including
+the sign column, and the fraction's trailing zeros in `9` positions).
+
+```sql
+SELECT to_char(1234567.891, '9G999G999D99');   --  1,234,567.89
+SELECT to_char(1234.5,     'FM9999.00');       -- 1234.50
+SELECT to_char(12,         '9,999');           --     12   (no stray separator)
+```
+
+A group separator prints only when some position to its left prints something, so `9,999` renders
+`12` as `    12` but `1234` as ` 1,234`. A number too wide for its integer positions renders as `#`
+fill. Any other format character (`S`, `MI`, `PR`, `$`, …) is rejected rather than silently
+mis-formatted.
 
 ## Session configuration variables
 
-`SET name = value` records any variable name for the session — a built-in setting such as
-`search_path` or `work_mem`, or an application's own, whether dotted (`SET myapp.request_id = '42'`)
-or bare (`SET feature_flag = 'on'`). `SHOW name` and `current_setting('name')` read it back as text,
-and an unset variable reads back as the empty string. This is broader than the reference engine,
-which takes only dotted custom names and rejects an unqualified unknown one — NusaDB stores a bare
-custom name too, so an application-defined session variable needs no special spelling.
+`SET name = value` accepts the settings the engine reads (`search_path`, `work_mem`,
+`statement_timeout`, `hnsw_ef_search`), the reported connection parameters a session may still set
+(`client_encoding`, `datestyle`, `timezone`, …), and an application's own variables — which must
+carry a class prefix, as in `SET myapp.request_id = '42'`. `SHOW name` and `current_setting('name')`
+read one back as text, and an unset variable reads back as the empty string.
 
-A *value* that a built-in setting cannot use is still rejected loudly at `SET` time rather than
-stored and then silently ignored: `SET work_mem = 'huge'` or an unparseable `statement_timeout`
-fails immediately with an `invalid value for parameter` error. The trade-off of accepting any name
-is that a misspelled built-in name (`word_mem` for `work_mem`) is taken as a new custom variable
-rather than flagged, so the intended setting keeps its default — check `SHOW` if a setting does not
-seem to take effect.
+An unrecognized bare name is an error (`42704`), not a new custom variable: a misspelling such as
+`SET word_mem` — or reaching for another engine's spelling of a knob, like `ef_search` instead of
+`hnsw_ef_search` — fails immediately instead of reporting success and doing nothing. A read-only
+parameter (`server_version`, `server_encoding`, `integer_datetimes`) reports `55P02`. A *value* a
+setting cannot use is likewise rejected at `SET` time: `SET work_mem = 'huge'` fails with an
+`invalid value for parameter` error rather than being stored and then ignored.

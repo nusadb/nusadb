@@ -102,16 +102,137 @@ pub fn contains(a: &str, b: &str) -> Option<bool> {
     Some(value_contains(&parse(a)?, &parse(b)?))
 }
 
-/// `json ? key` (as the `jsonb_exists` function) — whether `key` is a top-level object key, a string
-/// element of a top-level array, or equals a scalar string. Invalid JSON → `false`.
+/// `json ? key` (also the `jsonb_exists` function) — whether `key` is a top-level object key, a
+/// string element of a top-level array, or equals a scalar string. Invalid JSON → `false`.
 #[must_use]
 pub fn has_key(json: &str, key: &str) -> bool {
-    match parse(json) {
-        Some(J::Object(map)) => map.contains_key(key),
-        Some(J::Array(items)) => items.iter().any(|v| v.as_str() == Some(key)),
-        Some(J::String(s)) => s == key,
+    parse(json).is_some_and(|v| key_present(&v, key))
+}
+
+/// `json ?| keys` — whether **any** of `keys` is present per [`has_key`]. An empty list is `false`:
+/// none of nothing is present.
+#[must_use]
+pub fn has_any_key(json: &str, keys: &[&str]) -> bool {
+    parse(json).is_some_and(|v| keys.iter().any(|k| key_present(&v, k)))
+}
+
+/// `json ?& keys` — whether **every** key in `keys` is present per [`has_key`]. An empty list is
+/// `true` (vacuously), matching the reference engine.
+#[must_use]
+pub fn has_all_keys(json: &str, keys: &[&str]) -> bool {
+    parse(json).is_some_and(|v| keys.iter().all(|k| key_present(&v, k)))
+}
+
+/// The shared membership test behind `?` / `?|` / `?&`: an object matches by key name, an array by a
+/// *string* element (a numeric element never matches the text `'1'`), and a scalar string by
+/// equality. Any other document shape has no keys.
+fn key_present(v: &J, key: &str) -> bool {
+    match v {
+        J::Object(map) => map.contains_key(key),
+        J::Array(items) => items.iter().any(|e| e.as_str() == Some(key)),
+        J::String(s) => s == key,
         _ => false,
     }
+}
+
+/// `a || b` — concatenate two JSON documents, as canonical text.
+///
+/// Two objects merge shallowly, with `b`'s members winning on a shared key (the merge is *not*
+/// recursive: `{"a":{"x":1}} || {"a":{"y":2}}` is `{"a":{"y":2}}`). Two arrays concatenate.
+/// Otherwise each non-array operand is treated as a one-element array, so `[1,2] || 3` is `[1,2,3]`,
+/// `3 || [1,2]` is `[3,1,2]`, and `1 || 2` is `[1,2]`. `None` if either side is invalid JSON.
+#[must_use]
+pub fn concat(a: &str, b: &str) -> Option<String> {
+    Some(to_text(&concat_values(parse(a)?, parse(b)?)))
+}
+
+fn concat_values(a: J, b: J) -> J {
+    match (a, b) {
+        (J::Object(mut left), J::Object(right)) => {
+            left.extend(right);
+            J::Object(left)
+        },
+        (J::Array(mut left), J::Array(right)) => {
+            left.extend(right);
+            J::Array(left)
+        },
+        (J::Array(mut left), other) => {
+            left.push(other);
+            J::Array(left)
+        },
+        (other, J::Array(right)) => {
+            let mut out = Vec::with_capacity(right.len() + 1);
+            out.push(other);
+            out.extend(right);
+            J::Array(out)
+        },
+        (left, right) => J::Array(vec![left, right]),
+    }
+}
+
+/// Why a `json - key` / `json - index` delete does not fit the document's shape.
+///
+/// Both cases are errors in the reference engine rather than a silently unchanged document, so the
+/// caller raises them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteRefusal {
+    /// The document is a scalar (a number, string, boolean or `null`): it has nothing to delete.
+    Scalar,
+    /// An integer index was applied to an object, which is keyed by name and not by position.
+    ObjectIndex,
+}
+
+/// `json - key` / `json - keys` — remove `keys` from a JSON document, as canonical text.
+///
+/// From an object, each key removes the member of that name; from an array, each key removes **every**
+/// string element equal to it. A key that is not present is not an error. A scalar document is
+/// [`DeleteRefusal::Scalar`]. `Ok(None)` means `json` is not valid JSON.
+///
+/// # Errors
+/// [`DeleteRefusal::Scalar`] when the document is not an object or array.
+pub fn delete_keys(json: &str, keys: &[&str]) -> Result<Option<String>, DeleteRefusal> {
+    let Some(v) = parse(json) else {
+        return Ok(None);
+    };
+    let out = match v {
+        J::Object(mut map) => {
+            for key in keys {
+                map.remove(*key);
+            }
+            J::Object(map)
+        },
+        J::Array(mut items) => {
+            items.retain(|e| !e.as_str().is_some_and(|s| keys.contains(&s)));
+            J::Array(items)
+        },
+        _ => return Err(DeleteRefusal::Scalar),
+    };
+    Ok(Some(to_text(&out)))
+}
+
+/// `json - n` — remove the array element at index `n`, as canonical text.
+///
+/// A negative index counts from the end; an index outside the array leaves the document unchanged.
+/// `Ok(None)` means `json` is not valid JSON.
+///
+/// # Errors
+/// [`DeleteRefusal::ObjectIndex`] for an object document, [`DeleteRefusal::Scalar`] for a scalar
+/// one — an object is keyed by name, and a scalar has nothing to delete.
+pub fn delete_index(json: &str, index: i64) -> Result<Option<String>, DeleteRefusal> {
+    let Some(v) = parse(json) else {
+        return Ok(None);
+    };
+    let J::Array(mut items) = v else {
+        return Err(if matches!(v, J::Object(_)) {
+            DeleteRefusal::ObjectIndex
+        } else {
+            DeleteRefusal::Scalar
+        });
+    };
+    if let Some(idx) = resolve_index(index, items.len()) {
+        items.remove(idx);
+    }
+    Ok(Some(to_text(&J::Array(items))))
 }
 
 /// `json #> path` — follow `path` (object keys / array indices given as text) and return the value
@@ -154,6 +275,40 @@ pub fn array_elements_text(json: &str) -> Option<Vec<Option<String>>> {
             })
             .collect(),
     )
+}
+
+/// `jsonb_each(json)` — the members of a JSON object as `(key, value)` pairs.
+///
+/// The value is canonical JSON text, and keys come in the document's canonical (sorted) order, the
+/// same order [`object_keys`] gives. `None` if `json` is not a JSON object (including a valid
+/// non-object document): the caller reports that rather than yielding no rows.
+#[must_use]
+pub fn each(json: &str) -> Option<Vec<(String, String)>> {
+    match parse(json)? {
+        J::Object(map) => Some(map.into_iter().map(|(k, v)| (k, to_text(&v))).collect()),
+        _ => None,
+    }
+}
+
+/// `jsonb_each_text(json)` — like [`each`] but the value is SQL text: a string member yields its raw
+/// contents, a JSON `null` yields SQL `NULL` (the inner `None`), everything else its JSON form.
+#[must_use]
+pub fn each_text(json: &str) -> Option<Vec<(String, Option<String>)>> {
+    match parse(json)? {
+        J::Object(map) => Some(
+            map.into_iter()
+                .map(|(k, v)| {
+                    let text = match v {
+                        J::Null => None,
+                        J::String(s) => Some(s),
+                        other => Some(to_text(&other)),
+                    };
+                    (k, text)
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// `json_typeof(json)` — the JSON type name of `json`: `null`/`boolean`/`number`/`string`/`array`/
@@ -658,6 +813,138 @@ mod tests {
         assert!(path_query(doc, "$..n").is_none());
         // Invalid JSON → None.
         assert!(path_query("not json", "$").is_none());
+    }
+
+    #[test]
+    fn concat_merges_objects_and_joins_everything_else_as_arrays() {
+        // Two objects merge shallowly; the right operand wins a shared key, and an object-valued
+        // key is replaced rather than merged into.
+        assert_eq!(
+            concat(r#"{"a":1,"b":2}"#, r#"{"b":3,"c":4}"#).unwrap(),
+            r#"{"a":1,"b":3,"c":4}"#
+        );
+        assert_eq!(
+            concat(r#"{"a":{"x":1}}"#, r#"{"a":{"y":2}}"#).unwrap(),
+            r#"{"a":{"y":2}}"#
+        );
+        // Two arrays concatenate; a non-array operand joins as one element, on either side.
+        assert_eq!(concat("[1,2]", "[3,4]").unwrap(), "[1,2,3,4]");
+        assert_eq!(concat("[1,2]", "3").unwrap(), "[1,2,3]");
+        assert_eq!(concat("3", "[1,2]").unwrap(), "[3,1,2]");
+        assert_eq!(concat("[1,2]", "null").unwrap(), "[1,2,null]");
+        // Neither side an array (including an object beside a scalar): the pair becomes an array.
+        assert_eq!(concat("1", "2").unwrap(), "[1,2]");
+        assert_eq!(concat("null", "null").unwrap(), "[null,null]");
+        assert_eq!(concat(r#"{"a":1}"#, r#""x""#).unwrap(), r#"[{"a":1},"x"]"#);
+        // An object beside an array is wrapped, not merged.
+        assert_eq!(concat(r#"{"a":1}"#, "[1,2]").unwrap(), r#"[{"a":1},1,2]"#);
+        assert_eq!(concat(r#"{"a":1}"#, "[]").unwrap(), r#"[{"a":1}]"#);
+        assert_eq!(concat("[]", r#"{"a":1}"#).unwrap(), r#"[{"a":1}]"#);
+        // Empty operands of the same shape stay that shape.
+        assert_eq!(concat("[]", "[]").unwrap(), "[]");
+        assert_eq!(concat("{}", "{}").unwrap(), "{}");
+        // Invalid JSON on either side → None.
+        assert!(concat("oops", "[]").is_none());
+        assert!(concat("[]", "oops").is_none());
+    }
+
+    #[test]
+    fn delete_removes_keys_elements_and_indices() {
+        // Object: by key name; an absent key is a no-op, not an error.
+        assert_eq!(
+            delete_keys(r#"{"a":1,"b":2}"#, &["a"]).unwrap().unwrap(),
+            r#"{"b":2}"#
+        );
+        assert_eq!(
+            delete_keys(r#"{"a":1,"b":2}"#, &["zz"]).unwrap().unwrap(),
+            r#"{"a":1,"b":2}"#
+        );
+        // Several keys at once.
+        assert_eq!(
+            delete_keys(r#"{"a":1,"b":2,"c":3}"#, &["a", "c"])
+                .unwrap()
+                .unwrap(),
+            r#"{"b":2}"#
+        );
+        // Array: a key removes *every* equal string element; non-string elements never match.
+        assert_eq!(
+            delete_keys(r#"["a","b","a"]"#, &["a"]).unwrap().unwrap(),
+            r#"["b"]"#
+        );
+        assert_eq!(delete_keys("[1,2,3]", &["1"]).unwrap().unwrap(), "[1,2,3]");
+        // Index: positive, negative (from the end), and out of range (a no-op).
+        assert_eq!(delete_index("[1,2,3]", 1).unwrap().unwrap(), "[1,3]");
+        assert_eq!(delete_index("[1,2,3]", -1).unwrap().unwrap(), "[1,2]");
+        assert_eq!(delete_index("[1,2,3]", 9).unwrap().unwrap(), "[1,2,3]");
+        assert_eq!(
+            delete_index("[1,2,3]", i64::MIN).unwrap().unwrap(),
+            "[1,2,3]"
+        );
+        // Shapes with nothing to delete are refused, not silently unchanged.
+        assert_eq!(delete_keys("1", &["a"]), Err(DeleteRefusal::Scalar));
+        assert_eq!(delete_keys(r#""s""#, &["a"]), Err(DeleteRefusal::Scalar));
+        assert_eq!(delete_index("1", 0), Err(DeleteRefusal::Scalar));
+        assert_eq!(
+            delete_index(r#"{"a":1}"#, 0),
+            Err(DeleteRefusal::ObjectIndex)
+        );
+        // Invalid JSON → Ok(None), the same "not a document" signal the other helpers give.
+        assert_eq!(delete_keys("oops", &["a"]), Ok(None));
+        assert_eq!(delete_index("oops", 0), Ok(None));
+    }
+
+    #[test]
+    fn key_existence_covers_objects_arrays_and_scalar_strings() {
+        let obj = r#"{"a":1,"b":2}"#;
+        assert!(has_key(obj, "a"));
+        assert!(!has_key(obj, "z"));
+        // A JSON null value still counts as a present key.
+        assert!(has_key(r#"{"a":null}"#, "a"));
+        // Arrays match string elements only — a numeric element is not the text key `1`.
+        assert!(has_key(r#"["a","b"]"#, "a"));
+        assert!(!has_key("[1,2]", "1"));
+        // A scalar string matches itself; other scalars have no keys.
+        assert!(has_key(r#""a""#, "a"));
+        assert!(!has_key("1", "1"));
+        assert!(!has_key("oops", "a"));
+        // Any / all, with the empty-list identities.
+        assert!(has_any_key(obj, &["z", "b"]));
+        assert!(!has_any_key(obj, &["z"]));
+        assert!(!has_any_key(obj, &[]));
+        assert!(has_all_keys(obj, &["a", "b"]));
+        assert!(!has_all_keys(obj, &["a", "z"]));
+        assert!(has_all_keys(obj, &[]));
+    }
+
+    #[test]
+    fn each_walks_object_members_in_canonical_order() {
+        // Members come back in canonical (sorted) key order, values as canonical JSON text.
+        assert_eq!(
+            each(r#"{"b":2,"a":1}"#).unwrap(),
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]
+        );
+        assert_eq!(each("{}").unwrap(), Vec::<(String, String)>::new());
+        // The text form unwraps a string member and turns a JSON null into SQL NULL; anything else
+        // keeps its JSON rendering.
+        assert_eq!(
+            each_text(r#"{"a":"x","b":1,"c":null,"d":[1,2],"e":{"k":1}}"#).unwrap(),
+            vec![
+                ("a".to_owned(), Some("x".to_owned())),
+                ("b".to_owned(), Some("1".to_owned())),
+                ("c".to_owned(), None),
+                ("d".to_owned(), Some("[1,2]".to_owned())),
+                ("e".to_owned(), Some(r#"{"k":1}"#.to_owned())),
+            ]
+        );
+        // A document that is not an object has no members — the caller reports that, so `None`
+        // rather than an empty list.
+        assert!(each("[1,2]").is_none());
+        assert!(each("1").is_none());
+        assert!(each("oops").is_none());
+        assert!(each_text("[1,2]").is_none());
     }
 
     #[test]

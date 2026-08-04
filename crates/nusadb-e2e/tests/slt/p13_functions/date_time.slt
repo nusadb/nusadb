@@ -153,7 +153,7 @@ SELECT TO_CHAR(DATE '2024-06-15', 'Month') || '|'
 ----
 June     |
 
-# --- TO_CHAR: format a number through a digit picture (`9`/`0`/`.`) ---
+# --- TO_CHAR: format a number through a digit picture (`9`/`0`/`.`/`D`, `,`/`G`, `FM`) ---
 # Digits fit exactly; the fraction is rounded/padded to the picture; the sign is a leading column.
 query T
 SELECT TO_CHAR(1234.5, '9999.99')
@@ -201,12 +201,30 @@ SELECT TO_CHAR(0, '0000.00')
 ----
  0000.00
 
-# An unsupported numeric format character is rejected, not silently mis-formatted.
-statement error
+# `FM` (fill mode) drops the reserved padding, the sign column included when the sign is a space.
+query T
 SELECT TO_CHAR(5, 'FM999')
+----
+5
+
+# A group separator prints only when a position to its left prints something, so a value that does
+# not reach it leaves a blank rather than a stray comma.
+query T
+SELECT TO_CHAR(5, '9,999')
+----
+     5
+
+query T
+SELECT TO_CHAR(1234567.891, '9G999G999D99')
+----
+ 1,234,567.89
+
+# An unsupported numeric format character is still rejected, not silently mis-formatted.
+statement error
+SELECT TO_CHAR(5, 'S999')
 
 statement error
-SELECT TO_CHAR(5, '9,999')
+SELECT TO_CHAR(5, '999PR')
 
 # --- TO_DATE: parse text to date ---
 query T

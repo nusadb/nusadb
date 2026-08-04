@@ -213,11 +213,15 @@ fn reject_explicit_generated(
     Ok(())
 }
 
-/// Recompute every `GENERATED ALWAYS AS (<expr>) STORED` column of `row` against the row's current
-/// values — used after an UPDATE's `SET` assignments, since a generated column must reflect the
-/// new values of the columns it derives from. Generated columns reference only non-generated columns,
-/// so a single pass is correct. A computed `NULL` on a `NOT NULL` column is a violation.
-fn recompute_generated(
+/// Bring an updated `row` into its final storable shape, after an UPDATE's `SET` assignments.
+///
+/// Two jobs. First, recompute every `GENERATED ALWAYS AS (<expr>) STORED` column against the row's
+/// current values, since a generated column must reflect the new values of the columns it derives
+/// from; generated columns reference only non-generated columns, so a single pass is correct, and a
+/// computed `NULL` on a `NOT NULL` column is a violation. Second, let a value whose type differs from
+/// its column's only by the time-zone facet adopt the column's type ([`row::adopt_column_type`]), so
+/// index keys and `RETURNING` see what a later read decodes.
+fn finalize_updated_row(
     mut row: Row,
     fills: &[Option<super::coldefault::ColumnFill>],
     table: &TableSchema,
@@ -236,6 +240,9 @@ fn recompute_generated(
             });
         }
         set_at(&mut row, index, value)?;
+    }
+    for (value, column) in row.iter_mut().zip(&table.columns) {
+        row::adopt_column_type(value, column.ty);
     }
     Ok(row)
 }
@@ -761,6 +768,12 @@ fn insert_rows_with_unique(
             }
         }
         apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
+        // A `timestamptz` written to a `timestamp` column (or the reverse) adopts the column's own
+        // type here, before uniqueness/RLS/`RETURNING` ever see the row — so all three agree with
+        // what a later read decodes.
+        for (value, ty) in full.iter_mut().zip(&schema) {
+            row::adopt_column_type(value, *ty);
+        }
         full_rows.push(full);
     }
     // Row-level security WITH CHECK: every row a non-superuser writes must satisfy the
@@ -972,7 +985,7 @@ fn upsert_rows(
                 set_at(&mut new_row, *ordinal, value)?;
             }
             // Recompute generated columns against the updated row, like plain UPDATE.
-            let new_row = recompute_generated(new_row, &fills, table)?;
+            let new_row = finalize_updated_row(new_row, &fills, table)?;
             affected_keys.push(key);
             updates.push((*tid, erow.clone(), new_row.clone()));
             affected.push(new_row);
@@ -3046,7 +3059,7 @@ pub(super) fn run_update(
         }
     }
     // Generated columns: SET-ting one is an error; any other SET recomputes them against the
-    // new row (`recompute_generated` per updated row below). `fills` is a no-op when none are generated.
+    // new row (`finalize_updated_row` per updated row below). `fills` is a no-op when none are generated.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
     {
         let set_cols: HashSet<usize> = assignments.iter().map(|a| a.column).collect();
@@ -3062,7 +3075,7 @@ pub(super) fn run_update(
                 combined.extend(frow.iter().cloned());
                 if predicate_matches(filter.as_ref(), &combined)? {
                     let old = track_old.then(|| row.clone());
-                    let new_row = recompute_generated(
+                    let new_row = finalize_updated_row(
                         apply_assignments_ctx(&assignments, &plan.table, row.clone(), &combined)?,
                         &fills,
                         &plan.table,
@@ -3084,7 +3097,7 @@ pub(super) fn run_update(
             if needs_unique {
                 old_for_unique.push(row.clone());
             }
-            let new_row = recompute_generated(
+            let new_row = finalize_updated_row(
                 apply_assignments(&assignments, &plan.table, row)?,
                 &fills,
                 &plan.table,
@@ -3424,7 +3437,7 @@ pub(super) fn run_merge(
                             &fills,
                             &assignments.iter().map(|a| a.column).collect(),
                         )?;
-                        let new = recompute_generated(
+                        let new = finalize_updated_row(
                             apply_assignments_ctx(
                                 assignments,
                                 &plan.table,

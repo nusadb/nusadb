@@ -1105,15 +1105,46 @@ fn to_char_value(value: &ast::Value, fmt: &str) -> ast::Value {
     })
 }
 
+/// One position of a `TO_CHAR` numeric picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumSlot {
+    /// `9` — a digit position left blank when it has no digit to show.
+    Digit9,
+    /// `0` — a digit position that forces zero-fill from itself rightward, so `0999` renders `1` as
+    /// `0001` while `9909` renders it as `  01`.
+    Digit0,
+    /// `,` or `G` — a group separator. It prints only when some digit position to its left does.
+    Group,
+}
+
+impl NumSlot {
+    const fn is_digit(self) -> bool {
+        matches!(self, Self::Digit9 | Self::Digit0)
+    }
+}
+
+/// A parsed `TO_CHAR` numeric picture: the positions before and after the decimal point, whether the
+/// picture had a decimal point at all, and whether `FM` (fill mode) was requested.
+struct NumFormat {
+    int: Vec<NumSlot>,
+    frac: Vec<NumSlot>,
+    has_point: bool,
+    fill: bool,
+}
+
 /// `TO_CHAR(numeric, fmt)` — render a number through a digit-picture format (B-fn).
 ///
-/// v1 supports the picture characters `9` (a digit whose leading positions are suppressed to
-/// spaces), `0` (a digit whose leading positions are forced to `0`), and `.` (the decimal point).
-/// The value is rounded to the fractional picture width. The sign is a reserved leading column that
-/// *floats* to just before the first shown digit — `-` for a negative, a space otherwise (so
-/// `to_char(-0.1, '99.99')` is `'  -.10'`) — and an integer part too wide for its positions renders
-/// as `#` fill. Any other format character (`,`, `FM`, `S`, `MI`, `PR`, `D`, `G`, `$`, ...) is
-/// rejected rather than silently mis-formatted; those forms are a later increment.
+/// Supported picture characters: `9` (a digit whose leading positions are suppressed to spaces),
+/// `0` (a digit position that forces zero-fill from itself rightward), `.` / `D` (the decimal
+/// point), `,` / `G` (a group separator), and the `FM` prefix (fill mode). The value is rounded to
+/// the fractional picture width. The sign is a reserved leading column that *floats* to just before
+/// the first shown digit — `-` for a negative, a space otherwise (so `to_char(-0.1, '99.99')` is
+/// `'  -.10'`) — and an integer part too wide for its positions renders as `#` fill. Fill mode drops
+/// the padding: the leading blanks (sign column included, when positive) and the fraction's trailing
+/// zeros in `9` positions. Any other format character (`S`, `MI`, `PR`, `$`, …) is rejected rather
+/// than silently mis-formatted; those forms are a later increment.
+///
+/// The group and decimal separators are `,` and `.`: this engine has no `lc_numeric` to vary them by.
 fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
     use ast::Value as V;
     let dec = match value {
@@ -1125,9 +1156,9 @@ fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
         // NULL (and any non-number, which the analyzer rejects) formats to NULL.
         _ => return Ok(V::Null),
     };
-    let (int_chars, frac_chars, has_point) = parse_numeric_format(fmt)?;
-    let frac_n = frac_chars.len();
-    let int_n = int_chars.len();
+    let format = parse_numeric_format(fmt)?;
+    let frac_n = format.frac.iter().filter(|s| s.is_digit()).count();
+    let int_n = format.int.iter().filter(|s| s.is_digit()).count();
     if int_n == 0 && frac_n == 0 {
         return Err(Error::Unsupported(format!(
             "to_char(): numeric format `{fmt}` has no digit positions"
@@ -1151,72 +1182,160 @@ fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
     // the decimal point (matching `to_char(-0.1, '99.99')` = `'  -.10'`).
     let int_digits = int_digits.trim_start_matches('0');
 
-    let overflow = int_digits.len() > int_n;
-    let mut out = numeric_integer_area(int_digits, &int_chars, neg, overflow);
-    if has_point {
+    // How many fraction positions survive: fill mode drops the trailing zeros that sit in `9`
+    // positions, so `to_char(1.00, 'FM9999.99')` is `1.` while `'FM9999.09'` keeps `1.0`.
+    let frac_kept = if format.fill {
+        fill_mode_frac_len(&format.frac, frac_digits)
+    } else {
+        format.frac.len()
+    };
+    // With nothing at all left to show — no integer digit and no surviving fraction digit — the
+    // number renders as a single `0` rather than an empty field: `to_char(0, '9999')` is `    0`.
+    let int_digits = if int_digits.is_empty() && frac_kept == 0 {
+        "0"
+    } else {
+        int_digits
+    };
+    // A picture with no integer digit position cannot show an integer part at all, so it always
+    // overflows — the reference engine renders `to_char(0.5, '.99')` as ` .##`.
+    let overflow = int_n == 0 || int_digits.len() > int_n;
+
+    let mut out = numeric_integer_area(int_digits, &format.int, neg, overflow);
+    if format.has_point && !format.frac.is_empty() {
         out.push('.');
-        if overflow {
-            out.extend(std::iter::repeat_n('#', frac_n));
+        // On overflow the fraction is `#` fill too, and fill mode does not trim it away.
+        let kept = if overflow {
+            format.frac.len()
         } else {
-            out.push_str(frac_digits);
+            frac_kept
+        };
+        let mut digits = frac_digits.chars();
+        for slot in format.frac.iter().take(kept) {
+            match slot {
+                NumSlot::Group => out.push(','),
+                _ if overflow => out.push('#'),
+                _ => out.push(digits.next().unwrap_or('0')),
+            }
         }
+    }
+    if format.fill {
+        // Fill mode drops the reserved padding, the sign column included when the sign is a space.
+        out = out.trim_start_matches(' ').to_owned();
     }
     Ok(V::Text(out))
 }
 
-/// Parse a `TO_CHAR` numeric format into `(integer picture, fractional picture, has decimal point)`.
-/// Only `9`, `0`, and `.` are accepted; a second `.` or any other character is rejected.
-fn parse_numeric_format(fmt: &str) -> Result<(Vec<char>, Vec<char>, bool), Error> {
-    let mut int_chars = Vec::new();
-    let mut frac_chars = Vec::new();
-    let mut has_point = false;
-    for ch in fmt.chars() {
-        match ch {
-            '9' | '0' if has_point => frac_chars.push(ch),
-            '9' | '0' => int_chars.push(ch),
-            '.' if has_point => {
-                return Err(Error::Unsupported(
-                    "to_char(): a numeric format may have only one decimal point".to_owned(),
-                ));
+/// How many of `slots` fill mode keeps, given the fraction's `digits`: trailing `9` positions
+/// holding a `0` are dropped, and a `0` position, a group separator or a non-zero digit stops the
+/// trim. Digits are consumed by digit slots only, so a group separator does not shift the pairing.
+fn fill_mode_frac_len(slots: &[NumSlot], digits: &str) -> usize {
+    // Pair each slot with the digit it renders (a group separator renders no digit).
+    let mut chars = digits.chars();
+    let rendered: Vec<Option<char>> = slots
+        .iter()
+        .map(|slot| slot.is_digit().then(|| chars.next().unwrap_or('0')))
+        .collect();
+    let mut kept = slots.len();
+    while kept > 0 {
+        let i = kept - 1;
+        match (slots.get(i), rendered.get(i).copied().flatten()) {
+            (Some(NumSlot::Digit9), Some('0')) => kept -= 1,
+            _ => break,
+        }
+    }
+    kept
+}
+
+/// Parse a `TO_CHAR` numeric picture. `FM` (in either case) is a modifier rather than a position;
+/// a second decimal point, or any character outside the supported set, is rejected.
+fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut format = NumFormat {
+        int: Vec::new(),
+        frac: Vec::new(),
+        has_point: false,
+        fill: false,
+    };
+    let mut i = 0;
+    while let Some(&ch) = chars.get(i) {
+        i += 1;
+        // `FM` is a two-character prefix modifier, not a picture position.
+        if matches!(ch, 'F' | 'f') && matches!(chars.get(i), Some('M' | 'm')) {
+            format.fill = true;
+            i += 1;
+            continue;
+        }
+        let slot = match ch {
+            '9' => NumSlot::Digit9,
+            '0' => NumSlot::Digit0,
+            ',' | 'G' | 'g' => NumSlot::Group,
+            '.' | 'D' | 'd' => {
+                if format.has_point {
+                    return Err(Error::Unsupported(
+                        "to_char(): a numeric format may have only one decimal point".to_owned(),
+                    ));
+                }
+                format.has_point = true;
+                continue;
             },
-            '.' => has_point = true,
             other => {
                 return Err(Error::Unsupported(format!(
                     "to_char(): unsupported numeric format character `{other}` \
-                     (supported: `9`, `0`, `.`)"
+                     (supported: `9`, `0`, `.`, `D`, `,`, `G`, `FM`)"
                 )));
             },
+        };
+        if format.has_point {
+            format.frac.push(slot);
+        } else {
+            format.int.push(slot);
         }
     }
-    Ok((int_chars, frac_chars, has_point))
+    Ok(format)
 }
 
-/// Render the sign + integer part of a `TO_CHAR` number: a digit field `int_chars.len()` wide (real
-/// digits right-aligned, a `0` picture position forced to `0`, a `9` position left blank when
-/// unused) preceded by a floating sign column. The sign sits just before the first shown character
-/// (or at the far right, next to the decimal point, when the integer part is entirely blank). On
-/// overflow every position is `#`.
-fn numeric_integer_area(int_digits: &str, int_chars: &[char], neg: bool, overflow: bool) -> String {
-    let int_n = int_chars.len();
+/// Render the sign + integer part of a `TO_CHAR` number: a digit field as wide as `slots` (real
+/// digits right-aligned, positions from the leftmost `0` rightward forced to `0`, a `9` position
+/// left blank when unused) preceded by a floating sign column. The sign sits just before the first
+/// shown character (or at the far right, next to the decimal point, when the integer part is
+/// entirely blank). On overflow every digit position is `#`.
+///
+/// A group separator prints only when some position to its *left* prints something — so `9,999`
+/// renders `12` as `   12` (no stray comma) but `1234` as `1,234`, and `0,000` renders `123` as
+/// `0,123` because the forced `0` counts as printed.
+fn numeric_integer_area(int_digits: &str, slots: &[NumSlot], neg: bool, overflow: bool) -> String {
     let sign = if neg { '-' } else { ' ' };
-    if overflow {
-        let mut s = String::with_capacity(int_n + 1);
-        s.push(sign);
-        s.extend(std::iter::repeat_n('#', int_n));
-        return s;
+    // The leftmost `0` position: from there rightward an unused digit position renders `0`.
+    let zero_from = slots.iter().position(|s| *s == NumSlot::Digit0);
+    // Right-to-left over the digit positions, consuming the real digits from their right end.
+    let mut field: Vec<char> = vec![' '; slots.len()];
+    let mut digits = int_digits.chars().rev();
+    for ((i, slot), cell) in slots.iter().enumerate().zip(field.iter_mut()).rev() {
+        if !slot.is_digit() {
+            continue; // a group separator, resolved in the left-to-right pass below
+        }
+        *cell = if overflow {
+            '#'
+        } else if let Some(d) = digits.next() {
+            d
+        } else if zero_from.is_some_and(|z| i >= z) {
+            '0'
+        } else {
+            ' '
+        };
     }
-    // Build the int_n-wide digit field by right-aligning the digits: first the leading filler
-    // positions (`0` for a `0` picture char, a space for a `9`), then the real digits.
-    let dlen = int_digits.chars().count();
-    let pad = int_n.saturating_sub(dlen);
-    let mut field: Vec<char> = Vec::with_capacity(int_n);
-    for &pic in int_chars.iter().take(pad) {
-        field.push(if pic == '0' { '0' } else { ' ' });
+    // Left to right: a group separator prints only once something to its left has printed.
+    let mut printed = false;
+    for (slot, cell) in slots.iter().zip(field.iter_mut()) {
+        if *slot == NumSlot::Group {
+            *cell = if printed { ',' } else { ' ' };
+        } else if *cell != ' ' {
+            printed = true;
+        }
     }
-    field.extend(int_digits.chars());
     // Float the sign to just before the first non-blank position (or the far right if all blank).
-    let first_sig = field.iter().position(|&c| c != ' ').unwrap_or(int_n);
-    let mut s = String::with_capacity(int_n + 1);
+    let first_sig = field.iter().position(|&c| c != ' ').unwrap_or(field.len());
+    let mut s = String::with_capacity(field.len() + 1);
     s.extend(field.iter().take(first_sig));
     s.push(sign);
     s.extend(field.iter().skip(first_sig));
@@ -3068,6 +3187,11 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         // (floor of whole days since the epoch) and TIME-of-day (micros within the day); a DATE
         // widens to midnight. `div_euclid`/`rem_euclid` floor toward negative infinity so dates
         // before the epoch land on the correct day with a non-negative time-of-day.
+        // TIMESTAMP ↔ TIMESTAMPTZ. Both are micros since the epoch and the session time zone is
+        // fixed at UTC, so the instant is preserved and only the type's rendering changes: a
+        // `timestamptz` prints its `+00` offset, a `timestamp` does not.
+        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => Ok(ast::Value::Timestamp(*t)),
+        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => Ok(ast::Value::TimestampTz(*t)),
         (ast::Value::Timestamp(t) | ast::Value::TimestampTz(t), ColumnType::Date) => {
             i32::try_from(t.div_euclid(MICROS_PER_DAY))
                 .map(ast::Value::Date)
@@ -3890,6 +4014,9 @@ fn apply_binary(
         Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => {
             Ok(apply_comparison(op, left, right))
         },
+        // JSON `-` (delete a key / array index / key list) shares the `-` operator with arithmetic;
+        // the JSON document on the left is what tells them apart.
+        Op::Minus if matches!(left, ast::Value::Json(_)) => json_delete_op(left, right),
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
             apply_arithmetic(op, left, right, result_ty)
         },
@@ -3932,6 +4059,9 @@ fn apply_binary(
         },
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             Ok(json_op(op, left, right))
+        },
+        Op::JsonExists | Op::JsonExistsAny | Op::JsonExistsAll => {
+            Ok(json_exists_op(op, left, right))
         },
         Op::VectorDistance => {
             vector_distance_op("<=>", crate::vector::cosine_distance, left, right)
@@ -4164,10 +4294,18 @@ fn vector_dim_mismatch(a: usize, b: usize) -> Error {
 /// Evaluate `||` string concatenation: NULL if either operand is NULL, otherwise the two
 /// text operands joined. The analyzer guarantees both operands are text.
 fn apply_concat(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
-    use ast::Value::{Array, Bytes, Null, Text};
+    use ast::Value::{Array, Bytes, Json, Null, Text};
+    // NULL-strict: a NULL operand yields NULL (matches the analyzer's `||` typing). Checked before
+    // the JSON dispatch below so `j || NULL` stays NULL instead of failing to parse a document.
+    if matches!(left, Null) || matches!(right, Null) {
+        return Ok(Null);
+    }
+    // JSON `||` — merge/concatenate two documents. Checked before the text arms below: a
+    // `json || text` pair reaching them would render the document as a string instead.
+    if matches!(left, Json(_)) || matches!(right, Json(_)) {
+        return json_concat_op(left, right);
+    }
     Ok(match (left, right) {
-        // NULL-strict: a NULL operand yields NULL (matches the analyzer's `||` typing).
-        (Null, _) | (_, Null) => Null,
         (Text(a), Text(b)) => Text(format!("{a}{b}")),
         // One text side coerces the other scalar to its text output — the
         // analyzer's `check_concat` admits exactly the textout-able scalar set.
@@ -4290,6 +4428,132 @@ fn containment_op(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> a
     }
     // JSON containment: reuse the `@>` path with the container as the left document.
     json_op(ast::BinaryOp::JsonContains, container, contained)
+}
+
+/// Parse a text operand as a JSON document, so `j || '{"b":2}'` works without an explicit cast (the
+/// same leniency `@>` gives its contained side). A `JSON` operand passes through unchanged.
+///
+/// # Errors
+/// [`Error::InvalidValue`] when the text is not valid JSON — the reference engine rejects it too, so
+/// reporting it beats silently yielding NULL.
+fn json_operand(value: &ast::Value) -> Result<String, Error> {
+    match value {
+        ast::Value::Json(doc) => Ok(doc.clone()),
+        ast::Value::Text(s) => crate::json::canonicalize(s).ok_or_else(|| Error::InvalidValue {
+            ty: ColumnType::Json,
+            value: s.clone(),
+        }),
+        // The analyzer admits only JSON and TEXT on either side of a JSON `||`, so this is
+        // unreachable from SQL; report it rather than inventing a document.
+        _ => Err(Error::Unsupported(
+            "JSON `||` operand is neither JSON nor text".to_owned(),
+        )),
+    }
+}
+
+/// Evaluate JSON `||`: merge two objects (right wins per key), concatenate two arrays, or pair the
+/// operands into an array. Called only when the analyzer typed the result `JSON`.
+///
+/// # Errors
+/// Propagates a text operand that is not valid JSON ([`json_operand`]).
+fn json_concat_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    let (a, b) = (json_operand(left)?, json_operand(right)?);
+    crate::json::concat(&a, &b).map_or_else(
+        || {
+            Err(Error::InvalidValue {
+                ty: ColumnType::Json,
+                value: a.clone(),
+            })
+        },
+        |doc| Ok(ast::Value::Json(doc)),
+    )
+}
+
+/// Evaluate JSON `-`: remove an object member / array element by key (`TEXT`), an array element by
+/// position (`INT`, negative counting from the end), or several keys at once (`TEXT[]`). A NULL
+/// operand yields NULL.
+///
+/// # Errors
+/// [`Error::Coded`] `22023` when the document's shape has nothing to delete — a scalar document, or
+/// an integer index applied to an object. Both are errors in the reference engine, and a silently
+/// unchanged document would hide the mistake.
+fn json_delete_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    use crate::json::DeleteRefusal;
+    let ast::Value::Json(doc) = left else {
+        return Ok(ast::Value::Null);
+    };
+    if matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    let refuse = |r: DeleteRefusal| {
+        Error::Coded {
+            message: match r {
+                DeleteRefusal::Scalar => "cannot delete from a scalar JSON value".to_owned(),
+                DeleteRefusal::ObjectIndex => {
+                    "cannot delete from a JSON object using an integer index".to_owned()
+                },
+            },
+            sqlstate: "22023", // invalid_parameter_value
+        }
+    };
+    let deleted = match right {
+        ast::Value::Int(i) => crate::json::delete_index(doc, *i).map_err(refuse)?,
+        // A `text[]` key list — or a bare `'{a,b}'` text form of one. A plain text key that is not
+        // array syntax is a single key, which is the common `j - 'a'` case.
+        ast::Value::Array(items) => {
+            let mut keys = Vec::with_capacity(items.len());
+            for item in items {
+                let ast::Value::Text(s) = item else {
+                    // A NULL element makes the whole key list unusable, as in the reference engine.
+                    return Ok(ast::Value::Null);
+                };
+                keys.push(s.as_str());
+            }
+            crate::json::delete_keys(doc, &keys).map_err(refuse)?
+        },
+        ast::Value::Text(key) => crate::json::delete_keys(doc, &[key.as_str()]).map_err(refuse)?,
+        _ => return Ok(ast::Value::Null),
+    };
+    Ok(deleted.map_or(ast::Value::Null, ast::Value::Json))
+}
+
+/// Evaluate the JSON key-existence operators `?` (one key), `?|` (any key) and `?&` (all keys).
+/// A NULL operand yields NULL; `?|` over an empty list is FALSE and `?&` over one is TRUE.
+fn json_exists_op(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> ast::Value {
+    let ast::Value::Json(doc) = left else {
+        return ast::Value::Null;
+    };
+    if op == ast::BinaryOp::JsonExists {
+        return match right {
+            ast::Value::Text(key) => ast::Value::Bool(crate::json::has_key(doc, key)),
+            _ => ast::Value::Null,
+        };
+    }
+    // `?|` / `?&` take a `text[]`; a bare `'{a,b}'` text value is coerced to one, as for `#>`.
+    let parsed;
+    let items: &[ast::Value] = match right {
+        ast::Value::Array(items) => items,
+        ast::Value::Text(s) => match crate::executor::row::parse_array_text(s) {
+            Some(v) => {
+                parsed = v;
+                &parsed
+            },
+            None => return ast::Value::Null,
+        },
+        _ => return ast::Value::Null,
+    };
+    let mut keys = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ast::Value::Text(s) => keys.push(s.as_str()),
+            _ => return ast::Value::Null,
+        }
+    }
+    ast::Value::Bool(if op == ast::BinaryOp::JsonExistsAny {
+        crate::json::has_any_key(doc, &keys)
+    } else {
+        crate::json::has_all_keys(doc, &keys)
+    })
 }
 
 /// Evaluate a JSON navigation operator: `->` (get as JSON), `->>` (get as text), `#>`/`#>>`
@@ -5099,10 +5363,33 @@ mod tests {
             run_text(ScalarFunc::ToChar, vec![num("-0.1"), txt("99.99")]),
             Value::Text("  -.10".to_owned())
         );
-        // `0` picture positions are forced to a zero digit.
+        // `0` picture positions are forced to a zero digit — from the leftmost `0` rightward, so
+        // `0999` zero-fills the whole field while `9909` only fills from its third position.
         assert_eq!(
             run_text(ScalarFunc::ToChar, vec![lit_int(12), txt("0000")]),
             Value::Text(" 0012".to_owned())
+        );
+        assert_eq!(
+            run_text(ScalarFunc::ToChar, vec![lit_int(1), txt("0999")]),
+            Value::Text(" 0001".to_owned())
+        );
+        assert_eq!(
+            run_text(ScalarFunc::ToChar, vec![lit_int(1), txt("9909")]),
+            Value::Text("   01".to_owned())
+        );
+        assert_eq!(
+            run_text(ScalarFunc::ToChar, vec![lit_int(1), txt("9990")]),
+            Value::Text("    1".to_owned())
+        );
+        // Zero shows a digit when the picture would otherwise render nothing at all, but keeps the
+        // integer part blank when the fraction still prints.
+        assert_eq!(
+            run_text(ScalarFunc::ToChar, vec![lit_int(0), txt("9999")]),
+            Value::Text("    0".to_owned())
+        );
+        assert_eq!(
+            run_text(ScalarFunc::ToChar, vec![lit_int(0), txt("9,999.99")]),
+            Value::Text("      .00".to_owned())
         );
         // A value too wide for the integer positions renders as `#` fill.
         assert_eq!(
@@ -5110,7 +5397,7 @@ mod tests {
             Value::Text(" ##".to_owned())
         );
         // An unsupported format character is rejected, never silently mis-formatted.
-        for bad in ["FM999", "9,999", "S999", "999D99", "999PR"] {
+        for bad in ["S999", "999PR", "999MI", "$999", "F999"] {
             assert!(
                 eval(
                     &scalar(
@@ -5124,6 +5411,57 @@ mod tests {
                 "format `{bad}` should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn to_char_numeric_fill_mode_and_separators_match_pg() {
+        // Every expectation here was read off a side-by-side run against the reference engine.
+        let ch = |value: TypedExpr, fmt: &str| -> String {
+            match run_text(ScalarFunc::ToChar, vec![value, txt(fmt)]) {
+                Value::Text(s) => s,
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        // --- FM: drop the reserved padding -----------------------------------
+        assert_eq!(ch(num("1234.5"), "FM9999.00"), "1234.50");
+        assert_eq!(ch(num("1234.5"), "fm9999.00"), "1234.50"); // case-insensitive
+        assert_eq!(ch(num("-1234.5"), "FM9999.00"), "-1234.50");
+        assert_eq!(ch(num("0.5"), "FM9999.00"), ".50");
+        assert_eq!(ch(num("0.5"), "FM0999.00"), "0000.50");
+        assert_eq!(ch(num("1234.5"), "FM9999"), "1235");
+        // FM also trims the fraction's trailing zeros — but only in `9` positions.
+        assert_eq!(ch(num("1.00"), "FM9999.99"), "1.");
+        assert_eq!(ch(num("1.00"), "FM9999.09"), "1.0");
+        assert_eq!(ch(num("1.10"), "FM9999.99"), "1.1");
+        assert_eq!(ch(num("0.10"), "FM9999.99"), ".1");
+        assert_eq!(ch(lit_int(0), "FM9999.99"), "0.");
+        assert_eq!(ch(lit_int(0), "FM9999.00"), ".00");
+        assert_eq!(ch(lit_int(0), "FM9999"), "0");
+        // --- `,` / `G`: a group separator that prints only when a digit precedes it ---
+        assert_eq!(ch(lit_int(12), "9,999"), "    12");
+        assert_eq!(ch(lit_int(12), "FM9,999"), "12");
+        assert_eq!(ch(lit_int(1234), "9,999"), " 1,234");
+        assert_eq!(ch(lit_int(-12), "9,999"), "   -12");
+        assert_eq!(ch(lit_int(123), "0,000"), " 0,123");
+        assert_eq!(ch(lit_int(1_234_567), "9,999,999"), " 1,234,567");
+        assert_eq!(ch(num("1234.5"), ",9999.00"), "  1234.50");
+        assert_eq!(ch(num("1234.5"), "9999,.00"), " 1234,.50");
+        assert_eq!(ch(num("1234567.891"), "9G999G999D99"), " 1,234,567.89");
+        assert_eq!(ch(num("1234567.891"), "FM9G999G999D99"), "1,234,567.89");
+        assert_eq!(ch(num("1234.5"), "FM9999G00"), "12,35");
+        // --- `D`: the decimal point ------------------------------------------
+        assert_eq!(ch(num("1234.5"), "9999D00"), " 1234.50");
+        assert_eq!(ch(num("1.5"), "FM9D00"), "1.50");
+        // --- overflow ---------------------------------------------------------
+        assert_eq!(ch(lit_int(12345), "9,999"), " #,###");
+        assert_eq!(ch(lit_int(12345), "FM9,999"), "#,###");
+        assert_eq!(ch(num("12345.5"), "FM999.99"), "###.##");
+        assert_eq!(ch(num("1234.5"), "99D99"), " ##.##");
+        assert_eq!(ch(num("1234.5"), "G999D00"), "  ###.##");
+        // A picture with no integer digit position can never hold the integer part.
+        assert_eq!(ch(num("0.5"), ".99"), " .##");
+        // A trailing decimal point with no fraction positions prints no point at all.
+        assert_eq!(ch(num("1234.5"), "9999."), " 1235");
     }
 
     #[test]

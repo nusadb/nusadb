@@ -89,6 +89,7 @@ pub(super) fn lazy_int_series(op: &PhysicalOperator) -> Option<(i64, i64, i64)> 
         input,
         columns,
         ordinality: false,
+        pair: None,
     } = op
     else {
         return None;

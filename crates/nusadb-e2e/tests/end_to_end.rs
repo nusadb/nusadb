@@ -8404,6 +8404,372 @@ fn b458a_json_path_operators_end_to_end() {
 }
 
 #[test]
+fn timestamptz_assigns_into_a_timestamp_column_end_to_end() {
+    // `DEFAULT CURRENT_TIMESTAMP` on a plain `timestamp` column — the most common schema idiom
+    // there is. `CURRENT_TIMESTAMP` is a `timestamptz`, and the reference engine applies an
+    // assignment cast in either direction; both types are micros since the epoch here and the
+    // session time zone is fixed at UTC, so the instant crosses unchanged.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (id INT NOT NULL, made TIMESTAMP DEFAULT CURRENT_TIMESTAMP, seen TIMESTAMPTZ)",
+    );
+    run(&engine, "INSERT INTO t (id) VALUES (1)");
+
+    // The default filled the column, and it reads back as the column's *own* type.
+    match rows(run(&engine, "SELECT made FROM t WHERE id = 1"))
+        .swap_remove(0)
+        .swap_remove(0)
+    {
+        Value::Timestamp(micros) => assert!(micros > 0, "expected a real instant, got {micros}"),
+        other => panic!("expected Timestamp, got {other:?}"),
+    }
+
+    // An explicit `timestamptz` value assigns too — and `RETURNING` already reports the column's
+    // type, not the expression's, so it agrees with what a later read decodes.
+    let returned = rows(run(
+        &engine,
+        "INSERT INTO t (id, made) VALUES (2, CURRENT_TIMESTAMP) RETURNING made",
+    ))
+    .swap_remove(0)
+    .swap_remove(0);
+    assert!(matches!(returned, Value::Timestamp(_)), "got {returned:?}");
+    assert_eq!(
+        returned,
+        rows(run(&engine, "SELECT made FROM t WHERE id = 2"))
+            .swap_remove(0)
+            .swap_remove(0)
+    );
+
+    // The other direction: a `timestamp` value into a `timestamptz` column.
+    run(
+        &engine,
+        "INSERT INTO t (id, seen) VALUES (3, TIMESTAMP '2026-08-04 10:11:12')",
+    );
+    match rows(run(&engine, "SELECT seen FROM t WHERE id = 3"))
+        .swap_remove(0)
+        .swap_remove(0)
+    {
+        Value::TimestampTz(_) => {},
+        other => panic!("expected TimestampTz, got {other:?}"),
+    }
+
+    // UPDATE takes the same route as INSERT.
+    run(
+        &engine,
+        "UPDATE t SET made = CURRENT_TIMESTAMP WHERE id = 3",
+    );
+    assert!(matches!(
+        rows(run(&engine, "SELECT made FROM t WHERE id = 3"))
+            .swap_remove(0)
+            .swap_remove(0),
+        Value::Timestamp(_)
+    ));
+
+    // The explicit cast both ways is what makes the assignment cast legible in a query.
+    let both = rows(run(
+        &engine,
+        "SELECT CURRENT_TIMESTAMP::timestamp, TIMESTAMP '2026-08-04 10:11:12'::timestamptz",
+    ))
+    .swap_remove(0);
+    assert!(
+        matches!(both.first(), Some(Value::Timestamp(_))),
+        "got {both:?}"
+    );
+    assert!(
+        matches!(both.get(1), Some(Value::TimestampTz(_))),
+        "got {both:?}"
+    );
+
+    // The two types still do not compare without a cast — this widens assignment, not equality.
+    assert!(run_try(&engine, "SELECT made = seen FROM t").is_err());
+}
+
+#[test]
+fn jsonb_each_expands_an_object_into_key_value_rows_end_to_end() {
+    // `jsonb_each` / `jsonb_each_text` are the two-column set-returning functions: one row per
+    // top-level object member, as `(key, value)`. Every expectation was taken from a side-by-side
+    // run against the reference engine.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, doc JSON)");
+    run(
+        &engine,
+        "INSERT INTO t VALUES (1, '{\"b\":2,\"a\":1}'), (2, '[10,20]'), (3, NULL)",
+    );
+
+    // Both columns are exposed, named `key` and `value` by default, in canonical key order.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT key, value FROM jsonb_each('{\"b\":2,\"a\":1}') ORDER BY key",
+        )),
+        vec![
+            vec![Value::Text("a".to_owned()), Value::Json("1".to_owned())],
+            vec![Value::Text("b".to_owned()), Value::Json("2".to_owned())],
+        ]
+    );
+    // `SELECT *` over the relation yields the same two columns.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT * FROM jsonb_each('{\"a\":1}') ORDER BY key",
+        )),
+        vec![vec![
+            Value::Text("a".to_owned()),
+            Value::Json("1".to_owned())
+        ]]
+    );
+    // An alias list renames both columns positionally.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT k, v FROM jsonb_each('{\"a\":1}') AS e(k, v)",
+        )),
+        vec![vec![
+            Value::Text("a".to_owned()),
+            Value::Json("1".to_owned())
+        ]]
+    );
+
+    // The `_text` form unwraps a string member and turns a JSON null into SQL NULL; everything else
+    // keeps its JSON rendering.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT key, value FROM jsonb_each_text('{\"a\":\"x\",\"b\":1,\"c\":null,\"d\":[1,2]}') \
+             ORDER BY key",
+        )),
+        vec![
+            vec![Value::Text("a".to_owned()), Value::Text("x".to_owned())],
+            vec![Value::Text("b".to_owned()), Value::Text("1".to_owned())],
+            vec![Value::Text("c".to_owned()), Value::Null],
+            vec![Value::Text("d".to_owned()), Value::Text("[1,2]".to_owned())],
+        ]
+    );
+
+    // Driven from a column, in the SELECT list: the value column is appended right after its key,
+    // so the row reads `(id, key, value)`.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, jsonb_each(doc) FROM t WHERE id = 1",
+        )),
+        vec![
+            vec![
+                Value::Int(1),
+                Value::Text("a".to_owned()),
+                Value::Json("1".to_owned()),
+            ],
+            vec![
+                Value::Int(1),
+                Value::Text("b".to_owned()),
+                Value::Json("2".to_owned()),
+            ],
+        ]
+    );
+
+    // An empty object yields no rows; a NULL document yields no rows (it is not an error).
+    assert!(rows(run(&engine, "SELECT * FROM jsonb_each('{}')")).is_empty());
+    assert!(rows(run(&engine, "SELECT jsonb_each(doc) FROM t WHERE id = 3")).is_empty());
+    // A document that is valid JSON but not an object is refused, not silently empty.
+    assert!(run_try(&engine, "SELECT * FROM jsonb_each('[1,2]')").is_err());
+    assert!(run_try(&engine, "SELECT * FROM jsonb_each('1')").is_err());
+
+    // `WITH ORDINALITY` appends its counter *after* the value column.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT * FROM jsonb_each('{\"a\":1,\"b\":2}') WITH ORDINALITY ORDER BY key",
+        )),
+        vec![
+            vec![
+                Value::Text("a".to_owned()),
+                Value::Json("1".to_owned()),
+                Value::Int(1),
+            ],
+            vec![
+                Value::Text("b".to_owned()),
+                Value::Json("2".to_owned()),
+                Value::Int(2),
+            ],
+        ]
+    );
+
+    // It must be the last item: anywhere earlier and the appended value column would be separated
+    // from its key by the items after it, so that shape is refused.
+    assert!(run_try(&engine, "SELECT jsonb_each(doc), id FROM t").is_err());
+    // A document that is not JSON at all is a plain type error.
+    assert!(run_try(&engine, "SELECT * FROM jsonb_each(42)").is_err());
+}
+
+#[test]
+fn json_concat_delete_and_exists_operators_end_to_end() {
+    // `||` (merge/concatenate), `-` (delete a key / index / key list) and `?` / `?|` / `?&`
+    // (key existence) over a JSON column, full pipeline. Every expectation below was taken from a
+    // side-by-side run against the reference engine, not from the specification prose.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, doc JSON)");
+    run(
+        &engine,
+        "INSERT INTO t VALUES (1, '{\"a\":1,\"b\":2}'), (2, '[10,20,30]')",
+    );
+    let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
+    let json = |s: &str| Value::Json(s.to_owned());
+
+    // --- `||` -------------------------------------------------------------
+    // Two objects merge shallowly, the right operand winning a shared key.
+    assert_eq!(
+        one("SELECT doc || '{\"b\":3,\"c\":4}'::json FROM t WHERE id = 1"),
+        json(r#"{"a":1,"b":3,"c":4}"#)
+    );
+    // Two arrays concatenate; a non-array operand joins as a single element, on either side.
+    assert_eq!(
+        one("SELECT doc || '[40]'::json FROM t WHERE id = 2"),
+        json("[10,20,30,40]")
+    );
+    assert_eq!(one("SELECT '[1,2]'::json || '3'::json"), json("[1,2,3]"));
+    assert_eq!(one("SELECT '3'::json || '[1,2]'::json"), json("[3,1,2]"));
+    // Neither side an array: the pair becomes a two-element array.
+    assert_eq!(one("SELECT '1'::json || '2'::json"), json("[1,2]"));
+    assert_eq!(
+        one("SELECT '{\"a\":1}'::json || '\"x\"'::json"),
+        json(r#"[{"a":1},"x"]"#)
+    );
+    // An object concatenated with an array is wrapped, not merged.
+    assert_eq!(
+        one("SELECT '{\"a\":1}'::json || '[1,2]'::json"),
+        json(r#"[{"a":1},1,2]"#)
+    );
+    // The merge is shallow: a shared object-valued key is replaced, not merged into.
+    assert_eq!(
+        one("SELECT '{\"a\":{\"x\":1}}'::json || '{\"a\":{\"y\":2}}'::json"),
+        json(r#"{"a":{"y":2}}"#)
+    );
+    // An uncast text operand is parsed as JSON; a NULL operand yields NULL.
+    assert_eq!(
+        one("SELECT doc || '{\"c\":3}' FROM t WHERE id = 1"),
+        json(r#"{"a":1,"b":2,"c":3}"#)
+    );
+    assert_eq!(one("SELECT '{\"a\":1}'::json || NULL"), Value::Null);
+    // Text that is not JSON is rejected rather than silently becoming a string.
+    assert!(run_try(&engine, "SELECT '{\"a\":1}'::json || 'oops'").is_err());
+
+    // --- `-` --------------------------------------------------------------
+    // Delete an object member by name; an absent key is not an error.
+    assert_eq!(
+        one("SELECT doc - 'a' FROM t WHERE id = 1"),
+        json(r#"{"b":2}"#)
+    );
+    assert_eq!(
+        one("SELECT doc - 'zz' FROM t WHERE id = 1"),
+        json(r#"{"a":1,"b":2}"#)
+    );
+    // From an array, a text key removes *every* equal string element.
+    assert_eq!(
+        one("SELECT '[\"a\",\"b\",\"a\"]'::json - 'a'"),
+        json(r#"["b"]"#)
+    );
+    // An integer removes by position, negative counting from the end; out of range is a no-op.
+    assert_eq!(one("SELECT doc - 1 FROM t WHERE id = 2"), json("[10,30]"));
+    assert_eq!(
+        one("SELECT doc - (-1) FROM t WHERE id = 2"),
+        json("[10,20]")
+    );
+    assert_eq!(
+        one("SELECT doc - 9 FROM t WHERE id = 2"),
+        json("[10,20,30]")
+    );
+    // A `text[]` removes several keys at once.
+    assert_eq!(
+        one("SELECT '{\"a\":1,\"b\":2,\"c\":3}'::json - ARRAY['a','c']"),
+        json(r#"{"b":2}"#)
+    );
+    // Shapes with nothing to delete are refused loudly, as in the reference engine.
+    assert!(run_try(&engine, "SELECT '1'::json - 'a'").is_err());
+    assert!(run_try(&engine, "SELECT '{\"a\":1}'::json - 0").is_err());
+    assert_eq!(one("SELECT doc - NULL FROM t WHERE id = 1"), Value::Null);
+}
+
+#[test]
+fn json_key_existence_operators_end_to_end() {
+    // `?` / `?|` / `?&` over a JSON column, full pipeline. Every expectation below was taken from a
+    // side-by-side run against the reference engine, not from the specification prose.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, doc JSON)");
+    run(
+        &engine,
+        "INSERT INTO t VALUES (1, '{\"a\":1,\"b\":2}'), (2, '[10,20,30]')",
+    );
+    let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
+
+    assert_eq!(
+        one("SELECT doc ? 'a' FROM t WHERE id = 1"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one("SELECT doc ? 'z' FROM t WHERE id = 1"),
+        Value::Bool(false)
+    );
+    // An array matches only *string* elements, so a numeric element never matches the text key.
+    assert_eq!(one("SELECT '[\"a\",\"b\"]'::json ? 'a'"), Value::Bool(true));
+    assert_eq!(
+        one("SELECT doc ? '10' FROM t WHERE id = 2"),
+        Value::Bool(false)
+    );
+    // A scalar string matches itself.
+    assert_eq!(one("SELECT '\"a\"'::json ? 'a'"), Value::Bool(true));
+    // `?|` is any, `?&` is all; the empty list is FALSE for `?|` and TRUE for `?&`.
+    assert_eq!(
+        one("SELECT doc ?| ARRAY['z','b'] FROM t WHERE id = 1"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one("SELECT doc ?& ARRAY['a','b'] FROM t WHERE id = 1"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one("SELECT doc ?& ARRAY['a','z'] FROM t WHERE id = 1"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        one("SELECT doc ?| ARRAY[]::text[] FROM t WHERE id = 1"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        one("SELECT doc ?& ARRAY[]::text[] FROM t WHERE id = 1"),
+        Value::Bool(true)
+    );
+    // A member whose value is JSON null still exists as a key.
+    assert_eq!(one("SELECT '{\"a\":null}'::json ? 'a'"), Value::Bool(true));
+
+    // The existence operators bind tighter than comparison, so they read as predicates.
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM t WHERE doc ? 'a' ORDER BY id")),
+        vec![vec![Value::Int(1)]]
+    );
+
+    // --- a NULL document ---------------------------------------------------
+    // Every one of these operators is NULL-strict, so a nullable JSON column carrying NULL yields
+    // NULL rather than an error — including `-`, which shares its operator with arithmetic.
+    run(&engine, "INSERT INTO t (id) VALUES (9)");
+    for expr in [
+        "doc || '{\"a\":1}'::json",
+        "doc - 'a'",
+        "doc - 1",
+        "doc - ARRAY['a']",
+        "doc ? 'a'",
+        "doc ?| ARRAY['a']",
+        "doc ?& ARRAY['a']",
+    ] {
+        assert_eq!(
+            one(&format!("SELECT {expr} FROM t WHERE id = 9")),
+            Value::Null,
+            "`{expr}` over a NULL document must be NULL"
+        );
+    }
+}
+
+#[test]
 fn b132_aggregate_filter_end_to_end() {
     // Aggregate FILTER (WHERE pred): only matching rows contribute, per aggregate.
     let engine = BtreeEngine::new();

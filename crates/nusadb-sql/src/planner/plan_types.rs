@@ -1166,6 +1166,11 @@ pub struct SelectPlan {
     /// analyzer sets it only for such a derived table (and requires a set-returning projection);
     /// `false` for every other plan.
     pub ordinality: bool,
+    /// A *pair* set-returning function (`jsonb_each`) in the projection: `Some(ty)` is the type of
+    /// the value column its `ProjectSet` appends after the key, `None` for every other plan. The
+    /// analyzer sets it only when such a call is the whole select list, so the appended column lands
+    /// directly beside its key.
+    pub pair: Option<ColumnType>,
     /// `FETCH FIRST n ROWS WITH TIES`: when `true`, the row cap in `limit` keeps,
     /// in addition to the first `limit` rows, every following row that ties the last kept row on the
     /// `ORDER BY` keys. The analyzer sets it only for a query with an `ORDER BY` and no
@@ -2101,6 +2106,9 @@ pub enum PhysicalOperator {
         input: Box<Self>,
         /// Output columns, in order; exactly one carries a `SetReturning` expression.
         columns: Vec<Projection>,
+        /// A *pair* set-returning function (`jsonb_each`): `Some(ty)` appends the produced element's
+        /// value beside its key, as a column of that type. Appended before `ordinality`.
+        pair: Option<ColumnType>,
         /// `WITH ORDINALITY`: when `true`, each emitted row appends a 1-based `BIGINT` row
         /// number counting the produced elements per input row.
         ordinality: bool,

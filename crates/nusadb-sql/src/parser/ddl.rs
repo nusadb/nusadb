@@ -937,9 +937,7 @@ pub(super) fn convert_create_view(
     if to.is_some() {
         return unsupported("CREATE VIEW ... TO <table>");
     }
-    if !matches!(options, sql::CreateTableOptions::None) {
-        return unsupported("CREATE VIEW ... WITH (...)");
-    }
+    let incremental = convert_view_options(options, materialized)?;
     // Render the body back to canonical SQL before consuming it, so REFRESH can re-execute it.
     let definition_sql = query.to_string();
     let (schema, name) = table_ref_name(name)?;
@@ -949,10 +947,61 @@ pub(super) fn convert_create_view(
         or_replace,
         if_not_exists,
         materialized,
+        incremental,
         columns: convert_view_columns(columns)?,
         query: Box::new(convert_select(query)?),
         definition_sql,
     })
+}
+
+/// Read the `WITH (...)` clause of a `CREATE [MATERIALIZED] VIEW`, returning whether
+/// `incremental = true` was requested.
+///
+/// `incremental` is the only option NusaDB models, and only on a *materialized* view: it asks for the
+/// view to be kept up to date as its base table changes rather than frozen until `REFRESH`. Every
+/// other option — and any option at all on a plain view — is refused by name rather than ignored,
+/// so a misspelled knob cannot look like it took effect.
+fn convert_view_options(
+    options: &sql::CreateTableOptions,
+    materialized: bool,
+) -> Result<bool, Error> {
+    let opts = match options {
+        sql::CreateTableOptions::None => return Ok(false),
+        sql::CreateTableOptions::With(opts) => opts,
+        _ => return unsupported("CREATE VIEW ... OPTIONS(...)"),
+    };
+    if !materialized {
+        return unsupported("CREATE VIEW ... WITH (...)");
+    }
+    let mut incremental = false;
+    for opt in opts {
+        let sql::SqlOption::KeyValue { key, value } = opt else {
+            return unsupported("CREATE MATERIALIZED VIEW ... WITH (...) option without a value");
+        };
+        if !fold_ident(key).eq_ignore_ascii_case("incremental") {
+            return unsupported(&format!(
+                "CREATE MATERIALIZED VIEW ... WITH ({key} = ...) — the only option is `incremental`"
+            ));
+        }
+        incremental = match value {
+            sql::Expr::Value(v) => match &v.value {
+                sql::Value::Boolean(b) => *b,
+                other => {
+                    return unsupported(&format!(
+                        "CREATE MATERIALIZED VIEW ... WITH (incremental = {other}) — \
+                         expected TRUE or FALSE"
+                    ));
+                },
+            },
+            other => {
+                return unsupported(&format!(
+                    "CREATE MATERIALIZED VIEW ... WITH (incremental = {other}) — \
+                     expected TRUE or FALSE"
+                ));
+            },
+        };
+    }
+    Ok(incremental)
 }
 
 /// Extract the optional explicit output column names. A typed or optioned view

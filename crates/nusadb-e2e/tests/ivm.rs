@@ -1,8 +1,10 @@
-//! End-to-end tests for incremental view maintenance: a single-table projection +
-//! filter materialized view stays in sync with its base table on INSERT/UPDATE/DELETE without a
-//! `REFRESH`, and matches what a full `REFRESH` would produce. Ineligible views (joins/aggregates)
-//! fall back to full-refresh-only. Driven through `parse → analyze → plan → execute` against the
-//! production `BtreeEngine`.
+//! End-to-end tests for incremental view maintenance: a materialized view created
+//! `WITH (incremental = true)` over a single-table projection + filter stays in sync with its base
+//! table on INSERT/UPDATE/DELETE without a `REFRESH`, and matches what a full `REFRESH` would
+//! produce. Maintenance is opt-in — a plain `CREATE MATERIALIZED VIEW` is a frozen snapshot — and a
+//! body that cannot be maintained incrementally (a join, an aggregate, a volatile expression) is
+//! rejected outright rather than quietly downgraded. Driven through
+//! `parse → analyze → plan → execute` against the production `BtreeEngine`.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -35,6 +37,12 @@ fn run(engine: &BtreeEngine, sql: &str) -> ExecutionResult {
     execute(plan(logical), engine).expect("execute")
 }
 
+fn run_try(engine: &BtreeEngine, sql: &str) -> Result<ExecutionResult, Error> {
+    let stmt = parse(sql)?;
+    let logical = analyze(stmt, &EngineCatalog(engine))?;
+    execute(plan(logical), engine)
+}
+
 /// The materialized view's backing rows (it is an ordinary table), sorted for comparison.
 fn mv_rows(engine: &BtreeEngine, view: &str) -> Vec<Vec<Value>> {
     let mut rows = match run(engine, &format!("SELECT * FROM {view}")) {
@@ -56,10 +64,10 @@ fn ivm_tracks_insert_update_delete_for_filtered_projection() {
         &engine,
         "INSERT INTO orders VALUES (1, 100, 'paid'), (2, 50, 'pending'), (3, 200, 'paid')",
     );
-    // A single-table projection + filter view → IVM-eligible.
+    // A single-table projection + filter view → IVM-eligible, and it opts in.
     run(
         &engine,
-        "CREATE MATERIALIZED VIEW big_paid AS \
+        "CREATE MATERIALIZED VIEW big_paid WITH (incremental = true) AS \
          SELECT id, amount FROM orders WHERE status = 'paid' AND amount >= 100",
     );
     assert_eq!(
@@ -128,7 +136,7 @@ fn ivm_preserves_duplicate_rows_as_a_bag() {
     // Projection drops the unique id, so all three rows project to the same view row.
     run(
         &engine,
-        "CREATE MATERIALIZED VIEW just_k AS SELECT k FROM t",
+        "CREATE MATERIALIZED VIEW just_k WITH (incremental = true) AS SELECT k FROM t",
     );
     assert_eq!(
         mv_rows(&engine, "just_k"),
@@ -143,6 +151,97 @@ fn ivm_preserves_duplicate_rows_as_a_bag() {
     assert_eq!(
         mv_rows(&engine, "just_k"),
         vec![vec![Value::Int(7)], vec![Value::Int(7)],]
+    );
+}
+
+#[test]
+fn a_materialized_view_is_a_frozen_snapshot_until_refresh() {
+    // The default a materialized view exists for: the rows are the ones computed at CREATE and stay
+    // put until an explicit REFRESH, even for a body that *could* be maintained incrementally.
+    // Silently tracking the base table instead would defeat the reason to materialize at all.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, k INT)");
+    run(&engine, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    // No `WITH (incremental = true)` — a plain single-table projection, the IVM-eligible shape.
+    run(
+        &engine,
+        "CREATE MATERIALIZED VIEW snap AS SELECT id, k FROM t",
+    );
+    assert_eq!(mv_rows(&engine, "snap").len(), 2);
+
+    // Base-table writes of every kind leave the snapshot alone.
+    run(&engine, "INSERT INTO t VALUES (3, 30)");
+    run(&engine, "UPDATE t SET k = 999 WHERE id = 1");
+    run(&engine, "DELETE FROM t WHERE id = 2");
+    assert_eq!(
+        mv_rows(&engine, "snap"),
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+        ],
+        "a materialized view must not follow its base table without an explicit REFRESH"
+    );
+
+    // REFRESH is what moves it.
+    run(&engine, "REFRESH MATERIALIZED VIEW snap");
+    assert_eq!(
+        mv_rows(&engine, "snap"),
+        vec![
+            vec![Value::Int(1), Value::Int(999)],
+            vec![Value::Int(3), Value::Int(30)],
+        ]
+    );
+
+    // `WITH (incremental = false)` is the default spelled out.
+    run(
+        &engine,
+        "CREATE MATERIALIZED VIEW snap2 WITH (incremental = false) AS SELECT id, k FROM t",
+    );
+    run(&engine, "INSERT INTO t VALUES (4, 40)");
+    assert_eq!(mv_rows(&engine, "snap2").len(), 2);
+}
+
+#[test]
+fn incremental_is_refused_for_a_body_that_cannot_be_maintained() {
+    // Asking for maintenance the engine cannot deliver is an error, not a quiet downgrade to the
+    // frozen default — the whole point of the opt-in is that it says what you get.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, k INT)");
+    run(&engine, "CREATE TABLE u (id INT NOT NULL)");
+    for body in [
+        "SELECT count(*) FROM t",                   // aggregate
+        "SELECT t.id FROM t JOIN u ON t.id = u.id", // join
+        "SELECT DISTINCT k FROM t",                 // DISTINCT
+        "SELECT k FROM t LIMIT 1",                  // LIMIT
+        "SELECT k FROM t GROUP BY k",               // GROUP BY
+    ] {
+        let sql = format!("CREATE MATERIALIZED VIEW mv WITH (incremental = true) AS {body}");
+        assert!(
+            run_try(&engine, &sql).is_err(),
+            "`{body}` cannot be maintained incrementally and must be refused"
+        );
+    }
+    // The option itself is only for materialized views, and only by that name.
+    assert!(
+        run_try(
+            &engine,
+            "CREATE VIEW v WITH (incremental = true) AS SELECT k FROM t"
+        )
+        .is_err()
+    );
+    assert!(
+        run_try(
+            &engine,
+            "CREATE MATERIALIZED VIEW mv WITH (incrementalx = true) AS SELECT k FROM t"
+        )
+        .is_err()
+    );
+    assert!(
+        run_try(
+            &engine,
+            "CREATE MATERIALIZED VIEW mv WITH (incremental = 1) AS SELECT k FROM t"
+        )
+        .is_err()
     );
 }
 
@@ -179,6 +278,15 @@ fn view_projecting_volatile_age_is_not_incrementally_maintained() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, d DATE)");
     run(&engine, "INSERT INTO t VALUES (1, DATE '2000-01-01')");
+    // Asking for maintenance over a volatile projection is refused outright.
+    assert!(
+        run_try(
+            &engine,
+            "CREATE MATERIALIZED VIEW aged WITH (incremental = true) AS SELECT id, age(d) FROM t",
+        )
+        .is_err(),
+        "a volatile projection cannot be maintained incrementally"
+    );
     run(
         &engine,
         "CREATE MATERIALIZED VIEW aged AS SELECT id, age(d) FROM t",
@@ -210,7 +318,7 @@ fn ivm_tracks_upsert_do_update() {
     run(&engine, "INSERT INTO orders VALUES (1, 100, 'paid')");
     run(
         &engine,
-        "CREATE MATERIALIZED VIEW big_paid AS \
+        "CREATE MATERIALIZED VIEW big_paid WITH (incremental = true) AS \
          SELECT id, amount FROM orders WHERE status = 'paid' AND amount >= 100",
     );
     assert_eq!(
@@ -253,7 +361,7 @@ fn ivm_tracks_fk_cascade_delete_on_the_child() {
     );
     run(
         &engine,
-        "CREATE MATERIALIZED VIEW child_ids AS SELECT id FROM child",
+        "CREATE MATERIALIZED VIEW child_ids WITH (incremental = true) AS SELECT id FROM child",
     );
     assert_eq!(mv_rows(&engine, "child_ids").len(), 3);
 
@@ -279,7 +387,7 @@ fn ivm_tracks_fk_set_null_on_the_child() {
     run(&engine, "INSERT INTO child VALUES (10, 1)");
     run(
         &engine,
-        "CREATE MATERIALIZED VIEW child_pids AS SELECT id, pid FROM child",
+        "CREATE MATERIALIZED VIEW child_pids WITH (incremental = true) AS SELECT id, pid FROM child",
     );
     assert_eq!(
         mv_rows(&engine, "child_pids"),

@@ -35,6 +35,15 @@ pub(super) fn assignable(target: ColumnType, source: ColumnType) -> bool {
         || (target == ColumnType::Float
             && matches!(source, ColumnType::Int | ColumnType::Numeric { .. }))
         || (source == ColumnType::Text && is_temporal_or_uuid(target))
+        // TIMESTAMP ↔ TIMESTAMPTZ: an assignment cast in either direction, so the ubiquitous
+        // `DEFAULT CURRENT_TIMESTAMP` (a `timestamptz`) fills a plain `timestamp` column. The two
+        // differ only by the session time zone, which is fixed at UTC here, so the instant is
+        // preserved exactly; the conversion happens in `row::adopt_column_type`.
+        || matches!(
+            (target, source),
+            (ColumnType::Timestamp, ColumnType::TimestampTz)
+                | (ColumnType::TimestampTz, ColumnType::Timestamp)
+        )
         // NUMERIC accepts Int / Float / Text / any-scale Numeric, rescaled at encode time.
         || (matches!(target, ColumnType::Numeric { .. })
             && matches!(

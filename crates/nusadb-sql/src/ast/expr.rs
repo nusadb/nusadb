@@ -339,6 +339,12 @@ pub enum SetReturningFunc {
     /// `JSON_ARRAY_ELEMENTS_TEXT(json)` / `JSONB_ARRAY_ELEMENTS_TEXT(json)` — one `TEXT` row per
     /// element of a JSON array (a string element's raw contents, a JSON `null` as SQL `NULL`).
     JsonArrayElementsText,
+    /// `JSONB_EACH(json)` / `JSON_EACH(json)` — one row per top-level member of a JSON object, as
+    /// `(key TEXT, value JSON)`. A *pair* function: see [`SetReturningFunc::pair_value_type`].
+    JsonEach,
+    /// `JSONB_EACH_TEXT(json)` / `JSON_EACH_TEXT(json)` — like [`Self::JsonEach`] but the value is
+    /// `TEXT` (a string member's raw contents, a JSON `null` as SQL `NULL`).
+    JsonEachText,
 }
 
 impl SetReturningFunc {
@@ -355,8 +361,32 @@ impl SetReturningFunc {
             Self::RegexpMatches => "regexp_matches",
             Self::StringToTable => "string_to_table",
             Self::JsonArrayElementsText => "jsonb_array_elements_text",
+            Self::JsonEach => "jsonb_each",
+            Self::JsonEachText => "jsonb_each_text",
         }
     }
+
+    /// The type of the **second** column a *pair* set-returning function produces, or `None` for the
+    /// ordinary single-column ones.
+    ///
+    /// `jsonb_each` yields `(key, value)` rather than one value per row. The second column rides
+    /// along the way `WITH ORDINALITY`'s counter does — appended by the `ProjectSet` operator — so
+    /// the single-column shape the rest of the pipeline assumes stays intact. The first column is
+    /// the key, always `TEXT`, and carries the function's ordinary element type.
+    #[must_use]
+    pub const fn pair_value_type(self) -> Option<nusadb_core::ColumnType> {
+        match self {
+            Self::JsonEach => Some(nusadb_core::ColumnType::Json),
+            Self::JsonEachText => Some(nusadb_core::ColumnType::Text),
+            _ => None,
+        }
+    }
+
+    /// The names a pair function's two columns take when the relation's alias list does not rename
+    /// them, matching the reference engine's `jsonb_each(json) AS (key, value)`.
+    pub(crate) const PAIR_KEY_COLUMN: &'static str = "key";
+    /// See [`Self::PAIR_KEY_COLUMN`].
+    pub(crate) const PAIR_COLUMN: &'static str = "value";
 }
 
 /// A scalar (non-aggregate, non-window) built-in function (+). Result and argument types are
@@ -1410,6 +1440,13 @@ pub enum BinaryOp {
     /// `<@` contained-by — is the left contained by the right? The mirror of [`Self::JsonContains`]
     /// (`a <@ b` ≡ `b @> a`); covers both `JSON` and arrays, yielding `BOOL`.
     JsonContainedBy,
+    /// JSON `?` — does a top-level key (object), string element (array) or scalar string equal the
+    /// right `TEXT` operand, as `BOOL`?
+    JsonExists,
+    /// JSON `?|` — does **any** key in the right `text[]` exist per [`Self::JsonExists`]?
+    JsonExistsAny,
+    /// JSON `?&` — does **every** key in the right `text[]` exist per [`Self::JsonExists`]?
+    JsonExistsAll,
     /// JSON `#>` — get the value at a `text[]` path as JSON.
     JsonGetPath,
     /// JSON `#>>` — get the value at a `text[]` path as text.

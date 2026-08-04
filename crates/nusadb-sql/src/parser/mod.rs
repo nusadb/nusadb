@@ -180,6 +180,26 @@ impl Dialect for NusaParserDialect {
                     }),
             );
         }
+        // JSON key-existence operators `?` / `?|` / `?&`. The tokenizer only fuses these into
+        // `Question`/`QuestionPipe`/`QuestionAnd` for a dialect that enables geometric types —
+        // which this one deliberately does not, because that also fuses `<->` and would break the
+        // vector distance operator above. With them off, `?` arrives as `Placeholder("?")` (a
+        // spelling `convert_placeholder` refuses: NusaDB's placeholders are `$1`, `$2`, …), so
+        // recognizing it here as an infix operator takes nothing away.
+        if let Some((symbol, tokens)) = recognize_json_exists_op(parser) {
+            for _ in 0..tokens {
+                parser.next_token();
+            }
+            return Some(
+                parser
+                    .parse_subexpr(precedence)
+                    .map(|right| sql::Expr::BinaryOp {
+                        left: Box::new(expr.clone()),
+                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
+                        right: Box::new(right),
+                    }),
+            );
+        }
         // `#` — the reference engine's integer XOR. sqlparser's own infix table gates the Sharp
         // token behind a dialect TypeId this wrapper does not report (it must keep reporting
         // `GenericDialect`'s — see `dialect()`), so parse the operator here. The default precedence table
@@ -212,6 +232,11 @@ impl Dialect for NusaParserDialect {
         // (default `PlusMinus` = 30) — matching where the standard operator class sits — so the
         // common `col ->> 'k' = 'v'` / `IS NULL` idioms parse correctly. Every other token falls
         // through to the default table (`None`).
+        //
+        // The key-existence operators `?` / `?|` / `?&` join that class: they arrive as a
+        // `Placeholder` token (see `recognize_json_exists_op`), for which the default table has no
+        // precedence at all, so without this the Pratt loop would stop before `parse_infix` ever
+        // sees them.
         match parser.peek_token().token {
             Token::Arrow
             | Token::LongArrow
@@ -219,8 +244,35 @@ impl Dialect for NusaParserDialect {
             | Token::HashLongArrow
             | Token::AtArrow
             | Token::ArrowAt => Some(Ok(25)),
+            Token::Placeholder(ref p) if p == "?" => Some(Ok(25)),
             _ => None,
         }
+    }
+}
+
+/// Recognize a JSON key-existence operator (`?`, `?|`, `?&`) at the current parser position.
+/// Returns the operator's canonical symbol and the number of tokens it spans, or `None` when the
+/// next token is not one.
+///
+/// With geometric types disabled — the surface [`NusaParserDialect`] reports — the tokenizer emits
+/// `?` as `Placeholder("?")` and does not fuse the two-character forms, so `?|` arrives as
+/// `Placeholder("?")` + `Pipe` and `?&` as `Placeholder("?")` + `Ampersand`. The second token only
+/// joins when it is directly adjacent (compared via token spans), so a spaced `j ? | x` keeps its
+/// tokens separate exactly as the reference engine's lexer would.
+fn recognize_json_exists_op(parser: &Parser) -> Option<(&'static str, usize)> {
+    let question = parser.peek_token_ref();
+    match question.token {
+        Token::Placeholder(ref p) if p == "?" => {},
+        _ => return None,
+    }
+    let after = parser.peek_nth_token_ref(1);
+    if question.span.end != after.span.start {
+        return Some(("?", 1));
+    }
+    match after.token {
+        Token::Pipe => Some(("?|", 2)),
+        Token::Ampersand => Some(("?&", 2)),
+        _ => Some(("?", 1)),
     }
 }
 

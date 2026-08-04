@@ -59,6 +59,28 @@ pub(crate) fn encode(row: &[ast::Value], schema: &[ColumnType]) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Convert a value that differs from its column's type only by the time-zone facet into the
+/// column's own type, in place. Every other value is left untouched.
+///
+/// `TIMESTAMP` and `TIMESTAMPTZ` are both micros since the epoch and the session time zone is fixed
+/// at UTC, so the conversion preserves the instant exactly. Applying it to a row *before* it is
+/// written makes the row the DML path hands to `RETURNING` carry the column's declared type, rather
+/// than the type the expression happened to produce (`CURRENT_TIMESTAMP` is a `timestamptz`).
+///
+/// Takes one value at a time so a caller with the column types in any shape — a `ColumnType` slice
+/// or a `ColumnDef` list — can drive it without materializing a second one per row.
+pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
+    match (&value, ty.physical()) {
+        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => {
+            *value = ast::Value::Timestamp(*t);
+        },
+        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => {
+            *value = ast::Value::TimestampTz(*t);
+        },
+        _ => {},
+    }
+}
+
 /// Decode a stored tuple back into a [`Row`].
 pub(crate) fn decode(bytes: &[u8], schema: &[ColumnType]) -> Result<Row, Error> {
     let mut row = Vec::with_capacity(schema.len());
@@ -214,10 +236,16 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         },
         // Temporal + UUID: fixed-width integer / byte encodings.
         (ast::Value::Date(d), ColumnType::Date) => out.extend_from_slice(&d.to_le_bytes()),
+        // `TIMESTAMP` and `TIMESTAMPTZ` accept each other: the two share this micros-since-epoch
+        // encoding and the session time zone is fixed at UTC, so an assignment across them crosses
+        // unchanged. Rows built by the DML path are already converted by [`adopt_column_type`];
+        // the crossed pairs here cover the writers that encode a value directly.
         (ast::Value::Time(t), ColumnType::Time)
         | (ast::Value::TimeTz(t), ColumnType::TimeTz)
-        | (ast::Value::Timestamp(t), ColumnType::Timestamp)
-        | (ast::Value::TimestampTz(t), ColumnType::TimestampTz) => {
+        | (
+            ast::Value::Timestamp(t) | ast::Value::TimestampTz(t),
+            ColumnType::Timestamp | ColumnType::TimestampTz,
+        ) => {
             out.extend_from_slice(&t.to_le_bytes());
         },
         (ast::Value::Uuid(u), ColumnType::Uuid) => out.extend_from_slice(u),

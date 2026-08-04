@@ -125,15 +125,18 @@ pub struct DropIndex {
     pub if_exists: bool,
 }
 
-/// `CREATE [OR REPLACE] VIEW name [(columns)] AS <select>`.
+/// `CREATE [OR REPLACE] [MATERIALIZED] VIEW name [(columns)] [WITH (incremental = …)] AS <select>`.
 ///
-/// Only the plain form is modelled. `MATERIALIZED`, `TEMPORARY`,
-/// `IF NOT EXISTS`, `WITH (...)`, and dialect-specific clauses (`CLUSTER BY`,
-/// `COMMENT`, `TO`, `WITH NO SCHEMA BINDING`) are out of scope for the v1
-/// parser surface and rejected with
-/// [`Error::Unsupported`](crate::error::Error::Unsupported). The view body is
-/// any supported `SELECT`; re-evaluation semantics belong to the analyzer.
+/// `TEMPORARY` and the dialect-specific clauses (`CLUSTER BY`, `COMMENT`, `TO`,
+/// `WITH NO SCHEMA BINDING`) are out of scope for the v1 parser surface and rejected with
+/// [`Error::Unsupported`](crate::error::Error::Unsupported). The view body is any supported
+/// `SELECT`; re-evaluation semantics belong to the analyzer.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one field per independent CREATE VIEW modifier; folding them into flags would only \
+              hide which modifier a rejection refers to"
+)]
 pub struct CreateView {
     /// Explicit schema qualifier: `Some(schema)` for `CREATE VIEW schema.v`, `None` when unqualified
     /// (created in the session's current schema). Only plain (non-materialized) views may be
@@ -149,6 +152,12 @@ pub struct CreateView {
     /// `MATERIALIZED` — the view body is computed and stored at creation time. A plain
     /// (non-materialized) view re-evaluates on read and is not yet implemented.
     pub materialized: bool,
+    /// `WITH (incremental = true)` — keep this materialized view up to date as its base table
+    /// changes, instead of freezing its rows until `REFRESH`. Opt-in: a materialized view's whole
+    /// point is to hold an expensive result still, so the default (`false`) is the frozen snapshot.
+    /// Only an IVM-eligible body can carry it; anything else is rejected rather than silently
+    /// downgraded. Meaningless — and refused — on a plain view.
+    pub incremental: bool,
     /// Explicit output column names; empty means "infer from the query".
     pub columns: Vec<String>,
     /// The view body — a supported `SELECT`.

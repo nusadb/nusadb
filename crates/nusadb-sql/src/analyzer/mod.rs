@@ -825,7 +825,24 @@ fn analyze_create_materialized_view(
             col.0 = name;
         }
     }
-    let ivm_base = ivm_base_table(&body);
+    // A materialized view is a *snapshot* by default, like the reference engine: its rows are the
+    // ones computed at CREATE (or the last REFRESH) and do not follow the base table. Incremental
+    // maintenance is a capability NusaDB has beyond that, but as a silent default it would defeat
+    // the reason to reach for a materialized view at all, so it is opt-in per view. Asking for it on
+    // a body that cannot be maintained incrementally is an error, not a quiet downgrade to frozen.
+    let ivm_base = if cv.incremental {
+        let base = ivm_base_table(&body).ok_or_else(|| {
+            Error::Unsupported(
+                "WITH (incremental = true) needs a body that is a single table with only a \
+                 projection and an optional WHERE — no join, aggregate, GROUP BY, window, \
+                 DISTINCT, HAVING, LIMIT/OFFSET, CTE or subquery"
+                    .to_owned(),
+            )
+        })?;
+        Some(base)
+    } else {
+        None
+    };
     Ok(LogicalPlan::CreateMaterializedView(MaterializedViewPlan {
         name: cv.name,
         or_replace: cv.or_replace,

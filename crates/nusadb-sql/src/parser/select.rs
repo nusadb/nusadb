@@ -484,7 +484,19 @@ fn srf_derived_table(
     column_aliases: Vec<String>,
     with_ordinality: bool,
 ) -> ast::TableRef {
-    let proj_alias = column_aliases.is_empty().then(|| table_alias.clone());
+    // A pair function (`jsonb_each`) names its two columns `key` and `value`, not after the
+    // relation — the value half is appended by the analyzer, so only the key is named here.
+    let pair = matches!(
+        &func_expr,
+        ast::Expr::SetReturning { func, .. } if func.pair_value_type().is_some()
+    );
+    let proj_alias = column_aliases.is_empty().then(|| {
+        if pair {
+            ast::SetReturningFunc::PAIR_KEY_COLUMN.to_owned()
+        } else {
+            table_alias.clone()
+        }
+    });
     let select = ast::Select {
         with: Vec::new(),
         distinct: None,

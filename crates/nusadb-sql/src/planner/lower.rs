@@ -490,6 +490,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
         PhysicalOperator::ProjectSet {
             input: Box::new(op),
             columns: select.projection,
+            pair: select.pair,
             ordinality: select.ordinality,
         }
     } else {

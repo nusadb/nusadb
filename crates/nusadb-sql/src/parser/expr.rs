@@ -1023,6 +1023,14 @@ pub(super) fn convert_function_call(function: sql::Function) -> Result<ast::Expr
             func: ast::SetReturningFunc::StringToTable,
             args,
         }),
+        "jsonb_each" | "json_each" => Ok(ast::Expr::SetReturning {
+            func: ast::SetReturningFunc::JsonEach,
+            args,
+        }),
+        "jsonb_each_text" | "json_each_text" => Ok(ast::Expr::SetReturning {
+            func: ast::SetReturningFunc::JsonEachText,
+            args,
+        }),
         "jsonb_array_elements_text" | "json_array_elements_text" => Ok(ast::Expr::SetReturning {
             func: ast::SetReturningFunc::JsonArrayElementsText,
             args,
@@ -1708,12 +1716,16 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
         B::HashLongArrow => ast::BinaryOp::JsonGetPathText,
         // Vector cosine distance `<=>` (sqlparser tokenizes it as `Spaceship`).
         B::Spaceship => ast::BinaryOp::VectorDistance,
-        // The remaining vector distance operators arrive as `Custom` from the dialect's infix hook,
-        // which fuses their multi-token forms (`<` `->` / `<` `#>` / `<` `+` `>`).
+        // The remaining vector distance operators, and the JSON key-existence operators, arrive as
+        // `Custom` from the dialect's infix hook, which fuses their multi-token forms
+        // (`<` `->` / `<` `#>` / `<` `+` `>`, and `?` `|` / `?` `&`).
         B::Custom(symbol) => match symbol.as_str() {
             "<->" => ast::BinaryOp::VectorL2Distance,
             "<#>" => ast::BinaryOp::VectorNegInnerProduct,
             "<+>" => ast::BinaryOp::VectorL1Distance,
+            "?" => ast::BinaryOp::JsonExists,
+            "?|" => ast::BinaryOp::JsonExistsAny,
+            "?&" => ast::BinaryOp::JsonExistsAll,
             other => return unsupported(&format!("binary operator `{other}`")),
         },
         // Full-text search match `@@` (F1).

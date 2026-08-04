@@ -3561,6 +3561,15 @@ pub(super) fn analyze_binary(
             left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
         }
     }
+    // The JSON key operators take a key, not a second document, so a bare `NULL` on their right
+    // must not be typed from the JSON document on their left ([`analyze_operands`] types it from the
+    // sibling by default). Re-type it as the key type the operator actually wants, so `j - NULL` and
+    // `j ? NULL` evaluate to NULL instead of failing to type-check.
+    if let Some(key_ty) = json_key_operand_type(op, left_typed.ty)
+        && is_null_literal(&right_typed)
+    {
+        right_typed.ty = key_ty;
+    }
     let ty = check_binary(op, left_typed.ty, right_typed.ty)?;
     Ok(TypedExpr {
         kind: TypedExprKind::Binary {
@@ -3675,7 +3684,10 @@ pub(super) fn check_binary(
     match op {
         Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => check_comparison(left, right),
         Op::And | Op::Or => check_logical(left, right),
-        Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
+        // JSON `-` deletes a key / an array index / a set of keys, yielding the trimmed document.
+        // Checked before the numeric rule (JSON is not numeric).
+        Op::Minus if left == ColumnType::Json => check_json_delete(right),
+        Op::Plus | Op::Multiply | Op::Divide | Op::Modulo | Op::Minus => {
             // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors) is checked
             // before the numeric rule (a vector operand is not numeric).
             if let (ColumnType::Vector(x), ColumnType::Vector(y)) = (left, right) {
@@ -3714,6 +3726,9 @@ pub(super) fn check_binary(
         Op::JsonContains | Op::JsonContainedBy => check_containment(op, left, right),
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             check_json(op, left, right)
+        },
+        Op::JsonExists | Op::JsonExistsAny | Op::JsonExistsAll => {
+            check_json_exists(op, left, right)
         },
         Op::VectorDistance => check_vector_distance("<=>", left, right),
         Op::VectorL2Distance => check_vector_distance("<->", left, right),
@@ -3955,6 +3970,12 @@ pub(super) fn check_concat(left: ColumnType, right: ColumnType) -> Result<Column
         (ColumnType::Text, ColumnType::Text) => Ok(ColumnType::Text),
         // BYTEA concatenation: `bytea || bytea → bytea`.
         (ColumnType::Bytes, ColumnType::Bytes) => Ok(ColumnType::Bytes),
+        // JSON concatenation: objects merge, arrays concatenate, anything else pairs up into an
+        // array (see `json::concat`). As with `@>`, the other side may be a bare text value, parsed
+        // as JSON at evaluation. Checked before the text-coercion arms below, which would otherwise
+        // render the JSON side as text and quietly produce a string.
+        (ColumnType::Json, ColumnType::Json | ColumnType::Text)
+        | (ColumnType::Text, ColumnType::Json) => Ok(ColumnType::Json),
         // Array concatenation: same element type on both sides.
         (Array(a), Array(b)) if a == b => Ok(Array(a)),
         // Append/prepend an element to an array: the scalar must be the array's element type.
@@ -4075,6 +4096,78 @@ pub(super) fn check_containment(
             container
         },
     })
+}
+
+/// The key type a JSON key operator (`-`, `?`, `?|`, `?&`) wants on its right, or `None` when `op`
+/// is not one of them (or its left operand is not a JSON document, so `-` is ordinary arithmetic).
+/// Used to type a bare `NULL` key, which would otherwise inherit the document's own type.
+const fn json_key_operand_type(op: ast::BinaryOp, left: ColumnType) -> Option<ColumnType> {
+    match op {
+        ast::BinaryOp::Minus | ast::BinaryOp::JsonExists if matches!(left, ColumnType::Json) => {
+            Some(ColumnType::Text)
+        },
+        ast::BinaryOp::JsonExistsAny | ast::BinaryOp::JsonExistsAll
+            if matches!(left, ColumnType::Json) =>
+        {
+            Some(ColumnType::Array(nusadb_core::engine::ArrayElem::Text))
+        },
+        _ => None,
+    }
+}
+
+/// Type rule for JSON `-`: the left operand is `JSON` (checked by the caller) and the right is the
+/// key to remove — `TEXT` (an object member / array string element), `INT` (an array index), or
+/// `TEXT[]` (several keys at once). The result is the trimmed `JSON` document.
+pub(super) fn check_json_delete(right: ColumnType) -> Result<ColumnType, Error> {
+    if matches!(
+        right,
+        ColumnType::Text
+            | ColumnType::Int
+            | ColumnType::Array(nusadb_core::engine::ArrayElem::Text)
+    ) {
+        Ok(ColumnType::Json)
+    } else {
+        Err(Error::TypeMismatch {
+            context: "JSON `-` key (TEXT, INT or TEXT[])".to_owned(),
+            expected: ColumnType::Text,
+            found: right,
+        })
+    }
+}
+
+/// Type rule for the JSON key-existence operators: the left operand is `JSON`, the right a single
+/// `TEXT` key for `?` or a `TEXT[]` key list for `?|` / `?&`; the result is `BOOL`. A bare text
+/// value is accepted where `text[]` is wanted and parsed as `{a,b}` at evaluation, the same
+/// leniency `#>` gives its path.
+pub(super) fn check_json_exists(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    let text_array = ColumnType::Array(nusadb_core::engine::ArrayElem::Text);
+    let (wanted, ok) = if op == ast::BinaryOp::JsonExists {
+        (ColumnType::Text, right == ColumnType::Text)
+    } else {
+        (
+            text_array,
+            matches!(right, ColumnType::Text) || right == text_array,
+        )
+    };
+    if left != ColumnType::Json {
+        return Err(Error::TypeMismatch {
+            context: "JSON `?`/`?|`/`?&` document".to_owned(),
+            expected: ColumnType::Json,
+            found: left,
+        });
+    }
+    if !ok {
+        return Err(Error::TypeMismatch {
+            context: "JSON `?`/`?|`/`?&` key".to_owned(),
+            expected: wanted,
+            found: right,
+        });
+    }
+    Ok(ColumnType::Bool)
 }
 
 /// Type-check a JSON navigation operator: the left operand must be `JSON`. `->`/`->>` take a

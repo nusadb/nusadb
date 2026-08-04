@@ -1534,6 +1534,7 @@ fn execute_op_inner(
         PhysicalOperator::ProjectSet {
             input,
             columns,
+            pair,
             ordinality,
         } => {
             let rows = execute_op(input, engine, txn)?;
@@ -1548,24 +1549,38 @@ fn execute_op_inner(
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 // Evaluate the scalar columns once per input row; the SRF column expands to a list.
-                // The analyzer guarantees exactly one SRF column, so `srf` is set exactly once.
+                // The analyzer guarantees exactly one SRF column, so `srf` is set exactly once. A
+                // *pair* function (`jsonb_each`) produces a second value per element, appended below.
                 let mut scalars: Row = Vec::with_capacity(resolved.len());
-                let mut srf: Option<(usize, Vec<ast::Value>)> = None;
+                let mut srf: Option<(usize, Vec<ast::Value>, Vec<ast::Value>)> = None;
                 for (i, expr) in resolved.iter().enumerate() {
                     if let crate::planner::TypedExprKind::SetReturning { func, args } = &expr.kind {
-                        srf = Some((i, eval_set_returning(*func, args, &row)?));
+                        let (elements, values) = if pair.is_some() {
+                            eval_set_returning_pairs(*func, args, &row)?
+                                .into_iter()
+                                .unzip()
+                        } else {
+                            (eval_set_returning(*func, args, &row)?, Vec::new())
+                        };
+                        srf = Some((i, elements, values));
                         scalars.push(ast::Value::Null); // placeholder, set per produced element
                     } else {
                         scalars.push(eval::eval(expr, &row)?);
                     }
                 }
                 // One output row per produced element; an empty/NULL set emits no row for this input.
-                // `WITH ORDINALITY` appends a 1-based counter of the produced elements.
-                if let Some((pos, elements)) = srf {
+                // The appended columns go value-then-counter, matching the relation schema
+                // `cte_schema` builds: `FROM jsonb_each(doc) WITH ORDINALITY` is
+                // `(key, value, ordinality)`.
+                if let Some((pos, elements, values)) = srf {
+                    let mut values = values.into_iter();
                     for (idx, element) in elements.into_iter().enumerate() {
                         let mut output = scalars.clone();
                         if let Some(slot) = output.get_mut(pos) {
                             *slot = element;
+                        }
+                        if pair.is_some() {
+                            output.push(values.next().unwrap_or(ast::Value::Null));
                         }
                         if *ordinality {
                             let n = i64::try_from(idx).map_or(i64::MAX, |i| i.saturating_add(1));
@@ -2747,8 +2762,58 @@ fn run_vector_knn(
     Ok(knn)
 }
 
+/// Evaluate a *pair* set-returning function (`jsonb_each` / `jsonb_each_text`) for one input row
+/// into its `(key, value)` list, in the document's canonical key order.
+///
+/// # Errors
+/// [`Error::Coded`] `22023` when the document is valid JSON but not an object — the caller asked for
+/// its members, so reporting beats yielding nothing. A `NULL` document yields no rows.
+fn eval_set_returning_pairs(
+    func: ast::SetReturningFunc,
+    args: &[TypedExpr],
+    row: &Row,
+) -> Result<Vec<(ast::Value, ast::Value)>, Error> {
+    use ast::SetReturningFunc as Srf;
+    let document = args
+        .first()
+        .map_or(Ok(ast::Value::Null), |a| eval::eval(a, row))?;
+    // A NULL document yields no rows, like every other set-returning function here.
+    let ast::Value::Json(doc) = document else {
+        return Ok(Vec::new());
+    };
+    // A valid document that is not an object has no members to walk. The reference engine raises
+    // rather than quietly yielding nothing, and so does this: the caller asked for fields.
+    let refuse = || Error::Coded {
+        message: format!("cannot call {}() on a non-object", func.name()),
+        sqlstate: "22023", // invalid_parameter_value
+    };
+    match func {
+        Srf::JsonEach => Ok(crate::json::each(&doc)
+            .ok_or_else(refuse)?
+            .into_iter()
+            .map(|(key, value)| (ast::Value::Text(key), ast::Value::Json(value)))
+            .collect()),
+        Srf::JsonEachText => Ok(crate::json::each_text(&doc)
+            .ok_or_else(refuse)?
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    ast::Value::Text(key),
+                    value.map_or(ast::Value::Null, ast::Value::Text),
+                )
+            })
+            .collect()),
+        // The planner only routes here for a function whose `pair_value_type` is `Some`.
+        other => Err(Error::Unsupported(format!(
+            "{}() does not produce (key, value) pairs",
+            other.name()
+        ))),
+    }
+}
+
 /// Evaluate a set-returning function for one input row into its element list. `UNNEST(arr)`
 /// yields the array's elements in order; a `NULL` (or non-array, defensively) array yields nothing.
+/// The pair functions go through [`eval_set_returning_pairs`] instead.
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per set-returning function; flatter than dispatching to per-function helpers"
@@ -2839,6 +2904,13 @@ fn eval_set_returning(
         // REGEXP_MATCHES(s, pattern [, flags]) → one TEXT[] row per match; the `g` flag returns every
         // match, else only the first. A NULL argument yields no rows.
         Srf::RegexpMatches => eval_regexp_matches(first, args, row),
+        // The pair functions produce two columns per row, so the `ProjectSet` operator routes them
+        // to `eval_set_returning_pairs` instead. Reaching here would mean the plan lost its `pair`
+        // marker, which would silently drop the value column.
+        Srf::JsonEach | Srf::JsonEachText => Err(Error::Unsupported(format!(
+            "{}() produces (key, value) pairs and cannot be expanded as a single column",
+            func.name()
+        ))),
         // JSONB_PATH_QUERY(json, path) → each match as JSON. A NULL document/path yields no rows; an
         // unparseable path (outside the supported subset) is a runtime error.
         Srf::JsonPathQuery => {
@@ -4307,9 +4379,17 @@ fn sort_based_distinct(
 /// `Project` is always present (the planner unconditionally wraps the source).
 pub(super) fn output_columns(op: &PhysicalOperator) -> Vec<String> {
     match op {
-        PhysicalOperator::Project { columns, .. }
-        | PhysicalOperator::ProjectSet { columns, .. } => {
+        PhysicalOperator::Project { columns, .. } => {
             columns.iter().map(|c| c.name.clone()).collect()
+        },
+        // A pair set-returning function appends its value column to the projected ones, so the
+        // announced names must too — otherwise the row width and the column list disagree.
+        PhysicalOperator::ProjectSet { columns, pair, .. } => {
+            let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            if pair.is_some() {
+                names.push(ast::SetReturningFunc::PAIR_COLUMN.to_owned());
+            }
+            names
         },
         PhysicalOperator::Limit { input, .. }
         | PhysicalOperator::Distinct { input }
@@ -4327,9 +4407,13 @@ pub(super) fn output_columns(op: &PhysicalOperator) -> Vec<String> {
 /// type is its already-resolved [`TypedExpr::ty`](crate::planner::TypedExpr).
 pub(super) fn output_column_types(op: &PhysicalOperator) -> Vec<ColumnType> {
     match op {
-        PhysicalOperator::Project { columns, .. }
-        | PhysicalOperator::ProjectSet { columns, .. } => {
-            columns.iter().map(|c| c.expr.ty).collect()
+        PhysicalOperator::Project { columns, .. } => columns.iter().map(|c| c.expr.ty).collect(),
+        // Parallel to `output_columns`: the pair function's appended value column carries its own
+        // declared type.
+        PhysicalOperator::ProjectSet { columns, pair, .. } => {
+            let mut types: Vec<ColumnType> = columns.iter().map(|c| c.expr.ty).collect();
+            types.extend(*pair);
+            types
         },
         PhysicalOperator::Limit { input, .. }
         | PhysicalOperator::Distinct { input }

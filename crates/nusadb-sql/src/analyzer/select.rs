@@ -153,6 +153,7 @@ fn analyze_values_table(
         modifying_ctes: Vec::new(),
         row_lock: None,
         ordinality: false,
+        pair: None,
     })
 }
 
@@ -204,6 +205,7 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
         modifying_ctes: Vec::new(),
         row_lock: None,
         ordinality: false,
+        pair: None,
     })
 }
 
@@ -1213,6 +1215,23 @@ fn analyze_select_scoped(
                 .to_owned(),
         ));
     }
+    // A *pair* set-returning function (`jsonb_each`) produces two columns per row: the key, which is
+    // this projection item, and the value, which `ProjectSet` appends after every other column. The
+    // two land side by side only when the function is the *last* item — which is how the
+    // `FROM jsonb_each(doc)` desugaring builds it, and how `SELECT id, jsonb_each(doc)` reads.
+    // Anywhere earlier the value column would be separated from its key by the items after it, so
+    // refuse rather than emit that shape.
+    let pair = pair_value_type(&projection);
+    if pair.is_some()
+        && !matches!(projection.last(), Some(last)
+            if matches!(last.expr.kind, TypedExprKind::SetReturning { .. }))
+    {
+        return Err(Error::Unsupported(
+            "jsonb_each() / jsonb_each_text() returns a (key, value) pair, so it must be the last \
+             item in its SELECT list — the value column is appended after it"
+                .to_owned(),
+        ));
+    }
 
     // A `SELECT` aggregates when it has `GROUP BY` keys (incl. grouping sets) or aggregate calls
     // (the sink may already hold aggregates a window's PARTITION/ORDER pulled in above).
@@ -1420,6 +1439,17 @@ fn analyze_select_scoped(
         modifying_ctes,
         row_lock,
         ordinality: false,
+        pair,
+    })
+}
+
+/// The value-column type of a *pair* set-returning function (`jsonb_each`) in `projection`, or
+/// `None` when the projection holds no such call. The caller has already established that at most
+/// one set-returning function is present.
+fn pair_value_type(projection: &[Projection]) -> Option<ColumnType> {
+    projection.iter().find_map(|p| match p.expr.kind {
+        TypedExprKind::SetReturning { func, .. } => func.pair_value_type(),
+        _ => None,
     })
 }
 
@@ -1806,8 +1836,10 @@ impl Catalog for CteCatalog<'_> {
 /// column-name list. CTE columns are conservatively typed as nullable.
 fn cte_schema(name: &str, explicit: &[String], plan: &SelectPlan) -> Result<TableSchema, Error> {
     let base_width = plan.projection.len();
-    // `WITH ORDINALITY` adds one trailing column to the relation.
-    let width = base_width + usize::from(plan.ordinality);
+    // A pair set-returning function (`jsonb_each`) adds its value column, then `WITH ORDINALITY`
+    // adds the counter — in that order, so `FROM jsonb_each(doc) WITH ORDINALITY` reads
+    // `(key, value, ordinality)`.
+    let width = base_width + usize::from(plan.pair.is_some()) + usize::from(plan.ordinality);
     if !explicit.is_empty() && explicit.len() != width {
         return Err(Error::Unsupported(format!(
             "CTE `{name}` declares {} column name(s) but its query returns {width}",
@@ -1827,12 +1859,24 @@ fn cte_schema(name: &str, explicit: &[String], plan: &SelectPlan) -> Result<Tabl
             nullable: true,
         })
         .collect();
+    // A pair function's value column comes first among the appended ones, named `value` unless the
+    // alias list renames it.
+    if let Some(ty) = plan.pair {
+        columns.push(ColumnDef {
+            name: explicit
+                .get(base_width)
+                .cloned()
+                .unwrap_or_else(|| ast::SetReturningFunc::PAIR_COLUMN.to_owned()),
+            ty,
+            nullable: true,
+        });
+    }
     // The appended `WITH ORDINALITY` column is a 1-based row number (a non-null BIGINT, named
     // `ordinality` unless the alias list renames it).
     if plan.ordinality {
         columns.push(ColumnDef {
             name: explicit
-                .get(base_width)
+                .get(base_width + usize::from(plan.pair.is_some()))
                 .cloned()
                 .unwrap_or_else(|| "ordinality".to_owned()),
             ty: ColumnType::BigInt,
@@ -2242,9 +2286,16 @@ pub(super) fn analyze_projection(
                 alias,
             } => {
                 let typed = analyze_set_returning(func, &args, scope, catalog)?;
+                // An unaliased column takes the function's name — except for a pair function, whose
+                // two columns are `key` and `value` (the value half is appended by `ProjectSet`).
+                let default_name = if func.pair_value_type().is_some() {
+                    ast::SetReturningFunc::PAIR_KEY_COLUMN
+                } else {
+                    func.name()
+                };
                 projection.push(Projection {
                     expr: typed,
-                    name: alias.unwrap_or_else(|| func.name().to_owned()),
+                    name: alias.unwrap_or_else(|| default_name.to_owned()),
                 });
             },
             ast::SelectItem::Expr { expr, alias } => {
@@ -2449,8 +2500,12 @@ fn analyze_set_returning(
         // JSONB_PATH_QUERY(json, path) → JSON per match.
         Srf::JsonPathQuery => (&[ColumnType::Json, ColumnType::Text], ColumnType::Json),
         // JSONB_OBJECT_KEYS(json) → TEXT per top-level key; JSONB_ARRAY_ELEMENTS_TEXT(json) →
-        // TEXT per array element.
-        Srf::JsonObjectKeys | Srf::JsonArrayElementsText => (&[ColumnType::Json], ColumnType::Text),
+        // TEXT per array element. JSONB_EACH(json) / JSONB_EACH_TEXT(json) → one row per object
+        // member, this element type being the *key* column — their value column rides along as the
+        // plan's pair column (see `SetReturningFunc::pair_value_type`).
+        Srf::JsonObjectKeys | Srf::JsonArrayElementsText | Srf::JsonEach | Srf::JsonEachText => {
+            (&[ColumnType::Json], ColumnType::Text)
+        },
         // STRING_TO_TABLE(s, sep) → TEXT per split piece.
         Srf::StringToTable => (&[ColumnType::Text, ColumnType::Text], ColumnType::Text),
     };
