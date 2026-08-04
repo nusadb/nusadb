@@ -216,6 +216,30 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                 })
             }
         },
+        // A minus in front of a numeric literal belongs to the literal, not to an operation on it.
+        // Read apart, the most negative integer overflows: its magnitude is one past the largest
+        // positive one, so it would fall through to an exact decimal and then refuse to assign to a
+        // BIGINT column.
+        sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Minus,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            sql::Expr::Value(sql::ValueWithSpan {
+                value: sql::Value::Number(..),
+                ..
+            })
+        ) =>
+        {
+            let sql::Expr::Value(sql::ValueWithSpan {
+                value: sql::Value::Number(n, _),
+                ..
+            }) = *expr
+            else {
+                unreachable!("guarded by the match above")
+            };
+            convert_number(&format!("-{n}")).map(ast::Expr::Literal)
+        },
         sql::Expr::UnaryOp { op, expr } => Ok(ast::Expr::Unary {
             op: convert_unary_op(op)?,
             expr: Box::new(convert_expr(*expr)?),

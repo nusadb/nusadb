@@ -522,6 +522,11 @@ fn slt_p10_range() {
 }
 
 #[test]
+fn slt_p10_bigint_bounds() {
+    run_slt("tests/slt/p10_types/bigint_bounds.slt");
+}
+
+#[test]
 fn slt_p10_numeric() {
     run_slt("tests/slt/p10_types/numeric.slt");
 }

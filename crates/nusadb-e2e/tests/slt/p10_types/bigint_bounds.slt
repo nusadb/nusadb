@@ -1,0 +1,45 @@
+# p10_types/bigint_bounds — the extremes of BIGINT round-trip.
+# The most negative integer has a magnitude one past the largest positive one, so a minus sign read
+# apart from its literal overflows and the value degrades to an exact decimal that no longer assigns
+# to the column. The sign belongs to the literal.
+
+statement ok
+CREATE TABLE b (v BIGINT)
+
+statement ok
+INSERT INTO b VALUES (-9223372036854775808), (9223372036854775807), (-9223372036854775807), (0)
+
+query I rowsort
+SELECT v FROM b
+----
+-9223372036854775807
+-9223372036854775808
+0
+9223372036854775807
+
+# The extremes survive a round trip through arithmetic and comparison.
+query I
+SELECT v FROM b WHERE v = -9223372036854775808
+----
+-9223372036854775808
+
+query I
+SELECT v + 1 FROM b WHERE v = -9223372036854775808
+----
+-9223372036854775807
+
+# One past either end is still refused rather than silently wrapped.
+statement error
+INSERT INTO b VALUES (9223372036854775808)
+
+# Negation as an operation on a column is unaffected.
+query I
+SELECT -v FROM b WHERE v = 9223372036854775807
+----
+-9223372036854775807
+
+# A negative decimal literal keeps its exactness.
+query T
+SELECT (-0.45)::TEXT
+----
+-0.45
