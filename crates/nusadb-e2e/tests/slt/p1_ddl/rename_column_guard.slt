@@ -1,0 +1,140 @@
+# p1_ddl/rename_column_guard — renaming a column that something else records by name is refused,
+# and the error says what is in the way.
+#
+# A column name is written down in more places than the table's own schema: a constraint keeps its
+# key columns and its CHECK body, a foreign key keeps both sides, an index keeps its key, and a
+# default is filed under the column. Renaming moved only the schema entry, so every one of those was
+# left naming a column that no longer existed and the table stopped accepting writes while still
+# answering reads. Until those references are carried across, the rename is refused instead.
+
+# --- The reported case: an INTEGER column carries a generated width check. ---
+
+statement ok
+CREATE TABLE rn (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO rn VALUES (1,2)
+
+statement error
+ALTER TABLE rn RENAME COLUMN b TO c
+
+# The refusal leaves the table exactly as it was — still writable under its own name.
+statement ok
+INSERT INTO rn VALUES (3,4)
+
+query I
+SELECT count(*) FROM rn
+----
+2
+
+# --- A column nothing refers to still renames, and stays writable and readable after. ---
+
+statement ok
+CREATE TABLE plain (a TEXT, b TEXT)
+
+statement ok
+INSERT INTO plain VALUES ('x','y')
+
+statement ok
+ALTER TABLE plain RENAME COLUMN b TO c
+
+statement ok
+INSERT INTO plain VALUES ('p','q')
+
+query T
+SELECT c FROM plain WHERE a = 'x'
+----
+y
+
+# --- Every kind of dependant blocks it. ---
+
+statement ok
+CREATE TABLE u (a INT, b TEXT UNIQUE)
+
+statement error
+ALTER TABLE u RENAME COLUMN b TO c
+
+statement ok
+CREATE TABLE ix (a TEXT, b TEXT)
+
+statement ok
+CREATE INDEX ix_b ON ix(b)
+
+statement error
+ALTER TABLE ix RENAME COLUMN b TO c
+
+statement ok
+CREATE TABLE df (a TEXT, b TEXT DEFAULT 'd')
+
+statement error
+ALTER TABLE df RENAME COLUMN b TO c
+
+statement ok
+CREATE TABLE par (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE chi (id INT PRIMARY KEY, pid INT REFERENCES par(id))
+
+# Blocked from the parent side and from the child side alike.
+statement error
+ALTER TABLE par RENAME COLUMN id TO k
+
+statement error
+ALTER TABLE chi RENAME COLUMN pid TO p
+
+# --- A longer name that merely contains the column is not what blocks it. ---
+# `bb` starts with `b`, so a scan that resumed one character in would match on its tail.
+
+statement ok
+CREATE TABLE lg (b TEXT, bb TEXT, CHECK (bb <> 'no'))
+
+statement ok
+INSERT INTO lg VALUES ('keep','yes')
+
+statement ok
+ALTER TABLE lg RENAME COLUMN b TO z
+
+statement ok
+INSERT INTO lg VALUES ('more','ok')
+
+query T
+SELECT z FROM lg WHERE bb = 'yes'
+----
+keep
+
+# --- A predicate is stored as it was written, so its case must not decide the outcome. ---
+
+statement ok
+CREATE TABLE uc (a BIGINT, b BIGINT, CHECK (B > 0))
+
+statement ok
+INSERT INTO uc VALUES (1, 5)
+
+statement error
+ALTER TABLE uc RENAME COLUMN b TO c
+
+# Refused, so the table is still writable — and the check still bites.
+statement ok
+INSERT INTO uc VALUES (2, 7)
+
+statement error
+INSERT INTO uc VALUES (3, -9)
+
+# --- A generated column reads other columns, and its expression is evaluated on every write. ---
+
+statement ok
+CREATE TABLE g (a BIGINT, b BIGINT, s BIGINT GENERATED ALWAYS AS (a + b) STORED)
+
+statement ok
+INSERT INTO g (a, b) VALUES (1, 2)
+
+statement error
+ALTER TABLE g RENAME COLUMN a TO x
+
+statement ok
+INSERT INTO g (a, b) VALUES (3, 4)
+
+query I
+SELECT s FROM g WHERE a = 3
+----
+7

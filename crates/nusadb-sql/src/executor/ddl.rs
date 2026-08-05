@@ -225,6 +225,132 @@ pub(super) fn run_create_table(
 /// ALTER TABLE ADD CONSTRAINT). Resolves the parent table against the live catalog and declares the
 /// constraint — the engine validates the parent has a `PRIMARY KEY`. v1 references the parent's
 /// `PRIMARY KEY` only: an explicit `REFERENCES parent(cols)` that is not exactly the parent's PK, or
+/// Refuse to rename a column that something else records by name.
+///
+/// A column name is written down in more places than the table's own schema: a constraint keeps its
+/// key columns and its `CHECK` body, a foreign key keeps the columns on both sides, an index keeps
+/// its key and predicate, and a default is filed under the column. Renaming moves only the schema
+/// entry, which leaves every one of those naming a column that no longer exists — the table stays
+/// readable and stops accepting writes, silently.
+///
+/// Until those references are carried across, the rename is refused and the error names what is in
+/// the way, so the operator can drop it, rename, and put it back. Refusing is worse than renaming
+/// but far better than the table quietly going read-only.
+///
+/// # Errors
+/// [`Error::Unsupported`] naming the first dependent found.
+fn refuse_rename_with_dependents(
+    table: &TableSchema,
+    column: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let refuse = |what: &str, name: &str| -> Error {
+        // A generated check enforces the column's declared width and is not visible as a
+        // constraint, so telling the operator to drop and redeclare it would be telling them to
+        // drop the width enforcement they never wrote.
+        let remedy = if name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
+            "the column's declared type is enforced by a check the engine generated, so renaming \
+             is not yet supported for a column of this type"
+        } else {
+            "drop it, rename the column, then declare it again"
+        };
+        Error::Unsupported(format!(
+            "cannot rename column \"{column}\" of \"{}\": {what} \"{name}\" refers to it by name \
+             and would stop resolving — {remedy}",
+            table.name
+        ))
+    };
+    for c in engine.list_constraints(table.id)? {
+        if c.columns.iter().any(|k| k == column) {
+            return Err(refuse("constraint", &c.name));
+        }
+        // A CHECK body is stored as SQL text; look for the column as a whole word so a longer name
+        // that merely contains it does not block the rename.
+        if let Some(bytes) = &c.expr
+            && let Ok(sql) = std::str::from_utf8(bytes)
+            && sql_mentions_column(sql, column)
+        {
+            return Err(refuse("check constraint", &c.name));
+        }
+    }
+    for fk in engine.list_foreign_keys(table.id)? {
+        if fk.child_columns.iter().any(|k| k == column)
+            || (fk.parent_table == table.id && fk.parent_columns.iter().any(|k| k == column))
+        {
+            return Err(refuse("foreign key", &fk.name));
+        }
+    }
+    for def in engine.list_indexes(table.id)? {
+        let named = def.columns.iter().chain(&def.include).any(|k| k == column)
+            || def.key_exprs.iter().any(|e| sql_mentions_column(e, column))
+            || def
+                .predicate
+                .as_deref()
+                .is_some_and(|p| sql_mentions_column(p, column));
+        if named {
+            return Err(refuse("index", &def.name));
+        }
+    }
+    // A foreign key on another table may point at this column as its parent key.
+    for other_name in engine.list_tables_as_of(txn)? {
+        let Some(other) = engine.lookup_table_as_of(txn, &other_name)? else {
+            continue;
+        };
+        if other.id == table.id {
+            continue;
+        }
+        for fk in engine.list_foreign_keys(other.id)? {
+            if fk.parent_table == table.id && fk.parent_columns.iter().any(|k| k == column) {
+                return Err(refuse("foreign key", &fk.name));
+            }
+        }
+    }
+    for (owner, sql) in super::coldefault::load_defaults(
+        &super::coldefault::catalog_key(&table.schema, &table.name),
+        engine,
+        txn,
+    )? {
+        // The column's own default moves with it, and a generated column's expression may read
+        // this column from elsewhere in the table — that expression is evaluated on every write.
+        if owner == column {
+            return Err(refuse("default expression on column", column));
+        }
+        if let Some(expr) = super::coldefault::generated_expr(&sql)
+            && sql_mentions_column(expr, column)
+        {
+            return Err(refuse("generated column", &owner));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a stored SQL fragment refers to `column` as a whole identifier, rather than as part of a
+/// longer name.
+///
+/// The comparison ignores case: a predicate is kept as the text it was written in, while a column
+/// name is folded, so `CHECK (B > 0)` refers to column `b`. Missing that would let the rename
+/// through and leave the table unwritable, which is the whole thing being prevented — so this errs
+/// toward matching, and a name that merely appears inside a string literal blocks the rename too.
+fn sql_mentions_column(sql: &str, column: &str) -> bool {
+    let is_part = |c: char| c.is_alphanumeric() || c == '_';
+    let (sql, column) = (sql.to_ascii_lowercase(), column.to_ascii_lowercase());
+    let mut from = 0;
+    while let Some(offset) = sql[from..].find(&column) {
+        let at = from + offset;
+        let end = at + column.len();
+        let before = sql[..at].chars().next_back();
+        let after = sql[end..].chars().next();
+        if !before.is_some_and(is_part) && !after.is_some_and(is_part) {
+            return true;
+        }
+        // Resume past the whole identifier this sat inside, so a longer name starting with the
+        // column (`bb` for `b`) cannot match on its own tail.
+        from = end + sql[end..].find(|c| !is_part(c)).unwrap_or(sql.len() - end);
+    }
+    false
+}
+
 /// Resolve the table a foreign key points at.
 ///
 /// The name is tried whole first, so every target that resolved before resolves to the same table —
@@ -720,9 +846,13 @@ pub(super) fn run_alter_table(
                 ty: *ty,
             }
         },
-        AlterColumnOp::RenameColumn { index, to } => AlterOp::RenameColumn {
-            from: column_name(&table, *index)?,
-            to: to.clone(),
+        AlterColumnOp::RenameColumn { index, to } => {
+            let from = column_name(&table, *index)?;
+            refuse_rename_with_dependents(&table, &from, engine, txn)?;
+            AlterOp::RenameColumn {
+                from,
+                to: to.clone(),
+            }
         },
         AlterColumnOp::SetNotNull { index } => {
             ensure_no_nulls(&table, *index, engine, txn)?;
