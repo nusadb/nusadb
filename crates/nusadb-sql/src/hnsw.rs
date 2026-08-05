@@ -515,6 +515,23 @@ impl HnswIndex {
     /// first), keep a node only if it is closer to the query than to every already-kept neighbour,
     /// up to `m`. This spreads links across directions instead of clumping on the nearest cluster,
     /// which is what gives HNSW its high recall.
+    ///
+    /// A kept neighbour sitting at distance **0** from the query point is excluded from that test,
+    /// and it has to be. Such a neighbour is an exact duplicate of the query point, so
+    /// `dist(c, kept)` equals `dist(c, query)` for *every* candidate `c` and the strict `<` never
+    /// holds — one twin vetoes the entire candidate list. When this runs from [`Self::connect`] to
+    /// prune a node's links, the node is left with a single link, to its own twin. That pair is a
+    /// sink: a greedy search reaching either can only step to the other, and when one of them is the
+    /// entry point *every* search ends there. A single duplicated row made the whole index answer
+    /// every query with that row, silently. A twin carries no directional information — it covers
+    /// all directions equally — so it has no business vetoing anything.
+    ///
+    /// Excluding only the zero-distance case is deliberate. Refilling the list from the rejected
+    /// candidates instead (the reference implementation's `keepPrunedConnections`) also clears the
+    /// collapse, but it pins every node at the degree cap: measured against this build, 6-14x the
+    /// build time and ~10% larger graphs, for a recall gain of about 0.01. The exclusion costs
+    /// nothing — on data with no exact duplicates no kept neighbour is ever at distance 0, so the
+    /// graph it produces is byte-identical to before (the pinned digest test proves it).
     fn select_neighbours(&self, candidates: &[Candidate], m: usize) -> Vec<u32> {
         let mut kept: Vec<Candidate> = Vec::with_capacity(m);
         for &cand in candidates {
@@ -525,6 +542,7 @@ impl HnswIndex {
             let (cand_vec, cand_term) = (&cand_node.vector, cand_node.term);
             let closer_to_query_than_to_kept = kept
                 .iter()
+                .filter(|k| k.dist > 0.0)
                 .all(|k| cand.dist < self.distance_to(cand_vec, cand_term, k.id));
             if closer_to_query_than_to_kept {
                 kept.push(cand);
@@ -913,6 +931,59 @@ mod tests {
         let got = index.search(&[0.1, 0.1], 3, 16).expect("search");
         let ids: Vec<u32> = got.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![0, 1, 2], "nearest three of (0.1,0.1)");
+    }
+
+    #[test]
+    fn a_duplicate_vector_does_not_collapse_the_graph() {
+        // One row whose vector is an exact copy of another used to be enough to break *every*
+        // query. Pruning a node's links keeps a candidate only when it is closer to the node than
+        // to each already-kept neighbour; against a twin at distance 0 that test is `d < d`, false
+        // for every candidate, so the node kept exactly one link — to the twin. The pair became a
+        // sink, and when one of them was the entry point every search ended there. The reported
+        // symptom was all twenty probes returning the duplicated row's id.
+        //
+        // The probes below deliberately target rows that are *not* part of the duplicate pair: the
+        // damage was global, not confined to the twins.
+        let dim = 32;
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1_u64 << 53) as f32
+        };
+        let mut vectors: Vec<Vec<f32>> = (0..400)
+            .map(|_| (0..dim).map(|_| next()).collect())
+            .collect();
+        vectors.push(vectors[0].clone()); // the one duplicate
+
+        let mut index = HnswIndex::new(dim, Metric::L2, HnswParams::default(), 42);
+        for v in &vectors {
+            index.insert(v.clone()).expect("insert");
+        }
+
+        // No node may be left with a single link on layer 0 — that is the collapse itself, and it
+        // is what disconnects the graph regardless of which query runs.
+        let min_degree = (0..vectors.len())
+            .filter_map(|i| index.node_neighbours(i).and_then(<[Vec<u32>]>::first))
+            .map(Vec::len)
+            .min()
+            .expect("a built graph has nodes");
+        assert!(
+            min_degree > 1,
+            "a node was pruned down to {min_degree} link(s) on layer 0 — the duplicate collapsed it"
+        );
+
+        // Every unique row still finds itself: an exact copy of the query is at distance 0, so an
+        // index that cannot return it is wrong, not approximate.
+        for want in [17_usize, 93, 155, 231, 307, 399] {
+            let hit = index.search(&vectors[want], 1, 64).expect("search");
+            assert_eq!(
+                hit.first().map(|(id, _)| *id as usize),
+                Some(want),
+                "self-retrieval of unique row {want} with a duplicate pair present"
+            );
+        }
     }
 
     #[test]
