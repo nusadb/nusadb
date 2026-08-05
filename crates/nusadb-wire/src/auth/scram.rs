@@ -23,6 +23,10 @@ use super::base64;
 /// Length of a SHA-256 output / HMAC-SHA-256 tag in bytes.
 const SHA256_LEN: usize = 32;
 
+/// Width of a SCRAM salt, in bytes. A stand-in salt must match it exactly — a differing length
+/// would tell an attacker the name is not real without any other observation.
+const SALT_LEN: usize = 16;
+
 /// Bytes of CSPRNG entropy behind each server nonce. 18 bytes → 24 base64 characters with no
 /// padding, comfortably above the RFC's "at least 16 bytes" guidance for the combined nonce.
 const SERVER_NONCE_BYTES: usize = 18;
@@ -220,7 +224,7 @@ pub fn generate_nonce() -> Result<String, ScramError> {
 /// [`ScramError::Rng`] if the system CSPRNG fails.
 pub fn generate_salt() -> Result<Vec<u8>, ScramError> {
     let rng = SystemRandom::new();
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; SALT_LEN];
     rng.fill(&mut buf).map_err(|_| ScramError::Rng)?;
     Ok(buf.to_vec())
 }
@@ -333,6 +337,52 @@ pub struct StoredCredentials {
     pub salt: Vec<u8>,
     /// The PBKDF2 iteration count.
     pub iterations: u32,
+}
+
+/// Derive the credentials to answer an authentication attempt for a user that does not exist.
+///
+/// SCRAM's `server-first` reply carries the user's salt and iteration count, so a server that
+/// refuses before sending it announces "no such user" by the shape of the exchange alone — the
+/// message text can be identical and an attacker still learns which names are real. Answering with
+/// derived-looking credentials keeps both cases indistinguishable: the handshake runs to the same
+/// length and fails at the same step, on a proof that cannot match.
+///
+/// Only `salt` and `iterations` are ever transmitted; `stored_key` and `server_key` stay on the
+/// server and merely have to be unguessable. So this derives all three with one HMAC each rather
+/// than running a key derivation — a real user's credentials were derived when the store was
+/// built, and their authentication is a map lookup, so spending 4096 PBKDF2 rounds here would
+/// separate the two by orders of magnitude and hand an attacker a sharper timing oracle than the
+/// frame-shape one this exists to close. It would also let an unauthenticated caller conscript the
+/// server into that work once per connection.
+///
+/// Each of the three values is keyed by its *own* subkey of `secret`, under a fixed label no caller
+/// can influence. Keying two of them with `secret` itself and separating them only by a prefix on
+/// the message would let a caller who connects as `<prefix><name>` read back material belonging to
+/// `<name>` — the salt is published, so that is a real read. Separate subkeys share no message
+/// space at all, which also rules out one value colliding with another for a crafted name.
+///
+/// The salt is stable for a given name — one that changed between attempts would give the absence
+/// away just as loudly — and unguessable without `secret`.
+#[must_use]
+pub fn derive_mock_credentials(
+    secret: &[u8],
+    username: &str,
+    iterations: u32,
+) -> StoredCredentials {
+    debug_assert!(
+        iterations > 0,
+        "a stand-in advertising zero iterations classifies the name"
+    );
+    let salt_key = hmac_sha256(secret, b"nusadb-scram-mock-salt");
+    let stored_subkey = hmac_sha256(secret, b"nusadb-scram-mock-stored-key");
+    let server_subkey = hmac_sha256(secret, b"nusadb-scram-mock-server-key");
+    StoredCredentials {
+        // Same width as a generated salt: a differing length would classify the name on its own.
+        salt: hmac_sha256(&salt_key, username.as_bytes())[..SALT_LEN].to_vec(),
+        stored_key: hmac_sha256(&stored_subkey, username.as_bytes()),
+        server_key: hmac_sha256(&server_subkey, username.as_bytes()),
+        iterations,
+    }
 }
 
 /// Compute one HMAC-SHA-256 tag as a fixed 32-byte array.

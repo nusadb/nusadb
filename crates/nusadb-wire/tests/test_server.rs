@@ -3297,3 +3297,227 @@ async fn stream_portal_fetch_all_inside_transaction() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A name that exists and one that does not must draw the same reply to `client-first`. Matching
+/// the wording is not enough on its own: SCRAM's `server-first` carries the user's salt, so a
+/// server that refuses before sending it says "no such user" through the shape of the exchange, and
+/// an attacker learns which names are real without ever guessing a password.
+#[tokio::test]
+async fn an_unknown_user_gets_the_same_reply_as_a_real_one() {
+    use nusadb_wire::auth::scram;
+
+    /// Drive client-first for `user` and report what the server replied with, plus the salt and
+    /// iteration count it advertised.
+    async fn probe(auth: &Arc<AuthStore>, user: &str) -> (String, Option<(String, u32)>) {
+        let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+        let auth = Arc::clone(auth);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let _handle = tokio::spawn(handle_client_with(
+            server,
+            engine,
+            None,
+            None,
+            None,
+            Some(auth),
+            None,
+            None,
+            None,
+        ));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 1,
+                user: user.to_owned(),
+                database: "nusadb".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let _offer = next(&mut conn).await;
+        let nonce = scram::generate_nonce().unwrap();
+        conn.write_frame(
+            &FrontendMessage::SaslInitialResponse {
+                mechanism: "SCRAM-SHA-256".to_owned(),
+                data: format!("n,,n={user},r={nonce}").into_bytes(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        match next(&mut conn).await {
+            BackendMessage::AuthSaslContinue { data } => {
+                let msg = String::from_utf8(data).unwrap();
+                let parsed = scram::ServerFirst::parse(&msg).unwrap();
+                let mut salt = String::new();
+                for b in &parsed.salt {
+                    use std::fmt::Write as _;
+                    write!(salt, "{b:02x}").unwrap();
+                }
+                (
+                    "AuthSaslContinue".to_owned(),
+                    Some((salt, parsed.iterations)),
+                )
+            },
+            BackendMessage::Error { code, message } => (format!("Error {code}: {message}"), None),
+            other => (format!("{other:?}"), None),
+        }
+    }
+
+    // One store for every probe: an attacker hits one running server, so that is what must not
+    // give the answer away.
+    let auth = Arc::new(AuthStore::from_passwords([("alice", "s3cret")]).unwrap());
+    let (known, known_params) = probe(&auth, "alice").await;
+    let (unknown, unknown_params) = probe(&auth, "ghost").await;
+    assert_eq!(
+        known, unknown,
+        "the reply to an unknown user must be indistinguishable from a real one"
+    );
+    let (known_salt, known_iters) = known_params.expect("a real user gets server-first");
+    let (ghost_salt, ghost_iters) = unknown_params.expect("an unknown user gets server-first too");
+    assert_eq!(
+        known_iters, ghost_iters,
+        "a differing iteration count would give the absence away"
+    );
+    assert_eq!(
+        known_salt.len(),
+        ghost_salt.len(),
+        "a differing salt width classifies the name on its own"
+    );
+
+    // The stand-in salt is stable: one that changed between attempts would mark the name as absent
+    // just as clearly as an early refusal.
+    let (_, again) = probe(&auth, "ghost").await;
+    let (ghost_salt_again, _) = again.expect("still server-first");
+    assert_eq!(
+        ghost_salt, ghost_salt_again,
+        "the stand-in salt must be stable per name"
+    );
+
+    // And it is not the same salt another name would get.
+    let (_, other) = probe(&auth, "phantom").await;
+    let (other_salt, _) = other.expect("still server-first");
+    assert_ne!(ghost_salt, other_salt, "two names must not share a salt");
+}
+
+/// Authenticating as an unknown user still fails — the stand-in credentials must not become a way
+/// in. The proof cannot match, so the exchange ends in the same generic failure.
+#[tokio::test]
+async fn an_unknown_user_cannot_authenticate() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let auth = Arc::new(AuthStore::from_passwords([("alice", "s3cret")]).unwrap());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let _handle = tokio::spawn(handle_client_with(
+        server,
+        engine,
+        None,
+        None,
+        None,
+        Some(auth),
+        None,
+        None,
+        None,
+    ));
+    let mut conn = Connection::new(client);
+
+    scram_handshake(&mut conn, "ghost", "any-password").await;
+
+    match next(&mut conn).await {
+        BackendMessage::Error { code, message } => {
+            assert_eq!(code, "XX000");
+            assert!(
+                message.contains("authentication failed"),
+                "wanted the generic failure, got `{message}`"
+            );
+        },
+        other => panic!("an unknown user must not authenticate; got {other:?}"),
+    }
+}
+
+/// Answering an unknown name must not cost noticeably more than answering a real one. This is the
+/// observable that replaced the frame-shape leak once before: deriving the stand-in through the
+/// same PBKDF2 a real user was *created* with made the unknown path ~150x slower, because a real
+/// user's authentication is only a map lookup. That gap classified a name from a single sample.
+///
+/// The bound is deliberately loose, because this measures a shared machine. That makes it a coarse
+/// regression guard, not a proof of indistinguishability: it catches a key derivation put back at
+/// its usual cost, and would miss one run at a heavily reduced iteration count, which would still
+/// leak. What it defends is the mistake that was actually made here.
+#[tokio::test]
+async fn answering_an_unknown_user_costs_about_the_same_as_a_real_one() {
+    use nusadb_wire::auth::scram;
+    use std::time::Instant;
+
+    async fn median_micros(auth: &Arc<AuthStore>, user: &str) -> u128 {
+        let mut samples = Vec::new();
+        for _ in 0..25 {
+            let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let _handle = tokio::spawn(handle_client_with(
+                server,
+                engine,
+                None,
+                None,
+                None,
+                Some(Arc::clone(auth)),
+                None,
+                None,
+                None,
+            ));
+            let mut conn = Connection::new(client);
+            conn.write_frame(
+                &FrontendMessage::Startup {
+                    major: 1,
+                    minor: 1,
+                    user: user.to_owned(),
+                    database: "nusadb".to_owned(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let _offer = next(&mut conn).await;
+            let nonce = scram::generate_nonce().unwrap();
+            let started = Instant::now();
+            conn.write_frame(
+                &FrontendMessage::SaslInitialResponse {
+                    mechanism: "SCRAM-SHA-256".to_owned(),
+                    data: format!("n,,n={user},r={nonce}").into_bytes(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let _server_first = next(&mut conn).await;
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    let auth = Arc::new(AuthStore::from_passwords([("alice", "s3cret")]).unwrap());
+    // Warm up first, so cold-start cost does not land on whichever name is measured first — there
+    // it would inflate the baseline a regression is compared against.
+    let _warmup = median_micros(&auth, "alice").await;
+    let known = median_micros(&auth, "alice").await.max(1);
+    let unknown = median_micros(&auth, "ghost").await.max(1);
+    assert!(
+        unknown <= known * 20,
+        "answering an unknown user took {unknown}us against {known}us for a real one; a gap this          size classifies a name by timing alone"
+    );
+    // The ratio alone is blind to a key derivation added to *both* paths: that leaks no name, but
+    // it hands an unauthenticated caller several hundred microseconds of server work per
+    // connection. So bound the absolute cost too. A PBKDF2 at the usual count is ~600us here;
+    // answering from derived material is single-digit.
+    for (label, measured) in [("a real user", known), ("an unknown user", unknown)] {
+        assert!(
+            measured < 200,
+            "answering {label} took {measured}us; the pre-authentication path should not be              doing work an unauthenticated caller can conscript"
+        );
+    }
+}

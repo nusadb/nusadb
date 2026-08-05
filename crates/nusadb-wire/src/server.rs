@@ -1795,12 +1795,18 @@ where
     else {
         return auth_fail(conn, "malformed client-first message").await;
     };
-    // The SCRAM username must match the connection's declared user (no cross-user auth). Look the
-    // credentials up; a missing user fails with the same generic message to avoid user enumeration.
-    let creds = match auth.lookup(user) {
-        Some(creds) if client_first.username == user => creds,
-        _ => return auth_fail(conn, "authentication failed").await,
-    };
+    // The SCRAM username must match the connection's declared user (no cross-user auth). Refusing
+    // early here is safe where it would not be below: the caller chose both names, so a mismatch
+    // tells it nothing it did not already know. That does not generalise — an early refusal keyed
+    // on anything the server knows and the caller does not is the very leak this path avoids.
+    if client_first.username != user {
+        return auth_fail(conn, "authentication failed").await;
+    }
+    // A name that is not configured gets stand-in credentials rather than an early refusal, so the
+    // exchange runs to the same length whether or not the user exists and only the proof decides.
+    // Refusing here would name the absent user by the shape of the reply alone.
+    let creds = auth.credentials_for(user);
+    let creds = creds.as_ref();
 
     // --- server-first ---
     let Ok(server_nonce) = scram::generate_nonce() else {
