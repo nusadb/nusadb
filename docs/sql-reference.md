@@ -206,7 +206,8 @@ mis-formatted.
 ## Session configuration variables
 
 `SET name = value` accepts the settings the engine reads (`search_path`, `work_mem`,
-`statement_timeout`, `hnsw_ef_search`), the reported connection parameters a session may still set
+`statement_timeout`, `hnsw_ef_search`, `max_autocommit_retries`), the reported connection parameters
+a session may still set
 (`client_encoding`, `datestyle`, `timezone`, …), and an application's own variables — which must
 carry a class prefix, as in `SET myapp.request_id = '42'`. `SHOW name` and `current_setting('name')`
 read one back as text, and an unset variable reads back as the empty string.
@@ -217,3 +218,42 @@ An unrecognized bare name is an error (`42704`), not a new custom variable: a mi
 parameter (`server_version`, `server_encoding`, `integer_datetimes`) reports `55P02`. A *value* a
 setting cannot use is likewise rejected at `SET` time: `SET work_mem = 'huge'` fails with an
 `invalid value for parameter` error rather than being stored and then ignored.
+
+## Serialization conflicts and the auto-commit retry
+
+Concurrency control is optimistic and locks never wait: when two sessions write the same row, one
+of them is rejected with SQLSTATE `40001` immediately rather than queueing behind the other. The
+rejected transaction changed nothing, and running it again against the now-committed value is the
+correct response.
+
+For a **single statement in auto-commit** — no `BEGIN` in effect — the server does that itself. Such
+a statement has no intermediate results the application has seen and committed nothing, so
+re-running it is exactly what a client retry loop would do, and the client never sees the conflict.
+Attempts are separated by an exponential back-off with jitter, so sessions that collided once are
+not released in lockstep to collide again.
+
+Inside an explicit transaction the conflict is reported, not retried. A statement there may follow
+others whose results the application already acted on, so silently re-running it would change what
+those earlier results meant — only the application knows whether the whole transaction can be
+replayed. Handle `40001` by rolling back and retrying the transaction.
+
+`SET max_autocommit_retries = N` bounds the attempts (default 50, maximum 100); `0` switches the
+retry off and reports the first conflict. The budget is a bound, not a promise: a conflict that
+outlives it is reported unchanged as `40001`, so an application's own retry loop still works. A
+`statement_timeout` or a cancel request applies to the retry sequence as a whole and ends it.
+
+Consequences worth knowing:
+
+- A retried statement re-runs its non-transactional side effects. `nextval` is the one to watch —
+  a sequence can advance once per attempt, so gaps are possible under contention. Sequences never
+  promise gapless values, but a retried statement makes gaps more likely. `RANDOM()` is the other:
+  a re-run draws again, so under `SETSEED` a session's random sequence advances by an amount that
+  depends on how many attempts the statement took.
+- A statement whose rows have already started reaching the client is **not** retried. Results are
+  streamed, and once a batch has been sent it cannot be unsaid — sending it twice would corrupt the
+  result. So a large `SELECT` that conflicts part-way through reports `40001` like any other
+  statement. Statements that return a count rather than rows, and results small enough not to have
+  been sent yet, are unaffected.
+- A statement that keeps losing occupies its connection for the length of the budget before
+  reporting. `SET max_autocommit_retries = 0` restores the immediate report where that matters more
+  than the automatic recovery.

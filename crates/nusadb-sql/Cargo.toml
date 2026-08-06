@@ -44,3 +44,8 @@ harness = false
 [[bench]]
 name    = "json_ops"
 harness = false
+
+# Bench: what the auto-commit conflict retry costs a statement that never conflicts.
+[[bench]]
+name    = "autocommit_retry"
+harness = false

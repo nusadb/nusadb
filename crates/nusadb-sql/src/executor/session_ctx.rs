@@ -188,6 +188,7 @@ pub fn check_settable_parameter(name: &str) -> Result<(), Error> {
                 | "work_mem"
                 | "statement_timeout"
                 | "hnsw_ef_search"
+                | crate::retry::MAX_AUTOCOMMIT_RETRIES
                 // Reported parameters a session may still set.
                 | "client_encoding"
                 | "standard_conforming_strings"

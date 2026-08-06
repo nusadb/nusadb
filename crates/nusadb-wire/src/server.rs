@@ -1971,9 +1971,11 @@ type StreamedOutcome = (
 );
 
 /// The result of [`run_query_streaming`] under an optional inline plan-shape gate:
-/// either the statement ran (`Done`), or the gate refused it BEFORE execution and the caller
-/// must re-dispatch to the blocking pool (`Punt` — guaranteed side-effect-free: the plan is
-/// cached but no row was read, no state changed, and any probe transaction was rolled back).
+/// either the statement ran (`Done`), or the caller must re-dispatch it to the blocking pool
+/// (`Punt` — guaranteed side-effect-free: no state changed, any probe transaction was rolled back,
+/// and nothing buffered for the client survives). Two things punt: the plan-shape gate refusing
+/// before execution, and an inline statement that hit a serialization conflict, which is retried on
+/// the pool rather than on the reactor.
 enum StreamedRun {
     /// The statement ran to an outcome (success or error) — the ordinary result.
     Done(StreamedOutcome),
@@ -2006,6 +2008,10 @@ struct ChannelSink {
     /// When the connection negotiated protocol `minor >= 2`, an `ARRAY` column's tag carries its
     /// element type (protocol 1.2). Implies `typed`.
     array_elements: bool,
+    /// Whether any chunk has been handed to the channel — that is, whether output has passed the
+    /// point where this side can still take it back. Read by the auto-commit retry: what is merely
+    /// *buffered* can be discarded and produced again, what has been sent cannot.
+    flushed: bool,
 }
 
 impl ChannelSink {
@@ -2013,14 +2019,16 @@ impl ChannelSink {
         self.buf.push(msg);
         if self.buf.len() >= SINK_CHUNK {
             match &self.tx {
-                SinkTx::Pool(tx) => tx
-                    .blocking_send(std::mem::replace(
+                SinkTx::Pool(tx) => {
+                    self.flushed = true;
+                    tx.blocking_send(std::mem::replace(
                         &mut self.buf,
                         Vec::with_capacity(SINK_CHUNK),
                     ))
                     .map_err(|_| {
                         nusadb_sql::Error::Unsupported("client connection closed".to_owned())
-                    })?,
+                    })?;
+                },
                 SinkTx::Inline => {
                     return Err(nusadb_sql::Error::Unsupported(
                         "internal: inline statement exceeded its buffered output".to_owned(),
@@ -2035,6 +2043,21 @@ impl ChannelSink {
     /// side with the statement outcome, so a small result never crosses the channel at all.
     fn into_tail(self) -> Vec<BackendMessage> {
         self.buf
+    }
+
+    /// Discard what this statement produced, reporting whether that was possible.
+    ///
+    /// `false` means a chunk already went to the client, so the output cannot be unsaid and the
+    /// statement must not be run a second time — the client would receive those rows twice. The
+    /// auto-commit retry asks this before every re-attempt, which is why a large streaming `SELECT`
+    /// that conflicts part-way through is reported rather than retried, while a DML statement (no
+    /// rows at all) and a small result that never filled a chunk still can be.
+    fn reset_if_unsent(&mut self) -> bool {
+        if self.flushed {
+            return false;
+        }
+        self.buf.clear();
+        true
     }
 }
 
@@ -2183,6 +2206,7 @@ fn run_query_streaming(
         tx,
         typed,
         array_elements,
+        flushed: false,
     };
     let run = stream_stmt_in_state(
         engine,
@@ -2198,8 +2222,9 @@ fn run_query_streaming(
     );
     let (outcome, new_state) = match run {
         StmtRun::Done(outcome, new_state) => (outcome, new_state),
-        // The gate refused before execution: the sink is untouched (nothing buffered) and state is
-        // unchanged. A cacheable statement left its plan in the cache for the pool's re-plan; a
+        // Nothing survives to the client and state is unchanged — either the gate refused before
+        // execution, or a conflicting inline statement rolled back and recalled its buffer for the
+        // pool to retry. A cacheable statement left its plan in the cache for the pool's re-plan; a
         // parameterized one bypasses the cache and the pool simply re-plans it fresh.
         StmtRun::Punt => return StreamedRun::Punt(plan_cache),
     };
@@ -2230,6 +2255,7 @@ fn run_show_streaming(
         tx,
         typed,
         array_elements,
+        flushed: false,
     };
     let pushed = show_result(name, &snapshot).and_then(|r| push_result_rows(r, &mut sink));
     (
@@ -2263,9 +2289,11 @@ fn push_result_rows(
     reason = "threads engine, statement, statement text, user, txn state, the row sink, the plan \
               cache, and the per-connection GUC snapshot — each a distinct per-statement concern"
 )]
-/// The result of [`stream_stmt_in_state`]: the statement ran (`Done`), or the inline point-get
-/// plan-shape gate refused it BEFORE any execution side effect (`Punt` — the connection state
-/// is unchanged and any auto-commit probe transaction was rolled back).
+/// The result of [`stream_stmt_in_state`]: the statement ran (`Done`), or it must be re-dispatched
+/// to the blocking pool (`Punt` — the connection state is unchanged and any auto-commit transaction
+/// was rolled back). Punting happens when the inline plan-shape gate refuses a statement before any
+/// execution side effect, and when an inline statement hits a serialization conflict it must not
+/// retry on the reactor.
 enum StmtRun {
     /// The statement executed; the ordinary (outcome, next-state) pair.
     Done(Result<StreamOutcome, nusadb_sql::Error>, TxnState),
@@ -2361,48 +2389,134 @@ fn stream_stmt_in_state(
                 Err(e) => StmtRun::Done(Err(e), TxnState::Failed { txn, isolation }),
             }
         },
-        TxnState::Auto => {
-            let txn = match engine.begin(session_isolation(snapshot)) {
-                Ok(txn) => txn,
-                Err(e) => return StmtRun::Done(Err(e.into()), TxnState::Auto),
-            };
-            let physical = match plan_streamed_stmt(
-                bypass_cache,
-                plan_cache,
-                sql,
-                stmt,
-                &EngineCatalog::new(engine, txn, user, snapshot),
-                engine,
-            ) {
-                Ok(physical) => physical,
+        TxnState::Auto => stream_stmt_autocommit(
+            engine,
+            stmt,
+            sql,
+            user,
+            sink,
+            plan_cache,
+            snapshot,
+            point_get_gate,
+            bypass_cache,
+        ),
+    }
+}
+
+/// The auto-commit arm of [`stream_stmt_in_state`]: one transaction per statement, retried on a
+/// serialization conflict.
+///
+/// A single auto-commit statement committed nothing and has shown the application no intermediate
+/// result, so re-running it is what a correct client retry loop would do (see
+/// [`nusadb_sql::retry`]). Streaming adds a second condition the buffered path does not have: rows
+/// are produced *towards* the client, so a re-run is sound only while everything produced so far can
+/// still be discarded. [`ChannelSink::reset_if_unsent`] decides that — a long `SELECT` that has
+/// already flushed a chunk reports its conflict instead, and only statements whose output is still
+/// recallable are attempted again.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arm's own context, unchanged from the caller it was split out of"
+)]
+fn stream_stmt_autocommit(
+    engine: &dyn StorageEngine,
+    stmt: nusadb_sql::ast::Statement,
+    sql: &str,
+    user: &str,
+    sink: &mut ChannelSink,
+    plan_cache: &mut nusadb_sql::PlanCache,
+    snapshot: &HashMap<String, String>,
+    point_get_gate: bool,
+    bypass_cache: bool,
+) -> StmtRun {
+    let budget = nusadb_sql::retry::budget(
+        snapshot
+            .get(nusadb_sql::retry::MAX_AUTOCOMMIT_RETRIES)
+            .map(String::as_str),
+    );
+    // An inline statement runs on the reactor rather than a blocking thread, so it must not retry
+    // *here*: the back-off sleeps, and sleeping on the reactor stalls every other connection sharing
+    // that thread. The statement timeout is armed after the inline attempt returns, too, so a retry
+    // here would also be the one place nothing bounds it. Such a statement punts back to the pool
+    // instead (below) and is retried there, where both problems are already solved.
+    let inline = matches!(sink.tx, SinkTx::Inline);
+    // Each attempt re-plans from the statement, so the spare kept here is the AST — cheaper to copy
+    // than a plan, and re-planning under the new transaction's catalog view is what a fresh attempt
+    // should do anyway. It is `None` once no attempt is left, which is how the budget is enforced;
+    // an inline statement keeps none at all, so the path built to skip a dispatch hop pays nothing.
+    let mut spare = (!inline && budget > 0).then(|| stmt.clone());
+    let mut current = stmt;
+    let mut attempt = 0_u32;
+    loop {
+        let txn = match engine.begin(session_isolation(snapshot)) {
+            Ok(txn) => txn,
+            Err(e) => return StmtRun::Done(Err(e.into()), TxnState::Auto),
+        };
+        let physical = match plan_streamed_stmt(
+            bypass_cache,
+            plan_cache,
+            sql,
+            current,
+            &EngineCatalog::new(engine, txn, user, snapshot),
+            engine,
+        ) {
+            Ok(physical) => physical,
+            Err(e) => {
+                let _ = engine.rollback(txn);
+                return StmtRun::Done(Err(e), TxnState::Auto);
+            },
+        };
+        // Inline point-get (see the Active arm): plan-only so far — roll the probe transaction back
+        // and punt with no visible effect.
+        if point_get_gate && !nusadb_sql::plan_is_inline_point_get(&physical) {
+            let _ = engine.rollback(txn);
+            return StmtRun::Punt;
+        }
+        let outcome =
+            execute_in_txn_as_streaming_with_settings(physical, engine, txn, user, snapshot, sink);
+        let failure = match outcome {
+            Ok(o) => match engine.commit(txn) {
+                Ok(()) => return StmtRun::Done(Ok(o), TxnState::Auto),
                 Err(e) => {
                     let _ = engine.rollback(txn);
-                    return StmtRun::Done(Err(e), TxnState::Auto);
+                    e.into()
                 },
-            };
-            // Inline point-get (see the Active arm): plan-only so far — roll the probe transaction
-            // back and punt with no visible effect.
-            if point_get_gate && !nusadb_sql::plan_is_inline_point_get(&physical) {
+            },
+            Err(err) => {
                 let _ = engine.rollback(txn);
-                return StmtRun::Punt;
-            }
-            let outcome = execute_in_txn_as_streaming_with_settings(
-                physical, engine, txn, user, snapshot, sink,
-            );
-            match outcome {
-                Ok(o) => match engine.commit(txn) {
-                    Ok(()) => StmtRun::Done(Ok(o), TxnState::Auto),
-                    Err(e) => {
-                        let _ = engine.rollback(txn);
-                        StmtRun::Done(Err(e.into()), TxnState::Auto)
-                    },
-                },
-                Err(err) => {
-                    let _ = engine.rollback(txn);
-                    StmtRun::Done(Err(err), TxnState::Auto)
-                },
-            }
-        },
+                err
+            },
+        };
+        // A failure re-running cannot resolve, or one there is no attempt left for: reported exactly
+        // as it arrived, so an application's own retry loop still sees its `40001`.
+        if !nusadb_sql::retry::is_retryable_conflict(&failure) {
+            return StmtRun::Done(Err(failure), TxnState::Auto);
+        }
+        // Rows already on their way to the client cannot be unsaid, so the conflict stands.
+        if !sink.reset_if_unsent() {
+            return StmtRun::Done(Err(failure), TxnState::Auto);
+        }
+        // An inline statement hands the retry to the pool rather than doing it on the reactor. The
+        // transaction is rolled back and the buffer has just been recalled, so this satisfies the
+        // same "nothing ran, nothing was sent" contract the point-get gate's punt relies on. A
+        // session that switched the retry off is not punted: it asked to be told about the first
+        // conflict, and the pool would retry it.
+        if inline && budget > 0 {
+            return StmtRun::Punt;
+        }
+        let Some(next) = spare.take() else {
+            return StmtRun::Done(Err(failure), TxnState::Auto);
+        };
+        // A statement out of time, or one the client asked to cancel, stops retrying and reports the
+        // cancellation — the same answer the buffered path gives, so a client cannot tell which path
+        // served it. Checking here also means a `statement_timeout` bounds the whole sequence rather
+        // than each attempt.
+        if let Err(cancelled) = nusadb_sql::cancel::check() {
+            return StmtRun::Done(Err(cancelled), TxnState::Auto);
+        }
+        attempt += 1;
+        spare = (attempt < budget).then(|| next.clone());
+        current = next;
+        nusadb_sql::retry::back_off(attempt);
     }
 }
 
@@ -2517,8 +2631,9 @@ where
                 plan_cache = cache;
                 stmt = match backup {
                     Some(stmt) => stmt,
-                    // Unreachable by construction (only the point-get gate punts, and it always
-                    // has a backup); re-parse rather than panic if it ever regresses.
+                    // Reachable: the `from_less` gate keeps no backup, and a serialization
+                    // conflict punts from either gate. Re-parsing is the fallback — do NOT turn
+                    // this arm into a panic on the assumption that only point-gets punt.
                     None => match parse(&sql).and_then(|s| bind_parameters(s, params)) {
                         Ok(stmt) => stmt,
                         Err(e) => {
@@ -3133,6 +3248,20 @@ fn apply_set_variable(
             sqlstate: "22023", // invalid_parameter_value
         });
     }
+    // `max_autocommit_retries` bounds the auto-commit conflict retry; same loud SET-time rejection,
+    // so a typo cannot leave a connection believing it changed the budget.
+    if sv.name == nusadb_sql::retry::MAX_AUTOCOMMIT_RETRIES
+        && let Some(value) = &sv.value
+        && nusadb_sql::retry::parse_max_autocommit_retries(value).is_none()
+    {
+        return Err(nusadb_sql::Error::Coded {
+            message: format!(
+                "invalid value for parameter \"max_autocommit_retries\": {value:?} — expected a \
+                 non-negative integer (0 = report the first conflict instead of retrying)"
+            ),
+            sqlstate: "22023", // invalid_parameter_value
+        });
+    }
     if let Ok(mut store) = settings.lock() {
         match sv.value {
             Some(value) => {
@@ -3505,26 +3634,56 @@ fn run_stmt_in_state(
             }
         },
         TxnState::Auto => {
-            let txn = match engine.begin(session_isolation(&snapshot)) {
-                Ok(txn) => txn,
-                Err(e) => return (Err(e.into()), TxnState::Auto),
-            };
-            let outcome = analyze(stmt, &EngineCatalog::new(engine, txn, user, &snapshot))
-                .and_then(|logical| {
-                    execute_in_txn_as_with_settings(plan(logical), engine, txn, user, &snapshot)
-                });
-            match outcome {
-                Ok(result) => match engine.commit(txn) {
-                    Ok(()) => (Ok(result), TxnState::Auto),
-                    Err(e) => {
-                        let _ = engine.rollback(txn);
-                        (Err(e.into()), TxnState::Auto)
+            // A single auto-commit statement retries its own serialization conflicts (see
+            // [`nusadb_sql::retry`]): it committed nothing, and on this path the whole result is
+            // materialized before anything reaches the client, so a re-attempt is invisible to it.
+            let budget = nusadb_sql::retry::budget(
+                snapshot
+                    .get(nusadb_sql::retry::MAX_AUTOCOMMIT_RETRIES)
+                    .map(String::as_str),
+            );
+            // The spare copy a re-attempt needs, kept only while an attempt is left — so its absence
+            // is what "out of attempts" means, and a session with the retry off copies nothing.
+            let mut spare = (budget > 0).then(|| stmt.clone());
+            let mut current = stmt;
+            let mut attempt = 0_u32;
+            loop {
+                let txn = match engine.begin(session_isolation(&snapshot)) {
+                    Ok(txn) => txn,
+                    Err(e) => return (Err(e.into()), TxnState::Auto),
+                };
+                let outcome = analyze(current, &EngineCatalog::new(engine, txn, user, &snapshot))
+                    .and_then(|logical| {
+                        execute_in_txn_as_with_settings(plan(logical), engine, txn, user, &snapshot)
+                    });
+                let failure = match outcome {
+                    Ok(result) => match engine.commit(txn) {
+                        Ok(()) => return (Ok(result), TxnState::Auto),
+                        Err(e) => {
+                            let _ = engine.rollback(txn);
+                            e.into()
+                        },
                     },
-                },
-                Err(err) => {
-                    let _ = engine.rollback(txn);
-                    (Err(err), TxnState::Auto)
-                },
+                    Err(err) => {
+                        let _ = engine.rollback(txn);
+                        err
+                    },
+                };
+                if !nusadb_sql::retry::is_retryable_conflict(&failure) {
+                    return (Err(failure), TxnState::Auto);
+                }
+                let Some(next) = spare.take() else {
+                    return (Err(failure), TxnState::Auto);
+                };
+                // A statement out of time, or one the client asked to cancel, stops retrying — so a
+                // `statement_timeout` bounds the whole sequence rather than each attempt.
+                if let Err(cancelled) = nusadb_sql::cancel::check() {
+                    return (Err(cancelled), TxnState::Auto);
+                }
+                attempt += 1;
+                spare = (attempt < budget).then(|| next.clone());
+                current = next;
+                nusadb_sql::retry::back_off(attempt);
             }
         },
     }
@@ -3783,6 +3942,79 @@ fn error_response_coded(message: &str, code: &str) -> BackendMessage {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    /// The guard the streaming auto-commit retry asks before every re-attempt.
+    ///
+    /// A statement may only be run again while everything it produced can still be taken back.
+    /// Buffered output can; anything handed to the channel is on its way to the client and cannot,
+    /// so a re-run would deliver those rows twice. Getting this backwards would corrupt results
+    /// rather than merely slow them, which is why it is pinned here and not left to the one caller.
+    #[test]
+    fn output_is_recallable_only_until_a_chunk_is_sent() {
+        let mut sink = ChannelSink {
+            buf: vec![BackendMessage::CommandComplete { tag: "X".into() }],
+            tx: SinkTx::Inline,
+            typed: false,
+            array_elements: false,
+            flushed: false,
+        };
+        assert!(sink.reset_if_unsent(), "nothing has been sent yet");
+        assert!(sink.buf.is_empty(), "a reset must discard what it recalled");
+
+        // Once a chunk has gone out, no re-attempt is permitted — regardless of what is buffered.
+        sink.flushed = true;
+        sink.buf
+            .push(BackendMessage::CommandComplete { tag: "Y".into() });
+        assert!(!sink.reset_if_unsent(), "sent output cannot be unsaid");
+        assert_eq!(
+            sink.buf.len(),
+            1,
+            "a refused reset must leave the buffer alone"
+        );
+    }
+
+    /// Sending a chunk is what makes output unrecallable, so `send` must be the thing that records
+    /// it — not the test above, which sets the flag by hand and would still pass if `send` stopped
+    /// setting it. Deleting that one assignment silently turns the retry into duplicate-row
+    /// delivery, so the assignment is pinned here, at the only place that performs it.
+    /// Not a `#[tokio::test]`: `send` uses `blocking_send`, which panics inside a runtime — the very
+    /// reason an inline statement must not reach this path. A plain thread is also where the real
+    /// producer runs.
+    #[test]
+    fn filling_a_chunk_marks_the_output_as_sent() {
+        let (tx, mut rx) = mpsc::channel::<Vec<BackendMessage>>(ROW_STREAM_CHANNEL_CAP);
+        let mut sink = ChannelSink {
+            buf: Vec::with_capacity(SINK_CHUNK),
+            tx: SinkTx::Pool(tx),
+            typed: false,
+            array_elements: false,
+            flushed: false,
+        };
+
+        // One short of a chunk: still entirely in hand, so a retry is still permitted.
+        for _ in 0..SINK_CHUNK - 1 {
+            sink.send(BackendMessage::CommandComplete { tag: "row".into() })
+                .expect("the receiver is alive");
+        }
+        assert!(
+            !sink.flushed,
+            "a partial chunk has not left this process yet"
+        );
+
+        // The message that completes the chunk is the one that puts it on the wire.
+        sink.send(BackendMessage::CommandComplete { tag: "row".into() })
+            .expect("the receiver is alive");
+        assert!(sink.flushed, "a flushed chunk must be recorded as sent");
+        assert!(
+            !sink.reset_if_unsent(),
+            "once a chunk is sent the statement can no longer be retried"
+        );
+        assert_eq!(
+            rx.try_recv().map(|chunk| chunk.len()),
+            Ok(SINK_CHUNK),
+            "the chunk really was handed to the channel"
+        );
+    }
 
     /// A materialized view's DDL reports its own command tag, not the backing table's `CREATE
     /// TABLE` / a plain `UPDATE n` (bug-report regression).

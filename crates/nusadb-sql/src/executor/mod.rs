@@ -1002,22 +1002,45 @@ impl<'engine> Session<'engine> {
             let read_only = self.txn_read_only;
             self.analyze_plan_dispatch(stmt, txn, read_only)
         } else {
-            let txn = self.engine.begin(self.default_isolation)?;
-            match self.analyze_plan_dispatch(stmt, txn, self.default_read_only) {
-                Ok(result) => match self.engine.commit(txn) {
-                    Ok(()) => Ok(result),
-                    // A failed auto-commit fsync must roll the transaction back, not leak it
-                    // Otherwise its view pins purge forever and its locks
-                    // are never released.
-                    Err(e) => {
-                        let _ = self.engine.rollback(txn);
-                        Err(e.into())
+            // Auto-commit, so this retries its own serialization conflicts exactly as a directly
+            // submitted statement does (see [`crate::retry`]). Running the same statement through
+            // `EXECUTE` must not change whether it survives contention.
+            let budget = crate::retry::budget(
+                session_ctx::setting(crate::retry::MAX_AUTOCOMMIT_RETRIES).as_deref(),
+            );
+            let mut spare = (budget > 0).then(|| stmt.clone());
+            let mut current = stmt;
+            let mut attempt = 0_u32;
+            loop {
+                let txn = self.engine.begin(self.default_isolation)?;
+                let failure = match self.analyze_plan_dispatch(current, txn, self.default_read_only)
+                {
+                    Ok(result) => match self.engine.commit(txn) {
+                        Ok(()) => return Ok(result),
+                        // A failed auto-commit fsync must roll the transaction back, not leak it
+                        // Otherwise its view pins purge forever and its locks
+                        // are never released.
+                        Err(e) => {
+                            let _ = self.engine.rollback(txn);
+                            Error::from(e)
+                        },
                     },
-                },
-                Err(err) => {
-                    let _ = self.engine.rollback(txn);
-                    Err(err)
-                },
+                    Err(err) => {
+                        let _ = self.engine.rollback(txn);
+                        err
+                    },
+                };
+                if !crate::retry::is_retryable_conflict(&failure) {
+                    return Err(failure);
+                }
+                let Some(next) = spare.take() else {
+                    return Err(failure);
+                };
+                crate::cancel::check()?;
+                attempt += 1;
+                spare = (attempt < budget).then(|| next.clone());
+                current = next;
+                crate::retry::back_off(attempt);
             }
         }
     }
@@ -1159,6 +1182,20 @@ impl<'engine> Session<'engine> {
                     "invalid value for parameter \"statement_timeout\": {v:?} — expected an \
                      integer with an optional us/ms/s/min/h/d unit (a bare integer is \
                      milliseconds; 0 = no timeout)"
+                ),
+                sqlstate: "22023", // invalid_parameter_value
+            });
+        }
+        // `max_autocommit_retries` bounds the auto-commit conflict retry; same loud SET-time
+        // rejection, so a typo cannot leave a session believing it changed the budget.
+        if name == crate::retry::MAX_AUTOCOMMIT_RETRIES
+            && let Some(v) = &value
+            && crate::retry::parse_max_autocommit_retries(v).is_none()
+        {
+            return Err(Error::Coded {
+                message: format!(
+                    "invalid value for parameter \"max_autocommit_retries\": {v:?} — expected a \
+                     non-negative integer (0 = report the first conflict instead of retrying)"
                 ),
                 sqlstate: "22023", // invalid_parameter_value
             });
@@ -1338,22 +1375,62 @@ impl<'engine> Session<'engine> {
         } else {
             // Auto-commit: one transaction per statement, at the session default isolation — its
             // `begin` already takes a fresh snapshot, so it needs no `begin_statement`.
-            let txn = self.engine.begin(self.default_isolation)?;
-            match dispatch(plan, self.engine, txn) {
-                Ok(result) => match self.engine.commit(txn) {
-                    Ok(()) => Ok(result),
-                    // A failed auto-commit fsync must roll the transaction back, not leak it
-                    // Otherwise its view pins purge forever and its locks
-                    // are never released.
-                    Err(e) => {
-                        let _ = self.engine.rollback(txn);
-                        Err(e.into())
+            //
+            // Concurrency control here is optimistic, so two sessions writing the same row make one
+            // of them fail with a serialization conflict instead of queueing. For a *single*
+            // statement in auto-commit that failure need not reach the client: nothing was
+            // committed, the statement has no intermediate state the application observed, and
+            // re-running it is exactly what a client retry loop would do. Doing it here is free of
+            // the hazard the same retry would carry inside `BEGIN…COMMIT`, where a statement may
+            // follow others whose results the application already acted on — that branch is above
+            // and never reaches this code.
+            let budget = crate::retry::budget(
+                session_ctx::setting(crate::retry::MAX_AUTOCOMMIT_RETRIES).as_deref(),
+            );
+            let mut attempt = 0_u32;
+            // `dispatch` consumes the plan, so a retry needs a spare copy of it. The spare is made
+            // only while a further attempt is still possible: a session with retries switched off
+            // clones nothing at all, and one with them on stops cloning on its final attempt. Its
+            // absence is also what "out of attempts" means below, so the budget is enforced in one
+            // place rather than by a counter that could drift from it.
+            let mut spare = (budget > 0).then(|| plan.clone());
+            let mut current = plan;
+            loop {
+                let txn = self.engine.begin(self.default_isolation)?;
+                let failure = match dispatch(current, self.engine, txn) {
+                    Ok(result) => match self.engine.commit(txn) {
+                        Ok(()) => return Ok(result),
+                        // A failed auto-commit fsync must roll the transaction back, not leak it
+                        // Otherwise its view pins purge forever and its locks
+                        // are never released.
+                        Err(e) => {
+                            let _ = self.engine.rollback(txn);
+                            Error::from(e)
+                        },
                     },
-                },
-                Err(err) => {
-                    let _ = self.engine.rollback(txn);
-                    Err(err)
-                },
+                    Err(err) => {
+                        let _ = self.engine.rollback(txn);
+                        err
+                    },
+                };
+                // A failure re-running cannot resolve, or one there is no attempt left for: report
+                // it exactly as it arrived. A `40001` that outlives the budget still reaches the
+                // client as `40001`, so an application's own retry loop is not deprived of it.
+                if !crate::retry::is_retryable_conflict(&failure) {
+                    return Err(failure);
+                }
+                let Some(next) = spare.take() else {
+                    return Err(failure);
+                };
+                // A statement that is out of time, or that the client asked to cancel, must not keep
+                // retrying: the cancel token is checked between attempts (and before sleeping) so a
+                // `statement_timeout` bounds the whole retry sequence rather than each attempt, and
+                // a cancel request is honoured within one back-off instead of the full budget.
+                crate::cancel::check()?;
+                attempt += 1;
+                spare = (attempt < budget).then(|| next.clone());
+                current = next;
+                crate::retry::back_off(attempt);
             }
         }
     }
