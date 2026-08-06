@@ -26,8 +26,8 @@ use crate::planner::{
     DeletePlan, DropIndexPlan, DropSchemaPlan, DropSequencePlan, DropTablePlan, DropViewPlan,
     FrameBound, HashKey, InsertPlan, InsertSource, OnConflictPlan, OrderByKey,
     PhysicalCreateTableAs, PhysicalMaterializedView, PhysicalOperator, PhysicalPlan,
-    PhysicalRecursiveCte, PhysicalSetOp, SetOpTree, TxnCharacteristics, TypedExpr, UpdatePlan,
-    WindowExpr, WindowFrame,
+    PhysicalRecursiveCte, PhysicalSetOp, SetOpTree, TruncateCascadePlan, TxnCharacteristics,
+    TypedExpr, UpdatePlan, WindowExpr, WindowFrame,
 };
 
 mod clock;
@@ -1535,6 +1535,7 @@ fn dispatch(
         PhysicalPlan::Select(op, est_scan_rows) => run_select(&op, est_scan_rows, engine, txn),
         PhysicalPlan::Update(p) => run_update(&p, engine, txn),
         PhysicalPlan::Delete(p) => run_delete(&p, engine, txn),
+        PhysicalPlan::TruncateCascade(p) => run_truncate_cascade(&p, engine, txn),
         PhysicalPlan::Merge(p) => dml::run_merge(&p, engine, txn),
         PhysicalPlan::Explain(inner, options) => run_explain(&inner, options, engine, txn),
         PhysicalPlan::Vacuum(options) => run_vacuum(options, engine, txn),
@@ -1972,6 +1973,9 @@ fn format_plan(
                 ""
             },
         )],
+        PhysicalPlan::TruncateCascade(p) => {
+            vec![format!("{indent}Truncate cascade from {}", p.table)]
+        },
         PhysicalPlan::Select(op, _) => format_op(op, depth, ctx, actuals),
         PhysicalPlan::Explain(inner, _) => {
             let mut lines = vec![format!("{indent}Explain")];

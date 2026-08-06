@@ -240,6 +240,8 @@ pub enum LogicalPlan {
     Update(UpdatePlan),
     /// `DELETE`.
     Delete(DeletePlan),
+    /// `TRUNCATE ... CASCADE`.
+    TruncateCascade(TruncateCascadePlan),
     /// `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED ...`.
     Merge(MergePlan),
     /// `EXPLAIN [ANALYZE] [VERBOSE] <statement>` — wraps the validated plan of the inner statement
@@ -1338,6 +1340,25 @@ pub struct DeletePlan {
     pub restart_identity: bool,
 }
 
+/// `TRUNCATE ... CASCADE`.
+///
+/// The target table is resolved (existence-checked) at analysis time, like a plain `TRUNCATE`;
+/// unlike a plain `TRUNCATE`, the set of tables actually emptied is not known until execution. The
+/// cascade closure (every table transitively referencing the target through a FOREIGN KEY)
+/// depends on the live constraint catalog, which the analyzer's `Catalog` trait does not expose —
+/// only the production `StorageEngine` adapter the executor runs against does. See
+/// `run_truncate_cascade`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncateCascadePlan {
+    /// Schema (namespace) the target table lives in.
+    pub schema: String,
+    /// Target table name.
+    pub table: String,
+    /// `TRUNCATE ... RESTART IDENTITY`, applied to every table in the cascade closure — not just
+    /// the one named in the statement, since every one of them is emptied by this same statement.
+    pub restart_identity: bool,
+}
+
 /// `MERGE INTO target USING source ON ... WHEN [NOT] MATCHED ...`.
 ///
 /// Every clause expression is type-checked against the concatenated `target ++ source` row, so a
@@ -1884,6 +1905,8 @@ pub enum PhysicalPlan {
     Update(UpdatePlan),
     /// `DELETE`.
     Delete(DeletePlan),
+    /// `TRUNCATE ... CASCADE`.
+    TruncateCascade(TruncateCascadePlan),
     /// `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED ...`.
     Merge(MergePlan),
     /// `EXPLAIN [ANALYZE] [VERBOSE] <statement>` — the executor formats the wrapped plan (and, for

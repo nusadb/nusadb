@@ -1119,6 +1119,34 @@ fn truncate_rejects_multiple_tables() {
     assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
 }
 
+#[test]
+fn truncate_cascade_flag() {
+    // CASCADE now parses (the closure it empties is resolved at execution time, where the live
+    // FOREIGN KEY catalog is available — see the `truncate_cascade.slt` SQLLogicTest). RESTRICT
+    // is the explicit spelling of the (unchanged) default.
+    let ast::Statement::Truncate(t) = ok("TRUNCATE TABLE orders CASCADE") else {
+        panic!("expected Truncate");
+    };
+    assert!(t.cascade);
+    let ast::Statement::Truncate(t) = ok("TRUNCATE TABLE orders RESTRICT") else {
+        panic!("expected Truncate");
+    };
+    assert!(!t.cascade);
+    let ast::Statement::Truncate(t) = ok("TRUNCATE TABLE orders") else {
+        panic!("expected Truncate");
+    };
+    assert!(!t.cascade);
+}
+
+#[test]
+fn truncate_cascade_combines_with_restart_identity() {
+    let ast::Statement::Truncate(t) = ok("TRUNCATE TABLE orders RESTART IDENTITY CASCADE") else {
+        panic!("expected Truncate");
+    };
+    assert!(t.cascade);
+    assert!(t.restart_identity);
+}
+
 // --- INSERT -----------------------------------------------------------
 
 #[test]

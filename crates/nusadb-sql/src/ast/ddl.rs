@@ -630,11 +630,10 @@ pub struct DropSequence {
     pub if_exists: bool,
 }
 
-/// `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY]`.
+/// `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
 ///
-/// Only a single-table form is modelled. Multi-table truncation, `ONLY`,
-/// partition lists, and `CASCADE`/`RESTRICT` are out of scope for the v1
-/// parser surface and rejected with
+/// Only a single-table form is modelled. Multi-table truncation, `ONLY`, and
+/// partition lists are out of scope for the v1 parser surface and rejected with
 /// [`Error::Unsupported`](crate::error::Error::Unsupported).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateTable {
@@ -645,6 +644,11 @@ pub struct TruncateTable {
     pub name: String,
     /// `true` = `RESTART IDENTITY`, `false` = `CONTINUE IDENTITY` or unspecified.
     pub restart_identity: bool,
+    /// `true` = `CASCADE`: also empty every table that references this one through a FOREIGN
+    /// KEY (directly or transitively), regardless of that key's own `ON DELETE` action. `false`
+    /// = `RESTRICT` (the default): refuse when a FOREIGN KEY on another table still depends on
+    /// this one.
+    pub cascade: bool,
 }
 
 /// `ALTER TABLE [IF EXISTS] name <action>`.

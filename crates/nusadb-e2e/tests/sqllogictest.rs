@@ -322,6 +322,11 @@ fn slt_p1_drop_cascade() {
 }
 
 #[test]
+fn slt_p1_truncate_cascade() {
+    run_slt("tests/slt/p1_ddl/truncate_cascade.slt");
+}
+
+#[test]
 fn slt_p1_create_table_as() {
     run_slt("tests/slt/p1_ddl/create_table_as.slt");
 }

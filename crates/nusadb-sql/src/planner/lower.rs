@@ -86,6 +86,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         },
         LogicalPlan::Update(p) => PhysicalPlan::Update(p),
         LogicalPlan::Delete(p) => PhysicalPlan::Delete(p),
+        LogicalPlan::TruncateCascade(p) => PhysicalPlan::TruncateCascade(p),
         LogicalPlan::Merge(p) => PhysicalPlan::Merge(p),
         LogicalPlan::Explain(inner, options) => {
             PhysicalPlan::Explain(Box::new(plan(*inner)), options)

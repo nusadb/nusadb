@@ -3362,6 +3362,87 @@ pub(super) fn run_delete(
     }
 }
 
+/// `TRUNCATE ... CASCADE`: empty the target table and every table that references it — directly
+/// or transitively — through a FOREIGN KEY, regardless of that key's own `ON DELETE` action (a
+/// statement-level cascade, distinct from a per-row `ON DELETE CASCADE`, which
+/// `enforce_fk_on_parent_delete` already applies within a single table's own delete). The closure
+/// is discovered by walking the FK-parent graph rooted at the target and recording each table in
+/// post-order (children before self), so a table is only emptied via [`run_delete`] once every
+/// *other* table in the closure that references it is already empty — the ordinary FK-RESTRICT
+/// check `run_delete` performs then always finds zero dependents from *within* the closure. A
+/// self-reference does not expand the closure (it empties with its own table, as an ordinary
+/// `TRUNCATE` already handles); a cycle that loops back to the target through two or more other
+/// tables is not resolved by this ordering (rare in practice — the walk still terminates via the
+/// visited set, it just does not guarantee every closure member is dependency-clean when its turn
+/// comes, so such a schema may see a spurious FK-RESTRICT error here).
+pub(super) fn run_truncate_cascade(
+    plan: &TruncateCascadePlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    let root = engine
+        .lookup_table_as_of_in(txn, &plan.schema, &plan.table)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: crate::analyzer::qualified_display(&plan.schema, &plan.table),
+        })?;
+    // `list_foreign_keys` reports table ids only; build an id -> schema map up front so each
+    // closure member can be turned into the `TableSchema` a `DeletePlan` needs. A full catalog
+    // scan here is cheap next to the row scan/delete every closure member performs regardless.
+    let mut by_id: HashMap<nusadb_core::TableId, TableSchema> = HashMap::new();
+    for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
+        if let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)? {
+            by_id.insert(table.id, table);
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    collect_cascade_closure(root.id, engine, &mut visited, &mut order)?;
+    let mut deleted = 0usize;
+    for id in order {
+        let Some(table) = by_id.get(&id) else {
+            continue; // Every closure member came from `list_foreign_keys` on a real table.
+        };
+        let result = run_delete(
+            &DeletePlan {
+                table: table.clone(),
+                using: None,
+                using_plan: None,
+                filter: None,
+                returning: Vec::new(),
+                restart_identity: plan.restart_identity,
+            },
+            engine,
+            txn,
+        )?;
+        if let ExecutionResult::Deleted(n) = result {
+            deleted += n;
+        }
+    }
+    Ok(ExecutionResult::Deleted(deleted))
+}
+
+/// Post-order walk of the FK-parent graph rooted at `table`: for every other table with a
+/// FOREIGN KEY whose parent is `table`, recurse into it first, then append `table` — so `order`
+/// ends with every table's referencing children ahead of it. `visited` guards against both
+/// re-visiting a table reachable through two paths and an infinite loop on a cycle.
+fn collect_cascade_closure(
+    table: nusadb_core::TableId,
+    engine: &dyn StorageEngine,
+    visited: &mut HashSet<nusadb_core::TableId>,
+    order: &mut Vec<nusadb_core::TableId>,
+) -> Result<(), Error> {
+    if !visited.insert(table) {
+        return Ok(());
+    }
+    for fk in engine.list_foreign_keys(table)? {
+        if fk.parent_table == table && fk.child_table != table {
+            collect_cascade_closure(fk.child_table, engine, visited, order)?;
+        }
+    }
+    order.push(table);
+    Ok(())
+}
+
 // === MERGE ========================================================
 
 /// Run `MERGE INTO target USING source ON ... WHEN [NOT] MATCHED ...`. Each source row is

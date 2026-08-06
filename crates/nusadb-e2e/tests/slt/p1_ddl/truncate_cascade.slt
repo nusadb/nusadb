@@ -1,0 +1,100 @@
+# TRUNCATE ... CASCADE empties every table that references the target through a FOREIGN KEY —
+# directly or transitively — regardless of that key's own ON DELETE action. Plain TRUNCATE (the
+# RESTRICT default) still refuses when a dependent FK exists. Unlike DROP TABLE ... CASCADE (which
+# only drops the referencing CONSTRAINT), TRUNCATE ... CASCADE empties the referencing TABLE too —
+# it stays, only its rows go.
+
+statement ok
+CREATE TABLE parent (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent (id))
+
+statement ok
+INSERT INTO parent VALUES (1)
+
+statement ok
+INSERT INTO child VALUES (10, 1)
+
+# RESTRICT (the default): the referencing FK blocks the truncate, same as DROP TABLE.
+statement error
+TRUNCATE parent
+
+statement ok
+TRUNCATE parent CASCADE
+
+# Both tables survive (only their rows are gone) — unlike DROP TABLE ... CASCADE, the child TABLE
+# itself is not dropped, so its columns/FK are still there for a later insert to exercise.
+query I
+SELECT count(*) FROM parent
+----
+0
+
+query I
+SELECT count(*) FROM child
+----
+0
+
+statement ok
+INSERT INTO parent VALUES (2)
+
+statement ok
+INSERT INTO child VALUES (20, 2)
+
+# The FK is still enforced after the cascade — it was the tables' rows that were emptied, not the
+# constraint (that is DROP TABLE ... CASCADE's job, not TRUNCATE's).
+statement error
+INSERT INTO child VALUES (21, 999)
+
+# A three-level chain: TRUNCATE CASCADE on the root must reach the grandchild too, not just the
+# immediate child.
+statement ok
+CREATE TABLE grandchild (id INT PRIMARY KEY, cid INT REFERENCES child (id))
+
+statement ok
+INSERT INTO grandchild VALUES (100, 20)
+
+statement ok
+TRUNCATE parent CASCADE
+
+query I
+SELECT count(*) FROM grandchild
+----
+0
+
+# RESTART IDENTITY CASCADE resets the backing sequence of every SERIAL column across the whole
+# closure, not just the table named in the statement.
+statement ok
+DROP TABLE grandchild
+
+statement ok
+DROP TABLE child
+
+statement ok
+DROP TABLE parent
+
+statement ok
+CREATE TABLE p (id SERIAL PRIMARY KEY)
+
+statement ok
+CREATE TABLE c (id SERIAL PRIMARY KEY, pid INT REFERENCES p (id))
+
+statement ok
+INSERT INTO p (id) VALUES (DEFAULT), (DEFAULT)
+
+statement ok
+INSERT INTO c (id, pid) VALUES (DEFAULT, 1), (DEFAULT, 2)
+
+statement ok
+TRUNCATE p RESTART IDENTITY CASCADE
+
+statement ok
+INSERT INTO p (id) VALUES (DEFAULT)
+
+statement ok
+INSERT INTO c (id, pid) VALUES (DEFAULT, 1)
+
+query II
+SELECT id, pid FROM c
+----
+1 1

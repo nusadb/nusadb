@@ -3339,11 +3339,12 @@ fn surface_batch_substring_view_if_not_exists_cte_hints() {
     parse("CREATE TABLE u1 (a INT, UNIQUE NULLS DISTINCT (a))").unwrap();
     assert!(parse("CREATE TABLE u2 (a INT, UNIQUE NULLS NOT DISTINCT (a))").is_err());
 
-    // TRUNCATE ... RESTRICT (the default) is accepted; CASCADE stays refused.
+    // TRUNCATE ... RESTRICT (the default) is accepted; CASCADE now parses too — the SQLLogicTest
+    // `truncate_cascade.slt` covers its actual cascading behavior against the real engine.
     run("TRUNCATE TABLE s RESTRICT", &engine).unwrap();
     let (_, rows) = rows_of(run("SELECT COUNT(*) FROM s", &engine).unwrap());
     assert_eq!(rows, vec![vec![Value::Int(0)]]);
-    assert!(parse("TRUNCATE TABLE s CASCADE").is_err());
+    run("TRUNCATE TABLE s CASCADE", &engine).unwrap();
 }
 
 /// Multi-object `DROP <kind> a, b` (internal Batch desugar — atomic within the statement) and

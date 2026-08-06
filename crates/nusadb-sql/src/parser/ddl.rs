@@ -822,8 +822,8 @@ pub(super) fn convert_sequence_option(
 
 // === TRUNCATE =============================================================
 
-/// Lower `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY]`.
-/// Only a single-table, non-partitioned, non-cascading form is modelled.
+/// Lower `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
+/// Only a single-table, non-partitioned form is modelled.
 pub(super) fn convert_truncate(
     table_names: &[sql::TruncateTableTarget],
     has_partitions: bool,
@@ -838,10 +838,9 @@ pub(super) fn convert_truncate(
         return unsupported("TRUNCATE TABLE with PARTITION");
     }
     // RESTRICT is the default semantic (refuse when FK-referenced — enforced at execution);
-    // CASCADE (truncate referencing tables too) is not modelled.
-    if cascade == Some(&sql::CascadeOption::Cascade) {
-        return unsupported("TRUNCATE TABLE ... CASCADE");
-    }
+    // CASCADE also empties every table that references this one, discovered and applied at
+    // execution time (the FK-closure walk needs the live constraint catalog).
+    let cascade = cascade == Some(&sql::CascadeOption::Cascade);
     let restart_identity = identity == Some(&sql::TruncateIdentityOption::Restart);
     match table_names {
         [one] => {
@@ -851,6 +850,7 @@ pub(super) fn convert_truncate(
                 schema,
                 name,
                 restart_identity,
+                cascade,
             })
         },
         _ => unsupported("TRUNCATE of multiple tables in one statement"),

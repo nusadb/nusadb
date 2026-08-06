@@ -35,8 +35,8 @@ use crate::planner::{
     DropTriggerPlan, DropViewPlan, ForeignKeySpec, FrameBound, IndexMeta, InsertPlan, InsertSource,
     JoinPlan, LogicalPlan, MaterializedViewPlan, MergeMatchedAction, MergePlan, MergeWhen,
     ModifyingCteDef, OnConflictPlan, OrderByKey, Projection, RecursiveCteDef, SelectPlan,
-    SetOpPlan, SetOpTree, TxnCharacteristics, TypedCaseBranch, TypedExpr, TypedExprKind,
-    UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr, WindowFrame,
+    SetOpPlan, SetOpTree, TruncateCascadePlan, TxnCharacteristics, TypedCaseBranch, TypedExpr,
+    TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr, WindowFrame,
 };
 
 mod ddl;
@@ -557,18 +557,30 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // table (honouring FK references + maintaining secondary indexes). `RESTART IDENTITY` is
         // carried through so the executor resets the backing sequence of each SERIAL/IDENTITY column
         // after the rows are removed (`CONTINUE IDENTITY` / unspecified leaves the sequence advancing).
+        // `CASCADE` cannot desugar this way: which other tables it must also empty depends on the
+        // live FOREIGN KEY catalog, which the `Catalog` trait used here does not expose (only the
+        // `StorageEngine` the executor runs against does) — so it gets its own plan, resolved fully
+        // at execution time.
         ast::Statement::Truncate(t) => {
             // Resolve the target through the search path (an explicit qualifier wins), exactly like a
             // DELETE target, so TRUNCATE reaches a non-public table too.
             let table = resolve_table(t.schema.as_deref(), &t.name, catalog)?;
-            Ok(LogicalPlan::Delete(DeletePlan {
-                table,
-                using: None,
-                using_plan: None,
-                filter: None,
-                returning: Vec::new(),
-                restart_identity: t.restart_identity,
-            }))
+            if t.cascade {
+                Ok(LogicalPlan::TruncateCascade(TruncateCascadePlan {
+                    schema: table.schema,
+                    table: table.name,
+                    restart_identity: t.restart_identity,
+                }))
+            } else {
+                Ok(LogicalPlan::Delete(DeletePlan {
+                    table,
+                    using: None,
+                    using_plan: None,
+                    filter: None,
+                    returning: Vec::new(),
+                    restart_identity: t.restart_identity,
+                }))
+            }
         },
         ast::Statement::Insert(ins) => analyze_insert(ins, catalog).map(LogicalPlan::Insert),
         ast::Statement::Select(sel) => {
