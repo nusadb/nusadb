@@ -3650,3 +3650,27 @@ fn a_vector_index_def_written_before_metrics_reads_as_cosine() {
         None
     );
 }
+
+/// The rename guard's whole-identifier matcher: it errs toward matching (a string literal counts),
+/// never matches inside a longer name, and folds the full character set — a predicate is stored as
+/// written while a column name is folded, so `CHECK (B > 0)` and a non-ASCII `CAFÉ` both refer to
+/// their lower-case columns.
+#[test]
+fn sql_mentions_column_is_whole_word_and_case_insensitive() {
+    use super::ddl::sql_mentions_column as m;
+    assert!(m("b > 0", "b"));
+    assert!(m("B > 0", "b"));
+    assert!(m("\"b\" > 0", "b"));
+    assert!(m("t.b > 0", "b"));
+    assert!(m("(b)>0", "b"));
+    assert!(m("CAFÉ > 0", "café"));
+    // Never part of a longer identifier, from either side.
+    assert!(!m("bb > 0", "b"));
+    assert!(!m("ab > 0", "b"));
+    assert!(!m("b2 > 0", "b"));
+    // A prefix match must not be salvaged from the longer identifier's tail.
+    assert!(m("bb > 0 AND b > 0", "b"));
+    assert!(!m("bb > bb", "b"));
+    // Errs toward matching: a string literal counts, which only over-refuses.
+    assert!(m("a <> 'b'", "b"));
+}

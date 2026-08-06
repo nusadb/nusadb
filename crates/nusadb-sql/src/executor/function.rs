@@ -19,7 +19,8 @@ use crate::planner::{CreateFunctionPlan, DropFunctionPlan};
 
 /// Engine-scoped system catalog of SQL functions: `(name, param_count, param_names, body)` text
 /// columns.
-const FUNCTION_CATALOG: &str = "nusadb_functions";
+// `pub(super)` so the rename guard can scan for bodies that name a column.
+pub(super) const FUNCTION_CATALOG: &str = "nusadb_functions";
 
 /// The current four-text-column schema of [`FUNCTION_CATALOG`] (added `param_names`).
 const FUNCTION_CATALOG_SCHEMA: [ColumnType; 4] = [

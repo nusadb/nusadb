@@ -138,3 +138,140 @@ query I
 SELECT s FROM g WHERE a = 3
 ----
 7
+
+# --- A view re-analyzes its stored SQL on every read, so it blocks the rename too. ---
+# BIGINT and TEXT columns carry no generated width check, so nothing else could be the blocker.
+
+statement ok
+CREATE TABLE vt (a BIGINT, b TEXT)
+
+statement ok
+INSERT INTO vt VALUES (1, 'x')
+
+statement ok
+CREATE VIEW vv AS SELECT b FROM vt
+
+statement error
+ALTER TABLE vt RENAME COLUMN b TO c
+
+# Refused, so both the table and the view still work.
+statement ok
+INSERT INTO vt VALUES (2, 'y')
+
+query T rowsort
+SELECT b FROM vv
+----
+x
+y
+
+# A view that does not name this column does not block it.
+statement ok
+ALTER TABLE vt RENAME COLUMN a TO z
+
+# A view over some other table does not block this one, even when the column names collide.
+statement ok
+CREATE TABLE elsewhere (b TEXT)
+
+statement ok
+INSERT INTO elsewhere VALUES ('other')
+
+statement ok
+CREATE VIEW ev AS SELECT b FROM elsewhere
+
+statement ok
+CREATE TABLE mine (a BIGINT, b TEXT)
+
+statement ok
+INSERT INTO mine VALUES (1, 'm')
+
+statement ok
+ALTER TABLE mine RENAME COLUMN b TO c
+
+# A view can stand for the table without naming it: v2 reads v1 reads the table, and only v1's
+# definition says so. The chain still blocks the rename.
+statement ok
+CREATE TABLE ct (a BIGINT, b TEXT)
+
+statement ok
+INSERT INTO ct VALUES (1, 'c')
+
+statement ok
+CREATE VIEW c1 AS SELECT * FROM ct
+
+statement ok
+CREATE VIEW c2 AS SELECT b FROM c1
+
+statement error
+ALTER TABLE ct RENAME COLUMN b TO z
+
+# Refused, so the whole chain still reads.
+query T
+SELECT b FROM c2
+----
+c
+
+# --- A materialized view's definition is re-run on refresh. ---
+
+statement ok
+CREATE TABLE mt (a BIGINT, b TEXT)
+
+statement ok
+INSERT INTO mt VALUES (1, 'm')
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS SELECT b FROM mt
+
+statement error
+ALTER TABLE mt RENAME COLUMN b TO c
+
+# --- A policy's predicates are re-analyzed on every read they protect. ---
+
+statement ok
+CREATE TABLE pt (a BIGINT, owner TEXT)
+
+statement ok
+INSERT INTO pt VALUES (1, 'alice')
+
+statement ok
+CREATE POLICY own ON pt FOR SELECT USING (owner = CURRENT_USER)
+
+statement error
+ALTER TABLE pt RENAME COLUMN owner TO holder
+
+# --- A trigger's WHEN and body run against this table's rows on every firing. ---
+
+statement ok
+CREATE TABLE tt (a BIGINT, b TEXT)
+
+statement ok
+INSERT INTO tt VALUES (1, 't')
+
+statement ok
+CREATE TABLE tlog (note TEXT)
+
+statement ok
+CREATE TRIGGER tt_ins AFTER INSERT ON tt FOR EACH ROW WHEN (NEW.b <> 'skip') INSERT INTO tlog VALUES ('hit')
+
+statement error
+ALTER TABLE tt RENAME COLUMN b TO c
+
+# --- The other side of a key: a child column of another table sharing the name is not ours. ---
+# `parent.pid` is TEXT with nothing referring to it; the key's child column `pid` belongs to the
+# child table, so the rename goes through.
+
+statement ok
+CREATE TABLE fpar (id INT PRIMARY KEY, pid TEXT)
+
+statement ok
+CREATE TABLE fchi (id INT PRIMARY KEY, pid INT REFERENCES fpar(id))
+
+statement ok
+INSERT INTO fpar VALUES (1, 'note')
+
+statement ok
+ALTER TABLE fpar RENAME COLUMN pid TO annotation
+
+query T
+SELECT annotation FROM fpar
+----
+note

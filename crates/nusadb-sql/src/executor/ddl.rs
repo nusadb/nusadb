@@ -274,10 +274,14 @@ fn refuse_rename_with_dependents(
             return Err(refuse("check constraint", &c.name));
         }
     }
+    // The engine reports keys where this table is either side, so pin each column list to its own
+    // side before matching — the child columns of a key we merely parent belong to another table,
+    // and one of them sharing this column's name must not block the rename.
     for fk in engine.list_foreign_keys(table.id)? {
-        if fk.child_columns.iter().any(|k| k == column)
-            || (fk.parent_table == table.id && fk.parent_columns.iter().any(|k| k == column))
-        {
+        let child_side = fk.child_table == table.id && fk.child_columns.iter().any(|k| k == column);
+        let parent_side =
+            fk.parent_table == table.id && fk.parent_columns.iter().any(|k| k == column);
+        if child_side || parent_side {
             return Err(refuse("foreign key", &fk.name));
         }
     }
@@ -290,20 +294,6 @@ fn refuse_rename_with_dependents(
                 .is_some_and(|p| sql_mentions_column(p, column));
         if named {
             return Err(refuse("index", &def.name));
-        }
-    }
-    // A foreign key on another table may point at this column as its parent key.
-    for other_name in engine.list_tables_as_of(txn)? {
-        let Some(other) = engine.lookup_table_as_of(txn, &other_name)? else {
-            continue;
-        };
-        if other.id == table.id {
-            continue;
-        }
-        for fk in engine.list_foreign_keys(other.id)? {
-            if fk.parent_table == table.id && fk.parent_columns.iter().any(|k| k == column) {
-                return Err(refuse("foreign key", &fk.name));
-            }
         }
     }
     for (owner, sql) in super::coldefault::load_defaults(
@@ -322,7 +312,151 @@ fn refuse_rename_with_dependents(
             return Err(refuse("generated column", &owner));
         }
     }
+    if let Some((what, name)) = sql_dependent_naming(table, column, engine, txn)? {
+        return Err(refuse(what, &name));
+    }
     Ok(())
+}
+
+/// The first SQL-holding derived object — view, materialized view, policy, trigger, function,
+/// procedure — whose stored definition names `column` of `table`, as `(kind, name)`.
+///
+/// Split from [`refuse_rename_with_dependents`] only for length; the policy is the same, erring
+/// toward reporting a dependant.
+fn sql_dependent_naming(
+    table: &TableSchema,
+    column: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Option<(&'static str, String)>, Error> {
+    // The derived objects below keep their defining SQL as text and re-analyze it later — a view
+    // on every read, a materialized view on refresh (and, when incrementally maintained, on every
+    // write to this table), a policy on every read it protects, a trigger on every firing, a
+    // function or procedure body when called. Their catalogs key by name, so a definition naming
+    // this table and this column is what breaks.
+    //
+    // The writers store the table bare today; the qualified arm is there for when they start
+    // qualifying, so that change cannot silently disarm this.
+    let qualified = format!("{}.{}", table.schema, table.name);
+    let names_this_table = |t: &str| t == table.name || t == qualified;
+    let mut views = Vec::new();
+    for (catalog, what) in [
+        (VIEW_CATALOG, "view"),
+        (MATVIEW_CATALOG, "materialized view"),
+    ] {
+        for row in scan_text_catalog(engine, txn, catalog, &[2])? {
+            let mut row = row.into_iter();
+            if let (Some(name), Some(def)) = (row.next(), row.next()) {
+                views.push((what, name, def));
+            }
+        }
+    }
+    // A view can stand for the table without naming it: `v2` reads `v1` reads the table, and only
+    // `v1`'s definition says so. Grow the set of names that reach the table until it stops
+    // growing, then judge every definition against the whole set.
+    let mut reaches: Vec<&str> = vec![&table.name];
+    loop {
+        let mut grew = false;
+        for (_, name, def) in &views {
+            if !reaches.iter().any(|n| n == name)
+                && reaches.iter().any(|n| sql_mentions_column(def, n))
+            {
+                reaches.push(name);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (what, name, def) in &views {
+        if sql_mentions_column(def, column) && reaches.iter().any(|n| sql_mentions_column(def, n)) {
+            return Ok(Some((what, name.clone())));
+        }
+    }
+    // A function or procedure body is re-analyzed when called, and may read the table through any
+    // of the names that reach it. Both catalogs are `(name, …, body)` with the body last; the
+    // function catalog has a legacy three-column layout from before parameter names were kept.
+    for (catalog, what, widths) in [
+        (
+            super::function::FUNCTION_CATALOG,
+            "function",
+            &[4usize, 3][..],
+        ),
+        (super::procedure::PROCEDURE_CATALOG, "procedure", &[4][..]),
+    ] {
+        for row in scan_text_catalog(engine, txn, catalog, widths)? {
+            if let (Some(name), Some(body)) = (row.first(), row.last())
+                && sql_mentions_column(body, column)
+                && reaches.iter().any(|n| sql_mentions_column(body, n))
+            {
+                return Ok(Some((what, name.clone())));
+            }
+        }
+    }
+    // (table, name, command, roles, using, check, permissive) — an orphaned policy fails closed,
+    // which locks every non-superuser out of the table rather than leaking rows.
+    for row in scan_text_catalog(engine, txn, POLICY_CATALOG, &[7])? {
+        if let [tbl, name, _, _, using, check, _] = row.as_slice()
+            && names_this_table(tbl)
+            && (sql_mentions_column(using, column) || sql_mentions_column(check, column))
+        {
+            return Ok(Some(("policy", name.clone())));
+        }
+    }
+    // (name, table, timing, events, for_each, when, action, enabled) — with a legacy seven-column
+    // row missing the trailing flag. A disabled trigger blocks too: it can be re-enabled at any
+    // time, and would come back broken.
+    for row in scan_text_catalog(engine, txn, super::trigger::TRIGGER_CATALOG, &[8, 7])? {
+        if let [name, tbl, _, _, _, when, action, ..] = row.as_slice()
+            && names_this_table(tbl)
+            && (sql_mentions_column(when, column) || sql_mentions_column(action, column))
+        {
+            return Ok(Some(("trigger", name.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// Scan an engine-scoped all-`TEXT` system catalog, yielding each row's columns as strings. A
+/// catalog that was never created yields nothing. `widths` lists the accepted column counts,
+/// current first, so a catalog with a legacy narrower layout still decodes; a row that decodes at
+/// no accepted width is reported rather than skipped — skipping would silently disarm a guard.
+fn scan_text_catalog(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    catalog: &str,
+    widths: &[usize],
+) -> Result<Vec<Vec<String>>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, catalog)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let schemas: Vec<Vec<ColumnType>> = widths.iter().map(|&w| vec![ColumnType::Text; w]).collect();
+    let malformed = || Error::Coded {
+        message: format!(
+            "system catalog {catalog} holds a row this build cannot decode; the statement is              refused rather than judged against a partial catalog"
+        ),
+        sqlstate: "XX000", // internal_error
+    };
+    let mut scan = engine.scan(txn, cat.id)?;
+    'rows: while let Some((_, bytes)) = scan.try_next()? {
+        for schema in &schemas {
+            if let Ok(row) = row::decode(&bytes, schema) {
+                let mut cols = Vec::with_capacity(row.len());
+                for value in row {
+                    match value {
+                        ast::Value::Text(s) => cols.push(s),
+                        _ => return Err(malformed()),
+                    }
+                }
+                out.push(cols);
+                continue 'rows;
+            }
+        }
+        return Err(malformed());
+    }
+    Ok(out)
 }
 
 /// Whether a stored SQL fragment refers to `column` as a whole identifier, rather than as part of a
@@ -332,9 +466,12 @@ fn refuse_rename_with_dependents(
 /// name is folded, so `CHECK (B > 0)` refers to column `b`. Missing that would let the rename
 /// through and leave the table unwritable, which is the whole thing being prevented — so this errs
 /// toward matching, and a name that merely appears inside a string literal blocks the rename too.
-fn sql_mentions_column(sql: &str, column: &str) -> bool {
+pub(super) fn sql_mentions_column(sql: &str, column: &str) -> bool {
     let is_part = |c: char| c.is_alphanumeric() || c == '_';
-    let (sql, column) = (sql.to_ascii_lowercase(), column.to_ascii_lowercase());
+    // Fold the full character set, not just ASCII: the identifier boundary test is Unicode-aware,
+    // so a non-ASCII name stored in another capitalisation would otherwise slip through — a miss
+    // here is the unsafe direction.
+    let (sql, column) = (sql.to_lowercase(), column.to_lowercase());
     let mut from = 0;
     while let Some(offset) = sql[from..].find(&column) {
         let at = from + offset;

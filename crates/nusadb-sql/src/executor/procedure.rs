@@ -18,7 +18,8 @@ use crate::planner::{CallPlan, CreateProcedurePlan, DropProcedurePlan};
 
 /// Engine-scoped system catalog of procedure definitions: `(name, in_param_count, out_params, body)`
 /// text columns. `out_params` is a comma-separated list of `OUT` parameter names.
-const PROCEDURE_CATALOG: &str = "nusadb_procedures";
+// `pub(super)` so the rename guard can scan for bodies that name a column.
+pub(super) const PROCEDURE_CATALOG: &str = "nusadb_procedures";
 
 /// The four-text-column schema of [`PROCEDURE_CATALOG`].
 const PROCEDURE_CATALOG_SCHEMA: [ColumnType; 4] = [

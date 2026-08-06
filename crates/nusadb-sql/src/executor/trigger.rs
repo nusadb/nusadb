@@ -26,7 +26,8 @@ use crate::planner::{AlterTriggerPlan, CreateTriggerPlan, DropTriggerPlan};
 /// created before the `enabled` column existed has seven columns; [`ensure_trigger_catalog`]
 /// upgrades it in place on the next trigger DDL, and every reader tolerates the legacy width via
 /// [`decode_catalog_row`] (a legacy row is enabled).
-const TRIGGER_CATALOG: &str = "nusadb_triggers";
+// `pub(super)` so the rename guard can scan for triggers whose WHEN/body name a column.
+pub(super) const TRIGGER_CATALOG: &str = "nusadb_triggers";
 
 /// The eight-text-column schema of [`TRIGGER_CATALOG`].
 const TRIGGER_CATALOG_SCHEMA: [ColumnType; 8] = [ColumnType::Text; 8];

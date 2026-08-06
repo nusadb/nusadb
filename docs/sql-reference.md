@@ -257,3 +257,8 @@ Consequences worth knowing:
 - A statement that keeps losing occupies its connection for the length of the budget before
   reporting. `SET max_autocommit_retries = 0` restores the immediate report where that matters more
   than the automatic recovery.
+- The retry budget bounds attempts, not time: the wall clock a losing statement can consume is
+  each attempt's own run time plus its back-off, times the budget, and no statement deadline is set
+  by default. Where connections are scarce, set the pair together — `max_autocommit_retries` for
+  how hard to try, `statement_timeout` for how long the whole sequence may take — since the timeout
+  covers all attempts as one.
