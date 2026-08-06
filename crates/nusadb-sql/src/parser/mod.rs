@@ -441,6 +441,12 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_notify(sql) {
         return result;
     }
+    // `CREATE SEQUENCE ...` — sqlparser's own grammar accepts the six options in only one fixed
+    // order and would reject e.g. `START 100 INCREMENT 5`; drive it ourselves so any order (and
+    // `INCREMENT` without `BY`) is accepted, matching the reference engine (B-UT2.DDL24).
+    if let Some(result) = recognize_create_sequence(sql) {
+        return result;
+    }
     let dialect = NusaParserDialect;
     let mut statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| Error::Syntax(e.to_string()))?;
@@ -1163,6 +1169,106 @@ fn parse_alter_policy(sql: &str) -> Result<ast::Statement, Error> {
         using,
         check,
     }))
+}
+
+/// Recognize `CREATE [TEMP|TEMPORARY] SEQUENCE ...` and drive it ourselves instead of the
+/// generic parser. sqlparser's own `CREATE SEQUENCE` grammar only accepts its six options
+/// (`INCREMENT`, `MINVALUE`/`MAXVALUE`, `START`, `CACHE`, `CYCLE`) in that one fixed order — real
+/// SQL (and the reference engine) accepts them in any order, and `INCREMENT n` without `BY` is
+/// valid wherever `INCREMENT` appears, not just first. See `B-UT2.DDL24`.
+fn recognize_create_sequence(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    (starts_with_two(sql, "create", "sequence")
+        || starts_with_three(sql, "create", "temp", "sequence")
+        || starts_with_three(sql, "create", "temporary", "sequence"))
+    .then(|| parse_create_sequence_flexible(sql))
+}
+
+/// Drive `CREATE [TEMP|TEMPORARY] SEQUENCE [IF NOT EXISTS] name [AS type] [options...]
+/// [OWNED BY ...]`, accepting the six sequence options in any order and either spelling of
+/// `INCREMENT`/`INCREMENT BY` and `START`/`START WITH`. Delegates the semantic checks
+/// (temporary/typed/owned-by rejection, option conversion) to [`convert_create_sequence`], which
+/// both this driver and the (now unreachable for `CREATE SEQUENCE`) generic path share.
+fn parse_create_sequence_flexible(sql: &str) -> Result<ast::Statement, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::parser::ParserError;
+
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+
+    parser.expect_keyword(Keyword::CREATE).map_err(syntax)?;
+    let temporary = parser
+        .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
+        .is_some();
+    parser.expect_keyword(Keyword::SEQUENCE).map_err(syntax)?;
+    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let name = parser.parse_object_name(false).map_err(syntax)?;
+
+    let data_type = if parser.parse_keyword(Keyword::AS) {
+        Some(parser.parse_data_type().map_err(syntax)?)
+    } else {
+        None
+    };
+
+    let mut options = Vec::new();
+    loop {
+        if parser.parse_keyword(Keyword::INCREMENT) {
+            let by = parser.parse_keyword(Keyword::BY);
+            options.push(sql::SequenceOptions::IncrementBy(
+                parser.parse_number().map_err(syntax)?,
+                by,
+            ));
+        } else if parser.parse_keywords(&[Keyword::NO, Keyword::MINVALUE]) {
+            options.push(sql::SequenceOptions::MinValue(None));
+        } else if parser.parse_keyword(Keyword::MINVALUE) {
+            options.push(sql::SequenceOptions::MinValue(Some(
+                parser.parse_number().map_err(syntax)?,
+            )));
+        } else if parser.parse_keywords(&[Keyword::NO, Keyword::MAXVALUE]) {
+            options.push(sql::SequenceOptions::MaxValue(None));
+        } else if parser.parse_keyword(Keyword::MAXVALUE) {
+            options.push(sql::SequenceOptions::MaxValue(Some(
+                parser.parse_number().map_err(syntax)?,
+            )));
+        } else if parser.parse_keyword(Keyword::START) {
+            let with = parser.parse_keyword(Keyword::WITH);
+            options.push(sql::SequenceOptions::StartWith(
+                parser.parse_number().map_err(syntax)?,
+                with,
+            ));
+        } else if parser.parse_keyword(Keyword::CACHE) {
+            options.push(sql::SequenceOptions::Cache(
+                parser.parse_number().map_err(syntax)?,
+            ));
+        } else if parser.parse_keywords(&[Keyword::NO, Keyword::CYCLE]) {
+            options.push(sql::SequenceOptions::Cycle(true));
+        } else if parser.parse_keyword(Keyword::CYCLE) {
+            options.push(sql::SequenceOptions::Cycle(false));
+        } else {
+            break;
+        }
+    }
+
+    let owned_by = if parser.parse_keywords(&[Keyword::OWNED, Keyword::BY]) {
+        if parser.parse_keyword(Keyword::NONE) {
+            Some(sql::ObjectName::from(vec![sql::Ident::new("NONE")]))
+        } else {
+            Some(parser.parse_object_name(false).map_err(syntax)?)
+        }
+    } else {
+        None
+    };
+
+    expect_statement_end(&mut parser)?;
+    convert_create_sequence(
+        temporary,
+        if_not_exists,
+        &name,
+        data_type.as_ref(),
+        options,
+        owned_by.as_ref(),
+    )
+    .map(ast::Statement::CreateSequence)
 }
 
 /// Recognize `CREATE [OR REPLACE] TRIGGER ...`; `None` if not a `CREATE TRIGGER` statement

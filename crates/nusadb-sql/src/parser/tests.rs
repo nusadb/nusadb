@@ -900,8 +900,8 @@ fn create_sequence_plain_has_no_options() {
 
 #[test]
 fn create_sequence_full_options() {
-    // sqlparser requires the canonical option order:
-    // INCREMENT, MINVALUE, MAXVALUE, START, CACHE, CYCLE.
+    // The canonical option order (INCREMENT, MINVALUE, MAXVALUE, START, CACHE, CYCLE) still
+    // parses — `create_sequence_options_out_of_order` below covers any other order.
     let ast::Statement::CreateSequence(s) = ok("CREATE SEQUENCE IF NOT EXISTS s \
              INCREMENT BY 2 MINVALUE 1 MAXVALUE 100 START WITH 10 CACHE 5 CYCLE")
     else {
@@ -976,6 +976,92 @@ fn create_sequence_no_bounds_and_no_cycle() {
 fn create_sequence_rejects_owned_by() {
     let err = parse("CREATE SEQUENCE s OWNED BY t.c").expect_err("OWNED BY");
     assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
+// B-UT2.DDL24: `INCREMENT n` (no `BY`) was rejected whenever it did not lead sqlparser's fixed
+// canonical option order (e.g. `START 100 INCREMENT 5`) — `NusaDB: syntax error: Expected: end of
+// statement, found: INCREMENT`. NusaDB now drives `CREATE SEQUENCE` itself, accepting the six
+// options in any order and either spelling of `INCREMENT`/`INCREMENT BY`.
+
+#[test]
+fn create_sequence_increment_without_by_leading() {
+    let ast::Statement::CreateSequence(s) = ok("CREATE SEQUENCE s START 100 INCREMENT 5") else {
+        panic!("expected CreateSequence");
+    };
+    assert_eq!(
+        s.options,
+        vec![
+            ast::SequenceOption::Start(ast::Expr::Literal(ast::Value::Int(100))),
+            ast::SequenceOption::Increment(ast::Expr::Literal(ast::Value::Int(5))),
+        ]
+    );
+}
+
+#[test]
+fn create_sequence_increment_by_and_without_by_are_identical() {
+    let ast::Statement::CreateSequence(with_by) =
+        ok("CREATE SEQUENCE seq_b START 100 INCREMENT BY 5")
+    else {
+        panic!("expected CreateSequence");
+    };
+    let ast::Statement::CreateSequence(without_by) =
+        ok("CREATE SEQUENCE seq_a START 100 INCREMENT 5")
+    else {
+        panic!("expected CreateSequence");
+    };
+    // Only the sequences' names differ (matching the report's `seq_a`/`seq_b`) — the two spellings
+    // must lower to the same options.
+    assert_eq!(with_by.options, without_by.options);
+}
+
+#[test]
+fn create_sequence_options_out_of_order() {
+    let ast::Statement::CreateSequence(s) =
+        ok("CREATE SEQUENCE s CACHE 5 CYCLE NO MAXVALUE INCREMENT BY 2 START WITH 10 NO MINVALUE")
+    else {
+        panic!("expected CreateSequence");
+    };
+    assert_eq!(s.options.len(), 6);
+    assert!(
+        s.options
+            .iter()
+            .any(|o| matches!(o, ast::SequenceOption::Increment(_)))
+    );
+    assert!(
+        s.options
+            .iter()
+            .any(|o| matches!(o, ast::SequenceOption::Start(_)))
+    );
+    assert!(
+        s.options
+            .iter()
+            .any(|o| matches!(o, ast::SequenceOption::MinValue(None)))
+    );
+    assert!(
+        s.options
+            .iter()
+            .any(|o| matches!(o, ast::SequenceOption::MaxValue(None)))
+    );
+    assert!(
+        s.options
+            .iter()
+            .any(|o| matches!(o, ast::SequenceOption::Cache(_)))
+    );
+    assert!(
+        s.options
+            .iter()
+            .any(|o| matches!(o, ast::SequenceOption::Cycle(true)))
+    );
+}
+
+#[test]
+fn create_sequence_still_rejects_temporary_and_typed() {
+    let temp = parse("CREATE TEMPORARY SEQUENCE s").expect_err("TEMPORARY SEQUENCE");
+    assert!(matches!(temp, Error::Unsupported(_)), "got {temp:?}");
+    let temp2 = parse("CREATE TEMP SEQUENCE s").expect_err("TEMP SEQUENCE");
+    assert!(matches!(temp2, Error::Unsupported(_)), "got {temp2:?}");
+    let typed = parse("CREATE SEQUENCE s AS INT").expect_err("AS <type>");
+    assert!(matches!(typed, Error::Unsupported(_)), "got {typed:?}");
 }
 
 #[test]
