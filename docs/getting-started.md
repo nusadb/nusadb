@@ -12,6 +12,14 @@ cargo build --release
 
 ## Connect
 
+NusaDB speaks its own wire protocol — the [Nusa Wire Protocol](wire-protocol.md) — not any other
+database's. Clients built for other systems (`psql`, JDBC or ODBC drivers for other engines,
+GUI tools that expect them) cannot connect: the server does not answer their handshake at all,
+which from their side looks like a dead socket. That is by design, not a missing feature or a
+misconfiguration. Connect with `nusa-cli`, the NusaDB drivers, or anything implementing the
+protocol spec. The SQL *dialect* is a different matter from the wire format: SQL written for
+other engines largely runs as-is once it arrives over a NusaDB connection.
+
 The stock defaults are host `127.0.0.1:5678`, database `nusadb`, and the bootstrap
 superuser `nusa-root` (password `nusa-root`). A trust-on-startup server ignores the
 password; a server started with `--auth-user nusa-root:nusa-root` (or the

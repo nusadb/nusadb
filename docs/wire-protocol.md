@@ -20,6 +20,12 @@
 
 ## 1. Scope
 
+This protocol is NusaDB's own. It is **not** compatible with any other database's wire format:
+a client library or tool built for another engine cannot connect — the server does not answer a
+foreign handshake, which from that client's side looks like a silent socket. This is a standing
+design decision, not an omission; a client is either one of the NusaDB drivers, `nusa-cli`, or an
+implementation of this document.
+
 This covers the on-wire byte format and message exchange:
 
 - TCP framing and primitive encodings (§3–§4)
