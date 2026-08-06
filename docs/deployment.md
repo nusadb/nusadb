@@ -4,7 +4,7 @@ NusaDB ships as a single server binary (`nusadb-server`) plus an interactive
 client (`nusa-cli`). This guide covers a bare-metal install on a Linux VM with systemd.
 
 The server is configured entirely by command-line flags (no config file). The
-durable state — WAL and page files — lives under `--data-dir`; back that path up
+durable state — write-ahead log — lives under `--data-dir`; back that path up
 and you have backed up the database.
 
 ## Server flags
@@ -12,7 +12,7 @@ and you have backed up the database.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:5678` | TCP listen address for the wire protocol. |
-| `--data-dir` | `./data` | Durable data directory (WAL + page files). |
+| `--data-dir` | `./data` | Durable data directory (the write-ahead log — the durable copy of the data). |
 | `--auth-user USER:PASSWORD` | — | Require SCRAM-SHA-256 for this user (repeatable). When **any** is set, every connection must authenticate; otherwise auth is trust-on-startup. |
 | `NUSADB_USER` + `NUSADB_PASSWORD` (env) | — | Fallback auth when no `--auth-user` is given: both together require SCRAM for that user (lets a container require auth without baking a secret into the image). Setting only one is an error. |
 | `--tls-cert` / `--tls-key` | — | PEM cert chain + key; enables TLS when both are set. |
@@ -21,6 +21,7 @@ and you have backed up the database.
 | `--idle-timeout` | `0` | Close a connection idle this many seconds (`0` = no limit). |
 | `--max-connections` | `25` | Cap concurrent connections; excess queue (`0` = unlimited). Small-safe default — raise it on a larger host (see *Resource defaults* below). |
 | `--mem-budget` | `0` | Engine memory budget in bytes; new transactions are refused with an honest error once the engine's logical footprint reaches it, instead of an OS OOM-kill (`0` = unlimited). |
+| `--max-resident-bytes` | derived | Ceiling on each database's in-memory page store; row inserts past it are refused with an error naming the limit (see *Data capacity is bounded by memory*). Derived from the memory budget when unset. |
 | `--work-mem` | `0` | Per-query work-memory budget in bytes; a query that materializes more than this in one executor stage (a big sort / aggregate / join, or — since the executor is not yet streaming — a wide scan) is failed honestly instead of OOM-killing the server (`0` = unlimited). |
 | `--drain-timeout` | `30` | On Ctrl-C, wait this long for in-flight connections to drain. |
 | `--statement-timeout` | `0` | Cancel statements running longer than this many seconds (`0` = no limit). |
@@ -49,6 +50,27 @@ big-server values that OOM a small host. A larger machine raises the limits deli
 > The memory budget defaults to off (`0`) until its Tier-1 value is calibrated against measured RSS
 > on a real small VM; the engine footprint it caps is a logical-bytes estimate, so the safe number is
 > set from measurement, not guessed. Set `--mem-budget` explicitly to cap memory today.
+
+### Data capacity is bounded by memory
+
+Table data lives in memory: rows are held in the in-memory page store and made durable through the
+write-ahead log, and pages are not evicted to disk. Once the resident store reaches its ceiling
+(`--max-resident-bytes`; derived from the detected memory budget when unset), further row inserts
+are refused with an error naming the limit. Updates and index builds are not gated by this
+ceiling, so an update-heavy workload running at the limit can still grow past it. Plan capacity
+accordingly: **a database's working data must fit inside the resident ceiling**, and on a
+memory-constrained host that ceiling is a fraction of RAM. A dataset larger than memory is not
+slower today — it does not fit. Deleting rows frees pages for reuse but does not lower the
+resident meter — page memory is recycled, not returned — and a restart does not lower it either:
+recovery replays the whole log in order, so the page high-water mark is rebuilt exactly as it was.
+Once the ceiling has been hit, the remedies are raising it, using a larger host, or reloading the
+live rows into a fresh data directory (which lands residency at the live-data level).
+
+Two further consequences of the same design, worth knowing when sizing a deployment:
+
+- The write-ahead log is the durable copy of the data and is not yet truncated by a checkpoint, so
+  the data directory grows with write history, not just with live data.
+- Recovery replays that log, so restart time grows with the same history.
 
 Other knobs (`--idle-timeout`, `--drain-timeout`, `--statement-timeout`) default to off/30 s and are
 not memory-bound. A declarative profile system (`--profile t0|t1|t2|t3|auto` over a `nusa.toml`) that

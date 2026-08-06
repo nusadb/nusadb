@@ -92,8 +92,10 @@ fn strip_bom(sql: &str) -> &str {
     sql.strip_prefix('\u{feff}').unwrap_or(sql)
 }
 
-/// Run a batch of `;`-separated statements, printing each result in `format`. Server errors are
-/// printed and do not stop the batch.
+/// Run a batch of `;`-separated statements, printing each result in `format`. A server error is
+/// printed to stderr and does not stop the batch — but it is not forgotten either: the return
+/// value says whether every statement succeeded, so the process can exit non-zero and a caller
+/// script does not sail past a failed load believing it worked.
 ///
 /// A `COPY … FROM STDIN` reads the process's standard input, and a `COPY … TO STDOUT` writes to
 /// standard output, so the shell forms work as they read:
@@ -110,10 +112,11 @@ async fn run_batch<S>(
     conn: &mut Connection<S>,
     sql: &str,
     format: OutputFormat,
-) -> std::io::Result<()>
+) -> std::io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut all_ok = true;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     // One redirect feeds one load: after a COPY has drained stdin to EOF, a later one in the same
@@ -129,17 +132,19 @@ where
         };
         let result = collect_result_with_copy(conn, &stmt, copy).await?;
         stdin_unread &= !result.copied_in;
+        all_ok &= result.error.is_none();
         for line in format_result(&result, format) {
             // A statement that streamed rows to stdout must not have its tag land there too:
-            // `COPY 3` appended to the exported rows makes the file fail to load back.
-            if result.copied_out {
+            // `COPY 3` appended to the exported rows makes the file fail to load back. An error
+            // line goes to stderr for the same reason — it is diagnostics, not data.
+            if result.copied_out || result.error.is_some() {
                 eprintln!("{line}");
             } else {
                 println!("{line}");
             }
         }
     }
-    Ok(())
+    Ok(all_ok)
 }
 
 /// The interactive `rustyline` REPL.
@@ -262,11 +267,12 @@ where
         println!("connected to {} as {}{scheme}", args.host, args.user);
     }
 
+    let mut batch_ok = true;
     if let Some(command) = &args.command {
-        run_batch(&mut conn, strip_bom(command), args.format).await?;
+        batch_ok = run_batch(&mut conn, strip_bom(command), args.format).await?;
     } else if let Some(path) = &args.file {
         let body = std::fs::read_to_string(path)?;
-        run_batch(&mut conn, strip_bom(&body), args.format).await?;
+        batch_ok = run_batch(&mut conn, strip_bom(&body), args.format).await?;
     } else {
         repl(&mut conn, args.format, &args.database).await?;
     }
@@ -275,6 +281,11 @@ where
         .await?;
     // The connection drops right after: force the queued frame onto the wire.
     conn.flush_now().await?;
+    if !batch_ok {
+        // Every result was printed; the exit status must still say the batch was not clean, or a
+        // calling script keeps going as if its load had worked.
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -326,5 +337,65 @@ mod bom_tests {
         assert_eq!(strip_bom("\u{feff}\u{feff}SELECT 1"), "\u{feff}SELECT 1");
         assert_eq!(strip_bom("SELECT '\u{feff}'"), "SELECT '\u{feff}'");
         assert_eq!(strip_bom(""), "");
+    }
+}
+
+#[cfg(test)]
+mod batch_exit_tests {
+    use std::sync::Arc;
+
+    use nusadb_btree::BtreeEngine;
+    use nusadb_cli::handshake;
+    use nusadb_core::StorageEngine;
+    use nusadb_wire::{Connection, serve};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::{OutputFormat, run_batch};
+
+    /// The bug this pins: a batch whose statement failed used to exit 0, so a caller script — one
+    /// loading data in steps under `set -e` — sailed on believing the load worked.
+    #[tokio::test]
+    async fn a_batch_with_a_failed_statement_reports_not_clean() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+        let server = tokio::spawn(serve(listener, engine));
+
+        let mut conn = Connection::new(TcpStream::connect(addr).await.unwrap());
+        handshake(&mut conn, "u", "nusadb", None).await.unwrap();
+
+        // A clean batch is clean.
+        let ok = run_batch(
+            &mut conn,
+            "CREATE TABLE t (id INT); INSERT INTO t VALUES (1)",
+            OutputFormat::Aligned,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "a batch of successful statements must report clean");
+
+        // One failing statement marks the whole batch, and later statements still ran.
+        let ok = run_batch(
+            &mut conn,
+            "INSERT INTO t VALUES (2); SELECT nope FROM missing; INSERT INTO t VALUES (3)",
+            OutputFormat::Aligned,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok,
+            "a batch containing a server error must report not-clean"
+        );
+        let clean = run_batch(&mut conn, "SELECT count(*) FROM t", OutputFormat::Aligned)
+            .await
+            .unwrap();
+        assert!(clean, "the session stays usable after a failed statement");
+        // And the statements around the failure really applied: rows 1, 2 and 3 all landed.
+        let count = nusadb_cli::collect_result(&mut conn, "SELECT count(*) FROM t")
+            .await
+            .unwrap();
+        assert_eq!(count.rows, vec![vec![Some(b"3".to_vec())]]);
+
+        server.abort();
     }
 }

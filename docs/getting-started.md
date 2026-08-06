@@ -49,6 +49,10 @@ Connect to a specific database by name (each connection targets one database):
 
 ## Bulk load and export
 
+In both batch forms (`-c` and `-f`) a server error is printed to standard error and the remaining
+statements still run — but the process then exits non-zero, so a script that loads data in steps
+stops at the failed step instead of sailing on believing it worked.
+
 `COPY` moves rows in and out in one streaming exchange rather than a round trip per row. The
 shell forms read as they look — the data travels on the command's own standard input and output:
 
