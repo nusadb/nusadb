@@ -887,6 +887,23 @@ pub trait StorageEngine: Send + Sync {
     /// Insert `tuple` into `table`, returning the new row's [`Tid`].
     fn insert(&self, txn: TxnId, table: TableId, tuple: &[u8]) -> Result<Tid>;
 
+    /// Insert every tuple of `tuples` into `table`, returning the new rows' [`Tid`]s **in input
+    /// order**. `RETURNING` and index maintenance pair rows with tids positionally, so the order
+    /// is part of the contract even for an engine that writes them in some other order.
+    ///
+    /// The default delegates to [`insert`](Self::insert) once per tuple, so every implementor
+    /// keeps its existing behaviour unchanged; an engine overrides this when it can amortize the
+    /// per-row costs — one log record for the whole batch, one writer-latch acquisition. Failure
+    /// semantics are those of the equivalent loop of `insert` calls: an error may leave earlier
+    /// tuples written *to the transaction*, where rollback removes them — a failed batch must
+    /// never commit tuples that the same failing loop of single inserts would not have.
+    fn insert_batch(&self, txn: TxnId, table: TableId, tuples: &[Vec<u8>]) -> Result<Vec<Tid>> {
+        tuples
+            .iter()
+            .map(|tuple| self.insert(txn, table, tuple))
+            .collect()
+    }
+
     /// Replace the tuple at `tid`. Under MVCC this writes a new version and returns its
     /// new [`Tid`].
     fn update(&self, txn: TxnId, table: TableId, tid: Tid, tuple: &[u8]) -> Result<Tid>;

@@ -55,6 +55,7 @@ const TAG_ALTER_SCHEMA: u8 = 18;
 const TAG_SCHEMA_CREATE: u8 = 19;
 const TAG_SCHEMA_DROP: u8 = 20;
 const TAG_INDEX_UNSTAMP: u8 = 21;
+const TAG_INSERT_BATCH: u8 = 22;
 
 /// One logical, replayable operation of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +70,19 @@ pub enum LoggedOp {
         row_id: u64,
         /// The opaque tuple bytes.
         tuple: Vec<u8>,
+    },
+    /// Rows `first_row_id..first_row_id + tuples.len()` of `table` were created with `tuples`,
+    /// in order — one record for a whole statement's rows, amortizing the per-record framing,
+    /// CRC and compression that a bulk load otherwise pays once per row.
+    InsertBatch {
+        /// Owning transaction.
+        txn: u64,
+        /// Target table id.
+        table: u64,
+        /// The first engine-minted row id; the batch occupies consecutive ids from here.
+        first_row_id: u64,
+        /// The opaque tuple bytes, in insertion order.
+        tuples: Vec<Vec<u8>>,
     },
     /// Row `row_id` of `table` now holds `tuple`.
     Update {
@@ -298,6 +312,7 @@ impl LoggedOp {
     pub const fn txn(&self) -> u64 {
         match self {
             Self::Insert { txn, .. }
+            | Self::InsertBatch { txn, .. }
             | Self::Update { txn, .. }
             | Self::Delete { txn, .. }
             | Self::CreateTable { txn, .. }
@@ -351,6 +366,33 @@ impl LoggedOp {
             } => {
                 push_key(&mut key, TAG_INSERT, *txn, *table, Some(*row_id));
                 value.extend_from_slice(tuple);
+            },
+            Self::InsertBatch {
+                txn,
+                table,
+                first_row_id,
+                tuples,
+            } => {
+                push_key(
+                    &mut key,
+                    TAG_INSERT_BATCH,
+                    *txn,
+                    *table,
+                    Some(*first_row_id),
+                );
+                // Self-framing payload: a count, then each tuple length-prefixed, both u32 LE —
+                // tuple sizes are already bounded well below u32 by the engine's write ceiling.
+                value.extend_from_slice(
+                    &u32::try_from(tuples.len())
+                        .unwrap_or(u32::MAX)
+                        .to_le_bytes(),
+                );
+                for tuple in tuples {
+                    value.extend_from_slice(
+                        &u32::try_from(tuple.len()).unwrap_or(u32::MAX).to_le_bytes(),
+                    );
+                    value.extend_from_slice(tuple);
+                }
             },
             Self::Update {
                 txn,
@@ -514,6 +556,29 @@ impl LoggedOp {
                 row_id: read_u64(rest, 16)?,
                 tuple: value.clone(),
             },
+            TAG_INSERT_BATCH => {
+                let first_row_id = read_u64(rest, 16)?;
+                let count = read_u32_at(value, 0)? as usize;
+                // No preallocation from the untrusted length prefix (TableDef-codec discipline).
+                let mut tuples = Vec::new();
+                let mut at = 4;
+                for _ in 0..count {
+                    let len = read_u32_at(value, at)? as usize;
+                    at += 4;
+                    tuples.push(value.get(at..at + len)?.to_vec());
+                    at += len;
+                }
+                // A record longer than its own framing is corrupt, not generous.
+                if at != value.len() {
+                    return None;
+                }
+                Self::InsertBatch {
+                    txn,
+                    table,
+                    first_row_id,
+                    tuples,
+                }
+            },
             TAG_UPDATE => Self::Update {
                 txn,
                 table,
@@ -672,6 +737,37 @@ fn push_key(key: &mut Vec<u8>, tag: u8, txn: u64, table: u64, row_id: Option<u64
 
 fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Build the [`LoggedOp::InsertBatch`] record directly from borrowed tuples.
+///
+/// The writer would otherwise deep-clone a whole statement's rows — while holding the table's
+/// writer latch — just to serialize and drop them. Byte-identical to
+/// `LoggedOp::InsertBatch { .. }.to_record()`.
+pub fn insert_batch_record(
+    txn: u64,
+    table: u64,
+    first_row_id: u64,
+    tuples: &[Vec<u8>],
+) -> WalRecord {
+    let mut key = Vec::with_capacity(25);
+    push_key(&mut key, TAG_INSERT_BATCH, txn, table, Some(first_row_id));
+    let payload: usize = tuples.iter().map(|t| 4 + t.len()).sum();
+    let mut value = Vec::with_capacity(4 + payload);
+    value.extend_from_slice(
+        &u32::try_from(tuples.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    for tuple in tuples {
+        value.extend_from_slice(&u32::try_from(tuple.len()).unwrap_or(u32::MAX).to_le_bytes());
+        value.extend_from_slice(tuple);
+    }
+    WalRecord::Put { key, value }
+}
+
+fn read_u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
 
 // --- TableDef codec -------------------------------------------------------------------------

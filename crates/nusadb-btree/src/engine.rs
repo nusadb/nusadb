@@ -53,7 +53,7 @@ use crate::mvcc::{self, ReadView, RowMeta, UndoVersion};
 use crate::node;
 use crate::store::MemPageStore;
 use crate::tree::ClusteredTree;
-use crate::wal::LoggedOp;
+use crate::wal::{self, LoggedOp};
 
 /// The largest user tuple the engine accepts: one leaf entry minus the MVCC header.
 const MAX_USER_TUPLE: usize = node::MAX_TUPLE - mvcc::META;
@@ -1261,6 +1261,33 @@ impl BtreeEngine {
                     t.set_root(tree.root());
                     let w = t.write.get_mut().map_err(|_| poisoned())?;
                     w.next_row_id = w.next_row_id.max(*row_id + 1);
+                }
+            },
+            LoggedOp::InsertBatch {
+                txn,
+                table,
+                first_row_id,
+                tuples,
+            } => {
+                if let Some(t) = cat.tables.get_mut(table) {
+                    // Corrupt-input arithmetic guard: a first_row_id near the top of the range
+                    // with a large count must end replay loudly, not wrap.
+                    let end = first_row_id
+                        .checked_add(tuples.len() as u64)
+                        .ok_or_else(|| {
+                            Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "nusadb-btree: insert-batch record's row-id range overflows",
+                            ))
+                        })?;
+                    let mut tree = ClusteredTree::open(store, t.root_id());
+                    for (i, tuple) in tuples.iter().enumerate() {
+                        let value = mvcc::encode_row(RowMeta::fresh(*txn), tuple);
+                        tree.insert(first_row_id + i as u64, &value)?;
+                    }
+                    t.set_root(tree.root());
+                    let w = t.write.get_mut().map_err(|_| poisoned())?;
+                    w.next_row_id = w.next_row_id.max(end);
                 }
             },
             LoggedOp::Update {
@@ -2836,6 +2863,78 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .iter()
             .map(|(&id, name)| (SchemaId(id), name.clone()))
             .collect())
+    }
+
+    fn insert_batch(&self, txn: TxnId, table: TableId, tuples: &[Vec<u8>]) -> Result<Vec<Tid>> {
+        // The loop this amortizes does nothing for zero rows, so neither may the batch: no
+        // ceiling check, no lock intention, no empty log record.
+        if tuples.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Everything that can refuse the batch is checked before anything is written, so the
+        // common failures leave nothing to unwind. A failure after writing began (an internal
+        // tree or log error) leaves the written prefix in the transaction with its undo entries
+        // pushed — exactly the state the same failing loop of single inserts leaves — and
+        // rollback removes it. Two deliberate batch-shaped divergences, both stricter or
+        // coarser but never wrong: the resident ceiling is consulted once for the whole batch
+        // rather than per row, and the writer latch is held for the whole batch, so another
+        // writer to this table waits for the statement instead of interleaving row by row.
+        for tuple in tuples {
+            if tuple.len() > MAX_USER_TUPLE {
+                return Err(tuple_too_large(tuple.len()));
+            }
+        }
+        self.check_resident_memory()?;
+        let total: u64 = tuples
+            .iter()
+            .map(|t| t.len() as u64 + PER_ROW_WRITE_OVERHEAD)
+            .sum();
+        self.charge_txn_memory(txn.0, total)?;
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        let t = cat
+            .tables
+            .get(&table.0)
+            .ok_or_else(|| table_not_found(table))?;
+        {
+            let mut txns = self.txns.lock().map_err(|_| poisoned())?;
+            if !txns.txns.contains_key(&txn.0) {
+                return Err(unknown_txn(txn));
+            }
+            txns.lock_table_intention(txn.0, table.0)?;
+        }
+        // One writer-latch acquisition and one log record for the whole batch — the two per-row
+        // costs the attribution measured largest on bulk loads. Row ids are minted consecutively,
+        // so the clustered tree receives an ascending key run.
+        let mut w = t.write.lock().map_err(|_| poisoned())?;
+        let first_row_id = w.next_row_id;
+        w.next_row_id += tuples.len() as u64;
+        let mut tree = ClusteredTree::open(&self.store, t.root_id());
+        let mut tids = Vec::with_capacity(tuples.len());
+        for (i, tuple) in tuples.iter().enumerate() {
+            let row_id = first_row_id + i as u64;
+            let value = mvcc::encode_row(RowMeta::fresh(txn.0), tuple);
+            tree.insert(row_id, &value)?;
+            // Publish the root per row, exactly as the loop of single inserts does, so a failure
+            // part-way never discards a root move a split already made.
+            t.set_root(tree.root());
+            self.push_undo(
+                txn.0,
+                UndoOp::Inserted {
+                    table: table.0,
+                    row_id,
+                },
+            )?;
+            tids.push(tid_of(row_id));
+        }
+        // Built from the borrowed tuples — no deep clone of the statement's rows while the
+        // writer latch is held.
+        self.log(&wal::insert_batch_record(
+            txn.0,
+            table.0,
+            first_row_id,
+            tuples,
+        ))?;
+        Ok(tids)
     }
 
     fn insert(&self, txn: TxnId, table: TableId, tuple: &[u8]) -> Result<Tid> {

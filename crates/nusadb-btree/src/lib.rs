@@ -84,6 +84,123 @@ mod tests {
 
     use super::*;
 
+    /// The batched insert is the per-row loop, amortized — same rows, same ids, same order,
+    /// same durability, same rollback. Each property here is a piece of that equivalence: a
+    /// batch and a loop on twin engines produce identical scans and tids; the tids come back in
+    /// input order and consecutively; a committed batch survives a crash-reopen (the one-record
+    /// form replays); a rolled-back batch leaves nothing; and a single insert after a batch
+    /// continues the id run rather than colliding with it.
+    #[test]
+    fn insert_batch_is_the_per_row_loop_amortized() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch_engine = BtreeEngine::open(dir.path().join("batch.wal")).unwrap();
+        let loop_engine = BtreeEngine::open(dir.path().join("loop.wal")).unwrap();
+
+        let rows: Vec<Vec<u8>> = (0u32..500).map(|i| i.to_le_bytes().to_vec()).collect();
+
+        // Twin engines: one batch call vs the per-row loop.
+        let txn = batch_engine.begin(RC).unwrap();
+        let t = batch_engine.create_table(txn, &table_def("t")).unwrap();
+        let batch_tids = batch_engine.insert_batch(txn, t, &rows).unwrap();
+        batch_engine.commit(txn).unwrap();
+
+        let txn = loop_engine.begin(RC).unwrap();
+        let t2 = loop_engine.create_table(txn, &table_def("t")).unwrap();
+        let mut loop_tids = Vec::new();
+        for r in &rows {
+            loop_tids.push(loop_engine.insert(txn, t2, r).unwrap());
+        }
+        loop_engine.commit(txn).unwrap();
+
+        // Tids: identical, in input order, consecutive.
+        assert_eq!(batch_tids, loop_tids);
+        assert!(
+            batch_tids
+                .windows(2)
+                .all(|w| w[1].page.0 == w[0].page.0 + 1),
+            "batch tids must be consecutive"
+        );
+
+        // Content: identical scans, tuple for tuple.
+        let rt = batch_engine.begin(RC).unwrap();
+        let rl = loop_engine.begin(RC).unwrap();
+        let a = collect(&batch_engine, rt, t);
+        let b = collect(&loop_engine, rl, t2);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), rows.len());
+        batch_engine.commit(rt).unwrap();
+        loop_engine.commit(rl).unwrap();
+
+        // A single insert after the batch continues the run — no id collision.
+        let txn = batch_engine.begin(RC).unwrap();
+        let next = batch_engine.insert(txn, t, &[9, 9]).unwrap();
+        assert_eq!(next.page.0, batch_tids.last().unwrap().page.0 + 1);
+        // Rollback of a batch leaves nothing of it.
+        let dropped = batch_engine.insert_batch(txn, t, &rows).unwrap();
+        assert_eq!(dropped.len(), rows.len());
+        batch_engine.rollback(txn).unwrap();
+        let rt = batch_engine.begin(RC).unwrap();
+        assert_eq!(collect(&batch_engine, rt, t).len(), rows.len());
+        batch_engine.commit(rt).unwrap();
+
+        // Durability: the one-record form replays on a crash-reopen (no clean shutdown).
+        drop(batch_engine);
+        let reopened = BtreeEngine::open(dir.path().join("batch.wal")).unwrap();
+        let t3 = reopened.lookup_table("t").unwrap().unwrap().id;
+        let rt = reopened.begin(RC).unwrap();
+        // Content, not just count: every replayed tuple must be byte-identical, at the same tid.
+        let replayed = collect(&reopened, rt, t3);
+        assert_eq!(
+            replayed, a,
+            "replay of the one-record form must reproduce the scan"
+        );
+        reopened.commit(rt).unwrap();
+    }
+
+    /// A truncated batch record — cut anywhere inside the self-framing payload — decodes to
+    /// `None` rather than a shorter batch or a panic; trailing garbage past the framed tuples is
+    /// corruption too, not something to shrug off.
+    #[test]
+    fn insert_batch_record_rejects_truncation_and_trailing_garbage() {
+        let op = wal::LoggedOp::InsertBatch {
+            txn: 7,
+            table: 3,
+            first_row_id: 43,
+            tuples: vec![vec![9; 40], Vec::new(), vec![1, 2, 3]],
+        };
+        let record = op.to_record();
+        // The engine writes through the borrowed-tuples builder; pin its claimed byte-identity
+        // with the enum encoder, so the two copies cannot drift apart unnoticed.
+        assert_eq!(
+            wal::insert_batch_record(7, 3, 43, &[vec![9; 40], Vec::new(), vec![1, 2, 3]]),
+            record,
+            "insert_batch_record must be byte-identical to to_record"
+        );
+        let nusadb_wal::WalRecord::Put { key, value } = &record else {
+            panic!("batch record is a Put");
+        };
+        for cut in 0..value.len() {
+            let shorter = nusadb_wal::WalRecord::Put {
+                key: key.clone(),
+                value: value[..cut].to_vec(),
+            };
+            assert!(
+                wal::LoggedOp::from_record(&shorter).is_none(),
+                "a value truncated to {cut} bytes must not decode"
+            );
+        }
+        let mut longer = value.clone();
+        longer.push(0);
+        let padded = nusadb_wal::WalRecord::Put {
+            key: key.clone(),
+            value: longer,
+        };
+        assert!(
+            wal::LoggedOp::from_record(&padded).is_none(),
+            "trailing garbage must not decode"
+        );
+    }
+
     /// The audit-caught staged-window schedule (SSI narrowing, durable engine): a reader
     /// that BEGINS while a writer is staged-but-mid-fsync cannot see the writer rows, yet the
     /// writer commit outranks it — so if the reader read the OLD row it MUST abort. A single
@@ -2558,6 +2675,21 @@ mod tests {
                 table: 3,
                 row_id: 42,
                 tuple: vec![1, 2, 3],
+            },
+            // The batch record's self-framing payload, in every edge shape: mixed lengths, a
+            // tuple that is itself empty, and a batch of zero tuples (the writer never emits
+            // one, but the codec must still be the identity on it).
+            wal::LoggedOp::InsertBatch {
+                txn: 7,
+                table: 3,
+                first_row_id: 43,
+                tuples: vec![vec![9; 40], Vec::new(), vec![1]],
+            },
+            wal::LoggedOp::InsertBatch {
+                txn: 7,
+                table: 3,
+                first_row_id: 50,
+                tuples: Vec::new(),
             },
             wal::LoggedOp::Update {
                 txn: 7,

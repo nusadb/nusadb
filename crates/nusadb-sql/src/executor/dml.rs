@@ -706,6 +706,35 @@ pub(super) fn insert_rows(
     )
 }
 
+/// Encode `rows` against `schema` and write them in one engine call, returning the new tids.
+///
+/// The batch amortizes the per-row write costs (one log record, one writer-latch acquisition)
+/// that dominate a bulk load. The tid list is positional by treaty and enforced here rather than
+/// trusted — a short return from some engine would otherwise silently skip index maintenance for
+/// the tail rows.
+fn insert_encoded_batch(
+    rows: &[Row],
+    schema: &[ColumnType],
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Tid>, Error> {
+    let encoded: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|r| row::encode(r, schema))
+        .collect::<Result<_, _>>()?;
+    let tids = engine.insert_batch(txn, table.id, &encoded)?;
+    if tids.len() != rows.len() {
+        return Err(Error::Unsupported(format!(
+            "storage engine returned {} tids for a {}-row insert batch — the treaty requires one \
+             per row, in input order",
+            tids.len(),
+            rows.len()
+        )));
+    }
+    Ok(tids)
+}
+
 /// [`insert_rows`] with the uniqueness mode explicit: `None` validates against the committed
 /// table now (every whole-statement path); `Some(collector)` is the streaming `INSERT ... SELECT`
 /// path — per-batch key locks + key collection now, one committed re-scan at end of stream
@@ -821,10 +850,11 @@ fn insert_rows_with_unique(
     // maintenance, so each of those sees the index exactly as the per-row path would leave it. A
     // plain insert keeps the immediate per-row maintenance.
     let defer_index_build = deferred.is_some();
+    // One engine call for the whole statement; tids come back in input order — the contract
+    // `RETURNING` and the index maintenance below pair rows by.
+    let tids = insert_encoded_batch(&full_rows, &schema, table, engine, txn)?;
     let mut deferred_tids: Vec<Tid> = Vec::new();
-    for full in &full_rows {
-        let bytes = row::encode(full, &schema)?;
-        let tid = engine.insert(txn, table.id, &bytes)?;
+    for (full, &tid) in full_rows.iter().zip(&tids) {
         if let Some(collector) = deferred.as_deref_mut() {
             collector.record_inserted(tid);
         }
