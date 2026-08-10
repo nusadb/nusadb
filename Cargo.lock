@@ -1076,10 +1076,12 @@ dependencies = [
 name = "nusadb-btree"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "nusadb-btree",
  "nusadb-core",
  "nusadb-wal",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1178,7 +1180,6 @@ dependencies = [
  "getrandom 0.3.4",
  "nusadb-btree",
  "nusadb-core",
- "nusadb-storage",
  "nusadb-test-utils",
  "proptest",
  "regex",

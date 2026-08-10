@@ -59,18 +59,26 @@ write-ahead log, and pages are not evicted to disk. Once the resident store reac
 are refused with an error naming the limit. Updates and index builds are not gated by this
 ceiling, so an update-heavy workload running at the limit can still grow past it. Plan capacity
 accordingly: **a database's working data must fit inside the resident ceiling**, and on a
-memory-constrained host that ceiling is a fraction of RAM. A dataset larger than memory is not
+memory-constrained host that ceiling is a fraction of RAM — with the default derivation, about a
+fifth of it (measured: an 859 MB ceiling inside a 4 GB container, roughly 2-3 million rows at
+~220 bytes each). Size against that number before loading, not against total RAM: the first
+sign of overshooting is the insert refusal itself, mid-load. A dataset larger than memory is not
 slower today — it does not fit. Deleting rows frees pages for reuse but does not lower the
-resident meter — page memory is recycled, not returned — and a restart does not lower it either:
-recovery replays the whole log in order, so the page high-water mark is rebuilt exactly as it was.
-Once the ceiling has been hit, the remedies are raising it, using a larger host, or reloading the
-live rows into a fresh data directory (which lands residency at the live-data level).
+resident meter within a running process — page memory is recycled, not returned. A restart can
+lower it: recovery rebuilds the store from the last checkpoint image, which holds only live rows,
+so residency comes back at the live-data level rather than the pre-restart high-water mark (a
+database that has never checkpointed still replays its whole log and returns to the old mark).
+Once the ceiling has been hit mid-process, the remedies are raising it, using a larger host, or
+reloading the live rows into a fresh data directory.
 
-Two further consequences of the same design, worth knowing when sizing a deployment:
+Two further notes on the durability design, worth knowing when sizing a deployment:
 
-- The write-ahead log is the durable copy of the data and is not yet truncated by a checkpoint, so
-  the data directory grows with write history, not just with live data.
-- Recovery replays that log, so restart time grows with the same history.
+- The write-ahead log is the durable copy of the data. A checkpoint folds the in-memory state into
+  an image file beside the log and truncates the log, so the data directory tracks live data plus
+  the write history *since the last checkpoint* rather than all history. A checkpoint is taken
+  automatically when a database is opened with a log past a few megabytes.
+- Recovery loads the last checkpoint image and replays only the log after it, so restart time
+  tracks the post-checkpoint tail, not the whole history.
 
 Other knobs (`--idle-timeout`, `--drain-timeout`, `--statement-timeout`) default to off/30 s and are
 not memory-bound. A declarative profile system (`--profile t0|t1|t2|t3|auto` over a `nusa.toml`) that

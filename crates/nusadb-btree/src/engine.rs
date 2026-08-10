@@ -93,6 +93,9 @@ pub(crate) const PURGE_ROW_BATCH: usize = 4096;
 struct Wal {
     writer: WalWriter<File>,
     sync: Arc<File>,
+    /// The log file's path; the checkpoint derives its image paths (`<path>.ckpt`,
+    /// `<path>.ckpt.tmp`) from it.
+    path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Wal {
@@ -1048,9 +1051,14 @@ impl BtreeEngine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let engine = Self::new();
+        // A checkpoint image, when present, replaces the log prefix it covers: recovery replays
+        // the image's records first, then only the log records with an LSN past the image's
+        // watermark. A leftover `.ckpt.tmp` is a checkpoint that crashed before its atomic
+        // rename — never named, never authoritative — and is simply removed.
+        let _ = std::fs::remove_file(ckpt_tmp_path(path));
+        let (mut records, covered_lsn) = read_checkpoint_image(&ckpt_path(path))?;
         let mut last_good: u64 = 0;
-        let mut last_lsn: u64 = 0;
-        let mut records: Vec<WalRecord> = Vec::new();
+        let mut last_lsn: u64 = covered_lsn;
         // Recovery must distinguish a torn *tail* (a crash mid-append — safe to truncate to the last
         // good record) from a *hole in the middle* of the log (bit-rot / a bad sector). Since the WAL
         // is the sole durable copy of the database (no checkpoint, volatile pages), truncating at a
@@ -1064,10 +1072,15 @@ impl BtreeEngine {
         match std::fs::read(path) {
             Ok(buf) => match nusadb_wal::recover_prefix(&buf) {
                 Ok(prefix) => {
-                    for (_lsn, record) in prefix.records {
-                        records.push(record);
+                    // Records at or before the image's watermark are already inside the image
+                    // (a crash between the image rename and the log truncation leaves them
+                    // behind); replaying them again would double-apply.
+                    for (lsn, record) in prefix.records {
+                        if lsn.0 > covered_lsn {
+                            records.push(record);
+                        }
                     }
-                    last_lsn = prefix.last_lsn;
+                    last_lsn = last_lsn.max(prefix.last_lsn);
                     last_good = prefix.good_bytes;
                 },
                 Err(hole) => {
@@ -1113,7 +1126,22 @@ impl BtreeEngine {
         writer_file.seek(std::io::SeekFrom::End(0))?;
         let writer = WalWriter::resume(writer_file, nusadb_core::Lsn(last_lsn + 1));
         let mut engine = engine;
-        engine.wal = Some(Mutex::new(Wal { writer, sync }));
+        engine.wal = Some(Mutex::new(Wal {
+            writer,
+            sync,
+            path: path.to_path_buf(),
+        }));
+        // A log that has grown past the threshold is folded into a fresh checkpoint image now,
+        // while the engine is provably quiesced (no transaction has begun yet): the next open
+        // replays the image plus an empty suffix instead of this whole history. Best-effort by
+        // design — recovery has already succeeded, so this is pure optimization. A failure here
+        // (disk full, a read-only forensic mount, a Windows AV lock on the new file) must never
+        // turn a fully recovered database into one that refuses to open; log it and carry on.
+        if last_good >= AUTO_CHECKPOINT_ON_OPEN_BYTES
+            && let Err(e) = engine.checkpoint()
+        {
+            tracing::warn!(error = %e, "open-time auto-checkpoint failed; continuing without it");
+        }
         Ok(engine)
     }
 
@@ -2057,6 +2085,404 @@ fn poisoned() -> Error {
     Error::Io(std::io::Error::other(
         "nusadb-btree: engine state lock poisoned by a previous panic",
     ))
+}
+
+/// Auto-checkpoint threshold at open: a recovered log at or past this size is folded into a
+/// fresh image before the engine starts serving, so the next recovery replays the (much
+/// smaller) image instead of the whole history. Open-time is the one moment quiescence is free.
+const AUTO_CHECKPOINT_ON_OPEN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Checkpoint image header magic.
+const CKPT_MAGIC: &[u8; 4] = b"NCKP";
+/// Checkpoint image format version.
+const CKPT_VERSION: u32 = 1;
+/// The checksummed part of the header: magic (4) + version (4) + covered-LSN watermark (8).
+const CKPT_HEADER_CHECKSUMMED_LEN: usize = 16;
+/// Full header length: the checksummed prefix plus its CRC32 (4).
+const CKPT_HEADER_LEN: usize = CKPT_HEADER_CHECKSUMMED_LEN + 4;
+
+/// The 20-byte checkpoint header: `NCKP` + version + covered-LSN + CRC32(of the first 16). The
+/// CRC covers `covered_lsn` specifically — a single flipped bit there would otherwise silently
+/// change which committed log records recovery skips, with no error, exactly the silent-data-loss
+/// the log's own header CRC was added to prevent.
+fn ckpt_header_bytes(covered_lsn: u64) -> [u8; CKPT_HEADER_LEN] {
+    let mut header = [0u8; CKPT_HEADER_LEN];
+    header[0..4].copy_from_slice(CKPT_MAGIC);
+    header[4..8].copy_from_slice(&CKPT_VERSION.to_le_bytes());
+    header[8..16].copy_from_slice(&covered_lsn.to_le_bytes());
+    let crc = crc32fast::hash(&header[0..CKPT_HEADER_CHECKSUMMED_LEN]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
+/// The image path beside the log: `<wal>.ckpt`.
+fn ckpt_path(wal: &Path) -> std::path::PathBuf {
+    let mut p = wal.as_os_str().to_owned();
+    p.push(".ckpt");
+    p.into()
+}
+
+/// The image's scratch path: `<wal>.ckpt.tmp` — written and fsynced first, renamed into place
+/// only when complete, so a named image is complete by construction.
+fn ckpt_tmp_path(wal: &Path) -> std::path::PathBuf {
+    let mut p = wal.as_os_str().to_owned();
+    p.push(".ckpt.tmp");
+    p.into()
+}
+
+/// Load the checkpoint image, if one exists: its records (replayed before the log suffix) and
+/// the LSN watermark it covers. No image means "replay the whole log" — `(empty, 0)`.
+///
+/// A *named* image is complete by construction (fsynced before its atomic rename), so any
+/// validation failure here is bit-rot or tampering — and by the time an image exists the log
+/// prefix it covers is gone, so falling back to the log would silently lose everything the
+/// image holds. Refuse loudly instead, the same stance recovery takes on a mid-log hole.
+fn read_checkpoint_image(path: &Path) -> Result<(Vec<WalRecord>, u64)> {
+    let buf = match std::fs::read(path) {
+        Ok(buf) => buf,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(e) => return Err(e.into()),
+    };
+    let corrupt = |what: &str| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "nusadb-btree: checkpoint image {} is invalid ({what}) — refusing to open (the \
+                 log prefix it covers was truncated, so ignoring the image would silently lose \
+                 the data it holds). Restore the image from a backup or repair it before \
+                 reopening.",
+                path.display()
+            ),
+        ))
+    };
+    let Some((header, body)) = buf.split_at_checked(CKPT_HEADER_LEN) else {
+        return Err(corrupt("truncated header"));
+    };
+    let (checksummed, crc_bytes) = header.split_at(CKPT_HEADER_CHECKSUMMED_LEN);
+    // Validate the header CRC before trusting any field it protects — above all `covered_lsn`,
+    // which decides which committed records recovery skips. Full-array destructuring keeps this
+    // panic-free (no range index into a slice).
+    let checksummed = <[u8; CKPT_HEADER_CHECKSUMMED_LEN]>::try_from(checksummed)
+        .map_err(|_| corrupt("short header"))?;
+    let stored_crc = u32::from_le_bytes(<[u8; 4]>::try_from(crc_bytes).unwrap_or([0; 4]));
+    if crc32fast::hash(&checksummed) != stored_crc {
+        return Err(corrupt("header checksum mismatch"));
+    }
+    let [
+        m0,
+        m1,
+        m2,
+        m3,
+        v0,
+        v1,
+        v2,
+        v3,
+        l0,
+        l1,
+        l2,
+        l3,
+        l4,
+        l5,
+        l6,
+        l7,
+    ] = checksummed;
+    if [m0, m1, m2, m3] != *CKPT_MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    let version = u32::from_le_bytes([v0, v1, v2, v3]);
+    if version != CKPT_VERSION {
+        return Err(corrupt("unsupported format version"));
+    }
+    let covered_lsn = u64::from_le_bytes([l0, l1, l2, l3, l4, l5, l6, l7]);
+    let prefix = nusadb_wal::recover_prefix(body).map_err(|_| corrupt("corrupt record body"))?;
+    // A torn tail is a valid state for a crash-interrupted LOG; an image was fsynced complete
+    // before it got its name, so trailing garbage is corruption, not a crash artifact.
+    if prefix.good_bytes != body.len() as u64 {
+        return Err(corrupt("trailing bytes after the last valid record"));
+    }
+    Ok((
+        prefix.records.into_iter().map(|(_, r)| r).collect(),
+        covered_lsn,
+    ))
+}
+
+impl BtreeEngine {
+    /// Serialize the whole committed state as replayable log records, in dependency order.
+    /// Runs under the checkpoint's quiesce (every domain locked, no active transactions), so
+    /// every version stamp in the trees and indexes belongs to a settled transaction: a row or
+    /// entry with a live range (`xmax == NO_XMAX`) is committed-alive, anything else is
+    /// committed-dead and stays out of the image.
+    ///
+    /// One behavior it deliberately does not preserve: the `next_row_id` / `next_table_id` /
+    /// `next_index_id` high-water marks. Replay re-derives them as `max(live id) + 1`, so an id
+    /// belonging to an object dropped before the checkpoint may be reused after a restart. Safe
+    /// because everything that could collide with it — the dropped object, its rows, its index
+    /// entries — is gone from the image, so no live reference points at the reused id; but it is a
+    /// relaxation of the pre-checkpoint "ids never repeat across a restart" invariant.
+    ///
+    /// Reads `IndexState::data` (rank 4) while holding `txns`/`seqs`/`wal` (ranks 6/7/9), which
+    /// inverts the rank order — safe *only* because the caller holds the rank-2 catalog **write**
+    /// guard, which drains every operation at ranks 3-5, so no one else can be holding an index
+    /// latch to deadlock against.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat one-family-per-block emitter mirroring replay_op; splitting it would \
+                  scatter the image's dependency order"
+    )]
+    fn emit_image_records(
+        cat: &Catalog,
+        seqs: &SeqDomain,
+        store: &MemPageStore,
+        synthetic_txn: u64,
+    ) -> Result<Vec<WalRecord>> {
+        let mut ops: Vec<LoggedOp> = Vec::new();
+        let mut sorted_ns: Vec<_> = cat.namespaces.iter().collect();
+        sorted_ns.sort_by_key(|(id, _)| **id);
+        for (id, name) in sorted_ns {
+            ops.push(LoggedOp::SchemaCreate {
+                txn: synthetic_txn,
+                id: *id,
+                name: name.clone(),
+            });
+        }
+        let mut sorted_tables: Vec<_> = cat.tables.iter().collect();
+        sorted_tables.sort_by_key(|(id, _)| **id);
+        for (id, t) in &sorted_tables {
+            // The full version history is re-declared: the lowest version as the CREATE, each
+            // later one as the ALTER that advanced to it — so `schema_for_version` answers
+            // after recovery exactly as before.
+            let mut versions: Vec<_> = t.schema_history.iter().collect();
+            versions.sort_by_key(|(v, _)| **v);
+            let mut versions = versions.into_iter();
+            let Some((_, first)) = versions.next() else {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("nusadb-btree: table {id} has an empty schema history"),
+                )));
+            };
+            let def_of = |schema: &TableSchema| TableDef {
+                schema: schema.schema.clone(),
+                name: schema.name.clone(),
+                columns: schema.columns.clone(),
+            };
+            ops.push(LoggedOp::CreateTable {
+                txn: synthetic_txn,
+                table: **id,
+                def: def_of(first),
+            });
+            for (version, schema) in versions {
+                ops.push(LoggedOp::AlterSchema {
+                    txn: synthetic_txn,
+                    table: **id,
+                    version: *version,
+                    def: def_of(schema),
+                });
+            }
+        }
+        for (id, t) in &sorted_tables {
+            let tree = ClusteredTree::open(store, t.root_id());
+            for (row_id, value) in tree.scan()? {
+                let Some((meta, tuple)) = mvcc::decode_row(&value) else {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("nusadb-btree: undecodable row {row_id} in table {id}"),
+                    )));
+                };
+                if meta.xmax != mvcc::NO_XMAX {
+                    continue; // committed-dead: a settled delete no future view can see
+                }
+                ops.push(LoggedOp::Insert {
+                    txn: synthetic_txn,
+                    table: **id,
+                    row_id,
+                    tuple: tuple.to_vec(),
+                });
+            }
+        }
+        let mut sorted_indexes: Vec<_> = cat.indexes.iter().collect();
+        sorted_indexes.sort_by_key(|(id, _)| **id);
+        for (id, idx) in sorted_indexes {
+            ops.push(LoggedOp::CreateIndex {
+                txn: synthetic_txn,
+                index: *id,
+                def: idx.def.clone(),
+            });
+            let data = idx.data.read().map_err(|_| poisoned())?;
+            for (key, rows) in &data.entries {
+                for (row_id, metas) in rows {
+                    if metas.iter().any(|m| m.xmax == mvcc::NO_XMAX) {
+                        ops.push(LoggedOp::IndexInsert {
+                            txn: synthetic_txn,
+                            index: *id,
+                            row_id: *row_id,
+                            key: key.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // These four families live in `HashMap`s; emit them in a stable key order so the image is
+        // byte-deterministic across runs (replay is order-insensitive for them, but a
+        // reproducible image is worth having for diffing and DST).
+        let mut sorted_constraints: Vec<_> = cat.constraints.iter().collect();
+        sorted_constraints.sort_by_key(|(table, _)| **table);
+        for (table, uniques) in sorted_constraints {
+            for u in uniques {
+                ops.push(LoggedOp::AddUnique {
+                    txn: synthetic_txn,
+                    table: *table,
+                    index: u.index,
+                    name: u.name.clone(),
+                    columns: u.columns.clone(),
+                    primary: u.primary,
+                });
+            }
+        }
+        let mut sorted_checks: Vec<_> = cat.checks.iter().collect();
+        sorted_checks.sort_by_key(|(table, _)| **table);
+        for (table, checks) in sorted_checks {
+            for c in checks {
+                ops.push(LoggedOp::AddCheck {
+                    txn: synthetic_txn,
+                    table: *table,
+                    name: c.name.clone(),
+                    expr: c.expr.clone(),
+                });
+            }
+        }
+        let mut sorted_fks: Vec<_> = cat.foreign_keys.values().collect();
+        sorted_fks.sort_by(|a, b| a.name.cmp(&b.name));
+        for fk in sorted_fks {
+            ops.push(LoggedOp::AddFk {
+                txn: synthetic_txn,
+                name: fk.name.clone(),
+                child_table: fk.child_table,
+                child_columns: fk.child_columns.clone(),
+                parent_table: fk.parent_table,
+                parent_index: fk.parent_index,
+                child_index: fk.child_index,
+                on_delete: fk.on_delete,
+                on_update: fk.on_update,
+            });
+        }
+        let mut sorted_stats: Vec<_> = cat.stats.iter().collect();
+        sorted_stats.sort_by_key(|(table, _)| **table);
+        for (table, stats) in sorted_stats {
+            ops.push(LoggedOp::SetStats {
+                txn: synthetic_txn,
+                table: *table,
+                stats: stats.clone(),
+            });
+        }
+        let mut sorted_seqs: Vec<_> = seqs.sequences.iter().collect();
+        sorted_seqs.sort_by_key(|(id, _)| **id);
+        for (id, seq) in sorted_seqs {
+            ops.push(LoggedOp::SeqCreate {
+                id: *id,
+                def: seq.def.clone(),
+            });
+            if let Some(value) = seq.current {
+                ops.push(LoggedOp::SeqSet { id: *id, value });
+            }
+        }
+        let mut records: Vec<WalRecord> = ops.iter().map(LoggedOp::to_record).collect();
+        records.push(WalRecord::CommitTxn {
+            txn: TxnId(synthetic_txn),
+        });
+        Ok(records)
+    }
+
+    /// Fold the whole committed state into an on-disk image and truncate the log — so the next
+    /// recovery replays the image plus only the records written after it, and the data
+    /// directory stops growing with write history.
+    ///
+    /// Stop-the-world: every domain is locked for the duration and the engine must be fully
+    /// quiesced — any active transaction refuses the checkpoint (its already-logged operations
+    /// would be truncated away while its commit marker lands after, silently losing the
+    /// transaction). The in-memory engine (no log) also refuses.
+    ///
+    /// The durability order is load-bearing and must never be reordered:
+    ///
+    /// 1. the image is written to `<wal>.ckpt.tmp` and **fsynced**;
+    /// 2. it is atomically **renamed** to `<wal>.ckpt` — only now does an image exist;
+    /// 3. only then is the log **truncated** to zero.
+    ///
+    /// A crash before (2) leaves the old world (full log; the stale tmp is removed at open); a
+    /// crash between (2) and (3) leaves the image plus the full log, and recovery skips every
+    /// log record at or before the image's watermark; a crash during (3) leaves either state.
+    /// The LSN counter is *not* reset by the truncation, so post-checkpoint records always
+    /// sort after the watermark.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "every guard IS the stop-the-world quiesce: all four must be held until the log \
+                  truncate completes, or a transaction could slip in between the image and the \
+                  truncate and be silently dropped"
+    )]
+    pub fn checkpoint(&self) -> Result<()> {
+        // Rank order: commit_gate -> catalog(write) -> txns -> seqs -> wal.
+        let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
+        let cat = self.catalog.write().map_err(|_| poisoned())?;
+        let mut txns = self.txns.lock().map_err(|_| poisoned())?;
+        if !txns.active.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "nusadb-btree: checkpoint requires a quiesced engine, {} transaction(s) \
+                     still active",
+                    txns.active.len()
+                ),
+            )));
+        }
+        // The image's records ride a synthetic transaction with a fresh id, consumed here so
+        // no later live transaction can collide with the image's commit marker.
+        let synthetic_txn = txns.next_txn_id;
+        txns.next_txn_id += 1;
+        let seqs = self.seqs.lock().map_err(|_| poisoned())?;
+        let Some(wal_mutex) = &self.wal else {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "nusadb-btree: the in-memory engine has no log to checkpoint",
+            )));
+        };
+        let mut wal = wal_mutex.lock().map_err(|_| poisoned())?;
+        let covered_lsn = wal.writer.next_lsn().0.saturating_sub(1);
+        let records = Self::emit_image_records(&cat, &seqs, &self.store, synthetic_txn)?;
+        // Phase 1: complete image at the scratch path, fsynced before it may earn its name.
+        let tmp = ckpt_tmp_path(&wal.path);
+        let named = ckpt_path(&wal.path);
+        {
+            let mut file = File::create(&tmp)?;
+            std::io::Write::write_all(&mut file, &ckpt_header_bytes(covered_lsn))?;
+            let mut writer = WalWriter::new(file);
+            for record in &records {
+                writer.append(record)?;
+            }
+            // Drain the writer's append buffer to the file, then fsync — the image is durable
+            // before its rename can make it authoritative.
+            writer.flush()?;
+            writer.get_mut().sync_all()?;
+        }
+        // Phase 2: the atomic publish — a named image is complete by construction. Fsync the
+        // containing directory so the rename itself is durable before phase 3 destroys the only
+        // other copy of the data (a crash after an un-synced rename could otherwise lose both).
+        std::fs::rename(&tmp, &named)?;
+        #[cfg(unix)]
+        if let Some(dir) = wal.path.parent() {
+            if let Ok(dir) = File::open(dir) {
+                let _ = dir.sync_all();
+            }
+        }
+        // Phase 3: the log prefix the image covers is gone. Drain any frames still buffered in the
+        // writer (all ≤ the watermark, so recovery would discard them anyway) so the truncation
+        // does not strand them, then rewind the file. The LSN counter is NOT reset, so suffix
+        // records stay past the watermark.
+        wal.writer.flush()?;
+        let file = wal.writer.get_mut();
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.sync_all()?;
+        Ok(())
+    }
 }
 
 /// Append the commit marker for `txn`, honoring the DST WAL-append fault point. In production

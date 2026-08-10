@@ -20,6 +20,8 @@ dst-fault = []
 [dependencies]
 nusadb-core = { workspace = true }
 nusadb-wal  = { workspace = true }
+crc32fast   = { workspace = true }
+tracing     = { workspace = true }
 
 [dev-dependencies]
 nusadb-btree = { path = ".", features = ["dst-fault"] }

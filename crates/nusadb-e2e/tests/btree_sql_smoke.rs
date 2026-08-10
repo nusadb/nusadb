@@ -537,3 +537,255 @@ fn truncate_keeps_index_named_like_check_and_names_refusing_child() {
         "refusal must name the child: {err}"
     );
 }
+
+// ---- Checkpoint durability --------------------------------------------------------------
+// The checkpoint folds the whole committed state into an on-disk image and truncates the log.
+// Its durability order — image fsynced, atomic rename, then log truncate — must survive a crash
+// at every phase boundary. A real SIGKILL can't be issued in-process, so each crash phase is
+// reproduced by reconstructing the exact on-disk state that crash would leave, then reopening.
+
+/// A committed dataset with an index and a sequence, so a checkpoint image carries every record
+/// family (table, rows, secondary index, PK/UNIQUE/CHECK, sequence).
+fn seed_checkpoint_dataset(engine: &BtreeEngine) {
+    run(
+        engine,
+        "CREATE TABLE t (id SERIAL PRIMARY KEY, tag TEXT UNIQUE, n INT CHECK (n >= 0))",
+    );
+    run(engine, "CREATE INDEX t_n ON t (n)");
+    for i in 0..500 {
+        run(
+            engine,
+            &format!("INSERT INTO t (tag, n) VALUES ('tag{i}', {i})"),
+        );
+    }
+    // A settled delete must NOT appear in the image.
+    run(engine, "DELETE FROM t WHERE n = 0");
+}
+
+/// Assert the recovered engine sees exactly the seeded dataset: 499 live rows, the deleted row
+/// gone, the secondary index answering, and every constraint kind still enforced.
+fn assert_checkpoint_dataset(engine: &BtreeEngine) {
+    assert_eq!(
+        rows(run(engine, "SELECT count(*) FROM t")),
+        vec![vec![Value::Int(499)]]
+    );
+    assert!(
+        rows(run(engine, "SELECT id FROM t WHERE n = 0")).is_empty(),
+        "the settled delete stayed out of the image"
+    );
+    assert_eq!(
+        rows(run(engine, "SELECT tag FROM t WHERE n = 250")),
+        vec![vec![Value::Text("tag250".to_owned())]],
+        "the secondary index answers over recovered rows"
+    );
+    assert!(
+        run_try(engine, "INSERT INTO t (tag, n) VALUES ('tag1', 7)").is_err(),
+        "UNIQUE still enforced"
+    );
+    assert!(
+        run_try(engine, "INSERT INTO t (tag, n) VALUES ('fresh', -1)").is_err(),
+        "CHECK still enforced"
+    );
+    // The SERIAL sequence continues past every id handed out before the checkpoint.
+    run(engine, "INSERT INTO t (tag, n) VALUES ('after', 1)");
+    let ids = rows(run(engine, "SELECT id FROM t WHERE tag = 'after'"));
+    let after_id = ids.first().and_then(|r| r.first());
+    assert!(
+        matches!(after_id, Some(Value::Int(n)) if *n >= 500),
+        "the SERIAL sequence continued past the checkpointed ids: {after_id:?}"
+    );
+}
+
+/// The happy path: checkpoint, then reopen. The image replaces the log, the log actually
+/// shrinks, and the recovered state is exact.
+#[test]
+fn checkpoint_shrinks_the_log_and_recovers_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    let ckpt = dir.path().join("btree.wal.ckpt");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        seed_checkpoint_dataset(&engine);
+        let log_before = std::fs::metadata(&path).unwrap().len();
+        engine.checkpoint().unwrap();
+        let log_after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            log_after < log_before,
+            "log must shrink after checkpoint: {log_before} -> {log_after}"
+        );
+        assert!(ckpt.exists(), "the image exists after checkpoint");
+        assert!(
+            !dir.path().join("btree.wal.ckpt.tmp").exists(),
+            "no scratch image left behind"
+        );
+    } // crash: no clean shutdown.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_checkpoint_dataset(&engine);
+}
+
+/// Crash while writing the image (phase 1): a `.ckpt.tmp` exists, no named `.ckpt`, the full log
+/// is intact. Open must discard the scratch file and replay the whole log — data intact.
+#[test]
+fn checkpoint_crash_while_writing_image_falls_back_to_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        seed_checkpoint_dataset(&engine);
+    }
+    // A half-written scratch image, exactly what a phase-1 crash leaves.
+    std::fs::write(
+        dir.path().join("btree.wal.ckpt.tmp"),
+        b"NCKP\x01\x00\x00\x00garbage",
+    )
+    .unwrap();
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert!(
+        !dir.path().join("btree.wal.ckpt.tmp").exists(),
+        "open removed the orphaned scratch image"
+    );
+    assert!(!dir.path().join("btree.wal.ckpt").exists());
+    assert_checkpoint_dataset(&engine);
+}
+
+/// Crash between the rename and the log truncation (phase 2/3 boundary): the named image AND the
+/// full log both exist. Recovery must load the image and skip every log record at or before its
+/// watermark — no double-apply (which would violate PK uniqueness and inflate the row count).
+#[test]
+fn checkpoint_crash_between_rename_and_truncate_does_not_double_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    let saved_log = dir.path().join("log_before.bin");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        seed_checkpoint_dataset(&engine);
+        // Snapshot the full log, then checkpoint (which truncates it).
+        std::fs::copy(&path, &saved_log).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    // Reconstruct the phase-2/3 crash: image present, full log restored (truncation never ran).
+    std::fs::copy(&saved_log, &path).unwrap();
+    assert!(dir.path().join("btree.wal.ckpt").exists());
+    let engine = BtreeEngine::open(&path).unwrap();
+    // Exactly 499 — a double-apply would show 998 or fail on the PK.
+    assert_checkpoint_dataset(&engine);
+}
+
+/// Two checkpoints back to back, with writes in between, recover correctly — the second image
+/// supersedes the first and the suffix after it replays once.
+#[test]
+fn second_checkpoint_supersedes_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        seed_checkpoint_dataset(&engine);
+        engine.checkpoint().unwrap();
+        run(&engine, "INSERT INTO t (tag, n) VALUES ('extra', 999)");
+        engine.checkpoint().unwrap();
+        run(&engine, "INSERT INTO t (tag, n) VALUES ('suffix', 1000)");
+    }
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM t")),
+        vec![vec![Value::Int(501)]],
+        "499 seeded + 'extra' + 'suffix'"
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT tag FROM t WHERE n = 999")),
+        vec![vec![Value::Text("extra".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT tag FROM t WHERE n = 1000")),
+        vec![vec![Value::Text("suffix".to_owned())]]
+    );
+}
+
+/// Post-checkpoint recovery reads far less of the log than a full-history recovery would. The
+/// proxy for "faster" that a unit test can assert deterministically is bytes-read: the log after
+/// a checkpoint is a tiny fraction of the pre-checkpoint history.
+#[test]
+fn checkpoint_recovery_reads_far_less_than_full_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    let engine = BtreeEngine::open(&path).unwrap();
+    seed_checkpoint_dataset(&engine);
+    for i in 500..2000 {
+        run(
+            &engine,
+            &format!("INSERT INTO t (tag, n) VALUES ('tag{i}', {i})"),
+        );
+    }
+    let history = std::fs::metadata(&path).unwrap().len();
+    engine.checkpoint().unwrap();
+    let after = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        after * 10 < history,
+        "post-checkpoint log ({after}) should be a small fraction of the history ({history})"
+    );
+}
+
+/// A corrupt NAMED image is refused, not silently ignored: falling back to the truncated log
+/// would lose every row the image holds. A flipped byte in the checksummed header (here, the
+/// covered-LSN watermark) must be caught by the header CRC.
+#[test]
+fn checkpoint_corrupt_named_image_refuses_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    let ckpt = dir.path().join("btree.wal.ckpt");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        seed_checkpoint_dataset(&engine);
+        engine.checkpoint().unwrap();
+    }
+    // Flip a bit inside the covered-LSN field (byte 8) of the named image.
+    let mut bytes = std::fs::read(&ckpt).unwrap();
+    bytes[8] ^= 0x01;
+    std::fs::write(&ckpt, &bytes).unwrap();
+    let err = BtreeEngine::open(&path).unwrap_err().to_string();
+    assert!(
+        err.contains("checkpoint image") && err.contains("invalid"),
+        "a corrupt named image must be refused, got: {err}"
+    );
+}
+
+/// A truncated NAMED image (torn record body) is refused too — a named image was fsynced whole
+/// before its rename, so trailing damage is corruption, not a crash artifact.
+#[test]
+fn checkpoint_truncated_named_image_refuses_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    let ckpt = dir.path().join("btree.wal.ckpt");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        seed_checkpoint_dataset(&engine);
+        engine.checkpoint().unwrap();
+    }
+    // Chop the last 32 bytes: header intact (CRC still valid), record body torn.
+    let bytes = std::fs::read(&ckpt).unwrap();
+    std::fs::write(&ckpt, &bytes[..bytes.len() - 32]).unwrap();
+    let err = BtreeEngine::open(&path).unwrap_err().to_string();
+    assert!(
+        err.contains("checkpoint image") && err.contains("invalid"),
+        "a truncated named image must be refused, got: {err}"
+    );
+}
+
+/// `checkpoint()` refuses while a transaction is still open — the quiesce is what lets it truncate
+/// the log safely.
+#[test]
+fn checkpoint_refuses_with_an_active_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = BtreeEngine::open(dir.path().join("btree.wal")).unwrap();
+    let txn = engine
+        .begin(nusadb_core::IsolationLevel::default())
+        .unwrap();
+    let err = engine.checkpoint().unwrap_err().to_string();
+    assert!(
+        err.contains("quiesced") && err.contains("active"),
+        "checkpoint with an open transaction must be refused, got: {err}"
+    );
+    engine.rollback(txn).unwrap();
+    // With the transaction gone it succeeds.
+    engine.checkpoint().unwrap();
+}

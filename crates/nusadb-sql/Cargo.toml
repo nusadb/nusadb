@@ -13,7 +13,6 @@ workspace = true
 
 [dependencies]
 nusadb-core    = { workspace = true }
-nusadb-storage = { workspace = true }
 thiserror      = { workspace = true }
 bytes          = { workspace = true }
 sqlparser      = { workspace = true }

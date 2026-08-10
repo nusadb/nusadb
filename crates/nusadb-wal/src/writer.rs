@@ -107,6 +107,15 @@ impl<W: Write> WalWriter<W> {
         Lsn(self.next_lsn)
     }
 
+    /// Mutable access to the wrapped sink, for maintenance the writer itself does not model —
+    /// a checkpoint truncating the log file and rewinding its cursor. The caller owns keeping
+    /// the sink consistent with the frames already issued; the LSN counter is untouched (it is
+    /// monotonic across a truncation on purpose, so records after a checkpoint always sort
+    /// after the state the checkpoint captured).
+    pub const fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
     /// Frame and append `record`, returning the LSN assigned to it.
     ///
     /// # Errors
