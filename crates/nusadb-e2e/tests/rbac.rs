@@ -44,6 +44,16 @@ impl Catalog for RbacCatalog<'_> {
         self.engine.lookup_table(name).map_err(Into::into)
     }
 
+    fn lookup_table_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<TableSchema>, nusadb_sql::Error> {
+        self.engine
+            .lookup_table_in(schema, name)
+            .map_err(Into::into)
+    }
+
     fn is_superuser(&self) -> bool {
         self.with_txn(|txn| nusadb_sql::rbac::principal(self.engine, txn, self.user))
             .is_ok_and(|p| p.superuser)
@@ -668,4 +678,118 @@ fn table_privileges_view_lists_what_was_granted() {
         }),
         "the grant should be visible through information_schema: {listed:?}"
     );
+}
+
+// ---- Role-administration and metadata regressions ---------------------------------------
+// Six ways the first RBAC cut let a non-superuser reach past its grants. Each test drives the
+// real enforcement path and fails on the pre-fix code.
+
+/// B1 — a `CREATEROLE` role cannot grant itself a SUPERUSER role and thereby become superuser.
+/// Minting a superuser was already blocked; membership was the unguarded second door.
+#[test]
+fn createrole_cannot_escalate_via_membership_in_a_superuser_role() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE admin SUPERUSER");
+    root(&engine, "ALTER ROLE app CREATEROLE");
+    // The escalation attempt is refused...
+    denied_as(&engine, "app", "GRANT admin TO app");
+    // ...and app still cannot read a table it was never granted.
+    denied_as(&engine, "app", "SELECT id FROM orders");
+}
+
+/// B2 — the bootstrap superuser's name is reserved, so no catalog role can be created under it to
+/// inherit ownership of every unowned object.
+#[test]
+fn the_bootstrap_superuser_name_is_reserved() {
+    let engine = fixture();
+    root(&engine, "ALTER ROLE app CREATEROLE");
+    let err = as_role(&engine, "app", "CREATE ROLE \"nusa-root\"").unwrap_err();
+    assert!(
+        err.contains("reserved"),
+        "creating a role named after the bootstrap superuser must be refused: {err}"
+    );
+}
+
+/// B3 — `CREATE TABLE AS` records the creator as owner, so the creator can read its own table.
+#[test]
+fn create_table_as_is_owned_by_its_creator() {
+    let engine = fixture();
+    root(&engine, "GRANT SELECT ON orders TO app");
+    root(&engine, "GRANT CREATE ON SCHEMA public TO app");
+    ok_as(&engine, "app", "CREATE TABLE mine AS SELECT id FROM orders");
+    // Owned by app: app reads it without any further grant.
+    let got = rows(ok_as(&engine, "app", "SELECT id FROM mine"));
+    assert_eq!(got.len(), 2);
+}
+
+/// B4 — `DROP SCHEMA` is owner-or-superuser only: a role cannot drop another's schema.
+#[test]
+fn drop_schema_requires_ownership() {
+    let engine = fixture();
+    root(&engine, "CREATE SCHEMA victim");
+    root(&engine, "CREATE TABLE victim.secrets (id INT)");
+    denied_as(&engine, "app", "DROP SCHEMA victim CASCADE");
+    // The schema survived the denied attempt: the owner can still drop it (a no-op the second
+    // time would error with "schema not found").
+    ok_as(&engine, ROOT, "DROP SCHEMA victim CASCADE");
+}
+
+/// B4 — a schema's own creator (not only a superuser) may drop it, because CREATE SCHEMA now
+/// records ownership.
+#[test]
+fn a_schema_can_be_dropped_by_its_creator() {
+    let engine = fixture();
+    root(&engine, "GRANT CREATE ON SCHEMA public TO app"); // not required, but mirrors real use
+    root(&engine, "ALTER ROLE app CREATEDB");
+    // app creates and then drops its own schema.
+    ok_as(&engine, "app", "CREATE SCHEMA mine");
+    ok_as(&engine, "app", "DROP SCHEMA mine");
+}
+
+/// B4 — `DROP DATABASE` is superuser-only.
+#[test]
+fn drop_database_requires_superuser() {
+    let engine = fixture();
+    denied_as(&engine, "app", "DROP DATABASE nusadb");
+}
+
+/// B6 — `ANALYZE` needs SELECT on the table: it reads every row and persists column values.
+#[test]
+fn analyze_requires_select_privilege() {
+    let engine = fixture();
+    denied_as(&engine, "app", "ANALYZE orders");
+    root(&engine, "GRANT SELECT ON orders TO app");
+    // With SELECT it is allowed.
+    ok_as(&engine, "app", "ANALYZE orders");
+}
+
+/// W7 — `REVOKE` of a non-existent role is a loud error, like its `GRANT` twin, not a silent
+/// no-op.
+#[test]
+fn revoke_of_a_missing_role_is_an_error() {
+    let engine = fixture();
+    let err = as_role(&engine, ROOT, "REVOKE ghost FROM app").unwrap_err();
+    assert!(
+        err.contains("does not exist"),
+        "revoking a missing role should error: {err}"
+    );
+}
+
+/// B5 — dropping a schema CASCADE clears its member tables' grants, so a later same-named table
+/// does not inherit the dropped one's permissions. Without the cleanup a role keeps SELECT on the
+/// reincarnated table.
+#[test]
+fn drop_schema_cascade_clears_member_grants() {
+    let engine = fixture();
+    root(&engine, "CREATE SCHEMA s");
+    root(&engine, "CREATE TABLE s.t (id INT)");
+    root(&engine, "GRANT SELECT ON s.t TO app");
+    // app can read it now.
+    ok_as(&engine, "app", "SELECT id FROM s.t");
+    // Drop the whole schema, then recreate the same names.
+    root(&engine, "DROP SCHEMA s CASCADE");
+    root(&engine, "CREATE SCHEMA s");
+    root(&engine, "CREATE TABLE s.t (id INT)");
+    // The stale grant must be gone: app cannot read the reincarnated table.
+    denied_as(&engine, "app", "SELECT id FROM s.t");
 }

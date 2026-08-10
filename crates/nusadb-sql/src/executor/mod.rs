@@ -3431,6 +3431,14 @@ fn run_create_materialized_view(
             .collect(),
     };
     let table_id = engine.create_table(txn, &def)?;
+    // Own the backing table under the creator, like every other table-creating path.
+    crate::rbac::set_owner(
+        engine,
+        txn,
+        crate::ast::ObjectKind::Table,
+        &format!("{}.{}", def.schema, def.name),
+        &session_ctx::current_user(),
+    )?;
     let rows = execute_op(&p.body, engine, txn)?;
     let schema: Vec<ColumnType> = p.columns.iter().map(|(_, ty)| *ty).collect();
     for row in &rows {
@@ -3562,6 +3570,15 @@ fn run_create_table_as(
             .collect(),
     };
     let table_id = engine.create_table(txn, &def)?;
+    // Record the creator as owner, exactly as `run_create_table` does — without it a CTAS table
+    // falls back to the bootstrap-superuser default and its own creator cannot read it.
+    crate::rbac::set_owner(
+        engine,
+        txn,
+        crate::ast::ObjectKind::Table,
+        &format!("{}.{}", def.schema, def.name),
+        &session_ctx::current_user(),
+    )?;
     // Compute the source rows before inserting; the body never reads the new (empty) table.
     let rows = execute_op(&p.body, engine, txn)?;
     let schema: Vec<ColumnType> = p.columns.iter().map(|(_, ty)| *ty).collect();

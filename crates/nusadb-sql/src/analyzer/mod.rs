@@ -589,11 +589,17 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             name: cs.name,
             if_not_exists: cs.if_not_exists,
         })),
-        ast::Statement::DropSchema(ds) => Ok(LogicalPlan::DropSchema(DropSchemaPlan {
-            name: ds.name,
-            if_exists: ds.if_exists,
-            cascade: ds.cascade,
-        })),
+        ast::Statement::DropSchema(ds) => {
+            // Owner-or-superuser only, like DROP TABLE — otherwise any role empties another's
+            // schema by going one level up. A missing schema under IF EXISTS still no-ops in the
+            // executor; checking here keeps the destructive right off the ungated path.
+            dcl::require_schema_ownership(catalog, &ds.name, "drop")?;
+            Ok(LogicalPlan::DropSchema(DropSchemaPlan {
+                name: ds.name,
+                if_exists: ds.if_exists,
+                cascade: ds.cascade,
+            }))
+        },
         // CREATE/ALTER DATABASE: NusaDB is single-database per data dir, so these are accepted as a
         // compatibility no-op (no catalog work) — the executor just reports success.
         ast::Statement::CreateDatabase(cd) => Ok(LogicalPlan::CreateDatabase(CreateDatabasePlan {
@@ -605,11 +611,16 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         })),
         // DROP DATABASE empties the single database's tables (backing them up first unless FIX); the
         // executor does the work against the engine.
-        ast::Statement::DropDatabase(dd) => Ok(LogicalPlan::DropDatabase(DropDatabasePlan {
-            name: dd.name,
-            if_exists: dd.if_exists,
-            force: dd.force,
-        })),
+        ast::Statement::DropDatabase(dd) => {
+            // Emptying the whole database is superuser-only — the most destructive statement, and
+            // ungated it let any authenticated role wipe the cluster.
+            dcl::require_superuser(catalog, "drop a database")?;
+            Ok(LogicalPlan::DropDatabase(DropDatabasePlan {
+                name: dd.name,
+                if_exists: dd.if_exists,
+                force: dd.force,
+            }))
+        },
         // CREATE/DROP SEQUENCE: the engine path exists; fold the options into a
         // SequenceDef. The executor calls the engine (resolving name → id for DROP).
         ast::Statement::CreateSequence(mut cs) => {

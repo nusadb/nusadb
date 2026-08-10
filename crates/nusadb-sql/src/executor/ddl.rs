@@ -702,6 +702,14 @@ pub(super) fn run_create_schema(
         return Ok(ExecutionResult::SchemaCreated);
     }
     engine.create_schema(txn, &plan.name)?;
+    // Own the schema under its creator so its owner (not only a superuser) can later drop it.
+    crate::rbac::set_owner(
+        engine,
+        txn,
+        crate::ast::ObjectKind::Schema,
+        &plan.name,
+        &super::session_ctx::current_user(),
+    )?;
     Ok(ExecutionResult::SchemaCreated)
 }
 
@@ -712,7 +720,34 @@ pub(super) fn run_drop_schema(
 ) -> Result<ExecutionResult, Error> {
     match engine.lookup_schema(&plan.name)? {
         // RESTRICT (default) refuses a non-empty schema; CASCADE drops its member tables too.
-        Some(id) => engine.drop_schema(txn, id, plan.cascade)?,
+        Some(id) => {
+            // The engine's cascade drops member tables directly, bypassing `run_drop_table`'s
+            // owner/grant cleanup — so clear each member's owner and grants first, then the
+            // schema's own owner. Otherwise a later same-named table (or schema) silently
+            // inherits the dropped one's permissions.
+            if plan.cascade {
+                for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
+                    if schema == plan.name {
+                        let owned = format!("{schema}.{name}");
+                        crate::rbac::clear_owner(
+                            engine,
+                            txn,
+                            crate::ast::ObjectKind::Table,
+                            &owned,
+                        )?;
+                        crate::rbac::delete_grants_on(
+                            engine,
+                            txn,
+                            crate::ast::ObjectKind::Table,
+                            &owned,
+                        )?;
+                    }
+                }
+            }
+            engine.drop_schema(txn, id, plan.cascade)?;
+            crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
+            crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
+        },
         None => {
             if !plan.if_exists {
                 return Err(Error::SchemaNotFound {

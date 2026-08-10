@@ -656,6 +656,9 @@ pub(super) fn analyze_analyze(
     } = an;
     // ANALYZE's name comes from `object_name` (public-only until NS3 opens it here).
     let table = resolve_table(None, &table_name, catalog)?;
+    // ANALYZE reads every row and persists column values (MCV lists, histogram bounds), so it
+    // needs the same SELECT privilege a plain read of the table would.
+    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Select)?;
     let columns = if requested.is_empty() {
         (0..table.columns.len()).collect()
     } else {

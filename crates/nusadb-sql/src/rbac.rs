@@ -151,6 +151,15 @@ pub fn validate_role_name(name: &str) -> Result<(), Error> {
                 .to_owned(),
         ));
     }
+    // The bootstrap superuser's name is what `object_owner` reports for every unowned object, so
+    // a catalog role created under that name would inherit ownership of them all. Reserve it.
+    if name.eq_ignore_ascii_case(crate::BOOTSTRAP_SUPERUSER) {
+        return Err(Error::Unsupported(format!(
+            "`{}` is reserved for the bootstrap superuser and may not be created, altered, or \
+             dropped as a role",
+            crate::BOOTSTRAP_SUPERUSER
+        )));
+    }
     Ok(())
 }
 
@@ -1064,8 +1073,15 @@ pub fn may_administer_role(
     if principal(engine, txn, user)?.superuser {
         return Ok(true);
     }
-    let effective = effective_roles(engine, txn, user)?;
     let roles = all_roles(engine, txn)?;
+    // Granting membership in a SUPERUSER role hands out superuser, exactly what minting one is
+    // (`analyze_create_role` already blocks that for a non-superuser). Membership is the second
+    // door to the same place, so a non-superuser may never administer a superuser role — even
+    // holding CREATEROLE or ADMIN on it.
+    if roles.iter().any(|r| r.name == role && r.superuser) {
+        return Ok(false);
+    }
+    let effective = effective_roles(engine, txn, user)?;
     if roles
         .iter()
         .any(|r| r.create_role && effective.contains(&r.name))

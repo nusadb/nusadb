@@ -88,6 +88,37 @@ pub(super) fn require_table_ownership(
     )))
 }
 
+/// Destroying a schema is its owner's right (or a superuser's), never a grantable privilege —
+/// the same rule as a table. A schema with no recorded owner reads as bootstrap-superuser-owned,
+/// so only a superuser reaches it, which is the safe default for the pre-RBAC `public` schema.
+pub(super) fn require_schema_ownership(
+    catalog: &dyn Catalog,
+    schema: &str,
+    action: &str,
+) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    if catalog.owns_object(ObjectKind::Schema, schema)? {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied(format!(
+        "must be the owner of schema `{schema}` to {action} it"
+    )))
+}
+
+/// Emptying the whole database (`DROP DATABASE`) is a cluster-level operation with no finer
+/// ownership model yet, so it is restricted to a superuser — fail-closed until a database-owner
+/// model exists.
+pub(super) fn require_superuser(catalog: &dyn Catalog, action: &str) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied(format!(
+        "must be a superuser to {action}"
+    )))
+}
+
 /// Resolve a table or sequence name written in a `GRANT` into the canonical `schema.name` the
 /// privilege catalog keys on.
 ///
@@ -306,6 +337,12 @@ pub(super) fn analyze_revoke_role(
     r: ast::RevokeRole,
     catalog: &dyn Catalog,
 ) -> Result<RevokeRolePlan, Error> {
+    // Mirror the GRANT twin: a typo'd role name is a loud error, not a silent no-op.
+    for role in r.roles.iter().chain(&r.members) {
+        if !catalog.role_exists(role)? {
+            return Err(Error::Unsupported(format!("role `{role}` does not exist")));
+        }
+    }
     for role in &r.roles {
         if !catalog.may_administer_role(role)? {
             return Err(Error::PermissionDenied(format!(

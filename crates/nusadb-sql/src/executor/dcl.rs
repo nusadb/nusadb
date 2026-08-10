@@ -212,7 +212,8 @@ fn revoke_one(
     if !dependents.is_empty() {
         if !plan.cascade {
             return Err(Error::Unsupported(format!(
-                "cannot revoke {privilege} on {noun} `{object}` from `{who}`: it has granted that                  privilege to {n} other role(s) — use CASCADE to revoke those too",
+                "cannot revoke {privilege} on {noun} `{object}` from `{who}`: it has granted that \
+                 privilege to {n} other role(s) — use CASCADE to revoke those too",
                 privilege = privilege.as_str(),
                 noun = kind.noun(),
                 who = grantee.as_str(),
