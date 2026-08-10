@@ -1,0 +1,171 @@
+# p5_advanced/merge_not_matched_by_source — the two BY SOURCE / BY TARGET spellings of MERGE.
+#
+# WHEN NOT MATCHED BY TARGET is the standard's explicit spelling of plain WHEN NOT MATCHED (a source
+# row with no counterpart in the target) and inserts. WHEN NOT MATCHED BY SOURCE is its mirror: it
+# fires for a TARGET row no source row matched, and so takes UPDATE/DELETE, not INSERT.
+#
+# Covers: BY TARGET == NOT MATCHED behaviourally, BY SOURCE delete and guarded update, all three
+# clause kinds interacting in one statement, an empty source, the NULL source half a BY SOURCE guard
+# sees, and the multi-match case where a target row is matched by a source row that already matched
+# an earlier target row.
+
+statement ok
+CREATE TABLE target (id INT PRIMARY KEY, val INT)
+
+statement ok
+INSERT INTO target VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE TABLE src (id INT, val INT)
+
+statement ok
+INSERT INTO src VALUES (2, 200), (4, 400)
+
+# BY TARGET is the same clause as plain NOT MATCHED: unmatched source row 4 is inserted, and target
+# rows 1 and 3 (which no source row matched) are left alone — that is the BY SOURCE side's job.
+statement ok
+MERGE INTO target USING src ON target.id = src.id
+WHEN NOT MATCHED BY TARGET THEN INSERT (id, val) VALUES (src.id, src.val)
+
+query II
+SELECT id, val FROM target ORDER BY id
+----
+1 10
+2 20
+3 30
+4 400
+
+# BY SOURCE THEN DELETE: source has 2 and 4, so target rows 1 and 3 go and 2/4 stay.
+statement ok
+MERGE INTO target USING src ON target.id = src.id
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+
+query II
+SELECT id, val FROM target ORDER BY id
+----
+2 20
+4 400
+
+# BY SOURCE THEN UPDATE, with an AND-guard: only the unmatched target rows above the threshold are
+# rewritten; an unmatched row failing the guard is left untouched (no clause fits it).
+statement ok
+DELETE FROM target
+
+statement ok
+INSERT INTO target VALUES (1, 10), (2, 20), (3, 30), (5, 500)
+
+statement ok
+MERGE INTO target USING src ON target.id = src.id
+WHEN NOT MATCHED BY SOURCE AND target.val >= 100 THEN UPDATE SET val = 0
+
+query II
+SELECT id, val FROM target ORDER BY id
+----
+1 10
+2 20
+3 30
+5 0
+
+# All three clause kinds in one statement, the interaction the feature exists for: matched rows are
+# updated, unmatched source rows inserted, unmatched target rows deleted. Source is (2, 200) and
+# (4, 400); target holds 1, 2, 3, 5.
+#   id 2 -> MATCHED       -> val := 200
+#   id 4 -> NOT MATCHED   -> inserted as (4, 400)
+#   id 1, 3, 5 -> NOT MATCHED BY SOURCE -> deleted
+statement ok
+MERGE INTO target USING src ON target.id = src.id
+WHEN MATCHED THEN UPDATE SET val = src.val
+WHEN NOT MATCHED BY TARGET THEN INSERT (id, val) VALUES (src.id, src.val)
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+
+query II
+SELECT id, val FROM target ORDER BY id
+----
+2 200
+4 400
+
+# The BY SOURCE clause is evaluated against a row whose SOURCE half is NULL — the mirror of the NULL
+# target half a NOT MATCHED insert sees. With an empty source every target row is unmatched, so the
+# guard below fires for all of them.
+statement ok
+CREATE TABLE empty_src (id INT, val INT)
+
+statement ok
+MERGE INTO target USING empty_src ON target.id = empty_src.id
+WHEN NOT MATCHED BY SOURCE AND empty_src.val IS NULL THEN UPDATE SET val = -1
+
+query II
+SELECT id, val FROM target ORDER BY id
+----
+2 -1
+4 -1
+
+# A target row matched by a source row that ALREADY matched an earlier target row is still MATCHED —
+# it must not fall into the BY SOURCE clause. Classification stops at the first target row each
+# source row hits, so the second row is only known to be matched by re-probing it against the source.
+# Without that re-probe this MERGE would delete row (1, 11) instead of leaving it.
+statement ok
+CREATE TABLE multi (id INT, val INT)
+
+statement ok
+INSERT INTO multi VALUES (1, 10), (1, 11), (2, 20)
+
+statement ok
+CREATE TABLE msrc (id INT)
+
+statement ok
+INSERT INTO msrc VALUES (1)
+
+statement ok
+MERGE INTO multi USING msrc ON multi.id = msrc.id
+WHEN MATCHED THEN UPDATE SET val = 99
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+
+query II
+SELECT id, val FROM multi ORDER BY val
+----
+1 11
+1 99
+
+# The NULL source half must be as WIDE as the source, not as wide as the target: a BY SOURCE guard
+# reading the LAST column of a source wider than the target has to see NULL, not fall off the row.
+statement ok
+CREATE TABLE narrow (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO narrow VALUES (1), (2)
+
+statement ok
+CREATE TABLE wide_src (id INT, a INT, b INT)
+
+statement ok
+INSERT INTO wide_src VALUES (1, 7, 8)
+
+statement ok
+MERGE INTO narrow USING wide_src ON narrow.id = wide_src.id
+WHEN NOT MATCHED BY SOURCE AND wide_src.b IS NULL THEN DELETE
+
+query I
+SELECT id FROM narrow ORDER BY id
+----
+1
+
+# The same width rule for a derived source, whose columns come from the projection rather than a
+# catalog schema.
+statement ok
+INSERT INTO narrow VALUES (3)
+
+statement ok
+MERGE INTO narrow USING (VALUES (1, 99, 100)) AS ds(id, v, w) ON narrow.id = ds.id
+WHEN NOT MATCHED BY SOURCE AND ds.w IS NULL THEN DELETE
+
+query I
+SELECT id FROM narrow ORDER BY id
+----
+1
+
+# BY SOURCE cannot INSERT — there is no source row to build one from. (The parser layer rejects this
+# before our converter sees it, so this pins the accepted surface, not our own guard.)
+statement error
+MERGE INTO target USING src ON target.id = src.id
+WHEN NOT MATCHED BY SOURCE THEN INSERT (id, val) VALUES (1, 1)

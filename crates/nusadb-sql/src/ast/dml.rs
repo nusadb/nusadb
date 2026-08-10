@@ -220,12 +220,26 @@ pub enum MergeWhen {
         /// The action to apply to the matched target row.
         action: MatchedAction,
     },
-    /// `WHEN NOT MATCHED [AND pred] THEN INSERT (...) VALUES (...)`.
+    /// `WHEN NOT MATCHED [BY TARGET] [AND pred] THEN INSERT (...) VALUES (...)`.
+    ///
+    /// `BY TARGET` is the standard's explicit spelling of plain `NOT MATCHED` — the same clause, so
+    /// both spellings land here.
     NotMatched {
         /// Optional `AND <pred>` guard on the clause.
         pred: Option<Expr>,
         /// The row to insert for an unmatched source row.
         insert: MergeInsert,
+    },
+    /// `WHEN NOT MATCHED BY SOURCE [AND pred] THEN {UPDATE SET ... | DELETE}`.
+    ///
+    /// The mirror of [`NotMatched`](Self::NotMatched): it drives off the *target*, firing for a target
+    /// row no source row matched. There is nothing to insert in that case, so it takes the same
+    /// actions a `WHEN MATCHED` clause does.
+    NotMatchedBySource {
+        /// Optional `AND <pred>` guard on the clause.
+        pred: Option<Expr>,
+        /// The action to apply to the unmatched target row.
+        action: MatchedAction,
     },
 }
 

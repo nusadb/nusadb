@@ -775,30 +775,14 @@ fn analyze_merge_when(
     catalog: &dyn Catalog,
 ) -> Result<MergeWhen, Error> {
     match when {
-        ast::MergeWhen::Matched { pred, action } => {
-            let pred = analyze_predicate(pred, scope, catalog)?;
-            let action = match action {
-                ast::MatchedAction::Update { assignments } => {
-                    let mut typed = Vec::with_capacity(assignments.len());
-                    let mut seen = HashSet::new();
-                    for a in assignments {
-                        let (index, column) = find_column(&table.columns, &a.column, &table.name)?;
-                        if !seen.insert(index) {
-                            return Err(Error::DuplicateColumn { name: a.column });
-                        }
-                        let value = analyze_expr(&a.value, scope, catalog, Some(column.ty))?;
-                        check_assignable(column, &value)?;
-                        typed.push(Assignment {
-                            column: index,
-                            value,
-                        });
-                    }
-                    MergeMatchedAction::Update { assignments: typed }
-                },
-                ast::MatchedAction::Delete => MergeMatchedAction::Delete,
-            };
-            Ok(MergeWhen::Matched { pred, action })
-        },
+        ast::MergeWhen::Matched { pred, action } => Ok(MergeWhen::Matched {
+            pred: analyze_predicate(pred, scope, catalog)?,
+            action: analyze_merge_matched_action(action, table, scope, catalog)?,
+        }),
+        ast::MergeWhen::NotMatchedBySource { pred, action } => Ok(MergeWhen::NotMatchedBySource {
+            pred: analyze_predicate(pred, scope, catalog)?,
+            action: analyze_merge_matched_action(action, table, scope, catalog)?,
+        }),
         ast::MergeWhen::NotMatched { pred, insert } => {
             let pred = analyze_predicate(pred, scope, catalog)?;
             let columns: Vec<usize> = if insert.columns.is_empty() {
@@ -836,5 +820,36 @@ fn analyze_merge_when(
                 values,
             })
         },
+    }
+}
+
+/// Analyze the `THEN {UPDATE SET ... | DELETE}` action of a clause that acts on an existing target
+/// row (`WHEN MATCHED` / `WHEN NOT MATCHED BY SOURCE`). Assignments name target columns and are
+/// type-checked against the combined `target ++ source` scope; a column may be assigned once.
+fn analyze_merge_matched_action(
+    action: ast::MatchedAction,
+    table: &TableSchema,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+) -> Result<MergeMatchedAction, Error> {
+    match action {
+        ast::MatchedAction::Update { assignments } => {
+            let mut typed = Vec::with_capacity(assignments.len());
+            let mut seen = HashSet::new();
+            for a in assignments {
+                let (index, column) = find_column(&table.columns, &a.column, &table.name)?;
+                if !seen.insert(index) {
+                    return Err(Error::DuplicateColumn { name: a.column });
+                }
+                let value = analyze_expr(&a.value, scope, catalog, Some(column.ty))?;
+                check_assignable(column, &value)?;
+                typed.push(Assignment {
+                    column: index,
+                    value,
+                });
+            }
+            Ok(MergeMatchedAction::Update { assignments: typed })
+        },
+        ast::MatchedAction::Delete => Ok(MergeMatchedAction::Delete),
     }
 }

@@ -2170,6 +2170,69 @@ fn merge_not_matched_delete_is_rejected() {
     assert!(parse("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN DELETE").is_err());
 }
 
+#[test]
+fn merge_not_matched_by_target_is_the_same_clause_as_not_matched() {
+    // `BY TARGET` is the standard's explicit spelling of plain `NOT MATCHED` — not a second kind of
+    // clause. Both spellings must produce an identical AST, so assert the whole statement is equal
+    // rather than just eyeballing the variant.
+    let plain = ok("MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)");
+    let by_target = ok("MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED BY TARGET THEN INSERT (id, val) VALUES (s.id, s.val)");
+    assert_eq!(plain, by_target);
+    let ast::Statement::Merge(m) = by_target else {
+        panic!("expected Merge");
+    };
+    let ast::MergeWhen::NotMatched { insert, pred: None } = &m.whens[0] else {
+        panic!("expected an unguarded NOT MATCHED INSERT");
+    };
+    assert_eq!(insert.columns, ["id", "val"]);
+}
+
+#[test]
+fn merge_not_matched_by_source_takes_update_and_delete() {
+    // The mirror clause: it acts on a target row, so it takes the same actions `WHEN MATCHED` does,
+    // guard included.
+    let ast::Statement::Merge(m) = ok("MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE AND t.val > 10 THEN UPDATE SET val = 0 \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE")
+    else {
+        panic!("expected Merge");
+    };
+    assert_eq!(m.whens.len(), 2);
+    let ast::MergeWhen::NotMatchedBySource {
+        pred: Some(_),
+        action: ast::MatchedAction::Update { assignments },
+    } = &m.whens[0]
+    else {
+        panic!("expected a guarded NOT MATCHED BY SOURCE UPDATE");
+    };
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].column, "val");
+    assert!(matches!(
+        m.whens[1],
+        ast::MergeWhen::NotMatchedBySource {
+            pred: None,
+            action: ast::MatchedAction::Delete,
+        }
+    ));
+}
+
+#[test]
+fn merge_not_matched_by_source_insert_is_rejected() {
+    // There is no source row to build an INSERT from, so `BY SOURCE THEN INSERT` is meaningless.
+    // Like `merge_matched_insert_is_rejected`, sqlparser rejects it before our converter — which
+    // also guards against it defensively. This pins the surface, not our own arm. Either way it
+    // must not parse.
+    assert!(
+        parse(
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE THEN INSERT (id) VALUES (1)"
+        )
+        .is_err()
+    );
+}
+
 // --- ORDER BY NULLS FIRST / LAST ------------------------------
 
 #[test]

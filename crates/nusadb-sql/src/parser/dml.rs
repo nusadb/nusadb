@@ -296,36 +296,13 @@ pub(super) fn convert_merge_clause(clause: sql::MergeClause) -> Result<ast::Merg
     } = clause;
     let pred = predicate.map(convert_expr).transpose()?;
     match clause_kind {
-        sql::MergeClauseKind::Matched => {
-            let action = match action {
-                sql::MergeAction::Update(update) => {
-                    // The dialect-specific per-action WHERE / DELETE WHERE clauses (newly modelled
-                    // by sqlparser 0.62) are out of surface.
-                    if update.update_predicate.is_some() || update.delete_predicate.is_some() {
-                        return unsupported("MERGE ... UPDATE with a WHERE / DELETE WHERE clause");
-                    }
-                    if update.assignments.is_empty() {
-                        return unsupported(
-                            "MERGE ... WHEN MATCHED THEN UPDATE with no assignments",
-                        );
-                    }
-                    let assignments = update
-                        .assignments
-                        .into_iter()
-                        .map(convert_assignment)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    ast::MatchedAction::Update { assignments }
-                },
-                sql::MergeAction::Delete { .. } => ast::MatchedAction::Delete,
-                sql::MergeAction::Insert(_) => {
-                    return unsupported(
-                        "MERGE ... WHEN MATCHED THEN INSERT (INSERT requires NOT MATCHED)",
-                    );
-                },
-            };
-            Ok(ast::MergeWhen::Matched { pred, action })
-        },
-        sql::MergeClauseKind::NotMatched => {
+        sql::MergeClauseKind::Matched => Ok(ast::MergeWhen::Matched {
+            pred,
+            action: convert_merge_matched_action(action, "WHEN MATCHED")?,
+        }),
+        // `NOT MATCHED BY TARGET` is the standard's explicit spelling of plain `NOT MATCHED`: both
+        // mean "this source row has no counterpart in the target", so they share one clause shape.
+        sql::MergeClauseKind::NotMatched | sql::MergeClauseKind::NotMatchedByTarget => {
             let insert = match action {
                 sql::MergeAction::Insert(insert) => convert_merge_insert(insert)?,
                 sql::MergeAction::Update(_) | sql::MergeAction::Delete { .. } => {
@@ -336,9 +313,45 @@ pub(super) fn convert_merge_clause(clause: sql::MergeClause) -> Result<ast::Merg
             };
             Ok(ast::MergeWhen::NotMatched { pred, insert })
         },
-        sql::MergeClauseKind::NotMatchedByTarget | sql::MergeClauseKind::NotMatchedBySource => {
-            unsupported("MERGE ... WHEN NOT MATCHED BY TARGET/SOURCE")
+        sql::MergeClauseKind::NotMatchedBySource => Ok(ast::MergeWhen::NotMatchedBySource {
+            pred,
+            action: convert_merge_matched_action(action, "WHEN NOT MATCHED BY SOURCE")?,
+        }),
+    }
+}
+
+/// Convert the `THEN {UPDATE SET ... | DELETE}` action of a clause that acts on an existing target
+/// row — `WHEN MATCHED` and `WHEN NOT MATCHED BY SOURCE`, which differ only in how that row is
+/// selected. `clause` names the clause in the rejection messages.
+fn convert_merge_matched_action(
+    action: sql::MergeAction,
+    clause: &str,
+) -> Result<ast::MatchedAction, Error> {
+    match action {
+        sql::MergeAction::Update(update) => {
+            // The dialect-specific per-action WHERE / DELETE WHERE clauses (newly modelled
+            // by sqlparser 0.62) are out of surface.
+            if update.update_predicate.is_some() || update.delete_predicate.is_some() {
+                return unsupported(&format!(
+                    "MERGE ... {clause} THEN UPDATE with a WHERE / DELETE WHERE clause"
+                ));
+            }
+            if update.assignments.is_empty() {
+                return unsupported(&format!(
+                    "MERGE ... {clause} THEN UPDATE with no assignments"
+                ));
+            }
+            let assignments = update
+                .assignments
+                .into_iter()
+                .map(convert_assignment)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::MatchedAction::Update { assignments })
         },
+        sql::MergeAction::Delete { .. } => Ok(ast::MatchedAction::Delete),
+        sql::MergeAction::Insert(_) => unsupported(&format!(
+            "MERGE ... {clause} THEN INSERT (INSERT requires NOT MATCHED)"
+        )),
     }
 }
 

@@ -1395,7 +1395,7 @@ pub enum MergeWhen {
         /// The action applied to the matched target row.
         action: MergeMatchedAction,
     },
-    /// `WHEN NOT MATCHED [AND pred] THEN INSERT (cols) VALUES (...)`.
+    /// `WHEN NOT MATCHED [BY TARGET] [AND pred] THEN INSERT (cols) VALUES (...)`.
     NotMatched {
         /// Optional `AND` guard (boolean over the `NULL-target ++ source` row).
         pred: Option<TypedExpr>,
@@ -1403,6 +1403,14 @@ pub enum MergeWhen {
         columns: Vec<usize>,
         /// The values to insert, over `target ++ source` (target half `NULL`).
         values: Vec<TypedExpr>,
+    },
+    /// `WHEN NOT MATCHED BY SOURCE [AND pred] THEN {UPDATE SET ... | DELETE}` — fires for a target
+    /// row no source row matched.
+    NotMatchedBySource {
+        /// Optional `AND` guard (boolean over the `target ++ NULL-source` row).
+        pred: Option<TypedExpr>,
+        /// The action applied to the unmatched target row.
+        action: MergeMatchedAction,
     },
 }
 

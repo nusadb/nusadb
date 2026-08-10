@@ -125,7 +125,8 @@ fn count_merge(merge: &ast::Merge, max: &mut usize) {
     count_expr(&merge.on, max);
     for when in &merge.whens {
         match when {
-            ast::MergeWhen::Matched { pred, action } => {
+            ast::MergeWhen::Matched { pred, action }
+            | ast::MergeWhen::NotMatchedBySource { pred, action } => {
                 count_opt(pred.as_ref(), max);
                 if let ast::MatchedAction::Update { assignments } = action {
                     for assignment in assignments {
@@ -568,7 +569,8 @@ fn substitute_merge(merge: &mut ast::Merge, params: &[ast::Value]) -> Result<(),
     substitute_expr(&mut merge.on, params)?;
     for when in &mut merge.whens {
         match when {
-            ast::MergeWhen::Matched { pred, action } => {
+            ast::MergeWhen::Matched { pred, action }
+            | ast::MergeWhen::NotMatchedBySource { pred, action } => {
                 substitute_opt(pred.as_mut(), params)?;
                 if let ast::MatchedAction::Update { assignments } = action {
                     for assignment in assignments {

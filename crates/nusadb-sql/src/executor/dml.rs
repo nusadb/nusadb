@@ -3478,8 +3478,13 @@ fn collect_cascade_closure(
 /// Run `MERGE INTO target USING source ON ... WHEN [NOT] MATCHED ...`. Each source row is
 /// classified against the target by the `ON` condition: a matched row drives the first satisfied
 /// `WHEN MATCHED` clause (UPDATE/DELETE), an unmatched row the first `WHEN NOT MATCHED` (INSERT). A
-/// target row may be affected at most once (a second hit is a cardinality error). The three op sets
-/// are then applied DELETE → UPDATE → INSERT, each with the same constraint/trigger/index/IVM
+/// target row may be affected at most once (a second hit is a cardinality error).
+///
+/// A `WHEN NOT MATCHED BY SOURCE` clause then runs the mirror pass, over target rows no source row
+/// matched (UPDATE/DELETE). Every clause is classified against the pre-merge state — the op sets are
+/// built first and applied after — so one MERGE's own writes never feed its later decisions.
+///
+/// The op sets are applied DELETE → UPDATE → INSERT, each with the same constraint/trigger/index/IVM
 /// enforcement a plain `DELETE`/`UPDATE`/`INSERT` performs (inserts run through [`insert_rows`]).
 #[allow(
     clippy::too_many_lines,
@@ -3490,7 +3495,7 @@ pub(super) fn run_merge(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    use crate::planner::{MergeMatchedAction, MergeWhen};
+    use crate::planner::MergeWhen;
     let target_rows = scan_table(&plan.table, engine, txn)?;
     // A derived `USING (VALUES ...)` / `USING (SELECT ...)` source runs its inlined plan; a plain
     // named source is scanned (mirrors `UPDATE ... FROM` / `DELETE ... USING`).
@@ -3504,11 +3509,22 @@ pub(super) fn run_merge(
     };
     let null_target = vec![ast::Value::Null; plan.table.columns.len()];
 
-    let mut updates: Vec<(Tid, Row, Row)> = Vec::new();
-    let mut deletes: Vec<(Tid, Row)> = Vec::new();
+    let mut ops = MergeOps {
+        updates: Vec::new(),
+        deletes: Vec::new(),
+    };
     // NOT-MATCHED inserts grouped by their target-column list so each group is one `insert_rows` batch.
     let mut insert_groups: HashMap<Vec<usize>, Vec<Row>> = HashMap::new();
     let mut affected: HashSet<Tid> = HashSet::new();
+    // Whether a `NOT MATCHED BY SOURCE` clause is present. Everything that pass needs is gated on
+    // this, so a MERGE without one keeps exactly the cost it had.
+    let has_by_source = plan
+        .whens
+        .iter()
+        .any(|w| matches!(w, MergeWhen::NotMatchedBySource { .. }));
+    // Target rows the ON condition matched, so the `NOT MATCHED BY SOURCE` pass can skip re-probing
+    // them. Only the FIRST hit per source row lands here, so absence does not prove "unmatched".
+    let mut matched_targets: HashSet<Tid> = HashSet::new();
     let mut count = 0usize;
     // Generated columns: a matched UPDATE recomputes them; `fills` is a no-op when none exist.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
@@ -3525,6 +3541,9 @@ pub(super) fn run_merge(
             }
         }
         if let Some((tid, trow)) = hit {
+            if has_by_source {
+                matched_targets.insert(tid);
+            }
             let mut combined = trow.clone();
             combined.extend(srow.iter().cloned());
             for when in &plan.whens {
@@ -3541,27 +3560,15 @@ pub(super) fn run_merge(
                     ))
                     .into());
                 }
-                match action {
-                    MergeMatchedAction::Update { assignments } => {
-                        reject_explicit_generated(
-                            &plan.table,
-                            &fills,
-                            &assignments.iter().map(|a| a.column).collect(),
-                        )?;
-                        let new = finalize_updated_row(
-                            apply_assignments_ctx(
-                                assignments,
-                                &plan.table,
-                                trow.clone(),
-                                &combined,
-                            )?,
-                            &fills,
-                            &plan.table,
-                        )?;
-                        updates.push((tid, trow.clone(), new));
-                    },
-                    MergeMatchedAction::Delete => deletes.push((tid, trow.clone())),
-                }
+                stage_merge_matched_action(
+                    action,
+                    &plan.table,
+                    &fills,
+                    tid,
+                    &trow,
+                    &combined,
+                    &mut ops,
+                )?;
                 count += 1;
                 break;
             }
@@ -3594,10 +3601,73 @@ pub(super) fn run_merge(
         }
     }
 
+    // `WHEN NOT MATCHED BY SOURCE` drives off the target instead of the source: it fires for a target
+    // row that NO source row matched. That is a second O(target x source) probe, hence the gate.
+    if has_by_source {
+        let null_source = vec![ast::Value::Null; plan.source.columns.len()];
+        // Reused across probes so the inner loop does not allocate a row buffer per (target, source)
+        // pair; each iteration rewinds it to the target half and appends the source row.
+        let mut probe: Row = Vec::with_capacity(plan.table.columns.len() + null_source.len());
+        for (tid, trow) in &target_rows {
+            // A row in `matched_targets` is settled. A row absent from it is NOT yet known to be
+            // unmatched — the classify loop stops at the first target row each source row hits, so a
+            // later target row matching that same source row never got recorded. Probe it in full.
+            if matched_targets.contains(tid) {
+                continue;
+            }
+            let mut matched = false;
+            for srow in &source_rows {
+                probe.clear();
+                probe.extend(trow.iter().cloned());
+                probe.extend(srow.iter().cloned());
+                if matches!(eval::eval(&plan.on, &probe)?, ast::Value::Bool(true)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+            // No source row to read, so the source half of the evaluation row is NULL — the mirror of
+            // the NULL target half a `WHEN NOT MATCHED` insert evaluates against.
+            let mut combined = trow.clone();
+            combined.extend(null_source.iter().cloned());
+            for when in &plan.whens {
+                let MergeWhen::NotMatchedBySource { pred, action } = when else {
+                    continue;
+                };
+                if !predicate_matches(pred.as_ref(), &combined)? {
+                    continue;
+                }
+                // No cardinality check here: every entry of `affected` comes from a matched clause,
+                // which requires a hit, and this row had none — so it cannot already be affected.
+                // The `break` below keeps a second BY SOURCE clause from firing on the same row.
+                stage_merge_matched_action(
+                    action,
+                    &plan.table,
+                    &fills,
+                    *tid,
+                    trow,
+                    &combined,
+                    &mut ops,
+                )?;
+                count += 1;
+                break;
+            }
+        }
+    }
+
     // Apply DELETE, then UPDATE, then INSERT — so the inserts' constraint checks see the updated
     // state (a not-matched insert never collides with a row a matched clause just changed/removed).
-    commit_merge_deletes(&plan.table, &deletes, engine, txn)?;
-    commit_merge_updates(&plan.table, &updates, &deletes, &target_rows, engine, txn)?;
+    commit_merge_deletes(&plan.table, &ops.deletes, engine, txn)?;
+    commit_merge_updates(
+        &plan.table,
+        &ops.updates,
+        &ops.deletes,
+        &target_rows,
+        engine,
+        txn,
+    )?;
     for (columns, value_rows) in insert_groups {
         // A `MERGE ... WHEN NOT MATCHED THEN INSERT` row carries concrete evaluated values, never a
         // `DEFAULT` cell — wrap each as `Some` for `insert_rows`.
@@ -3608,6 +3678,48 @@ pub(super) fn run_merge(
         insert_rows(&plan.table, &columns, value_rows, None, false, engine, txn)?;
     }
     Ok(ExecutionResult::Merged(count))
+}
+
+/// The row operations a `MERGE` stages against its target before applying any of them, so no write
+/// of the statement can feed a later decision of the same statement.
+struct MergeOps {
+    /// Matched / not-matched-by-source `UPDATE`s as `(tid, old row, new row)`.
+    updates: Vec<(Tid, Row, Row)>,
+    /// Matched / not-matched-by-source `DELETE`s as `(tid, old row)`.
+    deletes: Vec<(Tid, Row)>,
+}
+
+/// Stage one target-row action (`UPDATE SET ... ` / `DELETE`) into `ops`.
+///
+/// Shared by `WHEN MATCHED` and `WHEN NOT MATCHED BY SOURCE`, which apply the same two actions to an
+/// existing target row and differ only in how the row was selected and what the source half of
+/// `combined` holds (the matched source row, or all `NULL`).
+fn stage_merge_matched_action(
+    action: &crate::planner::MergeMatchedAction,
+    table: &TableSchema,
+    fills: &[Option<super::coldefault::ColumnFill>],
+    tid: Tid,
+    trow: &Row,
+    combined: &Row,
+    ops: &mut MergeOps,
+) -> Result<(), Error> {
+    match action {
+        crate::planner::MergeMatchedAction::Update { assignments } => {
+            reject_explicit_generated(
+                table,
+                fills,
+                &assignments.iter().map(|a| a.column).collect(),
+            )?;
+            let new = finalize_updated_row(
+                apply_assignments_ctx(assignments, table, trow.clone(), combined)?,
+                fills,
+                table,
+            )?;
+            ops.updates.push((tid, trow.clone(), new));
+        },
+        crate::planner::MergeMatchedAction::Delete => ops.deletes.push((tid, trow.clone())),
+    }
+    Ok(())
 }
 
 /// Commit a `MERGE`'s matched-DELETE set with the same enforcement a plain `DELETE` performs:
