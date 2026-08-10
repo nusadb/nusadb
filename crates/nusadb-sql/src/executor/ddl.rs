@@ -19,6 +19,11 @@ pub(super) fn run_show_tables(
     let rows = engine
         .list_tables_as_of(txn)?
         .into_iter()
+        // Hide the engine's own catalogs, matching `information_schema.tables`. This listing had no
+        // such filter, so any feature whose catalog had been created — a policy, a view, a trigger —
+        // already leaked its `nusadb_*` table here; the ownership catalog, which exists as soon as
+        // any table does, only made it unconditional.
+        .filter(|name| !name.starts_with(crate::SYSTEM_TABLE_PREFIX))
         .map(|name| vec![ast::Value::Text(name)])
         .collect();
     Ok(ExecutionResult::Rows {
@@ -217,6 +222,16 @@ pub(super) fn run_create_table(
         &plan.defaults,
         engine,
         txn,
+    )?;
+    // Record who owns the new table. Without this the table would fall back to the "no recorded
+    // owner" reading — owned by the bootstrap superuser — and the role that just created it would
+    // be unable to read its own table.
+    crate::rbac::set_owner(
+        engine,
+        txn,
+        crate::ast::ObjectKind::Table,
+        &format!("{}.{}", def.schema, def.name),
+        &super::session_ctx::current_user(),
     )?;
     Ok(ExecutionResult::Created(id))
 }
@@ -658,6 +673,11 @@ pub(super) fn run_drop_table(
             // re-create a policy of the same name ("policy already exists").
             super::delete_policies_for_table(engine, txn, &plan.table)?;
             super::set_table_rls(engine, txn, &plan.table, false)?;
+            // Ownership and grants go with the table. Leaving them behind would hand a later table
+            // that reused the name the old one's permissions.
+            let owned = format!("{}.{}", plan.schema, plan.table);
+            crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
+            crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
         },
         None => {
             if !plan.if_exists {
@@ -897,8 +917,24 @@ pub(super) fn run_alter_table(
             return Ok(ExecutionResult::Altered);
         },
         // RENAME TO: a catalog-only rename, no row rewrite.
-        AlterTablePlan::RenameTable { table, name } => {
+        AlterTablePlan::RenameTable {
+            table,
+            name,
+            from,
+            schema,
+        } => {
+            let to = format!("{schema}.{name}");
             engine.alter_table(txn, table, &AlterOp::RenameTable { name })?;
+            // Carry ownership and grants to the new name. Without this the renamed table reads as
+            // unowned — which resolves to the bootstrap superuser — locking its owner out, and the
+            // stale rows under the old name would be inherited by whatever is created with it next.
+            crate::rbac::rename_owned_object(
+                engine,
+                txn,
+                crate::ast::ObjectKind::Table,
+                &from,
+                &to,
+            )?;
             return Ok(ExecutionResult::Altered);
         },
         // DROP CONSTRAINT [IF EXISTS]. A missing constraint is a no-op only with IF EXISTS;

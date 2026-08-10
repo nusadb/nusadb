@@ -39,6 +39,7 @@ use crate::planner::{
     TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr, WindowFrame,
 };
 
+mod dcl;
 mod ddl;
 mod dml;
 mod expr;
@@ -172,6 +173,68 @@ pub trait Catalog {
     fn lookup_policies(&self, name: &str) -> Result<Vec<PolicyDef>, Error> {
         let _ = name;
         Ok(Vec::new())
+    }
+
+    // --- Access control -------------------------------------------------
+    //
+    // Each of these defaults to "permitted", matching [`Catalog::is_superuser`]'s default and for
+    // the same reason: a minimal catalog (the analyzer's own unit tests, and any embedding that
+    // has no role catalog) behaves exactly as it did before access control existed. Enforcement
+    // comes from the production adapter in the executor, which answers these from the role and
+    // privilege catalogs. A permissive default is only safe *because* it is unreachable from the
+    // wire: every connection is served by that adapter.
+
+    /// Whether the session may exercise `privilege` on an object.
+    fn has_privilege(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        let _ = (kind, object, privilege);
+        Ok(true)
+    }
+
+    /// Whether the session may pass `privilege` on to another role — ownership, superuser, or a
+    /// grant carrying the grant option.
+    fn may_grant_object(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        let _ = (kind, object, privilege);
+        Ok(true)
+    }
+
+    /// Whether the session may create roles.
+    fn may_create_role(&self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    /// Whether the session may grant membership in, alter, or drop `role`.
+    fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
+        let _ = role;
+        Ok(true)
+    }
+
+    /// Whether the session may `SET ROLE` to `role` — that is, is a member of it.
+    fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
+        let _ = role;
+        Ok(true)
+    }
+
+    /// Whether a role of this name exists.
+    fn role_exists(&self, name: &str) -> Result<bool, Error> {
+        let _ = name;
+        Ok(true)
+    }
+
+    /// Whether the session owns an object — the check `DROP` / `ALTER` needs, which no `GRANT` can
+    /// satisfy.
+    fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
+        let _ = (kind, object);
+        Ok(true)
     }
 }
 
@@ -491,6 +554,24 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             Ok(LogicalPlan::RefreshMaterializedView(name))
         },
         // CREATE/DROP POLICY: validate the policy against its table, then persist it.
+        ast::Statement::Grant(g) => dcl::analyze_grant(g, catalog).map(LogicalPlan::Grant),
+        ast::Statement::Revoke(r) => dcl::analyze_revoke(r, catalog).map(LogicalPlan::Revoke),
+        ast::Statement::GrantRole(g) => {
+            dcl::analyze_grant_role(g, catalog).map(LogicalPlan::GrantRole)
+        },
+        ast::Statement::RevokeRole(r) => {
+            dcl::analyze_revoke_role(r, catalog).map(LogicalPlan::RevokeRole)
+        },
+        ast::Statement::CreateRole(c) => {
+            dcl::analyze_create_role(c, catalog).map(LogicalPlan::CreateRole)
+        },
+        ast::Statement::DropRole(d) => {
+            dcl::analyze_drop_role(d, catalog).map(LogicalPlan::DropRole)
+        },
+        ast::Statement::AlterRole(a) => {
+            dcl::analyze_alter_role(a, catalog).map(LogicalPlan::AlterRole)
+        },
+        ast::Statement::SetRole(s) => dcl::analyze_set_role(s, catalog).map(LogicalPlan::SetRole),
         ast::Statement::CreatePolicy(cp) => analyze_create_policy(cp, catalog),
         ast::Statement::DropPolicy(dp) => {
             require_rls_admin(catalog, "drop a row-level-security policy")?;
@@ -565,6 +646,10 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             // Resolve the target through the search path (an explicit qualifier wins), exactly like a
             // DELETE target, so TRUNCATE reaches a non-public table too.
             let table = resolve_table(t.schema.as_deref(), &t.name, catalog)?;
+            // TRUNCATE is its own privilege, not shorthand for an unrestricted DELETE: it skips
+            // per-row rules, so a role trusted to delete rows one policy at a time is not
+            // automatically trusted to empty the table in one step.
+            dcl::require_table_privilege(catalog, &table, ast::Privilege::Truncate)?;
             if t.cascade {
                 Ok(LogicalPlan::TruncateCascade(TruncateCascadePlan {
                     schema: table.schema,

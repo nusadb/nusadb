@@ -70,6 +70,16 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::RefreshMaterializedView(name) => PhysicalPlan::RefreshMaterializedView(name),
         LogicalPlan::CreatePolicy(p) => PhysicalPlan::CreatePolicy(p),
         LogicalPlan::DropPolicy(p) => PhysicalPlan::DropPolicy(p),
+        // Access-control statements carry no expressions to lower — the analyzer already resolved
+        // every name it could, so the physical form is the logical one.
+        LogicalPlan::Grant(p) => PhysicalPlan::Grant(p),
+        LogicalPlan::Revoke(p) => PhysicalPlan::Revoke(p),
+        LogicalPlan::GrantRole(p) => PhysicalPlan::GrantRole(p),
+        LogicalPlan::RevokeRole(p) => PhysicalPlan::RevokeRole(p),
+        LogicalPlan::CreateRole(p) => PhysicalPlan::CreateRole(p),
+        LogicalPlan::DropRole(p) => PhysicalPlan::DropRole(p),
+        LogicalPlan::AlterRole(p) => PhysicalPlan::AlterRole(p),
+        LogicalPlan::SetRole(p) => PhysicalPlan::SetRole(p),
         LogicalPlan::AlterTable(p) => PhysicalPlan::AlterTable(p),
         LogicalPlan::Insert(p) => PhysicalPlan::Insert(p),
         LogicalPlan::Select(p) => {

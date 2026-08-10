@@ -27,6 +27,12 @@ pub enum InfoSchemaView {
     /// `information_schema.statistics` — one row per (index, key column); an index-metadata view
     /// that backs JDBC `getIndexInfo`.
     Statistics,
+    /// `information_schema.table_privileges` — one row per privilege granted on a table.
+    TablePrivileges,
+    /// `information_schema.applicable_roles` — one row per role membership.
+    ApplicableRoles,
+    /// `information_schema.enabled_roles` — one row per role the current session effectively holds.
+    EnabledRoles,
 }
 
 impl InfoSchemaView {
@@ -41,6 +47,9 @@ impl InfoSchemaView {
             Self::TableConstraints => "table_constraints",
             Self::KeyColumnUsage => "key_column_usage",
             Self::Statistics => "statistics",
+            Self::TablePrivileges => "table_privileges",
+            Self::ApplicableRoles => "applicable_roles",
+            Self::EnabledRoles => "enabled_roles",
         }
     }
 
@@ -129,6 +138,17 @@ impl InfoSchemaView {
                 int("seq_in_index"),
                 text("column_name"),
             ],
+            Self::TablePrivileges => vec![
+                text("grantor"),
+                text("grantee"),
+                text("table_catalog"),
+                text("table_schema"),
+                text("table_name"),
+                text("privilege_type"),
+                text("is_grantable"),
+            ],
+            Self::ApplicableRoles => vec![text("grantee"), text("role_name"), text("is_grantable")],
+            Self::EnabledRoles => vec![text("role_name")],
         };
         TableSchema {
             schema: "public".to_owned(),
@@ -150,6 +170,9 @@ impl InfoSchemaView {
             "information_schema.table_constraints" => Some(Self::TableConstraints),
             "information_schema.key_column_usage" => Some(Self::KeyColumnUsage),
             "information_schema.statistics" => Some(Self::Statistics),
+            "information_schema.table_privileges" => Some(Self::TablePrivileges),
+            "information_schema.applicable_roles" => Some(Self::ApplicableRoles),
+            "information_schema.enabled_roles" => Some(Self::EnabledRoles),
             _ => None,
         }
     }
@@ -229,6 +252,22 @@ pub enum LogicalPlan {
     CreatePolicy(CreatePolicyPlan),
     /// `DROP POLICY [IF EXISTS] name ON table`.
     DropPolicy(DropPolicyPlan),
+    /// `GRANT privileges ON objects TO grantees`.
+    Grant(GrantPlan),
+    /// `REVOKE privileges ON objects FROM grantees`.
+    Revoke(RevokePlan),
+    /// `GRANT role TO member` — role membership.
+    GrantRole(GrantRolePlan),
+    /// `REVOKE role FROM member`.
+    RevokeRole(RevokeRolePlan),
+    /// `CREATE ROLE | USER`.
+    CreateRole(CreateRolePlan),
+    /// `DROP ROLE | USER`.
+    DropRole(DropRolePlan),
+    /// `ALTER ROLE`.
+    AlterRole(AlterRolePlan),
+    /// `SET ROLE` / `RESET ROLE`.
+    SetRole(SetRolePlan),
     /// `ALTER TABLE`.
     AlterTable(AlterTablePlan),
     /// `INSERT`.
@@ -786,6 +825,109 @@ pub struct DropPolicyPlan {
     pub if_exists: bool,
 }
 
+/// The objects a `GRANT`/`REVOKE` names, after the analyzer has resolved what it can.
+///
+/// Explicitly named objects are canonicalized at analysis time, where the `search_path` lives.
+/// The `ALL ... IN SCHEMA` forms cannot be: they mean "the objects that exist when the statement
+/// runs", which only the executor can see, so the schema name is carried through instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantTargetsPlan {
+    /// Named objects, resolved to canonical (schema-qualified where applicable) names.
+    Objects(Vec<crate::ast::GrantObject>),
+    /// `ALL TABLES IN SCHEMA s [, ...]`, expanded at execution.
+    AllTablesInSchemas(Vec<String>),
+    /// `ALL SEQUENCES IN SCHEMA s [, ...]`, expanded at execution.
+    AllSequencesInSchemas(Vec<String>),
+}
+
+/// `GRANT privileges ON objects TO grantees [WITH GRANT OPTION]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantPlan {
+    /// Privileges to grant; `None` is `ALL PRIVILEGES`, expanded per object kind at execution.
+    pub privileges: Option<Vec<crate::ast::Privilege>>,
+    /// The objects the privileges apply to.
+    pub targets: GrantTargetsPlan,
+    /// Who receives them.
+    pub grantees: Vec<crate::ast::Grantee>,
+    /// Whether the grantees may pass the privilege on.
+    pub with_grant_option: bool,
+}
+
+/// `REVOKE [GRANT OPTION FOR] privileges ON objects FROM grantees [CASCADE | RESTRICT]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokePlan {
+    /// Privileges to revoke; `None` is `ALL PRIVILEGES`.
+    pub privileges: Option<Vec<crate::ast::Privilege>>,
+    /// The objects to revoke on.
+    pub targets: GrantTargetsPlan,
+    /// Who loses them.
+    pub grantees: Vec<crate::ast::Grantee>,
+    /// Revoke only the grant option, keeping the privilege.
+    pub grant_option_for: bool,
+    /// Whether dependent grants are revoked too (`CASCADE`) rather than refused (`RESTRICT`).
+    pub cascade: bool,
+}
+
+/// `GRANT role[, ...] TO member[, ...] [WITH ADMIN OPTION]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRolePlan {
+    /// Roles whose privileges flow to the members.
+    pub roles: Vec<String>,
+    /// Roles receiving membership.
+    pub members: Vec<String>,
+    /// Whether the members may grant this membership on.
+    pub with_admin_option: bool,
+}
+
+/// `REVOKE [ADMIN OPTION FOR] role[, ...] FROM member[, ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeRolePlan {
+    /// Roles to remove membership in.
+    pub roles: Vec<String>,
+    /// Roles losing membership.
+    pub members: Vec<String>,
+    /// Revoke only the admin option, keeping the membership.
+    pub admin_option_for: bool,
+}
+
+/// `CREATE ROLE | USER [IF NOT EXISTS] name [options]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRolePlan {
+    /// The role name.
+    pub name: String,
+    /// Whether `IF NOT EXISTS` was given.
+    pub if_not_exists: bool,
+    /// The attributes requested.
+    pub options: crate::ast::RoleOptions,
+    /// `IN ROLE r` — memberships granted immediately.
+    pub in_role: Vec<String>,
+}
+
+/// `DROP ROLE | USER [IF EXISTS] name[, ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropRolePlan {
+    /// Roles to drop.
+    pub names: Vec<String>,
+    /// Whether `IF EXISTS` was given.
+    pub if_exists: bool,
+}
+
+/// `ALTER ROLE name [options]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterRolePlan {
+    /// The role to alter.
+    pub name: String,
+    /// Attributes to change; unmentioned ones keep their stored value.
+    pub options: crate::ast::RoleOptions,
+}
+
+/// `SET ROLE name | NONE` / `RESET ROLE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetRolePlan {
+    /// The role to assume, or `None` to return to the login role.
+    pub role: Option<String>,
+}
+
 /// `CREATE [OR REPLACE] VIEW name AS <select>` — a non-materialized view.
 ///
 /// Only its defining SQL is stored; querying it re-evaluates the body (inlined by the analyzer), so
@@ -936,6 +1078,13 @@ pub enum AlterTablePlan {
         table: nusadb_core::TableId,
         /// The new table name (validated free at analysis time).
         name: String,
+        /// The table's schema, and its name *before* the rename, schema-qualified. Access control
+        /// keys objects by this name, so the executor needs the old spelling to move the ownership
+        /// and grant rows across — otherwise the renamed table reads as unowned (superuser-only)
+        /// and its grants stay behind for whatever next takes the old name.
+        from: String,
+        /// The schema the table lives in; the rename keeps it, so the new key is `schema.name`.
+        schema: String,
     },
 }
 
@@ -1900,6 +2049,22 @@ pub enum PhysicalPlan {
     CreatePolicy(CreatePolicyPlan),
     /// `DROP POLICY [IF EXISTS] name ON table`.
     DropPolicy(DropPolicyPlan),
+    /// `GRANT privileges ON objects TO grantees`.
+    Grant(GrantPlan),
+    /// `REVOKE privileges ON objects FROM grantees`.
+    Revoke(RevokePlan),
+    /// `GRANT role TO member` — role membership.
+    GrantRole(GrantRolePlan),
+    /// `REVOKE role FROM member`.
+    RevokeRole(RevokeRolePlan),
+    /// `CREATE ROLE | USER`.
+    CreateRole(CreateRolePlan),
+    /// `DROP ROLE | USER`.
+    DropRole(DropRolePlan),
+    /// `ALTER ROLE`.
+    AlterRole(AlterRolePlan),
+    /// `SET ROLE` / `RESET ROLE`.
+    SetRole(SetRolePlan),
     /// `ALTER TABLE`.
     AlterTable(AlterTablePlan),
     /// `INSERT`.

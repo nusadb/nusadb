@@ -377,6 +377,11 @@ pub(super) fn analyze_drop_table(
             name: super::qualified_display_opt(dt.schema.as_deref(), &dt.name),
         });
     }
+    // Destroying a table is the owner's right, not a grantable privilege — otherwise a role given
+    // INSERT could drop the table out from under everyone else granted access to it.
+    if let Some(table) = &resolved {
+        super::dcl::require_table_ownership(catalog, table, "drop")?;
+    }
     // Drop where it actually resolved; under IF EXISTS on a missing table fall back to the explicit
     // (or current) schema — the executor then finds nothing and no-ops.
     let schema = resolved
@@ -418,6 +423,9 @@ pub(super) fn analyze_alter_table(
         }
         return Err(Error::TableNotFound { name: display });
     };
+    // Restructuring a table is likewise the owner's right: an ALTER can drop a column, change a
+    // type, or add a constraint that silently invalidates other roles' access.
+    super::dcl::require_table_ownership(catalog, &table, "alter")?;
     let op = match at.action {
         // Row-level-security toggles are SQL-layer catalog changes, not column rewrites — they
         // produce a `SetRls` plan rather than an `AlterColumnOp`. Reserved to superusers, so a
@@ -533,7 +541,7 @@ pub(super) fn analyze_alter_table(
             });
         },
         ast::AlterTableAction::RenameTable { name } => {
-            return analyze_rename_table(table.id, &table.schema, name, catalog);
+            return analyze_rename_table(table.id, &table.schema, &table.name, name, catalog);
         },
     };
     Ok(AlterTablePlan::Apply { table, op })
@@ -546,6 +554,7 @@ pub(super) fn analyze_alter_table(
 fn analyze_rename_table(
     table_id: nusadb_core::TableId,
     schema: &str,
+    current_name: &str,
     name: String,
     catalog: &dyn Catalog,
 ) -> Result<AlterTablePlan, Error> {
@@ -557,6 +566,8 @@ fn analyze_rename_table(
     }
     Ok(AlterTablePlan::RenameTable {
         table: table_id,
+        from: format!("{schema}.{current_name}"),
+        schema: schema.to_owned(),
         name,
     })
 }

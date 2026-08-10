@@ -1,0 +1,671 @@
+//! End-to-end tests for access control: roles, privileges, ownership, and the statements that
+//! manage them.
+//!
+//! These drive the real enforcement path. The catalog below answers privilege questions from the
+//! actual role and privilege catalogs, exactly as the wire server's adapter does — a permissive
+//! stand-in would make every assertion here vacuous, since the `Catalog` trait's defaults grant
+//! everything so that embeddings without a role catalog behave as they did before.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration tests live outside #[cfg(test)], so the test-only lint relaxations in \
+              clippy.toml do not reach them"
+)]
+
+use nusadb_btree::BtreeEngine;
+use nusadb_core::{StorageEngine, TableSchema};
+use nusadb_sql::ast::{ObjectKind, Privilege, Value};
+use nusadb_sql::{Catalog, ExecutionResult, Session, analyze, parse, plan};
+
+/// A catalog that resolves privileges against the real catalogs, one snapshot per question — the
+/// same shape as the per-statement catalog the server builds for a connection.
+struct RbacCatalog<'a> {
+    engine: &'a BtreeEngine,
+    user: &'a str,
+}
+
+impl RbacCatalog<'_> {
+    /// Run `f` against a fresh read snapshot, rolling it back afterwards.
+    fn with_txn<T>(
+        &self,
+        f: impl FnOnce(nusadb_core::TxnId) -> Result<T, nusadb_sql::Error>,
+    ) -> Result<T, nusadb_sql::Error> {
+        let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+        let out = f(txn);
+        let _ = self.engine.rollback(txn);
+        out
+    }
+}
+
+impl Catalog for RbacCatalog<'_> {
+    fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
+        self.engine.lookup_table(name).map_err(Into::into)
+    }
+
+    fn is_superuser(&self) -> bool {
+        self.with_txn(|txn| nusadb_sql::rbac::principal(self.engine, txn, self.user))
+            .is_ok_and(|p| p.superuser)
+    }
+
+    fn current_user(&self) -> String {
+        self.user.to_owned()
+    }
+
+    fn has_privilege(
+        &self,
+        kind: ObjectKind,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::has_privilege(self.engine, txn, self.user, kind, object, privilege)
+        })
+    }
+
+    fn may_grant_object(
+        &self,
+        kind: ObjectKind,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::may_grant(self.engine, txn, self.user, kind, object, privilege)
+        })
+    }
+
+    fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::rbac::may_create_role(self.engine, txn, self.user))
+    }
+
+    fn may_administer_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::may_administer_role(self.engine, txn, self.user, role)
+        })
+    }
+
+    fn may_assume_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            Ok(
+                nusadb_sql::rbac::principal(self.engine, txn, self.user)?.superuser
+                    || nusadb_sql::rbac::effective_roles(self.engine, txn, self.user)?
+                        .contains(role),
+            )
+        })
+    }
+
+    fn role_exists(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            Ok(name == nusadb_sql::BOOTSTRAP_SUPERUSER
+                || nusadb_sql::rbac::lookup_role(self.engine, txn, name)?.is_some())
+        })
+    }
+
+    fn owns_object(&self, kind: ObjectKind, object: &str) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::owns_object(self.engine, txn, self.user, kind, object)
+        })
+    }
+
+    fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::lookup_view_definition(self.engine, txn, name))
+    }
+
+    fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::lookup_view_columns(self.engine, txn, name))
+    }
+}
+
+/// The bootstrap superuser, used for every setup statement.
+const ROOT: &str = "nusa-root";
+
+/// Run `sql` as `user`, returning the result or the error text.
+fn as_role(engine: &BtreeEngine, user: &str, sql: &str) -> Result<ExecutionResult, String> {
+    let stmt = parse(sql).map_err(|e| e.to_string())?;
+    let logical = analyze(stmt, &RbacCatalog { engine, user }).map_err(|e| e.to_string())?;
+    let mut session = Session::new(engine);
+    session.set_current_user(user);
+    session.execute(plan(logical)).map_err(|e| e.to_string())
+}
+
+/// Run `sql` as `user` and expect success.
+fn ok_as(engine: &BtreeEngine, user: &str, sql: &str) -> ExecutionResult {
+    as_role(engine, user, sql).unwrap_or_else(|e| panic!("`{sql}` as {user} should succeed: {e}"))
+}
+
+/// Run a setup statement as the superuser.
+fn root(engine: &BtreeEngine, sql: &str) -> ExecutionResult {
+    ok_as(engine, ROOT, sql)
+}
+
+/// Run `sql` as `user` and expect a permission denial.
+fn denied_as(engine: &BtreeEngine, user: &str, sql: &str) {
+    match as_role(engine, user, sql) {
+        Err(msg) => assert!(
+            msg.contains("permission denied"),
+            "`{sql}` as {user} should be denied, got: {msg}"
+        ),
+        Ok(other) => panic!("`{sql}` as {user} should have been denied, got {other:?}"),
+    }
+}
+
+/// The rows of a `SELECT` result.
+fn rows(result: ExecutionResult) -> Vec<Vec<Value>> {
+    match result {
+        ExecutionResult::Rows { rows, .. } => rows,
+        other => panic!("expected SELECT rows, got {other:?}"),
+    }
+}
+
+/// An engine with one superuser-owned table and a bare `app` role that holds nothing.
+fn fixture() -> BtreeEngine {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE TABLE orders (id INT, total INT)");
+    root(&engine, "INSERT INTO orders VALUES (1, 100), (2, 200)");
+    root(&engine, "CREATE ROLE app LOGIN");
+    engine
+}
+
+#[test]
+fn denies_until_granted_and_denies_again_after_revoke() {
+    let engine = fixture();
+
+    // This is the finding being closed: a connected role used to reach everything.
+    denied_as(&engine, "app", "SELECT id FROM orders");
+    denied_as(&engine, "app", "INSERT INTO orders VALUES (3, 300)");
+
+    root(&engine, "GRANT SELECT ON orders TO app");
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders ORDER BY id")),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+    // One privilege must not imply the others.
+    denied_as(&engine, "app", "INSERT INTO orders VALUES (3, 300)");
+
+    root(&engine, "REVOKE SELECT ON orders FROM app");
+    denied_as(&engine, "app", "SELECT id FROM orders");
+}
+
+#[test]
+fn grant_all_covers_every_table_privilege() {
+    let engine = fixture();
+    root(&engine, "GRANT ALL PRIVILEGES ON orders TO app");
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+    ok_as(&engine, "app", "INSERT INTO orders VALUES (3, 300)");
+    ok_as(&engine, "app", "DELETE FROM orders WHERE id = 3");
+}
+
+#[test]
+fn privileges_flow_through_role_membership() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE reader");
+    root(&engine, "GRANT SELECT ON orders TO reader");
+
+    denied_as(&engine, "app", "SELECT id FROM orders");
+    root(&engine, "GRANT reader TO app");
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+
+    root(&engine, "REVOKE reader FROM app");
+    denied_as(&engine, "app", "SELECT id FROM orders");
+}
+
+#[test]
+fn public_grant_reaches_every_role() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE other LOGIN");
+    root(&engine, "GRANT SELECT ON orders TO PUBLIC");
+    // Including a role never named in the grant.
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+    assert_eq!(
+        rows(ok_as(&engine, "other", "SELECT id FROM orders")).len(),
+        2
+    );
+    root(&engine, "REVOKE SELECT ON orders FROM PUBLIC");
+    denied_as(&engine, "app", "SELECT id FROM orders");
+}
+
+#[test]
+fn holding_a_privilege_does_not_confer_the_right_to_grant_it() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE third LOGIN");
+    root(&engine, "GRANT SELECT ON orders TO app");
+
+    denied_as(&engine, "app", "GRANT SELECT ON orders TO third");
+    denied_as(&engine, "third", "SELECT id FROM orders");
+
+    root(&engine, "GRANT SELECT ON orders TO app WITH GRANT OPTION");
+    ok_as(&engine, "app", "GRANT SELECT ON orders TO third");
+    assert_eq!(
+        rows(ok_as(&engine, "third", "SELECT id FROM orders")).len(),
+        2
+    );
+}
+
+#[test]
+fn revoke_restrict_refuses_dependents_and_cascade_unwinds_them() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE third LOGIN");
+    root(&engine, "GRANT SELECT ON orders TO app WITH GRANT OPTION");
+    ok_as(&engine, "app", "GRANT SELECT ON orders TO third");
+
+    let err = as_role(&engine, ROOT, "REVOKE SELECT ON orders FROM app")
+        .expect_err("RESTRICT must refuse while a dependent grant exists");
+    assert!(
+        err.contains("CASCADE"),
+        "message should name the way out: {err}"
+    );
+    assert_eq!(
+        rows(ok_as(&engine, "third", "SELECT id FROM orders")).len(),
+        2,
+        "a refused revoke must not have partially applied"
+    );
+
+    root(&engine, "REVOKE SELECT ON orders FROM app CASCADE");
+    denied_as(&engine, "app", "SELECT id FROM orders");
+    denied_as(&engine, "third", "SELECT id FROM orders");
+}
+
+#[test]
+fn filtered_writes_need_select_on_top_of_the_write_privilege() {
+    let engine = fixture();
+    root(&engine, "GRANT UPDATE, DELETE ON orders TO app");
+
+    // A filtered write reads rows to decide what to change.
+    denied_as(&engine, "app", "UPDATE orders SET total = 1 WHERE id = 1");
+    denied_as(&engine, "app", "DELETE FROM orders WHERE id = 1");
+    // An unconditional one reads nothing.
+    ok_as(&engine, "app", "UPDATE orders SET total = 1");
+
+    root(&engine, "GRANT SELECT ON orders TO app");
+    ok_as(&engine, "app", "UPDATE orders SET total = 2 WHERE id = 1");
+}
+
+#[test]
+fn truncate_is_not_implied_by_delete() {
+    let engine = fixture();
+    root(&engine, "GRANT DELETE, SELECT ON orders TO app");
+    denied_as(&engine, "app", "TRUNCATE orders");
+    root(&engine, "GRANT TRUNCATE ON orders TO app");
+    ok_as(&engine, "app", "TRUNCATE orders");
+}
+
+#[test]
+fn a_join_needs_select_on_every_table_it_reads() {
+    let engine = fixture();
+    root(&engine, "CREATE TABLE secret (id INT, code INT)");
+    root(&engine, "INSERT INTO secret VALUES (1, 42)");
+    root(&engine, "GRANT SELECT ON orders TO app");
+
+    // Joining must not become a way to read a table the session may not read directly.
+    denied_as(
+        &engine,
+        "app",
+        "SELECT o.id FROM orders o JOIN secret s ON o.id = s.id",
+    );
+    root(&engine, "GRANT SELECT ON secret TO app");
+    assert_eq!(
+        rows(ok_as(
+            &engine,
+            "app",
+            "SELECT o.id FROM orders o JOIN secret s ON o.id = s.id"
+        ))
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn a_creator_owns_its_table_and_needs_no_self_grant() {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE ROLE app LOGIN");
+    ok_as(&engine, "app", "CREATE TABLE mine (id INT)");
+    ok_as(&engine, "app", "INSERT INTO mine VALUES (1)");
+    assert_eq!(rows(ok_as(&engine, "app", "SELECT id FROM mine")).len(), 1);
+}
+
+#[test]
+fn dropping_a_table_takes_its_grants_with_it() {
+    let engine = fixture();
+    root(&engine, "GRANT SELECT ON orders TO app");
+    root(&engine, "DROP TABLE orders");
+    root(&engine, "CREATE TABLE orders (id INT, total INT)");
+    // The recreated table is a different object; the old grant must not carry over.
+    denied_as(&engine, "app", "SELECT id FROM orders");
+}
+
+#[test]
+fn dropping_and_altering_need_ownership_which_no_grant_confers() {
+    let engine = fixture();
+    // Every table privilege there is, still not enough: DROP and ALTER are the owner's rights.
+    root(
+        &engine,
+        "GRANT ALL PRIVILEGES ON orders TO app WITH GRANT OPTION",
+    );
+    denied_as(&engine, "app", "DROP TABLE orders");
+    denied_as(&engine, "app", "ALTER TABLE orders ADD COLUMN note TEXT");
+
+    // On a table it owns, both work without any grant at all.
+    ok_as(&engine, "app", "CREATE TABLE mine (id INT)");
+    ok_as(&engine, "app", "ALTER TABLE mine ADD COLUMN note TEXT");
+    ok_as(&engine, "app", "DROP TABLE mine");
+}
+
+#[test]
+fn ownership_reaches_through_role_membership() {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE ROLE team");
+    root(&engine, "CREATE ROLE app LOGIN");
+    root(&engine, "GRANT team TO app");
+    ok_as(&engine, "team", "CREATE TABLE shared (id INT)");
+    // `app` inherits `team`, so it inherits what `team` owns.
+    ok_as(&engine, "app", "ALTER TABLE shared ADD COLUMN note TEXT");
+    ok_as(&engine, "app", "DROP TABLE shared");
+}
+
+#[test]
+fn a_view_is_not_a_way_around_the_check_on_its_base_table() {
+    let engine = fixture();
+    root(&engine, "CREATE VIEW order_ids AS SELECT id FROM orders");
+
+    // A view's body is re-analyzed as the querying role, so reading through it needs the same
+    // privilege reading the table directly would. This is the stricter of the two readings a SQL
+    // engine can take (the alternative runs the body as the view's owner), and it is the one that
+    // cannot turn a view into a privilege-laundering step.
+    denied_as(&engine, "app", "SELECT id FROM order_ids");
+
+    root(&engine, "GRANT SELECT ON orders TO app");
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM order_ids")).len(),
+        2
+    );
+}
+
+// === Regressions for the bypasses the pre-push audit found ===============
+
+#[test]
+fn a_nested_body_does_not_run_as_superuser() {
+    let engine = fixture();
+    // The catalog used to analyze a `DO` / `CALL` / trigger body took the trait's permissive
+    // defaults, so `is_superuser()` was true inside it and the body could write the role catalog —
+    // handing any authenticated role a superuser row. The body must be analyzed as the same role
+    // that reached it.
+    let err = as_role(
+        &engine,
+        "app",
+        "DO $$ INSERT INTO nusadb_roles VALUES ('app','t','t','t','t','t') $$",
+    )
+    .expect_err("a nested body must not reach the role catalog");
+    assert!(
+        !err.is_empty(),
+        "writing the role catalog from a nested body must be refused"
+    );
+    // The decisive check: `app` must still not be a superuser afterwards.
+    denied_as(&engine, "app", "SELECT id FROM orders");
+}
+
+#[test]
+fn merge_needs_privileges_on_its_target() {
+    let engine = fixture();
+    // MERGE reads the target through its ON condition and writes it through the WHEN arms, but had
+    // no check at all on the target — only on the USING source.
+    denied_as(
+        &engine,
+        "app",
+        "MERGE INTO orders t USING (VALUES (1)) s(x) ON t.id = s.x \
+         WHEN MATCHED THEN UPDATE SET total = 0",
+    );
+    denied_as(
+        &engine,
+        "app",
+        "MERGE INTO orders t USING (VALUES (9)) s(x) ON t.id = s.x \
+         WHEN NOT MATCHED THEN INSERT (id, total) VALUES (9, 9)",
+    );
+
+    // SELECT alone is not enough — the write side still needs its own privilege.
+    root(&engine, "GRANT SELECT ON orders TO app");
+    denied_as(
+        &engine,
+        "app",
+        "MERGE INTO orders t USING (VALUES (1)) s(x) ON t.id = s.x \
+         WHEN MATCHED THEN UPDATE SET total = 0",
+    );
+
+    root(&engine, "GRANT UPDATE ON orders TO app");
+    ok_as(
+        &engine,
+        "app",
+        "MERGE INTO orders t USING (VALUES (1)) s(x) ON t.id = s.x \
+         WHEN MATCHED THEN UPDATE SET total = 0",
+    );
+}
+
+#[test]
+fn renaming_a_table_carries_its_ownership_and_grants() {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE ROLE app LOGIN");
+    root(&engine, "CREATE ROLE reader LOGIN");
+    ok_as(&engine, "app", "CREATE TABLE t (id INT)");
+    ok_as(&engine, "app", "GRANT SELECT ON t TO reader");
+
+    ok_as(&engine, "app", "ALTER TABLE t RENAME TO t2");
+    // The owner must not be locked out of its own table by renaming it, and the grant must follow.
+    ok_as(&engine, "app", "INSERT INTO t2 VALUES (1)");
+    assert_eq!(rows(ok_as(&engine, "reader", "SELECT id FROM t2")).len(), 1);
+
+    // And the vacated name must not carry the old permissions to whatever takes it next.
+    root(&engine, "CREATE TABLE t (id INT)");
+    denied_as(&engine, "reader", "SELECT id FROM t");
+}
+
+#[test]
+fn a_cascade_revoke_terminates_on_a_grantor_cycle() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE a LOGIN");
+    root(&engine, "CREATE ROLE b LOGIN");
+    root(&engine, "GRANT SELECT ON orders TO a WITH GRANT OPTION");
+    ok_as(
+        &engine,
+        "a",
+        "GRANT SELECT ON orders TO b WITH GRANT OPTION",
+    );
+    // Re-granting to `a` re-parents `a`'s row to `b`, closing a grantor cycle a <-> b. The cascade
+    // walked that loop forever and overflowed the stack — an abort, not a catchable error.
+    ok_as(
+        &engine,
+        "b",
+        "GRANT SELECT ON orders TO a WITH GRANT OPTION",
+    );
+
+    root(&engine, "REVOKE SELECT ON orders FROM a CASCADE");
+    denied_as(&engine, "a", "SELECT id FROM orders");
+    denied_as(&engine, "b", "SELECT id FROM orders");
+}
+
+#[test]
+fn a_cached_plan_is_not_reused_across_a_role_switch() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE weak LOGIN");
+    root(&engine, "GRANT SELECT ON orders TO app");
+    root(&engine, "GRANT weak TO app");
+
+    // Planning as `app` (which may read) must not leave a plan that `weak` (which may not) can be
+    // served. Both directions are checked through the same statement text.
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+    denied_as(&engine, "weak", "SELECT id FROM orders");
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+}
+
+#[test]
+fn set_role_requires_membership() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE elevated");
+    // Otherwise SET ROLE walks straight past every other check.
+    denied_as(&engine, "app", "SET ROLE elevated");
+    root(&engine, "GRANT elevated TO app");
+    ok_as(&engine, "app", "SET ROLE elevated");
+}
+
+#[test]
+fn membership_cycles_are_refused() {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE ROLE a");
+    root(&engine, "CREATE ROLE b");
+    root(&engine, "CREATE ROLE c");
+
+    // Self-membership.
+    assert!(
+        as_role(&engine, ROOT, "GRANT a TO a").is_err(),
+        "a role may not be made a member of itself"
+    );
+
+    // The two-role loop, which the first version of the check walked past.
+    root(&engine, "GRANT a TO b");
+    let err =
+        as_role(&engine, ROOT, "GRANT b TO a").expect_err("a membership cycle must be refused");
+    assert!(err.contains("cycle"), "message should say why: {err}");
+
+    // And a longer chain: a -> b -> c, so c must not flow back into a.
+    root(&engine, "GRANT b TO c");
+    assert!(
+        as_role(&engine, ROOT, "GRANT c TO a").is_err(),
+        "a three-role cycle must be refused too"
+    );
+
+    // A diamond is not a cycle: both b and c already inherit from a, and c inheriting from b as
+    // well keeps the graph acyclic. Refusing this would be over-strict.
+    root(&engine, "CREATE ROLE d");
+    root(&engine, "GRANT a TO d");
+    root(&engine, "GRANT d TO c");
+}
+
+#[test]
+fn creating_roles_requires_authority_and_is_not_a_path_to_superuser() {
+    let engine = fixture();
+    denied_as(&engine, "app", "CREATE ROLE sneaky");
+
+    root(&engine, "ALTER ROLE app CREATEROLE");
+    ok_as(&engine, "app", "CREATE ROLE ordinary");
+    // A CREATEROLE role that could mint a superuser would hold superuser authority by two steps.
+    denied_as(&engine, "app", "CREATE ROLE godmode SUPERUSER");
+}
+
+#[test]
+fn a_wildcard_grant_skips_the_access_control_catalogs() {
+    let engine = fixture();
+    root(
+        &engine,
+        "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app",
+    );
+    // The wildcard reached the user's table...
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+
+    // ...but a grantee that could write the privilege catalog could rewrite its own permissions.
+    let txn = engine
+        .begin(nusadb_core::IsolationLevel::default())
+        .expect("begin");
+    let grants = nusadb_sql::rbac::all_grants(&engine, txn).expect("read grants");
+    let _ = engine.rollback(txn);
+    assert!(
+        !grants
+            .iter()
+            .any(|g| g.object.ends_with(nusadb_sql::rbac::PRIVILEGE_CATALOG)),
+        "a wildcard grant must not cover the privilege catalog itself"
+    );
+}
+
+#[test]
+fn superuser_bypasses_every_check_directly_and_through_membership() {
+    let engine = fixture();
+    // The bootstrap user holds nothing explicitly and still reaches everything.
+    assert_eq!(rows(ok_as(&engine, ROOT, "SELECT id FROM orders")).len(), 2);
+    root(&engine, "CREATE ROLE admin SUPERUSER");
+    root(&engine, "GRANT admin TO app");
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+}
+
+#[test]
+fn a_role_cannot_be_dropped_while_it_owns_objects() {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE ROLE app LOGIN");
+    ok_as(&engine, "app", "CREATE TABLE mine (id INT)");
+    let err = as_role(&engine, ROOT, "DROP ROLE app")
+        .expect_err("dropping an owner would orphan its tables");
+    assert!(err.contains("still owns"), "message should say why: {err}");
+    root(&engine, "DROP TABLE mine");
+    root(&engine, "DROP ROLE app");
+}
+
+#[test]
+fn public_is_reserved_and_password_is_refused_rather_than_ignored() {
+    let engine = BtreeEngine::new();
+    // A real role named `public` would make `GRANT ... TO public` ambiguous, in the direction of
+    // more access.
+    assert!(
+        as_role(&engine, ROOT, "CREATE ROLE public").is_err(),
+        "`public` must not be creatable as a real role"
+    );
+    // A password set here would never be checked at login.
+    let err = as_role(&engine, ROOT, "CREATE ROLE app LOGIN PASSWORD 'x'")
+        .expect_err("PASSWORD must be refused, not silently dropped");
+    assert!(
+        err.contains("auth-user"),
+        "message should point at the real knob: {err}"
+    );
+}
+
+#[test]
+fn revoking_the_grant_option_keeps_the_privilege() {
+    let engine = fixture();
+    root(&engine, "GRANT SELECT ON orders TO app WITH GRANT OPTION");
+    root(&engine, "REVOKE GRANT OPTION FOR SELECT ON orders FROM app");
+    // The privilege itself survives; only the right to pass it on is gone.
+    assert_eq!(
+        rows(ok_as(&engine, "app", "SELECT id FROM orders")).len(),
+        2
+    );
+    root(&engine, "CREATE ROLE third LOGIN");
+    denied_as(&engine, "app", "GRANT SELECT ON orders TO third");
+}
+
+#[test]
+fn table_privileges_view_lists_what_was_granted() {
+    let engine = fixture();
+    root(&engine, "GRANT SELECT ON orders TO app");
+    let listed = rows(ok_as(
+        &engine,
+        ROOT,
+        "SELECT grantee, table_name, privilege_type FROM information_schema.table_privileges",
+    ));
+    assert!(
+        listed.iter().any(|r| {
+            r == &[
+                Value::Text("app".to_owned()),
+                Value::Text("orders".to_owned()),
+                Value::Text("SELECT".to_owned()),
+            ]
+        }),
+        "the grant should be visible through information_schema: {listed:?}"
+    );
+}

@@ -179,7 +179,7 @@ fn exec_one(
         ScriptStmt::Block(block) => exec_block(block, env, params, engine, txn),
         ScriptStmt::Sql(sql) => {
             let bound = bind((**sql).clone(), env, params, engine, txn)?;
-            let logical = crate::analyze(bound, &ExecCatalog { engine, txn })?;
+            let logical = crate::analyze(bound, &ExecCatalog::new(engine, txn))?;
             super::dispatch(crate::plan(logical), engine, txn)?;
             Ok(Flow::Normal)
         },
@@ -197,7 +197,7 @@ fn eval_value(
 ) -> Result<ast::Value, Error> {
     let select = wrap_select(expr.clone());
     let bound = bind(select, env, params, engine, txn)?;
-    let logical = crate::analyze(bound, &ExecCatalog { engine, txn })?;
+    let logical = crate::analyze(bound, &ExecCatalog::new(engine, txn))?;
     match super::dispatch(crate::plan(logical), engine, txn)? {
         ExecutionResult::Rows { rows, .. } => Ok(rows
             .into_iter()

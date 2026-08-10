@@ -19,11 +19,14 @@
 //! The types are grouped into per-concern submodules (ADR 007: `statement`, `ddl`, `dml`,
 //! `query`, `expr`) and re-exported here so consumers keep using `crate::ast::*` unchanged.
 
+mod dcl;
 mod ddl;
 mod dml;
 mod expr;
 mod query;
 mod statement;
+#[allow(clippy::wildcard_imports)]
+pub use dcl::*;
 #[allow(clippy::wildcard_imports)]
 pub use ddl::*;
 #[allow(clippy::wildcard_imports)]

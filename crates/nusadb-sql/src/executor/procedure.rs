@@ -135,7 +135,7 @@ pub(super) fn run_call(
         // variables, so OUT parameters come back NULL.
         for stmt in crate::parser::parse_statements(&body)? {
             let bound = crate::params::substitute_values(stmt, &plan.args)?;
-            let logical = crate::analyze(bound, &ExecCatalog { engine, txn })?;
+            let logical = crate::analyze(bound, &ExecCatalog::new(engine, txn))?;
             super::dispatch(crate::plan(logical), engine, txn)?;
         }
         let values = vec![ast::Value::Null; out_params.len()];
@@ -157,7 +157,7 @@ pub(super) fn run_do(
         super::script::run_block(&block, &[], engine, txn)?;
     } else {
         for stmt in crate::parser::parse_statements(body)? {
-            let logical = crate::analyze(stmt, &ExecCatalog { engine, txn })?;
+            let logical = crate::analyze(stmt, &ExecCatalog::new(engine, txn))?;
             super::dispatch(crate::plan(logical), engine, txn)?;
         }
     }

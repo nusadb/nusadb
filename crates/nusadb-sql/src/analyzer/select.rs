@@ -260,10 +260,11 @@ fn resolve_join_input(
             )),
         };
     }
-    Ok((
-        resolve_table(table.schema.as_deref(), &table.name, catalog)?,
-        None,
-    ))
+    // The right side of a JOIN is read like any other source, so it needs SELECT in its own right —
+    // otherwise joining to a table would be a way to read one the session may not read directly.
+    let schema = resolve_table(table.schema.as_deref(), &table.name, catalog)?;
+    super::dcl::require_table_privilege(catalog, &schema, crate::ast::Privilege::Select)?;
+    Ok((schema, None))
 }
 
 /// Resolve a single auxiliary relation for `UPDATE ... FROM` / `DELETE ... USING`: a named
@@ -301,6 +302,10 @@ pub(super) fn resolve_aux_relation(
                     name: qualified_display_opt(base.schema.as_deref(), &base.name),
                 }
             })?;
+        // An `UPDATE ... FROM` / `DELETE ... USING` source is read, so it needs SELECT — the write
+        // privilege on the statement's target says nothing about the tables it reads to decide
+        // what to write.
+        super::dcl::require_table_privilege(catalog, &schema, crate::ast::Privilege::Select)?;
         Ok((schema, None))
     }
 }
@@ -366,6 +371,10 @@ pub(super) fn resolve_from(
         if let Some(schema) =
             lookup_table_ref(from.base.schema.as_deref(), &from.base.name, catalog)?
         {
+            // Reading a table needs SELECT on it. This precedes row-level security, which narrows
+            // *which rows* a permitted read returns — a session with no SELECT privilege never
+            // gets as far as having rows filtered.
+            super::dcl::require_table_privilege(catalog, &schema, crate::ast::Privilege::Select)?;
             // Row-level security for the base table is applied by `apply_rls` once the WHERE
             // filter is built (single-table queries inject policy predicates; joins are refused).
             (schema, None)

@@ -887,8 +887,15 @@ where
                     // COPY ... FROM STDIN / TO STDOUT drives the COPY sub-protocol. COPY does not pass
                     // through the RLS-aware analyzer, so refuse it on an RLS-enabled table for a
                     // non-superuser — fail closed, never bypass the policy.
-                    let outcome = if let Some(msg) = copy_rls_block(engine.as_ref(), &copy.table, &user)
-                    {
+                    // Checked as the role the session currently acts as, so a `SET ROLE` does not
+                    // leave COPY evaluating against the login role's privileges.
+                    let copy_actor = effective_user(&user, &settings);
+                    let outcome = if let Some(msg) = copy_rls_block(
+                        engine.as_ref(),
+                        &copy.table,
+                        &copy_actor,
+                        copy.direction,
+                    ) {
                         Err(msg)
                     } else {
                         match copy.direction {
@@ -1912,8 +1919,33 @@ where
 /// `nusadb_*` namespace is likewise refused here, or COPY would be the one remaining path a user
 /// could read or rewrite the policy/RLS catalogs through. Returns an error message to relay, or
 /// `None` to proceed. If the RLS flag cannot be read, it fails closed.
-fn copy_rls_block(engine: &dyn StorageEngine, table: &str, user: &str) -> Option<String> {
-    if user == nusadb_sql::BOOTSTRAP_SUPERUSER {
+fn copy_rls_block(
+    engine: &dyn StorageEngine,
+    table: &str,
+    user: &str,
+    direction: nusadb_sql::ast::CopyDirection,
+) -> Option<String> {
+    let Ok(txn) = engine.begin(IsolationLevel::default()) else {
+        return Some("could not verify access for COPY".to_owned());
+    };
+    let verdict = copy_access_verdict(engine, txn, table, user, direction);
+    let _ = engine.rollback(txn);
+    verdict
+}
+
+/// The access decision for a `COPY`, evaluated under `txn`. Split out so the transaction is closed
+/// on every path.
+fn copy_access_verdict(
+    engine: &dyn StorageEngine,
+    txn: nusadb_core::TxnId,
+    table: &str,
+    user: &str,
+    direction: nusadb_sql::ast::CopyDirection,
+) -> Option<String> {
+    // Superuser is read from the role catalog rather than from the bootstrap name alone, so a role
+    // holding the attribute through a membership is recognised too. A failed read answers "not a
+    // superuser", which is the restrictive direction.
+    if nusadb_sql::rbac::principal(engine, txn, user).is_ok_and(|p| p.superuser) {
         return None;
     }
     if table.starts_with(nusadb_sql::SYSTEM_TABLE_PREFIX) {
@@ -1923,12 +1955,38 @@ fn copy_rls_block(engine: &dyn StorageEngine, table: &str, user: &str) -> Option
             nusadb_sql::SYSTEM_TABLE_PREFIX
         ));
     }
-    let Ok(txn) = engine.begin(IsolationLevel::default()) else {
-        return Some("could not verify row-level security for COPY".to_owned());
+    // COPY never reaches the analyzer, so the privilege check the analyzer would have raised has to
+    // be raised here instead — otherwise COPY is a complete read/write bypass of the feature these
+    // privileges exist to provide. Reading needs SELECT, loading needs INSERT.
+    let privilege = match direction {
+        nusadb_sql::ast::CopyDirection::To => nusadb_sql::ast::Privilege::Select,
+        nusadb_sql::ast::CopyDirection::From => nusadb_sql::ast::Privilege::Insert,
     };
-    let enabled = nusadb_sql::rls_table_enabled(engine, txn, table);
-    let _ = engine.rollback(txn);
-    match enabled {
+    // The privilege catalog keys tables by canonical `schema.name`; an unqualified COPY resolves
+    // against the default namespace, so check it under the same key.
+    let object = if table.contains('.') {
+        table.to_owned()
+    } else {
+        format!("{}.{table}", nusadb_core::engine::PUBLIC_SCHEMA)
+    };
+    match nusadb_sql::rbac::has_privilege(
+        engine,
+        txn,
+        user,
+        nusadb_sql::ast::ObjectKind::Table,
+        &object,
+        privilege,
+    ) {
+        Ok(true) => {},
+        Ok(false) => {
+            return Some(format!(
+                "permission denied: {} on table `{table}`",
+                privilege.as_str()
+            ));
+        },
+        Err(_) => return Some("could not verify access for COPY".to_owned()),
+    }
+    match nusadb_sql::rls_table_enabled(engine, txn, table) {
         Ok(false) => None,
         Ok(true) => Some(format!(
             "row-level security is enabled on `{table}`; COPY is not yet supported under RLS, so it \
@@ -2161,6 +2219,18 @@ fn run_query_streaming(
         savepoint @ (Statement::Savepoint(_)
         | Statement::RollbackToSavepoint(_)
         | Statement::ReleaseSavepoint(_)) => Some(savepoint_txn(engine, savepoint, state)),
+        // `SET ROLE` produces no rows either, and must land on the same settings store the
+        // buffered path writes — otherwise which of the two paths served the statement would
+        // decide whether the switch took effect. Authorized as the login role (see the buffered
+        // arm for why), and recorded only once the executor has approved it.
+        Statement::SetRole(_) => {
+            let (result, new_state) =
+                run_stmt_in_state(engine, database, stmt.clone(), user, state, settings);
+            if let Ok(ExecutionResult::RoleSet(role)) = &result {
+                record_assumed_role(settings, role.as_deref());
+            }
+            Some((result, new_state))
+        },
         _ => None,
     };
     if let Some((result, new_state)) = control {
@@ -2208,11 +2278,14 @@ fn run_query_streaming(
         array_elements,
         flushed: false,
     };
+    // Everything past the control statements runs as the assumed role when `SET ROLE` set one, so
+    // a switched session's reads and writes are checked against the role it switched to.
+    let acting = effective_user(user, settings);
     let run = stream_stmt_in_state(
         engine,
         stmt,
         sql,
-        user,
+        &acting,
         state,
         &mut sink,
         &mut plan_cache,
@@ -3172,7 +3245,21 @@ fn run_query_txn(
             stamp_transaction_isolation(&mut snapshot, state);
             (show_result(&name, &snapshot), state)
         },
-        other => run_stmt_in_state(engine, database, other, user, state, settings),
+        // `SET ROLE` is authorized against the role the connection *logged in as*, never against a
+        // role it has already assumed — otherwise switching to a weaker role would be one-way, and
+        // a chain of switches could reach somewhere the login role was never a member of.
+        set_role @ Statement::SetRole(_) => {
+            let (result, state) =
+                run_stmt_in_state(engine, database, set_role, user, state, settings);
+            if let Ok(ExecutionResult::RoleSet(role)) = &result {
+                record_assumed_role(settings, role.as_deref());
+            }
+            (result, state)
+        },
+        other => {
+            let acting = effective_user(user, settings);
+            run_stmt_in_state(engine, database, other, &acting, state, settings)
+        },
     }
 }
 
@@ -3183,6 +3270,40 @@ fn run_query_txn(
 /// `default_transaction_isolation` is validated on write (P-ISOLATION): the value steers what
 /// isolation later transactions actually begin with, so a typo must fail loudly here rather than
 /// silently fall back to the default level at `BEGIN`.
+/// The reserved settings key holding the role a `SET ROLE` switched this connection to.
+///
+/// It lives in the connection's settings store rather than in a field so that it needs no change
+/// to the signatures threading a statement through the query loop. The name is not a settable
+/// parameter, so a client cannot reach it with `SET` and assume a role that way — the only writer
+/// is [`record_assumed_role`], reached only after the executor authorized the switch.
+const ASSUMED_ROLE_SETTING: &str = "nusadb.assumed_role";
+
+/// The role this connection currently acts as, if `SET ROLE` switched it.
+fn assumed_role(settings: &std::sync::Mutex<HashMap<String, String>>) -> Option<String> {
+    settings
+        .lock()
+        .ok()
+        .and_then(|store| store.get(ASSUMED_ROLE_SETTING).cloned())
+}
+
+/// Record (or, for `None`, clear) the role a `SET ROLE` / `RESET ROLE` selected.
+fn record_assumed_role(settings: &std::sync::Mutex<HashMap<String, String>>, role: Option<&str>) {
+    if let Ok(mut store) = settings.lock() {
+        match role {
+            Some(role) => store.insert(ASSUMED_ROLE_SETTING.to_owned(), role.to_owned()),
+            None => store.remove(ASSUMED_ROLE_SETTING),
+        };
+    }
+}
+
+/// The identity a statement runs under: the assumed role when one is set, else the login role.
+fn effective_user(
+    login_user: &str,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+) -> String {
+    assumed_role(settings).unwrap_or_else(|| login_user.to_owned())
+}
+
 fn apply_set_variable(
     settings: &std::sync::Mutex<HashMap<String, String>>,
     sv: nusadb_sql::ast::SetVariable,
@@ -3788,9 +3909,59 @@ impl Catalog for EngineCatalog<'_> {
     }
 
     fn is_superuser(&self) -> bool {
-        // Row-level security is bypassed only for the bootstrap superuser. Every other
-        // authenticated connection is a regular user and is subject to RLS.
-        self.user == nusadb_sql::BOOTSTRAP_SUPERUSER
+        // The bootstrap user is always a superuser; any other role is one only when the role
+        // catalog says so, directly or through a membership. A failed catalog read answers
+        // `false`, which is the restrictive direction for every caller (RLS applies, privileges
+        // are checked).
+        nusadb_sql::rbac::principal(self.engine, self.txn, self.user)
+            .is_ok_and(|principal| principal.superuser)
+    }
+
+    fn has_privilege(
+        &self,
+        kind: nusadb_sql::ast::ObjectKind,
+        object: &str,
+        privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        nusadb_sql::rbac::has_privilege(self.engine, self.txn, self.user, kind, object, privilege)
+    }
+
+    fn may_grant_object(
+        &self,
+        kind: nusadb_sql::ast::ObjectKind,
+        object: &str,
+        privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        nusadb_sql::rbac::may_grant(self.engine, self.txn, self.user, kind, object, privilege)
+    }
+
+    fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
+        nusadb_sql::rbac::may_create_role(self.engine, self.txn, self.user)
+    }
+
+    fn may_administer_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
+        nusadb_sql::rbac::may_administer_role(self.engine, self.txn, self.user, role)
+    }
+
+    fn may_assume_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(
+            nusadb_sql::rbac::principal(self.engine, self.txn, self.user)?.superuser
+                || nusadb_sql::rbac::effective_roles(self.engine, self.txn, self.user)?
+                    .contains(role),
+        )
+    }
+
+    fn role_exists(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(name == nusadb_sql::BOOTSTRAP_SUPERUSER
+            || nusadb_sql::rbac::lookup_role(self.engine, self.txn, name)?.is_some())
+    }
+
+    fn owns_object(
+        &self,
+        kind: nusadb_sql::ast::ObjectKind,
+        object: &str,
+    ) -> Result<bool, nusadb_sql::Error> {
+        nusadb_sql::rbac::owns_object(self.engine, self.txn, self.user, kind, object)
     }
 
     fn current_user(&self) -> String {
@@ -3817,6 +3988,12 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::Created(_) => "CREATE TABLE".to_owned(),
         ExecutionResult::Dropped => "DROP TABLE".to_owned(),
         ExecutionResult::Altered => "ALTER TABLE".to_owned(),
+        ExecutionResult::Granted => "GRANT".to_owned(),
+        ExecutionResult::Revoked => "REVOKE".to_owned(),
+        ExecutionResult::RoleCreated => "CREATE ROLE".to_owned(),
+        ExecutionResult::RoleDropped => "DROP ROLE".to_owned(),
+        ExecutionResult::RoleAltered => "ALTER ROLE".to_owned(),
+        ExecutionResult::RoleSet(_) => "SET".to_owned(),
         ExecutionResult::Inserted(n) => format!("INSERT {n}"),
         ExecutionResult::Updated(n) => format!("UPDATE {n}"),
         ExecutionResult::Deleted(n) => format!("DELETE {n}"),

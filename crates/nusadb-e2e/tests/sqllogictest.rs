@@ -190,6 +190,12 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         ExecutionResult::Created(_)
         | ExecutionResult::Dropped
         | ExecutionResult::Altered
+        | ExecutionResult::Granted
+        | ExecutionResult::Revoked
+        | ExecutionResult::RoleCreated
+        | ExecutionResult::RoleDropped
+        | ExecutionResult::RoleAltered
+        | ExecutionResult::RoleSet(_)
         | ExecutionResult::Analyzed { .. }
         | ExecutionResult::Commented
         | ExecutionResult::SchemaCreated

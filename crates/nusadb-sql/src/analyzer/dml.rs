@@ -19,6 +19,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
                 name: super::qualified_display_opt(ins.schema.as_deref(), &ins.table),
             }
         })?;
+    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Insert)?;
     // `DEFAULT VALUES` names no target columns — every column is omitted and takes its DEFAULT.
     let targets = if matches!(ins.source, ast::InsertSource::DefaultValues) {
         Vec::new()
@@ -510,6 +511,13 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
                 name: super::qualified_display_opt(upd.schema.as_deref(), &upd.table),
             }
         })?;
+    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Update)?;
+    // A `WHERE` or `RETURNING` reads the target's rows to decide what to change or to hand back, so
+    // it needs SELECT too. An unconditional `UPDATE t SET c = 1` reads nothing and needs only
+    // UPDATE — the standard distinction, and the one that keeps a write-only role write-only.
+    if upd.filter.is_some() || !upd.returning.is_empty() {
+        super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Select)?;
+    }
     // RETURNING projects the updated rows, resolved against the table's (post-update) columns.
     let returning = analyze_returning(&upd.returning, &table, catalog)?;
     // UPDATE ... FROM: resolve a single named FROM table and extend the scope with it, so the
@@ -633,6 +641,11 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
                 name: super::qualified_display_opt(del.schema.as_deref(), &del.table),
             }
         })?;
+    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Delete)?;
+    // As for UPDATE: a `WHERE` or `RETURNING` reads rows, so it additionally needs SELECT.
+    if del.filter.is_some() || !del.returning.is_empty() {
+        super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Select)?;
+    }
     // RETURNING projects the deleted rows, resolved against the table's columns.
     let returning = analyze_returning(&del.returning, &table, catalog)?;
     // DELETE ... USING: resolve a single named source table and extend the scope, so the
@@ -718,6 +731,26 @@ pub(super) fn analyze_merge(m: ast::Merge, catalog: &dyn Catalog) -> Result<Merg
     // derived source carries an inlined plan the executor materializes; a plain table has `None` and
     // is scanned. `LATERAL` stays unsupported (rejected inside `resolve_aux_relation`).
     let (source, source_plan) = resolve_aux_relation(&m.source, catalog)?;
+    // MERGE always reads the target — the `ON` condition matches against its rows — and then writes
+    // it in whichever ways its WHEN arms name. Require exactly those: SELECT unconditionally, plus
+    // INSERT / UPDATE / DELETE per the arms present. Without this a role with no privileges at all
+    // on the target could read it through the match and rewrite it through the actions.
+    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Select)?;
+    for when in &m.whens {
+        match when {
+            ast::MergeWhen::NotMatched { .. } => {
+                super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Insert)?;
+            },
+            ast::MergeWhen::Matched { action, .. }
+            | ast::MergeWhen::NotMatchedBySource { action, .. } => {
+                let privilege = match action {
+                    ast::MatchedAction::Delete => ast::Privilege::Delete,
+                    ast::MatchedAction::Update { .. } => ast::Privilege::Update,
+                };
+                super::dcl::require_table_privilege(catalog, &table, privilege)?;
+            },
+        }
+    }
     // Row-level security on the MERGE target is not yet wired (the matched UPDATE/DELETE side would
     // not enforce the policies' USING / WITH CHECK that a plain UPDATE/DELETE does). Reject rather
     // than silently bypass RLS for a non-superuser; a superuser bypasses RLS anyway.

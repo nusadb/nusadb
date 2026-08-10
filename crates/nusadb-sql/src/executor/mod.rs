@@ -44,6 +44,7 @@ mod stats;
 // currently live in `ops` (a follow-up may hoist them into their own files).
 pub mod agg;
 pub(crate) mod coldefault;
+mod dcl;
 mod ddl;
 mod dml;
 mod function;
@@ -198,6 +199,20 @@ pub enum ExecutionResult {
     /// `REFRESH MATERIALIZED VIEW` recomputed the view — the number of rows the backing table now
     /// holds.
     MaterializedViewRefreshed(usize),
+    /// `GRANT` — privileges or role membership were recorded.
+    Granted,
+    /// `REVOKE` — privileges or role membership were withdrawn.
+    Revoked,
+    /// `CREATE ROLE` / `CREATE USER` succeeded (or `IF NOT EXISTS` made it a no-op).
+    RoleCreated,
+    /// `DROP ROLE` / `DROP USER` succeeded (or `IF EXISTS` made it a no-op).
+    RoleDropped,
+    /// `ALTER ROLE` succeeded.
+    RoleAltered,
+    /// `SET ROLE` / `RESET ROLE` — the role the session runs as, or `None` to return to the role it
+    /// logged in as. The session layer applies this; the executor only reports the decision, since
+    /// the role outlives the statement's transaction.
+    RoleSet(Option<String>),
 }
 
 /// A push-based receiver for a streamed statement's output (Phase 2 streaming output).
@@ -1528,6 +1543,14 @@ fn dispatch(
         PhysicalPlan::RefreshMaterializedView(name) => {
             run_refresh_materialized_view(&name, engine, txn)
         },
+        PhysicalPlan::Grant(p) => dcl::run_grant(&p, engine, txn),
+        PhysicalPlan::Revoke(p) => dcl::run_revoke(&p, engine, txn),
+        PhysicalPlan::GrantRole(p) => dcl::run_grant_role(&p, engine, txn),
+        PhysicalPlan::RevokeRole(p) => dcl::run_revoke_role(&p, engine, txn),
+        PhysicalPlan::CreateRole(p) => dcl::run_create_role(&p, engine, txn),
+        PhysicalPlan::DropRole(p) => dcl::run_drop_role(&p, engine, txn),
+        PhysicalPlan::AlterRole(p) => dcl::run_alter_role(&p, engine, txn),
+        PhysicalPlan::SetRole(p) => dcl::run_set_role(&p, engine, txn),
         PhysicalPlan::CreatePolicy(p) => run_create_policy(&p, engine, txn),
         PhysicalPlan::DropPolicy(p) => run_drop_policy(&p, engine, txn),
         PhysicalPlan::AlterTable(p) => run_alter_table(p, engine, txn),
@@ -1944,6 +1967,33 @@ fn format_plan(
         PhysicalPlan::DropPolicy(p) => {
             vec![format!("{indent}DropPolicy: {} ON {}", p.name, p.table)]
         },
+        // Access-control statements have no operator tree; the plan line names the statement and
+        // how many grantees or roles it touches, which is all EXPLAIN can usefully say.
+        PhysicalPlan::Grant(p) => {
+            vec![format!("{indent}Grant: {} grantee(s)", p.grantees.len())]
+        },
+        PhysicalPlan::Revoke(p) => {
+            vec![format!("{indent}Revoke: {} grantee(s)", p.grantees.len())]
+        },
+        PhysicalPlan::GrantRole(p) => vec![format!(
+            "{indent}GrantRole: {} role(s) to {} member(s)",
+            p.roles.len(),
+            p.members.len()
+        )],
+        PhysicalPlan::RevokeRole(p) => vec![format!(
+            "{indent}RevokeRole: {} role(s) from {} member(s)",
+            p.roles.len(),
+            p.members.len()
+        )],
+        PhysicalPlan::CreateRole(p) => vec![format!("{indent}CreateRole: {}", p.name)],
+        PhysicalPlan::DropRole(p) => {
+            vec![format!("{indent}DropRole: {}", p.names.join(", "))]
+        },
+        PhysicalPlan::AlterRole(p) => vec![format!("{indent}AlterRole: {}", p.name)],
+        PhysicalPlan::SetRole(p) => vec![format!(
+            "{indent}SetRole: {}",
+            p.role.as_deref().unwrap_or("NONE")
+        )],
         PhysicalPlan::AlterTable(p) => vec![format!("{indent}AlterTable{}", format_alter(p))],
         PhysicalPlan::Insert(p) => {
             let source = match &p.source {
@@ -3066,6 +3116,26 @@ fn parse_policy_command(text: &str) -> ast::PolicyCommand {
 struct ExecCatalog<'a> {
     engine: &'a dyn StorageEngine,
     txn: TxnId,
+    /// The role the enclosing statement runs as.
+    ///
+    /// A nested body — a trigger action, a `CALL`/`DO` block, a view being refreshed — is analyzed
+    /// through this catalog, and it must be analyzed as the *same* role as the statement that
+    /// reached it. Without this field the trait's permissive defaults applied
+    /// (`is_superuser() == true`, every privilege granted), which turned any nested body into a
+    /// superuser context: `DO $$ INSERT INTO nusadb_roles ... $$` would have let any role write
+    /// itself a superuser row.
+    user: String,
+}
+
+impl<'a> ExecCatalog<'a> {
+    /// Build a catalog bound to the running statement's role.
+    fn new(engine: &'a dyn StorageEngine, txn: TxnId) -> Self {
+        Self {
+            engine,
+            txn,
+            user: session_ctx::current_user(),
+        }
+    }
 }
 
 impl crate::Catalog for ExecCatalog<'_> {
@@ -3103,6 +3173,68 @@ impl crate::Catalog for ExecCatalog<'_> {
 
     fn lookup_function(&self, name: &str) -> Result<Option<crate::FunctionDef>, Error> {
         function::lookup_function_definition(self.engine, self.txn, name)
+    }
+
+    // Access control. These must delegate rather than take the trait's permissive defaults — see
+    // the note on the `user` field.
+
+    fn is_superuser(&self) -> bool {
+        crate::rbac::principal(self.engine, self.txn, &self.user)
+            .is_ok_and(|principal| principal.superuser)
+    }
+
+    fn current_user(&self) -> String {
+        self.user.clone()
+    }
+
+    fn rls_enabled(&self, name: &str) -> Result<bool, Error> {
+        rls_table_enabled(self.engine, self.txn, name)
+    }
+
+    fn lookup_policies(&self, name: &str) -> Result<Vec<crate::analyzer::PolicyDef>, Error> {
+        lookup_policies_for(self.engine, self.txn, name)
+    }
+
+    fn has_privilege(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::has_privilege(self.engine, self.txn, &self.user, kind, object, privilege)
+    }
+
+    fn may_grant_object(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::may_grant(self.engine, self.txn, &self.user, kind, object, privilege)
+    }
+
+    fn may_create_role(&self) -> Result<bool, Error> {
+        crate::rbac::may_create_role(self.engine, self.txn, &self.user)
+    }
+
+    fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
+        crate::rbac::may_administer_role(self.engine, self.txn, &self.user, role)
+    }
+
+    fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
+        Ok(
+            crate::rbac::principal(self.engine, self.txn, &self.user)?.superuser
+                || crate::rbac::effective_roles(self.engine, self.txn, &self.user)?.contains(role),
+        )
+    }
+
+    fn role_exists(&self, name: &str) -> Result<bool, Error> {
+        Ok(name == crate::BOOTSTRAP_SUPERUSER
+            || crate::rbac::lookup_role(self.engine, self.txn, name)?.is_some())
+    }
+
+    fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
+        crate::rbac::owns_object(self.engine, self.txn, &self.user, kind, object)
     }
 }
 
@@ -3165,11 +3297,57 @@ impl crate::Catalog for SessionCatalog<'_> {
     }
 
     fn is_superuser(&self) -> bool {
-        self.user == crate::BOOTSTRAP_SUPERUSER
+        // The bootstrap user is a superuser unconditionally; any other role is one only if the
+        // catalog says so, directly or through a membership. A catalog read that fails answers
+        // `false`, which is the restrictive direction for every caller.
+        crate::rbac::principal(self.engine, self.txn, self.user)
+            .is_ok_and(|principal| principal.superuser)
     }
 
     fn current_user(&self) -> String {
         self.user.to_owned()
+    }
+
+    fn has_privilege(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::has_privilege(self.engine, self.txn, self.user, kind, object, privilege)
+    }
+
+    fn may_grant_object(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::may_grant(self.engine, self.txn, self.user, kind, object, privilege)
+    }
+
+    fn may_create_role(&self) -> Result<bool, Error> {
+        crate::rbac::may_create_role(self.engine, self.txn, self.user)
+    }
+
+    fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
+        crate::rbac::may_administer_role(self.engine, self.txn, self.user, role)
+    }
+
+    fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
+        Ok(
+            crate::rbac::principal(self.engine, self.txn, self.user)?.superuser
+                || crate::rbac::effective_roles(self.engine, self.txn, self.user)?.contains(role),
+        )
+    }
+
+    fn role_exists(&self, name: &str) -> Result<bool, Error> {
+        Ok(name == crate::BOOTSTRAP_SUPERUSER
+            || crate::rbac::lookup_role(self.engine, self.txn, name)?.is_some())
+    }
+
+    fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
+        crate::rbac::owns_object(self.engine, self.txn, self.user, kind, object)
     }
 
     fn rls_enabled(&self, name: &str) -> Result<bool, Error> {
@@ -3436,7 +3614,7 @@ fn run_refresh_materialized_view(
             name: name.to_owned(),
         })?;
     // Re-analyze and re-plan the stored SELECT against the current catalog, then run it.
-    let logical = crate::analyze(crate::parse(&def_sql)?, &ExecCatalog { engine, txn })?;
+    let logical = crate::analyze(crate::parse(&def_sql)?, &ExecCatalog::new(engine, txn))?;
     let PhysicalPlan::Select(op, _) = crate::plan(logical) else {
         return Err(Error::Unsupported(
             "materialized view definition is not a SELECT".to_owned(),

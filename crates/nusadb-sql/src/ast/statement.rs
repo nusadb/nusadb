@@ -262,6 +262,23 @@ pub enum Statement {
     DropPolicy(DropPolicy),
     /// `ALTER POLICY name ON table [TO ...] [USING ...] [WITH CHECK ...]`. Custom-parsed.
     AlterPolicy(AlterPolicy),
+    /// `GRANT privileges ON objects TO grantees [WITH GRANT OPTION]`.
+    Grant(Grant),
+    /// `REVOKE [GRANT OPTION FOR] privileges ON objects FROM grantees [CASCADE | RESTRICT]`.
+    Revoke(Revoke),
+    /// `GRANT role[, ...] TO member[, ...] [WITH ADMIN OPTION]` — role membership. Told apart from
+    /// [`Statement::Grant`] by the absence of `ON`.
+    GrantRole(GrantRole),
+    /// `REVOKE [ADMIN OPTION FOR] role[, ...] FROM member[, ...]`.
+    RevokeRole(RevokeRole),
+    /// `CREATE ROLE | USER [IF NOT EXISTS] name [options]`.
+    CreateRole(CreateRole),
+    /// `DROP ROLE | USER [IF EXISTS] name[, ...]`.
+    DropRole(DropRole),
+    /// `ALTER ROLE name [options]`.
+    AlterRole(AlterRole),
+    /// `SET ROLE name | NONE` / `RESET ROLE` — switch the privileges the session runs with.
+    SetRole(SetRole),
     /// `CREATE SCHEMA [IF NOT EXISTS] name`.
     CreateSchema(CreateSchema),
     /// `DROP SCHEMA [IF EXISTS] name`.

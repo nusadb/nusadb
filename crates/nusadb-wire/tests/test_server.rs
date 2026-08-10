@@ -2169,6 +2169,12 @@ async fn row_level_security_is_enforced_per_connection_user() {
         "CREATE POLICY own ON doc FOR SELECT TO alice USING (owner = CURRENT_USER)",
     )
     .await;
+    // Privileges are checked before row-level security: the policy narrows *which rows* a permitted
+    // read returns, it does not itself grant the read. Without this the non-superuser connections
+    // below would be refused outright and the test would stop exercising RLS at all. `PUBLIC` keeps
+    // the grant off the policy's own `TO alice` axis, so the filtering assertions still isolate the
+    // policy.
+    run_ok(&mut su, "GRANT SELECT ON doc TO PUBLIC").await;
     // The superuser bypasses RLS: it sees all three rows.
     assert_eq!(
         select_ids(&mut su, "SELECT id FROM doc ORDER BY id")
@@ -2216,6 +2222,120 @@ async fn row_level_security_is_enforced_per_connection_user() {
             .is_empty()
     );
     terminate(carol, carol_handle).await;
+}
+
+/// `COPY` is gated by the privilege catalog, not just by row-level security.
+///
+/// `COPY` never reaches the analyzer — the wire layer drives it straight against the engine — so
+/// the privilege check the analyzer would have raised has to be raised at that gate instead.
+/// Before it was, `COPY t TO STDOUT` read every row of any non-RLS table for any connected role,
+/// and `COPY t FROM STDIN` wrote it: a complete bypass of the feature privileges exist to provide.
+#[tokio::test]
+async fn copy_is_refused_without_the_matching_table_privilege() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    /// Drain a statement, returning the error message if one arrived.
+    async fn outcome(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Option<String> {
+        query(conn, sql).await;
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => err = Some(message),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err
+    }
+
+    let (mut su, su_handle) = connect(&engine, "nusa-root").await;
+    assert!(
+        outcome(&mut su, "CREATE TABLE secret (id INT NOT NULL)")
+            .await
+            .is_none()
+    );
+    assert!(
+        outcome(&mut su, "INSERT INTO secret VALUES (1), (2)")
+            .await
+            .is_none()
+    );
+    assert!(outcome(&mut su, "CREATE ROLE app LOGIN").await.is_none());
+
+    // No grants: both directions must be refused, on a table with no row-level security at all.
+    let (mut app, app_handle) = connect(&engine, "app").await;
+    let read = outcome(&mut app, "COPY secret TO STDOUT")
+        .await
+        .expect("COPY TO must be refused without SELECT");
+    assert!(
+        read.contains("permission denied"),
+        "refusal should name the privilege, got: {read}"
+    );
+    let write = outcome(&mut app, "COPY secret FROM STDIN")
+        .await
+        .expect("COPY FROM must be refused without INSERT");
+    assert!(
+        write.contains("permission denied"),
+        "refusal should name the privilege, got: {write}"
+    );
+
+    // SELECT opens the read side and leaves the write side shut — one grant must not imply both.
+    assert!(
+        outcome(&mut su, "GRANT SELECT ON secret TO app")
+            .await
+            .is_none()
+    );
+    assert!(
+        outcome(&mut app, "COPY secret TO STDOUT").await.is_none(),
+        "COPY TO should be permitted once SELECT is granted"
+    );
+    assert!(
+        outcome(&mut app, "COPY secret FROM STDIN")
+            .await
+            .is_some_and(|m| m.contains("permission denied")),
+        "COPY FROM still needs INSERT"
+    );
+
+    terminate_conn(app, app_handle).await;
+    terminate_conn(su, su_handle).await;
+}
+
+/// Close a connection and join its task.
+async fn terminate_conn(
+    mut conn: Connection<tokio::io::DuplexStream>,
+    handle: tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
 }
 
 /// A multi-row `SELECT` streams every row to the socket in order (Phase 2): `RowDescription`,

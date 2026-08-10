@@ -184,6 +184,50 @@ impl Catalog for RecordingCatalog<'_> {
     fn is_superuser(&self) -> bool {
         self.inner.is_superuser()
     }
+    fn has_privilege(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        // A privilege decision is an unversioned dependency, exactly like a row-level-security
+        // predicate: `REVOKE` from another session changes the answer without bumping any table's
+        // schema version, so a plan that consulted one cannot be invalidated by the fingerprint and
+        // must not be cached. A superuser short-circuits before reaching here, so the administrative
+        // path keeps its cache; a role whose access can be revoked trades caching for not being
+        // served a plan its privileges no longer justify.
+        //
+        // Restoring caching for these needs a catalog generation counter in the fingerprint —
+        // worth doing, but a correctness-first default belongs here in the meantime.
+        self.saw_unversioned_dep.set(true);
+        self.inner.has_privilege(kind, object, privilege)
+    }
+    fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
+        // Ownership gates DROP/ALTER, which are never cached, but it is also unversioned — record
+        // it for the same reason as `has_privilege`.
+        self.saw_unversioned_dep.set(true);
+        self.inner.owns_object(kind, object)
+    }
+    fn may_grant_object(
+        &self,
+        kind: crate::ast::ObjectKind,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        self.inner.may_grant_object(kind, object, privilege)
+    }
+    fn may_create_role(&self) -> Result<bool, Error> {
+        self.inner.may_create_role()
+    }
+    fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
+        self.inner.may_administer_role(role)
+    }
+    fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
+        self.inner.may_assume_role(role)
+    }
+    fn role_exists(&self, name: &str) -> Result<bool, Error> {
+        self.inner.role_exists(name)
+    }
     fn current_user(&self) -> String {
         self.inner.current_user()
     }
@@ -314,6 +358,12 @@ pub fn plan_cached(
 /// or in normal SQL, so the key is unambiguous.
 fn cache_key(catalog: &dyn Catalog, sql: &str) -> String {
     let mut key = String::new();
+    // The acting role leads the key. A plan bakes the privilege decisions made when it was
+    // analyzed, and `SET ROLE` changes those decisions without changing the SQL or the search path
+    // — so without this a session could plan a query as a privileged role, switch to a weaker one,
+    // and be served the cached plan with no check re-run.
+    key.push_str(&catalog.current_user());
+    key.push('\u{2}');
     for schema in catalog.search_path() {
         key.push_str(&schema);
         key.push('\u{1}');

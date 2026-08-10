@@ -156,7 +156,7 @@ fn maintain_one(
         return Ok(()); // The view was dropped; nothing to maintain.
     };
     let LogicalPlan::Select(select) =
-        crate::analyze(crate::parse(&def_sql)?, &ExecCatalog { engine, txn })?
+        crate::analyze(crate::parse(&def_sql)?, &ExecCatalog::new(engine, txn))?
     else {
         return Ok(()); // Not a SELECT — never IVM-registered, so unreachable in practice.
     };

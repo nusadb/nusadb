@@ -571,7 +571,7 @@ fn fire_one(
     }
     let mut stmt = crate::parse(&trig.action)?;
     substitute_row_refs(&mut stmt, &refs)?;
-    let logical = crate::analyze(stmt, &ExecCatalog { engine, txn })?;
+    let logical = crate::analyze(stmt, &ExecCatalog::new(engine, txn))?;
     super::dispatch(crate::plan(logical), engine, txn)?;
     Ok(())
 }
@@ -586,7 +586,7 @@ fn eval_when(
 ) -> Result<bool, Error> {
     let mut stmt = crate::parse(&format!("SELECT ({when}) AS w"))?;
     substitute_row_refs(&mut stmt, refs)?;
-    let logical = crate::analyze(stmt, &ExecCatalog { engine, txn })?;
+    let logical = crate::analyze(stmt, &ExecCatalog::new(engine, txn))?;
     match super::dispatch(crate::plan(logical), engine, txn)? {
         ExecutionResult::Rows { rows, .. } => Ok(matches!(
             rows.first().and_then(|r| r.first()),

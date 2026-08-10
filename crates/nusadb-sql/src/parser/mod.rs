@@ -34,6 +34,7 @@ use nusadb_core::ColumnType;
 use crate::ast;
 use crate::error::Error;
 
+mod dcl;
 mod ddl;
 mod dml;
 mod expr;
@@ -314,6 +315,10 @@ fn recognize_vector_distance_op(parser: &Parser) -> Option<(&'static str, usize)
 /// `GenericDialect` to enable grammar extensions inside sqlparser. The input
 /// must contain exactly one statement; empty input and multi-statement input
 /// are both rejected.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat chain of statement recognizers; length tracks the number of statement forms               custom-parsed, not branching depth"
+)]
 pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // Re-narrow the identifier lexicon to NusaDB's surface before anything else, so the gate
     // covers every path (the VACUUM / COMMENT recognizers below as well as the generic parser).
@@ -331,6 +336,27 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `COMMENT ON ...` is tokenized by `sqlparser` 0.51 but not modelled as a statement, so
     // (like `VACUUM`) recognize and parse it ourselves before the generic path.
     if let Some(result) = recognize_comment(sql) {
+        return result;
+    }
+    // Access control. `SET ROLE` / `RESET ROLE` must be recognized before the generic `SET`/`RESET`
+    // handling below, which would otherwise file `role` away as an ordinary session variable and
+    // report success while the session's privileges stayed exactly as they were.
+    if let Some(result) = dcl::recognize_set_role(sql) {
+        return result;
+    }
+    if let Some(result) = dcl::recognize_grant(sql) {
+        return result;
+    }
+    if let Some(result) = dcl::recognize_revoke(sql) {
+        return result;
+    }
+    if let Some(result) = dcl::recognize_create_role(sql) {
+        return result;
+    }
+    if let Some(result) = dcl::recognize_drop_role(sql) {
+        return result;
+    }
+    if let Some(result) = dcl::recognize_alter_role(sql) {
         return result;
     }
     // `RESET name` is not in the generic tokenizer's statement grammar; recognize it

@@ -3090,7 +3090,76 @@ pub(super) fn run_info_schema(
         V::TableConstraints => info_schema_table_constraints(engine, txn),
         V::KeyColumnUsage => info_schema_key_column_usage(engine, txn),
         V::Statistics => info_schema_statistics(engine, txn),
+        V::TablePrivileges => info_schema_table_privileges(engine, txn),
+        V::ApplicableRoles => info_schema_applicable_roles(engine, txn),
+        V::EnabledRoles => info_schema_enabled_roles(engine, txn),
     }
+}
+
+/// `information_schema.table_privileges`: one row per privilege granted on a table.
+///
+/// Only grants the session can already see are listed — those held by a role it effectively has,
+/// or by `PUBLIC` — unless it is a superuser, which sees all. A view that listed every grant would
+/// tell any connected user the shape of the whole access-control configuration.
+fn info_schema_table_privileges(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
+    let user = super::session_ctx::current_user();
+    let superuser = crate::rbac::principal(engine, txn, &user)?.superuser;
+    let effective = crate::rbac::effective_roles(engine, txn, &user)?;
+    let mut rows = Vec::new();
+    for grant in crate::rbac::all_grants(engine, txn)? {
+        if grant.kind != crate::ast::ObjectKind::Table {
+            continue;
+        }
+        let visible = superuser
+            || matches!(&grant.grantee, crate::ast::Grantee::Public)
+            || matches!(&grant.grantee, crate::ast::Grantee::Role(r) if effective.contains(r))
+            || effective.contains(&grant.grantor);
+        if !visible {
+            continue;
+        }
+        // Objects are keyed `schema.name`; split so the view reports the two columns separately.
+        let (schema, name) = grant
+            .object
+            .split_once('.')
+            .unwrap_or((nusadb_core::engine::PUBLIC_SCHEMA, grant.object.as_str()));
+        rows.push(vec![
+            ast::Value::Text(grant.grantor.clone()),
+            ast::Value::Text(grant.grantee.as_str().to_owned()),
+            ast::Value::Text("nusadb".to_owned()),
+            ast::Value::Text(schema.to_owned()),
+            ast::Value::Text(name.to_owned()),
+            ast::Value::Text(grant.privilege.as_str().to_owned()),
+            ast::Value::Text(if grant.grantable { "YES" } else { "NO" }.to_owned()),
+        ]);
+    }
+    Ok(rows)
+}
+
+/// `information_schema.applicable_roles`: one row per role membership visible to the session.
+fn info_schema_applicable_roles(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
+    let user = super::session_ctx::current_user();
+    let superuser = crate::rbac::principal(engine, txn, &user)?.superuser;
+    let effective = crate::rbac::effective_roles(engine, txn, &user)?;
+    Ok(crate::rbac::all_memberships(engine, txn)?
+        .into_iter()
+        .filter(|edge| superuser || effective.contains(&edge.member))
+        .map(|edge| {
+            vec![
+                ast::Value::Text(edge.member),
+                ast::Value::Text(edge.role),
+                ast::Value::Text(if edge.admin { "YES" } else { "NO" }.to_owned()),
+            ]
+        })
+        .collect())
+}
+
+/// `information_schema.enabled_roles`: the roles the session effectively acts as right now.
+fn info_schema_enabled_roles(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
+    let user = super::session_ctx::current_user();
+    Ok(crate::rbac::effective_roles(engine, txn, &user)?
+        .into_iter()
+        .map(|role| vec![ast::Value::Text(role)])
+        .collect())
 }
 
 /// Map a [`ConstraintKind`](nusadb_core::engine::ConstraintKind) to the SQL-standard
