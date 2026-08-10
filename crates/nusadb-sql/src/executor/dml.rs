@@ -839,7 +839,11 @@ fn insert_rows_with_unique(
         Some(collector) => collector.admit_batch(table, &full_rows, engine, txn)?,
         None => enforce_unique_on_insert(table, &full_rows, engine, txn)?,
     }
-    enforce_fk_on_child_write(table, &full_rows, engine, txn)?;
+    // The statement's own rows are offered as parent material, so a child may reference a parent
+    // arriving beside it. Checking here, before anything is written, is what keeps a refused
+    // statement from leaving rows behind — there is no statement-level undo inside an explicit
+    // transaction to fall back on.
+    enforce_fk_on_child_write(table, &full_rows, &full_rows, engine, txn)?;
     enforce_check_on_write(table, &full_rows, engine)?;
 
     let index_targets = secondary_index_targets(table, engine)?;
@@ -1084,8 +1088,9 @@ fn upsert_rows(
             )?;
         }
     }
-    // Every affected row validates FOREIGN KEY and CHECK.
-    enforce_fk_on_child_write(table, &affected, engine, txn)?;
+    // Every affected row validates FOREIGN KEY and CHECK. As with a plain insert, the statement's
+    // own rows count as parent material for a key pointing back at this table.
+    enforce_fk_on_child_write(table, &affected, &affected, engine, txn)?;
     enforce_check_on_write(table, &affected, engine)?;
 
     // Triggers: an upsert fires INSERT triggers for the inserted rows and UPDATE triggers for
@@ -2015,7 +2020,10 @@ pub(super) fn unique_key_cmp(a: &[ast::Value], b: &[ast::Value]) -> std::cmp::Or
         .zip(b)
         .map(|(x, y)| eval::compare(x, y))
         .find(|ordering| *ordering != std::cmp::Ordering::Equal)
-        .unwrap_or(std::cmp::Ordering::Equal)
+        // Zipping stops at the shorter tuple, so a prefix match would otherwise report `Equal` for
+        // keys of different width. Length decides, as it does for arrays — a caller that sorts or
+        // searches on this ordering inherits the guard rather than having to remember it.
+        .unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 
 /// Resolve a constraint's column names to their ordinals in `table` (declaration order). The names
@@ -2091,9 +2099,23 @@ fn fk_parent_ordinals(
 /// written by an INSERT/UPDATE. A row whose FK columns contain a `NULL` does not reference
 /// anything (MATCH SIMPLE) and is skipped. Scan-based (the SQL layer owns row decoding); an
 /// index-backed `fk_check` fast path is a follow-up once the index key encoder lands.
+///
+/// `pending` is the set of rows this statement is about to write, and it counts as parent material
+/// for a key pointing back at `table` itself. A statement loading a tree into a self-referencing
+/// table carries the parent and the child together, and arrival order should not decide whether it
+/// is accepted. Passing the rows in — rather than checking after they are written — keeps the
+/// guarantee that a refused statement writes nothing, which matters because a statement error
+/// inside an explicit transaction leaves that transaction open rather than undoing it. Callers with
+/// nothing pending pass `&[]`.
+///
+/// The scope is one call, not one statement, and for `COPY` those differ: it loads in batches and
+/// each batch sees only its own rows, so a child separated from its parent by a batch boundary is
+/// still refused. `INSERT ... SELECT` into such a table is buffered whole rather than streamed, so
+/// it does not have that seam.
 pub(super) fn enforce_fk_on_child_write(
     table: &TableSchema,
     rows: &[Row],
+    pending: &[Row],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -2118,14 +2140,50 @@ pub(super) fn enforce_fk_on_child_write(
             .into());
         };
         let parent_rows = scan_rows(&parent, engine, txn)?;
+        // Rows this statement is adding to the parent table count as parents. They only can be
+        // when the key points back at this same table; a key to another table is unaffected by
+        // what this statement writes here.
+        let self_referencing = fk.parent_table == table.id;
+        let pending = if self_referencing { pending } else { &[] };
+        let candidate_keys = || {
+            parent_rows
+                .iter()
+                .chain(pending)
+                .filter_map(|prow| unique_key(prow, &parent_key))
+        };
+        // How the parent is searched depends on how many rows are asking, measured against how big
+        // the parent is. One row wants a lazy walk that stops at the first match — the common
+        // single-row insert, where extracting and sorting every parent key is work thrown away. A
+        // bulk statement wants the opposite: walking the parent once per row is quadratic, and a
+        // self-referencing load searches its own rows too. Sorting costs one pass over the parent
+        // and buys `log2` per lookup, so it pays once the statement carries more rows than that
+        // logarithm — a threshold that has to scale with the parent rather than sit at a constant,
+        // or a statement just above a fixed line pays for a sort a lazy walk would have beaten.
+        //
+        // Both routes rank keys by `unique_key_cmp`, the comparison the equality check itself uses,
+        // so the answer does not depend on which one runs. The ordering is a sound one to search
+        // because a key position holds one value variant — a column has a single type — and
+        // `compare` is a total order within a variant. Across variants it is not transitive
+        // (an exact `NUMERIC` and an `INT` can each compare equal to the same `FLOAT` while
+        // differing from each other), which a binary search would not survive; that is unreachable
+        // here, and worth knowing before this ordering is reused somewhere columns do mix.
+        let lookups_saved = (parent_rows.len() + pending.len()).max(2).ilog2() as usize;
+        let sorted_keys = (rows.len() > lookups_saved).then(|| {
+            let mut keys: Vec<_> = candidate_keys().collect();
+            keys.sort_by(|a, b| unique_key_cmp(a, b));
+            keys
+        });
         for row in rows {
             let Some(key) = unique_key(row, &child_ordinals) else {
                 continue; // NULL foreign key — references nothing (MATCH SIMPLE).
             };
-            let present = parent_rows
-                .iter()
-                .filter_map(|prow| unique_key(prow, &parent_key))
-                .any(|pkey| unique_key_eq(&pkey, &key));
+            let present = sorted_keys.as_ref().map_or_else(
+                || candidate_keys().any(|pkey| unique_key_eq(&pkey, &key)),
+                |keys| {
+                    keys.binary_search_by(|pkey| unique_key_cmp(pkey, &key))
+                        .is_ok()
+                },
+            );
             if !present {
                 return Err(nusadb_core::Error::ConstraintViolation(format!(
                     "insert or update on \"{}\" violates foreign key \"{}\": no matching row in \"{}\"",
@@ -3206,7 +3264,7 @@ pub(super) fn run_update(
             )?;
         }
     }
-    enforce_fk_on_child_write(&plan.table, &updated_rows, engine, txn)?;
+    enforce_fk_on_child_write(&plan.table, &updated_rows, &[], engine, txn)?;
     enforce_check_on_write(&plan.table, &updated_rows, engine)?;
     // …and a changed parent key must be propagated to its children (ON UPDATE) before any write.
     if is_fk_parent {
@@ -4085,7 +4143,7 @@ fn commit_merge_updates(
             .collect();
         enforce_new_keys_vs_committed(table, &rewritten, &old_images, &new_rows, engine, txn)?;
     }
-    enforce_fk_on_child_write(table, &new_rows, engine, txn)?;
+    enforce_fk_on_child_write(table, &new_rows, &[], engine, txn)?;
     enforce_check_on_write(table, &new_rows, engine)?;
     if table_is_fk_parent(table, engine)? {
         let changes: Vec<(Row, Row)> = updates

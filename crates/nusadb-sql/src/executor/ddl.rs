@@ -948,7 +948,8 @@ pub(super) fn run_alter_table(
         AlterTablePlan::AddForeignKey { table, fk } => {
             register_foreign_key(table.id, &table.schema, &fk, engine, txn)?;
             let existing = scan_rows(&table, engine, txn)?;
-            dml::enforce_fk_on_child_write(&table, &existing, engine, txn)?;
+            // Validating rows already in the table when a key is added: nothing is pending.
+            dml::enforce_fk_on_child_write(&table, &existing, &[], engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // RENAME TO: a catalog-only rename, no row rewrite.

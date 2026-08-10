@@ -9402,3 +9402,229 @@ fn projection_columns_are_named_after_their_function() {
         ["total", "a"]
     );
 }
+
+/// A row may reference another row of the same statement. Loading a tree into a self-referencing
+/// table is the ordinary case — a child arrives beside its parent — and it used to be refused,
+/// because the check looked only at rows already stored. It now counts the statement's own rows as
+/// parent material, so the reference resolves whatever order the rows arrive in.
+#[test]
+fn a_foreign_key_sees_rows_written_by_its_own_statement() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE org (id INT PRIMARY KEY, nama TEXT, atasan_id INT REFERENCES org(id))",
+    );
+    run(
+        &engine,
+        "INSERT INTO org VALUES (1,'CEO',NULL),(2,'CTO',1),(3,'CFO',1),(4,'DevLead',2),(5,'Eng',4)",
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(5)]]
+    );
+
+    // Arrival order must not decide the outcome: children ahead of their parents load just as well.
+    run(
+        &engine,
+        "CREATE TABLE org2 (id INT PRIMARY KEY, nama TEXT, atasan_id INT REFERENCES org2(id))",
+    );
+    run(
+        &engine,
+        "INSERT INTO org2 VALUES (5,'Eng',4),(4,'DevLead',2),(2,'CTO',1),(1,'CEO',NULL)",
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org2")),
+        vec![vec![Value::Int(4)]]
+    );
+
+    // Through `INSERT ... SELECT`. That path buffers the whole statement for a table carrying a
+    // child key rather than streaming it, so this is the same shape as the VALUES case above — it
+    // is here because it is what an ORM fixture or migration tool writes, not because it exercises
+    // a different mechanism.
+    run(
+        &engine,
+        "CREATE TABLE seed (id INT, nama TEXT, atasan_id INT)",
+    );
+    run(
+        &engine,
+        "INSERT INTO seed VALUES (11,'a',NULL),(12,'b',11),(13,'c',12)",
+    );
+    run(
+        &engine,
+        "CREATE TABLE org3 (id INT PRIMARY KEY, nama TEXT, atasan_id INT REFERENCES org3(id))",
+    );
+    run(
+        &engine,
+        "INSERT INTO org3 SELECT id, nama, atasan_id FROM seed",
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org3")),
+        vec![vec![Value::Int(3)]]
+    );
+}
+
+/// Widening what counts as a parent must not widen what is accepted. A reference matching nothing
+/// is still refused, and the statement leaves nothing behind.
+///
+/// Note this runs through auto-commit, where the harness rolls back for us — so the "leaves nothing
+/// behind" half is not really tested here. The test below it, driving an explicit transaction, is
+/// the one that can make that claim.
+#[test]
+fn a_dangling_foreign_key_is_still_refused_and_writes_nothing() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE org (id INT PRIMARY KEY, nama TEXT, atasan_id INT REFERENCES org(id))",
+    );
+
+    // Mixed statement: rows 1 and 2 are satisfiable, 3 references a row that never exists.
+    let err = run_try(
+        &engine,
+        "INSERT INTO org VALUES (1,'CEO',NULL),(2,'CTO',1),(3,'ghost',99)",
+    )
+    .expect_err("a reference to a row that does not exist must be refused");
+    assert!(
+        err.to_string().contains("foreign key"),
+        "wanted the foreign-key violation, got `{err}`"
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(0)]],
+        "a refused statement must leave no rows behind, not the two that were satisfiable"
+    );
+
+    // A single row pointing at a key nobody supplies is refused just the same.
+    run(&engine, "INSERT INTO org VALUES (1,'CEO',NULL)");
+    let err = run_try(&engine, "INSERT INTO org VALUES (2,'CTO',7)")
+        .expect_err("still refused on a single row");
+    assert!(err.to_string().contains("foreign key"));
+
+    // And a child table pointing at a separate parent is unaffected by the move.
+    run(&engine, "CREATE TABLE parent (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+    );
+    run(&engine, "INSERT INTO parent VALUES (1)");
+    run(&engine, "INSERT INTO child VALUES (10, 1)");
+    assert!(
+        run_try(&engine, "INSERT INTO child VALUES (11, 2)").is_err(),
+        "a cross-table dangling reference must still be refused"
+    );
+}
+
+/// The refusal must leave nothing behind *inside an explicit transaction*, where there is no
+/// statement-level undo to fall back on: a failed statement leaves the transaction open, so
+/// anything it wrote before failing would survive a later COMMIT.
+///
+/// This is the assertion the auto-commit path cannot make. There the harness rolls back for us, so
+/// a check performed after the write would look just as clean while quietly durably committing a
+/// dangling reference.
+#[test]
+fn a_refused_foreign_key_writes_nothing_inside_an_open_transaction() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE parent (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+    );
+    run(&engine, "INSERT INTO parent VALUES (1)");
+
+    let mut session = Session::new(&engine);
+    session.execute(build_plan(&engine, "BEGIN")).unwrap();
+    session
+        .execute(build_plan(&engine, "INSERT INTO child VALUES (1, 1)"))
+        .unwrap();
+    // Mixed statement: the first row is satisfiable, the second is not.
+    assert!(
+        session
+            .execute(build_plan(
+                &engine,
+                "INSERT INTO child VALUES (2, 1), (3, 99)"
+            ))
+            .is_err(),
+        "the dangling reference must be refused"
+    );
+    session.execute(build_plan(&engine, "COMMIT")).unwrap();
+
+    // Only the row from the statement that succeeded may have survived.
+    assert_eq!(
+        rows(run(&engine, "SELECT id, pid FROM child ORDER BY id")),
+        vec![vec![Value::Int(1), Value::Int(1)]],
+        "a refused statement committed rows anyway — the check must run before the write"
+    );
+
+    // And the tree load still works in the same setting.
+    run(
+        &engine,
+        "CREATE TABLE org (id INT PRIMARY KEY, atasan_id INT REFERENCES org(id))",
+    );
+    let mut session = Session::new(&engine);
+    session.execute(build_plan(&engine, "BEGIN")).unwrap();
+    session
+        .execute(build_plan(
+            &engine,
+            "INSERT INTO org VALUES (1,NULL),(2,1),(3,2)",
+        ))
+        .unwrap();
+    session.execute(build_plan(&engine, "COMMIT")).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(3)]]
+    );
+}
+
+/// The check picks between a lazy walk and a sorted search by weighing how many rows the statement
+/// carries against how big the parent is. Both must answer identically — the split is about how the
+/// parent is searched, not what counts as present.
+///
+/// The row counts straddle the threshold so both routes are exercised. They do not pin where the
+/// threshold sits, and no correctness test can: moving it changes which route runs, and the whole
+/// point is that the two routes answer the same. I checked — an off-by-one in the comparison
+/// leaves this test green. Where the line falls is a performance question, answered by measurement,
+/// not here.
+#[test]
+fn both_foreign_key_search_strategies_agree() {
+    for n in [1usize, 2, 3, 4, 9, 40] {
+        let engine = BtreeEngine::new();
+        run(
+            &engine,
+            "CREATE TABLE org (id INT PRIMARY KEY, atasan_id INT REFERENCES org(id))",
+        );
+        // A chain where every row but the first points at the row before it.
+        let mut values = vec!["(1,NULL)".to_owned()];
+        for id in 2..=n {
+            values.push(format!("({id},{})", id - 1));
+        }
+        run(
+            &engine,
+            &format!("INSERT INTO org VALUES {}", values.join(",")),
+        );
+        assert_eq!(
+            rows(run(&engine, "SELECT count(*) FROM org")),
+            vec![vec![Value::Int(i64::try_from(n).unwrap())]],
+            "chain of {n} rows"
+        );
+
+        // One unsatisfiable row anywhere in the same shape refuses the whole statement.
+        let mut bad = values.clone();
+        bad.push(format!("({},9999)", n + 1));
+        let engine2 = BtreeEngine::new();
+        run(
+            &engine2,
+            "CREATE TABLE org (id INT PRIMARY KEY, atasan_id INT REFERENCES org(id))",
+        );
+        assert!(
+            run_try(
+                &engine2,
+                &format!("INSERT INTO org VALUES {}", bad.join(","))
+            )
+            .is_err(),
+            "chain of {n} rows with one dangling reference"
+        );
+        assert_eq!(
+            rows(run(&engine2, "SELECT count(*) FROM org")),
+            vec![vec![Value::Int(0)]]
+        );
+    }
+}
