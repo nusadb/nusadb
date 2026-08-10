@@ -495,6 +495,17 @@ pub fn effective_roles(
 ) -> Result<BTreeSet<String>, Error> {
     let memberships = all_memberships(engine, txn)?;
     let roles = all_roles(engine, txn)?;
+    Ok(effective_roles_from(&memberships, &roles, user))
+}
+
+/// The membership closure computed from already-fetched catalogs — no scan. Split out so a caller
+/// that also needs `all_roles`/`all_memberships` for something else (the superuser attribute, a
+/// grant scan) fetches each catalog once instead of paying for a fresh scan per question.
+fn effective_roles_from(
+    memberships: &[MembershipRecord],
+    roles: &[RoleRecord],
+    user: &str,
+) -> BTreeSet<String> {
     let inherits: HashMap<&str, bool> =
         roles.iter().map(|r| (r.name.as_str(), r.inherit)).collect();
 
@@ -514,7 +525,31 @@ pub fn effective_roles(
             }
         }
     }
-    Ok(seen)
+    seen
+}
+
+/// The membership closure a session effectively holds, and whether it is a superuser.
+///
+/// Both facts come from the same two catalogs (roles and memberships), so resolving them together
+/// in one scan pass avoids the scan-and-throw-away that separate [`effective_roles`] +
+/// [`principal`] calls paid.
+pub fn resolve_session(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+) -> Result<(BTreeSet<String>, bool), Error> {
+    if user == crate::BOOTSTRAP_SUPERUSER {
+        let mut effective = BTreeSet::new();
+        effective.insert(user.to_owned());
+        return Ok((effective, true));
+    }
+    let memberships = all_memberships(engine, txn)?;
+    let roles = all_roles(engine, txn)?;
+    let effective = effective_roles_from(&memberships, &roles, user);
+    let superuser = roles
+        .iter()
+        .any(|r| r.superuser && effective.contains(&r.name));
+    Ok((effective, superuser))
 }
 
 /// Whether granting membership in `role` to `member` would close a cycle — that is, whether
@@ -943,18 +978,9 @@ pub struct Principal {
 /// # Errors
 /// Propagates storage errors.
 pub fn principal(engine: &dyn StorageEngine, txn: TxnId, user: &str) -> Result<Principal, Error> {
-    if user == crate::BOOTSTRAP_SUPERUSER {
-        return Ok(Principal {
-            role: user.to_owned(),
-            superuser: true,
-        });
-    }
-    // A superuser attribute on any role the session effectively holds makes the session a
-    // superuser — membership in a superuser role is how the attribute is meant to spread.
-    let effective = effective_roles(engine, txn, user)?;
-    let superuser = all_roles(engine, txn)?
-        .into_iter()
-        .any(|r| r.superuser && effective.contains(&r.name));
+    // Whether the session is a superuser is derived from the same role/membership catalogs as its
+    // effective roles, so [`resolve_session`] computes both in one scan pass.
+    let (_effective, superuser) = resolve_session(engine, txn, user)?;
     Ok(Principal {
         role: user.to_owned(),
         superuser,
@@ -976,10 +1002,13 @@ pub fn has_privilege(
     object: &str,
     privilege: Privilege,
 ) -> Result<bool, Error> {
-    if principal(engine, txn, user)?.superuser {
+    // One scan pass yields both the superuser flag and the effective roles the owner- and
+    // grant-checks need — previously the effective set was recomputed after `principal` discarded
+    // it.
+    let (effective, superuser) = resolve_session(engine, txn, user)?;
+    if superuser {
         return Ok(true);
     }
-    let effective = effective_roles(engine, txn, user)?;
     if effective.contains(&object_owner(engine, txn, kind, object)?) {
         return Ok(true);
     }
@@ -1010,10 +1039,10 @@ pub fn may_grant(
     object: &str,
     privilege: Privilege,
 ) -> Result<bool, Error> {
-    if principal(engine, txn, user)?.superuser {
+    let (effective, superuser) = resolve_session(engine, txn, user)?;
+    if superuser {
         return Ok(true);
     }
-    let effective = effective_roles(engine, txn, user)?;
     if effective.contains(&object_owner(engine, txn, kind, object)?) {
         return Ok(true);
     }
@@ -1048,10 +1077,10 @@ pub fn owns_object(
 /// # Errors
 /// Propagates storage errors.
 pub fn may_create_role(engine: &dyn StorageEngine, txn: TxnId, user: &str) -> Result<bool, Error> {
-    if principal(engine, txn, user)?.superuser {
+    let (effective, superuser) = resolve_session(engine, txn, user)?;
+    if superuser {
         return Ok(true);
     }
-    let effective = effective_roles(engine, txn, user)?;
     Ok(all_roles(engine, txn)?
         .into_iter()
         .any(|r| r.create_role && effective.contains(&r.name)))
@@ -1070,7 +1099,8 @@ pub fn may_administer_role(
     user: &str,
     role: &str,
 ) -> Result<bool, Error> {
-    if principal(engine, txn, user)?.superuser {
+    let (effective, superuser) = resolve_session(engine, txn, user)?;
+    if superuser {
         return Ok(true);
     }
     let roles = all_roles(engine, txn)?;
@@ -1081,7 +1111,6 @@ pub fn may_administer_role(
     if roles.iter().any(|r| r.name == role && r.superuser) {
         return Ok(false);
     }
-    let effective = effective_roles(engine, txn, user)?;
     if roles
         .iter()
         .any(|r| r.create_role && effective.contains(&r.name))
