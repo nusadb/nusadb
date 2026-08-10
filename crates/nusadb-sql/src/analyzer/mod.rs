@@ -730,17 +730,23 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::ShowTables => Ok(LogicalPlan::ShowTables),
         ast::Statement::ShowColumns(table) => {
             let schema = resolve_table(None, &table, catalog)?;
+            // Enumerating a table's columns leaks its shape; require some relationship to it.
+            dcl::require_table_metadata_access(catalog, &schema)?;
             Ok(LogicalPlan::ShowColumns(schema))
         },
         ast::Statement::Vacuum(options) => Ok(LogicalPlan::Vacuum(options)),
         ast::Statement::Reindex => Ok(LogicalPlan::Reindex),
         ast::Statement::Analyze(an) => analyze_analyze(an, catalog).map(LogicalPlan::Analyze),
         ast::Statement::LockTable { tables, mode } => {
-            // Resolve every named table (each must exist); the executor then acquires the lock.
+            // Resolve every named table (each must exist); a lock guards a write, so require
+            // ownership or a write privilege on each before the executor acquires it.
             let tables = tables
                 .iter()
                 .map(|name| resolve_table(None, name, catalog))
                 .collect::<Result<Vec<_>, Error>>()?;
+            for table in &tables {
+                dcl::require_table_lock(catalog, table)?;
+            }
             Ok(LogicalPlan::LockTable { tables, mode })
         },
         ast::Statement::Prepare { name, statement } => {
@@ -805,7 +811,10 @@ fn analyze_create_trigger(
     enforce_system_catalog(&ct.table, catalog)?;
     // The target table must exist (resolve discards the schema — the executor re-resolves at fire
     // time under the live snapshot).
-    resolve_table(None, &ct.table, catalog)?;
+    let table = resolve_table(None, &ct.table, catalog)?;
+    // Attaching a trigger needs the TRIGGER privilege on the table (the grantable right that
+    // exists for exactly this).
+    dcl::require_table_privilege(catalog, &table, ast::Privilege::Trigger)?;
     Ok(LogicalPlan::CreateTrigger(CreateTriggerPlan {
         name: ct.name,
         or_replace: ct.or_replace,

@@ -88,6 +88,55 @@ pub(super) fn require_table_ownership(
     )))
 }
 
+/// Whether the session may see a table's metadata (its column list, via `SHOW COLUMNS`). Any
+/// relationship to the table is enough — ownership, a superuser session, or any single privilege
+/// on it — but a role with no relationship to the table cannot enumerate its columns, which would
+/// otherwise leak the schema of tables it can neither read nor write.
+pub(super) fn require_table_metadata_access(
+    catalog: &dyn Catalog,
+    table: &nusadb_core::TableSchema,
+) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    let object = format!("{}.{}", table.schema, table.name);
+    if catalog.owns_object(ObjectKind::Table, &object)? {
+        return Ok(());
+    }
+    for privilege in Privilege::all_for(ObjectKind::Table) {
+        if catalog.has_privilege(ObjectKind::Table, &object, privilege)? {
+            return Ok(());
+        }
+    }
+    Err(Error::PermissionDenied(format!(
+        "must have some privilege on table `{object}` to see its columns"
+    )))
+}
+
+/// Whether the session may `LOCK` a table: the table's owner, a superuser, or a role holding a
+/// privilege that lets it change the table's rows (`UPDATE`/`DELETE`/`TRUNCATE`) — a lock exists
+/// to guard a write, so read-only access does not grant it.
+pub(super) fn require_table_lock(
+    catalog: &dyn Catalog,
+    table: &nusadb_core::TableSchema,
+) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    let object = format!("{}.{}", table.schema, table.name);
+    if catalog.owns_object(ObjectKind::Table, &object)? {
+        return Ok(());
+    }
+    for privilege in [Privilege::Update, Privilege::Delete, Privilege::Truncate] {
+        if catalog.has_privilege(ObjectKind::Table, &object, privilege)? {
+            return Ok(());
+        }
+    }
+    Err(Error::PermissionDenied(format!(
+        "must own table `{object}` or hold UPDATE, DELETE or TRUNCATE on it to lock it"
+    )))
+}
+
 /// Destroying a schema is its owner's right (or a superuser's), never a grantable privilege —
 /// the same rule as a table. A schema with no recorded owner reads as bootstrap-superuser-owned,
 /// so only a superuser reaches it, which is the safe default for the pre-RBAC `public` schema.

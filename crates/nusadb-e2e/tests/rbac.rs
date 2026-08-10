@@ -793,3 +793,52 @@ fn drop_schema_cascade_clears_member_grants() {
     // The stale grant must be gone: app cannot read the reincarnated table.
     denied_as(&engine, "app", "SELECT id FROM s.t");
 }
+
+/// SHOW COLUMNS must not leak a table's shape to a role with no relationship to it; any single
+/// privilege (or ownership) is enough to see it.
+#[test]
+fn show_columns_requires_some_privilege() {
+    let engine = fixture();
+    denied_as(&engine, "app", "SHOW COLUMNS FROM orders");
+    root(&engine, "GRANT SELECT ON orders TO app");
+    // Any privilege suffices — the column list is visible now.
+    ok_as(&engine, "app", "SHOW COLUMNS FROM orders");
+}
+
+/// CREATE INDEX restructures a table — the owner's right, denied to a mere reader.
+#[test]
+fn create_index_requires_ownership() {
+    let engine = fixture();
+    root(&engine, "GRANT SELECT ON orders TO app");
+    denied_as(&engine, "app", "CREATE INDEX ord_total ON orders (total)");
+}
+
+/// CREATE TRIGGER needs the TRIGGER privilege, not merely the ability to read the table.
+#[test]
+fn create_trigger_requires_trigger_privilege() {
+    let engine = fixture();
+    root(&engine, "CREATE TABLE audit (msg TEXT)");
+    root(&engine, "GRANT SELECT ON orders TO app");
+    denied_as(
+        &engine,
+        "app",
+        "CREATE TRIGGER t AFTER INSERT ON orders FOR EACH ROW INSERT INTO audit VALUES ('x')",
+    );
+    root(&engine, "GRANT TRIGGER ON orders TO app");
+    ok_as(
+        &engine,
+        "app",
+        "CREATE TRIGGER t AFTER INSERT ON orders FOR EACH ROW INSERT INTO audit VALUES ('x')",
+    );
+}
+
+/// LOCK TABLE guards a write, so a read-only role cannot take one; a write privilege (or
+/// ownership) grants it.
+#[test]
+fn lock_table_requires_write_or_ownership() {
+    let engine = fixture();
+    root(&engine, "GRANT SELECT ON orders TO app");
+    denied_as(&engine, "app", "LOCK TABLE orders IN ACCESS EXCLUSIVE MODE");
+    root(&engine, "GRANT UPDATE ON orders TO app");
+    ok_as(&engine, "app", "LOCK TABLE orders IN ACCESS EXCLUSIVE MODE");
+}

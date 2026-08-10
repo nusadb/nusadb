@@ -258,6 +258,8 @@ pub(super) fn analyze_create_index(
         .ok_or_else(|| Error::TableNotFound {
             name: super::qualified_display_opt(ci.table_schema.as_deref(), &ci.table),
         })?;
+    // Adding an index restructures the table — the owner's right, like ALTER and DROP.
+    super::dcl::require_table_ownership(catalog, &table, "create an index on")?;
     // Every plain key column and every INCLUDE column must exist (find_column reports
     // ColumnNotFound). Expression keys are validated below by type-checking them against the table.
     for column in ci.columns.iter().chain(&ci.include) {

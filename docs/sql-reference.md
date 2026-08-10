@@ -262,3 +262,42 @@ Consequences worth knowing:
   by default. Where connections are scarce, set the pair together — `max_autocommit_retries` for
   how hard to try, `statement_timeout` for how long the whole sequence may take — since the timeout
   covers all attempts as one.
+
+## Access control: what is enforced
+
+Objects are owned, and access defaults to closed: a role reaches only what it owns or has been
+granted. The following are checked on every statement.
+
+- **Reading and writing rows** — `SELECT`, `INSERT`, `UPDATE`, `DELETE` each need their own
+  privilege on the table (or ownership). One does not imply another.
+- **Emptying a table** — `TRUNCATE` needs the `TRUNCATE` privilege; it is not implied by `DELETE`.
+- **`ANALYZE`** — needs `SELECT`, because it reads every row and stores column values.
+- **Restructuring a table** — `CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE` require ownership.
+- **Attaching a trigger** — `CREATE TRIGGER` needs the `TRIGGER` privilege on the table.
+- **Locking** — `LOCK TABLE` needs ownership or a write privilege (`UPDATE`/`DELETE`/`TRUNCATE`),
+  since a lock exists to guard a write.
+- **Seeing a table's columns** — `SHOW COLUMNS` needs some privilege on the table (any one), so a
+  role cannot enumerate the shape of a table it has no relationship to.
+- **Schemas and databases** — `DROP SCHEMA` requires ownership of the schema (its creator owns
+  it); `DROP DATABASE` requires a superuser.
+- **Roles** — a role may be administered only by a superuser, a `CREATEROLE` role, or a member
+  holding it `WITH ADMIN OPTION`; a superuser role can be administered only by a superuser, so
+  `CREATEROLE` cannot escalate itself to superuser.
+
+### Not yet enforced (stored, and honest about it)
+
+Some privileges parse, are stored, and appear in `information_schema`, but no statement consults
+them yet. They are recorded so grants written today keep their meaning once enforcement lands;
+until then, do not rely on them to restrict access:
+
+- **`REFERENCES`** — creating a foreign key that points at another role's table is not yet gated by
+  this privilege.
+- **Schema `USAGE`/`CREATE`, database `CONNECT`/`CREATE`/`TEMPORARY`, and sequence
+  `USAGE`/`SELECT`/`UPDATE`** — stored but not consulted at the corresponding call sites.
+
+### Metadata enumeration
+
+`SHOW TABLES` and the `information_schema` views list object *names* without a per-object
+privilege filter (they do hide the engine's own internal catalogs). A role can therefore learn
+which tables exist, though not their contents or (via `SHOW COLUMNS`) their shape without some
+privilege. Per-privilege filtering of these listings is planned.
