@@ -1125,6 +1125,13 @@ pub struct WindowFunction {
     pub order: Vec<OrderByItem>,
     /// `ROWS | RANGE | GROUPS` frame; `None` when absent.
     pub frame: Option<WindowFrame>,
+    /// `FILTER (WHERE pred)` — restrict the aggregation to rows where `pred` is true. Only an
+    /// aggregate used `OVER` a window may carry one; the parser rejects it on the ranking,
+    /// navigation and distribution functions, which aggregate nothing. `None` when absent.
+    ///
+    /// A filtered row is excluded from the aggregate but still produces an output row, so this
+    /// narrows what the window *reads*, never what the query *returns*.
+    pub filter: Option<Box<Expr>>,
 }
 
 /// A `ROWS | RANGE | GROUPS BETWEEN start AND end` window frame.

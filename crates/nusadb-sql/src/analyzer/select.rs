@@ -1342,8 +1342,11 @@ fn analyze_select_scoped(
             rebase_onto_aggregation(&mut key.expr, &mut ctx)?;
         }
         // A window over aggregated rows runs on the post-aggregation row, so its PARTITION / ORDER /
-        // argument expressions rebase onto it too — a grouped column becomes its key slot and a
-        // grouping aggregate its shifted `AggregateRef`, exactly as the projection's do.
+        // argument / FILTER expressions rebase onto it too — a grouped column becomes its key slot
+        // and a grouping aggregate its shifted `AggregateRef`, exactly as the projection's do.
+        // Every sub-expression of the window must be listed here: one left out keeps its source
+        // ordinals and is then read against a different row, which lands on a same-typed column and
+        // answers wrongly in silence rather than failing.
         for window in &mut windows {
             for part in &mut window.partition {
                 rebase_onto_aggregation(part, &mut ctx)?;
@@ -1353,6 +1356,9 @@ fn analyze_select_scoped(
             }
             for arg in &mut window.args {
                 rebase_onto_aggregation(arg, &mut ctx)?;
+            }
+            if let Some(filter) = window.filter.as_mut() {
+                rebase_onto_aggregation(filter, &mut ctx)?;
             }
         }
     }

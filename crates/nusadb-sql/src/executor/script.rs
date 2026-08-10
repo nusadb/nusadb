@@ -656,6 +656,9 @@ fn bind_vars_expr(
             for order in &mut wf.order {
                 bind_vars_expr(&mut order.expr, ctx, shadowed)?;
             }
+            if let Some(filter) = wf.filter.as_mut() {
+                bind_vars_expr(filter, ctx, shadowed)?;
+            }
         },
         ast::Expr::WithinGroup(wg) => {
             for arg in &mut wg.args {

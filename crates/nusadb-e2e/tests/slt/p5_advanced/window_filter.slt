@@ -1,0 +1,181 @@
+# p5_advanced/window_filter — FILTER (WHERE ...) on an aggregate used OVER a window.
+#
+# The filter narrows what the aggregate READS, never what the query RETURNS: a row excluded by the
+# predicate still produces an output row, it just does not contribute to the aggregate. A row whose
+# every frame excludes it gets the empty-aggregate value (0 for COUNT, NULL for SUM/AVG/MIN/MAX).
+#
+# Covers: OVER () and OVER (PARTITION BY ... ORDER BY ...), per-partition independence, the running
+# frame, an explicit ROWS frame (which takes a different execution path), COUNT/SUM/AVG/MIN/MAX,
+# a filter that matches nothing, and equivalence with the CASE WHEN rewrite it replaces.
+
+statement ok
+CREATE TABLE produk (id INT PRIMARY KEY, dept TEXT, harga INT)
+
+statement ok
+INSERT INTO produk VALUES
+  (1, 'a', 50), (2, 'a', 150), (3, 'a', 250),
+  (4, 'b', 100), (5, 'b', 300)
+
+# OVER () — one value shared by every row: 3 of the 5 rows have harga > 100. Every input row is
+# still returned, including the ones the filter excluded.
+query ITII
+SELECT id, dept, harga, count(*) FILTER (WHERE harga > 100) OVER () AS mahal
+FROM produk ORDER BY id
+----
+1 a 50 3
+2 a 150 3
+3 a 250 3
+4 b 100 3
+5 b 300 3
+
+# The filter is per-partition, not global: dept 'a' has 2 rows over 100, dept 'b' has 1.
+query ITI
+SELECT id, dept, count(*) FILTER (WHERE harga > 100) OVER (PARTITION BY dept) AS mahal
+FROM produk ORDER BY id
+----
+1 a 2
+2 a 2
+3 a 2
+4 b 1
+5 b 1
+
+# With ORDER BY the default frame runs from the partition start through the current peer group, so
+# the filtered count accumulates. Row 1 (harga 50) is excluded from its own count.
+query III
+SELECT id, harga, count(*) FILTER (WHERE harga > 100) OVER (ORDER BY id) AS berjalan
+FROM produk ORDER BY id
+----
+1 50 0
+2 150 1
+3 250 2
+4 100 2
+5 300 3
+
+# An explicit ROWS frame takes a different execution path from the default frame, so pin it
+# separately: a sliding two-row window over the filtered rows.
+query III
+SELECT id, harga,
+       count(*) FILTER (WHERE harga > 100) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS dua
+FROM produk ORDER BY id
+----
+1 50 0
+2 150 1
+3 250 2
+4 100 1
+5 300 1
+
+# SUM / AVG / MIN / MAX all take the filter too. Only rows over 100 contribute: 150+250+300 = 700.
+query IIII
+SELECT sum(harga) FILTER (WHERE harga > 100) OVER () AS s,
+       min(harga) FILTER (WHERE harga > 100) OVER () AS lo,
+       max(harga) FILTER (WHERE harga > 100) OVER () AS hi,
+       count(harga) FILTER (WHERE harga > 100) OVER () AS n
+FROM produk ORDER BY id LIMIT 1
+----
+700 150 300 3
+
+# A filter matching nothing yields the empty-aggregate value, not a dropped row: COUNT gives 0 and
+# SUM gives NULL, and all five rows are still returned.
+query III
+SELECT id, count(*) FILTER (WHERE harga > 100000) OVER () AS n,
+       sum(harga) FILTER (WHERE harga > 100000) OVER () AS s
+FROM produk ORDER BY id
+----
+1 0 NULL
+2 0 NULL
+3 0 NULL
+4 0 NULL
+5 0 NULL
+
+# The workaround this clause replaces must agree with it — a filtered COUNT is the SUM of a CASE.
+query III
+SELECT id,
+       count(*) FILTER (WHERE harga > 100) OVER (PARTITION BY dept) AS pakai_filter,
+       sum(CASE WHEN harga > 100 THEN 1 ELSE 0 END) OVER (PARTITION BY dept) AS pakai_case
+FROM produk ORDER BY id
+----
+1 2 2
+2 2 2
+3 2 2
+4 1 1
+5 1 1
+
+# The predicate may reference any column of the row, not just the aggregated one.
+query II
+SELECT id, count(*) FILTER (WHERE dept = 'a') OVER () AS n_a
+FROM produk ORDER BY id LIMIT 1
+----
+1 3
+
+# Over GROUP BY the window runs on the POST-aggregation row, so the filter has to be remapped onto
+# it exactly as the partition/order/argument expressions are. Left unmapped it keeps its source
+# ordinals and reads a different column of a same-width row — a wrong answer in silence, not an
+# error. Post-aggregation rows here are (a,50) (b,100); exactly one has dept = 'a'.
+query TII
+SELECT dept, min(harga) AS termurah,
+       count(dept) FILTER (WHERE dept = 'a') OVER () AS n_a
+FROM produk GROUP BY dept ORDER BY dept
+----
+a 50 1
+b 100 1
+
+# The same remap must also carry the "neither grouped nor aggregated" rejection: `harga` is a raw
+# column here, so the filter cannot reference it once the rows have been grouped.
+statement error
+SELECT dept, count(*) FILTER (WHERE harga > 100) OVER () FROM produk GROUP BY dept
+
+# A subquery whose ONLY correlation to the outer row lives inside the window FILTER is still a
+# correlated subquery. Missed, it is classified uncorrelated, evaluated once with no outer row
+# bound, and the unbound reference reads NULL — so the predicate never holds and every row comes
+# back 0. That is an ordinary-looking answer, not an error.
+query II
+SELECT p.id,
+       (SELECT count(q.dept) FILTER (WHERE q.dept = p.dept) OVER () FROM produk q LIMIT 1) AS sesama
+FROM produk p ORDER BY p.id
+----
+1 3
+2 3
+3 3
+4 2
+5 2
+
+# A placeholder inside the filter has to be counted and substituted like any other. The walkers that
+# do that traverse the window field by field, so one left out is a silent mis-bind, not an error:
+# the predicate would keep an unbound `$1` or bind the wrong value.
+statement ok
+PREPARE mahal_di AS SELECT count(*) FILTER (WHERE harga > $1) OVER () AS n FROM produk
+
+query I
+EXECUTE mahal_di(100)
+----
+3
+3
+3
+3
+3
+
+# A different argument must change the answer — otherwise the binding could be ignored entirely and
+# the case above would still pass.
+query I
+EXECUTE mahal_di(200)
+----
+2
+2
+2
+2
+2
+
+statement ok
+DEALLOCATE mahal_di
+
+# FILTER is for aggregates: the ranking and navigation functions aggregate nothing, so it is
+# rejected rather than silently ignored.
+statement error
+SELECT row_number() FILTER (WHERE harga > 100) OVER () FROM produk
+
+statement error
+SELECT lag(harga) FILTER (WHERE harga > 100) OVER (ORDER BY id) FROM produk
+
+# The predicate must be boolean.
+statement error
+SELECT count(*) FILTER (WHERE harga) OVER () FROM produk

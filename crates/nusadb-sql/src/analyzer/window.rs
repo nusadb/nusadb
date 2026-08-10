@@ -386,6 +386,25 @@ pub(super) fn resolve_window(
             (arg.into_iter().collect(), ty)
         },
     };
+    // `FILTER (WHERE pred)` is a per-row predicate over the source rows, so it resolves against the
+    // same scope the arguments do and must be boolean. It is deliberately analyzed WITHOUT the
+    // aggregate sink: an aggregate inside the filter of an aggregate has no meaning, and handing it
+    // the sink would quietly hoist that aggregate into the enclosing GROUP BY instead of rejecting.
+    let filter = wf
+        .filter
+        .as_ref()
+        .map(|pred| -> Result<TypedExpr, Error> {
+            let typed = analyze_expr_agg(pred, scope, catalog, Some(ColumnType::Bool), None)?;
+            if typed.ty != ColumnType::Bool {
+                return Err(Error::TypeMismatch {
+                    context: "window function FILTER".to_owned(),
+                    expected: ColumnType::Bool,
+                    found: typed.ty,
+                });
+            }
+            Ok(typed)
+        })
+        .transpose()?;
     Ok(WindowExpr {
         func: wf.func,
         args,
@@ -393,6 +412,7 @@ pub(super) fn resolve_window(
         order,
         frame,
         result_ty,
+        filter,
     })
 }
 

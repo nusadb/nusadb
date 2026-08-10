@@ -1127,7 +1127,8 @@ fn plan_has_outer_column(plan: &crate::planner::SelectPlan) -> bool {
             plan.windows
                 .iter()
                 .flat_map(|w| w.order.iter().map(|k| &k.expr)),
-        );
+        )
+        .chain(plan.windows.iter().filter_map(|w| w.filter.as_ref()));
     exprs.into_iter().any(expr_has_outer_column)
         || plan.from_cte.as_deref().is_some_and(plan_has_outer_column)
         || plan
@@ -3681,6 +3682,30 @@ pub(super) fn compute_window(rows: &[Row], window: &WindowExpr) -> Result<Vec<as
         }
     }
 
+    // Built once, not per partition: nothing in it depends on the bucket, and rebuilding it there
+    // would clone the argument and filter expressions for every partition.
+    let aggregate_call = match &window.func {
+        W::Aggregate(func) => Some(AggregateCall {
+            func: *func,
+            arg: window.args.first().cloned(),
+            result_ty: window.result_ty,
+            // Window aggregates do not carry DISTINCT, an ordered-set fraction, or the
+            // two-argument statistical forms — those are grouped-aggregate clauses.
+            // `FILTER` they do carry, and it means what it means for a grouped aggregate:
+            // a row contributes only when the predicate holds.
+            distinct: false,
+            fraction: None,
+            ordered_set_descending: false,
+            filter: window.filter.clone(),
+            separator: None,
+            arg2: None,
+            order_by: Vec::new(),
+            row_args: Vec::new(),
+            grouping_args: Vec::new(),
+        }),
+        _ => None,
+    };
+
     for bucket in &partitions {
         crate::cancel::check()?;
         // Order the partition's rows by the window ORDER BY (stable; identity when unordered).
@@ -3714,25 +3739,16 @@ pub(super) fn compute_window(rows: &[Row], window: &WindowExpr) -> Result<Vec<as
             W::RowNumber | W::Rank | W::DenseRank => {
                 assign_ranking(&ordered, &window.func, &mut result);
             },
-            W::Aggregate(func) => {
-                let call = AggregateCall {
-                    func: *func,
-                    arg: window.args.first().cloned(),
-                    result_ty: window.result_ty,
-                    // Window aggregates do not carry DISTINCT, FILTER, an ordered-set
-                    // fraction, or the two-argument statistical forms — those are
-                    // grouped-aggregate clauses.
-                    distinct: false,
-                    fraction: None,
-                    ordered_set_descending: false,
-                    filter: None,
-                    separator: None,
-                    arg2: None,
-                    order_by: Vec::new(),
-                    row_args: Vec::new(),
-                    grouping_args: Vec::new(),
-                };
-                assign_window_aggregate(&ordered, rows, &call, window, &mut result)?;
+            W::Aggregate(_) => {
+                // `aggregate_call` is `Some` for exactly this arm, by construction above. Failing
+                // loudly rather than skipping keeps a future `WindowFunc` variant (or a refactor
+                // that moves the construction) from quietly emitting an all-NULL column.
+                let call = aggregate_call.as_ref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "window aggregate reached without a prepared call".to_owned(),
+                    )
+                })?;
+                assign_window_aggregate(&ordered, rows, call, window, &mut result)?;
             },
             W::Lag | W::Lead | W::FirstValue | W::LastValue | W::NthValue => {
                 assign_navigation(&ordered, rows, window, &mut result)?;

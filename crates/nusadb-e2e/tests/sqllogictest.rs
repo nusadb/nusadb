@@ -508,6 +508,11 @@ fn slt_p5_merge() {
 }
 
 #[test]
+fn slt_p5_window_filter() {
+    run_slt("tests/slt/p5_advanced/window_filter.slt");
+}
+
+#[test]
 fn slt_p5_merge_not_matched_by_source() {
     run_slt("tests/slt/p5_advanced/merge_not_matched_by_source.slt");
 }

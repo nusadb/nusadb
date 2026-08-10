@@ -1937,6 +1937,13 @@ pub struct WindowExpr {
     pub frame: Option<WindowFrame>,
     /// Result type of the produced column.
     pub result_ty: ColumnType,
+    /// `FILTER (WHERE pred)` — a per-row boolean predicate over the pre-window scope; a row
+    /// contributes to the aggregate only when it evaluates to `TRUE`. `None` when absent, and always
+    /// `None` for the non-aggregate window functions (the parser rejects a filter on those).
+    ///
+    /// Filtering changes only what the aggregate reads: every input row still yields an output row,
+    /// and a row excluded from every frame gets the empty-aggregate value.
+    pub filter: Option<TypedExpr>,
 }
 
 /// A resolved window frame.

@@ -693,12 +693,17 @@ pub(super) fn window_func_by_name(name: &str) -> Option<ast::WindowFunc> {
 /// Frame bounds (`ROWS`/`RANGE`/`GROUPS`) are not yet modelled — they are rejected
 /// with [`Error::Unsupported`] pointing at
 pub(super) fn convert_window_function(function: sql::Function) -> Result<ast::Expr, Error> {
-    if function.filter.is_some()
-        || function.null_treatment.is_some()
-        || !function.within_group.is_empty()
-        || !matches!(function.parameters, sql::FunctionArguments::None)
-    {
-        return unsupported("FILTER / NULLS / WITHIN GROUP in window function");
+    // Rejected one clause at a time, not as one arm: `FILTER` is supported on an aggregate used
+    // `OVER` a window, while these three are not supported at all. Lumping them together would make
+    // the surface unreadable from the error message alone.
+    if function.null_treatment.is_some() {
+        return unsupported("IGNORE NULLS / RESPECT NULLS in window function");
+    }
+    if !function.within_group.is_empty() {
+        return unsupported("WITHIN GROUP in window function");
+    }
+    if !matches!(function.parameters, sql::FunctionArguments::None) {
+        return unsupported("parameterized aggregate in window function");
     }
     let spec = match function.over {
         Some(sql::WindowType::WindowSpec(s)) => s,
@@ -776,12 +781,25 @@ pub(super) fn convert_window_function(function: sql::Function) -> Result<ast::Ex
         })
         .collect::<Result<Vec<_>, _>>()?;
     let frame = spec.window_frame.map(convert_window_frame).transpose()?;
+    // `FILTER (WHERE pred)` restricts what the aggregate reads. The ranking, navigation and
+    // distribution functions aggregate nothing, so a filter on one of them has no meaning to give
+    // — reject rather than accept-and-ignore, which would answer a question nobody asked.
+    let filter = match function.filter {
+        None => None,
+        Some(pred) => {
+            if !matches!(func, ast::WindowFunc::Aggregate(_)) {
+                return unsupported("FILTER on a non-aggregate window function");
+            }
+            Some(Box::new(convert_expr(*pred)?))
+        },
+    };
     Ok(ast::Expr::WindowFunction(Box::new(ast::WindowFunction {
         func,
         args,
         partition,
         order,
         frame,
+        filter,
     })))
 }
 

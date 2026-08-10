@@ -1672,6 +1672,82 @@ fn window_count_over() {
 }
 
 #[test]
+fn window_aggregate_takes_a_filter() {
+    let wf = get_window("SELECT COUNT(*) FILTER (WHERE price > 100) OVER () FROM t");
+    assert_eq!(
+        wf.func,
+        ast::WindowFunc::Aggregate(ast::AggregateFunc::Count)
+    );
+    assert!(wf.filter.is_some(), "the FILTER predicate must be carried");
+    // The predicate is the filter's, not an argument: COUNT(*) still has no arguments.
+    assert!(wf.args.is_empty());
+    // A window aggregate without the clause carries none, so `Some` above means the clause and not
+    // a default.
+    assert!(
+        get_window("SELECT COUNT(*) OVER () FROM t")
+            .filter
+            .is_none(),
+        "no FILTER clause must leave the field empty"
+    );
+}
+
+#[test]
+fn window_filter_is_rejected_on_non_aggregates() {
+    // The ranking, navigation and distribution functions aggregate nothing, so a FILTER on them has
+    // no meaning to give. Rejected loudly rather than accepted and ignored.
+    for sql in [
+        "SELECT ROW_NUMBER() FILTER (WHERE x > 1) OVER () FROM t",
+        "SELECT RANK() FILTER (WHERE x > 1) OVER (ORDER BY id) FROM t",
+        "SELECT LAG(x) FILTER (WHERE x > 1) OVER (ORDER BY id) FROM t",
+        "SELECT NTILE(4) FILTER (WHERE x > 1) OVER (ORDER BY id) FROM t",
+    ] {
+        // Assert the specific rejection, not merely that something failed: each of these parses
+        // once the FILTER is removed, so a bare `is_err()` could be satisfied by an unrelated
+        // failure and would not notice this arm disappearing.
+        let err = parse(sql).expect_err(&format!("must not parse: {sql}"));
+        assert!(
+            err.to_string()
+                .contains("FILTER on a non-aggregate window function"),
+            "{sql}\n  want the non-aggregate FILTER rejection, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn window_null_treatment_and_within_group_stay_rejected() {
+    // Splitting the old three-in-one rejection arm opened FILTER only. These two are still outside
+    // the surface, and the split is exactly what could have let one through unnoticed.
+    // Each case names a RECOGNISED window function, so the rejection under test is the one that
+    // fires. An unrecognised name (`percentile_cont`) would fail later regardless and would keep
+    // passing with the arm deleted — a test that cannot fail.
+    for (sql, want) in [
+        (
+            "SELECT LAG(x) IGNORE NULLS OVER (ORDER BY id) FROM t",
+            "IGNORE NULLS / RESPECT NULLS in window function",
+        ),
+        (
+            "SELECT LAG(x) RESPECT NULLS OVER (ORDER BY id) FROM t",
+            "IGNORE NULLS / RESPECT NULLS in window function",
+        ),
+        (
+            "SELECT COUNT(x) WITHIN GROUP (ORDER BY x) OVER () FROM t",
+            "WITHIN GROUP in window function",
+        ),
+        // The third arm of the split: a parametrized aggregate call, `func(params)(args)`.
+        (
+            "SELECT quantile(0.5)(x) OVER () FROM t",
+            "parameterized aggregate in window function",
+        ),
+    ] {
+        let err = parse(sql).expect_err(&format!("must not parse: {sql}"));
+        assert!(
+            err.to_string().contains(want),
+            "{sql}\n  want the {want} rejection, got: {err}"
+        );
+    }
+}
+
+#[test]
 fn window_frame_is_rejected() {
     // Landed — frame now parses; update to assert it parses correctly.
     let wf = get_window(

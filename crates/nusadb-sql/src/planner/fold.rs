@@ -73,6 +73,9 @@ fn fold_window(window: &mut WindowExpr) {
     for key in &mut window.order {
         fold_in_place(&mut key.expr);
     }
+    if let Some(filter) = window.filter.as_mut() {
+        fold_in_place(filter);
+    }
 }
 
 /// Fold `expr` in place (a small helper for the many `&mut TypedExpr` clause slots above).

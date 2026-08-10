@@ -342,6 +342,9 @@ fn count_expr(expr: &ast::Expr, max: &mut usize) {
             for o in &wf.order {
                 count_expr(&o.expr, max);
             }
+            if let Some(filter) = &wf.filter {
+                count_expr(filter, max);
+            }
             count_window_frame(wf.frame.as_ref(), max);
         },
         ast::Expr::WithinGroup(wg) => {
@@ -499,6 +502,9 @@ pub(crate) fn substitute_param_exprs(
             }
             for order in &mut wf.order {
                 substitute_param_exprs(&mut order.expr, args, param_names);
+            }
+            if let Some(filter) = wf.filter.as_mut() {
+                substitute_param_exprs(filter, args, param_names);
             }
         },
         ast::Expr::WithinGroup(wg) => {
@@ -798,6 +804,9 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Er
             }
             for o in &mut wf.order {
                 substitute_expr(&mut o.expr, params)?;
+            }
+            if let Some(filter) = wf.filter.as_mut() {
+                substitute_expr(filter, params)?;
             }
             substitute_window_frame(wf.frame.as_mut(), params)?;
             Ok(())

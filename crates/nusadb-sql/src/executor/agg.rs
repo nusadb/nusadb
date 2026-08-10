@@ -757,6 +757,13 @@ pub(super) fn sliding_window_aggregate(
     mut emit: impl FnMut(usize, ast::Value) -> Result<(), Error>,
 ) -> Result<bool, Error> {
     use crate::ast::AggregateFunc as F;
+    // A `FILTER` decides per row whether that row contributes at all, but the slide only ever sees
+    // `value_at(pos)` — it has no way to ask. Accepting one here would silently count and sum the
+    // rows the filter excludes, so hand these back to the caller's from-scratch fold, which applies
+    // the predicate. (Same reason `call_is_parallel_mergeable` excludes a filtered call.)
+    if call.filter.is_some() {
+        return Ok(false);
+    }
     let kind = match call.func {
         // A row-value COUNT has no `arg` to slide over and is not a COUNT(*); it has no sliding
         // form, so the caller keeps the general per-frame fold.

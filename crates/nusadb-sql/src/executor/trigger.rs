@@ -885,6 +885,9 @@ fn sub_expr(expr: &mut ast::Expr, refs: &RowRefs<'_>) -> Result<(), Error> {
             for order in &mut wf.order {
                 sub_expr(&mut order.expr, refs)?;
             }
+            if let Some(filter) = wf.filter.as_mut() {
+                sub_expr(filter, refs)?;
+            }
             sub_frame(wf.frame.as_mut(), refs)
         },
         ast::Expr::WithinGroup(wg) => {
