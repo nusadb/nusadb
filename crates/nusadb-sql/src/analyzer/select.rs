@@ -940,7 +940,7 @@ pub(super) fn analyze_set_body(
             let (ltree, lcols) = analyze_set_body(*left, catalog)?;
             let (rtree, rcols) = analyze_set_body(*right, catalog)?;
             if lcols.len() != rcols.len() {
-                return Err(Error::ArityMismatch {
+                return Err(Error::SetOpArityMismatch {
                     context: "set operation".to_owned(),
                     expected: lcols.len(),
                     found: rcols.len(),
@@ -1741,7 +1741,10 @@ fn analyze_recursive_cte(
     };
     let recursive_plan = analyze_select((**rec_select).clone(), &cte_catalog)?;
     if recursive_plan.projection.len() != base_plan.projection.len() {
-        return Err(Error::ArityMismatch {
+        // The anchor and recursive terms are the two branches of the CTE's `UNION ALL`, so a width
+        // disagreement here is the same malformed-query error as any other set operation's, and
+        // carries the same class-42 code. The context still names the CTE.
+        return Err(Error::SetOpArityMismatch {
             context: format!("recursive CTE `{}` term", cte.name),
             expected: base_plan.projection.len(),
             found: recursive_plan.projection.len(),

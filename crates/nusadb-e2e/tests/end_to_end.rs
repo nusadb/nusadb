@@ -1332,6 +1332,59 @@ fn runtime_data_exceptions_carry_class_22_sqlstates() {
 }
 
 #[test]
+fn set_operation_arity_mismatch_is_a_class_42_not_an_internal_error() {
+    // Branches selecting different column counts is a malformed query, so it carries class 42
+    // (syntax_error). Reporting XX000 told every driver, pooling layer and retry wrapper that the
+    // engine had faulted on what is really a user typo — those layers branch on the two-letter
+    // class, never on the message text, so this was invisible by hand and wrong in integration.
+    let engine = BtreeEngine::new();
+    let err = |sql: &str| run_try(&engine, sql).expect_err("expected an arity error");
+
+    // All four set operators reach the same check, as does the UNION ALL between a recursive CTE's
+    // anchor and recursive terms. Pin each rather than assume, and assert the CODE.
+    for sql in [
+        "SELECT 1, 2 UNION SELECT 1",
+        "SELECT 1, 2 UNION ALL SELECT 1",
+        "SELECT 1, 2 INTERSECT SELECT 1",
+        "SELECT 1, 2 EXCEPT SELECT 1",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n, n FROM t) SELECT n FROM t",
+    ] {
+        assert_eq!(err(sql).sqlstate(), "42601", "got: {} for {sql}", err(sql));
+    }
+
+    // The code must not have been bought by dropping the diagnosis. Pin the messages WHOLE rather
+    // than by fragments: a `contains` on a short fragment can be satisfied by the surrounding
+    // boilerplate, so it would keep passing after the very loss it claims to guard against.
+    assert_eq!(
+        err("SELECT 1, 2 UNION SELECT 1").to_string(),
+        "set operation: expected 2 value(s), found 1"
+    );
+    assert_eq!(
+        err("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n, n FROM t) SELECT n FROM t")
+            .to_string(),
+        "recursive CTE `t` term: expected 1 value(s), found 2"
+    );
+
+    // A well-formed set operation is unaffected.
+    assert!(
+        run_try(&engine, "SELECT 1, 2 UNION SELECT 3, 4").is_ok(),
+        "matching branch widths must still succeed"
+    );
+
+    // The recode is deliberately narrow, so pin the boundary by VARIANT rather than by code: a
+    // VALUES-list width error is still the generic arity error. Asserting its XX000 instead would
+    // pin the absence of the wider fix, and would fail the day that fix lands for an unrelated
+    // reason — this assertion survives it.
+    assert!(
+        matches!(
+            err("SELECT * FROM (VALUES (1, 2), (3)) v"),
+            nusadb_sql::Error::ArityMismatch { .. }
+        ),
+        "a VALUES width error must stay the generic arity error, not be swept into the set-op one"
+    );
+}
+
+#[test]
 fn timetz_literal_insert_cast_and_round_trip() {
     // K3 — TIME WITH TIME ZONE was DDL-only: a text literal would not insert and `timetz::text`
     // was unsupported. A timetz value now stores from a text literal and casts both directions.

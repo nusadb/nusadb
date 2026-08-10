@@ -1069,13 +1069,14 @@ fn set_operations_resolve_and_check_compatibility() {
             "expected a SetOperation plan for {sql}",
         );
     }
-    // Column-count mismatch and per-column type mismatch are rejected.
+    // Column-count mismatch and per-column type mismatch are rejected. A branch-width mismatch has
+    // its own variant, carrying a class-42 SQLSTATE rather than the generic internal-error code.
     assert!(matches!(
         plan(
             "SELECT id FROM users UNION SELECT id, name FROM users",
             &catalog()
         ),
-        Err(Error::ArityMismatch { .. }),
+        Err(Error::SetOpArityMismatch { .. }),
     ));
     assert!(matches!(
         plan(
@@ -1181,7 +1182,10 @@ fn with_recursive_cte_rejects_type_mismatch_between_terms() {
                  SELECT n FROM t",
             &catalog(),
         ),
-        Err(Error::TypeMismatch { .. } | Error::ArityMismatch { .. }),
+        // Both terms select one column, so this is the type check, not the width check. The width
+        // check on this same path raises `SetOpArityMismatch`; hedging across both here would only
+        // hide which one fired.
+        Err(Error::TypeMismatch { .. }),
     ));
 }
 

@@ -98,6 +98,10 @@ pub enum Error {
 
     /// A value list had the wrong number of elements (e.g. `INSERT` row width
     /// does not match the target column count).
+    ///
+    /// Not every arity error: a set operation whose branches disagree on column count carries
+    /// [`SetOpArityMismatch`](Self::SetOpArityMismatch) instead, for its SQLSTATE. Match on both
+    /// when you mean "any arity error" — the compiler cannot warn you here.
     #[error("{context}: expected {expected} value(s), found {found}")]
     ArityMismatch {
         /// Human-readable description of where the mismatch occurred.
@@ -105,6 +109,31 @@ pub enum Error {
         /// The required number of values.
         expected: usize,
         /// The number of values supplied.
+        found: usize,
+    },
+
+    /// The branches of a set operation select a different number of columns — either the two sides
+    /// of a `UNION`/`INTERSECT`/`EXCEPT`, or the anchor and recursive terms of a recursive CTE
+    /// (which are the branches of its `UNION ALL`).
+    ///
+    /// Split out of [`ArityMismatch`](Self::ArityMismatch) for its SQLSTATE alone: this is a
+    /// malformed query, so it reports `42601`, while the generic variant still reports `XX000`
+    /// ("the engine is broken") — a class drivers and pooling layers branch on. The rendered message
+    /// is identical to what the generic variant produced for these cases, so the recode buys the
+    /// class without costing the diagnosis.
+    ///
+    /// The sibling arity errors (`VALUES`, `INSERT`, function calls, `CREATE VIEW` column lists) are
+    /// user-facing too and still report `XX000`, as does the per-column *type* mismatch of a set
+    /// operation. That is a known wider gap, tracked separately — it is deliberately not fixed here,
+    /// because a blanket recode would also hit the internal batch-construction errors, which are not
+    /// user SQL at all.
+    #[error("{context}: expected {expected} value(s), found {found}")]
+    SetOpArityMismatch {
+        /// Human-readable description of which set operation disagreed.
+        context: String,
+        /// The number of columns the first branch selects.
+        expected: usize,
+        /// The number of columns the other branch selects.
         found: usize,
     },
 
@@ -306,8 +335,9 @@ impl Error {
     /// statement (timeout / cancel request) gets the standard `57014` so drivers that branch on
     /// `query_canceled` recognise it. A runtime **data exception** — a value the query itself
     /// produced that the type cannot represent — gets its standard class-`22` code so a driver can
-    /// tell a user data error from an engine fault; every other SQL-layer error uses the generic
-    /// `XX000`.
+    /// tell a user data error from an engine fault; a set operation whose branches disagree on
+    /// column count is a malformed query and gets class `42`; every other SQL-layer error uses the
+    /// generic `XX000`.
     #[must_use]
     pub fn sqlstate(&self) -> &'static str {
         match self {
@@ -315,6 +345,9 @@ impl Error {
             Self::Coded { sqlstate, .. } => sqlstate,
             Self::NotNullViolation { .. } => "23502",
             Self::Cancelled => "57014", // query_canceled
+            // Class 42 — the query is malformed, not the engine. `XX000` here would tell a driver
+            // the server had faulted on what is really a user typo.
+            Self::SetOpArityMismatch { .. } => "42601", // syntax_error
             // Class 22 — data exception: a runtime value error, not an internal fault.
             Self::DivisionByZero => "22012", // division_by_zero
             // numeric_value_out_of_range — an overflow or a value outside a function's domain.
