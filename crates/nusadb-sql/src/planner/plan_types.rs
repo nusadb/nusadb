@@ -279,7 +279,7 @@ pub enum LogicalPlan {
     Update(UpdatePlan),
     /// `DELETE`.
     Delete(DeletePlan),
-    /// `TRUNCATE ... CASCADE`.
+    /// `TRUNCATE`, with or without `CASCADE` (the plan's `cascade` flag tells them apart).
     TruncateCascade(TruncateCascadePlan),
     /// `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED ...`.
     Merge(MergePlan),
@@ -1483,20 +1483,16 @@ pub struct DeletePlan {
     /// `RETURNING` output columns, resolved against the table's columns and evaluated
     /// against each row's **pre-delete** values. Empty when there is no `RETURNING` clause.
     pub returning: Vec<Projection>,
-    /// `TRUNCATE ... RESTART IDENTITY`: after emptying the table, reset the backing sequence
-    /// of every `SERIAL`/`IDENTITY` column so the next insert restarts at the sequence's start value.
-    /// Always `false` for an ordinary `DELETE` and for `TRUNCATE` / `CONTINUE IDENTITY`.
-    pub restart_identity: bool,
 }
 
-/// `TRUNCATE ... CASCADE`.
+/// `TRUNCATE`, both forms — the `cascade` flag records whether `CASCADE` was written.
 ///
-/// The target table is resolved (existence-checked) at analysis time, like a plain `TRUNCATE`;
-/// unlike a plain `TRUNCATE`, the set of tables actually emptied is not known until execution. The
-/// cascade closure (every table transitively referencing the target through a FOREIGN KEY)
-/// depends on the live constraint catalog, which the analyzer's `Catalog` trait does not expose —
-/// only the production `StorageEngine` adapter the executor runs against does. See
-/// `run_truncate_cascade`.
+/// The target table is resolved (existence-checked) at analysis time; the set of tables actually
+/// emptied is not known until execution. The cascade closure (every table transitively
+/// referencing the target through a FOREIGN KEY) and the FK/view/vector-index facts that pick
+/// between the constant-time rebuild and the row-by-row path all depend on live catalogs, which
+/// the analyzer's `Catalog` trait does not expose — only the production `StorageEngine` adapter
+/// the executor runs against does. See `run_truncate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateCascadePlan {
     /// Schema (namespace) the target table lives in.
@@ -1506,6 +1502,10 @@ pub struct TruncateCascadePlan {
     /// `TRUNCATE ... RESTART IDENTITY`, applied to every table in the cascade closure — not just
     /// the one named in the statement, since every one of them is emptied by this same statement.
     pub restart_identity: bool,
+    /// Whether `CASCADE` was written: the closure of referencing tables is emptied too. Without
+    /// it only the named table empties, and a referencing key from any table outside the
+    /// statement refuses the whole statement — even when that referencing table is empty.
+    pub cascade: bool,
 }
 
 /// `MERGE INTO target USING source ON ... WHEN [NOT] MATCHED ...`.
@@ -2085,7 +2085,7 @@ pub enum PhysicalPlan {
     Update(UpdatePlan),
     /// `DELETE`.
     Delete(DeletePlan),
-    /// `TRUNCATE ... CASCADE`.
+    /// `TRUNCATE`, with or without `CASCADE` (the plan's `cascade` flag tells them apart).
     TruncateCascade(TruncateCascadePlan),
     /// `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED ...`.
     Merge(MergePlan),

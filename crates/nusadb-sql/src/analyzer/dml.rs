@@ -701,7 +701,6 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
         using_plan,
         filter,
         returning,
-        restart_identity: false,
     })
 }
 

@@ -3364,23 +3364,6 @@ pub(super) fn run_delete(
     // Incremental view maintenance: remove the projected rows from any IVM view over this
     // table.
     super::ivm::maintain_on_change(&plan.table.name, &[], &deleted_rows, engine, txn)?;
-    // TRUNCATE ... RESTART IDENTITY: reset the backing sequence of each SERIAL/IDENTITY
-    // column so the next insert restarts at the sequence's start value. Those sequences are created
-    // with start = 1, increment = 1, so setting the current value to 0 makes the next `nextval`
-    // return 1 (matching the reference engine, which restarts identity at the sequence start).
-    if plan.restart_identity {
-        let key = super::coldefault::catalog_key(&plan.table.schema, &plan.table.name);
-        for (column, sql) in super::coldefault::load_defaults(&key, engine, txn)? {
-            if let Some(seq) = super::coldefault::serial_sequence(&sql) {
-                let id = engine.lookup_sequence(seq)?.ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "serial column \"{column}\" has no backing sequence"
-                    ))
-                })?;
-                engine.sequence_set(id, 0)?;
-            }
-        }
-    }
     let deleted = to_delete.len();
     if plan.returning.is_empty() {
         Ok(ExecutionResult::Deleted(deleted))
@@ -3392,20 +3375,30 @@ pub(super) fn run_delete(
     }
 }
 
-/// `TRUNCATE ... CASCADE`: empty the target table and every table that references it — directly
-/// or transitively — through a FOREIGN KEY, regardless of that key's own `ON DELETE` action (a
-/// statement-level cascade, distinct from a per-row `ON DELETE CASCADE`, which
-/// `enforce_fk_on_parent_delete` already applies within a single table's own delete). The closure
-/// is discovered by walking the FK-parent graph rooted at the target and recording each table in
-/// post-order (children before self), so a table is only emptied via [`run_delete`] once every
-/// *other* table in the closure that references it is already empty — the ordinary FK-RESTRICT
-/// check `run_delete` performs then always finds zero dependents from *within* the closure. A
-/// self-reference does not expand the closure (it empties with its own table, as an ordinary
-/// `TRUNCATE` already handles); a cycle that loops back to the target through two or more other
-/// tables is not resolved by this ordering (rare in practice — the walk still terminates via the
-/// visited set, it just does not guarantee every closure member is dependency-clean when its turn
-/// comes, so such a schema may see a spurious FK-RESTRICT error here).
-pub(super) fn run_truncate_cascade(
+/// `TRUNCATE [CASCADE]` — empty the target (and, with `CASCADE`, every table that references it,
+/// directly or transitively, through a FOREIGN KEY).
+///
+/// Two paths. The **constant-time** one rebuilds each table through the rollback-aware DDL the
+/// treaty already has — drop and recreate the table, then its constraints, keys and secondary
+/// indexes — so the cost scales with the schema, not the row count, and an empty index over an
+/// empty table is exactly right. It runs only when nothing outside the statement tracks the
+/// rows: no incrementally-maintained view, no vector index. Either falls back to the
+/// **row-by-row** path (an unfiltered MVCC delete feeding view maintenance). Neither path fires
+/// DELETE triggers — `TRUNCATE` is not a `DELETE`. Both report the `TRUNCATE` tag, and both roll
+/// back like any DDL/DML.
+///
+/// The closure is discovered by walking the FK-parent graph rooted at the target in post-order
+/// (children before self); a cycle through other tables terminates via the visited set. Without
+/// `CASCADE`, a referencing key from any table outside the statement refuses it outright — even
+/// when that referencing table is empty — while a self-reference is fine (the referencing table
+/// is the one being truncated).
+///
+/// Known limitation: the constant-time path makes `TRUNCATE` behave like DDL for concurrency,
+/// because the catalog it rewrites is eager and unversioned (the same model as `DROP`/`ALTER`).
+/// Concretely: an uncommitted truncate is visible to other sessions before commit; and under
+/// SERIALIZABLE it stamps no row versions, so it raises no rw-antidependency against concurrent
+/// readers the way the row-by-row path did.
+pub(super) fn run_truncate(
     plan: &TruncateCascadePlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -3415,40 +3408,316 @@ pub(super) fn run_truncate_cascade(
         .ok_or_else(|| Error::TableNotFound {
             name: crate::analyzer::qualified_display(&plan.schema, &plan.table),
         })?;
-    // `list_foreign_keys` reports table ids only; build an id -> schema map up front so each
-    // closure member can be turned into the `TableSchema` a `DeletePlan` needs. A full catalog
-    // scan here is cheap next to the row scan/delete every closure member performs regardless.
+    // `list_foreign_keys` reports table ids only; with CASCADE, walk the catalog up front so
+    // each closure member's id can be resolved back to its schema. The root is seeded directly,
+    // which is all the non-CASCADE form needs — no catalog walk on that (common) form, and an
+    // engine without a catalog listing (`list_tables` defaults to empty) can still truncate the
+    // table it just resolved.
     let mut by_id: HashMap<nusadb_core::TableId, TableSchema> = HashMap::new();
+    by_id.insert(root.id, root.clone());
+    let order = if plan.cascade {
+        for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
+            if let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)? {
+                by_id.insert(table.id, table);
+            }
+        }
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+        collect_cascade_closure(root.id, engine, &mut visited, &mut order)?;
+        order
+    } else {
+        vec![root.id]
+    };
+    // A closure member that cannot be resolved is an error, never a skip: silently truncating
+    // only part of the closure would report success for work that was not done.
+    let members: Vec<&TableSchema> = order
+        .iter()
+        .map(|id| {
+            by_id.get(id).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "internal: TRUNCATE cascade closure member {id:?} has no resolvable schema"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    // Without CASCADE, a referencing key from any table outside the statement refuses the whole
+    // statement outright — even when that referencing table holds no rows. Emptiness is a
+    // point-in-time accident; the reference itself is what makes the truncate unsafe to order
+    // freely. A self-reference is fine: the referencing table *is* being truncated.
+    let member_ids: HashSet<nusadb_core::TableId> = members.iter().map(|t| t.id).collect();
+    for table in &members {
+        for fk in engine.list_foreign_keys(table.id)? {
+            if fk.parent_table == table.id && !member_ids.contains(&fk.child_table) {
+                // Error path only: worth a catalog walk to name the referencing table.
+                let child = table_name_by_id(engine, txn, fk.child_table)?
+                    .unwrap_or_else(|| "?".to_owned());
+                return Err(nusadb_core::Error::ConstraintViolation(format!(
+                    "cannot truncate \"{}\": table \"{child}\" references it through foreign key \"{}\" (use TRUNCATE ... CASCADE)",
+                    table.name, fk.name
+                ))
+                .into());
+            }
+        }
+    }
+    if truncate_fast_path_applies(&members, engine, txn)? {
+        truncate_rebuild(&members, engine, txn)?;
+    } else {
+        // Row-by-row fallback, kept for anything that tracks rows by tid (an incrementally
+        // maintained view, a vector index): stamp each row deleted and hand the removed set to
+        // view maintenance. Deliberately NOT `run_delete`: `TRUNCATE` fires no DELETE triggers
+        // (per the reference semantics) on either path, and the per-row FK enforcement is
+        // unnecessary here — a referencing table outside the statement already refused the
+        // whole statement above, and every one inside it is being emptied too.
+        for table in &members {
+            let mut removed: Vec<Row> = Vec::new();
+            for (tid, row) in scan_table(table, engine, txn)? {
+                engine.delete(txn, table.id, tid)?;
+                removed.push(row);
+            }
+            super::ivm::maintain_on_change(&table.name, &[], &removed, engine, txn)?;
+        }
+    }
+    if plan.restart_identity {
+        for table in &members {
+            restart_serial_sequences(table, engine, txn)?;
+        }
+    }
+    Ok(ExecutionResult::Truncated)
+}
+
+/// Resolve a table id back to its (bare) name through the qualified catalog listing, for error
+/// messages. `Ok(None)` when no visible table carries the id.
+fn table_name_by_id(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    id: nusadb_core::TableId,
+) -> Result<Option<String>, Error> {
     for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
-        if let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)? {
-            by_id.insert(table.id, table);
+        if let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)?
+            && table.id == id
+        {
+            return Ok(Some(table.name));
         }
     }
-    let mut visited = HashSet::new();
-    let mut order = Vec::new();
-    collect_cascade_closure(root.id, engine, &mut visited, &mut order)?;
-    let mut deleted = 0usize;
-    for id in order {
-        let Some(table) = by_id.get(&id) else {
-            continue; // Every closure member came from `list_foreign_keys` on a real table.
-        };
-        let result = run_delete(
-            &DeletePlan {
-                table: table.clone(),
-                using: None,
-                using_plan: None,
-                filter: None,
-                returning: Vec::new(),
-                restart_identity: plan.restart_identity,
+    Ok(None)
+}
+
+/// Whether the constant-time rebuild may run: nothing tracks these rows by tid.
+///
+/// An incrementally-maintained view needs the removed set to subtract; a vector index holds a
+/// graph over the old rows that a rebuild would silently orphan. Either keeps the row-by-row
+/// path. DELETE triggers deliberately do NOT gate it: `TRUNCATE` is not a `DELETE` and fires no
+/// DELETE triggers, so there is nothing for the fast path to skip. A referencing key from
+/// outside the statement never reaches here — `run_truncate` already refused that shape.
+fn truncate_fast_path_applies(
+    members: &[&TableSchema],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<bool, Error> {
+    for table in members {
+        if super::ivm::has_views_for_base(engine, txn, &table.name)? {
+            return Ok(false);
+        }
+    }
+    let vector_indexed: HashSet<String> = super::list_vector_indexes(engine, txn)?
+        .into_iter()
+        .map(|v| v.table)
+        .collect();
+    if members.iter().any(|t| vector_indexed.contains(&t.name)) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Empty every member by rebuilding it: drop and recreate the table, then its constraints, keys
+/// and secondary indexes, all through the same rollback-aware DDL any other statement uses — a
+/// ROLLBACK restores the originals, rows included. Runs in passes across the whole member set
+/// because members may reference each other: every foreign key goes first (a key cannot be
+/// dropped while one inside the set still depends on it), then the rest and the tables, then
+/// everything is declared again over the new — empty — tables.
+fn truncate_rebuild(
+    members: &[&TableSchema],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    // Pass 0: read every definition before touching anything.
+    let saved = truncate_snapshot(members, engine)?;
+    // Drop every foreign key first, then the rest, then the tables.
+    for (table, s) in members.iter().zip(&saved) {
+        for fk in &s.fks {
+            engine.drop_constraint(txn, table.id, &fk.name)?;
+        }
+    }
+    for (table, s) in members.iter().zip(&saved) {
+        for c in s.uniques.iter().chain(&s.checks) {
+            engine.drop_constraint(txn, table.id, &c.name)?;
+        }
+        for def in &s.indexes {
+            if let Some(id) = engine.lookup_index(&def.name)? {
+                engine.drop_index(txn, id)?;
+            }
+        }
+        engine.drop_table(txn, table.id)?;
+    }
+    // Recreate every table, remembering old id -> new id for the keys (a member's foreign key
+    // may point at another member, whose id also changed).
+    let mut new_ids: HashMap<nusadb_core::TableId, nusadb_core::TableId> = HashMap::new();
+    let mut created = Vec::with_capacity(saved.len());
+    for s in &saved {
+        let new_id = engine.create_table(txn, &s.def)?;
+        new_ids.insert(s.old_id, new_id);
+        created.push(new_id);
+    }
+    // Declare everything again over the empty tables. An empty unique index over an empty table
+    // is correct by construction — the hazard a rebuild has on a populated table is absent here.
+    for (s, &id) in saved.iter().zip(&created) {
+        for c in &s.uniques {
+            engine.add_unique_constraint(
+                txn,
+                id,
+                &c.name,
+                &c.columns,
+                c.kind == nusadb_core::engine::ConstraintKind::PrimaryKey,
+            )?;
+        }
+        for c in &s.checks {
+            // Non-None guaranteed by `truncate_snapshot`, which refuses a CHECK without bytes.
+            let expr = c.expr.as_deref().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "internal: TRUNCATE CHECK \"{}\" lost its predicate",
+                    c.name
+                ))
+            })?;
+            engine.add_check_constraint(txn, id, &c.name, expr)?;
+        }
+    }
+    for (s, &id) in saved.iter().zip(&created) {
+        for fk in &s.fks {
+            let mut fk = fk.clone();
+            fk.child_table = id;
+            // A parent inside the statement moved to its new id; one outside kept its own.
+            if let Some(&parent) = new_ids.get(&fk.parent_table) {
+                fk.parent_table = parent;
+            }
+            engine.add_foreign_key(txn, &fk)?;
+        }
+        for def in &s.indexes {
+            let mut def = def.clone();
+            def.table = id;
+            engine.create_index(txn, &def)?;
+        }
+    }
+    Ok(())
+}
+
+/// One member's full definition, read before the rebuild touches anything: the table shape plus
+/// everything `truncate_rebuild` must declare again over the recreated table.
+struct TruncateSaved {
+    def: TableDef,
+    old_id: nusadb_core::TableId,
+    uniques: Vec<nusadb_core::engine::Constraint>,
+    checks: Vec<nusadb_core::engine::Constraint>,
+    fks: Vec<nusadb_core::engine::ForeignKeyDef>,
+    indexes: Vec<nusadb_core::engine::IndexDef>,
+}
+
+/// Read every member's definition — constraints split by kind, child-side foreign keys, true
+/// secondary indexes — without modifying anything.
+fn truncate_snapshot(
+    members: &[&TableSchema],
+    engine: &dyn StorageEngine,
+) -> Result<Vec<TruncateSaved>, Error> {
+    let mut saved = Vec::with_capacity(members.len());
+    for table in members {
+        let constraints = engine.list_constraints(table.id)?;
+        let fks: Vec<_> = engine
+            .list_foreign_keys(table.id)?
+            .into_iter()
+            .filter(|fk| fk.child_table == table.id)
+            .collect();
+        let fk_names: HashSet<&str> = fks.iter().map(|f| f.name.as_str()).collect();
+        // Keep only true secondary indexes: a constraint-backing index carries its constraint's
+        // name and is recreated by that constraint's re-declaration; the FK child-side index
+        // carries the key's name and is recreated by the key's. Only a constraint that actually
+        // BACKS an index (`index.is_some()` — PK/UNIQUE, never CHECK) may shadow one by name: a
+        // CHECK shares the table's constraint namespace but not the index namespace, so a
+        // secondary index that happens to bear a CHECK's name is still a real index to keep.
+        let backing_names: HashSet<&str> = constraints
+            .iter()
+            .filter(|c| c.index.is_some())
+            .map(|c| c.name.as_str())
+            .collect();
+        let indexes: Vec<_> = engine
+            .list_indexes(table.id)?
+            .into_iter()
+            .filter(|def| {
+                !backing_names.contains(def.name.as_str()) && !fk_names.contains(def.name.as_str())
+            })
+            .collect();
+        let mut uniques = Vec::new();
+        let mut checks = Vec::new();
+        for c in constraints {
+            if fk_names.contains(c.name.as_str()) {
+                continue; // Re-declared from `fks`, which carries the full key definition.
+            }
+            match c.kind {
+                nusadb_core::engine::ConstraintKind::PrimaryKey
+                | nusadb_core::engine::ConstraintKind::Unique => uniques.push(c),
+                nusadb_core::engine::ConstraintKind::Check => {
+                    // A CHECK without its predicate bytes cannot be re-declared faithfully;
+                    // refusing beats silently rebuilding the table with a broken constraint.
+                    if c.expr.is_none() {
+                        return Err(Error::Unsupported(format!(
+                            "internal: TRUNCATE found CHECK \"{}\" on \"{}\" with no stored predicate",
+                            c.name, table.name
+                        )));
+                    }
+                    checks.push(c);
+                },
+                nusadb_core::engine::ConstraintKind::ForeignKey => {
+                    return Err(Error::Unsupported(format!(
+                        "internal: TRUNCATE found foreign key \"{}\" on \"{}\" missing from list_foreign_keys",
+                        c.name, table.name
+                    )));
+                },
+            }
+        }
+        saved.push(TruncateSaved {
+            def: TableDef {
+                schema: table.schema.clone(),
+                name: table.name.clone(),
+                columns: table.columns.clone(),
             },
-            engine,
-            txn,
-        )?;
-        if let ExecutionResult::Deleted(n) = result {
-            deleted += n;
+            old_id: table.id,
+            uniques,
+            checks,
+            fks,
+            indexes,
+        });
+    }
+    Ok(saved)
+}
+
+/// `TRUNCATE ... RESTART IDENTITY`: reset the backing sequence of each SERIAL/IDENTITY column so
+/// the next insert restarts at the start value (sequences are created with start 1, increment 1,
+/// so current-value 0 makes the next `nextval` return 1, matching the reference engine).
+fn restart_serial_sequences(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let key = super::coldefault::catalog_key(&table.schema, &table.name);
+    for (column, sql) in super::coldefault::load_defaults(&key, engine, txn)? {
+        if let Some(seq) = super::coldefault::serial_sequence(&sql) {
+            let id = engine.lookup_sequence(seq)?.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "serial column \"{column}\" has no backing sequence"
+                ))
+            })?;
+            engine.sequence_set(id, 0)?;
         }
     }
-    Ok(ExecutionResult::Deleted(deleted))
+    Ok(())
 }
 
 /// Post-order walk of the FK-parent graph rooted at `table`: for every other table with a

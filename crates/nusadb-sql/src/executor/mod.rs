@@ -113,6 +113,8 @@ pub enum ExecutionResult {
     Updated(usize),
     /// `DELETE` — the number of rows matched by the predicate and removed.
     Deleted(usize),
+    /// `TRUNCATE` completed (whichever internal path emptied the tables).
+    Truncated,
     /// `MERGE` — the number of source rows that drove an applied `WHEN` action.
     Merged(usize),
     /// `SELECT` — projected output rows and their column names.
@@ -1558,7 +1560,7 @@ fn dispatch(
         PhysicalPlan::Select(op, est_scan_rows) => run_select(&op, est_scan_rows, engine, txn),
         PhysicalPlan::Update(p) => run_update(&p, engine, txn),
         PhysicalPlan::Delete(p) => run_delete(&p, engine, txn),
-        PhysicalPlan::TruncateCascade(p) => run_truncate_cascade(&p, engine, txn),
+        PhysicalPlan::TruncateCascade(p) => run_truncate(&p, engine, txn),
         PhysicalPlan::Merge(p) => dml::run_merge(&p, engine, txn),
         PhysicalPlan::Explain(inner, options) => run_explain(&inner, options, engine, txn),
         PhysicalPlan::Vacuum(options) => run_vacuum(options, engine, txn),
@@ -2024,7 +2026,8 @@ fn format_plan(
             },
         )],
         PhysicalPlan::TruncateCascade(p) => {
-            vec![format!("{indent}Truncate cascade from {}", p.table)]
+            let cascade = if p.cascade { " cascade" } else { "" };
+            vec![format!("{indent}Truncate{cascade} from {}", p.table)]
         },
         PhysicalPlan::Select(op, _) => format_op(op, depth, ctx, actuals),
         PhysicalPlan::Explain(inner, _) => {

@@ -227,7 +227,8 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::Deallocated
         | ExecutionResult::Reindexed
         | ExecutionResult::MaterializedViewCreated
-        | ExecutionResult::VariableSet => DBOutput::StatementComplete(0),
+        | ExecutionResult::VariableSet
+        | ExecutionResult::Truncated => DBOutput::StatementComplete(0),
         ExecutionResult::Inserted(n)
         | ExecutionResult::Updated(n)
         | ExecutionResult::Deleted(n)
@@ -330,6 +331,11 @@ fn slt_p1_drop_cascade() {
 #[test]
 fn slt_p1_truncate_cascade() {
     run_slt("tests/slt/p1_ddl/truncate_cascade.slt");
+}
+
+#[test]
+fn slt_p1_truncate_fast() {
+    run_slt("tests/slt/p1_ddl/truncate_fast.slt");
 }
 
 #[test]

@@ -440,3 +440,100 @@ fn alter_table_and_create_schema_work_and_survive_reopen() {
     run(&engine, "INSERT INTO items VALUES (3, 30, 'new')");
     assert_eq!(rows(run(&engine, "SELECT id FROM items")).len(), 3);
 }
+
+/// `TRUNCATE`'s constant-time path (a drop-and-recreate through rollback-aware DDL, all inside
+/// one transaction) is durable: after a crash-reopen the table is still empty, every constraint
+/// kind still enforces, the secondary index answers over post-truncate rows, and `RESTART
+/// IDENTITY`'s sequence reset held.
+#[test]
+fn truncate_fast_path_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(
+            &engine,
+            "CREATE TABLE items (id SERIAL PRIMARY KEY, tag TEXT UNIQUE, score INT CHECK (score >= 0))",
+        );
+        run(&engine, "CREATE INDEX items_score ON items (score)");
+        run(
+            &engine,
+            "INSERT INTO items (tag, score) VALUES ('a', 10), ('b', 20), ('c', 30)",
+        );
+        run(&engine, "TRUNCATE items RESTART IDENTITY");
+        run(&engine, "INSERT INTO items (tag, score) VALUES ('z', 99)");
+    } // crash: no shutdown.
+
+    let engine = BtreeEngine::open(&path).unwrap();
+    // Only the post-truncate row survived, with the restarted id.
+    assert_eq!(
+        rows(run(&engine, "SELECT id, tag FROM items")),
+        vec![vec![Value::Int(1), Value::Text("z".to_owned())]]
+    );
+    // The secondary index answers over the rebuilt (post-truncate) table.
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM items WHERE score = 99")),
+        vec![vec![Value::Int(1)]]
+    );
+    assert!(rows(run(&engine, "SELECT id FROM items WHERE score = 10")).is_empty());
+    // Every constraint kind still enforces after recovery.
+    assert!(
+        run_try(
+            &engine,
+            "INSERT INTO items (id, tag, score) VALUES (1, 'q', 5)"
+        )
+        .is_err()
+    );
+    assert!(run_try(&engine, "INSERT INTO items (tag, score) VALUES ('z', 5)").is_err());
+    assert!(run_try(&engine, "INSERT INTO items (tag, score) VALUES ('w', -1)").is_err());
+    run(&engine, "INSERT INTO items (tag, score) VALUES ('y', 44)");
+    assert_eq!(rows(run(&engine, "SELECT id FROM items")).len(), 2);
+}
+
+/// Two `TRUNCATE` edges that only bite on the rebuild path. A CHECK constraint shares the
+/// table's constraint namespace but not the index namespace — a secondary index bearing a
+/// CHECK's name must survive the rebuild as a real index (not be mistaken for that
+/// constraint's backing index and silently dropped, name leaked). And the non-CASCADE refusal
+/// must name the referencing table in its message, not a placeholder.
+#[test]
+fn truncate_keeps_index_named_like_check_and_names_refusing_child() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (a INT, b INT, CONSTRAINT dup CHECK (a > 0))",
+    );
+    run(&engine, "CREATE INDEX dup ON t (b)");
+    run(&engine, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    run(&engine, "TRUNCATE t");
+    // The index survived as a real index on the rebuilt table — asserted directly, because the
+    // failure mode is silent (a leaked name also collides, and a seq scan also answers).
+    let table = engine.lookup_table("t").unwrap().unwrap();
+    let index_names: Vec<String> = engine
+        .list_indexes(table.id)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(index_names, vec!["dup".to_owned()]);
+    // And its name is owned by that index: a re-create collides, and the CHECK enforces.
+    assert!(run_try(&engine, "CREATE INDEX dup ON t (b)").is_err());
+    assert!(run_try(&engine, "INSERT INTO t VALUES (-5, 1)").is_err());
+    run(&engine, "INSERT INTO t VALUES (3, 30)");
+    assert_eq!(
+        rows(run(&engine, "SELECT a FROM t WHERE b = 30")),
+        vec![vec![Value::Int(3)]]
+    );
+
+    run(&engine, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        "CREATE TABLE kid (id INT PRIMARY KEY, pid INT REFERENCES p (id))",
+    );
+    run(&engine, "INSERT INTO p VALUES (1)");
+    let err = run_try(&engine, "TRUNCATE p").unwrap_err().to_string();
+    assert!(
+        err.contains("\"kid\""),
+        "refusal must name the child: {err}"
+    );
+}

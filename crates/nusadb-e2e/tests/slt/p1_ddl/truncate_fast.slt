@@ -1,0 +1,220 @@
+# TRUNCATE's constant-time path rebuilds the table (and, with CASCADE, the whole closure)
+# through rollback-aware DDL instead of deleting row by row. Everything here runs on tables
+# WITH rows — the rebuild's hazards (a recreated-but-empty index, a lost constraint, a stale
+# sequence) only show on populated tables. TRUNCATE is not a DELETE: it fires no DELETE
+# triggers on either path. Only something that tracks rows by tid (an incrementally
+# maintained view here) keeps the row-by-row path, observably: the view follows the truncate.
+
+statement ok
+CREATE TABLE big (id INT PRIMARY KEY, tag TEXT UNIQUE, score INT CHECK (score >= 0))
+
+statement ok
+CREATE INDEX big_score ON big (score)
+
+statement ok
+INSERT INTO big VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)
+
+statement ok
+TRUNCATE big
+
+query I
+SELECT count(*) FROM big
+----
+0
+
+# The rebuilt table still enforces every constraint: PRIMARY KEY, UNIQUE, CHECK.
+statement ok
+INSERT INTO big VALUES (1, 'a', 10)
+
+statement error
+INSERT INTO big VALUES (1, 'z', 5)
+
+statement error
+INSERT INTO big VALUES (9, 'a', 5)
+
+statement error
+INSERT INTO big VALUES (9, 'z', -1)
+
+# The secondary index survives the rebuild and answers over post-truncate rows only.
+statement ok
+INSERT INTO big VALUES (2, 'b', 20)
+
+query I
+SELECT id FROM big WHERE score = 20
+----
+2
+
+query I
+SELECT count(*) FROM big WHERE score = 30
+----
+0
+
+# TRUNCATE rolls back like any DDL/DML: the rows, not just the table, come back.
+statement ok
+BEGIN
+
+statement ok
+TRUNCATE big
+
+query I
+SELECT count(*) FROM big
+----
+0
+
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT id FROM big
+----
+1
+2
+
+# RESTART IDENTITY resets the SERIAL sequence even on the constant-time path.
+statement ok
+CREATE TABLE counted (id SERIAL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO counted (v) VALUES (7), (8), (9)
+
+statement ok
+TRUNCATE counted RESTART IDENTITY
+
+statement ok
+INSERT INTO counted (v) VALUES (77)
+
+query II
+SELECT id, v FROM counted
+----
+1 77
+
+# Without RESTART IDENTITY the sequence keeps counting from where it was.
+statement ok
+TRUNCATE counted
+
+statement ok
+INSERT INTO counted (v) VALUES (88)
+
+query II
+SELECT id, v FROM counted
+----
+2 88
+
+# A referencing key from a table OUTSIDE the statement refuses plain TRUNCATE even when that
+# table holds no rows — the reference itself is what blocks it, not the rows.
+statement ok
+CREATE TABLE ref_parent (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE ref_child (id INT PRIMARY KEY, pid INT REFERENCES ref_parent (id))
+
+statement ok
+INSERT INTO ref_parent VALUES (1)
+
+statement error
+TRUNCATE ref_parent
+
+statement ok
+TRUNCATE ref_parent CASCADE
+
+# The member-to-member key was remapped onto the rebuilt tables: it still enforces (a dangling
+# reference refuses) and still accepts a valid parent — a remap onto a wrong-but-existing table
+# would fail one of the two.
+statement error
+INSERT INTO ref_child VALUES (30, 999)
+
+statement ok
+INSERT INTO ref_parent VALUES (2)
+
+statement ok
+INSERT INTO ref_child VALUES (20, 2)
+
+# A self-referencing key does NOT block plain TRUNCATE: the referencing table is the one
+# being truncated.
+statement ok
+CREATE TABLE org (id INT PRIMARY KEY, boss INT REFERENCES org (id))
+
+statement ok
+INSERT INTO org VALUES (1, NULL)
+
+statement ok
+INSERT INTO org VALUES (2, 1)
+
+statement ok
+TRUNCATE org
+
+query I
+SELECT count(*) FROM org
+----
+0
+
+statement ok
+INSERT INTO org VALUES (5, NULL)
+
+statement error
+INSERT INTO org VALUES (6, 999)
+
+# TRUNCATE is not a DELETE: it fires no DELETE triggers, on either path.
+statement ok
+CREATE TABLE audit (what TEXT, whom INT)
+
+statement ok
+CREATE TABLE watched (id INT PRIMARY KEY)
+
+statement ok
+CREATE TRIGGER watched_del AFTER DELETE ON watched FOR EACH ROW INSERT INTO audit VALUES ('del', old.id)
+
+statement ok
+INSERT INTO watched VALUES (1), (2), (3)
+
+statement ok
+TRUNCATE watched
+
+query I
+SELECT count(*) FROM watched
+----
+0
+
+query I
+SELECT count(*) FROM audit
+----
+0
+
+# An incrementally-maintained view keeps the row-by-row path — observably: the view follows the
+# truncate without a REFRESH, because the removed rows were fed through view maintenance.
+statement ok
+CREATE TABLE sales (id INT PRIMARY KEY, amount INT)
+
+statement ok
+INSERT INTO sales VALUES (1, 100), (2, 200), (3, 300)
+
+statement ok
+CREATE MATERIALIZED VIEW sales_big WITH (incremental = true) AS SELECT id, amount FROM sales WHERE amount >= 200
+
+query II rowsort
+SELECT id, amount FROM sales_big
+----
+2 200
+3 300
+
+statement ok
+TRUNCATE sales
+
+query I
+SELECT count(*) FROM sales
+----
+0
+
+query I
+SELECT count(*) FROM sales_big
+----
+0
+
+# The view keeps maintaining after the truncate.
+statement ok
+INSERT INTO sales VALUES (9, 900)
+
+query II
+SELECT id, amount FROM sales_big
+----
+9 900

@@ -634,14 +634,11 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 if_exists: ds.if_exists,
             }))
         },
-        // TRUNCATE: desugar to an unfiltered DELETE — the same MVCC delete path empties the
-        // table (honouring FK references + maintaining secondary indexes). `RESTART IDENTITY` is
-        // carried through so the executor resets the backing sequence of each SERIAL/IDENTITY column
-        // after the rows are removed (`CONTINUE IDENTITY` / unspecified leaves the sequence advancing).
-        // `CASCADE` cannot desugar this way: which other tables it must also empty depends on the
-        // live FOREIGN KEY catalog, which the `Catalog` trait used here does not expose (only the
-        // `StorageEngine` the executor runs against does) — so it gets its own plan, resolved fully
-        // at execution time.
+        // TRUNCATE gets its own plan for both forms: which tables it touches and whether the
+        // constant-time path applies depend on the live FOREIGN KEY / trigger / view catalogs,
+        // which the analyzer's `Catalog` trait does not expose — only the `StorageEngine` the
+        // executor runs against does. Resolution happens fully at execution time; `RESTART
+        // IDENTITY` is carried through so the executor resets each SERIAL/IDENTITY sequence.
         ast::Statement::Truncate(t) => {
             // Resolve the target through the search path (an explicit qualifier wins), exactly like a
             // DELETE target, so TRUNCATE reaches a non-public table too.
@@ -650,22 +647,12 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             // per-row rules, so a role trusted to delete rows one policy at a time is not
             // automatically trusted to empty the table in one step.
             dcl::require_table_privilege(catalog, &table, ast::Privilege::Truncate)?;
-            if t.cascade {
-                Ok(LogicalPlan::TruncateCascade(TruncateCascadePlan {
-                    schema: table.schema,
-                    table: table.name,
-                    restart_identity: t.restart_identity,
-                }))
-            } else {
-                Ok(LogicalPlan::Delete(DeletePlan {
-                    table,
-                    using: None,
-                    using_plan: None,
-                    filter: None,
-                    returning: Vec::new(),
-                    restart_identity: t.restart_identity,
-                }))
-            }
+            Ok(LogicalPlan::TruncateCascade(TruncateCascadePlan {
+                schema: table.schema,
+                table: table.name,
+                restart_identity: t.restart_identity,
+                cascade: t.cascade,
+            }))
         },
         ast::Statement::Insert(ins) => analyze_insert(ins, catalog).map(LogicalPlan::Insert),
         ast::Statement::Select(sel) => {

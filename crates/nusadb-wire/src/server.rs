@@ -3997,6 +3997,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::Inserted(n) => format!("INSERT {n}"),
         ExecutionResult::Updated(n) => format!("UPDATE {n}"),
         ExecutionResult::Deleted(n) => format!("DELETE {n}"),
+        ExecutionResult::Truncated => "TRUNCATE TABLE".to_owned(),
         ExecutionResult::Merged(n) => format!("MERGE {n}"),
         ExecutionResult::TransactionBegun => "BEGIN".to_owned(),
         ExecutionResult::TransactionCommitted => "COMMIT".to_owned(),
