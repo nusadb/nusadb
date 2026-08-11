@@ -8,5 +8,5 @@ User-facing documentation. The crate/layer map and design decisions are in
 
 - [`getting-started.md`](getting-started.md) — install, connect, run a query (TODO)
 - [`sql-reference.md`](sql-reference.md) — supported SQL surface (TODO)
-- [`transactions.md`](transactions.md) — OCC, the `40001` retry discipline, isolation levels over the wire
+- [`transactions.md`](transactions.md) — OCC, the class-`40` retry discipline, isolation levels over the wire
 - [`wire-protocol.md`](wire-protocol.md) — Nusa Wire Protocol reference (TODO)

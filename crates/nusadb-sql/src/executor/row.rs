@@ -41,7 +41,7 @@ const TAG_PRESENT: u8 = 1;
 /// must have the same length.
 pub(crate) fn encode(row: &[ast::Value], schema: &[ColumnType]) -> Result<Vec<u8>, Error> {
     if row.len() != schema.len() {
-        return Err(Error::ArityMismatch {
+        return Err(Error::MalformedBatch {
             context: "tuple encode".to_owned(),
             expected: schema.len(),
             found: row.len(),
@@ -982,10 +982,12 @@ mod tests {
 
     #[test]
     fn arity_mismatch_is_rejected() {
-        assert!(matches!(
-            encode(&[Value::Int(1)], &schema()),
-            Err(Error::ArityMismatch { .. }),
-        ));
+        let err = encode(&[Value::Int(1)], &schema())
+            .expect_err("a row that does not match its schema must be rejected");
+        assert!(matches!(err, Error::MalformedBatch { .. }), "{err}");
+        // Row and schema both come from the same table definition, so reaching this is a bug in
+        // the engine — not something to report to a client as a malformed statement.
+        assert_eq!(err.sqlstate(), crate::error::INTERNAL_ERROR, "{err}");
     }
 
     #[test]

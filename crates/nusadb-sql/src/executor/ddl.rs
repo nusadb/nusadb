@@ -452,7 +452,7 @@ fn scan_text_catalog(
         message: format!(
             "system catalog {catalog} holds a row this build cannot decode; the statement is              refused rather than judged against a partial catalog"
         ),
-        sqlstate: "XX000", // internal_error
+        sqlstate: crate::error::INTERNAL_ERROR,
     };
     let mut scan = engine.scan(txn, cat.id)?;
     'rows: while let Some((_, bytes)) = scan.try_next()? {

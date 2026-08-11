@@ -100,10 +100,28 @@ pub enum Error {
     /// does not match the target column count).
     ///
     /// Not every arity error: a set operation whose branches disagree on column count carries
-    /// [`SetOpArityMismatch`](Self::SetOpArityMismatch) instead, for its SQLSTATE. Match on both
-    /// when you mean "any arity error" — the compiler cannot warn you here.
+    /// [`SetOpArityMismatch`](Self::SetOpArityMismatch), and one the engine finds in its own
+    /// bookkeeping carries [`MalformedBatch`](Self::MalformedBatch), which reports a different
+    /// class. Match on all three when you mean "any arity error" — the compiler cannot warn you.
     #[error("{context}: expected {expected} value(s), found {found}")]
     ArityMismatch {
+        /// Human-readable description of where the mismatch occurred.
+        context: String,
+        /// The required number of values.
+        expected: usize,
+        /// The number of values supplied.
+        found: usize,
+    },
+
+    /// A shape mismatch the engine found in its own bookkeeping, not in anything the query said:
+    /// a record batch, a list array, or an encoded tuple built with a column count that disagrees
+    /// with the schema it was built from. Both sides come from the same plan node, so reaching this
+    /// is a bug in the engine and it reports `internal_error`, which is what it is.
+    ///
+    /// Split from [`ArityMismatch`](Self::ArityMismatch) precisely so that one can report a
+    /// malformed *query* without dressing an engine fault as the caller's mistake.
+    #[error("{context}: expected {expected} value(s), found {found}")]
+    MalformedBatch {
         /// Human-readable description of where the mismatch occurred.
         context: String,
         /// The required number of values.
@@ -116,17 +134,8 @@ pub enum Error {
     /// of a `UNION`/`INTERSECT`/`EXCEPT`, or the anchor and recursive terms of a recursive CTE
     /// (which are the branches of its `UNION ALL`).
     ///
-    /// Split out of [`ArityMismatch`](Self::ArityMismatch) for its SQLSTATE alone: this is a
-    /// malformed query, so it reports `42601`, while the generic variant still reports `XX000`
-    /// ("the engine is broken") — a class drivers and pooling layers branch on. The rendered message
-    /// is identical to what the generic variant produced for these cases, so the recode buys the
-    /// class without costing the diagnosis.
-    ///
-    /// The sibling arity errors (`VALUES`, `INSERT`, function calls, `CREATE VIEW` column lists) are
-    /// user-facing too and still report `XX000`, as does the per-column *type* mismatch of a set
-    /// operation. That is a known wider gap, tracked separately — it is deliberately not fixed here,
-    /// because a blanket recode would also hit the internal batch-construction errors, which are not
-    /// user SQL at all.
+    /// Carried separately from [`ArityMismatch`](Self::ArityMismatch) so a caller can tell the two
+    /// apart; both report `42601`, since either is a malformed query.
     #[error("{context}: expected {expected} value(s), found {found}")]
     SetOpArityMismatch {
         /// Human-readable description of which set operation disagreed.
@@ -329,15 +338,24 @@ pub enum Error {
 }
 
 impl Error {
-    /// The 5-character SQLSTATE the wire protocol reports for this error. Engine errors (a
-    /// serialization conflict / deadlock / constraint violation) carry their standard codes via
-    /// [`nusadb_core::Error::sqlstate`]; a `NOT NULL` assignment gets `23502`; a cancelled
-    /// statement (timeout / cancel request) gets the standard `57014` so drivers that branch on
-    /// `query_canceled` recognise it. A runtime **data exception** — a value the query itself
-    /// produced that the type cannot represent — gets its standard class-`22` code so a driver can
-    /// tell a user data error from an engine fault; a set operation whose branches disagree on
-    /// column count is a malformed query and gets class `42`; every other SQL-layer error uses the
-    /// generic `XX000`.
+    /// The 5-character SQLSTATE the wire protocol reports for this error.
+    ///
+    /// The class is the part a client acts on: a driver, pool or migration tool reads it to decide
+    /// whether to retry, report to the user, or stop. So a mistake in the query says so — class
+    /// `42` for a malformed or unresolvable statement, `22` for a value the type cannot represent,
+    /// `23` for a violated constraint — and `XX000` (`internal_error`) is reserved for the engine's
+    /// own faults. Reporting an ordinary mistake as an engine fault is not a cosmetic error: it
+    /// tells a caller there is nothing it can fix.
+    ///
+    /// One class this deliberately does not return is `0A` (`feature_not_supported`), even though
+    /// [`Unsupported`](Self::Unsupported) looks like its home; the reason is with that arm below.
+    ///
+    /// Engine errors carry their standard codes via [`nusadb_core::Error::sqlstate`], and a
+    /// cancelled statement reports `57014` so a driver branching on `query_canceled` recognises it.
+    ///
+    /// The match below is exhaustive on purpose. A wildcard arm is what once let most of this
+    /// enum report `internal_error` unnoticed; without one, a new variant does not compile until
+    /// someone decides its class.
     #[must_use]
     pub fn sqlstate(&self) -> &'static str {
         match self {
@@ -346,8 +364,51 @@ impl Error {
             Self::NotNullViolation { .. } => "23502",
             Self::Cancelled => "57014", // query_canceled
             // Class 42 — the query is malformed, not the engine. `XX000` here would tell a driver
-            // the server had faulted on what is really a user typo.
-            Self::SetOpArityMismatch { .. } => "42601", // syntax_error
+            // the server had faulted on what is really a user typo. A driver, ORM or migration tool
+            // reads the class to decide whether to retry, report or abort, so a whole category of
+            // ordinary mistakes arriving as "internal error" is a defect that never shows up in
+            // hand testing and behaves strangely in an integration layer.
+            // `Unsupported` is deliberately NOT mapped to `feature_not_supported` here. It is the
+            // engine's catch-all refusal, and a good share of what it carries is an ordinary
+            // mistake — an unknown role, an unbound parameter, two PRIMARY KEYs — not a missing
+            // feature. Telling a migration tool "feature not supported" invites it to skip the
+            // statement and carry on, which is worse than the honest "something went wrong" it
+            // gets today. Splitting the variant is the fix, and it is its own piece of work.
+            //
+            // syntax_error, including the arity mismatches: supplying the wrong number of values
+            // is a malformed statement, not a fault.
+            Self::Syntax(_)
+            | Self::MultipleStatements(_)
+            | Self::Empty
+            | Self::ArityMismatch { .. }
+            | Self::SetOpArityMismatch { .. } => "42601",
+            Self::TableNotFound { .. } => "42P01", // undefined_table
+            Self::TableExists { .. } => "42P07",   // duplicate_table
+            Self::SchemaNotFound { .. } => "3F000", // invalid_schema_name
+            Self::ColumnNotFound { .. } => "42703", // undefined_column
+            Self::DuplicateColumn { .. } => "42701", // duplicate_column
+            Self::TypeMismatch { .. } => "42804",  // datatype_mismatch
+            Self::AmbiguousNull { .. } => "42P18", // indeterminate_datatype
+            // Class 42501 — the role lacks the right, whether refused outright or by a row policy.
+            Self::PermissionDenied(_) | Self::RlsCheckViolation { .. } => "42501",
+            // undefined_function — a name the caller used that resolves to nothing callable.
+            Self::UnknownFunction(_)
+            | Self::FunctionNotFound { .. }
+            | Self::ProcedureNotFound { .. }
+            | Self::ProcedureArgCount { .. } => "42883",
+            // duplicate_function / duplicate_object — creating something already there.
+            Self::FunctionExists { .. } | Self::ProcedureExists { .. } => "42723",
+            Self::TriggerExists { .. } => "42710", // duplicate_object
+            // undefined_object — a named thing that is not there.
+            Self::TriggerNotFound { .. }
+            | Self::SequenceNotFound { .. }
+            | Self::IndexNotFound { .. } => "42704",
+            // statement_too_complex — the nesting limit, not a fault.
+            Self::TriggerRecursionLimit { .. } | Self::ProcedureRecursionLimit { .. } => "54001",
+            // raise_exception — the user's own RAISE from a procedure body. Reporting this as an
+            // engine fault is the single most misleading code here: the statement did exactly what
+            // it was told to.
+            Self::Raised { .. } => "P0001",
             // Class 22 — data exception: a runtime value error, not an internal fault.
             Self::DivisionByZero => "22012", // division_by_zero
             // numeric_value_out_of_range — an overflow or a value outside a function's domain.
@@ -357,10 +418,25 @@ impl Error {
             Self::InvalidValue { ty, .. } if is_datetime(*ty) => "22007",
             Self::InvalidValue { .. } => "22P02",
             Self::InvalidRegex(_) => "2201B", // invalid_regular_expression
-            _ => "XX000",
+            // The residue, each for its own reason: `MalformedBatch` and `MalformedTuple` are the
+            // engine's own bookkeeping; `Decryption` and `UdfFailed` come from outside the engine
+            // but have no class that says more than "it went wrong" here; and `Unsupported` is
+            // held back deliberately, for the reason recorded above.
+            Self::Unsupported(_)
+            | Self::MalformedBatch { .. }
+            | Self::MalformedTuple { .. }
+            | Self::Decryption(_)
+            | Self::UdfFailed { .. } => INTERNAL_ERROR,
         }
     }
 }
+
+/// The code for a fault in the engine rather than in the query — `internal_error`.
+///
+/// Exposed so a caller reporting its own internal failure can name this directly instead of
+/// reaching for whichever `Error` variant happens to map here today. One did, and it would have
+/// started reporting "feature not supported" the moment that variant was given a code of its own.
+pub const INTERNAL_ERROR: &str = "XX000";
 
 /// Whether a column type is a date/time type, whose malformed text form is
 /// `invalid_datetime_format` (`22007`) rather than the generic `invalid_text_representation`.
@@ -373,4 +449,127 @@ const fn is_datetime(ty: ColumnType) -> bool {
             | ColumnType::Timestamp
             | ColumnType::TimestampTz
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, INTERNAL_ERROR};
+    use nusadb_core::ColumnType;
+
+    /// Every variant a query can provoke reports the class a client acts on. Asserted by code, not
+    /// by message text: a driver switches on the code, and a test matching on wording would pass
+    /// while the code beneath it was wrong.
+    #[test]
+    fn a_users_mistake_reports_its_own_class_not_internal_error() {
+        let cases: Vec<(Error, &str)> = vec![
+            (Error::Syntax("bad".to_owned()), "42601"),
+            (Error::Empty, "42601"),
+            (Error::MultipleStatements(2), "42601"),
+            (
+                Error::ArityMismatch {
+                    context: "INSERT".to_owned(),
+                    expected: 2,
+                    found: 3,
+                },
+                "42601",
+            ),
+            (
+                Error::TableNotFound {
+                    name: "t".to_owned(),
+                },
+                "42P01",
+            ),
+            (
+                Error::TableExists {
+                    name: "t".to_owned(),
+                },
+                "42P07",
+            ),
+            (
+                Error::SchemaNotFound {
+                    name: "s".to_owned(),
+                },
+                "3F000",
+            ),
+            (
+                Error::ColumnNotFound {
+                    table: "t".to_owned(),
+                    column: "c".to_owned(),
+                },
+                "42703",
+            ),
+            (
+                Error::DuplicateColumn {
+                    name: "c".to_owned(),
+                },
+                "42701",
+            ),
+            (
+                Error::TypeMismatch {
+                    context: "WHERE".to_owned(),
+                    expected: ColumnType::Int,
+                    found: ColumnType::Text,
+                },
+                "42804",
+            ),
+            (Error::PermissionDenied("no SELECT".to_owned()), "42501"),
+            (
+                Error::RlsCheckViolation {
+                    table: "t".to_owned(),
+                },
+                "42501",
+            ),
+            (
+                Error::AmbiguousNull {
+                    context: "COALESCE".to_owned(),
+                },
+                "42P18",
+            ),
+            (
+                Error::SetOpArityMismatch {
+                    context: "UNION".to_owned(),
+                    expected: 2,
+                    found: 3,
+                },
+                "42601",
+            ),
+            (Error::UnknownFunction("nosuchfn".to_owned()), "42883"),
+            (Error::Raised("custom".to_owned()), "P0001"),
+        ];
+        for (error, want) in cases {
+            assert_eq!(
+                error.sqlstate(),
+                want,
+                "wrong class for `{error}`; a client reads this to decide what to do"
+            );
+        }
+    }
+
+    /// A fault in the engine keeps reporting `internal_error`, which is what it is. Recoding the
+    /// user-facing variants must not sweep these along: the batch-construction mismatch shares its
+    /// wording with the query-level one and differs only in which variant carries it.
+    #[test]
+    fn an_engine_fault_still_reports_internal_error() {
+        let internal: Vec<Error> = vec![
+            Error::MalformedBatch {
+                context: "column 0".to_owned(),
+                expected: 2,
+                found: 3,
+            },
+            Error::MalformedTuple { offset: 7 },
+            // The catch-all refusal: deliberately still internal, see the mapping's own note.
+            Error::Unsupported("LATERAL".to_owned()),
+            Error::UdfFailed {
+                name: "f".to_owned(),
+                message: "boom".to_owned(),
+            },
+        ];
+        for error in internal {
+            assert_eq!(
+                error.sqlstate(),
+                INTERNAL_ERROR,
+                "`{error}` is the engine's own failure and must not be dressed as a user mistake"
+            );
+        }
+    }
 }

@@ -35,7 +35,7 @@ impl ListArray {
     ///
     /// # Errors
     ///
-    /// [`Error::ArityMismatch`] if `offsets` is empty, is not non-decreasing, does not end
+    /// [`Error::MalformedBatch`] if `offsets` is empty, is not non-decreasing, does not end
     /// at `child.len()`, or if a supplied `validity` length does not match the row count.
     pub fn try_new(
         element: ArrayElem,
@@ -44,7 +44,7 @@ impl ListArray {
         validity: Option<&[bool]>,
     ) -> Result<Self, Error> {
         let Some(&last) = offsets.last() else {
-            return Err(Error::ArityMismatch {
+            return Err(Error::MalformedBatch {
                 context: "list array offsets (must hold at least the leading 0)".to_owned(),
                 expected: 1,
                 found: 0,
@@ -55,14 +55,14 @@ impl ListArray {
             .zip(offsets.iter().skip(1))
             .all(|(a, b)| a <= b);
         if !monotonic {
-            return Err(Error::ArityMismatch {
+            return Err(Error::MalformedBatch {
                 context: "list array offsets must be non-decreasing".to_owned(),
                 expected: 0,
                 found: 0,
             });
         }
         if last != child.len() {
-            return Err(Error::ArityMismatch {
+            return Err(Error::MalformedBatch {
                 context: "list array final offset vs child length".to_owned(),
                 expected: child.len(),
                 found: last,
@@ -73,7 +73,7 @@ impl ListArray {
         if let Some(v) = validity
             && v.len() != rows
         {
-            return Err(Error::ArityMismatch {
+            return Err(Error::MalformedBatch {
                 context: "list array validity length vs row count".to_owned(),
                 expected: rows,
                 found: v.len(),
@@ -187,11 +187,11 @@ mod tests {
         // Final offset (1) does not match child length (2).
         let err = ListArray::try_new(ArrayElem::Int, child.clone(), vec![0, 1], None)
             .expect_err("final offset mismatch");
-        assert!(matches!(err, Error::ArityMismatch { .. }));
+        assert!(matches!(err, Error::MalformedBatch { .. }));
         // Non-decreasing violated.
         let err = ListArray::try_new(ArrayElem::Int, child, vec![0, 2, 1], None)
             .expect_err("non-monotonic offsets");
-        assert!(matches!(err, Error::ArityMismatch { .. }));
+        assert!(matches!(err, Error::MalformedBatch { .. }));
     }
 
     #[test]

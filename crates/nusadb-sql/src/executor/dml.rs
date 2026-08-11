@@ -1300,10 +1300,18 @@ pub(super) fn run_copy_from(
         crate::cancel::check()?;
         let fields = record?;
         if fields.len() != columns.len() {
-            return Err(Error::ArityMismatch {
-                context: format!("COPY data line {}", record_no + 1),
-                expected: columns.len(),
-                found: fields.len(),
+            // The same class the record decoder above reports: a line with the wrong number of
+            // fields is a badly formed COPY file, not a badly formed SQL statement. Answering one
+            // malformation with `bad_copy_file_format` and the other with `syntax_error` would
+            // leave a loader guessing which of its two errors it had.
+            return Err(Error::Coded {
+                message: format!(
+                    "COPY data line {}: expected {} value(s), found {}",
+                    record_no + 1,
+                    columns.len(),
+                    fields.len()
+                ),
+                sqlstate: "22P04", // bad_copy_file_format
             });
         }
         let mut row = Vec::with_capacity(fields.len());

@@ -51,7 +51,7 @@ pub use batch::{
     RecordBatchScan, Schema, StringArray, TemporalArray, TemporalKind, TimeArray, TimestampArray,
     TimestampTzArray, Uuid, UuidArray, schema_from_columns,
 };
-pub use error::Error;
+pub use error::{Error, INTERNAL_ERROR};
 pub use executor::{
     ExecutionResult, Row, RowSink, Session, SpillConfig, StreamOutcome, auto_analyze_stale_tables,
     catalog_approx_row_count, catalog_list_indexes, catalog_table_stats, check_settable_parameter,

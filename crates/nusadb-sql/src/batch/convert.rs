@@ -32,9 +32,10 @@ use crate::executor::row;
 ///
 /// # Errors
 ///
-/// [`Error::TypeMismatch`] if a present value's runtime type does not match its column
-/// type, or [`Error::ArityMismatch`] / [`Error::TypeMismatch`] from
-/// [`RecordBatch::try_new`].
+/// An `internal_error` if a present value's runtime type does not match its column type, or
+/// [`Error::MalformedBatch`] / an `internal_error` from [`RecordBatch::try_new`]. Both the values
+/// and the schema come from the same plan node, so either disagreement is a fault here rather than
+/// anything a caller can act on.
 pub(crate) fn rows_to_batch(schema: &Arc<Schema>, rows: Vec<Row>) -> Result<RecordBatch, Error> {
     let row_count = rows.len();
     let mut columns: Vec<Vec<ast::Value>> = schema
@@ -214,7 +215,8 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
 
 /// Build the column array for `ty` from one batch's worth of values (one entry per row, in
 /// row order). `Null` becomes a null slot; a present value whose runtime type does not
-/// match `ty` is a defensive [`Error::TypeMismatch`].
+/// match `ty` is a defensive `internal_error` — reaching it means the engine built the batch
+/// wrongly.
 #[allow(
     clippy::too_many_lines,
     reason = "flat one-arm-per-ColumnType builder; length tracks the type set, not branching"
@@ -418,10 +420,16 @@ fn collect<T>(
 /// A column value whose runtime type does not match its column type (defensive — values
 /// from [`row::decode`] always match).
 fn type_mismatch(ty: ColumnType, value: &ast::Value) -> Error {
-    Error::TypeMismatch {
-        context: "row → record batch column".to_owned(),
-        expected: ty,
-        found: row::runtime_type_of(value),
+    // Carries its own code rather than `TypeMismatch`: a value reaching here disagreeing with its
+    // column means the engine built the batch wrongly, and a client told `datatype_mismatch` would
+    // go looking for a fault in its query.
+    Error::Coded {
+        message: format!(
+            "type mismatch in row → record batch column: expected {:?}, found {:?}",
+            ty,
+            row::runtime_type_of(value)
+        ),
+        sqlstate: crate::error::INTERNAL_ERROR,
     }
 }
 
@@ -517,7 +525,10 @@ mod tests {
     #[test]
     fn type_mismatch_is_rejected() {
         let s = schema(vec![("i", ColumnType::Int)]);
-        let err = rows_to_batch(&s, vec![vec![Value::Text("nope".to_owned())]]);
-        assert!(matches!(err, Err(crate::error::Error::TypeMismatch { .. })));
+        let err = rows_to_batch(&s, vec![vec![Value::Text("nope".to_owned())]])
+            .expect_err("a value disagreeing with its column must be rejected");
+        // Reported as the engine's own fault, which is what it is: both the value and the column
+        // type come from the same plan, so a client has nothing to fix in its query.
+        assert_eq!(err.sqlstate(), crate::error::INTERNAL_ERROR, "{err}");
     }
 }

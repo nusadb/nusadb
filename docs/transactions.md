@@ -9,16 +9,18 @@ conflicting transactions instead of blocking it, so your application must be pre
 | Situation | NusaDB behaviour | SQLSTATE |
 | --- | --- | --- |
 | Two transactions write the same row/key | Second writer aborts immediately (no wait) | `40001` |
-| Deadlock between transactions | Both abort (no hang) | `40001` |
+| Deadlock between transactions | Both abort (no hang) | `40P01` |
 | SERIALIZABLE rw-antidependency cycle | One transaction aborts at COMMIT | `40001` |
 
-`40001` (`serialization_failure`) is not an application bug. It is the engine asking you to run the
-transaction again. Integrity is preserved either way: exactly one writer wins, and there are no lost
-updates.
+Neither `40001` (`serialization_failure`) nor `40P01` (`deadlock_detected`) is an application bug.
+Both are the engine asking you to run the transaction again, so retry on the class — any code
+starting `40` — rather than on one value. The engine's own retry helper treats both as retryable.
+Integrity is preserved either way: exactly one writer wins, and there are no lost updates.
 
 ## The retry loop (required discipline)
 
-Wrap every write transaction in a bounded retry loop that re-runs the whole transaction on `40001`.
+Wrap every write transaction in a bounded retry loop that re-runs the whole transaction on a
+class-`40` error.
 Never retry a single statement in isolation, because the aborted transaction's earlier reads may be
 stale.
 
@@ -37,14 +39,16 @@ def with_retry(conn, work, attempts=5):
             return result
         except Exception as e:
             cur.execute("ROLLBACK")
-            if getattr(e, "sqlstate", None) != "40001" or attempt == attempts - 1:
+            # Retry the whole class: `40001` and `40P01` are both "run it again".
+            sqlstate = getattr(e, "sqlstate", None) or ""
+            if not sqlstate.startswith("40") or attempt == attempts - 1:
                 raise
             time.sleep(random.uniform(0, 0.05 * 2**attempt))  # jittered backoff
 ```
 
-The same shape applies through any driver or ORM: catch `40001`, roll back, back off with jitter,
-re-run. ORMs with a "retry on serialization failure" option (e.g. SQLAlchemy retrying decorators)
-should enable it.
+The same shape applies through any driver or ORM: catch class `40`, roll back, back off with
+jitter, re-run. ORMs with a "retry on serialization failure" option (e.g. SQLAlchemy retrying
+decorators) should enable it.
 
 ## Isolation levels over the wire
 
@@ -64,8 +68,8 @@ SET default_transaction_isolation = 'serializable';                   -- session
 enforce access modes; an error is safer than silently granting a writable "read-only"
 transaction).
 
-Higher isolation means more `40001`s under contention, and the retry loop above is what makes
-SERIALIZABLE practical.
+Higher isolation means more class-`40` aborts under contention, and the retry loop above is what
+makes SERIALIZABLE practical.
 
 ## Timeouts and cancellation
 

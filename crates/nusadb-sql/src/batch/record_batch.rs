@@ -31,12 +31,13 @@ impl RecordBatch {
     ///
     /// # Errors
     ///
-    /// - [`Error::ArityMismatch`] if the number of columns differs from the number of
+    /// - [`Error::MalformedBatch`] if the number of columns differs from the number of
     ///   fields, or if the columns are not all the same length.
-    /// - [`Error::TypeMismatch`] if a column's type differs from its field's type.
+    /// - An `internal_error` if a column's type differs from its field's type — the same class as
+    ///   the shape errors above, since both come from the engine having built the batch wrongly.
     pub fn try_new(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<Self, Error> {
         if columns.len() != schema.len() {
-            return Err(Error::ArityMismatch {
+            return Err(Error::MalformedBatch {
                 context: "record batch columns vs schema fields".to_owned(),
                 expected: schema.len(),
                 found: columns.len(),
@@ -51,14 +52,21 @@ impl RecordBatch {
             // type: the declared/physical distinction is DDL metadata, not a batch-shape error, but
             // a genuine wrong-type array (an `Int64` in a text field) still differs and is caught.
             if column.data_type().physical() != field.data_type().physical() {
-                return Err(Error::TypeMismatch {
-                    context: format!("record batch column `{}`", field.name()),
-                    expected: field.data_type(),
-                    found: column.data_type(),
+                // Both the field and the array come from the same plan node, so a disagreement is
+                // the engine's own bookkeeping, exactly as the length check below is. Reported the
+                // same way: a client told `datatype_mismatch` would go hunting in its query.
+                return Err(Error::Coded {
+                    message: format!(
+                        "type mismatch in record batch column `{}`: expected {:?}, found {:?}",
+                        field.name(),
+                        field.data_type(),
+                        column.data_type()
+                    ),
+                    sqlstate: crate::error::INTERNAL_ERROR,
                 });
             }
             if column.len() != row_count {
-                return Err(Error::ArityMismatch {
+                return Err(Error::MalformedBatch {
                     context: format!("record batch column `{}` length", field.name()),
                     expected: row_count,
                     found: column.len(),
@@ -184,7 +192,7 @@ mod tests {
             .expect_err("too few columns");
         assert!(matches!(
             err,
-            Error::ArityMismatch {
+            Error::MalformedBatch {
                 expected: 2,
                 found: 1,
                 ..
@@ -199,14 +207,13 @@ mod tests {
             vec![col(ColumnType::Int, 3), col(ColumnType::Int, 3)],
         )
         .expect_err("label column is Int, not Text");
-        assert!(matches!(
-            err,
-            Error::TypeMismatch {
-                expected: ColumnType::Text,
-                found: ColumnType::Int,
-                ..
-            }
-        ));
+        // Reported as the engine's own fault: schema and columns come from the same plan node, so
+        // a disagreement is a bug here, not something a client can act on.
+        assert_eq!(err.sqlstate(), crate::error::INTERNAL_ERROR, "{err}");
+        assert!(
+            err.to_string().contains("expected Text") && err.to_string().contains("found Int"),
+            "the diagnosis must still name both types: {err}"
+        );
     }
 
     #[test]
@@ -240,7 +247,7 @@ mod tests {
         .expect_err("columns of unequal length");
         assert!(matches!(
             err,
-            Error::ArityMismatch {
+            Error::MalformedBatch {
                 expected: 3,
                 found: 2,
                 ..

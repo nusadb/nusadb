@@ -3641,3 +3641,63 @@ async fn answering_an_unknown_user_costs_about_the_same_as_a_real_one() {
         );
     }
 }
+
+/// The classes a driver actually receives. `sqlstate()` is unit-tested next to its own definition,
+/// but what a client acts on is the code carried in the error frame — so this checks the whole way
+/// out, over a real session.
+///
+/// Before these were mapped, every one of them arrived as `XX000`: an ORM or migration tool asking
+/// "is this my query's fault or the server's?" was told the server had faulted, on an ordinary
+/// typo.
+#[tokio::test]
+async fn a_client_receives_the_class_of_its_own_mistake() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let _handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (id INT NOT NULL, s TEXT)").await;
+    let _ = next(&mut conn).await; // CommandComplete
+    let _ = next(&mut conn).await; // ReadyForQuery
+
+    for (sql, want, what) in [
+        ("SELECT FROM WHERE", "42601", "syntax_error"),
+        ("SELECT * FROM ghost", "42P01", "undefined_table"),
+        ("CREATE TABLE t (id INT)", "42P07", "duplicate_table"),
+        ("SELECT ghost_col FROM t", "42703", "undefined_column"),
+        // A qualified name whose schema is absent is an absent *relation* — the schema class is for
+        // naming a schema that is not there, which is what dropping one does.
+        ("SELECT * FROM ghost_schema.t", "42P01", "undefined_table"),
+        // `3F000` is asserted at its production site instead: this session is not a superuser, so
+        // `DROP SCHEMA` on an absent schema is answered by the ownership check before existence is
+        // ever considered. An operator connecting with the rights to drop a schema does receive it.
+        (
+            "INSERT INTO t VALUES (1, 'a', 'extra')",
+            "42601",
+            "syntax_error",
+        ),
+        (
+            "CREATE TABLE d (a INT, a TEXT)",
+            "42701",
+            "duplicate_column",
+        ),
+    ] {
+        query(&mut conn, sql).await;
+        match next(&mut conn).await {
+            BackendMessage::Error { code, message } => assert_eq!(
+                code, want,
+                "`{sql}` should report {what} ({want}); got {code}: {message}"
+            ),
+            other => panic!("`{sql}` should have been refused; got {other:?}"),
+        }
+        let _ = next(&mut conn).await; // ReadyForQuery
+    }
+
+    // The session is unharmed by the refusals.
+    query(&mut conn, "INSERT INTO t VALUES (1, 'ok')").await;
+    match next(&mut conn).await {
+        BackendMessage::CommandComplete { tag } => assert_eq!(tag, "INSERT 1"),
+        other => panic!("the session should still work after the refusals; got {other:?}"),
+    }
+}

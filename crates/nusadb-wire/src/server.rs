@@ -2759,7 +2759,7 @@ where
             StreamedRun::Punt(plan_cache) => (
                 Err((
                     "internal: the pool path cannot punt".to_owned(),
-                    nusadb_sql::Error::Unsupported(String::new()).sqlstate(),
+                    nusadb_sql::INTERNAL_ERROR,
                 )),
                 Vec::new(),
                 state,

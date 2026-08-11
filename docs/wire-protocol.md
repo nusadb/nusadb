@@ -515,9 +515,42 @@ A `CancelRequest` arriving mid-session (not as the first frame) is stray and ign
 
 Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
 
-- `code` is a 5-character SQLSTATE. In 1.0 the server emits `XX000` (`internal_error`) for most
-  errors; finer codes are a forward-compatible follow-up. Clients MUST read the code as 5 chars and
-  not assume a specific value.
+- `code` is a 5-character SQLSTATE, and its first two characters — the class — are what a client
+  should branch on. A fault in the query reports its own class; `XX000` (`internal_error`) is
+  reserved for a fault in the server. Clients MUST read the code as 5 characters and MUST NOT
+  assume a specific value within a class, since a code may be refined to a more precise one in the
+  same class.
+
+  | Class | Meaning | Examples |
+  | --- | --- | --- |
+  | `22` | data exception — a value the type cannot represent | `22012` division by zero, `22P02` unparseable text, `22007` bad date/time, `22P04` malformed COPY data |
+  | `23` | integrity constraint violation | `23502` NOT NULL, `23505` unique, `23503` foreign key |
+  | `25` | the transaction is in the wrong state for this statement | `25P02` transaction is aborted — send `ROLLBACK`; `25001` this statement cannot run here (inside a transaction block, or after a query has already run in it) |
+  | `2B` | dependent objects still exist | `2BP01` — resolve with `CASCADE` |
+  | `3D` | invalid catalog (database) name | `3D000` |
+  | `3F` | invalid schema name | `3F000` |
+  | `40` | transaction rollback — **retryable** | `40001` serialization failure, `40P01` deadlock |
+  | `42` | syntax error or access rule violation | `42601` syntax, `42P01` no such table, `42703` no such column, `42883` no such function, `42501` permission denied |
+  | `53` | insufficient resources — **back off and retry** | `53300` too many connections; the server closes the connection after sending it |
+  | `54` | program limit exceeded | `54001` recursion limit |
+  | `55` | object not in a state the operation needs | `55006` object in use, `55P02` parameter cannot be changed now |
+  | `57` | operator intervention | `57014` statement cancelled or timed out |
+  | `P0` | raised by the user's own code | `P0001` `RAISE` from a procedure |
+  | `XX` | internal error — the server's fault, not the caller's | `XX000` |
+
+  The list is what the server emits today, not a closed set: a future version may add a class, and
+  a client should treat an unrecognised one as it treats `XX`. Two notes worth having:
+
+  - A client that retries should retry the whole class `40` — both `40001` and `40P01`, which is
+    what the server's own retry helper does — and back off on `53300` rather than reconnecting at
+    once. One that surfaces the error should distinguish class `42`/`22` (fix the query or the
+    data) from `XX` (report it as a defect). On `25P02` there is nothing to retry until the
+    transaction is ended: send `ROLLBACK` first.
+  - `0A` (`feature_not_supported`) is **not** emitted. A statement the server will not run reports
+    `XX000` today, because the refusal that carries it is also raised for ordinary mistakes, and
+    telling a caller "feature not supported" would invite it to skip work it should have stopped
+    on. Do not branch on `0A` expecting to find unsupported features.
+
 - `message` is human-readable.
 
 An `Error` during a simple query is followed by `ReadyForQuery`. During extended query it triggers

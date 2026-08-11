@@ -492,8 +492,14 @@ fn create_and_drop_schema_end_to_end() {
         run(&engine, "DROP SCHEMA app"),
         ExecutionResult::SchemaDropped
     ));
-    // DROP of a missing schema errors without IF EXISTS, no-ops with it.
-    assert!(run_try(&engine, "DROP SCHEMA app").is_err());
+    // DROP of a missing schema errors without IF EXISTS, no-ops with it. The class matters: a
+    // client is told it named a schema that is not there, not that the engine broke.
+    let err = run_try(&engine, "DROP SCHEMA app").expect_err("a missing schema must be refused");
+    assert_eq!(
+        err.sqlstate(),
+        "3F000",
+        "wanted invalid_schema_name; got `{err}`"
+    );
     assert!(matches!(
         run(&engine, "DROP SCHEMA IF EXISTS app"),
         ExecutionResult::SchemaDropped

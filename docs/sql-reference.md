@@ -235,11 +235,12 @@ not released in lockstep to collide again.
 Inside an explicit transaction the conflict is reported, not retried. A statement there may follow
 others whose results the application already acted on, so silently re-running it would change what
 those earlier results meant — only the application knows whether the whole transaction can be
-replayed. Handle `40001` by rolling back and retrying the transaction.
+replayed. Handle a class-`40` error — `40001` or `40P01` — by rolling back and retrying the
+transaction; see [`transactions.md`](transactions.md) for the loop.
 
 `SET max_autocommit_retries = N` bounds the attempts (default 50, maximum 100); `0` switches the
 retry off and reports the first conflict. The budget is a bound, not a promise: a conflict that
-outlives it is reported unchanged as `40001`, so an application's own retry loop still works. A
+outlives it is reported unchanged, so an application's own retry loop still works. A
 `statement_timeout` or a cancel request applies to the retry sequence as a whole and ends it.
 
 Consequences worth knowing:
