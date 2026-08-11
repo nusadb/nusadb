@@ -3824,6 +3824,13 @@ struct EngineCatalog<'a> {
     /// The session's ordered `search_path` schemas, derived from `SET search_path`; `[public]`
     /// when unset. An unqualified name is created in the first entry and resolved through the list.
     search_path: Vec<String>,
+    /// The resolved session (effective roles + superuser flag), computed once and reused for every
+    /// privilege question this statement asks. A fresh `EngineCatalog` is built per statement over a
+    /// fixed transaction snapshot, so the cache is exactly statement-scoped and never outlives the
+    /// snapshot it was resolved against — a role or grant change lands in the next statement's
+    /// catalog, not this one. Without it a statement touching several tables re-scanned the role
+    /// catalogs once per table reference (and again for each `is_superuser` + `has_privilege` pair).
+    resolved: std::cell::RefCell<Option<nusadb_sql::rbac::ResolvedSession>>,
 }
 
 impl<'a> EngineCatalog<'a> {
@@ -3841,7 +3848,21 @@ impl<'a> EngineCatalog<'a> {
             txn,
             user,
             search_path,
+            resolved: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The resolved session for this statement — computed on first use, cached for the rest. Cloned
+    /// out (a small in-memory copy) rather than borrowed, to avoid holding the `RefCell` across the
+    /// catalog scans the returned session then drives.
+    fn resolved(&self) -> Result<nusadb_sql::rbac::ResolvedSession, nusadb_sql::Error> {
+        if let Some(resolved) = self.resolved.borrow().as_ref() {
+            return Ok(resolved.clone());
+        }
+        let resolved =
+            nusadb_sql::rbac::ResolvedSession::resolve(self.engine, self.txn, self.user)?;
+        *self.resolved.borrow_mut() = Some(resolved.clone());
+        Ok(resolved)
     }
 }
 
@@ -3913,8 +3934,7 @@ impl Catalog for EngineCatalog<'_> {
         // catalog says so, directly or through a membership. A failed catalog read answers
         // `false`, which is the restrictive direction for every caller (RLS applies, privileges
         // are checked).
-        nusadb_sql::rbac::principal(self.engine, self.txn, self.user)
-            .is_ok_and(|principal| principal.superuser)
+        self.resolved().is_ok_and(|r| r.is_superuser())
     }
 
     fn has_privilege(
@@ -3923,7 +3943,8 @@ impl Catalog for EngineCatalog<'_> {
         object: &str,
         privilege: nusadb_sql::ast::Privilege,
     ) -> Result<bool, nusadb_sql::Error> {
-        nusadb_sql::rbac::has_privilege(self.engine, self.txn, self.user, kind, object, privilege)
+        self.resolved()?
+            .has_privilege(self.engine, self.txn, kind, object, privilege)
     }
 
     fn may_grant_object(
@@ -3932,7 +3953,8 @@ impl Catalog for EngineCatalog<'_> {
         object: &str,
         privilege: nusadb_sql::ast::Privilege,
     ) -> Result<bool, nusadb_sql::Error> {
-        nusadb_sql::rbac::may_grant(self.engine, self.txn, self.user, kind, object, privilege)
+        self.resolved()?
+            .may_grant(self.engine, self.txn, kind, object, privilege)
     }
 
     fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
@@ -3944,11 +3966,7 @@ impl Catalog for EngineCatalog<'_> {
     }
 
     fn may_assume_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
-        Ok(
-            nusadb_sql::rbac::principal(self.engine, self.txn, self.user)?.superuser
-                || nusadb_sql::rbac::effective_roles(self.engine, self.txn, self.user)?
-                    .contains(role),
-        )
+        Ok(self.resolved()?.may_assume_role(role))
     }
 
     fn role_exists(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
@@ -3961,7 +3979,8 @@ impl Catalog for EngineCatalog<'_> {
         kind: nusadb_sql::ast::ObjectKind,
         object: &str,
     ) -> Result<bool, nusadb_sql::Error> {
-        nusadb_sql::rbac::owns_object(self.engine, self.txn, self.user, kind, object)
+        self.resolved()?
+            .owns_object(self.engine, self.txn, kind, object)
     }
 
     fn current_user(&self) -> String {

@@ -538,18 +538,156 @@ pub fn resolve_session(
     txn: TxnId,
     user: &str,
 ) -> Result<(BTreeSet<String>, bool), Error> {
-    if user == crate::BOOTSTRAP_SUPERUSER {
-        let mut effective = BTreeSet::new();
-        effective.insert(user.to_owned());
-        return Ok((effective, true));
+    let resolved = ResolvedSession::resolve(engine, txn, user)?;
+    Ok((resolved.effective, resolved.superuser))
+}
+
+/// A session resolved to the roles it effectively holds and whether it is a superuser — the two
+/// facts every privilege question turns on, computed once from the role and membership catalogs.
+///
+/// Every RBAC question in one statement is about the same session, so resolving it once and asking
+/// the resolved session (rather than re-deriving it per question) is what keeps a statement that
+/// touches several tables from re-scanning the role catalogs per table. The decision procedure
+/// lives here as pure methods over already-fetched catalog rows; the free functions below fetch
+/// those rows and delegate, so a caller with nothing cached gets the exact same answer.
+#[derive(Debug, Clone)]
+pub struct ResolvedSession {
+    /// Every role the session effectively holds — itself and everything it inherits, transitively.
+    effective: BTreeSet<String>,
+    /// Whether any of those roles carries the superuser attribute.
+    superuser: bool,
+}
+
+impl ResolvedSession {
+    /// Resolve `user` against the role and membership catalogs (one scan of each).
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub fn resolve(engine: &dyn StorageEngine, txn: TxnId, user: &str) -> Result<Self, Error> {
+        if user == crate::BOOTSTRAP_SUPERUSER {
+            let mut effective = BTreeSet::new();
+            effective.insert(user.to_owned());
+            return Ok(Self {
+                effective,
+                superuser: true,
+            });
+        }
+        let memberships = all_memberships(engine, txn)?;
+        let roles = all_roles(engine, txn)?;
+        let effective = effective_roles_from(&memberships, &roles, user);
+        let superuser = roles
+            .iter()
+            .any(|r| r.superuser && effective.contains(&r.name));
+        Ok(Self {
+            effective,
+            superuser,
+        })
     }
-    let memberships = all_memberships(engine, txn)?;
-    let roles = all_roles(engine, txn)?;
-    let effective = effective_roles_from(&memberships, &roles, user);
-    let superuser = roles
-        .iter()
-        .any(|r| r.superuser && effective.contains(&r.name));
-    Ok((effective, superuser))
+
+    /// Whether the session is a superuser (bypasses every check).
+    #[must_use]
+    pub const fn is_superuser(&self) -> bool {
+        self.superuser
+    }
+
+    /// Whether the session effectively holds the role named `owner` — pure ownership, given an
+    /// already-resolved owner name. Deliberately does **not** fold in the superuser flag: ownership
+    /// and superuser are distinct, and every caller that treats a superuser as able-to-do-anything
+    /// checks [`is_superuser`](Self::is_superuser) separately first. Matches the historical
+    /// `owns_object`, whose result was exactly `effective.contains(owner)`.
+    #[must_use]
+    pub fn owns(&self, owner: &str) -> bool {
+        self.effective.contains(owner)
+    }
+
+    /// The privilege decision over already-fetched inputs: superuser, or owner, or a matching
+    /// grant held by an effective role (or `PUBLIC`). `grantable_only` narrows the grant match to
+    /// grantable grants (the `may_grant` rule). Pure — no scan — so the same logic serves the
+    /// cached catalog path and the free-function path identically.
+    #[must_use]
+    pub fn decide(
+        &self,
+        owner: &str,
+        grants: &[GrantRecord],
+        kind: ObjectKind,
+        object: &str,
+        privilege: Privilege,
+        grantable_only: bool,
+    ) -> bool {
+        if self.owns(owner) {
+            return true;
+        }
+        grants.iter().any(|g| {
+            g.kind == kind
+                && g.object == object
+                && g.privilege == privilege
+                && (!grantable_only || g.grantable)
+                && match &g.grantee {
+                    Grantee::Public => true,
+                    Grantee::Role(name) => self.effective.contains(name),
+                }
+        })
+    }
+
+    /// [`decide`](Self::decide), fetching the object's owner and the grant list itself.
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub fn has_privilege(
+        &self,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        kind: ObjectKind,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, Error> {
+        if self.superuser {
+            return Ok(true);
+        }
+        let owner = object_owner(engine, txn, kind, object)?;
+        let grants = all_grants(engine, txn)?;
+        Ok(self.decide(&owner, &grants, kind, object, privilege, false))
+    }
+
+    /// The grant-option variant of [`has_privilege`](Self::has_privilege) (`may_grant`).
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub fn may_grant(
+        &self,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        kind: ObjectKind,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, Error> {
+        if self.superuser {
+            return Ok(true);
+        }
+        let owner = object_owner(engine, txn, kind, object)?;
+        let grants = all_grants(engine, txn)?;
+        Ok(self.decide(&owner, &grants, kind, object, privilege, true))
+    }
+
+    /// Whether the session owns `object`, fetching its owner.
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub fn owns_object(
+        &self,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        kind: ObjectKind,
+        object: &str,
+    ) -> Result<bool, Error> {
+        Ok(self.owns(&object_owner(engine, txn, kind, object)?))
+    }
+
+    /// Whether the session may assume `role` — a superuser, or a role it effectively holds.
+    #[must_use]
+    pub fn may_assume_role(&self, role: &str) -> bool {
+        self.superuser || self.effective.contains(role)
+    }
 }
 
 /// Whether granting membership in `role` to `member` would close a cycle — that is, whether
@@ -1002,25 +1140,7 @@ pub fn has_privilege(
     object: &str,
     privilege: Privilege,
 ) -> Result<bool, Error> {
-    // One scan pass yields both the superuser flag and the effective roles the owner- and
-    // grant-checks need — previously the effective set was recomputed after `principal` discarded
-    // it.
-    let (effective, superuser) = resolve_session(engine, txn, user)?;
-    if superuser {
-        return Ok(true);
-    }
-    if effective.contains(&object_owner(engine, txn, kind, object)?) {
-        return Ok(true);
-    }
-    Ok(all_grants(engine, txn)?.into_iter().any(|g| {
-        g.kind == kind
-            && g.object == object
-            && g.privilege == privilege
-            && match &g.grantee {
-                Grantee::Public => true,
-                Grantee::Role(name) => effective.contains(name),
-            }
-    }))
+    ResolvedSession::resolve(engine, txn, user)?.has_privilege(engine, txn, kind, object, privilege)
 }
 
 /// Whether `user` may *pass on* `privilege` — needed to run a `GRANT`.
@@ -1039,23 +1159,7 @@ pub fn may_grant(
     object: &str,
     privilege: Privilege,
 ) -> Result<bool, Error> {
-    let (effective, superuser) = resolve_session(engine, txn, user)?;
-    if superuser {
-        return Ok(true);
-    }
-    if effective.contains(&object_owner(engine, txn, kind, object)?) {
-        return Ok(true);
-    }
-    Ok(all_grants(engine, txn)?.into_iter().any(|g| {
-        g.kind == kind
-            && g.object == object
-            && g.privilege == privilege
-            && g.grantable
-            && match &g.grantee {
-                Grantee::Public => true,
-                Grantee::Role(name) => effective.contains(name),
-            }
-    }))
+    ResolvedSession::resolve(engine, txn, user)?.may_grant(engine, txn, kind, object, privilege)
 }
 
 /// Whether `user` effectively owns an object — directly, or through a role it inherits.
@@ -1069,7 +1173,7 @@ pub fn owns_object(
     kind: ObjectKind,
     object: &str,
 ) -> Result<bool, Error> {
-    Ok(effective_roles(engine, txn, user)?.contains(&object_owner(engine, txn, kind, object)?))
+    ResolvedSession::resolve(engine, txn, user)?.owns_object(engine, txn, kind, object)
 }
 
 /// Whether `user` may create roles — a superuser, or a role holding `CREATEROLE`.
