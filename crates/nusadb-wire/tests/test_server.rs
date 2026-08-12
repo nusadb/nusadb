@@ -3701,3 +3701,129 @@ async fn a_client_receives_the_class_of_its_own_mistake() {
         other => panic!("the session should still work after the refusals; got {other:?}"),
     }
 }
+
+/// `Describe(Portal)` must authorize as the **assumed** role (after `SET ROLE`), not the login
+/// role — otherwise it reports the columns of a table the acting role cannot read, a metadata
+/// leak and a disagreement with what `Execute` would then refuse.
+#[tokio::test]
+async fn describe_portal_authorizes_as_the_assumed_role() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+
+    // Log in as the bootstrap superuser.
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "nusa-root".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+
+    // Drain a simple query to its ReadyForQuery, asserting it did not error.
+    async fn drain_ok(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) {
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => panic!("`{sql}` errored: {message}"),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+    }
+
+    // A table only the superuser can read, and a weak role that holds nothing on it.
+    query(&mut conn, "CREATE TABLE secret (id INT NOT NULL)").await;
+    drain_ok(&mut conn, "CREATE TABLE secret").await;
+    query(&mut conn, "CREATE ROLE weak LOGIN").await;
+    drain_ok(&mut conn, "CREATE ROLE weak").await;
+
+    // A helper: Parse + Bind a SELECT portal, ask to Describe it, and return whether the server
+    // answered with row metadata (Ok) or an error (the acting role may not read it).
+    async fn describe_select(conn: &mut Connection<tokio::io::DuplexStream>) -> Result<(), String> {
+        conn.write_frame(
+            &FrontendMessage::Parse {
+                name: "s".to_owned(),
+                sql: "SELECT id FROM secret".to_owned(),
+                param_types: vec![],
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(conn).await, BackendMessage::ParseComplete);
+        conn.write_frame(
+            &FrontendMessage::Bind {
+                portal: "p".to_owned(),
+                statement: "s".to_owned(),
+                params: vec![],
+                result_formats: vec![],
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(conn).await, BackendMessage::BindComplete);
+        conn.write_frame(
+            &FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "p".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let out = match next(conn).await {
+            BackendMessage::RowDescription { .. } | BackendMessage::RowDescriptionTyped { .. } => {
+                Ok(())
+            },
+            BackendMessage::Error { message, .. } => Err(message),
+            other => panic!("unexpected Describe reply: {other:?}"),
+        };
+        // Drain the failed extended-query state (Sync → ReadyForQuery) so the next block is clean.
+        conn.write_frame(&FrontendMessage::Sync.encode().unwrap())
+            .await
+            .unwrap();
+        while !matches!(next(conn).await, BackendMessage::ReadyForQuery(_)) {}
+        out
+    }
+
+    // As the login superuser, Describe succeeds.
+    describe_select(&mut conn)
+        .await
+        .expect("superuser Describe should report the columns");
+
+    // Switch to the weak role. Now Describe must be refused — the acting role cannot read `secret`.
+    query(&mut conn, "SET ROLE weak").await;
+    drain_ok(&mut conn, "SET ROLE weak").await;
+    let denied = describe_select(&mut conn)
+        .await
+        .expect_err("Describe as the assumed weak role must be refused");
+    assert!(
+        denied.contains("permission denied"),
+        "refusal should be a permission error, got: {denied}"
+    );
+
+    // Back to the superuser: Describe works again, proving the switch is what gated it.
+    query(&mut conn, "RESET ROLE").await;
+    drain_ok(&mut conn, "RESET ROLE").await;
+    describe_select(&mut conn)
+        .await
+        .expect("Describe should report the columns again after RESET ROLE");
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

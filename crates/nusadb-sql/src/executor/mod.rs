@@ -352,10 +352,39 @@ pub fn auto_analyze_stale_tables(
     Ok(analysed)
 }
 
+/// `COPY <table> FROM STDIN` within a caller-owned transaction — no `begin`/`commit`/`rollback`.
+///
+/// The wire server uses this so the access check it must raise for COPY (which never reaches the
+/// analyzer) runs in the **same** transaction as the load, closing the window between checking and
+/// transferring. Plain callers use [`copy_from`], which owns the transaction.
+///
+/// # Errors
+/// Propagates parse, type, and constraint errors. The caller owns rollback on error.
+pub fn copy_from_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    data: &str,
+    txn: nusadb_core::TxnId,
+) -> Result<usize, Error> {
+    run_copy_from(copy, data, engine, txn)
+}
+
+/// `COPY <table> TO STDOUT` within a caller-owned transaction — the read-only counterpart of
+/// [`copy_from_in`].
+///
+/// # Errors
+/// Propagates lookup and rendering errors. The caller owns rollback on error.
+pub fn copy_to_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    txn: nusadb_core::TxnId,
+) -> Result<(usize, String), Error> {
+    run_copy_to(copy, engine, txn)
+}
+
 /// Execute `COPY <table> FROM STDIN`: bulk-load the text-format `data` into the table in a
 /// single auto-committed transaction, returning the number of rows inserted.
 ///
-/// The wire server collects the `CopyData` stream and calls this once the client sends `CopyDone`.
 /// The load is all-or-nothing: a malformed row or a constraint violation rolls the whole copy back
 /// (the same semantics a single multi-row `INSERT` would have).
 ///

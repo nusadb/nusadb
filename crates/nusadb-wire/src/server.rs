@@ -21,9 +21,8 @@ use nusadb_core::{IsolationLevel, StorageEngine, TableSchema, TxnId};
 use nusadb_sql::ast::Value;
 use nusadb_sql::{
     Catalog, ExecutionResult, IndexInfo, RowSink, StreamOutcome, analyze, bind_parameters,
-    copy_from, copy_to, describe_column_types, describe_columns,
-    execute_in_txn_as_streaming_with_settings, execute_in_txn_as_with_settings, parameter_count,
-    parse, plan, show_session_variable,
+    describe_column_types, describe_columns, execute_in_txn_as_streaming_with_settings,
+    execute_in_txn_as_with_settings, parameter_count, parse, plan, show_session_variable,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -907,11 +906,12 @@ where
                                     idle_timeout,
                                     &mut shutdown,
                                     copy_from_max_bytes,
+                                    &copy_actor,
                                 )
                                 .await?
                             },
                             nusadb_sql::ast::CopyDirection::To => {
-                                handle_copy_out(&mut conn, &engine, copy).await?
+                                handle_copy_out(&mut conn, &engine, copy, &copy_actor).await?
                             },
                         }
                     };
@@ -1076,7 +1076,11 @@ where
                     // Plan-only: report the row shape without executing (side effects wait for
                     // Execute).
                     DescribeTarget::Portal => match describe_portal(
-                        &engine, &portals, &name, &user,
+                        &engine,
+                        &portals,
+                        &name,
+                        &effective_user(&user, &settings),
+                        &settings.lock().map(|g| g.clone()).unwrap_or_default(),
                     )
                     .await
                     {
@@ -1361,6 +1365,7 @@ async fn handle_copy_in<S>(
     idle_timeout: Option<Duration>,
     shutdown: &mut Option<watch::Receiver<bool>>,
     max_bytes: Option<usize>,
+    actor: &str,
 ) -> io::Result<Result<usize, String>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1415,8 +1420,37 @@ where
         return Ok(Err("COPY data is not valid UTF-8".to_owned()));
     };
     let engine = Arc::clone(engine);
+    let actor = actor.to_owned();
     let result = tokio::task::spawn_blocking(move || {
-        copy_from(engine.as_ref(), &copy, &data).map_err(|e| e.to_string())
+        // The access check runs in the SAME transaction as the load, so a REVOKE that lands after
+        // the pre-upload fast-fail check still bites — there is no window between "allowed" and
+        // "written" for a concurrent change to slip through.
+        let txn = engine
+            .begin(IsolationLevel::default())
+            .map_err(|e| e.to_string())?;
+        if let Some(msg) = copy_access_verdict(
+            engine.as_ref(),
+            txn,
+            &copy.table,
+            &actor,
+            nusadb_sql::ast::CopyDirection::From,
+        ) {
+            let _ = engine.rollback(txn);
+            return Err(msg);
+        }
+        match nusadb_sql::copy_from_in(engine.as_ref(), &copy, &data, txn) {
+            Ok(count) => match engine.commit(txn) {
+                Ok(()) => Ok(count),
+                Err(e) => {
+                    let _ = engine.rollback(txn);
+                    Err(e.to_string())
+                },
+            },
+            Err(e) => {
+                let _ = engine.rollback(txn);
+                Err(e.to_string())
+            },
+        }
     })
     .await
     .unwrap_or_else(|_join| Err("internal execution error".to_owned()));
@@ -1430,14 +1464,33 @@ async fn handle_copy_out<S>(
     conn: &mut Connection<S>,
     engine: &Arc<dyn StorageEngine>,
     copy: nusadb_sql::ast::Copy,
+    actor: &str,
 ) -> io::Result<Result<usize, String>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let columns = u16::try_from(copy.columns.len()).unwrap_or(0);
     let engine = Arc::clone(engine);
+    let actor = actor.to_owned();
     let rendered = tokio::task::spawn_blocking(move || {
-        copy_to(engine.as_ref(), &copy).map_err(|e| e.to_string())
+        // Check and render in one transaction, so the rows streamed out are exactly the ones the
+        // access check was evaluated against.
+        let txn = engine
+            .begin(IsolationLevel::default())
+            .map_err(|e| e.to_string())?;
+        if let Some(msg) = copy_access_verdict(
+            engine.as_ref(),
+            txn,
+            &copy.table,
+            &actor,
+            nusadb_sql::ast::CopyDirection::To,
+        ) {
+            let _ = engine.rollback(txn);
+            return Err(msg);
+        }
+        let out = nusadb_sql::copy_to_in(engine.as_ref(), &copy, txn).map_err(|e| e.to_string());
+        let _ = engine.rollback(txn); // read-only: nothing to commit
+        out
     })
     .await
     .unwrap_or_else(|_join| Err("internal execution error".to_owned()));
@@ -1598,7 +1651,8 @@ async fn describe_portal(
     engine: &Arc<dyn StorageEngine>,
     portals: &HashMap<String, Portal>,
     name: &str,
-    user: &str,
+    acting_user: &str,
+    settings: &HashMap<String, String>,
 ) -> Result<(Vec<String>, Vec<nusadb_core::ColumnType>), String> {
     let (sql, params) = match portals.get(name) {
         // A portal already executed (its rows are cached) reuses the executed column names. Types are
@@ -1610,17 +1664,20 @@ async fn describe_portal(
         None => return Err(format!("unknown portal {name:?}")),
     };
     let engine = Arc::clone(engine);
-    let user = user.to_owned();
+    let acting_user = acting_user.to_owned();
+    let settings = settings.clone();
     tokio::task::spawn_blocking(move || {
         let stmt = bind_parameters(parse(&sql)?, &params)?;
         // Describe resolves the row shape without running the statement, but analysis still
         // needs a transaction to resolve schema visibility. Use a short read-only
-        // transaction and roll it back — Describe must have no side effects. The connection's user
-        // is carried so RLS-restricted columns analyze the same way they will at execution.
+        // transaction and roll it back — Describe must have no side effects. The **acting** user
+        // (the assumed role after `SET ROLE`, not the login role) and the connection's settings
+        // are carried so column visibility and search-path resolution match execution exactly —
+        // otherwise Describe would report columns of tables the acting role cannot read.
         let txn = engine.begin(IsolationLevel::default())?;
         let result = analyze(
             stmt,
-            &EngineCatalog::new(engine.as_ref(), txn, &user, &HashMap::new()),
+            &EngineCatalog::new(engine.as_ref(), txn, &acting_user, &settings),
         )
         .map(|logical| {
             let physical = plan(logical);
