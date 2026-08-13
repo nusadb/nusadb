@@ -333,6 +333,10 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(stmt) = recognize_reindex(sql) {
         return Ok(stmt);
     }
+    // `CHECKPOINT` is not modelled by the generic tokenizer either; recognize the bare form here.
+    if let Some(stmt) = recognize_checkpoint(sql) {
+        return Ok(stmt);
+    }
     // `COMMENT ON ...` is tokenized by `sqlparser` 0.51 but not modelled as a statement, so
     // (like `VACUUM`) recognize and parse it ourselves before the generic path.
     if let Some(result) = recognize_comment(sql) {
@@ -547,6 +551,20 @@ fn recognize_reindex(sql: &str) -> Option<ast::Statement> {
         return None;
     }
     Some(ast::Statement::Reindex)
+}
+
+/// Recognize a bare `CHECKPOINT` (optionally trailing `;`/whitespace). `sqlparser` does not model
+/// it as a statement, so — like `VACUUM`/`REINDEX` — it is recognized here before the generic
+/// parser. It takes no arguments: anything after the keyword (other than whitespace or `;`) falls
+/// through to the generic parser, which rejects it, so a glued token like `checkpoints` is not
+/// mistaken for it.
+fn recognize_checkpoint(sql: &str) -> Option<ast::Statement> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if trimmed.eq_ignore_ascii_case("checkpoint") {
+        Some(ast::Statement::Checkpoint)
+    } else {
+        None
+    }
 }
 
 /// Parse the text after the `VACUUM` keyword into [`ast::VacuumOptions`]. Accepts an empty tail, a

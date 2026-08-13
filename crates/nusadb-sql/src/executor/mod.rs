@@ -144,6 +144,8 @@ pub enum ExecutionResult {
     Vacuumed(usize),
     /// `REINDEX` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
     Reindexed,
+    /// A `CHECKPOINT` completed: the log was folded into an image and truncated.
+    CheckpointDone,
     /// `ANALYZE` — statistics recomputed for the given number of columns.
     Analyzed {
         /// Table whose statistics were recomputed.
@@ -941,6 +943,14 @@ impl<'engine> Session<'engine> {
                 );
                 Ok(ExecutionResult::Prepared)
             },
+            // CHECKPOINT needs a quiesced engine, so it runs outside any data transaction. If this
+            // session holds an open explicit transaction the engine refuses (that transaction is
+            // active) — the correct answer, with the active count in the message.
+            PhysicalPlan::Checkpoint => self
+                .engine
+                .checkpoint()
+                .map(|()| ExecutionResult::CheckpointDone)
+                .map_err(Into::into),
             PhysicalPlan::Execute { name, args } => self.execute_prepared(&name, &args),
             PhysicalPlan::Deallocate(target) => {
                 match target {
@@ -1595,6 +1605,13 @@ fn dispatch(
         PhysicalPlan::Vacuum(options) => run_vacuum(options, engine, txn),
         // REINDEX is a no-op: NusaDB's B-tree indexes are always consistent (MVCC + purge).
         PhysicalPlan::Reindex => Ok(ExecutionResult::Reindexed),
+        // CHECKPOINT is normally intercepted before a data transaction is opened (it needs a
+        // quiesced engine). Reaching it here means it ran inside `txn`, so the engine refuses with
+        // its active-transaction error — the honest answer; the interception paths avoid it.
+        PhysicalPlan::Checkpoint => engine
+            .checkpoint()
+            .map(|()| ExecutionResult::CheckpointDone)
+            .map_err(Into::into),
         PhysicalPlan::LockTable { tables, mode } => run_lock_table(&tables, mode, engine, txn),
         PhysicalPlan::ShowTables => run_show_tables(engine, txn),
         PhysicalPlan::ShowColumns(schema) => Ok(run_show_columns(&schema)),
@@ -2085,6 +2102,7 @@ fn format_plan(
             if options.analyze { " ANALYZE" } else { "" }
         )],
         PhysicalPlan::Reindex => vec![format!("{indent}Reindex (no-op)")],
+        PhysicalPlan::Checkpoint => vec![format!("{indent}Checkpoint")],
         PhysicalPlan::Analyze(p) => vec![format!(
             "{indent}Analyze: {} ({} column(s))",
             p.table.name,

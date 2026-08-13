@@ -319,6 +319,8 @@ pub enum LogicalPlan {
     Vacuum(crate::ast::VacuumOptions),
     /// `REINDEX ...` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
     Reindex,
+    /// `CHECKPOINT` — fold the durable log into an image and truncate it. Requires quiescence.
+    Checkpoint,
     /// `ANALYZE` — recompute statistics for a table's columns.
     Analyze(AnalyzePlan),
     /// `LOCK TABLE` — acquire a table-level lock on each resolved table.
@@ -2124,6 +2126,8 @@ pub enum PhysicalPlan {
     Vacuum(crate::ast::VacuumOptions),
     /// `REINDEX ...` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
     Reindex,
+    /// `CHECKPOINT` — fold the durable log into an image and truncate it. Requires quiescence.
+    Checkpoint,
     /// `ANALYZE` — recompute statistics for a table's columns.
     Analyze(AnalyzePlan),
     /// `LOCK TABLE` — acquire a table-level lock on each resolved table.

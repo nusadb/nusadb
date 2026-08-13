@@ -2270,6 +2270,7 @@ fn run_query_streaming(
         Statement::BeginTransaction(ts) => Some(begin_txn(engine, state, settings, ts)),
         Statement::Commit => Some(commit_txn(engine, state)),
         Statement::Rollback => Some(rollback_txn(engine, state)),
+        Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
         // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` (P-ISOLATION): session default in
         // autocommit, re-begin in an untouched transaction, refused after any query.
         Statement::SetTransaction(ts) => Some(set_transaction_txn(engine, settings, ts, state)),
@@ -3701,6 +3702,22 @@ fn rollback_txn(
     (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
 }
 
+/// `CHECKPOINT` — fold the log into an image and truncate it. It runs *outside* any data
+/// transaction (the engine's checkpoint needs a quiesced engine), so it is intercepted here rather
+/// than executed against a statement transaction. If this connection holds an open transaction the
+/// engine refuses it (that transaction is active) with the active-count in the message, which is
+/// the correct answer; the connection's transaction state is left unchanged either way.
+fn checkpoint_txn(
+    engine: &dyn StorageEngine,
+    state: TxnState,
+) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
+    let result = engine
+        .checkpoint()
+        .map(|()| ExecutionResult::CheckpointDone)
+        .map_err(Into::into);
+    (result, state)
+}
+
 /// `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` against the connection's open
 /// transaction. Outside a transaction block (`Auto`) all three error, like the standard. In a failed
 /// transaction only `ROLLBACK TO SAVEPOINT` is allowed — and on success it *recovers* the transaction
@@ -3785,6 +3802,12 @@ fn run_stmt_in_state(
     // store lock is not held across execution.
     let mut snapshot = settings_snapshot(settings, database);
     stamp_transaction_isolation(&mut snapshot, state);
+    // CHECKPOINT runs outside any data transaction (it needs a quiesced engine), so intercept it
+    // before a statement transaction is opened — the same reason the streaming path routes it
+    // through its control block. An open transaction on this connection makes the engine refuse.
+    if matches!(stmt, nusadb_sql::ast::Statement::Checkpoint) {
+        return checkpoint_txn(engine, state);
+    }
     match state {
         TxnState::Failed { .. } => (
             Err(nusadb_sql::Error::Unsupported(
@@ -4089,6 +4112,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::SavepointReleased => "RELEASE".to_owned(),
         ExecutionResult::Vacuumed(n) => format!("VACUUM {n}"),
         ExecutionResult::Reindexed => "REINDEX".to_owned(),
+        ExecutionResult::CheckpointDone => "CHECKPOINT".to_owned(),
         ExecutionResult::Analyzed { .. } => "ANALYZE".to_owned(),
         ExecutionResult::Commented => "COMMENT".to_owned(),
         ExecutionResult::TableLocked => "LOCK TABLE".to_owned(),

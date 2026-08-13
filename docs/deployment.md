@@ -80,6 +80,28 @@ Two further notes on the durability design, worth knowing when sizing a deployme
 - Recovery loads the last checkpoint image and replays only the log after it, so restart time
   tracks the post-checkpoint tail, not the whole history.
 
+### Checkpointing a running server
+
+Today the automatic checkpoint fires only at open, so a server that stays up for a long time keeps
+appending to its log without truncating it. Until an automatic runtime checkpoint lands, an
+operator can bound the log on a long-lived server by issuing the `CHECKPOINT` statement — for
+example from a cron job over an otherwise-idle connection:
+
+```sql
+CHECKPOINT;
+```
+
+It folds the log into a fresh image and truncates it, exactly as the open-time checkpoint does, and
+reports the `CHECKPOINT` command tag on success.
+
+**It requires a quiesced engine.** The checkpoint writes a consistent point-in-time image, so it
+refuses while any transaction is in flight — including one open on the very connection that issues
+it. The refusal is explicit (it names how many transactions are still active), not a silent no-op,
+so `CHECKPOINT` inside a `BEGIN ... COMMIT` block, or on a busy server with overlapping
+transactions, returns an error rather than appearing to succeed. Issue it from a connection in
+autocommit, and prefer a quiet moment; a load with continuously overlapping transactions may need
+to retry.
+
 Other knobs (`--idle-timeout`, `--drain-timeout`, `--statement-timeout`) default to off/30 s and are
 not memory-bound. A declarative profile system (`--profile t0|t1|t2|t3|auto` over a `nusa.toml`) that
 sets these in one step is planned; until then, raise the individual flags above.

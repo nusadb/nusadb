@@ -4004,6 +4004,25 @@ fn reindex_is_accepted_as_a_noop() {
 }
 
 #[test]
+fn checkpoint_parses_only_as_the_bare_keyword() {
+    // The bare form (any case, optional trailing `;`/whitespace) is recognized.
+    for sql in [
+        "CHECKPOINT",
+        "checkpoint",
+        "  Checkpoint ;  ",
+        "CHECKPOINT;",
+    ] {
+        assert!(
+            matches!(parse(sql), Ok(ast::Statement::Checkpoint)),
+            "should accept: {sql:?}"
+        );
+    }
+    // A glued token or a trailing argument is not CHECKPOINT (falls through, rejected).
+    assert!(parse("CHECKPOINTS").is_err());
+    assert!(parse("CHECKPOINT foo").is_err());
+}
+
+#[test]
 fn lock_table_parses_modes_lists_and_defaults() {
     use ast::LockMode as M;
     let lock = |sql: &str| match ok(sql) {

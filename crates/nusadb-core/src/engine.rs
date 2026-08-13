@@ -1422,6 +1422,18 @@ pub trait StorageEngine: Send + Sync {
     fn vacuum(&self) -> Result<usize> {
         Ok(0)
     }
+
+    /// Fold the durable log into a checkpoint image and truncate it, so recovery replays only the
+    /// records written since — the operator-triggered counterpart of the engine's own maintenance.
+    ///
+    /// The default reports an unsupported-operation error, so an engine with no durable log (and
+    /// the SQL layer's in-memory test double) says honestly that it has nothing to checkpoint; the
+    /// durable engine overrides it. It requires a quiesced engine and may fail (e.g. with a
+    /// would-block error) when a transaction is active, so a caller must be prepared for a
+    /// legitimate refusal.
+    fn checkpoint(&self) -> Result<()> {
+        Err(unsupported("checkpoint"))
+    }
 }
 
 /// The error returned by the default (unimplemented) treaty methods, e.g. an engine that does not

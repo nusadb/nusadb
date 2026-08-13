@@ -226,6 +226,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::Prepared
         | ExecutionResult::Deallocated
         | ExecutionResult::Reindexed
+        | ExecutionResult::CheckpointDone
         | ExecutionResult::MaterializedViewCreated
         | ExecutionResult::VariableSet
         | ExecutionResult::Truncated => DBOutput::StatementComplete(0),

@@ -2365,7 +2365,14 @@ impl BtreeEngine {
                 on_update: fk.on_update,
             });
         }
-        let mut sorted_stats: Vec<_> = cat.stats.iter().collect();
+        // Only stats for tables that still exist go into the image — a safety net so an orphaned
+        // stats entry (from any cause, not only the drop path above) can never become a permanent,
+        // per-checkpoint-re-emitted fixture that grows the image without bound.
+        let mut sorted_stats: Vec<_> = cat
+            .stats
+            .iter()
+            .filter(|(id, _)| cat.tables.contains_key(id))
+            .collect();
         sorted_stats.sort_by_key(|(table, _)| **table);
         for (table, stats) in sorted_stats {
             ops.push(LoggedOp::SetStats {
@@ -3054,6 +3061,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .ok_or_else(|| table_not_found(table))?;
         cat.by_name
             .remove(&(state.schema.schema.clone(), state.schema.name.clone()));
+        // The table's ANALYZE statistics go with it. Without this a dropped table's stats stay
+        // in `cat.stats` under its (never-reused) id forever — and since checkpointing they are
+        // baked into every image, so a `TRUNCATE` of an analyzed table (drop + recreate) accretes
+        // one orphaned entry per truncate and the image grows without bound. Reuse the same
+        // undo/redo the `ANALYZE` path uses so a rollback restores the stats and replay clears the
+        // now-orphaned entry; a table that was never analyzed has no entry and pays nothing.
+        let previous_stats = cat.stats.remove(&table.0);
         // Queue the tree for page reclamation; purge frees it once this txn settles, and the
         // rollback path (or a compensated savepoint rollback) removes the entry again.
         self.dropped
@@ -3070,6 +3084,22 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 state,
             },
         )?;
+        if previous_stats.is_some() {
+            self.push_undo(
+                txn.0,
+                UndoOp::AnalyzedTable {
+                    table: table.0,
+                    previous: previous_stats.map(Box::new),
+                },
+            )?;
+            self.log(
+                &LoggedOp::ClearStats {
+                    txn: txn.0,
+                    table: table.0,
+                }
+                .to_record(),
+            )?;
+        }
         self.log(
             &LoggedOp::DropTable {
                 txn: txn.0,
@@ -3666,6 +3696,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // (superseded chain versions freed plus dead rows physically removed).
         let stats = self.purge()?;
         Ok(stats.versions_reclaimed + stats.rows_removed)
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        // Expose the engine's own stop-the-world checkpoint through the treaty. `Self::checkpoint`
+        // resolves to the inherent method (inherent methods win over a trait method of the same
+        // name in path resolution), so this is not a recursive call into this trait method; the
+        // inherent one refuses with a would-block error when a transaction is active.
+        Self::checkpoint(self)
     }
 
     fn create_sequence(&self, txn: TxnId, def: &SequenceDef) -> Result<SequenceId> {

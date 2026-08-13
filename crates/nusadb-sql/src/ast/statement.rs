@@ -362,6 +362,10 @@ pub enum Statement {
     /// to rebuild; but migration tools and ORM health-checks emit `REINDEX`, so it is accepted rather
     /// than rejected (which would break their scripts).
     Reindex,
+    /// `CHECKPOINT` — fold the durable log into a checkpoint image and truncate it, so recovery
+    /// replays only what was written since. Requires a quiesced engine, so it may be refused when a
+    /// transaction is active. The bare, argument-less form.
+    Checkpoint,
     /// `ANALYZE [TABLE] name [(columns)]` — recompute table/column statistics.
     Analyze(Analyze),
     /// `PREPARE name [(types)] AS <statement>` — store a parameterized statement under `name` for

@@ -789,3 +789,113 @@ fn checkpoint_refuses_with_an_active_transaction() {
     // With the transaction gone it succeeds.
     engine.checkpoint().unwrap();
 }
+
+/// A `TRUNCATE` drops and recreates the table, and a dropped table's ANALYZE stats used to stay in
+/// the catalog under its retired id — and, since checkpointing, get baked into every image. So
+/// `ANALYZE`-then-`TRUNCATE` in a loop (the ETL staging pattern the fast TRUNCATE serves) grew the
+/// checkpoint image without bound. The stats now go with the drop, and the image emitter only
+/// writes stats for tables that still exist, so the image no longer grows with the truncate count —
+/// while a live analyzed table keeps its stats across a checkpoint and reopen.
+#[test]
+fn truncate_of_analyzed_table_does_not_grow_the_image_and_keeps_live_stats() {
+    fn image_bytes_after_cycles(cycles: usize) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("btree.wal");
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        for _ in 0..cycles {
+            run(
+                &engine,
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+            );
+            run(&engine, "ANALYZE t");
+            run(&engine, "TRUNCATE t");
+        }
+        engine.checkpoint().unwrap();
+        std::fs::metadata(dir.path().join("btree.wal.ckpt"))
+            .unwrap()
+            .len()
+    }
+
+    // One cycle versus forty: with the leak each truncate stranded one stats entry that the image
+    // re-emitted, so forty would dwarf one. With the fix the image is the same shape regardless.
+    let one = image_bytes_after_cycles(1);
+    let many = image_bytes_after_cycles(40);
+    assert!(
+        many <= one + 512,
+        "checkpoint image grew with the truncate count: {one} bytes -> {many} bytes"
+    );
+
+    // A live analyzed table keeps its stats across a checkpoint and reopen (the planner must not
+    // lose its histogram just because an unrelated table was truncated).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE live (id INT PRIMARY KEY, v INT)");
+        run(&engine, "CREATE TABLE staging (id INT PRIMARY KEY, v INT)");
+        run(&engine, "INSERT INTO live VALUES (1, 10), (2, 20), (3, 30)");
+        run(&engine, "ANALYZE live");
+        // Exercise the orphan path alongside: analyze then truncate the staging table.
+        run(&engine, "INSERT INTO staging VALUES (1, 1), (2, 2)");
+        run(&engine, "ANALYZE staging");
+        run(&engine, "TRUNCATE staging");
+        engine.checkpoint().unwrap();
+    } // crash: no shutdown.
+    let engine = BtreeEngine::open(&path).unwrap();
+    let live = engine.lookup_table("live").unwrap().unwrap();
+    assert!(
+        engine.table_stats(live.id).unwrap().is_some(),
+        "a live table's ANALYZE stats must survive the checkpoint"
+    );
+}
+
+/// `CHECKPOINT` as a SQL statement folds the log into an image and truncates it: the WAL shrinks
+/// measurably, the data survives a reopen, and the statement refuses (rather than silently doing
+/// nothing) while a transaction is active.
+#[test]
+fn checkpoint_statement_shrinks_the_log_and_refuses_when_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        for i in 0..2000 {
+            run(&engine, &format!("INSERT INTO t VALUES ({i}, 'row{i}')"));
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        // The statement runs through the same parse/analyze/plan/execute path a client uses.
+        assert!(matches!(
+            run(&engine, "CHECKPOINT"),
+            ExecutionResult::CheckpointDone
+        ));
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < before,
+            "CHECKPOINT must shrink the log: {before} bytes -> {after} bytes"
+        );
+        assert!(dir.path().join("btree.wal.ckpt").exists());
+    } // crash: no shutdown.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM t")),
+        vec![vec![Value::Int(2000)]]
+    );
+
+    // With a transaction open the engine is not quiesced, so CHECKPOINT is refused — and the
+    // message names the number of active transactions rather than silently succeeding.
+    let txn = engine
+        .begin(nusadb_core::IsolationLevel::default())
+        .unwrap();
+    let err = run_try(&engine, "CHECKPOINT").unwrap_err().to_string();
+    assert!(
+        err.contains("quiesced") && err.contains("active"),
+        "CHECKPOINT during a transaction must be refused with a quiescence error, got: {err}"
+    );
+    engine.rollback(txn).unwrap();
+    // Once the transaction ends it succeeds again.
+    assert!(matches!(
+        run(&engine, "CHECKPOINT"),
+        ExecutionResult::CheckpointDone
+    ));
+}
