@@ -915,6 +915,113 @@ mod tests {
         );
     }
 
+    /// Exact top-`k` ids under an arbitrary metric — the per-metric recall oracle. Ties broken by
+    /// id so the ground truth is deterministic.
+    fn brute_force_metric(data: &[Vec<f32>], query: &[f32], k: usize, metric: Metric) -> Vec<u32> {
+        let mut scored: Vec<(f64, u32)> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    metric.exact_distance(v, query).unwrap_or(f64::INFINITY),
+                    i as u32,
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    /// Recall must clear a high bar for EVERY metric, not just L2 (the metric is baked into the
+    /// index since the operator-class binding, so each is a distinct build+search path). The
+    /// recall oracle uses the same metric the index was built with — the standard definition of
+    /// recall against exact search.
+    #[test]
+    fn recall_beats_threshold_for_every_metric() {
+        let (n, dim, k, ef) = (1500, 64, 10, 96);
+        let data = random_vectors(n, dim, 7);
+        let queries = random_vectors(50, dim, 8);
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct, Metric::L1] {
+            let mut index = HnswIndex::new(dim, metric, HnswParams::default(), 42);
+            for v in &data {
+                index.insert(v.clone()).expect("insert");
+            }
+            let mut total_recall = 0.0;
+            for q in &queries {
+                let exact: HashSet<u32> = brute_force_metric(&data, q, k, metric)
+                    .into_iter()
+                    .collect();
+                let approx = index.search(q, k, ef).expect("search");
+                assert_eq!(approx.len(), k, "must return k results when n >= k");
+                for w in approx.windows(2) {
+                    assert!(
+                        w[0].1 <= w[1].1,
+                        "{metric:?}: results not sorted by distance"
+                    );
+                }
+                let hits = approx.iter().filter(|(id, _)| exact.contains(id)).count();
+                total_recall += hits as f64 / k as f64;
+            }
+            let recall = total_recall / queries.len() as f64;
+            eprintln!("VECRECALL {metric:?} recall@{k} = {recall:.3}");
+            assert!(
+                recall >= 0.85,
+                "HNSW recall@{k} for {metric:?} = {recall:.3} fell below 0.85"
+            );
+        }
+    }
+
+    /// Each metric must rank the *right* vector nearest — a guard against a sign/direction error
+    /// that self-consistent recall cannot catch (a flipped inner product would still recall 1.0
+    /// against its own oracle while returning the *farthest* vector). The expected nearest here is
+    /// worked out from each metric's definition by hand, independent of the implementation:
+    /// - **L2 / L1**: the closer point in space is nearer (`[1,0]` beats `[3,0]` from the origin).
+    /// - **Cosine**: the same-direction vector is nearer (`[5,0]` beats `[0,9]` for query `[1,0]`,
+    ///   regardless of magnitude — cosine ignores it).
+    /// - **Inner product**: a *larger* dot product with the query is *more* similar (nearer), so
+    ///   `[2,0]` (dot 2) must beat `[0.5,0]` (dot 0.5) for query `[1,0]`. A flipped sign would pick
+    ///   `[0.5,0]` — exactly the bug this pins.
+    #[test]
+    fn each_metric_ranks_the_correct_vector_nearest() {
+        let cases = [
+            (
+                Metric::L2,
+                vec![vec![1.0, 0.0], vec![3.0, 0.0]],
+                vec![0.0, 0.0],
+                0u32,
+            ),
+            (
+                Metric::L1,
+                vec![vec![1.0, 0.0], vec![0.0, 3.0]],
+                vec![0.0, 0.0],
+                0,
+            ),
+            (
+                Metric::Cosine,
+                vec![vec![5.0, 0.0], vec![0.0, 9.0]],
+                vec![1.0, 0.0],
+                0,
+            ),
+            (
+                Metric::InnerProduct,
+                vec![vec![2.0, 0.0], vec![0.5, 0.0]],
+                vec![1.0, 0.0],
+                0,
+            ),
+        ];
+        for (metric, points, query, expected_nearest) in cases {
+            let mut index = HnswIndex::new(2, metric, HnswParams::default(), 1);
+            for p in &points {
+                index.insert(p.clone()).expect("insert");
+            }
+            let got = index.search(&query, 1, 16).expect("search");
+            assert_eq!(
+                got[0].0, expected_nearest,
+                "{metric:?}: expected id {expected_nearest} nearest to {query:?}, got {got:?}"
+            );
+        }
+    }
+
     #[test]
     fn search_is_exact_on_a_tiny_index() {
         // With few points and a wide beam, HNSW degenerates to exact search.
