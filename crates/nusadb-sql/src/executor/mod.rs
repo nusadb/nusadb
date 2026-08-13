@@ -3254,10 +3254,7 @@ impl crate::Catalog for ExecCatalog<'_> {
     }
 
     fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
-        Ok(
-            crate::rbac::principal(self.engine, self.txn, &self.user)?.superuser
-                || crate::rbac::effective_roles(self.engine, self.txn, &self.user)?.contains(role),
-        )
+        crate::rbac::may_assume_role(self.engine, self.txn, &self.user, role)
     }
 
     fn role_exists(&self, name: &str) -> Result<bool, Error> {
@@ -3367,10 +3364,7 @@ impl crate::Catalog for SessionCatalog<'_> {
     }
 
     fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
-        Ok(
-            crate::rbac::principal(self.engine, self.txn, self.user)?.superuser
-                || crate::rbac::effective_roles(self.engine, self.txn, self.user)?.contains(role),
-        )
+        crate::rbac::may_assume_role(self.engine, self.txn, self.user, role)
     }
 
     fn role_exists(&self, name: &str) -> Result<bool, Error> {

@@ -842,3 +842,58 @@ fn lock_table_requires_write_or_ownership() {
     root(&engine, "GRANT UPDATE ON orders TO app");
     ok_as(&engine, "app", "LOCK TABLE orders IN ACCESS EXCLUSIVE MODE");
 }
+
+/// A `NOINHERIT` member does not automatically wield its roles' privileges, but it may still
+/// `SET ROLE` into them — that is exactly what `NOINHERIT` is for. Eligibility to switch follows
+/// membership, not the inherit flag.
+#[test]
+fn noinherit_member_may_assume_but_does_not_inherit() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE parent");
+    root(&engine, "GRANT SELECT ON orders TO parent");
+    root(&engine, "CREATE ROLE child LOGIN NOINHERIT");
+    root(&engine, "GRANT parent TO child");
+
+    // NOINHERIT: child does not inherit parent's SELECT, so a plain read is refused.
+    denied_as(&engine, "child", "SELECT id FROM orders");
+
+    let txn = engine
+        .begin(nusadb_core::IsolationLevel::default())
+        .unwrap();
+    // ...yet child may SET ROLE into parent (membership, not inheritance, governs this).
+    assert!(
+        nusadb_sql::rbac::may_assume_role(&engine, txn, "child", "parent").unwrap(),
+        "a NOINHERIT member must still be able to SET ROLE into its role"
+    );
+    // And the inherit-gated effective set correctly excludes parent.
+    assert!(
+        !nusadb_sql::rbac::effective_roles(&engine, txn, "child")
+            .unwrap()
+            .contains("parent"),
+        "a NOINHERIT member must not silently inherit its role's privileges"
+    );
+    let _ = engine.rollback(txn);
+}
+
+/// Unquoted `PUBLIC` is the pseudo-role every session belongs to; quoted `"PUBLIC"` is an ordinary
+/// (case-preserving) role identifier, not the pseudo-role. Treating the quoted spelling as the
+/// pseudo-role would widen a grant from "one specific role" to "everyone".
+#[test]
+fn quoted_public_is_a_role_identifier_not_the_pseudo_role() {
+    use nusadb_sql::ast::{Grantee, Statement};
+    let unquoted = parse("GRANT SELECT ON t TO PUBLIC").unwrap();
+    let Statement::Grant(g) = unquoted else {
+        panic!("expected a GRANT, got {unquoted:?}")
+    };
+    assert_eq!(g.grantees, vec![Grantee::Public]);
+
+    let quoted = parse("GRANT SELECT ON t TO \"PUBLIC\"").unwrap();
+    let Statement::Grant(g) = quoted else {
+        panic!("expected a GRANT, got {quoted:?}")
+    };
+    assert_eq!(
+        g.grantees,
+        vec![Grantee::Role("PUBLIC".to_owned())],
+        "quoted \"PUBLIC\" must be a role identifier, not the pseudo-role"
+    );
+}

@@ -56,6 +56,17 @@ fn peek_word(parser: &mut Parser) -> Option<String> {
     }
 }
 
+/// The next token's word text, folded to lowercase, but **only if it was written unquoted** —
+/// `None` for a quoted identifier. Used where an unquoted keyword and its quoted spelling must be
+/// told apart: unquoted `PUBLIC` is the pseudo-role every session belongs to, but quoted
+/// `"PUBLIC"` is an ordinary (case-sensitive) role identifier, not the pseudo-role.
+fn peek_unquoted_word(parser: &mut Parser) -> Option<String> {
+    match &parser.peek_token_ref().token {
+        Token::Word(word) if word.quote_style.is_none() => Some(word.value.to_lowercase()),
+        _ => None,
+    }
+}
+
 /// Consume the next token, which the caller has already inspected with [`peek_word`].
 fn eat_word(parser: &mut Parser) {
     let _ = parser.next_token();
@@ -121,9 +132,11 @@ fn parse_grantees(parser: &mut Parser) -> Result<Vec<ast::Grantee>, Error> {
         {
             eat_word(parser);
         }
-        if let Some(word) = peek_word(parser)
+        if let Some(word) = peek_unquoted_word(parser)
             && word == "public"
         {
+            // Unquoted `PUBLIC` is the pseudo-role; quoted `"PUBLIC"` falls through to be read as an
+            // ordinary role identifier (which `validate_role_name` then refuses as reserved).
             eat_word(parser);
             out.push(ast::Grantee::Public);
         } else {

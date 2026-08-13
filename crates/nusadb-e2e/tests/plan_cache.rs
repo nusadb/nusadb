@@ -269,3 +269,87 @@ fn search_path_is_part_of_the_plan_cache_key() {
         vec![vec![Value::Int(200)]]
     );
 }
+
+/// A catalog whose superuser status can be flipped at runtime, and which grants an ordinary role
+/// nothing — modelling a real role catalog after `ALTER ROLE ... NOSUPERUSER`.
+struct ToggleCatalog<'a> {
+    engine: &'a dyn StorageEngine,
+    superuser: &'a std::cell::Cell<bool>,
+}
+
+impl Catalog for ToggleCatalog<'_> {
+    fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
+        self.engine.lookup_table(name).map_err(Into::into)
+    }
+    fn is_superuser(&self) -> bool {
+        self.superuser.get()
+    }
+    fn current_user(&self) -> String {
+        "u".to_owned()
+    }
+    fn has_privilege(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(false)
+    }
+    fn owns_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(false)
+    }
+}
+
+/// A plan cached while the session was a superuser must not be reused after the superuser attribute
+/// is stripped. The superuser plan skipped the privilege check (superuser short-circuits before it),
+/// so serving it to the now-ordinary role would bypass access control entirely. Keying the cache on
+/// the superuser flag makes the stripped session miss and re-analyze — where the check now bites.
+#[test]
+fn a_stripped_superuser_is_not_served_its_cached_superuser_plan() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (v INT NOT NULL)");
+    run(&engine, "INSERT INTO t VALUES (1), (2)");
+    let superuser = std::cell::Cell::new(true);
+    let mut cache = PlanCache::new();
+    let sql = "SELECT v FROM t";
+
+    // As a superuser the check is skipped, the query runs, and the plan is cached.
+    let planned = plan_cached(
+        &mut cache,
+        sql,
+        parse(sql).expect("parse"),
+        &ToggleCatalog {
+            engine: &engine,
+            superuser: &superuser,
+        },
+        &engine,
+    )
+    .expect("superuser plan");
+    assert!(matches!(
+        execute(planned, &engine).expect("execute"),
+        ExecutionResult::Rows { .. }
+    ));
+
+    // Strip the superuser attribute. The same SQL by the same user must now be refused — a fresh
+    // analysis runs the privilege check the cached plan had skipped. Before the fix this returned
+    // the cached superuser plan and the ordinary role read the table with no check.
+    superuser.set(false);
+    let denied = plan_cached(
+        &mut cache,
+        sql,
+        parse(sql).expect("parse"),
+        &ToggleCatalog {
+            engine: &engine,
+            superuser: &superuser,
+        },
+        &engine,
+    );
+    assert!(
+        denied.is_err_and(|e| e.to_string().contains("permission denied")),
+        "a stripped superuser must be re-checked, not served the cached superuser plan"
+    );
+}

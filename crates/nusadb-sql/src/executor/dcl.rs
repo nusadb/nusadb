@@ -414,8 +414,7 @@ pub(super) fn run_set_role(
         return Ok(ExecutionResult::RoleSet(None));
     };
     let actor = actor();
-    let permitted = rbac::principal(engine, txn, &actor)?.superuser
-        || rbac::effective_roles(engine, txn, &actor)?.contains(role);
+    let permitted = rbac::may_assume_role(engine, txn, &actor, role)?;
     if !permitted {
         return Err(Error::PermissionDenied(format!(
             "cannot SET ROLE to `{role}` — the session is not a member of it"

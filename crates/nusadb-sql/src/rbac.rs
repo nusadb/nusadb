@@ -528,6 +528,25 @@ fn effective_roles_from(
     seen
 }
 
+/// The full membership closure of `user`: every role it is a member of, directly or transitively,
+/// **ignoring the `INHERIT` flag**. This is the set a session may `SET ROLE` into — a `NOINHERIT`
+/// role does not automatically wield its memberships' privileges (that is [`effective_roles_from`],
+/// which stops at the `NOINHERIT` edge), but it may still switch into them, which is precisely what
+/// `NOINHERIT` is for. `user` itself is included (a session may always `SET ROLE` back to itself).
+fn membership_closure_from(memberships: &[MembershipRecord], user: &str) -> BTreeSet<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(user.to_owned());
+    let mut frontier = vec![user.to_owned()];
+    while let Some(current) = frontier.pop() {
+        for edge in memberships.iter().filter(|e| e.member == current) {
+            if seen.insert(edge.role.clone()) {
+                frontier.push(edge.role.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// The membership closure a session effectively holds, and whether it is a superuser.
 ///
 /// Both facts come from the same two catalogs (roles and memberships), so resolving them together
@@ -553,8 +572,13 @@ pub fn resolve_session(
 #[derive(Debug, Clone)]
 pub struct ResolvedSession {
     /// Every role the session effectively holds — itself and everything it inherits, transitively.
+    /// Used for privilege and ownership decisions.
     effective: BTreeSet<String>,
-    /// Whether any of those roles carries the superuser attribute.
+    /// Every role the session may `SET ROLE` into — the full membership closure, ignoring
+    /// `INHERIT`. A superset of `effective` (a `NOINHERIT` edge is in `assumable` but not
+    /// `effective`).
+    assumable: BTreeSet<String>,
+    /// Whether any of the effective roles carries the superuser attribute.
     superuser: bool,
 }
 
@@ -568,6 +592,7 @@ impl ResolvedSession {
             let mut effective = BTreeSet::new();
             effective.insert(user.to_owned());
             return Ok(Self {
+                assumable: effective.clone(),
                 effective,
                 superuser: true,
             });
@@ -575,11 +600,13 @@ impl ResolvedSession {
         let memberships = all_memberships(engine, txn)?;
         let roles = all_roles(engine, txn)?;
         let effective = effective_roles_from(&memberships, &roles, user);
+        let assumable = membership_closure_from(&memberships, user);
         let superuser = roles
             .iter()
             .any(|r| r.superuser && effective.contains(&r.name));
         Ok(Self {
             effective,
+            assumable,
             superuser,
         })
     }
@@ -686,7 +713,10 @@ impl ResolvedSession {
     /// Whether the session may assume `role` — a superuser, or a role it effectively holds.
     #[must_use]
     pub fn may_assume_role(&self, role: &str) -> bool {
-        self.superuser || self.effective.contains(role)
+        // `SET ROLE` eligibility follows the full membership closure, not the inherit-gated
+        // `effective` set: a `NOINHERIT` role is a member of its roles and may switch into them,
+        // it just does not wield their privileges automatically.
+        self.superuser || self.assumable.contains(role)
     }
 }
 
@@ -1174,6 +1204,24 @@ pub fn owns_object(
     object: &str,
 ) -> Result<bool, Error> {
     ResolvedSession::resolve(engine, txn, user)?.owns_object(engine, txn, kind, object)
+}
+
+/// Whether `user` may `SET ROLE` into `role`.
+///
+/// True for a superuser, or for a member of `role` (directly or transitively), **regardless of
+/// `INHERIT`**. `SET ROLE` is exactly how a `NOINHERIT` role uses a membership it does not wield
+/// automatically, so eligibility follows the full membership closure, not the inherit-gated
+/// effective set.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn may_assume_role(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+    role: &str,
+) -> Result<bool, Error> {
+    Ok(ResolvedSession::resolve(engine, txn, user)?.may_assume_role(role))
 }
 
 /// Whether `user` may create roles — a superuser, or a role holding `CREATEROLE`.

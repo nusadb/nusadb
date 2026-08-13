@@ -358,6 +358,15 @@ pub fn plan_cached(
 /// or in normal SQL, so the key is unambiguous.
 fn cache_key(catalog: &dyn Catalog, sql: &str) -> String {
     let mut key = String::new();
+    // The superuser attribute leads the key. A superuser plan skips the privilege and row-level
+    // security checks a non-superuser plan bakes in, and `ALTER ROLE ... NOSUPERUSER` strips that
+    // attribute without changing the SQL, the role, or the search path. Keying on it means a
+    // session that loses the attribute gets a cache miss — and a freshly-analyzed, checked plan —
+    // instead of being served the superuser plan whose skipped checks no longer hold. (A
+    // superuser short-circuits before `has_privilege`, so nothing else would mark such a plan
+    // uncacheable.)
+    key.push(if catalog.is_superuser() { 'S' } else { 'n' });
+    key.push('\u{3}');
     // The acting role leads the key. A plan bakes the privilege decisions made when it was
     // analyzed, and `SET ROLE` changes those decisions without changing the SQL or the search path
     // — so without this a session could plan a query as a privileged role, switch to a weaker one,
