@@ -13,8 +13,19 @@
 //!    cheap to plan and must never be served from a snapshot of an earlier schema.
 //! 2. **No unversioned dependency.** A plan can bake things that change *without* bumping any table's
 //!    schema version: an inlined view/UDF body, a row-level-security policy predicate, or an index
-//!    choice (`CREATE`/`DROP INDEX` is unversioned). The recording catalog flags all of these during
+//!    choice (`CREATE`/`DROP INDEX` is unversioned). The recording catalog flags these during
 //!    analysis, and such plans are not cached at all (conservative, always safe).
+//! 4. **Privilege decisions are re-checked on reuse.** A privilege gate (`has_privilege` /
+//!    `owns_object`) is not baked into the plan's *shape* — it only decides whether the plan is
+//!    built at all — and it can change without any table's schema version moving (a `REVOKE` from
+//!    another session). So the recording catalog captures every privilege decision the analysis made
+//!    and its result, and a cache hit re-runs each against the *current* catalog snapshot before the
+//!    plan is served: if any decision now differs (a privilege was revoked), the entry is discarded
+//!    and the statement re-analyzed, which then denies it. The re-check is the cheap part (the RBAC
+//!    lookup) without the expensive part (parse/analyze/plan), and — being read from the same live
+//!    snapshot the re-analysis would use — it has no cross-transaction staleness. Row-level security,
+//!    whose *predicate* is baked into the plan, is not re-checkable this way and stays uncached
+//!    (rule 2).
 //! 3. **Schema-version fingerprint.** Each entry records the schema version of *every* base table the
 //!    analyzer resolved (captured by a recording catalog, which is complete by construction — the
 //!    analyzer cannot resolve a table without looking it up). The entry is reused only while every one
@@ -38,11 +49,26 @@ use crate::planner::PhysicalPlan;
 /// correct — a later query simply re-analyzes and repopulates it; a true LRU is a follow-up.
 const MAX_PLAN_CACHE_ENTRIES: usize = 256;
 
+/// One privilege decision the analysis made: `(kind, object, privilege)` and the boolean the
+/// catalog returned. On reuse the same question is asked of the current catalog and the answer must
+/// still match, or the plan is discarded (a `REVOKE` changed it).
+type PrivilegeCheck = (ast::ObjectKind, String, ast::Privilege, bool);
+
+/// One ownership decision the analysis made: `(kind, object)` and the boolean returned. Re-checked
+/// on reuse exactly like a [`PrivilegeCheck`].
+type OwnershipCheck = (ast::ObjectKind, String, bool);
+
 /// A planned read statement plus the schema fingerprint it was planned under.
 struct CachedPlan {
     /// `(table, schema version)` for every base table the plan references, sorted. The plan is reused
     /// only while each table still reports this exact version.
     fingerprint: Vec<(TableId, u32)>,
+    /// Every privilege decision the analysis consulted, re-verified against the live catalog before
+    /// the plan is served (see module rule 4). Empty for a plan that consulted none (e.g. a
+    /// superuser plan, which short-circuits before any privilege check).
+    privilege_checks: Vec<PrivilegeCheck>,
+    /// Every ownership decision the analysis consulted, re-verified the same way.
+    ownership_checks: Vec<OwnershipCheck>,
     plan: PhysicalPlan,
 }
 
@@ -98,6 +124,11 @@ struct RecordingCatalog<'a> {
     /// that depends on either cannot be safely invalidated by the fingerprint — such plans are not
     /// cached at all (conservative: it also skips index-bearing tables whose plan chose a seq scan).
     saw_unversioned_dep: Cell<bool>,
+    /// Every privilege decision the analysis asked for, captured with its result so a cache hit can
+    /// re-verify it against the live catalog (module rule 4). These do **not** bar caching.
+    privilege_checks: RefCell<Vec<PrivilegeCheck>>,
+    /// Every ownership decision the analysis asked for, captured the same way.
+    ownership_checks: RefCell<Vec<OwnershipCheck>>,
 }
 
 impl<'a> RecordingCatalog<'a> {
@@ -108,6 +139,8 @@ impl<'a> RecordingCatalog<'a> {
             saw_view: Cell::new(false),
             saw_function: Cell::new(false),
             saw_unversioned_dep: Cell::new(false),
+            privilege_checks: RefCell::new(Vec::new()),
+            ownership_checks: RefCell::new(Vec::new()),
         }
     }
 }
@@ -190,23 +223,25 @@ impl Catalog for RecordingCatalog<'_> {
         object: &str,
         privilege: crate::ast::Privilege,
     ) -> Result<bool, Error> {
-        // A privilege decision is an unversioned dependency, exactly like a row-level-security
-        // predicate: `REVOKE` from another session changes the answer without bumping any table's
-        // schema version, so a plan that consulted one cannot be invalidated by the fingerprint and
-        // must not be cached. A superuser short-circuits before reaching here, so the administrative
-        // path keeps its cache; a role whose access can be revoked trades caching for not being
-        // served a plan its privileges no longer justify.
-        //
-        // Restoring caching for these needs a catalog generation counter in the fingerprint —
-        // worth doing, but a correctness-first default belongs here in the meantime.
-        self.saw_unversioned_dep.set(true);
-        self.inner.has_privilege(kind, object, privilege)
+        // A privilege decision is not baked into the plan's shape — it only gates whether the plan
+        // is built — and it changes without any table's schema version moving (a `REVOKE` from
+        // another session). Rather than bar caching, capture the decision and its result; a cache
+        // hit re-verifies it against the live catalog before serving (module rule 4). (A superuser
+        // short-circuits before reaching here, so its plan records nothing and is simply cached.)
+        let allowed = self.inner.has_privilege(kind, object, privilege)?;
+        self.privilege_checks
+            .borrow_mut()
+            .push((kind, object.to_owned(), privilege, allowed));
+        Ok(allowed)
     }
     fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
-        // Ownership gates DROP/ALTER, which are never cached, but it is also unversioned — record
-        // it for the same reason as `has_privilege`.
-        self.saw_unversioned_dep.set(true);
-        self.inner.owns_object(kind, object)
+        // Ownership gates DROP/ALTER (never cached), but a cacheable read can consult it too;
+        // capture it and re-verify on reuse, like `has_privilege`.
+        let owns = self.inner.owns_object(kind, object)?;
+        self.ownership_checks
+            .borrow_mut()
+            .push((kind, object.to_owned(), owns));
+        Ok(owns)
     }
     fn may_grant_object(
         &self,
@@ -247,6 +282,24 @@ const fn is_cacheable(stmt: &ast::Statement) -> bool {
 
 /// Whether every table in `fingerprint` still reports the recorded schema version. A table whose
 /// version is unknown (dropped, or untracked) counts as changed, so the plan is rebuilt.
+/// Whether every privilege and ownership decision the cached plan's analysis made still holds when
+/// asked of the live `catalog` (the current per-statement snapshot). A `REVOKE` since the plan was
+/// cached flips one of these, so the plan must not be served. A catalog error is propagated (the
+/// caller then treats the entry as stale and re-analyzes, surfacing the error properly).
+fn access_checks_still_hold(catalog: &dyn Catalog, entry: &CachedPlan) -> Result<bool, Error> {
+    for (kind, object, privilege, expected) in &entry.privilege_checks {
+        if catalog.has_privilege(*kind, object, *privilege)? != *expected {
+            return Ok(false);
+        }
+    }
+    for (kind, object, expected) in &entry.ownership_checks {
+        if catalog.owns_object(*kind, object)? != *expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn fingerprint_unchanged(engine: &dyn StorageEngine, fingerprint: &[(TableId, u32)]) -> bool {
     fingerprint
         .iter()
@@ -319,11 +372,17 @@ pub fn plan_cached(
     // search_path` changes which schema a bare name binds to.
     let key = cache_key(catalog, sql);
     if let Some(entry) = cache.entries.get(&key) {
-        if fingerprint_unchanged(engine, &entry.fingerprint) {
+        // Reuse only while every referenced table is at its recorded schema version AND every
+        // privilege/ownership decision the analysis made still holds against the live catalog — the
+        // latter re-checked from the current snapshot, so a committed `REVOKE` (even one made in
+        // another session's transaction) is seen and the plan is not served.
+        if fingerprint_unchanged(engine, &entry.fingerprint)
+            && access_checks_still_hold(catalog, entry)?
+        {
             cache.hits += 1;
             return Ok(entry.plan.clone());
         }
-        // Stale: a referenced table changed schema since this was planned.
+        // Stale: a referenced table changed schema, or a privilege was revoked since this was planned.
         cache.entries.remove(&key);
     }
     cache.misses += 1;
@@ -344,6 +403,8 @@ pub fn plan_cached(
             key,
             CachedPlan {
                 fingerprint,
+                privilege_checks: recorder.privilege_checks.into_inner(),
+                ownership_checks: recorder.ownership_checks.into_inner(),
                 plan: physical.clone(),
             },
         );
