@@ -4113,7 +4113,9 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::Vacuumed(n) => format!("VACUUM {n}"),
         ExecutionResult::Reindexed => "REINDEX".to_owned(),
         ExecutionResult::CheckpointDone => "CHECKPOINT".to_owned(),
-        ExecutionResult::Analyzed { .. } => "ANALYZE".to_owned(),
+        ExecutionResult::Analyzed { .. } | ExecutionResult::AnalyzedAll { .. } => {
+            "ANALYZE".to_owned()
+        },
         ExecutionResult::Commented => "COMMENT".to_owned(),
         ExecutionResult::TableLocked => "LOCK TABLE".to_owned(),
         ExecutionResult::Prepared => "PREPARE".to_owned(),

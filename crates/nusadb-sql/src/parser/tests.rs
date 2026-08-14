@@ -4110,13 +4110,20 @@ fn analyze_parses_table_and_column_forms() {
     let ast::Statement::Analyze(a) = ok("ANALYZE TABLE Users") else {
         panic!("expected Analyze");
     };
-    assert_eq!(a.table, "users"); // unquoted identifier folds to lowercase
+    assert_eq!(a.table.as_deref(), Some("users")); // unquoted identifier folds to lowercase
     assert!(a.columns.is_empty());
 
     let ast::Statement::Analyze(a) = ok("ANALYZE TABLE t FOR COLUMNS a, b") else {
         panic!("expected Analyze");
     };
     assert_eq!(a.columns, vec!["a".to_owned(), "b".to_owned()]);
+
+    // Bare `ANALYZE` (no table) is the all-user-tables form: table is `None`, no columns.
+    let ast::Statement::Analyze(a) = ok("ANALYZE") else {
+        panic!("expected Analyze");
+    };
+    assert_eq!(a.table, None);
+    assert!(a.columns.is_empty());
 }
 
 #[test]

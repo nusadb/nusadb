@@ -153,6 +153,11 @@ pub enum ExecutionResult {
         /// Number of columns analyzed.
         columns: usize,
     },
+    /// Bare `ANALYZE` (no table) — statistics recomputed for every user table.
+    AnalyzedAll {
+        /// Number of user tables analyzed.
+        tables: usize,
+    },
     /// `COMMENT ON` — the target was resolved and the statement accepted.
     Commented,
     /// `LOCK TABLE` — the requested table locks were acquired.
@@ -1616,6 +1621,8 @@ fn dispatch(
         PhysicalPlan::ShowTables => run_show_tables(engine, txn),
         PhysicalPlan::ShowColumns(schema) => Ok(run_show_columns(&schema)),
         PhysicalPlan::Analyze(p) => run_analyze(p, engine, txn),
+        PhysicalPlan::AnalyzeAll => analyze_every_user_table(engine, txn)
+            .map(|tables| ExecutionResult::AnalyzedAll { tables }),
         PhysicalPlan::CreateSchema(p) => run_create_schema(&p, engine, txn),
         PhysicalPlan::DropSchema(p) => run_drop_schema(&p, engine, txn),
         PhysicalPlan::CreateDatabase(_) => Ok(ExecutionResult::DatabaseCreated),
@@ -1687,20 +1694,32 @@ fn run_vacuum(
 ) -> Result<ExecutionResult, Error> {
     let reclaimed = engine.vacuum()?;
     if options.analyze {
-        // Recompute statistics for every user table (skip internal/system tables, which carry the
-        // reserved prefix and are not user-analyzable). Enumerate under this txn's snapshot so a table
-        // committed by an earlier statement on the same connection is reliably included.
-        for name in engine.list_tables_as_of(txn)? {
-            if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
-                continue;
-            }
-            if let Some(table) = engine.lookup_table_as_of(txn, &name)? {
-                let columns: Vec<usize> = (0..table.columns.len()).collect();
-                run_analyze(AnalyzePlan { table, columns }, engine, txn)?;
-            }
-        }
+        analyze_every_user_table(engine, txn)?;
     }
     Ok(ExecutionResult::Vacuumed(reclaimed))
+}
+
+/// Recompute statistics for every user table under `txn`'s snapshot, returning how many were
+/// analyzed. Shared by bare `ANALYZE` and the `ANALYZE` clause of `VACUUM ANALYZE` — the same
+/// all-tables maintenance operation. Internal/system tables (the reserved prefix) are not
+/// user-analyzable and are skipped. Enumerating under this txn's snapshot includes a table an
+/// earlier statement on the same connection committed.
+///
+/// # Errors
+/// Propagates table-listing, schema-lookup, and per-table `ANALYZE` errors.
+fn analyze_every_user_table(engine: &dyn StorageEngine, txn: TxnId) -> Result<usize, Error> {
+    let mut analyzed = 0;
+    for name in engine.list_tables_as_of(txn)? {
+        if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
+            continue;
+        }
+        if let Some(table) = engine.lookup_table_as_of(txn, &name)? {
+            let columns: Vec<usize> = (0..table.columns.len()).collect();
+            run_analyze(AnalyzePlan { table, columns }, engine, txn)?;
+            analyzed += 1;
+        }
+    }
+    Ok(analyzed)
 }
 
 fn run_explain(
@@ -2110,6 +2129,7 @@ fn format_plan(
             p.table.name,
             p.columns.len(),
         )],
+        PhysicalPlan::AnalyzeAll => vec![format!("{indent}Analyze (all user tables)")],
         PhysicalPlan::LockTable { tables, mode } => {
             let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
             let mode = match mode {

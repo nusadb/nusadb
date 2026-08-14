@@ -3013,7 +3013,15 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
                 return unsupported("ANALYZE ... COMPUTE STATISTICS");
             }
             let Some(ref table_name) = a.table_name else {
-                return unsupported("ANALYZE without a table name");
+                // Bare `ANALYZE` (no table) refreshes statistics for every user table, like the
+                // `ANALYZE` clause of `VACUUM ANALYZE`. Any other clause needs a table to attach to.
+                if a.partitions.is_some() || !a.columns.is_empty() || a.cache_metadata || a.noscan {
+                    return unsupported("ANALYZE without a table name takes no further options");
+                }
+                return Ok(ast::Statement::Analyze(ast::Analyze {
+                    table: None,
+                    columns: Vec::new(),
+                }));
             };
             convert_analyze(
                 table_name,

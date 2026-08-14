@@ -483,8 +483,8 @@ pub enum CommentTarget {
 /// chosen subset of its columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Analyze {
-    /// Target table name.
-    pub table: String,
-    /// Columns to analyze; empty means every column.
+    /// Target table name; `None` is the bare `ANALYZE` that refreshes every user table.
+    pub table: Option<String>,
+    /// Columns to analyze; empty means every column. Always empty when `table` is `None`.
     pub columns: Vec<String>,
 }

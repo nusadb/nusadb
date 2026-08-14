@@ -29,7 +29,7 @@ pub(super) fn convert_analyze(
         return unsupported("ANALYZE ... NOSCAN");
     }
     Ok(ast::Statement::Analyze(ast::Analyze {
-        table: object_name(name)?,
+        table: Some(object_name(name)?),
         columns: columns.into_iter().map(|c| fold_ident(&c)).collect(),
     }))
 }

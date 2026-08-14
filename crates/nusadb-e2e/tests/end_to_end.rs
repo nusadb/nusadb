@@ -2256,6 +2256,62 @@ fn explain_annotates_estimated_rows_after_analyze() {
 }
 
 #[test]
+fn bare_analyze_refreshes_every_user_table() {
+    // `ANALYZE` with no table name is the all-user-tables maintenance form (like the reference
+    // engine, and like the `ANALYZE` clause of `VACUUM ANALYZE`): it recomputes statistics for every
+    // user table in one statement. Verified here by planning against BOTH tables afterwards — each
+    // carries a row estimate only its own ANALYZE could have produced.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE a (id INT NOT NULL)");
+    run(&engine, "CREATE TABLE b (id INT NOT NULL)");
+    for i in 0..8 {
+        run(&engine, &format!("INSERT INTO a VALUES ({i})"));
+    }
+    for i in 0..5 {
+        run(&engine, &format!("INSERT INTO b VALUES ({i})"));
+    }
+
+    // One bare statement analyzes both user tables.
+    assert!(
+        matches!(
+            run(&engine, "ANALYZE"),
+            ExecutionResult::AnalyzedAll { tables: 2 },
+        ),
+        "bare ANALYZE must report every user table it refreshed",
+    );
+
+    // Both tables now carry a planner row estimate — proof each was actually analyzed, not just one.
+    let est = |sql: &str| -> String {
+        rows(run(&engine, sql))
+            .into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        est("EXPLAIN SELECT id FROM a WHERE id = 3").contains("est. rows=8"),
+        "table a was not analyzed",
+    );
+    assert!(
+        est("EXPLAIN SELECT id FROM b WHERE id = 3").contains("est. rows=5"),
+        "table b was not analyzed",
+    );
+}
+
+#[test]
+fn bare_analyze_on_an_empty_database_is_a_no_op() {
+    // No user tables: bare ANALYZE still succeeds, reporting that it refreshed zero tables.
+    let engine = BtreeEngine::new();
+    assert!(matches!(
+        run(&engine, "ANALYZE"),
+        ExecutionResult::AnalyzedAll { tables: 0 },
+    ));
+}
+
+#[test]
 fn vectorized_path_matches_row_path_end_to_end() {
     // Wiring — with the opt-in vectorized flag on, a SeqScan/Filter/Project/Sort/Limit query
     // returns exactly what the row path does, against the real engine.

@@ -323,6 +323,8 @@ pub enum LogicalPlan {
     Checkpoint,
     /// `ANALYZE` — recompute statistics for a table's columns.
     Analyze(AnalyzePlan),
+    /// Bare `ANALYZE` (no table) — recompute statistics for every user table.
+    AnalyzeAll,
     /// `LOCK TABLE` — acquire a table-level lock on each resolved table.
     LockTable {
         /// Resolved tables to lock, in order.
@@ -2130,6 +2132,8 @@ pub enum PhysicalPlan {
     Checkpoint,
     /// `ANALYZE` — recompute statistics for a table's columns.
     Analyze(AnalyzePlan),
+    /// Bare `ANALYZE` (no table) — recompute statistics for every user table.
+    AnalyzeAll,
     /// `LOCK TABLE` — acquire a table-level lock on each resolved table.
     LockTable {
         /// Resolved tables to lock, in order.

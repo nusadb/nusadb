@@ -197,6 +197,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::RoleAltered
         | ExecutionResult::RoleSet(_)
         | ExecutionResult::Analyzed { .. }
+        | ExecutionResult::AnalyzedAll { .. }
         | ExecutionResult::Commented
         | ExecutionResult::SchemaCreated
         | ExecutionResult::SchemaDropped

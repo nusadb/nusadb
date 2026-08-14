@@ -1,5 +1,5 @@
 # p5_advanced/analyze — ANALYZE recomputes table/column statistics end-to-end
-# (B-stat.01: sketch-based NDV/MCV/histogram).
+# (sketch-based NDV/MCV/histogram).
 #
 # These assert the statement runs and is accepted by the surface; the numeric
 # accuracy + determinism of the sketches is covered by unit tests in
@@ -42,5 +42,13 @@ ANALYZE TABLE ghost
 statement error
 ANALYZE TABLE t FOR COLUMNS nope
 
+# Bare ANALYZE (no table) refreshes every user table in one statement.
+statement ok
+ANALYZE
+
 statement ok
 DROP TABLE t
+
+# Bare ANALYZE with no user tables left is still a valid no-op.
+statement ok
+ANALYZE

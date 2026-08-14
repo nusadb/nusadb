@@ -116,6 +116,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Reindex => PhysicalPlan::Reindex,
         LogicalPlan::Checkpoint => PhysicalPlan::Checkpoint,
         LogicalPlan::Analyze(p) => PhysicalPlan::Analyze(p),
+        LogicalPlan::AnalyzeAll => PhysicalPlan::AnalyzeAll,
         LogicalPlan::Comment(p) => PhysicalPlan::Comment(p),
         LogicalPlan::CreateSchema(p) => PhysicalPlan::CreateSchema(p),
         LogicalPlan::DropSchema(p) => PhysicalPlan::DropSchema(p),

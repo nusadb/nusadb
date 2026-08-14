@@ -649,11 +649,17 @@ fn analyze_add_constraint(
 pub(super) fn analyze_analyze(
     an: ast::Analyze,
     catalog: &dyn Catalog,
-) -> Result<AnalyzePlan, Error> {
+) -> Result<LogicalPlan, Error> {
     let ast::Analyze {
         table: table_name,
         columns: requested,
     } = an;
+    // Bare `ANALYZE` (no table) refreshes every user table, exactly like the `ANALYZE` clause of
+    // `VACUUM ANALYZE` — same all-tables maintenance operation, so it carries no per-table resolution
+    // or column list here (the executor enumerates the live tables under its snapshot).
+    let Some(table_name) = table_name else {
+        return Ok(LogicalPlan::AnalyzeAll);
+    };
     // ANALYZE's name comes from `object_name` (public-only until NS3 opens it here).
     let table = resolve_table(None, &table_name, catalog)?;
     // ANALYZE reads every row and persists column values (MCV lists, histogram bounds), so it
@@ -673,5 +679,5 @@ pub(super) fn analyze_analyze(
         }
         indices
     };
-    Ok(AnalyzePlan { table, columns })
+    Ok(LogicalPlan::Analyze(AnalyzePlan { table, columns }))
 }
