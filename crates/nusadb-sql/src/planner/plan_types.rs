@@ -1312,10 +1312,11 @@ pub struct SelectPlan {
     /// `SELECT ... FOR UPDATE` / `FOR SHARE` row lock. `Some` only for the supported shape —
     /// a single base table with no join/aggregate/grouping/window/distinct and a subquery-free
     /// predicate — validated by the analyzer; the planner wraps the pipeline in a
-    /// [`PhysicalOperator::LockRows`] that locks each matched base row before output; the `bool`
-    /// is `SKIP LOCKED` (skip rows another transaction holds locked instead of conflicting).
-    /// `None` = no row locking.
-    pub row_lock: Option<(nusadb_core::engine::RowLockMode, bool)>,
+    /// [`PhysicalOperator::LockRows`] that locks each matched base row before output; the first
+    /// `bool` is `SKIP LOCKED` (skip rows another transaction holds locked instead of conflicting),
+    /// the second is `NOWAIT` (report a held row as `lock_not_available` rather than a retryable
+    /// serialization conflict). At most one of the two is set. `None` = no row locking.
+    pub row_lock: Option<(nusadb_core::engine::RowLockMode, bool, bool)>,
     /// `WITH ORDINALITY` on a `FROM` set-returning function: when `true`, this plan is a
     /// set-returning derived table whose `ProjectSet` appends a 1-based `ordinality` column. The
     /// analyzer sets it only for such a derived table (and requires a set-returning projection);
@@ -2251,6 +2252,10 @@ pub enum PhysicalOperator {
         /// holds is skipped — excluded from both the locks taken and the pipeline's output —
         /// instead of aborting with a serialization conflict.
         skip_locked: bool,
+        /// `NOWAIT`: a matched row another transaction holds locked fails the statement with
+        /// `lock_not_available` (`55P03`, non-retryable) instead of the default no-wait
+        /// serialization conflict (`40001`, retryable). At most one of `skip_locked`/`nowait` is set.
+        nowait: bool,
     },
     /// Produces exactly one row with no columns — the source for a `SELECT`
     /// without a `FROM` clause (e.g. `SELECT 1`).

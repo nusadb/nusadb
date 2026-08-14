@@ -462,7 +462,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
         // `FOR UPDATE ... SKIP LOCKED` fills its LIMIT from *lockable* rows — the executor skips a
         // row another txn holds locked and keeps scanning. A capped ordered index scan can't honour
         // that, so it is disqualified below; the Sort+SeqScan path is kept instead.
-        let skip_locked = matches!(row_lock, Some((_, true)));
+        let skip_locked = matches!(row_lock, Some((_, true, _)));
         if let Some(ordered) = try_ordered_index_scan(
             &op,
             &select.order_by,
@@ -562,13 +562,14 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
     }
     // `FOR UPDATE` / `FOR SHARE`: wrap the finished pipeline so the executor locks every
     // matched base row before producing output. Only set for the validated single-table shape.
-    if let (Some((mode, skip_locked)), Some(table)) = (row_lock, lock_table) {
+    if let (Some((mode, skip_locked, nowait)), Some(table)) = (row_lock, lock_table) {
         op = PhysicalOperator::LockRows {
             input: Box::new(op),
             table,
             predicate: lock_predicate,
             mode,
             skip_locked,
+            nowait,
         };
     }
     // Projection pushdown: run last, on the finished tree, so a reference from any pipeline

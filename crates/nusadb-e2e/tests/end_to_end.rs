@@ -3561,13 +3561,61 @@ fn for_update_skip_locked_skips_a_row_another_txn_holds() {
     );
 
     // Without SKIP LOCKED, the same held row conflicts rather than blocking (no-wait).
-    assert!(
+    assert_eq!(
         b.execute(build_plan(
             &engine,
             "SELECT id FROM q WHERE id = 2 FOR UPDATE"
         ))
-        .is_err(),
-        "plain FOR UPDATE on a row another txn holds must conflict under the no-wait lock manager",
+        .expect_err("plain FOR UPDATE on a row another txn holds must conflict (no-wait)")
+        .sqlstate(),
+        "40001",
+        "plain FOR UPDATE conflict is a retryable serialization failure",
+    );
+
+    let _ = a.execute(build_plan(&engine, "ROLLBACK"));
+    let _ = b.execute(build_plan(&engine, "ROLLBACK"));
+}
+
+#[test]
+fn for_update_nowait_reports_lock_not_available_on_a_held_row() {
+    // NOWAIT over a row another transaction holds fails immediately with `lock_not_available`
+    // (55P03, non-retryable) — distinct from the default FOR UPDATE's retryable serialization
+    // conflict (40001, asserted above). The no-wait lock manager already fails fast; NOWAIT only
+    // re-classifies that failure so retry logic does not loop on a genuinely locked row, matching the
+    // reference engine. With no contention, NOWAIT returns every matched row.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE q (id INT PRIMARY KEY, v INT)");
+    run(&engine, "INSERT INTO q VALUES (1, 10), (2, 20), (3, 30)");
+
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM q ORDER BY id FOR UPDATE NOWAIT",
+        )),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)]
+        ],
+        "with no competing lock, NOWAIT returns every matched row",
+    );
+
+    let mut a = Session::new(&engine);
+    a.execute(build_plan(&engine, "BEGIN")).unwrap();
+    a.execute(build_plan(
+        &engine,
+        "SELECT id FROM q WHERE id = 2 FOR UPDATE",
+    ))
+    .unwrap();
+
+    let mut b = Session::new(&engine);
+    b.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        b.execute(build_plan(&engine, "SELECT id FROM q FOR UPDATE NOWAIT"))
+            .expect_err("NOWAIT over a held row must fail immediately")
+            .sqlstate(),
+        "55P03",
+        "NOWAIT conflict must be lock_not_available, not a retryable serialization failure",
     );
 
     let _ = a.execute(build_plan(&engine, "ROLLBACK"));

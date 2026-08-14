@@ -797,26 +797,25 @@ fn resolve_order_by_key(
 /// Validate a `SELECT ... FOR UPDATE` / `FOR SHARE` clause and map it to a [`RowLockMode`] plus
 /// the `SKIP LOCKED` flag (the job-queue pattern). Only the simple shape is supported — a
 /// single base table with no join / aggregate / GROUP BY / DISTINCT / window and a subquery-free
-/// `WHERE` — so the executor can lock exactly the matched base rows by re-scanning. `OF <table>` /
-/// `NOWAIT` and any richer shape are honest `Unsupported` (`NOWAIT` because the no-wait lock
-/// manager reports a conflict as `40001`, not the reference engine's `55P03` — mapping it would mislead retry
-/// logic). `None` lock → `None`.
+/// `WHERE` — so the executor can lock exactly the matched base rows by re-scanning. `OF <table>`
+/// and any richer shape are honest `Unsupported`. `None` lock → `None`.
+///
+/// The returned booleans are `(skip_locked, nowait)`. `NOWAIT` is the natural fit for a no-wait lock
+/// manager — it means "fail immediately on a held row", which is what the manager already does; the
+/// executor maps that conflict to `lock_not_available` (`55P03`, non-retryable) so it is distinct
+/// from the default `FOR UPDATE`'s retryable serialization conflict (`40001`) and matches how the
+/// reference engine classifies a `NOWAIT` failure.
 fn analyze_row_lock(
     lock: Option<&ast::RowLock>,
     simple_shape: bool,
     filter: Option<&TypedExpr>,
-) -> Result<Option<(nusadb_core::engine::RowLockMode, bool)>, Error> {
+) -> Result<Option<(nusadb_core::engine::RowLockMode, bool, bool)>, Error> {
     let Some(lock) = lock else {
         return Ok(None);
     };
     if lock.of.is_some() {
         return Err(Error::Unsupported(
             "FOR UPDATE / FOR SHARE ... OF <table>".to_owned(),
-        ));
-    }
-    if matches!(lock.wait, ast::LockWait::NoWait) {
-        return Err(Error::Unsupported(
-            "FOR UPDATE / FOR SHARE with NOWAIT".to_owned(),
         ));
     }
     if !simple_shape {
@@ -835,7 +834,11 @@ fn analyze_row_lock(
         ast::LockStrength::Update => nusadb_core::engine::RowLockMode::Exclusive,
         ast::LockStrength::Share => nusadb_core::engine::RowLockMode::Shared,
     };
-    Ok(Some((mode, matches!(lock.wait, ast::LockWait::SkipLocked))))
+    Ok(Some((
+        mode,
+        matches!(lock.wait, ast::LockWait::SkipLocked),
+        matches!(lock.wait, ast::LockWait::NoWait),
+    )))
 }
 
 /// Resolve a `UNION`/`INTERSECT`/`EXCEPT` statement: analyze the operand tree, enforce

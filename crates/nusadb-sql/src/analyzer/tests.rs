@@ -967,6 +967,7 @@ fn select_for_update_locks_single_table_else_unsupported() {
         "SELECT * FROM users FOR UPDATE",
         "SELECT * FROM users FOR SHARE",
         "SELECT * FROM users FOR UPDATE SKIP LOCKED",
+        "SELECT * FROM users FOR UPDATE NOWAIT",
     ] {
         assert!(plan(sql, &catalog()).is_ok(), "expected Ok for {sql}");
     }
@@ -975,16 +976,26 @@ fn select_for_update_locks_single_table_else_unsupported() {
     else {
         panic!("expected a SELECT plan");
     };
+    // (mode, skip_locked, nowait): SKIP LOCKED sets the first flag only.
     assert_eq!(
         p.row_lock,
-        Some((nusadb_core::engine::RowLockMode::Exclusive, true))
+        Some((nusadb_core::engine::RowLockMode::Exclusive, true, false))
     );
-    // Richer shapes and lock options remain honest `Unsupported` in v1 (NOWAIT because the
-    // no-wait lock manager reports a conflict as 40001, not the reference engine's 55P03).
+    let LogicalPlan::Select(p) =
+        plan("SELECT * FROM users FOR UPDATE NOWAIT", &catalog()).expect("NOWAIT should analyze")
+    else {
+        panic!("expected a SELECT plan");
+    };
+    // NOWAIT sets the second flag only — the no-wait manager already fails fast; the executor tags
+    // that failure as `lock_not_available`.
+    assert_eq!(
+        p.row_lock,
+        Some((nusadb_core::engine::RowLockMode::Exclusive, false, true))
+    );
+    // Richer shapes remain honest `Unsupported` in v1.
     for sql in [
         "SELECT COUNT(*) FROM users FOR UPDATE",  // aggregate
         "SELECT * FROM users FOR SHARE OF users", // OF <table>
-        "SELECT * FROM users FOR UPDATE NOWAIT",  // NOWAIT
     ] {
         assert!(
             matches!(plan(sql, &catalog()), Err(Error::Unsupported(_))),

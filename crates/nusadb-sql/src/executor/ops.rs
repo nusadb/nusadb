@@ -1395,6 +1395,7 @@ fn execute_op_inner(
             predicate,
             mode,
             skip_locked,
+            nowait,
         } => {
             // `FOR UPDATE` / `FOR SHARE`: take a row lock on every base row that satisfies the
             // predicate, then return the pipeline's rows unchanged. The analyzer guarantees a
@@ -1407,6 +1408,12 @@ fn execute_op_inner(
             // holds is collected instead of aborting, and the pipeline then runs under a scan
             // guard that hides exactly those rows — so workers claim disjoint rows without
             // blocking, and a LIMIT fills up from lockable rows, like the reference engine.
+            //
+            // `NOWAIT`: the same held row instead fails the statement immediately with
+            // `lock_not_available` (`55P03`, non-retryable). The lock manager already reports a
+            // conflict without waiting; re-tagging it from the default retryable serialization
+            // conflict (`40001`) to `55P03` is what tells a client this is a genuine "row is locked",
+            // not a transient conflict to retry — matching how the reference engine classifies it.
             let mut lock_held_elsewhere: HashSet<Tid> = HashSet::new();
             for (tid, row) in super::scan::scan_table(table, engine, txn)? {
                 let matched = match predicate {
@@ -1420,6 +1427,15 @@ fn execute_op_inner(
                     Ok(()) => {},
                     Err(nusadb_core::Error::SerializationConflict { .. }) if *skip_locked => {
                         lock_held_elsewhere.insert(tid);
+                    },
+                    Err(nusadb_core::Error::SerializationConflict { .. }) if *nowait => {
+                        return Err(Error::Coded {
+                            message: format!(
+                                "could not obtain lock on row in relation \"{}\"",
+                                table.name
+                            ),
+                            sqlstate: "55P03", // lock_not_available
+                        });
                     },
                     Err(e) => return Err(e.into()),
                 }

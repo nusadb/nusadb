@@ -59,9 +59,14 @@ SELECT a.id FROM acct a JOIN acct b ON a.id = b.id FOR UPDATE
 statement error
 SELECT id FROM acct WHERE id IN (SELECT id FROM acct) FOR UPDATE
 
-# NOWAIT is not supported (there is no wait to decline — the lock manager is already no-wait).
-statement error
-SELECT id FROM acct FOR UPDATE NOWAIT
+# NOWAIT IS supported: with no competing lock it returns every matched row (a held row instead
+# fails with lock_not_available — covered by the concurrent-session test in end_to_end.rs).
+query I
+SELECT id FROM acct ORDER BY id FOR UPDATE NOWAIT
+----
+1
+2
+3
 
 # SKIP LOCKED IS supported: with no competing lock it is a no-op that returns every matched row (the
 # row-skipping under contention is covered by the concurrent-session test in end_to_end.rs).
