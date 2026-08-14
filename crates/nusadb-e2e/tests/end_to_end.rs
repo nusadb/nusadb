@@ -3469,6 +3469,56 @@ fn explicit_transaction_commit_persists() {
 }
 
 #[test]
+fn for_update_skip_locked_skips_a_row_another_txn_holds() {
+    // SKIP LOCKED (the job-queue pattern): a row whose lock another transaction holds is skipped,
+    // not waited on and not aborted, so the query fills from the lockable rows. Verified against the
+    // reference engine on populated rows: with id=2 held elsewhere, `... FOR UPDATE SKIP LOCKED`
+    // returns {1, 3}; the plain `... FOR UPDATE` on the held row conflicts under the no-wait lock
+    // manager — which is what proves SKIP LOCKED actually changed the behaviour rather than being an
+    // accepted-but-ignored keyword.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE q (id INT PRIMARY KEY, v INT)");
+    run(&engine, "INSERT INTO q VALUES (1, 10), (2, 20), (3, 30)");
+
+    // Session A locks id = 2 and holds it.
+    let mut a = Session::new(&engine);
+    a.execute(build_plan(&engine, "BEGIN")).unwrap();
+    a.execute(build_plan(
+        &engine,
+        "SELECT id FROM q WHERE id = 2 FOR UPDATE",
+    ))
+    .unwrap();
+
+    // Session B skips the locked row and locks the rest.
+    let mut b = Session::new(&engine);
+    b.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        rows(
+            b.execute(build_plan(
+                &engine,
+                "SELECT id FROM q ORDER BY id FOR UPDATE SKIP LOCKED",
+            ))
+            .unwrap()
+        ),
+        vec![vec![Value::Int(1)], vec![Value::Int(3)]],
+        "SKIP LOCKED must return the rows whose locks are free, skipping the held id = 2",
+    );
+
+    // Without SKIP LOCKED, the same held row conflicts rather than blocking (no-wait).
+    assert!(
+        b.execute(build_plan(
+            &engine,
+            "SELECT id FROM q WHERE id = 2 FOR UPDATE"
+        ))
+        .is_err(),
+        "plain FOR UPDATE on a row another txn holds must conflict under the no-wait lock manager",
+    );
+
+    let _ = a.execute(build_plan(&engine, "ROLLBACK"));
+    let _ = b.execute(build_plan(&engine, "ROLLBACK"));
+}
+
+#[test]
 fn explicit_transaction_rollback_discards() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL)");
