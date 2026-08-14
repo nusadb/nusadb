@@ -871,6 +871,15 @@ pub(super) fn analyze_scalar_function(
                 found: args.len(),
             });
         };
+        // A bare, undecorated `NULL` has no determined type — report `unknown` (the reference
+        // engine's pseudo-type for a typeless NULL) rather than failing to type-check the argument.
+        // A typed NULL such as `NULL::int` is a cast, not a bare NULL, so it still reports `integer`.
+        if is_bare_null(arg) {
+            return Ok(TypedExpr {
+                kind: TypedExprKind::Literal(ast::Value::Text("unknown".to_owned())),
+                ty: Text,
+            });
+        }
         let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
         let name = crate::executor::ops::info_schema_data_type(typed.ty).to_owned();
         return Ok(TypedExpr {

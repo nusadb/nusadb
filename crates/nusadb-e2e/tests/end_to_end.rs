@@ -188,8 +188,8 @@ fn data_modifying_cte_reports_returning_column_metadata() {
 
 #[test]
 fn nusa_typeof_reports_the_expression_type() {
-    // QA minor (pg_typeof idiom, NusaDB-named): `nusa_typeof(expr)` returns the SQL type name of the
-    // expression. Folded to a constant at analysis, so it works without a FROM and over column refs.
+    // `nusa_typeof(expr)` returns the SQL type name of the expression. Folded to a constant at
+    // analysis, so it works without a FROM and over column refs.
     let engine = BtreeEngine::new();
     assert_eq!(
         rows(run(&engine, "SELECT nusa_typeof(1)")),
@@ -207,9 +207,19 @@ fn nusa_typeof_reports_the_expression_type() {
         rows(run(&engine, "SELECT nusa_typeof(1.5)")),
         vec![vec![Value::Text("numeric".to_owned())]]
     );
+    // A bare, undecorated NULL has no determined type → `unknown`. A typed NULL is a cast and keeps
+    // its cast type. (Matches the reference engine: typeless NULL is the `unknown` pseudo-type.)
+    assert_eq!(
+        rows(run(&engine, "SELECT nusa_typeof(NULL)")),
+        vec![vec![Value::Text("unknown".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT nusa_typeof(NULL::int)")),
+        vec![vec![Value::Text("integer".to_owned())]]
+    );
     // Over a real column: the column's analysis-time type is reported. (Integer widths physicalize to
-    // `integer` in the analyzer scope — the K4/K6 design keeps declared width in the codec, not the
-    // expression scope — so a TEXT column is used here to show a column reference resolves.)
+    // `integer` in the analyzer scope — declared width lives in the codec, not the expression scope —
+    // so a TEXT column is used here to show a column reference resolves.)
     run(&engine, "CREATE TABLE t (id INT NOT NULL, label TEXT)");
     run(&engine, "INSERT INTO t VALUES (1, 'a')");
     assert_eq!(
