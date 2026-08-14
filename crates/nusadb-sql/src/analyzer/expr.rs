@@ -3375,7 +3375,10 @@ pub(super) fn comparable(a: ColumnType, b: ColumnType) -> bool {
 /// temporal column stays a real type error, matching the reference engine (only string literals are
 /// "unknown"). A non-temporal `anchor` (or a non-literal operand) is returned unchanged.
 fn coerce_unknown_literal(operand: TypedExpr, anchor: ColumnType) -> TypedExpr {
-    if is_temporal_or_uuid(anchor)
+    // A `VECTOR` anchor coerces a bare string literal too: `'[1,0,0]'` is the same literal form
+    // `INSERT` accepts for a `VECTOR` column, so `emb <-> '[1,0,0]'` should work without an
+    // explicit `::VECTOR(n)` — the rule must not differ between the two places the literal appears.
+    if (is_temporal_or_uuid(anchor) || matches!(anchor, ColumnType::Vector(_)))
         && matches!(&operand.kind, TypedExprKind::Literal(ast::Value::Text(_)))
     {
         TypedExpr {
@@ -3549,6 +3552,24 @@ pub(super) fn analyze_binary(
     ) {
         right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
         left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
+    }
+    // The vector distance operators have only a `VECTOR <op> VECTOR` form, so a bare string literal
+    // next to a `VECTOR` operand is unambiguous: coerce it to that operand's vector type, exactly
+    // as `INSERT` coerces the same `'[…]'` literal into a `VECTOR` column. Without this the operator
+    // demands an explicit `::VECTOR(n)` the column-insert never asks for.
+    if matches!(
+        op,
+        ast::BinaryOp::VectorDistance
+            | ast::BinaryOp::VectorL2Distance
+            | ast::BinaryOp::VectorNegInnerProduct
+            | ast::BinaryOp::VectorL1Distance
+    ) {
+        if matches!(left_typed.ty, ColumnType::Vector(_)) {
+            right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
+        }
+        if matches!(right_typed.ty, ColumnType::Vector(_)) {
+            left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
+        }
     }
     // `&&` over ranges has only a range/range form, so a bare string literal next to a range
     // operand is unambiguous and coerces the same way. (`@>`/`<@` do not: a literal there could be

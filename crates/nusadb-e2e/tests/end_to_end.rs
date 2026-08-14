@@ -2186,6 +2186,47 @@ fn explain_returns_a_plan_tree() {
 }
 
 #[test]
+fn explain_vector_knn_distinguishes_hnsw_index_from_exact_scan() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE docs (id INT NOT NULL, emb VECTOR(3))",
+    );
+    run(
+        &engine,
+        "INSERT INTO docs VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[1,1,0]')",
+    );
+    // A plain hnsw index defaults to the cosine metric.
+    run(&engine, "CREATE INDEX docs_hnsw ON docs USING hnsw (emb)");
+
+    let explain = |sql: &str| -> String {
+        rows(run(&engine, sql))
+            .into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // `<=>` is cosine — matches the index's metric, so the plan names the HNSW index it will use.
+    let cosine = explain("EXPLAIN SELECT id FROM docs ORDER BY emb <=> '[1,0,0]' LIMIT 2");
+    assert!(
+        cosine.contains("using HNSW index docs_hnsw"),
+        "cosine KNN should use the index: {cosine}"
+    );
+
+    // `<->` is L2 — no L2 index exists, so the same query shape falls back to an exact scan and the
+    // plan says so instead of falsely implying an index-backed search.
+    let l2 = explain("EXPLAIN SELECT id FROM docs ORDER BY emb <-> '[1,0,0]' LIMIT 2");
+    assert!(
+        l2.contains("exact scan, no HNSW index"),
+        "L2 KNN has no matching index, should read as exact: {l2}"
+    );
+}
+
+#[test]
 fn explain_annotates_estimated_rows_after_analyze() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, val INT)");

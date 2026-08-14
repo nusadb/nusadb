@@ -805,8 +805,19 @@ pub(super) fn run_create_index(
     // A `USING hnsw` vector index is recorded in the SQL-layer vector-index catalog rather
     // than created as an engine B-tree index; its graph is built on demand at query time.
     if let Some(spec) = &plan.vector {
-        if plan.if_not_exists && super::vector_index_exists(engine, txn, &spec.name)? {
-            return Ok(ExecutionResult::IndexCreated);
+        // A name already taken — by another vector index OR a B-tree index — must be refused, the
+        // same as a B-tree `CREATE INDEX` does, rather than silently overwriting (and rebuilding
+        // the expensive HNSW graph over) the existing one. `IF NOT EXISTS` makes it a no-op instead.
+        let name_taken = super::vector_index_exists(engine, txn, &spec.name)?
+            || engine.lookup_index(&spec.name)?.is_some();
+        if name_taken {
+            if plan.if_not_exists {
+                return Ok(ExecutionResult::IndexCreated);
+            }
+            return Err(nusadb_core::Error::IndexExists {
+                name: spec.name.clone(),
+            }
+            .into());
         }
         super::store_vector_index(engine, txn, spec)?;
         // Eager build: build the HNSW graph now, so the cost lands at `CREATE INDEX`

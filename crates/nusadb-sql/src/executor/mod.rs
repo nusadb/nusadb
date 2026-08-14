@@ -1756,7 +1756,7 @@ fn run_explain(
     } else {
         (None, None)
     };
-    let plan_lines = format_plan(plan, 0, ctx.as_ref(), actuals.as_ref());
+    let plan_lines = format_plan(plan, 0, ctx.as_ref(), actuals.as_ref(), engine, txn);
 
     // VERBOSE: the plan's output column names for a row-producing statement.
     let output_columns = if options.verbose {
@@ -1961,23 +1961,25 @@ fn format_plan(
     depth: usize,
     ctx: Option<&cost::ScanStats>,
     actuals: Option<&HashMap<usize, u64>>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Vec<String> {
     let indent = "  ".repeat(depth);
     match plan {
         PhysicalPlan::Batch(children) => children
             .iter()
-            .flat_map(|c| format_plan(c, depth, ctx, actuals))
+            .flat_map(|c| format_plan(c, depth, ctx, actuals, engine, txn))
             .collect(),
         PhysicalPlan::CreateTable(p) => vec![format!("{indent}CreateTable: {}", p.table)],
         PhysicalPlan::CreateTableAs(p) => {
             let mut lines = vec![format!("{indent}CreateTableAs: {}", p.name)];
-            lines.extend(format_op(&p.body, depth + 1, ctx, actuals));
+            lines.extend(format_op(&p.body, depth + 1, ctx, actuals, engine, txn));
             lines
         },
         PhysicalPlan::DropTable(p) => vec![format!("{indent}DropTable: {}", p.table)],
         PhysicalPlan::CreateMaterializedView(p) => {
             let mut lines = vec![format!("{indent}CreateMaterializedView: {}", p.name)];
-            lines.extend(format_op(&p.body, depth + 1, ctx, actuals));
+            lines.extend(format_op(&p.body, depth + 1, ctx, actuals, engine, txn));
             lines
         },
         PhysicalPlan::CreateView(p) => vec![format!("{indent}CreateView: {}", p.name)],
@@ -2075,10 +2077,10 @@ fn format_plan(
             let cascade = if p.cascade { " cascade" } else { "" };
             vec![format!("{indent}Truncate{cascade} from {}", p.table)]
         },
-        PhysicalPlan::Select(op, _) => format_op(op, depth, ctx, actuals),
+        PhysicalPlan::Select(op, _) => format_op(op, depth, ctx, actuals, engine, txn),
         PhysicalPlan::Explain(inner, _) => {
             let mut lines = vec![format!("{indent}Explain")];
-            lines.extend(format_plan(inner, depth + 1, ctx, actuals));
+            lines.extend(format_plan(inner, depth + 1, ctx, actuals, engine, txn));
             lines
         },
         PhysicalPlan::BeginTransaction(_) => vec![format!("{indent}BeginTransaction")],
@@ -2155,7 +2157,7 @@ fn format_plan(
         PhysicalPlan::DropIndex(p) => vec![format!("{indent}DropIndex: {}", p.name)],
         PhysicalPlan::SetOperation(p) => {
             let mut lines = vec![format!("{indent}SetOperation")];
-            format_set_tree(&p.tree, depth + 1, &mut lines, actuals);
+            format_set_tree(&p.tree, depth + 1, &mut lines, actuals, engine, txn);
             lines
         },
     }
@@ -2167,10 +2169,12 @@ fn format_set_tree(
     depth: usize,
     lines: &mut Vec<String>,
     actuals: Option<&HashMap<usize, u64>>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
 ) {
     let indent = "  ".repeat(depth);
     match tree {
-        SetOpTree::Leaf(op) => lines.extend(format_op(op, depth, None, actuals)),
+        SetOpTree::Leaf(op) => lines.extend(format_op(op, depth, None, actuals, engine, txn)),
         SetOpTree::Node {
             op,
             all,
@@ -2179,8 +2183,8 @@ fn format_set_tree(
         } => {
             let all = if *all { " ALL" } else { "" };
             lines.push(format!("{indent}{op:?}{all}"));
-            format_set_tree(left, depth + 1, lines, actuals);
-            format_set_tree(right, depth + 1, lines, actuals);
+            format_set_tree(left, depth + 1, lines, actuals, engine, txn);
+            format_set_tree(right, depth + 1, lines, actuals, engine, txn);
         },
     }
 }
@@ -2194,6 +2198,8 @@ fn format_op(
     depth: usize,
     ctx: Option<&cost::ScanStats>,
     actuals: Option<&HashMap<usize, u64>>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Vec<String> {
     let indent = "  ".repeat(depth);
     let mut lines = Vec::new();
@@ -2212,16 +2218,36 @@ fn format_op(
             }
         },
         PhysicalOperator::VectorKnn {
-            table, k, metric, ..
+            table,
+            column_ordinal,
+            k,
+            metric,
+            ..
         } => {
-            // Name the metric: with four of them, and a silent fall back to an exact scan when no
-            // index was built for the one asked for, the plan is otherwise indistinguishable from
-            // the case where the index is doing the work.
-            lines.push(format!(
-                "{indent}VectorKnn: {} (k={k}, metric={})",
-                table.name,
-                metric.operator_class()
-            ));
+            // Say whether an HNSW index actually serves this search or it falls back to an exact
+            // scan — the executor uses the declared index only if one was built for THIS metric, so
+            // without this the plan for an index-backed search and a brute-force scan read the same,
+            // and a user cannot verify the feature most worth verifying in the product.
+            let index = list_vector_indexes(engine, txn).ok().and_then(|indexes| {
+                indexes.into_iter().find(|v| {
+                    v.table == table.name
+                        && v.column_ordinal == *column_ordinal
+                        && v.metric == *metric
+                })
+            });
+            match index {
+                Some(v) => lines.push(format!(
+                    "{indent}VectorKnn: {} using HNSW index {} (k={k}, metric={})",
+                    table.name,
+                    v.name,
+                    metric.operator_class()
+                )),
+                None => lines.push(format!(
+                    "{indent}VectorKnn: {} exact scan, no HNSW index for {} (k={k})",
+                    table.name,
+                    metric.operator_class()
+                )),
+            }
         },
         PhysicalOperator::IndexScan { table, index, .. } => {
             lines.push(format!("{indent}IndexScan: {} using {index}", table.name));
@@ -2232,14 +2258,14 @@ fn format_op(
         },
         PhysicalOperator::SetOperation(set_op) => {
             lines.push(format!("{indent}SetOperation"));
-            format_set_tree(&set_op.tree, depth + 1, &mut lines, actuals);
+            format_set_tree(&set_op.tree, depth + 1, &mut lines, actuals, engine, txn);
         },
         PhysicalOperator::InfoSchemaScan { view } => {
             lines.push(format!("{indent}InfoSchemaScan: {}", view.view_name()));
         },
         PhysicalOperator::Filter { input, .. } => {
             lines.push(format!("{indent}Filter"));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::LockRows {
             input, table, mode, ..
@@ -2249,7 +2275,7 @@ fn format_op(
                 nusadb_core::engine::RowLockMode::Shared => "FOR SHARE",
             };
             lines.push(format!("{indent}LockRows ({strength} on {})", table.name));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::Sort {
             input,
@@ -2266,15 +2292,15 @@ fn format_op(
                 String::new()
             };
             lines.push(format!("{indent}Sort ({} key(s)){suffix}", keys.len()));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::Project { input, columns } => {
             lines.push(format!("{indent}Project ({} column(s))", columns.len()));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::ProjectSet { input, columns, .. } => {
             lines.push(format!("{indent}ProjectSet ({} column(s))", columns.len()));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::Limit {
             input,
@@ -2286,22 +2312,22 @@ fn format_op(
             } else {
                 lines.push(format!("{indent}Limit {count}"));
             }
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::Distinct { input } => {
             lines.push(format!("{indent}Distinct"));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::DistinctOn { input, keys } => {
             lines.push(format!("{indent}DistinctOn ({} key(s))", keys.len()));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::ScalarAggregate { input, calls } => {
             lines.push(format!(
                 "{indent}ScalarAggregate ({} aggregate(s))",
                 calls.len()
             ));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::GroupAggregate {
             input,
@@ -2313,7 +2339,7 @@ fn format_op(
                 group_keys.len(),
                 calls.len()
             ));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::GroupingSetsAggregate {
             input,
@@ -2327,7 +2353,7 @@ fn format_op(
                 group_keys.len(),
                 calls.len()
             ));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::Window {
             input,
@@ -2339,7 +2365,7 @@ fn format_op(
                 "{indent}Window ({} function(s)){suffix}",
                 windows.len()
             ));
-            lines.extend(format_op(input, depth + 1, ctx, actuals));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::NestedLoopJoin {
             left, right, kind, ..
@@ -2352,8 +2378,8 @@ fn format_op(
                 ast::JoinKind::Cross => "Cross",
             };
             lines.push(format!("{indent}NestedLoopJoin ({kind_label})"));
-            lines.extend(format_op(left, depth + 1, ctx, actuals));
-            lines.extend(format_op(right, depth + 1, ctx, actuals));
+            lines.extend(format_op(left, depth + 1, ctx, actuals, engine, txn));
+            lines.extend(format_op(right, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::HashJoin {
             left,
@@ -2373,8 +2399,8 @@ fn format_op(
                 "{indent}HashJoin ({kind_label}, {} key(s))",
                 keys.len()
             ));
-            lines.extend(format_op(left, depth + 1, ctx, actuals));
-            lines.extend(format_op(right, depth + 1, ctx, actuals));
+            lines.extend(format_op(left, depth + 1, ctx, actuals, engine, txn));
+            lines.extend(format_op(right, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::LateralJoin {
             left, right, kind, ..
@@ -2387,22 +2413,29 @@ fn format_op(
                 ast::JoinKind::Cross => "Cross",
             };
             lines.push(format!("{indent}LateralJoin ({kind_label})"));
-            lines.extend(format_op(left, depth + 1, ctx, actuals));
-            lines.extend(format_op(right, depth + 1, ctx, actuals));
+            lines.extend(format_op(left, depth + 1, ctx, actuals, engine, txn));
+            lines.extend(format_op(right, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::WithRecursive { ctes, body } => {
             lines.push(format!("{indent}WithRecursive ({} CTE(s))", ctes.len()));
             for cte in ctes {
                 let label = if cte.union_all { "UNION ALL" } else { "UNION" };
                 lines.push(format!("{indent}  RecursiveCte ({label})"));
-                lines.extend(format_op(&cte.base, depth + 2, ctx, actuals));
-                lines.extend(format_op(&cte.recursive, depth + 2, ctx, actuals));
+                lines.extend(format_op(&cte.base, depth + 2, ctx, actuals, engine, txn));
+                lines.extend(format_op(
+                    &cte.recursive,
+                    depth + 2,
+                    ctx,
+                    actuals,
+                    engine,
+                    txn,
+                ));
             }
-            lines.extend(format_op(body, depth + 1, ctx, actuals));
+            lines.extend(format_op(body, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::WithModifying { ctes, body } => {
             lines.push(format!("{indent}WithModifying ({} CTE(s))", ctes.len()));
-            lines.extend(format_op(body, depth + 1, ctx, actuals));
+            lines.extend(format_op(body, depth + 1, ctx, actuals, engine, txn));
         },
     }
     // Annotate this operator's own line with its estimated row count and subtree cost when a cost
