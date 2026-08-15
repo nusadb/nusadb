@@ -311,6 +311,21 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn quote_nullable_quotes_text_and_renders_null() {
+    // quote_nullable(x): a NULL argument yields the unquoted text NULL; otherwise it single-quotes
+    // like quote_literal (embedded quotes doubled) — matching the reference engine.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(&engine, "SELECT quote_nullable(NULL)")),
+        vec![vec![Value::Text("NULL".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT quote_nullable('a''b')")),
+        vec![vec![Value::Text("'a''b'".to_owned())]]
+    );
+}
+
+#[test]
 fn make_timestamptz_builds_a_timestamptz_value() {
     // make_timestamptz(fields) builds a TIMESTAMPTZ; the session time zone is UTC, so it is the same
     // instant as make_timestamp of the same fields cast to TIMESTAMPTZ (matching the reference engine

@@ -1263,6 +1263,7 @@ pub(super) fn analyze_scalar_function(
         | F::Sha512
         | F::Md5
         | F::QuoteLiteral
+        | F::QuoteNullable
         | F::QuoteIdent
         | F::CurrentSetting => ScalarSig::Fixed(&[Text], &[], Text),
         // CHR(n) maps an INT code point to a one-character TEXT; TO_HEX(n) renders an INT as a

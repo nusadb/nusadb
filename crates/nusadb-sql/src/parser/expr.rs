@@ -1240,6 +1240,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "sha512" => F::Sha512,
         "md5" => F::Md5,
         "quote_literal" => F::QuoteLiteral,
+        "quote_nullable" => F::QuoteNullable,
         "quote_ident" => F::QuoteIdent,
         "format" => F::Format,
         "degrees" => F::Degrees,

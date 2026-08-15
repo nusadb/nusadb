@@ -406,6 +406,9 @@ fn eval_scalar_function(
         // FORMAT substitutes its arguments into specifiers itself (a NULL renders per specifier, not
         // by propagating), so it skips the NULL-strict collection (B-fn).
         F::Format => return eval_format(args, row),
+        // QUOTE_NULLABLE renders a NULL argument as the unquoted text `NULL` (for dynamic SQL) instead
+        // of propagating NULL, so it skips the NULL-strict collection below.
+        F::QuoteNullable => return eval_quote_nullable(args, row),
         // NUM_NONNULLS / NUM_NULLS count their arguments by NULL-ness — they inspect NULLs rather
         // than propagating them, so they skip the NULL-strict collection below.
         F::NumNonNulls => return eval_num_nulls(args, row, false),
@@ -1670,6 +1673,21 @@ fn regexp_split_to_array(source: &str, pattern: &str, flags: &str) -> Result<ast
 
 /// `CONCAT(a, b, ...)` — concatenate the text of every non-`NULL` argument; `NULL`s contribute
 /// nothing and the result is never `NULL` (`''` when all arguments are `NULL`).
+/// `QUOTE_NULLABLE(x)` — like `quote_literal`, but a NULL argument returns the unquoted text `NULL`
+/// so it can be spliced into dynamic SQL. A non-NULL value is rendered to text and single-quoted
+/// (embedded quotes doubled), exactly as `quote_literal`.
+fn eval_quote_nullable(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
+    let [arg] = args else {
+        return Err(Error::Unsupported(
+            "quote_nullable() expects 1 argument".to_owned(),
+        ));
+    };
+    Ok(match eval(arg, row)? {
+        ast::Value::Null => ast::Value::Text("NULL".to_owned()),
+        value => ast::Value::Text(quote_literal(&text_output(value)?)),
+    })
+}
+
 fn eval_concat(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let mut out = String::new();
     for arg in args {

@@ -642,6 +642,9 @@ pub enum ScalarFunc {
     /// `QUOTE_LITERAL(text)` — `text` wrapped as a SQL string literal (embedded `'` doubled), as
     /// `TEXT`.
     QuoteLiteral,
+    /// `QUOTE_NULLABLE(text)` — like `QUOTE_LITERAL`, but a NULL argument yields the unquoted text
+    /// `NULL` (for splicing into dynamic SQL) rather than propagating NULL, as `TEXT`.
+    QuoteNullable,
     /// `QUOTE_IDENT(text)` — `text` quoted as a SQL identifier when needed (embedded `"` doubled), as
     /// `TEXT`.
     QuoteIdent,
@@ -997,6 +1000,7 @@ impl ScalarFunc {
             Self::Sha512 => "sha512",
             Self::Md5 => "md5",
             Self::QuoteLiteral => "quote_literal",
+            Self::QuoteNullable => "quote_nullable",
             Self::QuoteIdent => "quote_ident",
             Self::Format => "format",
             Self::StartsWith => "starts_with",
