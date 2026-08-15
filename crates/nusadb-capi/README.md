@@ -19,7 +19,7 @@ The header is hand-maintained at `include/nusadb.h` (it can also be regenerated 
 ## API (see `include/nusadb.h`)
 
 ```c
-NusaConnection *conn = nusadb_connect("127.0.0.1", 5678, "nusa-root", "nusadb", "nusa-root");
+NusaConnection *conn = nusadb_connect("127.0.0.1", 5678, "nusadb-root", "nusadb", "nusadb-root");
 NusaResult *r = nusadb_query(conn, "SELECT id, name FROM t WHERE id = $1");
 
 /* parameterised: params[i] is a C string, or NULL for SQL NULL */

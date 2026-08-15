@@ -1,4 +1,4 @@
-//! nusa-cli client library: the Nusa Wire Protocol handshake, query execution, and result
+//! nusadb-cli client library: the Nusa Wire Protocol handshake, query execution, and result
 //! rendering — factored out of `main.rs` so it can be tested against a real server.
 
 use std::fmt::Write as _;

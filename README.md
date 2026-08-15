@@ -61,7 +61,7 @@ docker run -d --name nusadb \
   nusadb/nusadb:latest
 
 # Connect with the interactive shell shipped in the same image
-docker exec -it nusadb nusa-cli
+docker exec -it nusadb nusadb-cli
 ```
 
 The image keeps its durable state in `/var/lib/nusadb`, so mount a volume there or the database
@@ -75,7 +75,7 @@ docker run -d --name nusadb \
   -p 5678:5678 \
   -v nusadb-data:/var/lib/nusadb \
   -v ./init:/docker-entrypoint-initdb.d:ro \
-  -e NUSADB_USER=nusa-root \
+  -e NUSADB_USER=nusadb-root \
   -e NUSADB_PASSWORD=change-me \
   -e RUST_LOG=info \
   nusadb/nusadb:latest

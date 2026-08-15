@@ -16,17 +16,17 @@ NusaDB speaks its own wire protocol — the [Nusa Wire Protocol](wire-protocol.m
 database's. Clients built for other systems (`psql`, JDBC or ODBC drivers for other engines,
 GUI tools that expect them) cannot connect: the server does not answer their handshake at all,
 which from their side looks like a dead socket. That is by design, not a missing feature or a
-misconfiguration. Connect with `nusa-cli`, the NusaDB drivers, or anything implementing the
+misconfiguration. Connect with `nusadb-cli`, the NusaDB drivers, or anything implementing the
 protocol spec. The SQL *dialect* is a different matter from the wire format: SQL written for
 other engines largely runs as-is once it arrives over a NusaDB connection.
 
 The stock defaults are host `127.0.0.1:5678`, database `nusadb`, and the bootstrap
-superuser `nusa-root` (password `nusa-root`). A trust-on-startup server ignores the
-password; a server started with `--auth-user nusa-root:nusa-root` (or the
+superuser `nusadb-root` (password `nusadb-root`). A trust-on-startup server ignores the
+password; a server started with `--auth-user nusadb-root:nusadb-root` (or the
 `NUSADB_USER`/`NUSADB_PASSWORD` env pair) requires it.
 
 ```bash
-./target/release/nusa-cli --host 127.0.0.1:5678 --user nusa-root --database nusa
+./target/release/nusadb-cli --host 127.0.0.1:5678 --user nusadb-root --database nusa
 ```
 
 ## Multiple databases & schemas
@@ -44,7 +44,7 @@ SELECT * FROM tenant.t;              -- resolved via search_path, falling back t
 Connect to a specific database by name (each connection targets one database):
 
 ```bash
-./target/release/nusa-cli --host 127.0.0.1:5678 --user nusa-root --database app
+./target/release/nusadb-cli --host 127.0.0.1:5678 --user nusadb-root --database app
 ```
 
 ## Bulk load and export
@@ -58,13 +58,13 @@ shell forms read as they look — the data travels on the command's own standard
 
 ```bash
 # Load: tab-delimited, \N for NULL (the server's text format)
-nusa-cli --host 127.0.0.1:5678 -c "COPY t FROM STDIN" < rows.tsv
+nusadb-cli --host 127.0.0.1:5678 -c "COPY t FROM STDIN" < rows.tsv
 
 # Export the same way
-nusa-cli --host 127.0.0.1:5678 -c "COPY t TO STDOUT" > rows.tsv
+nusadb-cli --host 127.0.0.1:5678 -c "COPY t TO STDOUT" > rows.tsv
 
 # CSV, with a header line
-nusa-cli --host 127.0.0.1:5678 -c "COPY t FROM STDIN WITH (FORMAT csv, HEADER)" < rows.csv
+nusadb-cli --host 127.0.0.1:5678 -c "COPY t FROM STDIN WITH (FORMAT csv, HEADER)" < rows.csv
 ```
 
 The row count is reported on standard error during an export, so it never lands in the exported

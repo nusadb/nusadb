@@ -1,4 +1,4 @@
-//! Tests for the nusa-cli client library (`src/lib.rs`): result rendering (pure) and a full
+//! Tests for the nusadb-cli client library (`src/lib.rs`): result rendering (pure) and a full
 //! query session driven against a real `nusadb-server` over TCP.
 
 #![allow(

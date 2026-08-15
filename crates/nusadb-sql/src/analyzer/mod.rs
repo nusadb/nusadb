@@ -164,7 +164,7 @@ pub trait Catalog {
     /// The session user, used to match a policy's `TO role` list. Default is the bootstrap
     /// superuser name; consulted only when building a non-superuser's policy predicate.
     fn current_user(&self) -> String {
-        "nusa-root".to_owned()
+        "nusadb-root".to_owned()
     }
 
     /// The row-level-security policies defined on base table `name`. Default empty so a

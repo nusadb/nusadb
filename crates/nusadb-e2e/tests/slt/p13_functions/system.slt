@@ -24,7 +24,7 @@ public
 query T
 SELECT CURRENT_USER
 ----
-nusa-root
+nusadb-root
 
 # Nested calls are fine: concat with version.
 query T

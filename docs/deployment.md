@@ -1,7 +1,7 @@
 # Deploying NusaDB
 
 NusaDB ships as a single server binary (`nusadb-server`) plus an interactive
-client (`nusa-cli`). This guide covers a bare-metal install on a Linux VM with systemd.
+client (`nusadb-cli`). This guide covers a bare-metal install on a Linux VM with systemd.
 
 The server is configured entirely by command-line flags (no config file). The
 durable state — write-ahead log — lives under `--data-dir`; back that path up
@@ -126,7 +126,7 @@ VM (requires the Rust toolchain pinned in `rust-toolchain.toml`):
 ```bash
 cargo build --release --locked -p nusadb-server -p nusadb-cli
 sudo install -m 0755 target/release/nusadb-server /usr/local/bin/
-sudo install -m 0755 target/release/nusa-cli      /usr/local/bin/
+sudo install -m 0755 target/release/nusadb-cli      /usr/local/bin/
 ```
 
 ### 2. Create a service user and data directory
@@ -188,7 +188,7 @@ sudo systemctl status nusadb
 journalctl -u nusadb -f          # follow logs
 
 # From a client host (open the VM firewall to 5678 first):
-nusa-cli --host VM_HOST:5678 --user admin
+nusadb-cli --host VM_HOST:5678 --user admin
 ```
 
 ### 5. Firewall

@@ -67,7 +67,7 @@ pub use executor::{
 ///
 /// NusaDB does not yet model per-role `SUPERUSER` attributes, so a session is a superuser exactly
 /// when it runs as this user. The wire server reports it from the connection's authenticated user.
-pub const BOOTSTRAP_SUPERUSER: &str = "nusa-root";
+pub const BOOTSTRAP_SUPERUSER: &str = "nusadb-root";
 
 /// The reserved settings-snapshot key the wire stamps with the connection's database.
 ///

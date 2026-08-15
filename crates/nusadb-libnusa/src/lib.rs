@@ -17,7 +17,7 @@
 //! use nusadb_libnusa::{Client, Config, Param};
 //!
 //! # async fn run() -> nusadb_libnusa::Result<()> {
-//! let config = Config::new("127.0.0.1", 5678, "nusa-root", "nusadb");
+//! let config = Config::new("127.0.0.1", 5678, "nusadb-root", "nusadb");
 //! let mut client = Client::connect(&config).await?;
 //! client.simple_query("CREATE TABLE t (id INT NOT NULL, name TEXT)").await?;
 //! client.execute("INSERT INTO t VALUES ($1, $2)", &[1_i64.into(), "alice".into()]).await?;

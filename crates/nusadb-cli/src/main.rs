@@ -1,4 +1,4 @@
-//! nusa-cli — interactive SQL shell for NusaDB.
+//! nusadb-cli — interactive SQL shell for NusaDB.
 //!
 //! Connects to a `nusadb-server` over the Nusa Wire Protocol, performs the Startup handshake,
 //! then either runs a batch (`--command` / `--file`) and exits, or starts a `rustyline`
@@ -25,16 +25,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-/// nusa-cli — interactive SQL shell for NusaDB.
+/// nusadb-cli — interactive SQL shell for NusaDB.
 #[derive(Debug, Parser)]
-#[command(name = "nusa-cli", version, about)]
+#[command(name = "nusadb-cli", version, about)]
 struct Args {
     /// Server to connect to.
     #[arg(long, default_value = "127.0.0.1:5678")]
     host: String,
 
     /// User to connect as.
-    #[arg(short, long, default_value = "nusa-root")]
+    #[arg(short, long, default_value = "nusadb-root")]
     user: String,
 
     /// Database to open.
@@ -101,8 +101,8 @@ fn strip_bom(sql: &str) -> &str {
 /// standard output, so the shell forms work as they read:
 ///
 /// ```text
-/// nusa-cli -c "COPY t FROM STDIN" < rows.tsv
-/// nusa-cli -c "COPY t TO STDOUT"  > rows.tsv
+/// nusadb-cli -c "COPY t FROM STDIN" < rows.tsv
+/// nusadb-cli -c "COPY t TO STDOUT"  > rows.tsv
 /// ```
 ///
 /// Both batch forms read their SQL from elsewhere — the command line or a file — so standard input
@@ -250,13 +250,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // The password comes from --password, falling back to NUSADB_PASSWORD (preferred — keeps the
-    // secret off the command line), then to the canonical default `nusa-root`. Only used if the
+    // secret off the command line), then to the canonical default `nusadb-root`. Only used if the
     // server requests authentication (a trust-on-startup server ignores it).
     let password = args
         .password
         .clone()
         .or_else(|| std::env::var("NUSADB_PASSWORD").ok())
-        .or_else(|| Some("nusa-root".to_owned()));
+        .or_else(|| Some("nusadb-root".to_owned()));
     handshake(&mut conn, &args.user, &args.database, password.as_deref()).await?;
     if interactive {
         let scheme = if args.tls || args.tls_ca.is_some() {
@@ -294,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let interactive = args.command.is_none() && args.file.is_none();
     if interactive {
-        println!("nusa-cli (NusaDB) — type \\q to quit");
+        println!("nusadb-cli (NusaDB) — type \\q to quit");
     }
 
     let tcp = TcpStream::connect(&args.host).await?;

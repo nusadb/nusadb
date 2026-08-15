@@ -66,7 +66,7 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let host = args.next().unwrap_or_else(|| "127.0.0.1".to_owned());
     let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(5678);
-    let config = Config::new(host, port, "nusa-root", "nusadb");
+    let config = Config::new(host, port, "nusadb-root", "nusadb");
     let mut client = Client::connect(&config).await.unwrap();
 
     // Round-trip floor.

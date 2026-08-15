@@ -1,6 +1,6 @@
 //! Integration test for CLI TLS: the client builds a rustls config that trusts the test
 //! certificate, completes the handshake against a TLS-enabled `nusadb-wire` server, and runs a
-//! query over the encrypted stream — exercising the same client path `nusa-cli --tls` uses.
+//! query over the encrypted stream — exercising the same client path `nusadb-cli --tls` uses.
 
 #![allow(
     clippy::unwrap_used,
@@ -36,7 +36,7 @@ async fn cli_runs_sql_against_a_tls_server() {
         let _ = stop_rx.await;
     }));
 
-    // Client: the same path `nusa-cli --tls --tls-ca <cert> --tls-domain localhost` takes.
+    // Client: the same path `nusadb-cli --tls --tls-ca <cert> --tls-domain localhost` takes.
     let tcp = TcpStream::connect(addr).await.unwrap();
     let connector = TlsConnector::from(Arc::new(tls_client_config(CERT_PEM).unwrap()));
     let server_name = ServerName::try_from("localhost").unwrap();

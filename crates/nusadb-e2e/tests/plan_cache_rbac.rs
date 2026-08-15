@@ -73,7 +73,7 @@ impl Catalog for RbacCatalog<'_> {
     }
 }
 
-/// Run a statement as `nusa-root` (a permissive superuser catalog for setup).
+/// Run a statement as `nusadb-root` (a permissive superuser catalog for setup).
 fn root(engine: &BtreeEngine, sql: &str) {
     struct Root<'a>(&'a BtreeEngine);
     impl Catalog for Root<'_> {
@@ -84,13 +84,13 @@ fn root(engine: &BtreeEngine, sql: &str) {
             true
         }
         fn current_user(&self) -> String {
-            "nusa-root".to_owned()
+            "nusadb-root".to_owned()
         }
     }
     let stmt = parse(sql).unwrap();
     let logical = analyze(stmt, &Root(engine)).expect(sql);
     let mut s = Session::new(engine);
-    s.set_current_user("nusa-root");
+    s.set_current_user("nusadb-root");
     s.execute(plan(logical)).expect(sql);
 }
 

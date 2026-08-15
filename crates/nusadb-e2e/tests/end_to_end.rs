@@ -8142,12 +8142,12 @@ fn p12_alter_policy_end_to_end() {
             &RlsCatalog {
                 engine: &engine,
                 superuser: true,
-                user: "nusa-root",
+                user: "nusadb-root",
             },
         )
         .expect("analyze");
         let mut session = Session::new(&engine);
-        session.set_current_user("nusa-root");
+        session.set_current_user("nusadb-root");
         session.execute(plan(logical)).expect("execute");
     };
 
@@ -8231,12 +8231,12 @@ fn p12_alter_policy_preserves_kind_end_to_end() {
             &RlsCatalog {
                 engine: &engine,
                 superuser: true,
-                user: "nusa-root",
+                user: "nusadb-root",
             },
         )
         .expect("analyze");
         let mut session = Session::new(&engine);
-        session.set_current_user("nusa-root");
+        session.set_current_user("nusadb-root");
         session.execute(plan(logical)).expect("execute");
     };
 
@@ -8314,12 +8314,12 @@ fn p12_rls_admin_requires_superuser_end_to_end() {
             &RlsCatalog {
                 engine: &engine,
                 superuser: true,
-                user: "nusa-root",
+                user: "nusadb-root",
             },
         )
         .expect("analyze");
         let mut session = Session::new(&engine);
-        session.set_current_user("nusa-root");
+        session.set_current_user("nusadb-root");
         session.execute(plan(logical)).expect("execute");
     };
     run_super("ALTER POLICY own ON doc USING (id = 1)");
@@ -8600,9 +8600,9 @@ fn p12_session_functions_end_to_end() {
     ) {
         ExecutionResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0][0], Value::Text("nusa-root".to_owned()));
-            assert_eq!(rows[0][1], Value::Text("nusa-root".to_owned()));
-            assert_eq!(rows[0][2], Value::Text("nusa-root".to_owned()));
+            assert_eq!(rows[0][0], Value::Text("nusadb-root".to_owned()));
+            assert_eq!(rows[0][1], Value::Text("nusadb-root".to_owned()));
+            assert_eq!(rows[0][2], Value::Text("nusadb-root".to_owned()));
             assert_eq!(rows[0][3], Value::Bool(true));
             assert_eq!(rows[0][0], rows[1][0], "session user is stable across rows");
         },

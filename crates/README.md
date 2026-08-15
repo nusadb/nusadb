@@ -14,10 +14,10 @@ SQL engine, and wire protocol, with no third-party database core underneath.
 
 ```bash
 docker run -d --name nusadb -p 5678:5678 -v nusadb-data:/var/lib/nusadb \
-  -e NUSADB_USER=nusa-root -e NUSADB_PASSWORD='choose-a-password' \
+  -e NUSADB_USER=nusadb-root -e NUSADB_PASSWORD='choose-a-password' \
   nusadb/nusadb:0.1.0.Beta
 
-docker exec -it nusadb nusa-cli --host 127.0.0.1:5678
+docker exec -it nusadb nusadb-cli --host 127.0.0.1:5678
 ```
 
 Without `NUSADB_USER`/`NUSADB_PASSWORD` the server starts in **trust mode** — every client is
@@ -60,7 +60,7 @@ depends back on it, and there are no cycles.
 | `nusadb-sql` | L3 | Parser → analyzer → planner/optimizer → executor (vectorized, spill-to-disk) |
 | `nusadb-wire` | L2 | Nusa Wire Protocol — framing, TLS, SCRAM-SHA-256 |
 | `nusadb-server` | L1 | The server binary; composition root that wires every layer together |
-| `nusadb-cli` | L1 | `nusa-cli` interactive shell |
+| `nusadb-cli` | L1 | `nusadb-cli` interactive shell |
 | `nusadb-libnusa` | L1 | Native client library the drivers build on |
 | `nusadb-capi` | L1 | C ABI over `libnusa`, for FFI-based drivers |
 | `nusadb-sim` | test | Deterministic simulation adapters with fault injection |
@@ -70,7 +70,7 @@ depends back on it, and there are no cycles.
 ## Design
 
 ```
-L1 Client        nusa-cli · drivers (Rust/Python/Node/JDBC/Go)
+L1 Client        nusadb-cli · drivers (Rust/Python/Node/JDBC/Go)
 L2 Protocol      Nusa Wire Protocol — TCP, TLS, SCRAM-SHA-256
 L3 SQL Engine    Parser → Analyzer → Planner/Optimizer → Executor
 L4 Transactions  MVCC · lock manager · savepoints · isolation levels

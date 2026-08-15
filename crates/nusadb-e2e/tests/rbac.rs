@@ -128,7 +128,7 @@ impl Catalog for RbacCatalog<'_> {
 }
 
 /// The bootstrap superuser, used for every setup statement.
-const ROOT: &str = "nusa-root";
+const ROOT: &str = "nusadb-root";
 
 /// Run `sql` as `user`, returning the result or the error text.
 fn as_role(engine: &BtreeEngine, user: &str, sql: &str) -> Result<ExecutionResult, String> {
@@ -703,7 +703,7 @@ fn createrole_cannot_escalate_via_membership_in_a_superuser_role() {
 fn the_bootstrap_superuser_name_is_reserved() {
     let engine = fixture();
     root(&engine, "ALTER ROLE app CREATEROLE");
-    let err = as_role(&engine, "app", "CREATE ROLE \"nusa-root\"").unwrap_err();
+    let err = as_role(&engine, "app", "CREATE ROLE \"nusadb-root\"").unwrap_err();
     assert!(
         err.contains("reserved"),
         "creating a role named after the bootstrap superuser must be refused: {err}"

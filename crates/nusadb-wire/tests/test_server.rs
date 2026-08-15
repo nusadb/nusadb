@@ -2156,7 +2156,7 @@ async fn row_level_security_is_enforced_per_connection_user() {
     }
 
     // As the bootstrap superuser: create the table, enable RLS, and add an owner-scoped policy.
-    let (mut su, su_handle) = connect(&engine, "nusa-root").await;
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
     run_ok(&mut su, "CREATE TABLE doc (id INT NOT NULL, owner TEXT)").await;
     run_ok(
         &mut su,
@@ -2275,7 +2275,7 @@ async fn copy_is_refused_without_the_matching_table_privilege() {
         err
     }
 
-    let (mut su, su_handle) = connect(&engine, "nusa-root").await;
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
     assert!(
         outcome(&mut su, "CREATE TABLE secret (id INT NOT NULL)")
             .await
@@ -3717,7 +3717,7 @@ async fn describe_portal_authorizes_as_the_assumed_role() {
         &FrontendMessage::Startup {
             major: 1,
             minor: 0,
-            user: "nusa-root".to_owned(),
+            user: "nusadb-root".to_owned(),
             database: "d".to_owned(),
         }
         .encode()

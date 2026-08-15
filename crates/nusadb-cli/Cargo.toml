@@ -5,14 +5,14 @@ edition      = { workspace = true }
 license      = { workspace = true }
 authors      = { workspace = true }
 rust-version = { workspace = true }
-description  = "nusa-cli — interactive SQL shell for NusaDB"
+description  = "nusadb-cli — interactive SQL shell for NusaDB"
 repository   = { workspace = true }
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "nusa-cli"
+name = "nusadb-cli"
 path = "src/main.rs"
 
 [dependencies]
