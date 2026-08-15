@@ -582,6 +582,18 @@ fn eval_scalar_function(
                 .next()
                 .map_or(ast::Value::Null, ast::Value::Json)
         },
+        (F::JsonbPathQueryArray, [ast::Value::Json(s) | Text(s), Text(path)]) => {
+            let matches = crate::json::path_query(s, path).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "jsonb_path_query_array: unsupported or invalid jsonpath `{path}`"
+                ))
+            })?;
+            let items = matches
+                .iter()
+                .filter_map(|m| crate::json::parse(m))
+                .collect();
+            ast::Value::Json(crate::json::build_array(items))
+        },
         (F::JsonArrayLength, [ast::Value::Json(s) | Text(s)]) => {
             crate::json::array_length(s).map_or(ast::Value::Null, Int)
         },

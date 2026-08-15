@@ -1313,7 +1313,7 @@ pub(super) fn analyze_scalar_function(
         // k defaulting to 60.
         F::RrfScore => ScalarSig::Fixed(&[Int], &[Int], ColumnType::Float),
         // JSONB_PATH_QUERY_FIRST(json, path) → JSON (the first match, or NULL).
-        F::JsonbPathQueryFirst => {
+        F::JsonbPathQueryFirst | F::JsonbPathQueryArray => {
             ScalarSig::Fixed(&[ColumnType::Json, Text], &[], ColumnType::Json)
         },
         // JSONB_SET(target, path TEXT[], new_value [, create_missing BOOL]) → JSON and

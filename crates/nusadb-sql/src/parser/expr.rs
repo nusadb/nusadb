@@ -1320,6 +1320,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "jsonb_path_exists" | "json_path_exists" => F::JsonbPathExists,
         "jsonb_insert" | "json_insert" => F::JsonbInsert,
         "jsonb_path_query_first" | "json_path_query_first" => F::JsonbPathQueryFirst,
+        "jsonb_path_query_array" | "json_path_query_array" => F::JsonbPathQueryArray,
         "jsonb_exists" | "json_exists" => F::JsonbExists,
         "to_tsvector" => F::ToTsvector,
         "to_tsquery" => F::ToTsquery,

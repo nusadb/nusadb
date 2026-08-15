@@ -311,6 +311,35 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn jsonb_path_query_array_collects_matches() {
+    // jsonb_path_query_array(json, path) collects every jsonpath match into a JSON array (compact
+    // rendering), matching the reference engine; no match yields an empty array.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT jsonb_path_query_array('[1,2,3,4]', '$[*]')"
+        )),
+        vec![vec![Value::Json("[1,2,3,4]".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT jsonb_path_query_array('{\"items\":[{\"n\":10},{\"n\":20}]}', '$.items[*].n')"
+        )),
+        vec![vec![Value::Json("[10,20]".to_owned())]]
+    );
+    // No match → an empty JSON array.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT jsonb_path_query_array('{\"a\":1}', '$.z')"
+        )),
+        vec![vec![Value::Json("[]".to_owned())]]
+    );
+}
+
+#[test]
 fn json_object_agg_builds_a_json_object() {
     // json_object_agg(key, value) / jsonb_object_agg aggregate key/value pairs into a JSON object.
     // Binary JSON dedups keys (last value wins), matching the reference engine's jsonb_object_agg; a

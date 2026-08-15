@@ -833,6 +833,9 @@ pub enum ScalarFunc {
     /// `JSONB_PATH_QUERY_FIRST(json, path)` / `JSON_PATH_QUERY_FIRST(json, path)` — the first
     /// `jsonpath` match in the document as `JSON`, or `NULL` if there is none.
     JsonbPathQueryFirst,
+    /// `JSONB_PATH_QUERY_ARRAY(json, path)` / `JSON_PATH_QUERY_ARRAY(json, path)` — every `jsonpath`
+    /// match collected into a JSON array (an empty array when there is no match).
+    JsonbPathQueryArray,
     /// `JSONB_EXISTS(json, key)` — whether `key` is a top-level object key, an array string element,
     /// or equals a scalar string, as `BOOL`. The function form of the `?` operator, which the
     /// tokenizer cannot expose as an operator (it reserves `?` for parameters) (Q-jsonb-exists).
@@ -1074,6 +1077,7 @@ impl ScalarFunc {
             Self::JsonbPathExists => "jsonb_path_exists",
             Self::JsonbInsert => "jsonb_insert",
             Self::JsonbPathQueryFirst => "jsonb_path_query_first",
+            Self::JsonbPathQueryArray => "jsonb_path_query_array",
             Self::JsonbExists => "jsonb_exists",
             Self::ToTsvector => "to_tsvector",
             Self::ToTsquery => "to_tsquery",
