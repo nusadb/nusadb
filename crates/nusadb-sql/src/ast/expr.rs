@@ -777,10 +777,10 @@ pub enum ScalarFunc {
     UuidGenerateV4,
     /// `VERSION()` — the NusaDB server version string as `TEXT`. Niladic.
     Version,
-    /// `NUSA_TYPEOF(expr)` — the SQL type name of `expr` as `TEXT` (e.g. `integer`, `text`,
+    /// `NUSADB_TYPEOF(expr)` — the SQL type name of `expr` as `TEXT` (e.g. `integer`, `text`,
     /// `numeric`). NusaDB's static type-introspection builtin. The type is known statically, so the
     /// analyzer folds this to a constant `TEXT` literal; it never reaches the executor.
-    NusaTypeof,
+    NusadbTypeof,
     /// `CURRENT_DATABASE()` — the name of the current database as `TEXT`. Niladic; read from
     /// the session, stable for every row of one statement.
     CurrentDatabase,
@@ -1044,7 +1044,7 @@ impl ScalarFunc {
             Self::RangeUpperInf => "upper_inf",
             Self::UuidGenerateV4 => "uuid_generate_v4",
             Self::Version => "version",
-            Self::NusaTypeof => "nusa_typeof",
+            Self::NusadbTypeof => "nusadb_typeof",
             Self::CurrentDatabase => "current_database",
             Self::CurrentSchema => "current_schema",
             Self::JsonTypeof => "json_typeof",

@@ -528,7 +528,7 @@ impl Client {
     fn fresh_name(&mut self, prefix: &str) -> String {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        format!("nusa_{prefix}_{id}")
+        format!("nusadb_{prefix}_{id}")
     }
 
     async fn send(&mut self, msg: FrontendMessage) -> Result<()> {

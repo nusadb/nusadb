@@ -29,7 +29,7 @@ fn next_savepoint() -> String {
     SAVEPOINT_SEQ.with(|seq| {
         let n = seq.get();
         seq.set(n.wrapping_add(1));
-        format!("__nusa_exc_{n}")
+        format!("__nusadb_exc_{n}")
     })
 }
 

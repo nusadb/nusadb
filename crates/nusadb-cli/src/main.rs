@@ -77,10 +77,10 @@ fn host_name(host: &str) -> &str {
     host.rsplit_once(':').map_or(host, |(name, _port)| name)
 }
 
-/// Where to persist command history (`~/.nusa_history`), or `None` if the home dir is unknown.
+/// Where to persist command history (`~/.nusadb_history`), or `None` if the home dir is unknown.
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".nusa_history"))
+    Some(PathBuf::from(home).join(".nusadb_history"))
 }
 
 /// Drop a leading byte-order mark from SQL text.

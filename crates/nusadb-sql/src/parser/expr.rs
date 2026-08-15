@@ -1298,9 +1298,9 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "gen_random_uuid" | "uuid_generate_v4" => F::UuidGenerateV4,
         // System functions.
         "version" => F::Version,
-        // `nusa_typeof(expr)` — NusaDB's static type-introspection builtin; folded to the static
+        // `nusadb_typeof(expr)` — NusaDB's static type-introspection builtin; folded to the static
         // type name at analysis.
-        "nusa_typeof" => F::NusaTypeof,
+        "nusadb_typeof" => F::NusadbTypeof,
         "current_database" => F::CurrentDatabase,
         "current_schema" => F::CurrentSchema,
         // JSON inspection + construction scalars.

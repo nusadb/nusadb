@@ -62,7 +62,7 @@ exact in every case — the accumulator is a 128-bit integer for integer inputs.
 
 ## Inspecting a value's type
 
-`nusa_typeof(expr)` returns the static SQL type name of its argument as `TEXT` (`integer`,
+`nusadb_typeof(expr)` returns the static SQL type name of its argument as `TEXT` (`integer`,
 `text`, `numeric`, …). The type is known at analysis time, so the argument is never evaluated.
 
 ## Array parameters to `ANY` / `ALL`

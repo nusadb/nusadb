@@ -860,13 +860,13 @@ pub(super) fn analyze_scalar_function(
     // as a `ScalarFunction { Grouping, .. }` node. `rebase_onto_aggregation` later matches each
     // argument against the resolved `group_keys` and rewrites this node into the runtime bitmask
     // reference (or a constant `0` for a plain `GROUP BY`). Result is always `INT`.
-    // NUSA_TYPEOF(expr) — the static SQL type name of the argument (NusaDB's type-introspection
+    // NUSADB_TYPEOF(expr) — the static SQL type name of the argument (NusaDB's type-introspection
     // builtin). The type is known here, so fold the call to a constant TEXT literal; the executor
     // never sees this node.
-    if matches!(func, F::NusaTypeof) {
+    if matches!(func, F::NusadbTypeof) {
         let [arg] = args else {
             return Err(Error::ArityMismatch {
-                context: "function `nusa_typeof`".to_owned(),
+                context: "function `nusadb_typeof`".to_owned(),
                 expected: 1,
                 found: args.len(),
             });
@@ -1219,9 +1219,11 @@ pub(super) fn analyze_scalar_function(
         // GROUPING(...) is resolved by the early `matches!(func, F::Grouping)` branch above (it has no
         // fixed scalar signature), so it never reaches this table.
         F::Grouping => unreachable!("GROUPING is handled before the scalar signature table"),
-        // NUSA_TYPEOF is folded to a TEXT literal by the early `matches!(func, F::NusaTypeof)` branch
+        // NUSADB_TYPEOF is folded to a TEXT literal by the early `matches!(func, F::NusadbTypeof)` branch
         // above, so it never reaches this table either.
-        F::NusaTypeof => unreachable!("NUSA_TYPEOF is folded before the scalar signature table"),
+        F::NusadbTypeof => {
+            unreachable!("NUSADB_TYPEOF is folded before the scalar signature table")
+        },
         // The sequence built-ins arrive as generic function calls (`FunctionCall`) and are analyzed
         // by `analyze_sequence_function` before this typed-builtin table, so they never reach here.
         F::SequenceNext | F::SequenceCurrent | F::SequenceSet => {
