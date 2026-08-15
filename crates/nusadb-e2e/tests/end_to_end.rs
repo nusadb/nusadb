@@ -187,6 +187,62 @@ fn data_modifying_cte_reports_returning_column_metadata() {
 }
 
 #[test]
+fn volatile_cte_is_materialized_once_across_references() {
+    // A CTE whose body calls a volatile function must be computed once and its rows shared across
+    // every reference — not inlined per reference (which would re-evaluate the function at each site
+    // and hand out a different value). Both references below must therefore see the SAME row.
+    let engine = BtreeEngine::new();
+    // `nextval` gives a deterministic proof: materialized once, it advances the sequence a single
+    // time, so both references read the same value. Inlined, it would advance twice (1 then 2) and
+    // the two references would differ. Comma join — the second reference resolves via the join path.
+    run(&engine, "CREATE SEQUENCE s");
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS (SELECT nextval('s') AS n) SELECT a.n = b.n AS eq FROM c a, c b"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+    // Advanced exactly once, so the next value is 2 (not 3).
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('s')")),
+        vec![vec![Value::Int(2)]]
+    );
+    // `random()` over an explicit JOIN — the materialized CTE is scanned as a join input. Two
+    // independent draws would essentially never be equal, so equality proves a single shared draw.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS (SELECT random() AS r) SELECT a.r = b.r AS eq FROM c a JOIN c b ON true"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+    // A non-volatile CTE stays inlined and still produces the right answer across references.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS (SELECT 1 AS x) SELECT a.x + b.x AS s FROM c a, c b"
+        )),
+        vec![vec![Value::Int(2)]]
+    );
+    // An UNREFERENCED volatile CTE must be pruned, not executed — materializing runs the body once,
+    // so a naive "materialize every volatile CTE" would advance the sequence here. It must not: the
+    // next value stays 1 (a single-reference volatile CTE likewise stays inlined and runs once).
+    run(&engine, "CREATE SEQUENCE u");
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS (SELECT nextval('u') AS n) SELECT 1 AS one"
+        )),
+        vec![vec![Value::Int(1)]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('u')")),
+        vec![vec![Value::Int(1)]]
+    );
+}
+
+#[test]
 fn nusadb_typeof_reports_the_expression_type() {
     // `nusadb_typeof(expr)` returns the SQL type name of the expression. Folded to a constant at
     // analysis, so it works without a FROM and over column refs.

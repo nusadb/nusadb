@@ -1891,13 +1891,24 @@ fn run_modifying_ctes(
             PhysicalPlan::Insert(p) => super::dml::run_insert(p, engine, txn)?,
             PhysicalPlan::Update(p) => super::dml::run_update(p, engine, txn)?,
             PhysicalPlan::Delete(p) => super::dml::run_delete(p, engine, txn)?,
+            // A materialized (volatile) read CTE rides the same run-once machinery: its body runs a
+            // single time here and its output rows bind to the synthetic table, so every reference in
+            // the outer query reads the *same* rows — a volatile function (`random()`, `nextval()`)
+            // is evaluated once, matching the reference engine, rather than re-evaluated per inlined
+            // reference (which would hand out a different value at each site).
+            PhysicalPlan::Select(op, _est) => ExecutionResult::Rows {
+                columns: Vec::new(),
+                rows: execute_op(op, engine, txn)?,
+            },
             _ => {
                 return Err(Error::Unsupported(
-                    "a data-modifying CTE must be INSERT/UPDATE/DELETE".to_owned(),
+                    "internal: a run-once CTE must be INSERT/UPDATE/DELETE or a materialized SELECT"
+                        .to_owned(),
                 ));
             },
         };
-        // The analyzer requires a RETURNING clause, so the statement yields a row set; bind it.
+        // A data-modifying CTE has a RETURNING clause and a materialized SELECT yields its
+        // projection, so either way the plan produces the row set to bind.
         let rows = match result {
             ExecutionResult::Rows { rows, .. } => rows,
             _ => Vec::new(),

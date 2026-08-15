@@ -253,6 +253,13 @@ fn resolve_join_input(
                 let schema = cte_schema(&table.name, &table.column_aliases, plan)?;
                 Ok((schema, Some(plan.clone())))
             },
+            // A materialized (volatile) CTE resolves to its synthetic table just like the FROM base:
+            // the executor binds its run-once rows before the body, so this join input scans that
+            // table (no inline plan). Positional column aliases rename the exposed columns.
+            CteSource::Materialized => Ok((
+                synthetic_cte_join_schema(&cte.schema, &table.column_aliases)?,
+                None,
+            )),
             CteSource::Recursive | CteSource::Modifying => Err(Error::Unsupported(
                 "a recursive or data-modifying CTE referenced in a JOIN is not yet supported \
                  — reference it as the FROM base"
@@ -354,9 +361,12 @@ pub(super) fn resolve_from(
         // A CTE only shadows an unqualified reference.
         match &cte.source {
             CteSource::Inline(plan) => (cte.schema.clone(), Some((**plan).clone())),
-            // Recursive / data-modifying CTEs resolve to their synthetic table; the executor binds
-            // the rows (the fixpoint working set / the RETURNING rows) before the body runs.
-            CteSource::Recursive | CteSource::Modifying => (cte.schema.clone(), None),
+            // Recursive / data-modifying / materialized CTEs resolve to their synthetic table; the
+            // executor binds the rows (the fixpoint working set / the RETURNING rows / the run-once
+            // SELECT output) before the body runs.
+            CteSource::Recursive | CteSource::Modifying | CteSource::Materialized => {
+                (cte.schema.clone(), None)
+            },
         }
     } else if let Some(view) = crate::planner::InfoSchemaView::from_full_name(&from.base.name) {
         // An `information_schema.{tables,columns,...}` reference resolves to a synthetic table
@@ -863,7 +873,9 @@ pub(super) fn analyze_set_operation(
     // the CTE. A recursive / data-modifying CTE has no place to carry its def on the set-operation
     // envelope, so reject it loudly rather than drop it; a plain inline CTE inlines into each branch.
     let outer = visible_ctes();
-    let (own_ctes, recursive, modifying) = analyze_ctes(&so.with, catalog, &outer)?;
+    // A set operation has no single FROM to count CTE references against (each branch carries its
+    // own), so volatile CTEs on it stay `Inline` — pass `None`.
+    let (own_ctes, recursive, modifying) = analyze_ctes(&so.with, catalog, &outer, None)?;
     if !recursive.is_empty() || !modifying.is_empty() {
         return Err(Error::Unsupported(
             "a recursive or data-modifying WITH on a UNION / INTERSECT / EXCEPT is not yet supported"
@@ -1119,7 +1131,8 @@ fn analyze_select_scoped(
     // Resolve `WITH` CTEs so the FROM base can reference them. Recursive CTEs also
     // yield fixpoint defs threaded into the plan and materialized at execution; data-modifying CTEs
     // yield run-once defs whose RETURNING rows are bound to the synthetic table.
-    let (own_ctes, recursive_ctes, modifying_ctes) = analyze_ctes(&sel.with, catalog, outer_ctes)?;
+    let (own_ctes, recursive_ctes, modifying_ctes) =
+        analyze_ctes(&sel.with, catalog, outer_ctes, sel.from.as_ref())?;
     // The CTEs visible to this block's FROM: its own (which shadow same-named enclosing ones), then
     // the enclosing `outer_ctes`.
     let ctes = combine_ctes(own_ctes, outer_ctes);
@@ -1549,6 +1562,15 @@ enum CteSource {
     /// resolves to the synthetic table id in its `schema`, bound to the statement's RETURNING rows.
     /// The def (the DML plan) is carried separately in [`SelectPlan::modifying_ctes`].
     Modifying,
+    /// Materialized: a non-recursive CTE whose body contains a volatile function (`random()`,
+    /// `nextval()`, …). Inlining would clone the body per reference and re-evaluate the function at
+    /// each site, so a multiply-referenced CTE would hand out a different value at every reference —
+    /// a divergence from the reference engine, which computes the CTE once. It therefore rides the
+    /// run-once machinery: the body is planned as a `SELECT` def carried in
+    /// [`SelectPlan::modifying_ctes`], run a single time, and its rows bound to the synthetic table id
+    /// in its `schema`. A non-volatile CTE stays [`CteSource::Inline`] so predicate/projection
+    /// pushdown into its body is preserved.
+    Materialized,
 }
 
 /// Combine a block's own resolved CTEs (`own`, which take precedence) with the enclosing `outer`
@@ -1566,6 +1588,10 @@ fn combine_ctes(mut own: Vec<ResolvedCte>, outer: &[ResolvedCte]) -> Vec<Resolve
 /// recursive CTEs yield a fixpoint def materialized at execution. A CTE body sees the earlier
 /// siblings in this clause plus any enclosing `outer_ctes`, so `WITH a …, b AS (SELECT … FROM a)`
 /// resolves (a set-operation / recursive body does not yet see siblings — a follow-up).
+///
+/// `body_from` is the consuming query's `FROM` clause, used only to decide whether a volatile CTE is
+/// referenced enough times to require materialization (see the routing at the call site); `None`
+/// leaves every volatile CTE `Inline` (e.g. for a set-operation, whose branches carry their own FROM).
 #[allow(
     clippy::type_complexity,
     reason = "the three CTE kinds (inline/recursive/modifying) are returned together; a named tuple \
@@ -1575,6 +1601,7 @@ fn analyze_ctes(
     with: &[ast::Cte],
     catalog: &dyn Catalog,
     outer_ctes: &[ResolvedCte],
+    body_from: Option<&ast::FromClause>,
 ) -> Result<(Vec<ResolvedCte>, Vec<RecursiveCteDef>, Vec<ModifyingCteDef>), Error> {
     let mut resolved: Vec<ResolvedCte> = Vec::with_capacity(with.len());
     let mut recursive_defs: Vec<RecursiveCteDef> = Vec::new();
@@ -1627,14 +1654,98 @@ fn analyze_ctes(
                 analyze_set_op_table(so, catalog)?
             },
         };
-        let schema = cte_schema(&cte.name, &cte.columns, &plan)?;
-        resolved.push(ResolvedCte {
-            name: cte.name.clone(),
-            schema,
-            source: CteSource::Inline(Box::new(plan)),
-        });
+        let mut schema = cte_schema(&cte.name, &cte.columns, &plan)?;
+        // Materialize a volatile CTE only when it is referenced *more than once* in the consuming
+        // query's FROM. Materializing means running the body once at execution, so an UNREFERENCED
+        // CTE must stay `Inline` — the reference engine prunes an unreferenced non-data-modifying CTE
+        // and never runs it (a volatile `nextval()` would otherwise advance the sequence). A CTE
+        // referenced exactly once also stays `Inline`: it executes once either way, and inlining keeps
+        // predicate/projection pushdown into its body. Only 2+ references diverge (each inlined copy
+        // re-evaluates the volatile function), so only they need the run-once treatment. The count
+        // covers top-level FROM base + joins — the canonical multiply-referenced shape; a reference
+        // reached only through a subquery or a later sibling CTE stays `Inline` (unchanged behavior).
+        if cte_body_is_volatile(&plan) && count_from_table_refs(body_from, &cte.name) >= 2 {
+            // Give it a synthetic table id — shared with the data-modifying CTE id space, keyed by the
+            // run-once def count — and carry the body as a `SELECT` def in `modifying_defs` so the
+            // planner wraps it in the same run-once operator (see [`CteSource::Materialized`]).
+            schema.id = synthetic_modifying_table_id(modifying_defs.len());
+            modifying_defs.push(ModifyingCteDef {
+                id: schema.id,
+                plan: Box::new(crate::planner::LogicalPlan::Select(Box::new(plan))),
+            });
+            resolved.push(ResolvedCte {
+                name: cte.name.clone(),
+                schema,
+                source: CteSource::Materialized,
+            });
+        } else {
+            resolved.push(ResolvedCte {
+                name: cte.name.clone(),
+                schema,
+                source: CteSource::Inline(Box::new(plan)),
+            });
+        }
     }
     Ok((resolved, recursive_defs, modifying_defs))
+}
+
+/// Whether a CTE body contains a volatile scalar function — one whose value can differ between
+/// evaluations (`random()`, `nextval()`, …) — so a multiply-referenced CTE must be materialized
+/// (computed once) rather than inlined per reference. Reuses the plan-cache volatility predicate over
+/// the plan's `Debug` rendering, which names every scalar function the plan contains: conservative for
+/// its marker set (a false positive only over-materializes, which stays correct and matches the
+/// reference engine's blocking of pushdown through a materialized CTE).
+fn cte_body_is_volatile(plan: &SelectPlan) -> bool {
+    crate::executor::rendered_plan_is_volatile(&format!("{plan:?}"))
+}
+
+/// Count how many times an unqualified name appears as a plain table reference in a `FROM` clause —
+/// its base plus each join — ignoring derived tables (subquery / `VALUES` / set-op) and schema-
+/// qualified names, which never denote a CTE. Used to decide whether a volatile CTE is referenced
+/// often enough to need materializing; a reference reached only through a subquery or a later sibling
+/// CTE is deliberately not counted (those cases stay `Inline`).
+fn count_from_table_refs(from: Option<&ast::FromClause>, name: &str) -> usize {
+    let is_cte_ref = |t: &ast::TableRef| {
+        t.schema.is_none()
+            && t.subquery.is_none()
+            && t.values.is_none()
+            && t.set_op.is_none()
+            && t.name == name
+    };
+    let Some(from) = from else { return 0 };
+    usize::from(is_cte_ref(&from.base)) + from.joins.iter().filter(|j| is_cte_ref(&j.table)).count()
+}
+
+/// Re-expose a materialized CTE's synthetic schema for a `JOIN` reference: keep the synthetic table
+/// id (so the join input scans the run-once rows) while applying any positional column aliases.
+fn synthetic_cte_join_schema(
+    schema: &TableSchema,
+    column_aliases: &[String],
+) -> Result<TableSchema, Error> {
+    if column_aliases.is_empty() {
+        return Ok(schema.clone());
+    }
+    if column_aliases.len() != schema.columns.len() {
+        return Err(Error::Unsupported(format!(
+            "CTE reference declares {} column alias(es) but the CTE exposes {}",
+            column_aliases.len(),
+            schema.columns.len()
+        )));
+    }
+    let columns = schema
+        .columns
+        .iter()
+        .zip(column_aliases)
+        .map(|(def, alias)| ColumnDef {
+            name: alias.clone(),
+            ty: def.ty,
+            nullable: def.nullable,
+        })
+        .collect();
+    Ok(TableSchema {
+        columns,
+        ..schema.clone()
+    })
 }
 
 /// The target table a data-modifying statement writes (guard / synthetic schema).

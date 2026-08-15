@@ -841,6 +841,15 @@ fn plan_is_volatile(rendered: &str) -> bool {
         .any(|marker| rendered.contains(marker))
 }
 
+/// Whether a plan's `Debug` rendering names any volatile scalar function — used both here (plan-cache
+/// eligibility) and by the analyzer to decide whether a CTE must be materialized (computed once)
+/// rather than inlined per reference. The `Debug` string names every `ScalarFunc` variant the plan
+/// contains, so this is conservative: a false positive only over-materializes (still correct); there
+/// are no false negatives.
+pub(crate) fn rendered_plan_is_volatile(rendered: &str) -> bool {
+    plan_is_volatile(rendered)
+}
+
 impl<'engine> Session<'engine> {
     /// Open a new session with no active transaction.
     pub fn new(engine: &'engine dyn StorageEngine) -> Self {
