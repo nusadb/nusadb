@@ -491,12 +491,74 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
         return result;
     }
     let dialect = NusaParserDialect;
-    let mut statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| Error::Syntax(e.to_string()))?;
+    // `WITH x AS [NOT] MATERIALIZED (...)`: sqlparser only parses the CTE materialization keyword for
+    // one specific built-in dialect (a hardcoded `dialect_of!` check a custom `Dialect` cannot opt
+    // into), so it would reject the keyword here. The hint never changes results — see `convert_cte` —
+    // so tokenize, drop the hint keyword, and parse the remaining tokens as an ordinary CTE.
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    strip_cte_materialized_hint(&mut tokens);
+    let mut statements = Parser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
     match statements.len() {
         1 => convert_statement(statements.remove(0)),
         0 => Err(Error::Empty),
         n => Err(Error::MultipleStatements(n)),
+    }
+}
+
+/// Remove the CTE materialization hint (`MATERIALIZED` / `NOT MATERIALIZED`) that appears between a
+/// CTE's `AS` and its opening `(`, so the query parses as an ordinary CTE (the hint carries no effect
+/// — see [`convert_cte`]). Only the exact `AS [NOT] MATERIALIZED (` shape is touched: the keyword must
+/// be immediately preceded (ignoring whitespace) by `AS`, or by `NOT` which is itself preceded by
+/// `AS`, and immediately followed by `(`. `CREATE/DROP/REFRESH MATERIALIZED VIEW` never matches (its
+/// keyword follows `CREATE`/`VIEW`, not `AS`, and is not followed by `(`).
+fn strip_cte_materialized_hint(tokens: &mut Vec<TokenWithSpan>) {
+    use sqlparser::keywords::Keyword;
+    // `.get`-based (never index) — this workspace denies `indexing_slicing` in production code.
+    let is_kw = |t: Option<&TokenWithSpan>, kw: Keyword| matches!(t, Some(t) if matches!(&t.token, Token::Word(w) if w.keyword == kw));
+    // Cheap guard: only the rare CTE hint needs the O(n) walk below.
+    if !tokens.iter().any(|t| is_kw(Some(t), Keyword::MATERIALIZED)) {
+        return;
+    }
+    let is_nonws = |t: Option<&TokenWithSpan>| matches!(t, Some(t) if !matches!(t.token, Token::Whitespace(_)));
+    let next_nonws = |toks: &[TokenWithSpan], from: usize| {
+        (from + 1..toks.len()).find(|&j| is_nonws(toks.get(j)))
+    };
+    let prev_nonws =
+        |toks: &[TokenWithSpan], from: usize| (0..from).rev().find(|&j| is_nonws(toks.get(j)));
+    let mut i = 0;
+    while i < tokens.len() {
+        if is_kw(tokens.get(i), Keyword::MATERIALIZED)
+            && next_nonws(tokens, i)
+                .is_some_and(|j| tokens.get(j).is_some_and(|t| t.token == Token::LParen))
+        {
+            // The keyword qualifies a CTE only when preceded by `AS` (bare `MATERIALIZED`) or by
+            // `NOT` that is itself preceded by `AS` (`NOT MATERIALIZED`). Collect the indices to drop.
+            let drop: Option<Vec<usize>> = match prev_nonws(tokens, i) {
+                Some(p) if is_kw(tokens.get(p), Keyword::AS) => Some(vec![i]),
+                Some(p)
+                    if is_kw(tokens.get(p), Keyword::NOT)
+                        && prev_nonws(tokens, p)
+                            .is_some_and(|pp| is_kw(tokens.get(pp), Keyword::AS)) =>
+                {
+                    Some(vec![p, i])
+                },
+                _ => None,
+            };
+            if let Some(mut idxs) = drop {
+                idxs.sort_unstable();
+                for idx in idxs.into_iter().rev() {
+                    tokens.remove(idx);
+                }
+                // The list shifted; re-examine from the same position.
+                continue;
+            }
+        }
+        i += 1;
     }
 }
 

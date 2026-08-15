@@ -243,6 +243,60 @@ fn volatile_cte_is_materialized_once_across_references() {
 }
 
 #[test]
+fn cte_materialized_hint_is_accepted_and_data_correct() {
+    // `WITH … [NOT] MATERIALIZED` is accepted and treated as a planner hint that never changes
+    // results — matching the reference engine's observable behavior: it always materializes a volatile
+    // CTE (so `NOT MATERIALIZED` does NOT inline one) and always prunes an unreferenced CTE (so
+    // `MATERIALIZED` does NOT force one to run). For a non-volatile CTE, materialize vs inline yields
+    // identical data either way.
+    let engine = BtreeEngine::new();
+    // NOT MATERIALIZED does not inline a volatile multi-reference CTE: one shared draw, so a.r = b.r.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS NOT MATERIALIZED (SELECT random() AS r) SELECT (a.r = b.r) AS eq FROM c a, c b"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+    // MATERIALIZED on the same shape: also one shared draw.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS MATERIALIZED (SELECT random() AS r) SELECT (a.r = b.r) AS eq FROM c a, c b"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+    // MATERIALIZED does not force execution of an UNREFERENCED CTE — the sequence is not advanced.
+    run(&engine, "CREATE SEQUENCE sm");
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS MATERIALIZED (SELECT nextval('sm') AS n) SELECT 1 AS one"
+        )),
+        vec![vec![Value::Int(1)]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('sm')")),
+        vec![vec![Value::Int(1)]]
+    );
+    // A non-volatile CTE with either hint returns the right data across references.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS MATERIALIZED (SELECT 1 AS x) SELECT a.x + b.x AS s FROM c a, c b"
+        )),
+        vec![vec![Value::Int(2)]]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "WITH c AS NOT MATERIALIZED (SELECT 1 AS x) SELECT a.x + b.x AS s FROM c a, c b"
+        )),
+        vec![vec![Value::Int(2)]]
+    );
+}
+
+#[test]
 fn nusadb_typeof_reports_the_expression_type() {
     // `nusadb_typeof(expr)` returns the SQL type name of the expression. Folded to a constant at
     // analysis, so it works without a FROM and over column refs.

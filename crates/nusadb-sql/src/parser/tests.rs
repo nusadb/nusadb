@@ -806,6 +806,25 @@ fn create_materialized_view_parses_with_flag() {
 }
 
 #[test]
+fn cte_materialized_hint_parses_as_ordinary_cte() {
+    // `WITH x AS [NOT] MATERIALIZED (...)` — the hint keyword is accepted and dropped, so the query
+    // parses as an ordinary CTE (the hint never changes results; sqlparser only parses it for one
+    // specific built-in dialect). `CREATE MATERIALIZED VIEW` is untouched — see
+    // `create_materialized_view_parses_with_flag`.
+    for sql in [
+        "WITH c AS (SELECT 1 AS x) SELECT x FROM c",
+        "WITH c AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM c",
+        "WITH c AS NOT MATERIALIZED (SELECT 1 AS x) SELECT x FROM c",
+    ] {
+        let ast::Statement::Select(s) = ok(sql) else {
+            panic!("expected Select for {sql:?}");
+        };
+        assert_eq!(s.with.len(), 1, "one CTE for {sql:?}");
+        assert_eq!(s.with[0].name, "c", "CTE name for {sql:?}");
+    }
+}
+
+#[test]
 fn drop_view_plain_and_if_exists() {
     let ast::Statement::DropView(d) = ok("DROP VIEW v") else {
         panic!("expected DropView");
@@ -1512,13 +1531,6 @@ fn with_recursive_is_rejected() {
         parse("WITH RECURSIVE cte AS (SELECT 1) SELECT * FROM cte"),
         Ok(ast::Statement::Select(_)),
     ));
-}
-
-#[test]
-fn with_materialized_is_rejected() {
-    // Syntax varies by dialect; either a parse error or Unsupported is acceptable —
-    // what matters is that it does NOT silently succeed with materialization ignored.
-    assert!(parse("WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte").is_err());
 }
 
 #[test]

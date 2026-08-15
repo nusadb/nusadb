@@ -126,8 +126,12 @@ pub(super) fn convert_with(with: Option<sql::With>) -> Result<Vec<ast::Cte>, Err
 
 /// Convert one sqlparser `Cte` into the internal [`ast::Cte`] (non-recursive recursive).
 pub(super) fn convert_cte(cte: sql::Cte, recursive: bool) -> Result<ast::Cte, Error> {
-    // `AS [NOT] MATERIALIZED` is an inlining hint; NusaDB evaluates every CTE once (the
-    // materialized semantic), so both spellings are accepted and the hint carries no effect.
+    // `AS [NOT] MATERIALIZED` is a planner hint that never changes results, so both spellings are
+    // accepted and the hint carries no effect. A CTE is inlined by default and materialized (run once)
+    // only when its body is volatile and it is referenced more than once — see the analyzer. This
+    // matches the reference engine's observable behavior: it always materializes a volatile CTE (so
+    // `NOT MATERIALIZED` never inlines one) and always prunes an unreferenced CTE (so `MATERIALIZED`
+    // never forces one to run); for a non-volatile CTE, materialize vs inline yields identical data.
     if cte.from.is_some() {
         return unsupported("CTE with a FROM alias");
     }
