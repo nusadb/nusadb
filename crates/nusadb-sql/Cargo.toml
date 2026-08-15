@@ -48,3 +48,9 @@ harness = false
 [[bench]]
 name    = "autocommit_retry"
 harness = false
+
+# Bench: HNSW graph build time vs corpus size (+ search latency) — the perf gate for any change to
+# the vector-index construction path. Recall is gated separately by the hnsw.rs recall tests.
+[[bench]]
+name    = "hnsw_build"
+harness = false
