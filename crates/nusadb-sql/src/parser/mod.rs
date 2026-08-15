@@ -115,6 +115,13 @@ impl Dialect for NusaParserDialect {
         true
     }
 
+    fn supports_explain_with_utility_options(&self) -> bool {
+        // `EXPLAIN (FORMAT JSON, ANALYZE, VERBOSE) ...` — the parenthesized option list. Without this
+        // only the bare `EXPLAIN FORMAT JSON` spelling parses; the converter folds the option list
+        // into the same `ExplainOptions`.
+        true
+    }
+
     fn supports_select_wildcard_except(&self) -> bool {
         // Must be true (same as GenericDialect) so that `SELECT * EXCEPT (col)`
         // is tokenised as a wildcard decoration that our converter can reject with
@@ -2745,6 +2752,64 @@ fn convert_deallocate(name: &sql::Ident) -> ast::Statement {
 // A flat one-arm-per-statement-kind dispatch: its length scales with the
 // breadth of the SQL surface, not with branching depth (each arm just
 // destructures and delegates). The line cap is the wrong signal here.
+/// Fold one `EXPLAIN (...)` utility option into `out`. Supports `FORMAT <text|json>`, `ANALYZE`, and
+/// `VERBOSE` (each optionally with a boolean argument); any other option is a loud error rather than
+/// silently ignored — matching how the dedicated-field spellings are handled.
+fn apply_explain_option(
+    opt: &sql::UtilityOption,
+    out: &mut ast::ExplainOptions,
+) -> Result<(), Error> {
+    match opt.name.value.to_ascii_uppercase().as_str() {
+        "FORMAT" => {
+            let word = explain_option_word(opt).ok_or_else(|| {
+                Error::Unsupported("EXPLAIN (FORMAT ...) requires a format name".to_owned())
+            })?;
+            out.format = match word.to_ascii_uppercase().as_str() {
+                "TEXT" => ast::ExplainFormat::Text,
+                "JSON" => ast::ExplainFormat::Json,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "EXPLAIN (FORMAT {other}) is not supported; only TEXT and JSON"
+                    )));
+                },
+            };
+        },
+        "ANALYZE" => out.analyze = explain_option_truthy(opt),
+        "VERBOSE" => out.verbose = explain_option_truthy(opt),
+        other => {
+            return Err(Error::Unsupported(format!(
+                "EXPLAIN option \"{other}\" is not supported"
+            )));
+        },
+    }
+    Ok(())
+}
+
+/// The identifier / string argument of an `EXPLAIN` utility option — e.g. the `JSON` in `FORMAT JSON`.
+fn explain_option_word(opt: &sql::UtilityOption) -> Option<String> {
+    match &opt.arg {
+        Some(sql::Expr::Identifier(ident)) => Some(fold_ident(ident)),
+        Some(sql::Expr::Value(v)) => match &v.value {
+            sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => {
+                Some(s.clone())
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a boolean-valued `EXPLAIN` option (`ANALYZE` / `VERBOSE`) is on: a bare option is on, an
+/// explicit `true`/`on` is on, `false`/`off` is off.
+fn explain_option_truthy(opt: &sql::UtilityOption) -> bool {
+    match &opt.arg {
+        Some(sql::Expr::Value(v)) => matches!(&v.value, sql::Value::Boolean(true)),
+        Some(sql::Expr::Identifier(ident)) => matches!(fold_ident(ident).as_str(), "true" | "on"),
+        // A bare option (no arg) or any other shape reads as on.
+        _ => true,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "flat per-statement dispatch; grows with the SQL surface, not with complexity"
@@ -2987,6 +3052,7 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
             analyze,
             verbose,
             format,
+            options,
             ..
         } => {
             // FORMAT TEXT (default) and JSON are supported; other formats (e.g. GRAPHVIZ) are
@@ -2995,24 +3061,26 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
             let format = format.map(|kind| match kind {
                 sql::AnalyzeFormatKind::Keyword(f) | sql::AnalyzeFormatKind::Assignment(f) => f,
             });
-            let format = match format {
-                None | Some(sql::AnalyzeFormat::TEXT) => ast::ExplainFormat::Text,
-                Some(sql::AnalyzeFormat::JSON) => ast::ExplainFormat::Json,
-                Some(other) => {
-                    return Err(Error::Unsupported(format!(
-                        "EXPLAIN (FORMAT {other}) is not supported; only TEXT and JSON"
-                    )));
+            let mut opts = ast::ExplainOptions {
+                analyze,
+                verbose,
+                format: match format {
+                    None | Some(sql::AnalyzeFormat::TEXT) => ast::ExplainFormat::Text,
+                    Some(sql::AnalyzeFormat::JSON) => ast::ExplainFormat::Json,
+                    Some(other) => {
+                        return Err(Error::Unsupported(format!(
+                            "EXPLAIN (FORMAT {other}) is not supported; only TEXT and JSON"
+                        )));
+                    },
                 },
             };
+            // The parenthesized `EXPLAIN (FORMAT JSON, ANALYZE, VERBOSE)` form carries its settings as
+            // a utility-option list rather than the dedicated fields; fold each into `opts`.
+            for opt in options.into_iter().flatten() {
+                apply_explain_option(&opt, &mut opts)?;
+            }
             let inner = convert_statement(*statement)?;
-            Ok(ast::Statement::Explain(
-                Box::new(inner),
-                ast::ExplainOptions {
-                    analyze,
-                    verbose,
-                    format,
-                },
-            ))
+            Ok(ast::Statement::Explain(Box::new(inner), opts))
         },
         sql::Statement::Analyze(a) => {
             if a.compute_statistics {

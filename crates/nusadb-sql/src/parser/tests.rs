@@ -1415,6 +1415,28 @@ fn explain_format_json_parses_and_graphviz_rejected() {
         parse("EXPLAIN FORMAT GRAPHVIZ SELECT 1"),
         Err(Error::Unsupported(_))
     ));
+
+    // The parenthesized option list (the standard `EXPLAIN (FORMAT JSON, ANALYZE, VERBOSE)` form)
+    // folds into the same ExplainOptions.
+    let ast::Statement::Explain(_, opts) = ok("EXPLAIN (FORMAT JSON) SELECT 1") else {
+        panic!("expected Explain");
+    };
+    assert_eq!(opts.format, ast::ExplainFormat::Json);
+    let ast::Statement::Explain(_, opts) = ok("EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT 1")
+    else {
+        panic!("expected Explain");
+    };
+    assert!(opts.analyze && opts.verbose);
+    assert_eq!(opts.format, ast::ExplainFormat::Json);
+    // An unsupported format or an unknown option in the parenthesized list is rejected loudly.
+    assert!(matches!(
+        parse("EXPLAIN (FORMAT GRAPHVIZ) SELECT 1"),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        parse("EXPLAIN (BOGUS) SELECT 1"),
+        Err(Error::Unsupported(_))
+    ));
 }
 
 // --- WITH / CTE -----------------------------------------------

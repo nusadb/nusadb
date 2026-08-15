@@ -203,8 +203,10 @@ fn explain_analyze_rejects_data_modifying_statements() {
 }
 
 #[test]
-fn explain_non_text_format_is_rejected() {
-    // Structured FORMAT output is a follow-up; the parser must reject it rather than
-    // silently producing text. (Either an Unsupported or a parser Syntax error is acceptable.)
-    assert!(parse("EXPLAIN (FORMAT JSON) SELECT 1").is_err());
+fn explain_format_json_is_accepted_and_unknown_formats_rejected() {
+    // FORMAT JSON is supported in both the bare and parenthesized spellings; an unsupported format
+    // is rejected loudly rather than silently producing text.
+    assert!(parse("EXPLAIN (FORMAT JSON) SELECT 1").is_ok());
+    assert!(parse("EXPLAIN FORMAT JSON SELECT 1").is_ok());
+    assert!(parse("EXPLAIN (FORMAT GRAPHVIZ) SELECT 1").is_err());
 }
