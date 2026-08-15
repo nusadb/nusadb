@@ -682,6 +682,9 @@ pub enum ScalarFunc {
     /// `ARRAY_LENGTH(arr, dim)` — the length of array `arr` along dimension `dim` as `INT`; `NULL`
     /// for an empty array or `dim ≠ 1` (only 1-D arrays are supported).
     ArrayLength,
+    /// `ARRAY_FILL(value, dims)` — a one-dimensional array of `value` repeated `dims[1]` times (only
+    /// 1-D `dims` supported); a NULL `value` fills with NULLs. The result element type is `value`'s.
+    ArrayFill,
     /// `ARRAY_LOWER(arr, dim)` — the lower bound of array `arr` along dimension `dim` (always `1` for
     /// a non-empty 1-D array), as `INT`; `NULL` for an empty array or `dim ≠ 1`.
     ArrayLower,
@@ -1015,6 +1018,7 @@ impl ScalarFunc {
             Self::Least => "least",
             Self::Cardinality => "cardinality",
             Self::ArrayLength => "array_length",
+            Self::ArrayFill => "array_fill",
             Self::ArrayLower => "array_lower",
             Self::ArrayUpper => "array_upper",
             Self::ArrayDims => "array_dims",

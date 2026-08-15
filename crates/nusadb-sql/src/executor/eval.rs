@@ -403,6 +403,9 @@ fn eval_scalar_function(
             return eval_array_mutate(func, args, row);
         },
         F::ArrayReplace => return eval_array_replace(args, row),
+        // ARRAY_FILL stores its `value` (possibly NULL) into every slot, so it must see a NULL value
+        // rather than propagate it away.
+        F::ArrayFill => return eval_array_fill(args, row),
         // FORMAT substitutes its arguments into specifiers itself (a NULL renders per specifier, not
         // by propagating), so it skips the NULL-strict collection (B-fn).
         F::Format => return eval_format(args, row),
@@ -1676,6 +1679,49 @@ fn regexp_split_to_array(source: &str, pattern: &str, flags: &str) -> Result<ast
 /// `QUOTE_NULLABLE(x)` — like `quote_literal`, but a NULL argument returns the unquoted text `NULL`
 /// so it can be spliced into dynamic SQL. A non-NULL value is rendered to text and single-quoted
 /// (embedded quotes doubled), exactly as `quote_literal`.
+/// `ARRAY_FILL(value, dims)` — a one-dimensional array of `value` repeated `dims[1]` times. NusaDB
+/// arrays are one-dimensional, so `dims` must have exactly one element; a size below zero or above the
+/// reference engine's cap is rejected, and a NULL `value` fills the slots with NULLs. NULL `dims`
+/// yields NULL.
+fn eval_array_fill(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
+    // The reference engine's maximum number of array elements.
+    const MAX_ARRAY_LEN: i64 = 134_217_727;
+    let [value_arg, dims_arg] = args else {
+        return Err(Error::Unsupported(
+            "array_fill() expects 2 arguments".to_owned(),
+        ));
+    };
+    let value = eval(value_arg, row)?;
+    let ast::Value::Array(dims) = eval(dims_arg, row)? else {
+        return Ok(ast::Value::Null);
+    };
+    if dims.len() != 1 {
+        return Err(Error::Unsupported(
+            "array_fill(): only one-dimensional arrays are supported".to_owned(),
+        ));
+    }
+    let n = match dims.first() {
+        Some(ast::Value::Int(n)) => *n,
+        Some(ast::Value::Null) => {
+            return Err(Error::Unsupported(
+                "array_fill(): dimension must not be NULL".to_owned(),
+            ));
+        },
+        _ => {
+            return Err(Error::Unsupported(
+                "array_fill(): dimension must be an integer".to_owned(),
+            ));
+        },
+    };
+    if !(0..=MAX_ARRAY_LEN).contains(&n) {
+        return Err(Error::Unsupported(format!(
+            "array size exceeds the maximum allowed ({MAX_ARRAY_LEN})"
+        )));
+    }
+    let count = usize::try_from(n).unwrap_or(0);
+    Ok(ast::Value::Array(vec![value; count]))
+}
+
 fn eval_quote_nullable(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let [arg] = args else {
         return Err(Error::Unsupported(

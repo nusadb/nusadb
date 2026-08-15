@@ -964,6 +964,11 @@ pub(super) fn analyze_scalar_function(
     ) {
         return analyze_array_function(func, args, scope, catalog, aggregates);
     }
+    // ARRAY_FILL(value, dims) builds an array whose element type is the first argument's, so its
+    // result type is polymorphic — not expressible with the fixed table.
+    if matches!(func, F::ArrayFill) {
+        return analyze_array_fill(args, scope, catalog, aggregates);
+    }
     // ARRAY_APPEND/PREPEND/CAT/POSITION/REMOVE take a polymorphic array — not table-shaped.
     if matches!(
         func,
@@ -1445,6 +1450,7 @@ pub(super) fn analyze_scalar_function(
         | F::Cardinality
         | F::ArrayDims
         | F::ArrayLength
+        | F::ArrayFill
         | F::ArrayLower
         | F::ArrayUpper
         | F::ArrayToString
@@ -1681,6 +1687,47 @@ fn analyze_row_to_json(
 /// Analyze `ARRAY_LENGTH(arr, dim)` / `ARRAY_TO_STRING(arr, sep)`. The first argument is an
 /// array of any element type; the second is an `INT` dimension (`ARRAY_LENGTH`, result `INT`) or a
 /// `TEXT` separator (`ARRAY_TO_STRING`, result `TEXT`).
+/// `ARRAY_FILL(value, dims)` — a one-dimensional array of `value` repeated `dims[1]` times. The
+/// element type is `value`'s type (so the result is polymorphic), and `dims` is a 1-D `INT[]` (NusaDB
+/// arrays are one-dimensional). A bare untyped NULL `value` has no array element type and is rejected,
+/// matching the reference engine's "could not determine polymorphic type".
+fn analyze_array_fill(
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let [value_expr, dims_expr] = args else {
+        return Err(Error::Unsupported(format!(
+            "array_fill() expects 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let value = analyze_expr_agg(value_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+    let Some(array_elem) = nusadb_core::engine::ArrayElem::from_column_type(value.ty) else {
+        return Err(Error::Unsupported(format!(
+            "array_fill() does not support an element of type {:?}",
+            value.ty
+        )));
+    };
+    let dims_ty = ColumnType::Array(nusadb_core::engine::ArrayElem::Int);
+    let dims = analyze_expr_agg(dims_expr, scope, catalog, Some(dims_ty), aggregates)?;
+    if dims.ty != dims_ty && !is_null_literal(&dims) {
+        return Err(Error::TypeMismatch {
+            context: "array_fill() dimensions".to_owned(),
+            expected: dims_ty,
+            found: dims.ty,
+        });
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func: ast::ScalarFunc::ArrayFill,
+            args: vec![value, dims],
+        },
+        ty: ColumnType::Array(array_elem),
+    })
+}
+
 fn analyze_array_function(
     func: ast::ScalarFunc,
     args: &[ast::Expr],

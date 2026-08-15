@@ -1256,6 +1256,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "least" => F::Least,
         "cardinality" => F::Cardinality,
         "array_length" => F::ArrayLength,
+        "array_fill" => F::ArrayFill,
         "array_lower" => F::ArrayLower,
         "array_upper" => F::ArrayUpper,
         "array_dims" => F::ArrayDims,

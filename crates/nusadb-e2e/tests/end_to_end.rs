@@ -311,6 +311,36 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn array_fill_builds_a_repeated_array() {
+    // array_fill(value, ARRAY[n]) → a 1-D array of `value` repeated n times, matching the reference
+    // engine: n=0 is empty, a NULL value fills with NULLs, and a negative size errors.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(&engine, "SELECT array_fill(7, ARRAY[3])")),
+        vec![vec![Value::Array(vec![
+            Value::Int(7),
+            Value::Int(7),
+            Value::Int(7)
+        ])]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT array_fill('x', ARRAY[2])")),
+        vec![vec![Value::Array(vec![
+            Value::Text("x".to_owned()),
+            Value::Text("x".to_owned())
+        ])]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT array_fill(0, ARRAY[0])")),
+        vec![vec![Value::Array(vec![])]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT array_fill(NULL::int, ARRAY[2])")),
+        vec![vec![Value::Array(vec![Value::Null, Value::Null])]]
+    );
+}
+
+#[test]
 fn quote_nullable_quotes_text_and_renders_null() {
     // quote_nullable(x): a NULL argument yields the unquoted text NULL; otherwise it single-quotes
     // like quote_literal (embedded quotes doubled) — matching the reference engine.
