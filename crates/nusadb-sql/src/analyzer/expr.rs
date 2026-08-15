@@ -1366,6 +1366,11 @@ pub(super) fn analyze_scalar_function(
         F::MakeTimestamp => {
             ScalarSig::Fixed(&[Int, Int, Int, Int, Int, Int], &[], ColumnType::Timestamp)
         },
+        F::MakeTimestamptz => ScalarSig::Fixed(
+            &[Int, Int, Int, Int, Int, Int],
+            &[],
+            ColumnType::TimestampTz,
+        ),
         // MAKE_INTERVAL(years, months, weeks, days, hours, mins, secs) — every field is optional and
         // positional, defaulting to 0; the seconds field is FLOAT.
         F::MakeInterval => ScalarSig::Fixed(

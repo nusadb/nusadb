@@ -1187,6 +1187,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "make_date" => F::MakeDate,
         "make_time" => F::MakeTime,
         "make_timestamp" => F::MakeTimestamp,
+        "make_timestamptz" => F::MakeTimestamptz,
         "make_interval" => F::MakeInterval,
         "justify_days" => F::JustifyDays,
         "justify_hours" => F::JustifyHours,

@@ -664,6 +664,15 @@ fn eval_scalar_function(
                     ))
                 })?
         },
+        (F::MakeTimestamptz, [Int(y), Int(mo), Int(d), Int(h), Int(mi), Int(s)]) => {
+            crate::temporal::make_timestamp(*y, *mo, *d, *h, *mi, *s)
+                .map(ast::Value::TimestampTz)
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "make_timestamptz(): {y}-{mo}-{d} {h}:{mi}:{s} is not valid"
+                    ))
+                })?
+        },
         // MAKE_INTERVAL(years, months, weeks, days, hours, mins, secs) → INTERVAL. Every field is
         // optional and positional, defaulting to 0; the seconds field may arrive as FLOAT or INT.
         (F::MakeInterval, fields) => {

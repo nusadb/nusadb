@@ -311,6 +311,22 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn make_timestamptz_builds_a_timestamptz_value() {
+    // make_timestamptz(fields) builds a TIMESTAMPTZ; the session time zone is UTC, so it is the same
+    // instant as make_timestamp of the same fields cast to TIMESTAMPTZ (matching the reference engine
+    // at UTC). Comparing the two avoids depending on the exact text rendering.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT make_timestamptz(2024,1,15,10,30,45) \
+             = CAST(make_timestamp(2024,1,15,10,30,45) AS timestamptz) AS eq"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
 fn nusadb_typeof_reports_the_expression_type() {
     // `nusadb_typeof(expr)` returns the SQL type name of the expression. Folded to a constant at
     // analysis, so it works without a FROM and over column refs.

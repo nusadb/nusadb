@@ -531,6 +531,9 @@ pub enum ScalarFunc {
     /// `MAKE_TIMESTAMP(year, month, day, hour, minute, second)` — build a `TIMESTAMP` from integer
     /// fields; errors on an invalid date or time.
     MakeTimestamp,
+    /// `MAKE_TIMESTAMPTZ(year, month, day, hour, minute, second)` — build a `TIMESTAMPTZ` from
+    /// integer fields (interpreted in the session time zone, UTC); errors on an invalid date/time.
+    MakeTimestamptz,
     /// `MAKE_INTERVAL([years [, months [, weeks [, days [, hours [, mins [, secs]]]]]]])` — build an
     /// `INTERVAL` from the (positional) field values, each defaulting to `0`.
     MakeInterval,
@@ -942,6 +945,7 @@ impl ScalarFunc {
             Self::MakeDate => "make_date",
             Self::MakeTime => "make_time",
             Self::MakeTimestamp => "make_timestamp",
+            Self::MakeTimestamptz => "make_timestamptz",
             Self::MakeInterval => "make_interval",
             Self::JustifyDays => "justify_days",
             Self::JustifyHours => "justify_hours",
