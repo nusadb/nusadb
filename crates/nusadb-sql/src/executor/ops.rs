@@ -2011,8 +2011,10 @@ type HnswSlot = std::sync::Arc<std::sync::RwLock<Option<CachedVectorIndex>>>;
 /// blocking-task pool builds each index once rather than once per thread. The outer lock only maps a
 /// key to its slot (held briefly); the per-slot lock guards the index itself — reads (the warm path)
 /// take the slot's shared read lock and run concurrently, and only a (re)build of *that* slot takes
-/// its exclusive write lock. The graph is still not persisted to disk — a fresh process rebuilds on
-/// first use (page-backed persistence is the separate milestone).
+/// its exclusive write lock. This cache is in-process only, but it is *not* the sole copy of the
+/// graph: the graph is persisted durably to the chunked [`VECTOR_GRAPH_CATALOG`], so a cold slot in a
+/// fresh process is filled by [`load_vector_graph`] (an O(n) scan) rather than a full rebuild — see
+/// the cold-slot branch in the query path.
 static HNSW_CACHE: std::sync::LazyLock<std::sync::RwLock<HashMap<HnswCacheKey, HnswSlot>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
