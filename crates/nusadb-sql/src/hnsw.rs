@@ -971,6 +971,50 @@ mod tests {
         }
     }
 
+    /// Measurement (not a pass/fail gate): the build-time-vs-recall trade-off of `ef_construction`,
+    /// the one build-cost lever that does not touch the distance kernel. Bit-identical layout changes
+    /// to the build path were measured and did not pay off, so the remaining lever is
+    /// result-affecting: a lower `ef_construction` builds faster but can lower recall. This prints
+    /// build time and recall@k per `ef_construction` so the trade-off is a measured table, not a
+    /// guess. `#[ignore]` — run manually
+    /// (`cargo test -p nusadb-sql ef_construction_build_time_vs_recall -- --ignored --nocapture`);
+    /// criterion measures the time half but cannot measure recall, so both live here.
+    #[test]
+    #[ignore = "measurement: ef_construction build-time vs recall trade-off (run manually)"]
+    fn ef_construction_build_time_vs_recall_tradeoff() {
+        use std::time::Instant;
+        let (k, ef_search) = (10, 96);
+        // Two configs: an easy one, and a harder one (more points, higher dimension — where a coarser
+        // graph is likelier to cost recall), so the trade-off is judged on more than one regime.
+        for (n, dim) in [(1500usize, 64usize), (2000, 128)] {
+            let data = random_vectors(n, dim, 7);
+            let queries = random_vectors(50, dim, 8);
+            eprintln!("EFTRADEOFF --- n={n} dim={dim} k={k} ef_search={ef_search} metric=L2 ---");
+            eprintln!("EFTRADEOFF ef_construction | build_ms | recall@{k}");
+            for ef_c in [40usize, 64, 100, 150] {
+                let params = HnswParams {
+                    m: 16,
+                    ef_construction: ef_c,
+                };
+                let start = Instant::now();
+                let mut index = HnswIndex::new(dim, Metric::L2, params, 42);
+                for v in &data {
+                    index.insert(v.clone()).expect("insert");
+                }
+                let build_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let mut total_recall = 0.0;
+                for q in &queries {
+                    let exact: HashSet<u32> = brute_force(&data, q, k).into_iter().collect();
+                    let approx = index.search(q, k, ef_search).expect("search");
+                    let hits = approx.iter().filter(|(id, _)| exact.contains(id)).count();
+                    total_recall += hits as f64 / k as f64;
+                }
+                let recall = total_recall / queries.len() as f64;
+                eprintln!("EFTRADEOFF {ef_c:>15} | {build_ms:8.1} | {recall:.3}");
+            }
+        }
+    }
+
     /// Each metric must rank the *right* vector nearest — a guard against a sign/direction error
     /// that self-consistent recall cannot catch (a flipped inner product would still recall 1.0
     /// against its own oracle while returning the *farthest* vector). The expected nearest here is
