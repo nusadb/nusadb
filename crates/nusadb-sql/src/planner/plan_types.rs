@@ -587,6 +587,10 @@ pub struct CreateTablePlan {
     pub defaults: Vec<(String, String)>,
     /// Whether `IF NOT EXISTS` was given (the table may already exist).
     pub if_not_exists: bool,
+    /// `CREATE TABLE ... (LIKE src)` source table name, if any. The analyzer has already merged
+    /// `src`'s columns into `columns`; the executor additionally copies `src`'s synthetic width /
+    /// length checks so the declared width (lost by the runtime `ColumnType`) is preserved.
+    pub like_source: Option<String>,
 }
 
 /// A resolved `CHECK` constraint.

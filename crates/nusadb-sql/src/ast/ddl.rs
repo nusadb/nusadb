@@ -22,6 +22,11 @@ pub struct CreateTable {
     pub constraints: Vec<TableConstraint>,
     /// Whether `IF NOT EXISTS` was specified.
     pub if_not_exists: bool,
+    /// `CREATE TABLE t (LIKE src)` — copy `src`'s columns (their type, width, and `NOT NULL`) into
+    /// this table's column list. `None` for an ordinary create. The columns are resolved from the
+    /// catalog at analysis (the parser has no catalog), and the width-enforcing checks are copied at
+    /// execution, so the copy preserves the declared width the runtime `ColumnType` alone would lose.
+    pub like_source: Option<String>,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name AS <select>`.

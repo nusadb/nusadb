@@ -8,12 +8,42 @@ use super::*;
 // === DDL ==================================================================
 
 pub(super) fn analyze_create_table(
-    ct: ast::CreateTable,
+    mut ct: ast::CreateTable,
     catalog: &dyn Catalog,
 ) -> Result<CreateTablePlan, Error> {
     // A non-superuser must not squat a system-catalog name (e.g. pre-create `nusadb_policies`
     // before the engine does, forging what later reads as the policy catalog).
     enforce_system_catalog(&ct.name, catalog)?;
+    // `CREATE TABLE ... (LIKE src)`: copy `src`'s columns (type + `NOT NULL`) ahead of any columns
+    // written after the LIKE clause, as the reference engine does. Only name/type/nullable are copied
+    // (the basic LIKE form); the executor additionally copies `src`'s synthetic width/length checks,
+    // since the declared width is not recoverable from the runtime `ColumnType`.
+    if let Some(source) = &ct.like_source {
+        let src = catalog
+            .lookup_table(source)?
+            .ok_or_else(|| Error::TableNotFound {
+                name: source.clone(),
+            })?;
+        let mut merged: Vec<ast::ColumnDef> = src
+            .columns
+            .iter()
+            .map(|c| ast::ColumnDef {
+                name: c.name.clone(),
+                ty: c.ty,
+                udt_name: None,
+                nullable: c.nullable,
+                primary_key: false,
+                unique: false,
+                default: None,
+                default_sql: None,
+                generated: None,
+                serial: false,
+                identity_always: false,
+            })
+            .collect();
+        merged.append(&mut ct.columns);
+        ct.columns = merged;
+    }
     {
         let mut seen = HashSet::new();
         for column in &ct.columns {
@@ -53,6 +83,7 @@ pub(super) fn analyze_create_table(
         check_constraints,
         defaults,
         if_not_exists: ct.if_not_exists,
+        like_source: ct.like_source,
     })
 }
 

@@ -233,7 +233,36 @@ pub(super) fn run_create_table(
         &format!("{}.{}", def.schema, def.name),
         &super::session_ctx::current_user(),
     )?;
+    copy_like_width_checks(plan.like_source.as_deref(), id, engine, txn)?;
     Ok(ExecutionResult::Created(id))
+}
+
+/// For `CREATE TABLE ... (LIKE src)`, copy `src`'s synthetic width / length checks onto the new table
+/// `id`. The analyzer already copied `src`'s columns, but the declared width of a narrow integer or
+/// bounded string lives only in these generated checks (every integer stores as i64), not in the
+/// runtime type — so without this the copy would silently accept values the source rejects. The
+/// copied columns keep `src`'s names, so each predicate is valid as-is, and the constraint names are
+/// per-table, so reusing them on the new table cannot collide.
+fn copy_like_width_checks(
+    like_source: Option<&str>,
+    id: nusadb_core::TableId,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(source) = like_source else {
+        return Ok(());
+    };
+    let Some(src) = engine.lookup_table_as_of(txn, source)? else {
+        return Ok(());
+    };
+    for c in engine.list_constraints(src.id)? {
+        if c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+            && let Some(bytes) = &c.expr
+        {
+            engine.add_check_constraint(txn, id, &c.name, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Register one `FOREIGN KEY` on child table `child_id` (shared by CREATE TABLE and

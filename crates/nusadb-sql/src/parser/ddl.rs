@@ -74,7 +74,20 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
             if_not_exists: ct.if_not_exists,
         }));
     }
-    if ct.columns.is_empty() {
+    // `CREATE TABLE t (LIKE src)` copies `src`'s columns. The basic form only — the `INCLUDING`
+    // options (defaults / constraints / indexes) are a separate feature, so a `DEFAULTS` option is
+    // rejected loudly rather than silently ignored.
+    let like_source = match &ct.like {
+        Some(sql::CreateTableLikeKind::Parenthesized(l) | sql::CreateTableLikeKind::Plain(l)) => {
+            if l.defaults.is_some() {
+                return unsupported("CREATE TABLE (LIKE ... INCLUDING/EXCLUDING DEFAULTS)");
+            }
+            Some(object_name(&l.name)?)
+        },
+        None => None,
+    };
+    // A `LIKE` source supplies the columns, so an otherwise-empty column list is fine then.
+    if ct.columns.is_empty() && like_source.is_none() {
         return unsupported("CREATE TABLE with no columns");
     }
     let (schema, name) = table_ref_name(&ct.name)?;
@@ -95,6 +108,7 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         columns,
         constraints,
         if_not_exists: ct.if_not_exists,
+        like_source,
     }))
 }
 

@@ -109,6 +109,12 @@ impl Dialect for NusaParserDialect {
         true // enables ROLLUP/CUBE/GROUPING SETS as GROUP BY expressions
     }
 
+    fn supports_create_table_like_parenthesized(&self) -> bool {
+        // `CREATE TABLE t2 (LIKE src)` (the SQL-standard form) — the converter copies src's columns.
+        // Without this the `(LIKE src)` is parsed as a `like` column of type `src`.
+        true
+    }
+
     fn supports_select_wildcard_except(&self) -> bool {
         // Must be true (same as GenericDialect) so that `SELECT * EXCEPT (col)`
         // is tokenised as a wildcard decoration that our converter can reject with

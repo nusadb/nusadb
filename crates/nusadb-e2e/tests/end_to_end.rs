@@ -4636,6 +4636,62 @@ fn alter_table_rename_to_renames_the_table() {
 }
 
 #[test]
+fn create_table_like_copies_columns_and_their_width() {
+    // CREATE TABLE t2 (LIKE src) copies src's columns (name, type, NOT NULL) — and, crucially, the
+    // declared width: a narrow integer / bounded string stores its width only in a generated check
+    // (every integer is an i64), so the copy carries those checks or it would silently accept values
+    // the source rejects. The basic form does NOT copy PRIMARY KEY or DEFAULT (parity with the
+    // reference engine's plain LIKE).
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE src (id INT NOT NULL PRIMARY KEY, s SMALLINT, v VARCHAR(5), d INT DEFAULT 7)",
+    );
+    run(&engine, "INSERT INTO src VALUES (1, 100, 'abc', 9)");
+
+    run(&engine, "CREATE TABLE t2 (LIKE src)");
+
+    // The columns exist and accept an in-range row.
+    run(&engine, "INSERT INTO t2 (id, s, v) VALUES (2, 200, 'xy')");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, s, v FROM t2")),
+        vec![vec![
+            Value::Int(2),
+            Value::Int(200),
+            Value::Text("xy".to_owned())
+        ]],
+    );
+    // Declared width carried: SMALLINT range and VARCHAR length still bite on the copy.
+    assert!(
+        run_try(&engine, "INSERT INTO t2 (id, s) VALUES (3, 99999)").is_err(),
+        "SMALLINT width must be copied by LIKE",
+    );
+    assert!(
+        run_try(&engine, "INSERT INTO t2 (id, v) VALUES (4, 'toolong')").is_err(),
+        "VARCHAR length must be copied by LIKE",
+    );
+    // Basic LIKE copies neither PRIMARY KEY (a duplicate id is accepted) nor DEFAULT (d is NULL).
+    run(&engine, "INSERT INTO t2 (id, s) VALUES (2, 5)");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM t2 WHERE id = 2")),
+        vec![vec![Value::Int(2)]],
+        "PRIMARY KEY must not be copied by the basic LIKE form",
+    );
+    run(&engine, "INSERT INTO t2 (id) VALUES (50)");
+    assert_eq!(
+        rows(run(&engine, "SELECT d FROM t2 WHERE id = 50")),
+        vec![vec![Value::Null]],
+        "DEFAULT must not be copied by the basic LIKE form",
+    );
+
+    // A missing source table is a loud error.
+    assert!(
+        run_try(&engine, "CREATE TABLE t3 (LIKE nope)").is_err(),
+        "LIKE of a nonexistent table must error",
+    );
+}
+
+#[test]
 fn alter_table_rename_column_carries_the_synthetic_width_check() {
     // RENAME COLUMN on a typed column (INT/SMALLINT/CHAR/VARCHAR) must succeed: the engine's own
     // synthetic width/length check names the column in its predicate, and it is rewritten for the new
