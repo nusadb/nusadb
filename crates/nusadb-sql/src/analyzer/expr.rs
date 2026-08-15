@@ -928,6 +928,7 @@ pub(super) fn analyze_scalar_function(
             | F::Sqrt
             | F::Ln
             | F::Log
+            | F::Log10
             | F::Exp
             | F::Sin
             | F::Cos
@@ -1412,6 +1413,7 @@ pub(super) fn analyze_scalar_function(
         | F::Sqrt
         | F::Ln
         | F::Log
+        | F::Log10
         | F::Exp
         | F::Sin
         | F::Cos
@@ -1891,6 +1893,7 @@ fn analyze_numeric_function(
         | F::Acosh
         | F::Atanh
         | F::Degrees
+        | F::Log10
         | F::Radians => (1, 1, true),
         _ => unreachable!("non-numeric function routed to analyze_numeric_function"),
     };

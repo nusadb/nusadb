@@ -577,6 +577,8 @@ pub enum ScalarFunc {
     Ln,
     /// `LOG(x)` / `LOG(b, x)` — base-10 (one arg) or base-`b` logarithm, as `FLOAT`.
     Log,
+    /// `LOG10(x)` — base-10 logarithm, as `FLOAT` (one argument only).
+    Log10,
     /// `EXP(x)` — `e` raised to `x`, as `FLOAT`.
     Exp,
     /// `SIN(x)` — sine (radians), as `FLOAT`.
@@ -961,6 +963,7 @@ impl ScalarFunc {
             Self::Sqrt => "sqrt",
             Self::Ln => "ln",
             Self::Log => "log",
+            Self::Log10 => "log10",
             Self::Exp => "exp",
             Self::Sin => "sin",
             Self::Cos => "cos",

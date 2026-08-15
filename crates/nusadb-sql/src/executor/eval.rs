@@ -753,6 +753,7 @@ fn eval_scalar_function(
             | F::Sqrt
             | F::Ln
             | F::Log
+            | F::Log10
             | F::Exp
             | F::Sin
             | F::Cos
@@ -2378,12 +2379,12 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
             }
             Float(x.sqrt())
         },
-        F::Ln => {
+        F::Ln | F::Log10 => {
             let x = f(0);
             if x <= 0.0 {
                 return Err(log_domain(x));
             }
-            Float(x.ln())
+            Float(if func == F::Log10 { x.log10() } else { x.ln() })
         },
         F::Exp => Float(f(0).exp()),
         F::Sin => Float(f(0).sin()),

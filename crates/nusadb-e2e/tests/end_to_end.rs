@@ -297,6 +297,20 @@ fn cte_materialized_hint_is_accepted_and_data_correct() {
 }
 
 #[test]
+fn log10_returns_base_ten_logarithm() {
+    // `log10(x)` is the base-10 logarithm (one argument), matching the reference engine.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(&engine, "SELECT log10(1000)")),
+        vec![vec![Value::Float(3.0)]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT log10(1)")),
+        vec![vec![Value::Float(0.0)]]
+    );
+}
+
+#[test]
 fn nusadb_typeof_reports_the_expression_type() {
     // `nusadb_typeof(expr)` returns the SQL type name of the expression. Folded to a constant at
     // analysis, so it works without a FROM and over column refs.

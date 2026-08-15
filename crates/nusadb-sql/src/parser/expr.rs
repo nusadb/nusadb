@@ -1209,6 +1209,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "sqrt" => F::Sqrt,
         "ln" => F::Ln,
         "log" => F::Log,
+        "log10" => F::Log10,
         "exp" => F::Exp,
         "sin" => F::Sin,
         "cos" => F::Cos,
