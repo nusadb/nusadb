@@ -838,10 +838,10 @@ pub enum ReferentialAction {
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (keys) [INCLUDE (cols)] [WHERE pred]`.
 ///
 /// Supports plain-column keys, **functional/expression** keys (`(lower(s))`, `((a + b))`, in
-/// `key_exprs`), and a **partial-index** `WHERE` predicate. Per-column `ASC`/`DESC` /
-/// `NULLS FIRST`/`NULLS LAST` are rejected — only ascending indexes are built and ordered index
-/// scans are not implemented, so accepting a direction would be a silent-lossy trap. `WITH (...)`,
-/// `NULLS DISTINCT`, `CONCURRENTLY`, and operator classes are also rejected. `USING <method>` is
+/// `key_exprs`), and a **partial-index** `WHERE` predicate. Per-column `ASC`/`DESC` are accepted as
+/// no-ops: the B-tree is built ascending and the planner serves a descending `ORDER BY` by scanning
+/// it backward, so the direction changes no result. Per-column `NULLS FIRST`/`NULLS LAST`, `WITH
+/// (...)`, `NULLS DISTINCT`, `CONCURRENTLY`, and operator classes are rejected. `USING <method>` is
 /// accepted only for the `hnsw` vector access method. An anonymous index (no name) is rejected —
 /// names are required so the downstream catalog has a stable handle.
 #[derive(Debug, Clone, PartialEq, Eq)]

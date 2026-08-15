@@ -382,7 +382,7 @@ fn union_with_fetch_first_is_rejected() {
 }
 
 #[test]
-fn create_index_accepts_functional_partial_and_rejects_asc_desc_udf_shapes() {
+fn create_index_accepts_functional_partial_asc_desc_and_rejects_nulls_udf_shapes() {
     // Functional / expression key → carried as `key_exprs` (SQL text), `columns` empty.
     let ast::Statement::CreateIndex(ci) = ok("CREATE INDEX i ON t (LOWER(name))") else {
         panic!("expected CreateIndex");
@@ -413,17 +413,21 @@ fn create_index_accepts_functional_partial_and_rejects_asc_desc_udf_shapes() {
     assert_eq!(ci.columns, vec!["a".to_owned()]);
     assert!(ci.predicate.is_some());
 
-    // `ASC` is the built default, so it is accepted as a no-op.
-    let ast::Statement::CreateIndex(ci) = ok("CREATE INDEX i ON t (a ASC)") else {
-        panic!("expected CreateIndex");
-    };
-    assert_eq!(ci.columns, vec!["a".to_owned()]);
-
-    // Still rejected: `DESC` (a descending ordered index scan is not wired, and treating DESC as
-    // ascending would be a silent-lossy trap), per-column `NULLS`, `USING <method>`, a qualified
-    // column key, and an operator class.
+    // `ASC` and `DESC` are both accepted as no-ops: the B-tree builds ascending, and the planner
+    // serves a descending `ORDER BY` by scanning it backward, so the direction changes no result.
     for sql in [
+        "CREATE INDEX i ON t (a ASC)",
         "CREATE INDEX i ON t (a DESC)",
+    ] {
+        let ast::Statement::CreateIndex(ci) = ok(sql) else {
+            panic!("expected CreateIndex for {sql}");
+        };
+        assert_eq!(ci.columns, vec!["a".to_owned()], "for {sql}");
+    }
+
+    // Still rejected: per-column `NULLS`, `USING <method>`, a qualified column key, and an operator
+    // class. (`DESC NULLS LAST` still fails — on the `NULLS`, no longer on the `DESC`.)
+    for sql in [
         "CREATE INDEX i ON t (a DESC NULLS LAST)",
         "CREATE INDEX i ON t (a NULLS FIRST)",
         "CREATE INDEX i ON t USING HASH (a)",

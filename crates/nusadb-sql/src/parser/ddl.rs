@@ -729,13 +729,12 @@ fn convert_index_key_expr(key: &sql::IndexColumn) -> Result<String, Error> {
     Ok(key.column.expr.to_string())
 }
 
-/// Reject index-key modifiers the engine cannot honor: an operator class, `WITH FILL`, and
-/// per-column `ASC`/`DESC` / `NULLS FIRST`/`NULLS LAST`. Direction and null-placement only matter
-/// for an *ordered* index scan (walking the index to satisfy an `ORDER BY`), which the engine does
-/// not do — so accepting the annotation and silently building an ascending index would be a trap
-/// (`(a DESC)` indistinguishable from `(a ASC)`, `ORDER BY a DESC` still not accelerated, the
-/// catalog recording no direction). Rejecting loudly is honest; a plain
-/// `(a)` index still serves equality and range lookups. `NULLS DISTINCT` is handled by the caller.
+/// Reject index-key modifiers the engine cannot honor: an operator class, `WITH FILL`, and per-column
+/// `NULLS FIRST`/`NULLS LAST`. `ASC`/`DESC` are *accepted* (see below). Direction matters only for an
+/// *ordered* index scan, which the engine now does — the planner walks a matching ascending index
+/// backward to satisfy a descending `ORDER BY` (see `try_ordered_index_scan`). So a `DESC` key builds
+/// the same ascending B-tree, and a descending-ordered query over it is still accelerated by the
+/// backward scan; the results are identical either way. `NULLS DISTINCT` is handled by the caller.
 fn reject_index_key_modifiers(
     key: &sql::IndexColumn,
     allow_operator_class: bool,
@@ -746,15 +745,10 @@ fn reject_index_key_modifiers(
     if key.operator_class.is_some() && !allow_operator_class {
         return unsupported("CREATE INDEX with an operator class on a key column");
     }
-    // `ASC` is the default and exactly what an index builds, so it is accepted as a no-op. `DESC`
-    // is rejected loudly (never silently treated as ascending): a descending index needs the planner
-    // to scan the index backward for a descending-ordered query, which is not wired yet.
-    if key.column.options.asc == Some(false) {
-        return unsupported(
-            "CREATE INDEX with DESC on a key column (indexes are built ascending; a descending \
-             ordered index scan is not implemented)",
-        );
-    }
+    // `ASC`/`DESC` are both accepted: the B-tree is always built ascending, and the planner serves a
+    // descending `ORDER BY` by scanning that index backward, so the direction annotation changes no
+    // result. (A mixed-direction multi-column key simply is not served by one ordered scan and falls
+    // back to a sort — still correct.)
     if key.column.options.nulls_first.is_some() {
         return unsupported("CREATE INDEX with NULLS FIRST/LAST on a key column");
     }

@@ -586,10 +586,10 @@ fn functional_partial_and_desc_indexes_end_to_end() {
         "CREATE TABLE t (id INT NOT NULL, s TEXT, a INT, active BOOL)",
     );
 
-    // DESC / NULLS annotations are rejected loudly: only ascending indexes are built and ordered
-    // index scans are not implemented, so silently building an ascending index for `(a DESC)`
-    // would be a lossy trap. A plain `(a)` index is the alternative.
-    assert!(run_try(&engine, "CREATE INDEX idx_a_desc ON t (a DESC)").is_err());
+    // `DESC` is accepted: the B-tree is built ascending and the planner serves a descending
+    // `ORDER BY` by scanning it backward, so the direction changes no result. A per-column `NULLS`
+    // placement is still rejected loudly (the engine has no null-placement control).
+    assert!(run_try(&engine, "CREATE INDEX idx_a_desc ON t (a DESC)").is_ok());
     assert!(run_try(&engine, "CREATE INDEX idx_a_nulls ON t (a NULLS FIRST)").is_err());
     // A user-defined SQL function in a key is rejected at CREATE, not silently unmaintainable: the
     // write-path re-analysis has no function catalog, so accepting it would produce a UNIQUE index
@@ -700,6 +700,45 @@ fn functional_partial_and_desc_indexes_end_to_end() {
     assert!(
         run_try(&engine, "INSERT INTO b VALUES (2, 'XYZ')").is_err(),
         "backfill must index the existing 'Xyz' so 'XYZ' collides"
+    );
+}
+
+#[test]
+fn desc_index_serves_descending_order_via_backward_scan() {
+    // A DESC index builds the same ascending B-tree; the planner serves a descending ORDER BY by
+    // scanning it backward, so the results are correct AND the descending query is accelerated (the
+    // one index serves both directions). Matches the reference engine's descending order.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (a INT NOT NULL, v INT)");
+    for i in [5, 1, 9, 3, 7, 2] {
+        run(&engine, &format!("INSERT INTO t VALUES ({i}, {})", i * 10));
+    }
+    run(&engine, "CREATE INDEX t_a_desc ON t (a DESC)");
+
+    // Descending order is correct.
+    assert_eq!(
+        rows(run(&engine, "SELECT a FROM t ORDER BY a DESC")),
+        [9, 7, 5, 3, 2, 1]
+            .into_iter()
+            .map(|n| vec![Value::Int(n)])
+            .collect::<Vec<_>>(),
+    );
+    // And it is served by a backward scan of the index (not a sort) — the one index serves both
+    // directions.
+    let plan: String = rows(run(
+        &engine,
+        "EXPLAIN SELECT a FROM t ORDER BY a DESC LIMIT 3",
+    ))
+    .into_iter()
+    .filter_map(|r| match r.into_iter().next() {
+        Some(Value::Text(s)) => Some(s),
+        _ => None,
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        plan.contains("IndexScan: t using t_a_desc"),
+        "descending ORDER BY should use the index (backward scan): {plan}",
     );
 }
 
