@@ -992,10 +992,16 @@ fn select_for_update_locks_single_table_else_unsupported() {
         p.row_lock,
         Some((nusadb_core::engine::RowLockMode::Exclusive, false, true))
     );
-    // Richer shapes remain honest `Unsupported` in v1.
+    // `OF <name>` naming the query's single base table is accepted — it locks the same rows as a
+    // bare FOR UPDATE.
+    assert!(
+        plan("SELECT * FROM users FOR SHARE OF users", &catalog()).is_ok(),
+        "FOR SHARE OF <the base table> should be accepted",
+    );
+    // Richer shapes, and an `OF` naming a relation not in the FROM, remain honest `Unsupported`.
     for sql in [
-        "SELECT COUNT(*) FROM users FOR UPDATE",  // aggregate
-        "SELECT * FROM users FOR SHARE OF users", // OF <table>
+        "SELECT COUNT(*) FROM users FOR UPDATE",   // aggregate
+        "SELECT * FROM users FOR UPDATE OF other", // OF names a table not in FROM
     ] {
         assert!(
             matches!(plan(sql, &catalog()), Err(Error::Unsupported(_))),

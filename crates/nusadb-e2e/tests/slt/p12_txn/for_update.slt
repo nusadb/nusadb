@@ -76,3 +76,26 @@ SELECT id FROM acct ORDER BY id FOR UPDATE SKIP LOCKED
 1
 2
 3
+
+# FOR UPDATE OF <the base table> is accepted — it locks the same rows as a bare FOR UPDATE.
+query I
+SELECT id FROM acct ORDER BY id FOR UPDATE OF acct
+----
+1
+2
+3
+
+# With an alias, OF must name the alias (as the reference engine requires).
+query I
+SELECT id FROM acct AS a ORDER BY id FOR UPDATE OF a
+----
+1
+2
+3
+
+# OF a relation not in the FROM is rejected; OF the real name when an alias is in force is too.
+statement error
+SELECT id FROM acct FOR UPDATE OF nope
+
+statement error
+SELECT id FROM acct AS a FOR UPDATE OF acct

@@ -797,8 +797,12 @@ fn resolve_order_by_key(
 /// Validate a `SELECT ... FOR UPDATE` / `FOR SHARE` clause and map it to a [`RowLockMode`] plus
 /// the `SKIP LOCKED` flag (the job-queue pattern). Only the simple shape is supported — a
 /// single base table with no join / aggregate / GROUP BY / DISTINCT / window and a subquery-free
-/// `WHERE` — so the executor can lock exactly the matched base rows by re-scanning. `OF <table>`
-/// and any richer shape are honest `Unsupported`. `None` lock → `None`.
+/// `WHERE` — so the executor can lock exactly the matched base rows by re-scanning. A richer shape is
+/// an honest `Unsupported`. `None` lock → `None`.
+///
+/// `OF <name>` is accepted when `<name>` is the query's single base table (its alias if aliased, else
+/// its name), given as `base_qualifier` — it then locks the same rows as a bare `FOR UPDATE`, as the
+/// reference engine does. An `OF` naming any other relation is rejected, since it is not in the FROM.
 ///
 /// The returned booleans are `(skip_locked, nowait)`. `NOWAIT` is the natural fit for a no-wait lock
 /// manager — it means "fail immediately on a held row", which is what the manager already does; the
@@ -809,21 +813,27 @@ fn analyze_row_lock(
     lock: Option<&ast::RowLock>,
     simple_shape: bool,
     filter: Option<&TypedExpr>,
+    base_qualifier: Option<&str>,
 ) -> Result<Option<(nusadb_core::engine::RowLockMode, bool, bool)>, Error> {
     let Some(lock) = lock else {
         return Ok(None);
     };
-    if lock.of.is_some() {
-        return Err(Error::Unsupported(
-            "FOR UPDATE / FOR SHARE ... OF <table>".to_owned(),
-        ));
-    }
+    // Check the single-table shape first, so a joined/aggregated query gets the accurate shape error
+    // rather than a misleading "no such table" from the `OF` check below (which only makes sense once
+    // there is exactly one base table to name).
     if !simple_shape {
         return Err(Error::Unsupported(
             "FOR UPDATE / FOR SHARE is supported only on a single base table without \
              join / aggregate / GROUP BY / DISTINCT / window"
                 .to_owned(),
         ));
+    }
+    if let Some(of) = &lock.of
+        && base_qualifier != Some(of.as_str())
+    {
+        return Err(Error::Unsupported(format!(
+            "FOR UPDATE / FOR SHARE OF \"{of}\": no such table in the query's FROM clause"
+        )));
     }
     if filter.is_some_and(crate::executor::ops::contains_subquery) {
         return Err(Error::Unsupported(
@@ -1401,7 +1411,18 @@ fn analyze_select_scoped(
         && having.is_none()
         && recursive_ctes.is_empty()
         && modifying_ctes.is_empty();
-    let row_lock = analyze_row_lock(sel.lock.as_ref(), simple_shape, filter.as_ref())?;
+    // The single base table's exposed name (its alias if aliased, else the name as written) — what a
+    // `FOR UPDATE OF <name>` must match. `None` when there is no FROM (then any OF is rejected).
+    let base_qualifier = sel
+        .from
+        .as_ref()
+        .map(|f| f.base.alias.clone().unwrap_or_else(|| f.base.name.clone()));
+    let row_lock = analyze_row_lock(
+        sel.lock.as_ref(),
+        simple_shape,
+        filter.as_ref(),
+        base_qualifier.as_deref(),
+    )?;
 
     // `FETCH FIRST n ROWS WITH TIES`: the tie set is defined by the ORDER BY, and
     // the tie trim runs on the sorted, pre-projection rows. It therefore requires an ORDER BY and is
