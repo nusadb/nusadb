@@ -1377,6 +1377,7 @@ pub(super) fn analyze_scalar_function(
         },
         F::CurrentDate => ScalarSig::Fixed(&[], &[], ColumnType::Date),
         F::CurrentTime => ScalarSig::Fixed(&[], &[], ColumnType::Time),
+        F::LocalTimestamp => ScalarSig::Fixed(&[], &[], ColumnType::Timestamp),
         // Niladic session-user / system built-ins → TEXT. `current_setting` is grouped
         // above with the string functions.
         F::CurrentUser | F::SessionUser | F::Version | F::CurrentDatabase | F::CurrentSchema => {

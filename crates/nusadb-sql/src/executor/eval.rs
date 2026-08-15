@@ -334,6 +334,9 @@ fn eval_scalar_function(
         },
         F::CurrentDate => return Ok(ast::Value::Date(super::clock::statement_today())),
         F::CurrentTime => return Ok(ast::Value::Time(super::clock::statement_time_of_day())),
+        F::LocalTimestamp => {
+            return Ok(ast::Value::Timestamp(super::clock::statement_now_micros()));
+        },
         // The niladic session-user built-ins read the statement's pinned session user.
         F::CurrentUser | F::SessionUser => {
             return Ok(Text(super::session_ctx::current_user()));

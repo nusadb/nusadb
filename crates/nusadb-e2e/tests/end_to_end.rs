@@ -311,6 +311,20 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn localtimestamp_is_the_statement_instant_without_zone() {
+    // LOCALTIMESTAMP is a TIMESTAMP (no zone); with the session zone at UTC it is the same instant as
+    // CURRENT_TIMESTAMP cast to timestamp — matching the reference engine.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT localtimestamp = CAST(current_timestamp AS timestamp) AS eq"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
 fn statement_timestamp_equals_now_within_a_statement() {
     // statement_timestamp() is the statement's start instant; NOW()/CURRENT_TIMESTAMP are already
     // statement-scoped in this engine, so within one statement they observe the same instant.

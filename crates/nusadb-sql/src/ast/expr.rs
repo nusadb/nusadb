@@ -486,6 +486,9 @@ pub enum ScalarFunc {
     /// `STATEMENT_TIMESTAMP()` — the current statement's start instant as `TIMESTAMPTZ`. In this
     /// engine `NOW()`/`CURRENT_TIMESTAMP` are already statement-scoped, so it is the same instant.
     StatementTimestamp,
+    /// `LOCALTIMESTAMP` — the statement instant as a `TIMESTAMP` (no time zone); the same instant as
+    /// `CURRENT_TIMESTAMP` but without the zone (the session zone is UTC).
+    LocalTimestamp,
     /// `CURRENT_TIMESTAMP` — synonym for [`NOW()`](Self::Now), `TIMESTAMPTZ`. Niladic.
     CurrentTimestamp,
     /// `CURRENT_DATE` — the statement instant's calendar date as `DATE`. Niladic.
@@ -945,6 +948,7 @@ impl ScalarFunc {
             Self::RegexpSplitToArray => "regexp_split_to_array",
             Self::Now => "now",
             Self::StatementTimestamp => "statement_timestamp",
+            Self::LocalTimestamp => "localtimestamp",
             Self::CurrentTimestamp => "current_timestamp",
             Self::CurrentDate => "current_date",
             Self::CurrentTime => "current_time",
@@ -1116,7 +1120,12 @@ impl ScalarFunc {
     pub const fn is_clock(self) -> bool {
         matches!(
             self,
-            Self::Now | Self::CurrentTimestamp | Self::CurrentDate | Self::CurrentTime
+            Self::Now
+                | Self::CurrentTimestamp
+                | Self::StatementTimestamp
+                | Self::LocalTimestamp
+                | Self::CurrentDate
+                | Self::CurrentTime
         )
     }
 
