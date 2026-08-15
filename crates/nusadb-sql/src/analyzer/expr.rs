@@ -1316,6 +1316,12 @@ pub(super) fn analyze_scalar_function(
         F::JsonbPathQueryFirst | F::JsonbPathQueryArray => {
             ScalarSig::Fixed(&[ColumnType::Json, Text], &[], ColumnType::Json)
         },
+        // JSON_OBJECT(pairs text[]) or JSON_OBJECT(keys text[], values text[]) → JSON object.
+        F::JsonObject => ScalarSig::Fixed(
+            &[ColumnType::Array(nusadb_core::engine::ArrayElem::Text)],
+            &[ColumnType::Array(nusadb_core::engine::ArrayElem::Text)],
+            ColumnType::Json,
+        ),
         // JSONB_SET(target, path TEXT[], new_value [, create_missing BOOL]) → JSON and
         // JSONB_INSERT(target, path TEXT[], new_value [, insert_after BOOL]) → JSON share the
         // same argument shape.

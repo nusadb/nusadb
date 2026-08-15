@@ -1313,6 +1313,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "to_json" | "to_jsonb" => F::ToJson,
         "row_to_json" => F::RowToJson,
         "json_build_object" | "jsonb_build_object" => F::JsonBuildObject,
+        "json_object" | "jsonb_object" => F::JsonObject,
         "json_build_array" | "jsonb_build_array" => F::JsonBuildArray,
         "jsonb_set" | "json_set" => F::JsonbSet,
         "jsonb_strip_nulls" | "json_strip_nulls" => F::JsonbStripNulls,

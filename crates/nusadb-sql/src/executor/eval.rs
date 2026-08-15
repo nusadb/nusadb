@@ -582,6 +582,10 @@ fn eval_scalar_function(
                 .next()
                 .map_or(ast::Value::Null, ast::Value::Json)
         },
+        (F::JsonObject, [ast::Value::Array(items)]) => json_object_from_pairs(items)?,
+        (F::JsonObject, [ast::Value::Array(keys), ast::Value::Array(vals)]) => {
+            json_object_from_kv(keys, vals)?
+        },
         (F::JsonbPathQueryArray, [ast::Value::Json(s) | Text(s), Text(path)]) => {
             let matches = crate::json::path_query(s, path).ok_or_else(|| {
                 Error::Unsupported(format!(
@@ -2228,6 +2232,45 @@ fn eval_row_to_json(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> 
 
 /// `JSON_BUILD_OBJECT(k1, v1, ...)`: build a JSON object from alternating key/value arguments.
 /// Keys are coerced to text and must not be NULL; values serialize to JSON (a NULL value → `null`).
+/// `JSON_OBJECT(pairs)` — a JSON object from a flat text array of alternating key/value elements
+/// (must be even length). Keys render to text (a NULL key errors); values become JSON strings, a NULL
+/// value becoming JSON `null` (the array is `text[]`, so `value_to_json` yields a string per value).
+fn json_object_from_pairs(items: &[ast::Value]) -> Result<ast::Value, Error> {
+    if !items.len().is_multiple_of(2) {
+        return Err(Error::Unsupported(
+            "array must have even number of elements".to_owned(),
+        ));
+    }
+    let mut pairs = Vec::with_capacity(items.len() / 2);
+    for chunk in items.chunks_exact(2) {
+        let [key, value] = chunk else { continue };
+        if matches!(key, ast::Value::Null) {
+            return Err(Error::Unsupported(
+                "null value not allowed for object key".to_owned(),
+            ));
+        }
+        pairs.push((text_output(key.clone())?, crate::json::value_to_json(value)));
+    }
+    Ok(ast::Value::Json(crate::json::build_object(pairs)))
+}
+
+/// `JSON_OBJECT(keys, values)` — a JSON object from parallel key/value text arrays (equal length).
+fn json_object_from_kv(keys: &[ast::Value], vals: &[ast::Value]) -> Result<ast::Value, Error> {
+    if keys.len() != vals.len() {
+        return Err(Error::Unsupported("mismatched array dimensions".to_owned()));
+    }
+    let mut pairs = Vec::with_capacity(keys.len());
+    for (key, value) in keys.iter().zip(vals) {
+        if matches!(key, ast::Value::Null) {
+            return Err(Error::Unsupported(
+                "null value not allowed for object key".to_owned(),
+            ));
+        }
+        pairs.push((text_output(key.clone())?, crate::json::value_to_json(value)));
+    }
+    Ok(ast::Value::Json(crate::json::build_object(pairs)))
+}
+
 fn eval_json_build_object(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let mut pairs = Vec::with_capacity(args.len() / 2);
     for pair in args.chunks_exact(2) {

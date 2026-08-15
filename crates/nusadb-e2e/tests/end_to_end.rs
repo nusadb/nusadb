@@ -311,6 +311,29 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn json_object_builds_object_from_text_arrays() {
+    // json_object(pairs) / json_object(keys, values): build a JSON object; values are stored as JSON
+    // strings, a NULL value becomes JSON null, matching the reference engine. NusaDB renders compact.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(&engine, "SELECT json_object(ARRAY['a','1','b','2'])")),
+        vec![vec![Value::Json("{\"a\":\"1\",\"b\":\"2\"}".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT json_object(ARRAY['a','b'], ARRAY['1','2'])"
+        )),
+        vec![vec![Value::Json("{\"a\":\"1\",\"b\":\"2\"}".to_owned())]]
+    );
+    // A NULL value becomes JSON null.
+    assert_eq!(
+        rows(run(&engine, "SELECT json_object(ARRAY['a', NULL])")),
+        vec![vec![Value::Json("{\"a\":null}".to_owned())]]
+    );
+}
+
+#[test]
 fn jsonb_path_query_array_collects_matches() {
     // jsonb_path_query_array(json, path) collects every jsonpath match into a JSON array (compact
     // rendering), matching the reference engine; no match yields an empty array.

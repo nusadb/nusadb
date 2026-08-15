@@ -809,6 +809,10 @@ pub enum ScalarFunc {
     /// `JSON_BUILD_OBJECT(k1, v1, ...)` / `JSONB_BUILD_OBJECT(...)` — build a JSON object from
     /// alternating key/value arguments (even arity; keys become text).
     JsonBuildObject,
+    /// `JSON_OBJECT(pairs)` / `JSON_OBJECT(keys, values)` — build a JSON object from a flat key/value
+    /// text array (even length) or from parallel key/value text arrays. Values are stored as JSON
+    /// strings; a NULL value becomes JSON `null`; a NULL key errors. Result `JSON`.
+    JsonObject,
     /// `JSON_BUILD_ARRAY(v1, v2, ...)` / `JSONB_BUILD_ARRAY(...)` — build a JSON array from the
     /// arguments in order (any arity, including none; each value at its natural type).
     JsonBuildArray,
@@ -1070,6 +1074,7 @@ impl ScalarFunc {
             Self::ToJson => "to_json",
             Self::RowToJson => "row_to_json",
             Self::JsonBuildObject => "json_build_object",
+            Self::JsonObject => "json_object",
             Self::JsonBuildArray => "json_build_array",
             Self::JsonbSet => "jsonb_set",
             Self::JsonbStripNulls => "jsonb_strip_nulls",
