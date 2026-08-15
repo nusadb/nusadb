@@ -43,6 +43,7 @@ pub(super) fn window_default_name(func: &ast::WindowFunc) -> String {
         // defensively (the parser's OVER path never produces them).
         W::Aggregate(A::ArrayAgg) => "array_agg",
         W::Aggregate(A::JsonAgg) => "jsonb_agg",
+        W::Aggregate(A::JsonObjectAgg) => "json_object_agg",
         W::Aggregate(A::BoolAnd) => "bool_and",
         W::Aggregate(A::BoolOr) => "bool_or",
         W::Aggregate(A::Stddev) => "stddev",

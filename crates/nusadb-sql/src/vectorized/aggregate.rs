@@ -251,7 +251,11 @@ pub(super) fn columnar_call_shape(call: &AggregateCall) -> Option<ColumnarShape>
     if call.filter.is_some() || call.arg2.is_some() || !call.order_by.is_empty() {
         return None;
     }
-    if matches!(call.func, F::Grouping | F::ArrayAgg | F::JsonAgg) || call.func.is_two_arg() {
+    if matches!(
+        call.func,
+        F::Grouping | F::ArrayAgg | F::JsonAgg | F::JsonObjectAgg
+    ) || call.func.is_two_arg()
+    {
         return None;
     }
     // A row-value COUNT reads several columns per row, so it has no single-column shape — and it

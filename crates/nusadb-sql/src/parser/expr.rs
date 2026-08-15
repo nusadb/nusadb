@@ -1457,6 +1457,8 @@ pub(super) fn aggregate_func(name: &str) -> Option<ast::AggregateFunc> {
         "array_agg" => Some(ast::AggregateFunc::ArrayAgg),
         // JSON_AGG and JSONB_AGG both collect into a JSON array (our JSON type is binary-backed).
         "jsonb_agg" | "json_agg" => Some(ast::AggregateFunc::JsonAgg),
+        // JSON_OBJECT_AGG / JSONB_OBJECT_AGG aggregate (key, value) pairs into a JSON object.
+        "json_object_agg" | "jsonb_object_agg" => Some(ast::AggregateFunc::JsonObjectAgg),
         // EVERY is the SQL-standard alias for BOOL_AND.
         "bool_and" | "every" => Some(ast::AggregateFunc::BoolAnd),
         "bool_or" => Some(ast::AggregateFunc::BoolOr),
@@ -1548,6 +1550,29 @@ pub(super) fn convert_aggregate(
             filter,
             separator: None,
             arg2: None,
+            order_by: Vec::new(),
+        });
+    }
+
+    // JSON_OBJECT_AGG(key, value) takes two per-row arguments (key, value) — the key becomes an
+    // object key (text), the value any JSON value. Unlike the statistical two-arg aggregates the value
+    // is not numeric-constrained, so it has its own block (like STRING_AGG). DISTINCT / ORDER BY are
+    // not supported for the object form.
+    if matches!(func, ast::AggregateFunc::JsonObjectAgg) {
+        if distinct {
+            return unsupported("JSON_OBJECT_AGG does not support DISTINCT");
+        }
+        if !order_by.is_empty() {
+            return unsupported("JSON_OBJECT_AGG does not support ORDER BY");
+        }
+        let [key, value] = unnamed_two_args(args, "JSON_OBJECT_AGG")?;
+        return Ok(ast::Expr::Aggregate {
+            func,
+            arg: Some(Box::new(convert_expr(key)?)),
+            distinct,
+            filter,
+            separator: None,
+            arg2: Some(Box::new(convert_expr(value)?)),
             order_by: Vec::new(),
         });
     }

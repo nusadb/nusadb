@@ -1247,6 +1247,10 @@ pub enum AggregateFunc {
     /// into a JSON array, in input order; an empty group yields `NULL`. The argument may be any type
     /// (serialized to JSON per element). Result `JSON`.
     JsonAgg,
+    /// `JSON_OBJECT_AGG(key, value)` / `JSONB_OBJECT_AGG` — aggregate key/value pairs into a JSON
+    /// object. A NULL key errors; a NULL value becomes JSON `null`; duplicate keys keep the last value
+    /// (our JSON is binary-backed, so keys dedup). Result `JSON`; an empty group yields `NULL`.
+    JsonObjectAgg,
     /// `BOOL_AND(expr)` — `TRUE` iff every non-`NULL` boolean input is `TRUE`; `NULL` for an empty
     /// group. Result `BOOL`.
     BoolAnd,
@@ -1337,6 +1341,7 @@ impl AggregateFunc {
             Self::Mode => "mode",
             Self::ArrayAgg => "array_agg",
             Self::JsonAgg => "json_agg",
+            Self::JsonObjectAgg => "json_object_agg",
             Self::BoolAnd => "bool_and",
             Self::BoolOr => "bool_or",
             Self::Stddev => "stddev",

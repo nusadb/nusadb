@@ -311,6 +311,35 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn json_object_agg_builds_a_json_object() {
+    // json_object_agg(key, value) / jsonb_object_agg aggregate key/value pairs into a JSON object.
+    // Binary JSON dedups keys (last value wins), matching the reference engine's jsonb_object_agg; a
+    // NULL key errors; a NULL value becomes JSON null.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE kv (k TEXT, v INT)");
+    run(&engine, "INSERT INTO kv VALUES ('a',1),('b',2),('a',3)");
+    // Duplicate key 'a' keeps the last value (3); keys dedup + sort in the binary-JSON representation.
+    // NusaDB renders JSON compactly (no spaces) — the data matches the reference engine's object.
+    assert_eq!(
+        rows(run(&engine, "SELECT json_object_agg(k, v) FROM kv")),
+        vec![vec![Value::Json("{\"a\":3,\"b\":2}".to_owned())]]
+    );
+    // jsonb_object_agg is the same aggregate.
+    assert_eq!(
+        rows(run(&engine, "SELECT jsonb_object_agg(k, v) FROM kv")),
+        vec![vec![Value::Json("{\"a\":3,\"b\":2}".to_owned())]]
+    );
+    // A NULL value is kept as JSON null.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT json_object_agg(k, v) FROM (VALUES ('x', NULL::int)) t(k, v)"
+        )),
+        vec![vec![Value::Json("{\"x\":null}".to_owned())]]
+    );
+}
+
+#[test]
 fn array_fill_builds_a_repeated_array() {
     // array_fill(value, ARRAY[n]) → a 1-D array of `value` repeated n times, matching the reference
     // engine: n=0 is empty, a NULL value fills with NULLs, and a negative size errors.

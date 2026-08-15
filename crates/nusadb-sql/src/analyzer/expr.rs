@@ -451,29 +451,44 @@ pub(super) fn analyze_expr_agg(
                             .to_owned(),
                     ));
                 }
-                let typed_arg2 = match (arg2, two_arg) {
-                    (Some(a2), true) => {
-                        let typed = analyze_expr(a2, scope, catalog, None)?;
-                        if !is_numeric(typed.ty) {
-                            return Err(Error::TypeMismatch {
-                                context: format!("{func:?} requires numeric arguments"),
-                                expected: ColumnType::Float,
-                                found: typed.ty,
-                            });
-                        }
-                        Some(typed)
-                    },
-                    (None, true) => {
-                        return Err(Error::Unsupported(format!(
-                            "{func:?} requires two arguments"
-                        )));
-                    },
-                    (Some(_), false) => {
-                        return Err(Error::Unsupported(format!(
-                            "{func:?} takes a single argument"
-                        )));
-                    },
-                    (None, false) => None,
+                // JSON_OBJECT_AGG(key, value) also takes a second per-row argument, but the value may
+                // be any type (serialized to JSON), so it is not numeric-constrained like the
+                // statistical two-arg aggregates.
+                let json_obj = matches!(func, ast::AggregateFunc::JsonObjectAgg);
+                let typed_arg2 = if json_obj {
+                    match arg2 {
+                        Some(a2) => Some(analyze_expr(a2, scope, catalog, None)?),
+                        None => {
+                            return Err(Error::Unsupported(
+                                "json_object_agg requires two arguments (key, value)".to_owned(),
+                            ));
+                        },
+                    }
+                } else {
+                    match (arg2, two_arg) {
+                        (Some(a2), true) => {
+                            let typed = analyze_expr(a2, scope, catalog, None)?;
+                            if !is_numeric(typed.ty) {
+                                return Err(Error::TypeMismatch {
+                                    context: format!("{func:?} requires numeric arguments"),
+                                    expected: ColumnType::Float,
+                                    found: typed.ty,
+                                });
+                            }
+                            Some(typed)
+                        },
+                        (None, true) => {
+                            return Err(Error::Unsupported(format!(
+                                "{func:?} requires two arguments"
+                            )));
+                        },
+                        (Some(_), false) => {
+                            return Err(Error::Unsupported(format!(
+                                "{func:?} takes a single argument"
+                            )));
+                        },
+                        (None, false) => None,
+                    }
                 };
                 // STRING_AGG's separator must be a constant string, resolved here to a plain value
                 // the executor reads (it is not per-row state).

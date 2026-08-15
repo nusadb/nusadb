@@ -2782,7 +2782,10 @@ pub(super) fn analyze_aggregate(
         // JSONB_AGG(expr) — collect every value (NULLs become JSON null) into a JSON array. The
         // argument may be any type (the executor serializes each element to JSON), so no element-type
         // restriction applies; result is JSON.
-        (ast::AggregateFunc::JsonAgg, Some(arg)) => {
+        // JSON_AGG(expr) collects any-typed values into a JSON array. JSON_OBJECT_AGG(key, value)'s
+        // first argument is the key — any type, coerced to a text object key at execution; its value
+        // is the second argument, resolved in the aggregate analysis arm. Both yield JSON.
+        (ast::AggregateFunc::JsonAgg | ast::AggregateFunc::JsonObjectAgg, Some(arg)) => {
             let typed = analyze_expr(arg, scope, catalog, None)?;
             Ok((Some(typed), ColumnType::Json))
         },

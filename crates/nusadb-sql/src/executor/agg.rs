@@ -203,8 +203,12 @@ pub(crate) struct Acc {
     // value in the group, sorted at finalization. Empty (and unused) for other aggregates.
     ordered_values: Vec<ast::Value>,
     // For ARRAY_AGG: every collected value in input order, NULLs included (unlike the other
-    // aggregates, which skip NULL). Empty (and unused) for other aggregates.
+    // aggregates, which skip NULL). Empty (and unused) for other aggregates. JSON_OBJECT_AGG also
+    // uses this for the per-row VALUE, paired positionally with `object_keys`.
     array_items: Vec<ast::Value>,
+    // For JSON_OBJECT_AGG: the per-row KEY, paired positionally with the value in `array_items`.
+    // Empty (and unused) for other aggregates.
+    object_keys: Vec<ast::Value>,
     // For ARRAY_AGG / STRING_AGG with `ORDER BY`: the evaluated sort-key tuple for each
     // value in `array_items`, in the same order. Empty (and unused) when the call has no `ORDER BY`.
     agg_sort_keys: Vec<Vec<ast::Value>>,
@@ -417,6 +421,21 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
                 };
                 let json = items.iter().map(crate::json::value_to_json).collect();
                 ast::Value::Json(crate::json::build_array(json))
+            } else {
+                ast::Value::Null
+            }
+        },
+        // JSON_OBJECT_AGG: the collected (key, value) pairs assembled into a JSON object. Keys render
+        // to text; duplicate keys keep the last value (binary JSON dedups); an empty group → NULL.
+        F::JsonObjectAgg => {
+            if acc.any_seen {
+                let pairs = acc
+                    .object_keys
+                    .iter()
+                    .zip(acc.array_items.iter())
+                    .map(|(k, v)| (crate::display::value_text(k), crate::json::value_to_json(v)))
+                    .collect();
+                ast::Value::Json(crate::json::build_object(pairs))
             } else {
                 ast::Value::Null
             }
@@ -1254,6 +1273,27 @@ pub(super) fn accumulate_row(
                     push_agg_sort_keys(acc, call, row)?;
                     acc.any_seen = true;
                 },
+                // JSON_OBJECT_AGG(key, value): collect the pair (key in `object_keys`, value in
+                // `array_items`, positionally paired). A NULL key is an error (matching the reference
+                // engine); a NULL value is kept and becomes JSON `null`. This explicit arm precedes the
+                // `is_two_arg` guard below so the value is NOT treated as a numeric statistical arg.
+                F::JsonObjectAgg => {
+                    let (Some(key_arg), Some(val_arg)) = (call.arg.as_ref(), call.arg2.as_ref())
+                    else {
+                        return Err(Error::Unsupported(
+                            "internal: json_object_agg requires two arguments".to_owned(),
+                        ));
+                    };
+                    let key = eval_arg(key_arg, row)?;
+                    if matches!(key, ast::Value::Null) {
+                        return Err(Error::Unsupported(
+                            "null value not allowed for object key".to_owned(),
+                        ));
+                    }
+                    acc.object_keys.push(key);
+                    acc.array_items.push(eval_arg(val_arg, row)?);
+                    acc.any_seen = true;
+                },
                 // The two-argument statistical aggregates (CORR/COVAR_*/REGR_*) fold over
                 // (y, x) pairs; a pair contributes only when BOTH values are non-NULL, so this runs
                 // before the single-value NULL-skip below.
@@ -1338,6 +1378,10 @@ pub(crate) fn fold_value(
         F::Count => acc.count += 1,
         // GROUPING folds no row values; handled in accumulate_row's outer match, never here.
         F::Grouping => unreachable!("GROUPING is folded in the outer match arm"),
+        // JSON_OBJECT_AGG collects (key, value) pairs in accumulate_row's dedicated arm, never here.
+        F::JsonObjectAgg => {
+            unreachable!("JSON_OBJECT_AGG is folded in accumulate_row's dedicated arm")
+        },
         F::Sum | F::Avg => {
             // Maintain every accumulator so `finalize_aggregate` reads a consistent
             // total whatever the value mix is — mixed-numeric CASE/COALESCE branches
