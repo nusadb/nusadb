@@ -483,6 +483,9 @@ pub enum ScalarFunc {
     /// `NOW()` — the statement's wall-clock instant as `TIMESTAMPTZ`. Niladic; stable for
     /// every row of one statement.
     Now,
+    /// `STATEMENT_TIMESTAMP()` — the current statement's start instant as `TIMESTAMPTZ`. In this
+    /// engine `NOW()`/`CURRENT_TIMESTAMP` are already statement-scoped, so it is the same instant.
+    StatementTimestamp,
     /// `CURRENT_TIMESTAMP` — synonym for [`NOW()`](Self::Now), `TIMESTAMPTZ`. Niladic.
     CurrentTimestamp,
     /// `CURRENT_DATE` — the statement instant's calendar date as `DATE`. Niladic.
@@ -941,6 +944,7 @@ impl ScalarFunc {
             Self::RegexpSubstr => "regexp_substr",
             Self::RegexpSplitToArray => "regexp_split_to_array",
             Self::Now => "now",
+            Self::StatementTimestamp => "statement_timestamp",
             Self::CurrentTimestamp => "current_timestamp",
             Self::CurrentDate => "current_date",
             Self::CurrentTime => "current_time",

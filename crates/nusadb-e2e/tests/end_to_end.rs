@@ -311,6 +311,24 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn statement_timestamp_equals_now_within_a_statement() {
+    // statement_timestamp() is the statement's start instant; NOW()/CURRENT_TIMESTAMP are already
+    // statement-scoped in this engine, so within one statement they observe the same instant.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(&engine, "SELECT statement_timestamp() = now() AS eq")),
+        vec![vec![Value::Bool(true)]]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT statement_timestamp() = current_timestamp AS eq"
+        )),
+        vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
 fn json_object_builds_object_from_text_arrays() {
     // json_object(pairs) / json_object(keys, values): build a JSON object; values are stored as JSON
     // strings, a NULL value becomes JSON null, matching the reference engine. NusaDB renders compact.

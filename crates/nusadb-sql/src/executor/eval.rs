@@ -329,7 +329,7 @@ fn eval_scalar_function(
                 "GROUPING is only allowed in an aggregated query with GROUP BY".to_owned(),
             ));
         },
-        F::Now | F::CurrentTimestamp => {
+        F::Now | F::CurrentTimestamp | F::StatementTimestamp => {
             return Ok(ast::Value::TimestampTz(super::clock::statement_now_micros()));
         },
         F::CurrentDate => return Ok(ast::Value::Date(super::clock::statement_today())),

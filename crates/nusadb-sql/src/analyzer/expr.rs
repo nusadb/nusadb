@@ -1372,7 +1372,9 @@ pub(super) fn analyze_scalar_function(
             unreachable!("text-polymorphic functions are handled before the signature table")
         },
         // Niladic clock built-ins resolved from the statement's wall clock.
-        F::Now | F::CurrentTimestamp => ScalarSig::Fixed(&[], &[], ColumnType::TimestampTz),
+        F::Now | F::CurrentTimestamp | F::StatementTimestamp => {
+            ScalarSig::Fixed(&[], &[], ColumnType::TimestampTz)
+        },
         F::CurrentDate => ScalarSig::Fixed(&[], &[], ColumnType::Date),
         F::CurrentTime => ScalarSig::Fixed(&[], &[], ColumnType::Time),
         // Niladic session-user / system built-ins → TEXT. `current_setting` is grouped

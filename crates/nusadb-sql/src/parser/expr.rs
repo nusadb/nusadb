@@ -1164,6 +1164,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         // Niladic clock built-ins, reachable through the parenthesised call form `NOW()` /
         // `CURRENT_TIMESTAMP()` (the bare keyword form is mapped in `convert_function_call`).
         "now" => F::Now,
+        "statement_timestamp" => F::StatementTimestamp,
         "current_timestamp" => F::CurrentTimestamp,
         "current_date" => F::CurrentDate,
         "current_time" => F::CurrentTime,

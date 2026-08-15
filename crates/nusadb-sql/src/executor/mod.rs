@@ -806,7 +806,7 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// may be non-deterministic). These are the exact-case [`ast::ScalarFunc`] variant names plus
 /// `ScalarUdf`, so a genuine volatile call is never missed; an incidental match (e.g. a quoted
 /// identifier) only skips caching, which is always safe.
-const VOLATILE_PLAN_MARKERS: [&str; 18] = [
+const VOLATILE_PLAN_MARKERS: [&str; 19] = [
     "ScalarUdf",
     // Sequence built-ins advance / read engine + session state per call, so a memoized result would
     // hand out a stale (or duplicate) value — never cache a plan that mentions one.
@@ -814,6 +814,7 @@ const VOLATILE_PLAN_MARKERS: [&str; 18] = [
     "SequenceCurrent",
     "SequenceSet",
     "Now",
+    "StatementTimestamp",
     "CurrentTimestamp",
     "CurrentDate",
     "CurrentTime",
