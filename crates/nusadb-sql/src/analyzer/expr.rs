@@ -1417,8 +1417,11 @@ pub(super) fn analyze_scalar_function(
         F::Scale | F::MinScale => ScalarSig::Fixed(&[NUMERIC_ANY], &[], Int),
         F::TrimScale => ScalarSig::Fixed(&[NUMERIC_ANY], &[], NUMERIC_ANY),
         // ENCODE(bytea, format) → text; DECODE(text, format) → bytea (B-fn).
-        F::Encode => ScalarSig::Fixed(&[ColumnType::Bytes, Text], &[], Text),
-        F::Decode => ScalarSig::Fixed(&[Text, Text], &[], ColumnType::Bytes),
+        // ENCODE(bytea, format)→text and CONVERT_FROM(bytea, encoding)→text share the (Bytes, Text)→
+        // Text shape; DECODE(text, format)→bytea and CONVERT_TO(text, encoding)→bytea share
+        // (Text, Text)→Bytes. The executor distinguishes them by function.
+        F::Encode | F::ConvertFrom => ScalarSig::Fixed(&[ColumnType::Bytes, Text], &[], Text),
+        F::Decode | F::ConvertTo => ScalarSig::Fixed(&[Text, Text], &[], ColumnType::Bytes),
         // DATE_BIN(stride INTERVAL, source TIMESTAMP, origin TIMESTAMP) → TIMESTAMP.
         F::DateBin => ScalarSig::Fixed(
             &[

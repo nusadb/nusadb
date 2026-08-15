@@ -740,6 +740,16 @@ fn eval_scalar_function(
         // ENCODE(bytea, format) → text (`hex` / `escape`); DECODE(text, format) → bytea (B-fn).
         (F::Encode, [ast::Value::Bytes(b), Text(fmt)]) => Text(encode_bytea(b, fmt)?),
         (F::Decode, [Text(s), Text(fmt)]) => ast::Value::Bytes(decode_bytea(s, fmt)?),
+        (F::ConvertTo, [Text(s), Text(enc)]) => {
+            require_utf8_encoding(enc)?;
+            ast::Value::Bytes(s.clone().into_bytes())
+        },
+        (F::ConvertFrom, [ast::Value::Bytes(b), Text(enc)]) => {
+            require_utf8_encoding(enc)?;
+            Text(String::from_utf8(b.clone()).map_err(|_| {
+                Error::Unsupported("convert_from(): bytes are not valid UTF8".to_owned())
+            })?)
+        },
         // DATE_BIN(stride, source, origin) → snap `source` to its bin aligned to `origin`.
         (
             F::DateBin,
@@ -3512,6 +3522,20 @@ fn cast_to_numeric(
 
 /// `ENCODE(bytea, format)` — render raw bytes as text in the `hex` (lowercase, no `\x` prefix) or
 /// `escape` (printable bytes literal, others as `\nnn` octal, backslash doubled) format (B-fn).
+/// Accept only the `UTF8` encoding (the engine's native text encoding) for `convert_to`/
+/// `convert_from`. `UTF8` and `UTF-8` are the same encoding; any other is rejected loudly rather than
+/// silently mis-transcoded.
+fn require_utf8_encoding(encoding: &str) -> Result<(), Error> {
+    let normalized = encoding.trim().to_ascii_uppercase().replace('-', "");
+    if normalized == "UTF8" {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "convert: only the UTF8 encoding is supported, got `{encoding}`"
+        )))
+    }
+}
+
 fn encode_bytea(bytes: &[u8], format: &str) -> Result<String, Error> {
     match format.to_ascii_lowercase().as_str() {
         "hex" => {

@@ -562,6 +562,12 @@ pub enum ScalarFunc {
     Encode,
     /// `DECODE(text, format)` — parse a `TEXT` in `hex`/`escape`/`base64` into a `BYTEA` (B-fn).
     Decode,
+    /// `CONVERT_TO(text, encoding)` — the bytes of `text` in `encoding` as `BYTEA`. Only `UTF8` (the
+    /// engine's native encoding) is supported; any other encoding is rejected.
+    ConvertTo,
+    /// `CONVERT_FROM(bytea, encoding)` — decode `bytea` in `encoding` to `TEXT`. Only `UTF8` is
+    /// supported; any other encoding, or bytes not valid in it, is rejected.
+    ConvertFrom,
     /// `DATE_BIN(stride, source, origin)` — snap `TIMESTAMP source` down to the start of its
     /// `stride`-wide bin aligned to `origin`, as `TIMESTAMP`; the stride must be a positive,
     /// fixed-duration interval (no months/years).
@@ -977,6 +983,8 @@ impl ScalarFunc {
             Self::IsFinite => "isfinite",
             Self::Encode => "encode",
             Self::Decode => "decode",
+            Self::ConvertTo => "convert_to",
+            Self::ConvertFrom => "convert_from",
             Self::DateBin => "date_bin",
             Self::Abs => "abs",
             Self::Round => "round",

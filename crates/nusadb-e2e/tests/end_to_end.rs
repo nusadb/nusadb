@@ -311,6 +311,27 @@ fn log10_returns_base_ten_logarithm() {
 }
 
 #[test]
+fn convert_to_and_from_roundtrip_utf8() {
+    // convert_to(text,'UTF8') → the UTF8 bytes; convert_from(bytea,'UTF8') → text. A round-trip and
+    // the hex of the bytes match the reference engine; a non-UTF8 encoding is rejected loudly.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT encode(convert_to('héllo', 'UTF8'), 'hex')"
+        )),
+        vec![vec![Value::Text("68c3a96c6c6f".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT convert_from(convert_to('abc', 'UTF8'), 'UTF8')"
+        )),
+        vec![vec![Value::Text("abc".to_owned())]]
+    );
+}
+
+#[test]
 fn localtimestamp_is_the_statement_instant_without_zone() {
     // LOCALTIMESTAMP is a TIMESTAMP (no zone); with the session zone at UTC it is the same instant as
     // CURRENT_TIMESTAMP cast to timestamp — matching the reference engine.

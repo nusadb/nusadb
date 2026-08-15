@@ -1200,6 +1200,8 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "isfinite" => F::IsFinite,
         "encode" => F::Encode,
         "decode" => F::Decode,
+        "convert_to" => F::ConvertTo,
+        "convert_from" => F::ConvertFrom,
         "date_bin" => F::DateBin,
         // Math.
         "abs" => F::Abs,
