@@ -277,6 +277,12 @@ fn refuse_rename_with_dependents(
         ))
     };
     for c in engine.list_constraints(table.id)? {
+        // The engine's own synthetic type-check (declared width / length enforcement) references the
+        // column by name, but the rename rewrites it for the new name rather than refusing — so it
+        // never blocks a rename. Every non-synthetic dependent below still does.
+        if c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
+            continue;
+        }
         if c.columns.iter().any(|k| k == column) {
             return Err(refuse("constraint", &c.name));
         }
@@ -331,6 +337,32 @@ fn refuse_rename_with_dependents(
         return Err(refuse(what, &name));
     }
     Ok(())
+}
+
+/// The engine's synthetic type-check constraints whose predicate names `column`, as
+/// `(constraint name, predicate SQL)`. These are the width / length checks the engine generates for a
+/// typed column (`INT` range, `VARCHAR`/`CHAR` length); their predicate references the column by name,
+/// so `ALTER TABLE ... RENAME COLUMN` collects them here to drop and re-add rewritten for the new
+/// name — they cannot be regenerated from the runtime type, since the declared width is stored only in
+/// the predicate.
+fn synthetic_type_checks_on_column(
+    table: &TableSchema,
+    column: &str,
+    engine: &dyn StorageEngine,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut out = Vec::new();
+    for c in engine.list_constraints(table.id)? {
+        if !c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
+            continue;
+        }
+        if let Some(bytes) = &c.expr
+            && let Ok(sql) = std::str::from_utf8(bytes)
+            && sql_mentions_column(sql, column)
+        {
+            out.push((c.name.clone(), sql.to_owned()));
+        }
+    }
+    Ok(out)
 }
 
 /// The first SQL-holding derived object — view, materialized view, policy, trigger, function,
@@ -1069,10 +1101,35 @@ pub(super) fn run_alter_table(
         AlterColumnOp::RenameColumn { index, to } => {
             let from = column_name(&table, *index)?;
             refuse_rename_with_dependents(&table, &from, engine, txn)?;
-            AlterOp::RenameColumn {
-                from,
-                to: to.clone(),
+            // The engine's synthetic type-check(s) on this column name it in their predicate, so they
+            // must move with the rename. They cannot be regenerated from the column's runtime type
+            // (the declared width lives only in the predicate — every integer stores as i64), so the
+            // stored predicate is rewritten by re-quoting the new name. Drop before the rename, re-add
+            // after, all in this txn: drop clears the old dependency, the rename lands, the rewritten
+            // check re-enforces the same bound under the new name.
+            let synthetic = synthetic_type_checks_on_column(&table, &from, engine)?;
+            for c in &synthetic {
+                engine.drop_constraint(txn, table.id, &c.0)?;
             }
+            engine.alter_table(
+                txn,
+                table.id,
+                &AlterOp::RenameColumn {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            )?;
+            for (old_name, predicate) in &synthetic {
+                // Re-name by replacing only the column stem, so a per-check disambiguator suffix
+                // (`…_0`, `…_1` on a multi-CHECK DOMAIN column) is preserved and two checks on one
+                // renamed column cannot collide on the same new name.
+                let old_stem = format!("{}{from}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+                let new_stem = format!("{}{to}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+                let new_name = old_name.replacen(&old_stem, &new_stem, 1);
+                let new_predicate = predicate.replace(&format!("\"{from}\""), &format!("\"{to}\""));
+                engine.add_check_constraint(txn, table.id, &new_name, new_predicate.as_bytes())?;
+            }
+            return Ok(ExecutionResult::Altered);
         },
         AlterColumnOp::SetNotNull { index } => {
             ensure_no_nulls(&table, *index, engine, txn)?;

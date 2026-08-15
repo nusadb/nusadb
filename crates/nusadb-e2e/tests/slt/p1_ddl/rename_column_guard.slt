@@ -3,11 +3,11 @@
 #
 # A column name is written down in more places than the table's own schema: a constraint keeps its
 # key columns and its CHECK body, a foreign key keeps both sides, an index keeps its key, and a
-# default is filed under the column. Renaming moved only the schema entry, so every one of those was
-# left naming a column that no longer existed and the table stopped accepting writes while still
-# answering reads. Until those references are carried across, the rename is refused instead.
+# default is filed under the column. Renaming moved only the schema entry, so a USER-defined one of
+# those would be left naming a column that no longer existed. Those are still refused. The engine's
+# OWN synthetic width check, however, is rewritten for the new name and carried across.
 
-# --- The reported case: an INTEGER column carries a generated width check. ---
+# --- An INTEGER column carries a generated width check; RENAME now carries it to the new name. ---
 
 statement ok
 CREATE TABLE rn (a INTEGER, b INTEGER)
@@ -15,10 +15,11 @@ CREATE TABLE rn (a INTEGER, b INTEGER)
 statement ok
 INSERT INTO rn VALUES (1,2)
 
-statement error
+# The rename succeeds: the engine's synthetic width check moves with the column.
+statement ok
 ALTER TABLE rn RENAME COLUMN b TO c
 
-# The refusal leaves the table exactly as it was — still writable under its own name.
+# The column is readable and writable under its new name.
 statement ok
 INSERT INTO rn VALUES (3,4)
 
@@ -26,6 +27,10 @@ query I
 SELECT count(*) FROM rn
 ----
 2
+
+# The INTEGER width bound moved with the column — an out-of-range value is still rejected under `c`.
+statement error
+INSERT INTO rn VALUES (5, 9999999999)
 
 # --- A column nothing refers to still renames, and stays writable and readable after. ---
 

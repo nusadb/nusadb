@@ -4636,6 +4636,54 @@ fn alter_table_rename_to_renames_the_table() {
 }
 
 #[test]
+fn alter_table_rename_column_carries_the_synthetic_width_check() {
+    // RENAME COLUMN on a typed column (INT/SMALLINT/CHAR/VARCHAR) must succeed: the engine's own
+    // synthetic width/length check names the column in its predicate, and it is rewritten for the new
+    // name rather than blocking the rename. The declared width is preserved — an out-of-range write
+    // is still rejected under the new name — matching the reference engine, which keeps the type.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (a INT NOT NULL, s SMALLINT, v VARCHAR(5))",
+    );
+    run(&engine, "INSERT INTO t VALUES (1, 100, 'abc')");
+
+    run(&engine, "ALTER TABLE t RENAME COLUMN a TO a2");
+    run(&engine, "ALTER TABLE t RENAME COLUMN s TO s2");
+    run(&engine, "ALTER TABLE t RENAME COLUMN v TO v2");
+
+    // The row is reachable under every new name.
+    assert_eq!(
+        rows(run(&engine, "SELECT a2, s2, v2 FROM t")),
+        vec![vec![
+            Value::Int(1),
+            Value::Int(100),
+            Value::Text("abc".to_owned())
+        ]],
+    );
+    // The width bound moved with the column: SMALLINT still rejects an out-of-range value under s2.
+    assert!(
+        run_try(&engine, "INSERT INTO t (a2, s2) VALUES (2, 99999)").is_err(),
+        "SMALLINT range must still be enforced under the renamed column",
+    );
+    // VARCHAR(5) length still enforced under v2.
+    assert!(
+        run_try(&engine, "INSERT INTO t (a2, v2) VALUES (3, 'toolong')").is_err(),
+        "VARCHAR length must still be enforced under the renamed column",
+    );
+
+    // A USER-defined dependent is still a hard refusal (only the engine's own synthetic check moves).
+    run(
+        &engine,
+        "CREATE TABLE u (id INT NOT NULL, CONSTRAINT ck CHECK (id > 0))",
+    );
+    assert!(
+        run_try(&engine, "ALTER TABLE u RENAME COLUMN id TO id2").is_err(),
+        "a user CHECK referencing the column must still block the rename",
+    );
+}
+
+#[test]
 fn alter_table_add_column_default_backfills_existing_rows() {
     // `ADD COLUMN ... DEFAULT <expr>` fills existing rows with the
     // default (parity with the reference engine), not NULL, and later inserts that omit the column get it too.
