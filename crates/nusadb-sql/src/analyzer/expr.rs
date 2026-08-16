@@ -1366,7 +1366,9 @@ pub(super) fn analyze_scalar_function(
         // a BOOL / INT / INT / TEXT result respectively.
         F::RegexpLike => ScalarSig::Fixed(&[Text, Text], &[Text], ColumnType::Bool),
         F::RegexpCount | F::RegexpInstr => ScalarSig::Fixed(&[Text, Text], &[Text], Int),
-        F::RegexpSubstr => ScalarSig::Fixed(&[Text, Text], &[Text], Text),
+        // regexp_substr(string, pattern [, start int [, N int [, flags text [, subexpr int]]]]).
+        // The 3rd argument is the 1-based start position (an integer), NOT flags — flags come 5th.
+        F::RegexpSubstr => ScalarSig::Fixed(&[Text, Text], &[Int, Int, Text, Int], Text),
         // CONCAT needs ≥1 value; CONCAT_WS needs at least its separator.
         // CONCAT/CONCAT_WS and the LENGTH family are intercepted by
         // `analyze_text_polymorphic` above and never reach

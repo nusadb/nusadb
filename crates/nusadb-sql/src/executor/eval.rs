@@ -515,8 +515,27 @@ fn eval_scalar_function(
         (F::RegexpCount, [Text(s), Text(pat), Text(flags)]) => Int(regexp_count(s, pat, flags)?),
         (F::RegexpInstr, [Text(s), Text(pat)]) => Int(regexp_instr(s, pat, "")?),
         (F::RegexpInstr, [Text(s), Text(pat), Text(flags)]) => Int(regexp_instr(s, pat, flags)?),
-        (F::RegexpSubstr, [Text(s), Text(pat)]) => regexp_substr(s, pat, "")?,
-        (F::RegexpSubstr, [Text(s), Text(pat), Text(flags)]) => regexp_substr(s, pat, flags)?,
+        (F::RegexpSubstr, [Text(s), Text(pat)]) => regexp_substr(s, pat, 1, 1, "", 0)?,
+        (F::RegexpSubstr, [Text(s), Text(pat), Int(start)]) => {
+            regexp_substr(s, pat, *start, 1, "", 0)?
+        },
+        (F::RegexpSubstr, [Text(s), Text(pat), Int(start), Int(n)]) => {
+            regexp_substr(s, pat, *start, *n, "", 0)?
+        },
+        (F::RegexpSubstr, [Text(s), Text(pat), Int(start), Int(n), Text(flags)]) => {
+            regexp_substr(s, pat, *start, *n, flags, 0)?
+        },
+        (
+            F::RegexpSubstr,
+            [
+                Text(s),
+                Text(pat),
+                Int(start),
+                Int(n),
+                Text(flags),
+                Int(subexpr),
+            ],
+        ) => regexp_substr(s, pat, *start, *n, flags, *subexpr)?,
         (F::RegexpSplitToArray, [Text(s), Text(pat)]) => regexp_split_to_array(s, pat, "")?,
         (F::RegexpSplitToArray, [Text(s), Text(pat), Text(flags)]) => {
             regexp_split_to_array(s, pat, flags)?
@@ -1675,9 +1694,59 @@ pub(super) fn split_on_literal(s: &str, sep: &str) -> Vec<String> {
 
 /// `REGEXP_SUBSTR(s, pattern [, flags])` — the first substring of `s` matching `pattern`, or `NULL`
 /// if there is no match.
-fn regexp_substr(source: &str, pattern: &str, flags: &str) -> Result<ast::Value, Error> {
-    let (re, _global) = compile_regex(pattern, flags)?;
-    Ok(re.find(source).map_or(ast::Value::Null, |m| {
+/// `regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])` — the substring matched by
+/// `pattern`, following the reference engine's signature (verified against a live truth table):
+/// `start` is the 1-based character position to begin searching (default 1), `N` is
+/// which occurrence to return (1-based, default 1), `flags` tunes matching, and `subexpr` selects a
+/// capture group (0 = the whole match, the default). `start` and `N` below 1 are hard errors, the
+/// `g` (global) flag is rejected, and a non-existent occurrence / capture group yields NULL.
+fn regexp_substr(
+    source: &str,
+    pattern: &str,
+    start: i64,
+    n: i64,
+    flags: &str,
+    subexpr: i64,
+) -> Result<ast::Value, Error> {
+    if start < 1 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"start\": {start}"
+        )));
+    }
+    if n < 1 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"n\": {n}"
+        )));
+    }
+    if subexpr < 0 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"subexpr\": {subexpr}"
+        )));
+    }
+    let (re, global) = compile_regex(pattern, flags)?;
+    if global {
+        return Err(Error::Unsupported(
+            "regexp_substr() does not support the \"global\" option".to_owned(),
+        ));
+    }
+    // `start` counts characters, not bytes; a start past the end of the string finds nothing.
+    let start_char = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    let byte_off = if start_char == 0 {
+        0
+    } else {
+        match source.char_indices().nth(start_char) {
+            Some((b, _)) => b,
+            None => return Ok(ast::Value::Null),
+        }
+    };
+    let hay = source.get(byte_off..).unwrap_or("");
+    // The N-th match from the start offset; `subexpr` picks the capture group (0 = whole match).
+    let nth = usize::try_from(n - 1).unwrap_or(usize::MAX);
+    let Some(caps) = re.captures_iter(hay).nth(nth) else {
+        return Ok(ast::Value::Null);
+    };
+    let group = usize::try_from(subexpr).unwrap_or(usize::MAX);
+    Ok(caps.get(group).map_or(ast::Value::Null, |m| {
         ast::Value::Text(m.as_str().to_owned())
     }))
 }

@@ -1556,6 +1556,65 @@ fn added_scalar_functions_justify_days_encode_decode_regexp_matches() {
 }
 
 #[test]
+fn regexp_substr_matches_pg_signature() {
+    // regexp_substr(string, pattern [, start int [, N int [, flags [, subexpr]]]]) — the 3rd argument
+    // is a 1-based START position (integer), NOT flags (flags are 5th). Every expected value below is
+    // from the live reference engine (v16).
+    let engine = BtreeEngine::new();
+    let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
+    let t = |s: &str| Value::Text(s.to_owned());
+
+    assert_eq!(one("SELECT regexp_substr('foobarbaz', 'b..')"), t("bar"));
+    // 2-arg with capture groups still returns the WHOLE match (subexpr defaults to 0).
+    assert_eq!(
+        one(r"SELECT regexp_substr('2001-05-31', '(\d+)-(\d+)-(\d+)')"),
+        t("2001-05-31")
+    );
+    // 3rd arg = 1-based start position.
+    assert_eq!(one("SELECT regexp_substr('foobarbaz', 'b..', 5)"), t("baz"));
+    // 4th arg = which occurrence.
+    assert_eq!(
+        one("SELECT regexp_substr('foo1bar2baz3', '[0-9]', 1, 2)"),
+        t("2")
+    );
+    // 5th arg = flags.
+    assert_eq!(
+        one("SELECT regexp_substr('FOObar', 'foo', 1, 1, 'i')"),
+        t("FOO")
+    );
+    // 6th arg = capture group; 0 = whole match.
+    assert_eq!(
+        one(r"SELECT regexp_substr('2001-05-31', '(\d+)-(\d+)-(\d+)', 1, 1, 'i', 2)"),
+        t("05")
+    );
+    assert_eq!(
+        one(r"SELECT regexp_substr('2001-05-31', '(\d+)-(\d+)-(\d+)', 1, 1, 'i', 0)"),
+        t("2001-05-31")
+    );
+    // NULL: no match, start past end, occurrence past end, subexpr out of range.
+    assert_eq!(one("SELECT regexp_substr('abc', 'z')"), Value::Null);
+    assert_eq!(one("SELECT regexp_substr('abc', 'a', 10)"), Value::Null);
+    assert_eq!(
+        one("SELECT regexp_substr('a1b2', '[0-9]', 1, 5)"),
+        Value::Null
+    );
+    assert_eq!(
+        one("SELECT regexp_substr('ab', '(a)(b)', 1, 1, 'i', 5)"),
+        Value::Null
+    );
+    // start counts characters, not bytes.
+    assert_eq!(
+        one(r"SELECT regexp_substr('héllo wörld', '\w+', 3)"),
+        t("llo")
+    );
+
+    // start < 1, N < 1, and the global flag are hard errors (matching the reference engine).
+    assert!(run_try(&engine, "SELECT regexp_substr('abc','a',0)").is_err());
+    assert!(run_try(&engine, "SELECT regexp_substr('a1','[0-9]',1,0)").is_err());
+    assert!(run_try(&engine, "SELECT regexp_substr('abc','a',1,1,'g')").is_err());
+}
+
+#[test]
 fn regexp_matches_is_set_returning_with_the_global_flag() {
     // regexp_matches is a set-returning function: with the `g` flag it yields one row per match (each
     // a TEXT[] of the capture groups), not a single first-match row. (QA finding: the `g` form was
