@@ -1021,6 +1021,14 @@ pub trait StorageEngine: Send + Sync {
         Err(unsupported("create_schema"))
     }
 
+    /// Create a non-durable, session-scoped SQL schema (namespace) for temporary tables. It — and
+    /// every table created in it — is excluded from the WAL and the checkpoint image, so it never
+    /// survives recovery/restart. Default `Unsupported`; the durable engine overrides it.
+    fn create_temp_schema(&self, txn: TxnId, name: &str) -> Result<SchemaId> {
+        let _ = (txn, name);
+        Err(unsupported("create_temp_schema"))
+    }
+
     /// Drop a SQL schema (namespace). Rollback-aware DDL. With `cascade`, every table in the
     /// schema is dropped too; without it (`RESTRICT`, the default), dropping a non-empty schema
     /// is an error.

@@ -233,6 +233,33 @@ struct Catalog {
     namespaces: HashMap<u64, String>,
     ns_by_name: HashMap<String, u64>,
     next_namespace_id: u64,
+    /// Table ids created as session temporary tables (non-durable): their row/index/catalog
+    /// operations are never written to the WAL and are excluded from the checkpoint image, so they
+    /// never survive recovery/restart. Empty in the common all-durable case.
+    nondurable_tables: HashSet<u64>,
+    /// Namespace ids created as session temp schemas (non-durable), with the same WAL/checkpoint
+    /// exclusion as [`Self::nondurable_tables`].
+    nondurable_namespaces: HashSet<u64>,
+}
+
+impl Catalog {
+    /// Whether `table`'s operations should be persisted (WAL + checkpoint). An unknown/absent id is
+    /// treated as durable — the safe default (a persistent table is never silently dropped).
+    fn table_is_durable(&self, table: u64) -> bool {
+        !self.nondurable_tables.contains(&table)
+    }
+
+    /// Whether `index`'s operations should be persisted — follows the durability of its table.
+    fn index_is_durable(&self, index: u64) -> bool {
+        self.indexes
+            .get(&index)
+            .is_none_or(|i| self.table_is_durable(i.def.table.0))
+    }
+
+    /// Whether namespace `id`'s catalog operations should be persisted.
+    fn ns_is_durable(&self, id: u64) -> bool {
+        !self.nondurable_namespaces.contains(&id)
+    }
 }
 
 /// The transaction + lock manager (rank 6). Every critical section over it is O(1)-ish (map
@@ -1575,6 +1602,44 @@ impl BtreeEngine {
         Ok(())
     }
 
+    /// Log a catalog/data operation, SKIPPING it when it belongs to a non-durable (temp) object —
+    /// the single durability gate for every op-time WAL write, so no call site can forget it. The
+    /// durability of `op` is derived from the object it names using `cat` (the caller's held catalog
+    /// guard): a table op by its table, an index op by its index's table, a schema op by its
+    /// namespace; the sequence family is always durable (it is non-transactional). Drop ops must be
+    /// logged BEFORE the object is removed from `cat`, so its durability is still resolvable here.
+    fn log_op(&self, cat: &Catalog, op: &LoggedOp) -> Result<()> {
+        let durable = match op {
+            LoggedOp::Insert { table, .. }
+            | LoggedOp::InsertBatch { table, .. }
+            | LoggedOp::Update { table, .. }
+            | LoggedOp::Delete { table, .. }
+            | LoggedOp::CreateTable { table, .. }
+            | LoggedOp::DropTable { table, .. }
+            | LoggedOp::AlterSchema { table, .. }
+            | LoggedOp::SetStats { table, .. }
+            | LoggedOp::ClearStats { table, .. }
+            | LoggedOp::AddUnique { table, .. }
+            | LoggedOp::AddCheck { table, .. }
+            | LoggedOp::DropConstraint { table, .. } => cat.table_is_durable(*table),
+            LoggedOp::AddFk { child_table, .. } => cat.table_is_durable(*child_table),
+            LoggedOp::CreateIndex { def, .. } => cat.table_is_durable(def.table.0),
+            LoggedOp::DropIndex { index, .. }
+            | LoggedOp::IndexInsert { index, .. }
+            | LoggedOp::IndexDelete { index, .. }
+            | LoggedOp::IndexUnstamp { index, .. } => cat.index_is_durable(*index),
+            LoggedOp::SchemaCreate { id, .. } | LoggedOp::SchemaDrop { id, .. } => {
+                cat.ns_is_durable(*id)
+            },
+            // The sequence family is non-transactional and always durable.
+            LoggedOp::SeqCreate { .. } | LoggedOp::SeqDrop { .. } | LoggedOp::SeqSet { .. } => true,
+        };
+        if durable {
+            self.log(&op.to_record())?;
+        }
+        Ok(())
+    }
+
     /// End a committed transaction in memory: drop its state, release its locks, leave the
     /// active set (its writes become visible), and bump the data-change version iff it wrote
     /// (a read-only commit leaves the SQL result cache valid). On the durable path this
@@ -1692,7 +1757,7 @@ impl BtreeEngine {
         clippy::too_many_lines,
         reason = "a flat one-arm-per-undo-op inverse table; splitting it would scatter the                   compensation semantics"
     )]
-    fn log_compensations(&self, txn: TxnId, undone: &[UndoOp]) -> Result<()> {
+    fn log_compensations(&self, cat: &Catalog, txn: TxnId, undone: &[UndoOp]) -> Result<()> {
         if self.wal.is_none() {
             return Ok(());
         }
@@ -1927,8 +1992,10 @@ impl BtreeEngine {
                     name: name.clone(),
                 }],
             };
+            // A compensation for a non-durable (temp) object is skipped: its original op was never
+            // logged, so there is nothing to neutralize (and nothing must reach the WAL).
             for comp in comps {
-                self.log(&comp.to_record())?;
+                self.log_op(cat, &comp)?;
             }
         }
         // A neutralizing SeqDrop must be as durable as the SeqCreate it erases (both replay
@@ -2239,13 +2306,24 @@ impl BtreeEngine {
         let mut sorted_ns: Vec<_> = cat.namespaces.iter().collect();
         sorted_ns.sort_by_key(|(id, _)| **id);
         for (id, name) in sorted_ns {
+            // A non-durable temp schema is excluded from the image (with its tables, above/below).
+            if !cat.ns_is_durable(*id) {
+                continue;
+            }
             ops.push(LoggedOp::SchemaCreate {
                 txn: synthetic_txn,
                 id: *id,
                 name: name.clone(),
             });
         }
-        let mut sorted_tables: Vec<_> = cat.tables.iter().collect();
+        // Non-durable (temp) tables are excluded from the checkpoint image entirely — this single
+        // filter keeps both the schema-declaration loop and the rows loop below from emitting them,
+        // so a temp table never persists across a restart.
+        let mut sorted_tables: Vec<_> = cat
+            .tables
+            .iter()
+            .filter(|(id, _)| cat.table_is_durable(**id))
+            .collect();
         sorted_tables.sort_by_key(|(id, _)| **id);
         for (id, t) in &sorted_tables {
             // The full version history is re-declared: the lowest version as the CREATE, each
@@ -2302,6 +2380,10 @@ impl BtreeEngine {
         let mut sorted_indexes: Vec<_> = cat.indexes.iter().collect();
         sorted_indexes.sort_by_key(|(id, _)| **id);
         for (id, idx) in sorted_indexes {
+            // Skip indexes on non-durable temp tables.
+            if !cat.index_is_durable(*id) {
+                continue;
+            }
             ops.push(LoggedOp::CreateIndex {
                 txn: synthetic_txn,
                 index: *id,
@@ -2327,6 +2409,9 @@ impl BtreeEngine {
         let mut sorted_constraints: Vec<_> = cat.constraints.iter().collect();
         sorted_constraints.sort_by_key(|(table, _)| **table);
         for (table, uniques) in sorted_constraints {
+            if !cat.table_is_durable(*table) {
+                continue;
+            }
             for u in uniques {
                 ops.push(LoggedOp::AddUnique {
                     txn: synthetic_txn,
@@ -2341,6 +2426,9 @@ impl BtreeEngine {
         let mut sorted_checks: Vec<_> = cat.checks.iter().collect();
         sorted_checks.sort_by_key(|(table, _)| **table);
         for (table, checks) in sorted_checks {
+            if !cat.table_is_durable(*table) {
+                continue;
+            }
             for c in checks {
                 ops.push(LoggedOp::AddCheck {
                     txn: synthetic_txn,
@@ -2353,6 +2441,9 @@ impl BtreeEngine {
         let mut sorted_fks: Vec<_> = cat.foreign_keys.values().collect();
         sorted_fks.sort_by(|a, b| a.name.cmp(&b.name));
         for fk in sorted_fks {
+            if !(cat.table_is_durable(fk.child_table) && cat.table_is_durable(fk.parent_table)) {
+                continue;
+            }
             ops.push(LoggedOp::AddFk {
                 txn: synthetic_txn,
                 name: fk.name.clone(),
@@ -2371,7 +2462,7 @@ impl BtreeEngine {
         let mut sorted_stats: Vec<_> = cat
             .stats
             .iter()
-            .filter(|(id, _)| cat.tables.contains_key(id))
+            .filter(|(id, _)| cat.tables.contains_key(id) && cat.table_is_durable(**id))
             .collect();
         sorted_stats.sort_by_key(|(table, _)| **table);
         for (table, stats) in sorted_stats {
@@ -3016,6 +3107,12 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: def.name.clone(),
             });
         }
+        // A table created in a non-durable temp schema is itself non-durable: its ops are never
+        // WAL-logged and it is excluded from the checkpoint image (so it never survives recovery).
+        let durable = cat
+            .ns_by_name
+            .get(&def.schema)
+            .is_none_or(|nid| !cat.nondurable_namespaces.contains(nid));
         let id = cat.next_table_id;
         cat.next_table_id += 1;
         let schema = TableSchema {
@@ -3037,15 +3134,20 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
         );
         cat.by_name.insert(key, id);
+        if !durable {
+            cat.nondurable_tables.insert(id);
+        }
         self.push_undo(txn.0, UndoOp::CreatedTable { table: id })?;
-        // Logged under the catalog write guard: DDL log order equals catalog apply order.
-        self.log(
+        // Logged under the catalog write guard: DDL log order equals catalog apply order. `log_op`
+        // is the single durability gate — it skips the WAL entirely for a non-durable (temp) table,
+        // so the call is made unconditionally (no redundant outer `if durable`).
+        self.log_op(
+            &cat,
             &LoggedOp::CreateTable {
                 txn: txn.0,
                 table: id,
                 def: def.clone(),
-            }
-            .to_record(),
+            },
         )?;
         Ok(TableId(id))
     }
@@ -3092,21 +3194,29 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     previous: previous_stats.map(Box::new),
                 },
             )?;
-            self.log(
+            self.log_op(
+                &cat,
                 &LoggedOp::ClearStats {
                     txn: txn.0,
                     table: table.0,
-                }
-                .to_record(),
+                },
             )?;
         }
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::DropTable {
                 txn: txn.0,
                 table: table.0,
-            }
-            .to_record(),
+            },
         )?;
+        // The non-durable marker is deliberately NOT cleared here. Dropping only removes the table
+        // from `cat.tables` in memory; the drop is not durable until commit, and a rollback (full
+        // abort or `ROLLBACK TO SAVEPOINT`) restores the table via `UndoOp::DroppedTable`. Clearing
+        // the marker now would make that restored temp table look durable — `log_compensations` (or
+        // any later write) would then log its DDL/rows to the WAL and it would survive recovery,
+        // breaking the core invariant. Ids are monotonic and never reused, and the set is only ever
+        // probed by `contains` for a live id, so leaving the id of a committed-dropped table in the
+        // set is a harmless, bounded no-op. Rollback of a CREATE prunes its own id in `undo_ops`.
         Ok(())
     }
 
@@ -3214,7 +3324,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 new_version,
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::AlterSchema {
                 txn: txn.0,
                 table: table.0,
@@ -3224,8 +3335,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     name: new_schema.name,
                     columns: new_schema.columns,
                 },
-            }
-            .to_record(),
+            },
         )?;
         Ok(())
     }
@@ -3249,14 +3359,41 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: name.to_owned(),
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::SchemaCreate {
                 txn: txn.0,
                 id,
                 name: name.to_owned(),
-            }
-            .to_record(),
+            },
         )?;
+        Ok(SchemaId(id))
+    }
+
+    fn create_temp_schema(&self, txn: TxnId, name: &str) -> Result<SchemaId> {
+        let mut cat = self.catalog.write().map_err(|_| poisoned())?;
+        if !self.txn_exists(txn.0)? {
+            return Err(unknown_txn(txn));
+        }
+        if cat.ns_by_name.contains_key(name) {
+            return Err(schema_error(&format!("schema {name} already exists")));
+        }
+        let id = cat.next_namespace_id;
+        cat.next_namespace_id += 1;
+        cat.ns_by_name.insert(name.to_owned(), id);
+        cat.namespaces.insert(id, name.to_owned());
+        // Mark non-durable BEFORE any table is created in it, so `create_table` sees the temp schema
+        // and makes its tables non-durable too.
+        cat.nondurable_namespaces.insert(id);
+        self.push_undo(
+            txn.0,
+            UndoOp::CreatedSchema {
+                id,
+                name: name.to_owned(),
+            },
+        )?;
+        // Non-durable: no `SchemaCreate` is written to the WAL, and `emit_image_records` excludes it
+        // from the checkpoint image, so it never survives recovery/restart.
         Ok(SchemaId(id))
     }
 
@@ -3295,14 +3432,19 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             return Err(schema_not_found(id));
         };
         cat.ns_by_name.remove(&name);
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::SchemaDrop {
                 txn: txn.0,
                 id: id.0,
                 name: name.clone(),
-            }
-            .to_record(),
+            },
         )?;
+        // The non-durable marker is deliberately NOT cleared here — same reasoning as `drop_table`:
+        // a rolled-back `DROP SCHEMA` restores the namespace via `UndoOp::DroppedSchema`, and a
+        // cleared marker would make the restored temp schema (and any table recreated under it by a
+        // compensation) look durable and survive recovery. A committed drop leaves a harmless,
+        // bounded stale id; rollback of a CREATE prunes its own id in `undo_ops`.
         self.push_undo(txn.0, UndoOp::DroppedSchema { id: id.0, name })?;
         Ok(())
     }
@@ -3383,13 +3525,15 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             tids.push(tid_of(row_id));
         }
         // Built from the borrowed tuples — no deep clone of the statement's rows while the
-        // writer latch is held.
-        self.log(&wal::insert_batch_record(
-            txn.0,
-            table.0,
-            first_row_id,
-            tuples,
-        ))?;
+        // writer latch is held. Skipped for a non-durable (temp) table.
+        if cat.table_is_durable(table.0) {
+            self.log(&wal::insert_batch_record(
+                txn.0,
+                table.0,
+                first_row_id,
+                tuples,
+            ))?;
+        }
         Ok(tids)
     }
 
@@ -3439,14 +3583,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 row_id,
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::Insert {
                 txn: txn.0,
                 table: table.0,
                 row_id,
                 tuple: tuple.to_vec(),
-            }
-            .to_record(),
+            },
         )?;
         Ok(tid_of(row_id))
     }
@@ -3524,14 +3668,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 undo_idx,
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::Update {
                 txn: txn.0,
                 table: table.0,
                 row_id,
                 tuple: tuple.to_vec(),
-            }
-            .to_record(),
+            },
         )?;
         // The row keeps its address (its row-id) across versions.
         Ok(tid)
@@ -3587,13 +3731,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 old: old_value,
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::Delete {
                 txn: txn.0,
                 table: table.0,
                 row_id,
-            }
-            .to_record(),
+            },
         )?;
         Ok(())
     }
@@ -3864,13 +4008,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
         );
         self.push_undo(txn.0, UndoOp::CreatedIndex { index: id })?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::CreateIndex {
                 txn: txn.0,
                 index: id,
                 def: def.clone(),
-            }
-            .to_record(),
+            },
         )?;
         Ok(IndexId(id))
     }
@@ -3884,15 +4028,23 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .indexes
             .remove(&id.0)
             .ok_or_else(|| index_not_found(id))?;
+        // Resolve durability from the parent table BEFORE the index leaves `cat.indexes`: once it is
+        // removed, `log_op`'s `index_is_durable` (which looks the index up in `cat.indexes`) can no
+        // longer see it and would default to durable. Unlike `create_table`, this outer gate is not
+        // redundant with `log_op` — it is the only place the parent link is still resolvable, so a
+        // temp-table index correctly skips the WAL here.
+        let parent_durable = cat.table_is_durable(state.def.table.0);
         cat.idx_by_name.remove(&state.def.name);
         self.push_undo(txn.0, UndoOp::DroppedIndex { index: id.0, state })?;
-        self.log(
-            &LoggedOp::DropIndex {
-                txn: txn.0,
-                index: id.0,
-            }
-            .to_record(),
-        )?;
+        if parent_durable {
+            self.log_op(
+                &cat,
+                &LoggedOp::DropIndex {
+                    txn: txn.0,
+                    index: id.0,
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -3990,14 +4142,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 },
             )?;
         }
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::IndexInsert {
                 txn: txn.0,
                 index: index.0,
                 row_id,
                 key: owned,
-            }
-            .to_record(),
+            },
         )?;
         Ok(())
     }
@@ -4045,14 +4197,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     meta,
                 },
             )?;
-            self.log(
+            self.log_op(
+                &cat,
                 &LoggedOp::IndexDelete {
                     txn: txn.0,
                     index: index.0,
                     row_id,
                     key: key.to_vec(),
-                }
-                .to_record(),
+                },
             )?;
         }
         Ok(())
@@ -4202,7 +4354,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: name.to_owned(),
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::AddUnique {
                 txn: txn.0,
                 table: table.0,
@@ -4210,8 +4363,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: name.to_owned(),
                 columns: columns.to_vec(),
                 primary,
-            }
-            .to_record(),
+            },
         )?;
         Ok(index)
     }
@@ -4250,14 +4402,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: name.to_owned(),
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::AddCheck {
                 txn: txn.0,
                 table: table.0,
                 name: name.to_owned(),
                 expr: expr.to_vec(),
-            }
-            .to_record(),
+            },
         )?;
         Ok(())
     }
@@ -4282,13 +4434,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                         state: check,
                     },
                 )?;
-                self.log(
+                self.log_op(
+                    &cat,
                     &LoggedOp::DropConstraint {
                         txn: txn.0,
                         table: table.0,
                         name: name.to_owned(),
-                    }
-                    .to_record(),
+                    },
                 )?;
                 return Ok(());
             }
@@ -4304,13 +4456,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 };
                 let child_index = fk.child_index;
                 self.push_undo(txn.0, UndoOp::DroppedForeignKey { state: fk })?;
-                self.log(
+                self.log_op(
+                    &cat,
                     &LoggedOp::DropConstraint {
                         txn: txn.0,
                         table: table.0,
                         name: name.to_owned(),
-                    }
-                    .to_record(),
+                    },
                 )?;
                 child_index
             } else {
@@ -4349,13 +4501,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                         state,
                     },
                 )?;
-                self.log(
+                self.log_op(
+                    &cat,
                     &LoggedOp::DropConstraint {
                         txn: txn.0,
                         table: table.0,
                         name: name.to_owned(),
-                    }
-                    .to_record(),
+                    },
                 )?;
                 index
             }
@@ -4517,7 +4669,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 child_table: def.child_table.0,
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::AddFk {
                 txn: txn.0,
                 name: def.name.clone(),
@@ -4528,8 +4681,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 child_index: child_index.0,
                 on_delete: def.on_delete,
                 on_update: def.on_update,
-            }
-            .to_record(),
+            },
         )?;
         Ok(child_index)
     }
@@ -4638,13 +4790,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 previous: previous.map(Box::new),
             },
         )?;
-        self.log(
+        self.log_op(
+            &cat,
             &LoggedOp::SetStats {
                 txn: txn.0,
                 table: table.0,
                 stats: stats.clone(),
-            }
-            .to_record(),
+            },
         )?;
         Ok(())
     }
@@ -4932,13 +5084,13 @@ impl BtreeEngine {
         if Self::undo_needs_catalog_write(&ops) {
             let mut cat = self.catalog.write().map_err(|_| poisoned())?;
             if compensate {
-                self.log_compensations(txn, &ops)?;
+                self.log_compensations(&cat, txn, &ops)?;
             }
             self.undo_ops(&mut CatalogRef::Write(&mut cat), txn.0, ops)
         } else {
             let cat = self.catalog.read().map_err(|_| poisoned())?;
             if compensate {
-                self.log_compensations(txn, &ops)?;
+                self.log_compensations(&cat, txn, &ops)?;
             }
             self.undo_ops(&mut CatalogRef::Read(&cat), txn.0, ops)
         }
@@ -5235,6 +5387,8 @@ impl BtreeEngine {
                 },
                 UndoOp::CreatedTable { table } => {
                     let cat = cat.get_mut()?;
+                    // A rolled-back temp table must not leave its id in the non-durable set.
+                    cat.nondurable_tables.remove(&table);
                     if let Some(state) = cat.tables.remove(&table) {
                         let root = state.root_id();
                         cat.by_name
@@ -5367,6 +5521,8 @@ impl BtreeEngine {
                 },
                 UndoOp::CreatedSchema { id, name } => {
                     let cat = cat.get_mut()?;
+                    // A rolled-back temp schema must not leave its id in the non-durable set.
+                    cat.nondurable_namespaces.remove(&id);
                     cat.namespaces.remove(&id);
                     cat.ns_by_name.remove(&name);
                 },
