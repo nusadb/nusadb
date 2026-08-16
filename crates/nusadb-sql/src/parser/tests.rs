@@ -4789,14 +4789,28 @@ fn create_temporary_table_is_parsed() {
 }
 
 #[test]
-fn create_temporary_table_on_commit_is_rejected() {
-    // Only the default PRESERVE ROWS is implemented; an explicit DELETE ROWS / DROP must not be
-    // silently downgraded to a preserve-rows temp table.
-    for sql in [
-        "CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS",
-        "CREATE TEMP TABLE t (id INT) ON COMMIT DROP",
+fn create_temporary_table_on_commit_parses() {
+    // Every ON COMMIT disposition now parses and is carried into the AST; a non-temp ON COMMIT is
+    // rejected later (by the analyzer), not by the parser.
+    for (sql, want) in [
+        (
+            "CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS",
+            ast::OnCommit::DeleteRows,
+        ),
+        (
+            "CREATE TEMP TABLE t (id INT) ON COMMIT DROP",
+            ast::OnCommit::Drop,
+        ),
+        (
+            "CREATE TEMP TABLE t (id INT) ON COMMIT PRESERVE ROWS",
+            ast::OnCommit::PreserveRows,
+        ),
+        ("CREATE TEMP TABLE t (id INT)", ast::OnCommit::PreserveRows),
     ] {
-        assert!(matches!(parse(sql), Err(Error::Unsupported(_))), "{sql}");
+        let ast::Statement::CreateTable(ct) = ok(sql) else {
+            panic!("expected CreateTable for {sql}");
+        };
+        assert_eq!(ct.on_commit, want, "{sql}");
     }
 }
 

@@ -14,6 +14,19 @@ pub(super) fn analyze_create_table(
     // A non-superuser must not squat a system-catalog name (e.g. pre-create `nusadb_policies`
     // before the engine does, forging what later reads as the policy catalog).
     enforce_system_catalog(&ct.name, catalog)?;
+    // `ON COMMIT {DELETE ROWS | DROP}` only means anything for a temporary table (its rows/lifetime
+    // are tied to the transaction). On an ordinary table it is meaningless, so reject it loudly rather
+    // than create a persistent table that silently ignores the clause.
+    if !ct.temporary
+        && matches!(
+            ct.on_commit,
+            ast::OnCommit::DeleteRows | ast::OnCommit::Drop
+        )
+    {
+        return Err(Error::Unsupported(
+            "ON COMMIT can only be used on temporary tables".to_owned(),
+        ));
+    }
     // `CREATE TABLE ... (LIKE src)`: copy `src`'s columns (type + `NOT NULL`) ahead of any columns
     // written after the LIKE clause, as the reference engine does. Only name/type/nullable are copied
     // (the basic LIKE form); the executor additionally copies `src`'s synthetic width/length checks,
@@ -101,6 +114,7 @@ pub(super) fn analyze_create_table(
         if_not_exists: ct.if_not_exists,
         temporary: ct.temporary,
         like_source: ct.like_source,
+        on_commit: ct.on_commit,
     })
 }
 

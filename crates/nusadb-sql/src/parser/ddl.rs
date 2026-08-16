@@ -38,18 +38,15 @@ pub(super) fn convert_analyze(
 
 pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statement, Error> {
     // `CREATE TEMP/TEMPORARY TABLE` is created in the session's non-durable temp schema (see
-    // `analyze_create_table`); `GLOBAL`/`LOCAL` are treated alike, so `ct.global` is ignored. Only the
-    // default `ON COMMIT PRESERVE ROWS` (the tables we implement) is accepted — an explicit
-    // `ON COMMIT DELETE ROWS`/`DROP` is rejected loudly rather than silently ignored (silent-wrong
-    // class). The guard fires regardless of `temporary` (a non-temp table cannot carry `ON COMMIT`).
-    if matches!(
-        ct.on_commit,
-        Some(sql::OnCommit::DeleteRows | sql::OnCommit::Drop)
-    ) {
-        return unsupported(
-            "CREATE TEMPORARY TABLE ... ON COMMIT (only PRESERVE ROWS is supported)",
-        );
-    }
+    // `analyze_create_table`); `GLOBAL`/`LOCAL` are treated alike, so `ct.global` is ignored. The
+    // `ON COMMIT {PRESERVE ROWS | DELETE ROWS | DROP}` disposition is carried into the AST; a
+    // non-default action on a non-temporary table is rejected by the analyzer (where the temp flag and
+    // catalog are known), and the wire layer — which owns transaction boundaries — fires the action.
+    let on_commit = match ct.on_commit {
+        None | Some(sql::OnCommit::PreserveRows) => ast::OnCommit::PreserveRows,
+        Some(sql::OnCommit::DeleteRows) => ast::OnCommit::DeleteRows,
+        Some(sql::OnCommit::Drop) => ast::OnCommit::Drop,
+    };
     // `PARTITION BY` / `CLUSTERED BY` change where rows physically live. NusaDB has no table
     // partitioning yet, so silently dropping the clause and creating an ordinary unpartitioned heap
     // would mis-store rows and accept out-of-range inserts — the same silent-wrong class as the
@@ -122,6 +119,7 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         if_not_exists: ct.if_not_exists,
         temporary: ct.temporary,
         like_source,
+        on_commit,
     }))
 }
 

@@ -10769,11 +10769,22 @@ fn temp_tables_are_isolated_across_sessions() {
 }
 
 #[test]
-fn temp_table_on_commit_is_rejected() {
-    // Only the default PRESERVE ROWS is implemented; an explicit non-default ON COMMIT must not be
-    // silently accepted as a persistent (or preserve-rows) temp table.
-    assert!(parse("CREATE TEMP TABLE t (id INT) ON COMMIT DROP").is_err());
-    assert!(parse("CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS").is_err());
+fn temp_table_on_commit_parses_and_rejects_non_temp() {
+    // A temporary table now accepts every ON COMMIT disposition (the wire layer fires DELETE ROWS /
+    // DROP at commit); the parser accepts it.
+    assert!(parse("CREATE TEMP TABLE t (id INT) ON COMMIT DROP").is_ok());
+    assert!(parse("CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS").is_ok());
+    // ON COMMIT is meaningless on an ordinary table — the analyzer rejects it loudly rather than
+    // create a persistent table that silently ignores the clause.
+    let engine = BtreeEngine::new();
+    assert!(matches!(
+        run_try(&engine, "CREATE TABLE t (id INT) ON COMMIT DROP"),
+        Err(nusadb_sql::Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        run_try(&engine, "CREATE TABLE t2 (id INT) ON COMMIT DELETE ROWS"),
+        Err(nusadb_sql::Error::Unsupported(_))
+    ));
 }
 
 #[test]

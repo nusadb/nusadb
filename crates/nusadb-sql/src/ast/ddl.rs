@@ -7,6 +7,25 @@
 use super::*;
 use nusadb_core::ColumnType;
 
+/// The `ON COMMIT` action of a `CREATE TEMPORARY TABLE`.
+///
+/// Determines what happens to the table at the end of each transaction. Meaningful only for temporary
+/// tables (a non-temp `ON COMMIT` is rejected by the analyzer); the wire layer, which owns the
+/// per-connection transaction boundaries, fires the non-default actions after each successful
+/// `COMMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCommit {
+    /// `ON COMMIT PRESERVE ROWS` (also the default when no clause is given) — the table and its rows
+    /// persist across commits, for the life of the session.
+    #[default]
+    PreserveRows,
+    /// `ON COMMIT DELETE ROWS` — the table's rows are emptied at the end of every transaction; the
+    /// table itself persists.
+    DeleteRows,
+    /// `ON COMMIT DROP` — the table is dropped at the end of the transaction that created it.
+    Drop,
+}
+
 /// `CREATE TABLE name (columns...)`.
 // Not `Eq`: a table-level `CHECK` constraint carries an `Expr`, which is only `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +50,10 @@ pub struct CreateTable {
     /// catalog at analysis (the parser has no catalog), and the width-enforcing checks are copied at
     /// execution, so the copy preserves the declared width the runtime `ColumnType` alone would lose.
     pub like_source: Option<String>,
+    /// `ON COMMIT {PRESERVE ROWS | DELETE ROWS | DROP}` — the end-of-transaction disposition of a
+    /// temporary table (see [`OnCommit`]). [`PreserveRows`](OnCommit::PreserveRows) for the default /
+    /// an ordinary table. A non-default action on a non-temporary table is rejected by the analyzer.
+    pub on_commit: OnCommit,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name AS <select>`.

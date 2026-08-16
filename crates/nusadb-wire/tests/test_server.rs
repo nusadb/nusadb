@@ -3911,3 +3911,210 @@ async fn temp_table_shadows_isolated_and_dropped_on_disconnect() {
     drop(b);
     handle_b.await.unwrap().unwrap();
 }
+
+// --- ON COMMIT temporary-table dispositions -------------------------------
+
+/// Run a simple query and assert its command tag, consuming through `ReadyForQuery(Idle)`.
+async fn run_tagged<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    sql: &str,
+    tag: &str,
+) {
+    query(conn, sql).await;
+    assert_eq!(next(conn).await, cc(tag), "{sql}");
+    consume_until_ready(conn).await;
+}
+
+/// Run a simple query expected to fail in autocommit: assert an `Error` frame, then the ready.
+async fn run_error<S: AsyncRead + AsyncWrite + Unpin>(conn: &mut Connection<S>, sql: &str) {
+    query(conn, sql).await;
+    assert!(
+        matches!(next(conn).await, BackendMessage::Error { .. }),
+        "expected an error for {sql}"
+    );
+    consume_until_ready(conn).await;
+}
+
+/// `ON COMMIT DELETE ROWS` empties the table at each autocommit statement's own commit, so an
+/// autocommit INSERT's rows are gone by the following SELECT.
+#[tokio::test]
+async fn on_commit_delete_rows_empties_after_autocommit() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    run_tagged(
+        &mut conn,
+        "CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS",
+        "CREATE TABLE",
+    )
+    .await;
+    run_tagged(&mut conn, "INSERT INTO t VALUES (9)", "INSERT 1").await;
+    query(&mut conn, "SELECT count(*) FROM t").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"0".to_vec())]);
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// `ON COMMIT DELETE ROWS` keeps rows visible within the explicit transaction that wrote them and
+/// empties the table when that transaction commits.
+#[tokio::test]
+async fn on_commit_delete_rows_empties_after_explicit_commit() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "BEGIN").await;
+    assert_eq!(next(&mut conn).await, cc("BEGIN"));
+    consume_until_ready_in_txn(&mut conn).await;
+    query(
+        &mut conn,
+        "CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS",
+    )
+    .await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready_in_txn(&mut conn).await;
+    query(&mut conn, "INSERT INTO t VALUES (1), (2)").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 2"));
+    consume_until_ready_in_txn(&mut conn).await;
+    // Still inside the transaction: the rows are visible.
+    query(&mut conn, "SELECT count(*) FROM t").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"2".to_vec())]);
+    // Committing empties the table.
+    run_tagged(&mut conn, "COMMIT", "COMMIT").await;
+    query(&mut conn, "SELECT count(*) FROM t").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"0".to_vec())]);
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// `ON COMMIT DROP` created as its own autocommit statement is dropped at that statement's commit —
+/// the table is gone immediately.
+#[tokio::test]
+async fn on_commit_drop_removes_table_after_autocommit() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    run_tagged(
+        &mut conn,
+        "CREATE TEMP TABLE t (id INT) ON COMMIT DROP",
+        "CREATE TABLE",
+    )
+    .await;
+    // The table was dropped at its own commit, so referencing it now errors.
+    run_error(&mut conn, "SELECT count(*) FROM t").await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// `ON COMMIT DROP` in an explicit transaction drops the table when that transaction commits.
+#[tokio::test]
+async fn on_commit_drop_removes_table_after_explicit_commit() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "BEGIN").await;
+    assert_eq!(next(&mut conn).await, cc("BEGIN"));
+    consume_until_ready_in_txn(&mut conn).await;
+    query(&mut conn, "CREATE TEMP TABLE t (id INT) ON COMMIT DROP").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready_in_txn(&mut conn).await;
+    query(&mut conn, "INSERT INTO t VALUES (1)").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready_in_txn(&mut conn).await;
+    run_tagged(&mut conn, "COMMIT", "COMMIT").await;
+    // Committed → the table has been dropped.
+    run_error(&mut conn, "SELECT count(*) FROM t").await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// The default `ON COMMIT PRESERVE ROWS` is unchanged: the table and its rows persist across commits.
+#[tokio::test]
+async fn on_commit_preserve_rows_persists() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    run_tagged(
+        &mut conn,
+        "CREATE TEMP TABLE t (id INT) ON COMMIT PRESERVE ROWS",
+        "CREATE TABLE",
+    )
+    .await;
+    run_tagged(&mut conn, "INSERT INTO t VALUES (1)", "INSERT 1").await;
+    // A later autocommit statement's commit does not empty a PRESERVE ROWS table.
+    query(&mut conn, "SELECT count(*) FROM t").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"1".to_vec())]);
+    query(&mut conn, "SELECT count(*) FROM t").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"1".to_vec())]);
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// `ON COMMIT` on an ordinary (non-temporary) table is rejected — the clause is meaningless there.
+#[tokio::test]
+async fn on_commit_on_non_temp_table_is_rejected() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    run_error(&mut conn, "CREATE TABLE t (id INT) ON COMMIT DROP").await;
+    run_error(&mut conn, "CREATE TABLE t2 (id INT) ON COMMIT DELETE ROWS").await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// An `ON COMMIT DROP` table whose creating transaction rolls back never existed — nothing is
+/// dropped, and its registration is discarded so it cannot later fire against an unrelated table.
+#[tokio::test]
+async fn on_commit_drop_rollback_leaves_nothing_dangling() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "BEGIN").await;
+    assert_eq!(next(&mut conn).await, cc("BEGIN"));
+    consume_until_ready_in_txn(&mut conn).await;
+    query(&mut conn, "CREATE TEMP TABLE t (id INT) ON COMMIT DROP").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready_in_txn(&mut conn).await;
+    run_tagged(&mut conn, "ROLLBACK", "ROLLBACK").await;
+    // The rolled-back table never existed.
+    run_error(&mut conn, "SELECT count(*) FROM t").await;
+
+    // A fresh PRESERVE ROWS temp table of the same name must survive later commits — proving the
+    // discarded DROP registration is not dangling and does not fire against it.
+    run_tagged(&mut conn, "CREATE TEMP TABLE t (id INT)", "CREATE TABLE").await;
+    run_tagged(&mut conn, "INSERT INTO t VALUES (5)", "INSERT 1").await;
+    // Another autocommit commit; a stale DROP would drop `t` here.
+    query(&mut conn, "SELECT 1").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"1".to_vec())]);
+    query(&mut conn, "SELECT count(*) FROM t").await;
+    assert_eq!(select_first_col(&mut conn).await, vec![Some(b"1".to_vec())]);
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

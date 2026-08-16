@@ -827,6 +827,10 @@ where
     // Explicit-transaction state across statements on this connection (transaction-over-wire). The
     // simple- and extended-query paths both thread it, so `BEGIN ... COMMIT` spans either.
     let mut txn_state = TxnState::Auto;
+    // Per-connection `ON COMMIT` registry for temporary tables (`DELETE ROWS` / `DROP`). Populated
+    // when such a table is created and consumed after each successful commit; the connection loop owns
+    // it because it is the only place that observes every transaction boundary.
+    let mut on_commit = OnCommitRegistry::default();
     // Per-connection session GUC store (session-state-over-wire): `SET name = value`
     // records here, `RESET` clears, `SHOW name` / `current_setting(name)` read it back. Scoped to this
     // connection so one client's settings never leak to another, and read into every statement so a
@@ -962,6 +966,10 @@ where
                     // rolls back (so it must discard them instead).
                     let control = txn_control_kind(&sql);
                     let was_active = matches!(txn_state, TxnState::Active { .. });
+                    // Capture the transaction state and any `ON COMMIT` registration before `sql` is
+                    // moved into the streaming call, so the temp-table hook can fire after the commit.
+                    let old_state = txn_state;
+                    let on_commit_create = detect_on_commit_create(&sql, &temp_schema_name);
                     // Stream the result's rows to the socket as they are produced (Phase 2):
                     // `RowDescription`, then each `DataRow` as the executor yields it, then
                     // `CommandComplete` — bounding the wire layer's memory to the channel capacity
@@ -987,6 +995,24 @@ where
                     .await?;
                     txn_state = new_state;
                     plan_cache = new_cache;
+                    // Fire any temporary-table ON COMMIT actions this commit triggered, before the
+                    // `ReadyForQuery` boundary so a following statement observes the effect.
+                    let on_commit_fire = on_commit_after_stmt(
+                        &mut on_commit,
+                        on_commit_create,
+                        control.as_ref(),
+                        ok,
+                        old_state,
+                        new_state,
+                    );
+                    fire_on_commit_actions(
+                        &engine,
+                        &database,
+                        &effective_user(&user, &settings),
+                        &settings,
+                        on_commit_fire,
+                    )
+                    .await;
                     // Apply the queued-NOTIFY effect of a transaction-control statement that ran ok.
                     if ok {
                         match control {
@@ -1136,6 +1162,9 @@ where
                     .filter(|p| p.result.is_none() && p.result_formats.iter().all(|&f| f == 0))
                     .map(|p| (p.sql.clone(), p.params.clone()));
                 if let Some((sql, params)) = stream_job {
+                    let old_state = txn_state;
+                    let on_commit_control = txn_control_kind(&sql);
+                    let on_commit_create = detect_on_commit_create(&sql, &temp_schema_name);
                     let (ok, new_state, new_cache) = stream_query_to_conn(
                         &mut conn,
                         &engine,
@@ -1156,6 +1185,22 @@ where
                     .await?;
                     txn_state = new_state;
                     plan_cache = new_cache;
+                    let on_commit_fire = on_commit_after_stmt(
+                        &mut on_commit,
+                        on_commit_create,
+                        on_commit_control.as_ref(),
+                        ok,
+                        old_state,
+                        new_state,
+                    );
+                    fire_on_commit_actions(
+                        &engine,
+                        &database,
+                        &effective_user(&user, &settings),
+                        &settings,
+                        on_commit_fire,
+                    )
+                    .await;
                     if let Some(m) = &metrics {
                         m.query(ok);
                     }
@@ -1181,6 +1226,12 @@ where
                 // Count the query exactly once — on the execution itself, not on every `Execute` of
                 // the same portal (a re-`Execute` after the rows were drained must not re-count).
                 let already_executed = portals.get(&portal).is_some_and(|p| p.result.is_some());
+                // The portal's SQL, captured only on the first (real) execution, drives the ON COMMIT
+                // temp-table hook after the commit.
+                let on_commit_sql = (!already_executed)
+                    .then(|| portals.get(&portal).map(|p| p.sql.clone()))
+                    .flatten();
+                let old_state = txn_state;
                 let (executed, new_state) = ensure_executed(
                     &engine,
                     &cluster,
@@ -1195,6 +1246,24 @@ where
                 )
                 .await;
                 txn_state = new_state;
+                if let Some(sql) = on_commit_sql {
+                    let on_commit_fire = on_commit_after_stmt(
+                        &mut on_commit,
+                        detect_on_commit_create(&sql, &temp_schema_name),
+                        txn_control_kind(&sql).as_ref(),
+                        executed.is_ok(),
+                        old_state,
+                        new_state,
+                    );
+                    fire_on_commit_actions(
+                        &engine,
+                        &database,
+                        &effective_user(&user, &settings),
+                        &settings,
+                        on_commit_fire,
+                    )
+                    .await;
+                }
                 match executed {
                     Ok(_columns) => {
                         if !already_executed && let Some(m) = &metrics {
@@ -3238,6 +3307,180 @@ fn txn_control_kind(sql: &str) -> Option<TxnControl> {
         Statement::RollbackToSavepoint(name) => Some(TxnControl::RollbackTo(name)),
         _ => None,
     }
+}
+
+/// A temporary table registered for a non-default `ON COMMIT` action on this connection.
+#[derive(Clone)]
+struct OnCommitEntry {
+    /// The connection's temporary schema (`nusadb_temp_<pid>`).
+    schema: String,
+    /// The (case-folded) table name.
+    table: String,
+    /// The action to apply at commit — [`DeleteRows`](nusadb_sql::ast::OnCommit::DeleteRows) or
+    /// [`Drop`](nusadb_sql::ast::OnCommit::Drop) (never `PreserveRows`).
+    action: nusadb_sql::ast::OnCommit,
+}
+
+/// A connection's `ON COMMIT` registry for temporary tables.
+///
+/// The connection loop owns it because it is the only place that sees every transaction boundary
+/// (autocommit statement commits *and* explicit `COMMIT`/`ROLLBACK`). `ON COMMIT DELETE ROWS` empties
+/// a table's rows at the end of **every** transaction; `ON COMMIT DROP` drops the table at the end of
+/// the transaction that created it. Neither fires on `ROLLBACK`.
+#[derive(Default)]
+struct OnCommitRegistry {
+    /// Registrations whose creating transaction has committed. A `DELETE ROWS` entry persists (fired
+    /// at every later commit); a `DROP` entry is fired once, then removed.
+    committed: Vec<OnCommitEntry>,
+    /// Registrations made by `CREATE TEMP ... ON COMMIT` inside the *current* explicit transaction —
+    /// promoted to `committed` on its `COMMIT`, discarded on `ROLLBACK` (the table never existed).
+    pending: Vec<OnCommitEntry>,
+}
+
+/// If `sql` is a `CREATE TEMPORARY TABLE ... ON COMMIT {DELETE ROWS | DROP}`, return the registration
+/// it should produce (qualified by this connection's temp schema). `None` for anything else — an
+/// ordinary create, `ON COMMIT PRESERVE ROWS`, or a non-temp table (which the analyzer rejects
+/// anyway). A cheap prefix/substring guard avoids parsing every statement.
+fn detect_on_commit_create(sql: &str, temp_schema: &str) -> Option<OnCommitEntry> {
+    let head = sql.trim_start();
+    if !head
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("create"))
+    {
+        return None;
+    }
+    if !sql.to_ascii_lowercase().contains("on commit") {
+        return None;
+    }
+    let nusadb_sql::ast::Statement::CreateTable(ct) = parse(sql).ok()? else {
+        return None;
+    };
+    if !ct.temporary {
+        return None;
+    }
+    match ct.on_commit {
+        nusadb_sql::ast::OnCommit::DeleteRows | nusadb_sql::ast::OnCommit::Drop => {
+            Some(OnCommitEntry {
+                schema: temp_schema.to_owned(),
+                table: ct.name,
+                action: ct.on_commit,
+            })
+        },
+        nusadb_sql::ast::OnCommit::PreserveRows => None,
+    }
+}
+
+/// Fold a statement's ON COMMIT effect into the connection registry and return the actions to fire
+/// **now** (empty unless a transaction just committed with registered tables).
+///
+/// `create` is the registration this statement produced (from [`detect_on_commit_create`], `None`
+/// otherwise); `control` classifies a transaction-control statement; `ok` is whether the statement
+/// succeeded; `old_state`/`new_state` bracket the connection's transaction state across it.
+fn on_commit_after_stmt(
+    reg: &mut OnCommitRegistry,
+    create: Option<OnCommitEntry>,
+    control: Option<&TxnControl>,
+    ok: bool,
+    old_state: TxnState,
+    new_state: TxnState,
+) -> Vec<OnCommitEntry> {
+    let old_active = matches!(old_state, TxnState::Active { .. });
+    let old_failed = matches!(old_state, TxnState::Failed { .. });
+    let now_auto = matches!(new_state, TxnState::Auto);
+    // 1) Register a just-created ON COMMIT temp table: inside an explicit transaction it is pending
+    //    (takes effect only if that transaction commits); in autocommit its own commit fires it below.
+    if ok && let Some(entry) = create {
+        if old_active {
+            reg.pending.push(entry);
+        } else {
+            reg.committed.push(entry);
+        }
+    }
+    // 2) End-of-explicit-transaction bookkeeping. A COMMIT of a *failed* transaction is a rollback.
+    let explicit_commit =
+        ok && old_active && matches!(control, Some(TxnControl::Commit)) && now_auto;
+    let explicit_abort = matches!(control, Some(TxnControl::Rollback))
+        || (old_failed && matches!(control, Some(TxnControl::Commit)));
+    if explicit_commit {
+        reg.committed.append(&mut reg.pending);
+    } else if explicit_abort {
+        reg.pending.clear();
+    }
+    // 3) Fire on any real commit: an explicit COMMIT, or an autocommit statement's own commit (a
+    //    BEGIN opens a transaction rather than committing, so it never fires).
+    let autocommit_commit = ok
+        && matches!(old_state, TxnState::Auto)
+        && now_auto
+        && !matches!(control, Some(TxnControl::Begin));
+    if (explicit_commit || autocommit_commit) && !reg.committed.is_empty() {
+        let to_fire = reg.committed.clone();
+        // DELETE ROWS entries persist across commits; a DROP fires exactly once, then is removed.
+        reg.committed
+            .retain(|e| matches!(e.action, nusadb_sql::ast::OnCommit::DeleteRows));
+        to_fire
+    } else {
+        Vec::new()
+    }
+}
+
+/// Apply one temporary-table `ON COMMIT` action in a fresh autocommit transaction, run *after* the
+/// user's own commit. `DELETE ROWS` empties the table; `DROP` removes it (`IF EXISTS`, so a redundant
+/// fire is harmless). Reuses the ordinary execute path so index / catalog upkeep is identical.
+fn fire_on_commit_action(
+    engine: &dyn StorageEngine,
+    database: &str,
+    user: &str,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+    entry: &OnCommitEntry,
+) -> Result<(), nusadb_sql::Error> {
+    let schema = entry.schema.replace('"', "\"\"");
+    let table = entry.table.replace('"', "\"\"");
+    let qname = format!("\"{schema}\".\"{table}\"");
+    let sql = match entry.action {
+        nusadb_sql::ast::OnCommit::DeleteRows => format!("TRUNCATE TABLE {qname}"),
+        nusadb_sql::ast::OnCommit::Drop => format!("DROP TABLE IF EXISTS {qname}"),
+        nusadb_sql::ast::OnCommit::PreserveRows => return Ok(()),
+    };
+    let stmt = parse(&sql)?;
+    let (result, _state) =
+        run_stmt_in_state(engine, database, stmt, user, TxnState::Auto, settings);
+    result.map(|_| ())
+}
+
+/// Fire every queued temporary-table `ON COMMIT` action on a blocking thread (the actions run engine
+/// transactions). A failure is logged rather than surfaced, since the user's own statement has already
+/// committed and its `CommandComplete` has been sent — but a non-durable temp table left with stale
+/// rows is never silently accepted as correct.
+async fn fire_on_commit_actions(
+    engine: &Arc<dyn StorageEngine>,
+    database: &str,
+    user: &str,
+    settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    to_fire: Vec<OnCommitEntry>,
+) {
+    if to_fire.is_empty() {
+        return;
+    }
+    let engine = Arc::clone(engine);
+    let database = database.to_owned();
+    let user = user.to_owned();
+    let settings = Arc::clone(settings);
+    let _ = tokio::task::spawn_blocking(move || {
+        for entry in to_fire {
+            if let Err(e) =
+                fire_on_commit_action(engine.as_ref(), &database, &user, &settings, &entry)
+            {
+                tracing::warn!(
+                    schema = %entry.schema,
+                    table = %entry.table,
+                    action = ?entry.action,
+                    error = %e,
+                    "failed to apply ON COMMIT action for a temporary table"
+                );
+            }
+        }
+    })
+    .await;
 }
 
 /// A connection's queue of `NOTIFY`s issued inside the current explicit transaction (transactional

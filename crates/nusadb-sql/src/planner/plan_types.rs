@@ -595,6 +595,11 @@ pub struct CreateTablePlan {
     /// `src`'s columns into `columns`; the executor additionally copies `src`'s synthetic width /
     /// length checks so the declared width (lost by the runtime `ColumnType`) is preserved.
     pub like_source: Option<String>,
+    /// The temporary table's `ON COMMIT` disposition (see [`ast::OnCommit`]). Carried through the plan
+    /// for completeness and diagnostics; the end-of-transaction action itself is fired by the wire
+    /// layer, which owns the per-connection transaction boundaries. Always
+    /// [`PreserveRows`](ast::OnCommit::PreserveRows) for an ordinary table.
+    pub on_commit: ast::OnCommit,
 }
 
 /// A resolved `CHECK` constraint.
