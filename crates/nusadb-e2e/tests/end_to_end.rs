@@ -10527,3 +10527,122 @@ fn build_plan_temp(engine: &BtreeEngine, temp: &str, sql: &str) -> nusadb_sql::P
     };
     plan(analyze(stmt, &catalog).expect("analyze"))
 }
+
+// --- OVERLAPS predicate (period overlap, three-valued logic) --------------------------------
+
+/// Evaluate a single scalar OVERLAPS expression and return its lone result value.
+fn overlaps_value(engine: &BtreeEngine, sql: &str) -> Value {
+    let r = rows(run(engine, sql));
+    let [row] = <[Vec<Value>; 1]>::try_from(r).expect("exactly one row");
+    let [val] = <[Value; 1]>::try_from(row).expect("exactly one column");
+    val
+}
+
+/// The exact NULL truth table validated against the reference engine. Each left period is tested
+/// against `P2 = (DATE '2001-01-10', DATE '2001-01-20')`; `05`/`15`/`25` map to `2001-01-05/15/25`.
+#[test]
+fn overlaps_null_truth_table() {
+    let engine = BtreeEngine::new();
+    let p2 = "(DATE '2001-01-10', DATE '2001-01-20')";
+    let cases: &[(&str, Value)] = &[
+        ("(DATE '2001-01-05', DATE '2001-01-15')", Value::Bool(true)),
+        ("(NULL, DATE '2001-01-15')", Value::Bool(true)),
+        ("(DATE '2001-01-05', NULL)", Value::Null),
+        ("(DATE '2001-01-15', NULL)", Value::Bool(true)),
+        // Critical: a start past the whole of P2 with an open end is UNKNOWN, not false.
+        ("(DATE '2001-01-25', NULL)", Value::Null),
+        ("(NULL, DATE '2001-01-05')", Value::Null),
+        ("(NULL, DATE '2001-01-25')", Value::Null),
+        ("(NULL, NULL)", Value::Null),
+    ];
+    for (left, expected) in cases {
+        let sql = format!("SELECT {left} OVERLAPS {p2}");
+        assert_eq!(overlaps_value(&engine, &sql), *expected, "row `{left}`");
+    }
+    // A NULL start on the right side is likewise UNKNOWN.
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2001-01-05', DATE '2001-01-15') OVERLAPS (NULL, DATE '2001-01-20')",
+        ),
+        Value::Null,
+        "right-side NULL start"
+    );
+}
+
+/// Plain (no-NULL) periods, endpoint touching, reversed args, point equality, and the interval
+/// form — all validated against the reference engine.
+#[test]
+fn overlaps_plain_and_interval_forms() {
+    let engine = BtreeEngine::new();
+    // Two overlapping year-spanning periods.
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2020-02-16', DATE '2020-12-21') \
+                 OVERLAPS (DATE '2020-10-30', DATE '2021-10-30')",
+        ),
+        Value::Bool(true),
+        "overlapping periods"
+    );
+    // Touching endpoints do NOT overlap (half-open semantics).
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2020-02-16', DATE '2020-12-21') \
+                 OVERLAPS (DATE '2020-12-21', DATE '2021-10-30')",
+        ),
+        Value::Bool(false),
+        "touching endpoints"
+    );
+    // Fully disjoint periods.
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2020-01-01', DATE '2020-02-01') \
+                 OVERLAPS (DATE '2020-10-30', DATE '2021-10-30')",
+        ),
+        Value::Bool(false),
+        "disjoint periods"
+    );
+    // A point equal to a point (same date twice on both sides) overlaps.
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2020-05-01', DATE '2020-05-01') \
+                 OVERLAPS (DATE '2020-05-01', DATE '2020-05-01')",
+        ),
+        Value::Bool(true),
+        "point == point"
+    );
+    // Reversed arguments are auto-ordered, so this matches the overlapping case above.
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2020-12-21', DATE '2020-02-16') \
+                 OVERLAPS (DATE '2020-10-30', DATE '2021-10-30')",
+        ),
+        Value::Bool(true),
+        "reversed args auto-ordered"
+    );
+    // Interval form: end = start + interval. 2020-02-16 + 100 days is well before 2020-10-30.
+    assert_eq!(
+        overlaps_value(
+            &engine,
+            "SELECT (DATE '2020-02-16', INTERVAL '100 days') \
+                 OVERLAPS (DATE '2020-10-30', DATE '2021-10-30')",
+        ),
+        Value::Bool(false),
+        "interval form, disjoint"
+    );
+}
+
+/// A non-temporal operand is rejected loudly.
+#[test]
+fn overlaps_rejects_non_temporal() {
+    let engine = BtreeEngine::new();
+    assert!(
+        run_try(&engine, "SELECT (1, 2) OVERLAPS (3, 4)").is_err(),
+        "integer periods are not temporal"
+    );
+}

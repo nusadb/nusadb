@@ -1681,6 +1681,19 @@ pub enum TypedExprKind {
         /// `true` for `NOT BETWEEN`.
         negated: bool,
     },
+    /// `(s1, e1) OVERLAPS (s2, e2)` — two-period overlap test. Each end is either a temporal
+    /// value of the start's type or an `INTERVAL` (real end = `start + interval`). Result is a
+    /// nullable `Bool` under three-valued logic.
+    Overlaps {
+        /// Start of the first period.
+        s1: Box<TypedExpr>,
+        /// End of the first period (temporal value or `INTERVAL`).
+        e1: Box<TypedExpr>,
+        /// Start of the second period.
+        s2: Box<TypedExpr>,
+        /// End of the second period (temporal value or `INTERVAL`).
+        e2: Box<TypedExpr>,
+    },
     /// `expr [NOT] LIKE pattern` — `%` = any chars, `_` = one char.
     Like {
         /// Subject string (must be `Text`).

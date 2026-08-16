@@ -186,6 +186,12 @@ fn extract_windows(
             rec(low, aggregates.as_deref_mut())?;
             rec(high, aggregates.as_deref_mut())?;
         },
+        E::Overlaps { s1, e1, s2, e2 } => {
+            rec(s1, aggregates.as_deref_mut())?;
+            rec(e1, aggregates.as_deref_mut())?;
+            rec(s2, aggregates.as_deref_mut())?;
+            rec(e2, aggregates.as_deref_mut())?;
+        },
         E::Like {
             expr: inner,
             pattern,

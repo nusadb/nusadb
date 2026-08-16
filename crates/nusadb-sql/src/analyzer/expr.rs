@@ -182,6 +182,9 @@ pub(super) fn analyze_expr_agg(
             high,
             negated,
         } => analyze_between(expr, low, high, *negated, scope, catalog, aggregates),
+        ast::Expr::Overlaps { s1, e1, s2, e2 } => {
+            analyze_overlaps(s1, e1, s2, e2, scope, catalog, aggregates)
+        },
         ast::Expr::Like {
             expr,
             pattern,
@@ -3438,6 +3441,95 @@ pub(super) fn analyze_between(
             low: Box::new(low_typed),
             high: Box::new(high_typed),
             negated,
+        },
+        ty: ColumnType::Bool,
+    })
+}
+
+/// Analyze `(s1, e1) OVERLAPS (s2, e2)`. Both starts must be temporal
+/// (`Date`/`Time`/`Timestamp`/`TimestampTz`); each end must be the same temporal type as its start
+/// or an `INTERVAL` (the interval form, whose real end is `start + interval`). The result is a
+/// nullable `Bool`.
+pub(super) fn analyze_overlaps(
+    s1: &ast::Expr,
+    e1: &ast::Expr,
+    s2: &ast::Expr,
+    e2: &ast::Expr,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let is_temporal = |ty: ColumnType| {
+        matches!(
+            ty,
+            ColumnType::Date | ColumnType::Time | ColumnType::Timestamp | ColumnType::TimestampTz
+        )
+    };
+    let is_null_lit = |e: &ast::Expr| matches!(e, ast::Expr::Literal(ast::Value::Null));
+    let raw = [s1, e1, s2, e2];
+    // Pass 1: analyze every non-NULL endpoint and discover the shared temporal type (the anchor)
+    // that types any bare NULL endpoint. An end may be an INTERVAL, which is not a valid anchor.
+    let mut typed: [Option<TypedExpr>; 4] = [None, None, None, None];
+    let mut anchor: Option<ColumnType> = None;
+    for (slot, e) in typed.iter_mut().zip(raw) {
+        if is_null_lit(e) {
+            continue;
+        }
+        let t = analyze_expr_agg(e, scope, catalog, anchor, aggregates.as_deref_mut())?;
+        if anchor.is_none() && is_temporal(t.ty) {
+            anchor = Some(t.ty);
+        }
+        *slot = Some(t);
+    }
+    let Some(anchor) = anchor else {
+        return Err(Error::Unsupported(
+            "OVERLAPS requires at least one temporal endpoint to determine the period type"
+                .to_owned(),
+        ));
+    };
+    // Pass 2: type the deferred bare-NULL endpoints against the anchor.
+    for (slot, e) in typed.iter_mut().zip(raw) {
+        if is_null_lit(e) {
+            *slot = Some(analyze_null(Some(anchor))?);
+        }
+    }
+    // Every slot is now populated; recover the four operands without panicking.
+    let assembled: Vec<TypedExpr> = typed.into_iter().flatten().collect();
+    let Ok([s1_typed, e1_typed, s2_typed, e2_typed]) = <[TypedExpr; 4]>::try_from(assembled) else {
+        return Err(Error::Unsupported(
+            "OVERLAPS requires two 2-element row expressions".to_owned(),
+        ));
+    };
+    // A bare temporal string literal adopts the anchor type (mirrors BETWEEN/IN).
+    let s1_typed = coerce_unknown_literal(s1_typed, anchor);
+    let e1_typed = coerce_unknown_literal(e1_typed, anchor);
+    let s2_typed = coerce_unknown_literal(s2_typed, anchor);
+    let e2_typed = coerce_unknown_literal(e2_typed, anchor);
+    for (start, label) in [(&s1_typed, "first"), (&s2_typed, "second")] {
+        if !is_temporal(start.ty) {
+            return Err(Error::TypeMismatch {
+                context: format!("OVERLAPS {label} period start"),
+                expected: ColumnType::Timestamp,
+                found: start.ty,
+            });
+        }
+    }
+    // Each end must be the anchor temporal type or an INTERVAL (interval form).
+    for (end, label) in [(&e1_typed, "first"), (&e2_typed, "second")] {
+        if end.ty != ColumnType::Interval && !comparable(anchor, end.ty) {
+            return Err(Error::TypeMismatch {
+                context: format!("OVERLAPS {label} period end"),
+                expected: anchor,
+                found: end.ty,
+            });
+        }
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::Overlaps {
+            s1: Box::new(s1_typed),
+            e1: Box::new(e1_typed),
+            s2: Box::new(s2_typed),
+            e2: Box::new(e2_typed),
         },
         ty: ColumnType::Bool,
     })

@@ -190,6 +190,12 @@ fn fold_children(kind: TypedExprKind) -> TypedExprKind {
             high: fold_box(high),
             negated,
         },
+        K::Overlaps { s1, e1, s2, e2 } => K::Overlaps {
+            s1: fold_box(s1),
+            e1: fold_box(e1),
+            s2: fold_box(s2),
+            e2: fold_box(e2),
+        },
         K::Like {
             expr,
             pattern,
@@ -312,6 +318,12 @@ fn is_foldable_constant(expr: &TypedExpr) -> bool {
         K::Between {
             expr, low, high, ..
         } => is_foldable_constant(expr) && is_foldable_constant(low) && is_foldable_constant(high),
+        K::Overlaps { s1, e1, s2, e2 } => {
+            is_foldable_constant(s1)
+                && is_foldable_constant(e1)
+                && is_foldable_constant(s2)
+                && is_foldable_constant(e2)
+        },
         K::Like { expr, pattern, .. }
         | K::RegexMatch { expr, pattern, .. }
         | K::SimilarTo { expr, pattern, .. } => {

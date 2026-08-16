@@ -268,6 +268,12 @@ fn count_expr(expr: &ast::Expr, max: &mut usize) {
             count_expr(low, max);
             count_expr(high, max);
         },
+        ast::Expr::Overlaps { s1, e1, s2, e2 } => {
+            count_expr(s1, max);
+            count_expr(e1, max);
+            count_expr(s2, max);
+            count_expr(e2, max);
+        },
         ast::Expr::Like { expr, pattern, .. }
         | ast::Expr::SimilarTo { expr, pattern, .. }
         | ast::Expr::RegexMatch { expr, pattern, .. } => {
@@ -438,6 +444,12 @@ pub(crate) fn substitute_param_exprs(
             substitute_param_exprs(expr, args, param_names);
             substitute_param_exprs(low, args, param_names);
             substitute_param_exprs(high, args, param_names);
+        },
+        ast::Expr::Overlaps { s1, e1, s2, e2 } => {
+            substitute_param_exprs(s1, args, param_names);
+            substitute_param_exprs(e1, args, param_names);
+            substitute_param_exprs(s2, args, param_names);
+            substitute_param_exprs(e2, args, param_names);
         },
         ast::Expr::Like { expr, pattern, .. }
         | ast::Expr::SimilarTo { expr, pattern, .. }
@@ -729,6 +741,12 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Er
             substitute_expr(expr, params)?;
             substitute_expr(low, params)?;
             substitute_expr(high, params)
+        },
+        ast::Expr::Overlaps { s1, e1, s2, e2 } => {
+            substitute_expr(s1, params)?;
+            substitute_expr(e1, params)?;
+            substitute_expr(s2, params)?;
+            substitute_expr(e2, params)
         },
         ast::Expr::Like { expr, pattern, .. }
         | ast::Expr::SimilarTo { expr, pattern, .. }

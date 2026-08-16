@@ -810,6 +810,12 @@ fn sub_expr(expr: &mut ast::Expr, refs: &RowRefs<'_>) -> Result<(), Error> {
             sub_expr(low, refs)?;
             sub_expr(high, refs)
         },
+        ast::Expr::Overlaps { s1, e1, s2, e2 } => {
+            sub_expr(s1, refs)?;
+            sub_expr(e1, refs)?;
+            sub_expr(s2, refs)?;
+            sub_expr(e2, refs)
+        },
         ast::Expr::Like { expr, pattern, .. }
         | ast::Expr::SimilarTo { expr, pattern, .. }
         | ast::Expr::RegexMatch { expr, pattern, .. } => {

@@ -328,6 +328,10 @@ fn collect_op(op: &PhysicalOperator, cols: &mut BTreeSet<usize>, has_sq: &mut bo
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive recursion arm per expression variant"
+)]
 fn collect_expr(expr: &TypedExpr, cols: &mut BTreeSet<usize>, has_sq: &mut bool) {
     use TypedExprKind as K;
     match &expr.kind {
@@ -370,6 +374,11 @@ fn collect_expr(expr: &TypedExpr, cols: &mut BTreeSet<usize>, has_sq: &mut bool)
             collect_expr(inner, cols, has_sq);
             collect_expr(low, cols, has_sq);
             collect_expr(high, cols, has_sq);
+        },
+        K::Overlaps { s1, e1, s2, e2 } => {
+            for e in [s1, e1, s2, e2] {
+                collect_expr(e, cols, has_sq);
+            }
         },
         K::Like {
             expr: inner,
@@ -515,6 +524,12 @@ fn remap_expr(expr: &mut TypedExpr, map: &HashMap<usize, usize>) {
             remap_expr(inner, map);
             remap_expr(low, map);
             remap_expr(high, map);
+        },
+        K::Overlaps { s1, e1, s2, e2 } => {
+            remap_expr(s1, map);
+            remap_expr(e1, map);
+            remap_expr(s2, map);
+            remap_expr(e2, map);
         },
         K::Like {
             expr: inner,

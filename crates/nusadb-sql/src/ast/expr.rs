@@ -88,6 +88,20 @@ pub enum Expr {
         /// `true` for `NOT BETWEEN`, `false` for `BETWEEN`.
         negated: bool,
     },
+    /// `(s1, e1) OVERLAPS (s2, e2)` — do two time periods overlap? Each side is a two-element
+    /// row: a start endpoint and an end endpoint. The end may be a temporal value of the same
+    /// type as the start, or an `INTERVAL` (then the real end is `start + interval`). The result
+    /// is a nullable `BOOLEAN` under three-valued logic.
+    Overlaps {
+        /// Start of the first period.
+        s1: Box<Self>,
+        /// End of the first period (temporal value or `INTERVAL`).
+        e1: Box<Self>,
+        /// Start of the second period.
+        s2: Box<Self>,
+        /// End of the second period (temporal value or `INTERVAL`).
+        e2: Box<Self>,
+    },
     /// `expr [NOT] LIKE pattern [ESCAPE 'c']` — SQL pattern match where `%` matches zero
     /// or more characters and `_` matches exactly one character. The optional `ESCAPE`
     /// character overrides the default backslash escape.

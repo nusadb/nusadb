@@ -138,6 +138,7 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
             high,
             negated,
         } => eval_between(inner, low, high, *negated, row),
+        TypedExprKind::Overlaps { s1, e1, s2, e2 } => eval_overlaps(s1, e1, s2, e2, row),
         TypedExprKind::Like {
             expr: inner,
             pattern,
@@ -4004,6 +4005,135 @@ fn eval_between(
     let in_range =
         !matches!(compare(&v, &l), Ordering::Less) && !matches!(compare(&v, &h), Ordering::Greater);
     Ok(ast::Value::Bool(in_range ^ negated))
+}
+
+/// `(s1, e1) OVERLAPS (s2, e2)` — do two time periods overlap?
+///
+/// Each end may be a temporal value or an `INTERVAL`; in the interval form the real end is
+/// `start + interval`. Each pair is then normalized to `(start, end)` and the overlap decided under
+/// three-valued (Kleene) logic, so a `NULL` endpoint yields `UNKNOWN` (a `NULL` boolean) rather than
+/// collapsing to `false`. Validated against the reference engine's exact truth table.
+fn eval_overlaps(
+    s1: &TypedExpr,
+    e1: &TypedExpr,
+    s2: &TypedExpr,
+    e2: &TypedExpr,
+    row: &Row,
+) -> Result<ast::Value, Error> {
+    let (start1, end1) = overlaps_endpoints(s1, e1, row)?;
+    let (start2, end2) = overlaps_endpoints(s2, e2, row)?;
+    let (start1, end1) = normalize_period(start1, end1);
+    let (start2, end2) = normalize_period(start2, end2);
+
+    // Three-valued comparisons on temporal endpoints: `None` (UNKNOWN) whenever an operand is NULL.
+    let gt = |a: &ast::Value, b: &ast::Value| overlaps_cmp(a, b).map(Ordering::is_gt);
+    let ge = |a: &ast::Value, b: &ast::Value| overlaps_cmp(a, b).map(Ordering::is_ge);
+    let eq = |a: &ast::Value, b: &ast::Value| overlaps_cmp(a, b).map(Ordering::is_eq);
+
+    // (S1 > S2 AND NOT (S1 >= E2 AND E1 >= E2))
+    // OR (S2 > S1 AND NOT (S2 >= E1 AND E2 >= E1))
+    // OR (S1 = S2)
+    let term1 = and3(
+        gt(&start1, &start2),
+        not3(and3(ge(&start1, &end2), ge(&end1, &end2))),
+    );
+    let term2 = and3(
+        gt(&start2, &start1),
+        not3(and3(ge(&start2, &end1), ge(&end2, &end1))),
+    );
+    let term3 = eq(&start1, &start2);
+    let result = or3(or3(term1, term2), term3);
+    Ok(result.map_or(ast::Value::Null, ast::Value::Bool))
+}
+
+/// Resolve one `OVERLAPS` side to concrete `(start, end)` temporal values. When the end expression
+/// is the interval form (`ColumnType::Interval`), the real end is `start + interval`; a `NULL` start
+/// or interval yields a `NULL` end.
+fn overlaps_endpoints(
+    start: &TypedExpr,
+    end: &TypedExpr,
+    row: &Row,
+) -> Result<(ast::Value, ast::Value), Error> {
+    let start_val = eval(start, row)?;
+    let end_val = eval(end, row)?;
+    let end_val = if end.ty == ColumnType::Interval {
+        if matches!(start_val, ast::Value::Null) || matches!(end_val, ast::Value::Null) {
+            ast::Value::Null
+        } else {
+            match interval_arith(ast::BinaryOp::Plus, &start_val, &end_val) {
+                Some(res) => res?,
+                None => {
+                    return Err(Error::Unsupported(
+                        "OVERLAPS interval end requires a temporal start".to_owned(),
+                    ));
+                },
+            }
+        }
+    } else {
+        end_val
+    };
+    Ok((start_val, end_val))
+}
+
+/// Normalize an `OVERLAPS` period to `(start, end)` per the reference engine:
+/// a `NULL` start with a non-`NULL` end becomes `(end, NULL)`; a `start > end` pair swaps; every
+/// other shape is left as-is (both-`NULL`, or a non-`NULL` start with a `NULL` end).
+fn normalize_period(start: ast::Value, end: ast::Value) -> (ast::Value, ast::Value) {
+    let start_null = matches!(start, ast::Value::Null);
+    let end_null = matches!(end, ast::Value::Null);
+    if start_null && !end_null {
+        (end, ast::Value::Null)
+    } else if !start_null && !end_null && overlaps_cmp(&start, &end) == Some(Ordering::Greater) {
+        (end, start)
+    } else {
+        (start, end)
+    }
+}
+
+/// Compare two temporal `OVERLAPS` endpoints on their canonical microsecond instant, returning
+/// `None` if either is `NULL` (the source of `UNKNOWN` in the three-valued logic). A canonical
+/// instant lets a `Date` start compare correctly against a `Timestamp` end produced by the interval
+/// form, which the general [`compare`] cannot (it orders those by variant rank).
+fn overlaps_cmp(a: &ast::Value, b: &ast::Value) -> Option<Ordering> {
+    Some(overlaps_micros(a)?.cmp(&overlaps_micros(b)?))
+}
+
+/// The canonical microsecond instant of a temporal `OVERLAPS` endpoint, or `None` for `NULL`.
+fn overlaps_micros(v: &ast::Value) -> Option<i64> {
+    match v {
+        ast::Value::Date(d) => Some(i64::from(*d) * MICROS_PER_DAY),
+        ast::Value::Time(t) | ast::Value::Timestamp(t) | ast::Value::TimestampTz(t) => Some(*t),
+        // NULL (the source of UNKNOWN) and any non-temporal variant map to `None`. The analyzer
+        // restricts starts to temporal types and ends to that type or an INTERVAL (already added
+        // into the start above), so no non-temporal, non-NULL variant actually reaches here.
+        _ => None,
+    }
+}
+
+/// Kleene three-valued `AND`: `false` dominates, `NULL` (`None`) otherwise unless both are `true`.
+const fn and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Kleene three-valued `OR`: `true` dominates, `NULL` (`None`) otherwise unless both are `false`.
+const fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// Kleene three-valued `NOT`: `NULL` (`None`) negates to `NULL`.
+const fn not3(a: Option<bool>) -> Option<bool> {
+    match a {
+        Some(b) => Some(!b),
+        None => None,
+    }
 }
 
 /// A *total* order over `f64` matching SQL semantics for `NaN`: every `NaN` is equal to every other

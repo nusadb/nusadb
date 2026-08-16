@@ -442,6 +442,9 @@ fn expr_is_vectorizable(expr: &TypedExpr) -> bool {
         | K::OuterColumn { .. }
         // An array slice yields an array; it has no vectorized kernel, so it uses the row path.
         | K::ArraySlice { .. }
+        // OVERLAPS has no vectorized kernel; it evaluates on the row path (period normalization
+        // + three-valued logic), the same fallback array slices take.
+        | K::Overlaps { .. }
         | K::AggregateRef(_) => false,
         K::Literal(_) | K::Column(_) => true,
         K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {

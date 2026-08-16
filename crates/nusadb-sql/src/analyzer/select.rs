@@ -2282,6 +2282,12 @@ pub(super) fn rebase_onto_aggregation(
             rebase_onto_aggregation(low, ctx)?;
             rebase_onto_aggregation(high, ctx)?;
         },
+        TypedExprKind::Overlaps { s1, e1, s2, e2 } => {
+            rebase_onto_aggregation(s1, ctx)?;
+            rebase_onto_aggregation(e1, ctx)?;
+            rebase_onto_aggregation(s2, ctx)?;
+            rebase_onto_aggregation(e2, ctx)?;
+        },
         TypedExprKind::Like { expr, pattern, .. }
         | TypedExprKind::RegexMatch { expr, pattern, .. }
         | TypedExprKind::SimilarTo { expr, pattern, .. } => {

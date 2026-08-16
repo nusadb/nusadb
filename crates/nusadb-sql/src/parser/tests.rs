@@ -5186,3 +5186,60 @@ fn collate_clause_rejects_loudly() {
     assert!(parse("SELECT 'a' COLLATE \"en_US\"").is_err());
     assert!(parse("SELECT x FROM t ORDER BY x COLLATE \"de_DE\"").is_err());
 }
+
+// --- OVERLAPS predicate ---------------------------------------
+
+/// Extract the single projected expression of a `SELECT`.
+fn projected_expr(sql: &str) -> ast::Expr {
+    let ast::Statement::Select(s) = ok(sql) else {
+        panic!("expected Select");
+    };
+    let ast::SelectItem::Expr { expr, .. } = &s.projection[0] else {
+        panic!("expected Expr projection");
+    };
+    expr.clone()
+}
+
+#[test]
+fn overlaps_parses_to_four_children() {
+    let ast::Expr::Overlaps { s1, e1, s2, e2 } = projected_expr(
+        "SELECT (DATE '2001-01-05', DATE '2001-01-15') \
+             OVERLAPS (DATE '2001-01-10', DATE '2001-01-20')",
+    ) else {
+        panic!("expected Overlaps");
+    };
+    // Each endpoint is a typed DATE literal.
+    for end in [&s1, &e1, &s2, &e2] {
+        assert!(
+            matches!(end.as_ref(), ast::Expr::Literal(ast::Value::Date(_))),
+            "each OVERLAPS endpoint is a DATE literal"
+        );
+    }
+}
+
+#[test]
+fn overlaps_interval_end_parses() {
+    let ast::Expr::Overlaps { e1, .. } = projected_expr(
+        "SELECT (DATE '2001-01-05', INTERVAL '10 days') \
+             OVERLAPS (DATE '2001-01-10', DATE '2001-01-20')",
+    ) else {
+        panic!("expected Overlaps");
+    };
+    assert!(
+        matches!(e1.as_ref(), ast::Expr::Literal(ast::Value::Interval(_))),
+        "the first period end is an INTERVAL literal"
+    );
+}
+
+#[test]
+fn overlaps_requires_two_element_rows() {
+    // A three-element row on the left is not a valid period.
+    assert!(
+        parse(
+            "SELECT (DATE '2001-01-05', DATE '2001-01-15', DATE '2001-01-16') \
+                 OVERLAPS (DATE '2001-01-10', DATE '2001-01-20')"
+        )
+        .is_err(),
+        "OVERLAPS rejects a non-2-element row"
+    );
+}

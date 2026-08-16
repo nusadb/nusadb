@@ -183,6 +183,19 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
         sql::Expr::IsNotUnknown(inner) => convert_is_bool(*inner, ast::TruthValue::Unknown, true),
         sql::Expr::BinaryOp { left, op, right } => {
             use sql::BinaryOperator as B;
+            // `(s1, e1) OVERLAPS (s2, e2)` — both sides must be two-element row expressions. The
+            // parser lowers this to a dedicated `Overlaps` node so the analyzer/executor can apply
+            // the period-overlap three-valued logic directly.
+            if op == B::Overlaps {
+                let [s1, e1] = overlaps_pair(*left)?;
+                let [s2, e2] = overlaps_pair(*right)?;
+                return Ok(ast::Expr::Overlaps {
+                    s1: Box::new(convert_expr(s1)?),
+                    e1: Box::new(convert_expr(e1)?),
+                    s2: Box::new(convert_expr(s2)?),
+                    e2: Box::new(convert_expr(e2)?),
+                });
+            }
             // POSIX regex match operators `~`/`~*`/`!~`/`!~*` become a dedicated
             // `RegexMatch` node rather than an ordinary binary op.
             let regex = match &op {
@@ -1752,6 +1765,18 @@ pub(super) fn convert_is_bool(
         truth,
         negated,
     })
+}
+
+/// One side of an `OVERLAPS` predicate: `(start, end)`. `sqlparser` parses each side as an
+/// `Expr::Tuple` of exactly two elements; any other shape (a single parenthesised value arrives as
+/// `Expr::Nested`, a longer row as a wider tuple) is rejected loudly.
+fn overlaps_pair(side: sql::Expr) -> Result<[sql::Expr; 2], Error> {
+    let unsupported =
+        || Error::Unsupported("OVERLAPS requires two 2-element row expressions".to_owned());
+    match side {
+        sql::Expr::Tuple(elems) => <[sql::Expr; 2]>::try_from(elems).map_err(|_| unsupported()),
+        _ => Err(unsupported()),
+    }
 }
 
 pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp, Error> {

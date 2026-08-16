@@ -408,6 +408,12 @@ pub(super) fn resolve_subqueries(
             resolve_subqueries(low, engine, txn)?;
             resolve_subqueries(high, engine, txn)?;
         },
+        K::Overlaps { s1, e1, s2, e2 } => {
+            resolve_subqueries(s1, engine, txn)?;
+            resolve_subqueries(e1, engine, txn)?;
+            resolve_subqueries(s2, engine, txn)?;
+            resolve_subqueries(e2, engine, txn)?;
+        },
         K::Like {
             expr: inner,
             pattern,
@@ -622,6 +628,12 @@ pub(crate) fn contains_subquery(expr: &TypedExpr) -> bool {
             high,
             ..
         } => contains_subquery(inner) || contains_subquery(low) || contains_subquery(high),
+        K::Overlaps { s1, e1, s2, e2 } => {
+            contains_subquery(s1)
+                || contains_subquery(e1)
+                || contains_subquery(s2)
+                || contains_subquery(e2)
+        },
         K::Like {
             expr: inner,
             pattern,
@@ -696,6 +708,12 @@ pub(crate) fn contains_sequence_call(expr: &TypedExpr) -> bool {
             contains_sequence_call(inner)
                 || contains_sequence_call(low)
                 || contains_sequence_call(high)
+        },
+        K::Overlaps { s1, e1, s2, e2 } => {
+            contains_sequence_call(s1)
+                || contains_sequence_call(e1)
+                || contains_sequence_call(s2)
+                || contains_sequence_call(e2)
         },
         K::Like {
             expr: inner,
@@ -798,6 +816,12 @@ pub(super) fn resolve_sequence_calls(
             resolve_sequence_calls(inner, engine)?;
             resolve_sequence_calls(low, engine)?;
             resolve_sequence_calls(high, engine)?;
+        },
+        K::Overlaps { s1, e1, s2, e2 } => {
+            resolve_sequence_calls(s1, engine)?;
+            resolve_sequence_calls(e1, engine)?;
+            resolve_sequence_calls(s2, engine)?;
+            resolve_sequence_calls(e2, engine)?;
         },
         K::Like {
             expr: inner,
@@ -1034,6 +1058,12 @@ fn expr_has_outer_column(expr: &TypedExpr) -> bool {
             expr_has_outer_column(inner)
                 || expr_has_outer_column(low)
                 || expr_has_outer_column(high)
+        },
+        K::Overlaps { s1, e1, s2, e2 } => {
+            expr_has_outer_column(s1)
+                || expr_has_outer_column(e1)
+                || expr_has_outer_column(s2)
+                || expr_has_outer_column(e2)
         },
         K::Like {
             expr: inner,

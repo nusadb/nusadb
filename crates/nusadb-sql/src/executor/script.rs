@@ -584,6 +584,12 @@ fn bind_vars_expr(
             bind_vars_expr(low, ctx, shadowed)?;
             bind_vars_expr(high, ctx, shadowed)?;
         },
+        ast::Expr::Overlaps { s1, e1, s2, e2 } => {
+            bind_vars_expr(s1, ctx, shadowed)?;
+            bind_vars_expr(e1, ctx, shadowed)?;
+            bind_vars_expr(s2, ctx, shadowed)?;
+            bind_vars_expr(e2, ctx, shadowed)?;
+        },
         ast::Expr::Like { expr, pattern, .. }
         | ast::Expr::SimilarTo { expr, pattern, .. }
         | ast::Expr::RegexMatch { expr, pattern, .. } => {

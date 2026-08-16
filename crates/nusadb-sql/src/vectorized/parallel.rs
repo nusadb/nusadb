@@ -145,6 +145,12 @@ fn thread_pure_expr(expr: &TypedExpr) -> bool {
         K::Between {
             expr, low, high, ..
         } => thread_pure_expr(expr) && thread_pure_expr(low) && thread_pure_expr(high),
+        K::Overlaps { s1, e1, s2, e2 } => {
+            thread_pure_expr(s1)
+                && thread_pure_expr(e1)
+                && thread_pure_expr(s2)
+                && thread_pure_expr(e2)
+        },
         K::InList { expr, list, .. } => thread_pure_expr(expr) && list.iter().all(thread_pure_expr),
         K::Case {
             operand,

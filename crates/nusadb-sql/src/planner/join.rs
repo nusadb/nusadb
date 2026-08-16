@@ -256,6 +256,10 @@ pub(super) fn column_side(expr: &TypedExpr, left_width: usize) -> Side {
 /// space when pushing it below the join. Only reached for a conjunct with no subquery (guarded at
 /// the call site), so the subquery/`OuterColumn` arms are inert; they leave any nested scope
 /// untouched, which is correct even if one ever slips through.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive recursion arm per expression variant"
+)]
 pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
     match &mut expr.kind {
         TypedExprKind::Column(index) => *index = index.saturating_sub(shift),
@@ -296,6 +300,11 @@ pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
             remap_columns(inner, shift);
             remap_columns(low, shift);
             remap_columns(high, shift);
+        },
+        TypedExprKind::Overlaps { s1, e1, s2, e2 } => {
+            for e in [s1, e1, s2, e2] {
+                remap_columns(e, shift);
+            }
         },
         TypedExprKind::Like {
             expr: inner,
@@ -358,6 +367,10 @@ pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
 }
 
 /// Gather every `Column` ordinal referenced anywhere in `expr`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive recursion arm per expression variant"
+)]
 pub(super) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
     match &expr.kind {
         TypedExprKind::Column(index) => out.push(*index),
@@ -401,6 +414,11 @@ pub(super) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
             collect_columns(inner, out);
             collect_columns(low, out);
             collect_columns(high, out);
+        },
+        TypedExprKind::Overlaps { s1, e1, s2, e2 } => {
+            for e in [s1, e1, s2, e2] {
+                collect_columns(e, out);
+            }
         },
         TypedExprKind::Like {
             expr: inner,

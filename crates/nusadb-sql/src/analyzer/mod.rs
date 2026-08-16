@@ -1038,6 +1038,12 @@ fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
         K::Between {
             expr, low, high, ..
         } => expr_is_ivm_stable(expr) && expr_is_ivm_stable(low) && expr_is_ivm_stable(high),
+        K::Overlaps { s1, e1, s2, e2 } => {
+            expr_is_ivm_stable(s1)
+                && expr_is_ivm_stable(e1)
+                && expr_is_ivm_stable(s2)
+                && expr_is_ivm_stable(e2)
+        },
         K::Like { expr, pattern, .. }
         | K::SimilarTo { expr, pattern, .. }
         | K::RegexMatch { expr, pattern, .. } => {
