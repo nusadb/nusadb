@@ -401,6 +401,19 @@ impl SetReturningFunc {
     pub(crate) const PAIR_KEY_COLUMN: &'static str = "key";
     /// See [`Self::PAIR_KEY_COLUMN`].
     pub(crate) const PAIR_COLUMN: &'static str = "value";
+
+    /// The default name each column this function appends *after* its primary output column takes
+    /// when the relation's alias list does not rename it: `value` for a pair function (`jsonb_each`),
+    /// otherwise the function's own name. A multi-array `UNNEST(a, b, ...)` appends one column per
+    /// further array, each taking this same `unnest` name — the reference engine names them alike.
+    #[must_use]
+    pub(crate) const fn appended_column_name(self) -> &'static str {
+        if self.pair_value_type().is_some() {
+            Self::PAIR_COLUMN
+        } else {
+            self.name()
+        }
+    }
 }
 
 /// A scalar (non-aggregate, non-window) built-in function (+). Result and argument types are

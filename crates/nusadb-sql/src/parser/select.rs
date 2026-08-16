@@ -439,11 +439,12 @@ fn desugar_table_function(
     ))
 }
 
-/// Desugar `FROM UNNEST(array) [AS x[(col)]] [WITH ORDINALITY]` into a derived table
-/// `(SELECT unnest(array)) AS x` — one row per element, reusing the same derived-table and
-/// projection-`ProjectSet` path as `generate_series`. `WITH ORDINALITY` appends a 1-based row number.
-/// Only the single-array form is supported: multiple arrays (the column-zip form) and `WITH OFFSET`
-/// are rejected rather than silently dropped.
+/// Desugar `FROM UNNEST(a [, b, ...]) [AS x[(col, ...)]] [WITH ORDINALITY]` into a derived table
+/// `(SELECT unnest(a [, b, ...])) AS x`, reusing the same derived-table and projection-`ProjectSet`
+/// path as `generate_series`. The single-array form yields one row per element; the multi-array
+/// (column-zip) form yields one row per position of the longest array, each further array supplying
+/// one more column (NULL-padded where it is shorter). `WITH ORDINALITY` appends a 1-based row number.
+/// `WITH OFFSET` is rejected rather than silently dropped.
 fn desugar_unnest(
     array_exprs: &[sql::Expr],
     alias: Option<&sql::TableAlias>,
@@ -454,12 +455,16 @@ fn desugar_unnest(
     if with_offset || with_offset_alias.is_some() {
         return unsupported("UNNEST ... WITH OFFSET");
     }
-    let [array_expr] = array_exprs else {
-        return unsupported("UNNEST of multiple arrays");
-    };
+    if array_exprs.is_empty() {
+        return unsupported("UNNEST requires at least one array argument");
+    }
+    let args = array_exprs
+        .iter()
+        .map(|e| convert_expr(e.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
     let func_expr = ast::Expr::SetReturning {
         func: ast::SetReturningFunc::Unnest,
-        args: vec![convert_expr(array_expr.clone())?],
+        args,
     };
     let table_alias = alias.map_or_else(|| "unnest".to_owned(), |a| fold_ident(&a.name));
     let column_aliases: Vec<String> = alias

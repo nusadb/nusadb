@@ -89,11 +89,15 @@ pub(super) fn lazy_int_series(op: &PhysicalOperator) -> Option<(i64, i64, i64)> 
         input,
         columns,
         ordinality: false,
-        pair: None,
+        extra_columns,
     } = op
     else {
         return None;
     };
+    // Any appended columns (a pair value / multi-array unnest) rule out the lazy counting source.
+    if !extra_columns.is_empty() {
+        return None;
+    }
     if !matches!(**input, PhysicalOperator::OneRow) {
         return None;
     }

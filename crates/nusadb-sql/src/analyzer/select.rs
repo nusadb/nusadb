@@ -153,7 +153,7 @@ fn analyze_values_table(
         modifying_ctes: Vec::new(),
         row_lock: None,
         ordinality: false,
-        pair: None,
+        extra_columns: Vec::new(),
     })
 }
 
@@ -205,7 +205,7 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
         modifying_ctes: Vec::new(),
         row_lock: None,
         ordinality: false,
-        pair: None,
+        extra_columns: Vec::new(),
     })
 }
 
@@ -1250,20 +1250,22 @@ fn analyze_select_scoped(
                 .to_owned(),
         ));
     }
-    // A *pair* set-returning function (`jsonb_each`) produces two columns per row: the key, which is
-    // this projection item, and the value, which `ProjectSet` appends after every other column. The
-    // two land side by side only when the function is the *last* item — which is how the
-    // `FROM jsonb_each(doc)` desugaring builds it, and how `SELECT id, jsonb_each(doc)` reads.
-    // Anywhere earlier the value column would be separated from its key by the items after it, so
-    // refuse rather than emit that shape.
-    let pair = pair_value_type(&projection);
-    if pair.is_some()
+    // Some set-returning functions produce more than one column per row: a *pair* function
+    // (`jsonb_each`) yields `(key, value)`, and a multi-array `UNNEST(a, b, ...)` yields one column
+    // per array. The primary column is this projection item; the rest `ProjectSet` appends after
+    // every other column. They land side by side only when the function is the *last* item — which is
+    // how the `FROM jsonb_each(doc)` / `FROM UNNEST(a, b)` desugaring builds it, and how
+    // `SELECT id, jsonb_each(doc)` reads. Anywhere earlier the appended columns would be separated
+    // from the primary by the items after it, so refuse rather than emit that shape.
+    let extra_columns = srf_extra_columns(&projection);
+    if !extra_columns.is_empty()
         && !matches!(projection.last(), Some(last)
             if matches!(last.expr.kind, TypedExprKind::SetReturning { .. }))
     {
         return Err(Error::Unsupported(
-            "jsonb_each() / jsonb_each_text() returns a (key, value) pair, so it must be the last \
-             item in its SELECT list — the value column is appended after it"
+            "a set-returning function that produces more than one column (jsonb_each / \
+             jsonb_each_text / multi-array unnest) must be the last item in its SELECT list — the \
+             extra columns are appended after it"
                 .to_owned(),
         ));
     }
@@ -1491,16 +1493,44 @@ fn analyze_select_scoped(
         modifying_ctes,
         row_lock,
         ordinality: false,
-        pair,
+        extra_columns,
     })
 }
 
-/// The value-column type of a *pair* set-returning function (`jsonb_each`) in `projection`, or
-/// `None` when the projection holds no such call. The caller has already established that at most
-/// one set-returning function is present.
-fn pair_value_type(projection: &[Projection]) -> Option<ColumnType> {
+/// The types of the extra columns a set-returning function in `projection` appends after its primary
+/// output column, in order — empty for an ordinary single-column call. A *pair* function
+/// (`jsonb_each`) appends its one value column; a multi-array `UNNEST(a, b, ...)` appends one column
+/// per further array, each typed by that array's element type. The caller has already established
+/// that at most one set-returning function is present.
+fn srf_extra_columns(projection: &[Projection]) -> Vec<ColumnType> {
+    projection
+        .iter()
+        .find_map(|p| match &p.expr.kind {
+            TypedExprKind::SetReturning { func, args } => Some(match func.pair_value_type() {
+                // A pair function (`jsonb_each`) appends its single value column.
+                Some(vt) => vec![vt],
+                // Columns 2..N of a multi-array unnest, each the further array's element type. A
+                // single-array unnest has no further arrays, so this yields an empty vec.
+                None if matches!(func, ast::SetReturningFunc::Unnest) => args
+                    .iter()
+                    .skip(1)
+                    .map(|a| match a.ty {
+                        ColumnType::Array(elem) => elem.column_type(),
+                        other => other,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The set-returning function in `projection`, if any — used to derive the default names of the
+/// columns it appends. The caller has already established that at most one is present.
+fn srf_projection_func(projection: &[Projection]) -> Option<ast::SetReturningFunc> {
     projection.iter().find_map(|p| match p.expr.kind {
-        TypedExprKind::SetReturning { func, .. } => func.pair_value_type(),
+        TypedExprKind::SetReturning { func, .. } => Some(func),
         _ => None,
     })
 }
@@ -2003,10 +2033,12 @@ impl Catalog for CteCatalog<'_> {
 /// column-name list. CTE columns are conservatively typed as nullable.
 fn cte_schema(name: &str, explicit: &[String], plan: &SelectPlan) -> Result<TableSchema, Error> {
     let base_width = plan.projection.len();
-    // A pair set-returning function (`jsonb_each`) adds its value column, then `WITH ORDINALITY`
-    // adds the counter — in that order, so `FROM jsonb_each(doc) WITH ORDINALITY` reads
-    // `(key, value, ordinality)`.
-    let width = base_width + usize::from(plan.pair.is_some()) + usize::from(plan.ordinality);
+    // A set-returning function may append extra columns (a pair function's value column, or a
+    // multi-array unnest's further arrays), then `WITH ORDINALITY` adds the counter — in that order,
+    // so `FROM jsonb_each(doc) WITH ORDINALITY` reads `(key, value, ordinality)` and
+    // `FROM unnest(a, b) WITH ORDINALITY` reads `(a, b, ordinality)`.
+    let extra = plan.extra_columns.len();
+    let width = base_width + extra + usize::from(plan.ordinality);
     if !explicit.is_empty() && explicit.len() != width {
         return Err(Error::Unsupported(format!(
             "CTE `{name}` declares {} column name(s) but its query returns {width}",
@@ -2026,24 +2058,31 @@ fn cte_schema(name: &str, explicit: &[String], plan: &SelectPlan) -> Result<Tabl
             nullable: true,
         })
         .collect();
-    // A pair function's value column comes first among the appended ones, named `value` unless the
-    // alias list renames it.
-    if let Some(ty) = plan.pair {
-        columns.push(ColumnDef {
-            name: explicit
-                .get(base_width)
-                .cloned()
-                .unwrap_or_else(|| ast::SetReturningFunc::PAIR_COLUMN.to_owned()),
-            ty,
-            nullable: true,
-        });
+    // The appended columns come next, before any ordinality counter. Each takes its default name
+    // (the pair value column's `value`, or a further unnest array's `unnest`) unless the alias list
+    // renames it positionally.
+    if extra > 0 {
+        let default = srf_projection_func(&plan.projection)
+            .map_or(ast::SetReturningFunc::PAIR_COLUMN, |f| {
+                f.appended_column_name()
+            });
+        for (j, ty) in plan.extra_columns.iter().enumerate() {
+            columns.push(ColumnDef {
+                name: explicit
+                    .get(base_width + j)
+                    .cloned()
+                    .unwrap_or_else(|| default.to_owned()),
+                ty: *ty,
+                nullable: true,
+            });
+        }
     }
     // The appended `WITH ORDINALITY` column is a 1-based row number (a non-null BIGINT, named
     // `ordinality` unless the alias list renames it).
     if plan.ordinality {
         columns.push(ColumnDef {
             name: explicit
-                .get(base_width + usize::from(plan.pair.is_some()))
+                .get(base_width + extra)
                 .cloned()
                 .unwrap_or_else(|| "ordinality".to_owned()),
             ty: ColumnType::BigInt,
@@ -2519,24 +2558,40 @@ fn analyze_set_returning(
     use ast::SetReturningFunc as Srf;
     // Each set-returning built-in has a fixed argument shape and per-row element type.
     let (expected, element_ty): (&[ColumnType], ColumnType) = match func {
-        // UNNEST(arr): one array argument; element type comes from the array.
+        // UNNEST(a [, b, ...]): one or more array arguments. The projection column takes the first
+        // array's element type; any further arrays each contribute one more output column (see
+        // `srf_extra_columns`), which `ProjectSet` zips in column-wise with NULL padding. Every
+        // argument must be an array.
         Srf::Unnest => {
-            let [arg_expr] = args else {
+            let Some((first_expr, rest_exprs)) = args.split_first() else {
                 return Err(srf_arity_error(func, 1, args.len()));
             };
-            let arg = analyze_expr(arg_expr, scope, catalog, None)?;
-            let ColumnType::Array(elem) = arg.ty else {
+            let first = analyze_expr(first_expr, scope, catalog, None)?;
+            let ColumnType::Array(elem) = first.ty else {
                 return Err(Error::Unsupported(format!(
                     "unnest() expects an array argument, got {:?}",
-                    arg.ty
+                    first.ty
                 )));
             };
+            let element_ty = elem.column_type();
+            let mut typed_args = Vec::with_capacity(args.len());
+            typed_args.push(first);
+            for arg_expr in rest_exprs {
+                let arg = analyze_expr(arg_expr, scope, catalog, None)?;
+                if !matches!(arg.ty, ColumnType::Array(_)) {
+                    return Err(Error::Unsupported(format!(
+                        "unnest() expects an array argument, got {:?}",
+                        arg.ty
+                    )));
+                }
+                typed_args.push(arg);
+            }
             return Ok(TypedExpr {
                 kind: TypedExprKind::SetReturning {
                     func,
-                    args: vec![arg],
+                    args: typed_args,
                 },
-                ty: elem.column_type(),
+                ty: element_ty,
             });
         },
         // GENERATE_SERIES(start, stop [, step]): the integer form takes two or three INT args → one

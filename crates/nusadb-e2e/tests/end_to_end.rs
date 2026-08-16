@@ -3886,6 +3886,115 @@ fn unnest_as_a_from_table_function() {
     );
 }
 
+/// `unnest(a, b)` over two equal-length arrays zips them column-wise: one row per position, the first
+/// array in column one and the second in column two. Verified against the reference engine.
+#[test]
+fn unnest_multi_array_equal_length() {
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT n, s FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b', 'c']) AS t(n, s)"
+        )),
+        vec![
+            vec![Value::Int(1), Value::Text("a".to_owned())],
+            vec![Value::Int(2), Value::Text("b".to_owned())],
+            vec![Value::Int(3), Value::Text("c".to_owned())],
+        ],
+    );
+}
+
+/// When the first array is longer, the shorter second array is NULL-padded up to the longest length.
+/// Verified against the reference engine.
+#[test]
+fn unnest_multi_array_first_longer() {
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT n, s FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b']) AS t(n, s)"
+        )),
+        vec![
+            vec![Value::Int(1), Value::Text("a".to_owned())],
+            vec![Value::Int(2), Value::Text("b".to_owned())],
+            vec![Value::Int(3), Value::Null],
+        ],
+    );
+}
+
+/// When the second array is longer, the shorter first array is NULL-padded up to the longest length.
+/// Verified against the reference engine.
+#[test]
+fn unnest_multi_array_second_longer() {
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT n, s FROM unnest(ARRAY[1], ARRAY['a', 'b', 'c']) AS t(n, s)"
+        )),
+        vec![
+            vec![Value::Int(1), Value::Text("a".to_owned())],
+            vec![Value::Null, Value::Text("b".to_owned())],
+            vec![Value::Null, Value::Text("c".to_owned())],
+        ],
+    );
+}
+
+/// Three arrays of differing lengths all zip against the longest, each shorter one NULL-padded
+/// independently. Verified against the reference engine.
+#[test]
+fn unnest_multi_array_three_arrays() {
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT a, b, c FROM unnest(ARRAY[1, 2], ARRAY[3], ARRAY[5, 6, 7]) AS t(a, b, c)"
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(3), Value::Int(5)],
+            vec![Value::Int(2), Value::Null, Value::Int(6)],
+            vec![Value::Null, Value::Null, Value::Int(7)],
+        ],
+    );
+}
+
+/// `WITH ORDINALITY` appends one 1-based counter column at the very end, after every zipped column —
+/// the counter runs over positions of the longest array, so a NULL-padded row still gets its number.
+/// Verified against the reference engine.
+#[test]
+fn unnest_multi_array_with_ordinality() {
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT n, s, o FROM unnest(ARRAY[10, 20], ARRAY['x', 'y', 'z']) \
+             WITH ORDINALITY AS t(n, s, o)"
+        )),
+        vec![
+            vec![Value::Int(10), Value::Text("x".to_owned()), Value::Int(1)],
+            vec![Value::Int(20), Value::Text("y".to_owned()), Value::Int(2)],
+            vec![Value::Null, Value::Text("z".to_owned()), Value::Int(3)],
+        ],
+    );
+}
+
+/// The single-array form is unchanged by the multi-array support: one row per element, one column.
+#[test]
+fn unnest_multi_array_single_array_regression() {
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT n FROM unnest(ARRAY[100, 200, 300]) AS t(n)"
+        )),
+        vec![
+            vec![Value::Int(100)],
+            vec![Value::Int(200)],
+            vec![Value::Int(300)],
+        ],
+    );
+}
+
 #[test]
 fn avg_over_an_exact_type_is_exact_numeric_not_lossy_float() {
     // QA Temuan-4: AVG over an integer (or NUMERIC) column is exact NUMERIC, not a lossy f64.

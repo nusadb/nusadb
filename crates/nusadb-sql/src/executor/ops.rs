@@ -1581,7 +1581,7 @@ fn execute_op_inner(
         PhysicalOperator::ProjectSet {
             input,
             columns,
-            pair,
+            extra_columns: _,
             ordinality,
         } => {
             let rows = execute_op(input, engine, txn)?;
@@ -1595,39 +1595,48 @@ fn execute_op_inner(
                 .collect::<Result<Vec<_>, _>>()?;
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                // Evaluate the scalar columns once per input row; the SRF column expands to a list.
-                // The analyzer guarantees exactly one SRF column, so `srf` is set exactly once. A
-                // *pair* function (`jsonb_each`) produces a second value per element, appended below.
+                // Evaluate the scalar columns once per input row; the SRF column expands to a primary
+                // element list plus zero or more equal-length extra columns (a pair function's value,
+                // or a multi-array unnest's further arrays). The analyzer guarantees exactly one SRF
+                // column, so `srf` is set exactly once.
                 let mut scalars: Row = Vec::with_capacity(resolved.len());
-                let mut srf: Option<(usize, Vec<ast::Value>, Vec<ast::Value>)> = None;
+                let mut srf: Option<(usize, Vec<ast::Value>, Vec<Vec<ast::Value>>)> = None;
                 for (i, expr) in resolved.iter().enumerate() {
                     if let crate::planner::TypedExprKind::SetReturning { func, args } = &expr.kind {
-                        let (elements, values) = if pair.is_some() {
-                            eval_set_returning_pairs(*func, args, &row)?
-                                .into_iter()
-                                .unzip()
-                        } else {
-                            (eval_set_returning(*func, args, &row)?, Vec::new())
-                        };
-                        srf = Some((i, elements, values));
+                        let (elements, extra) =
+                            if matches!(func, ast::SetReturningFunc::Unnest) && args.len() > 1 {
+                                // Multi-array unnest zips its arrays, NULL-padding to the longest.
+                                eval_unnest_multi(args, &row)?
+                            } else if func.pair_value_type().is_some() {
+                                // A pair function (`jsonb_each`) yields (key, value) per element; the
+                                // value becomes the single extra column beside the key.
+                                let (keys, values): (Vec<ast::Value>, Vec<ast::Value>) =
+                                    eval_set_returning_pairs(*func, args, &row)?
+                                        .into_iter()
+                                        .unzip();
+                                (keys, vec![values])
+                            } else {
+                                (eval_set_returning(*func, args, &row)?, Vec::new())
+                            };
+                        srf = Some((i, elements, extra));
                         scalars.push(ast::Value::Null); // placeholder, set per produced element
                     } else {
                         scalars.push(eval::eval(expr, &row)?);
                     }
                 }
                 // One output row per produced element; an empty/NULL set emits no row for this input.
-                // The appended columns go value-then-counter, matching the relation schema
-                // `cte_schema` builds: `FROM jsonb_each(doc) WITH ORDINALITY` is
-                // `(key, value, ordinality)`.
-                if let Some((pos, elements, values)) = srf {
-                    let mut values = values.into_iter();
+                // The appended columns go extra-columns-then-counter, matching the relation schema
+                // `cte_schema` builds: `FROM jsonb_each(doc) WITH ORDINALITY` is `(key, value,
+                // ordinality)` and `FROM unnest(a, b) WITH ORDINALITY` is `(a, b, ordinality)`. Every
+                // extra column is padded to the primary's length, so indexing by `idx` never misses.
+                if let Some((pos, elements, extra)) = srf {
                     for (idx, element) in elements.into_iter().enumerate() {
                         let mut output = scalars.clone();
                         if let Some(slot) = output.get_mut(pos) {
                             *slot = element;
                         }
-                        if pair.is_some() {
-                            output.push(values.next().unwrap_or(ast::Value::Null));
+                        for col in &extra {
+                            output.push(col.get(idx).cloned().unwrap_or(ast::Value::Null));
                         }
                         if *ordinality {
                             let n = i64::try_from(idx).map_or(i64::MAX, |i| i.saturating_add(1));
@@ -2871,9 +2880,38 @@ fn eval_set_returning_pairs(
     }
 }
 
+/// Evaluate a multi-array `UNNEST(a, b, ...)` for one input row, zipping the arrays column-wise.
+/// Returns `(primary, extra)`: `primary` is the first array's elements and each entry of `extra` is a
+/// further array's elements. Every column is NULL-padded to the longest array's length, so the caller
+/// emits one row per position — a shorter array contributing `NULL` past its end. Each array's
+/// elements are extracted exactly as the single-array form (a multidimensional array flattens to its
+/// leaves; a `NULL`/non-array contributes no elements, i.e. an all-`NULL` column of the padded width).
+fn eval_unnest_multi(
+    args: &[TypedExpr],
+    row: &Row,
+) -> Result<(Vec<ast::Value>, Vec<Vec<ast::Value>>), Error> {
+    let mut cols: Vec<Vec<ast::Value>> = Vec::with_capacity(args.len());
+    for arg in args {
+        cols.push(eval_set_returning(
+            ast::SetReturningFunc::Unnest,
+            std::slice::from_ref(arg),
+            row,
+        )?);
+    }
+    let longest = cols.iter().map(Vec::len).max().unwrap_or(0);
+    for col in &mut cols {
+        col.resize(longest, ast::Value::Null);
+    }
+    // The analyzer requires at least one array argument, so `cols` has a first (primary) column.
+    let mut iter = cols.into_iter();
+    let primary = iter.next().unwrap_or_default();
+    Ok((primary, iter.collect()))
+}
+
 /// Evaluate a set-returning function for one input row into its element list. `UNNEST(arr)`
 /// yields the array's elements in order; a `NULL` (or non-array, defensively) array yields nothing.
-/// The pair functions go through [`eval_set_returning_pairs`] instead.
+/// The pair functions go through [`eval_set_returning_pairs`] instead; the multi-array unnest form
+/// goes through [`eval_unnest_multi`].
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per set-returning function; flatter than dispatching to per-function helpers"
@@ -4526,12 +4564,24 @@ pub(super) fn output_columns(op: &PhysicalOperator) -> Vec<String> {
         PhysicalOperator::Project { columns, .. } => {
             columns.iter().map(|c| c.name.clone()).collect()
         },
-        // A pair set-returning function appends its value column to the projected ones, so the
-        // announced names must too — otherwise the row width and the column list disagree.
-        PhysicalOperator::ProjectSet { columns, pair, .. } => {
+        // A set-returning function may append extra columns (a pair value, or a multi-array unnest's
+        // further arrays) to the projected ones, so the announced names must too — otherwise the row
+        // width and the column list disagree. Each takes the function's appended-column name.
+        PhysicalOperator::ProjectSet {
+            columns,
+            extra_columns,
+            ..
+        } => {
             let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-            if pair.is_some() {
-                names.push(ast::SetReturningFunc::PAIR_COLUMN.to_owned());
+            if !extra_columns.is_empty() {
+                let default = columns
+                    .iter()
+                    .find_map(|c| match c.expr.kind {
+                        crate::planner::TypedExprKind::SetReturning { func, .. } => Some(func),
+                        _ => None,
+                    })
+                    .map_or(ast::SetReturningFunc::PAIR_COLUMN, |f| f.appended_column_name());
+                names.extend(std::iter::repeat_n(default.to_owned(), extra_columns.len()));
             }
             names
         },
@@ -4552,11 +4602,15 @@ pub(super) fn output_columns(op: &PhysicalOperator) -> Vec<String> {
 pub(super) fn output_column_types(op: &PhysicalOperator) -> Vec<ColumnType> {
     match op {
         PhysicalOperator::Project { columns, .. } => columns.iter().map(|c| c.expr.ty).collect(),
-        // Parallel to `output_columns`: the pair function's appended value column carries its own
-        // declared type.
-        PhysicalOperator::ProjectSet { columns, pair, .. } => {
+        // Parallel to `output_columns`: the set-returning function's appended columns carry their own
+        // declared types.
+        PhysicalOperator::ProjectSet {
+            columns,
+            extra_columns,
+            ..
+        } => {
             let mut types: Vec<ColumnType> = columns.iter().map(|c| c.expr.ty).collect();
-            types.extend(*pair);
+            types.extend(extra_columns.iter().copied());
             types
         },
         PhysicalOperator::Limit { input, .. }
