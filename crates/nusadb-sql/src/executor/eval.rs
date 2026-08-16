@@ -511,8 +511,13 @@ fn eval_scalar_function(
         (F::RegexpLike, [Text(s), Text(pat), Text(flags)]) => {
             ast::Value::Bool(regexp_like(s, pat, flags)?)
         },
-        (F::RegexpCount, [Text(s), Text(pat)]) => Int(regexp_count(s, pat, "")?),
-        (F::RegexpCount, [Text(s), Text(pat), Text(flags)]) => Int(regexp_count(s, pat, flags)?),
+        (F::RegexpCount, [Text(s), Text(pat)]) => Int(regexp_count(s, pat, 1, "")?),
+        (F::RegexpCount, [Text(s), Text(pat), Int(start)]) => {
+            Int(regexp_count(s, pat, *start, "")?)
+        },
+        (F::RegexpCount, [Text(s), Text(pat), Int(start), Text(flags)]) => {
+            Int(regexp_count(s, pat, *start, flags)?)
+        },
         (F::RegexpInstr, [Text(s), Text(pat)]) => Int(regexp_instr(s, pat, "")?),
         (F::RegexpInstr, [Text(s), Text(pat), Text(flags)]) => Int(regexp_instr(s, pat, flags)?),
         (F::RegexpSubstr, [Text(s), Text(pat)]) => regexp_substr(s, pat, 1, 1, "", 0)?,
@@ -1661,11 +1666,27 @@ fn regexp_like(source: &str, pattern: &str, flags: &str) -> Result<bool, Error> 
     Ok(re.is_match(source))
 }
 
-/// `REGEXP_COUNT(s, pattern [, flags])` — number of non-overlapping matches of `pattern` in `s`,
-/// saturating at `i64::MAX` (no string holds that many matches).
-fn regexp_count(source: &str, pattern: &str, flags: &str) -> Result<i64, Error> {
+/// `regexp_count(string, pattern [, start [, flags]])` — how many times `pattern` matches in
+/// `string` from character position `start` (1-based, default 1). Matches are non-overlapping.
+/// `start` below 1 is a hard error; a `start` past the end counts zero. Counts characters, not bytes.
+fn regexp_count(source: &str, pattern: &str, start: i64, flags: &str) -> Result<i64, Error> {
+    if start < 1 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"start\": {start}"
+        )));
+    }
     let (re, _global) = compile_regex(pattern, flags)?;
-    Ok(i64::try_from(re.find_iter(source).count()).unwrap_or(i64::MAX))
+    let start_char = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    let byte_off = if start_char == 0 {
+        0
+    } else {
+        match source.char_indices().nth(start_char) {
+            Some((b, _)) => b,
+            None => return Ok(0),
+        }
+    };
+    let hay = source.get(byte_off..).unwrap_or("");
+    Ok(i64::try_from(re.find_iter(hay).count()).unwrap_or(i64::MAX))
 }
 
 /// `REGEXP_INSTR(s, pattern [, flags])` — the 1-based character position of the first match of

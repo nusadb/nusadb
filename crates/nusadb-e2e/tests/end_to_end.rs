@@ -1615,6 +1615,38 @@ fn regexp_substr_matches_pg_signature() {
 }
 
 #[test]
+fn regexp_count_matches_pg_signature() {
+    // regexp_count(string, pattern [, start int [, flags]]) — the 3rd argument is a 1-based START
+    // position (integer), NOT flags. Expected values are from the live reference engine (v16).
+    let engine = BtreeEngine::new();
+    let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
+
+    assert_eq!(one("SELECT regexp_count('foobarbaz', 'a')"), Value::Int(2));
+    // 3rd arg = 1-based start position.
+    assert_eq!(
+        one("SELECT regexp_count('foobarbaz', 'a', 4)"),
+        Value::Int(2)
+    );
+    // 4th arg = flags.
+    assert_eq!(
+        one("SELECT regexp_count('FOOBAR', 'o', 1, 'i')"),
+        Value::Int(2)
+    );
+    // non-overlapping matches.
+    assert_eq!(one("SELECT regexp_count('aaaa', 'aa')"), Value::Int(2));
+    // a match straddling the start position is not counted (search begins AT start).
+    assert_eq!(one("SELECT regexp_count('xaax', 'aa', 2)"), Value::Int(1));
+    // start past the end counts zero.
+    assert_eq!(one("SELECT regexp_count('abc', 'a', 10)"), Value::Int(0));
+    // start counts characters, not bytes.
+    assert_eq!(one(r"SELECT regexp_count('héllo', 'l', 3)"), Value::Int(2));
+
+    // start < 1 is a hard error; a flags string in the start slot is a type error, not silent flags.
+    assert!(run_try(&engine, "SELECT regexp_count('abc','a',0)").is_err());
+    assert!(run_try(&engine, "SELECT regexp_count('FOO','o','i')").is_err());
+}
+
+#[test]
 fn regexp_matches_is_set_returning_with_the_global_flag() {
     // regexp_matches is a set-returning function: with the `g` flag it yields one row per match (each
     // a TEXT[] of the capture groups), not a single first-match row. (QA finding: the `g` form was
