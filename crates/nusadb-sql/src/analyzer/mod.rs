@@ -92,6 +92,14 @@ pub trait Catalog {
             .unwrap_or_else(|| nusadb_core::PUBLIC_SCHEMA.to_owned())
     }
 
+    /// The session's temporary schema (`nusadb_temp_<id>`), if this is a real session. An unqualified
+    /// name resolves here FIRST (temp objects shadow the search path), but this does NOT change
+    /// `current_schema` — a non-temp CREATE still targets the search-path schema. Default reads the
+    /// executor session context; test doubles have none.
+    fn temp_schema(&self) -> Option<String> {
+        crate::executor::current_temp_schema()
+    }
+
     /// The secondary indexes declared on `table`, for index-scan planning. Default empty so
     /// a minimal catalog — or one whose engine has no indexes — simply plans sequential scans; the
     /// production adapter overrides it to expose the engine's indexes. Called only for a real base
@@ -1207,6 +1215,13 @@ fn lookup_table_ref(
     }
     if let Some(s) = schema {
         return catalog.lookup_table_in(s, name);
+    }
+    // Unqualified: a temporary table shadows the search path — resolve the session's temp schema
+    // first, so `t` finds the session's temp `t` before any durable `public.t`.
+    if let Some(temp) = catalog.temp_schema()
+        && let Some(table) = catalog.lookup_table_in(&temp, name)?
+    {
+        return Ok(Some(table));
     }
     // Unqualified: walk the search path, taking the first schema that has the table.
     for s in catalog.search_path() {

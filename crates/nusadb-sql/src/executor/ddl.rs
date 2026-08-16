@@ -122,6 +122,12 @@ pub(super) fn run_create_table(
             name: crate::analyzer::qualified_display(&plan.schema, &plan.table),
         });
     }
+    // A temporary table lives in the session's non-durable temp schema (`nusadb_temp_<id>`), which is
+    // created lazily on the first temp CREATE and reused by later ones. Only mint it when absent — a
+    // second `CREATE TEMP TABLE` in the same session must not fail on "schema already exists".
+    if plan.temporary && engine.lookup_schema(&plan.schema)?.is_none() {
+        engine.create_temp_schema(txn, &plan.schema)?;
+    }
     // Resolve any deferred user-defined column type (B-ENUM): it must name a registered ENUM, which
     // is stored as its `TEXT` placeholder. An unresolved name is a loud error (caught here, not at
     // parse time, because only the executor can read the type catalog). The enum's label set is

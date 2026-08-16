@@ -169,6 +169,14 @@ impl Catalog for RecordingCatalog<'_> {
         self.inner.search_path()
     }
 
+    fn temp_schema(&self) -> Option<String> {
+        // Forward the session's temp schema: it must come from the wrapped catalog (the wire reads
+        // it from the connection's settings), NOT the default, which reads the thread-local session
+        // context — stale on a reused pool thread, so an unqualified name would bind to another
+        // connection's temp table.
+        self.inner.temp_schema()
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, Error> {
         let view = self.inner.lookup_view(name)?;
         if view.is_some() {

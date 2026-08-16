@@ -54,11 +54,27 @@ pub(super) fn analyze_create_table(
             }
         }
     }
-    // An unqualified CREATE targets the session's current schema; an explicit qualifier wins.
-    let target_schema = ct
-        .schema
-        .clone()
-        .unwrap_or_else(|| catalog.current_schema());
+    // An unqualified CREATE targets the session's current schema; an explicit qualifier wins. A
+    // temporary table instead targets the session's non-durable temp schema — which does NOT change
+    // `current_schema`, so a plain CREATE alongside it still lands in the search-path schema.
+    let target_schema = if ct.temporary {
+        if ct.schema.is_some() {
+            // A temp table lives in the session's own temp schema; naming another schema is a
+            // contradiction, not a silent override.
+            return Err(Error::Unsupported(
+                "CREATE TEMPORARY TABLE with an explicit schema qualifier".to_owned(),
+            ));
+        }
+        catalog.temp_schema().ok_or_else(|| {
+            Error::Unsupported(
+                "temporary tables require a session (no temp schema available)".to_owned(),
+            )
+        })?
+    } else {
+        ct.schema
+            .clone()
+            .unwrap_or_else(|| catalog.current_schema())
+    };
     if !ct.if_not_exists && catalog.lookup_table_in(&target_schema, &ct.name)?.is_some() {
         return Err(Error::TableExists {
             name: super::qualified_display(&target_schema, &ct.name),
@@ -83,6 +99,7 @@ pub(super) fn analyze_create_table(
         check_constraints,
         defaults,
         if_not_exists: ct.if_not_exists,
+        temporary: ct.temporary,
         like_source: ct.like_source,
     })
 }

@@ -834,6 +834,18 @@ where
     // `Arc`; statements on one connection run strictly serially, so the `Mutex` is never contended.
     let settings: Arc<std::sync::Mutex<HashMap<String, String>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // This connection's temporary schema (non-durable, per-connection): named by the unique backend
+    // pid so no two live connections collide. Stamped into the GUC store under a reserved key so every
+    // per-statement snapshot carries it — analysis (`EngineCatalog::temp_schema`) and execution (the
+    // pinned session context read from the same snapshot) then agree which temp schema this connection
+    // owns. A `CREATE TEMP TABLE` creates it on demand; the disconnect handler below drops it.
+    let temp_schema_name = format!("nusadb_temp_{}", key.pid);
+    if let Ok(mut store) = settings.lock() {
+        store.insert(
+            nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING.to_owned(),
+            temp_schema_name.clone(),
+        );
+    }
     // Per-connection plan cache: reuses a planned read query when the same SQL is issued again
     // and none of its tables changed schema. Scoped to this connection (hence this user), so a cached
     // plan — which bakes RLS predicates for the analyzing user — is never served across users.
@@ -1251,7 +1263,41 @@ where
         let engine = Arc::clone(&engine);
         let _ = tokio::task::spawn_blocking(move || engine.rollback(txn)).await;
     }
+    // Drop this connection's temporary schema (and every table in it) if a `CREATE TEMP TABLE` ever
+    // created one. Best-effort on a blocking thread: a disconnect cleanup must never fail teardown,
+    // and a connection that made no temp table finds no schema and does nothing.
+    {
+        let engine = Arc::clone(&engine);
+        let _ = tokio::task::spawn_blocking(move || {
+            drop_temp_schema(engine.as_ref(), &temp_schema_name);
+        })
+        .await;
+    }
     Ok(())
+}
+
+/// Drop a connection's temporary schema on disconnect — best-effort, in a fresh transaction.
+///
+/// A no-op when the schema was never created (no `CREATE TEMP TABLE` ran). Any error is rolled back
+/// and swallowed: a connection teardown must not surface a failure, and a leaked non-durable schema
+/// is reclaimed on the next restart regardless (it never reaches the WAL or checkpoint).
+fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) {
+    let result = (|| -> Result<(), nusadb_core::Error> {
+        let Some(id) = engine.lookup_schema(name)? else {
+            return Ok(());
+        };
+        let txn = engine.begin(nusadb_core::IsolationLevel::default())?;
+        match engine.drop_schema(txn, id, true) {
+            Ok(()) => engine.commit(txn),
+            Err(e) => {
+                let _ = engine.rollback(txn);
+                Err(e)
+            },
+        }
+    })();
+    if let Err(e) = result {
+        tracing::warn!(schema = %name, error = %e, "failed to drop temporary schema on disconnect");
+    }
 }
 
 /// If `sql` is a `COPY ... FROM STDIN` / `TO STDOUT`, parse and return it; otherwise `None` (the
@@ -2723,7 +2769,14 @@ where
     // Bound parameters were substituted into `stmt` above, so this plan is specific to these values
     // and must not be cached under the shared SQL text (a reused prepared statement would then get
     // the previous parameter set's rows). The simple-query path passes no parameters and caches.
-    let bypass_plan_cache = !params.is_empty();
+    //
+    // Once this connection owns a temporary schema, an unqualified name can be shadowed by a temp
+    // table the plan cache's per-table fingerprint cannot track (creating `temp.t` does not change
+    // `public.t`'s version, so a plan cached for `public.t` would be served stale). Bypass the cache
+    // for the whole connection while its temp schema exists — correct, and paid only by the niche
+    // sessions that use temp tables; the common no-temp connection keeps full caching.
+    let bypass_plan_cache =
+        !params.is_empty() || connection_temp_schema_exists(engine.as_ref(), settings);
     let from_less = nusadb_sql::ast::from_less_pure_select(&stmt);
     let point_get = !from_less && nusadb_sql::ast::point_get_candidate(&stmt);
     if from_less || point_get {
@@ -3369,9 +3422,14 @@ fn apply_set_variable(
     // `RESET ALL` clears every parameter the connection set, rather than naming one.
     if sv.value.is_none() && sv.name.eq_ignore_ascii_case("all") {
         if let Ok(mut store) = settings.lock() {
-            // The reserved connection-database key is stamped by the server, not by the client,
-            // so it survives — resetting it would make `current_database()` lie.
-            store.retain(|k, _| k == nusadb_sql::CONNECTION_DATABASE_SETTING);
+            // The reserved connection keys are stamped by the server, not by the client, so they
+            // survive: resetting the database would make `current_database()` lie, and resetting the
+            // temp-schema key would strand this connection's temp tables (analysis would stop
+            // resolving them).
+            store.retain(|k, _| {
+                k == nusadb_sql::CONNECTION_DATABASE_SETTING
+                    || k == nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING
+            });
         }
         return Ok(ExecutionResult::VariableSet);
     }
@@ -3559,6 +3617,22 @@ fn settings_snapshot(
         database.to_owned(),
     );
     snapshot
+}
+
+/// Whether this connection's temporary schema currently exists in the engine — i.e. a `CREATE TEMP
+/// TABLE` has run on it and it has not been dropped. A cheap in-memory catalog lookup; used to
+/// bypass the per-connection plan cache while temp tables can shadow unqualified names (the cache's
+/// per-table fingerprint cannot see a newly created shadowing temp table). Returns `false` when the
+/// connection has no temp-schema key (defensive) or the schema does not (yet) exist.
+fn connection_temp_schema_exists(
+    engine: &dyn StorageEngine,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+) -> bool {
+    let name = settings
+        .lock()
+        .ok()
+        .and_then(|s| s.get(nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING).cloned());
+    name.is_some_and(|n| matches!(engine.lookup_schema(&n), Ok(Some(_))))
 }
 
 /// How many statements have run on the reactor-inline point-get path, process-wide.
@@ -3904,6 +3978,11 @@ struct EngineCatalog<'a> {
     /// The session's ordered `search_path` schemas, derived from `SET search_path`; `[public]`
     /// when unset. An unqualified name is created in the first entry and resolved through the list.
     search_path: Vec<String>,
+    /// The connection's temporary schema (`nusadb_temp_<pid>`), read from the reserved settings key
+    /// the wire stamps. An unqualified name resolves here before the search path. Analysis runs before
+    /// the session context is pinned, so the catalog reads it from its own settings rather than the
+    /// thread-local — otherwise a temp table would be invisible to the statement that queries it.
+    temp_schema: Option<String>,
     /// The resolved session (effective roles + superuser flag), computed once and reused for every
     /// privilege question this statement asks. A fresh `EngineCatalog` is built per statement over a
     /// fixed transaction snapshot, so the cache is exactly statement-scoped and never outlives the
@@ -3923,11 +4002,15 @@ impl<'a> EngineCatalog<'a> {
     ) -> Self {
         let search_path =
             nusadb_sql::search_path_schemas(settings.get("search_path").map(String::as_str));
+        let temp_schema = settings
+            .get(nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING)
+            .cloned();
         Self {
             engine,
             txn,
             user,
             search_path,
+            temp_schema,
             resolved: std::cell::RefCell::new(None),
         }
     }
@@ -3949,6 +4032,10 @@ impl<'a> EngineCatalog<'a> {
 impl Catalog for EngineCatalog<'_> {
     fn search_path(&self) -> Vec<String> {
         self.search_path.clone()
+    }
+
+    fn temp_schema(&self) -> Option<String> {
+        self.temp_schema.clone()
     }
 
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {

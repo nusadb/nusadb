@@ -22,6 +22,10 @@ pub struct CreateTable {
     pub constraints: Vec<TableConstraint>,
     /// Whether `IF NOT EXISTS` was specified.
     pub if_not_exists: bool,
+    /// `CREATE TEMP`/`TEMPORARY TABLE` — the table is created in the session's non-durable temporary
+    /// schema (`nusadb_temp_<id>`) rather than the search-path schema, and an unqualified name
+    /// resolves there first. `GLOBAL`/`LOCAL` are treated alike. `false` for an ordinary table.
+    pub temporary: bool,
     /// `CREATE TABLE t (LIKE src)` — copy `src`'s columns (their type, width, and `NOT NULL`) into
     /// this table's column list. `None` for an ordinary create. The columns are resolved from the
     /// catalog at analysis (the parser has no catalog), and the width-enforcing checks are copied at

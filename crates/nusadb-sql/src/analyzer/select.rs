@@ -1947,9 +1947,15 @@ impl Catalog for CteCatalog<'_> {
     }
 
     fn lookup_table_in(&self, schema: &str, name: &str) -> Result<Option<TableSchema>, Error> {
-        // The synthetic recursive-CTE table is unqualified; a schema qualifier always denotes
-        // a real base table, so delegate qualified resolution straight to the inner catalog.
-        if schema == nusadb_core::PUBLIC_SCHEMA && name == self.name {
+        // The synthetic recursive-CTE table shadows any real object of the same unqualified name.
+        // Unqualified resolution reaches this via the `public` probe (the search-path loop) and the
+        // temp-schema probe (`lookup_table_ref` tries the session temp schema first) — so the CTE
+        // name must win for BOTH, or a session temp table of the same name would hijack the CTE's
+        // self-reference. A genuine other-schema qualifier still denotes a real base table.
+        if name == self.name
+            && (schema == nusadb_core::PUBLIC_SCHEMA
+                || self.inner.temp_schema().as_deref() == Some(schema))
+        {
             return Ok(Some(self.schema.clone()));
         }
         self.inner.lookup_table_in(schema, name)
@@ -1959,6 +1965,14 @@ impl Catalog for CteCatalog<'_> {
         // Forward the session search path: a recursive CTE term that references an unqualified
         // base table must resolve it under the real session path, not the default `public`.
         self.inner.search_path()
+    }
+
+    fn temp_schema(&self) -> Option<String> {
+        // Forward the session temp schema from the inner (real) catalog. Without this the default
+        // reads the executor thread-local, which during wire analysis holds the PREVIOUS statement's
+        // context — on a reused thread that is another connection's temp schema (a cross-session
+        // leak). The inner catalog carries this connection's own temp schema from its settings.
+        self.inner.temp_schema()
     }
 
     fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {

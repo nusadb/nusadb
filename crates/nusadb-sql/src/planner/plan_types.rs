@@ -587,6 +587,10 @@ pub struct CreateTablePlan {
     pub defaults: Vec<(String, String)>,
     /// Whether `IF NOT EXISTS` was given (the table may already exist).
     pub if_not_exists: bool,
+    /// Whether this is a `CREATE TEMP`/`TEMPORARY TABLE`: [`schema`](Self::schema) is the session's
+    /// non-durable temp schema (`nusadb_temp_<id>`), which the executor creates on demand before the
+    /// table. `false` for an ordinary table.
+    pub temporary: bool,
     /// `CREATE TABLE ... (LIKE src)` source table name, if any. The analyzer has already merged
     /// `src`'s columns into `columns`; the executor additionally copies `src`'s synthetic width /
     /// length checks so the declared width (lost by the runtime `ColumnType`) is preserved.

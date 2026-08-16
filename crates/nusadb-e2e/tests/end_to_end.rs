@@ -10301,3 +10301,229 @@ fn both_foreign_key_search_strategies_agree() {
         );
     }
 }
+
+// === Temporary tables =====================================================
+
+/// A `Catalog` that resolves table names against the real engine in any schema and reports a fixed
+/// temporary schema, so `CREATE TEMP TABLE` and unqualified temp reads route exactly as a real
+/// session's would — without depending on when the thread-local session context is pinned. Each
+/// distinct `temp` name models a distinct session (cross-session isolation is by distinct temp
+/// schema).
+struct TempCatalog<'a> {
+    engine: &'a dyn StorageEngine,
+    temp: String,
+}
+
+impl Catalog for TempCatalog<'_> {
+    fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
+        self.engine.lookup_table(name).map_err(Into::into)
+    }
+
+    fn lookup_table_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<TableSchema>, nusadb_sql::Error> {
+        self.engine
+            .lookup_table_in(schema, name)
+            .map_err(Into::into)
+    }
+
+    fn temp_schema(&self) -> Option<String> {
+        Some(self.temp.clone())
+    }
+}
+
+/// Run one statement end-to-end resolving unqualified names through temp schema `temp` first.
+fn run_temp(engine: &BtreeEngine, temp: &str, sql: &str) -> ExecutionResult {
+    let stmt = parse(sql).expect("parse");
+    let catalog = TempCatalog {
+        engine,
+        temp: temp.to_owned(),
+    };
+    let logical = analyze(stmt, &catalog).expect("analyze");
+    execute(plan(logical), engine).expect("execute")
+}
+
+#[test]
+fn temp_table_create_insert_select() {
+    let engine = BtreeEngine::new();
+    let temp = "nusadb_temp_1";
+    assert!(matches!(
+        run_temp(&engine, temp, "CREATE TEMP TABLE t (id INT, v TEXT)"),
+        ExecutionResult::Created(_)
+    ));
+    run_temp(&engine, temp, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    // The unqualified read resolves to the temp table.
+    assert_eq!(
+        rows(run_temp(&engine, temp, "SELECT id, v FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(1), Value::Text("a".to_owned())],
+            vec![Value::Int(2), Value::Text("b".to_owned())],
+        ]
+    );
+    // The table lives in the temp schema, not `public`.
+    assert!(engine.lookup_table("t").expect("lookup").is_none());
+    assert!(engine.lookup_table_in(temp, "t").expect("lookup").is_some());
+}
+
+#[test]
+fn temp_table_full_temporary_keyword() {
+    let engine = BtreeEngine::new();
+    let temp = "nusadb_temp_2";
+    assert!(matches!(
+        run_temp(&engine, temp, "CREATE TEMPORARY TABLE t (id INT)"),
+        ExecutionResult::Created(_)
+    ));
+    run_temp(&engine, temp, "INSERT INTO t VALUES (7)");
+    assert_eq!(
+        rows(run_temp(&engine, temp, "SELECT id FROM t")),
+        vec![vec![Value::Int(7)]]
+    );
+}
+
+#[test]
+fn recursive_cte_resolves_a_temp_table_in_its_recursive_term() {
+    // Regression: the recursive term of a `WITH RECURSIVE` is analyzed through a `CteCatalog`
+    // wrapper. That wrapper must forward `temp_schema()` from the real catalog — otherwise it falls
+    // to the trait default (the executor thread-local, unset here) and an unqualified temp table in
+    // the recursive term fails to resolve (and, over the wire, could bind a DIFFERENT connection's
+    // temp table off a reused pool thread). Here the recursive term references the temp `edges`.
+    let engine = BtreeEngine::new();
+    let temp = "nusadb_temp_rec";
+    run_temp(&engine, temp, "CREATE TEMP TABLE edges (src INT, dst INT)");
+    run_temp(
+        &engine,
+        temp,
+        "INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4)",
+    );
+    assert_eq!(
+        rows(run_temp(
+            &engine,
+            temp,
+            "WITH RECURSIVE reach(n) AS (\
+               SELECT 1 \
+               UNION ALL \
+               SELECT e.dst FROM reach r JOIN edges e ON e.src = r.n\
+             ) SELECT n FROM reach ORDER BY n",
+        )),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+}
+
+#[test]
+fn recursive_cte_name_shadows_a_same_named_temp_table() {
+    // A recursive CTE named the same as a session temp table: the CTE self-reference must win over
+    // the temp table (matching standard CTE precedence), even though the temp-first probe would
+    // otherwise resolve the name to the temp table. `CteCatalog` intercepts its own name for the
+    // temp-schema probe as well as the public one.
+    let engine = BtreeEngine::new();
+    let temp = "nusadb_temp_rec2";
+    run_temp(&engine, temp, "CREATE TEMP TABLE reach (n INT)");
+    run_temp(&engine, temp, "INSERT INTO reach VALUES (999)");
+    // The CTE `reach` must count 1..=3, never see the temp table's 999.
+    assert_eq!(
+        rows(run_temp(
+            &engine,
+            temp,
+            "WITH RECURSIVE reach(n) AS (\
+               SELECT 1 \
+               UNION ALL \
+               SELECT n + 1 FROM reach WHERE n < 3\
+             ) SELECT n FROM reach ORDER BY n",
+        )),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)]
+        ]
+    );
+}
+
+#[test]
+fn temp_table_shadows_durable_public_table() {
+    let engine = BtreeEngine::new();
+    let temp = "nusadb_temp_3";
+    // A durable public.t with one value.
+    run(&engine, "CREATE TABLE t (id INT)");
+    run(&engine, "INSERT INTO t VALUES (100)");
+    // A same-named temp t with a different value.
+    run_temp(&engine, temp, "CREATE TEMP TABLE t (id INT)");
+    run_temp(&engine, temp, "INSERT INTO t VALUES (1)");
+    // Unqualified resolves to the temp table (shadowing the search path)…
+    assert_eq!(
+        rows(run_temp(&engine, temp, "SELECT id FROM t")),
+        vec![vec![Value::Int(1)]]
+    );
+    // …while the explicit `public.t` qualifier still reaches the durable table.
+    assert_eq!(
+        rows(run_temp(&engine, temp, "SELECT id FROM public.t")),
+        vec![vec![Value::Int(100)]]
+    );
+}
+
+#[test]
+fn temp_tables_are_isolated_across_sessions() {
+    // Two "sessions" = two distinct temp schema names on one engine. Same-named temp tables do not
+    // leak across them.
+    let engine = BtreeEngine::new();
+    let (a, b) = ("nusadb_temp_10", "nusadb_temp_11");
+    run_temp(&engine, a, "CREATE TEMP TABLE t (id INT)");
+    run_temp(&engine, a, "INSERT INTO t VALUES (1)");
+    run_temp(&engine, b, "CREATE TEMP TABLE t (id INT)");
+    run_temp(&engine, b, "INSERT INTO t VALUES (2)");
+    assert_eq!(
+        rows(run_temp(&engine, a, "SELECT id FROM t")),
+        vec![vec![Value::Int(1)]]
+    );
+    assert_eq!(
+        rows(run_temp(&engine, b, "SELECT id FROM t")),
+        vec![vec![Value::Int(2)]]
+    );
+}
+
+#[test]
+fn temp_table_on_commit_is_rejected() {
+    // Only the default PRESERVE ROWS is implemented; an explicit non-default ON COMMIT must not be
+    // silently accepted as a persistent (or preserve-rows) temp table.
+    assert!(parse("CREATE TEMP TABLE t (id INT) ON COMMIT DROP").is_err());
+    assert!(parse("CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS").is_err());
+}
+
+#[test]
+fn temp_table_disconnect_drop_reclaims_schema() {
+    // The Session drops its temp schema on `drop_temp_schema` (the wire calls this at disconnect).
+    let engine = BtreeEngine::new();
+    let mut session = Session::new(&engine);
+    let temp = session.temp_schema_name();
+    // A temp CREATE through the session records that its temp schema exists (so cleanup fires) and
+    // creates the schema in the engine. Analysis runs outside the session, so it uses a temp-aware
+    // catalog pinned to this session's temp schema name.
+    session
+        .execute(build_plan_temp(
+            &engine,
+            &temp,
+            "CREATE TEMP TABLE t (id INT)",
+        ))
+        .expect("temp create via session");
+    assert!(engine.lookup_schema(&temp).expect("lookup").is_some());
+    session.drop_temp_schema();
+    // The whole temp schema (and its tables) is gone.
+    assert!(engine.lookup_schema(&temp).expect("lookup").is_none());
+}
+
+/// Plan SQL resolving unqualified names through temp schema `temp` first, for the Session-based
+/// disconnect test (analysis happens outside the session, so it needs a temp-aware catalog).
+fn build_plan_temp(engine: &BtreeEngine, temp: &str, sql: &str) -> nusadb_sql::PhysicalPlan {
+    let stmt = parse(sql).expect("parse");
+    let catalog = TempCatalog {
+        engine,
+        temp: temp.to_owned(),
+    };
+    plan(analyze(stmt, &catalog).expect("analyze"))
+}

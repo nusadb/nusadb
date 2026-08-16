@@ -4769,9 +4769,42 @@ fn drop_temporary_is_rejected() {
 }
 
 #[test]
-fn create_temporary_table_is_rejected() {
+fn create_temporary_table_is_parsed() {
+    // TEMP and the full TEMPORARY keyword both set the `temporary` flag; the table lands in the
+    // session's temp schema at analysis time (see the analyzer/e2e tests).
+    for sql in [
+        "CREATE TEMP TABLE t (id INT)",
+        "CREATE TEMPORARY TABLE t (id INT)",
+    ] {
+        match parse(sql) {
+            Ok(ast::Statement::CreateTable(ct)) => assert!(ct.temporary, "{sql}"),
+            other => panic!("expected a temporary CreateTable for `{sql}`, got {other:?}"),
+        }
+    }
+    // A plain CREATE TABLE is not temporary.
+    match parse("CREATE TABLE t (id INT)") {
+        Ok(ast::Statement::CreateTable(ct)) => assert!(!ct.temporary),
+        other => panic!("expected a non-temporary CreateTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_temporary_table_on_commit_is_rejected() {
+    // Only the default PRESERVE ROWS is implemented; an explicit DELETE ROWS / DROP must not be
+    // silently downgraded to a preserve-rows temp table.
+    for sql in [
+        "CREATE TEMP TABLE t (id INT) ON COMMIT DELETE ROWS",
+        "CREATE TEMP TABLE t (id INT) ON COMMIT DROP",
+    ] {
+        assert!(matches!(parse(sql), Err(Error::Unsupported(_))), "{sql}");
+    }
+}
+
+#[test]
+fn create_temporary_table_as_select_is_rejected() {
+    // The CTAS AST path carries no `temporary` flag, so accept it would silently persist the table.
     assert!(matches!(
-        parse("CREATE TEMPORARY TABLE t (id INT)"),
+        parse("CREATE TEMP TABLE t AS SELECT 1 AS a"),
         Err(Error::Unsupported(_)),
     ));
 }

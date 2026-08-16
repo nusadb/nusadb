@@ -37,11 +37,17 @@ pub(super) fn convert_analyze(
 // === CREATE TABLE =========================================================
 
 pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statement, Error> {
-    if ct.temporary {
-        // NusaDB has no temporary tables; silently creating a *persistent* table for
-        // `CREATE TEMPORARY TABLE` would be a silent-wrong surface (class).
+    // `CREATE TEMP/TEMPORARY TABLE` is created in the session's non-durable temp schema (see
+    // `analyze_create_table`); `GLOBAL`/`LOCAL` are treated alike, so `ct.global` is ignored. Only the
+    // default `ON COMMIT PRESERVE ROWS` (the tables we implement) is accepted — an explicit
+    // `ON COMMIT DELETE ROWS`/`DROP` is rejected loudly rather than silently ignored (silent-wrong
+    // class). The guard fires regardless of `temporary` (a non-temp table cannot carry `ON COMMIT`).
+    if matches!(
+        ct.on_commit,
+        Some(sql::OnCommit::DeleteRows | sql::OnCommit::Drop)
+    ) {
         return unsupported(
-            "CREATE TEMPORARY TABLE is not supported (NusaDB has no temporary tables)",
+            "CREATE TEMPORARY TABLE ... ON COMMIT (only PRESERVE ROWS is supported)",
         );
     }
     // `PARTITION BY` / `CLUSTERED BY` change where rows physically live. NusaDB has no table
@@ -60,6 +66,12 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
     // explicit column list (which `sqlparser` only accepts in typed form here) and inline constraints
     // are out of scope for v1 — use column aliases in the `SELECT` to name the output columns.
     if let Some(query) = ct.query {
+        if ct.temporary {
+            // A CREATE TABLE AS SELECT does not carry the `temporary` flag through the CTAS AST path,
+            // so a `CREATE TEMP TABLE ... AS SELECT` would silently land as a *persistent* table.
+            // Reject loudly rather than mis-create it (silent-wrong class).
+            return unsupported("CREATE TEMPORARY TABLE ... AS SELECT");
+        }
         if !ct.columns.is_empty() {
             return unsupported(
                 "CREATE TABLE ... AS SELECT with a column list (alias the SELECT columns instead)",
@@ -108,6 +120,7 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         columns,
         constraints,
         if_not_exists: ct.if_not_exists,
+        temporary: ct.temporary,
         like_source,
     }))
 }

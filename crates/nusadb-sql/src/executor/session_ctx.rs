@@ -46,6 +46,10 @@ struct Context {
     database: String,
     /// The current schema name, read by `CURRENT_SCHEMA()`.
     schema: String,
+    /// The session's temporary schema (`nusadb_temp_<id>`), if this is a real session; `None` for a
+    /// bare execution path with no session identity. An unqualified name resolves here first, but it
+    /// does *not* change [`schema`](Self::schema) (a non-temp `CREATE` still targets the search path).
+    temp_schema: Option<String>,
 }
 
 /// Pin the session context for the statement about to run, replacing any prior snapshot. Called
@@ -55,6 +59,7 @@ pub(super) fn set_session_context(
     settings: &HashMap<String, String>,
     database: &str,
     schema: &str,
+    temp_schema: Option<&str>,
 ) {
     SESSION_CONTEXT.with(|cell| {
         *cell.borrow_mut() = Some(Context {
@@ -62,6 +67,7 @@ pub(super) fn set_session_context(
             settings: settings.clone(),
             database: database.to_owned(),
             schema: schema.to_owned(),
+            temp_schema: temp_schema.map(ToOwned::to_owned),
         });
     });
 }
@@ -69,7 +75,13 @@ pub(super) fn set_session_context(
 /// Pin just the session user (no session variables, defaults for database/schema), for an execution
 /// path that has no `SET` store — a bare statement run as a user.
 pub(super) fn set_session_user(user: &str) {
-    set_session_context(user, &HashMap::new(), DEFAULT_DATABASE, DEFAULT_SCHEMA);
+    set_session_context(
+        user,
+        &HashMap::new(),
+        DEFAULT_DATABASE,
+        DEFAULT_SCHEMA,
+        None,
+    );
 }
 
 /// Pin the session user **together with** an explicit `SET` store (defaults for database/schema), for
@@ -86,7 +98,12 @@ pub(super) fn set_session_user_with_settings(user: &str, settings: &HashMap<Stri
     let database = settings
         .get(crate::CONNECTION_DATABASE_SETTING)
         .map_or(DEFAULT_DATABASE, String::as_str);
-    set_session_context(user, settings, database, &schema);
+    // The connection's temporary schema, stamped by the wire under a reserved key, so an unqualified
+    // name in a statement resolving through the pinned context sees this session's temp tables.
+    let temp_schema = settings
+        .get(crate::CONNECTION_TEMP_SCHEMA_SETTING)
+        .map(String::as_str);
+    set_session_context(user, settings, database, &schema, temp_schema);
 }
 
 /// The pinned session user, or [`DEFAULT_USER`] if nothing has been pinned on this thread.
@@ -113,6 +130,17 @@ pub(super) fn current_schema() -> String {
         cell.borrow()
             .as_ref()
             .map_or_else(|| DEFAULT_SCHEMA.to_owned(), |ctx| ctx.schema.clone())
+    })
+}
+
+/// The pinned session's temporary schema (`nusadb_temp_<id>`), or `None` if this execution path has
+/// no session identity (a bare `execute` call or a direct evaluator unit test). Read by the default
+/// [`Catalog::temp_schema`](crate::Catalog::temp_schema) so an unqualified name resolves temp-first.
+pub(super) fn current_temp_schema() -> Option<String> {
+    SESSION_CONTEXT.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|ctx| ctx.temp_schema.clone())
     })
 }
 

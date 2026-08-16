@@ -3827,3 +3827,87 @@ async fn describe_portal_authorizes_as_the_assumed_role() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// Read a single-column result to completion: `RowDescription`, zero or more `DataRow`s,
+/// `CommandComplete`, `ReadyForQuery`. Returns each row's first column (`None` for SQL NULL).
+async fn select_first_col<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    loop {
+        match next(conn).await {
+            BackendMessage::RowDescription { .. } | BackendMessage::CommandComplete { .. } => {},
+            BackendMessage::DataRow { values } => out.push(values.into_iter().next().flatten()),
+            BackendMessage::ReadyForQuery(_) => return out,
+            other => panic!("unexpected message in result: {other:?}"),
+        }
+    }
+}
+
+/// Temporary tables over the wire: a temp table shadows a same-named durable `public` table for
+/// unqualified reads on its own connection, is invisible to another connection, and is dropped when
+/// its connection ends (step-10 end-to-end).
+#[tokio::test]
+async fn temp_table_shadows_isolated_and_dropped_on_disconnect() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    // Connection A: create a durable public.t, then a temp t shadowing it.
+    let (client_a, server_a) = tokio::io::duplex(64 * 1024);
+    let handle_a = tokio::spawn(handle_client(server_a, Arc::clone(&engine)));
+    let mut a = Connection::new(client_a);
+    start_session(&mut a).await;
+    query(&mut a, "CREATE TABLE t (v INT)").await;
+    select_first_col(&mut a).await;
+    query(&mut a, "INSERT INTO t VALUES (100)").await;
+    select_first_col(&mut a).await;
+    query(&mut a, "CREATE TEMP TABLE t (v INT)").await;
+    select_first_col(&mut a).await;
+    query(&mut a, "INSERT INTO t VALUES (1)").await;
+    select_first_col(&mut a).await;
+
+    // Unqualified reads resolve to the temp table; the explicit `public.t` still reaches the durable
+    // one. Run each twice so the plan-cache-bypass-while-temp-exists path is exercised on a reuse.
+    for _ in 0..2 {
+        query(&mut a, "SELECT v FROM t").await;
+        assert_eq!(select_first_col(&mut a).await, vec![Some(b"1".to_vec())]);
+        query(&mut a, "SELECT v FROM public.t").await;
+        assert_eq!(select_first_col(&mut a).await, vec![Some(b"100".to_vec())]);
+    }
+
+    // A temp schema now exists for this connection.
+    assert!(
+        engine
+            .list_schemas()
+            .unwrap()
+            .iter()
+            .any(|(_, name)| name.starts_with("nusadb_temp_")),
+        "connection A's temp schema should exist while it is connected"
+    );
+
+    // Connection B does not see A's temp table — an unqualified `t` resolves to the durable public
+    // one (cross-session isolation).
+    let (client_b, server_b) = tokio::io::duplex(64 * 1024);
+    let handle_b = tokio::spawn(handle_client(server_b, Arc::clone(&engine)));
+    let mut b = Connection::new(client_b);
+    start_session(&mut b).await;
+    query(&mut b, "SELECT v FROM t").await;
+    assert_eq!(select_first_col(&mut b).await, vec![Some(b"100".to_vec())]);
+
+    // Connection A disconnects: its temp schema (and temp table) is dropped by the disconnect handler.
+    drop(a);
+    handle_a.await.unwrap().unwrap();
+    assert!(
+        engine
+            .list_schemas()
+            .unwrap()
+            .iter()
+            .all(|(_, name)| !name.starts_with("nusadb_temp_")),
+        "connection A's temp schema must be dropped on disconnect"
+    );
+    // The durable public.t is untouched by A's temp-schema teardown.
+    query(&mut b, "SELECT v FROM t").await;
+    assert_eq!(select_first_col(&mut b).await, vec![Some(b"100".to_vec())]);
+
+    drop(b);
+    handle_b.await.unwrap().unwrap();
+}

@@ -78,6 +78,17 @@ pub const BOOTSTRAP_SUPERUSER: &str = "nusadb-root";
 /// also keeps the key out of normal identifier space.
 pub const CONNECTION_DATABASE_SETTING: &str = "\u{0}conn_database";
 
+/// The reserved settings-snapshot key the wire stamps with the connection's temporary schema name
+/// (`nusadb_temp_<backend-pid>`).
+///
+/// A temporary table lives in a per-connection non-durable schema; an unqualified name resolves
+/// there before the `search_path`. The wire stamps this key into the connection's GUC store so both
+/// analysis (via [`Catalog::temp_schema`], read from the catalog's
+/// settings) and execution (via the pinned session context) agree on which temp schema this
+/// connection owns. The leading NUL keeps the key out of normal identifier space, so a client `SET`
+/// can never forge or read it.
+pub const CONNECTION_TEMP_SCHEMA_SETTING: &str = "\u{0}conn_temp_schema";
+
 /// The ordered list of schemas an unqualified name resolves through, derived from a `search_path`
 /// GUC value — the heart of search-path name resolution.
 ///

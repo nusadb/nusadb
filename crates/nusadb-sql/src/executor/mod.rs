@@ -12,6 +12,7 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nusadb_core::{
     AlterOp, ColumnDef, ColumnType, IsolationLevel, StorageEngine, TableDef, TableSchema,
@@ -37,6 +38,13 @@ pub mod eval;
 mod rng;
 pub mod row;
 mod session_ctx;
+
+/// The pinned session's temporary schema (`nusadb_temp_<id>`), or `None` if no session identity is
+/// pinned. Exposed for the analyzer's default [`Catalog::temp_schema`](crate::Catalog::temp_schema)
+/// so an unqualified name resolves temp-first; the `session_ctx` module stays private to the executor.
+pub(crate) fn current_temp_schema() -> Option<String> {
+    session_ctx::current_temp_schema()
+}
 pub use session_ctx::check_settable_parameter;
 mod stats;
 
@@ -776,7 +784,17 @@ pub struct Session<'engine> {
     /// unchanged (any committed write invalidates every entry), and only for non-volatile plans —
     /// keeping it from ever serving stale, snapshot-wrong, cross-user, or non-deterministic results.
     result_cache: HashMap<ResultCacheKey, CachedQueryResult>,
+    /// This session's process-unique id, assigned at [`Session::new`]. It names the session's
+    /// temporary schema (`nusadb_temp_<id>`), so two sessions on one engine never share temp tables.
+    id: u64,
+    /// Whether this session has created its temporary schema (a `CREATE TEMP TABLE` succeeded), so
+    /// [`drop_temp_schema`](Self::drop_temp_schema) knows there is one to drop on disconnect.
+    temp_schema_created: bool,
 }
+
+/// Process-global source of per-session ids. Monotonic, so each [`Session`] names a distinct
+/// temporary schema; wrap-around after `u64::MAX` sessions is not a practical concern.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A statement stored by `PREPARE`: the un-analyzed body plus its placeholder count.
 struct PreparedStatement {
@@ -867,7 +885,49 @@ impl<'engine> Session<'engine> {
             current_schema: "public".to_owned(),
             prepared: HashMap::new(),
             result_cache: HashMap::new(),
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            temp_schema_created: false,
         }
+    }
+
+    /// This session's process-unique id.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.id
+    }
+
+    /// The name of this session's temporary schema (`nusadb_temp_<id>`). A `CREATE TEMP TABLE`
+    /// creates the table here; an unqualified name resolves here before the search path.
+    #[must_use]
+    pub fn temp_schema_name(&self) -> String {
+        format!("nusadb_temp_{}", self.id)
+    }
+
+    /// Drop this session's temporary schema (and every table in it) on disconnect. Best-effort: any
+    /// error is rolled back and swallowed — a cleanup at connection end must never panic or surface.
+    /// A no-op when the session never created a temp table.
+    pub fn drop_temp_schema(&mut self) {
+        if !self.temp_schema_created {
+            return;
+        }
+        let name = self.temp_schema_name();
+        let result = (|| -> Result<(), Error> {
+            let Some(id) = self.engine.lookup_schema(&name)? else {
+                return Ok(());
+            };
+            let txn = self.engine.begin(IsolationLevel::default())?;
+            match self.engine.drop_schema(txn, id, true) {
+                Ok(()) => self.engine.commit(txn).map_err(Into::into),
+                Err(e) => {
+                    let _ = self.engine.rollback(txn);
+                    Err(e.into())
+                },
+            }
+        })();
+        if let Err(e) = result {
+            tracing::warn!(schema = %name, error = %e, "failed to drop temporary schema on disconnect");
+        }
+        self.temp_schema_created = false;
     }
 
     /// Whether the session is inside an explicit `BEGIN ... COMMIT/ROLLBACK`.
@@ -981,7 +1041,18 @@ impl<'engine> Session<'engine> {
                 }
                 Ok(ExecutionResult::Deallocated)
             },
-            other => self.run_within_txn(other),
+            // A temporary `CREATE TABLE` creates the session's temp schema (in the executor); record
+            // that so `drop_temp_schema` cleans it up on disconnect. The flag is set only on success,
+            // and `drop_temp_schema` re-checks the schema exists — an explicit-transaction create that
+            // later rolls back leaves no schema, so the eventual drop is a harmless no-op.
+            other => {
+                let created_temp = matches!(&other, PhysicalPlan::CreateTable(p) if p.temporary);
+                let result = self.run_within_txn(other);
+                if created_temp && result.is_ok() {
+                    self.temp_schema_created = true;
+                }
+                result
+            },
         }
     }
 
@@ -1001,6 +1072,7 @@ impl<'engine> Session<'engine> {
             &self.variables,
             &self.current_database,
             &self.current_schema,
+            Some(&self.temp_schema_name()),
         );
         let Some(version) = self.engine.data_version() else {
             // The engine does not track a version, so caching cannot be invalidated safely.
@@ -1067,6 +1139,7 @@ impl<'engine> Session<'engine> {
             &self.variables,
             &self.current_database,
             &self.current_schema,
+            Some(&self.temp_schema_name()),
         );
         if let Some(txn) = self.current_txn {
             // Refresh the READ COMMITTED statement snapshot.
@@ -1186,6 +1259,7 @@ impl<'engine> Session<'engine> {
             &self.variables,
             &self.current_database,
             &self.current_schema,
+            Some(&self.temp_schema_name()),
         );
         clock::set_statement_now();
         if let Some(txn) = self.current_txn {
@@ -1423,6 +1497,7 @@ impl<'engine> Session<'engine> {
             &self.variables,
             &self.current_database,
             &self.current_schema,
+            Some(&self.temp_schema_name()),
         );
         // Enforce READ ONLY: reject data-modifying statements. Inside an explicit
         // transaction the flag is the one captured at BEGIN; in auto-commit it is the session
