@@ -1607,6 +1607,15 @@ fn regexp_substr_matches_pg_signature() {
         one(r"SELECT regexp_substr('héllo wörld', '\w+', 3)"),
         t("llo")
     );
+    // A pattern with NO capture groups treats subexpr 1 as the whole match; subexpr 2 has none.
+    assert_eq!(
+        one("SELECT regexp_substr('abc', 'abc', 1, 1, 'i', 1)"),
+        t("abc")
+    );
+    assert_eq!(
+        one("SELECT regexp_substr('abc', 'abc', 1, 1, 'i', 2)"),
+        Value::Null
+    );
 
     // start < 1, N < 1, and the global flag are hard errors (matching the reference engine).
     assert!(run_try(&engine, "SELECT regexp_substr('abc','a',0)").is_err());
@@ -1644,6 +1653,78 @@ fn regexp_count_matches_pg_signature() {
     // start < 1 is a hard error; a flags string in the start slot is a type error, not silent flags.
     assert!(run_try(&engine, "SELECT regexp_count('abc','a',0)").is_err());
     assert!(run_try(&engine, "SELECT regexp_count('FOO','o','i')").is_err());
+}
+
+#[test]
+fn regexp_instr_matches_pg_signature() {
+    // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) — the 3rd/4th
+    // args are integer start/occurrence, not flags. Returns a 1-based character position (0 = none).
+    // Expected values are from the live reference engine (v16).
+    let engine = BtreeEngine::new();
+    let n = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
+
+    assert_eq!(n("SELECT regexp_instr('foobarbaz', 'b')"), Value::Int(4));
+    // start position.
+    assert_eq!(n("SELECT regexp_instr('foobarbaz', 'a', 4)"), Value::Int(5));
+    // Nth occurrence.
+    assert_eq!(
+        n("SELECT regexp_instr('foo1bar2baz3', '[0-9]', 1, 2)"),
+        Value::Int(8)
+    );
+    // endoption 0 = match start, 1 = position just after the match.
+    assert_eq!(
+        n("SELECT regexp_instr('foobar', 'o', 1, 1, 0)"),
+        Value::Int(2)
+    );
+    assert_eq!(
+        n("SELECT regexp_instr('foobar', 'o', 1, 1, 1)"),
+        Value::Int(3)
+    );
+    assert_eq!(
+        n("SELECT regexp_instr('xxABCyy', 'ABC', 1, 1, 1)"),
+        Value::Int(6)
+    );
+    // flags (6th).
+    assert_eq!(
+        n("SELECT regexp_instr('FOObar', 'o', 1, 1, 0, 'i')"),
+        Value::Int(2)
+    );
+    // subexpr (7th): position of a capture group; endoption applies to that group.
+    assert_eq!(
+        n(r"SELECT regexp_instr('2001-05-31', '(\d+)-(\d+)-(\d+)', 1, 1, 0, 'i', 2)"),
+        Value::Int(6)
+    );
+    assert_eq!(
+        n(r"SELECT regexp_instr('2001-05-31', '(\d+)-(\d+)-(\d+)', 1, 1, 1, 'i', 2)"),
+        Value::Int(8)
+    );
+    // A pattern with no capture groups treats subexpr 1 as the whole match; subexpr beyond → 0.
+    assert_eq!(
+        n("SELECT regexp_instr('abc', 'abc', 1, 1, 0, 'i', 1)"),
+        Value::Int(1)
+    );
+    assert_eq!(
+        n("SELECT regexp_instr('ab', '(a)(b)', 1, 1, 0, 'i', 5)"),
+        Value::Int(0)
+    );
+    // Zero results: no match, start past end, occurrence past end.
+    assert_eq!(n("SELECT regexp_instr('abc', 'z')"), Value::Int(0));
+    assert_eq!(n("SELECT regexp_instr('abc', 'a', 10)"), Value::Int(0));
+    assert_eq!(
+        n("SELECT regexp_instr('a1b2', '[0-9]', 1, 5)"),
+        Value::Int(0)
+    );
+    // position counts characters, not bytes.
+    assert_eq!(
+        n("SELECT regexp_instr('héllo wörld', 'w', 1)"),
+        Value::Int(7)
+    );
+
+    // Hard errors: start<1, N<1, endoption not in {0,1}, subexpr<0.
+    assert!(run_try(&engine, "SELECT regexp_instr('abc','a',0)").is_err());
+    assert!(run_try(&engine, "SELECT regexp_instr('a1','[0-9]',1,0)").is_err());
+    assert!(run_try(&engine, "SELECT regexp_instr('abc','a',1,1,2)").is_err());
+    assert!(run_try(&engine, "SELECT regexp_instr('abc','a',1,1,0,'',-1)").is_err());
 }
 
 #[test]

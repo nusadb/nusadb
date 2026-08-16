@@ -1368,7 +1368,9 @@ pub(super) fn analyze_scalar_function(
         // regexp_count(string, pattern [, start int [, flags text]]) — arg 3 is the 1-based start
         // position (integer), not flags.
         F::RegexpCount => ScalarSig::Fixed(&[Text, Text], &[Int, Text], Int),
-        F::RegexpInstr => ScalarSig::Fixed(&[Text, Text], &[Text], Int),
+        // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) — the
+        // 3rd/4th args are integer position/occurrence, not flags (flags are 6th).
+        F::RegexpInstr => ScalarSig::Fixed(&[Text, Text], &[Int, Int, Int, Text, Int], Int),
         // regexp_substr(string, pattern [, start int [, N int [, flags text [, subexpr int]]]]).
         // The 3rd argument is the 1-based start position (an integer), NOT flags — flags come 5th.
         F::RegexpSubstr => ScalarSig::Fixed(&[Text, Text], &[Int, Int, Text, Int], Text),

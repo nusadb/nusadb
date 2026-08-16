@@ -518,8 +518,39 @@ fn eval_scalar_function(
         (F::RegexpCount, [Text(s), Text(pat), Int(start), Text(flags)]) => {
             Int(regexp_count(s, pat, *start, flags)?)
         },
-        (F::RegexpInstr, [Text(s), Text(pat)]) => Int(regexp_instr(s, pat, "")?),
-        (F::RegexpInstr, [Text(s), Text(pat), Text(flags)]) => Int(regexp_instr(s, pat, flags)?),
+        (F::RegexpInstr, [Text(s), Text(pat)]) => Int(regexp_instr(s, pat, 1, 1, 0, "", 0)?),
+        (F::RegexpInstr, [Text(s), Text(pat), Int(start)]) => {
+            Int(regexp_instr(s, pat, *start, 1, 0, "", 0)?)
+        },
+        (F::RegexpInstr, [Text(s), Text(pat), Int(start), Int(n)]) => {
+            Int(regexp_instr(s, pat, *start, *n, 0, "", 0)?)
+        },
+        (F::RegexpInstr, [Text(s), Text(pat), Int(start), Int(n), Int(endopt)]) => {
+            Int(regexp_instr(s, pat, *start, *n, *endopt, "", 0)?)
+        },
+        (
+            F::RegexpInstr,
+            [
+                Text(s),
+                Text(pat),
+                Int(start),
+                Int(n),
+                Int(endopt),
+                Text(flags),
+            ],
+        ) => Int(regexp_instr(s, pat, *start, *n, *endopt, flags, 0)?),
+        (
+            F::RegexpInstr,
+            [
+                Text(s),
+                Text(pat),
+                Int(start),
+                Int(n),
+                Int(endopt),
+                Text(flags),
+                Int(subexpr),
+            ],
+        ) => Int(regexp_instr(s, pat, *start, *n, *endopt, flags, *subexpr)?),
         (F::RegexpSubstr, [Text(s), Text(pat)]) => regexp_substr(s, pat, 1, 1, "", 0)?,
         (F::RegexpSubstr, [Text(s), Text(pat), Int(start)]) => {
             regexp_substr(s, pat, *start, 1, "", 0)?
@@ -1689,16 +1720,67 @@ fn regexp_count(source: &str, pattern: &str, start: i64, flags: &str) -> Result<
     Ok(i64::try_from(re.find_iter(hay).count()).unwrap_or(i64::MAX))
 }
 
-/// `REGEXP_INSTR(s, pattern [, flags])` — the 1-based character position of the first match of
-/// `pattern` in `s`, or `0` if there is no match. Counts Unicode scalar values, not bytes.
-fn regexp_instr(source: &str, pattern: &str, flags: &str) -> Result<i64, Error> {
+/// `regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]])` — the 1-based
+/// character position of the `N`-th match of `pattern` (from character position `start`), or `0` if
+/// there is none. `endoption` `0` (default) returns the position of the match's first character; `1`
+/// returns the position just after its last character. `subexpr` locates a capture group instead of
+/// the whole match (see [`subexpr_group`]); a group that does not participate yields `0`. `start`,
+/// `N` below 1, `endoption` outside {0,1}, and `subexpr` below 0 are hard errors. Counts characters,
+/// not bytes.
+fn regexp_instr(
+    source: &str,
+    pattern: &str,
+    start: i64,
+    n: i64,
+    endoption: i64,
+    flags: &str,
+    subexpr: i64,
+) -> Result<i64, Error> {
+    if start < 1 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"start\": {start}"
+        )));
+    }
+    if n < 1 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"n\": {n}"
+        )));
+    }
+    if endoption != 0 && endoption != 1 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"endoption\": {endoption}"
+        )));
+    }
+    if subexpr < 0 {
+        return Err(Error::Unsupported(format!(
+            "invalid value for parameter \"subexpr\": {subexpr}"
+        )));
+    }
     let (re, _global) = compile_regex(pattern, flags)?;
-    let Some(m) = re.find(source) else {
+    let start_char = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    let byte_off = if start_char == 0 {
+        0
+    } else {
+        match source.char_indices().nth(start_char) {
+            Some((b, _)) => b,
+            None => return Ok(0),
+        }
+    };
+    let hay = source.get(byte_off..).unwrap_or("");
+    let nth = usize::try_from(n - 1).unwrap_or(usize::MAX);
+    let Some(caps) = re.captures_iter(hay).nth(nth) else {
         return Ok(0);
     };
-    // Convert the byte offset of the match to a 1-based character index.
-    let char_index = source.get(..m.start()).map_or(0, |p| p.chars().count());
-    Ok(i64::try_from(char_index)
+    let Some(m) = caps.get(subexpr_group(subexpr, &re)) else {
+        return Ok(0);
+    };
+    // `endoption` 1 reports the character just past the match; the byte offset is a valid boundary.
+    let target = if endoption == 1 { m.end() } else { m.start() };
+    // The position is absolute in `source`: characters skipped by `start` plus characters before the
+    // target byte within `hay`, made 1-based.
+    let chars_before =
+        start_char.saturating_add(hay.get(..target).map_or(0, |p| p.chars().count()));
+    Ok(i64::try_from(chars_before)
         .unwrap_or(i64::MAX)
         .saturating_add(1))
 }
@@ -1766,10 +1848,22 @@ fn regexp_substr(
     let Some(caps) = re.captures_iter(hay).nth(nth) else {
         return Ok(ast::Value::Null);
     };
-    let group = usize::try_from(subexpr).unwrap_or(usize::MAX);
+    let group = subexpr_group(subexpr, &re);
     Ok(caps.get(group).map_or(ast::Value::Null, |m| {
         ast::Value::Text(m.as_str().to_owned())
     }))
+}
+
+/// Map a `subexpr` argument (of `regexp_substr`/`regexp_instr`) to the capture-group index to read.
+/// `0` is the whole match; a positive value selects that parenthesized group. As a special case, a
+/// pattern with NO capture groups treats `subexpr = 1` as the whole match too (the reference engine
+/// counts the entire pattern as subexpression 1 when there are no explicit groups). A value beyond
+/// the group count maps to a non-existent index, which the caller resolves to "no match".
+fn subexpr_group(subexpr: i64, re: &regex::Regex) -> usize {
+    if subexpr == 1 && re.captures_len() == 1 {
+        return 0;
+    }
+    usize::try_from(subexpr).unwrap_or(usize::MAX)
 }
 
 /// Split `source` on each match of `pattern` into owned pieces — the shared core of
