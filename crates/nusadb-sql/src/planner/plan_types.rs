@@ -222,8 +222,10 @@ pub enum LogicalPlan {
     DropView(DropViewPlan),
     /// `CREATE TYPE name AS ENUM (...)` — persist a user-defined enum type (B-ENUM).
     CreateEnum(ast::CreateEnum),
-    /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM).
+    /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM / composite).
     DropType(ast::DropType),
+    /// `CREATE TYPE name AS (field type, ...)` — persist a user-defined composite (row) type.
+    CreateComposite(ast::CreateComposite),
     /// `CREATE DOMAIN ...` — persist a user-defined domain (base type + NOT NULL + CHECKs).
     CreateDomain(ast::CreateDomain),
     /// `DROP DOMAIN [IF EXISTS] name` — drop a user-defined domain.
@@ -1879,6 +1881,86 @@ pub enum TypedExprKind {
         /// `true` for `NOT IN`.
         negated: bool,
     },
+    /// A user-defined composite (row) type operation — construction, a text cast, field access, or a
+    /// composite comparison. Boxed so [`TypedExprKind`] stays uniform in size; a composite *value* is
+    /// carried between operators as its canonical [`ast::Value::Text`] form, so no new
+    /// [`ast::Value`] variant is needed.
+    Composite(Box<CompositeExpr>),
+}
+
+/// A composite (row) type operation carried in a [`TypedExprKind::Composite`].
+///
+/// A composite value is represented as its canonical `(f1,f2,…)` text form
+/// ([`ast::Value::Text`]) throughout; each operation remembers the type's field types so the
+/// executor can parse/format that text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompositeExpr {
+    /// `ROW(a, b, ...)::T` — build a composite from field expressions. The enclosing
+    /// [`TypedExpr::ty`] is `Text` (the canonical form). Each field is evaluated and coerced to its
+    /// declared type before formatting.
+    Construct {
+        /// The field expressions, in declared order (already checked assignable to `field_types`).
+        fields: Vec<TypedExpr>,
+        /// The declared field types, in order.
+        field_types: Vec<ColumnType>,
+    },
+    /// `'(a,b)'::T` — a text-literal cast to a composite type: parse the text form against
+    /// `field_types`, then re-emit the canonical form. The enclosing [`TypedExpr::ty`] is `Text`.
+    Cast {
+        /// The text-valued operand.
+        expr: Box<TypedExpr>,
+        /// The declared field types, in order.
+        field_types: Vec<ColumnType>,
+    },
+    /// `(expr).field` — extract one field of a composite value. `base` evaluates to the canonical
+    /// text form; the executor parses it and returns field `index`. The enclosing [`TypedExpr::ty`]
+    /// is that field's declared type; a `NULL` field yields `NULL`.
+    Field {
+        /// The composite-typed operand (evaluates to the canonical text form).
+        base: Box<TypedExpr>,
+        /// The declared field types of the composite, in order.
+        field_types: Vec<ColumnType>,
+        /// The zero-based ordinal of the selected field.
+        index: usize,
+    },
+    /// `a <op> b` between two composite operands of the same type. Both evaluate to the canonical
+    /// text form; the executor parses both and orders them field-by-field via
+    /// [`crate::composite::CompositeVal::compare`] (two-valued, NULL-last), distinct from the
+    /// three-valued `ROW(…)` comparison. The enclosing [`TypedExpr::ty`] is `Bool`.
+    Compare {
+        /// Left operand (canonical text form).
+        left: Box<TypedExpr>,
+        /// Right operand (canonical text form).
+        right: Box<TypedExpr>,
+        /// The comparison operator (one of `=`, `<>`, `<`, `<=`, `>`, `>=`).
+        op: ast::BinaryOp,
+        /// The declared field types of the composite, in order.
+        field_types: Vec<ColumnType>,
+    },
+}
+
+impl CompositeExpr {
+    /// The child typed expressions this operation contains, in evaluation order, for read-only
+    /// walks (column collection, foldability checks, ...).
+    #[must_use]
+    pub fn children(&self) -> Vec<&TypedExpr> {
+        match self {
+            Self::Construct { fields, .. } => fields.iter().collect(),
+            Self::Cast { expr, .. } => vec![expr],
+            Self::Field { base, .. } => vec![base],
+            Self::Compare { left, right, .. } => vec![left, right],
+        }
+    }
+
+    /// The child typed expressions, for mutating walks (column remap, constant folding, ...).
+    pub fn children_mut(&mut self) -> Vec<&mut TypedExpr> {
+        match self {
+            Self::Construct { fields, .. } => fields.iter_mut().collect(),
+            Self::Cast { expr, .. } => vec![expr],
+            Self::Field { base, .. } => vec![base],
+            Self::Compare { left, right, .. } => vec![left, right],
+        }
+    }
 }
 
 /// Direction of a [`TypedExprKind::Crypto`] call.
@@ -2058,8 +2140,10 @@ pub enum PhysicalPlan {
     DropView(DropViewPlan),
     /// `CREATE TYPE name AS ENUM (...)` — persist a user-defined enum type (B-ENUM).
     CreateEnum(ast::CreateEnum),
-    /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM).
+    /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM / composite).
     DropType(ast::DropType),
+    /// `CREATE TYPE name AS (field type, ...)` — persist a user-defined composite (row) type.
+    CreateComposite(ast::CreateComposite),
     /// `CREATE DOMAIN ...` — persist a user-defined domain (base type + NOT NULL + CHECKs).
     CreateDomain(ast::CreateDomain),
     /// `DROP DOMAIN [IF EXISTS] name` — drop a user-defined domain.

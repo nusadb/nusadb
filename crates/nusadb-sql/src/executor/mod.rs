@@ -1661,6 +1661,7 @@ fn dispatch(
         PhysicalPlan::DropView(p) => run_drop_view(&p, engine, txn),
         PhysicalPlan::CreateEnum(p) => run_create_enum(&p, engine, txn),
         PhysicalPlan::DropType(p) => run_drop_type(&p, engine, txn),
+        PhysicalPlan::CreateComposite(p) => run_create_composite(&p, engine, txn),
         PhysicalPlan::CreateDomain(p) => run_create_domain(&p, engine, txn),
         PhysicalPlan::DropDomain(p) => run_drop_domain(&p, engine, txn),
         PhysicalPlan::CreateTrigger(p) => trigger::run_create_trigger(&p, engine, txn),
@@ -2091,6 +2092,7 @@ fn format_plan(
         PhysicalPlan::DropView(p) => vec![format!("{indent}DropView: {}", p.name)],
         PhysicalPlan::CreateEnum(p) => vec![format!("{indent}CreateEnum: {}", p.name)],
         PhysicalPlan::DropType(p) => vec![format!("{indent}DropType: {}", p.name)],
+        PhysicalPlan::CreateComposite(p) => vec![format!("{indent}CreateComposite: {}", p.name)],
         PhysicalPlan::CreateDomain(p) => vec![format!("{indent}CreateDomain: {}", p.name)],
         PhysicalPlan::DropDomain(p) => vec![format!("{indent}DropDomain: {}", p.name)],
         PhysicalPlan::CreateTrigger(p) => {
@@ -3364,6 +3366,19 @@ impl crate::Catalog for ExecCatalog<'_> {
         function::lookup_function_definition(self.engine, self.txn, name)
     }
 
+    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+        lookup_composite(self.engine, self.txn, name)
+    }
+
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        lookup_composite_column(self.engine, self.txn, schema, table, column)
+    }
+
     // Access control. These must delegate rather than take the trait's permissive defaults — see
     // the note on the `user` field.
 
@@ -3480,6 +3495,19 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn lookup_function(&self, name: &str) -> Result<Option<crate::FunctionDef>, Error> {
         function::lookup_function_definition(self.engine, self.txn, name)
+    }
+
+    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+        lookup_composite(self.engine, self.txn, name)
+    }
+
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        lookup_composite_column(self.engine, self.txn, schema, table, column)
     }
 
     fn is_superuser(&self) -> bool {
@@ -3882,13 +3910,26 @@ fn run_create_enum(
     Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
 }
 
-/// `DROP TYPE [IF EXISTS] name` — forget a user-defined enum (B-ENUM).
+/// `DROP TYPE [IF EXISTS] name` — forget a user-defined enum (B-ENUM) or composite type. Both share
+/// the one type namespace, so this drops whichever the name denotes. A composite type still
+/// referenced by a table column is refused with a dependency error (naming the table + column),
+/// mirroring the reference engine's `DROP TYPE` dependency check.
 fn run_drop_type(
     p: &ast::DropType,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    let removed = delete_view_def(engine, txn, ENUM_CATALOG, &p.name)?;
+    // A composite type still used by a column cannot be dropped — report the first dependent column.
+    if lookup_composite(engine, txn, &p.name)?.is_some()
+        && let Some((table, column)) = first_composite_dependent(engine, txn, &p.name)?
+    {
+        return Err(Error::Unsupported(format!(
+            "cannot drop type \"{}\" because column \"{column}\" of table \"{table}\" depends on it",
+            p.name
+        )));
+    }
+    let removed = delete_view_def(engine, txn, ENUM_CATALOG, &p.name)?
+        | delete_view_def(engine, txn, COMPOSITE_CATALOG, &p.name)?;
     if !removed && !p.if_exists {
         return Err(Error::Unsupported(format!(
             "type {:?} does not exist",
@@ -3906,6 +3947,166 @@ pub(crate) fn lookup_enum(
 ) -> Result<Option<Vec<String>>, Error> {
     Ok(load_view_def(engine, txn, ENUM_CATALOG, name)?
         .map(|def| def.split(ENUM_LABEL_SEP).map(str::to_owned).collect()))
+}
+
+/// Engine-scoped system catalog of user-defined composite types: `(name, def)` where `def` is the
+/// fields joined by [`ENUM_LABEL_SEP`] as alternating `field_name`, `field_type_sql`, in declared
+/// order. Same `(name, def)` shape as [`ENUM_CATALOG`].
+const COMPOSITE_CATALOG: &str = "nusadb_composites";
+
+/// Engine-scoped catalog mapping a composite-typed table column to its type name:
+/// key = `schema`/`table`/`column` joined by [`ENUM_LABEL_SEP`], value = the composite type name.
+/// This is what lets a read know a `TEXT`-stored column actually holds a composite value.
+const COMPOSITE_COLUMN_CATALOG: &str = "nusadb_composite_columns";
+
+/// The catalog key for a composite column, `schema`/`table`/`column` joined by [`ENUM_LABEL_SEP`].
+fn composite_column_key(schema: &str, table: &str, column: &str) -> String {
+    [schema, table, column].join(&ENUM_LABEL_SEP.to_string())
+}
+
+/// `CREATE TYPE name AS (field type, ...)` — persist the composite type's fields. Rejects a name
+/// already taken by a composite, an enum, a domain, or an existing table (one type namespace).
+fn run_create_composite(
+    p: &ast::CreateComposite,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    if lookup_composite(engine, txn, &p.name)?.is_some()
+        || lookup_enum(engine, txn, &p.name)?.is_some()
+        || lookup_domain(engine, txn, &p.name)?.is_some()
+        || engine.lookup_table_as_of(txn, &p.name)?.is_some()
+    {
+        return Err(Error::Unsupported(format!(
+            "type {:?} already exists",
+            p.name
+        )));
+    }
+    // Encode the fields as alternating name / type-SQL, separated by the unit separator.
+    let mut parts = Vec::with_capacity(p.fields.len() * 2);
+    for (name, type_sql) in &p.fields {
+        parts.push(name.clone());
+        parts.push(type_sql.clone());
+    }
+    let encoded = parts.join(&ENUM_LABEL_SEP.to_string());
+    store_view_def(engine, txn, COMPOSITE_CATALOG, &p.name, &encoded)?;
+    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+}
+
+/// The fields of a user-defined composite type, or `None` if none exists.
+///
+/// Returns `(field_name, type)` in declared order. Each field's type SQL is re-parsed via
+/// [`crate::parser::parse_column_type`].
+pub fn lookup_composite(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+    let Some(def) = load_view_def(engine, txn, COMPOSITE_CATALOG, name)? else {
+        return Ok(None);
+    };
+    // The stored form is alternating `name`, `type_sql`, so it always has an even part count. Parse
+    // each `(name, type_sql)` pair.
+    let parts: Vec<&str> = def.split(ENUM_LABEL_SEP).collect();
+    let mut fields = Vec::with_capacity(parts.len() / 2);
+    for pair in parts.chunks_exact(2) {
+        if let [name, type_sql] = pair {
+            fields.push((
+                (*name).to_owned(),
+                crate::parser::parse_column_type(type_sql)?,
+            ));
+        }
+    }
+    Ok(Some(fields))
+}
+
+/// Record that base-table column `(schema, table, column)` is of composite type `type_name`.
+fn store_composite_column(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+    column: &str,
+    type_name: &str,
+) -> Result<(), Error> {
+    let key = composite_column_key(schema, table, column);
+    store_view_def(engine, txn, COMPOSITE_COLUMN_CATALOG, &key, type_name)
+}
+
+/// Remove every per-column composite row for base table `(schema, table)`.
+///
+/// The per-column catalog is decoupled from the table's own lifecycle, so a table that is dropped or
+/// recreated would otherwise leave rows behind — and a later table of the same name whose column of
+/// the same name is *not* composite would then be mis-tagged as composite. Scrubbing on drop and
+/// before a (re)create keeps the catalog consistent with the live tables. Returns the number removed.
+fn delete_composite_columns_for_table(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+) -> Result<usize, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, COMPOSITE_COLUMN_CATALOG)? else {
+        return Ok(0);
+    };
+    // Keys are `schema<sep>table<sep>column`; match every column of this exact `(schema, table)`.
+    let prefix = format!("{schema}{ENUM_LABEL_SEP}{table}{ENUM_LABEL_SEP}");
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+        if matches!(row.first(), Some(ast::Value::Text(key)) if key.starts_with(&prefix)) {
+            victims.push(tid);
+        }
+    }
+    let removed = victims.len();
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(removed)
+}
+
+/// The composite type name of base-table column `(schema, table, column)`, or `None` if that column
+/// is not composite.
+pub fn lookup_composite_column(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, Error> {
+    let key = composite_column_key(schema, table, column);
+    load_view_def(engine, txn, COMPOSITE_COLUMN_CATALOG, &key)
+}
+
+/// The first `(table, column)` still declaring composite type `name`, or `None` if none does — used
+/// by `DROP TYPE` to report the dependency that blocks the drop. Scans the per-column catalog and
+/// returns the first row whose value is `name`.
+fn first_composite_dependent(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<Option<(String, String)>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, COMPOSITE_COLUMN_CATALOG)? else {
+        return Ok(None);
+    };
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+        if let [ast::Value::Text(key), ast::Value::Text(type_name)] = row.as_slice()
+            && type_name == name
+        {
+            let mut parts = key.split(ENUM_LABEL_SEP);
+            let schema = parts.next().unwrap_or_default();
+            let table = parts.next().unwrap_or_default();
+            let column = parts.next().unwrap_or_default();
+            // DROP TABLE scrubs a table's per-column rows, but a schema-CASCADE drop bypasses that
+            // path, so an orphan row can still outlive its table; only a row whose table still exists
+            // is a live dependency.
+            if engine.lookup_table_as_of_in(txn, schema, table)?.is_some() {
+                return Ok(Some((table.to_owned(), column.to_owned())));
+            }
+        }
+    }
+    Ok(None)
 }
 
 const DOMAIN_CATALOG: &str = "nusadb_domains";

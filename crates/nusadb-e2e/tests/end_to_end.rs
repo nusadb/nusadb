@@ -74,6 +74,29 @@ impl Catalog for EngineCatalog<'_> {
         };
         self.0.table_stats(schema.id).map_err(Into::into)
     }
+
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, nusadb_sql::Error> {
+        // Read the composite type registry under a fresh read snapshot, like the production catalog.
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_composite(self.0, txn, name);
+        let _ = self.0.rollback(txn);
+        out
+    }
+
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_composite_column(self.0, txn, schema, table, column);
+        let _ = self.0.rollback(txn);
+        out
+    }
 }
 
 /// A `Catalog` that analyzes as a chosen user (superuser or not) for row-level-security tests,
@@ -10936,5 +10959,177 @@ fn overlaps_rejects_non_temporal() {
     assert!(
         run_try(&engine, "SELECT (1, 2) OVERLAPS (3, 4)").is_err(),
         "integer periods are not temporal"
+    );
+}
+
+// === Composite (row) types ================================================
+//
+// A `CREATE TYPE name AS (fields...)` composite type: a column of it stores the canonical
+// `(f1,f2,…)` text form, field access reads one field, and two composites of the same type compare
+// field-by-field. Every row below was verified against the reference engine.
+
+/// Set up the `addr` composite type and `people` table (id 1/2 populated, id 3 with a NULL whole).
+fn composite_people(engine: &BtreeEngine) {
+    run(engine, "CREATE TYPE addr AS (street text, num int)");
+    run(engine, "CREATE TABLE people (id int, home addr)");
+    run(
+        engine,
+        "INSERT INTO people VALUES (1, ROW('Main',10)), (2, ROW('Elm',20)), (3, NULL)",
+    );
+}
+
+#[test]
+fn composite_type_whole_value_and_null() {
+    let engine = BtreeEngine::new();
+    composite_people(&engine);
+    // A whole composite prints as its canonical text form; a NULL whole is NULL (empty on the wire).
+    assert_eq!(
+        rows(run(&engine, "SELECT home FROM people ORDER BY id")),
+        vec![
+            vec![Value::Text("(Main,10)".to_owned())],
+            vec![Value::Text("(Elm,20)".to_owned())],
+            vec![Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn composite_type_field_access() {
+    let engine = BtreeEngine::new();
+    composite_people(&engine);
+    // `(home).street` / `(home).num` — a field of a NULL whole is NULL.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT (home).street, (home).num FROM people ORDER BY id",
+        )),
+        vec![
+            vec![Value::Text("Main".to_owned()), Value::Int(10)],
+            vec![Value::Text("Elm".to_owned()), Value::Int(20)],
+            vec![Value::Null, Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn composite_type_row_construction_cast() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TYPE addr AS (street text, num int)");
+    // `ROW(...)::T` builds the canonical form; a NULL field is empty, the whole is not null.
+    assert_eq!(
+        rows(run(&engine, "SELECT ROW('X',5)::addr")),
+        vec![vec![Value::Text("(X,5)".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT ROW('Y',NULL)::addr")),
+        vec![vec![Value::Text("(Y,)".to_owned())]]
+    );
+}
+
+#[test]
+fn composite_type_literal_cast_and_field() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TYPE addr AS (street text, num int)");
+    // A text-literal cast parses to the canonical form; a field of that literal cast reads through.
+    assert_eq!(
+        rows(run(&engine, "SELECT '(Oak,7)'::addr")),
+        vec![vec![Value::Text("(Oak,7)".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT ('(Oak,7)'::addr).num")),
+        vec![vec![Value::Int(7)]]
+    );
+}
+
+#[test]
+fn composite_type_equality_and_ordering() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TYPE addr AS (street text, num int)");
+    // Two-valued composite equality (via `CompositeVal::compare`), and field-by-field ordering.
+    assert_eq!(
+        rows(run(&engine, "SELECT ROW('a',1)::addr = ROW('a',1)::addr")),
+        vec![vec![Value::Bool(true)]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT ROW('a',1)::addr < ROW('a',2)::addr")),
+        vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
+fn composite_type_field_access_in_where() {
+    let engine = BtreeEngine::new();
+    composite_people(&engine);
+    // Field access in a predicate: only id 2 has num > 15 (id 3's NULL field is not > 15).
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM people WHERE (home).num > 15")),
+        vec![vec![Value::Int(2)]]
+    );
+}
+
+#[test]
+fn composite_type_drop_with_dependency_is_rejected() {
+    let engine = BtreeEngine::new();
+    composite_people(&engine);
+    // A type still used by a table column cannot be dropped.
+    let err = run_try(&engine, "DROP TYPE addr").expect_err("drop should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("home") && msg.contains("people"),
+        "dependency error must name the column + table, got: {msg}"
+    );
+    // Dropping the table first frees the type.
+    run(&engine, "DROP TABLE people");
+    assert!(
+        matches!(
+            run(&engine, "DROP TYPE addr"),
+            nusadb_sql::ExecutionResult::Dropped
+        ),
+        "type drops once no column depends on it"
+    );
+}
+
+#[test]
+fn composite_type_unknown_field_is_rejected() {
+    let engine = BtreeEngine::new();
+    composite_people(&engine);
+    // A field name not in the type is a loud error, never a silent NULL.
+    assert!(
+        run_try(&engine, "SELECT (home).zip FROM people").is_err(),
+        "an unknown composite field must be rejected"
+    );
+}
+
+#[test]
+fn composite_type_recreate_column_as_non_composite_is_not_mis_tagged() {
+    // Regression: the per-column composite catalog is decoupled from the table's lifecycle. Dropping a
+    // table with a composite column and recreating it with a SAME-NAMED, NON-composite column (while
+    // the type still exists) must NOT leave a stale row that mis-tags the new column as composite.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TYPE addr AS (street text, num int)");
+    run(&engine, "CREATE TABLE people (id int, home addr)");
+    run(&engine, "DROP TABLE people");
+    // `home` is now a plain INT — ordinary DML must work, not be rejected as composite.
+    run(&engine, "CREATE TABLE people (id int, home int)");
+    run(&engine, "INSERT INTO people VALUES (1, 5)");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, home FROM people WHERE home = 5")),
+        vec![vec![Value::Int(1), Value::Int(5)]]
+    );
+}
+
+#[test]
+fn composite_type_recreate_column_as_composite_again_is_still_tagged() {
+    // The symmetric legit case: dropping and recreating the column as the SAME composite type must
+    // keep it tagged (a fresh per-column row is stored), so field access still works.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TYPE addr AS (street text, num int)");
+    run(&engine, "CREATE TABLE people (id int, home addr)");
+    run(&engine, "DROP TABLE people");
+    run(&engine, "CREATE TABLE people (id int, home addr)");
+    run(&engine, "INSERT INTO people VALUES (1, ROW('Main', 10))");
+    assert_eq!(
+        rows(run(&engine, "SELECT (home).street, (home).num FROM people")),
+        vec![vec![Value::Text("Main".to_owned()), Value::Int(10)]]
     );
 }

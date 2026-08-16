@@ -109,6 +109,10 @@ fn enum_membership_predicate(col: &str, labels: &[String]) -> Option<String> {
     Some(format!("\"{}\" IN ({list})", col.replace('"', "\"\"")))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat CREATE TABLE: udt resolution, constraints, defaults, composite columns, ownership"
+)]
 pub(super) fn run_create_table(
     plan: CreateTablePlan,
     engine: &dyn StorageEngine,
@@ -136,6 +140,9 @@ pub(super) fn run_create_table(
     let mut columns = Vec::with_capacity(plan.columns.len());
     let mut enum_checks: Vec<(String, Vec<String>)> = Vec::new();
     let mut domain_checks: Vec<(String, String)> = Vec::new();
+    // Composite-typed columns to register in the per-column catalog once the table exists:
+    // `(column, type_name)`. The physical column type is `TEXT` (it holds the canonical form).
+    let mut composite_columns: Vec<(String, String)> = Vec::new();
     for c in plan.columns {
         let mut ty = c.ty;
         let mut nullable = c.nullable;
@@ -143,6 +150,11 @@ pub(super) fn run_create_table(
             if let Some(labels) = super::lookup_enum(engine, txn, udt)? {
                 // An ENUM is stored as its TEXT placeholder; membership is enforced below.
                 enum_checks.push((c.name.clone(), labels));
+            } else if super::lookup_composite(engine, txn, udt)?.is_some() {
+                // A composite column stores as its TEXT placeholder (the canonical `(f1,f2,…)` form);
+                // its composite type name is recorded per-column so reads know it is composite.
+                ty = ColumnType::Text;
+                composite_columns.push((c.name.clone(), udt.clone()));
             } else if let Some(domain) = super::lookup_domain(engine, txn, udt)? {
                 // A DOMAIN column takes the domain's base type; its NOT NULL and CHECKs are applied
                 // to this column (the CHECK's `VALUE` placeholder rewritten to the column name).
@@ -203,6 +215,15 @@ pub(super) fn run_create_table(
     // through the same machinery; the synthetic prefix hides them from introspection.
     for (name, predicate_sql) in &domain_checks {
         engine.add_check_constraint(txn, id, name, predicate_sql.as_bytes())?;
+    }
+    // Clear any per-column composite rows left by a prior table of this exact `(schema, name)` — a
+    // dropped/recreated table would otherwise mis-tag a same-named non-composite column as composite.
+    // Done unconditionally (even when this table has no composite column) so stale rows never linger.
+    super::delete_composite_columns_for_table(engine, txn, &def.schema, &def.name)?;
+    // Record each composite column's type name so reads (field access, comparison, output) know the
+    // TEXT-stored column actually holds a composite value.
+    for (column, type_name) in &composite_columns {
+        super::store_composite_column(engine, txn, &def.schema, &def.name, column, type_name)?;
     }
     // Create the backing sequence for each SERIAL column before persisting its sentinel
     // default, so INSERT's `lookup_sequence` resolves.
@@ -735,6 +756,9 @@ pub(super) fn run_drop_table(
             // Drop any `USING hnsw` vector index declared on the table (A-UR.01c), which
             // lives in the SQL-layer catalog rather than the engine's index namespace.
             super::delete_vector_indexes_for_table(engine, txn, &plan.table)?;
+            // Scrub the table's per-column composite-type rows so a later same-named table cannot
+            // inherit them (a non-composite column would otherwise be mis-tagged as composite).
+            super::delete_composite_columns_for_table(engine, txn, &plan.schema, &plan.table)?;
             // Cascade-drop the table's row-level-security policies and its RLS-enabled marker (
             // ): otherwise they orphan the catalog, and a later same-named table cannot
             // re-create a policy of the same name ("policy already exists").

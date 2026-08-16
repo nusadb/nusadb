@@ -646,6 +646,9 @@ fn bind_vars_expr(
             bind_vars_expr(base, ctx, shadowed)?;
             bind_vars_expr(index, ctx, shadowed)?;
         },
+        ast::Expr::FieldAccess { base: inner, .. } | ast::Expr::CastNamed { expr: inner, .. } => {
+            bind_vars_expr(inner, ctx, shadowed)?;
+        },
         ast::Expr::ArraySlice { base, lower, upper } => {
             bind_vars_expr(base, ctx, shadowed)?;
             for bound in [lower, upper].into_iter().flatten() {

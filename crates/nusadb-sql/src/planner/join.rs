@@ -363,6 +363,11 @@ pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
                 remap_columns(bound, shift);
             }
         },
+        TypedExprKind::Composite(op) => {
+            for child in op.children_mut() {
+                remap_columns(child, shift);
+            }
+        },
     }
 }
 
@@ -477,6 +482,11 @@ pub(super) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
             collect_columns(base, out);
             for bound in [lower, upper].into_iter().flatten() {
                 collect_columns(bound, out);
+            }
+        },
+        TypedExprKind::Composite(op) => {
+            for child in op.children() {
+                collect_columns(child, out);
             }
         },
     }

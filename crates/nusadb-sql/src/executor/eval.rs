@@ -25,9 +25,10 @@ use std::cmp::Ordering;
 use nusadb_core::ColumnType;
 
 use crate::ast;
+use crate::composite::CompositeVal;
 use crate::error::Error;
 use crate::executor::row::Row;
-use crate::planner::{TypedCaseBranch, TypedExpr, TypedExprKind};
+use crate::planner::{CompositeExpr, TypedCaseBranch, TypedExpr, TypedExprKind};
 
 thread_local! {
     /// Stack of enclosing-query rows bound while a correlated subquery runs. The executor
@@ -263,7 +264,94 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
              JOIN ON / ORDER BY)"
                 .to_owned(),
         )),
+        TypedExprKind::Composite(op) => eval_composite(op, row),
     }
+}
+
+/// Evaluate a composite (row) type operation. A composite value is carried as its canonical
+/// `(f1,f2,…)` text form ([`ast::Value::Text`]); a `NULL` whole composite propagates as `NULL`.
+fn eval_composite(op: &CompositeExpr, row: &Row) -> Result<ast::Value, Error> {
+    match op {
+        // `ROW(a,b,...)::T` — evaluate each field, coerce it to the declared type, then format the
+        // canonical text form. A `NULL` field stays `NULL` (formatted as an empty field).
+        CompositeExpr::Construct {
+            fields,
+            field_types,
+        } => {
+            let mut values = Vec::with_capacity(fields.len());
+            for (field, want) in fields.iter().zip(field_types) {
+                values.push(cast_value(eval(field, row)?, *want)?);
+            }
+            Ok(ast::Value::Text(CompositeVal::new(values).format()))
+        },
+        // `'(a,b)'::T` — parse the text form against the field types, then re-emit the canonical
+        // form. A `NULL` whole value passes through; a malformed literal is a loud error.
+        CompositeExpr::Cast { expr, field_types } => {
+            let text = match eval(expr, row)? {
+                ast::Value::Null => return Ok(ast::Value::Null),
+                ast::Value::Text(text) => text,
+                other => return Err(malformed_composite(&crate::display::value_text(&other))),
+            };
+            let parsed = crate::composite::parse(&text, field_types)
+                .ok_or_else(|| malformed_composite(&text))?;
+            Ok(ast::Value::Text(parsed.format()))
+        },
+        // `(expr).field` — parse the operand's canonical form and return one field (`NULL` for a
+        // `NULL` whole value or a `NULL` field).
+        CompositeExpr::Field {
+            base,
+            field_types,
+            index,
+        } => {
+            let text = match eval(base, row)? {
+                ast::Value::Null => return Ok(ast::Value::Null),
+                ast::Value::Text(text) => text,
+                other => return Err(malformed_composite(&crate::display::value_text(&other))),
+            };
+            let parsed = crate::composite::parse(&text, field_types)
+                .ok_or_else(|| malformed_composite(&text))?;
+            Ok(parsed
+                .fields
+                .get(*index)
+                .cloned()
+                .unwrap_or(ast::Value::Null))
+        },
+        // `a <op> b` between two composites of the same type — order them field-by-field via
+        // `CompositeVal::compare` (two-valued, NULL-last). A `NULL` whole operand yields `NULL`.
+        CompositeExpr::Compare {
+            left,
+            right,
+            op,
+            field_types,
+        } => {
+            let (ast::Value::Text(lt), ast::Value::Text(rt)) =
+                (eval(left, row)?, eval(right, row)?)
+            else {
+                // A `NULL` whole operand (or a non-text placeholder) makes the comparison `NULL`.
+                return Ok(ast::Value::Null);
+            };
+            let lv = crate::composite::parse(&lt, field_types)
+                .ok_or_else(|| malformed_composite(&lt))?;
+            let rv = crate::composite::parse(&rt, field_types)
+                .ok_or_else(|| malformed_composite(&rt))?;
+            let ord = lv.compare(&rv);
+            Ok(ast::Value::Bool(match op {
+                ast::BinaryOp::Eq => ord == Ordering::Equal,
+                ast::BinaryOp::NotEq => ord != Ordering::Equal,
+                ast::BinaryOp::Lt => ord == Ordering::Less,
+                ast::BinaryOp::LtEq => ord != Ordering::Greater,
+                ast::BinaryOp::Gt => ord == Ordering::Greater,
+                ast::BinaryOp::GtEq => ord != Ordering::Less,
+                // The analyzer only builds a composite compare for the six comparison operators.
+                _ => return Ok(ast::Value::Null),
+            }))
+        },
+    }
+}
+
+/// A loud error for a malformed composite text form the executor could not parse.
+fn malformed_composite(text: &str) -> Error {
+    Error::Unsupported(format!("malformed composite value {text:?}"))
 }
 
 /// Evaluate `encrypt(value, key)` / `decrypt(value, key)`. A `NULL` value or key

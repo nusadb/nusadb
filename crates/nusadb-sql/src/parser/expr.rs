@@ -413,7 +413,15 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                         }
                     },
                     sql::AccessExpr::Dot(field) => {
-                        return unsupported(&format!("composite field access `.{field}`"));
+                        // `(expr).field` — composite field access. The field must be a plain
+                        // identifier (`(x).*` and other dotted forms are out of surface).
+                        let sql::Expr::Identifier(ident) = field else {
+                            return unsupported(&format!("composite field access `.{field}`"));
+                        };
+                        ast::Expr::FieldAccess {
+                            base: Box::new(base),
+                            field: fold_ident(&ident),
+                        }
                     },
                 };
             }
@@ -540,11 +548,24 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                     truncated
                 });
             }
-            Ok(ast::Expr::Cast {
-                expr: Box::new(convert_expr(*expr)?),
-                target: convert_data_type(&data_type)?,
-                try_cast,
-            })
+            // A cast target that is not a built-in type but a bare user-defined type name
+            // (e.g. a composite type `x::addr`) defers to the analyzer via `CastNamed`; a genuinely
+            // unknown type still surfaces the original "unsupported type" error.
+            match convert_data_type(&data_type) {
+                Ok(target) => Ok(ast::Expr::Cast {
+                    expr: Box::new(convert_expr(*expr)?),
+                    target,
+                    try_cast,
+                }),
+                Err(e) => match deferred_udt_name(&data_type) {
+                    Some(type_name) => Ok(ast::Expr::CastNamed {
+                        expr: Box::new(convert_expr(*expr)?),
+                        type_name,
+                        try_cast,
+                    }),
+                    None => Err(e),
+                },
+            }
         },
         // Quantified comparison `x <op> ANY(...)` / `x <op> ALL(...)` over an `ARRAY[...]`
         // literal. Desugared into an OR / AND chain of element comparisons so it reuses the existing

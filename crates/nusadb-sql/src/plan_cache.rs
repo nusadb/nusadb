@@ -222,6 +222,20 @@ impl Catalog for RecordingCatalog<'_> {
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {
         self.inner.lookup_view_columns(name)
     }
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, Error> {
+        self.inner.lookup_composite(name)
+    }
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        self.inner.lookup_composite_column(schema, table, column)
+    }
     fn is_superuser(&self) -> bool {
         self.inner.is_superuser()
     }

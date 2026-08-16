@@ -406,15 +406,7 @@ pub(super) fn resolve_from(
         }
     };
     let base_qualifier = from.base.alias.clone().unwrap_or_else(|| base.name.clone());
-    let mut scope: Vec<ScopedColumn> = base
-        .columns
-        .iter()
-        .map(|def| ScopedColumn {
-            qualifier: base_qualifier.clone(),
-            def: def.clone(),
-            qualified_only: false,
-        })
-        .collect();
+    let mut scope: Vec<ScopedColumn> = super::base_scope(&base, &base_qualifier, catalog)?;
     let mut joins = Vec::with_capacity(from.joins.len());
     for join in &from.joins {
         // A LATERAL join input correlates to the columns to its left, so resolve it against the
@@ -434,11 +426,7 @@ pub(super) fn resolve_from(
         // Columns to the LEFT of this join (the running scope) end here; the joined table's
         // columns follow. `USING`/`NATURAL` reference both sides by this boundary.
         let left_width = scope.len();
-        scope.extend(joined.columns.iter().map(|def| ScopedColumn {
-            qualifier: qualifier.clone(),
-            def: def.clone(),
-            qualified_only: false,
-        }));
+        scope.extend(super::base_scope(&joined, &qualifier, catalog)?);
         // Resolve the join predicate. `ON` analyzes the explicit boolean; `CROSS` (no
         // condition) is a Cartesian product (predicate `true`); `USING (cols)` and `NATURAL` build
         // an equality conjunction over the named / common columns. All lower to the same join
@@ -533,6 +521,8 @@ pub(super) fn single_table_scope(table: &TableSchema) -> Vec<ScopedColumn> {
             qualifier: table.name.clone(),
             def: def.clone(),
             qualified_only: false,
+            // A policy predicate does not use composite field access.
+            composite_type: None,
         })
         .collect()
 }
@@ -901,6 +891,8 @@ pub(super) fn analyze_set_operation(
                 nullable: true,
             },
             qualified_only: false,
+            // A set-operation output column is derived, never a composite base-table column.
+            composite_type: None,
         })
         .collect();
     let mut order_by = Vec::with_capacity(so.order_by.len());
@@ -1208,6 +1200,8 @@ fn analyze_select_scoped(
                 nullable: true,
             },
             qualified_only: false,
+            // A window output column is derived, never a composite base-table column.
+            composite_type: None,
         }))
         .collect();
 
@@ -2013,6 +2007,24 @@ impl Catalog for CteCatalog<'_> {
         self.inner.list_indexes(table)
     }
 
+    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+        // Composite types are engine-global; delegate so a CTE term resolves them.
+        self.inner.lookup_composite(name)
+    }
+
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        // The synthetic CTE table has no composite columns; a real base table's delegate.
+        if table == self.name {
+            return Ok(None);
+        }
+        self.inner.lookup_composite_column(schema, table, column)
+    }
+
     // The security context must delegate to the inner catalog: otherwise a recursive CTE's term,
     // analyzed through this overlay, would fall back to the trait defaults (superuser, no RLS) and
     // a non-superuser could read an RLS-enabled base table by wrapping it in a CTE.
@@ -2373,6 +2385,11 @@ pub(super) fn rebase_onto_aggregation(
             rebase_onto_aggregation(base, ctx)?;
             for bound in [lower, upper].into_iter().flatten() {
                 rebase_onto_aggregation(bound, ctx)?;
+            }
+        },
+        TypedExprKind::Composite(op) => {
+            for child in op.children_mut() {
+                rebase_onto_aggregation(child, ctx)?;
             }
         },
     }

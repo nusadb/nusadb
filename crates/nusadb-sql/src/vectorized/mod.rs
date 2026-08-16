@@ -445,6 +445,8 @@ fn expr_is_vectorizable(expr: &TypedExpr) -> bool {
         // OVERLAPS has no vectorized kernel; it evaluates on the row path (period normalization
         // + three-valued logic), the same fallback array slices take.
         | K::Overlaps { .. }
+        // Composite operations have no vectorized kernel; they evaluate on the row path.
+        | K::Composite(_)
         | K::AggregateRef(_) => false,
         K::Literal(_) | K::Column(_) => true,
         K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {

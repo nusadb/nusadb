@@ -437,6 +437,11 @@ fn collect_expr(expr: &TypedExpr, cols: &mut BTreeSet<usize>, has_sq: &mut bool)
                 collect_expr(bound, cols, has_sq);
             }
         },
+        K::Composite(op) => {
+            for child in op.children() {
+                collect_expr(child, cols, has_sq);
+            }
+        },
     }
 }
 
@@ -586,6 +591,11 @@ fn remap_expr(expr: &mut TypedExpr, map: &HashMap<usize, usize>) {
             remap_expr(base, map);
             for bound in [lower, upper].into_iter().flatten() {
                 remap_expr(bound, map);
+            }
+        },
+        K::Composite(op) => {
+            for child in op.children_mut() {
+                remap_expr(child, map);
             }
         },
     }

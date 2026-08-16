@@ -1531,6 +1531,40 @@ fn parse_create_type_enum(sql: &str) -> Result<ast::Statement, Error> {
     Ok(ast::Statement::CreateEnum(ast::CreateEnum { name, labels }))
 }
 
+/// Convert sqlparser's generic `CREATE TYPE name AS (field type, ...)` into a [`ast::CreateComposite`].
+///
+/// Only the composite representation is in surface; the `RANGE` / base-SQL-definition forms are
+/// rejected loudly. Each attribute's declared type is validated to be a supported built-in (so an
+/// unknown field type is a loud error here, not a broken type) and stored as canonical SQL text for
+/// the type registry; a `COLLATE` on a field is rejected rather than silently dropped.
+fn convert_create_composite(
+    name: &sql::ObjectName,
+    representation: Option<sql::UserDefinedTypeRepresentation>,
+) -> Result<ast::Statement, Error> {
+    let Some(sql::UserDefinedTypeRepresentation::Composite { attributes }) = representation else {
+        return unsupported(
+            "only CREATE TYPE name AS (field type, ...) and CREATE TYPE name AS ENUM (...) are supported",
+        );
+    };
+    if attributes.is_empty() {
+        return unsupported("CREATE TYPE ... AS (...) requires at least one field");
+    }
+    let mut fields = Vec::with_capacity(attributes.len());
+    for attr in attributes {
+        if attr.collation.is_some() {
+            return unsupported("CREATE TYPE field with COLLATE is not supported");
+        }
+        // Validate the field type is a supported built-in, then keep its canonical SQL text so the
+        // registry can re-parse it via `parse_column_type`.
+        ddl::convert_data_type(&attr.data_type)?;
+        fields.push((fold_ident(&attr.name), attr.data_type.to_string()));
+    }
+    Ok(ast::Statement::CreateComposite(ast::CreateComposite {
+        name: object_name(name)?,
+        fields,
+    }))
+}
+
 /// Drive `DROP TYPE [IF EXISTS] name` (B-ENUM).
 fn parse_drop_type(sql: &str) -> Result<ast::Statement, Error> {
     use sqlparser::keywords::Keyword;
@@ -2986,6 +3020,14 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
             if_not_exists,
             ..
         } => convert_create_database(&db_name, if_not_exists).map(ast::Statement::CreateDatabase),
+        // `CREATE TYPE name AS (field type, ...)` — a composite (row) type. sqlparser's generic
+        // grammar parses this form (the `AS ENUM` / `DROP TYPE` forms are recognized earlier by a
+        // custom pass), so convert its composite representation here. Any other `CREATE TYPE`
+        // representation (RANGE / base SQL definition) is out of surface.
+        sql::Statement::CreateType {
+            name,
+            representation,
+        } => convert_create_composite(&name, representation),
         sql::Statement::CreateSequence {
             temporary,
             if_not_exists,

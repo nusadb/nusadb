@@ -277,7 +277,7 @@ pub(super) fn convert_column_def(
 /// column type (B-ENUM): a single-identifier `Custom` type with no modifiers (e.g. an `ENUM` name).
 /// `None` for anything else — a modifier'd or multi-part name is not a user-defined type reference,
 /// so the original "unsupported type" error stands.
-fn deferred_udt_name(ty: &sql::DataType) -> Option<String> {
+pub(super) fn deferred_udt_name(ty: &sql::DataType) -> Option<String> {
     let sql::DataType::Custom(name, modifiers) = ty else {
         return None;
     };

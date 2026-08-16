@@ -285,6 +285,27 @@ pub enum Expr {
     },
     /// `ROW(a, b, ...)` / `(a, b, ...)` row-value constructor.
     Row(Vec<Self>),
+    /// `(expr).field` — composite field access. The operand must denote a value of a user-defined
+    /// composite type (a composite column or a cast to a composite type); the analyzer resolves the
+    /// field by name against the type's declared fields.
+    FieldAccess {
+        /// The composite-typed operand.
+        base: Box<Self>,
+        /// The field name being selected.
+        field: String,
+    },
+    /// `expr::T` where `T` is a user-defined type name the parser could not resolve to a built-in
+    /// [`ColumnType`] (e.g. a composite type). The name is resolved by the analyzer against the type
+    /// registry; anything but a composite type is rejected there. Kept separate from
+    /// [`Cast`](Self::Cast) because a composite type has no `ColumnType` to name a target with.
+    CastNamed {
+        /// The expression being cast.
+        expr: Box<Self>,
+        /// The user-defined type name (folded).
+        type_name: String,
+        /// `true` for `TRY_CAST`/`SAFE_CAST`.
+        try_cast: bool,
+    },
     /// `func([args]) OVER (PARTITION BY … ORDER BY …)` — a window function call.
     /// Boxed to keep `Expr` variants uniform in size.
     WindowFunction(Box<WindowFunction>),

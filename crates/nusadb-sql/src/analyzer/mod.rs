@@ -27,8 +27,8 @@ use crate::ast;
 use crate::error::Error;
 use crate::planner::{
     AggregateCall, AlterColumnOp, AlterDatabasePlan, AlterTablePlan, AlterTriggerPlan, AnalyzePlan,
-    Assignment, CallPlan, CheckSpec, CommentPlan, ConflictArbiter, CreateDatabasePlan,
-    CreateFunctionPlan, CreateIndexPlan, CreatePlainViewPlan, CreatePolicyPlan,
+    Assignment, CallPlan, CheckSpec, CommentPlan, CompositeExpr, ConflictArbiter,
+    CreateDatabasePlan, CreateFunctionPlan, CreateIndexPlan, CreatePlainViewPlan, CreatePolicyPlan,
     CreateProcedurePlan, CreateSchemaPlan, CreateSequencePlan, CreateTableAsPlan, CreateTablePlan,
     CreateTriggerPlan, CryptoOp, DeletePlan, DropDatabasePlan, DropFunctionPlan, DropIndexPlan,
     DropPolicyPlan, DropProcedurePlan, DropSchemaPlan, DropSequencePlan, DropTablePlan,
@@ -149,6 +149,28 @@ pub trait Catalog {
     /// the function catalog. The analyzer inlines the function body in place of a call to it.
     fn lookup_function(&self, name: &str) -> Result<Option<FunctionDef>, Error> {
         let _ = name;
+        Ok(None)
+    }
+
+    /// The fields of a user-defined composite type named `name`, as `(field_name, type)` in declared
+    /// order, or `None` if no such composite type exists. Default `None` so a minimal catalog has no
+    /// composite types; the production adapter reads the composite type registry. Used to type
+    /// composite construction, field access, and comparison.
+    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// The composite type name of base-table column `(schema, table, column)`, or `None` if that
+    /// column is not of a composite type. Default `None`; the production adapter reads the per-column
+    /// composite catalog. Used to resolve `(col).field` on a composite column.
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        let _ = (schema, table, column);
         Ok(None)
     }
 
@@ -480,6 +502,26 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             Ok(LogicalPlan::CreateEnum(ce))
         },
         ast::Statement::DropType(dt) => Ok(LogicalPlan::DropType(dt)),
+        // CREATE TYPE ... AS (...): validate the fields (at least one, distinct names). The field
+        // types were validated to parse in the parser; uniqueness against other type objects and the
+        // registry write happen in the executor (which alone reads the type catalogs), mirroring the
+        // deferred ENUM resolution.
+        ast::Statement::CreateComposite(cc) => {
+            if cc.fields.is_empty() {
+                return Err(Error::Unsupported(
+                    "CREATE TYPE ... AS (...) requires at least one field".to_owned(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (field, _) in &cc.fields {
+                if !seen.insert(field.as_str()) {
+                    return Err(Error::Unsupported(format!(
+                        "duplicate composite field {field:?}"
+                    )));
+                }
+            }
+            Ok(LogicalPlan::CreateComposite(cc))
+        },
         // CREATE DOMAIN: the base type + CHECK predicates were validated to parse in the parser; a
         // predicate's meaning is checked against the base type when a column of the domain is created
         // (the injected CHECK is analyzed then), mirroring the deferred ENUM resolution.
@@ -1068,6 +1110,8 @@ fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
                 && lower.as_deref().is_none_or(expr_is_ivm_stable)
                 && upper.as_deref().is_none_or(expr_is_ivm_stable)
         },
+        // Composite operations are deterministic — stable if every child is.
+        K::Composite(op) => op.children().into_iter().all(expr_is_ivm_stable),
     }
 }
 
@@ -1473,11 +1517,39 @@ pub(crate) struct ScopedColumn {
     /// which is merged into one output column reached via the left side.
     /// `false` for an ordinary table/CTE column.
     qualified_only: bool,
+    /// When the column is of a user-defined composite type, its type name (from the per-column
+    /// composite catalog); `None` otherwise. This is what lets `(col).field` and a composite
+    /// comparison recognise a composite column whose physical type is `TEXT`. Populated only for
+    /// base-table columns in a `SELECT` scope; a derived column (CTE, projection) is never composite.
+    composite_type: Option<String>,
 }
 
 /// Build the scope for a single table (the common, non-join case).
 fn scope_of(table: &TableSchema) -> Vec<ScopedColumn> {
     scope_of_aliased(table, &table.name)
+}
+
+/// Build a base-table `SELECT` scope, enriching each column with its user-defined composite type
+/// name (from the per-column composite catalog) so `(col).field` and composite comparisons can
+/// recognise a composite column whose physical type is `TEXT`. A non-composite column carries
+/// `None`. Used for the `FROM` base and each joined table of a `SELECT`.
+pub(crate) fn base_scope(
+    table: &TableSchema,
+    qualifier: &str,
+    catalog: &dyn Catalog,
+) -> Result<Vec<ScopedColumn>, Error> {
+    let mut out = Vec::with_capacity(table.columns.len());
+    for def in &table.columns {
+        let composite_type =
+            catalog.lookup_composite_column(&table.schema, &table.name, &def.name)?;
+        out.push(ScopedColumn {
+            qualifier: qualifier.to_owned(),
+            def: def.clone(),
+            qualified_only: false,
+            composite_type,
+        });
+    }
+    Ok(out)
 }
 
 /// Like [`scope_of`] but with an explicit `qualifier` (an alias) for the columns — for the secondary
@@ -1491,8 +1563,34 @@ pub(crate) fn scope_of_aliased(table: &TableSchema, qualifier: &str) -> Vec<Scop
             qualifier: qualifier.to_owned(),
             def: def.clone(),
             qualified_only: false,
+            // The `SELECT` scope builder enriches base-table columns with their composite type; this
+            // DML-target builder has no catalog, so composite field access there is not resolved.
+            composite_type: None,
         })
         .collect()
+}
+
+/// The user-defined composite type name recorded for the column reference `qualifier.name` in
+/// `scope`, or `None` if the column is not composite (or does not resolve here). Best-effort: the
+/// authoritative column resolution ([`resolve_scoped`]) reports ambiguity / not-found; this only
+/// reads the composite tag once the caller has (or will) resolve the column normally.
+pub(super) fn scoped_composite_type(
+    scope: &[ScopedColumn],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    scope.iter().find_map(|col| {
+        if col.def.name != name {
+            return None;
+        }
+        if qualifier.is_some_and(|q| col.qualifier != q) {
+            return None;
+        }
+        if qualifier.is_none() && col.qualified_only {
+            return None;
+        }
+        col.composite_type.clone()
+    })
 }
 
 /// Resolve a column reference against `scope`, returning its row ordinal and

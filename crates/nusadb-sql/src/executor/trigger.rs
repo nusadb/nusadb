@@ -874,6 +874,9 @@ fn sub_expr(expr: &mut ast::Expr, refs: &RowRefs<'_>) -> Result<(), Error> {
             sub_expr(base, refs)?;
             sub_expr(index, refs)
         },
+        ast::Expr::FieldAccess { base: inner, .. } | ast::Expr::CastNamed { expr: inner, .. } => {
+            sub_expr(inner, refs)
+        },
         ast::Expr::ArraySlice { base, lower, upper } => {
             sub_expr(base, refs)?;
             for bound in [lower, upper].into_iter().flatten() {

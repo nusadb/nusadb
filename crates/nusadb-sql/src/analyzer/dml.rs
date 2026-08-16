@@ -7,6 +7,10 @@ use super::*;
 
 // === INSERT ===============================================================
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat INSERT analysis: column resolution, per-cell typing, RETURNING, ON CONFLICT, RLS"
+)]
 pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<InsertPlan, Error> {
     // The system-catalog namespace is reserved: a user INSERT into e.g. `nusadb_policies`
     // would forge a policy and bypass RLS entirely.
@@ -38,6 +42,16 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         .iter()
         .filter_map(|&index| table.columns.get(index).cloned())
         .collect();
+    // For each target column, its user-defined composite type name (if it is a composite column).
+    // A composite column stores as `TEXT`, so a `ROW(...)` / text value is coerced to its type here.
+    let mut composite_targets: Vec<Option<String>> = Vec::with_capacity(target_columns.len());
+    for column in &target_columns {
+        composite_targets.push(catalog.lookup_composite_column(
+            &table.schema,
+            &table.name,
+            &column.name,
+        )?);
+    }
 
     let source = match ins.source {
         ast::InsertSource::Values(rows_vec) => {
@@ -51,11 +65,27 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
                     });
                 }
                 let mut typed_row = Vec::with_capacity(row.len());
-                for (value, column) in row.iter().zip(&target_columns) {
+                for ((value, column), composite) in
+                    row.iter().zip(&target_columns).zip(&composite_targets)
+                {
                     // A `None` cell is an explicit `DEFAULT`: leave it unresolved so the executor
                     // fills it from the column's default/serial/NULL, exactly like an omitted column.
                     let typed = match value {
-                        Some(expr) => Some(analyze_insert_value(expr, column, catalog)?),
+                        // A composite column takes a `ROW(...)` / text value as its composite type;
+                        // wrap it in a named cast so the composite construction/parse path types it.
+                        // A bare `NULL` whole value is left alone so the ordinary NOT NULL check and
+                        // NULL storage apply.
+                        Some(expr) => match composite {
+                            Some(type_name) if !super::typecheck::is_bare_null(expr) => {
+                                let wrapped = ast::Expr::CastNamed {
+                                    expr: Box::new(expr.clone()),
+                                    type_name: type_name.clone(),
+                                    try_cast: false,
+                                };
+                                Some(analyze_insert_value(&wrapped, column, catalog)?)
+                            },
+                            _ => Some(analyze_insert_value(expr, column, catalog)?),
+                        },
                         None => None,
                     };
                     typed_row.push(typed);
@@ -198,6 +228,7 @@ fn upsert_scope(table: &TableSchema) -> Vec<ScopedColumn> {
         qualifier: "excluded".to_owned(),
         def: def.clone(),
         qualified_only: true,
+        composite_type: None,
     }));
     scope
 }
@@ -553,6 +584,8 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             qualifier: qualifier.clone(),
             def: def.clone(),
             qualified_only: false,
+            // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
+            composite_type: None,
         }));
         from_plan = plan.map(Box::new);
         from_table = Some(schema);
@@ -682,6 +715,8 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
             qualifier: qualifier.clone(),
             def: def.clone(),
             qualified_only: false,
+            // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
+            composite_type: None,
         }));
         using_plan = plan.map(Box::new);
         using_table = Some(schema);

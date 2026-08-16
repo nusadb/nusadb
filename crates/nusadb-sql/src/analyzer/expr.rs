@@ -415,7 +415,18 @@ pub(super) fn analyze_expr_agg(
         ),
         // Ordered-set aggregate WITHIN GROUP.
         ast::Expr::WithinGroup(wg) => analyze_within_group(wg, scope, catalog, aggregates),
-        // ROW(...) is parsed but row-value comparison/evaluation is not yet wired.
+        // `(expr).field` — composite field access.
+        ast::Expr::FieldAccess { base, field } => {
+            analyze_field_access(base, field, scope, catalog, aggregates)
+        },
+        // `expr::T` where `T` is a user-defined (composite) type name.
+        ast::Expr::CastNamed {
+            expr,
+            type_name,
+            try_cast,
+        } => analyze_cast_named(expr, type_name, *try_cast, scope, catalog, aggregates),
+        // ROW(...) is parsed but row-value comparison/evaluation is not yet wired — except as the
+        // operand of a cast to a composite type (`ROW(...)::T`), handled in `analyze_cast_named`.
         ast::Expr::Row(_) => Err(Error::Unsupported(
             "ROW(...) constructor is parsed but the executor path is not yet implemented"
                 .to_owned(),
@@ -3043,6 +3054,131 @@ pub(super) fn analyze_cast(
     })
 }
 
+/// The declared fields of the composite type an expression denotes, or `None` if the expression is
+/// not a value of a statically known composite type. Only a cast to a composite type (`x::T`) and a
+/// composite base-table column are recognised — a bare `f(...)` returning composite, a nested field,
+/// or any other operand has no statically known composite type (out of first-cut scope), so it
+/// returns `None` and the caller rejects it loudly rather than mis-typing it.
+fn composite_type_of(
+    expr: &ast::Expr,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+    let type_name = match expr {
+        ast::Expr::CastNamed { type_name, .. } => Some(type_name.clone()),
+        ast::Expr::Column(name) => super::scoped_composite_type(scope, None, name),
+        ast::Expr::QualifiedColumn { table, column } => {
+            super::scoped_composite_type(scope, Some(table), column)
+        },
+        _ => None,
+    };
+    type_name.map_or(Ok(None), |name| catalog.lookup_composite(&name))
+}
+
+/// `(expr).field` — extract one field of a composite value. The operand's composite type is resolved
+/// statically ([`composite_type_of`]); the field is looked up by name (a miss is a loud error), and
+/// the executor parses the operand's canonical text form and returns that field.
+fn analyze_field_access(
+    base: &ast::Expr,
+    field: &str,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let Some(fields) = composite_type_of(base, scope, catalog)? else {
+        return Err(Error::Unsupported(format!(
+            "field access `.{field}` requires an operand of a known composite type (a composite \
+             column or a cast to a composite type)"
+        )));
+    };
+    let index = fields
+        .iter()
+        .position(|(name, _)| name == field)
+        .ok_or_else(|| {
+            Error::Unsupported(format!("composite type has no field named {field:?}"))
+        })?;
+    let field_ty = fields.get(index).map(|(_, ty)| *ty).ok_or_else(|| {
+        Error::Unsupported("internal: composite field index out of range".to_owned())
+    })?;
+    let field_types: Vec<ColumnType> = fields.iter().map(|(_, ty)| *ty).collect();
+    // The operand evaluates to the canonical text form (a composite column is stored as `TEXT`; a
+    // composite cast produces the text form), so analyze it normally with no hint.
+    let base_typed = analyze_expr_agg(base, scope, catalog, None, aggregates)?;
+    Ok(TypedExpr {
+        kind: TypedExprKind::Composite(Box::new(CompositeExpr::Field {
+            base: Box::new(base_typed),
+            field_types,
+            index,
+        })),
+        ty: super::expr_type(field_ty),
+    })
+}
+
+/// `expr::T` where `T` is a user-defined type name. Only a composite type is in surface; an enum /
+/// domain / unknown name is rejected loudly (they have no composite cast path). `ROW(...)::T` builds
+/// the composite from its field expressions; any other operand is treated as a text value parsed
+/// against `T`'s field types.
+fn analyze_cast_named(
+    expr: &ast::Expr,
+    type_name: &str,
+    _try_cast: bool,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let Some(fields) = catalog.lookup_composite(type_name)? else {
+        return Err(Error::Unsupported(format!(
+            "type \"{type_name}\" does not exist or is not a composite type"
+        )));
+    };
+    let field_types: Vec<ColumnType> = fields.iter().map(|(_, ty)| *ty).collect();
+    if let ast::Expr::Row(items) = expr {
+        if items.len() != field_types.len() {
+            return Err(Error::Unsupported(format!(
+                "composite type \"{type_name}\" has {} fields but the ROW value supplies {}",
+                field_types.len(),
+                items.len()
+            )));
+        }
+        let mut typed = Vec::with_capacity(items.len());
+        for (item, want) in items.iter().zip(&field_types) {
+            let field =
+                analyze_expr_agg(item, scope, catalog, Some(*want), aggregates.as_deref_mut())?;
+            // A `NULL` field is always allowed; otherwise it must be assignable to the declared type
+            // (the executor coerces it to that type before formatting the canonical text form).
+            if !is_null_literal(&field) && !assignable(*want, field.ty) {
+                return Err(Error::TypeMismatch {
+                    context: format!("field of composite type \"{type_name}\""),
+                    expected: *want,
+                    found: field.ty,
+                });
+            }
+            typed.push(field);
+        }
+        return Ok(TypedExpr {
+            kind: TypedExprKind::Composite(Box::new(CompositeExpr::Construct {
+                fields: typed,
+                field_types,
+            })),
+            ty: ColumnType::Text,
+        });
+    }
+    // A non-ROW operand is a text value spelling the composite's canonical form (e.g. `'(a,b)'::T`).
+    let inner = analyze_expr_agg(expr, scope, catalog, Some(ColumnType::Text), aggregates)?;
+    if inner.ty.physical() != ColumnType::Text {
+        return Err(Error::Unsupported(format!(
+            "a cast to composite type \"{type_name}\" requires a ROW(...) value or a text value"
+        )));
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::Composite(Box::new(CompositeExpr::Cast {
+            expr: Box::new(inner),
+            field_types,
+        })),
+        ty: ColumnType::Text,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "flat WHEN/THEN/ELSE typing pass with deferred bare-NULL branch resolution"
@@ -3683,6 +3819,10 @@ fn desugar_row_comparison(
         .ok_or_else(|| Error::Unsupported("a row comparison requires a non-empty row".to_owned()))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat operator-coercion pass; length tracks the operand-coercion special cases"
+)]
 pub(super) fn analyze_binary(
     left: &ast::Expr,
     op: ast::BinaryOp,
@@ -3712,6 +3852,51 @@ pub(super) fn analyze_binary(
             Some(ColumnType::Bool),
             aggregates,
         );
+    }
+    // A comparison between two composite operands of the same type orders them field-by-field via
+    // `CompositeVal::compare` (two-valued, NULL-last) — distinct from the three-valued `ROW(…)`
+    // comparison above. A composite operand paired with a non-composite one is rejected loudly
+    // rather than silently compared as text.
+    if matches!(
+        op,
+        ast::BinaryOp::Eq
+            | ast::BinaryOp::NotEq
+            | ast::BinaryOp::Lt
+            | ast::BinaryOp::LtEq
+            | ast::BinaryOp::Gt
+            | ast::BinaryOp::GtEq
+    ) {
+        let left_fields = composite_type_of(left, scope, catalog)?;
+        let right_fields = composite_type_of(right, scope, catalog)?;
+        match (left_fields, right_fields) {
+            (Some(lf), Some(rf)) => {
+                let lt: Vec<ColumnType> = lf.iter().map(|(_, ty)| *ty).collect();
+                let rt: Vec<ColumnType> = rf.iter().map(|(_, ty)| *ty).collect();
+                if lt != rt {
+                    return Err(Error::Unsupported(
+                        "cannot compare values of different composite types".to_owned(),
+                    ));
+                }
+                let left_typed =
+                    analyze_expr_agg(left, scope, catalog, None, aggregates.as_deref_mut())?;
+                let right_typed = analyze_expr_agg(right, scope, catalog, None, aggregates)?;
+                return Ok(TypedExpr {
+                    kind: TypedExprKind::Composite(Box::new(CompositeExpr::Compare {
+                        left: Box::new(left_typed),
+                        right: Box::new(right_typed),
+                        op,
+                        field_types: lt,
+                    })),
+                    ty: ColumnType::Bool,
+                });
+            },
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::Unsupported(
+                    "cannot compare a composite value to a non-composite value".to_owned(),
+                ));
+            },
+            (None, None) => {},
+        }
     }
     // When BOTH operands are a bare `NULL`, neither can be typed from a sibling. Most operators are
     // genuinely ambiguous then — `NULL + NULL` has no unique operator to resolve — but comparison,

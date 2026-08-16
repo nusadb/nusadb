@@ -475,6 +475,11 @@ pub(super) fn resolve_subqueries(
                 resolve_subqueries(bound, engine, txn)?;
             }
         },
+        K::Composite(op) => {
+            for child in op.children_mut() {
+                resolve_subqueries(child, engine, txn)?;
+            }
+        },
         K::ScalarSubquery(_)
         | K::Exists { .. }
         | K::InSubquery { .. }
@@ -675,6 +680,7 @@ pub(crate) fn contains_subquery(expr: &TypedExpr) -> bool {
                 || lower.as_deref().is_some_and(contains_subquery)
                 || upper.as_deref().is_some_and(contains_subquery)
         },
+        K::Composite(op) => op.children().into_iter().any(contains_subquery),
         K::Literal(_) | K::Column(_) | K::OuterColumn { .. } | K::AggregateRef(_) => false,
     }
 }
@@ -759,6 +765,7 @@ pub(crate) fn contains_sequence_call(expr: &TypedExpr) -> bool {
                 || lower.as_deref().is_some_and(contains_sequence_call)
                 || upper.as_deref().is_some_and(contains_sequence_call)
         },
+        K::Composite(op) => op.children().into_iter().any(contains_sequence_call),
         // A sequence call inside a subquery is resolved when that subquery runs, not here; leaf
         // nodes carry no function call.
         K::ScalarSubquery(_)
@@ -882,6 +889,11 @@ pub(super) fn resolve_sequence_calls(
             resolve_sequence_calls(base, engine)?;
             for bound in [lower, upper].into_iter().flatten() {
                 resolve_sequence_calls(bound, engine)?;
+            }
+        },
+        K::Composite(op) => {
+            for child in op.children_mut() {
+                resolve_sequence_calls(child, engine)?;
             }
         },
         // Subqueries carry their own scope; their sequence calls resolve when the subquery executes.
@@ -1113,6 +1125,7 @@ fn expr_has_outer_column(expr: &TypedExpr) -> bool {
         | K::QuantifiedSubquery {
             expr: probe, plan, ..
         } => expr_has_outer_column(probe) || plan_has_outer_column(plan),
+        K::Composite(op) => op.children().into_iter().any(expr_has_outer_column),
     }
 }
 

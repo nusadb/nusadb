@@ -221,6 +221,19 @@ pub struct CreateEnum {
     pub labels: Vec<String>,
 }
 
+/// `CREATE TYPE name AS (field type, ...)` — a user-defined composite (row) type.
+///
+/// Stored as a catalog object; a column of this type is stored as `TEXT` holding the canonical
+/// `(f1,f2,…)` text form, with the field types remembered in the type registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateComposite {
+    /// Type name (unique within the catalog).
+    pub name: String,
+    /// The ordered fields, each a `(field_name, field_type_sql)` pair. The type is kept as canonical
+    /// SQL text and re-parsed (via [`crate::parser::parse_column_type`]) when the type is resolved.
+    pub fields: Vec<(String, String)>,
+}
+
 /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropType {

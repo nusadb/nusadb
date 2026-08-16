@@ -282,6 +282,44 @@ fn fold_children(kind: TypedExprKind) -> TypedExprKind {
             func,
             args: fold_vec(args),
         },
+        // Fold each composite operand; the composite node itself is not constant-evaluated (see
+        // `is_foldable_constant`).
+        K::Composite(op) => {
+            use crate::planner::CompositeExpr as C;
+            K::Composite(Box::new(match *op {
+                C::Construct {
+                    fields,
+                    field_types,
+                } => C::Construct {
+                    fields: fold_vec(fields),
+                    field_types,
+                },
+                C::Cast { expr, field_types } => C::Cast {
+                    expr: fold_box(expr),
+                    field_types,
+                },
+                C::Field {
+                    base,
+                    field_types,
+                    index,
+                } => C::Field {
+                    base: fold_box(base),
+                    field_types,
+                    index,
+                },
+                C::Compare {
+                    left,
+                    right,
+                    op,
+                    field_types,
+                } => C::Compare {
+                    left: fold_box(left),
+                    right: fold_box(right),
+                    op,
+                    field_types,
+                },
+            }))
+        },
     }
 }
 

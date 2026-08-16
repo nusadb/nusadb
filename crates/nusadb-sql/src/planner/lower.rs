@@ -56,6 +56,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::DropView(p) => PhysicalPlan::DropView(p),
         LogicalPlan::CreateEnum(p) => PhysicalPlan::CreateEnum(p),
         LogicalPlan::DropType(p) => PhysicalPlan::DropType(p),
+        LogicalPlan::CreateComposite(p) => PhysicalPlan::CreateComposite(p),
         LogicalPlan::CreateDomain(p) => PhysicalPlan::CreateDomain(p),
         LogicalPlan::DropDomain(p) => PhysicalPlan::DropDomain(p),
         LogicalPlan::CreateTrigger(p) => PhysicalPlan::CreateTrigger(p),

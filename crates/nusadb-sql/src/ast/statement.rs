@@ -224,8 +224,12 @@ pub enum Statement {
     /// `CREATE TYPE name AS ENUM (...)` — a user-defined enum type (B-ENUM). Recognized by a custom
     /// parser pass (sqlparser 0.51 only models the composite `CREATE TYPE name AS (...)` form).
     CreateEnum(CreateEnum),
-    /// `DROP TYPE [IF EXISTS] name` (B-ENUM). Custom-parsed.
+    /// `DROP TYPE [IF EXISTS] name` (B-ENUM / composite). Custom-parsed for the `DROP` form; a
+    /// composite type and an enum share the one type namespace, so both are dropped here.
     DropType(DropType),
+    /// `CREATE TYPE name AS (field type, ...)` — a user-defined composite (row) type. Parsed by
+    /// sqlparser's generic `CREATE TYPE` grammar and converted in the statement converter.
+    CreateComposite(CreateComposite),
     /// `CREATE DOMAIN name AS base_type [NOT NULL] [CHECK (VALUE …)]` — a constrained base type.
     /// Recognized by a custom parser pass.
     CreateDomain(CreateDomain),
