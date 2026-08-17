@@ -275,6 +275,7 @@ pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
         },
         TypedExprKind::Unary { expr: inner, .. }
         | TypedExprKind::IsNull { expr: inner, .. }
+        | TypedExprKind::IsJson { operand: inner, .. }
         | TypedExprKind::IsBool { expr: inner, .. }
         | TypedExprKind::Cast(inner, _)
         | TypedExprKind::InSubquery { expr: inner, .. }
@@ -393,6 +394,7 @@ pub(super) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
         },
         TypedExprKind::Unary { expr: inner, .. }
         | TypedExprKind::IsNull { expr: inner, .. }
+        | TypedExprKind::IsJson { operand: inner, .. }
         | TypedExprKind::IsBool { expr: inner, .. }
         | TypedExprKind::Cast(inner, _)
         // Only the probe of an IN / quantified subquery can reference an outer (join-input) column.

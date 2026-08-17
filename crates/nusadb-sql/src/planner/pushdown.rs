@@ -355,6 +355,7 @@ fn collect_expr(expr: &TypedExpr, cols: &mut BTreeSet<usize>, has_sq: &mut bool)
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => collect_expr(inner, cols, has_sq),
         K::InList {
@@ -510,6 +511,7 @@ fn remap_expr(expr: &mut TypedExpr, map: &HashMap<usize, usize>) {
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => remap_expr(inner, map),
         K::InList {

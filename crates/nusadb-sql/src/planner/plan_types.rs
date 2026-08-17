@@ -1649,6 +1649,18 @@ pub enum TypedExprKind {
         /// `true` for `IS NOT NULL`, `false` for `IS NULL`.
         negated: bool,
     },
+    /// `<expr> IS [NOT] JSON [item_type] [WITH UNIQUE KEYS]` — a JSON validity / shape
+    /// predicate yielding a **nullable** boolean (a `NULL` operand yields `NULL`).
+    IsJson {
+        /// Operand whose text is checked for JSON validity / shape.
+        operand: Box<TypedExpr>,
+        /// `true` for `IS NOT JSON`.
+        negated: bool,
+        /// Which JSON item type is required (`Value` = any type).
+        item_type: ast::JsonItemType,
+        /// `true` for `WITH UNIQUE KEYS` — every object's keys must be unique, recursively.
+        unique_keys: bool,
+    },
     /// `left IS [NOT] DISTINCT FROM right` — NULL-aware comparison
     /// yielding a non-NULL boolean.
     IsDistinctFrom {

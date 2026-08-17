@@ -253,6 +253,7 @@ fn count_expr(expr: &ast::Expr, max: &mut usize) {
         },
         ast::Expr::Unary { expr, .. }
         | ast::Expr::IsNull { expr, .. }
+        | ast::Expr::IsJson { operand: expr, .. }
         | ast::Expr::IsBool { expr, .. }
         | ast::Expr::Cast { expr, .. } => count_expr(expr, max),
         ast::Expr::InList { expr, list, .. } => {
@@ -433,6 +434,7 @@ pub(crate) fn substitute_param_exprs(
         },
         ast::Expr::Unary { expr, .. }
         | ast::Expr::IsNull { expr, .. }
+        | ast::Expr::IsJson { operand: expr, .. }
         | ast::Expr::IsBool { expr, .. }
         | ast::Expr::Cast { expr, .. } => substitute_param_exprs(expr, args, param_names),
         ast::Expr::InList { expr, list, .. } => {
@@ -732,6 +734,7 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Er
         },
         ast::Expr::Unary { expr, .. }
         | ast::Expr::IsNull { expr, .. }
+        | ast::Expr::IsJson { operand: expr, .. }
         | ast::Expr::IsBool { expr, .. }
         | ast::Expr::Cast { expr, .. } => substitute_expr(expr, params),
         ast::Expr::InList { expr, list, .. } => {

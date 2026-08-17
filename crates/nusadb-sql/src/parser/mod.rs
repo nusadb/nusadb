@@ -504,6 +504,12 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // and rewrite the inline window into a uniquely-named synthetic window that carries the mode
     // through to conversion. See `strip_window_exclude`.
     strip_window_exclude(&mut tokens)?;
+    // `<expr> IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [WITH|WITHOUT UNIQUE [KEYS]]`: sqlparser
+    // (0.62, the latest mainline) cannot parse this postfix operator. Rewrite each occurrence into
+    // `<expr> IS DISTINCT FROM __nusadb_isjson_<n>` — an IS-predicate of the same precedence, so
+    // sqlparser binds the identical left operand — and record the mode per sentinel. See
+    // `strip_is_json`.
+    strip_is_json(&mut tokens)?;
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -763,6 +769,129 @@ fn parse_window_spec(spec: &str) -> Result<sql::WindowSpec, Error> {
             "malformed window specification before EXCLUDE".to_owned(),
         )),
     }
+}
+
+/// The reserved identifier prefix for the sentinel names the `IS JSON` preprocessor mints.
+const IS_JSON_PREFIX: &str = "__nusadb_isjson_";
+
+/// Rewrite each postfix `<expr> IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE
+/// [KEYS]]` into `<expr> IS DISTINCT FROM __nusadb_isjson_<n>`, recording `<sentinel> -> (negated,
+/// item_type, unique_keys)` in a thread-local consumed during conversion (see
+/// [`expr::install_is_json`] and [`expr::convert_is_distinct`]).
+///
+/// `IS JSON` is a postfix operator on an ARBITRARY left expression, so a naive token rewrite cannot
+/// find the operand's left boundary. `IS DISTINCT FROM` is itself an IS-predicate with the SAME
+/// precedence as `IS JSON`, so sqlparser parses the identical left operand — no boundary guessing.
+/// Association is robust, not positional: each occurrence gets a globally unique sentinel name that
+/// sqlparser threads verbatim from the exact predicate site into the `Identifier` it produces, so
+/// the captured mode reaches exactly the predicate it came from even when one statement carries
+/// several `IS JSON` predicates.
+///
+/// Only UNQUOTED keyword words match: a quoted `"json"` or a string `'json'` is data and never
+/// matches, and a name merely containing `json` (e.g. the function `json_query`) tokenizes as one
+/// word, not the bare `JSON` keyword, so it is left untouched.
+fn strip_is_json(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
+    // Cheap guard: the rewrite is only needed when an unquoted `json` keyword word appears. Always
+    // seed the map (clearing any leftover) so conversion never reads a stale entry.
+    if !tokens.iter().any(|t| word_ci(Some(t), "json")) {
+        expr::install_is_json(std::collections::HashMap::new());
+        return Ok(());
+    }
+    // The sentinel prefix is reserved; a statement that already uses it is rejected loudly rather
+    // than risk a collision between a user identifier and a minted one.
+    if tokens.iter().any(
+        |t| matches!(&t.token, Token::Word(w) if w.value.to_ascii_lowercase().starts_with(IS_JSON_PREFIX)),
+    ) {
+        return Err(Error::Unsupported(format!(
+            "identifiers beginning with `{IS_JSON_PREFIX}` are reserved"
+        )));
+    }
+
+    let is_nonws = |t: Option<&TokenWithSpan>| matches!(t, Some(t) if !matches!(t.token, Token::Whitespace(_)));
+    let next_nonws = |toks: &[TokenWithSpan], from: usize| {
+        (from + 1..toks.len()).find(|&j| is_nonws(toks.get(j)))
+    };
+
+    let mut map: std::collections::HashMap<String, (bool, ast::JsonItemType, bool)> =
+        std::collections::HashMap::new();
+    let mut counter: u32 = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        // The phrase begins at an unquoted `IS` keyword word.
+        if !word_ci(tokens.get(i), "is") {
+            i += 1;
+            continue;
+        }
+        // `IS [NOT] JSON` — anything else after `IS` is a different IS-predicate, left alone.
+        let mut cursor = next_nonws(tokens, i);
+        let negated = cursor.is_some_and(|j| word_ci(tokens.get(j), "not"));
+        if negated {
+            cursor = cursor.and_then(|j| next_nonws(tokens, j));
+        }
+        let Some(json_idx) = cursor.filter(|&j| word_ci(tokens.get(j), "json")) else {
+            i += 1;
+            continue;
+        };
+        // The last token the phrase consumes so far is `JSON`; extend it over the optional
+        // item-type word and the optional `(WITH|WITHOUT) UNIQUE [KEYS]` tail.
+        let mut last = json_idx;
+        let mut item_type = ast::JsonItemType::Value;
+        let mut probe = next_nonws(tokens, json_idx);
+        if let Some(j) = probe {
+            let ty = if word_ci(tokens.get(j), "value") {
+                Some(ast::JsonItemType::Value)
+            } else if word_ci(tokens.get(j), "scalar") {
+                Some(ast::JsonItemType::Scalar)
+            } else if word_ci(tokens.get(j), "array") {
+                Some(ast::JsonItemType::Array)
+            } else if word_ci(tokens.get(j), "object") {
+                Some(ast::JsonItemType::Object)
+            } else {
+                None
+            };
+            if let Some(ty) = ty {
+                item_type = ty;
+                last = j;
+                probe = next_nonws(tokens, j);
+            }
+        }
+        let mut unique_keys = false;
+        if let Some(j) = probe {
+            let uniq = if word_ci(tokens.get(j), "with") {
+                Some(true)
+            } else if word_ci(tokens.get(j), "without") {
+                Some(false)
+            } else {
+                None
+            };
+            // Only consume `WITH`/`WITHOUT` when it is the `UNIQUE [KEYS]` tail; a bare trailing
+            // `WITH` belonging to something else is left in place.
+            if let Some(with) = uniq
+                && let Some(u) = next_nonws(tokens, j).filter(|&u| word_ci(tokens.get(u), "unique"))
+            {
+                unique_keys = with;
+                last = u;
+                if let Some(k) = next_nonws(tokens, u).filter(|&k| word_ci(tokens.get(k), "keys")) {
+                    last = k;
+                }
+            }
+        }
+        // Mint the sentinel and splice `IS DISTINCT FROM <sentinel>` over the whole phrase `[i..=last]`.
+        counter += 1;
+        let name = format!("{IS_JSON_PREFIX}{counter}");
+        map.insert(name.clone(), (negated, item_type, unique_keys));
+        let replacement = [
+            TokenWithSpan::wrap(Token::make_word("IS", None)),
+            TokenWithSpan::wrap(Token::make_word("DISTINCT", None)),
+            TokenWithSpan::wrap(Token::make_word("FROM", None)),
+            TokenWithSpan::wrap(Token::make_word(&name, None)),
+        ];
+        let _: Vec<TokenWithSpan> = tokens.splice(i..=last, replacement).collect();
+        // Continue scanning after the four inserted tokens.
+        i += 4;
+    }
+    expr::install_is_json(map);
+    Ok(())
 }
 
 /// Recognize the bare `VACUUM` statement (and `EXPLAIN VACUUM`), which the

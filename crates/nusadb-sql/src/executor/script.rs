@@ -569,6 +569,7 @@ fn bind_vars_expr(
         },
         ast::Expr::Unary { expr, .. }
         | ast::Expr::IsNull { expr, .. }
+        | ast::Expr::IsJson { operand: expr, .. }
         | ast::Expr::IsBool { expr, .. }
         | ast::Expr::Cast { expr, .. } => bind_vars_expr(expr, ctx, shadowed)?,
         ast::Expr::InList { expr, list, .. } => {

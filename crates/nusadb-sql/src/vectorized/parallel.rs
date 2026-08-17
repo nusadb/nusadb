@@ -141,6 +141,7 @@ fn thread_pure_expr(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. } => thread_pure_expr(inner),
         K::Between {
             expr, low, high, ..

@@ -454,6 +454,7 @@ fn expr_is_vectorizable(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => expr_is_vectorizable(inner),
         K::InList { expr, list, .. } => {

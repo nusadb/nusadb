@@ -3759,6 +3759,181 @@ fn is_null_and_is_not_null() {
     ));
 }
 
+/// The `IS JSON` predicate is parsed via the `IS DISTINCT FROM __nusadb_isjson_<n>` sentinel
+/// rewrite. Each form and item type is captured, and two predicates in one statement associate with
+/// their own modes (no positional guessing).
+#[test]
+fn is_json_predicate_parsing() {
+    use ast::JsonItemType as It;
+
+    let filter = |sql: &str| {
+        let ast::Statement::Select(s) = ok(sql) else {
+            panic!("expected Select");
+        };
+        s.filter.expect("expected a WHERE filter")
+    };
+
+    // Bare `IS JSON` = `IS JSON VALUE` (any type), not negated, no uniqueness.
+    assert!(matches!(
+        filter("SELECT * FROM t WHERE x IS JSON"),
+        ast::Expr::IsJson {
+            negated: false,
+            item_type: It::Value,
+            unique_keys: false,
+            ..
+        }
+    ));
+    // Each explicit item type.
+    for (sql, want) in [
+        ("SELECT * FROM t WHERE x IS JSON VALUE", It::Value),
+        ("SELECT * FROM t WHERE x IS JSON SCALAR", It::Scalar),
+        ("SELECT * FROM t WHERE x IS JSON ARRAY", It::Array),
+        ("SELECT * FROM t WHERE x IS JSON OBJECT", It::Object),
+    ] {
+        let ast::Expr::IsJson { item_type, .. } = filter(sql) else {
+            panic!("expected IsJson for `{sql}`");
+        };
+        assert_eq!(item_type, want, "item type for `{sql}`");
+    }
+    // `IS NOT JSON` negates; `WITH`/`WITHOUT UNIQUE KEYS` sets the uniqueness flag.
+    assert!(matches!(
+        filter("SELECT * FROM t WHERE x IS NOT JSON"),
+        ast::Expr::IsJson { negated: true, .. }
+    ));
+    assert!(matches!(
+        filter("SELECT * FROM t WHERE x IS JSON WITH UNIQUE KEYS"),
+        ast::Expr::IsJson {
+            unique_keys: true,
+            item_type: It::Value,
+            ..
+        }
+    ));
+    assert!(matches!(
+        filter("SELECT * FROM t WHERE x IS JSON OBJECT WITHOUT UNIQUE KEYS"),
+        ast::Expr::IsJson {
+            unique_keys: false,
+            item_type: It::Object,
+            ..
+        }
+    ));
+    // `UNIQUE` without the trailing `KEYS` word is still accepted.
+    assert!(matches!(
+        filter("SELECT * FROM t WHERE x IS JSON WITH UNIQUE"),
+        ast::Expr::IsJson {
+            unique_keys: true,
+            ..
+        }
+    ));
+
+    // Two distinct predicates in one statement each keep their own item type — the sentinel
+    // association is by unique name, not by source order.
+    let ast::Expr::Binary {
+        left,
+        op: ast::BinaryOp::And,
+        right,
+    } = filter("SELECT * FROM t WHERE a IS JSON OBJECT AND b IS JSON ARRAY")
+    else {
+        panic!("expected AND of two IsJson predicates");
+    };
+    assert!(matches!(
+        *left,
+        ast::Expr::IsJson {
+            item_type: It::Object,
+            ..
+        }
+    ));
+    assert!(matches!(
+        *right,
+        ast::Expr::IsJson {
+            item_type: It::Array,
+            ..
+        }
+    ));
+
+    // Precedence edge cases — `IS JSON` binds like the other IS-predicates.
+    // `NOT x IS JSON` = `NOT (x IS JSON)`.
+    assert!(matches!(
+        filter("SELECT * FROM t WHERE NOT x IS JSON"),
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } if matches!(*expr, ast::Expr::IsJson { .. })
+    ));
+    // `a = b IS JSON` = `(a = b) IS JSON` — the operand is the whole equality.
+    let ast::Expr::IsJson { operand, .. } = filter("SELECT * FROM t WHERE a = b IS JSON") else {
+        panic!("expected IsJson");
+    };
+    assert!(matches!(
+        *operand,
+        ast::Expr::Binary {
+            op: ast::BinaryOp::Eq,
+            ..
+        }
+    ));
+}
+
+/// A quoted identifier `"json"` or a string literal containing the word `json` is data, never the
+/// `IS JSON` operator — and an ordinary `IS DISTINCT FROM` is not mistaken for the sentinel form.
+#[test]
+fn is_json_does_not_mis_rewrite_json_data() {
+    // A string literal that contains "json" is untouched: a plain equality remains.
+    assert!(matches!(
+        {
+            let ast::Statement::Select(s) = ok("SELECT * FROM t WHERE name = 'is this json?'")
+            else {
+                panic!("expected Select");
+            };
+            s.filter
+        },
+        Some(ast::Expr::Binary {
+            op: ast::BinaryOp::Eq,
+            ..
+        })
+    ));
+    // A quoted `"json"` after `IS DISTINCT FROM` is an ordinary column comparison, not `IS JSON`.
+    assert!(matches!(
+        {
+            let ast::Statement::Select(s) =
+                ok(r#"SELECT * FROM t WHERE a IS DISTINCT FROM "json""#)
+            else {
+                panic!("expected Select");
+            };
+            s.filter
+        },
+        Some(ast::Expr::IsDistinctFrom { negated: false, .. })
+    ));
+
+    // The reserved sentinel prefix in user SQL is rejected loudly rather than risking a collision
+    // with a minted one (checked on the rewrite path, i.e. when an `IS JSON` predicate is present).
+    assert!(matches!(
+        parse("SELECT * FROM t WHERE __nusadb_isjson_1 IS JSON"),
+        Err(Error::Unsupported(_))
+    ));
+
+    // `IS JSON` chained directly before another postfix/ternary operator is rejected with a clear
+    // message (parenthesise instead) — never leaking the internal sentinel as an "unknown column".
+    for sql in [
+        "SELECT * FROM t WHERE x IS JSON IS NULL",
+        "SELECT * FROM t WHERE x IS JSON BETWEEN a AND b",
+    ] {
+        let err = parse(sql).expect_err(sql).to_string();
+        assert!(
+            err.contains("parenthesise") && !err.contains("__nusadb_isjson_"),
+            "chained IS JSON must give a clean paren hint, got: {err}"
+        );
+    }
+    // The parenthesised form parses fine.
+    assert!(matches!(
+        {
+            let ast::Statement::Select(s) = ok("SELECT * FROM t WHERE (x IS JSON) IS NULL") else {
+                panic!("expected Select");
+            };
+            s.filter
+        },
+        Some(ast::Expr::IsNull { .. })
+    ));
+}
+
 #[test]
 fn unary_not_operator() {
     let ast::Statement::Select(s) = ok("SELECT * FROM t WHERE NOT a") else {

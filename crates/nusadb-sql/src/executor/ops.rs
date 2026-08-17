@@ -388,6 +388,7 @@ pub(super) fn resolve_subqueries(
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => resolve_subqueries(inner, engine, txn)?,
         K::InList {
@@ -622,6 +623,7 @@ pub(crate) fn contains_subquery(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => contains_subquery(inner),
         K::InList {
@@ -700,6 +702,7 @@ pub(crate) fn contains_sequence_call(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => contains_sequence_call(inner),
         K::InList {
@@ -804,6 +807,7 @@ pub(super) fn resolve_sequence_calls(
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => resolve_sequence_calls(inner, engine)?,
         K::InList {
@@ -1056,6 +1060,7 @@ fn expr_has_outer_column(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr: inner, .. }
         | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
         | K::IsBool { expr: inner, .. }
         | K::Cast(inner, _) => expr_has_outer_column(inner),
         K::InList {

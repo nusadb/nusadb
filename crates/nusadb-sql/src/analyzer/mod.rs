@@ -1072,6 +1072,7 @@ fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr, .. }
         | K::IsNull { expr, .. }
+        | K::IsJson { operand: expr, .. }
         | K::IsBool { expr, .. }
         | K::Cast(expr, _) => expr_is_ivm_stable(expr),
         K::InList { expr, list, .. } => {

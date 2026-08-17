@@ -2310,6 +2310,7 @@ pub(super) fn rebase_onto_aggregation(
         // forms rebase their lone operand the same way.
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::IsNull { expr, .. }
+        | TypedExprKind::IsJson { operand: expr, .. }
         | TypedExprKind::IsBool { expr, .. }
         | TypedExprKind::Cast(expr, _)
         | TypedExprKind::InSubquery { expr, .. }

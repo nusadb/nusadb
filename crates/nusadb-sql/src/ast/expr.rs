@@ -68,6 +68,25 @@ pub enum Expr {
         /// `true` for the `IS NOT …` form.
         negated: bool,
     },
+    /// `<expr> IS [NOT] JSON [VALUE | SCALAR | ARRAY | OBJECT] [WITH | WITHOUT UNIQUE KEYS]` —
+    /// a JSON validity / shape predicate yielding a **nullable** boolean.
+    ///
+    /// A `NULL` operand yields `NULL` (three-valued: null in, null out; `IS NOT JSON` of a `NULL`
+    /// operand is still `NULL`). Otherwise the operand's text is tested for validity (`IS JSON` /
+    /// `IS JSON VALUE` = valid JSON of any type; `SCALAR`/`ARRAY`/`OBJECT` = valid JSON of that
+    /// specific type); with `unique_keys`, every object's keys must additionally be unique,
+    /// recursively. `negated` flips the non-null result.
+    IsJson {
+        /// Operand whose text is checked for JSON validity / shape (`TEXT` or `JSON`/`JSONB`).
+        operand: Box<Self>,
+        /// `true` for `IS NOT JSON`.
+        negated: bool,
+        /// Which JSON item type is required (`Value` = any type).
+        item_type: JsonItemType,
+        /// `true` for `WITH UNIQUE KEYS` — every object's keys must be unique, recursively
+        /// (`WITHOUT UNIQUE KEYS`, the default, imposes no uniqueness requirement).
+        unique_keys: bool,
+    },
     /// `expr [NOT] IN (list...)` — membership test against a fixed list.
     InList {
         /// Value being tested.
@@ -1648,6 +1667,19 @@ pub enum UnaryOp {
     Negate,
     /// Unary plus, `+` — a no-op on a numeric operand (returns it unchanged), rejected on others.
     Plus,
+}
+
+/// The JSON item type required by an [`Expr::IsJson`] predicate (`<expr> IS JSON <item_type>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonItemType {
+    /// `IS JSON` / `IS JSON VALUE` — valid JSON of any type.
+    Value,
+    /// `IS JSON SCALAR` — a JSON scalar (number, string, boolean, or `null`).
+    Scalar,
+    /// `IS JSON ARRAY` — a JSON array.
+    Array,
+    /// `IS JSON OBJECT` — a JSON object.
+    Object,
 }
 
 /// The truth value tested by an [`Expr::IsBool`] (`IS [NOT] TRUE/FALSE/UNKNOWN`).

@@ -794,6 +794,7 @@ fn sub_expr(expr: &mut ast::Expr, refs: &RowRefs<'_>) -> Result<(), Error> {
         },
         ast::Expr::Unary { expr, .. }
         | ast::Expr::IsNull { expr, .. }
+        | ast::Expr::IsJson { operand: expr, .. }
         | ast::Expr::IsBool { expr, .. }
         | ast::Expr::Cast { expr, .. } => sub_expr(expr, refs),
         ast::Expr::InList { expr, list, .. } => {

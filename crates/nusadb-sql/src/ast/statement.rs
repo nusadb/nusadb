@@ -170,9 +170,10 @@ fn pure_row_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Column(_) => true,
         Expr::Binary { left, right, .. } => pure_row_expr(left) && pure_row_expr(right),
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            pure_row_expr(expr)
-        },
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::IsJson { operand: expr, .. }
+        | Expr::Cast { expr, .. } => pure_row_expr(expr),
         Expr::Between {
             expr, low, high, ..
         } => pure_row_expr(expr) && pure_row_expr(low) && pure_row_expr(high),

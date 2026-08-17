@@ -152,6 +152,17 @@ fn fold_children(kind: TypedExprKind) -> TypedExprKind {
             expr: fold_box(expr),
             negated,
         },
+        K::IsJson {
+            operand,
+            negated,
+            item_type,
+            unique_keys,
+        } => K::IsJson {
+            operand: fold_box(operand),
+            negated,
+            item_type,
+            unique_keys,
+        },
         K::IsDistinctFrom {
             left,
             right,
@@ -348,6 +359,7 @@ fn is_foldable_constant(expr: &TypedExpr) -> bool {
         },
         K::Unary { expr, .. }
         | K::IsNull { expr, .. }
+        | K::IsJson { operand: expr, .. }
         | K::IsBool { expr, .. }
         | K::Cast(expr, _) => is_foldable_constant(expr),
         K::InList { expr, list, .. } => {

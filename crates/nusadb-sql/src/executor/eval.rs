@@ -74,6 +74,27 @@ fn outer_column(level: usize, ordinal: usize) -> ast::Value {
     })
 }
 
+/// Whether `text` satisfies an `IS JSON [item_type] [WITH UNIQUE KEYS]` check (the non-null,
+/// pre-negation result). Invalid JSON fails every form.
+fn json_predicate_holds(text: &str, item_type: ast::JsonItemType, unique_keys: bool) -> bool {
+    use ast::JsonItemType as It;
+    // Validity first; `type_name` is `None` exactly when `text` is not valid JSON.
+    let Some(kind) = crate::json::type_name(text) else {
+        return false;
+    };
+    let type_ok = match item_type {
+        It::Value => true,
+        It::Object => kind == "object",
+        It::Array => kind == "array",
+        // A JSON scalar is a number, string, boolean, or null — anything that is not an object or
+        // array.
+        It::Scalar => matches!(kind, "null" | "boolean" | "number" | "string"),
+    };
+    // `WITH UNIQUE KEYS` additionally requires every object's keys to be unique, recursively; a
+    // non-object document is trivially unique.
+    type_ok && (!unique_keys || crate::json::has_unique_keys_recursive(text) == Some(true))
+}
+
 /// Evaluate `expr` against `row`. The row must have one entry per column of
 /// the operator's source schema; the expression's `Column(i)` nodes index
 /// directly into it.
@@ -110,6 +131,27 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
             let v = eval(inner, row)?;
             let is_null = matches!(v, ast::Value::Null);
             Ok(ast::Value::Bool(if *negated { !is_null } else { is_null }))
+        },
+        TypedExprKind::IsJson {
+            operand,
+            negated,
+            item_type,
+            unique_keys,
+        } => {
+            let v = eval(operand, row)?;
+            // Three-valued: a NULL operand yields NULL — and `IS NOT JSON` of a NULL operand is
+            // still NULL (the negation of NULL is NULL).
+            if matches!(v, ast::Value::Null) {
+                return Ok(ast::Value::Null);
+            }
+            let text = match &v {
+                ast::Value::Text(s) | ast::Value::Json(s) => s.clone(),
+                // The analyzer restricts the operand to TEXT/JSON, so this is unreachable in
+                // practice; fall back to the value's text form rather than mis-report.
+                other => crate::display::value_text(other),
+            };
+            let holds = json_predicate_holds(&text, *item_type, *unique_keys);
+            Ok(ast::Value::Bool(holds ^ *negated))
         },
         TypedExprKind::IsDistinctFrom {
             left,

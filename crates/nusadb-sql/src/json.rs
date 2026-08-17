@@ -725,6 +725,175 @@ fn resolve_index(index: i64, len: usize) -> Option<usize> {
     }
 }
 
+/// Whether every JSON object in `text` has unique keys, checked **recursively** at every nesting
+/// depth (the `WITH UNIQUE KEYS` check of the `IS JSON` predicate).
+///
+/// `Some(true)` when no object anywhere has a duplicate key, `Some(false)` when at least one does,
+/// and `None` when `text` is not valid JSON. A non-object (array/scalar) is trivially unique.
+///
+/// `serde_json`'s object model is a map that COLLAPSES duplicate keys on the way in, so
+/// [`parse`]/[`canonicalize`] cannot see them — this walks the **raw** text instead, tracking each
+/// object's keys as it goes. It is intentionally permissive on scalar syntax (numbers, literals,
+/// string escapes): validity is established separately by [`parse`], and this scanner only needs to
+/// locate object boundaries and their keys.
+#[must_use]
+pub(crate) fn has_unique_keys_recursive(text: &str) -> Option<bool> {
+    let mut scanner = RawScanner {
+        bytes: text.as_bytes(),
+        pos: 0,
+    };
+    scanner.skip_ws();
+    let unique = scanner.scan_value()?;
+    scanner.skip_ws();
+    // Trailing non-whitespace means the text is not a single JSON value.
+    if scanner.pos != scanner.bytes.len() {
+        return None;
+    }
+    Some(unique)
+}
+
+/// A minimal cursor over raw JSON bytes for [`has_unique_keys_recursive`]. Structural characters
+/// (`{}[]":,`) are ASCII, and UTF-8 continuation bytes never collide with them, so byte scanning is
+/// safe for multi-byte string contents.
+struct RawScanner<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl RawScanner<'_> {
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Scan one JSON value, returning whether it (and every nested object) has unique keys, or
+    /// `None` on any structural parse error.
+    fn scan_value(&mut self) -> Option<bool> {
+        self.skip_ws();
+        match self.bytes.get(self.pos)? {
+            b'{' => self.scan_object(),
+            b'[' => self.scan_array(),
+            b'"' => self.scan_string().map(|()| true),
+            // Scalars (numbers, `true`/`false`/`null`) carry no keys; consume the run of characters
+            // that can form one. Fine-grained validity is `parse`'s job, not this scanner's.
+            _ => {
+                let start = self.pos;
+                while let Some(&b) = self.bytes.get(self.pos) {
+                    if matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                (self.pos > start).then_some(true)
+            },
+        }
+    }
+
+    /// Scan an object (cursor on the opening `{`), returning whether it and its children have unique
+    /// keys. A duplicate key anywhere makes the whole subtree non-unique, but scanning continues so
+    /// the full document is still validated structurally.
+    fn scan_object(&mut self) -> Option<bool> {
+        self.pos += 1; // consume `{`
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b'}') {
+            self.pos += 1;
+            return Some(true);
+        }
+        let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unique = true;
+        loop {
+            self.skip_ws();
+            if self.bytes.get(self.pos) != Some(&b'"') {
+                return None;
+            }
+            let key = self.take_string()?;
+            if !keys.insert(key) {
+                unique = false;
+            }
+            self.skip_ws();
+            if self.bytes.get(self.pos) != Some(&b':') {
+                return None;
+            }
+            self.pos += 1; // consume `:`
+            unique &= self.scan_value()?;
+            self.skip_ws();
+            match self.bytes.get(self.pos) {
+                Some(&b',') => {
+                    self.pos += 1;
+                },
+                Some(&b'}') => {
+                    self.pos += 1;
+                    return Some(unique);
+                },
+                _ => return None,
+            }
+        }
+    }
+
+    /// Scan an array (cursor on the opening `[`), returning whether every element subtree is unique.
+    fn scan_array(&mut self) -> Option<bool> {
+        self.pos += 1; // consume `[`
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b']') {
+            self.pos += 1;
+            return Some(true);
+        }
+        let mut unique = true;
+        loop {
+            unique &= self.scan_value()?;
+            self.skip_ws();
+            match self.bytes.get(self.pos) {
+                Some(&b',') => {
+                    self.pos += 1;
+                },
+                Some(&b']') => {
+                    self.pos += 1;
+                    return Some(unique);
+                },
+                _ => return None,
+            }
+        }
+    }
+
+    /// Consume a string (cursor on the opening `"`), discarding the value.
+    fn scan_string(&mut self) -> Option<()> {
+        self.take_string().map(|_| ())
+    }
+
+    /// Consume a string (cursor on the opening `"`) and return its decoded-enough key text. Only the
+    /// two escapes that matter for delimiting — `\"` and `\\` — are unescaped; other escapes are kept
+    /// verbatim, which is enough to compare object keys for equality (any two source keys that are
+    /// byte-identical stay equal, and distinct ones stay distinct).
+    fn take_string(&mut self) -> Option<String> {
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return None;
+        }
+        self.pos += 1; // consume opening `"`
+        let start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            match b {
+                b'\\' => {
+                    // Skip the escape introducer and the escaped byte (so a `\"` does not end the
+                    // string and a `\\` is consumed as a pair).
+                    self.pos += 2;
+                },
+                b'"' => {
+                    let raw = self.bytes.get(start..self.pos)?;
+                    self.pos += 1; // consume closing `"`
+                    return Some(String::from_utf8_lossy(raw).into_owned());
+                },
+                _ => self.pos += 1,
+            }
+        }
+        None // unterminated string
+    }
+}
+
 /// Recursive JSONB containment (`@>`): objects must match key-by-key, arrays must have every
 /// right element contained in some left element, scalars must be equal.
 fn value_contains(a: &J, b: &J) -> bool {
@@ -1002,6 +1171,42 @@ mod tests {
         assert!(each("1").is_none());
         assert!(each("oops").is_none());
         assert!(each_text("[1,2]").is_none());
+    }
+
+    #[test]
+    fn has_unique_keys_recursive_detects_duplicates_at_every_depth() {
+        // No duplicates anywhere → unique.
+        assert_eq!(has_unique_keys_recursive(r#"{"a":1,"b":2}"#), Some(true));
+        // A top-level duplicate key.
+        assert_eq!(has_unique_keys_recursive(r#"{"a":1,"a":2}"#), Some(false));
+        // A duplicate NESTED inside a value object — the check is recursive.
+        assert_eq!(
+            has_unique_keys_recursive(r#"{"a":{"b":1,"b":2}}"#),
+            Some(false)
+        );
+        // A duplicate inside an object that is an array element.
+        assert_eq!(
+            has_unique_keys_recursive(r#"[{"a":1},{"c":1,"c":2}]"#),
+            Some(false)
+        );
+        // A non-object (array / scalar) is trivially unique.
+        assert_eq!(has_unique_keys_recursive("[1,2]"), Some(true));
+        assert_eq!(has_unique_keys_recursive("5"), Some(true));
+        assert_eq!(has_unique_keys_recursive(r#""s""#), Some(true));
+        // Duplicate keys collapse under serde parsing, so a canonical form cannot be used here —
+        // but the raw scanner still sees them.
+        assert!(canonicalize(r#"{"a":1,"a":2}"#).is_some());
+        // Keys that merely share a prefix are distinct.
+        assert_eq!(has_unique_keys_recursive(r#"{"a":1,"ab":2}"#), Some(true));
+        // A key containing an escaped quote does not end the key early or false-match.
+        assert_eq!(
+            has_unique_keys_recursive(r#"{"a\"b":1,"a\"b":2}"#),
+            Some(false)
+        );
+        // Invalid JSON → None (the "not a document" signal).
+        assert_eq!(has_unique_keys_recursive("not json"), None);
+        assert_eq!(has_unique_keys_recursive(r#"{"a":1,}"#), None);
+        assert_eq!(has_unique_keys_recursive("{"), None);
     }
 
     #[test]

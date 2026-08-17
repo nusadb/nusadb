@@ -143,6 +143,37 @@ pub(super) fn analyze_expr_agg(
                 ty: ColumnType::Bool,
             })
         },
+        ast::Expr::IsJson {
+            operand,
+            negated,
+            item_type,
+            unique_keys,
+        } => {
+            // The predicate validates the operand's *text*, so the operand must be textual or
+            // JSON/JSONB (a bare string literal is fine — a `NULL` literal defaults to `TEXT`). The
+            // result is a nullable `BOOLEAN` (a `NULL` operand yields `NULL` at evaluation).
+            let operand =
+                analyze_expr_agg(operand, scope, catalog, Some(ColumnType::Text), aggregates)?;
+            match operand.ty.physical() {
+                ColumnType::Text | ColumnType::Json => {},
+                other => {
+                    return Err(Error::TypeMismatch {
+                        context: "IS JSON".to_owned(),
+                        expected: ColumnType::Text,
+                        found: other,
+                    });
+                },
+            }
+            Ok(TypedExpr {
+                kind: TypedExprKind::IsJson {
+                    operand: Box::new(operand),
+                    negated: *negated,
+                    item_type: *item_type,
+                    unique_keys: *unique_keys,
+                },
+                ty: ColumnType::Bool,
+            })
+        },
         ast::Expr::IsDistinctFrom {
             left,
             right,

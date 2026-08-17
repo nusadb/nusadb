@@ -22,6 +22,19 @@ thread_local! {
     static EXCLUDE_WINDOWS: std::cell::RefCell<
         std::collections::HashMap<String, (sql::WindowSpec, ast::WindowExclude)>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// `IS JSON` predicate modes minted by the `strip_is_json` preprocessor. sqlparser (0.62,
+    /// the latest mainline) cannot parse the postfix `IS JSON` operator, so the preprocessor
+    /// rewrites each `<expr> IS [NOT] JSON [type] [uniq]` into
+    /// `<expr> IS DISTINCT FROM __nusadb_isjson_<n>` — an IS-predicate of the SAME precedence, so
+    /// sqlparser binds the identical left operand — and records `<sentinel> -> (negated, item_type,
+    /// unique_keys)` here. Keyed by the unique per-occurrence sentinel, this associates each captured
+    /// mode with the exact predicate sqlparser produces, even when one statement carries several
+    /// `IS JSON` predicates. Populated per statement by [`super::install_is_json`] and consumed
+    /// (removed) in [`convert_is_distinct`].
+    static IS_JSON_MODES: std::cell::RefCell<
+        std::collections::HashMap<String, (bool, ast::JsonItemType, bool)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Replace the exclude-window map with `windows`, returning the previous contents (so the caller
@@ -31,6 +44,14 @@ pub(super) fn install_exclude_windows(
     windows: std::collections::HashMap<String, (sql::WindowSpec, ast::WindowExclude)>,
 ) {
     EXCLUDE_WINDOWS.with(|c| *c.borrow_mut() = windows);
+}
+
+/// Seed the `IS JSON` predicate-mode map for the statement about to be converted (clearing any
+/// leftover from a prior statement). Consumed per sentinel in [`convert_is_distinct`].
+pub(super) fn install_is_json(
+    modes: std::collections::HashMap<String, (bool, ast::JsonItemType, bool)>,
+) {
+    IS_JSON_MODES.with(|c| *c.borrow_mut() = modes);
 }
 
 /// Install `windows` as the current named-window scope for the lifetime of the returned guard,
@@ -151,6 +172,19 @@ pub(super) const fn interval_field_unit(field: &sql::DateTimeField) -> &'static 
 )]
 pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
     match expr {
+        // A surviving `IS JSON` sentinel reaching here means the predicate was chained directly
+        // before another postfix/ternary operator (`x IS JSON IS NULL`, `x IS JSON BETWEEN a AND b`)
+        // whose node shape the spine re-association does not descend through, so the synthetic name
+        // leaked. Reject it clearly — never surface the internal name as an "unknown column" — and
+        // point at the parenthesised form, which parses fine: `(x IS JSON) IS NULL`.
+        sql::Expr::Identifier(ident)
+            if ident.quote_style.is_none() && ident.value.starts_with(super::IS_JSON_PREFIX) =>
+        {
+            unsupported(
+                "IS JSON written directly before another operator (IS/BETWEEN/IN/LIKE …) is not \
+                 supported; parenthesise it, e.g. `(x IS JSON) IS NULL`",
+            )
+        },
         sql::Expr::Identifier(ident) => Ok(ast::Expr::Column(fold_ident(&ident))),
         sql::Expr::Value(sql::ValueWithSpan {
             value: sql::Value::Placeholder(p),
@@ -1835,16 +1869,78 @@ pub(super) fn convert_number(n: &str) -> Result<ast::Value, Error> {
 }
 
 /// Build an [`ast::Expr::IsDistinctFrom`] from a sqlparser `IS [NOT] DISTINCT FROM`.
+///
+/// The `strip_is_json` preprocessor rewrites each postfix `<expr> IS JSON ...` (which sqlparser
+/// cannot parse) into `<expr> IS DISTINCT FROM __nusadb_isjson_<n>`. sqlparser binds the identical
+/// **left** operand (an IS-predicate has the same precedence as `IS JSON`), but it parses the
+/// **right** operand of `IS DISTINCT FROM` with *full* precedence, so any infix operator that
+/// follows the predicate is swallowed into that right operand — `x IS JSON AND y` arrives as
+/// `x IS DISTINCT FROM (__nusadb_isjson_1 AND y)`. The sentinel is therefore always the leftmost
+/// leaf of the right subtree; when it is present, splice the [`ast::Expr::IsJson`] over the
+/// (untouched) left operand in the sentinel's place and re-associate the rest of the subtree —
+/// recovering `(x IS JSON) AND y`. Any other `IS DISTINCT FROM` is converted normally.
 pub(super) fn convert_is_distinct(
     left: sql::Expr,
     right: sql::Expr,
     negated: bool,
 ) -> Result<ast::Expr, Error> {
+    // `IS NOT DISTINCT FROM <sentinel>` never occurs — the preprocessor only ever emits the plain
+    // `IS DISTINCT FROM` form — so a sentinel only needs recognising on the non-negated path.
+    if !negated && spine_bottoms_at_is_json_sentinel(&right) {
+        let operand = Box::new(convert_expr(left)?);
+        return build_is_json_spine(right, operand);
+    }
     Ok(ast::Expr::IsDistinctFrom {
         left: Box::new(convert_expr(left)?),
         right: Box::new(convert_expr(right)?),
         negated,
     })
+}
+
+/// Whether the left spine of `expr` (descending through binary operators) bottoms out at an
+/// unquoted `IS JSON` sentinel identifier — the signal that `expr` is the greedily-parsed right
+/// operand of a rewritten `IS JSON` predicate rather than a genuine `IS DISTINCT FROM` operand.
+fn spine_bottoms_at_is_json_sentinel(expr: &sql::Expr) -> bool {
+    let mut cur = expr;
+    loop {
+        match cur {
+            sql::Expr::Identifier(ident) => {
+                return ident.quote_style.is_none()
+                    && IS_JSON_MODES.with(|c| c.borrow().contains_key(&ident.value));
+            },
+            sql::Expr::BinaryOp { left, .. } => cur = left,
+            _ => return false,
+        }
+    }
+}
+
+/// Rebuild the greedily-parsed right operand `expr`, replacing its leftmost-leaf `IS JSON` sentinel
+/// with the [`ast::Expr::IsJson`] predicate over `operand` and re-associating the binary spine above
+/// it. Only reached after [`spine_bottoms_at_is_json_sentinel`] confirms a sentinel is present.
+fn build_is_json_spine(expr: sql::Expr, operand: Box<ast::Expr>) -> Result<ast::Expr, Error> {
+    match expr {
+        sql::Expr::Identifier(ident) if ident.quote_style.is_none() => {
+            match IS_JSON_MODES.with(|c| c.borrow_mut().remove(&ident.value)) {
+                Some((negated, item_type, unique_keys)) => Ok(ast::Expr::IsJson {
+                    operand,
+                    negated,
+                    item_type,
+                    unique_keys,
+                }),
+                // Unreachable: the spine check just confirmed this identifier is a live sentinel.
+                None => unsupported("internal: IS JSON sentinel vanished before conversion"),
+            }
+        },
+        sql::Expr::BinaryOp { left, op, right } => Ok(ast::Expr::Binary {
+            left: Box::new(build_is_json_spine(*left, operand)?),
+            op: convert_binary_op(op)?,
+            right: Box::new(convert_expr(*right)?),
+        }),
+        // Unreachable given the spine check, which only descends through binary operators.
+        other => unsupported(&format!(
+            "unexpected expression after IS JSON predicate: `{other}`"
+        )),
+    }
 }
 
 /// Build an [`ast::Expr::IsBool`] from a sqlparser `IS [NOT] {TRUE|FALSE|UNKNOWN}`.

@@ -166,6 +166,7 @@ fn extract_windows(
         },
         E::Unary { expr: inner, .. }
         | E::IsNull { expr: inner, .. }
+        | E::IsJson { operand: inner, .. }
         | E::IsBool { expr: inner, .. }
         | E::Cast { expr: inner, .. } => rec(inner, aggregates.as_deref_mut())?,
         E::InList {
