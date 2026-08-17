@@ -661,6 +661,11 @@ fn slt_p9_window_frames_and_value_functions() {
 }
 
 #[test]
+fn slt_p9_window_exclude() {
+    run_slt("tests/slt/p9_window/window_exclude.slt");
+}
+
+#[test]
 fn slt_p11_materialized_view() {
     run_slt("tests/slt/p11_views/materialized.slt");
 }

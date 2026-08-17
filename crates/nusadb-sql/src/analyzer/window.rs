@@ -461,6 +461,9 @@ fn resolve_frame(f: &ast::WindowFrame, order: &[OrderByKey]) -> Result<WindowFra
         end,
         peer_based,
         range_descending,
+        // `EXCLUDE` is orthogonal to the bound resolution: it drops rows from the frame the bounds
+        // select, so it is carried through verbatim for the executor to apply.
+        exclude: f.exclude,
     })
 }
 

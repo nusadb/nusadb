@@ -2080,6 +2080,10 @@ pub struct WindowFrame {
     /// then reverses the value-boundary direction (preceding rows have larger keys) and the scan
     /// comparison. `false` for `ASC` / non-`RANGE`-value frames.
     pub range_descending: bool,
+    /// `EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS}` — rows dropped from the frame *after* the
+    /// bounds select it. Peers are rows sharing the current row's `ORDER BY` value (with no
+    /// `ORDER BY`, all partition rows are mutual peers). Defaults to `NoOthers` (no exclusion).
+    pub exclude: ast::WindowExclude,
 }
 
 /// One bound of a [`WindowFrame`]. A `ROWS`/`GROUPS` offset is a non-negative count (rows or peer

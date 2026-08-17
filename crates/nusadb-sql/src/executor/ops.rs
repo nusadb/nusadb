@@ -4126,6 +4126,27 @@ fn frame_bounds(
     }
 }
 
+/// Whether ordered-partition position `p` is removed from the current row `k`'s frame by its
+/// `EXCLUDE` mode, given `k`'s peer group `[peer_lo, peer_hi]` (equal `ORDER BY` keys):
+/// - `CURRENT ROW` drops `p == k`;
+/// - `GROUP` drops the whole peer group (`peer_lo..=peer_hi`);
+/// - `TIES` drops the peer group except the current row itself;
+/// - `NO OTHERS` drops nothing.
+const fn frame_excludes(
+    exclude: ast::WindowExclude,
+    p: usize,
+    k: usize,
+    peer_lo: usize,
+    peer_hi: usize,
+) -> bool {
+    match exclude {
+        ast::WindowExclude::NoOthers => false,
+        ast::WindowExclude::CurrentRow => p == k,
+        ast::WindowExclude::Group => peer_lo <= p && p <= peer_hi,
+        ast::WindowExclude::Ties => peer_lo <= p && p <= peer_hi && p != k,
+    }
+}
+
 /// Assign an aggregate window's values over one ordered partition. With an explicit frame
 /// each row folds over its frame (physical for `ROWS`, peer-aware for `RANGE`/`GROUPS`); otherwise
 /// the default frame applies — the whole partition when unordered, or running through each peer
@@ -4154,7 +4175,11 @@ pub(super) fn assign_window_aggregate(
     // (`RANGE`/`GROUPS`, or ARRAY_AGG/STDDEV/float-SUM/…) falls back to the per-row re-fold below.
     if let Some(frame) = &window.frame {
         let len = ordered.len();
-        if !frame.peer_based {
+        // The O(n) sliding accumulator assumes a single contiguous, monotonically-advancing frame.
+        // A frame `EXCLUDE` can punch a hole in the middle (drop the current row / its peers), so it
+        // is handled only by the per-row re-fold below.
+        let no_exclude = matches!(frame.exclude, ast::WindowExclude::NoOthers);
+        if !frame.peer_based && no_exclude {
             let handled = super::agg::sliding_window_aggregate(
                 call,
                 len,
@@ -4177,13 +4202,22 @@ pub(super) fn assign_window_aggregate(
         }
         for k in 0..len {
             // Fallback — collect frame-row *references* (pointers, not row clones) and re-fold.
+            // `EXCLUDE` drops the current row (`CURRENT ROW`), its peer group (`GROUP`), or its
+            // peers-but-not-itself (`TIES`) from the `[lo, hi]` range the bounds selected. Peers are
+            // the `ORDER BY`-equal rows around `k` (the whole partition when there is no `ORDER BY`).
             let frame_rows: Vec<&Row> = match frame_bounds(frame, k, ordered) {
-                Some((lo, hi)) => ordered
-                    .get(lo..=hi)
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|(_, i)| rows.get(*i))
-                    .collect(),
+                Some((lo, hi)) => {
+                    let (peer_lo, peer_hi) = match frame.exclude {
+                        ast::WindowExclude::Group | ast::WindowExclude::Ties => {
+                            peer_group(ordered, k)
+                        },
+                        ast::WindowExclude::NoOthers | ast::WindowExclude::CurrentRow => (k, k),
+                    };
+                    (lo..=hi)
+                        .filter(|&p| !frame_excludes(frame.exclude, p, k, peer_lo, peer_hi))
+                        .filter_map(|p| ordered.get(p).and_then(|(_, i)| rows.get(*i)))
+                        .collect()
+                },
                 None => Vec::new(),
             };
             let value = fold_one(call, frame_rows.iter().copied())?;

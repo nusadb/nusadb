@@ -12,6 +12,25 @@ thread_local! {
     /// subquery's WINDOW clause never leaks into an enclosing one.
     static NAMED_WINDOWS: std::cell::RefCell<std::collections::HashMap<String, sql::WindowSpec>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Synthetic named windows minted by the window-exclude preprocessor. sqlparser does not
+    /// parse a frame `EXCLUDE` clause, so the preprocessor rewrites each `OVER ( spec EXCLUDE mode )`
+    /// into `OVER __nusadb_excl_win_<n>` and records `<name> -> (spec, mode)` here. Keyed by the
+    /// unique synthetic name, this associates the captured exclusion with the exact window function
+    /// call sqlparser produces — no positional or source-order guessing. Populated per statement by
+    /// [`super::install_exclude_windows`] and consumed (removed) in [`convert_window_function`].
+    static EXCLUDE_WINDOWS: std::cell::RefCell<
+        std::collections::HashMap<String, (sql::WindowSpec, ast::WindowExclude)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Replace the exclude-window map with `windows`, returning the previous contents (so the caller
+/// can restore or clear). Used by the parser preprocessor to seed the synthetic named windows for
+/// the statement about to be converted.
+pub(super) fn install_exclude_windows(
+    windows: std::collections::HashMap<String, (sql::WindowSpec, ast::WindowExclude)>,
+) {
+    EXCLUDE_WINDOWS.with(|c| *c.borrow_mut() = windows);
 }
 
 /// Install `windows` as the current named-window scope for the lifetime of the returned guard,
@@ -739,19 +758,10 @@ pub(super) fn convert_window_function(function: sql::Function) -> Result<ast::Ex
     if !matches!(function.parameters, sql::FunctionArguments::None) {
         return unsupported("parameterized aggregate in window function");
     }
-    let spec = match function.over {
-        Some(sql::WindowType::WindowSpec(s)) => s,
-        // `OVER w` — resolve `w` to a `WINDOW w AS (...)` definition of the enclosing SELECT.
-        Some(sql::WindowType::NamedWindow(name)) => {
-            let key = fold_ident(&name);
-            NAMED_WINDOWS
-                .with(|c| c.borrow().get(&key).cloned())
-                .ok_or_else(|| {
-                    Error::Unsupported(format!("window `{key}` is not defined in a WINDOW clause"))
-                })?
-        },
-        None => unreachable!("convert_window_function called without OVER clause"),
-    };
+    // The window spec, plus a frame `EXCLUDE` mode captured by the preprocessor (re-attached to the
+    // frame below). `exclude_mode` is `None` when this window had no `EXCLUDE`; `Some(mode)` demands
+    // a frame (rejected loudly if absent).
+    let (spec, exclude_mode) = resolve_over_spec(function.over)?;
     // window_frame is handled below; no early rejection here.
     if spec.window_name.is_some() {
         return unsupported("named window base in OVER clause is not yet supported");
@@ -814,7 +824,10 @@ pub(super) fn convert_window_function(function: sql::Function) -> Result<ast::Ex
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let frame = spec.window_frame.map(convert_window_frame).transpose()?;
+    let mut frame = spec.window_frame.map(convert_window_frame).transpose()?;
+    if let Some(mode) = exclude_mode {
+        attach_frame_exclude(frame.as_mut(), mode, &func)?;
+    }
     // `FILTER (WHERE pred)` restricts what the aggregate reads. The ranking, navigation and
     // distribution functions aggregate nothing, so a filter on one of them has no meaning to give
     // — reject rather than accept-and-ignore, which would answer a question nobody asked.
@@ -837,6 +850,34 @@ pub(super) fn convert_window_function(function: sql::Function) -> Result<ast::Ex
     })))
 }
 
+/// Resolve an `OVER (...)` / `OVER w` clause to its window spec plus any captured frame `EXCLUDE`
+/// mode. A synthetic `__nusadb_excl_win_<n>` reference minted by the parser's window-exclude
+/// preprocessor resolves to the stored spec and carries the exclusion mode; an ordinary named
+/// window resolves against the enclosing SELECT's `WINDOW` clause; an inline spec carries no mode.
+fn resolve_over_spec(
+    over: Option<sql::WindowType>,
+) -> Result<(sql::WindowSpec, Option<ast::WindowExclude>), Error> {
+    match over {
+        Some(sql::WindowType::WindowSpec(s)) => Ok((s, None)),
+        Some(sql::WindowType::NamedWindow(name)) => {
+            let key = fold_ident(&name);
+            if let Some((spec, mode)) = EXCLUDE_WINDOWS.with(|c| c.borrow_mut().remove(&key)) {
+                Ok((spec, Some(mode)))
+            } else {
+                let spec = NAMED_WINDOWS
+                    .with(|c| c.borrow().get(&key).cloned())
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "window `{key}` is not defined in a WINDOW clause"
+                        ))
+                    })?;
+                Ok((spec, None))
+            }
+        },
+        None => unreachable!("convert_window_function called without OVER clause"),
+    }
+}
+
 /// Convert a sqlparser [`sql::WindowFrame`] into an [`ast::WindowFrame`].
 pub(super) fn convert_window_frame(f: sql::WindowFrame) -> Result<ast::WindowFrame, Error> {
     let units = match f.units {
@@ -846,7 +887,38 @@ pub(super) fn convert_window_frame(f: sql::WindowFrame) -> Result<ast::WindowFra
     };
     let start = convert_window_frame_bound(f.start_bound)?;
     let end = f.end_bound.map(convert_window_frame_bound).transpose()?;
-    Ok(ast::WindowFrame { units, start, end })
+    // `EXCLUDE` is not modelled by sqlparser; it is stripped and captured by the parser's
+    // window-exclude preprocessor and re-attached in `convert_window_function`. Default here.
+    Ok(ast::WindowFrame {
+        units,
+        start,
+        end,
+        exclude: ast::WindowExclude::NoOthers,
+    })
+}
+
+/// Attach a frame `EXCLUDE` mode (captured by the parser's window-exclude preprocessor) to `frame`.
+///
+/// `EXCLUDE` requires a frame clause (the reference engine treats `OVER (... EXCLUDE ...)` without a
+/// frame as a syntax error), so a captured mode with no frame is rejected loudly rather than
+/// silently dropped (which would compute the wrong aggregate). A real exclusion (anything but
+/// `NO OTHERS`) only has a defined meaning for a frame-reading aggregate — the ranking / navigation
+/// / distribution functions are rejected rather than silently ignoring the clause.
+fn attach_frame_exclude(
+    frame: Option<&mut ast::WindowFrame>,
+    mode: ast::WindowExclude,
+    func: &ast::WindowFunc,
+) -> Result<(), Error> {
+    if mode != ast::WindowExclude::NoOthers && !matches!(func, ast::WindowFunc::Aggregate(_)) {
+        return unsupported("EXCLUDE on a non-aggregate window function");
+    }
+    match frame {
+        Some(f) => {
+            f.exclude = mode;
+            Ok(())
+        },
+        None => unsupported("EXCLUDE requires a window frame clause (ROWS/RANGE/GROUPS ...)"),
+    }
 }
 
 /// Convert a single window-frame boundary.

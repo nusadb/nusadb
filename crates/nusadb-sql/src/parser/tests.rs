@@ -1798,6 +1798,86 @@ fn window_frame_is_rejected() {
     assert_eq!(frame.end, Some(ast::WindowFrameBound::CurrentRow));
 }
 
+// --- Window frame EXCLUDE ------------------------------------
+
+#[test]
+fn window_frame_exclude_modes_parse() {
+    // sqlparser cannot parse the frame EXCLUDE clause; the preprocessor strips it and threads the
+    // mode onto the frame. Each mode lands on the frame of the right window function.
+    for (clause, expected) in [
+        ("EXCLUDE NO OTHERS", ast::WindowExclude::NoOthers),
+        ("EXCLUDE CURRENT ROW", ast::WindowExclude::CurrentRow),
+        ("EXCLUDE GROUP", ast::WindowExclude::Group),
+        ("EXCLUDE TIES", ast::WindowExclude::Ties),
+    ] {
+        let sql = format!(
+            "SELECT SUM(v) OVER (PARTITION BY g ORDER BY v \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING {clause}) FROM t"
+        );
+        let wf = get_window(&sql);
+        let frame = wf.frame.expect("frame");
+        assert_eq!(frame.exclude, expected, "clause: {clause}");
+        // The spec (partition/order/frame) still round-trips intact through the rewrite.
+        assert_eq!(wf.partition.len(), 1);
+        assert_eq!(wf.order.len(), 1);
+        assert_eq!(frame.units, ast::WindowFrameUnits::Rows);
+    }
+}
+
+#[test]
+fn window_frame_no_exclude_defaults_to_no_others() {
+    let wf = get_window(
+        "SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+    );
+    let frame = wf.frame.expect("frame");
+    assert_eq!(frame.exclude, ast::WindowExclude::NoOthers);
+}
+
+#[test]
+fn window_frame_exclude_associates_each_of_two_windows() {
+    // Two window functions in one statement, each with a DIFFERENT EXCLUDE. The unique synthetic
+    // name minted per window guarantees each mode reaches its own function (no positional guessing).
+    let ast::Statement::Select(select) = ok(
+        "SELECT SUM(a) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
+         EXCLUDE GROUP), \
+         SUM(b) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
+         EXCLUDE TIES) FROM t",
+    ) else {
+        panic!("expected Select");
+    };
+    let exclude_of = |item: &ast::SelectItem| -> ast::WindowExclude {
+        let ast::SelectItem::Expr { expr, .. } = item else {
+            panic!("expected Expr projection");
+        };
+        let ast::Expr::WindowFunction(wf) = expr else {
+            panic!("expected WindowFunction");
+        };
+        wf.frame.as_ref().expect("frame").exclude
+    };
+    assert_eq!(exclude_of(&select.projection[0]), ast::WindowExclude::Group);
+    assert_eq!(exclude_of(&select.projection[1]), ast::WindowExclude::Ties);
+}
+
+#[test]
+fn window_frame_exclude_without_frame_is_rejected() {
+    // EXCLUDE requires a frame clause; without one it is rejected, never silently dropped.
+    let err = parse("SELECT SUM(v) OVER (PARTITION BY g EXCLUDE TIES) FROM t")
+        .expect_err("EXCLUDE without a frame must be rejected");
+    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
+#[test]
+fn window_frame_exclude_on_non_aggregate_is_rejected() {
+    // A real exclusion on a ranking/navigation function has no defined meaning; reject it rather
+    // than silently ignore the clause.
+    let err = parse(
+        "SELECT ROW_NUMBER() OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+         EXCLUDE TIES) FROM t",
+    )
+    .expect_err("EXCLUDE on a non-aggregate must be rejected");
+    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
 // --- Window frame bounds -------------------------------------
 
 #[test]

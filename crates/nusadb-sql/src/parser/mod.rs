@@ -499,6 +499,11 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
         .tokenize_with_location()
         .map_err(|e| Error::Syntax(e.to_string()))?;
     strip_cte_materialized_hint(&mut tokens);
+    // `OVER ( ... EXCLUDE {CURRENT ROW|GROUP|TIES|NO OTHERS} )`: sqlparser does not parse the frame
+    // `EXCLUDE` clause (its `WindowFrame` records no exclusion), so strip it here, capture the mode,
+    // and rewrite the inline window into a uniquely-named synthetic window that carries the mode
+    // through to conversion. See `strip_window_exclude`.
+    strip_window_exclude(&mut tokens)?;
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -559,6 +564,204 @@ fn strip_cte_materialized_hint(tokens: &mut Vec<TokenWithSpan>) {
             }
         }
         i += 1;
+    }
+}
+
+/// The reserved identifier prefix for the synthetic named windows the exclude preprocessor mints.
+const EXCLUDE_WINDOW_PREFIX: &str = "__nusadb_excl_win_";
+
+/// A window-frame `EXCLUDE` mode captured from the token stream, plus the token index of the
+/// `EXCLUDE` keyword (so the clean spec is the frame text before it).
+struct DetectedExclude {
+    mode: ast::WindowExclude,
+    exclude_idx: usize,
+}
+
+/// `true` when `t` is an **unquoted** word equal to `s` (case-insensitive). A quoted identifier
+/// (`"over"`) is data, not a keyword, so it never matches.
+fn word_ci(t: Option<&TokenWithSpan>, s: &str) -> bool {
+    matches!(t, Some(t) if matches!(&t.token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(s)))
+}
+
+/// Strip the window-frame `EXCLUDE` clause that sqlparser cannot parse, rewriting each affected
+/// `OVER ( spec EXCLUDE mode )` into `OVER __nusadb_excl_win_<n>` and recording `<name> -> (spec,
+/// mode)` in a thread-local consumed during conversion (see [`expr::install_exclude_windows`] and
+/// `convert_window_function`).
+///
+/// Association is robust — not positional. Each affected window gets a globally unique synthetic
+/// name that sqlparser threads verbatim from the exact `OVER` site into the `WindowType::NamedWindow`
+/// it produces, so the captured mode reaches exactly the window function it came from even when one
+/// statement carries several different `EXCLUDE` clauses. The spec (minus `EXCLUDE`) is re-parsed
+/// with sqlparser via a synthetic `count(*) OVER ( spec )` wrapper, so the partition/order/frame
+/// grammar is handled by the same parser as everywhere else.
+///
+/// `EXCLUDE` is structurally always the last element inside `OVER( ... )`, immediately before the
+/// closing `)`, after the frame bounds — so detecting it as the trailing `EXCLUDE <mode>` of the
+/// balanced `OVER(...)` group is unambiguous. A frame is required (the reference engine treats
+/// `OVER (... EXCLUDE ...)` with no frame as a syntax error); that requirement is enforced in
+/// `convert_window_function`, which rejects a captured mode whose spec has no frame.
+fn strip_window_exclude(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
+    // Cheap guard: the rewrite is only needed when both `OVER` and `EXCLUDE` appear. Always seed the
+    // map (clearing any leftover from a prior statement) so conversion never reads a stale entry.
+    let has_over = tokens.iter().any(|t| word_ci(Some(t), "over"));
+    let has_exclude = tokens.iter().any(|t| word_ci(Some(t), "exclude"));
+    if !(has_over && has_exclude) {
+        expr::install_exclude_windows(std::collections::HashMap::new());
+        return Ok(());
+    }
+    // The synthetic name prefix is reserved; a statement that already uses it is rejected loudly
+    // rather than risk a collision between a user window and a minted one.
+    if tokens.iter().any(
+        |t| matches!(&t.token, Token::Word(w) if w.value.to_ascii_lowercase().starts_with(EXCLUDE_WINDOW_PREFIX)),
+    ) {
+        return Err(Error::Unsupported(format!(
+            "identifiers beginning with `{EXCLUDE_WINDOW_PREFIX}` are reserved"
+        )));
+    }
+
+    let is_nonws = |t: Option<&TokenWithSpan>| matches!(t, Some(t) if !matches!(t.token, Token::Whitespace(_)));
+    let next_nonws = |toks: &[TokenWithSpan], from: usize| {
+        (from + 1..toks.len()).find(|&j| is_nonws(toks.get(j)))
+    };
+
+    let mut map: std::collections::HashMap<String, (sql::WindowSpec, ast::WindowExclude)> =
+        std::collections::HashMap::new();
+    let mut counter: u32 = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        // Find `OVER` immediately followed (ignoring whitespace) by `(`.
+        if word_ci(tokens.get(i), "over")
+            && let Some(open) = next_nonws(tokens, i)
+            && tokens.get(open).is_some_and(|t| t.token == Token::LParen)
+            && let Some(close) = matching_rparen(tokens, open)
+            && let Some(det) = detect_trailing_exclude(tokens, open, close)
+        {
+            // Reconstruct the frame spec (everything between `(` and the `EXCLUDE` keyword) and
+            // parse it with sqlparser via a synthetic `count(*) OVER ( spec )`.
+            let spec_str: String = tokens
+                .get(open + 1..det.exclude_idx)
+                .unwrap_or(&[])
+                .iter()
+                .map(|t| t.token.to_string())
+                .collect();
+            let spec = parse_window_spec(&spec_str)?;
+            counter += 1;
+            let name = format!("{EXCLUDE_WINDOW_PREFIX}{counter}");
+            map.insert(name.clone(), (spec, det.mode));
+            // Replace the whole `( spec EXCLUDE mode )` group with the synthetic name reference.
+            let replacement = TokenWithSpan::wrap(Token::make_word(&name, None));
+            let _: Vec<TokenWithSpan> = tokens.splice(open..=close, [replacement]).collect();
+            // Continue scanning after the inserted name token.
+            i = open + 1;
+            continue;
+        }
+        i += 1;
+    }
+    expr::install_exclude_windows(map);
+    Ok(())
+}
+
+/// The index of the `)` matching the `(` at `open`, tracking nested parens over the token stream.
+fn matching_rparen(tokens: &[TokenWithSpan], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (j, t) in tokens.iter().enumerate().skip(open) {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// Detect a trailing `EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS}` inside the balanced
+/// `OVER(...)` group spanning `[open, close]`. Returns the mode and the token index of the
+/// `EXCLUDE` keyword, or `None` when the group does not end with an `EXCLUDE` clause.
+fn detect_trailing_exclude(
+    tokens: &[TokenWithSpan],
+    open: usize,
+    close: usize,
+) -> Option<DetectedExclude> {
+    // Non-whitespace inner token indices, in order.
+    let inner: Vec<usize> = (open + 1..close)
+        .filter(|&j| matches!(tokens.get(j), Some(t) if !matches!(t.token, Token::Whitespace(_))))
+        .collect();
+    let word_at = |pos: usize, s: &str| word_ci(tokens.get(pos), s);
+    // Match from the end: the shortest patterns first would misfire, so test each full shape.
+    let n = inner.len();
+    let at = |back: usize| inner.get(n.wrapping_sub(back)).copied();
+    // `... EXCLUDE NO OTHERS`
+    if let (Some(a), Some(b), Some(c)) = (at(3), at(2), at(1))
+        && word_at(a, "exclude")
+        && word_at(b, "no")
+        && word_at(c, "others")
+    {
+        return Some(DetectedExclude {
+            mode: ast::WindowExclude::NoOthers,
+            exclude_idx: a,
+        });
+    }
+    // `... EXCLUDE CURRENT ROW`
+    if let (Some(a), Some(b), Some(c)) = (at(3), at(2), at(1))
+        && word_at(a, "exclude")
+        && word_at(b, "current")
+        && word_at(c, "row")
+    {
+        return Some(DetectedExclude {
+            mode: ast::WindowExclude::CurrentRow,
+            exclude_idx: a,
+        });
+    }
+    // `... EXCLUDE GROUP`
+    if let (Some(a), Some(b)) = (at(2), at(1))
+        && word_at(a, "exclude")
+        && word_at(b, "group")
+    {
+        return Some(DetectedExclude {
+            mode: ast::WindowExclude::Group,
+            exclude_idx: a,
+        });
+    }
+    // `... EXCLUDE TIES`
+    if let (Some(a), Some(b)) = (at(2), at(1))
+        && word_at(a, "exclude")
+        && word_at(b, "ties")
+    {
+        return Some(DetectedExclude {
+            mode: ast::WindowExclude::Ties,
+            exclude_idx: a,
+        });
+    }
+    None
+}
+
+/// Parse a window specification (the text between `OVER (` and `)`, with any `EXCLUDE` already
+/// removed) into a [`sql::WindowSpec`] by wrapping it in a synthetic `count(*) OVER ( spec )` call
+/// and parsing that expression — so the partition/order/frame grammar is handled by sqlparser.
+fn parse_window_spec(spec: &str) -> Result<sql::WindowSpec, Error> {
+    let src = format!("count(*) OVER ({spec})");
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(&src)
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    let expr = parser
+        .parse_expr()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    match expr {
+        sql::Expr::Function(f) => match f.over {
+            Some(sql::WindowType::WindowSpec(s)) => Ok(s),
+            _ => Err(Error::Syntax(
+                "malformed window specification before EXCLUDE".to_owned(),
+            )),
+        },
+        _ => Err(Error::Syntax(
+            "malformed window specification before EXCLUDE".to_owned(),
+        )),
     }
 }
 

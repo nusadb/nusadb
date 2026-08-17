@@ -1237,6 +1237,30 @@ pub struct WindowFrame {
     /// Frame end bound; `None` for the shorthand `ROWS n PRECEDING` form
     /// (semantically equivalent to `end = CURRENT ROW`).
     pub end: Option<WindowFrameBound>,
+    /// `EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS}` — which rows to drop from the frame
+    /// after the bounds have selected it. Defaults to [`WindowExclude::NoOthers`] (no exclusion).
+    pub exclude: WindowExclude,
+}
+
+/// The `EXCLUDE` clause of a window frame: which rows to remove from the frame after the
+/// frame bounds have selected it.
+///
+/// Peers are rows sharing the current row's `ORDER BY` value (with no `ORDER BY`, every row in the
+/// partition is a peer of every other). The frame `EXCLUDE` clause is not parsed by the upstream
+/// `sqlparser` crate (its `WindowFrame` records no exclusion), so the parser strips it before
+/// handing SQL to `sqlparser` and threads the captured mode here — see the window-exclude
+/// preprocessor in the parser module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowExclude {
+    /// `EXCLUDE NO OTHERS` (the default) — no rows are excluded.
+    #[default]
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW` — drop the current row from its frame.
+    CurrentRow,
+    /// `EXCLUDE GROUP` — drop the current row and all its peers.
+    Group,
+    /// `EXCLUDE TIES` — drop the current row's peers but keep the current row itself.
+    Ties,
 }
 
 /// Unit of a window frame: `ROWS`, `RANGE`, or `GROUPS`.
