@@ -2294,12 +2294,15 @@ impl ChannelSink {
                         Vec::with_capacity(SINK_CHUNK),
                     ))
                     .map_err(|_| {
-                        nusadb_sql::Error::Unsupported("client connection closed".to_owned())
+                        nusadb_sql::Error::Coded {
+                            message: "client connection closed".to_owned(),
+                            sqlstate: "08006", // connection_failure
+                        }
                     })?;
                 },
                 SinkTx::Inline => {
-                    return Err(nusadb_sql::Error::Unsupported(
-                        "internal: inline statement exceeded its buffered output".to_owned(),
+                    return Err(nusadb_sql::Error::Internal(
+                        "inline statement exceeded its buffered output".to_owned(),
                     ));
                 },
             }
@@ -2627,7 +2630,7 @@ fn stream_stmt_in_state(
 ) -> StmtRun {
     match state {
         TxnState::Failed { .. } => StmtRun::Done(
-            Err(nusadb_sql::Error::Unsupported(
+            Err(nusadb_sql::Error::TransactionAborted(
                 "current transaction is aborted, commands ignored until end of transaction block"
                     .to_owned(),
             )),
@@ -3224,7 +3227,7 @@ fn set_transaction_txn(
     }
     match state {
         TxnState::Failed { .. } => (
-            Err(nusadb_sql::Error::Unsupported(
+            Err(nusadb_sql::Error::TransactionAborted(
                 "current transaction is aborted, commands ignored until end of transaction block"
                     .to_owned(),
             )),
@@ -4085,7 +4088,7 @@ fn savepoint_txn(
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     use nusadb_sql::ast::Statement;
     let aborted = || {
-        nusadb_sql::Error::Unsupported(
+        nusadb_sql::Error::TransactionAborted(
             "current transaction is aborted, commands ignored until end of transaction block"
                 .to_owned(),
         )
@@ -4131,7 +4134,7 @@ fn savepoint_txn(
             _ => (Err(aborted()), TxnState::Failed { txn, isolation }),
         },
         TxnState::Auto => (
-            Err(nusadb_sql::Error::Unsupported(
+            Err(nusadb_sql::Error::NoActiveTransaction(
                 "SAVEPOINT can only be used in transaction blocks".to_owned(),
             )),
             TxnState::Auto,
@@ -4165,7 +4168,7 @@ fn run_stmt_in_state(
     }
     match state {
         TxnState::Failed { .. } => (
-            Err(nusadb_sql::Error::Unsupported(
+            Err(nusadb_sql::Error::TransactionAborted(
                 "current transaction is aborted, commands ignored until end of transaction block"
                     .to_owned(),
             )),

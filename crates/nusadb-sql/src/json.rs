@@ -637,15 +637,31 @@ fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
     Some(steps)
 }
 
+/// Why a [`path_query`] did not run. The two are different mistakes by different arguments, and a
+/// caller that reports them as one thing names the wrong culprit half the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathQueryError {
+    /// The first argument is not JSON. Nothing to do with the path.
+    MalformedDocument,
+    /// The second argument is not a `jsonpath` this engine accepts — either malformed, or outside
+    /// the supported subset. Both are the caller's to fix, and neither is a reason to skip the
+    /// statement, so they share one variant.
+    UnusablePath,
+}
+
 /// `jsonb_path_query(json, path)` — every value in `json` matching the `jsonpath` `path`.
 ///
 /// Each match is canonical JSON text. A `[*]`/`.*` step fans out over children, so the result may
-/// hold many matches (or none). `None` if `json` is invalid or `path` is outside the supported
-/// subset (the caller turns that into an error); a valid path matching nothing yields `Some(empty)`.
-#[must_use]
-pub fn path_query(json: &str, path: &str) -> Option<Vec<String>> {
-    let doc = parse(json)?;
-    let steps = parse_jsonpath(path)?;
+/// hold many matches (or none); a valid path matching nothing yields an empty `Vec`. A failure says
+/// which argument was at fault — see [`PathQueryError`].
+///
+/// # Errors
+///
+/// [`PathQueryError::MalformedDocument`] if `json` does not parse, or
+/// [`PathQueryError::UnusablePath`] if `path` is not a usable `jsonpath`.
+pub fn path_query(json: &str, path: &str) -> Result<Vec<String>, PathQueryError> {
+    let doc = parse(json).ok_or(PathQueryError::MalformedDocument)?;
+    let steps = parse_jsonpath(path).ok_or(PathQueryError::UnusablePath)?;
     let mut current = vec![doc];
     for step in &steps {
         let mut next = Vec::new();
@@ -675,7 +691,7 @@ pub fn path_query(json: &str, path: &str) -> Option<Vec<String>> {
         }
         current = next;
     }
-    Some(current.iter().map(to_text).collect())
+    Ok(current.iter().map(to_text).collect())
 }
 
 /// Follow a `#>`/`#>>` path through `value`: each step indexes an object by key, or an array by the
@@ -1008,13 +1024,17 @@ mod tests {
         );
         // `.*` fans out over object values (two members here).
         assert_eq!(path_query(doc, "$.*").unwrap().len(), 2);
-        // Valid path, no match → empty (not None).
+        // Valid path, no match: an empty result, not a failure.
         assert_eq!(path_query(doc, "$.nope").unwrap(), Vec::<String>::new());
-        // Unsupported syntax / bad path → None.
-        assert!(path_query(doc, "items").is_none());
-        assert!(path_query(doc, "$..n").is_none());
-        // Invalid JSON → None.
-        assert!(path_query("not json", "$").is_none());
+        // Unsupported syntax and a malformed path are one outcome: the path is unusable.
+        assert_eq!(path_query(doc, "items"), Err(PathQueryError::UnusablePath));
+        assert_eq!(path_query(doc, "$..n"), Err(PathQueryError::UnusablePath));
+        // A malformed *document* is a different mistake from a malformed *path*, and the caller
+        // reports them in different classes, so the distinction is pinned here.
+        assert_eq!(
+            path_query("not json", "$"),
+            Err(PathQueryError::MalformedDocument)
+        );
     }
 
     #[test]

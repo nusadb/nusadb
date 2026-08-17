@@ -329,7 +329,7 @@ pub(super) fn column_fills(
             )?)
         } else if let Some(seq) = serial_sequence(&sql) {
             let id = engine.lookup_sequence(seq)?.ok_or_else(|| {
-                Error::Unsupported(format!(
+                Error::Internal(format!(
                     "serial column \"{column}\" has no backing sequence"
                 ))
             })?;

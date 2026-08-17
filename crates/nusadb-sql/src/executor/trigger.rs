@@ -615,7 +615,7 @@ impl RowRefs<'_> {
             _ => return Ok(None),
         };
         let row = row.ok_or_else(|| {
-            Error::Unsupported(format!("{which} is not available in this trigger event"))
+            Error::InvalidStatement(format!("{which} is not available in this trigger event"))
         })?;
         let index = self
             .schema

@@ -232,23 +232,23 @@ fn hnsw_index_creation_is_validated() {
         "CREATE TABLE items (id INT NOT NULL, embedding VECTOR(3), label TEXT)",
     );
 
-    // An unknown access method is rejected (only `hnsw` is supported).
+    // An unknown access method really is a feature NusaDB has not built: `0A000`.
     assert!(matches!(
         try_analyze(engine, "CREATE INDEX i ON items USING gin (embedding)"),
         Err(Error::Unsupported(_))
     ));
-    // An hnsw index over a non-vector column is rejected.
+    // The two below are the caller's mistake, not a gap — `hnsw` exists and these calls misuse it —
+    // so they report `42601` rather than telling a migration tool the feature is missing.
     assert!(matches!(
         try_analyze(engine, "CREATE INDEX i ON items USING hnsw (label)"),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidStatement(_))
     ));
-    // An hnsw index over more than one column is rejected.
     assert!(matches!(
         try_analyze(
             engine,
             "CREATE INDEX i ON items USING hnsw (embedding, label)"
         ),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidStatement(_))
     ));
     // A plain (B-tree) index is unaffected by the new `USING` surface.
     assert!(matches!(
@@ -344,7 +344,7 @@ fn operator_class_selects_the_metric() {
     // the trap this whole change removes.
     assert!(matches!(
         try_analyze(engine, "CREATE INDEX i_bad ON v USING hnsw (e text_ops)"),
-        Err(Error::Unsupported(_))
+        Err(Error::ObjectNotFound(_))
     ));
     // An operator class on a plain B-tree index is still refused.
     assert!(matches!(

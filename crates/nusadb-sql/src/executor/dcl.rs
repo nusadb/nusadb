@@ -211,7 +211,7 @@ fn revoke_one(
     let dependents = rbac::dependent_grants(engine, txn, grantee, kind, object, privilege)?;
     if !dependents.is_empty() {
         if !plan.cascade {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::DependentObjects(format!(
                 "cannot revoke {privilege} on {noun} `{object}` from `{who}`: it has granted that \
                  privilege to {n} other role(s) — use CASCADE to revoke those too",
                 privilege = privilege.as_str(),
@@ -245,7 +245,7 @@ pub(super) fn run_grant_role(
     for role in &plan.roles {
         for member in &plan.members {
             if rbac::would_create_cycle(engine, txn, role, member)? {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::InvalidStatement(format!(
                     "granting `{role}` to `{member}` would create a membership cycle"
                 )));
             }
@@ -295,7 +295,7 @@ pub(super) fn run_create_role(
         if plan.if_not_exists {
             return Ok(ExecutionResult::RoleCreated);
         }
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectExists(format!(
             "role `{}` already exists",
             plan.name
         )));
@@ -340,10 +340,12 @@ pub(super) fn run_drop_role(
             if plan.if_exists {
                 continue;
             }
-            return Err(Error::Unsupported(format!("role `{name}` does not exist")));
+            return Err(Error::ObjectNotFound(format!(
+                "role `{name}` does not exist"
+            )));
         }
         if let Some(object) = first_object_owned_by(engine, txn, name)? {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::DependentObjects(format!(
                 "cannot drop role `{name}`: it still owns `{object}` — reassign or drop the \
                  objects it owns first"
             )));
@@ -380,7 +382,7 @@ pub(super) fn run_alter_role(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let Some(mut record) = rbac::lookup_role(engine, txn, &plan.name)? else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectNotFound(format!(
             "role `{}` does not exist",
             plan.name
         )));

@@ -523,33 +523,44 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
 
   | Class | Meaning | Examples |
   | --- | --- | --- |
-  | `22` | data exception — a value the type cannot represent | `22012` division by zero, `22P02` unparseable text, `22007` bad date/time, `22P04` malformed COPY data |
+  | `08` | connection exception | `08006` the connection failed while the statement was running |
+  | `0A` | the server has not built this feature | `0A000` — see the note below on what this does and does not mean |
+  | `21` | cardinality violation | `21000` a subquery returned more than one row where one was required |
+  | `22` | data exception — a value the type cannot represent | `22012` division by zero, `22P02` unparseable text, `22007` bad date/time, `22008` date/time out of range, `22023` an argument value the function does not accept, `22P04` malformed COPY data |
   | `23` | integrity constraint violation | `23502` NOT NULL, `23505` unique, `23503` foreign key |
-  | `25` | the transaction is in the wrong state for this statement | `25P02` transaction is aborted — send `ROLLBACK`; `25001` this statement cannot run here (inside a transaction block, or after a query has already run in it) |
+  | `25` | the transaction is in the wrong state for this statement | `25P02` transaction is aborted — send `ROLLBACK`; `25P01` no transaction is open; `25001` this statement cannot run here (inside a transaction block, or after a query has already run in it); `25006` the transaction is READ ONLY |
+  | `26` | invalid SQL statement name | `26000` no such prepared statement — re-prepare it |
   | `2B` | dependent objects still exist | `2BP01` — resolve with `CASCADE` |
+  | `34` | invalid cursor name | `34000` no such portal |
   | `3D` | invalid catalog (database) name | `3D000` |
   | `3F` | invalid schema name | `3F000` |
   | `40` | transaction rollback — **retryable** | `40001` serialization failure, `40P01` deadlock |
-  | `42` | syntax error or access rule violation | `42601` syntax, `42P01` no such table, `42703` no such column, `42883` no such function, `42501` permission denied |
+  | `42` | syntax error or access rule violation | `42601` syntax or a malformed statement, `42P01` no such table, `42703` no such column, `42883` no such function *or no form of it with these arguments*, `42501` permission denied, `42P10` an invalid column reference, `42P16` an invalid table definition, `428C9` a value supplied for a `GENERATED ALWAYS` column |
   | `53` | insufficient resources — **back off and retry** | `53300` too many connections; the server closes the connection after sending it |
-  | `54` | program limit exceeded | `54001` recursion limit |
-  | `55` | object not in a state the operation needs | `55006` object in use, `55P02` parameter cannot be changed now |
+  | `54` | program limit exceeded — the request must get smaller | `54000` a built-in limit (row cap, nesting depth, value size), `54001` recursion limit |
+  | `55` | object not in a state the operation needs | `55006` object in use or reserved, `55P02` parameter cannot be changed now |
   | `57` | operator intervention | `57014` statement cancelled or timed out |
+  | `58` | the environment failed, not the statement | `58030` an I/O error under the engine |
   | `P0` | raised by the user's own code | `P0001` `RAISE` from a procedure |
   | `XX` | internal error — the server's fault, not the caller's | `XX000` |
 
   The list is what the server emits today, not a closed set: a future version may add a class, and
-  a client should treat an unrecognised one as it treats `XX`. Two notes worth having:
+  a client should treat an unrecognised one as it treats `XX`. Three notes worth having:
 
   - A client that retries should retry the whole class `40` — both `40001` and `40P01`, which is
     what the server's own retry helper does — and back off on `53300` rather than reconnecting at
     once. One that surfaces the error should distinguish class `42`/`22` (fix the query or the
     data) from `XX` (report it as a defect). On `25P02` there is nothing to retry until the
     transaction is ended: send `ROLLBACK` first.
-  - `0A` (`feature_not_supported`) is **not** emitted. A statement the server will not run reports
-    `XX000` today, because the refusal that carries it is also raised for ordinary mistakes, and
-    telling a caller "feature not supported" would invite it to skip work it should have stopped
-    on. Do not branch on `0A` expecting to find unsupported features.
+  - `0A000` (`feature_not_supported`) means what it says, and a client may act on it: the statement
+    is well formed and NusaDB has not built the construct, so a migration or compatibility tool can
+    skip it and carry on. It is emitted **only** for that. An ordinary mistake — an unknown role, a
+    call with the wrong number of arguments, a value out of range — reports its own class instead,
+    so skipping on `0A000` will not skip past a statement that was simply wrong.
+  - `26000` and `34000` are the two a pooler should watch: they say the *name* is gone, not that
+    the statement was wrong. On `26000` re-prepare and retry; on `34000` re-issue `Bind` before
+    `Execute`. `26000` now also answers the SQL-level `EXECUTE` / `DEALLOCATE` of a statement this
+    session never prepared, so both spellings of the same mistake report the same code.
 
 - `message` is human-readable.
 

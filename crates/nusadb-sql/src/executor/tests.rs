@@ -516,7 +516,7 @@ fn failed_commit_rolls_back_instead_of_leaking_txn() {
     let follow_up = session_run(&mut session, &engine, "COMMIT")
         .expect_err("the transaction is over, so a second COMMIT must fail");
     assert!(
-        matches!(follow_up, Error::Unsupported(_)),
+        matches!(follow_up, Error::NoActiveTransaction(_)),
         "expected 'COMMIT without an active transaction', got {follow_up:?}"
     );
 }
@@ -1847,7 +1847,7 @@ fn explain_format_graphviz_is_rejected() {
     let engine = setup();
     assert!(matches!(
         run("EXPLAIN FORMAT GRAPHVIZ SELECT * FROM users", &engine),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidParameterValue(_)),
     ));
 }
 
@@ -2383,7 +2383,7 @@ fn cardinality_rejects_a_non_array_argument() {
     let engine = seeded_arrays();
     assert!(matches!(
         run("SELECT cardinality(id) FROM t", &engine),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2555,7 +2555,7 @@ fn unnest_rejects_a_non_array_argument() {
     let engine = seeded_arrays();
     assert!(matches!(
         run("SELECT unnest(id) FROM t", &engine),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2641,22 +2641,22 @@ fn jsonb_path_query_rejects_an_unsupported_path_at_runtime() {
             "SELECT jsonb_path_query(doc, 'items') FROM j WHERE id = 2",
             &engine,
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidParameterValue(_)),
     ));
 }
 
 #[test]
 fn json_srf_rejects_wrong_argument_type_and_arity() {
     let engine = seeded_json();
-    // json_array_elements over a non-JSON argument.
-    assert!(matches!(
-        run("SELECT json_array_elements(id) FROM j", &engine),
-        Err(Error::TypeMismatch { .. } | Error::Unsupported(_)),
-    ));
+    // json_array_elements over a non-JSON argument. Accepting either of two variants let the
+    // outcome drift; pin the class a client actually reads instead.
+    let err = run("SELECT json_array_elements(id) FROM j", &engine)
+        .expect_err("a non-JSON argument is refused");
+    assert_eq!(err.sqlstate(), "42804", "got {err}");
     // jsonb_path_query needs two arguments.
     assert!(matches!(
         run("SELECT jsonb_path_query(doc) FROM j", &engine),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 

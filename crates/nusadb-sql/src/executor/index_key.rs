@@ -73,7 +73,7 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         // but a future equality-lookup wiring must normalize them if it wants `0.0` to match `-0.0`.
         ast::Value::Float(f) => {
             if f.is_nan() {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "NaN cannot be used as an index key".to_owned(),
                 ));
             }
@@ -132,7 +132,7 @@ const NUMERIC_FRAC_DIGITS: usize = crate::numeric::MAX_SCALE as usize;
 fn encode_numeric(d: &crate::numeric::Decimal, out: &mut Vec<u8>) -> Result<(), Error> {
     let scale = d.scale as usize;
     if scale > NUMERIC_FRAC_DIGITS {
-        return Err(Error::Unsupported(
+        return Err(Error::LimitExceeded(
             "NUMERIC scale beyond the index key limit".to_owned(),
         ));
     }

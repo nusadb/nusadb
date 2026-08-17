@@ -53,8 +53,9 @@ fn decode_param(raw: Option<&[u8]>) -> Result<ast::Value, Error> {
     let Some(bytes) = raw else {
         return Ok(ast::Value::Null);
     };
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| Error::Unsupported("parameter value is not valid UTF-8".to_owned()))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        Error::InvalidParameterValue("parameter value is not valid UTF-8".to_owned())
+    })?;
     if let Ok(i) = text.parse::<i64>() {
         return Ok(ast::Value::Int(i));
     }
@@ -722,7 +723,7 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Er
     match expr {
         ast::Expr::Parameter(n) => {
             let value = params.get(*n).cloned().ok_or_else(|| {
-                Error::Unsupported(format!("parameter ${} was not bound", *n + 1))
+                Error::InvalidStatement(format!("parameter ${} was not bound", *n + 1))
             })?;
             *expr = ast::Expr::Literal(value);
             Ok(())

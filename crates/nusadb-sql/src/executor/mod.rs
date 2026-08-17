@@ -300,8 +300,8 @@ pub fn execute(plan: PhysicalPlan, engine: &dyn StorageEngine) -> Result<Executi
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
-        | PhysicalPlan::SetTransaction(_) => Err(Error::Unsupported(
-            "explicit BEGIN/COMMIT/ROLLBACK requires a Session — use Session::execute".to_owned(),
+        | PhysicalPlan::SetTransaction(_) => Err(Error::Internal(
+            "transaction-control plan reached an entry point with no session".to_owned(),
         )),
         other => Session::new(engine).execute(other),
     }
@@ -478,8 +478,8 @@ pub fn execute_in_txn(
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
-        | PhysicalPlan::SetTransaction(_) => Err(Error::Unsupported(
-            "explicit BEGIN/COMMIT/ROLLBACK requires a Session — use Session::execute".to_owned(),
+        | PhysicalPlan::SetTransaction(_) => Err(Error::Internal(
+            "transaction-control plan reached an entry point with no session".to_owned(),
         )),
         other => dispatch(other, engine, txn),
     }
@@ -1033,7 +1033,7 @@ impl<'engine> Session<'engine> {
                     ast::DeallocateTarget::All => self.prepared.clear(),
                     ast::DeallocateTarget::Name(name) => {
                         if self.prepared.remove(&name).is_none() {
-                            return Err(Error::Unsupported(format!(
+                            return Err(Error::PreparedStatementNotFound(format!(
                                 "prepared statement \"{name}\" does not exist"
                             )));
                         }
@@ -1116,12 +1116,14 @@ impl<'engine> Session<'engine> {
     fn execute_prepared(&self, name: &str, args: &[ast::Value]) -> Result<ExecutionResult, Error> {
         let (statement, param_count) = {
             let prepared = self.prepared.get(name).ok_or_else(|| {
-                Error::Unsupported(format!("prepared statement \"{name}\" does not exist"))
+                Error::PreparedStatementNotFound(format!(
+                    "prepared statement \"{name}\" does not exist"
+                ))
             })?;
             (prepared.statement.clone(), prepared.param_count)
         };
         if args.len() != param_count {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "prepared statement \"{name}\" expects {param_count} parameter(s), got {}",
                 args.len()
             )));
@@ -1207,7 +1209,7 @@ impl<'engine> Session<'engine> {
         let logical = crate::analyze(stmt, &catalog)?;
         let physical = crate::plan(logical);
         if read_only && plan_modifies_data(&physical) {
-            return Err(Error::Unsupported(
+            return Err(Error::ReadOnlyTransaction(
                 "cannot execute a data-modifying statement in a READ ONLY transaction".to_owned(),
             ));
         }
@@ -1418,13 +1420,14 @@ impl<'engine> Session<'engine> {
     /// The active explicit transaction, or an error naming the `stmt` that requires one.
     /// Savepoints only make sense inside `BEGIN ... COMMIT/ROLLBACK`.
     fn active_txn(&self, stmt: &str) -> Result<TxnId, Error> {
-        self.current_txn
-            .ok_or_else(|| Error::Unsupported(format!("{stmt} without an active transaction")))
+        self.current_txn.ok_or_else(|| {
+            Error::NoActiveTransaction(format!("{stmt} without an active transaction"))
+        })
     }
 
     fn begin(&mut self, characteristics: TxnCharacteristics) -> Result<ExecutionResult, Error> {
         if self.current_txn.is_some() {
-            return Err(Error::Unsupported(
+            return Err(Error::ActiveTransaction(
                 "nested BEGIN — already inside a transaction".to_owned(),
             ));
         }
@@ -1446,7 +1449,7 @@ impl<'engine> Session<'engine> {
         // transaction's first statement. Reject it inside an active transaction rather than
         // silently ignoring it.
         if self.current_txn.is_some() {
-            return Err(Error::Unsupported(
+            return Err(Error::ActiveTransaction(
                 "SET TRANSACTION must run before the transaction's first statement; \
                  characteristics are fixed at BEGIN"
                     .to_owned(),
@@ -1462,10 +1465,9 @@ impl<'engine> Session<'engine> {
     }
 
     fn commit(&mut self) -> Result<ExecutionResult, Error> {
-        let txn = self
-            .current_txn
-            .take()
-            .ok_or_else(|| Error::Unsupported("COMMIT without an active transaction".to_owned()))?;
+        let txn = self.current_txn.take().ok_or_else(|| {
+            Error::NoActiveTransaction("COMMIT without an active transaction".to_owned())
+        })?;
         // A failed COMMIT (e.g. a failed group fsync) must NOT leak the transaction: roll it back so
         // the engine releases it and its locks and purge is not blocked forever
         // `current_txn` is already cleared, so the session returns to
@@ -1481,7 +1483,7 @@ impl<'engine> Session<'engine> {
 
     fn rollback(&mut self) -> Result<ExecutionResult, Error> {
         let txn = self.current_txn.take().ok_or_else(|| {
-            Error::Unsupported("ROLLBACK without an active transaction".to_owned())
+            Error::NoActiveTransaction("ROLLBACK without an active transaction".to_owned())
         })?;
         self.engine.rollback(txn)?;
         self.txn_read_only = false;
@@ -1508,7 +1510,7 @@ impl<'engine> Session<'engine> {
             self.default_read_only
         };
         if read_only && plan_modifies_data(&plan) {
-            return Err(Error::Unsupported(
+            return Err(Error::ReadOnlyTransaction(
                 "cannot execute a data-modifying statement in a READ ONLY transaction".to_owned(),
             ));
         }
@@ -1651,7 +1653,7 @@ fn dispatch(
             for child in children {
                 last = Some(dispatch(child, engine, txn)?);
             }
-            last.ok_or_else(|| Error::Unsupported("internal: empty statement batch".to_owned()))
+            last.ok_or_else(|| Error::Internal("empty statement batch".to_owned()))
         },
         PhysicalPlan::CreateTable(p) => run_create_table(p, engine, txn),
         PhysicalPlan::CreateTableAs(p) => run_create_table_as(p, engine, txn),
@@ -1738,7 +1740,7 @@ fn dispatch(
             // Transaction-, session-, and prepared-statement-control plans are intercepted by
             // `Session::execute` before reaching `dispatch` (the latter need the session's statement
             // store); this arm is defensive. PREPARE/EXECUTE/DEALLOCATE require a `Session`.
-            Err(Error::Unsupported(
+            Err(Error::Internal(
                 "session-control plan reached executor dispatch (requires a Session)".to_owned(),
             ))
         },
@@ -3206,7 +3208,7 @@ fn run_create_policy(
         .iter()
         .any(|existing| existing.name == p.name)
     {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectExists(format!(
             "policy `{}` already exists on `{}`",
             p.name, p.table
         )));
@@ -3233,7 +3235,7 @@ fn run_drop_policy(
 ) -> Result<ExecutionResult, Error> {
     let removed = delete_policy_row(engine, txn, &p.table, &p.name)?;
     if !removed && !p.if_exists {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectNotFound(format!(
             "policy `{}` does not exist on `{}`",
             p.name, p.table
         )));
@@ -3832,7 +3834,7 @@ fn run_refresh_materialized_view(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let Some(def_sql) = load_view_def(engine, txn, MATVIEW_CATALOG, name)? else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "`{name}` is not a materialized view (no stored definition to refresh)"
         )));
     };
@@ -3844,7 +3846,7 @@ fn run_refresh_materialized_view(
     // Re-analyze and re-plan the stored SELECT against the current catalog, then run it.
     let logical = crate::analyze(crate::parse(&def_sql)?, &ExecCatalog::new(engine, txn))?;
     let PhysicalPlan::Select(op, _) = crate::plan(logical) else {
-        return Err(Error::Unsupported(
+        return Err(Error::Internal(
             "materialized view definition is not a SELECT".to_owned(),
         ));
     };
@@ -3900,7 +3902,7 @@ fn run_create_enum(
     if lookup_enum(engine, txn, &p.name)?.is_some()
         || engine.lookup_table_as_of(txn, &p.name)?.is_some()
     {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectExists(format!(
             "type {:?} already exists",
             p.name
         )));
@@ -3923,7 +3925,7 @@ fn run_drop_type(
     if lookup_composite(engine, txn, &p.name)?.is_some()
         && let Some((table, column)) = first_composite_dependent(engine, txn, &p.name)?
     {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::DependentObjects(format!(
             "cannot drop type \"{}\" because column \"{column}\" of table \"{table}\" depends on it",
             p.name
         )));
@@ -3931,7 +3933,7 @@ fn run_drop_type(
     let removed = delete_view_def(engine, txn, ENUM_CATALOG, &p.name)?
         | delete_view_def(engine, txn, COMPOSITE_CATALOG, &p.name)?;
     if !removed && !p.if_exists {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectNotFound(format!(
             "type {:?} does not exist",
             p.name
         )));
@@ -3976,7 +3978,7 @@ fn run_create_composite(
         || lookup_domain(engine, txn, &p.name)?.is_some()
         || engine.lookup_table_as_of(txn, &p.name)?.is_some()
     {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectExists(format!(
             "type {:?} already exists",
             p.name
         )));
@@ -4133,7 +4135,7 @@ fn run_create_domain(
         || lookup_enum(engine, txn, &p.name)?.is_some()
         || engine.lookup_table_as_of(txn, &p.name)?.is_some()
     {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectExists(format!(
             "type {:?} already exists",
             p.name
         )));
@@ -4156,7 +4158,7 @@ fn run_drop_domain(
 ) -> Result<ExecutionResult, Error> {
     let removed = delete_view_def(engine, txn, DOMAIN_CATALOG, &p.name)?;
     if !removed && !p.if_exists {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectNotFound(format!(
             "domain {:?} does not exist",
             p.name
         )));
@@ -4200,13 +4202,13 @@ fn column_at(table: &TableSchema, index: usize) -> Result<&ColumnDef, Error> {
 /// Error for an out-of-range ordinal the analyzer should have ruled out — a
 /// planner/analyzer bug, surfaced rather than panicking.
 fn internal_index(index: usize) -> Error {
-    Error::Unsupported(format!("internal: row/column index {index} out of bounds"))
+    Error::Internal(format!("row/column index {index} out of bounds"))
 }
 
 fn set_at(row: &mut Row, index: usize, value: ast::Value) -> Result<(), Error> {
     let slot = row
         .get_mut(index)
-        .ok_or_else(|| Error::Unsupported(format!("internal: row index {index} out of bounds")))?;
+        .ok_or_else(|| Error::Internal(format!("row index {index} out of bounds")))?;
     *slot = value;
     Ok(())
 }

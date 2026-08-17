@@ -172,7 +172,7 @@ fn analyze_on_conflict(
         },
         Some(ast::ConflictTarget::Constraint(name)) => ConflictArbiter::Constraint(name),
         None => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "ON CONFLICT DO UPDATE requires a conflict target — \
                  `ON CONFLICT (columns)` or `ON CONFLICT ON CONSTRAINT name`"
                     .to_owned(),
@@ -267,7 +267,7 @@ pub(super) fn analyze_returning(
         source_len,
     )?;
     if !aggregates.is_empty() {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidGrouping(
             "aggregate functions are not allowed in RETURNING".to_owned(),
         ));
     }
@@ -398,13 +398,13 @@ fn analyze_hnsw_index(
         ));
     }
     let [column] = ci.columns.as_slice() else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "an hnsw vector index must be over exactly one VECTOR column".to_owned(),
         ));
     };
     let (column_ordinal, def) = find_column(&table.columns, column, &table.name)?;
     let ColumnType::Vector(dim) = def.ty else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "an hnsw index requires a VECTOR(n) column".to_owned(),
         ));
     };
@@ -413,7 +413,7 @@ fn analyze_hnsw_index(
     let metric = match &ci.operator_class {
         None => crate::hnsw::Metric::Cosine,
         Some(name) => crate::hnsw::Metric::from_operator_class(name).ok_or_else(|| {
-            Error::Unsupported(format!(
+            Error::ObjectNotFound(format!(
                 "operator class `{name}` on an hnsw index (expected one of `vector_l2_ops`, \
                  `vector_cosine_ops`, `vector_ip_ops`, `vector_l1_ops`)"
             ))
@@ -482,14 +482,14 @@ pub(super) fn const_i64(expr: &ast::Expr) -> Result<i64, Error> {
             op: ast::UnaryOp::Negate,
             expr,
         } => match expr.as_ref() {
-            ast::Expr::Literal(ast::Value::Int(n)) => n
-                .checked_neg()
-                .ok_or_else(|| Error::Unsupported("sequence option value out of range".to_owned())),
-            _ => Err(Error::Unsupported(
+            ast::Expr::Literal(ast::Value::Int(n)) => n.checked_neg().ok_or_else(|| {
+                Error::InvalidParameterValue("sequence option value out of range".to_owned())
+            }),
+            _ => Err(Error::InvalidStatement(
                 "sequence option must be an integer constant".to_owned(),
             )),
         },
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::InvalidStatement(
             "sequence option must be an integer constant".to_owned(),
         )),
     }
@@ -754,7 +754,7 @@ pub(super) fn analyze_merge(m: ast::Merge, catalog: &dyn Catalog) -> Result<Merg
         || m.target.set_op.is_some()
         || m.target.lateral
     {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "MERGE target must be a plain table".to_owned(),
         ));
     }

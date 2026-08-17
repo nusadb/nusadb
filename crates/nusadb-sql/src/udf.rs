@@ -88,7 +88,7 @@ pub(crate) fn call_scalar_udf(name: &str, args: &[Value]) -> Result<Value, Error
     let func = {
         let registry = REGISTRY
             .read()
-            .map_err(|_| Error::Unsupported("UDF registry lock was poisoned".to_owned()))?;
+            .map_err(|_| Error::Internal("UDF registry lock was poisoned".to_owned()))?;
         registry
             .get(name)
             .map(|udf| Arc::clone(&udf.func))

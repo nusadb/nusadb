@@ -410,9 +410,10 @@ impl ParallelGroupedAggregate {
             keys = self.key_indices.len(),
             "grouped aggregate: parallel fold"
         );
-        let mut scan = self.scan.take().ok_or_else(|| {
-            Error::Unsupported("internal: parallel aggregate folded twice".to_owned())
-        })?;
+        let mut scan = self
+            .scan
+            .take()
+            .ok_or_else(|| Error::Internal("parallel aggregate folded twice".to_owned()))?;
         let workers = self.workers;
         let mut partials: Vec<WorkerPartial> = Vec::with_capacity(workers);
         let (input_schema, source_types, keep, key_indices, calls, arg_shapes) = (
@@ -501,9 +502,7 @@ impl ParallelGroupedAggregate {
                     },
                     Err(_) => {
                         first_err.get_or_insert_with(|| {
-                            Error::Unsupported(
-                                "internal: parallel aggregate worker panicked".to_owned(),
-                            )
+                            Error::Internal("parallel aggregate worker panicked".to_owned())
                         });
                     },
                 }
@@ -524,9 +523,9 @@ impl ParallelGroupedAggregate {
         for partial in partials {
             for ((key, accs), first) in partial.states.into_iter().zip(partial.firsts) {
                 let at = merged.find_or_create(key, self.calls.len());
-                let slot = merged.accs_at(at).ok_or_else(|| {
-                    Error::Unsupported("internal: parallel merge lost a group".to_owned())
-                })?;
+                let slot = merged
+                    .accs_at(at)
+                    .ok_or_else(|| Error::Internal("parallel merge lost a group".to_owned()))?;
                 if at == firsts.len() {
                     // First worker to contribute this group: adopt its accumulators wholesale.
                     firsts.push(first);
@@ -637,7 +636,7 @@ fn worker_fold(
                     // group count; if reality blows far past it, abort loudly instead of growing
                     // unbounded hash state under a memory budget.
                     if group_cap.is_some_and(|cap| firsts.len() >= cap) {
-                        return Err(Error::Unsupported(
+                        return Err(Error::Internal(
                             "parallel aggregate exceeded its statistics-bounded group estimate \
                              (stale statistics?); re-run ANALYZE on the scanned table"
                                 .to_owned(),

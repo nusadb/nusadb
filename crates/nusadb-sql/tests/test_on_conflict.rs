@@ -321,7 +321,7 @@ fn do_update_honest_rejects() {
             &mut session,
             "INSERT INTO t VALUES (1, 'a') ON CONFLICT DO UPDATE SET v = 'b'"
         ),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidStatement(_))
     ));
     // The target columns must match a declared UNIQUE / PRIMARY KEY constraint.
     assert!(

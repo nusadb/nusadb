@@ -251,7 +251,7 @@ fn check_privileges_apply(
     };
     for privilege in privileges {
         if let Some(kind) = kinds.iter().find(|kind| !privilege.applies_to(**kind)) {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidStatement(format!(
                 "{privilege} is not a privilege on a {noun}",
                 privilege = privilege.as_str(),
                 noun = kind.noun(),
@@ -342,7 +342,9 @@ fn require_known_grantees(catalog: &dyn Catalog, grantees: &[Grantee]) -> Result
         if let Grantee::Role(name) = grantee
             && !catalog.role_exists(name)?
         {
-            return Err(Error::Unsupported(format!("role `{name}` does not exist")));
+            return Err(Error::ObjectNotFound(format!(
+                "role `{name}` does not exist"
+            )));
         }
     }
     Ok(())
@@ -359,7 +361,9 @@ pub(super) fn analyze_grant_role(
 ) -> Result<GrantRolePlan, Error> {
     for role in g.roles.iter().chain(&g.members) {
         if !catalog.role_exists(role)? {
-            return Err(Error::Unsupported(format!("role `{role}` does not exist")));
+            return Err(Error::ObjectNotFound(format!(
+                "role `{role}` does not exist"
+            )));
         }
     }
     for role in &g.roles {
@@ -389,7 +393,9 @@ pub(super) fn analyze_revoke_role(
     // Mirror the GRANT twin: a typo'd role name is a loud error, not a silent no-op.
     for role in r.roles.iter().chain(&r.members) {
         if !catalog.role_exists(role)? {
-            return Err(Error::Unsupported(format!("role `{role}` does not exist")));
+            return Err(Error::ObjectNotFound(format!(
+                "role `{role}` does not exist"
+            )));
         }
     }
     for role in &r.roles {
@@ -509,7 +515,9 @@ pub(super) fn analyze_set_role(
 ) -> Result<SetRolePlan, Error> {
     if let Some(role) = &s.role {
         if !catalog.role_exists(role)? {
-            return Err(Error::Unsupported(format!("role `{role}` does not exist")));
+            return Err(Error::ObjectNotFound(format!(
+                "role `{role}` does not exist"
+            )));
         }
         if !catalog.may_assume_role(role)? {
             return Err(Error::PermissionDenied(format!(

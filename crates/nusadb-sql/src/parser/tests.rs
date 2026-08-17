@@ -1436,7 +1436,7 @@ fn explain_format_json_parses_and_graphviz_rejected() {
     // An unsupported format is rejected rather than silently ignored.
     assert!(matches!(
         parse("EXPLAIN FORMAT GRAPHVIZ SELECT 1"),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidParameterValue(_))
     ));
 
     // The parenthesized option list (the standard `EXPLAIN (FORMAT JSON, ANALYZE, VERBOSE)` form)
@@ -1454,11 +1454,11 @@ fn explain_format_json_parses_and_graphviz_rejected() {
     // An unsupported format or an unknown option in the parenthesized list is rejected loudly.
     assert!(matches!(
         parse("EXPLAIN (FORMAT GRAPHVIZ) SELECT 1"),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidParameterValue(_))
     ));
     assert!(matches!(
         parse("EXPLAIN (BOGUS) SELECT 1"),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidParameterValue(_))
     ));
 }
 
@@ -1938,7 +1938,7 @@ fn window_without_frame_has_none() {
 fn window_unknown_func_is_rejected() {
     assert!(matches!(
         parse("SELECT MY_FUNC() OVER (ORDER BY id) FROM t"),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -3907,7 +3907,7 @@ fn is_json_does_not_mis_rewrite_json_data() {
     // with a minted one (checked on the rewrite path, i.e. when an `IS JSON` predicate is present).
     assert!(matches!(
         parse("SELECT * FROM t WHERE __nusadb_isjson_1 IS JSON"),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidStatement(_))
     ));
 
     // `IS JSON` chained directly before another postfix/ternary operator is rejected with a clear

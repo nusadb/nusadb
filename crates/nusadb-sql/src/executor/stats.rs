@@ -146,7 +146,7 @@ fn encode_one(value: &ast::Value, ty: ColumnType) -> Result<Vec<u8>, Error> {
 }
 
 fn internal(what: &str) -> Error {
-    Error::Unsupported(format!("internal: {what} out of bounds"))
+    Error::Internal(format!("{what} out of bounds"))
 }
 
 /// Total order over non-null values of one column. All values in a column share

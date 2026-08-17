@@ -37,6 +37,10 @@ pub enum ClusterError {
     /// The operation is not supported by this cluster (e.g. creating a database in single-database
     /// embedded mode).
     Unsupported(String),
+    /// The operation named a database the cluster will not let go — today, the default database,
+    /// which every connection falls back to. The name is right and the caller has the rights; the
+    /// cluster reserves it.
+    Protected(String),
     /// An I/O error opening, creating, or removing a database's on-disk storage.
     Io(String),
 }
@@ -48,7 +52,7 @@ impl std::fmt::Display for ClusterError {
             Self::NotFound(n) => write!(f, "database \"{n}\" does not exist"),
             Self::InUse(n) => write!(f, "cannot drop the currently open database \"{n}\""),
             Self::InvalidName(n) => write!(f, "invalid database name \"{n}\""),
-            Self::Unsupported(m) => write!(f, "{m}"),
+            Self::Unsupported(m) | Self::Protected(m) => write!(f, "{m}"),
             Self::Io(m) => write!(f, "database storage error: {m}"),
         }
     }
@@ -58,16 +62,20 @@ impl std::error::Error for ClusterError {}
 
 impl ClusterError {
     /// The SQLSTATE the wire reports for this error. `3D000` is *invalid catalog name* (unknown
-    /// database); `42P04` is *duplicate database*; `55006` is *object in use*; the rest fall back to
-    /// the generic internal-error code.
+    /// database); `42P04` is *duplicate database*; `55006` is *object in use*, which also answers a
+    /// database the cluster reserves; `0A000` is *feature not supported*, which single-database mode
+    /// genuinely is; and `58030` is `io_error`, which is the caller's cue that the disk, not the
+    /// statement, is the problem. None of these is `internal_error` any more: the last two used to
+    /// be, and both told a caller the engine had faulted when it had not.
     #[must_use]
     pub const fn sqlstate(&self) -> &'static str {
         match self {
             Self::NotFound(_) => "3D000",
             Self::AlreadyExists(_) => "42P04",
-            Self::InUse(_) => "55006",
             Self::InvalidName(_) => "42602",
-            Self::Unsupported(_) | Self::Io(_) => nusadb_sql::INTERNAL_ERROR,
+            Self::InUse(_) | Self::Protected(_) => "55006",
+            Self::Unsupported(_) => "0A000",
+            Self::Io(_) => "58030",
         }
     }
 }

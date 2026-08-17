@@ -29,7 +29,7 @@ fn resolve_derived_base(
     catalog: &dyn Catalog,
 ) -> Result<(TableSchema, Option<SelectPlan>), Error> {
     if base.lateral {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "a LATERAL derived table cannot be the first item in FROM".to_owned(),
         ));
     }
@@ -49,7 +49,7 @@ fn apply_ordinality(mut plan: SelectPlan, table: &ast::TableRef) -> Result<Selec
             .iter()
             .any(|p| matches!(p.expr.kind, TypedExprKind::SetReturning { .. }));
         if !has_srf {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "WITH ORDINALITY requires a set-returning function (e.g. unnest, generate_series)"
                     .to_owned(),
             ));
@@ -692,7 +692,7 @@ fn join_equality_predicate(
             .enumerate()
             .find(|(_, c)| &c.def.name == name)
             .ok_or_else(|| {
-                Error::Unsupported(format!(
+                Error::InvalidStatement(format!(
                     "join column `{name}` is not present on the left side"
                 ))
             })?;
@@ -702,7 +702,7 @@ fn join_equality_predicate(
             .enumerate()
             .find(|(_, d)| &d.name == name)
             .ok_or_else(|| {
-                Error::Unsupported(format!(
+                Error::InvalidStatement(format!(
                     "join column `{name}` is not present on the right side"
                 ))
             })?;
@@ -774,7 +774,7 @@ fn resolve_order_by_key(
             .and_then(|p| projection.get(p - 1))
             .map(|p| p.expr.clone())
             .ok_or_else(|| {
-                Error::Unsupported(format!(
+                Error::InvalidColumnReference(format!(
                     "ORDER BY position {n} is out of range (1..={})",
                     projection.len()
                 ))
@@ -831,7 +831,7 @@ fn analyze_row_lock(
     if let Some(of) = &lock.of
         && base_qualifier != Some(of.as_str())
     {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "FOR UPDATE / FOR SHARE OF \"{of}\": no such table in the query's FROM clause"
         )));
     }
@@ -910,7 +910,7 @@ pub(super) fn analyze_set_operation(
                     ty,
                 },
                 None => {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::InvalidColumnReference(format!(
                         "ORDER BY position {n} is out of range (1..={})",
                         cols.len()
                     )));
@@ -1030,14 +1030,14 @@ fn resolve_view(name: &str, catalog: &dyn Catalog) -> Result<SelectPlan, Error> 
         });
     };
     if VIEW_DEPTH.with(std::cell::Cell::get) >= MAX_VIEW_DEPTH {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::LimitExceeded(format!(
             "view `{name}` nests deeper than {MAX_VIEW_DEPTH} levels (likely a recursive view)"
         )));
     }
     VIEW_DEPTH.with(|d| d.set(d.get() + 1));
     let result = match crate::parse(&sql) {
         Ok(ast::Statement::Select(sel)) => analyze_select(sel, catalog),
-        Ok(_) => Err(Error::Unsupported(format!(
+        Ok(_) => Err(Error::Internal(format!(
             "view `{name}` definition is not a SELECT"
         ))),
         Err(e) => Err(e),
@@ -1300,7 +1300,7 @@ fn analyze_select_scoped(
     let mut having = match sel.having {
         Some(expr) => {
             if !aggregated {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidStatement(
                     "HAVING requires GROUP BY or an aggregate function".to_owned(),
                 ));
             }
@@ -1440,7 +1440,7 @@ fn analyze_select_scoped(
     let limit_with_ties = sel.limit_with_ties && sel.limit.is_some();
     if limit_with_ties {
         if order_by.is_empty() {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "FETCH FIRST ... WITH TIES requires an ORDER BY clause".to_owned(),
             ));
         }
@@ -1632,7 +1632,7 @@ fn analyze_ctes(
     let mut modifying_defs: Vec<ModifyingCteDef> = Vec::new();
     for cte in with {
         if resolved.iter().any(|c| c.name == cte.name) {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidStatement(format!(
                 "duplicate CTE name `{}` in the same WITH clause",
                 cte.name
             )));
@@ -1750,7 +1750,7 @@ fn synthetic_cte_join_schema(
         return Ok(schema.clone());
     }
     if column_aliases.len() != schema.columns.len() {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidColumnReference(format!(
             "CTE reference declares {} column alias(es) but the CTE exposes {}",
             column_aliases.len(),
             schema.columns.len()
@@ -1798,7 +1798,7 @@ fn analyze_modifying_cte(
     catalog: &dyn Catalog,
 ) -> Result<(ResolvedCte, ModifyingCteDef), Error> {
     let target = dml_target_name(stmt).ok_or_else(|| {
-        Error::Unsupported("a data-modifying CTE must be INSERT/UPDATE/DELETE".to_owned())
+        Error::InvalidStatement("a data-modifying CTE must be INSERT/UPDATE/DELETE".to_owned())
     })?;
     // The statement modifies (and may read) its own target; lift the forbid for just this analysis.
     let logical = {
@@ -1810,20 +1810,20 @@ fn analyze_modifying_cte(
         crate::planner::LogicalPlan::Update(p) => &p.returning,
         crate::planner::LogicalPlan::Delete(p) => &p.returning,
         _ => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "a data-modifying CTE must be INSERT/UPDATE/DELETE".to_owned(),
             ));
         },
     };
     if returning.is_empty() {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "data-modifying CTE `{}` must have a RETURNING clause",
             cte.name
         )));
     }
     let width = returning.len();
     if !cte.columns.is_empty() && cte.columns.len() != width {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidColumnReference(format!(
             "CTE `{}` declares {} column name(s) but its statement returns {width}",
             cte.name,
             cte.columns.len()
@@ -1869,7 +1869,7 @@ fn analyze_recursive_cte(
     catalog: &dyn Catalog,
 ) -> Result<(ResolvedCte, RecursiveCteDef), Error> {
     let ast::CteBody::Query(query) = &cte.body else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "recursive CTE `{}` cannot be a data-modifying statement",
             cte.name
         )));
@@ -1881,13 +1881,13 @@ fn analyze_recursive_cte(
         right,
     } = &**query
     else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "recursive CTE `{}` must combine a base and a recursive term with UNION [ALL]",
             cte.name
         )));
     };
     if !matches!(op, ast::SetOp::Union) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "recursive CTE `{}` must use UNION [ALL], not INTERSECT/EXCEPT",
             cte.name
         )));
@@ -2052,7 +2052,7 @@ fn cte_schema(name: &str, explicit: &[String], plan: &SelectPlan) -> Result<Tabl
     let extra = plan.extra_columns.len();
     let width = base_width + extra + usize::from(plan.ordinality);
     if !explicit.is_empty() && explicit.len() != width {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidColumnReference(format!(
             "CTE `{name}` declares {} column name(s) but its query returns {width}",
             explicit.len()
         )));
@@ -2142,7 +2142,7 @@ pub(super) fn expand_grouping(group_by: &ast::GroupBy) -> Result<GroupingSpec, E
             // Every subset of the elements (2^n), highest bitmask first so the full set leads.
             let n = elements.len();
             if n > MAX_CUBE_ELEMENTS {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::LimitExceeded(format!(
                     "CUBE with {n} elements is too large (max {MAX_CUBE_ELEMENTS}; it expands to 2^n grouping sets)"
                 )));
             }
@@ -2184,8 +2184,8 @@ pub(super) fn intern_group_key(
     };
     let typed = analyze_expr(effective, scope, catalog, None)?;
     if matches!(typed.kind, TypedExprKind::Literal(_)) {
-        return Err(Error::Unsupported(
-            "GROUP BY on a constant is not supported — group by a column or expression".to_owned(),
+        return Err(Error::InvalidColumnReference(
+            "GROUP BY on a constant — group by a column or expression".to_owned(),
         ));
     }
     // De-duplicate by structural equality so `GROUP BY a, a` and a repeated expression share a slot.
@@ -2206,11 +2206,12 @@ fn positional_group_key(n: i64, projection: &[ast::SelectItem]) -> Result<&ast::
         .and_then(|p| projection.get(p - 1));
     match item {
         Some(ast::SelectItem::Expr { expr, .. }) => Ok(expr),
-        Some(_) => Err(Error::Unsupported(
-            "positional GROUP BY over a `*` / `table.*` wildcard is not supported — name the column"
-                .to_owned(),
+        // The arm below reports an out-of-range position as an invalid column reference; a position
+        // that lands on a wildcard is the same kind of mistake and reports the same class.
+        Some(_) => Err(Error::InvalidColumnReference(
+            "positional GROUP BY over a `*` / `table.*` wildcard — name the column".to_owned(),
         )),
-        None => Err(Error::Unsupported(format!(
+        None => Err(Error::InvalidColumnReference(format!(
             "GROUP BY position {n} is out of range (1..={})",
             projection.len()
         ))),
@@ -2287,7 +2288,7 @@ pub(super) fn rebase_onto_aggregation(
         },
         // A bare (base) column that is not (part of) a GROUP BY key is neither grouped nor aggregated.
         TypedExprKind::Column(_) => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidGrouping(
                 "column must appear in GROUP BY or inside an aggregate function".to_owned(),
             ));
         },
@@ -2416,7 +2417,7 @@ fn rebase_grouping_call(
             .iter()
             .position(|key| key == arg)
             .ok_or_else(|| {
-                Error::Unsupported(
+                Error::InvalidGrouping(
                     "GROUPING arguments must be expressions that appear in GROUP BY".to_owned(),
                 )
             })?;
@@ -2463,7 +2464,7 @@ pub(super) fn analyze_projection(
         match item {
             ast::SelectItem::Wildcard => {
                 if visible.is_empty() {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidStatement(
                         "SELECT * requires a FROM clause".to_owned(),
                     ));
                 }
@@ -2504,7 +2505,7 @@ pub(super) fn analyze_projection(
                     });
                 }
                 if !matched {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::InvalidStatement(format!(
                         "`{table}.*` refers to a table not in the FROM clause"
                     )));
                 }
@@ -2586,7 +2587,7 @@ fn analyze_set_returning(
             };
             let first = analyze_expr(first_expr, scope, catalog, None)?;
             let ColumnType::Array(elem) = first.ty else {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::FunctionArgs(format!(
                     "unnest() expects an array argument, got {:?}",
                     first.ty
                 )));
@@ -2597,7 +2598,7 @@ fn analyze_set_returning(
             for arg_expr in rest_exprs {
                 let arg = analyze_expr(arg_expr, scope, catalog, None)?;
                 if !matches!(arg.ty, ColumnType::Array(_)) {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::FunctionArgs(format!(
                         "unnest() expects an array argument, got {:?}",
                         arg.ty
                     )));
@@ -2626,7 +2627,7 @@ fn analyze_set_returning(
             let start = analyze_expr(first_arg, scope, catalog, None)?;
             if matches!(start.ty, Date | Timestamp | TimestampTz) {
                 let [stop_e, step_e] = rest else {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidStatement(
                         "generate_series over a temporal range requires (start, stop, interval step)"
                             .to_owned(),
                     ));
@@ -2784,7 +2785,7 @@ fn analyze_set_returning(
 
 /// Arity error for a set-returning function call.
 fn srf_arity_error(func: ast::SetReturningFunc, expected: usize, got: usize) -> Error {
-    Error::Unsupported(format!(
+    Error::FunctionArgs(format!(
         "{}() expects {expected} argument(s), got {got}",
         func.name()
     ))
@@ -2968,18 +2969,20 @@ pub(super) fn analyze_aggregate(
             | ast::AggregateFunc::PercentileDisc
             | ast::AggregateFunc::Mode,
             _,
-        ) => Err(Error::Unsupported(
+        ) => Err(Error::InvalidStatement(
             "PERCENTILE_CONT / PERCENTILE_DISC / MODE require WITHIN GROUP syntax".to_owned(),
         )),
         // GROUPING is a synthetic aggregate created by `rebase_onto_aggregation` from a scalar
         // `GROUPING(...)` call, never type-checked through this path; reject defensively.
-        (ast::AggregateFunc::Grouping, _) => Err(Error::Unsupported(
+        (ast::AggregateFunc::Grouping, _) => Err(Error::InvalidStatement(
             "GROUPING is resolved against the query's grouping sets, not as an aggregate"
                 .to_owned(),
         )),
         // SUM/AVG/MIN/MAX without an argument is a parser error in practice,
         // but defensively reject here.
-        (_, None) => Err(Error::Unsupported(format!("{func:?} requires an argument"))),
+        (_, None) => Err(Error::FunctionArgs(format!(
+            "{func:?} requires an argument"
+        ))),
     }
 }
 

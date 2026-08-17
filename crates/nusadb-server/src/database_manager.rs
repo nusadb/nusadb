@@ -388,7 +388,7 @@ impl DatabaseCluster for DatabaseManager {
             return Err(ClusterError::InUse(name.to_owned()));
         }
         if name == self.default_name {
-            return Err(ClusterError::Unsupported(format!(
+            return Err(ClusterError::Protected(format!(
                 "cannot drop the default database \"{name}\""
             )));
         }
@@ -702,7 +702,7 @@ mod tests {
         );
         assert!(matches!(
             m.drop_database("nusadb", false, "shop"),
-            Err(ClusterError::Unsupported(_))
+            Err(ClusterError::Protected(_))
         ));
 
         // Dropping a non-current database removes its catalog entry and storage.

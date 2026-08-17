@@ -26,10 +26,129 @@ pub enum Error {
     #[error("expected a single SQL statement, found {0}")]
     MultipleStatements(usize),
 
-    /// The input is valid SQL but uses a construct the Stage 4 SQL engine does
-    /// not support yet. The string names the offending construct.
+    /// The input is valid SQL but uses a construct NusaDB has not built yet. The string names the
+    /// offending construct.
+    ///
+    /// This reports `0A000` (`feature_not_supported`), and that is a promise about what it carries:
+    /// a caller reading it is entitled to conclude the statement would work elsewhere and that
+    /// nothing here is its fault. A migration tool acts on that by skipping the statement and
+    /// carrying on. So an ordinary mistake — an unknown role, a mistyped argument count, a value
+    /// out of range — must **not** arrive here; those have variants of their own below, and putting
+    /// one back in this one tells the tool to sail past a statement it should have stopped at.
     #[error("unsupported SQL construct: {0}")]
     Unsupported(String),
+
+    // --- Split out of the old catch-all refusal --------------------------
+    // Every variant in this block was once `Unsupported`, back when that one variant answered for
+    // engine bugs, ordinary user mistakes and genuinely missing features alike — and reported all
+    // three as `internal_error`. They are separate now because a client acts on the class: these
+    // say whose mistake it was, which is the whole point of sending a code rather than a sentence.
+    /// The engine's own invariant broke: a plan node reached a stage that cannot serve it, a lookup
+    /// that the planner guarantees came back empty, a cache that was built went missing. Nothing
+    /// the caller wrote can cause this and nothing it can write will avoid it, which is exactly
+    /// what `internal_error` means.
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    /// The statement parses but says something illegal: a constant where an expression was
+    /// required, two rows of different width compared, `SELECT *` with nothing to select from.
+    /// Reported as `42601`, the same class as a syntax error, because it is one — just caught a
+    /// stage later.
+    #[error("{0}")]
+    InvalidStatement(String),
+
+    /// A call gave a known function the wrong number of arguments, or arguments of a type it has no
+    /// form for. Reported as `42883` (`undefined_function`): overload resolution found no function
+    /// of that name and shape, which is what the caller needs to hear.
+    #[error("{0}")]
+    FunctionArgs(String),
+
+    /// A named object the statement referred to is not there — a role, a policy, a type, a domain,
+    /// an operator class. Distinct from [`TableNotFound`](Self::TableNotFound) and friends only in
+    /// that those name a kind the standard gives a class of its own.
+    #[error("{0}")]
+    ObjectNotFound(String),
+
+    /// A `CREATE` named an object, of a kind without a class of its own, that is already there.
+    #[error("{0}")]
+    ObjectExists(String),
+
+    /// A column reference that cannot stand where it stands: a name that matches two relations in
+    /// scope, an `ORDER BY`/`GROUP BY` ordinal past the end of the select list, or a column alias
+    /// list whose width disagrees with the query it names.
+    #[error("{0}")]
+    InvalidColumnReference(String),
+
+    /// An aggregate used where the query's grouping cannot support it — a column neither grouped
+    /// nor aggregated, an aggregate in a clause that has no grouping to speak of.
+    #[error("{0}")]
+    InvalidGrouping(String),
+
+    /// A `CREATE`/`ALTER TABLE` that would leave the table itself ill-formed: a second `PRIMARY
+    /// KEY`, `ON COMMIT` on a table that is not temporary, dropping the last column.
+    #[error("{0}")]
+    InvalidTableDefinition(String),
+
+    /// A write supplied a value for a column the table computes itself — `GENERATED ALWAYS AS
+    /// IDENTITY` or a generated column. `428C9` is the class a client branches on to retry the
+    /// write without that column.
+    #[error("{0}")]
+    GeneratedAlways(String),
+
+    /// `EXECUTE`/`DEALLOCATE` named a prepared statement this session does not hold. Reported as
+    /// `26000` (`invalid_sql_statement_name`), the code a pool checks to decide whether its cached
+    /// statement was discarded and needs re-preparing — advice `internal_error` cannot give.
+    #[error("{0}")]
+    PreparedStatementNotFound(String),
+
+    /// A statement or object hit a built-in limit: a series longer than the row cap, a view nested
+    /// deeper than the engine walks, a value too large to encode. Class `54` tells a client the
+    /// request must get smaller — not that it was wrong, and not that the engine broke.
+    #[error("{0}")]
+    LimitExceeded(String),
+
+    /// The statement would orphan something that still points at it — a table another table's
+    /// foreign key references, a role that still owns objects, a privilege it has granted onward.
+    /// `2BP01` is what a client reads to know that `CASCADE`, or dropping the dependants first, is
+    /// the way through.
+    #[error("{0}")]
+    DependentObjects(String),
+
+    /// A subquery used where one row was required returned more than one — `21000`, the standard's
+    /// cardinality violation.
+    #[error("{0}")]
+    CardinalityViolation(String),
+
+    /// A statement arrived while the transaction is already in the failed state; nothing will run
+    /// until it is ended. `25P02` is the single code a pool watches most closely, because it says
+    /// "roll back and start again" rather than "retry this".
+    #[error("{0}")]
+    TransactionAborted(String),
+
+    /// `COMMIT`, `ROLLBACK` or `SAVEPOINT` arrived with no transaction open.
+    #[error("{0}")]
+    NoActiveTransaction(String),
+
+    /// A statement that must precede a transaction arrived inside one — a nested `BEGIN`, a `SET
+    /// TRANSACTION` after the first statement.
+    #[error("{0}")]
+    ActiveTransaction(String),
+
+    /// A write arrived in a `READ ONLY` transaction.
+    #[error("{0}")]
+    ReadOnlyTransaction(String),
+
+    /// A runtime argument's *value* is outside what the function accepts, though its type is right:
+    /// a zero step for `generate_series`, a bucket count of zero, a malformed escape in `decode`,
+    /// a `NULL` where a JSON object key must go.
+    #[error("{0}")]
+    InvalidParameterValue(String),
+
+    /// A date/time computation left the representable range — adding an interval past the end of
+    /// time, an epoch too large to be a timestamp. `22008` rather than the numeric `22003` so a
+    /// client can tell a calendar overflow from an integer one.
+    #[error("{0}")]
+    DatetimeOverflow(String),
 
     // --- Analyzer -------------------------------------------------------
     /// A referenced table is not present in the catalog.
@@ -347,8 +466,10 @@ impl Error {
     /// own faults. Reporting an ordinary mistake as an engine fault is not a cosmetic error: it
     /// tells a caller there is nothing it can fix.
     ///
-    /// One class this deliberately does not return is `0A` (`feature_not_supported`), even though
-    /// [`Unsupported`](Self::Unsupported) looks like its home; the reason is with that arm below.
+    /// `0A000` (`feature_not_supported`) is returned by exactly one variant,
+    /// [`Unsupported`](Self::Unsupported), and it means what it says: NusaDB has not built this.
+    /// It used to mean less than that — the same variant also carried unknown roles, miscounted
+    /// arguments and engine bugs — which is why the block of variants split out of it exists.
     ///
     /// Engine errors carry their standard codes via [`nusadb_core::Error::sqlstate`], and a
     /// cancelled statement reports `57014` so a driver branching on `query_canceled` recognises it.
@@ -368,20 +489,14 @@ impl Error {
             // reads the class to decide whether to retry, report or abort, so a whole category of
             // ordinary mistakes arriving as "internal error" is a defect that never shows up in
             // hand testing and behaves strangely in an integration layer.
-            // `Unsupported` is deliberately NOT mapped to `feature_not_supported` here. It is the
-            // engine's catch-all refusal, and a good share of what it carries is an ordinary
-            // mistake — an unknown role, an unbound parameter, two PRIMARY KEYs — not a missing
-            // feature. Telling a migration tool "feature not supported" invites it to skip the
-            // statement and carry on, which is worse than the honest "something went wrong" it
-            // gets today. Splitting the variant is the fix, and it is its own piece of work.
-            //
             // syntax_error, including the arity mismatches: supplying the wrong number of values
             // is a malformed statement, not a fault.
             Self::Syntax(_)
             | Self::MultipleStatements(_)
             | Self::Empty
             | Self::ArityMismatch { .. }
-            | Self::SetOpArityMismatch { .. } => "42601",
+            | Self::SetOpArityMismatch { .. }
+            | Self::InvalidStatement(_) => "42601",
             Self::TableNotFound { .. } => "42P01", // undefined_table
             Self::TableExists { .. } => "42P07",   // duplicate_table
             Self::SchemaNotFound { .. } => "3F000", // invalid_schema_name
@@ -391,18 +506,42 @@ impl Error {
             Self::AmbiguousNull { .. } => "42P18", // indeterminate_datatype
             // Class 42501 — the role lacks the right, whether refused outright or by a row policy.
             Self::PermissionDenied(_) | Self::RlsCheckViolation { .. } => "42501",
-            // undefined_function — a name the caller used that resolves to nothing callable.
+            // undefined_function — a name the caller used that resolves to nothing callable, or a
+            // call whose shape matches no form of a name that does exist. Overload resolution
+            // cannot tell those apart and neither does the standard: both are `42883`.
             Self::UnknownFunction(_)
             | Self::FunctionNotFound { .. }
             | Self::ProcedureNotFound { .. }
-            | Self::ProcedureArgCount { .. } => "42883",
+            | Self::ProcedureArgCount { .. }
+            | Self::FunctionArgs(_) => "42883",
             // duplicate_function / duplicate_object — creating something already there.
             Self::FunctionExists { .. } | Self::ProcedureExists { .. } => "42723",
-            Self::TriggerExists { .. } => "42710", // duplicate_object
+            // duplicate_object
+            Self::TriggerExists { .. } | Self::ObjectExists { .. } => "42710",
             // undefined_object — a named thing that is not there.
             Self::TriggerNotFound { .. }
             | Self::SequenceNotFound { .. }
-            | Self::IndexNotFound { .. } => "42704",
+            | Self::IndexNotFound { .. }
+            | Self::ObjectNotFound { .. } => "42704",
+            Self::InvalidColumnReference(_) => "42P10", // invalid_column_reference
+            Self::InvalidGrouping(_) => "42803",        // grouping_error
+            Self::InvalidTableDefinition(_) => "42P16", // invalid_table_definition
+            Self::GeneratedAlways(_) => "428C9",        // generated_always
+            // invalid_sql_statement_name — the name is gone, so re-preparing is the way out.
+            Self::PreparedStatementNotFound(_) => "26000",
+            // Class 25 — the transaction is not in a state that admits this statement. A pool reads
+            // these to decide between "roll back and retry" and "this connection is fine".
+            Self::TransactionAborted(_) => "25P02", // in_failed_sql_transaction
+            Self::NoActiveTransaction(_) => "25P01", // no_active_sql_transaction
+            Self::ActiveTransaction(_) => "25001",  // active_sql_transaction
+            Self::ReadOnlyTransaction(_) => "25006", // read_only_sql_transaction
+            // dependent_objects_still_exist — CASCADE, or drop the dependants, is the way through.
+            Self::DependentObjects(_) => "2BP01",
+            Self::CardinalityViolation(_) => "21000", // cardinality_violation
+            // program_limit_exceeded — the request must get smaller; it was not wrong.
+            Self::LimitExceeded(_) => "54000",
+            // The engine has not built this. The only variant that may say so; see its doc.
+            Self::Unsupported(_) => "0A000", // feature_not_supported
             // statement_too_complex — the nesting limit, not a fault.
             Self::TriggerRecursionLimit { .. } | Self::ProcedureRecursionLimit { .. } => "54001",
             // raise_exception — the user's own RAISE from a procedure body. Reporting this as an
@@ -418,11 +557,13 @@ impl Error {
             Self::InvalidValue { ty, .. } if is_datetime(*ty) => "22007",
             Self::InvalidValue { .. } => "22P02",
             Self::InvalidRegex(_) => "2201B", // invalid_regular_expression
-            // The residue, each for its own reason: `MalformedBatch` and `MalformedTuple` are the
-            // engine's own bookkeeping; `Decryption` and `UdfFailed` come from outside the engine
-            // but have no class that says more than "it went wrong" here; and `Unsupported` is
-            // held back deliberately, for the reason recorded above.
-            Self::Unsupported(_)
+            // invalid_parameter_value — the argument's type is right, its value is not.
+            Self::InvalidParameterValue(_) => "22023",
+            Self::DatetimeOverflow(_) => "22008", // datetime_field_overflow
+            // The residue, each for its own reason: `Internal`, `MalformedBatch` and
+            // `MalformedTuple` are the engine's own bookkeeping; `Decryption` and `UdfFailed` come
+            // from outside the engine but have no class that says more than "it went wrong" here.
+            Self::Internal(_)
             | Self::MalformedBatch { .. }
             | Self::MalformedTuple { .. }
             | Self::Decryption(_)
@@ -545,6 +686,64 @@ mod tests {
         }
     }
 
+    /// The same contract for the variants split out of the old catch-all refusal. Kept apart from
+    /// the case list above so the split's own coverage is visible as a block: every one of these
+    /// reported `internal_error` before, and each now names whose mistake it was.
+    #[test]
+    fn a_refusal_split_from_the_catch_all_reports_its_own_class() {
+        let cases: Vec<(Error, &str)> = vec![
+            (Error::InvalidStatement("no FROM".to_owned()), "42601"),
+            (Error::FunctionArgs("abs() takes 1".to_owned()), "42883"),
+            (
+                Error::ObjectNotFound("role `alice` does not exist".to_owned()),
+                "42704",
+            ),
+            (
+                Error::ObjectExists("role `alice` already exists".to_owned()),
+                "42710",
+            ),
+            (
+                Error::InvalidColumnReference("ORDER BY position 9".to_owned()),
+                "42P10",
+            ),
+            (Error::InvalidGrouping("not grouped".to_owned()), "42803"),
+            (
+                Error::InvalidTableDefinition("two PRIMARY KEYs".to_owned()),
+                "42P16",
+            ),
+            (
+                Error::GeneratedAlways("identity column".to_owned()),
+                "428C9",
+            ),
+            (
+                Error::PreparedStatementNotFound("no statement \"p1\"".to_owned()),
+                "26000",
+            ),
+            (Error::TransactionAborted("aborted".to_owned()), "25P02"),
+            (Error::NoActiveTransaction("no txn".to_owned()), "25P01"),
+            (Error::ActiveTransaction("nested BEGIN".to_owned()), "25001"),
+            (Error::ReadOnlyTransaction("read only".to_owned()), "25006"),
+            (
+                Error::DependentObjects("a view uses it".to_owned()),
+                "2BP01",
+            ),
+            (Error::CardinalityViolation("two rows".to_owned()), "21000"),
+            (Error::LimitExceeded("too many rows".to_owned()), "54000"),
+            (
+                Error::InvalidParameterValue("step is 0".to_owned()),
+                "22023",
+            ),
+            (Error::DatetimeOverflow("year 300000".to_owned()), "22008"),
+        ];
+        for (error, want) in cases {
+            assert_eq!(
+                error.sqlstate(),
+                want,
+                "wrong class for `{error}`; a client reads this to decide what to do"
+            );
+        }
+    }
+
     /// A fault in the engine keeps reporting `internal_error`, which is what it is. Recoding the
     /// user-facing variants must not sweep these along: the batch-construction mismatch shares its
     /// wording with the query-level one and differs only in which variant carries it.
@@ -557,8 +756,7 @@ mod tests {
                 found: 3,
             },
             Error::MalformedTuple { offset: 7 },
-            // The catch-all refusal: deliberately still internal, see the mapping's own note.
-            Error::Unsupported("LATERAL".to_owned()),
+            Error::Internal("plan node reached the wrong stage".to_owned()),
             Error::UdfFailed {
                 name: "f".to_owned(),
                 message: "boom".to_owned(),
@@ -569,6 +767,33 @@ mod tests {
                 error.sqlstate(),
                 INTERNAL_ERROR,
                 "`{error}` is the engine's own failure and must not be dressed as a user mistake"
+            );
+        }
+    }
+
+    /// `feature_not_supported` is a claim, not a shrug: it tells a migration tool the statement is
+    /// fine and this server merely lacks the feature, which the tool answers by skipping it and
+    /// carrying on. So exactly one variant may say it, and it is the one whose name promises it.
+    ///
+    /// The asymmetry is the point. A missing feature reported as `internal_error` costs a caller a
+    /// needless stop; an ordinary mistake reported as `feature_not_supported` costs it the
+    /// statement it should have stopped at. That is why the split had to happen before this
+    /// mapping did, and why a variant that carries a user's mistake must never be added here.
+    #[test]
+    fn only_a_genuinely_missing_feature_reports_feature_not_supported() {
+        assert_eq!(Error::Unsupported("LATERAL".to_owned()).sqlstate(), "0A000");
+        let user_mistakes: Vec<Error> = vec![
+            Error::ObjectNotFound("role `alice` does not exist".to_owned()),
+            Error::FunctionArgs("abs() expects 1 argument, got 2".to_owned()),
+            Error::InvalidParameterValue("step must not be zero".to_owned()),
+            Error::InvalidStatement("SELECT * requires a FROM clause".to_owned()),
+        ];
+        for error in user_mistakes {
+            assert_ne!(
+                error.sqlstate(),
+                "0A000",
+                "`{error}` is the caller's mistake; telling a migration tool the feature is missing \
+                 invites it to skip a statement it should have stopped at"
             );
         }
     }

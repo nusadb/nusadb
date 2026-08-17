@@ -246,10 +246,12 @@ fn derived_table_limitations_are_rejected() {
         err("SELECT a FROM (SELECT a FROM t)"),
         Error::Unsupported(_)
     ));
-    // A LATERAL derived table cannot be the first FROM item.
+    // A LATERAL derived table cannot be the first FROM item. That is the query's mistake, not a
+    // feature NusaDB lacks — there is nothing to the left for it to depend on — so it reports
+    // `42601` while the `RIGHT JOIN LATERAL` below stays `0A000`.
     assert!(matches!(
         err("SELECT a FROM LATERAL (SELECT a FROM t) AS x"),
-        Error::Unsupported(_)
+        Error::InvalidStatement(_)
     ));
     // A RIGHT/FULL JOIN LATERAL is meaningless (the right side depends on the left) → rejected.
     assert!(matches!(

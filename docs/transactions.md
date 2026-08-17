@@ -50,6 +50,32 @@ The same shape applies through any driver or ORM: catch class `40`, roll back, b
 jitter, re-run. ORMs with a "retry on serialization failure" option (e.g. SQLAlchemy retrying
 decorators) should enable it.
 
+### Class `25` — the transaction is in the wrong state
+
+Class `40` says *run it again*. Class `25` says *the transaction you are in cannot take this
+statement*, which is a different instruction:
+
+| Code | What happened | What to do |
+| --- | --- | --- |
+| `25P02` | a statement already failed, so the transaction is aborted and every later statement is refused | `ROLLBACK` (or roll back to a `SAVEPOINT` taken before the failure), then start again |
+| `25P01` | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` outside a transaction block | open a transaction first; there is no savepoint scope without one |
+| `25001` | `SET TRANSACTION ISOLATION LEVEL` after the transaction has already run a query | issue it before the transaction's first statement |
+
+Two things the server does **not** treat as errors, which a client should not code around:
+
+- `COMMIT` and `ROLLBACK` outside a transaction block **succeed as no-ops**. A pool that ends a
+  transaction defensively before returning a connection can do so unconditionally.
+- A redundant `BEGIN` inside an open transaction is a **no-op**, not `25001`. Transactions do not
+  nest; use `SAVEPOINT` for a nested scope.
+
+`25P02` is the one worth handling explicitly. The loop above already does the right thing — its
+handler rolls back before deciding whether to retry — but a handler that instead re-runs the
+*statement* on a connection in this state will get `25P02` again for every attempt, because nothing
+clears it but ending the transaction. Nothing in class `25` is retryable in place.
+
+(`25006`, *read-only transaction*, is defined but not reachable over the wire: `BEGIN READ ONLY`
+and `SET TRANSACTION READ ONLY` are refused up front with `0A000` — see the note below.)
+
 ## Isolation levels over the wire
 
 The default is `READ COMMITTED`. All four standard levels are supported end-to-end, requested any

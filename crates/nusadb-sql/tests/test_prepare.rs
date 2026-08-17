@@ -117,12 +117,12 @@ fn execute_errors_and_deallocate() {
     // Wrong argument arity is an error.
     assert!(matches!(
         try_exec(engine, &mut session, "EXECUTE p (1, 2)"),
-        Err(Error::Unsupported(_))
+        Err(Error::FunctionArgs(_))
     ));
     // Executing an unknown prepared statement is an error.
     assert!(matches!(
         try_exec(engine, &mut session, "EXECUTE ghost (1)"),
-        Err(Error::Unsupported(_))
+        Err(Error::PreparedStatementNotFound(_))
     ));
 
     // DEALLOCATE removes it; afterwards EXECUTE fails.

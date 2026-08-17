@@ -491,7 +491,7 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         // type so schemas using it still load (B-types); a genuinely unknown name is still rejected.
         D::Custom(name, _) => {
             return aliased_type(name)
-                .ok_or_else(|| Error::Unsupported(format!("column type `{name}`")));
+                .ok_or_else(|| Error::ObjectNotFound(format!("type `{name}` does not exist")));
         },
         other => return unsupported(&format!("column type `{other}`")),
     };
@@ -600,7 +600,7 @@ pub(super) fn exact_numeric_type(info: &sql::ExactNumberInfo) -> Result<ColumnTy
     // it to 255 — a clamped declaration would round values to the wrong scale.
     let checked = |v: u64, what: &str| -> Result<u8, Error> {
         u8::try_from(v).map_err(|_| {
-            Error::Unsupported(format!(
+            Error::InvalidParameterValue(format!(
                 "NUMERIC {what} {v} exceeds the maximum supported ({})",
                 u8::MAX
             ))
@@ -613,7 +613,7 @@ pub(super) fn exact_numeric_type(info: &sql::ExactNumberInfo) -> Result<ColumnTy
             // sqlparser 0.62 models the scale as signed (a negative scale is a newer-standard extension);
             // the catalog stores an unsigned scale, so anything outside 0..=255 is rejected.
             let scale = u64::try_from(*s).map_err(|_| {
-                Error::Unsupported(format!(
+                Error::InvalidParameterValue(format!(
                     "NUMERIC scale {s} out of the supported range (0..=255)"
                 ))
             })?;
@@ -625,7 +625,7 @@ pub(super) fn exact_numeric_type(info: &sql::ExactNumberInfo) -> Result<ColumnTy
     // loudly here rather than accept a declaration whose wider values would fail (or corrupt) on
     // write. Precision `0` means "unconstrained" and is unaffected.
     if precision > NUMERIC_MAX_PRECISION {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "NUMERIC precision {precision} exceeds the maximum supported ({NUMERIC_MAX_PRECISION})"
         )));
     }

@@ -362,7 +362,7 @@ impl HnswIndex {
     /// [`Error::Unsupported`] if `vector`'s length differs from the index dimension.
     pub fn insert_reporting(&mut self, vector: Vec<f32>) -> Result<(u32, Vec<u32>), Error> {
         if vector.len() != self.dim {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidParameterValue(format!(
                 "HNSW expects dimension {}, got {}",
                 self.dim,
                 vector.len()
@@ -370,7 +370,7 @@ impl HnswIndex {
         }
         let level = self.random_level();
         let id = u32::try_from(self.nodes.len())
-            .map_err(|_| Error::Unsupported("HNSW index is full (u32 node ids)".to_owned()))?;
+            .map_err(|_| Error::LimitExceeded("HNSW index is full (u32 node ids)".to_owned()))?;
         let node = Node::new(self.metric, vector, vec![Vec::new(); level + 1]);
         self.nodes.push(node);
 
@@ -585,7 +585,7 @@ impl HnswIndex {
     /// [`Error::Unsupported`] if `query`'s length differs from the index dimension.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f64)>, Error> {
         if query.len() != self.dim {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidParameterValue(format!(
                 "HNSW expects dimension {}, got {}",
                 self.dim,
                 query.len()

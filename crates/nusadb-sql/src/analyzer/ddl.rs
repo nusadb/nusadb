@@ -23,7 +23,7 @@ pub(super) fn analyze_create_table(
             ast::OnCommit::DeleteRows | ast::OnCommit::Drop
         )
     {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidTableDefinition(
             "ON COMMIT can only be used on temporary tables".to_owned(),
         ));
     }
@@ -239,7 +239,7 @@ fn resolve_column_defaults(
                 ));
             }
             if column.default.is_some() {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidStatement(
                     "a GENERATED column may not also have a DEFAULT".to_owned(),
                 ));
             }
@@ -271,7 +271,7 @@ fn resolve_column_defaults(
         // an explicit DEFAULT.
         if column.serial {
             if column.default.is_some() {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidStatement(
                     "a SERIAL column may not also have a DEFAULT".to_owned(),
                 ));
             }
@@ -425,7 +425,7 @@ fn resolve_unique_constraints(
     }
 
     if specs.iter().filter(|s| s.primary).count() > 1 {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidTableDefinition(
             "a table may have at most one PRIMARY KEY".to_owned(),
         ));
     }
@@ -559,7 +559,7 @@ pub(super) fn analyze_alter_table(
                 });
             };
             if table.columns.len() == 1 {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidTableDefinition(
                     "ALTER TABLE DROP COLUMN would leave the table with no columns".to_owned(),
                 ));
             }

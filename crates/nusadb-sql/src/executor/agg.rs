@@ -1139,8 +1139,8 @@ pub(crate) fn merge_acc(into: &mut Acc, from: Acc, call: &AggregateCall) -> Resu
             }
         },
         _ => {
-            return Err(Error::Unsupported(
-                "internal: aggregate is not parallel-mergeable".to_owned(),
+            return Err(Error::Internal(
+                "aggregate is not parallel-mergeable".to_owned(),
             ));
         },
     }
@@ -1246,9 +1246,7 @@ pub(super) fn accumulate_row(
                 // DISTINCT drops duplicates ("not distinct" equality, so a single NULL is kept).
                 F::ArrayAgg | F::JsonAgg => {
                     let arg = call.arg.as_ref().ok_or_else(|| {
-                        Error::Unsupported(
-                            "internal: array_agg / jsonb_agg requires an argument".to_owned(),
-                        )
+                        Error::Internal("array_agg / jsonb_agg requires an argument".to_owned())
                     })?;
                     let value = eval_arg(arg, row)?;
                     if call.distinct {
@@ -1280,13 +1278,13 @@ pub(super) fn accumulate_row(
                 F::JsonObjectAgg => {
                     let (Some(key_arg), Some(val_arg)) = (call.arg.as_ref(), call.arg2.as_ref())
                     else {
-                        return Err(Error::Unsupported(
-                            "internal: json_object_agg requires two arguments".to_owned(),
+                        return Err(Error::Internal(
+                            "json_object_agg requires two arguments".to_owned(),
                         ));
                     };
                     let key = eval_arg(key_arg, row)?;
                     if matches!(key, ast::Value::Null) {
-                        return Err(Error::Unsupported(
+                        return Err(Error::InvalidParameterValue(
                             "null value not allowed for object key".to_owned(),
                         ));
                     }
@@ -1300,8 +1298,8 @@ pub(super) fn accumulate_row(
                 f if f.is_two_arg() => {
                     let (arg_y, arg_x) = (call.arg.as_ref(), call.arg2.as_ref());
                     let (Some(arg_y), Some(arg_x)) = (arg_y, arg_x) else {
-                        return Err(Error::Unsupported(format!(
-                            "internal: aggregate {:?} requires two arguments",
+                        return Err(Error::Internal(format!(
+                            "aggregate {:?} requires two arguments",
                             call.func,
                         )));
                     };
@@ -1320,10 +1318,7 @@ pub(super) fn accumulate_row(
                 },
                 _ => {
                     let arg = call.arg.as_ref().ok_or_else(|| {
-                        Error::Unsupported(format!(
-                            "internal: aggregate {:?} requires an argument",
-                            call.func,
-                        ))
+                        Error::Internal(format!("aggregate {:?} requires an argument", call.func))
                     })?;
                     let value = eval_arg(arg, row)?;
                     fold_value(acc, call, value, row)?;
@@ -1624,7 +1619,7 @@ const fn value_as_decimal(v: &ast::Value) -> Option<crate::numeric::Decimal> {
 /// Error for a NUMERIC SUM/AVG that overflowed the `i128` mantissa. Also raised by the
 /// vectorized `SUM(INT)` path (A-PERF.AGG5a), which must fail identically to the row path.
 pub(crate) fn numeric_overflow() -> Error {
-    Error::Unsupported("numeric aggregate overflow".to_owned())
+    Error::ArgumentOutOfDomain("numeric aggregate overflow".to_owned())
 }
 
 #[cfg(test)]

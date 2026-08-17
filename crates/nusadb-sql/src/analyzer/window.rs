@@ -285,7 +285,7 @@ pub(super) fn resolve_window(
         Some(ast::WindowFrameUnits::Groups)
     ) && wf.order.is_empty()
     {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "a GROUPS window frame requires an ORDER BY clause".to_owned(),
         ));
     }
@@ -352,7 +352,7 @@ pub(super) fn resolve_window(
     let (args, result_ty) = match &wf.func {
         W::RowNumber | W::Rank | W::DenseRank => {
             if !typed_args.is_empty() {
-                return Err(Error::Unsupported(
+                return Err(Error::FunctionArgs(
                     "ranking window functions take no arguments".to_owned(),
                 ));
             }
@@ -361,7 +361,7 @@ pub(super) fn resolve_window(
         // CUME_DIST / PERCENT_RANK: no arguments, relative position in [0, 1].
         W::CumeDist | W::PercentRank => {
             if !typed_args.is_empty() {
-                return Err(Error::Unsupported(
+                return Err(Error::FunctionArgs(
                     "CUME_DIST / PERCENT_RANK take no arguments".to_owned(),
                 ));
             }
@@ -383,7 +383,7 @@ pub(super) fn resolve_window(
         // NTH_VALUE(expr, n): result type is the first argument's type.
         W::NthValue => {
             let [expr, n] = <[TypedExpr; 2]>::try_from(typed_args).map_err(|_| {
-                Error::Unsupported("NTH_VALUE takes exactly two arguments (expr, n)".to_owned())
+                Error::FunctionArgs("NTH_VALUE takes exactly two arguments (expr, n)".to_owned())
             })?;
             require_int(&n, "NTH_VALUE position")?;
             let ty = expr.ty;
@@ -443,7 +443,7 @@ fn resolve_frame(f: &ast::WindowFrame, order: &[OrderByKey]) -> Result<WindowFra
                 // direction for DESC (preceding rows have larger keys), so both are supported.
                 [key] => (Some(key.expr.ty), !key.ascending),
                 _ => {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidStatement(
                         "a RANGE frame with a value offset requires exactly one ORDER BY column"
                             .to_owned(),
                     ));
@@ -504,7 +504,7 @@ fn const_range_offset(
     use crate::ast::Value as V;
     use ColumnType as T;
     let order_ty = order_ty.ok_or_else(|| {
-        Error::Unsupported("a RANGE frame value offset requires an ORDER BY column".to_owned())
+        Error::InvalidStatement("a RANGE frame value offset requires an ORDER BY column".to_owned())
     })?;
     let int_ordered = matches!(order_ty, T::SmallInt | T::Int | T::BigInt);
     let temporal = matches!(order_ty, T::Date | T::Timestamp | T::TimestampTz);
@@ -515,7 +515,7 @@ fn const_range_offset(
         )));
     }
     let ast::Expr::Literal(value) = expr else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "a RANGE frame offset must be a literal value".to_owned(),
         ));
     };
@@ -527,7 +527,7 @@ fn const_range_offset(
     if ok {
         Ok(value.clone())
     } else {
-        Err(Error::Unsupported(format!(
+        Err(Error::InvalidStatement(format!(
             "a RANGE frame offset over a {order_ty:?} ordering must be a non-negative {} literal",
             if temporal { "INTERVAL" } else { "integer" }
         )))
@@ -538,7 +538,7 @@ fn const_range_offset(
 fn const_frame_offset(expr: &ast::Expr) -> Result<u64, Error> {
     match expr {
         ast::Expr::Literal(ast::Value::Int(n)) if *n >= 0 => Ok(u64::try_from(*n).unwrap_or(0)),
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::InvalidStatement(
             "window frame offset must be a non-negative integer literal".to_owned(),
         )),
     }
@@ -547,7 +547,7 @@ fn const_frame_offset(expr: &ast::Expr) -> Result<u64, Error> {
 /// A window function taking exactly one integer argument (`NTILE`).
 fn single_int_arg(args: &[TypedExpr], func: &str) -> Result<TypedExpr, Error> {
     let [arg] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{func} takes exactly one argument"
         )));
     };
@@ -558,7 +558,7 @@ fn single_int_arg(args: &[TypedExpr], func: &str) -> Result<TypedExpr, Error> {
 /// A window function taking exactly one value argument of any type (`FIRST_VALUE`/`LAST_VALUE`).
 fn single_value_arg(args: &[TypedExpr], func: &ast::WindowFunc) -> Result<TypedExpr, Error> {
     let [arg] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{func:?} takes exactly one argument"
         )));
     };
@@ -571,7 +571,7 @@ fn resolve_navigation_offset(
     func: &ast::WindowFunc,
 ) -> Result<(Vec<TypedExpr>, ColumnType), Error> {
     if args.is_empty() || args.len() > 3 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{func:?} takes 1 to 3 arguments (expr [, offset [, default]])"
         )));
     }

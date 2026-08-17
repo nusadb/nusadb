@@ -336,9 +336,10 @@ impl Operator for ScalarAggregate {
                     batches.iter().flat_map(batch_to_rows).collect::<Vec<_>>()
                 });
                 let folded = fold_aggregates(std::slice::from_ref(call), rows.iter())?;
-                folded.into_iter().next().ok_or_else(|| {
-                    Error::Unsupported("internal: empty scalar-aggregate result".to_owned())
-                })?
+                folded
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::Internal("empty scalar-aggregate result".to_owned()))?
             };
             result.push(value);
         }

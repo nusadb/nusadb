@@ -230,7 +230,7 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         },
         (ast::Value::Text(s), ColumnType::Text) => {
             let len = u32::try_from(s.len())
-                .map_err(|_| Error::Unsupported("text value larger than 4 GiB".to_owned()))?;
+                .map_err(|_| Error::LimitExceeded("text value larger than 4 GiB".to_owned()))?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         },
@@ -397,7 +397,7 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
 /// encoding. Each element is coerced to `elem_ty` via [`encode_value`].
 fn encode_array(items: &[ast::Value], elem_ty: ColumnType, out: &mut Vec<u8>) -> Result<(), Error> {
     let count = u32::try_from(items.len())
-        .map_err(|_| Error::Unsupported("array longer than 4 G elements".to_owned()))?;
+        .map_err(|_| Error::LimitExceeded("array longer than 4 G elements".to_owned()))?;
     out.extend_from_slice(&count.to_le_bytes());
     for item in items {
         if matches!(item, ast::Value::Null) {
@@ -504,7 +504,7 @@ fn put_interval(iv: crate::interval::Interval, out: &mut Vec<u8>) {
 /// Write a JSON document as length-prefixed text.
 fn put_json_text(s: &str, out: &mut Vec<u8>) -> Result<(), Error> {
     let len = u32::try_from(s.len())
-        .map_err(|_| Error::Unsupported("JSON value larger than 4 GiB".to_owned()))?;
+        .map_err(|_| Error::LimitExceeded("JSON value larger than 4 GiB".to_owned()))?;
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(s.as_bytes());
     Ok(())
@@ -513,7 +513,7 @@ fn put_json_text(s: &str, out: &mut Vec<u8>) -> Result<(), Error> {
 /// Encode a `BYTEA` value: a `u32` length prefix then the raw bytes.
 fn put_bytes(b: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     let len = u32::try_from(b.len())
-        .map_err(|_| Error::Unsupported("BYTEA value larger than 4 GiB".to_owned()))?;
+        .map_err(|_| Error::LimitExceeded("BYTEA value larger than 4 GiB".to_owned()))?;
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(b);
     Ok(())

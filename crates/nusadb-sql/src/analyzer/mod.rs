@@ -487,14 +487,14 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE TYPE ... AS ENUM (B-ENUM): validate the labels (at least one, distinct) and persist.
         ast::Statement::CreateEnum(ce) => {
             if ce.labels.is_empty() {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidStatement(
                     "CREATE TYPE ... AS ENUM requires at least one label".to_owned(),
                 ));
             }
             let mut seen = std::collections::HashSet::new();
             for label in &ce.labels {
                 if !seen.insert(label.as_str()) {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::InvalidStatement(format!(
                         "duplicate ENUM label {label:?}"
                     )));
                 }
@@ -508,14 +508,14 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // deferred ENUM resolution.
         ast::Statement::CreateComposite(cc) => {
             if cc.fields.is_empty() {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidStatement(
                     "CREATE TYPE ... AS (...) requires at least one field".to_owned(),
                 ));
             }
             let mut seen = std::collections::HashSet::new();
             for (field, _) in &cc.fields {
                 if !seen.insert(field.as_str()) {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::InvalidStatement(format!(
                         "duplicate composite field {field:?}"
                     )));
                 }
@@ -841,11 +841,11 @@ fn const_value(expr: &ast::Expr) -> Result<ast::Value, Error> {
                     scale: d.scale,
                 }))
             },
-            _ => Err(Error::Unsupported(
+            _ => Err(Error::InvalidStatement(
                 "EXECUTE argument must be a constant value".to_owned(),
             )),
         },
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::InvalidStatement(
             "EXECUTE argument must be a constant value".to_owned(),
         )),
     }
@@ -901,7 +901,7 @@ fn analyze_create_table_as(
         .map(|p| (p.name.clone(), p.expr.ty))
         .collect();
     if columns.is_empty() {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "CREATE TABLE ... AS SELECT with no output columns".to_owned(),
         ));
     }
@@ -909,10 +909,10 @@ fn analyze_create_table_as(
     let mut seen = std::collections::HashSet::with_capacity(columns.len());
     for (name, _) in &columns {
         if !seen.insert(name.as_str()) {
-            return Err(Error::Unsupported(format!(
-                "CREATE TABLE ... AS SELECT: duplicate output column name {name:?} (alias the \
-                 SELECT columns to make them distinct)"
-            )));
+            // The same defect a duplicate in an explicit column list is, reached by a different
+            // route: two projections that land on one name. `DuplicateColumn` says so in the class
+            // (`42701`) as well as the message, where this once said "unsupported".
+            return Err(Error::DuplicateColumn { name: name.clone() });
         }
     }
     Ok(LogicalPlan::CreateTableAs(CreateTableAsPlan {
@@ -1443,7 +1443,7 @@ fn analyze_alter_policy(ap: ast::AlterPolicy, catalog: &dyn Catalog) -> Result<L
         .into_iter()
         .find(|p| p.name == ap.name)
         .ok_or_else(|| {
-            Error::Unsupported(format!(
+            Error::ObjectNotFound(format!(
                 "policy `{}` does not exist on `{}`",
                 ap.name, table.name
             ))
@@ -1615,7 +1615,7 @@ fn resolve_scoped(
             continue;
         }
         if found.is_some() {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidColumnReference(format!(
                 "ambiguous column reference `{name}` — qualify it with a table name"
             )));
         }

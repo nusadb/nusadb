@@ -153,7 +153,7 @@ impl RowSource for SeriesSource {
             return Ok(None);
         }
         if self.emitted >= MAX_ROWS {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::LimitExceeded(format!(
                 "generate_series: the series exceeds the {MAX_ROWS}-row limit"
             )));
         }

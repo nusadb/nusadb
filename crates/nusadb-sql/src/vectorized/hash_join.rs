@@ -255,9 +255,7 @@ impl Operator for HashJoin {
                 return Ok(None);
             };
             let Some(build) = self.build.as_ref() else {
-                return Err(Error::Unsupported(
-                    "internal: hash-join build side missing".to_owned(),
-                ));
+                return Err(Error::Internal("hash-join build side missing".to_owned()));
             };
             // Probe: for each left row, collect an index pair per hash-matched build row. A NULL key
             // (or any non-matching key) contributes no pair — the row path's unmatched treatment.

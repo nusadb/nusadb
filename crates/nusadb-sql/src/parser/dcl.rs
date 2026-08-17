@@ -226,7 +226,7 @@ fn items_as_privileges(items: Vec<GrantItem>) -> Result<Vec<ast::Privilege>, Err
         .into_iter()
         .map(|item| match item {
             GrantItem::Privilege(p) => Ok(p),
-            GrantItem::Name(name) => Err(Error::Unsupported(format!(
+            GrantItem::Name(name) => Err(Error::InvalidStatement(format!(
                 "`{name}` is not a privilege; a privilege grant expects SELECT, INSERT, UPDATE, \
                  DELETE, TRUNCATE, REFERENCES, TRIGGER, USAGE, CREATE, CONNECT, or TEMPORARY"
             ))),
@@ -240,7 +240,7 @@ fn items_as_roles(items: Vec<GrantItem>) -> Result<Vec<String>, Error> {
         .into_iter()
         .map(|item| match item {
             GrantItem::Name(name) => Ok(name),
-            GrantItem::Privilege(p) => Err(Error::Unsupported(format!(
+            GrantItem::Privilege(p) => Err(Error::InvalidStatement(format!(
                 "`{}` is a privilege keyword, not a role name — a privilege grant needs an `ON` \
                  clause naming what it applies to",
                 p.as_str()
@@ -311,7 +311,7 @@ fn parse_grant(sql: &str) -> Result<ast::Statement, Error> {
         .into_iter()
         .map(|g| match g {
             ast::Grantee::Role(name) => Ok(name),
-            ast::Grantee::Public => Err(Error::Unsupported(
+            ast::Grantee::Public => Err(Error::InvalidStatement(
                 "membership in a role cannot be granted to PUBLIC".to_owned(),
             )),
         })
@@ -417,7 +417,7 @@ fn parse_revoke(sql: &str) -> Result<ast::Statement, Error> {
         .into_iter()
         .map(|g| match g {
             ast::Grantee::Role(name) => Ok(name),
-            ast::Grantee::Public => Err(Error::Unsupported(
+            ast::Grantee::Public => Err(Error::InvalidStatement(
                 "membership in a role cannot be revoked from PUBLIC".to_owned(),
             )),
         })

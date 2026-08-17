@@ -620,7 +620,7 @@ fn strip_window_exclude(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
     if tokens.iter().any(
         |t| matches!(&t.token, Token::Word(w) if w.value.to_ascii_lowercase().starts_with(EXCLUDE_WINDOW_PREFIX)),
     ) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "identifiers beginning with `{EXCLUDE_WINDOW_PREFIX}` are reserved"
         )));
     }
@@ -802,7 +802,7 @@ fn strip_is_json(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
     if tokens.iter().any(
         |t| matches!(&t.token, Token::Word(w) if w.value.to_ascii_lowercase().starts_with(IS_JSON_PREFIX)),
     ) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "identifiers beginning with `{IS_JSON_PREFIX}` are reserved"
         )));
     }
@@ -2844,7 +2844,7 @@ fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
                 "QUOTE" => quote = Some(copy_single_char(parser)?),
                 "ESCAPE" => escape = Some(copy_single_char(parser)?),
                 other => {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::InvalidStatement(format!(
                         "unsupported COPY option `{other}` (FORMAT, DELIMITER, NULL, HEADER, QUOTE, ESCAPE)"
                     )));
                 },
@@ -3119,7 +3119,7 @@ const fn order_by_is_effective(order_by: &sql::OrderBy) -> bool {
 fn convert_prepare(name: &sql::Ident, statement: sql::Statement) -> Result<ast::Statement, Error> {
     let inner = convert_statement(statement)?;
     if !is_prepareable(&inner) {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "PREPARE accepts only a SELECT, set operation, INSERT, UPDATE, or DELETE".to_owned(),
         ));
     }
@@ -3190,13 +3190,13 @@ fn apply_explain_option(
     match opt.name.value.to_ascii_uppercase().as_str() {
         "FORMAT" => {
             let word = explain_option_word(opt).ok_or_else(|| {
-                Error::Unsupported("EXPLAIN (FORMAT ...) requires a format name".to_owned())
+                Error::InvalidStatement("EXPLAIN (FORMAT ...) requires a format name".to_owned())
             })?;
             out.format = match word.to_ascii_uppercase().as_str() {
                 "TEXT" => ast::ExplainFormat::Text,
                 "JSON" => ast::ExplainFormat::Json,
                 other => {
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::InvalidParameterValue(format!(
                         "EXPLAIN (FORMAT {other}) is not supported; only TEXT and JSON"
                     )));
                 },
@@ -3205,7 +3205,7 @@ fn apply_explain_option(
         "ANALYZE" => out.analyze = explain_option_truthy(opt),
         "VERBOSE" => out.verbose = explain_option_truthy(opt),
         other => {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidParameterValue(format!(
                 "EXPLAIN option \"{other}\" is not supported"
             )));
         },
@@ -3504,7 +3504,7 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
                     None | Some(sql::AnalyzeFormat::TEXT) => ast::ExplainFormat::Text,
                     Some(sql::AnalyzeFormat::JSON) => ast::ExplainFormat::Json,
                     Some(other) => {
-                        return Err(Error::Unsupported(format!(
+                        return Err(Error::InvalidParameterValue(format!(
                             "EXPLAIN (FORMAT {other}) is not supported; only TEXT and JSON"
                         )));
                     },
@@ -3797,7 +3797,7 @@ fn show_columns_table(opts: &sql::ShowStatementOptions) -> Result<sql::ObjectNam
         return unsupported("SHOW COLUMNS FROM with a parent-object qualifier");
     }
     show_in.parent_name.clone().ok_or_else(|| {
-        Error::Unsupported(
+        Error::InvalidStatement(
             "SHOW COLUMNS without a table (use SHOW COLUMNS FROM <table>)".to_owned(),
         )
     })

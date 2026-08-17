@@ -112,7 +112,7 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
         TypedExprKind::OuterColumn { level, ordinal } => Ok(outer_column(*level, *ordinal)),
         // A set-returning function yields multiple rows and is expanded by the `ProjectSet` operator;
         // it must never reach the scalar evaluator.
-        TypedExprKind::SetReturning { .. } => Err(Error::Unsupported(
+        TypedExprKind::SetReturning { .. } => Err(Error::Internal(
             "set-returning function cannot be evaluated as a scalar value".to_owned(),
         )),
         TypedExprKind::Binary { left, op, right } => {
@@ -393,7 +393,7 @@ fn eval_composite(op: &CompositeExpr, row: &Row) -> Result<ast::Value, Error> {
 
 /// A loud error for a malformed composite text form the executor could not parse.
 fn malformed_composite(text: &str) -> Error {
-    Error::Unsupported(format!("malformed composite value {text:?}"))
+    Error::InvalidParameterValue(format!("malformed composite value {text:?}"))
 }
 
 /// Evaluate `encrypt(value, key)` / `decrypt(value, key)`. A `NULL` value or key
@@ -456,7 +456,7 @@ fn eval_scalar_function(
         // GROUPING(...) is rewritten by the analyzer against the query's grouping sets before
         // evaluation; reaching the per-row evaluator means it was used without GROUP BY.
         F::Grouping => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidGrouping(
                 "GROUPING is only allowed in an aggregated query with GROUP BY".to_owned(),
             ));
         },
@@ -751,21 +751,15 @@ fn eval_scalar_function(
         // JSONB_PATH_EXISTS(json, path) → TRUE if the jsonpath matches anywhere; an unsupported or
         // invalid path is a runtime error (mirroring JSONB_PATH_QUERY).
         (F::JsonbPathExists, [ast::Value::Json(s) | Text(s), Text(path)]) => {
-            let matches = crate::json::path_query(s, path).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "jsonb_path_exists: unsupported or invalid jsonpath `{path}`"
-                ))
-            })?;
+            let matches = crate::json::path_query(s, path)
+                .map_err(|why| jsonpath_error("jsonb_path_exists", why, s, path))?;
             ast::Value::Bool(!matches.is_empty())
         },
         // JSONB_PATH_QUERY_FIRST(json, path) → the first match as JSON, or NULL; an unsupported or
         // invalid path is a runtime error (mirroring JSONB_PATH_QUERY).
         (F::JsonbPathQueryFirst, [ast::Value::Json(s) | Text(s), Text(path)]) => {
-            let matches = crate::json::path_query(s, path).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "jsonb_path_query_first: unsupported or invalid jsonpath `{path}`"
-                ))
-            })?;
+            let matches = crate::json::path_query(s, path)
+                .map_err(|why| jsonpath_error("jsonb_path_query_first", why, s, path))?;
             matches
                 .into_iter()
                 .next()
@@ -776,11 +770,8 @@ fn eval_scalar_function(
             json_object_from_kv(keys, vals)?
         },
         (F::JsonbPathQueryArray, [ast::Value::Json(s) | Text(s), Text(path)]) => {
-            let matches = crate::json::path_query(s, path).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "jsonb_path_query_array: unsupported or invalid jsonpath `{path}`"
-                ))
-            })?;
+            let matches = crate::json::path_query(s, path)
+                .map_err(|why| jsonpath_error("jsonb_path_query_array", why, s, path))?;
             let items = matches
                 .iter()
                 .filter_map(|m| crate::json::parse(m))
@@ -843,7 +834,7 @@ fn eval_scalar_function(
         (F::MakeDate, [Int(y), Int(m), Int(d)]) => crate::temporal::make_date(*y, *m, *d)
             .map(ast::Value::Date)
             .ok_or_else(|| {
-                Error::Unsupported(format!("make_date(): {y}-{m}-{d} is not a valid date"))
+                Error::DatetimeOverflow(format!("make_date(): {y}-{m}-{d} is not a valid date"))
             })?,
         // MAKE_TIME(h, mi, sec) — seconds is double precision, so fractional seconds are kept as
         // microseconds. The seconds field, rounded to whole microseconds, must be in
@@ -851,7 +842,7 @@ fn eval_scalar_function(
         (F::MakeTime, [Int(h), Int(mi), secs]) => {
             let s = to_f64(secs);
             let base = crate::temporal::make_time(*h, *mi, 0).ok_or_else(|| {
-                Error::Unsupported(format!("make_time(): {h}:{mi}:{s} is not a valid time"))
+                Error::DatetimeOverflow(format!("make_time(): {h}:{mi}:{s} is not a valid time"))
             })?;
             #[allow(
                 clippy::cast_possible_truncation,
@@ -859,7 +850,7 @@ fn eval_scalar_function(
             )]
             let sec_micros = (s * 1_000_000.0).round() as i64;
             if !(0..60_000_000).contains(&sec_micros) {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::DatetimeOverflow(format!(
                     "make_time(): seconds {s} is out of range [0, 60)"
                 )));
             }
@@ -870,7 +861,7 @@ fn eval_scalar_function(
             crate::temporal::make_timestamp(*y, *mo, *d, *h, *mi, *s)
                 .map(ast::Value::Timestamp)
                 .ok_or_else(|| {
-                    Error::Unsupported(format!(
+                    Error::DatetimeOverflow(format!(
                         "make_timestamp(): {y}-{mo}-{d} {h}:{mi}:{s} is not valid"
                     ))
                 })?
@@ -879,7 +870,7 @@ fn eval_scalar_function(
             crate::temporal::make_timestamp(*y, *mo, *d, *h, *mi, *s)
                 .map(ast::Value::TimestampTz)
                 .ok_or_else(|| {
-                    Error::Unsupported(format!(
+                    Error::DatetimeOverflow(format!(
                         "make_timestamptz(): {y}-{mo}-{d} {h}:{mi}:{s} is not valid"
                     ))
                 })?
@@ -933,7 +924,7 @@ fn eval_scalar_function(
         (F::ConvertFrom, [ast::Value::Bytes(b), Text(enc)]) => {
             require_utf8_encoding(enc)?;
             Text(String::from_utf8(b.clone()).map_err(|_| {
-                Error::Unsupported("convert_from(): bytes are not valid UTF8".to_owned())
+                Error::InvalidParameterValue("convert_from(): bytes are not valid UTF8".to_owned())
             })?)
         },
         // DATE_BIN(stride, source, origin) → snap `source` to its bin aligned to `origin`.
@@ -946,14 +937,14 @@ fn eval_scalar_function(
             ],
         ) => {
             if stride.months != 0 {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "date_bin: the stride interval must not contain months or years".to_owned(),
                 ));
             }
             crate::temporal::date_bin(stride.days, stride.micros, *source, *origin)
                 .map(ast::Value::Timestamp)
                 .ok_or_else(|| {
-                    Error::Unsupported(
+                    Error::InvalidParameterValue(
                         "date_bin: the stride must be positive and the result in range".to_owned(),
                     )
                 })?
@@ -1191,7 +1182,7 @@ fn extract_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
         _ => return Ok(V::Null),
     };
     value.map(V::Float).ok_or_else(|| {
-        Error::Unsupported(format!(
+        Error::InvalidParameterValue(format!(
             "EXTRACT field `{field}` is not valid for this value"
         ))
     })
@@ -1206,7 +1197,7 @@ fn date_trunc_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> 
         _ => return Ok(V::Null),
     };
     let truncated = crate::temporal::date_trunc_micros(field, micros).ok_or_else(|| {
-        Error::Unsupported(format!("DATE_TRUNC field `{field}` is not supported"))
+        Error::InvalidParameterValue(format!("DATE_TRUNC field `{field}` is not supported"))
     })?;
     Ok(if is_tz {
         V::TimestampTz(truncated)
@@ -1222,7 +1213,9 @@ fn age_value(end: &ast::Value, start: Option<&ast::Value>) -> Result<ast::Value,
         (temporal_to_micros(end)?, temporal_to_micros(start)?)
     } else {
         let today_midnight = super::clock::day_start_micros(super::clock::statement_today())
-            .ok_or_else(|| Error::Unsupported("AGE(): statement date out of range".to_owned()))?;
+            .ok_or_else(|| {
+                Error::DatetimeOverflow("AGE(): statement date out of range".to_owned())
+            })?;
         (today_midnight, temporal_to_micros(end)?)
     };
     let (months, days, micros) = crate::temporal::calendar_age(end_micros, start_micros);
@@ -1251,7 +1244,7 @@ fn at_time_zone_value(value: &ast::Value, zone: &ast::Value) -> Result<ast::Valu
         })?,
         V::Interval(iv) => interval_zone_offset_micros(iv)?,
         other => {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "AT TIME ZONE requires a text or INTERVAL zone, got {:?}",
                 runtime_type(other)
             )));
@@ -1268,7 +1261,7 @@ fn at_time_zone_value(value: &ast::Value, zone: &ast::Value) -> Result<ast::Valu
             .checked_add(offset)
             .map(V::Timestamp)
             .ok_or(Error::IntegerOutOfRange),
-        other => Err(Error::Unsupported(format!(
+        other => Err(Error::FunctionArgs(format!(
             "AT TIME ZONE requires a TIMESTAMP or TIMESTAMPTZ value, got {:?}",
             runtime_type(other)
         ))),
@@ -1297,7 +1290,7 @@ fn zone_offset_micros(zone: &str) -> Option<i64> {
 /// months component has no fixed length, so it is rejected rather than guessed.
 fn interval_zone_offset_micros(iv: &crate::interval::Interval) -> Result<i64, Error> {
     if iv.months != 0 {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "AT TIME ZONE INTERVAL offset must not contain a months component (ambiguous length)"
                 .to_owned(),
         ));
@@ -1313,9 +1306,9 @@ fn temporal_to_micros(v: &ast::Value) -> Result<i64, Error> {
     use ast::Value as V;
     match v {
         V::Date(days) => super::clock::day_start_micros(*days)
-            .ok_or_else(|| Error::Unsupported("AGE(): date out of range".to_owned())),
+            .ok_or_else(|| Error::DatetimeOverflow("AGE(): date out of range".to_owned())),
         V::Timestamp(m) | V::TimestampTz(m) => Ok(*m),
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::FunctionArgs(
             "AGE() requires a date or timestamp argument".to_owned(),
         )),
     }
@@ -1382,7 +1375,9 @@ fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
         V::Int(i) => crate::numeric::Decimal::from_i64(*i),
         V::Numeric(d) => *d,
         V::Float(f) => crate::numeric::from_f64_text(*f).ok_or_else(|| {
-            Error::Unsupported("to_char(): a non-finite number has no formatted form".to_owned())
+            Error::InvalidParameterValue(
+                "to_char(): a non-finite number has no formatted form".to_owned(),
+            )
         })?,
         // NULL (and any non-number, which the analyzer rejects) formats to NULL.
         _ => return Ok(V::Null),
@@ -1391,7 +1386,7 @@ fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
     let frac_n = format.frac.iter().filter(|s| s.is_digit()).count();
     let int_n = format.int.iter().filter(|s| s.is_digit()).count();
     if int_n == 0 && frac_n == 0 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "to_char(): numeric format `{fmt}` has no digit positions"
         )));
     }
@@ -1502,7 +1497,7 @@ fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
             ',' | 'G' | 'g' => NumSlot::Group,
             '.' | 'D' | 'd' => {
                 if format.has_point {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidParameterValue(
                         "to_char(): a numeric format may have only one decimal point".to_owned(),
                     ));
                 }
@@ -1510,7 +1505,7 @@ fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
                 continue;
             },
             other => {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::InvalidParameterValue(format!(
                     "to_char(): unsupported numeric format character `{other}` \
                      (supported: `9`, `0`, `.`, `D`, `,`, `G`, `FM`)"
                 )));
@@ -1606,7 +1601,7 @@ fn to_timestamp_value(text: &str, fmt: &str) -> Result<ast::Value, Error> {
 fn to_timestamp_epoch(secs: &ast::Value) -> Result<ast::Value, Error> {
     const MICROS_PER_SEC: i64 = 1_000_000;
     fn overflow() -> Error {
-        Error::Unsupported("to_timestamp(): epoch is out of range".to_owned())
+        Error::DatetimeOverflow("to_timestamp(): epoch is out of range".to_owned())
     }
     // Scale fractional seconds to micros, rounding half-away-from-zero, and reject any value outside
     // the representable `[i64::MIN, 2^63)` micro range rather than saturating to a wrong instant.
@@ -1832,7 +1827,7 @@ fn regexp_like(source: &str, pattern: &str, flags: &str) -> Result<bool, Error> 
 /// `start` below 1 is a hard error; a `start` past the end counts zero. Counts characters, not bytes.
 fn regexp_count(source: &str, pattern: &str, start: i64, flags: &str) -> Result<i64, Error> {
     if start < 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"start\": {start}"
         )));
     }
@@ -1867,22 +1862,22 @@ fn regexp_instr(
     subexpr: i64,
 ) -> Result<i64, Error> {
     if start < 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"start\": {start}"
         )));
     }
     if n < 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"n\": {n}"
         )));
     }
     if endoption != 0 && endoption != 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"endoption\": {endoption}"
         )));
     }
     if subexpr < 0 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"subexpr\": {subexpr}"
         )));
     }
@@ -1942,17 +1937,17 @@ fn regexp_substr(
     subexpr: i64,
 ) -> Result<ast::Value, Error> {
     if start < 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"start\": {start}"
         )));
     }
     if n < 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"n\": {n}"
         )));
     }
     if subexpr < 0 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidParameterValue(format!(
             "invalid value for parameter \"subexpr\": {subexpr}"
         )));
     }
@@ -2031,7 +2026,7 @@ fn eval_array_fill(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     // The reference engine's maximum number of array elements.
     const MAX_ARRAY_LEN: i64 = 134_217_727;
     let [value_arg, dims_arg] = args else {
-        return Err(Error::Unsupported(
+        return Err(Error::FunctionArgs(
             "array_fill() expects 2 arguments".to_owned(),
         ));
     };
@@ -2047,18 +2042,18 @@ fn eval_array_fill(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let n = match dims.first() {
         Some(ast::Value::Int(n)) => *n,
         Some(ast::Value::Null) => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidParameterValue(
                 "array_fill(): dimension must not be NULL".to_owned(),
             ));
         },
         _ => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "array_fill(): dimension must be an integer".to_owned(),
             ));
         },
     };
     if !(0..=MAX_ARRAY_LEN).contains(&n) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::LimitExceeded(format!(
             "array size exceeds the maximum allowed ({MAX_ARRAY_LEN})"
         )));
     }
@@ -2068,7 +2063,7 @@ fn eval_array_fill(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
 
 fn eval_quote_nullable(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let [arg] = args else {
-        return Err(Error::Unsupported(
+        return Err(Error::FunctionArgs(
             "quote_nullable() expects 1 argument".to_owned(),
         ));
     };
@@ -2098,8 +2093,8 @@ fn text_output(value: ast::Value) -> Result<String, Error> {
         ast::Value::Bool(b) => Ok(if b { "t" } else { "f" }.to_owned()),
         other => match cast_value(other, ColumnType::Text)? {
             ast::Value::Text(s) => Ok(s),
-            _ => Err(Error::Unsupported(
-                "internal: cast to TEXT did not yield text".to_owned(),
+            _ => Err(Error::Internal(
+                "cast to TEXT did not yield text".to_owned(),
             )),
         },
     }
@@ -2119,9 +2114,9 @@ fn eval_range_constructor(
     let name = func.name();
     let kind = func
         .range_kind()
-        .ok_or_else(|| Error::Unsupported(format!("{name}() is not a range constructor")))?;
+        .ok_or_else(|| Error::FunctionArgs(format!("{name}() is not a range constructor")))?;
     let [lo_expr, hi_expr, rest @ ..] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 2..=3 argument(s), got {}",
             args.len()
         )));
@@ -2156,7 +2151,7 @@ fn eval_range_constructor(
                 });
             },
             other => {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::FunctionArgs(format!(
                     "{name}() bound flags must be text, got {other:?}"
                 )));
             },
@@ -2193,7 +2188,7 @@ fn range_element(
         | (v @ ast::Value::Timestamp(_), RangeKind::Ts)
         | (v @ ast::Value::TimestampTz(_), RangeKind::TsTz) => v,
         (other, _) => {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{name}() bound is not a {} element: {other:?}",
                 kind.name()
             )));
@@ -2452,7 +2447,7 @@ fn value_eq(a: &ast::Value, b: &ast::Value) -> bool {
 /// error. A NULL format string yields NULL.
 fn eval_format(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let Some((fmt_expr, rest)) = args.split_first() else {
-        return Err(Error::Unsupported(
+        return Err(Error::FunctionArgs(
             "format() expects at least 1 argument".to_owned(),
         ));
     };
@@ -2478,13 +2473,13 @@ fn eval_format(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
             Some('%') => out.push('%'),
             Some(spec @ ('s' | 'I' | 'L')) => {
                 let value = next_arg.next().ok_or_else(|| {
-                    Error::Unsupported(format!("format(): too few arguments for %{spec}"))
+                    Error::InvalidParameterValue(format!("format(): too few arguments for %{spec}"))
                 })?;
                 match (spec, &value) {
                     ('s', ast::Value::Null) => {},
                     ('s', v) => out.push_str(&crate::display::value_text(v)),
                     ('I', ast::Value::Null) => {
-                        return Err(Error::Unsupported(
+                        return Err(Error::InvalidParameterValue(
                             "format(): NULL is not allowed for the %I specifier".to_owned(),
                         ));
                     },
@@ -2495,12 +2490,12 @@ fn eval_format(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
                 }
             },
             Some(other) => {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::InvalidParameterValue(format!(
                     "format(): unrecognized format specifier %{other}"
                 )));
             },
             None => {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "format(): dangling % at end of format string".to_owned(),
                 ));
             },
@@ -2513,7 +2508,7 @@ fn eval_format(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
 /// argument becomes JSON `null`.
 fn eval_to_json(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let [arg] = args else {
-        return Err(Error::Unsupported(
+        return Err(Error::FunctionArgs(
             "to_json() expects 1 argument".to_owned(),
         ));
     };
@@ -2538,7 +2533,7 @@ fn eval_row_to_json(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> 
         let [key_expr, val_expr] = pair else { continue };
         let key = match eval(key_expr, row)? {
             ast::Value::Null => {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "row_to_json(): field name must not be NULL".to_owned(),
                 ));
             },
@@ -2558,6 +2553,45 @@ fn eval_row_to_json(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> 
     Ok(ast::Value::Json(out))
 }
 
+/// Report a failed `jsonb_path_*` call against the argument that actually caused it.
+///
+/// The two failures arrive at the same call site but belong to different arguments, and the older
+/// wording ("unsupported or invalid jsonpath") named the path even when the *document* was the
+/// malformed one. They also want different classes — see each arm for which and why. Neither is
+/// `feature_not_supported`, which would invite a caller to skip the statement over what is usually
+/// a typo.
+pub(super) fn jsonpath_error(
+    func: &str,
+    why: crate::json::PathQueryError,
+    doc: &str,
+    path: &str,
+) -> Error {
+    match why {
+        // Not reachable from SQL: analysis requires argument 1 to be JSON-typed (a TEXT column is
+        // refused with `42804`) and a literal is validated on the way in (`22P02`), so by here the
+        // document has already parsed once. If it does not parse now, the engine stored or produced
+        // something its own type system says is impossible — which is what `internal_error` is for,
+        // and is not the caller's to fix.
+        crate::json::PathQueryError::MalformedDocument => Error::Internal(format!(
+            "{func}: a value typed JSON did not parse: {}",
+            truncate_for_message(doc)
+        )),
+        crate::json::PathQueryError::UnusablePath => Error::InvalidParameterValue(format!(
+            "{func}: `{path}` is not a jsonpath this server accepts (supported: `$` root, `.key`, \
+             `.*`, `['key']`, `[n]`, `[*]`)"
+        )),
+    }
+}
+
+/// Keep an offending value short enough to read in an error message.
+fn truncate_for_message(value: &str) -> String {
+    const MAX: usize = 60;
+    match value.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &value[..cut]),
+        None => value.to_owned(),
+    }
+}
+
 /// `JSON_BUILD_OBJECT(k1, v1, ...)`: build a JSON object from alternating key/value arguments.
 /// Keys are coerced to text and must not be NULL; values serialize to JSON (a NULL value → `null`).
 /// `JSON_OBJECT(pairs)` — a JSON object from a flat text array of alternating key/value elements
@@ -2565,7 +2599,7 @@ fn eval_row_to_json(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> 
 /// value becoming JSON `null` (the array is `text[]`, so `value_to_json` yields a string per value).
 fn json_object_from_pairs(items: &[ast::Value]) -> Result<ast::Value, Error> {
     if !items.len().is_multiple_of(2) {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "array must have even number of elements".to_owned(),
         ));
     }
@@ -2573,7 +2607,7 @@ fn json_object_from_pairs(items: &[ast::Value]) -> Result<ast::Value, Error> {
     for chunk in items.chunks_exact(2) {
         let [key, value] = chunk else { continue };
         if matches!(key, ast::Value::Null) {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidParameterValue(
                 "null value not allowed for object key".to_owned(),
             ));
         }
@@ -2585,12 +2619,14 @@ fn json_object_from_pairs(items: &[ast::Value]) -> Result<ast::Value, Error> {
 /// `JSON_OBJECT(keys, values)` — a JSON object from parallel key/value text arrays (equal length).
 fn json_object_from_kv(keys: &[ast::Value], vals: &[ast::Value]) -> Result<ast::Value, Error> {
     if keys.len() != vals.len() {
-        return Err(Error::Unsupported("mismatched array dimensions".to_owned()));
+        return Err(Error::InvalidParameterValue(
+            "mismatched array dimensions".to_owned(),
+        ));
     }
     let mut pairs = Vec::with_capacity(keys.len());
     for (key, value) in keys.iter().zip(vals) {
         if matches!(key, ast::Value::Null) {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidParameterValue(
                 "null value not allowed for object key".to_owned(),
             ));
         }
@@ -2607,7 +2643,7 @@ fn eval_json_build_object(args: &[TypedExpr], row: &Row) -> Result<ast::Value, E
         };
         let key = match eval(key_expr, row)? {
             ast::Value::Null => {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "json_build_object(): object key must not be NULL".to_owned(),
                 ));
             },
@@ -3009,8 +3045,9 @@ fn math_round(vals: &[ast::Value]) -> Result<ast::Value, Error> {
         Some(ast::Value::Numeric(d)) => {
             let target = u8::try_from(places.max(0)).unwrap_or(crate::numeric::MAX_SCALE);
             ast::Value::Numeric(
-                d.rescale(target)
-                    .ok_or_else(|| Error::Unsupported("numeric round overflow".to_owned()))?,
+                d.rescale(target).ok_or_else(|| {
+                    Error::ArgumentOutOfDomain("numeric round overflow".to_owned())
+                })?,
             )
         },
         _ => ast::Value::Null,
@@ -3080,7 +3117,7 @@ fn math_mod(a: Option<&ast::Value>, b: Option<&ast::Value>) -> Result<ast::Value
             return Err(Error::DivisionByZero);
         }
         return Ok(ast::Value::Numeric(da.checked_rem(&db).ok_or_else(
-            || Error::Unsupported("numeric mod overflow".to_owned()),
+            || Error::ArgumentOutOfDomain("numeric mod overflow".to_owned()),
         )?));
     }
     if let (ast::Value::Int(x), ast::Value::Int(y)) = (a, b) {
@@ -3099,14 +3136,14 @@ fn math_mod(a: Option<&ast::Value>, b: Option<&ast::Value>) -> Result<ast::Value
 /// `n > 20` overflows `i64` (`checked_mul` surfaces this as an error rather than wrapping).
 fn factorial(n: i64) -> Result<ast::Value, Error> {
     if n < 0 {
-        return Err(Error::Unsupported(
+        return Err(Error::ArgumentOutOfDomain(
             "factorial of a negative number is undefined".to_owned(),
         ));
     }
     let mut acc: i64 = 1;
     for k in 2..=n {
         acc = acc.checked_mul(k).ok_or_else(|| {
-            Error::Unsupported(format!("factorial({n}) overflows a 64-bit integer"))
+            Error::ArgumentOutOfDomain(format!("factorial({n}) overflows a 64-bit integer"))
         })?;
     }
     Ok(ast::Value::Int(acc))
@@ -3118,17 +3155,17 @@ fn factorial(n: i64) -> Result<ast::Value, Error> {
 /// non-positive `count`, equal bounds, or a NaN argument (matching the standard's domain rules).
 fn width_bucket(operand: f64, low: f64, high: f64, count: i64) -> Result<ast::Value, Error> {
     if count <= 0 {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "width_bucket: count must be greater than zero".to_owned(),
         ));
     }
     if operand.is_nan() || low.is_nan() || high.is_nan() {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "width_bucket: operand and bounds must not be NaN".to_owned(),
         ));
     }
     if low == high {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "width_bucket: lower bound must not equal upper bound".to_owned(),
         ));
     }
@@ -3171,7 +3208,7 @@ fn substring(s: &str, start: i64, length: Option<i64>) -> Result<ast::Value, Err
     let end_excl = match length {
         Some(l) => {
             if l < 0 {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "SUBSTRING length must be non-negative".to_owned(),
                 ));
             }
@@ -3758,7 +3795,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             }
             cast_value(ast::Value::Text(t.to_owned()), target)
         },
-        _ => Err(Error::Unsupported(format!(
+        _ => Err(Error::InvalidStatement(format!(
             "CAST from {:?} to {:?} not supported",
             runtime_type(&value),
             target,
@@ -3878,7 +3915,7 @@ fn encode_bytea(bytes: &[u8], format: &str) -> Result<String, Error> {
             Ok(out)
         },
         "base64" => Ok(base64_encode(bytes)),
-        other => Err(Error::Unsupported(format!(
+        other => Err(Error::InvalidParameterValue(format!(
             "ENCODE format {other:?} (supported: hex, escape, base64)"
         ))),
     }
@@ -3935,7 +3972,10 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, Error> {
             continue;
         }
         let v = sextet(b).ok_or_else(|| {
-            Error::Unsupported(format!("DECODE base64: invalid character {:?}", b as char))
+            Error::InvalidParameterValue(format!(
+                "DECODE base64: invalid character {:?}",
+                b as char
+            ))
         })?;
         acc = (acc << 6) | v;
         bits += 6;
@@ -3955,19 +3995,19 @@ fn decode_bytea(s: &str, format: &str) -> Result<Vec<u8>, Error> {
         "hex" => {
             let hex: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
             if !hex.len().is_multiple_of(2) {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "DECODE hex: odd number of digits".to_owned(),
                 ));
             }
             let mut out = Vec::with_capacity(hex.len() / 2);
             let mut chars = hex.chars();
             while let (Some(a), Some(b)) = (chars.next(), chars.next()) {
-                let hi = a
-                    .to_digit(16)
-                    .ok_or_else(|| Error::Unsupported("DECODE hex: invalid digit".to_owned()))?;
-                let lo = b
-                    .to_digit(16)
-                    .ok_or_else(|| Error::Unsupported("DECODE hex: invalid digit".to_owned()))?;
+                let hi = a.to_digit(16).ok_or_else(|| {
+                    Error::InvalidParameterValue("DECODE hex: invalid digit".to_owned())
+                })?;
+                let lo = b.to_digit(16).ok_or_else(|| {
+                    Error::InvalidParameterValue("DECODE hex: invalid digit".to_owned())
+                })?;
                 out.push(u8::try_from(hi * 16 + lo).unwrap_or(0));
             }
             Ok(out)
@@ -3998,7 +4038,9 @@ fn decode_bytea(s: &str, format: &str) -> Result<Vec<u8>, Error> {
                             }
                         }
                         out.push(u8::try_from(val).map_err(|_| {
-                            Error::Unsupported("DECODE escape: octal value out of range".to_owned())
+                            Error::InvalidParameterValue(
+                                "DECODE escape: octal value out of range".to_owned(),
+                            )
                         })?);
                     },
                     _ => out.push(b'\\'),
@@ -4007,7 +4049,7 @@ fn decode_bytea(s: &str, format: &str) -> Result<Vec<u8>, Error> {
             Ok(out)
         },
         "base64" => base64_decode(s),
-        other => Err(Error::Unsupported(format!(
+        other => Err(Error::InvalidParameterValue(format!(
             "DECODE format {other:?} (supported: hex, escape, base64)"
         ))),
     }
@@ -4377,7 +4419,7 @@ fn overlaps_endpoints(
             match interval_arith(ast::BinaryOp::Plus, &start_val, &end_val) {
                 Some(res) => res?,
                 None => {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidStatement(
                         "OVERLAPS interval end requires a temporal start".to_owned(),
                     ));
                 },
@@ -4886,7 +4928,7 @@ fn eval_vector_distance(func: ast::ScalarFunc, args: &[ast::Value]) -> Result<as
 
 /// The runtime error for applying a vector op to two different-dimension vectors.
 fn vector_dim_mismatch(a: usize, b: usize) -> Error {
-    Error::Unsupported(format!(
+    Error::InvalidParameterValue(format!(
         "vector distance requires equal dimensions, got {a} and {b}"
     ))
 }
@@ -4979,7 +5021,7 @@ fn apply_range_predicate(
         return Ok(ast::Value::Null);
     }
     let mismatch = || {
-        Err(Error::Unsupported(
+        Err(Error::InvalidStatement(
             "range predicate over operands of different element kinds".to_owned(),
         ))
     };
@@ -5045,7 +5087,7 @@ fn json_operand(value: &ast::Value) -> Result<String, Error> {
         }),
         // The analyzer admits only JSON and TEXT on either side of a JSON `||`, so this is
         // unreachable from SQL; report it rather than inventing a document.
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::FunctionArgs(
             "JSON `||` operand is neither JSON nor text".to_owned(),
         )),
     }
@@ -5268,7 +5310,7 @@ fn interval_arith(
     right: &ast::Value,
 ) -> Option<Result<ast::Value, Error>> {
     use ast::Value::{Date, Int, Interval, Time, Timestamp, TimestampTz};
-    let overflow = || Error::Unsupported("INTERVAL arithmetic overflow".to_owned());
+    let overflow = || Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned());
     // `interval * number` (commutative) scales every component. An integer factor is exact; a float
     // factor scales fractionally and cascades (`INTERVAL '1 month' * 1.5` → `1 mon 15 days`).
     if matches!(op, ast::BinaryOp::Multiply) {
@@ -5289,7 +5331,7 @@ fn interval_arith(
     if !add && !matches!(op, ast::BinaryOp::Minus) {
         return None;
     }
-    let date_overflow = || Error::Unsupported("DATE arithmetic out of range".to_owned());
+    let date_overflow = || Error::DatetimeOverflow("DATE arithmetic out of range".to_owned());
     // `date ± integer` (whole days, result DATE) and `date - date` (day count, result INTEGER).
     // A DATE is `i32` days since the epoch; the day arithmetic is done in `i64` then range-checked.
     let date_plus_days = |d: i32, days: i64| -> Result<ast::Value, Error> {
@@ -5590,10 +5632,12 @@ fn to_i64(v: &ast::Value) -> Result<i64, Error> {
         // (Latent today: integer arithmetic only ever sees Int operands, since a NUMERIC operand
         // makes the result NUMERIC — but mask-to-zero would be a silent-wrong answer if reached.)
         ast::Value::Numeric(d) => d.to_i64().ok_or_else(|| {
-            Error::Unsupported("NUMERIC value out of i64 range in integer arithmetic".to_owned())
+            Error::ArgumentOutOfDomain(
+                "NUMERIC value out of i64 range in integer arithmetic".to_owned(),
+            )
         }),
         // The analyzer only routes integer operands here; anything else is a bug, not a silent zero.
-        other => Err(Error::Unsupported(format!(
+        other => Err(Error::Internal(format!(
             "integer arithmetic on a non-integer value: {other:?}"
         ))),
     }
@@ -6137,7 +6181,7 @@ mod tests {
             ),
             &vec![],
         );
-        assert!(matches!(r, Err(Error::Unsupported(_))));
+        assert!(matches!(r, Err(Error::InvalidParameterValue(_))));
     }
 
     #[test]

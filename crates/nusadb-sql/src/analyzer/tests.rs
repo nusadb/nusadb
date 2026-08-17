@@ -556,7 +556,7 @@ fn insert_on_conflict_do_update_resolves_upsert() {
             "INSERT INTO users (id) VALUES (1) ON CONFLICT DO UPDATE SET name = 'x'",
             &catalog(),
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidStatement(_)),
     ));
     // A subquery in the SET value is rejected (the executor evaluates it against an in-memory row).
     assert!(matches!(
@@ -702,7 +702,7 @@ fn subquery_arity_and_type_are_checked() {
     // A scalar / IN subquery must project exactly one column.
     assert!(matches!(
         plan("SELECT (SELECT id, name FROM users) FROM users", &catalog(),),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidStatement(_)),
     ));
     // The IN probe type must match the subquery's single column.
     assert!(matches!(
@@ -808,7 +808,7 @@ fn array_rejects_mixed_types_empty_and_bad_subscript() {
     // Empty array has no inferable element type.
     assert!(matches!(
         plan("SELECT ARRAY[]", &MockCatalog::new()),
-        Err(Error::Unsupported(_)),
+        Err(Error::AmbiguousNull { .. }),
     ));
     // Subscripting a non-array is a type error.
     assert!(matches!(
@@ -878,7 +878,7 @@ fn within_group_rejects_bad_fraction_type_and_order() {
             "SELECT MODE(1) WITHIN GROUP (ORDER BY age) FROM users",
             &catalog(),
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -998,15 +998,16 @@ fn select_for_update_locks_single_table_else_unsupported() {
         plan("SELECT * FROM users FOR SHARE OF users", &catalog()).is_ok(),
         "FOR SHARE OF <the base table> should be accepted",
     );
-    // Richer shapes, and an `OF` naming a relation not in the FROM, remain honest `Unsupported`.
-    for sql in [
-        "SELECT COUNT(*) FROM users FOR UPDATE",   // aggregate
-        "SELECT * FROM users FOR UPDATE OF other", // OF names a table not in FROM
+    // Both are refused, but not for the same reason, and the codes now say which is which: the
+    // aggregate is a shape the engine has not built (`0A000`), while an `OF` naming a relation that
+    // is not in the query is the caller's mistake (`42601`). Reporting the second as a missing
+    // feature would invite a migration tool to skip past a typo.
+    for (sql, want) in [
+        ("SELECT COUNT(*) FROM users FOR UPDATE", "0A000"),
+        ("SELECT * FROM users FOR UPDATE OF other", "42601"),
     ] {
-        assert!(
-            matches!(plan(sql, &catalog()), Err(Error::Unsupported(_))),
-            "expected Unsupported for {sql}",
-        );
+        let err = plan(sql, &catalog()).expect_err("both shapes are refused");
+        assert_eq!(err.sqlstate(), want, "wrong class for {sql}: {err}");
     }
 }
 
@@ -1259,7 +1260,7 @@ fn order_by_position_resolves_to_output_column() {
 fn order_by_position_out_of_range_is_rejected() {
     assert!(matches!(
         plan("SELECT id, name FROM users ORDER BY 5", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidColumnReference(_)),
     ));
 }
 
@@ -1267,7 +1268,7 @@ fn order_by_position_out_of_range_is_rejected() {
 fn order_by_position_zero_is_rejected() {
     assert!(matches!(
         plan("SELECT id FROM users ORDER BY 0", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidColumnReference(_)),
     ));
 }
 
@@ -1383,7 +1384,7 @@ fn count_distinct_star_is_rejected() {
     // DISTINCT needs a concrete argument to dedupe — COUNT(DISTINCT *) is meaningless.
     assert!(matches!(
         plan("SELECT COUNT(DISTINCT *) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -1488,7 +1489,7 @@ fn grouping_of_a_non_group_key_is_rejected() {
             "SELECT id, GROUPING(name) FROM users GROUP BY ROLLUP (id)",
             &catalog(),
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidGrouping(_)),
     ));
 }
 
@@ -1502,7 +1503,7 @@ fn cube_with_too_many_elements_is_rejected() {
     let group_by = crate::ast::GroupBy::Cube(elements);
     assert!(matches!(
         super::expand_grouping(&group_by),
-        Err(Error::Unsupported(_)),
+        Err(Error::LimitExceeded(_)),
     ));
 }
 
@@ -1567,7 +1568,7 @@ fn window_over_aggregation_type_checks() {
             "SELECT name, ROW_NUMBER() OVER () FROM users GROUP BY id",
             &catalog(),
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidGrouping(_)),
     ));
 }
 
@@ -1591,7 +1592,7 @@ fn window_frames_resolve_incl_range_and_groups_offsets() {
             "SELECT SUM(age) OVER (ORDER BY id, age RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
             &catalog(),
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidStatement(_)),
     ));
     // A GROUPS frame *with* an offset resolves — the offset counts peer groups, not a value.
     assert!(plan(
@@ -1605,7 +1606,7 @@ fn window_frames_resolve_incl_range_and_groups_offsets() {
             "SELECT SUM(age) OVER (GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM users",
             &catalog(),
         ),
-        Err(Error::Unsupported(_)),
+        Err(Error::InvalidStatement(_)),
     ));
     // …but a GROUPS frame *with* ORDER BY resolves.
     assert!(plan(
@@ -2124,11 +2125,11 @@ fn scalar_function_rejects_wrong_arity() {
     // UPPER takes exactly one argument; REPLACE exactly three.
     assert!(matches!(
         plan("SELECT UPPER(name, name) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
     assert!(matches!(
         plan("SELECT REPLACE(name, 'a') FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2153,7 +2154,7 @@ fn clock_functions_reject_arguments() {
     // They are niladic (arity 0) — passing an argument is an arity error.
     assert!(matches!(
         plan("SELECT NOW(1)", &MockCatalog::new()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2214,7 +2215,7 @@ fn temporal_functions_reject_bad_field_and_type_and_arity() {
     // AGE arity (0 or >2).
     assert!(matches!(
         plan("SELECT AGE(NOW(), NOW(), NOW())", &MockCatalog::new()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2299,16 +2300,16 @@ fn b448_functions_reject_wrong_arity() {
     // CONCAT / CONCAT_WS need at least one argument.
     assert!(matches!(
         plan("SELECT CONCAT() FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
     // REVERSE takes exactly one; LEFT exactly two.
     assert!(matches!(
         plan("SELECT REVERSE(name, name) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
     assert!(matches!(
         plan("SELECT LEFT(name) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2336,7 +2337,7 @@ fn b449_regex_functions_accept_and_typecheck() {
     // Wrong arity.
     assert!(matches!(
         plan("SELECT REGEXP_MATCH(name) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2372,11 +2373,11 @@ fn b453_55_math_reject_wrong_type_and_arity() {
     // POWER needs two arguments; SQRT exactly one.
     assert!(matches!(
         plan("SELECT POWER(age) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
     assert!(matches!(
         plan("SELECT SQRT(age, age) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
     // ROUND decimal places must be an integer, not text.
     assert!(matches!(
@@ -2407,7 +2408,7 @@ fn b457_conditional_accept_and_reject() {
     // NULLIF needs exactly two arguments.
     assert!(matches!(
         plan("SELECT NULLIF(age) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 
@@ -2422,11 +2423,11 @@ fn b456_random_setseed_types_and_arity() {
     // RANDOM takes no argument; SETSEED takes exactly one.
     assert!(matches!(
         plan("SELECT RANDOM(1) FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
     assert!(matches!(
         plan("SELECT SETSEED() FROM users", &catalog()),
-        Err(Error::Unsupported(_)),
+        Err(Error::FunctionArgs(_)),
     ));
 }
 

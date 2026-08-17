@@ -140,12 +140,12 @@ pub struct GrantRecord {
 /// Returns [`Error::Unsupported`] for an empty or reserved name.
 pub fn validate_role_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "a role name may not be empty".to_owned(),
         ));
     }
     if name.eq_ignore_ascii_case(PUBLIC_GRANTEE) {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "`public` is reserved for the pseudo-role every session belongs to and may not be \
              created, altered, or dropped as a role"
                 .to_owned(),
@@ -154,7 +154,7 @@ pub fn validate_role_name(name: &str) -> Result<(), Error> {
     // The bootstrap superuser's name is what `object_owner` reports for every unowned object, so
     // a catalog role created under that name would inherit ownership of them all. Reserve it.
     if name.eq_ignore_ascii_case(crate::BOOTSTRAP_SUPERUSER) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "`{}` is reserved for the bootstrap superuser and may not be created, altered, or \
              dropped as a role",
             crate::BOOTSTRAP_SUPERUSER

@@ -183,7 +183,7 @@ fn reject_explicit_identity_always(
                 Some(super::coldefault::ColumnFill::Serial { always: true, .. })
             )
         {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::GeneratedAlways(format!(
                 "column \"{}\" is GENERATED ALWAYS AS IDENTITY and cannot be given an explicit value",
                 table.columns.get(index).map_or("", |c| c.name.as_str())
             )));
@@ -204,7 +204,7 @@ fn reject_explicit_generated(
         if covered.contains(&index)
             && matches!(fill, Some(super::coldefault::ColumnFill::Generated(_)))
         {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::GeneratedAlways(format!(
                 "column \"{}\" is a generated column and cannot be given an explicit value",
                 table.columns.get(index).map_or("", |c| c.name.as_str())
             )));
@@ -673,8 +673,8 @@ fn insert_value_rows(
                     .map(|r| r.into_iter().map(Some).collect())
                     .collect()),
                 // `run_select` always yields `Rows`; anything else is an internal invariant break.
-                _ => Err(Error::Unsupported(
-                    "internal: INSERT ... SELECT subquery did not produce a row set".to_owned(),
+                _ => Err(Error::Internal(
+                    "INSERT ... SELECT subquery did not produce a row set".to_owned(),
                 )),
             }
         },
@@ -725,7 +725,7 @@ fn insert_encoded_batch(
         .collect::<Result<_, _>>()?;
     let tids = engine.insert_batch(txn, table.id, &encoded)?;
     if tids.len() != rows.len() {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::Internal(format!(
             "storage engine returned {} tids for a {}-row insert batch — the treaty requires one \
              per row, in input order",
             tids.len(),
@@ -2963,8 +2963,8 @@ fn materialize_subplan(
     match run_select(&op, None, engine, txn)? {
         ExecutionResult::Rows { rows, .. } => Ok(rows),
         // `run_select` always yields `Rows`; anything else is an internal invariant break.
-        _ => Err(Error::Unsupported(
-            "internal: a derived UPDATE/DELETE source did not produce a row set".to_owned(),
+        _ => Err(Error::Internal(
+            "a derived UPDATE/DELETE source did not produce a row set".to_owned(),
         )),
     }
 }
@@ -3500,8 +3500,8 @@ pub(super) fn run_truncate(
         .iter()
         .map(|id| {
             by_id.get(id).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "internal: TRUNCATE cascade closure member {id:?} has no resolvable schema"
+                Error::Internal(format!(
+                    "TRUNCATE cascade closure member {id:?} has no resolvable schema"
                 ))
             })
         })
@@ -3649,10 +3649,7 @@ fn truncate_rebuild(
         for c in &s.checks {
             // Non-None guaranteed by `truncate_snapshot`, which refuses a CHECK without bytes.
             let expr = c.expr.as_deref().ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "internal: TRUNCATE CHECK \"{}\" lost its predicate",
-                    c.name
-                ))
+                Error::Internal(format!("TRUNCATE CHECK \"{}\" lost its predicate", c.name))
             })?;
             engine.add_check_constraint(txn, id, &c.name, expr)?;
         }
@@ -3733,16 +3730,16 @@ fn truncate_snapshot(
                     // A CHECK without its predicate bytes cannot be re-declared faithfully;
                     // refusing beats silently rebuilding the table with a broken constraint.
                     if c.expr.is_none() {
-                        return Err(Error::Unsupported(format!(
-                            "internal: TRUNCATE found CHECK \"{}\" on \"{}\" with no stored predicate",
+                        return Err(Error::Internal(format!(
+                            "TRUNCATE found CHECK \"{}\" on \"{}\" with no stored predicate",
                             c.name, table.name
                         )));
                     }
                     checks.push(c);
                 },
                 nusadb_core::engine::ConstraintKind::ForeignKey => {
-                    return Err(Error::Unsupported(format!(
-                        "internal: TRUNCATE found foreign key \"{}\" on \"{}\" missing from list_foreign_keys",
+                    return Err(Error::Internal(format!(
+                        "TRUNCATE found foreign key \"{}\" on \"{}\" missing from list_foreign_keys",
                         c.name, table.name
                     )));
                 },
@@ -3776,7 +3773,7 @@ fn restart_serial_sequences(
     for (column, sql) in super::coldefault::load_defaults(&key, engine, txn)? {
         if let Some(seq) = super::coldefault::serial_sequence(&sql) {
             let id = engine.lookup_sequence(seq)?.ok_or_else(|| {
-                Error::Unsupported(format!(
+                Error::Internal(format!(
                     "serial column \"{column}\" has no backing sequence"
                 ))
             })?;

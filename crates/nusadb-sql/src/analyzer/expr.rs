@@ -117,7 +117,7 @@ pub(super) fn analyze_expr_agg(
         },
         // A `$n` placeholder must be replaced by `bind_parameters` before analysis (extended
         // query protocol); one reaching here was never bound.
-        ast::Expr::Parameter(n) => Err(Error::Unsupported(format!(
+        ast::Expr::Parameter(n) => Err(Error::InvalidStatement(format!(
             "parameter ${} was not bound (use a prepared statement with Bind)",
             n + 1
         ))),
@@ -465,7 +465,7 @@ pub(super) fn analyze_expr_agg(
         // A window function is only valid where the SELECT pipeline supplies a window stage
         // (the projection path lifts it before expression analysis); anywhere else there is
         // no execution path for it, so reject it here.
-        ast::Expr::WindowFunction(_) => Err(Error::Unsupported(
+        ast::Expr::WindowFunction(_) => Err(Error::InvalidStatement(
             "window functions (OVER) are not supported in this position".to_owned(),
         )),
         // An aggregate is only valid where a sink is supplied (a projection,
@@ -483,7 +483,7 @@ pub(super) fn analyze_expr_agg(
             Some(sink) => {
                 // COUNT(DISTINCT *) is meaningless — DISTINCT needs a concrete argument to dedupe.
                 if *distinct && arg.is_none() {
-                    return Err(Error::Unsupported(
+                    return Err(Error::FunctionArgs(
                         "DISTINCT requires an argument (COUNT(DISTINCT *) is not valid)".to_owned(),
                     ));
                 }
@@ -504,7 +504,7 @@ pub(super) fn analyze_expr_agg(
                     match arg2 {
                         Some(a2) => Some(analyze_expr(a2, scope, catalog, None)?),
                         None => {
-                            return Err(Error::Unsupported(
+                            return Err(Error::FunctionArgs(
                                 "json_object_agg requires two arguments (key, value)".to_owned(),
                             ));
                         },
@@ -523,12 +523,12 @@ pub(super) fn analyze_expr_agg(
                             Some(typed)
                         },
                         (None, true) => {
-                            return Err(Error::Unsupported(format!(
+                            return Err(Error::FunctionArgs(format!(
                                 "{func:?} requires two arguments"
                             )));
                         },
                         (Some(_), false) => {
-                            return Err(Error::Unsupported(format!(
+                            return Err(Error::FunctionArgs(format!(
                                 "{func:?} takes a single argument"
                             )));
                         },
@@ -544,7 +544,7 @@ pub(super) fn analyze_expr_agg(
                         match typed.kind {
                             TypedExprKind::Literal(ast::Value::Text(s)) => Some(s),
                             _ => {
-                                return Err(Error::Unsupported(
+                                return Err(Error::InvalidStatement(
                                     "STRING_AGG separator must be a constant string".to_owned(),
                                 ));
                             },
@@ -574,7 +574,7 @@ pub(super) fn analyze_expr_agg(
                 let row_args = match (*func, arg.as_deref()) {
                     (ast::AggregateFunc::Count, Some(ast::Expr::Row(items))) => {
                         if items.is_empty() {
-                            return Err(Error::Unsupported(
+                            return Err(Error::InvalidStatement(
                                 "COUNT() over an empty row value has nothing to count".to_owned(),
                             ));
                         }
@@ -620,7 +620,7 @@ pub(super) fn analyze_expr_agg(
                     ty: result_ty,
                 })
             },
-            None => Err(Error::Unsupported(
+            None => Err(Error::InvalidGrouping(
                 "aggregate functions are only allowed in a SELECT projection, HAVING, or ORDER BY"
                     .to_owned(),
             )),
@@ -635,7 +635,7 @@ pub(super) fn analyze_coalesce(
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     if args.is_empty() {
-        return Err(Error::Unsupported("COALESCE with no arguments".to_owned()));
+        return Err(Error::FunctionArgs("COALESCE with no arguments".to_owned()));
     }
     // Resolve the non-NULL arguments to a common result type first. A bare `NULL` literal carries no
     // type of its own, so it is deferred and typed from that result — this lets a leading `NULL`
@@ -866,7 +866,7 @@ fn analyze_sql_function(
     });
     let result = (|| {
         if depth >= MAX_FN_INLINE_DEPTH {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::LimitExceeded(format!(
                 "function `{name}` inlining exceeded the recursion limit"
             )));
         }
@@ -949,7 +949,7 @@ pub(super) fn analyze_scalar_function(
     }
     if matches!(func, F::Grouping) {
         if args.is_empty() {
-            return Err(Error::Unsupported(
+            return Err(Error::FunctionArgs(
                 "GROUPING requires at least one argument".to_owned(),
             ));
         }
@@ -1050,14 +1050,14 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::Cardinality | F::ArrayDims | F::ArrayNdims) {
         let name = func.name();
         let [arg_expr] = args else {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{name}() expects 1 argument, got {}",
                 args.len()
             )));
         };
         let arg = analyze_expr_agg(arg_expr, scope, catalog, None, aggregates.as_deref_mut())?;
         if !matches!(arg.ty, ColumnType::Array(_)) && !is_null_literal(&arg) {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{name}() expects an array argument, got {:?}",
                 arg.ty
             )));
@@ -1075,7 +1075,7 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::IsFinite) {
         let name = func.name();
         let [arg_expr] = args else {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{name}() expects 1 argument, got {}",
                 args.len()
             )));
@@ -1109,7 +1109,7 @@ pub(super) fn analyze_scalar_function(
     // they never propagate NULL, so they are not expressible with the fixed table.
     if matches!(func, F::NumNonNulls | F::NumNulls) {
         if args.is_empty() {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{}() expects at least 1 argument",
                 func.name()
             )));
@@ -1138,7 +1138,7 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::Format) {
         let name = func.name();
         let Some((fmt_expr, rest)) = args.split_first() else {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{name}() expects at least 1 argument (the format string)"
             )));
         };
@@ -1592,7 +1592,7 @@ pub(super) fn analyze_scalar_function(
             (lo, usize::MAX) => format!("at least {lo}"),
             (lo, hi) => format!("{lo}..={hi}"),
         };
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects {arity} argument(s), got {}",
             args.len()
         )));
@@ -1658,13 +1658,13 @@ fn analyze_json_construct(
     use ast::ScalarFunc as F;
     let name = func.name();
     if func == F::ToJson && args.len() != 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 1 argument, got {}",
             args.len()
         )));
     }
     if func == F::JsonBuildObject && !args.len().is_multiple_of(2) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() requires an even number of arguments (key, value pairs), got {}",
             args.len()
         )));
@@ -1702,7 +1702,7 @@ fn analyze_row_to_json(
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     let [arg] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "row_to_json() expects 1 argument, got {}",
             args.len()
         )));
@@ -1747,7 +1747,7 @@ fn analyze_row_to_json(
             typed
         },
         _ => {
-            return Err(Error::Unsupported(
+            return Err(Error::FunctionArgs(
                 "row_to_json() expects a ROW(...) constructor or a table/alias in the FROM clause \
                  (e.g. row_to_json(row(a, b)) or row_to_json(t))"
                     .to_owned(),
@@ -1777,7 +1777,7 @@ fn analyze_array_fill(
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     let [value_expr, dims_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "array_fill() expects 2 arguments, got {}",
             args.len()
         )));
@@ -1817,14 +1817,14 @@ fn analyze_array_function(
     use ast::ScalarFunc as F;
     let name = func.name();
     let [arr_expr, second_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 2 arguments, got {}",
             args.len()
         )));
     };
     let arr = analyze_expr_agg(arr_expr, scope, catalog, None, aggregates.as_deref_mut())?;
     if !matches!(arr.ty, ColumnType::Array(_)) && !is_null_literal(&arr) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects an array first argument, got {:?}",
             arr.ty
         )));
@@ -1865,7 +1865,7 @@ fn analyze_array_mutate(
     use ast::ScalarFunc as F;
     let name = func.name();
     let [a_expr, b_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 2 arguments, got {}",
             args.len()
         )));
@@ -1881,7 +1881,7 @@ fn analyze_array_mutate(
     };
     let array = analyze_expr_agg(array_expr, scope, catalog, None, aggregates.as_deref_mut())?;
     let ColumnType::Array(array_elem) = array.ty else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects an array argument, got {:?}",
             array.ty
         )));
@@ -1933,14 +1933,14 @@ fn analyze_array_replace(
 ) -> Result<TypedExpr, Error> {
     let name = func.name();
     let [arr_expr, from_expr, to_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 3 arguments, got {}",
             args.len()
         )));
     };
     let array = analyze_expr_agg(arr_expr, scope, catalog, None, aggregates.as_deref_mut())?;
     let ColumnType::Array(array_elem) = array.ty else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects an array argument, got {:?}",
             array.ty
         )));
@@ -2036,7 +2036,7 @@ fn analyze_numeric_function(
         } else {
             format!("{min}..={max}")
         };
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects {arity} argument(s), got {}",
             args.len()
         )));
@@ -2101,7 +2101,7 @@ fn analyze_conditional_function(
         } else {
             format!("at least {min}")
         };
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects {arity} argument(s), got {}",
             args.len()
         )));
@@ -2151,7 +2151,7 @@ fn analyze_vector_function(
 ) -> Result<TypedExpr, Error> {
     let name = func.name();
     let [a_expr, b_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 2 arguments, got {}",
             args.len()
         )));
@@ -2196,7 +2196,7 @@ fn analyze_bit_function(
     let name = func.name();
     let want = if func == F::BitSetBit { 3 } else { 2 };
     if args.len() != want {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects {want} argument(s), got {}",
             args.len()
         )));
@@ -2246,7 +2246,7 @@ fn analyze_range_function(
 ) -> Result<TypedExpr, Error> {
     let name = func.name();
     let [a_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 1 argument, got {}",
             args.len()
         )));
@@ -2282,7 +2282,7 @@ fn analyze_range_constructor(
 ) -> Result<TypedExpr, Error> {
     let name = func.name();
     if args.len() < 2 || args.len() > 3 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 2..=3 argument(s), got {}",
             args.len()
         )));
@@ -2361,14 +2361,19 @@ fn analyze_inet_function(
     let name = func.name();
     let want = if func == F::InetSetMasklen { 2 } else { 1 };
     if args.len() != want {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects {want} argument(s), got {}",
             args.len()
         )));
     }
-    let a_expr = args
-        .first()
-        .ok_or_else(|| Error::Unsupported(format!("{name}() argument")))?;
+    // The arity check above already guarantees these are present, so reaching either is a bug in
+    // this function rather than anything the caller wrote — which is why they do not report `42883`
+    // and blame the call.
+    let a_expr = args.first().ok_or_else(|| {
+        Error::Internal(format!(
+            "{name}() passed the arity check with no first argument"
+        ))
+    })?;
     let a = analyze_expr_agg(a_expr, scope, catalog, None, aggregates.as_deref_mut())?;
     if !is_inet_type(a.ty) && !is_null_literal(&a) {
         return Err(Error::TypeMismatch {
@@ -2384,9 +2389,11 @@ fn analyze_inet_function(
         F::InetNetwork => ColumnType::Cidr,
         F::InetBroadcast => ColumnType::Inet,
         F::InetSetMasklen => {
-            let n_expr = args
-                .get(1)
-                .ok_or_else(|| Error::Unsupported(format!("{name}() mask length argument")))?;
+            let n_expr = args.get(1).ok_or_else(|| {
+                Error::Internal(format!(
+                    "{name}() passed the arity check with no mask-length argument"
+                ))
+            })?;
             let n = analyze_expr_agg(n_expr, scope, catalog, None, aggregates)?;
             if !matches!(n.ty, ColumnType::Int) && !is_null_literal(&n) {
                 return Err(Error::TypeMismatch {
@@ -2418,7 +2425,7 @@ fn analyze_vector_unary(
 ) -> Result<TypedExpr, Error> {
     let name = func.name();
     let [a_expr] = args else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects 1 argument, got {}",
             args.len()
         )));
@@ -2471,10 +2478,8 @@ fn analyze_array_literal(
             Some(ColumnType::Array(elem)) => Some(elem.column_type()),
             _ => None,
         })
-        .ok_or_else(|| {
-            Error::Unsupported(
-                "empty ARRAY[] has no inferable element type — add an explicit cast".to_owned(),
-            )
+        .ok_or_else(|| Error::AmbiguousNull {
+            context: "an empty ARRAY[] — add an explicit cast, e.g. ARRAY[]::INT[]".to_owned(),
         })?;
     // Map the unified element type to a storable array element. NUMERIC is a supported element type
     // (exact decimals — `ARRAY[1, 2.0]` is `NUMERIC[]`). A **nested** array element makes this a
@@ -2600,7 +2605,7 @@ fn analyze_within_group(
 ) -> Result<TypedExpr, Error> {
     use ast::AggregateFunc as F;
     let Some(sink) = aggregates else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidGrouping(
             "ordered-set aggregates are only allowed in a SELECT projection, HAVING, or ORDER BY"
                 .to_owned(),
         ));
@@ -2610,7 +2615,7 @@ fn analyze_within_group(
         "percentile_disc" => F::PercentileDisc,
         "mode" => F::Mode,
         other => {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "ordered-set aggregate `{other}` is not supported (PERCENTILE_CONT / \
                  PERCENTILE_DISC / MODE only)"
             )));
@@ -2620,7 +2625,7 @@ fn analyze_within_group(
     // FIRST/LAST` clause is accepted but has no effect (NULL ordering values are excluded from the
     // set, so their placement cannot change the percentile/mode).
     let [order_item] = wg.order_by.as_slice() else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "WITHIN GROUP requires exactly one ORDER BY expression".to_owned(),
         ));
     };
@@ -2630,7 +2635,7 @@ fn analyze_within_group(
     let (fraction, result_ty) = match func {
         F::Mode => {
             if !wg.args.is_empty() {
-                return Err(Error::Unsupported(
+                return Err(Error::FunctionArgs(
                     "MODE() takes no direct arguments".to_owned(),
                 ));
             }
@@ -2638,7 +2643,7 @@ fn analyze_within_group(
         },
         F::PercentileCont | F::PercentileDisc => {
             let [fraction_expr] = wg.args.as_slice() else {
-                return Err(Error::Unsupported(
+                return Err(Error::FunctionArgs(
                     "PERCENTILE_CONT / PERCENTILE_DISC take exactly one fraction argument"
                         .to_owned(),
                 ));
@@ -2759,7 +2764,7 @@ fn const_fraction(expr: &ast::Expr) -> Result<f64, Error> {
         ast::Expr::Literal(ast::Value::Int(i)) => *i as f64,
         ast::Expr::Literal(ast::Value::Numeric(d)) => d.to_f64(),
         _ => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "the PERCENTILE fraction must be a constant numeric literal".to_owned(),
             ));
         },
@@ -2863,7 +2868,7 @@ fn analyze_temporal_function(
             // name/offset (`'UTC'`, `'+05:00'`) or an INTERVAL fixed offset (`INTERVAL '5 hours'`).
             // The result flips the time-zone-awareness — TIMESTAMP → TIMESTAMPTZ, TIMESTAMPTZ → TIMESTAMP.
             let [value, zone] = args else {
-                return Err(Error::Unsupported(
+                return Err(Error::FunctionArgs(
                     "AT TIME ZONE expects a value and a zone".to_owned(),
                 ));
             };
@@ -2898,7 +2903,7 @@ fn analyze_temporal_function(
         },
         F::Age => {
             if args.is_empty() || args.len() > 2 {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::FunctionArgs(format!(
                     "{name}() expects 1 or 2 argument(s), got {}",
                     args.len()
                 )));
@@ -2924,7 +2929,7 @@ fn analyze_temporal_function(
         // the two-argument `to_timestamp(text, format)` keeps the text-parsing path.
         F::ToTimestamp if matches!(args, [_]) => {
             let [epoch] = args else {
-                return Err(Error::Unsupported(format!("{name}() expects 1 argument")));
+                return Err(Error::FunctionArgs(format!("{name}() expects 1 argument")));
             };
             let arg = analyze_expr_agg(epoch, scope, catalog, None, aggregates.as_deref_mut())?;
             if !matches!(arg.ty, Float | ColumnType::Int | ColumnType::Numeric { .. })
@@ -3011,7 +3016,7 @@ fn expect_two_args<'a>(
 ) -> Result<(&'a ast::Expr, &'a ast::Expr), Error> {
     match args {
         [a, b] => Ok((a, b)),
-        _ => Err(Error::Unsupported(format!(
+        _ => Err(Error::FunctionArgs(format!(
             "{name}() expects 2 argument(s), got {}",
             args.len()
         ))),
@@ -3022,7 +3027,7 @@ fn expect_two_args<'a>(
 fn expect_field_literal(expr: &ast::Expr, name: &str) -> Result<String, Error> {
     match expr {
         ast::Expr::Literal(ast::Value::Text(s)) => Ok(s.to_lowercase()),
-        _ => Err(Error::Unsupported(format!(
+        _ => Err(Error::InvalidStatement(format!(
             "{name}() field must be a string literal"
         ))),
     }
@@ -3117,7 +3122,7 @@ fn analyze_field_access(
     aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     let Some(fields) = composite_type_of(base, scope, catalog)? else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "field access `.{field}` requires an operand of a known composite type (a composite \
              column or a cast to a composite type)"
         )));
@@ -3126,11 +3131,12 @@ fn analyze_field_access(
         .iter()
         .position(|(name, _)| name == field)
         .ok_or_else(|| {
-            Error::Unsupported(format!("composite type has no field named {field:?}"))
+            Error::InvalidStatement(format!("composite type has no field named {field:?}"))
         })?;
-    let field_ty = fields.get(index).map(|(_, ty)| *ty).ok_or_else(|| {
-        Error::Unsupported("internal: composite field index out of range".to_owned())
-    })?;
+    let field_ty = fields
+        .get(index)
+        .map(|(_, ty)| *ty)
+        .ok_or_else(|| Error::Internal("composite field index out of range".to_owned()))?;
     let field_types: Vec<ColumnType> = fields.iter().map(|(_, ty)| *ty).collect();
     // The operand evaluates to the canonical text form (a composite column is stored as `TEXT`; a
     // composite cast produces the text form), so analyze it normally with no hint.
@@ -3158,14 +3164,14 @@ fn analyze_cast_named(
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     let Some(fields) = catalog.lookup_composite(type_name)? else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::ObjectNotFound(format!(
             "type \"{type_name}\" does not exist or is not a composite type"
         )));
     };
     let field_types: Vec<ColumnType> = fields.iter().map(|(_, ty)| *ty).collect();
     if let ast::Expr::Row(items) = expr {
         if items.len() != field_types.len() {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidStatement(format!(
                 "composite type \"{type_name}\" has {} fields but the ROW value supplies {}",
                 field_types.len(),
                 items.len()
@@ -3197,7 +3203,7 @@ fn analyze_cast_named(
     // A non-ROW operand is a text value spelling the composite's canonical form (e.g. `'(a,b)'::T`).
     let inner = analyze_expr_agg(expr, scope, catalog, Some(ColumnType::Text), aggregates)?;
     if inner.ty.physical() != ColumnType::Text {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "a cast to composite type \"{type_name}\" requires a ROW(...) value or a text value"
         )));
     }
@@ -3656,7 +3662,7 @@ pub(super) fn analyze_overlaps(
         *slot = Some(t);
     }
     let Some(anchor) = anchor else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "OVERLAPS requires at least one temporal endpoint to determine the period type"
                 .to_owned(),
         ));
@@ -3670,7 +3676,7 @@ pub(super) fn analyze_overlaps(
     // Every slot is now populated; recover the four operands without panicking.
     let assembled: Vec<TypedExpr> = typed.into_iter().flatten().collect();
     let Ok([s1_typed, e1_typed, s2_typed, e2_typed]) = <[TypedExpr; 4]>::try_from(assembled) else {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "OVERLAPS requires two 2-element row expressions".to_owned(),
         ));
     };
@@ -3802,7 +3808,7 @@ fn desugar_row_comparison(
 ) -> Result<ast::Expr, Error> {
     use ast::BinaryOp as B;
     if left.len() != right.len() {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidStatement(
             "a row comparison requires both rows to have the same number of fields".to_owned(),
         ));
     }
@@ -3841,13 +3847,14 @@ fn desugar_row_comparison(
             })
         },
         _ => {
-            return Err(Error::Unsupported(
+            return Err(Error::InvalidStatement(
                 "a row (…) is only valid with a comparison operator".to_owned(),
             ));
         },
     };
-    combined
-        .ok_or_else(|| Error::Unsupported("a row comparison requires a non-empty row".to_owned()))
+    combined.ok_or_else(|| {
+        Error::InvalidStatement("a row comparison requires a non-empty row".to_owned())
+    })
 }
 
 #[allow(
@@ -3904,7 +3911,7 @@ pub(super) fn analyze_binary(
                 let lt: Vec<ColumnType> = lf.iter().map(|(_, ty)| *ty).collect();
                 let rt: Vec<ColumnType> = rf.iter().map(|(_, ty)| *ty).collect();
                 if lt != rt {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidStatement(
                         "cannot compare values of different composite types".to_owned(),
                     ));
                 }
@@ -3922,7 +3929,7 @@ pub(super) fn analyze_binary(
                 });
             },
             (Some(_), None) | (None, Some(_)) => {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidStatement(
                     "cannot compare a composite value to a non-composite value".to_owned(),
                 ));
             },
@@ -4242,7 +4249,7 @@ fn analyze_text_polymorphic(
         } else {
             format!("at least {min}")
         };
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "{name}() expects {arity} argument(s), got {}",
             args.len()
         )));
@@ -4300,13 +4307,13 @@ fn analyze_substring(
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
     let Some(([source_arg, second_arg], rest)) = args.split_first_chunk() else {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "substring() expects 2..=3 argument(s), got {}",
             args.len()
         )));
     };
     if rest.len() > 1 {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::FunctionArgs(format!(
             "substring() expects 2..=3 argument(s), got {}",
             args.len()
         )));
@@ -4649,7 +4656,7 @@ pub(super) fn check_json(
                 Ok(ColumnType::Text)
             }
         },
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::Internal(
             "non-JSON operator in check_json".to_owned(),
         )),
     }
@@ -4894,7 +4901,7 @@ pub(super) fn analyze_unary(
 fn single_subquery_column(plan: &SelectPlan, context: &str) -> Result<ColumnType, Error> {
     match plan.projection.as_slice() {
         [only] => Ok(only.expr.ty),
-        _ => Err(Error::Unsupported(format!(
+        _ => Err(Error::InvalidStatement(format!(
             "{context} must return exactly one column"
         ))),
     }

@@ -137,7 +137,7 @@ fn exec_one(
             while eval_bool(cond, env, params, engine, txn)? {
                 iterations += 1;
                 if iterations > MAX_LOOP_ITERS {
-                    return Err(Error::Unsupported(
+                    return Err(Error::LimitExceeded(
                         "NusaScript WHILE loop exceeded the iteration limit".to_owned(),
                     ));
                 }
@@ -160,7 +160,7 @@ fn exec_one(
             for i in lo..=hi {
                 iterations += 1;
                 if iterations > MAX_LOOP_ITERS {
-                    return Err(Error::Unsupported(
+                    return Err(Error::LimitExceeded(
                         "NusaScript FOR loop exceeded the iteration limit".to_owned(),
                     ));
                 }
@@ -218,7 +218,7 @@ fn eval_int(
 ) -> Result<i64, Error> {
     match eval_value(expr, env, params, engine, txn)? {
         ast::Value::Int(n) => Ok(n),
-        other => Err(Error::Unsupported(format!(
+        other => Err(Error::InvalidStatement(format!(
             "FOR loop bound must be an integer, got {other:?}"
         ))),
     }

@@ -4579,7 +4579,7 @@ fn savepoint_without_an_active_transaction_is_rejected() {
     let mut session = Session::new(&engine);
     assert!(matches!(
         session.execute(build_plan(&engine, "SAVEPOINT sp1")),
-        Err(nusadb_sql::Error::Unsupported(_)),
+        Err(nusadb_sql::Error::NoActiveTransaction(_)),
     ));
 }
 
@@ -4607,7 +4607,7 @@ fn read_only_transaction_blocks_writes_but_allows_reads() {
     // A write is refused.
     assert!(matches!(
         session.execute(build_plan(&engine, "INSERT INTO t VALUES (2)")),
-        Err(nusadb_sql::Error::Unsupported(_)),
+        Err(nusadb_sql::Error::ReadOnlyTransaction(_)),
     ));
     session.execute(build_plan(&engine, "COMMIT")).unwrap();
 
@@ -4630,7 +4630,7 @@ fn set_transaction_sets_the_session_read_only_default() {
     ));
     assert!(matches!(
         session.execute(build_plan(&engine, "INSERT INTO t VALUES (1)")),
-        Err(nusadb_sql::Error::Unsupported(_)),
+        Err(nusadb_sql::Error::ReadOnlyTransaction(_)),
     ));
 }
 
@@ -5788,7 +5788,10 @@ fn one_shot_execute_rejects_explicit_transaction_control() {
     let logical = analyze(stmt, &EngineCatalog(&engine)).expect("analyze");
     let physical = plan(logical);
     let result = execute(physical, &engine);
-    assert!(matches!(result, Err(nusadb_sql::Error::Unsupported(_))));
+    // A caller that reaches this has used the one-shot entry point for a statement that needs a
+    // session — a mistake in the embedding, not in the SQL. NusaDB supports `BEGIN` perfectly well,
+    // so `feature_not_supported` would be a false statement about the server.
+    assert!(matches!(result, Err(nusadb_sql::Error::Internal(_))));
 }
 
 #[test]
@@ -10802,11 +10805,11 @@ fn temp_table_on_commit_parses_and_rejects_non_temp() {
     let engine = BtreeEngine::new();
     assert!(matches!(
         run_try(&engine, "CREATE TABLE t (id INT) ON COMMIT DROP"),
-        Err(nusadb_sql::Error::Unsupported(_))
+        Err(nusadb_sql::Error::InvalidTableDefinition(_))
     ));
     assert!(matches!(
         run_try(&engine, "CREATE TABLE t2 (id INT) ON COMMIT DELETE ROWS"),
-        Err(nusadb_sql::Error::Unsupported(_))
+        Err(nusadb_sql::Error::InvalidTableDefinition(_))
     ));
 }
 
@@ -11132,4 +11135,116 @@ fn composite_type_recreate_column_as_composite_again_is_still_tagged() {
         rows(run(&engine, "SELECT (home).street, (home).num FROM people")),
         vec![vec![Value::Text("Main".to_owned()), Value::Int(10)]]
     );
+}
+
+/// Every kind of refusal reports the class a client acts on, checked by running the statement all
+/// the way through parse → analyze → plan → execute rather than by constructing an `Error`.
+///
+/// The mapping in `Error::sqlstate` has its own unit tests, and they pass whether or not any call
+/// site actually uses the variant they check. Reverting a single re-tagged site back to the
+/// catch-all leaves those green — which is how a site regression would ship unnoticed. These cases
+/// fail instead, because each one is a statement a user can type.
+///
+/// The `0A000` row is the load-bearing one. It is the only class that invites a client to *skip*
+/// the statement and carry on, so a mistake that leaks into it is worse than one that lands on
+/// `XX000`: the caller never learns anything went wrong.
+#[test]
+fn each_kind_of_refusal_reports_its_own_class_over_the_full_pipeline() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT NOT NULL, name TEXT)");
+    run(
+        &engine,
+        "CREATE TABLE gen (id INT GENERATED ALWAYS AS IDENTITY, v INT)",
+    );
+    run(&engine, "CREATE TYPE mood AS ENUM ('ok', 'bad')");
+    run(&engine, "CREATE TYPE addr AS (street TEXT, num INT)");
+    run(&engine, "CREATE TABLE homes (id INT, where_ addr)");
+    run(&engine, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+
+    let cases: &[(&str, &str, &str)] = &[
+        // (what it is, statement, class it must report)
+        (
+            "a named object that is not there",
+            "DROP ROLE nobody",
+            "42704",
+        ),
+        (
+            "a call with the wrong argument count",
+            "SELECT UPPER(name, name) FROM t",
+            "42883",
+        ),
+        (
+            "an ordinal past the end of the select list",
+            "SELECT id FROM t ORDER BY 9",
+            "42P10",
+        ),
+        (
+            "a column neither grouped nor aggregated",
+            "SELECT name, COUNT(*) FROM t",
+            "42803",
+        ),
+        (
+            "a value for a GENERATED ALWAYS column",
+            "INSERT INTO gen (id, v) VALUES (1, 2)",
+            "428C9",
+        ),
+        (
+            "a statement that is merely illegal, not unbuilt",
+            "SELECT *",
+            "42601",
+        ),
+        (
+            "an argument value the function will not take",
+            "SELECT generate_series(1, 10, 0)",
+            "22023",
+        ),
+        (
+            "a second PRIMARY KEY on one table",
+            "CREATE TABLE two (a INT PRIMARY KEY, b INT PRIMARY KEY)",
+            "42P16",
+        ),
+        (
+            "a name that is already taken",
+            "CREATE TYPE mood AS ENUM ('ok')",
+            "42710",
+        ),
+        (
+            "dropping something another object still points at",
+            "DROP TYPE addr",
+            "2BP01",
+        ),
+        (
+            "a subquery returning more rows than the position allows",
+            "SELECT (SELECT id FROM t)",
+            "21000",
+        ),
+        (
+            "a date that does not exist",
+            "SELECT make_date(2026, 2, 30)",
+            "22008",
+        ),
+        (
+            "a jsonpath the server does not accept",
+            "SELECT jsonb_path_query_first('{\"a\":1}', 'a')",
+            "22023",
+        ),
+        // And the one genuinely missing feature, so the rows above are not vacuous: this class
+        // must still be reachable, or "nothing reports 0A000" would pass for the wrong reason.
+        (
+            "a construct the engine has not built",
+            "SELECT COUNT(*) FROM t FOR UPDATE",
+            "0A000",
+        ),
+    ];
+
+    for (what, sql, want) in cases {
+        let err = run_try(&engine, sql).expect_err(what);
+        assert_eq!(
+            err.sqlstate(),
+            *want,
+            "{what}: `{sql}` reported {} — a client branches on this class to decide whether to \
+             retry, report, or skip",
+            err.sqlstate()
+        );
+    }
 }

@@ -166,7 +166,9 @@ pub(super) fn run_create_table(
                     domain_checks.push((name, predicate));
                 }
             } else {
-                return Err(Error::Unsupported(format!("type \"{udt}\" does not exist")));
+                return Err(Error::ObjectNotFound(format!(
+                    "type \"{udt}\" does not exist"
+                )));
             }
         }
         columns.push(ColumnDef {
@@ -326,7 +328,7 @@ fn refuse_rename_with_dependents(
         } else {
             "drop it, rename the column, then declare it again"
         };
-        Error::Unsupported(format!(
+        Error::DependentObjects(format!(
             "cannot rename column \"{column}\" of \"{}\": {what} \"{name}\" refers to it by name \
              and would stop resolving — {remedy}",
             table.name
@@ -646,7 +648,7 @@ pub(super) fn register_foreign_key(
         fk.referred_columns.clone()
     };
     if parent_columns.is_empty() {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "foreign key \"{}\" references \"{}\", which has no PRIMARY KEY — name the referenced \
              UNIQUE columns explicitly with REFERENCES \"{}\" (columns)",
             fk.name, fk.parent_table, fk.parent_table
@@ -661,14 +663,14 @@ pub(super) fn register_foreign_key(
         ) && c.columns == parent_columns
     });
     if !references_unique_key {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "foreign key \"{}\" references columns of \"{}\" that are not a PRIMARY KEY or UNIQUE \
              constraint",
             fk.name, fk.parent_table
         )));
     }
     if fk.columns.len() != parent_columns.len() {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::InvalidStatement(format!(
             "foreign key \"{}\" column count does not match the referenced key of \"{}\"",
             fk.name, fk.parent_table
         )));
@@ -707,7 +709,7 @@ pub(super) fn run_drop_table(
                         engine.drop_constraint(txn, fk.child_table, &fk.name)?;
                         continue;
                     }
-                    return Err(Error::Unsupported(format!(
+                    return Err(Error::DependentObjects(format!(
                         "cannot drop table \"{}\": foreign key \"{}\" on another table depends on it",
                         plan.table, fk.name
                     )));

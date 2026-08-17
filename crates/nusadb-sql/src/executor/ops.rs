@@ -603,7 +603,7 @@ fn scalar_subquery_value(rows: Vec<Row>) -> Result<ast::Value, Error> {
             .next()
             .and_then(|mut row| (!row.is_empty()).then(|| row.swap_remove(0)))
             .unwrap_or(ast::Value::Null)),
-        _ => Err(Error::Unsupported(
+        _ => Err(Error::CardinalityViolation(
             "scalar subquery returned more than one row".to_owned(),
         )),
     }
@@ -934,20 +934,20 @@ fn eval_sequence_call(
         Some(arg) => match eval::eval(arg, &empty)? {
             ast::Value::Text(s) => s,
             ast::Value::Null => {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::InvalidParameterValue(format!(
                     "{}() sequence name must not be NULL",
                     func.name()
                 )));
             },
             _ => {
-                return Err(Error::Unsupported(format!(
+                return Err(Error::InvalidStatement(format!(
                     "{}() sequence name must be text",
                     func.name()
                 )));
             },
         },
         None => {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::FunctionArgs(format!(
                 "{}() requires a sequence name",
                 func.name()
             )));
@@ -955,7 +955,7 @@ fn eval_sequence_call(
     };
     let id = engine
         .lookup_sequence(&name)?
-        .ok_or_else(|| Error::Unsupported(format!("sequence \"{name}\" does not exist")))?;
+        .ok_or_else(|| Error::ObjectNotFound(format!("sequence \"{name}\" does not exist")))?;
     match func {
         ast::ScalarFunc::SequenceNext => Ok(engine.sequence_next(id)?),
         ast::ScalarFunc::SequenceCurrent => Ok(engine.sequence_current(id)?),
@@ -963,12 +963,12 @@ fn eval_sequence_call(
             let value = match args.get(1).map(|a| eval::eval(a, &empty)).transpose()? {
                 Some(ast::Value::Int(v)) => v,
                 Some(ast::Value::Null) => {
-                    return Err(Error::Unsupported(
+                    return Err(Error::InvalidParameterValue(
                         "setval() target value must not be NULL".to_owned(),
                     ));
                 },
                 _ => {
-                    return Err(Error::Unsupported(
+                    return Err(Error::FunctionArgs(
                         "setval() requires an integer target value".to_owned(),
                     ));
                 },
@@ -988,12 +988,12 @@ fn eval_sequence_call(
                         ));
                     },
                     ast::Value::Null => {
-                        return Err(Error::Unsupported(
+                        return Err(Error::InvalidParameterValue(
                             "setval() is_called must not be NULL".to_owned(),
                         ));
                     },
                     _ => {
-                        return Err(Error::Unsupported(
+                        return Err(Error::InvalidStatement(
                             "setval() is_called must be a boolean".to_owned(),
                         ));
                     },
@@ -1432,8 +1432,8 @@ fn execute_op_inner(
             // operation (which yields a materialized row set).
             match run_set_operation(set_op, engine, txn)? {
                 ExecutionResult::Rows { rows, .. } => Ok(rows),
-                _ => Err(Error::Unsupported(
-                    "internal: a derived set operation did not produce a row set".to_owned(),
+                _ => Err(Error::Internal(
+                    "a derived set operation did not produce a row set".to_owned(),
                 )),
             }
         },
@@ -1958,8 +1958,8 @@ fn run_modifying_ctes(
                 rows: execute_op(op, engine, txn)?,
             },
             _ => {
-                return Err(Error::Unsupported(
-                    "internal: a run-once CTE must be INSERT/UPDATE/DELETE or a materialized SELECT"
+                return Err(Error::Internal(
+                    "a run-once CTE must be INSERT/UPDATE/DELETE or a materialized SELECT"
                         .to_owned(),
                 ));
             },
@@ -2832,9 +2832,9 @@ fn run_vector_knn(
             };
             *guard = Some(built);
         }
-        let cached = guard.as_ref().ok_or_else(|| {
-            Error::Unsupported("vector index cache missing after build".to_owned())
-        })?;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| Error::Internal("vector index cache missing after build".to_owned()))?;
         search_cached(cached, &query_vec, want, ef, k, filter)?
     };
     // A selective filter can starve the over-fetched candidate set; an exact filtered scan then
@@ -2891,7 +2891,7 @@ fn eval_set_returning_pairs(
             })
             .collect()),
         // The planner only routes here for a function whose `pair_value_type` is `Some`.
-        other => Err(Error::Unsupported(format!(
+        other => Err(Error::FunctionArgs(format!(
             "{}() does not produce (key, value) pairs",
             other.name()
         ))),
@@ -3023,7 +3023,7 @@ fn eval_set_returning(
         // The pair functions produce two columns per row, so the `ProjectSet` operator routes them
         // to `eval_set_returning_pairs` instead. Reaching here would mean the plan lost its `pair`
         // marker, which would silently drop the value column.
-        Srf::JsonEach | Srf::JsonEachText => Err(Error::Unsupported(format!(
+        Srf::JsonEach | Srf::JsonEachText => Err(Error::FunctionArgs(format!(
             "{}() produces (key, value) pairs and cannot be expanded as a single column",
             func.name()
         ))),
@@ -3036,11 +3036,8 @@ fn eval_set_returning(
             let (ast::Value::Json(doc), ast::Value::Text(path)) = (first, path) else {
                 return Ok(Vec::new());
             };
-            let matches = crate::json::path_query(&doc, &path).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "jsonb_path_query: unsupported or invalid jsonpath `{path}`"
-                ))
-            })?;
+            let matches = crate::json::path_query(&doc, &path)
+                .map_err(|why| eval::jsonpath_error("jsonb_path_query", why, &doc, &path))?;
             Ok(matches.into_iter().map(ast::Value::Json).collect())
         },
         // GENERATE_SERIES(start, stop [, step]) → one INT per value in the series. A NULL argument
@@ -3100,7 +3097,7 @@ fn eval_regexp_matches(
 fn generate_series(start: i64, stop: i64, step: i64) -> Result<Vec<ast::Value>, Error> {
     const MAX_ROWS: usize = 10_000_000;
     if step == 0 {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "generate_series: step must not be zero".to_owned(),
         ));
     }
@@ -3112,7 +3109,7 @@ fn generate_series(start: i64, stop: i64, step: i64) -> Result<Vec<ast::Value>, 
             break;
         }
         if out.len() >= MAX_ROWS {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::LimitExceeded(format!(
                 "generate_series: the series exceeds the {MAX_ROWS}-row limit"
             )));
         }
@@ -3151,7 +3148,7 @@ fn generate_series_temporal(
     let next_of =
         |t: i64| crate::temporal::add_interval_to_micros(t, step.months, step.days, step.micros);
     if next_of(start) == start {
-        return Err(Error::Unsupported(
+        return Err(Error::InvalidParameterValue(
             "generate_series: step must not be zero".to_owned(),
         ));
     }
@@ -3171,7 +3168,7 @@ fn generate_series_temporal(
             break;
         }
         if out.len() >= MAX_ROWS {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::LimitExceeded(format!(
                 "generate_series: the series exceeds the {MAX_ROWS}-row limit"
             )));
         }
@@ -3674,7 +3671,7 @@ fn materialize_recursive_cte(
         crate::cancel::check()?;
         iterations += 1;
         if iterations > MAX_RECURSIVE_ITERATIONS {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::LimitExceeded(format!(
                 "recursive CTE exceeded the {MAX_RECURSIVE_ITERATIONS}-round safety backstop \
                  (likely a non-terminating recursion under an unlimited work_mem and no statement \
                  timeout) — add a termination condition, set a statement timeout, or a work_mem cap"
@@ -3859,9 +3856,7 @@ pub(super) fn compute_window(rows: &[Row], window: &WindowExpr) -> Result<Vec<as
                 // loudly rather than skipping keeps a future `WindowFunc` variant (or a refactor
                 // that moves the construction) from quietly emitting an all-NULL column.
                 let call = aggregate_call.as_ref().ok_or_else(|| {
-                    Error::Unsupported(
-                        "window aggregate reached without a prepared call".to_owned(),
-                    )
+                    Error::Internal("window aggregate reached without a prepared call".to_owned())
                 })?;
                 assign_window_aggregate(&ordered, rows, call, window, &mut result)?;
             },
@@ -4423,7 +4418,7 @@ fn assign_distribution(
                 None => 0,
             };
             if raw < 1 {
-                return Err(Error::Unsupported(
+                return Err(Error::InvalidParameterValue(
                     "NTILE requires a positive bucket count".to_owned(),
                 ));
             }

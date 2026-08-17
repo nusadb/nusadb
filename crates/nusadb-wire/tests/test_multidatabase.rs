@@ -784,3 +784,120 @@ async fn notify_in_a_failed_transaction_is_rejected() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn an_aborted_transaction_reports_25p02_for_every_kind_of_statement() {
+    // `25P02` is the code a connection pool acts on most sharply: it means the connection is not
+    // broken and the statement is not wrong — the transaction is poisoned and nothing but ending it
+    // will help. So it has to be what every statement gets while the transaction is in that state,
+    // whatever kind of statement it is. One `NOTIFY` case covered this before; a read, a write and a
+    // DDL each reach the check by a different path.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cluster: Arc<dyn DatabaseCluster> = Arc::new(MockCluster::new());
+    let server = tokio::spawn(serve_cluster_with_shutdown(
+        listener,
+        Arc::clone(&cluster),
+        ServerConfig::default(),
+        std::future::pending::<()>(),
+    ));
+
+    let mut c = connect(addr, "nusadb").await.expect("connect");
+    assert_eq!(
+        run(&mut c, "CREATE TABLE poisoned (id INT)").await,
+        Outcome::Done("CREATE TABLE".to_owned())
+    );
+    assert_eq!(
+        run(&mut c, "BEGIN").await,
+        Outcome::Done("BEGIN".to_owned())
+    );
+    // The statement that poisons it reports its own class — `42P01`, not `25P02`. Getting this
+    // backwards would tell a pool to roll back when the query was simply wrong.
+    assert_eq!(
+        run(&mut c, "SELECT * FROM does_not_exist").await,
+        Outcome::Error("42P01".to_owned())
+    );
+    for sql in [
+        "SELECT 1",
+        "SELECT * FROM poisoned",
+        "INSERT INTO poisoned VALUES (1)",
+        "CREATE TABLE later (id INT)",
+    ] {
+        assert_eq!(
+            run(&mut c, sql).await,
+            Outcome::Error("25P02".to_owned()),
+            "`{sql}` in an aborted transaction must report 25P02 — a pool reads it to decide to \
+             roll back rather than to retry the statement"
+        );
+    }
+    // And ending the transaction is what clears it, which is the advice the code carries.
+    assert_eq!(
+        run(&mut c, "ROLLBACK").await,
+        Outcome::Done("ROLLBACK".to_owned())
+    );
+    assert_eq!(run(&mut c, "SELECT 1").await, Outcome::Rows(1));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn transaction_state_codes_are_what_a_wire_client_actually_sees() {
+    // `docs/transactions.md` documents class `25` for driver authors, and its rows have to describe
+    // the wire, not the error enum. Three of them once did not: `COMMIT`/`ROLLBACK` outside a block
+    // and a redundant `BEGIN` were written up as errors when the server treats all three as no-ops,
+    // and `25006` was written up as reachable when the wire refuses READ ONLY up front. Each row now
+    // has a case here, so the documented behaviour is the observed one.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cluster: Arc<dyn DatabaseCluster> = Arc::new(MockCluster::new());
+    let server = tokio::spawn(serve_cluster_with_shutdown(
+        listener,
+        Arc::clone(&cluster),
+        ServerConfig::default(),
+        std::future::pending::<()>(),
+    ));
+
+    let mut c = connect(addr, "nusadb").await.expect("connect");
+
+    // Ending a transaction that is not open succeeds — a pool may do it unconditionally.
+    assert_eq!(
+        run(&mut c, "COMMIT").await,
+        Outcome::Done("COMMIT".to_owned())
+    );
+    assert_eq!(
+        run(&mut c, "ROLLBACK").await,
+        Outcome::Done("ROLLBACK".to_owned())
+    );
+    // A savepoint outside a block has no scope to attach to, and that *is* an error.
+    assert_eq!(
+        run(&mut c, "SAVEPOINT sp").await,
+        Outcome::Error("25P01".to_owned())
+    );
+    // READ ONLY is refused before the transaction opens, so `25006` never arises over the wire.
+    assert_eq!(
+        run(&mut c, "BEGIN READ ONLY").await,
+        Outcome::Error("0A000".to_owned())
+    );
+
+    assert_eq!(
+        run(&mut c, "BEGIN").await,
+        Outcome::Done("BEGIN".to_owned())
+    );
+    // Transactions do not nest: a redundant BEGIN is a no-op, not `25001`.
+    assert_eq!(
+        run(&mut c, "BEGIN").await,
+        Outcome::Done("BEGIN".to_owned())
+    );
+    assert_eq!(run(&mut c, "SELECT 1").await, Outcome::Rows(1));
+    // `25001` is for the one statement that must precede the transaction's first query.
+    assert_eq!(
+        run(&mut c, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await,
+        Outcome::Error("25001".to_owned())
+    );
+    assert_eq!(
+        run(&mut c, "ROLLBACK").await,
+        Outcome::Done("ROLLBACK".to_owned())
+    );
+
+    server.abort();
+}

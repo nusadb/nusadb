@@ -804,10 +804,10 @@ pub(super) fn convert_window_function(function: sql::Function) -> Result<ast::Ex
         .name
         .0
         .last()
-        .ok_or_else(|| Error::Unsupported("empty window function name".to_owned()))?;
+        .ok_or_else(|| Error::InvalidStatement("empty window function name".to_owned()))?;
     let name = fold_part(name_ident)?;
     let func = window_func_by_name(&name)
-        .ok_or_else(|| Error::Unsupported(format!("window function `{name}` is not recognised")))?;
+        .ok_or_else(|| Error::FunctionArgs(format!("no window function named `{name}`")))?;
     let args = match function.args {
         sql::FunctionArguments::None => Vec::new(),
         sql::FunctionArguments::List(list) => {
@@ -901,7 +901,7 @@ fn resolve_over_spec(
                 let spec = NAMED_WINDOWS
                     .with(|c| c.borrow().get(&key).cloned())
                     .ok_or_else(|| {
-                        Error::Unsupported(format!(
+                        Error::InvalidStatement(format!(
                             "window `{key}` is not defined in a WINDOW clause"
                         ))
                     })?;
@@ -989,7 +989,7 @@ fn convert_within_group(function: sql::Function) -> Result<ast::Expr, Error> {
         .name
         .0
         .last()
-        .ok_or_else(|| Error::Unsupported("empty function name".to_owned()))?;
+        .ok_or_else(|| Error::InvalidStatement("empty function name".to_owned()))?;
     let func = fold_part(name_ident)?;
     let args = match function.args {
         sql::FunctionArguments::None => Vec::new(),
@@ -1063,7 +1063,7 @@ pub(super) fn convert_function_call(function: sql::Function) -> Result<ast::Expr
         .name
         .0
         .last()
-        .ok_or_else(|| Error::Unsupported("empty function name".to_owned()))?;
+        .ok_or_else(|| Error::InvalidStatement("empty function name".to_owned()))?;
     let name = fold_part(name_ident)?;
 
     let mut arg_list = match function.args {
@@ -1820,7 +1820,7 @@ fn unnamed_two_args(args: Vec<sql::FunctionArg>, name: &str) -> Result<[sql::Exp
         }
     }
     out.try_into()
-        .map_err(|_| Error::Unsupported(format!("{name} takes exactly two arguments")))
+        .map_err(|_| Error::FunctionArgs(format!("{name} takes exactly two arguments")))
 }
 
 /// Lower a positional placeholder `$1`, `$2`, … into a zero-based
@@ -1831,7 +1831,7 @@ pub(super) fn convert_placeholder(p: &str) -> Result<ast::Expr, Error> {
         .and_then(|n| n.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .ok_or_else(|| {
-            Error::Unsupported(format!("unsupported placeholder `{p}` (use $1, $2, …)"))
+            Error::InvalidStatement(format!("unsupported placeholder `{p}` (use $1, $2, …)"))
         })?;
     Ok(ast::Expr::Parameter(index - 1))
 }
@@ -1961,7 +1961,7 @@ pub(super) fn convert_is_bool(
 /// `Expr::Nested`, a longer row as a wider tuple) is rejected loudly.
 fn overlaps_pair(side: sql::Expr) -> Result<[sql::Expr; 2], Error> {
     let unsupported =
-        || Error::Unsupported("OVERLAPS requires two 2-element row expressions".to_owned());
+        || Error::InvalidStatement("OVERLAPS requires two 2-element row expressions".to_owned());
     match side {
         sql::Expr::Tuple(elems) => <[sql::Expr; 2]>::try_from(elems).map_err(|_| unsupported()),
         _ => Err(unsupported()),
