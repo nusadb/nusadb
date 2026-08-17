@@ -20,9 +20,10 @@ use bytes::BytesMut;
 use nusadb_core::{IsolationLevel, StorageEngine, TableSchema, TxnId};
 use nusadb_sql::ast::Value;
 use nusadb_sql::{
-    Catalog, ExecutionResult, IndexInfo, RowSink, StreamOutcome, analyze, bind_parameters,
-    describe_column_types, describe_columns, execute_in_txn_as_streaming_with_settings,
-    execute_in_txn_as_with_settings, parameter_count, parse, plan, show_session_variable,
+    Catalog, ExecutionResult, INTERNAL_ERROR, IndexInfo, RowSink, StreamOutcome, analyze,
+    bind_parameters, describe_column_types, describe_columns,
+    execute_in_txn_as_streaming_with_settings, execute_in_txn_as_with_settings, parameter_count,
+    parse, plan, show_session_variable,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -1069,7 +1070,7 @@ where
                         .await?;
                 } else {
                     let msg = format!("unknown prepared statement {statement:?}");
-                    fail(&mut conn, &mut failed, &msg).await?;
+                    fail_coded(&mut conn, &mut failed, &msg, INVALID_SQL_STATEMENT_NAME).await?;
                 }
             },
             FrontendMessage::Describe { target, name } => {
@@ -1096,7 +1097,13 @@ where
                                              exceeding the protocol limit of {}",
                                             u16::MAX
                                         );
-                                        fail(&mut conn, &mut failed, &msg).await?;
+                                        fail_coded(
+                                            &mut conn,
+                                            &mut failed,
+                                            &msg,
+                                            PROGRAM_LIMIT_EXCEEDED,
+                                        )
+                                        .await?;
                                         continue;
                                     }
                                 },
@@ -1108,7 +1115,8 @@ where
                             conn.write_frame(&BackendMessage::NoData.encode()?).await?;
                         } else {
                             let msg = format!("unknown prepared statement {name:?}");
-                            fail(&mut conn, &mut failed, &msg).await?;
+                            fail_coded(&mut conn, &mut failed, &msg, INVALID_SQL_STATEMENT_NAME)
+                                .await?;
                         }
                     },
                     // Plan-only: report the row shape without executing (side effects wait for
@@ -1142,7 +1150,9 @@ where
                             };
                             conn.write_frame(&msg.encode()?).await?;
                         },
-                        Err(msg) => fail(&mut conn, &mut failed, &msg).await?,
+                        Err((msg, code)) => {
+                            fail_coded(&mut conn, &mut failed, &msg, code).await?;
+                        },
                     },
                 }
             },
@@ -1750,7 +1760,12 @@ async fn run_blocking(
         )
     })
     .await
-    .unwrap_or_else(|_join| (Err(("internal execution error".to_owned(), "XX000")), state));
+    .unwrap_or_else(|_join| {
+        (
+            Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
+            state,
+        )
+    });
 
     // The statement finished (or failed); stop the timer so it cannot trip a later statement.
     if let Some(timer) = timer {
@@ -1768,7 +1783,7 @@ async fn describe_portal(
     name: &str,
     acting_user: &str,
     settings: &HashMap<String, String>,
-) -> Result<(Vec<String>, Vec<nusadb_core::ColumnType>), String> {
+) -> Result<(Vec<String>, Vec<nusadb_core::ColumnType>), (String, &'static str)> {
     let (sql, params) = match portals.get(name) {
         // A portal already executed (its rows are cached) reuses the executed column names. Types are
         // not cached, so a Describe after Execute falls back to the untyped form (empty type list).
@@ -1776,7 +1791,10 @@ async fn describe_portal(
             Some(result) => return Ok((result.columns.clone(), Vec::new())),
             None => (p.sql.clone(), p.params.clone()),
         },
-        None => return Err(format!("unknown portal {name:?}")),
+        // A protocol-level client mistake, not an engine fault — see `INVALID_CURSOR_NAME`.
+        None => {
+            return Err((format!("unknown portal {name:?}"), INVALID_CURSOR_NAME));
+        },
     };
     let engine = Arc::clone(engine);
     let acting_user = acting_user.to_owned();
@@ -1805,8 +1823,15 @@ async fn describe_portal(
         result
     })
     .await
-    .unwrap_or_else(|_join| Err(nusadb_sql::Error::Unsupported("internal error".to_owned())))
-    .map_err(|e: nusadb_sql::Error| e.to_string())
+    // Carry the engine's own SQLSTATE instead of flattening every analysis failure to the
+    // internal-error class: a Describe that fails because the table does not exist is the client's
+    // error to read, and the engine already classified it.
+    .map_or_else(
+        // The worker panicked: name the internal class outright rather than borrowing it from
+        // whatever `Unsupported` happens to map to, which is due to change.
+        |_join| Err(("internal error".to_owned(), INTERNAL_ERROR)),
+        |result| result.map_err(|e: nusadb_sql::Error| (e.to_string(), e.sqlstate())),
+    )
 }
 
 /// Ensure the named portal has been executed (running it once, lazily), returning its output
@@ -1833,7 +1858,12 @@ async fn ensure_executed(
             Some((p.sql.clone(), p.params.clone(), p.result_formats.clone()))
         },
         Some(_) => None, // already executed
-        None => return (Err((format!("unknown portal {name:?}"), "XX000")), state),
+        None => {
+            return (
+                Err((format!("unknown portal {name:?}"), INVALID_CURSOR_NAME)),
+                state,
+            );
+        },
     };
     let mut state = state;
     if let Some((sql, params, formats)) = job {
@@ -2060,16 +2090,24 @@ where
     Ok(false)
 }
 
-/// Write an error response and enter the "skip until Sync" state.
-async fn fail<S>(conn: &mut Connection<S>, failed: &mut bool, message: &str) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    fail_coded(conn, failed, message, "XX000").await
-}
+/// SQLSTATE `26000` — *`invalid_sql_statement_name`*: the client named a prepared statement that does
+/// not exist on this connection. A client mistake in the extended-query protocol, not an engine
+/// fault, so it must not carry the internal-error class.
+const INVALID_SQL_STATEMENT_NAME: &str = "26000";
 
-/// Like [`fail`], but with an explicit SQLSTATE class code (B-QA SQLSTATE) so a serialization
-/// conflict / deadlock surfaced from statement execution reaches the client as a retryable error.
+/// SQLSTATE `34000` — *`invalid_cursor_name`*: the client named a portal that does not exist on this
+/// connection. Like [`INVALID_SQL_STATEMENT_NAME`], a protocol-level client mistake.
+const INVALID_CURSOR_NAME: &str = "34000";
+
+/// SQLSTATE `54000` — *`program_limit_exceeded`*: the statement exceeds a protocol limit (more
+/// `$n` placeholders than the wire's `u16` count can carry). A limit of the interface, not a fault.
+const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+
+/// Write an error response with an explicit SQLSTATE and enter the "skip until Sync" state.
+///
+/// Every extended-query failure names its own class here. There is deliberately no variant that
+/// defaults to the internal-error class: the helper that once did had only misclassified callers,
+/// and every one of them was a client mistake reported to drivers as a server fault.
 async fn fail_coded<S>(
     conn: &mut Connection<S>,
     failed: &mut bool,
@@ -2983,7 +3021,7 @@ where
         // The blocking task panicked: its moved-in plan cache is gone, so resume with an empty one
         // (cold but correct). A panic mid-statement is catastrophic regardless.
         (
-            Err(("internal execution error".to_owned(), "XX000")),
+            Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
             Vec::new(),
             state,
             nusadb_sql::PlanCache::new(),
@@ -4534,9 +4572,9 @@ fn command_complete(tag: &str) -> BackendMessage {
 }
 
 fn error_response(message: &str) -> BackendMessage {
-    // XX000 = internal_error (SQLSTATE). Use `error_response_coded` for an error whose SQLSTATE the
-    // engine classifies (e.g. a serialization conflict → 40001).
-    error_response_coded(message, "XX000")
+    // The internal-error class. Use `error_response_coded` for an error whose SQLSTATE the engine
+    // classifies (e.g. a serialization conflict → 40001).
+    error_response_coded(message, INTERNAL_ERROR)
 }
 
 /// An `ErrorResponse` carrying an explicit SQLSTATE class code (B-QA SQLSTATE). A serialization

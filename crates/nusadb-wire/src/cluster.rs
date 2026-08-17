@@ -67,7 +67,7 @@ impl ClusterError {
             Self::AlreadyExists(_) => "42P04",
             Self::InUse(_) => "55006",
             Self::InvalidName(_) => "42602",
-            Self::Unsupported(_) | Self::Io(_) => "XX000",
+            Self::Unsupported(_) | Self::Io(_) => nusadb_sql::INTERNAL_ERROR,
         }
     }
 }

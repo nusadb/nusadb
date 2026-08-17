@@ -1999,6 +1999,185 @@ async fn extended_query_error_skips_until_sync() {
 }
 
 #[tokio::test]
+async fn unknown_statement_and_portal_are_client_errors_not_engine_faults() {
+    // Naming a statement or portal that does not exist is a mistake in the client's use of the
+    // extended-query protocol. Reported as the internal-error class it reads to a driver, pool or
+    // retry layer as "the server broke" — those layers branch on the SQLSTATE class, never on the
+    // message. Each of the three paths below is asserted by CODE.
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, engine));
+    let mut conn = Connection::new(client);
+
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+
+    // Each case leaves the pipeline poisoned until Sync, so resynchronise between them.
+    async fn code_of<S>(conn: &mut Connection<S>, frame: FrontendMessage) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        conn.write_frame(&frame.encode().unwrap()).await.unwrap();
+        let code = match next(conn).await {
+            BackendMessage::Error { code, .. } => code,
+            other => panic!("expected an Error, got {other:?}"),
+        };
+        conn.write_frame(&FrontendMessage::Sync.encode().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            next(conn).await,
+            BackendMessage::ReadyForQuery(TxnStatus::Idle)
+        );
+        code
+    }
+
+    // Bind naming a statement that was never parsed → invalid_sql_statement_name.
+    assert_eq!(
+        code_of(
+            &mut conn,
+            FrontendMessage::Bind {
+                portal: "p".to_owned(),
+                statement: "ghost".to_owned(),
+                params: vec![],
+                result_formats: vec![],
+            }
+        )
+        .await,
+        "26000"
+    );
+
+    // Describe naming a statement that was never parsed → the same class.
+    assert_eq!(
+        code_of(
+            &mut conn,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "ghost".to_owned(),
+            }
+        )
+        .await,
+        "26000"
+    );
+
+    // Describe naming a portal that was never bound → invalid_cursor_name. This is the path that
+    // discards the engine's own classification, so it is the one most likely to regress.
+    assert_eq!(
+        code_of(
+            &mut conn,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "ghost".to_owned(),
+            }
+        )
+        .await,
+        "34000"
+    );
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn describe_portal_reports_the_engines_own_error_class() {
+    // Describing a portal resolves its row shape by analyzing the statement, so it can fail the same
+    // ways execution does. The class must be the engine's own: a portal over a missing table is
+    // `42P01`, exactly as executing it would report. Reporting the internal-error class here would
+    // mean one statement answers with two different classes depending on whether the driver sent
+    // Describe or Execute first.
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, engine));
+    let mut conn = Connection::new(client);
+
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+
+    conn.write_frame(
+        &FrontendMessage::Parse {
+            name: "s".to_owned(),
+            sql: "SELECT * FROM no_such_table".to_owned(),
+            param_types: vec![],
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::ParseComplete);
+    conn.write_frame(
+        &FrontendMessage::Bind {
+            portal: "p".to_owned(),
+            statement: "s".to_owned(),
+            params: vec![],
+            result_formats: vec![],
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::BindComplete);
+
+    conn.write_frame(
+        &FrontendMessage::Describe {
+            target: DescribeTarget::Portal,
+            name: "p".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    match next(&mut conn).await {
+        // Asserted by CODE, not by message: a driver branches on the class, and an assertion on the
+        // text would pass just as well with the class flattened.
+        BackendMessage::Error { code, .. } => assert_eq!(code, "42P01"),
+        other => panic!("expected an Error naming the missing table, got {other:?}"),
+    }
+
+    conn.write_frame(&FrontendMessage::Sync.encode().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::ReadyForQuery(TxnStatus::Idle)
+    );
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn rejects_missing_startup() {
     let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
     let (client, server) = tokio::io::duplex(4096);
