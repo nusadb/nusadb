@@ -214,6 +214,11 @@ pub(crate) struct Acc {
     agg_sort_keys: Vec<Vec<ast::Value>>,
     // For STDDEV/VARIANCE: the running sum of squares (`sum` holds the running sum, `count` the n).
     sum_sq: f64,
+    // For a NUMERIC-typed STDDEV/VARIANCE (integer / NUMERIC input): the exact running Σx² as a
+    // decimal, paired with the exact Σx in `dec_sum`. `None` until the first value is folded (or on
+    // overflow past the 38-digit mantissa). A FLOAT-typed statistic never populates this and reads
+    // the `f64` moments above instead.
+    dec_sum_sq: Option<crate::numeric::Decimal>,
     // For BOOL_AND/BOOL_OR: the running boolean fold; `None` until the first non-NULL bool is seen.
     bool_fold: Option<bool>,
     // For BIT_AND/BIT_OR: the running integer bit fold; `None` until the first non-NULL int.
@@ -507,11 +512,14 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
         | F::RegrSlope
         | F::RegrIntercept
         | F::RegrR2 => regr_finalize(call.func, &acc),
-        // STDDEV / VARIANCE: the sample statistic; NULL for fewer than two values. A tiny negative
-        // variance from float cancellation is clamped to 0.
+        // STDDEV / VARIANCE: the sample statistic; NULL for fewer than two values. Integer / NUMERIC
+        // input yields an exact NUMERIC statistic; FLOAT input the f64 statistic (a tiny negative
+        // variance from float cancellation is clamped to 0).
         F::Stddev | F::Variance => {
             if acc.count < 2 {
                 ast::Value::Null
+            } else if matches!(call.result_ty, ColumnType::Numeric { .. }) {
+                numeric_variance(&acc, true, call.func == F::Stddev)?
             } else {
                 let n = acc.count as f64;
                 let variance = ((acc.sum_sq - acc.sum * acc.sum / n) / (n - 1.0)).max(0.0);
@@ -526,6 +534,8 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
         F::StddevPop | F::VarPop => {
             if acc.count < 1 {
                 ast::Value::Null
+            } else if matches!(call.result_ty, ColumnType::Numeric { .. }) {
+                numeric_variance(&acc, false, call.func == F::StddevPop)?
             } else {
                 let n = acc.count as f64;
                 let variance = ((acc.sum_sq - acc.sum * acc.sum / n) / n).max(0.0);
@@ -537,6 +547,44 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
             }
         },
     })
+}
+
+/// The exact NUMERIC sample/population variance (or, when `sqrt`, its square root) from the decimal
+/// moment sums `Σx` (`dec_sum`) and `Σx²` (`dec_sum_sq`), matching the reference engine's value and
+/// result scale. The numerator `N·Σx² − (Σx)²` and denominator (`N·(N−1)` sample, `N²` population)
+/// are exact; the final division carries the reference engine's ≥16-significant-digit scale, and the
+/// standard deviation takes the square root at the variance's own scale. A constant group has a zero
+/// numerator, reported as `0` (scale 0) — exactly as the reference engine does.
+fn numeric_variance(acc: &Acc, sample: bool, sqrt: bool) -> Result<ast::Value, Error> {
+    use crate::numeric::Decimal;
+    let sum = acc.dec_sum.ok_or_else(numeric_overflow)?;
+    let sum_sq = acc.dec_sum_sq.ok_or_else(numeric_overflow)?;
+    let n = i128::from(acc.count);
+    // numerator = N·Σx² − (Σx)²
+    let numerator = Decimal::from_i128(n)
+        .checked_mul(&sum_sq)
+        .and_then(|n_sxx| {
+            sum.checked_mul(&sum)
+                .and_then(|sx2| n_sxx.checked_sub(&sx2))
+        })
+        .ok_or_else(numeric_overflow)?;
+    // Exact arithmetic keeps the numerator ≥ 0; a zero (constant group) is variance/stddev 0 at
+    // scale 0, matching the reference engine.
+    if numerator.mantissa <= 0 {
+        return Ok(ast::Value::Numeric(Decimal::ZERO));
+    }
+    let divisor = if sample { n * (n - 1) } else { n * n };
+    let variance = numerator
+        .checked_div(&Decimal::from_i128(divisor))
+        .ok_or_else(numeric_overflow)?;
+    if sqrt {
+        let root = variance
+            .sqrt_round(variance.scale)
+            .ok_or_else(numeric_overflow)?;
+        Ok(ast::Value::Numeric(root))
+    } else {
+        Ok(ast::Value::Numeric(variance))
+    }
 }
 
 /// Compute an ordered-set aggregate (`PERCENTILE_CONT`/`PERCENTILE_DISC`, `MODE`) over the
@@ -1423,6 +1471,15 @@ pub(crate) fn fold_value(
             let f = value_as_f64(&value);
             acc.sum += f;
             acc.sum_sq += f * f;
+            // Exact decimal Σx / Σx² for a NUMERIC-typed statistic (integer / NUMERIC input). A
+            // FLOAT-typed statistic never receives a decimal value, so this stays `None` and the
+            // f64 moments above are read at finalization.
+            if let Some(d) = value_as_decimal(&value) {
+                let s = acc.dec_sum.unwrap_or(crate::numeric::Decimal::ZERO);
+                acc.dec_sum = s.checked_add(&d);
+                let sq = acc.dec_sum_sq.unwrap_or(crate::numeric::Decimal::ZERO);
+                acc.dec_sum_sq = d.checked_mul(&d).and_then(|d2| sq.checked_add(&d2));
+            }
             acc.count += 1;
         },
         // STRING_AGG collects the non-NULL text values in input order; joined with

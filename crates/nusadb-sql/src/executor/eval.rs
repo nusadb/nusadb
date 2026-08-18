@@ -2856,28 +2856,44 @@ fn int_arg(vals: &[ast::Value], i: usize) -> i64 {
     }
 }
 
-/// Greatest common divisor of two integers (always non-negative); `gcd(0, 0) = 0`.
-fn int_gcd(a: i64, b: i64) -> i64 {
+/// The greatest common divisor magnitude of two integers, as an unsigned value; `gcd(0, 0) = 0`.
+/// Unsigned so `gcd(i64::MIN, 0)` — whose magnitude is `2^63`, one past `i64::MAX` — is computed
+/// without overflow before the caller range-checks it.
+const fn int_gcd_magnitude(a: i64, b: i64) -> u64 {
     let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
     while b != 0 {
         (a, b) = (b, a % b);
     }
-    i64::try_from(a).unwrap_or(i64::MAX)
+    a
 }
 
-/// Least common multiple of two integers (non-negative); `0` if either operand is `0`. The
-/// product saturates rather than overflowing.
-fn int_lcm(a: i64, b: i64) -> i64 {
+/// Greatest common divisor of two integers (always non-negative); `gcd(0, 0) = 0`. A result past
+/// `i64::MAX` — only `gcd(i64::MIN, 0)`, whose value is `2^63` — is out of range and errors rather
+/// than saturating to a wrong answer.
+fn int_gcd(a: i64, b: i64) -> Result<i64, Error> {
+    i64::try_from(int_gcd_magnitude(a, b)).map_err(|_| Error::IntegerOutOfRange)
+}
+
+/// Least common multiple of two integers (non-negative); `0` if either operand is `0`. A product
+/// past `i64::MAX` is out of range and errors rather than saturating to a wrong answer.
+fn int_lcm(a: i64, b: i64) -> Result<i64, Error> {
     if a == 0 || b == 0 {
-        return 0;
+        return Ok(0);
     }
-    let g = int_gcd(a, b);
-    (a.saturating_abs() / g).saturating_mul(b.saturating_abs())
+    // `g` divides both operands, so `|a| / g` is exact; the multiply is done in `i128` and
+    // range-checked back into `i64`.
+    let g = i128::from(int_gcd_magnitude(a, b));
+    let product = (i128::from(a).abs() / g) * i128::from(b).abs();
+    i64::try_from(product).map_err(|_| Error::IntegerOutOfRange)
 }
 
 /// Evaluate a numeric math built-in. Arguments are already NULL-checked and numeric. The
 /// power/transcendental/trig functions compute in `f64` and return `FLOAT`; the type-preserving
 /// functions (`ABS`/`CEIL`/`FLOOR`/`SIGN`/`ROUND`/`MOD`) dispatch on the operand's value type.
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat one-arm-per-function dispatch; length tracks the math built-in set"
+)]
 fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, Error> {
     use ast::ScalarFunc as F;
     use ast::Value::Float;
@@ -2939,9 +2955,10 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
         F::Asinh => Float(f(0).asinh()),
         F::Acosh => Float(f(0).acosh()),
         F::Atanh => Float(f(0).atanh()),
-        // GCD/LCM operate on the integer values; non-Int operands are impossible after analysis.
-        F::Gcd => ast::Value::Int(int_gcd(int_arg(vals, 0), int_arg(vals, 1))),
-        F::Lcm => ast::Value::Int(int_lcm(int_arg(vals, 0), int_arg(vals, 1))),
+        // GCD/LCM operate on the integer values; non-Int operands are impossible after analysis. A
+        // result past the 64-bit range errors (matching the reference engine) rather than saturating.
+        F::Gcd => ast::Value::Int(int_gcd(int_arg(vals, 0), int_arg(vals, 1))?),
+        F::Lcm => ast::Value::Int(int_lcm(int_arg(vals, 0), int_arg(vals, 1))?),
         // DIV(a, b) is the integer quotient truncated toward zero; a zero divisor is an error, and
         // the `i64::MIN / -1` overflow errors rather than wrapping.
         F::Div => {
@@ -2956,7 +2973,20 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
         },
         F::Degrees => Float(f(0).to_degrees()),
         F::Radians => Float(f(0).to_radians()),
-        F::Power => Float(f(0).powf(f(1))),
+        // POWER is out of domain for a negative base with a non-integer exponent (a complex result)
+        // and for a zero base with a negative exponent (undefined) — errors, not a silent NaN/±inf.
+        F::Power => {
+            let (base, exp) = (f(0), f(1));
+            if base < 0.0 && exp.fract() != 0.0 {
+                return Err(domain(
+                    "a negative number raised to a non-integer power yields a complex result",
+                ));
+            }
+            if base == 0.0 && exp < 0.0 {
+                return Err(domain("zero raised to a negative power is undefined"));
+            }
+            Float(base.powf(exp))
+        },
         // LOG(x) = base-10; LOG(b, x) = base-b (args ordered base then value, per SQL). A non-positive
         // value is out of domain; a base ≤ 0 or = 1 has no logarithm (base 1 would divide by zero).
         F::Log if vals.len() <= 1 => {
@@ -3003,13 +3033,13 @@ fn math_abs(v: Option<&ast::Value>) -> Result<ast::Value, Error> {
     })
 }
 
-/// `SIGN` (`-1`/`0`/`1`) preserving the numeric type. `SIGN(0.0)` is `0.0` and `SIGN(NaN)` is `NaN`
-/// (f64's own `signum` returns `±1.0` for these, which SQL does not want).
+/// `SIGN` (`-1`/`0`/`1`) preserving the numeric type. `SIGN(0.0)` is `0.0`, and `SIGN(NaN)` is `0`
+/// (matching the reference engine — not `NaN`, and not f64 `signum`'s `±1.0`).
 fn math_sign(v: Option<&ast::Value>) -> ast::Value {
     match v {
         Some(ast::Value::Int(i)) => ast::Value::Int(i.signum()),
         Some(ast::Value::Float(x)) => ast::Value::Float(if *x == 0.0 || x.is_nan() {
-            *x
+            0.0
         } else {
             x.signum()
         }),
@@ -3070,24 +3100,48 @@ fn math_round(vals: &[ast::Value]) -> Result<ast::Value, Error> {
     Ok(match vals.first() {
         Some(ast::Value::Int(i)) => ast::Value::Int(*i),
         Some(ast::Value::Float(x)) => {
+            // A FLOAT rounds half-to-even (banker's rounding), matching the reference engine's
+            // `round(double precision)` — `round(2.5) = 2`, `round(3.5) = 4` — unlike the NUMERIC
+            // path, which rounds half-away-from-zero.
             let scale = 10f64.powi(i32::try_from(places).unwrap_or(0));
-            ast::Value::Float((x * scale).round() / scale)
+            ast::Value::Float((x * scale).round_ties_even() / scale)
         },
-        Some(ast::Value::Numeric(d)) => {
-            let target = u8::try_from(places.max(0)).unwrap_or(crate::numeric::MAX_SCALE);
-            ast::Value::Numeric(
-                d.rescale(target).ok_or_else(|| {
-                    Error::ArgumentOutOfDomain("numeric round overflow".to_owned())
-                })?,
-            )
-        },
+        Some(ast::Value::Numeric(d)) => ast::Value::Numeric(
+            numeric_round(d, places)
+                .ok_or_else(|| Error::ArgumentOutOfDomain("numeric round overflow".to_owned()))?,
+        ),
         _ => ast::Value::Null,
     })
 }
 
+/// Round a [`crate::numeric::Decimal`] half-away-from-zero to `places` fractional digits. A negative
+/// `places` rounds to the left of the decimal point (`round(1234.5, -2) = 1200`), matching the
+/// reference engine — the result is then a whole number (scale 0). `None` on overflow.
+fn numeric_round(d: &crate::numeric::Decimal, places: i64) -> Option<crate::numeric::Decimal> {
+    use crate::numeric::Decimal;
+    if places >= 0 {
+        let target = u8::try_from(places).unwrap_or(crate::numeric::MAX_SCALE);
+        return d.rescale(target);
+    }
+    // Round at the 10^n place (n = -places): q = round(mantissa / 10^(scale + n)), result = q * 10^n.
+    let n = u32::try_from(places.unsigned_abs()).ok()?;
+    let shed = u32::from(d.scale).checked_add(n)?;
+    let divisor = 10i128.checked_pow(shed)?;
+    let quotient = d.mantissa / divisor;
+    let remainder = d.mantissa % divisor;
+    let rounded = if remainder.unsigned_abs() * 2 >= divisor.unsigned_abs() {
+        quotient + d.mantissa.signum()
+    } else {
+        quotient
+    };
+    let mantissa = rounded.checked_mul(10i128.checked_pow(n)?)?;
+    Some(Decimal { mantissa, scale: 0 })
+}
+
 /// `TRUNC(x [, d])` truncating toward zero to `d` decimal places (default 0), preserving the numeric
-/// type. Unlike [`math_round`] the discarded fraction is dropped, not rounded. Like `ROUND`, a
-/// negative `d` is clamped to `0` for the `NUMERIC` path (the `FLOAT` path honours it via scaling).
+/// type. Unlike [`math_round`] the discarded fraction is dropped, not rounded. A negative `d`
+/// truncates to the left of the decimal point (`trunc(1234.56, -2) = 1200`), matching the reference
+/// engine.
 fn math_trunc(vals: &[ast::Value]) -> ast::Value {
     let places = match vals.get(1) {
         Some(ast::Value::Int(d)) => *d,
@@ -3105,10 +3159,29 @@ fn math_trunc(vals: &[ast::Value]) -> ast::Value {
 }
 
 /// Truncate a [`crate::numeric::Decimal`] toward zero to `places` fractional digits. `i128` division
-/// truncates toward zero — exactly the `TRUNC` semantics. A negative `places` is clamped to `0`.
+/// truncates toward zero — exactly the `TRUNC` semantics. A negative `places` truncates to the left
+/// of the point (result scale 0); overflow falls back to the unchanged value (a no-panic guard for an
+/// absurd place count).
 fn numeric_trunc(d: &crate::numeric::Decimal, places: i64) -> ast::Value {
     use crate::numeric::Decimal;
-    let target = u8::try_from(places.max(0)).unwrap_or(u8::MAX);
+    if places < 0 {
+        // Drop every digit below the 10^n place (n = -places): mantissa / 10^(scale + n) * 10^n.
+        let Some(shed) = u32::try_from(places.unsigned_abs())
+            .ok()
+            .and_then(|n| u32::from(d.scale).checked_add(n))
+        else {
+            return ast::Value::Numeric(*d);
+        };
+        let n = shed - u32::from(d.scale);
+        let (Some(div), Some(mul)) = (10i128.checked_pow(shed), 10i128.checked_pow(n)) else {
+            return ast::Value::Numeric(*d);
+        };
+        return (d.mantissa / div).checked_mul(mul).map_or_else(
+            || ast::Value::Numeric(*d),
+            |mantissa| ast::Value::Numeric(Decimal { mantissa, scale: 0 }),
+        );
+    }
+    let target = u8::try_from(places).unwrap_or(u8::MAX);
     if d.scale <= target {
         return ast::Value::Numeric(*d);
     }

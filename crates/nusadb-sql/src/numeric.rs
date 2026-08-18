@@ -12,10 +12,12 @@
 
 use std::cmp::Ordering;
 
-/// Extra fractional digits a division carries beyond its wider operand, so the quotient keeps at
-/// least ~16 significant digits — rather than truncating to a handful and producing a
-/// silently-wrong money result. Capped at [`MAX_SCALE`].
-const DIV_GUARD: u8 = 16;
+/// The fewest significant digits a division's quotient carries — the reference engine's
+/// `NUMERIC_MIN_SIG_DIGITS`, so a numeric quotient is no less accurate than an `f64` one.
+const MIN_SIG_DIGITS: i32 = 16;
+/// Decimal digits per base-10000 "group" in the reference engine's weight arithmetic (`DEC_DIGITS`),
+/// which [`div_result_scale`] mirrors so a division's result scale matches it exactly.
+const DEC_DIGITS: i32 = 4;
 /// The largest scale (fractional digits) the codec / arithmetic will carry.
 pub const MAX_SCALE: u8 = 38;
 
@@ -39,6 +41,60 @@ impl PartialEq for Decimal {
 /// `10^exp` as an `i128`, or `None` on overflow / `exp > 38`.
 const fn pow10(exp: u32) -> Option<i128> {
     10i128.checked_pow(exp)
+}
+
+/// The base-10000 weight and leading base-10000 digit of `d` — the two quantities the reference
+/// engine's `select_div_scale` reads. For a zero operand both are `0` (the reference engine leaves a
+/// zero's weight and first digit at their initial `0`, which drives the quotient scale identically).
+fn weight_and_first_digit(d: &Decimal) -> (i32, u32) {
+    if d.mantissa == 0 {
+        return (0, 0);
+    }
+    let abs = d.mantissa.unsigned_abs();
+    // Decimal digit count, then the decimal weight (power of ten of the most-significant digit).
+    let ndigits = i32::try_from(abs.ilog10()).unwrap_or(0) + 1;
+    let decimal_weight = ndigits - 1 - i32::from(d.scale);
+    // The base-10000 weight of the most-significant 4-digit group.
+    let weight = decimal_weight.div_euclid(DEC_DIGITS);
+    // Leading base-10000 digit = floor(|value| / 10000^weight), always in 1..=9999. `k` is the
+    // power of ten to divide the mantissa by; it stays within `0..=38` (proven by the digit count),
+    // and a negative `k` only ever needs `10^1..10^3`, so neither `pow` overflows.
+    let k = i32::from(d.scale) + DEC_DIGITS * weight;
+    let first = if k >= 0 {
+        abs / 10u128.pow(k.unsigned_abs())
+    } else {
+        abs * 10u128.pow(k.unsigned_abs())
+    };
+    (weight, u32::try_from(first).unwrap_or(0))
+}
+
+/// The result scale of `dividend / divisor`, matching the reference engine's `select_div_scale`:
+/// enough fractional digits for at least [`MIN_SIG_DIGITS`] significant digits of the quotient, but
+/// never fewer than either input's own scale, clamped to the range `0..=MAX_SCALE`. (The reference engine
+/// caps at 1000; NUSADB's `i128` decimal caps at [`MAX_SCALE`] = 38, so a quotient needing a scale
+/// beyond that — only a division by a value ≥ ~10^22 — carries fewer trailing digits than the
+/// reference engine.)
+fn div_result_scale(dividend: &Decimal, divisor: &Decimal) -> u8 {
+    let (weight1, first1) = weight_and_first_digit(dividend);
+    let (weight2, first2) = weight_and_first_digit(divisor);
+    let mut qweight = weight1 - weight2;
+    if first1 <= first2 {
+        qweight -= 1;
+    }
+    let rscale = (MIN_SIG_DIGITS - qweight * DEC_DIGITS)
+        .max(i32::from(dividend.scale))
+        .max(i32::from(divisor.scale))
+        .max(0)
+        .min(i32::from(MAX_SCALE));
+    u8::try_from(rscale).unwrap_or(MAX_SCALE)
+}
+
+/// Rounded (nearest, half-up) integer square root of `a`. `r*r <= a` never overflows since
+/// `r = isqrt(a)`, and `r + 1` stays within `u128` (`r < 2^64`).
+const fn rounded_isqrt(a: u128) -> u128 {
+    let r = a.isqrt();
+    // Round up once the remainder reaches the next half-step: a - r^2 > r  ⇔  a >= (r + 0.5)^2.
+    if a - r * r > r { r + 1 } else { r }
 }
 
 impl Decimal {
@@ -207,19 +263,16 @@ impl Decimal {
         })
     }
 
-    /// Division at a result scale of `min(max(self.scale, other.scale) + DIV_GUARD, MAX_SCALE)`,
-    /// rounding half-away-from-zero — enough fractional digits to keep ~16+ significant digits
+    /// Division rounding half-away-from-zero at the reference engine's result scale, which carries
+    /// enough fractional digits for ≥16 significant digits of the quotient (so `scale(1/3) = 20`,
+    /// `scale(100/7) = 16`), never fewer than either input's own scale, capped at [`MAX_SCALE`].
     /// `None` on overflow (caller checks `other.is_zero()` for div-by-zero).
     #[must_use]
     pub fn checked_div(&self, other: &Self) -> Option<Self> {
         if other.mantissa == 0 {
             return None;
         }
-        let result_scale = self
-            .scale
-            .max(other.scale)
-            .saturating_add(DIV_GUARD)
-            .min(MAX_SCALE);
+        let result_scale = div_result_scale(self, other);
         // value = (self.m / 10^self.s) / (other.m / 10^other.s)
         //       = self.m * 10^other.s / (other.m * 10^self.s)
         // want mantissa at result_scale: rm = round(self.m * 10^(result_scale + other.s - self.s) / other.m)
@@ -262,6 +315,50 @@ impl Decimal {
             mantissa: a.mantissa % b.mantissa,
             scale,
         })
+    }
+
+    /// The square root of a non-negative value, rounded half-up to `target_scale` fractional digits.
+    /// Used by the exact NUMERIC standard-deviation aggregates, which pass the variance's own scale
+    /// so the standard deviation carries the same scale as the variance (matching the reference
+    /// engine).
+    ///
+    /// It computes an exact rounded **integer** square root when the intermediate `mantissa *
+    /// 10^(2*target_scale - scale)` fits a `u128`; a very-small-magnitude value whose required scale
+    /// pushes that past `u128` falls back to an `f64` square root formatted to `target_scale` (the
+    /// final digit or two may then differ from an arbitrary-precision reference — this only affects
+    /// sub-`0.1`-magnitude standard deviations, whose scale exceeds 19).
+    #[must_use]
+    pub fn sqrt_round(&self, target_scale: u8) -> Option<Self> {
+        if self.mantissa < 0 {
+            return None;
+        }
+        if self.mantissa == 0 {
+            return Some(Self {
+                mantissa: 0,
+                scale: target_scale,
+            });
+        }
+        // want mantissa = round(sqrt(value) * 10^ts) = round(sqrt(mantissa * 10^(2*ts - scale))).
+        let exp = 2 * i32::from(target_scale) - i32::from(self.scale);
+        let abs = self.mantissa.unsigned_abs();
+        let radicand = if exp >= 0 {
+            10u128
+                .checked_pow(exp.unsigned_abs())
+                .and_then(|p| abs.checked_mul(p))
+        } else {
+            10u128.checked_pow(exp.unsigned_abs()).map(|p| abs / p)
+        };
+        if let Some(a) = radicand
+            && let Ok(m) = i128::try_from(rounded_isqrt(a))
+        {
+            return Some(Self {
+                mantissa: m,
+                scale: target_scale,
+            });
+        }
+        // Fallback for magnitudes whose exact integer radicand overflows `u128`.
+        let approx = self.to_f64().max(0.0).sqrt();
+        Self::parse(&format!("{:.*}", usize::from(target_scale), approx))
     }
 
     /// Numeric negation.
@@ -418,16 +515,60 @@ mod tests {
             d("10").checked_div(&d("3")).unwrap(),
             d("3.3333333333333333")
         );
-        // The money case from the audit: 2.00 / 3 keeps full precision (scale max(2,0)+16 = 18),
-        // not the old 0.666667.
+        // The money case from the audit: 2.00 / 3 carries ≥16 significant digits of the quotient.
+        // The reference engine's rule gives scale 20 here (not the old fixed max(2,0)+16 = 18).
         assert_eq!(
             d("2.00").checked_div(&d("3")).unwrap(),
-            d("0.666666666666666667")
+            d("0.66666666666666666667")
         );
         // 1 / 8 = 0.125 exactly (trailing zeros compare equal regardless of scale).
         assert_eq!(d("1").checked_div(&d("8")).unwrap(), d("0.125"));
         // Division by zero is rejected.
         assert!(d("1").checked_div(&Decimal::ZERO).is_none());
+    }
+
+    #[test]
+    fn div_result_scale_matches_reference_engine() {
+        // Each case's result scale is the reference engine's `scale(a / b)` (captured live).
+        let cases = [
+            ("1", "3", 20u8),
+            ("2.00", "3", 20),
+            ("1", "7", 20),
+            ("100", "7", 16),
+            ("1.0", "3.0", 20),
+            ("22", "7", 16),
+            ("10.0", "3.0", 16),
+            ("10", "2", 16),
+            ("1000000", "3", 12),
+            ("1", "30000", 24),
+            ("5", "1000", 20),
+            ("123456.789", "1", 12),
+            ("7", "11", 20),
+            ("0.001", "7", 20),
+            ("1000.5", "3", 16),
+            ("0", "3", 20),
+        ];
+        for (a, b, scale) in cases {
+            assert_eq!(
+                d(a).checked_div(&d(b)).unwrap().scale,
+                scale,
+                "scale({a} / {b})"
+            );
+        }
+    }
+
+    #[test]
+    fn sqrt_round_is_exact_for_representable_radicands() {
+        // Perfect squares and the standard-deviation cases come out exactly.
+        assert_eq!(d("4.0000000000000000").sqrt_round(16).unwrap(), d("2"));
+        assert_eq!(d("0").sqrt_round(16).unwrap(), d("0"));
+        // sqrt(2.6666666666666667) at scale 16 (the population-variance stddev case).
+        assert_eq!(
+            d("2.6666666666666667").sqrt_round(16).unwrap(),
+            d("1.6329931618554521")
+        );
+        // A negative radicand has no real root.
+        assert!(d("-1").sqrt_round(16).is_none());
     }
 
     #[test]

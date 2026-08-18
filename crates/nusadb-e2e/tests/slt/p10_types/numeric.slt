@@ -37,11 +37,12 @@ SELECT SUM(amount) FROM prices
 ----
 120.00
 
-# AVG of NUMERIC stays exact NUMERIC (sum / count; division carries ~16+ sig digits, P0-R2-1).
+# AVG of NUMERIC stays exact NUMERIC: sum / count carries the reference engine's division scale
+# (here 16 fractional digits, not input-scale+16 — the quotient keeps ≥16 significant digits).
 query T
 SELECT AVG(amount) FROM prices
 ----
-40.000000000000000000
+40.0000000000000000
 
 # MIN keeps the exact value.
 query T
@@ -52,6 +53,40 @@ SELECT MIN(amount) FROM prices
 # Division rounds half-away-from-zero, keeping ~16+ significant digits (P0-R2-1).
 query T
 SELECT CAST('10' AS NUMERIC) / CAST('3' AS NUMERIC) AS third
+----
+3.3333333333333333
+
+# --- N8: NUMERIC division result scale matches the reference engine's `select_div_scale` ---
+# The scale is chosen for at least 16 significant digits of the quotient, never fewer than either
+# input's scale. Values / scales below are the reference engine's, captured live.
+query T
+SELECT CAST(CAST('2.00' AS NUMERIC) / CAST('3' AS NUMERIC) AS TEXT)
+----
+0.66666666666666666667
+
+query I
+SELECT SCALE(CAST('1' AS NUMERIC) / CAST('3' AS NUMERIC))
+----
+20
+
+query I
+SELECT SCALE(CAST('100' AS NUMERIC) / CAST('7' AS NUMERIC))
+----
+16
+
+query I
+SELECT SCALE(CAST('1000000' AS NUMERIC) / CAST('3' AS NUMERIC))
+----
+12
+
+query I
+SELECT SCALE(CAST('1' AS NUMERIC) / CAST('30000' AS NUMERIC))
+----
+24
+
+# 10.0 / 3.0 carries 16 fractional digits.
+query T
+SELECT CAST(CAST('10.0' AS NUMERIC) / CAST('3.0' AS NUMERIC) AS TEXT)
 ----
 3.3333333333333333
 

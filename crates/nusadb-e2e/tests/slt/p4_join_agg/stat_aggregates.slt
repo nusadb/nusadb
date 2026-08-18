@@ -38,22 +38,25 @@ SELECT CAST(BOOL_AND(flag) AS TEXT) FROM t WHERE g = 3
 NULL
 
 # --- VARIANCE / STDDEV (sample) ---
+# STDDEV/VARIANCE over integer (or NUMERIC) input are exact NUMERIC (16 fractional digits,
+# zero-padded), matching the reference engine — not a truncated float.
 # Group 1 has n = {2, 4, 6}: mean 4, sample variance = ((4+0+4))/2 = 4, stddev = 2.
-query R
+query T
 SELECT VARIANCE(n) FROM t WHERE g = 1
 ----
-4.000
+4.0000000000000000
 
-query R
+query T
 SELECT STDDEV(n) FROM t WHERE g = 1
 ----
-2.000
+2.0000000000000000
 
-# Group 2 has n = {10, 10}: variance 0, stddev 0.
-query R
+# Group 2 has n = {10, 10}: a constant group has variance 0, stddev 0 (scale 0, as the reference
+# engine reports it).
+query T
 SELECT STDDEV(n) FROM t WHERE g = 2
 ----
-0.000
+0
 
 # A single value gives NULL sample variance/stddev.
 query T
@@ -62,28 +65,28 @@ SELECT CAST(VARIANCE(n) AS TEXT) FROM t WHERE g = 3
 NULL
 
 # STDDEV_SAMP / VAR_SAMP aliases.
-query R
+query T
 SELECT VAR_SAMP(n) FROM t WHERE g = 1
 ----
-4.000
+4.0000000000000000
 
 # --- VAR_POP / STDDEV_POP (population, divisor n) ---
 # Group 1 n = {2, 4, 6}: population variance = (4+0+4)/3 = 8/3, stddev = sqrt(8/3).
-query R
+query T
 SELECT VAR_POP(n) FROM t WHERE g = 1
 ----
-2.667
+2.6666666666666667
 
-query R
+query T
 SELECT STDDEV_POP(n) FROM t WHERE g = 1
 ----
-1.633
+1.6329931618554521
 
 # Unlike the sample form, a single value has a defined population variance of 0 (not NULL).
-query R
+query T
 SELECT VAR_POP(n) FROM t WHERE g = 3
 ----
-0.000
+0
 
 # --- STRING_AGG(expr, separator) ---
 statement ok

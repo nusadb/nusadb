@@ -2924,16 +2924,41 @@ pub(super) fn analyze_aggregate(
             }
             Ok((Some(typed), ColumnType::Text))
         },
-        // STDDEV / VARIANCE (sample), STDDEV_POP / VAR_POP (population), and the first argument of the
-        // two-argument CORR / COVAR_* / REGR_* — numeric argument, FLOAT result, except REGR_COUNT
-        // which is an INT pair count. (The second argument of the two-argument forms is resolved by
-        // the caller in `analyze_expr`.)
+        // STDDEV / VARIANCE (sample) and STDDEV_POP / VAR_POP (population) — numeric argument.
+        // Integer / NUMERIC input yields an exact NUMERIC statistic (matching the reference engine,
+        // which computes these in numeric); FLOAT input stays FLOAT. (The two-argument statistics
+        // below stay FLOAT for every numeric input, exactly as the reference engine's `float8`
+        // covariance/correlation/regression do.)
         (
             ast::AggregateFunc::Stddev
             | ast::AggregateFunc::Variance
             | ast::AggregateFunc::StddevPop
-            | ast::AggregateFunc::VarPop
-            | ast::AggregateFunc::Corr
+            | ast::AggregateFunc::VarPop,
+            Some(arg),
+        ) => {
+            let typed = analyze_expr(arg, scope, catalog, None)?;
+            if !is_numeric(typed.ty) {
+                return Err(Error::TypeMismatch {
+                    context: format!("{func:?} requires a numeric argument"),
+                    expected: ColumnType::Float,
+                    found: typed.ty,
+                });
+            }
+            let result_ty = if typed.ty == ColumnType::Float {
+                ColumnType::Float
+            } else {
+                ColumnType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                }
+            };
+            Ok((Some(typed), result_ty))
+        },
+        // The first argument of the two-argument CORR / COVAR_* / REGR_* — numeric argument, FLOAT
+        // result, except REGR_COUNT which is an INT pair count. (The second argument of the
+        // two-argument forms is resolved by the caller in `analyze_expr`.)
+        (
+            ast::AggregateFunc::Corr
             | ast::AggregateFunc::CovarPop
             | ast::AggregateFunc::CovarSamp
             | ast::AggregateFunc::RegrCount

@@ -624,3 +624,94 @@ query T
 SELECT CAST(TO_NUMBER(NULL, '99') AS TEXT)
 ----
 NULL
+
+# === Reference-engine differential fixes (numeric / math) ====================
+# Each expected value below is the reference engine's exact output, captured live.
+
+# --- N2: ROUND(numeric, n) with n < 0 rounds to the LEFT of the decimal point ---
+query T
+SELECT CAST(ROUND(CAST(1234.5 AS NUMERIC), -2) AS TEXT)
+----
+1200
+
+query T
+SELECT CAST(ROUND(CAST(1234.5 AS NUMERIC), -1) AS TEXT)
+----
+1230
+
+# Half-away-from-zero still applies at the rounding place: 1250 -> 1300, 1350 -> 1400.
+query T
+SELECT CAST(ROUND(CAST(1250 AS NUMERIC), -2) AS TEXT)
+----
+1300
+
+query T
+SELECT CAST(ROUND(CAST(1350 AS NUMERIC), -2) AS TEXT)
+----
+1400
+
+# --- N3: TRUNC(numeric, n) with n < 0 truncates to the LEFT of the decimal point ---
+query T
+SELECT CAST(TRUNC(CAST(1234.56 AS NUMERIC), -2) AS TEXT)
+----
+1200
+
+query T
+SELECT CAST(TRUNC(CAST(1234.56 AS NUMERIC), -1) AS TEXT)
+----
+1230
+
+# --- N1: ROUND(float8) rounds half-to-even (banker's), unlike the half-away NUMERIC path ---
+query R
+SELECT ROUND(CAST(2.5 AS FLOAT))
+----
+2.000
+
+query R
+SELECT ROUND(CAST(0.5 AS FLOAT))
+----
+0.000
+
+query R
+SELECT ROUND(CAST(3.5 AS FLOAT))
+----
+4.000
+
+# A bare numeric literal keeps half-away-from-zero (2.5 -> 3), which the NUMERIC path preserves.
+query T
+SELECT CAST(ROUND(CAST(2.5 AS NUMERIC)) AS TEXT)
+----
+3
+
+# --- N7: SIGN of a NaN float8 is 0 (not NaN) ---
+query R
+SELECT SIGN(CAST('NaN' AS FLOAT))
+----
+0.000
+
+# --- N4: POWER(negative, non-integer) is a domain error (a complex result), not a silent NaN ---
+statement error
+SELECT POWER(CAST(-2 AS FLOAT), CAST(0.5 AS FLOAT))
+
+# An integer exponent over a negative base is fine: (-2)^3 = -8.
+query R
+SELECT POWER(CAST(-2 AS FLOAT), CAST(3 AS FLOAT))
+----
+-8.000
+
+# --- N5: POWER(0, negative) is undefined — a domain error, not a silent +Infinity ---
+statement error
+SELECT POWER(CAST(0 AS FLOAT), CAST(-1 AS FLOAT))
+
+# --- N6: GCD / LCM past the 64-bit range error (out of range), not saturate to a wrong value ---
+statement error
+SELECT LCM(9223372036854775807, 2)
+
+statement error
+SELECT GCD(-9223372036854775808, 0)
+
+# LCM / GCD within range still compute normally.
+query I
+SELECT LCM(4, 6)
+----
+12
