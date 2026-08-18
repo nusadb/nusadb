@@ -222,6 +222,77 @@ fn sql_catalog_survives_reopen() {
     assert_eq!(rows(run(&engine, "SELECT id FROM users")).len(), 2);
 }
 
+/// A `MACADDR8` column is DURABLE on disk: the 8-byte value is written to the WAL and recovery
+/// decodes it back to the same value after a crash — not just held in memory. The EUI-48 literal
+/// also proves the parse-time EUI-48→64 expansion is what gets persisted (not the raw 6 bytes).
+#[test]
+fn macaddr8_value_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(
+            &engine,
+            "CREATE TABLE nics (id INT PRIMARY KEY, mac MACADDR8)",
+        );
+        run(
+            &engine,
+            "INSERT INTO nics VALUES (1, '08:00:2b:01:02:03:04:05')",
+        );
+        // A 6-byte (EUI-48) literal expands to EUI-64 on the write path; the expanded value persists.
+        run(&engine, "INSERT INTO nics VALUES (2, '08:00:2b:01:02:03')");
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The macaddr8 column decodes to its 8-byte value (canonical text), not text/wrong length.
+        assert_eq!(
+            rows(run(&engine, "SELECT mac::TEXT FROM nics WHERE id = 1")),
+            vec![vec![Value::Text("08:00:2b:01:02:03:04:05".to_owned())]]
+        );
+        assert_eq!(
+            rows(run(&engine, "SELECT mac::TEXT FROM nics WHERE id = 2")),
+            vec![vec![Value::Text("08:00:2b:ff:fe:01:02:03".to_owned())]]
+        );
+        // Ordering by the recovered value works, and a committed insert after recovery also persists.
+        run(
+            &engine,
+            "INSERT INTO nics VALUES (3, '00:00:00:00:00:00:00:01')",
+        );
+        assert_eq!(
+            rows(run(&engine, "SELECT id FROM nics ORDER BY mac")),
+            vec![
+                vec![Value::Int(3)],
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+            ]
+        );
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed transaction is durable across repeated recovery — the
+    // pre-crash rows AND the row committed after the first recovery all survive, byte-for-byte. This
+    // is the production durability guarantee: once a transaction commits, its data is on disk.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT id, mac::TEXT FROM nics ORDER BY mac")),
+        vec![
+            vec![
+                Value::Int(3),
+                Value::Text("00:00:00:00:00:00:00:01".to_owned()),
+            ],
+            vec![
+                Value::Int(1),
+                Value::Text("08:00:2b:01:02:03:04:05".to_owned()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Text("08:00:2b:ff:fe:01:02:03".to_owned()),
+            ],
+        ]
+    );
+}
+
 /// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical

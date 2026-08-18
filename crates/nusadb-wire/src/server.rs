@@ -4556,6 +4556,7 @@ fn value_to_field(value: Value) -> Option<Vec<u8>> {
         Value::TimeTz(t) => Some(nusadb_sql::temporal::format_timetz(t).into_bytes()),
         Value::Uuid(u) => Some(nusadb_sql::temporal::format_uuid(&u).into_bytes()),
         Value::Macaddr(m) => Some(nusadb_sql::macaddr::format(m).into_bytes()),
+        Value::Macaddr8(m) => Some(nusadb_sql::macaddr8::format(m).into_bytes()),
         Value::Inet(a) => Some(a.format().into_bytes()),
         Value::Bit(ref b) => Some(nusadb_sql::bit::format(b).into_bytes()),
         Value::Range(ref r) => Some(r.format().into_bytes()),

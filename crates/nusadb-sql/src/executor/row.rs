@@ -250,6 +250,7 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         },
         (ast::Value::Uuid(u), ColumnType::Uuid) => out.extend_from_slice(u),
         (ast::Value::Macaddr(m), ColumnType::Macaddr) => out.extend_from_slice(m),
+        (ast::Value::Macaddr8(m), ColumnType::Macaddr8) => out.extend_from_slice(m),
         (ast::Value::Inet(a), ColumnType::Inet | ColumnType::Cidr) => {
             out.extend_from_slice(&a.encode());
         },
@@ -302,6 +303,10 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         },
         (ast::Value::Text(s), ColumnType::Macaddr) => {
             let m = crate::macaddr::parse(s).ok_or_else(|| invalid(ty, s))?;
+            out.extend_from_slice(&m);
+        },
+        (ast::Value::Text(s), ColumnType::Macaddr8) => {
+            let m = crate::macaddr8::parse(s).ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&m);
         },
         (ast::Value::Text(s), ColumnType::Inet) => {
@@ -672,6 +677,10 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
             let arr = read_array::<6>(bytes, pos)?;
             Ok((ast::Value::Macaddr(arr), pos + 6))
         },
+        ColumnType::Macaddr8 => {
+            let arr = read_array::<8>(bytes, pos)?;
+            Ok((ast::Value::Macaddr8(arr), pos + 8))
+        },
         // INET/CIDR are self-describing: the flags byte's family bit sets the total length (2-byte
         // header + 4 or 16 address octets).
         ColumnType::Inet | ColumnType::Cidr => {
@@ -833,6 +842,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::TimeTz(_) => ColumnType::TimeTz,
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
+        ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),

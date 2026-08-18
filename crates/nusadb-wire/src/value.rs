@@ -68,6 +68,8 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
         Value::Uuid(u) => u.to_vec(),
         // MACADDR is its six raw bytes in transmission order.
         Value::Macaddr(m) => m.to_vec(),
+        // MACADDR8 is its eight raw bytes in transmission order.
+        Value::Macaddr8(m) => m.to_vec(),
         // INET/CIDR: the self-describing `[flags, masklen, octets]` encoding (the tag tells the
         // client it is a network address).
         Value::Inet(a) => a.encode(),

@@ -962,6 +962,13 @@ fn eval_scalar_function(
         },
         // PI() → the constant π (niladic).
         (F::Pi, []) => ast::Value::Float(std::f64::consts::PI),
+        // MACADDR8 overloads: `trunc` keeps the first three bytes (the OUI) and zeros the rest;
+        // `macaddr8_set7bit` sets the locally-administered bit of the first byte. Matched before the
+        // numeric-`trunc` dispatch below so the MACADDR8 argument is not routed to `eval_math`.
+        (F::Trunc, [ast::Value::Macaddr8(m)]) => ast::Value::Macaddr8(crate::macaddr8::trunc(*m)),
+        (F::Macaddr8Set7bit, [ast::Value::Macaddr8(m)]) => {
+            ast::Value::Macaddr8(crate::macaddr8::set7bit(*m))
+        },
         // Math functions — numeric-polymorphic, dispatched on value type within.
         (
             F::Abs
@@ -3552,6 +3559,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         | (ast::Value::TimestampTz(_), ColumnType::TimestampTz)
         | (ast::Value::Uuid(_), ColumnType::Uuid)
         | (ast::Value::Macaddr(_), ColumnType::Macaddr)
+        | (ast::Value::Macaddr8(_), ColumnType::Macaddr8)
         | (ast::Value::Json(_), ColumnType::Json)
         | (ast::Value::Interval(_), ColumnType::Interval)
         | (ast::Value::Bytes(_), ColumnType::Bytes)
@@ -3622,6 +3630,13 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Text(s), ColumnType::Macaddr) => crate::macaddr::parse(s)
             .map(ast::Value::Macaddr)
             .ok_or_else(|| invalid_cast(s, ColumnType::Macaddr)),
+        (ast::Value::Text(s), ColumnType::Macaddr8) => crate::macaddr8::parse(s)
+            .map(ast::Value::Macaddr8)
+            .ok_or_else(|| invalid_cast(s, ColumnType::Macaddr8)),
+        // MACADDR (EUI-48) widens to MACADDR8 (EUI-64) by inserting `ff:fe` after the third byte.
+        (ast::Value::Macaddr(m), ColumnType::Macaddr8) => {
+            Ok(ast::Value::Macaddr8(crate::macaddr8::from_eui48(*m)))
+        },
         (ast::Value::Text(s), ColumnType::Inet) => crate::inet::parse_inet(s)
             .map(ast::Value::Inet)
             .ok_or_else(|| invalid_cast(s, ColumnType::Inet)),
@@ -3676,6 +3691,9 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         },
         (ast::Value::Macaddr(m), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::macaddr::format(*m)))
+        },
+        (ast::Value::Macaddr8(m), ColumnType::Text) => {
+            Ok(ast::Value::Text(crate::macaddr8::format(*m)))
         },
         // Temporal narrowing/widening (QA category-D): a TIMESTAMP[TZ] splits into its DATE
         // (floor of whole days since the epoch) and TIME-of-day (micros within the day); a DATE
@@ -4086,6 +4104,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::TimeTz(_) => ColumnType::TimeTz,
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
+        ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -4547,6 +4566,8 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         (Uuid(a), Uuid(b)) => a.cmp(b),
         // MACADDR orders by its six bytes as a big-endian integer — the raw byte order.
         (ast::Value::Macaddr(a), ast::Value::Macaddr(b)) => a.cmp(b),
+        // MACADDR8 orders by its eight bytes as a big-endian integer — the raw byte order.
+        (ast::Value::Macaddr8(a), ast::Value::Macaddr8(b)) => a.cmp(b),
         // INET/CIDR use the network comparison (family, masked prefix, mask, full address) — not a
         // plain byte order, so it cannot be an index key.
         (ast::Value::Inet(a), ast::Value::Inet(b)) => a.network_cmp(b),
@@ -4640,6 +4661,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Inet(_) => 18,
         ast::Value::Bit(_) => 19,
         ast::Value::Range(_) => 20,
+        ast::Value::Macaddr8(_) => 21,
     }
 }
 
@@ -4667,6 +4689,10 @@ fn apply_binary(
             if matches!(left, ast::Value::Inet(_)) || matches!(right, ast::Value::Inet(_)) =>
         {
             Ok(apply_inet_predicate(op, left, right))
+        },
+        // MACADDR8 `&`/`|`: byte-wise AND / OR of two eight-byte addresses.
+        Op::BitAnd | Op::BitOr if matches!(left, ast::Value::Macaddr8(_)) => {
+            Ok(apply_macaddr8_bit_op(op, left, right))
         },
         // BIT-string operators: `&`/`|`/`#`, `<<`/`>>` (shift), and `||` (concat).
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight | Op::Concat
@@ -4790,6 +4816,24 @@ fn apply_bitwise(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> as
         _ => return ast::Value::Null,
     };
     ast::Value::Int(result)
+}
+
+/// Evaluate a MACADDR8 `&` / `|` operator — the byte-wise AND / OR of two eight-byte addresses. A
+/// `NULL` operand yields `NULL`; both operands are MACADDR8 (the analyzer enforces this).
+const fn apply_macaddr8_bit_op(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> ast::Value {
+    use ast::BinaryOp as Op;
+    let (ast::Value::Macaddr8(a), ast::Value::Macaddr8(b)) = (left, right) else {
+        return ast::Value::Null;
+    };
+    match op {
+        Op::BitAnd => ast::Value::Macaddr8(crate::macaddr8::and(*a, *b)),
+        Op::BitOr => ast::Value::Macaddr8(crate::macaddr8::or(*a, *b)),
+        _ => ast::Value::Null,
+    }
 }
 
 /// The error for a `GET_BIT`/`SET_BIT` index outside `0..len`.
@@ -5611,6 +5655,12 @@ fn apply_unary(op: ast::UnaryOp, value: &ast::Value) -> Result<ast::Value, Error
         // Unary plus returns a numeric operand unchanged (the analyzer already rejected non-numeric).
         ast::UnaryOp::Plus => match value {
             ast::Value::Int(_) | ast::Value::Float(_) | ast::Value::Numeric(_) => value.clone(),
+            _ => ast::Value::Null,
+        },
+        // `~` complements every bit of an integer or a MACADDR8 (the analyzer rejected other types).
+        ast::UnaryOp::BitNot => match value {
+            ast::Value::Int(i) => ast::Value::Int(!*i),
+            ast::Value::Macaddr8(m) => ast::Value::Macaddr8(crate::macaddr8::complement(*m)),
             _ => ast::Value::Null,
         },
     })

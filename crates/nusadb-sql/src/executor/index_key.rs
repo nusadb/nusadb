@@ -89,6 +89,8 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         ast::Value::Uuid(bytes) => out.extend_from_slice(bytes),
         // MACADDR is six fixed big-endian bytes, so lexicographic order is MAC-address order.
         ast::Value::Macaddr(bytes) => out.extend_from_slice(bytes),
+        // MACADDR8 is eight fixed big-endian bytes, so lexicographic order is EUI-64 order.
+        ast::Value::Macaddr8(bytes) => out.extend_from_slice(bytes),
         // Text / BYTEA: byte-stuffed and 0x00-terminated so a prefix sorts before its extensions.
         ast::Value::Text(s) => encode_ordered_bytes(s.as_bytes(), out),
         ast::Value::Bytes(b) => encode_ordered_bytes(b, out),

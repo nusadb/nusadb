@@ -194,6 +194,7 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
         // only ever reach the null case here.
         ColumnType::Vector(_)
         | ColumnType::Macaddr
+        | ColumnType::Macaddr8
         | ColumnType::Inet
         | ColumnType::Cidr
         | ColumnType::Bit(_)
@@ -332,6 +333,7 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
         // authoritative.
         ColumnType::Vector(_)
         | ColumnType::Macaddr
+        | ColumnType::Macaddr8
         | ColumnType::Inet
         | ColumnType::Cidr
         | ColumnType::Bit(_)
@@ -346,6 +348,7 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
 fn unsupported_batch_type(ty: ColumnType) -> Error {
     let name = match ty {
         ColumnType::Macaddr => "MACADDR",
+        ColumnType::Macaddr8 => "MACADDR8",
         ColumnType::Inet => "INET",
         ColumnType::Cidr => "CIDR",
         ColumnType::Bit(_) => "BIT",

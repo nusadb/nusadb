@@ -158,6 +158,9 @@ pub enum ColumnType {
     /// MAC address (`MACADDR`) — six bytes in transmission order, stored as those 6 bytes. Compared
     /// and ordered by the six bytes as an unsigned big-endian integer.
     Macaddr,
+    /// 8-byte MAC / EUI-64 (`MACADDR8`), stored as 8 bytes. Compared and ordered by the eight bytes
+    /// as an unsigned big-endian integer, like [`Macaddr`](Self::Macaddr).
+    Macaddr8,
     /// IPv4/IPv6 host address with an optional network (`INET`). Host bits may be set.
     Inet,
     /// IPv4/IPv6 network specification (`CIDR`) — like `INET` but host bits below the mask must be
@@ -380,6 +383,7 @@ impl ArrayElem {
             | ColumnType::Jsonb
             | ColumnType::Interval
             | ColumnType::Macaddr
+            | ColumnType::Macaddr8
             | ColumnType::Inet
             | ColumnType::Cidr
             | ColumnType::Bit(_)

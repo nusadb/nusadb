@@ -957,6 +957,9 @@ pub enum ScalarFunc {
     /// `value` as `INT`. With `is_called = false` the *next* [`NEXTVAL`](Self::SequenceNext) returns
     /// `value` itself; the default `true` returns `value + increment`. Side-effecting like `NEXTVAL`.
     SequenceSet,
+    /// `MACADDR8_SET7BIT(macaddr8)` — set the `0x02` (locally-administered) bit of the first byte,
+    /// returning the modified `MACADDR8`.
+    Macaddr8Set7bit,
 }
 
 impl ScalarFunc {
@@ -1176,6 +1179,7 @@ impl ScalarFunc {
             Self::SequenceNext => "nextval",
             Self::SequenceCurrent => "currval",
             Self::SequenceSet => "setval",
+            Self::Macaddr8Set7bit => "macaddr8_set7bit",
         }
     }
 
@@ -1555,6 +1559,8 @@ pub enum Value {
     Uuid([u8; 16]),
     /// MAC address — six bytes in transmission order.
     Macaddr([u8; 6]),
+    /// 8-byte MAC / EUI-64 — eight bytes in transmission order.
+    Macaddr8([u8; 8]),
     /// IPv4/IPv6 address for `INET` or `CIDR` — the `is_cidr` flag inside distinguishes the two.
     Inet(crate::inet::InetAddr),
     /// A `BIT`/`BIT VARYING` bit string — index 0 is the leftmost bit.
@@ -1667,6 +1673,8 @@ pub enum UnaryOp {
     Negate,
     /// Unary plus, `+` — a no-op on a numeric operand (returns it unchanged), rejected on others.
     Plus,
+    /// Bitwise complement, `~` — flips every bit of an integer or `MACADDR8` operand.
+    BitNot,
 }
 
 /// The JSON item type required by an [`Expr::IsJson`] predicate (`<expr> IS JSON <item_type>`).

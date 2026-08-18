@@ -85,6 +85,7 @@ pub(super) fn analyze_expr_agg(
                 ast::Value::TimeTz(_) => ColumnType::TimeTz,
                 ast::Value::Uuid(_) => ColumnType::Uuid,
                 ast::Value::Macaddr(_) => ColumnType::Macaddr,
+                ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
                 ast::Value::Inet(a) => a.column_type(),
                 ast::Value::Bit(b) => crate::bit::column_type(b),
                 ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -1298,6 +1299,8 @@ pub(super) fn analyze_scalar_function(
         // ASCII takes one TEXT argument and returns INT (the LENGTH family is intercepted by
         // `analyze_text_polymorphic` above — Text-or-BYTEA).
         F::Ascii => ScalarSig::Fixed(&[Text], &[], Int),
+        // MACADDR8_SET7BIT(macaddr8) → macaddr8 (sets the locally-administered bit of the first byte).
+        F::Macaddr8Set7bit => ScalarSig::Fixed(&[ColumnType::Macaddr8], &[], ColumnType::Macaddr8),
         // GCD(a, b) / LCM(a, b) / DIV(a, b) take two INT arguments and return INT.
         F::Gcd | F::Lcm | F::Div => ScalarSig::Fixed(&[Int, Int], &[], Int),
         // FACTORIAL(n) takes one INT and returns INT.
@@ -1987,6 +1990,38 @@ fn widen_numeric(a: ColumnType, b: ColumnType) -> ColumnType {
     }
 }
 
+/// Analyze the single-argument `TRUNC`. On a `MACADDR8` argument it is the MACADDR8 overload (zero
+/// the trailing bytes, returning `MACADDR8`); otherwise it is the numeric single-argument form
+/// (truncate toward zero, preserving the unified numeric type). The argument is analyzed once so an
+/// aggregate inside it is recorded a single time.
+fn analyze_trunc_unary(
+    arg_expr: &ast::Expr,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    use ColumnType::{Float, Int};
+    let arg = analyze_expr_agg(arg_expr, scope, catalog, Some(Float), aggregates)?;
+    let ty = if arg.ty == ColumnType::Macaddr8 {
+        ColumnType::Macaddr8
+    } else if is_numeric(arg.ty) || is_null_literal(&arg) {
+        widen_numeric(Int, arg.ty)
+    } else {
+        return Err(Error::TypeMismatch {
+            context: "trunc() argument 1".to_owned(),
+            expected: Float,
+            found: arg.ty,
+        });
+    };
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func: ast::ScalarFunc::Trunc,
+            args: vec![arg],
+        },
+        ty,
+    })
+}
+
 /// Analyze a numeric math built-in. Every argument must be numeric (`INT`/`FLOAT`/
 /// `NUMERIC`) or a bare `NULL` (typed `FLOAT`, so e.g. `ABS(NULL)` is a `FLOAT` `NULL` rather than
 /// ambiguous). Type-preserving functions (`ABS`/`CEIL`/`FLOOR`/`SIGN`/`ROUND`/`MOD`) return the
@@ -2000,6 +2035,13 @@ fn analyze_numeric_function(
 ) -> Result<TypedExpr, Error> {
     use ColumnType::{Float, Int};
     use ast::ScalarFunc as F;
+    // TRUNC has a MACADDR8 overload (`trunc(macaddr8)` zeros the last five bytes) that dispatches on
+    // the single argument's type, so it is analyzed on its own path rather than the numeric table.
+    if func == F::Trunc
+        && let [arg_expr] = args
+    {
+        return analyze_trunc_unary(arg_expr, scope, catalog, aggregates);
+    }
     // (min arity, max arity, result is always FLOAT).
     let (min, max, force_float) = match func {
         F::Abs | F::Ceil | F::Floor | F::Sign => (1, 1, false),
@@ -4140,6 +4182,10 @@ pub(super) fn check_binary(
         {
             Ok(ColumnType::Bool)
         },
+        // MACADDR8: `&`/`|` combine two eight-byte addresses byte-wise, yielding a MACADDR8.
+        Op::BitAnd | Op::BitOr if left == ColumnType::Macaddr8 && right == ColumnType::Macaddr8 => {
+            Ok(ColumnType::Macaddr8)
+        },
         // BIT strings: `&`/`|`/`#` combine two (equal-length) bit strings, `<<`/`>>` shift by an
         // `INT`, all yielding a bit string; `||` concatenates into a variable-length result.
         Op::BitAnd | Op::BitOr | Op::BitXor if is_bit_type(left) && is_bit_type(right) => Ok(left),
@@ -4858,7 +4904,7 @@ pub(super) fn analyze_unary(
     // `NOT NULL` is NULL, three-valued) instead of rejecting as untypeable.
     let hint = match op {
         ast::UnaryOp::Not => Some(ColumnType::Bool),
-        ast::UnaryOp::Negate | ast::UnaryOp::Plus => None,
+        ast::UnaryOp::Negate | ast::UnaryOp::Plus | ast::UnaryOp::BitNot => None,
     };
     let operand = analyze_expr_agg(expr, scope, catalog, hint, aggregates)?;
     let ty = match op {
@@ -4881,6 +4927,17 @@ pub(super) fn analyze_unary(
         ast::UnaryOp::Plus => {
             return Err(Error::TypeMismatch {
                 context: "unary plus".to_owned(),
+                expected: ColumnType::Int,
+                found: operand.ty,
+            });
+        },
+        // `~` complements an integer or a MACADDR8 bit-for-bit, preserving the operand type.
+        ast::UnaryOp::BitNot if matches!(operand.ty, ColumnType::Int | ColumnType::Macaddr8) => {
+            operand.ty
+        },
+        ast::UnaryOp::BitNot => {
+            return Err(Error::TypeMismatch {
+                context: "bitwise complement".to_owned(),
                 expected: ColumnType::Int,
                 found: operand.ty,
             });

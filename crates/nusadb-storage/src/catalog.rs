@@ -410,6 +410,7 @@ const fn coltype_to_u8(t: ColumnType) -> u8 {
         ColumnType::VarBit(_) => 26,
         // Tag 27; the element-kind tag is serialized separately.
         ColumnType::Range(_) => 27,
+        ColumnType::Macaddr8 => 28,
     }
 }
 fn u8_to_coltype(b: u8) -> Result<ColumnType> {
@@ -436,6 +437,7 @@ fn u8_to_coltype(b: u8) -> Result<ColumnType> {
         22 => ColumnType::Macaddr,
         23 => ColumnType::Inet,
         24 => ColumnType::Cidr,
+        28 => ColumnType::Macaddr8,
         // An array's NUMERIC element is unconstrained (single tag byte, no precision/scale); a
         // column-level NUMERIC (tag 10) is decoded with its precision/scale before this fallback.
         10 => ColumnType::Numeric {

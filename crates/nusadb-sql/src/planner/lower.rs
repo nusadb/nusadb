@@ -953,6 +953,7 @@ const fn is_index_safe_value(value: &ast::Value) -> bool {
             | ast::Value::TimestampTz(_)
             | ast::Value::Uuid(_)
             | ast::Value::Macaddr(_)
+            | ast::Value::Macaddr8(_)
     )
 }
 

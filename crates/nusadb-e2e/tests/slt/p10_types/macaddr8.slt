@@ -1,0 +1,133 @@
+# p10_types/macaddr8 — MACADDR8 type (eight-byte MAC / EUI-64).
+# Covers: catalog type, implicit string coercion, CAST both directions, canonical (lowercase,
+# colon-separated) display incl. normalization of dash/dot-quad/uppercase input, EUI-48 -> EUI-64
+# widening (insert ff:fe after the third byte) on both a six-byte text input and a MACADDR value,
+# numeric ordering, equality predicates, index lookup, the bitwise operators (~, &, |), the
+# trunc(macaddr8) and macaddr8_set7bit(macaddr8) functions, and loud rejection of malformed input.
+
+statement ok
+CREATE TABLE m8 (id INT NOT NULL, mac MACADDR8)
+
+# Implicit string coercion (the "unknown literal" rule), colon form.
+statement ok
+INSERT INTO m8 VALUES (1, '08:00:2b:01:02:03:04:05')
+
+# Explicit CAST, dash form normalizes to canonical colon form.
+statement ok
+INSERT INTO m8 VALUES (2, CAST('08-00-2b-01-02-03-04-05' AS MACADDR8))
+
+# Dot-quad (Cisco EUI-64) form and upper-case both normalize to canonical lowercase colon form.
+statement ok
+INSERT INTO m8 VALUES (3, '0102.0304.0506.0708')
+
+statement ok
+INSERT INTO m8 VALUES (4, 'AA:BB:CC:DD:EE:FF:00:11')
+
+# A six-byte (EUI-48) input widens to EUI-64 by inserting ff:fe after the third byte.
+statement ok
+INSERT INTO m8 VALUES (5, '08:00:2b:01:02:03')
+
+query IT rowsort
+SELECT id, mac FROM m8
+----
+1  08:00:2b:01:02:03:04:05
+2  08:00:2b:01:02:03:04:05
+3  01:02:03:04:05:06:07:08
+4  aa:bb:cc:dd:ee:ff:00:11
+5  08:00:2b:ff:fe:01:02:03
+
+# All input forms of the same address compare equal.
+query I
+SELECT id FROM m8 WHERE mac = '08-00-2b-01-02-03-04-05' ORDER BY id
+----
+1
+2
+
+# Ordering is by the eight bytes as a big-endian integer, not by text.
+query T
+SELECT mac FROM m8 ORDER BY mac
+----
+01:02:03:04:05:06:07:08
+08:00:2b:01:02:03:04:05
+08:00:2b:01:02:03:04:05
+08:00:2b:ff:fe:01:02:03
+aa:bb:cc:dd:ee:ff:00:11
+
+# DISTINCT collapses the two equal EUI-64 rows.
+query T
+SELECT DISTINCT mac FROM m8 WHERE id IN (1, 2)
+----
+08:00:2b:01:02:03:04:05
+
+# Strict less-than by byte order.
+query I
+SELECT id FROM m8 WHERE mac < '08:00:2b:01:02:03:04:05' ORDER BY id
+----
+3
+
+# EUI-48 text and the widened EUI-64 form are the same value.
+query I
+SELECT id FROM m8 WHERE mac = '08:00:2b:ff:fe:01:02:03'
+----
+5
+
+# CAST macaddr8 -> text yields the canonical form.
+query T
+SELECT CAST(mac AS TEXT) FROM m8 WHERE id = 4
+----
+aa:bb:cc:dd:ee:ff:00:11
+
+# A six-byte MACADDR value widens to MACADDR8 (EUI-48 -> EUI-64) on an explicit cast.
+query T
+SELECT CAST(CAST('08:00:2b:01:02:03' AS MACADDR) AS MACADDR8)
+----
+08:00:2b:ff:fe:01:02:03
+
+# Bitwise complement (~): flips every bit of all eight bytes.
+query T
+SELECT ~ CAST('08:00:2b:01:02:03:04:05' AS MACADDR8)
+----
+f7:ff:d4:fe:fd:fc:fb:fa
+
+# Bitwise AND (&): mask keeping the first three bytes.
+query T
+SELECT CAST('08:00:2b:01:02:03:04:05' AS MACADDR8) & CAST('ff:ff:ff:00:00:00:00:00' AS MACADDR8)
+----
+08:00:2b:00:00:00:00:00
+
+# Bitwise OR (|): set the low bytes.
+query T
+SELECT CAST('08:00:2b:00:00:00:00:00' AS MACADDR8) | CAST('00:00:00:01:02:03:04:05' AS MACADDR8)
+----
+08:00:2b:01:02:03:04:05
+
+# trunc(macaddr8): keep the first three bytes (the OUI) and zero the last five.
+query T
+SELECT trunc(CAST('08:00:2b:01:02:03:04:05' AS MACADDR8))
+----
+08:00:2b:00:00:00:00:00
+
+# macaddr8_set7bit(macaddr8): set the 0x02 (locally-administered) bit of the first byte.
+query T
+SELECT macaddr8_set7bit(CAST('00:00:2b:01:02:03:04:05' AS MACADDR8))
+----
+02:00:2b:01:02:03:04:05
+
+# Index lookup on a macaddr8 column.
+statement ok
+CREATE INDEX m8_mac ON m8 (mac)
+
+query I
+SELECT id FROM m8 WHERE mac = 'aa:bb:cc:dd:ee:ff:00:11'
+----
+4
+
+# A malformed MAC address is rejected at execution time (not silently stored).
+statement error
+INSERT INTO m8 VALUES (6, 'zz')
+
+statement error
+INSERT INTO m8 VALUES (7, '08:00:2b:01:02:03:04')
+
+statement error
+SELECT CAST('zz' AS MACADDR8)

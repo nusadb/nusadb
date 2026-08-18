@@ -479,6 +479,9 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         D::Array(elem) => return array_type(elem),
         // `VECTOR(n)` parses as an unknown custom type with one numeric modifier.
         D::Custom(name, modifiers) if is_vector_name(name) => return vector_type(modifiers),
+        // `MACADDR8` — a native 8-byte MAC / EUI-64 (checked before `MACADDR` so the longer name
+        // wins; not the text-backed alias below).
+        D::Custom(name, _) if is_named(name, "macaddr8") => ColumnType::Macaddr8,
         // `MACADDR` — a native 6-byte MAC address (not the text-backed alias below).
         D::Custom(name, _) if is_macaddr_name(name) => ColumnType::Macaddr,
         // `INET` / `CIDR` — native IPv4/IPv6 address types (not the text-backed alias below).
@@ -518,8 +521,8 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
         // Stored as their canonical text form (no native operators yet): geometric, full-text, and
         // XML types. (`macaddr`/`inet`/`cidr` and the range types are now native, handled above.)
-        "xml" | "macaddr8" | "tsvector" | "tsquery" | "point" | "line" | "lseg" | "box"
-        | "path" | "polygon" | "circle" => ColumnType::Text,
+        "xml" | "tsvector" | "tsquery" | "point" | "line" | "lseg" | "box" | "path" | "polygon"
+        | "circle" => ColumnType::Text,
         _ => return None,
     })
 }

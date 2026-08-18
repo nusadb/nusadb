@@ -895,6 +895,7 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
             out.push(27);
             out.push(kind.tag());
         },
+        ColumnType::Macaddr8 => out.push(28),
     }
 }
 
@@ -956,6 +957,7 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
             *at += 1;
             ColumnType::Range(kind)
         },
+        28 => ColumnType::Macaddr8,
         _ => return None,
     })
 }

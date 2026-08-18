@@ -53,6 +53,7 @@ const TAG_MACADDR: u8 = 17;
 const TAG_INET: u8 = 18;
 const TAG_BIT: u8 = 19;
 const TAG_RANGE: u8 = 20;
+const TAG_MACADDR8: u8 = 21;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -114,6 +115,10 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             out.push(TAG_MACADDR);
             out.extend_from_slice(bytes);
         },
+        ast::Value::Macaddr8(bytes) => {
+            out.push(TAG_MACADDR8);
+            out.extend_from_slice(bytes);
+        },
         ast::Value::Inet(a) => {
             out.push(TAG_INET);
             out.extend_from_slice(&a.encode());
@@ -173,6 +178,7 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
         TAG_TIMETZ => ast::Value::TimeTz(c.i64()?),
         TAG_UUID => ast::Value::Uuid(c.arr::<16>()?),
         TAG_MACADDR => ast::Value::Macaddr(c.arr::<6>()?),
+        TAG_MACADDR8 => ast::Value::Macaddr8(c.arr::<8>()?),
         TAG_INET => {
             let flags = c.u8()?;
             let masklen = c.u8()?;

@@ -75,6 +75,7 @@ pub(super) fn type_name(ty: ColumnType) -> String {
         ColumnType::TimeTz => "TIMETZ".to_owned(),
         ColumnType::Uuid => "UUID".to_owned(),
         ColumnType::Macaddr => "MACADDR".to_owned(),
+        ColumnType::Macaddr8 => "MACADDR8".to_owned(),
         ColumnType::Inet => "INET".to_owned(),
         ColumnType::Cidr => "CIDR".to_owned(),
         ColumnType::Bit(n) => format!("BIT({n})"),

@@ -28,6 +28,7 @@ pub mod interval;
 pub mod json;
 pub mod jsonb;
 pub mod macaddr;
+pub mod macaddr8;
 pub mod numeric;
 pub mod params;
 pub mod parser;

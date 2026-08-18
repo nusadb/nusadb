@@ -752,6 +752,7 @@ pub(crate) enum KeyAtom {
     TimestampTz(i64),
     Uuid([u8; 16]),
     Macaddr([u8; 6]),
+    Macaddr8([u8; 8]),
     Inet(crate::inet::InetAddr),
     Bit(Vec<bool>),
     /// A range, keyed by its canonical serialized bytes (its bound values are not `Hash`/`Eq`).
@@ -808,6 +809,7 @@ pub(super) fn key_atoms(
             ast::Value::TimestampTz(t) => atoms.push(KeyAtom::TimestampTz(t)),
             ast::Value::Uuid(u) => atoms.push(KeyAtom::Uuid(u)),
             ast::Value::Macaddr(m) => atoms.push(KeyAtom::Macaddr(m)),
+            ast::Value::Macaddr8(m) => atoms.push(KeyAtom::Macaddr8(m)),
             ast::Value::Inet(a) => atoms.push(KeyAtom::Inet(a)),
             ast::Value::Bit(b) => atoms.push(KeyAtom::Bit(b)),
             // Scale-normalized so numrange bounds `1.5`/`1.50` join as equal, matching `=`.

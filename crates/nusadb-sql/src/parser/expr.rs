@@ -97,6 +97,7 @@ pub(super) fn convert_typed_literal(
         ColumnType::TimeTz => crate::temporal::parse_timetz(&value).map(ast::Value::TimeTz),
         ColumnType::Uuid => crate::temporal::parse_uuid(&value).map(ast::Value::Uuid),
         ColumnType::Macaddr => crate::macaddr::parse(&value).map(ast::Value::Macaddr),
+        ColumnType::Macaddr8 => crate::macaddr8::parse(&value).map(ast::Value::Macaddr8),
         ColumnType::Inet => crate::inet::parse_inet(&value).map(ast::Value::Inet),
         ColumnType::Cidr => crate::inet::parse_cidr(&value).map(ast::Value::Inet),
         ColumnType::Bit(n) => {
@@ -1391,6 +1392,8 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "radians" => F::Radians,
         "pi" => F::Pi,
         "trunc" => F::Trunc,
+        // MACADDR8.
+        "macaddr8_set7bit" => F::Macaddr8Set7bit,
         // Random.
         "random" => F::Random,
         "setseed" => F::Setseed,
@@ -2031,6 +2034,8 @@ pub(super) fn convert_unary_op(op: sql::UnaryOperator) -> Result<ast::UnaryOp, E
         sql::UnaryOperator::Not => Ok(ast::UnaryOp::Not),
         sql::UnaryOperator::Minus => Ok(ast::UnaryOp::Negate),
         sql::UnaryOperator::Plus => Ok(ast::UnaryOp::Plus),
+        // `~` — bitwise complement of an integer or a `MACADDR8`.
+        sql::UnaryOperator::BitwiseNot => Ok(ast::UnaryOp::BitNot),
         other => unsupported(&format!("unary operator `{other}`")),
     }
 }
