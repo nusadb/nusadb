@@ -634,3 +634,178 @@ query T
 SELECT ARRAY_DIMS(ARRAY_REMOVE(ARRAY[1], 1))
 ----
 NULL
+
+# --- Differential fixes vs the reference engine (SILENT-WRONG audit) ---
+
+# SPLIT_PART: a negative field position counts from the end (-1 = last field).
+query T
+SELECT SPLIT_PART('a,b,c', ',', -1)
+----
+c
+
+query T
+SELECT SPLIT_PART('a,b,c', ',', -2)
+----
+b
+
+query T
+SELECT SPLIT_PART('a,b,c', ',', -3)
+----
+a
+
+# Out-of-range negative position yields the empty string.
+query T
+SELECT SPLIT_PART('a,b,c', ',', -4)
+----
+(empty)
+
+# An empty delimiter treats the whole string as field 1 / -1.
+query T
+SELECT SPLIT_PART('hello', '', -1)
+----
+hello
+
+# Field position 0 is an error, not the empty string.
+statement error
+SELECT SPLIT_PART('a,b,c', ',', 0)
+
+# TRIM family with no explicit set strips only the ASCII space (0x20); tabs and newlines are kept.
+query T
+SELECT '[' || BTRIM(E'\tab\t') || ']'
+----
+[	ab	]
+
+query T
+SELECT '[' || LTRIM(E'\t x') || ']'
+----
+[	 x]
+
+query T
+SELECT '[' || RTRIM(E'x \t') || ']'
+----
+[x 	]
+
+query T
+SELECT '[' || BTRIM('   hi   ') || ']'
+----
+[hi]
+
+# CHR(0) is rejected: a NUL byte cannot appear in TEXT.
+statement error
+SELECT CHR(0)
+
+# Other code points are unchanged.
+query T
+SELECT CHR(65)
+----
+A
+
+# QUOTE_IDENT quotes reserved keywords even though they match the safe identifier pattern.
+query T
+SELECT QUOTE_IDENT('select')
+----
+"select"
+
+query T
+SELECT QUOTE_IDENT('order')
+----
+"order"
+
+query T
+SELECT QUOTE_IDENT('user')
+----
+"user"
+
+query T
+SELECT QUOTE_IDENT('check')
+----
+"check"
+
+# Unreserved words and plain identifiers stay unquoted.
+query T
+SELECT QUOTE_IDENT('name')
+----
+name
+
+query T
+SELECT QUOTE_IDENT('value')
+----
+value
+
+# STRING_TO_ARRAY is not NULL-strict on its delimiter: a NULL delimiter splits into characters.
+query I
+SELECT ARRAY_LENGTH(STRING_TO_ARRAY('hello', NULL), 1)
+----
+5
+
+query T
+SELECT ARRAY_TO_STRING(STRING_TO_ARRAY('abc', NULL), '-')
+----
+a-b-c
+
+# An empty delimiter returns the whole string as one element.
+query T
+SELECT ARRAY_TO_STRING(STRING_TO_ARRAY('abc', ''), '-')
+----
+abc
+
+# A NULL input string yields NULL; an empty input yields an empty array (any delimiter).
+query T
+SELECT STRING_TO_ARRAY(NULL, ',') IS NULL
+----
+1
+
+query I
+SELECT ARRAY_LENGTH(STRING_TO_ARRAY('', 'x'), 1)
+----
+NULL
+
+# ENCODE(...,'escape') escapes only NUL (\000), high-bit bytes (\nnn octal), and backslash (\);
+# other bytes are raw. Round-trip through DECODE preserves every byte.
+query T
+SELECT ENCODE(DECODE('00', 'hex'), 'escape')
+----
+\000
+
+query T
+SELECT ENCODE(DECODE('5c', 'hex'), 'escape')
+----
+\\
+
+query T
+SELECT ENCODE(DECODE('80', 'hex'), 'escape')
+----
+\200
+
+query T
+SELECT ENCODE(DECODE('ff', 'hex'), 'escape')
+----
+\377
+
+query T
+SELECT ENCODE(DECODE('41', 'hex'), 'escape')
+----
+A
+
+query T
+SELECT ENCODE(DECODE(ENCODE(DECODE('0001091f207e7f8081ff5c', 'hex'), 'escape'), 'escape'), 'hex')
+----
+0001091f207e7f8081ff5c
+
+# ENCODE(...,'base64') wraps output at 76 characters with newlines (MIME line wrapping). 200 bytes
+# → 268 base64 chars + 3 newlines = 271; an exact 76-char line (57 bytes) ends with a trailing
+# newline (77 chars). DECODE ignores the newlines, so the round-trip is preserved.
+query I
+SELECT LENGTH(ENCODE(DECODE(REPEAT('61', 200), 'hex'), 'base64'))
+----
+271
+
+query I
+SELECT LENGTH(ENCODE(DECODE(REPEAT('61', 57), 'hex'), 'base64'))
+----
+77
+
+query T
+SELECT ENCODE(DECODE(ENCODE(DECODE(REPEAT('61', 200), 'hex'), 'base64'), 'base64'), 'hex') = REPEAT('61', 200)
+----
+1

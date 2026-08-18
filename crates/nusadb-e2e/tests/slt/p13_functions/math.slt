@@ -366,6 +366,23 @@ SELECT TO_HEX(4096)
 ----
 1000
 
+# A negative int4 renders as its 32-bit two's-complement (8 hex digits); a negative int8 uses all
+# 64 bits (16 digits). Matches the reference engine's two TO_HEX overloads.
+query T
+SELECT TO_HEX(-1)
+----
+ffffffff
+
+query T
+SELECT TO_HEX(-256)
+----
+ffffff00
+
+query T
+SELECT TO_HEX((-1)::bigint)
+----
+ffffffffffffffff
+
 # NULL propagates.
 query T
 SELECT DIV(NULL, 2)

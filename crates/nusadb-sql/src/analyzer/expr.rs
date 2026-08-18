@@ -1628,7 +1628,14 @@ pub(super) fn analyze_scalar_function(
         let coercible = (expected == ColumnType::Float
             && matches!(typed.ty, ColumnType::Int | ColumnType::Numeric { .. }))
             || (matches!(expected, ColumnType::Numeric { .. })
-                && matches!(typed.ty, ColumnType::Int | ColumnType::Numeric { .. }));
+                && matches!(typed.ty, ColumnType::Int | ColumnType::Numeric { .. }))
+            // TO_HEX accepts any integer width (int2/int4/int8): the evaluator masks int2/int4 to
+            // 32 bits and renders int8 with all 64, mirroring the reference engine's two overloads.
+            || (func == ast::ScalarFunc::ToHex
+                && matches!(
+                    typed.ty,
+                    ColumnType::Int | ColumnType::SmallInt | ColumnType::BigInt
+                ));
         if typed.ty != expected && !coercible && !is_null_literal(&typed) {
             return Err(Error::TypeMismatch {
                 context: format!("{name}() argument {}", i + 1),

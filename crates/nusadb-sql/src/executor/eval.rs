@@ -555,6 +555,9 @@ fn eval_scalar_function(
         F::Int4Range | F::Int8Range | F::NumRange | F::DateRange | F::TsRange | F::TsTzRange => {
             return eval_range_constructor(func, args, row);
         },
+        // STRING_TO_ARRAY is not NULL-strict on its delimiter: a NULL delimiter means "split into
+        // individual characters" rather than propagating NULL, so it skips the NULL-strict collection.
+        F::StringToArray => return eval_string_to_array(args, row),
         _ => {},
     }
     let mut vals = Vec::with_capacity(args.len());
@@ -614,7 +617,7 @@ fn eval_scalar_function(
         (F::BTrim, [Text(s), Text(set)]) => Text(trim(s, Some(set), TrimSide::Both)),
         (F::Left, [Text(s), Int(n)]) => Text(left(s, *n)),
         (F::Right, [Text(s), Int(n)]) => Text(right(s, *n)),
-        (F::SplitPart, [Text(s), Text(delim), Int(n)]) => Text(split_part(s, delim, *n)),
+        (F::SplitPart, [Text(s), Text(delim), Int(n)]) => Text(split_part(s, delim, *n)?),
         (F::Reverse, [Text(s)]) => Text(reverse(s)),
         (F::QuoteLiteral, [Text(s)]) => Text(quote_literal(s)),
         (F::QuoteIdent, [Text(s)]) => Text(quote_ident(s)),
@@ -622,8 +625,17 @@ fn eval_scalar_function(
             ast::Value::Bool(s.starts_with(prefix.as_str()))
         },
         (F::Ascii, [Text(s)]) => Int(s.chars().next().map_or(0, |c| i64::from(u32::from(c)))),
-        (F::Chr, [Int(n)]) => char::from_u32(u32::try_from(*n).unwrap_or(u32::MAX))
-            .map_or(ast::Value::Null, |c| Text(c.to_string())),
+        (F::Chr, [Int(n)]) => {
+            // The reference engine rejects the NUL code point (a NUL byte cannot appear in TEXT)
+            // rather than producing a `"\0"` string.
+            if *n == 0 {
+                return Err(Error::InvalidParameterValue(
+                    "null character not permitted".to_owned(),
+                ));
+            }
+            char::from_u32(u32::try_from(*n).unwrap_or(u32::MAX))
+                .map_or(ast::Value::Null, |c| Text(c.to_string()))
+        },
         (F::Initcap, [Text(s)]) => Text(initcap(s)),
         (F::Repeat, [Text(s), Int(n)]) => Text(s.repeat(usize::try_from(*n).unwrap_or(0))),
         // STRPOS(s, sub) is POSITION(sub IN s) with the haystack-first argument order.
@@ -1006,7 +1018,19 @@ fn eval_scalar_function(
             | F::Trunc,
             _,
         ) => eval_math(func, vals.as_slice())?,
-        (F::ToHex, [Int(n)]) => Text(format!("{:x}", u64::from_ne_bytes(n.to_ne_bytes()))),
+        // TO_HEX renders the two's-complement bit pattern of the argument. The reference engine has
+        // two overloads: `to_hex(int4)` masks to 32 bits (so `to_hex(-1)` = `ffffffff`) and
+        // `to_hex(int8)` uses all 64 bits (`ffffffffffffffff`). Dispatch on the argument's declared
+        // type; int2/int4 mask to 32 bits, int8 keeps all 64.
+        (F::ToHex, [Int(n)]) => {
+            let bits = u64::from_ne_bytes(n.to_ne_bytes());
+            let value = if matches!(args.first().map(|a| a.ty), Some(ColumnType::BigInt)) {
+                bits
+            } else {
+                bits & 0xFFFF_FFFF
+            };
+            Text(format!("{value:x}"))
+        },
         (F::Factorial, [Int(n)]) => factorial(*n)?,
         // BIT_COUNT(n) — set bits in the two's-complement 64-bit value; 0..=64, never panics.
         (F::BitCount, [Int(n)]) => Int(i64::from(n.count_ones())),
@@ -1081,13 +1105,7 @@ fn eval_scalar_function(
                     .join(sep),
             )
         },
-        // STRING_TO_ARRAY(s, sep): split `s` on `sep` into a TEXT[]; an empty `sep` yields `{s}`.
-        (F::StringToArray, [Text(s), Text(sep)]) => ast::Value::Array(
-            split_on_literal(s, sep)
-                .into_iter()
-                .map(ast::Value::Text)
-                .collect(),
-        ),
+        // STRING_TO_ARRAY is handled by `eval_string_to_array` before the NULL-strict collection.
         // Vector distance functions. NULL operands already returned NULL above.
         (F::L2Distance | F::CosineDistance | F::InnerProduct | F::L1Distance, args) => {
             eval_vector_distance(func, args)?
@@ -1951,6 +1969,38 @@ pub(super) fn split_on_literal(s: &str, sep: &str) -> Vec<String> {
     }
 }
 
+/// `STRING_TO_ARRAY(s, delim)` → `TEXT[]`. Unlike most functions this is not NULL-strict on the
+/// delimiter, matching the reference engine:
+///   * a NULL string yields NULL;
+///   * an empty string yields an empty array (regardless of delimiter);
+///   * a NULL delimiter splits into individual characters;
+///   * an empty delimiter yields the whole string as a single element;
+///   * otherwise the string is split on the literal delimiter.
+fn eval_string_to_array(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
+    use ast::Value::Text;
+    let (Some(s_expr), Some(delim_expr)) = (args.first(), args.get(1)) else {
+        return Err(Error::FunctionArgs(
+            "string_to_array() expects 2 argument(s)".to_owned(),
+        ));
+    };
+    let s = match eval(s_expr, row)? {
+        ast::Value::Null => return Ok(ast::Value::Null),
+        Text(s) => s,
+        other => crate::display::value_text(&other),
+    };
+    // An empty input string yields an empty array, whatever the delimiter is (even NULL).
+    if s.is_empty() {
+        return Ok(ast::Value::Array(Vec::new()));
+    }
+    let pieces: Vec<String> = match eval(delim_expr, row)? {
+        // NULL delimiter → split into individual characters.
+        ast::Value::Null => s.chars().map(|c| c.to_string()).collect(),
+        Text(delim) => split_on_literal(&s, &delim),
+        other => split_on_literal(&s, &crate::display::value_text(&other)),
+    };
+    Ok(ast::Value::Array(pieces.into_iter().map(Text).collect()))
+}
+
 /// `REGEXP_SUBSTR(s, pattern [, flags])` — the first substring of `s` matching `pattern`, or `NULL`
 /// if there is no match.
 /// `regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])` — the substring matched by
@@ -2714,21 +2764,32 @@ fn right(s: &str, n: i64) -> String {
     s.chars().skip(usize::try_from(skip).unwrap_or(0)).collect()
 }
 
-/// `SPLIT_PART(s, delim, n)` — the 1-based `n`th field of `s` split on `delim`, or `''` when `n` is
-/// out of range (`n < 1` always yields `''`). An empty `delim` treats `s` as a single field.
-fn split_part(s: &str, delim: &str, n: i64) -> String {
-    if n < 1 {
-        return String::new();
+/// `SPLIT_PART(s, delim, n)` — the `n`th field of `s` split on `delim`. A positive `n` counts from
+/// the start (1-based); a negative `n` counts from the end (`-1` is the last field), matching the
+/// reference engine. `n = 0` is an error ("field position must not be zero"). An out-of-range field
+/// yields `''`. An empty `delim` treats `s` as a single field.
+fn split_part(s: &str, delim: &str, n: i64) -> Result<String, Error> {
+    if n == 0 {
+        return Err(Error::InvalidParameterValue(
+            "field position must not be zero".to_owned(),
+        ));
     }
-    let idx = usize::try_from(n - 1).unwrap_or(usize::MAX);
-    if delim.is_empty() {
-        return if idx == 0 {
-            s.to_owned()
-        } else {
-            String::new()
-        };
+    let fields: Vec<&str> = if delim.is_empty() {
+        vec![s]
+    } else {
+        s.split(delim).collect()
+    };
+    let len = i64::try_from(fields.len()).unwrap_or(i64::MAX);
+    // A negative `n` indexes from the end: `-1` → the last field.
+    let idx = if n < 0 { len + n } else { n - 1 };
+    if idx < 0 || idx >= len {
+        return Ok(String::new());
     }
-    s.split(delim).nth(idx).unwrap_or("").to_owned()
+    Ok(fields
+        .get(usize::try_from(idx).unwrap_or(usize::MAX))
+        .copied()
+        .unwrap_or("")
+        .to_owned())
 }
 
 /// `REVERSE(s)` — the characters of `s` in reverse order.
@@ -2780,11 +2841,175 @@ fn quote_literal(s: &str) -> String {
     out
 }
 
-/// `QUOTE_IDENT(s)` — quote `s` for use as a SQL identifier. A string that is already a safe
-/// unquoted identifier (`[a-z_][a-z0-9_]*`) is returned unchanged; otherwise it is wrapped in double
-/// quotes with any embedded double quote doubled. v1 does not also quote reserved words.
+/// Reserved keywords that must be quoted by [`quote_ident`] even though they match the safe
+/// identifier pattern. This mirrors the reference engine's `quote_ident`, which quotes any keyword
+/// whose category is not "unreserved" (so `select`/`from`/`table`/`user`/`check`… are quoted, while
+/// unreserved words like `name`/`value`/`type` are not). Sorted for binary search (asserted by a
+/// unit test); every entry is lowercase, so a lookup is only meaningful for an all-lowercase input.
+const RESERVED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json_array",
+    "json_arrayagg",
+    "json_object",
+    "json_objectagg",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// `QUOTE_IDENT(s)` — quote `s` for use as a SQL identifier. A string that is already a safe unquoted
+/// identifier (`[a-z_][a-z0-9_]*`) and is not a reserved keyword is returned unchanged; otherwise it
+/// is wrapped in double quotes with any embedded double quote doubled.
 fn quote_ident(s: &str) -> String {
-    let is_safe = {
+    let matches_pattern = {
         let mut chars = s.chars();
         // `next()` yields `Some` only for a non-empty string, so an empty `s` is never "safe".
         chars
@@ -2792,6 +3017,8 @@ fn quote_ident(s: &str) -> String {
             .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
             && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     };
+    // A reserved keyword must be quoted even though it matches the identifier pattern.
+    let is_safe = matches_pattern && RESERVED_KEYWORDS.binary_search(&s).is_err();
     if is_safe {
         return s.to_owned();
     }
@@ -3377,28 +3604,18 @@ fn pad(s: &str, target_len: i64, fill: &str, side: PadSide) -> String {
     }
 }
 
-/// Strip characters from the leading/trailing side(s) of `s`. With no `set`, Unicode whitespace is
-/// stripped; otherwise any character contained in `set` is stripped from the relevant side(s).
+/// Strip characters from the leading/trailing side(s) of `s`. With no explicit `set` the reference
+/// engine strips only the ASCII space (0x20) — tabs, newlines and other whitespace are kept — so the
+/// default set is a single space. An explicit `set` strips any character it contains.
 fn trim(s: &str, set: Option<&str>, side: TrimSide) -> String {
-    set.map_or_else(
-        || {
-            match side {
-                TrimSide::Left => s.trim_start(),
-                TrimSide::Right => s.trim_end(),
-                TrimSide::Both => s.trim(),
-            }
-            .to_owned()
-        },
-        |set| {
-            let in_set = |c: char| set.contains(c);
-            match side {
-                TrimSide::Left => s.trim_start_matches(in_set),
-                TrimSide::Right => s.trim_end_matches(in_set),
-                TrimSide::Both => s.trim_matches(in_set),
-            }
-            .to_owned()
-        },
-    )
+    let set = set.unwrap_or(" ");
+    let in_set = |c: char| set.contains(c);
+    match side {
+        TrimSide::Left => s.trim_start_matches(in_set),
+        TrimSide::Right => s.trim_end_matches(in_set),
+        TrimSide::Both => s.trim_matches(in_set),
+    }
+    .to_owned()
 }
 
 /// Return the first non-NULL argument; `NULL` if every argument is `NULL`.
@@ -3988,7 +4205,8 @@ fn cast_to_numeric(
 }
 
 /// `ENCODE(bytea, format)` — render raw bytes as text in the `hex` (lowercase, no `\x` prefix) or
-/// `escape` (printable bytes literal, others as `\nnn` octal, backslash doubled) format (B-fn).
+/// `escape` (NUL and high-bit bytes as `\nnn` octal, backslash doubled, everything else raw) format
+/// (B-fn).
 /// Accept only the `UTF8` encoding (the engine's native text encoding) for `convert_to`/
 /// `convert_from`. `UTF8` and `UTF-8` are the same encoding; any other is rejected loudly rather than
 /// silently mis-transcoded.
@@ -4014,17 +4232,21 @@ fn encode_bytea(bytes: &[u8], format: &str) -> Result<String, Error> {
             Ok(out)
         },
         "escape" => {
+            // The reference engine's `escape` form emits only a NUL byte (`\000`) and any high-bit
+            // byte (`0x80..=0xff`, as a 3-digit octal `\nnn`) as escapes, and doubles a backslash
+            // (`\\`); every other byte (0x01..=0x7f, including control characters like tab/newline) is
+            // emitted raw.
             let mut out = String::with_capacity(bytes.len());
             for &b in bytes {
                 match b {
                     b'\\' => out.push_str("\\\\"),
-                    0x20..=0x7e => out.push(b as char),
-                    other => {
+                    0x00 | 0x80..=0xff => {
                         out.push('\\');
-                        out.push(char::from_digit(u32::from(other >> 6) & 0x7, 8).unwrap_or('0'));
-                        out.push(char::from_digit(u32::from(other >> 3) & 0x7, 8).unwrap_or('0'));
-                        out.push(char::from_digit(u32::from(other) & 0x7, 8).unwrap_or('0'));
+                        out.push(char::from_digit(u32::from(b >> 6) & 0x7, 8).unwrap_or('0'));
+                        out.push(char::from_digit(u32::from(b >> 3) & 0x7, 8).unwrap_or('0'));
+                        out.push(char::from_digit(u32::from(b) & 0x7, 8).unwrap_or('0'));
                     },
+                    _ => out.push(b as char),
                 }
             }
             Ok(out)
@@ -4042,6 +4264,10 @@ const BASE64_ALPHABET: &[u8; 64] =
 
 /// Encode raw bytes as standard base-64 text (RFC 4648, with `=` padding) — the `base64` form of
 /// `ENCODE` (B-fn). Each 3-byte group becomes 4 output characters; a 1- or 2-byte tail is padded.
+/// The reference engine wraps the output into lines of at most 76 characters, emitting a newline
+/// after every 76th output character (so a total that is an exact multiple of 76 ends with a
+/// trailing newline). `DECODE(..., 'base64')` ignores the embedded newlines, so the round-trip is
+/// preserved.
 fn base64_encode(bytes: &[u8]) -> String {
     // Map a 6-bit group to its alphabet symbol. The `& 0x3f` keeps the index in `0..64`, so the
     // lookup always hits; the `unwrap_or` is unreachable and only satisfies the no-indexing lint.
@@ -4051,16 +4277,27 @@ fn base64_encode(bytes: &[u8]) -> String {
             .copied()
             .unwrap_or(b'A') as char
     };
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let encoded = bytes.len().div_ceil(3) * 4;
+    // One newline per completed 76-character line.
+    let mut out = String::with_capacity(encoded + encoded / 76 + 1);
+    let mut line_len: usize = 0;
+    let mut emit = |out: &mut String, ch: char| {
+        out.push(ch);
+        line_len += 1;
+        if line_len == 76 {
+            out.push('\n');
+            line_len = 0;
+        }
+    };
     for chunk in bytes.chunks(3) {
         let b0 = u32::from(chunk.first().copied().unwrap_or(0));
         let b1 = chunk.get(1).copied().map_or(0, u32::from);
         let b2 = chunk.get(2).copied().map_or(0, u32::from);
         let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(sym(n >> 18));
-        out.push(sym(n >> 12));
-        out.push(if chunk.len() > 1 { sym(n >> 6) } else { '=' });
-        out.push(if chunk.len() > 2 { sym(n) } else { '=' });
+        emit(&mut out, sym(n >> 18));
+        emit(&mut out, sym(n >> 12));
+        emit(&mut out, if chunk.len() > 1 { sym(n >> 6) } else { '=' });
+        emit(&mut out, if chunk.len() > 2 { sym(n) } else { '=' });
     }
     out
 }
@@ -6414,6 +6651,142 @@ mod tests {
     }
 
     #[test]
+    fn trim_default_strips_only_ascii_space() {
+        // With no explicit character set the reference engine strips only the ASCII space (0x20);
+        // tabs and newlines are kept.
+        assert_eq!(
+            run_text(ScalarFunc::BTrim, vec![txt("\t \n abc \t\n")]),
+            Value::Text("\t \n abc \t\n".to_owned())
+        );
+        assert_eq!(
+            run_text(ScalarFunc::LTrim, vec![txt("\t abc")]),
+            Value::Text("\t abc".to_owned())
+        );
+        assert_eq!(
+            run_text(ScalarFunc::RTrim, vec![txt("abc \t")]),
+            Value::Text("abc \t".to_owned())
+        );
+        // A leading/trailing run of plain spaces is still stripped.
+        assert_eq!(
+            run_text(ScalarFunc::BTrim, vec![txt("   abc   ")]),
+            Value::Text("abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn chr_zero_is_rejected() {
+        // The NUL code point is an error (a NUL byte cannot live in TEXT), not a `"\0"` string.
+        assert!(matches!(
+            try_scalar(ScalarFunc::Chr, vec![lit_int(0)], ColumnType::Text),
+            Err(Error::InvalidParameterValue(_))
+        ));
+        // Other code points are unaffected.
+        assert_eq!(
+            run_text(ScalarFunc::Chr, vec![lit_int(65)]),
+            Value::Text("A".to_owned())
+        );
+    }
+
+    #[test]
+    fn quote_ident_quotes_reserved_words() {
+        use super::quote_ident;
+        // Reserved keywords are quoted even though they match the safe identifier pattern.
+        for word in [
+            "select", "from", "table", "order", "group", "where", "user", "check",
+        ] {
+            assert_eq!(quote_ident(word), format!("\"{word}\""));
+        }
+        // Unreserved words and plain identifiers stay unquoted.
+        assert_eq!(quote_ident("name"), "name");
+        assert_eq!(quote_ident("value"), "value");
+        assert_eq!(quote_ident("foo123"), "foo123");
+        // A non-lowercase / non-identifier string is quoted (with embedded quotes doubled).
+        assert_eq!(quote_ident("NAME"), "\"NAME\"");
+        assert_eq!(quote_ident("a b"), "\"a b\"");
+        assert_eq!(quote_ident("1abc"), "\"1abc\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn to_hex_dispatches_on_integer_width() {
+        let to_hex = |v: i64, ty: ColumnType| {
+            eval(
+                &scalar(
+                    ScalarFunc::ToHex,
+                    vec![lit(Value::Int(v), ty)],
+                    ColumnType::Text,
+                ),
+                &vec![],
+            )
+            .unwrap()
+        };
+        // int4 masks to 32 bits; int8 uses all 64 bits.
+        assert_eq!(
+            to_hex(-1, ColumnType::Int),
+            Value::Text("ffffffff".to_owned())
+        );
+        assert_eq!(
+            to_hex(-1, ColumnType::BigInt),
+            Value::Text("ffffffffffffffff".to_owned())
+        );
+        assert_eq!(
+            to_hex(-256, ColumnType::Int),
+            Value::Text("ffffff00".to_owned())
+        );
+        assert_eq!(to_hex(255, ColumnType::Int), Value::Text("ff".to_owned()));
+        // int2 (smallint) also renders as the 32-bit form.
+        assert_eq!(
+            to_hex(-1, ColumnType::SmallInt),
+            Value::Text("ffffffff".to_owned())
+        );
+    }
+
+    #[test]
+    fn encode_escape_matches_reference_rule() {
+        use super::{decode_bytea, encode_bytea};
+        // Only NUL and high-bit bytes are octal-escaped; backslash doubles; everything else is raw.
+        let bytes: Vec<u8> = vec![
+            0x00, 0x01, 0x09, 0x1f, 0x20, 0x7e, 0x7f, 0x80, 0x81, 0xff, 0x5c,
+        ];
+        let escaped = encode_bytea(&bytes, "escape").expect("encode");
+        assert_eq!(
+            escaped,
+            "\\000\u{01}\u{09}\u{1f} ~\u{7f}\\200\\201\\377\\\\"
+        );
+        // The round-trip through DECODE reproduces the original bytes.
+        assert_eq!(decode_bytea(&escaped, "escape").expect("decode"), bytes);
+    }
+
+    #[test]
+    fn string_to_array_delimiter_is_not_null_strict() {
+        let sta = |s: TypedExpr, d: TypedExpr| {
+            eval(
+                &scalar(
+                    ScalarFunc::StringToArray,
+                    vec![s, d],
+                    ColumnType::Array(nusadb_core::engine::ArrayElem::Text),
+                ),
+                &vec![],
+            )
+            .unwrap()
+        };
+        let text_arr = |items: &[&str]| {
+            Value::Array(items.iter().map(|s| Value::Text((*s).to_owned())).collect())
+        };
+        // NULL delimiter → split into individual characters.
+        assert_eq!(sta(txt("abc"), null_text()), text_arr(&["a", "b", "c"]));
+        assert_eq!(sta(txt("a,b"), null_text()), text_arr(&["a", ",", "b"]));
+        // Empty delimiter → the whole string as a single element.
+        assert_eq!(sta(txt("abc"), txt("")), text_arr(&["abc"]));
+        // Ordinary delimiter still splits.
+        assert_eq!(sta(txt("a,b,c"), txt(",")), text_arr(&["a", "b", "c"]));
+        // A NULL input string yields NULL; an empty input yields an empty array (any delimiter).
+        assert_eq!(sta(null_text(), txt(",")), Value::Null);
+        assert_eq!(sta(txt(""), txt(",")), text_arr(&[]));
+        assert_eq!(sta(txt(""), null_text()), text_arr(&[]));
+    }
+
+    #[test]
     fn scalar_function_propagates_null() {
         // Any NULL argument yields NULL (all functions are NULL-strict).
         assert_eq!(
@@ -6519,8 +6892,25 @@ mod tests {
         assert_eq!(sp("a,b,c", ",", 2), Value::Text("b".to_owned()));
         assert_eq!(sp("a,b,c", ",", 1), Value::Text("a".to_owned()));
         assert_eq!(sp("a,b,c", ",", 9), Value::Text(String::new())); // out of range
-        assert_eq!(sp("a,b,c", ",", 0), Value::Text(String::new())); // n < 1
         assert_eq!(sp("a##b", "##", 2), Value::Text("b".to_owned())); // multi-char delim
+        // A negative field position counts from the end (the reference engine): `-1` is the last
+        // field, `-2` the second-to-last, and out-of-range still yields the empty string.
+        assert_eq!(sp("a,b,c", ",", -1), Value::Text("c".to_owned()));
+        assert_eq!(sp("a,b,c", ",", -2), Value::Text("b".to_owned()));
+        assert_eq!(sp("a,b,c", ",", -3), Value::Text("a".to_owned()));
+        assert_eq!(sp("a,b,c", ",", -4), Value::Text(String::new()));
+        // An empty delimiter treats the whole string as the single field 1 / -1.
+        assert_eq!(sp("abc", "", 1), Value::Text("abc".to_owned()));
+        assert_eq!(sp("abc", "", -1), Value::Text("abc".to_owned()));
+        // Field position 0 is an error ("field position must not be zero").
+        assert!(matches!(
+            try_scalar(
+                ScalarFunc::SplitPart,
+                vec![txt("a,b,c"), txt(","), lit_int(0)],
+                ColumnType::Text,
+            ),
+            Err(Error::InvalidParameterValue(_))
+        ));
     }
 
     #[test]
@@ -7041,6 +7431,38 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encode_wraps_at_76_chars() {
+        use super::base64_encode;
+        // 57 input bytes → exactly 76 output characters → a single line plus a trailing newline
+        // (the reference engine emits a newline after each completed 76-character line).
+        let out57 = base64_encode(&[b'a'; 57]);
+        assert_eq!(out57.len(), 77);
+        assert!(out57.ends_with('\n'));
+        assert_eq!(out57.trim_end().len(), 76);
+        assert_eq!(out57.matches('\n').count(), 1);
+        // 58 bytes → 80 output characters → 76 chars, a newline, then a 4-char remainder (no
+        // trailing newline).
+        let out58 = base64_encode(&[b'a'; 58]);
+        let lines: Vec<&str> = out58.split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), 76);
+        assert_eq!(lines[1].len(), 4);
+        assert!(!out58.ends_with('\n'));
+        // Short input is unwrapped, and DECODE ignores the embedded newlines so the round-trip holds.
+        assert!(!base64_encode(b"foobar").contains('\n'));
+        assert_eq!(
+            super::base64_decode(&base64_encode(&[b'a'; 200])).expect("round-trip"),
+            vec![b'a'; 200]
+        );
+    }
+
+    #[test]
+    fn reserved_keywords_table_is_sorted_for_binary_search() {
+        // `quote_ident` binary-searches this table, which requires ascending order.
+        assert!(super::RESERVED_KEYWORDS.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
