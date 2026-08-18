@@ -1,18 +1,21 @@
 //! JSON / JSONB value support for the `JSON` column type (phase 3).
 //!
 //! A JSON value is stored as its **canonical text** (see [`ast::Value::Json`](crate::ast::Value::Json)):
-//! parsed with `serde_json`, then re-serialized. `serde_json`'s default map is a `BTreeMap`, so
-//! object keys are emitted in sorted order and insignificant whitespace is dropped — giving JSONB
-//! semantics where `{"b":2,"a":1}` and `{ "a": 1, "b": 2 }` normalize to the same text and so
-//! compare equal. Operators (`->`, `->>`, `@>`) parse the canonical text on demand.
+//! parsed with `serde_json`, then re-serialized by [`to_text`]. Object keys are emitted in the
+//! reference engine's `jsonb` order — shorter keys first, then bytewise — and insignificant
+//! whitespace is dropped, giving JSONB semantics where `{"b":2,"aa":1}` and `{ "aa": 1, "b": 2 }`
+//! normalize to the same text and so compare equal. Operators (`->`, `->>`, `@>`) parse the
+//! canonical text on demand.
 
 use serde_json::Value as J;
 
-/// Parse + canonicalize `s`, or `None` if it is not valid JSON. Goes through [`parse`], so numbers
-/// reach their canonical decimal form rather than being echoed as written.
+/// Parse + canonicalize `s`, or `None` if it is not valid JSON.
+///
+/// Goes through [`parse`], so numbers reach their canonical decimal form rather than being echoed as
+/// written, and through [`to_text`], so object keys land in the reference engine's `jsonb` order.
 #[must_use]
 pub fn canonicalize(s: &str) -> Option<String> {
-    serde_json::to_string(&parse(s)?).ok()
+    Some(to_text(&parse(s)?))
 }
 
 /// Parse JSON text into a [`serde_json::Value`].
@@ -54,10 +57,50 @@ fn normalize_numbers(value: &mut J) {
     }
 }
 
-/// Serialize a [`serde_json::Value`] back to canonical text.
+/// Serialize a [`serde_json::Value`] back to canonical (compact) text.
+///
+/// Object keys are emitted in the reference engine's `jsonb` order — shorter keys first, then
+/// bytewise — rather than `serde_json`'s pure-bytewise map order, so a document's canonical form (and
+/// therefore its text output, equality and `DISTINCT`) agrees with it. Arrays keep element order and
+/// scalars use `serde_json`'s rendering (so number normalization and string escaping are unchanged).
 #[must_use]
 pub fn to_text(v: &J) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned())
+    let mut out = String::new();
+    write_canonical(v, &mut out);
+    out
+}
+
+/// Recursive worker for [`to_text`]: render `v` compactly with objects in `jsonb` key order.
+fn write_canonical(v: &J, out: &mut String) {
+    match v {
+        J::Object(map) => {
+            let mut entries: Vec<(&String, &J)> = map.iter().collect();
+            entries.sort_by(|a, b| crate::jsonb::key_order(a.0, b.0));
+            out.push('{');
+            for (i, (key, val)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&string_literal(key));
+                out.push(':');
+                write_canonical(val, out);
+            }
+            out.push('}');
+        },
+        J::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        },
+        scalar => {
+            out.push_str(&serde_json::to_string(scalar).unwrap_or_else(|_| "null".to_owned()));
+        },
+    }
 }
 
 /// Render `s` as a JSON string literal — quoted, with the necessary escaping. Used when assembling
@@ -318,7 +361,12 @@ pub fn array_elements_text(json: &str) -> Option<Vec<Option<String>>> {
 #[must_use]
 pub fn each(json: &str) -> Option<Vec<(String, String)>> {
     match parse(json)? {
-        J::Object(map) => Some(map.into_iter().map(|(k, v)| (k, to_text(&v))).collect()),
+        J::Object(map) => {
+            let mut pairs: Vec<(String, String)> =
+                map.into_iter().map(|(k, v)| (k, to_text(&v))).collect();
+            pairs.sort_by(|a, b| crate::jsonb::key_order(&a.0, &b.0));
+            Some(pairs)
+        },
         _ => None,
     }
 }
@@ -328,8 +376,9 @@ pub fn each(json: &str) -> Option<Vec<(String, String)>> {
 #[must_use]
 pub fn each_text(json: &str) -> Option<Vec<(String, Option<String>)>> {
     match parse(json)? {
-        J::Object(map) => Some(
-            map.into_iter()
+        J::Object(map) => {
+            let mut pairs: Vec<(String, Option<String>)> = map
+                .into_iter()
                 .map(|(k, v)| {
                     let text = match v {
                         J::Null => None,
@@ -338,8 +387,10 @@ pub fn each_text(json: &str) -> Option<Vec<(String, Option<String>)>> {
                     };
                     (k, text)
                 })
-                .collect(),
-        ),
+                .collect();
+            pairs.sort_by(|a, b| crate::jsonb::key_order(&a.0, &b.0));
+            Some(pairs)
+        },
         _ => None,
     }
 }
@@ -397,10 +448,56 @@ fn strip_nulls_in_place(v: &mut J) {
 
 /// `jsonb_pretty(json)` — the JSON re-serialized with indentation for readability, as `TEXT`; `None`
 /// if `json` is invalid.
+///
+/// Matches the reference engine's `jsonb_pretty`: 4-space indentation per level, a space after each
+/// object-member colon, object keys in `jsonb` order, and empty containers spread over two lines
+/// (`{\n}` / `[\n]`). A top-level scalar is rendered on one line.
 #[must_use]
 pub fn pretty(json: &str) -> Option<String> {
-    let v = parse(json)?;
-    serde_json::to_string_pretty(&v).ok()
+    let mut out = String::new();
+    write_pretty(&parse(json)?, 0, &mut out);
+    Some(out)
+}
+
+/// Recursive worker for [`pretty`]: render `v` at nesting `level` (4 spaces each).
+fn write_pretty(v: &J, level: usize, out: &mut String) {
+    let indent = |n: usize, out: &mut String| out.push_str(&"    ".repeat(n));
+    match v {
+        J::Object(map) => {
+            out.push('{');
+            let mut entries: Vec<(&String, &J)> = map.iter().collect();
+            entries.sort_by(|a, b| crate::jsonb::key_order(a.0, b.0));
+            for (i, (key, val)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                indent(level + 1, out);
+                out.push_str(&string_literal(key));
+                out.push_str(": ");
+                write_pretty(val, level + 1, out);
+            }
+            // An empty object still closes on its own line: `{\n}` (with the parent's indent).
+            out.push('\n');
+            indent(level, out);
+            out.push('}');
+        },
+        J::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                indent(level + 1, out);
+                write_pretty(item, level + 1, out);
+            }
+            out.push('\n');
+            indent(level, out);
+            out.push(']');
+        },
+        scalar => out.push_str(&to_text(scalar)),
+    }
 }
 
 /// `jsonb_object_keys(json)` — the top-level field names of a JSON object, in canonical (sorted)
@@ -408,7 +505,11 @@ pub fn pretty(json: &str) -> Option<String> {
 #[must_use]
 pub fn object_keys(json: &str) -> Option<Vec<String>> {
     match parse(json)? {
-        J::Object(map) => Some(map.keys().cloned().collect()),
+        J::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort_by(|a, b| crate::jsonb::key_order(a, b));
+            Some(keys)
+        },
         _ => None,
     }
 }
@@ -424,15 +525,41 @@ pub fn value_to_json(v: &crate::ast::Value) -> J {
         V::Null => J::Null,
         V::Bool(b) => J::Bool(*b),
         V::Int(i) => J::Number((*i).into()),
-        V::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+        V::Float(f) => float_to_json(*f),
         V::Text(s) => J::String(s.clone()),
         V::Json(s) => parse(s).unwrap_or_else(|| J::String(s.clone())),
         V::Numeric(d) => {
             serde_json::from_str(&d.format()).unwrap_or_else(|_| J::String(d.format()))
         },
+        // A temporal value uses ISO 8601 in JSON: a `T` between date and time, and `+00:00` (not a
+        // bare `+00`) on a zoned timestamp. This is JSON-specific — the general text rendering, used
+        // for display and casts, keeps its space separator and `+00` zone.
+        V::Timestamp(micros) => {
+            J::String(crate::temporal::format_timestamp(*micros).replacen(' ', "T", 1))
+        },
+        V::TimestampTz(micros) => {
+            let iso = crate::temporal::format_timestamp(*micros).replacen(' ', "T", 1);
+            J::String(format!("{iso}+00:00"))
+        },
         V::Array(items) => J::Array(items.iter().map(value_to_json).collect()),
         other => J::String(crate::display::value_text(other)),
     }
+}
+
+/// Convert an `f64` (float8) to its JSON form. A finite value uses the shortest round-trip decimal
+/// (so an integral float loses its `.0`, matching the reference: `1.0` renders as `1`); a non-finite
+/// one becomes the JSON *string* `"Infinity"` / `"-Infinity"` / `"NaN"`, as the reference does (there
+/// is no JSON number for them).
+fn float_to_json(f: f64) -> J {
+    if f.is_nan() {
+        return J::String("NaN".to_owned());
+    }
+    if f.is_infinite() {
+        return J::String(if f < 0.0 { "-Infinity" } else { "Infinity" }.to_owned());
+    }
+    // `f64`'s `Display` is the shortest round-tripping decimal without an exponent — the same form
+    // the reference engine's float-to-json uses — so parsing it as a JSON number is exact.
+    serde_json::from_str::<serde_json::Number>(&f.to_string()).map_or(J::Null, J::Number)
 }
 
 /// Build a JSON object from `(key, value)` pairs as canonical text (`json_build_object`). A
@@ -1227,6 +1354,91 @@ mod tests {
         assert_eq!(has_unique_keys_recursive("not json"), None);
         assert_eq!(has_unique_keys_recursive(r#"{"a":1,}"#), None);
         assert_eq!(has_unique_keys_recursive("{"), None);
+    }
+
+    #[test]
+    fn objects_render_in_reference_jsonb_key_order() {
+        // Keys sort by (length, then bytes): the single-char keys first (bytewise b<c), then the
+        // two-char (aa<bb), then the three-char — captured from the reference engine's jsonb.
+        assert_eq!(
+            canonicalize(r#"{"b":1,"aa":2,"zzz":3,"c":4,"bb":5}"#).unwrap(),
+            r#"{"b":1,"c":4,"aa":2,"bb":5,"zzz":3}"#
+        );
+        // The doc's example: `b` (length 1) precedes `aa` (length 2), which pure bytewise reverses.
+        assert_eq!(
+            canonicalize(r#"{"b":1,"aa":2}"#).unwrap(),
+            r#"{"b":1,"aa":2}"#
+        );
+        // The order reaches every object render, nested ones included.
+        assert_eq!(
+            canonicalize(r#"{"outer":{"bb":1,"a":2}}"#).unwrap(),
+            r#"{"outer":{"a":2,"bb":1}}"#
+        );
+        // `object_keys` and `each` report the same order.
+        assert_eq!(
+            object_keys(r#"{"b":1,"aa":2,"zzz":3}"#).unwrap(),
+            vec!["b".to_owned(), "aa".to_owned(), "zzz".to_owned()]
+        );
+        assert_eq!(
+            each(r#"{"aa":1,"b":2}"#).unwrap(),
+            vec![
+                ("b".to_owned(), "2".to_owned()),
+                ("aa".to_owned(), "1".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn value_to_json_temporal_uses_iso_8601() {
+        use crate::ast::Value as V;
+        let ts = crate::temporal::parse_timestamp("2020-01-02 03:04:05").unwrap();
+        // A timestamp gets a `T` separator and no zone; a timestamptz gets `T` and `+00:00`.
+        assert_eq!(
+            to_text(&value_to_json(&V::Timestamp(ts))),
+            r#""2020-01-02T03:04:05""#
+        );
+        assert_eq!(
+            to_text(&value_to_json(&V::TimestampTz(ts))),
+            r#""2020-01-02T03:04:05+00:00""#
+        );
+        // Date and time keep their plain ISO forms.
+        let d = crate::temporal::parse_date("2020-01-02").unwrap();
+        assert_eq!(to_text(&value_to_json(&V::Date(d))), r#""2020-01-02""#);
+    }
+
+    #[test]
+    fn value_to_json_float_matches_reference() {
+        use crate::ast::Value as V;
+        let j = |f: f64| to_text(&value_to_json(&V::Float(f)));
+        // An integral float loses its `.0`; other finite floats use the shortest decimal.
+        assert_eq!(j(1.0), "1");
+        assert_eq!(j(100.0), "100");
+        assert_eq!(j(1.5), "1.5");
+        assert_eq!(j(0.1), "0.1");
+        assert_eq!(j(-2.5), "-2.5");
+        // Large / small magnitudes expand without an exponent, like the reference.
+        assert_eq!(j(1e20), "100000000000000000000");
+        assert_eq!(j(1e-7), "0.0000001");
+        // Non-finite floats become JSON strings.
+        assert_eq!(j(f64::INFINITY), r#""Infinity""#);
+        assert_eq!(j(f64::NEG_INFINITY), r#""-Infinity""#);
+        assert_eq!(j(f64::NAN), r#""NaN""#);
+    }
+
+    #[test]
+    fn pretty_matches_reference_layout() {
+        // 4-space indent, space after colon, jsonb key order, two-line empty containers.
+        assert_eq!(
+            pretty(r#"{"b":1,"aa":{"x":[1,2,3],"y":{}},"z":[]}"#).unwrap(),
+            "{\n    \"b\": 1,\n    \"z\": [\n    ],\n    \"aa\": {\n        \"x\": [\n            1,\n            2,\n            3\n        ],\n        \"y\": {\n        }\n    }\n}"
+        );
+        // Empty containers spread over two lines.
+        assert_eq!(pretty("{}").unwrap(), "{\n}");
+        assert_eq!(pretty("[]").unwrap(), "[\n]");
+        // A top-level scalar stays on one line.
+        assert_eq!(pretty("42").unwrap(), "42");
+        assert_eq!(pretty(r#""hi""#).unwrap(), r#""hi""#);
+        assert_eq!(pretty("null").unwrap(), "null");
     }
 
     #[test]

@@ -442,3 +442,54 @@ SELECT id FROM jprec WHERE body ->> 'a' = '5'
 
 statement ok
 DROP TABLE jprec
+
+# --- JSONB key ORDER: shorter keys first, then bytewise (reference-engine jsonb order) ---
+# Captured from the reference engine: b,c (length 1) precede aa,bb (length 2) precede zzz (length 3).
+query T
+SELECT CAST(JSON '{"b":1,"aa":2,"zzz":3,"c":4,"bb":5}' AS TEXT)
+----
+{"b": 1, "c": 4, "aa": 2, "bb": 5, "zzz": 3}
+
+# `b` (length 1) precedes `aa` (length 2), which pure bytewise order would reverse.
+query T
+SELECT JSONB_OBJECT_KEYS(JSON '{"b":1,"aa":2,"zzz":3}')
+----
+b
+aa
+zzz
+
+# --- to_jsonb/to_json of a temporal value uses ISO-8601 (a `T` separator, and `+00:00` on a zoned value) ---
+query T
+SELECT CAST(TO_JSONB(TIMESTAMP '2020-01-02 03:04:05') AS TEXT)
+----
+"2020-01-02T03:04:05"
+
+query T
+SELECT CAST(TO_JSONB(CAST(TIMESTAMP '2020-01-02 03:04:05' AS TIMESTAMPTZ)) AS TEXT)
+----
+"2020-01-02T03:04:05+00:00"
+
+# --- to_jsonb(float8): an integral float loses its `.0`; a non-finite one becomes a JSON string ---
+query T
+SELECT CAST(TO_JSONB(CAST(1.0 AS DOUBLE PRECISION)) AS TEXT) || '|' || CAST(TO_JSONB(CAST(1.5 AS DOUBLE PRECISION)) AS TEXT)
+----
+1|1.5
+
+query T
+SELECT CAST(TO_JSONB(CAST('Infinity' AS DOUBLE PRECISION)) AS TEXT) || '|' || CAST(TO_JSONB(CAST('NaN' AS DOUBLE PRECISION)) AS TEXT)
+----
+"Infinity"|"NaN"
+
+# --- jsonb_pretty: reference-engine layout (exact 4-space/empty-container form is pinned by the
+# unit test `json::tests::pretty_matches_reference_layout`; here, whitespace-collapsed, it must equal
+# the canonical document in jsonb key order — `b` before `aa`, not bytewise) ---
+query T
+SELECT REGEXP_REPLACE(JSONB_PRETTY(JSON '{"aa":1,"b":2,"z":3}'), '\s+', '', 'g')
+----
+{"b":2,"z":3,"aa":1}
+
+# The pretty form indents nested members with 4 spaces (so a member line begins with them).
+query T
+SELECT REGEXP_LIKE(JSONB_PRETTY(JSON '{"a":1}'), CHR(10) || '    "a": 1')
+----
+1

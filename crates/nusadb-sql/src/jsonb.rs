@@ -73,7 +73,7 @@ pub fn is_binary(bytes: &[u8]) -> bool {
 /// The order object keys are held in: shorter keys first, then bytewise. This is the reference
 /// engine's `jsonb` key order; matching it keeps a document's canonical bytes — and so equality,
 /// `DISTINCT` and text output — agreeing with it.
-fn key_order(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn key_order(a: &str, b: &str) -> std::cmp::Ordering {
     a.len()
         .cmp(&b.len())
         .then_with(|| a.as_bytes().cmp(b.as_bytes()))

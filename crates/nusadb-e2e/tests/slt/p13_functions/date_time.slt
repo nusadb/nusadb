@@ -408,3 +408,52 @@ query R
 SELECT EXTRACT(DAY FROM INTERVAL '1 year 2 mons 10 days')
 ----
 10.000
+
+# --- TO_CHAR: extended template codes (quarter, weeks, century, Julian, ISO year, Roman month,
+# seconds-past-midnight, comma year, era) — every expected value captured from the reference engine ---
+query T
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 13:45:30', 'Q|WW|W|CC|J|IW|IYYY|IYY|IY|I')
+----
+2|24|3|21|2460477|24|2024|024|24|4
+
+# Roman month is blank-padded to 4 (the width of "VIII"); the lowercase form matches case.
+query T
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 13:45:30', 'RM') || '/' || TO_CHAR(TIMESTAMP '2024-06-15 13:45:30', 'rm')
+----
+VI  /vi  
+
+# Seconds past midnight (SSSS/SSSSS, never zero-padded) and the comma year (Y,YYY).
+query T
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 13:45:30', 'SSSS') || '|' || TO_CHAR(TIMESTAMP '2024-06-15 13:45:30', 'Y,YYY')
+----
+49530|2,024
+
+# The era reflects the year (an AD date is "AD"/"A.D." regardless of the BC/AD template letters).
+query T
+SELECT TO_CHAR(DATE '2024-01-01', 'BC') || '|' || TO_CHAR(DATE '2024-01-01', 'A.D.')
+----
+AD|A.D.
+
+# ISO year diverges from the Gregorian year at the boundary: 2023-01-01 is ISO week 52 of 2022.
+query T
+SELECT TO_CHAR(DATE '2023-01-01', 'IYYY-"W"IW')
+----
+2022-W52
+
+# An unknown letter run still passes through verbatim, and RN/rn stay literal in a datetime template.
+query T
+SELECT TO_CHAR(DATE '2024-06-15', 'ZZZ') || '|' || TO_CHAR(DATE '2024-06-15', 'RN')
+----
+ZZZ|RN
+
+# --- TO_CHAR: `th`/`TH` ordinal suffix on the preceding numeric field ---
+query T
+SELECT TO_CHAR(DATE '2024-01-21', 'DDth') || ' ' || TO_CHAR(DATE '2024-01-22', 'DDth') || ' ' || TO_CHAR(DATE '2024-01-23', 'DDth') || ' ' || TO_CHAR(DATE '2024-01-04', 'DDth')
+----
+21st 22nd 23rd 04th
+
+# TH upper-cases the suffix; a th not adjacent to a number is a plain literal.
+query T
+SELECT TO_CHAR(DATE '2024-01-21', 'DDTH') || '|' || TO_CHAR(DATE '2024-01-21', 'DD th')
+----
+21ST|21 th

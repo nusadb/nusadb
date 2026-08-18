@@ -769,13 +769,184 @@ enum FmtToken {
     Milli,
     /// `US` — microsecond (6 digits).
     Micro,
+    /// `Q` — quarter of the year, `1..4`.
+    Quarter,
+    /// `WW` — week of the year, `1 + (doy - 1) / 7` (2 digits).
+    WeekOfYear,
+    /// `W` — week of the month, `1 + (day - 1) / 7`.
+    WeekOfMonth,
+    /// `CC` — century, `(year - 1) / 100 + 1` (2 digits).
+    Century,
+    /// `J` — Julian day number (days since 4714-11-24 BC, proleptic Gregorian).
+    JulianDay,
+    /// `IW` — ISO 8601 week of the year (2 digits).
+    IsoWeek,
+    /// `IYYY`/`IYY`/`IY`/`I` — the last 4/3/2/1 digits of the ISO 8601 year (the `usize` is the
+    /// digit count).
+    IsoYear(usize),
+    /// `RM`/`rm` — the month as an uppercase / lowercase Roman numeral `I..XII` (the bool is upper
+    /// case), blank-padded to 4 (the width of `VIII`).
+    RomanMonth(bool),
+    /// `SSSS`/`SSSSS` — seconds past midnight, `0..86399` (no zero padding).
+    SecondsPastMidnight,
+    /// `Y,YYY` — the 4-digit year with a comma before its last three digits (`2,024`).
+    YearComma,
+    /// `AD`/`BC`/`A.D.`/`B.C.` — the era of the value (`first`: upper case, `second`: with dots).
+    /// The rendered era reflects the year, not the template letters (`BC` on an AD date is `AD`).
+    Era(bool, bool),
     /// `AM`/`PM` (the bool is whether to render upper case).
     Meridiem(bool),
+    /// `th`/`TH` — the English ordinal suffix (`st`/`nd`/`rd`/`th`) of the *preceding* numeric
+    /// field (the bool is upper case). Emitted only immediately after a numeric field.
+    OrdinalSuffix(bool),
     /// `FM` — fill-mode modifier: suppress the leading zeros / trailing blanks of the *next* field.
     /// Emits nothing itself.
     FillMode,
     /// Verbatim text (a quoted `"..."` run, a separator, or any unrecognised character).
     Literal(String),
+}
+
+/// Whether a token renders a bare number, so an immediately following `th`/`TH` becomes its ordinal
+/// suffix. Name/era/roman/meridiem fields are not numeric.
+const fn is_numeric_field(tok: &FmtToken) -> bool {
+    use FmtToken as T;
+    matches!(
+        tok,
+        T::Year4
+            | T::Year2
+            | T::MonthNum
+            | T::Day2
+            | T::DayOfYear
+            | T::IsoDayOfYear
+            | T::DayOfWeek
+            | T::IsoDayOfWeek
+            | T::Hour24
+            | T::Hour12
+            | T::Minute
+            | T::Second
+            | T::Milli
+            | T::Micro
+            | T::Quarter
+            | T::WeekOfYear
+            | T::WeekOfMonth
+            | T::Century
+            | T::JulianDay
+            | T::IsoWeek
+            | T::IsoYear(_)
+            | T::SecondsPastMidnight
+    )
+}
+
+/// The Roman-numeral form of a month `1..=12` (`I`..`XII`); empty for an out-of-range month.
+const fn roman_month(month: i64) -> &'static str {
+    match month {
+        1 => "I",
+        2 => "II",
+        3 => "III",
+        4 => "IV",
+        5 => "V",
+        6 => "VI",
+        7 => "VII",
+        8 => "VIII",
+        9 => "IX",
+        10 => "X",
+        11 => "XI",
+        12 => "XII",
+        _ => "",
+    }
+}
+
+/// The English ordinal suffix of `n` (`st`/`nd`/`rd`/`th`), in the requested case. Numbers whose last
+/// two digits are 11–13 always take `th`.
+fn ordinal_suffix(n: i64, upper: bool) -> &'static str {
+    // 11–13 (by the last two digits) always take `th`; otherwise the last digit picks the suffix.
+    let lower = if (11..=13).contains(&n.rem_euclid(100)) {
+        "th"
+    } else {
+        match n.rem_euclid(10) {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    match (lower, upper) {
+        ("st", true) => "ST",
+        ("nd", true) => "ND",
+        ("rd", true) => "RD",
+        (_, true) => "TH",
+        (other, false) => other,
+    }
+}
+
+/// The calendar + clock components of the instant being formatted, so [`numeric_field`] can be a
+/// free function rather than a giant closure inside [`format_with_pattern`].
+struct TimeParts {
+    y: i64,
+    m: i64,
+    d: i64,
+    h: i64,
+    mi: i64,
+    s: i64,
+    us: i64,
+    days: i64,
+}
+
+/// The `(value, zero-pad width)` a numeric `TO_CHAR` field renders, or `None` for a non-numeric
+/// token. Kept in lockstep with [`is_numeric_field`].
+fn numeric_field(tok: &FmtToken, p: &TimeParts) -> Option<(i64, usize)> {
+    // ISO weekday 1 = Monday .. 7 = Sunday.
+    let iso_dow = match (p.days + 4).rem_euclid(7) {
+        0 => 7,
+        w => w,
+    };
+    Some(match tok {
+        FmtToken::Year4 => (p.y, 4),
+        FmtToken::Year2 => (p.y.rem_euclid(100), 2),
+        FmtToken::MonthNum => (p.m, 2),
+        FmtToken::Day2 => (p.d, 2),
+        FmtToken::DayOfYear => (p.days - days_from_civil(p.y, 1, 1) + 1, 3),
+        // ISO day of year: within an ISO year, week W day D (1=Mon..7=Sun) is the `(W-1)*7 + D`-th
+        // day. `iso_week` handles Jan/Dec dates in the adjacent ISO year.
+        FmtToken::IsoDayOfYear => ((iso_week(p.days, p.y) - 1) * 7 + iso_dow, 3),
+        // 1 = Sunday .. 7 = Saturday.
+        FmtToken::DayOfWeek => ((p.days + 4).rem_euclid(7) + 1, 1),
+        FmtToken::IsoDayOfWeek => (iso_dow, 1),
+        FmtToken::Hour24 => (p.h, 2),
+        FmtToken::Hour12 => ((p.h + 11) % 12 + 1, 2),
+        FmtToken::Minute => (p.mi, 2),
+        FmtToken::Second => (p.s, 2),
+        FmtToken::Milli => (p.us / 1000, 3),
+        FmtToken::Micro => (p.us, 6),
+        FmtToken::Quarter => ((p.m - 1) / 3 + 1, 1),
+        FmtToken::WeekOfYear => ((p.days - days_from_civil(p.y, 1, 1)) / 7 + 1, 2),
+        FmtToken::WeekOfMonth => ((p.d - 1) / 7 + 1, 1),
+        // Century: 2001..2100 is century 21, matching `(year - 1) / 100 + 1`.
+        FmtToken::Century => ((p.y - 1).div_euclid(100) + 1, 2),
+        // Julian day number: day 0 (1970-01-01) is JDN 2_440_588.
+        FmtToken::JulianDay => (p.days + 2_440_588, 1),
+        FmtToken::IsoWeek => (iso_week(p.days, p.y), 2),
+        FmtToken::IsoYear(digits) => {
+            let modulus = 10_i64.pow(u32::try_from(*digits).unwrap_or(4));
+            (iso_year(p.days).rem_euclid(modulus), *digits)
+        },
+        // Seconds past midnight, 0..86399 (never zero-padded, so a width of 1).
+        FmtToken::SecondsPastMidnight => (p.h * 3600 + p.mi * 60 + p.s, 1),
+        _ => return None,
+    })
+}
+
+/// The ISO 8601 calendar year the day `days` belongs to (the Gregorian year of the Thursday of its
+/// ISO week).
+const fn iso_year(days: i64) -> i64 {
+    let iso_dow = match (days + 4).rem_euclid(7) {
+        0 => 7,
+        w => w,
+    };
+    // The Thursday of the current ISO week fixes the ISO year (weeks 1..53 all contain their year's
+    // Thursday). ISO weekday 1=Mon..7=Sun, so Thursday is `days + (4 - iso_dow)`.
+    let (thursday_year, _, _) = civil_from_days(days + 4 - iso_dow);
+    thursday_year
 }
 
 /// Detect the capitalisation style of a matched name pattern from its original characters.
@@ -802,10 +973,33 @@ fn ci_prefix(s: &[char], pat: &str) -> bool {
 }
 
 /// Match the longest known format token at the start of `s`, returning it and its char width.
+///
+/// `th`/`TH` is deliberately *not* matched here: it is an ordinal-suffix modifier that
+/// [`tokenize_format`] only recognises immediately after a numeric field, so a bare `th` stays a
+/// literal (as the reference engine renders it).
 fn match_pattern(s: &[char]) -> Option<(FmtToken, usize)> {
     use FmtToken as T;
     let name_case = |len: usize| s.get(..len).map_or(NameCase::Title, detect_case);
-    // Longest patterns first so `HH24` wins over `HH`, `YYYY` over `YY`, `MONTH` over `MON`/`MM`.
+    let upper = || s.first().is_some_and(char::is_ascii_uppercase);
+    // Multi-character / case-bearing patterns whose token depends on the matched text are handled
+    // first, longest form before its prefix (`A.D.` before `AD`, `Y,YYY` before `YYYY`).
+    if ci_prefix(s, "A.D.") {
+        return Some((T::Era(upper(), true), 4));
+    }
+    if ci_prefix(s, "B.C.") {
+        return Some((T::Era(upper(), true), 4));
+    }
+    if ci_prefix(s, "Y,YYY") {
+        return Some((T::YearComma, 5));
+    }
+    if ci_prefix(s, "RM") {
+        return Some((T::RomanMonth(upper()), 2));
+    }
+    if ci_prefix(s, "AD") || ci_prefix(s, "BC") {
+        return Some((T::Era(upper(), false), 2));
+    }
+    // Longest patterns first so `HH24` wins over `HH`, `YYYY` over `YY`, `MONTH` over `MON`/`MM`,
+    // `IYYY` over `IYY`/`IY`/`I`, `SSSSS` over `SSSS`/`SS`, `WW` over `W`.
     let candidates: &[(&str, usize)] = &[
         ("HH24", 0),
         ("HH12", 1),
@@ -823,8 +1017,20 @@ fn match_pattern(s: &[char]) -> Option<(FmtToken, usize)> {
         ("DD", 10),
         ("DY", 16),
         ("IDDD", 18),
+        ("IYYY", 20),
+        ("IYY", 21),
+        ("IW", 24),
+        ("IY", 22),
         ("ID", 15),
+        ("I", 23),
+        ("SSSSS", 30),
+        ("SSSS", 30),
         ("SS", 11),
+        ("WW", 25),
+        ("W", 26),
+        ("CC", 27),
+        ("J", 28),
+        ("Q", 29),
         ("AM", 12),
         ("PM", 12),
         ("FM", 19),
@@ -832,7 +1038,7 @@ fn match_pattern(s: &[char]) -> Option<(FmtToken, usize)> {
     ];
     for (pat, id) in candidates {
         if ci_prefix(s, pat) {
-            let len = pat.len();
+            let len = pat.chars().count();
             let tok = match id {
                 0 => T::Hour24,
                 1 => T::Hour12,
@@ -853,6 +1059,17 @@ fn match_pattern(s: &[char]) -> Option<(FmtToken, usize)> {
                 17 => T::WeekdayFull(name_case(len)),
                 18 => T::IsoDayOfYear,
                 19 => T::FillMode,
+                20 => T::IsoYear(4),
+                21 => T::IsoYear(3),
+                22 => T::IsoYear(2),
+                23 => T::IsoYear(1),
+                24 => T::IsoWeek,
+                25 => T::WeekOfYear,
+                26 => T::WeekOfMonth,
+                27 => T::Century,
+                28 => T::JulianDay,
+                29 => T::Quarter,
+                30 => T::SecondsPastMidnight,
                 _ => T::Meridiem(s.first().is_some_and(char::is_ascii_uppercase)),
             };
             return Some((tok, len));
@@ -882,8 +1099,19 @@ fn tokenize_format(fmt: &str) -> Vec<FmtToken> {
             continue;
         }
         if let Some((tok, len)) = match_pattern(chars.get(i..).unwrap_or_default()) {
+            let numeric = is_numeric_field(&tok);
             tokens.push(tok);
             i += len;
+            // A `th`/`TH` immediately after a numeric field is its ordinal suffix; anywhere else it
+            // is a plain literal (a separator or a bare `th` renders verbatim, like the reference).
+            if numeric
+                && let (Some(&c0), Some(&c1)) = (chars.get(i), chars.get(i + 1))
+                && c0.eq_ignore_ascii_case(&'t')
+                && c1.eq_ignore_ascii_case(&'h')
+            {
+                tokens.push(FmtToken::OrdinalSuffix(c0.is_ascii_uppercase()));
+                i += 2;
+            }
             continue;
         }
         tokens.push(FmtToken::Literal(c.to_string()));
@@ -949,50 +1177,83 @@ fn weekday_name(days: i64, table: &[&str; 7], case: NameCase) -> String {
 pub fn format_with_pattern(micros: i64, fmt: &str) -> String {
     let (y, m, d, h, mi, s, us) = decompose_micros(micros);
     let days = micros.div_euclid(MICROS_PER_DAY);
+    let parts = TimeParts {
+        y,
+        m,
+        d,
+        h,
+        mi,
+        s,
+        us,
+        days,
+    };
     let mut out = String::new();
     // `FM` sets fill mode for the next field only; it emits nothing and does not itself reset the
     // flag. A literal between `FM` and its field passes the flag through; every rendered field
     // consumes and clears it.
     let mut fill = false;
+    // The numeric value of the most recently rendered numeric field, so an immediately following
+    // `th`/`TH` can form its ordinal suffix. Cleared by any non-numeric field.
+    let mut last_num: Option<i64> = None;
     for tok in tokenize_format(fmt) {
         if matches!(tok, FmtToken::FillMode) {
             fill = true;
             continue;
         }
         let is_literal = matches!(tok, FmtToken::Literal(_));
+        let is_ordinal = matches!(tok, FmtToken::OrdinalSuffix(_));
+        if let Some((value, width)) = numeric_field(&tok, &parts) {
+            out.push_str(&num_field(value, width, fill));
+            last_num = Some(value);
+            fill = false;
+            continue;
+        }
         match tok {
-            FmtToken::Year4 => out.push_str(&num_field(y, 4, fill)),
-            FmtToken::Year2 => out.push_str(&num_field(y.rem_euclid(100), 2, fill)),
-            FmtToken::MonthNum => out.push_str(&num_field(m, 2, fill)),
+            FmtToken::OrdinalSuffix(upper) => {
+                if let Some(n) = last_num {
+                    out.push_str(ordinal_suffix(n, upper));
+                }
+            },
+            FmtToken::YearComma => {
+                // The 4-digit (min) year with a comma before its last three digits: 2024 -> "2,024".
+                let digits = format!("{y:04}");
+                let split = digits.len() - 3;
+                out.push_str(digits.get(..split).unwrap_or_default());
+                out.push(',');
+                out.push_str(digits.get(split..).unwrap_or_default());
+            },
+            FmtToken::Era(upper, dotted) => {
+                let ad = y >= 1;
+                out.push_str(match (ad, upper, dotted) {
+                    (true, true, false) => "AD",
+                    (true, false, false) => "ad",
+                    (true, true, true) => "A.D.",
+                    (true, false, true) => "a.d.",
+                    (false, true, false) => "BC",
+                    (false, false, false) => "bc",
+                    (false, true, true) => "B.C.",
+                    (false, false, true) => "b.c.",
+                });
+            },
+            FmtToken::RomanMonth(upper) => {
+                let roman = roman_month(m);
+                let cased = if upper {
+                    roman.to_owned()
+                } else {
+                    roman.to_lowercase()
+                };
+                // Blank-padded to 4 (the width of "VIII") unless `FM` suppresses the padding.
+                if fill {
+                    out.push_str(&cased);
+                } else {
+                    let _ = write!(out, "{cased:<4}");
+                }
+            },
             FmtToken::MonthAbbr(case) => out.push_str(&month_name(m, &MONTH_ABBR, case)),
             // The full month name is blank-padded to the longest month's width (9 = "September")
             // unless `FM` suppresses the padding.
             FmtToken::MonthFull(case) => {
                 out.push_str(&name_field(&month_name(m, &MONTH_FULL, case), fill));
-            },
-            FmtToken::Day2 => out.push_str(&num_field(d, 2, fill)),
-            FmtToken::DayOfYear => {
-                out.push_str(&num_field(days - days_from_civil(y, 1, 1) + 1, 3, fill));
-            },
-            FmtToken::IsoDayOfYear => {
-                // ISO day of year: within an ISO year, week W (ISO) day D (1=Mon..7=Sun) is the
-                // `(W-1)*7 + D`-th day. `iso_week` already handles Jan/Dec dates that belong to the
-                // adjacent ISO year, so this counts from the Monday of that ISO year's week 1.
-                let iso_dow = match (days + 4).rem_euclid(7) {
-                    0 => 7,
-                    w => w,
-                };
-                out.push_str(&num_field((iso_week(days, y) - 1) * 7 + iso_dow, 3, fill));
-            },
-            // 1 = Sunday .. 7 = Saturday (already single-digit, so `FM` has no effect).
-            FmtToken::DayOfWeek => out.push_str(&num_field((days + 4).rem_euclid(7) + 1, 1, fill)),
-            FmtToken::IsoDayOfWeek => {
-                // 1 = Monday .. 7 = Sunday.
-                let iso = match (days + 4).rem_euclid(7) {
-                    0 => 7,
-                    w => w,
-                };
-                out.push_str(&num_field(iso, 1, fill));
             },
             FmtToken::WeekdayAbbr(case) => out.push_str(&weekday_name(days, &WEEKDAY_ABBR, case)),
             // The full weekday name is blank-padded to the longest name's width (9 = "Wednesday")
@@ -1000,12 +1261,6 @@ pub fn format_with_pattern(micros: i64, fmt: &str) -> String {
             FmtToken::WeekdayFull(case) => {
                 out.push_str(&name_field(&weekday_name(days, &WEEKDAY_FULL, case), fill));
             },
-            FmtToken::Hour24 => out.push_str(&num_field(h, 2, fill)),
-            FmtToken::Hour12 => out.push_str(&num_field((h + 11) % 12 + 1, 2, fill)),
-            FmtToken::Minute => out.push_str(&num_field(mi, 2, fill)),
-            FmtToken::Second => out.push_str(&num_field(s, 2, fill)),
-            FmtToken::Milli => out.push_str(&num_field(us / 1000, 3, fill)),
-            FmtToken::Micro => out.push_str(&num_field(us, 6, fill)),
             FmtToken::Meridiem(upper) => {
                 out.push_str(match (h < 12, upper) {
                     (true, true) => "AM",
@@ -1015,12 +1270,17 @@ pub fn format_with_pattern(micros: i64, fmt: &str) -> String {
                 });
             },
             FmtToken::Literal(lit) => out.push_str(&lit),
-            // `FillMode` is handled before the match.
-            FmtToken::FillMode => {},
+            // `FillMode` is handled before the match and every numeric field is handled above, so
+            // the remaining tokens (and the unreachable `FillMode`) render nothing here.
+            _ => {},
         }
-        // A field consumes the fill flag; a literal leaves it pending for the next field.
+        // A non-numeric field ends any run a `th`/`TH` could suffix (a `th` after a name renders
+        // nothing) and consumes a pending fill flag; a literal leaves both pending.
         if !is_literal {
             fill = false;
+            if !is_ordinal {
+                last_num = None;
+            }
         }
     }
     out
@@ -1124,10 +1384,6 @@ pub fn parse_with_pattern(input: &str, fmt: &str) -> Option<i64> {
             },
             FmtToken::Day2 => day = take_int(&inp, &mut pos, 2)?,
             FmtToken::DayOfYear => day_of_year = Some(take_int(&inp, &mut pos, 3)?),
-            // Reconstructing a date from the ISO day of year needs the ISO year (`IYYY`), which the
-            // format engine does not model, so `IDDD` is not accepted on the parse side (loud-fail
-            // rather than silently ignore a field that does constrain the date).
-            FmtToken::IsoDayOfYear => return None,
             // A weekday does not constrain the calendar date, so these are consumed and ignored.
             FmtToken::DayOfWeek | FmtToken::IsoDayOfWeek => {
                 take_int(&inp, &mut pos, 1)?;
@@ -1148,7 +1404,27 @@ pub fn parse_with_pattern(input: &str, fmt: &str) -> Option<i64> {
             // `FM` is a modifier: on the parse side it relaxes fixed-width matching, and `take_int`
             // already accepts a variable number of digits, so it consumes no input here.
             FmtToken::FillMode => {},
+            // An ordinal suffix (`th`/`TH`) does not constrain the value; consume the two letters.
+            FmtToken::OrdinalSuffix(_) => {
+                pos += 2;
+            },
             FmtToken::Literal(lit) => consume_literal(&inp, &mut pos, &lit)?,
+            // Fields that either do not model back into a calendar date (`Q`/`WW`/`W`/`CC`/`IW`/
+            // `SSSS`/era/Roman month/ISO day-of-year) or would need machinery the format engine does
+            // not carry (`J`/`IYYY`…) are loud-rejected on the parse side rather than silently
+            // ignored (`IDDD` would need the ISO year, which is not modelled).
+            FmtToken::IsoDayOfYear
+            | FmtToken::Quarter
+            | FmtToken::WeekOfYear
+            | FmtToken::WeekOfMonth
+            | FmtToken::Century
+            | FmtToken::JulianDay
+            | FmtToken::IsoWeek
+            | FmtToken::IsoYear(_)
+            | FmtToken::RomanMonth(_)
+            | FmtToken::SecondsPastMidnight
+            | FmtToken::YearComma
+            | FmtToken::Era(_, _) => return None,
         }
     }
     if let Some(doy) = day_of_year {
@@ -1538,6 +1814,128 @@ mod tests {
         assert_eq!(format_with_pattern(ts, "FMHH24:MI"), "9:03");
         // A full date in fill mode, the reference engine's `FMDD FMMonth YYYY` shape.
         assert_eq!(format_with_pattern(ts, "FMDD FMMonth YYYY"), "5 June 2024");
+    }
+
+    #[test]
+    fn format_with_pattern_new_codes_match_reference() {
+        // All expected outputs captured from the reference engine for 2024-06-15 13:45:30.
+        let ts = parse_timestamp("2024-06-15 13:45:30").unwrap();
+        let f = |fmt: &str| format_with_pattern(ts, fmt);
+        assert_eq!(f("Q"), "2");
+        assert_eq!(f("WW"), "24");
+        assert_eq!(f("W"), "3");
+        assert_eq!(f("CC"), "21");
+        assert_eq!(f("J"), "2460477");
+        assert_eq!(f("IW"), "24");
+        assert_eq!(f("IYYY"), "2024");
+        assert_eq!(f("IYY"), "024");
+        assert_eq!(f("IY"), "24");
+        assert_eq!(f("I"), "4");
+        assert_eq!(f("RM"), "VI  ");
+        assert_eq!(f("rm"), "vi  ");
+        assert_eq!(f("SSSS"), "49530");
+        assert_eq!(f("SSSSS"), "49530");
+        assert_eq!(f("Y,YYY"), "2,024");
+        // The era reflects the year, not the template letters, and keeps the template's case + dots.
+        assert_eq!(f("BC"), "AD");
+        assert_eq!(f("AD"), "AD");
+        assert_eq!(f("B.C."), "A.D.");
+        assert_eq!(f("A.D."), "A.D.");
+        assert_eq!(f("ad"), "ad");
+        assert_eq!(f("a.d."), "a.d.");
+        // `RN`/`rn` are numeric-only in the reference engine; a datetime template emits them
+        // verbatim (`R` and `N` are plain literals), which this already does.
+        assert_eq!(f("RN"), "RN");
+        assert_eq!(f("rn"), "rn");
+        // Lower-case spellings of the value codes are accepted (case-insensitive), same values.
+        assert_eq!(f("q ww cc j iw iyyy ssss"), "2 24 21 2460477 24 2024 49530");
+        // An unknown letter run still passes through as a literal (matching the reference).
+        assert_eq!(f("ZZZ"), "ZZZ");
+        // `W` is a code even inside a word: `Week` -> week-of-month `3` then literal `eek`.
+        assert_eq!(f("Week"), "3eek");
+    }
+
+    #[test]
+    fn format_with_pattern_century_julian_and_iso_year_edges() {
+        let cc = |s: &str| format_with_pattern(parse_timestamp(s).unwrap(), "CC");
+        assert_eq!(cc("2000-01-01 00:00:00"), "20");
+        assert_eq!(cc("2001-01-01 00:00:00"), "21");
+        assert_eq!(cc("1999-12-31 00:00:00"), "20");
+        let j = |s: &str| format_with_pattern(parse_timestamp(s).unwrap(), "J");
+        assert_eq!(j("1970-01-01 00:00:00"), "2440588");
+        assert_eq!(j("2000-01-01 00:00:00"), "2451545");
+        // ISO year differs from the Gregorian year at the boundaries.
+        let iso = |s: &str, fmt: &str| format_with_pattern(parse_timestamp(s).unwrap(), fmt);
+        // 2023-01-01 (Sunday) belongs to ISO week 52 of ISO-year 2022.
+        assert_eq!(iso("2023-01-01 00:00:00", "IYYY-IW"), "2022-52");
+        assert_eq!(iso("2023-01-01 00:00:00", "IYY IY I"), "022 22 2");
+        // 2021-01-01 (Friday) belongs to ISO week 53 of ISO-year 2020.
+        assert_eq!(iso("2021-01-01 00:00:00", "IYYY IW"), "2020 53");
+        // Week-of-year / week-of-month boundaries.
+        let wy = |s: &str| format_with_pattern(parse_timestamp(s).unwrap(), "WW");
+        assert_eq!(wy("2024-01-08 00:00:00"), "02");
+        assert_eq!(wy("2024-12-31 00:00:00"), "53");
+        // Roman month for August is the widest form (VIII); `FM` strips the blank padding.
+        let aug = parse_timestamp("2024-08-15 00:00:00").unwrap();
+        assert_eq!(format_with_pattern(aug, "RM"), "VIII");
+        assert_eq!(format_with_pattern(aug, "FMRM"), "VIII");
+        assert_eq!(format_with_pattern(aug, "FMrm"), "viii");
+        // `Y,YYY` on a small year keeps its 4-digit-with-comma shape, even under `FM`.
+        let yr7 = parse_timestamp("0007-01-01 00:00:00").unwrap();
+        assert_eq!(format_with_pattern(yr7, "Y,YYY"), "0,007");
+        assert_eq!(format_with_pattern(yr7, "FMY,YYY"), "0,007");
+    }
+
+    #[test]
+    fn format_with_pattern_ordinal_suffix_matches_reference() {
+        // The suffix is the English ordinal of the preceding number's value (11–13 always `th`).
+        let dd = |day: i64| {
+            let ts = parse_timestamp(&format!("2024-01-{day:02} 00:00:00")).unwrap();
+            format_with_pattern(ts, "DDth")
+        };
+        assert_eq!(dd(1), "01st");
+        assert_eq!(dd(2), "02nd");
+        assert_eq!(dd(3), "03rd");
+        assert_eq!(dd(4), "04th");
+        assert_eq!(dd(11), "11th");
+        assert_eq!(dd(12), "12th");
+        assert_eq!(dd(13), "13th");
+        assert_eq!(dd(21), "21st");
+        assert_eq!(dd(22), "22nd");
+        assert_eq!(dd(23), "23rd");
+        assert_eq!(dd(24), "24th");
+        assert_eq!(dd(31), "31st");
+        let ts = parse_timestamp("2024-06-15 13:45:30").unwrap();
+        // `TH` upper-cases the suffix, and it attaches to any numeric field.
+        assert_eq!(format_with_pattern(ts, "DDTH"), "15TH");
+        assert_eq!(format_with_pattern(ts, "YYYYth"), "2024th");
+        assert_eq!(format_with_pattern(ts, "MMth"), "06th");
+        assert_eq!(format_with_pattern(ts, "HH24th"), "13th");
+        assert_eq!(format_with_pattern(ts, "DDDth"), "167th");
+        // `FM` strips the field's zero-padding but the suffix still comes from the value.
+        let d5 = parse_timestamp("2024-01-05 00:00:00").unwrap();
+        assert_eq!(format_with_pattern(d5, "FMDDth"), "5th");
+        // A `th` not immediately after a number is a plain literal (matching the reference).
+        assert_eq!(format_with_pattern(ts, "DD th"), "15 th");
+        assert_eq!(format_with_pattern(ts, "th"), "th");
+    }
+
+    #[test]
+    fn format_with_pattern_combined_formats_match_reference() {
+        // Full realistic formats mixing old and new codes, captured from the reference engine.
+        let ts = parse_timestamp("2024-06-15 13:45:30").unwrap();
+        assert_eq!(
+            format_with_pattern(
+                ts,
+                "FMDay, DDth \"of\" FMMonth YYYY \"(Q\"Q\", week \"WW\", J=\"J\")"
+            ),
+            "Saturday, 15th of June 2024 (Q2, week 24, J=2460477)"
+        );
+        let morning = parse_timestamp("2024-06-15 09:05:03").unwrap();
+        assert_eq!(
+            format_with_pattern(morning, "HH12:MI:SSam CCth \"cent\""),
+            "09:05:03am 21st cent"
+        );
     }
 
     #[test]

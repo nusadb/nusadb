@@ -5444,7 +5444,14 @@ fn containment_op(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> a
         (right, left)
     };
     if let (ast::Value::Array(big), ast::Value::Array(small)) = (container, contained) {
-        return ast::Value::Bool(small.iter().all(|elem| big.contains(elem)));
+        // A NULL element on the contained side is never matched, so its presence makes containment
+        // false (mirroring the `&&` overlap path): the explicit `!matches!(elem, Null)` guard drops
+        // it before any comparison, so a container NULL can never satisfy a contained NULL even
+        // though `value_eq(Null, Null)` is itself true.
+        let contained_all = small
+            .iter()
+            .all(|elem| !matches!(elem, ast::Value::Null) && big.iter().any(|b| value_eq(b, elem)));
+        return ast::Value::Bool(contained_all);
     }
     // JSON containment: reuse the `@>` path with the container as the left document.
     json_op(ast::BinaryOp::JsonContains, container, contained)
@@ -6104,6 +6111,48 @@ mod tests {
     fn integer_arithmetic() {
         let expr = bin(lit_int(6), BinaryOp::Plus, lit_int(7), ColumnType::Int);
         assert_eq!(eval(&expr, &vec![]).unwrap(), Value::Int(13));
+    }
+
+    #[test]
+    fn array_containment_never_matches_a_null_element() {
+        use super::containment_op;
+        // Expected verdicts captured from the reference engine: a NULL is never contained, so its
+        // presence on the contained side makes containment false.
+        let arr = |v: Vec<Value>| Value::Array(v);
+        let contains =
+            |a: Vec<Value>, b: Vec<Value>| containment_op(BinaryOp::JsonContains, &arr(a), &arr(b));
+        let contained_by = |a: Vec<Value>, b: Vec<Value>| {
+            containment_op(BinaryOp::JsonContainedBy, &arr(a), &arr(b))
+        };
+        // ARRAY[1,NULL] @> ARRAY[NULL] -> false; ARRAY[NULL] <@ ARRAY[1,NULL] -> false.
+        assert_eq!(
+            contains(vec![Value::Int(1), Value::Null], vec![Value::Null]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            contained_by(vec![Value::Null], vec![Value::Int(1), Value::Null]),
+            Value::Bool(false)
+        );
+        // A NULL on the contained side poisons an otherwise-matching set.
+        assert_eq!(
+            contains(
+                vec![Value::Int(1), Value::Null],
+                vec![Value::Int(1), Value::Null]
+            ),
+            Value::Bool(false)
+        );
+        // Non-NULL containment still works, and a NULL in the container is simply ignored.
+        assert_eq!(
+            contains(
+                vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+                vec![Value::Int(2)]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            contains(vec![Value::Int(1), Value::Null], vec![Value::Int(1)]),
+            Value::Bool(true)
+        );
     }
 
     #[test]

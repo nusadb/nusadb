@@ -180,3 +180,31 @@ SELECT x, n FROM unnest(ARRAY[]::INT[]) WITH ORDINALITY AS u(x, n)
 # WITH ORDINALITY on a non-set-returning FROM function is rejected, not silently dropped.
 statement error
 SELECT * FROM abs(5) WITH ORDINALITY AS t(a, b)
+
+# --- array @> / <@ containment with a NULL element: a NULL is never contained (reference-engine rule) ---
+query T
+SELECT CAST(ARRAY[1, CAST(NULL AS INT)] @> ARRAY[CAST(NULL AS INT)] AS TEXT)
+----
+false
+
+query T
+SELECT CAST(ARRAY[CAST(NULL AS INT)] <@ ARRAY[1, CAST(NULL AS INT)] AS TEXT)
+----
+false
+
+# A NULL on the contained side poisons an otherwise-matching set.
+query T
+SELECT CAST(ARRAY[1, CAST(NULL AS INT)] @> ARRAY[1, CAST(NULL AS INT)] AS TEXT)
+----
+false
+
+# Non-NULL containment still holds, and a NULL in the container is simply ignored.
+query T
+SELECT CAST(ARRAY[1, 2, 3] @> ARRAY[2] AS TEXT)
+----
+true
+
+query T
+SELECT CAST(ARRAY[1, CAST(NULL AS INT)] @> ARRAY[1] AS TEXT)
+----
+true
