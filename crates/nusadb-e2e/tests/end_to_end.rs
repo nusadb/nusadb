@@ -1579,6 +1579,40 @@ fn added_scalar_functions_justify_days_encode_decode_regexp_matches() {
 }
 
 #[test]
+fn regexp_dot_matches_newline_by_default_like_the_reference_engine() {
+    // The reference engine's default (no flag) is non-newline-sensitive: `.` matches a newline. Rust
+    // `regex` defaults the other way, so this was a silent divergence across every regex function.
+    let engine = BtreeEngine::new();
+    let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
+    let nl = "'a' || chr(10) || 'b'"; // the two-char value a<newline>b
+
+    // Default: `.` spans the newline → the pattern matches.
+    assert_eq!(
+        one(&format!("SELECT regexp_replace({nl}, 'a.b', 'X')")),
+        Value::Text("X".to_owned())
+    );
+    assert_eq!(
+        one(&format!("SELECT regexp_match({nl}, 'a.b') IS NOT NULL")),
+        Value::Bool(true)
+    );
+    // The `n` (newline-sensitive) flag makes `.` stop at the newline (no match) and `^`/`$` anchor at
+    // line boundaries (so `^b` matches the second line).
+    assert_eq!(
+        one(&format!("SELECT regexp_match({nl}, 'a.b', 'n') IS NULL")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&format!("SELECT regexp_match({nl}, '^b', 'n') IS NOT NULL")),
+        Value::Bool(true)
+    );
+    // `^b` without a newline flag anchors only at the string start → no match.
+    assert_eq!(
+        one(&format!("SELECT regexp_match({nl}, '^b') IS NULL")),
+        Value::Bool(true)
+    );
+}
+
+#[test]
 fn regexp_substr_matches_pg_signature() {
     // regexp_substr(string, pattern [, start int [, N int [, flags [, subexpr]]]]) — the 3rd argument
     // is a 1-based START position (integer), NOT flags (flags are 5th). Every expected value below is

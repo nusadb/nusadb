@@ -1682,16 +1682,38 @@ fn to_number_value(text: &str) -> Result<ast::Value, Error> {
 fn compile_regex(pattern: &str, flags: &str) -> Result<(regex::Regex, bool), Error> {
     let mut builder = regex::RegexBuilder::new(pattern);
     let mut global = false;
+    // The reference engine's DEFAULT is non-newline-sensitive: `.` matches a newline and `^`/`$`
+    // anchor only at the ends of the string. Rust's `regex` defaults `.` the other way, so this is
+    // set explicitly. The newline-sensitivity flags override it exactly as the reference engine does:
+    //   n / m → newline-sensitive: `.` stops at `\n`, and `^`/`$` match at line boundaries
+    //   s     → `.` matches `\n`, `^`/`$` only at the string ends (the explicit default)
+    //   p     → `.` stops at `\n`, `^`/`$` only at the string ends (partial)
+    //   w     → `.` matches `\n`, `^`/`$` match at line boundaries (inverse-partial)
+    let mut dot_matches_newline = true;
+    let mut line_anchors = false;
     for f in flags.chars() {
         match f {
             'i' => {
                 builder.case_insensitive(true);
             },
-            'm' => {
-                builder.multi_line(true);
+            'c' => {
+                builder.case_insensitive(false);
+            },
+            'n' | 'm' => {
+                dot_matches_newline = false;
+                line_anchors = true;
             },
             's' => {
-                builder.dot_matches_new_line(true);
+                dot_matches_newline = true;
+                line_anchors = false;
+            },
+            'p' => {
+                dot_matches_newline = false;
+                line_anchors = false;
+            },
+            'w' => {
+                dot_matches_newline = true;
+                line_anchors = true;
             },
             'x' => {
                 builder.ignore_whitespace(true);
@@ -1700,6 +1722,8 @@ fn compile_regex(pattern: &str, flags: &str) -> Result<(regex::Regex, bool), Err
             other => return Err(Error::InvalidRegex(format!("unsupported flag '{other}'"))),
         }
     }
+    builder.dot_matches_new_line(dot_matches_newline);
+    builder.multi_line(line_anchors);
     let re = builder
         .build()
         .map_err(|e| Error::InvalidRegex(e.to_string()))?;
