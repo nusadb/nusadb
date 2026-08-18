@@ -3795,8 +3795,8 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             }
             cast_value(ast::Value::Text(t.to_owned()), target)
         },
-        _ => Err(Error::InvalidStatement(format!(
-            "CAST from {:?} to {:?} not supported",
+        _ => Err(Error::CannotCoerce(format!(
+            "cannot cast from {:?} to {:?}",
             runtime_type(&value),
             target,
         ))),

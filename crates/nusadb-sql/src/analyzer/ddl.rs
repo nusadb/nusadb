@@ -239,7 +239,13 @@ fn resolve_column_defaults(
                 ));
             }
             if column.default.is_some() {
-                return Err(Error::InvalidStatement(
+                // `42P16` rather than the plain syntax error `42601`: the statement parses and the
+                // column definition contradicts itself, which is what invalid_table_definition
+                // names. This is a deliberate divergence — the widely-deployed engine reports
+                // `42601` here and keeps `42P16` for the `ON COMMIT` family — taken because the two
+                // sit in the same class and no client branches between them, so matching the
+                // standard's meaning costs nothing and reads truer.
+                return Err(Error::InvalidTableDefinition(
                     "a GENERATED column may not also have a DEFAULT".to_owned(),
                 ));
             }
@@ -271,7 +277,7 @@ fn resolve_column_defaults(
         // an explicit DEFAULT.
         if column.serial {
             if column.default.is_some() {
-                return Err(Error::InvalidStatement(
+                return Err(Error::InvalidTableDefinition(
                     "a SERIAL column may not also have a DEFAULT".to_owned(),
                 ));
             }

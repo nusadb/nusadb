@@ -3827,16 +3827,32 @@ fn run_create_view(
 }
 
 /// `REFRESH MATERIALIZED VIEW name`: re-execute the view's stored definition and replace its
-/// backing rows in place. Errors if the name is not a materialized view (no recorded definition).
+/// backing rows in place. A name that is not a materialized view gets one of two answers: `42809`
+/// if it names something else (a table or a plain view), `42P01` if it names nothing.
 fn run_refresh_materialized_view(
     name: &str,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let Some(def_sql) = load_view_def(engine, txn, MATVIEW_CATALOG, name)? else {
-        return Err(Error::InvalidStatement(format!(
-            "`{name}` is not a materialized view (no stored definition to refresh)"
-        )));
+        // Two different mistakes shared one message here. A name that is nothing at all is
+        // `42P01`; a name that exists but is a plain table or a plain view is `42809`, which tells
+        // the caller the name is right and the statement is the wrong one to use on it.
+        //
+        // A plain view has to be asked for separately: `run_create_view` stores a definition and
+        // creates no backing table, so a table lookup alone reports a view as "not found" — true of
+        // no table and false of the view the caller can see.
+        let names_something = engine.lookup_table_as_of(txn, name)?.is_some()
+            || load_view_def(engine, txn, VIEW_CATALOG, name)?.is_some();
+        return Err(if names_something {
+            Error::WrongObjectType(format!(
+                "`{name}` is not a materialized view (no stored definition to refresh)"
+            ))
+        } else {
+            Error::TableNotFound {
+                name: name.to_owned(),
+            }
+        });
     };
     let table = engine
         .lookup_table_as_of(txn, name)?

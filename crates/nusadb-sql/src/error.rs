@@ -73,6 +73,29 @@ pub enum Error {
     #[error("{0}")]
     ObjectExists(String),
 
+    /// A column the query named that is not there, in a position where no structured
+    /// [`ColumnNotFound`](Self::ColumnNotFound) is available — a `USING` join key missing from one
+    /// side, where the "table" is a join input rather than a name the caller wrote.
+    #[error("{0}")]
+    UndefinedColumn(String),
+
+    /// A `$n` placeholder reached execution without a value. Reported as `42P02`
+    /// (`undefined_parameter`) rather than a syntax error: the statement is well formed, and a
+    /// driver reads this to know it under-supplied `Bind` rather than that the SQL was wrong.
+    #[error("{0}")]
+    UndefinedParameter(String),
+
+    /// A cast between two types with no conversion between them — `42846` (`cannot_coerce`), the
+    /// class that says the pair is the problem rather than the value.
+    #[error("{0}")]
+    CannotCoerce(String),
+
+    /// The name resolves to an object of the wrong kind for this statement — `REFRESH MATERIALIZED
+    /// VIEW` naming a plain table, say. Distinct from "not there at all", which is `42P01`/`42704`:
+    /// `42809` tells the caller the name is fine and the statement is not.
+    #[error("{0}")]
+    WrongObjectType(String),
+
     /// A column reference that cannot stand where it stands: a name that matches two relations in
     /// scope, an `ORDER BY`/`GROUP BY` ordinal past the end of the select list, or a column alias
     /// list whose width disagrees with the query it names.
@@ -500,10 +523,14 @@ impl Error {
             Self::TableNotFound { .. } => "42P01", // undefined_table
             Self::TableExists { .. } => "42P07",   // duplicate_table
             Self::SchemaNotFound { .. } => "3F000", // invalid_schema_name
-            Self::ColumnNotFound { .. } => "42703", // undefined_column
+            // undefined_column — a name the query used that resolves to no column.
+            Self::ColumnNotFound { .. } | Self::UndefinedColumn(_) => "42703",
+            Self::UndefinedParameter(_) => "42P02", // undefined_parameter
+            Self::CannotCoerce(_) => "42846",       // cannot_coerce
+            Self::WrongObjectType(_) => "42809",    // wrong_object_type
             Self::DuplicateColumn { .. } => "42701", // duplicate_column
-            Self::TypeMismatch { .. } => "42804",  // datatype_mismatch
-            Self::AmbiguousNull { .. } => "42P18", // indeterminate_datatype
+            Self::TypeMismatch { .. } => "42804",   // datatype_mismatch
+            Self::AmbiguousNull { .. } => "42P18",  // indeterminate_datatype
             // Class 42501 — the role lacks the right, whether refused outright or by a row policy.
             Self::PermissionDenied(_) | Self::RlsCheckViolation { .. } => "42501",
             // undefined_function — a name the caller used that resolves to nothing callable, or a

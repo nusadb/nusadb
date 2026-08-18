@@ -723,7 +723,7 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Er
     match expr {
         ast::Expr::Parameter(n) => {
             let value = params.get(*n).cloned().ok_or_else(|| {
-                Error::InvalidStatement(format!("parameter ${} was not bound", *n + 1))
+                Error::UndefinedParameter(format!("parameter ${} was not bound", *n + 1))
             })?;
             *expr = ast::Expr::Literal(value);
             Ok(())
@@ -886,6 +886,23 @@ fn substitute_frame_bound(
 mod tests {
     use super::{bind_parameters, parameter_count};
     use crate::parser::parse;
+
+    /// Under-supplying `Bind` reports `42P02` (`undefined_parameter`), not a syntax error.
+    ///
+    /// The wire checks the count before it gets here, so this arm is defence in depth and no
+    /// pipeline test can reach it — which is exactly why it needs a test of its own. A driver that
+    /// does reach it is told it sent too few values, not that its SQL was malformed.
+    #[test]
+    fn binding_too_few_values_reports_undefined_parameter() {
+        let stmt = parse("SELECT * FROM t WHERE id = $1 AND name = $2").unwrap();
+        let err = bind_parameters(stmt, &[Some(b"1".to_vec())])
+            .expect_err("only one of two placeholders was supplied");
+        assert_eq!(err.sqlstate(), "42P02", "got {err}");
+        assert!(
+            err.to_string().contains("$2"),
+            "the message must name which placeholder is missing; got {err}"
+        );
+    }
 
     #[test]
     fn parameter_count_reports_highest_placeholder_plus_one() {

@@ -117,7 +117,7 @@ pub(super) fn analyze_expr_agg(
         },
         // A `$n` placeholder must be replaced by `bind_parameters` before analysis (extended
         // query protocol); one reaching here was never bound.
-        ast::Expr::Parameter(n) => Err(Error::InvalidStatement(format!(
+        ast::Expr::Parameter(n) => Err(Error::UndefinedParameter(format!(
             "parameter ${} was not bound (use a prepared statement with Bind)",
             n + 1
         ))),

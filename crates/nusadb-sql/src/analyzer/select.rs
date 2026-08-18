@@ -692,7 +692,7 @@ fn join_equality_predicate(
             .enumerate()
             .find(|(_, c)| &c.def.name == name)
             .ok_or_else(|| {
-                Error::InvalidStatement(format!(
+                Error::UndefinedColumn(format!(
                     "join column `{name}` is not present on the left side"
                 ))
             })?;
@@ -702,7 +702,7 @@ fn join_equality_predicate(
             .enumerate()
             .find(|(_, d)| &d.name == name)
             .ok_or_else(|| {
-                Error::InvalidStatement(format!(
+                Error::UndefinedColumn(format!(
                     "join column `{name}` is not present on the right side"
                 ))
             })?;

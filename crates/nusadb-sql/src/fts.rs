@@ -44,8 +44,8 @@ fn check_config(config: &str) -> Result<Config, Error> {
     } else if config.eq_ignore_ascii_case("english") {
         Ok(Config::English)
     } else {
-        Err(Error::Unsupported(format!(
-            "text search configuration {config:?} is not implemented (supported: 'simple', \
+        Err(Error::ObjectNotFound(format!(
+            "text search configuration {config:?} does not exist (available: 'simple', \
              'english')"
         )))
     }
@@ -1589,18 +1589,17 @@ mod tests {
 
     #[test]
     fn unknown_configuration_is_rejected() {
-        assert!(matches!(
+        // A configuration this server does not have is a name that resolves to nothing (`42704`),
+        // not a feature gap: `0A000` would invite a migration tool to skip the statement instead of
+        // telling the caller to name a configuration that exists.
+        for err in [
             to_tsvector("french", "x"),
-            Err(Error::Unsupported(_))
-        ));
-        assert!(matches!(
             to_tsquery("french", "x"),
-            Err(Error::Unsupported(_))
-        ));
-        assert!(matches!(
             plainto_tsquery("french", "x"),
-            Err(Error::Unsupported(_))
-        ));
+        ] {
+            let err = err.expect_err("an unknown configuration is refused");
+            assert_eq!(err.sqlstate(), "42704", "got {err}");
+        }
     }
 
     #[test]

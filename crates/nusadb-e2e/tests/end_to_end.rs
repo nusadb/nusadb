@@ -11137,19 +11137,9 @@ fn composite_type_recreate_column_as_composite_again_is_still_tagged() {
     );
 }
 
-/// Every kind of refusal reports the class a client acts on, checked by running the statement all
-/// the way through parse → analyze → plan → execute rather than by constructing an `Error`.
-///
-/// The mapping in `Error::sqlstate` has its own unit tests, and they pass whether or not any call
-/// site actually uses the variant they check. Reverting a single re-tagged site back to the
-/// catch-all leaves those green — which is how a site regression would ship unnoticed. These cases
-/// fail instead, because each one is a statement a user can type.
-///
-/// The `0A000` row is the load-bearing one. It is the only class that invites a client to *skip*
-/// the statement and carry on, so a mistake that leaks into it is worse than one that lands on
-/// `XX000`: the caller never learns anything went wrong.
-#[test]
-fn each_kind_of_refusal_reports_its_own_class_over_the_full_pipeline() {
+/// The fixture the refusal tests share: one ordinary table, one with a generated column, a couple
+/// of types, and a row to make runtime paths reachable.
+fn refusal_fixture() -> BtreeEngine {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, name TEXT)");
     run(
@@ -11160,9 +11150,59 @@ fn each_kind_of_refusal_reports_its_own_class_over_the_full_pipeline() {
     run(&engine, "CREATE TYPE addr AS (street TEXT, num INT)");
     run(&engine, "CREATE TABLE homes (id INT, where_ addr)");
     run(&engine, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    run(&engine, "CREATE VIEW plain_v AS SELECT id FROM t");
+    engine
+}
 
+/// Run each `(what, statement, class)` row end to end and collect every mismatch before failing.
+///
+/// Asserting row by row stops at the first one and hides the rest, which matters here: the way
+/// these tests break is a re-tag that misses several sites at once, and seeing one of them tells
+/// you least about the others.
+fn assert_refusal_classes(engine: &BtreeEngine, cases: &[(&str, &str, &str)]) {
+    let mut wrong = Vec::new();
+    for (what, sql, want) in cases {
+        match run_try(engine, sql) {
+            Err(err) if err.sqlstate() == *want => {},
+            Err(err) => wrong.push(format!(
+                "  {what}
+    {sql}
+    reported {}, wanted {want}",
+                err.sqlstate()
+            )),
+            // Collected rather than panicked on: a row that stops being refused at all must not
+            // hide the verdict of every row after it.
+            Ok(_) => wrong.push(format!(
+                "  {what}
+    {sql}
+    was not refused at all, wanted {want}"
+            )),
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} refusals report the wrong class - a client branches on this to decide whether \
+         to retry, report, or skip:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+}
+
+/// A mistake in the statement reports class `42`, checked by running it all the way through
+/// parse -> analyze -> plan -> execute rather than by constructing an `Error`.
+///
+/// The mapping in `Error::sqlstate` has its own unit tests, and they pass whether or not any call
+/// site actually uses the variant they check. Reverting a single re-tagged site back to the
+/// catch-all leaves those green - which is how a site regression would ship unnoticed. These cases
+/// fail instead, because each one is a statement a user can type.
+///
+/// Within the class the distinctions are the ones a caller can act on: not there at all, there but
+/// the wrong kind, there but used wrongly.
+#[test]
+fn a_mistake_in_the_statement_reports_its_own_class_over_the_full_pipeline() {
+    let engine = refusal_fixture();
     let cases: &[(&str, &str, &str)] = &[
-        // (what it is, statement, class it must report)
         (
             "a named object that is not there",
             "DROP ROLE nobody",
@@ -11194,11 +11234,6 @@ fn each_kind_of_refusal_reports_its_own_class_over_the_full_pipeline() {
             "42601",
         ),
         (
-            "an argument value the function will not take",
-            "SELECT generate_series(1, 10, 0)",
-            "22023",
-        ),
-        (
             "a second PRIMARY KEY on one table",
             "CREATE TABLE two (a INT PRIMARY KEY, b INT PRIMARY KEY)",
             "42P16",
@@ -11207,6 +11242,73 @@ fn each_kind_of_refusal_reports_its_own_class_over_the_full_pipeline() {
             "a name that is already taken",
             "CREATE TYPE mood AS ENUM ('ok')",
             "42710",
+        ),
+        (
+            "a cast between two types with no conversion",
+            "SELECT CAST(ARRAY[1] AS DATE)",
+            "42846",
+        ),
+        (
+            "a name that exists but is the wrong kind of object",
+            "REFRESH MATERIALIZED VIEW t",
+            "42809",
+        ),
+        (
+            "a name that is not there at all",
+            "REFRESH MATERIALIZED VIEW nosuch",
+            "42P01",
+        ),
+        (
+            "a plain view, which is something rather than nothing",
+            "REFRESH MATERIALIZED VIEW plain_v",
+            "42809",
+        ),
+        ("a placeholder that was never bound", "SELECT $1", "42P02"),
+        (
+            "a USING key present on the left but missing on the right",
+            "SELECT * FROM t JOIN gen USING (name)",
+            "42703",
+        ),
+        (
+            "a USING key missing from one side of the join",
+            "SELECT * FROM t JOIN gen USING (nosuchcol)",
+            "42703",
+        ),
+        (
+            "a column that is both generated and defaulted",
+            "CREATE TABLE g2 (a INT GENERATED ALWAYS AS (1) STORED DEFAULT 5)",
+            "42P16",
+        ),
+        (
+            "a SERIAL column that also carries a DEFAULT",
+            "CREATE TABLE s2 (a SERIAL DEFAULT 5)",
+            "42P16",
+        ),
+        (
+            "a text search configuration this server does not have",
+            "SELECT to_tsvector('french', 'x')",
+            "42704",
+        ),
+    ];
+    assert_refusal_classes(&engine, cases);
+}
+
+/// The refusals that are not about the statement's shape: a value the function will not take, a
+/// limit, a dependency, a transaction state - and the one class that means the engine has not
+/// built this.
+///
+/// The `0A000` row is the load-bearing one. It is the only class that invites a client to *skip*
+/// the statement and carry on, so a mistake that leaks into it is worse than one that lands on
+/// `XX000`: the caller never learns anything went wrong. The row is also what keeps the others
+/// honest - without it, "nothing reports 0A000" would pass for the wrong reason.
+#[test]
+fn a_refusal_that_is_not_about_the_statement_reports_its_own_class() {
+    let engine = refusal_fixture();
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "an argument value the function will not take",
+            "SELECT generate_series(1, 10, 0)",
+            "22023",
         ),
         (
             "dropping something another object still points at",
@@ -11228,23 +11330,11 @@ fn each_kind_of_refusal_reports_its_own_class_over_the_full_pipeline() {
             "SELECT jsonb_path_query_first('{\"a\":1}', 'a')",
             "22023",
         ),
-        // And the one genuinely missing feature, so the rows above are not vacuous: this class
-        // must still be reachable, or "nothing reports 0A000" would pass for the wrong reason.
         (
             "a construct the engine has not built",
             "SELECT COUNT(*) FROM t FOR UPDATE",
             "0A000",
         ),
     ];
-
-    for (what, sql, want) in cases {
-        let err = run_try(&engine, sql).expect_err(what);
-        assert_eq!(
-            err.sqlstate(),
-            *want,
-            "{what}: `{sql}` reported {} — a client branches on this class to decide whether to \
-             retry, report, or skip",
-            err.sqlstate()
-        );
-    }
+    assert_refusal_classes(&engine, cases);
 }
