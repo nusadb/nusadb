@@ -541,7 +541,8 @@ fn scan_text_catalog(
     let schemas: Vec<Vec<ColumnType>> = widths.iter().map(|&w| vec![ColumnType::Text; w]).collect();
     let malformed = || Error::Coded {
         message: format!(
-            "system catalog {catalog} holds a row this build cannot decode; the statement is              refused rather than judged against a partial catalog"
+            "system catalog {catalog} holds a row this build cannot decode; the statement is \
+             refused rather than judged against a partial catalog"
         ),
         sqlstate: crate::error::INTERNAL_ERROR,
     };

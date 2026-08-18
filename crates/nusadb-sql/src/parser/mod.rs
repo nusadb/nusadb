@@ -2939,7 +2939,8 @@ fn table_and_column(name: &sql::ObjectName) -> Result<(String, String), Error> {
     match name.0.as_slice() {
         [table, column] => Ok((fold_part(table)?, fold_part(column)?)),
         // A schema-qualified `schema.table.column` must not silently collapse to `table.column`
-        // (single namespace in Stage 4); a bare `column` has no table to resolve against.
+        // (which would answer for the wrong table); a bare `column` has no table to resolve
+        // against.
         _ => unsupported("COMMENT ON COLUMN requires a table-qualified column name (table.column)"),
     }
 }
@@ -3270,7 +3271,8 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
                 )
             {
                 return unsupported(
-                    "DROP ... CASCADE is not supported for this object kind (NusaDB tracks no object \n                     dependencies; CASCADE applies to DROP SCHEMA and DROP TABLE)",
+                    "DROP ... CASCADE is not supported for this object kind (NusaDB tracks no \
+                     object dependencies; CASCADE applies to DROP SCHEMA and DROP TABLE)",
                 );
             }
             if purge {
@@ -3835,9 +3837,14 @@ fn guc_name(name: &sql::ObjectName) -> Result<String, Error> {
 /// Extract a bare object name.
 ///
 /// A schema-qualified name (`schema.table`) is **rejected** rather than silently collapsed to its
-/// last component: NusaDB has a single namespace in Stage 4, so quietly resolving `app.users`
-/// and `users` — or `a.t` and `b.t` — to the same object would be a silent-wrong answer. (Consistent
-/// with the 3-part `CompoundIdentifier` rejection in `convert_expr`.)
+/// last component, which would resolve `app.users` and `users` — or `a.t` and `b.t` — to the
+/// same object and answer the wrong question. (Consistent with the 3-part `CompoundIdentifier`
+/// rejection in `convert_expr`.)
+///
+/// This is the narrow helper, for statements whose name this parser does not yet resolve through
+/// a schema. Statements that do take a qualifier — `CREATE TABLE`, `DROP VIEW`, and table
+/// references generally — use [`table_ref_name`] instead. The split is not a considered boundary:
+/// it is where multi-schema support reached before these statements were revisited.
 ///
 /// The exception is the `information_schema` schema: `information_schema.tables` is accepted and
 /// joined with a `.`.
@@ -3850,22 +3857,21 @@ fn object_name(name: &sql::ObjectName) -> Result<String, Error> {
             if schema == "information_schema" {
                 Ok(format!("information_schema.{ident}"))
             } else if schema == PUBLIC_SCHEMA {
-                // `public.<name>` resolves to the bare name: NusaDB has a single table
-                // namespace, which is the default `public` schema — so `public.t` and `t` denote
-                // the same table. Only `public` is recognised; any other schema qualifier is
-                // rejected (no silent collapse).
+                // `public.<name>` resolves to the bare name: `public` is the default schema, so
+                // for a statement that does not carry a schema of its own, `public.t` and `t`
+                // denote the same object. Any other qualifier is rejected, never collapsed.
                 Ok(ident)
             } else {
                 unsupported(
-                    "schema-qualified object name (NusaDB has a single namespace; only the \
-                     default `public` schema is recognised — use a bare name or `public.<name>`)",
+                    "a schema qualifier on this statement (it does not resolve one yet — \
+                     name the object without a schema, or qualify it with `public.`)",
                 )
             }
         },
         [] => unsupported("empty object name"),
         _ => unsupported(
-            "schema-qualified object name (NusaDB has a single namespace; only the default \
-             `public` schema is recognised — use a bare name or `public.<name>`)",
+            "a multi-part object name (only a bare name or a `public.` qualifier is understood \
+             here)",
         ),
     }
 }
@@ -3893,8 +3899,8 @@ fn table_ref_name(name: &sql::ObjectName) -> Result<(Option<String>, String), Er
     }
 }
 
-/// The default (and only) schema name. NusaDB has a single flat table namespace, conventionally the
-/// `public` schema, so a `public.` qualifier denotes that same namespace.
+/// The default schema name. A name with no qualifier resolves through the session search path,
+/// which ends here, so a `public.` qualifier and a bare name denote the same object.
 const PUBLIC_SCHEMA: &str = "public";
 
 #[cfg(test)]

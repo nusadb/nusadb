@@ -590,7 +590,8 @@ pub(super) fn convert_select_item(item: sql::SelectItem) -> Result<ast::SelectIt
         sql::SelectItem::ExprWithAliases { .. } => {
             unsupported("projection with multiple aliases `expr AS (a, b)`")
         },
-        // `table.*`. The qualifier is the final name component (single namespace),
+        // `table.*`. The qualifier is the final name component (this path does not resolve a
+        // schema of its own),
         // folded like any identifier; the wildcard decorations NusaDB does not model are rejected
         // (not silently dropped), as they are for plain `*`.
         sql::SelectItem::QualifiedWildcard(kind, opts) => {

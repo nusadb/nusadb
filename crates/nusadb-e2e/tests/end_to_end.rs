@@ -11120,7 +11120,7 @@ fn composite_type_drop_with_dependency_is_rejected() {
     assert!(
         matches!(
             run(&engine, "DROP TYPE addr"),
-            nusadb_sql::ExecutionResult::Dropped
+            nusadb_sql::ExecutionResult::TypeDropped
         ),
         "type drops once no column depends on it"
     );

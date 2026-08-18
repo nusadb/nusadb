@@ -189,6 +189,14 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
     match result {
         ExecutionResult::Created(_)
         | ExecutionResult::Dropped
+        | ExecutionResult::ViewCreated
+        | ExecutionResult::ViewDropped
+        | ExecutionResult::PolicyCreated
+        | ExecutionResult::PolicyDropped
+        | ExecutionResult::TypeCreated
+        | ExecutionResult::TypeDropped
+        | ExecutionResult::DomainCreated
+        | ExecutionResult::DomainDropped
         | ExecutionResult::Altered
         | ExecutionResult::Granted
         | ExecutionResult::Revoked

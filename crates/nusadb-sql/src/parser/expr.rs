@@ -316,8 +316,9 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                 table: fold_ident(table),
                 column: fold_ident(column),
             }),
-            // `public.table.column` resolves to `table.column`: `public` is the default (and
-            // only) schema namespace. Any other schema qualifier is rejected (no silent collapse).
+            // `public.table.column` resolves to `table.column`: `public` is the default schema,
+            // so the qualifier adds nothing. Any other schema qualifier is rejected here rather
+            // than silently collapsed (this path resolves no schema of its own).
             [schema, table, column] if fold_ident(schema) == PUBLIC_SCHEMA => {
                 Ok(ast::Expr::QualifiedColumn {
                     table: fold_ident(table),

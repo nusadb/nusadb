@@ -49,7 +49,7 @@ fn public_schema_qualifier_resolves_to_the_bare_table() {
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
 
-    // A `public.`-qualified CREATE / INSERT / DROP all denote the single namespace.
+    // A `public.`-qualified CREATE / INSERT / DROP all denote the same table as the bare name.
     exec(
         engine,
         &mut session,

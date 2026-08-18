@@ -305,21 +305,41 @@ If the SQL is a `COPY … FROM STDIN` / `COPY … TO STDOUT`, the COPY sub-proto
 ### 9.1 `CommandComplete` tags
 The tag is a human-readable completion string. Known forms (1.0):
 
-| statement                       | tag                       |
-| ------------------------------- | ------------------------- |
-| `SELECT` (and row-returning)    | `SELECT <rowcount>`       |
-| `INSERT`                        | `INSERT <count>`          |
-| `UPDATE`                        | `UPDATE <count>`          |
-| `DELETE`                        | `DELETE <count>`          |
-| `CREATE TABLE` / `DROP TABLE` / `ALTER TABLE` | `CREATE TABLE` / `DROP TABLE` / `ALTER TABLE` |
+| statement | tag |
+| --- | --- |
+| `SELECT` (and row-returning) | `SELECT <rowcount>` |
+| `INSERT` / `UPDATE` / `DELETE` / `MERGE` | `INSERT <n>` / `UPDATE <n>` / `DELETE <n>` / `MERGE <n>` |
+| `COPY` | `COPY <count>` |
+| `CREATE` / `DROP` / `ALTER TABLE` | `CREATE TABLE` / `DROP TABLE` / `ALTER TABLE` |
+| `CREATE` / `DROP VIEW` | `CREATE VIEW` / `DROP VIEW` |
+| `CREATE MATERIALIZED VIEW`, `REFRESH` | `CREATE MATERIALIZED VIEW` / `REFRESH MATERIALIZED VIEW` |
+| `CREATE` / `DROP TYPE` (enum and composite) | `CREATE TYPE` / `DROP TYPE` |
+| `CREATE` / `DROP DOMAIN` | `CREATE DOMAIN` / `DROP DOMAIN` |
+| `CREATE` / `DROP POLICY` | `CREATE POLICY` / `DROP POLICY` |
+| `CREATE` / `DROP` / `ALTER TRIGGER` | `CREATE TRIGGER` / `DROP TRIGGER` / `ALTER TRIGGER` |
+| `CREATE` / `DROP PROCEDURE`, `CALL` | `CREATE PROCEDURE` / `DROP PROCEDURE` / `CALL` |
+| `CREATE` / `DROP FUNCTION` | `CREATE FUNCTION` / `DROP FUNCTION` |
+| `CREATE` / `DROP SCHEMA` | `CREATE SCHEMA` / `DROP SCHEMA` |
+| `CREATE` / `DROP SEQUENCE` | `CREATE SEQUENCE` / `DROP SEQUENCE` |
+| `CREATE` / `DROP INDEX` | `CREATE INDEX` / `DROP INDEX` |
+| `CREATE` / `DROP` / `ALTER DATABASE` | `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE` |
+| `CREATE` / `DROP` / `ALTER ROLE` | `CREATE ROLE` / `DROP ROLE` / `ALTER ROLE` |
+| `GRANT` / `REVOKE` | `GRANT` / `REVOKE` |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | `BEGIN` / `COMMIT` / `ROLLBACK` |
-| `SAVEPOINT` / `RELEASE`         | `SAVEPOINT` / `RELEASE`   |
-| `SET` (vars & `SET TRANSACTION`) | `SET`                    |
-| `CREATE SCHEMA` / `DROP SCHEMA` | `CREATE SCHEMA` / `DROP SCHEMA` |
-| `CREATE SEQUENCE` / `DROP SEQUENCE` | `CREATE SEQUENCE` / `DROP SEQUENCE` |
-| `CREATE INDEX` / `DROP INDEX`   | `CREATE INDEX` / `DROP INDEX` |
+| `SAVEPOINT` / `RELEASE` | `SAVEPOINT` / `RELEASE` |
+| `SET` (vars, `SET TRANSACTION`, `SET ROLE`) | `SET` |
+| `TRUNCATE` | `TRUNCATE TABLE` |
+| `LOCK TABLE` | `LOCK TABLE` |
+| `PREPARE` / `DEALLOCATE` | `PREPARE` / `DEALLOCATE` (embedded API only — see §14) |
 | `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM <n>` / `ANALYZE` / `COMMENT` |
-| `COPY`                          | `COPY <count>`            |
+| `REINDEX` / `CHECKPOINT` | `REINDEX` / `CHECKPOINT` |
+
+`DROP MATERIALIZED VIEW` reports `DROP VIEW`: the parser folds the two spellings into one
+statement, so the server cannot tell them apart by the time it picks a tag.
+
+Each kind of object reports its own tag. A statement that creates a view says `CREATE VIEW`, not
+`CREATE TABLE` — earlier builds reported the table tag for views, types, domains and policies alike,
+so a client that branched on the tag was told the wrong thing.
 
 A driver MUST treat the tag as informational text: parse the trailing count where it needs an
 affected-row number, but tolerate tags it does not recognise.

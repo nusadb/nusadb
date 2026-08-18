@@ -110,9 +110,29 @@ pub(crate) fn spill_is_configured() -> bool {
 #[derive(Debug)]
 pub enum ExecutionResult {
     /// `CREATE TABLE` — the new (or existing-if-`IF NOT EXISTS`) table id.
+    ///
+    /// Tables only. Every other kind of object has its own variant, because the wire reports the
+    /// variant as the statement's command tag and a client reads that tag to learn what happened;
+    /// five kinds used to share this one and every one of them announced itself as `CREATE TABLE`.
     Created(nusadb_core::TableId),
-    /// `DROP TABLE` succeeded (or `IF EXISTS` made it a no-op).
+    /// `DROP TABLE` succeeded (or `IF EXISTS` made it a no-op). Tables only — see [`Created`](Self::Created).
     Dropped,
+    /// `CREATE VIEW` succeeded (or `OR REPLACE`/`IF NOT EXISTS` made it a replace/no-op).
+    ViewCreated,
+    /// `DROP VIEW` succeeded (or `IF EXISTS` made it a no-op).
+    ViewDropped,
+    /// `CREATE POLICY` succeeded.
+    PolicyCreated,
+    /// `DROP POLICY` succeeded (or `IF EXISTS` made it a no-op).
+    PolicyDropped,
+    /// `CREATE TYPE` succeeded — either the `AS ENUM` or the `AS (...)` composite form.
+    TypeCreated,
+    /// `DROP TYPE` succeeded (or `IF EXISTS` made it a no-op).
+    TypeDropped,
+    /// `CREATE DOMAIN` succeeded.
+    DomainCreated,
+    /// `DROP DOMAIN` succeeded (or `IF EXISTS` made it a no-op).
+    DomainDropped,
     /// `ALTER TABLE` succeeded (or an `IF [NOT] EXISTS` guard made it a no-op).
     Altered,
     /// `INSERT` — the number of rows written.
@@ -1733,17 +1753,39 @@ fn dispatch(
         | PhysicalPlan::RollbackToSavepoint(_)
         | PhysicalPlan::ReleaseSavepoint(_)
         | PhysicalPlan::SetVariable { .. }
-        | PhysicalPlan::ShowVariable(_)
-        | PhysicalPlan::Prepare { .. }
-        | PhysicalPlan::Execute { .. }
-        | PhysicalPlan::Deallocate(_) => {
-            // Transaction-, session-, and prepared-statement-control plans are intercepted by
-            // `Session::execute` before reaching `dispatch` (the latter need the session's statement
-            // store); this arm is defensive. PREPARE/EXECUTE/DEALLOCATE require a `Session`.
+        | PhysicalPlan::ShowVariable(_) => {
+            // No connected client reaches this: both wire paths intercept every one of these,
+            // verified over a real connection (BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK
+            // TO, SET, SHOW). Nor does an `execute` caller — that entry point delegates to
+            // `Session::execute`, which handles them.
+            //
+            // What does reach it is `execute_in_txn` (and its `_as` variants), whose own guard
+            // covers only the four transaction-control plans: a savepoint or a SET/SHOW plan
+            // passed there lands here. That is the embedding holding a Rust API wrong rather than
+            // anything a SQL statement did, so the message names the API that serves these
+            // instead of implying the engine broke.
             Err(Error::Internal(
-                "session-control plan reached executor dispatch (requires a Session)".to_owned(),
+                "this plan needs a session: run it through `Session::execute`, which holds the \
+                 transaction, savepoint and variable state it depends on"
+                    .to_owned(),
             ))
         },
+        // Statement-level PREPARE / EXECUTE / DEALLOCATE need somewhere to keep the statement
+        // between calls. `Session::execute` has that store, so an embedded caller is served; the
+        // wire server has no equivalent for the SQL-level spelling and routes here, which is why a
+        // connected client cannot use these at all.
+        //
+        // That is a feature this engine has not built, so it says so. It reported `internal_error`
+        // before — telling every client that the server had broken when the honest answer is that
+        // the wire protocol's own Parse/Bind path is the way to prepare a statement today.
+        PhysicalPlan::Prepare { .. }
+        | PhysicalPlan::Execute { .. }
+        | PhysicalPlan::Deallocate(_) => Err(Error::Unsupported(
+            "PREPARE / EXECUTE / DEALLOCATE as SQL statements (a connected client prepares a \
+             statement with the wire protocol's extended query messages; an embedded caller uses \
+             `Session::execute`, which holds the statement store these need)"
+                .to_owned(),
+        )),
     }
 }
 
@@ -3224,7 +3266,7 @@ fn run_create_policy(
     ];
     let bytes = row::encode(&row, &POLICY_CATALOG_SCHEMA)?;
     engine.insert(txn, cat, &bytes)?;
-    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+    Ok(ExecutionResult::PolicyCreated)
 }
 
 /// `DROP POLICY [IF EXISTS] name ON table`.
@@ -3240,7 +3282,7 @@ fn run_drop_policy(
             p.name, p.table
         )));
     }
-    Ok(ExecutionResult::Dropped)
+    Ok(ExecutionResult::PolicyDropped)
 }
 
 /// The row-level-security policies defined on `table`, read under `txn`'s snapshot. Used by the
@@ -3812,7 +3854,7 @@ fn run_create_view(
         && (load_view_def(engine, txn, VIEW_CATALOG, &p.name)?.is_some()
             || engine.lookup_table_as_of(txn, &p.name)?.is_some())
     {
-        return Ok(ExecutionResult::Created(nusadb_core::TableId(0)));
+        return Ok(ExecutionResult::ViewCreated);
     }
     store_view_def(engine, txn, VIEW_CATALOG, &p.name, &p.definition_sql)?;
     // Record (or, under OR REPLACE, clear) the explicit column-name list. Always remove the prior
@@ -3823,7 +3865,7 @@ fn run_create_view(
         let joined = p.columns.join(&VIEW_COLUMN_SEP.to_string());
         store_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name, &joined)?;
     }
-    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+    Ok(ExecutionResult::ViewCreated)
 }
 
 /// `REFRESH MATERIALIZED VIEW name`: re-execute the view's stored definition and replace its
@@ -3896,7 +3938,7 @@ fn run_drop_view(
             });
         }
     }
-    Ok(ExecutionResult::Dropped)
+    Ok(ExecutionResult::ViewDropped)
 }
 
 /// Engine-scoped system catalog of user-defined `ENUM` types: `(name, def)` where `def` is the
@@ -3925,7 +3967,7 @@ fn run_create_enum(
     }
     let joined = p.labels.join(&ENUM_LABEL_SEP.to_string());
     store_view_def(engine, txn, ENUM_CATALOG, &p.name, &joined)?;
-    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+    Ok(ExecutionResult::TypeCreated)
 }
 
 /// `DROP TYPE [IF EXISTS] name` — forget a user-defined enum (B-ENUM) or composite type. Both share
@@ -3954,7 +3996,7 @@ fn run_drop_type(
             p.name
         )));
     }
-    Ok(ExecutionResult::Dropped)
+    Ok(ExecutionResult::TypeDropped)
 }
 
 /// The ordered labels of a user-defined enum type, or `None` if no such type exists (B-ENUM).
@@ -4007,7 +4049,7 @@ fn run_create_composite(
     }
     let encoded = parts.join(&ENUM_LABEL_SEP.to_string());
     store_view_def(engine, txn, COMPOSITE_CATALOG, &p.name, &encoded)?;
-    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+    Ok(ExecutionResult::TypeCreated)
 }
 
 /// The fields of a user-defined composite type, or `None` if none exists.
@@ -4163,7 +4205,7 @@ fn run_create_domain(
     fields.extend(p.checks.iter().cloned());
     let encoded = fields.join(&ENUM_LABEL_SEP.to_string());
     store_view_def(engine, txn, DOMAIN_CATALOG, &p.name, &encoded)?;
-    Ok(ExecutionResult::Created(nusadb_core::TableId(0)))
+    Ok(ExecutionResult::DomainCreated)
 }
 
 /// `DROP DOMAIN [IF EXISTS] name` — forget a user-defined domain.
@@ -4179,7 +4221,7 @@ fn run_drop_domain(
             p.name
         )));
     }
-    Ok(ExecutionResult::Dropped)
+    Ok(ExecutionResult::DomainDropped)
 }
 
 /// The definition of a user-defined domain, or `None` if no such domain exists.

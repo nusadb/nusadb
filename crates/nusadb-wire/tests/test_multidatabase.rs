@@ -107,13 +107,23 @@ async fn connect(
     addr: std::net::SocketAddr,
     database: &str,
 ) -> Result<Connection<TcpStream>, String> {
+    connect_as(addr, database, "u").await
+}
+
+/// Connect as a named user. Most tests do not care and use [`connect`]; the ones that exercise
+/// statements reserved to a superuser (policy DDL) need the bootstrap role.
+async fn connect_as(
+    addr: std::net::SocketAddr,
+    database: &str,
+    user: &str,
+) -> Result<Connection<TcpStream>, String> {
     let mut client = Connection::new(TcpStream::connect(addr).await.unwrap());
     client
         .write_frame(
             &FrontendMessage::Startup {
                 major: PROTOCOL_VERSION.0,
                 minor: PROTOCOL_VERSION.1,
-                user: "u".to_owned(),
+                user: user.to_owned(),
                 database: database.to_owned(),
             }
             .encode()
@@ -898,6 +908,93 @@ async fn transaction_state_codes_are_what_a_wire_client_actually_sees() {
         run(&mut c, "ROLLBACK").await,
         Outcome::Done("ROLLBACK".to_owned())
     );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn each_kind_of_object_reports_its_own_command_tag() {
+    // The `CommandComplete` tag is how a client learns what a statement did — an ORM reads it to
+    // decide whether its migration step ran, and a pooler logs it. Six kinds of object used to
+    // share two generic results and so announced themselves as `CREATE TABLE` / `DROP TABLE`:
+    // creating a view, a type or a domain all claimed to have created a table.
+    //
+    // Asserted over a real connection because that is the only place the tag exists — the embedded
+    // API returns a typed result and never formats one, so no in-process test can see this.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cluster: Arc<dyn DatabaseCluster> = Arc::new(MockCluster::new());
+    let server = tokio::spawn(serve_cluster_with_shutdown(
+        listener,
+        Arc::clone(&cluster),
+        ServerConfig::default(),
+        std::future::pending::<()>(),
+    ));
+
+    // Policy DDL is reserved to a superuser, so this one connects as the bootstrap role.
+    let mut c = connect_as(addr, "nusadb", "nusadb-root")
+        .await
+        .expect("connect");
+    let cases: &[(&str, &str)] = &[
+        ("CREATE TABLE t (id INT)", "CREATE TABLE"),
+        ("CREATE VIEW v AS SELECT id FROM t", "CREATE VIEW"),
+        ("CREATE TYPE mood AS ENUM ('ok')", "CREATE TYPE"),
+        ("CREATE TYPE addr AS (street TEXT)", "CREATE TYPE"),
+        ("CREATE DOMAIN pos AS INT", "CREATE DOMAIN"),
+        ("CREATE POLICY p ON t USING (id > 0)", "CREATE POLICY"),
+        ("DROP POLICY p ON t", "DROP POLICY"),
+        ("DROP DOMAIN pos", "DROP DOMAIN"),
+        ("DROP TYPE addr", "DROP TYPE"),
+        ("DROP TYPE mood", "DROP TYPE"),
+        ("DROP VIEW v", "DROP VIEW"),
+        ("DROP TABLE t", "DROP TABLE"),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        match run(&mut c, sql).await {
+            Outcome::Done(tag) if tag == *want => {},
+            other => wrong.push(format!("  {sql}\n    got {other:?}, wanted `{want}`")),
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} statements reported the wrong command tag:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn sql_level_prepare_over_a_connection_says_it_is_not_built() {
+    // `PREPARE` / `EXECUTE` / `DEALLOCATE` as SQL statements need a place to keep the statement
+    // between calls. The embedded `Session` has one; the wire server does not, so these route to a
+    // defensive arm that used to report `XX000` — telling every client the server had faulted when
+    // the truth is that this spelling is not built. `0A000` says that, and the message points at
+    // the extended query protocol, which is how a connected client prepares a statement today.
+    //
+    // The SQL-level form is pinned in the SLT corpus and passes there, because that harness runs
+    // the embedded path. Only a real connection sees this.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cluster: Arc<dyn DatabaseCluster> = Arc::new(MockCluster::new());
+    let server = tokio::spawn(serve_cluster_with_shutdown(
+        listener,
+        Arc::clone(&cluster),
+        ServerConfig::default(),
+        std::future::pending::<()>(),
+    ));
+
+    let mut c = connect(addr, "nusadb").await.expect("connect");
+    for sql in ["PREPARE p AS SELECT 1", "EXECUTE p", "DEALLOCATE p"] {
+        assert_eq!(
+            run(&mut c, sql).await,
+            Outcome::Error("0A000".to_owned()),
+            "`{sql}` must say the feature is not built, not that the server broke"
+        );
+    }
 
     server.abort();
 }
