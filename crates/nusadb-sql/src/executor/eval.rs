@@ -5304,13 +5304,38 @@ fn geom_distance_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
         ) => ast::Value::Float(crate::geometry::lseg_distance_lseg(
             *ax1, *ay1, *ax2, *ay2, *bx1, *by1, *bx2, *by2,
         )),
+        // `line <-> point`, either operand order: the perpendicular distance to the infinite line.
+        (
+            ast::Value::Geometry(GeomVal::Line { a, b, c }),
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+        )
+        | (
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+            ast::Value::Geometry(GeomVal::Line { a, b, c }),
+        ) => ast::Value::Float(crate::geometry::line_distance_point(*a, *b, *c, *x, *y)),
+        // `line <-> line`: 0 if they cross, else the constant perpendicular gap between the parallels.
+        (
+            ast::Value::Geometry(GeomVal::Line {
+                a: a1,
+                b: b1,
+                c: c1,
+            }),
+            ast::Value::Geometry(GeomVal::Line {
+                a: a2,
+                b: b2,
+                c: c2,
+            }),
+        ) => ast::Value::Float(crate::geometry::line_distance_line(
+            *a1, *b1, *c1, *a2, *b2, *c2,
+        )),
         _ => ast::Value::Null,
     }
 }
 
 /// Evaluate the geometric intersection operator `#`: `lseg # lseg` yields the crossing `point` when
-/// the two segments cross or touch at a single point, else `NULL` (collinear-overlapping or
-/// non-intersecting segments). A `NULL` or non-lseg operand yields `NULL`.
+/// the two segments cross or touch at a single point, and `line # line` yields the crossing `point`
+/// of two infinite lines; each is `NULL` when there is no single crossing point (collinear /
+/// non-intersecting segments, or parallel lines). A `NULL` or otherwise-shaped operand yields `NULL`.
 fn geom_intersection_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
     use crate::geometry::GeomVal;
     match (left, right) {
@@ -5328,6 +5353,19 @@ fn geom_intersection_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
                 y2: by2,
             }),
         ) => crate::geometry::lseg_intersection(*ax1, *ay1, *ax2, *ay2, *bx1, *by1, *bx2, *by2)
+            .map_or(ast::Value::Null, ast::Value::Geometry),
+        (
+            ast::Value::Geometry(GeomVal::Line {
+                a: a1,
+                b: b1,
+                c: c1,
+            }),
+            ast::Value::Geometry(GeomVal::Line {
+                a: a2,
+                b: b2,
+                c: c2,
+            }),
+        ) => crate::geometry::line_intersection(*a1, *b1, *c1, *a2, *b2, *c2)
             .map_or(ast::Value::Null, ast::Value::Geometry),
         _ => ast::Value::Null,
     }

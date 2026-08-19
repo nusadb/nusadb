@@ -1,10 +1,11 @@
-//! Geometric types `point`, `box`, `circle`, and `lseg`: parsing, canonical formatting, operators,
-//! and functions.
+//! Geometric types `point`, `box`, `circle`, `lseg`, and `line`: parsing, canonical formatting,
+//! operators, and functions.
 //!
 //! A geometric value is a [`GeomVal`] — a `point` (an `(x, y)` pair), an axis-aligned `box` (two
-//! opposite corners), a `circle` (a center `(x, y)` and a radius `r`), or an `lseg` (a line segment
-//! between two endpoints). Values persist as their canonical text form; the column's [`GeomKind`]
-//! tells the reader which shape to parse back into. Every function here is total: parse
+//! opposite corners), a `circle` (a center `(x, y)` and a radius `r`), an `lseg` (a line segment
+//! between two endpoints), or a `line` (an infinite line `A·x + B·y + C = 0`). Values persist as
+//! their canonical text form; the column's [`GeomKind`] tells the reader which shape to parse back
+//! into. Every function here is total: parse
 //! entry points return [`Option`] (a syntax error is `None`), and coordinate access is checked, so
 //! no path indexes or unwraps.
 //!
@@ -59,6 +60,16 @@ pub enum GeomVal {
         /// Second endpoint Y coordinate.
         y2: f64,
     },
+    /// A `line` — an infinite line `A·x + B·y + C = 0`, carried as its three coefficients. The
+    /// three-coefficient input form `{A,B,C}` is stored verbatim (no normalization).
+    Line {
+        /// Coefficient `A`.
+        a: f64,
+        /// Coefficient `B`.
+        b: f64,
+        /// Coefficient `C`.
+        c: f64,
+    },
 }
 
 impl GeomVal {
@@ -70,6 +81,7 @@ impl GeomVal {
             Self::Box { .. } => GeomKind::Box,
             Self::Circle { .. } => GeomKind::Circle,
             Self::Lseg { .. } => GeomKind::Lseg,
+            Self::Line { .. } => GeomKind::Line,
         }
     }
 
@@ -89,6 +101,35 @@ impl GeomVal {
     #[must_use]
     pub const fn lseg(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
         Self::Lseg { x1, y1, x2, y2 }
+    }
+
+    /// Build a `line` from its three coefficients `A·x + B·y + C = 0`, stored verbatim.
+    #[must_use]
+    pub const fn line(a: f64, b: f64, c: f64) -> Self {
+        Self::Line { a, b, c }
+    }
+
+    /// Build a `line` through two distinct points, matching the reference engine's `line_construct`:
+    /// a vertical line (`x1 == x2`) becomes `A=-1, B=0, C=x1`; a horizontal line (`y1 == y2`) becomes
+    /// `A=0, B=-1, C=y1`; otherwise `A=(y2−y1)/(x2−x1)`, `B=-1`, `C=y1 − A·x1`.
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "an exact `== ` is the vertical/horizontal test the reference engine's line_construct uses for the two degenerate slopes"
+    )]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "plain (non-fused) multiply-then-subtract matches the reference engine's IEEE-754 coefficient result bit-for-bit; a fused mul_add would round differently"
+    )]
+    pub fn line_construct(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
+        if x1 == x2 {
+            Self::line(-1.0, 0.0, x1)
+        } else if y1 == y2 {
+            Self::line(0.0, -1.0, y1)
+        } else {
+            let a = (y2 - y1) / (x2 - x1);
+            Self::line(a, -1.0, y1 - a * x1)
+        }
     }
 
     /// Build a normalized `box` from two opposite corners, so the stored `high` corner is the
@@ -118,7 +159,7 @@ fn fmt_num(v: f64) -> String {
 }
 
 /// Render a value in its canonical text form: a `point` as `(x,y)`, a `box` as `(hx,hy),(lx,ly)`, a
-/// `circle` as `<(cx,cy),r>`, an `lseg` as `[(x1,y1),(x2,y2)]`.
+/// `circle` as `<(cx,cy),r>`, an `lseg` as `[(x1,y1),(x2,y2)]`, a `line` as `{A,B,C}`.
 #[must_use]
 pub fn format(v: &GeomVal) -> String {
     match v {
@@ -145,18 +186,22 @@ pub fn format(v: &GeomVal) -> String {
             fmt_num(*x2),
             fmt_num(*y2),
         ),
+        GeomVal::Line { a, b, c } => {
+            format!("{{{},{},{}}}", fmt_num(*a), fmt_num(*b), fmt_num(*c))
+        },
     }
 }
 
 /// Extract the finite floating-point tokens from a geometric literal, treating parentheses, the
-/// circle delimiters `<`/`>`, the lseg brackets `[`/`]`, commas, and whitespace as separators.
-/// Returns `None` if any token fails to parse. A minus sign and exponent stay attached to their
-/// number since only `(`, `)`, `<`, `>`, `[`, `]`, `,`, and whitespace separate tokens.
+/// circle delimiters `<`/`>`, the lseg brackets `[`/`]`, the line braces `{`/`}`, commas, and
+/// whitespace as separators. Returns `None` if any token fails to parse. A minus sign and exponent
+/// stay attached to their number since only `(`, `)`, `<`, `>`, `[`, `]`, `{`, `}`, `,`, and
+/// whitespace separate tokens.
 fn floats(s: &str) -> Option<Vec<f64>> {
     let cleaned: String = s
         .chars()
         .map(|c| {
-            if matches!(c, '(' | ')' | '<' | '>' | '[' | ']') {
+            if matches!(c, '(' | ')' | '<' | '>' | '[' | ']' | '{' | '}') {
                 ' '
             } else {
                 c
@@ -215,6 +260,36 @@ pub fn parse_lseg(s: &str) -> Option<GeomVal> {
     }
 }
 
+/// Parse a `line` literal into the infinite line `A·x + B·y + C = 0`.
+///
+/// Two spellings are accepted, dispatched by coordinate count:
+/// - three coordinates — the `{A,B,C}` coefficient form — are stored verbatim (no normalization,
+///   matching the reference engine: `{2,-2,0}` stays `{2,-2,0}`);
+/// - four coordinates — a two-point form `[(x1,y1),(x2,y2)]`, `((x1,y1),(x2,y2))`, or bare
+///   `x1,y1,x2,y2` — construct the line through those points (see [`GeomVal::line_construct`]).
+///
+/// Any other count yields `None`.
+///
+/// A degenerate line is rejected (`None`), matching the reference engine: the `{A,B,C}` form with
+/// `A` and `B` both zero is not a line, and the two-point form with coincident points has no unique
+/// line through it.
+#[must_use]
+#[allow(
+    clippy::float_cmp,
+    reason = "the exact `== 0.0` and point-equality tests are the degenerate-line rejections the reference engine makes: `{0,0,C}` (A and B both zero) and a two-point form whose points coincide are both invalid line specifications"
+)]
+pub fn parse_line(s: &str) -> Option<GeomVal> {
+    match *floats(s)?.as_slice() {
+        // `{A,B,C}` coefficient form — reject `A` and `B` both zero (not a line).
+        [a, b, c] => (!(a == 0.0 && b == 0.0)).then(|| GeomVal::line(a, b, c)),
+        // Two-point form — reject two coincident points (no unique line through a single point).
+        [x1, y1, x2, y2] => {
+            (!(x1 == x2 && y1 == y2)).then(|| GeomVal::line_construct(x1, y1, x2, y2))
+        },
+        _ => None,
+    }
+}
+
 /// Parse a geometric literal against the target [`GeomKind`].
 #[must_use]
 pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
@@ -223,6 +298,7 @@ pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
         GeomKind::Box => parse_box(s),
         GeomKind::Circle => parse_circle(s),
         GeomKind::Lseg => parse_lseg(s),
+        GeomKind::Line => parse_line(s),
     }
 }
 
@@ -534,6 +610,88 @@ pub fn lseg_distance_lseg(
     d1.min(d2).min(d3).min(d4)
 }
 
+// ── line functions & operators ───────────────────────────────────────────────────────────────────
+
+/// Perpendicular distance from an infinite line `A·x + B·y + C = 0` to a point (`line <-> point`).
+///
+/// The foot of the perpendicular (the closest point on the line) is found first, then the actual
+/// distance to it is taken as the hypotenuse of the coordinate deltas. This matches the reference
+/// engine's point↔line path bit-for-bit — which finds the foot then measures the deltas, and differs
+/// in the last ULP from the algebraic `|A·px + B·py + C| / hypot(A, B)` closed form on some inputs.
+#[must_use]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) arithmetic matches the reference engine's IEEE-754 foot-of-perpendicular result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn line_distance_point(a: f64, b: f64, c: f64, px: f64, py: f64) -> f64 {
+    // `k` scales the line normal `(A, B)` to reach the point; subtracting it lands on the foot.
+    let k = (a * px + b * py + c) / (a * a + b * b);
+    let foot_x = px - a * k;
+    let foot_y = py - b * k;
+    (px - foot_x).hypot(py - foot_y)
+}
+
+/// The intersection point of two infinite lines (`line # line`), or `None` when they are parallel.
+///
+/// With `denom = A1·B2 − A2·B1`: a zero denominator means the lines are parallel (or identical) and
+/// yields `None`; otherwise the crossing point is
+/// `x = (B1·C2 − B2·C1)/denom`, `y = (A2·C1 − A1·C2)/denom`.
+#[must_use]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the parallel test the reference engine uses for the zero cross-coefficient denominator"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-product arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn line_intersection(a1: f64, b1: f64, c1: f64, a2: f64, b2: f64, c2: f64) -> Option<GeomVal> {
+    let denom = a1 * b2 - a2 * b1;
+    if denom == 0.0 {
+        // Parallel or identical lines: no single crossing point.
+        return None;
+    }
+    Some(GeomVal::point(
+        (b1 * c2 - b2 * c1) / denom,
+        (a2 * c1 - a1 * c2) / denom,
+    ))
+}
+
+/// Distance between two infinite lines (`line <-> line`): `0` when they cross (a non-zero
+/// `A1·B2 − A2·B1` denominator), otherwise the constant perpendicular gap between the parallel lines.
+///
+/// For a parallel pair a point on the first line is taken (`(0, −C1/B1)` when `B1 ≠ 0`, else
+/// `(−C1/A1, 0)`) and its perpendicular distance to the second line is returned by the algebraic
+/// `|A2·px + B2·py + C2| / hypot(A2, B2)` closed form; this is scale-invariant, so two parallel lines
+/// with differently scaled coefficients still report the same gap. (Unlike the point↔line operator,
+/// the reference engine's line↔line path uses this closed form directly rather than the foot of the
+/// perpendicular, so the two paths can differ in the last ULP — this reproduces the line↔line one.)
+#[must_use]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the crossing/parallel test (denominator) and the vertical-line test (B1) the reference engine uses"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-coefficient arithmetic matches the reference engine's IEEE-754 denominator and closed-form distance bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn line_distance_line(a1: f64, b1: f64, c1: f64, a2: f64, b2: f64, c2: f64) -> f64 {
+    let denom = a1 * b2 - a2 * b1;
+    if denom != 0.0 {
+        // The lines cross.
+        return 0.0;
+    }
+    // Parallel: measure a point on line 1 against line 2. Take `(0, −C1/B1)` for a non-vertical line,
+    // else (`B1 == 0`, a vertical line) the point `(−C1/A1, 0)`.
+    let (px, py) = if b1 == 0.0 {
+        (-c1 / a1, 0.0)
+    } else {
+        (0.0, -c1 / b1)
+    };
+    // The closed-form perpendicular distance — the reference engine's line↔line path (not the foot).
+    (a2 * px + b2 * py + c2).abs() / a2.hypot(b2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +898,113 @@ mod tests {
             lseg_intersection(0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 1.0, 2.0),
             None
         );
+    }
+
+    #[test]
+    fn line_parse_forms() {
+        // The three-coefficient `{A,B,C}` form is stored verbatim (no normalization).
+        assert_eq!(parse_line("{1,-1,0}"), Some(GeomVal::line(1.0, -1.0, 0.0)));
+        assert_eq!(parse_line("{2,-2,0}"), Some(GeomVal::line(2.0, -2.0, 0.0)));
+        // The two-point forms construct via line_construct — bracket, paren, and bare spellings.
+        assert_eq!(
+            parse_line("[(1,2),(3,4)]"),
+            Some(GeomVal::line(1.0, -1.0, 1.0))
+        );
+        assert_eq!(
+            parse_line("((0,0),(1,1))"),
+            Some(GeomVal::line(1.0, -1.0, 0.0))
+        );
+        assert_eq!(parse_line("2,0,2,5"), Some(GeomVal::line(-1.0, 0.0, 2.0)));
+        assert_eq!(parse_line("0,3,5,3"), Some(GeomVal::line(0.0, -1.0, 3.0)));
+        // A wrong coordinate count or garbage is rejected.
+        assert_eq!(parse_line("abc"), None);
+        assert_eq!(parse_line("{1,2}"), None);
+        assert_eq!(parse_line("{1,2,3,4,5}"), None);
+    }
+
+    #[test]
+    fn line_construct_oracle() {
+        // Verified against the reference engine's line_construct.
+        assert_eq!(
+            GeomVal::line_construct(1.0, 2.0, 3.0, 4.0),
+            GeomVal::line(1.0, -1.0, 1.0)
+        );
+        assert_eq!(
+            GeomVal::line_construct(0.0, 0.0, 1.0, 1.0),
+            GeomVal::line(1.0, -1.0, 0.0)
+        );
+        // Vertical and horizontal degenerate slopes.
+        assert_eq!(
+            GeomVal::line_construct(2.0, 0.0, 2.0, 5.0),
+            GeomVal::line(-1.0, 0.0, 2.0)
+        );
+        assert_eq!(
+            GeomVal::line_construct(0.0, 3.0, 5.0, 3.0),
+            GeomVal::line(0.0, -1.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn line_format_canonical() {
+        assert_eq!(format(&GeomVal::line(1.0, -1.0, 0.0)), "{1,-1,0}");
+        // The verbatim (non-normalized) coefficients render as-is.
+        assert_eq!(format(&GeomVal::line(2.0, -2.0, 0.0)), "{2,-2,0}");
+        assert_eq!(format(&GeomVal::line(-0.0, -1.0, 3.5)), "{0,-1,3.5}");
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact integer-valued and √-of-perfect-square results compare exactly"
+    )]
+    #[allow(
+        clippy::approx_constant,
+        clippy::unreadable_literal,
+        reason = "the 1.414213562373095 literals are the line↔line closed-form gap — deliberately 1 ULP below SQRT_2, so the constant cannot be substituted"
+    )]
+    fn line_ops() {
+        // line <-> point: the foot-of-perpendicular path reaches √2 exactly (`SQRT_2`), matching the
+        // reference engine bit-for-bit — unlike the algebraic closed form, which is 1 ULP below here.
+        assert_eq!(
+            line_distance_point(1.0, -1.0, 0.0, 0.0, 2.0),
+            std::f64::consts::SQRT_2
+        );
+        assert_eq!(line_distance_point(1.0, -1.0, 0.0, 3.0, 3.0), 0.0);
+        assert_eq!(line_distance_point(-1.0, 0.0, 2.0, 5.0, 7.0), 3.0);
+        // line # line: the crossing point, or None when parallel.
+        assert_eq!(
+            line_intersection(1.0, -1.0, 0.0, 1.0, 1.0, 0.0),
+            Some(GeomVal::point(0.0, 0.0))
+        );
+        assert_eq!(
+            line_intersection(1.0, -1.0, 1.0, 1.0, 1.0, -7.0),
+            Some(GeomVal::point(3.0, 4.0))
+        );
+        assert_eq!(line_intersection(1.0, -1.0, 0.0, 1.0, -1.0, 5.0), None);
+        // line <-> line: 0 when crossing, else the constant (scale-invariant) parallel gap. This path
+        // uses the algebraic closed form, 1 ULP below `SQRT_2` — matching the reference engine, whose
+        // line↔line path also uses the closed form. The differently scaled {2,-2,4} reports the same
+        // gap as {1,-1,2}.
+        assert_eq!(line_distance_line(1.0, -1.0, 0.0, 1.0, 1.0, 0.0), 0.0);
+        assert_eq!(
+            line_distance_line(1.0, -1.0, 0.0, 1.0, -1.0, 2.0),
+            1.414213562373095
+        );
+        assert_eq!(
+            line_distance_line(1.0, -1.0, 0.0, 2.0, -2.0, 4.0),
+            1.414213562373095
+        );
+    }
+
+    #[test]
+    fn line_rejects_degenerate() {
+        // `{A,B,C}` with A and B both zero is not a line.
+        assert_eq!(parse_line("{0,0,5}"), None);
+        // A two-point form whose points coincide has no unique line.
+        assert_eq!(parse_line("[(2,2),(2,2)]"), None);
+        assert_eq!(parse_line("3,3,3,3"), None);
+        // A valid coefficient line and a valid two-point line still parse.
+        assert_eq!(parse_line("{2,-2,0}"), Some(GeomVal::line(2.0, -2.0, 0.0)));
+        assert!(parse_line("[(0,0),(1,1)]").is_some());
     }
 }

@@ -4421,3 +4421,45 @@ async fn lseg_renders_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A `LINE` column renders correctly over the real wire protocol — this proves the wire value
+/// encoding (`value_to_field`) formats an infinite line as its canonical text `{A,B,C}`, not a debug
+/// or byte dump. The two-point input form proves the parse-and-construct (`line_construct`) happens
+/// before it reaches the wire.
+#[tokio::test]
+async fn line_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (l line)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // The two-point input form must show up as the constructed canonical coefficients {A,B,C} on the
+    // wire: [(1,2),(3,4)] constructs to {1,-1,1}.
+    query(&mut conn, "INSERT INTO t VALUES ('[(1,2),(3,4)]')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT l FROM t").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["l".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"{1,-1,1}".to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

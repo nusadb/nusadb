@@ -359,3 +359,101 @@ query I
 SELECT 5 # 3
 ----
 6
+
+# ── line ────────────────────────────────────────────────────────────────────────────────────
+# A line is an INFINITE line A·x + B·y + C = 0, canonical form {A,B,C}. The three-coefficient input
+# {A,B,C} is stored VERBATIM (no normalization); a two-point input is converted to coefficients.
+
+statement ok
+CREATE TABLE lin (id INT NOT NULL, l LINE)
+
+# Coefficient form {A,B,C}, stored verbatim — including a non-reduced {2,-2,0} that stays {2,-2,0}.
+statement ok
+INSERT INTO lin VALUES (1, '{1,-1,0}')
+
+statement ok
+INSERT INTO lin VALUES (2, '{2,-2,0}')
+
+# Two-point forms convert to coefficients via line_construct: slanted, vertical, and horizontal.
+statement ok
+INSERT INTO lin VALUES (3, '[(1,2),(3,4)]')
+
+statement ok
+INSERT INTO lin VALUES (4, '[(0,0),(1,1)]')
+
+statement ok
+INSERT INTO lin VALUES (5, '[(2,0),(2,5)]')
+
+statement ok
+INSERT INTO lin VALUES (6, '[(0,3),(5,3)]')
+
+# Canonical output {A,B,C}: verbatim coefficients preserved, two-point rows rendered as coefficients.
+query IT rowsort
+SELECT id, l FROM lin
+----
+1  {1,-1,0}
+2  {2,-2,0}
+3  {1,-1,1}
+4  {1,-1,0}
+5  {-1,0,2}
+6  {0,-1,3}
+
+# An explicit CAST from text parses the same way; a malformed or wrong-arity string is a loud error.
+query T
+SELECT CAST('{2,-2,0}' AS LINE)
+----
+{2,-2,0}
+
+statement error
+SELECT CAST('abc' AS LINE)
+
+statement error
+SELECT CAST('{1,2}' AS LINE)
+
+statement error
+SELECT CAST('{1,2,3,4,5}' AS LINE)
+
+# A degenerate line is rejected: {A,B,C} with A and B both zero is not a line.
+statement error
+SELECT CAST('{0,0,5}' AS LINE)
+
+# A two-point line whose points coincide has no unique line through it.
+statement error
+SELECT CAST('[(2,2),(2,2)]' AS LINE)
+
+# line <-> point: perpendicular distance |A·px + B·py + C| / sqrt(A² + B²). A point on the line is 0.
+query RRR
+SELECT
+  CAST('{1,-1,0}' AS LINE) <-> CAST('(0,2)' AS POINT),
+  CAST('{1,-1,0}' AS LINE) <-> CAST('(3,3)' AS POINT),
+  CAST('{-1,0,2}' AS LINE) <-> CAST('(5,7)' AS POINT)
+----
+1.414  0.000  3.000
+
+# line <-> line: 0 when they cross, else the constant perpendicular gap (scale-invariant, so the
+# differently scaled {2,-2,4} still reports the same gap as {1,-1,2}).
+query RRR
+SELECT
+  CAST('{1,-1,0}' AS LINE) <-> CAST('{1,1,0}' AS LINE),
+  CAST('{1,-1,0}' AS LINE) <-> CAST('{1,-1,2}' AS LINE),
+  CAST('{1,-1,0}' AS LINE) <-> CAST('{2,-2,4}' AS LINE)
+----
+0.000  1.414  1.414
+
+# line # line: the crossing point of two infinite lines.
+query T
+SELECT CAST('{1,-1,0}' AS LINE) # CAST('{1,1,0}' AS LINE)
+----
+(0,0)
+
+# Two-point-constructed lines cross at their common point.
+query T
+SELECT CAST('[(0,0),(4,4)]' AS LINE) # CAST('[(0,4),(4,0)]' AS LINE)
+----
+(2,2)
+
+# Parallel lines never meet — the intersection is NULL.
+query T
+SELECT CAST('{1,-1,0}' AS LINE) # CAST('{1,-1,5}' AS LINE)
+----
+NULL

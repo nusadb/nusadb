@@ -506,6 +506,68 @@ fn lseg_value_survives_reopen() {
     );
 }
 
+/// A `LINE` column is DURABLE on disk: each value is written to the WAL as its canonical text
+/// `{A,B,C}` and recovery decodes it back to the same typed geometry after a crash — not just held in
+/// memory. The two-point input form proves the parse-and-construct (`line_construct`) happens before
+/// persistence, the non-reduced `{2,-2,0}` row proves the coefficients are stored VERBATIM (no
+/// normalization) and survive intact, and a second crash-reopen proves a value committed after
+/// recovery also survives.
+#[test]
+fn line_value_survives_reopen() {
+    use nusadb_sql::geometry::GeomVal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE lines (id INT PRIMARY KEY, l LINE)");
+        run(&engine, "INSERT INTO lines VALUES (1, '{1,-1,0}')");
+        // A non-reduced coefficient triple is stored verbatim (no normalization to {1,-1,0}).
+        run(&engine, "INSERT INTO lines VALUES (2, '{2,-2,0}')");
+        // The two-point form is converted to coefficients before it persists.
+        run(&engine, "INSERT INTO lines VALUES (3, '[(1,2),(3,4)]')");
+        // A vertical two-point line constructs to {-1,0,C}.
+        run(&engine, "INSERT INTO lines VALUES (4, '[(2,0),(2,5)]')");
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The line column decodes back to a typed geometry value (byte-correct), not text.
+        assert_eq!(
+            rows(run(&engine, "SELECT l FROM lines WHERE id = 1")),
+            vec![vec![Value::Geometry(GeomVal::line(1.0, -1.0, 0.0))]]
+        );
+        // The canonical text of the recovered two-point inputs matches their constructed coefficients.
+        assert_eq!(
+            rows(run(
+                &engine,
+                "SELECT l::TEXT FROM lines WHERE id = 3 OR id = 4 ORDER BY id"
+            )),
+            vec![
+                vec![Value::Text("{1,-1,1}".to_owned())],
+                vec![Value::Text("{-1,0,2}".to_owned())],
+            ]
+        );
+        // A committed insert after recovery also persists.
+        run(&engine, "INSERT INTO lines VALUES (5, '{0,-1,3}')");
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed row — pre-crash and post-recovery — survives, with the
+    // non-reduced row (id 2) still stored verbatim as {2,-2,0}.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT id, l::TEXT FROM lines ORDER BY id")),
+        vec![
+            vec![Value::Int(1), Value::Text("{1,-1,0}".to_owned())],
+            vec![Value::Int(2), Value::Text("{2,-2,0}".to_owned())],
+            vec![Value::Int(3), Value::Text("{1,-1,1}".to_owned())],
+            vec![Value::Int(4), Value::Text("{-1,0,2}".to_owned())],
+            vec![Value::Int(5), Value::Text("{0,-1,3}".to_owned())],
+        ]
+    );
+}
+
 /// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical

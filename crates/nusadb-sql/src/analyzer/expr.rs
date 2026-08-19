@@ -4353,13 +4353,17 @@ const fn is_geometry_type(ty: ColumnType) -> bool {
 }
 
 /// Type rule for the geometric distance `<->`: `point <-> point`, `box <-> box`, `circle <-> circle`,
-/// `lseg <-> lseg` (same-kind), and the mixed `circle <-> point` / `lseg <-> point` (either order);
-/// each yields the `FLOAT` distance.
+/// `lseg <-> lseg`, `line <-> line` (same-kind), and the mixed `circle <-> point` / `lseg <-> point`
+/// / `line <-> point` (either order); each yields the `FLOAT` distance.
 fn check_geom_distance(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind::{Circle, Lseg, Point};
+    use nusadb_core::engine::GeomKind::{Circle, Line, Lseg, Point};
     match (left, right) {
         (ColumnType::Geometry(a), ColumnType::Geometry(b))
-            if a == b || matches!((a, b), (Circle | Lseg, Point) | (Point, Circle | Lseg)) =>
+            if a == b
+                || matches!(
+                    (a, b),
+                    (Circle | Lseg | Line, Point) | (Point, Circle | Lseg | Line)
+                ) =>
         {
             Ok(ColumnType::Float)
         },
@@ -4371,12 +4375,16 @@ fn check_geom_distance(left: ColumnType, right: ColumnType) -> Result<ColumnType
     }
 }
 
-/// Type rule for `#` geometric intersection: `lseg # lseg`, yielding the (nullable) `point` where
-/// the two segments cross — `NULL` at evaluation when they do not cross at a single point.
+/// Type rule for `#` geometric intersection: `lseg # lseg` and `line # line`, yielding the (nullable)
+/// `point` where the two operands cross — `NULL` at evaluation when they do not cross at a single
+/// point (collinear / non-intersecting segments, or parallel lines).
 fn check_geom_intersection(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind::{Lseg, Point};
+    use nusadb_core::engine::GeomKind::{Line, Lseg, Point};
     match (left, right) {
-        (ColumnType::Geometry(Lseg), ColumnType::Geometry(Lseg)) => Ok(ColumnType::Geometry(Point)),
+        (ColumnType::Geometry(Lseg), ColumnType::Geometry(Lseg))
+        | (ColumnType::Geometry(Line), ColumnType::Geometry(Line)) => {
+            Ok(ColumnType::Geometry(Point))
+        },
         _ => Err(Error::TypeMismatch {
             context: "`#` geometric intersection".to_owned(),
             expected: left,
