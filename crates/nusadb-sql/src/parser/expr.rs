@@ -1407,6 +1407,9 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "width" => F::GeomWidth,
         "radius" => F::GeomRadius,
         "diameter" => F::GeomDiameter,
+        "npoints" => F::GeomNpoints,
+        "isopen" => F::GeomIsOpen,
+        "isclosed" => F::GeomIsClosed,
         // Random.
         "random" => F::Random,
         "setseed" => F::Setseed,

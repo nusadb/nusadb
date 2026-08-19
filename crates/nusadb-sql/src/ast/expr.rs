@@ -978,6 +978,12 @@ pub enum ScalarFunc {
     GeomRadius,
     /// `DIAMETER(circle)` — the diameter (`2 · r`) of a circle, as `FLOAT`.
     GeomDiameter,
+    /// `NPOINTS(path)` — the number of vertices in a path, as `INT`.
+    GeomNpoints,
+    /// `ISOPEN(path)` — whether a path is an open polyline, as `BOOL`.
+    GeomIsOpen,
+    /// `ISCLOSED(path)` — whether a path is a closed loop, as `BOOL`.
+    GeomIsClosed,
 }
 
 impl ScalarFunc {
@@ -1206,6 +1212,9 @@ impl ScalarFunc {
             Self::GeomWidth => "width",
             Self::GeomRadius => "radius",
             Self::GeomDiameter => "diameter",
+            Self::GeomNpoints => "npoints",
+            Self::GeomIsOpen => "isopen",
+            Self::GeomIsClosed => "isclosed",
         }
     }
 

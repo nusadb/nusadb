@@ -1337,6 +1337,14 @@ pub(super) fn analyze_scalar_function(
             &[],
             ColumnType::Float,
         ),
+        // NPOINTS(path) → INT (the vertex count).
+        F::GeomNpoints => ScalarSig::Fixed(&[ColumnType::Geometry(GeomKind::Path)], &[], Int),
+        // ISOPEN/ISCLOSED(path) → BOOL.
+        F::GeomIsOpen | F::GeomIsClosed => ScalarSig::Fixed(
+            &[ColumnType::Geometry(GeomKind::Path)],
+            &[],
+            ColumnType::Bool,
+        ),
         // AREA/CENTER are polymorphic over box|circle and analyzed before this table.
         F::GeomArea | F::GeomCenter => {
             unreachable!("AREA/CENTER are analyzed before the scalar signature table")
@@ -4269,6 +4277,15 @@ pub(super) fn check_binary(
         {
             Ok(ColumnType::Geometry(GeomKind::Point))
         },
+        // Geometric path concatenation: `path + path` appends the second path's vertices to the
+        // first, yielding a `path` (NULL at evaluation when either operand is a closed path). Checked
+        // before the numeric rule (a path is not numeric).
+        Op::Plus
+            if left == ColumnType::Geometry(GeomKind::Path)
+                && right == ColumnType::Geometry(GeomKind::Path) =>
+        {
+            Ok(ColumnType::Geometry(GeomKind::Path))
+        },
         Op::Plus | Op::Multiply | Op::Divide | Op::Modulo | Op::Minus => {
             // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors) is checked
             // before the numeric rule (a vector operand is not numeric).
@@ -4527,10 +4544,12 @@ fn analyze_text_polymorphic(
             args.len()
         )));
     }
-    // `LENGTH(lseg)` is a FLOAT (the segment's Euclidean length), unlike the INT text/BYTEA/BIT
-    // lengths — the sole arg's type decides the result.
+    // `LENGTH(lseg)` and `LENGTH(path)` are a FLOAT (the segment's / path's Euclidean length), unlike
+    // the INT text/BYTEA/BIT lengths — the sole arg's type decides the result.
     let lseg_ty = ColumnType::Geometry(nusadb_core::engine::GeomKind::Lseg);
-    let mut length_of_lseg = false;
+    let path_ty = ColumnType::Geometry(nusadb_core::engine::GeomKind::Path);
+    let is_geom_length_arg = |ty: ColumnType| ty == lseg_ty || ty == path_ty;
+    let mut length_of_geometry = false;
     let mut typed_args = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
         let typed = analyze_expr_agg(
@@ -4543,7 +4562,7 @@ fn analyze_text_polymorphic(
         let ok = if length_family {
             matches!(typed.ty.physical(), ColumnType::Text | ColumnType::Bytes)
                 || is_bit_type(typed.ty)
-                || (func == F::Length && typed.ty == lseg_ty)
+                || (func == F::Length && is_geom_length_arg(typed.ty))
         } else if matches!(func, F::ConcatWs) && i == 0 {
             typed.ty.physical() == ColumnType::Text
         } else {
@@ -4556,7 +4575,7 @@ fn analyze_text_polymorphic(
                 found: typed.ty,
             });
         }
-        length_of_lseg = func == F::Length && typed.ty == lseg_ty;
+        length_of_geometry = func == F::Length && is_geom_length_arg(typed.ty);
         typed_args.push(typed);
     }
     Ok(TypedExpr {
@@ -4564,7 +4583,7 @@ fn analyze_text_polymorphic(
             func,
             args: typed_args,
         },
-        ty: if length_of_lseg {
+        ty: if length_of_geometry {
             ColumnType::Float
         } else if length_family {
             ColumnType::Int

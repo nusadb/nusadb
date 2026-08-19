@@ -457,3 +457,118 @@ query T
 SELECT CAST('{1,-1,0}' AS LINE) # CAST('{1,-1,5}' AS LINE)
 ----
 NULL
+
+# ── path ────────────────────────────────────────────────────────────────────────────────────
+# A path is an ordered list of vertices, either an OPEN polyline `[(x1,y1),…]` or a CLOSED loop
+# `((x1,y1),…)`. The open/closed flag comes from the input's first delimiter: `[` opens, a `(` or a
+# bare coordinate closes.
+
+statement ok
+CREATE TABLE pth (id INT NOT NULL, p PATH)
+
+# Open (bracketed), closed (parenthesized), bare (→ closed), and single-vertex forms.
+statement ok
+INSERT INTO pth VALUES (1, '[(0,0),(1,1),(2,0)]')
+
+statement ok
+INSERT INTO pth VALUES (2, '((0,0),(1,1),(2,0))')
+
+statement ok
+INSERT INTO pth VALUES (3, '(0,0),(1,1),(2,0)')
+
+statement ok
+INSERT INTO pth VALUES (4, '[(5,5)]')
+
+statement ok
+INSERT INTO pth VALUES (5, '[(0,0),(3,0),(3,4)]')
+
+statement ok
+INSERT INTO pth VALUES (6, '((0,0),(3,0),(3,4))')
+
+statement ok
+INSERT INTO pth VALUES (7, '((0,0),(1,1),(2,0),(3,3))')
+
+# Canonical output: open keeps its brackets, closed and bare render with parentheses.
+query IT
+SELECT id, p FROM pth ORDER BY id
+----
+1  [(0,0),(1,1),(2,0)]
+2  ((0,0),(1,1),(2,0))
+3  ((0,0),(1,1),(2,0))
+4  [(5,5)]
+5  [(0,0),(3,0),(3,4)]
+6  ((0,0),(3,0),(3,4))
+7  ((0,0),(1,1),(2,0),(3,3))
+
+# An explicit CAST from text parses the same way; a bare coordinate list becomes a closed path.
+query T
+SELECT CAST('(0,0),(1,1),(2,0)' AS PATH)
+----
+((0,0),(1,1),(2,0))
+
+# npoints() counts the vertices.
+query I
+SELECT npoints(p) FROM pth WHERE id = 1
+----
+3
+
+query I
+SELECT npoints(p) FROM pth WHERE id = 7
+----
+4
+
+# length() sums the inter-vertex segments; a CLOSED path also adds the closing segment back to the
+# first vertex (id 5 open = 7, id 6 same vertices closed = 12), and a single-vertex path is 0.
+query R
+SELECT length(p) FROM pth WHERE id = 5
+----
+7.000
+
+query R
+SELECT length(p) FROM pth WHERE id = 6
+----
+12.000
+
+query R
+SELECT length(p) FROM pth WHERE id = 4
+----
+0.000
+
+# isopen()/isclosed() report the flag (rendered 1/0). An open path is open; a closed path is closed.
+query TT
+SELECT isopen(p), isclosed(p) FROM pth WHERE id = 1
+----
+1  0
+
+query TT
+SELECT isopen(p), isclosed(p) FROM pth WHERE id = 2
+----
+0  1
+
+# path + path: two OPEN paths concatenate into one OPEN path (the second's vertices appended).
+query T
+SELECT CAST('[(0,0),(1,1)]' AS PATH) + CAST('[(2,2),(3,3)]' AS PATH)
+----
+[(0,0),(1,1),(2,2),(3,3)]
+
+query T
+SELECT CAST('[(0,0),(1,1)]' AS PATH) + CAST('[(2,2)]' AS PATH)
+----
+[(0,0),(1,1),(2,2)]
+
+# If EITHER operand is CLOSED, the concatenation is NULL.
+query T
+SELECT (CAST('((0,0),(1,1))' AS PATH) + CAST('[(2,2)]' AS PATH)) IS NULL
+----
+1
+
+# A malformed path — an empty string or an odd coordinate count (a dangling half-vertex) — is a loud
+# error, not a silently truncated value.
+statement error
+SELECT CAST('' AS PATH)
+
+statement error
+SELECT CAST('[(0,0),(1)]' AS PATH)
+
+statement error
+SELECT CAST('abc' AS PATH)

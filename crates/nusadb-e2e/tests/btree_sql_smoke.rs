@@ -568,6 +568,76 @@ fn line_value_survives_reopen() {
     );
 }
 
+/// A `PATH` column is DURABLE on disk: each value is written to the WAL as its canonical text and
+/// recovery decodes it back to the same typed geometry after a crash — not just held in memory. Both
+/// an OPEN and a CLOSED path are stored, proving the open/closed FLAG and the variable-length vertex
+/// list survive intact; a second crash-reopen proves a value committed after recovery also survives.
+#[test]
+fn path_value_survives_reopen() {
+    use nusadb_sql::geometry::GeomVal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE paths (id INT PRIMARY KEY, p PATH)");
+        // An OPEN polyline (three vertices).
+        run(
+            &engine,
+            "INSERT INTO paths VALUES (1, '[(0,0),(1,1),(2,0)]')",
+        );
+        // A CLOSED loop over the same vertices — only the flag differs.
+        run(
+            &engine,
+            "INSERT INTO paths VALUES (2, '((0,0),(1,1),(2,0))')",
+        );
+        // A single-vertex open path (the minimal valid path).
+        run(&engine, "INSERT INTO paths VALUES (3, '[(5,5)]')");
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The open path decodes back to a typed geometry value (byte-correct), not text.
+        assert_eq!(
+            rows(run(&engine, "SELECT p FROM paths WHERE id = 1")),
+            vec![vec![Value::Geometry(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                false,
+            ))]]
+        );
+        // The closed path decodes back with its closed flag intact.
+        assert_eq!(
+            rows(run(&engine, "SELECT p FROM paths WHERE id = 2")),
+            vec![vec![Value::Geometry(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                true,
+            ))]]
+        );
+        // A committed insert after recovery also persists.
+        run(
+            &engine,
+            "INSERT INTO paths VALUES (4, '((0,0),(4,0),(4,3),(0,3))')",
+        );
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed row — pre-crash and post-recovery — survives, with each
+    // path's open/closed rendering preserved.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT id, p::TEXT FROM paths ORDER BY id")),
+        vec![
+            vec![Value::Int(1), Value::Text("[(0,0),(1,1),(2,0)]".to_owned())],
+            vec![Value::Int(2), Value::Text("((0,0),(1,1),(2,0))".to_owned())],
+            vec![Value::Int(3), Value::Text("[(5,5)]".to_owned())],
+            vec![
+                Value::Int(4),
+                Value::Text("((0,0),(4,0),(4,3),(0,3))".to_owned()),
+            ],
+        ]
+    );
+}
+
 /// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical

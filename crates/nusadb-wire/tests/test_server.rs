@@ -4463,3 +4463,53 @@ async fn line_renders_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A `PATH` column renders correctly over the real wire protocol — this proves the wire value
+/// encoding (`value_to_field`) formats a path as its canonical text (open in brackets, closed in
+/// parentheses), not a debug or byte dump, and that the variable-length vertex list survives the
+/// encode intact.
+#[tokio::test]
+async fn path_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (id int, p path)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // An OPEN path keeps its brackets; a bare coordinate list becomes a CLOSED path in parentheses.
+    query(&mut conn, "INSERT INTO t VALUES (1, '[(0,0),(1,1),(2,0)]')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+    query(&mut conn, "INSERT INTO t VALUES (2, '(0,0),(1,1),(2,0)')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT p FROM t ORDER BY id").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["p".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"[(0,0),(1,1),(2,0)]".to_vec())]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"((0,0),(1,1),(2,0))".to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 2"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

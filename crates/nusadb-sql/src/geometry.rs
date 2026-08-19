@@ -1,9 +1,10 @@
-//! Geometric types `point`, `box`, `circle`, `lseg`, and `line`: parsing, canonical formatting,
-//! operators, and functions.
+//! Geometric types `point`, `box`, `circle`, `lseg`, `line`, and `path`: parsing, canonical
+//! formatting, operators, and functions.
 //!
 //! A geometric value is a [`GeomVal`] — a `point` (an `(x, y)` pair), an axis-aligned `box` (two
 //! opposite corners), a `circle` (a center `(x, y)` and a radius `r`), an `lseg` (a line segment
-//! between two endpoints), or a `line` (an infinite line `A·x + B·y + C = 0`). Values persist as
+//! between two endpoints), a `line` (an infinite line `A·x + B·y + C = 0`), or a `path` (an ordered
+//! list of vertices forming an open polyline or a closed loop). Values persist as
 //! their canonical text form; the column's [`GeomKind`] tells the reader which shape to parse back
 //! into. Every function here is total: parse
 //! entry points return [`Option`] (a syntax error is `None`), and coordinate access is checked, so
@@ -70,6 +71,16 @@ pub enum GeomVal {
         /// Coefficient `C`.
         c: f64,
     },
+    /// A `path` — an ordered list of vertices. It is either an OPEN polyline (`[(x1,y1),…]`) or a
+    /// CLOSED loop (`((x1,y1),…)`); the input's first delimiter decides which (`[` opens, anything
+    /// else closes). This is the first variable-length geometric value, so [`GeomVal`] is no longer
+    /// fixed-arity — it already derives `Clone`/`PartialEq` (not `Copy`), so the [`Vec`] fits.
+    Path {
+        /// The ordered vertices `(x, y)`; at least one.
+        points: Vec<(f64, f64)>,
+        /// Whether the path is a CLOSED loop (`true`) or an OPEN polyline (`false`).
+        closed: bool,
+    },
 }
 
 impl GeomVal {
@@ -82,6 +93,7 @@ impl GeomVal {
             Self::Circle { .. } => GeomKind::Circle,
             Self::Lseg { .. } => GeomKind::Lseg,
             Self::Line { .. } => GeomKind::Line,
+            Self::Path { .. } => GeomKind::Path,
         }
     }
 
@@ -132,6 +144,12 @@ impl GeomVal {
         }
     }
 
+    /// Build a `path` from its ordered vertices and open/closed flag, preserving the vertex order.
+    #[must_use]
+    pub const fn path(points: Vec<(f64, f64)>, closed: bool) -> Self {
+        Self::Path { points, closed }
+    }
+
     /// Build a normalized `box` from two opposite corners, so the stored `high` corner is the
     /// per-axis maximum and `low` the per-axis minimum. Both `((1,1),(3,3))` and `((3,3),(1,1))`
     /// yield the same box.
@@ -158,8 +176,11 @@ fn fmt_num(v: f64) -> String {
     format!("{v}")
 }
 
-/// Render a value in its canonical text form: a `point` as `(x,y)`, a `box` as `(hx,hy),(lx,ly)`, a
-/// `circle` as `<(cx,cy),r>`, an `lseg` as `[(x1,y1),(x2,y2)]`, a `line` as `{A,B,C}`.
+/// Render a value in its canonical text form.
+///
+/// A `point` is `(x,y)`, a `box` is `(hx,hy),(lx,ly)`, a `circle` is `<(cx,cy),r>`, an `lseg` is
+/// `[(x1,y1),(x2,y2)]`, a `line` is `{A,B,C}`, and a `path` is `[(x1,y1),…]` when open or
+/// `((x1,y1),…)` when closed.
 #[must_use]
 pub fn format(v: &GeomVal) -> String {
     match v {
@@ -188,6 +209,18 @@ pub fn format(v: &GeomVal) -> String {
         ),
         GeomVal::Line { a, b, c } => {
             format!("{{{},{},{}}}", fmt_num(*a), fmt_num(*b), fmt_num(*c))
+        },
+        GeomVal::Path { points, closed } => {
+            let inner = points
+                .iter()
+                .map(|(x, y)| format!("({},{})", fmt_num(*x), fmt_num(*y)))
+                .collect::<Vec<_>>()
+                .join(",");
+            if *closed {
+                format!("({inner})")
+            } else {
+                format!("[{inner}]")
+            }
         },
     }
 }
@@ -290,6 +323,34 @@ pub fn parse_line(s: &str) -> Option<GeomVal> {
     }
 }
 
+/// Parse a `path` literal into an ordered vertex list plus an open/closed flag.
+///
+/// The open/closed flag is decided by the FIRST non-whitespace character of the input, BEFORE any
+/// delimiter is stripped: `[` opens (a polyline), anything else — a `(` or a bare coordinate —
+/// closes (a loop). The flat coordinate list is then read with `floats` and paired two-at-a-time
+/// into vertices, so `[(0,0),(1,1)]`, `((0,0),(1,1))`, and bare `(0,0),(1,1)` all parse.
+///
+/// Requires at least one vertex and an even coordinate count; an odd count (a dangling half-vertex),
+/// zero vertices, or an empty string yields `None`. A single vertex such as `[(5,5)]` is valid.
+#[must_use]
+pub fn parse_path(s: &str) -> Option<GeomVal> {
+    // Decide open/closed from the first non-whitespace character before stripping delimiters.
+    let closed = s.trim_start().chars().next()? != '[';
+    let coords = floats(s)?;
+    // A path needs at least one vertex, and every vertex is a full `(x, y)` pair (an even count).
+    if coords.is_empty() || coords.len() % 2 != 0 {
+        return None;
+    }
+    let points: Vec<(f64, f64)> = coords
+        .chunks_exact(2)
+        .filter_map(|pair| match pair {
+            [x, y] => Some((*x, *y)),
+            _ => None,
+        })
+        .collect();
+    Some(GeomVal::path(points, closed))
+}
+
 /// Parse a geometric literal against the target [`GeomKind`].
 #[must_use]
 pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
@@ -299,6 +360,7 @@ pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
         GeomKind::Circle => parse_circle(s),
         GeomKind::Lseg => parse_lseg(s),
         GeomKind::Line => parse_line(s),
+        GeomKind::Path => parse_path(s),
     }
 }
 
@@ -692,6 +754,56 @@ pub fn line_distance_line(a1: f64, b1: f64, c1: f64, a2: f64, b2: f64, c2: f64) 
     (a2 * px + b2 * py + c2).abs() / a2.hypot(b2)
 }
 
+// ── path functions & operators ───────────────────────────────────────────────────────────────────
+
+/// The number of vertices in a `path` (`npoints`), as `INT`. Saturates at [`i64::MAX`] rather than
+/// wrapping, so an implausibly long vertex list can never report a negative count.
+#[must_use]
+pub fn path_npoints(points: &[(f64, f64)]) -> i64 {
+    i64::try_from(points.len()).unwrap_or(i64::MAX)
+}
+
+/// The total length of a `path` (`length`): the sum of the segment lengths between consecutive
+/// vertices, plus — for a CLOSED path — the closing segment from the last vertex back to the first.
+///
+/// A single-vertex path has no segments, so its length is `0` (both open and closed, since the
+/// closing segment of a lone vertex has zero length).
+#[must_use]
+pub fn path_length(points: &[(f64, f64)], closed: bool) -> f64 {
+    let mut total = 0.0;
+    for pair in points.windows(2) {
+        if let [(x1, y1), (x2, y2)] = pair {
+            total += (x2 - x1).hypot(y2 - y1);
+        }
+    }
+    // A closed path adds the closing segment from the last vertex back to the first.
+    if closed && let (Some(&(fx, fy)), Some(&(lx, ly))) = (points.first(), points.last()) {
+        total += (fx - lx).hypot(fy - ly);
+    }
+    total
+}
+
+/// Concatenate two paths (`path + path`).
+///
+/// When BOTH operands are OPEN, the result is an OPEN path whose vertices are the first's followed by
+/// the second's. If EITHER operand is CLOSED there is no concatenation and the result is `None` (the
+/// operator yields `NULL`).
+#[must_use]
+pub fn path_concat(
+    a: &[(f64, f64)],
+    a_closed: bool,
+    b: &[(f64, f64)],
+    b_closed: bool,
+) -> Option<GeomVal> {
+    if a_closed || b_closed {
+        return None;
+    }
+    let mut points = Vec::with_capacity(a.len() + b.len());
+    points.extend_from_slice(a);
+    points.extend_from_slice(b);
+    Some(GeomVal::path(points, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,5 +1118,118 @@ mod tests {
         // A valid coefficient line and a valid two-point line still parse.
         assert_eq!(parse_line("{2,-2,0}"), Some(GeomVal::line(2.0, -2.0, 0.0)));
         assert!(parse_line("[(0,0),(1,1)]").is_some());
+    }
+
+    #[test]
+    fn path_parse_forms() {
+        // `[` opens a polyline; `(` or a bare coordinate closes a loop. The flag comes from the first
+        // non-whitespace character, before delimiters are stripped.
+        assert_eq!(
+            parse_path("[(0,0),(1,1),(2,0)]"),
+            Some(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                false
+            ))
+        );
+        assert_eq!(
+            parse_path("((0,0),(1,1),(2,0))"),
+            Some(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                true
+            ))
+        );
+        // A bare (undelimited) coordinate list is a CLOSED path.
+        assert_eq!(
+            parse_path("(0,0),(1,1),(2,0)"),
+            Some(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                true
+            ))
+        );
+        // A single vertex is valid.
+        assert_eq!(
+            parse_path("[(5,5)]"),
+            Some(GeomVal::path(vec![(5.0, 5.0)], false))
+        );
+        // An empty string, no vertices, an odd coordinate count, or garbage is rejected.
+        assert_eq!(parse_path(""), None);
+        assert_eq!(parse_path("[]"), None);
+        assert_eq!(parse_path("[(0,0),(1)]"), None);
+        assert_eq!(parse_path("abc"), None);
+    }
+
+    #[test]
+    fn path_format_canonical() {
+        assert_eq!(
+            format(&GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                false
+            )),
+            "[(0,0),(1,1),(2,0)]"
+        );
+        assert_eq!(
+            format(&GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)],
+                true
+            )),
+            "((0,0),(1,1),(2,0))"
+        );
+        assert_eq!(format(&GeomVal::path(vec![(5.0, 5.0)], false)), "[(5,5)]");
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact integer-valued segment sums (3-4-5 triangles) compare exactly"
+    )]
+    fn path_measures() {
+        let open = [(0.0, 0.0), (3.0, 0.0), (3.0, 4.0)];
+        let closed_pts = [(0.0, 0.0), (3.0, 0.0), (3.0, 4.0)];
+        // npoints counts the vertices.
+        assert_eq!(path_npoints(&open), 3);
+        assert_eq!(
+            path_npoints(&[(0.0, 0.0), (1.0, 1.0), (2.0, 0.0), (3.0, 3.0)]),
+            4
+        );
+        // length: open sums the segments; closed adds the closing segment back to the first vertex.
+        assert_eq!(path_length(&open, false), 7.0);
+        assert_eq!(path_length(&closed_pts, true), 12.0);
+        // A single vertex has no segments — length 0 whether open or closed.
+        assert_eq!(path_length(&[(5.0, 5.0)], false), 0.0);
+        assert_eq!(path_length(&[(5.0, 5.0)], true), 0.0);
+    }
+
+    #[test]
+    fn path_concat_forms() {
+        // open + open appends the second's vertices, staying open.
+        assert_eq!(
+            path_concat(
+                &[(0.0, 0.0), (1.0, 1.0)],
+                false,
+                &[(2.0, 2.0), (3.0, 3.0)],
+                false
+            ),
+            Some(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)],
+                false
+            ))
+        );
+        // A single-vertex second operand still appends.
+        assert_eq!(
+            path_concat(&[(0.0, 0.0), (1.0, 1.0)], false, &[(2.0, 2.0)], false),
+            Some(GeomVal::path(
+                vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)],
+                false
+            ))
+        );
+        // If EITHER operand is closed, there is no concatenation.
+        assert_eq!(
+            path_concat(&[(0.0, 0.0), (1.0, 1.0)], true, &[(2.0, 2.0)], false),
+            None
+        );
+        assert_eq!(
+            path_concat(&[(0.0, 0.0), (1.0, 1.0)], false, &[(2.0, 2.0)], true),
+            None
+        );
     }
 }

@@ -593,6 +593,11 @@ fn eval_scalar_function(
         (F::Length, [ast::Value::Geometry(crate::geometry::GeomVal::Lseg { x1, y1, x2, y2 })]) => {
             ast::Value::Float(crate::geometry::lseg_length(*x1, *y1, *x2, *y2))
         },
+        // Over a `path`, LENGTH is the total of the inter-vertex segments (plus the closing segment
+        // for a closed path), as a FLOAT.
+        (F::Length, [ast::Value::Geometry(crate::geometry::GeomVal::Path { points, closed })]) => {
+            ast::Value::Float(crate::geometry::path_length(points, *closed))
+        },
         (F::Upper, [Text(s)]) => Text(s.to_uppercase()),
         (F::Lower, [Text(s)]) => Text(s.to_lowercase()),
         (F::Sha256, [Text(s)]) => Text(super::crypto::sha256_hex(s)),
@@ -1042,6 +1047,18 @@ fn eval_scalar_function(
         (F::GeomDiameter, [ast::Value::Geometry(crate::geometry::GeomVal::Circle { r, .. })]) => {
             ast::Value::Float(crate::geometry::circle_diameter(*r))
         },
+        // NPOINTS(path) — the vertex count.
+        (F::GeomNpoints, [ast::Value::Geometry(crate::geometry::GeomVal::Path { points, .. })]) => {
+            ast::Value::Int(crate::geometry::path_npoints(points))
+        },
+        // ISOPEN/ISCLOSED(path) — the open/closed flag.
+        (F::GeomIsOpen, [ast::Value::Geometry(crate::geometry::GeomVal::Path { closed, .. })]) => {
+            ast::Value::Bool(!*closed)
+        },
+        (
+            F::GeomIsClosed,
+            [ast::Value::Geometry(crate::geometry::GeomVal::Path { closed, .. })],
+        ) => ast::Value::Bool(*closed),
         // Math functions — numeric-polymorphic, dispatched on value type within.
         (
             F::Abs
@@ -5207,6 +5224,25 @@ fn apply_geom_arithmetic(
 ) -> Result<ast::Value, Error> {
     use crate::geometry::GeomVal;
     use ast::BinaryOp as Op;
+    // `path + path` concatenates the two vertex lists (open + open); a closed operand yields NULL.
+    // Any other operator over paths is undefined and yields NULL.
+    if let (
+        ast::Value::Geometry(GeomVal::Path {
+            points: ap,
+            closed: ac,
+        }),
+        ast::Value::Geometry(GeomVal::Path {
+            points: bp,
+            closed: bc,
+        }),
+    ) = (left, right)
+    {
+        return Ok(match op {
+            Op::Plus => crate::geometry::path_concat(ap, *ac, bp, *bc)
+                .map_or(ast::Value::Null, ast::Value::Geometry),
+            _ => ast::Value::Null,
+        });
+    }
     let (
         ast::Value::Geometry(GeomVal::Point { x: ax, y: ay }),
         ast::Value::Geometry(GeomVal::Point { x: bx, y: by }),
