@@ -5464,7 +5464,8 @@ fn apply_geom_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value
 }
 
 /// Whether `container` contains `element`, inclusive of the boundary: `box @> point`,
-/// `circle @> point`, or `circle @> circle`. A `NULL` or wrong-shape operand yields `NULL`.
+/// `circle @> point`, `circle @> circle`, or `polygon @> point`. A `NULL` or wrong-shape operand
+/// yields `NULL`.
 fn geom_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
     use crate::geometry::GeomVal;
     match (container, element) {
@@ -5497,6 +5498,10 @@ fn geom_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
         ) => ast::Value::Bool(crate::geometry::circle_contains_circle(
             *ocx, *ocy, *or, *icx, *icy, *ir,
         )),
+        (
+            ast::Value::Geometry(GeomVal::Polygon { points }),
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+        ) => ast::Value::Bool(crate::geometry::polygon_contains_point(points, *x, *y)),
         _ => ast::Value::Null,
     }
 }

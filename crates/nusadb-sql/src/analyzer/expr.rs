@@ -4512,13 +4512,13 @@ fn check_geom_overlap(left: ColumnType, right: ColumnType) -> Result<ColumnType,
 }
 
 /// Type rule for geometric containment: `@>` (contains) and `<@` (contained by), for `box @> point`,
-/// `circle @> point`, and `circle @> circle`; each yields `BOOL`.
+/// `circle @> point`, `circle @> circle`, and `polygon @> point`; each yields `BOOL`.
 fn check_geom_containment(
     op: ast::BinaryOp,
     left: ColumnType,
     right: ColumnType,
 ) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind::{Box, Circle, Point};
+    use nusadb_core::engine::GeomKind::{Box, Circle, Point, Polygon};
     let (container, element) = match op {
         ast::BinaryOp::JsonContains => (left, right),
         _ => (right, left),
@@ -4526,7 +4526,7 @@ fn check_geom_containment(
     if matches!(
         (container, element),
         (
-            ColumnType::Geometry(Box | Circle),
+            ColumnType::Geometry(Box | Circle | Polygon),
             ColumnType::Geometry(Point)
         ) | (ColumnType::Geometry(Circle), ColumnType::Geometry(Circle))
     ) {

@@ -736,3 +736,54 @@ SELECT CAST('' AS POLYGON)
 
 statement error
 SELECT CAST('((0,0),(1))' AS POLYGON)
+
+# Containment polygon @> point, boundary-inclusive and correct for concave shapes. Unit square:
+# (2,2) interior → in; (5,2) exterior → out; (2,0) edge midpoint → in; (4,4) vertex → in;
+# (4.0001,4) just past the corner → out.
+query IIIII
+SELECT
+  CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) @> point(2,2),
+  CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) @> point(5,2),
+  CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) @> point(2,0),
+  CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) @> point(4,4),
+  CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) @> point(4.0001,4)
+----
+1  0  1  1  0
+
+# Right triangle: (1,1) interior → in; (2,2) on the hypotenuse → in; (3,3) past the hypotenuse →
+# out; (6,0) collinear with the base but beyond it → out.
+query IIII
+SELECT
+  CAST('((0,0),(4,0),(0,4))' AS POLYGON) @> point(1,1),
+  CAST('((0,0),(4,0),(0,4))' AS POLYGON) @> point(2,2),
+  CAST('((0,0),(4,0),(0,4))' AS POLYGON) @> point(3,3),
+  CAST('((0,0),(4,0),(0,4))' AS POLYGON) @> point(6,0)
+----
+1  1  0  0
+
+# Concave arrow ((0,0),(4,0),(4,4),(2,2),(0,4)): the notch point (2,3) sits in the cut-out → out;
+# the near-notch interior (1,3) → in; the shared notch vertex (2,2) → in.
+query III
+SELECT
+  CAST('((0,0),(4,0),(4,4),(2,2),(0,4))' AS POLYGON) @> point(2,3),
+  CAST('((0,0),(4,0),(4,4),(2,2),(0,4))' AS POLYGON) @> point(1,3),
+  CAST('((0,0),(4,0),(4,4),(2,2),(0,4))' AS POLYGON) @> point(2,2)
+----
+0  1  1
+
+# W-shape central notch (3,3) → out; the two prongs (1,3) and (3,1) → in.
+query III
+SELECT
+  CAST('((0,0),(6,0),(6,4),(4,4),(4,2),(2,2),(2,4),(0,4))' AS POLYGON) @> point(3,3),
+  CAST('((0,0),(6,0),(6,4),(4,4),(4,2),(2,2),(2,4),(0,4))' AS POLYGON) @> point(1,3),
+  CAST('((0,0),(6,0),(6,4),(4,4),(4,2),(2,2),(2,4),(0,4))' AS POLYGON) @> point(3,1)
+----
+0  1  1
+
+# point <@ polygon is the mirror of polygon @> point: (2,2) interior → in, (5,2) exterior → out.
+query II
+SELECT
+  point(2,2) <@ CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON),
+  point(5,2) <@ CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON)
+----
+1  0

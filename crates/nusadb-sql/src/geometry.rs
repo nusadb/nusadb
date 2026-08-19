@@ -129,7 +129,7 @@ impl GeomVal {
         Self::Line { a, b, c }
     }
 
-    /// Build a `line` through two distinct points, matching the reference engine's `line_construct`:
+    /// Build a `line` through two distinct points, matching the reference engine's construction:
     /// a vertical line (`x1 == x2`) becomes `A=-1, B=0, C=x1`; a horizontal line (`y1 == y2`) becomes
     /// `A=0, B=-1, C=y1`; otherwise `A=(y2−y1)/(x2−x1)`, `B=-1`, `C=y1 − A·x1`.
     #[must_use]
@@ -971,7 +971,7 @@ pub fn polygon_npoints(points: &[(f64, f64)]) -> i64 {
 }
 
 /// Whether two polygons are the SAME closed cycle (`polygon ~= polygon`), matching the reference
-/// engine's `poly_same`.
+/// engine's same-as rule.
 ///
 /// The two are the same iff their vertex counts are equal AND the vertex lists describe the same
 /// closed cycle: there is an index `i` where `b[i] == a[0]`, and from that anchor the two lists
@@ -1001,6 +1001,67 @@ pub fn polygon_same(a: &[(f64, f64)], b: &[(f64, f64)]) -> bool {
         let backward = (0..n).all(|k| b.get((i + n - k) % n) == a.get(k));
         forward || backward
     })
+}
+
+/// Whether a `polygon` CONTAINS a `point` (`polygon @> point`), boundary-inclusive and correct for
+/// concave shapes, matching the reference engine's point-in-polygon containment.
+///
+/// The vertices `points` form the closed loop `v[0] → v[1] → … → v[n-1] → v[0]`; the closing edge
+/// from the last vertex back to the first is implicit. The test is two-stage, returning `true` if
+/// EITHER stage does:
+///
+/// 1. **Boundary:** if `(px, py)` lies ON any edge — collinear with the two endpoints (the cross
+///    product of the edge vector and the endpoint→point vector is exactly `0.0`) AND inside the
+///    edge's coordinate bounding box — the point is contained. This makes every vertex and every
+///    edge point (including on the closing edge) `true`.
+/// 2. **Strict interior:** the crossing-number (pnpoly) ray-cast. For each edge `(v[i], v[j])` with
+///    `j` the previous vertex (wrapping), the horizontal ray to the point's left crosses the edge
+///    when `(v[i].y > py) != (v[j].y > py)` and the edge's x at height `py` is right of `px`. The
+///    half-open `>` comparison makes a ray that grazes a vertex count consistently, so
+///    ray-through-vertex degeneracies resolve the same as the reference engine.
+///
+/// Total: an empty vertex list is `false`; all vertex access is via [`slice::get`] / windows /
+/// iterators, never an index or an `unwrap`.
+#[must_use]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-product and ray-cast arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently and could flip a boundary point"
+)]
+pub fn polygon_contains_point(points: &[(f64, f64)], px: f64, py: f64) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    // Stage 1 — boundary: the point lies on some edge (each vertex paired with the next, wrapping so
+    // the last vertex closes back to the first).
+    let n = points.len();
+    let on_boundary = points.iter().enumerate().any(|(i, &(ax, ay))| {
+        let Some(&(bx, by)) = points.get((i + 1) % n) else {
+            return false;
+        };
+        // Collinear: the cross product of the edge vector (b−a) and (point−a) is exactly zero.
+        // Plain (non-fused) multiply-then-subtract to match the reference engine bit-for-bit.
+        let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+        // Within the edge's bounding box on both axes.
+        let in_box = px >= ax.min(bx) && px <= ax.max(bx) && py >= ay.min(by) && py <= ay.max(by);
+        cross == 0.0 && in_box
+    });
+    if on_boundary {
+        return true;
+    }
+    // Stage 2 — strict interior: the crossing-number ray-cast. `prev` is the previous vertex,
+    // starting at the last so the first edge tested is the closing edge (v[n-1] → v[0]).
+    let mut inside = false;
+    let mut prev = points.get(n - 1).copied();
+    for &(ix, iy) in points {
+        if let Some((jx, jy)) = prev
+            && ((iy > py) != (jy > py))
+            && (px < (jx - ix) * (py - iy) / (jy - iy) + ix)
+        {
+            inside = !inside;
+        }
+        prev = Some((ix, iy));
+    }
+    inside
 }
 
 #[cfg(test)]
@@ -1545,5 +1606,89 @@ mod tests {
         // Length mismatch and empty both return false.
         assert!(!super::polygon_same(&base, &[(0.0, 0.0)]));
         assert!(!super::polygon_same(&[], &[]));
+    }
+
+    #[test]
+    fn polygon_contains_point_matches_reference() {
+        // Every case here was checked against the reference engine's `polygon @> point`; the boolean
+        // is that engine's answer. Shapes: the unit square, a right triangle, a concave arrow, a
+        // W-shape, and an apex triangle, plus degenerate ray-through-vertex points and a 1-vertex
+        // polygon.
+        let square = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+        let triangle = [(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)];
+        let arrow = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (2.0, 2.0), (0.0, 4.0)];
+        let w = [
+            (0.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 4.0),
+            (4.0, 4.0),
+            (4.0, 2.0),
+            (2.0, 2.0),
+            (2.0, 4.0),
+            (0.0, 4.0),
+        ];
+        let apex = [(0.0, 0.0), (2.0, 2.0), (4.0, 0.0)];
+        let single = [(5.0, 5.0)];
+
+        let chk = |poly: &[(f64, f64)], px: f64, py: f64, want: bool| {
+            assert_eq!(
+                polygon_contains_point(poly, px, py),
+                want,
+                "polygon {poly:?} @> ({px},{py}) expected {want}"
+            );
+        };
+
+        // Unit square: interior, exterior, edge midpoints, vertices, just-outside corners, and
+        // ray-through-two-top-vertices degeneracies.
+        chk(&square, 2.0, 2.0, true);
+        chk(&square, 5.0, 2.0, false);
+        chk(&square, 2.0, 0.0, true);
+        chk(&square, 0.0, 2.0, true);
+        chk(&square, 4.0, 4.0, true);
+        chk(&square, 4.0001, 4.0, false);
+        chk(&square, 0.0, 0.0, true);
+        chk(&square, 4.0, 0.0, true);
+        chk(&square, 0.0, 4.0, true);
+        chk(&square, 4.0, 2.0, true);
+        chk(&square, 2.0, 4.0, true);
+        chk(&square, -0.0001, 2.0, false);
+        chk(&square, -1.0, 4.0, false);
+        chk(&square, -1.0, 2.0, false);
+        chk(&square, 1.0, 3.0, true);
+        // Right triangle: interior, on-hypotenuse, past-hypotenuse, collinear-outside, legs and
+        // vertices.
+        chk(&triangle, 1.0, 1.0, true);
+        chk(&triangle, 2.0, 2.0, true);
+        chk(&triangle, 3.0, 3.0, false);
+        chk(&triangle, 6.0, 0.0, false);
+        chk(&triangle, 2.0, 0.0, true);
+        chk(&triangle, 0.0, 2.0, true);
+        chk(&triangle, 1.5, 1.5, true);
+        chk(&triangle, 4.0, 4.0, false);
+        // Concave arrow: interior, the notch point (false), near-notch interior (true), and the
+        // shared notch vertex.
+        chk(&arrow, 2.0, 1.0, true);
+        chk(&arrow, 2.0, 3.0, false);
+        chk(&arrow, 1.0, 3.0, true);
+        chk(&arrow, 3.0, 3.0, true);
+        chk(&arrow, 2.0, 2.0, true);
+        // W-shape: central notch (false), the two interior prongs (true), and a prong edge.
+        chk(&w, 3.0, 3.0, false);
+        chk(&w, 1.0, 3.0, true);
+        chk(&w, 3.0, 1.0, true);
+        chk(&w, 5.0, 3.0, true);
+        chk(&w, 3.0, 5.0, false);
+        // Apex triangle: horizontal ray at apex height grazing the apex vertex (false), interior,
+        // on-apex, leg interior, base midpoint.
+        chk(&apex, -1.0, 2.0, false);
+        chk(&apex, 2.0, 1.0, true);
+        chk(&apex, 2.0, 2.0, true);
+        chk(&apex, 1.0, 1.0, true);
+        chk(&apex, 2.0, 0.0, true);
+        // Single-vertex polygon: only that exact point is contained.
+        chk(&single, 5.0, 5.0, true);
+        chk(&single, 5.0, 6.0, false);
+        // An empty polygon contains nothing.
+        assert!(!polygon_contains_point(&[], 0.0, 0.0));
     }
 }
