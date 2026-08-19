@@ -5453,6 +5453,10 @@ fn apply_geom_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value
             ) => ast::Value::Bool(crate::geometry::circle_overlap(
                 *acx, *acy, *ar, *bcx, *bcy, *br,
             )),
+            (
+                ast::Value::Geometry(GeomVal::Polygon { points: a }),
+                ast::Value::Geometry(GeomVal::Polygon { points: b }),
+            ) => ast::Value::Bool(crate::geometry::polygon_overlaps(a, b)),
             _ => ast::Value::Null,
         },
         // `@>` is `container @> element`; `<@` is `element <@ container`, so the container/element
@@ -5464,8 +5468,8 @@ fn apply_geom_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value
 }
 
 /// Whether `container` contains `element`, inclusive of the boundary: `box @> point`,
-/// `circle @> point`, `circle @> circle`, or `polygon @> point`. A `NULL` or wrong-shape operand
-/// yields `NULL`.
+/// `circle @> point`, `circle @> circle`, `polygon @> point`, or `polygon @> polygon`. A `NULL` or
+/// wrong-shape operand yields `NULL`.
 fn geom_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
     use crate::geometry::GeomVal;
     match (container, element) {
@@ -5502,6 +5506,10 @@ fn geom_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
             ast::Value::Geometry(GeomVal::Polygon { points }),
             ast::Value::Geometry(GeomVal::Point { x, y }),
         ) => ast::Value::Bool(crate::geometry::polygon_contains_point(points, *x, *y)),
+        (
+            ast::Value::Geometry(GeomVal::Polygon { points: outer }),
+            ast::Value::Geometry(GeomVal::Polygon { points: inner }),
+        ) => ast::Value::Bool(crate::geometry::polygon_contains_polygon(outer, inner)),
         _ => ast::Value::Null,
     }
 }

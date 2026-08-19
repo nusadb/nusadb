@@ -787,3 +787,71 @@ SELECT
   point(5,2) <@ CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON)
 ----
 1  0
+
+# --- Polygon–polygon predicates: overlap (&&), contains (@>), contained-by (<@) ---
+
+# Overlap && shares ANY point. Partial overlap, disjoint, bounding-boxes-overlap-but-shapes-don't,
+# one-inside-other, and far-apart squares.
+query IIIII
+SELECT
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) && CAST('((1,1),(3,1),(3,3),(1,3))' AS POLYGON),
+  CAST('((0,0),(1,0),(1,1))' AS POLYGON) && CAST('((5,5),(6,5),(6,6))' AS POLYGON),
+  CAST('((0,0),(4,0),(0,4))' AS POLYGON) && CAST('((4,4),(1,4),(4,1))' AS POLYGON),
+  CAST('((0,0),(6,0),(6,6),(0,6))' AS POLYGON) && CAST('((2,2),(3,2),(3,3),(2,3))' AS POLYGON),
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) && CAST('((10,10),(12,10),(12,12),(10,12))' AS POLYGON)
+----
+1  0  0  1  0
+
+# Overlap boundary touches: shared edge, shared corner only, plus-sign cross, single boundary point,
+# and a translated gap (no touch).
+query IIIII
+SELECT
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) && CAST('((2,0),(4,0),(4,2),(2,2))' AS POLYGON),
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) && CAST('((2,2),(4,2),(4,4),(2,4))' AS POLYGON),
+  CAST('((0,2),(6,2),(6,3),(0,3))' AS POLYGON) && CAST('((2,0),(3,0),(3,6),(2,6))' AS POLYGON),
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) && CAST('((2,1),(4,1),(4,3),(2,3))' AS POLYGON),
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) && CAST('((3,0),(5,0),(5,2),(3,2))' AS POLYGON)
+----
+1  1  1  1  0
+
+# Overlap on concave shapes: an arrow with a top notch vs a box sitting in the notch → no overlap
+# (bounding boxes overlap but the shapes don't); the same arrow vs a box in its solid lower-left →
+# overlap.
+query II
+SELECT
+  CAST('((0,0),(4,0),(4,4),(2,1),(0,4))' AS POLYGON) && CAST('((1,3),(3,3),(3,3.5),(1,3.5))' AS POLYGON),
+  CAST('((0,0),(4,0),(4,4),(2,1),(0,4))' AS POLYGON) && CAST('((0.5,0.5),(1,0.5),(1,1),(0.5,1))' AS POLYGON)
+----
+0  1
+
+# Contains @>: strictly inside, partial (poke-out), equal triangles, inner sharing outer boundary,
+# and inner wholly outside.
+query IIIII
+SELECT
+  CAST('((0,0),(6,0),(6,6),(0,6))' AS POLYGON) @> CAST('((2,2),(3,2),(3,3),(2,3))' AS POLYGON),
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) @> CAST('((1,1),(3,1),(3,3),(1,3))' AS POLYGON),
+  CAST('((0,0),(4,0),(4,4))' AS POLYGON) @> CAST('((0,0),(4,0),(4,4))' AS POLYGON),
+  CAST('((0,0),(6,0),(6,6),(0,6))' AS POLYGON) @> CAST('((0,0),(3,0),(3,3))' AS POLYGON),
+  CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON) @> CAST('((5,5),(6,5),(6,6))' AS POLYGON)
+----
+1  0  1  1  0
+
+# Contains @> on concave shapes and boundary-degenerate inners: concave poke-through (vertices in,
+# an edge crosses the notch) → out; concave clean → in; inner-vertex T-junction on an outer edge →
+# in; inner edge collinear-shares part of an outer edge → in.
+query IIII
+SELECT
+  CAST('((0,0),(4,0),(4,4),(2,1),(0,4))' AS POLYGON) @> CAST('((1,3),(3,3),(3,3.5),(1,3.5))' AS POLYGON),
+  CAST('((0,0),(4,0),(4,4),(2,1),(0,4))' AS POLYGON) @> CAST('((0.5,0.5),(1,0.5),(1,1),(0.5,1))' AS POLYGON),
+  CAST('((0,0),(6,0),(6,6),(0,6))' AS POLYGON) @> CAST('((3,0),(5,2),(1,2))' AS POLYGON),
+  CAST('((0,0),(6,0),(6,6),(0,6))' AS POLYGON) @> CAST('((1,0),(5,0),(3,3))' AS POLYGON)
+----
+0  1  1  1
+
+# Contained-by <@ is the mirror of @>: a small square inside a large one → in; a partial one → out.
+query II
+SELECT
+  CAST('((2,2),(3,2),(3,3),(2,3))' AS POLYGON) <@ CAST('((0,0),(6,0),(6,6),(0,6))' AS POLYGON),
+  CAST('((1,1),(3,1),(3,3),(1,3))' AS POLYGON) <@ CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON)
+----
+1  0

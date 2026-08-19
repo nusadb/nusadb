@@ -1064,6 +1064,179 @@ pub fn polygon_contains_point(points: &[(f64, f64)], px: f64, py: f64) -> bool {
     inside
 }
 
+/// The axis-aligned bounding box of a polygon's vertices as `(min_x, min_y, max_x, max_y)`.
+///
+/// An empty vertex list would yield `(+∞, +∞, −∞, −∞)`; the public callers guard emptiness before
+/// relying on the result, so that degenerate box never escapes.
+fn polygon_bbox(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    points.iter().fold(
+        (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ),
+        |(minx, miny, maxx, maxy), &(x, y)| (minx.min(x), miny.min(y), maxx.max(x), maxy.max(y)),
+    )
+}
+
+/// Iterate a polygon's directed edges as `(x1, y1, x2, y2)`, including the implicit closing edge
+/// from the last vertex back to the first (`v[n-1] → v[0]`).
+///
+/// Access is via [`slice::get`] with a modular index, never a raw index, so a malformed length can
+/// only shorten the iteration, never panic. An empty list yields no edges; a single vertex yields
+/// one self-edge.
+fn polygon_edges(points: &[(f64, f64)]) -> impl Iterator<Item = (f64, f64, f64, f64)> + '_ {
+    let n = points.len();
+    points.iter().enumerate().filter_map(move |(i, &(x1, y1))| {
+        points
+            .get((i + 1) % n.max(1))
+            .map(|&(x2, y2)| (x1, y1, x2, y2))
+    })
+}
+
+/// Whether two line segments PROPERLY cross: they meet at a single point that is strictly INTERIOR
+/// to BOTH segments.
+///
+/// Solving the same parametric system as [`lseg_intersection`] — `a1 + t·(a2−a1) = b1 + u·(b2−b1)`
+/// — this returns `true` only when the denominator is non-zero (segments are not parallel or
+/// collinear) AND both parameters land strictly inside the open interval `(0, 1)`. A shared
+/// endpoint, a T-junction where one segment's endpoint touches the other's interior, or a collinear
+/// overlap are therefore NOT proper crossings: the first two pin a parameter to exactly `0.0` or
+/// `1.0`, and the last leaves the denominator at zero.
+///
+/// Plain (non-fused) multiply-then-subtract keeps the cross products bit-for-bit identical to the
+/// reference engine; a fused `mul_add` could round the denominator or a parameter differently and
+/// flip a boundary decision.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the eight coordinates are the two segments' endpoints; grouping them into structs would only re-spell what the flat coordinate list already states"
+)]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the parallel/collinear test on the zero cross-product denominator, mirroring the reference engine"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-product arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently and could flip a boundary decision"
+)]
+pub fn lseg_proper_crossing(
+    ax1: f64,
+    ay1: f64,
+    ax2: f64,
+    ay2: f64,
+    bx1: f64,
+    by1: f64,
+    bx2: f64,
+    by2: f64,
+) -> bool {
+    let rx = ax2 - ax1;
+    let ry = ay2 - ay1;
+    let sx = bx2 - bx1;
+    let sy = by2 - by1;
+    let denom = rx * sy - ry * sx;
+    if denom == 0.0 {
+        // Parallel or collinear: no single interior crossing point.
+        return false;
+    }
+    let qpx = bx1 - ax1;
+    let qpy = by1 - ay1;
+    let t = (qpx * sy - qpy * sx) / denom;
+    let u = (qpx * ry - qpy * rx) / denom;
+    0.0 < t && t < 1.0 && 0.0 < u && u < 1.0
+}
+
+/// Whether two polygons OVERLAP — share ANY point (`polygon && polygon`), matching the reference
+/// engine's overlap predicate.
+///
+/// The vertices of each form a closed loop; the closing edge (last → first) is implicit. The test
+/// is a boundary-inclusive, concavity-correct four-step decision, returning `true` as soon as a
+/// step succeeds:
+///
+/// 1. **Quick reject:** if the two axis-aligned bounding boxes do not overlap, the shapes cannot —
+///    return `false` immediately.
+/// 2. **Edge touch/cross:** if ANY edge of `a` meets ANY edge of `b` — via [`lseg_intersection`],
+///    which is inclusive of endpoint and boundary touches — the shapes share a point.
+/// 3. **Containment:** otherwise, if `a` contains any vertex of `b` OR `b` contains any vertex of
+///    `a` (one shape sits wholly inside the other), they share a point.
+/// 4. Otherwise they are disjoint.
+///
+/// Total: an empty operand shares no point, so it is `false`. All vertex access is via iterators
+/// and [`slice::get`], never a raw index or an `unwrap`.
+#[must_use]
+pub fn polygon_overlaps(a: &[(f64, f64)], b: &[(f64, f64)]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    // Step 1 — quick reject on disjoint bounding boxes.
+    let (aminx, aminy, amaxx, amaxy) = polygon_bbox(a);
+    let (bminx, bminy, bmaxx, bmaxy) = polygon_bbox(b);
+    if !(aminx <= bmaxx && bminx <= amaxx && aminy <= bmaxy && bminy <= amaxy) {
+        return false;
+    }
+    // Step 2 — any edge pair meets (inclusive of endpoint/boundary touches).
+    for (ax1, ay1, ax2, ay2) in polygon_edges(a) {
+        for (bx1, by1, bx2, by2) in polygon_edges(b) {
+            if lseg_intersection(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2).is_some() {
+                return true;
+            }
+        }
+    }
+    // Step 3 — one shape wholly inside the other: a vertex of one lies within the other.
+    b.iter().any(|&(x, y)| polygon_contains_point(a, x, y))
+        || a.iter().any(|&(x, y)| polygon_contains_point(b, x, y))
+}
+
+/// Whether `outer` CONTAINS `inner` (`outer @> inner`, equivalently `inner <@ outer`), matching the
+/// reference engine's polygon-in-polygon containment, boundary-inclusive and correct for concave
+/// shapes.
+///
+/// The vertices of each form a closed loop; the closing edge (last → first) is implicit. Containment
+/// holds when every step below passes:
+///
+/// 1. **Bounding box:** `inner`'s bounding box must sit fully inside `outer`'s, else `outer` cannot
+///    contain it — return `false`.
+/// 2. **Vertices inside:** every vertex of `inner` must be contained in `outer` (boundary counts),
+///    else `false`.
+/// 3. **No proper crossing:** no edge of `inner` may PROPERLY cross an edge of `outer` (a strictly
+///    interior intersection of both segments, via [`lseg_proper_crossing`]). A shared endpoint, a
+///    T-junction touch, or a collinear shared edge does NOT disqualify — only a genuine
+///    poke-through does. This is what rejects a concave notch that an inner edge cuts across while
+///    its vertices remain inside.
+/// 4. Otherwise `inner` lies within `outer`.
+///
+/// Total: an empty operand is never contained and contains nothing, so it is `false`. All vertex
+/// access is via iterators and [`slice::get`], never a raw index or an `unwrap`.
+#[must_use]
+pub fn polygon_contains_polygon(outer: &[(f64, f64)], inner: &[(f64, f64)]) -> bool {
+    if outer.is_empty() || inner.is_empty() {
+        return false;
+    }
+    // Step 1 — inner's bounding box fully within outer's.
+    let (ominx, ominy, omaxx, omaxy) = polygon_bbox(outer);
+    let (iminx, iminy, imaxx, imaxy) = polygon_bbox(inner);
+    if !(ominx <= iminx && imaxx <= omaxx && ominy <= iminy && imaxy <= omaxy) {
+        return false;
+    }
+    // Step 2 — every vertex of inner is inside outer (boundary-inclusive).
+    if inner
+        .iter()
+        .any(|&(x, y)| !polygon_contains_point(outer, x, y))
+    {
+        return false;
+    }
+    // Step 3 — no inner edge properly crosses an outer edge (rejects concave poke-through).
+    for (ix1, iy1, ix2, iy2) in polygon_edges(inner) {
+        for (ox1, oy1, ox2, oy2) in polygon_edges(outer) {
+            if lseg_proper_crossing(ix1, iy1, ix2, iy2, ox1, oy1, ox2, oy2) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1690,5 +1863,243 @@ mod tests {
         chk(&single, 5.0, 6.0, false);
         // An empty polygon contains nothing.
         assert!(!polygon_contains_point(&[], 0.0, 0.0));
+    }
+
+    #[test]
+    fn lseg_proper_crossing_strict() {
+        // A genuine interior X-crossing: both parameters strictly in (0,1).
+        assert!(lseg_proper_crossing(0.0, 0.0, 2.0, 2.0, 0.0, 2.0, 2.0, 0.0));
+        // A T-junction: one segment's endpoint lands on the other's interior (a parameter is 0.0).
+        assert!(!lseg_proper_crossing(
+            0.0, 0.0, 4.0, 0.0, 2.0, 0.0, 2.0, 2.0
+        ));
+        // Shared endpoint only.
+        assert!(!lseg_proper_crossing(
+            0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 4.0, 0.0
+        ));
+        // Collinear overlap: the denominator is zero, so never a proper crossing.
+        assert!(!lseg_proper_crossing(
+            0.0, 0.0, 4.0, 0.0, 1.0, 0.0, 3.0, 0.0
+        ));
+        // Parallel but apart.
+        assert!(!lseg_proper_crossing(
+            0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 2.0, 1.0
+        ));
+        // Crossing lines whose segments do not both reach the meeting point (a parameter > 1).
+        assert!(!lseg_proper_crossing(
+            0.0, 0.0, 1.0, 1.0, 0.0, 4.0, 4.0, 0.0
+        ));
+    }
+
+    #[test]
+    fn polygon_overlaps_matches_reference() {
+        // Every boolean below is the reference engine's `polygon && polygon` answer, verified live.
+        let chk = |a: &[(f64, f64)], b: &[(f64, f64)], want: bool| {
+            assert_eq!(
+                polygon_overlaps(a, b),
+                want,
+                "{a:?} && {b:?} expected {want}"
+            );
+            // Overlap is symmetric.
+            assert_eq!(
+                polygon_overlaps(b, a),
+                want,
+                "{b:?} && {a:?} expected {want}"
+            );
+        };
+        // O1 partial overlap.
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)],
+            true,
+        );
+        // O2 disjoint triangles.
+        chk(
+            &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            &[(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
+            false,
+        );
+        // O3 bounding boxes overlap but the shapes do not (true-geometric reject).
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)],
+            &[(4.0, 4.0), (1.0, 4.0), (4.0, 1.0)],
+            false,
+        );
+        // O4 one wholly inside the other.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (2.0, 3.0)],
+            true,
+        );
+        // O5 shared edge.
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(2.0, 0.0), (4.0, 0.0), (4.0, 2.0), (2.0, 2.0)],
+            true,
+        );
+        // O6 shared corner only.
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0)],
+            true,
+        );
+        // O7 plus-sign cross: edges cross, no vertex of either inside the other.
+        chk(
+            &[(0.0, 2.0), (6.0, 2.0), (6.0, 3.0), (0.0, 3.0)],
+            &[(2.0, 0.0), (3.0, 0.0), (3.0, 6.0), (2.0, 6.0)],
+            true,
+        );
+        // O8 single boundary point (a vertex on the other's edge).
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(2.0, 1.0), (4.0, 1.0), (4.0, 3.0), (2.0, 3.0)],
+            true,
+        );
+        // O9 far disjoint squares.
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(10.0, 10.0), (12.0, 10.0), (12.0, 12.0), (10.0, 12.0)],
+            false,
+        );
+        // O10 small square nested inside a larger one.
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            &[(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0)],
+            true,
+        );
+        // O11 translated apart (a gap between them on x).
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(3.0, 0.0), (5.0, 0.0), (5.0, 2.0), (3.0, 2.0)],
+            false,
+        );
+        // O12 concave arrow vs a box sitting in its notch: bounding boxes overlap, shapes do not.
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (2.0, 1.0), (0.0, 4.0)],
+            &[(1.0, 3.0), (3.0, 3.0), (3.0, 3.5), (1.0, 3.5)],
+            false,
+        );
+        // O13 concave arrow vs a small box in its solid lower-left: overlaps.
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (2.0, 1.0), (0.0, 4.0)],
+            &[(0.5, 0.5), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0)],
+            true,
+        );
+        // O14 identical triangles.
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)],
+            &[(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)],
+            true,
+        );
+        // O15 a vertical strip passing right through a square (edges cross).
+        chk(
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, -1.0), (4.0, -1.0), (4.0, 11.0), (3.0, 11.0)],
+            true,
+        );
+        // Empty operands never overlap.
+        assert!(!polygon_overlaps(
+            &[],
+            &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+        ));
+    }
+
+    #[test]
+    fn polygon_contains_polygon_matches_reference() {
+        // Every boolean below is the reference engine's `outer @> inner` answer, verified live.
+        let chk = |outer: &[(f64, f64)], inner: &[(f64, f64)], want: bool| {
+            assert_eq!(
+                polygon_contains_polygon(outer, inner),
+                want,
+                "{outer:?} @> {inner:?} expected {want}"
+            );
+        };
+        // C1 small square strictly inside a large one.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (2.0, 3.0)],
+            true,
+        );
+        // C2 partial: inner pokes out (bounding box escapes).
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)],
+            false,
+        );
+        // C3 equal triangles: each contains the other (boundary-inclusive).
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)],
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)],
+            true,
+        );
+        // C4 inner shares part of the outer boundary but stays inside.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)],
+            true,
+        );
+        // C5 inner wholly outside.
+        chk(
+            &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+            &[(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
+            false,
+        );
+        // C6 concave poke-through: inner vertices inside, but an inner edge crosses the notch.
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (2.0, 1.0), (0.0, 4.0)],
+            &[(1.0, 3.0), (3.0, 3.0), (3.0, 3.5), (1.0, 3.5)],
+            false,
+        );
+        // C7 concave, clean: inner sits in the solid lower-left of the arrow.
+        chk(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (2.0, 1.0), (0.0, 4.0)],
+            &[(0.5, 0.5), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0)],
+            true,
+        );
+        // C8 T-junction: an inner vertex rests on an outer edge.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(3.0, 0.0), (5.0, 2.0), (1.0, 2.0)],
+            true,
+        );
+        // C9 collinear-shared edge: an inner edge lies along part of an outer edge.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(1.0, 0.0), (5.0, 0.0), (3.0, 3.0)],
+            true,
+        );
+        // C11 inner in a far corner, wholly outside.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(7.0, 7.0), (8.0, 7.0), (8.0, 8.0), (7.0, 8.0)],
+            false,
+        );
+        // C12 inner straddles a corner (bounding box escapes on the low side).
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)],
+            false,
+        );
+        // C13 a square contains itself.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            true,
+        );
+        // C14 inner shares an outer edge but its bounding box pokes past it.
+        chk(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[(6.0, 0.0), (8.0, 0.0), (8.0, 2.0), (6.0, 2.0)],
+            false,
+        );
+        // Empty operands: never contained, and contain nothing.
+        assert!(!polygon_contains_polygon(
+            &[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)],
+            &[]
+        ));
+        assert!(!polygon_contains_polygon(
+            &[],
+            &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+        ));
     }
 }

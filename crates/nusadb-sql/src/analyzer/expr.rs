@@ -4499,10 +4499,11 @@ fn check_geom_same_as(left: ColumnType, right: ColumnType) -> Result<ColumnType,
 
 /// Type rule for geometric overlap `&&`: `box && box` or `circle && circle`; the result is `BOOL`.
 fn check_geom_overlap(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind::{Box, Circle};
+    use nusadb_core::engine::GeomKind::{Box, Circle, Polygon};
     match (left, right) {
         (ColumnType::Geometry(Box), ColumnType::Geometry(Box))
-        | (ColumnType::Geometry(Circle), ColumnType::Geometry(Circle)) => Ok(ColumnType::Bool),
+        | (ColumnType::Geometry(Circle), ColumnType::Geometry(Circle))
+        | (ColumnType::Geometry(Polygon), ColumnType::Geometry(Polygon)) => Ok(ColumnType::Bool),
         _ => Err(Error::TypeMismatch {
             context: "`&&` geometric overlap".to_owned(),
             expected: left,
@@ -4512,7 +4513,8 @@ fn check_geom_overlap(left: ColumnType, right: ColumnType) -> Result<ColumnType,
 }
 
 /// Type rule for geometric containment: `@>` (contains) and `<@` (contained by), for `box @> point`,
-/// `circle @> point`, `circle @> circle`, and `polygon @> point`; each yields `BOOL`.
+/// `circle @> point`, `circle @> circle`, `polygon @> point`, and `polygon @> polygon`; each yields
+/// `BOOL`.
 fn check_geom_containment(
     op: ast::BinaryOp,
     left: ColumnType,
@@ -4529,6 +4531,7 @@ fn check_geom_containment(
             ColumnType::Geometry(Box | Circle | Polygon),
             ColumnType::Geometry(Point)
         ) | (ColumnType::Geometry(Circle), ColumnType::Geometry(Circle))
+            | (ColumnType::Geometry(Polygon), ColumnType::Geometry(Polygon))
     ) {
         Ok(ColumnType::Bool)
     } else {
