@@ -1,10 +1,10 @@
-//! Geometric types `point`, `box`, and `circle`: parsing, canonical formatting, operators, and
-//! functions.
+//! Geometric types `point`, `box`, `circle`, and `lseg`: parsing, canonical formatting, operators,
+//! and functions.
 //!
 //! A geometric value is a [`GeomVal`] — a `point` (an `(x, y)` pair), an axis-aligned `box` (two
-//! opposite corners), or a `circle` (a center `(x, y)` and a radius `r`). Values persist as their
-//! canonical text form; the column's [`GeomKind`] tells the reader which shape to parse back into.
-//! Every function here is total: parse
+//! opposite corners), a `circle` (a center `(x, y)` and a radius `r`), or an `lseg` (a line segment
+//! between two endpoints). Values persist as their canonical text form; the column's [`GeomKind`]
+//! tells the reader which shape to parse back into. Every function here is total: parse
 //! entry points return [`Option`] (a syntax error is `None`), and coordinate access is checked, so
 //! no path indexes or unwraps.
 //!
@@ -47,6 +47,18 @@ pub enum GeomVal {
         /// Radius (never negative; a zero radius is a degenerate point-circle).
         r: f64,
     },
+    /// An `lseg` — a line segment between two endpoints. Unlike a `box`, the endpoint order is
+    /// preserved exactly as entered (no normalization).
+    Lseg {
+        /// First endpoint X coordinate.
+        x1: f64,
+        /// First endpoint Y coordinate.
+        y1: f64,
+        /// Second endpoint X coordinate.
+        x2: f64,
+        /// Second endpoint Y coordinate.
+        y2: f64,
+    },
 }
 
 impl GeomVal {
@@ -57,6 +69,7 @@ impl GeomVal {
             Self::Point { .. } => GeomKind::Point,
             Self::Box { .. } => GeomKind::Box,
             Self::Circle { .. } => GeomKind::Circle,
+            Self::Lseg { .. } => GeomKind::Lseg,
         }
     }
 
@@ -70,6 +83,12 @@ impl GeomVal {
     #[must_use]
     pub const fn circle(cx: f64, cy: f64, r: f64) -> Self {
         Self::Circle { cx, cy, r }
+    }
+
+    /// Build an `lseg` from its two endpoints, preserving the given order (no normalization).
+    #[must_use]
+    pub const fn lseg(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
+        Self::Lseg { x1, y1, x2, y2 }
     }
 
     /// Build a normalized `box` from two opposite corners, so the stored `high` corner is the
@@ -99,7 +118,7 @@ fn fmt_num(v: f64) -> String {
 }
 
 /// Render a value in its canonical text form: a `point` as `(x,y)`, a `box` as `(hx,hy),(lx,ly)`, a
-/// `circle` as `<(cx,cy),r>`.
+/// `circle` as `<(cx,cy),r>`, an `lseg` as `[(x1,y1),(x2,y2)]`.
 #[must_use]
 pub fn format(v: &GeomVal) -> String {
     match v {
@@ -119,18 +138,25 @@ pub fn format(v: &GeomVal) -> String {
         GeomVal::Circle { cx, cy, r } => {
             format!("<({},{}),{}>", fmt_num(*cx), fmt_num(*cy), fmt_num(*r))
         },
+        GeomVal::Lseg { x1, y1, x2, y2 } => format!(
+            "[({},{}),({},{})]",
+            fmt_num(*x1),
+            fmt_num(*y1),
+            fmt_num(*x2),
+            fmt_num(*y2),
+        ),
     }
 }
 
 /// Extract the finite floating-point tokens from a geometric literal, treating parentheses, the
-/// circle delimiters `<`/`>`, commas, and whitespace as separators. Returns `None` if any token
-/// fails to parse. A minus sign and exponent stay attached to their number since only `(`, `)`,
-/// `<`, `>`, `,`, and whitespace separate tokens.
+/// circle delimiters `<`/`>`, the lseg brackets `[`/`]`, commas, and whitespace as separators.
+/// Returns `None` if any token fails to parse. A minus sign and exponent stay attached to their
+/// number since only `(`, `)`, `<`, `>`, `[`, `]`, `,`, and whitespace separate tokens.
 fn floats(s: &str) -> Option<Vec<f64>> {
     let cleaned: String = s
         .chars()
         .map(|c| {
-            if c == '(' || c == ')' || c == '<' || c == '>' {
+            if matches!(c, '(' | ')' | '<' | '>' | '[' | ']') {
                 ' '
             } else {
                 c
@@ -177,6 +203,18 @@ pub fn parse_circle(s: &str) -> Option<GeomVal> {
     }
 }
 
+/// Parse an `lseg` literal: `[(x1,y1),(x2,y2)]`, `((x1,y1),(x2,y2))`, or `x1,y1,x2,y2`.
+///
+/// Requires exactly four coordinates (the two endpoints). Unlike a `box`, the endpoint order is
+/// preserved exactly (no normalization), so `[(3,4),(1,2)]` stays `[(3,4),(1,2)]`.
+#[must_use]
+pub fn parse_lseg(s: &str) -> Option<GeomVal> {
+    match floats(s)?.as_slice() {
+        &[x1, y1, x2, y2] => Some(GeomVal::lseg(x1, y1, x2, y2)),
+        _ => None,
+    }
+}
+
 /// Parse a geometric literal against the target [`GeomKind`].
 #[must_use]
 pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
@@ -184,6 +222,7 @@ pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
         GeomKind::Point => parse_point(s),
         GeomKind::Box => parse_box(s),
         GeomKind::Circle => parse_circle(s),
+        GeomKind::Lseg => parse_lseg(s),
     }
 }
 
@@ -379,6 +418,122 @@ pub fn circle_contains_circle(ocx: f64, ocy: f64, or: f64, icx: f64, icy: f64, i
     point_distance(ocx, ocy, icx, icy) + ir <= or
 }
 
+// ── lseg functions & operators ─────────────────────────────────────────────────────────────────
+
+/// Length of a line segment (`length(lseg)`): the Euclidean distance between its two endpoints.
+#[must_use]
+pub fn lseg_length(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    point_distance(x1, y1, x2, y2)
+}
+
+/// Distance from a line segment to a point (`lseg <-> point`): the distance to the nearest point on
+/// the segment.
+///
+/// The point is projected onto the segment's line; if the foot lies within the segment the
+/// perpendicular distance is used, otherwise the distance to the nearer endpoint. A degenerate
+/// segment (both endpoints equal) collapses to the point-to-point distance.
+#[must_use]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the intended test for a degenerate (zero-length) segment, where no projection parameter exists"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) multiply-then-add matches the reference engine's IEEE-754 projection result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn lseg_distance_point(x1: f64, y1: f64, x2: f64, y2: f64, px: f64, py: f64) -> f64 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let denom = dx * dx + dy * dy;
+    // Project the point onto the segment; `t` is the clamped parameter of the foot in `[0, 1]`.
+    let t = if denom == 0.0 {
+        0.0
+    } else {
+        (((px - x1) * dx + (py - y1) * dy) / denom).clamp(0.0, 1.0)
+    };
+    point_distance(x1 + t * dx, y1 + t * dy, px, py)
+}
+
+/// The intersection point of two line segments (`lseg # lseg`), or `None` when they do not cross at
+/// a single point.
+///
+/// Solves the two-parameter line system `A1 + t·(A2−A1) = B1 + u·(B2−B1)`; the intersection is valid
+/// only when both `t` and `u` lie in `[0, 1]`. A zero denominator (the segments are parallel or
+/// collinear) yields `None` — collinear overlap is not reported as a point.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the eight coordinates are the two segments' endpoints; grouping them into structs would only re-spell what the flat coordinate list already states"
+)]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the parallel/collinear test the reference engine uses for the zero cross-product denominator"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-product arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn lseg_intersection(
+    ax1: f64,
+    ay1: f64,
+    ax2: f64,
+    ay2: f64,
+    bx1: f64,
+    by1: f64,
+    bx2: f64,
+    by2: f64,
+) -> Option<GeomVal> {
+    let rx = ax2 - ax1;
+    let ry = ay2 - ay1;
+    let sx = bx2 - bx1;
+    let sy = by2 - by1;
+    let denom = rx * sy - ry * sx;
+    if denom == 0.0 {
+        // Parallel or collinear: no single crossing point.
+        return None;
+    }
+    let qpx = bx1 - ax1;
+    let qpy = by1 - ay1;
+    let t = (qpx * sy - qpy * sx) / denom;
+    let u = (qpx * ry - qpy * rx) / denom;
+    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+        Some(GeomVal::point(ax1 + t * rx, ay1 + t * ry))
+    } else {
+        None
+    }
+}
+
+/// Distance between two line segments (`lseg <-> lseg`): `0` when they intersect, otherwise the
+/// minimum endpoint-to-segment gap.
+///
+/// The minimum is taken over the four endpoint-to-segment distances (each endpoint of one segment to
+/// the other segment). A collinear-overlapping pair falls out as `0` naturally, since an endpoint of
+/// one lies on the other segment.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the eight coordinates are the two segments' endpoints; grouping them into structs would only re-spell what the flat coordinate list already states"
+)]
+pub fn lseg_distance_lseg(
+    ax1: f64,
+    ay1: f64,
+    ax2: f64,
+    ay2: f64,
+    bx1: f64,
+    by1: f64,
+    bx2: f64,
+    by2: f64,
+) -> f64 {
+    if lseg_intersection(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2).is_some() {
+        return 0.0;
+    }
+    let d1 = lseg_distance_point(bx1, by1, bx2, by2, ax1, ay1);
+    let d2 = lseg_distance_point(bx1, by1, bx2, by2, ax2, ay2);
+    let d3 = lseg_distance_point(ax1, ay1, ax2, ay2, bx1, by1);
+    let d4 = lseg_distance_point(ax1, ay1, ax2, ay2, bx2, by2);
+    d1.min(d2).min(d3).min(d4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +654,91 @@ mod tests {
         assert!(!circle_contains_point(0.0, 0.0, 5.0, 3.0, 5.0));
         assert!(circle_contains_circle(0.0, 0.0, 5.0, 0.0, 0.0, 2.0));
         assert!(!circle_contains_circle(0.0, 0.0, 5.0, 4.0, 0.0, 2.0));
+    }
+
+    #[test]
+    fn lseg_parse_forms() {
+        // All three input spellings parse identically.
+        assert_eq!(
+            parse_lseg("[(1,2),(3,4)]"),
+            Some(GeomVal::lseg(1.0, 2.0, 3.0, 4.0))
+        );
+        assert_eq!(
+            parse_lseg("((1,2),(3,4))"),
+            Some(GeomVal::lseg(1.0, 2.0, 3.0, 4.0))
+        );
+        assert_eq!(
+            parse_lseg("1,2,3,4"),
+            Some(GeomVal::lseg(1.0, 2.0, 3.0, 4.0))
+        );
+        // Endpoint order is preserved (no normalization).
+        assert_eq!(
+            parse_lseg("[(3,4),(1,2)]"),
+            Some(GeomVal::lseg(3.0, 4.0, 1.0, 2.0))
+        );
+        assert_eq!(parse_lseg("abc"), None);
+        assert_eq!(parse_lseg("[(1,2),(3,4),(5,6)]"), None);
+        assert_eq!(parse_lseg("[(1,2)]"), None);
+    }
+
+    #[test]
+    fn lseg_format_canonical() {
+        assert_eq!(
+            format(&GeomVal::lseg(1.5, 2.5, 3.5, 4.5)),
+            "[(1.5,2.5),(3.5,4.5)]"
+        );
+        // Order-preserving: the reversed endpoints render reversed, unlike a box.
+        assert_eq!(format(&GeomVal::lseg(3.0, 4.0, 1.0, 2.0)), "[(3,4),(1,2)]");
+        assert_eq!(
+            format(&GeomVal::lseg(-0.0, -0.0, 0.0, 0.0)),
+            "[(0,0),(0,0)]"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact integer-valued and √-of-perfect-square results compare exactly"
+    )]
+    fn lseg_ops() {
+        // length = distance between endpoints.
+        assert_eq!(lseg_length(0.0, 0.0, 3.0, 4.0), 5.0);
+        assert_eq!(lseg_length(0.0, 0.0, 0.0, 7.0), 7.0);
+        assert_eq!(lseg_length(0.0, 0.0, 0.0, 0.0), 0.0);
+        // lseg <-> point: perpendicular when the foot is on the segment, else the nearer endpoint.
+        assert_eq!(lseg_distance_point(0.0, 0.0, 4.0, 0.0, 6.0, 0.0), 2.0);
+        assert_eq!(lseg_distance_point(0.0, 0.0, 4.0, 0.0, 2.0, 3.0), 3.0);
+        assert_eq!(lseg_distance_point(0.0, 0.0, 0.0, 4.0, 3.0, 0.0), 3.0);
+        // lseg <-> lseg: 0 when they cross, else the endpoint-gap minimum.
+        assert_eq!(
+            lseg_distance_lseg(0.0, 0.0, 2.0, 2.0, 0.0, 2.0, 2.0, 0.0),
+            0.0
+        );
+        assert_eq!(
+            lseg_distance_lseg(0.0, 0.0, 4.0, 0.0, 0.0, 3.0, 4.0, 3.0),
+            3.0
+        );
+        assert_eq!(
+            lseg_distance_lseg(0.0, 0.0, 1.0, 0.0, 5.0, 0.0, 6.0, 0.0),
+            4.0
+        );
+        // lseg # lseg: the crossing point, a shared endpoint, or None.
+        assert_eq!(
+            lseg_intersection(0.0, 0.0, 2.0, 2.0, 0.0, 2.0, 2.0, 0.0),
+            Some(GeomVal::point(1.0, 1.0))
+        );
+        assert_eq!(
+            lseg_intersection(0.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 2.0),
+            Some(GeomVal::point(2.0, 0.0))
+        );
+        // Collinear overlap and disjoint parallels return no single point.
+        assert_eq!(
+            lseg_intersection(0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 3.0, 0.0),
+            None
+        );
+        assert_eq!(
+            lseg_intersection(0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 1.0, 2.0),
+            None
+        );
     }
 }

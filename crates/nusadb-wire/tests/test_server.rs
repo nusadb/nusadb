@@ -4378,3 +4378,46 @@ async fn circle_renders_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// An `LSEG` column renders correctly over the real wire protocol — this proves the wire value
+/// encoding (`value_to_field`) formats a line segment as its canonical text `[(x1,y1),(x2,y2)]`, not
+/// a debug or byte dump. The paren input form proves canonicalization happens before it reaches the
+/// wire, and the reversed endpoints prove the segment order is preserved (no box-style
+/// normalization).
+#[tokio::test]
+async fn lseg_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (s lseg)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // The paren input form with reversed endpoints must show up as the canonical, order-preserving
+    // [(x1,y1),(x2,y2)] on the wire.
+    query(&mut conn, "INSERT INTO t VALUES ('((3.5,4.5),(1.5,2.5))')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT s FROM t").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["s".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"[(3.5,4.5),(1.5,2.5)]".to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

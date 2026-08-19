@@ -589,6 +589,10 @@ fn eval_scalar_function(
         (F::BitLength, [Text(s)]) => {
             Int(i64::try_from(s.len()).map_or(i64::MAX, |n| n.saturating_mul(8)))
         },
+        // Over an `lseg`, LENGTH is the segment's Euclidean length, as a FLOAT.
+        (F::Length, [ast::Value::Geometry(crate::geometry::GeomVal::Lseg { x1, y1, x2, y2 })]) => {
+            ast::Value::Float(crate::geometry::lseg_length(*x1, *y1, *x2, *y2))
+        },
         (F::Upper, [Text(s)]) => Text(s.to_uppercase()),
         (F::Lower, [Text(s)]) => Text(s.to_lowercase()),
         (F::Sha256, [Text(s)]) => Text(super::crypto::sha256_hex(s)),
@@ -5120,6 +5124,14 @@ fn apply_binary(
         Op::BitAnd | Op::BitOr if matches!(left, ast::Value::Macaddr8(_)) => {
             Ok(apply_macaddr8_bit_op(op, left, right))
         },
+        // `#` (BitXor) is the geometric `lseg # lseg` intersection when an operand is geometry,
+        // yielding the crossing point (or NULL); routed before the bit-string / integer XOR below.
+        Op::BitXor
+            if matches!(left, ast::Value::Geometry(_))
+                || matches!(right, ast::Value::Geometry(_)) =>
+        {
+            Ok(geom_intersection_op(left, right))
+        },
         // BIT-string operators: `&`/`|`/`#`, `<<`/`>>` (shift), and `||` (concat).
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight | Op::Concat
             if matches!(left, ast::Value::Bit(_)) =>
@@ -5264,6 +5276,59 @@ fn geom_distance_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
         ) => ast::Value::Float(crate::geometry::circle_distance_circle(
             *acx, *acy, *ar, *bcx, *bcy, *br,
         )),
+        // `lseg <-> point`, either operand order: distance to the nearest point on the segment.
+        (
+            ast::Value::Geometry(GeomVal::Lseg { x1, y1, x2, y2 }),
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+        )
+        | (
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+            ast::Value::Geometry(GeomVal::Lseg { x1, y1, x2, y2 }),
+        ) => ast::Value::Float(crate::geometry::lseg_distance_point(
+            *x1, *y1, *x2, *y2, *x, *y,
+        )),
+        // `lseg <-> lseg`: 0 if they intersect, else the minimum endpoint-to-segment gap.
+        (
+            ast::Value::Geometry(GeomVal::Lseg {
+                x1: ax1,
+                y1: ay1,
+                x2: ax2,
+                y2: ay2,
+            }),
+            ast::Value::Geometry(GeomVal::Lseg {
+                x1: bx1,
+                y1: by1,
+                x2: bx2,
+                y2: by2,
+            }),
+        ) => ast::Value::Float(crate::geometry::lseg_distance_lseg(
+            *ax1, *ay1, *ax2, *ay2, *bx1, *by1, *bx2, *by2,
+        )),
+        _ => ast::Value::Null,
+    }
+}
+
+/// Evaluate the geometric intersection operator `#`: `lseg # lseg` yields the crossing `point` when
+/// the two segments cross or touch at a single point, else `NULL` (collinear-overlapping or
+/// non-intersecting segments). A `NULL` or non-lseg operand yields `NULL`.
+fn geom_intersection_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
+    use crate::geometry::GeomVal;
+    match (left, right) {
+        (
+            ast::Value::Geometry(GeomVal::Lseg {
+                x1: ax1,
+                y1: ay1,
+                x2: ax2,
+                y2: ay2,
+            }),
+            ast::Value::Geometry(GeomVal::Lseg {
+                x1: bx1,
+                y1: by1,
+                x2: bx2,
+                y2: by2,
+            }),
+        ) => crate::geometry::lseg_intersection(*ax1, *ay1, *ax2, *ay2, *bx1, *by1, *bx2, *by2)
+            .map_or(ast::Value::Null, ast::Value::Geometry),
         _ => ast::Value::Null,
     }
 }

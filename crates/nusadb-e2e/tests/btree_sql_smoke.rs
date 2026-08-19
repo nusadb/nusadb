@@ -439,6 +439,73 @@ fn circle_value_survives_reopen() {
     );
 }
 
+/// An `LSEG` column is DURABLE on disk: each value is written to the WAL as its canonical text
+/// `[(x1,y1),(x2,y2)]` and recovery decodes it back to the same typed geometry after a crash — not
+/// just held in memory. The non-canonical input forms (paren and bare) prove the
+/// parse-and-canonicalize happens before persistence, the reversed-endpoint row proves the segment
+/// order is preserved (no box-style normalization), and a second crash-reopen proves a value
+/// committed after recovery also survives.
+#[test]
+fn lseg_value_survives_reopen() {
+    use nusadb_sql::geometry::GeomVal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE segs (id INT PRIMARY KEY, s LSEG)");
+        run(
+            &engine,
+            "INSERT INTO segs VALUES (1, '[(1.5,2.5),(3.5,4.5)]')",
+        );
+        // Non-canonical input forms canonicalize before they persist.
+        run(&engine, "INSERT INTO segs VALUES (2, '((1,2),(3,4))')");
+        run(&engine, "INSERT INTO segs VALUES (3, '5,6,7,8')");
+        // Reversed endpoints stay reversed — the order is preserved, unlike a box.
+        run(&engine, "INSERT INTO segs VALUES (4, '[(3,4),(1,2)]')");
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The lseg column decodes back to a typed geometry value (byte-correct), not text.
+        assert_eq!(
+            rows(run(&engine, "SELECT s FROM segs WHERE id = 1")),
+            vec![vec![Value::Geometry(GeomVal::lseg(1.5, 2.5, 3.5, 4.5))]]
+        );
+        // The canonical text of the recovered non-canonical inputs matches.
+        assert_eq!(
+            rows(run(
+                &engine,
+                "SELECT s::TEXT FROM segs WHERE id = 2 OR id = 3 ORDER BY id"
+            )),
+            vec![
+                vec![Value::Text("[(1,2),(3,4)]".to_owned())],
+                vec![Value::Text("[(5,6),(7,8)]".to_owned())],
+            ]
+        );
+        // A committed insert after recovery also persists.
+        run(&engine, "INSERT INTO segs VALUES (5, '[(0,0),(0,0)]')");
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed row — pre-crash and post-recovery — survives, with the
+    // reversed-endpoint row (id 4) still un-normalized.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT id, s::TEXT FROM segs ORDER BY id")),
+        vec![
+            vec![
+                Value::Int(1),
+                Value::Text("[(1.5,2.5),(3.5,4.5)]".to_owned())
+            ],
+            vec![Value::Int(2), Value::Text("[(1,2),(3,4)]".to_owned())],
+            vec![Value::Int(3), Value::Text("[(5,6),(7,8)]".to_owned())],
+            vec![Value::Int(4), Value::Text("[(3,4),(1,2)]".to_owned())],
+            vec![Value::Int(5), Value::Text("[(0,0),(0,0)]".to_owned())],
+        ]
+    );
+}
+
 /// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical

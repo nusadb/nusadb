@@ -489,7 +489,8 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         D::Custom(name, _) if is_named(name, "cidr") => ColumnType::Cidr,
         // Range types (`int4range`/`numrange`/`daterange`/`tsrange`/`tstzrange`) → native ranges.
         D::Custom(name, _) if let Some(kind) = range_kind_of_name(name) => ColumnType::Range(kind),
-        // Geometric types (`point`/`box`/`circle`) → native geometry (not the text-backed alias below).
+        // Geometric types (`point`/`box`/`circle`/`lseg`) → native geometry (not the text-backed
+        // alias below).
         D::Custom(name, _) if is_named(name, "point") => {
             ColumnType::Geometry(nusadb_core::engine::GeomKind::Point)
         },
@@ -498,6 +499,9 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         },
         D::Custom(name, _) if is_named(name, "circle") => {
             ColumnType::Geometry(nusadb_core::engine::GeomKind::Circle)
+        },
+        D::Custom(name, _) if is_named(name, "lseg") => {
+            ColumnType::Geometry(nusadb_core::engine::GeomKind::Lseg)
         },
         // A custom (named) type: a standard SQL type NusaDB does not model natively (currency,
         // object-id, network, bit-string, geometric, range, full-text, XML) maps onto a base storage
@@ -531,8 +535,8 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
         // Stored as their canonical text form (no native operators yet): the remaining geometric
         // shapes, full-text, and XML types. (`macaddr`/`inet`/`cidr`, the range types, and the native
-        // geometric types `point`/`box`/`circle` are handled above.)
-        "xml" | "tsvector" | "tsquery" | "line" | "lseg" | "path" | "polygon" => ColumnType::Text,
+        // geometric types `point`/`box`/`circle`/`lseg` are handled above.)
+        "xml" | "tsvector" | "tsquery" | "line" | "path" | "polygon" => ColumnType::Text,
         _ => return None,
     })
 }

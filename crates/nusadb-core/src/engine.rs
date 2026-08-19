@@ -337,7 +337,7 @@ impl RangeKind {
 /// The kind of a geometric value (`point`, `box`, …) carried by [`ColumnType::Geometry`]. A `Copy`
 /// enum so [`ColumnType`] stays `Copy`.
 ///
-/// Extensible: further kinds (`line`, `lseg`, `path`, `polygon`) append new variants and new
+/// Extensible: further kinds (`line`, `path`, `polygon`) append new variants and new
 /// [`GeomKind::tag`] values without renumbering the existing ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GeomKind {
@@ -347,16 +347,19 @@ pub enum GeomKind {
     Box,
     /// `circle` — a center `(x, y)` and a non-negative radius `r`.
     Circle,
+    /// `lseg` — a line segment given by its two endpoints `(x1, y1)` and `(x2, y2)`.
+    Lseg,
 }
 
 impl GeomKind {
-    /// The SQL type name (`point`, `box`, `circle`).
+    /// The SQL type name (`point`, `box`, `circle`, `lseg`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Point => "point",
             Self::Box => "box",
             Self::Circle => "circle",
+            Self::Lseg => "lseg",
         }
     }
 
@@ -367,6 +370,7 @@ impl GeomKind {
             Self::Point => 0,
             Self::Box => 1,
             Self::Circle => 2,
+            Self::Lseg => 3,
         }
     }
 
@@ -377,6 +381,7 @@ impl GeomKind {
             0 => Some(Self::Point),
             1 => Some(Self::Box),
             2 => Some(Self::Circle),
+            3 => Some(Self::Lseg),
             _ => None,
         }
     }

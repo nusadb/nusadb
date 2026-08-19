@@ -250,3 +250,112 @@ SELECT
   CAST('<(0,0),2>' AS CIRCLE) ~= CAST('<(1,0),2>' AS CIRCLE)
 ----
 1  0
+
+# ── lseg ────────────────────────────────────────────────────────────────────────────────────
+# An lseg is a line segment between two endpoints, canonical form [(x1,y1),(x2,y2)]. Unlike a box,
+# the endpoint order is PRESERVED (no normalization).
+
+statement ok
+CREATE TABLE seg (id INT NOT NULL, s LSEG)
+
+# Implicit text coercion: canonical [(..),(..)], the paren form ((..),(..)), and the bare x1,y1,x2,y2.
+statement ok
+INSERT INTO seg VALUES (1, '[(1.5,2.5),(3.5,4.5)]')
+
+statement ok
+INSERT INTO seg VALUES (2, '((1,2),(3,4))')
+
+statement ok
+INSERT INTO seg VALUES (3, '5,6,7,8')
+
+# Endpoint order is preserved verbatim — a reversed segment stays reversed (a box would normalize).
+statement ok
+INSERT INTO seg VALUES (4, '[(3,4),(1,2)]')
+
+# Canonical output: [(x1,y1),(x2,y2)], regardless of the accepted input form, order intact.
+query IT rowsort
+SELECT id, s FROM seg
+----
+1  [(1.5,2.5),(3.5,4.5)]
+2  [(1,2),(3,4)]
+3  [(5,6),(7,8)]
+4  [(3,4),(1,2)]
+
+# An explicit CAST from text parses the same way; a malformed string is a loud error.
+query T
+SELECT CAST('[(3,4),(1,2)]' AS LSEG)
+----
+[(3,4),(1,2)]
+
+statement error
+SELECT CAST('abc' AS LSEG)
+
+statement error
+SELECT CAST('[(1,2)]' AS LSEG)
+
+statement error
+SELECT CAST('[(1,2),(3,4),(5,6)]' AS LSEG)
+
+# length(lseg) = the Euclidean distance between the two endpoints.
+query RR
+SELECT length(CAST('[(0,0),(3,4)]' AS LSEG)), length(CAST('[(0,0),(0,7)]' AS LSEG))
+----
+5.000  7.000
+
+# lseg <-> point: distance to the nearest point on the segment. When the projected foot lies beyond
+# an endpoint, the nearer endpoint is used; otherwise the perpendicular distance.
+query RRRR
+SELECT
+  CAST('[(0,0),(4,0)]' AS LSEG) <-> CAST('(6,0)' AS POINT),
+  CAST('[(0,0),(4,0)]' AS LSEG) <-> CAST('(2,3)' AS POINT),
+  CAST('[(0,0),(4,4)]' AS LSEG) <-> CAST('(4,0)' AS POINT),
+  CAST('[(0,0),(0,4)]' AS LSEG) <-> CAST('(3,0)' AS POINT)
+----
+2.000  3.000  2.828  3.000
+
+# lseg <-> lseg: 0 when the segments intersect, else the minimum endpoint-to-segment gap. Cases:
+# crossing (0), parallel (3), skew (sqrt 5), and collinear-apart (endpoint gap 4).
+query RRRR
+SELECT
+  CAST('[(0,0),(2,2)]' AS LSEG) <-> CAST('[(0,2),(2,0)]' AS LSEG),
+  CAST('[(0,0),(4,0)]' AS LSEG) <-> CAST('[(0,3),(4,3)]' AS LSEG),
+  CAST('[(0,0),(1,0)]' AS LSEG) <-> CAST('[(3,1),(3,5)]' AS LSEG),
+  CAST('[(0,0),(1,0)]' AS LSEG) <-> CAST('[(5,0),(6,0)]' AS LSEG)
+----
+0.000  3.000  2.236  4.000
+
+# lseg # lseg: the intersection point when the segments cross or touch at a single point.
+query T
+SELECT CAST('[(0,0),(2,2)]' AS LSEG) # CAST('[(0,2),(2,0)]' AS LSEG)
+----
+(1,1)
+
+query T
+SELECT CAST('[(0,0),(4,2)]' AS LSEG) # CAST('[(0,2),(4,0)]' AS LSEG)
+----
+(2,1)
+
+# Touch at a shared endpoint is a single-point intersection.
+query T
+SELECT CAST('[(0,0),(2,0)]' AS LSEG) # CAST('[(2,0),(2,2)]' AS LSEG)
+----
+(2,0)
+
+# Collinear overlap returns NULL (the reference engine does not report a point for a collinear pair).
+query T
+SELECT CAST('[(0,0),(2,0)]' AS LSEG) # CAST('[(1,0),(3,0)]' AS LSEG)
+----
+NULL
+
+# Disjoint parallel segments do not intersect.
+query T
+SELECT CAST('[(0,0),(1,0)]' AS LSEG) # CAST('[(0,2),(1,2)]' AS LSEG)
+----
+NULL
+
+# Guard: with no geometry operand, `#` remains the integer bitwise XOR (5 ^ 3 = 6), unaffected by the
+# lseg-intersection routing above.
+query I
+SELECT 5 # 3
+----
+6

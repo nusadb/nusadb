@@ -4289,6 +4289,12 @@ pub(super) fn check_binary(
         Op::BitAnd | Op::BitOr if left == ColumnType::Macaddr8 && right == ColumnType::Macaddr8 => {
             Ok(ColumnType::Macaddr8)
         },
+        // Geometry: `#` (BitXor) is the `lseg # lseg` intersection, yielding a (nullable) `point`.
+        // Checked before the bit/integer XOR below (a geometry operand is neither a bit string nor an
+        // integer).
+        Op::BitXor if is_geometry_type(left) || is_geometry_type(right) => {
+            check_geom_intersection(left, right)
+        },
         // BIT strings: `&`/`|`/`#` combine two (equal-length) bit strings, `<<`/`>>` shift by an
         // `INT`, all yielding a bit string; `||` concatenates into a variable-length result.
         Op::BitAnd | Op::BitOr | Op::BitXor if is_bit_type(left) && is_bit_type(right) => Ok(left),
@@ -4346,19 +4352,33 @@ const fn is_geometry_type(ty: ColumnType) -> bool {
     matches!(ty, ColumnType::Geometry(_))
 }
 
-/// Type rule for the geometric distance `<->`: `point <-> point`, `box <-> box`, `circle <-> circle`
-/// (same-kind), and the mixed `circle <-> point` / `point <-> circle`; each yields the `FLOAT`
-/// distance.
+/// Type rule for the geometric distance `<->`: `point <-> point`, `box <-> box`, `circle <-> circle`,
+/// `lseg <-> lseg` (same-kind), and the mixed `circle <-> point` / `lseg <-> point` (either order);
+/// each yields the `FLOAT` distance.
 fn check_geom_distance(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind::{Circle, Point};
+    use nusadb_core::engine::GeomKind::{Circle, Lseg, Point};
     match (left, right) {
         (ColumnType::Geometry(a), ColumnType::Geometry(b))
-            if a == b || matches!((a, b), (Circle, Point) | (Point, Circle)) =>
+            if a == b || matches!((a, b), (Circle | Lseg, Point) | (Point, Circle | Lseg)) =>
         {
             Ok(ColumnType::Float)
         },
         _ => Err(Error::TypeMismatch {
             context: "`<->` geometric distance".to_owned(),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for `#` geometric intersection: `lseg # lseg`, yielding the (nullable) `point` where
+/// the two segments cross — `NULL` at evaluation when they do not cross at a single point.
+fn check_geom_intersection(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    use nusadb_core::engine::GeomKind::{Lseg, Point};
+    match (left, right) {
+        (ColumnType::Geometry(Lseg), ColumnType::Geometry(Lseg)) => Ok(ColumnType::Geometry(Point)),
+        _ => Err(Error::TypeMismatch {
+            context: "`#` geometric intersection".to_owned(),
             expected: left,
             found: right,
         }),
@@ -4499,6 +4519,10 @@ fn analyze_text_polymorphic(
             args.len()
         )));
     }
+    // `LENGTH(lseg)` is a FLOAT (the segment's Euclidean length), unlike the INT text/BYTEA/BIT
+    // lengths — the sole arg's type decides the result.
+    let lseg_ty = ColumnType::Geometry(nusadb_core::engine::GeomKind::Lseg);
+    let mut length_of_lseg = false;
     let mut typed_args = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
         let typed = analyze_expr_agg(
@@ -4511,6 +4535,7 @@ fn analyze_text_polymorphic(
         let ok = if length_family {
             matches!(typed.ty.physical(), ColumnType::Text | ColumnType::Bytes)
                 || is_bit_type(typed.ty)
+                || (func == F::Length && typed.ty == lseg_ty)
         } else if matches!(func, F::ConcatWs) && i == 0 {
             typed.ty.physical() == ColumnType::Text
         } else {
@@ -4523,6 +4548,7 @@ fn analyze_text_polymorphic(
                 found: typed.ty,
             });
         }
+        length_of_lseg = func == F::Length && typed.ty == lseg_ty;
         typed_args.push(typed);
     }
     Ok(TypedExpr {
@@ -4530,7 +4556,9 @@ fn analyze_text_polymorphic(
             func,
             args: typed_args,
         },
-        ty: if length_family {
+        ty: if length_of_lseg {
+            ColumnType::Float
+        } else if length_family {
             ColumnType::Int
         } else {
             ColumnType::Text
