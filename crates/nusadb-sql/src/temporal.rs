@@ -495,9 +495,34 @@ pub fn extract_from_micros(field: &str, micros: i64) -> Option<f64> {
         "quarter" => ((m - 1) / 3 + 1) as f64,
         "epoch" => micros as f64 / MICROS_PER_SEC as f64,
         "week" => iso_week(days, y) as f64,
+        "decade" => y.div_euclid(10) as f64,
+        "century" => century_of(y) as f64,
+        "millennium" => millennium_of(y) as f64,
+        "isoyear" => iso_year(days) as f64,
+        // The seconds field carried down to microsecond resolution (`0..60_000_000`).
+        "microseconds" => (s * MICROS_PER_SEC + us) as f64,
+        // The seconds field to millisecond resolution, keeping the sub-millisecond fraction.
+        "milliseconds" => (s * MICROS_PER_SEC + us) as f64 / 1_000.0,
+        // The Julian Date: whole Julian-day count plus the fraction of the day since midnight.
+        // 1970-01-01 is Julian day 2_440_588.
+        "julian" => {
+            let tod = micros.rem_euclid(MICROS_PER_DAY);
+            2_440_588.0 + days as f64 + tod as f64 / MICROS_PER_DAY as f64
+        },
         _ => return None,
     };
     Some(val)
+}
+
+/// The century of Gregorian year `y`: years 1..100 are century 1, 101..200 century 2, and so on, so
+/// year 2026 is century 21. Matches the reference engine (which numbers centuries from year 1, not 0).
+const fn century_of(y: i64) -> i64 {
+    (y - 1).div_euclid(100) + 1
+}
+
+/// The millennium of Gregorian year `y`: years 1..1000 are millennium 1, so year 2026 is millennium 3.
+const fn millennium_of(y: i64) -> i64 {
+    (y - 1).div_euclid(1000) + 1
 }
 
 /// ISO 8601 week number (1..53) of the day `days` (days since the epoch), where `y` is its Gregorian
@@ -564,6 +589,14 @@ pub fn extract_interval_field(field: &str, months: i64, days: i64, micros: i64) 
             let us = micros % MICROS_PER_SEC;
             s as f64 + us as f64 / MICROS_PER_SEC as f64
         },
+        // For an interval the decade/century/millennium are the whole-year count divided down (no
+        // calendar-origin offset, unlike a timestamp): 25 years is decade 2, 250 years century 2.
+        "decade" => (months / 12 / 10) as f64,
+        "century" => (months / 12 / 100) as f64,
+        "millennium" => (months / 12 / 1000) as f64,
+        // The seconds field to microsecond / millisecond resolution.
+        "microseconds" => (micros % (60 * MICROS_PER_SEC)) as f64,
+        "milliseconds" => (micros % (60 * MICROS_PER_SEC)) as f64 / 1_000.0,
         "epoch" => {
             let years = (months / 12) as f64;
             let rem_months = (months % 12) as f64;
@@ -607,6 +640,8 @@ pub fn extract_time_field(field: &str, tod_micros: i64) -> Option<f64> {
 pub fn date_trunc_micros(field: &str, micros: i64) -> Option<i64> {
     let unit = match field {
         "microsecond" | "microseconds" => return Some(micros),
+        // Floor to the millisecond: drop the sub-millisecond microseconds.
+        "millisecond" | "milliseconds" => return Some(micros - micros.rem_euclid(1_000)),
         "second" => MICROS_PER_SEC,
         "minute" => 60 * MICROS_PER_SEC,
         "hour" => 3600 * MICROS_PER_SEC,
@@ -625,6 +660,11 @@ pub fn date_trunc_micros(field: &str, micros: i64) -> Option<i64> {
         "month" => days_from_civil(y, m, 1),
         "quarter" => days_from_civil(y, (m - 1) / 3 * 3 + 1, 1),
         "year" => days_from_civil(y, 1, 1),
+        // The decade floors the year to a multiple of ten; the century and millennium floor to the
+        // year that starts them (year 2001 begins century 21 and millennium 3).
+        "decade" => days_from_civil(y - y.rem_euclid(10), 1, 1),
+        "century" => days_from_civil((century_of(y) - 1) * 100 + 1, 1, 1),
+        "millennium" => days_from_civil((millennium_of(y) - 1) * 1000 + 1, 1, 1),
         _ => return None,
     };
     Some(start_day.saturating_mul(MICROS_PER_DAY))
@@ -1671,6 +1711,44 @@ mod tests {
         // ISO week 24 of 2024 (the Monday-based week holding 2024-06-15).
         assert_eq!(extract_from_micros("week", ts), Some(24.0));
         assert_eq!(extract_from_micros("nonsense", ts), None);
+    }
+
+    #[test]
+    fn extract_reads_extended_calendar_fields() {
+        // Reference-engine oracle values for 2026-08-20 13:45:30.123456.
+        let ts = parse_timestamp("2026-08-20 13:45:30.123456").unwrap();
+        assert_eq!(extract_from_micros("century", ts), Some(21.0));
+        assert_eq!(extract_from_micros("decade", ts), Some(202.0));
+        assert_eq!(extract_from_micros("millennium", ts), Some(3.0));
+        assert_eq!(extract_from_micros("isoyear", ts), Some(2026.0));
+        assert_eq!(extract_from_micros("microseconds", ts), Some(30_123_456.0));
+        assert_eq!(extract_from_micros("milliseconds", ts), Some(30_123.456));
+        // Julian Date: 2_461_273 whole days + the fraction of the day since midnight.
+        let julian = extract_from_micros("julian", ts).unwrap();
+        assert!(
+            (julian - 2_461_273.573_265_3).abs() < 1e-6,
+            "julian was {julian}"
+        );
+        // Century numbering starts at year 1: 2000 is still century 20, 2001 begins century 21.
+        let c = |s: &str| extract_from_micros("century", parse_timestamp(s).unwrap());
+        assert_eq!(c("2000-06-01 00:00:00"), Some(20.0));
+        assert_eq!(c("2001-06-01 00:00:00"), Some(21.0));
+        // A DATE's Julian Date is the whole day count (no time fraction).
+        let jd = extract_from_micros("julian", parse_timestamp("2026-08-20 00:00:00").unwrap());
+        assert_eq!(jd, Some(2_461_273.0));
+    }
+
+    #[test]
+    fn date_trunc_extended_precisions() {
+        let ts = parse_timestamp("2026-08-20 13:45:30.123456").unwrap();
+        let fmt = |field: &str| format_timestamp(date_trunc_micros(field, ts).unwrap());
+        assert_eq!(fmt("decade"), "2020-01-01 00:00:00");
+        assert_eq!(fmt("century"), "2001-01-01 00:00:00");
+        assert_eq!(fmt("millennium"), "2001-01-01 00:00:00");
+        // Millisecond floors the sub-millisecond microseconds (…123456 → …123000); microsecond is a
+        // no-op. Checked on the raw micros so the assertion does not depend on fractional rendering.
+        assert_eq!(date_trunc_micros("millisecond", ts), Some(ts - 456));
+        assert_eq!(date_trunc_micros("microseconds", ts), Some(ts));
     }
 
     #[test]

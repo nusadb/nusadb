@@ -457,3 +457,64 @@ query T
 SELECT TO_CHAR(DATE '2024-01-21', 'DDTH') || '|' || TO_CHAR(DATE '2024-01-21', 'DD th')
 ----
 21ST|21 th
+
+# EXTRACT extended calendar precisions. Reference-engine oracle for 2026-08-20 13:45:30.123456:
+# century 21 (years 2001..2100), decade 202 (year/10), millennium 3, isoyear 2026, and the seconds
+# field carried to microsecond (30123456) and millisecond (30123.456) resolution.
+query RRRR
+SELECT
+  EXTRACT(CENTURY FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
+  EXTRACT(DECADE FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
+  EXTRACT(MILLENNIUM FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
+  EXTRACT(ISOYEAR FROM TIMESTAMP '2026-08-20 13:45:30.123456')
+----
+21.000 202.000 3.000 2026.000
+
+query RR
+SELECT
+  EXTRACT(MICROSECONDS FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
+  EXTRACT(MILLISECONDS FROM TIMESTAMP '2026-08-20 13:45:30.123456')
+----
+30123456.000 30123.456
+
+# Century numbering starts at year 1: 2000 is century 20, 2001 begins century 21.
+query RR
+SELECT
+  EXTRACT(CENTURY FROM DATE '2000-06-01'),
+  EXTRACT(CENTURY FROM DATE '2001-06-01')
+----
+20.000 21.000
+
+# The Julian Date of a date is its whole Julian-day count; a timestamp adds the day fraction.
+query RR
+SELECT
+  EXTRACT(JULIAN FROM DATE '2026-08-20'),
+  EXTRACT(JULIAN FROM TIMESTAMP '2026-08-20 13:45:30.123456')
+----
+2461273.000 2461273.573
+
+# ISOYEAR near a year boundary: 2027-01-01 (Friday) belongs to ISO year 2026.
+query R
+SELECT EXTRACT(ISOYEAR FROM DATE '2027-01-01')
+----
+2026.000
+
+# DATE_TRUNC to the decade, century and millennium floors to the year that starts the period
+# (year 2001 begins century 21 and millennium 3).
+query TTT
+SELECT
+  DATE_TRUNC('decade', TIMESTAMP '2026-08-20 13:45:30'),
+  DATE_TRUNC('century', TIMESTAMP '2026-08-20 13:45:30'),
+  DATE_TRUNC('millennium', TIMESTAMP '2026-08-20 13:45:30')
+----
+2020-01-01 00:00:00 2001-01-01 00:00:00 2001-01-01 00:00:00
+
+# EXTRACT of the extended precisions from an interval divides the year count down (no calendar
+# origin): 25 years is decade 2, 250 years century 2.
+query RRR
+SELECT
+  EXTRACT(DECADE FROM INTERVAL '25 years'),
+  EXTRACT(CENTURY FROM INTERVAL '250 years'),
+  EXTRACT(MILLENNIUM FROM INTERVAL '2500 years')
+----
+2.000 2.000 2.000

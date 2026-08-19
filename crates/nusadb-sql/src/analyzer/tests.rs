@@ -2189,15 +2189,19 @@ fn temporal_functions_resolve_result_types() {
 
 #[test]
 fn temporal_functions_reject_bad_field_and_type_and_arity() {
-    // Unknown field.
+    // A recognized field NusaDB does not support (time-zone extraction is session-dependent).
     assert!(matches!(
-        plan("SELECT EXTRACT(CENTURY FROM NOW())", &MockCatalog::new()),
+        plan("SELECT EXTRACT(TIMEZONE FROM NOW())", &MockCatalog::new()),
         Err(Error::Unsupported(_)),
     ));
     assert!(matches!(
         plan("SELECT DATE_TRUNC('fortnight', NOW())", &MockCatalog::new()),
         Err(Error::Unsupported(_)),
     ));
+    // The extended calendar precisions are accepted.
+    assert!(plan("SELECT EXTRACT(CENTURY FROM NOW())", &MockCatalog::new()).is_ok());
+    assert!(plan("SELECT EXTRACT(ISOYEAR FROM NOW())", &MockCatalog::new()).is_ok());
+    assert!(plan("SELECT DATE_TRUNC('decade', NOW())", &MockCatalog::new()).is_ok());
     // Non-temporal source.
     assert!(matches!(
         plan("SELECT EXTRACT(YEAR FROM name) FROM users", &catalog()),

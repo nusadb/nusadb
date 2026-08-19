@@ -3238,6 +3238,13 @@ fn is_extract_field(field: &str) -> bool {
             | "quarter"
             | "epoch"
             | "week"
+            | "decade"
+            | "century"
+            | "millennium"
+            | "isoyear"
+            | "microseconds"
+            | "milliseconds"
+            | "julian"
     )
 }
 
@@ -3247,6 +3254,8 @@ fn is_trunc_field(field: &str) -> bool {
         field,
         "microsecond"
             | "microseconds"
+            | "millisecond"
+            | "milliseconds"
             | "second"
             | "minute"
             | "hour"
@@ -3255,6 +3264,9 @@ fn is_trunc_field(field: &str) -> bool {
             | "month"
             | "quarter"
             | "year"
+            | "decade"
+            | "century"
+            | "millennium"
     )
 }
 
