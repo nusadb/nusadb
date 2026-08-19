@@ -194,6 +194,28 @@ impl Dialect for NusaParserDialect {
                     }),
             );
         }
+        // Geometric predicate operators `?||` (parallel), `?-|` (perpendicular) and `?#`
+        // (intersects). Like the JSON key-existence operators below they begin with the `?`
+        // (`Placeholder("?")`) token, so they must be recognized *before* it — otherwise the JSON
+        // hook would consume the lone `?` and mis-parse the tail. The fused forms are distinct token
+        // sequences (`?||` = `Placeholder` + `StringConcat`, `?-|` = `Placeholder` + `Minus` + `Pipe`,
+        // `?#` = `Placeholder` + `Sharp`), all requiring direct adjacency, so JSON `?` / `?|` / `?&`
+        // (whose second token is a lone `Pipe`/`Ampersand`, never `StringConcat`) fall through here
+        // untouched.
+        if let Some((symbol, tokens)) = recognize_geom_predicate(parser) {
+            for _ in 0..tokens {
+                parser.next_token();
+            }
+            return Some(
+                parser
+                    .parse_subexpr(precedence)
+                    .map(|right| sql::Expr::BinaryOp {
+                        left: Box::new(expr.clone()),
+                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
+                        right: Box::new(right),
+                    }),
+            );
+        }
         // JSON key-existence operators `?` / `?|` / `?&`. The tokenizer only fuses these into
         // `Question`/`QuestionPipe`/`QuestionAnd` for a dialect that enables geometric types —
         // which this one deliberately does not, because that also fuses `<->` and would break the
@@ -296,6 +318,42 @@ fn recognize_geom_same_as(parser: &Parser) -> Option<(&'static str, usize)> {
     }
     let after = parser.peek_nth_token_ref(1);
     (matches!(after.token, Token::Eq) && tilde.span.end == after.span.start).then_some(("~=", 2))
+}
+
+/// Recognize a geometric predicate operator (`?||` parallel, `?-|` perpendicular, `?#` intersects)
+/// at the current parser position, where the next token is a `?` (`Placeholder("?")`). Returns the
+/// canonical symbol and the number of tokens it spans, or `None` when the tokens after `?` are not
+/// one of these fused forms (so the plain JSON `?` / `?|` / `?&` key-existence operators, and a
+/// spaced `? …`, are left for [`recognize_json_exists_op`]).
+///
+/// With geometric types disabled — the surface [`NusaParserDialect`] reports — the tokenizer emits
+/// `?||` as `Placeholder("?")` + `StringConcat` (the whole `||` fuses into one token), `?-|` as
+/// `Placeholder("?")` + `Minus` + `Pipe`, and `?#` as `Placeholder("?")` + `Sharp`. Each piece must
+/// be directly adjacent (compared via token spans), so a spaced `j ? || x` keeps its tokens separate
+/// and the JSON `?|` (a lone `Pipe`, never `StringConcat`) is never mistaken for `?||`.
+fn recognize_geom_predicate(parser: &Parser) -> Option<(&'static str, usize)> {
+    let question = parser.peek_token_ref();
+    match question.token {
+        Token::Placeholder(ref p) if p == "?" => {},
+        _ => return None,
+    }
+    let after = parser.peek_nth_token_ref(1);
+    if question.span.end != after.span.start {
+        return None;
+    }
+    match after.token {
+        // `?||` — `||` tokenizes as a single `StringConcat`.
+        Token::StringConcat => Some(("?||", 2)),
+        // `?#` — `#` is a `Sharp`.
+        Token::Sharp => Some(("?#", 2)),
+        // `?-|` — a `Minus` then a directly-adjacent `Pipe`.
+        Token::Minus => {
+            let pipe = parser.peek_nth_token_ref(2);
+            (matches!(pipe.token, Token::Pipe) && after.span.end == pipe.span.start)
+                .then_some(("?-|", 3))
+        },
+        _ => None,
+    }
 }
 
 /// Recognize a JSON key-existence operator (`?`, `?|`, `?&`) at the current parser position.

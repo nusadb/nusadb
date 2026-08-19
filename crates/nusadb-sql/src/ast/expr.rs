@@ -1703,6 +1703,15 @@ pub enum BinaryOp {
     /// Geometric same-as `~=` — are two geometric values (both `point` or both `box`) equal by
     /// their coordinates, as `BOOL`?
     GeomSameAs,
+    /// Geometric parallel `?||` — are two `lseg`s or two `line`s parallel (their direction vectors,
+    /// resp. normals, colinear — same or opposite direction), as `BOOL`?
+    GeomParallel,
+    /// Geometric perpendicular `?-|` — are two `lseg`s or two `line`s perpendicular (their direction
+    /// vectors, resp. normals, at a right angle), as `BOOL`?
+    GeomPerpendicular,
+    /// Geometric intersects `?#` — do two `lseg`s cross/touch at a single point, or do two `line`s
+    /// cross (i.e. are not parallel), as `BOOL`?
+    GeomIntersects,
 }
 
 /// Unary operators the parser accepts.

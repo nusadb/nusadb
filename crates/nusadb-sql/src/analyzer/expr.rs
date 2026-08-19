@@ -4407,6 +4407,10 @@ pub(super) fn check_binary(
         Op::TsMatch => check_ts_match(left, right),
         // `~=` geometric same-as — both operands the same geometric kind, yielding `BOOL`.
         Op::GeomSameAs => check_geom_same_as(left, right),
+        // `?||` / `?-|` / `?#` geometric predicates — `lseg`↔`lseg` or `line`↔`line`, yielding `BOOL`.
+        Op::GeomParallel | Op::GeomPerpendicular | Op::GeomIntersects => {
+            check_geom_predicate(op, left, right)
+        },
     }
 }
 
@@ -4450,6 +4454,31 @@ fn check_geom_intersection(left: ColumnType, right: ColumnType) -> Result<Column
         },
         _ => Err(Error::TypeMismatch {
             context: "`#` geometric intersection".to_owned(),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for the geometric predicates `?||` (parallel), `?-|` (perpendicular) and `?#`
+/// (intersects): `lseg ? lseg` and `line ? line` (same kind, only `lseg`/`line`); each yields the
+/// `BOOL` predicate. Mirrors [`check_geom_intersection`], which shares the `lseg`/`line` domain.
+fn check_geom_predicate(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    use nusadb_core::engine::GeomKind::{Line, Lseg};
+    let context = match op {
+        ast::BinaryOp::GeomParallel => "`?||` geometric parallel",
+        ast::BinaryOp::GeomPerpendicular => "`?-|` geometric perpendicular",
+        _ => "`?#` geometric intersects",
+    };
+    match (left, right) {
+        (ColumnType::Geometry(Lseg), ColumnType::Geometry(Lseg))
+        | (ColumnType::Geometry(Line), ColumnType::Geometry(Line)) => Ok(ColumnType::Bool),
+        _ => Err(Error::TypeMismatch {
+            context: context.to_owned(),
             expected: left,
             found: right,
         }),

@@ -5216,6 +5216,10 @@ fn apply_binary(
         Op::TsMatch => ts_match_op(left, right),
         // `~=` geometric same-as.
         Op::GeomSameAs => Ok(geom_same_as_op(left, right)),
+        // `?||` / `?-|` / `?#` geometric predicates.
+        Op::GeomParallel | Op::GeomPerpendicular | Op::GeomIntersects => {
+            Ok(geom_predicate_op(op, left, right))
+        },
     }
 }
 
@@ -5515,6 +5519,56 @@ fn geom_same_as_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
         (ast::Value::Geometry(a), ast::Value::Geometry(b)) => ast::Value::Bool(a == b),
         _ => ast::Value::Null,
     }
+}
+
+/// Evaluate a geometric predicate `?||` (parallel), `?-|` (perpendicular) or `?#` (intersects) over
+/// two `lseg`s or two `line`s, yielding `BOOL`. `?||`/`?-|` delegate to the total cross/dot tests in
+/// [`crate::geometry`]; `?#` is `lseg_intersection`/`line_intersection` `.is_some()`. A `NULL`
+/// operand, a mismatched pair (`lseg` vs `line`), or a non-geometry operand yields `NULL`, mirroring
+/// [`geom_same_as_op`].
+fn geom_predicate_op(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> ast::Value {
+    use crate::geometry::{self, GeomVal};
+    let (ast::Value::Geometry(a), ast::Value::Geometry(b)) = (left, right) else {
+        return ast::Value::Null;
+    };
+    let result = match (a, b) {
+        (
+            GeomVal::Lseg { x1, y1, x2, y2 },
+            GeomVal::Lseg {
+                x1: bx1,
+                y1: by1,
+                x2: bx2,
+                y2: by2,
+            },
+        ) => match op {
+            ast::BinaryOp::GeomParallel => {
+                geometry::lseg_parallel(*x1, *y1, *x2, *y2, *bx1, *by1, *bx2, *by2)
+            },
+            ast::BinaryOp::GeomPerpendicular => {
+                geometry::lseg_perpendicular(*x1, *y1, *x2, *y2, *bx1, *by1, *bx2, *by2)
+            },
+            _ => geometry::lseg_intersection(*x1, *y1, *x2, *y2, *bx1, *by1, *bx2, *by2).is_some(),
+        },
+        (
+            GeomVal::Line {
+                a: a1,
+                b: b1,
+                c: c1,
+            },
+            GeomVal::Line {
+                a: a2,
+                b: b2,
+                c: c2,
+            },
+        ) => match op {
+            ast::BinaryOp::GeomParallel => geometry::line_parallel(*a1, *b1, *a2, *b2),
+            ast::BinaryOp::GeomPerpendicular => geometry::line_perpendicular(*a1, *b1, *a2, *b2),
+            _ => geometry::line_intersection(*a1, *b1, *c1, *a2, *b2, *c2).is_some(),
+        },
+        // A mismatched pair (`lseg` vs `line`) or any other geometry kind is undefined here.
+        _ => return ast::Value::Null,
+    };
+    ast::Value::Bool(result)
 }
 
 /// Evaluate `@@` (F1): the left operand is the `tsvector` text form and the right the `tsquery`

@@ -2038,6 +2038,11 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
             "?&" => ast::BinaryOp::JsonExistsAll,
             // Geometric same-as `~=` (fused from `~` + `=` by the dialect's infix hook).
             "~=" => ast::BinaryOp::GeomSameAs,
+            // Geometric predicates `?||` (parallel), `?-|` (perpendicular), `?#` (intersects),
+            // fused from their multi-token forms by the dialect's infix hook.
+            "?||" => ast::BinaryOp::GeomParallel,
+            "?-|" => ast::BinaryOp::GeomPerpendicular,
+            "?#" => ast::BinaryOp::GeomIntersects,
             other => return unsupported(&format!("binary operator `{other}`")),
         },
         // Full-text search match `@@` (F1).

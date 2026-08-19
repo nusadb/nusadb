@@ -726,6 +726,75 @@ pub fn lseg_distance_lseg(
     d1.min(d2).min(d3).min(d4)
 }
 
+/// Whether two line segments are parallel (`lseg ?|| lseg`).
+///
+/// Their direction vectors `d1 = (x2−x1, y2−y1)` and `d2 = (bx2−bx1, by2−by1)` are colinear, i.e.
+/// the 2-D cross product `dx1·dy2 − dy1·dx2` is exactly zero. Same direction and opposite direction
+/// both count.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the eight coordinates are the two segments' endpoints; grouping them into structs would only re-spell what the flat coordinate list already states"
+)]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the parallel test the reference engine uses for the zero cross-product of the two direction vectors"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-product arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn lseg_parallel(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    bx1: f64,
+    by1: f64,
+    bx2: f64,
+    by2: f64,
+) -> bool {
+    let dx1 = x2 - x1;
+    let dy1 = y2 - y1;
+    let dx2 = bx2 - bx1;
+    let dy2 = by2 - by1;
+    dx1 * dy2 - dy1 * dx2 == 0.0
+}
+
+/// Whether two line segments are perpendicular (`lseg ?-| lseg`).
+///
+/// Their direction vectors `d1 = (x2−x1, y2−y1)` and `d2 = (bx2−bx1, by2−by1)` meet at a right
+/// angle, i.e. the dot product `dx1·dx2 + dy1·dy2` is exactly zero. The segments need not touch.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the eight coordinates are the two segments' endpoints; grouping them into structs would only re-spell what the flat coordinate list already states"
+)]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the perpendicular test the reference engine uses for the zero dot product of the two direction vectors"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) dot-product arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn lseg_perpendicular(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    bx1: f64,
+    by1: f64,
+    bx2: f64,
+    by2: f64,
+) -> bool {
+    let dx1 = x2 - x1;
+    let dy1 = y2 - y1;
+    let dx2 = bx2 - bx1;
+    let dy2 = by2 - by1;
+    dx1 * dx2 + dy1 * dy2 == 0.0
+}
+
 // ── line functions & operators ───────────────────────────────────────────────────────────────────
 
 /// Perpendicular distance from an infinite line `A·x + B·y + C = 0` to a point (`line <-> point`).
@@ -771,6 +840,40 @@ pub fn line_intersection(a1: f64, b1: f64, c1: f64, a2: f64, b2: f64, c2: f64) -
         (b1 * c2 - b2 * c1) / denom,
         (a2 * c1 - a1 * c2) / denom,
     ))
+}
+
+/// Whether two infinite lines are parallel (`line ?|| line`).
+///
+/// Their normals `(A1, B1)` and `(A2, B2)` are colinear, i.e. the cross-coefficient `A1·B2 − A2·B1`
+/// is exactly zero. This is scale-invariant, so `{2,-2,9}` counts as parallel to `{1,-1,0}`.
+#[must_use]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the parallel test the reference engine uses for the zero cross-coefficient of the two normals"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) cross-coefficient arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn line_parallel(a1: f64, b1: f64, a2: f64, b2: f64) -> bool {
+    a1 * b2 - a2 * b1 == 0.0
+}
+
+/// Whether two infinite lines are perpendicular (`line ?-| line`).
+///
+/// Their normals `(A1, B1)` and `(A2, B2)` meet at a right angle, i.e. the dot product
+/// `A1·A2 + B1·B2` is exactly zero.
+#[must_use]
+#[allow(
+    clippy::float_cmp,
+    reason = "an exact `== 0.0` is the perpendicular test the reference engine uses for the zero dot product of the two normals"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "plain (non-fused) dot-product arithmetic matches the reference engine's IEEE-754 result bit-for-bit; a fused mul_add would round differently"
+)]
+pub fn line_perpendicular(a1: f64, b1: f64, a2: f64, b2: f64) -> bool {
+    a1 * a2 + b1 * b2 == 0.0
 }
 
 /// Distance between two infinite lines (`line <-> line`): `0` when they cross (a non-zero
@@ -1106,6 +1209,29 @@ mod tests {
             lseg_intersection(0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 1.0, 2.0),
             None
         );
+    }
+
+    #[test]
+    fn lseg_parallel_perpendicular_oracle() {
+        // lseg ?|| lseg — direction vectors colinear. Same direction, opposite direction (both
+        // count), and a non-parallel pair. Verified against the reference engine.
+        assert!(lseg_parallel(0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0));
+        assert!(lseg_parallel(0.0, 0.0, 1.0, 1.0, 5.0, 5.0, 3.0, 3.0));
+        assert!(!lseg_parallel(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 2.0));
+        // lseg ?-| lseg — direction vectors at a right angle; touching not required.
+        assert!(lseg_perpendicular(0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0));
+        assert!(lseg_perpendicular(0.0, 0.0, 4.0, 0.0, 1.0, 1.0, 1.0, 5.0));
+        assert!(!lseg_perpendicular(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 2.0, 2.0));
+    }
+
+    #[test]
+    fn line_parallel_perpendicular_oracle() {
+        // line ?|| line — normals colinear (scale-invariant). Verified against the reference engine.
+        assert!(line_parallel(1.0, -1.0, 2.0, -2.0));
+        assert!(!line_parallel(1.0, -1.0, 1.0, 1.0));
+        // line ?-| line — normals at a right angle.
+        assert!(line_perpendicular(1.0, -1.0, 1.0, 1.0));
+        assert!(!line_perpendicular(1.0, -1.0, 2.0, -2.0));
     }
 
     #[test]

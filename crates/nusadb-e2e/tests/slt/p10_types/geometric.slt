@@ -360,6 +360,38 @@ SELECT 5 # 3
 ----
 6
 
+# lseg ?|| lseg: parallel when the two direction vectors are colinear (same or opposite direction).
+# Cases: same direction (t), opposite direction (t), and non-parallel (f).
+query III
+SELECT
+  CAST('[(0,0),(1,1)]' AS LSEG) ?|| CAST('[(2,2),(3,3)]' AS LSEG),
+  CAST('[(0,0),(1,1)]' AS LSEG) ?|| CAST('[(5,5),(3,3)]' AS LSEG),
+  CAST('[(0,0),(1,1)]' AS LSEG) ?|| CAST('[(0,0),(1,2)]' AS LSEG)
+----
+1  1  0
+
+# lseg ?-| lseg: perpendicular when the direction vectors meet at a right angle; touching is NOT
+# required. Cases: meeting at a right angle (t), non-touching right angle (t), and colinear (f).
+query III
+SELECT
+  CAST('[(0,0),(1,0)]' AS LSEG) ?-| CAST('[(0,0),(0,1)]' AS LSEG),
+  CAST('[(0,0),(4,0)]' AS LSEG) ?-| CAST('[(1,1),(1,5)]' AS LSEG),
+  CAST('[(0,0),(1,1)]' AS LSEG) ?-| CAST('[(0,0),(2,2)]' AS LSEG)
+----
+1  1  0
+
+# lseg ?# lseg: intersects when the segments cross or touch at a single point; a collinear overlap
+# and a disjoint pair are both false. Cases: crossing (t), endpoint touch (t), disjoint (f),
+# collinear overlap (f).
+query IIII
+SELECT
+  CAST('[(0,0),(2,2)]' AS LSEG) ?# CAST('[(0,2),(2,0)]' AS LSEG),
+  CAST('[(0,0),(2,0)]' AS LSEG) ?# CAST('[(2,0),(2,2)]' AS LSEG),
+  CAST('[(0,0),(1,1)]' AS LSEG) ?# CAST('[(2,2),(3,3)]' AS LSEG),
+  CAST('[(0,0),(2,0)]' AS LSEG) ?# CAST('[(1,0),(3,0)]' AS LSEG)
+----
+1  1  0  0
+
 # ── line ────────────────────────────────────────────────────────────────────────────────────
 # A line is an INFINITE line A·x + B·y + C = 0, canonical form {A,B,C}. The three-coefficient input
 # {A,B,C} is stored VERBATIM (no normalization); a two-point input is converted to coefficients.
@@ -457,6 +489,42 @@ query T
 SELECT CAST('{1,-1,0}' AS LINE) # CAST('{1,-1,5}' AS LINE)
 ----
 NULL
+
+# line ?|| line: parallel when the normals are colinear (scale-invariant, so a differently scaled
+# {2,-2,9} counts as parallel to {1,-1,0}). Cases: parallel (t) and non-parallel (f).
+query II
+SELECT
+  CAST('{1,-1,0}' AS LINE) ?|| CAST('{2,-2,9}' AS LINE),
+  CAST('{1,-1,0}' AS LINE) ?|| CAST('{1,1,0}' AS LINE)
+----
+1  0
+
+# line ?-| line: perpendicular when the normals meet at a right angle. Cases: perpendicular (t) and
+# a parallel (non-perpendicular) pair (f).
+query II
+SELECT
+  CAST('{1,-1,0}' AS LINE) ?-| CAST('{1,1,3}' AS LINE),
+  CAST('{1,-1,0}' AS LINE) ?-| CAST('{2,-2,0}' AS LINE)
+----
+1  0
+
+# line ?# line: intersects unless the lines are parallel. Cases: crossing (t) and parallel (f).
+query II
+SELECT
+  CAST('{1,-1,0}' AS LINE) ?# CAST('{1,1,0}' AS LINE),
+  CAST('{1,-1,0}' AS LINE) ?# CAST('{1,-1,5}' AS LINE)
+----
+1  0
+
+# Regression guard: the JSON key-existence operators `?` / `?|` / `?&` (jsonb) still parse — they
+# share the leading `?` token with the geometry predicates above. A spaced `?` is JSON existence.
+query III
+SELECT
+  CAST('{"a":1,"b":2}' AS JSONB) ? 'a',
+  CAST('{"a":1}' AS JSONB) ?| CAST(ARRAY['x','a'] AS TEXT[]),
+  CAST('{"a":1,"b":2}' AS JSONB) ?& CAST(ARRAY['a','b'] AS TEXT[])
+----
+1  1  1
 
 # ── path ────────────────────────────────────────────────────────────────────────────────────
 # A path is an ordered list of vertices, either an OPEN polyline `[(x1,y1),…]` or a CLOSED loop
