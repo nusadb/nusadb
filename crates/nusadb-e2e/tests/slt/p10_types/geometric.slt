@@ -129,3 +129,124 @@ query R
 SELECT CAST('(0,0),(2,2)' AS BOX) <-> CAST('(10,0),(12,2)' AS BOX)
 ----
 10.000
+
+# ── circle ──────────────────────────────────────────────────────────────────────────────────
+# A circle is a center (cx,cy) and a non-negative radius r, canonical form <(cx,cy),r>.
+
+statement ok
+CREATE TABLE circ (id INT NOT NULL, c CIRCLE)
+
+# Implicit text coercion: canonical <(x,y),r>, the paren form ((x,y),r), and the bare x,y,r form.
+statement ok
+INSERT INTO circ VALUES (1, '<(1.5,2.5),3.25>')
+
+statement ok
+INSERT INTO circ VALUES (2, '((1,2),3)')
+
+statement ok
+INSERT INTO circ VALUES (3, '4,5,6')
+
+# A zero radius is a valid (degenerate) circle.
+statement ok
+INSERT INTO circ VALUES (4, '<(0,0),0>')
+
+# A negative radius is rejected loudly, not stored.
+statement error
+INSERT INTO circ VALUES (9, '<(0,0),-1>')
+
+# Canonical output: <(cx,cy),r>, regardless of the accepted input form.
+query IT rowsort
+SELECT id, c FROM circ
+----
+1  <(1.5,2.5),3.25>
+2  <(1,2),3>
+3  <(4,5),6>
+4  <(0,0),0>
+
+# An explicit CAST from text parses the same way; a malformed or negative-radius string is a loud
+# error.
+query T
+SELECT CAST('<(1,2),3>' AS CIRCLE)
+----
+<(1,2),3>
+
+statement error
+SELECT CAST('abc' AS CIRCLE)
+
+statement error
+SELECT CAST('<(0,0),-1>' AS CIRCLE)
+
+statement error
+SELECT CAST('<(1,2),3,4>' AS CIRCLE)
+
+# area = pi*r^2, radius = r, diameter = 2*r.
+query R
+SELECT area(CAST('<(0,0),2>' AS CIRCLE))
+----
+12.566
+
+query RR
+SELECT radius(CAST('<(0,0),2>' AS CIRCLE)), diameter(CAST('<(0,0),2>' AS CIRCLE))
+----
+2.000  4.000
+
+# center is the circle's center point.
+query T
+SELECT center(CAST('<(3,4),5>' AS CIRCLE))
+----
+(3,4)
+
+# circle <-> point: gap from the point to the circle's boundary; a point inside the circle is 0.
+query RR
+SELECT
+  CAST('<(0,0),1>' AS CIRCLE) <-> CAST('(5,0)' AS POINT),
+  CAST('<(0,0),5>' AS CIRCLE) <-> CAST('(1,1)' AS POINT)
+----
+4.000  0.000
+
+# circle <-> circle: gap between the two boundaries; overlapping circles are 0.
+query RR
+SELECT
+  CAST('<(0,0),1>' AS CIRCLE) <-> CAST('<(5,0),1>' AS CIRCLE),
+  CAST('<(0,0),3>' AS CIRCLE) <-> CAST('<(4,0),3>' AS CIRCLE)
+----
+3.000  0.000
+
+# Overlap circle && circle: true when the centers are within the summed radii; disjoint is false.
+query II
+SELECT
+  CAST('<(0,0),2>' AS CIRCLE) && CAST('<(3,0),2>' AS CIRCLE),
+  CAST('<(0,0),2>' AS CIRCLE) && CAST('<(5,0),2>' AS CIRCLE)
+----
+1  0
+
+# Containment circle @> point (inclusive of the boundary): (3,4) is on the radius-5 circle → in;
+# (3,5) is outside.
+query II
+SELECT
+  CAST('<(0,0),5>' AS CIRCLE) @> CAST('(3,4)' AS POINT),
+  CAST('<(0,0),5>' AS CIRCLE) @> CAST('(3,5)' AS POINT)
+----
+1  0
+
+# Containment circle @> circle: the outer fully covers the inner.
+query I
+SELECT CAST('<(0,0),5>' AS CIRCLE) @> CAST('<(0,0),2>' AS CIRCLE)
+----
+1
+
+# point <@ circle and circle <@ circle are the mirror of @>.
+query II
+SELECT
+  CAST('(3,4)' AS POINT) <@ CAST('<(0,0),5>' AS CIRCLE),
+  CAST('<(0,0),2>' AS CIRCLE) <@ CAST('<(0,0),5>' AS CIRCLE)
+----
+1  1
+
+# Same-as (~=): equal by center and radius.
+query II
+SELECT
+  CAST('<(0,0),2>' AS CIRCLE) ~= CAST('<(0,0),2>' AS CIRCLE),
+  CAST('<(0,0),2>' AS CIRCLE) ~= CAST('<(1,0),2>' AS CIRCLE)
+----
+1  0

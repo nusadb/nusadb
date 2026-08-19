@@ -964,14 +964,20 @@ pub enum ScalarFunc {
     PointCtor,
     /// `BOX(p1, p2)` — construct a `box` from two `point` corners.
     BoxCtor,
-    /// `AREA(box)` — the area (`width × height`) of a box, as `FLOAT`.
+    /// `AREA(box)` / `AREA(circle)` — the area of a box (`width × height`) or a circle (`π · r²`),
+    /// as `FLOAT`.
     GeomArea,
-    /// `CENTER(box)` — the center (midpoint) of a box, as a `point`.
+    /// `CENTER(box)` / `CENTER(circle)` — the center of a box (its midpoint) or a circle, as a
+    /// `point`.
     GeomCenter,
     /// `HEIGHT(box)` — the height of a box, as `FLOAT`.
     GeomHeight,
     /// `WIDTH(box)` — the width of a box, as `FLOAT`.
     GeomWidth,
+    /// `RADIUS(circle)` — the radius of a circle, as `FLOAT`.
+    GeomRadius,
+    /// `DIAMETER(circle)` — the diameter (`2 · r`) of a circle, as `FLOAT`.
+    GeomDiameter,
 }
 
 impl ScalarFunc {
@@ -1198,6 +1204,8 @@ impl ScalarFunc {
             Self::GeomCenter => "center",
             Self::GeomHeight => "height",
             Self::GeomWidth => "width",
+            Self::GeomRadius => "radius",
+            Self::GeomDiameter => "diameter",
         }
     }
 

@@ -1,8 +1,10 @@
-//! Geometric types `point` and `box`: parsing, canonical formatting, operators, and functions.
+//! Geometric types `point`, `box`, and `circle`: parsing, canonical formatting, operators, and
+//! functions.
 //!
-//! A geometric value is a [`GeomVal`] — either a `point` (an `(x, y)` pair) or an axis-aligned
-//! `box` (two opposite corners). Values persist as their canonical text form; the column's
-//! [`GeomKind`] tells the reader which shape to parse back into. Every function here is total: parse
+//! A geometric value is a [`GeomVal`] — a `point` (an `(x, y)` pair), an axis-aligned `box` (two
+//! opposite corners), or a `circle` (a center `(x, y)` and a radius `r`). Values persist as their
+//! canonical text form; the column's [`GeomKind`] tells the reader which shape to parse back into.
+//! Every function here is total: parse
 //! entry points return [`Option`] (a syntax error is `None`), and coordinate access is checked, so
 //! no path indexes or unwraps.
 //!
@@ -36,6 +38,15 @@ pub enum GeomVal {
         /// Lower-left Y (the smaller of the two input Y coordinates).
         low_y: f64,
     },
+    /// A `circle` — a center point and a non-negative radius.
+    Circle {
+        /// Center X coordinate.
+        cx: f64,
+        /// Center Y coordinate.
+        cy: f64,
+        /// Radius (never negative; a zero radius is a degenerate point-circle).
+        r: f64,
+    },
 }
 
 impl GeomVal {
@@ -45,6 +56,7 @@ impl GeomVal {
         match self {
             Self::Point { .. } => GeomKind::Point,
             Self::Box { .. } => GeomKind::Box,
+            Self::Circle { .. } => GeomKind::Circle,
         }
     }
 
@@ -52,6 +64,12 @@ impl GeomVal {
     #[must_use]
     pub const fn point(x: f64, y: f64) -> Self {
         Self::Point { x, y }
+    }
+
+    /// Build a `circle` from a center and a radius.
+    #[must_use]
+    pub const fn circle(cx: f64, cy: f64, r: f64) -> Self {
+        Self::Circle { cx, cy, r }
     }
 
     /// Build a normalized `box` from two opposite corners, so the stored `high` corner is the
@@ -80,7 +98,8 @@ fn fmt_num(v: f64) -> String {
     format!("{v}")
 }
 
-/// Render a value in its canonical text form: a `point` as `(x,y)`, a `box` as `(hx,hy),(lx,ly)`.
+/// Render a value in its canonical text form: a `point` as `(x,y)`, a `box` as `(hx,hy),(lx,ly)`, a
+/// `circle` as `<(cx,cy),r>`.
 #[must_use]
 pub fn format(v: &GeomVal) -> String {
     match v {
@@ -97,17 +116,26 @@ pub fn format(v: &GeomVal) -> String {
             fmt_num(*low_x),
             fmt_num(*low_y),
         ),
+        GeomVal::Circle { cx, cy, r } => {
+            format!("<({},{}),{}>", fmt_num(*cx), fmt_num(*cy), fmt_num(*r))
+        },
     }
 }
 
-/// Extract the finite floating-point tokens from a geometric literal, treating parentheses,
-/// commas, and whitespace as separators. Returns `None` if any token fails to parse. A minus sign
-/// and exponent stay attached to their number since only `(`, `)`, `,`, and whitespace separate
-/// tokens.
+/// Extract the finite floating-point tokens from a geometric literal, treating parentheses, the
+/// circle delimiters `<`/`>`, commas, and whitespace as separators. Returns `None` if any token
+/// fails to parse. A minus sign and exponent stay attached to their number since only `(`, `)`,
+/// `<`, `>`, `,`, and whitespace separate tokens.
 fn floats(s: &str) -> Option<Vec<f64>> {
     let cleaned: String = s
         .chars()
-        .map(|c| if c == '(' || c == ')' { ' ' } else { c })
+        .map(|c| {
+            if c == '(' || c == ')' || c == '<' || c == '>' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     cleaned
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -136,12 +164,26 @@ pub fn parse_box(s: &str) -> Option<GeomVal> {
     }
 }
 
+/// Parse a `circle` literal: `<(x,y),r>`, `((x,y),r)`, or `x,y,r`.
+///
+/// Requires exactly three coordinates (center X, center Y, radius); a negative radius is rejected
+/// (`None`), matching the reference engine's `invalid input syntax for type circle`. A zero radius
+/// is valid.
+#[must_use]
+pub fn parse_circle(s: &str) -> Option<GeomVal> {
+    match floats(s)?.as_slice() {
+        &[cx, cy, r] if r >= 0.0 => Some(GeomVal::circle(cx, cy, r)),
+        _ => None,
+    }
+}
+
 /// Parse a geometric literal against the target [`GeomKind`].
 #[must_use]
 pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
     match kind {
         GeomKind::Point => parse_point(s),
         GeomKind::Box => parse_box(s),
+        GeomKind::Circle => parse_circle(s),
     }
 }
 
@@ -288,6 +330,55 @@ pub fn box_distance(
     point_distance(acx, acy, bcx, bcy)
 }
 
+// ── circle functions & operators ─────────────────────────────────────────────────────────────
+
+/// Area of a circle (`π · r²`).
+#[must_use]
+pub fn circle_area(r: f64) -> f64 {
+    std::f64::consts::PI * r * r
+}
+
+/// Diameter of a circle (`2 · r`).
+#[must_use]
+pub const fn circle_diameter(r: f64) -> f64 {
+    2.0 * r
+}
+
+/// Distance from a circle to a point (`circle <-> point`): the gap between the point and the
+/// circle's boundary, or `0` when the point is inside or on the circle.
+#[must_use]
+pub fn circle_distance_point(cx: f64, cy: f64, r: f64, px: f64, py: f64) -> f64 {
+    (point_distance(cx, cy, px, py) - r).max(0.0)
+}
+
+/// Distance between two circles (`circle <-> circle`): the gap between their boundaries, or `0` when
+/// they touch or overlap.
+#[must_use]
+pub fn circle_distance_circle(acx: f64, acy: f64, ar: f64, bcx: f64, bcy: f64, br: f64) -> f64 {
+    (point_distance(acx, acy, bcx, bcy) - ar - br).max(0.0)
+}
+
+/// Whether two circles overlap (`circle && circle`), inclusive of a single touching point: the
+/// distance between centers is at most the sum of the radii.
+#[must_use]
+pub fn circle_overlap(acx: f64, acy: f64, ar: f64, bcx: f64, bcy: f64, br: f64) -> bool {
+    point_distance(acx, acy, bcx, bcy) <= ar + br
+}
+
+/// Whether a circle contains a point (`circle @> point`), inclusive of the boundary: the point is
+/// within the radius of the center.
+#[must_use]
+pub fn circle_contains_point(cx: f64, cy: f64, r: f64, px: f64, py: f64) -> bool {
+    point_distance(cx, cy, px, py) <= r
+}
+
+/// Whether the `outer` circle contains the `inner` circle (`outer @> inner`), inclusive of the
+/// boundary: the distance between centers plus the inner radius does not exceed the outer radius.
+#[must_use]
+pub fn circle_contains_circle(ocx: f64, ocy: f64, or: f64, icx: f64, icy: f64, ir: f64) -> bool {
+    point_distance(ocx, ocy, icx, icy) + ir <= or
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +446,58 @@ mod tests {
         assert!(box_overlap(2.0, 2.0, 0.0, 0.0, 3.0, 3.0, 1.0, 1.0));
         assert!(!box_overlap(2.0, 2.0, 0.0, 0.0, 4.0, 4.0, 3.0, 3.0));
         assert_eq!(box_distance(2.0, 2.0, 0.0, 0.0, 12.0, 2.0, 10.0, 0.0), 10.0);
+    }
+
+    #[test]
+    fn circle_parse_forms() {
+        assert_eq!(
+            parse_circle("<(1,2),3>"),
+            Some(GeomVal::circle(1.0, 2.0, 3.0))
+        );
+        assert_eq!(
+            parse_circle("((1,2),3)"),
+            Some(GeomVal::circle(1.0, 2.0, 3.0))
+        );
+        assert_eq!(parse_circle("4,5,6"), Some(GeomVal::circle(4.0, 5.0, 6.0)));
+        // A zero radius is valid; a negative radius is rejected.
+        assert_eq!(
+            parse_circle("<(0,0),0>"),
+            Some(GeomVal::circle(0.0, 0.0, 0.0))
+        );
+        assert_eq!(parse_circle("<(0,0),-1>"), None);
+        assert_eq!(parse_circle("abc"), None);
+        assert_eq!(parse_circle("<(1,2)>"), None);
+        assert_eq!(parse_circle("<(1,2,3),4>"), None);
+    }
+
+    #[test]
+    fn circle_format_canonical() {
+        assert_eq!(format(&GeomVal::circle(1.5, 2.5, 3.25)), "<(1.5,2.5),3.25>");
+        assert_eq!(format(&GeomVal::circle(0.0, 0.0, 0.0)), "<(0,0),0>");
+        assert_eq!(format(&GeomVal::circle(-0.0, -0.0, 2.0)), "<(0,0),2>");
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact integer-valued and power-of-two results compare exactly"
+    )]
+    fn circle_ops() {
+        assert_eq!(circle_area(2.0), std::f64::consts::PI * 4.0);
+        assert_eq!(circle_diameter(3.0), 6.0);
+        // circle <-> point: gap to boundary, clamped to 0 when the point is inside.
+        assert_eq!(circle_distance_point(0.0, 0.0, 1.0, 5.0, 0.0), 4.0);
+        assert_eq!(circle_distance_point(0.0, 0.0, 5.0, 1.0, 1.0), 0.0);
+        // circle <-> circle: gap between boundaries, clamped to 0 when overlapping.
+        assert_eq!(circle_distance_circle(0.0, 0.0, 1.0, 5.0, 0.0, 1.0), 3.0);
+        assert_eq!(circle_distance_circle(0.0, 0.0, 3.0, 4.0, 0.0, 3.0), 0.0);
+        // Overlap.
+        assert!(circle_overlap(0.0, 0.0, 2.0, 3.0, 0.0, 2.0));
+        assert!(!circle_overlap(0.0, 0.0, 2.0, 5.0, 0.0, 2.0));
+        // Contains point (inclusive) and contains circle.
+        assert!(circle_contains_point(0.0, 0.0, 5.0, 3.0, 4.0));
+        assert!(!circle_contains_point(0.0, 0.0, 5.0, 3.0, 5.0));
+        assert!(circle_contains_circle(0.0, 0.0, 5.0, 0.0, 0.0, 2.0));
+        assert!(!circle_contains_circle(0.0, 0.0, 5.0, 4.0, 0.0, 2.0));
     }
 }

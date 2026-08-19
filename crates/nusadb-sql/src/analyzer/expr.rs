@@ -1019,6 +1019,11 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::Nullif | F::Greatest | F::Least) {
         return analyze_conditional_function(func, args, scope, catalog, aggregates);
     }
+    // AREA(g) / CENTER(g) are polymorphic over the geometric kind — a `box` or a `circle` — so the
+    // single argument's kind is validated directly, not via the fixed (single-kind) table.
+    if matches!(func, F::GeomArea | F::GeomCenter) {
+        return analyze_geom_measure(func, args, scope, catalog, aggregates);
+    }
     // ARRAY_LENGTH(arr, dim) / ARRAY_TO_STRING(arr, sep) take an array of any element type — the
     // element type is polymorphic, so they are not expressible with the fixed table.
     if matches!(
@@ -1319,18 +1324,23 @@ pub(super) fn analyze_scalar_function(
             &[],
             ColumnType::Geometry(GeomKind::Box),
         ),
-        // AREA/HEIGHT/WIDTH(box) → FLOAT.
-        F::GeomArea | F::GeomHeight | F::GeomWidth => ScalarSig::Fixed(
+        // HEIGHT/WIDTH(box) → FLOAT. (AREA/CENTER are polymorphic over box|circle and handled before
+        // this table.)
+        F::GeomHeight | F::GeomWidth => ScalarSig::Fixed(
             &[ColumnType::Geometry(GeomKind::Box)],
             &[],
             ColumnType::Float,
         ),
-        // CENTER(box) → point.
-        F::GeomCenter => ScalarSig::Fixed(
-            &[ColumnType::Geometry(GeomKind::Box)],
+        // RADIUS/DIAMETER(circle) → FLOAT.
+        F::GeomRadius | F::GeomDiameter => ScalarSig::Fixed(
+            &[ColumnType::Geometry(GeomKind::Circle)],
             &[],
-            ColumnType::Geometry(GeomKind::Point),
+            ColumnType::Float,
         ),
+        // AREA/CENTER are polymorphic over box|circle and analyzed before this table.
+        F::GeomArea | F::GeomCenter => {
+            unreachable!("AREA/CENTER are analyzed before the scalar signature table")
+        },
         // GCD(a, b) / LCM(a, b) / DIV(a, b) take two INT arguments and return INT.
         F::Gcd | F::Lcm | F::Div => ScalarSig::Fixed(&[Int, Int], &[], Int),
         // FACTORIAL(n) takes one INT and returns INT.
@@ -2160,6 +2170,50 @@ fn analyze_numeric_function(
 /// common type (like `COALESCE`): the running type is threaded as the NULL hint so a bare `NULL`
 /// adopts its siblings' type, and the result is that unified type. `NULLIF` takes exactly two
 /// arguments; `GREATEST`/`LEAST` take one or more.
+/// Analyze `AREA(g)` / `CENTER(g)`, each taking a single geometric argument that is a `box` or a
+/// `circle`. `AREA` yields the `FLOAT` area; `CENTER` yields the `point` center. A non-geometry
+/// argument, or a `point` (which has no area or distinct center), is a loud type error.
+fn analyze_geom_measure(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    use nusadb_core::engine::GeomKind;
+    let name = func.name();
+    let [arg] = args else {
+        return Err(Error::ArityMismatch {
+            context: format!("function `{name}`"),
+            expected: 1,
+            found: args.len(),
+        });
+    };
+    let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates)?;
+    if !matches!(
+        typed.ty,
+        ColumnType::Geometry(GeomKind::Box | GeomKind::Circle)
+    ) {
+        return Err(Error::TypeMismatch {
+            context: format!("argument to function `{name}`"),
+            expected: ColumnType::Geometry(GeomKind::Box),
+            found: typed.ty,
+        });
+    }
+    let ty = if func == ast::ScalarFunc::GeomCenter {
+        ColumnType::Geometry(GeomKind::Point)
+    } else {
+        ColumnType::Float
+    };
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: vec![typed],
+        },
+        ty,
+    })
+}
+
 fn analyze_conditional_function(
     func: ast::ScalarFunc,
     args: &[ast::Expr],
@@ -4292,11 +4346,17 @@ const fn is_geometry_type(ty: ColumnType) -> bool {
     matches!(ty, ColumnType::Geometry(_))
 }
 
-/// Type rule for `box <-> box` / `point <-> point`: both operands are the same geometric kind; the
-/// result is the `FLOAT` distance.
+/// Type rule for the geometric distance `<->`: `point <-> point`, `box <-> box`, `circle <-> circle`
+/// (same-kind), and the mixed `circle <-> point` / `point <-> circle`; each yields the `FLOAT`
+/// distance.
 fn check_geom_distance(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    use nusadb_core::engine::GeomKind::{Circle, Point};
     match (left, right) {
-        (ColumnType::Geometry(a), ColumnType::Geometry(b)) if a == b => Ok(ColumnType::Float),
+        (ColumnType::Geometry(a), ColumnType::Geometry(b))
+            if a == b || matches!((a, b), (Circle, Point) | (Point, Circle)) =>
+        {
+            Ok(ColumnType::Float)
+        },
         _ => Err(Error::TypeMismatch {
             context: "`<->` geometric distance".to_owned(),
             expected: left,
@@ -4317,41 +4377,45 @@ fn check_geom_same_as(left: ColumnType, right: ColumnType) -> Result<ColumnType,
     }
 }
 
-/// Type rule for `box && box` overlap: both operands are boxes; the result is `BOOL`.
+/// Type rule for geometric overlap `&&`: `box && box` or `circle && circle`; the result is `BOOL`.
 fn check_geom_overlap(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind;
-    if left == ColumnType::Geometry(GeomKind::Box) && right == ColumnType::Geometry(GeomKind::Box) {
-        Ok(ColumnType::Bool)
-    } else {
-        Err(Error::TypeMismatch {
+    use nusadb_core::engine::GeomKind::{Box, Circle};
+    match (left, right) {
+        (ColumnType::Geometry(Box), ColumnType::Geometry(Box))
+        | (ColumnType::Geometry(Circle), ColumnType::Geometry(Circle)) => Ok(ColumnType::Bool),
+        _ => Err(Error::TypeMismatch {
             context: "`&&` geometric overlap".to_owned(),
-            expected: ColumnType::Geometry(GeomKind::Box),
-            found: if is_geometry_type(left) { right } else { left },
-        })
+            expected: left,
+            found: right,
+        }),
     }
 }
 
-/// Type rule for geometric containment: `box @> point` (contains) and `point <@ box` (contained by),
-/// each yielding `BOOL`.
+/// Type rule for geometric containment: `@>` (contains) and `<@` (contained by), for `box @> point`,
+/// `circle @> point`, and `circle @> circle`; each yields `BOOL`.
 fn check_geom_containment(
     op: ast::BinaryOp,
     left: ColumnType,
     right: ColumnType,
 ) -> Result<ColumnType, Error> {
-    use nusadb_core::engine::GeomKind;
+    use nusadb_core::engine::GeomKind::{Box, Circle, Point};
     let (container, element) = match op {
         ast::BinaryOp::JsonContains => (left, right),
         _ => (right, left),
     };
-    if container == ColumnType::Geometry(GeomKind::Box)
-        && element == ColumnType::Geometry(GeomKind::Point)
-    {
+    if matches!(
+        (container, element),
+        (
+            ColumnType::Geometry(Box | Circle),
+            ColumnType::Geometry(Point)
+        ) | (ColumnType::Geometry(Circle), ColumnType::Geometry(Circle))
+    ) {
         Ok(ColumnType::Bool)
     } else {
         Err(Error::TypeMismatch {
-            context: "geometric containment (`box @> point`)".to_owned(),
-            expected: ColumnType::Geometry(GeomKind::Box),
-            found: container,
+            context: "geometric containment (`@>` / `<@`)".to_owned(),
+            expected: container,
+            found: element,
         })
     }
 }

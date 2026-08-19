@@ -1398,13 +1398,15 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "trunc" => F::Trunc,
         // MACADDR8.
         "macaddr8_set7bit" => F::Macaddr8Set7bit,
-        // Geometric constructors and box accessors.
+        // Geometric constructors, box accessors, and circle accessors.
         "point" => F::PointCtor,
         "box" => F::BoxCtor,
         "area" => F::GeomArea,
         "center" => F::GeomCenter,
         "height" => F::GeomHeight,
         "width" => F::GeomWidth,
+        "radius" => F::GeomRadius,
+        "diameter" => F::GeomDiameter,
         // Random.
         "random" => F::Random,
         "setseed" => F::Setseed,

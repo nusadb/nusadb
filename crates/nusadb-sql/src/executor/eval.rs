@@ -1004,6 +1004,9 @@ fn eval_scalar_function(
                 }),
             ],
         ) => ast::Value::Float(crate::geometry::box_area(*high_x, *high_y, *low_x, *low_y)),
+        (F::GeomArea, [ast::Value::Geometry(crate::geometry::GeomVal::Circle { r, .. })]) => {
+            ast::Value::Float(crate::geometry::circle_area(*r))
+        },
         (
             F::GeomCenter,
             [
@@ -1018,6 +1021,10 @@ fn eval_scalar_function(
             *high_x, *high_y, *low_x, *low_y,
         )),
         (
+            F::GeomCenter,
+            [ast::Value::Geometry(crate::geometry::GeomVal::Circle { cx, cy, .. })],
+        ) => ast::Value::Geometry(crate::geometry::GeomVal::point(*cx, *cy)),
+        (
             F::GeomHeight,
             [ast::Value::Geometry(crate::geometry::GeomVal::Box { high_y, low_y, .. })],
         ) => ast::Value::Float(crate::geometry::box_height(*high_y, *low_y)),
@@ -1025,6 +1032,12 @@ fn eval_scalar_function(
             F::GeomWidth,
             [ast::Value::Geometry(crate::geometry::GeomVal::Box { high_x, low_x, .. })],
         ) => ast::Value::Float(crate::geometry::box_width(*high_x, *low_x)),
+        (F::GeomRadius, [ast::Value::Geometry(crate::geometry::GeomVal::Circle { r, .. })]) => {
+            ast::Value::Float(*r)
+        },
+        (F::GeomDiameter, [ast::Value::Geometry(crate::geometry::GeomVal::Circle { r, .. })]) => {
+            ast::Value::Float(crate::geometry::circle_diameter(*r))
+        },
         // Math functions — numeric-polymorphic, dispatched on value type within.
         (
             F::Abs
@@ -5200,8 +5213,10 @@ fn apply_geom_arithmetic(
     })
 }
 
-/// Evaluate the geometric distance operator `<->`: Euclidean between two points, or between two box
-/// centers. A `NULL` or mismatched operand yields `NULL`.
+/// Evaluate the geometric distance operator `<->`: Euclidean between two points, between two box
+/// centers, from a circle to a point (gap to its boundary), or between two circles (gap between
+/// boundaries). The `circle <-> point` form accepts either operand order. A `NULL` or mismatched
+/// operand yields `NULL`.
 fn geom_distance_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
     use crate::geometry::GeomVal;
     match (left, right) {
@@ -5225,12 +5240,37 @@ fn geom_distance_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
         ) => ast::Value::Float(crate::geometry::box_distance(
             *a_hx, *a_hy, *a_lx, *a_ly, *b_hx, *b_hy, *b_lx, *b_ly,
         )),
+        // `circle <-> point`, either operand order.
+        (
+            ast::Value::Geometry(GeomVal::Circle { cx, cy, r }),
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+        )
+        | (
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+            ast::Value::Geometry(GeomVal::Circle { cx, cy, r }),
+        ) => ast::Value::Float(crate::geometry::circle_distance_point(*cx, *cy, *r, *x, *y)),
+        // `circle <-> circle`.
+        (
+            ast::Value::Geometry(GeomVal::Circle {
+                cx: acx,
+                cy: acy,
+                r: ar,
+            }),
+            ast::Value::Geometry(GeomVal::Circle {
+                cx: bcx,
+                cy: bcy,
+                r: br,
+            }),
+        ) => ast::Value::Float(crate::geometry::circle_distance_circle(
+            *acx, *acy, *ar, *bcx, *bcy, *br,
+        )),
         _ => ast::Value::Null,
     }
 }
 
-/// Evaluate the geometric set predicates: `box && box` (overlap), `box @> point` (contains), and
-/// `point <@ box` (contained by). A `NULL` or wrong-shape operand yields `NULL`.
+/// Evaluate the geometric set predicates: overlap `&&` (`box && box`, `circle && circle`) and
+/// containment `@>`/`<@` (`box @> point`, `circle @> point`, `circle @> circle`). A `NULL` or
+/// wrong-shape operand yields `NULL`.
 fn apply_geom_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> ast::Value {
     use crate::geometry::GeomVal;
     use ast::BinaryOp as Op;
@@ -5252,19 +5292,33 @@ fn apply_geom_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value
             ) => ast::Value::Bool(crate::geometry::box_overlap(
                 *a_hx, *a_hy, *a_lx, *a_ly, *b_hx, *b_hy, *b_lx, *b_ly,
             )),
+            (
+                ast::Value::Geometry(GeomVal::Circle {
+                    cx: acx,
+                    cy: acy,
+                    r: ar,
+                }),
+                ast::Value::Geometry(GeomVal::Circle {
+                    cx: bcx,
+                    cy: bcy,
+                    r: br,
+                }),
+            ) => ast::Value::Bool(crate::geometry::circle_overlap(
+                *acx, *acy, *ar, *bcx, *bcy, *br,
+            )),
             _ => ast::Value::Null,
         },
-        // `@>` is `container @> element`; `<@` is `element <@ container`, so the box/point roles
-        // swap. Either way the box must contain the point.
-        Op::JsonContains => geom_box_contains(left, right),
-        Op::JsonContainedBy => geom_box_contains(right, left),
+        // `@>` is `container @> element`; `<@` is `element <@ container`, so the container/element
+        // roles swap.
+        Op::JsonContains => geom_contains(left, right),
+        Op::JsonContainedBy => geom_contains(right, left),
         _ => ast::Value::Null,
     }
 }
 
-/// Whether `container` (a box) contains `element` (a point), inclusive of the boundary. A `NULL` or
-/// wrong-shape operand yields `NULL`.
-fn geom_box_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
+/// Whether `container` contains `element`, inclusive of the boundary: `box @> point`,
+/// `circle @> point`, or `circle @> circle`. A `NULL` or wrong-shape operand yields `NULL`.
+fn geom_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
     use crate::geometry::GeomVal;
     match (container, element) {
         (
@@ -5277,6 +5331,24 @@ fn geom_box_contains(container: &ast::Value, element: &ast::Value) -> ast::Value
             ast::Value::Geometry(GeomVal::Point { x, y }),
         ) => ast::Value::Bool(crate::geometry::box_contains_point(
             *high_x, *high_y, *low_x, *low_y, *x, *y,
+        )),
+        (
+            ast::Value::Geometry(GeomVal::Circle { cx, cy, r }),
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+        ) => ast::Value::Bool(crate::geometry::circle_contains_point(*cx, *cy, *r, *x, *y)),
+        (
+            ast::Value::Geometry(GeomVal::Circle {
+                cx: ocx,
+                cy: ocy,
+                r: or,
+            }),
+            ast::Value::Geometry(GeomVal::Circle {
+                cx: icx,
+                cy: icy,
+                r: ir,
+            }),
+        ) => ast::Value::Bool(crate::geometry::circle_contains_circle(
+            *ocx, *ocy, *or, *icx, *icy, *ir,
         )),
         _ => ast::Value::Null,
     }

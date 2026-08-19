@@ -377,6 +377,68 @@ fn geometry_value_survives_reopen() {
     );
 }
 
+/// A `CIRCLE` column is DURABLE on disk: each value is written to the WAL as its canonical text
+/// `<(cx,cy),r>` and recovery decodes it back to the same typed geometry after a crash — not just
+/// held in memory. The non-canonical input forms (paren and bare) prove the parse-and-canonicalize
+/// happens before persistence, and a second crash-reopen proves a value committed after recovery
+/// also survives.
+#[test]
+fn circle_value_survives_reopen() {
+    use nusadb_sql::geometry::GeomVal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(
+            &engine,
+            "CREATE TABLE circles (id INT PRIMARY KEY, c CIRCLE)",
+        );
+        run(
+            &engine,
+            "INSERT INTO circles VALUES (1, '<(1.5,2.5),3.25>')",
+        );
+        // Non-canonical input forms canonicalize before they persist.
+        run(&engine, "INSERT INTO circles VALUES (2, '((1,2),3)')");
+        run(&engine, "INSERT INTO circles VALUES (3, '4,5,6')");
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The circle column decodes back to a typed geometry value (byte-correct), not text.
+        assert_eq!(
+            rows(run(&engine, "SELECT c FROM circles WHERE id = 1")),
+            vec![vec![Value::Geometry(GeomVal::circle(1.5, 2.5, 3.25))]]
+        );
+        // The canonical text of the recovered non-canonical inputs matches.
+        assert_eq!(
+            rows(run(
+                &engine,
+                "SELECT c::TEXT FROM circles WHERE id = 2 OR id = 3 ORDER BY id"
+            )),
+            vec![
+                vec![Value::Text("<(1,2),3>".to_owned())],
+                vec![Value::Text("<(4,5),6>".to_owned())],
+            ]
+        );
+        // A committed insert after recovery also persists.
+        run(&engine, "INSERT INTO circles VALUES (4, '<(0,0),0>')");
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed row — pre-crash and post-recovery — survives.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT id, c::TEXT FROM circles ORDER BY id")),
+        vec![
+            vec![Value::Int(1), Value::Text("<(1.5,2.5),3.25>".to_owned())],
+            vec![Value::Int(2), Value::Text("<(1,2),3>".to_owned())],
+            vec![Value::Int(3), Value::Text("<(4,5),6>".to_owned())],
+            vec![Value::Int(4), Value::Text("<(0,0),0>".to_owned())],
+        ]
+    );
+}
+
 /// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical

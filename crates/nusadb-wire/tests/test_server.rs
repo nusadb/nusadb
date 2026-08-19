@@ -4338,3 +4338,43 @@ async fn geometry_renders_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A `CIRCLE` column renders correctly over the real wire protocol — this proves the wire value
+/// encoding (`value_to_field`) formats a circle as its canonical text `<(cx,cy),r>`, not a debug or
+/// byte dump. The paren input form also proves canonicalization happens before it reaches the wire.
+#[tokio::test]
+async fn circle_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (c circle)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // The paren input form must show up as the canonical <(cx,cy),r> on the wire.
+    query(&mut conn, "INSERT INTO t VALUES ('((1.5,2.5),3.25)')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT c FROM t").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["c".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"<(1.5,2.5),3.25>".to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
