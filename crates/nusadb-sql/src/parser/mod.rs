@@ -214,6 +214,23 @@ impl Dialect for NusaParserDialect {
                     }),
             );
         }
+        // Geometric same-as `~=`. The tokenizer emits `~` (`Tilde`) then an adjacent `=` (`Eq`);
+        // recognize that pair here and emit a `Custom("~=")` operator the converter maps to the
+        // geometric same-as. A bare `~` (regex match) or a spaced `~ =` falls through untouched.
+        if let Some((symbol, tokens)) = recognize_geom_same_as(parser) {
+            for _ in 0..tokens {
+                parser.next_token();
+            }
+            return Some(
+                parser
+                    .parse_subexpr(precedence)
+                    .map(|right| sql::Expr::BinaryOp {
+                        left: Box::new(expr.clone()),
+                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
+                        right: Box::new(right),
+                    }),
+            );
+        }
         // `#` — the reference engine's integer XOR. sqlparser's own infix table gates the Sharp
         // token behind a dialect TypeId this wrapper does not report (it must keep reporting
         // `GenericDialect`'s — see `dialect()`), so parse the operator here. The default precedence table
@@ -259,9 +276,26 @@ impl Dialect for NusaParserDialect {
             | Token::AtArrow
             | Token::ArrowAt => Some(Ok(25)),
             Token::Placeholder(ref p) if p == "?" => Some(Ok(25)),
+            // Geometric same-as `~=` — the `~` (`Tilde`) followed by an adjacent `=` sits at the
+            // comparison tier so `a ~= b` binds like an equality. A bare `~` keeps its default
+            // precedence (fall through to `None`).
+            Token::Tilde if recognize_geom_same_as(parser).is_some() => Some(Ok(25)),
             _ => None,
         }
     }
+}
+
+/// Recognize the geometric same-as operator `~=` at the current parser position, where the next
+/// token is a `~` (`Token::Tilde`). Returns the canonical symbol and the number of tokens it spans,
+/// or `None` when the token after `~` is not a directly-adjacent `=` (so a bare `~` regex match or a
+/// spaced `~ =` is left untouched).
+fn recognize_geom_same_as(parser: &Parser) -> Option<(&'static str, usize)> {
+    let tilde = parser.peek_token_ref();
+    if tilde.token != Token::Tilde {
+        return None;
+    }
+    let after = parser.peek_nth_token_ref(1);
+    (matches!(after.token, Token::Eq) && tilde.span.end == after.span.start).then_some(("~=", 2))
 }
 
 /// Recognize a JSON key-existence operator (`?`, `?|`, `?&`) at the current parser position.

@@ -89,6 +89,7 @@ pub(super) fn type_name(ty: ColumnType) -> String {
         ColumnType::Interval => "INTERVAL".to_owned(),
         ColumnType::Array(elem) => format!("{}[]", type_name(elem.column_type())),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
+        ColumnType::Geometry(kind) => kind.name().to_uppercase(),
     }
 }
 

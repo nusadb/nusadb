@@ -960,6 +960,18 @@ pub enum ScalarFunc {
     /// `MACADDR8_SET7BIT(macaddr8)` — set the `0x02` (locally-administered) bit of the first byte,
     /// returning the modified `MACADDR8`.
     Macaddr8Set7bit,
+    /// `POINT(x, y)` — construct a `point` from two `FLOAT` coordinates.
+    PointCtor,
+    /// `BOX(p1, p2)` — construct a `box` from two `point` corners.
+    BoxCtor,
+    /// `AREA(box)` — the area (`width × height`) of a box, as `FLOAT`.
+    GeomArea,
+    /// `CENTER(box)` — the center (midpoint) of a box, as a `point`.
+    GeomCenter,
+    /// `HEIGHT(box)` — the height of a box, as `FLOAT`.
+    GeomHeight,
+    /// `WIDTH(box)` — the width of a box, as `FLOAT`.
+    GeomWidth,
 }
 
 impl ScalarFunc {
@@ -1180,6 +1192,12 @@ impl ScalarFunc {
             Self::SequenceCurrent => "currval",
             Self::SequenceSet => "setval",
             Self::Macaddr8Set7bit => "macaddr8_set7bit",
+            Self::PointCtor => "point",
+            Self::BoxCtor => "box",
+            Self::GeomArea => "area",
+            Self::GeomCenter => "center",
+            Self::GeomHeight => "height",
+            Self::GeomWidth => "width",
         }
     }
 
@@ -1580,6 +1598,9 @@ pub enum Value {
     /// Raw byte string `BYTEA` — the in-runtime value of a `ColumnType::Bytes` column. Cast
     /// to/from text via the `\x<hex>` form; rendered the same way.
     Bytes(Vec<u8>),
+    /// A geometric value (`point` / `box`); its [`GeomKind`](nusadb_core::engine::GeomKind) is
+    /// carried inside the [`crate::geometry::GeomVal`].
+    Geometry(crate::geometry::GeomVal),
 }
 
 /// Binary operators the parser accepts.
@@ -1662,6 +1683,9 @@ pub enum BinaryOp {
     /// Full-text `@@` — does the left `tsvector` (canonical text form) match the right `tsquery`
     /// (text form), as `BOOL` (F1)? Either operand order is accepted, like the reference engine.
     TsMatch,
+    /// Geometric same-as `~=` — are two geometric values (both `point` or both `box`) equal by
+    /// their coordinates, as `BOOL`?
+    GeomSameAs,
 }
 
 /// Unary operators the parser accepts.

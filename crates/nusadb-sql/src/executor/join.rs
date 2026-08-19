@@ -827,7 +827,9 @@ pub(super) fn key_atoms(
             | ast::Value::Json(_)
             | ast::Value::Interval(_)
             | ast::Value::Array(_)
-            | ast::Value::Vector(_) => return Ok(None),
+            | ast::Value::Vector(_)
+            // Geometry is not a hash-join key type (`is_hashable_key_type`); a value here never matches.
+            | ast::Value::Geometry(_) => return Ok(None),
         }
     }
     Ok(Some(atoms))

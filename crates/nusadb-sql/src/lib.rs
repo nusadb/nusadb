@@ -22,6 +22,7 @@ pub mod display;
 pub mod error;
 pub mod executor;
 pub mod fts;
+pub mod geometry;
 pub mod hnsw;
 pub mod inet;
 pub mod interval;

@@ -166,11 +166,14 @@ pub(crate) fn skip_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<usi
         // TEXT/VARCHAR/CHAR and JSON/JSONB share the `[u32 len][len UTF-8 bytes]` layout;
         // `read_text_field` bounds- and UTF-8-validates and returns the end offset without owning
         // the string (the `.to_owned()` a full decode pays is exactly what a dropped column skips).
+        // GEOMETRY shares the length-prefixed canonical-text layout, so it skips the same way (no
+        // parse needed to advance the cursor).
         ColumnType::Text
         | ColumnType::VarChar(_)
         | ColumnType::Char(_)
         | ColumnType::Json
-        | ColumnType::Jsonb => Ok(read_text_field(bytes, pos)?.1),
+        | ColumnType::Jsonb
+        | ColumnType::Geometry(_) => Ok(read_text_field(bytes, pos)?.1),
         // BYTEA: `[u32 len][len raw bytes]`, no UTF-8 validation (matching `decode_value`).
         ColumnType::Bytes => {
             let len = u32::from_le_bytes(read_array::<4>(bytes, pos)?) as usize;
@@ -203,6 +206,16 @@ fn bpchar_canonical(value: &ast::Value, ty: ColumnType) -> Option<ast::Value> {
         },
         _ => None,
     }
+}
+
+/// Write `s` length-prefixed (a `u32` little-endian length then the UTF-8 bytes), the same framing
+/// as a `TEXT` field. Used for the canonical text form of a `GEOMETRY` value.
+fn write_geometry_text(s: &str, out: &mut Vec<u8>) -> Result<(), Error> {
+    let len = u32::try_from(s.len())
+        .map_err(|_| Error::LimitExceeded("geometry value larger than 4 GiB".to_owned()))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
 #[allow(
@@ -251,6 +264,14 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Uuid(u), ColumnType::Uuid) => out.extend_from_slice(u),
         (ast::Value::Macaddr(m), ColumnType::Macaddr) => out.extend_from_slice(m),
         (ast::Value::Macaddr8(m), ColumnType::Macaddr8) => out.extend_from_slice(m),
+        // GEOMETRY is stored as its canonical text form, length-prefixed like TEXT; the column's
+        // kind must match the value's shape.
+        (ast::Value::Geometry(g), ColumnType::Geometry(kind)) => {
+            if g.kind() != kind {
+                return Err(invalid(ty, &crate::geometry::format(g)));
+            }
+            write_geometry_text(&crate::geometry::format(g), out)?;
+        },
         (ast::Value::Inet(a), ColumnType::Inet | ColumnType::Cidr) => {
             out.extend_from_slice(&a.encode());
         },
@@ -320,6 +341,12 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Text(s), ColumnType::Range(kind)) => {
             let r = crate::range::parse(s, kind).ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&crate::range::encode(&r));
+        },
+        // A text literal assigned to a GEOMETRY column is parsed into the column's kind, then stored
+        // in its canonical text form.
+        (ast::Value::Text(s), ColumnType::Geometry(kind)) => {
+            let g = crate::geometry::parse(s, kind).ok_or_else(|| invalid(ty, s))?;
+            write_geometry_text(&crate::geometry::format(&g), out)?;
         },
         (ast::Value::Text(s), ColumnType::Bit(n)) => {
             let bits = crate::bit::parse(s).ok_or_else(|| invalid(ty, s))?;
@@ -681,6 +708,13 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
             let arr = read_array::<8>(bytes, pos)?;
             Ok((ast::Value::Macaddr8(arr), pos + 8))
         },
+        // GEOMETRY: length-prefixed canonical text, re-parsed into the column's kind.
+        ColumnType::Geometry(kind) => {
+            let (text, next) = read_text_field(bytes, pos)?;
+            let g =
+                crate::geometry::parse(text, kind).ok_or(Error::MalformedTuple { offset: pos })?;
+            Ok((ast::Value::Geometry(g), next))
+        },
         // INET/CIDR are self-describing: the flags byte's family bit sets the total length (2-byte
         // header + 4 or 16 address octets).
         ColumnType::Inet | ColumnType::Cidr => {
@@ -843,6 +877,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
+        ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),

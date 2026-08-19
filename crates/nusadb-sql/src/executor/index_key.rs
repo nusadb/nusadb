@@ -105,10 +105,12 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         | ast::Value::Vector(_)
         | ast::Value::Inet(_)
         | ast::Value::Bit(_)
-        | ast::Value::Range(_) => {
+        | ast::Value::Range(_)
+        // GEOMETRY has no order-preserving key form (no default btree opclass).
+        | ast::Value::Geometry(_) => {
             return Err(Error::Unsupported(
-                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE columns cannot yet be \
-                 index keys"
+                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE / GEOMETRY columns \
+                 cannot yet be index keys"
                     .to_owned(),
             ));
         },

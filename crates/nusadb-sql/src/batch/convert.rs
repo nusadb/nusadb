@@ -199,7 +199,8 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
         | ColumnType::Cidr
         | ColumnType::Bit(_)
         | ColumnType::VarBit(_)
-        | ColumnType::Range(_) => ast::Value::Null,
+        | ColumnType::Range(_)
+        | ColumnType::Geometry(_) => ast::Value::Null,
         ColumnType::Array(_) => {
             let Some(list) = any.downcast_ref::<ListArray>() else {
                 return ast::Value::Null;
@@ -338,7 +339,8 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
         | ColumnType::Cidr
         | ColumnType::Bit(_)
         | ColumnType::VarBit(_)
-        | ColumnType::Range(_) => return Err(unsupported_batch_type(ty)),
+        | ColumnType::Range(_)
+        | ColumnType::Geometry(_) => return Err(unsupported_batch_type(ty)),
     };
     Ok(array)
 }
@@ -354,6 +356,7 @@ fn unsupported_batch_type(ty: ColumnType) -> Error {
         ColumnType::Bit(_) => "BIT",
         ColumnType::VarBit(_) => "BIT VARYING",
         ColumnType::Range(_) => "RANGE",
+        ColumnType::Geometry(_) => "GEOMETRY",
         _ => "VECTOR",
     };
     Error::Unsupported(format!(

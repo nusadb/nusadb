@@ -981,6 +981,50 @@ fn eval_scalar_function(
         (F::Macaddr8Set7bit, [ast::Value::Macaddr8(m)]) => {
             ast::Value::Macaddr8(crate::macaddr8::set7bit(*m))
         },
+        // Geometric constructors and box accessors. Arguments are non-NULL here (the strict
+        // collection above returned NULL otherwise); the analyzer fixed their kinds.
+        (F::PointCtor, [a, b]) => {
+            ast::Value::Geometry(crate::geometry::GeomVal::point(to_f64(a), to_f64(b)))
+        },
+        (
+            F::BoxCtor,
+            [
+                ast::Value::Geometry(crate::geometry::GeomVal::Point { x: ax, y: ay }),
+                ast::Value::Geometry(crate::geometry::GeomVal::Point { x: bx, y: by }),
+            ],
+        ) => ast::Value::Geometry(crate::geometry::GeomVal::make_box(*ax, *ay, *bx, *by)),
+        (
+            F::GeomArea,
+            [
+                ast::Value::Geometry(crate::geometry::GeomVal::Box {
+                    high_x,
+                    high_y,
+                    low_x,
+                    low_y,
+                }),
+            ],
+        ) => ast::Value::Float(crate::geometry::box_area(*high_x, *high_y, *low_x, *low_y)),
+        (
+            F::GeomCenter,
+            [
+                ast::Value::Geometry(crate::geometry::GeomVal::Box {
+                    high_x,
+                    high_y,
+                    low_x,
+                    low_y,
+                }),
+            ],
+        ) => ast::Value::Geometry(crate::geometry::box_center(
+            *high_x, *high_y, *low_x, *low_y,
+        )),
+        (
+            F::GeomHeight,
+            [ast::Value::Geometry(crate::geometry::GeomVal::Box { high_y, low_y, .. })],
+        ) => ast::Value::Float(crate::geometry::box_height(*high_y, *low_y)),
+        (
+            F::GeomWidth,
+            [ast::Value::Geometry(crate::geometry::GeomVal::Box { high_x, low_x, .. })],
+        ) => ast::Value::Float(crate::geometry::box_width(*high_x, *low_x)),
         // Math functions — numeric-polymorphic, dispatched on value type within.
         (
             F::Abs
@@ -3762,6 +3806,16 @@ fn index_one_level(base: &TypedExpr, index: &TypedExpr, row: &Row) -> Result<ast
         _ => eval(base, row)?,
     };
     let index_v = eval(index, row)?;
+    // A `point` subscript is 0-based: `p[0]` is X, `p[1]` is Y; any other index is NULL.
+    if let (ast::Value::Geometry(crate::geometry::GeomVal::Point { x, y }), ast::Value::Int(i)) =
+        (&base_v, &index_v)
+    {
+        return Ok(match i {
+            0 => ast::Value::Float(*x),
+            1 => ast::Value::Float(*y),
+            _ => ast::Value::Null,
+        });
+    }
     let (ast::Value::Array(items), ast::Value::Int(i)) = (&base_v, &index_v) else {
         // NULL array / NULL index, or a base that did not reach an array (too many subscripts) → NULL.
         return Ok(ast::Value::Null);
@@ -3878,6 +3932,9 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         | (ast::Value::Interval(_), ColumnType::Interval)
         | (ast::Value::Bytes(_), ColumnType::Bytes)
         | (ast::Value::Array(_), ColumnType::Array(_)) => Ok(value),
+        // GEOMETRY casts to the same geometric kind unchanged; a different kind is a cast error
+        // (caught by the fallthrough below).
+        (ast::Value::Geometry(g), ColumnType::Geometry(kind)) if g.kind() == kind => Ok(value),
         // Numeric widening / narrowing.
         (ast::Value::Int(i), ColumnType::Float) => Ok(ast::Value::Float(*i as f64)),
         (ast::Value::Float(f), ColumnType::Int) => {
@@ -3951,6 +4008,10 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Macaddr(m), ColumnType::Macaddr8) => {
             Ok(ast::Value::Macaddr8(crate::macaddr8::from_eui48(*m)))
         },
+        // Text → GEOMETRY parses into the target's geometric kind.
+        (ast::Value::Text(s), ColumnType::Geometry(kind)) => crate::geometry::parse(s, kind)
+            .map(ast::Value::Geometry)
+            .ok_or_else(|| invalid_cast(s, ColumnType::Geometry(kind))),
         (ast::Value::Text(s), ColumnType::Inet) => crate::inet::parse_inet(s)
             .map(ast::Value::Inet)
             .ok_or_else(|| invalid_cast(s, ColumnType::Inet)),
@@ -4008,6 +4069,10 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         },
         (ast::Value::Macaddr8(m), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::macaddr8::format(*m)))
+        },
+        // GEOMETRY → Text renders the canonical text form.
+        (ast::Value::Geometry(g), ColumnType::Text) => {
+            Ok(ast::Value::Text(crate::geometry::format(g)))
         },
         // Temporal narrowing/widening (QA category-D): a TIMESTAMP[TZ] splits into its DATE
         // (floor of whole days since the epoch) and TIME-of-day (micros within the day); a DATE
@@ -4439,6 +4504,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::Uuid(_) => ColumnType::Uuid,
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
+        ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -4911,6 +4977,10 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         (ast::Value::Range(a), ast::Value::Range(b)) => a.range_cmp(b),
         // BYTEA orders lexicographically by raw byte.
         (ast::Value::Bytes(a), ast::Value::Bytes(b)) => a.cmp(b),
+        // GEOMETRY has no natural order; compare by canonical text so DISTINCT / ORDER BY are stable.
+        (ast::Value::Geometry(a), ast::Value::Geometry(b)) => {
+            crate::geometry::format(a).cmp(&crate::geometry::format(b))
+        },
         (Interval(a), Interval(b)) => a.compare(b),
         // Arrays order lexicographically by element, then by length. A user-visible array is
         // homogeneous (the column's element type), so element-wise `compare` is well-defined
@@ -4996,6 +5066,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Bit(_) => 19,
         ast::Value::Range(_) => 20,
         ast::Value::Macaddr8(_) => 21,
+        ast::Value::Geometry(_) => 22,
     }
 }
 
@@ -5015,6 +5086,14 @@ fn apply_binary(
         // JSON `-` (delete a key / array index / key list) shares the `-` operator with arithmetic;
         // the JSON document on the left is what tells them apart.
         Op::Minus if matches!(left, ast::Value::Json(_)) => json_delete_op(left, right),
+        // Geometric point arithmetic (`+`/`-` vector add/sub, `*`/`/` complex mult/div); a geometry
+        // operand distinguishes it from numeric arithmetic.
+        Op::Plus | Op::Minus | Op::Multiply | Op::Divide
+            if matches!(left, ast::Value::Geometry(_))
+                || matches!(right, ast::Value::Geometry(_)) =>
+        {
+            apply_geom_arithmetic(op, left, right)
+        },
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
             apply_arithmetic(op, left, right, result_ty)
         },
@@ -5036,6 +5115,13 @@ fn apply_binary(
         },
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             Ok(apply_bitwise(op, left, right))
+        },
+        // Geometry predicates share `&&` (box overlap) and `@>`/`<@` (box↔point containment).
+        Op::ArrayOverlap | Op::JsonContains | Op::JsonContainedBy
+            if matches!(left, ast::Value::Geometry(_))
+                || matches!(right, ast::Value::Geometry(_)) =>
+        {
+            Ok(apply_geom_predicate(op, left, right))
         },
         // Range predicates share `&&` (overlap) and `@>`/`<@` (containment) with the array forms.
         Op::ArrayOverlap | Op::JsonContains | Op::JsonContainedBy
@@ -5068,12 +5154,141 @@ fn apply_binary(
         Op::VectorDistance => {
             vector_distance_op("<=>", crate::vector::cosine_distance, left, right)
         },
+        // `<->` is the geometric distance (`point <-> point`, `box <-> box`) when an operand is
+        // geometry, otherwise the vector L2 distance.
+        Op::VectorL2Distance
+            if matches!(left, ast::Value::Geometry(_))
+                || matches!(right, ast::Value::Geometry(_)) =>
+        {
+            Ok(geom_distance_op(left, right))
+        },
         Op::VectorL2Distance => vector_distance_op("<->", crate::vector::l2_distance, left, right),
         Op::VectorNegInnerProduct => {
             vector_distance_op("<#>", crate::vector::neg_inner_product, left, right)
         },
         Op::VectorL1Distance => vector_distance_op("<+>", crate::vector::l1_distance, left, right),
         Op::TsMatch => ts_match_op(left, right),
+        // `~=` geometric same-as.
+        Op::GeomSameAs => Ok(geom_same_as_op(left, right)),
+    }
+}
+
+/// Evaluate geometric point arithmetic: `+`/`-` (vector add/sub) and `*`/`/` (complex mult/div).
+/// A `NULL` operand yields `NULL`; dividing by the zero point is a division-by-zero error.
+fn apply_geom_arithmetic(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    use crate::geometry::GeomVal;
+    use ast::BinaryOp as Op;
+    let (
+        ast::Value::Geometry(GeomVal::Point { x: ax, y: ay }),
+        ast::Value::Geometry(GeomVal::Point { x: bx, y: by }),
+    ) = (left, right)
+    else {
+        return Ok(ast::Value::Null);
+    };
+    Ok(match op {
+        Op::Plus => ast::Value::Geometry(crate::geometry::point_add(*ax, *ay, *bx, *by)),
+        Op::Minus => ast::Value::Geometry(crate::geometry::point_sub(*ax, *ay, *bx, *by)),
+        Op::Multiply => ast::Value::Geometry(crate::geometry::point_mul(*ax, *ay, *bx, *by)),
+        Op::Divide => crate::geometry::point_div(*ax, *ay, *bx, *by)
+            .map(ast::Value::Geometry)
+            .ok_or(Error::DivisionByZero)?,
+        _ => ast::Value::Null,
+    })
+}
+
+/// Evaluate the geometric distance operator `<->`: Euclidean between two points, or between two box
+/// centers. A `NULL` or mismatched operand yields `NULL`.
+fn geom_distance_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
+    use crate::geometry::GeomVal;
+    match (left, right) {
+        (
+            ast::Value::Geometry(GeomVal::Point { x: ax, y: ay }),
+            ast::Value::Geometry(GeomVal::Point { x: bx, y: by }),
+        ) => ast::Value::Float(crate::geometry::point_distance(*ax, *ay, *bx, *by)),
+        (
+            ast::Value::Geometry(GeomVal::Box {
+                high_x: a_hx,
+                high_y: a_hy,
+                low_x: a_lx,
+                low_y: a_ly,
+            }),
+            ast::Value::Geometry(GeomVal::Box {
+                high_x: b_hx,
+                high_y: b_hy,
+                low_x: b_lx,
+                low_y: b_ly,
+            }),
+        ) => ast::Value::Float(crate::geometry::box_distance(
+            *a_hx, *a_hy, *a_lx, *a_ly, *b_hx, *b_hy, *b_lx, *b_ly,
+        )),
+        _ => ast::Value::Null,
+    }
+}
+
+/// Evaluate the geometric set predicates: `box && box` (overlap), `box @> point` (contains), and
+/// `point <@ box` (contained by). A `NULL` or wrong-shape operand yields `NULL`.
+fn apply_geom_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> ast::Value {
+    use crate::geometry::GeomVal;
+    use ast::BinaryOp as Op;
+    match op {
+        Op::ArrayOverlap => match (left, right) {
+            (
+                ast::Value::Geometry(GeomVal::Box {
+                    high_x: a_hx,
+                    high_y: a_hy,
+                    low_x: a_lx,
+                    low_y: a_ly,
+                }),
+                ast::Value::Geometry(GeomVal::Box {
+                    high_x: b_hx,
+                    high_y: b_hy,
+                    low_x: b_lx,
+                    low_y: b_ly,
+                }),
+            ) => ast::Value::Bool(crate::geometry::box_overlap(
+                *a_hx, *a_hy, *a_lx, *a_ly, *b_hx, *b_hy, *b_lx, *b_ly,
+            )),
+            _ => ast::Value::Null,
+        },
+        // `@>` is `container @> element`; `<@` is `element <@ container`, so the box/point roles
+        // swap. Either way the box must contain the point.
+        Op::JsonContains => geom_box_contains(left, right),
+        Op::JsonContainedBy => geom_box_contains(right, left),
+        _ => ast::Value::Null,
+    }
+}
+
+/// Whether `container` (a box) contains `element` (a point), inclusive of the boundary. A `NULL` or
+/// wrong-shape operand yields `NULL`.
+fn geom_box_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
+    use crate::geometry::GeomVal;
+    match (container, element) {
+        (
+            ast::Value::Geometry(GeomVal::Box {
+                high_x,
+                high_y,
+                low_x,
+                low_y,
+            }),
+            ast::Value::Geometry(GeomVal::Point { x, y }),
+        ) => ast::Value::Bool(crate::geometry::box_contains_point(
+            *high_x, *high_y, *low_x, *low_y, *x, *y,
+        )),
+        _ => ast::Value::Null,
+    }
+}
+
+/// Evaluate the geometric same-as operator `~=`: two values are equal when they are the same kind
+/// and equal by coordinates (a box is compared in its normalized form). A `NULL` operand yields
+/// `NULL`.
+fn geom_same_as_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
+    match (left, right) {
+        (ast::Value::Geometry(a), ast::Value::Geometry(b)) => ast::Value::Bool(a == b),
+        _ => ast::Value::Null,
     }
 }
 

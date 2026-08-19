@@ -4297,3 +4297,44 @@ async fn on_commit_drop_rollback_leaves_nothing_dangling() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A `POINT` and a `BOX` column render correctly over the real wire protocol — the SLT corpus
+/// evaluates embedded, so this proves the wire value encoding (`value_to_field`) formats each
+/// geometric value as its canonical text (`(x,y)` / normalized `(hx,hy),(lx,ly)`), not a debug or
+/// byte dump.
+#[tokio::test]
+async fn geometry_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (p point, b box)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // The box corners are given lower-left first; the wire must show the normalized order.
+    query(&mut conn, "INSERT INTO t VALUES ('(1,2)', '(1,1),(3,3)')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT p, b FROM t").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["p".to_owned(), "b".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"(1,2)".to_vec()), Some(b"(3,3),(1,1)".to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

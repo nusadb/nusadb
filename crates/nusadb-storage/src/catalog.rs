@@ -243,6 +243,8 @@ impl<'s, S: PageStore> Catalog<'s, S> {
                     },
                     // RANGE carries its element-kind tag byte.
                     ColumnType::Range(kind) => buf.push(kind.tag()),
+                    // GEOMETRY carries its geometry-kind tag byte.
+                    ColumnType::Geometry(kind) => buf.push(kind.tag()),
                     _ => {},
                 }
                 buf.push(u8::from(c.nullable));
@@ -296,6 +298,12 @@ impl<'s, S: PageStore> Catalog<'s, S> {
                     // RANGE (tag 27) stores its element-kind tag.
                     ColumnType::Range(
                         nusadb_core::engine::RangeKind::from_tag(rd_u8(blob, &mut cur)?)
+                            .ok_or_else(corrupt)?,
+                    )
+                } else if tag == 29 {
+                    // GEOMETRY (tag 29) stores its geometry-kind tag.
+                    ColumnType::Geometry(
+                        nusadb_core::engine::GeomKind::from_tag(rd_u8(blob, &mut cur)?)
                             .ok_or_else(corrupt)?,
                     )
                 } else {
@@ -411,6 +419,8 @@ const fn coltype_to_u8(t: ColumnType) -> u8 {
         // Tag 27; the element-kind tag is serialized separately.
         ColumnType::Range(_) => 27,
         ColumnType::Macaddr8 => 28,
+        // Tag 29; the geometry-kind tag is serialized separately.
+        ColumnType::Geometry(_) => 29,
     }
 }
 fn u8_to_coltype(b: u8) -> Result<ColumnType> {
@@ -438,6 +448,8 @@ fn u8_to_coltype(b: u8) -> Result<ColumnType> {
         23 => ColumnType::Inet,
         24 => ColumnType::Cidr,
         28 => ColumnType::Macaddr8,
+        // GEOMETRY (tag 29) carries its geometry-kind tag; handled in `deserialize`, but a bare
+        // element decode (arrays never hold geometry) has no default, so it is unreachable here.
         // An array's NUMERIC element is unconstrained (single tag byte, no precision/scale); a
         // column-level NUMERIC (tag 10) is decoded with its precision/scale before this fallback.
         10 => ColumnType::Numeric {

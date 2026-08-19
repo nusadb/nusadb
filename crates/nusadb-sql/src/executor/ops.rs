@@ -357,7 +357,9 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         | T::Jsonb
         | T::Interval
         | T::Array(_)
-        | T::Vector(_) => false,
+        | T::Vector(_)
+        // Geometry has no order-preserving backing index to probe (stored as canonical text).
+        | T::Geometry(_) => false,
     }
 }
 
@@ -3527,6 +3529,7 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Interval => "interval",
         ColumnType::Array(_) => "ARRAY",
         ColumnType::Vector(_) => "vector",
+        ColumnType::Geometry(kind) => kind.name(),
     }
 }
 

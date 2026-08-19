@@ -201,6 +201,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Bit(_) => 19,
         ast::Value::Range(_) => 20,
         ast::Value::Macaddr8(_) => 21,
+        ast::Value::Geometry(_) => 22,
     }
 }
 

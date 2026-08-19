@@ -99,8 +99,9 @@ pub(super) const fn wider_int(a: ColumnType, b: ColumnType) -> ColumnType {
 }
 
 /// Types whose value is parsed from a `TEXT` *literal* by the "unknown literal" coercion rule — the
-/// temporal types, `UUID`, `MACADDR`, the network types, the bit strings, and the ranges: everything
-/// with a canonical text form but no literal syntax of its own. A text literal compared or assigned
+/// temporal types, `UUID`, `MACADDR`, the network types, the bit strings, the ranges, and the
+/// geometric types: everything with a canonical text form but no literal syntax of its own. A text
+/// literal compared or assigned
 /// against one of these is
 /// re-typed as that type (parsed at evaluation, loud-rejecting a bad string), so e.g.
 /// `WHERE mac = '08:00:2b:01:02:03'` and `INSERT ... VALUES ('08:00:2b:01:02:03')` work.
@@ -120,6 +121,7 @@ pub(super) const fn is_temporal_or_uuid(ty: ColumnType) -> bool {
             | ColumnType::Bit(_)
             | ColumnType::VarBit(_)
             | ColumnType::Range(_)
+            | ColumnType::Geometry(_)
     )
 }
 

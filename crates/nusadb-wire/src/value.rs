@@ -70,6 +70,8 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
         Value::Macaddr(m) => m.to_vec(),
         // MACADDR8 is its eight raw bytes in transmission order.
         Value::Macaddr8(m) => m.to_vec(),
+        // GEOMETRY is sent as its canonical text form (`(x,y)` / `(hx,hy),(lx,ly)`).
+        Value::Geometry(g) => nusadb_sql::geometry::format(g).into_bytes(),
         // INET/CIDR: the self-describing `[flags, masklen, octets]` encoding (the tag tells the
         // client it is a network address).
         Value::Inet(a) => a.encode(),

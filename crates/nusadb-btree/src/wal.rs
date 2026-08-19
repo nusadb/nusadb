@@ -896,6 +896,10 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
             out.push(kind.tag());
         },
         ColumnType::Macaddr8 => out.push(28),
+        ColumnType::Geometry(kind) => {
+            out.push(29);
+            out.push(kind.tag());
+        },
     }
 }
 
@@ -958,6 +962,11 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
             ColumnType::Range(kind)
         },
         28 => ColumnType::Macaddr8,
+        29 => {
+            let kind = nusadb_core::engine::GeomKind::from_tag(*bytes.get(*at)?)?;
+            *at += 1;
+            ColumnType::Geometry(kind)
+        },
         _ => return None,
     })
 }

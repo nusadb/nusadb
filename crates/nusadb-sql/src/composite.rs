@@ -183,6 +183,7 @@ fn parse_field(s: &str, ty: ColumnType) -> Option<ast::Value> {
         ColumnType::Uuid => ast::Value::Uuid(crate::temporal::parse_uuid(s)?),
         ColumnType::Macaddr => ast::Value::Macaddr(crate::macaddr::parse(s)?),
         ColumnType::Macaddr8 => ast::Value::Macaddr8(crate::macaddr8::parse(s)?),
+        ColumnType::Geometry(kind) => ast::Value::Geometry(crate::geometry::parse(s, kind)?),
         ColumnType::Inet => ast::Value::Inet(crate::inet::parse_inet(s)?),
         ColumnType::Cidr => ast::Value::Inet(crate::inet::parse_cidr(s)?),
         ColumnType::Json | ColumnType::Jsonb => ast::Value::Json(crate::json::canonicalize(s)?),

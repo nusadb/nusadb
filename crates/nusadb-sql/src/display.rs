@@ -25,6 +25,7 @@ pub fn value_text(v: &Value) -> String {
         Value::TimeTz(t) => temporal::format_timetz(*t),
         Value::Uuid(u) => temporal::format_uuid(u),
         Value::Macaddr(m) => crate::macaddr::format(*m),
+        Value::Geometry(g) => crate::geometry::format(g),
         Value::Macaddr8(m) => crate::macaddr8::format(*m),
         Value::Inet(a) => a.format(),
         Value::Bit(b) => crate::bit::format(b),

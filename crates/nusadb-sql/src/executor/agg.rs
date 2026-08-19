@@ -1637,6 +1637,9 @@ fn distinct_hash(v: &ast::Value) -> u64 {
         V::Uuid(u) => (12u8, u).hash(&mut h),
         V::Macaddr(m) => (17u8, m).hash(&mut h),
         V::Macaddr8(m) => (21u8, m).hash(&mut h),
+        // GEOMETRY hashes by its canonical text, matching `compare`'s text-based equality (so a
+        // normalized box and its reversed input land together).
+        V::Geometry(g) => (22u8, crate::geometry::format(g)).hash(&mut h),
         V::Inet(a) => (18u8, a).hash(&mut h),
         V::Bit(b) => (19u8, b).hash(&mut h),
         // A range hashes by its scale-normalized key bytes (its bound values are not `Hash`; the

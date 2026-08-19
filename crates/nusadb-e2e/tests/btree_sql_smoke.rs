@@ -293,6 +293,90 @@ fn macaddr8_value_survives_reopen() {
     );
 }
 
+/// A `POINT` and a `BOX` column are DURABLE on disk: each value is written to the WAL as its
+/// canonical text and recovery decodes it back to the same typed geometry after a crash — not just
+/// held in memory. The box literals also prove the parse-time normalization (upper-right,
+/// lower-left) is what gets persisted, not the raw input order.
+#[test]
+fn geometry_value_survives_reopen() {
+    use nusadb_sql::geometry::GeomVal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(
+            &engine,
+            "CREATE TABLE shapes (id INT PRIMARY KEY, p POINT, b BOX)",
+        );
+        run(
+            &engine,
+            "INSERT INTO shapes VALUES (1, '(1.5,-2.5)', '(1,1),(3,3)')",
+        );
+        // The box corners are given lower-left first; normalization to upper-right-first persists.
+        run(
+            &engine,
+            "INSERT INTO shapes VALUES (2, '3,4', '(1,3),(3,1)')",
+        );
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The point/box columns decode back to typed geometry values (byte-correct), not text.
+        assert_eq!(
+            rows(run(&engine, "SELECT p, b FROM shapes WHERE id = 1")),
+            vec![vec![
+                Value::Geometry(GeomVal::point(1.5, -2.5)),
+                Value::Geometry(GeomVal::make_box(1.0, 1.0, 3.0, 3.0)),
+            ]]
+        );
+        // The canonical text of the recovered values matches (box normalized regardless of input).
+        assert_eq!(
+            rows(run(
+                &engine,
+                "SELECT p::TEXT, b::TEXT FROM shapes WHERE id = 2"
+            )),
+            vec![vec![
+                Value::Text("(3,4)".to_owned()),
+                Value::Text("(3,3),(1,1)".to_owned()),
+            ]]
+        );
+        // A committed insert after recovery also persists.
+        run(
+            &engine,
+            "INSERT INTO shapes VALUES (3, '(0,0)', '(0,0),(2,2)')",
+        );
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed row — the pre-crash rows AND the row committed after
+    // the first recovery — survives byte-for-byte.
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, p::TEXT, b::TEXT FROM shapes ORDER BY id"
+        )),
+        vec![
+            vec![
+                Value::Int(1),
+                Value::Text("(1.5,-2.5)".to_owned()),
+                Value::Text("(3,3),(1,1)".to_owned()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Text("(3,4)".to_owned()),
+                Value::Text("(3,3),(1,1)".to_owned()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Text("(0,0)".to_owned()),
+                Value::Text("(2,2),(0,0)".to_owned()),
+            ],
+        ]
+    );
+}
+
 /// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical

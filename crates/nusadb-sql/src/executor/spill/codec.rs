@@ -54,6 +54,7 @@ const TAG_INET: u8 = 18;
 const TAG_BIT: u8 = 19;
 const TAG_RANGE: u8 = 20;
 const TAG_MACADDR8: u8 = 21;
+const TAG_GEOMETRY: u8 = 22;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -131,6 +132,13 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             out.push(TAG_RANGE);
             out.push(r.kind.tag());
             out.extend_from_slice(&crate::range::encode(r));
+        },
+        ast::Value::Geometry(g) => {
+            out.push(TAG_GEOMETRY);
+            out.push(g.kind().tag());
+            let text = crate::geometry::format(g);
+            write_len(out, text.len())?;
+            out.extend_from_slice(text.as_bytes());
         },
         ast::Value::Numeric(d) => {
             out.push(TAG_NUMERIC);
@@ -211,6 +219,14 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
             let (r, _) =
                 crate::range::decode(&buf, 0, kind).ok_or(Error::MalformedTuple { offset: 0 })?;
             ast::Value::Range(Box::new(r))
+        },
+        TAG_GEOMETRY => {
+            let kind = nusadb_core::engine::GeomKind::from_tag(c.u8()?)
+                .ok_or(Error::MalformedTuple { offset: 0 })?;
+            let text = c.string()?;
+            ast::Value::Geometry(
+                crate::geometry::parse(&text, kind).ok_or(Error::MalformedTuple { offset: 0 })?,
+            )
         },
         TAG_NUMERIC => ast::Value::Numeric(Decimal {
             mantissa: i128::from_le_bytes(c.arr::<16>()?),

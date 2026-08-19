@@ -197,6 +197,9 @@ pub enum ColumnType {
     /// declared dimension `n`; every value of the column carries exactly `n` components. The element
     /// count keeps `ColumnType` `Copy`.
     Vector(u32),
+    /// A geometric type (`point`, `box`, …). The [`GeomKind`] fixes which shape. Values are stored
+    /// as their canonical text form; the kind tells the reader how to parse them back.
+    Geometry(GeomKind),
 }
 
 impl ColumnType {
@@ -331,6 +334,49 @@ impl RangeKind {
     }
 }
 
+/// The kind of a geometric value (`point`, `box`, …) carried by [`ColumnType::Geometry`]. A `Copy`
+/// enum so [`ColumnType`] stays `Copy`.
+///
+/// Extensible: further kinds (`line`, `lseg`, `path`, `polygon`, `circle`) append new variants and
+/// new [`GeomKind::tag`] values without renumbering the existing ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GeomKind {
+    /// `point` — a single `(x, y)` coordinate pair.
+    Point,
+    /// `box` — an axis-aligned rectangle given by two opposite corner points.
+    Box,
+}
+
+impl GeomKind {
+    /// The SQL type name (`point`, `box`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::Box => "box",
+        }
+    }
+
+    /// A stable one-byte tag for on-disk / on-wire serialization. Never renumber an existing value.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Point => 0,
+            Self::Box => 1,
+        }
+    }
+
+    /// Inverse of [`GeomKind::tag`]; `None` for an unknown tag.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Point),
+            1 => Some(Self::Box),
+            _ => None,
+        }
+    }
+}
+
 impl ArrayElem {
     /// The scalar [`ColumnType`] of this element.
     #[must_use]
@@ -390,7 +436,8 @@ impl ArrayElem {
             | ColumnType::VarBit(_)
             | ColumnType::Range(_)
             | ColumnType::Array(_)
-            | ColumnType::Vector(_) => None,
+            | ColumnType::Vector(_)
+            | ColumnType::Geometry(_) => None,
         }
     }
 }

@@ -86,6 +86,7 @@ pub(super) fn analyze_expr_agg(
                 ast::Value::Uuid(_) => ColumnType::Uuid,
                 ast::Value::Macaddr(_) => ColumnType::Macaddr,
                 ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
+                ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
                 ast::Value::Inet(a) => a.column_type(),
                 ast::Value::Bit(b) => crate::bit::column_type(b),
                 ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -915,6 +916,7 @@ pub(super) fn analyze_scalar_function(
 ) -> Result<TypedExpr, Error> {
     use ColumnType::{Int, Text};
     use ast::ScalarFunc as F;
+    use nusadb_core::engine::GeomKind;
     // GROUPING(key, ...) — super-aggregate indicator. Its arguments must be GROUP BY key
     // expressions, but the grouping sets are not in scope here; so we only type-check the arguments
     // against the source scope (they reference source columns, not aggregates) and carry them through
@@ -1301,6 +1303,34 @@ pub(super) fn analyze_scalar_function(
         F::Ascii => ScalarSig::Fixed(&[Text], &[], Int),
         // MACADDR8_SET7BIT(macaddr8) → macaddr8 (sets the locally-administered bit of the first byte).
         F::Macaddr8Set7bit => ScalarSig::Fixed(&[ColumnType::Macaddr8], &[], ColumnType::Macaddr8),
+        // Geometric constructors and box accessors.
+        // POINT(x, y) → point (two FLOAT coordinates).
+        F::PointCtor => ScalarSig::Fixed(
+            &[ColumnType::Float, ColumnType::Float],
+            &[],
+            ColumnType::Geometry(GeomKind::Point),
+        ),
+        // BOX(p1, p2) → box (two point corners).
+        F::BoxCtor => ScalarSig::Fixed(
+            &[
+                ColumnType::Geometry(GeomKind::Point),
+                ColumnType::Geometry(GeomKind::Point),
+            ],
+            &[],
+            ColumnType::Geometry(GeomKind::Box),
+        ),
+        // AREA/HEIGHT/WIDTH(box) → FLOAT.
+        F::GeomArea | F::GeomHeight | F::GeomWidth => ScalarSig::Fixed(
+            &[ColumnType::Geometry(GeomKind::Box)],
+            &[],
+            ColumnType::Float,
+        ),
+        // CENTER(box) → point.
+        F::GeomCenter => ScalarSig::Fixed(
+            &[ColumnType::Geometry(GeomKind::Box)],
+            &[],
+            ColumnType::Geometry(GeomKind::Point),
+        ),
         // GCD(a, b) / LCM(a, b) / DIV(a, b) take two INT arguments and return INT.
         F::Gcd | F::Lcm | F::Div => ScalarSig::Fixed(&[Int, Int], &[], Int),
         // FACTORIAL(n) takes one INT and returns INT.
@@ -2566,6 +2596,8 @@ fn analyze_subscript(
     // bare scalar (`(1)[2]`) is still rejected.
     let elem_ty = match base_t.ty {
         ColumnType::Array(elem) => elem.column_type(),
+        // A `point` is subscriptable: `p[0]` is its X and `p[1]` its Y (both `FLOAT`, 0-based).
+        ColumnType::Geometry(nusadb_core::engine::GeomKind::Point) => ColumnType::Float,
         scalar if matches!(base, ast::Expr::Subscript { .. }) => scalar,
         _ => {
             return Err(Error::TypeMismatch {
@@ -4167,12 +4199,22 @@ pub(super) fn check_binary(
     right: ColumnType,
 ) -> Result<ColumnType, Error> {
     use ast::BinaryOp as Op;
+    use nusadb_core::engine::GeomKind;
     match op {
         Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => check_comparison(left, right),
         Op::And | Op::Or => check_logical(left, right),
         // JSON `-` deletes a key / an array index / a set of keys, yielding the trimmed document.
         // Checked before the numeric rule (JSON is not numeric).
         Op::Minus if left == ColumnType::Json => check_json_delete(right),
+        // Geometric point arithmetic: `p1 + p2` / `p1 - p2` (vector add/sub) and `p1 * p2` / `p1 / p2`
+        // (complex multiply/divide) each yield a point. Checked before the numeric rule (a point is
+        // not numeric).
+        Op::Plus | Op::Minus | Op::Multiply | Op::Divide
+            if left == ColumnType::Geometry(GeomKind::Point)
+                && right == ColumnType::Geometry(GeomKind::Point) =>
+        {
+            Ok(ColumnType::Geometry(GeomKind::Point))
+        },
         Op::Plus | Op::Multiply | Op::Divide | Op::Modulo | Op::Minus => {
             // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors) is checked
             // before the numeric rule (a vector operand is not numeric).
@@ -4203,6 +4245,16 @@ pub(super) fn check_binary(
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
             check_bitwise(op, left, right)
         },
+        // Geometry: `box && box` overlap and `box @> point` / `point <@ box` containment, each `BOOL`.
+        // Checked before the range/array rules (a geometry operand is neither).
+        Op::ArrayOverlap if is_geometry_type(left) || is_geometry_type(right) => {
+            check_geom_overlap(left, right)
+        },
+        Op::JsonContains | Op::JsonContainedBy
+            if is_geometry_type(left) || is_geometry_type(right) =>
+        {
+            check_geom_containment(op, left, right)
+        },
         // Ranges: `&&` overlap and `@>`/`<@` containment, of a range or of a single element.
         Op::ArrayOverlap if is_range_type(left) || is_range_type(right) => {
             check_range_overlap(left, right)
@@ -4221,10 +4273,86 @@ pub(super) fn check_binary(
             check_json_exists(op, left, right)
         },
         Op::VectorDistance => check_vector_distance("<=>", left, right),
+        // `<->` is the geometric distance (`point <-> point`, `box <-> box`) when both operands are
+        // geometry, else the vector L2 distance.
+        Op::VectorL2Distance if is_geometry_type(left) || is_geometry_type(right) => {
+            check_geom_distance(left, right)
+        },
         Op::VectorL2Distance => check_vector_distance("<->", left, right),
         Op::VectorNegInnerProduct => check_vector_distance("<#>", left, right),
         Op::VectorL1Distance => check_vector_distance("<+>", left, right),
         Op::TsMatch => check_ts_match(left, right),
+        // `~=` geometric same-as — both operands the same geometric kind, yielding `BOOL`.
+        Op::GeomSameAs => check_geom_same_as(left, right),
+    }
+}
+
+/// Whether a column type is a geometric type.
+const fn is_geometry_type(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Geometry(_))
+}
+
+/// Type rule for `box <-> box` / `point <-> point`: both operands are the same geometric kind; the
+/// result is the `FLOAT` distance.
+fn check_geom_distance(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    match (left, right) {
+        (ColumnType::Geometry(a), ColumnType::Geometry(b)) if a == b => Ok(ColumnType::Float),
+        _ => Err(Error::TypeMismatch {
+            context: "`<->` geometric distance".to_owned(),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for `~=`: both operands are the same geometric kind; the result is `BOOL`.
+fn check_geom_same_as(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    match (left, right) {
+        (ColumnType::Geometry(a), ColumnType::Geometry(b)) if a == b => Ok(ColumnType::Bool),
+        _ => Err(Error::TypeMismatch {
+            context: "`~=` geometric same-as".to_owned(),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for `box && box` overlap: both operands are boxes; the result is `BOOL`.
+fn check_geom_overlap(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    use nusadb_core::engine::GeomKind;
+    if left == ColumnType::Geometry(GeomKind::Box) && right == ColumnType::Geometry(GeomKind::Box) {
+        Ok(ColumnType::Bool)
+    } else {
+        Err(Error::TypeMismatch {
+            context: "`&&` geometric overlap".to_owned(),
+            expected: ColumnType::Geometry(GeomKind::Box),
+            found: if is_geometry_type(left) { right } else { left },
+        })
+    }
+}
+
+/// Type rule for geometric containment: `box @> point` (contains) and `point <@ box` (contained by),
+/// each yielding `BOOL`.
+fn check_geom_containment(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    use nusadb_core::engine::GeomKind;
+    let (container, element) = match op {
+        ast::BinaryOp::JsonContains => (left, right),
+        _ => (right, left),
+    };
+    if container == ColumnType::Geometry(GeomKind::Box)
+        && element == ColumnType::Geometry(GeomKind::Point)
+    {
+        Ok(ColumnType::Bool)
+    } else {
+        Err(Error::TypeMismatch {
+            context: "geometric containment (`box @> point`)".to_owned(),
+            expected: ColumnType::Geometry(GeomKind::Box),
+            found: container,
+        })
     }
 }
 

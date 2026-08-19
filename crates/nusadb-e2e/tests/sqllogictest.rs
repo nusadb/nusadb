@@ -280,6 +280,7 @@ const fn infer_column_type(v: &Value) -> DefaultColumnType {
         | Value::Interval(_)
         | Value::Array(_)
         | Value::Vector(_)
+        | Value::Geometry(_)
         | Value::Bytes(_) => DefaultColumnType::Text,
         Value::Null => DefaultColumnType::Any,
     }
@@ -306,6 +307,7 @@ fn format_value(v: &Value) -> String {
         Value::Uuid(u) => temporal::format_uuid(u),
         Value::Macaddr(m) => nusadb_sql::macaddr::format(*m),
         Value::Macaddr8(m) => nusadb_sql::macaddr8::format(*m),
+        Value::Geometry(g) => nusadb_sql::geometry::format(g),
         Value::Inet(a) => a.format(),
         Value::Bit(b) => nusadb_sql::bit::format(b),
         Value::Range(r) => r.format(),
@@ -558,6 +560,11 @@ fn slt_p10_macaddr() {
 #[test]
 fn slt_p10_macaddr8() {
     run_slt("tests/slt/p10_types/macaddr8.slt");
+}
+
+#[test]
+fn slt_p10_geometric() {
+    run_slt("tests/slt/p10_types/geometric.slt");
 }
 
 #[test]

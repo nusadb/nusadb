@@ -97,6 +97,7 @@ pub const fn column_type_tag(ty: nusadb_core::ColumnType) -> u8 {
         ColumnType::VarBit(_) => 0x15,
         ColumnType::Range(_) => 0x16,
         ColumnType::Macaddr8 => 0x17,
+        ColumnType::Geometry(_) => 0x18,
     }
 }
 
