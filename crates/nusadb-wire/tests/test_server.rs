@@ -4513,3 +4513,57 @@ async fn path_renders_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A `POLYGON` column renders correctly over the real wire protocol — this proves the wire value
+/// encoding (`value_to_field`) formats a polygon as its canonical parenthesized text, not a debug or
+/// byte dump, and that the variable-length vertex list survives the encode intact. A bare coordinate
+/// list gains parentheses on render.
+#[tokio::test]
+async fn polygon_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (id int, g polygon)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // A parenthesized polygon is unchanged; a bare coordinate list gains parentheses.
+    query(
+        &mut conn,
+        "INSERT INTO t VALUES (1, '((0,0),(4,0),(4,4),(0,4))')",
+    )
+    .await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+    query(&mut conn, "INSERT INTO t VALUES (2, '(0,0),(4,0),(4,4)')").await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT g FROM t ORDER BY id").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["g".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"((0,0),(4,0),(4,4),(0,4))".to_vec())]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(b"((0,0),(4,0),(4,4))".to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 2"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

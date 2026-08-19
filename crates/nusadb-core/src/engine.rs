@@ -337,7 +337,7 @@ impl RangeKind {
 /// The kind of a geometric value (`point`, `box`, …) carried by [`ColumnType::Geometry`]. A `Copy`
 /// enum so [`ColumnType`] stays `Copy`.
 ///
-/// Extensible: further kinds (`polygon`) append new variants and new
+/// Extensible: further kinds append new variants and new
 /// [`GeomKind::tag`] values without renumbering the existing ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GeomKind {
@@ -353,10 +353,12 @@ pub enum GeomKind {
     Line,
     /// `path` — an ordered list of vertices, either an open polyline or a closed loop.
     Path,
+    /// `polygon` — an ordered vertex list forming a closed loop (no open/closed flag).
+    Polygon,
 }
 
 impl GeomKind {
-    /// The SQL type name (`point`, `box`, `circle`, `lseg`, `line`, `path`).
+    /// The SQL type name (`point`, `box`, `circle`, `lseg`, `line`, `path`, `polygon`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -366,6 +368,7 @@ impl GeomKind {
             Self::Lseg => "lseg",
             Self::Line => "line",
             Self::Path => "path",
+            Self::Polygon => "polygon",
         }
     }
 
@@ -379,6 +382,7 @@ impl GeomKind {
             Self::Lseg => 3,
             Self::Line => 4,
             Self::Path => 5,
+            Self::Polygon => 6,
         }
     }
 
@@ -392,6 +396,7 @@ impl GeomKind {
             3 => Some(Self::Lseg),
             4 => Some(Self::Line),
             5 => Some(Self::Path),
+            6 => Some(Self::Polygon),
             _ => None,
         }
     }

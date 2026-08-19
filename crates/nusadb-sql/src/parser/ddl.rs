@@ -489,8 +489,8 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         D::Custom(name, _) if is_named(name, "cidr") => ColumnType::Cidr,
         // Range types (`int4range`/`numrange`/`daterange`/`tsrange`/`tstzrange`) → native ranges.
         D::Custom(name, _) if let Some(kind) = range_kind_of_name(name) => ColumnType::Range(kind),
-        // Geometric types (`point`/`box`/`circle`/`lseg`/`line`/`path`) → native geometry (not the
-        // text-backed alias below).
+        // Geometric types (`point`/`box`/`circle`/`lseg`/`line`/`path`/`polygon`) → native geometry
+        // (not the text-backed alias below).
         D::Custom(name, _) if is_named(name, "point") => {
             ColumnType::Geometry(nusadb_core::engine::GeomKind::Point)
         },
@@ -508,6 +508,9 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         },
         D::Custom(name, _) if is_named(name, "path") => {
             ColumnType::Geometry(nusadb_core::engine::GeomKind::Path)
+        },
+        D::Custom(name, _) if is_named(name, "polygon") => {
+            ColumnType::Geometry(nusadb_core::engine::GeomKind::Polygon)
         },
         // A custom (named) type: a standard SQL type NusaDB does not model natively (currency,
         // object-id, network, bit-string, geometric, range, full-text, XML) maps onto a base storage
@@ -539,10 +542,10 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         },
         // Object identifier — an unsigned 32-bit integer.
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
-        // Stored as their canonical text form (no native operators yet): the remaining geometric
-        // shapes, full-text, and XML types. (`macaddr`/`inet`/`cidr`, the range types, and the native
-        // geometric types `point`/`box`/`circle`/`lseg`/`line`/`path` are handled above.)
-        "xml" | "tsvector" | "tsquery" | "polygon" => ColumnType::Text,
+        // Stored as their canonical text form (no native operators yet): the full-text and XML types.
+        // (`macaddr`/`inet`/`cidr`, the range types, and the native geometric types
+        // `point`/`box`/`circle`/`lseg`/`line`/`path`/`polygon` are handled above.)
+        "xml" | "tsvector" | "tsquery" => ColumnType::Text,
         _ => return None,
     })
 }

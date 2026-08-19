@@ -1024,6 +1024,11 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::GeomArea | F::GeomCenter) {
         return analyze_geom_measure(func, args, scope, catalog, aggregates);
     }
+    // NPOINTS(g) is polymorphic over the vertex-carrying kinds — a `path` or a `polygon` — so the
+    // single argument's kind is validated directly, not via the fixed (single-kind) table.
+    if matches!(func, F::GeomNpoints) {
+        return analyze_geom_npoints(func, args, scope, catalog, aggregates);
+    }
     // ARRAY_LENGTH(arr, dim) / ARRAY_TO_STRING(arr, sep) take an array of any element type — the
     // element type is polymorphic, so they are not expressible with the fixed table.
     if matches!(
@@ -1337,8 +1342,10 @@ pub(super) fn analyze_scalar_function(
             &[],
             ColumnType::Float,
         ),
-        // NPOINTS(path) → INT (the vertex count).
-        F::GeomNpoints => ScalarSig::Fixed(&[ColumnType::Geometry(GeomKind::Path)], &[], Int),
+        // NPOINTS is polymorphic over path|polygon and analyzed before this table.
+        F::GeomNpoints => {
+            unreachable!("NPOINTS is analyzed before the scalar signature table")
+        },
         // ISOPEN/ISCLOSED(path) → BOOL.
         F::GeomIsOpen | F::GeomIsClosed => ScalarSig::Fixed(
             &[ColumnType::Geometry(GeomKind::Path)],
@@ -2219,6 +2226,45 @@ fn analyze_geom_measure(
             args: vec![typed],
         },
         ty,
+    })
+}
+
+/// Analyze `NPOINTS(g)`, taking a single geometric argument that carries a vertex list — a `path` or
+/// a `polygon` — and yielding the `INT` vertex count. A non-geometry argument, or a geometric kind
+/// with no vertex list (`point`/`box`/`circle`/`lseg`/`line`), is a loud type error.
+fn analyze_geom_npoints(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    use nusadb_core::engine::GeomKind;
+    let name = func.name();
+    let [arg] = args else {
+        return Err(Error::ArityMismatch {
+            context: format!("function `{name}`"),
+            expected: 1,
+            found: args.len(),
+        });
+    };
+    let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates)?;
+    if !matches!(
+        typed.ty,
+        ColumnType::Geometry(GeomKind::Path | GeomKind::Polygon)
+    ) {
+        return Err(Error::TypeMismatch {
+            context: format!("argument to function `{name}`"),
+            expected: ColumnType::Geometry(GeomKind::Path),
+            found: typed.ty,
+        });
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: vec![typed],
+        },
+        ty: ColumnType::Int,
     })
 }
 

@@ -572,3 +572,99 @@ SELECT CAST('[(0,0),(1)]' AS PATH)
 
 statement error
 SELECT CAST('abc' AS PATH)
+
+# ── polygon ─────────────────────────────────────────────────────────────────────────────────
+# A polygon is an ordered vertex list forming a closed loop, written `((x1,y1),…)`. Unlike a path
+# there is no open form — the bracketed `[(…)]` spelling is rejected.
+
+statement ok
+CREATE TABLE pgn (id INT NOT NULL, g POLYGON)
+
+# Canonical (parenthesized), bare (→ parens added), and single-vertex forms.
+statement ok
+INSERT INTO pgn VALUES (1, '((0,0),(4,0),(4,4),(0,4))')
+
+statement ok
+INSERT INTO pgn VALUES (2, '(0,0),(4,0),(4,4),(0,4)')
+
+statement ok
+INSERT INTO pgn VALUES (3, '((5,5))')
+
+statement ok
+INSERT INTO pgn VALUES (4, '((0,0),(4,0),(4,4))')
+
+# Canonical output: the bare form gains parentheses; the parenthesized form is unchanged.
+query IT
+SELECT id, g FROM pgn ORDER BY id
+----
+1  ((0,0),(4,0),(4,4),(0,4))
+2  ((0,0),(4,0),(4,4),(0,4))
+3  ((5,5))
+4  ((0,0),(4,0),(4,4))
+
+# An explicit CAST from a bare coordinate list also gains parentheses.
+query T
+SELECT CAST('(0,0),(4,0),(4,4),(0,4)' AS POLYGON)
+----
+((0,0),(4,0),(4,4),(0,4))
+
+# npoints() counts the vertices.
+query I
+SELECT npoints(g) FROM pgn WHERE id = 4
+----
+3
+
+query I
+SELECT npoints(g) FROM pgn WHERE id = 1
+----
+4
+
+# polygon ~= polygon (poly_same): true for identical, a cyclic rotation, or a reversal of the same
+# closed cycle; false for a different vertex count, a same-bounding-box different shape, or a
+# translation.
+# Identical.
+query I
+SELECT CAST('((0,0),(4,0),(4,4))' AS POLYGON) ~= CAST('((0,0),(4,0),(4,4))' AS POLYGON)
+----
+1
+
+# Cyclic rotation.
+query I
+SELECT CAST('((0,0),(4,0),(4,4))' AS POLYGON) ~= CAST('((4,0),(4,4),(0,0))' AS POLYGON)
+----
+1
+
+# Reversal.
+query I
+SELECT CAST('((0,0),(4,0),(4,4))' AS POLYGON) ~= CAST('((4,4),(4,0),(0,0))' AS POLYGON)
+----
+1
+
+# Different vertex count.
+query I
+SELECT CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) ~= CAST('((0,0),(4,4),(0,4))' AS POLYGON)
+----
+0
+
+# Same bounding box, different shape (same four vertices in a non-cyclic order).
+query I
+SELECT CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON) ~= CAST('((0,0),(4,4),(4,0),(0,4))' AS POLYGON)
+----
+0
+
+# Translation.
+query I
+SELECT CAST('((0,0),(4,0),(4,4))' AS POLYGON) ~= CAST('((1,1),(5,1),(5,5))' AS POLYGON)
+----
+0
+
+# A malformed polygon is a loud error: the path OPEN form `[…]`, an empty string, or an odd
+# coordinate count (a dangling half-vertex).
+statement error
+SELECT CAST('[(0,0),(1,1),(2,0)]' AS POLYGON)
+
+statement error
+SELECT CAST('' AS POLYGON)
+
+statement error
+SELECT CAST('((0,0),(1))' AS POLYGON)

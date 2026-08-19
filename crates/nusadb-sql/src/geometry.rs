@@ -1,10 +1,11 @@
-//! Geometric types `point`, `box`, `circle`, `lseg`, `line`, and `path`: parsing, canonical
-//! formatting, operators, and functions.
+//! Geometric types `point`, `box`, `circle`, `lseg`, `line`, `path`, and `polygon`: parsing,
+//! canonical formatting, operators, and functions.
 //!
 //! A geometric value is a [`GeomVal`] — a `point` (an `(x, y)` pair), an axis-aligned `box` (two
 //! opposite corners), a `circle` (a center `(x, y)` and a radius `r`), an `lseg` (a line segment
-//! between two endpoints), a `line` (an infinite line `A·x + B·y + C = 0`), or a `path` (an ordered
-//! list of vertices forming an open polyline or a closed loop). Values persist as
+//! between two endpoints), a `line` (an infinite line `A·x + B·y + C = 0`), a `path` (an ordered
+//! list of vertices forming an open polyline or a closed loop), or a `polygon` (an ordered vertex
+//! list forming a closed loop). Values persist as
 //! their canonical text form; the column's [`GeomKind`] tells the reader which shape to parse back
 //! into. Every function here is total: parse
 //! entry points return [`Option`] (a syntax error is `None`), and coordinate access is checked, so
@@ -81,6 +82,12 @@ pub enum GeomVal {
         /// Whether the path is a CLOSED loop (`true`) or an OPEN polyline (`false`).
         closed: bool,
     },
+    /// A `polygon` — an ordered vertex list forming a closed loop. Unlike a `path` there is no
+    /// open/closed flag; a polygon is always a closed cycle. Written `((x1,y1),…)`.
+    Polygon {
+        /// The ordered vertices `(x, y)`; at least one.
+        points: Vec<(f64, f64)>,
+    },
 }
 
 impl GeomVal {
@@ -94,6 +101,7 @@ impl GeomVal {
             Self::Lseg { .. } => GeomKind::Lseg,
             Self::Line { .. } => GeomKind::Line,
             Self::Path { .. } => GeomKind::Path,
+            Self::Polygon { .. } => GeomKind::Polygon,
         }
     }
 
@@ -150,6 +158,13 @@ impl GeomVal {
         Self::Path { points, closed }
     }
 
+    /// Build a `polygon` from its ordered vertices, preserving the vertex order. A polygon is always
+    /// a closed loop, so there is no open/closed flag.
+    #[must_use]
+    pub const fn polygon(points: Vec<(f64, f64)>) -> Self {
+        Self::Polygon { points }
+    }
+
     /// Build a normalized `box` from two opposite corners, so the stored `high` corner is the
     /// per-axis maximum and `low` the per-axis minimum. Both `((1,1),(3,3))` and `((3,3),(1,1))`
     /// yield the same box.
@@ -179,8 +194,8 @@ fn fmt_num(v: f64) -> String {
 /// Render a value in its canonical text form.
 ///
 /// A `point` is `(x,y)`, a `box` is `(hx,hy),(lx,ly)`, a `circle` is `<(cx,cy),r>`, an `lseg` is
-/// `[(x1,y1),(x2,y2)]`, a `line` is `{A,B,C}`, and a `path` is `[(x1,y1),…]` when open or
-/// `((x1,y1),…)` when closed.
+/// `[(x1,y1),(x2,y2)]`, a `line` is `{A,B,C}`, a `path` is `[(x1,y1),…]` when open or
+/// `((x1,y1),…)` when closed, and a `polygon` is `((x1,y1),…)`.
 #[must_use]
 pub fn format(v: &GeomVal) -> String {
     match v {
@@ -221,6 +236,14 @@ pub fn format(v: &GeomVal) -> String {
             } else {
                 format!("[{inner}]")
             }
+        },
+        GeomVal::Polygon { points } => {
+            let inner = points
+                .iter()
+                .map(|(x, y)| format!("({},{})", fmt_num(*x), fmt_num(*y)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("({inner})")
         },
     }
 }
@@ -351,6 +374,36 @@ pub fn parse_path(s: &str) -> Option<GeomVal> {
     Some(GeomVal::path(points, closed))
 }
 
+/// Parse a `polygon` literal into an ordered vertex list.
+///
+/// A polygon is always a closed loop, so — unlike a `path` — there is no open form: input whose first
+/// non-whitespace character is `[` (the path open form) is rejected as `None`.
+///
+/// The flat coordinate list is read with `floats` and paired two-at-a-time into vertices, so
+/// `((0,0),(4,4))` and bare `(0,0),(4,4)` both parse. Requires at least one vertex and an even
+/// coordinate count; an odd count (a dangling half-vertex), zero vertices, or an empty string yields
+/// `None`. A single vertex such as `((5,5))` is valid.
+#[must_use]
+pub fn parse_polygon(s: &str) -> Option<GeomVal> {
+    // A polygon has no open form: reject the path open delimiter `[` outright.
+    if s.trim_start().chars().next()? == '[' {
+        return None;
+    }
+    let coords = floats(s)?;
+    // A polygon needs at least one vertex, and every vertex is a full `(x, y)` pair (an even count).
+    if coords.is_empty() || coords.len() % 2 != 0 {
+        return None;
+    }
+    let points: Vec<(f64, f64)> = coords
+        .chunks_exact(2)
+        .filter_map(|pair| match pair {
+            [x, y] => Some((*x, *y)),
+            _ => None,
+        })
+        .collect();
+    Some(GeomVal::polygon(points))
+}
+
 /// Parse a geometric literal against the target [`GeomKind`].
 #[must_use]
 pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
@@ -361,6 +414,7 @@ pub fn parse(s: &str, kind: GeomKind) -> Option<GeomVal> {
         GeomKind::Lseg => parse_lseg(s),
         GeomKind::Line => parse_line(s),
         GeomKind::Path => parse_path(s),
+        GeomKind::Polygon => parse_polygon(s),
     }
 }
 
@@ -804,6 +858,48 @@ pub fn path_concat(
     Some(GeomVal::path(points, false))
 }
 
+// ── polygon functions & operators ──────────────────────────────────────────────────────────────────
+
+/// The number of vertices in a `polygon` (`npoints`), as `INT`. Saturates at [`i64::MAX`] rather
+/// than wrapping, so an implausibly long vertex list can never report a negative count.
+#[must_use]
+pub fn polygon_npoints(points: &[(f64, f64)]) -> i64 {
+    i64::try_from(points.len()).unwrap_or(i64::MAX)
+}
+
+/// Whether two polygons are the SAME closed cycle (`polygon ~= polygon`), matching the reference
+/// engine's `poly_same`.
+///
+/// The two are the same iff their vertex counts are equal AND the vertex lists describe the same
+/// closed cycle: there is an index `i` where `b[i] == a[0]`, and from that anchor the two lists
+/// match either reading FORWARD (wrapping) or reading BACKWARD (wrapping). So a cyclic rotation OR a
+/// reversal (or both) of the same vertices is same; a different shape, a different vertex count, or a
+/// translation is not.
+///
+/// Total: differing lengths, an empty list, or no matching anchor all return `false`; indexing is
+/// modular over the shared length via [`slice::get`], never a panic.
+#[must_use]
+pub fn polygon_same(a: &[(f64, f64)], b: &[(f64, f64)]) -> bool {
+    let n = a.len();
+    if n != b.len() || n == 0 {
+        return false;
+    }
+    let Some(&first) = a.first() else {
+        return false;
+    };
+    // Try every anchor `i` in `b` that matches `a[0]`, then check a forward or backward wrap-around.
+    (0..n).any(|i| {
+        if b.get(i) != Some(&first) {
+            return false;
+        }
+        // Forward: b[(i + k) % n] == a[k] for all k.
+        let forward = (0..n).all(|k| b.get((i + k) % n) == a.get(k));
+        // Backward: b[(i + n - k) % n] == a[k] for all k.
+        let backward = (0..n).all(|k| b.get((i + n - k) % n) == a.get(k));
+        forward || backward
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,5 +1327,97 @@ mod tests {
             path_concat(&[(0.0, 0.0), (1.0, 1.0)], false, &[(2.0, 2.0)], true),
             None
         );
+    }
+
+    #[test]
+    fn polygon_parse_forms() {
+        // A parenthesized vertex list is a polygon.
+        assert_eq!(
+            parse_polygon("((0,0),(4,0),(4,4),(0,4))"),
+            Some(GeomVal::polygon(vec![
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 4.0),
+                (0.0, 4.0)
+            ]))
+        );
+        // A bare (undelimited) coordinate list is also a polygon (parens added on render).
+        assert_eq!(
+            parse_polygon("(0,0),(4,0),(4,4),(0,4)"),
+            Some(GeomVal::polygon(vec![
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 4.0),
+                (0.0, 4.0)
+            ]))
+        );
+        // A single vertex is valid.
+        assert_eq!(
+            parse_polygon("((5,5))"),
+            Some(GeomVal::polygon(vec![(5.0, 5.0)]))
+        );
+        // The path OPEN form `[…]` is NOT a polygon.
+        assert_eq!(parse_polygon("[(0,0),(1,1),(2,0)]"), None);
+        // An empty string, no vertices, an odd coordinate count, or garbage is rejected.
+        assert_eq!(parse_polygon(""), None);
+        assert_eq!(parse_polygon("()"), None);
+        assert_eq!(parse_polygon("((0,0),(1))"), None);
+        assert_eq!(parse_polygon("abc"), None);
+    }
+
+    #[test]
+    fn polygon_format_canonical() {
+        assert_eq!(
+            format(&GeomVal::polygon(vec![
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 4.0),
+                (0.0, 4.0)
+            ])),
+            "((0,0),(4,0),(4,4),(0,4))"
+        );
+        // A bare-parsed polygon renders WITH parentheses.
+        assert_eq!(
+            format(&parse_polygon("(0,0),(4,0),(4,4),(0,4)").unwrap()),
+            "((0,0),(4,0),(4,4),(0,4))"
+        );
+        assert_eq!(format(&GeomVal::polygon(vec![(5.0, 5.0)])), "((5,5))");
+        // npoints counts the vertices.
+        assert_eq!(polygon_npoints(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)]), 3);
+    }
+
+    #[test]
+    fn polygon_same() {
+        let base = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)];
+        // Identical.
+        assert!(super::polygon_same(&base, &base));
+        // Cyclic rotation.
+        assert!(super::polygon_same(
+            &base,
+            &[(4.0, 0.0), (4.0, 4.0), (0.0, 0.0)]
+        ));
+        // Reversal.
+        assert!(super::polygon_same(
+            &base,
+            &[(4.0, 4.0), (4.0, 0.0), (0.0, 0.0)]
+        ));
+        // Different vertex count.
+        assert!(!super::polygon_same(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            &[(0.0, 0.0), (4.0, 4.0), (0.0, 4.0)]
+        ));
+        // Same bounding box, different shape.
+        assert!(!super::polygon_same(
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            &[(0.0, 0.0), (4.0, 4.0), (0.0, 4.0)]
+        ));
+        // Translated.
+        assert!(!super::polygon_same(
+            &base,
+            &[(1.0, 1.0), (5.0, 1.0), (5.0, 5.0)]
+        ));
+        // Length mismatch and empty both return false.
+        assert!(!super::polygon_same(&base, &[(0.0, 0.0)]));
+        assert!(!super::polygon_same(&[], &[]));
     }
 }

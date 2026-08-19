@@ -1051,6 +1051,10 @@ fn eval_scalar_function(
         (F::GeomNpoints, [ast::Value::Geometry(crate::geometry::GeomVal::Path { points, .. })]) => {
             ast::Value::Int(crate::geometry::path_npoints(points))
         },
+        // NPOINTS(polygon) — the vertex count.
+        (F::GeomNpoints, [ast::Value::Geometry(crate::geometry::GeomVal::Polygon { points })]) => {
+            ast::Value::Int(crate::geometry::polygon_npoints(points))
+        },
         // ISOPEN/ISCLOSED(path) — the open/closed flag.
         (F::GeomIsOpen, [ast::Value::Geometry(crate::geometry::GeomVal::Path { closed, .. })]) => {
             ast::Value::Bool(!*closed)
@@ -5496,8 +5500,18 @@ fn geom_contains(container: &ast::Value, element: &ast::Value) -> ast::Value {
 /// Evaluate the geometric same-as operator `~=`: two values are equal when they are the same kind
 /// and equal by coordinates (a box is compared in its normalized form). A `NULL` operand yields
 /// `NULL`.
+///
+/// Two polygons are special-cased: structural `==` compares the vertex lists in strict order, but a
+/// polygon `~=` (the reference engine's `poly_same`) treats a cyclic rotation or a reversal of the
+/// same closed cycle as the same, so both `Polygon` operands route through
+/// [`crate::geometry::polygon_same`]. Every other kind keeps the structural `==`.
 fn geom_same_as_op(left: &ast::Value, right: &ast::Value) -> ast::Value {
+    use crate::geometry::GeomVal;
     match (left, right) {
+        (
+            ast::Value::Geometry(GeomVal::Polygon { points: a }),
+            ast::Value::Geometry(GeomVal::Polygon { points: b }),
+        ) => ast::Value::Bool(crate::geometry::polygon_same(a, b)),
         (ast::Value::Geometry(a), ast::Value::Geometry(b)) => ast::Value::Bool(a == b),
         _ => ast::Value::Null,
     }
