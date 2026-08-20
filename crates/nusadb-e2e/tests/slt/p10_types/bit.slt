@@ -140,3 +140,15 @@ SELECT SET_BIT('10110'::BIT(5), 0, 0)
 # An out-of-range bit index is rejected.
 statement error
 SELECT GET_BIT('101'::BIT(3), 5)
+
+# The ~ operator complements every bit, keeping the string's length.
+query TT
+SELECT ~CAST('10110' AS BIT(5)), ~CAST('0000' AS BIT(4))
+----
+01001 1111
+
+# ~ preserves length and round-trips through a double complement.
+query TT
+SELECT ~CAST('1100' AS BIT(4)), ~(~CAST('101' AS BIT(3)))
+----
+0011 101

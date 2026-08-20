@@ -68,6 +68,12 @@ pub fn shift(bits: &[bool], amount: i64, left: bool) -> Vec<bool> {
         .collect()
 }
 
+/// Complement every bit (the `~` operator), preserving the length: `~1011` is `0100`.
+#[must_use]
+pub fn complement(bits: &[bool]) -> Vec<bool> {
+    bits.iter().map(|&b| !b).collect()
+}
+
 /// Render a bit string as its canonical text (`"1011"`).
 #[must_use]
 pub fn format(bits: &[bool]) -> String {
@@ -132,6 +138,16 @@ mod tests {
         assert_eq!(parse("102"), None);
         assert_eq!(format(&[true, false, true, true]), "1011");
         assert_eq!(format(&[]), "");
+    }
+
+    #[test]
+    fn complement_flips_every_bit_preserving_length() {
+        assert_eq!(format(&complement(&parse("10110").unwrap())), "01001");
+        assert_eq!(format(&complement(&parse("0000").unwrap())), "1111");
+        assert_eq!(format(&complement(&[])), "");
+        // Double complement is the identity.
+        let b = parse("1010011").unwrap();
+        assert_eq!(complement(&complement(&b)), b);
     }
 
     #[test]

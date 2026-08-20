@@ -5275,8 +5275,14 @@ pub(super) fn analyze_unary(
                 found: operand.ty,
             });
         },
-        // `~` complements an integer or a MACADDR8 bit-for-bit, preserving the operand type.
-        ast::UnaryOp::BitNot if matches!(operand.ty, ColumnType::Int | ColumnType::Macaddr8) => {
+        // `~` complements an integer, a MACADDR8, or a bit string bit-for-bit, preserving the
+        // operand type (a bit string keeps its length).
+        ast::UnaryOp::BitNot
+            if matches!(
+                operand.ty,
+                ColumnType::Int | ColumnType::Macaddr8 | ColumnType::Bit(_)
+            ) =>
+        {
             operand.ty
         },
         ast::UnaryOp::BitNot => {

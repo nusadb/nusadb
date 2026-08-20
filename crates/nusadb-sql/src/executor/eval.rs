@@ -6509,6 +6509,7 @@ fn apply_unary(op: ast::UnaryOp, value: &ast::Value) -> Result<ast::Value, Error
         ast::UnaryOp::BitNot => match value {
             ast::Value::Int(i) => ast::Value::Int(!*i),
             ast::Value::Macaddr8(m) => ast::Value::Macaddr8(crate::macaddr8::complement(*m)),
+            ast::Value::Bit(b) => ast::Value::Bit(crate::bit::complement(b)),
             _ => ast::Value::Null,
         },
     })
