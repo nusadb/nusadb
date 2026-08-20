@@ -2082,6 +2082,8 @@ fn analyze_trunc_unary(
     let arg = analyze_expr_agg(arg_expr, scope, catalog, Some(Float), aggregates)?;
     let ty = if arg.ty == ColumnType::Macaddr8 {
         ColumnType::Macaddr8
+    } else if arg.ty == ColumnType::Macaddr {
+        ColumnType::Macaddr
     } else if is_numeric(arg.ty) || is_null_literal(&arg) {
         widen_numeric(Int, arg.ty)
     } else {
@@ -4482,6 +4484,9 @@ pub(super) fn check_binary(
         Op::BitAnd | Op::BitOr if left == ColumnType::Macaddr8 && right == ColumnType::Macaddr8 => {
             Ok(ColumnType::Macaddr8)
         },
+        Op::BitAnd | Op::BitOr if left == ColumnType::Macaddr && right == ColumnType::Macaddr => {
+            Ok(ColumnType::Macaddr)
+        },
         // Geometry: `#` (BitXor) is the `lseg # lseg` intersection, yielding a (nullable) `point`.
         // Checked before the bit/integer XOR below (a geometry operand is neither a bit string nor an
         // integer).
@@ -5527,12 +5532,12 @@ pub(super) fn analyze_unary(
                 found: operand.ty,
             });
         },
-        // `~` complements an integer, a MACADDR8, or a bit string bit-for-bit, preserving the
-        // operand type (a bit string keeps its length).
+        // `~` complements an integer, a MACADDR, a MACADDR8, or a bit string bit-for-bit, preserving
+        // the operand type (a bit string keeps its length).
         ast::UnaryOp::BitNot
             if matches!(
                 operand.ty,
-                ColumnType::Int | ColumnType::Macaddr8 | ColumnType::Bit(_)
+                ColumnType::Int | ColumnType::Macaddr | ColumnType::Macaddr8 | ColumnType::Bit(_)
             ) =>
         {
             operand.ty

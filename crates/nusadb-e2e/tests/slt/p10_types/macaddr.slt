@@ -77,3 +77,27 @@ INSERT INTO m VALUES (6, 'not-a-mac')
 
 statement error
 INSERT INTO m VALUES (7, '08:00:2b:01:02')
+
+# Bitwise complement (~): flips every bit of all six bytes.
+query T
+SELECT ~ CAST('08:00:2b:01:02:03' AS MACADDR)
+----
+f7:ff:d4:fe:fd:fc
+
+# Bitwise AND (&): byte-wise, masking off the last three bytes.
+query T
+SELECT CAST('08:00:2b:01:02:03' AS MACADDR) & CAST('ff:ff:ff:00:00:00' AS MACADDR)
+----
+08:00:2b:00:00:00
+
+# Bitwise OR (|): byte-wise.
+query T
+SELECT CAST('08:00:2b:00:00:00' AS MACADDR) | CAST('00:00:00:ff:ff:ff' AS MACADDR)
+----
+08:00:2b:ff:ff:ff
+
+# trunc(macaddr): keep the first three bytes (the manufacturer prefix) and zero the last three.
+query T
+SELECT trunc(CAST('08:00:2b:01:02:03' AS MACADDR))
+----
+08:00:2b:00:00:00

@@ -53,6 +53,45 @@ pub fn format(m: [u8; 6]) -> String {
     out
 }
 
+/// The byte-wise complement of an address (the `~` operator).
+#[must_use]
+pub const fn complement(m: [u8; 6]) -> [u8; 6] {
+    [!m[0], !m[1], !m[2], !m[3], !m[4], !m[5]]
+}
+
+/// The byte-wise AND of two addresses (the `&` operator).
+#[must_use]
+pub const fn and(a: [u8; 6], b: [u8; 6]) -> [u8; 6] {
+    [
+        a[0] & b[0],
+        a[1] & b[1],
+        a[2] & b[2],
+        a[3] & b[3],
+        a[4] & b[4],
+        a[5] & b[5],
+    ]
+}
+
+/// The byte-wise OR of two addresses (the `|` operator).
+#[must_use]
+pub const fn or(a: [u8; 6], b: [u8; 6]) -> [u8; 6] {
+    [
+        a[0] | b[0],
+        a[1] | b[1],
+        a[2] | b[2],
+        a[3] | b[3],
+        a[4] | b[4],
+        a[5] | b[5],
+    ]
+}
+
+/// `trunc(macaddr)` — the address with its last three bytes (the device identifier) zeroed, leaving
+/// the first three (the manufacturer prefix).
+#[must_use]
+pub const fn trunc(m: [u8; 6]) -> [u8; 6] {
+    [m[0], m[1], m[2], 0, 0, 0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +137,25 @@ mod tests {
         for m in [[0u8; 6], [0xff; 6], [0x01, 0x23, 0x45, 0x67, 0x89, 0xab]] {
             assert_eq!(parse(&format(m)), Some(m));
         }
+    }
+
+    #[test]
+    fn bitwise_and_trunc() {
+        let m = parse("08:00:2b:01:02:03").unwrap();
+        assert_eq!(format(complement(m)), "f7:ff:d4:fe:fd:fc");
+        assert_eq!(
+            format(and(m, parse("ff:ff:ff:00:00:00").unwrap())),
+            "08:00:2b:00:00:00"
+        );
+        assert_eq!(
+            format(or(
+                parse("08:00:2b:00:00:00").unwrap(),
+                parse("00:00:00:ff:ff:ff").unwrap()
+            )),
+            "08:00:2b:ff:ff:ff"
+        );
+        assert_eq!(format(trunc(m)), "08:00:2b:00:00:00");
+        // Double complement is the identity.
+        assert_eq!(complement(complement(m)), m);
     }
 }

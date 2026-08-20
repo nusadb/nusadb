@@ -987,6 +987,7 @@ fn eval_scalar_function(
         // `macaddr8_set7bit` sets the locally-administered bit of the first byte. Matched before the
         // numeric-`trunc` dispatch below so the MACADDR8 argument is not routed to `eval_math`.
         (F::Trunc, [ast::Value::Macaddr8(m)]) => ast::Value::Macaddr8(crate::macaddr8::trunc(*m)),
+        (F::Trunc, [ast::Value::Macaddr(m)]) => ast::Value::Macaddr(crate::macaddr::trunc(*m)),
         (F::Macaddr8Set7bit, [ast::Value::Macaddr8(m)]) => {
             ast::Value::Macaddr8(crate::macaddr8::set7bit(*m))
         },
@@ -5197,6 +5198,9 @@ fn apply_binary(
         Op::BitAnd | Op::BitOr if matches!(left, ast::Value::Macaddr8(_)) => {
             Ok(apply_macaddr8_bit_op(op, left, right))
         },
+        Op::BitAnd | Op::BitOr if matches!(left, ast::Value::Macaddr(_)) => {
+            Ok(apply_macaddr_bit_op(op, left, right))
+        },
         // `#` (BitXor) is the geometric `lseg # lseg` intersection when an operand is geometry,
         // yielding the crossing point (or NULL); routed before the bit-string / integer XOR below.
         Op::BitXor
@@ -5727,6 +5731,24 @@ const fn apply_macaddr8_bit_op(
     match op {
         Op::BitAnd => ast::Value::Macaddr8(crate::macaddr8::and(*a, *b)),
         Op::BitOr => ast::Value::Macaddr8(crate::macaddr8::or(*a, *b)),
+        _ => ast::Value::Null,
+    }
+}
+
+/// Evaluate a MACADDR bit operator (`&` / `|`), byte-wise over the six-byte addresses. A
+/// `NULL` operand yields `NULL`; both operands are MACADDR (the analyzer enforces this).
+const fn apply_macaddr_bit_op(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> ast::Value {
+    use ast::BinaryOp as Op;
+    let (ast::Value::Macaddr(a), ast::Value::Macaddr(b)) = (left, right) else {
+        return ast::Value::Null;
+    };
+    match op {
+        Op::BitAnd => ast::Value::Macaddr(crate::macaddr::and(*a, *b)),
+        Op::BitOr => ast::Value::Macaddr(crate::macaddr::or(*a, *b)),
         _ => ast::Value::Null,
     }
 }
@@ -6750,6 +6772,7 @@ fn apply_unary(op: ast::UnaryOp, value: &ast::Value) -> Result<ast::Value, Error
         ast::UnaryOp::BitNot => match value {
             ast::Value::Int(i) => ast::Value::Int(!*i),
             ast::Value::Macaddr8(m) => ast::Value::Macaddr8(crate::macaddr8::complement(*m)),
+            ast::Value::Macaddr(m) => ast::Value::Macaddr(crate::macaddr::complement(*m)),
             ast::Value::Bit(b) => ast::Value::Bit(crate::bit::complement(b)),
             _ => ast::Value::Null,
         },
