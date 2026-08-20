@@ -74,6 +74,66 @@ pub fn complement(bits: &[bool]) -> Vec<bool> {
     bits.iter().map(|&b| !b).collect()
 }
 
+/// Build a `BIT(n)` from an integer — the `integer::bit(n)` cast.
+///
+/// Takes the low `n` bits of the value's 32-bit two's-complement representation, most-significant
+/// first. Bit position `p` (counted from the right) is bit `p` of the 32-bit value; positions at or
+/// beyond 32 repeat the sign bit, so a positive value zero-extends and a negative one sign-extends
+/// (`5::bit(40)` is 40 bits ending `101`, `(-1)::bit(8)` is all ones).
+#[must_use]
+pub fn from_int(value: i64, n: usize) -> Vec<bool> {
+    let v = value.cast_unsigned(); // reinterpret the two's-complement bits, no value change
+    let sign = (v >> 31) & 1 == 1; // bit 31 is the 32-bit int's sign
+    (0..n)
+        .rev()
+        .map(|p| if p < 32 { (v >> p) & 1 == 1 } else { sign })
+        .collect()
+}
+
+/// Reinterpret a bit string as a signed 32-bit integer — the `bit::integer` cast.
+///
+/// The bits right-align in a 32-bit field and are read as a two's-complement `i32` (widened to
+/// `i64`): a string of fewer than 32 bits is always non-negative, a 32-bit string with the top bit
+/// set is negative. `None` when the string is longer than 32 bits (the value would not fit).
+#[must_use]
+pub fn to_int(bits: &[bool]) -> Option<i64> {
+    if bits.len() > 32 {
+        return None;
+    }
+    let mut acc: u32 = 0;
+    for &b in bits {
+        acc = (acc << 1) | u32::from(b);
+    }
+    Some(i64::from(acc.cast_signed()))
+}
+
+/// Read bit `i` of a `BYTEA` value — `get_bit(bytea, int)`.
+///
+/// Bits are numbered least-significant-first within each byte (bit 0 = the `0x01` bit of the first
+/// byte, bit 7 = its `0x80` bit, bit 8 = the `0x01` bit of the second byte). `None` when `i` is at
+/// or past the last bit.
+#[must_use]
+pub fn bytea_get_bit(bytes: &[u8], i: usize) -> Option<bool> {
+    let byte = bytes.get(i / 8)?;
+    Some((byte >> (i % 8)) & 1 == 1)
+}
+
+/// Set bit `i` (same numbering as [`bytea_get_bit`]) of a `BYTEA` value — `set_bit(bytea, int, int)`.
+/// The caller bounds-checks `i`; an out-of-range index leaves the bytes unchanged.
+#[must_use]
+pub fn bytea_set_bit(bytes: &[u8], i: usize, one: bool) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    if let Some(byte) = out.get_mut(i / 8) {
+        let mask = 1u8 << (i % 8);
+        if one {
+            *byte |= mask;
+        } else {
+            *byte &= !mask;
+        }
+    }
+    out
+}
+
 /// Render a bit string as its canonical text (`"1011"`).
 #[must_use]
 pub fn format(bits: &[bool]) -> String {
@@ -161,6 +221,62 @@ mod tests {
                 "for {s}"
             );
         }
+    }
+
+    #[test]
+    fn from_int_takes_low_n_bits_msb_first() {
+        assert_eq!(format(&from_int(11, 8)), "00001011");
+        assert_eq!(format(&from_int(259, 8)), "00000011"); // low 8 bits of 259 (0x103)
+        assert_eq!(format(&from_int(-1, 8)), "11111111");
+        assert_eq!(format(&from_int(5, 16)), "0000000000000101");
+        // A width beyond 32 sign-extends: positive zero-fills, negative one-fills.
+        assert_eq!(
+            format(&from_int(5, 40)),
+            "0000000000000000000000000000000000000101"
+        );
+        assert_eq!(
+            format(&from_int(-1, 40)),
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            format(&from_int(-2, 35)),
+            "11111111111111111111111111111111110"
+        );
+        assert_eq!(format(&from_int(0, 0)), "");
+    }
+
+    #[test]
+    fn to_int_reads_signed_32bit_two_complement() {
+        assert_eq!(to_int(&parse("1011").unwrap()), Some(11));
+        assert_eq!(to_int(&parse("101").unwrap()), Some(5));
+        // 32 ones = -1; the 32-bit high-bit-set value is i32::MIN.
+        assert_eq!(to_int(&parse(&"1".repeat(32)).unwrap()), Some(-1));
+        let mut min = String::from("1");
+        min.push_str(&"0".repeat(31));
+        assert_eq!(to_int(&parse(&min).unwrap()), Some(-2_147_483_648));
+        assert_eq!(to_int(&[]), Some(0));
+        // A string longer than 32 bits cannot fit a signed 32-bit integer.
+        assert_eq!(to_int(&parse(&"1".repeat(33)).unwrap()), None);
+    }
+
+    #[test]
+    fn int_bit_round_trip_at_the_32bit_boundary() {
+        for v in [0_i64, 1, -1, 5, 255, -128, 2_147_483_647, -2_147_483_648] {
+            let bits = from_int(v, 32);
+            assert_eq!(to_int(&bits), Some(v), "round trip for {v}");
+        }
+    }
+
+    #[test]
+    fn bytea_bit_accessors_are_lsb_first_within_a_byte() {
+        assert_eq!(bytea_get_bit(&[0x80], 0), Some(false));
+        assert_eq!(bytea_get_bit(&[0x80], 7), Some(true));
+        assert_eq!(bytea_get_bit(&[0x01], 0), Some(true));
+        assert_eq!(bytea_get_bit(&[0x12, 0x34], 3), Some(false));
+        assert_eq!(bytea_get_bit(&[0x00, 0x80], 15), Some(true));
+        assert_eq!(bytea_get_bit(&[0x80], 8), None); // one past the last bit
+        assert_eq!(bytea_set_bit(&[0xff, 0xff], 0, false), vec![0xfe, 0xff]);
+        assert_eq!(bytea_set_bit(&[0x12, 0x34], 3, true), vec![0x1a, 0x34]);
     }
 
     #[test]

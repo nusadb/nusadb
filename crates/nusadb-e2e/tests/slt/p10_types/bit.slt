@@ -152,3 +152,61 @@ query TT
 SELECT ~CAST('1100' AS BIT(4)), ~(~CAST('101' AS BIT(3)))
 ----
 0011 101
+
+# --- INTEGER → BIT(n) cast: the low n bits of the 32-bit two's-complement value, MSB first. ---
+query T
+SELECT CAST(11 AS BIT(8))
+----
+00001011
+
+# Only the low 8 bits survive (259 = 0x103).
+query T
+SELECT CAST(259 AS BIT(8))
+----
+00000011
+
+# A negative value fills with its sign: -1 is all ones.
+query T
+SELECT CAST(-1 AS BIT(8))
+----
+11111111
+
+# A wider target left-pads with zeros for a positive value.
+query T
+SELECT CAST(5 AS BIT(16))
+----
+0000000000000101
+
+# Beyond 32 bits the sign bit extends: positive zero-fills, negative one-fills.
+query TT
+SELECT CAST(5 AS BIT(40)), CAST(-2 AS BIT(35))
+----
+0000000000000000000000000000000000000101 11111111111111111111111111111111110
+
+# --- BIT → INTEGER cast: right-align in a 32-bit field, read as signed two's-complement. ---
+query I
+SELECT CAST(CAST('1011' AS BIT(4)) AS INT)
+----
+11
+
+# A short string is always non-negative.
+query I
+SELECT CAST(CAST('101' AS BIT(3)) AS INT)
+----
+5
+
+# 32 ones read as -1; a 32-bit value with the top bit set is i32::MIN.
+query II
+SELECT CAST(CAST('11111111111111111111111111111111' AS BIT(32)) AS INT), CAST(CAST('10000000000000000000000000000000' AS BIT(32)) AS INT)
+----
+-1 -2147483648
+
+# The postfix `::` cast form composes the same way.
+query I
+SELECT CAST('1011' AS BIT(4))::INT
+----
+11
+
+# A bit string wider than 32 bits overflows the signed 32-bit integer.
+statement error
+SELECT CAST(CAST('101010101010101010101010101010101' AS BIT(33)) AS INT)

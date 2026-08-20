@@ -1291,6 +1291,30 @@ fn eval_scalar_function(
                 },
             }
         },
+        // BYTEA get_bit/set_bit: bit `n` is numbered least-significant-first within each byte, so
+        // its valid range is `0..(len*8)`. Same out-of-range and non-0/1-value errors as the BIT arms.
+        (F::BitGetBit, [ast::Value::Bytes(b), ast::Value::Int(n)]) => {
+            match usize::try_from(*n)
+                .ok()
+                .and_then(|i| crate::bit::bytea_get_bit(b, i))
+            {
+                Some(bit) => ast::Value::Int(i64::from(bit)),
+                None => return Err(bit_index_out_of_range(*n, b.len() * 8)),
+            }
+        },
+        (F::BitSetBit, [ast::Value::Bytes(b), ast::Value::Int(n), ast::Value::Int(v)]) => {
+            let idx = usize::try_from(*n).ok().filter(|&i| i / 8 < b.len());
+            match (idx, v) {
+                (Some(i), 0 | 1) => ast::Value::Bytes(crate::bit::bytea_set_bit(b, i, *v == 1)),
+                (None, _) => return Err(bit_index_out_of_range(*n, b.len() * 8)),
+                (Some(_), _) => {
+                    return Err(Error::Coded {
+                        message: format!("new bit must be 0 or 1, got {v}"),
+                        sqlstate: "22023",
+                    });
+                },
+            }
+        },
         // Arity/type mismatch is impossible after analysis — fall back to NULL defensively.
         _ => ast::Value::Null,
     })
@@ -4109,6 +4133,15 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             max.map(|n| n as usize),
         ))),
         (ast::Value::Bit(b), ColumnType::Text) => Ok(ast::Value::Text(crate::bit::format(b))),
+        // INT ↔ BIT: `int::bit(n)` takes the low `n` bits of the 32-bit two's-complement value
+        // (most-significant first); `bit::int` right-aligns the bits in a 32-bit field and reads
+        // them as a signed 32-bit integer. A bit string wider than 32 bits overflows loudly.
+        (ast::Value::Int(i), ColumnType::Bit(n)) => {
+            Ok(ast::Value::Bit(crate::bit::from_int(*i, n as usize)))
+        },
+        (ast::Value::Bit(b), ColumnType::Int) => crate::bit::to_int(b)
+            .map(ast::Value::Int)
+            .ok_or(Error::IntegerOutOfRange),
         // Render temporal + UUID back to their canonical text form.
         (ast::Value::Date(d), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::temporal::format_date(*d)))

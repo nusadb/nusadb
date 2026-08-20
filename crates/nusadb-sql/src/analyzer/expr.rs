@@ -2388,8 +2388,9 @@ fn analyze_vector_function(
 /// Analyze an `INET`/`CIDR` scalar function. The first argument must be a network type; `SET_MASKLEN`
 /// takes a second `INT`. The result type is per-function (`HOST`→`TEXT`, `MASKLEN`/`FAMILY`→`INT`,
 /// `NETWORK`→`CIDR`, `BROADCAST`→`INET`, `SET_MASKLEN`→the input's own type).
-/// Analyze `GET_BIT(bits, n)` → `INT` and `SET_BIT(bits, n, v)` → the input's bit type. The first
-/// argument must be a bit string; the remaining arguments are `INT` positions/values.
+/// Analyze `GET_BIT(bits, n)` → `INT` and `SET_BIT(bits, n, v)` → the input's own type. The first
+/// argument is a bit string or a `BYTEA` (`SET_BIT` returns the same type it was given); the
+/// remaining arguments are `INT` positions/values.
 fn analyze_bit_function(
     func: ast::ScalarFunc,
     args: &[ast::Expr],
@@ -2410,7 +2411,7 @@ fn analyze_bit_function(
     for (i, arg) in args.iter().enumerate() {
         let t = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
         let ok = if i == 0 {
-            is_bit_type(t.ty)
+            is_bit_type(t.ty) || matches!(t.ty, ColumnType::Bytes)
         } else {
             matches!(t.ty, ColumnType::Int)
         };
