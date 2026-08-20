@@ -1721,6 +1721,8 @@ pub enum BinaryOp {
     JsonGetPath,
     /// JSON `#>>` — get the value at a `text[]` path as text.
     JsonGetPathText,
+    /// JSON `#-` — delete the element at a `text[]` path, yielding the trimmed `JSON` document.
+    JsonDeletePath,
     /// Vector distance `<=>` — cosine distance between two `VECTOR(n)` operands, as `FLOAT`
     /// (the `<=>` operator). See [`crate::vector::cosine_distance`].
     VectorDistance,

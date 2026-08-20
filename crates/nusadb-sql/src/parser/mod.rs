@@ -274,6 +274,7 @@ impl Dialect for NusaParserDialect {
             | Token::LongArrow
             | Token::HashArrow
             | Token::HashLongArrow
+            | Token::HashMinus
             | Token::AtArrow
             | Token::ArrowAt => Some(Ok(25)),
             Token::Placeholder(ref p) if p == "?" => Some(Ok(25)),

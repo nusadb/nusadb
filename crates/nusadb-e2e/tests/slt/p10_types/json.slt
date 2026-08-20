@@ -443,6 +443,137 @@ SELECT id FROM jprec WHERE body ->> 'a' = '5'
 statement ok
 DROP TABLE jprec
 
+# --- JSON `#-` (delete the element at a text[] path). Every expected value below is the reference
+# engine's canonical (spaced) jsonb output. ---
+# A top-level object key.
+query T
+SELECT '{"a":1,"b":2}'::JSONB #- '{a}'
+----
+{"b": 2}
+
+# A nested object key (two-step path).
+query T
+SELECT '{"a":{"b":1,"c":2}}'::JSONB #- '{a,b}'
+----
+{"a": {"c": 2}}
+
+# An array element by index, and by a negative index counting from the end.
+query T
+SELECT '[10,20,30]'::JSONB #- '{1}'
+----
+[10, 30]
+
+query T
+SELECT '[10,20,30]'::JSONB #- '{-1}'
+----
+[10, 20]
+
+# A path into a nested array.
+query T
+SELECT '{"a":[1,2,3]}'::JSONB #- '{a,0}'
+----
+{"a": [2, 3]}
+
+# A deep path mixing object and array steps.
+query T
+SELECT '{"a":{"b":{"c":[1,2,3]}}}'::JSONB #- '{a,b,c,1}'
+----
+{"a": {"b": {"c": [1, 3]}}}
+
+# A missing object key leaves the document unchanged (not an error).
+query T
+SELECT '{"a":1}'::JSONB #- '{x}'
+----
+{"a": 1}
+
+# An out-of-range array index — positive or negative — leaves it unchanged.
+query T
+SELECT '[10,20,30]'::JSONB #- '{5}'
+----
+[10, 20, 30]
+
+query T
+SELECT '[10,20,30]'::JSONB #- '{-5}'
+----
+[10, 20, 30]
+
+# A single-element path.
+query T
+SELECT '{"a":1,"b":2}'::JSONB #- '{b}'
+----
+{"a": 1}
+
+# An empty path leaves the document unchanged.
+query T
+SELECT '{"a":1}'::JSONB #- '{}'
+----
+{"a": 1}
+
+# Navigating *into* a scalar mid-path stops there, leaving the document unchanged (no error).
+query T
+SELECT '{"a":5}'::JSONB #- '{a,b}'
+----
+{"a": 5}
+
+# An object's final path element is matched as a key even when it looks numeric (the parent is an
+# object, not an array).
+query T
+SELECT '{"1":10,"2":20}'::JSONB #- '{1}'
+----
+{"2": 20}
+
+# The path may also be given as a real text[] (ARRAY[...]), not only the '{a,b}' text form.
+query T
+SELECT '{"a":{"b":1,"c":2}}'::JSONB #- ARRAY['a','b']
+----
+{"a": {"c": 2}}
+
+# A NULL document (or NULL path) yields SQL NULL.
+query T
+SELECT CAST(CAST(NULL AS JSON) #- '{a}' AS TEXT)
+----
+NULL
+
+# `#-` binds tighter than `=` (JSON-operator tier), so `j #- '{a}' = rhs` is `(j #- '{a}') = rhs`
+# (an uncast boolean renders as 0/1).
+query T
+SELECT '{"a":1,"b":2}'::JSONB #- '{a}' = '{"b":2}'::JSONB
+----
+1
+
+# A scalar top-level document with a non-empty path is an error, not a silent no-op.
+statement error
+SELECT '5'::JSONB #- '{a}'
+
+# A non-integer path element addressing an array is an error.
+statement error
+SELECT '[1,2,3]'::JSONB #- '{a}'
+
+# --- Regression guards: `#-` shares tokens with integer/geometry `#` and with `-`. ---
+# Integer XOR `#` (a bare, spaced `#`) is unaffected.
+query I
+SELECT 5 # 3
+----
+6
+
+# Integer subtraction `-` is unaffected.
+query I
+SELECT 5 - 2
+----
+3
+
+# Geometric `lseg # lseg` intersection (a bare `#` between two segments) is unaffected.
+query T
+SELECT CAST('[(0,0),(2,2)]' AS LSEG) # CAST('[(0,2),(2,0)]' AS LSEG)
+----
+(1,1)
+
+# JSON `-` key delete (a bare `-`) is unaffected.
+query T
+SELECT '{"a":1,"b":2}'::JSONB - 'a'
+----
+{"b": 2}
+
 # --- JSONB key ORDER: shorter keys first, then bytewise (reference-engine jsonb order) ---
 # Captured from the reference engine: b,c (length 1) precede aa,bb (length 2) precede zzz (length 3).
 query T

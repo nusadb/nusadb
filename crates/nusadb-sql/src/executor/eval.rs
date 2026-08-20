@@ -5283,6 +5283,7 @@ fn apply_binary(
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             Ok(json_op(op, left, right))
         },
+        Op::JsonDeletePath => json_delete_path_op(left, right),
         Op::JsonExists | Op::JsonExistsAny | Op::JsonExistsAll => {
             Ok(json_exists_op(op, left, right))
         },
@@ -6345,6 +6346,57 @@ fn json_delete_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, E
         _ => return Ok(ast::Value::Null),
     };
     Ok(deleted.map_or(ast::Value::Null, ast::Value::Json))
+}
+
+/// Evaluate JSON `#-`: delete the element at a `text[]` path. The path is a `text[]`, but a bare
+/// text value (`'{a,b}'`) is coerced to one, exactly as `#>` does. A NULL operand — or a non-text
+/// path element — yields NULL.
+///
+/// # Errors
+/// [`Error::Coded`] `22023` when the whole document is a scalar (nothing to delete from), and
+/// [`Error::Coded`] `22P02` when a path element addressing an array is not an integer — both matching
+/// the reference engine, which errors rather than leaving the document unchanged.
+fn json_delete_path_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    use crate::json::DeletePathError;
+    let ast::Value::Json(doc) = left else {
+        return Ok(ast::Value::Null);
+    };
+    if matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    // Resolve the right operand to a `text[]` path (a bare `'{a,b}'` is coerced), mirroring `#>`.
+    let parsed;
+    let items: &[ast::Value] = match right {
+        ast::Value::Array(items) => items,
+        ast::Value::Text(s) => match crate::executor::row::parse_array_text(s) {
+            Some(v) => {
+                parsed = v;
+                &parsed
+            },
+            None => return Ok(ast::Value::Null),
+        },
+        _ => return Ok(ast::Value::Null),
+    };
+    let mut path = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ast::Value::Text(s) => path.push(s.as_str()),
+            _ => return Ok(ast::Value::Null),
+        }
+    }
+    match crate::json::delete_path(doc, &path) {
+        Ok(deleted) => Ok(deleted.map_or(ast::Value::Null, ast::Value::Json)),
+        Err(DeletePathError::ScalarRoot) => Err(Error::Coded {
+            message: "cannot delete path in scalar".to_owned(),
+            sqlstate: "22023", // invalid_parameter_value
+        }),
+        Err(DeletePathError::NonIntegerArrayIndex { position, element }) => Err(Error::Coded {
+            message: format!(
+                "path element at position {position} is not an integer: \"{element}\""
+            ),
+            sqlstate: "22P02", // invalid_text_representation
+        }),
+    }
 }
 
 /// Evaluate the JSON key-existence operators `?` (one key), `?|` (any key) and `?&` (all keys).

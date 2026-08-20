@@ -311,6 +311,92 @@ pub fn delete_index(json: &str, index: i64) -> Result<Option<String>, DeleteRefu
     Ok(Some(to_text(&J::Array(items))))
 }
 
+/// Why a `json #- path` delete could not follow the document. Both are raised by the reference
+/// engine rather than silently leaving the document unchanged, so the caller reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletePathError {
+    /// The whole document is a scalar (number / string / boolean / `null`): a non-empty path has
+    /// nothing to follow. (A scalar reached *mid-path* is different — navigation stops there and the
+    /// document is left unchanged, not an error.)
+    ScalarRoot,
+    /// A path element addressing an array did not parse as an integer index. Carries the 1-based
+    /// position of the element within the path and its text, to reproduce the reference message.
+    NonIntegerArrayIndex {
+        /// 1-based position of the offending element within the path.
+        position: usize,
+        /// The offending element text.
+        element: String,
+    },
+}
+
+/// `json #- path` — remove the element at `path` (object keys / array indices given as text), as
+/// canonical text.
+///
+/// Each step follows the document like [`get_path`]: an object step selects a member by key, an
+/// array step by the (possibly negative) integer it parses to. The final step then removes an object
+/// member of that name, or an array element at that index. A missing object key or an out-of-range
+/// array index leaves the document unchanged, as does an empty path. `Ok(None)` means `json` is not
+/// valid JSON (the same "not a document" signal the sibling helpers give).
+///
+/// # Errors
+/// [`DeletePathError::ScalarRoot`] when the whole document is a scalar and the path is non-empty, and
+/// [`DeletePathError::NonIntegerArrayIndex`] when a step addressing an array is not an integer — both
+/// raised by the reference engine.
+pub fn delete_path(json: &str, path: &[&str]) -> Result<Option<String>, DeletePathError> {
+    let Some(mut root) = parse(json) else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(Some(to_text(&root)));
+    }
+    // A scalar top-level document has nothing to delete from — an error, not a no-op.
+    if !matches!(root, J::Object(_) | J::Array(_)) {
+        return Err(DeletePathError::ScalarRoot);
+    }
+    delete_in(&mut root, path, 1)?;
+    Ok(Some(to_text(&root)))
+}
+
+/// Recursive worker for [`delete_path`]: remove `path` from `node`, where `position` is the 1-based
+/// index of `path[0]` within the original path (used only for the not-an-integer error message).
+fn delete_in(node: &mut J, path: &[&str], position: usize) -> Result<(), DeletePathError> {
+    let Some((seg, rest)) = path.split_first() else {
+        return Ok(());
+    };
+    let last = rest.is_empty();
+    match node {
+        J::Object(map) => {
+            if last {
+                map.remove(*seg);
+            } else if let Some(child) = map.get_mut(*seg) {
+                delete_in(child, rest, position + 1)?;
+            }
+            // A missing key mid-path leaves the document unchanged.
+        },
+        J::Array(arr) => {
+            // An array step must be an integer, at any depth — the reference engine errors otherwise
+            // (before any range check), so a non-integer is reported even when it would be out of range.
+            let Ok(index) = seg.parse::<i64>() else {
+                return Err(DeletePathError::NonIntegerArrayIndex {
+                    position,
+                    element: (*seg).to_owned(),
+                });
+            };
+            if let Some(idx) = resolve_index(index, arr.len()) {
+                if last {
+                    arr.remove(idx);
+                } else if let Some(child) = arr.get_mut(idx) {
+                    delete_in(child, rest, position + 1)?;
+                }
+            }
+            // An out-of-range index leaves the document unchanged.
+        },
+        // A scalar reached mid-path: nothing to descend into, so leave it unchanged.
+        _ => {},
+    }
+    Ok(())
+}
+
 /// `json #> path` — follow `path` (object keys / array indices given as text) and return the value
 /// as canonical JSON text. `None` (SQL `NULL`) if any step is missing or `json` is invalid.
 #[must_use]
@@ -1240,6 +1326,87 @@ mod tests {
         // Invalid JSON → Ok(None), the same "not a document" signal the other helpers give.
         assert_eq!(delete_keys("oops", &["a"]), Ok(None));
         assert_eq!(delete_index("oops", 0), Ok(None));
+    }
+
+    #[test]
+    fn delete_path_removes_the_element_at_a_path() {
+        let del = |j: &str, p: &[&str]| delete_path(j, p).unwrap().unwrap();
+        // Object key, top-level and nested.
+        assert_eq!(del(r#"{"a":1,"b":2}"#, &["a"]), r#"{"b":2}"#);
+        assert_eq!(
+            del(r#"{"a":{"b":1,"c":2}}"#, &["a", "b"]),
+            r#"{"a":{"c":2}}"#
+        );
+        // Array index: positive, negative (from the end).
+        assert_eq!(del("[10,20,30]", &["1"]), "[10,30]");
+        assert_eq!(del("[10,20,30]", &["-1"]), "[10,20]");
+        // Array nested inside an object.
+        assert_eq!(del(r#"{"a":[1,2,3]}"#, &["a", "0"]), r#"{"a":[2,3]}"#);
+        // Deep mix of object and array steps.
+        assert_eq!(
+            del(r#"{"a":{"b":{"c":[1,2,3]}}}"#, &["a", "b", "c", "1"]),
+            r#"{"a":{"b":{"c":[1,3]}}}"#
+        );
+        // A missing object key leaves the document unchanged (not an error).
+        assert_eq!(del(r#"{"a":1}"#, &["x"]), r#"{"a":1}"#);
+        assert_eq!(del(r#"{"a":{"b":1}}"#, &["a", "x"]), r#"{"a":{"b":1}}"#);
+        // An out-of-range array index (positive or negative) leaves it unchanged.
+        assert_eq!(del("[10,20,30]", &["5"]), "[10,20,30]");
+        assert_eq!(del("[10,20,30]", &["-5"]), "[10,20,30]");
+        // A single-element path down to the last array element.
+        assert_eq!(del("[100]", &["0"]), "[]");
+        // An empty path leaves the document unchanged (still canonicalized).
+        assert_eq!(del(r#"{ "a": 1 }"#, &[]), r#"{"a":1}"#);
+        // An object key is matched as text even when it looks numeric (object, not array, parent).
+        assert_eq!(del(r#"{"1":10,"2":20}"#, &["1"]), r#"{"2":20}"#);
+        // Navigating *into* a scalar mid-path stops there, leaving the document unchanged.
+        assert_eq!(del(r#"{"a":5}"#, &["a", "b"]), r#"{"a":5}"#);
+        assert_eq!(
+            del(r#"{"a":{"b":5}}"#, &["a", "b", "c"]),
+            r#"{"a":{"b":5}}"#
+        );
+    }
+
+    #[test]
+    fn delete_path_reports_scalar_root_and_non_integer_index() {
+        // A scalar top-level document with a non-empty path is an error, not a no-op.
+        assert_eq!(delete_path("5", &["a"]), Err(DeletePathError::ScalarRoot));
+        assert_eq!(
+            delete_path(r#""hi""#, &["a"]),
+            Err(DeletePathError::ScalarRoot)
+        );
+        assert_eq!(
+            delete_path("null", &["a"]),
+            Err(DeletePathError::ScalarRoot)
+        );
+        // But an *empty* path over a scalar is fine — nothing to follow — and returns it unchanged.
+        assert_eq!(delete_path("5", &[]).unwrap().unwrap(), "5");
+        // A non-integer element addressing an array is an error, carrying its 1-based position.
+        assert_eq!(
+            delete_path("[1,2,3]", &["a"]),
+            Err(DeletePathError::NonIntegerArrayIndex {
+                position: 1,
+                element: "a".to_owned(),
+            })
+        );
+        assert_eq!(
+            delete_path(r#"{"a":[1,2,3]}"#, &["a", "x", "y"]),
+            Err(DeletePathError::NonIntegerArrayIndex {
+                position: 2,
+                element: "x".to_owned(),
+            })
+        );
+        // The integer check fires before any range check (a non-integer that would be out of range
+        // still errors rather than being a silent no-op).
+        assert_eq!(
+            delete_path("[1,2,3]", &["1.5"]),
+            Err(DeletePathError::NonIntegerArrayIndex {
+                position: 1,
+                element: "1.5".to_owned(),
+            })
+        );
+        // Invalid JSON → Ok(None), the "not a document" signal the sibling helpers give.
+        assert_eq!(delete_path("oops", &["a"]), Ok(None));
     }
 
     #[test]

@@ -4573,6 +4573,8 @@ pub(super) fn check_binary(
         Op::JsonGet | Op::JsonGetText | Op::JsonGetPath | Op::JsonGetPathText => {
             check_json(op, left, right)
         },
+        // JSON `#-` deletes the element at a `text[]` path, yielding the trimmed document.
+        Op::JsonDeletePath => check_json_delete_path(left, right),
         Op::JsonExists | Op::JsonExistsAny | Op::JsonExistsAll => {
             check_json_exists(op, left, right)
         },
@@ -5195,6 +5197,34 @@ pub(super) fn check_json_delete(right: ColumnType) -> Result<ColumnType, Error> 
             found: right,
         })
     }
+}
+
+/// Type rule for JSON `#-`: the left operand is `JSON` (a `JSONB` value shares the same physical
+/// type) and the right is the `text[]` path to the element to remove. A bare text value like
+/// `'{a,b}'` is accepted where `text[]` is wanted and parsed at evaluation, the same leniency `#>`
+/// gives its path. The result is the trimmed `JSON` document.
+pub(super) fn check_json_delete_path(
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    if !matches!(left, ColumnType::Json | ColumnType::Jsonb) {
+        return Err(Error::TypeMismatch {
+            context: "JSON `#-` document".to_owned(),
+            expected: ColumnType::Json,
+            found: left,
+        });
+    }
+    if !matches!(
+        right,
+        ColumnType::Array(nusadb_core::engine::ArrayElem::Text) | ColumnType::Text
+    ) {
+        return Err(Error::TypeMismatch {
+            context: "JSON `#-` path".to_owned(),
+            expected: ColumnType::Array(nusadb_core::engine::ArrayElem::Text),
+            found: right,
+        });
+    }
+    Ok(ColumnType::Json)
 }
 
 /// Type rule for the JSON key-existence operators: the left operand is `JSON`, the right a single

@@ -2046,6 +2046,9 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
         // JSON path operators.
         B::HashArrow => ast::BinaryOp::JsonGetPath,
         B::HashLongArrow => ast::BinaryOp::JsonGetPathText,
+        // JSON `#-` — delete the element at a `text[]` path (a first-class `HashMinus` token, like
+        // the `#>` / `#>>` arrows above).
+        B::HashMinus => ast::BinaryOp::JsonDeletePath,
         // Vector cosine distance `<=>` (sqlparser tokenizes it as `Spaceship`).
         B::Spaceship => ast::BinaryOp::VectorDistance,
         // The remaining vector distance operators, and the JSON key-existence operators, arrive as
