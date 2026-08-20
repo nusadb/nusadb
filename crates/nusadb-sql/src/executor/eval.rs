@@ -1214,6 +1214,20 @@ fn eval_scalar_function(
                 },
             }
         },
+        (F::InetNetmask, [ast::Value::Inet(a)]) => ast::Value::Inet(a.netmask()),
+        (F::InetHostmask, [ast::Value::Inet(a)]) => ast::Value::Inet(a.hostmask()),
+        (F::InetAbbrev, [ast::Value::Inet(a)]) => ast::Value::Text(a.abbrev()),
+        (F::InetMerge, [ast::Value::Inet(a), ast::Value::Inet(b)]) => match a.merge(*b) {
+            Some(v) => ast::Value::Inet(v),
+            None => {
+                return Err(Error::InvalidParameterValue(
+                    "cannot merge addresses from different families".to_owned(),
+                ));
+            },
+        },
+        (F::InetSameFamily, [ast::Value::Inet(a), ast::Value::Inet(b)]) => {
+            ast::Value::Bool(a.same_family(b))
+        },
         // Range accessors. NULL operands already returned NULL above. An empty range has no bounds,
         // so every accessor reports the absent/false answer for it.
         (F::RangeLower, [ast::Value::Range(r)]) => {

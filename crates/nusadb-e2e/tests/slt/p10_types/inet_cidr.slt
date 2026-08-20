@@ -137,3 +137,107 @@ query T
 SELECT SET_MASKLEN('192.168.1.5/24'::INET, 16)
 ----
 192.168.1.5/16
+
+# NETMASK: the first masklen bits set, rendered as a bare address.
+query TTTT
+SELECT NETMASK('192.168.1.5/24'::INET), NETMASK('192.168.1.5'::INET),
+       NETMASK('10.1.2.3/16'::INET), NETMASK('10.1.2.3/0'::INET)
+----
+255.255.255.0 255.255.255.255 255.255.0.0 0.0.0.0
+
+query TT
+SELECT NETMASK('192.168.1.5/30'::INET), NETMASK('2001:db8::1/64'::INET)
+----
+255.255.255.252 ffff:ffff:ffff:ffff::
+
+query TT
+SELECT NETMASK('2001:db8::1/128'::INET), NETMASK('2001:db8::1/0'::INET)
+----
+ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff ::
+
+# HOSTMASK: the inverse — the first masklen bits zero, the rest set.
+query TTT
+SELECT HOSTMASK('192.168.1.5/24'::INET), HOSTMASK('192.168.1.5/30'::INET),
+       HOSTMASK('10.1.2.3/0'::INET)
+----
+0.0.0.255 0.0.0.3 255.255.255.255
+
+query TTT
+SELECT HOSTMASK('192.168.1.5'::INET), HOSTMASK('10.1.2.3/12'::INET),
+       HOSTMASK('2001:db8::1/64'::INET)
+----
+0.0.0.0 0.15.255.255 ::ffff:ffff:ffff:ffff
+
+# ABBREV over an INET keeps every octet (display form).
+query TTT
+SELECT ABBREV('192.168.1.5/24'::INET), ABBREV('192.168.1.5'::INET),
+       ABBREV('10.1.0.0/16'::INET)
+----
+192.168.1.5/24 192.168.1.5 10.1.0.0/16
+
+# ABBREV over a CIDR drops the trailing zero octets the mask does not need.
+query TTTT
+SELECT ABBREV('10.1.0.0/16'::CIDR), ABBREV('10.0.0.0/8'::CIDR),
+       ABBREV('192.168.1.0/24'::CIDR), ABBREV('192.168.1.0/32'::CIDR)
+----
+10.1/16 10/8 192.168.1/24 192.168.1.0/32
+
+query TTT
+SELECT ABBREV('0.0.0.0/0'::CIDR), ABBREV('10.0.0.0/12'::CIDR),
+       ABBREV('10.1.2.0/24'::CIDR)
+----
+0/0 10.0/12 10.1.2/24
+
+# ABBREV over an IPv6 CIDR collapses trailing zero groups to `::`.
+query TTTT
+SELECT ABBREV('2001:db8::/32'::CIDR), ABBREV('2001:db8:abcd::/48'::CIDR),
+       ABBREV('2001:db8::/64'::CIDR), ABBREV('ffff::/16'::CIDR)
+----
+2001:db8/32 2001:db8:abcd/48 2001:db8::/64 ffff::/16
+
+query TTTT
+SELECT ABBREV('ff00::/8'::CIDR), ABBREV('::/0'::CIDR),
+       ABBREV('2001:db8::/128'::CIDR), ABBREV('2001:db8:0:1::/64'::CIDR)
+----
+ff00::/8 ::/0 2001:db8::/128 2001:db8::1/64
+
+# INET_MERGE: the smallest network (CIDR) containing both inputs.
+query TTT
+SELECT INET_MERGE('192.168.1.5/24'::INET, '192.168.2.5/24'::INET),
+       INET_MERGE('10.0.0.0/24'::INET, '10.0.1.0/24'::INET),
+       INET_MERGE('10.0.0.0/8'::INET, '10.5.3.2/32'::INET)
+----
+192.168.0.0/22 10.0.0.0/23 10.0.0.0/8
+
+query TTT
+SELECT INET_MERGE('192.168.1.1'::INET, '192.168.1.1'::INET),
+       INET_MERGE('0.0.0.0/0'::INET, '255.255.255.255'::INET),
+       INET_MERGE('10.0.0.1'::INET, '10.0.0.128'::INET)
+----
+192.168.1.1/32 0.0.0.0/0 10.0.0.0/24
+
+query TTT
+SELECT INET_MERGE('2001:db8::1'::INET, '2001:db8::ffff'::INET),
+       INET_MERGE('2001:db8:1::/48'::INET, '2001:db8:2::/48'::INET),
+       INET_MERGE('172.16.0.0/12'::INET, '172.31.255.255/32'::INET)
+----
+2001:db8::/112 2001:db8::/46 172.16.0.0/12
+
+# Merging addresses from different families is an error.
+statement error
+SELECT INET_MERGE('192.168.1.5'::INET, '::1'::INET)
+
+# INET_SAME_FAMILY: true only when both are the same family; never errors on a mismatch.
+query III
+SELECT CASE WHEN INET_SAME_FAMILY('192.168.1.5'::INET, '10.0.0.1'::INET) THEN 1 ELSE 0 END,
+       CASE WHEN INET_SAME_FAMILY('192.168.1.5'::INET, '::1'::INET) THEN 1 ELSE 0 END,
+       CASE WHEN INET_SAME_FAMILY('::1'::INET, '2001:db8::1'::INET) THEN 1 ELSE 0 END
+----
+1 0 1
+
+# NULL propagates through the new functions.
+query TTTT
+SELECT NETMASK(NULL::INET), HOSTMASK(NULL::INET), ABBREV(NULL::INET),
+       INET_MERGE(NULL::INET, '10.0.0.0/8'::INET)
+----
+NULL NULL NULL NULL

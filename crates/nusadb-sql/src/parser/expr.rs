@@ -1446,6 +1446,11 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "network" => F::InetNetwork,
         "broadcast" => F::InetBroadcast,
         "set_masklen" => F::InetSetMasklen,
+        "netmask" => F::InetNetmask,
+        "hostmask" => F::InetHostmask,
+        "abbrev" => F::InetAbbrev,
+        "inet_merge" => F::InetMerge,
+        "inet_same_family" => F::InetSameFamily,
         "get_bit" => F::BitGetBit,
         "set_bit" => F::BitSetBit,
         // Range accessors. `lower`/`upper` are not here: they share their spelling with the

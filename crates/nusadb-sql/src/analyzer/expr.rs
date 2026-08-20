@@ -1209,6 +1209,11 @@ pub(super) fn analyze_scalar_function(
             | F::InetNetwork
             | F::InetBroadcast
             | F::InetSetMasklen
+            | F::InetNetmask
+            | F::InetHostmask
+            | F::InetAbbrev
+            | F::InetMerge
+            | F::InetSameFamily
     ) {
         return analyze_inet_function(func, args, scope, catalog, aggregates);
     }
@@ -1611,6 +1616,11 @@ pub(super) fn analyze_scalar_function(
         | F::InetNetwork
         | F::InetBroadcast
         | F::InetSetMasklen
+        | F::InetNetmask
+        | F::InetHostmask
+        | F::InetAbbrev
+        | F::InetMerge
+        | F::InetSameFamily
         | F::BitGetBit
         | F::BitSetBit
         | F::RangeLower
@@ -2546,7 +2556,11 @@ fn analyze_inet_function(
 ) -> Result<TypedExpr, Error> {
     use ast::ScalarFunc as F;
     let name = func.name();
-    let want = if func == F::InetSetMasklen { 2 } else { 1 };
+    let want = if matches!(func, F::InetSetMasklen | F::InetMerge | F::InetSameFamily) {
+        2
+    } else {
+        1
+    };
     if args.len() != want {
         return Err(Error::FunctionArgs(format!(
             "{name}() expects {want} argument(s), got {}",
@@ -2571,10 +2585,33 @@ fn analyze_inet_function(
     }
     let mut typed_args = vec![a.clone()];
     let ty = match func {
-        F::InetHost => ColumnType::Text,
+        F::InetHost | F::InetAbbrev => ColumnType::Text,
         F::InetMasklen | F::InetFamily => ColumnType::Int,
         F::InetNetwork => ColumnType::Cidr,
-        F::InetBroadcast => ColumnType::Inet,
+        F::InetBroadcast | F::InetNetmask | F::InetHostmask => ColumnType::Inet,
+        // INET_MERGE(inet, inet) → CIDR and INET_SAME_FAMILY(inet, inet) → BOOL both take a second
+        // INET/CIDR argument; validate and record it here.
+        F::InetMerge | F::InetSameFamily => {
+            let b_expr = args.get(1).ok_or_else(|| {
+                Error::Internal(format!(
+                    "{name}() passed the arity check with no second argument"
+                ))
+            })?;
+            let b = analyze_expr_agg(b_expr, scope, catalog, None, aggregates)?;
+            if !is_inet_type(b.ty) && !is_null_literal(&b) {
+                return Err(Error::TypeMismatch {
+                    context: format!("{name}() second argument"),
+                    expected: ColumnType::Inet,
+                    found: b.ty,
+                });
+            }
+            typed_args.push(b);
+            if func == F::InetMerge {
+                ColumnType::Cidr
+            } else {
+                ColumnType::Bool
+            }
+        },
         F::InetSetMasklen => {
             let n_expr = args.get(1).ok_or_else(|| {
                 Error::Internal(format!(

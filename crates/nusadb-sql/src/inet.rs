@@ -256,6 +256,235 @@ impl InetAddr {
         }
         network_prefix_eq(self.addr, other.addr, self.masklen)
     }
+
+    /// The network mask of this value's subnet: the first `masklen` bits set, the rest zero, as an
+    /// `INET` whose own mask is the family maximum (so it renders as a bare address — `255.255.255.0`
+    /// for `/24`). The `netmask()` function.
+    #[must_use]
+    pub fn netmask(self) -> Self {
+        self.mask_value(true)
+    }
+
+    /// The host mask — the inverse of [`InetAddr::netmask`]: the first `masklen` bits zero, the rest
+    /// set (`0.0.0.255` for `/24`). The `hostmask()` function.
+    #[must_use]
+    pub fn hostmask(self) -> Self {
+        self.mask_value(false)
+    }
+
+    /// Build a mask value as a bare `INET`: `ones_in_prefix` sets the first `masklen` bits and clears
+    /// the rest (netmask); `false` clears the first `masklen` bits and sets the rest (hostmask).
+    fn mask_value(self, ones_in_prefix: bool) -> Self {
+        let len = addr_octets(self.addr).len();
+        let octets = mask_octets(len, usize::from(self.masklen), ones_in_prefix);
+        Self {
+            addr: octets_to_addr(&octets, is_v6(self.addr)),
+            masklen: max_masklen(self.addr),
+            is_cidr: false,
+        }
+    }
+
+    /// The abbreviated text form. For an `INET` value it is the display form ([`InetAddr::format`] —
+    /// the mask shown unless it is the family maximum). For a `CIDR` value it additionally drops the
+    /// trailing all-zero octets/groups the mask does not need (`10.1.0.0/16` → `10.1/16`).
+    #[must_use]
+    pub fn abbrev(&self) -> String {
+        if !self.is_cidr {
+            return self.format();
+        }
+        let octets = addr_octets(self.addr);
+        let body = if is_v6(self.addr) {
+            abbrev_cidr_v6(&octets, self.masklen)
+        } else {
+            abbrev_cidr_v4(&octets, self.masklen)
+        };
+        std::format!("{body}/{}", self.masklen)
+    }
+
+    /// `true` when both values are the same address family (both IPv4 or both IPv6). Never errors on
+    /// a mismatch — it reports `false`. The `inet_same_family()` function.
+    #[must_use]
+    pub const fn same_family(&self, other: &Self) -> bool {
+        is_v6(self.addr) == is_v6(other.addr)
+    }
+
+    /// The smallest network (`CIDR`) that contains both `self` and `other`: the longest common bit
+    /// prefix of the two addresses — examined only up to the shorter of the two masks — with the host
+    /// bits below it zeroed. `None` when the two are different families (the caller raises the typed
+    /// "cannot merge addresses from different families" error). The `inet_merge()` function.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Option<Self> {
+        if is_v6(self.addr) != is_v6(other.addr) {
+            return None;
+        }
+        let oa = addr_octets(self.addr);
+        let ob = addr_octets(other.addr);
+        let limit = self.masklen.min(other.masklen);
+        let common = common_prefix_len(&oa, &ob, limit);
+        // Zero the host bits below the common prefix and stamp it as a CIDR network.
+        Some(
+            Self {
+                addr: self.addr,
+                masklen: common,
+                is_cidr: false,
+            }
+            .to_cidr(),
+        )
+    }
+}
+
+/// Octets of a contiguous mask of `len` bytes: `ones_in_prefix` sets the first `bits` bits and clears
+/// the rest; `false` clears the first `bits` bits and sets the rest.
+fn mask_octets(len: usize, bits: usize, ones_in_prefix: bool) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            let bit_lo = i * 8;
+            let prefix: u8 = if bit_lo + 8 <= bits {
+                0xff
+            } else if bit_lo >= bits {
+                0x00
+            } else {
+                // The high `bits - bit_lo` bits of this byte are in the prefix.
+                let n = bits - bit_lo;
+                (0xffu16 << (8 - n)) as u8
+            };
+            if ones_in_prefix { prefix } else { !prefix }
+        })
+        .collect()
+}
+
+/// The number of leading bits `a` and `b` share, examining at most `maxbits` bits.
+fn common_prefix_len(a: &[u8], b: &[u8], maxbits: u8) -> u8 {
+    let mut n = 0u8;
+    while n < maxbits {
+        let idx = usize::from(n / 8);
+        let mask = 0x80u8 >> (n % 8);
+        let xa = a.get(idx).copied().unwrap_or(0) & mask;
+        let yb = b.get(idx).copied().unwrap_or(0) & mask;
+        if xa != yb {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Abbreviate an IPv4 `CIDR` network body (without the `/mask` suffix): keep only the octets the mask
+/// reaches (`10.1.0.0/16` → `10.1`), always at least one (`0.0.0.0/0` → `0`). Ports the reference
+/// engine's network-notation output.
+fn abbrev_cidr_v4(octets: &[u8], bits: u8) -> String {
+    let mut out = String::new();
+    if bits == 0 {
+        out.push('0');
+    }
+    let whole = bits / 8;
+    for i in 0..whole {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&octets.get(usize::from(i)).copied().unwrap_or(0).to_string());
+    }
+    let partial = bits % 8;
+    if partial > 0 {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        let m = (((1u16 << partial) - 1) << (8 - partial)) as u8;
+        let val = octets.get(usize::from(whole)).copied().unwrap_or(0) & m;
+        out.push_str(&val.to_string());
+    }
+    out
+}
+
+/// Abbreviate an IPv6 `CIDR` network body (without the `/mask` suffix), a faithful port of the
+/// reference engine's network-notation output: emit only the 16-bit groups the mask reaches, with the
+/// longest run of zero groups collapsed to `::`. A single-group mask is padded to two so a `/16`
+/// still shows the `::` (`ffff::/16`).
+fn abbrev_cidr_v6(src: &[u8], bits: u8) -> String {
+    use std::fmt::Write as _;
+    if bits == 0 {
+        return "::".to_string();
+    }
+    // Copy the network bytes into a fixed buffer, zero the host part, and mask the partial last byte.
+    let p = usize::from(bits).div_ceil(8);
+    let mut buf = [0u8; 16];
+    for (i, slot) in buf.iter_mut().enumerate().take(p.min(16)) {
+        *slot = src.get(i).copied().unwrap_or(0);
+    }
+    let rem = bits % 8;
+    if rem != 0 && (1..=16).contains(&p) {
+        let m = 0xffu8 << (8 - rem);
+        if let Some(byte) = buf.get_mut(p - 1) {
+            *byte &= m;
+        }
+    }
+    // How many 16-bit words the mask reaches; a lone word is padded to two.
+    let mut words = usize::from(bits).div_ceil(16);
+    if words == 1 {
+        words = 2;
+    }
+    // Longest run of zero words among the first `words` — faithful to the reference (which does not
+    // reset its running tally when a non-zero word is no longer than the best run so far).
+    let (mut zero_s, mut zero_l) = (0usize, 0usize);
+    let (mut tmp_s, mut tmp_l) = (0usize, 0usize);
+    for i in 0..words {
+        let hi = buf.get(2 * i).copied().unwrap_or(0);
+        let lo = buf.get(2 * i + 1).copied().unwrap_or(0);
+        if hi | lo == 0 {
+            if tmp_l == 0 {
+                tmp_s = i;
+            }
+            tmp_l += 1;
+        } else if tmp_l != 0 && zero_l < tmp_l {
+            zero_s = tmp_s;
+            zero_l = tmp_l;
+            tmp_l = 0;
+        }
+    }
+    if tmp_l != 0 && zero_l < tmp_l {
+        zero_s = tmp_s;
+        zero_l = tmp_l;
+    }
+    // IPv4-in-IPv6 detection, matching the reference engine's dotted-quad tail rendering.
+    let is_ipv4 = zero_l != words
+        && zero_s == 0
+        && (zero_l == 6
+            || (zero_l == 5 && buf.get(10) == Some(&0xff) && buf.get(11) == Some(&0xff))
+            || (zero_l == 7 && buf.get(14) != Some(&0) && buf.get(15) != Some(&1)));
+
+    let mut out = String::new();
+    let mut s = 0usize;
+    for word in 0..words {
+        if zero_l != 0 && word >= zero_s && word < zero_s + zero_l {
+            if word == zero_s {
+                out.push(':');
+            }
+            if word == words - 1 {
+                out.push(':');
+            }
+            s += 2;
+            continue;
+        }
+        if is_ipv4 && word > 5 {
+            out.push(if word == 6 { ':' } else { '.' });
+            out.push_str(&buf.get(s).copied().unwrap_or(0).to_string());
+            s += 1;
+            if word != 7 || bits > 120 {
+                out.push('.');
+                out.push_str(&buf.get(s).copied().unwrap_or(0).to_string());
+                s += 1;
+            }
+        } else {
+            if !out.is_empty() {
+                out.push(':');
+            }
+            let hi = u16::from(buf.get(s).copied().unwrap_or(0));
+            let lo = u16::from(buf.get(s + 1).copied().unwrap_or(0));
+            let _ = write!(out, "{:x}", hi * 256 + lo);
+            s += 2;
+        }
+    }
+    out
 }
 
 /// Rebuild an [`IpAddr`] from big-endian octets (4 for IPv4 when `v6` is false, 16 for IPv6).
@@ -438,6 +667,114 @@ mod tests {
             "10.0.0.1/32"
         );
         assert_eq!(parse_inet("::1").unwrap().format_cast_text(), "::1/128");
+    }
+
+    #[test]
+    fn netmask_builds_prefix_ones() {
+        let nm = |s: &str| parse_inet(s).unwrap().netmask().format();
+        assert_eq!(nm("192.168.1.5/24"), "255.255.255.0");
+        assert_eq!(nm("192.168.1.5"), "255.255.255.255");
+        assert_eq!(nm("10.1.2.3/16"), "255.255.0.0");
+        assert_eq!(nm("10.1.2.3/0"), "0.0.0.0");
+        assert_eq!(nm("192.168.1.5/30"), "255.255.255.252");
+        assert_eq!(nm("2001:db8::1/64"), "ffff:ffff:ffff:ffff::");
+        assert_eq!(nm("2001:db8::1/48"), "ffff:ffff:ffff::");
+        assert_eq!(
+            nm("2001:db8::1/128"),
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+        );
+        assert_eq!(nm("2001:db8::1/0"), "::");
+    }
+
+    #[test]
+    fn hostmask_builds_suffix_ones() {
+        let hm = |s: &str| parse_inet(s).unwrap().hostmask().format();
+        assert_eq!(hm("192.168.1.5/24"), "0.0.0.255");
+        assert_eq!(hm("192.168.1.5/30"), "0.0.0.3");
+        assert_eq!(hm("10.1.2.3/0"), "255.255.255.255");
+        assert_eq!(hm("192.168.1.5"), "0.0.0.0");
+        assert_eq!(hm("10.1.2.3/12"), "0.15.255.255");
+        assert_eq!(hm("2001:db8::1/64"), "::ffff:ffff:ffff:ffff");
+        assert_eq!(hm("2001:db8::1/128"), "::");
+    }
+
+    #[test]
+    fn abbrev_inet_is_display_form() {
+        // INET keeps every octet; the mask shows unless it is the family maximum.
+        assert_eq!(
+            parse_inet("192.168.1.5/24").unwrap().abbrev(),
+            "192.168.1.5/24"
+        );
+        assert_eq!(parse_inet("192.168.1.5").unwrap().abbrev(), "192.168.1.5");
+        assert_eq!(parse_inet("10.1.0.0/16").unwrap().abbrev(), "10.1.0.0/16");
+        assert_eq!(
+            parse_inet("2001:db8::1/64").unwrap().abbrev(),
+            "2001:db8::1/64"
+        );
+    }
+
+    #[test]
+    fn abbrev_cidr_drops_trailing_zero_octets_v4() {
+        let ab = |s: &str| parse_cidr(s).unwrap().abbrev();
+        assert_eq!(ab("10.1.0.0/16"), "10.1/16");
+        assert_eq!(ab("10.0.0.0/8"), "10/8");
+        assert_eq!(ab("192.168.1.0/24"), "192.168.1/24");
+        assert_eq!(ab("192.168.1.0/32"), "192.168.1.0/32");
+        assert_eq!(ab("0.0.0.0/0"), "0/0");
+        assert_eq!(ab("10.0.0.0/12"), "10.0/12");
+    }
+
+    #[test]
+    fn abbrev_cidr_drops_trailing_zero_groups_v6() {
+        let ab = |s: &str| parse_cidr(s).unwrap().abbrev();
+        assert_eq!(ab("2001:db8::/32"), "2001:db8/32");
+        assert_eq!(ab("2001:db8:abcd::/48"), "2001:db8:abcd/48");
+        assert_eq!(ab("2001:db8::/64"), "2001:db8::/64");
+        assert_eq!(ab("ffff::/16"), "ffff::/16");
+        assert_eq!(ab("ff00::/8"), "ff00::/8");
+        assert_eq!(ab("::/0"), "::/0");
+        assert_eq!(ab("2001:db8::/128"), "2001:db8::/128");
+        assert_eq!(ab("2001:db8:0:1::/64"), "2001:db8::1/64");
+        assert_eq!(ab("1:2:3::/48"), "1:2:3/48");
+        // IPv4-in-IPv6 networks keep the dotted-quad tail.
+        assert_eq!(ab("::ffff:0:0/96"), "::ffff/96");
+        assert_eq!(ab("::ffff:1.2.3.4/128"), "::ffff:1.2.3.4/128");
+        assert_eq!(ab("::ffff:1.2.0.0/112"), "::ffff:1.2/112");
+        assert_eq!(ab("::1.2.3.4/128"), "::1.2.3.4/128");
+        assert_eq!(ab("::1/128"), "::1/128");
+    }
+
+    #[test]
+    fn merge_finds_smallest_common_network() {
+        let mg = |a: &str, b: &str| {
+            parse_inet(a)
+                .unwrap()
+                .merge(parse_inet(b).unwrap())
+                .unwrap()
+                .format()
+        };
+        assert_eq!(mg("192.168.1.5/24", "192.168.2.5/24"), "192.168.0.0/22");
+        assert_eq!(mg("10.0.0.0/24", "10.0.1.0/24"), "10.0.0.0/23");
+        assert_eq!(mg("10.0.0.0/8", "10.5.3.2/32"), "10.0.0.0/8");
+        assert_eq!(mg("192.168.1.1", "192.168.1.1"), "192.168.1.1/32");
+        assert_eq!(mg("0.0.0.0/0", "255.255.255.255"), "0.0.0.0/0");
+        assert_eq!(mg("2001:db8::1", "2001:db8::ffff"), "2001:db8::/112");
+        assert_eq!(mg("2001:db8:1::/48", "2001:db8:2::/48"), "2001:db8::/46");
+        // Cross-family merge has no answer.
+        assert!(
+            parse_inet("192.168.1.5")
+                .unwrap()
+                .merge(parse_inet("::1").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn same_family_never_errors() {
+        let sf = |a: &str, b: &str| parse_inet(a).unwrap().same_family(&parse_inet(b).unwrap());
+        assert!(sf("192.168.1.5", "10.0.0.1"));
+        assert!(!sf("192.168.1.5", "::1"));
+        assert!(sf("::1", "2001:db8::1"));
     }
 
     #[test]

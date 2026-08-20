@@ -825,6 +825,16 @@ pub enum ScalarFunc {
     InetBroadcast,
     /// `SET_MASKLEN(inet, int)` — the address with a new mask length, as `INET`/`CIDR`.
     InetSetMasklen,
+    /// `NETMASK(inet)` — the network mask (prefix bits set), as `INET`.
+    InetNetmask,
+    /// `HOSTMASK(inet)` — the host mask (suffix bits set), as `INET`.
+    InetHostmask,
+    /// `ABBREV(inet)` — the abbreviated text form (drops a `CIDR`'s trailing zero groups), as `TEXT`.
+    InetAbbrev,
+    /// `INET_MERGE(inet, inet)` — the smallest network containing both, as `CIDR`.
+    InetMerge,
+    /// `INET_SAME_FAMILY(inet, inet)` — whether both are the same address family, as `BOOLEAN`.
+    InetSameFamily,
     /// `GET_BIT(bits, n)` — the `n`-th bit (0-based from the left) as `INT` (`0`/`1`).
     BitGetBit,
     /// `SET_BIT(bits, n, v)` — `bits` with its `n`-th bit set to `v` (`0`/`1`), as the same bit type.
@@ -1161,6 +1171,11 @@ impl ScalarFunc {
             Self::InetNetwork => "network",
             Self::InetBroadcast => "broadcast",
             Self::InetSetMasklen => "set_masklen",
+            Self::InetNetmask => "netmask",
+            Self::InetHostmask => "hostmask",
+            Self::InetAbbrev => "abbrev",
+            Self::InetMerge => "inet_merge",
+            Self::InetSameFamily => "inet_same_family",
             Self::BitGetBit => "get_bit",
             Self::BitSetBit => "set_bit",
             Self::RangeIsEmpty => "isempty",
