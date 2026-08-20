@@ -1236,6 +1236,11 @@ pub(super) fn analyze_scalar_function(
     if let Some(kind) = func.range_kind() {
         return analyze_range_constructor(func, kind, args, scope, catalog, aggregates);
     }
+    // `range_merge` takes two ranges and returns a range of their (shared) kind — a result type that
+    // follows the argument, so it is not expressible in the fixed table either.
+    if matches!(func, F::RangeMerge) {
+        return analyze_range_merge(func, args, scope, catalog, aggregates);
+    }
     // `lower`/`upper` are overloaded: over a range they yield a bound, over text they fold case.
     // The argument decides, so it is analyzed once here and handed to whichever form wins —
     // re-analyzing to pick would double the work per call and square it for every nested one.
@@ -1636,6 +1641,7 @@ pub(super) fn analyze_scalar_function(
         | F::DateRange
         | F::TsRange
         | F::TsTzRange
+        | F::RangeMerge
         | F::ToJson
         | F::RowToJson
         | F::JsonBuildObject
@@ -2522,6 +2528,55 @@ fn analyze_range_constructor(
             args: typed_args,
         },
         ty: ColumnType::Range(kind),
+    })
+}
+
+/// Analyze `RANGE_MERGE(range, range)`: two ranges of the same element kind, yielding that range
+/// type. There is no element form, so both arguments must already be ranges — a bare string literal
+/// carries no kind and needs an explicit cast (`'[1,5)'::int4range`), exactly as the range
+/// strict-order operators require.
+fn analyze_range_merge(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let name = func.name();
+    let [a_expr, b_expr] = args else {
+        return Err(Error::FunctionArgs(format!(
+            "{name}() expects 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let a = analyze_expr_agg(a_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+    let b = analyze_expr_agg(b_expr, scope, catalog, None, aggregates)?;
+    let (ColumnType::Range(ka), ColumnType::Range(kb)) = (a.ty, b.ty) else {
+        // Point the error at whichever operand is not a range.
+        let (found, expected) = if is_range_type(a.ty) {
+            (b.ty, a.ty)
+        } else {
+            (a.ty, ColumnType::Range(nusadb_core::engine::RangeKind::Int))
+        };
+        return Err(Error::TypeMismatch {
+            context: format!("{name}() arguments"),
+            expected,
+            found,
+        });
+    };
+    if ka != kb {
+        return Err(Error::TypeMismatch {
+            context: format!("{name}() arguments"),
+            expected: ColumnType::Range(ka),
+            found: ColumnType::Range(kb),
+        });
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: vec![a, b],
+        },
+        ty: ColumnType::Range(ka),
     })
 }
 
@@ -4225,10 +4280,17 @@ pub(super) fn analyze_binary(
             left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
         }
     }
-    // `&&` over ranges has only a range/range form, so a bare string literal next to a range
-    // operand is unambiguous and coerces the same way. (`@>`/`<@` do not: a literal there could be
-    // the range or one element, so it stays a mismatch until cast.)
-    if op == ast::BinaryOp::ArrayOverlap {
+    // `&&` (overlap) and the boundary operators `-|-` / `&<` / `&>` over ranges have only a
+    // range/range form, so a bare string literal next to a range operand is unambiguous and coerces
+    // to that range's kind. (`@>`/`<@` do not: a literal there could be the range or one element, so
+    // it stays a mismatch until cast.)
+    if matches!(
+        op,
+        ast::BinaryOp::ArrayOverlap
+            | ast::BinaryOp::RangeAdjacent
+            | ast::BinaryOp::RangeNotExtendRight
+            | ast::BinaryOp::RangeNotExtendLeft
+    ) {
         if is_range_type(left_typed.ty) {
             right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
         }
@@ -4482,6 +4544,11 @@ pub(super) fn check_binary(
         // INET/CIDR subnet-or-equal `<<=` / supernet-or-equal `>>=` — both operands are network
         // addresses, yielding `BOOL`.
         Op::InetSubnetEq | Op::InetSupernetEq => check_inet_subnet(op, left, right),
+        // Range boundary predicates `-|-` (adjacent), `&<` (does not extend right), `&>` (does not
+        // extend left) — both operands ranges of the same element kind, yielding `BOOL`.
+        Op::RangeAdjacent | Op::RangeNotExtendRight | Op::RangeNotExtendLeft => {
+            check_range_bound_predicate(op, left, right)
+        },
     }
 }
 
@@ -5349,6 +5416,29 @@ fn check_range_strict(
         (ColumnType::Range(a), ColumnType::Range(b)) if a == b => Ok(ColumnType::Bool),
         _ => Err(Error::TypeMismatch {
             context: format!("range strict-order operator `{symbol}`"),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for the range boundary predicates `-|-` (adjacent), `&<` (does not extend to the right
+/// of), and `&>` (does not extend to the left of): both operands are ranges of the same element kind,
+/// and the result is `BOOL`.
+fn check_range_bound_predicate(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    let symbol = match op {
+        ast::BinaryOp::RangeAdjacent => "-|-",
+        ast::BinaryOp::RangeNotExtendRight => "&<",
+        _ => "&>",
+    };
+    match (left, right) {
+        (ColumnType::Range(a), ColumnType::Range(b)) if a == b => Ok(ColumnType::Bool),
+        _ => Err(Error::TypeMismatch {
+            context: format!("range boundary operator `{symbol}`"),
             expected: left,
             found: right,
         }),

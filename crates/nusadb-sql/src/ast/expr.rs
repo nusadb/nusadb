@@ -872,6 +872,10 @@ pub enum ScalarFunc {
     TsRange,
     /// `TSTZRANGE(lo, hi [, bounds])` — build a timestamp-with-time-zone range.
     TsTzRange,
+    /// `RANGE_MERGE(range, range)` — the smallest range covering both inputs, spanning any gap
+    /// between them (unlike `+`, which errors on a gap). Both inputs share an element kind; the result
+    /// is that range type. An empty input contributes nothing to the result.
+    RangeMerge,
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
@@ -1185,6 +1189,7 @@ impl ScalarFunc {
             Self::DateRange => "daterange",
             Self::TsRange => "tsrange",
             Self::TsTzRange => "tstzrange",
+            Self::RangeMerge => "range_merge",
             Self::RangeLowerInc => "lower_inc",
             Self::RangeUpperInc => "upper_inc",
             Self::RangeLowerInf => "lower_inf",
@@ -1733,6 +1738,17 @@ pub enum BinaryOp {
     /// `>>=` — supernet-or-equal: does the left network contain **or equal** the right, as `BOOL`?
     /// (`a >>= b` ≡ the left contains-or-equals the right.) A cross-family pair is `FALSE`.
     InetSupernetEq,
+    /// `-|-` — range adjacency: do two ranges of the same element kind touch at exactly one boundary,
+    /// with no overlap and no gap, as `BOOL`? An empty operand on either side is never adjacent.
+    RangeAdjacent,
+    /// `&<` — does-not-extend-to-the-right-of: is the left range's upper bound at or below the right's
+    /// (both ranges of the same element kind), as `BOOL`? An empty operand on either side yields
+    /// `FALSE`.
+    RangeNotExtendRight,
+    /// `&>` — does-not-extend-to-the-left-of: is the left range's lower bound at or above the right's
+    /// (both ranges of the same element kind), as `BOOL`? An empty operand on either side yields
+    /// `FALSE`.
+    RangeNotExtendLeft,
 }
 
 /// Unary operators the parser accepts.

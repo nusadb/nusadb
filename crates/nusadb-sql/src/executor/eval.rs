@@ -1253,6 +1253,17 @@ fn eval_scalar_function(
         (F::RangeUpperInf, [ast::Value::Range(r)]) => {
             ast::Value::Bool(!r.empty && r.upper.is_none())
         },
+        // RANGE_MERGE: the smallest range covering both operands, spanning any gap. NULL operands
+        // already returned NULL above; the analyzer guarantees a matching element kind, so a mismatch
+        // here means the two layers disagree — report it rather than merge unlike kinds.
+        (F::RangeMerge, [ast::Value::Range(a), ast::Value::Range(b)]) => {
+            if a.kind != b.kind {
+                return Err(Error::InvalidStatement(
+                    "range_merge over operands of different element kinds".to_owned(),
+                ));
+            }
+            ast::Value::Range(Box::new(a.merge(b)))
+        },
         // BIT string functions. NULL operands already returned NULL above.
         (F::BitGetBit, [ast::Value::Bit(b), ast::Value::Int(n)]) => {
             match usize::try_from(*n).ok().and_then(|i| b.get(i)) {
@@ -5122,6 +5133,10 @@ const fn type_rank(v: &ast::Value) -> u8 {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat one-arm-per-operator dispatch; splitting it would scatter the operator table"
+)]
 fn apply_binary(
     op: ast::BinaryOp,
     left: &ast::Value,
@@ -5166,6 +5181,11 @@ fn apply_binary(
         // predicates that share these operators.
         Op::ShiftLeft | Op::ShiftRight if has_range_operand(left, right) => {
             apply_range_strict(op, left, right)
+        },
+        // Range boundary predicates `-|-` (adjacent), `&<` (does not extend right), `&>` (does not
+        // extend left) — dedicated operators used by no other type, so no operand guard is needed.
+        Op::RangeAdjacent | Op::RangeNotExtendRight | Op::RangeNotExtendLeft => {
+            apply_range_bound_predicate(op, left, right)
         },
         // INET/CIDR network predicates share the `<<` / `>>` / `&&` operators.
         Op::ShiftLeft | Op::ShiftRight | Op::ArrayOverlap
@@ -6111,6 +6131,43 @@ fn apply_range_strict(
         Op::ShiftLeft => a.strictly_left_of(b),
         Op::ShiftRight => a.strictly_right_of(b),
         // The dispatcher routes only these two operators here.
+        _ => {
+            return Err(Error::InvalidStatement(
+                "unsupported range predicate".to_owned(),
+            ));
+        },
+    };
+    Ok(ast::Value::Bool(result))
+}
+
+/// Evaluate a range boundary predicate: `-|-` (adjacent), `&<` (does not extend to the right of), or
+/// `&>` (does not extend to the left of), as BOOL. A NULL operand yields NULL; operands of different
+/// element kinds are a loud error, as in [`apply_range_strict`].
+fn apply_range_bound_predicate(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    use ast::BinaryOp as Op;
+    if matches!(left, ast::Value::Null) || matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    let mismatch = || {
+        Error::InvalidStatement(
+            "range predicate over operands of different element kinds".to_owned(),
+        )
+    };
+    let (ast::Value::Range(a), ast::Value::Range(b)) = (left, right) else {
+        return Err(mismatch());
+    };
+    if a.kind != b.kind {
+        return Err(mismatch());
+    }
+    let result = match op {
+        Op::RangeAdjacent => a.adjacent(b),
+        Op::RangeNotExtendRight => a.not_extend_right_of(b),
+        Op::RangeNotExtendLeft => a.not_extend_left_of(b),
+        // The dispatcher routes only these three operators here.
         _ => {
             return Err(Error::InvalidStatement(
                 "unsupported range predicate".to_owned(),

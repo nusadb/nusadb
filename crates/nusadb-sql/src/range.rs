@@ -348,6 +348,88 @@ impl RangeVal {
         Self::new(self.kind, lower, upper, lower_inc, upper_inc)
     }
 
+    /// The smallest range covering both `self` and `other`, spanning any gap between them — unlike
+    /// [`RangeVal::union`], which has no single-range answer across a gap and returns `None`. It runs
+    /// from the lesser lower bound to the greater upper bound. An empty operand contributes nothing
+    /// (the other range is returned; two empty ranges give the empty range).
+    ///
+    /// Like [`RangeVal::overlaps`], this compares bounds only — the caller guarantees the two ranges
+    /// share an element kind.
+    #[must_use]
+    pub fn merge(&self, other: &Self) -> Self {
+        if self.empty {
+            return other.clone();
+        }
+        if other.empty {
+            return self.clone();
+        }
+        // The lesser lower bound and the greater upper bound — the same picks a union makes, but with
+        // no contiguity requirement.
+        let (lower, lower_inc) = self.lower_bound(other, false);
+        let (upper, upper_inc) = self.upper_bound(other, false);
+        // The merged bounds never cross (a min lower is at or below a max upper), so the build
+        // succeeds; fall back to empty rather than unwrap so a construction quirk can never panic.
+        Self::new(self.kind, lower, upper, lower_inc, upper_inc)
+            .unwrap_or_else(|| Self::empty(self.kind))
+    }
+
+    /// Whether `self` and `other` are adjacent (`-|-`): they touch at exactly one boundary, with no
+    /// overlap and no gap. The touching side has complementary
+    /// inclusivity — one bound includes the shared value, the other excludes it — leaving no common
+    /// point. An empty operand on either side is never adjacent. The caller guarantees the two ranges
+    /// share an element kind.
+    #[must_use]
+    pub fn adjacent(&self, other: &Self) -> bool {
+        if self.empty || other.empty {
+            return false;
+        }
+        bounds_touch(
+            self.upper.as_ref(),
+            self.upper_inc,
+            other.lower.as_ref(),
+            other.lower_inc,
+        ) || bounds_touch(
+            other.upper.as_ref(),
+            other.upper_inc,
+            self.lower.as_ref(),
+            self.lower_inc,
+        )
+    }
+
+    /// Whether `self` does not extend to the right of `other` (`&<`): `self`'s upper bound is at or
+    /// below `other`'s. An empty operand on either side yields `false`, matching the reference engine.
+    /// The caller guarantees the two ranges share an element kind.
+    #[must_use]
+    pub fn not_extend_right_of(&self, other: &Self) -> bool {
+        if self.empty || other.empty {
+            return false;
+        }
+        cmp_upper(
+            self.upper.as_ref(),
+            self.upper_inc,
+            other.upper.as_ref(),
+            other.upper_inc,
+        )
+        .is_le()
+    }
+
+    /// Whether `self` does not extend to the left of `other` (`&>`): `self`'s lower bound is at or
+    /// above `other`'s. An empty operand on either side yields `false`, matching the reference engine.
+    /// The caller guarantees the two ranges share an element kind.
+    #[must_use]
+    pub fn not_extend_left_of(&self, other: &Self) -> bool {
+        if self.empty || other.empty {
+            return false;
+        }
+        cmp_lower(
+            self.lower.as_ref(),
+            self.lower_inc,
+            other.lower.as_ref(),
+            other.lower_inc,
+        )
+        .is_ge()
+    }
+
     /// Whether `self` lies entirely to the left of `other` with no point in common (`<<`). An empty
     /// operand on either side is never strictly left of anything. The caller guarantees the two ranges
     /// share an element kind.
@@ -1172,6 +1254,74 @@ mod tests {
             fmt(int("[1,10)").difference(&int("(,5)"))),
             Some("[5,10)".into())
         );
+    }
+
+    #[test]
+    fn merge_spans_gaps_overlaps_and_empty() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        let num = |s: &str| parse(s, RangeKind::Num).expect("numrange");
+        // A gap is spanned (unlike `union`, which has no single-range answer): [1,15).
+        assert_eq!(int("[1,5)").merge(&int("[10,15)")).format(), "[1,15)");
+        assert_eq!(int("[10,15)").merge(&int("[1,5)")).format(), "[1,15)");
+        // An overlap merges to the outer bounds.
+        assert_eq!(int("[1,10)").merge(&int("[5,15)")).format(), "[1,15)");
+        assert_eq!(
+            num("[1.0,5.0)").merge(&num("[10.0,15.0)")).format(),
+            "[1.0,15.0)"
+        );
+        // An empty operand contributes nothing; two empties give empty.
+        let empty = RangeVal::empty(RangeKind::Int);
+        assert_eq!(int("[1,5)").merge(&empty).format(), "[1,5)");
+        assert_eq!(empty.merge(&int("[1,5)")).format(), "[1,5)");
+        assert!(empty.merge(&empty).empty);
+        // Unbounded ends widen the merge to the outer infinity on that side.
+        assert_eq!(int("(,5)").merge(&int("[10,)")).format(), "(,)");
+    }
+
+    #[test]
+    fn adjacent_touches_but_never_overlaps_or_gaps() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        let num = |s: &str| parse(s, RangeKind::Num).expect("numrange");
+        // Touch at one boundary: adjacent. A gap or an overlap: not.
+        assert!(int("[1,5)").adjacent(&int("[5,10)")));
+        assert!(int("[5,10)").adjacent(&int("[1,5)"))); // symmetric
+        assert!(!int("[1,5)").adjacent(&int("[6,10)"))); // gap (discrete)
+        assert!(!int("[1,10)").adjacent(&int("[5,15)"))); // overlap
+        // Continuous kind: `[1.0,5.0]` and `(5.0,8.0)` touch at 5.0 with complementary inclusivity.
+        assert!(num("[1.0,5.0]").adjacent(&num("(5.0,8.0)")));
+        assert!(!num("[1.0,5.0)").adjacent(&num("(5.0,8.0)"))); // both exclude 5.0 → gap
+        // Unbounded ends can still be adjacent where the finite sides touch.
+        assert!(int("(,5)").adjacent(&int("[5,)")));
+        // Empty is never adjacent to anything.
+        let empty = RangeVal::empty(RangeKind::Int);
+        assert!(!empty.adjacent(&int("[1,5)")));
+        assert!(!int("[1,5)").adjacent(&empty));
+    }
+
+    #[test]
+    fn not_extend_right_and_left_of() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        // `&<`: self's upper bound at or below other's.
+        assert!(int("[1,10)").not_extend_right_of(&int("[5,20)")));
+        assert!(!int("[1,25)").not_extend_right_of(&int("[5,20)")));
+        assert!(int("[1,10)").not_extend_right_of(&int("[1,10)"))); // equal upper
+        // An unbounded upper of `other` is never exceeded; an unbounded upper of `self` exceeds any
+        // finite upper.
+        assert!(int("[1,10)").not_extend_right_of(&int("[5,)")));
+        assert!(!int("[1,)").not_extend_right_of(&int("[5,20)")));
+        assert!(int("[1,)").not_extend_right_of(&int("[5,)"))); // both +inf
+        // `&>`: self's lower bound at or above other's.
+        assert!(int("[5,20)").not_extend_left_of(&int("[1,10)")));
+        assert!(!int("[0,20)").not_extend_left_of(&int("[1,10)")));
+        assert!(int("[5,20)").not_extend_left_of(&int("(,10)")));
+        assert!(!int("(,20)").not_extend_left_of(&int("[1,10)")));
+        assert!(int("(,20)").not_extend_left_of(&int("(,10)"))); // both -inf
+        // An empty operand on either side makes both predicates false.
+        let empty = RangeVal::empty(RangeKind::Int);
+        assert!(!empty.not_extend_right_of(&int("[1,5)")));
+        assert!(!int("[1,5)").not_extend_right_of(&empty));
+        assert!(!empty.not_extend_left_of(&int("[1,5)")));
+        assert!(!int("[1,5)").not_extend_left_of(&empty));
     }
 
     #[test]

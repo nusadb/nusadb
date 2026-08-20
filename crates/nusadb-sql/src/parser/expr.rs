@@ -1462,6 +1462,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "daterange" => F::DateRange,
         "tsrange" => F::TsRange,
         "tstzrange" => F::TsTzRange,
+        "range_merge" => F::RangeMerge,
         "lower_inc" => F::RangeLowerInc,
         "upper_inc" => F::RangeUpperInc,
         "lower_inf" => F::RangeLowerInf,
@@ -2052,6 +2053,11 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
             // the dialect's infix hook).
             "<<=" => ast::BinaryOp::InetSubnetEq,
             ">>=" => ast::BinaryOp::InetSupernetEq,
+            // Range adjacency `-|-` and not-extend `&<` / `&>` (fused from their multi-token forms
+            // — `-` `|` `-`, `&` `<`, `&` `>` — by the dialect's infix hook).
+            "-|-" => ast::BinaryOp::RangeAdjacent,
+            "&<" => ast::BinaryOp::RangeNotExtendRight,
+            "&>" => ast::BinaryOp::RangeNotExtendLeft,
             other => return unsupported(&format!("binary operator `{other}`")),
         },
         // Full-text search match `@@` (F1).

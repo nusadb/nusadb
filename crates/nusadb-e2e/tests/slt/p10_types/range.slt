@@ -331,6 +331,137 @@ SELECT 1 + 2, 5 << 2, '192.168.1.5'::inet << '192.168.1.0/24'::inet,
 3 20 1 1 1
 
 # ---------------------------------------------------------------------------
+# Boundary operators: `-|-` adjacent, `&<` does-not-extend-right, `&>` does-not-extend-left.
+# ---------------------------------------------------------------------------
+
+# Adjacent `-|-`: true only when the two touch at one boundary with no overlap and no gap. [1,5) and
+# [5,10) touch; a gap (a discrete gap at 5) or an overlap is false. Symmetric.
+query IIII
+SELECT '[1,5)'::int4range -|- '[5,10)'::int4range, '[1,5)'::int4range -|- '[6,10)'::int4range,
+       '[1,10)'::int4range -|- '[5,15)'::int4range, '[5,10)'::int4range -|- '[1,5)'::int4range
+----
+1 0 0 1
+
+# A continuous kind decides adjacency by inclusivity at the shared value: `[1,5]` touches `(5,8)` (one
+# includes 5, the other excludes it), but two exclusive ends at 5 leave a gap.
+query III
+SELECT numrange(1.0,5.0) -|- numrange(5.0,8.0), '[1.0,5.0]'::numrange -|- '(5.0,8.0)'::numrange,
+       '(1.0,5.0)'::numrange -|- '(5.0,8.0)'::numrange
+----
+1 1 0
+
+# Unbounded sides are still adjacent where the finite ends touch; an empty operand is never adjacent.
+query IIII
+SELECT '(,5)'::int4range -|- '[5,)'::int4range, 'empty'::int4range -|- '[1,5)'::int4range,
+       '[1,5)'::int4range -|- 'empty'::int4range, 'empty'::int4range -|- 'empty'::int4range
+----
+1 0 0 0
+
+# `&<` does not extend to the right of: the left upper bound is at or below the right's — including
+# equal uppers. An unbounded right upper is never exceeded; an unbounded left upper exceeds any finite.
+query IIIII
+SELECT '[1,10)'::int4range &< '[5,20)'::int4range, '[1,25)'::int4range &< '[5,20)'::int4range,
+       '[1,10)'::int4range &< '[1,10)'::int4range, '[1,10)'::int4range &< '[5,)'::int4range,
+       '[1,)'::int4range &< '[5,20)'::int4range
+----
+1 0 1 1 0
+
+# `&>` does not extend to the left of: the left lower bound is at or above the right's. An unbounded
+# right lower is never undercut; an unbounded left lower undercuts any finite.
+query IIII
+SELECT '[5,20)'::int4range &> '[1,10)'::int4range, '[0,20)'::int4range &> '[1,10)'::int4range,
+       '[5,20)'::int4range &> '(,10)'::int4range, '(,20)'::int4range &> '[1,10)'::int4range
+----
+1 0 1 0
+
+# Both boundary predicates hold on numeric ranges too.
+query II
+SELECT numrange(1.0,10.0) &< numrange(5.0,20.0), numrange(5.0,20.0) &> numrange(1.0,10.0)
+----
+1 1
+
+# An empty operand on either side makes `&<` and `&>` false — matching the reference engine.
+query IIII
+SELECT 'empty'::int4range &< '[1,5)'::int4range, '[1,5)'::int4range &< 'empty'::int4range,
+       'empty'::int4range &> '[1,5)'::int4range, '[1,5)'::int4range &> 'empty'::int4range
+----
+0 0 0 0
+
+# A bare string literal beside a boundary operator is unambiguous (range/range only) and coerces to
+# the range kind, on either side — as it does beside `&&`.
+query III
+SELECT '[1,5)'::int4range -|- '[5,10)', '[1,5)' -|- '[5,10)'::int4range,
+       '[1,10)'::int4range &< '[5,20)'
+----
+1 1 1
+
+# A NULL operand yields NULL for every boundary operator, not an error or a wrong value.
+query III
+SELECT NULL::int4range -|- '[1,5)'::int4range, '[1,5)'::int4range &< NULL::int4range,
+       NULL::int4range &> '[1,5)'::int4range
+----
+NULL NULL NULL
+
+# Mixing element kinds under a boundary operator is a type error, like the other range operators.
+statement error
+SELECT '[1,10)'::int4range -|- '[1.5,3.5)'::numrange
+
+statement error
+SELECT '[1,10)'::int4range &< '[1.5,3.5)'::numrange
+
+statement error
+SELECT '[1,10)'::int4range &> '[1.5,3.5)'::numrange
+
+# ---------------------------------------------------------------------------
+# range_merge(range, range): the smallest range covering both, spanning any gap.
+# ---------------------------------------------------------------------------
+
+# Unlike `+`, `range_merge` spans a gap; over an overlap it is the outer bounds.
+query TT
+SELECT range_merge('[1,5)'::int4range, '[10,15)'::int4range),
+       range_merge('[1,10)'::int4range, '[5,15)'::int4range)
+----
+[1,15)  [1,15)
+
+# An empty operand contributes nothing (the other range is returned); two empties give the empty range.
+query TTT
+SELECT range_merge('[1,5)'::int4range, 'empty'::int4range),
+       range_merge('empty'::int4range, '[1,5)'::int4range),
+       range_merge('empty'::int4range, 'empty'::int4range)
+----
+[1,5)  [1,5)  empty
+
+# It works across kinds and unbounded ends, and propagates a NULL operand.
+query TTT
+SELECT range_merge(numrange(1.0,5.0), numrange(10.0,15.0)),
+       range_merge('(,5)'::int4range, '[10,)'::int4range),
+       range_merge(NULL::int4range, '[1,5)'::int4range)
+----
+[1.0,15.0)  (,)  NULL
+
+# Mixing element kinds under range_merge is a type error.
+statement error
+SELECT range_merge('[1,5)'::int4range, '[1.5,3.5)'::numrange)
+
+# The tokens the boundary operators build on keep their old meanings: integer subtraction, comparison,
+# bitwise `&`/`|`, integer shift, and the existing range `<<`/`+`/`&&` are all unchanged.
+query IIIII
+SELECT 1 + 2, 5 - 2, 5 << 2, 12 & 10, 12 | 3
+----
+3 3 20 8 15
+
+query IIII
+SELECT 1 < 2, 8 > 3, '{1,2,3}'::int[] && '{3,4}'::int[], '{1,2}'::int[] && '{3,4}'::int[]
+----
+1 1 1 0
+
+query ITI
+SELECT '[1,5)'::int4range << '[10,20)'::int4range, '[1,10)'::int4range + '[5,15)'::int4range,
+       '[1,10)'::int4range && '[5,20)'::int4range
+----
+1  [1,15)  1
+
+# ---------------------------------------------------------------------------
 # Accessors: lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
 # ---------------------------------------------------------------------------
 

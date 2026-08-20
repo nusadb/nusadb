@@ -181,18 +181,7 @@ impl Dialect for NusaParserDialect {
         // existing comparison changes meaning. Emitting a `Custom` operator lets the converter map
         // each to its distance op.
         if let Some((symbol, tokens)) = recognize_vector_distance_op(parser) {
-            for _ in 0..tokens {
-                parser.next_token();
-            }
-            return Some(
-                parser
-                    .parse_subexpr(precedence)
-                    .map(|right| sql::Expr::BinaryOp {
-                        left: Box::new(expr.clone()),
-                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
-                        right: Box::new(right),
-                    }),
-            );
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
         }
         // Geometric predicate operators `?||` (parallel), `?-|` (perpendicular) and `?#`
         // (intersects). Like the JSON key-existence operators below they begin with the `?`
@@ -203,18 +192,7 @@ impl Dialect for NusaParserDialect {
         // (whose second token is a lone `Pipe`/`Ampersand`, never `StringConcat`) fall through here
         // untouched.
         if let Some((symbol, tokens)) = recognize_geom_predicate(parser) {
-            for _ in 0..tokens {
-                parser.next_token();
-            }
-            return Some(
-                parser
-                    .parse_subexpr(precedence)
-                    .map(|right| sql::Expr::BinaryOp {
-                        left: Box::new(expr.clone()),
-                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
-                        right: Box::new(right),
-                    }),
-            );
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
         }
         // JSON key-existence operators `?` / `?|` / `?&`. The tokenizer only fuses these into
         // `Question`/`QuestionPipe`/`QuestionAnd` for a dialect that enables geometric types —
@@ -223,35 +201,13 @@ impl Dialect for NusaParserDialect {
         // spelling `convert_placeholder` refuses: NusaDB's placeholders are `$1`, `$2`, …), so
         // recognizing it here as an infix operator takes nothing away.
         if let Some((symbol, tokens)) = recognize_json_exists_op(parser) {
-            for _ in 0..tokens {
-                parser.next_token();
-            }
-            return Some(
-                parser
-                    .parse_subexpr(precedence)
-                    .map(|right| sql::Expr::BinaryOp {
-                        left: Box::new(expr.clone()),
-                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
-                        right: Box::new(right),
-                    }),
-            );
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
         }
         // Geometric same-as `~=`. The tokenizer emits `~` (`Tilde`) then an adjacent `=` (`Eq`);
         // recognize that pair here and emit a `Custom("~=")` operator the converter maps to the
         // geometric same-as. A bare `~` (regex match) or a spaced `~ =` falls through untouched.
         if let Some((symbol, tokens)) = recognize_geom_same_as(parser) {
-            for _ in 0..tokens {
-                parser.next_token();
-            }
-            return Some(
-                parser
-                    .parse_subexpr(precedence)
-                    .map(|right| sql::Expr::BinaryOp {
-                        left: Box::new(expr.clone()),
-                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
-                        right: Box::new(right),
-                    }),
-            );
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
         }
         // INET subnet-or-equal `<<=` / supernet-or-equal `>>=`. The tokenizer emits `<<` / `>>`
         // (`ShiftLeft` / `ShiftRight`) followed by an adjacent `=` (`Eq`); recognize that pair here
@@ -259,18 +215,22 @@ impl Dialect for NusaParserDialect {
         // A bare `<<` / `>>` (integer bit shift or the INET strict subnet/supernet predicate) and a
         // spaced `<< =` fall through untouched.
         if let Some((symbol, tokens)) = recognize_inet_subnet_eq(parser) {
-            for _ in 0..tokens {
-                parser.next_token();
-            }
-            return Some(
-                parser
-                    .parse_subexpr(precedence)
-                    .map(|right| sql::Expr::BinaryOp {
-                        left: Box::new(expr.clone()),
-                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
-                        right: Box::new(right),
-                    }),
-            );
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
+        }
+        // Range adjacency `-|-`. The tokenizer emits `-` (`Minus`), a directly-adjacent `|` (`Pipe`),
+        // then a directly-adjacent `-` (`Minus`); recognize that triple here and emit a `Custom("-|-")`
+        // the converter maps to the range adjacency operator. A bare `-` (subtraction), a spaced
+        // `- | -`, and `a -| b` (only two of the three) fall through untouched.
+        if let Some((symbol, tokens)) = recognize_range_adjacent(parser) {
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
+        }
+        // Range not-extend `&<` (does not extend to the right of) / `&>` (does not extend to the left
+        // of). The tokenizer emits `&` (`Ampersand`) then a directly-adjacent `<` (`Lt`) / `>` (`Gt`);
+        // recognize that pair here and emit a `Custom("&<")` / `Custom("&>")` the converter maps to the
+        // range predicate. Array overlap `&&` tokenizes as a single `Overlap` (never two `Ampersand`s),
+        // so it is untouched, as are a bare `&` (integer/bit/INET AND) and a spaced `& <`.
+        if let Some((symbol, tokens)) = recognize_range_not_extend(parser) {
+            return Some(emit_custom_infix(parser, expr, precedence, symbol, tokens));
         }
         // `#` — the reference engine's integer XOR. sqlparser's own infix table gates the Sharp
         // token behind a dialect TypeId this wrapper does not report (it must keep reporting
@@ -327,9 +287,40 @@ impl Dialect for NusaParserDialect {
             Token::ShiftLeft | Token::ShiftRight if recognize_inet_subnet_eq(parser).is_some() => {
                 Some(Ok(25))
             },
+            // Range adjacency `-|-` — the `-` `|` `-` triple sits at the comparison tier so
+            // `a -|- b` binds like an equality. A bare `-` keeps its default `PlusMinus` precedence
+            // (fall through to `None`) so ordinary subtraction is unaffected.
+            Token::Minus if recognize_range_adjacent(parser).is_some() => Some(Ok(25)),
+            // Range not-extend `&<` / `&>` — the `&` `<` / `&` `>` pair sits at the comparison tier so
+            // `a &< b` binds like an equality. A bare `&` keeps its default precedence (fall through
+            // to `None`).
+            Token::Ampersand if recognize_range_not_extend(parser).is_some() => Some(Ok(25)),
             _ => None,
         }
     }
+}
+
+/// Consume `tokens` tokens for a recognized fused operator and build the infix `Custom(symbol)`
+/// application over `expr` and the right operand parsed at `precedence`. Shared by every
+/// `recognize_*` hook in [`NusaParserDialect::parse_infix`], which differ only in the symbol and the
+/// token count they detect.
+fn emit_custom_infix(
+    parser: &mut Parser,
+    expr: &sql::Expr,
+    precedence: u8,
+    symbol: &str,
+    tokens: usize,
+) -> Result<sql::Expr, sqlparser::parser::ParserError> {
+    for _ in 0..tokens {
+        parser.next_token();
+    }
+    parser
+        .parse_subexpr(precedence)
+        .map(|right| sql::Expr::BinaryOp {
+            left: Box::new(expr.clone()),
+            op: sql::BinaryOperator::Custom(symbol.to_owned()),
+            right: Box::new(right),
+        })
 }
 
 /// Recognize the INET subnet-or-equal `<<=` / supernet-or-equal `>>=` operators at the current
@@ -393,6 +384,46 @@ fn recognize_geom_predicate(parser: &Parser) -> Option<(&'static str, usize)> {
             (matches!(pipe.token, Token::Pipe) && after.span.end == pipe.span.start)
                 .then_some(("?-|", 3))
         },
+        _ => None,
+    }
+}
+
+/// Recognize the range adjacency operator `-|-` at the current parser position, where the next token
+/// is a `-` (`Token::Minus`). Returns the canonical symbol and the number of tokens it spans, or
+/// `None` when the tokens after it are not a directly-adjacent `|` (`Token::Pipe`) then `-`
+/// (`Token::Minus`) — so a bare `-` (subtraction), a spaced `- | -`, and `a -| b` are left untouched.
+fn recognize_range_adjacent(parser: &Parser) -> Option<(&'static str, usize)> {
+    let minus = parser.peek_token_ref();
+    if minus.token != Token::Minus {
+        return None;
+    }
+    let pipe = parser.peek_nth_token_ref(1);
+    if !matches!(pipe.token, Token::Pipe) || minus.span.end != pipe.span.start {
+        return None;
+    }
+    let minus2 = parser.peek_nth_token_ref(2);
+    (matches!(minus2.token, Token::Minus) && pipe.span.end == minus2.span.start)
+        .then_some(("-|-", 3))
+}
+
+/// Recognize the range not-extend operators `&<` (does not extend to the right of) / `&>` (does not
+/// extend to the left of) at the current parser position, where the next token is a `&`
+/// (`Token::Ampersand`). Returns the canonical symbol and the number of tokens it spans, or `None`
+/// when the token after `&` is not a directly-adjacent `<` (`Token::Lt`) / `>` (`Token::Gt`) — so a
+/// bare `&` (integer/bit/INET AND), the array-overlap `&&` (a single `Token::Overlap`), and a spaced
+/// `& <` are left untouched.
+fn recognize_range_not_extend(parser: &Parser) -> Option<(&'static str, usize)> {
+    let amp = parser.peek_token_ref();
+    if amp.token != Token::Ampersand {
+        return None;
+    }
+    let after = parser.peek_nth_token_ref(1);
+    if amp.span.end != after.span.start {
+        return None;
+    }
+    match after.token {
+        Token::Lt => Some(("&<", 2)),
+        Token::Gt => Some(("&>", 2)),
         _ => None,
     }
 }
