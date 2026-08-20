@@ -4588,6 +4588,8 @@ pub(super) fn check_binary(
         Op::VectorNegInnerProduct => check_vector_distance("<#>", left, right),
         Op::VectorL1Distance => check_vector_distance("<+>", left, right),
         Op::TsMatch => check_ts_match(left, right),
+        // `@?` — a JSON document on the left, a jsonpath text on the right, yielding `BOOL`.
+        Op::JsonPathExists => check_json_path_exists(left, right),
         // `~=` geometric same-as — both operands the same geometric kind, yielding `BOOL`.
         Op::GeomSameAs => check_geom_same_as(left, right),
         // `?||` / `?-|` / `?#` geometric predicates — `lseg`↔`lseg` or `line`↔`line`, yielding `BOOL`.
@@ -4788,6 +4790,33 @@ fn check_geom_containment(
             context: "geometric containment (`@>` / `<@`)".to_owned(),
             expected: container,
             found: element,
+        })
+    }
+}
+
+/// `json @? jsonpath` — a JSON (or text) document on the left, a jsonpath text on the right,
+/// yielding `BOOL`.
+pub(super) fn check_json_path_exists(
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    let text_like = |t: ColumnType| {
+        matches!(
+            t,
+            ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_)
+        )
+    };
+    if (left == ColumnType::Json || text_like(left)) && text_like(right) {
+        Ok(ColumnType::Bool)
+    } else {
+        Err(Error::TypeMismatch {
+            context: "`@?` json path exists".to_owned(),
+            expected: ColumnType::Json,
+            found: if left == ColumnType::Json || text_like(left) {
+                right
+            } else {
+                left
+            },
         })
     }
 }

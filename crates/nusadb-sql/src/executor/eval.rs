@@ -5304,6 +5304,8 @@ fn apply_binary(
         },
         Op::VectorL1Distance => vector_distance_op("<+>", crate::vector::l1_distance, left, right),
         Op::TsMatch => ts_match_op(left, right),
+        // `@?` — does the right jsonpath return any item for the left JSON value?
+        Op::JsonPathExists => json_path_exists_op(left, right),
         // `~=` geometric same-as.
         Op::GeomSameAs => Ok(geom_same_as_op(left, right)),
         // `?||` / `?-|` / `?#` geometric predicates.
@@ -6298,6 +6300,21 @@ fn json_concat_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, E
         },
         |doc| Ok(ast::Value::Json(doc)),
     )
+}
+
+/// Evaluate `json @? jsonpath` — whether the right jsonpath returns any item for the left JSON
+/// value, as `BOOL`. A `NULL` operand yields `NULL`; an unsupported or invalid path is a loud
+/// runtime error, exactly like `jsonb_path_exists`.
+fn json_path_exists_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    let (ast::Value::Json(doc) | ast::Value::Text(doc)) = left else {
+        return Ok(ast::Value::Null);
+    };
+    let ast::Value::Text(path) = right else {
+        return Ok(ast::Value::Null);
+    };
+    let matches =
+        crate::json::path_query(doc, path).map_err(|why| jsonpath_error("@?", why, doc, path))?;
+    Ok(ast::Value::Bool(!matches.is_empty()))
 }
 
 /// Evaluate JSON `-`: remove an object member / array element by key (`TEXT`), an array element by

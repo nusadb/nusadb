@@ -1739,6 +1739,9 @@ pub enum BinaryOp {
     /// Full-text `@@` — does the left `tsvector` (canonical text form) match the right `tsquery`
     /// (text form), as `BOOL` (F1)? Either operand order is accepted, like the reference engine.
     TsMatch,
+    /// JSON path exists `@?` — does the right `jsonpath` return any item for the left JSON value, as
+    /// `BOOL`? An unsupported or invalid path is a loud runtime error, like `jsonb_path_exists`.
+    JsonPathExists,
     /// Geometric same-as `~=` — are two geometric values (both `point` or both `box`) equal by
     /// their coordinates, as `BOOL`?
     GeomSameAs,

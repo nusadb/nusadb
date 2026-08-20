@@ -624,3 +624,9 @@ query T
 SELECT REGEXP_LIKE(JSONB_PRETTY(JSON '{"a":1}'), CHR(10) || '    "a": 1')
 ----
 1
+
+# The @? operator tests whether a jsonpath returns any item for the JSON value.
+query III
+SELECT '{"a":1,"b":{"c":2}}'::JSONB @? '$.a', '{"a":1}'::JSONB @? '$.x', '{"a":{"c":2}}'::JSONB @? '$.a.c'
+----
+1 0 1

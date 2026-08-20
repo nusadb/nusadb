@@ -2081,6 +2081,8 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
         },
         // Full-text search match `@@` (F1).
         B::AtAt => ast::BinaryOp::TsMatch,
+        // JSON path exists `@?`.
+        B::AtQuestion => ast::BinaryOp::JsonPathExists,
         other => return unsupported(&format!("binary operator `{other}`")),
     };
     Ok(mapped)
