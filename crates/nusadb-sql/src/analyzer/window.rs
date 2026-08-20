@@ -19,11 +19,7 @@ pub(super) fn window_default_name(func: &ast::WindowFunc) -> String {
     use ast::{AggregateFunc as A, WindowFunc as W};
     match func {
         W::RowNumber => "row_number",
-        W::Rank => "rank",
-        W::DenseRank => "dense_rank",
         W::Ntile => "ntile",
-        W::CumeDist => "cume_dist",
-        W::PercentRank => "percent_rank",
         W::Lag => "lag",
         W::Lead => "lead",
         W::FirstValue => "first_value",
@@ -39,6 +35,12 @@ pub(super) fn window_default_name(func: &ast::WindowFunc) -> String {
         W::Aggregate(A::PercentileCont) => "percentile_cont",
         W::Aggregate(A::PercentileDisc) => "percentile_disc",
         W::Aggregate(A::Mode) => "mode",
+        // The hypothetical-set aggregates share a name with the same-spelled ranking window
+        // functions; one arm each keeps the mapping unambiguous (and clippy's same-arm lint quiet).
+        W::Rank | W::Aggregate(A::Rank) => "rank",
+        W::DenseRank | W::Aggregate(A::DenseRank) => "dense_rank",
+        W::PercentRank | W::Aggregate(A::PercentRank) => "percent_rank",
+        W::CumeDist | W::Aggregate(A::CumeDist) => "cume_dist",
         // ARRAY_AGG and the statistical aggregates are not wired as window functions; named
         // defensively (the parser's OVER path never produces them).
         W::Aggregate(A::ArrayAgg) => "array_agg",

@@ -401,6 +401,21 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
             call.ordered_set_descending,
             acc.ordered_values,
         ),
+        // Hypothetical-set aggregates: rank the constant direct argument against the collected
+        // ordered set. The argument is a per-group constant (resolved against an empty scope), so it
+        // evaluates without a row; a stray column reference errors loudly here rather than panics.
+        F::Rank | F::DenseRank | F::PercentRank | F::CumeDist => {
+            let arg = call.hypothetical_arg.as_ref().ok_or_else(|| {
+                Error::Internal("hypothetical-set aggregate requires a direct argument".to_owned())
+            })?;
+            let hypothetical = eval::eval(arg, &Row::new())?;
+            finalize_hypothetical_set(
+                call.func,
+                &hypothetical,
+                call.ordered_set_descending,
+                &acc.ordered_values,
+            )
+        },
         // ARRAY_AGG: the collected values as an array; an empty group (nothing seen) → NULL.
         // An `ORDER BY` clause reorders the values before they form the array.
         F::ArrayAgg => {
@@ -654,6 +669,84 @@ fn finalize_ordered_set(
                 i = j;
             }
             values.get(best_start).cloned().unwrap_or(ast::Value::Null)
+        },
+        _ => ast::Value::Null,
+    }
+}
+
+/// Compute a hypothetical-set aggregate (`RANK` / `DENSE_RANK` / `PERCENT_RANK` / `CUME_DIST` in
+/// their `WITHIN GROUP (ORDER BY key)` form) — report where the constant hypothetical value `arg`
+/// would rank if inserted into the group's collected non-NULL ordering `values`.
+///
+/// Let `n = values.len()`, and read `≺`/`≼` under the `ORDER BY` direction (`descending` flips the
+/// sense): `k ≺ arg` is `k < arg` ascending, `k > arg` descending; `k ≼ arg` adds equality.
+///
+/// - `RANK` = `1 + count(k ≺ arg)` (rank with gaps) — `BIGINT`.
+/// - `DENSE_RANK` = `1 + count(distinct k ≺ arg)` (rank without gaps) — `BIGINT`.
+/// - `PERCENT_RANK` = `(rank − 1) / n`, i.e. `count(k ≺ arg) / n`, and `0` when `n = 0` — `FLOAT`.
+/// - `CUME_DIST` = `(count(k ≼ arg) + 1) / (n + 1)` — `FLOAT`.
+///
+/// An empty group is not special-cased: `n = 0` yields `RANK`/`DENSE_RANK` `1`, `PERCENT_RANK` `0`,
+/// and `CUME_DIST` `1` — matching the reference oracle.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the group size and rank counts are small non-negative counts widened to f64 ratios"
+)]
+fn finalize_hypothetical_set(
+    func: ast::AggregateFunc,
+    arg: &ast::Value,
+    descending: bool,
+    values: &[ast::Value],
+) -> ast::Value {
+    use std::cmp::Ordering;
+
+    use crate::ast::AggregateFunc as F;
+    // Direction-aware "k strictly precedes the hypothetical arg" in the ORDER BY ordering.
+    let precedes = |k: &ast::Value| match eval::compare(k, arg) {
+        Ordering::Less => !descending,
+        Ordering::Greater => descending,
+        Ordering::Equal => false,
+    };
+    // Direction-aware "k precedes-or-ties the hypothetical arg".
+    let precedes_or_ties = |k: &ast::Value| match eval::compare(k, arg) {
+        Ordering::Equal => true,
+        Ordering::Less => !descending,
+        Ordering::Greater => descending,
+    };
+    let n = values.len();
+    match func {
+        // RANK: 1 + how many values sort strictly before the hypothetical one.
+        F::Rank => {
+            let before = values.iter().filter(|k| precedes(k)).count();
+            ast::Value::Int(i64::try_from(before).unwrap_or(i64::MAX).saturating_add(1))
+        },
+        // DENSE_RANK: 1 + how many *distinct* values sort strictly before it. Equal values are
+        // adjacent after sorting, so a dedup collapses each run to one.
+        F::DenseRank => {
+            let mut distinct: Vec<ast::Value> =
+                values.iter().filter(|k| precedes(k)).cloned().collect();
+            distinct.sort_by(eval::compare);
+            distinct.dedup_by(|a, b| eval::compare(a, b) == Ordering::Equal);
+            ast::Value::Int(
+                i64::try_from(distinct.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1),
+            )
+        },
+        // PERCENT_RANK: (rank − 1) / n = count(strictly before) / n; 0 for an empty group.
+        F::PercentRank => {
+            let before = values.iter().filter(|k| precedes(k)).count();
+            let pr = if n == 0 {
+                0.0
+            } else {
+                before as f64 / n as f64
+            };
+            ast::Value::Float(pr)
+        },
+        // CUME_DIST: (count(≼ arg) + 1) / (n + 1).
+        F::CumeDist => {
+            let le = values.iter().filter(|k| precedes_or_ties(k)).count();
+            ast::Value::Float((le as f64 + 1.0) / (n as f64 + 1.0))
         },
         _ => ast::Value::Null,
     }
@@ -1516,9 +1609,15 @@ pub(crate) fn fold_value(
                 acc.bit_fold = Some(acc.bit_fold.unwrap_or(0) ^ i);
             }
         },
-        // Ordered-set aggregates collect every non-NULL ordering value; the
-        // percentile/mode is computed from the sorted set at finalization.
-        F::PercentileCont | F::PercentileDisc | F::Mode => {
+        // Ordered-set and hypothetical-set aggregates collect every non-NULL ordering value; the
+        // percentile/mode or the hypothetical rank is computed from the set at finalization.
+        F::PercentileCont
+        | F::PercentileDisc
+        | F::Mode
+        | F::Rank
+        | F::DenseRank
+        | F::PercentRank
+        | F::CumeDist => {
             acc.ordered_values.push(value);
         },
         // ARRAY_AGG / JSONB_AGG are handled in accumulate_row's outer match (they keep NULLs, so they
@@ -1690,8 +1789,8 @@ mod tests {
 
     use super::distinct_hash;
     use super::{
-        Acc, call_is_parallel_mergeable, finalize_aggregate, fold_aggregates, fold_value,
-        merge_acc, sliding_window_aggregate,
+        Acc, call_is_parallel_mergeable, finalize_aggregate, finalize_hypothetical_set,
+        fold_aggregates, fold_value, merge_acc, sliding_window_aggregate,
     };
     use crate::ast::Value as V;
     use crate::executor::eval;
@@ -1699,6 +1798,85 @@ mod tests {
     use crate::numeric::Decimal;
     use crate::planner::AggregateCall;
     use nusadb_core::ColumnType;
+
+    /// Hypothetical-set rank math over a small ordered set, matching the reference oracle:
+    /// `rank`/`dense_rank` count how many (distinct) values precede the hypothetical argument,
+    /// `percent_rank`/`cume_dist` are the corresponding ratios, and `DESC` flips "precede".
+    #[test]
+    fn hypothetical_set_ranks_the_direct_argument() {
+        use crate::ast::AggregateFunc as F;
+        let ints = |xs: &[i64]| xs.iter().map(|&i| V::Int(i)).collect::<Vec<_>>();
+        let hs = ints(&[1, 2, 3, 4, 5, 6]);
+        let ties = ints(&[1, 3, 3, 5]);
+
+        // rank(4) = 1 + count(<4) = 4; dense_rank matches (no ties among 1..6).
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &V::Int(4), false, &hs),
+            V::Int(4)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::DenseRank, &V::Int(4), false, &hs),
+            V::Int(4)
+        );
+        // percent_rank(4) = 3/6 = 0.5; cume_dist(4) = (4 + 1)/(6 + 1) = 5/7.
+        assert_eq!(
+            finalize_hypothetical_set(F::PercentRank, &V::Int(4), false, &hs),
+            V::Float(0.5)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &V::Int(4), false, &hs),
+            V::Float(5.0 / 7.0)
+        );
+        // DESC flips "before": rank(4) DESC = 1 + count(>4) = 3.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &V::Int(4), true, &hs),
+            V::Int(3)
+        );
+
+        // Argument absent from the set: above the max ASC ranks last; below the min ranks first.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &V::Int(7), false, &hs),
+            V::Int(7)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &V::Int(0), false, &hs),
+            V::Int(1)
+        );
+
+        // Ties (1,3,3,5): rank(3) = 2, dense_rank(3) = 2, cume_dist(3) counts ties as <= : 4/5.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &V::Int(3), false, &ties),
+            V::Int(2)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::DenseRank, &V::Int(3), false, &ties),
+            V::Int(2)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &V::Int(3), false, &ties),
+            V::Float(0.8)
+        );
+        // dense_rank(4) over ties: distinct(<4) = {1,3} = 2, so 3.
+        assert_eq!(
+            finalize_hypothetical_set(F::DenseRank, &V::Int(4), false, &ties),
+            V::Int(3)
+        );
+
+        // Empty group (n = 0): rank/dense_rank = 1, percent_rank = 0, cume_dist = 1.
+        let empty: Vec<V> = Vec::new();
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &V::Int(4), false, &empty),
+            V::Int(1)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::PercentRank, &V::Int(4), false, &empty),
+            V::Float(0.0)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &V::Int(4), false, &empty),
+            V::Float(1.0)
+        );
+    }
 
     /// The hash-index invariant the streamed group-by relies on (A-PERF.AGG1): any two keys
     /// [`crate::executor::ops::group_keys_equal`] calls equal must land in the same hash bucket.
@@ -1944,6 +2122,7 @@ mod tests {
             distinct: false,
             fraction: None,
             ordered_set_descending: false,
+            hypothetical_arg: None,
             filter: None,
             separator: None,
             arg2: None,

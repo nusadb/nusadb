@@ -177,3 +177,139 @@ SELECT grp, count(DISTINCT (grp, v)) FROM m GROUP BY grp
 ----
 a  3
 b  2
+
+# --- Hypothetical-set aggregates (WITHIN GROUP) -----------------------------
+# rank/dense_rank/percent_rank/cume_dist rank a hypothetical direct argument against the ordered
+# group. Expected values verified against the reference oracle.
+
+statement ok
+CREATE TABLE hs (x INT)
+
+statement ok
+INSERT INTO hs VALUES (1), (2), (3), (4), (5), (6)
+
+# x = 1..6 (n = 6). rank(4) = 1 + count(x < 4) = 4; dense_rank matches (no ties).
+query II
+SELECT rank(4) WITHIN GROUP (ORDER BY x),
+       dense_rank(4) WITHIN GROUP (ORDER BY x)
+FROM hs
+----
+4  4
+
+# percent_rank(4) = (4 - 1) / 6 = 0.5; cume_dist(4) = (count(x <= 4) + 1) / (6 + 1) = 5/7.
+query RR
+SELECT percent_rank(4) WITHIN GROUP (ORDER BY x),
+       cume_dist(4) WITHIN GROUP (ORDER BY x)
+FROM hs
+----
+0.500  0.714
+
+# DESC reverses "before": rank(4) DESC = 1 + count(x > 4) = 3; cume_dist(4) DESC = (count(x >= 4)+1)/7 = 4/7.
+query IR
+SELECT rank(4) WITHIN GROUP (ORDER BY x DESC),
+       cume_dist(4) WITHIN GROUP (ORDER BY x DESC)
+FROM hs
+----
+3  0.571
+
+# Argument above the max (absent, would sort last ASC): rank = n + 1 = 7; cume_dist = 1; percent_rank = 1.
+query IRR
+SELECT rank(7) WITHIN GROUP (ORDER BY x),
+       cume_dist(7) WITHIN GROUP (ORDER BY x),
+       percent_rank(7) WITHIN GROUP (ORDER BY x)
+FROM hs
+----
+7  1.000  1.000
+
+# Argument below the min: rank = 1.
+query I
+SELECT rank(0) WITHIN GROUP (ORDER BY x) FROM hs
+----
+1
+
+statement ok
+CREATE TABLE ht (x INT)
+
+statement ok
+INSERT INTO ht VALUES (1), (3), (3), (5)
+
+# Ties: x = 1,3,3,5. rank(3) = 1 + count(x < 3) = 2; dense_rank(3) = 1 + distinct(x < 3) = 2.
+query II
+SELECT rank(3) WITHIN GROUP (ORDER BY x),
+       dense_rank(3) WITHIN GROUP (ORDER BY x)
+FROM ht
+----
+2  2
+
+# cume_dist(3) counts ties as <= : (count(x <= 3) + 1)/(4 + 1) = (3 + 1)/5 = 0.8.
+query R
+SELECT cume_dist(3) WITHIN GROUP (ORDER BY x) FROM ht
+----
+0.800
+
+# DESC with ties: rank(3) DESC = 1 + count(x > 3) = 2; cume_dist(3) DESC = (count(x >= 3)+1)/5 = 4/5 = 0.8.
+query IR
+SELECT rank(3) WITHIN GROUP (ORDER BY x DESC),
+       cume_dist(3) WITHIN GROUP (ORDER BY x DESC)
+FROM ht
+----
+2  0.800
+
+# dense_rank(4) over ties: distinct x < 4 = {1,3} = 2, so dense_rank = 3.
+query I
+SELECT dense_rank(4) WITHIN GROUP (ORDER BY x) FROM ht
+----
+3
+
+statement ok
+CREATE TABLE h1 (x INT)
+
+statement ok
+INSERT INTO h1 VALUES (5)
+
+# n = 1. rank(5) = 1 (nothing before), rank(10) = 2 (one value before), percent_rank = 0, cume_dist = 1.
+query IIRR
+SELECT rank(5) WITHIN GROUP (ORDER BY x),
+       rank(10) WITHIN GROUP (ORDER BY x),
+       percent_rank(5) WITHIN GROUP (ORDER BY x),
+       cume_dist(5) WITHIN GROUP (ORDER BY x)
+FROM h1
+----
+1  2  0.000  1.000
+
+statement ok
+CREATE TABLE he (x INT)
+
+# Empty group (n = 0): rank/dense_rank = 1, percent_rank = 0, cume_dist = (0+1)/(0+1) = 1.
+query IIRR
+SELECT rank(4) WITHIN GROUP (ORDER BY x),
+       dense_rank(4) WITHIN GROUP (ORDER BY x),
+       percent_rank(4) WITHIN GROUP (ORDER BY x),
+       cume_dist(4) WITHIN GROUP (ORDER BY x)
+FROM he
+----
+1  1  0.000  1.000
+
+statement ok
+CREATE TABLE hg (g TEXT, x INT)
+
+statement ok
+INSERT INTO hg VALUES ('a', 1), ('a', 2), ('a', 3), ('b', 10), ('b', 20)
+
+# Grouped: group 'a' (1,2,3): rank(5) = 4, cume_dist(5) = (3+1)/(3+1) = 1.
+# group 'b' (10,20): rank(5) = 1, cume_dist(5) = (0+1)/(2+1) = 1/3.
+query TIR rowsort
+SELECT g,
+       rank(5) WITHIN GROUP (ORDER BY x),
+       cume_dist(5) WITHIN GROUP (ORDER BY x)
+FROM hg GROUP BY g
+----
+a  4  1.000
+b  1  0.333
+
+# A hypothetical-set aggregate used as a plain (non-WITHIN-GROUP) call is a loud error.
+statement error
+SELECT rank(4) FROM hs
+
+statement error
+SELECT cume_dist(4) FROM hs

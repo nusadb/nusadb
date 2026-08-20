@@ -2436,6 +2436,7 @@ fn rebase_grouping_call(
         distinct: false,
         fraction: None,
         ordered_set_descending: false,
+        hypothetical_arg: None,
         filter: None,
         separator: None,
         arg2: None,
@@ -2988,14 +2989,21 @@ pub(super) fn analyze_aggregate(
             };
             Ok((Some(typed), result_ty))
         },
-        // Ordered-set aggregates are resolved by `analyze_within_group`, never here.
+        // Ordered-set and hypothetical-set aggregates are resolved by `analyze_within_group`, never
+        // here — a plain (non-WITHIN-GROUP) call is a loud error.
         (
             ast::AggregateFunc::PercentileCont
             | ast::AggregateFunc::PercentileDisc
-            | ast::AggregateFunc::Mode,
+            | ast::AggregateFunc::Mode
+            | ast::AggregateFunc::Rank
+            | ast::AggregateFunc::DenseRank
+            | ast::AggregateFunc::PercentRank
+            | ast::AggregateFunc::CumeDist,
             _,
         ) => Err(Error::InvalidStatement(
-            "PERCENTILE_CONT / PERCENTILE_DISC / MODE require WITHIN GROUP syntax".to_owned(),
+            "PERCENTILE_CONT / PERCENTILE_DISC / MODE / RANK / DENSE_RANK / PERCENT_RANK / \
+             CUME_DIST require WITHIN GROUP syntax"
+                .to_owned(),
         )),
         // GROUPING is a synthetic aggregate created by `rebase_onto_aggregation` from a scalar
         // `GROUPING(...)` call, never type-checked through this path; reject defensively.

@@ -3814,6 +3814,7 @@ pub(super) fn compute_window(rows: &[Row], window: &WindowExpr) -> Result<Vec<as
             distinct: false,
             fraction: None,
             ordered_set_descending: false,
+            hypothetical_arg: None,
             filter: window.filter.clone(),
             separator: None,
             arg2: None,

@@ -610,6 +610,7 @@ pub(super) fn analyze_expr_agg(
                     distinct: *distinct,
                     fraction: None,
                     ordered_set_descending: false,
+                    hypothetical_arg: None,
                     filter: typed_filter,
                     separator,
                     arg2: typed_arg2,
@@ -2898,10 +2899,14 @@ fn analyze_within_group(
         "percentile_cont" => F::PercentileCont,
         "percentile_disc" => F::PercentileDisc,
         "mode" => F::Mode,
+        "rank" => F::Rank,
+        "dense_rank" => F::DenseRank,
+        "percent_rank" => F::PercentRank,
+        "cume_dist" => F::CumeDist,
         other => {
             return Err(Error::FunctionArgs(format!(
                 "ordered-set aggregate `{other}` is not supported (PERCENTILE_CONT / \
-                 PERCENTILE_DISC / MODE only)"
+                 PERCENTILE_DISC / MODE / RANK / DENSE_RANK / PERCENT_RANK / CUME_DIST only)"
             )));
         },
     };
@@ -2916,14 +2921,23 @@ fn analyze_within_group(
     let ordered_set_descending = !order_item.ascending;
     // The ordered value references source rows, not aggregates (no nested aggregate sink).
     let order_value = analyze_expr(&order_item.expr, scope, catalog, None)?;
-    let (fraction, result_ty) = match func {
+    let (fraction, hypothetical_arg, result_ty) = match func {
         F::Mode => {
             if !wg.args.is_empty() {
                 return Err(Error::FunctionArgs(
                     "MODE() takes no direct arguments".to_owned(),
                 ));
             }
-            (None, order_value.ty)
+            (None, None, order_value.ty)
+        },
+        // Hypothetical-set aggregates take exactly one direct argument — a constant hypothetical
+        // value whose type must be comparable with the single ORDER BY key. The executor reports
+        // where that value would rank if inserted into the ordered set. RANK / DENSE_RANK yield a
+        // BIGINT position; PERCENT_RANK / CUME_DIST a FLOAT ratio.
+        F::Rank | F::DenseRank | F::PercentRank | F::CumeDist => {
+            let (arg, result_ty) =
+                analyze_hypothetical_arg(func, &wg.args, order_value.ty, catalog)?;
+            (None, Some(arg), result_ty)
         },
         F::PercentileCont | F::PercentileDisc => {
             let [fraction_expr] = wg.args.as_slice() else {
@@ -2964,7 +2978,7 @@ fn analyze_within_group(
                 );
             }
             let fraction = const_fraction(fraction_expr)?;
-            (Some(fraction), elem_ty)
+            (Some(fraction), None, elem_ty)
         },
         _ => unreachable!("guarded by the func match above"),
     };
@@ -2976,6 +2990,7 @@ fn analyze_within_group(
         distinct: false,
         fraction,
         ordered_set_descending,
+        hypothetical_arg,
         filter: None,
         separator: None,
         arg2: None,
@@ -2987,6 +3002,35 @@ fn analyze_within_group(
         kind: TypedExprKind::AggregateRef(idx),
         ty: result_ty,
     })
+}
+
+/// Analyze the single direct argument of a hypothetical-set aggregate (`RANK` / `DENSE_RANK` /
+/// `PERCENT_RANK` / `CUME_DIST`), returning the typed argument and the aggregate's result type
+/// (`RANK` / `DENSE_RANK` → `INT`, `PERCENT_RANK` / `CUME_DIST` → `FLOAT`). The argument is a
+/// per-group constant, so it resolves against an empty scope — a column reference is a loud error
+/// here rather than a per-row value — and its type must be comparable with the `ORDER BY` key
+/// `order_ty` under the same rule `=`/`<`/`>` use (cross-type numeric included).
+fn analyze_hypothetical_arg(
+    func: ast::AggregateFunc,
+    args: &[ast::Expr],
+    order_ty: ColumnType,
+    catalog: &dyn Catalog,
+) -> Result<(TypedExpr, ColumnType), Error> {
+    use ast::AggregateFunc as F;
+    let [arg_expr] = args else {
+        return Err(Error::FunctionArgs(
+            "RANK / DENSE_RANK / PERCENT_RANK / CUME_DIST take exactly one direct argument"
+                .to_owned(),
+        ));
+    };
+    let arg = analyze_expr(arg_expr, &[], catalog, None)?;
+    check_comparison(order_ty, arg.ty)?;
+    let result_ty = if matches!(func, F::Rank | F::DenseRank) {
+        ColumnType::Int
+    } else {
+        ColumnType::Float
+    };
+    Ok((arg, result_ty))
 }
 
 /// Desugar the array-of-fractions percentile form `PERCENTILE_CONT/DISC(ARRAY[f1, f2, ...]) WITHIN
@@ -3019,6 +3063,7 @@ fn analyze_percentile_array(
             distinct: false,
             fraction: Some(fraction),
             ordered_set_descending,
+            hypothetical_arg: None,
             filter: None,
             separator: None,
             arg2: None,

@@ -408,6 +408,7 @@ mod tests {
             distinct: false,
             fraction: None,
             ordered_set_descending: false,
+            hypothetical_arg: None,
             filter: None,
             separator: None,
             arg2: None,

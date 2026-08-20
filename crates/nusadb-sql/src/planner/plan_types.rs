@@ -2007,6 +2007,12 @@ pub struct AggregateCall {
     /// for `ASC` and for every non-ordered-set aggregate. (`NULLS FIRST/LAST` needs no flag: the
     /// ordered set excludes `NULL` ordering values, so their placement never affects the result.)
     pub ordered_set_descending: bool,
+    /// The hypothetical direct argument of a hypothetical-set aggregate (`RANK` / `DENSE_RANK` /
+    /// `PERCENT_RANK` / `CUME_DIST` in their `WITHIN GROUP (ORDER BY key)` form) — a constant whose
+    /// type matches the single `ORDER BY` key. The executor evaluates it once and reports where it
+    /// would rank in the collected ordered set (`arg` carries the per-row `ORDER BY` value). `None`
+    /// for every other aggregate (including the percentile / `MODE` ordered-set forms).
+    pub hypothetical_arg: Option<TypedExpr>,
     /// `FILTER (WHERE pred)` — a per-row boolean predicate (resolved against the pre-aggregation
     /// scope); a row contributes to this call only when it evaluates to `TRUE`. `None` when
     /// the clause is absent.

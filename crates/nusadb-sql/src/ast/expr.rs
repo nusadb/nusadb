@@ -1420,6 +1420,19 @@ pub enum AggregateFunc {
     /// `MODE() WITHIN GROUP (ORDER BY x)` — the most frequent non-NULL `x`, ties broken by the sort
     /// order. Result is an element of `x`.
     Mode,
+    /// `RANK(a) WITHIN GROUP (ORDER BY x)` — hypothetical-set rank *with* gaps: the rank the direct
+    /// argument `a` would take if inserted into the sorted non-NULL `x`, i.e. `1 + count(x ≺ a)`
+    /// under the `ORDER BY` direction. Result `BIGINT`.
+    Rank,
+    /// `DENSE_RANK(a) WITHIN GROUP (ORDER BY x)` — hypothetical-set rank *without* gaps:
+    /// `1 + count(distinct x ≺ a)`. Result `BIGINT`.
+    DenseRank,
+    /// `PERCENT_RANK(a) WITHIN GROUP (ORDER BY x)` — relative rank of the hypothetical `a`:
+    /// `(rank(a) − 1) / n` over the `n` non-NULL `x` (`0` when `n = 0`). Result `FLOAT`.
+    PercentRank,
+    /// `CUME_DIST(a) WITHIN GROUP (ORDER BY x)` — cumulative distribution of the hypothetical `a`:
+    /// `(count(x ≼ a) + 1) / (n + 1)` over the `n` non-NULL `x`. Result `FLOAT`.
+    CumeDist,
     /// `ARRAY_AGG(expr)` — collect every input value (including `NULL`s) of `expr` into an array, in
     /// input order; an empty group yields `NULL`. Result type is an array of `expr`'s type.
     ArrayAgg,
@@ -1519,6 +1532,10 @@ impl AggregateFunc {
             Self::PercentileCont => "percentile_cont",
             Self::PercentileDisc => "percentile_disc",
             Self::Mode => "mode",
+            Self::Rank => "rank",
+            Self::DenseRank => "dense_rank",
+            Self::PercentRank => "percent_rank",
+            Self::CumeDist => "cume_dist",
             Self::ArrayAgg => "array_agg",
             Self::JsonAgg => "json_agg",
             Self::JsonObjectAgg => "json_object_agg",
