@@ -4381,6 +4381,13 @@ pub(super) fn check_binary(
         {
             Ok(ColumnType::Geometry(GeomKind::Path))
         },
+        // INET arithmetic: `inet ± int` / `int + inet` (offset the address, → INET) and
+        // `inet - inet` (address difference, → BIGINT). Checked before the numeric rule (a network
+        // address is not numeric); the helper rejects the undefined forms (`int - inet`,
+        // `inet + inet`, `inet ± numeric`) loudly.
+        Op::Plus | Op::Minus if is_inet_type(left) || is_inet_type(right) => {
+            check_inet_arithmetic(op, left, right)
+        },
         Op::Plus | Op::Multiply | Op::Divide | Op::Modulo | Op::Minus => {
             // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors) is checked
             // before the numeric rule (a vector operand is not numeric).
@@ -4460,6 +4467,67 @@ pub(super) fn check_binary(
         Op::GeomParallel | Op::GeomPerpendicular | Op::GeomIntersects => {
             check_geom_predicate(op, left, right)
         },
+        // INET/CIDR subnet-or-equal `<<=` / supernet-or-equal `>>=` — both operands are network
+        // addresses, yielding `BOOL`.
+        Op::InetSubnetEq | Op::InetSupernetEq => check_inet_subnet(op, left, right),
+    }
+}
+
+/// Type rule for INET arithmetic: `inet + int` / `int + inet` / `inet - int` yield an `INET` (the
+/// address offset by the integer), and `inet - inet` yields a `BIGINT` (the signed address
+/// difference). Every other operand combination involving a network address (`int - inet`,
+/// `inet + inet`, `inet ± numeric`) is undefined and rejected.
+fn check_inet_arithmetic(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    use ast::BinaryOp as Op;
+    const fn is_int(ty: ColumnType) -> bool {
+        matches!(
+            ty,
+            ColumnType::SmallInt | ColumnType::Int | ColumnType::BigInt
+        )
+    }
+    // `inet + int` and the commutative `int + inet`, plus `inet - int`, offset the address → INET.
+    let addr_offset = (matches!(op, Op::Plus)
+        && ((is_inet_type(left) && is_int(right)) || (is_int(left) && is_inet_type(right))))
+        || (matches!(op, Op::Minus) && is_inet_type(left) && is_int(right));
+    // `inet - inet` is the signed address difference → BIGINT.
+    let addr_diff = matches!(op, Op::Minus) && is_inet_type(left) && is_inet_type(right);
+    if addr_offset {
+        Ok(ColumnType::Inet)
+    } else if addr_diff {
+        Ok(ColumnType::BigInt)
+    } else {
+        Err(Error::TypeMismatch {
+            context: "network address arithmetic (`inet ± int`, `inet - inet`)".to_owned(),
+            expected: left,
+            found: right,
+        })
+    }
+}
+
+/// Type rule for the INET subnet-or-equal `<<=` / supernet-or-equal `>>=` predicates: both operands
+/// must be network addresses (`INET` or `CIDR`); the result is `BOOL`.
+fn check_inet_subnet(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    if is_inet_type(left) && is_inet_type(right) {
+        Ok(ColumnType::Bool)
+    } else {
+        let symbol = if matches!(op, ast::BinaryOp::InetSubnetEq) {
+            "<<="
+        } else {
+            ">>="
+        };
+        Err(Error::TypeMismatch {
+            context: format!("`{symbol}` network subnet predicate"),
+            expected: left,
+            found: right,
+        })
     }
 }
 

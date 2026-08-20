@@ -241,3 +241,164 @@ SELECT NETMASK(NULL::INET), HOSTMASK(NULL::INET), ABBREV(NULL::INET),
        INET_MERGE(NULL::INET, '10.0.0.0/8'::INET)
 ----
 NULL NULL NULL NULL
+
+# --- INET arithmetic (`inet ± int`, `int + inet`, `inet - inet`) ---
+
+# `inet + int`: add the integer to the address; carries propagate across octets.
+query T
+SELECT '192.168.1.5'::INET + 10
+----
+192.168.1.15
+
+# `int + inet` is commutative.
+query T
+SELECT 5 + '192.168.1.5'::INET
+----
+192.168.1.10
+
+# A carry crosses the octet boundary.
+query T
+SELECT '192.168.1.250'::INET + 10
+----
+192.168.2.4
+
+# IPv6 addition.
+query T
+SELECT '2001:db8::1'::INET + 5
+----
+2001:db8::6
+
+# The mask length is preserved.
+query T
+SELECT '192.168.1.5/24'::INET + 1
+----
+192.168.1.6/24
+
+# `inet - int`: subtract, with a borrow across octets.
+query T
+SELECT '192.168.1.5'::INET - 10
+----
+192.168.0.251
+
+query T
+SELECT '10.0.0.5/24'::INET - 10
+----
+9.255.255.251/24
+
+# `inet - inet`: the signed difference of the two addresses, as BIGINT.
+query I
+SELECT '192.168.1.20'::INET - '192.168.1.5'::INET
+----
+15
+
+query I
+SELECT '192.168.1.5'::INET - '192.168.1.20'::INET
+----
+-15
+
+query I
+SELECT '2001:db8::ffff:ffff:ffff'::INET - '2001:db8::'::INET
+----
+281474976710655
+
+# Overflow / range / cross-family are loud errors, not wrong values.
+statement error
+SELECT '255.255.255.255'::INET + 1
+
+statement error
+SELECT '0.0.0.0'::INET - 1
+
+# A difference that exceeds the BIGINT range errors.
+statement error
+SELECT '2001:db8::'::INET - '2001::'::INET
+
+# Subtracting addresses of different families errors.
+statement error
+SELECT '192.168.1.5'::INET - '::1'::INET
+
+# NULL propagates through INET arithmetic.
+query I
+SELECT CASE WHEN (NULL::INET + 5) IS NULL THEN 1 ELSE 0 END
+----
+1
+
+query I
+SELECT CASE WHEN ('10.0.0.0/8'::INET - NULL::INET) IS NULL THEN 1 ELSE 0 END
+----
+1
+
+# --- subnet-or-equal `<<=` / supernet-or-equal `>>=` (boolean renders as 1/0) ---
+
+# `a <<= b`: `a` is contained within OR equal to `b`.
+query I
+SELECT CASE WHEN '10.0.0.0/8'::INET <<= '10.1.2.3/32'::INET THEN 1 ELSE 0 END
+----
+0
+
+query I
+SELECT CASE WHEN '10.1.2.3/32'::INET <<= '10.0.0.0/8'::INET THEN 1 ELSE 0 END
+----
+1
+
+# Equal networks are subnet-or-equal (unlike the strict `<<`).
+query I
+SELECT CASE WHEN '10.0.0.0/8'::INET <<= '10.0.0.0/8'::INET THEN 1 ELSE 0 END
+----
+1
+
+# `a >>= b`: `a` contains OR equals `b`.
+query I
+SELECT CASE WHEN '10.1.2.3/32'::INET >>= '10.0.0.0/8'::INET THEN 1 ELSE 0 END
+----
+0
+
+query I
+SELECT CASE WHEN '10.0.0.0/8'::INET >>= '10.1.2.3/32'::INET THEN 1 ELSE 0 END
+----
+1
+
+query I
+SELECT CASE WHEN '10.0.0.0/8'::INET >>= '10.0.0.0/8'::INET THEN 1 ELSE 0 END
+----
+1
+
+# IPv6 subnet-or-equal / supernet-or-equal.
+query I
+SELECT CASE WHEN '2001:db8::1/128'::INET <<= '2001:db8::/32'::INET THEN 1 ELSE 0 END
+----
+1
+
+query I
+SELECT CASE WHEN '2001:db8::/32'::INET >>= '2001:db8::1/128'::INET THEN 1 ELSE 0 END
+----
+1
+
+# A cross-family pair is FALSE (never an error), like the strict `<<` / `>>`.
+query I
+SELECT CASE WHEN '10.0.0.0/8'::INET <<= '::/0'::INET THEN 1 ELSE 0 END
+----
+0
+
+# A NULL operand yields NULL.
+query I
+SELECT CASE WHEN (NULL::INET <<= '10.0.0.0/8'::INET) IS NULL THEN 1 ELSE 0 END
+----
+1
+
+# --- guards: the bare (strict) `<<` / `>>` and the integer bit shift still parse and work ---
+
+query I
+SELECT CASE WHEN '192.168.1.5'::INET << '192.168.1.0/24'::INET THEN 1 ELSE 0 END
+----
+1
+
+query I
+SELECT CASE WHEN '192.168.1.0/24'::INET >> '192.168.1.5'::INET THEN 1 ELSE 0 END
+----
+1
+
+# The integer bit shifts `<<` / `>>` are unaffected by the new `<<=` / `>>=` hooks.
+query II
+SELECT 5 << 2, 20 >> 2
+----
+20 5

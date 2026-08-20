@@ -48,6 +48,14 @@ pub fn addr_octets(addr: IpAddr) -> Vec<u8> {
     }
 }
 
+/// The address as a big-endian unsigned integer (0..2^32 for IPv4, 0..2^128 for IPv6). IPv4 values
+/// occupy only the low 32 bits, so the two families share one `u128` representation for arithmetic.
+fn addr_to_u128(addr: IpAddr) -> u128 {
+    addr_octets(addr)
+        .iter()
+        .fold(0u128, |acc, &byte| (acc << 8) | u128::from(byte))
+}
+
 impl InetAddr {
     /// The SQL column type this value belongs to: `CIDR` when `is_cidr`, else `INET`.
     #[must_use]
@@ -255,6 +263,47 @@ impl InetAddr {
             return false;
         }
         network_prefix_eq(self.addr, other.addr, self.masklen)
+    }
+
+    /// This address offset by `delta` (added, or subtracted when negative), keeping the mask length,
+    /// family and `is_cidr` flag. The address is treated as a big unsigned integer (32-bit for IPv4,
+    /// 128-bit for IPv6) with carry/borrow across octets. Returns `None` when the result would leave
+    /// the family's range — below the all-zero address or above the all-ones address — which the
+    /// caller raises as the loud `inet ± int` out-of-range error. Total and panic-free.
+    #[must_use]
+    pub fn add_offset(self, delta: i64) -> Option<Self> {
+        let cur = addr_to_u128(self.addr);
+        let magnitude = u128::from(delta.unsigned_abs());
+        let next = if delta >= 0 {
+            cur.checked_add(magnitude)?
+        } else {
+            cur.checked_sub(magnitude)?
+        };
+        let addr = if is_v6(self.addr) {
+            IpAddr::V6(Ipv6Addr::from(next))
+        } else {
+            IpAddr::V4(Ipv4Addr::from(u32::try_from(next).ok()?))
+        };
+        Some(Self { addr, ..self })
+    }
+
+    /// The signed difference `self - other` of the two addresses as integers (each a big unsigned
+    /// integer per [`InetAddr::add_offset`]) — the basis of `inet - inet`. Returns `None` when the two
+    /// are different families or the difference does not fit `i64`, both of which the caller raises as
+    /// a loud error. Total and panic-free.
+    #[must_use]
+    pub fn diff(&self, other: &Self) -> Option<i64> {
+        if is_v6(self.addr) != is_v6(other.addr) {
+            return None;
+        }
+        let (a, b) = (addr_to_u128(self.addr), addr_to_u128(other.addr));
+        let (magnitude, negative) = if a >= b {
+            (a - b, false)
+        } else {
+            (b - a, true)
+        };
+        let signed = i64::try_from(magnitude).ok()?;
+        Some(if negative { -signed } else { signed })
     }
 
     /// The network mask of this value's subnet: the first `masklen` bits set, the rest zero, as an
@@ -775,6 +824,43 @@ mod tests {
         assert!(sf("192.168.1.5", "10.0.0.1"));
         assert!(!sf("192.168.1.5", "::1"));
         assert!(sf("::1", "2001:db8::1"));
+    }
+
+    #[test]
+    fn add_offset_carries_and_preserves_mask() {
+        let off = |s: &str, d: i64| parse_inet(s).unwrap().add_offset(d).map(|v| v.format());
+        // Plain add, and a carry across an octet boundary.
+        assert_eq!(off("192.168.1.5", 10).as_deref(), Some("192.168.1.15"));
+        assert_eq!(off("192.168.1.250", 10).as_deref(), Some("192.168.2.4"));
+        // Subtract with a borrow across octets; the /24 mask is preserved.
+        assert_eq!(off("192.168.1.5", -10).as_deref(), Some("192.168.0.251"));
+        assert_eq!(off("192.168.1.5/24", 1).as_deref(), Some("192.168.1.6/24"));
+        // IPv6.
+        assert_eq!(off("2001:db8::1", 5).as_deref(), Some("2001:db8::6"));
+        // Out of range: past the all-ones / all-zero address of the family → None.
+        assert_eq!(off("255.255.255.255", 1), None);
+        assert_eq!(off("0.0.0.0", -1), None);
+        assert_eq!(off("::", -1), None);
+        // A large IPv6 offset that stays in range.
+        assert_eq!(
+            off("2001:db8::", i64::MAX).as_deref(),
+            Some("2001:db8::7fff:ffff:ffff:ffff")
+        );
+    }
+
+    #[test]
+    fn diff_is_signed_and_range_checked() {
+        let d = |a: &str, b: &str| parse_inet(a).unwrap().diff(&parse_inet(b).unwrap());
+        assert_eq!(d("192.168.1.20", "192.168.1.5"), Some(15));
+        assert_eq!(d("192.168.1.5", "192.168.1.20"), Some(-15));
+        assert_eq!(
+            d("2001:db8::ffff:ffff:ffff", "2001:db8::"),
+            Some(281_474_976_710_655)
+        );
+        // Difference that does not fit i64 → None.
+        assert_eq!(d("2001:db8::", "2001::"), None);
+        // Cross-family difference → None.
+        assert_eq!(d("192.168.1.5", "::1"), None);
     }
 
     #[test]

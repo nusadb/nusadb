@@ -1727,6 +1727,12 @@ pub enum BinaryOp {
     /// Geometric intersects `?#` — do two `lseg`s cross/touch at a single point, or do two `line`s
     /// cross (i.e. are not parallel), as `BOOL`?
     GeomIntersects,
+    /// `<<=` — subnet-or-equal: is the left network contained within **or equal to** the right, as
+    /// `BOOL`? (`a <<= b` ≡ the right contains-or-equals the left.) A cross-family pair is `FALSE`.
+    InetSubnetEq,
+    /// `>>=` — supernet-or-equal: does the left network contain **or equal** the right, as `BOOL`?
+    /// (`a >>= b` ≡ the left contains-or-equals the right.) A cross-family pair is `FALSE`.
+    InetSupernetEq,
 }
 
 /// Unary operators the parser accepts.

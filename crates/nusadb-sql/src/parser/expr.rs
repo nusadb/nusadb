@@ -2048,6 +2048,10 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
             "?||" => ast::BinaryOp::GeomParallel,
             "?-|" => ast::BinaryOp::GeomPerpendicular,
             "?#" => ast::BinaryOp::GeomIntersects,
+            // INET subnet-or-equal `<<=` / supernet-or-equal `>>=` (fused from `<<`/`>>` + `=` by
+            // the dialect's infix hook).
+            "<<=" => ast::BinaryOp::InetSubnetEq,
+            ">>=" => ast::BinaryOp::InetSupernetEq,
             other => return unsupported(&format!("binary operator `{other}`")),
         },
         // Full-text search match `@@` (F1).

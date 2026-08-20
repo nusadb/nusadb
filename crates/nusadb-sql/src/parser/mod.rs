@@ -253,6 +253,25 @@ impl Dialect for NusaParserDialect {
                     }),
             );
         }
+        // INET subnet-or-equal `<<=` / supernet-or-equal `>>=`. The tokenizer emits `<<` / `>>`
+        // (`ShiftLeft` / `ShiftRight`) followed by an adjacent `=` (`Eq`); recognize that pair here
+        // and emit a `Custom("<<=")` / `Custom(">>=")` the converter maps to the network predicate.
+        // A bare `<<` / `>>` (integer bit shift or the INET strict subnet/supernet predicate) and a
+        // spaced `<< =` fall through untouched.
+        if let Some((symbol, tokens)) = recognize_inet_subnet_eq(parser) {
+            for _ in 0..tokens {
+                parser.next_token();
+            }
+            return Some(
+                parser
+                    .parse_subexpr(precedence)
+                    .map(|right| sql::Expr::BinaryOp {
+                        left: Box::new(expr.clone()),
+                        op: sql::BinaryOperator::Custom(symbol.to_owned()),
+                        right: Box::new(right),
+                    }),
+            );
+        }
         // `#` — the reference engine's integer XOR. sqlparser's own infix table gates the Sharp
         // token behind a dialect TypeId this wrapper does not report (it must keep reporting
         // `GenericDialect`'s — see `dialect()`), so parse the operator here. The default precedence table
@@ -302,9 +321,31 @@ impl Dialect for NusaParserDialect {
             // comparison tier so `a ~= b` binds like an equality. A bare `~` keeps its default
             // precedence (fall through to `None`).
             Token::Tilde if recognize_geom_same_as(parser).is_some() => Some(Ok(25)),
+            // INET subnet-or-equal `<<=` / supernet-or-equal `>>=` — the `<<` / `>>` token followed
+            // by an adjacent `=` sits at the comparison tier so `a <<= b` binds like an equality. A
+            // bare `<<` / `>>` keeps its default precedence (fall through to `None`).
+            Token::ShiftLeft | Token::ShiftRight if recognize_inet_subnet_eq(parser).is_some() => {
+                Some(Ok(25))
+            },
             _ => None,
         }
     }
+}
+
+/// Recognize the INET subnet-or-equal `<<=` / supernet-or-equal `>>=` operators at the current
+/// parser position, where the next token is a `<<` (`Token::ShiftLeft`) or `>>` (`Token::ShiftRight`).
+/// Returns the canonical symbol and the number of tokens it spans, or `None` when the token after the
+/// shift is not a directly-adjacent `=` (so a bare `<<` / `>>` — an integer bit shift or the INET
+/// strict subnet/supernet predicate — and a spaced `<< =` are left untouched).
+fn recognize_inet_subnet_eq(parser: &Parser) -> Option<(&'static str, usize)> {
+    let shift = parser.peek_token_ref();
+    let symbol = match shift.token {
+        Token::ShiftLeft => "<<=",
+        Token::ShiftRight => ">>=",
+        _ => return None,
+    };
+    let after = parser.peek_nth_token_ref(1);
+    (matches!(after.token, Token::Eq) && shift.span.end == after.span.start).then_some((symbol, 2))
 }
 
 /// Recognize the geometric same-as operator `~=` at the current parser position, where the next

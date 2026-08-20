@@ -5146,6 +5146,14 @@ fn apply_binary(
         {
             apply_geom_arithmetic(op, left, right)
         },
+        // INET arithmetic: `inet ± int` / `int + inet` (offset the address, → INET) and
+        // `inet - inet` (address difference, → BIGINT); an inet operand routes here before the
+        // generic numeric arithmetic.
+        Op::Plus | Op::Minus
+            if matches!(left, ast::Value::Inet(_)) || matches!(right, ast::Value::Inet(_)) =>
+        {
+            apply_inet_arithmetic(op, left, right)
+        },
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
             apply_arithmetic(op, left, right, result_ty)
         },
@@ -5234,6 +5242,8 @@ fn apply_binary(
         Op::GeomParallel | Op::GeomPerpendicular | Op::GeomIntersects => {
             Ok(geom_predicate_op(op, left, right))
         },
+        // INET subnet-or-equal `<<=` / supernet-or-equal `>>=`.
+        Op::InetSubnetEq | Op::InetSupernetEq => Ok(apply_inet_subnet_predicate(op, left, right)),
     }
 }
 
@@ -5767,6 +5777,74 @@ fn apply_inet_predicate(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value
         _ => return ast::Value::Null,
     };
     ast::Value::Bool(result)
+}
+
+/// Evaluate the INET subnet-or-equal `<<=` / supernet-or-equal `>>=` predicates, as `BOOL`. `a <<= b`
+/// is true when `b`'s network contains **or equals** `a`; `a >>= b` when `a`'s network contains or
+/// equals `b`. A `NULL` operand yields `NULL`; a cross-family pair is `FALSE` (never an error), like
+/// the strict `<<` / `>>`.
+fn apply_inet_subnet_predicate(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> ast::Value {
+    use ast::BinaryOp as Op;
+    let (ast::Value::Inet(a), ast::Value::Inet(b)) = (left, right) else {
+        return ast::Value::Null;
+    };
+    let result = match op {
+        // `a <<= b` — `a` is contained-or-equal in `b`, i.e. `b` contains-or-equals `a`.
+        Op::InetSubnetEq => b.contains_or_equal(a),
+        // `a >>= b` — `a` contains-or-equals `b`.
+        Op::InetSupernetEq => a.contains_or_equal(b),
+        _ => return ast::Value::Null,
+    };
+    ast::Value::Bool(result)
+}
+
+/// Evaluate INET arithmetic: `inet + int` / `int + inet` / `inet - int` offset the address by the
+/// integer (result `INET`, preserving the mask), and `inet - inet` is the signed address difference
+/// (result `BIGINT`). A `NULL` operand yields `NULL`. An offset that leaves the family's address
+/// range, a cross-family subtraction, and a difference that overflows `i64` are loud errors rather
+/// than wrong values.
+fn apply_inet_arithmetic(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    use ast::BinaryOp as Op;
+    if matches!(left, ast::Value::Null) || matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    let out_of_range = || Error::Coded {
+        message: "inet value out of range".to_owned(),
+        sqlstate: "22003", // numeric_value_out_of_range
+    };
+    match (op, left, right) {
+        // `inet + int` and the commutative `int + inet`.
+        (Op::Plus, ast::Value::Inet(a), ast::Value::Int(n))
+        | (Op::Plus, ast::Value::Int(n), ast::Value::Inet(a)) => a
+            .add_offset(*n)
+            .map(ast::Value::Inet)
+            .ok_or_else(out_of_range),
+        // `inet - int`: offset by the negated integer.
+        (Op::Minus, ast::Value::Inet(a), ast::Value::Int(n)) => n
+            .checked_neg()
+            .and_then(|d| a.add_offset(d))
+            .map(ast::Value::Inet)
+            .ok_or_else(out_of_range),
+        // `inet - inet`: the signed address difference, as BIGINT.
+        (Op::Minus, ast::Value::Inet(a), ast::Value::Inet(b)) => {
+            if !a.same_family(b) {
+                return Err(Error::InvalidParameterValue(
+                    "cannot subtract addresses from different families".to_owned(),
+                ));
+            }
+            a.diff(b).map(ast::Value::Int).ok_or_else(out_of_range)
+        },
+        // The analyzer rejects every other operand combination.
+        _ => Ok(ast::Value::Null),
+    }
 }
 
 /// Evaluate array overlap `a && b` (B-fn): `TRUE` if the two arrays share at least one element. A
