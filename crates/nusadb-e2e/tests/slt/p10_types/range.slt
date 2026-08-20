@@ -209,6 +209,128 @@ statement error
 SELECT '[1,10)'::int4range && '[1.5,3.5)'::numrange
 
 # ---------------------------------------------------------------------------
+# Set operators: `+` union, `*` intersection, `-` difference, `<<`/`>>` strict order.
+# ---------------------------------------------------------------------------
+
+# Union is the smallest covering range, for overlapping and (contiguously) adjacent inputs.
+query TTT
+SELECT '[1,10)'::int4range + '[5,15)'::int4range, '[1,5)'::int4range + '[5,10)'::int4range,
+       '[1.0,5.0)'::numrange + '[3.0,8.0)'::numrange
+----
+[1,15)  [1,10)  [1.0,8.0)
+
+# An unbounded side widens the union; union with the empty range returns the other range.
+query TTT
+SELECT '[1,10)'::int4range + '[5,)'::int4range, '[1,5)'::int4range + 'empty'::int4range,
+       'empty'::int4range + '[1,5)'::int4range
+----
+[1,)  [1,5)  [1,5)
+
+# A gap between the two has no single-range answer, so the union is a loud error — a discrete gap
+# (nothing between [1,5) and [6,10)) as much as a plainly-separated pair.
+statement error
+SELECT '[1,5)'::int4range + '[10,15)'::int4range
+
+statement error
+SELECT '[1,5)'::int4range + '[6,10)'::int4range
+
+# A shared *exclusive* endpoint on both sides is still a gap for a continuous kind; one inclusive
+# side closes it.
+statement error
+SELECT '[1.0,5.0)'::numrange + '(5.0,8.0)'::numrange
+
+query T
+SELECT '[1.0,5.0]'::numrange + '(5.0,8.0)'::numrange
+----
+[1.0,8.0)
+
+# Intersection is the overlap, or the empty range when the two are disjoint (adjacent counts as
+# disjoint: they share no point).
+query TTT
+SELECT '[1,10)'::int4range * '[5,15)'::int4range, '[1,5)'::int4range * '[10,15)'::int4range,
+       '[1,5)'::int4range * '[5,10)'::int4range
+----
+[5,10)  empty  empty
+
+query TT
+SELECT '[1.0,5.0)'::numrange * '[3.0,8.0)'::numrange, '(,10)'::int4range * '[5,)'::int4range
+----
+[3.0,5.0)  [5,10)
+
+# Intersection with the empty range is empty.
+query T
+SELECT '[1,10)'::int4range * 'empty'::int4range
+----
+empty
+
+# Difference removes the second range from the first: trim the high side, the low side, or clear it.
+query TTT
+SELECT '[1,10)'::int4range - '[5,15)'::int4range, '[1,10)'::int4range - '[1,5)'::int4range,
+       '[1,10)'::int4range - '[1,10)'::int4range
+----
+[1,5)  [5,10)  empty
+
+# A disjoint or empty subtrahend leaves the first range unchanged; an unbounded end trims that side.
+query TTT
+SELECT '[1,10)'::int4range - '[20,30)'::int4range, '[1,10)'::int4range - 'empty'::int4range,
+       '[1,10)'::int4range - '(,5)'::int4range
+----
+[1,10)  [1,10)  [5,10)
+
+# Removing an interior piece would split the first into two — no single-range answer, a loud error.
+statement error
+SELECT '[1,10)'::int4range - '[3,5)'::int4range
+
+# Strictly-left `<<` and strictly-right `>>`: true only with no shared point. Adjacent ranges share
+# no point, so [1,5) is strictly left of [5,10); overlap or the wrong direction is false.
+query IIII
+SELECT '[1,5)'::int4range << '[10,20)'::int4range, '[1,5)'::int4range << '[5,10)'::int4range,
+       '[1,10)'::int4range << '[5,15)'::int4range, '[1,5)'::int4range << '[4,10)'::int4range
+----
+1 1 0 0
+
+query II
+SELECT '[10,20)'::int4range >> '[1,5)'::int4range, '[1,5)'::int4range >> '[10,20)'::int4range
+----
+1 0
+
+# An unbounded side reaches into the neighbour, so it is never strictly left/right; a bounded end is.
+query II
+SELECT '[1,)'::int4range << '[10,20)'::int4range, '(,5)'::int4range << '[10,20)'::int4range
+----
+0 1
+
+# An empty operand is never strictly left or right of anything, on either side.
+query III
+SELECT 'empty'::int4range << '[1,5)'::int4range, '[1,5)'::int4range << 'empty'::int4range,
+       'empty'::int4range >> '[1,5)'::int4range
+----
+0 0 0
+
+# A NULL operand yields NULL for every set operator, not an error or a wrong value.
+query IIII
+SELECT NULL::int4range + '[1,5)'::int4range, NULL::int4range * '[1,5)'::int4range,
+       NULL::int4range - '[1,5)'::int4range, NULL::int4range << '[1,5)'::int4range
+----
+NULL NULL NULL NULL
+
+# Mixing element kinds under a set operator is a type error, like the predicates above.
+statement error
+SELECT '[1,10)'::int4range + '[1.5,3.5)'::numrange
+
+statement error
+SELECT '[1,10)'::int4range << '[1.5,3.5)'::numrange
+
+# The operators these reuse still mean what they did: numeric `+`, integer bit-shift `<<`, and the
+# INET network predicates `<<` / `<<=` are unchanged by the range arms.
+query IIIII
+SELECT 1 + 2, 5 << 2, '192.168.1.5'::inet << '192.168.1.0/24'::inet,
+       '192.168.1.0/24'::inet <<= '192.168.0.0/16'::inet,
+       '10.0.0.0/8'::inet >>= '10.1.2.0/24'::inet
+----
+3 20 1 1 1
+
+# ---------------------------------------------------------------------------
 # Accessors: lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
 # ---------------------------------------------------------------------------
 

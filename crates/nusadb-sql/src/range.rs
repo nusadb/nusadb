@@ -236,6 +236,181 @@ impl RangeVal {
         lower_below_upper(self, other) && lower_below_upper(other, self)
     }
 
+    /// The smallest range that covers both `self` and `other` (the set union). Returns `None` when a
+    /// gap between the two would make the result non-contiguous — the reference engine raises an error
+    /// in that case, since a range value cannot represent two disjoint pieces. Union with an empty
+    /// range returns the other range unchanged.
+    ///
+    /// Like [`RangeVal::overlaps`], this compares bounds only — the caller guarantees the two ranges
+    /// share an element kind.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Option<Self> {
+        if self.empty {
+            return Some(other.clone());
+        }
+        if other.empty {
+            return Some(self.clone());
+        }
+        // Contiguous only when the two ranges overlap or exactly touch on one side (one ends where
+        // the other begins, with complementary inclusivity so no point is dropped or shared).
+        if !self.overlaps(other)
+            && !bounds_touch(
+                self.upper.as_ref(),
+                self.upper_inc,
+                other.lower.as_ref(),
+                other.lower_inc,
+            )
+            && !bounds_touch(
+                other.upper.as_ref(),
+                other.upper_inc,
+                self.lower.as_ref(),
+                self.lower_inc,
+            )
+        {
+            return None;
+        }
+        let (lower, lower_inc) = self.lower_bound(other, false);
+        let (upper, upper_inc) = self.upper_bound(other, false);
+        Self::new(self.kind, lower, upper, lower_inc, upper_inc)
+    }
+
+    /// The set intersection — the points in both ranges — or the empty range when they are disjoint.
+    /// Intersection with the empty range is empty.
+    ///
+    /// Like [`RangeVal::overlaps`], this compares bounds only — the caller guarantees the two ranges
+    /// share an element kind.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        if !self.overlaps(other) {
+            return Self::empty(self.kind);
+        }
+        // The overlap starts at the later lower bound and ends at the earlier upper bound.
+        let (lower, lower_inc) = self.lower_bound(other, true);
+        let (upper, upper_inc) = self.upper_bound(other, true);
+        // The overlap is guaranteed non-crossing, so the build succeeds; fall back to empty rather
+        // than unwrap so a construction quirk can never panic.
+        Self::new(self.kind, lower, upper, lower_inc, upper_inc)
+            .unwrap_or_else(|| Self::empty(self.kind))
+    }
+
+    /// The set difference — `self` with every point of `other` removed. Returns `None` when removing
+    /// `other` would split `self` into two disjoint pieces (a hole in the middle): a range value
+    /// cannot hold that, so the reference engine raises an error. Removing a disjoint or empty range
+    /// leaves `self` unchanged; an empty `self` stays empty.
+    ///
+    /// Like [`RangeVal::overlaps`], this compares bounds only — the caller guarantees the two ranges
+    /// share an element kind.
+    #[must_use]
+    pub fn difference(&self, other: &Self) -> Option<Self> {
+        // Nothing to remove: an empty subtrahend, or no shared point, leaves `self` as it is.
+        if self.empty || other.empty || !self.overlaps(other) {
+            return Some(self.clone());
+        }
+        let starts_before = cmp_lower(
+            self.lower.as_ref(),
+            self.lower_inc,
+            other.lower.as_ref(),
+            other.lower_inc,
+        )
+        .is_lt();
+        let ends_after = cmp_upper(
+            self.upper.as_ref(),
+            self.upper_inc,
+            other.upper.as_ref(),
+            other.upper_inc,
+        )
+        .is_gt();
+        if starts_before && ends_after {
+            // `other` sits strictly inside `self`, so removing it would leave two pieces.
+            return None;
+        }
+        if !starts_before && !ends_after {
+            // `other` covers `self` on both ends, so nothing is left.
+            return Some(Self::empty(self.kind));
+        }
+        let (lower, lower_inc, upper, upper_inc) = if ends_after {
+            // `other` trims the low side of `self`; what remains begins just past `other`'s upper end.
+            (
+                other.upper.clone(),
+                !other.upper_inc,
+                self.upper.clone(),
+                self.upper_inc,
+            )
+        } else {
+            // `other` trims the high side; what remains ends just before `other`'s lower end.
+            (
+                self.lower.clone(),
+                self.lower_inc,
+                other.lower.clone(),
+                !other.lower_inc,
+            )
+        };
+        Self::new(self.kind, lower, upper, lower_inc, upper_inc)
+    }
+
+    /// Whether `self` lies entirely to the left of `other` with no point in common (`<<`). An empty
+    /// operand on either side is never strictly left of anything. The caller guarantees the two ranges
+    /// share an element kind.
+    #[must_use]
+    pub fn strictly_left_of(&self, other: &Self) -> bool {
+        if self.empty || other.empty {
+            return false;
+        }
+        match (&self.upper, &other.lower) {
+            // An unbounded upper here (or unbounded lower there) reaches into the other range's side.
+            (None, _) | (_, None) => false,
+            (Some(u), Some(l)) => match compare(u, l) {
+                std::cmp::Ordering::Less => true,
+                // At a shared value they touch; it is a common point only if both bounds include it.
+                std::cmp::Ordering::Equal => !(self.upper_inc && other.lower_inc),
+                std::cmp::Ordering::Greater => false,
+            },
+        }
+    }
+
+    /// Whether `self` lies entirely to the right of `other` with no point in common (`>>`) — the
+    /// mirror of [`RangeVal::strictly_left_of`].
+    #[must_use]
+    pub fn strictly_right_of(&self, other: &Self) -> bool {
+        other.strictly_left_of(self)
+    }
+
+    /// The lower bound to use when combining `self` and `other`: the later-starting bound when
+    /// `tighter` (intersection), else the earlier-starting one (union). An equal value resolves to the
+    /// inclusivity [`cmp_lower`] ranks as more covering for a union and less covering for a tighter
+    /// intersection.
+    fn lower_bound(&self, other: &Self, tighter: bool) -> (Option<ast::Value>, bool) {
+        let ord = cmp_lower(
+            self.lower.as_ref(),
+            self.lower_inc,
+            other.lower.as_ref(),
+            other.lower_inc,
+        );
+        let take_other = if tighter { ord.is_lt() } else { ord.is_gt() };
+        if take_other {
+            (other.lower.clone(), other.lower_inc)
+        } else {
+            (self.lower.clone(), self.lower_inc)
+        }
+    }
+
+    /// The upper bound to use when combining `self` and `other`: the earlier-ending bound when
+    /// `tighter` (intersection), else the later-ending one (union).
+    fn upper_bound(&self, other: &Self, tighter: bool) -> (Option<ast::Value>, bool) {
+        let ord = cmp_upper(
+            self.upper.as_ref(),
+            self.upper_inc,
+            other.upper.as_ref(),
+            other.upper_inc,
+        );
+        let take_other = if tighter { ord.is_gt() } else { ord.is_lt() };
+        if take_other {
+            (other.upper.clone(), other.upper_inc)
+        } else {
+            (self.upper.clone(), self.upper_inc)
+        }
+    }
+
     /// Canonical text form: `empty`, or `[lo,hi)` with the actual inclusivity and blank infinite ends.
     #[must_use]
     pub fn format(&self) -> String {
@@ -451,6 +626,57 @@ fn decode_bound(bytes: &[u8], pos: usize, kind: RangeKind) -> Option<(ast::Value
             (ast::Value::Numeric(d), pos + 17)
         },
     })
+}
+
+/// Order two lower bounds. An unbounded (`None`) lower is −infinity, hence the smallest; at an equal
+/// value an inclusive `[` starts at or before an exclusive `(`.
+fn cmp_lower(
+    av: Option<&ast::Value>,
+    ainc: bool,
+    bv: Option<&ast::Value>,
+    binc: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (av, bv) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        // At the same value the inclusive side starts earlier, so it sorts first.
+        (Some(a), Some(b)) => match compare(a, b) {
+            Ordering::Equal => binc.cmp(&ainc),
+            ord => ord,
+        },
+    }
+}
+
+/// Order two upper bounds. An unbounded (`None`) upper is +infinity, hence the largest; at an equal
+/// value an inclusive `]` ends at or after an exclusive `)`.
+fn cmp_upper(
+    av: Option<&ast::Value>,
+    ainc: bool,
+    bv: Option<&ast::Value>,
+    binc: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (av, bv) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        // At the same value the inclusive side ends later, so it sorts last.
+        (Some(a), Some(b)) => match compare(a, b) {
+            Ordering::Equal => ainc.cmp(&binc),
+            ord => ord,
+        },
+    }
+}
+
+/// Whether an upper bound and a lower bound sit at the same value with complementary inclusivity —
+/// the two ranges touch there, leaving no gap and no shared point. Both bounds must be finite.
+fn bounds_touch(uv: Option<&ast::Value>, uinc: bool, lv: Option<&ast::Value>, linc: bool) -> bool {
+    let (Some(u), Some(l)) = (uv, lv) else {
+        return false;
+    };
+    compare(u, l) == std::cmp::Ordering::Equal && (uinc != linc)
 }
 
 /// Whether `a`'s lower bound lies at or below `b`'s upper bound (a half of the overlap test).
@@ -858,5 +1084,111 @@ mod tests {
         for (a, b) in [("[1,10)", "[2,5)"), ("[1,)", "[5,)"), ("(,)", "[1,10)")] {
             assert!(int(a).contains_range(&int(b)) && int(a).overlaps(&int(b)));
         }
+    }
+
+    #[test]
+    fn union_covers_overlap_adjacency_gap_and_empty() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        let num = |s: &str| parse(s, RangeKind::Num).expect("numrange");
+        let fmt = |r: Option<RangeVal>| r.map(|r| r.format());
+        // Overlapping and adjacent unions are contiguous; a gap has no single-range answer.
+        assert_eq!(
+            fmt(int("[1,10)").union(&int("[5,15)"))),
+            Some("[1,15)".into())
+        );
+        assert_eq!(
+            fmt(int("[1,5)").union(&int("[5,10)"))),
+            Some("[1,10)".into())
+        );
+        assert_eq!(
+            fmt(num("[1.0,5.0)").union(&num("[3.0,8.0)"))),
+            Some("[1.0,8.0)".into())
+        );
+        assert_eq!(int("[1,5)").union(&int("[10,15)")), None); // gap
+        assert_eq!(int("[1,5)").union(&int("[6,10)")), None); // discrete gap at 5
+        // A shared exclusive value on both sides is still a gap for a continuous kind.
+        assert_eq!(num("[1.0,5.0)").union(&num("(5.0,8.0)")), None);
+        assert_eq!(
+            fmt(num("[1.0,5.0]").union(&num("(5.0,8.0)"))),
+            Some("[1.0,8.0)".into())
+        );
+        // Union with empty returns the other range; an unbounded side widens the result.
+        let empty = RangeVal::empty(RangeKind::Int);
+        assert_eq!(fmt(int("[1,5)").union(&empty)), Some("[1,5)".into()));
+        assert_eq!(fmt(empty.union(&int("[1,5)"))), Some("[1,5)".into()));
+        assert_eq!(fmt(int("[1,10)").union(&int("[5,)"))), Some("[1,)".into()));
+    }
+
+    #[test]
+    fn intersect_yields_overlap_or_empty() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        let num = |s: &str| parse(s, RangeKind::Num).expect("numrange");
+        assert_eq!(int("[1,10)").intersect(&int("[5,15)")).format(), "[5,10)");
+        assert_eq!(
+            num("[1.0,5.0)").intersect(&num("[3.0,8.0)")).format(),
+            "[3.0,5.0)"
+        );
+        assert!(int("[1,5)").intersect(&int("[10,15)")).empty); // disjoint
+        assert!(int("[1,5)").intersect(&int("[5,10)")).empty); // adjacent, no shared point
+        assert!(
+            int("[1,10)")
+                .intersect(&RangeVal::empty(RangeKind::Int))
+                .empty
+        );
+        // Unbounded sides intersect to the finite overlap.
+        assert_eq!(int("(,10)").intersect(&int("[5,)")).format(), "[5,10)");
+    }
+
+    #[test]
+    fn difference_trims_splits_or_clears() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        let fmt = |r: Option<RangeVal>| r.map(|r| r.format());
+        // Trim the high side, the low side, or clear entirely.
+        assert_eq!(
+            fmt(int("[1,10)").difference(&int("[5,15)"))),
+            Some("[1,5)".into())
+        );
+        assert_eq!(
+            fmt(int("[1,10)").difference(&int("[1,5)"))),
+            Some("[5,10)".into())
+        );
+        assert_eq!(
+            fmt(int("[1,10)").difference(&int("[1,10)"))),
+            Some("empty".into())
+        );
+        // Removing an interior piece would split into two — no single-range answer.
+        assert_eq!(int("[1,10)").difference(&int("[3,5)")), None);
+        // Disjoint or empty subtrahend leaves the range unchanged.
+        assert_eq!(
+            fmt(int("[1,10)").difference(&int("[20,30)"))),
+            Some("[1,10)".into())
+        );
+        assert_eq!(
+            fmt(int("[1,10)").difference(&RangeVal::empty(RangeKind::Int))),
+            Some("[1,10)".into())
+        );
+        // An unbounded subtrahend end trims from that side.
+        assert_eq!(
+            fmt(int("[1,10)").difference(&int("(,5)"))),
+            Some("[5,10)".into())
+        );
+    }
+
+    #[test]
+    fn strictly_left_and_right_of() {
+        let int = |s: &str| parse(s, RangeKind::Int).expect("int4range");
+        assert!(int("[1,5)").strictly_left_of(&int("[10,20)")));
+        assert!(int("[1,5)").strictly_left_of(&int("[5,10)"))); // adjacent, still no shared point
+        assert!(!int("[1,10)").strictly_left_of(&int("[5,15)"))); // overlap
+        assert!(!int("[1,5)").strictly_left_of(&int("[4,10)"))); // overlap at 4
+        assert!(int("[10,20)").strictly_right_of(&int("[1,5)")));
+        assert!(!int("[1,5)").strictly_right_of(&int("[10,20)")));
+        // An unbounded side reaches into the neighbour, so it is never strictly left/right.
+        assert!(!int("[1,)").strictly_left_of(&int("[10,20)")));
+        assert!(int("(,5)").strictly_left_of(&int("[10,20)")));
+        // The empty range is never strictly left or right of anything, on either side.
+        let empty = RangeVal::empty(RangeKind::Int);
+        assert!(!empty.strictly_left_of(&int("[1,5)")));
+        assert!(!int("[1,5)").strictly_left_of(&empty));
     }
 }

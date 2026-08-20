@@ -5154,8 +5154,18 @@ fn apply_binary(
         {
             apply_inet_arithmetic(op, left, right)
         },
+        // Range set operators `+` (union) / `*` (intersection) / `-` (difference); a range operand
+        // routes here before the generic numeric arithmetic below (a range is not a number).
+        Op::Plus | Op::Multiply | Op::Minus if has_range_operand(left, right) => {
+            apply_range_setop(op, left, right)
+        },
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo => {
             apply_arithmetic(op, left, right, result_ty)
+        },
+        // Range strict-order predicates `<<` / `>>`; a range operand routes here before the INET
+        // predicates that share these operators.
+        Op::ShiftLeft | Op::ShiftRight if has_range_operand(left, right) => {
+            apply_range_strict(op, left, right)
         },
         // INET/CIDR network predicates share the `<<` / `>>` / `&&` operators.
         Op::ShiftLeft | Op::ShiftRight | Op::ArrayOverlap
@@ -6026,6 +6036,88 @@ fn apply_range_predicate(
         ast::Value::Range(_) => mismatch(),
         elem => Ok(ast::Value::Bool(outer.contains_elem(elem))),
     }
+}
+
+/// Whether either operand is a range value — the guard that routes the shared `+`/`*`/`-`/`<<`/`>>`
+/// operators to the range set-ops before their numeric / INET meanings.
+const fn has_range_operand(left: &ast::Value, right: &ast::Value) -> bool {
+    matches!(left, ast::Value::Range(_)) || matches!(right, ast::Value::Range(_))
+}
+
+/// Evaluate a range set operator: `+` (union), `*` (intersection), or `-` (difference), yielding a
+/// range. A NULL operand yields NULL. Both operands must be ranges of the same element kind — a
+/// mismatch is a loud error, as in [`apply_range_predicate`]. A union or difference whose result
+/// cannot be one contiguous range is a loud error; a disjoint intersection is the empty range.
+fn apply_range_setop(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    use ast::BinaryOp as Op;
+    if matches!(left, ast::Value::Null) || matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    let mismatch = || {
+        Error::InvalidStatement(
+            "range set operator over operands of different element kinds".to_owned(),
+        )
+    };
+    let (ast::Value::Range(a), ast::Value::Range(b)) = (left, right) else {
+        return Err(mismatch());
+    };
+    if a.kind != b.kind {
+        return Err(mismatch());
+    }
+    let noncontiguous = |what: &str| {
+        Error::InvalidParameterValue(format!("result of range {what} would not be contiguous"))
+    };
+    let out = match op {
+        Op::Plus => a.union(b).ok_or_else(|| noncontiguous("union"))?,
+        Op::Multiply => a.intersect(b),
+        Op::Minus => a.difference(b).ok_or_else(|| noncontiguous("difference"))?,
+        // The dispatcher routes only these three operators here.
+        _ => {
+            return Err(Error::InvalidStatement(
+                "unsupported range set operator".to_owned(),
+            ));
+        },
+    };
+    Ok(ast::Value::Range(Box::new(out)))
+}
+
+/// Evaluate a range strict-order predicate: `<<` (strictly left of) or `>>` (strictly right of), as
+/// BOOL. A NULL operand yields NULL; operands of different element kinds are a loud error.
+fn apply_range_strict(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Result<ast::Value, Error> {
+    use ast::BinaryOp as Op;
+    if matches!(left, ast::Value::Null) || matches!(right, ast::Value::Null) {
+        return Ok(ast::Value::Null);
+    }
+    let mismatch = || {
+        Error::InvalidStatement(
+            "range predicate over operands of different element kinds".to_owned(),
+        )
+    };
+    let (ast::Value::Range(a), ast::Value::Range(b)) = (left, right) else {
+        return Err(mismatch());
+    };
+    if a.kind != b.kind {
+        return Err(mismatch());
+    }
+    let result = match op {
+        Op::ShiftLeft => a.strictly_left_of(b),
+        Op::ShiftRight => a.strictly_right_of(b),
+        // The dispatcher routes only these two operators here.
+        _ => {
+            return Err(Error::InvalidStatement(
+                "unsupported range predicate".to_owned(),
+            ));
+        },
+    };
+    Ok(ast::Value::Bool(result))
 }
 
 /// Evaluate `@>` (contains) / `<@` (contained-by) over arrays or JSON. A NULL operand yields NULL.

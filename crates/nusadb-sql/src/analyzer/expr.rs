@@ -4388,6 +4388,12 @@ pub(super) fn check_binary(
         Op::Plus | Op::Minus if is_inet_type(left) || is_inet_type(right) => {
             check_inet_arithmetic(op, left, right)
         },
+        // Range set operators: `range + range` (union), `range * range` (intersection), and
+        // `range - range` (difference) over two ranges of the same element kind, each yielding that
+        // range type. Checked before the numeric rule (a range is not a number).
+        Op::Plus | Op::Multiply | Op::Minus if is_range_type(left) || is_range_type(right) => {
+            check_range_setop(op, left, right)
+        },
         Op::Plus | Op::Multiply | Op::Divide | Op::Modulo | Op::Minus => {
             // Element-wise vector arithmetic (`+`/`-`/`*` over two same-dimension vectors) is checked
             // before the numeric rule (a vector operand is not numeric).
@@ -4403,6 +4409,12 @@ pub(super) fn check_binary(
             if is_inet_type(left) && is_inet_type(right) =>
         {
             Ok(ColumnType::Bool)
+        },
+        // Ranges reuse `<<` / `>>` as strict-order predicates (`range << range` strictly-left-of,
+        // `range >> range` strictly-right-of), yielding `BOOL`. Checked before the bit/integer shift
+        // rules below (a range is neither a bit string nor an integer).
+        Op::ShiftLeft | Op::ShiftRight if is_range_type(left) || is_range_type(right) => {
+            check_range_strict(op, left, right)
         },
         // MACADDR8: `&`/`|` combine two eight-byte addresses byte-wise, yielding a MACADDR8.
         Op::BitAnd | Op::BitOr if left == ColumnType::Macaddr8 && right == ColumnType::Macaddr8 => {
@@ -5296,6 +5308,51 @@ fn check_range_containment(
         expected: kind.element_type(),
         found: contained,
     })
+}
+
+/// Type rule for the range set operators `+` (union), `*` (intersection), and `-` (difference): both
+/// operands are ranges of the same element kind, and the result is that range type. A mismatched kind
+/// (or a non-range operand) is a loud type error.
+fn check_range_setop(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    let symbol = match op {
+        ast::BinaryOp::Plus => "+",
+        ast::BinaryOp::Multiply => "*",
+        _ => "-",
+    };
+    match (left, right) {
+        (ColumnType::Range(a), ColumnType::Range(b)) if a == b => Ok(ColumnType::Range(a)),
+        _ => Err(Error::TypeMismatch {
+            context: format!("range set operator `{symbol}`"),
+            expected: left,
+            found: right,
+        }),
+    }
+}
+
+/// Type rule for the range strict-order predicates `<<` (strictly left of) and `>>` (strictly right
+/// of): both operands are ranges of the same element kind, and the result is `BOOL`.
+fn check_range_strict(
+    op: ast::BinaryOp,
+    left: ColumnType,
+    right: ColumnType,
+) -> Result<ColumnType, Error> {
+    let symbol = if matches!(op, ast::BinaryOp::ShiftLeft) {
+        "<<"
+    } else {
+        ">>"
+    };
+    match (left, right) {
+        (ColumnType::Range(a), ColumnType::Range(b)) if a == b => Ok(ColumnType::Bool),
+        _ => Err(Error::TypeMismatch {
+            context: format!("range strict-order operator `{symbol}`"),
+            expected: left,
+            found: right,
+        }),
+    }
 }
 
 /// Type rule for the integer bitwise operators `&` / `|`: both operands must be `INT` and the
