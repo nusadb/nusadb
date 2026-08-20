@@ -1871,6 +1871,22 @@ pub(super) fn convert_value(value: sql::Value) -> Result<ast::Value, Error> {
         // E'…' / U&'…' arrive already unescaped from the tokenizer.
         | sql::Value::EscapedStringLiteral(s)
         | sql::Value::UnicodeStringLiteral(s) => Ok(ast::Value::Text(s)),
+        // `B'1011'` is a bit-string literal (each character a bit); `X'1a'` is a hex-string literal
+        // (four bits per hex digit). Both become a `BIT` value.
+        sql::Value::SingleQuotedByteStringLiteral(s) => crate::bit::parse(&s)
+            .map(ast::Value::Bit)
+            .ok_or(Error::InvalidValue {
+                ty: nusadb_core::ColumnType::Bit(0),
+                value: s,
+            }),
+        sql::Value::HexStringLiteral(s) => {
+            crate::bit::from_hex(&s)
+                .map(ast::Value::Bit)
+                .ok_or(Error::InvalidValue {
+                    ty: nusadb_core::ColumnType::Bit(0),
+                    value: s,
+                })
+        },
         other => unsupported(&format!("literal `{other}`")),
     }
 }

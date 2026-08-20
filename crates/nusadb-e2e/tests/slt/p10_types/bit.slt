@@ -210,3 +210,16 @@ SELECT CAST('1011' AS BIT(4))::INT
 # A bit string wider than 32 bits overflows the signed 32-bit integer.
 statement error
 SELECT CAST(CAST('101010101010101010101010101010101' AS BIT(33)) AS INT)
+
+# A B'...' literal is a bit string (each character one bit); an X'...' literal is a hex string
+# (four bits per hex digit). Both are BIT values.
+query TTT
+SELECT B'1011', X'1a', X'ff'
+----
+1011 00011010 11111111
+
+# They compose with the bit-string operators.
+query TI
+SELECT B'1011' || X'0', length(B'1011')
+----
+10110000 4

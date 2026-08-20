@@ -134,6 +134,20 @@ pub fn bytea_set_bit(bytes: &[u8], i: usize, one: bool) -> Vec<u8> {
     out
 }
 
+/// Parse a hex-string literal (`X'1a'`) into its bits — four bits per hex digit, most-significant
+/// first (`X'1a'` is `00011010`). `None` if any character is not a hex digit.
+#[must_use]
+pub fn from_hex(s: &str) -> Option<Vec<bool>> {
+    let mut bits = Vec::with_capacity(s.len() * 4);
+    for c in s.chars() {
+        let nibble = c.to_digit(16)?;
+        for p in (0..4).rev() {
+            bits.push((nibble >> p) & 1 == 1);
+        }
+    }
+    Some(bits)
+}
+
 /// Render a bit string as its canonical text (`"1011"`).
 #[must_use]
 pub fn format(bits: &[bool]) -> String {
@@ -198,6 +212,21 @@ mod tests {
         assert_eq!(parse("102"), None);
         assert_eq!(format(&[true, false, true, true]), "1011");
         assert_eq!(format(&[]), "");
+    }
+
+    #[test]
+    fn from_hex_expands_each_digit_to_four_bits() {
+        assert_eq!(
+            from_hex("1a").map(|b| format(&b)),
+            Some("00011010".to_owned())
+        );
+        assert_eq!(
+            from_hex("ff").map(|b| format(&b)),
+            Some("11111111".to_owned())
+        );
+        assert_eq!(from_hex("0").map(|b| format(&b)), Some("0000".to_owned()));
+        assert_eq!(from_hex("").map(|b| format(&b)), Some(String::new()));
+        assert_eq!(from_hex("1g"), None);
     }
 
     #[test]
