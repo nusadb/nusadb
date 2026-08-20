@@ -98,7 +98,7 @@ SELECT MAKE_INTERVAL()
 query T
 SELECT MAKE_INTERVAL(0, 0, 0, 0, 0, 0, 1.5)
 ----
-00:00:01.500000
+00:00:01.5
 
 # --- DATE_BIN (snap a timestamp to a stride-aligned bin) ---
 # 10:37 in 1-hour bins from midnight → 10:00.

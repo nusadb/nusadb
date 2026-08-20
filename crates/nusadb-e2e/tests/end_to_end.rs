@@ -1571,10 +1571,10 @@ fn added_scalar_functions_justify_days_encode_decode_regexp_matches() {
         ])
     );
     // make_time accepts fractional seconds (its seconds field is double precision); the time renders
-    // with full microsecond precision.
+    // with trailing zeros trimmed off the fraction.
     assert_eq!(
         one("SELECT make_time(8, 15, 23.5)::text"),
-        Value::Text("08:15:23.500000".to_owned())
+        Value::Text("08:15:23.5".to_owned())
     );
 }
 

@@ -214,17 +214,29 @@ pub fn parse_time(s: &str) -> Option<i64> {
     parse_time_of_day(s.trim())
 }
 
-/// Format microseconds-since-midnight as `HH:MM:SS` (or `HH:MM:SS.ffffff` with a fraction).
+/// The trailing fractional-seconds suffix for `frac` sub-second microseconds: an empty string when
+/// zero, otherwise a dot and the six-digit fraction with trailing zeros trimmed (`.5`, `.12`,
+/// `.123456`) — matching the reference engine, which does not pad the fraction to a fixed width.
+#[must_use]
+pub(crate) fn subsecond_suffix(frac: u32) -> String {
+    if frac == 0 {
+        return String::new();
+    }
+    let digits = format!("{frac:06}");
+    format!(".{}", digits.trim_end_matches('0'))
+}
+
+/// Format microseconds-since-midnight as `HH:MM:SS` (or `HH:MM:SS.f…` with a trimmed fraction).
 #[must_use]
 pub fn format_time(micros: i64) -> String {
     let secs = micros / MICROS_PER_SEC;
     let frac = micros % MICROS_PER_SEC;
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if frac == 0 {
-        format!("{h:02}:{m:02}:{s:02}")
-    } else {
-        format!("{h:02}:{m:02}:{s:02}.{frac:06}")
-    }
+    // `frac` is `micros % 1_000_000`, always in `[0, 1_000_000)`, so the cast is lossless.
+    format!(
+        "{h:02}:{m:02}:{s:02}{}",
+        subsecond_suffix(u32::try_from(frac).unwrap_or(0))
+    )
 }
 
 fn parse_time_of_day(s: &str) -> Option<i64> {
@@ -1557,7 +1569,7 @@ mod tests {
 
     #[test]
     fn time_round_trips() {
-        for s in ["00:00:00", "23:59:59", "12:30:45.123456", "01:02:03.000500"] {
+        for s in ["00:00:00", "23:59:59", "12:30:45.123456", "01:02:03.0005"] {
             assert_eq!(format_time(parse_time(s).unwrap()), s);
         }
         assert_eq!(parse_time("00:00:01"), Some(1_000_000));
@@ -1575,7 +1587,7 @@ mod tests {
         // 'T' separator accepted, formatted with a space.
         assert_eq!(
             format_timestamp(parse_timestamp("2024-06-15T13:45:30.500000").unwrap()),
-            "2024-06-15 13:45:30.500000"
+            "2024-06-15 13:45:30.5"
         );
     }
 
@@ -1619,7 +1631,7 @@ mod tests {
         assert_eq!(fmt("23:30:00-02:00"), "23:30:00-02");
         assert_eq!(fmt("06:45:30Z"), "06:45:30+00");
         assert_eq!(fmt("06:45:30"), "06:45:30+00");
-        assert_eq!(fmt("12:00:00.250000+03"), "12:00:00.250000+03");
+        assert_eq!(fmt("12:00:00.250000+03"), "12:00:00.25+03");
 
         // The packed accessors round-trip local time and offset.
         let packed = parse_timetz("13:45:30+07").unwrap();

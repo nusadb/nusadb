@@ -391,11 +391,9 @@ fn format_clock(micros: i64) -> String {
     let frac = micros % per_sec;
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     let sign = if neg { "-" } else { "" };
-    if frac == 0 {
-        format!("{sign}{h:02}:{m:02}:{s:02}")
-    } else {
-        format!("{sign}{h:02}:{m:02}:{s:02}.{frac:06}")
-    }
+    // `frac` is `micros % 1_000_000`, always in `[0, 1_000_000)`, so the cast is lossless.
+    let suffix = crate::temporal::subsecond_suffix(u32::try_from(frac).unwrap_or(0));
+    format!("{sign}{h:02}:{m:02}:{s:02}{suffix}")
 }
 
 #[cfg(test)]
