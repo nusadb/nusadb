@@ -6878,7 +6878,36 @@ fn apply_unary(op: ast::UnaryOp, value: &ast::Value) -> Result<ast::Value, Error
             ast::Value::Bit(b) => ast::Value::Bit(crate::bit::complement(b)),
             _ => ast::Value::Null,
         },
+        // `@@` — the center point of a box, circle, lseg, or polygon.
+        ast::UnaryOp::GeomCenter => geom_center(value),
     })
+}
+
+/// Evaluate the geometric center operator `@@`: the center point of a `box` (corner midpoint),
+/// `circle` (its center), `lseg` (midpoint), or `polygon` (vertex mean). A `NULL` or otherwise-shaped
+/// operand yields `NULL`.
+fn geom_center(value: &ast::Value) -> ast::Value {
+    use crate::geometry::GeomVal;
+    match value {
+        ast::Value::Geometry(GeomVal::Box {
+            high_x,
+            high_y,
+            low_x,
+            low_y,
+        }) => ast::Value::Geometry(crate::geometry::box_center(
+            *high_x, *high_y, *low_x, *low_y,
+        )),
+        ast::Value::Geometry(GeomVal::Circle { cx, cy, .. }) => {
+            ast::Value::Geometry(GeomVal::point(*cx, *cy))
+        },
+        ast::Value::Geometry(GeomVal::Lseg { x1, y1, x2, y2 }) => {
+            ast::Value::Geometry(crate::geometry::lseg_center(*x1, *y1, *x2, *y2))
+        },
+        ast::Value::Geometry(GeomVal::Polygon { points }) => {
+            crate::geometry::polygon_center(points).map_or(ast::Value::Null, ast::Value::Geometry)
+        },
+        _ => ast::Value::Null,
+    }
 }
 
 fn to_f64(v: &ast::Value) -> f64 {

@@ -5610,7 +5610,10 @@ pub(super) fn analyze_unary(
     // `NOT NULL` is NULL, three-valued) instead of rejecting as untypeable.
     let hint = match op {
         ast::UnaryOp::Not => Some(ColumnType::Bool),
-        ast::UnaryOp::Negate | ast::UnaryOp::Plus | ast::UnaryOp::BitNot => None,
+        ast::UnaryOp::Negate
+        | ast::UnaryOp::Plus
+        | ast::UnaryOp::BitNot
+        | ast::UnaryOp::GeomCenter => None,
     };
     let operand = analyze_expr_agg(expr, scope, catalog, hint, aggregates)?;
     let ty = match op {
@@ -5651,6 +5654,27 @@ pub(super) fn analyze_unary(
             return Err(Error::TypeMismatch {
                 context: "bitwise complement".to_owned(),
                 expected: ColumnType::Int,
+                found: operand.ty,
+            });
+        },
+        // `@@` — the center point of a box, circle, lseg, or polygon, yielding a `point`.
+        ast::UnaryOp::GeomCenter
+            if matches!(
+                operand.ty,
+                ColumnType::Geometry(
+                    nusadb_core::engine::GeomKind::Box
+                        | nusadb_core::engine::GeomKind::Circle
+                        | nusadb_core::engine::GeomKind::Lseg
+                        | nusadb_core::engine::GeomKind::Polygon
+                )
+            ) =>
+        {
+            ColumnType::Geometry(nusadb_core::engine::GeomKind::Point)
+        },
+        ast::UnaryOp::GeomCenter => {
+            return Err(Error::TypeMismatch {
+                context: "geometric center `@@`".to_owned(),
+                expected: ColumnType::Geometry(nusadb_core::engine::GeomKind::Box),
                 found: operand.ty,
             });
         },

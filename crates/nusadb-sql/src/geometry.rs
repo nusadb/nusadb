@@ -502,6 +502,36 @@ pub fn box_center(high_x: f64, high_y: f64, low_x: f64, low_y: f64) -> GeomVal {
     GeomVal::point((high_x + low_x) / 2.0, (high_y + low_y) / 2.0)
 }
 
+/// Center (midpoint) of a line segment — the `@@` operator on an `lseg`.
+#[must_use]
+#[allow(
+    clippy::manual_midpoint,
+    reason = "plain `(a + b) / 2` matches the reference engine's center rounding; `f64::midpoint` rounds differently for large magnitudes"
+)]
+pub fn lseg_center(x1: f64, y1: f64, x2: f64, y2: f64) -> GeomVal {
+    GeomVal::point((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+}
+
+/// Center of a polygon — the `@@` operator on a `polygon`.
+///
+/// The arithmetic mean of the vertices (matching the reference engine, which averages the vertices
+/// rather than computing the area centroid). `None` for an empty vertex list.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the vertex count is small (a polygon literal), so the f64 conversion is exact in practice and matches the reference engine's mean-of-vertices"
+)]
+pub fn polygon_center(points: &[(f64, f64)]) -> Option<GeomVal> {
+    if points.is_empty() {
+        return None;
+    }
+    let n = points.len() as f64;
+    let (sx, sy) = points
+        .iter()
+        .fold((0.0, 0.0), |(ax, ay), &(x, y)| (ax + x, ay + y));
+    Some(GeomVal::point(sx / n, sy / n))
+}
+
 /// Whether a box contains a point (`box @> point`), inclusive of the boundary.
 #[must_use]
 pub fn box_contains_point(
@@ -1357,6 +1387,19 @@ mod tests {
         assert!(!circle_contains_point(0.0, 0.0, 5.0, 3.0, 5.0));
         assert!(circle_contains_circle(0.0, 0.0, 5.0, 0.0, 0.0, 2.0));
         assert!(!circle_contains_circle(0.0, 0.0, 5.0, 4.0, 0.0, 2.0));
+    }
+
+    #[test]
+    fn center_of_lseg_and_polygon() {
+        // lseg center is the midpoint of the endpoints.
+        assert_eq!(lseg_center(0.0, 0.0, 4.0, 6.0), GeomVal::point(2.0, 3.0));
+        assert_eq!(lseg_center(0.0, 0.0, 3.0, 3.0), GeomVal::point(1.5, 1.5));
+        // polygon center is the arithmetic mean of the vertices (not the area centroid).
+        let square = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+        assert_eq!(polygon_center(&square), Some(GeomVal::point(2.0, 2.0)));
+        let five = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)];
+        assert_eq!(polygon_center(&five), Some(GeomVal::point(1.0, 0.8)));
+        assert_eq!(polygon_center(&[]), None);
     }
 
     #[test]

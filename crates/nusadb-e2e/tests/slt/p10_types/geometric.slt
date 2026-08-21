@@ -855,3 +855,26 @@ SELECT
   CAST('((1,1),(3,1),(3,3),(1,3))' AS POLYGON) <@ CAST('((0,0),(2,0),(2,2),(0,2))' AS POLYGON)
 ----
 1  0
+
+# The prefix @@ operator gives the center point: a box's corner midpoint, a circle's center, an
+# lseg's midpoint, and a polygon's vertex mean.
+query TTTT
+SELECT
+  @@ CAST('((0,0),(4,6))' AS BOX),
+  @@ CAST('<(3,4),5>' AS CIRCLE),
+  @@ CAST('[(0,0),(4,6)]' AS LSEG),
+  @@ CAST('((0,0),(4,0),(4,4),(0,4))' AS POLYGON)
+----
+(2,3) (3,4) (2,3) (2,2)
+
+# The polygon center is the arithmetic mean of the vertices, not the area centroid.
+query TT
+SELECT
+  @@ CAST('((0,0),(1,0),(2,0),(2,2),(0,2))' AS POLYGON),
+  @@ CAST('((0,0),(6,0),(0,6))' AS POLYGON)
+----
+(1,0.8) (2,2)
+
+# @@ on a geometric kind without a center (point/path/line) is a loud type error.
+statement error
+SELECT @@ CAST('(2,3)' AS POINT)

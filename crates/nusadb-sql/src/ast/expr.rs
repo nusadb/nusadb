@@ -1784,6 +1784,9 @@ pub enum UnaryOp {
     Plus,
     /// Bitwise complement, `~` — flips every bit of an integer or `MACADDR8` operand.
     BitNot,
+    /// Geometric center `@@` — the center point of a `box` (corner midpoint), `circle` (center),
+    /// `lseg` (midpoint), or `polygon` (vertex mean), as a `point`.
+    GeomCenter,
 }
 
 /// The JSON item type required by an [`Expr::IsJson`] predicate (`<expr> IS JSON <item_type>`).

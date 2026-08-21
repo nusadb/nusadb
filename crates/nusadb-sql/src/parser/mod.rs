@@ -25,7 +25,7 @@
 
 use core::any::TypeId;
 use sqlparser::ast as sql;
-use sqlparser::dialect::{Dialect, GenericDialect};
+use sqlparser::dialect::{Dialect, GenericDialect, Precedence};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
@@ -165,6 +165,26 @@ impl Dialect for NusaParserDialect {
     fn supports_select_wildcard_replace(&self) -> bool {
         // Same rationale for `SELECT * REPLACE (expr AS col)`.
         true
+    }
+
+    fn parse_prefix(
+        &self,
+        parser: &mut Parser,
+    ) -> Option<Result<sql::Expr, sqlparser::parser::ParserError>> {
+        // Prefix `@@` — the geometric center operator. sqlparser parses the geometric *prefix*
+        // operators only behind `supports_geometric_types()`, which would also change how the many
+        // infix geometric/range operators this wrapper hooks itself get tokenized. So recognize just
+        // this one prefix form here. A `@@` in infix position (the full-text match) is untouched —
+        // this fires only when `@@` starts an expression.
+        if parser.peek_token().token != Token::AtAt {
+            return None;
+        }
+        parser.next_token();
+        let prec = self.prec_value(Precedence::PlusMinus);
+        Some(parser.parse_subexpr(prec).map(|expr| sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::DoubleAt,
+            expr: Box::new(expr),
+        }))
     }
 
     fn parse_infix(

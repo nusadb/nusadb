@@ -2095,6 +2095,8 @@ pub(super) fn convert_unary_op(op: sql::UnaryOperator) -> Result<ast::UnaryOp, E
         sql::UnaryOperator::Plus => Ok(ast::UnaryOp::Plus),
         // `~` — bitwise complement of an integer or a `MACADDR8`.
         sql::UnaryOperator::BitwiseNot => Ok(ast::UnaryOp::BitNot),
+        // `@@` prefix — the geometric center operator.
+        sql::UnaryOperator::DoubleAt => Ok(ast::UnaryOp::GeomCenter),
         other => unsupported(&format!("unary operator `{other}`")),
     }
 }
