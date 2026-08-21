@@ -61,6 +61,14 @@ fn fold_aggregate(agg: &mut AggregateCall) {
     for key in &mut agg.order_by {
         fold_in_place(&mut key.expr);
     }
+    // A hypothetical-set aggregate's ORDER BY key expressions and its per-group constant direct
+    // arguments both fold like any other input-space expression.
+    for key in &mut agg.ordered_set_keys {
+        fold_in_place(&mut key.expr);
+    }
+    for arg in &mut agg.hypothetical_args {
+        fold_in_place(arg);
+    }
 }
 
 fn fold_window(window: &mut WindowExpr) {

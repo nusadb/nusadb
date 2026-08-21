@@ -34,9 +34,10 @@ use crate::planner::{
     DropPolicyPlan, DropProcedurePlan, DropSchemaPlan, DropSequencePlan, DropTablePlan,
     DropTriggerPlan, DropViewPlan, ForeignKeySpec, FrameBound, IndexMeta, InsertPlan, InsertSource,
     JoinPlan, LogicalPlan, MaterializedViewPlan, MergeMatchedAction, MergePlan, MergeWhen,
-    ModifyingCteDef, OnConflictPlan, OrderByKey, Projection, RecursiveCteDef, SelectPlan,
-    SetOpPlan, SetOpTree, TruncateCascadePlan, TxnCharacteristics, TypedCaseBranch, TypedExpr,
-    TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr, WindowFrame,
+    ModifyingCteDef, OnConflictPlan, OrderByKey, OrderedSetKey, Projection, RecursiveCteDef,
+    SelectPlan, SetOpPlan, SetOpTree, TruncateCascadePlan, TxnCharacteristics, TypedCaseBranch,
+    TypedExpr, TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr,
+    WindowFrame,
 };
 
 mod dcl;

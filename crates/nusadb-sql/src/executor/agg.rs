@@ -202,6 +202,10 @@ pub(crate) struct Acc {
     // For ordered-set aggregates (PERCENTILE_CONT/DISC, MODE): every non-`NULL` ordering
     // value in the group, sorted at finalization. Empty (and unused) for other aggregates.
     ordered_values: Vec<ast::Value>,
+    // For hypothetical-set aggregates (RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST): the ORDER BY key
+    // tuple of each collected row, in input order. A `NULL` key is kept (counted in `n`) and ordered
+    // by its key's `NULLS FIRST`/`LAST` placement. Empty (and unused) for every other aggregate.
+    ordered_key_tuples: Vec<Vec<ast::Value>>,
     // For ARRAY_AGG: every collected value in input order, NULLs included (unlike the other
     // aggregates, which skip NULL). Empty (and unused) for other aggregates. JSON_OBJECT_AGG also
     // uses this for the per-row VALUE, paired positionally with `object_keys`.
@@ -401,19 +405,20 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
             call.ordered_set_descending,
             acc.ordered_values,
         ),
-        // Hypothetical-set aggregates: rank the constant direct argument against the collected
-        // ordered set. The argument is a per-group constant (resolved against an empty scope), so it
-        // evaluates without a row; a stray column reference errors loudly here rather than panics.
+        // Hypothetical-set aggregates: rank the constant direct-argument tuple against the collected
+        // ordered set of key tuples, comparing lexicographically with each key's own direction and
+        // NULL placement. The arguments are per-group constants (resolved against an empty scope),
+        // so they evaluate without a row; a stray column reference errors loudly here rather than panics.
         F::Rank | F::DenseRank | F::PercentRank | F::CumeDist => {
-            let arg = call.hypothetical_arg.as_ref().ok_or_else(|| {
-                Error::Internal("hypothetical-set aggregate requires a direct argument".to_owned())
-            })?;
-            let hypothetical = eval::eval(arg, &Row::new())?;
+            let mut arg_tuple = Vec::with_capacity(call.hypothetical_args.len());
+            for arg in &call.hypothetical_args {
+                arg_tuple.push(eval::eval(arg, &Row::new())?);
+            }
             finalize_hypothetical_set(
                 call.func,
-                &hypothetical,
-                call.ordered_set_descending,
-                &acc.ordered_values,
+                &arg_tuple,
+                &call.ordered_set_keys,
+                &acc.ordered_key_tuples,
             )
         },
         // ARRAY_AGG: the collected values as an array; an empty group (nothing seen) → NULL.
@@ -674,17 +679,78 @@ fn finalize_ordered_set(
     }
 }
 
+/// Order one key column of a collected tuple's value `row` against the hypothetical `arg` value,
+/// honoring the key's direction and `NULLS FIRST/LAST` placement. `Less` = `row` sorts before `arg`
+/// at this column, `Greater` = after, `Equal` = a tie (compare the next column). A `NULL`'s position
+/// is fixed by `nulls_first` **independent of `descending`**: `NULLS FIRST` puts it at the front,
+/// `NULLS LAST` at the back. `descending` only flips the order of two non-`NULL` values.
+fn ordered_set_element_cmp(
+    row: &ast::Value,
+    arg: &ast::Value,
+    key: &OrderedSetKey,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (row, arg) {
+        // Two NULLs tie at this column.
+        (ast::Value::Null, ast::Value::Null) => Ordering::Equal,
+        // The row's NULL sits at the front (NULLS FIRST → before arg) or back (NULLS LAST → after).
+        (ast::Value::Null, _) => {
+            if key.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        },
+        // The arg's NULL sits at the front (NULLS FIRST → arg before row) or back (arg after row).
+        (_, ast::Value::Null) => {
+            if key.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        },
+        // Both non-NULL: the direction-aware value compare.
+        (r, a) => match eval::compare(r, a) {
+            Ordering::Less if key.descending => Ordering::Greater,
+            Ordering::Greater if key.descending => Ordering::Less,
+            ord => ord,
+        },
+    }
+}
+
+/// Lexicographic order of a collected key tuple `row` against a comparison tuple `other` under the
+/// per-key direction + NULL placement in `keys`: the first column that is not a tie decides; an
+/// all-tie tuple returns `Equal`. `other` is either the hypothetical `arg` (for the rank counts) or
+/// another collected tuple (for the `DENSE_RANK` distinct grouping — equality is arg-independent).
+/// The three slices are the same length by construction (one entry per `ORDER BY` key).
+fn ordered_set_tuple_cmp(
+    row: &[ast::Value],
+    other: &[ast::Value],
+    keys: &[OrderedSetKey],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for ((r, a), key) in row.iter().zip(other).zip(keys) {
+        match ordered_set_element_cmp(r, a, key) {
+            Ordering::Equal => {},
+            other => return other,
+        }
+    }
+    Ordering::Equal
+}
+
 /// Compute a hypothetical-set aggregate (`RANK` / `DENSE_RANK` / `PERCENT_RANK` / `CUME_DIST` in
-/// their `WITHIN GROUP (ORDER BY key)` form) — report where the constant hypothetical value `arg`
-/// would rank if inserted into the group's collected non-NULL ordering `values`.
+/// their `WITHIN GROUP (ORDER BY k1, …, kN)` form) — report where the constant hypothetical tuple
+/// `arg` would rank if inserted into the group's collected key `tuples`. Each column is compared
+/// under its own `keys[i]` direction and `NULLS FIRST/LAST` placement; comparison is lexicographic
+/// and every row (NULL keys included) is in the set and in `n`.
 ///
-/// Let `n = values.len()`, and read `≺`/`≼` under the `ORDER BY` direction (`descending` flips the
-/// sense): `k ≺ arg` is `k < arg` ascending, `k > arg` descending; `k ≼ arg` adds equality.
+/// Let `n = tuples.len()`, `t ≺ arg` = [`ordered_set_tuple_cmp`] returns `Less`, `t ≼ arg` = `Less`
+/// or `Equal`:
 ///
-/// - `RANK` = `1 + count(k ≺ arg)` (rank with gaps) — `BIGINT`.
-/// - `DENSE_RANK` = `1 + count(distinct k ≺ arg)` (rank without gaps) — `BIGINT`.
-/// - `PERCENT_RANK` = `(rank − 1) / n`, i.e. `count(k ≺ arg) / n`, and `0` when `n = 0` — `FLOAT`.
-/// - `CUME_DIST` = `(count(k ≼ arg) + 1) / (n + 1)` — `FLOAT`.
+/// - `RANK` = `1 + count(t ≺ arg)` (rank with gaps) — `BIGINT`.
+/// - `DENSE_RANK` = `1 + count(distinct t ≺ arg)` (rank without gaps) — `BIGINT`.
+/// - `PERCENT_RANK` = `(rank − 1) / n`, i.e. `count(t ≺ arg) / n`, and `0` when `n = 0` — `FLOAT`.
+/// - `CUME_DIST` = `(count(t ≼ arg) + 1) / (n + 1)` — `FLOAT`.
 ///
 /// An empty group is not special-cased: `n = 0` yields `RANK`/`DENSE_RANK` `1`, `PERCENT_RANK` `0`,
 /// and `CUME_DIST` `1` — matching the reference oracle.
@@ -694,39 +760,31 @@ fn finalize_ordered_set(
 )]
 fn finalize_hypothetical_set(
     func: ast::AggregateFunc,
-    arg: &ast::Value,
-    descending: bool,
-    values: &[ast::Value],
+    arg: &[ast::Value],
+    keys: &[OrderedSetKey],
+    tuples: &[Vec<ast::Value>],
 ) -> ast::Value {
     use std::cmp::Ordering;
 
     use crate::ast::AggregateFunc as F;
-    // Direction-aware "k strictly precedes the hypothetical arg" in the ORDER BY ordering.
-    let precedes = |k: &ast::Value| match eval::compare(k, arg) {
-        Ordering::Less => !descending,
-        Ordering::Greater => descending,
-        Ordering::Equal => false,
-    };
-    // Direction-aware "k precedes-or-ties the hypothetical arg".
-    let precedes_or_ties = |k: &ast::Value| match eval::compare(k, arg) {
-        Ordering::Equal => true,
-        Ordering::Less => !descending,
-        Ordering::Greater => descending,
-    };
-    let n = values.len();
+    let precedes = |t: &Vec<ast::Value>| ordered_set_tuple_cmp(t, arg, keys) == Ordering::Less;
+    let precedes_or_ties =
+        |t: &Vec<ast::Value>| ordered_set_tuple_cmp(t, arg, keys) != Ordering::Greater;
+    let n = tuples.len();
     match func {
-        // RANK: 1 + how many values sort strictly before the hypothetical one.
+        // RANK: 1 + how many tuples sort strictly before the hypothetical one.
         F::Rank => {
-            let before = values.iter().filter(|k| precedes(k)).count();
+            let before = tuples.iter().filter(|t| precedes(t)).count();
             ast::Value::Int(i64::try_from(before).unwrap_or(i64::MAX).saturating_add(1))
         },
-        // DENSE_RANK: 1 + how many *distinct* values sort strictly before it. Equal values are
-        // adjacent after sorting, so a dedup collapses each run to one.
+        // DENSE_RANK: 1 + how many *distinct* tuples sort strictly before it. Sorting (by the same
+        // direction-aware order, arg-independent for equality) makes equal tuples adjacent so a
+        // dedup collapses each run to one; a NULL ties only another NULL in the same column.
         F::DenseRank => {
-            let mut distinct: Vec<ast::Value> =
-                values.iter().filter(|k| precedes(k)).cloned().collect();
-            distinct.sort_by(eval::compare);
-            distinct.dedup_by(|a, b| eval::compare(a, b) == Ordering::Equal);
+            let mut distinct: Vec<Vec<ast::Value>> =
+                tuples.iter().filter(|t| precedes(t)).cloned().collect();
+            distinct.sort_by(|a, b| ordered_set_tuple_cmp(a, b, keys));
+            distinct.dedup_by(|a, b| ordered_set_tuple_cmp(a, b, keys) == Ordering::Equal);
             ast::Value::Int(
                 i64::try_from(distinct.len())
                     .unwrap_or(i64::MAX)
@@ -735,7 +793,7 @@ fn finalize_hypothetical_set(
         },
         // PERCENT_RANK: (rank − 1) / n = count(strictly before) / n; 0 for an empty group.
         F::PercentRank => {
-            let before = values.iter().filter(|k| precedes(k)).count();
+            let before = tuples.iter().filter(|t| precedes(t)).count();
             let pr = if n == 0 {
                 0.0
             } else {
@@ -745,7 +803,7 @@ fn finalize_hypothetical_set(
         },
         // CUME_DIST: (count(≼ arg) + 1) / (n + 1).
         F::CumeDist => {
-            let le = values.iter().filter(|k| precedes_or_ties(k)).count();
+            let le = tuples.iter().filter(|t| precedes_or_ties(t)).count();
             ast::Value::Float((le as f64 + 1.0) / (n as f64 + 1.0))
         },
         _ => ast::Value::Null,
@@ -1458,6 +1516,16 @@ pub(super) fn accumulate_row(
                     acc.count += 1;
                     acc.any_seen = true;
                 },
+                // Hypothetical-set aggregates collect the ORDER BY key tuple of every row — NULL
+                // keys included, ordered later by their NULLS placement and counted in `n`.
+                F::Rank | F::DenseRank | F::PercentRank | F::CumeDist => {
+                    let mut tuple = Vec::with_capacity(call.ordered_set_keys.len());
+                    for key in &call.ordered_set_keys {
+                        tuple.push(eval_arg(&key.expr, row)?);
+                    }
+                    acc.ordered_key_tuples.push(tuple);
+                    acc.any_seen = true;
+                },
                 _ => {
                     let arg = call.arg.as_ref().ok_or_else(|| {
                         Error::Internal(format!("aggregate {:?} requires an argument", call.func))
@@ -1609,16 +1677,16 @@ pub(crate) fn fold_value(
                 acc.bit_fold = Some(acc.bit_fold.unwrap_or(0) ^ i);
             }
         },
-        // Ordered-set and hypothetical-set aggregates collect every non-NULL ordering value; the
-        // percentile/mode or the hypothetical rank is computed from the set at finalization.
-        F::PercentileCont
-        | F::PercentileDisc
-        | F::Mode
-        | F::Rank
-        | F::DenseRank
-        | F::PercentRank
-        | F::CumeDist => {
+        // Ordered-set aggregates collect every non-NULL ordering value; the percentile/mode is
+        // computed from the sorted set at finalization. (The hypothetical-set aggregates collect
+        // their ORDER BY key tuple in `accumulate_row` instead, never reaching this per-value fold.)
+        F::PercentileCont | F::PercentileDisc | F::Mode => {
             acc.ordered_values.push(value);
+        },
+        // Hypothetical-set aggregates collect their ORDER BY key tuple in accumulate_row's outer
+        // match (with a per-tuple NULL-key skip) and never reach this single-value fold.
+        F::Rank | F::DenseRank | F::PercentRank | F::CumeDist => {
+            unreachable!("hypothetical-set aggregates fold their key tuple in the outer arm")
         },
         // ARRAY_AGG / JSONB_AGG are handled in accumulate_row's outer match (they keep NULLs, so they
         // run before the NULL-skip above) and never reach this non-NULL value path.
@@ -1800,81 +1868,221 @@ mod tests {
     use nusadb_core::ColumnType;
 
     /// Hypothetical-set rank math over a small ordered set, matching the reference oracle:
-    /// `rank`/`dense_rank` count how many (distinct) values precede the hypothetical argument,
-    /// `percent_rank`/`cume_dist` are the corresponding ratios, and `DESC` flips "precede".
+    /// `rank`/`dense_rank` count how many (distinct) key tuples precede the hypothetical argument
+    /// tuple, `percent_rank`/`cume_dist` are the corresponding ratios, and each key's `DESC` flag +
+    /// `NULLS FIRST/LAST` placement decide "precede" for that column. Covers single-key (1-tuples),
+    /// multi-key tuples, and NULL keys (kept and ordered by their placement, counted in `n`).
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat battery of assertions over the single-key, multi-key, and NULL rank forms"
+    )]
     fn hypothetical_set_ranks_the_direct_argument() {
         use crate::ast::AggregateFunc as F;
-        let ints = |xs: &[i64]| xs.iter().map(|&i| V::Int(i)).collect::<Vec<_>>();
-        let hs = ints(&[1, 2, 3, 4, 5, 6]);
-        let ties = ints(&[1, 3, 3, 5]);
+        use crate::planner::{OrderedSetKey, TypedExpr, TypedExprKind};
+        // A sort key with a given direction + NULL placement; the expr is unused by finalize.
+        let key = |descending: bool, nulls_first: bool| OrderedSetKey {
+            expr: TypedExpr {
+                kind: TypedExprKind::Column(0),
+                ty: ColumnType::Int,
+            },
+            descending,
+            nulls_first,
+        };
+        // ASC default (NULLS LAST) and DESC default (NULLS FIRST) single-key sort specs.
+        let asc = [key(false, false)];
+        let desc = [key(true, true)];
+        // Build a set of 1-tuples from scalar ints (the single-key form).
+        let ones = |xs: &[i64]| xs.iter().map(|&i| vec![V::Int(i)]).collect::<Vec<_>>();
+        let hs = ones(&[1, 2, 3, 4, 5, 6]);
+        let ties = ones(&[1, 3, 3, 5]);
 
+        // --- Single-key form (1-tuples) — unchanged behavior. ---
         // rank(4) = 1 + count(<4) = 4; dense_rank matches (no ties among 1..6).
         assert_eq!(
-            finalize_hypothetical_set(F::Rank, &V::Int(4), false, &hs),
+            finalize_hypothetical_set(F::Rank, &[V::Int(4)], &asc, &hs),
             V::Int(4)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::DenseRank, &V::Int(4), false, &hs),
+            finalize_hypothetical_set(F::DenseRank, &[V::Int(4)], &asc, &hs),
             V::Int(4)
         );
         // percent_rank(4) = 3/6 = 0.5; cume_dist(4) = (4 + 1)/(6 + 1) = 5/7.
         assert_eq!(
-            finalize_hypothetical_set(F::PercentRank, &V::Int(4), false, &hs),
+            finalize_hypothetical_set(F::PercentRank, &[V::Int(4)], &asc, &hs),
             V::Float(0.5)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::CumeDist, &V::Int(4), false, &hs),
+            finalize_hypothetical_set(F::CumeDist, &[V::Int(4)], &asc, &hs),
             V::Float(5.0 / 7.0)
         );
         // DESC flips "before": rank(4) DESC = 1 + count(>4) = 3.
         assert_eq!(
-            finalize_hypothetical_set(F::Rank, &V::Int(4), true, &hs),
+            finalize_hypothetical_set(F::Rank, &[V::Int(4)], &desc, &hs),
             V::Int(3)
         );
-
         // Argument absent from the set: above the max ASC ranks last; below the min ranks first.
         assert_eq!(
-            finalize_hypothetical_set(F::Rank, &V::Int(7), false, &hs),
+            finalize_hypothetical_set(F::Rank, &[V::Int(7)], &asc, &hs),
             V::Int(7)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::Rank, &V::Int(0), false, &hs),
+            finalize_hypothetical_set(F::Rank, &[V::Int(0)], &asc, &hs),
             V::Int(1)
         );
-
         // Ties (1,3,3,5): rank(3) = 2, dense_rank(3) = 2, cume_dist(3) counts ties as <= : 4/5.
         assert_eq!(
-            finalize_hypothetical_set(F::Rank, &V::Int(3), false, &ties),
+            finalize_hypothetical_set(F::Rank, &[V::Int(3)], &asc, &ties),
             V::Int(2)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::DenseRank, &V::Int(3), false, &ties),
+            finalize_hypothetical_set(F::DenseRank, &[V::Int(3)], &asc, &ties),
             V::Int(2)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::CumeDist, &V::Int(3), false, &ties),
+            finalize_hypothetical_set(F::CumeDist, &[V::Int(3)], &asc, &ties),
             V::Float(0.8)
         );
         // dense_rank(4) over ties: distinct(<4) = {1,3} = 2, so 3.
         assert_eq!(
-            finalize_hypothetical_set(F::DenseRank, &V::Int(4), false, &ties),
+            finalize_hypothetical_set(F::DenseRank, &[V::Int(4)], &asc, &ties),
             V::Int(3)
         );
-
         // Empty group (n = 0): rank/dense_rank = 1, percent_rank = 0, cume_dist = 1.
-        let empty: Vec<V> = Vec::new();
+        let empty: Vec<Vec<V>> = Vec::new();
         assert_eq!(
-            finalize_hypothetical_set(F::Rank, &V::Int(4), false, &empty),
+            finalize_hypothetical_set(F::Rank, &[V::Int(4)], &asc, &empty),
             V::Int(1)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::PercentRank, &V::Int(4), false, &empty),
+            finalize_hypothetical_set(F::PercentRank, &[V::Int(4)], &asc, &empty),
             V::Float(0.0)
         );
         assert_eq!(
-            finalize_hypothetical_set(F::CumeDist, &V::Int(4), false, &empty),
+            finalize_hypothetical_set(F::CumeDist, &[V::Int(4)], &asc, &empty),
             V::Float(1.0)
+        );
+
+        // --- Single-key NULL handling (kept in the set and in n, placed by NULLS FIRST/LAST). ---
+        // sk = 1,2,NULL,3,NULL (n = 5).
+        let sk = vec![
+            vec![V::Int(1)],
+            vec![V::Int(2)],
+            vec![V::Null],
+            vec![V::Int(3)],
+            vec![V::Null],
+        ];
+        // rank(2) ASC (NULLS LAST): NULLs sort after 2, do not precede → 1 + count(<2) = 2.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &[V::Int(2)], &[key(false, false)], &sk),
+            V::Int(2)
+        );
+        // rank(2) ASC NULLS FIRST: both NULLs + value 1 precede → 4.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &[V::Int(2)], &[key(false, true)], &sk),
+            V::Int(4)
+        );
+        // rank(2) DESC (default NULLS FIRST): NULLs precede → 2 NULLs + value 3 precede → 4.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &[V::Int(2)], &[key(true, true)], &sk),
+            V::Int(4)
+        );
+        // rank(2) DESC NULLS LAST: NULLs sort last → only value 3 precedes → 2.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &[V::Int(2)], &[key(true, false)], &sk),
+            V::Int(2)
+        );
+        // cume_dist(2) ASC: (count(<=2)=2 + 1)/(5 + 1) = 3/6 = 0.5.
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &[V::Int(2)], &[key(false, false)], &sk),
+            V::Float(0.5)
+        );
+
+        // --- Multi-key form (matches the reference oracle over mk(a,b) below). ---
+        // mk = (1,10),(1,20),(2,10),(2,20),(3,5).
+        let aa = [key(false, false), key(false, false)];
+        let mk = vec![
+            vec![V::Int(1), V::Int(10)],
+            vec![V::Int(1), V::Int(20)],
+            vec![V::Int(2), V::Int(10)],
+            vec![V::Int(2), V::Int(20)],
+            vec![V::Int(3), V::Int(5)],
+        ];
+        let arg = [V::Int(2), V::Int(15)];
+        // rank(2,15) ORDER BY a, b = 4; dense_rank = 4; cume_dist = 4/6.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &arg, &aa, &mk),
+            V::Int(4)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::DenseRank, &arg, &aa, &mk),
+            V::Int(4)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &arg, &aa, &mk),
+            V::Float(4.0 / 6.0)
+        );
+        // rank(2,15) ORDER BY a, b DESC = 4 (for a=2, a row with b>15 precedes).
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &arg, &[key(false, false), key(true, true)], &mk),
+            V::Int(4)
+        );
+        // rank(2,15) ORDER BY a DESC, b = 3.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &arg, &[key(true, true), key(false, false)], &mk),
+            V::Int(3)
+        );
+        // rank(2,10) ORDER BY a, b = 3.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &[V::Int(2), V::Int(10)], &aa, &mk),
+            V::Int(3)
+        );
+        // Exact-tuple match (2,20): rank counts only strictly-before = 4; cume_dist counts the tie = 5/6.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &[V::Int(2), V::Int(20)], &aa, &mk),
+            V::Int(4)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &[V::Int(2), V::Int(20)], &aa, &mk),
+            V::Float(5.0 / 6.0)
+        );
+
+        // --- Multi-key NULL handling on the second key (mkn(a,b), n = 4). ---
+        // mkn = (1,10),(2,NULL),(2,20),(3,5).
+        let mkn = vec![
+            vec![V::Int(1), V::Int(10)],
+            vec![V::Int(2), V::Null],
+            vec![V::Int(2), V::Int(20)],
+            vec![V::Int(3), V::Int(5)],
+        ];
+        let m_arg = [V::Int(2), V::Int(15)];
+        // ORDER BY a, b (b NULLS LAST): (2,NULL) sorts after (2,15) → only (1,10) precedes → rank 2.
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &m_arg, &aa, &mkn),
+            V::Int(2)
+        );
+        // dense_rank matches (distinct precede = {(1,10)}) → 2; cume_dist = (1+1)/(4+1) = 0.4.
+        assert_eq!(
+            finalize_hypothetical_set(F::DenseRank, &m_arg, &aa, &mkn),
+            V::Int(2)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &m_arg, &aa, &mkn),
+            V::Float(2.0 / 5.0)
+        );
+        // ORDER BY a, b NULLS FIRST: (2,NULL) now precedes (2,15) → (1,10),(2,NULL) precede → rank 3.
+        let a_bnf = [key(false, false), key(false, true)];
+        assert_eq!(
+            finalize_hypothetical_set(F::Rank, &m_arg, &a_bnf, &mkn),
+            V::Int(3)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::DenseRank, &m_arg, &a_bnf, &mkn),
+            V::Int(3)
+        );
+        assert_eq!(
+            finalize_hypothetical_set(F::CumeDist, &m_arg, &a_bnf, &mkn),
+            V::Float(3.0 / 5.0)
         );
     }
 
@@ -2122,7 +2330,8 @@ mod tests {
             distinct: false,
             fraction: None,
             ordered_set_descending: false,
-            hypothetical_arg: None,
+            hypothetical_args: Vec::new(),
+            ordered_set_keys: Vec::new(),
             filter: None,
             separator: None,
             arg2: None,

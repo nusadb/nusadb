@@ -610,7 +610,8 @@ pub(super) fn analyze_expr_agg(
                     distinct: *distinct,
                     fraction: None,
                     ordered_set_descending: false,
-                    hypothetical_arg: None,
+                    hypothetical_args: Vec::new(),
+                    ordered_set_keys: Vec::new(),
                     filter: typed_filter,
                     separator,
                     arg2: typed_arg2,
@@ -2878,10 +2879,11 @@ fn analyze_array_slice(
     })
 }
 
-/// Analyze an ordered-set aggregate `f(args) WITHIN GROUP (ORDER BY key)` — `PERCENTILE_CONT`,
-/// `PERCENTILE_DISC`, or `MODE`. The single `ORDER BY` key becomes the aggregate's `arg`;
-/// a percentile's fraction is a constant in `[0, 1]`. The `ORDER BY` must be a single ascending key
-/// without a `NULLS` clause (v1). Registered into the aggregate sink like an ordinary aggregate.
+/// Analyze an ordered-set aggregate `f(args) WITHIN GROUP (ORDER BY key)`. The percentile / `MODE`
+/// forms (`PERCENTILE_CONT`, `PERCENTILE_DISC`, `MODE`) take a single `ORDER BY` key that becomes
+/// the aggregate's `arg`; a percentile's fraction is a constant in `[0, 1]`. The hypothetical-set
+/// forms (`RANK` / `DENSE_RANK` / `PERCENT_RANK` / `CUME_DIST`) take N keys and dispatch to
+/// [`analyze_hypothetical_set`]. Registered into the aggregate sink like an ordinary aggregate.
 fn analyze_within_group(
     wg: &ast::WithinGroup,
     scope: &[ScopedColumn],
@@ -2910,6 +2912,12 @@ fn analyze_within_group(
             )));
         },
     };
+    // Hypothetical-set aggregates take N ORDER BY keys (one per direct argument) and compare the
+    // argument tuple lexicographically against each row's key tuple; they have their own analysis
+    // path below. The percentile / MODE ordered-set aggregates take exactly one ORDER BY key.
+    if matches!(func, F::Rank | F::DenseRank | F::PercentRank | F::CumeDist) {
+        return analyze_hypothetical_set(func, wg, scope, catalog, sink);
+    }
     // WITHIN GROUP takes exactly one ORDER BY key. `DESC` reverses the ordered set; a `NULLS
     // FIRST/LAST` clause is accepted but has no effect (NULL ordering values are excluded from the
     // set, so their placement cannot change the percentile/mode).
@@ -2921,23 +2929,14 @@ fn analyze_within_group(
     let ordered_set_descending = !order_item.ascending;
     // The ordered value references source rows, not aggregates (no nested aggregate sink).
     let order_value = analyze_expr(&order_item.expr, scope, catalog, None)?;
-    let (fraction, hypothetical_arg, result_ty) = match func {
+    let (fraction, result_ty) = match func {
         F::Mode => {
             if !wg.args.is_empty() {
                 return Err(Error::FunctionArgs(
                     "MODE() takes no direct arguments".to_owned(),
                 ));
             }
-            (None, None, order_value.ty)
-        },
-        // Hypothetical-set aggregates take exactly one direct argument — a constant hypothetical
-        // value whose type must be comparable with the single ORDER BY key. The executor reports
-        // where that value would rank if inserted into the ordered set. RANK / DENSE_RANK yield a
-        // BIGINT position; PERCENT_RANK / CUME_DIST a FLOAT ratio.
-        F::Rank | F::DenseRank | F::PercentRank | F::CumeDist => {
-            let (arg, result_ty) =
-                analyze_hypothetical_arg(func, &wg.args, order_value.ty, catalog)?;
-            (None, Some(arg), result_ty)
+            (None, order_value.ty)
         },
         F::PercentileCont | F::PercentileDisc => {
             let [fraction_expr] = wg.args.as_slice() else {
@@ -2978,7 +2977,7 @@ fn analyze_within_group(
                 );
             }
             let fraction = const_fraction(fraction_expr)?;
-            (Some(fraction), None, elem_ty)
+            (Some(fraction), elem_ty)
         },
         _ => unreachable!("guarded by the func match above"),
     };
@@ -2990,7 +2989,8 @@ fn analyze_within_group(
         distinct: false,
         fraction,
         ordered_set_descending,
-        hypothetical_arg,
+        hypothetical_args: Vec::new(),
+        ordered_set_keys: Vec::new(),
         filter: None,
         separator: None,
         arg2: None,
@@ -3004,33 +3004,85 @@ fn analyze_within_group(
     })
 }
 
-/// Analyze the single direct argument of a hypothetical-set aggregate (`RANK` / `DENSE_RANK` /
-/// `PERCENT_RANK` / `CUME_DIST`), returning the typed argument and the aggregate's result type
-/// (`RANK` / `DENSE_RANK` → `INT`, `PERCENT_RANK` / `CUME_DIST` → `FLOAT`). The argument is a
-/// per-group constant, so it resolves against an empty scope — a column reference is a loud error
-/// here rather than a per-row value — and its type must be comparable with the `ORDER BY` key
-/// `order_ty` under the same rule `=`/`<`/`>` use (cross-type numeric included).
-fn analyze_hypothetical_arg(
+/// Analyze a hypothetical-set aggregate (`RANK` / `DENSE_RANK` / `PERCENT_RANK` / `CUME_DIST`) in
+/// its multi-key `f(a1, …, aN) WITHIN GROUP (ORDER BY k1, …, kN)` form, registering it into the
+/// aggregate `sink`. The direct arguments form a hypothetical tuple compared lexicographically
+/// against each row's `ORDER BY` key tuple, every key honoring its own `ASC`/`DESC`.
+///
+/// The argument count must equal the key count (else a loud error). Each key expression resolves
+/// against the source `scope`; each argument is a per-group constant, so it resolves against an
+/// empty scope — a column reference is a loud error rather than a per-row value — and its type must
+/// be comparable with the corresponding key under the same rule `=`/`<`/`>` use (cross-type numeric
+/// included). `RANK` / `DENSE_RANK` yield a `BIGINT` position; `PERCENT_RANK` / `CUME_DIST` a
+/// `FLOAT` ratio.
+fn analyze_hypothetical_set(
     func: ast::AggregateFunc,
-    args: &[ast::Expr],
-    order_ty: ColumnType,
+    wg: &ast::WithinGroup,
+    scope: &[ScopedColumn],
     catalog: &dyn Catalog,
-) -> Result<(TypedExpr, ColumnType), Error> {
+    sink: &mut Vec<AggregateCall>,
+) -> Result<TypedExpr, Error> {
     use ast::AggregateFunc as F;
-    let [arg_expr] = args else {
+    if wg.order_by.is_empty() {
+        return Err(Error::InvalidStatement(
+            "WITHIN GROUP requires at least one ORDER BY expression".to_owned(),
+        ));
+    }
+    if wg.args.len() != wg.order_by.len() {
         return Err(Error::FunctionArgs(
-            "RANK / DENSE_RANK / PERCENT_RANK / CUME_DIST take exactly one direct argument"
+            "the number of hypothetical direct arguments must match the number of ordering columns"
                 .to_owned(),
         ));
-    };
-    let arg = analyze_expr(arg_expr, &[], catalog, None)?;
-    check_comparison(order_ty, arg.ty)?;
+    }
+    let mut ordered_set_keys = Vec::with_capacity(wg.order_by.len());
+    let mut hypothetical_args = Vec::with_capacity(wg.args.len());
+    for (order_item, arg_expr) in wg.order_by.iter().zip(&wg.args) {
+        // The key references source rows, not aggregates (no nested aggregate sink). NULL keys are
+        // kept and ordered by their NULLS placement (the default is NULLS LAST for ASC, NULLS FIRST
+        // for DESC), matching the ordered-set NULL semantics.
+        let key = analyze_expr(&order_item.expr, scope, catalog, None)?;
+        let arg = analyze_expr(arg_expr, &[], catalog, None)?;
+        check_comparison(key.ty, arg.ty)?;
+        let descending = !order_item.ascending;
+        let nulls_first = match order_item.nulls {
+            ast::NullOrdering::First => true,
+            ast::NullOrdering::Last => false,
+            // Default: NULLS LAST for ASC, NULLS FIRST for DESC.
+            ast::NullOrdering::Default => descending,
+        };
+        ordered_set_keys.push(OrderedSetKey {
+            expr: key,
+            descending,
+            nulls_first,
+        });
+        hypothetical_args.push(arg);
+    }
     let result_ty = if matches!(func, F::Rank | F::DenseRank) {
         ColumnType::Int
     } else {
         ColumnType::Float
     };
-    Ok((arg, result_ty))
+    let idx = sink.len();
+    sink.push(AggregateCall {
+        func,
+        arg: None,
+        result_ty,
+        distinct: false,
+        fraction: None,
+        ordered_set_descending: false,
+        hypothetical_args,
+        ordered_set_keys,
+        filter: None,
+        separator: None,
+        arg2: None,
+        order_by: Vec::new(),
+        row_args: Vec::new(),
+        grouping_args: Vec::new(),
+    });
+    Ok(TypedExpr {
+        kind: TypedExprKind::AggregateRef(idx),
+        ty: result_ty,
+    })
 }
 
 /// Desugar the array-of-fractions percentile form `PERCENTILE_CONT/DISC(ARRAY[f1, f2, ...]) WITHIN
@@ -3063,7 +3115,8 @@ fn analyze_percentile_array(
             distinct: false,
             fraction: Some(fraction),
             ordered_set_descending,
-            hypothetical_arg: None,
+            hypothetical_args: Vec::new(),
+            ordered_set_keys: Vec::new(),
             filter: None,
             separator: None,
             arg2: None,

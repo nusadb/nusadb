@@ -313,3 +313,205 @@ SELECT rank(4) FROM hs
 
 statement error
 SELECT cume_dist(4) FROM hs
+
+# --- Multi-key hypothetical-set aggregates (WITHIN GROUP with N ORDER BY keys) ---
+# The N direct arguments form a tuple compared lexicographically against each row's key tuple, each
+# key honoring its own ASC/DESC. Expected values verified against the reference oracle.
+
+statement ok
+CREATE TABLE mk (a INT, b INT)
+
+statement ok
+INSERT INTO mk VALUES (1, 10), (1, 20), (2, 10), (2, 20), (3, 5)
+
+# rank(2,15) ORDER BY a, b = 4 (precede: (1,10),(1,20),(2,10)); dense_rank = 4;
+# percent_rank = (4-1)/5 = 0.6; cume_dist = (4+1-1)/(5+1) ... = count(<=)=4 -> (4+1)/6 = 0.667.
+query IIRR
+SELECT rank(2, 15) WITHIN GROUP (ORDER BY a, b),
+       dense_rank(2, 15) WITHIN GROUP (ORDER BY a, b),
+       percent_rank(2, 15) WITHIN GROUP (ORDER BY a, b),
+       cume_dist(2, 15) WITHIN GROUP (ORDER BY a, b)
+FROM mk
+----
+4  4  0.600  0.667
+
+# ASC/DESC mix — b descending: for a=2 a row with b>15 now precedes. rank(2,15) = 4; cume_dist = 0.667.
+query IR
+SELECT rank(2, 15) WITHIN GROUP (ORDER BY a, b DESC),
+       cume_dist(2, 15) WITHIN GROUP (ORDER BY a, b DESC)
+FROM mk
+----
+4  0.667
+
+# Leading key DESC: a descending. rank(2,15) ORDER BY a DESC, b = 3 (precede: (3,5),(2,10)).
+query I
+SELECT rank(2, 15) WITHIN GROUP (ORDER BY a DESC, b) FROM mk
+----
+3
+
+# Both keys DESC. rank(2,15) ORDER BY a DESC, b DESC = 3.
+query I
+SELECT rank(2, 15) WITHIN GROUP (ORDER BY a DESC, b DESC) FROM mk
+----
+3
+
+# Argument lands on an exact key tuple (2,20): rank counts only strictly-before = 4; dense_rank = 4;
+# cume_dist counts the tie as <= : (5+1)/6 ... count(<=)=5 -> (5+1)/6 = 0.833.
+query IIR
+SELECT rank(2, 20) WITHIN GROUP (ORDER BY a, b),
+       dense_rank(2, 20) WITHIN GROUP (ORDER BY a, b),
+       cume_dist(2, 20) WITHIN GROUP (ORDER BY a, b)
+FROM mk
+----
+4  4  0.833
+
+# rank(2,10) ORDER BY a, b = 3 (precede: (1,10),(1,20)); dense_rank = 3; cume_dist = 0.667.
+query IIR
+SELECT rank(2, 10) WITHIN GROUP (ORDER BY a, b),
+       dense_rank(2, 10) WITHIN GROUP (ORDER BY a, b),
+       cume_dist(2, 10) WITHIN GROUP (ORDER BY a, b)
+FROM mk
+----
+3  3  0.667
+
+# Tuple below all: rank = 1. Tuple above all: rank = n + 1 = 6.
+query II
+SELECT rank(0, 0) WITHIN GROUP (ORDER BY a, b),
+       rank(9, 9) WITHIN GROUP (ORDER BY a, b)
+FROM mk
+----
+1  6
+
+# --- Three ORDER BY keys ---
+statement ok
+CREATE TABLE mk3 (a INT, b INT, c INT)
+
+statement ok
+INSERT INTO mk3 VALUES (1, 1, 1), (1, 1, 2), (1, 2, 1), (2, 1, 1), (2, 2, 2)
+
+# rank(1,2,1) ORDER BY a, b, c = 3 (precede: (1,1,1),(1,1,2)); dense_rank = 3;
+# percent_rank = (3-1)/5 = 0.4; cume_dist = count(<=)=3 -> (3+1)... wait: count(<=)=3, (3+1)/(5+1)=0.667.
+query IIRR
+SELECT rank(1, 2, 1) WITHIN GROUP (ORDER BY a, b, c),
+       dense_rank(1, 2, 1) WITHIN GROUP (ORDER BY a, b, c),
+       percent_rank(1, 2, 1) WITHIN GROUP (ORDER BY a, b, c),
+       cume_dist(1, 2, 1) WITHIN GROUP (ORDER BY a, b, c)
+FROM mk3
+----
+3  3  0.400  0.667
+
+# 3-key with a middle DESC key: rank(1,2,1) ORDER BY a, b DESC, c = 1 (nothing precedes).
+query I
+SELECT rank(1, 2, 1) WITHIN GROUP (ORDER BY a, b DESC, c) FROM mk3
+----
+1
+
+# --- Grouped multi-key ---
+statement ok
+CREATE TABLE hg2 (g TEXT, a INT, b INT)
+
+statement ok
+INSERT INTO hg2 VALUES ('a', 1, 1), ('a', 1, 2), ('a', 2, 1), ('b', 5, 5), ('b', 5, 6)
+
+# group 'a' (1,1),(1,2),(2,1): rank(1,2) = 2 (precede (1,1)); cume_dist = count(<=)=2 -> (2+1)/(3+1)=0.75.
+# group 'b' (5,5),(5,6): rank(1,2) = 1; cume_dist = (0+1)/(2+1) = 0.333.
+query TIR rowsort
+SELECT g,
+       rank(1, 2) WITHIN GROUP (ORDER BY a, b),
+       cume_dist(1, 2) WITHIN GROUP (ORDER BY a, b)
+FROM hg2 GROUP BY g
+----
+a  2  0.750
+b  1  0.333
+
+# --- Argument count must equal the ORDER BY key count (loud errors) ---
+# Too few arguments (1 arg, 2 keys).
+statement error
+SELECT rank(2) WITHIN GROUP (ORDER BY a, b) FROM mk
+
+# Too many arguments (3 args, 2 keys).
+statement error
+SELECT rank(2, 3, 4) WITHIN GROUP (ORDER BY a, b) FROM mk
+
+# The single-key percentile / mode ordered-set aggregates stay single-key: a 2-key ORDER BY is a loud error.
+statement error
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a, b) FROM mk
+
+statement error
+SELECT mode() WITHIN GROUP (ORDER BY a, b) FROM mk
+
+# Single-key hypothetical-set aggregate still works after the multi-key generalization.
+# a = 1,1,2,2,3 (n = 5): rank(2) = 1 + count(a < 2) = 3; cume_dist(2) = (count(a <= 2) + 1)/(5+1) = 5/6.
+query IR
+SELECT rank(2) WITHIN GROUP (ORDER BY a),
+       cume_dist(2) WITHIN GROUP (ORDER BY a)
+FROM mk
+----
+3  0.833
+
+# Single-key percentile_cont / mode WITHIN GROUP still work.
+query RI
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a),
+       mode() WITHIN GROUP (ORDER BY a)
+FROM mk
+----
+2.000  1
+
+# --- NULL keys are kept in the ordered set and counted in n, placed by NULLS FIRST/LAST ---
+# (matching the reference oracle, which does NOT exclude NULL-key rows from the hypothetical set).
+
+# Single-key NULL placement. sk = 1,2,NULL,3,NULL (n = 5).
+statement ok
+CREATE TABLE sk (x INT)
+
+statement ok
+INSERT INTO sk VALUES (1), (2), (NULL), (3), (NULL)
+
+# rank(2) ASC (default NULLS LAST): the 2 NULLs sort after 2 and do not precede -> 1 + count(x<2) = 2.
+# ASC NULLS FIRST: both NULLs + value 1 precede -> 4.
+# DESC (default NULLS FIRST): the 2 NULLs precede, plus value 3 -> 4.
+# DESC NULLS LAST: NULLs sort last, only value 3 precedes -> 2.
+query IIII
+SELECT rank(2) WITHIN GROUP (ORDER BY x),
+       rank(2) WITHIN GROUP (ORDER BY x ASC NULLS FIRST),
+       rank(2) WITHIN GROUP (ORDER BY x DESC),
+       rank(2) WITHIN GROUP (ORDER BY x DESC NULLS LAST)
+FROM sk
+----
+2  4  4  2
+
+# cume_dist(2) ASC = (count(x <= 2) = 2, + 1)/(n = 5 + 1) = 3/6 = 0.5.
+# percentile_cont still EXCLUDES NULLs (n = 3 over 1,2,3): median = 2.
+query RR
+SELECT cume_dist(2) WITHIN GROUP (ORDER BY x),
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY x)
+FROM sk
+----
+0.500  2.000
+
+# Multi-key NULL on the second key. mkn = (1,10),(2,NULL),(2,20),(3,5), n = 4.
+statement ok
+CREATE TABLE mkn (a INT, b INT)
+
+statement ok
+INSERT INTO mkn VALUES (1, 10), (2, NULL), (2, 20), (3, 5)
+
+# ORDER BY a, b (b default NULLS LAST): (2,NULL) sorts after (2,15) -> only (1,10) precedes -> rank 2;
+# dense_rank = 2; cume_dist = (1+1)/(4+1) = 0.4.
+query IIR
+SELECT rank(2, 15) WITHIN GROUP (ORDER BY a, b),
+       dense_rank(2, 15) WITHIN GROUP (ORDER BY a, b),
+       cume_dist(2, 15) WITHIN GROUP (ORDER BY a, b)
+FROM mkn
+----
+2  2  0.400
+
+# ORDER BY a, b NULLS FIRST: (2,NULL) now precedes (2,15) -> (1,10),(2,NULL) precede -> rank 3;
+# dense_rank = 3; cume_dist = (2+1)/(4+1) = 0.6.
+query IIR
+SELECT rank(2, 15) WITHIN GROUP (ORDER BY a, b NULLS FIRST),
+       dense_rank(2, 15) WITHIN GROUP (ORDER BY a, b NULLS FIRST),
+       cume_dist(2, 15) WITHIN GROUP (ORDER BY a, b NULLS FIRST)
+FROM mkn
+----
+3  3  0.600

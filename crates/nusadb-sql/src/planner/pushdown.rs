@@ -197,8 +197,9 @@ fn find_aggregate_mut(op: &mut PhysicalOperator) -> Option<&mut PhysicalOperator
 }
 
 /// Visit every input-space expression an aggregate operator owns: each call's argument(s), the
-/// fields of a row-value `COUNT`, and `FILTER`, the in-aggregate `ORDER BY` keys, and the group
-/// keys. (`grouping_args` are indices into `group_keys`, not table ordinals — nothing to visit.)
+/// fields of a row-value `COUNT`, `FILTER`, the in-aggregate `ORDER BY` keys, a hypothetical-set
+/// aggregate's ordered-set key expressions and direct arguments, and the group keys.
+/// (`grouping_args` are indices into `group_keys`, not table ordinals — nothing to visit.)
 fn for_each_aggregate_expr(agg: &mut PhysicalOperator, f: &mut dyn FnMut(&mut TypedExpr)) {
     use PhysicalOperator as O;
     let (calls, group_keys) = match agg {
@@ -228,6 +229,16 @@ fn for_each_aggregate_expr(agg: &mut PhysicalOperator, f: &mut dyn FnMut(&mut Ty
         }
         for key in &mut call.order_by {
             f(&mut key.expr);
+        }
+        // A hypothetical-set aggregate reads its ORDER BY key columns through `ordered_set_keys`
+        // (its `arg` is `None`); those references need the same remapping as any other, or the
+        // fold would read whatever now sits at the pre-pushdown ordinal. The `hypothetical_args`
+        // are per-group constants (empty-scope) with no column refs, but visiting them is harmless.
+        for key in &mut call.ordered_set_keys {
+            f(&mut key.expr);
+        }
+        for arg in &mut call.hypothetical_args {
+            f(arg);
         }
     }
     if let Some(keys) = group_keys {
@@ -695,7 +706,8 @@ mod tests {
             distinct: false,
             fraction: None,
             ordered_set_descending: false,
-            hypothetical_arg: None,
+            hypothetical_args: Vec::new(),
+            ordered_set_keys: Vec::new(),
             filter: None,
             separator: None,
             arg2: None,

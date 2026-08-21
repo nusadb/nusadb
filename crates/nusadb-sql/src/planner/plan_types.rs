@@ -1984,6 +1984,23 @@ pub enum CryptoOp {
     Decrypt,
 }
 
+/// One `ORDER BY` key of a hypothetical-set aggregate's `WITHIN GROUP` clause: the key expression
+/// plus how it sorts.
+///
+/// `descending` is `true` for a `DESC` key; `nulls_first` is `true` when a `NULL` key sorts before
+/// all non-`NULL` values — taken from an explicit `NULLS FIRST/LAST` if present, else the SQL
+/// default (`NULLS LAST` for `ASC`, `NULLS FIRST` for `DESC`). The NULL placement is independent of
+/// `descending`, so both are stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderedSetKey {
+    /// The key expression, evaluated per row against the pre-aggregation scope.
+    pub expr: TypedExpr,
+    /// `true` when the key sorts descending (`DESC`).
+    pub descending: bool,
+    /// `true` when a `NULL` in this key sorts before all non-`NULL` values (`NULLS FIRST`).
+    pub nulls_first: bool,
+}
+
 /// One aggregate function call collected from a `SELECT` projection. The
 /// executor's [`PhysicalOperator::ScalarAggregate`] folds the input stream
 /// across all calls in one pass.
@@ -2007,12 +2024,21 @@ pub struct AggregateCall {
     /// for `ASC` and for every non-ordered-set aggregate. (`NULLS FIRST/LAST` needs no flag: the
     /// ordered set excludes `NULL` ordering values, so their placement never affects the result.)
     pub ordered_set_descending: bool,
-    /// The hypothetical direct argument of a hypothetical-set aggregate (`RANK` / `DENSE_RANK` /
-    /// `PERCENT_RANK` / `CUME_DIST` in their `WITHIN GROUP (ORDER BY key)` form) — a constant whose
-    /// type matches the single `ORDER BY` key. The executor evaluates it once and reports where it
-    /// would rank in the collected ordered set (`arg` carries the per-row `ORDER BY` value). `None`
-    /// for every other aggregate (including the percentile / `MODE` ordered-set forms).
-    pub hypothetical_arg: Option<TypedExpr>,
+    /// The hypothetical direct arguments of a hypothetical-set aggregate (`RANK` / `DENSE_RANK` /
+    /// `PERCENT_RANK` / `CUME_DIST` in their `WITHIN GROUP (ORDER BY k1, …, kN)` form) — one
+    /// per-group constant per `ORDER BY` key, matched positionally. The executor evaluates the
+    /// tuple once and reports where it would rank in the collected ordered set of key tuples.
+    /// Empty for every other aggregate (including the percentile / `MODE` ordered-set forms).
+    pub hypothetical_args: Vec<TypedExpr>,
+    /// The `ORDER BY` keys of a hypothetical-set aggregate — one [`OrderedSetKey`] per key,
+    /// carrying its expression, `DESC` flag, and `NULLS FIRST/LAST` placement. The executor collects
+    /// this tuple for **every** row (a `NULL` key is kept, ordered by its `nulls_first` placement,
+    /// and counted in `n` — matching the ordered-set NULL semantics) and compares it
+    /// lexicographically against [`hypothetical_args`](Self::hypothetical_args), each key honoring
+    /// its own direction and NULL placement. Empty for every other aggregate; the percentile /
+    /// `MODE` ordered-set forms keep their single key in [`arg`](Self::arg) plus
+    /// [`ordered_set_descending`](Self::ordered_set_descending) and still exclude `NULL` keys.
+    pub ordered_set_keys: Vec<OrderedSetKey>,
     /// `FILTER (WHERE pred)` — a per-row boolean predicate (resolved against the pre-aggregation
     /// scope); a row contributes to this call only when it evaluates to `TRUE`. `None` when
     /// the clause is absent.

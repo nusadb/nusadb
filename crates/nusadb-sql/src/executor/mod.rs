@@ -25,7 +25,7 @@ use crate::planner::{
     AggregateCall, AlterColumnOp, AlterTablePlan, AnalyzePlan, Assignment, ConflictArbiter,
     CreateIndexPlan, CreatePlainViewPlan, CreateSchemaPlan, CreateSequencePlan, CreateTablePlan,
     DeletePlan, DropIndexPlan, DropSchemaPlan, DropSequencePlan, DropTablePlan, DropViewPlan,
-    FrameBound, HashKey, InsertPlan, InsertSource, OnConflictPlan, OrderByKey,
+    FrameBound, HashKey, InsertPlan, InsertSource, OnConflictPlan, OrderByKey, OrderedSetKey,
     PhysicalCreateTableAs, PhysicalMaterializedView, PhysicalOperator, PhysicalPlan,
     PhysicalRecursiveCte, PhysicalSetOp, SetOpTree, TruncateCascadePlan, TxnCharacteristics,
     TypedExpr, UpdatePlan, WindowExpr, WindowFrame,
