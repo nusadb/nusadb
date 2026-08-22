@@ -938,6 +938,10 @@ pub enum ScalarFunc {
     /// `JSONB_SET(target, path, new_value [, create_missing])` — replace the value at `path` (a
     /// `TEXT[]` of object keys / array indices) with `new_value`.
     JsonbSet,
+    /// `JSONB_SET_LAX(target, path, new_value [, create_missing [, null_value_treatment]])` — like
+    /// `JSONB_SET`, but when `new_value` is SQL `NULL` the `null_value_treatment` decides the outcome:
+    /// `use_json_null` (default), `delete_key`, `return_target`, or `raise_exception`.
+    JsonbSetLax,
     /// `JSONB_STRIP_NULLS(json)` — recursively drop object members whose value is JSON `null`, as
     /// `JSON`.
     JsonbStripNulls,
@@ -1250,6 +1254,7 @@ impl ScalarFunc {
             Self::JsonExtractPath => "jsonb_extract_path",
             Self::JsonExtractPathText => "jsonb_extract_path_text",
             Self::JsonbSet => "jsonb_set",
+            Self::JsonbSetLax => "jsonb_set_lax",
             Self::JsonbStripNulls => "jsonb_strip_nulls",
             Self::JsonbPretty => "jsonb_pretty",
             Self::JsonbPathExists => "jsonb_path_exists",

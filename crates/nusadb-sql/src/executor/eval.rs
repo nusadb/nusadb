@@ -543,6 +543,9 @@ fn eval_scalar_function(
         // FORMAT substitutes its arguments into specifiers itself (a NULL renders per specifier, not
         // by propagating), so it skips the NULL-strict collection (B-fn).
         F::Format => return eval_format(args, row),
+        // JSONB_SET_LAX treats a NULL new_value as meaningful (per its null_value_treatment), so it
+        // must see its arguments rather than propagate the first NULL away.
+        F::JsonbSetLax => return eval_jsonb_set_lax(args, row),
         // QUOTE_NULLABLE renders a NULL argument as the unquoted text `NULL` (for dynamic SQL) instead
         // of propagating NULL, so it skips the NULL-strict collection below.
         F::QuoteNullable => return eval_quote_nullable(args, row),
@@ -2704,6 +2707,74 @@ fn json_set(
     let new_json = crate::json::value_to_json(new);
     crate::json::set_path(target, &keys, new_json, create_missing)
         .map_or(ast::Value::Null, ast::Value::Json)
+}
+
+/// `JSONB_SET_LAX(target, path, new_value [, create_missing [, null_value_treatment]])`.
+///
+/// With a non-NULL `new_value` this is exactly `jsonb_set`. With a SQL-NULL `new_value` the
+/// `null_value_treatment` chooses the outcome: `use_json_null` (the default) stores a JSON null,
+/// `delete_key` removes the element at the path, `return_target` yields the target unchanged, and
+/// `raise_exception` is a loud error; any other treatment string is a loud error. A NULL target,
+/// path, or create-missing flag yields NULL.
+fn eval_jsonb_set_lax(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
+    use ast::Value;
+    let (Some(target_expr), Some(path_expr), Some(new_expr)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return Err(Error::FunctionArgs(
+            "jsonb_set_lax() expects 3 to 5 arguments".to_owned(),
+        ));
+    };
+    let target = eval(target_expr, row)?;
+    let path = eval(path_expr, row)?;
+    let new = eval(new_expr, row)?;
+    let create = match args.get(3) {
+        Some(e) => eval(e, row)?,
+        None => Value::Bool(true),
+    };
+    // A NULL target / path / create-missing flag propagates NULL.
+    let (Value::Json(_) | Value::Text(_)) = target else {
+        return Ok(Value::Null);
+    };
+    let Value::Array(path_items) = &path else {
+        return Ok(Value::Null);
+    };
+    let Value::Bool(create_missing) = create else {
+        return Ok(Value::Null);
+    };
+    // A non-NULL new_value behaves exactly like jsonb_set.
+    if !matches!(new, Value::Null) {
+        return Ok(json_set(&target, path_items, &new, create_missing));
+    }
+    // new_value is NULL — the treatment decides the outcome.
+    let treatment = match args.get(4) {
+        Some(e) => eval(e, row)?,
+        None => Value::Text("use_json_null".to_owned()),
+    };
+    let Value::Text(mode) = &treatment else {
+        return Ok(Value::Null);
+    };
+    match mode.as_str() {
+        "use_json_null" => Ok(json_set(&target, path_items, &Value::Null, create_missing)),
+        "delete_key" => json_delete_path_op(&target, &path),
+        "return_target" => {
+            let (Value::Json(s) | Value::Text(s)) = &target else {
+                return Ok(Value::Null);
+            };
+            Ok(crate::json::canonicalize(s).map_or(Value::Null, Value::Json))
+        },
+        "raise_exception" => Err(Error::Coded {
+            message: "JSON value must not be null".to_owned(),
+            sqlstate: "22004", // null_value_not_allowed
+        }),
+        other => Err(Error::Coded {
+            message: format!(
+                "null_value_treatment must be \"delete_key\", \"return_target\", \
+                 \"use_json_null\", or \"raise_exception\", got \"{other}\""
+            ),
+            sqlstate: "22023",
+        }),
+    }
 }
 
 /// `JSONB_INSERT(target, path, new_value [, insert_after])` — insert `new_value` at `path` without

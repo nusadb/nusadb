@@ -1476,6 +1476,16 @@ pub(super) fn analyze_scalar_function(
             &[ColumnType::Bool],
             ColumnType::Json,
         ),
+        // JSONB_SET_LAX adds an optional null_value_treatment TEXT after the create_missing flag.
+        F::JsonbSetLax => ScalarSig::Fixed(
+            &[
+                ColumnType::Json,
+                ColumnType::Array(nusadb_core::engine::ArrayElem::Text),
+                ColumnType::Json,
+            ],
+            &[ColumnType::Bool, ColumnType::Text],
+            ColumnType::Json,
+        ),
         // SUBSTRING is intercepted by `analyze_substring` above (its positional-vs-regex form
         // is dispatched on the second argument's type) and never reaches this table.
         F::Substring => {

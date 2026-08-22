@@ -250,6 +250,32 @@ SELECT CAST(JSONB_SET(CAST(NULL AS JSON), ARRAY['a'], JSON '1') AS TEXT)
 ----
 NULL
 
+# --- JSONB_SET_LAX: like JSONB_SET, but a NULL new_value is governed by null_value_treatment ---
+# A non-NULL new_value behaves exactly like JSONB_SET.
+query T
+SELECT JSONB_SET_LAX(JSON '{"a":1,"b":2}', ARRAY['a'], JSON '9')
+----
+{"a": 9, "b": 2}
+
+# A NULL new_value: the default (use_json_null) stores a JSON null.
+query T
+SELECT JSONB_SET_LAX(JSON '{"a":1}', ARRAY['a'], CAST(NULL AS JSON))
+----
+{"a": null}
+
+# delete_key removes the element; return_target leaves the target unchanged.
+query TT
+SELECT JSONB_SET_LAX(JSON '{"a":1,"b":2}', ARRAY['a'], CAST(NULL AS JSON), TRUE, 'delete_key'), JSONB_SET_LAX(JSON '{"a":1}', ARRAY['a'], CAST(NULL AS JSON), TRUE, 'return_target')
+----
+{"b": 2} {"a": 1}
+
+# raise_exception and an invalid treatment are both loud errors.
+statement error
+SELECT JSONB_SET_LAX(JSON '{"a":1}', ARRAY['a'], CAST(NULL AS JSON), TRUE, 'raise_exception')
+
+statement error
+SELECT JSONB_SET_LAX(JSON '{"a":1}', ARRAY['a'], CAST(NULL AS JSON), TRUE, 'bogus')
+
 # --- JSONB_STRIP_NULLS / JSONB_PRETTY ---
 # Object members with a null value are dropped (recursively); array nulls are kept.
 query T
