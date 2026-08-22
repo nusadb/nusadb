@@ -786,6 +786,54 @@ enum PathStep {
     Index(i64),
     /// `[*]` (array elements) or `.*` (object values) — every child (the set-returning step).
     Wildcard,
+    /// `? (predicate)` — keep only the current values for which `predicate` holds.
+    Filter(Box<FilterExpr>),
+}
+
+/// A comparison operator inside a `jsonpath` filter predicate.
+#[derive(Clone, Copy)]
+enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// The root a filter accessor path starts from: `@` (the item under test) or `$` (the document).
+#[derive(Clone, Copy)]
+enum FilterRoot {
+    Current,
+    Root,
+}
+
+/// One side of a filter comparison: either an accessor path (relative to `@` or `$`) or a literal.
+enum FilterOperand {
+    Path {
+        root: FilterRoot,
+        steps: Vec<PathStep>,
+    },
+    Literal(J),
+}
+
+/// A `jsonpath` filter predicate — the expression inside `? (...)`, and (later) the whole argument to
+/// a predicate-check (`@@`). Evaluated with three-valued logic (true / false / unknown); a `?` filter
+/// keeps an item only when the predicate is definitely true.
+enum FilterExpr {
+    Or(Box<Self>, Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Not(Box<Self>),
+    /// `exists(path)` — true iff the path yields at least one value.
+    Exists {
+        root: FilterRoot,
+        steps: Vec<PathStep>,
+    },
+    Cmp {
+        left: FilterOperand,
+        op: CmpOp,
+        right: FilterOperand,
+    },
 }
 
 /// Parse the supported `jsonpath` subset: `$` root, `.key`, `.*`, `['key']`/`["key"]`, `[n]`, `[*]`.
@@ -798,6 +846,45 @@ fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
     let mut steps = Vec::new();
     while let Some(&c) = chars.peek() {
         match c {
+            ' ' | '\t' | '\n' | '\r' => {
+                chars.next();
+            },
+            '?' => {
+                chars.next();
+                while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+                    chars.next();
+                }
+                if chars.next() != Some('(') {
+                    return None;
+                }
+                let mut inner = String::new();
+                let mut depth = 1u32;
+                let mut quote: Option<char> = None;
+                for ch in chars.by_ref() {
+                    if let Some(q) = quote {
+                        if ch == q {
+                            quote = None;
+                        }
+                    } else {
+                        match ch {
+                            '"' | '\'' => quote = Some(ch),
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                    inner.push(ch);
+                }
+                if depth != 0 {
+                    return None;
+                }
+                steps.push(PathStep::Filter(Box::new(parse_filter(&inner)?)));
+            },
             '.' => {
                 chars.next();
                 if chars.peek() == Some(&'*') {
@@ -850,6 +937,250 @@ fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
     Some(steps)
 }
 
+/// Recursive-descent parser for the filter predicate inside `? (...)`.
+///
+/// Grammar (loosest to tightest binding): `||`, then `&&`, then a leading `!`, then a primary — a
+/// parenthesized group, an `exists(path)`, or a comparison `operand <cmp> operand`. An operand is an
+/// accessor path (rooted at `@` or `$`) or a literal (number / double- or single-quoted string /
+/// `true` / `false` / `null`). Returns `None` for anything outside this grammar.
+struct FilterParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl FilterParser {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+            self.pos += 1;
+        }
+    }
+
+    /// Consume the literal token `tok` if it appears next (after whitespace); else leave `pos` put.
+    fn eat(&mut self, tok: &str) -> bool {
+        self.skip_ws();
+        let toks: Vec<char> = tok.chars().collect();
+        if self
+            .chars
+            .get(self.pos..)
+            .is_some_and(|rest| rest.starts_with(&toks))
+        {
+            self.pos += toks.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_or(&mut self) -> Option<FilterExpr> {
+        let mut left = self.parse_and()?;
+        while self.eat("||") {
+            let right = self.parse_and()?;
+            left = FilterExpr::Or(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_and(&mut self) -> Option<FilterExpr> {
+        let mut left = self.parse_not()?;
+        while self.eat("&&") {
+            let right = self.parse_not()?;
+            left = FilterExpr::And(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_not(&mut self) -> Option<FilterExpr> {
+        self.skip_ws();
+        // A leading `!` is negation only when it is not the `!=` comparison operator.
+        if self.peek() == Some('!') && self.chars.get(self.pos + 1) != Some(&'=') {
+            self.pos += 1;
+            return Some(FilterExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Option<FilterExpr> {
+        self.skip_ws();
+        if self.eat("(") {
+            let inner = self.parse_or()?;
+            if !self.eat(")") {
+                return None;
+            }
+            return Some(inner);
+        }
+        if self.eat("exists") {
+            if !self.eat("(") {
+                return None;
+            }
+            let (root, steps) = self.parse_path()?;
+            if !self.eat(")") {
+                return None;
+            }
+            return Some(FilterExpr::Exists { root, steps });
+        }
+        let left = self.parse_operand()?;
+        let op = self.parse_cmp_op()?;
+        let right = self.parse_operand()?;
+        Some(FilterExpr::Cmp { left, op, right })
+    }
+
+    fn parse_cmp_op(&mut self) -> Option<CmpOp> {
+        self.skip_ws();
+        for (tok, op) in [
+            ("==", CmpOp::Eq),
+            ("!=", CmpOp::Ne),
+            ("<>", CmpOp::Ne),
+            ("<=", CmpOp::Le),
+            (">=", CmpOp::Ge),
+            ("<", CmpOp::Lt),
+            (">", CmpOp::Gt),
+        ] {
+            if self.eat(tok) {
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    fn parse_operand(&mut self) -> Option<FilterOperand> {
+        self.skip_ws();
+        match self.peek() {
+            Some('@' | '$') => {
+                let (root, steps) = self.parse_path()?;
+                Some(FilterOperand::Path { root, steps })
+            },
+            _ => Some(FilterOperand::Literal(self.parse_literal()?)),
+        }
+    }
+
+    /// Parse `@`/`$` followed by `.key`, `.*`, `[n]`, `[*]`, or `['key']` accessors.
+    fn parse_path(&mut self) -> Option<(FilterRoot, Vec<PathStep>)> {
+        self.skip_ws();
+        let root = match self.peek() {
+            Some('@') => FilterRoot::Current,
+            Some('$') => FilterRoot::Root,
+            _ => return None,
+        };
+        self.pos += 1;
+        let mut steps = Vec::new();
+        while let Some(c) = self.peek() {
+            match c {
+                '.' => {
+                    self.pos += 1;
+                    if self.peek() == Some('*') {
+                        self.pos += 1;
+                        steps.push(PathStep::Wildcard);
+                        continue;
+                    }
+                    let mut key = String::new();
+                    while let Some(c) = self.peek() {
+                        if matches!(c, '.' | '[' | ' ' | '\t' | '\n' | '\r')
+                            || matches!(c, '=' | '!' | '<' | '>' | '&' | '|' | ')')
+                        {
+                            break;
+                        }
+                        key.push(c);
+                        self.pos += 1;
+                    }
+                    if key.is_empty() {
+                        return None;
+                    }
+                    steps.push(PathStep::Key(key));
+                },
+                '[' => {
+                    self.pos += 1;
+                    let mut inner = String::new();
+                    while let Some(c) = self.peek() {
+                        if c == ']' {
+                            break;
+                        }
+                        inner.push(c);
+                        self.pos += 1;
+                    }
+                    if self.peek() != Some(']') {
+                        return None;
+                    }
+                    self.pos += 1;
+                    let inner = inner.trim();
+                    if inner == "*" {
+                        steps.push(PathStep::Wildcard);
+                    } else if let Ok(n) = inner.parse::<i64>() {
+                        steps.push(PathStep::Index(n));
+                    } else if (inner.starts_with('\'') && inner.ends_with('\'') && inner.len() >= 2)
+                        || (inner.starts_with('"') && inner.ends_with('"') && inner.len() >= 2)
+                    {
+                        steps.push(PathStep::Key(inner[1..inner.len() - 1].to_owned()));
+                    } else {
+                        return None;
+                    }
+                },
+                _ => break,
+            }
+        }
+        Some((root, steps))
+    }
+
+    fn parse_literal(&mut self) -> Option<J> {
+        self.skip_ws();
+        if let Some(quote @ ('"' | '\'')) = self.peek() {
+            self.pos += 1;
+            let mut s = String::new();
+            while let Some(c) = self.peek() {
+                self.pos += 1;
+                if c == '\\' {
+                    if let Some(esc) = self.peek() {
+                        self.pos += 1;
+                        s.push(esc);
+                    }
+                } else if c == quote {
+                    return Some(J::String(s));
+                } else {
+                    s.push(c);
+                }
+            }
+            return None;
+        }
+        if self.eat("true") {
+            return Some(J::Bool(true));
+        }
+        if self.eat("false") {
+            return Some(J::Bool(false));
+        }
+        if self.eat("null") {
+            return Some(J::Null);
+        }
+        let mut num = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E') {
+                num.push(c);
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        parse(&num)
+    }
+}
+
+/// Parse a `jsonpath` filter predicate, or `None` if it falls outside the accepted grammar.
+fn parse_filter(inner: &str) -> Option<FilterExpr> {
+    let mut parser = FilterParser {
+        chars: inner.chars().collect(),
+        pos: 0,
+    };
+    let expr = parser.parse_or()?;
+    parser.skip_ws();
+    if parser.pos == parser.chars.len() {
+        Some(expr)
+    } else {
+        None
+    }
+}
+
 /// Why a [`path_query`] did not run. The two are different mistakes by different arguments, and a
 /// caller that reports them as one thing names the wrong culprit half the time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -875,8 +1206,14 @@ pub enum PathQueryError {
 pub fn path_query(json: &str, path: &str) -> Result<Vec<String>, PathQueryError> {
     let doc = parse(json).ok_or(PathQueryError::MalformedDocument)?;
     let steps = parse_jsonpath(path).ok_or(PathQueryError::UnusablePath)?;
-    let mut current = vec![doc];
-    for step in &steps {
+    let matches = apply_steps(vec![doc.clone()], &steps, &doc);
+    Ok(matches.iter().map(to_text).collect())
+}
+
+/// Walk `steps` over the `current` value set, returning the set of matched values. `root` is the
+/// whole document, needed to resolve `$`-rooted operands inside a filter predicate.
+fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
+    for step in steps {
         let mut next = Vec::new();
         for value in current {
             match step {
@@ -900,11 +1237,136 @@ pub fn path_query(json: &str, path: &str) -> Result<Vec<String>, PathQueryError>
                     J::Object(map) => next.extend(map.into_values()),
                     _ => {},
                 },
+                PathStep::Filter(pred) => {
+                    if eval_filter(pred, &value, root) == Some(true) {
+                        next.push(value);
+                    }
+                },
             }
         }
         current = next;
     }
-    Ok(current.iter().map(to_text).collect())
+    current
+}
+
+/// Evaluate a filter predicate with three-valued logic: `Some(true)` / `Some(false)` / `None`
+/// (unknown — e.g. a comparison against a path that resolves to nothing). `current` is the item under
+/// test (the `@` in the predicate); `root` is the whole document (the `$`).
+fn eval_filter(expr: &FilterExpr, current: &J, root: &J) -> Option<bool> {
+    match expr {
+        FilterExpr::Or(a, b) => {
+            three_or(eval_filter(a, current, root), eval_filter(b, current, root))
+        },
+        FilterExpr::And(a, b) => {
+            three_and(eval_filter(a, current, root), eval_filter(b, current, root))
+        },
+        FilterExpr::Not(a) => eval_filter(a, current, root).map(|v| !v),
+        FilterExpr::Exists { root: r, steps } => {
+            let start = filter_start(*r, current, root);
+            Some(!apply_steps(vec![start], steps, root).is_empty())
+        },
+        FilterExpr::Cmp { left, op, right } => {
+            let ls = operand_values(left, current, root);
+            let rs = operand_values(right, current, root);
+            existential_compare(&ls, *op, &rs)
+        },
+    }
+}
+
+/// The value a `@`/`$`-rooted filter path starts walking from.
+fn filter_start(root: FilterRoot, current: &J, doc: &J) -> J {
+    match root {
+        FilterRoot::Current => current.clone(),
+        FilterRoot::Root => doc.clone(),
+    }
+}
+
+/// Resolve a filter operand to the set of JSON values it denotes.
+fn operand_values(operand: &FilterOperand, current: &J, root: &J) -> Vec<J> {
+    match operand {
+        FilterOperand::Path { root: r, steps } => {
+            apply_steps(vec![filter_start(*r, current, root)], steps, root)
+        },
+        FilterOperand::Literal(value) => vec![value.clone()],
+    }
+}
+
+/// Three-valued AND: true only if both true, false if either is false, else unknown.
+const fn three_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Three-valued OR: true if either is true, false only if both false, else unknown.
+const fn three_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// Existential comparison: true if any (left, right) pair satisfies `op`; false if pairs exist and
+/// are comparable but none satisfy it; unknown if no comparable pair exists (empty side, or every
+/// pair type-incompatible for an ordered operator).
+fn existential_compare(left: &[J], op: CmpOp, right: &[J]) -> Option<bool> {
+    let mut saw_comparable = false;
+    for l in left {
+        for r in right {
+            match compare_pair(l, op, r) {
+                Some(true) => return Some(true),
+                Some(false) => saw_comparable = true,
+                None => {},
+            }
+        }
+    }
+    if saw_comparable { Some(false) } else { None }
+}
+
+/// Compare one scalar pair under `op`. `None` when the pair is not comparable under that operator
+/// (a container operand, or type-mismatched operands for an ordered comparison).
+fn compare_pair(left: &J, op: CmpOp, right: &J) -> Option<bool> {
+    match op {
+        CmpOp::Eq => scalar_eq(left, right),
+        CmpOp::Ne => scalar_eq(left, right).map(|equal| !equal),
+        CmpOp::Lt => scalar_ord(left, right).map(|o| o == std::cmp::Ordering::Less),
+        CmpOp::Le => scalar_ord(left, right).map(|o| o != std::cmp::Ordering::Greater),
+        CmpOp::Gt => scalar_ord(left, right).map(|o| o == std::cmp::Ordering::Greater),
+        CmpOp::Ge => scalar_ord(left, right).map(|o| o != std::cmp::Ordering::Less),
+    }
+}
+
+/// Equality of two JSON scalars: `None` if either is a container (not comparable in a predicate),
+/// else `Some(true/false)`. Cross-type scalars are unequal (a number never equals a string).
+fn scalar_eq(left: &J, right: &J) -> Option<bool> {
+    if matches!(left, J::Array(_) | J::Object(_)) || matches!(right, J::Array(_) | J::Object(_)) {
+        return None;
+    }
+    let equal = match (left, right) {
+        (J::Number(a), J::Number(b)) => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.to_string() == b.to_string(),
+        },
+        (J::String(a), J::String(b)) => a == b,
+        (J::Bool(a), J::Bool(b)) => a == b,
+        (J::Null, J::Null) => true,
+        _ => false,
+    };
+    Some(equal)
+}
+
+/// Ordering of two JSON scalars of the same comparable type: `None` unless both are numbers, both
+/// strings, or both booleans.
+fn scalar_ord(left: &J, right: &J) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (J::Number(a), J::Number(b)) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        (J::String(a), J::String(b)) => Some(a.cmp(b)),
+        (J::Bool(a), J::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
 }
 
 /// Follow a `#>`/`#>>` path through `value`: each step indexes an object by key, or an array by the
@@ -1247,6 +1709,63 @@ mod tests {
         assert_eq!(
             path_query("not json", "$"),
             Err(PathQueryError::MalformedDocument)
+        );
+    }
+
+    #[test]
+    fn path_query_filters_match_the_reference_engine() {
+        // Numeric comparisons keep the qualifying elements.
+        assert_eq!(
+            path_query("[1,2,3,4]", "$[*] ? (@ > 2)").unwrap(),
+            vec!["3".to_owned(), "4".to_owned()]
+        );
+        assert_eq!(
+            path_query("[1,2,3]", "$[*] ? (@ != 2)").unwrap(),
+            vec!["1".to_owned(), "3".to_owned()]
+        );
+        assert_eq!(
+            path_query("[1,2,3]", "$[*] ? (@ <= 2)").unwrap(),
+            vec!["1".to_owned(), "2".to_owned()]
+        );
+        // String equality against a double-quoted literal.
+        assert_eq!(
+            path_query(r#"[{"s":"x"},{"s":"y"}]"#, r#"$[*] ? (@.s == "x")"#).unwrap(),
+            vec![r#"{"s":"x"}"#.to_owned()]
+        );
+        // Boolean OR / NOT / AND, and a nested-key accessor.
+        assert_eq!(
+            path_query("[1,2,3,4]", "$[*] ? (@ < 2 || @ > 3)").unwrap(),
+            vec!["1".to_owned(), "4".to_owned()]
+        );
+        assert_eq!(
+            path_query("[1,2,3]", "$[*] ? (!(@ == 2))").unwrap(),
+            vec!["1".to_owned(), "3".to_owned()]
+        );
+        assert_eq!(
+            path_query(r#"[{"a":{"b":5}}]"#, "$[*] ? (@.a.b == 5)").unwrap(),
+            vec![r#"{"a":{"b":5}}"#.to_owned()]
+        );
+        assert_eq!(
+            path_query(
+                r#"[{"n":5,"ok":true},{"n":1,"ok":true}]"#,
+                "$[*] ? (@.n > 2 && @.ok == true)"
+            )
+            .unwrap(),
+            vec![r#"{"n":5,"ok":true}"#.to_owned()]
+        );
+        // A filter then a further step, and a filter that keeps nothing.
+        assert_eq!(
+            path_query(r#"{"a":[1,2,3]}"#, "$.a[*] ? (@ > 2)").unwrap(),
+            vec!["3".to_owned()]
+        );
+        assert_eq!(
+            path_query("[1,2,3]", "$[*] ? (@ > 9)").unwrap(),
+            Vec::<String>::new()
+        );
+        // A malformed filter is an unusable path, not a document error.
+        assert_eq!(
+            path_query("[1,2,3]", "$[*] ? (@ >)"),
+            Err(PathQueryError::UnusablePath)
         );
     }
 

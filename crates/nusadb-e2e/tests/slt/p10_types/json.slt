@@ -630,3 +630,48 @@ query III
 SELECT '{"a":1,"b":{"c":2}}'::JSONB @? '$.a', '{"a":1}'::JSONB @? '$.x', '{"a":{"c":2}}'::JSONB @? '$.a.c'
 ----
 1 0 1
+
+# --- jsonpath filters: `? (predicate)` keeps only the items for which the predicate holds ---
+
+# Numeric comparison selects the qualifying array elements.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[1,2,3,4]'::JSONB, '$[*] ? (@ > 2)') AS TEXT)
+----
+[3, 4]
+
+# Inequality keeps everything but the excluded value.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[1,2,3]'::JSONB, '$[*] ? (@ != 2)') AS TEXT)
+----
+[1, 3]
+
+# String equality against a double-quoted literal.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[{"s":"x"},{"s":"y"}]'::JSONB, '$[*] ? (@.s == "x")') AS TEXT)
+----
+[{"s": "x"}]
+
+# Boolean OR combines two comparisons.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[1,2,3,4]'::JSONB, '$[*] ? (@ < 2 || @ > 3)') AS TEXT)
+----
+[1, 4]
+
+# AND with a nested-key accessor and a boolean literal.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[{"n":5,"ok":true},{"n":1,"ok":true}]'::JSONB, '$[*] ? (@.n > 2 && @.ok == true)') AS TEXT)
+----
+[{"n": 5, "ok": true}]
+
+# A filter under @? drives existence: the array has an element > 2 but none > 9.
+query II
+SELECT '{"a":[1,2,3]}'::JSONB @? '$.a[*] ? (@ > 2)', '{"a":[1,2,3]}'::JSONB @? '$.a[*] ? (@ > 9)'
+----
+1 0
+
+# jsonb_path_query fans the filtered matches into one row each.
+query T rowsort
+SELECT JSONB_PATH_QUERY('{"a":[1,2,3,4]}'::JSONB, '$.a[*] ? (@ >= 3)')
+----
+3
+4
