@@ -850,6 +850,11 @@ pub enum ScalarFunc {
     BitGetBit,
     /// `SET_BIT(bits, n, v)` — `bits` with its `n`-th bit set to `v` (`0`/`1`), as the same bit type.
     BitSetBit,
+    /// `GET_BYTE(bytea, n)` — the `n`-th byte (0-based) of a binary string as `INT` (`0`–`255`).
+    GetByte,
+    /// `SET_BYTE(bytea, n, v)` — the binary string with its `n`-th byte set to `v` (low 8 bits), as
+    /// `BYTEA`.
+    SetByte,
     /// `LOWER(range)` — the lower bound, as the element type; `NULL` when empty or unbounded below.
     /// Spelled `lower`, like the text-folding [`Self::Lower`]; the analyzer picks between them by
     /// argument type.
@@ -1210,6 +1215,8 @@ impl ScalarFunc {
             Self::InetSameFamily => "inet_same_family",
             Self::BitGetBit => "get_bit",
             Self::BitSetBit => "set_bit",
+            Self::GetByte => "get_byte",
+            Self::SetByte => "set_byte",
             Self::RangeIsEmpty => "isempty",
             Self::Int4Range => "int4range",
             Self::Int8Range => "int8range",

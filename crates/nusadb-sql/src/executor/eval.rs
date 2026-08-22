@@ -1220,6 +1220,26 @@ fn eval_scalar_function(
         // PARSE_IDENT(text [, strict]): split a qualified identifier into its parts as TEXT[].
         (F::ParseIdent, [Text(s)]) => parse_ident_value(s, true)?,
         (F::ParseIdent, [Text(s), ast::Value::Bool(strict)]) => parse_ident_value(s, *strict)?,
+        // GET_BYTE(bytea, n): the n-th byte (0-based) as INT; an out-of-range index is a loud error.
+        (F::GetByte, [ast::Value::Bytes(b), Int(n)]) => {
+            match usize::try_from(*n).ok().and_then(|i| b.get(i)) {
+                Some(&byte) => Int(i64::from(byte)),
+                None => return Err(byte_index_out_of_range(*n, b.len())),
+            }
+        },
+        // SET_BYTE(bytea, n, v): the binary string with byte n set to the low 8 bits of v.
+        (F::SetByte, [ast::Value::Bytes(b), Int(n), Int(v)]) => {
+            match usize::try_from(*n).ok().filter(|&i| i < b.len()) {
+                Some(i) => {
+                    let mut bytes = b.clone();
+                    if let Some(slot) = bytes.get_mut(i) {
+                        *slot = u8::try_from(v.rem_euclid(256)).unwrap_or(0);
+                    }
+                    ast::Value::Bytes(bytes)
+                },
+                None => return Err(byte_index_out_of_range(*n, b.len())),
+            }
+        },
         // TRIM_ARRAY(arr, n): drop the last `n` elements; `n` must be between 0 and the length. A
         // NULL operand yields NULL.
         (F::TrimArray, [arr, count]) => match (arr, count) {
@@ -6018,6 +6038,16 @@ const fn apply_macaddr_bit_op(
 fn bit_index_out_of_range(n: i64, len: usize) -> Error {
     Error::Coded {
         message: format!("bit index {n} out of valid range, 0..{len}"),
+        sqlstate: "22003",
+    }
+}
+
+/// The error for a `get_byte`/`set_byte` index outside a binary string, matching the reference
+/// engine's wording (the valid range is `0..len-1`, and `0..-1` for an empty string).
+fn byte_index_out_of_range(n: i64, len: usize) -> Error {
+    let upper = i64::try_from(len).unwrap_or(i64::MAX) - 1;
+    Error::Coded {
+        message: format!("index {n} out of valid range, 0..{upper}"),
         sqlstate: "22003",
     }
 }

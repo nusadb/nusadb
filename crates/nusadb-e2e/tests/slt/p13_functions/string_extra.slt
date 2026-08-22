@@ -530,6 +530,26 @@ SELECT SET_BIT('\xffff'::BYTEA, 0, 0)
 ----
 \xfeff
 
+# --- GET_BYTE / SET_BYTE on BYTEA: whole bytes, 0-based ---
+# The first and last bytes of 0xdeadbeef as integers.
+query II
+SELECT GET_BYTE('\xdeadbeef'::BYTEA, 0), GET_BYTE('\xdeadbeef'::BYTEA, 3)
+----
+222 239
+
+# SET_BYTE replaces one whole byte; the value is taken modulo 256 (257 -> 0x01, -1 -> 0xff).
+query TTT
+SELECT SET_BYTE('\xdeadbeef'::BYTEA, 1, 0), SET_BYTE('\x0000'::BYTEA, 0, 257), SET_BYTE('\x0000'::BYTEA, 0, -1)
+----
+\xde00beef \x0100 \xff00
+
+# An out-of-range index is a loud error for both.
+statement error
+SELECT GET_BYTE('\xdeadbeef'::BYTEA, 4)
+
+statement error
+SELECT SET_BYTE('\xdeadbeef'::BYTEA, 4, 1)
+
 # SET_BIT sets the 0x08 bit of the first byte (0x1234 -> 0x1a34).
 query T
 SELECT SET_BIT('\x1234'::BYTEA, 3, 1)

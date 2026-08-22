@@ -1457,6 +1457,8 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "inet_same_family" => F::InetSameFamily,
         "get_bit" => F::BitGetBit,
         "set_bit" => F::BitSetBit,
+        "get_byte" => F::GetByte,
+        "set_byte" => F::SetByte,
         // Range accessors. `lower`/`upper` are not here: they share their spelling with the
         // text-folding functions, so the analyzer resolves them by argument type.
         "isempty" => F::RangeIsEmpty,
