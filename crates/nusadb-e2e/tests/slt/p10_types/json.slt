@@ -732,3 +732,9 @@ query I
 SELECT '{"a":{"x":5}}'::JSONB @@ '$.**.x == 5'
 ----
 1
+
+# $.* emits object values in jsonb key order (length-first, then bytewise): b, z, aa -> 3, 2, 1.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('{"aa":1,"z":2,"b":3}'::JSONB, '$.*') AS TEXT)
+----
+[3, 2, 1]

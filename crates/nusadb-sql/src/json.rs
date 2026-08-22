@@ -1295,7 +1295,14 @@ fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
                 },
                 PathStep::Wildcard => match value {
                     J::Array(arr) => next.extend(arr),
-                    J::Object(map) => next.extend(map.into_values()),
+                    // Object values are emitted in `jsonb` key order (length-first, then bytewise),
+                    // not the raw map's bytewise order, so `$.*` matches the reference engine even
+                    // when the members have keys of differing length.
+                    J::Object(map) => {
+                        let mut entries: Vec<(String, J)> = map.into_iter().collect();
+                        entries.sort_by(|a, b| crate::jsonb::key_order(&a.0, &b.0));
+                        next.extend(entries.into_iter().map(|(_, value)| value));
+                    },
                     _ => {},
                 },
                 PathStep::RecursiveDescent => collect_descendants(value, &mut next),
@@ -1785,6 +1792,12 @@ mod tests {
         );
         // `.*` fans out over object values (two members here).
         assert_eq!(path_query(doc, "$.*").unwrap().len(), 2);
+        // `.*` emits object values in jsonb key order (length-first, then bytewise) — here `b`, `z`,
+        // `aa` — not the raw bytewise `aa`, `b`, `z`.
+        assert_eq!(
+            path_query(r#"{"aa":1,"z":2,"b":3}"#, "$.*").unwrap(),
+            vec!["3".to_owned(), "2".to_owned(), "1".to_owned()]
+        );
         // Valid path, no match: an empty result, not a failure.
         assert_eq!(path_query(doc, "$.nope").unwrap(), Vec::<String>::new());
         // Unsupported syntax and a malformed path are one outcome: the path is unusable.
