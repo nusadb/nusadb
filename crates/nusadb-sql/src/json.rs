@@ -788,8 +788,29 @@ enum PathStep {
     Wildcard,
     /// `.**` — recursive descent: the value itself and every descendant, in document (pre-order).
     RecursiveDescent,
+    /// `.type()` / `.size()` — an item method mapping each current value to a derived value.
+    Method(ItemMethod),
     /// `? (predicate)` — keep only the current values for which `predicate` holds.
     Filter(Box<FilterExpr>),
+}
+
+/// A jsonpath item method (the `.name()` forms). Only the total methods are modelled here — those
+/// that always produce a value, so they fit the fallible-free path walker.
+#[derive(Clone, Copy)]
+enum ItemMethod {
+    /// `.type()` — the value's type as a string (`"object"`, `"array"`, `"number"`, …).
+    Type,
+    /// `.size()` — an array's element count; `1` for any non-array value.
+    Size,
+}
+
+/// Resolve an item-method name to its variant, or `None` for an unknown method.
+fn item_method(name: &str) -> Option<ItemMethod> {
+    match name {
+        "type" => Some(ItemMethod::Type),
+        "size" => Some(ItemMethod::Size),
+        _ => None,
+    }
 }
 
 /// A comparison operator inside a `jsonpath` filter predicate.
@@ -923,8 +944,8 @@ fn capture_filter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Optio
 }
 
 /// Parse the supported `jsonpath` subset: `$` root, `.key`, `.*`, `.**` (recursive descent),
-/// `['key']`/`["key"]`, `[n]`, `[*]`, and `? (predicate)` filters. Returns `None` for any syntax
-/// outside the subset (e.g. the level-bounded `.**{n}` form).
+/// `.type()`/`.size()` item methods, `['key']`/`["key"]`, `[n]`, `[*]`, and `? (predicate)` filters.
+/// Returns `None` for any syntax outside the subset (e.g. the level-bounded `.**{n}` form).
 fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
     let mut chars = path.trim().chars().peekable();
     if chars.next()? != '$' {
@@ -960,7 +981,7 @@ fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
                 }
                 let mut key = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c == '.' || c == '[' {
+                    if c == '.' || c == '[' || c == '(' {
                         break;
                     }
                     key.push(c);
@@ -969,7 +990,16 @@ fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
                 if key.is_empty() {
                     return None;
                 }
-                steps.push(PathStep::Key(key));
+                // A trailing `()` makes this an item method (`.type()`, `.size()`); otherwise a key.
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    if chars.next() != Some(')') {
+                        return None;
+                    }
+                    steps.push(PathStep::Method(item_method(&key)?));
+                } else {
+                    steps.push(PathStep::Key(key));
+                }
             },
             '[' => {
                 chars.next();
@@ -1154,7 +1184,7 @@ impl FilterParser {
         }
     }
 
-    /// Parse `@`/`$` followed by `.key`, `.*`, `.**`, `[n]`, `[*]`, or `['key']` accessors.
+    /// Parse `@`/`$` followed by `.key`, `.*`, `.**`, `.type()`/`.size()`, `[n]`, `[*]`, or `['key']`.
     fn parse_path(&mut self) -> Option<(FilterRoot, Vec<PathStep>)> {
         self.skip_ws();
         let root = match self.peek() {
@@ -1184,7 +1214,7 @@ impl FilterParser {
                     }
                     let mut key = String::new();
                     while let Some(c) = self.peek() {
-                        if matches!(c, '.' | '[' | ' ' | '\t' | '\n' | '\r')
+                        if matches!(c, '.' | '[' | '(' | ' ' | '\t' | '\n' | '\r')
                             || matches!(c, '=' | '!' | '<' | '>' | '&' | '|' | ')')
                         {
                             break;
@@ -1195,7 +1225,17 @@ impl FilterParser {
                     if key.is_empty() {
                         return None;
                     }
-                    steps.push(PathStep::Key(key));
+                    // A trailing `()` makes this an item method (`.type()`, `.size()`); else a key.
+                    if self.peek() == Some('(') {
+                        self.pos += 1;
+                        if self.peek() != Some(')') {
+                            return None;
+                        }
+                        self.pos += 1;
+                        steps.push(PathStep::Method(item_method(&key)?));
+                    } else {
+                        steps.push(PathStep::Key(key));
+                    }
                 },
                 '[' => {
                     self.pos += 1;
@@ -1381,6 +1421,7 @@ fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
                     _ => {},
                 },
                 PathStep::RecursiveDescent => collect_descendants(value, &mut next),
+                PathStep::Method(method) => next.push(apply_item_method(*method, value)),
                 PathStep::Filter(pred) => {
                     if eval_filter(pred, &value, root) == Some(true) {
                         next.push(value);
@@ -1391,6 +1432,31 @@ fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
         current = next;
     }
     current
+}
+
+/// Apply a total item method to `value`: `.type()` yields the type name as a string; `.size()` yields
+/// an array's length, or `1` for any non-array value.
+fn apply_item_method(method: ItemMethod, value: J) -> J {
+    match method {
+        ItemMethod::Type => J::String(
+            match value {
+                J::Null => "null",
+                J::Bool(_) => "boolean",
+                J::Number(_) => "number",
+                J::String(_) => "string",
+                J::Array(_) => "array",
+                J::Object(_) => "object",
+            }
+            .to_owned(),
+        ),
+        ItemMethod::Size => {
+            let size = match value {
+                J::Array(arr) => arr.len(),
+                _ => 1,
+            };
+            J::Number(size.into())
+        },
+    }
 }
 
 /// Append `value` and every descendant to `out` in pre-order: the value itself, then each child
@@ -2003,6 +2069,26 @@ mod tests {
         // An invalid regex is an unusable path, not a document error.
         assert_eq!(
             path_query(r#"["x"]"#, r#"$[*] ? (@ like_regex "[")"#),
+            Err(PathQueryError::UnusablePath)
+        );
+        // Item methods `.type()` and `.size()`.
+        assert_eq!(
+            path_query(r#"{"a":1}"#, "$.type()").unwrap(),
+            vec![r#""object""#.to_owned()]
+        );
+        assert_eq!(
+            path_query("[1,2,3]", "$.size()").unwrap(),
+            vec!["3".to_owned()]
+        );
+        // `.size()` of a non-array is 1; `.type()` inside a filter selects by type.
+        assert_eq!(path_query("5", "$.size()").unwrap(), vec!["1".to_owned()]);
+        assert_eq!(
+            path_query(r#"[1,"x",true]"#, r#"$[*] ? (@.type() == "string")"#).unwrap(),
+            vec![r#""x""#.to_owned()]
+        );
+        // An unknown item method is an unusable path.
+        assert_eq!(
+            path_query(r#"{"a":1}"#, "$.nope()"),
             Err(PathQueryError::UnusablePath)
         );
         // A malformed filter is an unusable path, not a document error.

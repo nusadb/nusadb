@@ -770,3 +770,22 @@ query IT
 SELECT '{"a":"Hello"}'::JSONB @@ '$.a like_regex "^h" flag "i"', CAST('{"a":5}'::JSONB @@ '$.a like_regex "5"' AS TEXT)
 ----
 1 NULL
+
+# --- item methods: .type() and .size() ---
+
+query T rowsort
+SELECT JSONB_PATH_QUERY('{"a":1}'::JSONB, '$.type()')
+----
+"object"
+
+# .size() is the array length; 1 for any non-array value.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[10,20,30]'::JSONB, '$.size()') AS TEXT), CAST(JSONB_PATH_QUERY_ARRAY('5'::JSONB, '$.size()') AS TEXT)
+----
+[3] [1]
+
+# .type() inside a filter selects values by their type.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[1,"x",true]'::JSONB, '$[*] ? (@.type() == "string")') AS TEXT)
+----
+["x"]
