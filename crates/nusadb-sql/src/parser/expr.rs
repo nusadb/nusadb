@@ -1308,7 +1308,8 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "regexp_split_to_array" => F::RegexpSplitToArray,
         // Niladic clock built-ins, reachable through the parenthesised call form `NOW()` /
         // `CURRENT_TIMESTAMP()` (the bare keyword form is mapped in `convert_function_call`).
-        "now" => F::Now,
+        // `transaction_timestamp()` is a synonym for `now()` — both give the transaction start time.
+        "now" | "transaction_timestamp" => F::Now,
         "statement_timestamp" => F::StatementTimestamp,
         "localtimestamp" => F::LocalTimestamp,
         "current_timestamp" => F::CurrentTimestamp,

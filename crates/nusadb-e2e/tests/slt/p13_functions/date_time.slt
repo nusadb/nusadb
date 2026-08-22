@@ -573,3 +573,9 @@ query R
 SELECT EXTRACT(MICROSECONDS FROM TIMETZ '12:34:56.789012+05')
 ----
 56789012.000
+
+# --- transaction_timestamp() is a synonym for now() (both are the transaction start time) ---
+query I
+SELECT TRANSACTION_TIMESTAMP() = NOW()
+----
+1
