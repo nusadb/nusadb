@@ -1488,6 +1488,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "jsonb_strip_nulls" | "json_strip_nulls" => F::JsonbStripNulls,
         "jsonb_pretty" | "json_pretty" => F::JsonbPretty,
         "jsonb_path_exists" | "json_path_exists" => F::JsonbPathExists,
+        "jsonb_path_match" | "json_path_match" => F::JsonbPathMatch,
         "jsonb_insert" | "json_insert" => F::JsonbInsert,
         "jsonb_path_query_first" | "json_path_query_first" => F::JsonbPathQueryFirst,
         "jsonb_path_query_array" | "json_path_query_array" => F::JsonbPathQueryArray,

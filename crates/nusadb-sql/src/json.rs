@@ -1210,6 +1210,36 @@ pub fn path_query(json: &str, path: &str) -> Result<Vec<String>, PathQueryError>
     Ok(matches.iter().map(to_text).collect())
 }
 
+/// `jsonb_path_match(json, path)` / the `@@` operator — evaluate `path` as a predicate check against
+/// `json` and return its boolean value.
+///
+/// `Ok(Some(bool))` is the predicate outcome. `Ok(None)` is SQL NULL, returned when the predicate is
+/// unknown (a comparison against an incompatible type), or when `path` is a bare accessor expression
+/// whose result is not a single boolean value. (A comparison against a path that resolves to nothing
+/// is a definite `false`, not unknown.)
+///
+/// # Errors
+///
+/// [`PathQueryError::MalformedDocument`] if `json` does not parse, or
+/// [`PathQueryError::UnusablePath`] if `path` is neither a usable predicate nor a usable accessor
+/// path.
+pub fn path_match(json: &str, path: &str) -> Result<Option<bool>, PathQueryError> {
+    let doc = parse(json).ok_or(PathQueryError::MalformedDocument)?;
+    let trimmed = path.trim();
+    // A predicate-check expression (comparison / logical / exists) evaluates to a boolean directly.
+    if let Some(expr) = parse_filter(trimmed) {
+        return Ok(eval_filter(&expr, &doc, &doc));
+    }
+    // Otherwise the argument must be a plain accessor path, which is a boolean check only when it
+    // resolves to exactly one boolean value; anything else is not a single boolean, hence NULL.
+    let steps = parse_jsonpath(trimmed).ok_or(PathQueryError::UnusablePath)?;
+    let values = apply_steps(vec![doc.clone()], &steps, &doc);
+    Ok(match values.as_slice() {
+        [J::Bool(b)] => Some(*b),
+        _ => None,
+    })
+}
+
 /// Walk `steps` over the `current` value set, returning the set of matched values. `root` is the
 /// whole document, needed to resolve `$`-rooted operands inside a filter predicate.
 fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
@@ -1250,8 +1280,8 @@ fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
 }
 
 /// Evaluate a filter predicate with three-valued logic: `Some(true)` / `Some(false)` / `None`
-/// (unknown — e.g. a comparison against a path that resolves to nothing). `current` is the item under
-/// test (the `@` in the predicate); `root` is the whole document (the `$`).
+/// (unknown — e.g. a comparison against an incompatible type). `current` is the item under test (the
+/// `@` in the predicate); `root` is the whole document (the `$`).
 fn eval_filter(expr: &FilterExpr, current: &J, root: &J) -> Option<bool> {
     match expr {
         FilterExpr::Or(a, b) => {
@@ -1309,21 +1339,25 @@ const fn three_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
-/// Existential comparison: true if any (left, right) pair satisfies `op`; false if pairs exist and
-/// are comparable but none satisfy it; unknown if no comparable pair exists (empty side, or every
-/// pair type-incompatible for an ordered operator).
+/// Existential comparison over the cross product of both operand sets, with three-valued logic:
+///
+/// - **true** if any pair satisfies `op` (true wins outright);
+/// - else **unknown** if any pair was incomparable — a type mismatch or a container operand raises an
+///   error that the predicate suppresses to unknown, and unknown outranks a definite false;
+/// - else **false** — every pair was comparable and none matched, *including* the empty case (a path
+///   that resolved to nothing has no matching pair, so the comparison is definitely false).
 fn existential_compare(left: &[J], op: CmpOp, right: &[J]) -> Option<bool> {
-    let mut saw_comparable = false;
+    let mut saw_error = false;
     for l in left {
         for r in right {
             match compare_pair(l, op, r) {
                 Some(true) => return Some(true),
-                Some(false) => saw_comparable = true,
-                None => {},
+                Some(false) => {},
+                None => saw_error = true,
             }
         }
     }
-    if saw_comparable { Some(false) } else { None }
+    if saw_error { None } else { Some(false) }
 }
 
 /// Compare one scalar pair under `op`. `None` when the pair is not comparable under that operator
@@ -1339,23 +1373,21 @@ fn compare_pair(left: &J, op: CmpOp, right: &J) -> Option<bool> {
     }
 }
 
-/// Equality of two JSON scalars: `None` if either is a container (not comparable in a predicate),
-/// else `Some(true/false)`. Cross-type scalars are unequal (a number never equals a string).
+/// Equality of two JSON scalars of a matching type: `Some(true/false)` only when both are numbers,
+/// both strings, both booleans, or both null. Any other pairing — a container operand, or two scalars
+/// of different types — is not comparable in a predicate and yields `None` (unknown), matching the
+/// reference engine, where a cross-type comparison is a suppressed error rather than a plain false.
 fn scalar_eq(left: &J, right: &J) -> Option<bool> {
-    if matches!(left, J::Array(_) | J::Object(_)) || matches!(right, J::Array(_) | J::Object(_)) {
-        return None;
-    }
-    let equal = match (left, right) {
-        (J::Number(a), J::Number(b)) => match (a.as_f64(), b.as_f64()) {
+    match (left, right) {
+        (J::Number(a), J::Number(b)) => Some(match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => x == y,
             _ => a.to_string() == b.to_string(),
-        },
-        (J::String(a), J::String(b)) => a == b,
-        (J::Bool(a), J::Bool(b)) => a == b,
-        (J::Null, J::Null) => true,
-        _ => false,
-    };
-    Some(equal)
+        }),
+        (J::String(a), J::String(b)) => Some(a == b),
+        (J::Bool(a), J::Bool(b)) => Some(a == b),
+        (J::Null, J::Null) => Some(true),
+        _ => None,
+    }
 }
 
 /// Ordering of two JSON scalars of the same comparable type: `None` unless both are numbers, both
@@ -1766,6 +1798,44 @@ mod tests {
         assert_eq!(
             path_query("[1,2,3]", "$[*] ? (@ >)"),
             Err(PathQueryError::UnusablePath)
+        );
+    }
+
+    #[test]
+    fn path_match_predicate_checks_match_the_reference_engine() {
+        // A comparison predicate evaluates to its boolean result.
+        assert_eq!(path_match(r#"{"a":1}"#, "$.a == 1"), Ok(Some(true)));
+        assert_eq!(path_match(r#"{"a":5}"#, "$.a > 3"), Ok(Some(true)));
+        // exists(...) and an existential comparison over a wildcard.
+        assert_eq!(path_match(r#"{"a":1}"#, "exists($.a)"), Ok(Some(true)));
+        assert_eq!(path_match(r#"{"a":[1,2,3]}"#, "$.a[*] > 2"), Ok(Some(true)));
+        // A missing path makes the comparison definitely false (not unknown), so NOT of it is true.
+        assert_eq!(path_match(r#"{"a":1}"#, "$.x == 1"), Ok(Some(false)));
+        assert_eq!(path_match(r#"{"a":1}"#, "!($.x == 1)"), Ok(Some(true)));
+        // A type mismatch is a suppressed error → unknown (NULL), not false.
+        assert_eq!(path_match(r#"{"a":1}"#, r#"$.a == "s""#), Ok(None));
+        assert_eq!(path_match(r#"{"a":1}"#, r#"$.a < "s""#), Ok(None));
+        // Existential precedence: a true wins; otherwise an error (unknown) outranks a false.
+        assert_eq!(path_match(r#"[1,"s"]"#, "$[*] == 1"), Ok(Some(true)));
+        assert_eq!(path_match(r#"[2,"s"]"#, "$[*] == 1"), Ok(None));
+        assert_eq!(path_match("[2,3]", "$[*] == 1"), Ok(Some(false)));
+        // Three-valued AND / OR with a missing operand.
+        assert_eq!(
+            path_match(r#"{"a":1}"#, "$.x == 1 && $.a == 1"),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            path_match(r#"{"a":1}"#, "$.x == 1 || $.a == 1"),
+            Ok(Some(true))
+        );
+        // A bare accessor path is a boolean check only when it is a single boolean value.
+        assert_eq!(path_match(r#"{"a":true}"#, "$.a"), Ok(Some(true)));
+        assert_eq!(path_match(r#"{"a":1}"#, "$.a"), Ok(None));
+        assert_eq!(path_match("[true,false]", "$[*]"), Ok(None));
+        // A malformed document is a document error, not a path error.
+        assert_eq!(
+            path_match("not json", "$.a == 1"),
+            Err(PathQueryError::MalformedDocument)
         );
     }
 

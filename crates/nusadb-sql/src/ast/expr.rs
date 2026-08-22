@@ -924,6 +924,10 @@ pub enum ScalarFunc {
     /// `JSONB_PATH_EXISTS(json, path)` / `JSON_PATH_EXISTS(json, path)` — whether the `jsonpath`
     /// matches anywhere in the document, as `BOOL`.
     JsonbPathExists,
+    /// `JSONB_PATH_MATCH(json, path)` / `JSON_PATH_MATCH(json, path)` — the boolean result of a
+    /// predicate-check `jsonpath` against the document, as `BOOL` (or `NULL` when the predicate is
+    /// unknown or the path is not a single boolean value).
+    JsonbPathMatch,
     /// `JSONB_INSERT(target, path, new_value [, insert_after])` — insert `new_value` at `path` without
     /// overwriting an existing value, as `JSON`.
     JsonbInsert,
@@ -1219,6 +1223,7 @@ impl ScalarFunc {
             Self::JsonbStripNulls => "jsonb_strip_nulls",
             Self::JsonbPretty => "jsonb_pretty",
             Self::JsonbPathExists => "jsonb_path_exists",
+            Self::JsonbPathMatch => "jsonb_path_match",
             Self::JsonbInsert => "jsonb_insert",
             Self::JsonbPathQueryFirst => "jsonb_path_query_first",
             Self::JsonbPathQueryArray => "jsonb_path_query_array",

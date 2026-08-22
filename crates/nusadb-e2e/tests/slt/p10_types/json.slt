@@ -675,3 +675,35 @@ SELECT JSONB_PATH_QUERY('{"a":[1,2,3,4]}'::JSONB, '$.a[*] ? (@ >= 3)')
 ----
 3
 4
+
+# --- @@ / jsonb_path_match: evaluate a jsonpath as a predicate check, yielding its boolean value ---
+
+# A comparison predicate, an existential comparison over a wildcard, and exists(...).
+query III
+SELECT '{"a":1}'::JSONB @@ '$.a == 1', '{"a":[1,2,3]}'::JSONB @@ '$.a[*] > 2', '{"a":1}'::JSONB @@ 'exists($.a)'
+----
+1 1 1
+
+# A missing path makes the comparison definitely false; AND/OR combine three-valued.
+query III
+SELECT '{"a":1}'::JSONB @@ '$.x == 1', '{"a":1}'::JSONB @@ '$.x == 1 && $.a == 1', '{"a":1}'::JSONB @@ '$.x == 1 || $.a == 1'
+----
+0 0 1
+
+# A bare accessor path is a boolean check only when it resolves to a single boolean value.
+query I
+SELECT '{"a":true}'::JSONB @@ '$.a'
+----
+1
+
+# A bare path to a non-boolean, and a type-mismatch comparison, are both unknown → NULL.
+query TT
+SELECT CAST('{"a":1}'::JSONB @@ '$.a' AS TEXT), CAST('{"a":1}'::JSONB @@ '$.a == "s"' AS TEXT)
+----
+NULL NULL
+
+# The jsonb_path_match function is the same predicate check as the @@ operator.
+query I
+SELECT JSONB_PATH_MATCH('{"a":1}'::JSONB, '$.a == 1')
+----
+1

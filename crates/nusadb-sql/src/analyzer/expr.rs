@@ -1415,6 +1415,8 @@ pub(super) fn analyze_scalar_function(
         F::JsonbPathExists | F::JsonbExists => {
             ScalarSig::Fixed(&[ColumnType::Json, Text], &[], ColumnType::Bool)
         },
+        // JSONB_PATH_MATCH(json, path) → BOOL (or NULL).
+        F::JsonbPathMatch => ScalarSig::Fixed(&[ColumnType::Json, Text], &[], ColumnType::Bool),
         // Full-text search (F1): TO_TSVECTOR/TO_TSQUERY/PLAINTO_TSQUERY([config,] text) → the
         // canonical tsvector/tsquery text form. The optional leading argument is the configuration;
         // with one argument the default configuration applies (rejected at evaluation until a
@@ -4903,6 +4905,16 @@ pub(super) fn check_json_path_exists(
 /// Type rule for `@@` (F1): both operands are the text forms of a `tsvector`/`tsquery` (either
 /// order, like the reference engine), so both must be `TEXT`; the result is the `BOOL` match.
 pub(super) fn check_ts_match(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
+    // `@@` also overloads as a jsonpath predicate check: a JSON document on the left, a jsonpath text
+    // on the right, yielding the `BOOL` (or NULL) predicate result — like `jsonb_path_match`.
+    if left == ColumnType::Json
+        && matches!(
+            right,
+            ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_)
+        )
+    {
+        return Ok(ColumnType::Bool);
+    }
     // `tsvector @@ tsquery`, either operand order, is the native form. A text operand is also
     // accepted (parsed at evaluation), keeping `to_tsvector(...) @@ '…'` and column-of-text usage.
     let is_ts_operand = |ty: ColumnType| {

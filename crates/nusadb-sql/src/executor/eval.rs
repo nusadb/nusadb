@@ -820,6 +820,13 @@ fn eval_scalar_function(
                 .map_err(|why| jsonpath_error("jsonb_path_exists", why, s, path))?;
             ast::Value::Bool(!matches.is_empty())
         },
+        // JSONB_PATH_MATCH(json, path) → the boolean result of the predicate check, or NULL when the
+        // predicate is unknown / not a single boolean; an unusable path is a runtime error.
+        (F::JsonbPathMatch, [ast::Value::Json(s) | Text(s), Text(path)]) => {
+            crate::json::path_match(s, path)
+                .map_err(|why| jsonpath_error("jsonb_path_match", why, s, path))?
+                .map_or(ast::Value::Null, ast::Value::Bool)
+        },
         // JSONB_PATH_QUERY_FIRST(json, path) → the first match as JSON, or NULL; an unsupported or
         // invalid path is a runtime error (mirroring JSONB_PATH_QUERY).
         (F::JsonbPathQueryFirst, [ast::Value::Json(s) | Text(s), Text(path)]) => {
@@ -5385,7 +5392,12 @@ fn apply_binary(
             vector_distance_op("<#>", crate::vector::neg_inner_product, left, right)
         },
         Op::VectorL1Distance => vector_distance_op("<+>", crate::vector::l1_distance, left, right),
-        Op::TsMatch => ts_match_op(left, right),
+        // `@@` overloads on the left operand: a JSON document is a jsonpath predicate check, a
+        // full-text operand is a `tsvector`/`tsquery` match.
+        Op::TsMatch => match left {
+            ast::Value::Json(_) => json_path_match_op(left, right),
+            _ => ts_match_op(left, right),
+        },
         // `@?` — does the right jsonpath return any item for the left JSON value?
         Op::JsonPathExists => json_path_exists_op(left, right),
         // `~=` geometric same-as.
@@ -6426,6 +6438,22 @@ fn json_path_exists_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Val
     let matches =
         crate::json::path_query(doc, path).map_err(|why| jsonpath_error("@?", why, doc, path))?;
     Ok(ast::Value::Bool(!matches.is_empty()))
+}
+
+/// Evaluate `json @@ jsonpath` — the boolean result of a predicate-check jsonpath against the left
+/// JSON value, as `BOOL`. A `NULL` operand yields `NULL`; a predicate whose result is unknown (or a
+/// bare path that is not a single boolean value) yields `NULL`; an unusable path is a loud runtime
+/// error, exactly like `jsonb_path_match`.
+fn json_path_match_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    let (ast::Value::Json(doc) | ast::Value::Text(doc)) = left else {
+        return Ok(ast::Value::Null);
+    };
+    let ast::Value::Text(path) = right else {
+        return Ok(ast::Value::Null);
+    };
+    let matched =
+        crate::json::path_match(doc, path).map_err(|why| jsonpath_error("@@", why, doc, path))?;
+    Ok(matched.map_or(ast::Value::Null, ast::Value::Bool))
 }
 
 /// Evaluate JSON `-`: remove an object member / array element by key (`TEXT`), an array element by
