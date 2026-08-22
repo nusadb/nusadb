@@ -640,6 +640,9 @@ pub fn extract_time_field(field: &str, tod_micros: i64) -> Option<f64> {
         "hour" => h as f64,
         "minute" => mi as f64,
         "second" => s as f64 + us as f64 / MICROS_PER_SEC as f64,
+        // The sub-minute seconds carried down to micro-/milliseconds, matching the reference engine.
+        "microseconds" => (s * MICROS_PER_SEC + us) as f64,
+        "milliseconds" => (s * MICROS_PER_SEC + us) as f64 / 1_000.0,
         "epoch" => tod_micros as f64 / MICROS_PER_SEC as f64,
         _ => return None,
     };
@@ -1850,6 +1853,10 @@ mod tests {
         assert_eq!(extract_time_field("hour", tod), Some(13.0));
         assert_eq!(extract_time_field("minute", tod), Some(45.0));
         assert_eq!(extract_time_field("second", tod), Some(30.0));
+        // Micro-/milliseconds carry the sub-minute seconds, matching the reference engine.
+        let frac = parse_time("12:34:56.789012").unwrap();
+        assert_eq!(extract_time_field("microseconds", frac), Some(56_789_012.0));
+        assert_eq!(extract_time_field("milliseconds", frac), Some(56_789.012));
         // A calendar field is meaningless for TIME.
         assert_eq!(extract_time_field("year", tod), None);
     }
