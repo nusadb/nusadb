@@ -1430,6 +1430,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "array_cat" => F::ArrayCat,
         "array_position" => F::ArrayPosition,
         "array_remove" => F::ArrayRemove,
+        "trim_array" => F::TrimArray,
         "array_replace" => F::ArrayReplace,
         "array_positions" => F::ArrayPositions,
         "array_ndims" => F::ArrayNdims,

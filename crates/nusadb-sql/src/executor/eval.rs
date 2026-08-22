@@ -1215,6 +1215,24 @@ fn eval_scalar_function(
                 _ => ast::Value::Null,
             }
         },
+        // TRIM_ARRAY(arr, n): drop the last `n` elements; `n` must be between 0 and the length. A
+        // NULL operand yields NULL.
+        (F::TrimArray, [arr, count]) => match (arr, count) {
+            (ast::Value::Array(items), Int(n)) => {
+                let len = items.len();
+                let keep = usize::try_from(*n)
+                    .ok()
+                    .filter(|&n| n <= len)
+                    .map(|n| len - n)
+                    .ok_or_else(|| {
+                        Error::InvalidParameterValue(format!(
+                            "number of elements to trim must be between 0 and {len}"
+                        ))
+                    })?;
+                ast::Value::Array(items.iter().take(keep).cloned().collect())
+            },
+            _ => ast::Value::Null,
+        },
         // ARRAY_LOWER(arr, dim): the lower bound — always 1 for an existing dimension, NULL otherwise.
         (F::ArrayLower, [ast::Value::Array(items), Int(dim)]) => {
             let dims = array_dimensions(items);

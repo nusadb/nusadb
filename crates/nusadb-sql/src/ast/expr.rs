@@ -794,6 +794,9 @@ pub enum ScalarFunc {
     /// `ARRAY_REPLACE(arr, from, to)` — `arr` with every element equal to `from` replaced by `to`;
     /// result keeps `arr`'s type (B-fn).
     ArrayReplace,
+    /// `TRIM_ARRAY(arr, n)` — `arr` with its last `n` elements removed; result keeps `arr`'s type.
+    /// `n` must be between 0 and the array's length.
+    TrimArray,
     /// `ARRAY_POSITIONS(arr, elem)` — an `INT[]` of every 1-based index where `elem` occurs in `arr`
     /// (empty array if none; `NULL` if `arr` is `NULL`) (B-fn).
     ArrayPositions,
@@ -1173,6 +1176,7 @@ impl ScalarFunc {
             Self::ArrayCat => "array_cat",
             Self::ArrayPosition => "array_position",
             Self::ArrayRemove => "array_remove",
+            Self::TrimArray => "trim_array",
             Self::ArrayReplace => "array_replace",
             Self::ArrayPositions => "array_positions",
             Self::ArrayNdims => "array_ndims",

@@ -1037,7 +1037,7 @@ pub(super) fn analyze_scalar_function(
     // element type is polymorphic, so they are not expressible with the fixed table.
     if matches!(
         func,
-        F::ArrayLength | F::ArrayLower | F::ArrayUpper | F::ArrayToString
+        F::ArrayLength | F::ArrayLower | F::ArrayUpper | F::ArrayToString | F::TrimArray
     ) {
         return analyze_array_function(func, args, scope, catalog, aggregates);
     }
@@ -1622,6 +1622,7 @@ pub(super) fn analyze_scalar_function(
         | F::ArrayRemove
         | F::ArrayReplace
         | F::ArrayPositions
+        | F::TrimArray
         | F::ArrayNdims
         | F::L2Distance
         | F::CosineDistance
@@ -1926,6 +1927,9 @@ fn analyze_array_function(
     }
     let (second_ty, result) = if func == F::ArrayToString {
         (ColumnType::Text, ColumnType::Text)
+    } else if func == F::TrimArray {
+        // TRIM_ARRAY(arr, n) removes the last `n` elements, keeping the array's own type.
+        (ColumnType::Int, arr.ty)
     } else {
         // ARRAY_LENGTH / ARRAY_LOWER / ARRAY_UPPER take a dimension INT and return INT.
         (ColumnType::Int, ColumnType::Int)
