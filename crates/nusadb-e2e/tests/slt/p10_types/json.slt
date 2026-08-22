@@ -631,6 +631,32 @@ SELECT '{"a":1,"b":{"c":2}}'::JSONB @? '$.a', '{"a":1}'::JSONB @? '$.x', '{"a":{
 ----
 1 0 1
 
+# --- jsonb_extract_path / _text: the variadic form of #> / #>> ---
+
+# A nested key path returns the value as JSON.
+query T
+SELECT CAST(JSONB_EXTRACT_PATH('{"a":{"b":{"c":5}}}'::JSONB, 'a', 'b', 'c') AS TEXT)
+----
+5
+
+# The _text form returns the value as text (a string is unquoted).
+query T
+SELECT JSONB_EXTRACT_PATH_TEXT('{"a":{"b":"hi"}}'::JSONB, 'a', 'b')
+----
+hi
+
+# A numeric path element indexes an array (0-based).
+query T
+SELECT CAST(JSONB_EXTRACT_PATH('{"a":[10,20,30]}'::JSONB, 'a', '2') AS TEXT)
+----
+30
+
+# A missing step yields NULL; a JSON null via _text is SQL NULL. The json_extract_path alias works too.
+query TT
+SELECT CAST(JSON_EXTRACT_PATH('{"a":1}'::JSONB, 'x') AS TEXT), CAST(JSONB_EXTRACT_PATH_TEXT('{"a":null}'::JSONB, 'a') AS TEXT)
+----
+NULL NULL
+
 # --- jsonpath filters: `? (predicate)` keeps only the items for which the predicate holds ---
 
 # Numeric comparison selects the qualifying array elements.

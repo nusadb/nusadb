@@ -829,6 +829,18 @@ fn eval_scalar_function(
                 .map_err(|why| jsonpath_error("jsonb_path_match", why, s, path))?
                 .map_or(ast::Value::Null, ast::Value::Bool)
         },
+        // JSONB_EXTRACT_PATH(json, VARIADIC path) → the value at the key/index path as JSON (the
+        // variadic form of `#>`), or NULL if a step is missing.
+        (F::JsonExtractPath, [ast::Value::Json(doc) | Text(doc), path @ ..]) => {
+            let parts = json_path_parts(path);
+            crate::json::get_path(doc, &parts).map_or(ast::Value::Null, ast::Value::Json)
+        },
+        // JSONB_EXTRACT_PATH_TEXT(json, VARIADIC path) → the value at the path as TEXT (the variadic
+        // form of `#>>`; a JSON null becomes SQL NULL).
+        (F::JsonExtractPathText, [ast::Value::Json(doc) | Text(doc), path @ ..]) => {
+            let parts = json_path_parts(path);
+            crate::json::get_path_text(doc, &parts).map_or(ast::Value::Null, Text)
+        },
         // JSONB_PATH_QUERY_FIRST(json, path) → the first match as JSON, or NULL; an unsupported or
         // invalid path is a runtime error (mirroring JSONB_PATH_QUERY).
         (F::JsonbPathQueryFirst, [ast::Value::Json(s) | Text(s), Text(path)]) => {
@@ -2304,6 +2316,18 @@ fn parse_ident_value(input: &str, strict: bool) -> Result<ast::Value, Error> {
         return Err(bad());
     }
     Ok(ast::Value::Array(parts))
+}
+
+/// Collect the text path elements of a `jsonb_extract_path[_text]` call into `&str` slices for
+/// [`crate::json::get_path`]. NULL elements are already filtered by the null-strict collection, and
+/// the analyzer requires each element to be text, so any non-text value here is skipped defensively.
+fn json_path_parts(path: &[ast::Value]) -> Vec<&str> {
+    path.iter()
+        .filter_map(|v| match v {
+            ast::Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `REGEXP_SUBSTR(s, pattern [, flags])` — the first substring of `s` matching `pattern`, or `NULL`

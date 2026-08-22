@@ -929,6 +929,12 @@ pub enum ScalarFunc {
     /// fields `f1`, `f2`, … in order, as `JSON`. Only the `ROW(...)` / `(a, b, …)` form is
     /// supported; whole-table-row references (`row_to_json(t)` with real column names) are not yet.
     RowToJson,
+    /// `JSONB_EXTRACT_PATH(json, VARIADIC path text)` / `JSON_EXTRACT_PATH(...)` — the value at the
+    /// key/index path, as `JSON` (the variadic form of `#>`); `NULL` if any step is missing.
+    JsonExtractPath,
+    /// `JSONB_EXTRACT_PATH_TEXT(json, VARIADIC path text)` / `JSON_EXTRACT_PATH_TEXT(...)` — the value
+    /// at the path as `TEXT` (the variadic form of `#>>`; a JSON `null` becomes SQL `NULL`).
+    JsonExtractPathText,
     /// `JSONB_SET(target, path, new_value [, create_missing])` — replace the value at `path` (a
     /// `TEXT[]` of object keys / array indices) with `new_value`.
     JsonbSet,
@@ -1241,6 +1247,8 @@ impl ScalarFunc {
             Self::JsonBuildObject => "json_build_object",
             Self::JsonObject => "json_object",
             Self::JsonBuildArray => "json_build_array",
+            Self::JsonExtractPath => "jsonb_extract_path",
+            Self::JsonExtractPathText => "jsonb_extract_path_text",
             Self::JsonbSet => "jsonb_set",
             Self::JsonbStripNulls => "jsonb_strip_nulls",
             Self::JsonbPretty => "jsonb_pretty",

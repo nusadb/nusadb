@@ -1062,6 +1062,10 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::ArrayReplace) {
         return analyze_array_replace(func, args, scope, catalog, aggregates);
     }
+    // JSONB_EXTRACT_PATH[_TEXT](json, VARIADIC path text) is variadic — not table-shaped.
+    if matches!(func, F::JsonExtractPath | F::JsonExtractPathText) {
+        return analyze_json_extract_path(func, args, scope, catalog, aggregates);
+    }
     // CARDINALITY / ARRAY_NDIMS (→ INT) and ARRAY_DIMS (→ TEXT) take one array of any element type —
     // not expressible with the fixed table since the element type is polymorphic.
     if matches!(func, F::Cardinality | F::ArrayDims | F::ArrayNdims) {
@@ -1634,6 +1638,8 @@ pub(super) fn analyze_scalar_function(
         | F::ArrayReplace
         | F::ArrayPositions
         | F::TrimArray
+        | F::JsonExtractPath
+        | F::JsonExtractPathText
         | F::ArrayNdims
         | F::L2Distance
         | F::CosineDistance
@@ -2029,6 +2035,79 @@ fn analyze_array_mutate(
             args: typed_args,
         },
         ty: result_ty,
+    })
+}
+
+/// Analyze `JSONB_EXTRACT_PATH[_TEXT](json, VARIADIC path text)`: a JSON (or text) document followed
+/// by one or more text path elements. The `_TEXT` form yields `TEXT`, the plain form yields `JSON`.
+fn analyze_json_extract_path(
+    func: ast::ScalarFunc,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    use ast::ScalarFunc as F;
+    let name = func.name();
+    let text_like = |ty: ColumnType| {
+        matches!(
+            ty,
+            ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_)
+        )
+    };
+    let Some((json_expr, path_exprs)) = args.split_first() else {
+        return Err(Error::FunctionArgs(format!(
+            "{name}() expects at least 2 arguments, got 0"
+        )));
+    };
+    if path_exprs.is_empty() {
+        return Err(Error::FunctionArgs(format!(
+            "{name}() expects at least one path element"
+        )));
+    }
+    let json = analyze_expr_agg(
+        json_expr,
+        scope,
+        catalog,
+        Some(ColumnType::Json),
+        aggregates.as_deref_mut(),
+    )?;
+    if json.ty != ColumnType::Json && !text_like(json.ty) && !is_null_literal(&json) {
+        return Err(Error::TypeMismatch {
+            context: format!("{name}() first argument"),
+            expected: ColumnType::Json,
+            found: json.ty,
+        });
+    }
+    let mut analyzed = vec![json];
+    for path_expr in path_exprs {
+        let elem = analyze_expr_agg(
+            path_expr,
+            scope,
+            catalog,
+            Some(ColumnType::Text),
+            aggregates.as_deref_mut(),
+        )?;
+        if !text_like(elem.ty) && !is_null_literal(&elem) {
+            return Err(Error::TypeMismatch {
+                context: format!("{name}() path element"),
+                expected: ColumnType::Text,
+                found: elem.ty,
+            });
+        }
+        analyzed.push(elem);
+    }
+    let ty = if func == F::JsonExtractPathText {
+        ColumnType::Text
+    } else {
+        ColumnType::Json
+    };
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func,
+            args: analyzed,
+        },
+        ty,
     })
 }
 
