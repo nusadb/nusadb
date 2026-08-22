@@ -1215,6 +1215,9 @@ fn eval_scalar_function(
                 _ => ast::Value::Null,
             }
         },
+        // PARSE_IDENT(text [, strict]): split a qualified identifier into its parts as TEXT[].
+        (F::ParseIdent, [Text(s)]) => parse_ident_value(s, true)?,
+        (F::ParseIdent, [Text(s), ast::Value::Bool(strict)]) => parse_ident_value(s, *strict)?,
         // TRIM_ARRAY(arr, n): drop the last `n` elements; `n` must be between 0 and the length. A
         // NULL operand yields NULL.
         (F::TrimArray, [arr, count]) => match (arr, count) {
@@ -2205,6 +2208,80 @@ fn eval_string_to_array(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Err
         other => split_on_literal(&s, &crate::display::value_text(&other)),
     };
     Ok(ast::Value::Array(pieces.into_iter().map(Text).collect()))
+}
+
+/// `parse_ident(input, strict)` — split a qualified identifier into its parts as a `TEXT[]`.
+///
+/// Dot-separated parts are parsed left to right. An unquoted part starts with a letter or underscore
+/// and continues with letters, digits, underscore or dollar, folded to lowercase; a double-quoted
+/// part keeps its case and treats a doubled quote as an embedded quote. Whitespace around parts and
+/// dots is ignored. A malformed part (or a dot with nothing after it) is a loud error, and in
+/// `strict` mode trailing text after the last identifier is an error too, otherwise it is ignored.
+fn parse_ident_value(input: &str, strict: bool) -> Result<ast::Value, Error> {
+    let bad = || Error::Coded {
+        message: format!("string is not a valid identifier: \"{input}\""),
+        sqlstate: "42602",
+    };
+    let chars: Vec<char> = input.chars().collect();
+    let mut pos = 0;
+    let mut parts: Vec<ast::Value> = Vec::new();
+    let skip_ws = |pos: &mut usize| {
+        while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
+            *pos += 1;
+        }
+    };
+    loop {
+        skip_ws(&mut pos);
+        match chars.get(pos) {
+            Some('"') => {
+                pos += 1;
+                let mut part = String::new();
+                loop {
+                    let c = *chars.get(pos).ok_or_else(bad)?;
+                    pos += 1;
+                    if c == '"' {
+                        if chars.get(pos) == Some(&'"') {
+                            part.push('"');
+                            pos += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        part.push(c);
+                    }
+                }
+                // A quoted identifier must not be empty, matching the reference engine.
+                if part.is_empty() {
+                    return Err(bad());
+                }
+                parts.push(ast::Value::Text(part));
+            },
+            Some(&c) if c.is_alphabetic() || c == '_' => {
+                let mut part = String::new();
+                while let Some(&c) = chars.get(pos) {
+                    if c.is_alphanumeric() || c == '_' || c == '$' {
+                        part.extend(c.to_lowercase());
+                        pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                parts.push(ast::Value::Text(part));
+            },
+            _ => return Err(bad()),
+        }
+        skip_ws(&mut pos);
+        if chars.get(pos) == Some(&'.') {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+    // Trailing content after the final identifier is an error only in strict mode.
+    if strict && pos < chars.len() {
+        return Err(bad());
+    }
+    Ok(ast::Value::Array(parts))
 }
 
 /// `REGEXP_SUBSTR(s, pattern [, flags])` — the first substring of `s` matching `pattern`, or `NULL`

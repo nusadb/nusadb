@@ -846,3 +846,48 @@ query T
 SELECT ENCODE(DECODE(ENCODE(DECODE(REPEAT('61', 200), 'hex'), 'base64'), 'base64'), 'hex') = REPEAT('61', 200)
 ----
 1
+
+# --- PARSE_IDENT(text [, strict]) → the identifier parts as TEXT[] ---
+# Unquoted parts fold to lowercase.
+query T
+SELECT PARSE_IDENT('SomeSchema.someTable')::TEXT
+----
+{someschema,sometable}
+
+# Quoted parts keep their case; an element with a space is quoted in the array text.
+query T
+SELECT PARSE_IDENT('"Foo"."Bar baz"')::TEXT
+----
+{Foo,"Bar baz"}
+
+# Whitespace around parts and the dot is ignored; a mix of quoted and unquoted parts works.
+query TT
+SELECT PARSE_IDENT('  a . b  ')::TEXT, PARSE_IDENT('sch."Tbl"')::TEXT
+----
+{a,b} {sch,Tbl}
+
+# Non-strict mode ignores trailing text after the last identifier; strict mode (the default) rejects it.
+query T
+SELECT PARSE_IDENT('a.b trailing', FALSE)::TEXT
+----
+{a,b}
+
+statement error
+SELECT PARSE_IDENT('a.b trailing')
+
+# A trailing dot and a part starting with a digit are both errors.
+statement error
+SELECT PARSE_IDENT('a.b.')
+
+statement error
+SELECT PARSE_IDENT('1abc')
+
+# An empty quoted identifier is rejected.
+statement error
+SELECT PARSE_IDENT('a.""')
+
+# A NULL argument yields NULL.
+query T
+SELECT CAST(PARSE_IDENT(CAST(NULL AS TEXT)) AS TEXT)
+----
+NULL

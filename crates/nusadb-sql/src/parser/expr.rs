@@ -1391,6 +1391,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "quote_literal" => F::QuoteLiteral,
         "quote_nullable" => F::QuoteNullable,
         "quote_ident" => F::QuoteIdent,
+        "parse_ident" => F::ParseIdent,
         "format" => F::Format,
         "degrees" => F::Degrees,
         "radians" => F::Radians,

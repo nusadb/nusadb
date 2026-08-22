@@ -1390,6 +1390,12 @@ pub(super) fn analyze_scalar_function(
             &[],
             ColumnType::Array(nusadb_core::engine::ArrayElem::Text),
         ),
+        // PARSE_IDENT(text [, strict bool]) → TEXT[].
+        F::ParseIdent => ScalarSig::Fixed(
+            &[Text],
+            &[ColumnType::Bool],
+            ColumnType::Array(nusadb_core::engine::ArrayElem::Text),
+        ),
         // UPPER/LOWER/REVERSE/INITCAP, the hash digests SHA256/SHA512/MD5, the quoting helpers
         // QUOTE_LITERAL/QUOTE_IDENT, and `current_setting(name)` take one TEXT argument → TEXT.
         F::Upper

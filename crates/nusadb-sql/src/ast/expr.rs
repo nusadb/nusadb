@@ -727,6 +727,10 @@ pub enum ScalarFunc {
     /// `QUOTE_IDENT(text)` — `text` quoted as a SQL identifier when needed (embedded `"` doubled), as
     /// `TEXT`.
     QuoteIdent,
+    /// `PARSE_IDENT(text [, strict bool])` — split a qualified identifier into its parts as `TEXT[]`.
+    /// Unquoted parts are folded to lowercase; quoted parts keep their case. In `strict` mode (the
+    /// default) trailing text after the last identifier is an error; otherwise it is ignored.
+    ParseIdent,
     /// `FORMAT(fmt, ...)` — a format string with `%s` (text), `%I` (identifier), `%L` (literal), and
     /// `%%` (a literal `%`) specifiers substituted by the trailing arguments in order, as `TEXT`
     /// (B-fn).
@@ -1152,6 +1156,7 @@ impl ScalarFunc {
             Self::QuoteLiteral => "quote_literal",
             Self::QuoteNullable => "quote_nullable",
             Self::QuoteIdent => "quote_ident",
+            Self::ParseIdent => "parse_ident",
             Self::Format => "format",
             Self::StartsWith => "starts_with",
             Self::Degrees => "degrees",
