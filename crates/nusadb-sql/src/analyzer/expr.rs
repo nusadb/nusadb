@@ -1402,7 +1402,9 @@ pub(super) fn analyze_scalar_function(
         | F::Lower
         | F::Reverse
         | F::Initcap
+        | F::Sha224
         | F::Sha256
+        | F::Sha384
         | F::Sha512
         | F::Md5
         | F::QuoteLiteral

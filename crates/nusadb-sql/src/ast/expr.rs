@@ -710,8 +710,12 @@ pub enum ScalarFunc {
     /// across `count` equi-width buckets spanning `[low, high)`, as `INT` (`0`/`count+1` for
     /// out-of-range values; SQL:2003).
     WidthBucket,
+    /// `SHA224(text)` — lowercase-hex SHA-224 digest, as `TEXT`.
+    Sha224,
     /// `SHA256(text)` — lowercase-hex SHA-256 digest, as `TEXT`.
     Sha256,
+    /// `SHA384(text)` — lowercase-hex SHA-384 digest, as `TEXT`.
+    Sha384,
     /// `SHA512(text)` — lowercase-hex SHA-512 digest, as `TEXT`.
     Sha512,
     /// `MD5(text)` — 32-character lowercase-hex MD5 digest, as `TEXT`. A non-security
@@ -1150,7 +1154,9 @@ impl ScalarFunc {
             Self::WidthBucket => "width_bucket",
             Self::NumNonNulls => "num_nonnulls",
             Self::NumNulls => "num_nulls",
+            Self::Sha224 => "sha224",
             Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
             Self::Sha512 => "sha512",
             Self::Md5 => "md5",
             Self::QuoteLiteral => "quote_literal",

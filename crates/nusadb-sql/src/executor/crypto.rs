@@ -24,13 +24,23 @@
 
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Key, Nonce};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
 use crate::error::Error;
+
+/// `SHA224(text)` — the 56-character lowercase-hex SHA-224 digest of the UTF-8 bytes of `input`.
+pub(super) fn sha224_hex(input: &str) -> String {
+    to_hex(&Sha224::digest(input.as_bytes()))
+}
 
 /// `SHA256(text)` — the 64-character lowercase-hex SHA-256 digest of the UTF-8 bytes of `input`.
 pub(super) fn sha256_hex(input: &str) -> String {
     to_hex(&Sha256::digest(input.as_bytes()))
+}
+
+/// `SHA384(text)` — the 96-character lowercase-hex SHA-384 digest of the UTF-8 bytes of `input`.
+pub(super) fn sha384_hex(input: &str) -> String {
+    to_hex(&Sha384::digest(input.as_bytes()))
 }
 
 /// `SHA512(text)` — the 128-character lowercase-hex SHA-512 digest of the UTF-8 bytes of `input`.
