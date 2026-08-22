@@ -903,6 +903,8 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
         // Tags 30/31; full-text types carry no payload (stored as their canonical text).
         ColumnType::Tsvector => out.push(30),
         ColumnType::Tsquery => out.push(31),
+        // Tag 32; XML carries no payload (stored as its original text).
+        ColumnType::Xml => out.push(32),
     }
 }
 
@@ -972,6 +974,7 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
         },
         30 => ColumnType::Tsvector,
         31 => ColumnType::Tsquery,
+        32 => ColumnType::Xml,
         _ => return None,
     })
 }

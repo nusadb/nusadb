@@ -1,0 +1,55 @@
+# p10_types/xml — the XML type.
+# Covers: the native XML column type, well-formedness validation on cast/store (CONTENT semantics),
+# and verbatim text preservation (unlike JSONB, XML is not canonicalized).
+
+statement ok
+CREATE TABLE xdoc (id INT NOT NULL, body XML)
+
+# A text literal assigned to an XML column is validated and stored verbatim.
+statement ok
+INSERT INTO xdoc VALUES (1, '<a x="1">t</a>'), (2, '<r><c/></r>')
+
+query IT
+SELECT id, body FROM xdoc ORDER BY id
+----
+1  <a x="1">t</a>
+2  <r><c/></r>
+
+# The cast preserves the input text exactly — whitespace, attributes, and self-closing tags.
+query T
+SELECT '<a>  spaced  </a>'::XML
+----
+<a>  spaced  </a>
+
+query T
+SELECT '<a/>'::XML
+----
+<a/>
+
+# Bare text is valid XML content (the cast uses CONTENT semantics, which allows fragments).
+query T
+SELECT 'notxml'::XML
+----
+notxml
+
+query T
+SELECT 'a<b/>c'::XML
+----
+a<b/>c
+
+# Round-trip through TEXT returns the stored text unchanged.
+query T
+SELECT CAST('<k>v</k>'::XML AS TEXT)
+----
+<k>v</k>
+
+# Malformed markup is rejected — an unclosed tag and a mismatched end tag.
+statement error
+SELECT '<a>'::XML
+
+statement error
+SELECT '<a></b>'::XML
+
+# ... and rejected on store into an XML column.
+statement error
+INSERT INTO xdoc VALUES (9, '<oops>')

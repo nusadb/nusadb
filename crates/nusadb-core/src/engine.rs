@@ -206,6 +206,9 @@ pub enum ColumnType {
     /// Full-text search query (`tsquery`) — a boolean expression over lexemes, stored as its
     /// canonical text form.
     Tsquery,
+    /// XML document or content (`xml`). Stored as its original text verbatim (not canonicalized);
+    /// validated as well-formed on input.
+    Xml,
 }
 
 impl ColumnType {
@@ -470,7 +473,8 @@ impl ArrayElem {
             | ColumnType::Vector(_)
             | ColumnType::Geometry(_)
             | ColumnType::Tsvector
-            | ColumnType::Tsquery => None,
+            | ColumnType::Tsquery
+            | ColumnType::Xml => None,
         }
     }
 }

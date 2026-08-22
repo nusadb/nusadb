@@ -57,6 +57,7 @@ const TAG_MACADDR8: u8 = 21;
 const TAG_GEOMETRY: u8 = 22;
 const TAG_TSVECTOR: u8 = 23;
 const TAG_TSQUERY: u8 = 24;
+const TAG_XML: u8 = 25;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -150,6 +151,7 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
         ast::Value::Json(s) => write_tagged_bytes(out, TAG_JSON, s.as_bytes())?,
         ast::Value::Tsvector(s) => write_tagged_bytes(out, TAG_TSVECTOR, s.as_bytes())?,
         ast::Value::Tsquery(s) => write_tagged_bytes(out, TAG_TSQUERY, s.as_bytes())?,
+        ast::Value::Xml(s) => write_tagged_bytes(out, TAG_XML, s.as_bytes())?,
         ast::Value::Interval(iv) => {
             out.push(TAG_INTERVAL);
             out.extend_from_slice(&iv.months.to_le_bytes());
@@ -239,6 +241,7 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
         TAG_JSON => ast::Value::Json(c.string()?),
         TAG_TSVECTOR => ast::Value::Tsvector(c.string()?),
         TAG_TSQUERY => ast::Value::Tsquery(c.string()?),
+        TAG_XML => ast::Value::Xml(c.string()?),
         TAG_INTERVAL => ast::Value::Interval(Interval {
             months: i32::from_le_bytes(c.arr::<4>()?),
             days: i32::from_le_bytes(c.arr::<4>()?),

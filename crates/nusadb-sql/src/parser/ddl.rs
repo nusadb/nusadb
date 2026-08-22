@@ -544,11 +544,8 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
         },
         // Object identifier — an unsigned 32-bit integer.
         "oid" | "regclass" | "regtype" | "xid" | "cid" | "tid" => ColumnType::Int,
-        // Stored as its canonical text form (no native operators yet): the XML type. (`macaddr`/
-        // `inet`/`cidr`, the range types, the native geometric types
-        // `point`/`box`/`circle`/`lseg`/`line`/`path`/`polygon`, and the native full-text types
-        // `tsvector`/`tsquery` are handled above.)
-        "xml" => ColumnType::Text,
+        // XML — stored as its original text (validated well-formed on input).
+        "xml" => ColumnType::Xml,
         _ => return None,
     })
 }

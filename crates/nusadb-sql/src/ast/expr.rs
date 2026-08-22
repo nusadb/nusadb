@@ -1713,6 +1713,8 @@ pub enum Value {
     /// A full-text search query (`tsquery`) in its canonical text form (a boolean expression over
     /// quoted lexemes).
     Tsquery(String),
+    /// An XML value (`xml`) as its original, well-formed text (not canonicalized).
+    Xml(String),
 }
 
 /// Binary operators the parser accepts.

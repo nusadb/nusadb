@@ -293,6 +293,51 @@ fn macaddr8_value_survives_reopen() {
     );
 }
 
+/// An `XML` column is DURABLE on disk: each value is written to the WAL as its original text and
+/// recovery decodes it back to the same `xml` value after a crash — stored verbatim (not
+/// canonicalized), and the type identity survives (it decodes as `xml`, not plain text).
+#[test]
+fn xml_value_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(&engine, "CREATE TABLE docs (id INT PRIMARY KEY, body XML)");
+        run(&engine, r#"INSERT INTO docs VALUES (1, '<a x="1">t</a>')"#);
+        // Whitespace and self-closing form are preserved verbatim (no canonicalization).
+        run(&engine, "INSERT INTO docs VALUES (2, '<r>  <c/>  </r>')");
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        assert_eq!(
+            rows(run(&engine, "SELECT body::TEXT FROM docs WHERE id = 1")),
+            vec![vec![Value::Text(r#"<a x="1">t</a>"#.to_owned())]]
+        );
+        assert_eq!(
+            rows(run(&engine, "SELECT body::TEXT FROM docs WHERE id = 2")),
+            vec![vec![Value::Text("<r>  <c/>  </r>".to_owned())]]
+        );
+        // The recovered value is a native XML value, and a commit after recovery also persists.
+        assert_eq!(
+            rows(run(&engine, "SELECT body FROM docs WHERE id = 1")),
+            vec![vec![Value::Xml(r#"<a x="1">t</a>"#.to_owned())]]
+        );
+        run(&engine, "INSERT INTO docs VALUES (3, '<z/>')");
+    } // second crash: no shutdown.
+
+    let engine = BtreeEngine::open(&path).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT id, body::TEXT FROM docs ORDER BY id")),
+        vec![
+            vec![Value::Int(1), Value::Text(r#"<a x="1">t</a>"#.to_owned())],
+            vec![Value::Int(2), Value::Text("<r>  <c/>  </r>".to_owned())],
+            vec![Value::Int(3), Value::Text("<z/>".to_owned())],
+        ]
+    );
+}
+
 /// A `POINT` and a `BOX` column are DURABLE on disk: each value is written to the WAL as its
 /// canonical text and recovery decodes it back to the same typed geometry after a crash — not just
 /// held in memory. The box literals also prove the parse-time normalization (upper-right,

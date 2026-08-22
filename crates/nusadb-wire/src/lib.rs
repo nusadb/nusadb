@@ -100,6 +100,7 @@ pub const fn column_type_tag(ty: nusadb_core::ColumnType) -> u8 {
         ColumnType::Geometry(_) => 0x18,
         ColumnType::Tsvector => 0x19,
         ColumnType::Tsquery => 0x1A,
+        ColumnType::Xml => 0x1B,
     }
 }
 

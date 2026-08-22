@@ -58,6 +58,9 @@ sqlparser      = "0.62"
 # Regular-expression engine for REGEXP_* / regex match / SIMILAR TO. Already in the
 # tree transitively; linear-time RE (no catastrophic backtracking), MIT/Apache-2.0, deny.toml-compliant.
 regex          = "1"
+# XML well-formedness validation for the XML type (XMLPARSE / text::xml). Pure-Rust streaming
+# reader; MIT, deny.toml-compliant.
+quick-xml      = "0.37"
 
 # === Networking / Async (L2 only) ===
 tokio          = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }

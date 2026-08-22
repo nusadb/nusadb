@@ -92,6 +92,7 @@ pub(super) fn type_name(ty: ColumnType) -> String {
         ColumnType::Geometry(kind) => kind.name().to_uppercase(),
         ColumnType::Tsvector => "TSVECTOR".to_owned(),
         ColumnType::Tsquery => "TSQUERY".to_owned(),
+        ColumnType::Xml => "XML".to_owned(),
     }
 }
 

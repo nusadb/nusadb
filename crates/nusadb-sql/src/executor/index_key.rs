@@ -110,10 +110,11 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         // join here for the same reason.
         | ast::Value::Geometry(_)
         | ast::Value::Tsvector(_)
-        | ast::Value::Tsquery(_) => {
+        | ast::Value::Tsquery(_)
+        | ast::Value::Xml(_) => {
             return Err(Error::Unsupported(
                 "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE / GEOMETRY / \
-                 TSVECTOR / TSQUERY columns cannot yet be index keys"
+                 TSVECTOR / TSQUERY / XML columns cannot yet be index keys"
                     .to_owned(),
             ));
         },

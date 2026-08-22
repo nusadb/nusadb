@@ -4428,6 +4428,46 @@ async fn tsvector_and_tsquery_render_over_the_wire() {
     handle.await.unwrap().unwrap();
 }
 
+/// An `XML` column renders correctly over the real wire protocol — this proves the wire value
+/// encoding (`value_to_field`) formats an `xml` value as its stored text, not a debug or byte dump.
+/// The value is stored verbatim (attributes and whitespace preserved), so what comes back on the
+/// wire is exactly what went in.
+#[tokio::test]
+async fn xml_renders_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (doc xml)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, r#"INSERT INTO t VALUES ('<a x="1">  t  </a>')"#).await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT doc FROM t").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["doc".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![Some(br#"<a x="1">  t  </a>"#.to_vec())]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
 /// An `LSEG` column renders correctly over the real wire protocol — this proves the wire value
 /// encoding (`value_to_field`) formats a line segment as its canonical text `[(x1,y1),(x2,y2)]`, not
 /// a debug or byte dump. The paren input form proves canonicalization happens before it reaches the

@@ -283,6 +283,7 @@ const fn infer_column_type(v: &Value) -> DefaultColumnType {
         | Value::Geometry(_)
         | Value::Tsvector(_)
         | Value::Tsquery(_)
+        | Value::Xml(_)
         | Value::Bytes(_) => DefaultColumnType::Text,
         Value::Null => DefaultColumnType::Any,
     }
@@ -298,7 +299,7 @@ fn format_value(v: &Value) -> String {
         Value::Float(f) => format!("{f:.3}"),
         Value::Text(s) if s.is_empty() => "(empty)".to_owned(),
         // Full-text values render as their stored canonical text, like plain text.
-        Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) => s.clone(),
+        Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) | Value::Xml(s) => s.clone(),
         // JSON renders in the spaced display form (`{"a": 1}`), matching standard jsonb output.
         Value::Json(s) => nusadb_sql::json::display_form(s),
         // Temporal + UUID in canonical text form.
@@ -608,6 +609,11 @@ fn slt_p10_bool_cast() {
 #[test]
 fn slt_p10_json() {
     run_slt("tests/slt/p10_types/json.slt");
+}
+
+#[test]
+fn slt_p10_xml() {
+    run_slt("tests/slt/p10_types/xml.slt");
 }
 
 #[test]

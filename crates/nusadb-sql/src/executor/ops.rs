@@ -362,7 +362,8 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         // as canonical text).
         | T::Geometry(_)
         | T::Tsvector
-        | T::Tsquery => false,
+        | T::Tsquery
+        | T::Xml => false,
     }
 }
 
@@ -3535,6 +3536,7 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Geometry(kind) => kind.name(),
         ColumnType::Tsvector => "tsvector",
         ColumnType::Tsquery => "tsquery",
+        ColumnType::Xml => "xml",
     }
 }
 

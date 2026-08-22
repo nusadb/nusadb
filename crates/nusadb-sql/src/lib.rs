@@ -42,6 +42,7 @@ pub mod temporal;
 pub mod udf;
 pub mod vector;
 pub mod vectorized;
+pub mod xml;
 
 pub use analyzer::{
     Catalog, FunctionDef, IndexInfo, PolicyDef, SYNTHETIC_TYPE_CHECK_PREFIX, SYSTEM_TABLE_PREFIX,

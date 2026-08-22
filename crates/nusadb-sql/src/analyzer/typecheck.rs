@@ -55,6 +55,8 @@ pub(super) fn assignable(target: ColumnType, source: ColumnType) -> bool {
         // The full-text types accept a text literal (parsed + canonicalized at encode time).
         || (matches!(target, ColumnType::Tsvector | ColumnType::Tsquery)
             && source == ColumnType::Text)
+        // XML accepts a text literal (validated as well-formed at encode time).
+        || (target == ColumnType::Xml && source == ColumnType::Text)
         // ARRAY accepts a `{...}` text literal (parsed at encode time).
         || (matches!(target, ColumnType::Array(_)) && source == ColumnType::Text)
         // INTERVAL accepts a text literal (parsed at encode time).

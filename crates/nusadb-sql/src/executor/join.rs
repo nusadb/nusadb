@@ -832,7 +832,8 @@ pub(super) fn key_atoms(
             // (`is_hashable_key_type`); a value here never matches.
             | ast::Value::Geometry(_)
             | ast::Value::Tsvector(_)
-            | ast::Value::Tsquery(_) => return Ok(None),
+            | ast::Value::Tsquery(_)
+            | ast::Value::Xml(_) => return Ok(None),
         }
     }
     Ok(Some(atoms))

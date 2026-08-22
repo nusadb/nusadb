@@ -175,7 +175,8 @@ pub(crate) fn skip_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<usi
         | ColumnType::Jsonb
         | ColumnType::Geometry(_)
         | ColumnType::Tsvector
-        | ColumnType::Tsquery => Ok(read_text_field(bytes, pos)?.1),
+        | ColumnType::Tsquery
+        | ColumnType::Xml => Ok(read_text_field(bytes, pos)?.1),
         // BYTEA: `[u32 len][len raw bytes]`, no UTF-8 validation (matching `decode_value`).
         ColumnType::Bytes => {
             let len = u32::from_le_bytes(read_array::<4>(bytes, pos)?) as usize;
@@ -387,15 +388,24 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             let canon = crate::json::canonicalize(s).ok_or_else(|| invalid(ty, s))?;
             put_json_text(&canon, out)?;
         },
-        // FULL-TEXT: length-prefixed canonical text. A native value is already canonical; a text
-        // value is parsed + canonicalized as a tsvector/tsquery *literal* (loud syntax error if bad).
+        // FULL-TEXT / XML: length-prefixed text. A native value is already canonical (full-text) or
+        // validated (xml), so it is written as-is; the text-value arms below parse or validate first.
         (ast::Value::Tsvector(s), ColumnType::Tsvector)
-        | (ast::Value::Tsquery(s), ColumnType::Tsquery) => put_fulltext_text(s, out)?,
+        | (ast::Value::Tsquery(s), ColumnType::Tsquery)
+        | (ast::Value::Xml(s), ColumnType::Xml) => put_fulltext_text(s, out)?,
         (ast::Value::Text(s), ColumnType::Tsvector) => {
             put_fulltext_text(&crate::fts::parse_tsvector(s)?, out)?;
         },
         (ast::Value::Text(s), ColumnType::Tsquery) => {
             put_fulltext_text(&crate::fts::parse_tsquery(s)?, out)?;
+        },
+        // XML: a text value is validated as well-formed content on the way in (loud error if bad).
+        (ast::Value::Text(s), ColumnType::Xml) => {
+            crate::xml::validate(s, crate::xml::XmlMode::Content).map_err(|why| Error::Coded {
+                message: format!("invalid XML content: {why}"),
+                sqlstate: "2200N", // invalid_xml_content
+            })?;
+            put_fulltext_text(s, out)?;
         },
         // INTERVAL: months(4) + days(4) + micros(8). A text value is parsed.
         (ast::Value::Interval(iv), ColumnType::Interval) => put_interval(*iv, out),
@@ -789,6 +799,11 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
             };
             Ok((value, next))
         },
+        // XML: length-prefixed text stored verbatim.
+        ColumnType::Xml => {
+            let (text, next) = read_text_field(bytes, pos)?;
+            Ok((ast::Value::Xml(text.to_owned()), next))
+        },
         // NUMERIC: 16-byte i128 mantissa + 1-byte scale.
         ColumnType::Numeric { .. } => {
             let mant = i128::from_le_bytes(read_array::<16>(bytes, pos)?);
@@ -911,6 +926,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
         ast::Value::Tsvector(_) => ColumnType::Tsvector,
         ast::Value::Tsquery(_) => ColumnType::Tsquery,
+        ast::Value::Xml(_) => ColumnType::Xml,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),

@@ -17,6 +17,7 @@ thiserror      = { workspace = true }
 bytes          = { workspace = true }
 sqlparser      = { workspace = true }
 regex          = { workspace = true }
+quick-xml      = { workspace = true }
 ahash          = { workspace = true }
 smallvec       = { workspace = true }
 tracing        = { workspace = true }

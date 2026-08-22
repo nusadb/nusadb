@@ -4287,6 +4287,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         | (ast::Value::Json(_), ColumnType::Json)
         | (ast::Value::Tsvector(_), ColumnType::Tsvector)
         | (ast::Value::Tsquery(_), ColumnType::Tsquery)
+        | (ast::Value::Xml(_), ColumnType::Xml)
         | (ast::Value::Interval(_), ColumnType::Interval)
         | (ast::Value::Bytes(_), ColumnType::Bytes)
         | (ast::Value::Array(_), ColumnType::Array(_)) => Ok(value),
@@ -4510,6 +4511,16 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Text(s), ColumnType::Tsquery) => {
             Ok(ast::Value::Tsquery(crate::fts::parse_tsquery(s)?))
         },
+        // XML: text -> xml validates as well-formed content (the CONTENT mode of the cast) and keeps
+        // the text verbatim; a malformed value is a loud error. xml -> text is that stored text.
+        (ast::Value::Text(s), ColumnType::Xml) => {
+            crate::xml::validate(s, crate::xml::XmlMode::Content).map_err(|why| Error::Coded {
+                message: format!("invalid XML content: {why}"),
+                sqlstate: "2200N", // invalid_xml_content
+            })?;
+            Ok(ast::Value::Xml(s.clone()))
+        },
+        (ast::Value::Xml(s), ColumnType::Text) => Ok(ast::Value::Text(s.clone())),
         // tsvector/tsquery -> text is the stored canonical text (identity casts handled above).
         (ast::Value::Tsvector(s) | ast::Value::Tsquery(s), ColumnType::Text) => {
             Ok(ast::Value::Text(s.clone()))
@@ -4887,6 +4898,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
         ast::Value::Tsvector(_) => ColumnType::Tsvector,
         ast::Value::Tsquery(_) => ColumnType::Tsquery,
+        ast::Value::Xml(_) => ColumnType::Xml,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -5332,7 +5344,8 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         (Text(a), Text(b))
         | (Json(a), Json(b))
         | (ast::Value::Tsvector(a), ast::Value::Tsvector(b))
-        | (ast::Value::Tsquery(a), ast::Value::Tsquery(b)) => a.cmp(b),
+        | (ast::Value::Tsquery(a), ast::Value::Tsquery(b))
+        | (ast::Value::Xml(a), ast::Value::Xml(b)) => a.cmp(b),
         // NUMERIC compares exactly with itself and with integers; against a float it falls back
         // to f64.
         (Numeric(a), Numeric(b)) => a.compare(b),
@@ -5455,6 +5468,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Geometry(_) => 22,
         ast::Value::Tsvector(_) => 23,
         ast::Value::Tsquery(_) => 24,
+        ast::Value::Xml(_) => 25,
     }
 }
 
