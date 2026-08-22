@@ -738,3 +738,16 @@ query T
 SELECT CAST(JSONB_PATH_QUERY_ARRAY('{"aa":1,"z":2,"b":3}'::JSONB, '$.*') AS TEXT)
 ----
 [3, 2, 1]
+
+# --- starts with: a string-prefix predicate ---
+
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('["foo","bar","baz"]'::JSONB, '$[*] ? (@ starts with "ba")') AS TEXT)
+----
+["bar", "baz"]
+
+# starts with as an @@ predicate check; a non-string operand is unknown (NULL).
+query IT
+SELECT '{"a":"hello"}'::JSONB @@ '$.a starts with "he"', CAST('{"a":123}'::JSONB @@ '$.a starts with "he"' AS TEXT)
+----
+1 NULL

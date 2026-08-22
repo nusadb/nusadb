@@ -836,6 +836,11 @@ enum FilterExpr {
         op: CmpOp,
         right: FilterOperand,
     },
+    /// `operand starts with operand` — true iff the left string begins with the right string.
+    StartsWith {
+        operand: FilterOperand,
+        prefix: FilterOperand,
+    },
 }
 
 /// Consume a `? (...)` filter body from `chars` (the `?` already consumed) and parse it: skip
@@ -1045,6 +1050,18 @@ impl FilterParser {
             return Some(FilterExpr::Exists { root, steps });
         }
         let left = self.parse_operand()?;
+        // `operand starts with operand` is a predicate keyword pair, checked before the comparison
+        // operators (it shares the operand-then-operator shape).
+        if self.eat("starts") {
+            if !self.eat("with") {
+                return None;
+            }
+            let prefix = self.parse_operand()?;
+            return Some(FilterExpr::StartsWith {
+                operand: left,
+                prefix,
+            });
+        }
         let op = self.parse_cmp_op()?;
         let right = self.parse_operand()?;
         Some(FilterExpr::Cmp { left, op, right })
@@ -1361,7 +1378,32 @@ fn eval_filter(expr: &FilterExpr, current: &J, root: &J) -> Option<bool> {
             let rs = operand_values(right, current, root);
             existential_compare(&ls, *op, &rs)
         },
+        FilterExpr::StartsWith { operand, prefix } => {
+            let ls = operand_values(operand, current, root);
+            let ps = operand_values(prefix, current, root);
+            existential_starts_with(&ls, &ps)
+        },
     }
+}
+
+/// Existential `starts with` over the cross product, with the same three-valued rules as
+/// [`existential_compare`]: true if any left string begins with any prefix string; unknown if a pair
+/// had a non-string operand (a suppressed error); otherwise false.
+fn existential_starts_with(left: &[J], prefixes: &[J]) -> Option<bool> {
+    let mut saw_error = false;
+    for l in left {
+        for p in prefixes {
+            match (l, p) {
+                (J::String(s), J::String(prefix)) => {
+                    if s.starts_with(prefix.as_str()) {
+                        return Some(true);
+                    }
+                },
+                _ => saw_error = true,
+            }
+        }
+    }
+    if saw_error { None } else { Some(false) }
 }
 
 /// The value a `@`/`$`-rooted filter path starts walking from.
@@ -1861,6 +1903,11 @@ mod tests {
             path_query("[1,2,3]", "$[*] ? (@ > 9)").unwrap(),
             Vec::<String>::new()
         );
+        // `starts with`: a string-prefix predicate; a non-string operand is unknown (dropped).
+        assert_eq!(
+            path_query(r#"["foo","bar","baz"]"#, r#"$[*] ? (@ starts with "ba")"#).unwrap(),
+            vec![r#""bar""#.to_owned(), r#""baz""#.to_owned()]
+        );
         // A malformed filter is an unusable path, not a document error.
         assert_eq!(
             path_query("[1,2,3]", "$[*] ? (@ >)"),
@@ -1934,6 +1981,15 @@ mod tests {
         assert_eq!(
             path_match(r#"{"a":1}"#, "$.x == 1 || $.a == 1"),
             Ok(Some(true))
+        );
+        // `starts with` as a predicate check: true for a matching prefix, unknown for a non-string.
+        assert_eq!(
+            path_match(r#"{"a":"hello"}"#, r#"$.a starts with "he""#),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            path_match(r#"{"a":123}"#, r#"$.a starts with "he""#),
+            Ok(None)
         );
         // A bare accessor path is a boolean check only when it is a single boolean value.
         assert_eq!(path_match(r#"{"a":true}"#, "$.a"), Ok(Some(true)));
