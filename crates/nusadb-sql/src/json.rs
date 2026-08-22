@@ -841,6 +841,45 @@ enum FilterExpr {
         operand: FilterOperand,
         prefix: FilterOperand,
     },
+    /// `operand like_regex "pattern" [flag "flags"]` — true iff the left string matches the regex.
+    /// The pattern is compiled while parsing, so an invalid pattern is an unusable path.
+    LikeRegex {
+        operand: FilterOperand,
+        regex: regex::Regex,
+    },
+}
+
+/// Compile a `like_regex` pattern with its optional flag string into a matcher, or `None` if the
+/// pattern is invalid or a flag is unsupported (either is an unusable path, loud rather than silent).
+/// Supported flags: `i` (case-insensitive), `s` (dot matches newline), `m` (per-line `^`/`$`), `q`
+/// (treat the pattern as a literal). The default flavor (no flags) already matches the reference
+/// engine (`.` does not match a newline; `^`/`$` anchor only at the string ends), so an empty flag
+/// string needs no changes.
+fn compile_like_regex(pattern: &str, flags: &str) -> Option<regex::Regex> {
+    let mut case_insensitive = false;
+    let mut dot_matches_new_line = false;
+    let mut multi_line = false;
+    let mut literal = false;
+    for flag in flags.chars() {
+        match flag {
+            'i' => case_insensitive = true,
+            's' => dot_matches_new_line = true,
+            'm' => multi_line = true,
+            'q' => literal = true,
+            _ => return None,
+        }
+    }
+    let pattern = if literal {
+        regex::escape(pattern)
+    } else {
+        pattern.to_owned()
+    };
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(case_insensitive)
+        .dot_matches_new_line(dot_matches_new_line)
+        .multi_line(multi_line)
+        .build()
+        .ok()
 }
 
 /// Consume a `? (...)` filter body from `chars` (the `?` already consumed) and parse it: skip
@@ -1060,6 +1099,25 @@ impl FilterParser {
             return Some(FilterExpr::StartsWith {
                 operand: left,
                 prefix,
+            });
+        }
+        // `operand like_regex "pattern" [flag "flags"]` — a regex-match predicate.
+        if self.eat("like_regex") {
+            let J::String(pattern) = self.parse_literal()? else {
+                return None;
+            };
+            let flags = if self.eat("flag") {
+                let J::String(flags) = self.parse_literal()? else {
+                    return None;
+                };
+                flags
+            } else {
+                String::new()
+            };
+            let regex = compile_like_regex(&pattern, &flags)?;
+            return Some(FilterExpr::LikeRegex {
+                operand: left,
+                regex,
             });
         }
         let op = self.parse_cmp_op()?;
@@ -1383,7 +1441,28 @@ fn eval_filter(expr: &FilterExpr, current: &J, root: &J) -> Option<bool> {
             let ps = operand_values(prefix, current, root);
             existential_starts_with(&ls, &ps)
         },
+        FilterExpr::LikeRegex { operand, regex } => {
+            existential_like_regex(&operand_values(operand, current, root), regex)
+        },
     }
+}
+
+/// Existential `like_regex` over the operand set, with the same three-valued rules as
+/// [`existential_compare`]: true if any string value matches the regex; unknown if a value was not a
+/// string (a suppressed error); otherwise false.
+fn existential_like_regex(left: &[J], regex: &regex::Regex) -> Option<bool> {
+    let mut saw_error = false;
+    for l in left {
+        match l {
+            J::String(s) => {
+                if regex.is_match(s) {
+                    return Some(true);
+                }
+            },
+            _ => saw_error = true,
+        }
+    }
+    if saw_error { None } else { Some(false) }
 }
 
 /// Existential `starts with` over the cross product, with the same three-valued rules as
@@ -1908,6 +1987,24 @@ mod tests {
             path_query(r#"["foo","bar","baz"]"#, r#"$[*] ? (@ starts with "ba")"#).unwrap(),
             vec![r#""bar""#.to_owned(), r#""baz""#.to_owned()]
         );
+        // `like_regex`: an anchored pattern, and a case-insensitive `flag "i"`.
+        assert_eq!(
+            path_query(r#"["abc","xyz","a1c"]"#, r#"$[*] ? (@ like_regex "^a.c$")"#).unwrap(),
+            vec![r#""abc""#.to_owned(), r#""a1c""#.to_owned()]
+        );
+        assert_eq!(
+            path_query(
+                r#"["ABC","abc"]"#,
+                r#"$[*] ? (@ like_regex "abc" flag "i")"#
+            )
+            .unwrap(),
+            vec![r#""ABC""#.to_owned(), r#""abc""#.to_owned()]
+        );
+        // An invalid regex is an unusable path, not a document error.
+        assert_eq!(
+            path_query(r#"["x"]"#, r#"$[*] ? (@ like_regex "[")"#),
+            Err(PathQueryError::UnusablePath)
+        );
         // A malformed filter is an unusable path, not a document error.
         assert_eq!(
             path_query("[1,2,3]", "$[*] ? (@ >)"),
@@ -1990,6 +2087,22 @@ mod tests {
         assert_eq!(
             path_match(r#"{"a":123}"#, r#"$.a starts with "he""#),
             Ok(None)
+        );
+        // `like_regex` predicate check, including a case-insensitive flag and a non-string → NULL.
+        assert_eq!(
+            path_match(r#"{"a":"Hello"}"#, r#"$.a like_regex "^h" flag "i""#),
+            Ok(Some(true))
+        );
+        assert_eq!(path_match(r#"{"a":5}"#, r#"$.a like_regex "5""#), Ok(None));
+        // The default flavor does not let `.` match a newline; the `s` flag turns it on. The document
+        // is the JSON string "a\nb" (a backslash-n escape, i.e. a real newline in the value).
+        assert_eq!(
+            path_match(r#""a\nb""#, r#"$ like_regex "a.b""#),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            path_match(r#""a\nb""#, r#"$ like_regex "a.b" flag "s""#),
+            Ok(Some(true))
         );
         // A bare accessor path is a boolean check only when it is a single boolean value.
         assert_eq!(path_match(r#"{"a":true}"#, "$.a"), Ok(Some(true)));

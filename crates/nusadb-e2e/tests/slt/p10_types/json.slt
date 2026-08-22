@@ -751,3 +751,22 @@ query IT
 SELECT '{"a":"hello"}'::JSONB @@ '$.a starts with "he"', CAST('{"a":123}'::JSONB @@ '$.a starts with "he"' AS TEXT)
 ----
 1 NULL
+
+# --- like_regex: a regex-match predicate, with an optional flag string ---
+
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('["abc","xyz","a1c"]'::JSONB, '$[*] ? (@ like_regex "^a.c$")') AS TEXT)
+----
+["abc", "a1c"]
+
+# The "i" flag is case-insensitive.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('["ABC","abc"]'::JSONB, '$[*] ? (@ like_regex "abc" flag "i")') AS TEXT)
+----
+["ABC", "abc"]
+
+# like_regex as an @@ predicate check; a non-string operand is unknown (NULL).
+query IT
+SELECT '{"a":"Hello"}'::JSONB @@ '$.a like_regex "^h" flag "i"', CAST('{"a":5}'::JSONB @@ '$.a like_regex "5"' AS TEXT)
+----
+1 NULL
