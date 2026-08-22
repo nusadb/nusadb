@@ -167,7 +167,10 @@ pub(super) fn value_cmp(a: &ast::Value, b: &ast::Value) -> Ordering {
         | (Timestamp(x), Timestamp(y))
         | (TimestampTz(x), TimestampTz(y)) => x.cmp(y),
         (Float(x), Float(y)) => x.total_cmp(y),
-        (Text(x), Text(y)) | (Json(x), Json(y)) => x.cmp(y),
+        (Text(x), Text(y))
+        | (Json(x), Json(y))
+        | (ast::Value::Tsvector(x), ast::Value::Tsvector(y))
+        | (ast::Value::Tsquery(x), ast::Value::Tsquery(y)) => x.cmp(y),
         (Date(x), Date(y)) => x.cmp(y),
         (Uuid(x), Uuid(y)) => x.cmp(y),
         (ast::Value::Bytes(x), ast::Value::Bytes(y)) => x.cmp(y),
@@ -202,6 +205,8 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Range(_) => 20,
         ast::Value::Macaddr8(_) => 21,
         ast::Value::Geometry(_) => 22,
+        ast::Value::Tsvector(_) => 23,
+        ast::Value::Tsquery(_) => 24,
     }
 }
 

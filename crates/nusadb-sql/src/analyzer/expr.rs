@@ -87,6 +87,8 @@ pub(super) fn analyze_expr_agg(
                 ast::Value::Macaddr(_) => ColumnType::Macaddr,
                 ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
                 ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
+                ast::Value::Tsvector(_) => ColumnType::Tsvector,
+                ast::Value::Tsquery(_) => ColumnType::Tsquery,
                 ast::Value::Inet(a) => a.column_type(),
                 ast::Value::Bit(b) => crate::bit::column_type(b),
                 ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -1417,13 +1419,15 @@ pub(super) fn analyze_scalar_function(
         // canonical tsvector/tsquery text form. The optional leading argument is the configuration;
         // with one argument the default configuration applies (rejected at evaluation until a
         // non-`simple` configuration exists).
-        F::ToTsvector | F::ToTsquery | F::PlaintoTsquery => {
-            ScalarSig::Fixed(&[Text], &[Text], Text)
-        },
+        F::ToTsvector => ScalarSig::Fixed(&[Text], &[Text], ColumnType::Tsvector),
+        F::ToTsquery | F::PlaintoTsquery => ScalarSig::Fixed(&[Text], &[Text], ColumnType::Tsquery),
         // TS_RANK / TS_RANK_CD(tsvector, tsquery [, normalization INT]) → the relevance score as a
-        // REAL. tsvector/tsquery are carried as TEXT; the optional third argument is the
-        // normalization bit-mask.
-        F::TsRank | F::TsRankCd => ScalarSig::Fixed(&[Text, Text], &[Int], ColumnType::Real),
+        // REAL. The optional third argument is the normalization bit-mask.
+        F::TsRank | F::TsRankCd => ScalarSig::Fixed(
+            &[ColumnType::Tsvector, ColumnType::Tsquery],
+            &[Int],
+            ColumnType::Real,
+        ),
         // RRF_SCORE(rank [, k]) → the Reciprocal Rank Fusion contribution 1/(k + rank) as FLOAT,
         // k defaulting to 60.
         F::RrfScore => ScalarSig::Fixed(&[Int], &[Int], ColumnType::Float),
@@ -4877,26 +4881,25 @@ pub(super) fn check_json_path_exists(
 /// Type rule for `@@` (F1): both operands are the text forms of a `tsvector`/`tsquery` (either
 /// order, like the reference engine), so both must be `TEXT`; the result is the `BOOL` match.
 pub(super) fn check_ts_match(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    if matches!(
-        left,
-        ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_)
-    ) && matches!(
-        right,
-        ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_)
-    ) {
+    // `tsvector @@ tsquery`, either operand order, is the native form. A text operand is also
+    // accepted (parsed at evaluation), keeping `to_tsvector(...) @@ '…'` and column-of-text usage.
+    let is_ts_operand = |ty: ColumnType| {
+        matches!(
+            ty,
+            ColumnType::Tsvector
+                | ColumnType::Tsquery
+                | ColumnType::Text
+                | ColumnType::VarChar(_)
+                | ColumnType::Char(_)
+        )
+    };
+    if is_ts_operand(left) && is_ts_operand(right) {
         Ok(ColumnType::Bool)
     } else {
         Err(Error::TypeMismatch {
             context: "`@@` text-search match".to_owned(),
-            expected: ColumnType::Text,
-            found: if matches!(
-                left,
-                ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_)
-            ) {
-                right
-            } else {
-                left
-            },
+            expected: ColumnType::Tsvector,
+            found: if is_ts_operand(left) { right } else { left },
         })
     }
 }

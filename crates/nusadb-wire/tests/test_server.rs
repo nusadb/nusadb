@@ -4379,6 +4379,55 @@ async fn circle_renders_over_the_wire() {
     handle.await.unwrap().unwrap();
 }
 
+/// `TSVECTOR` / `TSQUERY` columns render correctly over the real wire protocol — this proves the
+/// wire value encoding (`value_to_field`) formats a full-text value as its canonical text, not a
+/// debug or byte dump. The out-of-order literal input proves canonicalization happens before it
+/// reaches the wire.
+#[tokio::test]
+async fn tsvector_and_tsquery_render_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    query(&mut conn, "CREATE TABLE t (v tsvector, q tsquery)").await;
+    assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
+    consume_until_ready(&mut conn).await;
+
+    // The out-of-order tsvector lexemes must show up sorted+canonical on the wire; the tsquery keeps
+    // its operand order.
+    query(
+        &mut conn,
+        "INSERT INTO t VALUES ('dog:2 cat:1', 'dog & cat')",
+    )
+    .await;
+    assert_eq!(next(&mut conn).await, cc("INSERT 1"));
+    consume_until_ready(&mut conn).await;
+
+    query(&mut conn, "SELECT v, q FROM t").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["v".to_owned(), "q".to_owned()]
+        }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::DataRow {
+            values: vec![
+                Some(b"'cat':1 'dog':2".to_vec()),
+                Some(b"'dog' & 'cat'".to_vec()),
+            ]
+        }
+    );
+    assert_eq!(next(&mut conn).await, cc("SELECT 1"));
+    consume_until_ready(&mut conn).await;
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
 /// An `LSEG` column renders correctly over the real wire protocol — this proves the wire value
 /// encoding (`value_to_field`) formats a line segment as its canonical text `[(x1,y1),(x2,y2)]`, not
 /// a debug or byte dump. The paren input form proves canonicalization happens before it reaches the

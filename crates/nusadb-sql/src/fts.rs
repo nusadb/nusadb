@@ -635,6 +635,51 @@ pub fn to_tsvector(config: &str, text: &str) -> Result<String, Error> {
     Ok(out)
 }
 
+/// Validate and canonicalize a `tsvector` literal — the `'…'::tsvector` cast.
+///
+/// Unlike [`to_tsvector`] it applies no dictionary: the lexemes are kept verbatim (no tokenizing,
+/// stemming, or case folding), only re-ordered into canonical form — lexemes sorted (byte order),
+/// each quoted, its positions sorted, deduplicated, and ascending, with any `A`-`C` weight letter
+/// preserved (`D`, the default, is elided). A malformed literal is a loud `42601` syntax error.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed tsvector literal.
+pub fn parse_tsvector(input: &str) -> Result<String, Error> {
+    // Merge same-lexeme entries (BTreeMap orders lexemes by byte order); per lexeme, a position
+    // map orders + deduplicates the positions, keeping the strongest weight if one repeats.
+    let mut by_lexeme: std::collections::BTreeMap<String, std::collections::BTreeMap<u32, u8>> =
+        std::collections::BTreeMap::new();
+    for entry in parse_tsvector_entries(input)? {
+        let slot = by_lexeme.entry(entry.lexeme).or_default();
+        for wp in entry.positions {
+            let weight = slot.entry(wp.pos).or_insert(wp.weight);
+            *weight = (*weight).max(wp.weight);
+        }
+    }
+    let mut out = String::new();
+    for (lexeme, positions) in &by_lexeme {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&quote_lexeme(lexeme));
+        for (i, (pos, weight)) in positions.iter().enumerate() {
+            out.push(if i == 0 { ':' } else { ',' });
+            out.push_str(&pos.to_string());
+            // Weight classes 3/2/1 render as A/B/C; class 0 (`D`, the default) is not printed.
+            let letter = match weight {
+                3 => Some('A'),
+                2 => Some('B'),
+                1 => Some('C'),
+                _ => None,
+            };
+            if let Some(letter) = letter {
+                out.push(letter);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A parsed `tsquery`: the boolean structure over lexemes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TsQuery {
@@ -733,7 +778,10 @@ enum QueryToken {
 /// Lex a `tsquery` input: `&`/`|`/`!`/parens, `'...'` quoted lexemes (with `''` escapes), and bare
 /// words (alphanumeric runs). `<->`/`<N>` phrase operators and `:...` weight suffixes are rejected
 /// loudly (follow-ups).
-fn lex_tsquery(input: &str) -> Result<Vec<QueryToken>, Error> {
+///
+/// `lowercase` case-folds each lexeme (the dictionary path, used by `to_tsquery`); when `false` the
+/// lexemes are kept verbatim, as the bare `'…'::tsquery` literal cast keeps them.
+fn lex_tsquery(input: &str, lowercase: bool) -> Result<Vec<QueryToken>, Error> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -791,19 +839,27 @@ fn lex_tsquery(input: &str) -> Result<Vec<QueryToken>, Error> {
                 if lexeme.is_empty() {
                     return Err(syntax_error(input));
                 }
-                tokens.push(QueryToken::Lexeme(lexeme.to_lowercase()));
+                tokens.push(QueryToken::Lexeme(if lowercase {
+                    lexeme.to_lowercase()
+                } else {
+                    lexeme
+                }));
             },
             c if c.is_alphanumeric() => {
                 let mut lexeme = String::new();
                 while let Some(&c) = chars.peek() {
                     if c.is_alphanumeric() {
-                        lexeme.extend(c.to_lowercase());
+                        lexeme.push(c);
                         chars.next();
                     } else {
                         break;
                     }
                 }
-                tokens.push(QueryToken::Lexeme(lexeme));
+                tokens.push(QueryToken::Lexeme(if lowercase {
+                    lexeme.to_lowercase()
+                } else {
+                    lexeme
+                }));
             },
             _ => return Err(syntax_error(input)),
         }
@@ -864,9 +920,16 @@ impl QueryParser<'_> {
     }
 }
 
-/// Parse a `tsquery` from its input (or canonical) text form.
-fn parse_tsquery(input: &str) -> Result<TsQuery, Error> {
-    let tokens = lex_tsquery(input)?;
+/// Parse a `tsquery` from its input (or canonical) text form into its AST, case-folding each lexeme
+/// (the dictionary path shared by `to_tsquery` and `@@`).
+fn parse_tsquery_ast(input: &str) -> Result<TsQuery, Error> {
+    parse_tsquery_with_case(input, true)
+}
+
+/// Parse a `tsquery`, choosing whether the lexemes are case-folded (`to_tsquery`) or kept verbatim
+/// (the `'…'::tsquery` literal cast).
+fn parse_tsquery_with_case(input: &str, lowercase: bool) -> Result<TsQuery, Error> {
+    let tokens = lex_tsquery(input, lowercase)?;
     if tokens.is_empty() {
         return Err(syntax_error(input));
     }
@@ -882,6 +945,21 @@ fn parse_tsquery(input: &str) -> Result<TsQuery, Error> {
     Ok(query)
 }
 
+/// Validate and canonicalize a `tsquery` literal — the `'…'::tsquery` cast.
+///
+/// Unlike [`to_tsquery`] it applies no dictionary: lexemes are neither stemmed nor stopword-elided
+/// nor case-folded, only the boolean structure is parsed and re-rendered in canonical form
+/// (parenthesized only where precedence requires). A malformed query is a loud `42601` syntax error.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed query, or [`Error::Unsupported`] for the
+/// unimplemented phrase/weight operators.
+pub fn parse_tsquery(input: &str) -> Result<String, Error> {
+    let mut out = String::new();
+    parse_tsquery_with_case(input, false)?.render(&mut out);
+    Ok(out)
+}
+
 /// `to_tsquery(config, text)` — parse a boolean lexeme query into the reference engine's canonical text form.
 ///
 /// The grammar is `&`/`|`/`!`/parens over quoted or bare lexemes. Under `english` each lexeme is
@@ -893,7 +971,7 @@ fn parse_tsquery(input: &str) -> Result<TsQuery, Error> {
 /// a `42601`-coded [`Error::Coded`] for a malformed query (like the reference engine's `syntax error in tsquery`).
 pub fn to_tsquery(config: &str, text: &str) -> Result<String, Error> {
     let config = check_config(config)?;
-    let Some(query) = parse_tsquery(text)?.normalize(config) else {
+    let Some(query) = parse_tsquery_ast(text)?.normalize(config) else {
         return Ok(String::new());
     };
     let mut out = String::new();
@@ -1001,7 +1079,7 @@ pub fn ts_match(tsvector: &str, tsquery: &str) -> Result<bool, Error> {
         return Ok(false);
     }
     let lexemes = tsvector_lexemes(tsvector)?;
-    let query = parse_tsquery(tsquery)?;
+    let query = parse_tsquery_ast(tsquery)?;
     Ok(query.matches(&lexemes))
 }
 
@@ -1349,7 +1427,7 @@ pub fn ts_rank(tsvector: &str, tsquery: &str, method: i32) -> Result<f32, Error>
         return Ok(0.0);
     }
     let entries = parse_tsvector_entries(tsvector)?;
-    let query = parse_tsquery(tsquery)?;
+    let query = parse_tsquery_ast(tsquery)?;
     Ok(calc_rank(&entries, &query, method))
 }
 
@@ -1556,7 +1634,7 @@ pub fn ts_rank_cd(tsvector: &str, tsquery: &str, method: i32) -> Result<f32, Err
         return Ok(0.0);
     }
     let entries = parse_tsvector_entries(tsvector)?;
-    let query = parse_tsquery(tsquery)?;
+    let query = parse_tsquery_ast(tsquery)?;
     Ok(calc_rank_cd(&entries, &query, method))
 }
 

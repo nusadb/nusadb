@@ -828,8 +828,11 @@ pub(super) fn key_atoms(
             | ast::Value::Interval(_)
             | ast::Value::Array(_)
             | ast::Value::Vector(_)
-            // Geometry is not a hash-join key type (`is_hashable_key_type`); a value here never matches.
-            | ast::Value::Geometry(_) => return Ok(None),
+            // Geometry and the full-text types are not hash-join key types
+            // (`is_hashable_key_type`); a value here never matches.
+            | ast::Value::Geometry(_)
+            | ast::Value::Tsvector(_)
+            | ast::Value::Tsquery(_) => return Ok(None),
         }
     }
     Ok(Some(atoms))

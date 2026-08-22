@@ -358,8 +358,11 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         | T::Interval
         | T::Array(_)
         | T::Vector(_)
-        // Geometry has no order-preserving backing index to probe (stored as canonical text).
-        | T::Geometry(_) => false,
+        // Geometry and the full-text types have no order-preserving backing index to probe (stored
+        // as canonical text).
+        | T::Geometry(_)
+        | T::Tsvector
+        | T::Tsquery => false,
     }
 }
 
@@ -3530,6 +3533,8 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Array(_) => "ARRAY",
         ColumnType::Vector(_) => "vector",
         ColumnType::Geometry(kind) => kind.name(),
+        ColumnType::Tsvector => "tsvector",
+        ColumnType::Tsquery => "tsquery",
     }
 }
 

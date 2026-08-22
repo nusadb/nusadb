@@ -200,6 +200,12 @@ pub enum ColumnType {
     /// A geometric type (`point`, `box`, …). The [`GeomKind`] fixes which shape. Values are stored
     /// as their canonical text form; the kind tells the reader how to parse them back.
     Geometry(GeomKind),
+    /// Full-text search document (`tsvector`) — a sorted set of lexemes with positions, stored as
+    /// its canonical text form.
+    Tsvector,
+    /// Full-text search query (`tsquery`) — a boolean expression over lexemes, stored as its
+    /// canonical text form.
+    Tsquery,
 }
 
 impl ColumnType {
@@ -462,7 +468,9 @@ impl ArrayElem {
             | ColumnType::Range(_)
             | ColumnType::Array(_)
             | ColumnType::Vector(_)
-            | ColumnType::Geometry(_) => None,
+            | ColumnType::Geometry(_)
+            | ColumnType::Tsvector
+            | ColumnType::Tsquery => None,
         }
     }
 }

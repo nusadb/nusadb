@@ -106,11 +106,14 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         | ast::Value::Inet(_)
         | ast::Value::Bit(_)
         | ast::Value::Range(_)
-        // GEOMETRY has no order-preserving key form (no default btree opclass).
-        | ast::Value::Geometry(_) => {
+        // GEOMETRY has no order-preserving key form (no default btree opclass); the full-text types
+        // join here for the same reason.
+        | ast::Value::Geometry(_)
+        | ast::Value::Tsvector(_)
+        | ast::Value::Tsquery(_) => {
             return Err(Error::Unsupported(
-                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE / GEOMETRY columns \
-                 cannot yet be index keys"
+                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE / GEOMETRY / \
+                 TSVECTOR / TSQUERY columns cannot yet be index keys"
                     .to_owned(),
             ));
         },

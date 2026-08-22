@@ -52,6 +52,9 @@ pub(super) fn assignable(target: ColumnType, source: ColumnType) -> bool {
             ))
         // JSON accepts a text value (parsed + canonicalized at encode time).
         || (target == ColumnType::Json && source == ColumnType::Text)
+        // The full-text types accept a text literal (parsed + canonicalized at encode time).
+        || (matches!(target, ColumnType::Tsvector | ColumnType::Tsquery)
+            && source == ColumnType::Text)
         // ARRAY accepts a `{...}` text literal (parsed at encode time).
         || (matches!(target, ColumnType::Array(_)) && source == ColumnType::Text)
         // INTERVAL accepts a text literal (parsed at encode time).

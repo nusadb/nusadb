@@ -439,6 +439,78 @@ fn circle_value_survives_reopen() {
     );
 }
 
+/// A `TSVECTOR` / `TSQUERY` column is DURABLE on disk: each value is written to the WAL as its
+/// canonical text and recovery decodes it back to the same native full-text value after a crash —
+/// not just held in memory. The non-canonical literal inputs (out-of-order lexemes, bare `& `
+/// spacing) prove the parse-and-canonicalize happens before persistence, and a second crash-reopen
+/// proves a value committed after recovery also survives.
+#[test]
+fn tsvector_and_tsquery_values_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        run(
+            &engine,
+            "CREATE TABLE docs (id INT PRIMARY KEY, v TSVECTOR, q TSQUERY)",
+        );
+        // A `to_tsvector`/`to_tsquery` result stored into the native column.
+        run(
+            &engine,
+            "INSERT INTO docs VALUES (1, to_tsvector('simple', 'The quick brown fox'), \
+             to_tsquery('simple', 'fox & quick'))",
+        );
+        // Non-canonical literals canonicalize before they persist (lexemes sorted; `&` re-spaced).
+        run(
+            &engine,
+            "INSERT INTO docs VALUES (2, 'dog:2 cat:1', 'dog&cat')",
+        );
+    } // crash: no shutdown.
+
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        // The columns decode back to the native full-text values (byte-correct), not text.
+        assert_eq!(
+            rows(run(&engine, "SELECT v, q FROM docs WHERE id = 1")),
+            vec![vec![
+                Value::Tsvector("'brown':3 'fox':4 'quick':2 'the':1".to_owned()),
+                Value::Tsquery("'fox' & 'quick'".to_owned()),
+            ]]
+        );
+        // The canonical text of the recovered non-canonical literal inputs matches.
+        assert_eq!(
+            rows(run(
+                &engine,
+                "SELECT v::TEXT, q::TEXT FROM docs WHERE id = 2"
+            )),
+            vec![vec![
+                Value::Text("'cat':1 'dog':2".to_owned()),
+                Value::Text("'dog' & 'cat'".to_owned()),
+            ]]
+        );
+        // A committed insert after recovery also persists.
+        run(
+            &engine,
+            "INSERT INTO docs VALUES (3, to_tsvector('simple', 'lazy dog'), \
+             to_tsquery('simple', 'lazy'))",
+        );
+    } // second crash: no shutdown.
+
+    // A SECOND crash-reopen: every committed row — pre-crash and post-recovery — survives, and the
+    // native `@@` match still works over the recovered values.
+    let engine = BtreeEngine::open(&path).unwrap();
+    // Every row's document satisfies its own query (id 1 fox&quick, id 2 cat&dog, id 3 lazy).
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM docs WHERE v @@ q ORDER BY id")),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)]
+        ]
+    );
+}
+
 /// An `LSEG` column is DURABLE on disk: each value is written to the WAL as its canonical text
 /// `[(x1,y1),(x2,y2)]` and recovery decodes it back to the same typed geometry after a crash — not
 /// just held in memory. The non-canonical input forms (paren and bare) prove the

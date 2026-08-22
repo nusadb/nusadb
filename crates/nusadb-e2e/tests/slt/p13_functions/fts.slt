@@ -185,3 +185,97 @@ query R
 SELECT ts_rank(to_tsvector('simple', 'a b'), to_tsquery('simple', 'a & b'), 2)
 ----
 0.050
+
+# --- Native TSVECTOR / TSQUERY column types ---
+
+# to_tsvector / to_tsquery now yield native values; they render as their canonical text (unchanged).
+statement ok
+CREATE TABLE ftdocs (id INT PRIMARY KEY, v TSVECTOR, q TSQUERY)
+
+# A native value from the builders, plus a canonical literal, plus a non-canonical literal that
+# canonicalizes on the way in (lexemes sorted; positions merged/sorted).
+statement ok
+INSERT INTO ftdocs VALUES
+  (1, to_tsvector('simple', 'The quick brown fox'), to_tsquery('simple', 'quick & fox')),
+  (2, 'cat:1 dog:2', 'cat & dog'),
+  (3, 'dog:2 cat:1 cat:3', 'dog | bird')
+
+# A native tsvector column renders as its stored canonical text.
+query T
+SELECT v FROM ftdocs WHERE id = 1
+----
+'brown':3 'fox':4 'quick':2 'the':1
+
+# A literal inserted into the column is canonicalized (sorted, positions merged/sorted/deduped).
+query T
+SELECT v FROM ftdocs WHERE id = 3
+----
+'cat':1,3 'dog':2
+
+# A native tsquery column renders as its canonical text (operand order preserved, not sorted).
+query T
+SELECT q FROM ftdocs WHERE id = 1
+----
+'quick' & 'fox'
+
+# Native `v @@ q` over the stored columns: each document satisfies its own query.
+query I
+SELECT id FROM ftdocs WHERE v @@ q ORDER BY id
+----
+1
+2
+3
+
+# The `'…'::tsvector` cast parses an already-canonical literal (no tokenizing or stemming), only
+# sorting lexemes and their positions — 'The' keeps its case, unlike to_tsvector.
+query T
+SELECT 'The:2 cat:1'::tsvector
+----
+'The':2 'cat':1
+
+# The `'…'::tsquery` cast parses the boolean structure without stemming or case-folding.
+query T
+SELECT 'cat & (dog | bird)'::tsquery
+----
+'cat' & ( 'dog' | 'bird' )
+
+# tsvector -> text is its canonical text form.
+query T
+SELECT ('cat:1 dog:2'::tsvector)::text
+----
+'cat':1 'dog':2
+
+# A malformed tsquery literal cast is a loud error, like the builder path.
+statement error
+SELECT 'cat &'::tsquery
+
+# A native cast round-trip still matches under `@@`.
+query I
+SELECT id FROM ftdocs WHERE v @@ 'fox'::tsquery ORDER BY id
+----
+1
+
+# Native tsvector / tsquery values compare by their canonical form: distinct values are not equal,
+# identical ones are, and ORDER BY / DISTINCT are stable (regression guard — they must not all
+# collapse to "equal"). Single-lexeme values keep an unambiguous alphabetical order.
+query II
+SELECT 'cat:1'::tsvector = 'dog:1'::tsvector, 'cat:1'::tsvector = 'cat:1'::tsvector
+----
+0 1
+
+query II
+SELECT 'cat'::tsquery = 'dog'::tsquery, 'cat'::tsquery = 'cat'::tsquery
+----
+0 1
+
+query T
+SELECT v FROM (VALUES ('banana:1'::tsvector), ('apple:1'::tsvector), ('cherry:1'::tsvector)) t(v) ORDER BY v
+----
+'apple':1
+'banana':1
+'cherry':1
+
+query I
+SELECT count(DISTINCT v) FROM (VALUES ('apple:1'::tsvector), ('banana:1'::tsvector), ('apple:1'::tsvector)) t(v)
+----
+2

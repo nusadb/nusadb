@@ -745,24 +745,57 @@ fn eval_scalar_function(
         // Full-text search (F1): the two-argument forms name their configuration explicitly; the
         // one-argument forms use the default configuration, `english` — the same default as the reference engine's
         // stock `default_text_search_config`.
-        (F::ToTsvector, [Text(config), Text(text)]) => Text(crate::fts::to_tsvector(config, text)?),
-        (F::ToTsquery, [Text(config), Text(text)]) => Text(crate::fts::to_tsquery(config, text)?),
+        (F::ToTsvector, [Text(config), Text(text)]) => {
+            ast::Value::Tsvector(crate::fts::to_tsvector(config, text)?)
+        },
+        (F::ToTsquery, [Text(config), Text(text)]) => {
+            ast::Value::Tsquery(crate::fts::to_tsquery(config, text)?)
+        },
         (F::PlaintoTsquery, [Text(config), Text(text)]) => {
-            Text(crate::fts::plainto_tsquery(config, text)?)
+            ast::Value::Tsquery(crate::fts::plainto_tsquery(config, text)?)
         },
-        (F::ToTsvector, [Text(text)]) => Text(crate::fts::to_tsvector("english", text)?),
-        (F::ToTsquery, [Text(text)]) => Text(crate::fts::to_tsquery("english", text)?),
-        (F::PlaintoTsquery, [Text(text)]) => Text(crate::fts::plainto_tsquery("english", text)?),
-        // Relevance ranking: the two-argument forms use the reference engine's default normalization (0); the
-        // optional third argument is the normalization bit-mask. The score is a `real` (float4).
-        (F::TsRank, [Text(v), Text(q)]) => real_value(crate::fts::ts_rank(v, q, 0)?),
-        (F::TsRank, [Text(v), Text(q), Int(m)]) => {
-            real_value(crate::fts::ts_rank(v, q, *m as i32)?)
+        (F::ToTsvector, [Text(text)]) => {
+            ast::Value::Tsvector(crate::fts::to_tsvector("english", text)?)
         },
-        (F::TsRankCd, [Text(v), Text(q)]) => real_value(crate::fts::ts_rank_cd(v, q, 0)?),
-        (F::TsRankCd, [Text(v), Text(q), Int(m)]) => {
-            real_value(crate::fts::ts_rank_cd(v, q, *m as i32)?)
+        (F::ToTsquery, [Text(text)]) => {
+            ast::Value::Tsquery(crate::fts::to_tsquery("english", text)?)
         },
+        (F::PlaintoTsquery, [Text(text)]) => {
+            ast::Value::Tsquery(crate::fts::plainto_tsquery("english", text)?)
+        },
+        // Relevance ranking: the two-argument forms use the default normalization (0); the optional
+        // third argument is the normalization bit-mask. The score is a `real` (float4). The document
+        // and query are the native `tsvector`/`tsquery` (a text operand is accepted too).
+        (
+            F::TsRank,
+            [
+                ast::Value::Tsvector(v) | Text(v),
+                ast::Value::Tsquery(q) | Text(q),
+            ],
+        ) => real_value(crate::fts::ts_rank(v, q, 0)?),
+        (
+            F::TsRank,
+            [
+                ast::Value::Tsvector(v) | Text(v),
+                ast::Value::Tsquery(q) | Text(q),
+                Int(m),
+            ],
+        ) => real_value(crate::fts::ts_rank(v, q, *m as i32)?),
+        (
+            F::TsRankCd,
+            [
+                ast::Value::Tsvector(v) | Text(v),
+                ast::Value::Tsquery(q) | Text(q),
+            ],
+        ) => real_value(crate::fts::ts_rank_cd(v, q, 0)?),
+        (
+            F::TsRankCd,
+            [
+                ast::Value::Tsvector(v) | Text(v),
+                ast::Value::Tsquery(q) | Text(q),
+                Int(m),
+            ],
+        ) => real_value(crate::fts::ts_rank_cd(v, q, *m as i32)?),
         // RRF_SCORE(rank [, k]) — the Reciprocal Rank Fusion contribution 1/(k + rank), with k
         // defaulting to 60, the standard constant. Each rank comes from a RANK() window
         // over one ranked list; summing the contributions fuses the lists (FTS + vector hybrid
@@ -4017,6 +4050,8 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         | (ast::Value::Macaddr(_), ColumnType::Macaddr)
         | (ast::Value::Macaddr8(_), ColumnType::Macaddr8)
         | (ast::Value::Json(_), ColumnType::Json)
+        | (ast::Value::Tsvector(_), ColumnType::Tsvector)
+        | (ast::Value::Tsquery(_), ColumnType::Tsquery)
         | (ast::Value::Interval(_), ColumnType::Interval)
         | (ast::Value::Bytes(_), ColumnType::Bytes)
         | (ast::Value::Array(_), ColumnType::Array(_)) => Ok(value),
@@ -4230,6 +4265,19 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         // `json::text` renders the spaced display form (`{"a": 1}`), like the standard jsonb output.
         (ast::Value::Json(s), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::json::display_form(s)))
+        },
+        // FULL-TEXT: text -> tsvector/tsquery parses + canonicalizes the *literal* (no tokenizing or
+        // stemming — that is `to_tsvector`/`to_tsquery`); the native value -> text is its canonical
+        // form. A malformed literal is a loud syntax error from the parser.
+        (ast::Value::Text(s), ColumnType::Tsvector) => {
+            Ok(ast::Value::Tsvector(crate::fts::parse_tsvector(s)?))
+        },
+        (ast::Value::Text(s), ColumnType::Tsquery) => {
+            Ok(ast::Value::Tsquery(crate::fts::parse_tsquery(s)?))
+        },
+        // tsvector/tsquery -> text is the stored canonical text (identity casts handled above).
+        (ast::Value::Tsvector(s) | ast::Value::Tsquery(s), ColumnType::Text) => {
+            Ok(ast::Value::Text(s.clone()))
         },
         // INTERVAL: text -> interval (parse), interval -> text (canonical form).
         (ast::Value::Text(s), ColumnType::Interval) => crate::interval::Interval::parse(s)
@@ -4602,6 +4650,8 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
         ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
+        ast::Value::Tsvector(_) => ColumnType::Tsvector,
+        ast::Value::Tsquery(_) => ColumnType::Tsquery,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -5042,8 +5092,12 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
         (Float(a), Float(b)) => float_total_cmp(*a, *b),
         (Int(a), Float(b)) => float_total_cmp(*a as f64, *b),
         (Float(a), Int(b)) => float_total_cmp(*a, *b as f64),
-        // Text and JSON both compare by their (canonical) string.
-        (Text(a), Text(b)) | (Json(a), Json(b)) => a.cmp(b),
+        // Text, JSON, and TSVECTOR/TSQUERY all compare by their (canonical) string, so equality,
+        // DISTINCT, and ORDER BY are stable for the text-backed types.
+        (Text(a), Text(b))
+        | (Json(a), Json(b))
+        | (ast::Value::Tsvector(a), ast::Value::Tsvector(b))
+        | (ast::Value::Tsquery(a), ast::Value::Tsquery(b)) => a.cmp(b),
         // NUMERIC compares exactly with itself and with integers; against a float it falls back
         // to f64.
         (Numeric(a), Numeric(b)) => a.compare(b),
@@ -5164,6 +5218,8 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Range(_) => 20,
         ast::Value::Macaddr8(_) => 21,
         ast::Value::Geometry(_) => 22,
+        ast::Value::Tsvector(_) => 23,
+        ast::Value::Tsquery(_) => 24,
     }
 }
 
@@ -5717,13 +5773,18 @@ fn rrf_score(rank: i64, k: i64) -> Result<ast::Value, Error> {
 }
 
 fn ts_match_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
-    use ast::Value::Text;
-    let (Text(l), Text(r)) = (left, right) else {
+    // Accept the native `tsvector`/`tsquery`, or a text operand (parsed as either). `ts_match` takes
+    // `(tsvector, tsquery)`, so the fallback retry covers the swapped `tsquery @@ tsvector` order.
+    let as_str = |v: &ast::Value| match v {
+        ast::Value::Tsvector(s) | ast::Value::Tsquery(s) | ast::Value::Text(s) => Some(s.clone()),
+        _ => None,
+    };
+    let (Some(l), Some(r)) = (as_str(left), as_str(right)) else {
         return Ok(ast::Value::Null);
     };
-    match crate::fts::ts_match(l, r) {
+    match crate::fts::ts_match(&l, &r) {
         Ok(matched) => Ok(ast::Value::Bool(matched)),
-        Err(first) => crate::fts::ts_match(r, l)
+        Err(first) => crate::fts::ts_match(&r, &l)
             .map(ast::Value::Bool)
             .map_err(|_| first),
     }

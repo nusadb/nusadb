@@ -900,6 +900,9 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
             out.push(29);
             out.push(kind.tag());
         },
+        // Tags 30/31; full-text types carry no payload (stored as their canonical text).
+        ColumnType::Tsvector => out.push(30),
+        ColumnType::Tsquery => out.push(31),
     }
 }
 
@@ -967,6 +970,8 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
             *at += 1;
             ColumnType::Geometry(kind)
         },
+        30 => ColumnType::Tsvector,
+        31 => ColumnType::Tsquery,
         _ => return None,
     })
 }

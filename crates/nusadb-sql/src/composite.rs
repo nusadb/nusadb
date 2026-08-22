@@ -187,6 +187,8 @@ fn parse_field(s: &str, ty: ColumnType) -> Option<ast::Value> {
         ColumnType::Inet => ast::Value::Inet(crate::inet::parse_inet(s)?),
         ColumnType::Cidr => ast::Value::Inet(crate::inet::parse_cidr(s)?),
         ColumnType::Json | ColumnType::Jsonb => ast::Value::Json(crate::json::canonicalize(s)?),
+        ColumnType::Tsvector => ast::Value::Tsvector(crate::fts::parse_tsvector(s).ok()?),
+        ColumnType::Tsquery => ast::Value::Tsquery(crate::fts::parse_tsquery(s).ok()?),
         ColumnType::Range(kind) => ast::Value::Range(Box::new(crate::range::parse(s, kind)?)),
         // A field type with no text form of its own is not something a literal can spell.
         _ => return None,

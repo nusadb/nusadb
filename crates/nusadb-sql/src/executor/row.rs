@@ -173,7 +173,9 @@ pub(crate) fn skip_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<usi
         | ColumnType::Char(_)
         | ColumnType::Json
         | ColumnType::Jsonb
-        | ColumnType::Geometry(_) => Ok(read_text_field(bytes, pos)?.1),
+        | ColumnType::Geometry(_)
+        | ColumnType::Tsvector
+        | ColumnType::Tsquery => Ok(read_text_field(bytes, pos)?.1),
         // BYTEA: `[u32 len][len raw bytes]`, no UTF-8 validation (matching `decode_value`).
         ColumnType::Bytes => {
             let len = u32::from_le_bytes(read_array::<4>(bytes, pos)?) as usize;
@@ -385,6 +387,16 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             let canon = crate::json::canonicalize(s).ok_or_else(|| invalid(ty, s))?;
             put_json_text(&canon, out)?;
         },
+        // FULL-TEXT: length-prefixed canonical text. A native value is already canonical; a text
+        // value is parsed + canonicalized as a tsvector/tsquery *literal* (loud syntax error if bad).
+        (ast::Value::Tsvector(s), ColumnType::Tsvector)
+        | (ast::Value::Tsquery(s), ColumnType::Tsquery) => put_fulltext_text(s, out)?,
+        (ast::Value::Text(s), ColumnType::Tsvector) => {
+            put_fulltext_text(&crate::fts::parse_tsvector(s)?, out)?;
+        },
+        (ast::Value::Text(s), ColumnType::Tsquery) => {
+            put_fulltext_text(&crate::fts::parse_tsquery(s)?, out)?;
+        },
         // INTERVAL: months(4) + days(4) + micros(8). A text value is parsed.
         (ast::Value::Interval(iv), ColumnType::Interval) => put_interval(*iv, out),
         (ast::Value::Text(s), ColumnType::Interval) => {
@@ -537,6 +549,15 @@ fn put_interval(iv: crate::interval::Interval, out: &mut Vec<u8>) {
 fn put_json_text(s: &str, out: &mut Vec<u8>) -> Result<(), Error> {
     let len = u32::try_from(s.len())
         .map_err(|_| Error::LimitExceeded("JSON value larger than 4 GiB".to_owned()))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+/// Write a `tsvector`/`tsquery` canonical text form as length-prefixed text.
+fn put_fulltext_text(s: &str, out: &mut Vec<u8>) -> Result<(), Error> {
+    let len = u32::try_from(s.len())
+        .map_err(|_| Error::LimitExceeded("full-text value larger than 4 GiB".to_owned()))?;
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(s.as_bytes());
     Ok(())
@@ -758,6 +779,16 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
                 .to_owned();
             Ok((ast::Value::Json(text), end))
         },
+        // FULL-TEXT: length-prefixed canonical text, wrapped back into its native value.
+        ColumnType::Tsvector | ColumnType::Tsquery => {
+            let (text, next) = read_text_field(bytes, pos)?;
+            let value = if matches!(ty, ColumnType::Tsvector) {
+                ast::Value::Tsvector(text.to_owned())
+            } else {
+                ast::Value::Tsquery(text.to_owned())
+            };
+            Ok((value, next))
+        },
         // NUMERIC: 16-byte i128 mantissa + 1-byte scale.
         ColumnType::Numeric { .. } => {
             let mant = i128::from_le_bytes(read_array::<16>(bytes, pos)?);
@@ -878,6 +909,8 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::Macaddr(_) => ColumnType::Macaddr,
         ast::Value::Macaddr8(_) => ColumnType::Macaddr8,
         ast::Value::Geometry(g) => ColumnType::Geometry(g.kind()),
+        ast::Value::Tsvector(_) => ColumnType::Tsvector,
+        ast::Value::Tsquery(_) => ColumnType::Tsquery,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),

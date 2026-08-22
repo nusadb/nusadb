@@ -281,6 +281,8 @@ const fn infer_column_type(v: &Value) -> DefaultColumnType {
         | Value::Array(_)
         | Value::Vector(_)
         | Value::Geometry(_)
+        | Value::Tsvector(_)
+        | Value::Tsquery(_)
         | Value::Bytes(_) => DefaultColumnType::Text,
         Value::Null => DefaultColumnType::Any,
     }
@@ -295,7 +297,8 @@ fn format_value(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => format!("{f:.3}"),
         Value::Text(s) if s.is_empty() => "(empty)".to_owned(),
-        Value::Text(s) => s.clone(),
+        // Full-text values render as their stored canonical text, like plain text.
+        Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) => s.clone(),
         // JSON renders in the spaced display form (`{"a": 1}`), matching standard jsonb output.
         Value::Json(s) => nusadb_sql::json::display_form(s),
         // Temporal + UUID in canonical text form.

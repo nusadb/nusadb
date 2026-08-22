@@ -421,6 +421,9 @@ const fn coltype_to_u8(t: ColumnType) -> u8 {
         ColumnType::Macaddr8 => 28,
         // Tag 29; the geometry-kind tag is serialized separately.
         ColumnType::Geometry(_) => 29,
+        // Tags 30/31; full-text types carry no payload (stored as their canonical text).
+        ColumnType::Tsvector => 30,
+        ColumnType::Tsquery => 31,
     }
 }
 fn u8_to_coltype(b: u8) -> Result<ColumnType> {
@@ -448,6 +451,8 @@ fn u8_to_coltype(b: u8) -> Result<ColumnType> {
         23 => ColumnType::Inet,
         24 => ColumnType::Cidr,
         28 => ColumnType::Macaddr8,
+        30 => ColumnType::Tsvector,
+        31 => ColumnType::Tsquery,
         // GEOMETRY (tag 29) carries its geometry-kind tag; handled in `deserialize`, but a bare
         // element decode (arrays never hold geometry) has no default, so it is unreachable here.
         // An array's NUMERIC element is unconstrained (single tag byte, no precision/scale); a

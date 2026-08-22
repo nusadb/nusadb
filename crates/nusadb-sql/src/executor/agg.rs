@@ -1807,6 +1807,9 @@ fn distinct_hash(v: &ast::Value) -> u64 {
         // GEOMETRY hashes by its canonical text, matching `compare`'s text-based equality (so a
         // normalized box and its reversed input land together).
         V::Geometry(g) => (22u8, crate::geometry::format(g)).hash(&mut h),
+        // Full-text values hash by their canonical text.
+        V::Tsvector(s) => (23u8, s).hash(&mut h),
+        V::Tsquery(s) => (24u8, s).hash(&mut h),
         V::Inet(a) => (18u8, a).hash(&mut h),
         V::Bit(b) => (19u8, b).hash(&mut h),
         // A range hashes by its scale-normalized key bytes (its bound values are not `Hash`; the

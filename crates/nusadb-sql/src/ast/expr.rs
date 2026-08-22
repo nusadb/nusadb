@@ -1655,6 +1655,12 @@ pub enum Value {
     /// A geometric value (`point` / `box`); its [`GeomKind`](nusadb_core::engine::GeomKind) is
     /// carried inside the [`crate::geometry::GeomVal`].
     Geometry(crate::geometry::GeomVal),
+    /// A full-text search document (`tsvector`) in its canonical text form (lexemes sorted, quoted,
+    /// with ascending positions).
+    Tsvector(String),
+    /// A full-text search query (`tsquery`) in its canonical text form (a boolean expression over
+    /// quoted lexemes).
+    Tsquery(String),
 }
 
 /// Binary operators the parser accepts.
