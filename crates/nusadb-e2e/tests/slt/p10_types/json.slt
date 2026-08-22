@@ -707,3 +707,28 @@ query I
 SELECT JSONB_PATH_MATCH('{"a":1}'::JSONB, '$.a == 1')
 ----
 1
+
+# --- .** recursive descent: the value itself and every descendant, in pre-order ---
+
+# Descent then a key step gathers a key at any depth.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('{"a":{"x":1},"b":{"x":2}}'::JSONB, '$.**.x') AS TEXT)
+----
+[1, 2]
+
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('{"a":{"b":{"c":9}}}'::JSONB, '$.**.c') AS TEXT)
+----
+[9]
+
+# A bare $.** over nested arrays: self first, then each element depth-first.
+query T
+SELECT CAST(JSONB_PATH_QUERY_ARRAY('[1,[2,[3]]]'::JSONB, '$.**') AS TEXT)
+----
+[[1, [2, [3]]], 1, [2, [3]], 2, [3], 3]
+
+# Recursive descent feeding a predicate check.
+query I
+SELECT '{"a":{"x":5}}'::JSONB @@ '$.**.x == 5'
+----
+1

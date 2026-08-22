@@ -786,6 +786,8 @@ enum PathStep {
     Index(i64),
     /// `[*]` (array elements) or `.*` (object values) — every child (the set-returning step).
     Wildcard,
+    /// `.**` — recursive descent: the value itself and every descendant, in document (pre-order).
+    RecursiveDescent,
     /// `? (predicate)` — keep only the current values for which `predicate` holds.
     Filter(Box<FilterExpr>),
 }
@@ -836,8 +838,49 @@ enum FilterExpr {
     },
 }
 
-/// Parse the supported `jsonpath` subset: `$` root, `.key`, `.*`, `['key']`/`["key"]`, `[n]`, `[*]`.
-/// Returns `None` for any syntax outside the subset (filters, `..` descent, etc.).
+/// Consume a `? (...)` filter body from `chars` (the `?` already consumed) and parse it: skip
+/// whitespace, require the opening `(`, capture up to the matching `)` (tracking nesting and skipping
+/// parentheses inside string literals), then parse the captured text as a predicate. `None` if the
+/// parentheses are unbalanced or the body is not a valid predicate.
+fn capture_filter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<FilterExpr> {
+    while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+        chars.next();
+    }
+    if chars.next() != Some('(') {
+        return None;
+    }
+    let mut inner = String::new();
+    let mut depth = 1u32;
+    let mut quote: Option<char> = None;
+    for ch in chars.by_ref() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                },
+                _ => {},
+            }
+        }
+        inner.push(ch);
+    }
+    if depth != 0 {
+        return None;
+    }
+    parse_filter(&inner)
+}
+
+/// Parse the supported `jsonpath` subset: `$` root, `.key`, `.*`, `.**` (recursive descent),
+/// `['key']`/`["key"]`, `[n]`, `[*]`, and `? (predicate)` filters. Returns `None` for any syntax
+/// outside the subset (e.g. the level-bounded `.**{n}` form).
 fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
     let mut chars = path.trim().chars().peekable();
     if chars.next()? != '$' {
@@ -851,45 +894,24 @@ fn parse_jsonpath(path: &str) -> Option<Vec<PathStep>> {
             },
             '?' => {
                 chars.next();
-                while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
-                    chars.next();
-                }
-                if chars.next() != Some('(') {
-                    return None;
-                }
-                let mut inner = String::new();
-                let mut depth = 1u32;
-                let mut quote: Option<char> = None;
-                for ch in chars.by_ref() {
-                    if let Some(q) = quote {
-                        if ch == q {
-                            quote = None;
-                        }
-                    } else {
-                        match ch {
-                            '"' | '\'' => quote = Some(ch),
-                            '(' => depth += 1,
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            },
-                            _ => {},
-                        }
-                    }
-                    inner.push(ch);
-                }
-                if depth != 0 {
-                    return None;
-                }
-                steps.push(PathStep::Filter(Box::new(parse_filter(&inner)?)));
+                steps.push(PathStep::Filter(Box::new(capture_filter(&mut chars)?)));
             },
             '.' => {
                 chars.next();
                 if chars.peek() == Some(&'*') {
                     chars.next();
-                    steps.push(PathStep::Wildcard);
+                    // `.**` is recursive descent; `.*` is a single-level wildcard.
+                    if chars.peek() == Some(&'*') {
+                        chars.next();
+                        // The level-bounded form `.**{n}` is not supported (reject it loudly rather
+                        // than treat the `{...}` as a key).
+                        if chars.peek() == Some(&'{') {
+                            return None;
+                        }
+                        steps.push(PathStep::RecursiveDescent);
+                    } else {
+                        steps.push(PathStep::Wildcard);
+                    }
                     continue;
                 }
                 let mut key = String::new();
@@ -1057,7 +1079,7 @@ impl FilterParser {
         }
     }
 
-    /// Parse `@`/`$` followed by `.key`, `.*`, `[n]`, `[*]`, or `['key']` accessors.
+    /// Parse `@`/`$` followed by `.key`, `.*`, `.**`, `[n]`, `[*]`, or `['key']` accessors.
     fn parse_path(&mut self) -> Option<(FilterRoot, Vec<PathStep>)> {
         self.skip_ws();
         let root = match self.peek() {
@@ -1073,7 +1095,16 @@ impl FilterParser {
                     self.pos += 1;
                     if self.peek() == Some('*') {
                         self.pos += 1;
-                        steps.push(PathStep::Wildcard);
+                        // `.**` is recursive descent; `.*` is a single-level wildcard.
+                        if self.peek() == Some('*') {
+                            self.pos += 1;
+                            if self.peek() == Some('{') {
+                                return None;
+                            }
+                            steps.push(PathStep::RecursiveDescent);
+                        } else {
+                            steps.push(PathStep::Wildcard);
+                        }
                         continue;
                     }
                     let mut key = String::new();
@@ -1267,6 +1298,7 @@ fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
                     J::Object(map) => next.extend(map.into_values()),
                     _ => {},
                 },
+                PathStep::RecursiveDescent => collect_descendants(value, &mut next),
                 PathStep::Filter(pred) => {
                     if eval_filter(pred, &value, root) == Some(true) {
                         next.push(value);
@@ -1277,6 +1309,28 @@ fn apply_steps(mut current: Vec<J>, steps: &[PathStep], root: &J) -> Vec<J> {
         current = next;
     }
     current
+}
+
+/// Append `value` and every descendant to `out` in pre-order: the value itself, then each child
+/// recursively. Array elements keep their order; object members are visited in `jsonb` key order, so
+/// a bare `$.**` yields values in the same order as the reference engine.
+fn collect_descendants(value: J, out: &mut Vec<J>) {
+    out.push(value.clone());
+    match value {
+        J::Array(arr) => {
+            for elem in arr {
+                collect_descendants(elem, out);
+            }
+        },
+        J::Object(map) => {
+            let mut entries: Vec<(String, J)> = map.into_iter().collect();
+            entries.sort_by(|a, b| crate::jsonb::key_order(&a.0, &b.0));
+            for (_, child) in entries {
+                collect_descendants(child, out);
+            }
+        },
+        _ => {},
+    }
 }
 
 /// Evaluate a filter predicate with three-valued logic: `Some(true)` / `Some(false)` / `None`
@@ -1797,6 +1851,46 @@ mod tests {
         // A malformed filter is an unusable path, not a document error.
         assert_eq!(
             path_query("[1,2,3]", "$[*] ? (@ >)"),
+            Err(PathQueryError::UnusablePath)
+        );
+    }
+
+    #[test]
+    fn path_query_recursive_descent_matches_the_reference_engine() {
+        // `.**` yields the value and every descendant in pre-order, then a further step maps each.
+        assert_eq!(
+            path_query(r#"{"a":{"x":1},"b":{"x":2}}"#, "$.**.x").unwrap(),
+            vec!["1".to_owned(), "2".to_owned()]
+        );
+        assert_eq!(
+            path_query(r#"{"a":{"b":{"c":9}}}"#, "$.**.c").unwrap(),
+            vec!["9".to_owned()]
+        );
+        // A bare `$.**` over nested arrays: self first, then each element depth-first.
+        assert_eq!(
+            path_query("[1,[2,[3]]]", "$.**").unwrap(),
+            vec![
+                "[1,[2,[3]]]".to_owned(),
+                "1".to_owned(),
+                "[2,[3]]".to_owned(),
+                "2".to_owned(),
+                "[3]".to_owned(),
+                "3".to_owned(),
+            ]
+        );
+        // Recursive descent as a filter accessor, keeping the matching descendant.
+        assert_eq!(
+            path_query(r#"{"a":{"x":5},"b":{"x":9}}"#, "$.** ? (@.x == 5)").unwrap(),
+            vec![r#"{"x":5}"#.to_owned()]
+        );
+        // Recursive descent inside an @@ predicate path.
+        assert_eq!(
+            path_match(r#"{"a":{"x":5}}"#, "$.**.x == 5"),
+            Ok(Some(true))
+        );
+        // The level-bounded `.**{n}` form is not supported and is a loud unusable-path error.
+        assert_eq!(
+            path_query(r#"{"a":1}"#, "$.**{1}"),
             Err(PathQueryError::UnusablePath)
         );
     }
