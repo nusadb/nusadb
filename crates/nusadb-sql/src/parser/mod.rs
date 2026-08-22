@@ -176,13 +176,21 @@ impl Dialect for NusaParserDialect {
         // infix geometric/range operators this wrapper hooks itself get tokenized. So recognize just
         // this one prefix form here. A `@@` in infix position (the full-text match) is untouched —
         // this fires only when `@@` starts an expression.
-        if parser.peek_token().token != Token::AtAt {
-            return None;
-        }
+        // Prefix `!!` — the tsquery negation operator. sqlparser's default prefix parser maps the
+        // `!!` token to a prefix factorial only under one specific built-in dialect (a `dialect_of!`
+        // check this wrapper does not satisfy), so `!!` would otherwise fail to parse; recognize it
+        // here as a prefix operator (there is no numeric prefix factorial in NusaDB's surface, so the
+        // spelling is unambiguous). A `@@` in infix position (the full-text match) is untouched — the
+        // hooks fire only in prefix position.
+        let op = match parser.peek_token().token {
+            Token::AtAt => sql::UnaryOperator::DoubleAt,
+            Token::DoubleExclamationMark => sql::UnaryOperator::PGPrefixFactorial,
+            _ => return None,
+        };
         parser.next_token();
         let prec = self.prec_value(Precedence::PlusMinus);
         Some(parser.parse_subexpr(prec).map(|expr| sql::Expr::UnaryOp {
-            op: sql::UnaryOperator::DoubleAt,
+            op,
             expr: Box::new(expr),
         }))
     }

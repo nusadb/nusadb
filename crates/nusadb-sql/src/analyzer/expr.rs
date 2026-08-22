@@ -1428,6 +1428,12 @@ pub(super) fn analyze_scalar_function(
             &[Int],
             ColumnType::Real,
         ),
+        // NUMNODE(tsquery) → INT; STRIP(tsvector) → tsvector; SETWEIGHT(tsvector, weight text) →
+        // tsvector. The LENGTH family (which gains a tsvector arm) is handled by
+        // `analyze_text_polymorphic` above.
+        F::Numnode => ScalarSig::Fixed(&[ColumnType::Tsquery], &[], Int),
+        F::Strip => ScalarSig::Fixed(&[ColumnType::Tsvector], &[], ColumnType::Tsvector),
+        F::Setweight => ScalarSig::Fixed(&[ColumnType::Tsvector, Text], &[], ColumnType::Tsvector),
         // RRF_SCORE(rank [, k]) → the Reciprocal Rank Fusion contribution 1/(k + rank) as FLOAT,
         // k defaulting to 60.
         F::RrfScore => ScalarSig::Fixed(&[Int], &[Int], ColumnType::Float),
@@ -4517,6 +4523,10 @@ pub(super) fn analyze_operands(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat one-arm-per-operator dispatch; splitting it would scatter the operator table"
+)]
 pub(super) fn check_binary(
     op: ast::BinaryOp,
     left: ColumnType,
@@ -4601,6 +4611,18 @@ pub(super) fn check_binary(
         Op::BitAnd | Op::BitOr | Op::BitXor if is_bit_type(left) && is_bit_type(right) => Ok(left),
         Op::ShiftLeft | Op::ShiftRight if is_bit_type(left) && matches!(right, ColumnType::Int) => {
             Ok(left)
+        },
+        // Full-text `tsvector || tsvector` concatenates into a `tsvector`. Checked before the
+        // bit/array/string `||` arms below.
+        Op::Concat if left == ColumnType::Tsvector && right == ColumnType::Tsvector => {
+            Ok(ColumnType::Tsvector)
+        },
+        // Full-text `tsquery || tsquery` (OR) and `tsquery && tsquery` (AND) both yield a `tsquery`
+        // (the executor distinguishes the two). Checked before the bit/geometry/range/array arms.
+        Op::Concat | Op::ArrayOverlap
+            if left == ColumnType::Tsquery && right == ColumnType::Tsquery =>
+        {
+            Ok(ColumnType::Tsquery)
         },
         Op::Concat if is_bit_type(left) && is_bit_type(right) => Ok(ColumnType::VarBit(None)),
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
@@ -4975,6 +4997,8 @@ fn analyze_text_polymorphic(
             matches!(typed.ty.physical(), ColumnType::Text | ColumnType::Bytes)
                 || is_bit_type(typed.ty)
                 || (func == F::Length && is_geom_length_arg(typed.ty))
+                // `length(tsvector)` counts distinct lexemes (an INT, not the char count).
+                || (func == F::Length && typed.ty == ColumnType::Tsvector)
         } else if matches!(func, F::ConcatWs) && i == 0 {
             typed.ty.physical() == ColumnType::Text
         } else {
@@ -5666,12 +5690,20 @@ pub(super) fn analyze_unary(
     // `NOT NULL` is NULL, three-valued) instead of rejecting as untypeable.
     let hint = match op {
         ast::UnaryOp::Not => Some(ColumnType::Bool),
+        // `!!` hints tsquery so a bare literal/`NULL` operand types from context.
+        ast::UnaryOp::TsqueryNot => Some(ColumnType::Tsquery),
         ast::UnaryOp::Negate
         | ast::UnaryOp::Plus
         | ast::UnaryOp::BitNot
         | ast::UnaryOp::GeomCenter => None,
     };
     let operand = analyze_expr_agg(expr, scope, catalog, hint, aggregates)?;
+    // A bare string literal under `!!` is coerced to tsquery (the unknown-literal rule).
+    let operand = if op == ast::UnaryOp::TsqueryNot {
+        coerce_text_literal_to(operand, ColumnType::Tsquery)
+    } else {
+        operand
+    };
     let ty = match op {
         ast::UnaryOp::Not if operand.ty == ColumnType::Bool => ColumnType::Bool,
         ast::UnaryOp::Not => {
@@ -5731,6 +5763,15 @@ pub(super) fn analyze_unary(
             return Err(Error::TypeMismatch {
                 context: "geometric center `@@`".to_owned(),
                 expected: ColumnType::Geometry(nusadb_core::engine::GeomKind::Box),
+                found: operand.ty,
+            });
+        },
+        // `!!` — negate a tsquery, yielding a tsquery.
+        ast::UnaryOp::TsqueryNot if operand.ty == ColumnType::Tsquery => ColumnType::Tsquery,
+        ast::UnaryOp::TsqueryNot => {
+            return Err(Error::TypeMismatch {
+                context: "tsquery negation `!!`".to_owned(),
+                expected: ColumnType::Tsquery,
                 found: operand.ty,
             });
         },

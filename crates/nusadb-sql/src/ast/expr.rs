@@ -952,6 +952,15 @@ pub enum ScalarFunc {
     /// `TS_RANK_CD(tsvector, tsquery [, normalization])` — the cover-density relevance score as a
     /// `REAL`.
     TsRankCd,
+    /// `NUMNODE(tsquery)` — the number of nodes (lexemes plus operators) in a `tsquery`, as `INT`
+    /// (F1).
+    Numnode,
+    /// `STRIP(tsvector)` — the `tsvector` with positions and weights removed, keeping the distinct
+    /// lexemes only (F1).
+    Strip,
+    /// `SETWEIGHT(tsvector, weight)` — the `tsvector` with every position's weight class set to
+    /// `weight` (`A`/`B`/`C`/`D`) (F1).
+    Setweight,
     /// `RRF_SCORE(rank [, k])` — the Reciprocal Rank Fusion contribution `1/(k + rank)` as a
     /// `FLOAT`, `k` defaulting to 60 (the standard constant). Summed across ranked lists (each
     /// rank from `RANK() OVER (...)`) to fuse FTS and vector rankings in hybrid search.
@@ -1219,6 +1228,9 @@ impl ScalarFunc {
             Self::PlaintoTsquery => "plainto_tsquery",
             Self::TsRank => "ts_rank",
             Self::TsRankCd => "ts_rank_cd",
+            Self::Numnode => "numnode",
+            Self::Strip => "strip",
+            Self::Setweight => "setweight",
             Self::RrfScore => "rrf_score",
             Self::SequenceNext => "nextval",
             Self::SequenceCurrent => "currval",
@@ -1793,6 +1805,8 @@ pub enum UnaryOp {
     /// Geometric center `@@` — the center point of a `box` (corner midpoint), `circle` (center),
     /// `lseg` (midpoint), or `polygon` (vertex mean), as a `point`.
     GeomCenter,
+    /// Tsquery negation `!!` (prefix) — negate a `tsquery`, e.g. `!!'cat'` = `!'cat'`.
+    TsqueryNot,
 }
 
 /// The JSON item type required by an [`Expr::IsJson`] predicate (`<expr> IS JSON <item_type>`).

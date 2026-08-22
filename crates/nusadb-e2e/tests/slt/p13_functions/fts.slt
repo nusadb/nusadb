@@ -279,3 +279,198 @@ query I
 SELECT count(DISTINCT v) FROM (VALUES ('apple:1'::tsvector), ('banana:1'::tsvector), ('apple:1'::tsvector)) t(v)
 ----
 2
+
+# ============================================================================
+# F1 follow-up: type-specific tsvector/tsquery functions and operators.
+# Every expected value is the reference-engine oracle.
+# ============================================================================
+
+# length(tsvector) = number of distinct lexemes.
+query I
+SELECT length('cat:1 dog:2,3 fox:4'::tsvector)
+----
+3
+
+query I
+SELECT length('cat dog cat'::tsvector)
+----
+2
+
+# numnode(tsquery) = number of nodes (lexemes + operators).
+query I
+SELECT numnode('cat & dog'::tsquery)
+----
+3
+
+query I
+SELECT numnode('!cat'::tsquery)
+----
+2
+
+query I
+SELECT numnode('(cat & dog) | !fox'::tsquery)
+----
+6
+
+query I
+SELECT numnode('!(cat & dog) | (a & b & c)'::tsquery)
+----
+10
+
+# strip(tsvector) drops positions and weights, keeping distinct lexemes (sorted, quoted).
+query T
+SELECT strip('cat:1A dog:2,3 fox:4B'::tsvector)
+----
+'cat' 'dog' 'fox'
+
+# setweight sets EVERY position's weight (A/B/C render; D elides); it overwrites any existing weight.
+query T
+SELECT setweight('cat:1 dog:2,3'::tsvector, 'A')
+----
+'cat':1A 'dog':2A,3A
+
+query T
+SELECT setweight('cat:1A dog:2'::tsvector, 'B')
+----
+'cat':1B 'dog':2B
+
+query T
+SELECT setweight('cat:1A dog:2'::tsvector, 'D')
+----
+'cat':1 'dog':2
+
+# A position-less lexeme is unchanged by setweight (weight attaches to a position).
+query T
+SELECT setweight('cat dog:2'::tsvector, 'C')
+----
+'cat' 'dog':2C
+
+# An unrecognized weight is a loud error.
+statement error
+SELECT setweight('cat:1'::tsvector, 'Z')
+
+# tsvector || tsvector concatenates: the right side's positions shift up by the left side's max.
+query T
+SELECT 'cat:1 dog:2'::tsvector || 'bird:1 cat:2'::tsvector
+----
+'bird':3 'cat':1,4 'dog':2
+
+query T
+SELECT 'a:1'::tsvector || 'b:1'::tsvector
+----
+'a':1 'b':2
+
+# A position-less left operand contributes a zero offset.
+query T
+SELECT 'a'::tsvector || 'a:1'::tsvector
+----
+'a':1
+
+# tsquery || tsquery is OR.
+query T
+SELECT 'cat'::tsquery || 'dog'::tsquery
+----
+'cat' | 'dog'
+
+# tsquery && tsquery is AND.
+query T
+SELECT 'cat'::tsquery && 'dog'::tsquery
+----
+'cat' & 'dog'
+
+# && nests with the spaced-paren canonical form when precedence requires it.
+query T
+SELECT ('cat | dog')::tsquery && 'fox'::tsquery
+----
+( 'cat' | 'dog' ) & 'fox'
+
+# A left-nested AND does not get parens (same precedence, left-associative).
+query T
+SELECT ('cat & fox')::tsquery && 'dog'::tsquery
+----
+'cat' & 'fox' & 'dog'
+
+# OR of two ANDs keeps the AND children unparenthesized (higher precedence).
+query T
+SELECT ('a & b')::tsquery || ('c & d')::tsquery
+----
+'a' & 'b' | 'c' & 'd'
+
+# !! is prefix tsquery NOT.
+query T
+SELECT !! 'cat'::tsquery
+----
+!'cat'
+
+query T
+SELECT !! ('a & b')::tsquery
+----
+!( 'a' & 'b' )
+
+# NULL propagates through every new function and operator.
+query I
+SELECT length(NULL::tsvector)
+----
+NULL
+
+query T
+SELECT strip(NULL::tsvector)
+----
+NULL
+
+query I
+SELECT numnode(NULL::tsquery)
+----
+NULL
+
+query T
+SELECT NULL::tsvector || 'a:1'::tsvector
+----
+NULL
+
+query T
+SELECT 'cat'::tsquery && NULL::tsquery
+----
+NULL
+
+query T
+SELECT !! NULL::tsquery
+----
+NULL
+
+# --- Regression guards: the overloaded `||` and `&&` tokens keep their other meanings. ---
+
+# String `||` still concatenates text.
+query T
+SELECT 'a' || 'b'
+----
+ab
+
+# Array `&&` (overlap) still returns a bool (rendered 0/1).
+query I
+SELECT ARRAY[1,2,3] && ARRAY[3,4]
+----
+1
+
+query I
+SELECT ARRAY[1,2] && ARRAY[8,9]
+----
+0
+
+# Array `||` (concat) still merges arrays.
+query T
+SELECT ARRAY[1,2] || ARRAY[3]
+----
+{1,2,3}
+
+# Geometry `&&` (box overlap) still returns a bool.
+query I
+SELECT '(0,0),(2,2)'::box && '(1,1),(3,3)'::box
+----
+1
+
+# Range `&&` (overlap) still returns a bool.
+query I
+SELECT '[1,5]'::int4range && '[3,9]'::int4range
+----
+1

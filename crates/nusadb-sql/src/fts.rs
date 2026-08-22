@@ -645,11 +645,17 @@ pub fn to_tsvector(config: &str, text: &str) -> Result<String, Error> {
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed tsvector literal.
 pub fn parse_tsvector(input: &str) -> Result<String, Error> {
-    // Merge same-lexeme entries (BTreeMap orders lexemes by byte order); per lexeme, a position
-    // map orders + deduplicates the positions, keeping the strongest weight if one repeats.
+    Ok(canonicalize_entries(parse_tsvector_entries(input)?))
+}
+
+/// Merge parsed `tsvector` entries into the canonical text form: lexemes sorted (byte order, via
+/// `BTreeMap`), each quoted, its positions sorted, deduplicated, and ascending, keeping the strongest
+/// weight when a position repeats, with any `A`-`C` weight letter rendered (`D`, the default,
+/// elided). Shared by the `::tsvector` cast, `setweight`, and `tsvector ||`.
+fn canonicalize_entries(entries: Vec<TsvEntry>) -> String {
     let mut by_lexeme: std::collections::BTreeMap<String, std::collections::BTreeMap<u32, u8>> =
         std::collections::BTreeMap::new();
-    for entry in parse_tsvector_entries(input)? {
+    for entry in entries {
         let slot = by_lexeme.entry(entry.lexeme).or_default();
         for wp in entry.positions {
             let weight = slot.entry(wp.pos).or_insert(wp.weight);
@@ -677,7 +683,183 @@ pub fn parse_tsvector(input: &str) -> Result<String, Error> {
             }
         }
     }
+    out
+}
+
+/// `length(tsvector)` — the number of distinct lexemes in a `tsvector` (positions/weights ignored).
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed `tsvector`.
+pub fn tsvector_length(input: &str) -> Result<i32, Error> {
+    let mut lexemes = std::collections::BTreeSet::new();
+    for entry in parse_tsvector_entries(input)? {
+        lexemes.insert(entry.lexeme);
+    }
+    Ok(i32::try_from(lexemes.len()).unwrap_or(i32::MAX))
+}
+
+/// `strip(tsvector)` — drop every position and weight, keeping the distinct lexemes only (sorted,
+/// quoted). `strip('cat:1A dog:2,3 fox:4B')` -> `'cat' 'dog' 'fox'`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed `tsvector`.
+pub fn strip(input: &str) -> Result<String, Error> {
+    let mut lexemes = std::collections::BTreeSet::new();
+    for entry in parse_tsvector_entries(input)? {
+        lexemes.insert(entry.lexeme);
+    }
+    let mut out = String::new();
+    for lexeme in &lexemes {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&quote_lexeme(lexeme));
+    }
     Ok(out)
+}
+
+/// Resolve a `setweight` weight argument to its class number (`A`=3, `B`=2, `C`=1, `D`=0),
+/// case-insensitively. Any other spelling is the reference engine's `22023` error.
+fn parse_weight(weight: &str) -> Result<u8, Error> {
+    let mut chars = weight.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c @ ('A'..='D' | 'a'..='d')), None) => Ok(weight_class(c)),
+        _ => Err(Error::Coded {
+            message: format!("unrecognized weight: {weight:?}"),
+            sqlstate: "22023",
+        }),
+    }
+}
+
+/// `setweight(tsvector, weight)` — reweight every position.
+///
+/// Every position's weight class becomes `weight` (one of `A`/`B`/`C`/`D`, `D` rendering as no
+/// suffix), overwriting any existing weight. A position-less lexeme is unchanged (a weight attaches
+/// to a position). `setweight('cat:1 dog:2,3','A')` -> `'cat':1A 'dog':2A,3A`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed `tsvector`, or a `22023`-coded [`Error::Coded`]
+/// for an unrecognized weight letter.
+pub fn setweight(input: &str, weight: &str) -> Result<String, Error> {
+    let class = parse_weight(weight)?;
+    let mut entries = parse_tsvector_entries(input)?;
+    for entry in &mut entries {
+        for wp in &mut entry.positions {
+            wp.weight = class;
+        }
+    }
+    Ok(canonicalize_entries(entries))
+}
+
+/// `tsvector || tsvector` — concatenate two `tsvector`s.
+///
+/// The second operand's positions are shifted up by the first operand's maximum position (0 if it
+/// has none), then the two are merged and canonicalized. `'cat:1 dog:2' || 'bird:1 cat:2'` ->
+/// `'bird':3 'cat':1,4 'dog':2`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed `tsvector` operand.
+pub fn tsvector_concat(left: &str, right: &str) -> Result<String, Error> {
+    let left_entries = parse_tsvector_entries(left)?;
+    let maxpos = left_entries
+        .iter()
+        .flat_map(|e| e.positions.iter().map(|wp| wp.pos))
+        .max()
+        .unwrap_or(0);
+    let mut combined = left_entries;
+    for mut entry in parse_tsvector_entries(right)? {
+        for wp in &mut entry.positions {
+            wp.pos = wp.pos.saturating_add(maxpos).min(MAX_POSITION);
+        }
+        combined.push(entry);
+    }
+    Ok(canonicalize_entries(combined))
+}
+
+/// `numnode(tsquery)` — the number of nodes (lexemes plus `&`/`|`/`!` operators) in a `tsquery`. The
+/// empty query has none. `numnode('(cat & dog) | !fox')` = 6.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed `tsquery`, or [`Error::Unsupported`] for an
+/// unimplemented phrase/weight form.
+pub fn numnode(input: &str) -> Result<i32, Error> {
+    Ok(parse_tsquery_operand(input)?.map_or(0, |query| count_nodes(&query)))
+}
+
+/// Count the nodes of a parsed query: each lexeme and each `&`/`|`/`!` operator is one node.
+fn count_nodes(query: &TsQuery) -> i32 {
+    match query {
+        TsQuery::Lexeme(_) => 1,
+        TsQuery::Not(inner) => 1 + count_nodes(inner),
+        TsQuery::And(a, b) | TsQuery::Or(a, b) => 1 + count_nodes(a) + count_nodes(b),
+    }
+}
+
+/// Parse a `tsquery` value operand for the combine/count operators, case-preserving (the value is
+/// already canonical). The empty query is `None` — the identity the reference engine gives it under
+/// `&`/`|` and `!`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed `tsquery`, or [`Error::Unsupported`] for an
+/// unimplemented phrase/weight form.
+fn parse_tsquery_operand(input: &str) -> Result<Option<TsQuery>, Error> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_tsquery_with_case(input, false).map(Some)
+}
+
+/// `tsquery && tsquery` — combine two queries with `&` (AND); an empty operand is the identity (the
+/// other side alone). `('cat | dog') && 'fox'` -> `( 'cat' | 'dog' ) & 'fox'`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed operand, or [`Error::Unsupported`] for an
+/// unimplemented phrase/weight form.
+pub fn ts_and(left: &str, right: &str) -> Result<String, Error> {
+    combine(left, right, TsQuery::And)
+}
+
+/// `tsquery || tsquery` — combine two queries with `|` (OR); an empty operand is the identity (the
+/// other side alone). `'cat' || 'dog'` -> `'cat' | 'dog'`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed operand, or [`Error::Unsupported`] for an
+/// unimplemented phrase/weight form.
+pub fn ts_or(left: &str, right: &str) -> Result<String, Error> {
+    combine(left, right, TsQuery::Or)
+}
+
+/// Combine two `tsquery` operands with `combiner` (`&` or `|`), rendering the result canonically. An
+/// empty operand drops out, leaving the other side (or the empty query if both are empty).
+fn combine(
+    left: &str,
+    right: &str,
+    combiner: fn(Box<TsQuery>, Box<TsQuery>) -> TsQuery,
+) -> Result<String, Error> {
+    let combined = match (parse_tsquery_operand(left)?, parse_tsquery_operand(right)?) {
+        (Some(l), Some(r)) => Some(combiner(Box::new(l), Box::new(r))),
+        (one, other) => one.or(other),
+    };
+    Ok(render_or_empty(combined.as_ref()))
+}
+
+/// `!! tsquery` — negate a query with `!`; the empty query stays empty. `!!'cat'` -> `!'cat'`.
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed operand, or [`Error::Unsupported`] for an
+/// unimplemented phrase/weight form.
+pub fn ts_not(input: &str) -> Result<String, Error> {
+    let negated = parse_tsquery_operand(input)?.map(|q| TsQuery::Not(Box::new(q)));
+    Ok(render_or_empty(negated.as_ref()))
+}
+
+/// Render a (possibly empty) query to its canonical text form; the empty query is `""`.
+fn render_or_empty(query: Option<&TsQuery>) -> String {
+    query.map_or_else(String::new, |q| {
+        let mut out = String::new();
+        q.render(&mut out);
+        out
+    })
 }
 
 /// A parsed `tsquery`: the boolean structure over lexemes.
@@ -1925,6 +2107,99 @@ mod tests {
         // No cover (one term missing) ranks 0; the empty query ranks 0.
         approx(ts_rank_cd("'a':1", "'a' & 'b'", 0).unwrap(), 0.0);
         approx(ts_rank_cd("'a':1 'b':2", "", 0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn tsvector_functions_match_pg() {
+        // length = distinct lexeme count; strip drops positions/weights (sorted, quoted).
+        assert_eq!(tsvector_length("cat:1 dog:2,3 fox:4").unwrap(), 3);
+        assert_eq!(tsvector_length("cat dog cat").unwrap(), 2);
+        assert_eq!(tsvector_length("").unwrap(), 0);
+        assert_eq!(strip("cat:1A dog:2,3 fox:4B").unwrap(), "'cat' 'dog' 'fox'");
+        assert_eq!(strip("cat dog").unwrap(), "'cat' 'dog'");
+        assert_eq!(strip("").unwrap(), "");
+    }
+
+    #[test]
+    fn setweight_overwrites_every_position() {
+        // Every position takes the new weight; A/B/C render, D elides; a bare lexeme is unchanged.
+        assert_eq!(
+            setweight("cat:1 dog:2,3", "A").unwrap(),
+            "'cat':1A 'dog':2A,3A"
+        );
+        assert_eq!(setweight("cat:1A dog:2", "B").unwrap(), "'cat':1B 'dog':2B");
+        assert_eq!(setweight("cat:1A dog:2", "D").unwrap(), "'cat':1 'dog':2");
+        assert_eq!(setweight("cat dog:2", "C").unwrap(), "'cat' 'dog':2C");
+        assert_eq!(setweight("cat:1", "a").unwrap(), "'cat':1A");
+        // An unrecognized weight is the reference engine's 22023 error.
+        match setweight("cat:1", "Z") {
+            Err(Error::Coded { sqlstate, message }) => {
+                assert_eq!(sqlstate, "22023");
+                assert_eq!(message, "unrecognized weight: \"Z\"");
+            },
+            other => panic!("expected 22023, got {other:?}"),
+        }
+        assert!(setweight("cat:1", "AB").is_err());
+        assert!(setweight("cat:1", "").is_err());
+    }
+
+    #[test]
+    fn tsvector_concat_offsets_the_right_operand() {
+        // The right side's positions shift up by the left side's maximum position.
+        assert_eq!(
+            tsvector_concat("cat:1 dog:2", "bird:1 cat:2").unwrap(),
+            "'bird':3 'cat':1,4 'dog':2"
+        );
+        assert_eq!(tsvector_concat("a:1", "b:1").unwrap(), "'a':1 'b':2");
+        // A position-less left operand contributes a zero offset.
+        assert_eq!(tsvector_concat("a", "a:1").unwrap(), "'a':1");
+        assert_eq!(tsvector_concat("", "a:1").unwrap(), "'a':1");
+        assert_eq!(tsvector_concat("a:1", "").unwrap(), "'a':1");
+        assert_eq!(tsvector_concat("cat", "dog").unwrap(), "'cat' 'dog'");
+        // Weights survive the offset+merge.
+        assert_eq!(tsvector_concat("a:1A", "a:1B").unwrap(), "'a':1A,2B");
+        assert_eq!(
+            tsvector_concat("cat:1,2 cat:3", "cat:1").unwrap(),
+            "'cat':1,2,3,4"
+        );
+    }
+
+    #[test]
+    fn numnode_counts_every_node() {
+        assert_eq!(numnode("cat").unwrap(), 1);
+        assert_eq!(numnode("cat & dog").unwrap(), 3);
+        assert_eq!(numnode("!cat").unwrap(), 2);
+        assert_eq!(numnode("( cat & dog ) | !fox").unwrap(), 6);
+        assert_eq!(numnode("!( cat & dog ) | ( a & b & c )").unwrap(), 10);
+        assert_eq!(numnode("").unwrap(), 0);
+    }
+
+    #[test]
+    fn tsquery_combine_renders_like_pg() {
+        // OR / AND / NOT combine, case preserved (the operands are already canonical values).
+        assert_eq!(ts_or("'cat'", "'dog'").unwrap(), "'cat' | 'dog'");
+        assert_eq!(ts_and("'cat'", "'dog'").unwrap(), "'cat' & 'dog'");
+        assert_eq!(ts_not("'cat'").unwrap(), "!'cat'");
+        assert_eq!(ts_or("'Cat'", "'DOG'").unwrap(), "'Cat' | 'DOG'");
+        // Precedence-driven parenthesization is reused from `render`.
+        assert_eq!(
+            ts_and("'cat' | 'dog'", "'fox'").unwrap(),
+            "( 'cat' | 'dog' ) & 'fox'"
+        );
+        assert_eq!(
+            ts_and("'cat' & 'fox'", "'dog'").unwrap(),
+            "'cat' & 'fox' & 'dog'"
+        );
+        assert_eq!(
+            ts_or("'a' & 'b'", "'c' & 'd'").unwrap(),
+            "'a' & 'b' | 'c' & 'd'"
+        );
+        assert_eq!(ts_not("'a' & 'b'").unwrap(), "!( 'a' & 'b' )");
+        // An empty operand is the identity under &/|/!.
+        assert_eq!(ts_or("", "'dog'").unwrap(), "'dog'");
+        assert_eq!(ts_and("'cat'", "").unwrap(), "'cat'");
+        assert_eq!(ts_not("").unwrap(), "");
+        assert_eq!(ts_or("", "").unwrap(), "");
     }
 
     /// Helper: rank `'fox'` in a document and wrap the score the way the executor renders it.

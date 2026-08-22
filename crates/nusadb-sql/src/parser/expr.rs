@@ -1497,6 +1497,9 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "plainto_tsquery" => F::PlaintoTsquery,
         "ts_rank" => F::TsRank,
         "ts_rank_cd" => F::TsRankCd,
+        "numnode" => F::Numnode,
+        "strip" => F::Strip,
+        "setweight" => F::Setweight,
         "rrf_score" => F::RrfScore,
         _ => return None,
     })
@@ -2097,6 +2100,8 @@ pub(super) fn convert_unary_op(op: sql::UnaryOperator) -> Result<ast::UnaryOp, E
         sql::UnaryOperator::BitwiseNot => Ok(ast::UnaryOp::BitNot),
         // `@@` prefix — the geometric center operator.
         sql::UnaryOperator::DoubleAt => Ok(ast::UnaryOp::GeomCenter),
+        // `!!` prefix — the tsquery negation operator (recognized by the dialect's `parse_prefix`).
+        sql::UnaryOperator::PGPrefixFactorial => Ok(ast::UnaryOp::TsqueryNot),
         other => unsupported(&format!("unary operator `{other}`")),
     }
 }

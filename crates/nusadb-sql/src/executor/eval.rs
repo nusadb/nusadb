@@ -598,6 +598,8 @@ fn eval_scalar_function(
         (F::Length, [ast::Value::Geometry(crate::geometry::GeomVal::Path { points, closed })]) => {
             ast::Value::Float(crate::geometry::path_length(points, *closed))
         },
+        // Over a `tsvector`, LENGTH is the number of distinct lexemes, as an INT.
+        (F::Length, [ast::Value::Tsvector(v)]) => Int(i64::from(crate::fts::tsvector_length(v)?)),
         (F::Upper, [Text(s)]) => Text(s.to_uppercase()),
         (F::Lower, [Text(s)]) => Text(s.to_lowercase()),
         (F::Sha256, [Text(s)]) => Text(super::crypto::sha256_hex(s)),
@@ -796,6 +798,15 @@ fn eval_scalar_function(
                 Int(m),
             ],
         ) => real_value(crate::fts::ts_rank_cd(v, q, *m as i32)?),
+        // NUMNODE(tsquery) → node count; STRIP(tsvector) → lexemes only; SETWEIGHT(tsvector, weight)
+        // → every position reweighted. A text operand is accepted too (parsed as the target type).
+        (F::Numnode, [ast::Value::Tsquery(q) | Text(q)]) => Int(i64::from(crate::fts::numnode(q)?)),
+        (F::Strip, [ast::Value::Tsvector(v) | Text(v)]) => {
+            ast::Value::Tsvector(crate::fts::strip(v)?)
+        },
+        (F::Setweight, [ast::Value::Tsvector(v) | Text(v), Text(w)]) => {
+            ast::Value::Tsvector(crate::fts::setweight(v, w)?)
+        },
         // RRF_SCORE(rank [, k]) — the Reciprocal Rank Fusion contribution 1/(k + rank), with k
         // defaulting to 60, the standard constant. Each rank comes from a RANK() window
         // over one ranked list; summing the contributions fuses the lists (FTS + vector hybrid
@@ -5298,6 +5309,21 @@ fn apply_binary(
         {
             Ok(geom_intersection_op(left, right))
         },
+        // Full-text `||`: `tsvector || tsvector` (concat) and `tsquery || tsquery` (OR). Routed
+        // before the bit/array/string `||` arms — a tsvector/tsquery operand is none of those.
+        Op::Concat
+            if matches!(left, ast::Value::Tsvector(_) | ast::Value::Tsquery(_))
+                || matches!(right, ast::Value::Tsvector(_) | ast::Value::Tsquery(_)) =>
+        {
+            ts_concat_op(left, right)
+        },
+        // Full-text `&&`: `tsquery && tsquery` (AND). Routed before the geometry/range/array overlap.
+        Op::ArrayOverlap
+            if matches!(left, ast::Value::Tsquery(_))
+                || matches!(right, ast::Value::Tsquery(_)) =>
+        {
+            ts_and_op(left, right)
+        },
         // BIT-string operators: `&`/`|`/`#`, `<<`/`>>` (shift), and `||` (concat).
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight | Op::Concat
             if matches!(left, ast::Value::Bit(_)) =>
@@ -5787,6 +5813,30 @@ fn ts_match_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Erro
         Err(first) => crate::fts::ts_match(&r, &l)
             .map(ast::Value::Bool)
             .map_err(|_| first),
+    }
+}
+
+/// The `||` operator over a full-text operand: `tsvector || tsvector` concatenates (offsetting the
+/// second's positions), `tsquery || tsquery` is OR. A `NULL` operand yields `NULL`.
+fn ts_concat_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    use ast::Value::{Null, Tsquery, Tsvector};
+    match (left, right) {
+        (Tsvector(a), Tsvector(b)) => crate::fts::tsvector_concat(a, b).map(Tsvector),
+        (Tsquery(a), Tsquery(b)) => crate::fts::ts_or(a, b).map(Tsquery),
+        // A `NULL` operand yields `NULL`; the analyzer admits only the matched-type pairs above, so
+        // any other combination is a safe `NULL` too.
+        _ => Ok(Null),
+    }
+}
+
+/// The `&&` operator over a full-text operand: `tsquery && tsquery` is AND. A `NULL` operand yields
+/// `NULL`.
+fn ts_and_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    use ast::Value::{Null, Tsquery};
+    match (left, right) {
+        (Tsquery(a), Tsquery(b)) => crate::fts::ts_and(a, b).map(Tsquery),
+        // A `NULL` (or any non-tsquery) operand yields `NULL`.
+        _ => Ok(Null),
     }
 }
 
@@ -6941,6 +6991,11 @@ fn apply_unary(op: ast::UnaryOp, value: &ast::Value) -> Result<ast::Value, Error
         },
         // `@@` — the center point of a box, circle, lseg, or polygon.
         ast::UnaryOp::GeomCenter => geom_center(value),
+        // `!!` — negate a tsquery.
+        ast::UnaryOp::TsqueryNot => match value {
+            ast::Value::Tsquery(q) => ast::Value::Tsquery(crate::fts::ts_not(q)?),
+            _ => ast::Value::Null,
+        },
     })
 }
 
