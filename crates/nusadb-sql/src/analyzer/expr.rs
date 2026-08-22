@@ -3187,10 +3187,10 @@ fn analyze_temporal_function(
     catalog: &dyn Catalog,
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
-    use ColumnType::{Date, Float, Interval, Text, Time, Timestamp, TimestampTz};
+    use ColumnType::{Date, Float, Interval, Text, Time, TimeTz, Timestamp, TimestampTz};
     use ast::ScalarFunc as F;
     let name = func.name();
-    let is_temporal = |ty| matches!(ty, Date | Time | Timestamp | TimestampTz);
+    let is_temporal = |ty| matches!(ty, Date | Time | TimeTz | Timestamp | TimestampTz);
     // Rebuild a field-carrying call: the field name as a typed `Text` literal, then the source.
     let field_call = |src: TypedExpr, result, field| TypedExpr {
         kind: TypedExprKind::ScalarFunction {
@@ -3450,6 +3450,9 @@ fn is_extract_field(field: &str) -> bool {
             | "microseconds"
             | "milliseconds"
             | "julian"
+            | "timezone"
+            | "timezone_hour"
+            | "timezone_minute"
     )
 }
 

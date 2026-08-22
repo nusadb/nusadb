@@ -1379,8 +1379,13 @@ fn extract_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
     let value = match src {
         V::Date(days) => super::clock::day_start_micros(*days)
             .and_then(|micros| crate::temporal::extract_from_micros(field, micros)),
-        V::Timestamp(m) | V::TimestampTz(m) => crate::temporal::extract_from_micros(field, *m),
+        // A plain `timestamp`/`time` has no zone, so a zone field falls through to `None` (a loud
+        // error, like the reference engine). The `tz` variants read the offset — the session zone is
+        // UTC, so a `timestamptz` instant carries a zero offset.
+        V::Timestamp(m) => crate::temporal::extract_from_micros(field, *m),
+        V::TimestampTz(m) => crate::temporal::extract_timestamptz_field(field, *m, 0),
         V::Time(t) => crate::temporal::extract_time_field(field, *t),
+        V::TimeTz(packed) => crate::temporal::extract_timetz_field(field, *packed),
         V::Interval(iv) => crate::temporal::extract_interval_field(
             field,
             i64::from(iv.months),

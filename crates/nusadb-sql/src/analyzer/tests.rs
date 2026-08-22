@@ -2189,11 +2189,10 @@ fn temporal_functions_resolve_result_types() {
 
 #[test]
 fn temporal_functions_reject_bad_field_and_type_and_arity() {
-    // A recognized field NusaDB does not support (time-zone extraction is session-dependent).
-    assert!(matches!(
-        plan("SELECT EXTRACT(TIMEZONE FROM NOW())", &MockCatalog::new()),
-        Err(Error::Unsupported(_)),
-    ));
+    // Time-zone extraction is supported: NOW() is a TIMESTAMPTZ, whose offset is 0 under the UTC
+    // session zone, so the field resolves rather than being rejected.
+    assert!(plan("SELECT EXTRACT(TIMEZONE FROM NOW())", &MockCatalog::new()).is_ok());
+    // An unrecognized DATE_TRUNC precision is still a loud, unsupported-field error.
     assert!(matches!(
         plan("SELECT DATE_TRUNC('fortnight', NOW())", &MockCatalog::new()),
         Err(Error::Unsupported(_)),

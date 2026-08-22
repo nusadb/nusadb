@@ -518,3 +518,45 @@ SELECT
   EXTRACT(MILLENNIUM FROM INTERVAL '2500 years')
 ----
 2.000 2.000 2.000
+
+# --- EXTRACT on TIMETZ: local time-of-day fields, plus the zone fields ---
+# The local time-of-day is read as entered (independent of the offset).
+query RRR
+SELECT
+  EXTRACT(HOUR FROM TIMETZ '12:34:56.789+05:30'),
+  EXTRACT(MINUTE FROM TIMETZ '12:34:56.789+05:30'),
+  EXTRACT(SECOND FROM TIMETZ '12:34:56.789+05:30')
+----
+12.000 34.000 56.789
+
+# The zone fields: timezone is the offset in seconds, split into whole hours and minutes.
+query RRR
+SELECT
+  EXTRACT(TIMEZONE FROM TIMETZ '12:34:56.789+05:30'),
+  EXTRACT(TIMEZONE_HOUR FROM TIMETZ '12:34:56.789+05:30'),
+  EXTRACT(TIMEZONE_MINUTE FROM TIMETZ '12:34:56.789+05:30')
+----
+19800.000 5.000 30.000
+
+# A negative offset carries its sign into both the hour and minute fields.
+query RR
+SELECT
+  EXTRACT(TIMEZONE_HOUR FROM TIMETZ '12:00-08:00'),
+  EXTRACT(TIMEZONE_MINUTE FROM TIMETZ '12:00-05:30')
+----
+-8.000 -30.000
+
+# epoch of a timetz is the UTC-equivalent seconds-of-day (local minus offset).
+query R
+SELECT EXTRACT(EPOCH FROM TIMETZ '12:34:56.789+05:30')
+----
+25496.789
+
+# --- EXTRACT zone fields on TIMESTAMPTZ: the session zone is UTC, so the offset is zero ---
+query RRR
+SELECT
+  EXTRACT(TIMEZONE FROM TIMESTAMPTZ '2024-06-15 12:00:00+00'),
+  EXTRACT(TIMEZONE_HOUR FROM TIMESTAMPTZ '2024-06-15 12:00:00+00'),
+  EXTRACT(TIMEZONE_MINUTE FROM TIMESTAMPTZ '2024-06-15 12:00:00+00')
+----
+0.000 0.000 0.000

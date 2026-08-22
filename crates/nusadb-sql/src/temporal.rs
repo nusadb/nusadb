@@ -646,6 +646,57 @@ pub fn extract_time_field(field: &str, tod_micros: i64) -> Option<f64> {
     Some(val)
 }
 
+/// The three `EXTRACT` zone fields shared by `timestamptz` and `timetz`, from a UTC offset east of
+/// UTC in whole seconds.
+///
+/// `timezone` is that offset in seconds, `timezone_hour` its whole hours, and `timezone_minute` its
+/// leftover whole minutes (both keeping the offset's sign). `None` for any other field, so the caller
+/// can fall through to its non-zone fields.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "EXTRACT yields a double-precision number; the offset fits comfortably in an f64"
+)]
+fn extract_zone_field(field: &str, offset_east_secs: i64) -> Option<f64> {
+    let val = match field {
+        "timezone" => offset_east_secs as f64,
+        "timezone_hour" => (offset_east_secs / 3600) as f64,
+        "timezone_minute" => ((offset_east_secs % 3600) / 60) as f64,
+        _ => return None,
+    };
+    Some(val)
+}
+
+/// `EXTRACT(field FROM timestamptz)` for the UTC instant `micros` under a session whose offset east
+/// of UTC is `offset_east_secs`.
+///
+/// The zone fields read the offset; every other field reads the instant (already the session-local
+/// wall clock, since the engine's session zone is UTC).
+#[must_use]
+pub fn extract_timestamptz_field(field: &str, micros: i64, offset_east_secs: i64) -> Option<f64> {
+    extract_zone_field(field, offset_east_secs).or_else(|| extract_from_micros(field, micros))
+}
+
+/// `EXTRACT(field FROM timetz)` for a packed `timetz`.
+///
+/// The zone fields read the value's own offset, `epoch` is the UTC-equivalent seconds-of-day (local
+/// minus offset), and every other field reads the local (as-entered) time-of-day.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "EXTRACT yields a double-precision number; a seconds-of-day count fits in an f64"
+)]
+pub fn extract_timetz_field(field: &str, packed: i64) -> Option<f64> {
+    let offset_east_secs = timetz_offset_east_secs(packed);
+    let local = timetz_local_micros(packed);
+    if let Some(zone) = extract_zone_field(field, offset_east_secs) {
+        return Some(zone);
+    }
+    if field == "epoch" {
+        return Some((local - offset_east_secs * MICROS_PER_SEC) as f64 / MICROS_PER_SEC as f64);
+    }
+    extract_time_field(field, local)
+}
+
 /// `DATE_TRUNC(field, ts)` — `ts` (epoch micros) floored to the start of the named precision.
 /// Returns `None` for an unrecognised field. `week` truncates to the preceding Monday 00:00.
 #[must_use]
@@ -1801,6 +1852,44 @@ mod tests {
         assert_eq!(extract_time_field("second", tod), Some(30.0));
         // A calendar field is meaningless for TIME.
         assert_eq!(extract_time_field("year", tod), None);
+    }
+
+    #[test]
+    fn extract_timetz_fields_match_the_reference_engine() {
+        // 12:34:56.789 with a +05:30 zone.
+        let tt = parse_timetz("12:34:56.789+05:30").unwrap();
+        // Local time-of-day fields.
+        assert_eq!(extract_timetz_field("hour", tt), Some(12.0));
+        assert_eq!(extract_timetz_field("minute", tt), Some(34.0));
+        assert_eq!(extract_timetz_field("second", tt), Some(56.789));
+        // Zone fields read the offset (east positive).
+        assert_eq!(extract_timetz_field("timezone", tt), Some(19800.0));
+        assert_eq!(extract_timetz_field("timezone_hour", tt), Some(5.0));
+        assert_eq!(extract_timetz_field("timezone_minute", tt), Some(30.0));
+        // epoch is the UTC-equivalent seconds-of-day (local minus offset).
+        assert_eq!(extract_timetz_field("epoch", tt), Some(25496.789));
+        // A negative offset carries its sign into both hour and minute.
+        let west = parse_timetz("12:00-08:00").unwrap();
+        assert_eq!(extract_timetz_field("timezone_hour", west), Some(-8.0));
+        let half = parse_timetz("12:00-05:30").unwrap();
+        assert_eq!(extract_timetz_field("timezone_minute", half), Some(-30.0));
+    }
+
+    #[test]
+    fn extract_timestamptz_zone_fields_are_zero_under_utc() {
+        let ts = parse_timestamp("2024-06-15 12:00:00").unwrap();
+        // The session zone is UTC, so a timestamptz instant carries a zero offset.
+        assert_eq!(extract_timestamptz_field("timezone", ts, 0), Some(0.0));
+        assert_eq!(extract_timestamptz_field("timezone_hour", ts, 0), Some(0.0));
+        assert_eq!(
+            extract_timestamptz_field("timezone_minute", ts, 0),
+            Some(0.0)
+        );
+        // A non-zone field still reads the instant.
+        assert_eq!(extract_timestamptz_field("hour", ts, 0), Some(12.0));
+        // A plain timestamp errors on a zone field: that path never calls this helper, and here the
+        // instant-based fallback has no zone field, so the caller surfaces the error.
+        assert_eq!(extract_from_micros("timezone", ts), None);
     }
 
     #[test]
