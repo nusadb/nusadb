@@ -612,6 +612,17 @@ fn eval_scalar_function(
         (F::XmlIsWellFormedDocument, [Text(s)]) => {
             ast::Value::Bool(crate::xml::validate(s, crate::xml::XmlMode::Document).is_ok())
         },
+        // XMLCOMMENT(text): wrap in `<!--...-->`. The content must not contain `--` or end with `-`,
+        // which would break the comment syntax — a loud error, matching the reference engine.
+        (F::XmlComment, [Text(s)]) => {
+            if s.contains("--") || s.ends_with('-') {
+                return Err(Error::Coded {
+                    message: "invalid XML comment".to_owned(),
+                    sqlstate: "2200S", // invalid_xml_comment
+                });
+            }
+            ast::Value::Xml(format!("<!--{s}-->"))
+        },
         (F::Sha224, [Text(s)]) => Text(super::crypto::sha224_hex(s)),
         (F::Sha256, [Text(s)]) => Text(super::crypto::sha256_hex(s)),
         (F::Sha384, [Text(s)]) => Text(super::crypto::sha384_hex(s)),

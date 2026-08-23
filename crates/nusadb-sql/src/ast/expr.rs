@@ -951,6 +951,9 @@ pub enum ScalarFunc {
     /// `XML_IS_WELL_FORMED_CONTENT(text)` — whether `text` is well-formed XML content (a fragment;
     /// bare text and multiple top-level nodes allowed), as `BOOL`.
     XmlIsWellFormedContent,
+    /// `XMLCOMMENT(text)` — an XML comment node `<!--text-->`, as `XML`. `text` must not contain `--`
+    /// or end with `-` (a loud error otherwise).
+    XmlComment,
     /// `JSONB_STRIP_NULLS(json)` — recursively drop object members whose value is JSON `null`, as
     /// `JSON`.
     JsonbStripNulls,
@@ -1267,6 +1270,7 @@ impl ScalarFunc {
             Self::XmlIsWellFormed => "xml_is_well_formed",
             Self::XmlIsWellFormedDocument => "xml_is_well_formed_document",
             Self::XmlIsWellFormedContent => "xml_is_well_formed_content",
+            Self::XmlComment => "xmlcomment",
             Self::JsonbStripNulls => "jsonb_strip_nulls",
             Self::JsonbPretty => "jsonb_pretty",
             Self::JsonbPathExists => "jsonb_path_exists",

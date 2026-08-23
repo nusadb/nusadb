@@ -1491,6 +1491,8 @@ pub(super) fn analyze_scalar_function(
         F::XmlIsWellFormed | F::XmlIsWellFormedDocument | F::XmlIsWellFormedContent => {
             ScalarSig::Fixed(&[Text], &[], ColumnType::Bool)
         },
+        // XMLCOMMENT(text) → XML.
+        F::XmlComment => ScalarSig::Fixed(&[Text], &[], ColumnType::Xml),
         // SUBSTRING is intercepted by `analyze_substring` above (its positional-vs-regex form
         // is dispatched on the second argument's type) and never reaches this table.
         F::Substring => {

@@ -79,3 +79,16 @@ query I
 SELECT CAST(XML_IS_WELL_FORMED(NULL) AS INT)
 ----
 NULL
+
+# --- xmlcomment: build an XML comment node ---
+query T
+SELECT CAST(XMLCOMMENT('hello') AS TEXT)
+----
+<!--hello-->
+
+# Content that would break the comment syntax (contains -- or ends with -) is a loud error.
+statement error
+SELECT XMLCOMMENT('a--b')
+
+statement error
+SELECT XMLCOMMENT('trailing-')
