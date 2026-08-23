@@ -1067,6 +1067,10 @@ pub(super) fn analyze_scalar_function(
     if matches!(func, F::JsonExtractPath | F::JsonExtractPathText) {
         return analyze_json_extract_path(func, args, scope, catalog, aggregates);
     }
+    // XMLCONCAT(VARIADIC xml) is variadic — not table-shaped.
+    if matches!(func, F::XmlConcat) {
+        return analyze_xmlconcat(args, scope, catalog, aggregates);
+    }
     // CARDINALITY / ARRAY_NDIMS (→ INT) and ARRAY_DIMS (→ TEXT) take one array of any element type —
     // not expressible with the fixed table since the element type is polymorphic.
     if matches!(func, F::Cardinality | F::ArrayDims | F::ArrayNdims) {
@@ -1657,6 +1661,7 @@ pub(super) fn analyze_scalar_function(
         | F::TrimArray
         | F::JsonExtractPath
         | F::JsonExtractPathText
+        | F::XmlConcat
         | F::ArrayNdims
         | F::L2Distance
         | F::CosineDistance
@@ -2052,6 +2057,46 @@ fn analyze_array_mutate(
             args: typed_args,
         },
         ty: result_ty,
+    })
+}
+
+/// Analyze `XMLCONCAT(VARIADIC xml)`: one or more `XML` arguments, yielding `XML`. A bare `NULL`
+/// argument is allowed (skipped at evaluation).
+fn analyze_xmlconcat(
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    if args.is_empty() {
+        return Err(Error::FunctionArgs(
+            "xmlconcat() expects at least one argument".to_owned(),
+        ));
+    }
+    let mut analyzed = Vec::with_capacity(args.len());
+    for arg in args {
+        let value = analyze_expr_agg(
+            arg,
+            scope,
+            catalog,
+            Some(ColumnType::Xml),
+            aggregates.as_deref_mut(),
+        )?;
+        if value.ty != ColumnType::Xml && !is_null_literal(&value) {
+            return Err(Error::TypeMismatch {
+                context: "xmlconcat() argument".to_owned(),
+                expected: ColumnType::Xml,
+                found: value.ty,
+            });
+        }
+        analyzed.push(value);
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction {
+            func: ast::ScalarFunc::XmlConcat,
+            args: analyzed,
+        },
+        ty: ColumnType::Xml,
     })
 }
 

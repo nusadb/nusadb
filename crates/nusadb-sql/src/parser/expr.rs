@@ -1497,6 +1497,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "xml_is_well_formed_document" => F::XmlIsWellFormedDocument,
         "xml_is_well_formed_content" => F::XmlIsWellFormedContent,
         "xmlcomment" => F::XmlComment,
+        "xmlconcat" => F::XmlConcat,
         "jsonb_strip_nulls" | "json_strip_nulls" => F::JsonbStripNulls,
         "jsonb_pretty" | "json_pretty" => F::JsonbPretty,
         "jsonb_path_exists" | "json_path_exists" => F::JsonbPathExists,

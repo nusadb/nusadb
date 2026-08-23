@@ -92,3 +92,21 @@ SELECT XMLCOMMENT('a--b')
 
 statement error
 SELECT XMLCOMMENT('trailing-')
+
+# --- xmlconcat: concatenate XML values, skipping NULLs ---
+query T
+SELECT CAST(XMLCONCAT('<a/>'::XML, '<b>1</b>'::XML) AS TEXT)
+----
+<a/><b>1</b>
+
+# A NULL argument is skipped (not propagated).
+query T
+SELECT CAST(XMLCONCAT('<a/>'::XML, CAST(NULL AS XML), '<b/>'::XML) AS TEXT)
+----
+<a/><b/>
+
+# All-NULL yields NULL.
+query T
+SELECT CAST(XMLCONCAT(CAST(NULL AS XML), CAST(NULL AS XML)) AS TEXT)
+----
+NULL

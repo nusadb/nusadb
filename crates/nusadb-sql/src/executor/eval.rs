@@ -546,6 +546,9 @@ fn eval_scalar_function(
         // JSONB_SET_LAX treats a NULL new_value as meaningful (per its null_value_treatment), so it
         // must see its arguments rather than propagate the first NULL away.
         F::JsonbSetLax => return eval_jsonb_set_lax(args, row),
+        // XMLCONCAT skips NULL arguments (rather than propagating the first one) and yields NULL only
+        // when every argument is NULL, so it must inspect its arguments itself.
+        F::XmlConcat => return eval_xmlconcat(args, row),
         // QUOTE_NULLABLE renders a NULL argument as the unquoted text `NULL` (for dynamic SQL) instead
         // of propagating NULL, so it skips the NULL-strict collection below.
         F::QuoteNullable => return eval_quote_nullable(args, row),
@@ -2793,6 +2796,29 @@ fn eval_jsonb_set_lax(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error
             sqlstate: "22023",
         }),
     }
+}
+
+/// `XMLCONCAT(xml, ...)` — concatenate the argument `xml` values' text. NULL arguments are skipped
+/// (not propagated); the result is NULL only when every argument is NULL.
+fn eval_xmlconcat(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
+    let mut out = String::new();
+    let mut any = false;
+    for arg in args {
+        match eval(arg, row)? {
+            ast::Value::Xml(s) | ast::Value::Text(s) => {
+                out.push_str(&s);
+                any = true;
+            },
+            // A NULL argument is skipped (the analyzer admits only XML or a bare NULL, so any other
+            // value here is treated as a safe skip too).
+            _ => {},
+        }
+    }
+    Ok(if any {
+        ast::Value::Xml(out)
+    } else {
+        ast::Value::Null
+    })
 }
 
 /// `JSONB_INSERT(target, path, new_value [, insert_after])` — insert `new_value` at `path` without

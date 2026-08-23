@@ -954,6 +954,9 @@ pub enum ScalarFunc {
     /// `XMLCOMMENT(text)` — an XML comment node `<!--text-->`, as `XML`. `text` must not contain `--`
     /// or end with `-` (a loud error otherwise).
     XmlComment,
+    /// `XMLCONCAT(xml, ...)` — the concatenation of its `XML` arguments, as `XML`. `NULL` arguments
+    /// are skipped; all-`NULL` yields `NULL`.
+    XmlConcat,
     /// `JSONB_STRIP_NULLS(json)` — recursively drop object members whose value is JSON `null`, as
     /// `JSON`.
     JsonbStripNulls,
@@ -1271,6 +1274,7 @@ impl ScalarFunc {
             Self::XmlIsWellFormedDocument => "xml_is_well_formed_document",
             Self::XmlIsWellFormedContent => "xml_is_well_formed_content",
             Self::XmlComment => "xmlcomment",
+            Self::XmlConcat => "xmlconcat",
             Self::JsonbStripNulls => "jsonb_strip_nulls",
             Self::JsonbPretty => "jsonb_pretty",
             Self::JsonbPathExists => "jsonb_path_exists",
