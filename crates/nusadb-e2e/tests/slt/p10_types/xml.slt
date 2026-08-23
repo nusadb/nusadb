@@ -53,3 +53,29 @@ SELECT '<a></b>'::XML
 # ... and rejected on store into an XML column.
 statement error
 INSERT INTO xdoc VALUES (9, '<oops>')
+
+# --- xml_is_well_formed* : test well-formedness without raising an error ---
+
+# _document requires a single root; a fragment or malformed markup is not a document.
+query III
+SELECT XML_IS_WELL_FORMED_DOCUMENT('<a>1</a>'), XML_IS_WELL_FORMED_DOCUMENT('a<b/>c'), XML_IS_WELL_FORMED_DOCUMENT('<a>')
+----
+1 0 0
+
+# _content allows fragments and bare text, but still rejects malformed markup.
+query III
+SELECT XML_IS_WELL_FORMED_CONTENT('a<b/>c'), XML_IS_WELL_FORMED_CONTENT('notxml'), XML_IS_WELL_FORMED_CONTENT('<a></b>')
+----
+1 1 0
+
+# The unsuffixed form uses content semantics (the session default).
+query II
+SELECT XML_IS_WELL_FORMED('a<b/>c'), XML_IS_WELL_FORMED('<a>')
+----
+1 0
+
+# NULL propagates.
+query I
+SELECT CAST(XML_IS_WELL_FORMED(NULL) AS INT)
+----
+NULL

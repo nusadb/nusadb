@@ -942,6 +942,15 @@ pub enum ScalarFunc {
     /// `JSONB_SET`, but when `new_value` is SQL `NULL` the `null_value_treatment` decides the outcome:
     /// `use_json_null` (default), `delete_key`, `return_target`, or `raise_exception`.
     JsonbSetLax,
+    /// `XML_IS_WELL_FORMED(text)` — whether `text` is well-formed XML content, as `BOOL` (the
+    /// session default is CONTENT, so this matches [`Self::XmlIsWellFormedContent`]).
+    XmlIsWellFormed,
+    /// `XML_IS_WELL_FORMED_DOCUMENT(text)` — whether `text` is a well-formed XML document (single
+    /// root), as `BOOL`.
+    XmlIsWellFormedDocument,
+    /// `XML_IS_WELL_FORMED_CONTENT(text)` — whether `text` is well-formed XML content (a fragment;
+    /// bare text and multiple top-level nodes allowed), as `BOOL`.
+    XmlIsWellFormedContent,
     /// `JSONB_STRIP_NULLS(json)` — recursively drop object members whose value is JSON `null`, as
     /// `JSON`.
     JsonbStripNulls,
@@ -1255,6 +1264,9 @@ impl ScalarFunc {
             Self::JsonExtractPathText => "jsonb_extract_path_text",
             Self::JsonbSet => "jsonb_set",
             Self::JsonbSetLax => "jsonb_set_lax",
+            Self::XmlIsWellFormed => "xml_is_well_formed",
+            Self::XmlIsWellFormedDocument => "xml_is_well_formed_document",
+            Self::XmlIsWellFormedContent => "xml_is_well_formed_content",
             Self::JsonbStripNulls => "jsonb_strip_nulls",
             Self::JsonbPretty => "jsonb_pretty",
             Self::JsonbPathExists => "jsonb_path_exists",

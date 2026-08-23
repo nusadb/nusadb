@@ -605,6 +605,13 @@ fn eval_scalar_function(
         (F::Length, [ast::Value::Tsvector(v)]) => Int(i64::from(crate::fts::tsvector_length(v)?)),
         (F::Upper, [Text(s)]) => Text(s.to_uppercase()),
         (F::Lower, [Text(s)]) => Text(s.to_lowercase()),
+        // XML_IS_WELL_FORMED[_CONTENT] check content mode; the _DOCUMENT form checks a single root.
+        (F::XmlIsWellFormed | F::XmlIsWellFormedContent, [Text(s)]) => {
+            ast::Value::Bool(crate::xml::validate(s, crate::xml::XmlMode::Content).is_ok())
+        },
+        (F::XmlIsWellFormedDocument, [Text(s)]) => {
+            ast::Value::Bool(crate::xml::validate(s, crate::xml::XmlMode::Document).is_ok())
+        },
         (F::Sha224, [Text(s)]) => Text(super::crypto::sha224_hex(s)),
         (F::Sha256, [Text(s)]) => Text(super::crypto::sha256_hex(s)),
         (F::Sha384, [Text(s)]) => Text(super::crypto::sha384_hex(s)),

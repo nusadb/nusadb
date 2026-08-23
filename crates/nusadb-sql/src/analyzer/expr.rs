@@ -1487,6 +1487,10 @@ pub(super) fn analyze_scalar_function(
             &[ColumnType::Bool, ColumnType::Text],
             ColumnType::Json,
         ),
+        // XML_IS_WELL_FORMED[_DOCUMENT|_CONTENT](text) → BOOL.
+        F::XmlIsWellFormed | F::XmlIsWellFormedDocument | F::XmlIsWellFormedContent => {
+            ScalarSig::Fixed(&[Text], &[], ColumnType::Bool)
+        },
         // SUBSTRING is intercepted by `analyze_substring` above (its positional-vs-regex form
         // is dispatched on the second argument's type) and never reaches this table.
         F::Substring => {
