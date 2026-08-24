@@ -96,11 +96,16 @@ pub enum Error {
     #[error("{0}")]
     WrongObjectType(String),
 
-    /// A column reference that cannot stand where it stands: a name that matches two relations in
-    /// scope, an `ORDER BY`/`GROUP BY` ordinal past the end of the select list, or a column alias
-    /// list whose width disagrees with the query it names.
+    /// A column reference that cannot stand where it stands: an `ORDER BY`/`GROUP BY` ordinal past
+    /// the end of the select list, or a column alias list whose width disagrees with the query it
+    /// names. (An unqualified name matching two relations is [`Self::AmbiguousColumn`].)
     #[error("{0}")]
     InvalidColumnReference(String),
+
+    /// An unqualified column name that matches more than one relation in scope — it must be qualified
+    /// with a table name to disambiguate.
+    #[error("{0}")]
+    AmbiguousColumn(String),
 
     /// An aggregate used where the query's grouping cannot support it — a column neither grouped
     /// nor aggregated, an aggregate in a clause that has no grouping to speak of.
@@ -551,6 +556,7 @@ impl Error {
             | Self::IndexNotFound { .. }
             | Self::ObjectNotFound { .. } => "42704",
             Self::InvalidColumnReference(_) => "42P10", // invalid_column_reference
+            Self::AmbiguousColumn(_) => "42702",        // ambiguous_column
             Self::InvalidGrouping(_) => "42803",        // grouping_error
             Self::InvalidTableDefinition(_) => "42P16", // invalid_table_definition
             Self::GeneratedAlways(_) => "428C9",        // generated_always
@@ -761,6 +767,10 @@ mod tests {
                 "22023",
             ),
             (Error::DatetimeOverflow("year 300000".to_owned()), "22008"),
+            (
+                Error::AmbiguousColumn("column `a` is ambiguous".to_owned()),
+                "42702",
+            ),
         ];
         for (error, want) in cases {
             assert_eq!(

@@ -1616,7 +1616,7 @@ fn resolve_scoped(
             continue;
         }
         if found.is_some() {
-            return Err(Error::InvalidColumnReference(format!(
+            return Err(Error::AmbiguousColumn(format!(
                 "ambiguous column reference `{name}` — qualify it with a table name"
             )));
         }

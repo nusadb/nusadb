@@ -2223,6 +2223,20 @@ fn temporal_functions_reject_bad_field_and_type_and_arity() {
 }
 
 #[test]
+fn ambiguous_unqualified_column_reports_its_own_class() {
+    // `id` exists in both self-joined relations, so a bare reference is ambiguous. This is its own
+    // error class (SQLSTATE 42702, ambiguous_column) — distinct from the other invalid column
+    // references that share `InvalidColumnReference` (42P10).
+    let err = plan(
+        "SELECT id FROM users u JOIN users w ON u.id = w.id",
+        &catalog(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::AmbiguousColumn(_)), "got `{err}`");
+    assert_eq!(err.sqlstate(), "42702");
+}
+
+#[test]
 fn to_char_date_timestamp_resolve_result_types() {
     // TO_CHAR → Text, TO_DATE → Date, TO_TIMESTAMP → Timestamp.
     for (sql, ty) in [
