@@ -243,6 +243,8 @@ fn finalize_updated_row(
     }
     for (value, column) in row.iter_mut().zip(&table.columns) {
         row::adopt_column_type(value, column.ty);
+        // Enforce the `VARCHAR(n)`/`CHAR(n)` length after the SET assignments, matching INSERT.
+        row::coerce_char_length(value, column.ty)?;
     }
     Ok(row)
 }
@@ -802,6 +804,9 @@ fn insert_rows_with_unique(
         // what a later read decodes.
         for (value, ty) in full.iter_mut().zip(&schema) {
             row::adopt_column_type(value, *ty);
+            // A `VARCHAR(n)`/`CHAR(n)` value over the declared length errors (`22001`) here, before
+            // the row is written, unless the overflow is all trailing blanks (then it is truncated).
+            row::coerce_char_length(value, *ty)?;
         }
         full_rows.push(full);
     }

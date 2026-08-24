@@ -81,6 +81,37 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
     }
 }
 
+/// Apply a `VARCHAR(n)` / `CHAR(n)` column's declared length to a text value about to be written,
+/// in place. Every non-text value and every unbounded/non-character type is left untouched.
+///
+/// The rule mirrors the reference engine: a string longer than the declared length is an error —
+/// *unless* every character past the limit is a space, in which case the excess blanks are truncated
+/// and the value stored. `CHAR(n)` is blank-padded (bpchar); its trailing blanks are insignificant,
+/// so a value overflowing only by blanks is accepted under the same rule (the encoder then strips the
+/// remaining trailing blanks into the canonical form). Length is counted in characters, not bytes.
+pub(crate) fn coerce_char_length(value: &mut ast::Value, ty: ColumnType) -> Result<(), Error> {
+    let limit = match ty {
+        ColumnType::VarChar(n) | ColumnType::Char(n) => n as usize,
+        _ => return Ok(()),
+    };
+    let ast::Value::Text(s) = value else {
+        return Ok(());
+    };
+    // The byte offset of the char just past the limit; `None` means the string is within the limit.
+    let Some((cut, _)) = s.char_indices().nth(limit) else {
+        return Ok(());
+    };
+    if s[cut..].bytes().all(|b| b == b' ') {
+        // The overflow is all trailing blanks — truncate to the declared length and keep the value.
+        s.truncate(cut);
+        Ok(())
+    } else {
+        Err(Error::StringTooLong {
+            ty: super::ddl::type_name(ty),
+        })
+    }
+}
+
 /// Decode a stored tuple back into a [`Row`].
 pub(crate) fn decode(bytes: &[u8], schema: &[ColumnType]) -> Result<Row, Error> {
     let mut row = Vec::with_capacity(schema.len());

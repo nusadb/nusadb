@@ -448,6 +448,14 @@ pub enum Error {
         value: String,
     },
 
+    /// A character string is longer than its column's declared `VARCHAR(n)` / `CHAR(n)` length, and
+    /// the overflow is not all trailing blanks (which would be truncated silently). SQLSTATE `22001`.
+    #[error("value too long for type {ty}")]
+    StringTooLong {
+        /// The declared character type whose length was exceeded, already rendered (`VARCHAR(5)`).
+        ty: String,
+    },
+
     /// A regular-expression argument to a `REGEXP_*` function failed to compile —
     /// an invalid pattern or an unsupported flag character.
     #[error("invalid regular expression: {0}")]
@@ -589,7 +597,8 @@ impl Error {
             // invalid_datetime_format (22007), everything else is invalid_text_representation (22P02).
             Self::InvalidValue { ty, .. } if is_datetime(*ty) => "22007",
             Self::InvalidValue { .. } => "22P02",
-            Self::InvalidRegex(_) => "2201B", // invalid_regular_expression
+            Self::StringTooLong { .. } => "22001", // string_data_right_truncation
+            Self::InvalidRegex(_) => "2201B",      // invalid_regular_expression
             // invalid_parameter_value — the argument's type is right, its value is not.
             Self::InvalidParameterValue(_) => "22023",
             Self::DatetimeOverflow(_) => "22008", // datetime_field_overflow
@@ -770,6 +779,12 @@ mod tests {
             (
                 Error::AmbiguousColumn("column `a` is ambiguous".to_owned()),
                 "42702",
+            ),
+            (
+                Error::StringTooLong {
+                    ty: "VARCHAR(5)".to_owned(),
+                },
+                "22001",
             ),
         ];
         for (error, want) in cases {

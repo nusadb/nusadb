@@ -1,9 +1,10 @@
 # p1_ddl/varchar_length — VARCHAR(n) / CHAR(n) length is enforced (D3, friend-QA R44) and the
 # declared type round-trips in DDL.
 #
-# VARCHAR(n)/CHAR(n) are stored as TEXT but keep n so `SHOW COLUMNS` reports the declared type; the
-# length is enforced by a desugared CHECK (length(col) <= n). A present value over the limit is
-# rejected; NULL is allowed; an unbounded VARCHAR (no length) imposes no limit and reports as TEXT.
+# VARCHAR(n)/CHAR(n) are stored as TEXT but keep n so `SHOW COLUMNS` reports the declared type. The
+# length is enforced at write time: a value over the limit is rejected (string_data_right_truncation),
+# except when the overflow is all trailing blanks, which is truncated to the limit and stored. NULL is
+# allowed; an unbounded VARCHAR (no length) imposes no limit and reports as TEXT.
 
 statement ok
 CREATE TABLE t (id INT NOT NULL, s VARCHAR(5))
@@ -35,13 +36,19 @@ INSERT INTO t VALUES (4, 'abcdef')
 statement error
 UPDATE t SET s = 'waytoolong' WHERE id = 1
 
-# Only the rows that satisfied the constraint are present.
+# Blank-only overflow is accepted for VARCHAR too: the excess trailing spaces are truncated to the
+# limit and the remaining value stored ('abcde  ' -> 'abcde'), matching the varying-length rule.
+statement ok
+INSERT INTO t VALUES (5, 'abcde  ')
+
+# Only the rows that satisfied the constraint are present; the blank-overflow row stored 'abcde'.
 query IT
 SELECT id, s FROM t ORDER BY id
 ----
 1 abc
 2 abcde
 3 NULL
+5 abcde
 
 # --- CHAR(n): blank-padded (bpchar) — trailing blanks are insignificant for length, equality, and
 # the length limit (a value overflowing only by trailing blanks is accepted; non-blank overflow is

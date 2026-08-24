@@ -3471,6 +3471,47 @@ fn out_of_range_date_reports_field_overflow_not_bad_format() {
     assert_eq!(one("SELECT DATE '2024-02-29'"), Value::Date(19782));
 }
 
+/// A character value longer than its column's declared `VARCHAR(n)`/`CHAR(n)` length is a
+/// string-data-right-truncation (22001) — unless the overflow is all trailing blanks, which is
+/// truncated to the limit and stored. The reference engine draws the same line.
+#[test]
+fn char_length_overflow_is_string_truncation_or_blank_trimmed() {
+    let engine = MockEngine::new();
+    run("CREATE TABLE cv (v VARCHAR(5))", &engine).unwrap();
+    run("CREATE TABLE ck (k CHAR(3))", &engine).unwrap();
+
+    // Non-blank overflow -> 22001 for both varchar and char.
+    let e = run("INSERT INTO cv VALUES ('abcdef')", &engine).unwrap_err();
+    assert_eq!(e.sqlstate(), "22001", "varchar overflow: {e}");
+    let e = run("INSERT INTO ck VALUES ('abcd')", &engine).unwrap_err();
+    assert_eq!(e.sqlstate(), "22001", "char overflow: {e}");
+
+    // An UPDATE that would overflow is rejected the same way.
+    run("INSERT INTO cv VALUES ('ok')", &engine).unwrap();
+    let e = run("UPDATE cv SET v = 'waytoolong' WHERE v = 'ok'", &engine).unwrap_err();
+    assert_eq!(e.sqlstate(), "22001", "update overflow: {e}");
+
+    // Blank-only overflow is accepted: varchar truncates to the limit (keeps its remaining blanks),
+    // char stores its canonical blank-stripped form. Values at/under the limit are untouched.
+    run("DELETE FROM cv", &engine).unwrap();
+    run("INSERT INTO cv VALUES ('abcde  '), ('abc')", &engine).unwrap();
+    run("INSERT INTO ck VALUES ('ab   '), ('xy')", &engine).unwrap();
+
+    let v: Vec<String> = rows_of(run("SELECT v FROM cv ORDER BY v", &engine).unwrap())
+        .1
+        .into_iter()
+        .map(|mut r| match r.remove(0) {
+            Value::Text(s) => s,
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(v, vec!["abc".to_owned(), "abcde".to_owned()]);
+
+    // CHAR is blank-padded: both stored values are their canonical (trimmed) form.
+    let lens = rows_of(run("SELECT length(k) FROM ck ORDER BY k", &engine).unwrap()).1;
+    assert_eq!(lens, vec![vec![Value::Int(2)], vec![Value::Int(2)]]);
+}
+
 /// (QA): a `DELETE ... RETURNING` CTE — the archive-then-remove pattern —
 /// runs once, its returned rows form the relation, and the deletion is real. INSERT/UPDATE
 /// CTEs already worked; DELETE was rejected only because a stale parser comment predated the
