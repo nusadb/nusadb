@@ -448,12 +448,13 @@ mod tests {
         }
     }
 
-    /// Dump realistic 128-dim vectors and this kernel's four distances (full `f64` precision) so an
-    /// external harness can differential them against pgvector. A no-op unless `VEC_DIFF_OUT` names an
-    /// output file; ignored so it never runs in the normal suite. The printed vectors use the exact
-    /// round-trippable `f32` text, so pgvector parses the identical values.
+    /// Dump realistic 128-dim vectors and this kernel's four distances (full `f64` precision) so
+    /// an external harness can differential them against a reference implementation. A no-op
+    /// unless `VEC_DIFF_OUT` names an output file; ignored so it never runs in the normal suite.
+    /// The printed vectors use the exact round-trippable `f32` text, so the reference parses the
+    /// identical values.
     #[test]
-    #[ignore = "differential dump for the pgvector harness; set VEC_DIFF_OUT and run --ignored"]
+    #[ignore = "differential dump for the reference harness; set VEC_DIFF_OUT and run --ignored"]
     fn differential_dump() {
         use std::fmt::Write as _;
         let Ok(path) = std::env::var("VEC_DIFF_OUT") else {
