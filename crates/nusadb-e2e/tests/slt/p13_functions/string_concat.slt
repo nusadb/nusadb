@@ -48,3 +48,22 @@ SELECT id, first || last FROM people WHERE id <> 3 ORDER BY id
 # Non-text operands are rejected (no implicit cast to text).
 statement error
 SELECT 1 || 2
+
+# --- bool concatenation: `||` coerces its operand via the text CAST, so a boolean renders
+# true/false (like ::text) — unlike concat()/concat_ws(), which use the type output function (t/f). ---
+query TT
+SELECT 'x' || true, 'y' || false
+----
+xtrue yfalse
+
+# A mixed || chain coerces each non-text operand via its cast (bool, int, numeric).
+query T
+SELECT 'x' || true || 1 || 2.5
+----
+xtrue12.5
+
+# Regression: concat() and concat_ws() keep the type output form (t/f), NOT true/false.
+query TT
+SELECT concat('x', true, false), concat_ws(',', 'x', true, false)
+----
+xtf x,t,f

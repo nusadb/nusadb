@@ -2534,6 +2534,22 @@ fn text_output(value: ast::Value) -> Result<String, Error> {
     }
 }
 
+/// The text a `||` operand coerces to. Unlike [`text_output`] (used by `concat`/`concat_ws`, which
+/// render a boolean via the type output function as `t`/`f`), the `||` operator coerces via the text
+/// CAST, so a boolean renders `true`/`false` — matching the reference engine, where `'x' || true` is
+/// `xtrue` while `concat('x', true)` is `xt`.
+fn concat_operand_text(value: ast::Value) -> Result<String, Error> {
+    match value {
+        ast::Value::Text(s) => Ok(s),
+        other => match cast_value(other, ColumnType::Text)? {
+            ast::Value::Text(s) => Ok(s),
+            _ => Err(Error::Internal(
+                "cast to TEXT did not yield text".to_owned(),
+            )),
+        },
+    }
+}
+
 /// `INT4RANGE(lo, hi [, bounds])` and its siblings — build a range from two bounds.
 ///
 /// A `NULL` bound means unbounded on that side, so this does not propagate NULL the way a strict
@@ -6425,10 +6441,10 @@ fn apply_concat(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Err
         // One text side coerces the other scalar to its text output — the
         // analyzer's `check_concat` admits exactly the textout-able scalar set.
         (Text(a), other) if !matches!(other, Array(_) | Bytes(_)) => {
-            Text(format!("{a}{}", text_output(other.clone())?))
+            Text(format!("{a}{}", concat_operand_text(other.clone())?))
         },
         (other, Text(b)) if !matches!(other, Array(_) | Bytes(_)) => {
-            Text(format!("{}{b}", text_output(other.clone())?))
+            Text(format!("{}{b}", concat_operand_text(other.clone())?))
         },
         // BYTEA concatenation: append the two byte strings.
         (Bytes(a), Bytes(b)) => {

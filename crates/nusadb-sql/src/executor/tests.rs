@@ -3386,8 +3386,9 @@ fn surface_batch_multi_drop_and_select_into() {
     assert!(parse("SELECT v INTO TEMPORARY t2 FROM src").is_err());
 }
 
-/// Gaps (QA routing): `||`/CONCAT coerce textout-able scalars to text — booleans render
-/// `t`/`f` via the output function, unlike CAST's `true`/`false`; a bare JSON
+/// Gaps (QA routing): `||`/CONCAT coerce textout-able scalars to text. The two differ on booleans,
+/// matching the reference engine: `CONCAT`/`CONCAT_WS` use the type output function (`t`/`f`), while
+/// the `||` operator coerces via the text cast (`true`/`false`, like `::text`). A bare JSON
 /// number/boolean casts to the numeric/bool target while objects/arrays/strings stay refused;
 /// `LENGTH`/`OCTET_LENGTH` over BYTEA count octets, `BIT_LENGTH` 8x.
 #[test]
@@ -3403,7 +3404,8 @@ fn q47_concat_coerce_json_scalar_cast_bytea_length() {
     );
     assert_eq!(one("SELECT 5 || 'x'"), Value::Text("5x".into()));
     assert_eq!(one("SELECT 'v: ' || 1.5"), Value::Text("v: 1.5".into()));
-    assert_eq!(one("SELECT 'b=' || FALSE"), Value::Text("b=f".into()));
+    // `||` coerces via the cast, so a boolean is `false` here (CONCAT above renders it `t`/`f`).
+    assert_eq!(one("SELECT 'b=' || FALSE"), Value::Text("b=false".into()));
     assert_eq!(
         one("SELECT CONCAT_WS('-', 'a', 2, NULL, TRUE)"),
         Value::Text("a-2-t".into())
