@@ -788,13 +788,9 @@ pub fn calendar_age(end: i64, start: i64) -> (i32, i32, i64) {
         d -= 1;
     }
     if d < 0 {
-        // Borrow the length of the month preceding the later instant's month.
-        let (py, pm) = if mon1 == 1 {
-            (y1 - 1, 12)
-        } else {
-            (y1, mon1 - 1)
-        };
-        d += days_in_month(py, pm);
+        // Borrow one month's worth of days, counted as the length of the *earlier* instant's own
+        // month (matching the reference engine — not the month preceding the later instant).
+        d += days_in_month(y2, mon2);
         mon -= 1;
     }
     if mon < 0 {
@@ -1951,14 +1947,34 @@ mod tests {
     fn calendar_age_borrows_across_month_and_is_antisymmetric() {
         let later = parse_timestamp("2024-03-01 00:00:00").unwrap();
         let earlier = parse_timestamp("2024-01-15 00:00:00").unwrap();
-        // 2024-01-15 + 1 month + 15 days = 2024-03-01 (Feb 2024 has 29 days).
-        assert_eq!(calendar_age(later, earlier), (1, 15, 0));
+        // A day borrow counts the *earlier* instant's own month: 1-15 borrows January's 31 days,
+        // giving 17, not February's 29 (oracle-checked: `1 mon 17 days`).
+        assert_eq!(calendar_age(later, earlier), (1, 17, 0));
         // Swapping negates every component.
-        assert_eq!(calendar_age(earlier, later), (-1, -15, 0));
+        assert_eq!(calendar_age(earlier, later), (-1, -17, 0));
         // Sub-day difference lands entirely in the micros component.
         let a = parse_timestamp("2024-01-01 12:00:00").unwrap();
         let b = parse_timestamp("2024-01-01 10:30:00").unwrap();
         assert_eq!(calendar_age(a, b), (0, 0, 90 * 60 * MICROS_PER_SEC));
+
+        // The borrow always uses the earlier date's month length, across leap and non-leap years and
+        // every earlier-month length — each oracle-checked against the reference engine.
+        let age = |e: &str, s: &str| {
+            calendar_age(
+                parse_timestamp(&format!("{e} 00:00:00")).unwrap(),
+                parse_timestamp(&format!("{s} 00:00:00")).unwrap(),
+            )
+        };
+        // Earlier month = January (31): the finding's own case.
+        assert_eq!(age("2024-03-01", "2023-01-15"), (13, 17, 0));
+        // Earlier month = November (30).
+        assert_eq!(age("2024-01-01", "2023-11-30"), (1, 1, 0));
+        // Earlier month = February, leap (29) vs non-leap (28) vs 1900 (28, not a leap year).
+        assert_eq!(age("2024-03-10", "2024-02-20"), (0, 19, 0));
+        assert_eq!(age("2023-03-10", "2023-02-20"), (0, 18, 0));
+        assert_eq!(age("1900-03-01", "1900-02-15"), (0, 14, 0));
+        // Earlier month = December (31), crossing the year with a month-underflow borrow too.
+        assert_eq!(age("2023-03-01", "2022-12-15"), (2, 17, 0));
     }
 
     // ----: TO_CHAR / TO_DATE / TO_TIMESTAMP format engine ----
