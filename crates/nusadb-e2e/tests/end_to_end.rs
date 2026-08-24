@@ -11614,3 +11614,129 @@ fn merge_can_empty_a_self_referencing_table() {
         vec![vec![Value::Int(3)]]
     );
 }
+
+/// Renumbering a self-referencing table works when the key and the references to it move together,
+/// and is still refused when only the key moves.
+///
+/// Two checks have to agree for this: one refuses a child pointing at a key that does not exist,
+/// the other refuses moving a key out from under a child. Each reads the table as it stands before
+/// the statement, so each on its own saw a violation that the finished statement does not have.
+/// Repairing either alone only changes which one rejects — the per-side mutations below hold that.
+#[test]
+fn a_self_referencing_key_and_its_references_can_move_together() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, p INT REFERENCES t(id))",
+    );
+    run(&engine, "INSERT INTO t VALUES (1,NULL),(2,1),(3,2)");
+
+    // Both move: nothing dangles once the statement finishes.
+    run(&engine, "UPDATE t SET id = id + 10, p = p + 10");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, p FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(11), Value::Null],
+            vec![Value::Int(12), Value::Int(11)],
+            vec![Value::Int(13), Value::Int(12)]
+        ]
+    );
+
+    // Only the key moves: the references are left pointing at keys that are gone, so it is refused
+    // — and refused without writing.
+    let err = run_try(&engine, "UPDATE t SET id = id + 10")
+        .expect_err("the children would be left pointing at keys that no longer exist");
+    assert_eq!(err.sqlstate(), "23503", "got {err}");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, p FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(11), Value::Null],
+            vec![Value::Int(12), Value::Int(11)],
+            vec![Value::Int(13), Value::Int(12)]
+        ],
+        "a refused update must leave every row as it was"
+    );
+
+    // A single row moving onto a key that this same statement is not touching still resolves.
+    run(&engine, "UPDATE t SET p = 11 WHERE id = 13");
+    assert_eq!(
+        rows(run(&engine, "SELECT p FROM t WHERE id = 13")),
+        vec![vec![Value::Int(11)]]
+    );
+}
+
+/// A repairing `ON UPDATE` action cannot reach a row the statement is itself rewriting, so the
+/// statement is refused rather than having the repair silently dropped.
+///
+/// This is the shape that made letting key and reference move together dangerous. The child check
+/// now accepts a reference to a key this statement creates, which lets execution reach the parent
+/// check; that check correctly finds a row still pointing at the departing key and asks `CASCADE`
+/// to repair it — but the repair goes through a row rewrite, and the statement's own write loop
+/// then puts its version at that row afterwards, discarding it. The table was left violating its
+/// own foreign key with nothing reported. A loud refusal is the honest answer.
+#[test]
+fn an_on_update_action_that_would_be_overwritten_is_refused() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, p INT REFERENCES t(id) ON UPDATE CASCADE)",
+    );
+    run(&engine, "INSERT INTO t VALUES (1,NULL),(2,1),(3,2)");
+
+    // Row 3 moves its reference onto the new key 12; row 2 keeps pointing at the departing key 1,
+    // so CASCADE would have to repair row 2 — which this same statement is rewriting.
+    let err = run_try(
+        &engine,
+        "UPDATE t SET id = id + 10, p = CASE WHEN p = 2 THEN 12 ELSE p END",
+    )
+    .expect_err("the cascade repair would be overwritten by the statement's own write");
+    assert_eq!(err.sqlstate(), "23503", "got {err}");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, p FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Int(1)],
+            vec![Value::Int(3), Value::Int(2)]
+        ],
+        "refused, and nothing written — the table must not be left referencing a key that is gone"
+    );
+
+    // Moving the reference along with the key needs no action at all, so it still works.
+    run(&engine, "UPDATE t SET id = id + 10, p = p + 10");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, p FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(11), Value::Null],
+            vec![Value::Int(12), Value::Int(11)],
+            vec![Value::Int(13), Value::Int(12)]
+        ]
+    );
+}
+
+/// The same key-and-reference move through `MERGE`, whose update path has its own caller for both
+/// checks and had no test of its own.
+#[test]
+fn merge_can_renumber_a_self_referencing_table() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, p INT REFERENCES t(id))",
+    );
+    run(&engine, "INSERT INTO t VALUES (1,NULL),(2,1),(3,2)");
+    run(&engine, "CREATE TABLE bump (id INT)");
+    run(&engine, "INSERT INTO bump VALUES (1),(2),(3)");
+
+    run(
+        &engine,
+        "MERGE INTO t USING bump ON t.id = bump.id \
+         WHEN MATCHED THEN UPDATE SET id = t.id + 10, p = t.p + 10",
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT id, p FROM t ORDER BY id")),
+        vec![
+            vec![Value::Int(11), Value::Null],
+            vec![Value::Int(12), Value::Int(11)],
+            vec![Value::Int(13), Value::Int(12)]
+        ]
+    );
+}

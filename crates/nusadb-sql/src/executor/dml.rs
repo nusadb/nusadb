@@ -2466,10 +2466,66 @@ fn table_is_fk_parent(table: &TableSchema, engine: &dyn StorageEngine) -> Result
 /// PRIMARY KEY changed, apply each pointing foreign key's `ON UPDATE` action to the children that
 /// referenced the *old* key — `NO ACTION`/`RESTRICT` (reject), `CASCADE` (rewrite the child FK to
 /// the new key), or `SET NULL` (null the child FK). `SET DEFAULT` is rejected (no column DEFAULT).
-/// `changes` are `(old_row, new_row)` pairs for the rows being updated.
+/// Refuse when a repairing `ON UPDATE` action would have to rewrite a row this statement is already
+/// rewriting.
+///
+/// The repair goes through `engine.update`, and the statement's own write loop then puts its
+/// version at that row afterwards, discarding it — leaving the table referencing a key that is
+/// gone, with nothing reported. Refusing is the honest answer. It can only arise for a
+/// self-referencing key, which is the only case where `post` is non-empty.
+fn refuse_action_the_statement_would_overwrite(
+    table: &TableSchema,
+    fk: &nusadb_core::ForeignKeyDef,
+    child_ordinals: &[usize],
+    referencing: &[(Tid, Row)],
+    post: &HashMap<Tid, &Row>,
+) -> Result<(), Error> {
+    if !matches!(
+        fk.on_update,
+        nusadb_core::FkAction::Cascade | nusadb_core::FkAction::SetNull
+    ) {
+        return Ok(());
+    }
+    let Some((tid, crow)) = referencing.iter().find(|(tid, _)| post.contains_key(tid)) else {
+        return Ok(());
+    };
+    // The row is in `referencing` because of the image it *will* have, so report that image. The
+    // stored one can carry a different reference entirely, and the sentence below would then name a
+    // value that has nothing to do with the refusal.
+    let crow = post.get(tid).copied().unwrap_or(crow);
+    // Name the row by the key it references, not by where it sits: a page and slot mean nothing to
+    // the caller, and the advice below is about a row they have to be able to find. Only the
+    // foreign-key columns — they identify the row for this purpose, and every other column of it
+    // would be carried into a client-visible error for no reason.
+    let referenced = child_ordinals
+        .iter()
+        .filter_map(|&ordinal| crow.get(ordinal))
+        .map(|v| format!("{v:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(nusadb_core::Error::ConstraintViolation(format!(
+        "update on \"{}\" violates foreign key \"{}\": the row ({referenced}) both \
+         references the old key and is rewritten by this statement, so the ON UPDATE action \
+         cannot be applied to it — give that row its new reference in this statement instead",
+        table.name, fk.name
+    ))
+    .into())
+}
+
+/// Refuse a key change that would strand a child row, and carry out `ON UPDATE` propagation for
+/// the ones that are allowed.
+///
+/// `changes` carries tids because for a self-referencing table the child being scanned *is* this
+/// table, and the scan returns each row as it stands *before* the statement. A row that is itself
+/// moving its reference onto the new key would otherwise be read in its old shape and counted as
+/// stranded — so a key and the references to it could never move together, and such a table could
+/// never be renumbered.
+///
+/// Where the delete side subtracts the statement's own rows, this one substitutes them: a child in
+/// the change set is judged by the image it will have, not the one it has.
 fn enforce_fk_on_parent_update(
     table: &TableSchema,
-    changes: &[(Row, Row)],
+    changes: &[(Tid, Row, Row)],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -2494,7 +2550,13 @@ fn enforce_fk_on_parent_update(
             ))
         })?;
         let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
-        for (old, new) in changes {
+        // For a self-referencing key, the post-statement image of every row this statement moves.
+        let post: HashMap<Tid, &Row> = if fk.child_table == table.id {
+            changes.iter().map(|(tid, _, new)| (*tid, new)).collect()
+        } else {
+            HashMap::new()
+        };
+        for (_, old, new) in changes {
             let (Some(old_key), new_key) = (
                 unique_key(old, &parent_ordinals),
                 unique_key(new, &parent_ordinals),
@@ -2508,15 +2570,35 @@ fn enforce_fk_on_parent_update(
             {
                 continue;
             }
+            // Re-scanned per change, and that is not known to be right. Hoisting it was tried
+            // and reverted on the theory that a later change must see an earlier `CASCADE`'s
+            // writes; measuring says the opposite. Renaming `1 -> 2` and `2 -> 3` in one
+            // statement leaves a child that referenced `1` pointing at `3`, because the cascade
+            // for the first change rewrites it to `2` and the re-scan for the second finds that
+            // fresh `2` and drags it along. A frozen scan would have given the right answer.
+            //
+            // So this is a defect, not a design: the fix wants the whole propagation computed
+            // against the pre-statement image. Do not "restore" the re-scan on the strength of
+            // the reverted-hoist story — it was wrong. The per-change scan is also a full table
+            // read per changed key; both are one piece of work, filed together.
             let referencing: Vec<(Tid, Row)> = scan_table(&child, engine, txn)?
                 .into_iter()
-                .filter(|(_, crow)| {
-                    unique_key(crow, &child_ordinals).is_some_and(|ck| unique_key_eq(&ck, &old_key))
+                .filter(|(ctid, crow)| {
+                    let judged = post.get(ctid).copied().unwrap_or(crow);
+                    unique_key(judged, &child_ordinals)
+                        .is_some_and(|ck| unique_key_eq(&ck, &old_key))
                 })
                 .collect();
             if referencing.is_empty() {
                 continue;
             }
+            refuse_action_the_statement_would_overwrite(
+                table,
+                fk,
+                &child_ordinals,
+                &referencing,
+                &post,
+            )?;
             match fk.on_update {
                 nusadb_core::FkAction::NoAction | nusadb_core::FkAction::Restrict => {
                     return Err(nusadb_core::Error::ConstraintViolation(format!(
@@ -3289,13 +3371,13 @@ pub(super) fn run_update(
             )?;
         }
     }
-    enforce_fk_on_child_write(&plan.table, &updated_rows, &[], engine, txn)?;
+    enforce_fk_on_child_write(&plan.table, &updated_rows, &updated_rows, engine, txn)?;
     enforce_check_on_write(&plan.table, &updated_rows, engine)?;
     // …and a changed parent key must be propagated to its children (ON UPDATE) before any write.
     if is_fk_parent {
-        let fk_changes: Vec<(Row, Row)> = to_update
+        let fk_changes: Vec<(Tid, Row, Row)> = to_update
             .iter()
-            .filter_map(|(_, old, new)| old.as_ref().map(|o| (o.clone(), new.clone())))
+            .filter_map(|(tid, old, new)| old.as_ref().map(|o| (*tid, o.clone(), new.clone())))
             .collect();
         enforce_fk_on_parent_update(&plan.table, &fk_changes, engine, txn)?;
     }
@@ -4165,14 +4247,10 @@ fn commit_merge_updates(
             .collect();
         enforce_new_keys_vs_committed(table, &rewritten, &old_images, &new_rows, engine, txn)?;
     }
-    enforce_fk_on_child_write(table, &new_rows, &[], engine, txn)?;
+    enforce_fk_on_child_write(table, &new_rows, &new_rows, engine, txn)?;
     enforce_check_on_write(table, &new_rows, engine)?;
     if table_is_fk_parent(table, engine)? {
-        let changes: Vec<(Row, Row)> = updates
-            .iter()
-            .map(|(_, o, n)| (o.clone(), n.clone()))
-            .collect();
-        enforce_fk_on_parent_update(table, &changes, engine, txn)?;
+        enforce_fk_on_parent_update(table, updates, engine, txn)?;
     }
     for (tid, old, new) in updates {
         let bytes = row::encode(new, &schema)?;
