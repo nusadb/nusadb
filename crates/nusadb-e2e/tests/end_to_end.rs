@@ -11372,3 +11372,245 @@ fn a_refusal_that_is_not_about_the_statement_reports_its_own_class() {
     ];
     assert_refusal_classes(&engine, cases);
 }
+
+/// Deleting every row of a self-referencing table leaves nothing dangling, so it is allowed — but
+/// a delete that keeps a row still pointing at a deleted one is still refused.
+///
+/// The sibling of `a_foreign_key_sees_rows_written_by_its_own_statement`, and not a copy of it: on
+/// the write side the statement's own rows had to count as *parent* material, while here they have
+/// to be subtracted from the *dependants*. The check scans the child table, and for a
+/// self-referencing table the child is the parent, so every row the statement is about to remove
+/// was counting itself as a reason not to remove it.
+#[test]
+fn deleting_a_whole_self_referencing_table_is_allowed() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE org (id INT PRIMARY KEY, nama TEXT, atasan_id INT REFERENCES org(id))",
+    );
+    run(
+        &engine,
+        "INSERT INTO org VALUES (1,'CEO',NULL),(2,'CTO',1),(3,'DevLead',2)",
+    );
+
+    // Every row goes: nothing is left to dangle.
+    run(&engine, "DELETE FROM org");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(0)]]
+    );
+
+    // A partial delete that would strand a survivor is still refused, and refuses without writing.
+    run(
+        &engine,
+        "INSERT INTO org VALUES (1,'CEO',NULL),(2,'CTO',1),(3,'DevLead',2)",
+    );
+    let err = run_try(&engine, "DELETE FROM org WHERE id = 2")
+        .expect_err("row 3 would be left pointing at a row that is gone");
+    assert_eq!(err.sqlstate(), "23503", "got {err}");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(3)]],
+        "the refused delete left rows behind (auto-commit rolls back for you here; the session \
+         test below is what holds this inside an explicit transaction)"
+    );
+
+    // The minimal case of the whole change: a row that references itself. Nothing else in the
+    // table is involved, so the only thing that could refuse it is the row counting itself.
+    run(&engine, "DELETE FROM org");
+    run(&engine, "INSERT INTO org VALUES (1,'solo',1)");
+    run(&engine, "DELETE FROM org WHERE id = 1");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(0)]]
+    );
+
+    run(
+        &engine,
+        "INSERT INTO org VALUES (1,'CEO',NULL),(2,'CTO',1),(3,'DevLead',2)",
+    );
+    // Deleting a leaf, which nothing points at, was always fine and stays fine.
+    run(&engine, "DELETE FROM org WHERE id = 3");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(2)]]
+    );
+
+    // And the whole-table case again from a subset: deleting the two survivors together works
+    // because they only reference each other.
+    run(&engine, "DELETE FROM org WHERE id IN (1, 2)");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(0)]]
+    );
+}
+
+/// The delete actions on a self-referencing table, where the row an action would reach may itself
+/// be leaving in the same statement.
+///
+/// `CASCADE` must not delete a row twice, and `SET NULL` must not write to a row on its way out —
+/// which would also fire an update trigger on a row that is about to disappear. Subtracting the
+/// statement's own delete set is what gives both, so both are checked rather than assumed from the
+/// one case that motivated the change.
+#[test]
+fn delete_actions_on_a_self_referencing_table_skip_rows_already_leaving() {
+    let engine = BtreeEngine::new();
+
+    // ON DELETE CASCADE: deleting a node takes its direct children, and emptying the table
+    // outright works even though every row is both a parent and a dependant.
+    run(
+        &engine,
+        "CREATE TABLE tree (id INT PRIMARY KEY, parent INT REFERENCES tree(id) ON DELETE CASCADE)",
+    );
+    run(
+        &engine,
+        "INSERT INTO tree VALUES (1,NULL),(2,1),(3,2),(4,1)",
+    );
+    // A control, not a case this change touches: 2 is not among its own dependants, so this
+    // worked before. Note what it does not say — cascade goes exactly one level, so a grandchild
+    // would be left dangling rather than followed. That predates this work and is unchanged.
+    run(&engine, "DELETE FROM tree WHERE id = 2");
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM tree ORDER BY id")),
+        vec![vec![Value::Int(1)], vec![Value::Int(4)]],
+        "deleting 2 takes its direct child 3; 1 and 4 are untouched"
+    );
+    run(&engine, "DELETE FROM tree");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM tree")),
+        vec![vec![Value::Int(0)]]
+    );
+
+    // ON DELETE SET NULL: a survivor is detached, while a row leaving in the same statement is
+    // simply removed rather than being nulled first.
+    run(
+        &engine,
+        "CREATE TABLE node (id INT PRIMARY KEY, parent INT REFERENCES node(id) ON DELETE SET NULL)",
+    );
+    run(&engine, "INSERT INTO node VALUES (1,NULL),(2,1),(3,2)");
+    run(&engine, "DELETE FROM node WHERE id = 1");
+    assert_eq!(
+        rows(run(&engine, "SELECT id, parent FROM node ORDER BY id")),
+        vec![
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Int(2)]
+        ],
+        "2 is detached from the deleted 1; 3 still points at the surviving 2"
+    );
+    // Emptying it: `count(*) = 0` alone cannot tell "never nulled" from "nulled, then deleted",
+    // and the second is what the fix exists to prevent — `engine.update` mints a new tid, so a row
+    // rewritten on its way out would then be deleted by a stale one. An update trigger is what
+    // distinguishes them, so the claim above is held by an assertion rather than by the comment.
+    run(&engine, "CREATE TABLE touched (id INT)");
+    run(
+        &engine,
+        "CREATE TRIGGER note AFTER UPDATE ON node FOR EACH ROW \
+         INSERT INTO touched VALUES (1)",
+    );
+    run(&engine, "DELETE FROM node");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM node")),
+        vec![vec![Value::Int(0)]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM touched")),
+        vec![vec![Value::Int(0)]],
+        "a row leaving in this statement must not be written on its way out"
+    );
+}
+
+/// Inside an explicit transaction, a refused delete on a self-referencing table writes nothing and
+/// the transaction stays usable.
+///
+/// This is the case the equivalent `INSERT` work got wrong: the test that claimed to guard it ran
+/// through auto-commit, where the harness rolls back for you, so the assertion could not fail. A
+/// failed statement inside `BEGIN` is *not* rolled back — there is no implicit savepoint — so
+/// driving a real session is the only way to hold this.
+///
+/// What it establishes is narrow, and deliberately stated as such: for a table with **one**
+/// foreign key and **no** delete triggers, a refused delete writes nothing, because the check
+/// runs ahead of the writes. The engine does not promise that in general, and two known paths
+/// break it — a `BEFORE DELETE` row trigger runs before the check and its writes survive the
+/// refusal, and with two foreign keys the loop can carry out one key's `CASCADE` before another
+/// key rejects. Both predate this change; neither is claimed here.
+#[test]
+fn a_refused_self_referencing_delete_inside_a_transaction_leaves_no_trace() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE org (id INT PRIMARY KEY, atasan_id INT REFERENCES org(id))",
+    );
+    run(&engine, "INSERT INTO org VALUES (1,NULL),(2,1),(3,2)");
+
+    let mut session = Session::new(&engine);
+    session.execute(build_plan(&engine, "BEGIN")).unwrap();
+    session
+        .execute(build_plan(&engine, "DELETE FROM org WHERE id = 3"))
+        .expect("a leaf nothing points at deletes cleanly");
+    session
+        .execute(build_plan(&engine, "DELETE FROM org WHERE id = 1"))
+        .expect_err("row 2 would be left pointing at a row that is gone");
+
+    // The refused statement wrote nothing, and the accepted one before it still stands.
+    let after = session
+        .execute(build_plan(&engine, "SELECT id FROM org ORDER BY id"))
+        .unwrap();
+    assert_eq!(
+        match after {
+            ExecutionResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        },
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+
+    // And the transaction is still usable: emptying the table now succeeds and commits.
+    session
+        .execute(build_plan(&engine, "DELETE FROM org"))
+        .expect("nothing is left behind, so the whole table may go");
+    session.execute(build_plan(&engine, "COMMIT")).unwrap();
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(0)]]
+    );
+}
+
+/// `MERGE ... WHEN MATCHED THEN DELETE` reaches the same referential check by a second route, and
+/// is fixed by the same subtraction.
+///
+/// It has its own caller (`commit_merge_deletes`), so passing the delete set through one of them
+/// and not the other would leave this shape refusing what plain `DELETE` now allows. Nothing else
+/// in the corpus drives that path against a self-referencing table.
+#[test]
+fn merge_can_empty_a_self_referencing_table() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE org (id INT PRIMARY KEY, atasan_id INT REFERENCES org(id))",
+    );
+    run(&engine, "INSERT INTO org VALUES (1,NULL),(2,1),(3,2)");
+    run(&engine, "CREATE TABLE doomed (id INT)");
+    run(&engine, "INSERT INTO doomed VALUES (1),(2),(3)");
+
+    run(
+        &engine,
+        "MERGE INTO org USING doomed ON org.id = doomed.id WHEN MATCHED THEN DELETE",
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(0)]]
+    );
+
+    // And the refusal still holds on this route: leaving a survivor behind is still rejected.
+    run(&engine, "INSERT INTO org VALUES (1,NULL),(2,1),(3,2)");
+    run(&engine, "DELETE FROM doomed WHERE id <> 2");
+    let err = run_try(
+        &engine,
+        "MERGE INTO org USING doomed ON org.id = doomed.id WHEN MATCHED THEN DELETE",
+    )
+    .expect_err("3 would be left pointing at the deleted 2");
+    assert_eq!(err.sqlstate(), "23503", "got {err}");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM org")),
+        vec![vec![Value::Int(3)]]
+    );
+}

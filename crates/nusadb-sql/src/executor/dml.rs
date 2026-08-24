@@ -2354,14 +2354,24 @@ fn null_fk_changes(
         .collect()
 }
 
-/// Enforce referential actions when parent `rows` of `table` are about to be deleted: for
-/// each foreign key pointing at `table`, find the child rows referencing a deleted key and apply
-/// `NO ACTION`/`RESTRICT` (reject), `CASCADE` (delete the children, one level), or `SET NULL` (null
-/// the child FK columns). `SET DEFAULT` needs a column DEFAULT clause and is rejected for honesty.
-/// Cascade writes fire the child's row triggers (see [`cascade_delete_children`]).
+/// Enforce referential actions when the rows in `deleting` are about to be removed from `table`:
+/// for each foreign key pointing at `table`, find the child rows referencing a deleted key and
+/// apply `NO ACTION`/`RESTRICT` (reject), `CASCADE` (delete the children, one level), or `SET NULL`
+/// (null the child FK columns). `SET DEFAULT` needs a column DEFAULT clause and is rejected for
+/// honesty. Cascade writes fire the child's row triggers (see [`cascade_delete_children`]).
+///
+/// `deleting` is the whole delete set of this statement, tids included, because for a
+/// self-referencing table the child being scanned *is* this table: without subtracting the rows
+/// that are themselves on their way out, every one of them counts as a reason not to remove it, and
+/// emptying such a table is impossible. The subtraction is by tid rather than by key — a key is
+/// only unique within a table, and for any other child table these tids belong to something else.
+///
+/// The same subtraction is what the three actions want. A row already leaving must not be
+/// cascade-deleted a second time, and must not be updated to `NULL` on its way out — which would
+/// fire an update trigger on a row that is about to disappear.
 fn enforce_fk_on_parent_delete(
     table: &TableSchema,
-    rows: &[Row],
+    deleting: &[(Tid, Row)],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -2379,9 +2389,9 @@ fn enforce_fk_on_parent_delete(
         let Some(parent_ordinals) = fk_parent_ordinals(table, &fk, engine)? else {
             continue; // This FK references the PK, but the parent has none — nothing references it.
         };
-        let deleted_keys: Vec<Vec<ast::Value>> = rows
+        let deleted_keys: Vec<Vec<ast::Value>> = deleting
             .iter()
-            .filter_map(|r| unique_key(r, &parent_ordinals))
+            .filter_map(|(_, r)| unique_key(r, &parent_ordinals))
             .collect();
         if deleted_keys.is_empty() {
             continue;
@@ -2394,11 +2404,18 @@ fn enforce_fk_on_parent_delete(
         })?;
         let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
         let child_rows = scan_table(&child, engine, txn)?;
+        // Self-referencing: the rows this statement is removing are not dependants of it.
+        let leaving: std::collections::BTreeSet<Tid> = if fk.child_table == table.id {
+            deleting.iter().map(|(tid, _)| *tid).collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let referencing: Vec<(Tid, Row)> = child_rows
             .into_iter()
-            .filter(|(_, crow)| {
-                unique_key(crow, &child_ordinals)
-                    .is_some_and(|ckey| deleted_keys.iter().any(|dk| unique_key_eq(dk, &ckey)))
+            .filter(|(ctid, crow)| {
+                !leaving.contains(ctid)
+                    && unique_key(crow, &child_ordinals)
+                        .is_some_and(|ckey| deleted_keys.iter().any(|dk| unique_key_eq(dk, &ckey)))
             })
             .collect();
         if referencing.is_empty() {
@@ -3406,7 +3423,7 @@ pub(super) fn run_delete(
         }
     }
     let deleted_rows: Vec<Row> = to_delete.iter().map(|(_, row)| row.clone()).collect();
-    enforce_fk_on_parent_delete(&plan.table, &deleted_rows, engine, txn)?;
+    enforce_fk_on_parent_delete(&plan.table, &to_delete, engine, txn)?;
 
     // RETURNING projects each deleted row's *pre-delete* values.
     let mut returned: Vec<Row> = Vec::new();
@@ -4074,7 +4091,7 @@ fn commit_merge_deletes(
             triggers.fire_row_before(table, Some(row), None, engine, txn)?;
         }
     }
-    enforce_fk_on_parent_delete(table, &deleted_rows, engine, txn)?;
+    enforce_fk_on_parent_delete(table, deletes, engine, txn)?;
     for (tid, _) in deletes {
         engine.delete(txn, table.id, *tid)?;
     }
