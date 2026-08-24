@@ -4399,9 +4399,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             _ => Err(invalid_cast(s, ColumnType::Bool)),
         },
         // Parse from text (`'2024-01-15'::DATE`, `CAST('…' AS UUID)`, …)
-        (ast::Value::Text(s), ColumnType::Date) => crate::temporal::parse_date(s)
-            .map(ast::Value::Date)
-            .ok_or_else(|| invalid_cast(s, ColumnType::Date)),
+        (ast::Value::Text(s), ColumnType::Date) => date_from_text(s).map(ast::Value::Date),
         (ast::Value::Text(s), ColumnType::Time) => crate::temporal::parse_time(s)
             .map(ast::Value::Time)
             .ok_or_else(|| invalid_cast(s, ColumnType::Time)),
@@ -4695,6 +4693,19 @@ fn invalid_cast(s: &str, target: ColumnType) -> Error {
         ty: target,
         value: s.to_owned(),
     }
+}
+
+/// Parse a `text -> DATE`, distinguishing (like the reference engine) a mis-shaped literal — an
+/// `invalid_datetime_format` error (`22007`) — from a well-shaped but out-of-range one such as
+/// `2023-02-30`, which is a `datetime_field_overflow` (`22008`).
+pub(super) fn date_from_text(s: &str) -> Result<i32, Error> {
+    crate::temporal::parse_date(s).ok_or_else(|| {
+        if crate::temporal::is_date_field_out_of_range(s) {
+            Error::DatetimeOverflow(format!("date/time field value out of range: \"{s}\""))
+        } else {
+            invalid_cast(s, ColumnType::Date)
+        }
+    })
 }
 
 /// Rescale a decimal to a NUMERIC cast target: to the declared `scale` when constrained

@@ -3436,6 +3436,41 @@ fn q47_concat_coerce_json_scalar_cast_bytea_length() {
     assert_eq!(one(r"SELECT bit_length('\x01'::bytea)"), Value::Int(8));
 }
 
+/// A date string whose fields are well-shaped `YYYY-MM-DD` but out of the calendar range
+/// (Feb 30, month 13, day 99) is a field-overflow (22008), distinct from a mis-shaped
+/// literal that is an invalid-format error (22007). The reference engine draws the same line.
+#[test]
+fn out_of_range_date_reports_field_overflow_not_bad_format() {
+    let engine = MockEngine::new();
+
+    for sql in [
+        "SELECT DATE '2023-02-30'",
+        "SELECT DATE '2023-13-01'",
+        "SELECT '2023-02-30'::date",
+        "SELECT CAST('2023-02-30' AS date)",
+    ] {
+        let err = run(sql, &engine).unwrap_err();
+        assert_eq!(
+            err.sqlstate(),
+            "22008",
+            "expected field-overflow for {sql}: {err}"
+        );
+    }
+
+    for sql in ["SELECT DATE 'abc'", "SELECT '2023-02'::date"] {
+        let err = run(sql, &engine).unwrap_err();
+        assert_eq!(
+            err.sqlstate(),
+            "22007",
+            "expected bad-format for {sql}: {err}"
+        );
+    }
+
+    // A real leap day still parses (epoch day 19782, oracle-checked).
+    let one = |sql: &str| rows_of(run(sql, &engine).unwrap()).1.remove(0).remove(0);
+    assert_eq!(one("SELECT DATE '2024-02-29'"), Value::Date(19782));
+}
+
 /// (QA): a `DELETE ... RETURNING` CTE — the archive-then-remove pattern —
 /// runs once, its returned rows form the relation, and the deletion is real. INSERT/UPDATE
 /// CTEs already worked; DELETE was rejected only because a stale parser comment predated the

@@ -147,6 +147,26 @@ pub fn parse_date(s: &str) -> Option<i32> {
     i32::try_from(days_from_civil(y, m, d)).ok()
 }
 
+/// Whether `s` is a well-shaped `YYYY-MM-DD` that still won't parse — a field out of range.
+///
+/// A three-field date with a two-digit month and day that fails to parse (`2023-02-30`,
+/// `99-99-99`) is a `datetime_field_overflow` (`22008`), whereas a mis-shaped literal (`abc`,
+/// `2023-02`) is `invalid_datetime_format` (`22007`); this tells the two apart for the caller.
+#[must_use]
+pub fn is_date_field_out_of_range(s: &str) -> bool {
+    let s = s.trim();
+    let mut it = s.splitn(3, '-');
+    let (Some(y), Some(m), Some(d)) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
+    let well_shaped = !y.is_empty()
+        && y.bytes().all(|b| b.is_ascii_digit())
+        && parse_fixed(m, 2).is_some()
+        && parse_fixed(d, 2).is_some();
+    // A well-shaped date that still won't parse is out-of-range, not a format error.
+    well_shaped && parse_date(s).is_none()
+}
+
 /// Build a `DATE` (days since the epoch) from a `(year, month, day)` triple, or `None` if it is not a
 /// real calendar day or falls outside the representable range (`MAKE_DATE`).
 #[must_use]
@@ -1845,6 +1865,20 @@ mod tests {
             Some(37_616_645.5)
         );
         assert_eq!(extract_interval_field("nonsense", 14, 10, micros), None);
+    }
+
+    #[test]
+    fn out_of_range_date_is_distinguished_from_a_bad_format() {
+        // Well-shaped `YYYY-MM-DD` but a field out of range — the reference engine's 22008 case.
+        assert!(is_date_field_out_of_range("2023-02-30"));
+        assert!(is_date_field_out_of_range("2023-13-01"));
+        assert!(is_date_field_out_of_range("99-99-99"));
+        // Mis-shaped input — the 22007 (invalid format) case, not out-of-range.
+        assert!(!is_date_field_out_of_range("abc"));
+        assert!(!is_date_field_out_of_range("2023-02"));
+        assert!(!is_date_field_out_of_range("2023/02/28"));
+        // A real calendar day is neither.
+        assert!(!is_date_field_out_of_range("2024-02-29"));
     }
 
     #[test]

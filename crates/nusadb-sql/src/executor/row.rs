@@ -302,7 +302,8 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         // Implicit string coercion ("unknown literal" rule): a text value assigned to a
         // temporal/UUID column is parsed into the column's type at encode time.
         (ast::Value::Text(s), ColumnType::Date) => {
-            let d = crate::temporal::parse_date(s).ok_or_else(|| invalid(ty, s))?;
+            // A well-shaped but out-of-range date reports 22008; a mis-shaped one 22007.
+            let d = super::eval::date_from_text(s)?;
             out.extend_from_slice(&d.to_le_bytes());
         },
         (ast::Value::Text(s), ColumnType::Time) => {

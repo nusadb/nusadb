@@ -120,9 +120,15 @@ pub(super) fn convert_typed_literal(
         // Other typed strings (e.g. `TEXT '…'`) carry no special parsing — treat as text.
         _ => return Ok(ast::Expr::Literal(ast::Value::Text(value))),
     };
-    parsed
-        .map(ast::Expr::Literal)
-        .ok_or(Error::InvalidValue { ty, value })
+    parsed.map(ast::Expr::Literal).ok_or_else(|| {
+        // A well-shaped `YYYY-MM-DD` whose field is out of the calendar range is a
+        // field-overflow (22008), distinct from a mis-shaped literal (22007).
+        if ty == ColumnType::Date && crate::temporal::is_date_field_out_of_range(&value) {
+            Error::DatetimeOverflow(format!("date/time field value out of range: \"{value}\""))
+        } else {
+            Error::InvalidValue { ty, value }
+        }
+    })
 }
 
 /// Convert an `INTERVAL '…'` literal. The value is a string (`'1 day'`) — possibly a bare
