@@ -2517,6 +2517,28 @@ fn refuse_action_the_statement_would_overwrite(
     .into())
 }
 
+/// The `(old_key, new_key)` pairs among `changes` that actually move the referenced key.
+///
+/// Selected before any child table is scanned: a table that is a foreign-key parent gets updated
+/// constantly without touching its key, and scanning there would decode every referencing row to
+/// find nothing. A `NULL` old key is dropped — nothing can be referencing it.
+fn keys_this_statement_moves(
+    changes: &[(Tid, Row, Row)],
+    parent_ordinals: &[usize],
+) -> Vec<(Vec<ast::Value>, Option<Vec<ast::Value>>)> {
+    changes
+        .iter()
+        .filter_map(|(_, old, new)| {
+            let old_key = unique_key(old, parent_ordinals)?;
+            let new_key = unique_key(new, parent_ordinals);
+            let unchanged = new_key
+                .as_ref()
+                .is_some_and(|nk| unique_key_eq(nk, &old_key));
+            (!unchanged).then_some((old_key, new_key))
+        })
+        .collect()
+}
+
 /// Refuse a key change that would strand a child row, and carry out `ON UPDATE` propagation for
 /// the ones that are allowed.
 ///
@@ -2561,38 +2583,32 @@ fn enforce_fk_on_parent_update(
         } else {
             HashMap::new()
         };
-        for (_, old, new) in changes {
-            let (Some(old_key), new_key) = (
-                unique_key(old, &parent_ordinals),
-                unique_key(new, &parent_ordinals),
-            ) else {
-                continue; // Old key was NULL — nothing references it.
-            };
-            // Only a *changed* key needs propagation.
-            if new_key
-                .as_ref()
-                .is_some_and(|nk| unique_key_eq(nk, &old_key))
-            {
-                continue;
-            }
-            // Re-scanned per change, and that is not known to be right. Hoisting it was tried
-            // and reverted on the theory that a later change must see an earlier `CASCADE`'s
-            // writes; measuring says the opposite. Renaming `1 -> 2` and `2 -> 3` in one
-            // statement leaves a child that referenced `1` pointing at `3`, because the cascade
-            // for the first change rewrites it to `2` and the re-scan for the second finds that
-            // fresh `2` and drags it along. A frozen scan would have given the right answer.
-            //
-            // So this is a defect, not a design: the fix wants the whole propagation computed
-            // against the pre-statement image. Do not "restore" the re-scan on the strength of
-            // the reverted-hoist story — it was wrong. The per-change scan is also a full table
-            // read per changed key; both are one piece of work, filed together.
-            let referencing: Vec<(Tid, Row)> = scan_table(&child, engine, txn)?
-                .into_iter()
+        let moving = keys_this_statement_moves(changes, &parent_ordinals);
+        // One scan for this foreign key, taken before any of *its* propagation runs, and every
+        // moving key judged against that one image. Re-scanning per key reads the writes an earlier
+        // key's `CASCADE` just made, which is how renaming `1 -> 2` and `2 -> 3` in one statement
+        // used to drag a child of `1` all the way to `3`: the cascade moved it to `2`, and the next
+        // key's scan found it there.
+        //
+        // The image is the pre-statement one with this statement's own rewrites applied on top —
+        // `post` above — so a self-referencing row is judged as the row it will become.
+        //
+        // A *later* foreign key does see an earlier one's cascade writes, because this scan sits
+        // inside the `for fk` loop. That is deliberate: two foreign keys touch different child
+        // columns, and the second must not undo the first.
+        if moving.is_empty() {
+            continue;
+        }
+        let child_rows = scan_table(&child, engine, txn)?;
+        for (old_key, new_key) in moving {
+            let referencing: Vec<(Tid, Row)> = child_rows
+                .iter()
                 .filter(|(ctid, crow)| {
                     let judged = post.get(ctid).copied().unwrap_or(crow);
                     unique_key(judged, &child_ordinals)
                         .is_some_and(|ck| unique_key_eq(&ck, &old_key))
                 })
+                .cloned()
                 .collect();
             if referencing.is_empty() {
                 continue;

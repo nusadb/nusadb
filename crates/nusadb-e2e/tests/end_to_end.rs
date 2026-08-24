@@ -11740,3 +11740,145 @@ fn merge_can_renumber_a_self_referencing_table() {
         ]
     );
 }
+
+/// A chained rename propagates each child to the parent row it was actually following.
+///
+/// `UPDATE par SET id = id + 1` renames `1 -> 2` and `2 -> 3` in one statement. A child of `1` must
+/// end up at `2`, not carried on to `3`. It used to be carried: the check re-read the child table
+/// for every changed key, so the cascade written for the first change was sitting there when the
+/// second change looked, and the second change took it too. Propagation is now judged against the
+/// pre-statement image with this statement's own rewrites overlaid — the self-referencing shape
+/// below depends on that overlay.
+#[test]
+fn a_chained_rename_moves_each_child_to_its_own_parent() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE par (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        "CREATE TABLE ch (cid INT PRIMARY KEY, p INT REFERENCES par(id) ON UPDATE CASCADE)",
+    );
+    run(&engine, "INSERT INTO par VALUES (1),(2)");
+    run(&engine, "INSERT INTO ch VALUES (101,1),(102,2)");
+
+    run(&engine, "UPDATE par SET id = id + 1");
+    assert_eq!(
+        rows(run(&engine, "SELECT cid, p FROM ch ORDER BY cid")),
+        vec![
+            vec![Value::Int(101), Value::Int(2)],
+            vec![Value::Int(102), Value::Int(3)]
+        ],
+        "101 followed the row that was 1 and is now 2; only 102 belongs at 3"
+    );
+
+    // The same shape where the parent is its own child.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, p INT REFERENCES t(id) ON UPDATE CASCADE)",
+    );
+    run(
+        &engine,
+        "INSERT INTO t VALUES (1,NULL),(2,NULL),(5,1),(6,2)",
+    );
+    run(&engine, "UPDATE t SET id = id + 1 WHERE id IN (1, 2)");
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id, p FROM t WHERE p IS NOT NULL ORDER BY id"
+        )),
+        vec![
+            vec![Value::Int(5), Value::Int(2)],
+            vec![Value::Int(6), Value::Int(3)]
+        ]
+    );
+
+    // An update that touches no key column must leave every reference alone, and a key update on
+    // the same table must still propagate. Both are checked here.
+    //
+    // The engine also skips the child-table scan entirely when no key moves. That skip is not
+    // checked here — it needs two sessions to see — but it is not merely a saving either: see
+    // `a_non_key_update_does_not_enrol_the_child_table_in_the_read_set`, which holds it.
+    let engine2 = BtreeEngine::new();
+    run(&engine2, "CREATE TABLE p3 (id INT PRIMARY KEY, note TEXT)");
+    run(
+        &engine2,
+        "CREATE TABLE c3 (cid INT PRIMARY KEY, p INT REFERENCES p3(id) ON UPDATE CASCADE)",
+    );
+    run(&engine2, "INSERT INTO p3 VALUES (1,'a'),(2,'b')");
+    run(&engine2, "INSERT INTO c3 VALUES (101,1),(102,2)");
+    run(&engine2, "UPDATE p3 SET note = 'changed'");
+    assert_eq!(
+        rows(run(&engine2, "SELECT cid, p FROM c3 ORDER BY cid")),
+        vec![
+            vec![Value::Int(101), Value::Int(1)],
+            vec![Value::Int(102), Value::Int(2)]
+        ],
+        "a non-key update must leave every reference exactly where it was"
+    );
+    run(&engine2, "UPDATE p3 SET id = id + 10");
+    assert_eq!(
+        rows(run(&engine2, "SELECT cid, p FROM c3 ORDER BY cid")),
+        vec![
+            vec![Value::Int(101), Value::Int(11)],
+            vec![Value::Int(102), Value::Int(12)]
+        ],
+        "and a key update on the same table still propagates"
+    );
+
+    // `SET NULL` detaches each child from the row it was following, once.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE p2 (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        "CREATE TABLE c2 (cid INT PRIMARY KEY, p INT REFERENCES p2(id) ON UPDATE SET NULL)",
+    );
+    run(&engine, "INSERT INTO p2 VALUES (1),(2)");
+    run(&engine, "INSERT INTO c2 VALUES (101,1),(102,2)");
+    run(&engine, "UPDATE p2 SET id = id + 1");
+    assert_eq!(
+        rows(run(&engine, "SELECT cid, p FROM c2 ORDER BY cid")),
+        vec![
+            vec![Value::Int(101), Value::Null],
+            vec![Value::Int(102), Value::Null]
+        ]
+    );
+}
+
+/// Skipping the child scan when no key moves is visible through isolation, not only through cost.
+///
+/// A scan under SERIALIZABLE records every row it reads into the transaction's read set, and commit
+/// validates that set against concurrent writes. So scanning the child table on an update that
+/// touches no key does not merely waste the read — it enrols the whole child table as a dependency,
+/// and any concurrent write to that table then aborts a transaction that never looked at it.
+///
+/// This is what the earlier note in `a_chained_rename_moves_each_child_to_its_own_parent` got
+/// wrong in both directions: first claiming the skip was behaviourally asserted, then claiming it
+/// had no behavioural shadow at all. It has one, and this is it.
+#[test]
+fn a_non_key_update_does_not_enrol_the_child_table_in_the_read_set() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE p4 (id INT PRIMARY KEY, note TEXT)");
+    run(
+        &engine,
+        "CREATE TABLE c4 (cid INT PRIMARY KEY, p INT REFERENCES p4(id) ON UPDATE CASCADE)",
+    );
+    run(&engine, "INSERT INTO p4 VALUES (1,'a'),(2,'b')");
+    run(&engine, "INSERT INTO c4 VALUES (101,1),(102,2)");
+
+    let mut a = Session::new(&engine);
+    a.execute(build_plan(&engine, "BEGIN ISOLATION LEVEL SERIALIZABLE"))
+        .unwrap();
+    // Touches no key column, so the child table is none of this transaction's business.
+    a.execute(build_plan(&engine, "UPDATE p4 SET note = 'changed'"))
+        .unwrap();
+
+    let mut b = Session::new(&engine);
+    b.execute(build_plan(&engine, "BEGIN ISOLATION LEVEL SERIALIZABLE"))
+        .unwrap();
+    b.execute(build_plan(&engine, "UPDATE c4 SET p = 2 WHERE cid = 101"))
+        .unwrap();
+    b.execute(build_plan(&engine, "COMMIT")).unwrap();
+
+    a.execute(build_plan(&engine, "COMMIT"))
+        .expect("a never read c4, so b's write to it must not abort a");
+}
