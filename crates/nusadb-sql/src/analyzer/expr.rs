@@ -3729,6 +3729,41 @@ fn analyze_cast_named(
     catalog: &dyn Catalog,
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
+    // A cast to a user-defined enum type. A constant text literal resolves to its declaration-order
+    // ordinal now (an unknown label is `22P02`); `NULL::enum` is a typed null. A non-constant operand
+    // is not yet supported (a runtime text→enum cast would need the label set at evaluation time).
+    if let Some(labels) = catalog.enum_labels(type_name)? {
+        return match expr {
+            ast::Expr::Literal(ast::Value::Null) => Ok(TypedExpr {
+                kind: TypedExprKind::Literal(ast::Value::Null),
+                ty: ColumnType::Enum,
+            }),
+            ast::Expr::Literal(ast::Value::Text(label)) => {
+                labels.iter().position(|l| l == label).map_or_else(
+                    || {
+                        Err(Error::Coded {
+                            message: format!(
+                                "invalid input value for enum {type_name}: \"{label}\""
+                            ),
+                            sqlstate: "22P02",
+                        })
+                    },
+                    |ordinal| {
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::Literal(ast::Value::Enum {
+                                ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                                label: label.clone(),
+                            }),
+                            ty: ColumnType::Enum,
+                        })
+                    },
+                )
+            },
+            _ => Err(Error::Unsupported(format!(
+                "a cast to enum type \"{type_name}\" is supported only for a text literal"
+            ))),
+        };
+    }
     let Some(fields) = catalog.lookup_composite(type_name)? else {
         return Err(Error::ObjectNotFound(format!(
             "type \"{type_name}\" does not exist or is not a composite type"

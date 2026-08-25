@@ -97,6 +97,25 @@ impl Catalog for EngineCatalog<'_> {
         let _ = self.0.rollback(txn);
         out
     }
+
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_enum_column(self.0, txn, schema, table, column);
+        let _ = self.0.rollback(txn);
+        out
+    }
+
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_enum(self.0, txn, name);
+        let _ = self.0.rollback(txn);
+        out
+    }
 }
 
 /// A `Catalog` that analyzes as a chosen user (superuser or not) for row-level-security tests,
@@ -1480,10 +1499,36 @@ fn create_type_enum_and_use_as_a_column() {
         vec![vec![sad], vec![ok], vec![happy], vec![Value::Null]]
     );
 
-    // Comparing an enum column to a bare text literal is a loud type error for now (a text literal
-    // is not yet coerced to the enum type in comparison context — that arrives with enum casts). It
-    // must never silently match nothing, so this stays an error rather than an empty result.
+    // Comparing an enum column to a BARE text literal is a loud type error for now (implicit literal
+    // coercion in comparison context is a later step). It must never silently match nothing.
     assert!(run_try(&engine, "SELECT id FROM t WHERE m = 'happy'").is_err());
+
+    // A `'label'::enum` cast resolves the label to its enum value, so an EXPLICIT cast compares and
+    // filters correctly (by ordinal). An unknown label in a cast is a loud error; `NULL::enum` is a
+    // typed null.
+    assert_eq!(
+        rows(run(&engine, "SELECT 'happy'::mood_enum")),
+        vec![vec![Value::Enum {
+            ordinal: 2,
+            label: "happy".to_owned(),
+        }]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT 'happy'::mood_enum > 'sad'::mood_enum")),
+        vec![vec![Value::Bool(true)]]
+    );
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM t WHERE m = 'happy'::mood_enum ORDER BY id"
+        )),
+        vec![vec![Value::Int(1)]]
+    );
+    assert!(run_try(&engine, "SELECT 'bogus'::mood_enum").is_err());
+    assert_eq!(
+        rows(run(&engine, "SELECT NULL::mood_enum")),
+        vec![vec![Value::Null]]
+    );
 
     // Re-declaring an existing type, and empty/duplicate labels, are rejected.
     assert!(run_try(&engine, "CREATE TYPE mood_enum AS ENUM ('x')").is_err());

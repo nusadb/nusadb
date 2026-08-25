@@ -4037,7 +4037,7 @@ fn run_drop_type(
 }
 
 /// The ordered labels of a user-defined enum type, or `None` if no such type exists (B-ENUM).
-pub(crate) fn lookup_enum(
+pub fn lookup_enum(
     engine: &dyn StorageEngine,
     txn: TxnId,
     name: &str,
@@ -4151,7 +4151,7 @@ fn store_enum_column(
 
 /// The enum type name of base-table column `(schema, table, column)`, or `None` if that column is not
 /// of an enum type.
-pub(crate) fn lookup_enum_column(
+pub fn lookup_enum_column(
     engine: &dyn StorageEngine,
     txn: TxnId,
     schema: &str,
