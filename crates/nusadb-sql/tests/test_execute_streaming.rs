@@ -612,3 +612,77 @@ fn stats_routed_hash_fold_under_spill_matches() {
     );
     assert_eq!(got, buffered(engine, &mut Session::new(engine), sql));
 }
+
+/// The introspection plans must advertise the types they actually send.
+///
+/// `describe_column_types` derives a `SELECT`'s types from the analyzer, which type-checked them.
+/// For the catalog-introspection plans it hand-writes the answer instead, and a hand-written answer
+/// can simply be wrong: `SHOW COLUMNS` declared its nullable column `Text` while emitting
+/// `Value::Bool`, so a typed client was told `TEXT` and handed `true` — the one thing a type tag
+/// exists to prevent. Nothing compared the two halves, in either direction.
+///
+/// Checked per value rather than per column so a plan that emits a different kind on some rows
+/// cannot hide behind the first one.
+#[test]
+fn introspection_plans_advertise_the_types_they_send() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    run(
+        engine,
+        &mut session,
+        "CREATE TABLE t (a INT NOT NULL, b TEXT)",
+    );
+
+    for sql in [
+        "SHOW COLUMNS FROM t",
+        "SHOW TABLES",
+        "SHOW transaction_isolation",
+        "EXPLAIN SELECT a FROM t",
+    ] {
+        let mut sink = Collect::default();
+        session
+            .execute_streaming(planned(engine, sql), &mut sink)
+            .unwrap();
+        assert!(sink.typed, "{sql}: sent an untyped row description");
+        assert_eq!(
+            sink.types.len(),
+            sink.columns.len(),
+            "{sql}: declared {} types for {} columns",
+            sink.types.len(),
+            sink.columns.len()
+        );
+
+        // Without this the per-value loop below is a no-op for a plan that stopped emitting rows,
+        // and the test passes on having judged nothing.
+        assert!(!sink.rows.is_empty(), "{sql}: produced no rows to check");
+
+        for row in &sink.rows {
+            // `zip` truncates to the shortest, so a row shorter than the declaration would leave
+            // its missing tail unexamined. The length check above compares the two *declarations*
+            // to each other and would not notice.
+            assert_eq!(
+                row.len(),
+                sink.columns.len(),
+                "{sql}: a row has {} values for {} declared columns",
+                row.len(),
+                sink.columns.len()
+            );
+            for ((value, declared), name) in row.iter().zip(&sink.types).zip(&sink.columns) {
+                let ok = match value {
+                    // NULL inhabits every type, so it constrains nothing.
+                    Value::Null => true,
+                    Value::Bool(_) => *declared == ColumnType::Bool,
+                    Value::Text(_) => *declared == ColumnType::Text,
+                    other => panic!(
+                        "{sql}: column `{name}` sent {other:?}, which this check does \
+                                     not know how to judge — teach it before widening the list"
+                    ),
+                };
+                assert!(
+                    ok,
+                    "{sql}: column `{name}` is advertised as {declared:?} but sent {value:?}"
+                );
+            }
+        }
+    }
+}

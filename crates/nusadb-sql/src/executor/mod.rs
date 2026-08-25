@@ -727,10 +727,15 @@ pub fn describe_columns(plan: &PhysicalPlan) -> Vec<String> {
 /// The output column **types** a [`PhysicalPlan`] would produce, parallel to [`describe_columns`].
 ///
 /// Same plan coverage and column order as the names, so for a row-producing plan
-/// `describe_columns(plan)` and `describe_column_types(plan)` line up element-for-element. The wire
-/// `RowDescription` carries only names today; this exposes the per-column types the analyzer already
-/// resolved so the protocol can pair them once it advertises types. Catalog-introspection
-/// and `SHOW`/`EXPLAIN` shapes emit text columns.
+/// `describe_columns(plan)` and `describe_column_types(plan)` line up element-for-element. A
+/// connection that negotiated the typed row description receives these as per-column type tags;
+/// one that did not still gets names only.
+///
+/// A `SELECT`'s types come from the analyzer, which resolved and checked them. The
+/// catalog-introspection and `SHOW`/`EXPLAIN` arms below hand-write theirs instead, so they can be
+/// wrong in a way a `SELECT` cannot: this doc used to say they are all text, and `SHOW COLUMNS`
+/// emits a boolean. Whatever is written here has to be what the plan's executor actually sends —
+/// `introspection_plans_advertise_the_types_they_send` holds the two together.
 #[must_use]
 pub fn describe_column_types(plan: &PhysicalPlan) -> Vec<ColumnType> {
     match plan {
@@ -746,9 +751,12 @@ pub fn describe_column_types(plan: &PhysicalPlan) -> Vec<ColumnType> {
         PhysicalPlan::Insert(p) => p.returning.iter().map(|r| r.expr.ty).collect(),
         PhysicalPlan::Update(p) => p.returning.iter().map(|r| r.expr.ty).collect(),
         PhysicalPlan::Delete(p) => p.returning.iter().map(|r| r.expr.ty).collect(),
-        // `SHOW COLUMNS` reports column / type / nullable, all text.
+        // `SHOW COLUMNS` reports column / type / nullable. The first two are text; the third is
+        // the boolean `run_show_columns` actually emits. It was declared text here, which made the
+        // row description tell a typed client `TEXT` and then hand it `true`/`false` — the one
+        // thing a type tag exists to prevent.
         PhysicalPlan::ShowColumns(_) => {
-            vec![ColumnType::Text, ColumnType::Text, ColumnType::Text]
+            vec![ColumnType::Text, ColumnType::Text, ColumnType::Bool]
         },
         _ => Vec::new(),
     }

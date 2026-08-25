@@ -17,24 +17,20 @@
 #
 # So editing a blocked `.slt` file ABOVE its pinned line will fail this suite, and that is working
 # as intended, not a wrong number to revert. The remedy is to re-measure: run the suite, take the
-# line it reports, and put that here. Do not adjust a pin by counting lines in an editor — three of
-# the nine below were first written that way and all three were wrong.
+# line it reports, and put that here. Do not adjust a pin by counting lines in an editor — three
+# pins were first written that way and all three were wrong.
 #
 # A reason is a measurement, not a guess. If you cannot say what the wire did differently, the
 # entry does not belong here yet. Every reason below is the diff the runner actually reported.
 #
-# All nine failures below are scenario disagreements, not harness faults. That distinction is
+# All five failures below are scenario disagreements, not harness faults. That distinction is
 # enforced: a file whose connection breaks is not excusable by this list at all.
-
-# --- `SHOW COLUMNS` sends an untyped `RowDescription` -----------------------------------------
-# The nullable column arrives as `true`/`false` with no type tag to canonicalise by, and the
-# corpus writes `1`/`0`. The runner will not guess from the text, because a genuine TEXT value of
-# `'true'` would be corrupted by the same guess. Either that statement sends a typed description,
-# or the corpus stops assuming the in-process rendering.
-p10_types/array.slt:115             SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
-p1_ddl/int_range.slt:61             SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
-p1_ddl/real_jsonb_fidelity.slt:11   SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
-p1_ddl/varchar_length.slt:14        SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
+#
+# Four entries have already been deleted from this file. `SHOW COLUMNS` declared its nullable
+# column TEXT and emitted a boolean, so the runner had no tag to canonicalise by and refused to
+# guess from the text — guessing would have rewritten a genuine TEXT value of `'true'` to `1`.
+# The refusal was the useful part: it pointed at the type declaration rather than papering over
+# it. Declaring the column what it actually is retired all four at once.
 
 # --- corpus conventions the wire does not share -----------------------------------------------
 p13_functions/string_extra.slt:106  empty TEXT: the in-process runner writes `(empty)`, its own convention; the wire sends an empty field
