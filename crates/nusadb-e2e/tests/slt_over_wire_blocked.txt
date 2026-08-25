@@ -1,0 +1,61 @@
+# Corpus files that cannot run over the wire yet.
+#
+# One per line: `path:line` under `tests/slt`, whitespace, then the reason. Read and enforced by
+# `every_corpus_file_runs_over_the_wire` in `tests/sqllogictest_over_wire.rs`, from both sides —
+# a listed file that starts passing fails the suite, so this list can only shrink.
+#
+# READ THIS BEFORE TRUSTING A LINE BELOW. `run_file` is fail-fast, so a blocked file runs only up
+# to the line named here and NOT ONE RECORD FURTHER. An entry does not mean "one statement in this
+# file diverges" — it means "this file is verified over the wire up to here, and not at all after".
+# For `varchar_length.slt` that is line 14 of 176. The remainder of every file below has never been
+# over a connection, and the way to change that is to move the divergent statement to the end of
+# its file, not to add a longer reason here.
+#
+# The line is pinned for the same reason: a new defect appearing EARLIER in a blocked file would
+# otherwise be absorbed by the entry and reported as nothing. If the divergence moves, the suite
+# fails and asks for a fresh measurement.
+#
+# So editing a blocked `.slt` file ABOVE its pinned line will fail this suite, and that is working
+# as intended, not a wrong number to revert. The remedy is to re-measure: run the suite, take the
+# line it reports, and put that here. Do not adjust a pin by counting lines in an editor — three of
+# the nine below were first written that way and all three were wrong.
+#
+# A reason is a measurement, not a guess. If you cannot say what the wire did differently, the
+# entry does not belong here yet. Every reason below is the diff the runner actually reported.
+#
+# All nine failures below are scenario disagreements, not harness faults. That distinction is
+# enforced: a file whose connection breaks is not excusable by this list at all.
+
+# --- `SHOW COLUMNS` sends an untyped `RowDescription` -----------------------------------------
+# The nullable column arrives as `true`/`false` with no type tag to canonicalise by, and the
+# corpus writes `1`/`0`. The runner will not guess from the text, because a genuine TEXT value of
+# `'true'` would be corrupted by the same guess. Either that statement sends a typed description,
+# or the corpus stops assuming the in-process rendering.
+p10_types/array.slt:115             SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
+p1_ddl/int_range.slt:61             SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
+p1_ddl/real_jsonb_fidelity.slt:11   SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
+p1_ddl/varchar_length.slt:14        SHOW COLUMNS: nullable renders `true`/`false` over the wire, corpus expects `1`/`0`
+
+# --- corpus conventions the wire does not share -----------------------------------------------
+p13_functions/string_extra.slt:106  empty TEXT: the in-process runner writes `(empty)`, its own convention; the wire sends an empty field
+
+# --- outside what a wire harness can reach ----------------------------------------------------
+# This file drives the wire loop directly (`serve_with_shutdown`), not the composition root in
+# `nusadb-server`, so the cluster manager `CREATE DATABASE` needs is not present. That also bounds
+# what this harness covers: the wire protocol, not the server's own wiring.
+p1_ddl/create_drop.slt:84           CREATE DATABASE refused `0A000`: needs the server's database manager, which this harness does not build
+
+# --- the two paths genuinely differ ------------------------------------------------------------
+# `PREPARE`/`EXECUTE`/`DEALLOCATE` are intercepted by `Session::execute` and refused `0A000` over a
+# connection, where a client uses the extended query protocol instead. The corpus pins the embedded
+# behaviour, and these green results were the original evidence that it was reporting on a path no
+# client takes.
+p1_ddl/schema_qualified.slt:228     PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
+p5_advanced/window_filter.slt:145   PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
+
+# `SET TRANSACTION ISOLATION LEVEL` inside a transaction that has not run a statement yet: the wire
+# re-begins the engine transaction at the new level (observably equivalent, and what the SQL rule
+# "before the transaction's first statement" allows), while `Session` refuses whenever a
+# transaction is active. The corpus pins the stricter embedded rule. Which one is right is a
+# decision, not a defect to be quietly patched here.
+p12_txn/isolation_levels.slt:70     SET TRANSACTION in an untouched txn: accepted over the wire, refused by `Session`; corpus expects the refusal

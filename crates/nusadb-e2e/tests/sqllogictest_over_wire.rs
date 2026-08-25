@@ -261,58 +261,334 @@ const BOOL_TAG: u8 = nusadb_wire::column_type_tag(nusadb_core::ColumnType::Bool)
 /// Compile-time, from the taxonomy — see [`canonicalize`].
 const FLOAT_TAG: u8 = nusadb_wire::column_type_tag(nusadb_core::ColumnType::Float);
 
-/// Run one `.slt` file over a real connection.
-fn run_over_wire(path: &str) {
-    let mut runner = Runner::new(|| async { Ok::<_, SltWireError>(WireConnection::new()) });
-    runner
-        .run_file(path)
-        .expect("sqllogictest scenario failed over the wire");
-}
-
 // === Corpus over the wire ===================================================
 //
-// Two beachhead files prove the plumbing on ground the in-process runner already covers, so a
-// failure here is a harness fault rather than an engine one. Everything after them is chosen for
-// the opposite reason: `p12_txn` is transaction control and savepoints, which `Session::execute`
-// intercepts and the in-process corpus therefore reports on without ever having exercised the path
-// a client takes. Those green results were unearned until now.
+// The corpus is globbed rather than hand-listed, because a hand-written list of what runs over the
+// wire is a list that silently stops being true. A new `.slt` file is picked up here with no
+// bookkeeping, and a file that cannot run yet has to say so in [`BLOCKED_LIST`] — where the entry
+// is checked from both sides. That is the property worth the loss of one test name per file: the
+// set of untested files stops being a comment and becomes something the suite enforces.
 
-#[test]
-fn wire_slt_p1_create_table_as() {
-    run_over_wire("tests/slt/p1_ddl/create_table_as.slt");
+/// The corpus root, relative to this crate.
+const CORPUS_ROOT: &str = "tests/slt";
+
+/// Files that cannot run over the wire yet, one per line, each with the reason it was measured to
+/// need. Checked in both directions: an entry that starts passing fails the suite, so the list can
+/// only shrink.
+const BLOCKED_LIST: &str = "tests/slt_over_wire_blocked.txt";
+
+/// Every `.slt` file in the corpus, relative to [`CORPUS_ROOT`], in a stable order.
+fn corpus_files() -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read a corpus directory") {
+            let path = entry.expect("read a corpus entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|ext| ext == "slt") {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("entry is under the corpus root");
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    let root = std::path::Path::new(CORPUS_ROOT);
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
 }
 
-#[test]
-fn wire_slt_p1_drop_cascade() {
-    run_over_wire("tests/slt/p1_ddl/drop_cascade.slt");
+/// One blocked-list entry: where the file first diverges, and why.
+struct Blocked {
+    /// The corpus line the divergence was measured at.
+    ///
+    /// Pinned because `run_file` is fail-fast: a blocked file runs only up to here, and everything
+    /// after it has never been over the wire. Without the line, a *new* defect appearing earlier in
+    /// the same file would be absorbed by the existing entry and reported as nothing at all — the
+    /// list would go on excusing a failure that is no longer the one it describes.
+    line: u32,
+    reason: String,
 }
 
-#[test]
-fn wire_slt_p12_transactions() {
-    run_over_wire("tests/slt/p12_txn/transactions.slt");
+/// The blocked list, parsed as path → entry. Entries are written `path:line  reason`.
+fn blocked_files() -> std::collections::BTreeMap<String, Blocked> {
+    let text = std::fs::read_to_string(BLOCKED_LIST).expect("read the blocked list");
+    let mut entries = std::collections::BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (located, reason) = line
+            .split_once(char::is_whitespace)
+            .unwrap_or_else(|| panic!("blocked-list entry carries no reason: {line}"));
+        let reason = reason.trim();
+        assert!(
+            !reason.is_empty(),
+            "blocked-list entry carries no reason: {line}"
+        );
+        let (path, at) = located
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("blocked-list entry names no line: {line}"));
+        let at = at
+            .parse::<u32>()
+            .unwrap_or_else(|e| panic!("blocked-list entry has an unreadable line number: {e}"));
+        let previous = entries.insert(
+            path.to_owned(),
+            Blocked {
+                line: at,
+                reason: reason.to_owned(),
+            },
+        );
+        // Otherwise the later one wins in silence, and deleting the entry someone is reading does
+        // not change what the suite enforces.
+        assert!(previous.is_none(), "blocked-list names {path} twice");
+    }
+    entries
 }
 
-#[test]
-fn wire_slt_p12_savepoints_nested() {
-    run_over_wire("tests/slt/p12_txn/savepoints_nested.slt");
+/// What running one file produced.
+enum Outcome {
+    Passed,
+    /// The scenario ran and disagreed: an engine refusal, or a result the file did not expect.
+    /// This is what the blocked list may excuse — at the line it names, and no other.
+    Failed {
+        line: Option<u32>,
+        detail: String,
+    },
+    /// The harness itself broke — a transport error, a closed socket, the response deadline.
+    ///
+    /// Deliberately *not* excusable by the blocked list. Folding a broken connection into the same
+    /// bucket as a genuine disagreement is how a harness starts reporting green for scenarios it
+    /// never ran, and this file exists because that already happened once.
+    Broke(String),
 }
 
-// Not yet runnable over the wire, each with a measured reason rather than a guess:
-//
-// * `p1_ddl/int_range.slt` — `SHOW COLUMNS` sends an untyped `RowDescription`, so its boolean
-//   column arrives as `true`/`false` with no tag to canonicalise by, and the corpus writes `1`/`0`.
-//   Guessing from the text would corrupt a genuine TEXT value of `'true'`, so the runner leaves it
-//   alone. Either that statement should send a typed description, or the corpus should not assume
-//   the in-process rendering.
-// * `p13_functions/string_extra.slt` — the in-process runner renders an empty TEXT value as
-//   `(empty)`, which is its own convention rather than anything `sqllogictest` normalises; the wire
-//   sends an empty field. Same shape as the boolean case, and the same choice: no guessing.
-// * Any file using `CREATE DATABASE` — this drives the wire loop directly
-//   (`nusadb_wire::server::serve_with_shutdown`), not the composition root in `nusadb-server`, so
-//   the cluster manager that statement needs is not present. That also bounds what this harness
-//   covers: the wire protocol, not the server's own wiring.
-// * Anything using `LISTEN`/`NOTIFY` — the notify registry is process-global and keyed on database
-//   name, and every file here connects as `nusadb`, so concurrently-running files would cross.
+/// Run one file, surviving whatever it does. A panic in file 3 must not cost the report on the
+/// other ninety.
+fn attempt(path: &str) -> Outcome {
+    let full = format!("{CORPUS_ROOT}/{path}");
+    let ran = std::panic::catch_unwind(|| {
+        let mut runner = Runner::new(|| async { Ok::<_, SltWireError>(WireConnection::new()) });
+        runner.run_file(&full)
+    });
+    match ran {
+        Ok(Ok(())) => Outcome::Passed,
+        Ok(Err(err)) => {
+            let detail = one_line(&err.to_string());
+            Outcome::Failed {
+                line: divergence_line(&detail, path),
+                detail,
+            }
+        },
+        Err(payload) => Outcome::Broke(one_line(&panic_message(payload.as_ref()))),
+    }
+}
+
+/// The corpus line a failure points at, read back out of `sqllogictest`'s own `at <file>:<line>`.
+///
+/// Recovered from the message rather than tracked separately because the message is what the
+/// library reports and what a reader compares against; a second count kept in parallel would be
+/// free to disagree with it.
+fn divergence_line(detail: &str, path: &str) -> Option<u32> {
+    let marker = format!("{CORPUS_ROOT}/{path}:");
+    let after = detail.rsplit_once(&marker)?.1;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panicked with a payload that is not a string".to_owned())
+}
+
+/// Collapse a failure onto one line so the report stays scannable when several files fail at once.
+///
+/// Length is left alone. An earlier version capped this at 240 characters on the grounds that the
+/// reasons are read in a line-oriented file — but nothing writes this text into that file, and the
+/// library puts the location, the SQL and the `-expected|+actual` header ahead of the diff, so the
+/// cap threw away the diff and kept the preamble. Losing the per-file test names is only paid for
+/// if what replaces them says more, not less.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Run the whole corpus over a real connection and hold it to [`BLOCKED_LIST`].
+///
+/// Reports every disagreement rather than the first, because the first tells you nothing about
+/// whether the change you just made moved one file or forty.
+///
+/// Set `SLT_WIRE_ONLY` to a path fragment to run just the files matching it — the one thing the
+/// per-file `#[test]`s this replaced were good for, in the harness whose whole purpose is
+/// diagnosing a wire-only defect. It narrows what runs, never what is enforced: any file it skips
+/// keeps its blocked-list entry untouched rather than being reported as stale.
+#[test]
+fn every_corpus_file_runs_over_the_wire() {
+    let files = corpus_files();
+    // This floor stays, where the one in `the_in_process_runner_names_every_corpus_file` was
+    // removed as decoration. There, the set difference against an independently-maintained list
+    // catches a short walk exactly; here there is no such list, and the blocked entries only touch
+    // five of the fifteen corpus directories — so a walk that stopped reaching, say, `p8_cte`
+    // would still be well above ninety and pass in silence.
+    assert!(
+        files.len() >= 90,
+        "found only {} corpus files — the walk is not reaching them",
+        files.len()
+    );
+
+    let only = std::env::var("SLT_WIRE_ONLY").ok();
+    let selected: Vec<&String> = files
+        .iter()
+        .filter(|file| {
+            only.as_ref()
+                .is_none_or(|frag| file.contains(frag.as_str()))
+        })
+        .collect();
+    assert!(
+        !selected.is_empty(),
+        "SLT_WIRE_ONLY={} matches no corpus file",
+        only.unwrap_or_default()
+    );
+
+    let mut blocked = blocked_files();
+    let mut complaints = Vec::new();
+
+    for file in &selected {
+        // Removed as we go, so whatever is left over is an entry naming a file that no longer
+        // exists — a rename would otherwise leave the list quietly excusing nothing.
+        let excuse = blocked.remove(*file);
+        match (attempt(file), excuse) {
+            (Outcome::Passed, Some(entry)) => complaints.push(format!(
+                "{file}: passes over the wire now — delete its line from {BLOCKED_LIST} (it says: {})",
+                entry.reason
+            )),
+            (Outcome::Failed { line, detail }, Some(entry)) if line != Some(entry.line) => {
+                complaints.push(format!(
+                    "{file}: blocked at line {}, but now diverges at {} — the entry no longer \
+                     describes what happens, and everything between the two is unrun: {detail}",
+                    entry.line,
+                    line.map_or_else(|| "an unreported line".to_owned(), |at| at.to_string())
+                ));
+            },
+            // The two silent outcomes: a file that passes and is not listed, and one that fails at
+            // exactly the line its entry names. This has to sit below the guarded arm above, which
+            // is the one that decides whether a listed failure is still the listed failure.
+            (Outcome::Passed, None) | (Outcome::Failed { .. }, Some(_)) => {},
+            (Outcome::Failed { detail, .. }, None) => {
+                complaints.push(format!("{file}: fails over the wire: {detail}"));
+            },
+            (Outcome::Broke(err), _) => complaints.push(format!(
+                "{file}: the harness broke, which no blocked-list entry excuses: {err}"
+            )),
+        }
+    }
+
+    // Only meaningful over a full run: a filtered run never visits the files it skipped, so their
+    // entries are still there and are not stale.
+    //
+    // Gated on what actually ran, not on whether a filter was configured. `SLT_WIRE_ONLY=` — an
+    // unset CI variable expanded into the command — parses as `Some("")`, which `contains` matches
+    // against every file: the whole corpus runs, the report says "of 93", and the sweep would have
+    // been skipped anyway. A run that looks complete while enforcing one of the two directions is
+    // the failure this file exists to refuse.
+    if selected.len() == files.len() {
+        for (stale, entry) in blocked {
+            complaints.push(format!(
+                "{stale}: listed in {BLOCKED_LIST} but no such corpus file (it says: {})",
+                entry.reason
+            ));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "{} of {} corpus files disagree with {BLOCKED_LIST}:\n{}",
+        complaints.len(),
+        selected.len(),
+        complaints.join("\n")
+    );
+}
+
+/// No corpus file may skip records conditionally, because the two runners answer to different
+/// names.
+///
+/// `sqllogictest` dispatches `skipif`/`onlyif` on `DB::engine_name`, which is `nusadb` in-process
+/// and `nusadb-wire` here, and `halt` stops a file early on both. Any of the three would make a
+/// record run on one path and not the other — a corpus that silently stops covering what it looks
+/// like it covers, which is the defect this whole file exists to remove, one layer further down.
+///
+/// `include` is here for a different reason: it makes the failure location print as the
+/// *including* line, which is the one thing [`divergence_line`] reads, so a blocked entry would
+/// pin a line that is not where the divergence is. Barring it keeps the pins meaning what the
+/// blocked list says they mean.
+///
+/// None are used today; this keeps it that way rather than trusting that nobody reaches for them.
+#[test]
+fn no_corpus_file_hides_records_from_one_runner() {
+    let offenders: Vec<String> = corpus_files()
+        .into_iter()
+        .filter_map(|file| {
+            let text = std::fs::read_to_string(format!("{CORPUS_ROOT}/{file}"))
+                .expect("read a corpus file");
+            let found: Vec<&str> = ["skipif", "onlyif", "halt", "include"]
+                .into_iter()
+                .filter(|directive| {
+                    text.lines()
+                        .any(|line| line.split_whitespace().next() == Some(*directive))
+                })
+                .collect();
+            (!found.is_empty()).then(|| format!("{file}: {}", found.join(", ")))
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "these files would run differently on the two paths — give the wire runner the same \
+         `engine_name` first, or the corpus stops meaning the same thing on each:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The in-process runner still names its files by hand, so hold that list to the corpus too.
+///
+/// It is complete today, and nothing was keeping it that way: a `.slt` file added without its
+/// `#[test]` would sit in the corpus untested, and the only signal would be a test count nobody
+/// reads. The wire runner cannot regress like that because it globs — this gives the other path
+/// the same guarantee without restructuring it.
+#[test]
+fn the_in_process_runner_names_every_corpus_file() {
+    const IN_PROCESS_RUNNER: &str = "tests/sqllogictest.rs";
+
+    let source = std::fs::read_to_string(IN_PROCESS_RUNNER).expect("read the in-process runner");
+    let listed: std::collections::BTreeSet<String> = source
+        .match_indices("run_slt(\"")
+        .filter_map(|(at, marker)| {
+            let rest = &source[at + marker.len()..];
+            rest.find('"').map(|end| rest[..end].to_owned())
+        })
+        .map(|path| path.trim_start_matches("tests/slt/").to_owned())
+        .collect();
+
+    // No count floor here on purpose: a scan that stopped matching would leave `listed` empty and
+    // every corpus file would surface in `unlisted` below, which says the same thing exactly. A
+    // floor would only look like it was guarding something.
+    let corpus: std::collections::BTreeSet<String> = corpus_files().into_iter().collect();
+    let unlisted: Vec<&String> = corpus.difference(&listed).collect();
+    let missing: Vec<&String> = listed.difference(&corpus).collect();
+
+    assert!(
+        unlisted.is_empty(),
+        "in the corpus but never run in-process — add a `#[test]` to {IN_PROCESS_RUNNER}: {unlisted:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "run in-process but no such corpus file — a rename left {IN_PROCESS_RUNNER} behind: {missing:?}"
+    );
+}
 
 /// Pin the wire's own rendering, so canonicalisation cannot quietly absorb a change to it.
 ///
