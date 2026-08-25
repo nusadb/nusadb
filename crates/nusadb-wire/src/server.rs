@@ -908,7 +908,7 @@ where
                     let copy_actor = effective_user(&user, &settings);
                     let outcome = if let Some(msg) = copy_rls_block(
                         engine.as_ref(),
-                        &copy.table,
+                        &copy,
                         &copy_actor,
                         copy.direction,
                     ) {
@@ -1556,7 +1556,7 @@ where
         if let Some(msg) = copy_access_verdict(
             engine.as_ref(),
             txn,
-            &copy.table,
+            &copy,
             &actor,
             nusadb_sql::ast::CopyDirection::From,
         ) {
@@ -1606,7 +1606,7 @@ where
         if let Some(msg) = copy_access_verdict(
             engine.as_ref(),
             txn,
-            &copy.table,
+            &copy,
             &actor,
             nusadb_sql::ast::CopyDirection::To,
         ) {
@@ -2131,14 +2131,14 @@ where
 /// `None` to proceed. If the RLS flag cannot be read, it fails closed.
 fn copy_rls_block(
     engine: &dyn StorageEngine,
-    table: &str,
+    copy: &nusadb_sql::ast::Copy,
     user: &str,
     direction: nusadb_sql::ast::CopyDirection,
 ) -> Option<String> {
     let Ok(txn) = engine.begin(IsolationLevel::default()) else {
         return Some("could not verify access for COPY".to_owned());
     };
-    let verdict = copy_access_verdict(engine, txn, table, user, direction);
+    let verdict = copy_access_verdict(engine, txn, copy, user, direction);
     let _ = engine.rollback(txn);
     verdict
 }
@@ -2148,10 +2148,14 @@ fn copy_rls_block(
 fn copy_access_verdict(
     engine: &dyn StorageEngine,
     txn: nusadb_core::TxnId,
-    table: &str,
+    copy: &nusadb_sql::ast::Copy,
     user: &str,
     direction: nusadb_sql::ast::CopyDirection,
 ) -> Option<String> {
+    // Taken as the whole statement rather than a name, because the name alone cannot be checked:
+    // the qualifier decides which object the load will touch, and a check keyed without it grants
+    // access to `app.orders` on the strength of owning `public.orders`.
+    let table = &copy.table;
     // Superuser is read from the role catalog rather than from the bootstrap name alone, so a role
     // holding the attribute through a membership is recognised too. A failed read answers "not a
     // superuser", which is the restrictive direction.
@@ -2172,12 +2176,19 @@ fn copy_access_verdict(
         nusadb_sql::ast::CopyDirection::To => nusadb_sql::ast::Privilege::Select,
         nusadb_sql::ast::CopyDirection::From => nusadb_sql::ast::Privilege::Insert,
     };
-    // The privilege catalog keys tables by canonical `schema.name`; an unqualified COPY resolves
-    // against the default namespace, so check it under the same key.
-    let object = if table.contains('.') {
-        table.to_owned()
-    } else {
-        format!("{}.{table}", nusadb_core::engine::PUBLIC_SCHEMA)
+    // The privilege catalog keys tables by canonical `schema.name`, so this has to name the exact
+    // object the load will resolve: a qualifier when the statement carried one, the default
+    // namespace when it did not — which is also what `lookup_copy_table` does.
+    let object = match &copy.schema {
+        Some(schema) => format!("{schema}.{table}"),
+        // A dot already inside an unqualified name — a flat `information_schema.x`, or a quoted
+        // identifier like `"a.b"`. Kept verbatim, as it always was. This does NOT agree with the
+        // load, which resolves such a name inside `public`; it is safe only because no writer ever
+        // records an owner or grant under a dot-bearing bare name, so the lookup falls back to the
+        // superuser and a lesser role is denied. Fail-closed by accident of the key form, not by
+        // agreement — do not read this arm as the qualified one above it.
+        None if table.contains('.') => table.clone(),
+        None => format!("{}.{table}", nusadb_core::engine::PUBLIC_SCHEMA),
     };
     match nusadb_sql::rbac::has_privilege(
         engine,
@@ -2190,7 +2201,7 @@ fn copy_access_verdict(
         Ok(true) => {},
         Ok(false) => {
             return Some(format!(
-                "permission denied: {} on table `{table}`",
+                "permission denied: {} on table `{object}`",
                 privilege.as_str()
             ));
         },

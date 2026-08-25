@@ -4782,10 +4782,22 @@ fn comment_on_table() {
     assert_eq!(
         c.target,
         ast::CommentTarget::Table {
+            schema: None,
             table: "users".to_owned(),
         }
     );
     assert_eq!(c.comment.as_deref(), Some("the user accounts"));
+
+    // A qualifier is carried rather than refused; `COMMENT ON TABLE app.users` used to be met
+    // with "it does not resolve one yet" while `SELECT ... FROM app.users` already worked.
+    let q = comment("COMMENT ON TABLE app.users IS 'x'");
+    assert_eq!(
+        q.target,
+        ast::CommentTarget::Table {
+            schema: Some("app".to_owned()),
+            table: "users".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -5101,10 +5113,20 @@ fn create_table_clustered_by_is_rejected() {
 #[test]
 fn comment_on_schema_qualified_column_is_rejected() {
     // `schema.table.column` must not silently collapse to `table.column`.
-    assert!(matches!(
-        parse("COMMENT ON COLUMN app.users.id IS 'x'"),
-        Err(Error::Unsupported(_)),
-    ));
+    // The message, not just the variant. Matching `Unsupported(_)` cannot tell the three-part arm
+    // from the catch-all it was split out of, so the wording — which is the whole point of that
+    // arm — would go untested, and a mangled string in it would pass a full suite.
+    let Err(Error::Unsupported(message)) = parse("COMMENT ON COLUMN app.users.id IS 'x'") else {
+        panic!("a schema-qualified column name is not resolved here yet");
+    };
+    assert!(
+        message.contains("a schema qualifier on COMMENT ON COLUMN"),
+        "refused by the wrong arm, or the wording drifted: {message}"
+    );
+    assert!(
+        !message.contains("  "),
+        "the message carries a run of spaces, which is how a generated line continuation          reaches a user: {message}"
+    );
 }
 
 // --- decimal literals are exact NUMERIC, not f64 ------------------

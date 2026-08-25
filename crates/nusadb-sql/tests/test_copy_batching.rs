@@ -50,7 +50,12 @@ fn rows(engine: &dyn StorageEngine, session: &mut Session, sql: &str) -> Vec<Row
 }
 
 /// Parse a `COPY <table> ... FROM STDIN` statement and drive `data` through the executor's
-/// `copy_from` — the same entry point the wire server calls with the client's `CopyData` payload.
+/// `copy_from`.
+///
+/// This is the *load*, not the whole wire path: the server runs its access check first and only
+/// then calls `copy_from_in`. Nothing asserted here can speak for privileges or row-level
+/// security — those are pinned in the wire crate's own tests, and a COPY change has to be
+/// checked there as well as here.
 fn copy(engine: &dyn StorageEngine, sql: &str, data: &str) -> Result<usize, Error> {
     let Statement::Copy(copy) = parse(sql).unwrap() else {
         panic!("not a COPY statement: {sql}");
@@ -457,4 +462,46 @@ fn create_unique_index_rejects_an_existing_duplicate() {
         msg.contains("unique") || msg.contains("duplicate"),
         "CREATE UNIQUE INDEX over duplicate data is rejected: {err}"
     );
+}
+
+/// `COPY` resolves a schema qualifier, in both directions.
+///
+/// It went through a name helper that understood a bare name or `public.` and refused anything
+/// else — so a user who could already `SELECT ... FROM app.t` had no way to export it, with the
+/// working alternative in plain sight.
+///
+/// The target is shadowed by a same-named table in the default schema holding different rows, so
+/// accepting the qualifier is not enough: it has to reach the right table in each direction.
+#[test]
+fn copy_resolves_a_schema_qualifier_in_both_directions() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+
+    exec(engine, &mut session, "CREATE SCHEMA app");
+    exec(engine, &mut session, "CREATE TABLE app.t (id INT NOT NULL)");
+    exec(engine, &mut session, "CREATE TABLE t (id INT NOT NULL)");
+    exec(engine, &mut session, "INSERT INTO t VALUES (999)");
+
+    assert_eq!(
+        copy(engine, "COPY app.t FROM STDIN", "1\n2\n").unwrap(),
+        2,
+        "COPY FROM refused or mis-resolved the qualifier"
+    );
+
+    // Reading back through the qualifier must show the loaded rows, not the shadowing table's.
+    assert_eq!(copy_out(engine, "COPY app.t TO STDOUT"), "1\n2\n");
+    // And the default-schema table must be untouched by a qualified load.
+    assert_eq!(copy_out(engine, "COPY t TO STDOUT"), "999\n");
+}
+
+/// A name with more parts than `schema.table` stays rejected on the path just widened.
+#[test]
+fn copy_still_rejects_a_three_part_name() {
+    // The message, not just the variant: `Error::Unsupported` alone would also be satisfied by
+    // COPY-to-STDOUT support being withdrawn, and this test would go on claiming to pin name
+    // arity.
+    assert!(matches!(
+        parse("COPY d.app.t TO STDOUT"),
+        Err(Error::Unsupported(m)) if m.contains("more than two parts")
+    ));
 }

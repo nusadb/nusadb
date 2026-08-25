@@ -46,6 +46,8 @@ pub enum InsertSource {
 /// only the shape and the text-format options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Copy {
+    /// Schema qualifier on the table, when the statement carried one.
+    pub schema: Option<String>,
     /// Target (FROM) or source (TO) table.
     pub table: String,
     /// Explicit column list; empty means "all columns, in declaration order".

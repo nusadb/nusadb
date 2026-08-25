@@ -1276,6 +1276,31 @@ fn resolve_arbiter(
     }
 }
 
+/// Resolve the table a `COPY` names.
+///
+/// An explicit qualifier resolves in exactly that schema. Without one the lookup is left as it was
+/// — the public namespace — rather than quietly gaining a search-path walk that this path has no
+/// session to perform.
+///
+/// The wire layer's access check keys the privilege catalog by the same rule, and must keep doing
+/// so: a check that drops the qualifier is asking about a different table than the one loaded.
+fn lookup_copy_table(
+    copy: &ast::Copy,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<TableSchema, Error> {
+    let found = match &copy.schema {
+        Some(schema) => engine.lookup_table_as_of_in(txn, schema, &copy.table)?,
+        None => engine.lookup_table_as_of(txn, &copy.table)?,
+    };
+    found.ok_or_else(|| Error::TableNotFound {
+        name: copy.schema.as_ref().map_or_else(
+            || copy.table.clone(),
+            |schema| crate::analyzer::qualified_display(schema, &copy.table),
+        ),
+    })
+}
+
 /// Execute `COPY <table> FROM STDIN`: resolve the target columns, tokenize the text-format
 /// `data` into rows, parse each field into a value of the column's type, and bulk-insert them all
 /// under `txn`. Returns the number of rows inserted. The whole load is one transaction at the
@@ -1286,11 +1311,7 @@ pub(super) fn run_copy_from(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<usize, Error> {
-    let table = engine
-        .lookup_table_as_of(txn, &copy.table)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: copy.table.clone(),
-        })?;
+    let table = lookup_copy_table(copy, engine, txn)?;
     let columns = resolve_copy_columns(copy, &table)?;
     let target_types: Vec<ColumnType> = columns
         .iter()
@@ -1408,11 +1429,7 @@ pub(super) fn run_copy_to(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(usize, String), Error> {
-    let table = engine
-        .lookup_table_as_of(txn, &copy.table)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: copy.table.clone(),
-        })?;
+    let table = lookup_copy_table(copy, engine, txn)?;
     let columns = resolve_copy_columns(copy, &table)?;
     let rows = scan_rows(&table, engine, txn)?;
 

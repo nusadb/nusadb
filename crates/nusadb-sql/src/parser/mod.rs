@@ -2860,9 +2860,8 @@ fn parse_comment_on(sql: &str) -> Result<ast::Statement, Error> {
 
     let target = if parser.parse_keyword(Keyword::TABLE) {
         let name = parser.parse_object_name(false).map_err(syntax)?;
-        ast::CommentTarget::Table {
-            table: object_name(&name)?,
-        }
+        let (schema, table) = table_ref_name(&name)?;
+        ast::CommentTarget::Table { schema, table }
     } else if parser.parse_keyword(Keyword::COLUMN) {
         let name = parser.parse_object_name(false).map_err(syntax)?;
         let (table, column) = table_and_column(&name)?;
@@ -2927,7 +2926,7 @@ fn parse_copy_stmt(sql: &str) -> Result<ast::Statement, Error> {
     let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
 
     parser.expect_keyword(Keyword::COPY).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let (schema, table) = table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
 
     let columns = if parser.consume_token(&Token::LParen) {
         let cols = parser
@@ -2979,6 +2978,7 @@ fn parse_copy_stmt(sql: &str) -> Result<ast::Statement, Error> {
         }
     }
     Ok(ast::Statement::Copy(ast::Copy {
+        schema,
         table,
         columns,
         direction,
@@ -3125,15 +3125,19 @@ fn copy_optional_bool(parser: &mut Parser) -> bool {
     true
 }
 
-/// Split a `COMMENT ON COLUMN` object name into `(table, column)`. The column must be
-/// table-qualified (`table.column`, optionally schema-qualified); a bare `column` has no table to
-/// resolve against and is rejected.
+/// Split a `COMMENT ON COLUMN` object name into `(table, column)`. The column must be spelled
+/// `table.column`; a bare `column` has no table to resolve against.
 fn table_and_column(name: &sql::ObjectName) -> Result<(String, String), Error> {
     match name.0.as_slice() {
         [table, column] => Ok((fold_part(table)?, fold_part(column)?)),
-        // A schema-qualified `schema.table.column` must not silently collapse to `table.column`
-        // (which would answer for the wrong table); a bare `column` has no table to resolve
-        // against.
+        // `schema.table.column` has exactly one reading and is a legitimate thing to write — it is
+        // simply not plumbed through here yet, while `COMMENT ON TABLE` does resolve a qualifier.
+        // Saying so beats the old message, which told a user whose name *was* table-qualified that
+        // it was not.
+        [_, _, _] => unsupported(
+            "a schema qualifier on COMMENT ON COLUMN (name the column as `table.column`; \
+             COMMENT ON TABLE does take a schema)",
+        ),
         _ => unsupported("COMMENT ON COLUMN requires a table-qualified column name (table.column)"),
     }
 }

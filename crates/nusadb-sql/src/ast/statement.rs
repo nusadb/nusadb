@@ -472,6 +472,8 @@ pub struct CommentOn {
 pub enum CommentTarget {
     /// `COMMENT ON TABLE <table>`.
     Table {
+        /// Schema qualifier, when the statement carried one.
+        schema: Option<String>,
         /// Target table name.
         table: String,
     },

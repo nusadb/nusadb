@@ -40,8 +40,13 @@ fn rows(engine: &dyn StorageEngine, session: &mut Session, sql: &str) -> Vec<Row
     rows
 }
 
+/// Whether `sql` is refused *for having too many name parts*.
+///
+/// Matching only `Error::Unsupported` would also accept a refusal for an unrelated reason — the
+/// statement losing support entirely, say — and quietly go on reporting that three-part names are
+/// rejected. The message is what distinguishes the two.
 fn rejected(sql: &str) -> bool {
-    matches!(parse(sql), Err(Error::Unsupported(_)))
+    matches!(parse(sql), Err(Error::Unsupported(m)) if m.contains("more than two parts"))
 }
 
 #[test]
@@ -155,6 +160,8 @@ fn deeper_qualifiers_stay_rejected() {
     assert!(rejected("ANALYZE d.app.t"));
     assert!(rejected("SHOW COLUMNS FROM d.app.t"));
     assert!(rejected("CREATE TABLE d.app.u AS SELECT 1 AS a"));
+    assert!(rejected("COMMENT ON TABLE d.app.t IS 'x'"));
+    assert!(rejected("COPY d.app.t TO STDOUT"));
     // A `public`-qualified table with a non-public column qualifier (or extra parts) is rejected.
     assert!(rejected("SELECT a.b.c.d FROM t"));
     assert!(rejected("SELECT public.t.a.extra FROM public.t"));
@@ -182,6 +189,22 @@ fn table_statements_resolve_a_schema_qualifier() {
     // Names a column that exists only in `app.t`, so resolving to the default `t` would fail
     // rather than quietly analyse the wrong table.
     exec(engine, &mut session, "ANALYZE app.t (b)");
+
+    // `COMMENT ON TABLE` resolves its target and discards the text — nothing persists a comment
+    // yet. Routing it through the shared resolver also subjects it to the reserved-catalog and
+    // row-level-security gates every other table-resolving statement already passes. Neither is
+    // observable here: this `Catalog` reports `is_superuser() == true` and `rls_enabled() == false`
+    // by default, so the RLS gate cannot fire in this harness at all.
+    //
+    // The target has to be a table that exists ONLY in `app`: against the shadowed `app.t`,
+    // ignoring the qualifier would still find the default `t` and pass — a test proving the
+    // qualifier was accepted rather than resolved.
+    exec(engine, &mut session, "CREATE TABLE app.only_here (a INT)");
+    exec(
+        engine,
+        &mut session,
+        "COMMENT ON TABLE app.only_here IS 'the app table'",
+    );
 
     // `SHOW COLUMNS` must describe `app.t`, not the default `t` that shadows it.
     let described = rows(engine, &mut session, "SHOW COLUMNS FROM app.t");

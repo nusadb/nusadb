@@ -2502,6 +2502,59 @@ async fn copy_is_refused_without_the_matching_table_privilege() {
         "COPY FROM still needs INSERT"
     );
 
+    // A qualified COPY must be checked against the object it will actually touch.
+    //
+    // The privilege catalog keys tables by canonical `schema.name`. When the qualifier is dropped
+    // on the way to that key, owning a same-named table in the default schema buys access to a
+    // table in another one — and owning it is self-serve, because creating a table makes you its
+    // owner. The load resolves `app_ns.orders`; a check keyed `public.orders` is asking about a
+    // different table entirely.
+    assert!(outcome(&mut su, "CREATE SCHEMA app_ns").await.is_none());
+    assert!(
+        outcome(&mut su, "CREATE TABLE app_ns.orders (id INT NOT NULL)")
+            .await
+            .is_none()
+    );
+    assert!(
+        outcome(&mut su, "INSERT INTO app_ns.orders VALUES (42)")
+            .await
+            .is_none()
+    );
+    // `app` owns a same-named table in the default schema, and nothing in `app_ns`.
+    assert!(
+        outcome(&mut app, "CREATE TABLE orders (id INT NOT NULL)")
+            .await
+            .is_none()
+    );
+    let cross = outcome(&mut app, "COPY app_ns.orders TO STDOUT")
+        .await
+        .expect("owning public.orders must not grant access to app_ns.orders");
+    assert!(
+        cross.contains("permission denied"),
+        "refusal should name the privilege, got: {cross}"
+    );
+    let cross_write = outcome(&mut app, "COPY app_ns.orders FROM STDIN")
+        .await
+        .expect("owning public.orders must not grant writes to app_ns.orders");
+    assert!(
+        cross_write.contains("permission denied"),
+        "refusal should name the privilege, got: {cross_write}"
+    );
+
+    // And the check is not merely refusing everything qualified: a real grant on the real object
+    // opens it, so the key it builds is the one the catalog actually holds.
+    assert!(
+        outcome(&mut su, "GRANT SELECT ON app_ns.orders TO app")
+            .await
+            .is_none()
+    );
+    assert!(
+        outcome(&mut app, "COPY app_ns.orders TO STDOUT")
+            .await
+            .is_none(),
+        "COPY TO should be permitted once SELECT is granted on the qualified table"
+    );
+
     terminate_conn(app, app_handle).await;
     terminate_conn(su, su_handle).await;
 }

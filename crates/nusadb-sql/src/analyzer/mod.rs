@@ -1196,16 +1196,14 @@ fn txn_characteristics(settings: &ast::TransactionSettings) -> TxnCharacteristic
 /// column) must exist. The comment text itself needs no validation. Persisting the comment is
 /// optional treaty work, so the resolved plan carries only the target names + text.
 fn analyze_comment(c: ast::CommentOn, catalog: &dyn Catalog) -> Result<CommentPlan, Error> {
-    let (table_name, column) = match c.target {
-        ast::CommentTarget::Table { table } => (table, None),
-        ast::CommentTarget::Column { table, column } => (table, Some(column)),
+    let (qualifier, table_name, column) = match c.target {
+        ast::CommentTarget::Table { schema, table } => (schema, table, None),
+        // `COMMENT ON COLUMN` spells its target `table.column`, so a schema would make it three
+        // parts — a distinct decision from this one, and left refused rather than guessed at.
+        ast::CommentTarget::Column { table, column } => (None, table, Some(column)),
     };
-    enforce_system_catalog(&table_name, catalog)?;
-    let schema = catalog
-        .lookup_table(&table_name)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: table_name.clone(),
-        })?;
+    // `resolve_table` enforces the reserved-catalog rule (and the RLS gate) itself.
+    let schema = resolve_table(qualifier.as_deref(), &table_name, catalog)?;
     if let Some(column) = &column
         && !schema.columns.iter().any(|c| &c.name == column)
     {
