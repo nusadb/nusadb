@@ -191,6 +191,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::Dropped
         | ExecutionResult::ViewCreated
         | ExecutionResult::ViewDropped
+        | ExecutionResult::MaterializedViewDropped
         | ExecutionResult::PolicyCreated
         | ExecutionResult::PolicyDropped
         | ExecutionResult::TypeCreated

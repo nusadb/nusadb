@@ -938,6 +938,10 @@ async fn each_kind_of_object_reports_its_own_command_tag() {
     let cases: &[(&str, &str)] = &[
         ("CREATE TABLE t (id INT)", "CREATE TABLE"),
         ("CREATE VIEW v AS SELECT id FROM t", "CREATE VIEW"),
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t",
+            "CREATE MATERIALIZED VIEW",
+        ),
         ("CREATE TYPE mood AS ENUM ('ok')", "CREATE TYPE"),
         ("CREATE TYPE addr AS (street TEXT)", "CREATE TYPE"),
         ("CREATE DOMAIN pos AS INT", "CREATE DOMAIN"),
@@ -946,7 +950,12 @@ async fn each_kind_of_object_reports_its_own_command_tag() {
         ("DROP DOMAIN pos", "DROP DOMAIN"),
         ("DROP TYPE addr", "DROP TYPE"),
         ("DROP TYPE mood", "DROP TYPE"),
+        // A materialized view drop reports its own object (not a plain `DROP VIEW`); the two are
+        // separated at execution by whether a backing table exists.
+        ("DROP MATERIALIZED VIEW mv", "DROP MATERIALIZED VIEW"),
         ("DROP VIEW v", "DROP VIEW"),
+        // The `VACUUM` tag carries no table count.
+        ("VACUUM", "VACUUM"),
         ("DROP TABLE t", "DROP TABLE"),
     ];
     let mut wrong = Vec::new();

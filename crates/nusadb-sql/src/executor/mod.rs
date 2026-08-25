@@ -236,6 +236,10 @@ pub enum ExecutionResult {
     /// `REFRESH MATERIALIZED VIEW` recomputed the view — the number of rows the backing table now
     /// holds.
     MaterializedViewRefreshed(usize),
+    /// `DROP MATERIALIZED VIEW` dropped the view's backing table. It is distinct from a plain
+    /// `DROP VIEW` so the command tag reports the right object. The parser maps both forms to one
+    /// statement, so they are separated at execution by whether a backing table exists.
+    MaterializedViewDropped,
     /// `GRANT` — privileges or role membership were recorded.
     Granted,
     /// `REVOKE` — privileges or role membership were withdrawn.
@@ -3953,16 +3957,16 @@ fn run_drop_view(
         engine.drop_table(txn, schema.id)?;
         delete_view_def(engine, txn, MATVIEW_CATALOG, &p.name)?;
         ivm::unregister_ivm_view(engine, txn, &p.name)?;
-    } else {
-        // No backing table — it may be a non-materialized view (catalog entry only).
-        let removed = delete_view_def(engine, txn, VIEW_CATALOG, &p.name)?;
-        // Forget any explicit column-name list (no-op if the view declared none).
-        delete_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name)?;
-        if !removed && !p.if_exists {
-            return Err(Error::TableNotFound {
-                name: p.name.clone(),
-            });
-        }
+        return Ok(ExecutionResult::MaterializedViewDropped);
+    }
+    // No backing table — it may be a non-materialized view (catalog entry only).
+    let removed = delete_view_def(engine, txn, VIEW_CATALOG, &p.name)?;
+    // Forget any explicit column-name list (no-op if the view declared none).
+    delete_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name)?;
+    if !removed && !p.if_exists {
+        return Err(Error::TableNotFound {
+            name: p.name.clone(),
+        });
     }
     Ok(ExecutionResult::ViewDropped)
 }

@@ -4489,7 +4489,8 @@ fn command_tag(result: &ExecutionResult) -> String {
         },
         ExecutionResult::SavepointCreated => "SAVEPOINT".to_owned(),
         ExecutionResult::SavepointReleased => "RELEASE".to_owned(),
-        ExecutionResult::Vacuumed(n) => format!("VACUUM {n}"),
+        // The reference engine's `VACUUM` tag carries no count, regardless of how many tables ran.
+        ExecutionResult::Vacuumed(_) => "VACUUM".to_owned(),
         ExecutionResult::Reindexed => "REINDEX".to_owned(),
         ExecutionResult::CheckpointDone => "CHECKPOINT".to_owned(),
         ExecutionResult::Analyzed { .. } | ExecutionResult::AnalyzedAll { .. } => {
@@ -4518,6 +4519,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::FunctionDropped => "DROP FUNCTION".to_owned(),
         ExecutionResult::MaterializedViewCreated => "CREATE MATERIALIZED VIEW".to_owned(),
         ExecutionResult::MaterializedViewRefreshed(_) => "REFRESH MATERIALIZED VIEW".to_owned(),
+        ExecutionResult::MaterializedViewDropped => "DROP MATERIALIZED VIEW".to_owned(),
     }
 }
 
