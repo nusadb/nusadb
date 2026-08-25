@@ -8224,10 +8224,11 @@ fn b451_date_time_functions_end_to_end() {
                     Value::Float(2024.0),
                     Value::Float(6.0),
                     Value::Timestamp(month_start),
-                    // 2024-01-15 + 1 month + 15 days = 2024-03-01 (Feb 2024 = 29 days).
+                    // A day borrow counts the earlier instant's own month: 1-15 borrows January's
+                    // 31 days, giving 17 (oracle-checked: `1 mon 17 days`), not February's 29.
                     Value::Interval(nusadb_sql::interval::Interval {
                         months: 1,
-                        days: 15,
+                        days: 17,
                         micros: 0,
                     }),
                 ]]
