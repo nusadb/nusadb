@@ -833,7 +833,10 @@ pub(super) fn key_atoms(
             | ast::Value::Geometry(_)
             | ast::Value::Tsvector(_)
             | ast::Value::Tsquery(_)
-            | ast::Value::Xml(_) => return Ok(None),
+            | ast::Value::Xml(_)
+            // ENUM is not a hash-join key type yet (no `KeyAtom`); the row falls back to the
+            // compare-based path, which orders enums by ordinal correctly.
+            | ast::Value::Enum { .. } => return Ok(None),
         }
     }
     Ok(Some(atoms))

@@ -208,6 +208,8 @@ pub(crate) fn skip_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<usi
         | ColumnType::Tsvector
         | ColumnType::Tsquery
         | ColumnType::Xml => Ok(read_text_field(bytes, pos)?.1),
+        // ENUM: a u32 ordinal then a length-prefixed label; skip both (matching `decode_value`).
+        ColumnType::Enum => Ok(read_text_field(bytes, pos + 4)?.1),
         // BYTEA: `[u32 len][len raw bytes]`, no UTF-8 validation (matching `decode_value`).
         ColumnType::Bytes => {
             let len = u32::from_le_bytes(read_array::<4>(bytes, pos)?) as usize;
@@ -425,6 +427,11 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         (ast::Value::Tsvector(s), ColumnType::Tsvector)
         | (ast::Value::Tsquery(s), ColumnType::Tsquery)
         | (ast::Value::Xml(s), ColumnType::Xml) => put_fulltext_text(s, out)?,
+        // ENUM: the u32 declaration-order ordinal, then the length-prefixed label text.
+        (ast::Value::Enum { ordinal, label }, ColumnType::Enum) => {
+            out.extend_from_slice(&ordinal.to_le_bytes());
+            put_fulltext_text(label, out)?;
+        },
         (ast::Value::Text(s), ColumnType::Tsvector) => {
             put_fulltext_text(&crate::fts::parse_tsvector(s)?, out)?;
         },
@@ -836,6 +843,19 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
             let (text, next) = read_text_field(bytes, pos)?;
             Ok((ast::Value::Xml(text.to_owned()), next))
         },
+        // ENUM: a u32 declaration-order ordinal, then the length-prefixed label text. The ordinal is
+        // stored so comparison never needs the enum type's label list at read time.
+        ColumnType::Enum => {
+            let ordinal = u32::from_le_bytes(read_array::<4>(bytes, pos)?);
+            let (text, next) = read_text_field(bytes, pos + 4)?;
+            Ok((
+                ast::Value::Enum {
+                    ordinal,
+                    label: text.to_owned(),
+                },
+                next,
+            ))
+        },
         // NUMERIC: 16-byte i128 mantissa + 1-byte scale.
         ColumnType::Numeric { .. } => {
             let mant = i128::from_le_bytes(read_array::<16>(bytes, pos)?);
@@ -959,6 +979,7 @@ pub(crate) fn runtime_type_of(value: &ast::Value) -> ColumnType {
         ast::Value::Tsvector(_) => ColumnType::Tsvector,
         ast::Value::Tsquery(_) => ColumnType::Tsquery,
         ast::Value::Xml(_) => ColumnType::Xml,
+        ast::Value::Enum { .. } => ColumnType::Enum,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -1074,6 +1095,44 @@ mod tests {
         let bytes = encode(&row, &schema()).unwrap();
         let back = decode(&bytes, &schema()).unwrap();
         assert_eq!(back, row);
+    }
+
+    #[test]
+    fn enum_value_round_trips_ordinal_and_label() {
+        // An enum stores its declaration-order ordinal alongside its label; both survive a
+        // storage round-trip so comparison never needs the type's label list at read time.
+        let row = vec![
+            Value::Int(7),
+            Value::Enum {
+                ordinal: 2,
+                label: "high".to_owned(),
+            },
+        ];
+        let schema = [ColumnType::Int, ColumnType::Enum];
+        let bytes = encode(&row, &schema).unwrap();
+        let back = decode(&bytes, &schema).unwrap();
+        assert_eq!(back, row);
+    }
+
+    #[test]
+    fn enum_compares_by_ordinal_not_label_bytes() {
+        use crate::executor::eval::compare;
+        use std::cmp::Ordering;
+        // 'low' (ordinal 0) precedes 'high' (ordinal 2) by declaration order, even though 'high'
+        // sorts *before* 'low' byte-wise — proving the ordinal, not the label text, drives ordering.
+        let low = Value::Enum {
+            ordinal: 0,
+            label: "low".to_owned(),
+        };
+        let high = Value::Enum {
+            ordinal: 2,
+            label: "high".to_owned(),
+        };
+        assert_eq!(compare(&low, &high), Ordering::Less);
+        assert_eq!(compare(&high, &low), Ordering::Greater);
+        assert_eq!(compare(&low, &low), Ordering::Equal);
+        // Byte order would say the opposite — guard that we did not fall back to it.
+        assert_eq!("high".cmp("low"), Ordering::Less);
     }
 
     #[test]

@@ -96,6 +96,9 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         ast::Value::Bytes(b) => encode_ordered_bytes(b, out),
         // NUMERIC: a fixed-width canonical decimal layout (see `encode_numeric`).
         ast::Value::Numeric(d) => encode_numeric(d, out)?,
+        // ENUM: the declaration-order ordinal as a big-endian u32 — monotonic, so a btree range scan
+        // over the key follows declaration order (matching `compare`).
+        ast::Value::Enum { ordinal, .. } => out.extend_from_slice(&ordinal.to_be_bytes()),
         // No v1 order-preserving form. INET/CIDR join here because their network order is not a
         // byte order (the masked prefix is compared before the mask), so a lexicographic key would
         // mis-order them; equality-only indexing is a follow-up.

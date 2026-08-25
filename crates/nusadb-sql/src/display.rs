@@ -17,6 +17,8 @@ pub fn value_text(v: &Value) -> String {
         Value::Float(f) => f.to_string(),
         // Full-text values render as their stored canonical text, like plain text.
         Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) | Value::Xml(s) => s.clone(),
+        // An enum renders as its label; the ordinal is an ordering detail, never shown.
+        Value::Enum { label, .. } => label.clone(),
         // JSON renders in the spaced display form (`{"a": 1}`); the stored form stays compact.
         Value::Json(s) => crate::json::display_form(s),
         Value::Date(d) => temporal::format_date(*d),

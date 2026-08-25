@@ -90,6 +90,7 @@ pub(super) fn analyze_expr_agg(
                 ast::Value::Tsvector(_) => ColumnType::Tsvector,
                 ast::Value::Tsquery(_) => ColumnType::Tsquery,
                 ast::Value::Xml(_) => ColumnType::Xml,
+                ast::Value::Enum { .. } => ColumnType::Enum,
                 ast::Value::Inet(a) => a.column_type(),
                 ast::Value::Bit(b) => crate::bit::column_type(b),
                 ast::Value::Range(r) => ColumnType::Range(r.kind),

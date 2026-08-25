@@ -363,7 +363,9 @@ pub(super) const fn is_hash_safe_key_type(ty: nusadb_core::ColumnType) -> bool {
         | T::Geometry(_)
         | T::Tsvector
         | T::Tsquery
-        | T::Xml => false,
+        | T::Xml
+        // ENUM is not a hash-probe key type yet (the join path falls back to compare-based matching).
+        | T::Enum => false,
     }
 }
 
@@ -3537,6 +3539,9 @@ pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
         ColumnType::Tsvector => "tsvector",
         ColumnType::Tsquery => "tsquery",
         ColumnType::Xml => "xml",
+        // A user-defined enum reports the standard `USER-DEFINED`; its `udt_name` column carries the
+        // enum type name (wired where the enum name is known).
+        ColumnType::Enum => "USER-DEFINED",
     }
 }
 

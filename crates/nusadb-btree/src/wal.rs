@@ -905,6 +905,9 @@ fn encode_column_type(out: &mut Vec<u8>, ty: ColumnType) {
         ColumnType::Tsquery => out.push(31),
         // Tag 32; XML carries no payload (stored as its original text).
         ColumnType::Xml => out.push(32),
+        // Tag 33; an enum column carries no payload here — each value stores its own ordinal + label,
+        // and the enum type name is tracked by the SQL layer's catalog, not this physical schema.
+        ColumnType::Enum => out.push(33),
     }
 }
 
@@ -975,6 +978,7 @@ fn decode_column_type(bytes: &[u8], at: &mut usize) -> Option<ColumnType> {
         30 => ColumnType::Tsvector,
         31 => ColumnType::Tsquery,
         32 => ColumnType::Xml,
+        33 => ColumnType::Enum,
         _ => return None,
     })
 }

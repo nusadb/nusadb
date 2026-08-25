@@ -93,6 +93,9 @@ pub(super) fn type_name(ty: ColumnType) -> String {
         ColumnType::Tsvector => "TSVECTOR".to_owned(),
         ColumnType::Tsquery => "TSQUERY".to_owned(),
         ColumnType::Xml => "XML".to_owned(),
+        // A bare enum type renders its generic keyword here; callers that know the column's enum type
+        // name (SHOW COLUMNS / information_schema) render that name instead.
+        ColumnType::Enum => "ENUM".to_owned(),
     }
 }
 

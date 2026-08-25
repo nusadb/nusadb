@@ -1735,6 +1735,18 @@ pub enum Value {
     Tsquery(String),
     /// An XML value (`xml`) as its original, well-formed text (not canonicalized).
     Xml(String),
+    /// A value of a user-defined enum type. It carries its declaration-order `ordinal` (position in
+    /// the `CREATE TYPE ... AS ENUM (...)` label list) and its `label` text. Ordering and comparison
+    /// use the ordinal — matching declaration order — while display and text conversion use the
+    /// label; two enum values are equal iff their labels are equal. Values of two *different* enum
+    /// types are never compared at runtime (the analyzer rejects that), so the ordinal needs no type
+    /// tag.
+    Enum {
+        /// Declaration-order position of `label` within its enum type (0-based).
+        ordinal: u32,
+        /// The enum label text, as declared.
+        label: String,
+    },
 }
 
 /// Binary operators the parser accepts.

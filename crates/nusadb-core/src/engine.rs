@@ -209,6 +209,12 @@ pub enum ColumnType {
     /// XML document or content (`xml`). Stored as its original text verbatim (not canonicalized);
     /// validated as well-formed on input.
     Xml,
+    /// A user-defined enumerated type (`CREATE TYPE ... AS ENUM (...)`). The variant carries no
+    /// payload so `ColumnType` stays `Copy`; each value records its own declaration-order ordinal and
+    /// label, so comparison follows declaration order — not the label's byte order — without any
+    /// catalog lookup at compare time. The column's enum *type name* (for DDL rendering and
+    /// write-time label resolution) is tracked by the SQL layer alongside the schema.
+    Enum,
 }
 
 impl ColumnType {
@@ -474,7 +480,8 @@ impl ArrayElem {
             | ColumnType::Geometry(_)
             | ColumnType::Tsvector
             | ColumnType::Tsquery
-            | ColumnType::Xml => None,
+            | ColumnType::Xml
+            | ColumnType::Enum => None,
         }
     }
 }

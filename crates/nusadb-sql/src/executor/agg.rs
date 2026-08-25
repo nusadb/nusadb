@@ -1811,6 +1811,9 @@ fn distinct_hash(v: &ast::Value) -> u64 {
         V::Tsvector(s) => (23u8, s).hash(&mut h),
         V::Tsquery(s) => (24u8, s).hash(&mut h),
         V::Xml(s) => (25u8, s).hash(&mut h),
+        // An enum hashes by its declaration-order ordinal, matching `compare`'s ordinal equality so
+        // GROUP BY / DISTINCT bucket by the enum value (identical labels share one ordinal).
+        V::Enum { ordinal, .. } => (26u8, ordinal).hash(&mut h),
         V::Inet(a) => (18u8, a).hash(&mut h),
         V::Bit(b) => (19u8, b).hash(&mut h),
         // A range hashes by its scale-normalized key bytes (its bound values are not `Hash`; the

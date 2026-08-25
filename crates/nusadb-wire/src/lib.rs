@@ -77,7 +77,8 @@ pub const fn column_type_tag(ty: nusadb_core::ColumnType) -> u8 {
         ColumnType::Float | ColumnType::Real => 0x03,
         ColumnType::Numeric { .. } => 0x04,
         // VARCHAR/CHAR are TEXT on the wire — the declared length is not carried in the tag.
-        ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_) => 0x05,
+        // ENUM joins them: a client reads its label as text (the ordinal is a server-side detail).
+        ColumnType::Text | ColumnType::VarChar(_) | ColumnType::Char(_) | ColumnType::Enum => 0x05,
         ColumnType::Bytes => 0x06,
         ColumnType::Date => 0x07,
         ColumnType::Time => 0x08,

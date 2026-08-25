@@ -209,6 +209,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Tsvector(_) => 23,
         ast::Value::Tsquery(_) => 24,
         ast::Value::Xml(_) => 25,
+        ast::Value::Enum { .. } => 26,
     }
 }
 

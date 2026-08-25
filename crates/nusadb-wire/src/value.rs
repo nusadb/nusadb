@@ -94,6 +94,8 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
         Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) | Value::Xml(s) => {
             s.clone().into_bytes()
         },
+        // An enum is sent as its label text (the ordinal is a server-side ordering detail).
+        Value::Enum { label, .. } => label.clone().into_bytes(),
         // JSON is sent in the spaced display form (`{"a": 1}`), matching standard jsonb text output.
         Value::Json(s) => nusadb_sql::json::display_form(s).into_bytes(),
         Value::Array(items) => nusadb_sql::display::array_text(items).into_bytes(),

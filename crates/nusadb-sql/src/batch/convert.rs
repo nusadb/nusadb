@@ -203,7 +203,8 @@ pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
         | ColumnType::Geometry(_)
         | ColumnType::Tsvector
         | ColumnType::Tsquery
-        | ColumnType::Xml => ast::Value::Null,
+        | ColumnType::Xml
+        | ColumnType::Enum => ast::Value::Null,
         ColumnType::Array(_) => {
             let Some(list) = any.downcast_ref::<ListArray>() else {
                 return ast::Value::Null;
@@ -346,7 +347,8 @@ pub(crate) fn build_column(ty: ColumnType, values: Vec<ast::Value>) -> Result<Ar
         | ColumnType::Geometry(_)
         | ColumnType::Tsvector
         | ColumnType::Tsquery
-        | ColumnType::Xml => return Err(unsupported_batch_type(ty)),
+        | ColumnType::Xml
+        | ColumnType::Enum => return Err(unsupported_batch_type(ty)),
     };
     Ok(array)
 }
@@ -366,6 +368,7 @@ fn unsupported_batch_type(ty: ColumnType) -> Error {
         ColumnType::Tsvector => "TSVECTOR",
         ColumnType::Tsquery => "TSQUERY",
         ColumnType::Xml => "XML",
+        ColumnType::Enum => "ENUM",
         _ => "VECTOR",
     };
     Error::Unsupported(format!(

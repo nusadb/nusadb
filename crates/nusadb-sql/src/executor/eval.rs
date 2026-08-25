@@ -4970,6 +4970,7 @@ fn runtime_type(v: &ast::Value) -> ColumnType {
         ast::Value::Tsvector(_) => ColumnType::Tsvector,
         ast::Value::Tsquery(_) => ColumnType::Tsquery,
         ast::Value::Xml(_) => ColumnType::Xml,
+        ast::Value::Enum { .. } => ColumnType::Enum,
         ast::Value::Inet(a) => a.column_type(),
         ast::Value::Bit(b) => crate::bit::column_type(b),
         ast::Value::Range(r) => ColumnType::Range(r.kind),
@@ -5471,6 +5472,11 @@ pub(crate) fn compare(left: &ast::Value, right: &ast::Value) -> Ordering {
             .map(|(x, y)| x.total_cmp(y))
             .find(|&o| o != Ordering::Equal)
             .unwrap_or_else(|| a.len().cmp(&b.len())),
+        // ENUM orders by declaration-order ordinal, not the label's byte order — so `ORDER BY`,
+        // `<`/`>`, MIN/MAX, and BETWEEN follow the `CREATE TYPE ... AS ENUM (...)` order. Two enum
+        // values of different types never reach here (the analyzer rejects that comparison); within a
+        // type the ordinal is a stable total order, and equal ordinals mean equal labels.
+        (ast::Value::Enum { ordinal: a, .. }, ast::Value::Enum { ordinal: b, .. }) => a.cmp(b),
         // Different value types: order by a stable per-variant rank rather than collapsing to
         // `Equal`. Collapsing made `compare` non-antisymmetric, so two genuinely distinct
         // values (e.g. `1` and `'a'`) looked equal and were wrongly merged by DISTINCT / GROUP BY /
@@ -5540,6 +5546,7 @@ const fn type_rank(v: &ast::Value) -> u8 {
         ast::Value::Tsvector(_) => 23,
         ast::Value::Tsquery(_) => 24,
         ast::Value::Xml(_) => 25,
+        ast::Value::Enum { .. } => 26,
     }
 }
 

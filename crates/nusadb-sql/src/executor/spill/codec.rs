@@ -58,6 +58,7 @@ const TAG_GEOMETRY: u8 = 22;
 const TAG_TSVECTOR: u8 = 23;
 const TAG_TSQUERY: u8 = 24;
 const TAG_XML: u8 = 25;
+const TAG_ENUM: u8 = 26;
 
 /// Encode `row` into the self-describing byte form.
 ///
@@ -173,6 +174,12 @@ fn write_value(out: &mut Vec<u8>, v: &ast::Value) -> Result<(), Error> {
             }
         },
         ast::Value::Bytes(b) => write_tagged_bytes(out, TAG_BYTES, b)?,
+        ast::Value::Enum { ordinal, label } => {
+            out.push(TAG_ENUM);
+            out.extend_from_slice(&ordinal.to_le_bytes());
+            write_len(out, label.len())?;
+            out.extend_from_slice(label.as_bytes());
+        },
     }
     Ok(())
 }
@@ -267,6 +274,13 @@ fn read_value(c: &mut Cursor<'_>) -> Result<ast::Value, Error> {
         TAG_BYTES => {
             let n = c.u32()? as usize;
             ast::Value::Bytes(c.take(n)?.to_vec())
+        },
+        TAG_ENUM => {
+            let ordinal = c.u32()?;
+            ast::Value::Enum {
+                ordinal,
+                label: c.string()?,
+            }
         },
         _ => return Err(Error::MalformedTuple { offset: c.pos - 1 }),
     };

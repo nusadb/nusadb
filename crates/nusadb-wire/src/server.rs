@@ -4557,6 +4557,8 @@ fn value_to_field(value: Value) -> Option<Vec<u8>> {
         Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) | Value::Xml(s) => {
             Some(s.into_bytes())
         },
+        // An enum renders as its label text.
+        Value::Enum { label, .. } => Some(label.into_bytes()),
         // JSON is sent in the spaced display form (`{"a": 1}`), matching standard jsonb text output.
         Value::Json(s) => Some(nusadb_sql::json::display_form(&s).into_bytes()),
         // Temporal + UUID render in their canonical text form.
