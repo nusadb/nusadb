@@ -1639,26 +1639,42 @@ impl NumSlot {
     }
 }
 
+/// Where an `S` anchored-sign appears in a `TO_CHAR` numeric picture. An anchored sign always prints
+/// a `+` or `-` (never a blank for a positive), unlike the default floating sign.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SignMode {
+    /// No `S`: the sign is the default floating column (`-` for a negative, a blank otherwise).
+    None,
+    /// `S` before the digits (`S999`): an always-printed sign floating to just before the first digit.
+    Leading,
+    /// `S` after the digits (`999S`): an always-printed sign appended after the number.
+    Trailing,
+}
+
 /// A parsed `TO_CHAR` numeric picture: the positions before and after the decimal point, whether the
-/// picture had a decimal point at all, and whether `FM` (fill mode) was requested.
+/// picture had a decimal point at all, whether `FM` (fill mode) was requested, and where an `S`
+/// anchored sign sits.
 struct NumFormat {
     int: Vec<NumSlot>,
     frac: Vec<NumSlot>,
     has_point: bool,
     fill: bool,
+    sign: SignMode,
 }
 
 /// `TO_CHAR(numeric, fmt)` — render a number through a digit-picture format (B-fn).
 ///
 /// Supported picture characters: `9` (a digit whose leading positions are suppressed to spaces),
 /// `0` (a digit position that forces zero-fill from itself rightward), `.` / `D` (the decimal
-/// point), `,` / `G` (a group separator), and the `FM` prefix (fill mode). The value is rounded to
-/// the fractional picture width. The sign is a reserved leading column that *floats* to just before
-/// the first shown digit — `-` for a negative, a space otherwise (so `to_char(-0.1, '99.99')` is
-/// `'  -.10'`) — and an integer part too wide for its positions renders as `#` fill. Fill mode drops
-/// the padding: the leading blanks (sign column included, when positive) and the fraction's trailing
-/// zeros in `9` positions. Any other format character (`S`, `MI`, `PR`, `$`, …) is rejected rather
-/// than silently mis-formatted; those forms are a later increment.
+/// point), `,` / `G` (a group separator), `S` (an anchored sign), and the `FM` prefix (fill mode).
+/// The value is rounded to the fractional picture width. Without `S` the sign is a reserved leading
+/// column that *floats* to just before the first shown digit — `-` for a negative, a space otherwise
+/// (so `to_char(-0.1, '99.99')` is `'  -.10'`). An `S` before the digits (`S999`) floats an
+/// always-printed `+`/`-` the same way; an `S` after the digits (`999S`) appends the sign after the
+/// number. An integer part too wide for its positions renders as `#` fill. Fill mode drops the
+/// padding: the leading blanks (sign column included, when positive) and the fraction's trailing
+/// zeros in `9` positions. Any other format character (`MI`, `PR`, `$`, …) is rejected rather than
+/// silently mis-formatted; those forms are a later increment.
 ///
 /// The group and decimal separators are `,` and `.`: this engine has no `lc_numeric` to vary them by.
 fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
@@ -1718,7 +1734,7 @@ fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
     // overflows — the reference engine renders `to_char(0.5, '.99')` as ` .##`.
     let overflow = int_n == 0 || int_digits.len() > int_n;
 
-    let mut out = numeric_integer_area(int_digits, &format.int, neg, overflow);
+    let mut out = numeric_integer_area(int_digits, &format.int, neg, overflow, format.sign);
     if format.has_point && !format.frac.is_empty() {
         out.push('.');
         // On overflow the fraction is `#` fill too, and fill mode does not trim it away.
@@ -1739,6 +1755,10 @@ fn to_char_numeric(value: &ast::Value, fmt: &str) -> Result<ast::Value, Error> {
     if format.fill {
         // Fill mode drops the reserved padding, the sign column included when the sign is a space.
         out = out.trim_start_matches(' ').to_owned();
+    }
+    // A trailing `S` appends its always-printed sign after the number (fraction and padding included).
+    if format.sign == SignMode::Trailing {
+        out.push(if neg { '-' } else { '+' });
     }
     Ok(V::Text(out))
 }
@@ -1773,6 +1793,7 @@ fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
         frac: Vec::new(),
         has_point: false,
         fill: false,
+        sign: SignMode::None,
     };
     let mut i = 0;
     while let Some(&ch) = chars.get(i) {
@@ -1781,6 +1802,21 @@ fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
         if matches!(ch, 'F' | 'f') && matches!(chars.get(i), Some('M' | 'm')) {
             format.fill = true;
             i += 1;
+            continue;
+        }
+        // `S` is an anchored sign, not a digit position: leading when no digit has been seen yet,
+        // trailing otherwise. At most one is allowed.
+        if matches!(ch, 'S' | 's') {
+            if format.sign != SignMode::None {
+                return Err(Error::InvalidParameterValue(
+                    "to_char(): a numeric format may have only one `S` sign".to_owned(),
+                ));
+            }
+            format.sign = if format.int.is_empty() && !format.has_point && format.frac.is_empty() {
+                SignMode::Leading
+            } else {
+                SignMode::Trailing
+            };
             continue;
         }
         let slot = match ch {
@@ -1799,7 +1835,7 @@ fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
             other => {
                 return Err(Error::InvalidParameterValue(format!(
                     "to_char(): unsupported numeric format character `{other}` \
-                     (supported: `9`, `0`, `.`, `D`, `,`, `G`, `FM`)"
+                     (supported: `9`, `0`, `.`, `D`, `,`, `G`, `S`, `FM`)"
                 )));
             },
         };
@@ -1821,8 +1857,22 @@ fn parse_numeric_format(fmt: &str) -> Result<NumFormat, Error> {
 /// A group separator prints only when some position to its *left* prints something — so `9,999`
 /// renders `12` as `   12` (no stray comma) but `1234` as `1,234`, and `0,000` renders `123` as
 /// `0,123` because the forced `0` counts as printed.
-fn numeric_integer_area(int_digits: &str, slots: &[NumSlot], neg: bool, overflow: bool) -> String {
-    let sign = if neg { '-' } else { ' ' };
+///
+/// The floating sign column depends on `sign`: the default (`SignMode::None`) is `-` for a negative
+/// and a blank otherwise; `SignMode::Leading` (an `S` before the digits) always prints `+`/`-`; and
+/// `SignMode::Trailing` (an `S` after the digits) prints no leading sign here — the caller appends it.
+fn numeric_integer_area(
+    int_digits: &str,
+    slots: &[NumSlot],
+    neg: bool,
+    overflow: bool,
+    sign: SignMode,
+) -> String {
+    let sign = match sign {
+        SignMode::Trailing => None,
+        SignMode::Leading => Some(if neg { '-' } else { '+' }),
+        SignMode::None => Some(if neg { '-' } else { ' ' }),
+    };
     // The leftmost `0` position: from there rightward an unused digit position renders `0`.
     let zero_from = slots.iter().position(|s| *s == NumSlot::Digit0);
     // Right-to-left over the digit positions, consuming the real digits from their right end.
@@ -1852,6 +1902,10 @@ fn numeric_integer_area(int_digits: &str, slots: &[NumSlot], neg: bool, overflow
         }
     }
     // Float the sign to just before the first non-blank position (or the far right if all blank).
+    // A trailing `S` reserves no leading column here — the caller appends the sign after the number.
+    let Some(sign) = sign else {
+        return field.into_iter().collect();
+    };
     let first_sig = field.iter().position(|&c| c != ' ').unwrap_or(field.len());
     let mut s = String::with_capacity(field.len() + 1);
     s.extend(field.iter().take(first_sig));
@@ -7839,8 +7893,9 @@ mod tests {
             run_text(ScalarFunc::ToChar, vec![lit_int(1234), txt("99")]),
             Value::Text(" ##".to_owned())
         );
-        // An unsupported format character is rejected, never silently mis-formatted.
-        for bad in ["S999", "999PR", "999MI", "$999", "F999"] {
+        // An unsupported format character is rejected, never silently mis-formatted. `S` twice is
+        // rejected too (matching the reference engine's "cannot use S twice").
+        for bad in ["999PR", "999MI", "$999", "F999", "S9S9"] {
             assert!(
                 eval(
                     &scalar(
@@ -7905,6 +7960,44 @@ mod tests {
         assert_eq!(ch(num("0.5"), ".99"), " .##");
         // A trailing decimal point with no fraction positions prints no point at all.
         assert_eq!(ch(num("1234.5"), "9999."), " 1235");
+    }
+
+    #[test]
+    fn to_char_numeric_anchored_sign_matches_pg() {
+        // Every expectation here was read off a side-by-side run against the reference engine.
+        let ch = |value: TypedExpr, fmt: &str| -> String {
+            match run_text(ScalarFunc::ToChar, vec![value, txt(fmt)]) {
+                Value::Text(s) => s,
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        // Leading `S`: an always-printed sign floating to just before the first digit.
+        assert_eq!(ch(lit_int(123), "S999"), "+123");
+        assert_eq!(ch(lit_int(-123), "S999"), "-123");
+        assert_eq!(ch(lit_int(0), "S999"), "  +0");
+        assert_eq!(ch(lit_int(5), "S9999"), "   +5");
+        assert_eq!(ch(lit_int(-5), "S9999"), "   -5");
+        assert_eq!(ch(num("12.34"), "S99.99"), "+12.34");
+        assert_eq!(ch(num("-12.34"), "S99.99"), "-12.34");
+        assert_eq!(ch(lit_int(-5), "S000"), "-005");
+        assert_eq!(ch(lit_int(5), "S000"), "+005");
+        assert_eq!(ch(lit_int(1234), "S9,999"), "+1,234");
+        assert_eq!(ch(lit_int(-1234), "S9,999"), "-1,234");
+        // Trailing `S`: an always-printed sign appended after the number (padding included).
+        assert_eq!(ch(lit_int(123), "999S"), "123+");
+        assert_eq!(ch(lit_int(-123), "999S"), "123-");
+        assert_eq!(ch(lit_int(5), "999S"), "  5+");
+        assert_eq!(ch(lit_int(-5), "9999S"), "   5-");
+        assert_eq!(ch(lit_int(0), "999S"), "  0+");
+        assert_eq!(ch(num("12.34"), "99.99S"), "12.34+");
+        assert_eq!(ch(lit_int(1234), "9,999S"), "1,234+");
+        // Fill mode with an anchored sign trims the blanks but keeps the sign adjacent.
+        assert_eq!(ch(lit_int(5), "FMS999"), "+5");
+        assert_eq!(ch(num("-12.3"), "FMS999.99"), "-12.3");
+        assert_eq!(ch(num("-12.3"), "FM999.99S"), "12.3-");
+        // Overflow: `#` fill, the anchored sign still on its side.
+        assert_eq!(ch(lit_int(99999), "S999"), "+###");
+        assert_eq!(ch(lit_int(99999), "999S"), "###+");
     }
 
     #[test]
