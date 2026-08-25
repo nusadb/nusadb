@@ -1630,6 +1630,31 @@ pub(super) fn scoped_composite_type(
     })
 }
 
+/// The declared length `n` of column `qualifier.name` when it is a `CHAR(n)` (blank-padded) column,
+/// or `None` otherwise. `CHAR(n)` normalizes to `TEXT` for expression typing ([`expr_type`]), so a
+/// caller that needs the blank-padded width (e.g. `octet_length`) reads it from the raw scope here.
+pub(super) fn scoped_char_len(
+    scope: &[ScopedColumn],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<u32> {
+    scope.iter().find_map(|col| {
+        if col.def.name != name {
+            return None;
+        }
+        if qualifier.is_some_and(|q| col.qualifier != q) {
+            return None;
+        }
+        if qualifier.is_none() && col.qualified_only {
+            return None;
+        }
+        match col.def.ty {
+            ColumnType::Char(n) => Some(n),
+            _ => None,
+        }
+    })
+}
+
 /// The user-defined enum type name recorded for the column reference `qualifier.name` in `scope`, or
 /// `None` if the column is not an enum (or does not resolve here). Best-effort, like
 /// [`scoped_composite_type`].

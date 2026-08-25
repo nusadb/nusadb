@@ -5251,6 +5251,10 @@ pub(super) fn check_vector_distance(
 /// return INT; `CONCAT`/`CONCAT_WS` accept any [`textout_scalar`] argument —
 /// NULLs are skipped at evaluation — with `CONCAT_WS`'s first argument (the separator) required
 /// to be TEXT. Mirrors the fixed table's arity message and NULL-literal tolerance.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat pass over the text-polymorphic family plus the CHAR(n) octet-length rewrite"
+)]
 fn analyze_text_polymorphic(
     func: ast::ScalarFunc,
     name: &str,
@@ -5312,6 +5316,50 @@ fn analyze_text_polymorphic(
         }
         length_of_geometry = func == F::Length && is_geom_length_arg(typed.ty);
         typed_args.push(typed);
+    }
+    // `CHAR(n)` is blank-padded to `n` characters in the reference engine, and `octet_length` counts
+    // that padding — NusaDB stores the value blank-trimmed, so add the `(n - char_length)` pad bytes
+    // (each a single-byte space) onto the octet length of the stored value. `length` (char count) and
+    // `bit_length` do not count the padding, so they need no adjustment and are left as-is. The
+    // `CHAR(n)` width is gone from the arg's type (it normalizes to `TEXT`), so read it from the raw
+    // column reference in scope; only a bare `CHAR(n)` column has this blank-padded width.
+    let char_pad_len = match args.first() {
+        Some(ast::Expr::Column(name)) => super::scoped_char_len(scope, None, name),
+        Some(ast::Expr::QualifiedColumn { table, column }) => {
+            super::scoped_char_len(scope, Some(table), column)
+        },
+        _ => None,
+    };
+    if func == F::OctetLength
+        && let Some(n) = char_pad_len
+        && let Some(arg) = typed_args.first().cloned()
+    {
+        let int_lit = |v: i64| TypedExpr {
+            kind: TypedExprKind::Literal(ast::Value::Int(v)),
+            ty: ColumnType::Int,
+        };
+        let call = |f: F, a: TypedExpr| TypedExpr {
+            kind: TypedExprKind::ScalarFunction {
+                func: f,
+                args: vec![a],
+            },
+            ty: ColumnType::Int,
+        };
+        let bin = |op: ast::BinaryOp, l: TypedExpr, r: TypedExpr| TypedExpr {
+            kind: TypedExprKind::Binary {
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
+            },
+            ty: ColumnType::Int,
+        };
+        // octet_length(arg) + (n - char_length(arg))
+        let pad = bin(
+            ast::BinaryOp::Minus,
+            int_lit(i64::from(n)),
+            call(F::Length, arg.clone()),
+        );
+        return Ok(bin(ast::BinaryOp::Plus, call(F::OctetLength, arg), pad));
     }
     Ok(TypedExpr {
         kind: TypedExprKind::ScalarFunction {

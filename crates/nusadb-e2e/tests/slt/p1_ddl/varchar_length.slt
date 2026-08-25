@@ -157,6 +157,22 @@ SELECT length('ab '::varchar(5))
 ----
 3
 
+# CHAR(n) is blank-padded to n for octet_length (it counts the padding), while length (character
+# count) and bit_length count only the significant, trimmed value — matching the reference engine.
+# A multibyte value pads with single-byte spaces: octet_length of 'á' in a char(5) column = 6.
+statement ok
+CREATE TABLE oc (k CHAR(5))
+
+statement ok
+INSERT INTO oc VALUES ('ab'), ('á'), (NULL)
+
+query III
+SELECT octet_length(k), length(k), bit_length(k) FROM oc ORDER BY k NULLS LAST
+----
+5 2 16
+6 1 16
+NULL NULL NULL
+
 # --- Unbounded VARCHAR (no length) imposes no limit and reports as TEXT ---
 statement ok
 CREATE TABLE u (s VARCHAR)
