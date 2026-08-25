@@ -800,8 +800,8 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // SHOW TABLES / SHOW COLUMNS: catalog introspection. TABLES needs no resolution
         // (the executor lists the engine's tables); COLUMNS resolves the table to its schema.
         ast::Statement::ShowTables => Ok(LogicalPlan::ShowTables),
-        ast::Statement::ShowColumns(table) => {
-            let schema = resolve_table(None, &table, catalog)?;
+        ast::Statement::ShowColumns(qualifier, table) => {
+            let schema = resolve_table(qualifier.as_deref(), &table, catalog)?;
             // Enumerating a table's columns leaks its shape; require some relationship to it.
             dcl::require_table_metadata_access(catalog, &schema)?;
             Ok(LogicalPlan::ShowColumns(schema))
@@ -911,10 +911,15 @@ fn analyze_create_table_as(
 ) -> Result<LogicalPlan, Error> {
     // A new table named like a system catalog (or an existing view) would shadow it.
     enforce_system_catalog(&ct.name, catalog)?;
-    let exists =
-        catalog.lookup_table(&ct.name)?.is_some() || catalog.lookup_view(&ct.name)?.is_some();
+    // Same rule as a plain `CREATE TABLE`: an explicit qualifier wins, otherwise the session's
+    // current schema. Without this the statement created in `public` whatever it was told.
+    let target_schema = ct.schema.unwrap_or_else(|| catalog.current_schema());
+    let exists = catalog.lookup_table_in(&target_schema, &ct.name)?.is_some()
+        || catalog.lookup_view(&ct.name)?.is_some();
     if exists && !ct.if_not_exists {
-        return Err(Error::TableExists { name: ct.name });
+        return Err(Error::TableExists {
+            name: qualified_display(&target_schema, &ct.name),
+        });
     }
     let body = analyze_select((*ct.query).clone(), catalog)?;
     let columns: Vec<(String, ColumnType)> = body
@@ -938,6 +943,7 @@ fn analyze_create_table_as(
         }
     }
     Ok(LogicalPlan::CreateTableAs(CreateTableAsPlan {
+        schema: target_schema,
         name: ct.name,
         columns,
         body: Box::new(body),

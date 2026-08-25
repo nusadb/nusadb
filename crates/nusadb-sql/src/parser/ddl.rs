@@ -28,8 +28,10 @@ pub(super) fn convert_analyze(
     if noscan {
         return unsupported("ANALYZE ... NOSCAN");
     }
+    let (schema, table) = table_ref_name(name)?;
     Ok(ast::Statement::Analyze(ast::Analyze {
-        table: Some(object_name(name)?),
+        schema,
+        table: Some(table),
         columns: columns.into_iter().map(|c| fold_ident(&c)).collect(),
     }))
 }
@@ -77,8 +79,10 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         if !ct.constraints.is_empty() {
             return unsupported("CREATE TABLE ... AS SELECT with table constraints");
         }
+        let (schema, name) = table_ref_name(&ct.name)?;
         return Ok(ast::Statement::CreateTableAs(ast::CreateTableAs {
-            name: object_name(&ct.name)?,
+            schema,
+            name,
             query: Box::new(convert_select(*query)?),
             if_not_exists: ct.if_not_exists,
         }));
@@ -911,6 +915,14 @@ pub(super) fn convert_create_schema(
     if_not_exists: bool,
 ) -> Result<ast::CreateSchema, Error> {
     let name = match schema_name {
+        // Refused on its own terms rather than through the shared qualifier check, which reports
+        // every multi-part name as something the engine does not resolve *yet*. Here there is
+        // nothing to wait for: a schema is the outermost namespace, so nothing can qualify it.
+        sql::SchemaName::Simple(name) if name.0.len() > 1 => {
+            return unsupported(
+                "a qualified schema name (a schema is not created inside another schema)",
+            );
+        },
         sql::SchemaName::Simple(name) => object_name(&name)?,
         sql::SchemaName::UnnamedAuthorization(_) | sql::SchemaName::NamedAuthorization(..) => {
             return unsupported("CREATE SCHEMA ... AUTHORIZATION");

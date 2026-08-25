@@ -358,7 +358,7 @@ pub enum Statement {
     /// `SHOW TABLES` — list the database's tables (catalog introspection).
     ShowTables,
     /// `SHOW COLUMNS FROM table` — list a table's columns (catalog introspection).
-    ShowColumns(String),
+    ShowColumns(Option<String>, String),
     /// `VACUUM [FULL] [ANALYZE]` — reclaim dead row versions across all tables; `ANALYZE` also
     /// recomputes statistics for every table. The bare, table-less form (any options) is supported.
     Vacuum(VacuumOptions),
@@ -488,6 +488,9 @@ pub enum CommentTarget {
 /// chosen subset of its columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Analyze {
+    /// Schema qualifier on the target, when the statement carried one; `None` resolves through the
+    /// session search path.
+    pub schema: Option<String>,
     /// Target table name; `None` is the bare `ANALYZE` that refreshes every user table.
     pub table: Option<String>,
     /// Columns to analyze; empty means every column. Always empty when `table` is `None`.

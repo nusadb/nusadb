@@ -32,6 +32,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Deallocate(target) => PhysicalPlan::Deallocate(target),
         LogicalPlan::CreateTable(p) => PhysicalPlan::CreateTable(p),
         LogicalPlan::CreateTableAs(p) => PhysicalPlan::CreateTableAs(PhysicalCreateTableAs {
+            schema: p.schema,
             name: p.name,
             columns: p.columns,
             body: Box::new(plan_select(*p.body)),

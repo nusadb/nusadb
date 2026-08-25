@@ -64,6 +64,8 @@ pub struct CreateTable {
 // Not `Eq`: the `Select` body carries `Expr`s, which are only `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableAs {
+    /// Schema to create the table in; `None` targets the session's current schema.
+    pub schema: Option<String>,
     /// Table name.
     pub name: String,
     /// The source query — any supported `SELECT`.

@@ -1724,7 +1724,7 @@ fn dispatch(
             last.ok_or_else(|| Error::Internal("empty statement batch".to_owned()))
         },
         PhysicalPlan::CreateTable(p) => run_create_table(p, engine, txn),
-        PhysicalPlan::CreateTableAs(p) => run_create_table_as(p, engine, txn),
+        PhysicalPlan::CreateTableAs(p) => run_create_table_as(&p, engine, txn),
         PhysicalPlan::DropTable(p) => run_drop_table(&p, engine, txn),
         PhysicalPlan::CreateMaterializedView(p) => run_create_materialized_view(p, engine, txn),
         PhysicalPlan::CreateView(p) => run_create_view(&p, engine, txn),
@@ -3871,20 +3871,22 @@ fn run_drop_database(
 /// is an independent table — no recorded definition, no incremental maintenance. With `IF NOT EXISTS`
 /// an already-existing table makes the statement a no-op (the query is not run again).
 fn run_create_table_as(
-    p: PhysicalCreateTableAs,
+    p: &PhysicalCreateTableAs,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    if let Some(existing) = engine.lookup_table_as_of(txn, &p.name)? {
+    if let Some(existing) = engine.lookup_table_as_of_in(txn, &p.schema, &p.name)? {
         if p.if_not_exists {
             return Ok(ExecutionResult::Created(existing.id));
         }
         // The analyzer already rejected a name clash without IF NOT EXISTS; guard defensively in case
         // the table was created concurrently after analysis.
-        return Err(Error::TableExists { name: p.name });
+        return Err(Error::TableExists {
+            name: crate::analyzer::qualified_display(&p.schema, &p.name),
+        });
     }
     let def = TableDef {
-        schema: "public".to_owned(),
+        schema: p.schema.clone(),
         name: p.name.clone(),
         columns: p
             .columns

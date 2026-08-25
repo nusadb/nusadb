@@ -727,6 +727,7 @@ pub(super) fn analyze_analyze(
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, Error> {
     let ast::Analyze {
+        schema,
         table: table_name,
         columns: requested,
     } = an;
@@ -736,8 +737,7 @@ pub(super) fn analyze_analyze(
     let Some(table_name) = table_name else {
         return Ok(LogicalPlan::AnalyzeAll);
     };
-    // ANALYZE's name comes from `object_name` (public-only until NS3 opens it here).
-    let table = resolve_table(None, &table_name, catalog)?;
+    let table = resolve_table(schema.as_deref(), &table_name, catalog)?;
     // ANALYZE reads every row and persists column values (MCV lists, histogram bounds), so it
     // needs the same SELECT privilege a plain read of the table would.
     super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Select)?;

@@ -192,6 +192,45 @@ SELECT id FROM pub_tbl
 ----
 7
 
+# An unqualified CREATE TABLE ... AS SELECT lands in the current schema too.
+#
+# This is the case that had no qualifier and still went wrong: the executor wrote `public`
+# regardless of the search path, so a bare CTAS and a bare CREATE TABLE sitting next to each other
+# produced two same-named tables in two different schemas, with nothing reported.
+statement ok
+CREATE TABLE sp_ctas AS SELECT id FROM sp_tbl
+
+query I
+SELECT id FROM sp.sp_ctas
+----
+1
+
+# The proof that it is not in `public`: naming that schema explicitly finds nothing.
+statement error
+SELECT id FROM public.sp_ctas
+
+# The creating role can read it back, so ownership was recorded against the schema it really
+# lives in rather than the hardcoded one.
+query I
+SELECT id FROM sp_ctas
+----
+1
+
+# `SELECT ... INTO` converges on the same statement, so it must place the table the same way.
+statement ok
+SELECT id INTO sp_into FROM sp_tbl
+
+query I
+SELECT id FROM sp.sp_into
+----
+1
+
+statement ok
+DROP TABLE sp.sp_ctas
+
+statement ok
+DROP TABLE sp.sp_into
+
 # Cleanup: drop the sp table by qualifier, reset the path, drop the public table + schema.
 statement ok
 DROP TABLE sp.sp_tbl

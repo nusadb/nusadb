@@ -46,7 +46,7 @@ p1_ddl/create_drop.slt:84           CREATE DATABASE refused `0A000`: needs the s
 # connection, where a client uses the extended query protocol instead. The corpus pins the embedded
 # behaviour, and these green results were the original evidence that it was reporting on a path no
 # client takes.
-p1_ddl/schema_qualified.slt:228     PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
+p1_ddl/schema_qualified.slt:267     PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
 p5_advanced/window_filter.slt:145   PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
 
 # `SET TRANSACTION ISOLATION LEVEL` inside a transaction that has not run a statement yet: the wire

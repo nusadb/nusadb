@@ -667,6 +667,8 @@ pub struct PhysicalMaterializedView {
 /// `CREATE TABLE ... AS <select>`: an analyzed source query plus the derived table schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableAsPlan {
+    /// Resolved schema to create the table in.
+    pub schema: String,
     /// New table name.
     pub name: String,
     /// Derived schema: `(column name, type)` in projection order.
@@ -680,6 +682,8 @@ pub struct CreateTableAsPlan {
 /// `CREATE TABLE ... AS <select>` lowered for execution: the source query is an operator tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalCreateTableAs {
+    /// Resolved schema to create the table in.
+    pub schema: String,
     /// New table name.
     pub name: String,
     /// Derived schema: `(column name, type)` in projection order.

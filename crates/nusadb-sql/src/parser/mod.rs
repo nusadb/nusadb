@@ -3647,11 +3647,12 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
                 if into.temporary || into.unlogged {
                     return unsupported("SELECT INTO TEMPORARY / UNLOGGED");
                 }
-                let name = object_name(&into.name)?;
+                let (schema, name) = table_ref_name(&into.name)?;
                 let ast::Statement::Select(body) = convert_query(*query)? else {
                     return unsupported("SELECT ... INTO over a non-SELECT query");
                 };
                 return Ok(ast::Statement::CreateTableAs(ast::CreateTableAs {
+                    schema,
                     name,
                     query: Box::new(body),
                     if_not_exists: false,
@@ -3731,6 +3732,7 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
                     return unsupported("ANALYZE without a table name takes no further options");
                 }
                 return Ok(ast::Statement::Analyze(ast::Analyze {
+                    schema: None,
                     table: None,
                     columns: Vec::new(),
                 }));
@@ -3816,14 +3818,18 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
             show_options,
         } => {
             let table_name = show_columns_table(&show_options)?;
-            Ok(ast::Statement::ShowColumns(object_name(&table_name)?))
+            let (schema, table) = table_ref_name(&table_name)?;
+            Ok(ast::Statement::ShowColumns(schema, table))
         },
         // `DESCRIBE t` / `DESC t` / `EXPLAIN t` — aliases that list a table's columns.
         sql::Statement::ExplainTable {
             table_name,
             hive_format: None,
             ..
-        } => Ok(ast::Statement::ShowColumns(object_name(&table_name)?)),
+        } => {
+            let (schema, table) = table_ref_name(&table_name)?;
+            Ok(ast::Statement::ShowColumns(schema, table))
+        },
         sql::Statement::ShowColumns { .. } => {
             unsupported("SHOW COLUMNS with EXTENDED/FULL/LIKE is not supported")
         },
