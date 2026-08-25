@@ -1577,6 +1577,47 @@ fn create_type_enum_and_use_as_a_column() {
 }
 
 #[test]
+fn correlated_subquery_referencing_a_group_by_key_binds_under_aggregation() {
+    // A correlated subquery in the SELECT of a GROUP BY query that references the grouped column must
+    // see the group's key value — not read past the compacted [group keys ++ aggregates] row and get
+    // NULL. Previously count(*) came back 0 and max() NULL; both are now correct (oracle-checked).
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t_emp (id INT, dept_id INT)");
+    run(
+        &engine,
+        "INSERT INTO t_emp VALUES (1,1),(2,1),(3,2),(4,2),(5,NULL)",
+    );
+
+    // count(*) per department, via a correlated subquery over the grouped key.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT dept_id, (SELECT count(*) FROM t_emp x WHERE x.dept_id = t_emp.dept_id) AS c \
+             FROM t_emp GROUP BY dept_id ORDER BY dept_id NULLS LAST"
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Null, Value::Int(0)],
+        ]
+    );
+
+    // A max() correlated variant: NULL dept has no matching rows, so max() is NULL.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT dept_id, (SELECT max(x.id) FROM t_emp x WHERE x.dept_id = t_emp.dept_id) AS m \
+             FROM t_emp GROUP BY dept_id ORDER BY dept_id NULLS LAST"
+        )),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(4)],
+            vec![Value::Null, Value::Null],
+        ]
+    );
+}
+
+#[test]
 fn create_domain_gives_a_column_its_base_type_not_null_and_checks() {
     // CREATE DOMAIN — a column of the domain takes its base type, and the domain's NOT NULL and
     // CHECK (over the VALUE placeholder) are enforced on that column on every write.

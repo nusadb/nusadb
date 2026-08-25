@@ -2267,6 +2267,183 @@ pub(super) struct AggRebase<'a> {
     pub post_agg_width: usize,
 }
 
+/// Remap, in a correlated subquery reached from a just-aggregated query's projection/HAVING, every
+/// `OuterColumn` that refers to THAT query — its `level` equals `depth`, the number of subquery
+/// boundaries crossed — whose source ordinal is one of the `group_keys`, onto that key's
+/// post-aggregation slot (group keys lead the `[group keys ++ aggregates]` row).
+///
+/// Safe by construction: under aggregation such an `OuterColumn` currently indexes the post-aggregation
+/// row by the *source* ordinal, which is wrong, so rewriting it to the correct slot only ever fixes a
+/// broken read; every other reference (a different level, or an ordinal that is not a group key) is
+/// left exactly as it was, so an arm this walker does not descend into simply stays as today.
+fn remap_grouped_outer_refs(expr: &mut TypedExpr, depth: usize, group_keys: &[TypedExpr]) {
+    use TypedExprKind as K;
+    match &mut expr.kind {
+        K::OuterColumn { level, ordinal } => {
+            if *level == depth
+                && let Some(slot) = group_keys
+                    .iter()
+                    .position(|k| matches!(&k.kind, K::Column(o) if o == ordinal))
+            {
+                *ordinal = slot;
+            }
+        },
+        K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {
+            remap_grouped_outer_refs(left, depth, group_keys);
+            remap_grouped_outer_refs(right, depth, group_keys);
+        },
+        K::Unary { expr: inner, .. }
+        | K::IsNull { expr: inner, .. }
+        | K::IsJson { operand: inner, .. }
+        | K::IsBool { expr: inner, .. }
+        | K::Cast(inner, _) => remap_grouped_outer_refs(inner, depth, group_keys),
+        K::InList {
+            expr: inner, list, ..
+        } => {
+            remap_grouped_outer_refs(inner, depth, group_keys);
+            for item in list {
+                remap_grouped_outer_refs(item, depth, group_keys);
+            }
+        },
+        K::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            remap_grouped_outer_refs(inner, depth, group_keys);
+            remap_grouped_outer_refs(low, depth, group_keys);
+            remap_grouped_outer_refs(high, depth, group_keys);
+        },
+        K::Like {
+            expr: inner,
+            pattern,
+            ..
+        }
+        | K::RegexMatch {
+            expr: inner,
+            pattern,
+            ..
+        }
+        | K::SimilarTo {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            remap_grouped_outer_refs(inner, depth, group_keys);
+            remap_grouped_outer_refs(pattern, depth, group_keys);
+        },
+        K::Case {
+            operand,
+            branches,
+            default,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                remap_grouped_outer_refs(o, depth, group_keys);
+            }
+            for b in branches.iter_mut() {
+                remap_grouped_outer_refs(&mut b.when, depth, group_keys);
+                remap_grouped_outer_refs(&mut b.then, depth, group_keys);
+            }
+            if let Some(d) = default.as_deref_mut() {
+                remap_grouped_outer_refs(d, depth, group_keys);
+            }
+        },
+        K::Coalesce(args)
+        | K::ScalarFunction { args, .. }
+        | K::ScalarUdf { args, .. }
+        | K::ArrayLiteral(args) => {
+            for a in args {
+                remap_grouped_outer_refs(a, depth, group_keys);
+            }
+        },
+        // A subquery boundary: references to the aggregated query are one level further out inside it.
+        K::ScalarSubquery(plan) | K::Exists { plan, .. } => {
+            remap_grouped_outer_refs_in_plan(plan, depth + 1, group_keys);
+        },
+        K::InSubquery {
+            expr: probe, plan, ..
+        }
+        | K::QuantifiedSubquery {
+            expr: probe, plan, ..
+        } => {
+            remap_grouped_outer_refs(probe, depth, group_keys);
+            remap_grouped_outer_refs_in_plan(plan, depth + 1, group_keys);
+        },
+        // Every remaining arm carries no correlated reference in practice, or one this walker leaves
+        // as-is (safe: it stays today's behavior, never a wrong rewrite).
+        _ => {},
+    }
+}
+
+/// Walk every per-row expression of `plan` — its projection/filter/having/group keys/distinct-on/
+/// order-by, join conditions, and aggregate + window sub-expressions — applying
+/// [`remap_grouped_outer_refs`]. `depth` is how many subquery boundaries separate `plan` from the
+/// aggregated query whose `group_keys` these ordinals resolve against.
+///
+/// CTE-carried subplans (`from_cte`, a join's `input_cte`, `recursive_ctes`) are intentionally NOT
+/// descended: a subquery body cannot carry a `WITH` today (the parser rejects it), so none arises
+/// here in practice, and leaving one un-remapped is safe — it merely keeps today's behavior (a
+/// missed fix, never a wrong rewrite; see [`remap_grouped_outer_refs`]).
+fn remap_grouped_outer_refs_in_plan(
+    plan: &mut crate::planner::SelectPlan,
+    depth: usize,
+    group_keys: &[TypedExpr],
+) {
+    for p in &mut plan.projection {
+        remap_grouped_outer_refs(&mut p.expr, depth, group_keys);
+    }
+    if let Some(f) = plan.filter.as_mut() {
+        remap_grouped_outer_refs(f, depth, group_keys);
+    }
+    if let Some(h) = plan.having.as_mut() {
+        remap_grouped_outer_refs(h, depth, group_keys);
+    }
+    for k in &mut plan.group_keys {
+        remap_grouped_outer_refs(k, depth, group_keys);
+    }
+    for e in &mut plan.distinct_on {
+        remap_grouped_outer_refs(e, depth, group_keys);
+    }
+    for k in &mut plan.order_by {
+        remap_grouped_outer_refs(&mut k.expr, depth, group_keys);
+    }
+    for j in &mut plan.joins {
+        remap_grouped_outer_refs(&mut j.on, depth, group_keys);
+    }
+    for a in &mut plan.aggregates {
+        if let Some(arg) = a.arg.as_mut() {
+            remap_grouped_outer_refs(arg, depth, group_keys);
+        }
+        if let Some(arg2) = a.arg2.as_mut() {
+            remap_grouped_outer_refs(arg2, depth, group_keys);
+        }
+        for r in &mut a.row_args {
+            remap_grouped_outer_refs(r, depth, group_keys);
+        }
+        for k in &mut a.order_by {
+            remap_grouped_outer_refs(&mut k.expr, depth, group_keys);
+        }
+        if let Some(fil) = a.filter.as_mut() {
+            remap_grouped_outer_refs(fil, depth, group_keys);
+        }
+    }
+    for w in &mut plan.windows {
+        for arg in &mut w.args {
+            remap_grouped_outer_refs(arg, depth, group_keys);
+        }
+        for part in &mut w.partition {
+            remap_grouped_outer_refs(part, depth, group_keys);
+        }
+        for k in &mut w.order {
+            remap_grouped_outer_refs(&mut k.expr, depth, group_keys);
+        }
+        if let Some(fil) = w.filter.as_mut() {
+            remap_grouped_outer_refs(fil, depth, group_keys);
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per TypedExprKind variant; length tracks the expression grammar"
@@ -2314,29 +2491,36 @@ pub(super) fn rebase_onto_aggregation(
             ));
         },
         // Literals carry no references. An `OuterColumn` resolves from an enclosing query's row, so
-        // it is constant w.r.t. this query's aggregation and is not rebased. A scalar/EXISTS
-        // subquery body has its own scope, so it carries no this-level column ref to rebase either.
+        // it is constant w.r.t. this query's aggregation and is not rebased.
         TypedExprKind::Literal(_)
         | TypedExprKind::OuterColumn { .. }
-        | TypedExprKind::ScalarSubquery(_)
         // A set-returning function never coexists with aggregation (rejected in `analyze_select`), so
         // it is unreachable here; nothing to rebase.
-        | TypedExprKind::SetReturning { .. }
-        | TypedExprKind::Exists { .. } => {},
+        | TypedExprKind::SetReturning { .. } => {},
+        // A scalar/EXISTS subquery body has its own scope, so no *this-level* column ref to rebase —
+        // but a correlated reference to one of THIS query's GROUP BY keys is an `OuterColumn` inside
+        // it that now indexes the post-aggregation row, so remap those onto their key slots.
+        TypedExprKind::ScalarSubquery(plan) | TypedExprKind::Exists { plan, .. } => {
+            remap_grouped_outer_refs_in_plan(plan, 1, ctx.group_keys);
+        },
         TypedExprKind::Binary { left, right, .. }
         | TypedExprKind::IsDistinctFrom { left, right, .. } => {
             rebase_onto_aggregation(left, ctx)?;
             rebase_onto_aggregation(right, ctx)?;
         },
-        // `IN (subquery)` rebases its (outer-referencing) probe; the single-child unary/cast
-        // forms rebase their lone operand the same way.
+        // `IN (subquery)` / quantified subquery: rebase the outer-referencing probe, and remap the
+        // subquery body's references to this query's group keys (as for a scalar subquery).
+        TypedExprKind::InSubquery { expr, plan, .. }
+        | TypedExprKind::QuantifiedSubquery { expr, plan, .. } => {
+            rebase_onto_aggregation(expr, ctx)?;
+            remap_grouped_outer_refs_in_plan(plan, 1, ctx.group_keys);
+        },
+        // The single-child unary/cast forms rebase their lone operand.
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::IsNull { expr, .. }
         | TypedExprKind::IsJson { operand: expr, .. }
         | TypedExprKind::IsBool { expr, .. }
-        | TypedExprKind::Cast(expr, _)
-        | TypedExprKind::InSubquery { expr, .. }
-        | TypedExprKind::QuantifiedSubquery { expr, .. } => {
+        | TypedExprKind::Cast(expr, _) => {
             rebase_onto_aggregation(expr, ctx)?;
         },
         TypedExprKind::QuantifiedArray { expr, array, .. } => {
