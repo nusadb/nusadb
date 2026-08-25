@@ -1660,7 +1660,10 @@ fn parse_create_policy(sql: &str) -> Result<ast::Statement, Error> {
     parser.expect_keyword(Keyword::POLICY).map_err(syntax)?;
     let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let table = unqualified_object_name(
+        &parser.parse_object_name(false).map_err(syntax)?,
+        POLICY_TABLE_IS_UNQUALIFIED,
+    )?;
 
     // `AS PERMISSIVE | AS RESTRICTIVE` (PERMISSIVE/RESTRICTIVE are not sqlparser keywords, so they
     // arrive as identifiers); the default when `AS` is omitted is PERMISSIVE.
@@ -1749,7 +1752,10 @@ fn parse_drop_policy(sql: &str) -> Result<ast::Statement, Error> {
     let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
     let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let table = unqualified_object_name(
+        &parser.parse_object_name(false).map_err(syntax)?,
+        POLICY_TABLE_IS_UNQUALIFIED,
+    )?;
     expect_statement_end(&mut parser)?;
     Ok(ast::Statement::DropPolicy(ast::DropPolicy {
         name,
@@ -1773,7 +1779,10 @@ fn parse_alter_policy(sql: &str) -> Result<ast::Statement, Error> {
     parser.expect_keyword(Keyword::POLICY).map_err(syntax)?;
     let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let table = unqualified_object_name(
+        &parser.parse_object_name(false).map_err(syntax)?,
+        POLICY_TABLE_IS_UNQUALIFIED,
+    )?;
 
     if parser.parse_keyword(Keyword::RENAME) {
         return unsupported("ALTER POLICY ... RENAME TO is not yet supported");
@@ -2302,7 +2311,10 @@ fn parse_create_trigger(sql: &str) -> Result<ast::Statement, Error> {
     }
 
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let table = unqualified_object_name(
+        &parser.parse_object_name(false).map_err(syntax)?,
+        TRIGGER_TABLE_IS_UNQUALIFIED,
+    )?;
 
     // `FOR EACH ROW | STATEMENT` is optional; it defaults to ROW (the form that binds NEW/OLD).
     let for_each = if parser.parse_keyword(Keyword::FOR) {
@@ -2368,7 +2380,10 @@ fn parse_drop_trigger(sql: &str) -> Result<ast::Statement, Error> {
     let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
     let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let table = unqualified_object_name(
+        &parser.parse_object_name(false).map_err(syntax)?,
+        TRIGGER_TABLE_IS_UNQUALIFIED,
+    )?;
     expect_statement_end(&mut parser)?;
     Ok(ast::Statement::DropTrigger(ast::DropTrigger {
         name,
@@ -2392,7 +2407,10 @@ fn parse_alter_trigger(sql: &str) -> Result<ast::Statement, Error> {
     parser.expect_keyword(Keyword::TRIGGER).map_err(syntax)?;
     let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
-    let table = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    let table = unqualified_object_name(
+        &parser.parse_object_name(false).map_err(syntax)?,
+        TRIGGER_TABLE_IS_UNQUALIFIED,
+    )?;
     if !parser.parse_keywords(&[Keyword::RENAME, Keyword::TO]) {
         return unsupported(
             "ALTER TRIGGER supports only RENAME TO; use ALTER TABLE ... {ENABLE|DISABLE} TRIGGER \
@@ -4058,6 +4076,53 @@ fn guc_name(name: &sql::ObjectName) -> Result<String, Error> {
 ///
 /// The exception is the `information_schema` schema: `information_schema.tables` is accepted and
 /// joined with a `.`.
+/// Why a policy's table cannot carry a schema yet — see [`unqualified_object_name`].
+const POLICY_TABLE_IS_UNQUALIFIED: &str = concat!(
+    "the policy catalog stores its table by bare name, so one row would serve ",
+    "two same-named tables in different schemas"
+);
+
+/// Why a trigger's table cannot carry a schema yet — see [`unqualified_object_name`].
+const TRIGGER_TABLE_IS_UNQUALIFIED: &str = concat!(
+    "the trigger catalog stores its table by bare name, so one row would serve ",
+    "two same-named tables in different schemas"
+);
+
+/// Like [`object_name`], but refusing a qualifier with a stated reason.
+///
+/// The shared message says a qualifier "does not resolve one yet", which reads as plumbing nobody
+/// has finished. For these statements that is false in a way that matters: the catalog holding the
+/// object keys it by a bare name, so a qualifier could be parsed here and then never honoured —
+/// and for a policy or a trigger it would be worse than dropped, because two same-named tables in
+/// different schemas share one catalog row. Opening them needs a schema column in that catalog,
+/// not a wider parser.
+///
+/// **This refuses `public.` and `information_schema.` too, which [`object_name`] accepted**, and
+/// that is deliberate rather than a side effect of checking the part count.
+///
+/// `object_name` collapses `public.t` to the bare `t`, and the bare name is what reaches the
+/// catalog — so the explicit `public.` buys nothing: it writes the same row `t` writes, and that
+/// row governs or fires on every schema's `t`. On `CREATE TRIGGER` it is worse than nothing,
+/// because that one site resolves through `lookup_table_ref`, which consults the session temp
+/// schema and then the search path: under `SET search_path = app`, an explicit `public.t` attaches
+/// the trigger to `app.t`. The other five never take that path: `CREATE POLICY` and `ALTER POLICY`
+/// look up in the public namespace only, and `DROP POLICY`, `DROP TRIGGER` and `ALTER TRIGGER` do
+/// not resolve the table at all.
+///
+/// `information_schema.` is refused for a separate reason. `object_name` passed it through as the
+/// flat name `information_schema.tables`, but no catalog table has that name — those views are
+/// resolved from a name only on the `SELECT` path, never here. The three sites that resolve their
+/// table therefore ended in `TableNotFound`; the three that do not went through to the executor and
+/// answered `policy ... does not exist` or `TriggerNotFound` — or, under `IF EXISTS`, reported
+/// **success** for a statement naming a table that has never existed. Refusing here replaces four
+/// different misleading answers with one true one.
+fn unqualified_object_name(name: &sql::ObjectName, why: &str) -> Result<String, Error> {
+    if name.0.len() > 1 {
+        return unsupported(&format!("a schema qualifier here ({why})"));
+    }
+    object_name(name)
+}
+
 fn object_name(name: &sql::ObjectName) -> Result<String, Error> {
     match name.0.as_slice() {
         [part] => fold_part(part),

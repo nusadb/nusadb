@@ -257,3 +257,52 @@ fn a_qualifier_that_cannot_mean_anything_is_refused_as_such() {
         "refused as unfinished work rather than as meaningless: {message}"
     );
 }
+
+/// A qualifier that the catalog could not honour is refused for that reason, not as unfinished
+/// plumbing.
+///
+/// Policies and triggers record their table by bare name (`nusadb_policies` and `nusadb_triggers`
+/// both store it as plain text), so one catalog row would serve two same-named tables in different
+/// schemas. Accepting `CREATE POLICY p ON app.t` would parse the qualifier and then govern
+/// `public.t` with it — worse than refusing, because the statement would appear to have worked.
+///
+/// The generic message says a qualifier "does not resolve one yet", which reads as work in
+/// progress. Here the blocker is a missing schema column in the object's own catalog.
+#[test]
+fn a_qualifier_the_catalog_cannot_hold_says_so() {
+    for (sql, catalog) in [
+        ("CREATE POLICY p ON app.t USING (true)", "policy catalog"),
+        ("DROP POLICY p ON app.t", "policy catalog"),
+        ("ALTER POLICY p ON app.t TO alice", "policy catalog"),
+        (
+            "CREATE TRIGGER tg BEFORE INSERT ON app.t EXECUTE FUNCTION f()",
+            "trigger catalog",
+        ),
+        ("DROP TRIGGER tg ON app.t", "trigger catalog"),
+        ("ALTER TRIGGER tg ON app.t DISABLE", "trigger catalog"),
+        // `public.` is refused here too, where the old helper collapsed it to a bare name. That
+        // collapse is not harmless: the analyzer re-resolves the bare name through the search
+        // path, so under `SET search_path = app` an explicit `public.t` would have attached the
+        // policy to `app.t`. Pinned because it is a narrowing of what parsed before, and a
+        // narrowing nobody pinned is one nobody notices.
+        ("CREATE POLICY p ON public.t USING (true)", "policy catalog"),
+        ("DROP TRIGGER tg ON public.t", "trigger catalog"),
+    ] {
+        let Err(Error::Unsupported(message)) = parse(sql) else {
+            panic!("expected `{sql}` to be refused while the catalog is unqualified");
+        };
+        assert!(
+            message.contains(catalog),
+            "`{sql}` should name the {catalog} as the blocker, got: {message}"
+        );
+        assert!(
+            !message.contains("does not resolve one yet"),
+            "`{sql}` still reports a catalog limit as unfinished plumbing: {message}"
+        );
+        // The same generated-continuation defect that has reached a user before.
+        assert!(
+            !message.contains("  "),
+            "`{sql}` carries a run of spaces in its message: {message}"
+        );
+    }
+}
