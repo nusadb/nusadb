@@ -590,7 +590,7 @@ pub enum ScalarFunc {
     ToChar,
     /// `TO_DATE(text, format)` — parse `text` per `format` into a `DATE`.
     ToDate,
-    /// `TO_TIMESTAMP(text, format)` — parse `text` per `format` into a `TIMESTAMP`.
+    /// `TO_TIMESTAMP(text, format)` — parse `text` per `format` into a `TIMESTAMPTZ`.
     ToTimestamp,
     /// `TO_NUMBER(text, format)` — parse a formatted number `text` into a `NUMERIC`, reading the
     /// digits, sign, and decimal point and ignoring group separators / currency / padding (B-fn).

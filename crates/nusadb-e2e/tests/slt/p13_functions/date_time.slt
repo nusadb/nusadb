@@ -219,10 +219,13 @@ SELECT TO_CHAR(1234567.891, '9G999G999D99')
 ----
  1,234,567.89
 
-# An unsupported numeric format character is still rejected, not silently mis-formatted.
-statement error
+# The anchored sign S prints an always-shown +/- (leading here, so before the digits).
+query T
 SELECT TO_CHAR(5, 'S999')
+----
+  +5
 
+# An unsupported numeric format character is still rejected, not silently mis-formatted.
 statement error
 SELECT TO_CHAR(5, '999PR')
 
@@ -232,11 +235,11 @@ SELECT TO_DATE('2024-06-15', 'YYYY-MM-DD')
 ----
 2024-06-15
 
-# --- TO_TIMESTAMP: parse text to timestamp ---
+# --- TO_TIMESTAMP: parse text to timestamptz (the instant in the session zone, UTC here) ---
 query T
 SELECT TO_TIMESTAMP('2024-06-15 14:30:45', 'YYYY-MM-DD HH24:MI:SS')
 ----
-2024-06-15 14:30:45
+2024-06-15 14:30:45+00
 
 # --- TimestampTz variants ---
 query T

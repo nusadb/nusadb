@@ -1931,14 +1931,15 @@ fn to_date_value(text: &str, fmt: &str) -> Result<ast::Value, Error> {
     Ok(ast::Value::Date(days))
 }
 
-/// `TO_TIMESTAMP(text, fmt)` — parse `text` per `fmt` into a `TIMESTAMP`.
+/// `TO_TIMESTAMP(text, fmt)` — parse `text` per `fmt` into a `TIMESTAMPTZ` (the instant read in the
+/// session zone, fixed at UTC here), matching the reference engine.
 fn to_timestamp_value(text: &str, fmt: &str) -> Result<ast::Value, Error> {
     let micros =
         crate::temporal::parse_with_pattern(text, fmt).ok_or_else(|| Error::InvalidValue {
-            ty: nusadb_core::ColumnType::Timestamp,
+            ty: nusadb_core::ColumnType::TimestampTz,
             value: text.to_owned(),
         })?;
-    Ok(ast::Value::Timestamp(micros))
+    Ok(ast::Value::TimestampTz(micros))
 }
 
 /// `to_timestamp(epoch_seconds)` — a UNIX epoch (seconds since 1970-01-01 UTC, fractional allowed)

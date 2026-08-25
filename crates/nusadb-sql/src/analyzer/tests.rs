@@ -2247,7 +2247,7 @@ fn to_char_date_timestamp_resolve_result_types() {
         ),
         (
             "SELECT TO_TIMESTAMP('2024-06-15', 'YYYY-MM-DD')",
-            ColumnType::Timestamp,
+            ColumnType::TimestampTz,
         ),
     ] {
         let LogicalPlan::Select(p) = plan(sql, &MockCatalog::new()).unwrap() else {

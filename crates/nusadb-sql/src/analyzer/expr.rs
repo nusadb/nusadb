@@ -3550,7 +3550,9 @@ fn analyze_format_function(
     let result = match func {
         F::ToChar => Text,
         F::ToDate => Date,
-        _ => Timestamp,
+        // `to_timestamp(text, format)` yields a TIMESTAMPTZ (the parsed instant in the session zone,
+        // fixed at UTC here), matching the reference engine — not a zoneless TIMESTAMP.
+        _ => ColumnType::TimestampTz,
     };
     Ok(TypedExpr {
         kind: TypedExprKind::ScalarFunction {
