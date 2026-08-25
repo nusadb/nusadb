@@ -49,6 +49,11 @@ impl std::error::Error for SltWireError {}
 ///
 /// One server and one connection per file, matching the in-process runner's "fresh engine per
 /// file" rule, so a scenario cannot be perturbed by another.
+///
+/// That holds for engine state, and not for `LISTEN`/`NOTIFY`: the listener registry is global to
+/// the process rather than owned by a server, and every file here starts up as the same database,
+/// so files would deliver to each other's listeners. No file uses either statement today. Adding
+/// one means giving it a channel or a database no other file uses.
 struct WireConnection {
     /// Declared before `runtime` on purpose: a tokio IO resource must not outlive the runtime it
     /// was created on, and struct fields drop in declaration order.

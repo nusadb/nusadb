@@ -160,41 +160,80 @@ mod tests {
         assert!(rx_c.try_recv().is_err()); // wrong database
     }
 
+    // Each test below registers under a database of its own.
+    //
+    // The registry is process-global and `notify` delivers to *every* listener on the named
+    // database — which is the behaviour, not a defect: two connections to one database are
+    // supposed to see each other. What is not allowed is for two tests to be two such
+    // connections. Sharing the name `db` made them exactly that, and libtest runs them
+    // concurrently: one test's `notify` counted the other's listener, and one received the
+    // other's payload. Distinct pids do not help, because delivery is not keyed on pid.
+    //
+    // A per-test database is one of two ways out; the integration tests in
+    // `tests/test_multidatabase.rs` take the other, isolating on a per-test *channel* name because
+    // they all connect as the same database. Either axis works — what matters is that two tests
+    // never share both.
     #[test]
     fn self_notification_is_delivered() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _r = register(9101, "db".to_owned(), tx);
+        let _r = register(9101, "db_self".to_owned(), tx);
         listen(9101, "ch".to_owned());
         let n = note(9101, "ch", "hi");
-        assert_eq!(notify("db", "ch", &n), 1);
+        assert_eq!(notify("db_self", "ch", &n), 1);
         assert_eq!(rx.try_recv(), Ok(n));
     }
 
     #[test]
     fn unlisten_stops_delivery() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _r = register(9201, "db".to_owned(), tx);
+        let _r = register(9201, "db_unlisten".to_owned(), tx);
         listen(9201, "a".to_owned());
         listen(9201, "b".to_owned());
 
         unlisten(9201, Some("a"));
-        assert_eq!(notify("db", "a", &note(1, "a", "")), 0);
-        assert_eq!(notify("db", "b", &note(1, "b", "")), 1);
+        assert_eq!(notify("db_unlisten", "a", &note(1, "a", "")), 0);
+        assert_eq!(notify("db_unlisten", "b", &note(1, "b", "")), 1);
         let _ = rx.try_recv();
 
         unlisten(9201, None); // unlisten *
-        assert_eq!(notify("db", "b", &note(1, "b", "")), 0);
+        assert_eq!(notify("db_unlisten", "b", &note(1, "b", "")), 0);
     }
 
     #[test]
     fn dropping_the_registration_removes_the_listener() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         {
-            let _r = register(9301, "db".to_owned(), tx);
+            let _r = register(9301, "db_drop".to_owned(), tx);
             listen(9301, "ch".to_owned());
-            assert_eq!(notify("db", "ch", &note(1, "ch", "")), 1);
+            assert_eq!(notify("db_drop", "ch", &note(1, "ch", "")), 1);
         }
         // After the registration drops, the listener is gone.
-        assert_eq!(notify("db", "ch", &note(1, "ch", "")), 0);
+        assert_eq!(notify("db_drop", "ch", &note(1, "ch", "")), 0);
+    }
+
+    /// Two connections on one database both receive — which is the point of `LISTEN`, and the
+    /// reason the tests above each need a database of their own.
+    ///
+    /// Every other assertion in this module expects a delivery count of 0 or 1, so an
+    /// implementation that delivered to the *first* matching listener and stopped would pass all of
+    /// them. This is the only test that pins a count above 1, and it is stated as a test rather
+    /// than a comment so the note above cannot drift away from the behaviour it explains.
+    #[test]
+    fn every_listener_on_one_database_receives() {
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let _a = register(9401, "db_shared".to_owned(), tx1);
+        let _b = register(9402, "db_shared".to_owned(), tx2);
+        listen(9401, "ch".to_owned());
+        listen(9402, "ch".to_owned());
+
+        let n = note(9401, "ch", "both");
+        assert_eq!(
+            notify("db_shared", "ch", &n),
+            2,
+            "every listener on the database must receive, not just the first"
+        );
+        assert_eq!(rx1.try_recv(), Ok(n.clone()));
+        assert_eq!(rx2.try_recv(), Ok(n));
     }
 }
