@@ -88,6 +88,7 @@ pub(super) fn run_insert(
         Ok(ExecutionResult::Rows {
             columns: plan.returning.iter().map(|p| p.name.clone()).collect(),
             rows: returned,
+            command: RowsCommand::Insert,
         })
     }
 }
@@ -3508,6 +3509,7 @@ pub(super) fn run_update(
         Ok(ExecutionResult::Rows {
             columns: plan.returning.iter().map(|p| p.name.clone()).collect(),
             rows: returned,
+            command: RowsCommand::Update,
         })
     }
 }
@@ -3617,6 +3619,7 @@ pub(super) fn run_delete(
         Ok(ExecutionResult::Rows {
             columns: plan.returning.iter().map(|p| p.name.clone()).collect(),
             rows: returned,
+            command: RowsCommand::Delete,
         })
     }
 }

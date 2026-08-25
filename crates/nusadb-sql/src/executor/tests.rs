@@ -391,7 +391,7 @@ fn run(sql: &str, engine: &MockEngine) -> Result<ExecutionResult, Error> {
 
 fn rows_of(result: ExecutionResult) -> (Vec<String>, Vec<Row>) {
     match result {
-        ExecutionResult::Rows { columns, rows } => (columns, rows),
+        ExecutionResult::Rows { columns, rows, .. } => (columns, rows),
         other => panic!("expected Rows, got {other:?}"),
     }
 }

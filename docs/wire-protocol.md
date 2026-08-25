@@ -331,8 +331,12 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `TRUNCATE` | `TRUNCATE TABLE` |
 | `LOCK TABLE` | `LOCK TABLE` |
 | `PREPARE` / `DEALLOCATE` | `PREPARE` / `DEALLOCATE` (embedded API only — see §14) |
-| `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM <n>` / `ANALYZE` / `COMMENT` |
+| `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM` / `ANALYZE` / `COMMENT` |
 | `REINDEX` / `CHECKPOINT` | `REINDEX` / `CHECKPOINT` |
+
+A statement with `RETURNING` still reports its own action, not `SELECT`: an
+`INSERT ... RETURNING` streams the returned rows and completes with `INSERT <n>` (and likewise
+`UPDATE <n>` / `DELETE <n>`), so a client reading the affected-row count off the tag is not misled.
 
 Each kind of object reports its own tag. A statement that creates a view says `CREATE VIEW`, not
 `CREATE TABLE` — earlier builds reported the table tag for views, types, domains and policies alike,

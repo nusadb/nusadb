@@ -173,6 +173,7 @@ fn call_result(out_params: Vec<String>, values: Vec<ast::Value>) -> ExecutionRes
         ExecutionResult::Rows {
             columns: out_params,
             rows: vec![values],
+            command: RowsCommand::Select,
         }
     }
 }

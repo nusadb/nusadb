@@ -15,8 +15,8 @@ use nusadb_btree::BtreeEngine;
 use nusadb_core::{ColumnType, StorageEngine, TableSchema};
 use nusadb_sql::ast::Value;
 use nusadb_sql::{
-    Catalog, Error, ExecutionResult, IndexInfo, RowSink, Session, SpillConfig, StreamOutcome,
-    analyze, parse, plan, set_spill_config,
+    Catalog, Error, ExecutionResult, IndexInfo, RowSink, RowsCommand, Session, SpillConfig,
+    StreamOutcome, analyze, parse, plan, set_spill_config,
 };
 
 struct Cat<'a>(&'a dyn StorageEngine);
@@ -89,7 +89,10 @@ fn buffered(
     session: &mut Session,
     sql: &str,
 ) -> (Vec<String>, Vec<Vec<Value>>) {
-    let ExecutionResult::Rows { columns, mut rows } = run(engine, session, sql) else {
+    let ExecutionResult::Rows {
+        columns, mut rows, ..
+    } = run(engine, session, sql)
+    else {
         panic!("expected rows from: {sql}");
     };
     rows.sort_by_key(|r| format!("{r:?}"));
@@ -133,7 +136,7 @@ fn execute_streaming_matches_buffered_execute() {
             let outcome = session
                 .execute_streaming(planned(engine, sql), &mut sink)
                 .unwrap();
-            let StreamOutcome::Rows { columns, count } = outcome else {
+            let StreamOutcome::Rows { columns, count, .. } = outcome else {
                 panic!("expected StreamOutcome::Rows for: {sql}");
             };
 
@@ -171,7 +174,7 @@ fn execute_streaming_self_join_left_build_matches_buffered() {
         let outcome = session
             .execute_streaming(planned(engine, sql), &mut sink)
             .unwrap();
-        let StreamOutcome::Rows { columns, count } = outcome else {
+        let StreamOutcome::Rows { columns, count, .. } = outcome else {
             panic!("{label}: expected StreamOutcome::Rows");
         };
         assert_eq!(columns, want_cols, "{label}: columns");
@@ -311,10 +314,20 @@ fn execute_streaming_returning_reports_real_column_types() {
             &mut sink,
         )
         .unwrap();
-    let StreamOutcome::Rows { columns, count } = outcome else {
+    let StreamOutcome::Rows {
+        columns,
+        count,
+        command,
+    } = outcome
+    else {
         panic!("expected rows from RETURNING");
     };
     assert_eq!(count, 1);
+    assert_eq!(
+        command,
+        RowsCommand::Insert,
+        "INSERT ... RETURNING must carry the INSERT command so its tag is not a bare SELECT"
+    );
     assert_eq!(columns, vec!["id", "label", "?column?"]);
     assert!(
         sink.typed,

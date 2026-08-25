@@ -55,7 +55,11 @@ pub(super) fn run_select(
     } else {
         execute_op(op, engine, txn)?
     };
-    Ok(ExecutionResult::Rows { columns, rows })
+    Ok(ExecutionResult::Rows {
+        columns,
+        rows,
+        command: RowsCommand::Select,
+    })
 }
 
 /// A vectorized-routing estimate for a plan that contains a [`HashJoin`](PhysicalOperator::HashJoin):
@@ -186,6 +190,7 @@ pub(super) fn run_set_operation(
     Ok(ExecutionResult::Rows {
         columns: plan.columns.clone(),
         rows,
+        command: RowsCommand::Select,
     })
 }
 
@@ -1966,6 +1971,7 @@ fn run_modifying_ctes(
             PhysicalPlan::Select(op, _est) => ExecutionResult::Rows {
                 columns: Vec::new(),
                 rows: execute_op(op, engine, txn)?,
+                command: RowsCommand::Select,
             },
             _ => {
                 return Err(Error::Internal(

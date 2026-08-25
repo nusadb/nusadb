@@ -192,7 +192,7 @@ fn create_insert_select_round_trip() {
     ));
 
     match run(&engine, "SELECT id, name FROM users") {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["id".to_owned(), "name".to_owned()]);
             assert_eq!(rows.len(), 2);
             assert!(rows.contains(&vec![Value::Int(1), Value::Text("alice".to_owned())]));
@@ -213,7 +213,7 @@ fn data_modifying_cte_reports_returning_column_metadata() {
         "WITH ins AS (INSERT INTO t VALUES (1, 10), (2, 20) RETURNING id, v) \
          SELECT id, v FROM ins ORDER BY id",
     ) {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["id".to_owned(), "v".to_owned()]);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0], vec![Value::Int(1), Value::Int(10)]);
@@ -731,7 +731,7 @@ fn insert_returning_projects_the_inserted_rows() {
         &engine,
         "INSERT INTO users (id, name) VALUES (1, 'alice') RETURNING id, name AS who",
     ) {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["id".to_owned(), "who".to_owned()]);
             assert_eq!(
                 rows,
@@ -746,7 +746,7 @@ fn insert_returning_projects_the_inserted_rows() {
         &engine,
         "INSERT INTO users (id, name) VALUES (2, 'bob'), (3, 'carol') RETURNING *",
     ) {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["id".to_owned(), "name".to_owned()]);
             assert_eq!(rows.len(), 2);
             assert!(rows.contains(&vec![Value::Int(2), Value::Text("bob".to_owned())]));
@@ -814,7 +814,7 @@ fn update_and_delete_returning_project_affected_rows() {
         &engine,
         "UPDATE users SET name = 'BOB' WHERE id = 2 RETURNING id, name",
     ) {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["id".to_owned(), "name".to_owned()]);
             assert_eq!(
                 rows,
@@ -829,7 +829,7 @@ fn update_and_delete_returning_project_affected_rows() {
         &engine,
         "DELETE FROM users WHERE id = 1 RETURNING name AS gone",
     ) {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["gone".to_owned()]);
             assert_eq!(rows, vec![vec![Value::Text("alice".to_owned())]]);
         },
@@ -2544,7 +2544,7 @@ fn distinct_on_keeps_first_row_per_key() {
 
     // DISTINCT ON (g) ORDER BY g, v → the smallest v per g.
     match run(&engine, "SELECT DISTINCT ON (g) g, v FROM t ORDER BY g, v") {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["g".to_owned(), "v".to_owned()]);
             assert_eq!(
                 rows,
@@ -8504,7 +8504,9 @@ fn b452_to_char_to_date_to_timestamp_end_to_end() {
                     Value::Text("2024-06-15 13:45:30".to_owned()),
                     Value::Text("15 Jun 2024".to_owned()),
                     Value::Date(date),
-                    Value::Timestamp(ts),
+                    // TO_TIMESTAMP(text, fmt) yields a timestamptz (the instant in the session zone,
+                    // UTC here), so the value is a TimestampTz carrying the same micros.
+                    Value::TimestampTz(ts),
                 ]]
             );
         },

@@ -262,7 +262,7 @@ fn out_parameters_are_returned_from_call() {
     );
     // CALL supplies arguments for the IN parameters only; OUT values come back as a one-row result.
     match run(&engine, "CALL compute(4)") {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows { columns, rows, .. } => {
             assert_eq!(columns, vec!["result".to_owned(), "label".to_owned()]);
             assert_eq!(
                 rows,

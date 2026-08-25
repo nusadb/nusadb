@@ -29,6 +29,7 @@ pub(super) fn run_show_tables(
     Ok(ExecutionResult::Rows {
         columns: vec!["table".to_owned()],
         rows,
+        command: RowsCommand::Select,
     })
 }
 
@@ -52,6 +53,7 @@ pub(super) fn run_show_columns(schema: &TableSchema) -> ExecutionResult {
             "nullable".to_owned(),
         ],
         rows,
+        command: RowsCommand::Select,
     }
 }
 

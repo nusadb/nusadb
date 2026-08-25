@@ -184,6 +184,36 @@ async fn run(client: &mut Connection<TcpStream>, sql: &str) -> Outcome {
     )
 }
 
+/// Run a simple query and return only its `CommandComplete` tag, regardless of whether the
+/// statement also streamed rows (which [`run`] collapses to `Outcome::Rows`). Panics on error.
+async fn tag_of(client: &mut Connection<TcpStream>, sql: &str) -> String {
+    client
+        .write_frame(
+            &FrontendMessage::Query {
+                sql: sql.to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut tag = None;
+    loop {
+        let frame = client
+            .read_frame()
+            .await
+            .unwrap()
+            .expect("server closed mid-query");
+        match BackendMessage::decode(&frame).unwrap() {
+            BackendMessage::CommandComplete { tag: t } => tag = Some(t),
+            BackendMessage::Error { code, .. } => panic!("query `{sql}` errored: {code}"),
+            BackendMessage::ReadyForQuery(_) => break,
+            _ => {},
+        }
+    }
+    tag.unwrap_or_default()
+}
+
 /// Run a query and return its first row's first column as text (for `SELECT current_database()`).
 async fn scalar(client: &mut Connection<TcpStream>, sql: &str) -> String {
     client
@@ -968,6 +998,54 @@ async fn each_kind_of_object_reports_its_own_command_tag() {
     assert!(
         wrong.is_empty(),
         "{} of {} statements reported the wrong command tag:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn returning_reports_the_dml_command_tag_not_select() {
+    // A statement with RETURNING sends its result rows AND still announces what it did: an
+    // `INSERT ... RETURNING` reports `INSERT <n>`, not `SELECT <n>`, so a client reading the
+    // affected-row count off the tag is not misled. The count is the number of affected rows.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cluster: Arc<dyn DatabaseCluster> = Arc::new(MockCluster::new());
+    let server = tokio::spawn(serve_cluster_with_shutdown(
+        listener,
+        Arc::clone(&cluster),
+        ServerConfig::default(),
+        std::future::pending::<()>(),
+    ));
+
+    let mut c = connect_as(addr, "nusadb", "nusadb-root")
+        .await
+        .expect("connect");
+    let cases: &[(&str, &str)] = &[
+        ("CREATE TABLE t (id INT, v TEXT)", "CREATE TABLE"),
+        (
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING id",
+            "INSERT 2",
+        ),
+        ("UPDATE t SET v = 'x' WHERE id = 1 RETURNING id", "UPDATE 1"),
+        ("DELETE FROM t WHERE id = 2 RETURNING id", "DELETE 1"),
+        // A plain SELECT still reports SELECT.
+        ("SELECT id FROM t", "SELECT 1"),
+        ("DROP TABLE t", "DROP TABLE"),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        let got = tag_of(&mut c, sql).await;
+        if got != *want {
+            wrong.push(format!("  {sql}\n    got `{got}`, wanted `{want}`"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} RETURNING statements reported the wrong command tag:\n{}",
         wrong.len(),
         cases.len(),
         wrong.join("\n")

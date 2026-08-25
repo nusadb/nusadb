@@ -106,6 +106,23 @@ pub(crate) fn spill_is_configured() -> bool {
     spill::spill_config().is_some()
 }
 
+/// Which statement produced a [`ExecutionResult::Rows`] result set.
+///
+/// This drives the command tag the wire emits: a plain `SELECT` reports `SELECT N`, while an
+/// `INSERT`/`UPDATE`/`DELETE ... RETURNING` reports its own affected-row count (`INSERT N`,
+/// `UPDATE N`, `DELETE N`) rather than swallowing it as a bare `SELECT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsCommand {
+    /// A `SELECT` (or any read-only projection): the tag is `SELECT N`.
+    Select,
+    /// An `INSERT ... RETURNING`: the tag is `INSERT N`.
+    Insert,
+    /// An `UPDATE ... RETURNING`: the tag is `UPDATE N`.
+    Update,
+    /// A `DELETE ... RETURNING`: the tag is `DELETE N`.
+    Delete,
+}
+
 /// The outcome of executing a single SQL statement.
 #[derive(Debug)]
 pub enum ExecutionResult {
@@ -145,12 +162,16 @@ pub enum ExecutionResult {
     Truncated,
     /// `MERGE` — the number of source rows that drove an applied `WHEN` action.
     Merged(usize),
-    /// `SELECT` — projected output rows and their column names.
+    /// `SELECT` — projected output rows and their column names. Also the result of an
+    /// `INSERT`/`UPDATE`/`DELETE ... RETURNING`, distinguished by `command` so the wire layer emits
+    /// the affected-row count in the command tag instead of `SELECT N`.
     Rows {
         /// Names of the output columns, in order.
         columns: Vec<String>,
         /// One row per output tuple, each with `columns.len()` entries.
         rows: Vec<Row>,
+        /// The statement kind behind these rows, driving the command tag.
+        command: RowsCommand,
     },
     /// `BEGIN` — an explicit transaction is now active in the session.
     TransactionBegun,
@@ -307,6 +328,9 @@ pub enum StreamOutcome {
         columns: Vec<String>,
         /// How many rows were delivered to the sink.
         count: usize,
+        /// The statement kind behind these rows, so the command tag reports an
+        /// `INSERT`/`UPDATE`/`DELETE ... RETURNING` as its DML action rather than a bare `SELECT`.
+        command: RowsCommand,
     },
     /// A non-row statement (DDL/DML/transaction control): its ordinary [`ExecutionResult`], so a
     /// caller can derive the same command tag it would from [`Session::execute`].
@@ -582,6 +606,7 @@ pub fn show_session_variable(name: &str, settings: &HashMap<String, String>) -> 
     ExecutionResult::Rows {
         columns: vec![name.to_owned()],
         rows: vec![vec![ast::Value::Text(value)]],
+        command: RowsCommand::Select,
     }
 }
 
@@ -671,7 +696,11 @@ fn replay_into_sink(
     sink: &mut dyn RowSink,
 ) -> Result<StreamOutcome, Error> {
     match result {
-        ExecutionResult::Rows { columns, rows } => {
+        ExecutionResult::Rows {
+            columns,
+            rows,
+            command,
+        } => {
             if types.len() == columns.len() {
                 sink.columns_typed(&columns, types)?;
             } else {
@@ -683,6 +712,7 @@ fn replay_into_sink(
             Ok(StreamOutcome::Rows {
                 columns,
                 count: rows.len(),
+                command,
             })
         },
         other => Ok(StreamOutcome::Other(other)),
@@ -1125,10 +1155,11 @@ impl<'engine> Session<'engine> {
             return Ok(ExecutionResult::Rows {
                 columns: columns.clone(),
                 rows: rows.clone(),
+                command: RowsCommand::Select,
             });
         }
         let result = self.run_within_txn(plan)?;
-        if let ExecutionResult::Rows { columns, rows } = &result
+        if let ExecutionResult::Rows { columns, rows, .. } = &result
             && rows.len() <= MAX_CACHE_ROWS
         {
             // Bound memory: a simple cap with a clear-on-full policy (a refinement to LRU is a
@@ -1413,6 +1444,7 @@ impl<'engine> Session<'engine> {
         ExecutionResult::Rows {
             columns: vec![name.to_owned()],
             rows: vec![vec![ast::Value::Text(value)]],
+            command: RowsCommand::Select,
         }
     }
 
@@ -1665,7 +1697,11 @@ fn stream_select_rows(
         sink.row(&row)?;
         count += 1;
     }
-    Ok(StreamOutcome::Rows { columns, count })
+    Ok(StreamOutcome::Rows {
+        columns,
+        count,
+        command: RowsCommand::Select,
+    })
 }
 
 fn dispatch(
@@ -1972,6 +2008,7 @@ fn run_explain(
     Ok(ExecutionResult::Rows {
         columns: vec!["plan".to_owned()],
         rows,
+        command: RowsCommand::Select,
     })
 }
 

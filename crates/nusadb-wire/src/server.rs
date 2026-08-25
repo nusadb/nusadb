@@ -20,8 +20,8 @@ use bytes::BytesMut;
 use nusadb_core::{IsolationLevel, StorageEngine, TableSchema, TxnId};
 use nusadb_sql::ast::Value;
 use nusadb_sql::{
-    Catalog, ExecutionResult, INTERNAL_ERROR, IndexInfo, RowSink, StreamOutcome, analyze,
-    bind_parameters, describe_column_types, describe_columns,
+    Catalog, ExecutionResult, INTERNAL_ERROR, IndexInfo, RowSink, RowsCommand, StreamOutcome,
+    analyze, bind_parameters, describe_column_types, describe_columns,
     execute_in_txn_as_streaming_with_settings, execute_in_txn_as_with_settings, parameter_count,
     parse, plan, show_session_variable,
 };
@@ -1936,7 +1936,7 @@ fn drain_portal(portal: &mut Portal, max_rows: u32) -> Vec<BackendMessage> {
 fn into_portal_result(result: ExecutionResult, result_formats: &[u16]) -> PortalResult {
     let tag = command_tag(&result);
     match result {
-        ExecutionResult::Rows { columns, rows } => PortalResult {
+        ExecutionResult::Rows { columns, rows, .. } => PortalResult {
             columns,
             rows: rows
                 .into_iter()
@@ -2362,11 +2362,17 @@ impl RowSink for ChannelSink {
     }
 }
 
-/// The `CommandComplete` tag for a streamed statement: `SELECT n` for a row result (the rows already
-/// went to the sink), otherwise the ordinary [`command_tag`].
+/// The `CommandComplete` tag for a streamed statement: the row result reports its statement kind
+/// (`SELECT n`, or `INSERT`/`UPDATE`/`DELETE n` for a `... RETURNING`, the rows already having gone
+/// to the sink); otherwise the ordinary [`command_tag`].
 fn stream_command_tag(outcome: &StreamOutcome) -> String {
     match outcome {
-        StreamOutcome::Rows { count, .. } => format!("SELECT {count}"),
+        StreamOutcome::Rows { count, command, .. } => match command {
+            RowsCommand::Select => format!("SELECT {count}"),
+            RowsCommand::Insert => format!("INSERT {count}"),
+            RowsCommand::Update => format!("UPDATE {count}"),
+            RowsCommand::Delete => format!("DELETE {count}"),
+        },
         StreamOutcome::Other(result) => command_tag(result),
     }
 }
@@ -2559,7 +2565,7 @@ fn push_result_rows(
     result: ExecutionResult,
     sink: &mut ChannelSink,
 ) -> Result<(), nusadb_sql::Error> {
-    let ExecutionResult::Rows { columns, rows } = result else {
+    let ExecutionResult::Rows { columns, rows, .. } = result else {
         return Ok(());
     };
     sink.columns(&columns)?;
@@ -4454,7 +4460,15 @@ impl Catalog for EngineCatalog<'_> {
 /// The `CommandComplete` tag for a result (e.g. `SELECT 3`, `INSERT 1`, `CREATE TABLE`).
 fn command_tag(result: &ExecutionResult) -> String {
     match result {
-        ExecutionResult::Rows { rows, .. } => format!("SELECT {}", rows.len()),
+        ExecutionResult::Rows { rows, command, .. } => match command {
+            // A plain SELECT reports the row count; an INSERT/UPDATE/DELETE ... RETURNING reports the
+            // affected-row count too (the same tag its non-RETURNING form would send), rather than
+            // swallowing it as a bare `SELECT n`.
+            RowsCommand::Select => format!("SELECT {}", rows.len()),
+            RowsCommand::Insert => format!("INSERT {}", rows.len()),
+            RowsCommand::Update => format!("UPDATE {}", rows.len()),
+            RowsCommand::Delete => format!("DELETE {}", rows.len()),
+        },
         ExecutionResult::Created(_) => "CREATE TABLE".to_owned(),
         ExecutionResult::Dropped => "DROP TABLE".to_owned(),
         ExecutionResult::ViewCreated => "CREATE VIEW".to_owned(),
