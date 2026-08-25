@@ -134,6 +134,7 @@ fn create_table_scope(ct: &ast::CreateTable) -> Vec<ScopedColumn> {
             // A `CHECK` predicate is type-checked at CREATE TABLE, before any composite catalog row
             // for this column exists, so field access is not resolved here.
             composite_type: None,
+            enum_type: None,
         })
         .collect()
 }
@@ -224,6 +225,7 @@ fn resolve_column_defaults(
             // A `CHECK` predicate is type-checked at CREATE TABLE, before any composite catalog row
             // for this column exists, so field access is not resolved here.
             composite_type: None,
+            enum_type: None,
         })
         .collect();
     let mut defaults = Vec::new();

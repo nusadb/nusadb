@@ -229,6 +229,7 @@ fn upsert_scope(table: &TableSchema) -> Vec<ScopedColumn> {
         def: def.clone(),
         qualified_only: true,
         composite_type: None,
+        enum_type: None,
     }));
     scope
 }
@@ -586,6 +587,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             qualified_only: false,
             // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
             composite_type: None,
+            enum_type: None,
         }));
         from_plan = plan.map(Box::new);
         from_table = Some(schema);
@@ -717,6 +719,7 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
             qualified_only: false,
             // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
             composite_type: None,
+            enum_type: None,
         }));
         using_plan = plan.map(Box::new);
         using_table = Some(schema);

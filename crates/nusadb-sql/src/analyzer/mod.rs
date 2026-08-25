@@ -1545,6 +1545,11 @@ pub(crate) struct ScopedColumn {
     /// comparison recognise a composite column whose physical type is `TEXT`. Populated only for
     /// base-table columns in a `SELECT` scope; a derived column (CTE, projection) is never composite.
     composite_type: Option<String>,
+    /// When the column is of a user-defined enum type, its type name (from the per-column enum
+    /// catalog); `None` otherwise. Lets a comparison coerce a text literal to the column's enum type
+    /// and reject comparing two different enum types. Populated only for base-table columns in a
+    /// `SELECT` scope, like [`Self::composite_type`].
+    enum_type: Option<String>,
 }
 
 /// Build the scope for a single table (the common, non-join case).
@@ -1565,11 +1570,19 @@ pub(crate) fn base_scope(
     for def in &table.columns {
         let composite_type =
             catalog.lookup_composite_column(&table.schema, &table.name, &def.name)?;
+        // An enum column's physical type is `Enum` (not `TEXT`), but the type name lives in the
+        // per-column enum catalog; carry it so a comparison can coerce a text literal to this enum.
+        let enum_type = if def.ty == ColumnType::Enum {
+            catalog.lookup_enum_column(&table.schema, &table.name, &def.name)?
+        } else {
+            None
+        };
         out.push(ScopedColumn {
             qualifier: qualifier.to_owned(),
             def: def.clone(),
             qualified_only: false,
             composite_type,
+            enum_type,
         });
     }
     Ok(out)
@@ -1589,6 +1602,7 @@ pub(crate) fn scope_of_aliased(table: &TableSchema, qualifier: &str) -> Vec<Scop
             // The `SELECT` scope builder enriches base-table columns with their composite type; this
             // DML-target builder has no catalog, so composite field access there is not resolved.
             composite_type: None,
+            enum_type: None,
         })
         .collect()
 }
@@ -1613,6 +1627,28 @@ pub(super) fn scoped_composite_type(
             return None;
         }
         col.composite_type.clone()
+    })
+}
+
+/// The user-defined enum type name recorded for the column reference `qualifier.name` in `scope`, or
+/// `None` if the column is not an enum (or does not resolve here). Best-effort, like
+/// [`scoped_composite_type`].
+pub(super) fn scoped_enum_type(
+    scope: &[ScopedColumn],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    scope.iter().find_map(|col| {
+        if col.def.name != name {
+            return None;
+        }
+        if qualifier.is_some_and(|q| col.qualifier != q) {
+            return None;
+        }
+        if qualifier.is_none() && col.qualified_only {
+            return None;
+        }
+        col.enum_type.clone()
     })
 }
 

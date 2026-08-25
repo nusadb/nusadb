@@ -523,6 +523,7 @@ pub(super) fn single_table_scope(table: &TableSchema) -> Vec<ScopedColumn> {
             qualified_only: false,
             // A policy predicate does not use composite field access.
             composite_type: None,
+            enum_type: None,
         })
         .collect()
 }
@@ -893,6 +894,7 @@ pub(super) fn analyze_set_operation(
             qualified_only: false,
             // A set-operation output column is derived, never a composite base-table column.
             composite_type: None,
+            enum_type: None,
         })
         .collect();
     let mut order_by = Vec::with_capacity(so.order_by.len());
@@ -1202,6 +1204,7 @@ fn analyze_select_scoped(
             qualified_only: false,
             // A window output column is derived, never a composite base-table column.
             composite_type: None,
+            enum_type: None,
         }))
         .collect();
 

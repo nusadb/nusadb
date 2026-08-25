@@ -1499,9 +1499,35 @@ fn create_type_enum_and_use_as_a_column() {
         vec![vec![sad], vec![ok], vec![happy], vec![Value::Null]]
     );
 
-    // Comparing an enum column to a BARE text literal is a loud type error for now (implicit literal
-    // coercion in comparison context is a later step). It must never silently match nothing.
-    assert!(run_try(&engine, "SELECT id FROM t WHERE m = 'happy'").is_err());
+    // A bare text literal beside an enum column is coerced to the enum type — no cast needed — and
+    // compares by declaration-order ordinal. `m = 'happy'` finds the happy row; `m > 'sad'` finds
+    // everything ordered after sad (ok, happy), NULL excluded.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM t WHERE m = 'happy' ORDER BY id"
+        )),
+        vec![vec![Value::Int(1)]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM t WHERE m > 'sad' ORDER BY id")),
+        vec![vec![Value::Int(1)], vec![Value::Int(4)]]
+    );
+    // `IN (list)` coerces each text literal to the enum type too.
+    assert_eq!(
+        rows(run(
+            &engine,
+            "SELECT id FROM t WHERE m IN ('happy', 'sad') ORDER BY id"
+        )),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+    // An unknown label in such a comparison is a loud error, never a silent empty result.
+    assert!(run_try(&engine, "SELECT id FROM t WHERE m = 'bogus'").is_err());
+    assert!(run_try(&engine, "SELECT id FROM t WHERE m IN ('happy', 'bogus')").is_err());
+    // Comparing two DIFFERENT enum types has no operator — rejected loudly, not compared by ordinal.
+    run(&engine, "CREATE TYPE size_enum AS ENUM ('s', 'l')");
+    assert!(run_try(&engine, "SELECT 'happy'::mood_enum = 's'::size_enum").is_err());
+    run(&engine, "DROP TYPE size_enum");
 
     // A `'label'::enum` cast resolves the label to its enum value, so an EXPLICIT cast compares and
     // filters correctly (by ordinal). An unknown label in a cast is a loud error; `NULL::enum` is a

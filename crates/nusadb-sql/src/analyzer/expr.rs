@@ -3677,6 +3677,71 @@ fn composite_type_of(
     type_name.map_or(Ok(None), |name| catalog.lookup_composite(&name))
 }
 
+/// The user-defined enum type NAME of `expr` when it is statically enum-typed: an enum base-table
+/// column, or a `x::enum` cast. `None` otherwise. Used by comparison to coerce a text literal to the
+/// sibling's enum type and to reject comparing two different enum types.
+fn enum_type_of(
+    expr: &ast::Expr,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+) -> Result<Option<String>, Error> {
+    let name = match expr {
+        ast::Expr::Column(name) => super::scoped_enum_type(scope, None, name),
+        ast::Expr::QualifiedColumn { table, column } => {
+            super::scoped_enum_type(scope, Some(table), column)
+        },
+        // A `::T` cast is enum-typed only when `T` is a declared enum type.
+        ast::Expr::CastNamed { type_name, .. } if catalog.enum_labels(type_name)?.is_some() => {
+            Some(type_name.clone())
+        },
+        _ => None,
+    };
+    Ok(name)
+}
+
+/// If `operand` is a bare text literal, resolve it to the value of enum type `enum_type` (an unknown
+/// label is `22P02`); otherwise return it unchanged. Coerces the literal in `enum_col = 'label'`.
+fn coerce_text_literal_to_enum(
+    operand: TypedExpr,
+    enum_type: &str,
+    catalog: &dyn Catalog,
+) -> Result<TypedExpr, Error> {
+    let TypedExprKind::Literal(ast::Value::Text(label)) = &operand.kind else {
+        return Ok(operand);
+    };
+    let labels = catalog.enum_labels(enum_type)?.unwrap_or_default();
+    labels.iter().position(|l| l == label).map_or_else(
+        || {
+            Err(Error::Coded {
+                message: format!("invalid input value for enum {enum_type}: \"{label}\""),
+                sqlstate: "22P02",
+            })
+        },
+        |ordinal| {
+            Ok(TypedExpr {
+                kind: TypedExprKind::Literal(ast::Value::Enum {
+                    ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    label: label.clone(),
+                }),
+                ty: ColumnType::Enum,
+            })
+        },
+    )
+}
+
+/// The SQL spelling of a comparison operator, for the "operator does not exist" message when two
+/// different enum types are compared.
+const fn comparison_op_symbol(op: ast::BinaryOp) -> &'static str {
+    match op {
+        ast::BinaryOp::Eq => "=",
+        ast::BinaryOp::NotEq => "<>",
+        ast::BinaryOp::Lt => "<",
+        ast::BinaryOp::LtEq => "<=",
+        ast::BinaryOp::Gt => ">",
+        _ => ">=",
+    }
+}
+
 /// `(expr).field` — extract one field of a composite value. The operand's composite type is resolved
 /// statically ([`composite_type_of`]); the field is looked up by name (a miss is a loud error), and
 /// the executor parses the operand's canonical text form and returns that field.
@@ -4151,6 +4216,9 @@ pub(super) fn analyze_in_list(
         _ => None,
     };
     let expr_typed = analyze_expr_agg(expr, scope, catalog, probe_hint, aggregates.as_deref_mut())?;
+    // When the probe is an enum, a bare text list item adopts that enum type (like `= 'label'`), so
+    // `m IN ('low', 'high')` needs no per-item cast; an unknown label is a loud error.
+    let probe_enum = enum_type_of(expr, scope, catalog)?;
     let mut typed_list = Vec::with_capacity(list.len());
     for item in list {
         let item_typed = analyze_expr_agg(
@@ -4163,6 +4231,10 @@ pub(super) fn analyze_in_list(
         // A bare string literal in the list adopts the probe's temporal / UUID type, so
         // `col IN ($1, $2)` (date bounds bound as text) type-checks like the explicit `::date` form.
         let item_typed = coerce_unknown_literal(item_typed, expr_typed.ty);
+        let item_typed = match probe_enum.as_deref() {
+            Some(enum_type) => coerce_text_literal_to_enum(item_typed, enum_type, catalog)?,
+            None => item_typed,
+        };
         if !comparable(expr_typed.ty, item_typed.ty) {
             return Err(Error::TypeMismatch {
                 context: "IN list".to_owned(),
@@ -4567,6 +4639,26 @@ pub(super) fn analyze_binary(
             | ast::BinaryOp::Gt
             | ast::BinaryOp::GtEq
     ) {
+        // Enum: a bare text literal beside an enum operand (column or `::enum` cast) adopts that enum
+        // type, so `m = 'high'` resolves `'high'` to its ordinal without an explicit cast. Comparing
+        // two DIFFERENT enum types has no operator (`42883`), matching the reference engine.
+        let left_enum = enum_type_of(left, scope, catalog)?;
+        let right_enum = enum_type_of(right, scope, catalog)?;
+        if let (Some(le), Some(re)) = (&left_enum, &right_enum)
+            && le != re
+        {
+            return Err(Error::Coded {
+                message: format!(
+                    "operator does not exist: {le} {} {re}",
+                    comparison_op_symbol(op)
+                ),
+                sqlstate: "42883",
+            });
+        }
+        if let Some(enum_type) = left_enum.as_deref().or(right_enum.as_deref()) {
+            left_typed = coerce_text_literal_to_enum(left_typed, enum_type, catalog)?;
+            right_typed = coerce_text_literal_to_enum(right_typed, enum_type, catalog)?;
+        }
         right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
         left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
     }
