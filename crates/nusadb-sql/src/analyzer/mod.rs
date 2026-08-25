@@ -175,6 +175,27 @@ pub trait Catalog {
         Ok(None)
     }
 
+    /// The enum type name of base-table column `(schema, table, column)`, or `None` if that column is
+    /// not of an enum type. Default `None`; the production adapter reads the per-column enum catalog.
+    /// Used to type an enum column and to resolve a text value assigned to it into its ordinal.
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        let _ = (schema, table, column);
+        Ok(None)
+    }
+
+    /// The ordered labels of a user-defined enum type named `name`, or `None` if no such enum type
+    /// exists. Default `None`; the production adapter reads the enum type registry. Used to resolve a
+    /// label to its declaration-order ordinal.
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, Error> {
+        let _ = name;
+        Ok(None)
+    }
+
     /// Whether the session running this statement is a superuser, which bypasses row-level security.
     /// Default `true` so a minimal catalog (and the analyzer's own unit tests) behaves as a
     /// superuser — RLS never restricts it, keeping existing behavior unchanged. The production

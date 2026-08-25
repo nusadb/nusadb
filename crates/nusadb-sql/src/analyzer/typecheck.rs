@@ -65,6 +65,9 @@ pub(super) fn assignable(target: ColumnType, source: ColumnType) -> bool {
         || (matches!(target, ColumnType::Vector(_)) && source == ColumnType::Text)
         // BYTEA accepts a `\x<hex>` text literal (parsed at encode time).
         || (target == ColumnType::Bytes && source == ColumnType::Text)
+        // An ENUM column accepts a text value: the label is resolved to its declaration-order
+        // ordinal on write (an unknown label is rejected there).
+        || (target == ColumnType::Enum && source == ColumnType::Text)
 }
 
 pub(super) const fn is_numeric(ty: ColumnType) -> bool {

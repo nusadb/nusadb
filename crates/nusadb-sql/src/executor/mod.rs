@@ -3423,6 +3423,19 @@ impl crate::Catalog for ExecCatalog<'_> {
         lookup_composite_column(self.engine, self.txn, schema, table, column)
     }
 
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        lookup_enum_column(self.engine, self.txn, schema, table, column)
+    }
+
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, Error> {
+        lookup_enum(self.engine, self.txn, name)
+    }
+
     // Access control. These must delegate rather than take the trait's permissive defaults — see
     // the note on the `user` field.
 
@@ -3552,6 +3565,19 @@ impl crate::Catalog for SessionCatalog<'_> {
         column: &str,
     ) -> Result<Option<String>, Error> {
         lookup_composite_column(self.engine, self.txn, schema, table, column)
+    }
+
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        lookup_enum_column(self.engine, self.txn, schema, table, column)
+    }
+
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, Error> {
+        lookup_enum(self.engine, self.txn, name)
     }
 
     fn is_superuser(&self) -> bool {
@@ -3988,6 +4014,17 @@ fn run_drop_type(
             p.name
         )));
     }
+    // Likewise an enum type still used by a column: since an enum column is a real `ColumnType::Enum`
+    // recorded in the per-column enum catalog, dropping the type out from under it would leave a
+    // dangling reference whose later writes fail with a misleading label error.
+    if lookup_enum(engine, txn, &p.name)?.is_some()
+        && let Some((table, column)) = first_enum_dependent(engine, txn, &p.name)?
+    {
+        return Err(Error::DependentObjects(format!(
+            "cannot drop type \"{}\" because column \"{column}\" of table \"{table}\" depends on it",
+            p.name
+        )));
+    }
     let removed = delete_view_def(engine, txn, ENUM_CATALOG, &p.name)?
         | delete_view_def(engine, txn, COMPOSITE_CATALOG, &p.name)?;
     if !removed && !p.if_exists {
@@ -4092,6 +4129,68 @@ fn store_composite_column(
     store_view_def(engine, txn, COMPOSITE_COLUMN_CATALOG, &key, type_name)
 }
 
+/// Engine-scoped catalog mapping an enum-typed table column to its enum type name:
+/// key = `schema`/`table`/`column` joined by [`ENUM_LABEL_SEP`] (reusing [`composite_column_key`]),
+/// value = the enum type name. A [`ColumnType::Enum`](nusadb_core::ColumnType) column carries no
+/// type name in the physical schema, so this is what lets a write resolve a label to its ordinal and
+/// lets `SHOW COLUMNS` / `information_schema` render the declared enum type.
+const ENUM_COLUMN_CATALOG: &str = "nusadb_enum_columns";
+
+/// Record that base-table column `(schema, table, column)` is of enum type `type_name`.
+fn store_enum_column(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+    column: &str,
+    type_name: &str,
+) -> Result<(), Error> {
+    let key = composite_column_key(schema, table, column);
+    store_view_def(engine, txn, ENUM_COLUMN_CATALOG, &key, type_name)
+}
+
+/// The enum type name of base-table column `(schema, table, column)`, or `None` if that column is not
+/// of an enum type.
+pub(crate) fn lookup_enum_column(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, Error> {
+    let key = composite_column_key(schema, table, column);
+    load_view_def(engine, txn, ENUM_COLUMN_CATALOG, &key)
+}
+
+/// Remove every per-column enum row for base table `(schema, table)`. Mirrors
+/// [`delete_composite_columns_for_table`]: the per-column catalog outlives the table's own lifecycle,
+/// so a dropped/recreated table would otherwise leave stale rows that mis-tag a later same-named
+/// column. Returns the number removed.
+fn delete_enum_columns_for_table(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+) -> Result<usize, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, ENUM_COLUMN_CATALOG)? else {
+        return Ok(0);
+    };
+    let prefix = format!("{schema}{ENUM_LABEL_SEP}{table}{ENUM_LABEL_SEP}");
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+        if matches!(row.first(), Some(ast::Value::Text(key)) if key.starts_with(&prefix)) {
+            victims.push(tid);
+        }
+    }
+    let removed = victims.len();
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(removed)
+}
+
 /// Remove every per-column composite row for base table `(schema, table)`.
 ///
 /// The per-column catalog is decoupled from the table's own lifecycle, so a table that is dropped or
@@ -4161,6 +4260,37 @@ fn first_composite_dependent(
             // DROP TABLE scrubs a table's per-column rows, but a schema-CASCADE drop bypasses that
             // path, so an orphan row can still outlive its table; only a row whose table still exists
             // is a live dependency.
+            if engine.lookup_table_as_of_in(txn, schema, table)?.is_some() {
+                return Ok(Some((table.to_owned(), column.to_owned())));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The first `(table, column)` still declaring enum type `name`, or `None` if none does — used by
+/// `DROP TYPE` to block dropping an enum still in use. Mirrors [`first_composite_dependent`] over the
+/// per-column enum catalog.
+fn first_enum_dependent(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<Option<(String, String)>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, ENUM_COLUMN_CATALOG)? else {
+        return Ok(None);
+    };
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+        if let [ast::Value::Text(key), ast::Value::Text(type_name)] = row.as_slice()
+            && type_name == name
+        {
+            let mut parts = key.split(ENUM_LABEL_SEP);
+            let schema = parts.next().unwrap_or_default();
+            let table = parts.next().unwrap_or_default();
+            let column = parts.next().unwrap_or_default();
+            // A row whose table still exists is a live dependency (an orphan can outlive its table
+            // through a schema-CASCADE drop that bypasses per-table scrubbing).
             if engine.lookup_table_as_of_in(txn, schema, table)?.is_some() {
                 return Ok(Some((table.to_owned(), column.to_owned())));
             }

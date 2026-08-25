@@ -2025,6 +2025,24 @@ impl Catalog for CteCatalog<'_> {
         self.inner.lookup_composite_column(schema, table, column)
     }
 
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        // The synthetic CTE table has no enum columns; a real base table's delegate.
+        if table == self.name {
+            return Ok(None);
+        }
+        self.inner.lookup_enum_column(schema, table, column)
+    }
+
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, Error> {
+        // Enum types are engine-global; delegate.
+        self.inner.enum_labels(name)
+    }
+
     // The security context must delegate to the inner catalog: otherwise a recursive CTE's term,
     // analyzed through this overlay, would fall back to the trait defaults (superuser, no RLS) and
     // a non-superuser could read an RLS-enabled base table by wrapping it in a CTE.

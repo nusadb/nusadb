@@ -225,6 +225,7 @@ fn finalize_updated_row(
     mut row: Row,
     fills: &[Option<super::coldefault::ColumnFill>],
     table: &TableSchema,
+    enum_info: &[Option<(String, Vec<String>)>],
 ) -> Result<Row, Error> {
     for (index, fill) in fills.iter().enumerate() {
         let Some(super::coldefault::ColumnFill::Generated(expr)) = fill else {
@@ -241,10 +242,14 @@ fn finalize_updated_row(
         }
         set_at(&mut row, index, value)?;
     }
-    for (value, column) in row.iter_mut().zip(&table.columns) {
+    for (index, (value, column)) in row.iter_mut().zip(&table.columns).enumerate() {
         row::adopt_column_type(value, column.ty);
         // Enforce the `VARCHAR(n)`/`CHAR(n)` length after the SET assignments, matching INSERT.
         row::coerce_char_length(value, column.ty)?;
+        // Resolve a text value assigned to an enum column into its ordinal (22P02 if unknown).
+        if let Some((enum_type, labels)) = enum_info.get(index).and_then(Option::as_ref) {
+            row::coerce_enum(value, labels, enum_type)?;
+        }
     }
     Ok(row)
 }
@@ -737,12 +742,43 @@ fn insert_encoded_batch(
     Ok(tids)
 }
 
+/// Per-column enum resolution table: for each column, `Some((enum type name, ordered labels))` when
+/// the column is of an enum type, else `None`. Indexed by column ordinal.
+type EnumColumnsInfo = Vec<Option<(String, Vec<String>)>>;
+
+/// For each column of `table`, its enum `(type name, ordered labels)` when the column is of an enum
+/// type, else `None`. The per-column enum catalog gives the type name; the enum type registry gives
+/// the labels. Used to resolve a text value assigned to an enum column into its ordinal on write.
+fn enum_columns_info(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<EnumColumnsInfo, Error> {
+    table
+        .columns
+        .iter()
+        .map(|col| -> Result<Option<(String, Vec<String>)>, Error> {
+            if col.ty != nusadb_core::ColumnType::Enum {
+                return Ok(None);
+            }
+            let Some(name) =
+                super::lookup_enum_column(engine, txn, &table.schema, &table.name, &col.name)?
+            else {
+                return Ok(None);
+            };
+            let labels = super::lookup_enum(engine, txn, &name)?.unwrap_or_default();
+            Ok(Some((name, labels)))
+        })
+        .collect()
+}
+
 /// [`insert_rows`] with the uniqueness mode explicit: `None` validates against the committed
 /// table now (every whole-statement path); `Some(collector)` is the streaming `INSERT ... SELECT`
 /// path — per-batch key locks + key collection now, one committed re-scan at end of stream
 /// ([`DeferredUnique::finish`]).
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "insert_rows' shared batch context plus the one uniqueness-mode knob"
 )]
 fn insert_rows_with_unique(
@@ -777,6 +813,10 @@ fn insert_rows_with_unique(
     }
 
     let schema = column_types(table);
+    // For each enum column, its `(type name, ordered labels)` — so a text value can be resolved to
+    // its declaration-order ordinal on write (an unknown label is rejected with 22P02). Resolved
+    // once for the batch; `None` for every non-enum column.
+    let enum_info = enum_columns_info(table, engine, txn)?;
     // Build every full row first so PRIMARY KEY / UNIQUE constraints validate the whole batch
     // before any tuple is written.
     let mut full_rows: Vec<Row> = Vec::with_capacity(value_rows.len());
@@ -802,11 +842,16 @@ fn insert_rows_with_unique(
         // A `timestamptz` written to a `timestamp` column (or the reverse) adopts the column's own
         // type here, before uniqueness/RLS/`RETURNING` ever see the row — so all three agree with
         // what a later read decodes.
-        for (value, ty) in full.iter_mut().zip(&schema) {
+        for (idx, (value, ty)) in full.iter_mut().zip(&schema).enumerate() {
             row::adopt_column_type(value, *ty);
             // A `VARCHAR(n)`/`CHAR(n)` value over the declared length errors (`22001`) here, before
             // the row is written, unless the overflow is all trailing blanks (then it is truncated).
             row::coerce_char_length(value, *ty)?;
+            // An enum column resolves its text value to a declaration-order ordinal (22P02 if the
+            // label is unknown), so what is stored and compared carries the ordinal.
+            if let Some((enum_type, labels)) = enum_info.get(idx).and_then(Option::as_ref) {
+                row::coerce_enum(value, labels, enum_type)?;
+            }
         }
         full_rows.push(full);
     }
@@ -934,6 +979,7 @@ fn upsert_rows(
     // Column DEFAULT / SERIAL fills for a column omitted from the proposed insert or
     // written as an explicit `DEFAULT` cell.
     let fills = super::coldefault::column_fills(table, engine, txn)?;
+    let enum_info = enum_columns_info(table, engine, txn)?;
     // Columns supplied a concrete value by some row (an explicit `DEFAULT` cell does not count).
     let any_explicit = explicitly_supplied_columns(columns, &value_rows);
     reject_explicit_identity_always(table, &fills, &any_explicit)?;
@@ -1024,7 +1070,7 @@ fn upsert_rows(
                 set_at(&mut new_row, *ordinal, value)?;
             }
             // Recompute generated columns against the updated row, like plain UPDATE.
-            let new_row = finalize_updated_row(new_row, &fills, table)?;
+            let new_row = finalize_updated_row(new_row, &fills, table, &enum_info)?;
             affected_keys.push(key);
             updates.push((*tid, erow.clone(), new_row.clone()));
             affected.push(new_row);
@@ -3277,6 +3323,7 @@ pub(super) fn run_update(
     // Generated columns: SET-ting one is an error; any other SET recomputes them against the
     // new row (`finalize_updated_row` per updated row below). `fills` is a no-op when none are generated.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
+    let enum_info = enum_columns_info(&plan.table, engine, txn)?;
     {
         let set_cols: HashSet<usize> = assignments.iter().map(|a| a.column).collect();
         reject_explicit_generated(&plan.table, &fills, &set_cols)?;
@@ -3295,6 +3342,7 @@ pub(super) fn run_update(
                         apply_assignments_ctx(&assignments, &plan.table, row.clone(), &combined)?,
                         &fills,
                         &plan.table,
+                        &enum_info,
                     )?;
                     if needs_unique {
                         result_rows.push(new_row.clone());
@@ -3317,6 +3365,7 @@ pub(super) fn run_update(
                 apply_assignments(&assignments, &plan.table, row)?,
                 &fills,
                 &plan.table,
+                &enum_info,
             )?;
             if needs_unique {
                 result_rows.push(new_row.clone());
@@ -3980,6 +4029,7 @@ pub(super) fn run_merge(
     let mut count = 0usize;
     // Generated columns: a matched UPDATE recomputes them; `fills` is a no-op when none exist.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
+    let enum_info = enum_columns_info(&plan.table, engine, txn)?;
 
     for srow in &source_rows {
         // The first target row the ON condition matches (over `target ++ source`).
@@ -4016,6 +4066,7 @@ pub(super) fn run_merge(
                     action,
                     &plan.table,
                     &fills,
+                    &enum_info,
                     tid,
                     &trow,
                     &combined,
@@ -4098,6 +4149,7 @@ pub(super) fn run_merge(
                     action,
                     &plan.table,
                     &fills,
+                    &enum_info,
                     *tid,
                     trow,
                     &combined,
@@ -4146,10 +4198,15 @@ struct MergeOps {
 /// Shared by `WHEN MATCHED` and `WHEN NOT MATCHED BY SOURCE`, which apply the same two actions to an
 /// existing target row and differ only in how the row was selected and what the source half of
 /// `combined` holds (the matched source row, or all `NULL`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared merge-action context plus the per-column enum resolution table"
+)]
 fn stage_merge_matched_action(
     action: &crate::planner::MergeMatchedAction,
     table: &TableSchema,
     fills: &[Option<super::coldefault::ColumnFill>],
+    enum_info: &[Option<(String, Vec<String>)>],
     tid: Tid,
     trow: &Row,
     combined: &Row,
@@ -4166,6 +4223,7 @@ fn stage_merge_matched_action(
                 apply_assignments_ctx(assignments, table, trow.clone(), combined)?,
                 fills,
                 table,
+                enum_info,
             )?;
             ops.updates.push((tid, trow.clone(), new));
         },

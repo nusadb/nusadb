@@ -101,22 +101,6 @@ pub(super) fn type_name(ty: ColumnType) -> String {
 
 // === DDL ==================================================================
 
-/// The predicate SQL for an ENUM column's membership CHECK: `"col" IN ('label', ...)`, with the
-/// column name double-quoted and each label single-quoted (each quote style escaped by doubling).
-/// `None` for a label-less set (an enum always has at least one label; guarded defensively so a
-/// malformed `IN ()` is never emitted).
-fn enum_membership_predicate(col: &str, labels: &[String]) -> Option<String> {
-    if labels.is_empty() {
-        return None;
-    }
-    let list = labels
-        .iter()
-        .map(|l| format!("'{}'", l.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("\"{}\" IN ({list})", col.replace('"', "\"\"")))
-}
-
 #[allow(
     clippy::too_many_lines,
     reason = "flat CREATE TABLE: udt resolution, constraints, defaults, composite columns, ownership"
@@ -146,18 +130,23 @@ pub(super) fn run_create_table(
     // captured so a membership CHECK can be registered below (the column stores as TEXT, so without
     // it any string would be accepted).
     let mut columns = Vec::with_capacity(plan.columns.len());
-    let mut enum_checks: Vec<(String, Vec<String>)> = Vec::new();
     let mut domain_checks: Vec<(String, String)> = Vec::new();
     // Composite-typed columns to register in the per-column catalog once the table exists:
     // `(column, type_name)`. The physical column type is `TEXT` (it holds the canonical form).
     let mut composite_columns: Vec<(String, String)> = Vec::new();
+    // Enum-typed columns to register in the per-column enum catalog once the table exists:
+    // `(column, enum_type_name)`. The physical column type is `Enum`; membership is enforced on
+    // write by resolving the value to a declaration-order ordinal (an unknown label is rejected).
+    let mut enum_columns: Vec<(String, String)> = Vec::new();
     for c in plan.columns {
         let mut ty = c.ty;
         let mut nullable = c.nullable;
         if let Some(udt) = &c.udt_name {
-            if let Some(labels) = super::lookup_enum(engine, txn, udt)? {
-                // An ENUM is stored as its TEXT placeholder; membership is enforced below.
-                enum_checks.push((c.name.clone(), labels));
+            if super::lookup_enum(engine, txn, udt)?.is_some() {
+                // A native enum column: each value stores its own ordinal + label; the enum type name
+                // is recorded per-column so writes resolve labels and DDL renders the declared type.
+                ty = ColumnType::Enum;
+                enum_columns.push((c.name.clone(), udt.clone()));
             } else if super::lookup_composite(engine, txn, udt)?.is_some() {
                 // A composite column stores as its TEXT placeholder (the canonical `(f1,f2,…)` form);
                 // its composite type name is recorded per-column so reads know it is composite.
@@ -211,16 +200,6 @@ pub(super) fn run_create_table(
     for chk in &plan.check_constraints {
         engine.add_check_constraint(txn, id, &chk.name, chk.predicate_sql.as_bytes())?;
     }
-    // An ENUM column stores as TEXT, so its type does not itself restrict the value. Enforce the
-    // declared label set with a synthetic membership CHECK — reusing the same machinery as the
-    // `VARCHAR(n)` length check, and named with the synthetic prefix so introspection hides it. A
-    // `NULL` passes (the CHECK is not false); anything outside the labels is rejected on write.
-    for (col, labels) in &enum_checks {
-        if let Some(predicate_sql) = enum_membership_predicate(col, labels) {
-            let name = format!("{}{col}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
-            engine.add_check_constraint(txn, id, &name, predicate_sql.as_bytes())?;
-        }
-    }
     // A DOMAIN column's CHECKs (already rewritten from `VALUE` to the column name) enforce on write
     // through the same machinery; the synthetic prefix hides them from introspection.
     for (name, predicate_sql) in &domain_checks {
@@ -234,6 +213,12 @@ pub(super) fn run_create_table(
     // TEXT-stored column actually holds a composite value.
     for (column, type_name) in &composite_columns {
         super::store_composite_column(engine, txn, &def.schema, &def.name, column, type_name)?;
+    }
+    // Likewise clear then record per-column enum rows (same stale-row reasoning as composites), so a
+    // write can resolve a label to its ordinal and DDL introspection can render the declared type.
+    super::delete_enum_columns_for_table(engine, txn, &def.schema, &def.name)?;
+    for (column, type_name) in &enum_columns {
+        super::store_enum_column(engine, txn, &def.schema, &def.name, column, type_name)?;
     }
     // Create the backing sequence for each SERIAL column before persisting its sentinel
     // default, so INSERT's `lookup_sequence` resolves.
@@ -770,6 +755,9 @@ pub(super) fn run_drop_table(
             // Scrub the table's per-column composite-type rows so a later same-named table cannot
             // inherit them (a non-composite column would otherwise be mis-tagged as composite).
             super::delete_composite_columns_for_table(engine, txn, &plan.schema, &plan.table)?;
+            // Same for per-column enum rows, so a later same-named table's non-enum column of the
+            // same name is not mis-tagged as an enum.
+            super::delete_enum_columns_for_table(engine, txn, &plan.schema, &plan.table)?;
             // Cascade-drop the table's row-level-security policies and its RLS-enabled marker (
             // ): otherwise they orphan the catalog, and a later same-named table cannot
             // re-create a policy of the same name ("policy already exists").

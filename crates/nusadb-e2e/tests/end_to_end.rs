@@ -1440,38 +1440,50 @@ fn create_type_enum_and_use_as_a_column() {
         "CREATE TYPE mood_enum AS ENUM ('sad', 'ok', 'happy')",
     );
 
-    // Use the enum as a column type, insert, and read back.
+    // Use the enum as a column type, insert, and read back. An enum value reads back as its label
+    // (carrying its declaration-order ordinal internally: sad=0, ok=1, happy=2).
     run(&engine, "CREATE TABLE t (id INT NOT NULL, m mood_enum)");
     run(
         &engine,
         "INSERT INTO t VALUES (1, 'happy'), (2, 'sad'), (3, NULL)",
     );
+    let happy = Value::Enum {
+        ordinal: 2,
+        label: "happy".to_owned(),
+    };
+    let sad = Value::Enum {
+        ordinal: 0,
+        label: "sad".to_owned(),
+    };
+    let ok = Value::Enum {
+        ordinal: 1,
+        label: "ok".to_owned(),
+    };
     assert_eq!(
         rows(run(&engine, "SELECT m FROM t ORDER BY id")),
-        vec![
-            vec![Value::Text("happy".to_owned())],
-            vec![Value::Text("sad".to_owned())],
-            vec![Value::Null],
-        ]
+        vec![vec![happy.clone()], vec![sad.clone()], vec![Value::Null],]
     );
 
-    // A value outside the enum's label set is rejected on write (the membership CHECK), on both
-    // INSERT and UPDATE — never silently stored; NULL and valid labels still pass.
+    // A value outside the enum's label set is rejected on write, on both INSERT and UPDATE — never
+    // silently stored; NULL and valid labels still pass.
     assert!(
         run_try(&engine, "INSERT INTO t VALUES (4, 'banana')").is_err(),
         "an out-of-set enum value must be rejected"
     );
     assert!(run_try(&engine, "UPDATE t SET m = 'banana' WHERE id = 1").is_err());
     run(&engine, "INSERT INTO t VALUES (4, 'ok')");
+
+    // ORDER BY the enum column follows DECLARATION order (sad < ok < happy), not the label's byte
+    // order (happy < ok < sad) — the whole point of a native enum type. NULLs sort last (ASC).
     assert_eq!(
-        rows(run(&engine, "SELECT id FROM t ORDER BY id")),
-        vec![
-            vec![Value::Int(1)],
-            vec![Value::Int(2)],
-            vec![Value::Int(3)],
-            vec![Value::Int(4)],
-        ]
+        rows(run(&engine, "SELECT m FROM t ORDER BY m")),
+        vec![vec![sad], vec![ok], vec![happy], vec![Value::Null]]
     );
+
+    // Comparing an enum column to a bare text literal is a loud type error for now (a text literal
+    // is not yet coerced to the enum type in comparison context — that arrives with enum casts). It
+    // must never silently match nothing, so this stays an error rather than an empty result.
+    assert!(run_try(&engine, "SELECT id FROM t WHERE m = 'happy'").is_err());
 
     // Re-declaring an existing type, and empty/duplicate labels, are rejected.
     assert!(run_try(&engine, "CREATE TYPE mood_enum AS ENUM ('x')").is_err());
@@ -1480,7 +1492,14 @@ fn create_type_enum_and_use_as_a_column() {
     // An unknown user-defined type on a column is a loud error (not silently text).
     assert!(run_try(&engine, "CREATE TABLE bad (x nonexistent_enum)").is_err());
 
-    // DROP TYPE removes it; afterwards a new table can no longer use it; IF EXISTS is a no-op.
+    // DROP TYPE is refused while a column still uses the enum (table `t.m` depends on it) — the
+    // reference engine's dependency check. Dropping the dependent table first frees the type.
+    assert!(
+        run_try(&engine, "DROP TYPE mood_enum").is_err(),
+        "an enum still used by a column must not be droppable"
+    );
+    run(&engine, "DROP TABLE t");
+    // Now it removes cleanly; afterwards a new table can no longer use it; IF EXISTS is a no-op.
     run(&engine, "DROP TYPE mood_enum");
     assert!(run_try(&engine, "CREATE TABLE u (m mood_enum)").is_err());
     run(&engine, "DROP TYPE IF EXISTS mood_enum");

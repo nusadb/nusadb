@@ -236,6 +236,17 @@ impl Catalog for RecordingCatalog<'_> {
     ) -> Result<Option<String>, Error> {
         self.inner.lookup_composite_column(schema, table, column)
     }
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, Error> {
+        self.inner.lookup_enum_column(schema, table, column)
+    }
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, Error> {
+        self.inner.enum_labels(name)
+    }
     fn is_superuser(&self) -> bool {
         self.inner.is_superuser()
     }

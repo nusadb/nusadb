@@ -112,6 +112,47 @@ pub(crate) fn coerce_char_length(value: &mut ast::Value, ty: ColumnType) -> Resu
     }
 }
 
+/// Resolve a text value assigned to an enum column into a [`Value::Enum`](ast::Value::Enum) carrying
+/// its declaration-order ordinal, in place. `labels` is the enum type's ordered label set and
+/// `enum_type` its name (for the error message). `NULL` and an already-resolved enum are left as is.
+///
+/// An unknown label is rejected as `22P02` (`invalid_text_representation`), matching the reference
+/// engine's `invalid input value for enum` error.
+pub(crate) fn coerce_enum(
+    value: &mut ast::Value,
+    labels: &[String],
+    enum_type: &str,
+) -> Result<(), Error> {
+    let label = match value {
+        ast::Value::Text(s) => std::mem::take(s),
+        // Already resolved, or NULL — nothing to do.
+        ast::Value::Enum { .. } | ast::Value::Null => return Ok(()),
+        other => {
+            return Err(Error::Coded {
+                message: format!(
+                    "invalid input value for enum {enum_type}: {}",
+                    crate::display::value_text(other)
+                ),
+                sqlstate: "22P02",
+            });
+        },
+    };
+    match labels.iter().position(|l| *l == label) {
+        Some(ordinal) => {
+            *value = ast::Value::Enum {
+                // An enum has at most a modest number of labels; the position fits a u32.
+                ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                label,
+            };
+            Ok(())
+        },
+        None => Err(Error::Coded {
+            message: format!("invalid input value for enum {enum_type}: \"{label}\""),
+            sqlstate: "22P02",
+        }),
+    }
+}
+
 /// Decode a stored tuple back into a [`Row`].
 pub(crate) fn decode(bytes: &[u8], schema: &[ColumnType]) -> Result<Row, Error> {
     let mut row = Vec::with_capacity(schema.len());
