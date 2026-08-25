@@ -2931,6 +2931,21 @@ fn explain_returns_a_plan_tree() {
         !joined.contains("est. rows"),
         "unexpected estimate: {joined}"
     );
+
+    // The reference engine's display/instrumentation EXPLAIN options are accepted and ignored — the
+    // engine renders its own plan (no cost estimates or timing), so `(COSTS OFF)` is already
+    // satisfied by the output shape rather than being rejected.
+    for opts in [
+        "(COSTS OFF)",
+        "(COSTS OFF, VERBOSE)",
+        "(BUFFERS OFF)",
+        "(SETTINGS ON)",
+    ] {
+        assert!(
+            run_try(&engine, &format!("EXPLAIN {opts} SELECT * FROM t")).is_ok(),
+            "EXPLAIN {opts} should be accepted"
+        );
+    }
 }
 
 #[test]

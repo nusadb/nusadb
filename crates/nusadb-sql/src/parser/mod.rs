@@ -3375,7 +3375,9 @@ fn convert_deallocate(name: &sql::Ident) -> ast::Statement {
 // breadth of the SQL surface, not with branching depth (each arm just
 // destructures and delegates). The line cap is the wrong signal here.
 /// Fold one `EXPLAIN (...)` utility option into `out`. Supports `FORMAT <text|json>`, `ANALYZE`, and
-/// `VERBOSE` (each optionally with a boolean argument); any other option is a loud error rather than
+/// `VERBOSE` (each optionally with a boolean argument). The display/instrumentation toggles
+/// (`COSTS`, `BUFFERS`, `SETTINGS`, `WAL`, `TIMING`, `SUMMARY`, `MEMORY`, `GENERIC_PLAN`) are accepted
+/// and ignored — the plan format models none of them. Any other option is a loud error rather than
 /// silently ignored — matching how the dedicated-field spellings are handled.
 fn apply_explain_option(
     opt: &sql::UtilityOption,
@@ -3398,6 +3400,11 @@ fn apply_explain_option(
         },
         "ANALYZE" => out.analyze = explain_option_truthy(opt),
         "VERBOSE" => out.verbose = explain_option_truthy(opt),
+        // Display/instrumentation toggles the plan format does not model are accepted and ignored:
+        // this engine renders its own plan (no cost estimates, buffer counters, or timing), so e.g.
+        // `EXPLAIN (COSTS OFF)` is already satisfied by the output shape regardless of the ON/OFF value.
+        "COSTS" | "BUFFERS" | "SETTINGS" | "WAL" | "TIMING" | "SUMMARY" | "MEMORY"
+        | "GENERIC_PLAN" => {},
         other => {
             return Err(Error::InvalidParameterValue(format!(
                 "EXPLAIN option \"{other}\" is not supported"
