@@ -195,6 +195,25 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                  supported; parenthesise it, e.g. `(x IS JSON) IS NULL`",
             )
         },
+        // The niladic keywords `current_schema` / `current_catalog` are parsed as bare identifiers
+        // (unlike `current_user`, which the parser models specially). Unquoted, they are the standard
+        // special values, not a column reference — map them to their built-in. A column of that name
+        // is still reachable when qualified (`t.current_schema`) or quoted.
+        sql::Expr::Identifier(ident)
+            if ident.quote_style.is_none()
+                && (ident.value.eq_ignore_ascii_case("current_schema")
+                    || ident.value.eq_ignore_ascii_case("current_catalog")) =>
+        {
+            let func = if ident.value.eq_ignore_ascii_case("current_schema") {
+                ast::ScalarFunc::CurrentSchema
+            } else {
+                ast::ScalarFunc::CurrentDatabase
+            };
+            Ok(ast::Expr::ScalarFunction {
+                func,
+                args: Vec::new(),
+            })
+        },
         sql::Expr::Identifier(ident) => Ok(ast::Expr::Column(fold_ident(&ident))),
         sql::Expr::Value(sql::ValueWithSpan {
             value: sql::Value::Placeholder(p),
@@ -1079,13 +1098,20 @@ pub(super) fn convert_function_call(function: sql::Function) -> Result<ast::Expr
 
     let mut arg_list = match function.args {
         sql::FunctionArguments::List(list) => list,
-        // The niladic clock built-ins (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`)
-        // and session-user built-ins (`CURRENT_USER`, `SESSION_USER`, `USER`) arrive in their
-        // bare keyword form with no argument list; map those here. Any other argument-less call is
-        // unsupported.
+        // The niladic clock built-ins (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`),
+        // session-user built-ins (`CURRENT_USER`, `SESSION_USER`, `USER`), and the
+        // catalog/schema built-ins (`CURRENT_CATALOG`, `CURRENT_SCHEMA`) arrive in their bare keyword
+        // form with no argument list; map those here. Any other argument-less call is unsupported.
         sql::FunctionArguments::None => {
             return scalar_func_by_name(&name)
-                .filter(|f| f.is_clock() || f.is_session_user())
+                .filter(|f| {
+                    f.is_clock()
+                        || f.is_session_user()
+                        || matches!(
+                            f,
+                            ast::ScalarFunc::CurrentDatabase | ast::ScalarFunc::CurrentSchema
+                        )
+                })
                 .map_or_else(
                     || unsupported("function call with non-list arguments"),
                     |func| {
@@ -1487,7 +1513,8 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         // `nusadb_typeof(expr)` — NusaDB's static type-introspection builtin; folded to the static
         // type name at analysis.
         "nusadb_typeof" => F::NusadbTypeof,
-        "current_database" => F::CurrentDatabase,
+        // `current_catalog` is the SQL-standard spelling of the current database name.
+        "current_database" | "current_catalog" => F::CurrentDatabase,
         "current_schema" => F::CurrentSchema,
         // JSON inspection + construction scalars.
         "json_typeof" | "jsonb_typeof" => F::JsonTypeof,

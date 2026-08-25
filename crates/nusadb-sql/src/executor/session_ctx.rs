@@ -179,6 +179,10 @@ pub(super) fn builtin_guc_static_default(name: &str) -> Option<&'static str> {
         "standard_conforming_strings" | "integer_datetimes" => "on",
         "datestyle" => "ISO, MDY",
         "timezone" => "UTC",
+        // Reported for `SHOW search_path` when the session has not `SET` it — the standard default.
+        // A `$user` schema does not exist here, so name resolution simply falls through to `public`
+        // (its effective behavior), while the reported value matches the reference engine.
+        "search_path" => "\"$user\", public",
         _ => return None,
     })
 }

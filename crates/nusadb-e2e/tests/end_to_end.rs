@@ -1618,6 +1618,26 @@ fn correlated_subquery_referencing_a_group_by_key_binds_under_aggregation() {
 }
 
 #[test]
+fn current_schema_and_catalog_resolve_without_parentheses() {
+    // The SQL-standard niladic keywords `current_schema` / `current_catalog` (no parens) resolve like
+    // their parenthesised forms — previously only the `()` spelling parsed. `current_catalog` is the
+    // standard name for the current database.
+    let engine = BtreeEngine::new();
+    assert_eq!(
+        rows(run(&engine, "SELECT current_schema")),
+        vec![vec![Value::Text("public".to_owned())]]
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT current_schema")),
+        rows(run(&engine, "SELECT current_schema()"))
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT current_catalog")),
+        rows(run(&engine, "SELECT current_database()"))
+    );
+}
+
+#[test]
 fn create_domain_gives_a_column_its_base_type_not_null_and_checks() {
     // CREATE DOMAIN — a column of the domain takes its base type, and the domain's NOT NULL and
     // CHECK (over the VALUE placeholder) are enforced on that column on every write.
@@ -4614,18 +4634,20 @@ fn savepoint_rollback_to_and_release_work_end_to_end() {
 
 #[test]
 fn set_show_reset_session_variable_round_trip() {
-    // /SET stores a session variable, SHOW reads it back, RESET clears it to "".
+    // /SET stores a session variable, SHOW reads it back, RESET clears it to its default.
     let engine = BtreeEngine::new();
     let mut session = Session::new(&engine);
 
-    // Unset variable shows as the empty string.
+    // An unset search_path reports the standard default, `"$user", public` (not the empty string) —
+    // matching the reference engine; a `$user` schema does not exist here, so resolution still falls
+    // through to `public`.
     assert_eq!(
         rows(
             session
                 .execute(build_plan(&engine, "SHOW search_path"))
                 .unwrap()
         ),
-        vec![vec![Value::Text(String::new())]],
+        vec![vec![Value::Text("\"$user\", public".to_owned())]],
     );
 
     assert!(matches!(
@@ -4652,7 +4674,7 @@ fn set_show_reset_session_variable_round_trip() {
                 .execute(build_plan(&engine, "SHOW search_path"))
                 .unwrap()
         ),
-        vec![vec![Value::Text(String::new())]],
+        vec![vec![Value::Text("\"$user\", public".to_owned())]],
     );
 }
 

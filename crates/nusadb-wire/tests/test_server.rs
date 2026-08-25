@@ -676,7 +676,8 @@ async fn set_show_and_reset_session_variable_over_the_wire() {
         BackendMessage::ReadyForQuery(TxnStatus::Idle)
     );
 
-    // RESET clears it; SHOW then reports the empty string (no built-in default for search_path).
+    // RESET clears it; SHOW then reports the standard default `"$user", public` (like the reference
+    // engine), not the empty string.
     query(&mut conn, "RESET search_path").await;
     assert_eq!(next(&mut conn).await, cc("SET"));
     assert_eq!(
@@ -693,7 +694,7 @@ async fn set_show_and_reset_session_variable_over_the_wire() {
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::DataRow {
-            values: vec![Some(b"".to_vec())]
+            values: vec![Some(b"\"$user\", public".to_vec())]
         }
     );
     assert_eq!(next(&mut conn).await, cc("SHOW"));
