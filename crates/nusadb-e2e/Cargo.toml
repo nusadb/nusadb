@@ -18,3 +18,5 @@ nusadb-sql   = { workspace = true }
 nusadb-btree = { workspace = true }
 tempfile     = { workspace = true }
 sqllogictest = { workspace = true }
+nusadb-wire  = { workspace = true }
+tokio        = { workspace = true }

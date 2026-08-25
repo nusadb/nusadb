@@ -1124,8 +1124,10 @@ dependencies = [
  "nusadb-btree",
  "nusadb-core",
  "nusadb-sql",
+ "nusadb-wire",
  "sqllogictest",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
