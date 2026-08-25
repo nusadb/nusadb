@@ -312,7 +312,7 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `COPY` | `COPY <count>` |
 | `CREATE` / `DROP` / `ALTER TABLE` | `CREATE TABLE` / `DROP TABLE` / `ALTER TABLE` |
 | `CREATE` / `DROP VIEW` | `CREATE VIEW` / `DROP VIEW` |
-| `CREATE MATERIALIZED VIEW`, `REFRESH` | `CREATE MATERIALIZED VIEW` / `REFRESH MATERIALIZED VIEW` |
+| `CREATE` / `DROP` / `REFRESH MATERIALIZED VIEW` | `CREATE MATERIALIZED VIEW` / `DROP MATERIALIZED VIEW` / `REFRESH MATERIALIZED VIEW` |
 | `CREATE` / `DROP TYPE` (enum and composite) | `CREATE TYPE` / `DROP TYPE` |
 | `CREATE` / `DROP DOMAIN` | `CREATE DOMAIN` / `DROP DOMAIN` |
 | `CREATE` / `DROP POLICY` | `CREATE POLICY` / `DROP POLICY` |
@@ -333,9 +333,6 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `PREPARE` / `DEALLOCATE` | `PREPARE` / `DEALLOCATE` (embedded API only — see §14) |
 | `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM <n>` / `ANALYZE` / `COMMENT` |
 | `REINDEX` / `CHECKPOINT` | `REINDEX` / `CHECKPOINT` |
-
-`DROP MATERIALIZED VIEW` reports `DROP VIEW`: the parser folds the two spellings into one
-statement, so the server cannot tell them apart by the time it picks a tag.
 
 Each kind of object reports its own tag. A statement that creates a view says `CREATE VIEW`, not
 `CREATE TABLE` — earlier builds reported the table tag for views, types, domains and policies alike,
