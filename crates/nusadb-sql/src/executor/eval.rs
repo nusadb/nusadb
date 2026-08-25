@@ -626,10 +626,10 @@ fn eval_scalar_function(
             }
             ast::Value::Xml(format!("<!--{s}-->"))
         },
-        (F::Sha224, [Text(s)]) => Text(super::crypto::sha224_hex(s)),
-        (F::Sha256, [Text(s)]) => Text(super::crypto::sha256_hex(s)),
-        (F::Sha384, [Text(s)]) => Text(super::crypto::sha384_hex(s)),
-        (F::Sha512, [Text(s)]) => Text(super::crypto::sha512_hex(s)),
+        (F::Sha224, [ast::Value::Bytes(b)]) => ast::Value::Bytes(super::crypto::sha224(b)),
+        (F::Sha256, [ast::Value::Bytes(b)]) => ast::Value::Bytes(super::crypto::sha256(b)),
+        (F::Sha384, [ast::Value::Bytes(b)]) => ast::Value::Bytes(super::crypto::sha384(b)),
+        (F::Sha512, [ast::Value::Bytes(b)]) => ast::Value::Bytes(super::crypto::sha512(b)),
         (F::Md5, [Text(s)]) => Text(super::crypto::md5_hex(s)),
         (F::Substring, [Text(s), Int(start)]) => substring(s, *start, None)?,
         // The POSIX-regex form `substring(s FROM 'pattern')` — dispatched by

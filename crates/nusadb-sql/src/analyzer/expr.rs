@@ -1409,21 +1409,22 @@ pub(super) fn analyze_scalar_function(
         // GET_BYTE(bytea, n) → INT; SET_BYTE(bytea, n, v) → BYTEA.
         F::GetByte => ScalarSig::Fixed(&[ColumnType::Bytes, Int], &[], Int),
         F::SetByte => ScalarSig::Fixed(&[ColumnType::Bytes, Int, Int], &[], ColumnType::Bytes),
-        // UPPER/LOWER/REVERSE/INITCAP, the hash digests SHA256/SHA512/MD5, the quoting helpers
+        // UPPER/LOWER/REVERSE/INITCAP, the MD5 fingerprint, the quoting helpers
         // QUOTE_LITERAL/QUOTE_IDENT, and `current_setting(name)` take one TEXT argument → TEXT.
         F::Upper
         | F::Lower
         | F::Reverse
         | F::Initcap
-        | F::Sha224
-        | F::Sha256
-        | F::Sha384
-        | F::Sha512
         | F::Md5
         | F::QuoteLiteral
         | F::QuoteNullable
         | F::QuoteIdent
         | F::CurrentSetting => ScalarSig::Fixed(&[Text], &[], Text),
+        // The SHA-2 digests take one BYTEA argument → BYTEA (a bare string literal is coerced to
+        // bytea by the unknown-literal rule), so `encode(sha256(x), 'hex')` round-trips.
+        F::Sha224 | F::Sha256 | F::Sha384 | F::Sha512 => {
+            ScalarSig::Fixed(&[ColumnType::Bytes], &[], ColumnType::Bytes)
+        },
         // CHR(n) maps an INT code point to a one-character TEXT; TO_HEX(n) renders an INT as a
         // lowercase hexadecimal TEXT string.
         F::Chr | F::ToHex => ScalarSig::Fixed(&[Int], &[], Text),

@@ -28,30 +28,30 @@ use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
 use crate::error::Error;
 
-/// `SHA224(text)` — the 56-character lowercase-hex SHA-224 digest of the UTF-8 bytes of `input`.
-pub(super) fn sha224_hex(input: &str) -> String {
-    to_hex(&Sha224::digest(input.as_bytes()))
+/// `SHA224(bytea)` — the 28-byte SHA-224 digest of `input`, returned as raw bytes (a `BYTEA`).
+pub(super) fn sha224(input: &[u8]) -> Vec<u8> {
+    Sha224::digest(input).to_vec()
 }
 
-/// `SHA256(text)` — the 64-character lowercase-hex SHA-256 digest of the UTF-8 bytes of `input`.
-pub(super) fn sha256_hex(input: &str) -> String {
-    to_hex(&Sha256::digest(input.as_bytes()))
+/// `SHA256(bytea)` — the 32-byte SHA-256 digest of `input`, returned as raw bytes (a `BYTEA`).
+pub(super) fn sha256(input: &[u8]) -> Vec<u8> {
+    Sha256::digest(input).to_vec()
 }
 
-/// `SHA384(text)` — the 96-character lowercase-hex SHA-384 digest of the UTF-8 bytes of `input`.
-pub(super) fn sha384_hex(input: &str) -> String {
-    to_hex(&Sha384::digest(input.as_bytes()))
+/// `SHA384(bytea)` — the 48-byte SHA-384 digest of `input`, returned as raw bytes (a `BYTEA`).
+pub(super) fn sha384(input: &[u8]) -> Vec<u8> {
+    Sha384::digest(input).to_vec()
 }
 
-/// `SHA512(text)` — the 128-character lowercase-hex SHA-512 digest of the UTF-8 bytes of `input`.
-pub(super) fn sha512_hex(input: &str) -> String {
-    to_hex(&Sha512::digest(input.as_bytes()))
+/// `SHA512(bytea)` — the 64-byte SHA-512 digest of `input`, returned as raw bytes (a `BYTEA`).
+pub(super) fn sha512(input: &[u8]) -> Vec<u8> {
+    Sha512::digest(input).to_vec()
 }
 
 /// `MD5(text)` — the 32-character lowercase-hex MD5 digest of the UTF-8 bytes of `input`.
 ///
 /// MD5 is **cryptographically broken** and is provided only as a non-security data fingerprint
-/// (ETL dedup, cache keys, checksums) — use [`sha256_hex`] for anything
+/// (ETL dedup, cache keys, checksums) — use [`sha256`] for anything
 /// security-relevant. The algorithm is implemented inline (RFC 1321) rather than via a crate: the
 /// `md5`/`md-5` crates are banned in production by `deny.toml`, and pulling a broken-hash dependency
 /// for a compatibility shim is exactly what that ban exists to prevent.

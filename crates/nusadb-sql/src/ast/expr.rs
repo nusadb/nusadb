@@ -710,13 +710,13 @@ pub enum ScalarFunc {
     /// across `count` equi-width buckets spanning `[low, high)`, as `INT` (`0`/`count+1` for
     /// out-of-range values; SQL:2003).
     WidthBucket,
-    /// `SHA224(text)` — lowercase-hex SHA-224 digest, as `TEXT`.
+    /// `SHA224(bytea)` — the raw 28-byte SHA-224 digest, as `BYTEA`.
     Sha224,
-    /// `SHA256(text)` — lowercase-hex SHA-256 digest, as `TEXT`.
+    /// `SHA256(bytea)` — the raw 32-byte SHA-256 digest, as `BYTEA`.
     Sha256,
-    /// `SHA384(text)` — lowercase-hex SHA-384 digest, as `TEXT`.
+    /// `SHA384(bytea)` — the raw 48-byte SHA-384 digest, as `BYTEA`.
     Sha384,
-    /// `SHA512(text)` — lowercase-hex SHA-512 digest, as `TEXT`.
+    /// `SHA512(bytea)` — the raw 64-byte SHA-512 digest, as `BYTEA`.
     Sha512,
     /// `MD5(text)` — 32-character lowercase-hex MD5 digest, as `TEXT`. A non-security
     /// fingerprint (ETL dedup, cache keys); MD5 is cryptographically
