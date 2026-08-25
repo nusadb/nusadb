@@ -158,26 +158,19 @@ fn analyze_on_conflict(
         filter,
     } = conflict.action
     else {
-        // DO NOTHING applies to any unique conflict, so a stated target is not needed.
-        return Ok(OnConflictPlan::DoNothing);
+        // DO NOTHING applies to any unique conflict, so a target is optional — but a stated one is
+        // resolved and validated (a bad arbiter is rejected even when no row collides, as the
+        // reference engine does).
+        return Ok(OnConflictPlan::DoNothing {
+            target: resolve_conflict_target(conflict.target, table)?,
+        });
     };
-    let target = match conflict.target {
-        Some(ast::ConflictTarget::Columns(cols)) => {
-            let mut ordinals = Vec::with_capacity(cols.len());
-            for name in &cols {
-                let (index, _) = find_column(&table.columns, name, &table.name)?;
-                ordinals.push(index);
-            }
-            ConflictArbiter::Columns(ordinals)
-        },
-        Some(ast::ConflictTarget::Constraint(name)) => ConflictArbiter::Constraint(name),
-        None => {
-            return Err(Error::InvalidStatement(
-                "ON CONFLICT DO UPDATE requires a conflict target — \
-                 `ON CONFLICT (columns)` or `ON CONFLICT ON CONSTRAINT name`"
-                    .to_owned(),
-            ));
-        },
+    let Some(target) = resolve_conflict_target(conflict.target, table)? else {
+        return Err(Error::InvalidStatement(
+            "ON CONFLICT DO UPDATE requires a conflict target — \
+             `ON CONFLICT (columns)` or `ON CONFLICT ON CONSTRAINT name`"
+                .to_owned(),
+        ));
     };
     // The combined scope: the existing row's columns (ordinals `[0, n)`) plus the proposed row as
     // `EXCLUDED` (ordinals `[n, 2n)`). `EXCLUDED` is reachable only via its qualifier, so a bare
@@ -217,6 +210,28 @@ fn analyze_on_conflict(
         assignments: typed,
         filter,
     })
+}
+
+/// Resolve an `ON CONFLICT` conflict target to a [`ConflictArbiter`]. `ON CONFLICT (cols)` maps each
+/// column name to its ordinal (the executor still checks those ordinals form a declared key); `ON
+/// CONFLICT ON CONSTRAINT name` carries the name through (the executor looks it up). `None` (no
+/// target) yields `None` — valid only for `DO NOTHING`.
+fn resolve_conflict_target(
+    target: Option<ast::ConflictTarget>,
+    table: &TableSchema,
+) -> Result<Option<ConflictArbiter>, Error> {
+    match target {
+        None => Ok(None),
+        Some(ast::ConflictTarget::Columns(cols)) => {
+            let mut ordinals = Vec::with_capacity(cols.len());
+            for name in &cols {
+                let (index, _) = find_column(&table.columns, name, &table.name)?;
+                ordinals.push(index);
+            }
+            Ok(Some(ConflictArbiter::Columns(ordinals)))
+        },
+        Some(ast::ConflictTarget::Constraint(name)) => Ok(Some(ConflictArbiter::Constraint(name))),
+    }
 }
 
 /// The combined `[target ++ EXCLUDED]` scope for an `ON CONFLICT DO UPDATE`: the target

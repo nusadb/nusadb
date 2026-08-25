@@ -44,15 +44,26 @@ pub(super) fn run_insert(
             engine,
             txn,
         )?,
-        other => insert_rows(
-            &plan.table,
-            &plan.columns,
-            value_rows,
-            plan.rls_check.as_ref(),
-            matches!(other, Some(OnConflictPlan::DoNothing)),
-            engine,
-            txn,
-        )?,
+        other => {
+            // A `DO NOTHING` with a stated target must name a real unique/primary-key arbiter — the
+            // reference engine rejects a bad one even when no row collides. Resolving it here is the
+            // validation (the skip itself applies to any unique conflict).
+            if let Some(OnConflictPlan::DoNothing {
+                target: Some(target),
+            }) = other
+            {
+                resolve_arbiter(&plan.table, target, engine)?;
+            }
+            insert_rows(
+                &plan.table,
+                &plan.columns,
+                value_rows,
+                plan.rls_check.as_ref(),
+                matches!(other, Some(OnConflictPlan::DoNothing { .. })),
+                engine,
+                txn,
+            )?
+        },
     };
 
     if plan.returning.is_empty() {

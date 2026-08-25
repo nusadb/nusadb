@@ -1193,7 +1193,14 @@ pub struct InsertPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnConflictPlan {
     /// `DO NOTHING` — silently skip a row that would violate a `PRIMARY KEY`/`UNIQUE` constraint.
-    DoNothing,
+    /// A stated conflict target (`ON CONFLICT (cols)` / `ON CONSTRAINT name`) is validated by the
+    /// executor to name a real unique/primary-key arbiter, even when no row actually collides;
+    /// `None` is the bare `DO NOTHING`, which needs no arbiter.
+    DoNothing {
+        /// The stated conflict arbiter, validated by the executor to name a real unique/primary-key
+        /// constraint; `None` for a bare `DO NOTHING`, which arbitrates on any unique conflict.
+        target: Option<ConflictArbiter>,
+    },
     /// `DO UPDATE SET ... [WHERE ...]` — update the existing conflicting row from the proposed one.
     DoUpdate {
         /// The conflict arbiter; the executor resolves it to the matching `PRIMARY KEY`/`UNIQUE`

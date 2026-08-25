@@ -84,3 +84,31 @@ SELECT id, k FROM u ORDER BY id
 
 statement ok
 DROP TABLE u
+
+# The arbiter can be named directly: ON CONFLICT ON CONSTRAINT <name> resolves the
+# unique/primary-key constraint by its name instead of listing its columns.
+statement ok
+CREATE TABLE c (id INT, v TEXT, CONSTRAINT c_id_key UNIQUE (id))
+
+statement ok
+INSERT INTO c VALUES (1, 'a')
+
+# DO UPDATE via the named constraint upserts the existing row.
+statement ok
+INSERT INTO c VALUES (1, 'b') ON CONFLICT ON CONSTRAINT c_id_key DO UPDATE SET v = EXCLUDED.v
+
+# DO NOTHING via the named constraint leaves the row untouched.
+statement ok
+INSERT INTO c VALUES (1, 'c') ON CONFLICT ON CONSTRAINT c_id_key DO NOTHING
+
+query IT
+SELECT id, v FROM c ORDER BY id
+----
+1  b
+
+# A name that is not a unique/primary-key constraint is rejected loudly.
+statement error
+INSERT INTO c VALUES (2, 'x') ON CONFLICT ON CONSTRAINT c_nope DO NOTHING
+
+statement ok
+DROP TABLE c
