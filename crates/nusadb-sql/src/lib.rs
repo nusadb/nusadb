@@ -31,6 +31,7 @@ pub mod jsonb;
 pub mod macaddr;
 pub mod macaddr8;
 pub mod numeric;
+pub mod numeric_ln;
 pub mod params;
 pub mod parser;
 pub mod plan_cache;

@@ -340,15 +340,17 @@ fn cte_materialized_hint_is_accepted_and_data_correct() {
 
 #[test]
 fn log10_returns_base_ten_logarithm() {
-    // `log10(x)` is the base-10 logarithm (one argument), matching the reference engine.
+    // `log10(x)` is the base-10 logarithm (one argument). Of an integer it is an exact NUMERIC
+    // (16 significant digits), matching the reference engine.
     let engine = BtreeEngine::new();
+    let num = |s: &str| Value::Numeric(nusadb_sql::numeric::Decimal::parse(s).unwrap());
     assert_eq!(
         rows(run(&engine, "SELECT log10(1000)")),
-        vec![vec![Value::Float(3.0)]]
+        vec![vec![num("3.0000000000000000")]]
     );
     assert_eq!(
         rows(run(&engine, "SELECT log10(1)")),
-        vec![vec![Value::Float(0.0)]]
+        vec![vec![num("0.0000000000000000")]]
     );
 }
 

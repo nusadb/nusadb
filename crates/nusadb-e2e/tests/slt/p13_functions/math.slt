@@ -121,21 +121,43 @@ SELECT ASIN(2)
 statement error
 SELECT ACOS(-3)
 
-# --- LN / LOG ---
-query R
+# --- LN / LOG. A numeric/integer argument yields an exact NUMERIC (16 significant digits). ---
+query T
 SELECT LN(1)
 ----
-0.000
+0.0000000000000000
 
-query R
+query T
 SELECT LOG(100)
 ----
-2.000
+2.0000000000000000
 
-query R
+query T
 SELECT LN(2.71828)
 ----
-1.000
+0.9999993273472820
+
+# LOG(base, value) is an exact NUMERIC as well: log(10, 1000) is 3, not the f64 2.9999999999999996.
+query T
+SELECT LOG(2, 8)
+----
+3.0000000000000000
+
+query T
+SELECT LOG(10, 1000)
+----
+3.0000000000000000
+
+query T
+SELECT LN(2)
+----
+0.6931471805599453
+
+# A double-precision argument keeps the f64 (double precision) form, not numeric.
+query R
+SELECT LN(CAST(2 AS DOUBLE PRECISION))
+----
+0.693
 
 # --- EXP ---
 query R

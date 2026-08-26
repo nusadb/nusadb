@@ -3665,9 +3665,22 @@ fn int_lcm(a: i64, b: i64) -> Result<i64, Error> {
     i64::try_from(product).map_err(|_| Error::IntegerOutOfRange)
 }
 
+/// Argument `i` as a [`Decimal`](crate::numeric::Decimal) when it is a `NUMERIC` or integer value
+/// (an integer widens to scale 0); `None` for a `FLOAT`. Drives `LN`/`LOG`/`LOG10`'s numeric-vs-float
+/// dispatch.
+fn arg_decimal(vals: &[ast::Value], i: usize) -> Option<crate::numeric::Decimal> {
+    match vals.get(i)? {
+        ast::Value::Numeric(d) => Some(*d),
+        ast::Value::Int(n) => Some(crate::numeric::Decimal::from_i64(*n)),
+        _ => None,
+    }
+}
+
 /// Evaluate a numeric math built-in. Arguments are already NULL-checked and numeric. The
 /// power/transcendental/trig functions compute in `f64` and return `FLOAT`; the type-preserving
 /// functions (`ABS`/`CEIL`/`FLOOR`/`SIGN`/`ROUND`/`MOD`) dispatch on the operand's value type.
+/// `LN`/`LOG`/`LOG10` return an exact `NUMERIC` for a numeric/int argument and the `f64` form for a
+/// float.
 #[allow(
     clippy::too_many_lines,
     reason = "flat one-arm-per-function dispatch; length tracks the math built-in set"
@@ -3697,6 +3710,17 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
             Float(x.sqrt())
         },
         F::Ln | F::Log10 => {
+            // A numeric/int argument yields an exact NUMERIC; a float uses the f64 form.
+            if let Some(dx) = arg_decimal(vals, 0) {
+                let out = if func == F::Log10 {
+                    crate::numeric_ln::log10(&dx)
+                } else {
+                    crate::numeric_ln::ln(&dx)
+                };
+                return out
+                    .map(ast::Value::Numeric)
+                    .ok_or_else(|| log_domain(dx.to_f64()));
+            }
             let x = f(0);
             if x <= 0.0 {
                 return Err(log_domain(x));
@@ -3768,6 +3792,12 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
         // LOG(x) = base-10; LOG(b, x) = base-b (args ordered base then value, per SQL). A non-positive
         // value is out of domain; a base ≤ 0 or = 1 has no logarithm (base 1 would divide by zero).
         F::Log if vals.len() <= 1 => {
+            // Base-10 log. Numeric for a numeric/int argument.
+            if let Some(dx) = arg_decimal(vals, 0) {
+                return crate::numeric_ln::log10(&dx)
+                    .map(ast::Value::Numeric)
+                    .ok_or_else(|| log_domain(dx.to_f64()));
+            }
             let x = f(0);
             if x <= 0.0 {
                 return Err(log_domain(x));
@@ -3775,6 +3805,15 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
             Float(x.log10())
         },
         F::Log => {
+            // Two-argument LOG(base, value): NUMERIC when both operands are numeric/int.
+            if let (Some(db), Some(dx)) = (arg_decimal(vals, 0), arg_decimal(vals, 1)) {
+                if dx.mantissa <= 0 {
+                    return Err(log_domain(dx.to_f64()));
+                }
+                return crate::numeric_ln::log_base(&db, &dx)
+                    .map(ast::Value::Numeric)
+                    .ok_or_else(|| domain("logarithm base must be positive and not 1"));
+            }
             let (base, x) = (f(0), f(1));
             if x <= 0.0 {
                 return Err(log_domain(x));
@@ -8740,16 +8779,27 @@ mod tests {
     }
 
     #[test]
-    fn power_root_log_trig_compute_in_float() {
+    fn power_sqrt_trig_are_float_and_log_is_numeric() {
         assert_eq!(
             math(ScalarFunc::Power, vec![lit_int(2), lit_int(10)]),
             Value::Float(1024.0)
         );
         assert_eq!(math(ScalarFunc::Sqrt, vec![lit_int(9)]), Value::Float(3.0));
-        approx(math(ScalarFunc::Ln, vec![lit_int(1)]), 0.0);
         approx(math(ScalarFunc::Exp, vec![lit_int(0)]), 1.0);
-        approx(math(ScalarFunc::Log, vec![lit_int(1000)]), 3.0); // log10
-        approx(math(ScalarFunc::Log, vec![lit_int(2), lit_int(8)]), 3.0); // base-2 of 8
+        // LN/LOG of an integer are exact NUMERIC (a float argument keeps the f64 form).
+        assert_eq!(
+            math(ScalarFunc::Ln, vec![lit_int(1)]),
+            numv("0.0000000000000000")
+        );
+        assert_eq!(
+            math(ScalarFunc::Log, vec![lit_int(1000)]), // log10
+            numv("3.0000000000000000")
+        );
+        assert_eq!(
+            math(ScalarFunc::Log, vec![lit_int(2), lit_int(8)]), // base-2 of 8
+            numv("3.0000000000000000")
+        );
+        approx(math(ScalarFunc::Ln, vec![lit_float(1.0)]), 0.0); // float arg stays float
         approx(math(ScalarFunc::Sin, vec![lit_float(0.0)]), 0.0);
         approx(math(ScalarFunc::Cos, vec![lit_float(0.0)]), 1.0);
         approx(

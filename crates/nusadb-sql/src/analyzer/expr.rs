@@ -2302,15 +2302,15 @@ fn analyze_numeric_function(
     {
         return analyze_trunc_unary(arg_expr, scope, catalog, aggregates);
     }
-    // (min arity, max arity, result is always FLOAT).
+    // (min arity, max arity, result is always FLOAT). LN/LOG/LOG10 are not forced to float: they are
+    // polymorphic (numeric/int argument → exact NUMERIC, float → double precision — see `is_log`),
+    // so they share the non-float arms (`LN`/`LOG10` with the one-arg group, `LOG` with the 1..=2 one).
     let (min, max, force_float) = match func {
-        F::Abs | F::Ceil | F::Floor | F::Sign => (1, 1, false),
-        F::Round | F::Trunc => (1, 2, false),
+        F::Abs | F::Ceil | F::Floor | F::Sign | F::Ln | F::Log10 => (1, 1, false),
+        F::Round | F::Trunc | F::Log => (1, 2, false),
         F::Mod => (2, 2, false),
         F::Power | F::Atan2 => (2, 2, true),
-        F::Log => (1, 2, true),
         F::Sqrt
-        | F::Ln
         | F::Exp
         | F::Sin
         | F::Cos
@@ -2327,10 +2327,12 @@ fn analyze_numeric_function(
         | F::Acosh
         | F::Atanh
         | F::Degrees
-        | F::Log10
         | F::Radians => (1, 1, true),
         _ => unreachable!("non-numeric function routed to analyze_numeric_function"),
     };
+    // LN/LOG/LOG10 keep a numeric argument numeric (no float hint) and return NUMERIC unless the
+    // argument is a float, in which case they return double precision.
+    let is_log = matches!(func, F::Ln | F::Log | F::Log10);
     let name = func.name();
     if args.len() < min || args.len() > max {
         let arity = if min == max {
@@ -2346,7 +2348,14 @@ fn analyze_numeric_function(
     let mut typed_args = Vec::with_capacity(args.len());
     let mut unified = Int;
     for (i, arg) in args.iter().enumerate() {
-        let typed = analyze_expr_agg(arg, scope, catalog, Some(Float), aggregates.as_deref_mut())?;
+        // The log family keeps a numeric argument numeric (and types a bare NULL as NUMERIC); the
+        // others prefer float for a bare literal.
+        let hint = if is_log {
+            Some(NUMERIC_ANY)
+        } else {
+            Some(Float)
+        };
+        let typed = analyze_expr_agg(arg, scope, catalog, hint, aggregates.as_deref_mut())?;
         if !is_numeric(typed.ty) && !is_null_literal(&typed) {
             return Err(Error::TypeMismatch {
                 context: format!("{name}() argument {}", i + 1),
@@ -2369,7 +2378,14 @@ fn analyze_numeric_function(
             found: d.ty,
         });
     }
-    let result = if force_float { Float } else { unified };
+    let result = if is_log {
+        // NUMERIC (unconstrained) for an int/numeric argument; double precision for a float.
+        if unified == Float { Float } else { NUMERIC_ANY }
+    } else if force_float {
+        Float
+    } else {
+        unified
+    };
     Ok(TypedExpr {
         kind: TypedExprKind::ScalarFunction {
             func,
