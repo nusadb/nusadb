@@ -11,69 +11,69 @@ statement ok
 INSERT INTO t VALUES (1, '2024-06-15 14:30:45', '2024-06-15', '2024-06-15 14:30:45+00'),
                      (2, '2023-01-01 00:00:00', '2023-01-01', '2023-01-01 00:00:00+00')
 
-# --- EXTRACT: year, month, day ---
-query IR
+# --- EXTRACT: year, month, day. EXTRACT yields an exact NUMERIC (whole fields at scale 0). ---
+query IT
 SELECT id, EXTRACT(YEAR FROM ts) FROM t ORDER BY id
 ----
-1 2024.000
-2 2023.000
+1 2024
+2 2023
 
-query IR
+query IT
 SELECT id, EXTRACT(MONTH FROM ts) FROM t ORDER BY id
 ----
-1 6.000
-2 1.000
+1 6
+2 1
 
-query IR
+query IT
 SELECT id, EXTRACT(DAY FROM ts) FROM t ORDER BY id
 ----
-1 15.000
-2 1.000
+1 15
+2 1
 
-# --- EXTRACT: hour, minute, second ---
-query R
+# --- EXTRACT: hour, minute, second. SECOND carries six fractional digits. ---
+query T
 SELECT EXTRACT(HOUR FROM TIMESTAMP '2024-06-15 14:30:45')
 ----
-14.000
+14
 
-query R
+query T
 SELECT EXTRACT(MINUTE FROM TIMESTAMP '2024-06-15 14:30:45')
 ----
-30.000
+30
 
-query R
+query T
 SELECT EXTRACT(SECOND FROM TIMESTAMP '2024-06-15 14:30:45')
 ----
-45.000
+45.000000
 
 # --- EXTRACT: day of week (dow: Sunday=0..Saturday=6) ---
-query R
+query T
 SELECT EXTRACT(DOW FROM DATE '2024-06-15')
 ----
-6.000
+6
 
 # --- EXTRACT: day of year (doy) ---
-query R
+query T
 SELECT EXTRACT(DOY FROM DATE '2024-06-15')
 ----
-167.000
+167
 
 # --- EXTRACT: quarter ---
-query R
+query T
 SELECT EXTRACT(QUARTER FROM DATE '2024-06-15')
 ----
-2.000
+2
 
-# --- EXTRACT: epoch (seconds since 1970-01-01) ---
-query R
+# --- EXTRACT: epoch (seconds since 1970-01-01), scale 6 ---
+query T
 SELECT EXTRACT(EPOCH FROM TIMESTAMP '1970-01-01 00:00:00')
 ----
-0.000
+0.000000
 
-query R
+query T
 SELECT EXTRACT(EPOCH FROM TIMESTAMP '1970-01-02 00:00:00')
 ----
-86400.000
+86400.000000
 
 # --- DATE_TRUNC: truncate to year, month, day ---
 query T
@@ -275,10 +275,10 @@ SELECT CAST(MAKE_DATE(1999, 12, 31) AS TEXT)
 1999-12-31
 
 # MAKE_DATE arithmetic round-trips through EXTRACT.
-query R
+query T
 SELECT EXTRACT(YEAR FROM MAKE_DATE(2030, 1, 1))
 ----
-2030.000
+2030
 
 # An impossible calendar day is rejected.
 statement error
@@ -327,10 +327,10 @@ SELECT MAKE_TIMESTAMP(2024, 6, 15, 9, 5, 1)
 2024-06-15 09:05:01
 
 # EXTRACT round-trips a constructed timestamp.
-query R
+query T
 SELECT EXTRACT(HOUR FROM MAKE_TIMESTAMP(2024, 1, 1, 23, 0, 0))
 ----
-23.000
+23
 
 # Out-of-range fields are rejected.
 statement error
@@ -390,27 +390,27 @@ SELECT TO_TIMESTAMP(86400)
 1970-01-02 00:00:00+00
 
 # --- EXTRACT(WEEK) — ISO 8601 week number ---
-query R
+query T
 SELECT EXTRACT(WEEK FROM DATE '2024-06-15')
 ----
-24.000
+24
 
 # 2021-01-01 (Friday) is ISO week 53 of the prior year.
-query R
+query T
 SELECT EXTRACT(WEEK FROM DATE '2021-01-01')
 ----
-53.000
+53
 
-# --- EXTRACT(EPOCH FROM INTERVAL) ---
-query R
+# --- EXTRACT(EPOCH FROM INTERVAL), scale 6 ---
+query T
 SELECT EXTRACT(EPOCH FROM INTERVAL '1 day 02:00:00')
 ----
-93600.000
+93600.000000
 
-query R
+query T
 SELECT EXTRACT(DAY FROM INTERVAL '1 year 2 mons 10 days')
 ----
-10.000
+10
 
 # --- TO_CHAR: extended template codes (quarter, weeks, century, Julian, ISO year, Roman month,
 # seconds-past-midnight, comma year, era) — every expected value captured from the reference engine ---
@@ -464,43 +464,44 @@ SELECT TO_CHAR(DATE '2024-01-21', 'DDTH') || '|' || TO_CHAR(DATE '2024-01-21', '
 # EXTRACT extended calendar precisions. Reference-engine oracle for 2026-08-20 13:45:30.123456:
 # century 21 (years 2001..2100), decade 202 (year/10), millennium 3, isoyear 2026, and the seconds
 # field carried to microsecond (30123456) and millisecond (30123.456) resolution.
-query RRRR
+query TTTT
 SELECT
   EXTRACT(CENTURY FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
   EXTRACT(DECADE FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
   EXTRACT(MILLENNIUM FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
   EXTRACT(ISOYEAR FROM TIMESTAMP '2026-08-20 13:45:30.123456')
 ----
-21.000 202.000 3.000 2026.000
+21 202 3 2026
 
-query RR
+query TT
 SELECT
   EXTRACT(MICROSECONDS FROM TIMESTAMP '2026-08-20 13:45:30.123456'),
   EXTRACT(MILLISECONDS FROM TIMESTAMP '2026-08-20 13:45:30.123456')
 ----
-30123456.000 30123.456
+30123456 30123.456
 
 # Century numbering starts at year 1: 2000 is century 20, 2001 begins century 21.
-query RR
+query TT
 SELECT
   EXTRACT(CENTURY FROM DATE '2000-06-01'),
   EXTRACT(CENTURY FROM DATE '2001-06-01')
 ----
-20.000 21.000
+20 21
 
-# The Julian Date of a date is its whole Julian-day count; a timestamp adds the day fraction.
-query RR
+# The Julian Date of a date is its whole Julian-day count (scale 0); a timestamp adds the day
+# fraction (scale 20).
+query TT
 SELECT
   EXTRACT(JULIAN FROM DATE '2026-08-20'),
   EXTRACT(JULIAN FROM TIMESTAMP '2026-08-20 13:45:30.123456')
 ----
-2461273.000 2461273.573
+2461273 2461273.57326531777777777778
 
 # ISOYEAR near a year boundary: 2027-01-01 (Friday) belongs to ISO year 2026.
-query R
+query T
 SELECT EXTRACT(ISOYEAR FROM DATE '2027-01-01')
 ----
-2026.000
+2026
 
 # DATE_TRUNC to the decade, century and millennium floors to the year that starts the period
 # (year 2001 begins century 21 and millennium 3).
@@ -514,68 +515,68 @@ SELECT
 
 # EXTRACT of the extended precisions from an interval divides the year count down (no calendar
 # origin): 25 years is decade 2, 250 years century 2.
-query RRR
+query TTT
 SELECT
   EXTRACT(DECADE FROM INTERVAL '25 years'),
   EXTRACT(CENTURY FROM INTERVAL '250 years'),
   EXTRACT(MILLENNIUM FROM INTERVAL '2500 years')
 ----
-2.000 2.000 2.000
+2 2 2
 
 # --- EXTRACT on TIMETZ: local time-of-day fields, plus the zone fields ---
 # The local time-of-day is read as entered (independent of the offset).
-query RRR
+query TTT
 SELECT
   EXTRACT(HOUR FROM TIMETZ '12:34:56.789+05:30'),
   EXTRACT(MINUTE FROM TIMETZ '12:34:56.789+05:30'),
   EXTRACT(SECOND FROM TIMETZ '12:34:56.789+05:30')
 ----
-12.000 34.000 56.789
+12 34 56.789000
 
 # The zone fields: timezone is the offset in seconds, split into whole hours and minutes.
-query RRR
+query TTT
 SELECT
   EXTRACT(TIMEZONE FROM TIMETZ '12:34:56.789+05:30'),
   EXTRACT(TIMEZONE_HOUR FROM TIMETZ '12:34:56.789+05:30'),
   EXTRACT(TIMEZONE_MINUTE FROM TIMETZ '12:34:56.789+05:30')
 ----
-19800.000 5.000 30.000
+19800 5 30
 
 # A negative offset carries its sign into both the hour and minute fields.
-query RR
+query TT
 SELECT
   EXTRACT(TIMEZONE_HOUR FROM TIMETZ '12:00-08:00'),
   EXTRACT(TIMEZONE_MINUTE FROM TIMETZ '12:00-05:30')
 ----
--8.000 -30.000
+-8 -30
 
-# epoch of a timetz is the UTC-equivalent seconds-of-day (local minus offset).
-query R
+# epoch of a timetz is the UTC-equivalent seconds-of-day (local minus offset), scale 6.
+query T
 SELECT EXTRACT(EPOCH FROM TIMETZ '12:34:56.789+05:30')
 ----
-25496.789
+25496.789000
 
 # --- EXTRACT zone fields on TIMESTAMPTZ: the session zone is UTC, so the offset is zero ---
-query RRR
+query TTT
 SELECT
   EXTRACT(TIMEZONE FROM TIMESTAMPTZ '2024-06-15 12:00:00+00'),
   EXTRACT(TIMEZONE_HOUR FROM TIMESTAMPTZ '2024-06-15 12:00:00+00'),
   EXTRACT(TIMEZONE_MINUTE FROM TIMESTAMPTZ '2024-06-15 12:00:00+00')
 ----
-0.000 0.000 0.000
+0 0 0
 
 # --- EXTRACT microseconds/milliseconds from TIME and TIMETZ: the sub-minute seconds carried down ---
-query RR
+query TT
 SELECT
   EXTRACT(MICROSECONDS FROM TIME '12:34:56.789012'),
   EXTRACT(MILLISECONDS FROM TIME '12:34:56.789012')
 ----
-56789012.000 56789.012
+56789012 56789.012
 
-query R
+query T
 SELECT EXTRACT(MICROSECONDS FROM TIMETZ '12:34:56.789012+05')
 ----
-56789012.000
+56789012
 
 # --- transaction_timestamp() is a synonym for now() (both are the transaction start time) ---
 query I

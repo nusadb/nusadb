@@ -720,6 +720,207 @@ pub fn extract_timetz_field(field: &str, packed: i64) -> Option<f64> {
     extract_time_field(field, local)
 }
 
+// === EXTRACT as exact NUMERIC =============================================================
+//
+// `EXTRACT` (unlike `date_part`, which is double precision) yields a `numeric` whose scale is fixed
+// per field: `second`/`epoch` carry six fractional digits, `milliseconds` three, `julian` twenty,
+// and every other field is a whole number. Computing straight from the integer micro-counts keeps
+// microsecond resolution exact even for far-future instants an `f64` could not represent.
+
+/// A whole-number EXTRACT result (scale 0).
+const fn extract_int(v: i64) -> crate::numeric::Decimal {
+    crate::numeric::Decimal {
+        mantissa: v as i128,
+        scale: 0,
+    }
+}
+
+/// The `julian` field as a scale-20 `numeric`: the whole Julian day at midnight plus the fraction of
+/// the day elapsed, rounded half-up to twenty places to match the reference engine's rendering.
+fn julian_decimal(days: i64, micros: i64) -> crate::numeric::Decimal {
+    let scale_pow = 10i128.pow(20);
+    let whole = (2_440_588i128 + i128::from(days)) * scale_pow;
+    let tod = i128::from(micros.rem_euclid(MICROS_PER_DAY));
+    let day = i128::from(MICROS_PER_DAY);
+    let frac = (tod * scale_pow + day / 2) / day;
+    crate::numeric::Decimal {
+        mantissa: whole + frac,
+        scale: 20,
+    }
+}
+
+/// `EXTRACT(field FROM ts)` as an exact `numeric` (see [`extract_from_micros`] for the `date_part`
+/// / double-precision form).
+#[must_use]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "y/m/d/h/s are the calendar-component names, as in extract_from_micros"
+)]
+pub fn extract_decimal_from_micros(field: &str, micros: i64) -> Option<crate::numeric::Decimal> {
+    use crate::numeric::Decimal;
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let (y, m, d, h, mi, s, us) = decompose_micros(micros);
+    let sub_min_us = i128::from(s * MICROS_PER_SEC + us);
+    let dec = match field {
+        "year" => extract_int(y),
+        "month" => extract_int(m),
+        "day" => extract_int(d),
+        "hour" => extract_int(h),
+        "minute" => extract_int(mi),
+        "second" => Decimal {
+            mantissa: sub_min_us,
+            scale: 6,
+        },
+        "dow" => extract_int((days + 4).rem_euclid(7)),
+        "isodow" => extract_int(match (days + 4).rem_euclid(7) {
+            0 => 7,
+            w => w,
+        }),
+        "doy" => extract_int(days - days_from_civil(y, 1, 1) + 1),
+        "quarter" => extract_int((m - 1) / 3 + 1),
+        "epoch" => Decimal {
+            mantissa: i128::from(micros),
+            scale: 6,
+        },
+        "week" => extract_int(iso_week(days, y)),
+        "decade" => extract_int(y.div_euclid(10)),
+        "century" => extract_int(century_of(y)),
+        "millennium" => extract_int(millennium_of(y)),
+        "isoyear" => extract_int(iso_year(days)),
+        "microseconds" => extract_int(s * MICROS_PER_SEC + us),
+        "milliseconds" => Decimal {
+            mantissa: sub_min_us,
+            scale: 3,
+        },
+        "julian" => julian_decimal(days, micros),
+        _ => return None,
+    };
+    Some(dec)
+}
+
+/// `EXTRACT(field FROM interval)` as an exact `numeric`.
+#[must_use]
+pub fn extract_decimal_interval_field(
+    field: &str,
+    months: i64,
+    days: i64,
+    micros: i64,
+) -> Option<crate::numeric::Decimal> {
+    use crate::numeric::Decimal;
+    const SECS_PER_DAY: i64 = 86_400;
+    // Sub-minute micros, using the truncated remainder (matching the `f64` form) so a negative
+    // interval keeps the same sign convention.
+    let sub_min_us = i128::from(micros % (60 * MICROS_PER_SEC));
+    let dec = match field {
+        "year" => extract_int(months / 12),
+        "month" => extract_int(months % 12),
+        "day" => extract_int(days),
+        "hour" => extract_int(micros / (3600 * MICROS_PER_SEC)),
+        "minute" => extract_int((micros / (60 * MICROS_PER_SEC)) % 60),
+        "second" => Decimal {
+            mantissa: i128::from((micros / MICROS_PER_SEC) % 60) * i128::from(MICROS_PER_SEC)
+                + i128::from(micros % MICROS_PER_SEC),
+            scale: 6,
+        },
+        "decade" => extract_int(months / 12 / 10),
+        "century" => extract_int(months / 12 / 100),
+        "millennium" => extract_int(months / 12 / 1000),
+        "microseconds" => extract_int(micros % (60 * MICROS_PER_SEC)),
+        "milliseconds" => Decimal {
+            mantissa: sub_min_us,
+            scale: 3,
+        },
+        // An interval's epoch is the total seconds under the standard 30-day-month, 365.25-day-year
+        // convention; every day/month/year term is a whole number of seconds (365.25 * 86400 = 31 557
+        // 600 s exactly) and the sub-day part contributes its raw microseconds, so the sum is exact at
+        // scale six.
+        "epoch" => {
+            let years = i128::from(months / 12);
+            let rem_months = i128::from(months % 12);
+            let secs = years * 31_557_600
+                + rem_months * 30 * i128::from(SECS_PER_DAY)
+                + i128::from(days) * i128::from(SECS_PER_DAY);
+            Decimal {
+                mantissa: secs * i128::from(MICROS_PER_SEC) + i128::from(micros),
+                scale: 6,
+            }
+        },
+        _ => return None,
+    };
+    Some(dec)
+}
+
+/// `EXTRACT(field FROM time)` as an exact `numeric`.
+#[must_use]
+pub fn extract_decimal_time_field(field: &str, tod_micros: i64) -> Option<crate::numeric::Decimal> {
+    use crate::numeric::Decimal;
+    let s = (tod_micros / MICROS_PER_SEC) % 60;
+    let us = tod_micros % MICROS_PER_SEC;
+    let sub_min_us = i128::from(s * MICROS_PER_SEC + us);
+    let dec = match field {
+        "hour" => extract_int(tod_micros / (3600 * MICROS_PER_SEC)),
+        "minute" => extract_int((tod_micros / (60 * MICROS_PER_SEC)) % 60),
+        "second" => Decimal {
+            mantissa: sub_min_us,
+            scale: 6,
+        },
+        "microseconds" => extract_int(s * MICROS_PER_SEC + us),
+        "milliseconds" => Decimal {
+            mantissa: sub_min_us,
+            scale: 3,
+        },
+        "epoch" => Decimal {
+            mantissa: i128::from(tod_micros),
+            scale: 6,
+        },
+        _ => return None,
+    };
+    Some(dec)
+}
+
+/// The three zone fields (`timezone`/`timezone_hour`/`timezone_minute`) as exact whole-number
+/// `numeric`s, from a UTC offset east of UTC in whole seconds.
+fn extract_decimal_zone_field(
+    field: &str,
+    offset_east_secs: i64,
+) -> Option<crate::numeric::Decimal> {
+    let v = match field {
+        "timezone" => offset_east_secs,
+        "timezone_hour" => offset_east_secs / 3600,
+        "timezone_minute" => (offset_east_secs % 3600) / 60,
+        _ => return None,
+    };
+    Some(extract_int(v))
+}
+
+/// `EXTRACT(field FROM timestamptz)` as an exact `numeric`.
+#[must_use]
+pub fn extract_decimal_timestamptz_field(
+    field: &str,
+    micros: i64,
+    offset_east_secs: i64,
+) -> Option<crate::numeric::Decimal> {
+    extract_decimal_zone_field(field, offset_east_secs)
+        .or_else(|| extract_decimal_from_micros(field, micros))
+}
+
+/// `EXTRACT(field FROM timetz)` as an exact `numeric`.
+#[must_use]
+pub fn extract_decimal_timetz_field(field: &str, packed: i64) -> Option<crate::numeric::Decimal> {
+    let offset_east_secs = timetz_offset_east_secs(packed);
+    let local = timetz_local_micros(packed);
+    if let Some(zone) = extract_decimal_zone_field(field, offset_east_secs) {
+        return Some(zone);
+    }
+    if field == "epoch" {
+        return Some(crate::numeric::Decimal {
+            mantissa: i128::from(local - offset_east_secs * MICROS_PER_SEC),
+            scale: 6,
+        });
+    }
+    extract_decimal_time_field(field, local)
+}
+
 /// `DATE_TRUNC(field, ts)` — `ts` (epoch micros) floored to the start of the named precision.
 /// Returns `None` for an unrecognised field. `week` truncates to the preceding Monday 00:00.
 #[must_use]
@@ -1818,6 +2019,64 @@ mod tests {
         // A DATE's Julian Date is the whole day count (no time fraction).
         let jd = extract_from_micros("julian", parse_timestamp("2026-08-20 00:00:00").unwrap());
         assert_eq!(jd, Some(2_461_273.0));
+    }
+
+    #[test]
+    fn extract_decimal_matches_reference_engine_scales() {
+        // EXTRACT is an exact NUMERIC: whole fields at scale 0, second/epoch at scale 6,
+        // milliseconds at scale 3, julian at scale 20. Every value below is the reference
+        // engine's `EXTRACT(...)::text`.
+        let d = |field: &str, ts_text: &str| {
+            extract_decimal_from_micros(field, parse_timestamp(ts_text).unwrap())
+                .unwrap()
+                .format()
+        };
+        let ts = "2024-06-15 14:30:45.123456";
+        assert_eq!(d("year", ts), "2024");
+        assert_eq!(d("quarter", ts), "2");
+        assert_eq!(d("dow", ts), "6");
+        assert_eq!(d("doy", ts), "167");
+        assert_eq!(d("week", ts), "24");
+        assert_eq!(d("second", ts), "45.123456");
+        assert_eq!(d("milliseconds", ts), "45123.456");
+        assert_eq!(d("microseconds", ts), "45123456");
+        assert_eq!(d("epoch", ts), "1718461845.123456");
+        assert_eq!(d("julian", ts), "2460477.60468892888888888889");
+
+        // Interval fields (30-day month, 365.25-day year for epoch — all whole micros, exact).
+        let iv = |field: &str, months: i64, days: i64, micros: i64| {
+            extract_decimal_interval_field(field, months, days, micros)
+                .unwrap()
+                .format()
+        };
+        // interval '1 year 2 mons 3 days 4:05:06.5'
+        let hms = (4 * 3600 + 5 * 60 + 6) * MICROS_PER_SEC + 500_000;
+        assert_eq!(iv("epoch", 14, 3, hms), "37015506.500000");
+        assert_eq!(
+            iv(
+                "second",
+                0,
+                0,
+                2 * 60 * MICROS_PER_SEC + 6 * MICROS_PER_SEC + 500_000
+            ),
+            "6.500000"
+        );
+        assert_eq!(iv("epoch", 12, 0, 0), "31557600.000000");
+
+        // Time fields.
+        let tod =
+            13 * 3600 * MICROS_PER_SEC + 45 * 60 * MICROS_PER_SEC + 30 * MICROS_PER_SEC + 500_000;
+        assert_eq!(
+            extract_decimal_time_field("second", tod).unwrap().format(),
+            "30.500000"
+        );
+        assert_eq!(
+            extract_decimal_time_field("epoch", tod).unwrap().format(),
+            "49530.500000"
+        );
+
+        // An inapplicable field is still rejected (None), like the f64 form.
+        assert_eq!(extract_decimal_from_micros("nonsense", 0), None);
     }
 
     #[test]

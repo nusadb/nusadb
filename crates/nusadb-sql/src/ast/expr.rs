@@ -571,9 +571,12 @@ pub enum ScalarFunc {
     /// `current_setting(name)` — the value of session setting `name` as `TEXT`, or `NULL` if it is
     /// unset. Reads the session's `SET`/`RESET` store.
     CurrentSetting,
-    /// `EXTRACT(field FROM source)` — a date/time field of `source` as `FLOAT`. The field
+    /// `EXTRACT(field FROM source)` — a date/time field of `source` as an exact `NUMERIC`. The field
     /// is carried as a lowercase text-literal first argument; `source` is the temporal value.
     Extract,
+    /// `DATE_PART(field, source)` — the function spelling of `EXTRACT`, but its result is
+    /// `DOUBLE PRECISION` rather than `NUMERIC` (the one difference from [`Self::Extract`]).
+    DatePart,
     /// `DATE_TRUNC(field, source)` — `source` truncated down to the precision named by the text
     /// `field`, returning the same temporal type. A `DATE` source widens to `TIMESTAMPTZ` at
     /// midnight first, so the call is always `TIMESTAMP`- or `TIMESTAMPTZ`-typed.
@@ -1124,6 +1127,7 @@ impl ScalarFunc {
             Self::SessionUser => "session_user",
             Self::CurrentSetting => "current_setting",
             Self::Extract => "extract",
+            Self::DatePart => "date_part",
             Self::DateTrunc => "date_trunc",
             Self::Age => "age",
             Self::AtTimeZone => "at_time_zone",

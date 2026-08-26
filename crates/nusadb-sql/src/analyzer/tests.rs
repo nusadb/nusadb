@@ -2160,10 +2160,18 @@ fn clock_functions_reject_arguments() {
 
 #[test]
 fn temporal_functions_resolve_result_types() {
-    // EXTRACT → Float, DATE_TRUNC → the (possibly widened) source's temporal type, AGE → Interval.
+    // EXTRACT → exact NUMERIC, DATE_PART → double precision, DATE_TRUNC → the (possibly widened)
+    // source's temporal type, AGE → Interval.
     for (sql, ty) in [
         (
             "SELECT EXTRACT(YEAR FROM CURRENT_TIMESTAMP)",
+            ColumnType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+        ),
+        (
+            "SELECT DATE_PART('year', CURRENT_TIMESTAMP)",
             ColumnType::Float,
         ),
         ("SELECT DATE_TRUNC('month', NOW())", ColumnType::TimestampTz),

@@ -979,7 +979,14 @@ pub(super) fn analyze_scalar_function(
     // are validated directly.
     if matches!(
         func,
-        F::Extract | F::DateTrunc | F::Age | F::ToChar | F::ToDate | F::ToTimestamp | F::AtTimeZone
+        F::Extract
+            | F::DatePart
+            | F::DateTrunc
+            | F::Age
+            | F::ToChar
+            | F::ToDate
+            | F::ToTimestamp
+            | F::AtTimeZone
     ) {
         return analyze_temporal_function(func, args, scope, catalog, aggregates);
     }
@@ -1607,6 +1614,7 @@ pub(super) fn analyze_scalar_function(
         // Handled above by `analyze_temporal_function` / `analyze_numeric_function` (their argument
         // and result types are not fixed-table shaped).
         F::Extract
+        | F::DatePart
         | F::DateTrunc
         | F::Age
         | F::AtTimeZone
@@ -3364,11 +3372,11 @@ fn analyze_temporal_function(
         ty: result,
     };
     match func {
-        F::Extract | F::DateTrunc => {
+        F::Extract | F::DatePart | F::DateTrunc => {
             let (field_expr, source_expr) = expect_two_args(args, name)?;
             let field = expect_field_literal(field_expr, name)?;
             let valid_field = match func {
-                F::Extract => is_extract_field(&field),
+                F::Extract | F::DatePart => is_extract_field(&field),
                 _ => is_trunc_field(&field),
             };
             if !valid_field {
@@ -3400,8 +3408,8 @@ fn analyze_temporal_function(
             };
             // EXTRACT accepts any temporal source; DATE_TRUNC truncates a timestamp.
             let ok_source = match func {
-                // EXTRACT also reads the fields of an INTERVAL (e.g. `epoch`, `day`, `hour`).
-                F::Extract => is_temporal(source.ty) || source.ty == Interval,
+                // EXTRACT/DATE_PART also read the fields of an INTERVAL (e.g. `epoch`, `day`, `hour`).
+                F::Extract | F::DatePart => is_temporal(source.ty) || source.ty == Interval,
                 _ => matches!(source.ty, Timestamp | TimestampTz),
             };
             if !ok_source {
@@ -3411,8 +3419,13 @@ fn analyze_temporal_function(
                     found: source.ty,
                 });
             }
-            // EXTRACT → FLOAT; DATE_TRUNC preserves the source's temporal type.
-            let result = if func == F::Extract { Float } else { source.ty };
+            // EXTRACT → exact NUMERIC; DATE_PART → double precision; DATE_TRUNC preserves the source's
+            // temporal type.
+            let result = match func {
+                F::Extract => NUMERIC_ANY,
+                F::DatePart => Float,
+                _ => source.ty,
+            };
             Ok(field_call(source, result, field))
         },
         F::AtTimeZone => {

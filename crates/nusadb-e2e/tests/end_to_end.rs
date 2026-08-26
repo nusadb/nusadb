@@ -8389,8 +8389,15 @@ fn b451_date_time_functions_end_to_end() {
             assert_eq!(
                 rows,
                 vec![vec![
-                    Value::Float(2024.0),
-                    Value::Float(6.0),
+                    // EXTRACT yields an exact NUMERIC (whole fields at scale 0).
+                    Value::Numeric(nusadb_sql::numeric::Decimal {
+                        mantissa: 2024,
+                        scale: 0,
+                    }),
+                    Value::Numeric(nusadb_sql::numeric::Decimal {
+                        mantissa: 6,
+                        scale: 0,
+                    }),
                     Value::Timestamp(month_start),
                     // A day borrow counts the earlier instant's own month: 1-15 borrows January's
                     // 31 days, giving 17 (oracle-checked: `1 mon 17 days`), not February's 29.

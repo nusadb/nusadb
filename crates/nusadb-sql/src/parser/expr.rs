@@ -1356,9 +1356,10 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         // Date/time functions reachable through the ordinary call form. `EXTRACT` has its
         // own special syntax (`EXTRACT(field FROM source)`) handled in `convert_expr`.
         "date_trunc" => F::DateTrunc,
-        // `date_part(field, source)` is the function-call spelling of `EXTRACT(field FROM source)`;
-        // the field arrives as a string-literal argument that the analyzer lowercases and validates.
-        "date_part" => F::Extract,
+        // `date_part(field, source)` is the function-call spelling of `EXTRACT(field FROM source)`,
+        // differing only in its result type (double precision, not numeric); the field arrives as a
+        // string-literal argument that the analyzer lowercases and validates.
+        "date_part" => F::DatePart,
         "age" => F::Age,
         "to_char" => F::ToChar,
         "to_date" => F::ToDate,

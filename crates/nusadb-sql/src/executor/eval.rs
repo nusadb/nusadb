@@ -920,7 +920,9 @@ fn eval_scalar_function(
             super::session_ctx::setting(name).map_or(ast::Value::Null, Text)
         },
         // Date/time functions. The field is the leading Text literal the analyzer attached.
-        (F::Extract, [Text(field), src]) => extract_value(field, src)?,
+        // EXTRACT yields an exact NUMERIC; DATE_PART the double-precision form.
+        (F::Extract, [Text(field), src]) => extract_decimal_value(field, src)?,
+        (F::DatePart, [Text(field), src]) => extract_value(field, src)?,
         (F::DateTrunc, [Text(field), src]) => date_trunc_value(field, src)?,
         (F::Age, [end]) => age_value(end, None)?,
         (F::Age, [end, start]) => age_value(end, Some(start))?,
@@ -1450,9 +1452,10 @@ fn eval_scalar_function(
     })
 }
 
-/// `EXTRACT(field FROM src)` — a temporal field of `src` as a `Float`. A `DATE`/timestamp
-/// gets the full field set; a `TIME` only the intraday fields. An inapplicable field (e.g. `year`
-/// from a `TIME`) is rejected honestly rather than returning a wrong number.
+/// `DATE_PART(field, src)` — a temporal field of `src` as a `Float` (double precision). `EXTRACT`
+/// uses the exact-NUMERIC form [`extract_decimal_value`] instead. A `DATE`/timestamp gets the full
+/// field set; a `TIME` only the intraday fields. An inapplicable field (e.g. `year` from a `TIME`)
+/// is rejected honestly rather than returning a wrong number.
 fn extract_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
     use ast::Value as V;
     let value = match src {
@@ -1474,6 +1477,39 @@ fn extract_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
         _ => return Ok(V::Null),
     };
     value.map(V::Float).ok_or_else(|| {
+        Error::InvalidParameterValue(format!(
+            "EXTRACT field `{field}` is not valid for this value"
+        ))
+    })
+}
+
+/// `EXTRACT(field FROM src)` as an exact `NUMERIC` (whereas `DATE_PART` — [`extract_value`] — is
+/// double precision). NULL propagates; an inapplicable field is a loud error.
+fn extract_decimal_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
+    use ast::Value as V;
+    let value = match src {
+        // A DATE has no time-of-day, so its `julian` is the whole Julian-day count (an integer),
+        // matching the reference engine's scale-0 result for a date (a timestamp keeps the day
+        // fraction). Every other field reads the widened midnight instant.
+        V::Date(days) if field == "julian" => Some(crate::numeric::Decimal {
+            mantissa: i128::from(2_440_588 + *days),
+            scale: 0,
+        }),
+        V::Date(days) => super::clock::day_start_micros(*days)
+            .and_then(|micros| crate::temporal::extract_decimal_from_micros(field, micros)),
+        V::Timestamp(m) => crate::temporal::extract_decimal_from_micros(field, *m),
+        V::TimestampTz(m) => crate::temporal::extract_decimal_timestamptz_field(field, *m, 0),
+        V::Time(t) => crate::temporal::extract_decimal_time_field(field, *t),
+        V::TimeTz(packed) => crate::temporal::extract_decimal_timetz_field(field, *packed),
+        V::Interval(iv) => crate::temporal::extract_decimal_interval_field(
+            field,
+            i64::from(iv.months),
+            i64::from(iv.days),
+            iv.micros,
+        ),
+        _ => return Ok(V::Null),
+    };
+    value.map(V::Numeric).ok_or_else(|| {
         Error::InvalidParameterValue(format!(
             "EXTRACT field `{field}` is not valid for this value"
         ))
