@@ -1500,16 +1500,51 @@ fn weekday_name(days: i64, table: &[&str; 7], case: NameCase) -> String {
 pub fn format_with_pattern(micros: i64, fmt: &str) -> String {
     let (y, m, d, h, mi, s, us) = decompose_micros(micros);
     let days = micros.div_euclid(MICROS_PER_DAY);
-    let parts = TimeParts {
-        y,
-        m,
-        d,
-        h,
-        mi,
-        s,
-        us,
-        days,
-    };
+    format_parts(
+        &TimeParts {
+            y,
+            m,
+            d,
+            h,
+            mi,
+            s,
+            us,
+            days,
+        },
+        fmt,
+    )
+}
+
+/// `TO_CHAR(interval, fmt)` — render an interval's component fields through a datetime picture.
+///
+/// The interval is read field-wise as the reference engine does: `YYYY` is the whole years
+/// (`months / 12`), `MM` the leftover months, `DD` the days, and `HH24`/`MI`/`SS` the time carried by
+/// the micros part — so `HH24` of `26 hours` is `26` (the micros are not folded into a day). The
+/// calendar-only codes (weekday, day-of-year, era, …) have no meaning for a duration and read from a
+/// zeroed date.
+#[must_use]
+pub fn format_interval_with_pattern(months: i64, days: i64, micros: i64, fmt: &str) -> String {
+    format_parts(
+        &TimeParts {
+            y: months / 12,
+            m: months % 12,
+            d: days,
+            h: micros / (3600 * MICROS_PER_SEC),
+            mi: (micros / (60 * MICROS_PER_SEC)) % 60,
+            s: (micros / MICROS_PER_SEC) % 60,
+            us: micros % MICROS_PER_SEC,
+            days: 0,
+        },
+        fmt,
+    )
+}
+
+/// Render a datetime picture `fmt` over already-decomposed [`TimeParts`]. Shared by the timestamp and
+/// interval `TO_CHAR` entry points.
+fn format_parts(parts: &TimeParts, fmt: &str) -> String {
+    // `y`/`m`/`h`/`days` are read directly by the year, month-name, meridiem and weekday codes; the
+    // rest reach the renderer through `numeric_field(&tok, parts)`.
+    let TimeParts { y, m, h, days, .. } = *parts;
     let mut out = String::new();
     // `FM` sets fill mode for the next field only; it emits nothing and does not itself reset the
     // flag. A literal between `FM` and its field passes the flag through; every rendered field
@@ -1525,7 +1560,7 @@ pub fn format_with_pattern(micros: i64, fmt: &str) -> String {
         }
         let is_literal = matches!(tok, FmtToken::Literal(_));
         let is_ordinal = matches!(tok, FmtToken::OrdinalSuffix(_));
-        if let Some((value, width)) = numeric_field(&tok, &parts) {
+        if let Some((value, width)) = numeric_field(&tok, parts) {
             out.push_str(&num_field(value, width, fill));
             last_num = Some(value);
             fill = false;

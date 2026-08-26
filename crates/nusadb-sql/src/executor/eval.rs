@@ -1646,6 +1646,16 @@ fn temporal_to_micros(v: &ast::Value) -> Result<i64, Error> {
 /// midnight; a `TIME` from the 1970-01-01 epoch date plus its time of day.
 fn to_char_value(value: &ast::Value, fmt: &str) -> ast::Value {
     use ast::Value as V;
+    // An interval is read field-wise (years/months/days + the time carried by its micros), not as an
+    // instant, so it has its own formatter.
+    if let V::Interval(iv) = value {
+        return V::Text(crate::temporal::format_interval_with_pattern(
+            i64::from(iv.months),
+            i64::from(iv.days),
+            iv.micros,
+            fmt,
+        ));
+    }
     let micros = match value {
         V::Date(days) => super::clock::day_start_micros(*days),
         V::Timestamp(m) | V::TimestampTz(m) => Some(*m),

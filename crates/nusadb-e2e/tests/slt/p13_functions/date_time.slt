@@ -153,6 +153,33 @@ SELECT TO_CHAR(DATE '2024-06-15', 'Month') || '|'
 ----
 June     |
 
+# --- TO_CHAR: format an interval field-wise (YYYY/MM/DD from the calendar parts, HH24/MI/SS from
+# the time part; HH24 is the total hours carried by the micros, so 26 hours stays 26). ---
+query T
+SELECT TO_CHAR(INTERVAL '1 day 2 hours 3 min 4 sec', 'HH24:MI:SS')
+----
+02:03:04
+
+query T
+SELECT TO_CHAR(INTERVAL '26 hours', 'HH24:MI:SS')
+----
+26:00:00
+
+query T
+SELECT TO_CHAR(INTERVAL '1 year 2 mons', 'YYYY-MM')
+----
+0001-02
+
+query T
+SELECT TO_CHAR(INTERVAL '1 day 2 hours 3 min 4 sec', 'DD HH24:MI:SS')
+----
+01 02:03:04
+
+query T
+SELECT TO_CHAR(INTERVAL '1.5 hours', 'HH12:MI AM')
+----
+01:30 AM
+
 # --- TO_CHAR: format a number through a digit picture (`9`/`0`/`.`/`D`, `,`/`G`, `FM`) ---
 # Digits fit exactly; the fraction is rounded/padded to the picture; the sign is a leading column.
 query T

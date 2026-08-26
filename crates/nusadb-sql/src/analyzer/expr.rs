@@ -3552,10 +3552,10 @@ fn analyze_format_function(
     let (value_expr, format_expr) = expect_two_args(args, name)?;
     let value = analyze_expr_agg(value_expr, scope, catalog, None, aggregates.as_deref_mut())?;
     let value_ok = if func == F::ToChar {
-        // TO_CHAR formats either a temporal value or a number (B-fn).
+        // TO_CHAR formats a temporal value, an interval, or a number (B-fn).
         matches!(
             value.ty,
-            Date | ColumnType::Time | Timestamp | ColumnType::TimestampTz
+            Date | ColumnType::Time | Timestamp | ColumnType::TimestampTz | ColumnType::Interval
         ) || is_numeric(value.ty)
             || is_null_literal(&value)
     } else {
