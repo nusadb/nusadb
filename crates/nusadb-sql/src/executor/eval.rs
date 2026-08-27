@@ -4518,7 +4518,9 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         // To Text.
         (ast::Value::Bool(b), ColumnType::Text) => Ok(ast::Value::Text(b.to_string())),
         (ast::Value::Int(i), ColumnType::Text) => Ok(ast::Value::Text(i.to_string())),
-        (ast::Value::Float(f), ColumnType::Text) => Ok(ast::Value::Text(f.to_string())),
+        (ast::Value::Float(f), ColumnType::Text) => {
+            Ok(ast::Value::Text(crate::display::format_float(*f)))
+        },
         // From Text — a value that does not parse as the target is a data exception (a runtime value
         // error), not a static type mismatch, so it carries the invalid-representation code.
         (ast::Value::Text(s), ColumnType::Int) => s

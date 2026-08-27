@@ -159,6 +159,28 @@ SELECT LN(CAST(2 AS DOUBLE PRECISION))
 ----
 0.693
 
+# --- DOUBLE PRECISION text: shortest round-trip, exponent notation outside [1e-4, 1e15), and the
+# Infinity / -Infinity / NaN spellings. ---
+query T
+SELECT CAST(CAST('1e20' AS DOUBLE PRECISION) AS TEXT)
+----
+1e+20
+
+query T
+SELECT CAST(CAST('0.00001' AS DOUBLE PRECISION) AS TEXT)
+----
+1e-05
+
+query T
+SELECT CAST(CAST('1234.5' AS DOUBLE PRECISION) AS TEXT)
+----
+1234.5
+
+query T
+SELECT CAST(CAST('Infinity' AS DOUBLE PRECISION) AS TEXT) || '|' || CAST(CAST('-Infinity' AS DOUBLE PRECISION) AS TEXT) || '|' || CAST(CAST('NaN' AS DOUBLE PRECISION) AS TEXT)
+----
+Infinity|-Infinity|NaN
+
 # --- EXP ---
 query R
 SELECT EXP(0)
