@@ -456,6 +456,11 @@ fn slt_p3_nulls_ordering() {
 }
 
 #[test]
+fn slt_p3_row_predicates() {
+    run_slt("tests/slt/p3_filter/row_predicates.slt");
+}
+
+#[test]
 fn slt_p4_scalar_aggregate() {
     run_slt("tests/slt/p4_join_agg/scalar_aggregate.slt");
 }

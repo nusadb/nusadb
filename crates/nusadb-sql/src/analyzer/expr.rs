@@ -4236,6 +4236,46 @@ pub(super) fn analyze_in_list(
     catalog: &dyn Catalog,
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
+    // A row-constructor probe `(a, b) IN ((1, 1), (2, 1))` desugars to a chain of row comparisons,
+    // reusing the same field-wise 3-valued logic as `(a, b) = (1, 1)`. `IN` is an `OR` of row
+    // equalities; `NOT IN` is (by De Morgan) an `AND` of row inequalities — both correct under NULLs.
+    // Every list item must itself be a row of the same width, or it is a loud arity error.
+    if let ast::Expr::Row(l) = expr {
+        let item_op = if negated {
+            ast::BinaryOp::NotEq
+        } else {
+            ast::BinaryOp::Eq
+        };
+        let mut comparisons = Vec::with_capacity(list.len());
+        for item in list {
+            let ast::Expr::Row(r) = item else {
+                return Err(Error::InvalidStatement(
+                    "a row on the left of IN requires every list item to be a row of the same width"
+                        .to_owned(),
+                ));
+            };
+            comparisons.push(desugar_row_comparison(l, item_op, r)?);
+        }
+        let combine = if negated {
+            ast::BinaryOp::And
+        } else {
+            ast::BinaryOp::Or
+        };
+        let folded = comparisons.into_iter().reduce(|acc, e| ast::Expr::Binary {
+            left: Box::new(acc),
+            op: combine,
+            right: Box::new(e),
+        });
+        // An empty list makes `IN` unconditionally false and `NOT IN` unconditionally true.
+        let desugared = folded.unwrap_or(ast::Expr::Literal(ast::Value::Bool(negated)));
+        return analyze_expr_agg(
+            &desugared,
+            scope,
+            catalog,
+            Some(ColumnType::Bool),
+            aggregates,
+        );
+    }
     // An untyped bare-`NULL` probe takes its type from a LITERAL first list item
     // (`NULL IN (1, 2)` is NULL, three-valued) — mirroring how bare-NULL
     // list ITEMS already type from the probe's hint below. Restricted to a literal so the

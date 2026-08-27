@@ -1,0 +1,61 @@
+# p3_filter/row_predicates — row-constructor comparisons and IN lists.
+# A `(a, b)` on the left desugars field-wise: `(a, b) = (1, 1)` folds with AND, `(a, b) IN (...)`
+# folds an OR of row equalities (AND of inequalities for NOT IN), each carrying the ordinary
+# 3-valued NULL logic. The NULL row exercises those edges.
+
+statement ok
+CREATE TABLE rt (a INT, b INT)
+
+statement ok
+INSERT INTO rt VALUES (1, 1), (2, 1), (3, 3), (1, NULL)
+
+# --- row equality / ordering ---
+query II
+SELECT a, b FROM rt WHERE (a, b) = (1, 1)
+----
+1 1
+
+# Lexicographic: `1 < 2` alone makes the first field decide, so both a=1 rows and (2, 1) (2 = 2, 1 < 5)
+# qualify; (3, 3) does not. NULL in the first-field-decided row is irrelevant.
+query II
+SELECT a, b FROM rt WHERE (a, b) < (2, 5) ORDER BY a, b
+----
+1 1
+1 NULL
+2 1
+
+# --- row IN a list ---
+query II
+SELECT a, b FROM rt WHERE (a, b) IN ((1, 1), (2, 1)) ORDER BY a, b
+----
+1 1
+2 1
+
+# A computed field on the left is fine — the desugar re-analyzes each element.
+query II
+SELECT a, b FROM rt WHERE (a, b + 0) IN ((1, 1), (3, 3)) ORDER BY a, b
+----
+1 1
+3 3
+
+# --- row NOT IN: the NULL row (1, NULL) is excluded (b <> 1 is UNKNOWN, not TRUE) ---
+query II
+SELECT a, b FROM rt WHERE (a, b) NOT IN ((1, 1)) ORDER BY a, b
+----
+2 1
+3 3
+
+# A NULL inside the probed list value makes every match UNKNOWN, so IN yields no rows.
+query II
+SELECT a, b FROM rt WHERE (a, b) IN ((1, NULL))
+----
+
+# --- arity is enforced: every list item must be a row of the same width ---
+statement error
+SELECT a FROM rt WHERE (a, b) IN ((1, 1, 1))
+
+statement error
+SELECT a FROM rt WHERE (a, b) IN (1, 2)
+
+statement ok
+DROP TABLE rt
