@@ -7402,9 +7402,9 @@ fn numeric_op(
     Ok(ast::Value::Numeric(result))
 }
 
-const fn float_op(op: ast::BinaryOp, l: f64, r: f64) -> Result<f64, Error> {
+fn float_op(op: ast::BinaryOp, l: f64, r: f64) -> Result<f64, Error> {
     use ast::BinaryOp as Op;
-    Ok(match op {
+    let result = match op {
         Op::Plus => l + r,
         Op::Minus => l - r,
         Op::Multiply => l * r,
@@ -7421,7 +7421,17 @@ const fn float_op(op: ast::BinaryOp, l: f64, r: f64) -> Result<f64, Error> {
             l % r
         },
         _ => 0.0,
-    })
+    };
+    // A finite computation that produced an infinity has overflowed the double-precision range: the
+    // reference engine raises this rather than returning `inf`. An operation with an already-infinite
+    // operand (e.g. `'Infinity'::float8 + 1`) keeps its infinite result and is not an overflow.
+    if result.is_infinite() && l.is_finite() && r.is_finite() {
+        return Err(Error::Coded {
+            message: "value out of range: overflow".to_owned(),
+            sqlstate: "22003",
+        });
+    }
+    Ok(result)
 }
 
 pub(crate) fn int_op(op: ast::BinaryOp, l: i64, r: i64) -> Result<i64, Error> {

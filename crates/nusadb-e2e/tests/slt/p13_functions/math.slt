@@ -181,6 +181,16 @@ SELECT CAST(CAST('Infinity' AS DOUBLE PRECISION) AS TEXT) || '|' || CAST(CAST('-
 ----
 Infinity|-Infinity|NaN
 
+# A finite double-precision computation that overflows the range is a loud error, not `inf`.
+statement error
+SELECT CAST('1e308' AS DOUBLE PRECISION) * 10
+
+# An operation on an explicit Infinity keeps its infinite result (not an overflow).
+query T
+SELECT CAST(CAST('Infinity' AS DOUBLE PRECISION) + 1 AS TEXT)
+----
+Infinity
+
 # --- EXP ---
 query R
 SELECT EXP(0)
