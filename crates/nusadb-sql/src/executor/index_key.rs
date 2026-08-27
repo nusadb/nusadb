@@ -141,6 +141,14 @@ const NUMERIC_FRAC_DIGITS: usize = crate::numeric::MAX_SCALE as usize;
 /// spellings of the same value (`1.5` and `1.50`) produce identical bytes — the equality an index
 /// needs. For a negative value every digit is inverted (`9 − d`) so a larger magnitude sorts lower.
 fn encode_numeric(d: &crate::numeric::Decimal, out: &mut Vec<u8>) -> Result<(), Error> {
+    // NaN sorts above every finite value and is equal only to itself, so it gets a sign class of its
+    // own (`0x03`, above the `0x02` of non-negatives) with all digit columns zeroed: one canonical
+    // encoding that is identical for every NaN (so a unique index dedups them) and orders last.
+    if d.is_nan() {
+        out.push(0x03);
+        out.resize(out.len() + NUMERIC_INT_DIGITS + NUMERIC_FRAC_DIGITS, b'0');
+        return Ok(());
+    }
     let scale = d.scale as usize;
     if scale > NUMERIC_FRAC_DIGITS {
         return Err(Error::LimitExceeded(

@@ -904,8 +904,9 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
                 .get(pos + 16)
                 .ok_or(Error::MalformedTuple { offset: pos + 16 })?;
             // Reject a corrupt/out-of-range scale rather than building an unrepresentable Decimal
-            // (the codec/arithmetic only carry up to MAX_SCALE fractional digits)
-            if scale > crate::numeric::MAX_SCALE {
+            // (the codec/arithmetic only carry up to MAX_SCALE fractional digits) — but the reserved
+            // NaN sentinel scale is a valid encoding of the not-a-number numeric.
+            if scale > crate::numeric::MAX_SCALE && scale != crate::numeric::NAN_SCALE {
                 return Err(Error::MalformedTuple { offset: pos + 16 });
             }
             Ok((

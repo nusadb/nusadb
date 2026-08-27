@@ -606,6 +606,11 @@ fn slt_p10_numeric() {
 }
 
 #[test]
+fn slt_p10_numeric_nan() {
+    run_slt("tests/slt/p10_types/numeric_nan.slt");
+}
+
+#[test]
 fn slt_p10_int_overflow() {
     run_slt("tests/slt/p10_types/int_overflow.slt");
 }

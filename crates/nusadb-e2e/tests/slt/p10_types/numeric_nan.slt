@@ -1,0 +1,140 @@
+# NUMERIC NaN. Unlike an IEEE-754 float NaN, a numeric NaN compares EQUAL to itself and GREATER than
+# every finite value (so it sorts last), and every arithmetic operation involving it yields NaN.
+
+# --- parse + display (case-insensitive, whitespace-trimmed) ---
+query T
+SELECT CAST('NaN' AS NUMERIC)
+----
+NaN
+
+query T
+SELECT CAST('nan' AS NUMERIC)
+----
+NaN
+
+query T
+SELECT CAST('  NaN  ' AS NUMERIC)
+----
+NaN
+
+# --- equality and ordering: NaN = NaN is true; NaN is the largest value ---
+query I
+SELECT CAST('NaN' AS NUMERIC) = CAST('NaN' AS NUMERIC)
+----
+1
+
+query I
+SELECT CAST('NaN' AS NUMERIC) > 99999
+----
+1
+
+query I
+SELECT CAST('NaN' AS NUMERIC) < 5
+----
+0
+
+# ORDER BY puts NaN last.
+statement ok
+CREATE TABLE nn (x NUMERIC)
+
+statement ok
+INSERT INTO nn VALUES (5), ('NaN'), (2), (100)
+
+query T
+SELECT x FROM nn ORDER BY x
+----
+2
+5
+100
+NaN
+
+# --- arithmetic: any operation with NaN yields NaN, including NaN / 0 and NaN % 0 ---
+query T
+SELECT CAST('NaN' AS NUMERIC) + 1
+----
+NaN
+
+query T
+SELECT 2 * CAST('NaN' AS NUMERIC)
+----
+NaN
+
+query T
+SELECT CAST('NaN' AS NUMERIC) / 0
+----
+NaN
+
+query T
+SELECT CAST('NaN' AS NUMERIC) % 3
+----
+NaN
+
+# --- functions propagate NaN ---
+query TTTTTT
+SELECT abs(CAST('NaN' AS NUMERIC)), sign(CAST('NaN' AS NUMERIC)), round(CAST('NaN' AS NUMERIC)), ceil(CAST('NaN' AS NUMERIC)), floor(CAST('NaN' AS NUMERIC)), trunc(CAST('NaN' AS NUMERIC))
+----
+NaN  NaN  NaN  NaN  NaN  NaN
+
+# --- aggregates: max/sum are NaN (NaN is the largest); min is the finite minimum; count includes it ---
+query TTTI
+SELECT max(x), min(x), sum(x), count(x) FROM (SELECT x FROM nn WHERE x IN (5, 2) OR x = CAST('NaN' AS NUMERIC)) t
+----
+NaN  2  NaN  3
+
+# --- casts: a float NaN becomes a numeric NaN; a numeric NaN to int is a loud error ---
+query T
+SELECT CAST(CAST(CAST('NaN' AS DOUBLE PRECISION) AS NUMERIC) AS TEXT)
+----
+NaN
+
+statement error
+SELECT CAST(CAST('NaN' AS NUMERIC) AS INT)
+
+statement ok
+DROP TABLE nn
+
+# same equality without an index, to prove predicate eval and the index seek agree
+statement ok
+CREATE TABLE ns (x NUMERIC)
+
+statement ok
+INSERT INTO ns VALUES (5), ('NaN'), (2), (100)
+
+query I
+SELECT count(*) FROM ns WHERE x = CAST('NaN' AS NUMERIC)
+----
+1
+
+statement ok
+DROP TABLE ns
+
+# --- NaN is indexable: it sorts last in an index-ordered scan and is found by equality lookup ---
+statement ok
+CREATE TABLE ni (x NUMERIC)
+
+statement ok
+CREATE INDEX ni_x ON ni (x)
+
+statement ok
+INSERT INTO ni VALUES (5), ('NaN'), (2), (100)
+
+query T
+SELECT x FROM ni ORDER BY x
+----
+2
+5
+100
+NaN
+
+query I
+SELECT count(*) FROM ni WHERE x > 99999
+----
+1
+
+query I
+SELECT count(*) FROM ni WHERE x = CAST('NaN' AS NUMERIC)
+----
+1
+
+statement ok
+DROP TABLE ni

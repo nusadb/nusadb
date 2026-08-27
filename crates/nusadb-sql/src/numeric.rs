@@ -21,6 +21,10 @@ const DEC_DIGITS: i32 = 4;
 /// The largest scale (fractional digits) the codec / arithmetic will carry.
 pub const MAX_SCALE: u8 = 38;
 
+/// The reserved scale that marks a `NaN` numeric. It sits above [`MAX_SCALE`], so no finite value can
+/// ever carry it, and it round-trips through every codec as an ordinary scale byte.
+pub const NAN_SCALE: u8 = u8::MAX;
+
 /// An exact base-10 fixed-point number: `mantissa * 10^(-scale)`.
 #[derive(Debug, Clone, Copy)]
 pub struct Decimal {
@@ -122,10 +126,26 @@ impl Decimal {
         }
     }
 
-    /// `true` if the value is exactly zero.
+    /// The `NaN` numeric. Unlike an IEEE-754 float `NaN`, a numeric `NaN` compares *equal* to itself
+    /// and *greater* than every finite value (so it sorts last), matching the reference engine.
+    #[must_use]
+    pub const fn nan() -> Self {
+        Self {
+            mantissa: 0,
+            scale: NAN_SCALE,
+        }
+    }
+
+    /// Whether this is the `NaN` numeric.
+    #[must_use]
+    pub const fn is_nan(&self) -> bool {
+        self.scale == NAN_SCALE
+    }
+
+    /// `true` if the value is exactly zero (a `NaN` is never zero).
     #[must_use]
     pub const fn is_zero(&self) -> bool {
-        self.mantissa == 0
+        self.mantissa == 0 && !self.is_nan()
     }
 
     /// Parse `[-|+]ddd[.ddd]` exactly. Rejects anything else (empty, multiple dots, non-digits,
@@ -133,6 +153,10 @@ impl Decimal {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
+        // `NaN` (any case) is the not-a-number numeric, matching the reference engine's text input.
+        if s.eq_ignore_ascii_case("nan") {
+            return Some(Self::nan());
+        }
         let (neg, body) = match s.as_bytes().first()? {
             b'-' => (true, s.get(1..)?),
             b'+' => (false, s.get(1..)?),
@@ -169,6 +193,9 @@ impl Decimal {
     /// Render in canonical form at the value's own scale (e.g. `1999`@2 -> `"19.99"`).
     #[must_use]
     pub fn format(&self) -> String {
+        if self.is_nan() {
+            return "NaN".to_owned();
+        }
         if self.scale == 0 {
             return self.mantissa.to_string();
         }
@@ -189,6 +216,9 @@ impl Decimal {
     /// `None` on overflow.
     #[must_use]
     pub fn rescale(&self, target: u8) -> Option<Self> {
+        if self.is_nan() {
+            return Some(Self::nan()); // a NaN has no scale to change
+        }
         match target.cmp(&self.scale) {
             Ordering::Equal => Some(*self),
             Ordering::Greater => {
@@ -215,9 +245,17 @@ impl Decimal {
         }
     }
 
-    /// Total order by numeric value (scale-independent).
+    /// Total order by numeric value (scale-independent). A `NaN` compares *equal* to another `NaN`
+    /// and *greater* than every finite value — so it sorts last — matching the reference engine (and
+    /// unlike an IEEE-754 float `NaN`).
     #[must_use]
     pub fn compare(&self, other: &Self) -> Ordering {
+        match (self.is_nan(), other.is_nan()) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            (false, false) => {},
+        }
         let scale = self.scale.max(other.scale);
         match (self.rescale(scale), other.rescale(scale)) {
             (Some(a), Some(b)) => a.mantissa.cmp(&b.mantissa),
@@ -226,9 +264,12 @@ impl Decimal {
         }
     }
 
-    /// Exact addition. `None` on overflow.
+    /// Exact addition. `None` on overflow. A `NaN` operand propagates.
     #[must_use]
     pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        if self.is_nan() || other.is_nan() {
+            return Some(Self::nan());
+        }
         let scale = self.scale.max(other.scale);
         let a = self.rescale(scale)?;
         let b = other.rescale(scale)?;
@@ -244,9 +285,13 @@ impl Decimal {
         self.checked_add(&other.neg())
     }
 
-    /// Exact multiplication (scales add). `None` on overflow / scale past [`MAX_SCALE`].
+    /// Exact multiplication (scales add). `None` on overflow / scale past [`MAX_SCALE`]. A `NaN`
+    /// operand propagates.
     #[must_use]
     pub fn checked_mul(&self, other: &Self) -> Option<Self> {
+        if self.is_nan() || other.is_nan() {
+            return Some(Self::nan());
+        }
         let scale = self.scale.checked_add(other.scale)?;
         if scale > MAX_SCALE {
             // Multiply then round back to MAX_SCALE so the scale stays representable.
@@ -269,6 +314,9 @@ impl Decimal {
     /// `None` on overflow (caller checks `other.is_zero()` for div-by-zero).
     #[must_use]
     pub fn checked_div(&self, other: &Self) -> Option<Self> {
+        if self.is_nan() || other.is_nan() {
+            return Some(Self::nan()); // NaN propagates (before the div-by-zero check)
+        }
         if other.mantissa == 0 {
             return None;
         }
@@ -302,9 +350,13 @@ impl Decimal {
         })
     }
 
-    /// Modulo (remainder), aligning scales. `None` on overflow / div-by-zero.
+    /// Modulo (remainder), aligning scales. `None` on overflow / div-by-zero. A `NaN` operand
+    /// propagates.
     #[must_use]
     pub fn checked_rem(&self, other: &Self) -> Option<Self> {
+        if self.is_nan() || other.is_nan() {
+            return Some(Self::nan());
+        }
         if other.mantissa == 0 {
             return None;
         }
@@ -329,6 +381,9 @@ impl Decimal {
     /// sub-`0.1`-magnitude standard deviations, whose scale exceeds 19).
     #[must_use]
     pub fn sqrt_round(&self, target_scale: u8) -> Option<Self> {
+        if self.is_nan() {
+            return Some(Self::nan());
+        }
         if self.mantissa < 0 {
             return None;
         }
@@ -377,6 +432,9 @@ impl Decimal {
         reason = "intentional lossy Numeric->f64 for mixed-type arithmetic + stats"
     )]
     pub fn to_f64(self) -> f64 {
+        if self.is_nan() {
+            return f64::NAN;
+        }
         (self.mantissa as f64) / 10f64.powi(i32::from(self.scale))
     }
 
@@ -404,6 +462,9 @@ impl Decimal {
     /// bound checks, where the value has already been rescaled to the column's scale.
     #[must_use]
     pub fn required_precision(&self) -> u32 {
+        if self.is_nan() {
+            return 0; // a NaN carries no precision and fits any NUMERIC(p, s)
+        }
         let scale = u32::from(self.scale);
         // `10^scale` as the divisor that strips the fractional part; saturate on an absurd scale
         // (which is itself an invalid declaration) rather than panic.
@@ -421,6 +482,9 @@ impl Decimal {
     /// after dropping trailing zeros (`12.340` → 2, `120` → 0, `0.000` → 0). `MIN_SCALE` (B-fn).
     #[must_use]
     pub const fn min_scale(&self) -> u8 {
+        if self.is_nan() {
+            return 0;
+        }
         let mut mantissa = self.mantissa;
         let mut scale = self.scale;
         while scale > 0 && mantissa % 10 == 0 {
@@ -434,6 +498,9 @@ impl Decimal {
     /// number at the smallest scale. `TRIM_SCALE` (B-fn).
     #[must_use]
     pub const fn trim_scale(&self) -> Self {
+        if self.is_nan() {
+            return Self::nan();
+        }
         let mut mantissa = self.mantissa;
         let mut scale = self.scale;
         while scale > 0 && mantissa % 10 == 0 {
@@ -445,10 +512,14 @@ impl Decimal {
 }
 
 /// Build a decimal from an `f64` via its shortest round-tripping decimal text, so a float literal
-/// like `19.99` lands in a NUMERIC column as the exact decimal the user wrote. `None` for
-/// non-finite values.
+/// like `19.99` lands in a NUMERIC column as the exact decimal the user wrote.
+///
+/// A float `NaN` becomes the numeric `NaN`; an infinity has no numeric form and yields `None`.
 #[must_use]
 pub fn from_f64_text(value: f64) -> Option<Decimal> {
+    if value.is_nan() {
+        return Some(Decimal::nan());
+    }
     if !value.is_finite() {
         return None;
     }

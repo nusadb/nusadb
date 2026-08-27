@@ -3870,6 +3870,7 @@ fn math_sign(v: Option<&ast::Value>) -> ast::Value {
         } else {
             x.signum()
         }),
+        Some(ast::Value::Numeric(d)) if d.is_nan() => ast::Value::Numeric(*d),
         Some(ast::Value::Numeric(d)) => {
             let s = match d.compare(&crate::numeric::Decimal::ZERO) {
                 Ordering::Less => -1,
@@ -3896,6 +3897,9 @@ fn math_floor_ceil(v: Option<&ast::Value>, ceil: bool) -> ast::Value {
 /// Round a [`crate::numeric::Decimal`] toward `+∞` (ceil) or `-∞` (floor) to a whole number.
 fn numeric_floor_ceil(d: &crate::numeric::Decimal, ceil: bool) -> ast::Value {
     use crate::numeric::Decimal;
+    if d.is_nan() {
+        return ast::Value::Numeric(*d);
+    }
     if d.scale == 0 {
         return ast::Value::Numeric(*d);
     }
@@ -3946,6 +3950,9 @@ fn math_round(vals: &[ast::Value]) -> Result<ast::Value, Error> {
 /// reference engine — the result is then a whole number (scale 0). `None` on overflow.
 fn numeric_round(d: &crate::numeric::Decimal, places: i64) -> Option<crate::numeric::Decimal> {
     use crate::numeric::Decimal;
+    if d.is_nan() {
+        return Some(*d);
+    }
     if places >= 0 {
         let target = u8::try_from(places).unwrap_or(crate::numeric::MAX_SCALE);
         return d.rescale(target);
@@ -3991,6 +3998,9 @@ fn math_trunc(vals: &[ast::Value]) -> ast::Value {
 /// absurd place count).
 fn numeric_trunc(d: &crate::numeric::Decimal, places: i64) -> ast::Value {
     use crate::numeric::Decimal;
+    if d.is_nan() {
+        return ast::Value::Numeric(*d);
+    }
     if places < 0 {
         // Drop every digit below the 10^n place (n = -places): mantissa / 10^(scale + n) * 10^n.
         let Some(shed) = u32::try_from(places.unsigned_abs())
@@ -4857,6 +4867,9 @@ fn cast_to_numeric(
     precision: u8,
     scale: u8,
 ) -> Result<crate::numeric::Decimal, Error> {
+    if d.is_nan() {
+        return Ok(d); // a NaN carries no precision/scale and fits any NUMERIC(p, s)
+    }
     if precision == 0 {
         return Ok(d);
     }
@@ -7381,6 +7394,11 @@ fn numeric_op(
     let (Some(a), Some(b)) = (to_dec(left), to_dec(right)) else {
         return Ok(ast::Value::Null);
     };
+    // A NaN operand propagates through every operator — including `NaN / 0` and `NaN % 0`, which are
+    // NaN rather than a division-by-zero error, so this precedes the zero-divisor checks below.
+    if a.is_nan() || b.is_nan() {
+        return Ok(ast::Value::Numeric(Decimal::nan()));
+    }
     let result = match op {
         Op::Plus => a.checked_add(&b).ok_or_else(overflow)?,
         Op::Minus => a.checked_sub(&b).ok_or_else(overflow)?,

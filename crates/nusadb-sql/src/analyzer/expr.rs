@@ -4474,19 +4474,23 @@ pub(super) fn coerce_unknown_literal(operand: TypedExpr, anchor: ColumnType) -> 
     }
 }
 
-/// For `INSERT`/`VALUES`: coerce a bare string literal into an integer / float / boolean column.
+/// For `INSERT`/`VALUES`: coerce a bare string literal into an integer / float / boolean / numeric
+/// column.
 ///
 /// Those types accept a text value only as an unknown literal, and for them a cast is exactly the
 /// assignment — they carry no length or padding, unlike a `BIT(n)` / `CHAR(n)` cast — so
 /// `INSERT INTO t(int_col) VALUES ('123')` stores `123` and `VALUES ('xyz')` loud-rejects at
-/// evaluation. Every other column type keeps its own assignment path: a `BIT`/temporal/range/…
-/// column already accepts a text literal through [`assignable`] with its own length/parse rules,
-/// which a cast here would wrongly relax. A non-literal operand or any other target is unchanged.
+/// evaluation. NUMERIC is included so a `'NaN'` (or any string) literal lands as a real `Numeric`
+/// in the row, not a stray `Text`: the tuple codec parses it either way, but a text-typed row value
+/// would encode a *text* index key that never matches the `Numeric` key a query builds. Every other
+/// column type keeps its own assignment path: a `BIT`/temporal/range/… column already accepts a text
+/// literal through [`assignable`] with its own length/parse rules, which a cast here would wrongly
+/// relax. A non-literal operand or any other target is unchanged.
 pub(super) fn coerce_insert_literal(typed: TypedExpr, column: ColumnType) -> TypedExpr {
     if matches!(&typed.kind, TypedExprKind::Literal(ast::Value::Text(_)))
         && matches!(
             column.physical(),
-            ColumnType::Int | ColumnType::Float | ColumnType::Bool
+            ColumnType::Int | ColumnType::Float | ColumnType::Bool | ColumnType::Numeric { .. }
         )
     {
         TypedExpr {
