@@ -90,3 +90,24 @@ SELECT d_id, (SELECT COUNT(*) FROM emp e WHERE e.e_dept = d.d_id) FROM dept d OR
 1 2
 2 1
 3 0
+
+# --- correlated scalar in the projection of a GROUP BY query ---
+# The outer column referenced by the subquery (`emp.e_dept`) is a grouping key, so the
+# correlation must bind to the group's value — not go unbound and collapse to 0 / NULL.
+query II
+SELECT e_dept, (SELECT COUNT(*) FROM emp x WHERE x.e_dept = emp.e_dept) AS c
+FROM emp GROUP BY e_dept ORDER BY e_dept NULLS LAST
+----
+1 2
+2 1
+NULL 0
+
+# Same correlation with an aggregate in the subquery, and the NULL group stays empty (NULL = NULL
+# is UNKNOWN, so its correlated count is 0 and its max is NULL).
+query II
+SELECT e_dept, (SELECT MAX(x.e_salary) FROM emp x WHERE x.e_dept = emp.e_dept) AS m
+FROM emp GROUP BY e_dept ORDER BY e_dept NULLS LAST
+----
+1 150
+2 120
+NULL NULL
