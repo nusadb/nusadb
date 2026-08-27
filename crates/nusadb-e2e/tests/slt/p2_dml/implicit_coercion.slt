@@ -1,0 +1,72 @@
+# Implicit coercion of an unknown (bare string literal) type. A string literal adopts the type of the
+# value it is compared or assigned to; a genuinely text-typed column stays a real type error, and an
+# unparseable literal loud-rejects at evaluation rather than matching or storing something wrong.
+
+# --- a string literal beside a numeric operand ---
+query I
+SELECT '1' = 1
+----
+1
+
+query I
+SELECT '2' = 1
+----
+0
+
+query I
+SELECT 1 = '1'
+----
+1
+
+# A non-numeric literal against an integer is a loud error, not a wrong match.
+statement error
+SELECT 'abc' = 1
+
+# --- DATE compared to TIMESTAMP widens to the timestamp (the date read at midnight) ---
+query I
+SELECT DATE '2024-01-01' = TIMESTAMP '2024-01-01 00:00:00'
+----
+1
+
+query I
+SELECT DATE '2024-01-01' < TIMESTAMP '2024-06-01 00:00:00'
+----
+1
+
+# --- WHERE col = <string literal> ---
+statement ok
+CREATE TABLE ic (id INT, v TEXT)
+
+statement ok
+INSERT INTO ic VALUES (1, 'a'), (2, 'b')
+
+query T
+SELECT v FROM ic WHERE id = '1'
+----
+a
+
+# A real TEXT column against an integer is still a type error — only string literals are "unknown".
+statement error
+SELECT id FROM ic WHERE v = 1
+
+statement ok
+DROP TABLE ic
+
+# --- INSERT string literals into non-text columns ---
+statement ok
+CREATE TABLE ct (a INT, b NUMERIC, c DATE, d BOOL)
+
+statement ok
+INSERT INTO ct VALUES ('123', '45.6', '2024-01-01', 'true')
+
+query ITTI
+SELECT a, b, c, d FROM ct
+----
+123  45.6  2024-01-01  1
+
+# A string that is not a valid integer loud-rejects at evaluation, not a type mismatch.
+statement error
+INSERT INTO ct(a) VALUES ('xyz')
+
+statement ok
+DROP TABLE ct

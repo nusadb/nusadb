@@ -421,6 +421,11 @@ fn slt_p2_upsert() {
 }
 
 #[test]
+fn slt_p2_implicit_coercion() {
+    run_slt("tests/slt/p2_dml/implicit_coercion.slt");
+}
+
+#[test]
 fn slt_p3_where_orderby_limit() {
     run_slt("tests/slt/p3_filter/where_orderby_limit.slt");
 }

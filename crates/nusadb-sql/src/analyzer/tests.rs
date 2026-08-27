@@ -503,9 +503,15 @@ fn insert_arity_mismatch_is_rejected() {
 }
 
 #[test]
-fn insert_type_mismatch_is_rejected() {
+fn insert_string_literal_coerces_and_bad_type_is_rejected() {
+    // A string literal is unknown-typed and adopts the INT column, so it type-checks; an unparseable
+    // value loud-rejects at *evaluation* (invalid_text_representation), not as a compile-time
+    // mismatch — matching the reference engine's implicit-coercion behavior.
+    assert!(plan("INSERT INTO users (id) VALUES ('123')", &catalog()).is_ok());
+    assert!(plan("INSERT INTO users (id) VALUES ('not an int')", &catalog()).is_ok());
+    // A genuinely non-text, non-numeric value into an INT column stays a real type mismatch.
     assert!(matches!(
-        plan("INSERT INTO users (id) VALUES ('not an int')", &catalog()),
+        plan("INSERT INTO users (id) VALUES (TRUE)", &catalog()),
         Err(Error::TypeMismatch { .. }),
     ));
 }

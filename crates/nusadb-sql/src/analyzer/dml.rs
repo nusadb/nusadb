@@ -542,6 +542,12 @@ pub(super) fn analyze_insert_value(
             column: column.name.clone(),
         });
     }
+    // A bare string literal is "unknown"-typed and adopts an integer / float / boolean target, so
+    // `INSERT INTO t(int_col) VALUES ('123')` stores `123` and `VALUES ('xyz')` loud-rejects at
+    // evaluation. (A genuinely TEXT-typed value into a non-text column still stays a real mismatch;
+    // bit / temporal / … columns already accept a text literal through their own length-checked
+    // assignment path, so they are left untouched here.)
+    let typed = super::expr::coerce_insert_literal(typed, column.ty);
     check_assignable(column, &typed)?;
     Ok(typed)
 }

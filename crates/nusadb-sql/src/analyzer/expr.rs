@@ -4435,29 +4435,66 @@ pub(super) fn comparable(a: ColumnType, b: ColumnType) -> bool {
 ///
 /// The reference engine treats a bare string literal as an *unknown* type that adopts the type of
 /// whatever it is compared against. Our literal typing pins a string literal to `TEXT`, so a
-/// comparison against a temporal / `UUID` operand — `WHERE d >= '2026-01-01'`, or the identical
-/// query with a bound `$1` (a driver sends a date/time/uuid parameter as text over the extended
-/// protocol) — would raise a spurious `TypeMismatch: expected Date, found Text`. When `anchor` is a
-/// temporal / `UUID` type and `operand` is a bare `TEXT` literal, re-type it as a cast to `anchor`,
-/// producing the exact same typed expression an explicit `'…'::date` would: the executor parses the
-/// text at evaluation, and an unparseable string still loud-rejects (never a silent wrong row).
+/// comparison against a non-text operand — `WHERE id = '1'`, `WHERE d >= '2026-01-01'`, or the
+/// identical query with a bound `$1` (a driver sends the parameter as text over the extended
+/// protocol) — would raise a spurious `TypeMismatch`. When `operand` is a bare `TEXT` literal and
+/// `anchor` is a type that accepts a text value, re-type it as a cast to `anchor`, producing the
+/// exact same typed expression an explicit `'…'::type` would: the executor parses the text at
+/// evaluation, and an unparseable string still loud-rejects (never a silent wrong row) — so
+/// `id = 'abc'` fails with the `invalid_text_representation` error, not a wrong match.
 ///
 /// Only a `TEXT` *literal* is coerced — a genuinely `TEXT`-typed column or expression versus a
-/// temporal column stays a real type error, matching the reference engine (only string literals are
-/// "unknown"). A non-temporal `anchor` (or a non-literal operand) is returned unchanged.
-fn coerce_unknown_literal(operand: TypedExpr, anchor: ColumnType) -> TypedExpr {
-    // A `VECTOR` anchor coerces a bare string literal too: `'[1,0,0]'` is the same literal form
-    // `INSERT` accepts for a `VECTOR` column, so `emb <-> '[1,0,0]'` should work without an
-    // explicit `::VECTOR(n)` — the rule must not differ between the two places the literal appears.
-    if (is_temporal_or_uuid(anchor) || matches!(anchor, ColumnType::Vector(_)))
-        && matches!(&operand.kind, TypedExprKind::Literal(ast::Value::Text(_)))
+/// non-text operand stays a real type error, matching the reference engine (only string literals are
+/// "unknown"). A non-coercible `anchor` (or a non-literal operand) is returned unchanged. Shared with
+/// the `INSERT`/`VALUES` path, where the `anchor` is the target column's type.
+pub(super) fn coerce_unknown_literal(operand: TypedExpr, anchor: ColumnType) -> TypedExpr {
+    if !matches!(&operand.kind, TypedExprKind::Literal(ast::Value::Text(_))) {
+        return operand;
+    }
+    // A temporal / `UUID` / `VECTOR` anchor keeps its exact type (`'[1,0,0]'` is the same literal form
+    // an `INSERT` accepts for a `VECTOR` column). A numeric or boolean anchor coerces to its physical
+    // type, which always has a text-parsing cast — so `int` / `smallint` / `numeric` / `real` / `bool`
+    // all accept an unknown literal, matching how the reference engine resolves it.
+    let target = if is_temporal_or_uuid(anchor) || matches!(anchor, ColumnType::Vector(_)) {
+        Some(anchor)
+    } else if matches!(
+        anchor.physical(),
+        ColumnType::Int | ColumnType::Float | ColumnType::Bool | ColumnType::Numeric { .. }
+    ) {
+        Some(anchor.physical())
+    } else {
+        None
+    };
+    match target {
+        Some(ty) => TypedExpr {
+            kind: TypedExprKind::Cast(Box::new(operand), false),
+            ty,
+        },
+        None => operand,
+    }
+}
+
+/// For `INSERT`/`VALUES`: coerce a bare string literal into an integer / float / boolean column.
+///
+/// Those types accept a text value only as an unknown literal, and for them a cast is exactly the
+/// assignment — they carry no length or padding, unlike a `BIT(n)` / `CHAR(n)` cast — so
+/// `INSERT INTO t(int_col) VALUES ('123')` stores `123` and `VALUES ('xyz')` loud-rejects at
+/// evaluation. Every other column type keeps its own assignment path: a `BIT`/temporal/range/…
+/// column already accepts a text literal through [`assignable`] with its own length/parse rules,
+/// which a cast here would wrongly relax. A non-literal operand or any other target is unchanged.
+pub(super) fn coerce_insert_literal(typed: TypedExpr, column: ColumnType) -> TypedExpr {
+    if matches!(&typed.kind, TypedExprKind::Literal(ast::Value::Text(_)))
+        && matches!(
+            column.physical(),
+            ColumnType::Int | ColumnType::Float | ColumnType::Bool
+        )
     {
         TypedExpr {
-            kind: TypedExprKind::Cast(Box::new(operand), false),
-            ty: anchor,
+            kind: TypedExprKind::Cast(Box::new(typed), false),
+            ty: column.physical(),
         }
     } else {
-        operand
+        typed
     }
 }
 
@@ -4659,9 +4696,10 @@ pub(super) fn analyze_binary(
         _ => analyze_operands(left, right, scope, catalog, aggregates)?,
     };
     // Unknown-literal coercion: on a comparison, a bare string literal adopts the other operand's
-    // temporal / UUID type, so a parameterized date filter (`WHERE d >= $1`, bound as text) type-checks
-    // exactly like the explicit `$1::date` form. A no-op for every non-comparison operator and for
-    // operands that are not a bare `TEXT` literal.
+    // type (numeric, boolean, temporal, …), so `WHERE id = '1'` or a parameterized date filter
+    // (`WHERE d >= $1`, bound as text) type-checks exactly like the explicit `'1'::int` / `$1::date`
+    // form. A no-op for every non-comparison operator and for operands that are not a bare `TEXT`
+    // literal.
     if matches!(
         op,
         ast::BinaryOp::Eq
@@ -4693,6 +4731,30 @@ pub(super) fn analyze_binary(
         }
         right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
         left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
+        // A DATE compared to a TIMESTAMP / TIMESTAMPTZ widens to that type (the date read at
+        // midnight), so `d = TIMESTAMP '…'` type-checks instead of raising a mismatch — the same
+        // implicit widening `DATE + INTERVAL` already relies on.
+        if left_typed.ty == ColumnType::Date
+            && matches!(
+                right_typed.ty,
+                ColumnType::Timestamp | ColumnType::TimestampTz
+            )
+        {
+            left_typed = TypedExpr {
+                kind: TypedExprKind::Cast(Box::new(left_typed), false),
+                ty: right_typed.ty,
+            };
+        } else if right_typed.ty == ColumnType::Date
+            && matches!(
+                left_typed.ty,
+                ColumnType::Timestamp | ColumnType::TimestampTz
+            )
+        {
+            right_typed = TypedExpr {
+                kind: TypedExprKind::Cast(Box::new(right_typed), false),
+                ty: left_typed.ty,
+            };
+        }
     }
     // The vector distance operators have only a `VECTOR <op> VECTOR` form, so a bare string literal
     // next to a `VECTOR` operand is unambiguous: coerce it to that operand's vector type, exactly
