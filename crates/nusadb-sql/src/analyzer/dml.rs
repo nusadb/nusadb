@@ -17,12 +17,16 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
     enforce_system_catalog(&ins.table, catalog)?;
     // Resolve without the RLS refusal `resolve_table` applies: a non-superuser may INSERT rows its
     // policies' WITH CHECK admit, so RLS is enforced by the `rls_check` predicate below.
-    let table =
-        super::lookup_table_ref(ins.schema.as_deref(), &ins.table, catalog)?.ok_or_else(|| {
-            Error::TableNotFound {
-                name: super::qualified_display_opt(ins.schema.as_deref(), &ins.table),
-            }
-        })?;
+    // Not a base table: an auto-updatable view rewrites onto its base table; anything else is an
+    // unknown relation.
+    let Some(table) = super::lookup_table_ref(ins.schema.as_deref(), &ins.table, catalog)? else {
+        if let Some(view) = resolve_updatable_view(ins.schema.as_deref(), &ins.table, catalog)? {
+            return insert_through_view(ins, view, catalog);
+        }
+        return Err(Error::TableNotFound {
+            name: super::qualified_display_opt(ins.schema.as_deref(), &ins.table),
+        });
+    };
     super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Insert)?;
     // `DEFAULT VALUES` names no target columns — every column is omitted and takes its DEFAULT.
     let targets = if matches!(ins.source, ast::InsertSource::DefaultValues) {
@@ -560,12 +564,15 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
     enforce_system_catalog(&upd.table, catalog)?;
     // Resolve without the RLS refusal `resolve_table` applies: a non-superuser may UPDATE the rows
     // its policies' USING grant (folded into `filter`) to values its WITH CHECK admit (`rls_check`).
-    let table =
-        super::lookup_table_ref(upd.schema.as_deref(), &upd.table, catalog)?.ok_or_else(|| {
-            Error::TableNotFound {
-                name: super::qualified_display_opt(upd.schema.as_deref(), &upd.table),
-            }
-        })?;
+    let Some(table) = super::lookup_table_ref(upd.schema.as_deref(), &upd.table, catalog)? else {
+        if let Some(view) = resolve_updatable_view(upd.schema.as_deref(), &upd.table, catalog)? {
+            let view_name = upd.table.clone();
+            return update_through_view(upd, view, &view_name, catalog);
+        }
+        return Err(Error::TableNotFound {
+            name: super::qualified_display_opt(upd.schema.as_deref(), &upd.table),
+        });
+    };
     super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Update)?;
     // A `WHERE` or `RETURNING` reads the target's rows to decide what to change or to hand back, so
     // it needs SELECT too. An unconditional `UPDATE t SET c = 1` reads nothing and needs only
@@ -693,12 +700,15 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
     // Resolve the target without the RLS refusal `resolve_table` applies: a non-superuser may
     // DELETE the rows its policies grant, so RLS is enforced by injecting a predicate below rather
     // than refusing.
-    let table =
-        super::lookup_table_ref(del.schema.as_deref(), &del.table, catalog)?.ok_or_else(|| {
-            Error::TableNotFound {
-                name: super::qualified_display_opt(del.schema.as_deref(), &del.table),
-            }
-        })?;
+    let Some(table) = super::lookup_table_ref(del.schema.as_deref(), &del.table, catalog)? else {
+        if let Some(view) = resolve_updatable_view(del.schema.as_deref(), &del.table, catalog)? {
+            let view_name = del.table.clone();
+            return delete_through_view(del, view, &view_name, catalog);
+        }
+        return Err(Error::TableNotFound {
+            name: super::qualified_display_opt(del.schema.as_deref(), &del.table),
+        });
+    };
     super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Delete)?;
     // As for UPDATE: a `WHERE` or `RETURNING` reads rows, so it additionally needs SELECT.
     if del.filter.is_some() || !del.returning.is_empty() {
@@ -945,4 +955,261 @@ fn analyze_merge_matched_action(
         },
         ast::MatchedAction::Delete => Ok(MergeMatchedAction::Delete),
     }
+}
+
+// === Updatable views =====================================================
+//
+// An INSERT/UPDATE/DELETE whose target is an *auto-updatable* view rewrites onto the view's base
+// table. A view is auto-updatable when its body is a single-table projection of plain (optionally
+// aliased) columns, optionally row-filtered, with none of the machinery — DISTINCT, GROUP BY,
+// HAVING, LIMIT/OFFSET, WITH, joins, set operations, derived tables — that makes a view read-only in
+// the reference engine.
+
+/// An auto-updatable view resolved to its base table.
+pub(super) struct UpdatableView {
+    /// The base table's explicit schema, when the view body qualified it; `None` otherwise.
+    base_schema: Option<String>,
+    /// The base table's name.
+    base_table: String,
+    /// The view's own row filter (its `WHERE`, written in terms of base columns), combined under
+    /// `AND` into an UPDATE/DELETE so the statement only affects the rows the view exposes.
+    filter: Option<ast::Expr>,
+    /// `(view output column, base column)` pairs, in projection order.
+    col_map: Vec<(String, String)>,
+}
+
+/// If `name` (optionally schema-qualified) names a non-materialized view, decide whether it is
+/// auto-updatable and, if so, return its base table + column mapping + filter. `Ok(None)` when `name`
+/// is not a view at all (the caller then reports the ordinary "table not found"). `Err` when it *is* a
+/// view but its shape is not auto-updatable.
+pub(super) fn resolve_updatable_view(
+    schema: Option<&str>,
+    name: &str,
+    catalog: &dyn Catalog,
+) -> Result<Option<UpdatableView>, Error> {
+    let Some(key) = super::view_lookup_key(schema, name, catalog)? else {
+        return Ok(None); // not a view
+    };
+    let Some(sql) = catalog.lookup_view(&key)? else {
+        return Ok(None);
+    };
+    let non_updatable = |why: &str| {
+        Error::Unsupported(format!(
+            "view `{name}` is not auto-updatable ({why}); modify its base table instead"
+        ))
+    };
+    let Ok(ast::Statement::Select(select)) = crate::parse(&sql) else {
+        return Err(non_updatable("its definition is not a plain SELECT"));
+    };
+    if select.distinct.is_some() {
+        return Err(non_updatable("it uses DISTINCT"));
+    }
+    if !matches!(&select.group_by, ast::GroupBy::Expressions(keys) if keys.is_empty()) {
+        return Err(non_updatable("it uses GROUP BY"));
+    }
+    if select.having.is_some() {
+        return Err(non_updatable("it has a HAVING clause"));
+    }
+    if select.limit.is_some() || select.offset.is_some() {
+        return Err(non_updatable("it uses LIMIT/OFFSET"));
+    }
+    if !select.with.is_empty() {
+        return Err(non_updatable("it has a WITH clause"));
+    }
+    let Some(from) = &select.from else {
+        return Err(non_updatable("it selects from no table"));
+    };
+    if !from.joins.is_empty() {
+        return Err(non_updatable("it joins more than one table"));
+    }
+    let base = &from.base;
+    if base.subquery.is_some() || base.values.is_some() || base.set_op.is_some() {
+        return Err(non_updatable(
+            "its FROM item is a derived table, not a base table",
+        ));
+    }
+    // The base must be a real table — a view over another view is not auto-updatable in this version.
+    let Some(base_table) = super::lookup_table_ref(base.schema.as_deref(), &base.name, catalog)?
+    else {
+        return Err(non_updatable("its base is not a plain table"));
+    };
+    // Every projection item must be a plain (optionally aliased) column reference; a wildcard expands
+    // to the base table's columns in order. Anything computed makes the view read-only.
+    let mut base_cols: Vec<String> = Vec::new();
+    let mut inferred_names: Vec<String> = Vec::new();
+    for item in &select.projection {
+        match item {
+            ast::SelectItem::Expr {
+                expr: ast::Expr::Column(column),
+                alias,
+            } => {
+                inferred_names.push(alias.clone().unwrap_or_else(|| column.clone()));
+                base_cols.push(column.clone());
+            },
+            ast::SelectItem::Expr {
+                expr: ast::Expr::QualifiedColumn { column, .. },
+                alias,
+            } => {
+                inferred_names.push(alias.clone().unwrap_or_else(|| column.clone()));
+                base_cols.push(column.clone());
+            },
+            ast::SelectItem::Wildcard | ast::SelectItem::QualifiedWildcard(_) => {
+                for col in &base_table.columns {
+                    inferred_names.push(col.name.clone());
+                    base_cols.push(col.name.clone());
+                }
+            },
+            ast::SelectItem::Expr { .. } => {
+                return Err(non_updatable(
+                    "a projected column is an expression, not a plain column",
+                ));
+            },
+        }
+    }
+    // An explicit `CREATE VIEW v (a, b) AS ...` column list overrides the inferred output names.
+    let declared = catalog.lookup_view_columns(&key)?;
+    let out_names = if declared.is_empty() {
+        inferred_names
+    } else if declared.len() == base_cols.len() {
+        declared
+    } else {
+        return Err(Error::Internal(format!(
+            "view `{name}` declares {} output column(s) but its body projects {}",
+            declared.len(),
+            base_cols.len()
+        )));
+    };
+    Ok(Some(UpdatableView {
+        base_schema: base.schema.clone(),
+        base_table: base.name.clone(),
+        filter: select.filter.clone(),
+        col_map: out_names.into_iter().zip(base_cols).collect(),
+    }))
+}
+
+/// Combine a statement filter with the view's own filter under `AND` (either may be absent).
+fn and_filters(stmt: Option<ast::Expr>, view: Option<ast::Expr>) -> Option<ast::Expr> {
+    match (stmt, view) {
+        (Some(a), Some(b)) => Some(ast::Expr::Binary {
+            left: Box::new(a),
+            op: ast::BinaryOp::And,
+            right: Box::new(b),
+        }),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// INSERT through an auto-updatable view: map the (view) target columns to base columns and re-run
+/// the INSERT against the base table. Column renames and column subsets are fine here — an omitted
+/// base column simply takes its default, exactly as a partial-column INSERT into the base would.
+fn insert_through_view(
+    mut ins: ast::Insert,
+    view: UpdatableView,
+    catalog: &dyn Catalog,
+) -> Result<InsertPlan, Error> {
+    if ins.on_conflict.is_some() {
+        return Err(Error::Unsupported(
+            "ON CONFLICT through a view is not supported yet".to_owned(),
+        ));
+    }
+    if !ins.returning.is_empty() {
+        return Err(Error::Unsupported(
+            "INSERT ... RETURNING through a view is not supported yet".to_owned(),
+        ));
+    }
+    let base_columns = if ins.columns.is_empty() {
+        // No column list: the target is every view column, in view order.
+        view.col_map.iter().map(|(_, base)| base.clone()).collect()
+    } else {
+        let mut mapped = Vec::with_capacity(ins.columns.len());
+        for column in &ins.columns {
+            match view.col_map.iter().find(|(view_col, _)| view_col == column) {
+                Some((_, base)) => mapped.push(base.clone()),
+                None => {
+                    return Err(Error::ColumnNotFound {
+                        table: ins.table.clone(),
+                        column: column.clone(),
+                    });
+                },
+            }
+        }
+        mapped
+    };
+    ins.schema = view.base_schema;
+    ins.table = view.base_table;
+    ins.columns = base_columns;
+    analyze_insert(ins, catalog)
+}
+
+/// A view usable as an UPDATE/DELETE target must expose *every* base column under its own name (no
+/// rename, no subset). Then the statement's own column references — which this version does not
+/// rewrite — resolve unchanged against the base table, and a reference to a column the view omits is
+/// rejected exactly as the reference engine rejects it.
+fn require_full_identity_view(
+    view: &UpdatableView,
+    view_name: &str,
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    if view.col_map.iter().any(|(out, base)| out != base) {
+        return Err(Error::Unsupported(format!(
+            "UPDATE/DELETE through view `{view_name}` that renames a column is not supported yet"
+        )));
+    }
+    let base = super::lookup_table_ref(view.base_schema.as_deref(), &view.base_table, catalog)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: view.base_table.clone(),
+        })?;
+    let exposed: HashSet<&str> = view.col_map.iter().map(|(_, base)| base.as_str()).collect();
+    if base
+        .columns
+        .iter()
+        .any(|col| !exposed.contains(col.name.as_str()))
+    {
+        return Err(Error::Unsupported(format!(
+            "UPDATE/DELETE through view `{view_name}` that exposes only some base columns is not \
+             supported yet"
+        )));
+    }
+    Ok(())
+}
+
+/// UPDATE through an auto-updatable view: retarget the base table and AND the view's filter into the
+/// WHERE so only rows the view exposes are updated.
+fn update_through_view(
+    mut upd: ast::Update,
+    view: UpdatableView,
+    view_name: &str,
+    catalog: &dyn Catalog,
+) -> Result<UpdatePlan, Error> {
+    if !upd.returning.is_empty() {
+        return Err(Error::Unsupported(
+            "UPDATE ... RETURNING through a view is not supported yet".to_owned(),
+        ));
+    }
+    require_full_identity_view(&view, view_name, catalog)?;
+    upd.filter = and_filters(upd.filter.take(), view.filter);
+    upd.schema = view.base_schema;
+    upd.table = view.base_table;
+    analyze_update(upd, catalog)
+}
+
+/// DELETE through an auto-updatable view: retarget the base table and AND the view's filter into the
+/// WHERE so only rows the view exposes are deleted.
+fn delete_through_view(
+    mut del: ast::Delete,
+    view: UpdatableView,
+    view_name: &str,
+    catalog: &dyn Catalog,
+) -> Result<DeletePlan, Error> {
+    if !del.returning.is_empty() {
+        return Err(Error::Unsupported(
+            "DELETE ... RETURNING through a view is not supported yet".to_owned(),
+        ));
+    }
+    require_full_identity_view(&view, view_name, catalog)?;
+    del.filter = and_filters(del.filter.take(), view.filter);
+    del.schema = view.base_schema;
+    del.table = view.base_table;
+    analyze_delete(del, catalog)
 }

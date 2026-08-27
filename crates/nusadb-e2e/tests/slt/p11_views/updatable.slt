@@ -1,0 +1,157 @@
+# p11_views/updatable — INSERT/UPDATE/DELETE through an auto-updatable view.
+# A view over a single base table, projecting plain columns (optionally with a row filter), rewrites
+# DML onto its base table. A view's own WHERE limits which rows an UPDATE/DELETE may touch. Views
+# with aggregation, joins, DISTINCT, GROUP BY, LIMIT, etc. are read-only.
+
+statement ok
+CREATE TABLE bt (id INT, v INT)
+
+statement ok
+CREATE VIEW bv AS SELECT id, v FROM bt
+
+# --- INSERT: positional, and a reordered explicit column list ---
+statement ok
+INSERT INTO bv VALUES (1, 10)
+
+statement ok
+INSERT INTO bv (v, id) VALUES (20, 2)
+
+query II
+SELECT id, v FROM bt ORDER BY id
+----
+1 10
+2 20
+
+# --- UPDATE and DELETE through the view reach the base rows ---
+statement ok
+UPDATE bv SET v = 99 WHERE id = 1
+
+query II
+SELECT id, v FROM bt ORDER BY id
+----
+1 99
+2 20
+
+statement ok
+DELETE FROM bv WHERE id = 2
+
+query II
+SELECT id, v FROM bt ORDER BY id
+----
+1 99
+
+# --- A row-filtered view only exposes (and so only mutates) matching rows ---
+statement ok
+CREATE TABLE t (id INT, status INT, note TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'a'), (2, 0, 'b'), (3, 1, 'c')
+
+statement ok
+CREATE VIEW av AS SELECT * FROM t WHERE status = 1
+
+# Deleting a hidden row (status = 0) affects nothing.
+statement ok
+DELETE FROM av WHERE id = 2
+
+query III
+SELECT id, status, note FROM t ORDER BY id
+----
+1 1 a
+2 0 b
+3 1 c
+
+# An unqualified UPDATE through the view only touches the visible (status = 1) rows.
+statement ok
+UPDATE av SET note = 'X'
+
+query III
+SELECT id, status, note FROM t ORDER BY id
+----
+1 1 X
+2 0 b
+3 1 X
+
+# --- INSERT accepts a column subset (omitted base columns take their default) ---
+statement ok
+CREATE TABLE w (a INT, b INT, c INT)
+
+statement ok
+CREATE VIEW sv AS SELECT a, b FROM w
+
+statement ok
+INSERT INTO sv VALUES (1, 2)
+
+query III
+SELECT a, b, c FROM w
+----
+1 2 NULL
+
+# --- INSERT through a column-renaming view maps the names ---
+statement ok
+CREATE TABLE r (a INT, b INT)
+
+statement ok
+CREATE VIEW rv AS SELECT a AS x, b AS y FROM r
+
+statement ok
+INSERT INTO rv (x, y) VALUES (7, 8)
+
+query II
+SELECT a, b FROM r
+----
+7 8
+
+# --- read-only view shapes are rejected loudly at DML time, not silently mis-applied ---
+statement ok
+CREATE VIEW agg AS SELECT status, count(*) c FROM t GROUP BY status
+
+statement error
+INSERT INTO agg VALUES (1, 5)
+
+statement ok
+CREATE VIEW dv AS SELECT DISTINCT status FROM t
+
+statement error
+INSERT INTO dv VALUES (1)
+
+# UPDATE/DELETE need the full column set under original names.
+statement error
+UPDATE sv SET a = 9
+
+statement error
+UPDATE rv SET x = 1
+
+# RETURNING through a view is not supported yet (a loud refusal, not a wrong answer).
+statement error
+INSERT INTO sv VALUES (5, 6) RETURNING a
+
+statement ok
+DROP VIEW rv
+
+statement ok
+DROP VIEW sv
+
+statement ok
+DROP VIEW dv
+
+statement ok
+DROP VIEW agg
+
+statement ok
+DROP VIEW av
+
+statement ok
+DROP VIEW bv
+
+statement ok
+DROP TABLE r
+
+statement ok
+DROP TABLE w
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE bt

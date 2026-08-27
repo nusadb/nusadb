@@ -1004,7 +1004,7 @@ thread_local! {
 /// under. An explicit qualifier names that schema; a bare name resolves like a base table — the
 /// current schema first, then the bare (`public`) name. Returns `Some(key)` only when a view actually
 /// exists under the resolved key, so a non-view name falls through to the caller's `TableNotFound`.
-fn view_lookup_key(
+pub(super) fn view_lookup_key(
     schema: Option<&str>,
     name: &str,
     catalog: &dyn Catalog,

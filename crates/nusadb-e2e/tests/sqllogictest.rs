@@ -741,6 +741,11 @@ fn slt_p11_plain_view() {
 }
 
 #[test]
+fn slt_p11_updatable_view() {
+    run_slt("tests/slt/p11_views/updatable.slt");
+}
+
+#[test]
 fn slt_p12_transactions() {
     run_slt("tests/slt/p12_txn/transactions.slt");
 }
