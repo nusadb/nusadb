@@ -129,6 +129,11 @@ pub enum Error {
     #[error("{0}")]
     PreparedStatementNotFound(String),
 
+    /// `FETCH`/`CLOSE` named a cursor this session does not hold (or that was already closed).
+    /// Reported as `34000` (`invalid_cursor_name`).
+    #[error("{0}")]
+    CursorNotFound(String),
+
     /// A statement or object hit a built-in limit: a series longer than the row cap, a view nested
     /// deeper than the engine walks, a value too large to encode. Class `54` tells a client the
     /// request must get smaller — not that it was wrong, and not that the engine broke.
@@ -570,6 +575,7 @@ impl Error {
             Self::GeneratedAlways(_) => "428C9",        // generated_always
             // invalid_sql_statement_name — the name is gone, so re-preparing is the way out.
             Self::PreparedStatementNotFound(_) => "26000",
+            Self::CursorNotFound(_) => "34000",
             // Class 25 — the transaction is not in a state that admits this statement. A pool reads
             // these to decide between "roll back and retry" and "this connection is fine".
             Self::TransactionAborted(_) => "25P02", // in_failed_sql_transaction

@@ -3165,6 +3165,92 @@ fn unsupported<T>(what: &str) -> Result<T, Error> {
     Err(Error::Unsupported(what.to_owned()))
 }
 
+/// Convert a `DECLARE ... CURSOR FOR <query>` into [`ast::Statement::DeclareCursor`]. Only the cursor
+/// form is accepted (a variable/`RESULTSET`/exception `DECLARE`, a binary cursor, or a multi-name
+/// declaration is rejected rather than silently reinterpreted).
+fn convert_declare_cursor(stmts: Vec<sql::Declare>) -> Result<ast::Statement, Error> {
+    let [declare] = <[sql::Declare; 1]>::try_from(stmts)
+        .map_err(|_| Error::Unsupported("only a single-cursor DECLARE is supported".to_owned()))?;
+    if !matches!(declare.declare_type, Some(sql::DeclareType::Cursor)) {
+        return unsupported("only DECLARE ... CURSOR is supported (a variable DECLARE is not)");
+    }
+    let [cursor_name] = declare.names.as_slice() else {
+        return unsupported("a cursor DECLARE names exactly one cursor");
+    };
+    if declare.binary == Some(true) {
+        return unsupported("DECLARE BINARY CURSOR is not supported");
+    }
+    let Some(query) = declare.for_query else {
+        return unsupported("DECLARE CURSOR requires a FOR <query> clause");
+    };
+    Ok(ast::Statement::DeclareCursor(ast::DeclareCursor {
+        name: fold_ident(cursor_name),
+        scroll: declare.scroll == Some(true),
+        hold: declare.hold == Some(true),
+        query: Box::new(query::convert_select(*query)?),
+    }))
+}
+
+/// Convert a `FETCH <direction> [FROM | IN] name` into [`ast::Statement::FetchCursor`]. The
+/// `FROM`/`IN` position keyword is cosmetic; `FETCH ... INTO` (writing rows into a target) is not
+/// modelled.
+fn convert_fetch(
+    name: &sql::Ident,
+    direction: sql::FetchDirection,
+    into: Option<&sql::ObjectName>,
+) -> Result<ast::Statement, Error> {
+    if into.is_some() {
+        return unsupported("FETCH ... INTO is not supported");
+    }
+    Ok(ast::Statement::FetchCursor(ast::FetchCursor {
+        name: fold_ident(name),
+        direction: convert_fetch_direction(direction)?,
+    }))
+}
+
+/// The integer count of a `FETCH`/`ABSOLUTE`/`RELATIVE` direction.
+fn fetch_count(value: &sql::ValueWithSpan) -> Result<i64, Error> {
+    match &value.value {
+        sql::Value::Number(n, _) => n.parse::<i64>().map_err(|_| {
+            Error::InvalidStatement(format!("FETCH count `{n}` is not a valid integer"))
+        }),
+        other => Err(Error::InvalidStatement(format!(
+            "FETCH count must be an integer, found `{other}`"
+        ))),
+    }
+}
+
+/// Convert sqlparser's fetch direction into [`ast::FetchDir`].
+fn convert_fetch_direction(direction: sql::FetchDirection) -> Result<ast::FetchDir, Error> {
+    use sql::FetchDirection as F;
+    Ok(match direction {
+        F::Count { limit } => ast::FetchDir::Count(fetch_count(&limit)?),
+        F::Next => ast::FetchDir::Next,
+        F::Prior => ast::FetchDir::Prior,
+        F::First => ast::FetchDir::First,
+        F::Last => ast::FetchDir::Last,
+        F::Absolute { limit } => ast::FetchDir::Absolute(fetch_count(&limit)?),
+        F::Relative { limit } => ast::FetchDir::Relative(fetch_count(&limit)?),
+        F::All => ast::FetchDir::All,
+        F::Forward { limit } => {
+            ast::FetchDir::Forward(limit.as_ref().map(fetch_count).transpose()?)
+        },
+        F::ForwardAll => ast::FetchDir::ForwardAll,
+        F::Backward { limit } => {
+            ast::FetchDir::Backward(limit.as_ref().map(fetch_count).transpose()?)
+        },
+        F::BackwardAll => ast::FetchDir::BackwardAll,
+    })
+}
+
+/// Convert a `CLOSE {name | ALL}` into [`ast::Statement::CloseCursor`].
+fn convert_close(cursor: sql::CloseCursor) -> ast::Statement {
+    ast::Statement::CloseCursor(match cursor {
+        sql::CloseCursor::All => ast::CloseTarget::All,
+        sql::CloseCursor::Specific { name } => ast::CloseTarget::Name(fold_ident(&name)),
+    })
+}
+
 /// Reject identifier tokens outside NusaDB's documented surface (follow-up).
 ///
 /// Parsing uses `GenericDialect` (required for the grammar extensions NusaDB models — see the
@@ -3861,6 +3947,14 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
         // `CALL name(args)` reached through the generic parser (e.g. inside a procedure body);
         // the top-level form is handled earlier by `recognize_call`.
         sql::Statement::Call(func) => convert_call_statement(func),
+        sql::Statement::Declare { stmts } => convert_declare_cursor(stmts),
+        sql::Statement::Fetch {
+            name,
+            direction,
+            into,
+            ..
+        } => convert_fetch(&name, direction, into.as_ref()),
+        sql::Statement::Close { cursor } => Ok(convert_close(cursor)),
         _ => unsupported(
             "only CREATE/DROP TABLE, INSERT, SELECT, UPDATE, DELETE, EXPLAIN, transaction \
              control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT/SET/SHOW) are supported",

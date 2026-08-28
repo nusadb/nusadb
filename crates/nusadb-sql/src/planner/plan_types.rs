@@ -354,6 +354,26 @@ pub enum LogicalPlan {
     Deallocate(crate::ast::DeallocateTarget),
     /// `COMMENT ON` — target resolved against the catalog.
     Comment(CommentPlan),
+    /// `DECLARE ... CURSOR` — the analyzed inner query, kept so the executor can materialize it.
+    DeclareCursor {
+        /// The cursor's name.
+        name: String,
+        /// `SCROLL` was requested.
+        scroll: bool,
+        /// `WITH HOLD` was requested.
+        hold: bool,
+        /// The cursor's query (a [`LogicalPlan::Select`]).
+        query: Box<Self>,
+    },
+    /// `FETCH` from an open cursor.
+    FetchCursor {
+        /// The cursor's name.
+        name: String,
+        /// The direction / count.
+        direction: crate::ast::FetchDir,
+    },
+    /// `CLOSE` an open cursor, or all of them.
+    CloseCursor(crate::ast::CloseTarget),
     /// `CREATE SCHEMA`.
     CreateSchema(CreateSchemaPlan),
     /// `DROP SCHEMA`.
@@ -2332,6 +2352,26 @@ pub enum PhysicalPlan {
     Deallocate(crate::ast::DeallocateTarget),
     /// `COMMENT ON` — target resolved; a metadata no-op at execution.
     Comment(CommentPlan),
+    /// `DECLARE ... CURSOR` — run the inner query and materialize it as a session cursor.
+    DeclareCursor {
+        /// The cursor's name.
+        name: String,
+        /// `SCROLL` was requested.
+        scroll: bool,
+        /// `WITH HOLD` was requested.
+        hold: bool,
+        /// The cursor's query plan.
+        query: Box<Self>,
+    },
+    /// `FETCH` from an open cursor.
+    FetchCursor {
+        /// The cursor's name.
+        name: String,
+        /// The direction / count.
+        direction: crate::ast::FetchDir,
+    },
+    /// `CLOSE` an open cursor, or all of them.
+    CloseCursor(crate::ast::CloseTarget),
     /// `CREATE SCHEMA`.
     CreateSchema(CreateSchemaPlan),
     /// `DROP SCHEMA`.

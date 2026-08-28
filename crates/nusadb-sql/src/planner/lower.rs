@@ -120,6 +120,21 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Analyze(p) => PhysicalPlan::Analyze(p),
         LogicalPlan::AnalyzeAll => PhysicalPlan::AnalyzeAll,
         LogicalPlan::Comment(p) => PhysicalPlan::Comment(p),
+        LogicalPlan::DeclareCursor {
+            name,
+            scroll,
+            hold,
+            query,
+        } => PhysicalPlan::DeclareCursor {
+            name,
+            scroll,
+            hold,
+            query: Box::new(plan(*query)),
+        },
+        LogicalPlan::FetchCursor { name, direction } => {
+            PhysicalPlan::FetchCursor { name, direction }
+        },
+        LogicalPlan::CloseCursor(target) => PhysicalPlan::CloseCursor(target),
         LogicalPlan::CreateSchema(p) => PhysicalPlan::CreateSchema(p),
         LogicalPlan::DropSchema(p) => PhysicalPlan::DropSchema(p),
         LogicalPlan::CreateDatabase(p) => PhysicalPlan::CreateDatabase(p),

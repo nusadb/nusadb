@@ -331,6 +331,7 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `TRUNCATE` | `TRUNCATE TABLE` |
 | `LOCK TABLE` | `LOCK TABLE` |
 | `PREPARE` / `DEALLOCATE` | `PREPARE` / `DEALLOCATE` (embedded API only — see §14) |
+| `DECLARE` / `CLOSE`, `FETCH` | `DECLARE CURSOR` / `CLOSE CURSOR` / `FETCH <rowcount>` (embedded API only — see §14) |
 | `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM` / `ANALYZE` / `COMMENT` |
 | `REINDEX` / `CHECKPOINT` | `REINDEX` / `CHECKPOINT` |
 

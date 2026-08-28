@@ -48,6 +48,7 @@ p1_ddl/create_drop.slt:84           CREATE DATABASE refused `0A000`: needs the s
 # client takes.
 p1_ddl/schema_qualified.slt:267     PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
 p5_advanced/window_filter.slt:145   PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
+p5_advanced/cursors.slt:14          DECLARE CURSOR / FETCH / CLOSE: refused `0A000` over the wire (the wire server holds no per-connection cursor state yet); handled by `Session` in-process, which the corpus pins
 
 # `SET TRANSACTION ISOLATION LEVEL` inside a transaction that has not run a statement yet: the wire
 # re-begins the engine transaction at the new level (observably equivalent, and what the SQL rule

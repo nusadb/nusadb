@@ -404,6 +404,12 @@ pub enum Statement {
     /// `COMMENT ON {TABLE | COLUMN} <object> IS {'text' | NULL}` — attach (or with
     /// `IS NULL`, clear) a human-readable description on a table or column.
     CommentOn(CommentOn),
+    /// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR <query>` — open a cursor over a query.
+    DeclareCursor(DeclareCursor),
+    /// `FETCH <direction> [FROM | IN] name` — read rows from an open cursor.
+    FetchCursor(FetchCursor),
+    /// `CLOSE {name | ALL}` — discard an open cursor, or all of them.
+    CloseCursor(CloseTarget),
 }
 
 /// Transaction characteristics for `BEGIN ...` and `SET TRANSACTION ...`.

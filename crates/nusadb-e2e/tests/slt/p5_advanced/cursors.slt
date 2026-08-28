@@ -1,0 +1,136 @@
+# p5_advanced/cursors — DECLARE ... CURSOR / FETCH / CLOSE.
+# The cursor's query is materialized at declaration (a stable snapshot), so every FETCH direction —
+# forward, backward, absolute, relative — is available. Every expected result here is what the
+# reference engine returns for the same sequence. Order matters, so no sort mode.
+#
+# Note: the `FROM` / `IN` keyword before the cursor name is required (`FETCH 2 FROM cur`).
+
+statement ok
+CREATE TABLE c (n INT)
+
+statement ok
+INSERT INTO c VALUES (1), (2), (3), (4), (5)
+
+statement ok
+DECLARE cur SCROLL CURSOR FOR SELECT n FROM c ORDER BY n
+
+# FORWARD count — stops on the last returned row.
+query I
+FETCH 2 FROM cur
+----
+1
+2
+
+query I
+FETCH NEXT FROM cur
+----
+3
+
+query I
+FETCH PRIOR FROM cur
+----
+2
+
+query I
+FETCH LAST FROM cur
+----
+5
+
+query I
+FETCH FIRST FROM cur
+----
+1
+
+query I
+FETCH ABSOLUTE 4 FROM cur
+----
+4
+
+# RELATIVE moves from the current row (row 4 -> row 5).
+query I
+FETCH RELATIVE 1 FROM cur
+----
+5
+
+# BACKWARD from row 5 comes back in reverse.
+query I
+FETCH BACKWARD 2 FROM cur
+----
+4
+3
+
+# FORWARD ALL scans from row 3 to past the last row; BACKWARD ALL then re-reads every row in reverse.
+query I
+FETCH FORWARD ALL FROM cur
+----
+4
+5
+
+query I
+FETCH BACKWARD ALL FROM cur
+----
+5
+4
+3
+2
+1
+
+# ABSOLUTE 0 sits before the first row and returns nothing.
+query I
+FETCH ABSOLUTE 0 FROM cur
+----
+
+# A count/offset past the end returns nothing; an absurd offset saturates to empty, never overflows.
+query I
+FETCH FIRST FROM cur
+----
+1
+
+query I
+FETCH RELATIVE 1000 FROM cur
+----
+
+query I
+FETCH RELATIVE 9223372036854775807 FROM cur
+----
+
+statement ok
+CLOSE cur
+
+# A closed (or never-declared) cursor is a loud error, not an empty result.
+statement error
+FETCH NEXT FROM cur
+
+statement error
+CLOSE cur
+
+# --- an empty result set fetches nothing in either direction ---
+statement ok
+DECLARE ec SCROLL CURSOR FOR SELECT n FROM c WHERE n > 99
+
+query I
+FETCH ALL FROM ec
+----
+
+query I
+FETCH BACKWARD ALL FROM ec
+----
+
+statement ok
+CLOSE ec
+
+# --- CLOSE ALL discards every open cursor ---
+statement ok
+DECLARE k1 CURSOR FOR SELECT n FROM c
+
+statement ok
+DECLARE k2 CURSOR FOR SELECT n FROM c
+
+statement ok
+CLOSE ALL
+
+statement error
+FETCH NEXT FROM k1
+
+statement ok
+DROP TABLE c

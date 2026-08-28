@@ -265,3 +265,69 @@ pub struct MergeInsert {
     /// The `VALUES (...)` row expressions.
     pub values: Vec<Expr>,
 }
+
+/// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR <query>`.
+///
+/// NusaDB materializes the query's rows at declaration (a stable snapshot) and keeps the cursor for
+/// the session, so `scroll`/`hold` are accepted for fidelity but every cursor is scrollable and
+/// holdable in practice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclareCursor {
+    /// The cursor's name.
+    pub name: String,
+    /// `SCROLL` was requested (backward fetches are always available regardless).
+    pub scroll: bool,
+    /// `WITH HOLD` was requested (every NusaDB cursor outlives its transaction regardless).
+    pub hold: bool,
+    /// The query whose rows the cursor returns.
+    pub query: Box<Select>,
+}
+
+/// `FETCH <direction> [FROM | IN] name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchCursor {
+    /// The cursor's name.
+    pub name: String,
+    /// The fetch direction / count.
+    pub direction: FetchDir,
+}
+
+/// A `FETCH`/`MOVE` direction. A positive count fetches forward, a negative one backward; the named
+/// directions position an INSENSITIVE (materialized) cursor within its row set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchDir {
+    /// `FETCH count` — `count` rows forward (backward when negative).
+    Count(i64),
+    /// `FETCH NEXT` — the next row.
+    Next,
+    /// `FETCH PRIOR` — the previous row.
+    Prior,
+    /// `FETCH FIRST` — the first row.
+    First,
+    /// `FETCH LAST` — the last row.
+    Last,
+    /// `FETCH ABSOLUTE n` — the n-th row (1-based; negative counts from the end; 0 positions before
+    /// the first row and returns nothing).
+    Absolute(i64),
+    /// `FETCH RELATIVE n` — the row `n` positions from the current one.
+    Relative(i64),
+    /// `FETCH ALL` — every remaining row forward.
+    All,
+    /// `FETCH FORWARD [count]` — `count` rows forward (all remaining when `None`).
+    Forward(Option<i64>),
+    /// `FETCH FORWARD ALL` — every remaining row forward.
+    ForwardAll,
+    /// `FETCH BACKWARD [count]` — `count` rows backward (all remaining when `None`).
+    Backward(Option<i64>),
+    /// `FETCH BACKWARD ALL` — every remaining row backward.
+    BackwardAll,
+}
+
+/// The target of a `CLOSE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTarget {
+    /// `CLOSE ALL` — close every open cursor.
+    All,
+    /// `CLOSE name` — close one cursor.
+    Name(String),
+}

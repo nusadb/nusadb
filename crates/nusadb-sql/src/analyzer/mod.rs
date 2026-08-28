@@ -842,6 +842,22 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         },
         ast::Statement::Deallocate(target) => Ok(LogicalPlan::Deallocate(target)),
         ast::Statement::CommentOn(c) => analyze_comment(c, catalog).map(LogicalPlan::Comment),
+        // A cursor's query is analyzed now (as the reference engine does at DECLARE); the executor
+        // materializes it into a session cursor. FETCH/CLOSE only carry the cursor name.
+        ast::Statement::DeclareCursor(declare) => {
+            let query = select::analyze_select(*declare.query, catalog)?;
+            Ok(LogicalPlan::DeclareCursor {
+                name: declare.name,
+                scroll: declare.scroll,
+                hold: declare.hold,
+                query: Box::new(LogicalPlan::Select(Box::new(query))),
+            })
+        },
+        ast::Statement::FetchCursor(fetch) => Ok(LogicalPlan::FetchCursor {
+            name: fetch.name,
+            direction: fetch.direction,
+        }),
+        ast::Statement::CloseCursor(target) => Ok(LogicalPlan::CloseCursor(target)),
     }
 }
 

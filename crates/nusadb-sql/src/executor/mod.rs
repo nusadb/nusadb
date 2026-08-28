@@ -121,6 +121,8 @@ pub enum RowsCommand {
     Update,
     /// A `DELETE ... RETURNING`: the tag is `DELETE N`.
     Delete,
+    /// A `FETCH` from a cursor: the tag is `FETCH N`.
+    Fetch,
 }
 
 /// The outcome of executing a single SQL statement.
@@ -215,6 +217,10 @@ pub enum ExecutionResult {
     Prepared,
     /// `DEALLOCATE` — one or all prepared statements were discarded.
     Deallocated,
+    /// `DECLARE ... CURSOR` — a cursor was opened in the session.
+    CursorDeclared,
+    /// `CLOSE` — one or all cursors were discarded.
+    CursorClosed,
     /// `CREATE SCHEMA` succeeded (or `IF NOT EXISTS` made it a no-op).
     SchemaCreated,
     /// `DROP SCHEMA` succeeded (or `IF EXISTS` made it a no-op).
@@ -841,6 +847,10 @@ pub struct Session<'engine> {
     /// Statements prepared in this session via `PREPARE`, keyed by name. Re-analyzed and run
     /// on `EXECUTE` with the supplied arguments bound to their `$n` placeholders.
     prepared: HashMap<String, PreparedStatement>,
+    /// Cursors opened in this session via `DECLARE ... CURSOR`, keyed by name. Each holds the query's
+    /// rows materialized at declaration (a stable snapshot) and a position; `FETCH` reads from it and
+    /// `CLOSE` discards it. Cursors are session-lived — every NusaDB cursor behaves like `WITH HOLD`.
+    cursors: HashMap<String, Cursor>,
     /// Result cache: maps `(user, plan)` to the data-version it was computed at plus its
     /// rows. A cached entry is served only in auto-commit, only while the engine's `data_version` is
     /// unchanged (any committed write invalidates every entry), and only for non-volatile plans —
@@ -862,6 +872,140 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 struct PreparedStatement {
     statement: ast::Statement,
     param_count: usize,
+}
+
+/// A cursor opened by `DECLARE ... CURSOR`: the query's rows materialized at declaration plus a
+/// scan position. Materializing up front gives a stable snapshot (an INSENSITIVE cursor) and makes
+/// every direction — including backward — a simple index move.
+struct Cursor {
+    /// The output column names.
+    columns: Vec<String>,
+    /// Every row of the cursor's query, captured at `DECLARE`.
+    rows: Vec<Row>,
+    /// The last-returned row index: `-1` before the first row, `i` on row `i` (`0`-based), and
+    /// `rows.len()` after the last row.
+    pos: i64,
+}
+
+impl Cursor {
+    /// The row count as a signed index bound (a materialized cursor never holds more than `i64::MAX`
+    /// rows).
+    fn len(&self) -> i64 {
+        i64::try_from(self.rows.len()).unwrap_or(i64::MAX)
+    }
+
+    /// The row at signed 0-based index `idx`, cloned; `None` when `idx` is outside `0..len`.
+    fn clone_row(&self, idx: i64) -> Option<Row> {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|i| self.rows.get(i))
+            .cloned()
+    }
+
+    /// Step forward up to `count` rows, stopping (positioned after the last row) at the end.
+    fn forward(&mut self, count: i64) -> Vec<Row> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            if let Some(row) = self.clone_row(self.pos + 1) {
+                self.pos += 1;
+                out.push(row);
+            } else {
+                self.pos = self.len();
+                break;
+            }
+        }
+        out
+    }
+
+    /// Step backward up to `count` rows (nearest-first), stopping (positioned before the first row)
+    /// at the start.
+    fn backward(&mut self, count: i64) -> Vec<Row> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            if let Some(row) = self.clone_row(self.pos - 1) {
+                self.pos -= 1;
+                out.push(row);
+            } else {
+                self.pos = -1;
+                break;
+            }
+        }
+        out
+    }
+
+    /// Every remaining row forward; the cursor ends up *after* the last row (unlike a count fetch,
+    /// which stops *on* its last returned row).
+    fn forward_all(&mut self) -> Vec<Row> {
+        let mut out = Vec::new();
+        while let Some(row) = self.clone_row(self.pos + 1) {
+            self.pos += 1;
+            out.push(row);
+        }
+        self.pos = self.len();
+        out
+    }
+
+    /// Every remaining row backward (nearest-first); the cursor ends up before the first row.
+    fn backward_all(&mut self) -> Vec<Row> {
+        let mut out = Vec::new();
+        while let Some(row) = self.clone_row(self.pos - 1) {
+            self.pos -= 1;
+            out.push(row);
+        }
+        self.pos = -1;
+        out
+    }
+
+    /// Land on signed 0-based index `idx`, returning that one row (or nothing when out of range).
+    fn land(&mut self, idx: i64) -> Vec<Row> {
+        if let Some(row) = self.clone_row(idx) {
+            self.pos = idx;
+            vec![row]
+        } else {
+            self.pos = if idx < 0 { -1 } else { self.len() };
+            Vec::new()
+        }
+    }
+
+    /// `ABSOLUTE n`: 1-based from the start, or from the end when negative; `0` sits before the first
+    /// row and returns nothing.
+    fn absolute(&mut self, n: i64) -> Vec<Row> {
+        match n.cmp(&0) {
+            std::cmp::Ordering::Greater => self.land(n - 1),
+            std::cmp::Ordering::Less => self.land(self.len() + n),
+            std::cmp::Ordering::Equal => {
+                self.pos = -1;
+                Vec::new()
+            },
+        }
+    }
+
+    /// Apply a `FETCH` direction, returning the rows it yields and advancing the position. Backward
+    /// directions yield rows in reverse (nearest-first), matching the reference engine.
+    fn fetch(&mut self, direction: ast::FetchDir) -> Vec<Row> {
+        use ast::FetchDir as D;
+        let last = self.len() - 1;
+        match direction {
+            D::Next | D::Forward(None) => self.forward(1),
+            D::Prior | D::Backward(None) => self.backward(1),
+            D::First => self.land(0),
+            D::Last => self.land(last),
+            D::All | D::ForwardAll => self.forward_all(),
+            D::BackwardAll => self.backward_all(),
+            D::Count(n) | D::Forward(Some(n)) if n >= 0 => self.forward(n),
+            // A negative `FETCH n` / `FETCH FORWARD n` counts backward, like the reference engine.
+            // `saturating_neg` keeps `n == i64::MIN` from overflowing (a scan that big stops at the
+            // start long before the count is reached anyway).
+            D::Count(n) | D::Forward(Some(n)) => self.backward(n.saturating_neg()),
+            D::Backward(Some(n)) if n >= 0 => self.backward(n),
+            D::Backward(Some(n)) => self.forward(n.saturating_neg()),
+            D::Absolute(n) => self.absolute(n),
+            // `RELATIVE n`: `n` positions from the current row; `0` re-reads the current row.
+            // `saturating_add` turns an absurd offset into a past-the-end/before-the-start landing
+            // (empty), rather than an arithmetic overflow.
+            D::Relative(n) => self.land(self.pos.saturating_add(n)),
+        }
+    }
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -946,6 +1090,7 @@ impl<'engine> Session<'engine> {
             current_database: "nusadb".to_owned(),
             current_schema: "public".to_owned(),
             prepared: HashMap::new(),
+            cursors: HashMap::new(),
             result_cache: HashMap::new(),
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             temp_schema_created: false,
@@ -1090,6 +1235,23 @@ impl<'engine> Session<'engine> {
                 .map(|()| ExecutionResult::CheckpointDone)
                 .map_err(Into::into),
             PhysicalPlan::Execute { name, args } => self.execute_prepared(&name, &args),
+            // Cursors live in the session (like prepared statements): DECLARE materializes the query,
+            // FETCH reads from the stored snapshot, CLOSE discards it.
+            PhysicalPlan::DeclareCursor { name, query, .. } => self.declare_cursor(name, *query),
+            PhysicalPlan::FetchCursor { name, direction } => self.fetch_cursor(&name, direction),
+            PhysicalPlan::CloseCursor(target) => {
+                match target {
+                    ast::CloseTarget::All => self.cursors.clear(),
+                    ast::CloseTarget::Name(name) => {
+                        if self.cursors.remove(&name).is_none() {
+                            return Err(Error::CursorNotFound(format!(
+                                "cursor \"{name}\" does not exist"
+                            )));
+                        }
+                    },
+                }
+                Ok(ExecutionResult::CursorClosed)
+            },
             PhysicalPlan::Deallocate(target) => {
                 match target {
                     ast::DeallocateTarget::All => self.prepared.clear(),
@@ -1193,6 +1355,47 @@ impl<'engine> Session<'engine> {
         }
         let bound = crate::params::substitute_values(statement, args)?;
         self.run_substituted(bound)
+    }
+
+    /// `DECLARE ... CURSOR`: run the query now (in this session's transaction context) and store its
+    /// rows as a session cursor positioned before the first row. A same-named cursor is replaced.
+    fn declare_cursor(
+        &mut self,
+        name: String,
+        query: PhysicalPlan,
+    ) -> Result<ExecutionResult, Error> {
+        let ExecutionResult::Rows { columns, rows, .. } = self.run_within_txn(query)? else {
+            return Err(Error::Internal(
+                "a cursor's query did not produce a row set".to_owned(),
+            ));
+        };
+        self.cursors.insert(
+            name,
+            Cursor {
+                columns,
+                rows,
+                pos: -1,
+            },
+        );
+        Ok(ExecutionResult::CursorDeclared)
+    }
+
+    /// `FETCH`: read rows from an open cursor, advancing its position.
+    fn fetch_cursor(
+        &mut self,
+        name: &str,
+        direction: ast::FetchDir,
+    ) -> Result<ExecutionResult, Error> {
+        let cursor = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))?;
+        let rows = cursor.fetch(direction);
+        Ok(ExecutionResult::Rows {
+            columns: cursor.columns.clone(),
+            rows,
+            command: RowsCommand::Fetch,
+        })
     }
 
     /// Analyze and execute a bound statement (from `EXECUTE`) in this session's transaction context,
@@ -1704,6 +1907,10 @@ fn stream_select_rows(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat arm per PhysicalPlan variant; length tracks the plan grammar, not complexity"
+)]
 fn dispatch(
     plan: PhysicalPlan,
     engine: &dyn StorageEngine,
@@ -1833,6 +2040,14 @@ fn dispatch(
              statement with the wire protocol's extended query messages; an embedded caller uses \
              `Session::execute`, which holds the statement store these need)"
                 .to_owned(),
+        )),
+        // Cursors are per-session state, handled in `Session::execute` before dispatch; the
+        // stateless dispatch path (and the wire server, which is not yet cursor-aware) cannot hold
+        // them.
+        PhysicalPlan::DeclareCursor { .. }
+        | PhysicalPlan::FetchCursor { .. }
+        | PhysicalPlan::CloseCursor(_) => Err(Error::Unsupported(
+            "DECLARE CURSOR / FETCH / CLOSE are not yet supported on this connection".to_owned(),
         )),
     }
 }
@@ -2331,6 +2546,16 @@ fn format_plan(
             crate::ast::DeallocateTarget::Name(name) => {
                 vec![format!("{indent}Deallocate: {name}")]
             },
+        },
+        PhysicalPlan::DeclareCursor { name, query, .. } => {
+            let mut out = vec![format!("{indent}DeclareCursor: {name}")];
+            out.extend(format_plan(query, depth + 1, ctx, actuals, engine, txn));
+            out
+        },
+        PhysicalPlan::FetchCursor { name, .. } => vec![format!("{indent}Fetch: {name}")],
+        PhysicalPlan::CloseCursor(target) => match target {
+            crate::ast::CloseTarget::All => vec![format!("{indent}Close: ALL")],
+            crate::ast::CloseTarget::Name(name) => vec![format!("{indent}Close: {name}")],
         },
         PhysicalPlan::Comment(p) => {
             let target = p

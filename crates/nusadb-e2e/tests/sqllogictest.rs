@@ -235,6 +235,8 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::TableLocked
         | ExecutionResult::Prepared
         | ExecutionResult::Deallocated
+        | ExecutionResult::CursorDeclared
+        | ExecutionResult::CursorClosed
         | ExecutionResult::Reindexed
         | ExecutionResult::CheckpointDone
         | ExecutionResult::MaterializedViewCreated
@@ -503,6 +505,11 @@ fn slt_p4_sum_bigint_precision() {
 #[test]
 fn slt_p5_alter_table() {
     run_slt("tests/slt/p5_advanced/alter_table.slt");
+}
+
+#[test]
+fn slt_p5_cursors() {
+    run_slt("tests/slt/p5_advanced/cursors.slt");
 }
 
 #[test]
