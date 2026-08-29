@@ -247,6 +247,37 @@ pub trait Catalog {
         Ok(true)
     }
 
+    /// Whether the session may access `column` of table `object` with `privilege` — a table-wide
+    /// grant, ownership, superuser, or a column-scoped grant on exactly this column. The default is
+    /// **fail-closed** (`false`): a catalog that enforces nothing keeps the permissive
+    /// [`Self::has_privilege`] default (`true`), which short-circuits before this method is ever
+    /// reached, so only a catalog that *does* enforce table privileges gets here — and for such a
+    /// catalog "no explicit column grant ⇒ deny" is the security-correct answer. Returning `true`
+    /// here would let an enforcing catalog that forgot to override this method fail open.
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        let _ = (object, column, privilege);
+        Ok(false)
+    }
+
+    /// Whether the session may access *at least one* column of table `object` with `privilege` — the
+    /// gate that brings a table into scope when the session lacks the table-wide privilege but holds
+    /// some column-scoped one. **Fail-closed** default (`false`) for the same reason as
+    /// [`Self::has_column_privilege`]: a permissive catalog never reaches it (the table-wide check
+    /// admits first), so returning `true` here would only ever fail an enforcing catalog open.
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        let _ = (object, privilege);
+        Ok(false)
+    }
+
     /// Whether the session may pass `privilege` on to another role — ownership, superuser, or a
     /// grant carrying the grant option.
     fn may_grant_object(
@@ -1570,6 +1601,11 @@ pub(crate) struct ScopedColumn {
     /// and reject comparing two different enum types. Populated only for base-table columns in a
     /// `SELECT` scope, like [`Self::composite_type`].
     enum_type: Option<String>,
+    /// Whether the session may `SELECT` this column: `true` unless it is a base-table column the
+    /// session may read only through a column-scoped grant that this specific column lacks. Referencing
+    /// a `false` column (or expanding it via `*`) is a permission error. `true` for every derived
+    /// column (CTE, projection, `VALUES`) and whenever the session holds table-wide SELECT.
+    select_granted: bool,
 }
 
 /// Build the scope for a single table (the common, non-join case).
@@ -1581,13 +1617,25 @@ fn scope_of(table: &TableSchema) -> Vec<ScopedColumn> {
 /// name (from the per-column composite catalog) so `(col).field` and composite comparisons can
 /// recognise a composite column whose physical type is `TEXT`. A non-composite column carries
 /// `None`. Used for the `FROM` base and each joined table of a `SELECT`.
+///
+/// `gate_columns` applies the per-column SELECT check: `true` for a real base table (whose read the
+/// caller has already admitted with [`dcl::require_read_access`]), `false` for an inlined relation
+/// (a view, CTE, or `information_schema` view), whose column reads were authorized when its body was
+/// analyzed — re-gating them against a grant on the *view* object would wrongly deny a role that may
+/// read the base table but was never granted the view itself.
 pub(crate) fn base_scope(
     table: &TableSchema,
     qualifier: &str,
     catalog: &dyn Catalog,
+    gate_columns: bool,
 ) -> Result<Vec<ScopedColumn>, Error> {
+    let select_grants = if gate_columns {
+        column_select_grants(table, catalog)?
+    } else {
+        vec![true; table.columns.len()]
+    };
     let mut out = Vec::with_capacity(table.columns.len());
-    for def in &table.columns {
+    for (def, select_granted) in table.columns.iter().zip(select_grants) {
         let composite_type =
             catalog.lookup_composite_column(&table.schema, &table.name, &def.name)?;
         // An enum column's physical type is `Enum` (not `TEXT`), but the type name lives in the
@@ -1603,9 +1651,31 @@ pub(crate) fn base_scope(
             qualified_only: false,
             composite_type,
             enum_type,
+            select_granted,
         });
     }
     Ok(out)
+}
+
+/// Per-column SELECT reachability for a base table, parallel to `table.columns`: `true` for every
+/// column when the session holds table-wide SELECT (or owns it / is a superuser), otherwise the
+/// per-column column-scoped SELECT grant. The common full-access path pays a single table check.
+fn column_select_grants(table: &TableSchema, catalog: &dyn Catalog) -> Result<Vec<bool>, Error> {
+    let object = format!("{}.{}", table.schema, table.name);
+    if catalog.is_superuser()
+        || catalog.has_privilege(
+            crate::ast::ObjectKind::Table,
+            &object,
+            crate::ast::Privilege::Select,
+        )?
+    {
+        return Ok(vec![true; table.columns.len()]);
+    }
+    table
+        .columns
+        .iter()
+        .map(|c| catalog.has_column_privilege(&object, &c.name, crate::ast::Privilege::Select))
+        .collect()
 }
 
 /// Like [`scope_of`] but with an explicit `qualifier` (an alias) for the columns — for the secondary
@@ -1623,6 +1693,9 @@ pub(crate) fn scope_of_aliased(table: &TableSchema, qualifier: &str) -> Vec<Scop
             // DML-target builder has no catalog, so composite field access there is not resolved.
             composite_type: None,
             enum_type: None,
+            // The UPDATE/DELETE target's own reads are gated table-wide (see `analyze_update`), not
+            // per column, so the target scope is always selectable here.
+            select_granted: true,
         })
         .collect()
 }
@@ -1720,6 +1793,14 @@ fn resolve_scoped(
         if found.is_some() {
             return Err(Error::AmbiguousColumn(format!(
                 "ambiguous column reference `{name}` — qualify it with a table name"
+            )));
+        }
+        // Column-scoped SELECT: a base-table column the session may not read (no table-wide SELECT
+        // and no column grant on this column) is a permission error, not a silently-dropped column.
+        if !col.select_granted {
+            return Err(Error::PermissionDenied(format!(
+                "SELECT on column `{name}` of table `{}`",
+                col.qualifier
             )));
         }
         // A column *reference* carries its expression type: `VARCHAR(n)`/`CHAR(n)` behave as `TEXT`

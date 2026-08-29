@@ -135,6 +135,8 @@ fn create_table_scope(ct: &ast::CreateTable) -> Vec<ScopedColumn> {
             // for this column exists, so field access is not resolved here.
             composite_type: None,
             enum_type: None,
+            // Not a user `SELECT` read of a base table, so column-scoped SELECT never gates it.
+            select_granted: true,
         })
         .collect()
 }
@@ -226,6 +228,8 @@ fn resolve_column_defaults(
             // for this column exists, so field access is not resolved here.
             composite_type: None,
             enum_type: None,
+            // Not a user `SELECT` read of a base table, so column-scoped SELECT never gates it.
+            select_granted: true,
         })
         .collect();
     let mut defaults = Vec::new();

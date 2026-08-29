@@ -267,6 +267,31 @@ impl Catalog for RecordingCatalog<'_> {
             .push((kind, object.to_owned(), privilege, allowed));
         Ok(allowed)
     }
+
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        // A column-scoped decision is not version-tracked (a `REVOKE SELECT (col)` moves no schema
+        // version), and the per-column check is only reached by a column-restricted session — the
+        // uncommon case. Rather than record and re-verify each column, mark the plan uncached so a
+        // later run re-enforces from the live grants. A session with table-wide access never reaches
+        // here, so the common path keeps full caching.
+        self.saw_unversioned_dep.set(true);
+        self.inner.has_column_privilege(object, column, privilege)
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        self.saw_unversioned_dep.set(true);
+        self.inner.has_any_column_privilege(object, privilege)
+    }
+
     fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
         // Ownership gates DROP/ALTER (never cached), but a cacheable read can consult it too;
         // capture it and re-verify on reuse, like `has_privilege`.

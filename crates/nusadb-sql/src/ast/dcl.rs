@@ -254,11 +254,26 @@ impl Grantee {
 /// The reserved catalog name standing for "every role".
 pub const PUBLIC_GRANTEE: &str = "public";
 
+/// A privilege scoped to specific columns of a table: `SELECT (a, b)` / `UPDATE (c)`.
+///
+/// Only `SELECT`, `INSERT`, `UPDATE`, and `REFERENCES` may be column-scoped (the privileges that act
+/// on individual columns); the parser rejects a column list on any other privilege.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnPrivilege {
+    /// The privilege held on the listed columns.
+    pub privilege: Privilege,
+    /// The columns it applies to; always non-empty.
+    pub columns: Vec<String>,
+}
+
 /// `GRANT privileges ON objects TO grantees [WITH GRANT OPTION]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
-    /// The privileges being granted; `None` means `ALL PRIVILEGES`, expanded per object kind.
+    /// The table-wide privileges being granted; `None` means `ALL PRIVILEGES`, expanded per object
+    /// kind. `Some(empty)` when the statement grants only column-scoped privileges.
     pub privileges: Option<Vec<Privilege>>,
+    /// Column-scoped privileges (`GRANT SELECT (a, b) ...`); empty for a purely table-wide grant.
+    pub column_privileges: Vec<ColumnPrivilege>,
     /// The objects the privileges apply to.
     pub targets: GrantTargets,
     /// Who receives them.
@@ -270,8 +285,10 @@ pub struct Grant {
 /// `REVOKE [GRANT OPTION FOR] privileges ON objects FROM grantees [CASCADE | RESTRICT]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revoke {
-    /// The privileges being revoked; `None` means `ALL PRIVILEGES`.
+    /// The table-wide privileges being revoked; `None` means `ALL PRIVILEGES`.
     pub privileges: Option<Vec<Privilege>>,
+    /// Column-scoped privileges to revoke (`REVOKE SELECT (a) ...`); empty for a table-wide revoke.
+    pub column_privileges: Vec<ColumnPrivilege>,
     /// The objects to revoke on.
     pub targets: GrantTargets,
     /// Who loses them.

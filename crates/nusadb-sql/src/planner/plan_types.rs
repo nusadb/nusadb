@@ -888,6 +888,8 @@ pub enum GrantTargetsPlan {
 pub struct GrantPlan {
     /// Privileges to grant; `None` is `ALL PRIVILEGES`, expanded per object kind at execution.
     pub privileges: Option<Vec<crate::ast::Privilege>>,
+    /// Column-scoped privileges to grant (each validated to exist on the target tables).
+    pub column_privileges: Vec<crate::ast::ColumnPrivilege>,
     /// The objects the privileges apply to.
     pub targets: GrantTargetsPlan,
     /// Who receives them.
@@ -901,6 +903,8 @@ pub struct GrantPlan {
 pub struct RevokePlan {
     /// Privileges to revoke; `None` is `ALL PRIVILEGES`.
     pub privileges: Option<Vec<crate::ast::Privilege>>,
+    /// Column-scoped privileges to revoke.
+    pub column_privileges: Vec<crate::ast::ColumnPrivilege>,
     /// The objects to revoke on.
     pub targets: GrantTargetsPlan,
     /// Who loses them.

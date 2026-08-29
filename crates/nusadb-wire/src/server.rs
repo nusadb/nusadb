@@ -4456,6 +4456,25 @@ impl Catalog for EngineCatalog<'_> {
             .has_privilege(self.engine, self.txn, kind, object, privilege)
     }
 
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.resolved()?
+            .has_column_privilege(self.engine, self.txn, object, column, privilege)
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.resolved()?
+            .has_any_column_privilege(self.engine, self.txn, object, privilege)
+    }
+
     fn may_grant_object(
         &self,
         kind: nusadb_sql::ast::ObjectKind,

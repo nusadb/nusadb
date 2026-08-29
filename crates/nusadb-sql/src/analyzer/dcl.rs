@@ -61,6 +61,64 @@ pub(super) fn require_table_privilege(
     require_privilege(catalog, ObjectKind::Table, &object, privilege)
 }
 
+/// Gate a table into a `SELECT` read scope: the session needs table-wide SELECT, ownership, superuser,
+/// or a column-scoped SELECT grant on *some* column. Passing this gate only admits the table; the
+/// per-column [`ScopedColumn`] flag then denies a reference to a column the session may not read (so
+/// `SELECT count(*)` works with any column grant, but `SELECT secret` still fails). A session with no
+/// SELECT of any kind gets the ordinary table-level denial.
+pub(super) fn require_read_access(
+    catalog: &dyn Catalog,
+    table: &nusadb_core::TableSchema,
+) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    let object = format!("{}.{}", table.schema, table.name);
+    if catalog.has_privilege(ObjectKind::Table, &object, Privilege::Select)?
+        || catalog.has_any_column_privilege(&object, Privilege::Select)?
+    {
+        return Ok(());
+    }
+    // Neither table-wide nor any column-scoped SELECT — the standard table-level denial.
+    require_privilege(catalog, ObjectKind::Table, &object, Privilege::Select)
+}
+
+/// Require `privilege` on `columns` of `table`: a table-wide grant covers them all, otherwise every
+/// named column must carry a column-scoped grant. Fail-closed — an empty column list (a statement
+/// that acts on the table but names no column, like `INSERT ... DEFAULT VALUES`) can only be
+/// satisfied table-wide, never by a column grant. Used for the column-scoped privileges (`SELECT`,
+/// `INSERT`, `UPDATE`, `REFERENCES`).
+pub(super) fn require_column_privilege(
+    catalog: &dyn Catalog,
+    table: &nusadb_core::TableSchema,
+    columns: &[&str],
+    privilege: Privilege,
+) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    let object = format!("{}.{}", table.schema, table.name);
+    // A table-wide grant (or ownership, via `has_privilege`) covers every column.
+    if catalog.has_privilege(ObjectKind::Table, &object, privilege)? {
+        return Ok(());
+    }
+    if columns.is_empty() {
+        return Err(Error::PermissionDenied(format!(
+            "{} on table `{object}`",
+            privilege.as_str()
+        )));
+    }
+    for column in columns {
+        if !catalog.has_column_privilege(&object, column, privilege)? {
+            return Err(Error::PermissionDenied(format!(
+                "{} on column `{column}` of table `{object}`",
+                privilege.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Raise the ownership check that `DROP` / `ALTER` on a table requires.
 ///
 /// These are not grantable privileges in the SQL standard and are not modelled as ones here:
@@ -298,6 +356,71 @@ fn check_may_grant(
     Ok(())
 }
 
+/// Resolve a `GRANT`/`REVOKE` target's canonical (`schema.table` or bare) name to its table schema.
+fn lookup_grant_table(
+    catalog: &dyn Catalog,
+    canonical: &str,
+) -> Result<nusadb_core::TableSchema, Error> {
+    let table = match canonical.split_once('.') {
+        Some((schema, name)) => catalog.lookup_table_in(schema, name)?,
+        None => catalog.lookup_table(canonical)?,
+    };
+    table.ok_or_else(|| Error::TableNotFound {
+        name: canonical.to_owned(),
+    })
+}
+
+/// Validate the column-scoped privileges of a `GRANT`/`REVOKE`: they apply only to named tables, each
+/// named column must exist, and the session must have the authority to pass the privilege on (the
+/// same `may_grant` authority a table-wide grant needs). Empty is a no-op.
+fn check_column_privileges(
+    catalog: &dyn Catalog,
+    column_privileges: &[ast::ColumnPrivilege],
+    targets: &GrantTargetsPlan,
+) -> Result<(), Error> {
+    if column_privileges.is_empty() {
+        return Ok(());
+    }
+    let GrantTargetsPlan::Objects(objects) = targets else {
+        return Err(Error::InvalidStatement(
+            "column-scoped privileges apply only to named tables, not an `ALL ... IN SCHEMA` form"
+                .to_owned(),
+        ));
+    };
+    for object in objects {
+        if object.kind != ObjectKind::Table {
+            return Err(Error::InvalidStatement(format!(
+                "column-scoped privileges apply only to tables, not a {}",
+                object.kind.noun()
+            )));
+        }
+        let table = lookup_grant_table(catalog, &object.name)?;
+        for column_privilege in column_privileges {
+            for column in &column_privilege.columns {
+                if !table.columns.iter().any(|c| &c.name == column) {
+                    return Err(Error::ColumnNotFound {
+                        table: object.name.clone(),
+                        column: column.clone(),
+                    });
+                }
+            }
+            if !catalog.may_grant_object(
+                ObjectKind::Table,
+                &object.name,
+                column_privilege.privilege,
+            )? {
+                return Err(Error::PermissionDenied(format!(
+                    "cannot grant {privilege} on columns of table `{name}` — the session neither \
+                     owns it nor holds that privilege WITH GRANT OPTION",
+                    privilege = column_privilege.privilege.as_str(),
+                    name = object.name,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Analyze `GRANT privileges ON objects TO grantees`.
 ///
 /// # Errors
@@ -306,9 +429,11 @@ pub(super) fn analyze_grant(g: ast::Grant, catalog: &dyn Catalog) -> Result<Gran
     let targets = resolve_targets(catalog, g.targets)?;
     check_privileges_apply(g.privileges.as_ref(), &targets)?;
     check_may_grant(catalog, g.privileges.as_ref(), &targets)?;
+    check_column_privileges(catalog, &g.column_privileges, &targets)?;
     require_known_grantees(catalog, &g.grantees)?;
     Ok(GrantPlan {
         privileges: g.privileges,
+        column_privileges: g.column_privileges,
         targets,
         grantees: g.grantees,
         with_grant_option: g.with_grant_option,
@@ -326,8 +451,10 @@ pub(super) fn analyze_revoke(r: ast::Revoke, catalog: &dyn Catalog) -> Result<Re
     let targets = resolve_targets(catalog, r.targets)?;
     check_privileges_apply(r.privileges.as_ref(), &targets)?;
     check_may_grant(catalog, r.privileges.as_ref(), &targets)?;
+    check_column_privileges(catalog, &r.column_privileges, &targets)?;
     Ok(RevokePlan {
         privileges: r.privileges,
+        column_privileges: r.column_privileges,
         targets,
         grantees: r.grantees,
         grant_option_for: r.grant_option_for,

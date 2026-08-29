@@ -270,8 +270,30 @@ fn resolve_join_input(
     // The right side of a JOIN is read like any other source, so it needs SELECT in its own right —
     // otherwise joining to a table would be a way to read one the session may not read directly.
     let schema = resolve_table(table.schema.as_deref(), &table.name, catalog)?;
-    super::dcl::require_table_privilege(catalog, &schema, crate::ast::Privilege::Select)?;
+    super::dcl::require_read_access(catalog, &schema)?;
     Ok((schema, None))
+}
+
+/// Whether a `FROM`/JOIN source is a real catalog base table — not a derived source, a `VALUES`/
+/// set-op inline, a CTE reference, or an `information_schema` view. Only a real base table gates its
+/// columns by per-column `SELECT` privilege in [`super::base_scope`]; an inlined relation's column
+/// reads were already authorized when its own body was analyzed, so re-gating them against a grant on
+/// the view/CTE object itself would wrongly deny a role that may read the underlying table.
+fn from_ref_is_real_table(
+    base: &ast::TableRef,
+    ctes: &[ResolvedCte],
+    catalog: &dyn Catalog,
+) -> Result<bool, Error> {
+    if base.set_op.is_some() || base.values.is_some() || base.subquery.is_some() {
+        return Ok(false);
+    }
+    if base.schema.is_none() && ctes.iter().any(|c| c.name == base.name) {
+        return Ok(false);
+    }
+    if crate::planner::InfoSchemaView::from_full_name(&base.name).is_some() {
+        return Ok(false);
+    }
+    Ok(lookup_table_ref(base.schema.as_deref(), &base.name, catalog)?.is_some())
 }
 
 /// Resolve a single auxiliary relation for `UPDATE ... FROM` / `DELETE ... USING`: a named
@@ -312,7 +334,7 @@ pub(super) fn resolve_aux_relation(
         // An `UPDATE ... FROM` / `DELETE ... USING` source is read, so it needs SELECT — the write
         // privilege on the statement's target says nothing about the tables it reads to decide
         // what to write.
-        super::dcl::require_table_privilege(catalog, &schema, crate::ast::Privilege::Select)?;
+        super::dcl::require_read_access(catalog, &schema)?;
         Ok((schema, None))
     }
 }
@@ -384,7 +406,7 @@ pub(super) fn resolve_from(
             // Reading a table needs SELECT on it. This precedes row-level security, which narrows
             // *which rows* a permitted read returns — a session with no SELECT privilege never
             // gets as far as having rows filtered.
-            super::dcl::require_table_privilege(catalog, &schema, crate::ast::Privilege::Select)?;
+            super::dcl::require_read_access(catalog, &schema)?;
             // Row-level security for the base table is applied by `apply_rls` once the WHERE
             // filter is built (single-table queries inject policy predicates; joins are refused).
             (schema, None)
@@ -406,7 +428,12 @@ pub(super) fn resolve_from(
         }
     };
     let base_qualifier = from.base.alias.clone().unwrap_or_else(|| base.name.clone());
-    let mut scope: Vec<ScopedColumn> = super::base_scope(&base, &base_qualifier, catalog)?;
+    // Only a real base table gates its columns by SELECT privilege; a view/CTE/derived source was
+    // authorized (or not) when its own body was analyzed, so re-gating its columns here would deny a
+    // role that may read the underlying table but was never granted the view.
+    let base_gates = from_ref_is_real_table(&from.base, ctes, catalog)?;
+    let mut scope: Vec<ScopedColumn> =
+        super::base_scope(&base, &base_qualifier, catalog, base_gates)?;
     let mut joins = Vec::with_capacity(from.joins.len());
     for join in &from.joins {
         // A LATERAL join input correlates to the columns to its left, so resolve it against the
@@ -426,7 +453,8 @@ pub(super) fn resolve_from(
         // Columns to the LEFT of this join (the running scope) end here; the joined table's
         // columns follow. `USING`/`NATURAL` reference both sides by this boundary.
         let left_width = scope.len();
-        scope.extend(super::base_scope(&joined, &qualifier, catalog)?);
+        let join_gates = from_ref_is_real_table(&join.table, ctes, catalog)?;
+        scope.extend(super::base_scope(&joined, &qualifier, catalog, join_gates)?);
         // Resolve the join predicate. `ON` analyzes the explicit boolean; `CROSS` (no
         // condition) is a Cartesian product (predicate `true`); `USING (cols)` and `NATURAL` build
         // an equality conjunction over the named / common columns. All lower to the same join
@@ -524,6 +552,9 @@ pub(super) fn single_table_scope(table: &TableSchema) -> Vec<ScopedColumn> {
             // A policy predicate does not use composite field access.
             composite_type: None,
             enum_type: None,
+            // A policy predicate / derived (VALUES, window) column, not a user read of a base
+            // table — column-scoped SELECT never gates it.
+            select_granted: true,
         })
         .collect()
 }
@@ -895,6 +926,9 @@ pub(super) fn analyze_set_operation(
             // A set-operation output column is derived, never a composite base-table column.
             composite_type: None,
             enum_type: None,
+            // A policy predicate / derived (VALUES, window) column, not a user read of a base
+            // table — column-scoped SELECT never gates it.
+            select_granted: true,
         })
         .collect();
     let mut order_by = Vec::with_capacity(so.order_by.len());
@@ -1205,6 +1239,9 @@ fn analyze_select_scoped(
             // A window output column is derived, never a composite base-table column.
             composite_type: None,
             enum_type: None,
+            // A policy predicate / derived (VALUES, window) column, not a user read of a base
+            // table — column-scoped SELECT never gates it.
+            select_granted: true,
         }))
         .collect();
 
@@ -2682,6 +2719,14 @@ pub(super) fn analyze_projection(
                     if col.qualified_only {
                         continue;
                     }
+                    // `*` reads every column, so a column-restricted session must hold SELECT on all
+                    // of them (matching the reference engine, which refuses `SELECT *` otherwise).
+                    if !col.select_granted {
+                        return Err(Error::PermissionDenied(format!(
+                            "SELECT on column `{}` of table `{}`",
+                            col.def.name, col.qualifier
+                        )));
+                    }
                     projection.push(Projection {
                         expr: TypedExpr {
                             kind: TypedExprKind::Column(index),
@@ -2699,6 +2744,12 @@ pub(super) fn analyze_projection(
                 for (index, col) in visible.iter().enumerate() {
                     if col.qualifier != table {
                         continue;
+                    }
+                    if !col.select_granted {
+                        return Err(Error::PermissionDenied(format!(
+                            "SELECT on column `{}` of table `{}`",
+                            col.def.name, col.qualifier
+                        )));
                     }
                     matched = true;
                     projection.push(Projection {

@@ -3881,6 +3881,30 @@ impl crate::Catalog for ExecCatalog<'_> {
         crate::rbac::has_privilege(self.engine, self.txn, &self.user, kind, object, privilege)
     }
 
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::has_column_privilege(
+            self.engine,
+            self.txn,
+            &self.user,
+            object,
+            column,
+            privilege,
+        )
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::has_any_column_privilege(self.engine, self.txn, &self.user, object, privilege)
+    }
+
     fn may_grant_object(
         &self,
         kind: crate::ast::ObjectKind,
@@ -4015,6 +4039,30 @@ impl crate::Catalog for SessionCatalog<'_> {
         privilege: crate::ast::Privilege,
     ) -> Result<bool, Error> {
         crate::rbac::has_privilege(self.engine, self.txn, self.user, kind, object, privilege)
+    }
+
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::has_column_privilege(
+            self.engine,
+            self.txn,
+            self.user,
+            object,
+            column,
+            privilege,
+        )
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: crate::ast::Privilege,
+    ) -> Result<bool, Error> {
+        crate::rbac::has_any_column_privilege(self.engine, self.txn, self.user, object, privilege)
     }
 
     fn may_grant_object(

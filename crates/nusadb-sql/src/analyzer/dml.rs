@@ -27,13 +27,19 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
             name: super::qualified_display_opt(ins.schema.as_deref(), &ins.table),
         });
     };
-    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Insert)?;
     // `DEFAULT VALUES` names no target columns — every column is omitted and takes its DEFAULT.
     let targets = if matches!(ins.source, ast::InsertSource::DefaultValues) {
         Vec::new()
     } else {
         resolve_insert_columns(&ins, &table)?
     };
+    // INSERT needs the privilege on the table, or a column-scoped INSERT grant on each target column.
+    // (`DEFAULT VALUES` names no column, so it can only be satisfied table-wide.)
+    let insert_columns: Vec<&str> = targets
+        .iter()
+        .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
+        .collect();
+    super::dcl::require_column_privilege(catalog, &table, &insert_columns, ast::Privilege::Insert)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
     let returning = analyze_returning(&ins.returning, &table, catalog)?;
     // `ON CONFLICT`: `DO NOTHING` skips conflicting rows; `DO UPDATE` upserts the existing
@@ -249,6 +255,8 @@ fn upsert_scope(table: &TableSchema) -> Vec<ScopedColumn> {
         qualified_only: true,
         composite_type: None,
         enum_type: None,
+        // The `EXCLUDED` pseudo-relation of `ON CONFLICT` is the proposed row, not a base-table read.
+        select_granted: true,
     }));
     scope
 }
@@ -573,10 +581,14 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             name: super::qualified_display_opt(upd.schema.as_deref(), &upd.table),
         });
     };
-    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Update)?;
+    // UPDATE needs the privilege on the table, or a column-scoped UPDATE grant on each SET column.
+    let update_columns: Vec<&str> = upd.assignments.iter().map(|a| a.column.as_str()).collect();
+    super::dcl::require_column_privilege(catalog, &table, &update_columns, ast::Privilege::Update)?;
     // A `WHERE` or `RETURNING` reads the target's rows to decide what to change or to hand back, so
     // it needs SELECT too. An unconditional `UPDATE t SET c = 1` reads nothing and needs only
     // UPDATE — the standard distinction, and the one that keeps a write-only role write-only.
+    // (A read here requires table-wide SELECT; a column-scoped SELECT does not yet satisfy an
+    // UPDATE/DELETE predicate — a fail-closed limitation, not a leak.)
     if upd.filter.is_some() || !upd.returning.is_empty() {
         super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Select)?;
     }
@@ -615,6 +627,9 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             qualified_only: false,
             // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
             composite_type: None,
+            // A secondary source has already passed a table-wide SELECT check (`resolve_aux_relation`),
+            // so its columns are readable; column-scoped SELECT does not gate a join source here.
+            select_granted: true,
             enum_type: None,
         }));
         from_plan = plan.map(Box::new);
@@ -750,6 +765,9 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
             qualified_only: false,
             // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
             composite_type: None,
+            // A secondary source has already passed a table-wide SELECT check (`resolve_aux_relation`),
+            // so its columns are readable; column-scoped SELECT does not gate a join source here.
+            select_granted: true,
             enum_type: None,
         }));
         using_plan = plan.map(Box::new);

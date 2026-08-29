@@ -52,6 +52,9 @@ pub const ROLE_CATALOG: &str = "nusadb_roles";
 pub const ROLE_MEMBER_CATALOG: &str = "nusadb_role_members";
 /// Object privilege grants.
 pub const PRIVILEGE_CATALOG: &str = "nusadb_privileges";
+/// Column-scoped privilege grants (`GRANT SELECT (col) ...`). Kept separate from
+/// [`PRIVILEGE_CATALOG`] so the table-wide grant format is unchanged.
+pub const COLUMN_PRIVILEGE_CATALOG: &str = "nusadb_column_privileges";
 /// Object ownership.
 pub const OWNER_CATALOG: &str = "nusadb_owners";
 
@@ -68,6 +71,15 @@ const ROLE_SCHEMA: [ColumnType; 6] = [
 const MEMBER_SCHEMA: [ColumnType; 3] = [ColumnType::Text, ColumnType::Text, ColumnType::Text];
 /// `(grantee, kind, object, privilege, grantor, grantable)`.
 const PRIVILEGE_SCHEMA: [ColumnType; 6] = [
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Text,
+];
+/// `(grantee, object, column, privilege, grantor, grantable)` — object is always a table.
+const COLUMN_PRIVILEGE_SCHEMA: [ColumnType; 6] = [
     ColumnType::Text,
     ColumnType::Text,
     ColumnType::Text,
@@ -125,6 +137,23 @@ pub struct GrantRecord {
     /// The privilege held.
     pub privilege: Privilege,
     /// The role that granted it — the audit trail `REVOKE ... CASCADE` walks.
+    pub grantor: String,
+    /// Whether the holder may pass it on.
+    pub grantable: bool,
+}
+
+/// A column-scoped grant as stored. The object is always a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnGrantRecord {
+    /// Who holds it.
+    pub grantee: Grantee,
+    /// The table's canonical (`schema.table`) name.
+    pub object: String,
+    /// The column the privilege is scoped to.
+    pub column: String,
+    /// The privilege held on that column (`SELECT`, `INSERT`, `UPDATE`, or `REFERENCES`).
+    pub privilege: Privilege,
+    /// The role that granted it.
     pub grantor: String,
     /// Whether the holder may pass it on.
     pub grantable: bool,
@@ -676,6 +705,108 @@ impl ResolvedSession {
         Ok(self.decide(&owner, &grants, kind, object, privilege, false))
     }
 
+    /// Column-scoped decision over pre-fetched grants: a table-wide privilege on the object grants
+    /// every column, else a column grant on this specific column to an effective role (or `PUBLIC`).
+    fn decide_column(
+        &self,
+        owner: &str,
+        table_grants: &[GrantRecord],
+        column_grants: &[ColumnGrantRecord],
+        object: &str,
+        column: &str,
+        privilege: Privilege,
+    ) -> bool {
+        // A table-wide grant (or ownership / superuser, via `decide`) covers every column.
+        if self.decide(
+            owner,
+            table_grants,
+            ObjectKind::Table,
+            object,
+            privilege,
+            false,
+        ) {
+            return true;
+        }
+        column_grants.iter().any(|g| {
+            g.object == object
+                && g.column == column
+                && g.privilege == privilege
+                && match &g.grantee {
+                    Grantee::Public => true,
+                    Grantee::Role(name) => self.effective.contains(name),
+                }
+        })
+    }
+
+    /// Whether the session may access `column` of table `object` with `privilege` — a table-wide
+    /// grant, ownership, superuser, or a column grant on exactly this column.
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub fn has_column_privilege(
+        &self,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        object: &str,
+        column: &str,
+        privilege: Privilege,
+    ) -> Result<bool, Error> {
+        if self.superuser {
+            return Ok(true);
+        }
+        let owner = object_owner(engine, txn, ObjectKind::Table, object)?;
+        let table_grants = all_grants(engine, txn)?;
+        let column_grants = all_column_grants(engine, txn)?;
+        let decision = self.decide_column(
+            &owner,
+            &table_grants,
+            &column_grants,
+            object,
+            column,
+            privilege,
+        );
+        Ok(decision)
+    }
+
+    /// Whether the session may access *at least one* column of table `object` with `privilege` — the
+    /// gate a query passes to bring a table into scope when it lacks the table-wide privilege (e.g.
+    /// `SELECT count(*)` needs the privilege on the table or on some column).
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub fn has_any_column_privilege(
+        &self,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, Error> {
+        if self.superuser {
+            return Ok(true);
+        }
+        let owner = object_owner(engine, txn, ObjectKind::Table, object)?;
+        let table_grants = all_grants(engine, txn)?;
+        if self.decide(
+            &owner,
+            &table_grants,
+            ObjectKind::Table,
+            object,
+            privilege,
+            false,
+        ) {
+            return Ok(true);
+        }
+        let column_grants = all_column_grants(engine, txn)?;
+        Ok(column_grants.iter().any(|g| {
+            g.object == object
+                && g.privilege == privilege
+                && match &g.grantee {
+                    Grantee::Public => true,
+                    Grantee::Role(name) => self.effective.contains(name),
+                }
+        }))
+    }
+
     /// The grant-option variant of [`has_privilege`](Self::has_privilege) (`may_grant`).
     ///
     /// # Errors
@@ -986,6 +1117,139 @@ pub fn delete_grant(
     Ok(count)
 }
 
+/// Create the column-privilege catalog if absent.
+fn ensure_column_privilege_catalog(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<nusadb_core::TableId, Error> {
+    ensure_catalog(
+        engine,
+        txn,
+        COLUMN_PRIVILEGE_CATALOG,
+        &[
+            "grantee",
+            "object",
+            "column",
+            "privilege",
+            "grantor",
+            "grantable",
+        ],
+    )
+}
+
+/// Every column-scoped grant in the catalog.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn all_column_grants(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<ColumnGrantRecord>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, COLUMN_PRIVILEGE_CATALOG)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &COLUMN_PRIVILEGE_SCHEMA)?;
+        if let [
+            ast::Value::Text(grantee),
+            ast::Value::Text(object),
+            ast::Value::Text(column),
+            ast::Value::Text(privilege),
+            ast::Value::Text(grantor),
+            ast::Value::Text(grantable),
+        ] = row.as_slice()
+            && let Some(privilege) = Privilege::from_catalog(privilege)
+        {
+            out.push(ColumnGrantRecord {
+                grantee: Grantee::from_catalog(grantee),
+                object: object.clone(),
+                column: column.clone(),
+                privilege,
+                grantor: grantor.clone(),
+                grantable: grantable == TRUE,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Record a column-scoped grant, replacing any existing row for the same
+/// (grantee, object, column, privilege) so a re-grant upgrades rather than duplicates.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn insert_column_grant(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    grant: &ColumnGrantRecord,
+) -> Result<(), Error> {
+    delete_column_grant(
+        engine,
+        txn,
+        &grant.grantee,
+        &grant.object,
+        Some(&grant.column),
+        Some(grant.privilege),
+    )?;
+    let cat = ensure_column_privilege_catalog(engine, txn)?;
+    let row = [
+        ast::Value::Text(grant.grantee.as_str().to_owned()),
+        ast::Value::Text(grant.object.clone()),
+        ast::Value::Text(grant.column.clone()),
+        ast::Value::Text(grant.privilege.as_str().to_owned()),
+        ast::Value::Text(grant.grantor.clone()),
+        ast::Value::Text(flag(grant.grantable)),
+    ];
+    let bytes = row::encode(&row, &COLUMN_PRIVILEGE_SCHEMA)?;
+    engine.insert(txn, cat, &bytes)?;
+    Ok(())
+}
+
+/// Remove column grants matching `grantee`/`object`, and `column`/`privilege` when given (`None`
+/// widens the match). Reports how many rows went.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn delete_column_grant(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    grantee: &Grantee,
+    object: &str,
+    column: Option<&str>,
+    privilege: Option<Privilege>,
+) -> Result<usize, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, COLUMN_PRIVILEGE_CATALOG)? else {
+        return Ok(0);
+    };
+    let wanted = grantee.as_str();
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &COLUMN_PRIVILEGE_SCHEMA)?;
+        if let [
+            ast::Value::Text(g),
+            ast::Value::Text(o),
+            ast::Value::Text(c),
+            ast::Value::Text(p),
+            ..,
+        ] = row.as_slice()
+            && g == wanted
+            && o == object
+            && column.is_none_or(|want| c == want)
+            && privilege.is_none_or(|want| p == want.as_str())
+        {
+            victims.push(tid);
+        }
+    }
+    let count = victims.len();
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(count)
+}
+
 /// Drop the grant option on a grant while keeping the privilege — `REVOKE GRANT OPTION FOR`.
 ///
 /// # Errors
@@ -1171,6 +1435,39 @@ pub fn has_privilege(
     privilege: Privilege,
 ) -> Result<bool, Error> {
     ResolvedSession::resolve(engine, txn, user)?.has_privilege(engine, txn, kind, object, privilege)
+}
+
+/// Whether `user` may access `column` of table `object` with `privilege` (table-wide grant, column
+/// grant, ownership, or superuser).
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn has_column_privilege(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+    object: &str,
+    column: &str,
+    privilege: Privilege,
+) -> Result<bool, Error> {
+    ResolvedSession::resolve(engine, txn, user)?
+        .has_column_privilege(engine, txn, object, column, privilege)
+}
+
+/// Whether `user` may access at least one column of table `object` with `privilege` — the
+/// bring-into-scope gate for a column-restricted table.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn has_any_column_privilege(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+    object: &str,
+    privilege: Privilege,
+) -> Result<bool, Error> {
+    ResolvedSession::resolve(engine, txn, user)?
+        .has_any_column_privilege(engine, txn, object, privilege)
 }
 
 /// Whether `user` may *pass on* `privilege` — needed to run a `GRANT`.

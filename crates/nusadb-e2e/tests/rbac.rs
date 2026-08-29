@@ -74,6 +74,40 @@ impl Catalog for RbacCatalog<'_> {
         })
     }
 
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::has_column_privilege(
+                self.engine,
+                txn,
+                self.user,
+                object,
+                column,
+                privilege,
+            )
+        })
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::has_any_column_privilege(
+                self.engine,
+                txn,
+                self.user,
+                object,
+                privilege,
+            )
+        })
+    }
+
     fn may_grant_object(
         &self,
         kind: ObjectKind,
@@ -896,4 +930,108 @@ fn quoted_public_is_a_role_identifier_not_the_pseudo_role() {
         vec![Grantee::Role("PUBLIC".to_owned())],
         "quoted \"PUBLIC\" must be a role identifier, not the pseudo-role"
     );
+}
+
+// === Column-level privileges ============================================================
+
+/// An engine with a three-column table and a bare `clerk` role.
+fn column_fixture() -> BtreeEngine {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE TABLE t (a INT, b INT, secret INT)");
+    root(&engine, "INSERT INTO t VALUES (1, 2, 99)");
+    root(&engine, "CREATE ROLE clerk LOGIN");
+    engine
+}
+
+#[test]
+fn column_select_grant_admits_only_the_named_columns() {
+    let engine = column_fixture();
+    root(&engine, "GRANT SELECT (a, b) ON t TO clerk");
+    // The granted columns read; the ungranted one, and a `*` that would expand it, are denied.
+    assert_eq!(rows(ok_as(&engine, "clerk", "SELECT a, b FROM t")).len(), 1);
+    assert_eq!(rows(ok_as(&engine, "clerk", "SELECT a FROM t")).len(), 1);
+    denied_as(&engine, "clerk", "SELECT secret FROM t");
+    denied_as(&engine, "clerk", "SELECT * FROM t");
+    // A predicate on an ungranted column is a read of it, so it is denied too.
+    denied_as(&engine, "clerk", "SELECT a FROM t WHERE secret = 99");
+}
+
+#[test]
+fn column_select_grant_allows_a_column_free_count() {
+    let engine = column_fixture();
+    root(&engine, "GRANT SELECT (a) ON t TO clerk");
+    // `count(*)` reads no specific column, and holding SELECT on *some* column is enough — matching
+    // the reference engine.
+    assert_eq!(
+        rows(ok_as(&engine, "clerk", "SELECT count(*) FROM t")),
+        vec![vec![Value::Int(1)]]
+    );
+}
+
+#[test]
+fn no_column_grant_still_denies_the_whole_table() {
+    let engine = column_fixture();
+    // `clerk` holds nothing: neither a bare column read nor `count(*)` is allowed.
+    denied_as(&engine, "clerk", "SELECT a FROM t");
+    denied_as(&engine, "clerk", "SELECT count(*) FROM t");
+}
+
+#[test]
+fn column_insert_grant_admits_only_the_named_columns() {
+    let engine = column_fixture();
+    root(&engine, "GRANT INSERT (a) ON t TO clerk");
+    ok_as(&engine, "clerk", "INSERT INTO t (a) VALUES (10)");
+    denied_as(&engine, "clerk", "INSERT INTO t (b) VALUES (10)");
+    // A column-less INSERT targets every column, so a single column grant cannot satisfy it.
+    denied_as(&engine, "clerk", "INSERT INTO t VALUES (1, 2, 3)");
+}
+
+#[test]
+fn column_update_grant_admits_only_the_named_columns() {
+    let engine = column_fixture();
+    root(&engine, "GRANT UPDATE (b) ON t TO clerk");
+    // An unconditional UPDATE of the granted column reads no rows, so it needs only column UPDATE.
+    ok_as(&engine, "clerk", "UPDATE t SET b = 5");
+    denied_as(&engine, "clerk", "UPDATE t SET a = 5");
+}
+
+#[test]
+fn revoking_a_column_grant_denies_again() {
+    let engine = column_fixture();
+    root(&engine, "GRANT SELECT (a) ON t TO clerk");
+    ok_as(&engine, "clerk", "SELECT a FROM t");
+    root(&engine, "REVOKE SELECT (a) ON t FROM clerk");
+    denied_as(&engine, "clerk", "SELECT a FROM t");
+}
+
+#[test]
+fn a_table_wide_grant_covers_every_column() {
+    let engine = column_fixture();
+    root(&engine, "GRANT SELECT ON t TO clerk");
+    // A plain table grant reads every column, including one no column grant named.
+    assert_eq!(rows(ok_as(&engine, "clerk", "SELECT * FROM t")).len(), 1);
+    assert_eq!(
+        rows(ok_as(&engine, "clerk", "SELECT secret FROM t")).len(),
+        1
+    );
+}
+
+#[test]
+fn granting_a_column_that_does_not_exist_is_an_error() {
+    let engine = column_fixture();
+    match as_role(&engine, ROOT, "GRANT SELECT (nope) ON t TO clerk") {
+        Err(msg) => assert!(
+            msg.contains("column not found") || msg.contains("nope"),
+            "expected a column-not-found error, got: {msg}"
+        ),
+        Ok(other) => panic!("granting on a missing column should fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_column_grantee_cannot_regrant_without_grant_option() {
+    let engine = column_fixture();
+    root(&engine, "GRANT SELECT (a) ON t TO clerk");
+    // `clerk` holds the column privilege but not the grant option, so it may not pass it on.
+    denied_as(&engine, "clerk", "GRANT SELECT (a) ON t TO app");
 }

@@ -60,6 +60,38 @@ impl Catalog for RbacCatalog<'_> {
             nusadb_sql::rbac::has_privilege(self.engine, txn, self.user, kind, object, privilege)
         })
     }
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::has_column_privilege(
+                self.engine,
+                txn,
+                self.user,
+                object,
+                column,
+                privilege,
+            )
+        })
+    }
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| {
+            nusadb_sql::rbac::has_any_column_privilege(
+                self.engine,
+                txn,
+                self.user,
+                object,
+                privilege,
+            )
+        })
+    }
     fn owns_object(&self, kind: ObjectKind, object: &str) -> Result<bool, nusadb_sql::Error> {
         self.with_txn(|txn| {
             nusadb_sql::rbac::owns_object(self.engine, txn, self.user, kind, object)

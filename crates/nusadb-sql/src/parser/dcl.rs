@@ -78,10 +78,30 @@ fn eat_word(parser: &mut Parser) {
 /// privilege or a role name. Both readings are kept until `ON` (object grant) or `TO`/`FROM`
 /// (role grant) settles it.
 enum GrantItem {
-    /// A recognized privilege keyword.
-    Privilege(ast::Privilege),
+    /// A recognized privilege keyword, with the column list of a column-scoped grant (`SELECT (a,
+    /// b)`); the list is empty for a table-wide privilege.
+    Privilege(ast::Privilege, Vec<String>),
     /// A bare identifier, which is a role name if this turns out to be a role grant.
     Name(String),
+}
+
+/// Parse a parenthesized, comma-separated, non-empty column list (`(a, b)`), folding each name.
+fn parse_paren_column_list(parser: &mut Parser) -> Result<Vec<String>, Error> {
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| syntax(&e))?;
+    let mut columns = Vec::new();
+    loop {
+        let ident = parser.parse_identifier().map_err(|e| syntax(&e))?;
+        columns.push(fold_ident(&ident));
+        if !parser.consume_token(&Token::Comma) {
+            break;
+        }
+    }
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| syntax(&e))?;
+    Ok(columns)
 }
 
 /// Parse one entry of the privilege/role list.
@@ -105,16 +125,27 @@ fn parse_grant_item(parser: &mut Parser) -> Result<GrantItem, Error> {
     };
     if let Some(privilege) = privilege {
         eat_word(parser);
-        // A column list (`SELECT (a, b)`) is column-level access control, which NusaDB does not
-        // enforce. Accepting and dropping the list would grant more than the statement asked for,
-        // so it is refused outright.
-        if parser.peek_token_ref().token == Token::LParen {
-            return unsupported(
-                "column-level privileges (`GRANT SELECT (col) ...`) are not supported; grant on \
-                 the whole table instead",
-            );
-        }
-        return Ok(GrantItem::Privilege(privilege));
+        // A column list (`SELECT (a, b)`) scopes the privilege to those columns. Only the
+        // privileges that act on individual columns may be column-scoped.
+        let columns = if parser.peek_token_ref().token == Token::LParen {
+            if !matches!(
+                privilege,
+                ast::Privilege::Select
+                    | ast::Privilege::Insert
+                    | ast::Privilege::Update
+                    | ast::Privilege::References
+            ) {
+                return unsupported(&format!(
+                    "{} cannot be granted on specific columns — only SELECT, INSERT, UPDATE, and \
+                     REFERENCES take a column list",
+                    privilege.as_str()
+                ));
+            }
+            parse_paren_column_list(parser)?
+        } else {
+            Vec::new()
+        };
+        return Ok(GrantItem::Privilege(privilege, columns));
     }
     let ident = parser.parse_identifier().map_err(|e| syntax(&e))?;
     Ok(GrantItem::Name(fold_ident(&ident)))
@@ -220,18 +251,31 @@ fn parse_targets(parser: &mut Parser) -> Result<ast::GrantTargets, Error> {
     }
 }
 
-/// Split a parsed item list into privileges, refusing a mix of privilege keywords and bare names.
-fn items_as_privileges(items: Vec<GrantItem>) -> Result<Vec<ast::Privilege>, Error> {
-    items
-        .into_iter()
-        .map(|item| match item {
-            GrantItem::Privilege(p) => Ok(p),
-            GrantItem::Name(name) => Err(Error::InvalidStatement(format!(
-                "`{name}` is not a privilege; a privilege grant expects SELECT, INSERT, UPDATE, \
-                 DELETE, TRUNCATE, REFERENCES, TRIGGER, USAGE, CREATE, CONNECT, or TEMPORARY"
-            ))),
-        })
-        .collect()
+/// Split a parsed item list into table-wide privileges and column-scoped ones, refusing a bare name
+/// (a role name used where a privilege belongs).
+fn items_as_grant(
+    items: Vec<GrantItem>,
+) -> Result<(Vec<ast::Privilege>, Vec<ast::ColumnPrivilege>), Error> {
+    let mut privileges = Vec::new();
+    let mut column_privileges = Vec::new();
+    for item in items {
+        match item {
+            GrantItem::Privilege(privilege, columns) if columns.is_empty() => {
+                privileges.push(privilege);
+            },
+            GrantItem::Privilege(privilege, columns) => {
+                column_privileges.push(ast::ColumnPrivilege { privilege, columns });
+            },
+            GrantItem::Name(name) => {
+                return Err(Error::InvalidStatement(format!(
+                    "`{name}` is not a privilege; a privilege grant expects SELECT, INSERT, \
+                     UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, USAGE, CREATE, CONNECT, or \
+                     TEMPORARY"
+                )));
+            },
+        }
+    }
+    Ok((privileges, column_privileges))
 }
 
 /// Split a parsed item list into role names, refusing privilege keywords used as role names.
@@ -240,7 +284,7 @@ fn items_as_roles(items: Vec<GrantItem>) -> Result<Vec<String>, Error> {
         .into_iter()
         .map(|item| match item {
             GrantItem::Name(name) => Ok(name),
-            GrantItem::Privilege(p) => Err(Error::InvalidStatement(format!(
+            GrantItem::Privilege(p, _) => Err(Error::InvalidStatement(format!(
                 "`{}` is a privilege keyword, not a role name — a privilege grant needs an `ON` \
                  clause naming what it applies to",
                 p.as_str()
@@ -289,12 +333,15 @@ fn parse_grant(sql: &str) -> Result<ast::Statement, Error> {
             parser.parse_keywords(&[Keyword::WITH, Keyword::GRANT, Keyword::OPTION]);
         reject_granted_by(&mut parser)?;
         expect_statement_end(&mut parser)?;
+        let (privileges, column_privileges) = if all_privileges {
+            (None, Vec::new())
+        } else {
+            let (privileges, column_privileges) = items_as_grant(items)?;
+            (Some(privileges), column_privileges)
+        };
         return Ok(ast::Statement::Grant(ast::Grant {
-            privileges: if all_privileges {
-                None
-            } else {
-                Some(items_as_privileges(items)?)
-            },
+            privileges,
+            column_privileges,
             targets,
             grantees,
             with_grant_option,
@@ -388,12 +435,15 @@ fn parse_revoke(sql: &str) -> Result<ast::Statement, Error> {
         let cascade = parse_drop_behavior(&mut parser);
         reject_granted_by(&mut parser)?;
         expect_statement_end(&mut parser)?;
+        let (privileges, column_privileges) = if all_privileges {
+            (None, Vec::new())
+        } else {
+            let (privileges, column_privileges) = items_as_grant(items)?;
+            (Some(privileges), column_privileges)
+        };
         return Ok(ast::Statement::Revoke(ast::Revoke {
-            privileges: if all_privileges {
-                None
-            } else {
-                Some(items_as_privileges(items)?)
-            },
+            privileges,
+            column_privileges,
             targets,
             grantees,
             grant_option_for,

@@ -19,7 +19,7 @@ use crate::planner::{
     AlterRolePlan, CreateRolePlan, DropRolePlan, GrantPlan, GrantRolePlan, GrantTargetsPlan,
     RevokePlan, RevokeRolePlan, SetRolePlan,
 };
-use crate::rbac::{self, GrantRecord, RoleRecord};
+use crate::rbac::{self, ColumnGrantRecord, GrantRecord, RoleRecord};
 
 use super::{ExecutionResult, session_ctx};
 
@@ -122,6 +122,41 @@ pub(super) fn run_grant(
                 )?;
             }
         }
+        // Column-scoped grants (all targets are tables — the analyzer validated this).
+        if kind == ObjectKind::Table {
+            for column_privilege in &plan.column_privileges {
+                if !rbac::may_grant(
+                    engine,
+                    txn,
+                    &actor,
+                    ObjectKind::Table,
+                    &object,
+                    column_privilege.privilege,
+                )? {
+                    return Err(Error::PermissionDenied(format!(
+                        "cannot grant {privilege} on columns of table `{object}` — the session \
+                         neither owns it nor holds that privilege WITH GRANT OPTION",
+                        privilege = column_privilege.privilege.as_str(),
+                    )));
+                }
+                for column in &column_privilege.columns {
+                    for grantee in &plan.grantees {
+                        rbac::insert_column_grant(
+                            engine,
+                            txn,
+                            &ColumnGrantRecord {
+                                grantee: grantee.clone(),
+                                object: object.clone(),
+                                column: column.clone(),
+                                privilege: column_privilege.privilege,
+                                grantor: actor.clone(),
+                                grantable: plan.with_grant_option,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
     }
     Ok(ExecutionResult::Granted)
 }
@@ -168,6 +203,52 @@ pub(super) fn run_revoke(
             for grantee in &plan.grantees {
                 let mut visited = std::collections::HashSet::new();
                 revoke_one(&target, grantee, &mut visited)?;
+            }
+        }
+        // Column-scoped revokes (all targets are tables — the analyzer validated this).
+        if kind == ObjectKind::Table {
+            for column_privilege in &plan.column_privileges {
+                if !rbac::may_grant(
+                    engine,
+                    txn,
+                    &actor,
+                    ObjectKind::Table,
+                    &object,
+                    column_privilege.privilege,
+                )? {
+                    return Err(Error::PermissionDenied(format!(
+                        "cannot revoke {privilege} on columns of table `{object}` — the session \
+                         neither owns it nor holds that privilege WITH GRANT OPTION",
+                        privilege = column_privilege.privilege.as_str(),
+                    )));
+                }
+                for column in &column_privilege.columns {
+                    for grantee in &plan.grantees {
+                        if plan.grant_option_for {
+                            // Keep the privilege, drop only its grant option — where it exists.
+                            let held =
+                                rbac::all_column_grants(engine, txn)?.into_iter().find(|g| {
+                                    &g.grantee == grantee
+                                        && g.object == object
+                                        && g.column == *column
+                                        && g.privilege == column_privilege.privilege
+                                });
+                            if let Some(mut grant) = held {
+                                grant.grantable = false;
+                                rbac::insert_column_grant(engine, txn, &grant)?;
+                            }
+                        } else {
+                            rbac::delete_column_grant(
+                                engine,
+                                txn,
+                                grantee,
+                                &object,
+                                Some(column.as_str()),
+                                Some(column_privilege.privilege),
+                            )?;
+                        }
+                    }
+                }
             }
         }
     }
