@@ -855,6 +855,12 @@ where
     // and none of its tables changed schema. Scoped to this connection (hence this user), so a cached
     // plan — which bakes RLS predicates for the analyzing user — is never served across users.
     let mut plan_cache = nusadb_sql::PlanCache::new();
+    // Per-connection open cursors (`DECLARE ... CURSOR`). Behind an `Arc<Mutex>` like `settings` so it
+    // can be shared into each statement's `spawn_blocking` task; statements on one connection run
+    // serially, so the lock is never contended. Scoped to this connection — cursors are private to it
+    // and outlive individual transactions (every NusaDB cursor behaves like `WITH HOLD`).
+    let cursors: Arc<std::sync::Mutex<nusadb_sql::CursorStore>> =
+        Arc::new(std::sync::Mutex::new(nusadb_sql::CursorStore::new()));
     // LISTEN/NOTIFY (async pub/sub): this connection's notification mailbox. `LISTEN` subscribes its
     // pid in the process-global registry; a `NOTIFY` from any connection in the same database pushes a
     // `Notification` here, which the loop below drains and writes as a `NotificationResponse` while the
@@ -991,6 +997,7 @@ where
                         array_element_types,
                         plan_cache,
                         &settings,
+                        &cursors,
                         false, // simple query sends its own RowDescription
                     )
                     .await?;
@@ -1190,6 +1197,7 @@ where
                         array_element_types,
                         plan_cache,
                         &settings,
+                        &cursors,
                         true, // portal path: `Describe` already sent `RowDescription`
                     )
                     .await?;
@@ -2413,6 +2421,7 @@ fn run_query_streaming(
     array_elements: bool,
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &std::sync::Mutex<HashMap<String, String>>,
+    cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
     point_get_gate: bool,
     bypass_cache: bool,
 ) -> StreamedRun {
@@ -2522,6 +2531,7 @@ fn run_query_streaming(
         &mut sink,
         &mut plan_cache,
         &snapshot,
+        cursors,
         point_get_gate,
         bypass_cache,
     );
@@ -2629,6 +2639,30 @@ fn plan_streamed_stmt(
     }
 }
 
+/// Execute a streamed statement, routing a cursor plan (`DECLARE`/`FETCH`/`CLOSE`) through this
+/// connection's [`CursorStore`](nusadb_sql::CursorStore) and everything else through the ordinary
+/// settings-aware path. Only a cursor plan takes the lock, so the hot path for normal statements is
+/// byte-for-byte unchanged.
+fn execute_streamed_with_cursors(
+    physical: nusadb_sql::PhysicalPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+    snapshot: &HashMap<String, String>,
+    cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    sink: &mut ChannelSink,
+) -> Result<StreamOutcome, nusadb_sql::Error> {
+    if nusadb_sql::is_cursor_plan(&physical) {
+        let mut store = cursors
+            .lock()
+            .map_err(|_| nusadb_sql::Error::Internal("cursor store lock poisoned".to_owned()))?;
+        return nusadb_sql::execute_in_txn_as_streaming_with_cursors(
+            physical, engine, txn, user, snapshot, &mut store, sink,
+        );
+    }
+    execute_in_txn_as_streaming_with_settings(physical, engine, txn, user, snapshot, sink)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "threads the per-statement transaction context, the inline point-get gate flag, and \
@@ -2643,6 +2677,7 @@ fn stream_stmt_in_state(
     sink: &mut ChannelSink,
     plan_cache: &mut nusadb_sql::PlanCache,
     snapshot: &HashMap<String, String>,
+    cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
     point_get_gate: bool,
     bypass_cache: bool,
 ) -> StmtRun {
@@ -2679,9 +2714,8 @@ fn stream_stmt_in_state(
             if point_get_gate && !nusadb_sql::plan_is_inline_point_get(&physical) {
                 return StmtRun::Punt;
             }
-            let outcome = execute_in_txn_as_streaming_with_settings(
-                physical, engine, txn, user, snapshot, sink,
-            );
+            let outcome =
+                execute_streamed_with_cursors(physical, engine, txn, user, snapshot, cursors, sink);
             match outcome {
                 Ok(o) => StmtRun::Done(
                     Ok(o),
@@ -2702,6 +2736,7 @@ fn stream_stmt_in_state(
             sink,
             plan_cache,
             snapshot,
+            cursors,
             point_get_gate,
             bypass_cache,
         ),
@@ -2730,6 +2765,7 @@ fn stream_stmt_autocommit(
     sink: &mut ChannelSink,
     plan_cache: &mut nusadb_sql::PlanCache,
     snapshot: &HashMap<String, String>,
+    cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
     point_get_gate: bool,
     bypass_cache: bool,
 ) -> StmtRun {
@@ -2777,7 +2813,7 @@ fn stream_stmt_autocommit(
             return StmtRun::Punt;
         }
         let outcome =
-            execute_in_txn_as_streaming_with_settings(physical, engine, txn, user, snapshot, sink);
+            execute_streamed_with_cursors(physical, engine, txn, user, snapshot, cursors, sink);
         let failure = match outcome {
             Ok(o) => match engine.commit(txn) {
                 Ok(()) => return StmtRun::Done(Ok(o), TxnState::Auto),
@@ -2861,6 +2897,7 @@ async fn stream_query_to_conn<S>(
     array_elements: bool,
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    cursors: &Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
     // Extended-query `Execute` must NOT repeat `RowDescription` (that is `Describe`'s job) — set for
     // the portal path so the streamed frames carry only `DataRow`s + `CommandComplete`.
     suppress_row_description: bool,
@@ -2926,6 +2963,7 @@ where
                 array_elements,
                 plan_cache,
                 settings,
+                cursors,
                 point_get,
                 bypass_plan_cache,
             )
@@ -2974,6 +3012,7 @@ where
     let cluster = Arc::clone(cluster);
     let database = database.to_owned();
     let settings = Arc::clone(settings);
+    let cursors = Arc::clone(cursors);
     let task = tokio::task::spawn_blocking(move || {
         let _cancel_guard = nusadb_sql::cancel::scope(cancel);
         match run_query_streaming(
@@ -2989,6 +3028,7 @@ where
             array_elements,
             plan_cache,
             &settings,
+            &cursors,
             false,
             bypass_plan_cache,
         ) {

@@ -681,6 +681,84 @@ pub fn execute_in_txn_as_streaming_with_settings(
     replay_into_sink(execute_in_txn(plan, engine, txn)?, &types, sink)
 }
 
+/// Whether `plan` is a cursor statement (`DECLARE`/`FETCH`/`CLOSE`), which needs a per-connection
+/// [`CursorStore`] rather than the stateless execution path.
+#[must_use]
+pub const fn is_cursor_plan(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::DeclareCursor { .. }
+            | PhysicalPlan::FetchCursor { .. }
+            | PhysicalPlan::CloseCursor(_)
+    )
+}
+
+/// Streaming execution that also serves cursor statements against a per-connection [`CursorStore`].
+///
+/// A non-cursor plan is handed to [`execute_in_txn_as_streaming_with_settings`] unchanged. A cursor
+/// plan is served from `store`: `DECLARE` runs its query in `txn` and materializes the rows, `FETCH`
+/// replays the requested rows into `sink` (typed when the cursor knows its column types), and `CLOSE`
+/// discards. `txn` is caller-managed, exactly like the delegate — never committed or rolled back here.
+///
+/// # Errors
+/// Propagates execution errors and any error returned by `sink`.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the wire server's per-connection GUC store is a default-hasher HashMap"
+)]
+pub fn execute_in_txn_as_streaming_with_cursors(
+    plan: PhysicalPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+    settings: &HashMap<String, String>,
+    store: &mut CursorStore,
+    sink: &mut dyn RowSink,
+) -> Result<StreamOutcome, Error> {
+    if !is_cursor_plan(&plan) {
+        return execute_in_txn_as_streaming_with_settings(plan, engine, txn, user, settings, sink);
+    }
+    session_ctx::set_session_user_with_settings(user, settings);
+    match plan {
+        PhysicalPlan::DeclareCursor { name, query, .. } => {
+            // Types before the plan is consumed, then materialize the rows in this transaction.
+            let col_types = describe_column_types(&query);
+            let ExecutionResult::Rows { columns, rows, .. } = execute_in_txn(*query, engine, txn)?
+            else {
+                return Err(Error::Internal(
+                    "a cursor's query did not produce a row set".to_owned(),
+                ));
+            };
+            store.declare(name, columns, col_types, rows);
+            Ok(StreamOutcome::Other(ExecutionResult::CursorDeclared))
+        },
+        PhysicalPlan::FetchCursor { name, direction } => {
+            let fetched = store.fetch(&name, direction)?;
+            // Advertise the cursor's column types when it has them, else fall back to names only —
+            // the same typed/untyped choice `replay_into_sink` makes for a buffered row set.
+            if fetched.col_types.len() == fetched.columns.len() {
+                sink.columns_typed(&fetched.columns, &fetched.col_types)?;
+            } else {
+                sink.columns(&fetched.columns)?;
+            }
+            let count = fetched.rows.len();
+            for row in &fetched.rows {
+                sink.row(row)?;
+            }
+            Ok(StreamOutcome::Rows {
+                columns: fetched.columns,
+                count,
+                command: RowsCommand::Fetch,
+            })
+        },
+        PhysicalPlan::CloseCursor(target) => {
+            store.close(&target)?;
+            Ok(StreamOutcome::Other(ExecutionResult::CursorClosed))
+        },
+        _ => unreachable!("is_cursor_plan admits only the three cursor plans"),
+    }
+}
+
 /// Replay a finished [`ExecutionResult`] into `sink` for a non-streamed statement: a row result
 /// announces its columns then pushes each row; anything else passes through as
 /// [`StreamOutcome::Other`]. Keeps the streaming entry points behaviourally identical to the
@@ -847,10 +925,10 @@ pub struct Session<'engine> {
     /// Statements prepared in this session via `PREPARE`, keyed by name. Re-analyzed and run
     /// on `EXECUTE` with the supplied arguments bound to their `$n` placeholders.
     prepared: HashMap<String, PreparedStatement>,
-    /// Cursors opened in this session via `DECLARE ... CURSOR`, keyed by name. Each holds the query's
-    /// rows materialized at declaration (a stable snapshot) and a position; `FETCH` reads from it and
+    /// Cursors opened in this session via `DECLARE ... CURSOR`. Each holds the query's rows
+    /// materialized at declaration (a stable snapshot) and a position; `FETCH` reads from it and
     /// `CLOSE` discards it. Cursors are session-lived — every NusaDB cursor behaves like `WITH HOLD`.
-    cursors: HashMap<String, Cursor>,
+    cursors: CursorStore,
     /// Result cache: maps `(user, plan)` to the data-version it was computed at plus its
     /// rows. A cached entry is served only in auto-commit, only while the engine's `data_version` is
     /// unchanged (any committed write invalidates every entry), and only for non-volatile plans —
@@ -877,9 +955,14 @@ struct PreparedStatement {
 /// A cursor opened by `DECLARE ... CURSOR`: the query's rows materialized at declaration plus a
 /// scan position. Materializing up front gives a stable snapshot (an INSENSITIVE cursor) and makes
 /// every direction — including backward — a simple index move.
+#[derive(Debug)]
 struct Cursor {
     /// The output column names.
     columns: Vec<String>,
+    /// The output column types, parallel to `columns` (so a `FETCH` can advertise them over the
+    /// wire). Empty when the declaring context could not supply them, which drops `FETCH` to the
+    /// untyped row description.
+    col_types: Vec<ColumnType>,
     /// Every row of the cursor's query, captured at `DECLARE`.
     rows: Vec<Row>,
     /// The last-returned row index: `-1` before the first row, `i` on row `i` (`0`-based), and
@@ -1008,6 +1091,84 @@ impl Cursor {
     }
 }
 
+/// The rows a `FETCH` produced, with the column shape needed to describe them over the wire.
+#[derive(Debug)]
+pub struct CursorRows {
+    /// The cursor's output column names.
+    pub columns: Vec<String>,
+    /// The output column types, parallel to `columns`; empty when unknown (untyped description).
+    pub col_types: Vec<ColumnType>,
+    /// The fetched rows, in fetch order.
+    pub rows: Vec<Row>,
+}
+
+/// A per-connection (or per-session) set of open cursors.
+///
+/// Owns each cursor's materialized rows and scan position; `DECLARE` inserts, `FETCH` reads and
+/// advances, `CLOSE` discards. Held behind the wire server's per-connection lock so cursors are
+/// private to one connection and survive across the statements on it.
+#[derive(Debug, Default)]
+pub struct CursorStore {
+    cursors: HashMap<String, Cursor>,
+}
+
+impl CursorStore {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open (or replace) a cursor over an already-materialized row set, positioned before the first
+    /// row.
+    fn declare(
+        &mut self,
+        name: String,
+        columns: Vec<String>,
+        col_types: Vec<ColumnType>,
+        rows: Vec<Row>,
+    ) {
+        self.cursors.insert(
+            name,
+            Cursor {
+                columns,
+                col_types,
+                rows,
+                pos: -1,
+            },
+        );
+    }
+
+    /// Apply a `FETCH` to the named cursor. `Err(CursorNotFound)` when it is not open.
+    fn fetch(&mut self, name: &str, direction: ast::FetchDir) -> Result<CursorRows, Error> {
+        let cursor = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))?;
+        let rows = cursor.fetch(direction);
+        Ok(CursorRows {
+            columns: cursor.columns.clone(),
+            col_types: cursor.col_types.clone(),
+            rows,
+        })
+    }
+
+    /// Close one cursor (`Err(CursorNotFound)` when it is not open) or, for `ALL`, every cursor.
+    fn close(&mut self, target: &ast::CloseTarget) -> Result<(), Error> {
+        match target {
+            ast::CloseTarget::All => self.cursors.clear(),
+            ast::CloseTarget::Name(name) => {
+                if self.cursors.remove(name).is_none() {
+                    return Err(Error::CursorNotFound(format!(
+                        "cursor \"{name}\" does not exist"
+                    )));
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for Session<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Skip the `&dyn StorageEngine` field — it has no `Debug` impl on the
@@ -1090,7 +1251,7 @@ impl<'engine> Session<'engine> {
             current_database: "nusadb".to_owned(),
             current_schema: "public".to_owned(),
             prepared: HashMap::new(),
-            cursors: HashMap::new(),
+            cursors: CursorStore::new(),
             result_cache: HashMap::new(),
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             temp_schema_created: false,
@@ -1240,16 +1401,7 @@ impl<'engine> Session<'engine> {
             PhysicalPlan::DeclareCursor { name, query, .. } => self.declare_cursor(name, *query),
             PhysicalPlan::FetchCursor { name, direction } => self.fetch_cursor(&name, direction),
             PhysicalPlan::CloseCursor(target) => {
-                match target {
-                    ast::CloseTarget::All => self.cursors.clear(),
-                    ast::CloseTarget::Name(name) => {
-                        if self.cursors.remove(&name).is_none() {
-                            return Err(Error::CursorNotFound(format!(
-                                "cursor \"{name}\" does not exist"
-                            )));
-                        }
-                    },
-                }
+                self.cursors.close(&target)?;
                 Ok(ExecutionResult::CursorClosed)
             },
             PhysicalPlan::Deallocate(target) => {
@@ -1364,19 +1516,13 @@ impl<'engine> Session<'engine> {
         name: String,
         query: PhysicalPlan,
     ) -> Result<ExecutionResult, Error> {
+        let col_types = describe_column_types(&query);
         let ExecutionResult::Rows { columns, rows, .. } = self.run_within_txn(query)? else {
             return Err(Error::Internal(
                 "a cursor's query did not produce a row set".to_owned(),
             ));
         };
-        self.cursors.insert(
-            name,
-            Cursor {
-                columns,
-                rows,
-                pos: -1,
-            },
-        );
+        self.cursors.declare(name, columns, col_types, rows);
         Ok(ExecutionResult::CursorDeclared)
     }
 
@@ -1386,14 +1532,10 @@ impl<'engine> Session<'engine> {
         name: &str,
         direction: ast::FetchDir,
     ) -> Result<ExecutionResult, Error> {
-        let cursor = self
-            .cursors
-            .get_mut(name)
-            .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))?;
-        let rows = cursor.fetch(direction);
+        let fetched = self.cursors.fetch(name, direction)?;
         Ok(ExecutionResult::Rows {
-            columns: cursor.columns.clone(),
-            rows,
+            columns: fetched.columns,
+            rows: fetched.rows,
             command: RowsCommand::Fetch,
         })
     }
