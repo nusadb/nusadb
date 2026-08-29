@@ -135,6 +135,22 @@ UTC, so the instant is preserved exactly — only the rendering changes (a `TIME
 *Comparison* is unchanged: the two types still do not compare without an explicit cast, so a mixed
 `WHERE ts_col = tstz_col` is still rejected rather than answered from a guess.
 
+## How `JSON` is stored
+
+A `JSON` (or `JSONB`) value is kept in a canonical form rather than as the exact text you supplied.
+Object keys are sorted, insignificant whitespace is dropped, and a key repeated in one object keeps
+its last value:
+
+```sql
+SELECT '{"b":1,  "a":2, "b":3}'::json;   -- {"a": 2, "b": 3}
+```
+
+This makes documents compare and hash by value, so `'{"a":1,"b":2}' = '{"b":2,"a":1}'` is true and an
+index on a JSON column matches regardless of how the text was written. The trade-off is that a stored
+value round-trips as its canonical form, not byte-for-byte the original — if you need to preserve the
+exact bytes of a payload (for a signature over the raw text, say), keep it in a `TEXT` column and
+parse it on read.
+
 ## JSON operators
 
 Beyond navigation (`->`, `->>`, `#>`, `#>>`) and containment (`@>`, `<@`), the `JSON` type supports:
