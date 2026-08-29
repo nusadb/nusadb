@@ -215,6 +215,27 @@ fn create_index_single_column_defaults() {
 }
 
 #[test]
+fn create_index_accepts_explicit_btree_and_rejects_other_scalar_methods() {
+    // The engine's only scalar index is a B-tree, so an explicit `USING btree` names the default
+    // access method and folds to `None`, exactly as a bare `CREATE INDEX` does.
+    let ast::Statement::CreateIndex(ci) = ok("CREATE INDEX i ON t USING btree (id)") else {
+        panic!("expected CreateIndex");
+    };
+    assert!(ci.using.is_none());
+    let ast::Statement::CreateIndex(ci) = ok("CREATE INDEX i ON t (id)") else {
+        panic!("expected CreateIndex");
+    };
+    assert!(ci.using.is_none());
+    // Every other access method is a distinct structure the engine does not build.
+    for method in ["hash", "gin", "gist", "brin"] {
+        assert!(
+            parse(&format!("CREATE INDEX i ON t USING {method} (id)")).is_err(),
+            "USING {method} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn create_index_unique_if_not_exists_multi_column_with_include() {
     let ast::Statement::CreateIndex(ci) =
         ok("CREATE UNIQUE INDEX IF NOT EXISTS orders_lookup_idx \

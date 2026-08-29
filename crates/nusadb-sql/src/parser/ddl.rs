@@ -672,14 +672,20 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
     if ci.concurrently {
         return unsupported("CREATE INDEX CONCURRENTLY");
     }
-    // `USING <method>` is accepted only for the `hnsw` vector access method; fold the
-    // method name and reject anything else (the default — no `USING` — is a B-tree).
+    // `USING <method>` names the access method. The engine's only scalar index is a B-tree, so an
+    // explicit `USING btree` names the default and is accepted exactly as if no `USING` clause were
+    // given; `hnsw` selects the vector index. Every other method (`hash`, `gin`, `gist`, `brin`, ...)
+    // is a distinct structure the engine does not build, so it stays rejected.
     let using = match &ci.using {
-        None => None,
+        None | Some(sql::IndexType::BTree) => None,
         Some(sql::IndexType::Custom(method)) if method.value.eq_ignore_ascii_case("hnsw") => {
             Some("hnsw".to_owned())
         },
-        Some(_) => return unsupported("CREATE INDEX USING <method> (only `hnsw` is supported)"),
+        Some(_) => {
+            return unsupported(
+                "CREATE INDEX USING <method> (only the default B-tree and `hnsw` are supported)",
+            );
+        },
     };
     if ci.nulls_distinct.is_some() {
         return unsupported("CREATE INDEX ... NULLS [NOT] DISTINCT");
