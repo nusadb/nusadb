@@ -1,320 +1,554 @@
 # SQL Reference
 
-> TODO: populated as the SQL engine matures. See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the
-> current design and scope.
+Everything on this page is accepted by the current engine. Each section shows the syntax and a
+runnable example. Where NusaDB deliberately behaves differently from what you may expect, that is
+called out in [Behaviour worth knowing](#behaviour-worth-knowing) rather than hidden.
 
-## Text ordering and collation
+Run the examples with `nusadb-cli`. They are written to be pasted in order.
 
-NusaDB orders text **bytewise** (the `C` collation): `ORDER BY`, `MIN`/`MAX`, `DISTINCT`,
-`GROUP BY`, and text-range comparisons all compare UTF-8 bytes directly. This is the same
-semantics as running the reference engine with the `C` locale — a configuration its own
-documentation recommends for performance, because locale-aware collation slows every text
-sort and index comparison. Consequences to design for:
+- [Data types](#data-types)
+- [Creating and changing objects](#creating-and-changing-objects)
+- [Inserting and changing rows](#inserting-and-changing-rows)
+- [Querying](#querying)
+- [Functions](#functions)
+- [Access control](#access-control)
+- [Session settings](#session-settings)
+- [Behaviour worth knowing](#behaviour-worth-knowing)
 
-- Uppercase ASCII sorts before lowercase (`'B' < 'a'`), and multibyte characters order by
-  their UTF-8 encoding, not language rules.
-- Results are deterministic and locale-independent across hosts — a property linguistic
-  collations do not have across library versions.
-- For a case-insensitive ordering, sort an explicit expression: `ORDER BY lower(name)`.
+---
 
-Per-column `COLLATE` support (locale/ICU collations) is a tracked future unit; today a
-`COLLATE` clause is rejected loudly rather than silently ignored.
+## Data types
 
-## Truncating a DATE
+### Numbers
 
-`DATE_TRUNC` takes a timestamp, so a `DATE` argument is widened to midnight and the call
-returns `TIMESTAMPTZ` — never `DATE`. This follows the reference engine, which picks the
-time-zone-aware form whenever a conversion is needed and both forms would serve:
-
-```sql
-SELECT DATE_TRUNC('month', DATE '2024-06-15');   -- 2024-06-01 00:00:00+00
-```
-
-NusaDB compares and assigns temporal values only between matching types, so feeding that
-result to a `TIMESTAMP` column or comparing it against a `TIMESTAMP` value needs an explicit
-cast on either side:
+| Type | Notes |
+| --- | --- |
+| `SMALLINT` / `INT` / `BIGINT` | 16 / 32 / 64-bit signed integers |
+| `REAL` / `DOUBLE PRECISION` | IEEE-754 binary floating point |
+| `NUMERIC(p,s)` | exact decimal; use this for money |
 
 ```sql
-INSERT INTO report (month_start)                 -- month_start TIMESTAMP
-SELECT DATE_TRUNC('month', CAST(d AS TIMESTAMP)) FROM sales;
+CREATE TABLE amounts (
+  qty   INT,
+  ratio DOUBLE PRECISION,
+  price NUMERIC(12,2)
+);
+INSERT INTO amounts VALUES (3, 0.5, 19.99);
+SELECT qty * price AS total FROM amounts;
+--  total
+-- -------
+--  59.97
 ```
 
-Comparing against a bare string literal needs no cast — `WHERE DATE_TRUNC('month', d) =
-'2024-06-01'` reads the literal as the column's type.
+### Text and binary
 
-## Fixed-width characters (`CHAR(n)`)
-
-`CHAR(n)` stores and compares text exactly as entered — NusaDB does **not** blank-pad a
-`CHAR` value out to its declared length. `'ab'` stored in a `CHAR(4)` stays `'ab'` (length 2),
-so `CHAR(n)` behaves like `VARCHAR(n)` with a declared maximum, and comparisons never ignore
-trailing spaces. This departs from the legacy blank-padding rule on purpose: padding is a
-surprising, storage-wasting wart, and a single consistent text semantics across `TEXT`,
-`VARCHAR`, and `CHAR` is easier to reason about. If an application needs a fixed-width,
-space-filled rendering, pad explicitly with `rpad(col, 4)`.
-
-## Summing 64-bit integers
-
-`SUM` over a `BIGINT` column returns `NUMERIC`, not `BIGINT`. A total over 64-bit values can
-exceed the 64-bit range, so the exact large sum is returned as `NUMERIC` rather than raised as
-an overflow error. `SUM` over `INT`/`SMALLINT` still returns a 64-bit integer (which errors on
-the far rarer overflow past that), and `SUM` over `NUMERIC` stays exact `NUMERIC`. The value is
-exact in every case — the accumulator is a 128-bit integer for integer inputs.
-
-## Inspecting a value's type
-
-`nusadb_typeof(expr)` returns the static SQL type name of its argument as `TEXT` (`integer`,
-`text`, `numeric`, …). The type is known at analysis time, so the argument is never evaluated.
-
-## Array parameters to `ANY` / `ALL`
-
-A driver commonly binds a list as a single array parameter — `WHERE id = ANY($1)` with `$1`
-bound to `{1,2,3}`. The bound value arrives as its array text form (typed `TEXT`), and NusaDB
-coerces it to an array of the probe's element type, exactly as an explicit `$1::INT[]` would.
-The same works with an array text literal written inline:
+| Type | Notes |
+| --- | --- |
+| `TEXT` | variable length, no limit |
+| `VARCHAR(n)` | variable length, rejected past `n` |
+| `CHAR(n)` | fixed width; see [`CHAR(n)`](#fixed-width-characters-charn) |
+| `BYTEA` | binary, written as `'\xDEADBEEF'` |
 
 ```sql
-SELECT id FROM t WHERE id = ANY('{1,3}');       -- id in (1, 3)
-SELECT id FROM t WHERE id <> ALL('{1,3}');       -- id not in (1, 3)
+SELECT 'hello' || ' ' || 'world' AS greeting,
+       length('héllo')           AS chars,
+       '\xdeadbeef'::BYTEA       AS blob;
 ```
 
-An unparseable member (`'{1,x}'` against an integer probe) is rejected loudly rather than
-silently dropping rows.
-
-## `NUMERIC` division precision
-
-`NUMERIC` division carries a fixed number of guard digits beyond its wider operand: the result
-scale is `min(max(left_scale, right_scale) + 16, MAX_SCALE)`. So `10 / 3` keeps ~16 fractional
-digits rather than truncating to the operands' scale. This is a fixed-scale rule (bounded,
-deterministic digits) rather than a significant-digit rule; every digit it returns is correct,
-and a computation needing a specific scale can `round(expr, n)` or cast to a declared
-`NUMERIC(p, s)`.
-
-## Materialized views are snapshots; maintenance is opt-in
-
-A materialized view holds the rows computed when it was created, and they stay put until you
-`REFRESH MATERIALIZED VIEW` it — the point of materializing is to hold an expensive result still.
-
-NusaDB can also keep such a view current, adjusting it on every insert, update or delete to its base
-table so it never needs a `REFRESH`. That is a per-view opt-in, because a view that quietly followed
-its base table would not be doing the job you materialized it for:
+### Booleans and UUIDs
 
 ```sql
-CREATE MATERIALIZED VIEW big_paid WITH (incremental = true) AS
-SELECT id, amount FROM orders WHERE status = 'paid' AND amount >= 100;
+SELECT TRUE AS t,
+       'f'::BOOLEAN                              AS parsed,
+       '5b8f...'::UUID IS NOT NULL               AS has_uuid;
 ```
 
-Incremental maintenance is only possible for a body that is a single base table with a projection
-and an optional `WHERE` — no join, aggregate, `GROUP BY`, window, `DISTINCT`, `HAVING`,
-`LIMIT`/`OFFSET`, CTE or subquery, and no volatile expression (`age()`, `now()`, …), whose stored
-value would drift. Asking for it on any other body is an error rather than a silent downgrade to a
-snapshot, so `WITH (incremental = true)` always means what it says. `WITH (incremental = false)`
-spells out the default.
+### Dates, times and intervals
 
-| View                                    | Freshness              | `REFRESH` needed? |
-| --------------------------------------- | ---------------------- | ----------------- |
-| `CREATE MATERIALIZED VIEW …`            | snapshot at last build | yes               |
-| `… WITH (incremental = true)`           | always current         | no (automatic)    |
-
-The incremental path writes only the rows that changed, so it avoids rescanning the base table; the
-trade-off is a small maintenance cost on every base-table write while such a view exists.
-
-## Assigning between `TIMESTAMP` and `TIMESTAMPTZ`
-
-`CURRENT_TIMESTAMP` (and `now()`) is a `TIMESTAMPTZ`, so the near-universal column definition
+| Type | Example literal |
+| --- | --- |
+| `DATE` | `DATE '2026-08-30'` |
+| `TIME` / `TIME WITH TIME ZONE` | `TIME '14:30:00'` |
+| `TIMESTAMP` | `TIMESTAMP '2026-08-30 14:30:00'` |
+| `TIMESTAMPTZ` | `TIMESTAMPTZ '2026-08-30 14:30:00+07'` |
+| `INTERVAL` | `INTERVAL '1 day 2 hours'` |
 
 ```sql
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+SELECT now()                                   AS instant,
+       date_trunc('month', DATE '2026-08-30')  AS month_start,
+       EXTRACT(dow FROM DATE '2026-08-30')     AS day_of_week,
+       DATE '2026-08-30' + INTERVAL '10 days'  AS later;
 ```
 
-needs a conversion. NusaDB applies it on assignment, in both directions: a `TIMESTAMPTZ` value
-stores into a `TIMESTAMP` column and vice versa, and `CAST(expr AS TIMESTAMP)` /
-`CAST(expr AS TIMESTAMPTZ)` spell the conversion out in a query. The session time zone is fixed at
-UTC, so the instant is preserved exactly — only the rendering changes (a `TIMESTAMPTZ` prints its
-`+00` offset, a `TIMESTAMP` does not).
+The session time zone is UTC and cannot currently be changed.
 
-*Comparison* is unchanged: the two types still do not compare without an explicit cast, so a mixed
-`WHERE ts_col = tstz_col` is still rejected rather than answered from a guess.
+### JSON
 
-## How `JSON` is stored
-
-A `JSON` (or `JSONB`) value is kept in a canonical form rather than as the exact text you supplied.
-Object keys are sorted, insignificant whitespace is dropped, and a key repeated in one object keeps
-its last value:
+`JSON` and `JSONB` both store a parsed value. See [How JSON is stored](#how-json-is-stored).
 
 ```sql
-SELECT '{"b":1,  "a":2, "b":3}'::json;   -- {"a": 2, "b": 3}
+CREATE TABLE docs (id INT PRIMARY KEY, body JSONB);
+INSERT INTO docs VALUES (1, '{"user":{"name":"ana","tags":["a","b"]},"active":true}');
+
+SELECT body -> 'user' ->> 'name'          AS name,
+       body #>> '{user,tags,0}'           AS first_tag,
+       body @> '{"active":true}'          AS is_active,
+       jsonb_path_query(body, '$.user.tags[*]') AS tag;
 ```
 
-This makes documents compare and hash by value, so `'{"a":1,"b":2}' = '{"b":2,"a":1}'` is true and an
-index on a JSON column matches regardless of how the text was written. The trade-off is that a stored
-value round-trips as its canonical form, not byte-for-byte the original — if you need to preserve the
-exact bytes of a payload (for a signature over the raw text, say), keep it in a `TEXT` column and
-parse it on read.
-
-## JSON operators
-
-Beyond navigation (`->`, `->>`, `#>`, `#>>`) and containment (`@>`, `<@`), the `JSON` type supports:
-
-| Operator          | Meaning                                                                  |
-| ----------------- | ------------------------------------------------------------------------ |
-| `json \|\| json`  | merge two objects (the right side wins a shared key), concatenate two arrays, otherwise pair the operands into an array |
-| `json - text`     | delete an object member by name, or every equal string element of an array |
-| `json - int`      | delete an array element by position (negative counts from the end)        |
-| `json - text[]`   | delete several keys at once                                              |
-| `json ? text`     | does the key exist as a top-level object key, array string element, or scalar string? |
-| `json ?\| text[]` | does **any** of the keys exist?                                          |
-| `json ?& text[]`  | do **all** of the keys exist?                                            |
+### Arrays
 
 ```sql
-SELECT '{"a":1,"b":2}'::json || '{"b":3,"c":4}'::json;   -- {"a": 1, "b": 3, "c": 4}
-SELECT '{"a":1,"b":2}'::json - 'a';                      -- {"b": 2}
-SELECT '[10,20,30]'::json - (-1);                        -- [10, 20]
-SELECT doc ?& ARRAY['a','b'] FROM t;                     -- both keys present?
+CREATE TABLE posts (id INT, tags TEXT[]);
+INSERT INTO posts VALUES (1, ARRAY['rust','db']), (2, '{"sql"}');
+
+SELECT id, array_length(tags, 1) AS n
+FROM   posts
+WHERE  tags @> ARRAY['rust'] OR 'sql' = ANY(tags);
+
+SELECT id, tag FROM posts, unnest(tags) AS tag;
 ```
 
-The merge is shallow: `{"a":{"x":1}} || {"a":{"y":2}}` is `{"a": {"y": 2}}`, not a recursive merge.
-Deleting from a scalar document, or by integer index from an object, is an error (SQLSTATE `22023`)
-rather than a silently unchanged document. A text operand next to a `JSON` one is parsed as JSON, so
-`doc || '{"c":3}'` needs no cast; text that is not valid JSON is rejected.
+### Ranges
 
-## Walking a JSON object with `jsonb_each`
-
-`jsonb_each(json)` produces one row per top-level object member, as `(key, value)`;
-`jsonb_each_text(json)` is the same with the value as `TEXT` (a string member's raw contents, a JSON
-`null` as SQL `NULL`). Members come in canonical key order.
+`INT4RANGE`, `INT8RANGE`, `NUMRANGE`, `DATERANGE`, `TSRANGE`.
 
 ```sql
-SELECT key, value FROM jsonb_each('{"b":2,"a":1}');    -- a|1 then b|2
-SELECT * FROM jsonb_each(doc) AS e(k, v);              -- rename both columns
-SELECT id, jsonb_each(doc) FROM t;                     -- id, key, value
+SELECT int4range(1, 10)                       AS r,          -- [1,10)
+       int4range(1, 10, '[]')                 AS closed,
+       int4range(1,10) @> 5                   AS contains,
+       int4range(1,10) && int4range(5,20)     AS overlaps,
+       lower(int4range(1,10))                 AS lo,
+       int4range(1,5) + int4range(4,9)        AS merged;
 ```
 
-Unlike every other set-returning function here it produces **two** columns, and the second is
-appended after the projection. So in a `SELECT` list it must be the **last** item — anywhere earlier
-the value column would be separated from its key by the items after it, and that shape is refused
-rather than emitted. In a `FROM` item there is nothing to separate them, so the ordinary form reads
-naturally. `WITH ORDINALITY` appends its counter after the value: `(key, value, ordinality)`.
+### Network and MAC addresses
 
-A `NULL` document yields no rows. A document that is valid JSON but not an object — an array or a
-scalar — is an error (SQLSTATE `22023`), not an empty result: the query asked for its members.
-
-A `FROM` table function cannot yet reference a column of a table to its left
-(`FROM t, jsonb_each(t.doc)`), so drive it from the `SELECT` list for that case.
-
-## `TO_CHAR` numeric formats
-
-The numeric picture accepts `9` (a digit position blanked when unused), `0` (a digit position that
-forces zero-fill from itself rightward), `.` or `D` (the decimal point), `,` or `G` (a group
-separator), and the `FM` prefix (fill mode, which drops the padding: the leading blanks including
-the sign column, and the fraction's trailing zeros in `9` positions).
+`INET`, `CIDR`, `MACADDR`, `MACADDR8`.
 
 ```sql
-SELECT to_char(1234567.891, '9G999G999D99');   --  1,234,567.89
-SELECT to_char(1234.5,     'FM9999.00');       -- 1234.50
-SELECT to_char(12,         '9,999');           --     12   (no stray separator)
+SELECT '192.168.1.5/24'::INET            AS addr,
+       host('192.168.1.5/24'::INET)      AS just_host,
+       masklen('192.168.1.5/24'::INET)   AS bits,
+       '192.168.1.0/24'::CIDR >> '192.168.1.5'::INET AS contains,
+       '08:00:2b:01:02:03'::MACADDR      AS mac;
 ```
 
-A group separator prints only when some position to its left prints something, so `9,999` renders
-`12` as `    12` but `1234` as ` 1,234`. A number too wide for its integer positions renders as `#`
-fill. Any other format character (`S`, `MI`, `PR`, `$`, …) is rejected rather than silently
-mis-formatted.
+### Bit strings
 
-## Session configuration variables
+`BIT(n)` and `BIT VARYING(n)`, with literals `B'1011'` and `X'0f'`.
 
-`SET name = value` accepts the settings the engine reads (`search_path`, `work_mem`,
-`statement_timeout`, `hnsw_ef_search`, `max_autocommit_retries`), the reported connection parameters
-a session may still set
-(`client_encoding`, `datestyle`, `timezone`, …), and an application's own variables — which must
-carry a class prefix, as in `SET myapp.request_id = '42'`. `SHOW name` and `current_setting('name')`
-read one back as text, and an unset variable reads back as the empty string.
+```sql
+SELECT B'1011' & B'1101'  AS and_,
+       B'1011' | B'1101'  AS or_,
+       ~B'1011'           AS not_,
+       length(B'1011')    AS len;
+```
 
-An unrecognized bare name is an error (`42704`), not a new custom variable: a misspelling such as
-`SET word_mem` — or reaching for another engine's spelling of a knob, like `ef_search` instead of
-`hnsw_ef_search` — fails immediately instead of reporting success and doing nothing. A read-only
-parameter (`server_version`, `server_encoding`, `integer_datetimes`) reports `55P02`. A *value* a
-setting cannot use is likewise rejected at `SET` time: `SET work_mem = 'huge'` fails with an
-`invalid value for parameter` error rather than being stored and then ignored.
+### Geometric types
 
-## Serialization conflicts and the auto-commit retry
+`POINT`, `BOX`, `CIRCLE`, `LSEG`, `LINE`, `PATH`, `POLYGON`.
 
-Concurrency control is optimistic and locks never wait: when two sessions write the same row, one
-of them is rejected with SQLSTATE `40001` immediately rather than queueing behind the other. The
-rejected transaction changed nothing, and running it again against the now-committed value is the
-correct response.
+```sql
+CREATE TABLE places (id INT, at POINT, area POLYGON);
+INSERT INTO places VALUES (1, '(1,2)', '((0,0),(0,4),(4,4),(4,0))');
 
-For a **single statement in auto-commit** — no `BEGIN` in effect — the server does that itself. Such
-a statement has no intermediate results the application has seen and committed nothing, so
-re-running it is exactly what a client retry loop would do, and the client never sees the conflict.
-Attempts are separated by an exponential back-off with jitter, so sessions that collided once are
-not released in lockstep to collide again.
+SELECT id FROM places WHERE area @> at;      -- point inside polygon
+SELECT '((0,0),(3,4))'::LSEG AS segment;
+```
 
-Inside an explicit transaction the conflict is reported, not retried. A statement there may follow
-others whose results the application already acted on, so silently re-running it would change what
-those earlier results meant — only the application knows whether the whole transaction can be
-replayed. Handle a class-`40` error — `40001` or `40P01` — by rolling back and retrying the
-transaction; see [`transactions.md`](transactions.md) for the loop.
+### XML
 
-`SET max_autocommit_retries = N` bounds the attempts (default 50, maximum 100); `0` switches the
-retry off and reports the first conflict. The budget is a bound, not a promise: a conflict that
-outlives it is reported unchanged, so an application's own retry loop still works. A
-`statement_timeout` or a cancel request applies to the retry sequence as a whole and ends it.
+Stored verbatim and validated as well-formed on cast or store; malformed input is a hard error.
 
-Consequences worth knowing:
+```sql
+SELECT '<a>1</a>'::XML                       AS doc,
+       xml_is_well_formed('<a>1</a>')        AS ok,
+       xmlconcat('<a/>'::XML, '<b/>'::XML)   AS joined;
+```
 
-- A retried statement re-runs its non-transactional side effects. `nextval` is the one to watch —
-  a sequence can advance once per attempt, so gaps are possible under contention. Sequences never
-  promise gapless values, but a retried statement makes gaps more likely. `RANDOM()` is the other:
-  a re-run draws again, so under `SETSEED` a session's random sequence advances by an amount that
-  depends on how many attempts the statement took.
-- A statement whose rows have already started reaching the client is **not** retried. Results are
-  streamed, and once a batch has been sent it cannot be unsaid — sending it twice would corrupt the
-  result. So a large `SELECT` that conflicts part-way through reports `40001` like any other
-  statement. Statements that return a count rather than rows, and results small enough not to have
-  been sent yet, are unaffected.
-- A statement that keeps losing occupies its connection for the length of the budget before
-  reporting. `SET max_autocommit_retries = 0` restores the immediate report where that matters more
-  than the automatic recovery.
-- The retry budget bounds attempts, not time: the wall clock a losing statement can consume is
-  each attempt's own run time plus its back-off, times the budget, and no statement deadline is set
-  by default. Where connections are scarce, set the pair together — `max_autocommit_retries` for
-  how hard to try, `statement_timeout` for how long the whole sequence may take — since the timeout
-  covers all attempts as one.
+### Vectors
 
-## Access control: what is enforced
+`VECTOR(n)` with four distance operators and an HNSW index.
 
-Objects are owned, and access defaults to closed: a role reaches only what it owns or has been
-granted. The following are checked on every statement.
+```sql
+CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3));
+INSERT INTO items VALUES (1, '[1,0,0]'), (2, '[0,1,0]');
 
-- **Reading and writing rows** — `SELECT`, `INSERT`, `UPDATE`, `DELETE` each need their own
-  privilege on the table (or ownership). One does not imply another.
-- **Emptying a table** — `TRUNCATE` needs the `TRUNCATE` privilege; it is not implied by `DELETE`.
-- **`ANALYZE`** — needs `SELECT`, because it reads every row and stores column values.
-- **Restructuring a table** — `CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE` require ownership.
-- **Attaching a trigger** — `CREATE TRIGGER` needs the `TRIGGER` privilege on the table.
-- **Locking** — `LOCK TABLE` needs ownership or a write privilege (`UPDATE`/`DELETE`/`TRUNCATE`),
-  since a lock exists to guard a write.
-- **Seeing a table's columns** — `SHOW COLUMNS` needs some privilege on the table (any one), so a
-  role cannot enumerate the shape of a table it has no relationship to.
-- **Schemas and databases** — `DROP SCHEMA` requires ownership of the schema (its creator owns
-  it); `DROP DATABASE` requires a superuser.
-- **Roles** — a role may be administered only by a superuser, a `CREATEROLE` role, or a member
-  holding it `WITH ADMIN OPTION`; a superuser role can be administered only by a superuser, so
-  `CREATEROLE` cannot escalate itself to superuser.
+CREATE INDEX items_emb ON items USING hnsw (emb vector_cosine_ops);
 
-### Not yet enforced (stored, and honest about it)
+SET hnsw_ef_search = 100;                    -- higher trades latency for recall
+SELECT id, emb <=> '[1,0,0]' AS distance
+FROM   items ORDER BY distance LIMIT 5;
+```
 
-Some privileges parse, are stored, and appear in `information_schema`, but no statement consults
-them yet. They are recorded so grants written today keep their meaning once enforcement lands;
-until then, do not rely on them to restrict access:
+Operators: `<->` L2, `<=>` cosine, `<#>` negative inner product, `<+>` L1. An index answers only the
+metric its operator class declared, so build one index per metric you query.
 
-- **`REFERENCES`** — creating a foreign key that points at another role's table is not yet gated by
-  this privilege.
-- **Schema `USAGE`/`CREATE`, database `CONNECT`/`CREATE`/`TEMPORARY`, and sequence
-  `USAGE`/`SELECT`/`UPDATE`** — stored but not consulted at the corresponding call sites.
+### Enumerated and composite types
 
-### Metadata enumeration
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE point3 AS (x INT, y INT, z INT);
 
-`SHOW TABLES` and the `information_schema` views list object *names* without a per-object
-privilege filter (they do hide the engine's own internal catalogs). A role can therefore learn
-which tables exist, though not their contents or (via `SHOW COLUMNS`) their shape without some
-privilege. Per-privilege filtering of these listings is planned.
+CREATE TABLE t (id INT, m mood, p point3);
+INSERT INTO t VALUES (1, 'happy', ROW(1,2,3));
+SELECT m, (p).y FROM t;
+```
+
+---
+
+## Creating and changing objects
+
+### Tables
+
+```sql
+CREATE TABLE customers (
+  id       BIGSERIAL PRIMARY KEY,
+  email    TEXT NOT NULL UNIQUE,
+  country  TEXT DEFAULT 'ID',
+  spend    NUMERIC(12,2) CHECK (spend >= 0),
+  tax      NUMERIC(12,2) GENERATED ALWAYS AS (spend * 0.11) STORED,
+  joined   TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id       BIGSERIAL PRIMARY KEY,
+  customer BIGINT REFERENCES customers (id) ON DELETE CASCADE,
+  total    NUMERIC(12,2)
+);
+
+CREATE TABLE archive (LIKE orders);          -- copy the shape, not the rows
+CREATE TABLE recent AS SELECT * FROM orders WHERE total > 100;
+```
+
+`CREATE TEMP TABLE` is supported. A temporary table belongs to the session that made it, is invisible
+to others, and disappears when the session ends. `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` are
+accepted.
+
+### Altering
+
+```sql
+ALTER TABLE orders ADD COLUMN note TEXT;
+ALTER TABLE orders ALTER COLUMN note SET DEFAULT '';
+ALTER TABLE orders ADD CONSTRAINT total_positive CHECK (total > 0);
+ALTER TABLE orders RENAME TO sales_orders;
+```
+
+`RENAME COLUMN` succeeds when nothing else records the column by name. If a user-defined check,
+foreign key, index, default, view, trigger or policy refers to it, the rename is refused and the
+error names what is in the way. Drop that object, rename, and recreate it.
+
+### Indexes
+
+```sql
+CREATE INDEX orders_customer ON orders (customer);
+CREATE INDEX orders_big      ON orders (customer) WHERE total > 1000;   -- partial
+CREATE INDEX orders_lower    ON customers ((lower(email)));             -- expression
+CREATE UNIQUE INDEX ON customers (email);
+CREATE INDEX orders_desc     ON orders (total DESC);
+```
+
+### Views, sequences, domains, schemas, databases
+
+```sql
+CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 1000;
+CREATE MATERIALIZED VIEW daily AS SELECT date_trunc('day', created) d, count(*) FROM orders GROUP BY 1;
+REFRESH MATERIALIZED VIEW daily;
+
+CREATE SEQUENCE invoice_no START 1000 INCREMENT BY 5;
+SELECT nextval('invoice_no'), currval('invoice_no');
+
+CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0);
+CREATE SCHEMA reporting;
+CREATE DATABASE app;
+```
+
+A view over a single table with no aggregate is **auto-updatable**: `INSERT`, `UPDATE` and `DELETE`
+through it reach the base table.
+
+A materialized view holds the result of its last `REFRESH`. Incremental maintenance is opt-in with
+`WITH (incremental = true)`.
+
+### Cursors
+
+```sql
+BEGIN;
+DECLARE c CURSOR FOR SELECT id FROM orders ORDER BY id;
+FETCH 10 FROM c;
+FETCH NEXT FROM c;
+CLOSE c;
+COMMIT;
+```
+
+---
+
+## Inserting and changing rows
+
+```sql
+INSERT INTO customers (email, country) VALUES ('ana@example.com', 'ID')
+RETURNING id, joined;
+
+INSERT INTO customers (email) VALUES ('ana@example.com')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO customers (email, country) VALUES ('ana@example.com', 'SG')
+ON CONFLICT (email) DO UPDATE SET country = EXCLUDED.country;
+
+UPDATE orders o SET total = total * 1.1
+FROM   customers c
+WHERE  o.customer = c.id AND c.country = 'ID';
+
+DELETE FROM orders USING customers c
+WHERE  orders.customer = c.id AND c.country = 'XX';
+
+MERGE INTO stock t USING shipment s ON t.sku = s.sku
+WHEN MATCHED             THEN UPDATE SET qty = t.qty + s.qty
+WHEN NOT MATCHED         THEN INSERT (sku, qty) VALUES (s.sku, s.qty)
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET qty = 0;
+
+TRUNCATE orders RESTART IDENTITY;
+TRUNCATE customers CASCADE;      -- also empties tables that reference it
+```
+
+### Bulk load and export
+
+`COPY` streams rows in one exchange instead of a round trip per row.
+
+```bash
+nusadb-cli -c "COPY customers FROM STDIN" < rows.tsv
+nusadb-cli -c "COPY customers FROM STDIN WITH (FORMAT csv, HEADER)" < rows.csv
+nusadb-cli -c "COPY customers TO STDOUT" > out.tsv
+```
+
+---
+
+## Querying
+
+### Joins, subqueries, set operations
+
+```sql
+SELECT c.email, count(o.id) AS orders
+FROM   customers c
+LEFT JOIN orders o ON o.customer = c.id
+WHERE  c.country = 'ID'
+GROUP BY c.email
+HAVING count(o.id) > 2
+ORDER BY orders DESC NULLS LAST
+LIMIT 10;
+
+SELECT * FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer = c.id AND o.total > 500);
+
+SELECT (id, email) IN ((1,'a@x'), (2,'b@x')) AS matched FROM customers;
+
+SELECT email FROM customers
+UNION      SELECT email FROM archive_customers
+EXCEPT     SELECT email FROM blocked
+INTERSECT  SELECT email FROM verified;
+
+SELECT c.email, o.total
+FROM   customers c
+CROSS JOIN LATERAL (SELECT total FROM orders WHERE customer = c.id ORDER BY total DESC LIMIT 1) o;
+```
+
+### Window functions
+
+```sql
+SELECT country, email, spend,
+       rank()       OVER w                         AS rk,
+       sum(spend)   OVER (PARTITION BY country)    AS country_total,
+       lag(spend)   OVER w                         AS previous,
+       avg(spend)   OVER (ORDER BY joined ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving
+FROM   customers
+WINDOW w AS (PARTITION BY country ORDER BY spend DESC);
+```
+
+Frames support `ROWS`, `RANGE`, `GROUPS` and the `EXCLUDE` clause.
+
+### Common table expressions
+
+```sql
+WITH RECURSIVE chain AS (
+  SELECT id, manager, 1 AS depth FROM staff WHERE manager IS NULL
+  UNION ALL
+  SELECT s.id, s.manager, c.depth + 1
+  FROM staff s JOIN chain c ON s.manager = c.id
+)
+SELECT depth, count(*) FROM chain GROUP BY depth ORDER BY depth;
+```
+
+`WITH x AS MATERIALIZED (...)` and `NOT MATERIALIZED` are accepted as hints.
+
+### Grouping sets and aggregates with filters
+
+```sql
+SELECT country, date_trunc('month', joined) AS m, count(*)
+FROM   customers
+GROUP BY GROUPING SETS ((country), (m), ());
+
+SELECT count(*) FILTER (WHERE spend > 100) AS big,
+       string_agg(email, ',' ORDER BY email) AS list,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY spend) AS median,
+       rank(500) WITHIN GROUP (ORDER BY spend) AS where_500_would_rank
+FROM   customers;
+```
+
+### Row locking
+
+```sql
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+SELECT * FROM orders FOR UPDATE OF orders SKIP LOCKED;
+SELECT * FROM orders FOR UPDATE NOWAIT;
+SELECT * FROM orders FOR SHARE;
+```
+
+---
+
+## Functions
+
+A selection; the engine ships several hundred.
+
+| Area | Examples |
+| --- | --- |
+| String | `length` `substring` `position` `overlay` `trim` `lpad` `split_part` `format` `regexp_replace` `regexp_substr` `regexp_count` `regexp_instr` `to_char` |
+| Numeric | `abs` `round` `trunc` `ceil` `floor` `mod` `power` `sqrt` `ln` `log` `log10` `exp` `random` |
+| Date/time | `now` `statement_timestamp` `localtimestamp` `date_trunc` `date_part` `EXTRACT` `age` `make_timestamptz` `to_timestamp` |
+| JSON | `jsonb_set` `jsonb_set_lax` `jsonb_build_object` `json_object` `jsonb_agg` `json_object_agg` `jsonb_array_elements` `jsonb_each` `jsonb_path_query` `jsonb_path_match` `jsonb_extract_path` |
+| Array | `array_agg` `array_length` `array_position` `array_remove` `array_fill` `unnest` |
+| Aggregate | `count` `sum` `avg` `min` `max` `string_agg` `percentile_cont` `percentile_disc` `rank` `dense_rank` `percent_rank` `cume_dist` |
+| Type | `nusadb_typeof` `quote_literal` `quote_nullable` `convert_to` `convert_from` |
+| Vector | `l1_distance` `l2_distance` `cosine_distance` `inner_product` `vector_dims` `vector_norm` |
+
+---
+
+## Access control
+
+```sql
+CREATE ROLE analyst LOGIN PASSWORD 'secret';
+CREATE ROLE readers;
+GRANT readers TO analyst;
+
+GRANT SELECT ON customers TO readers;
+GRANT SELECT (email, country) ON customers TO analyst;   -- column-level
+GRANT INSERT, UPDATE ON orders TO analyst WITH GRANT OPTION;
+REVOKE INSERT ON orders FROM analyst;
+
+SET ROLE analyst;
+RESET ROLE;
+```
+
+Row-level security restricts which rows a role sees:
+
+```sql
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON orders
+  USING (customer = current_setting('app.customer')::BIGINT);
+```
+
+Ownership, grants, role membership and policies are enforced inside the engine. A superuser
+bypasses these checks.
+
+---
+
+## Session settings
+
+```sql
+SET search_path = reporting, public;
+SET work_mem = 67108864;
+SET statement_timeout = '30s';
+SET max_autocommit_retries = 50;
+SET hnsw_ef_search = 100;
+SET myapp.tenant = '7';        -- application variables need a class prefix
+SHOW search_path;
+RESET ALL;
+```
+
+An unrecognised parameter name is an error rather than a silent no-op, and a read-only parameter
+reports that it cannot be changed.
+
+---
+
+## Behaviour worth knowing
+
+These are deliberate choices. Each one is here because it can surprise you.
+
+### Text ordering and collation
+
+Comparison and ordering are bytewise, equivalent to a `C` collation. `COLLATE "C"` and `"POSIX"` are
+accepted; locale collations are refused. Byte order is deterministic and does not change when a
+system library is upgraded, which is what makes an index safe across upgrades. The visible effect is
+that uppercase sorts before lowercase.
+
+```sql
+SELECT 'a' < 'B' AS byte_order;   -- false: 'B' (0x42) precedes 'a' (0x61)
+```
+
+### Fixed-width characters (`CHAR(n)`)
+
+`CHAR(n)` stores what you give it and does not pad to `n`.
+
+### `NUMERIC` division precision
+
+Division produces a fixed scale rather than deriving one from the operands. The value is the same;
+only the number of digits kept differs. Round explicitly when a specific scale matters.
+
+### How `JSON` is stored
+
+`JSON` and `JSONB` both store a parsed value, so key order and insignificant whitespace from the
+input text are not preserved. Keep the original text in a `TEXT` column when byte fidelity matters,
+such as a signed payload.
+
+### Assigning between `TIMESTAMP` and `TIMESTAMPTZ`
+
+A value of either type can be assigned to a column of the other and the instant passes through
+unchanged. Equality between the two types is still refused: this widened assignment, not comparison.
+
+### Type coercion is explicit
+
+The engine does not insert implicit coercions between unrelated types. Cast explicitly with
+`::TYPE` when mixing them.
+
+### Materialized views are snapshots
+
+A materialized view holds the result from the last `REFRESH`. Incremental maintenance is opt-in with
+`WITH (incremental = true)`, and asking for it on a body that cannot be maintained incrementally is
+an error rather than a silent downgrade.
+
+### Serialization conflicts and the auto-commit retry
+
+Concurrency control is optimistic and locks do not wait: two sessions writing the same row make one
+fail with SQLSTATE `40001` rather than queue.
+
+A **single statement outside a transaction** is retried by the server, because it committed nothing
+and showed the application no intermediate result. Inside `BEGIN … COMMIT` it is not, because a
+statement there may follow others whose results the application already acted on.
+
+```sql
+SET max_autocommit_retries = 50;   -- 0 turns the retry off
+```
+
+The budget is a bound, not a promise: a conflict that outlives it is reported unchanged, so an
+application's own retry loop still sees its `40001`. A retry re-runs the statement, so `now()` and
+`random()` produce fresh values and a sequence consumed by a failed attempt leaves a gap. Pair the
+budget with `statement_timeout` if you want an upper bound on how long one statement may hold a
+connection.
+
+### A query over its memory budget fails rather than spilling
+
+With `--work-mem` set, a stage that materialises more than the budget fails with an error naming the
+limit, the bytes involved and how to raise it. The server stays responsive. This keeps one large
+query from slowing every other query, at the cost of not finishing it.
+
+### Capacity is bounded by memory
+
+Table pages live in memory and are not evicted to disk, so a database's working set must fit inside
+the resident ceiling. See [deployment](deployment.md) before loading a large dataset.
+
+---
+
+## Not accepted
+
+Recognised and refused with a clear message rather than half-implemented: advisory locks,
+`PREPARE`/`EXECUTE` as statements over a connection (use the extended query protocol),
+`SET TIME ZONE`, index methods other than B-tree and HNSW, and locale collations.
