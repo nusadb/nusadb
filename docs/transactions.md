@@ -97,8 +97,60 @@ transaction).
 Higher isolation means more class-`40` aborts under contention, and the retry loop above is what
 makes SERIALIZABLE practical.
 
+## Savepoints
+
+A savepoint marks a point a transaction can roll back to without abandoning the whole transaction.
+Transactions do not nest; a savepoint is the nested scope.
+
+```sql
+BEGIN;
+INSERT INTO audit (event) VALUES ('import started');
+SAVEPOINT before_rows;
+INSERT INTO rows_in (payload) VALUES ('...');
+ROLLBACK TO SAVEPOINT before_rows;   -- the audit row survives
+RELEASE SAVEPOINT before_rows;       -- optional: forget the savepoint, keep the work
+COMMIT;
+```
+
+`ROLLBACK TO SAVEPOINT` is also the way out of an aborted transaction (`25P02`) when the work before
+the savepoint is worth keeping.
+
+## Row and table locks
+
+Locks never wait, so `SELECT ... FOR UPDATE` on a row another transaction has locked fails at once
+with `40001`; `NOWAIT` is accepted and changes nothing. `SKIP LOCKED` steps over such rows instead,
+which is the usual shape for a job queue: each worker claims a different row and none of them
+conflict.
+
+```sql
+BEGIN;
+SELECT * FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+UPDATE jobs SET state = 'running' WHERE id = 42;
+COMMIT;
+```
+
+`LOCK TABLE name IN ACCESS SHARE MODE` and `IN ACCESS EXCLUSIVE MODE` are available inside a
+transaction; the other modes are refused.
+
+## Cursors
+
+A cursor reads a large result in pieces without materialising it on the client. It lives inside a
+transaction and is closed when the transaction ends.
+
+```sql
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, email FROM customers ORDER BY id;
+FETCH 100 FROM c;
+FETCH NEXT FROM c;
+CLOSE c;
+COMMIT;
+```
+
 ## Timeouts and cancellation
 
-- `SET statement_timeout = <ms>` bounds any single statement.
+- `SET statement_timeout = '30s'` bounds any single statement on this session; the server flag
+  `--statement-timeout` sets a default for every session. A cancelled statement reports `57014`.
 - A connection cap (`--max-connections`) queues excess connections by default;
   `--reject-excess-connections` refuses them immediately with `53300` so a pool can back off.
+- `CHECKPOINT` refuses while any transaction is open, including one on the connection issuing it;
+  run it from a connection in autocommit.
