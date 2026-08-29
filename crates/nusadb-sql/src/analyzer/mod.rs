@@ -436,6 +436,67 @@ pub struct IndexInfo {
     pub unique: bool,
 }
 
+/// Blank-pad each fixed-width `CHAR(n)` output column to width `n` for the client-facing result of a
+/// top-level `SELECT`. A `char(n)` value is stored with its insignificant trailing spaces removed (so
+/// comparison and `||` ignore them, the SQL `PAD SPACE` rule), but the standard defines the type as
+/// fixed width, so a *direct* result column must render the full `n` characters. Doing it only at the
+/// outermost user `SELECT` — a subquery, or a stored `SELECT` (an `INSERT ... SELECT` / `CREATE TABLE
+/// AS` / view body) reaches `analyze_select` directly, not this entry — keeps the stored and compared
+/// form stripped while the client sees the padded width. A text operation that consumes the column
+/// (`||`, `substring`, `length`) still reads the unwrapped, stripped value.
+///
+/// Scope is the common, unambiguous case: a bare base-table column of a plain (non-aggregated,
+/// non-grouped, non-windowed) single query, whose column ordinal indexes straight into the scanned
+/// `[table ++ joins]` row. An aggregated / grouped / windowed / `VALUES` / set-op / CTE-based, or a
+/// computed-expression projection is left unpadded — the width is not recoverable there without deeper
+/// plumbing, matching how `octet_length` also pads only a bare `CHAR(n)` column reference.
+fn pad_fixed_char_output(plan: &mut SelectPlan) {
+    if plan.table.is_none()
+        || plan.from_cte.is_some()
+        || !plan.values.is_empty()
+        || plan.set_op_source.is_some()
+        || !plan.aggregates.is_empty()
+        || !plan.group_keys.is_empty()
+        || !plan.grouping_sets.is_empty()
+        || !plan.windows.is_empty()
+    {
+        return;
+    }
+    // The scanned row is `[base table columns ++ each joined table's columns]`, so a `Column(i)`
+    // projection reads the declared type at position `i` of this concatenation.
+    let mut source_types: Vec<ColumnType> = Vec::new();
+    if let Some(t) = &plan.table {
+        source_types.extend(t.columns.iter().map(|c| c.ty));
+    }
+    for j in &plan.joins {
+        source_types.extend(j.table.columns.iter().map(|c| c.ty));
+    }
+    for proj in &mut plan.projection {
+        let TypedExprKind::Column(index) = proj.expr.kind else {
+            continue;
+        };
+        let Some(ColumnType::Char(n)) = source_types.get(index).copied() else {
+            continue;
+        };
+        let inner = proj.expr.clone();
+        proj.expr = TypedExpr {
+            kind: TypedExprKind::ScalarFunction {
+                func: ast::ScalarFunc::Rpad,
+                args: vec![
+                    inner,
+                    TypedExpr {
+                        kind: TypedExprKind::Literal(ast::Value::Int(i64::from(n))),
+                        ty: ColumnType::Int,
+                    },
+                ],
+            },
+            // The value is now `n` characters; the declared output type is unchanged (a bare `CHAR(n)`
+            // column already reports its physical `TEXT` to the client).
+            ty: proj.expr.ty,
+        };
+    }
+}
+
 /// Analyze a parsed [`ast::Statement`] into a typed [`LogicalPlan`].
 #[allow(
     clippy::too_many_lines,
@@ -769,9 +830,10 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             }))
         },
         ast::Statement::Insert(ins) => analyze_insert(ins, catalog).map(LogicalPlan::Insert),
-        ast::Statement::Select(sel) => {
-            analyze_select(sel, catalog).map(|p| LogicalPlan::Select(Box::new(p)))
-        },
+        ast::Statement::Select(sel) => analyze_select(sel, catalog).map(|mut p| {
+            pad_fixed_char_output(&mut p);
+            LogicalPlan::Select(Box::new(p))
+        }),
         // Set operations are parsed but the column-compat / type-promotion resolver and
         // the physical Union/Intersect/Except path are not yet wired.
         // Set operations: analyze each leaf SELECT, check column-count + per-column type

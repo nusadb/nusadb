@@ -3436,6 +3436,45 @@ fn q47_concat_coerce_json_scalar_cast_bytea_length() {
     assert_eq!(one(r"SELECT bit_length('\x01'::bytea)"), Value::Int(8));
 }
 
+/// A top-level `SELECT` of a fixed-width `CHAR(n)` column blank-pads each value to width `n` for the
+/// client (the standard defines the type as fixed width), while the stored and compared form stays
+/// stripped: a `||` read of the same column still sees the trimmed value, a subquery projection is
+/// never padded, and `octet_length` reports the padded width. NULL stays NULL, not spaces.
+#[test]
+fn char_n_output_is_blank_padded_only_at_the_top_level() {
+    let engine = MockEngine::new();
+    run("CREATE TABLE t (v CHAR(5))", &engine).unwrap();
+    run("INSERT INTO t VALUES ('ab'), ('abcde'), (NULL)", &engine).unwrap();
+    let rows = |sql: &str| rows_of(run(sql, &engine).unwrap()).1;
+
+    // Direct output: a short value gains trailing spaces to width 5, an exact-width one is unchanged,
+    // and NULL is preserved.
+    assert_eq!(
+        rows("SELECT v FROM t ORDER BY v"),
+        vec![
+            vec![Value::Text("ab   ".into())],
+            vec![Value::Text("abcde".into())],
+            vec![Value::Null],
+        ]
+    );
+    // `||` still strips the insignificant trailing blanks — the value feeding a text op is the trimmed
+    // one, not the padded display.
+    assert_eq!(
+        rows("SELECT '[' || v || ']' FROM t WHERE v = 'ab'"),
+        vec![vec![Value::Text("[ab]".into())]]
+    );
+    // A subquery projection is analyzed on its own, never through the top-level pad.
+    assert_eq!(
+        rows("SELECT '[' || (SELECT v FROM t WHERE v = 'ab') || ']'"),
+        vec![vec![Value::Text("[ab]".into())]]
+    );
+    // The padded width is what `octet_length` reports for the column.
+    assert_eq!(
+        rows("SELECT octet_length(v) FROM t WHERE v = 'ab'"),
+        vec![vec![Value::Int(5)]]
+    );
+}
+
 /// A date string whose fields are well-shaped `YYYY-MM-DD` but out of the calendar range
 /// (Feb 30, month 13, day 99) is a field-overflow (22008), distinct from a mis-shaped
 /// literal that is an invalid-format error (22007). The reference engine draws the same line.
