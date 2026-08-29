@@ -486,7 +486,10 @@ SELECT 'a' < 'B' AS byte_order;   -- false: 'B' (0x42) precedes 'a' (0x61)
 
 ### Fixed-width characters (`CHAR(n)`)
 
-`CHAR(n)` stores what you give it and does not pad to `n`.
+`CHAR(n)` is a fixed-width type. A value is stored with its trailing spaces trimmed, so comparison
+and `||` treat `'ab'` and `'ab   '` as equal and `length` counts only the real characters. A `CHAR(n)`
+column read out as a result on its own is blank-padded back to `n` characters, and `octet_length`
+reports that full width.
 
 ### `NUMERIC` division precision
 
