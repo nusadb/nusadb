@@ -641,38 +641,93 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// If a dollar-quote delimiter (`$$` or `$tag$`) begins at `chars[i]` (which must be `$`), return its
+/// tag (the text between the two dollar signs, empty for `$$`) and the delimiter's length in `char`s.
+///
+/// A tag follows unquoted-identifier rules (a letter or underscore, then letters/digits/underscores),
+/// so a positional parameter like `$1` is not a delimiter and `$` there stays literal.
+fn dollar_delimiter_at(chars: &[char], i: usize) -> Option<(String, usize)> {
+    debug_assert_eq!(chars.get(i), Some(&'$'));
+    let mut j = i + 1;
+    while chars
+        .get(j)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        j += 1;
+    }
+    // The candidate tag is `chars[i + 1..j]`; a real delimiter closes it with a second `$`.
+    if chars.get(j) != Some(&'$') {
+        return None;
+    }
+    let tag: String = chars.iter().skip(i + 1).take(j - (i + 1)).collect();
+    // A non-empty tag cannot start with a digit (identifier rule); this rejects `$1$` too.
+    if tag.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((tag, j - i + 1))
+}
+
 /// Split a batch of SQL (e.g. a `--file` body) into individual statements on `;`.
 ///
-/// Semicolons inside single- or double-quoted strings (with `''`/`""` doubling) do not split.
-/// Whitespace-only fragments are dropped; trailing input without a `;` is returned as a final
-/// statement.
+/// Semicolons inside single- or double-quoted strings (with `''`/`""` doubling) do not split, nor do
+/// semicolons inside a dollar-quoted string (`$$ … $$` or `$tag$ … $tag$`) — so a function or
+/// procedure body written with dollar-quoting survives as one statement. Whitespace-only fragments
+/// are dropped; trailing input without a `;` is returned as a final statement.
 #[must_use]
 pub fn split_statements(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
+    // The tag of the dollar-quoted string currently open (empty for `$$`), or `None` when not inside
+    // one; only its matching `$tag$` closes it, and quotes/semicolons are literal within.
+    let mut dollar_tag: Option<String> = None;
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if let Some(tag) = &dollar_tag {
+            if c == '$'
+                && let Some((closing, len)) = dollar_delimiter_at(&chars, i)
+                && &closing == tag
+            {
+                cur.extend(chars.iter().skip(i).take(len));
+                i += len;
+                dollar_tag = None;
+                continue;
+            }
+            cur.push(c);
+            i += 1;
+            continue;
+        }
         match c {
             '\'' if !in_double => {
                 cur.push(c);
-                if in_single && chars.peek() == Some(&'\'') {
-                    if let Some(q) = chars.next() {
-                        cur.push(q); // escaped '' — stays inside the string
-                    }
+                if in_single && chars.get(i + 1) == Some(&'\'') {
+                    cur.push('\''); // escaped '' — stays inside the string
+                    i += 1;
                 } else {
                     in_single = !in_single;
                 }
+                i += 1;
             },
             '"' if !in_single => {
                 cur.push(c);
-                if in_double && chars.peek() == Some(&'"') {
-                    if let Some(q) = chars.next() {
-                        cur.push(q); // escaped "" — stays inside the identifier
-                    }
+                if in_double && chars.get(i + 1) == Some(&'"') {
+                    cur.push('"'); // escaped "" — stays inside the identifier
+                    i += 1;
                 } else {
                     in_double = !in_double;
+                }
+                i += 1;
+            },
+            '$' if !in_single && !in_double => {
+                if let Some((tag, len)) = dollar_delimiter_at(&chars, i) {
+                    cur.extend(chars.iter().skip(i).take(len));
+                    i += len;
+                    dollar_tag = Some(tag);
+                } else {
+                    cur.push(c);
+                    i += 1;
                 }
             },
             ';' if !in_single && !in_double => {
@@ -680,8 +735,12 @@ pub fn split_statements(input: &str) -> Vec<String> {
                     out.push(cur.trim().to_owned());
                 }
                 cur.clear();
+                i += 1;
             },
-            _ => cur.push(c),
+            _ => {
+                cur.push(c);
+                i += 1;
+            },
         }
     }
     if !cur.trim().is_empty() {
@@ -944,5 +1003,36 @@ mod tests {
         );
         // trailing statement without a terminator is kept.
         assert_eq!(split_statements("a; b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn statements_do_not_split_inside_dollar_quotes() {
+        // A `;` inside a `$$ … $$` body keeps the whole `CREATE FUNCTION` as one statement.
+        assert_eq!(
+            split_statements(
+                "CREATE FUNCTION f(a int) RETURNS int LANGUAGE nusascript \
+                 AS $$ BEGIN RETURN a * 3; END $$; SELECT f(2)"
+            ),
+            vec![
+                "CREATE FUNCTION f(a int) RETURNS int LANGUAGE nusascript \
+                 AS $$ BEGIN RETURN a * 3; END $$",
+                "SELECT f(2)",
+            ]
+        );
+        // A custom tag closes only on the same tag; a `;` and a bare `$$` inside it are literal.
+        assert_eq!(
+            split_statements("DO $body$ SELECT 1; SELECT '$$' $body$; SELECT 2"),
+            vec!["DO $body$ SELECT 1; SELECT '$$' $body$", "SELECT 2"]
+        );
+        // A positional parameter (`$1`) is not a dollar-quote, so `;` still splits around it.
+        assert_eq!(
+            split_statements("SELECT $1; SELECT $2"),
+            vec!["SELECT $1", "SELECT $2"]
+        );
+        // An empty-tag body with no internal `;` still round-trips as one statement.
+        assert_eq!(
+            split_statements("CREATE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+            vec!["CREATE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"]
+        );
     }
 }
