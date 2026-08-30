@@ -703,6 +703,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // sqlparser binds the identical left operand — and record the mode per sentinel. See
     // `strip_is_json`.
     strip_is_json(&mut tokens)?;
+    // `ORDER BY <key> USING <op>`: sqlparser has no operator field on its sort key (only ASC/DESC),
+    // so rewrite `USING <` / `USING >` to the equivalent `ASC` / `DESC` keyword before parsing.
+    rewrite_order_by_using(&mut tokens);
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -711,6 +714,46 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
         1 => convert_statement(statements.remove(0)),
         0 => Err(Error::Empty),
         n => Err(Error::MultipleStatements(n)),
+    }
+}
+
+/// Rewrite `ORDER BY <key> USING <op>` to the equivalent `ASC` / `DESC` sort direction, which
+/// sqlparser's sort key can represent (it has no ordering-operator field). Per the SQL standard,
+/// `USING <` orders ascending and `USING >` descending. Only `USING` immediately followed (ignoring
+/// whitespace) by a `<` or `>` comparison operator is touched — `JOIN ... USING (cols)` is followed
+/// by `(`, and `CONVERT(... USING x)` / `DELETE ... USING t` by an identifier, so none of those ever
+/// precede a comparison operator and none are affected. A non-strict or unknown operator (`<=`, a
+/// custom one) is left as-is, so the parser reports it rather than this silently guessing a direction.
+fn rewrite_order_by_using(tokens: &mut Vec<TokenWithSpan>) {
+    use sqlparser::keywords::Keyword;
+    let is_using = |t: Option<&TokenWithSpan>| matches!(t, Some(t) if matches!(&t.token, Token::Word(w) if w.keyword == Keyword::USING));
+    // Cheap guard: only walk when a `USING` word is present at all.
+    if !tokens.iter().any(|t| is_using(Some(t))) {
+        return;
+    }
+    let is_nonws = |t: Option<&TokenWithSpan>| matches!(t, Some(t) if !matches!(t.token, Token::Whitespace(_)));
+    let next_nonws = |toks: &[TokenWithSpan], from: usize| {
+        (from + 1..toks.len()).find(|&j| is_nonws(toks.get(j)))
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if is_using(tokens.get(i))
+            && let Some(j) = next_nonws(tokens, i)
+        {
+            let dir = tokens.get(j).and_then(|t| match t.token {
+                Token::Lt => Some("ASC"),
+                Token::Gt => Some("DESC"),
+                _ => None,
+            });
+            if let Some(dir) = dir {
+                // Replace `USING <op>` (indices `i..=j`, spanning any whitespace between them) with a
+                // single ASC/DESC keyword word; the parser then binds it as an ordinary sort direction.
+                let replacement = TokenWithSpan::wrap(Token::make_word(dir, None));
+                let _: Vec<TokenWithSpan> = tokens.splice(i..=j, [replacement]).collect();
+                continue; // the list shifted; re-examine from the same position
+            }
+        }
+        i += 1;
     }
 }
 

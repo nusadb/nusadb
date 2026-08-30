@@ -2032,6 +2032,30 @@ fn select_where_order_by_limit() {
 }
 
 #[test]
+fn order_by_using_operator_maps_to_asc_or_desc() {
+    // `USING <` sorts ascending, `USING >` descending (the SQL-standard rule); the token rewrite
+    // turns them into the ordinary sort direction before parsing.
+    let ast::Statement::Select(s) = ok("SELECT v FROM t ORDER BY v USING <") else {
+        panic!("expected Select");
+    };
+    assert_eq!(s.order_by.len(), 1);
+    assert!(s.order_by[0].ascending, "USING < is ascending");
+
+    let ast::Statement::Select(s) = ok("SELECT id, v FROM t ORDER BY v USING >, id USING <") else {
+        panic!("expected Select");
+    };
+    assert_eq!(s.order_by.len(), 2);
+    assert!(!s.order_by[0].ascending, "USING > is descending");
+    assert!(s.order_by[1].ascending, "USING < is ascending");
+
+    // `JOIN ... USING (cols)` is untouched — its `USING` is followed by `(`, never an operator.
+    let ast::Statement::Select(s) = ok("SELECT a.v FROM t a JOIN t b USING (id)") else {
+        panic!("expected Select");
+    };
+    assert_eq!(s.from.expect("FROM").joins.len(), 1);
+}
+
+#[test]
 fn select_without_from() {
     let ast::Statement::Select(s) = ok("SELECT 1") else {
         panic!("expected Select");
