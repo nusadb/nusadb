@@ -37,8 +37,9 @@ fn next_savepoint() -> String {
 enum Flow {
     /// Continue with the next statement.
     Normal,
-    /// `RETURN` was hit — stop the enclosing procedure.
-    Return,
+    /// `RETURN` was hit — stop the enclosing routine, carrying the returned value (`None` for a bare
+    /// `RETURN`, as a procedure uses; `Some` for a function's `RETURN expr`).
+    Return(Option<ast::Value>),
 }
 
 /// The variable environment: declared name → current value.
@@ -55,6 +56,32 @@ pub(super) fn run_block(
     let mut env = Env::new();
     exec_block(block, &mut env, params, engine, txn)?;
     Ok(env)
+}
+
+/// Run a parsed NusaScript block as a *function* body: execute it and yield the value of the
+/// `RETURN expr` that stopped it, coerced to the declared return type. Reaching the end of the body —
+/// or a bare `RETURN` with no value — without returning a value is an error: a function must return
+/// one. (A procedure uses [`run_block`], which ignores the return value.)
+#[allow(
+    dead_code,
+    reason = "foundation for a NusaScript CREATE FUNCTION; the query-time call site that invokes this \
+              lands in a following increment"
+)]
+pub(super) fn run_function_block(
+    block: &ScriptBlock,
+    params: &[ast::Value],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    return_ty: ColumnType,
+) -> Result<ast::Value, Error> {
+    let mut env = Env::new();
+    match exec_block(block, &mut env, params, engine, txn)? {
+        Flow::Return(Some(value)) => super::eval::cast_value(value, return_ty),
+        Flow::Return(None) | Flow::Normal => Err(Error::Coded {
+            message: "control reached end of function without RETURN".to_owned(),
+            sqlstate: "2F005",
+        }),
+    }
 }
 
 /// Execute a block, honoring its `EXCEPTION WHEN OTHERS THEN` handler: if the body errors and
@@ -94,8 +121,8 @@ fn exec_stmts(
     txn: TxnId,
 ) -> Result<Flow, Error> {
     for stmt in stmts {
-        if matches!(exec_one(stmt, env, params, engine, txn)?, Flow::Return) {
-            return Ok(Flow::Return);
+        if let Flow::Return(value) = exec_one(stmt, env, params, engine, txn)? {
+            return Ok(Flow::Return(value));
         }
     }
     Ok(Flow::Normal)
@@ -141,8 +168,8 @@ fn exec_one(
                         "NusaScript WHILE loop exceeded the iteration limit".to_owned(),
                     ));
                 }
-                if matches!(exec_stmts(body, env, params, engine, txn)?, Flow::Return) {
-                    return Ok(Flow::Return);
+                if let Flow::Return(value) = exec_stmts(body, env, params, engine, txn)? {
+                    return Ok(Flow::Return(value));
                 }
             }
             Ok(Flow::Normal)
@@ -165,8 +192,8 @@ fn exec_one(
                     ));
                 }
                 env.insert(var.clone(), ast::Value::Int(i));
-                if matches!(exec_stmts(body, env, params, engine, txn)?, Flow::Return) {
-                    return Ok(Flow::Return);
+                if let Flow::Return(value) = exec_stmts(body, env, params, engine, txn)? {
+                    return Ok(Flow::Return(value));
                 }
             }
             Ok(Flow::Normal)
@@ -175,7 +202,13 @@ fn exec_one(
             let value = eval_value(expr, env, params, engine, txn)?;
             Err(Error::Raised(message_text(&value)))
         },
-        ScriptStmt::Return => Ok(Flow::Return),
+        ScriptStmt::Return(expr) => {
+            let value = match expr {
+                Some(expr) => Some(eval_value(expr, env, params, engine, txn)?),
+                None => None,
+            };
+            Ok(Flow::Return(value))
+        },
         ScriptStmt::Block(block) => exec_block(block, env, params, engine, txn),
         ScriptStmt::Sql(sql) => {
             let bound = bind((**sql).clone(), env, params, engine, txn)?;

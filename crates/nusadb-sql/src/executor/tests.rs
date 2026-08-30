@@ -3500,6 +3500,45 @@ fn aggregate_as_window_function_argument() {
     assert!(run("SELECT sum(count(*)) FROM t GROUP BY id", &engine).is_err());
 }
 
+/// NusaScript foundation for a `CREATE FUNCTION` body: a function body's `RETURN expr` yields a value,
+/// coerced to the declared return type; a `RETURN` reachable through control flow works; and a body
+/// that never returns a value is an error (a function must return one). This drives `run_function_block`
+/// directly — the runtime invocation from a query is a later increment.
+#[test]
+fn nusascript_function_body_returns_a_value_or_errors() {
+    let engine = MockEngine::new();
+    let txn = engine.begin(IsolationLevel::default()).unwrap();
+    let run_fn = |body: &str, args: &[Value], ret: ColumnType| {
+        let block = crate::parser::parse_script(body).unwrap();
+        super::script::run_function_block(&block, args, &engine, txn, ret)
+    };
+
+    // `RETURN expr` yields the value, coerced to the declared return type.
+    assert_eq!(
+        run_fn(
+            "BEGIN RETURN $1 + 1; END",
+            &[Value::Int(41)],
+            ColumnType::Int
+        )
+        .unwrap(),
+        Value::Int(42)
+    );
+    // A `RETURN` reached through control flow (inside an IF).
+    assert_eq!(
+        run_fn(
+            "BEGIN IF $1 > 0 THEN RETURN 'pos'; ELSE RETURN 'neg'; END IF; END",
+            &[Value::Int(5)],
+            ColumnType::Text,
+        )
+        .unwrap(),
+        Value::Text("pos".into())
+    );
+    // Falling off the end without returning a value is an error.
+    assert!(run_fn("BEGIN DECLARE x INT DEFAULT 1; END", &[], ColumnType::Int).is_err());
+    // A bare `RETURN` (no value) in a function is likewise an error.
+    assert!(run_fn("BEGIN RETURN; END", &[], ColumnType::Int).is_err());
+}
+
 /// A date string whose fields are well-shaped `YYYY-MM-DD` but out of the calendar range
 /// (Feb 30, month 13, day 99) is a field-overflow (22008), distinct from a mis-shaped
 /// literal that is an invalid-format error (22007). The reference engine draws the same line.

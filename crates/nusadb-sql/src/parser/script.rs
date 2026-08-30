@@ -80,8 +80,9 @@ pub(crate) enum ScriptStmt {
     },
     /// `RAISE expr` — abort the procedure with the message `expr` evaluates to.
     Raise(ast::Expr),
-    /// `RETURN` — stop the procedure (no value; procedures do not return values in v1).
-    Return,
+    /// `RETURN [expr]` — stop the routine. A procedure uses the bare `RETURN` (`None`); a function
+    /// uses `RETURN expr` to yield its result value.
+    Return(Option<ast::Expr>),
     /// An embedded SQL data statement (`INSERT`/`UPDATE`/`DELETE`/`SELECT`/`CALL`). Boxed because an
     /// [`ast::Statement`] is far larger than the other variants.
     Sql(Box<ast::Statement>),
@@ -224,7 +225,17 @@ fn parse_one(parser: &mut Parser) -> Result<ScriptStmt, Error> {
         },
         Some("return") => {
             parser.next_token();
-            Ok(ScriptStmt::Return)
+            // A bare `RETURN` (at a `;`, block terminator, or end of input) yields no value — the
+            // procedure form; `RETURN expr` yields a function's result.
+            let value = if matches!(parser.peek_token().token, Token::SemiColon | Token::EOF)
+                || peek_word(parser)
+                    .is_some_and(|w| matches!(w.as_str(), "end" | "else" | "elsif" | "exception"))
+            {
+                None
+            } else {
+                Some(parse_expr(parser)?)
+            };
+            Ok(ScriptStmt::Return(value))
         },
         // Anything else is an embedded SQL data statement.
         _ => {
