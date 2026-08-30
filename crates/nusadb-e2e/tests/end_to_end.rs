@@ -950,10 +950,12 @@ fn functional_partial_and_desc_indexes_end_to_end() {
     );
 
     // `DESC` is accepted: the B-tree is built ascending and the planner serves a descending
-    // `ORDER BY` by scanning it backward, so the direction changes no result. A per-column `NULLS`
-    // placement is still rejected loudly (the engine has no null-placement control).
+    // `ORDER BY` by scanning it backward, so the direction changes no result. A per-column `NULLS
+    // FIRST/LAST` is likewise accepted and its placement ignored — safely, since the only path that
+    // uses an index to satisfy an `ORDER BY` fires solely over `NOT NULL` columns, and a nullable
+    // ordering column always falls back to an explicit sort that honours the query's own placement.
     assert!(run_try(&engine, "CREATE INDEX idx_a_desc ON t (a DESC)").is_ok());
-    assert!(run_try(&engine, "CREATE INDEX idx_a_nulls ON t (a NULLS FIRST)").is_err());
+    assert!(run_try(&engine, "CREATE INDEX idx_a_nulls ON t (a NULLS FIRST)").is_ok());
     // A user-defined SQL function in a key is rejected at CREATE, not silently unmaintainable: the
     // write-path re-analysis has no function catalog, so accepting it would produce a UNIQUE index
     // that enforces nothing.

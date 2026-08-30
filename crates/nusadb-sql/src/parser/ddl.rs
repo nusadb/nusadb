@@ -776,9 +776,9 @@ fn convert_index_key_expr(key: &sql::IndexColumn) -> Result<String, Error> {
     Ok(key.column.expr.to_string())
 }
 
-/// Reject index-key modifiers the engine cannot honor: an operator class, `WITH FILL`, and per-column
-/// `NULLS FIRST`/`NULLS LAST`. `ASC`/`DESC` are *accepted* (see below). Direction matters only for an
-/// *ordered* index scan, which the engine now does — the planner walks a matching ascending index
+/// Reject index-key modifiers the engine cannot honor: an operator class and `WITH FILL`. Per-column
+/// `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST` are *accepted* (see below). Direction matters only for
+/// an *ordered* index scan, which the engine now does — the planner walks a matching ascending index
 /// backward to satisfy a descending `ORDER BY` (see `try_ordered_index_scan`). So a `DESC` key builds
 /// the same ascending B-tree, and a descending-ordered query over it is still accelerated by the
 /// backward scan; the results are identical either way. `NULLS DISTINCT` is handled by the caller.
@@ -792,21 +792,21 @@ fn reject_index_key_modifiers(
     if key.operator_class.is_some() && !allow_operator_class {
         return unsupported("CREATE INDEX with an operator class on a key column");
     }
-    // `ASC`/`DESC` are both accepted: the B-tree is always built ascending, and the planner serves a
-    // descending `ORDER BY` by scanning that index backward, so the direction annotation changes no
-    // result. (A mixed-direction multi-column key simply is not served by one ordered scan and falls
-    // back to a sort — still correct.)
-    if key.column.options.nulls_first.is_some() {
-        return unsupported("CREATE INDEX with NULLS FIRST/LAST on a key column");
-    }
+    // `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST` are accepted and carry no effect on results: the
+    // B-tree is always built ascending, and the planner serves a descending `ORDER BY` by scanning it
+    // backward. The per-key null placement is likewise ignored, and safely so — the only path that
+    // uses an index to satisfy an `ORDER BY` (`try_ordered_index_scan`) fires solely over `NOT NULL`
+    // columns, where no NULL exists for a placement to reorder; a nullable ordering column always
+    // falls back to an explicit sort, which honours the query's own `NULLS FIRST/LAST` regardless of
+    // how the index was declared.
     if key.column.with_fill.is_some() {
         return unsupported("CREATE INDEX with WITH FILL on a key column");
     }
     Ok(())
 }
 
-/// Extract a plain column name from an index-key entry. Per-column `ASC`/`DESC`/`NULLS` and other
-/// key modifiers are rejected by [`reject_index_key_modifiers`].
+/// Extract a plain column name from an index-key entry. Per-column `ASC`/`DESC`/`NULLS` are accepted
+/// but carry no effect; an operator class / `WITH FILL` is rejected by [`reject_index_key_modifiers`].
 pub(super) fn convert_index_key(
     key: &sql::IndexColumn,
     allow_operator_class: bool,

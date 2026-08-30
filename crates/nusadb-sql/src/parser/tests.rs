@@ -236,6 +236,32 @@ fn create_index_accepts_explicit_btree_and_rejects_other_scalar_methods() {
 }
 
 #[test]
+fn create_index_accepts_per_key_asc_desc_and_nulls_ordering() {
+    // Per-key `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST` are accepted and carry no effect: the
+    // B-tree is built ascending and the null placement is ignored (safe — an ordered index scan
+    // only serves a `NOT NULL` column, where no NULL exists for a placement to reorder). Each key
+    // folds to its plain column name.
+    let cases = [
+        ("CREATE INDEX i ON t (v NULLS FIRST)", vec!["v"]),
+        ("CREATE INDEX i ON t (v NULLS LAST)", vec!["v"]),
+        ("CREATE INDEX i ON t (v DESC NULLS FIRST)", vec!["v"]),
+        ("CREATE INDEX i ON t (a, v NULLS LAST)", vec!["a", "v"]),
+    ];
+    for (sql, cols) in cases {
+        let ast::Statement::CreateIndex(ci) = ok(sql) else {
+            panic!("expected CreateIndex for {sql}");
+        };
+        assert_eq!(
+            ci.columns,
+            cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+    // A modifier the engine truly cannot honor stays rejected.
+    assert!(parse("CREATE INDEX i ON t (v gist_trgm_ops)").is_err());
+}
+
+#[test]
 fn create_index_unique_if_not_exists_multi_column_with_include() {
     let ast::Statement::CreateIndex(ci) =
         ok("CREATE UNIQUE INDEX IF NOT EXISTS orders_lookup_idx \
