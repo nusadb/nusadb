@@ -860,15 +860,41 @@ fn analyze_sql_function(
     args: &[ast::Expr],
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
-    aggregates: Option<&mut Vec<AggregateCall>>,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
-    // A NusaScript function is run by the interpreter, not inlined like a SQL function; invoking one
-    // from a query is a following increment, so a call to it is rejected clearly here rather than
-    // mis-parsed as a `SELECT` body below.
+    // A NusaScript function is run by the interpreter per row, not inlined like a SQL function. Type
+    // its argument expressions, then emit a `NusaCall` the executor invokes through the per-statement
+    // execution context; the result type is the declared return type.
     if matches!(func.language, crate::ast::FunctionLanguage::NusaScript) {
-        return Err(Error::Unsupported(format!(
-            "calling a NusaScript function (`{name}`) from a query is not supported yet"
-        )));
+        if args.len() != func.param_count {
+            return Err(Error::ArityMismatch {
+                context: format!("function `{name}`"),
+                expected: func.param_count,
+                found: args.len(),
+            });
+        }
+        let mut typed_args = Vec::with_capacity(args.len());
+        for arg in args {
+            typed_args.push(analyze_expr_agg(
+                arg,
+                scope,
+                catalog,
+                None,
+                aggregates.as_deref_mut(),
+            )?);
+        }
+        return Ok(TypedExpr {
+            kind: TypedExprKind::NusaCall {
+                args: typed_args,
+                def: Box::new(crate::planner::NusaCallDef {
+                    name: name.to_owned(),
+                    param_names: func.param_names.clone(),
+                    body: func.body.clone(),
+                    return_type: func.return_type,
+                }),
+            },
+            ty: func.return_type,
+        });
     }
     if args.len() != func.param_count {
         return Err(Error::ArityMismatch {

@@ -297,6 +297,12 @@ fn fold_children(kind: TypedExprKind) -> TypedExprKind {
             args: fold_vec(args),
             arg_types,
         },
+        // A NusaScript call's arguments fold, but the call itself is never constant-evaluated (the
+        // function may be non-deterministic or side-effecting), so the node is kept.
+        K::NusaCall { args, def } => K::NusaCall {
+            args: fold_vec(args),
+            def,
+        },
         K::SetReturning { func, args } => K::SetReturning {
             func,
             args: fold_vec(args),

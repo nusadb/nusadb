@@ -3510,7 +3510,7 @@ fn nusascript_function_body_returns_a_value_or_errors() {
     let txn = engine.begin(IsolationLevel::default()).unwrap();
     let run_fn = |body: &str, args: &[Value], ret: ColumnType| {
         let block = crate::parser::parse_script(body).unwrap();
-        super::script::run_function_block(&block, args, &engine, txn, ret)
+        super::script::run_function_block(&block, args, &[], &engine, txn, ret)
     };
 
     // `RETURN expr` yields the value, coerced to the declared return type.

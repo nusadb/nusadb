@@ -345,6 +345,7 @@ pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
         TypedExprKind::Coalesce(args)
         | TypedExprKind::ScalarFunction { args, .. }
         | TypedExprKind::ScalarUdf { args, .. }
+        | TypedExprKind::NusaCall { args, .. }
         | TypedExprKind::ArrayLiteral(args)
         | TypedExprKind::SetReturning { args, .. } => {
             for arg in args {
@@ -465,6 +466,7 @@ pub(super) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
         TypedExprKind::Coalesce(args)
         | TypedExprKind::ScalarFunction { args, .. }
         | TypedExprKind::ScalarUdf { args, .. }
+        | TypedExprKind::NusaCall { args, .. }
         | TypedExprKind::ArrayLiteral(args)
         // A set-returning function only appears in a projection, never a join predicate, but cover
         // its arguments here for completeness.

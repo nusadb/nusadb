@@ -19,10 +19,10 @@
     reason = "exact `== 0.0` is the canonical division-by-zero guard"
 )]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 
-use nusadb_core::ColumnType;
+use nusadb_core::{ColumnType, StorageEngine, TxnId};
 
 use crate::ast;
 use crate::composite::CompositeVal;
@@ -56,6 +56,96 @@ impl Drop for OuterRowGuard {
             stack.borrow_mut().pop();
         });
     }
+}
+
+/// The engine + transaction of the statement executing on this thread, pinned by
+/// [`bind_exec_context`] for the duration of its execution. A [`TypedExprKind::NusaCall`] reads it to
+/// run the function body against the same engine/transaction.
+#[derive(Clone, Copy)]
+struct ExecContext {
+    engine: *const dyn StorageEngine,
+    txn: TxnId,
+}
+
+thread_local! {
+    static EXEC_CONTEXT: Cell<Option<ExecContext>> = const { Cell::new(None) };
+    /// Nesting depth of NusaScript function invocations, bounding (mutually) recursive calls.
+    static NUSA_CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Maximum nesting depth of NusaScript function calls (a call inside a call inside …).
+const MAX_NUSA_CALL_DEPTH: usize = 64;
+
+/// Pin `engine` + `txn` as the execution context for the returned guard's lifetime, so a `NusaCall`
+/// evaluated within it can run its body against them. Restored to the previous context on drop, so a
+/// nested statement (a function body's own query) leaves the outer context intact.
+#[must_use]
+pub(crate) fn bind_exec_context(engine: &dyn StorageEngine, txn: TxnId) -> ExecContextGuard {
+    // Erase the borrow's lifetime so the fat pointer fits a `'static` thread-local. SAFETY: this only
+    // stashes the pointer; the guard restores the previous context on drop, and every read
+    // (`invoke_nusa_function`) happens strictly within this call's dynamic extent, where `engine` is
+    // still borrowed and alive — so the pointer is never dereferenced after it dangles.
+    let engine: *const dyn StorageEngine =
+        unsafe { std::mem::transmute::<&dyn StorageEngine, *const dyn StorageEngine>(engine) };
+    let prev = EXEC_CONTEXT.with(|c| c.replace(Some(ExecContext { engine, txn })));
+    ExecContextGuard(prev)
+}
+
+/// Restores the execution context pinned by [`bind_exec_context`] on drop.
+pub(crate) struct ExecContextGuard(Option<ExecContext>);
+
+impl Drop for ExecContextGuard {
+    fn drop(&mut self) {
+        EXEC_CONTEXT.with(|c| c.set(self.0));
+    }
+}
+
+/// Decrements the NusaScript call-depth counter on drop, pairing with the increment in
+/// [`invoke_nusa_function`] so every early return still restores the depth.
+struct NusaCallDepthGuard;
+
+impl Drop for NusaCallDepthGuard {
+    fn drop(&mut self) {
+        NUSA_CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Invoke a NusaScript function: run its `body` against the pinned execution context, binding
+/// `arg_values` to the parameters, and return the value of its `RETURN` coerced to `return_type`.
+/// Errors if there is no execution context (a `NusaCall` reached outside statement execution) or the
+/// call nesting is too deep.
+fn invoke_nusa_function(
+    name: &str,
+    body: &str,
+    param_names: &[String],
+    arg_values: &[ast::Value],
+    return_type: ColumnType,
+) -> Result<ast::Value, Error> {
+    let Some(ctx) = EXEC_CONTEXT.with(Cell::get) else {
+        return Err(Error::Unsupported(format!(
+            "a NusaScript function (`{name}`) cannot be called in this context"
+        )));
+    };
+    NUSA_CALL_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth = NusaCallDepthGuard;
+    if NUSA_CALL_DEPTH.with(Cell::get) > MAX_NUSA_CALL_DEPTH {
+        return Err(Error::LimitExceeded(format!(
+            "NusaScript function `{name}` exceeded the call-nesting limit"
+        )));
+    }
+    // SAFETY: `ctx.engine` was pinned by `bind_exec_context`'s guard, which lives for the whole of the
+    // statement's execution on this thread. This evaluation is reached only from within that
+    // execution (a function body runs in the same pinned context), so the engine reference is live.
+    let engine: &dyn StorageEngine = unsafe { &*ctx.engine };
+    let block = crate::parser::parse_script(body)?;
+    super::script::run_function_block(
+        &block,
+        arg_values,
+        param_names,
+        engine,
+        ctx.txn,
+        return_type,
+    )
 }
 
 /// Read an `OuterColumn` from the bound outer-row stack: `level = 1` is the innermost enclosing
@@ -255,6 +345,22 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
                 values.push(cast_value(eval(arg, row)?, *want)?);
             }
             crate::udf::call_scalar_udf(name, &values)
+        },
+        // A NusaScript function: evaluate its arguments, then run the body against the pinned
+        // execution context (which supplies the engine + transaction). A nested `NusaCall` in an
+        // argument recurses through this same arm, reading the same pinned context.
+        TypedExprKind::NusaCall { args, def } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(eval(arg, row)?);
+            }
+            invoke_nusa_function(
+                &def.name,
+                &def.body,
+                &def.param_names,
+                &values,
+                def.return_type,
+            )
         },
         // `Project` runs over the single row produced by `ScalarAggregate`, whose column `slot`
         // holds the computed value for that aggregate call.

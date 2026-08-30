@@ -467,6 +467,7 @@ pub(super) fn resolve_subqueries(
         K::Coalesce(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::ArrayLiteral(args)
         | K::SetReturning { args, .. } => {
             for arg in args {
@@ -685,6 +686,7 @@ pub(crate) fn contains_subquery(expr: &TypedExpr) -> bool {
         K::Coalesce(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::ArrayLiteral(args)
         | K::SetReturning { args, .. } => args.iter().any(contains_subquery),
         K::Crypto { value, key, .. } => contains_subquery(value) || contains_subquery(key),
@@ -767,6 +769,7 @@ pub(crate) fn contains_sequence_call(expr: &TypedExpr) -> bool {
         },
         K::Coalesce(args)
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::ArrayLiteral(args)
         | K::SetReturning { args, .. } => args.iter().any(contains_sequence_call),
         K::Crypto { value, key, .. } => {
@@ -886,6 +889,7 @@ pub(super) fn resolve_sequence_calls(
         K::Coalesce(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::ArrayLiteral(args)
         | K::SetReturning { args, .. } => {
             for arg in args {
@@ -1126,6 +1130,7 @@ fn expr_has_outer_column(expr: &TypedExpr) -> bool {
         K::Coalesce(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::ArrayLiteral(args)
         | K::SetReturning { args, .. } => args.iter().any(expr_has_outer_column),
         K::Crypto { value, key, .. } => expr_has_outer_column(value) || expr_has_outer_column(key),

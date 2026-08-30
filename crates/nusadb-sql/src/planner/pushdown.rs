@@ -430,6 +430,7 @@ fn collect_expr(expr: &TypedExpr, cols: &mut BTreeSet<usize>, has_sq: &mut bool)
         | K::ArrayLiteral(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::SetReturning { args, .. } => {
             for a in args {
                 collect_expr(a, cols, has_sq);
@@ -587,6 +588,7 @@ fn remap_expr(expr: &mut TypedExpr, map: &HashMap<usize, usize>) {
         | K::ArrayLiteral(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::SetReturning { args, .. } => {
             for a in args {
                 remap_expr(a, map);

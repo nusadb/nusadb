@@ -196,31 +196,58 @@ fn function_body_must_be_a_scalar_select() {
 }
 
 #[test]
-fn nusascript_function_round_trips_but_is_not_callable_yet() {
+fn nusascript_function_is_created_stored_and_invoked() {
     let engine = BtreeEngine::new();
 
-    // A multi-statement NusaScript body (with `;` between statements) is created and persisted. The
-    // `LANGUAGE plpgsql` spelling is accepted as a surface alias for the procedural language, and may
-    // sit after the body (the reference engine's usual order).
+    // A multi-statement NusaScript body: declare a local, assign from the named parameter, return it.
+    // `LANGUAGE plpgsql` is accepted as a surface alias and may sit after the body.
     run(
         &engine,
         "CREATE FUNCTION step(n INT) RETURNS INT AS $$ BEGIN DECLARE x INT DEFAULT 0; SET x = n + 1; RETURN x; END $$ LANGUAGE plpgsql",
     );
 
-    // Calling it from a query is not supported yet (invocation is a following increment): a clear
-    // error, not a mis-parse of the body as a SELECT.
-    let err = run_try(&engine, "SELECT step(1)").expect_err("not yet callable");
-    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    // It is invoked per row: `step(1)` runs the body (`x := 1 + 1`) and returns 2.
+    assert_eq!(
+        rows(run(&engine, "SELECT step(1)")),
+        vec![vec![Value::Int(2)]]
+    );
 
-    // `LANGUAGE nusascript` first, plus `OR REPLACE`, both work.
+    // `OR REPLACE` with `LANGUAGE nusascript` first changes the behavior the next call sees.
     run(
         &engine,
         "CREATE OR REPLACE FUNCTION step(n INT) RETURNS INT LANGUAGE nusascript AS $$ BEGIN RETURN n * 2; END $$",
+    );
+    assert_eq!(
+        rows(run(&engine, "SELECT step(3)")),
+        vec![vec![Value::Int(6)]]
     );
     assert!(matches!(
         run(&engine, "DROP FUNCTION step"),
         ExecutionResult::FunctionDropped
     ));
+    // Once dropped, the call is unknown again.
+    assert!(run_try(&engine, "SELECT step(1)").is_err());
+
+    // Control flow + recursion: factorial via IF and a self-call, invoked in a projection over a table.
+    run(
+        &engine,
+        "CREATE FUNCTION fact(n INT) RETURNS INT AS $$ BEGIN IF n <= 1 THEN RETURN 1; END IF; RETURN n * fact(n - 1); END $$ LANGUAGE plpgsql",
+    );
+    run(&engine, "CREATE TABLE nums (n INT)");
+    run(&engine, "INSERT INTO nums VALUES (1), (4), (5)");
+    assert_eq!(
+        rows(run(&engine, "SELECT fact(n) FROM nums ORDER BY n")),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(24)],
+            vec![Value::Int(120)],
+        ]
+    );
+    // A nested call composes, and the result coerces to its declared type in an outer expression.
+    assert_eq!(
+        rows(run(&engine, "SELECT fact(fact(3))")),
+        vec![vec![Value::Int(720)]]
+    );
 
     // A SQL function is unaffected — still inlined and callable.
     run(

@@ -62,19 +62,20 @@ pub(super) fn run_block(
 /// `RETURN expr` that stopped it, coerced to the declared return type. Reaching the end of the body —
 /// or a bare `RETURN` with no value — without returning a value is an error: a function must return
 /// one. (A procedure uses [`run_block`], which ignores the return value.)
-#[allow(
-    dead_code,
-    reason = "foundation for a NusaScript CREATE FUNCTION; the query-time call site that invokes this \
-              lands in a following increment"
-)]
 pub(super) fn run_function_block(
     block: &ScriptBlock,
     params: &[ast::Value],
+    param_names: &[String],
     engine: &dyn StorageEngine,
     txn: TxnId,
     return_ty: ColumnType,
 ) -> Result<ast::Value, Error> {
     let mut env = Env::new();
+    // Seed the parameters by name so the body may reference them as `n` as well as positionally as
+    // `$1`..`$n` (the positional form is bound from `params` by the embedded-SQL path).
+    for (name, value) in param_names.iter().zip(params) {
+        env.insert(name.clone(), value.clone());
+    }
     match exec_block(block, &mut env, params, engine, txn)? {
         Flow::Return(Some(value)) => super::eval::cast_value(value, return_ty),
         Flow::Return(None) | Flow::Normal => Err(Error::Coded {

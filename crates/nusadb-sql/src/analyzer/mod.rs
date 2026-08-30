@@ -416,11 +416,14 @@ pub struct FunctionDef {
     /// inline time. Empty for functions persisted before names were tracked (positional-only).
     pub param_names: Vec<String>,
     /// The implementation language. A `SQL` function is inlined at the call site; a NusaScript
-    /// function is run by the interpreter (invocation is a following increment). Rows persisted before
-    /// the language was tracked decode as `SQL`.
+    /// function is run by the interpreter. Rows persisted before the language was tracked decode as
+    /// `SQL`.
     pub language: crate::ast::FunctionLanguage,
-    /// The function body — a `SELECT <expr>` for `SQL` (the result type is the inlined body's type;
-    /// the declared `RETURNS` is accepted but not enforced), or a `BEGIN … END` block for NusaScript.
+    /// The declared return type. For a NusaScript call it is the call's result type (and the type its
+    /// `RETURN` value is coerced to). For a SQL function the result type is the inlined body's instead;
+    /// a row persisted before the return type was tracked decodes as `TEXT`.
+    pub return_type: ColumnType,
+    /// The function body — a `SELECT <expr>` for `SQL`, or a `BEGIN … END` block for NusaScript.
     pub body: String,
 }
 
@@ -701,13 +704,13 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE/DROP FUNCTION: a SQL scalar function, inlined at call sites by the analyzer.
         ast::Statement::CreateFunction(cf) => {
             enforce_system_catalog(&cf.name, catalog)?;
-            // The declared RETURNS type is accepted at parse time but not stored/enforced (v1).
             Ok(LogicalPlan::CreateFunction(CreateFunctionPlan {
                 name: cf.name,
                 or_replace: cf.or_replace,
                 param_count: cf.params.len(),
                 param_names: cf.params.iter().map(|p| p.name.clone()).collect(),
                 language: cf.language,
+                return_type: cf.return_type,
                 body: cf.body,
             }))
         },
@@ -1198,6 +1201,7 @@ fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
         K::OuterColumn { .. }
         | K::AggregateRef(_)
         | K::ScalarUdf { .. }
+        | K::NusaCall { .. }
         | K::SetReturning { .. }
         | K::ScalarSubquery(_)
         | K::Exists { .. }

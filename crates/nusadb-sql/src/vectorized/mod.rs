@@ -447,6 +447,12 @@ fn expr_is_vectorizable(expr: &TypedExpr) -> bool {
         | K::Overlaps { .. }
         // Composite operations have no vectorized kernel; they evaluate on the row path.
         | K::Composite(_)
+        // A NusaScript call runs the interpreter through the row evaluator, which reads the engine +
+        // transaction from a thread-local execution context bound only on the dispatching thread. The
+        // parallel aggregate fold evaluates on worker threads that do not inherit that context, so a
+        // `NusaCall` reached there would spuriously fail — keep it off the vectorized/parallel path
+        // entirely so it always falls back to the row path, where the context is bound.
+        | K::NusaCall { .. }
         | K::AggregateRef(_) => false,
         K::Literal(_) | K::Column(_) => true,
         K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {
@@ -512,4 +518,32 @@ pub trait Operator: std::fmt::Debug {
     ///
     /// Propagates any decode/storage/evaluation error encountered while producing the batch.
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::NusaCallDef;
+    use nusadb_core::ColumnType;
+
+    /// A NusaScript call must never be routed onto the vectorized/parallel path: its interpreter
+    /// reads the engine + transaction from a thread-local execution context bound only on the
+    /// dispatching thread, so a call reached on a parallel-aggregate worker (which does not inherit
+    /// that context) would spuriously fail. It always falls back to the row path instead.
+    #[test]
+    fn nusascript_call_is_never_vectorizable() {
+        let call = TypedExpr {
+            kind: TypedExprKind::NusaCall {
+                args: Vec::new(),
+                def: Box::new(NusaCallDef {
+                    name: "f".to_owned(),
+                    param_names: Vec::new(),
+                    body: "BEGIN RETURN 1; END".to_owned(),
+                    return_type: ColumnType::BigInt,
+                }),
+            },
+            ty: ColumnType::BigInt,
+        };
+        assert!(!expr_is_vectorizable(&call));
+    }
 }

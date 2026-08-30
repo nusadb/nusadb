@@ -820,6 +820,8 @@ pub struct CreateFunctionPlan {
     pub param_names: Vec<String>,
     /// The implementation language (`SQL` or NusaScript).
     pub language: crate::ast::FunctionLanguage,
+    /// The declared return type (persisted; a NusaScript call types to it and coerces its `RETURN`).
+    pub return_type: ColumnType,
     /// The function body — a `SELECT <expr>` for `SQL`, or a `BEGIN … END` block for NusaScript.
     pub body: String,
 }
@@ -1645,6 +1647,20 @@ pub struct TypedExpr {
     pub ty: ColumnType,
 }
 
+/// The static definition of a NusaScript function, carried (boxed) by a [`TypedExprKind::NusaCall`]
+/// so the call node stays small. Identical for every call to the function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NusaCallDef {
+    /// The function name (folded), for error messages and recursion accounting.
+    pub name: String,
+    /// Declared parameter names (folded), bound to the arguments positionally (`$1`..`$n`) and by name.
+    pub param_names: Vec<String>,
+    /// The `BEGIN … END` body text, parsed on invocation.
+    pub body: String,
+    /// The declared return type; the `RETURN` value is coerced to it and it is the call's `ty`.
+    pub return_type: ColumnType,
+}
+
 /// The shape of a [`TypedExpr`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
@@ -1866,6 +1882,19 @@ pub enum TypedExprKind {
         /// The UDF's declared parameter types, captured at analysis time so the executor coerces each
         /// argument to the contract type without a per-row registry read (deep-gate).
         arg_types: Vec<ColumnType>,
+    },
+    /// A call to a NusaScript function, run by the interpreter per row (unlike a `SQL` function, which
+    /// is inlined). The executor evaluates each argument, binds them to the parameters, runs the body,
+    /// and takes the value of its `RETURN`; `ty` is the declared return type. Evaluation needs the
+    /// engine + transaction, so it is served through the per-statement execution context.
+    NusaCall {
+        /// Argument expressions, in positional order (arity-checked at analysis time), evaluated per
+        /// row and bound to the parameters.
+        args: Vec<TypedExpr>,
+        /// The function's static definition (name, parameter names, body, return type). Boxed to keep
+        /// [`TypedExprKind`] small — this metadata is identical for every call and would otherwise
+        /// bloat the hot expression enum (and every `Result<_, TypedExpr>` with it).
+        def: Box<NusaCallDef>,
     },
     /// A set-returning function at the top of a `SELECT`-list item; `ty` is the per-row
     /// element type it produces. It yields multiple values per input row, so the scalar evaluator

@@ -642,6 +642,9 @@ pub fn execute_in_txn_as_streaming(
         engine.begin_statement(txn)?;
         // Mirror `dispatch`'s per-statement clock pin (bypassed here because we skip `dispatch`).
         clock::set_statement_now();
+        // Pin the engine + transaction for a NusaScript function call in the streamed projection
+        // (this path skips `execute_in_txn`, where the buffered path pins it).
+        let _exec_ctx = eval::bind_exec_context(engine, txn);
         return stream_select_rows(&op, engine, txn, sink);
     }
     // Capture the row shape before the plan is consumed so a replayed RETURNING set is typed.
@@ -674,6 +677,9 @@ pub fn execute_in_txn_as_streaming_with_settings(
         // So the extended-query streaming path stays on one snapshot.
         engine.begin_statement(txn)?;
         clock::set_statement_now();
+        // Pin the engine + transaction for a NusaScript function call in the streamed projection
+        // (this path skips `execute_in_txn`, where the buffered path pins it).
+        let _exec_ctx = eval::bind_exec_context(engine, txn);
         return stream_select_rows(&op, engine, txn, sink);
     }
     // Capture the row shape before the plan is consumed so a replayed RETURNING set is typed.
@@ -2061,6 +2067,11 @@ fn dispatch(
     // Pin the wall clock for this statement so every NOW()/CURRENT_TIMESTAMP/CURRENT_DATE/
     // CURRENT_TIME it contains observes the same instant (SQL statement stability).
     clock::set_statement_now();
+    // Pin the engine + transaction so a NusaScript function call reached by the evaluator can run its
+    // body against them. `dispatch` is the primitive every non-streaming path reaches (the streaming
+    // SELECT path binds it separately); it is re-entered for `Batch` desugars and nested trigger /
+    // procedure / DO / function bodies, which re-bind the same context and restore it on return.
+    let _exec_ctx = eval::bind_exec_context(engine, txn);
     match plan {
         // The multi-object DDL desugar: children run in order within this same statement
         // transaction (so `DROP TABLE a, b` is atomic); the first error aborts the rest and

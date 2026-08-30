@@ -2389,6 +2389,7 @@ fn remap_grouped_outer_refs(expr: &mut TypedExpr, depth: usize, group_keys: &[Ty
         K::Coalesce(args)
         | K::ScalarFunction { args, .. }
         | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
         | K::ArrayLiteral(args) => {
             for a in args {
                 remap_grouped_outer_refs(a, depth, group_keys);
@@ -2616,6 +2617,7 @@ pub(super) fn rebase_onto_aggregation(
         },
         TypedExprKind::ScalarFunction { args, .. }
         | TypedExprKind::ScalarUdf { args, .. }
+        | TypedExprKind::NusaCall { args, .. }
         | TypedExprKind::ArrayLiteral(args) => {
             for arg in args {
                 rebase_onto_aggregation(arg, ctx)?;
