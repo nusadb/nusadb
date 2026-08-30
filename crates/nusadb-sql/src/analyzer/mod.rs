@@ -415,8 +415,12 @@ pub struct FunctionDef {
     /// positionally as `$1`..`$n` or by these names; both bind to the call arguments at
     /// inline time. Empty for functions persisted before names were tracked (positional-only).
     pub param_names: Vec<String>,
-    /// The function body as canonical SQL (a `SELECT <expr>`). The result type is the inlined body's
-    /// type; the declared `RETURNS` type is accepted but not enforced (a follow-up, like `PREPARE`).
+    /// The implementation language. A `SQL` function is inlined at the call site; a NusaScript
+    /// function is run by the interpreter (invocation is a following increment). Rows persisted before
+    /// the language was tracked decode as `SQL`.
+    pub language: crate::ast::FunctionLanguage,
+    /// The function body — a `SELECT <expr>` for `SQL` (the result type is the inlined body's type;
+    /// the declared `RETURNS` is accepted but not enforced), or a `BEGIN … END` block for NusaScript.
     pub body: String,
 }
 
@@ -703,6 +707,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 or_replace: cf.or_replace,
                 param_count: cf.params.len(),
                 param_names: cf.params.iter().map(|p| p.name.clone()).collect(),
+                language: cf.language,
                 body: cf.body,
             }))
         },

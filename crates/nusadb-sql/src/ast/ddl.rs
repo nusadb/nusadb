@@ -450,11 +450,21 @@ pub struct Call {
     pub args: Vec<Expr>,
 }
 
-/// `CREATE [OR REPLACE] FUNCTION name(p type, ...) RETURNS type [LANGUAGE SQL] AS <body>`.
+/// The implementation language of a [`CreateFunction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionLanguage {
+    /// `LANGUAGE SQL` — the body is a `SELECT <expr>` inlined at the call site.
+    Sql,
+    /// A NusaScript procedural body (`BEGIN … RETURN expr … END`), run by the interpreter. The
+    /// `plpgsql` spelling is accepted as a surface alias for compatibility and maps here.
+    NusaScript,
+}
+
+/// `CREATE [OR REPLACE] FUNCTION name(p type, ...) RETURNS type [LANGUAGE lang] AS <body>`.
 ///
-/// The body is a `SELECT <expr>` whose single scalar projection references the parameters as
-/// `$1`..`$n`. A call to the function is inlined: the body's expression (with arguments substituted
-/// for the placeholders) is analyzed in place of the call.
+/// A `LANGUAGE SQL` body is a `SELECT <expr>` whose single scalar projection references the parameters
+/// as `$1`..`$n`, inlined at the call site. A NusaScript body is a `BEGIN … END` block executed by the
+/// interpreter, which yields the value of its `RETURN expr`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateFunction {
     /// Function name (unique).
@@ -465,7 +475,10 @@ pub struct CreateFunction {
     pub params: Vec<ProcedureParam>,
     /// The declared return type.
     pub return_type: ColumnType,
-    /// The function body as raw SQL (`SELECT <expr>`).
+    /// The implementation language (`SQL` or NusaScript).
+    pub language: FunctionLanguage,
+    /// The function body as raw text — a `SELECT <expr>` for `SQL`, or a `BEGIN … END` block for
+    /// NusaScript.
     pub body: String,
 }
 

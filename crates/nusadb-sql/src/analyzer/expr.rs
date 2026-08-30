@@ -862,6 +862,14 @@ fn analyze_sql_function(
     catalog: &dyn Catalog,
     aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
+    // A NusaScript function is run by the interpreter, not inlined like a SQL function; invoking one
+    // from a query is a following increment, so a call to it is rejected clearly here rather than
+    // mis-parsed as a `SELECT` body below.
+    if matches!(func.language, crate::ast::FunctionLanguage::NusaScript) {
+        return Err(Error::Unsupported(format!(
+            "calling a NusaScript function (`{name}`) from a query is not supported yet"
+        )));
+    }
     if args.len() != func.param_count {
         return Err(Error::ArityMismatch {
             context: format!("function `{name}`"),

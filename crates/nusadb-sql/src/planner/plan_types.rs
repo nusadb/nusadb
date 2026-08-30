@@ -818,7 +818,9 @@ pub struct CreateFunctionPlan {
     /// Declared parameter names, in order (lowercase-folded) — persisted so a call can bind arguments
     /// to the body's named references as well as `$1`..`$n`.
     pub param_names: Vec<String>,
-    /// The function body as canonical SQL (a `SELECT <expr>`).
+    /// The implementation language (`SQL` or NusaScript).
+    pub language: crate::ast::FunctionLanguage,
+    /// The function body — a `SELECT <expr>` for `SQL`, or a `BEGIN … END` block for NusaScript.
     pub body: String,
 }
 

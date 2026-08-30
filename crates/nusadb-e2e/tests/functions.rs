@@ -194,3 +194,52 @@ fn function_body_must_be_a_scalar_select() {
         .is_err()
     );
 }
+
+#[test]
+fn nusascript_function_round_trips_but_is_not_callable_yet() {
+    let engine = BtreeEngine::new();
+
+    // A multi-statement NusaScript body (with `;` between statements) is created and persisted. The
+    // `LANGUAGE plpgsql` spelling is accepted as a surface alias for the procedural language, and may
+    // sit after the body (the reference engine's usual order).
+    run(
+        &engine,
+        "CREATE FUNCTION step(n INT) RETURNS INT AS $$ BEGIN DECLARE x INT DEFAULT 0; SET x = n + 1; RETURN x; END $$ LANGUAGE plpgsql",
+    );
+
+    // Calling it from a query is not supported yet (invocation is a following increment): a clear
+    // error, not a mis-parse of the body as a SELECT.
+    let err = run_try(&engine, "SELECT step(1)").expect_err("not yet callable");
+    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+
+    // `LANGUAGE nusascript` first, plus `OR REPLACE`, both work.
+    run(
+        &engine,
+        "CREATE OR REPLACE FUNCTION step(n INT) RETURNS INT LANGUAGE nusascript AS $$ BEGIN RETURN n * 2; END $$",
+    );
+    assert!(matches!(
+        run(&engine, "DROP FUNCTION step"),
+        ExecutionResult::FunctionDropped
+    ));
+
+    // A SQL function is unaffected — still inlined and callable.
+    run(
+        &engine,
+        "CREATE FUNCTION dbl(x INT) RETURNS INT AS $$ SELECT x * 2 $$",
+    );
+    run(&engine, "CREATE TABLE t (n INT)");
+    run(&engine, "INSERT INTO t VALUES (21)");
+    assert_eq!(
+        rows(run(&engine, "SELECT dbl(n) FROM t")),
+        vec![vec![Value::Int(42)]]
+    );
+
+    // An unknown implementation language is rejected.
+    assert!(
+        run_try(
+            &engine,
+            "CREATE FUNCTION z(n INT) RETURNS INT LANGUAGE python AS $$ x $$",
+        )
+        .is_err()
+    );
+}

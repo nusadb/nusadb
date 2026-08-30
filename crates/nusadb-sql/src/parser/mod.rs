@@ -2776,50 +2776,97 @@ fn parse_create_function(sql: &str) -> Result<ast::Statement, Error> {
     parser.expect_keyword(Keyword::RETURNS).map_err(syntax)?;
     let return_type = convert_data_type(&parser.parse_data_type().map_err(syntax)?)?;
 
-    if parser.parse_keyword(Keyword::LANGUAGE) {
-        let lang = fold_ident(&parser.parse_identifier().map_err(syntax)?);
-        if lang != "sql" {
-            return unsupported("CREATE FUNCTION supports only LANGUAGE SQL");
+    // `LANGUAGE <lang>` and `AS <body>` may appear in either order after `RETURNS` (the reference
+    // engine writes `LANGUAGE` last); collect them in a small loop. `LANGUAGE` defaults to SQL.
+    let mut language: Option<ast::FunctionLanguage> = None;
+    let mut body: Option<String> = None;
+    loop {
+        if parser.parse_keyword(Keyword::LANGUAGE) {
+            if language.is_some() {
+                return unsupported("CREATE FUNCTION with a repeated LANGUAGE clause");
+            }
+            let lang = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+            language = Some(match lang.as_str() {
+                "sql" => ast::FunctionLanguage::Sql,
+                // `plpgsql` is accepted as a surface alias for the NusaScript procedural language.
+                "plpgsql" | "nusascript" => ast::FunctionLanguage::NusaScript,
+                _ => {
+                    return unsupported(
+                        "CREATE FUNCTION supports LANGUAGE SQL or the NusaScript procedural language",
+                    );
+                },
+            });
+        } else if parser.parse_keyword(Keyword::AS) {
+            if body.is_some() {
+                return unsupported("CREATE FUNCTION with a repeated body");
+            }
+            body = Some(match parser.next_token().token {
+                Token::SingleQuotedString(s) => s,
+                Token::DollarQuotedString(dq) => dq.value,
+                other => {
+                    return Err(Error::Syntax(format!(
+                        "expected a quoted function body after AS, found {other}"
+                    )));
+                },
+            });
+        } else {
+            break;
         }
     }
-    parser.expect_keyword(Keyword::AS).map_err(syntax)?;
-    let body = match parser.next_token().token {
-        Token::SingleQuotedString(s) => s,
-        Token::DollarQuotedString(dq) => dq.value,
-        other => {
-            return Err(Error::Syntax(format!(
-                "expected a quoted function body after AS, found {other}"
-            )));
-        },
-    };
     expect_statement_end(&mut parser)?;
-
-    // The body must be `SELECT <expr>` — one scalar projection, no FROM — and reference at most the
-    // declared parameters.
-    let ast::Statement::Select(select) = parse(&body)? else {
-        return unsupported("a function body must be a `SELECT <expr>` statement");
+    let Some(body) = body else {
+        return unsupported("CREATE FUNCTION requires an `AS <body>`");
     };
-    if select.from.is_some()
-        || select.projection.len() != 1
-        || !matches!(
-            select.projection.first(),
-            Some(ast::SelectItem::Expr { .. })
-        )
-    {
-        return unsupported(
-            "a function body must be `SELECT <expr>` — a single scalar expression with no FROM",
-        );
-    }
-    if crate::params::parameter_count(&ast::Statement::Select(select)) > params.len() {
-        return unsupported("a function body references more parameters than are declared");
-    }
+    let language = language.unwrap_or(ast::FunctionLanguage::Sql);
+    validate_function_body(language, &body, params.len())?;
     Ok(ast::Statement::CreateFunction(ast::CreateFunction {
         name,
         or_replace,
         params,
         return_type,
+        language,
         body,
     }))
+}
+
+/// Validate a `CREATE FUNCTION` body against its language at creation time, so a malformed body is a
+/// CREATE-time error rather than one surfacing only at the first call. A `SQL` body must be a single
+/// scalar `SELECT <expr>` with no `FROM` that references at most the declared parameters (it is inlined
+/// at the call site); a NusaScript body must be a `BEGIN … END` block that parses.
+fn validate_function_body(
+    language: ast::FunctionLanguage,
+    body: &str,
+    param_count: usize,
+) -> Result<(), Error> {
+    match language {
+        ast::FunctionLanguage::Sql => {
+            let ast::Statement::Select(select) = parse(body)? else {
+                return unsupported("a SQL function body must be a `SELECT <expr>` statement");
+            };
+            if select.from.is_some()
+                || select.projection.len() != 1
+                || !matches!(
+                    select.projection.first(),
+                    Some(ast::SelectItem::Expr { .. })
+                )
+            {
+                return unsupported(
+                    "a SQL function body must be `SELECT <expr>` — a single scalar expression with no FROM",
+                );
+            }
+            if crate::params::parameter_count(&ast::Statement::Select(select)) > param_count {
+                return unsupported("a function body references more parameters than are declared");
+            }
+            Ok(())
+        },
+        ast::FunctionLanguage::NusaScript => {
+            if !script::is_script(body) {
+                return unsupported("a procedural function body must be a `BEGIN ... END` block");
+            }
+            script::parse_script(body)?;
+            Ok(())
+        },
+    }
 }
 
 /// Drive `DROP FUNCTION [IF EXISTS] name`.
