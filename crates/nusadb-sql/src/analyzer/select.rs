@@ -3059,18 +3059,24 @@ pub(super) fn analyze_aggregate(
     arg: Option<&ast::Expr>,
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<(Option<TypedExpr>, ColumnType), Error> {
+    // The aggregate's argument is analyzed with `aggregates` as its aggregate sink. A plain aggregate
+    // passes `None`, so a nested aggregate argument (`sum(count(*))` with no window) is rejected. A
+    // window aggregate (`sum(count(*)) OVER ()`) passes the sink, so its argument may itself be an
+    // aggregate — the inner aggregate is computed at the group level and the window runs over the
+    // grouped rows (double aggregation).
     match (func, arg) {
         // COUNT(*) — no arg; counts every input row.
         (ast::AggregateFunc::Count, None) => Ok((None, ColumnType::Int)),
         // COUNT(expr) — counts non-NULL `expr`.
         (ast::AggregateFunc::Count, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             Ok((Some(typed), ColumnType::Int))
         },
         // SUM(expr) / AVG(expr) — numeric only. SUM(Int)→Int, SUM(Float)→Float.
         (ast::AggregateFunc::Sum | ast::AggregateFunc::Avg, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             if !is_numeric(typed.ty) {
                 return Err(Error::TypeMismatch {
                     context: format!("{func:?} requires a numeric argument"),
@@ -3105,13 +3111,13 @@ pub(super) fn analyze_aggregate(
         },
         // MIN(expr) / MAX(expr) — any comparable type; result keeps the type.
         (ast::AggregateFunc::Min | ast::AggregateFunc::Max, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             Ok((Some(typed.clone()), typed.ty))
         },
         // ARRAY_AGG(expr) — collect values into an array; the element type is `expr`'s type, which
         // must be array-able (a scalar; not NUMERIC/JSON/nested-array).
         (ast::AggregateFunc::ArrayAgg, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             // A NUMERIC argument (e.g. `array_agg(0.5)` — a decimal literal now types as NUMERIC)
             // falls back to a FLOAT element, the same as `ARRAY[…]` literals: NUMERIC[] is
             // not a supported element type yet, so this preserves the earlier behavior.
@@ -3138,13 +3144,19 @@ pub(super) fn analyze_aggregate(
         // first argument is the key — any type, coerced to a text object key at execution; its value
         // is the second argument, resolved in the aggregate analysis arm. Both yield JSON.
         (ast::AggregateFunc::JsonAgg | ast::AggregateFunc::JsonObjectAgg, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             Ok((Some(typed), ColumnType::Json))
         },
         // BOOL_AND(expr) / BOOL_OR(expr) — boolean argument; result BOOL. A bare NULL argument types
         // as BOOL via the hint, so the empty/NULL-only group still yields a BOOL NULL.
         (ast::AggregateFunc::BoolAnd | ast::AggregateFunc::BoolOr, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, Some(ColumnType::Bool))?;
+            let typed = analyze_expr_agg(
+                arg,
+                scope,
+                catalog,
+                Some(ColumnType::Bool),
+                aggregates.as_deref_mut(),
+            )?;
             if typed.ty != ColumnType::Bool {
                 return Err(Error::TypeMismatch {
                     context: format!("{func:?} requires a boolean argument"),
@@ -3159,7 +3171,13 @@ pub(super) fn analyze_aggregate(
             ast::AggregateFunc::BitAnd | ast::AggregateFunc::BitOr | ast::AggregateFunc::BitXor,
             Some(arg),
         ) => {
-            let typed = analyze_expr(arg, scope, catalog, Some(ColumnType::Int))?;
+            let typed = analyze_expr_agg(
+                arg,
+                scope,
+                catalog,
+                Some(ColumnType::Int),
+                aggregates.as_deref_mut(),
+            )?;
             if typed.ty != ColumnType::Int {
                 return Err(Error::TypeMismatch {
                     context: format!("{func:?} requires an integer argument"),
@@ -3172,7 +3190,13 @@ pub(super) fn analyze_aggregate(
         // STRING_AGG(expr, sep) — concatenate TEXT inputs; TEXT argument, TEXT result. The separator
         // is resolved in the aggregate analysis arm (it is a constant, not a per-row value).
         (ast::AggregateFunc::StringAgg, Some(arg)) => {
-            let typed = analyze_expr(arg, scope, catalog, Some(ColumnType::Text))?;
+            let typed = analyze_expr_agg(
+                arg,
+                scope,
+                catalog,
+                Some(ColumnType::Text),
+                aggregates.as_deref_mut(),
+            )?;
             if typed.ty != ColumnType::Text {
                 return Err(Error::TypeMismatch {
                     context: "STRING_AGG requires a text argument".to_owned(),
@@ -3194,7 +3218,7 @@ pub(super) fn analyze_aggregate(
             | ast::AggregateFunc::VarPop,
             Some(arg),
         ) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             if !is_numeric(typed.ty) {
                 return Err(Error::TypeMismatch {
                     context: format!("{func:?} requires a numeric argument"),
@@ -3230,7 +3254,7 @@ pub(super) fn analyze_aggregate(
             | ast::AggregateFunc::RegrR2,
             Some(arg),
         ) => {
-            let typed = analyze_expr(arg, scope, catalog, None)?;
+            let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates)?;
             if !is_numeric(typed.ty) {
                 return Err(Error::TypeMismatch {
                     context: format!("{func:?} requires a numeric argument"),

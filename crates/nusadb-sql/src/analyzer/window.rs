@@ -344,6 +344,10 @@ pub(super) fn resolve_window(
             )?;
             vec![value, offset, default]
         },
+        // An aggregate window function's argument is analyzed once, with the sink, in the
+        // `W::Aggregate` arm below (so `sum(count(*)) OVER ()` extracts the inner aggregate exactly
+        // once); pre-analyzing it here too would double-extract it.
+        (W::Aggregate(_), _) => Vec::new(),
         _ => wf
             .args
             .iter()
@@ -392,7 +396,9 @@ pub(super) fn resolve_window(
             (vec![expr, n], ty)
         },
         W::Aggregate(func) => {
-            let (arg, ty) = analyze_aggregate(*func, wf.args.first(), scope, catalog)?;
+            // Pass the aggregate sink so the argument may itself be an aggregate — `sum(count(*))
+            // OVER ()` computes `count(*)` per group, then the window sums over the grouped rows.
+            let (arg, ty) = analyze_aggregate(*func, wf.args.first(), scope, catalog, aggregates)?;
             (arg.into_iter().collect(), ty)
         },
     };

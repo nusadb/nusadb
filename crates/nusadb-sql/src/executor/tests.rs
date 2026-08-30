@@ -3475,6 +3475,31 @@ fn char_n_output_is_blank_padded_only_at_the_top_level() {
     );
 }
 
+/// A window function whose argument is itself an aggregate — `sum(count(*)) OVER ()` — computes the
+/// inner aggregate per group, then runs the window over the grouped rows (double aggregation). A
+/// nested aggregate WITHOUT a window stays rejected, because a plain aggregate's argument may not
+/// itself be an aggregate.
+#[test]
+fn aggregate_as_window_function_argument() {
+    let engine = MockEngine::new();
+    run("CREATE TABLE t (id INT, v INT)", &engine).unwrap();
+    run("INSERT INTO t VALUES (1, 2), (1, 5), (2, 3)", &engine).unwrap();
+    let rows = |sql: &str| rows_of(run(sql, &engine).unwrap()).1;
+
+    // Per group: count(*) = {2, 1}; the window sums the two grouped rows to 3, repeated per row.
+    assert_eq!(
+        rows("SELECT sum(count(*)) OVER () FROM t GROUP BY id"),
+        vec![vec![Value::Int(3)], vec![Value::Int(3)]]
+    );
+    // Per group: sum(v) = {7, 3}; the window sums them to 10.
+    assert_eq!(
+        rows("SELECT sum(sum(v)) OVER () FROM t GROUP BY id"),
+        vec![vec![Value::Int(10)], vec![Value::Int(10)]]
+    );
+    // A nested aggregate with no window is still rejected — the plain-aggregate rule is unchanged.
+    assert!(run("SELECT sum(count(*)) FROM t GROUP BY id", &engine).is_err());
+}
+
 /// A date string whose fields are well-shaped `YYYY-MM-DD` but out of the calendar range
 /// (Feb 30, month 13, day 99) is a field-overflow (22008), distinct from a mis-shaped
 /// literal that is an invalid-format error (22007). The reference engine draws the same line.

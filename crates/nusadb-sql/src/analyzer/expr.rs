@@ -592,7 +592,9 @@ pub(super) fn analyze_expr_agg(
                     _ => Vec::new(),
                 };
                 let (typed_arg, result_ty) = if row_args.is_empty() {
-                    analyze_aggregate(*func, arg.as_deref(), scope, catalog)?
+                    // A plain aggregate's argument may not itself be an aggregate (no sink), so a
+                    // nested aggregate without a window is rejected.
+                    analyze_aggregate(*func, arg.as_deref(), scope, catalog, None)?
                 } else {
                     (None, ColumnType::Int)
                 };
