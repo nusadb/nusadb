@@ -23,8 +23,12 @@
 # A reason is a measurement, not a guess. If you cannot say what the wire did differently, the
 # entry does not belong here yet. Every reason below is the diff the runner actually reported.
 #
-# All five failures below are scenario disagreements, not harness faults. That distinction is
+# All three failures below are scenario disagreements, not harness faults. That distinction is
 # enforced: a file whose connection breaks is not excusable by this list at all.
+#
+# `PREPARE`/`EXECUTE`/`DEALLOCATE` as SQL statements were once listed here, refused `0A000` over the
+# wire while the embedded path served them; each connection now holds its own prepared-statement
+# store, so both paths agree and the two entries were retired.
 #
 # Four entries have already been deleted from this file. `SHOW COLUMNS` declared its nullable
 # column TEXT and emitted a boolean, so the runner had no tag to canonicalise by and refused to
@@ -42,13 +46,6 @@ p13_functions/string_extra.slt:106  empty TEXT: the in-process runner writes `(e
 p1_ddl/create_drop.slt:84           CREATE DATABASE refused `0A000`: needs the server's database manager, which this harness does not build
 
 # --- the two paths genuinely differ ------------------------------------------------------------
-# `PREPARE`/`EXECUTE`/`DEALLOCATE` are intercepted by `Session::execute` and refused `0A000` over a
-# connection, where a client uses the extended query protocol instead. The corpus pins the embedded
-# behaviour, and these green results were the original evidence that it was reporting on a path no
-# client takes.
-p1_ddl/schema_qualified.slt:267     PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
-p5_advanced/window_filter.slt:145   PREPARE/EXECUTE as SQL statements: refused `0A000` over the wire, intercepted by `Session` in-process
-
 # `SET TRANSACTION ISOLATION LEVEL` inside a transaction that has not run a statement yet: the wire
 # re-begins the engine transaction at the new level (observably equivalent, and what the SQL rule
 # "before the transaction's first statement" allows), while `Session` refuses whenever a

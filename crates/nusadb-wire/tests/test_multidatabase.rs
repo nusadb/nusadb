@@ -1055,15 +1055,12 @@ async fn returning_reports_the_dml_command_tag_not_select() {
 }
 
 #[tokio::test]
-async fn sql_level_prepare_over_a_connection_says_it_is_not_built() {
+async fn sql_level_prepare_execute_deallocate_work_over_a_connection() {
     // `PREPARE` / `EXECUTE` / `DEALLOCATE` as SQL statements need a place to keep the statement
-    // between calls. The embedded `Session` has one; the wire server does not, so these route to a
-    // defensive arm that used to report `XX000` — telling every client the server had faulted when
-    // the truth is that this spelling is not built. `0A000` says that, and the message points at
-    // the extended query protocol, which is how a connected client prepares a statement today.
-    //
-    // The SQL-level form is pinned in the SLT corpus and passes there, because that harness runs
-    // the embedded path. Only a real connection sees this.
+    // between calls. Each connection holds its own `PreparedStore` (the SQL-level spelling of the
+    // extended query protocol's per-connection Parse/Bind store), so a connected client can prepare a
+    // parameterized statement once and execute it with different arguments — mirroring the embedded
+    // `Session` and matching the reference engine.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cluster: Arc<dyn DatabaseCluster> = Arc::new(MockCluster::new());
@@ -1075,13 +1072,28 @@ async fn sql_level_prepare_over_a_connection_says_it_is_not_built() {
     ));
 
     let mut c = connect(addr, "nusadb").await.expect("connect");
-    for sql in ["PREPARE p AS SELECT 1", "EXECUTE p", "DEALLOCATE p"] {
-        assert_eq!(
-            run(&mut c, sql).await,
-            Outcome::Error("0A000".to_owned()),
-            "`{sql}` must say the feature is not built, not that the server broke"
-        );
-    }
+    // PREPARE stores; EXECUTE binds `$1..$n` and runs; the prepared statement is reusable with new
+    // arguments; DEALLOCATE discards it, after which EXECUTE reports `26000`.
+    assert_eq!(
+        run(&mut c, "PREPARE p AS SELECT $1::int + 1 AS r").await,
+        Outcome::Done("PREPARE".to_owned())
+    );
+    assert_eq!(run(&mut c, "EXECUTE p (41)").await, Outcome::Rows(1));
+    assert_eq!(run(&mut c, "EXECUTE p (100)").await, Outcome::Rows(1));
+    assert_eq!(
+        run(&mut c, "EXECUTE p (1, 2)").await,
+        Outcome::Error("42883".to_owned()),
+        "wrong argument count is rejected"
+    );
+    assert_eq!(
+        run(&mut c, "DEALLOCATE p").await,
+        Outcome::Done("DEALLOCATE".to_owned())
+    );
+    assert_eq!(
+        run(&mut c, "EXECUTE p (1)").await,
+        Outcome::Error("26000".to_owned()),
+        "a deallocated statement no longer exists"
+    );
 
     server.abort();
 }

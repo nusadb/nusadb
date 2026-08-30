@@ -765,6 +765,86 @@ pub fn execute_in_txn_as_streaming_with_cursors(
     }
 }
 
+/// Whether `plan` is a prepared-statement statement (`PREPARE`/`EXECUTE`/`DEALLOCATE`), which needs a
+/// per-connection [`PreparedStore`] rather than the stateless execution path.
+#[must_use]
+pub const fn is_prepare_plan(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Prepare { .. } | PhysicalPlan::Execute { .. } | PhysicalPlan::Deallocate(_)
+    )
+}
+
+/// Streaming execution that also serves `PREPARE` / `EXECUTE` / `DEALLOCATE` against a per-connection
+/// [`PreparedStore`].
+///
+/// A non-prepared plan is handed to [`execute_in_txn_as_streaming_with_settings`] unchanged. `PREPARE`
+/// stores the un-analyzed statement and its placeholder count; `DEALLOCATE` discards one or all;
+/// `EXECUTE` binds the stored statement's `$1..$n` to the given constant values, then analyzes, plans
+/// and streams the bound statement in `txn` — so a prepared `SELECT` streams and a prepared
+/// data-modifying statement reports its row count. `txn` is caller-managed, exactly like the delegate
+/// — never committed or rolled back here.
+///
+/// # Errors
+/// Propagates execution errors and any error returned by `sink`.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the wire server's per-connection GUC store is a default-hasher HashMap"
+)]
+pub fn execute_in_txn_as_streaming_with_prepared(
+    plan: PhysicalPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+    settings: &HashMap<String, String>,
+    store: &mut PreparedStore,
+    sink: &mut dyn RowSink,
+) -> Result<StreamOutcome, Error> {
+    if !is_prepare_plan(&plan) {
+        return execute_in_txn_as_streaming_with_settings(plan, engine, txn, user, settings, sink);
+    }
+    session_ctx::set_session_user_with_settings(user, settings);
+    match plan {
+        PhysicalPlan::Prepare {
+            name,
+            statement,
+            param_count,
+        } => {
+            store.prepare(name, *statement, param_count);
+            Ok(StreamOutcome::Other(ExecutionResult::Prepared))
+        },
+        PhysicalPlan::Deallocate(target) => {
+            store.deallocate(&target)?;
+            Ok(StreamOutcome::Other(ExecutionResult::Deallocated))
+        },
+        PhysicalPlan::Execute { name, args } => {
+            let (statement, param_count) = store.lookup(&name)?;
+            if args.len() != param_count {
+                return Err(Error::FunctionArgs(format!(
+                    "prepared statement \"{name}\" expects {param_count} parameter(s), got {}",
+                    args.len()
+                )));
+            }
+            // Bind the constant arguments to `$1..$n`, then analyze + plan the bound statement under
+            // this connection's transaction and search path (the session user drives row-level
+            // security, so `EXECUTE` cannot bypass it) and stream it like a directly submitted one.
+            let bound = crate::params::substitute_values(statement, &args)?;
+            let catalog = SessionCatalog {
+                engine,
+                txn,
+                user,
+                search_path: crate::search_path_schemas(
+                    settings.get("search_path").map(String::as_str),
+                ),
+            };
+            let logical = crate::analyze(bound, &catalog)?;
+            let physical = crate::plan(logical);
+            execute_in_txn_as_streaming_with_settings(physical, engine, txn, user, settings, sink)
+        },
+        _ => unreachable!("is_prepare_plan admits only PREPARE / EXECUTE / DEALLOCATE"),
+    }
+}
+
 /// Replay a finished [`ExecutionResult`] into `sink` for a non-streamed statement: a row result
 /// announces its columns then pushes each row; anything else passes through as
 /// [`StreamOutcome::Other`]. Keeps the streaming entry points behaviourally identical to the
@@ -930,7 +1010,7 @@ pub struct Session<'engine> {
     current_schema: String,
     /// Statements prepared in this session via `PREPARE`, keyed by name. Re-analyzed and run
     /// on `EXECUTE` with the supplied arguments bound to their `$n` placeholders.
-    prepared: HashMap<String, PreparedStatement>,
+    prepared: PreparedStore,
     /// Cursors opened in this session via `DECLARE ... CURSOR`. Each holds the query's rows
     /// materialized at declaration (a stable snapshot) and a position; `FETCH` reads from it and
     /// `CLOSE` discards it. Cursors are session-lived — every NusaDB cursor behaves like `WITH HOLD`.
@@ -953,9 +1033,66 @@ pub struct Session<'engine> {
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A statement stored by `PREPARE`: the un-analyzed body plus its placeholder count.
+#[derive(Debug)]
 struct PreparedStatement {
     statement: ast::Statement,
     param_count: usize,
+}
+
+/// A store of `PREPARE`d statements keyed by name.
+///
+/// Held by the embedded [`Session`] and, over the wire, by each connection (behind a mutex) so a
+/// connected client can `PREPARE` / `EXECUTE` / `DEALLOCATE` — the SQL-level spelling of the
+/// extended-query protocol's Parse/Bind.
+#[derive(Debug, Default)]
+pub struct PreparedStore {
+    prepared: HashMap<String, PreparedStatement>,
+}
+
+impl PreparedStore {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store (or replace) a prepared statement under `name`.
+    fn prepare(&mut self, name: String, statement: ast::Statement, param_count: usize) {
+        self.prepared.insert(
+            name,
+            PreparedStatement {
+                statement,
+                param_count,
+            },
+        );
+    }
+
+    /// Discard the named prepared statement, or all of them. `Err(PreparedStatementNotFound)` when a
+    /// named statement is not held (`DEALLOCATE ALL` never errors).
+    fn deallocate(&mut self, target: &ast::DeallocateTarget) -> Result<(), Error> {
+        match target {
+            ast::DeallocateTarget::All => self.prepared.clear(),
+            ast::DeallocateTarget::Name(name) => {
+                if self.prepared.remove(name).is_none() {
+                    return Err(Error::PreparedStatementNotFound(format!(
+                        "prepared statement \"{name}\" does not exist"
+                    )));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// The named statement and its placeholder count, cloned for binding.
+    /// `Err(PreparedStatementNotFound)` when it is not held.
+    fn lookup(&self, name: &str) -> Result<(ast::Statement, usize), Error> {
+        let prepared = self.prepared.get(name).ok_or_else(|| {
+            Error::PreparedStatementNotFound(format!(
+                "prepared statement \"{name}\" does not exist"
+            ))
+        })?;
+        Ok((prepared.statement.clone(), prepared.param_count))
+    }
 }
 
 /// A cursor opened by `DECLARE ... CURSOR`: the query's rows materialized at declaration plus a
@@ -1256,7 +1393,7 @@ impl<'engine> Session<'engine> {
             current_user: session_ctx::DEFAULT_USER.to_owned(),
             current_database: "nusadb".to_owned(),
             current_schema: "public".to_owned(),
-            prepared: HashMap::new(),
+            prepared: PreparedStore::new(),
             cursors: CursorStore::new(),
             result_cache: HashMap::new(),
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
@@ -1384,13 +1521,7 @@ impl<'engine> Session<'engine> {
                 statement,
                 param_count,
             } => {
-                self.prepared.insert(
-                    name,
-                    PreparedStatement {
-                        statement: *statement,
-                        param_count,
-                    },
-                );
+                self.prepared.prepare(name, *statement, param_count);
                 Ok(ExecutionResult::Prepared)
             },
             // CHECKPOINT needs a quiesced engine, so it runs outside any data transaction. If this
@@ -1411,16 +1542,7 @@ impl<'engine> Session<'engine> {
                 Ok(ExecutionResult::CursorClosed)
             },
             PhysicalPlan::Deallocate(target) => {
-                match target {
-                    ast::DeallocateTarget::All => self.prepared.clear(),
-                    ast::DeallocateTarget::Name(name) => {
-                        if self.prepared.remove(&name).is_none() {
-                            return Err(Error::PreparedStatementNotFound(format!(
-                                "prepared statement \"{name}\" does not exist"
-                            )));
-                        }
-                    },
-                }
+                self.prepared.deallocate(&target)?;
                 Ok(ExecutionResult::Deallocated)
             },
             // A temporary `CREATE TABLE` creates the session's temp schema (in the executor); record
@@ -1497,14 +1619,7 @@ impl<'engine> Session<'engine> {
     /// The bound statement is re-analyzed and executed in this session's transaction context, with
     /// the session user driving row-level security (so EXECUTE cannot bypass it).
     fn execute_prepared(&self, name: &str, args: &[ast::Value]) -> Result<ExecutionResult, Error> {
-        let (statement, param_count) = {
-            let prepared = self.prepared.get(name).ok_or_else(|| {
-                Error::PreparedStatementNotFound(format!(
-                    "prepared statement \"{name}\" does not exist"
-                ))
-            })?;
-            (prepared.statement.clone(), prepared.param_count)
-        };
+        let (statement, param_count) = self.prepared.lookup(name)?;
         if args.len() != param_count {
             return Err(Error::FunctionArgs(format!(
                 "prepared statement \"{name}\" expects {param_count} parameter(s), got {}",
@@ -2179,28 +2294,26 @@ fn dispatch(
             ))
         },
         // Statement-level PREPARE / EXECUTE / DEALLOCATE need somewhere to keep the statement
-        // between calls. `Session::execute` has that store, so an embedded caller is served; the
-        // wire server has no equivalent for the SQL-level spelling and routes here, which is why a
-        // connected client cannot use these at all.
-        //
-        // That is a feature this engine has not built, so it says so. It reported `internal_error`
-        // before — telling every client that the server had broken when the honest answer is that
-        // the wire protocol's own Parse/Bind path is the way to prepare a statement today.
+        // between calls. Both the embedded `Session` and each wire connection hold a `PreparedStore`
+        // and serve these before dispatch (`is_prepare_plan`), so a normal caller never lands here.
+        // What does is a raw `execute_in_txn` (no session, no store) — the Rust API held wrong rather
+        // than a SQL statement failing, so the message names the entry points that carry a store.
         PhysicalPlan::Prepare { .. }
         | PhysicalPlan::Execute { .. }
         | PhysicalPlan::Deallocate(_) => Err(Error::Unsupported(
-            "PREPARE / EXECUTE / DEALLOCATE as SQL statements (a connected client prepares a \
-             statement with the wire protocol's extended query messages; an embedded caller uses \
-             `Session::execute`, which holds the statement store these need)"
+            "PREPARE / EXECUTE / DEALLOCATE need a per-connection statement store: run them through \
+             `Session::execute` or a wire connection, each of which holds one"
                 .to_owned(),
         )),
-        // Cursors are per-session state, handled in `Session::execute` before dispatch; the
-        // stateless dispatch path (and the wire server, which is not yet cursor-aware) cannot hold
-        // them.
+        // Cursors are per-session state, served from a `CursorStore` before dispatch (`is_cursor_plan`)
+        // by both the embedded `Session` and each wire connection. Reaching the stateless dispatch
+        // path means neither store was present (a raw `execute_in_txn`), which cannot hold them.
         PhysicalPlan::DeclareCursor { .. }
         | PhysicalPlan::FetchCursor { .. }
         | PhysicalPlan::CloseCursor(_) => Err(Error::Unsupported(
-            "DECLARE CURSOR / FETCH / CLOSE are not yet supported on this connection".to_owned(),
+            "DECLARE CURSOR / FETCH / CLOSE need a per-connection cursor store: run them through \
+             `Session::execute` or a wire connection, each of which holds one"
+                .to_owned(),
         )),
     }
 }

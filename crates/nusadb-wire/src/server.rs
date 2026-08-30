@@ -861,6 +861,11 @@ where
     // and outlive individual transactions (every NusaDB cursor behaves like `WITH HOLD`).
     let cursors: Arc<std::sync::Mutex<nusadb_sql::CursorStore>> =
         Arc::new(std::sync::Mutex::new(nusadb_sql::CursorStore::new()));
+    // Per-connection prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE` as SQL). Shared into each
+    // statement's task behind an `Arc<Mutex>` exactly like `cursors`, and private to this connection —
+    // the SQL-level spelling of the extended-query protocol's per-connection Parse/Bind store.
+    let prepared: Arc<std::sync::Mutex<nusadb_sql::PreparedStore>> =
+        Arc::new(std::sync::Mutex::new(nusadb_sql::PreparedStore::new()));
     // LISTEN/NOTIFY (async pub/sub): this connection's notification mailbox. `LISTEN` subscribes its
     // pid in the process-global registry; a `NOTIFY` from any connection in the same database pushes a
     // `Notification` here, which the loop below drains and writes as a `NotificationResponse` while the
@@ -998,6 +1003,7 @@ where
                         plan_cache,
                         &settings,
                         &cursors,
+                        &prepared,
                         false, // simple query sends its own RowDescription
                     )
                     .await?;
@@ -1198,6 +1204,7 @@ where
                         plan_cache,
                         &settings,
                         &cursors,
+                        &prepared,
                         true, // portal path: `Describe` already sent `RowDescription`
                     )
                     .await?;
@@ -2422,6 +2429,7 @@ fn run_query_streaming(
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &std::sync::Mutex<HashMap<String, String>>,
     cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    prepared: &std::sync::Mutex<nusadb_sql::PreparedStore>,
     point_get_gate: bool,
     bypass_cache: bool,
 ) -> StreamedRun {
@@ -2532,6 +2540,7 @@ fn run_query_streaming(
         &mut plan_cache,
         &snapshot,
         cursors,
+        prepared,
         point_get_gate,
         bypass_cache,
     );
@@ -2639,17 +2648,26 @@ fn plan_streamed_stmt(
     }
 }
 
-/// Execute a streamed statement, routing a cursor plan (`DECLARE`/`FETCH`/`CLOSE`) through this
-/// connection's [`CursorStore`](nusadb_sql::CursorStore) and everything else through the ordinary
-/// settings-aware path. Only a cursor plan takes the lock, so the hot path for normal statements is
-/// byte-for-byte unchanged.
-fn execute_streamed_with_cursors(
+/// Execute a streamed statement, routing per-connection session-state plans through the right store —
+/// a cursor plan (`DECLARE`/`FETCH`/`CLOSE`) through this connection's
+/// [`CursorStore`](nusadb_sql::CursorStore), a `PREPARE`/`EXECUTE`/`DEALLOCATE` through its
+/// [`PreparedStore`](nusadb_sql::PreparedStore) — and everything else through the ordinary
+/// settings-aware path. Only a session-state plan takes a lock, so the hot path for normal statements
+/// is byte-for-byte unchanged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the per-statement execution context (plan, engine, txn, user, settings snapshot, sink) \
+              plus this connection's two session-state stores (cursors, prepared) — each a distinct \
+              concern, not worth bundling"
+)]
+fn execute_streamed_with_session_state(
     physical: nusadb_sql::PhysicalPlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
     user: &str,
     snapshot: &HashMap<String, String>,
     cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    prepared: &std::sync::Mutex<nusadb_sql::PreparedStore>,
     sink: &mut ChannelSink,
 ) -> Result<StreamOutcome, nusadb_sql::Error> {
     if nusadb_sql::is_cursor_plan(&physical) {
@@ -2657,6 +2675,14 @@ fn execute_streamed_with_cursors(
             .lock()
             .map_err(|_| nusadb_sql::Error::Internal("cursor store lock poisoned".to_owned()))?;
         return nusadb_sql::execute_in_txn_as_streaming_with_cursors(
+            physical, engine, txn, user, snapshot, &mut store, sink,
+        );
+    }
+    if nusadb_sql::is_prepare_plan(&physical) {
+        let mut store = prepared
+            .lock()
+            .map_err(|_| nusadb_sql::Error::Internal("prepared store lock poisoned".to_owned()))?;
+        return nusadb_sql::execute_in_txn_as_streaming_with_prepared(
             physical, engine, txn, user, snapshot, &mut store, sink,
         );
     }
@@ -2678,6 +2704,7 @@ fn stream_stmt_in_state(
     plan_cache: &mut nusadb_sql::PlanCache,
     snapshot: &HashMap<String, String>,
     cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    prepared: &std::sync::Mutex<nusadb_sql::PreparedStore>,
     point_get_gate: bool,
     bypass_cache: bool,
 ) -> StmtRun {
@@ -2714,8 +2741,9 @@ fn stream_stmt_in_state(
             if point_get_gate && !nusadb_sql::plan_is_inline_point_get(&physical) {
                 return StmtRun::Punt;
             }
-            let outcome =
-                execute_streamed_with_cursors(physical, engine, txn, user, snapshot, cursors, sink);
+            let outcome = execute_streamed_with_session_state(
+                physical, engine, txn, user, snapshot, cursors, prepared, sink,
+            );
             match outcome {
                 Ok(o) => StmtRun::Done(
                     Ok(o),
@@ -2737,6 +2765,7 @@ fn stream_stmt_in_state(
             plan_cache,
             snapshot,
             cursors,
+            prepared,
             point_get_gate,
             bypass_cache,
         ),
@@ -2766,6 +2795,7 @@ fn stream_stmt_autocommit(
     plan_cache: &mut nusadb_sql::PlanCache,
     snapshot: &HashMap<String, String>,
     cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    prepared: &std::sync::Mutex<nusadb_sql::PreparedStore>,
     point_get_gate: bool,
     bypass_cache: bool,
 ) -> StmtRun {
@@ -2812,8 +2842,9 @@ fn stream_stmt_autocommit(
             let _ = engine.rollback(txn);
             return StmtRun::Punt;
         }
-        let outcome =
-            execute_streamed_with_cursors(physical, engine, txn, user, snapshot, cursors, sink);
+        let outcome = execute_streamed_with_session_state(
+            physical, engine, txn, user, snapshot, cursors, prepared, sink,
+        );
         let failure = match outcome {
             Ok(o) => match engine.commit(txn) {
                 Ok(()) => return StmtRun::Done(Ok(o), TxnState::Auto),
@@ -2898,6 +2929,7 @@ async fn stream_query_to_conn<S>(
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     cursors: &Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
+    prepared: &Arc<std::sync::Mutex<nusadb_sql::PreparedStore>>,
     // Extended-query `Execute` must NOT repeat `RowDescription` (that is `Describe`'s job) — set for
     // the portal path so the streamed frames carry only `DataRow`s + `CommandComplete`.
     suppress_row_description: bool,
@@ -2964,6 +2996,7 @@ where
                 plan_cache,
                 settings,
                 cursors,
+                prepared,
                 point_get,
                 bypass_plan_cache,
             )
@@ -3013,6 +3046,7 @@ where
     let database = database.to_owned();
     let settings = Arc::clone(settings);
     let cursors = Arc::clone(cursors);
+    let prepared = Arc::clone(prepared);
     let task = tokio::task::spawn_blocking(move || {
         let _cancel_guard = nusadb_sql::cancel::scope(cancel);
         match run_query_streaming(
@@ -3029,6 +3063,7 @@ where
             plan_cache,
             &settings,
             &cursors,
+            &prepared,
             false,
             bypass_plan_cache,
         ) {
