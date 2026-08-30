@@ -292,7 +292,26 @@ pub(super) fn convert_from_item(factor: &sql::TableFactor) -> Result<ast::TableR
         ..
     } = factor
     {
-        return desugar_table_function(name, table_args, alias.as_ref(), *with_ordinality);
+        return desugar_table_function(
+            name,
+            &table_args.args,
+            alias.as_ref(),
+            *with_ordinality,
+            false,
+        );
+    }
+    // `JOIN LATERAL func(args) [AS x]` — sqlparser models a lateral function call as its own
+    // `Function` factor (distinct from the `Table { args }` base form above). Desugar it the same
+    // way, but mark the derived table `LATERAL` so its arguments may reference columns to its left.
+    if let sql::TableFactor::Function {
+        lateral,
+        name,
+        args,
+        with_ordinality,
+        alias,
+    } = factor
+    {
+        return desugar_table_function(name, args, alias.as_ref(), *with_ordinality, *lateral);
     }
     // `FROM UNNEST(array) [AS x[(col)]]` — sqlparser models UNNEST as its own table factor, not the
     // generic function form, so route it through the dedicated desugaring.
@@ -319,80 +338,92 @@ pub(super) fn convert_from_item(factor: &sql::TableFactor) -> Result<ast::TableR
         sample,
     } = factor
     {
-        if sample.is_some() {
-            return unsupported("TABLESAMPLE on a derived table");
+        return convert_derived_table_factor(*lateral, subquery, alias.as_ref(), sample.is_some());
+    }
+    convert_table_ref(factor)
+}
+
+/// Convert a `(SELECT ...)` / `(VALUES ...)` derived-table FROM item — a plain `SELECT` body, a
+/// set-operation body, or an inline `VALUES` list — carrying its `LATERAL` marker. Split out of
+/// [`convert_from_item`] to keep that per-factor dispatcher small; a derived table must have an alias.
+fn convert_derived_table_factor(
+    lateral: bool,
+    subquery: &sql::Query,
+    alias: Option<&sql::TableAlias>,
+    has_sample: bool,
+) -> Result<ast::TableRef, Error> {
+    if has_sample {
+        return unsupported("TABLESAMPLE on a derived table");
+    }
+    let Some(alias) = alias else {
+        return unsupported("a subquery in FROM must have an alias");
+    };
+    // A derived table may rename its output columns: `(SELECT ...) AS x(a, b)`.
+    let name = fold_ident(&alias.name);
+    let column_aliases = fold_alias_columns(&alias.columns)?;
+    // `(VALUES (row), ...) AS x` is a values derived table — carry the inline rows rather than a
+    // SELECT body (which cannot represent a multi-row VALUES list).
+    if let sql::SetExpr::Values(values) = &*subquery.body {
+        let rows: Vec<Vec<ast::Expr>> = values
+            .rows
+            .iter()
+            .map(|row| {
+                row.content
+                    .iter()
+                    .cloned()
+                    .map(convert_expr)
+                    .collect::<Result<_, _>>()
+            })
+            .collect::<Result<_, _>>()?;
+        if rows.is_empty() {
+            return unsupported("VALUES with no rows");
         }
-        let Some(alias) = alias.as_ref() else {
-            return unsupported("a subquery in FROM must have an alias");
-        };
-        // A derived table may rename its output columns: `(SELECT ...) AS x(a, b)`.
-        let name = fold_ident(&alias.name);
-        let column_aliases = fold_alias_columns(&alias.columns)?;
-        // `(VALUES (row), ...) AS x` is a values derived table — carry the inline rows rather than a
-        // SELECT body (which cannot represent a multi-row VALUES list).
-        if let sql::SetExpr::Values(values) = &*subquery.body {
-            let rows: Vec<Vec<ast::Expr>> = values
-                .rows
-                .iter()
-                .map(|row| {
-                    row.content
-                        .iter()
-                        .cloned()
-                        .map(convert_expr)
-                        .collect::<Result<_, _>>()
-                })
-                .collect::<Result<_, _>>()?;
-            if rows.is_empty() {
-                return unsupported("VALUES with no rows");
-            }
-            return Ok(ast::TableRef {
-                // Derived table: the schema field is unused (it has a subquery/values body, no name).
-                schema: None,
-                name: name.clone(),
-                alias: Some(name),
-                subquery: None,
-                values: Some(rows),
-                set_op: None,
-                lateral: *lateral,
-                column_aliases,
-                with_ordinality: false,
-            });
-        }
-        // `(SELECT ... UNION/INTERSECT/EXCEPT ...) AS x` is a set-operation derived table — carry the
-        // set-op body (a single SELECT body cannot represent it). `convert_query` lowers the inner
-        // query, yielding a `SetOperation` for a set-op body and a `Select` for a plain one.
-        if matches!(&*subquery.body, sql::SetExpr::SetOperation { .. }) {
-            let ast::Statement::SetOperation(so) = convert_query((**subquery).clone())? else {
-                return unsupported("a derived-table set operation could not be lowered");
-            };
-            return Ok(ast::TableRef {
-                // Derived table: the schema field is unused (it has a subquery/values body, no name).
-                schema: None,
-                name: name.clone(),
-                alias: Some(name),
-                subquery: None,
-                values: None,
-                set_op: Some(Box::new(so)),
-                lateral: *lateral,
-                column_aliases,
-                with_ordinality: false,
-            });
-        }
-        let body = convert_select((**subquery).clone())?;
         return Ok(ast::TableRef {
-            // Derived `(SELECT ...)` table: the schema field is unused.
+            // Derived table: the schema field is unused (it has a subquery/values body, no name).
             schema: None,
             name: name.clone(),
             alias: Some(name),
-            subquery: Some(Box::new(body)),
-            values: None,
+            subquery: None,
+            values: Some(rows),
             set_op: None,
-            lateral: *lateral,
+            lateral,
             column_aliases,
             with_ordinality: false,
         });
     }
-    convert_table_ref(factor)
+    // `(SELECT ... UNION/INTERSECT/EXCEPT ...) AS x` is a set-operation derived table — carry the
+    // set-op body (a single SELECT body cannot represent it). `convert_query` lowers the inner
+    // query, yielding a `SetOperation` for a set-op body and a `Select` for a plain one.
+    if matches!(&*subquery.body, sql::SetExpr::SetOperation { .. }) {
+        let ast::Statement::SetOperation(so) = convert_query(subquery.clone())? else {
+            return unsupported("a derived-table set operation could not be lowered");
+        };
+        return Ok(ast::TableRef {
+            // Derived table: the schema field is unused (it has a subquery/values body, no name).
+            schema: None,
+            name: name.clone(),
+            alias: Some(name),
+            subquery: None,
+            values: None,
+            set_op: Some(Box::new(so)),
+            lateral,
+            column_aliases,
+            with_ordinality: false,
+        });
+    }
+    let body = convert_select(subquery.clone())?;
+    Ok(ast::TableRef {
+        // Derived `(SELECT ...)` table: the schema field is unused.
+        schema: None,
+        name: name.clone(),
+        alias: Some(name),
+        subquery: Some(Box::new(body)),
+        values: None,
+        set_op: None,
+        lateral,
+        column_aliases,
+        with_ordinality: false,
+    })
 }
 
 /// Desugar a `FROM func(args) [AS x[(cols)]]` table function into a derived table whose subquery is
@@ -402,9 +433,10 @@ pub(super) fn convert_from_item(factor: &sql::TableFactor) -> Result<ast::TableR
 /// output column takes the relation's name (so `FROM gs(1,3) AS g` exposes column `g`).
 fn desugar_table_function(
     name: &sql::ObjectName,
-    table_args: &sql::TableFunctionArgs,
+    args: &[sql::FunctionArg],
     alias: Option<&sql::TableAlias>,
     with_ordinality: bool,
+    lateral: bool,
 ) -> Result<ast::TableRef, Error> {
     // Rebuild the call as an ordinary function expression so the normal conversion maps a known
     // set-returning function to its `SetReturning` node (and an unknown name is rejected there).
@@ -414,7 +446,7 @@ fn desugar_table_function(
         parameters: sql::FunctionArguments::None,
         args: sql::FunctionArguments::List(sql::FunctionArgumentList {
             duplicate_treatment: None,
-            args: table_args.args.clone(),
+            args: args.to_vec(),
             clauses: Vec::new(),
         }),
         filter: None,
@@ -436,6 +468,7 @@ fn desugar_table_function(
         table_alias,
         column_aliases,
         with_ordinality,
+        lateral,
     ))
 }
 
@@ -476,6 +509,7 @@ fn desugar_unnest(
         table_alias,
         column_aliases,
         with_ordinality,
+        false,
     ))
 }
 
@@ -488,6 +522,7 @@ fn srf_derived_table(
     table_alias: String,
     column_aliases: Vec<String>,
     with_ordinality: bool,
+    lateral: bool,
 ) -> ast::TableRef {
     // A pair function (`jsonb_each`) names its two columns `key` and `value`, not after the
     // relation — the value half is appended by the analyzer, so only the key is named here.
@@ -527,7 +562,7 @@ fn srf_derived_table(
         subquery: Some(Box::new(select)),
         values: None,
         set_op: None,
-        lateral: false,
+        lateral,
         column_aliases,
         with_ordinality,
     }

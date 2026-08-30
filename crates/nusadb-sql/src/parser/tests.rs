@@ -1992,6 +1992,32 @@ fn select_wildcard_no_filter() {
 }
 
 #[test]
+fn from_join_lateral_set_returning_function_desugars_to_a_lateral_derived_table() {
+    // `JOIN LATERAL func(args)` is not a plain table: it desugars to a LATERAL derived table
+    // `(SELECT func(args)) AS alias`, so a set-returning function may sit on the right of a join and
+    // correlate to the columns on its left. A plain `FROM func(args)` already desugared the same way
+    // (non-lateral); this covers the lateral join-input form.
+    let ast::Statement::Select(s) =
+        ok("SELECT g FROM base CROSS JOIN LATERAL generate_series(1, base.v) AS g")
+    else {
+        panic!("expected Select");
+    };
+    let from = s.from.expect("FROM clause");
+    assert_eq!(from.joins.len(), 1);
+    let join = &from.joins[0];
+    assert!(matches!(join.kind, ast::JoinKind::Cross));
+    assert_eq!(join.table.name, "g");
+    assert!(
+        join.table.lateral,
+        "a lateral function join input must be marked LATERAL"
+    );
+    assert!(
+        join.table.subquery.is_some(),
+        "it desugars to a (SELECT ...) derived table"
+    );
+}
+
+#[test]
 fn select_where_order_by_limit() {
     let ast::Statement::Select(s) =
         ok("SELECT id, name FROM users WHERE id > 10 ORDER BY name DESC LIMIT 5")
