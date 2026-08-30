@@ -472,11 +472,10 @@ fn create_index_accepts_functional_partial_asc_desc_and_rejects_nulls_udf_shapes
         assert_eq!(ci.columns, vec!["a".to_owned()], "for {sql}");
     }
 
-    // Still rejected: per-column `NULLS`, `USING <method>`, a qualified column key, and an operator
-    // class. (`DESC NULLS LAST` still fails — on the `NULLS`, no longer on the `DESC`.)
+    // Still rejected: `USING <method>` (a non-default access method), a qualified column key, and an
+    // operator class. (Per-column `ASC`/`DESC`/`NULLS FIRST/LAST` are accepted — covered above and in
+    // `create_index_accepts_per_key_asc_desc_and_nulls_ordering`.)
     for sql in [
-        "CREATE INDEX i ON t (a DESC NULLS LAST)",
-        "CREATE INDEX i ON t (a NULLS FIRST)",
         "CREATE INDEX i ON t USING HASH (a)",
         "CREATE INDEX i ON t (t.a)",
         "CREATE INDEX i ON t (a varchar_pattern_ops)",
