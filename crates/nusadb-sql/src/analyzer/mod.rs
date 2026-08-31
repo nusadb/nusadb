@@ -795,6 +795,8 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         },
         // CREATE/DROP SEQUENCE: the engine path exists; fold the options into a
         // SequenceDef. The executor calls the engine (resolving name → id for DROP).
+        // CREATE EXTENSION is a no-op: nothing to resolve or check, so it lowers straight through.
+        ast::Statement::CreateExtension { name } => Ok(LogicalPlan::CreateExtension { name }),
         ast::Statement::CreateSequence(mut cs) => {
             // The engine's sequence namespace is keyed by name, so a non-public schema qualifies the
             // key (`dev.s`) — the same scheme a SERIAL column's auto-sequence in a non-public schema

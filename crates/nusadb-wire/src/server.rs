@@ -4628,6 +4628,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::DatabaseCreated => "CREATE DATABASE".to_owned(),
         ExecutionResult::DatabaseAltered => "ALTER DATABASE".to_owned(),
         ExecutionResult::DatabaseDropped => "DROP DATABASE".to_owned(),
+        ExecutionResult::ExtensionCreated => "CREATE EXTENSION".to_owned(),
         ExecutionResult::SequenceCreated => "CREATE SEQUENCE".to_owned(),
         ExecutionResult::SequenceAltered => "ALTER SEQUENCE".to_owned(),
         ExecutionResult::SequenceDropped => "DROP SEQUENCE".to_owned(),

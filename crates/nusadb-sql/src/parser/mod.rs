@@ -4129,6 +4129,12 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
             ..
         } => convert_fetch(&name, direction, into.as_ref()),
         sql::Statement::Close { cursor } => Ok(convert_close(cursor)),
+        // `CREATE EXTENSION ...` is accepted as a no-op (NusaDB has no extension system): tools and
+        // ORMs routinely issue it for compatibility, and rejecting it blocks otherwise-portable
+        // scripts. `SCHEMA`/`VERSION`/`CASCADE` and `IF NOT EXISTS` are all ignored.
+        sql::Statement::CreateExtension(ce) => Ok(ast::Statement::CreateExtension {
+            name: ce.name.value,
+        }),
         _ => unsupported(
             "only CREATE/DROP TABLE, INSERT, SELECT, UPDATE, DELETE, EXPLAIN, transaction \
              control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT/SET/SHOW) are supported",

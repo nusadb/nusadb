@@ -140,6 +140,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::CreateDatabase(p) => PhysicalPlan::CreateDatabase(p),
         LogicalPlan::AlterDatabase(p) => PhysicalPlan::AlterDatabase(p),
         LogicalPlan::DropDatabase(p) => PhysicalPlan::DropDatabase(p),
+        LogicalPlan::CreateExtension { name } => PhysicalPlan::CreateExtension { name },
         LogicalPlan::CreateSequence(p) => PhysicalPlan::CreateSequence(p),
         LogicalPlan::AlterSequence(p) => PhysicalPlan::AlterSequence(p),
         LogicalPlan::DropSequence(p) => PhysicalPlan::DropSequence(p),

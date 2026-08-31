@@ -880,6 +880,26 @@ fn create_and_drop_schema_end_to_end() {
 }
 
 #[test]
+fn create_extension_is_accepted_as_a_noop() {
+    let engine = BtreeEngine::new();
+    // Plain, IF NOT EXISTS, and the full option form are all accepted; NusaDB installs nothing.
+    for sql in [
+        "CREATE EXTENSION foo",
+        "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"",
+        "CREATE EXTENSION bar WITH SCHEMA public VERSION '1.2' CASCADE",
+        // Being a no-op, a repeat succeeds too (there is no catalog to conflict against).
+        "CREATE EXTENSION foo",
+    ] {
+        assert!(
+            matches!(run(&engine, sql), ExecutionResult::ExtensionCreated),
+            "`{sql}` should be accepted as a no-op"
+        );
+    }
+    // It installed nothing: no table/relation named after the extension exists.
+    assert!(run_try(&engine, "SELECT * FROM foo").is_err());
+}
+
+#[test]
 fn create_and_drop_sequence_end_to_end() {
     let engine = BtreeEngine::new();
     assert!(matches!(

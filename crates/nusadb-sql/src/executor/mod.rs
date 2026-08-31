@@ -233,6 +233,8 @@ pub enum ExecutionResult {
     /// `DROP DATABASE` dropped every table in the single database (backing each up first unless
     /// `FIX DROP DATABASE` skipped the backup).
     DatabaseDropped,
+    /// `CREATE EXTENSION` was accepted as a no-op (NusaDB has no extension system).
+    ExtensionCreated,
     /// `CREATE SEQUENCE` succeeded (or `IF NOT EXISTS` made it a no-op).
     SequenceCreated,
     /// `ALTER SEQUENCE` succeeded (or `IF EXISTS` made it a no-op).
@@ -2262,6 +2264,8 @@ fn dispatch(
         PhysicalPlan::CreateDatabase(_) => Ok(ExecutionResult::DatabaseCreated),
         PhysicalPlan::AlterDatabase(_) => Ok(ExecutionResult::DatabaseAltered),
         PhysicalPlan::DropDatabase(p) => run_drop_database(&p, engine, txn),
+        // CREATE EXTENSION is accepted for compatibility but installs nothing (no extension system).
+        PhysicalPlan::CreateExtension { .. } => Ok(ExecutionResult::ExtensionCreated),
         PhysicalPlan::CreateSequence(p) => run_create_sequence(&p, engine, txn),
         PhysicalPlan::AlterSequence(p) => run_alter_sequence(&p, engine, txn),
         PhysicalPlan::DropSequence(p) => run_drop_sequence(&p, engine, txn),
@@ -2840,6 +2844,9 @@ fn format_plan(
         PhysicalPlan::DropDatabase(p) => {
             let how = if p.force { "force" } else { "backup-then-drop" };
             vec![format!("{indent}DropDatabase: {} ({how})", p.name)]
+        },
+        PhysicalPlan::CreateExtension { name } => {
+            vec![format!("{indent}CreateExtension (no-op): {name}")]
         },
         PhysicalPlan::CreateSequence(p) => {
             vec![format!("{indent}CreateSequence: {}", p.def.name)]

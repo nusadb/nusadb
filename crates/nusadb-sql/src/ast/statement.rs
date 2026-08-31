@@ -295,6 +295,14 @@ pub enum Statement {
     DropDatabase(DropDatabase),
     /// `ALTER DATABASE name ...` — single-database compatibility no-op.
     AlterDatabase(AlterDatabase),
+    /// `CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA ..] [VERSION ..] [CASCADE]` — accepted
+    /// as a no-op for client/tool compatibility. NusaDB has no extension system, so nothing is
+    /// installed; the `name` is kept only for `EXPLAIN`. Options (`SCHEMA`/`VERSION`/`CASCADE`) are
+    /// ignored.
+    CreateExtension {
+        /// The extension name (as written).
+        name: String,
+    },
     /// `CREATE SEQUENCE [IF NOT EXISTS] name [options...]`.
     CreateSequence(CreateSequence),
     /// `ALTER SEQUENCE [IF EXISTS] name <options...>`.

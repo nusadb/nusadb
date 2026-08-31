@@ -384,6 +384,12 @@ pub enum LogicalPlan {
     AlterDatabase(AlterDatabasePlan),
     /// `DROP DATABASE` — drop every table in the single database (backup-then-drop, or forced).
     DropDatabase(DropDatabasePlan),
+    /// `CREATE EXTENSION` — accepted as a no-op (NusaDB has no extension system); `name` is kept
+    /// only for `EXPLAIN`.
+    CreateExtension {
+        /// The extension name, for `EXPLAIN` output only.
+        name: String,
+    },
     /// `CREATE SEQUENCE`.
     CreateSequence(CreateSequencePlan),
     /// `ALTER SEQUENCE`.
@@ -2430,6 +2436,12 @@ pub enum PhysicalPlan {
     AlterDatabase(AlterDatabasePlan),
     /// `DROP DATABASE` — drop every table in the single database (backup-then-drop, or forced).
     DropDatabase(DropDatabasePlan),
+    /// `CREATE EXTENSION` — accepted as a no-op (NusaDB has no extension system); `name` is kept
+    /// only for `EXPLAIN`.
+    CreateExtension {
+        /// The extension name, for `EXPLAIN` output only.
+        name: String,
+    },
     /// `CREATE SEQUENCE`.
     CreateSequence(CreateSequencePlan),
     /// `ALTER SEQUENCE`.
