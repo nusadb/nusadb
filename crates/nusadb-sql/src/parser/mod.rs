@@ -539,6 +539,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(stmt) = recognize_reindex(sql) {
         return Ok(stmt);
     }
+    if let Some(stmt) = recognize_cluster(sql) {
+        return Ok(stmt);
+    }
     // `CHECKPOINT` is not modelled by the generic tokenizer either; recognize the bare form here.
     if let Some(stmt) = recognize_checkpoint(sql) {
         return Ok(stmt);
@@ -1321,6 +1324,28 @@ fn recognize_reindex(sql: &str) -> Option<ast::Statement> {
         return None;
     }
     Some(ast::Statement::Reindex)
+}
+
+/// Recognize `CLUSTER [VERBOSE] [table [USING index]]` (all forms, incl. the bare recluster-all) and
+/// accept it as a no-op. sqlparser does not model `CLUSTER` as a statement, so — like `REINDEX` — it
+/// is recognized here before the generic parser.
+///
+/// `CLUSTER` physically reorders a heap; NusaDB has no user-visible physical row order to change, so
+/// there is nothing to do — accepting rather than rejecting keeps migration tools working. A glued
+/// token like `clustered` is not mistaken for it (the keyword must be a whole word, or the whole
+/// statement for the bare form).
+fn recognize_cluster(sql: &str) -> Option<ast::Statement> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    // Bare `CLUSTER` — recluster every previously-clustered table (a no-op here).
+    if trimmed.eq_ignore_ascii_case("cluster") {
+        return Some(ast::Statement::Cluster);
+    }
+    // `CLUSTER <args>`: `cluster` must be a whole word followed by more text.
+    let after = trimmed
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("cluster"))
+        .and_then(|_| trimmed.get(7..))?;
+    (after.starts_with(' ') || after.starts_with('(')).then_some(ast::Statement::Cluster)
 }
 
 /// Recognize a bare `CHECKPOINT` (optionally trailing `;`/whitespace). `sqlparser` does not model

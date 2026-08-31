@@ -335,6 +335,7 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `DECLARE` / `CLOSE`, `FETCH` | `DECLARE CURSOR` / `CLOSE CURSOR` / `FETCH <rowcount>` (embedded API only — see §14) |
 | `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM` / `ANALYZE` / `COMMENT` |
 | `REINDEX` / `CHECKPOINT` | `REINDEX` / `CHECKPOINT` |
+| `CLUSTER` (accepted, no-op) | `CLUSTER` |
 
 A statement with `RETURNING` still reports its own action, not `SELECT`: an
 `INSERT ... RETURNING` streams the returned rows and completes with `INSERT <n>` (and likewise

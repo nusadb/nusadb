@@ -377,6 +377,11 @@ pub enum Statement {
     /// to rebuild; but migration tools and ORM health-checks emit `REINDEX`, so it is accepted rather
     /// than rejected (which would break their scripts).
     Reindex,
+    /// `CLUSTER [VERBOSE] [table [USING index]]` — accepted as a no-op. `CLUSTER` physically reorders a
+    /// heap to an index's order; NusaDB stores rows in a clustered B-tree keyed by an engine-minted
+    /// row-id (no user-visible physical order to change), so there is nothing to do — but migration
+    /// tools emit it, so it is accepted rather than rejected.
+    Cluster,
     /// `CHECKPOINT` — fold the durable log into a checkpoint image and truncate it, so recovery
     /// replays only what was written since. Requires a quiesced engine, so it may be refused when a
     /// transaction is active. The bare, argument-less form.

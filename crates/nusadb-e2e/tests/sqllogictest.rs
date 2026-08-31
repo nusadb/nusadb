@@ -240,6 +240,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::CursorDeclared
         | ExecutionResult::CursorClosed
         | ExecutionResult::Reindexed
+        | ExecutionResult::Clustered
         | ExecutionResult::CheckpointDone
         | ExecutionResult::MaterializedViewCreated
         | ExecutionResult::VariableSet

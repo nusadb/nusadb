@@ -321,6 +321,8 @@ pub enum LogicalPlan {
     Vacuum(crate::ast::VacuumOptions),
     /// `REINDEX ...` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
     Reindex,
+    /// `CLUSTER ...` — accepted as a no-op (NusaDB has no user-visible physical row order to change).
+    Cluster,
     /// `CHECKPOINT` — fold the durable log into an image and truncate it. Requires quiescence.
     Checkpoint,
     /// `ANALYZE` — recompute statistics for a table's columns.
@@ -2397,6 +2399,8 @@ pub enum PhysicalPlan {
     Vacuum(crate::ast::VacuumOptions),
     /// `REINDEX ...` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
     Reindex,
+    /// `CLUSTER ...` — accepted as a no-op (NusaDB has no user-visible physical row order to change).
+    Cluster,
     /// `CHECKPOINT` — fold the durable log into an image and truncate it. Requires quiescence.
     Checkpoint,
     /// `ANALYZE` — recompute statistics for a table's columns.

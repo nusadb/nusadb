@@ -195,6 +195,8 @@ pub enum ExecutionResult {
     Vacuumed(usize),
     /// `REINDEX` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
     Reindexed,
+    /// `CLUSTER` — accepted as a no-op (NusaDB has no user-visible physical row order).
+    Clustered,
     /// A `CHECKPOINT` completed: the log was folded into an image and truncated.
     CheckpointDone,
     /// `ANALYZE` — statistics recomputed for the given number of columns.
@@ -2251,6 +2253,8 @@ fn dispatch(
         PhysicalPlan::Vacuum(options) => run_vacuum(options, engine, txn),
         // REINDEX is a no-op: NusaDB's B-tree indexes are always consistent (MVCC + purge).
         PhysicalPlan::Reindex => Ok(ExecutionResult::Reindexed),
+        // CLUSTER is a no-op: NusaDB has no user-visible physical row order to reorganize.
+        PhysicalPlan::Cluster => Ok(ExecutionResult::Clustered),
         // CHECKPOINT is normally intercepted before a data transaction is opened (it needs a
         // quiesced engine). Reaching it here means it ran inside `txn`, so the engine refuses with
         // its active-transaction error — the honest answer; the interception paths avoid it.
@@ -2797,6 +2801,7 @@ fn format_plan(
             if options.analyze { " ANALYZE" } else { "" }
         )],
         PhysicalPlan::Reindex => vec![format!("{indent}Reindex (no-op)")],
+        PhysicalPlan::Cluster => vec![format!("{indent}Cluster (no-op)")],
         PhysicalPlan::Checkpoint => vec![format!("{indent}Checkpoint")],
         PhysicalPlan::Analyze(p) => vec![format!(
             "{indent}Analyze: {} ({} column(s))",

@@ -1001,6 +1001,25 @@ fn view_with_check_option_rejects_invisible_writes() {
 }
 
 #[test]
+fn cluster_is_accepted_as_a_noop() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    run(&engine, "INSERT INTO t VALUES (2, 'b'), (1, 'a')");
+    run(&engine, "CREATE INDEX t_v ON t (v)");
+    // Every CLUSTER form is accepted and does nothing; the table's rows are unchanged.
+    for sql in ["CLUSTER t USING t_v", "CLUSTER t", "CLUSTER"] {
+        assert!(
+            matches!(run(&engine, sql), ExecutionResult::Clustered),
+            "`{sql}` should be a no-op"
+        );
+    }
+    assert_eq!(
+        rows(run(&engine, "SELECT id FROM t ORDER BY id")),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+}
+
+#[test]
 fn create_extension_is_accepted_as_a_noop() {
     let engine = BtreeEngine::new();
     // Plain, IF NOT EXISTS, and the full option form are all accepted; NusaDB installs nothing.

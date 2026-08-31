@@ -116,6 +116,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::ShowColumns(schema) => PhysicalPlan::ShowColumns(schema),
         LogicalPlan::Vacuum(options) => PhysicalPlan::Vacuum(options),
         LogicalPlan::Reindex => PhysicalPlan::Reindex,
+        LogicalPlan::Cluster => PhysicalPlan::Cluster,
         LogicalPlan::Checkpoint => PhysicalPlan::Checkpoint,
         LogicalPlan::Analyze(p) => PhysicalPlan::Analyze(p),
         LogicalPlan::AnalyzeAll => PhysicalPlan::AnalyzeAll,

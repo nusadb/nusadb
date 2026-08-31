@@ -4393,6 +4393,30 @@ fn reindex_is_accepted_as_a_noop() {
 }
 
 #[test]
+fn cluster_is_accepted_as_a_noop() {
+    // CLUSTER (which sqlparser does not model as a statement) is accepted rather than rejected —
+    // NusaDB has no user-visible physical row order to reorganize, so it is a no-op. Every form,
+    // including the bare recluster-all, is recognized.
+    for sql in [
+        "CLUSTER",
+        "cluster ;",
+        "CLUSTER users",
+        "CLUSTER users USING users_pkey",
+        "CLUSTER VERBOSE t",
+        "CLUSTER (VERBOSE) t",
+        "CLUSTER idx ON t",
+    ] {
+        assert!(
+            matches!(parse(sql), Ok(ast::Statement::Cluster)),
+            "should accept: {sql}"
+        );
+    }
+    // A glued token is not mistaken for it (falls through to the generic parser, which rejects it).
+    assert!(parse("CLUSTERED").is_err());
+    assert!(parse("CLUSTERING x").is_err());
+}
+
+#[test]
 fn checkpoint_parses_only_as_the_bare_keyword() {
     // The bare form (any case, optional trailing `;`/whitespace) is recognized.
     for sql in [

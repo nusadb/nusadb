@@ -4625,6 +4625,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         // The reference engine's `VACUUM` tag carries no count, regardless of how many tables ran.
         ExecutionResult::Vacuumed(_) => "VACUUM".to_owned(),
         ExecutionResult::Reindexed => "REINDEX".to_owned(),
+        ExecutionResult::Clustered => "CLUSTER".to_owned(),
         ExecutionResult::CheckpointDone => "CHECKPOINT".to_owned(),
         ExecutionResult::Analyzed { .. } | ExecutionResult::AnalyzedAll { .. } => {
             "ANALYZE".to_owned()

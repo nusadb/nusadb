@@ -926,6 +926,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         },
         ast::Statement::Vacuum(options) => Ok(LogicalPlan::Vacuum(options)),
         ast::Statement::Reindex => Ok(LogicalPlan::Reindex),
+        ast::Statement::Cluster => Ok(LogicalPlan::Cluster),
         ast::Statement::Checkpoint => Ok(LogicalPlan::Checkpoint),
         ast::Statement::Analyze(an) => analyze_analyze(an, catalog),
         ast::Statement::LockTable { tables, mode } => {
