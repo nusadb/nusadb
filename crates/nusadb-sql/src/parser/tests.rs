@@ -1579,6 +1579,53 @@ fn with_single_cte_bare() {
 }
 
 #[test]
+fn recursive_cte_cycle_clause_parses_and_guards() {
+    // The `CYCLE c SET mark USING path` clause (which sqlparser cannot parse) is stripped by the
+    // pre-parse and re-attached to its named recursive CTE. The name is found even with a second CTE.
+    let ast::Statement::Select(s) = ok(
+        "WITH RECURSIVE t(id) AS (SELECT 1 UNION ALL SELECT id FROM t WHERE id < 1) \
+         CYCLE id SET is_cycle USING path SELECT * FROM t",
+    ) else {
+        panic!("expected Select");
+    };
+    let cycle = s.with[0].cycle.as_ref().expect("cycle spec");
+    assert_eq!(cycle.column, "id");
+    assert_eq!(cycle.mark_column, "is_cycle");
+    assert_eq!(cycle.path_column, "path");
+
+    // A plain (non-CYCLE) recursive CTE leaves `cycle` unset.
+    let ast::Statement::Select(s) = ok(
+        "WITH RECURSIVE t(id) AS (SELECT 1 UNION ALL SELECT id FROM t WHERE id < 1) SELECT * FROM t",
+    ) else {
+        panic!("expected Select");
+    };
+    assert!(s.with[0].cycle.is_none());
+
+    // Rejections: multi-column CYCLE, the `TO ... DEFAULT ...` marker form, and CYCLE on a
+    // non-recursive CTE.
+    assert!(
+        parse(
+            "WITH RECURSIVE t(a, b) AS (SELECT 1, 2 UNION ALL SELECT a, b FROM t WHERE a < 1) \
+         CYCLE a, b SET c USING p SELECT * FROM t"
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            "WITH RECURSIVE t(id) AS (SELECT 1 UNION ALL SELECT id FROM t WHERE id < 1) \
+         CYCLE id SET c TO 'y' DEFAULT 'n' USING p SELECT * FROM t"
+        )
+        .is_err()
+    );
+    assert!(parse("WITH t(id) AS (SELECT 1) CYCLE id SET c USING p SELECT * FROM t").is_err());
+
+    // `cycle` is not a reserved word, so a bare column/table alias named `cycle` right after a `)`
+    // still parses — the pre-parse only fires on the full `CYCLE <col> {SET|,}` clause shape.
+    ok("SELECT count(*) cycle FROM t");
+    ok("SELECT * FROM (SELECT 1) cycle");
+}
+
+#[test]
 fn with_multi_cte_chain() {
     let ast::Statement::Select(s) =
         ok("WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT x FROM a")

@@ -719,6 +719,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `INSERT INTO t OVERRIDING {SYSTEM|USER} VALUE ...`: sqlparser has no grammar for the clause, so
     // strip it here and re-attach the mode to the parsed `INSERT` below.
     let insert_overriding = strip_insert_overriding(&mut tokens);
+    // `WITH RECURSIVE t(...) AS (...) CYCLE c SET mark USING path ...`: sqlparser errors at `CYCLE`,
+    // so strip each such clause here and re-attach it to the matching CTE after parsing.
+    let cte_cycles = strip_cte_cycle(&mut tokens)?;
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -731,6 +734,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
             }
             if let Some(mode) = insert_overriding {
                 stmt = apply_insert_overriding(stmt, mode)?;
+            }
+            if !cte_cycles.is_empty() {
+                apply_cte_cycles(&mut stmt, cte_cycles)?;
             }
             Ok(stmt)
         },
@@ -953,6 +959,192 @@ struct DetectedExclude {
 /// (`"over"`) is data, not a keyword, so it never matches.
 fn word_ci(t: Option<&TokenWithSpan>, s: &str) -> bool {
     matches!(t, Some(t) if matches!(&t.token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(s)))
+}
+
+/// The folded (lowercase) identifier value of a `Token::Word`, or `None` for any other token.
+fn word_value(t: Option<&TokenWithSpan>) -> Option<String> {
+    match t.map(|t| &t.token) {
+        Some(Token::Word(w)) => Some(w.value.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Detect and remove each recursive-CTE `CYCLE <col> SET <mark> USING <path>` clause (sqlparser has
+/// no grammar for it — it errors at the `CYCLE` keyword). Returns `(cte_name, spec)` for each, keyed
+/// so [`apply_cte_cycles`] can re-attach it to the matching CTE after parsing. The multi-column form
+/// (`CYCLE a, b ...`) and the marker literals (`TO x DEFAULT y`) are rejected loudly rather than
+/// silently dropped — an ignored `CYCLE` would remove the cycle guard.
+fn strip_cte_cycle(
+    tokens: &mut Vec<TokenWithSpan>,
+) -> Result<Vec<(String, ast::CycleSpec)>, Error> {
+    // Cheap guard: only walk when a `CYCLE` word is present at all.
+    if !tokens.iter().any(|t| word_ci(Some(t), "cycle")) {
+        return Ok(Vec::new());
+    }
+    // Meaningful token indices (skip whitespace / EOF / `;`), so "next"/"prev" ignore layout.
+    let mi: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            !matches!(
+                t.token,
+                Token::Whitespace(_) | Token::EOF | Token::SemiColon
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let tok = |p: usize| mi.get(p).and_then(|&i| tokens.get(i));
+    let is_kw = |p: usize, kw: &str| word_ci(tok(p), kw);
+    let is_rparen = |p: usize| matches!(tok(p).map(|t| &t.token), Some(Token::RParen));
+    let is_comma = |p: usize| matches!(tok(p).map(|t| &t.token), Some(Token::Comma));
+
+    let mut specs = Vec::new();
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    let mut p = 0;
+    while p < mi.len() {
+        // The CTE-trailing clause is `) CYCLE <col> {SET | ,} ...`. `CYCLE` is not a reserved word,
+        // so it can also be a bare column/table alias (`SELECT count(*) cycle FROM t`); only the full
+        // clause shape — a `)` then `CYCLE`, a column word, then `SET` or a `,` — is treated as the
+        // clause. Anything else leaves the `CYCLE` token for sqlparser to parse as an alias.
+        let is_clause = is_kw(p, "cycle")
+            && p > 0
+            && is_rparen(p - 1)
+            && word_value(tok(p + 1)).is_some()
+            && (is_kw(p + 2, "set") || is_comma(p + 2));
+        if !is_clause {
+            p += 1;
+            continue;
+        }
+        // Parse the clause forward: `CYCLE <col> SET <mark> USING <path>`.
+        let syntax = |m: &str| Error::Syntax(format!("malformed CYCLE clause: {m}"));
+        let column = word_value(tok(p + 1)).ok_or_else(|| syntax("expected a cycle column"))?;
+        // A comma after the column means multiple cycle columns — not supported.
+        if matches!(tok(p + 2).map(|t| &t.token), Some(Token::Comma)) {
+            return Err(Error::Unsupported(
+                "a multi-column CYCLE clause is not supported (use a single cycle column)"
+                    .to_owned(),
+            ));
+        }
+        if !is_kw(p + 2, "set") {
+            return Err(syntax("expected SET after the cycle column"));
+        }
+        let mark_column = word_value(tok(p + 3)).ok_or_else(|| syntax("expected a SET column"))?;
+        // The marker-literal form `SET mark TO x DEFAULT y` is not modelled (mark is boolean).
+        if is_kw(p + 4, "to") {
+            return Err(Error::Unsupported(
+                "CYCLE ... SET ... TO ... DEFAULT (custom marker values) is not supported; use the \
+                 boolean form CYCLE c SET mark USING path"
+                    .to_owned(),
+            ));
+        }
+        if !is_kw(p + 4, "using") {
+            return Err(syntax("expected USING after the SET column"));
+        }
+        let path_column =
+            word_value(tok(p + 5)).ok_or_else(|| syntax("expected a USING column"))?;
+        // Locate the CTE name: from the `)` before `CYCLE`, match parens back to the body's `(`, then
+        // `AS`, then the name (skipping an optional `(col, ...)` list).
+        let name = cte_name_before_close(&mi, tokens, p - 1)
+            .ok_or_else(|| syntax("could not associate the CYCLE clause with a CTE"))?;
+        specs.push((
+            name,
+            ast::CycleSpec {
+                column,
+                mark_column,
+                path_column,
+            },
+        ));
+        // Remove `CYCLE .. <path>` (meaningful positions p..=p+5), spanning any interleaved layout.
+        if let (Some(&start), Some(&end)) = (mi.get(p), mi.get(p + 5)) {
+            removals.push((start, end));
+        }
+        p += 6;
+    }
+    // Drop the clause token ranges from the back so earlier indices stay valid.
+    for (start, end) in removals.into_iter().rev() {
+        tokens.drain(start..=end);
+    }
+    Ok(specs)
+}
+
+/// Re-attach each captured `CYCLE` spec to its named CTE in the parsed statement's top-level `WITH`
+/// list. A `CYCLE` on a CTE that does not exist, or on a non-recursive CTE, is a loud error.
+fn apply_cte_cycles(
+    stmt: &mut ast::Statement,
+    cycles: Vec<(String, ast::CycleSpec)>,
+) -> Result<(), Error> {
+    let ctes: &mut Vec<ast::Cte> = match stmt {
+        ast::Statement::Select(select) => &mut select.with,
+        ast::Statement::SetOperation(so) => &mut so.with,
+        _ => {
+            return Err(Error::Unsupported(
+                "a CYCLE clause is only supported on a top-level WITH RECURSIVE query".to_owned(),
+            ));
+        },
+    };
+    for (name, spec) in cycles {
+        let cte = ctes
+            .iter_mut()
+            .find(|c| c.name == name)
+            .ok_or_else(|| Error::Syntax(format!("CYCLE names an unknown CTE `{name}`")))?;
+        if !cte.recursive {
+            return Err(Error::InvalidStatement(format!(
+                "CYCLE is only valid on a recursive CTE, but `{name}` is not recursive"
+            )));
+        }
+        cte.cycle = Some(spec);
+    }
+    Ok(())
+}
+
+/// Walk back from the CTE body's closing `)` (at meaningful position `close`) to the CTE name: match
+/// parens to the body's `(`, expect `AS` before it, then read the name identifier, skipping an
+/// optional `(column, ...)` list between the name and `AS`.
+fn cte_name_before_close(mi: &[usize], tokens: &[TokenWithSpan], close: usize) -> Option<String> {
+    let tok = |p: usize| mi.get(p).and_then(|&i| tokens.get(i));
+    let is_lparen = |p: usize| matches!(tok(p).map(|t| &t.token), Some(Token::LParen));
+    let is_rparen = |p: usize| matches!(tok(p).map(|t| &t.token), Some(Token::RParen));
+    let is_kw = |p: usize, kw: &str| word_ci(tok(p), kw);
+    // Match the body parens backward: `close` is a `)`, find its `(`.
+    let mut depth = 0i32;
+    let mut i = close;
+    let body_open = loop {
+        if is_rparen(i) {
+            depth += 1;
+        } else if is_lparen(i) {
+            depth -= 1;
+            if depth == 0 {
+                break i;
+            }
+        }
+        i = i.checked_sub(1)?;
+    };
+    // `AS` sits just before the body's `(`.
+    let as_pos = body_open.checked_sub(1)?;
+    if !is_kw(as_pos, "as") {
+        return None;
+    }
+    // Before `AS`: either the name, or a `)` closing the CTE's column list — skip that list.
+    let before_as = as_pos.checked_sub(1)?;
+    let name_pos = if is_rparen(before_as) {
+        let mut d = 0i32;
+        let mut j = before_as;
+        let list_open = loop {
+            if is_rparen(j) {
+                d += 1;
+            } else if is_lparen(j) {
+                d -= 1;
+                if d == 0 {
+                    break j;
+                }
+            }
+            j = j.checked_sub(1)?;
+        };
+        list_open.checked_sub(1)?
+    } else {
+        before_as
+    };
+    word_value(tok(name_pos))
 }
 
 /// Strip the window-frame `EXCLUDE` clause that sqlparser cannot parse, rewriting each affected

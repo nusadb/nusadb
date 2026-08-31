@@ -1,0 +1,53 @@
+# Recursive-CTE CYCLE clause: `CYCLE c SET mark USING path` detects cycles so a recursive query over
+# a cyclic graph terminates instead of looping. It appends two columns to the CTE — `mark` (true on
+# the row that revisits a value) and `path` (the values seen so far) — and stops descending past a
+# marked row. Single-column, boolean-mark form. (Booleans render as 1/0 here.)
+
+statement ok
+CREATE TABLE edge (src INT, dst INT)
+
+# A cycle: 1 -> 2 -> 3 -> 1.
+statement ok
+INSERT INTO edge VALUES (1, 2), (2, 3), (3, 1)
+
+# Walking from 1 revisits 1 at depth 3, which is flagged and stops the recursion — without CYCLE this
+# would loop until the safety backstop.
+query III
+WITH RECURSIVE walk(id, depth) AS (
+  SELECT 1, 0
+  UNION ALL
+  SELECT e.dst, walk.depth + 1 FROM walk JOIN edge e ON walk.id = e.src
+) CYCLE id SET is_cycle USING path
+SELECT id, depth, is_cycle FROM walk ORDER BY depth
+----
+1  0  0
+2  1  0
+3  2  0
+1  3  1
+
+# A DAG (no cycle): every row is unmarked and recursion ends naturally.
+statement ok
+CREATE TABLE dag (src INT, dst INT)
+
+statement ok
+INSERT INTO dag VALUES (1, 2), (2, 3)
+
+query II
+WITH RECURSIVE w(id) AS (
+  SELECT 1
+  UNION ALL
+  SELECT d.dst FROM w JOIN dag d ON w.id = d.src
+) CYCLE id SET is_cycle USING path
+SELECT id, is_cycle FROM w ORDER BY id
+----
+1  0
+2  0
+3  0
+
+# CYCLE requires a single cycle column and the boolean-mark form; other shapes are refused, not
+# silently accepted (which would drop the cycle guard).
+statement error
+WITH RECURSIVE w(a, b) AS (SELECT 1, 2 UNION ALL SELECT a, b FROM w WHERE a < 1) CYCLE a, b SET c USING p SELECT * FROM w
+
+statement error
+WITH t(id) AS (SELECT 1) CYCLE id SET c USING p SELECT * FROM t

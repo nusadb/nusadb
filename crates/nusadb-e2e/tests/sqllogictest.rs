@@ -718,6 +718,11 @@ fn slt_p8_cte_and_subquery() {
 }
 
 #[test]
+fn slt_p8_recursive_cte_cycle() {
+    run_slt("tests/slt/p8_cte/recursive_cte_cycle.slt");
+}
+
+#[test]
 fn slt_p8_data_modifying_cte() {
     run_slt("tests/slt/p8_cte/data_modifying_cte.slt");
 }

@@ -2045,10 +2045,39 @@ fn analyze_recursive_cte(
             cte.name
         )));
     };
+    // `CYCLE c SET mark USING path`: rewrite both terms to carry the two cycle-tracking columns before
+    // analysis (see `apply_cycle_rewrite`), and name them so the CTE schema exposes them.
+    let mut base_owned = (**base_select).clone();
+    let mut rec_owned = (**rec_select).clone();
+    let schema_columns: Vec<String> = if let Some(spec) = &cte.cycle {
+        if cte.columns.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "recursive CTE `{}` with CYCLE needs an explicit column list (e.g. `{}(...)`)",
+                cte.name, cte.name
+            )));
+        }
+        let idx = cte
+            .columns
+            .iter()
+            .position(|c| c == &spec.column)
+            .ok_or_else(|| {
+                Error::InvalidColumnReference(format!(
+                    "CYCLE column `{}` is not one of recursive CTE `{}`'s columns",
+                    spec.column, cte.name
+                ))
+            })?;
+        apply_cycle_rewrite(&mut base_owned, &mut rec_owned, &cte.name, spec, idx)?;
+        let mut cols = cte.columns.clone();
+        cols.push(spec.mark_column.clone());
+        cols.push(spec.path_column.clone());
+        cols
+    } else {
+        cte.columns.clone()
+    };
     // The base term must not reference the CTE: resolve it against the plain catalog. Its projection
     // fixes the CTE's column names and types.
-    let base_plan = analyze_select((**base_select).clone(), catalog)?;
-    let mut schema = cte_schema(&cte.name, &cte.columns, &base_plan)?;
+    let base_plan = analyze_select(base_owned, catalog)?;
+    let mut schema = cte_schema(&cte.name, &schema_columns, &base_plan)?;
     schema.id = synthetic_recursive_table_id(recursive_index);
     // The recursive term references the CTE by name; expose its synthetic schema so the
     // self-reference resolves to a scan of the synthetic table.
@@ -2057,7 +2086,7 @@ fn analyze_recursive_cte(
         name: &cte.name,
         schema: &schema,
     };
-    let recursive_plan = analyze_select((**rec_select).clone(), &cte_catalog)?;
+    let recursive_plan = analyze_select(rec_owned, &cte_catalog)?;
     if recursive_plan.projection.len() != base_plan.projection.len() {
         // The anchor and recursive terms are the two branches of the CTE's `UNION ALL`, so a width
         // disagreement here is the same malformed-query error as any other set operation's, and
@@ -2089,6 +2118,91 @@ fn analyze_recursive_cte(
         source: CteSource::Recursive,
     };
     Ok((resolved, def))
+}
+
+/// Rewrite a recursive CTE's base and recursive terms to carry the `CYCLE` clause's two extra
+/// columns, mirroring the standard's expansion:
+/// - base term appends `false AS mark`, `ARRAY[<base cycle value>] AS path`;
+/// - recursive term appends `<rec cycle value> = ANY(t.path) AS mark`,
+///   `array_append(t.path, <rec cycle value>) AS path`, and adds `AND NOT t.mark` to its `WHERE` so
+///   recursion stops descending past a row that already closed a cycle.
+///
+/// `idx` is the cycle column's position in the CTE's declared column list; the cycle value is that
+/// projection item's expression in each term. `t` is the CTE name (the recursive term references it).
+fn apply_cycle_rewrite(
+    base: &mut ast::Select,
+    rec: &mut ast::Select,
+    cte_name: &str,
+    spec: &ast::CycleSpec,
+    idx: usize,
+) -> Result<(), Error> {
+    // The cycle value in each term is the expression it projects for the cycle column — require an
+    // explicit expression there (a `SELECT *` term has no addressable item at that position).
+    let cycle_expr = |select: &ast::Select| -> Result<ast::Expr, Error> {
+        match select.projection.get(idx) {
+            Some(ast::SelectItem::Expr { expr, .. }) => Ok(expr.clone()),
+            _ => Err(Error::Unsupported(format!(
+                "a recursive CTE with CYCLE must project the cycle column `{}` as an explicit \
+                 expression in both terms (not `*`)",
+                spec.column
+            ))),
+        }
+    };
+    let path_ref = || ast::Expr::QualifiedColumn {
+        table: cte_name.to_owned(),
+        column: spec.path_column.clone(),
+    };
+    let named = |expr: ast::Expr, name: &str| ast::SelectItem::Expr {
+        expr,
+        alias: Some(name.to_owned()),
+    };
+
+    // Base term: `false AS mark`, `ARRAY[<base cycle value>] AS path`.
+    let base_cycle = cycle_expr(base)?;
+    base.projection.push(named(
+        ast::Expr::Literal(ast::Value::Bool(false)),
+        &spec.mark_column,
+    ));
+    base.projection.push(named(
+        ast::Expr::ArrayLiteral(vec![base_cycle]),
+        &spec.path_column,
+    ));
+
+    // Recursive term: mark = `<rec cycle value> = ANY(t.path)`, path = `array_append(t.path, <rec
+    // cycle value>)`, and `WHERE ... AND NOT t.mark`.
+    let rec_cycle = cycle_expr(rec)?;
+    rec.projection.push(named(
+        ast::Expr::QuantifiedArray {
+            expr: Box::new(rec_cycle.clone()),
+            op: ast::BinaryOp::Eq,
+            all: false,
+            array: Box::new(path_ref()),
+        },
+        &spec.mark_column,
+    ));
+    rec.projection.push(named(
+        ast::Expr::ScalarFunction {
+            func: ast::ScalarFunc::ArrayAppend,
+            args: vec![path_ref(), rec_cycle],
+        },
+        &spec.path_column,
+    ));
+    let not_mark = ast::Expr::Unary {
+        op: ast::UnaryOp::Not,
+        expr: Box::new(ast::Expr::QualifiedColumn {
+            table: cte_name.to_owned(),
+            column: spec.mark_column.clone(),
+        }),
+    };
+    rec.filter = Some(match rec.filter.take() {
+        Some(existing) => ast::Expr::Binary {
+            left: Box::new(existing),
+            op: ast::BinaryOp::And,
+            right: Box::new(not_mark),
+        },
+        None => not_mark,
+    });
+    Ok(())
 }
 
 /// Synthetic [`nusadb_core::TableId`] for the `index`-th recursive CTE of a query. Reserved

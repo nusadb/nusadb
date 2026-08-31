@@ -22,6 +22,26 @@ pub struct Cte {
     pub body: CteBody,
     /// `true` when this CTE was introduced by `WITH RECURSIVE`.
     pub recursive: bool,
+    /// `CYCLE c SET mark USING path` — cycle detection for a recursive CTE, captured by the parser's
+    /// pre-parse (sqlparser has no grammar for it). `None` when absent.
+    pub cycle: Option<CycleSpec>,
+}
+
+/// A recursive CTE's `CYCLE <column> SET <mark_column> USING <path_column>` clause.
+///
+/// The analyzer appends two columns to the CTE: `mark_column` (boolean — `true` on the row that
+/// closes a cycle) and `path_column` (an array of the cycle column's values seen so far). The
+/// recursive term stops descending past a row already marked as a cycle. Only the single-column,
+/// boolean-mark form is modelled; multi-column `CYCLE` and the `TO x DEFAULT y` marker literals are
+/// rejected at the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleSpec {
+    /// The cycle column whose repetition on a path signals a cycle.
+    pub column: String,
+    /// The boolean column the clause introduces to flag a cycle-closing row (`SET` target).
+    pub mark_column: String,
+    /// The array column the clause introduces to accumulate the visited cycle values (`USING` target).
+    pub path_column: String,
 }
 
 /// A CTE's body.

@@ -144,6 +144,9 @@ pub(super) fn convert_cte(cte: sql::Cte, recursive: bool) -> Result<ast::Cte, Er
         columns,
         body,
         recursive,
+        // Attached after parsing from the pre-parse's captured `CYCLE` clauses (sqlparser has no
+        // grammar for them), keyed by CTE name — see `parse` / `apply_cte_cycles`.
+        cycle: None,
     })
 }
 
