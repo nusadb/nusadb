@@ -376,9 +376,13 @@ const INSERT_SELECT_BATCH: usize = 1024;
 /// and the statement fails with the honest duplicate error, or (b) tried to lock `K` *after* us —
 /// then it aborted on our held lock (`40001`). There is no in-between: the lock is taken before
 /// the key's row is written and held to transaction end.
+/// One PK/UNIQUE constraint's enforcement metadata:
+/// `(name, kind label, column names, ordinals, nulls_not_distinct)`.
+type DeferredConstraint = (String, &'static str, Vec<String>, Vec<usize>, bool);
+
 struct DeferredUnique {
-    /// Per PK/UNIQUE constraint: `(name, kind label, column names, ordinals)`.
-    constraints: Vec<(String, &'static str, Vec<String>, Vec<usize>)>,
+    /// Per PK/UNIQUE constraint (see [`DeferredConstraint`]).
+    constraints: Vec<DeferredConstraint>,
     /// Per constraint (same order), the statement's inserted keys, bucketed by the shared
     /// [`unique_key_hash`] (collisions only cost a comparison, never correctness).
     seen: Vec<HashMap<u64, Vec<Vec<ast::Value>>>>,
@@ -399,7 +403,7 @@ impl DeferredUnique {
     /// Load the target's PK/UNIQUE constraints; a table without any yields an empty (free)
     /// collector.
     fn load(table: &TableSchema, engine: &dyn StorageEngine) -> Result<Self, Error> {
-        let constraints: Vec<(String, &'static str, Vec<String>, Vec<usize>)> = engine
+        let constraints: Vec<DeferredConstraint> = engine
             .list_constraints(table.id)?
             .into_iter()
             .filter_map(|c| {
@@ -408,10 +412,11 @@ impl DeferredUnique {
                     nusadb_core::ConstraintKind::Unique => "unique",
                     _ => return None,
                 };
-                Some((c.name, kind, c.columns))
+                Some((c.name, kind, c.columns, c.nulls_not_distinct))
             })
-            .map(|(name, kind, columns)| {
-                constraint_ordinals(table, &columns).map(|ordinals| (name, kind, columns, ordinals))
+            .map(|(name, kind, columns, nnd)| {
+                constraint_ordinals(table, &columns)
+                    .map(|ordinals| (name, kind, columns, ordinals, nnd))
             })
             .collect::<Result<_, _>>()?;
         // Index-probe eligibility: every constraint must have a backing index (named after the
@@ -420,7 +425,7 @@ impl DeferredUnique {
         // statement's keys; otherwise the O(N) `seen`/`inserted` path is kept (an ineligible probe
         // would fall back to an O(table) scan per batch — quadratic — so accumulation is cheaper).
         let mut eligible = !constraints.is_empty();
-        for (name, _, _, ordinals) in &constraints {
+        for (name, _, _, ordinals, nulls_not_distinct) in &constraints {
             let has_backing = engine.lookup_index(name)?.is_some();
             let keys_safe = ordinals.iter().all(|&o| {
                 table
@@ -428,7 +433,9 @@ impl DeferredUnique {
                     .get(o)
                     .is_some_and(|c| super::ops::is_hash_safe_key_type(c.ty))
             });
-            if !has_backing || !keys_safe {
+            // A NULLS NOT DISTINCT constraint must detect NULL-key collisions, which the backing
+            // index cannot probe — so it forces the accumulating scan path, like an ineligible key.
+            if !has_backing || !keys_safe || *nulls_not_distinct {
                 eligible = false;
                 break;
             }
@@ -465,10 +472,10 @@ impl DeferredUnique {
         }
         lock_unique_keys(table, rows, engine, txn)?;
         for row in rows {
-            for ((name, kind, columns, ordinals), buckets) in
+            for ((name, kind, columns, ordinals, nulls_not_distinct), buckets) in
                 self.constraints.iter().zip(&mut self.seen)
             {
-                let Some(key) = unique_key(row, ordinals) else {
+                let Some(key) = unique_key(row, ordinals, *nulls_not_distinct) else {
                     continue;
                 };
                 let bucket = buckets
@@ -510,10 +517,10 @@ impl DeferredUnique {
             if self.inserted.contains(&tid) {
                 continue;
             }
-            for ((name, kind, columns, ordinals), buckets) in
+            for ((name, kind, columns, ordinals, nulls_not_distinct), buckets) in
                 self.constraints.iter().zip(&self.seen)
             {
-                let Some(key) = unique_key(&row, ordinals) else {
+                let Some(key) = unique_key(&row, ordinals, *nulls_not_distinct) else {
                     continue;
                 };
                 let clash = buckets
@@ -1129,7 +1136,10 @@ fn upsert_rows(
     let mut affected_keys: Vec<Vec<ast::Value>> = Vec::new();
 
     for prow in proposed {
-        let Some(key) = unique_key(&prow, &key_ordinals) else {
+        // ON CONFLICT arbiter matching treats a NULL key as distinct (standard `NULLS DISTINCT`); a
+        // NULLS-NOT-DISTINCT arbiter's NULL duplicate is still caught by the NULL-aware uniqueness
+        // enforcement on the resulting insert.
+        let Some(key) = unique_key(&prow, &key_ordinals, false) else {
             // A NULL arbiter key never collides (NULLs are distinct) → plain insert.
             inserts.push(prow.clone());
             affected.push(prow);
@@ -1143,7 +1153,7 @@ fn upsert_rows(
             .into());
         }
         let hit = existing.iter().find(|(_, erow)| {
-            unique_key(erow, &key_ordinals).is_some_and(|ekey| unique_key_eq(&ekey, &key))
+            unique_key(erow, &key_ordinals, false).is_some_and(|ekey| unique_key_eq(&ekey, &key))
         });
         if let Some((tid, erow)) = hit {
             // Evaluate SET / WHERE against `existing ++ EXCLUDED(proposed)`.
@@ -1737,6 +1747,12 @@ fn try_unique_by_index_probe(
         ) {
             continue;
         }
+        // A NULLS NOT DISTINCT constraint must also detect NULL-key collisions; the backing index
+        // does not index NULL keys, so an index probe cannot see them — take the scan path, which
+        // evaluates NULL equality via `enforce_unique_over_rows`.
+        if constraint.nulls_not_distinct {
+            return Ok(false);
+        }
         let ordinals = constraint_ordinals(table, &constraint.columns)?;
         let Some(index) = engine.lookup_index(&constraint.name)? else {
             return Ok(false); // no backing index for some constraint → take the scan path
@@ -1753,7 +1769,9 @@ fn try_unique_by_index_probe(
     // key column disqualifies the whole table (fall back to the scan, which uses `eval::compare`).
     for probe in &probes {
         for row in new_rows {
-            if let Some(key) = unique_key(row, &probe.ordinals)
+            // Only non-NND constraints reach the probe path (NND takes the scan), so NULLs are
+            // distinct here.
+            if let Some(key) = unique_key(row, &probe.ordinals, false)
                 && !key.iter().all(super::ops::is_hash_safe_value)
             {
                 return Ok(false);
@@ -1765,7 +1783,7 @@ fn try_unique_by_index_probe(
     for probe in &probes {
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row in new_rows {
-            let Some(key) = unique_key(row, &probe.ordinals) else {
+            let Some(key) = unique_key(row, &probe.ordinals, false) else {
                 continue; // a NULL key column: the row does not participate (NULL is distinct)
             };
             let encoded = index_key::encode_index_key(&key)?;
@@ -1824,7 +1842,7 @@ fn lock_unique_keys(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let constraints: Vec<(Vec<String>, Vec<usize>)> = engine
+    let constraints: Vec<(Vec<String>, Vec<usize>, bool)> = engine
         .list_constraints(table.id)?
         .into_iter()
         .filter(|c| {
@@ -1833,11 +1851,13 @@ fn lock_unique_keys(
                 nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
             )
         })
-        .map(|c| constraint_ordinals(table, &c.columns).map(|ord| (c.columns, ord)))
+        .map(|c| {
+            constraint_ordinals(table, &c.columns).map(|ord| (c.columns, ord, c.nulls_not_distinct))
+        })
         .collect::<Result<_, _>>()?;
     for row in rows {
-        for (columns, ordinals) in &constraints {
-            if let Some(key) = unique_key(row, ordinals) {
+        for (columns, ordinals, nulls_not_distinct) in &constraints {
+            if let Some(key) = unique_key(row, ordinals, *nulls_not_distinct) {
                 let key_hash = unique_key_hash(table, columns, &key);
                 engine.lock_key(
                     txn,
@@ -1894,8 +1914,8 @@ fn keep_non_conflicting(
     if !table_has_unique_constraint(table, engine)? {
         return Ok(new_rows);
     }
-    // The key-column ordinals of each PK/UNIQUE constraint.
-    let constraints: Vec<Vec<usize>> = engine
+    // The key-column ordinals of each PK/UNIQUE constraint, plus its NULLS-NOT-DISTINCT flag.
+    let constraints: Vec<(Vec<usize>, bool)> = engine
         .list_constraints(table.id)?
         .into_iter()
         .filter(|c| {
@@ -1904,17 +1924,17 @@ fn keep_non_conflicting(
                 nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
             )
         })
-        .map(|c| constraint_ordinals(table, &c.columns))
+        .map(|c| constraint_ordinals(table, &c.columns).map(|ord| (ord, c.nulls_not_distinct)))
         .collect::<Result<_, _>>()?;
     // Per constraint, a sorted set of the keys already present (existing rows + accepted rows), so a
     // collision is a binary search under the total order.
     let existing = scan_rows(table, engine, txn)?;
     let mut seen: Vec<Vec<Vec<ast::Value>>> = constraints
         .iter()
-        .map(|ordinals| {
+        .map(|(ordinals, nnd)| {
             let mut keys: Vec<Vec<ast::Value>> = existing
                 .iter()
-                .filter_map(|row| unique_key(row, ordinals))
+                .filter_map(|row| unique_key(row, ordinals, *nnd))
                 .collect();
             keys.sort_by(|a, b| unique_key_cmp(a, b));
             keys
@@ -1924,7 +1944,7 @@ fn keep_non_conflicting(
     for row in new_rows {
         let keys: Vec<Option<Vec<ast::Value>>> = constraints
             .iter()
-            .map(|ordinals| unique_key(&row, ordinals))
+            .map(|(ordinals, nnd)| unique_key(&row, ordinals, *nnd))
             .collect();
         let conflicts = keys.iter().enumerate().any(|(i, key)| {
             key.as_ref().is_some_and(|k| {
@@ -1974,11 +1994,12 @@ fn enforce_unique_over_rows(
             continue;
         }
         let ordinals = constraint_ordinals(table, &constraint.columns)?;
-        // Gather the participating (non-NULL) key tuples, sort by the total order, then any two
-        // equal keys are adjacent.
+        // Gather the participating key tuples, sort by the total order, then any two equal keys are
+        // adjacent. Under NULLS NOT DISTINCT a NULL row participates (NULL equals NULL); otherwise a
+        // NULL key is skipped.
         let mut keys: Vec<Vec<ast::Value>> = rows
             .iter()
-            .filter_map(|row| unique_key(row, &ordinals))
+            .filter_map(|row| unique_key(row, &ordinals, constraint.nulls_not_distinct))
             .collect();
         keys.sort_by(|a, b| unique_key_cmp(a, b));
         if keys
@@ -2024,8 +2045,9 @@ fn enforce_new_keys_vs_committed(
     if !table_has_unique_constraint(table, engine)? {
         return Ok(());
     }
-    // Per PK/UNIQUE constraint, the (sorted) keys the rewritten rows held before this statement.
-    let constraints: Vec<Vec<usize>> = engine
+    // Per PK/UNIQUE constraint, the (sorted) keys the rewritten rows held before this statement, plus
+    // its NULLS-NOT-DISTINCT flag (so a NULL old key matches under that mode).
+    let constraints: Vec<(Vec<usize>, bool)> = engine
         .list_constraints(table.id)?
         .into_iter()
         .filter(|c| {
@@ -2034,26 +2056,29 @@ fn enforce_new_keys_vs_committed(
                 nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
             )
         })
-        .map(|c| constraint_ordinals(table, &c.columns))
+        .map(|c| constraint_ordinals(table, &c.columns).map(|ord| (ord, c.nulls_not_distinct)))
         .collect::<Result<_, _>>()?;
     let old_keys: Vec<Vec<Vec<ast::Value>>> = constraints
         .iter()
-        .map(|ordinals| {
+        .map(|(ordinals, nnd)| {
             let mut keys: Vec<Vec<ast::Value>> = old_rows
                 .iter()
-                .filter_map(|row| unique_key(row, ordinals))
+                .filter_map(|row| unique_key(row, ordinals, *nnd))
                 .collect();
             keys.sort_by(|a, b| unique_key_cmp(a, b));
             keys
         })
         .collect();
     let holds_a_rewritten_key = |row: &Row| {
-        constraints.iter().zip(&old_keys).any(|(ordinals, keys)| {
-            unique_key(row, ordinals).is_some_and(|key| {
-                keys.binary_search_by(|probe| unique_key_cmp(probe, &key))
-                    .is_ok()
+        constraints
+            .iter()
+            .zip(&old_keys)
+            .any(|((ordinals, nnd), keys)| {
+                unique_key(row, ordinals, *nnd).is_some_and(|key| {
+                    keys.binary_search_by(|probe| unique_key_cmp(probe, &key))
+                        .is_ok()
+                })
             })
-        })
     };
     let mut universe: Vec<Row> = scan_table_committed(table, engine, txn)?
         .into_iter()
@@ -2103,6 +2128,11 @@ fn try_update_unique_by_index_probe(
         ) {
             continue;
         }
+        // A NULLS NOT DISTINCT constraint needs NULL-key collision detection the backing index cannot
+        // probe → take the scan path.
+        if constraint.nulls_not_distinct {
+            return Ok(false);
+        }
         let ordinals = constraint_ordinals(table, &constraint.columns)?;
         let Some(index) = engine.lookup_index(&constraint.name)? else {
             return Ok(false);
@@ -2117,7 +2147,9 @@ fn try_update_unique_by_index_probe(
     }
     for probe in &probes {
         for row in new_rows {
-            if let Some(key) = unique_key(row, &probe.ordinals)
+            // Only non-NND constraints reach the probe path (NND takes the scan), so NULLs are
+            // distinct here.
+            if let Some(key) = unique_key(row, &probe.ordinals, false)
                 && !key.iter().all(super::ops::is_hash_safe_value)
             {
                 return Ok(false);
@@ -2132,7 +2164,7 @@ fn try_update_unique_by_index_probe(
         .map(|probe| {
             let mut keys: Vec<Vec<ast::Value>> = old_rows
                 .iter()
-                .filter_map(|row| unique_key(row, &probe.ordinals))
+                .filter_map(|row| unique_key(row, &probe.ordinals, false))
                 .collect();
             keys.sort_by(|a, b| unique_key_cmp(a, b));
             keys
@@ -2140,7 +2172,7 @@ fn try_update_unique_by_index_probe(
         .collect();
     let holds_a_rewritten_key = |row: &Row| {
         probes.iter().zip(&old_keys).any(|(probe, keys)| {
-            unique_key(row, &probe.ordinals)
+            unique_key(row, &probe.ordinals, false)
                 .is_some_and(|key| keys.binary_search_by(|p| unique_key_cmp(p, &key)).is_ok())
         })
     };
@@ -2148,7 +2180,7 @@ fn try_update_unique_by_index_probe(
     for probe in &probes {
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row in new_rows {
-            let Some(key) = unique_key(row, &probe.ordinals) else {
+            let Some(key) = unique_key(row, &probe.ordinals, false) else {
                 continue;
             };
             let encoded = index_key::encode_index_key(&key)?;
@@ -2220,13 +2252,25 @@ fn update_touches_unique_columns(
     Ok(false)
 }
 
-/// The key tuple of `row` for a constraint's columns, or `None` if any key column is `NULL` (such
-/// a row does not participate in `UNIQUE` — `NULL` is distinct from everything, including `NULL`).
-pub(super) fn unique_key(row: &Row, ordinals: &[usize]) -> Option<Vec<ast::Value>> {
+/// The key tuple of `row` for a constraint's columns. With the standard `NULLS DISTINCT` semantics
+/// (`nulls_not_distinct = false`), a `NULL` key column yields `None` — such a row does not participate
+/// in `UNIQUE`, since `NULL` is distinct from everything, including `NULL`. With `NULLS NOT DISTINCT`,
+/// a `NULL` is a real key value (`NULL` equals `NULL`), so the row participates: `NULL` columns are
+/// carried as `Value::Null` and the key is always `Some`.
+pub(super) fn unique_key(
+    row: &Row,
+    ordinals: &[usize],
+    nulls_not_distinct: bool,
+) -> Option<Vec<ast::Value>> {
     let mut key = Vec::with_capacity(ordinals.len());
     for &ordinal in ordinals {
         match row.get(ordinal) {
-            Some(ast::Value::Null) | None => return None,
+            Some(ast::Value::Null) | None => {
+                if !nulls_not_distinct {
+                    return None;
+                }
+                key.push(ast::Value::Null);
+            },
             Some(value) => key.push(value.clone()),
         }
     }
@@ -2374,7 +2418,7 @@ pub(super) fn enforce_fk_on_child_write(
             parent_rows
                 .iter()
                 .chain(pending)
-                .filter_map(|prow| unique_key(prow, &parent_key))
+                .filter_map(|prow| unique_key(prow, &parent_key, false))
         };
         // How the parent is searched depends on how many rows are asking, measured against how big
         // the parent is. One row wants a lazy walk that stops at the first match — the common
@@ -2399,7 +2443,7 @@ pub(super) fn enforce_fk_on_child_write(
             keys
         });
         for row in rows {
-            let Some(key) = unique_key(row, &child_ordinals) else {
+            let Some(key) = unique_key(row, &child_ordinals, false) else {
                 continue; // NULL foreign key — references nothing (MATCH SIMPLE).
             };
             let present = sorted_keys.as_ref().map_or_else(
@@ -2608,7 +2652,7 @@ fn enforce_fk_on_parent_delete(
         };
         let deleted_keys: Vec<Vec<ast::Value>> = deleting
             .iter()
-            .filter_map(|(_, r)| unique_key(r, &parent_ordinals))
+            .filter_map(|(_, r)| unique_key(r, &parent_ordinals, false))
             .collect();
         if deleted_keys.is_empty() {
             continue;
@@ -2631,7 +2675,7 @@ fn enforce_fk_on_parent_delete(
             .into_iter()
             .filter(|(ctid, crow)| {
                 !leaving.contains(ctid)
-                    && unique_key(crow, &child_ordinals)
+                    && unique_key(crow, &child_ordinals, false)
                         .is_some_and(|ckey| deleted_keys.iter().any(|dk| unique_key_eq(dk, &ckey)))
             })
             .collect();
@@ -2741,8 +2785,8 @@ fn keys_this_statement_moves(
     changes
         .iter()
         .filter_map(|(_, old, new)| {
-            let old_key = unique_key(old, parent_ordinals)?;
-            let new_key = unique_key(new, parent_ordinals);
+            let old_key = unique_key(old, parent_ordinals, false)?;
+            let new_key = unique_key(new, parent_ordinals, false);
             let unchanged = new_key
                 .as_ref()
                 .is_some_and(|nk| unique_key_eq(nk, &old_key));
@@ -2817,7 +2861,7 @@ fn enforce_fk_on_parent_update(
                 .iter()
                 .filter(|(ctid, crow)| {
                     let judged = post.get(ctid).copied().unwrap_or(crow);
-                    unique_key(judged, &child_ordinals)
+                    unique_key(judged, &child_ordinals, false)
                         .is_some_and(|ck| unique_key_eq(&ck, &old_key))
                 })
                 .cloned()
@@ -3992,6 +4036,7 @@ fn truncate_rebuild(
                 &c.name,
                 &c.columns,
                 c.kind == nusadb_core::engine::ConstraintKind::PrimaryKey,
+                c.nulls_not_distinct,
             )?;
         }
         for c in &s.checks {

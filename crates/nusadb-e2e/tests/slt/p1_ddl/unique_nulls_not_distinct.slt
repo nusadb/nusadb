@@ -1,0 +1,55 @@
+# UNIQUE NULLS NOT DISTINCT: with plain UNIQUE, each NULL is distinct so many NULLs
+# coexist; with NULLS NOT DISTINCT the constraint treats NULL as a single value, so a
+# second NULL collides. Both the inline table constraint and ALTER ... ADD paths honor it.
+
+# Plain UNIQUE — NULLs are distinct, multiple NULLs allowed.
+statement ok
+CREATE TABLE plain_u (a INT, UNIQUE (a))
+
+statement ok
+INSERT INTO plain_u VALUES (NULL), (NULL), (1)
+
+query I
+SELECT count(*) FROM plain_u
+----
+3
+
+# Inline UNIQUE NULLS NOT DISTINCT — NULL treated as one value, second NULL rejected.
+statement ok
+CREATE TABLE nnd_inline (a INT, b TEXT, UNIQUE NULLS NOT DISTINCT (a))
+
+statement ok
+INSERT INTO nnd_inline VALUES (NULL, 'x')
+
+statement error duplicate key
+INSERT INTO nnd_inline VALUES (NULL, 'y')
+
+# Non-NULL duplicates still collide as usual.
+statement ok
+INSERT INTO nnd_inline VALUES (1, 'a')
+
+statement error duplicate key
+INSERT INTO nnd_inline VALUES (1, 'b')
+
+query I
+SELECT count(*) FROM nnd_inline
+----
+2
+
+# ALTER TABLE ... ADD UNIQUE NULLS NOT DISTINCT — same semantics on an existing table.
+statement ok
+CREATE TABLE nnd_alter (a INT)
+
+statement ok
+INSERT INTO nnd_alter VALUES (NULL)
+
+statement ok
+ALTER TABLE nnd_alter ADD UNIQUE NULLS NOT DISTINCT (a)
+
+statement error duplicate key
+INSERT INTO nnd_alter VALUES (NULL)
+
+query I
+SELECT count(*) FROM nnd_alter
+----
+1

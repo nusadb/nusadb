@@ -191,6 +191,7 @@ pub(super) fn run_create_table(
             &constraint.name,
             &constraint.columns,
             constraint.primary,
+            constraint.nulls_not_distinct,
         )?;
     }
     // Register each FOREIGN KEY.
@@ -1033,9 +1034,24 @@ pub(super) fn run_alter_table(
             name,
             columns,
             primary,
+            nulls_not_distinct,
         } => {
-            validate_add_unique_constraint(&table, &columns, primary, engine, txn)?;
-            let index = engine.add_unique_constraint(txn, table.id, &name, &columns, primary)?;
+            validate_add_unique_constraint(
+                &table,
+                &columns,
+                primary,
+                nulls_not_distinct,
+                engine,
+                txn,
+            )?;
+            let index = engine.add_unique_constraint(
+                txn,
+                table.id,
+                &name,
+                &columns,
+                primary,
+                nulls_not_distinct,
+            )?;
             // Backfill the constraint's backing index with the existing rows: the backing
             // index is a scannable access path now, so on a populated table it must cover every
             // live row from the moment it exists — like `CREATE INDEX`'s backfill. Uniqueness was
@@ -1236,6 +1252,7 @@ fn validate_add_unique_constraint(
     table: &TableSchema,
     columns: &[String],
     primary: bool,
+    nulls_not_distinct: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -1255,7 +1272,7 @@ fn validate_add_unique_constraint(
     }
     let mut keys: Vec<Vec<ast::Value>> = rows
         .iter()
-        .filter_map(|row| dml::unique_key(row, &ordinals))
+        .filter_map(|row| dml::unique_key(row, &ordinals, nulls_not_distinct))
         .collect();
     keys.sort_by(|a, b| dml::unique_key_cmp(a, b));
     if keys.windows(2).any(

@@ -708,6 +708,11 @@ pub struct Constraint {
     pub index: Option<IndexId>,
     /// The `CHECK` predicate as opaque bytes (the SQL layer's encoding), or `None` otherwise.
     pub expr: Option<Vec<u8>>,
+    /// `UNIQUE ... NULLS NOT DISTINCT`: `NULL` key values are treated as equal to each other, so at
+    /// most one row may have `NULL` in the constrained columns. `false` (the default) is the standard
+    /// `NULLS DISTINCT` — every `NULL` is distinct, so `NULL` rows never conflict. Meaningful only for
+    /// `Unique` (a `PrimaryKey`'s columns are `NOT NULL`; `ForeignKey`/`Check` ignore it).
+    pub nulls_not_distinct: bool,
 }
 
 /// Per-column statistics for the cost-based optimizer.
@@ -1381,8 +1386,9 @@ pub trait StorageEngine: Send + Sync {
         name: &str,
         columns: &[String],
         primary: bool,
+        nulls_not_distinct: bool,
     ) -> Result<IndexId> {
-        let _ = (txn, table, name, columns, primary);
+        let _ = (txn, table, name, columns, primary, nulls_not_distinct);
         Err(unsupported("add_unique_constraint"))
     }
 

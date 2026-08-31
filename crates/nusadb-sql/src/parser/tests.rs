@@ -635,8 +635,11 @@ fn alter_table_add_unique_constraint() {
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t ADD CONSTRAINT u UNIQUE (email)") else {
         panic!("expected AlterTable");
     };
-    let ast::AlterTableAction::AddConstraint(ast::TableConstraint::Unique { name, columns }) =
-        a.action
+    let ast::AlterTableAction::AddConstraint(ast::TableConstraint::Unique {
+        name,
+        columns,
+        nulls_not_distinct: _,
+    }) = a.action
     else {
         panic!("expected Unique constraint");
     };

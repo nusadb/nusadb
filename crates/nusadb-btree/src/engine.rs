@@ -657,6 +657,8 @@ struct UniqueState {
     columns: Vec<String>,
     primary: bool,
     index: u64,
+    /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (at most one NULL row).
+    nulls_not_distinct: bool,
 }
 
 /// A declared `CHECK` constraint: name + the SQL layer's opaque predicate bytes.
@@ -1443,6 +1445,7 @@ impl BtreeEngine {
                 name,
                 columns,
                 primary,
+                nulls_not_distinct,
             } => {
                 cat.constraints
                     .entry(*table)
@@ -1452,6 +1455,7 @@ impl BtreeEngine {
                         columns: columns.clone(),
                         primary: *primary,
                         index: *index,
+                        nulls_not_distinct: *nulls_not_distinct,
                     });
             },
             LoggedOp::AddCheck {
@@ -1935,6 +1939,7 @@ impl BtreeEngine {
                     name: state.name.clone(),
                     columns: state.columns.clone(),
                     primary: state.primary,
+                    nulls_not_distinct: state.nulls_not_distinct,
                 }],
                 UndoOp::DroppedCheck { table, state } => vec![LoggedOp::AddCheck {
                     txn: txn.0,
@@ -2434,6 +2439,7 @@ impl BtreeEngine {
                     name: u.name.clone(),
                     columns: u.columns.clone(),
                     primary: u.primary,
+                    nulls_not_distinct: u.nulls_not_distinct,
                 });
             }
         }
@@ -4421,6 +4427,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         name: &str,
         columns: &[String],
         primary: bool,
+        nulls_not_distinct: bool,
     ) -> Result<IndexId> {
         // Create the backing unique index first (it takes the state latch internally). If the
         // single-PK check below rejects this, the index was created within this transaction and
@@ -4459,6 +4466,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 columns: columns.to_vec(),
                 primary,
                 index: index.0,
+                nulls_not_distinct,
             });
         self.push_undo(
             txn.0,
@@ -4476,6 +4484,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: name.to_owned(),
                 columns: columns.to_vec(),
                 primary,
+                nulls_not_distinct,
             },
         )?;
         Ok(index)
@@ -4643,6 +4652,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     },
                     index: Some(IndexId(c.index)),
                     expr: None,
+                    nulls_not_distinct: c.nulls_not_distinct,
                 })
                 .collect()
         });
@@ -4658,6 +4668,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 kind: ConstraintKind::ForeignKey,
                 index: Some(IndexId(fk.child_index)),
                 expr: None,
+                nulls_not_distinct: false,
             });
         }
         if let Some(cs) = cat.checks.get(&table.0) {
@@ -4669,6 +4680,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     kind: ConstraintKind::Check,
                     index: None,
                     expr: Some(c.expr.clone()),
+                    nulls_not_distinct: false,
                 });
             }
         }

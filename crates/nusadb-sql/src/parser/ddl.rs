@@ -1317,12 +1317,9 @@ pub(super) fn convert_table_constraint(
             if u.index_type_display != sql::KeyOrIndexDisplay::None {
                 return unsupported("UNIQUE constraint with KEY|INDEX display");
             }
-            // `NULLS DISTINCT` is the SQL default (NULL keys never conflict — exactly the
-            // engine's unique-index semantic), so the explicit spelling is accepted;
-            // `NULLS NOT DISTINCT` changes the semantics and stays refused.
-            if u.nulls_distinct == sql::NullsDistinctOption::NotDistinct {
-                return unsupported("UNIQUE constraint with NULLS NOT DISTINCT");
-            }
+            // `NULLS DISTINCT` (default): NULL keys never conflict. `NULLS NOT DISTINCT`: NULL keys
+            // are treated as equal (at most one NULL row) — carried through to enforcement.
+            let nulls_not_distinct = u.nulls_distinct == sql::NullsDistinctOption::NotDistinct;
             reject_index_hints(
                 u.index_name.as_ref(),
                 u.index_type.as_ref(),
@@ -1332,6 +1329,7 @@ pub(super) fn convert_table_constraint(
             Ok(ast::TableConstraint::Unique {
                 name: u.name.as_ref().map(fold_ident),
                 columns: constraint_column_names(&u.columns)?,
+                nulls_not_distinct,
             })
         },
         T::ForeignKey(fk) => {

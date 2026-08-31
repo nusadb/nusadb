@@ -165,6 +165,7 @@ impl StorageEngine for MockEngine {
             kind: ConstraintKind::Check,
             index: None,
             expr: Some(expr.to_vec()),
+            nulls_not_distinct: false,
         });
         Ok(())
     }
@@ -3298,7 +3299,8 @@ fn parallel_filtered_and_scalar_aggregate_match_sequential() {
 /// SQL-surface batch (user directive "impl sintaks yang belum"): `SUBSTRING(s FOR n)` defaults
 /// its start to 1; `CREATE [MATERIALIZED] VIEW IF NOT EXISTS` is accepted (no-op contract
 /// pinned end-to-end in `p11_views/plain.slt`); explicit `UNIQUE ... NULLS DISTINCT` (the
-/// default semantic) and `TRUNCATE ... RESTRICT` are accepted.
+/// default semantic) and `UNIQUE ... NULLS NOT DISTINCT` both parse, and `TRUNCATE ... RESTRICT`
+/// is accepted.
 #[test]
 fn surface_batch_substring_view_if_not_exists_cte_hints() {
     let engine = MockEngine::new();
@@ -3334,10 +3336,11 @@ fn surface_batch_substring_view_if_not_exists_cte_hints() {
         .is_err()
     );
 
-    // UNIQUE NULLS DISTINCT = the default semantic (parse-level: constraints need the real
-    // engine, exercised via SLT); NULLS NOT DISTINCT stays refused.
+    // UNIQUE NULLS DISTINCT = the default semantic; NULLS NOT DISTINCT treats NULL as a single
+    // value. Both parse here (enforcement needs the real engine, exercised in
+    // p1_ddl/unique_nulls_not_distinct.slt).
     parse("CREATE TABLE u1 (a INT, UNIQUE NULLS DISTINCT (a))").unwrap();
-    assert!(parse("CREATE TABLE u2 (a INT, UNIQUE NULLS NOT DISTINCT (a))").is_err());
+    parse("CREATE TABLE u2 (a INT, UNIQUE NULLS NOT DISTINCT (a))").unwrap();
 
     // TRUNCATE ... RESTRICT (the default) is accepted; CASCADE now parses too — the SQLLogicTest
     // `truncate_cascade.slt` covers its actual cascading behavior against the real engine.

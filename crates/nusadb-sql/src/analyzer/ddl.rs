@@ -394,13 +394,17 @@ fn resolve_unique_constraints(
                 name: format!("{name_base}_pkey"),
                 columns: vec![column.name.clone()],
                 primary: true,
+                nulls_not_distinct: false,
             });
         }
         if column.unique {
+            // A column-level `UNIQUE NULLS NOT DISTINCT` is not modelled at the surface (sqlparser has
+            // no grammar for it on a column); the table-level `UNIQUE NULLS NOT DISTINCT (col)` form is.
             specs.push(UniqueConstraintSpec {
                 name: format!("{name_base}_{}_key", column.name),
                 columns: vec![column.name.clone()],
                 primary: false,
+                nulls_not_distinct: false,
             });
         }
     }
@@ -409,8 +413,14 @@ fn resolve_unique_constraints(
     for constraint in &ct.constraints {
         match constraint {
             ast::TableConstraint::PrimaryKey { name, columns }
-            | ast::TableConstraint::Unique { name, columns } => {
-                let primary = matches!(constraint, ast::TableConstraint::PrimaryKey { .. });
+            | ast::TableConstraint::Unique { name, columns, .. } => {
+                let (primary, nulls_not_distinct) = match constraint {
+                    ast::TableConstraint::PrimaryKey { .. } => (true, false),
+                    ast::TableConstraint::Unique {
+                        nulls_not_distinct, ..
+                    } => (false, *nulls_not_distinct),
+                    _ => unreachable!("outer match binds only PrimaryKey / Unique"),
+                };
                 for column in columns {
                     if !column_exists(column) {
                         return Err(Error::ColumnNotFound {
@@ -428,6 +438,7 @@ fn resolve_unique_constraints(
                     name: name.clone().unwrap_or(default),
                     columns: columns.clone(),
                     primary,
+                    nulls_not_distinct,
                 });
             },
             // Foreign keys / CHECK are resolved separately (`resolve_foreign_keys` /
@@ -664,9 +675,13 @@ fn analyze_add_constraint(
     // public schema, `schema.name` otherwise) so two same-named tables in different schemas do not
     // collide on `t_pkey`/`t_<col>_key`/… — exactly as `CREATE TABLE` qualifies its auto-names.
     let name_base = super::qualified_display(&table.schema, &table.name);
-    let (name, columns, primary) = match constraint {
-        ast::TableConstraint::PrimaryKey { name, columns } => (name, columns, true),
-        ast::TableConstraint::Unique { name, columns } => (name, columns, false),
+    let (name, columns, primary, nulls_not_distinct) = match constraint {
+        ast::TableConstraint::PrimaryKey { name, columns } => (name, columns, true, false),
+        ast::TableConstraint::Unique {
+            name,
+            columns,
+            nulls_not_distinct,
+        } => (name, columns, false, nulls_not_distinct),
         ast::TableConstraint::ForeignKey {
             name,
             columns,
@@ -720,6 +735,7 @@ fn analyze_add_constraint(
         name,
         columns,
         primary,
+        nulls_not_distinct,
     })
 }
 

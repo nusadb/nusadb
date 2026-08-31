@@ -3507,7 +3507,7 @@ mod tests {
         let orders = engine.create_table(txn, &table_def("orders")).unwrap();
 
         let pk = engine
-            .add_unique_constraint(txn, users, "users_pkey", &["v".to_owned()], true)
+            .add_unique_constraint(txn, users, "users_pkey", &["v".to_owned()], true, false)
             .unwrap();
         assert_eq!(engine.lookup_index("users_pkey").unwrap(), Some(pk));
         assert!(engine.has_unique_constraint(users).unwrap());
@@ -3515,7 +3515,7 @@ mod tests {
         // At most one PRIMARY KEY.
         assert!(
             engine
-                .add_unique_constraint(txn, users, "users_pkey2", &["v".to_owned()], true)
+                .add_unique_constraint(txn, users, "users_pkey2", &["v".to_owned()], true, false)
                 .is_err()
         );
         // The backing index is EXEMPT from the byte-level unique check (the SQL layer's
@@ -3597,14 +3597,14 @@ mod tests {
         let users = engine.create_table(setup, &table_def("users")).unwrap();
         let orders = engine.create_table(setup, &table_def("orders")).unwrap();
         engine
-            .add_unique_constraint(setup, users, "users_pkey", &["v".to_owned()], true)
+            .add_unique_constraint(setup, users, "users_pkey", &["v".to_owned()], true, false)
             .unwrap();
         engine.commit(setup).unwrap();
 
         // Abort: constraint + check + FK (and their backing indexes) all revert.
         let txn = engine.begin(RC).unwrap();
         engine
-            .add_unique_constraint(txn, users, "email_uq", &["v".to_owned()], false)
+            .add_unique_constraint(txn, users, "email_uq", &["v".to_owned()], false, false)
             .unwrap();
         engine.add_check_constraint(txn, users, "ck", b"x").unwrap();
         engine
@@ -3654,7 +3654,7 @@ mod tests {
             let users = engine.create_table(txn, &table_def("users")).unwrap();
             let orders = engine.create_table(txn, &table_def("orders")).unwrap();
             engine
-                .add_unique_constraint(txn, users, "users_pkey", &["v".to_owned()], true)
+                .add_unique_constraint(txn, users, "users_pkey", &["v".to_owned()], true, false)
                 .unwrap();
             engine
                 .add_check_constraint(txn, users, "ck", b"age >= 0")
@@ -3693,7 +3693,7 @@ mod tests {
             // Uncommitted constraint: lost at the crash.
             let doomed = engine.begin(RC).unwrap();
             engine
-                .add_unique_constraint(doomed, users, "ghost_uq", &["v".to_owned()], false)
+                .add_unique_constraint(doomed, users, "ghost_uq", &["v".to_owned()], false, false)
                 .unwrap();
             (users, orders)
         };
@@ -3732,6 +3732,16 @@ mod tests {
                 name: "pk".to_owned(),
                 columns: vec!["a".to_owned(), "b".to_owned()],
                 primary: true,
+                nulls_not_distinct: false,
+            },
+            wal::LoggedOp::AddUnique {
+                txn: 1,
+                table: 2,
+                index: 4,
+                name: "uq".to_owned(),
+                columns: vec!["c".to_owned()],
+                primary: false,
+                nulls_not_distinct: true,
             },
             wal::LoggedOp::AddCheck {
                 txn: 1,

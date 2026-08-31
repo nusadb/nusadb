@@ -386,6 +386,11 @@ fn slt_p1_fk_cross_schema() {
 }
 
 #[test]
+fn slt_p1_unique_nulls_not_distinct() {
+    run_slt("tests/slt/p1_ddl/unique_nulls_not_distinct.slt");
+}
+
+#[test]
 fn slt_p1_information_schema() {
     run_slt("tests/slt/p1_ddl/information_schema.slt");
 }

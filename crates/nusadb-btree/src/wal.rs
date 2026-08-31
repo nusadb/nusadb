@@ -188,6 +188,8 @@ pub enum LoggedOp {
         columns: Vec<String>,
         /// Whether this is the table's `PRIMARY KEY`.
         primary: bool,
+        /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal.
+        nulls_not_distinct: bool,
     },
     /// A `CHECK` constraint was declared on `table` (predicate = opaque SQL-layer bytes).
     AddCheck {
@@ -473,12 +475,16 @@ impl LoggedOp {
                 name,
                 columns,
                 primary,
+                nulls_not_distinct,
             } => {
                 push_key(&mut key, TAG_ADD_UNIQUE, *txn, *table, None);
                 value.extend_from_slice(&index.to_le_bytes());
                 value.push(u8::from(*primary));
                 push_str(&mut value, name);
                 push_strs(&mut value, columns);
+                // Appended after the original fields, so a record written before this flag existed
+                // decodes with `nulls_not_distinct = false` (the standard NULLS DISTINCT).
+                value.push(u8::from(*nulls_not_distinct));
             },
             Self::AddCheck {
                 txn,
@@ -662,6 +668,13 @@ impl LoggedOp {
                 let mut at = 9;
                 let name = read_str(value, &mut at)?;
                 let columns = read_strs(value, &mut at)?;
+                // The `nulls_not_distinct` byte was appended later: a record written before it existed
+                // ends right after `columns`, so an absent byte means `false` (standard NULLS DISTINCT).
+                let nulls_not_distinct = match value.get(at) {
+                    None | Some(0) => false,
+                    Some(1) => true,
+                    Some(_) => return None,
+                };
                 Self::AddUnique {
                     txn,
                     table,
@@ -669,6 +682,7 @@ impl LoggedOp {
                     name,
                     columns,
                     primary,
+                    nulls_not_distinct,
                 }
             },
             TAG_ADD_CHECK => {

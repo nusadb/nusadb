@@ -862,12 +862,15 @@ pub enum TableConstraint {
         /// Key columns in declaration order; always non-empty.
         columns: Vec<String>,
     },
-    /// `[CONSTRAINT name] UNIQUE (columns)`.
+    /// `[CONSTRAINT name] UNIQUE [NULLS [NOT] DISTINCT] (columns)`.
     Unique {
         /// Optional constraint name.
         name: Option<String>,
         /// Unique columns in declaration order; always non-empty.
         columns: Vec<String>,
+        /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (at most one
+        /// NULL row). `false` is the standard `NULLS DISTINCT`.
+        nulls_not_distinct: bool,
     },
     /// `[CONSTRAINT name] FOREIGN KEY (columns) REFERENCES table (referred)
     /// [ON DELETE action] [ON UPDATE action]`.

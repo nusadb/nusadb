@@ -1030,6 +1030,9 @@ pub struct UniqueConstraintSpec {
     pub columns: Vec<String>,
     /// `true` for `PRIMARY KEY` (also enforces at-most-one-per-table), `false` for `UNIQUE`.
     pub primary: bool,
+    /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (at most one NULL
+    /// row). Always `false` for a `PRIMARY KEY` (its columns are `NOT NULL`).
+    pub nulls_not_distinct: bool,
 }
 
 /// A resolved `FOREIGN KEY` constraint to declare at `CREATE TABLE`. The child columns
@@ -1115,6 +1118,9 @@ pub enum AlterTablePlan {
         columns: Vec<String>,
         /// `true` for `PRIMARY KEY` (key columns must also be non-`NULL`), `false` for `UNIQUE`.
         primary: bool,
+        /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (`false` for a
+        /// `PRIMARY KEY`).
+        nulls_not_distinct: bool,
     },
     /// `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent (...)` — the executor
     /// registers the FK, then validates that the table's existing rows reference live parent rows.
