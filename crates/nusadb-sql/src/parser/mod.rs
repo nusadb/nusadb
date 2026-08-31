@@ -713,18 +713,23 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // trailing check-option clause, so strip it here and remember it — the flag is re-attached to the
     // parsed `CreateView` below (a statement-level property, applied after conversion).
     let view_check_option = strip_view_check_option(&mut tokens);
+    // `INSERT INTO t OVERRIDING {SYSTEM|USER} VALUE ...`: sqlparser has no grammar for the clause, so
+    // strip it here and re-attach the mode to the parsed `INSERT` below.
+    let insert_overriding = strip_insert_overriding(&mut tokens);
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
         .map_err(|e| Error::Syntax(e.to_string()))?;
     match statements.len() {
         1 => {
-            let stmt = convert_statement(statements.remove(0))?;
+            let mut stmt = convert_statement(statements.remove(0))?;
             if view_check_option {
-                apply_view_check_option(stmt)
-            } else {
-                Ok(stmt)
+                stmt = apply_view_check_option(stmt)?;
             }
+            if let Some(mode) = insert_overriding {
+                stmt = apply_insert_overriding(stmt, mode)?;
+            }
+            Ok(stmt)
         },
         0 => Err(Error::Empty),
         n => Err(Error::MultipleStatements(n)),
@@ -793,6 +798,49 @@ fn apply_view_check_option(stmt: ast::Statement) -> Result<ast::Statement, Error
             Ok(ast::Statement::CreateView(cv))
         },
         _ => unsupported("WITH CHECK OPTION is only valid on CREATE VIEW"),
+    }
+}
+
+/// Detect and remove an `OVERRIDING {SYSTEM | USER} VALUE` clause (sqlparser has no grammar for it),
+/// returning its mode. The clause sits between an INSERT's target and its row source; only the exact
+/// three-keyword run is matched and drained, so nothing else is touched. The caller applies the mode
+/// via [`apply_insert_overriding`].
+fn strip_insert_overriding(tokens: &mut Vec<TokenWithSpan>) -> Option<ast::Overriding> {
+    let meaningful: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+    for window in meaningful.windows(3) {
+        let [a, b, c] = *window else { continue };
+        if !word_ci(tokens.get(a), "overriding") || !word_ci(tokens.get(c), "value") {
+            continue;
+        }
+        let mode = if word_ci(tokens.get(b), "system") {
+            ast::Overriding::SystemValue
+        } else if word_ci(tokens.get(b), "user") {
+            ast::Overriding::UserValue
+        } else {
+            continue;
+        };
+        tokens.drain(a..=c);
+        return Some(mode);
+    }
+    None
+}
+
+/// Re-attach a stripped `OVERRIDING` clause to a parsed `INSERT`. It is valid only there.
+fn apply_insert_overriding(
+    stmt: ast::Statement,
+    mode: ast::Overriding,
+) -> Result<ast::Statement, Error> {
+    match stmt {
+        ast::Statement::Insert(mut ins) => {
+            ins.overriding = Some(mode);
+            Ok(ast::Statement::Insert(ins))
+        },
+        _ => unsupported("OVERRIDING { SYSTEM | USER } VALUE is only valid in INSERT"),
     }
 }
 

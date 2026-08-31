@@ -12,6 +12,7 @@ use super::*;
     reason = "flat INSERT analysis: column resolution, per-cell typing, RETURNING, ON CONFLICT, RLS"
 )]
 pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<InsertPlan, Error> {
+    let overriding = ins.overriding;
     // The system-catalog namespace is reserved: a user INSERT into e.g. `nusadb_policies`
     // would forge a policy and bypass RLS entirely.
     enforce_system_catalog(&ins.table, catalog)?;
@@ -153,6 +154,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         // Set by `insert_through_view` when the target is a view WITH CHECK OPTION; a direct INSERT
         // has no view check.
         view_check: None,
+        overriding,
         on_conflict,
     })
 }

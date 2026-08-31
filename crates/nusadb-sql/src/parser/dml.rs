@@ -25,6 +25,9 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<ast::Insert, Error> 
             schema,
             table,
             columns,
+            // Set by `parse` when a stripped `OVERRIDING {SYSTEM|USER} VALUE` was present (sqlparser
+            // has no grammar for it).
+            overriding: None,
             source: ast::InsertSource::DefaultValues,
             on_conflict: convert_on_insert(insert.on)?,
             returning: convert_returning(insert.returning)?,
@@ -63,6 +66,8 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<ast::Insert, Error> 
         schema,
         table,
         columns,
+        // Set by `parse` when a stripped `OVERRIDING {SYSTEM|USER} VALUE` was present.
+        overriding: None,
         source,
         on_conflict,
         returning,
