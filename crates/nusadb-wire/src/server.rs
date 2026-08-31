@@ -4477,6 +4477,16 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::lookup_view_check_option(self.engine, self.txn, name)
     }
 
+    fn any_inheritance(&self) -> Result<bool, nusadb_sql::Error> {
+        // Whether any table inherits from another — the cheap gate for parent→descendant expansion.
+        nusadb_sql::inheritance_any(self.engine, self.txn)
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, nusadb_sql::Error> {
+        // A query on a parent expands to a union over it and these descendants.
+        nusadb_sql::inheritance_descendants(self.engine, self.txn, table)
+    }
+
     fn lookup_function(
         &self,
         name: &str,

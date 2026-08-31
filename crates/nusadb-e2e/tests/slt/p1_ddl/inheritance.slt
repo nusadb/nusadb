@@ -1,0 +1,118 @@
+# Table inheritance (INHERITS): a child inherits its parents' columns (ahead of its own), and a
+# query on a parent also reads its descendants' rows unless it says ONLY. Multi-level inheritance is
+# transitive. UPDATE/DELETE through a parent is refused (NusaDB does not propagate the write down the
+# hierarchy) rather than silently touching only the parent; ONLY makes it a plain single-table write.
+# Dropping a parent that still has children is refused.
+
+statement ok
+CREATE TABLE cities (name TEXT, pop INT)
+
+# The child's columns are the parent's (name, pop) followed by its own (state).
+statement ok
+CREATE TABLE capitals (state TEXT) INHERITS (cities)
+
+# A grandchild with no columns of its own inherits the full chain.
+statement ok
+CREATE TABLE megacaps () INHERITS (capitals)
+
+statement ok
+INSERT INTO cities VALUES ('Springfield', 100)
+
+statement ok
+INSERT INTO capitals VALUES ('Jakarta', 10000, 'JK')
+
+statement ok
+INSERT INTO megacaps VALUES ('Tokyo', 37000, 'TK')
+
+# A query on the parent includes every descendant's rows (transitive).
+query TI
+SELECT name, pop FROM cities ORDER BY pop
+----
+Springfield  100
+Jakarta  10000
+Tokyo  37000
+
+# ONLY restricts to the parent's own rows.
+query TI
+SELECT name, pop FROM ONLY cities ORDER BY pop
+----
+Springfield  100
+
+# A mid-level parent sees itself and its descendants (capitals + megacaps), not the top.
+query TT
+SELECT name, state FROM capitals ORDER BY pop
+----
+Jakarta  JK
+Tokyo  TK
+
+# The inherited columns are real: the child carries name, pop, and state.
+query TIT
+SELECT name, pop, state FROM ONLY capitals
+----
+Jakarta  10000  JK
+
+# UPDATE / DELETE through a parent with descendants is refused (0A000) — not silently parent-only.
+statement error
+UPDATE cities SET pop = 0 WHERE name = 'Jakarta'
+
+statement error
+DELETE FROM cities WHERE pop > 0
+
+# ONLY makes the write a plain single-table operation on the parent.
+statement ok
+UPDATE ONLY cities SET pop = 1 WHERE name = 'Springfield'
+
+query I
+SELECT pop FROM ONLY cities
+----
+1
+
+# A child can be written and read directly.
+statement ok
+INSERT INTO megacaps VALUES ('Seoul', 9700, 'SE')
+
+query TI
+SELECT name, pop FROM ONLY megacaps ORDER BY name
+----
+Seoul  9700
+Tokyo  37000
+
+# A parent joined in also contributes its descendants' rows (not silently parent-only).
+statement ok
+CREATE TABLE region (city TEXT, area TEXT)
+
+statement ok
+INSERT INTO region VALUES ('Jakarta', 'SEA'), ('Springfield', 'US')
+
+query TT
+SELECT c.name, r.area FROM cities c JOIN region r ON c.name = r.city ORDER BY c.name
+----
+Jakarta  SEA
+Springfield  US
+
+# A parent used as an `UPDATE ... FROM` read source also contributes descendant rows: the match on
+# pop > 5000 selects Jakarta (a child row in capitals), so region's Jakarta row is updated.
+statement ok
+UPDATE region SET area = 'X' FROM cities WHERE region.city = cities.name AND cities.pop > 5000
+
+query TT
+SELECT city, area FROM region ORDER BY city
+----
+Jakarta  X
+Springfield  US
+
+statement ok
+DROP TABLE region
+
+# Dropping a parent that still has children is refused; dropping the leaves first then works.
+statement error
+DROP TABLE cities
+
+statement ok
+DROP TABLE megacaps
+
+statement ok
+DROP TABLE capitals
+
+statement ok
+DROP TABLE cities

@@ -643,6 +643,11 @@ pub struct CreateTablePlan {
     /// layer, which owns the per-connection transaction boundaries. Always
     /// [`PreserveRows`](ast::OnCommit::PreserveRows) for an ordinary table.
     pub on_commit: ast::OnCommit,
+    /// `INHERITS (parent[, ...])` parent table names (resolved, in order). The analyzer has already
+    /// merged the parents' columns into [`columns`](Self::columns); the executor records the
+    /// child→parent edges in the inheritance catalog so a query on a parent expands to its
+    /// descendants. Empty for a non-inheriting table.
+    pub inherits: Vec<String>,
 }
 
 /// A resolved `CHECK` constraint.

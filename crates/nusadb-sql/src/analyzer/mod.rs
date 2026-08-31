@@ -161,6 +161,22 @@ pub trait Catalog {
         Ok(None)
     }
 
+    /// Whether *any* table in the database inherits from another — the cheap gate that lets a database
+    /// with no inheritance skip the per-table descendant probe (and keep its plans cacheable). Default
+    /// `false`; the production adapter checks the inheritance catalog.
+    fn any_inheritance(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// The transitive inheritance descendants of `table` (children, grandchildren, …), by name, each
+    /// once. Default empty so a minimal catalog has no inheritance; the production adapter reads the
+    /// inheritance catalog. Used to expand a query on a parent into a union over it and its
+    /// descendants.
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
+        let _ = table;
+        Ok(Vec::new())
+    }
+
     /// The fields of a user-defined composite type named `name`, as `(field_name, type)` in declared
     /// order, or `None` if no such composite type exists. Default `None` so a minimal catalog has no
     /// composite types; the production adapter reads the composite type registry. Used to type

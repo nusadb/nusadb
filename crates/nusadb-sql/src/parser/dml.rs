@@ -165,7 +165,7 @@ pub(super) fn convert_update(
         return unsupported("UPDATE with no assignments");
     }
     let target = convert_table_ref(&table.relation)?;
-    let (schema, table_name, alias) = (target.schema, target.name, target.alias);
+    let (schema, table_name, alias, only) = (target.schema, target.name, target.alias, target.only);
     // `UPDATE ... FROM` source: a single `TableWithJoins` (base + optional joins on that base).
     // 0.62 models the FROM as a list (and records whether it came before or after `SET` — a
     // dialect variation; both spellings carry the same source).
@@ -194,6 +194,7 @@ pub(super) fn convert_update(
         from,
         filter,
         returning,
+        only,
     })
 }
 
@@ -222,13 +223,13 @@ pub(super) fn convert_delete(delete: sql::Delete) -> Result<ast::Delete, Error> 
     let tables = match delete.from {
         sql::FromTable::WithFromKeyword(tables) | sql::FromTable::WithoutKeyword(tables) => tables,
     };
-    let (schema, table, alias) = match tables.as_slice() {
+    let (schema, table, alias, only) = match tables.as_slice() {
         [twj] => {
             if !twj.joins.is_empty() {
                 return unsupported("JOIN in DELETE");
             }
             let target = convert_table_ref(&twj.relation)?;
-            (target.schema, target.name, target.alias)
+            (target.schema, target.name, target.alias, target.only)
         },
         _ => return unsupported("DELETE must target exactly one table"),
     };
@@ -256,6 +257,7 @@ pub(super) fn convert_delete(delete: sql::Delete) -> Result<ast::Delete, Error> 
         using,
         filter,
         returning,
+        only,
     })
 }
 

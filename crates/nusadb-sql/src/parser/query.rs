@@ -87,6 +87,7 @@ fn convert_top_level_values(query: sql::Query) -> Result<ast::Statement, Error> 
         lateral: false,
         column_aliases: Vec::new(),
         with_ordinality: false,
+        only: false,
     };
     Ok(ast::Statement::Select(ast::Select {
         with: Vec::new(),

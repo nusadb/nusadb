@@ -185,6 +185,9 @@ pub struct Update {
     pub filter: Option<Expr>,
     /// `RETURNING` projection; empty when the clause is absent.
     pub returning: Vec<SelectItem>,
+    /// `UPDATE ONLY t` — restrict the update to the target's own rows, not those of its inheritance
+    /// descendants. `false` (the default) means the target and its descendants.
+    pub only: bool,
 }
 
 /// One `column = value` pair inside an [`Update`].
@@ -214,6 +217,9 @@ pub struct Delete {
     pub filter: Option<Expr>,
     /// `RETURNING` projection; empty when the clause is absent.
     pub returning: Vec<SelectItem>,
+    /// `DELETE FROM ONLY t` — restrict the delete to the target's own rows, not those of its
+    /// inheritance descendants. `false` (the default) means the target and its descendants.
+    pub only: bool,
 }
 
 /// `MERGE INTO target USING source ON cond { WHEN ... }+`.

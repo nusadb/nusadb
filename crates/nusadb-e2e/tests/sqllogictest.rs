@@ -127,6 +127,28 @@ impl Catalog for SltCatalog<'_> {
         Ok(out)
     }
 
+    fn any_inheritance(&self) -> Result<bool, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::inheritance_any(self.engine, txn)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::inheritance_any(self.engine, txn);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::inheritance_descendants(self.engine, txn, table)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::inheritance_descendants(self.engine, txn, table);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
         // The view catalog is a regular table. Reuse the session's open transaction when there is
         // one so a view created earlier in the same explicit transaction is visible; otherwise read
@@ -388,6 +410,11 @@ fn slt_p1_fk_cross_schema() {
 #[test]
 fn slt_p1_unique_nulls_not_distinct() {
     run_slt("tests/slt/p1_ddl/unique_nulls_not_distinct.slt");
+}
+
+#[test]
+fn slt_p1_inheritance() {
+    run_slt("tests/slt/p1_ddl/inheritance.slt");
 }
 
 #[test]

@@ -259,6 +259,9 @@ pub(super) fn run_create_table(
         &super::session_ctx::current_user(),
     )?;
     copy_like_width_checks(plan.like_source.as_deref(), id, engine, txn)?;
+    // Record the child→parent inheritance edges so a later query on a parent expands to this table.
+    // A prior same-named table's edges are cleared on DROP, so there is nothing stale to purge here.
+    super::inheritance::record_inheritance(engine, txn, &def.name, &plan.inherits)?;
     Ok(ExecutionResult::Created(id))
 }
 
@@ -694,6 +697,17 @@ pub(super) fn run_drop_table(
 ) -> Result<ExecutionResult, Error> {
     match engine.lookup_table_as_of_in(txn, &plan.schema, &plan.table)? {
         Some(schema) => {
+            // An inheritance parent cannot be dropped while children depend on it: the children would
+            // be left with columns whose origin is gone. Refuse loudly (drop the inheriting tables
+            // first) rather than orphan them — done before any teardown so a refusal is a no-op.
+            let children = super::inheritance::direct_children(engine, txn, &plan.table)?;
+            if !children.is_empty() {
+                return Err(Error::DependentObjects(format!(
+                    "cannot drop table \"{}\": {} table(s) inherit from it (drop them first)",
+                    plan.table,
+                    children.len()
+                )));
+            }
             // RESTRICT (A-UR.01b): refuse to drop a table that another table's FOREIGN KEY references,
             // so the FK is not left silently dangling (standard SQL rejects this without CASCADE). A
             // self-referencing FK (child == parent) does not block — it drops with the table.
@@ -771,6 +785,9 @@ pub(super) fn run_drop_table(
             let owned = format!("{}.{}", plan.schema, plan.table);
             crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
             crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
+            // Remove this table's inheritance edges (as a child of its own parents) so a later
+            // same-named table does not inherit stale parent links.
+            super::inheritance::remove_edges_for(engine, txn, &plan.table)?;
         },
         None => {
             if !plan.if_exists {

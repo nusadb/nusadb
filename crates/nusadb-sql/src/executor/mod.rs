@@ -57,6 +57,7 @@ mod ddl;
 mod dml;
 mod function;
 mod index_key;
+mod inheritance;
 mod instrument;
 mod ivm;
 pub mod join;
@@ -3428,6 +3429,22 @@ pub fn lookup_view_check_option(
     Ok(load_view_def(engine, txn, VIEW_CHECK_CATALOG, name)?.is_some())
 }
 
+/// Production adapter: whether any table inherits from another (the cheap plan-cache gate). Used by
+/// the wire server's catalog to answer [`Catalog::any_inheritance`](crate::Catalog::any_inheritance).
+pub fn inheritance_any(engine: &dyn StorageEngine, txn: TxnId) -> Result<bool, Error> {
+    inheritance::has_any(engine, txn)
+}
+
+/// Production adapter: the transitive inheritance descendants of `table`. Used by the wire server's
+/// catalog for [`Catalog::inheritance_descendants`](crate::Catalog::inheritance_descendants).
+pub fn inheritance_descendants(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: &str,
+) -> Result<Vec<String>, Error> {
+    inheritance::descendants(engine, txn, table)
+}
+
 /// Engine-scoped system catalog of `USING hnsw` vector-index declarations. Same `(name, def)`
 /// two-text-column shape as the view catalog; `def` is tab-separated `table`, column ordinal, and
 /// dimension. Only the *declaration* is persisted here — the HNSW graph is rebuilt in memory on
@@ -3994,6 +4011,14 @@ impl crate::Catalog for ExecCatalog<'_> {
         function::lookup_function_definition(self.engine, self.txn, name)
     }
 
+    fn any_inheritance(&self) -> Result<bool, Error> {
+        inheritance::has_any(self.engine, self.txn)
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
+        inheritance::descendants(self.engine, self.txn, table)
+    }
+
     fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
         lookup_composite(self.engine, self.txn, name)
     }
@@ -4164,6 +4189,14 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn lookup_function(&self, name: &str) -> Result<Option<crate::FunctionDef>, Error> {
         function::lookup_function_definition(self.engine, self.txn, name)
+    }
+
+    fn any_inheritance(&self) -> Result<bool, Error> {
+        inheritance::has_any(self.engine, self.txn)
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
+        inheritance::descendants(self.engine, self.txn, table)
     }
 
     fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {

@@ -65,6 +65,60 @@ fn create_table_columns_and_constraints() {
 }
 
 #[test]
+fn create_table_inherits_and_from_only_parse() {
+    // INHERITS records the parent names (in order); the child may declare its own columns too, or
+    // none (an empty column list is allowed when it inherits).
+    let ast::Statement::CreateTable(ct) =
+        ok("CREATE TABLE capitals (state TEXT) INHERITS (cities)")
+    else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(ct.inherits, vec!["cities".to_owned()]);
+    assert_eq!(ct.columns.len(), 1);
+
+    let ast::Statement::CreateTable(ct) = ok("CREATE TABLE mega () INHERITS (capitals, cities)")
+    else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(
+        ct.inherits,
+        vec!["capitals".to_owned(), "cities".to_owned()]
+    );
+    assert!(ct.columns.is_empty());
+
+    // A non-inheriting table has an empty parent list.
+    let ast::Statement::CreateTable(ct) = ok("CREATE TABLE plain (a INT)") else {
+        panic!("expected CreateTable");
+    };
+    assert!(ct.inherits.is_empty());
+
+    // `FROM ONLY t` sets the `only` flag on the base table; a plain `FROM t` leaves it false. The
+    // `only` table's real name is `t` (the keyword is not the table).
+    let ast::Statement::Select(s) = ok("SELECT * FROM ONLY t") else {
+        panic!("expected Select");
+    };
+    let base = &s.from.as_ref().expect("from").base;
+    assert_eq!(base.name, "t");
+    assert!(base.only);
+    let ast::Statement::Select(s) = ok("SELECT * FROM t") else {
+        panic!("expected Select");
+    };
+    assert!(!s.from.as_ref().expect("from").base.only);
+
+    // `UPDATE ONLY t` / `DELETE FROM ONLY t` set the target's `only` flag.
+    let ast::Statement::Update(u) = ok("UPDATE ONLY t SET a = 1") else {
+        panic!("expected Update");
+    };
+    assert_eq!(u.table, "t");
+    assert!(u.only);
+    let ast::Statement::Delete(d) = ok("DELETE FROM ONLY t") else {
+        panic!("expected Delete");
+    };
+    assert_eq!(d.table, "t");
+    assert!(d.only);
+}
+
+#[test]
 fn create_table_if_not_exists_and_type_mapping() {
     let ast::Statement::CreateTable(ct) = ok(
         "CREATE TABLE IF NOT EXISTS t (a BIGINT, b VARCHAR(20), c DOUBLE PRECISION, \

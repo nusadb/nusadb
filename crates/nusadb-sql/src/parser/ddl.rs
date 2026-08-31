@@ -99,8 +99,13 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         },
         None => None,
     };
-    // A `LIKE` source supplies the columns, so an otherwise-empty column list is fine then.
-    if ct.columns.is_empty() && like_source.is_none() {
+    // A `LIKE` source or an `INHERITS` parent supplies the columns, so an otherwise-empty column list
+    // is fine then (a child may add none of its own).
+    let inherits_present = ct
+        .inherits
+        .as_ref()
+        .is_some_and(|parents| !parents.is_empty());
+    if ct.columns.is_empty() && like_source.is_none() && !inherits_present {
         return unsupported("CREATE TABLE with no columns");
     }
     let (schema, name) = table_ref_name(&ct.name)?;
@@ -115,6 +120,12 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
     for constraint in ct.constraints {
         constraints.push(convert_table_constraint(constraint)?);
     }
+    let inherits = ct
+        .inherits
+        .into_iter()
+        .flatten()
+        .map(|parent| object_name(&parent))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ast::Statement::CreateTable(ast::CreateTable {
         schema,
         name,
@@ -124,6 +135,7 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         temporary: ct.temporary,
         like_source,
         on_commit,
+        inherits,
     }))
 }
 

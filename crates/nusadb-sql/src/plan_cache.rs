@@ -193,6 +193,23 @@ impl Catalog for RecordingCatalog<'_> {
         Ok(func)
     }
 
+    fn any_inheritance(&self) -> Result<bool, Error> {
+        let any = self.inner.any_inheritance()?;
+        // A query's shape depends on the current inheritance edges (which parent expands to which
+        // descendants), and those change without bumping any table's schema version. Once inheritance
+        // exists, a plan that consulted it cannot be safely reused across a later inheritance change,
+        // so mark it uncacheable — a database with no inheritance pays nothing.
+        if any {
+            self.saw_unversioned_dep.set(true);
+        }
+        Ok(any)
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
+        self.saw_unversioned_dep.set(true);
+        self.inner.inheritance_descendants(table)
+    }
+
     fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {
         let indexes = self.inner.list_indexes(table)?;
         // A plan that can see an index may lower to an `IndexScan`; index DDL is unversioned, so do

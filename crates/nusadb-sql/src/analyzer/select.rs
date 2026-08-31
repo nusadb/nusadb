@@ -209,6 +209,76 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
     })
 }
 
+/// Expand a query on an inheritance parent into a `SELECT <cols> FROM ONLY parent UNION ALL SELECT
+/// <cols> FROM ONLY d1 UNION ALL ...` over the parent and each descendant, projected to the parent's
+/// columns by name (so a descendant's extra columns drop and the order is the parent's). Each branch
+/// scans `ONLY` its table — no re-expansion — and is analyzed as an ordinary `SELECT`, so per-table
+/// privilege and row-level security apply per branch. The result is inlined like a derived table.
+fn expand_inheritance(
+    parent: &TableSchema,
+    descendants: &[String],
+    catalog: &dyn Catalog,
+) -> Result<SelectPlan, Error> {
+    let cols: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
+    let branch = |table: &str| ast::SelectBody::Select(Box::new(inheritance_branch(&cols, table)));
+    let mut body = branch(&parent.name);
+    for descendant in descendants {
+        body = ast::SelectBody::SetOp {
+            op: ast::SetOp::Union,
+            all: true,
+            left: Box::new(body),
+            right: Box::new(branch(descendant)),
+        };
+    }
+    analyze_set_op_table(
+        ast::SetOperation {
+            with: Vec::new(),
+            body,
+            order_by: Vec::new(),
+            limit: None,
+        },
+        catalog,
+    )
+}
+
+/// One `SELECT col1, col2, ... FROM ONLY <table>` branch of an inheritance-expansion union.
+fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
+    ast::Select {
+        with: Vec::new(),
+        distinct: None,
+        projection: cols
+            .iter()
+            .map(|c| ast::SelectItem::Expr {
+                expr: ast::Expr::Column(c.clone()),
+                alias: None,
+            })
+            .collect(),
+        from: Some(ast::FromClause {
+            base: ast::TableRef {
+                schema: None,
+                name: table.to_owned(),
+                alias: None,
+                subquery: None,
+                values: None,
+                set_op: None,
+                lateral: false,
+                column_aliases: Vec::new(),
+                with_ordinality: false,
+                only: true,
+            },
+            joins: Vec::new(),
+        }),
+        filter: None,
+        group_by: ast::GroupBy::Expressions(Vec::new()),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        limit_with_ties: false,
+        offset: None,
+        lock: None,
+    }
+}
+
 /// Resolve a join input (the right side of a `JOIN`): a derived table `JOIN (SELECT ...) AS x`
 /// (increment 3b) — analyzed standalone and inlined via `input_cte` like a CTE — or a named
 /// catalog table. A `LATERAL` join input is analyzed with `left_scope` pushed as the enclosing scope
@@ -271,6 +341,16 @@ fn resolve_join_input(
     // otherwise joining to a table would be a way to read one the session may not read directly.
     let schema = resolve_table(table.schema.as_deref(), &table.name, catalog)?;
     super::dcl::require_read_access(catalog, &schema)?;
+    // An inheritance parent joined in (without `ONLY`) must also contribute its descendants' rows,
+    // exactly as when it is the FROM base — otherwise the join would silently see only the parent's
+    // own rows. Inline the same parent+descendants union as a derived-table join input.
+    if !table.only && catalog.any_inheritance()? {
+        let descendants = catalog.inheritance_descendants(&schema.name)?;
+        if !descendants.is_empty() {
+            let plan = expand_inheritance(&schema, &descendants, catalog)?;
+            return Ok((schema, Some(Box::new(plan))));
+        }
+    }
     Ok((schema, None))
 }
 
@@ -335,6 +415,16 @@ pub(super) fn resolve_aux_relation(
         // privilege on the statement's target says nothing about the tables it reads to decide
         // what to write.
         super::dcl::require_read_access(catalog, &schema)?;
+        // Read the source as an inheritance parent too (unless `ONLY`): a parent used as an
+        // UPDATE/DELETE source must contribute its descendants' rows, exactly like a FROM base or a
+        // JOIN input — otherwise the write would silently see only the parent's own rows.
+        if !base.only && catalog.any_inheritance()? {
+            let descendants = catalog.inheritance_descendants(&schema.name)?;
+            if !descendants.is_empty() {
+                let plan = expand_inheritance(&schema, &descendants, catalog)?;
+                return Ok((schema, Some(plan)));
+            }
+        }
         Ok((schema, None))
     }
 }
@@ -407,9 +497,23 @@ pub(super) fn resolve_from(
             // *which rows* a permitted read returns — a session with no SELECT privilege never
             // gets as far as having rows filtered.
             super::dcl::require_read_access(catalog, &schema)?;
+            // `INHERITS`: a query on a parent (without `ONLY`) also reads its descendants' rows.
+            // Expand into a union over the parent + its descendants, each projected to the parent's
+            // columns, inlined like a derived table. Each branch scans `ONLY` its table, so it does
+            // not re-expand, and each branch applies its own table's row-level security. Gated on the
+            // cheap `any_inheritance` probe so a database with no inheritance pays almost nothing.
+            let inherited = if !from.base.only && catalog.any_inheritance()? {
+                let descendants = catalog.inheritance_descendants(&schema.name)?;
+                (!descendants.is_empty())
+                    .then(|| expand_inheritance(&schema, &descendants, catalog))
+                    .transpose()?
+            } else {
+                None
+            };
             // Row-level security for the base table is applied by `apply_rls` once the WHERE
-            // filter is built (single-table queries inject policy predicates; joins are refused).
-            (schema, None)
+            // filter is built (single-table queries inject policy predicates; joins are refused) —
+            // but an expanded parent carries `base_cte`, so its RLS rides each union branch instead.
+            (schema, inherited)
         } else if let Some(view_key) =
             view_lookup_key(from.base.schema.as_deref(), &from.base.name, catalog)?
         {

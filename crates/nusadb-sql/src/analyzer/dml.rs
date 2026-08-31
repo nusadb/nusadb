@@ -609,6 +609,26 @@ pub(super) fn analyze_insert_value(
 
 // === UPDATE / DELETE ======================================================
 
+/// An `UPDATE`/`DELETE` on an inheritance parent (without `ONLY`) would, in the reference engine,
+/// also modify every descendant table's matching rows. NusaDB does not yet propagate the write down
+/// the hierarchy, so rather than silently touch only the parent (leaving descendant rows wrongly
+/// unchanged), it is refused loudly — use `ONLY` to target just the parent, or write each table.
+/// Gated on the cheap `any_inheritance` probe so a database with no inheritance pays almost nothing.
+fn reject_inheritance_write(
+    table: &str,
+    only: bool,
+    verb: &str,
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    if !only && catalog.any_inheritance()? && !catalog.inheritance_descendants(table)?.is_empty() {
+        return Err(Error::Unsupported(format!(
+            "{verb} on an inheritance parent (\"{table}\") would also affect its descendant tables, \
+             which is not supported yet — use {verb} ... ONLY {table}, or target each table directly"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<UpdatePlan, Error> {
     // The system-catalog namespace is reserved: a user UPDATE of e.g. `nusadb_policies`
     // could widen a policy's USING predicate and bypass RLS.
@@ -624,6 +644,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             name: super::qualified_display_opt(upd.schema.as_deref(), &upd.table),
         });
     };
+    reject_inheritance_write(&table.name, upd.only, "UPDATE", catalog)?;
     // UPDATE needs the privilege on the table, or a column-scoped UPDATE grant on each SET column.
     let update_columns: Vec<&str> = upd.assignments.iter().map(|a| a.column.as_str()).collect();
     super::dcl::require_column_privilege(catalog, &table, &update_columns, ast::Privilege::Update)?;
@@ -770,6 +791,7 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
             name: super::qualified_display_opt(del.schema.as_deref(), &del.table),
         });
     };
+    reject_inheritance_write(&table.name, del.only, "DELETE", catalog)?;
     super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Delete)?;
     // As for UPDATE: a `WHERE` or `RETURNING` reads rows, so it additionally needs SELECT.
     if del.filter.is_some() || !del.returning.is_empty() {

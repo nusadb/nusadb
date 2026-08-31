@@ -247,6 +247,24 @@ pub(super) fn convert_table_ref(factor: &sql::TableFactor) -> Result<ast::TableR
             args: None,
             ..
         } => {
+            // `FROM ONLY t`: sqlparser parses the `ONLY` keyword as a table named `only` with `t` as an
+            // implicit alias. Recognize that shape and read it as `ONLY t` — scan only the named table's
+            // own rows, not its inheritance descendants. (A table genuinely named `only` must be
+            // quoted, exactly as the reference engine requires.)
+            if let Some(name) = only_table_name(name, alias.as_ref()) {
+                return Ok(ast::TableRef {
+                    schema: None,
+                    name,
+                    alias: None,
+                    subquery: None,
+                    values: None,
+                    set_op: None,
+                    lateral: false,
+                    column_aliases: Vec::new(),
+                    with_ordinality: false,
+                    only: true,
+                });
+            }
             let alias = convert_table_alias(alias.as_ref())?;
             let (schema, name) = table_ref_name(name)?;
             Ok(ast::TableRef {
@@ -259,9 +277,27 @@ pub(super) fn convert_table_ref(factor: &sql::TableFactor) -> Result<ast::TableR
                 lateral: false,
                 column_aliases: Vec::new(),
                 with_ordinality: false,
+                only: false,
             })
         },
         _ => unsupported("FROM item that is not a plain table (subquery, function, ...)"),
+    }
+}
+
+/// Recognize the `FROM ONLY t` shape that sqlparser reports as a table named `only` (unquoted) with
+/// an *implicit* alias `t` and no argument list. Returns the real table name (`t`, folded) when it
+/// matches, or `None` for an ordinary table reference. A quoted `"only"` or an explicit `only AS x`
+/// alias is a genuine table named `only`, not the keyword.
+fn only_table_name(name: &sql::ObjectName, alias: Option<&sql::TableAlias>) -> Option<String> {
+    let [sql::ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return None;
+    };
+    if ident.quote_style.is_some() || !ident.value.eq_ignore_ascii_case("only") {
+        return None;
+    }
+    match alias {
+        Some(alias) if !alias.explicit && alias.columns.is_empty() => Some(fold_ident(&alias.name)),
+        _ => None,
     }
 }
 
@@ -389,6 +425,7 @@ fn convert_derived_table_factor(
             lateral,
             column_aliases,
             with_ordinality: false,
+            only: false,
         });
     }
     // `(SELECT ... UNION/INTERSECT/EXCEPT ...) AS x` is a set-operation derived table — carry the
@@ -409,6 +446,7 @@ fn convert_derived_table_factor(
             lateral,
             column_aliases,
             with_ordinality: false,
+            only: false,
         });
     }
     let body = convert_select(subquery.clone())?;
@@ -423,6 +461,7 @@ fn convert_derived_table_factor(
         lateral,
         column_aliases,
         with_ordinality: false,
+        only: false,
     })
 }
 
@@ -565,6 +604,7 @@ fn srf_derived_table(
         lateral,
         column_aliases,
         with_ordinality,
+        only: false,
     }
 }
 

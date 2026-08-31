@@ -219,6 +219,10 @@ pub struct TableRef {
     /// appends a 1-based `ordinality` column to the relation. Only set on a table-function /
     /// `UNNEST` derived table; `false` everywhere else.
     pub with_ordinality: bool,
+    /// `ONLY` before a named table (`FROM ONLY t`): read only that table's own rows, not those of its
+    /// inheritance descendants. `false` (the default) means a query on an inheritance parent also sees
+    /// descendant rows. Only meaningful for a named table.
+    pub only: bool,
 }
 
 /// One join in a [`FromClause`].

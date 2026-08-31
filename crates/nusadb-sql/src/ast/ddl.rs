@@ -54,6 +54,10 @@ pub struct CreateTable {
     /// temporary table (see [`OnCommit`]). [`PreserveRows`](OnCommit::PreserveRows) for the default /
     /// an ordinary table. A non-default action on a non-temporary table is rejected by the analyzer.
     pub on_commit: OnCommit,
+    /// `INHERITS (parent[, ...])` — the parent tables this table inherits from, in written order.
+    /// The child's column list is the parents' columns (deduped by name) followed by its own; a query
+    /// on a parent includes this table's rows unless it says `ONLY`. Empty for a non-inheriting table.
+    pub inherits: Vec<String>,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name AS <select>`.

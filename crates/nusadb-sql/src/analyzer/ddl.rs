@@ -67,6 +67,10 @@ pub(super) fn analyze_create_table(
             }
         }
     }
+    // `INHERITS (parent, ...)`: prepend the parents' columns (in order, deduped across parents),
+    // then merge the child's own columns by name. A query on a parent later expands to this table's
+    // rows (see the inheritance catalog + the analyzer's scan expansion).
+    let inherited_parents = merge_inherited_columns(&mut ct, catalog)?;
     // An unqualified CREATE targets the session's current schema; an explicit qualifier wins. A
     // temporary table instead targets the session's non-durable temp schema — which does NOT change
     // `current_schema`, so a plain CREATE alongside it still lands in the search-path schema.
@@ -115,7 +119,78 @@ pub(super) fn analyze_create_table(
         temporary: ct.temporary,
         like_source: ct.like_source,
         on_commit: ct.on_commit,
+        inherits: inherited_parents,
     })
+}
+
+/// Apply `INHERITS (parent, ...)`: prepend the parents' columns (in written order, deduped across
+/// parents by name) ahead of the child's own, then merge the child's own columns by name — a
+/// redeclared inherited column merges (its type must match) and the child's own definition wins,
+/// while a new column is appended. Returns the resolved parent table names (empty for a
+/// non-inheriting table) for the executor to record as inheritance edges. `NOT NULL` is the OR of the
+/// merged columns (a column is nullable only if every merged copy is).
+fn merge_inherited_columns(
+    ct: &mut ast::CreateTable,
+    catalog: &dyn Catalog,
+) -> Result<Vec<String>, Error> {
+    if ct.inherits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inherited_col = |c: &ColumnDef| ast::ColumnDef {
+        name: c.name.clone(),
+        ty: c.ty,
+        udt_name: None,
+        nullable: c.nullable,
+        primary_key: false,
+        unique: false,
+        default: None,
+        default_sql: None,
+        generated: None,
+        serial: false,
+        identity_always: false,
+    };
+    // Column counts are small, so a linear find-by-name (rather than a side index) keeps this simple
+    // and avoids any fallible indexing.
+    let mut merged: Vec<ast::ColumnDef> = Vec::new();
+    let mut parents = Vec::with_capacity(ct.inherits.len());
+    for parent_name in &ct.inherits {
+        let parent = catalog
+            .lookup_table(parent_name)?
+            .ok_or_else(|| Error::TableNotFound {
+                name: parent_name.clone(),
+            })?;
+        for col in &parent.columns {
+            if let Some(slot) = merged.iter_mut().find(|c| c.name == col.name) {
+                if slot.ty != col.ty {
+                    return Err(Error::InvalidTableDefinition(format!(
+                        "inherited column \"{}\" has a type conflict between parents",
+                        col.name
+                    )));
+                }
+                slot.nullable = slot.nullable && col.nullable;
+            } else {
+                merged.push(inherited_col(col));
+            }
+        }
+        parents.push(parent.name.clone());
+    }
+    for col in std::mem::take(&mut ct.columns) {
+        if let Some(slot) = merged.iter_mut().find(|c| c.name == col.name) {
+            if slot.ty != col.ty {
+                return Err(Error::InvalidTableDefinition(format!(
+                    "column \"{}\" conflicts with the type of the inherited column",
+                    col.name
+                )));
+            }
+            // The child's own definition (its NOT NULL / DEFAULT / constraints) wins; the type is
+            // already checked to match the inherited one.
+            *slot = col;
+        } else {
+            merged.push(col);
+        }
+    }
+    ct.columns = merged;
+    Ok(parents)
 }
 
 /// Build the column scope for a not-yet-created table (its declared columns, qualified by the table
