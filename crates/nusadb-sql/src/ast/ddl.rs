@@ -354,10 +354,12 @@ impl TriggerForEach {
 /// `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE}[ OR ...] ON table
 /// [FOR EACH {ROW|STATEMENT}] [WHEN (cond)] <triggered-statement>`.
 ///
-/// The triggered action is a single SQL data statement (stored verbatim as text) that may reference
-/// the affected row through the `NEW.col` / `OLD.col` pseudo-columns, substituted with the row's
-/// values when the trigger fires. `INSTEAD OF` triggers (which require updatable views) are
-/// rejected at the parser.
+/// The triggered action is stored verbatim as text and may reference the affected row through the
+/// `NEW.col` / `OLD.col` pseudo-columns, substituted with the row's values when the trigger fires.
+/// It is either a single SQL data statement (INSERT/UPDATE/DELETE/SELECT) or
+/// `EXECUTE FUNCTION name()`, which runs a NusaScript function's body (side-effect semantics: the
+/// function's `RETURN` value is ignored, so a `BEFORE` trigger cannot modify or skip the row).
+/// `INSTEAD OF` triggers (which require updatable views) are rejected at the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTrigger {
     /// Trigger name (unique per table).

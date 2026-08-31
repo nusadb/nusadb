@@ -2979,10 +2979,29 @@ fn create_and_drop_trigger_parse() {
     assert_eq!(dt.table, "t");
     assert!(dt.if_exists);
 
-    // Rejections: INSTEAD OF (no updatable views), a bad timing, and a non-data action statement.
+    // EXECUTE FUNCTION / EXECUTE PROCEDURE actions are captured canonically as `EXECUTE FUNCTION
+    // name()` (the two spellings are equivalent), and the function name is folded like any identifier.
+    let ast::Statement::CreateTrigger(ct) =
+        parse("CREATE TRIGGER e AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION Log_Change()")
+            .expect("parse")
+    else {
+        panic!("expected CreateTrigger");
+    };
+    assert_eq!(ct.action, "EXECUTE FUNCTION log_change()");
+    let ast::Statement::CreateTrigger(ct) =
+        parse("CREATE TRIGGER f AFTER DELETE ON t EXECUTE PROCEDURE audit()").expect("parse")
+    else {
+        panic!("expected CreateTrigger");
+    };
+    assert_eq!(ct.action, "EXECUTE FUNCTION audit()");
+
+    // Rejections: INSTEAD OF (no updatable views), a bad timing, a non-data action statement,
+    // EXECUTE that names neither FUNCTION nor PROCEDURE, and trigger-function arguments (TG_ARGV).
     assert!(parse("CREATE TRIGGER x INSTEAD OF INSERT ON t INSERT INTO a VALUES (1)").is_err());
     assert!(parse("CREATE TRIGGER x DURING INSERT ON t INSERT INTO a VALUES (1)").is_err());
     assert!(parse("CREATE TRIGGER x AFTER INSERT ON t CREATE TABLE z (a INT)").is_err());
+    assert!(parse("CREATE TRIGGER x AFTER INSERT ON t EXECUTE log()").is_err());
+    assert!(parse("CREATE TRIGGER x AFTER INSERT ON t EXECUTE FUNCTION log('a')").is_err());
 }
 
 #[test]

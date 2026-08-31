@@ -598,3 +598,95 @@ fn legacy_seven_column_trigger_catalog_upgrades_in_place() {
         ExecutionResult::Rows { ref rows, .. } if rows == &[vec![Value::Text("t".to_owned())]]
     ));
 }
+
+/// `EXECUTE FUNCTION`: an `AFTER` row trigger runs a NusaScript function's body with `NEW`/`OLD`
+/// bound, per affected row. The function's side-effecting `INSERT` is what the trigger performs; its
+/// `RETURN` value is discarded (side-effect semantics).
+#[test]
+fn execute_function_after_insert_runs_the_function_body() {
+    let engine = BtreeEngine::new();
+    setup(&engine);
+    run(
+        &engine,
+        "CREATE FUNCTION log_ins() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN INSERT INTO audit VALUES ('ins', new.val); RETURN NEW; END; $$",
+    );
+    run(
+        &engine,
+        "CREATE TRIGGER log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_ins()",
+    );
+    assert!(matches!(
+        run(&engine, "INSERT INTO t VALUES (1, 10), (2, 20)"),
+        ExecutionResult::Inserted(2)
+    ));
+    assert_eq!(
+        audit(&engine),
+        vec![("ins".to_owned(), 10), ("ins".to_owned(), 20)]
+    );
+}
+
+/// A trigger function sees both `OLD` and `NEW` on `UPDATE`, and a `WHEN` guard still gates firing.
+/// The `EXECUTE PROCEDURE` spelling is equivalent to `EXECUTE FUNCTION`.
+#[test]
+fn execute_function_update_binds_old_and_new_under_when_guard() {
+    let engine = BtreeEngine::new();
+    setup(&engine);
+    run(&engine, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    run(
+        &engine,
+        "CREATE FUNCTION log_upd() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN INSERT INTO audit VALUES ('upd', old.val); INSERT INTO audit VALUES ('new', new.val); \
+         RETURN NEW; END; $$",
+    );
+    run(
+        &engine,
+        "CREATE TRIGGER u AFTER UPDATE ON t FOR EACH ROW WHEN (old.val <> new.val) \
+         EXECUTE PROCEDURE log_upd()",
+    );
+    // id=1 changes 10 -> 11 (guard true); id=2 set to its own value (guard false, no firing).
+    run(&engine, "UPDATE t SET val = 11 WHERE id = 1");
+    run(&engine, "UPDATE t SET val = 20 WHERE id = 2");
+    assert_eq!(
+        audit(&engine),
+        vec![("new".to_owned(), 11), ("upd".to_owned(), 10)]
+    );
+}
+
+/// A control-flow (`IF`) body composes: the function conditionally records different rows.
+#[test]
+fn execute_function_body_honors_control_flow() {
+    let engine = BtreeEngine::new();
+    setup(&engine);
+    run(
+        &engine,
+        "CREATE FUNCTION classify() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN IF new.val > 15 THEN INSERT INTO audit VALUES ('hi', new.val); \
+         ELSE INSERT INTO audit VALUES ('lo', new.val); END IF; RETURN NEW; END; $$",
+    );
+    run(
+        &engine,
+        "CREATE TRIGGER c AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION classify()",
+    );
+    run(&engine, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    assert_eq!(
+        audit(&engine),
+        vec![("hi".to_owned(), 20), ("lo".to_owned(), 10)]
+    );
+}
+
+/// A trigger naming a function that does not exist is refused at `CREATE TRIGGER` time (not deferred
+/// to the first firing), matching the reference engine.
+#[test]
+fn execute_function_missing_function_is_rejected_at_create() {
+    let engine = BtreeEngine::new();
+    setup(&engine);
+    let err = run_try(
+        &engine,
+        "CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION nope()",
+    )
+    .expect_err("missing trigger function must be rejected");
+    assert!(
+        matches!(err, Error::UnknownFunction(ref n) if n == "nope"),
+        "expected UnknownFunction, got {err:?}"
+    );
+}

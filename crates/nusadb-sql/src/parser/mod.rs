@@ -2538,9 +2538,11 @@ mod domain_rewrite_tests {
 }
 
 /// Drive `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE}[ OR ...] ON table
-/// [FOR EACH {ROW|STATEMENT}] [WHEN (cond)] <triggered-statement>`. The `WHEN` predicate and
-/// the action are captured as canonical SQL text (so they can be re-parsed, `NEW`/`OLD`-substituted,
-/// and run when the trigger fires). The action must be a single data statement.
+/// [FOR EACH {ROW|STATEMENT}] [WHEN (cond)] <action>`. The `WHEN` predicate and the action are
+/// captured as canonical SQL text (so they can be re-parsed, `NEW`/`OLD`-substituted, and run when
+/// the trigger fires). The action is either a single data statement (INSERT/UPDATE/DELETE/SELECT) or
+/// `EXECUTE {FUNCTION|PROCEDURE} name()`, which runs a NusaScript function's body with `NEW`/`OLD`
+/// bound.
 fn parse_create_trigger(sql: &str) -> Result<ast::Statement, Error> {
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::ParserError;
@@ -2612,22 +2614,7 @@ fn parse_create_trigger(sql: &str) -> Result<ast::Statement, Error> {
         None
     };
 
-    // The triggered action is the trailing SQL statement, captured as canonical SQL.
-    let action_stmt = parser.parse_statement().map_err(syntax)?;
-    let action = action_stmt.to_string();
-    let converted = convert_statement(action_stmt)?;
-    if !matches!(
-        converted,
-        ast::Statement::Insert(_)
-            | ast::Statement::Update(_)
-            | ast::Statement::Delete(_)
-            | ast::Statement::Select(_)
-            | ast::Statement::SetOperation(_)
-    ) {
-        return unsupported(
-            "a trigger action must be an INSERT, UPDATE, DELETE, or SELECT statement",
-        );
-    }
+    let action = parse_trigger_action(&mut parser)?;
 
     expect_statement_end(&mut parser)?;
     Ok(ast::Statement::CreateTrigger(ast::CreateTrigger {
@@ -2640,6 +2627,57 @@ fn parse_create_trigger(sql: &str) -> Result<ast::Statement, Error> {
         when,
         action,
     }))
+}
+
+/// Parse a trigger's action into canonical text: either `EXECUTE {FUNCTION|PROCEDURE} name()`
+/// (canonicalized to `EXECUTE FUNCTION name()`, which runs a NusaScript function's body with
+/// `NEW`/`OLD` bound) or a single trailing data statement (INSERT/UPDATE/DELETE/SELECT). The text is
+/// re-parsed and `NEW`/`OLD`-substituted when the trigger fires.
+fn parse_trigger_action(parser: &mut Parser<'_>) -> Result<String, Error> {
+    use sqlparser::keywords::Keyword;
+
+    let syntax = |e: sqlparser::parser::ParserError| Error::Syntax(e.to_string());
+    if parser.parse_keyword(Keyword::EXECUTE) {
+        // `EXECUTE FUNCTION`/`EXECUTE PROCEDURE` are equivalent here (as in the reference surface).
+        if parser
+            .parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE])
+            .is_none()
+        {
+            return unsupported("EXECUTE in a trigger action must name a FUNCTION or PROCEDURE");
+        }
+        let func = unqualified_object_name(
+            &parser.parse_object_name(false).map_err(syntax)?,
+            "a trigger's EXECUTE FUNCTION target",
+        )?;
+        parser
+            .expect_token(&sqlparser::tokenizer::Token::LParen)
+            .map_err(syntax)?;
+        // Trigger-function arguments populate `TG_ARGV`, which NusaScript does not expose — reject
+        // them rather than silently drop the arguments.
+        if !parser.consume_token(&sqlparser::tokenizer::Token::RParen) {
+            return unsupported(
+                "trigger function arguments (TG_ARGV) are not supported; use EXECUTE FUNCTION name()",
+            );
+        }
+        return Ok(format!("EXECUTE FUNCTION {func}()"));
+    }
+    let action_stmt = parser.parse_statement().map_err(syntax)?;
+    let action = action_stmt.to_string();
+    let converted = convert_statement(action_stmt)?;
+    if !matches!(
+        converted,
+        ast::Statement::Insert(_)
+            | ast::Statement::Update(_)
+            | ast::Statement::Delete(_)
+            | ast::Statement::Select(_)
+            | ast::Statement::SetOperation(_)
+    ) {
+        return unsupported(
+            "a trigger action must be an INSERT, UPDATE, DELETE, or SELECT statement, or \
+             EXECUTE FUNCTION name()",
+        );
+    }
+    Ok(action)
 }
 
 /// Drive `DROP TRIGGER [IF EXISTS] name ON table`.
@@ -3007,7 +3045,14 @@ fn parse_create_function(sql: &str) -> Result<ast::Statement, Error> {
     }
 
     parser.expect_keyword(Keyword::RETURNS).map_err(syntax)?;
-    let return_type = convert_data_type(&parser.parse_data_type().map_err(syntax)?)?;
+    // `RETURNS trigger` names the trigger pseudo-type — a function so declared is meant to be run by
+    // a `CREATE TRIGGER ... EXECUTE FUNCTION`, which discards the returned row. The engine never
+    // materializes the type, so store an inert `TEXT` placeholder and accept the declaration.
+    let return_type = if parser.parse_keyword(Keyword::TRIGGER) {
+        ColumnType::Text
+    } else {
+        convert_data_type(&parser.parse_data_type().map_err(syntax)?)?
+    };
 
     // `LANGUAGE <lang>` and `AS <body>` may appear in either order after `RETURNS` (the reference
     // engine writes `LANGUAGE` last); collect them in a small loop. `LANGUAGE` defaults to SQL.
