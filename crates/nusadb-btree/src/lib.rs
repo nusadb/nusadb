@@ -4016,6 +4016,32 @@ mod tests {
                 id: 3,
                 value: i64::MIN,
             },
+            // ALTER with a RESTART (counter carried) and without (def change only) — both shapes of
+            // the optional `current` prefix.
+            wal::LoggedOp::SeqAlter {
+                id: 3,
+                def: nusadb_core::engine::SequenceDef {
+                    name: "s".to_owned(),
+                    start: 1,
+                    increment: 10,
+                    min_value: 1,
+                    max_value: 1000,
+                    cycle: false,
+                },
+                current: Some(i64::MAX),
+            },
+            wal::LoggedOp::SeqAlter {
+                id: 3,
+                def: nusadb_core::engine::SequenceDef {
+                    name: "seq_with_a_longer_name".to_owned(),
+                    start: -5,
+                    increment: -2,
+                    min_value: i64::MIN,
+                    max_value: -1,
+                    cycle: true,
+                },
+                current: None,
+            },
         ];
         for op in &ops {
             assert!(wal::roundtrip_check(op), "codec identity for {op:?}");

@@ -906,6 +906,68 @@ fn create_and_drop_sequence_end_to_end() {
 }
 
 #[test]
+fn alter_sequence_end_to_end() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE SEQUENCE s");
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('s')")),
+        vec![vec![Value::Int(1)]]
+    );
+
+    // RESTART WITH: the next value is exactly the target.
+    assert!(matches!(
+        run(&engine, "ALTER SEQUENCE s RESTART WITH 100"),
+        ExecutionResult::SequenceAltered
+    ));
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('s')")),
+        vec![vec![Value::Int(100)]]
+    );
+
+    // INCREMENT BY changes the step; the counter keeps its place.
+    run(&engine, "ALTER SEQUENCE s INCREMENT BY 10");
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('s')")),
+        vec![vec![Value::Int(110)]]
+    );
+
+    // A bare RESTART repositions to the start.
+    run(&engine, "ALTER SEQUENCE s RESTART");
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('s')")),
+        vec![vec![Value::Int(1)]]
+    );
+
+    // MAXVALUE + CYCLE: exhaust the range, then wrap after enabling cycling.
+    run(&engine, "CREATE SEQUENCE c MAXVALUE 3");
+    for expected in 1..=3 {
+        assert_eq!(
+            rows(run(&engine, "SELECT nextval('c')")),
+            vec![vec![Value::Int(expected)]]
+        );
+    }
+    assert!(run_try(&engine, "SELECT nextval('c')").is_err()); // limit reached, no cycle
+    run(&engine, "ALTER SEQUENCE c CYCLE");
+    assert_eq!(
+        rows(run(&engine, "SELECT nextval('c')")),
+        vec![vec![
+            Value::Int(1) // wrapped to MINVALUE
+        ]]
+    );
+
+    // IF EXISTS on a missing sequence is a no-op; without it, a missing sequence errors.
+    assert!(matches!(
+        run(&engine, "ALTER SEQUENCE IF EXISTS nope RESTART WITH 5"),
+        ExecutionResult::SequenceAltered
+    ));
+    assert!(run_try(&engine, "ALTER SEQUENCE nope RESTART WITH 5").is_err());
+
+    // A zero increment and inverted bounds are rejected.
+    assert!(run_try(&engine, "ALTER SEQUENCE s INCREMENT BY 0").is_err());
+    assert!(run_try(&engine, "ALTER SEQUENCE s MINVALUE 10 MAXVALUE 5").is_err());
+}
+
+#[test]
 fn create_and_drop_index_end_to_end() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, name TEXT)");

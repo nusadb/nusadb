@@ -676,6 +676,24 @@ pub enum SequenceOption {
     Cache(Expr),
     /// `CYCLE` (`true`) or `NO CYCLE` (`false`).
     Cycle(bool),
+    /// `RESTART [WITH <n>]` — reposition the counter (`ALTER SEQUENCE` only). `Some` restarts so
+    /// the next value is `<n>`; `None` restarts to the sequence's start.
+    Restart(Option<Expr>),
+}
+
+/// `ALTER SEQUENCE [IF EXISTS] name <options...>` — change a sequence's properties and/or
+/// reposition its counter. Reuses [`SequenceOption`] (the `Restart` variant is valid only here).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterSequence {
+    /// Explicit schema qualifier (`Some` for `schema.s`), or `None` to resolve through the
+    /// session search path.
+    pub schema: Option<String>,
+    /// Sequence name.
+    pub name: String,
+    /// Whether `IF EXISTS` was specified (a missing sequence is then a no-op).
+    pub if_exists: bool,
+    /// Changes in declaration order; at least one.
+    pub options: Vec<SequenceOption>,
 }
 
 /// `DROP SEQUENCE [IF EXISTS] name`.

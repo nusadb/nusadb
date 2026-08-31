@@ -683,6 +683,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_create_sequence(sql) {
         return result;
     }
+    if let Some(result) = recognize_alter_sequence(sql) {
+        return result;
+    }
     let dialect = NusaParserDialect;
     // `WITH x AS [NOT] MATERIALIZED (...)`: sqlparser only parses the CTE materialization keyword for
     // one specific built-in dialect (a hardcoded `dialect_of!` check a custom `Dialect` cannot opt
@@ -1965,6 +1968,87 @@ fn parse_create_sequence_flexible(sql: &str) -> Result<ast::Statement, Error> {
         owned_by.as_ref(),
     )
     .map(ast::Statement::CreateSequence)
+}
+
+/// Recognize `ALTER SEQUENCE ...` — sqlparser has no grammar for it, so drive it here.
+fn recognize_alter_sequence(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    starts_with_two(sql, "alter", "sequence").then(|| parse_alter_sequence(sql))
+}
+
+/// Drive `ALTER SEQUENCE [IF EXISTS] name <options...>`, accepting the same options as
+/// `CREATE SEQUENCE` (in any order, either spelling of `INCREMENT`/`START`) plus `RESTART [[WITH] n]`.
+/// At least one option is required. Cache and the trailing `BY`/`WITH` keyword flags are cosmetic.
+fn parse_alter_sequence(sql: &str) -> Result<ast::Statement, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::parser::ParserError;
+    use sqlparser::tokenizer::Token;
+
+    // A signed integer literal as an option value, converted straight to our AST expression.
+    fn number(parser: &mut Parser<'_>) -> Result<ast::Expr, Error> {
+        let e = parser
+            .parse_number()
+            .map_err(|e| Error::Syntax(e.to_string()))?;
+        convert_expr(e)
+    }
+
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    let dialect = NusaParserDialect;
+    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+
+    parser.expect_keyword(Keyword::ALTER).map_err(syntax)?;
+    parser.expect_keyword(Keyword::SEQUENCE).map_err(syntax)?;
+    let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+    let name = parser.parse_object_name(false).map_err(syntax)?;
+    let (schema, name) = table_ref_name(&name)?;
+
+    let mut options = Vec::new();
+    loop {
+        if parser.parse_keyword(Keyword::INCREMENT) {
+            let _by = parser.parse_keyword(Keyword::BY);
+            options.push(ast::SequenceOption::Increment(number(&mut parser)?));
+        } else if parser.parse_keywords(&[Keyword::NO, Keyword::MINVALUE]) {
+            options.push(ast::SequenceOption::MinValue(None));
+        } else if parser.parse_keyword(Keyword::MINVALUE) {
+            options.push(ast::SequenceOption::MinValue(Some(number(&mut parser)?)));
+        } else if parser.parse_keywords(&[Keyword::NO, Keyword::MAXVALUE]) {
+            options.push(ast::SequenceOption::MaxValue(None));
+        } else if parser.parse_keyword(Keyword::MAXVALUE) {
+            options.push(ast::SequenceOption::MaxValue(Some(number(&mut parser)?)));
+        } else if parser.parse_keyword(Keyword::START) {
+            let _with = parser.parse_keyword(Keyword::WITH);
+            options.push(ast::SequenceOption::Start(number(&mut parser)?));
+        } else if parser.parse_keyword(Keyword::RESTART) {
+            // `RESTART`, `RESTART n`, and `RESTART WITH n` are all valid — a bare `RESTART`
+            // repositions to the start.
+            let with = parser.parse_keyword(Keyword::WITH);
+            let value =
+                if with || matches!(parser.peek_token().token, Token::Number(..) | Token::Minus) {
+                    Some(number(&mut parser)?)
+                } else {
+                    None
+                };
+            options.push(ast::SequenceOption::Restart(value));
+        } else if parser.parse_keyword(Keyword::CACHE) {
+            options.push(ast::SequenceOption::Cache(number(&mut parser)?));
+        } else if parser.parse_keywords(&[Keyword::NO, Keyword::CYCLE]) {
+            options.push(ast::SequenceOption::Cycle(false));
+        } else if parser.parse_keyword(Keyword::CYCLE) {
+            options.push(ast::SequenceOption::Cycle(true));
+        } else {
+            break;
+        }
+    }
+
+    expect_statement_end(&mut parser)?;
+    if options.is_empty() {
+        return unsupported("ALTER SEQUENCE requires at least one action");
+    }
+    Ok(ast::Statement::AlterSequence(ast::AlterSequence {
+        schema,
+        name,
+        if_exists,
+        options,
+    }))
 }
 
 /// Recognize `CREATE [OR REPLACE] TRIGGER ...`; `None` if not a `CREATE TRIGGER` statement

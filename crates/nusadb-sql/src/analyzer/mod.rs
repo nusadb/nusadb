@@ -26,18 +26,18 @@ use nusadb_core::{ColumnDef, ColumnType, TableSchema};
 use crate::ast;
 use crate::error::Error;
 use crate::planner::{
-    AggregateCall, AlterColumnOp, AlterDatabasePlan, AlterTablePlan, AlterTriggerPlan, AnalyzePlan,
-    Assignment, CallPlan, CheckSpec, CommentPlan, CompositeExpr, ConflictArbiter,
-    CreateDatabasePlan, CreateFunctionPlan, CreateIndexPlan, CreatePlainViewPlan, CreatePolicyPlan,
-    CreateProcedurePlan, CreateSchemaPlan, CreateSequencePlan, CreateTableAsPlan, CreateTablePlan,
-    CreateTriggerPlan, CryptoOp, DeletePlan, DropDatabasePlan, DropFunctionPlan, DropIndexPlan,
-    DropPolicyPlan, DropProcedurePlan, DropSchemaPlan, DropSequencePlan, DropTablePlan,
-    DropTriggerPlan, DropViewPlan, ForeignKeySpec, FrameBound, IndexMeta, InsertPlan, InsertSource,
-    JoinPlan, LogicalPlan, MaterializedViewPlan, MergeMatchedAction, MergePlan, MergeWhen,
-    ModifyingCteDef, OnConflictPlan, OrderByKey, OrderedSetKey, Projection, RecursiveCteDef,
-    SelectPlan, SetOpPlan, SetOpTree, TruncateCascadePlan, TxnCharacteristics, TypedCaseBranch,
-    TypedExpr, TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr,
-    WindowFrame,
+    AggregateCall, AlterColumnOp, AlterDatabasePlan, AlterSequencePlan, AlterTablePlan,
+    AlterTriggerPlan, AnalyzePlan, Assignment, CallPlan, CheckSpec, CommentPlan, CompositeExpr,
+    ConflictArbiter, CreateDatabasePlan, CreateFunctionPlan, CreateIndexPlan, CreatePlainViewPlan,
+    CreatePolicyPlan, CreateProcedurePlan, CreateSchemaPlan, CreateSequencePlan, CreateTableAsPlan,
+    CreateTablePlan, CreateTriggerPlan, CryptoOp, DeletePlan, DropDatabasePlan, DropFunctionPlan,
+    DropIndexPlan, DropPolicyPlan, DropProcedurePlan, DropSchemaPlan, DropSequencePlan,
+    DropTablePlan, DropTriggerPlan, DropViewPlan, ForeignKeySpec, FrameBound, IndexMeta,
+    InsertPlan, InsertSource, JoinPlan, LogicalPlan, MaterializedViewPlan, MergeMatchedAction,
+    MergePlan, MergeWhen, ModifyingCteDef, OnConflictPlan, OrderByKey, OrderedSetKey, Projection,
+    RecursiveCteDef, SelectPlan, SetOpPlan, SetOpTree, TruncateCascadePlan, TxnCharacteristics,
+    TypedCaseBranch, TypedExpr, TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec,
+    WindowExpr, WindowFrame,
 };
 
 mod dcl;
@@ -806,6 +806,13 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 .unwrap_or_else(|| catalog.current_schema());
             cs.name = qualified_display(&schema, &cs.name);
             analyze_create_sequence(cs).map(LogicalPlan::CreateSequence)
+        },
+        ast::Statement::AlterSequence(mut a) => {
+            // Qualify the name exactly as CREATE/DROP SEQUENCE do, so ALTER reaches a sequence in a
+            // non-public schema through the same name key.
+            let schema = a.schema.clone().unwrap_or_else(|| catalog.current_schema());
+            a.name = qualified_display(&schema, &a.name);
+            analyze_alter_sequence(a).map(LogicalPlan::AlterSequence)
         },
         ast::Statement::DropSequence(ds) => {
             let schema = ds

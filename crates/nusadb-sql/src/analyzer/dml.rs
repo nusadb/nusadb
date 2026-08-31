@@ -484,6 +484,12 @@ pub(super) fn analyze_create_sequence(
             ast::SequenceOption::MinValue(None)
             | ast::SequenceOption::MaxValue(None)
             | ast::SequenceOption::Cache(_) => {},
+            // RESTART repositions an existing counter — it belongs to `ALTER SEQUENCE`, not `CREATE`.
+            ast::SequenceOption::Restart(_) => {
+                return Err(Error::InvalidStatement(
+                    "RESTART is not valid in CREATE SEQUENCE".to_owned(),
+                ));
+            },
         }
     }
     let min_value = min_value.unwrap_or(1);
@@ -499,6 +505,38 @@ pub(super) fn analyze_create_sequence(
             cycle,
         },
         if_not_exists: cs.if_not_exists,
+    })
+}
+
+/// Lower `ALTER SEQUENCE [IF EXISTS] name <options>` to a partial [`SequenceChange`]. `NO MINVALUE`
+/// / `NO MAXVALUE` reset to the same defaults `CREATE` uses; `CACHE` is a no-op; `RESTART` becomes
+/// the counter reposition the engine applies.
+pub(super) fn analyze_alter_sequence(a: ast::AlterSequence) -> Result<AlterSequencePlan, Error> {
+    use nusadb_core::engine::{SequenceChange, SequenceRestart};
+
+    let mut change = SequenceChange::default();
+    for option in &a.options {
+        match option {
+            ast::SequenceOption::Increment(e) => change.increment = Some(const_i64(e)?),
+            ast::SequenceOption::MinValue(Some(e)) => change.min_value = Some(const_i64(e)?),
+            ast::SequenceOption::MaxValue(Some(e)) => change.max_value = Some(const_i64(e)?),
+            ast::SequenceOption::Start(e) => change.start = Some(const_i64(e)?),
+            ast::SequenceOption::Cycle(b) => change.cycle = Some(*b),
+            ast::SequenceOption::Restart(Some(e)) => {
+                change.restart = Some(SequenceRestart::To(const_i64(e)?));
+            },
+            ast::SequenceOption::Restart(None) => change.restart = Some(SequenceRestart::ToStart),
+            // `NO MINVALUE` / `NO MAXVALUE` reset to the engine's default bounds (as `CREATE` does);
+            // `CACHE` has no effect.
+            ast::SequenceOption::MinValue(None) => change.min_value = Some(1),
+            ast::SequenceOption::MaxValue(None) => change.max_value = Some(i64::MAX),
+            ast::SequenceOption::Cache(_) => {},
+        }
+    }
+    Ok(AlterSequencePlan {
+        name: a.name,
+        if_exists: a.if_exists,
+        change,
     })
 }
 

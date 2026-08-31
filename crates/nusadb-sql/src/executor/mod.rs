@@ -22,11 +22,11 @@ use nusadb_core::{
 use crate::ast;
 use crate::error::Error;
 use crate::planner::{
-    AggregateCall, AlterColumnOp, AlterTablePlan, AnalyzePlan, Assignment, ConflictArbiter,
-    CreateIndexPlan, CreatePlainViewPlan, CreateSchemaPlan, CreateSequencePlan, CreateTablePlan,
-    DeletePlan, DropIndexPlan, DropSchemaPlan, DropSequencePlan, DropTablePlan, DropViewPlan,
-    FrameBound, HashKey, InsertPlan, InsertSource, OnConflictPlan, OrderByKey, OrderedSetKey,
-    PhysicalCreateTableAs, PhysicalMaterializedView, PhysicalOperator, PhysicalPlan,
+    AggregateCall, AlterColumnOp, AlterSequencePlan, AlterTablePlan, AnalyzePlan, Assignment,
+    ConflictArbiter, CreateIndexPlan, CreatePlainViewPlan, CreateSchemaPlan, CreateSequencePlan,
+    CreateTablePlan, DeletePlan, DropIndexPlan, DropSchemaPlan, DropSequencePlan, DropTablePlan,
+    DropViewPlan, FrameBound, HashKey, InsertPlan, InsertSource, OnConflictPlan, OrderByKey,
+    OrderedSetKey, PhysicalCreateTableAs, PhysicalMaterializedView, PhysicalOperator, PhysicalPlan,
     PhysicalRecursiveCte, PhysicalSetOp, SetOpTree, TruncateCascadePlan, TxnCharacteristics,
     TypedExpr, UpdatePlan, WindowExpr, WindowFrame,
 };
@@ -235,6 +235,8 @@ pub enum ExecutionResult {
     DatabaseDropped,
     /// `CREATE SEQUENCE` succeeded (or `IF NOT EXISTS` made it a no-op).
     SequenceCreated,
+    /// `ALTER SEQUENCE` succeeded (or `IF EXISTS` made it a no-op).
+    SequenceAltered,
     /// `DROP SEQUENCE` succeeded (or `IF EXISTS` made it a no-op).
     SequenceDropped,
     /// `CREATE INDEX` succeeded (or `IF NOT EXISTS` made it a no-op).
@@ -2261,6 +2263,7 @@ fn dispatch(
         PhysicalPlan::AlterDatabase(_) => Ok(ExecutionResult::DatabaseAltered),
         PhysicalPlan::DropDatabase(p) => run_drop_database(&p, engine, txn),
         PhysicalPlan::CreateSequence(p) => run_create_sequence(&p, engine, txn),
+        PhysicalPlan::AlterSequence(p) => run_alter_sequence(&p, engine, txn),
         PhysicalPlan::DropSequence(p) => run_drop_sequence(&p, engine, txn),
         PhysicalPlan::CreateIndex(p) => run_create_index(&p, engine, txn),
         PhysicalPlan::DropIndex(p) => run_drop_index(&p, engine, txn),
@@ -2841,6 +2844,7 @@ fn format_plan(
         PhysicalPlan::CreateSequence(p) => {
             vec![format!("{indent}CreateSequence: {}", p.def.name)]
         },
+        PhysicalPlan::AlterSequence(p) => vec![format!("{indent}AlterSequence: {}", p.name)],
         PhysicalPlan::DropSequence(p) => vec![format!("{indent}DropSequence: {}", p.name)],
         PhysicalPlan::CreateIndex(p) => vec![format!(
             "{indent}CreateIndex: {} on {}",

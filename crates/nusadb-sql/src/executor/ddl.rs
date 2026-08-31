@@ -883,6 +883,24 @@ pub(super) fn run_drop_sequence(
     Ok(ExecutionResult::SequenceDropped)
 }
 
+pub(super) fn run_alter_sequence(
+    plan: &AlterSequencePlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    match engine.lookup_sequence(&plan.name)? {
+        Some(id) => engine.alter_sequence(txn, id, &plan.change)?,
+        None => {
+            if !plan.if_exists {
+                return Err(Error::SequenceNotFound {
+                    name: plan.name.clone(),
+                });
+            }
+        },
+    }
+    Ok(ExecutionResult::SequenceAltered)
+}
+
 // === CREATE / DROP INDEX ==================================
 
 /// Register the index in the catalog, then **backfill** the rows already present so the index is

@@ -15,7 +15,7 @@
 //! (index vs. sequential scan, join ordering) are deferred until that
 //! infrastructure exists.
 
-use nusadb_core::engine::{IndexDef, SequenceDef};
+use nusadb_core::engine::{IndexDef, SequenceChange, SequenceDef};
 use nusadb_core::{ColumnType, TableSchema};
 
 use crate::ast;

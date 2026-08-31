@@ -297,6 +297,8 @@ pub enum Statement {
     AlterDatabase(AlterDatabase),
     /// `CREATE SEQUENCE [IF NOT EXISTS] name [options...]`.
     CreateSequence(CreateSequence),
+    /// `ALTER SEQUENCE [IF EXISTS] name <options...>`.
+    AlterSequence(AlterSequence),
     /// `DROP SEQUENCE [IF EXISTS] name`.
     DropSequence(DropSequence),
     /// `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY]`.

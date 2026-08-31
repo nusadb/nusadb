@@ -386,6 +386,8 @@ pub enum LogicalPlan {
     DropDatabase(DropDatabasePlan),
     /// `CREATE SEQUENCE`.
     CreateSequence(CreateSequencePlan),
+    /// `ALTER SEQUENCE`.
+    AlterSequence(AlterSequencePlan),
     /// `DROP SEQUENCE`.
     DropSequence(DropSequencePlan),
     /// `CREATE INDEX`.
@@ -509,6 +511,17 @@ pub struct DropSequencePlan {
     pub name: String,
     /// Whether `IF EXISTS` was given.
     pub if_exists: bool,
+}
+
+/// `ALTER SEQUENCE [IF EXISTS] name <options>` — options folded into a partial [`SequenceChange`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterSequencePlan {
+    /// Sequence name (sequences share a flat namespace, like `CREATE`/`DROP SEQUENCE`).
+    pub name: String,
+    /// Whether `IF EXISTS` was given (a missing sequence is then a no-op).
+    pub if_exists: bool,
+    /// The requested changes.
+    pub change: SequenceChange,
 }
 
 /// `CREATE SCHEMA [IF NOT EXISTS] name`.
@@ -2419,6 +2432,8 @@ pub enum PhysicalPlan {
     DropDatabase(DropDatabasePlan),
     /// `CREATE SEQUENCE`.
     CreateSequence(CreateSequencePlan),
+    /// `ALTER SEQUENCE`.
+    AlterSequence(AlterSequencePlan),
     /// `DROP SEQUENCE`.
     DropSequence(DropSequencePlan),
     /// `CREATE INDEX`.

@@ -214,6 +214,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::DatabaseAltered
         | ExecutionResult::DatabaseDropped
         | ExecutionResult::SequenceCreated
+        | ExecutionResult::SequenceAltered
         | ExecutionResult::SequenceDropped
         | ExecutionResult::IndexCreated
         | ExecutionResult::IndexDropped

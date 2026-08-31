@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nusadb_core::engine::{
-    AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, ScanDirection, SequenceDef,
-    SharedTuple, TableDef, TableLockMode, TableStats, Tid, TupleScan,
+    AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, ScanDirection, SequenceChange,
+    SequenceDef, SequenceRestart, SharedTuple, TableDef, TableLockMode, TableStats, Tid, TupleScan,
 };
 use nusadb_core::{
     Constraint, ConstraintKind, Error, FkAction, ForeignKeyDef, IndexId, PageStore, Result,
@@ -1542,6 +1542,17 @@ impl BtreeEngine {
                     seq.current = Some(*value);
                 }
             },
+            LoggedOp::SeqAlter { id, def, current } => {
+                // Replace the definition, and reposition the counter when the ALTER carried a
+                // `RESTART` (`current` is `Some`). The name never changes under ALTER, so
+                // `seq_by_name` needs no update.
+                if let Some(seq) = seqs.sequences.get_mut(id) {
+                    seq.def = def.clone();
+                    if let Some(c) = current {
+                        seq.current = Some(*c);
+                    }
+                }
+            },
             LoggedOp::AlterSchema {
                 txn: _,
                 table,
@@ -1632,7 +1643,10 @@ impl BtreeEngine {
                 cat.ns_is_durable(*id)
             },
             // The sequence family is non-transactional and always durable.
-            LoggedOp::SeqCreate { .. } | LoggedOp::SeqDrop { .. } | LoggedOp::SeqSet { .. } => true,
+            LoggedOp::SeqCreate { .. }
+            | LoggedOp::SeqDrop { .. }
+            | LoggedOp::SeqSet { .. }
+            | LoggedOp::SeqAlter { .. } => true,
         };
         if durable {
             self.log(&op.to_record())?;
@@ -3974,6 +3988,105 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if let Err(e) = self.log_durable(&LoggedOp::SeqSet { id: id.0, value }.to_record()) {
             if let Some(seq) = seqs.sequences.get_mut(&id.0) {
                 seq.current = prior;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn alter_sequence(&self, txn: TxnId, id: SequenceId, change: &SequenceChange) -> Result<()> {
+        // Rank order: the txn check (rank 6) precedes the sequence latch (rank 7).
+        if !self.txn_exists(txn.0)? {
+            return Err(unknown_txn(txn));
+        }
+        let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
+        let seq = seqs
+            .sequences
+            .get_mut(&id.0)
+            .ok_or_else(|| sequence_not_found(id))?;
+        let prior_def = seq.def.clone();
+        let prior_current = seq.current;
+
+        // Build the new definition from the requested changes, then validate the result as a whole.
+        let mut def = prior_def.clone();
+        if let Some(v) = change.increment {
+            def.increment = v;
+        }
+        if let Some(v) = change.min_value {
+            def.min_value = v;
+        }
+        if let Some(v) = change.max_value {
+            def.max_value = v;
+        }
+        if let Some(v) = change.start {
+            def.start = v;
+        }
+        if let Some(v) = change.cycle {
+            def.cycle = v;
+        }
+        if def.increment == 0 {
+            return Err(sequence_error("sequence INCREMENT must not be zero"));
+        }
+        if def.min_value > def.max_value {
+            return Err(sequence_error("sequence MINVALUE must not exceed MAXVALUE"));
+        }
+        if def.start < def.min_value || def.start > def.max_value {
+            return Err(sequence_error(
+                "sequence START must be between MINVALUE and MAXVALUE",
+            ));
+        }
+
+        // A RESTART repositions the counter so the next advance returns the target. The model's
+        // counter holds the last value handed out (next = current + increment), so store
+        // `target - increment`; `RESTART` with no value returns to the (possibly new) start.
+        let new_current = match change.restart {
+            None => None,
+            Some(SequenceRestart::To(target)) => Some(
+                target
+                    .checked_sub(def.increment)
+                    .ok_or_else(|| sequence_error("sequence RESTART value out of range"))?,
+            ),
+            Some(SequenceRestart::ToStart) => Some(
+                def.start
+                    .checked_sub(def.increment)
+                    .ok_or_else(|| sequence_error("sequence RESTART value out of range"))?,
+            ),
+        };
+        let def_changed = def != prior_def;
+
+        // Apply in memory first (ends the `seq` borrow), then make durable — restoring memory if the
+        // log append fails, so RAM never runs ahead of the log. Definition change and RESTART travel
+        // in ONE `SeqAlter` record, so a failed ALTER persists neither half (atomic under a crash,
+        // unlike two separate records). A pure RESTART (no def change) rides as a `SeqSet`, and a
+        // no-op ALTER (e.g. `CACHE` only) logs nothing.
+        seq.def = def.clone();
+        if let Some(cur) = new_current {
+            seq.current = Some(cur);
+        }
+        let record = if def_changed {
+            Some(
+                LoggedOp::SeqAlter {
+                    id: id.0,
+                    def,
+                    current: new_current,
+                }
+                .to_record(),
+            )
+        } else {
+            new_current.map(|cur| {
+                LoggedOp::SeqSet {
+                    id: id.0,
+                    value: cur,
+                }
+                .to_record()
+            })
+        };
+        if let Some(record) = record
+            && let Err(e) = self.log_durable(&record)
+        {
+            if let Some(seq) = seqs.sequences.get_mut(&id.0) {
+                seq.def = prior_def;
+                seq.current = prior_current;
             }
             return Err(e);
         }

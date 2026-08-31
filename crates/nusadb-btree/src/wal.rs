@@ -56,6 +56,7 @@ const TAG_SCHEMA_CREATE: u8 = 19;
 const TAG_SCHEMA_DROP: u8 = 20;
 const TAG_INDEX_UNSTAMP: u8 = 21;
 const TAG_INSERT_BATCH: u8 = 22;
+const TAG_SEQ_ALTER: u8 = 23;
 
 /// One logical, replayable operation of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +273,18 @@ pub enum LoggedOp {
         /// The counter value after the advance.
         value: i64,
     },
+    /// Sequence `id`'s definition was changed by `ALTER SEQUENCE` — the new definition `def`
+    /// replaces the old one, and when `current` is `Some` the counter is also repositioned to it (a
+    /// `RESTART`). Carrying both in one record keeps the change atomic under a crash: a def change and
+    /// its `RESTART` replay together or not at all. Non-transactional, replayed unconditionally.
+    SeqAlter {
+        /// The sequence id.
+        id: u64,
+        /// The definition after the change.
+        def: SequenceDef,
+        /// The counter value after a `RESTART`, or `None` to leave the counter unchanged.
+        current: Option<i64>,
+    },
     /// `ALTER TABLE` advanced `table`'s schema to `version` with the new definition `def`.
     /// Transactional, committed-gated; the row rewrites the SQL layer drives ride
     /// as ordinary `Update` records.
@@ -333,7 +346,10 @@ impl LoggedOp {
             | Self::SchemaDrop { txn, .. } => *txn,
             // Non-transactional records own no transaction: the reserved id 0 (never begun,
             // never committed) — replay applies them unconditionally instead.
-            Self::SeqCreate { .. } | Self::SeqDrop { .. } | Self::SeqSet { .. } => 0,
+            Self::SeqCreate { .. }
+            | Self::SeqDrop { .. }
+            | Self::SeqSet { .. }
+            | Self::SeqAlter { .. } => 0,
         }
     }
 
@@ -344,7 +360,10 @@ impl LoggedOp {
     pub const fn is_non_transactional(&self) -> bool {
         matches!(
             self,
-            Self::SeqCreate { .. } | Self::SeqDrop { .. } | Self::SeqSet { .. }
+            Self::SeqCreate { .. }
+                | Self::SeqDrop { .. }
+                | Self::SeqSet { .. }
+                | Self::SeqAlter { .. }
         )
     }
 
@@ -512,6 +531,19 @@ impl LoggedOp {
             Self::SeqSet { id, value: v } => {
                 push_key(&mut key, TAG_SEQ_SET, 0, *id, None);
                 value.extend_from_slice(&v.to_le_bytes());
+            },
+            Self::SeqAlter { id, def, current } => {
+                push_key(&mut key, TAG_SEQ_ALTER, 0, *id, None);
+                // A one-byte presence flag then the optional counter, ahead of the variable-length
+                // def so the decoder can read them before handing the rest to `decode_sequence_def`.
+                match current {
+                    Some(v) => {
+                        value.push(1);
+                        value.extend_from_slice(&v.to_le_bytes());
+                    },
+                    None => value.push(0),
+                }
+                encode_sequence_def(&mut value, def);
             },
             Self::AlterSchema {
                 txn,
@@ -693,6 +725,18 @@ impl LoggedOp {
             TAG_SEQ_SET => Self::SeqSet {
                 id: table,
                 value: read_i64(value, 0)?,
+            },
+            TAG_SEQ_ALTER => {
+                let (current, def_at) = match *value.first()? {
+                    0 => (None, 1),
+                    1 => (Some(read_i64(value, 1)?), 9),
+                    _ => return None,
+                };
+                Self::SeqAlter {
+                    id: table,
+                    def: decode_sequence_def(value.get(def_at..)?)?,
+                    current,
+                }
             },
             TAG_ALTER_SCHEMA => {
                 let version = u32::from_le_bytes(value.get(0..4)?.try_into().ok()?);

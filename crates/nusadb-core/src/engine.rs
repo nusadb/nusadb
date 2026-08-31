@@ -547,6 +547,35 @@ pub struct SequenceDef {
     pub cycle: bool,
 }
 
+/// How an `ALTER SEQUENCE ... RESTART` repositions the counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceRestart {
+    /// `RESTART WITH n` — the next [`sequence_next`](StorageEngine::sequence_next) returns `n`.
+    To(i64),
+    /// `RESTART` with no argument — reposition to the sequence's (possibly newly set) start.
+    ToStart,
+}
+
+/// A partial change to a sequence's definition, supplied to [`StorageEngine::alter_sequence`].
+///
+/// Every field is optional; `None` leaves that property of the [`SequenceDef`] unchanged. `restart`
+/// repositions the counter (see [`SequenceRestart`]); `None` there leaves the current value untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequenceChange {
+    /// New `INCREMENT [BY]` (must be non-zero).
+    pub increment: Option<i64>,
+    /// New inclusive lower bound (`MINVALUE`).
+    pub min_value: Option<i64>,
+    /// New inclusive upper bound (`MAXVALUE`).
+    pub max_value: Option<i64>,
+    /// New `START [WITH]` — the value a `RESTART` with no argument returns to.
+    pub start: Option<i64>,
+    /// New `CYCLE` / `NO CYCLE`.
+    pub cycle: Option<bool>,
+    /// A `RESTART`, or `None` to leave the counter where it is.
+    pub restart: Option<SequenceRestart>,
+}
+
 /// The access method of a secondary index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
@@ -1104,6 +1133,19 @@ pub trait StorageEngine: Send + Sync {
     fn sequence_set(&self, id: SequenceId, value: i64) -> Result<()> {
         let _ = (id, value);
         Err(unsupported("sequence_set"))
+    }
+
+    /// Apply an `ALTER SEQUENCE` change to sequence `id`: update the properties named in `change` and
+    /// optionally reposition the counter. **Non-transactional DDL** (like create/drop): durable
+    /// immediately, not undone by a rollback. The default returns an `Unsupported` error; the
+    /// production engine overrides it.
+    ///
+    /// # Errors
+    /// The sequence does not exist, `txn` is unknown, or `change` is invalid (a zero increment, or a
+    /// bound/start that leaves `min_value <= start <= max_value` unsatisfied).
+    fn alter_sequence(&self, txn: TxnId, id: SequenceId, change: &SequenceChange) -> Result<()> {
+        let _ = (txn, id, change);
+        Err(unsupported("alter_sequence"))
     }
 
     /// Create a SQL schema (namespace), returning its [`SchemaId`]. Rollback-aware DDL.
