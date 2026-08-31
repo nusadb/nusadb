@@ -709,14 +709,90 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `ORDER BY <key> USING <op>`: sqlparser has no operator field on its sort key (only ASC/DESC),
     // so rewrite `USING <` / `USING >` to the equivalent `ASC` / `DESC` keyword before parsing.
     rewrite_order_by_using(&mut tokens);
+    // `CREATE VIEW ... WITH [LOCAL|CASCADED] CHECK OPTION`: sqlparser (0.62) has no grammar for the
+    // trailing check-option clause, so strip it here and remember it — the flag is re-attached to the
+    // parsed `CreateView` below (a statement-level property, applied after conversion).
+    let view_check_option = strip_view_check_option(&mut tokens);
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
         .map_err(|e| Error::Syntax(e.to_string()))?;
     match statements.len() {
-        1 => convert_statement(statements.remove(0)),
+        1 => {
+            let stmt = convert_statement(statements.remove(0))?;
+            if view_check_option {
+                apply_view_check_option(stmt)
+            } else {
+                Ok(stmt)
+            }
+        },
         0 => Err(Error::Empty),
         n => Err(Error::MultipleStatements(n)),
+    }
+}
+
+/// Detect and remove a trailing `WITH [LOCAL | CASCADED] CHECK OPTION` (sqlparser has no grammar for
+/// it), returning whether it was present. Only the exact trailing keyword run — ignoring whitespace
+/// and a final `;` — is matched, so a view body is never touched. The caller applies the flag via
+/// [`apply_view_check_option`].
+fn strip_view_check_option(tokens: &mut Vec<TokenWithSpan>) -> bool {
+    // Positions of the "meaningful" tokens (skip whitespace and a trailing EOF / `;`).
+    let meaningful: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            !matches!(
+                t.token,
+                Token::Whitespace(_) | Token::EOF | Token::SemiColon
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let m = meaningful.len();
+    if m < 3 {
+        return false;
+    }
+    // `word(k)` is the k-th meaningful token from the end (`word(1)` is the last).
+    let word = |k: usize, kw: &str| {
+        m.checked_sub(k)
+            .and_then(|j| meaningful.get(j))
+            .and_then(|&idx| tokens.get(idx))
+            .is_some_and(|t| word_ci(Some(t), kw))
+    };
+    if !word(1, "option") || !word(2, "check") {
+        return false;
+    }
+    // `WITH CHECK OPTION`, or `WITH {LOCAL|CASCADED} CHECK OPTION`.
+    let with_k = if m >= 4 && (word(3, "local") || word(3, "cascaded")) {
+        if !word(4, "with") {
+            return false;
+        }
+        4
+    } else if word(3, "with") {
+        3
+    } else {
+        return false;
+    };
+    let (Some(&with_pos), Some(&last_pos)) = (meaningful.get(m - with_k), meaningful.get(m - 1))
+    else {
+        return false;
+    };
+    tokens.drain(with_pos..=last_pos);
+    true
+}
+
+/// Re-attach a stripped `WITH CHECK OPTION` to a parsed `CREATE VIEW`. It is valid only on a plain
+/// (non-materialized) view; anywhere else is a surface error.
+fn apply_view_check_option(stmt: ast::Statement) -> Result<ast::Statement, Error> {
+    match stmt {
+        ast::Statement::CreateView(mut cv) => {
+            if cv.materialized {
+                return unsupported("WITH CHECK OPTION on a materialized view");
+            }
+            cv.check_option = true;
+            Ok(ast::Statement::CreateView(cv))
+        },
+        _ => unsupported("WITH CHECK OPTION is only valid on CREATE VIEW"),
     }
 }
 

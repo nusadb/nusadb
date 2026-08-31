@@ -322,6 +322,14 @@ pub enum Error {
         table: String,
     },
 
+    /// A row written through a view created `WITH CHECK OPTION` would not be visible through that
+    /// view (it fails the view's own `WHERE`), so the write is rejected.
+    #[error("new row violates check option for view `{view}`")]
+    ViewCheckOptionViolation {
+        /// The view whose check option the row failed.
+        view: String,
+    },
+
     /// The session lacks the privilege to run a statement. Used to reserve security administration —
     /// for example, only a superuser may create/alter/drop a row-level-security policy or toggle a
     /// table's RLS, so the very session RLS constrains cannot lift its own restrictions. Full
@@ -551,6 +559,8 @@ impl Error {
             Self::AmbiguousNull { .. } => "42P18",  // indeterminate_datatype
             // Class 42501 — the role lacks the right, whether refused outright or by a row policy.
             Self::PermissionDenied(_) | Self::RlsCheckViolation { .. } => "42501",
+            // Class 44000 — with_check_option_violation: a write through a view broke its CHECK OPTION.
+            Self::ViewCheckOptionViolation { .. } => "44000",
             // undefined_function — a name the caller used that resolves to nothing callable, or a
             // call whose shape matches no form of a name that does exist. Overload resolution
             // cannot tell those apart and neither does the standard: both are `42883`.

@@ -116,6 +116,27 @@ impl Catalog for EngineCatalog<'_> {
         let _ = self.0.rollback(txn);
         out
     }
+
+    fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_view_definition(self.0, txn, name);
+        let _ = self.0.rollback(txn);
+        out
+    }
+
+    fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_view_columns(self.0, txn, name);
+        let _ = self.0.rollback(txn);
+        out
+    }
+
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::lookup_view_check_option(self.0, txn, name);
+        let _ = self.0.rollback(txn);
+        out
+    }
 }
 
 /// A `Catalog` that analyzes as a chosen user (superuser or not) for row-level-security tests,
@@ -877,6 +898,60 @@ fn create_and_drop_schema_end_to_end() {
         run(&engine, "DROP SCHEMA IF EXISTS app"),
         ExecutionResult::SchemaDropped
     ));
+}
+
+#[test]
+fn view_with_check_option_rejects_invisible_writes() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (id INT, v INT)");
+    run(
+        &engine,
+        "CREATE VIEW pos AS SELECT * FROM t WHERE v > 0 WITH CHECK OPTION",
+    );
+
+    // A row visible through the view inserts; one that is not is rejected with `44000`.
+    run(&engine, "INSERT INTO pos VALUES (1, 5)");
+    let err = run_try(&engine, "INSERT INTO pos VALUES (2, -1)")
+        .expect_err("an insert of a row not visible through the view must be refused");
+    assert_eq!(
+        err.sqlstate(),
+        "44000",
+        "wanted check-option violation; got `{err}`"
+    );
+
+    // UPDATE through the view that would move a row out of the view is rejected; one that keeps it
+    // visible succeeds.
+    let err = run_try(&engine, "UPDATE pos SET v = -3 WHERE id = 1")
+        .expect_err("an update that moves the row out of the view must be refused");
+    assert_eq!(err.sqlstate(), "44000");
+    run(&engine, "UPDATE pos SET v = 10 WHERE id = 1");
+
+    // Only the valid row is present — the rejected writes left no trace.
+    assert_eq!(
+        rows(run(&engine, "SELECT id, v FROM t ORDER BY id")),
+        vec![vec![Value::Int(1), Value::Int(10)]]
+    );
+
+    // A view WITHOUT the option accepts a row that is not visible through it (no check).
+    run(
+        &engine,
+        "CREATE VIEW nocheck AS SELECT * FROM t WHERE v > 0",
+    );
+    run(&engine, "INSERT INTO nocheck VALUES (9, -9)");
+    assert_eq!(
+        rows(run(&engine, "SELECT count(*) FROM t WHERE v < 0")),
+        vec![vec![Value::Int(1)]]
+    );
+
+    // `WITH LOCAL CHECK OPTION` / `WITH CASCADED CHECK OPTION` parse the same way.
+    run(
+        &engine,
+        "CREATE VIEW pos_local AS SELECT * FROM t WHERE v > 0 WITH LOCAL CHECK OPTION",
+    );
+    assert!(run_try(&engine, "INSERT INTO pos_local VALUES (3, -1)").is_err());
+
+    // The clause is only valid on CREATE VIEW.
+    assert!(run_try(&engine, "SELECT 1 WITH CHECK OPTION").is_err());
 }
 
 #[test]

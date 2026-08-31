@@ -4465,6 +4465,11 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::lookup_view_columns(self.engine, self.txn, name)
     }
 
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
+        // `WITH CHECK OPTION`, so a write through the view is checked against its `WHERE`.
+        nusadb_sql::lookup_view_check_option(self.engine, self.txn, name)
+    }
+
     fn lookup_function(
         &self,
         name: &str,

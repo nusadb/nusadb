@@ -65,9 +65,9 @@ pub use executor::{
     execute_in_txn_as_streaming_with_prepared, execute_in_txn_as_streaming_with_settings,
     execute_in_txn_as_with_settings, is_cursor_plan, is_prepare_plan, lookup_composite,
     lookup_composite_column, lookup_enum, lookup_enum_column, lookup_function_definition,
-    lookup_policies_for, lookup_view_columns, lookup_view_definition, maintenance_work_mem,
-    parse_work_mem, rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_work_mem,
-    show_session_variable, work_mem,
+    lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
+    maintenance_work_mem, parse_work_mem, rls_table_enabled, set_maintenance_work_mem,
+    set_spill_config, set_work_mem, show_session_variable, work_mem,
 };
 
 /// The bootstrap database superuser, which bypasses row-level security.

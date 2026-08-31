@@ -222,6 +222,11 @@ impl Catalog for RecordingCatalog<'_> {
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {
         self.inner.lookup_view_columns(name)
     }
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, Error> {
+        // Delegation is enough: any write through a view already went through `lookup_view`, which
+        // sets `saw_view` and makes the plan non-cacheable.
+        self.inner.lookup_view_check_option(name)
+    }
     fn lookup_composite(
         &self,
         name: &str,

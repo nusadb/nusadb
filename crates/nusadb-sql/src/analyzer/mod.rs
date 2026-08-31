@@ -145,6 +145,14 @@ pub trait Catalog {
         Ok(Vec::new())
     }
 
+    /// Whether the non-materialized view `name` was created `WITH CHECK OPTION`. Default `false`; the
+    /// production adapter reads the view check-option catalog. When set, a write through the
+    /// (auto-updatable) view is checked against the view's `WHERE`.
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, Error> {
+        let _ = name;
+        Ok(false)
+    }
+
     /// The definition of a SQL scalar function named `name`, or `None` if no such function exists.
     /// Default `None` so a minimal catalog has no functions; the production adapter reads
     /// the function catalog. The analyzer inlines the function body in place of a call to it.
@@ -1115,6 +1123,7 @@ fn analyze_create_materialized_view(
             if_not_exists: cv.if_not_exists,
             definition_sql: cv.definition_sql,
             columns: cv.columns,
+            check_option: cv.check_option,
         }));
     }
     let mut columns: Vec<(String, ColumnType)> = body

@@ -199,6 +199,11 @@ pub struct CreateView {
     /// The view body rendered back to canonical SQL, persisted so `REFRESH MATERIALIZED VIEW` can
     /// re-execute the definition. Captured from the original `SELECT` at parse time.
     pub definition_sql: String,
+    /// `WITH [LOCAL | CASCADED] CHECK OPTION` — a row written through this (auto-updatable) view must
+    /// remain visible through it (satisfy its `WHERE`), else the write is rejected. Since NusaDB's
+    /// updatable views are single-table with a real base, `LOCAL` and `CASCADED` coincide, so only the
+    /// presence of the option is tracked. Only meaningful on a plain, auto-updatable view.
+    pub check_option: bool,
 }
 
 /// `DROP VIEW [IF EXISTS] name`.

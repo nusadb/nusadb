@@ -59,6 +59,7 @@ pub(super) fn run_insert(
                 &plan.columns,
                 value_rows,
                 plan.rls_check.as_ref(),
+                plan.view_check.as_ref(),
                 matches!(other, Some(OnConflictPlan::DoNothing { .. })),
                 engine,
                 txn,
@@ -600,6 +601,7 @@ fn insert_select_streaming(
             &plan.columns,
             rows,
             plan.rls_check.as_ref(),
+            plan.view_check.as_ref(),
             false,
             engine,
             txn,
@@ -704,11 +706,17 @@ fn insert_value_rows(
 /// full-width rows. Shared by `INSERT` and `COPY FROM`: NOT-NULL coverage check, build the full
 /// table-width rows, enforce UNIQUE/FK over the whole batch (against existing + the new rows), then
 /// encode + insert each tuple and maintain secondary indexes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the batch context plus the two write-check predicates (RLS and view CHECK OPTION); each \
+              is a distinct concern"
+)]
 pub(super) fn insert_rows(
     table: &TableSchema,
     columns: &[usize],
     value_rows: Vec<Vec<Option<ast::Value>>>,
     rls_check: Option<&crate::planner::TypedExpr>,
+    view_check: Option<&crate::planner::ViewCheck>,
     conflict_do_nothing: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -718,6 +726,7 @@ pub(super) fn insert_rows(
         columns,
         value_rows,
         rls_check,
+        view_check,
         conflict_do_nothing,
         engine,
         txn,
@@ -798,6 +807,7 @@ fn insert_rows_with_unique(
     columns: &[usize],
     value_rows: Vec<Vec<Option<ast::Value>>>,
     rls_check: Option<&crate::planner::TypedExpr>,
+    view_check: Option<&crate::planner::ViewCheck>,
     conflict_do_nothing: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -875,6 +885,18 @@ fn insert_rows_with_unique(
             if !predicate_matches(Some(check), full)? {
                 return Err(Error::RlsCheckViolation {
                     table: table.name.clone(),
+                });
+            }
+        }
+    }
+    // WITH CHECK OPTION: a row inserted through a checked view must remain visible through it (satisfy
+    // the view's `WHERE`, resolved against base columns). Like the RLS check, this runs before any
+    // tuple is written, so a violation aborts the whole INSERT. `None` for a direct-table INSERT.
+    if let Some(check) = view_check {
+        for full in &full_rows {
+            if !predicate_matches(Some(&check.predicate), full)? {
+                return Err(Error::ViewCheckOptionViolation {
+                    view: check.view.clone(),
                 });
             }
         }
@@ -1334,11 +1356,12 @@ pub(super) fn run_copy_from(
      -> Result<(), Error> {
         let rows = std::mem::replace(batch, Vec::with_capacity(INSERT_SELECT_BATCH));
         // COPY runs only for a superuser on an RLS table (the wire layer refuses it otherwise), so
-        // there is no per-row WITH CHECK to apply here.
+        // there is no per-row WITH CHECK to apply here; nor does COPY target a view.
         inserted += insert_rows_with_unique(
             &table,
             &columns,
             rows,
+            None,
             None,
             false,
             engine,
@@ -3423,6 +3446,17 @@ pub(super) fn run_update(
             }
         }
     }
+    // WITH CHECK OPTION: each post-update row written through a checked view must remain visible
+    // through it (satisfy the view's `WHERE`). Checked before any write, like the RLS check.
+    if let Some(check) = plan.view_check.as_ref() {
+        for (_, _, new_row) in &to_update {
+            if !predicate_matches(Some(&check.predicate), new_row)? {
+                return Err(Error::ViewCheckOptionViolation {
+                    view: check.view.clone(),
+                });
+            }
+        }
+    }
     // FOREIGN KEY: each updated row must still reference an existing parent…
     let updated_rows: Vec<Row> = to_update.iter().map(|(_, _, new)| new.clone()).collect();
     if needs_unique {
@@ -4210,7 +4244,16 @@ pub(super) fn run_merge(
             .into_iter()
             .map(|r| r.into_iter().map(Some).collect())
             .collect();
-        insert_rows(&plan.table, &columns, value_rows, None, false, engine, txn)?;
+        insert_rows(
+            &plan.table,
+            &columns,
+            value_rows,
+            None,
+            None,
+            false,
+            engine,
+            txn,
+        )?;
     }
     Ok(ExecutionResult::Merged(count))
 }

@@ -150,6 +150,9 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         source,
         returning,
         rls_check,
+        // Set by `insert_through_view` when the target is a view WITH CHECK OPTION; a direct INSERT
+        // has no view check.
+        view_check: None,
         on_conflict,
     })
 }
@@ -722,6 +725,9 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         filter,
         returning,
         rls_check,
+        // Set by `update_through_view` when the target is a view WITH CHECK OPTION; a direct UPDATE
+        // has no view check.
+        view_check: None,
     })
 }
 
@@ -1032,6 +1038,9 @@ pub(super) struct UpdatableView {
     filter: Option<ast::Expr>,
     /// `(view output column, base column)` pairs, in projection order.
     col_map: Vec<(String, String)>,
+    /// Whether the view was created `WITH CHECK OPTION` — a row written through it must still satisfy
+    /// [`filter`](Self::filter), enforced by a `view_check` predicate on the rewritten INSERT/UPDATE.
+    check_option: bool,
 }
 
 /// If `name` (optionally schema-qualified) names a non-materialized view, decide whether it is
@@ -1140,6 +1149,7 @@ pub(super) fn resolve_updatable_view(
         base_table: base.name.clone(),
         filter: select.filter.clone(),
         col_map: out_names.into_iter().zip(base_cols).collect(),
+        check_option: catalog.lookup_view_check_option(&key)?,
     }))
 }
 
@@ -1192,10 +1202,26 @@ fn insert_through_view(
         }
         mapped
     };
+    let check_option = view.check_option;
+    let view_filter = view.filter.clone();
+    let view_name = ins.table.clone();
     ins.schema = view.base_schema;
     ins.table = view.base_table;
     ins.columns = base_columns;
-    analyze_insert(ins, catalog)
+    let mut plan = analyze_insert(ins, catalog)?;
+    // WITH CHECK OPTION: every row inserted through the view must satisfy the view's `WHERE` (in base
+    // columns), enforced against the fully-defaulted row at execution.
+    if check_option {
+        let scope = super::single_table_scope(&plan.table);
+        plan.view_check =
+            super::analyze_predicate(view_filter, &scope, catalog)?.map(|predicate| {
+                crate::planner::ViewCheck {
+                    predicate,
+                    view: view_name,
+                }
+            });
+    }
+    Ok(plan)
 }
 
 /// A view usable as an UPDATE/DELETE target must expose *every* base column under its own name (no
@@ -1244,10 +1270,25 @@ fn update_through_view(
         ));
     }
     require_full_identity_view(&view, view_name, catalog)?;
+    let check_option = view.check_option;
+    let view_filter = view.filter.clone();
     upd.filter = and_filters(upd.filter.take(), view.filter);
     upd.schema = view.base_schema;
     upd.table = view.base_table;
-    analyze_update(upd, catalog)
+    let mut plan = analyze_update(upd, catalog)?;
+    // WITH CHECK OPTION: each post-update row must still be visible through the view (satisfy its
+    // `WHERE`), enforced against the post-update row at execution.
+    if check_option {
+        let scope = super::single_table_scope(&plan.table);
+        plan.view_check =
+            super::analyze_predicate(view_filter, &scope, catalog)?.map(|predicate| {
+                crate::planner::ViewCheck {
+                    predicate,
+                    view: view_name.to_owned(),
+                }
+            });
+    }
+    Ok(plan)
 }
 
 /// DELETE through an auto-updatable view: retarget the base table and AND the view's filter into the

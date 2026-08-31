@@ -1015,6 +1015,8 @@ pub struct CreatePlainViewPlan {
     /// Explicit output column names from `CREATE VIEW name (cols) AS ...`, or empty to use the
     /// body's inferred projection names. Applied positionally when the view is inlined on read.
     pub columns: Vec<String>,
+    /// `WITH CHECK OPTION` — persisted so a write through this view is checked against its `WHERE`.
+    pub check_option: bool,
 }
 
 /// A resolved `PRIMARY KEY` / `UNIQUE` constraint to declare at `CREATE TABLE`.
@@ -1234,6 +1236,10 @@ pub struct InsertPlan {
     /// against the table's columns. `None` for a superuser or an RLS-free table; `FALSE` (default
     /// deny) when RLS is on but no `INSERT`/`ALL` policy grants the write.
     pub rls_check: Option<TypedExpr>,
+    /// `WITH CHECK OPTION` predicate — the view's `WHERE`, resolved against the base table's columns —
+    /// that every row inserted *through a checked view* must satisfy, else the write is rejected
+    /// (`44000`). `None` for a direct-table INSERT or a view without the option.
+    pub view_check: Option<ViewCheck>,
     /// The `ON CONFLICT` clause, or `None` for a plain `INSERT`. `DoNothing` skips a row
     /// that would violate a `PRIMARY KEY`/`UNIQUE` constraint; `DoUpdate` updates the existing
     /// conflicting row instead (upsert).
@@ -1533,6 +1539,20 @@ pub struct UpdatePlan {
     /// resolved against the table's columns. `None` for a superuser or an RLS-free table; the
     /// `USING` side (which rows are updatable) is folded into [`filter`](Self::filter) instead.
     pub rls_check: Option<TypedExpr>,
+    /// `WITH CHECK OPTION` predicate — the view's `WHERE`, resolved against the base table's columns —
+    /// each **post-update** row written *through a checked view* must satisfy, else the update is
+    /// rejected (`44000`). `None` for a direct-table UPDATE or a view without the option.
+    pub view_check: Option<ViewCheck>,
+}
+
+/// A view's `WITH CHECK OPTION` enforcement: the predicate a row written through the view must
+/// satisfy, plus the view's name for the error message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewCheck {
+    /// The view's `WHERE`, resolved against the base table's columns.
+    pub predicate: TypedExpr,
+    /// The view name, for the `44000` error.
+    pub view: String,
 }
 
 /// One `SET column = value` assignment of an [`UpdatePlan`].

@@ -3180,6 +3180,12 @@ const VIEW_CATALOG: &str = "nusadb_views";
 /// tab-separated column names. Same `(name, def)` shape as [`VIEW_CATALOG`].
 const VIEW_COLUMNS_CATALOG: &str = "nusadb_view_columns";
 
+/// Engine-scoped system catalog of non-materialized views created `WITH CHECK OPTION`, keyed by view
+/// name. Presence of a row means the option is on; `def` records the mode text (`cascaded`) for
+/// forward-compat. Same `(name, def)` shape as [`VIEW_CATALOG`]. A view without the option has no row
+/// here, so older catalogs (predating the option) read as "off" with no migration.
+const VIEW_CHECK_CATALOG: &str = "nusadb_view_check_options";
+
 /// `(name, def)` text schema of the view catalog tables.
 const VIEW_CATALOG_SCHEMA: [ColumnType; 2] = [ColumnType::Text, ColumnType::Text];
 
@@ -3397,6 +3403,19 @@ pub fn lookup_view_columns(
             joined.split(VIEW_COLUMN_SEP).map(str::to_owned).collect()
         }),
     )
+}
+
+/// Whether the non-materialized view `name` was created `WITH CHECK OPTION` — a row in the
+/// check-option catalog means it was.
+///
+/// # Errors
+/// Propagates storage/decode errors.
+pub fn lookup_view_check_option(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<bool, Error> {
+    Ok(load_view_def(engine, txn, VIEW_CHECK_CATALOG, name)?.is_some())
 }
 
 /// Engine-scoped system catalog of `USING hnsw` vector-index declarations. Same `(name, def)`
@@ -3957,6 +3976,10 @@ impl crate::Catalog for ExecCatalog<'_> {
         lookup_view_columns(self.engine, self.txn, name)
     }
 
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, Error> {
+        lookup_view_check_option(self.engine, self.txn, name)
+    }
+
     fn lookup_function(&self, name: &str) -> Result<Option<crate::FunctionDef>, Error> {
         function::lookup_function_definition(self.engine, self.txn, name)
     }
@@ -4123,6 +4146,10 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {
         lookup_view_columns(self.engine, self.txn, name)
+    }
+
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, Error> {
+        lookup_view_check_option(self.engine, self.txn, name)
     }
 
     fn lookup_function(&self, name: &str) -> Result<Option<crate::FunctionDef>, Error> {
@@ -4492,6 +4519,13 @@ fn run_create_view(
         let joined = p.columns.join(&VIEW_COLUMN_SEP.to_string());
         store_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name, &joined)?;
     }
+    // Record (or, under OR REPLACE, clear) the `WITH CHECK OPTION` flag — always clear the prior
+    // entry first so replacing a checked view with an unchecked one drops the stale flag.
+    if p.check_option {
+        store_view_def(engine, txn, VIEW_CHECK_CATALOG, &p.name, "cascaded")?;
+    } else {
+        delete_view_def(engine, txn, VIEW_CHECK_CATALOG, &p.name)?;
+    }
     Ok(ExecutionResult::ViewCreated)
 }
 
@@ -4560,6 +4594,8 @@ fn run_drop_view(
     let removed = delete_view_def(engine, txn, VIEW_CATALOG, &p.name)?;
     // Forget any explicit column-name list (no-op if the view declared none).
     delete_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name)?;
+    // Forget any `WITH CHECK OPTION` flag (no-op if the view had none).
+    delete_view_def(engine, txn, VIEW_CHECK_CATALOG, &p.name)?;
     if !removed && !p.if_exists {
         return Err(Error::TableNotFound {
             name: p.name.clone(),

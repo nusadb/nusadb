@@ -1014,6 +1014,9 @@ pub(super) fn convert_create_view(
         columns: convert_view_columns(columns)?,
         query: Box::new(convert_select(query)?),
         definition_sql,
+        // Set by `parse` when a trailing `WITH CHECK OPTION` was stripped before sqlparser ran
+        // (sqlparser has no grammar for it); the default here is "no check option".
+        check_option: false,
     })
 }
 
