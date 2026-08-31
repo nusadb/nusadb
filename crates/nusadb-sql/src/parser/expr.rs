@@ -6,6 +6,20 @@
 
 use super::*;
 
+/// If `low` is the pre-parse `SYMMETRIC` marker `<SYMMETRIC_BETWEEN_MARKER>(inner)` (injected because
+/// sqlparser cannot parse `BETWEEN SYMMETRIC`), return `(true, inner)`; otherwise `(false, low)`.
+fn strip_symmetric_marker(low: sql::Expr) -> (bool, sql::Expr) {
+    if let sql::Expr::Function(func) = &low
+        && let [sql::ObjectNamePart::Identifier(name)] = func.name.0.as_slice()
+        && name.value == SYMMETRIC_BETWEEN_MARKER
+        && let sql::FunctionArguments::List(list) = &func.args
+        && let [sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(inner))] = list.args.as_slice()
+    {
+        return (true, inner.clone());
+    }
+    (false, low)
+}
+
 thread_local! {
     /// The `WINDOW w AS (...)` definitions of the SELECT currently being converted, so an
     /// `OVER w` reference resolves to the right spec. Saved/restored per SELECT so a
@@ -387,12 +401,19 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
             negated,
             low,
             high,
-        } => Ok(ast::Expr::Between {
-            expr: Box::new(convert_expr(*expr)?),
-            low: Box::new(convert_expr(*low)?),
-            high: Box::new(convert_expr(*high)?),
-            negated,
-        }),
+        } => {
+            // `BETWEEN SYMMETRIC` reaches here with its lower bound wrapped in the pre-parse marker
+            // `<SYMMETRIC_BETWEEN_MARKER>(low)` (sqlparser has no grammar for `SYMMETRIC`); unwrap it
+            // and flag the node symmetric.
+            let (symmetric, low) = strip_symmetric_marker(*low);
+            Ok(ast::Expr::Between {
+                expr: Box::new(convert_expr(*expr)?),
+                low: Box::new(convert_expr(low)?),
+                high: Box::new(convert_expr(*high)?),
+                negated,
+                symmetric,
+            })
+        },
         sql::Expr::Like {
             negated,
             any,

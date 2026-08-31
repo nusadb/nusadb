@@ -1,0 +1,43 @@
+# BETWEEN SYMMETRIC: the bounds may be given in either order — `x BETWEEN SYMMETRIC a AND b` tests
+# `LEAST(a,b) <= x <= GREATEST(a,b)`. A plain (ASYMMETRIC) BETWEEN keeps the low..high order, so a
+# reversed pair matches nothing. (Booleans render as 1/0 here.)
+
+query III
+SELECT (5 BETWEEN SYMMETRIC 1 AND 10)::int,
+       (5 BETWEEN SYMMETRIC 10 AND 1)::int,
+       (5 BETWEEN 10 AND 1)::int
+----
+1  1  0
+
+query III
+SELECT (15 BETWEEN SYMMETRIC 10 AND 1)::int,
+       (5 NOT BETWEEN SYMMETRIC 10 AND 1)::int,
+       (3 BETWEEN ASYMMETRIC 1 AND 5)::int
+----
+0  0  1
+
+# Expression bounds are delimited at the BETWEEN's own AND, respecting precedence.
+query II
+SELECT (5 BETWEEN SYMMETRIC 2 + 8 AND 1)::int, (7 BETWEEN SYMMETRIC 10 AND 2 * 2)::int
+----
+1  1
+
+# Column operands, reversed and normal bounds, in a WHERE.
+statement ok
+CREATE TABLE t (x INT, lo INT, hi INT)
+
+statement ok
+INSERT INTO t VALUES (5, 10, 1), (5, 1, 10), (15, 1, 10), (3, 5, 2)
+
+query III
+SELECT x, lo, hi FROM t WHERE x BETWEEN SYMMETRIC lo AND hi ORDER BY x, lo
+----
+3  5  2
+5  1  10
+5  10  1
+
+# NULL bound → NULL (unknown), so the row is excluded from a WHERE.
+query I
+SELECT count(*) FROM (SELECT 5 AS x) s WHERE x BETWEEN SYMMETRIC NULL AND 10
+----
+0

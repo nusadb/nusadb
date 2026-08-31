@@ -306,6 +306,8 @@ pub(crate) fn selectivity(pred: &TypedExpr, ctx: &ScanStats) -> f64 {
             low,
             high,
             negated,
+            // Symmetry does not change the estimated selectivity of a range test.
+            symmetric: _,
         } => between_selectivity(expr, low, high, *negated, ctx),
         _ => DEFAULT_SELECTIVITY,
     }

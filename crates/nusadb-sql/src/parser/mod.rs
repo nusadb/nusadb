@@ -712,6 +712,10 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `ORDER BY <key> USING <op>`: sqlparser has no operator field on its sort key (only ASC/DESC),
     // so rewrite `USING <` / `USING >` to the equivalent `ASC` / `DESC` keyword before parsing.
     rewrite_order_by_using(&mut tokens);
+    // `<expr> BETWEEN [NOT] {SYMMETRIC|ASYMMETRIC} <low> AND <high>`: sqlparser has no grammar for the
+    // symmetry keyword. Wrap the lower bound in a marker function so the node parses, and flag it in
+    // conversion; `ASYMMETRIC` (the default) is simply dropped.
+    rewrite_between_symmetric(&mut tokens)?;
     // `CREATE VIEW ... WITH [LOCAL|CASCADED] CHECK OPTION`: sqlparser (0.62) has no grammar for the
     // trailing check-option clause, so strip it here and remember it — the flag is re-attached to the
     // parsed `CreateView` below (a statement-level property, applied after conversion).
@@ -891,6 +895,93 @@ fn rewrite_order_by_using(tokens: &mut Vec<TokenWithSpan>) {
         }
         i += 1;
     }
+}
+
+/// The marker function the [`rewrite_between_symmetric`] pre-parse wraps a `BETWEEN SYMMETRIC` lower
+/// bound in, recognized during conversion (see `parser::expr`). The double-underscore prefix keeps it
+/// out of the real function namespace.
+pub(super) const SYMMETRIC_BETWEEN_MARKER: &str = "__nusadb_between_symmetric__";
+
+/// Rewrite `BETWEEN [NOT] {SYMMETRIC|ASYMMETRIC} <low> AND <high>` (which sqlparser cannot parse) so
+/// it parses as an ordinary `BETWEEN`. `ASYMMETRIC` (the default order-sensitive form) is just
+/// dropped; `SYMMETRIC` wraps the lower bound `<low>` in the marker call
+/// `<SYMMETRIC_BETWEEN_MARKER>(<low>)` — the conversion unwraps it and flags the node symmetric. The
+/// lower bound ends at the `BETWEEN`'s own `AND`, found by skipping any `AND` that belongs to a nested
+/// `BETWEEN` (a boolean `AND`/`OR` cannot appear there — it binds looser than a `BETWEEN` operand, so
+/// sqlparser would end the bound before it).
+fn rewrite_between_symmetric(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
+    use sqlparser::keywords::Keyword;
+    if !tokens
+        .iter()
+        .any(|t| word_ci(Some(t), "symmetric") || word_ci(Some(t), "asymmetric"))
+    {
+        return Ok(());
+    }
+    let is_kw = |t: Option<&TokenWithSpan>, kw: Keyword| matches!(t, Some(t) if matches!(&t.token, Token::Word(w) if w.keyword == kw));
+    let next_meaningful = |toks: &[TokenWithSpan], from: usize| {
+        (from + 1..toks.len())
+            .find(|&j| !matches!(toks.get(j).map(|t| &t.token), Some(Token::Whitespace(_))))
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if !is_kw(tokens.get(i), Keyword::BETWEEN) {
+            i += 1;
+            continue;
+        }
+        let Some(j) = next_meaningful(tokens, i) else {
+            break;
+        };
+        if word_ci(tokens.get(j), "asymmetric") {
+            tokens.remove(j);
+            i += 1;
+            continue;
+        }
+        if !word_ci(tokens.get(j), "symmetric") {
+            i += 1;
+            continue;
+        }
+        // `BETWEEN SYMMETRIC` at (i, j). Find the `AND` that ends the lower bound.
+        let and_pos = between_symmetric_delimiter(tokens, j)?;
+        // Insert the closing `)` before that `AND` first (higher index), so `j` stays valid; then
+        // turn `SYMMETRIC` into the marker word and open its paren.
+        tokens.insert(and_pos, TokenWithSpan::wrap(Token::RParen));
+        if let Some(slot) = tokens.get_mut(j) {
+            *slot = TokenWithSpan::wrap(Token::make_word(SYMMETRIC_BETWEEN_MARKER, None));
+        }
+        tokens.insert(j + 1, TokenWithSpan::wrap(Token::LParen));
+        i = j + 2;
+    }
+    Ok(())
+}
+
+/// From the `SYMMETRIC` token at `sym`, return the token index of the `AND` that closes the
+/// `BETWEEN`'s lower bound: the first depth-0 `AND` not consumed by a nested `BETWEEN`.
+fn between_symmetric_delimiter(tokens: &[TokenWithSpan], sym: usize) -> Result<usize, Error> {
+    use sqlparser::keywords::Keyword;
+    let mut depth = 0i32;
+    let mut nested = 0usize;
+    for (k, tok) in tokens.iter().enumerate().skip(sym + 1) {
+        match &tok.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            },
+            Token::Word(w) if depth == 0 && w.keyword == Keyword::BETWEEN => nested += 1,
+            Token::Word(w) if depth == 0 && w.keyword == Keyword::AND => {
+                if nested == 0 {
+                    return Ok(k);
+                }
+                nested -= 1;
+            },
+            _ => {},
+        }
+    }
+    Err(Error::Syntax(
+        "BETWEEN SYMMETRIC without a matching AND for its bounds".to_owned(),
+    ))
 }
 
 /// Remove the CTE materialization hint (`MATERIALIZED` / `NOT MATERIALIZED`) that appears between a

@@ -203,11 +203,13 @@ fn fold_children(kind: TypedExprKind) -> TypedExprKind {
             low,
             high,
             negated,
+            symmetric,
         } => K::Between {
             expr: fold_box(expr),
             low: fold_box(low),
             high: fold_box(high),
             negated,
+            symmetric,
         },
         K::Overlaps { s1, e1, s2, e2 } => K::Overlaps {
             s1: fold_box(s1),

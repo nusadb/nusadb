@@ -473,6 +473,11 @@ fn slt_p3_where_orderby_limit() {
 }
 
 #[test]
+fn slt_p3_between_symmetric() {
+    run_slt("tests/slt/p3_filter/between_symmetric.slt");
+}
+
+#[test]
 fn slt_p3_null_handling() {
     run_slt("tests/slt/p3_filter/null_handling.slt");
 }

@@ -1827,6 +1827,9 @@ pub enum TypedExprKind {
         high: Box<TypedExpr>,
         /// `true` for `NOT BETWEEN`.
         negated: bool,
+        /// `true` for `BETWEEN SYMMETRIC` — the bounds are order-insensitive, tested as
+        /// `LEAST(low, high) <= expr <= GREATEST(low, high)`.
+        symmetric: bool,
     },
     /// `(s1, e1) OVERLAPS (s2, e2)` — two-period overlap test. Each end is either a temporal
     /// value of the start's type or an `INTERVAL` (real end = `start + interval`). Result is a

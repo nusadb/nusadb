@@ -218,7 +218,10 @@ pub(super) fn analyze_expr_agg(
             low,
             high,
             negated,
-        } => analyze_between(expr, low, high, *negated, scope, catalog, aggregates),
+            symmetric,
+        } => analyze_between(
+            expr, low, high, *negated, *symmetric, scope, catalog, aggregates,
+        ),
         ast::Expr::Overlaps { s1, e1, s2, e2 } => {
             analyze_overlaps(s1, e1, s2, e2, scope, catalog, aggregates)
         },
@@ -4362,11 +4365,16 @@ pub(super) fn analyze_in_list(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors analyze_expr_agg's threaded context"
+)]
 pub(super) fn analyze_between(
     expr: &ast::Expr,
     low: &ast::Expr,
     high: &ast::Expr,
     negated: bool,
+    symmetric: bool,
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
     mut aggregates: Option<&mut Vec<AggregateCall>>,
@@ -4402,6 +4410,7 @@ pub(super) fn analyze_between(
             low: Box::new(low_typed),
             high: Box::new(high_typed),
             negated,
+            symmetric,
         },
         ty: ColumnType::Bool,
     })

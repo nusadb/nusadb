@@ -106,6 +106,9 @@ pub enum Expr {
         high: Box<Self>,
         /// `true` for `NOT BETWEEN`, `false` for `BETWEEN`.
         negated: bool,
+        /// `true` for `BETWEEN SYMMETRIC` — the bounds may be given in either order, so the test is
+        /// `LEAST(low, high) <= expr <= GREATEST(low, high)`. `false` for a plain (asymmetric) BETWEEN.
+        symmetric: bool,
     },
     /// `(s1, e1) OVERLAPS (s2, e2)` — do two time periods overlap? Each side is a two-element
     /// row: a start endpoint and an end endpoint. The end may be a temporal value of the same

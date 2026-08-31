@@ -728,6 +728,10 @@ pub(super) fn try_index_scan(
                 low,
                 high,
                 negated: false,
+                // A `SYMMETRIC` BETWEEN's bounds may be reversed (`low > high`), so it is not a
+                // contiguous `[low, high]` range — leave it in the retained filter, evaluated
+                // correctly by `eval_between`, rather than pushing a wrong index range.
+                symmetric: false,
             } = &conjunct.kind
                 && let TypedExprKind::Column(ord) = expr.kind
                 && ord == col

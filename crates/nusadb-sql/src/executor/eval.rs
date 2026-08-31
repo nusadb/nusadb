@@ -270,7 +270,8 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
             low,
             high,
             negated,
-        } => eval_between(inner, low, high, *negated, row),
+            symmetric,
+        } => eval_between(inner, low, high, *negated, *symmetric, row),
         TypedExprKind::Overlaps { s1, e1, s2, e2 } => eval_overlaps(s1, e1, s2, e2, row),
         TypedExprKind::Like {
             expr: inner,
@@ -5493,6 +5494,7 @@ fn eval_between(
     low: &TypedExpr,
     high: &TypedExpr,
     negated: bool,
+    symmetric: bool,
     row: &Row,
 ) -> Result<ast::Value, Error> {
     let v = eval(expr, row)?;
@@ -5504,6 +5506,13 @@ fn eval_between(
     {
         return Ok(ast::Value::Null);
     }
+    // `SYMMETRIC` makes the bounds order-insensitive: test against `[LEAST(l,h), GREATEST(l,h)]`.
+    // Each bound is still evaluated exactly once (above), so a volatile bound is not re-run.
+    let (l, h) = if symmetric && matches!(compare(&l, &h), Ordering::Greater) {
+        (h, l)
+    } else {
+        (l, h)
+    };
     let in_range =
         !matches!(compare(&v, &l), Ordering::Less) && !matches!(compare(&v, &h), Ordering::Greater);
     Ok(ast::Value::Bool(in_range ^ negated))

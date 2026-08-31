@@ -1658,6 +1658,41 @@ fn recursive_cte_cycle_clause_parses_and_guards() {
 }
 
 #[test]
+fn between_symmetric_sets_the_flag_and_delimits_bounds() {
+    // The single projected expression of `SELECT <e>` — reach through the projection to the Between.
+    let between = |sql: &str| -> (bool, bool) {
+        let ast::Statement::Select(s) = ok(sql) else {
+            panic!("expected Select");
+        };
+        let ast::SelectItem::Expr { expr, .. } = &s.projection[0] else {
+            panic!("expected an expression projection");
+        };
+        match expr {
+            ast::Expr::Between {
+                negated, symmetric, ..
+            } => (*symmetric, *negated),
+            other => panic!("expected Between, got {other:?}"),
+        }
+    };
+    // SYMMETRIC sets the flag; ASYMMETRIC (the default) and a plain BETWEEN do not; NOT is carried.
+    assert_eq!(between("SELECT x BETWEEN SYMMETRIC 1 AND 5"), (true, false));
+    assert_eq!(
+        between("SELECT x NOT BETWEEN SYMMETRIC 1 AND 5"),
+        (true, true)
+    );
+    assert_eq!(
+        between("SELECT x BETWEEN ASYMMETRIC 1 AND 5"),
+        (false, false)
+    );
+    assert_eq!(between("SELECT x BETWEEN 1 AND 5"), (false, false));
+
+    // The lower bound is delimited at the BETWEEN's own AND even with an expression bound, and a
+    // parenthesized bound (with an internal AND) does not confuse the delimiter.
+    ok("SELECT x BETWEEN SYMMETRIC 2 + 8 AND 1");
+    ok("SELECT x BETWEEN SYMMETRIC (a AND b) AND c");
+}
+
+#[test]
 fn with_multi_cte_chain() {
     let ast::Statement::Select(s) =
         ok("WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT x FROM a")
