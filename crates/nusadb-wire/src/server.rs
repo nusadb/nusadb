@@ -1618,17 +1618,24 @@ where
         let txn = engine
             .begin(IsolationLevel::default())
             .map_err(|e| e.to_string())?;
-        if let Some(msg) = copy_access_verdict(
-            engine.as_ref(),
-            txn,
-            &copy,
-            &actor,
-            nusadb_sql::ast::CopyDirection::To,
-        ) {
+        // The table form's SELECT-privilege check is raised here because table COPY never reaches the
+        // analyzer. The query form (`COPY (<query>) TO STDOUT`) DOES go through analysis — which
+        // enforces per-table privileges and row-level security as the COPY user — so the flat
+        // table-level check is neither applicable nor sufficient there and is skipped.
+        if copy.query.is_none()
+            && let Some(msg) = copy_access_verdict(
+                engine.as_ref(),
+                txn,
+                &copy,
+                &actor,
+                nusadb_sql::ast::CopyDirection::To,
+            )
+        {
             let _ = engine.rollback(txn);
             return Err(msg);
         }
-        let out = nusadb_sql::copy_to_in(engine.as_ref(), &copy, txn).map_err(|e| e.to_string());
+        let out =
+            nusadb_sql::copy_to_in(engine.as_ref(), &copy, &actor, txn).map_err(|e| e.to_string());
         let _ = engine.rollback(txn); // read-only: nothing to commit
         out
     })

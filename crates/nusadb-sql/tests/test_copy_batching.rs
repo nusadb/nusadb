@@ -69,7 +69,7 @@ fn copy_out(engine: &dyn StorageEngine, sql: &str) -> String {
     let Statement::Copy(copy) = parse(sql).unwrap() else {
         panic!("not a COPY statement: {sql}");
     };
-    copy_to(engine, &copy).unwrap().1
+    copy_to(engine, &copy, "nusadb-root").unwrap().1
 }
 
 /// Count the live entries in a secondary index by scanning it directly through the engine — used to
@@ -125,6 +125,39 @@ fn copy_inserts_every_row_across_the_batch_boundary() {
         vec![vec![Value::Int(3000)]],
         "the row at the second batch boundary is correct"
     );
+}
+
+#[test]
+fn copy_query_to_stdout_exports_the_result() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE t (id INT, v TEXT)");
+    exec(
+        engine,
+        &mut session,
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
+
+    // A filtered, ordered projection exports exactly the query's rows in the text format.
+    assert_eq!(
+        copy_out(
+            engine,
+            "COPY (SELECT id, v FROM t WHERE id > 1 ORDER BY id) TO STDOUT"
+        ),
+        "2\tb\n3\tc\n"
+    );
+
+    // CSV + HEADER over an aggregate: a header line of the projection names, then the row.
+    assert_eq!(
+        copy_out(
+            engine,
+            "COPY (SELECT count(*) AS n, max(v) AS mx FROM t) TO STDOUT WITH (FORMAT csv, HEADER)"
+        ),
+        "n,mx\n3,c\n"
+    );
+
+    // The query form is only valid `TO STDOUT`.
+    assert!(parse("COPY (SELECT 1) FROM STDIN").is_err());
 }
 
 #[test]

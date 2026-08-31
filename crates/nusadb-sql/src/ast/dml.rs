@@ -54,17 +54,22 @@ pub enum InsertSource {
 
 /// A `COPY ... FROM STDIN` / `COPY ... TO STDOUT` statement in the text format.
 ///
-/// Only the streaming STDIN/STDOUT forms are modeled; a file/program target or a query source is
-/// rejected at the parser. The data itself rides the wire's COPY sub-protocol, so the AST carries
-/// only the shape and the text-format options.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Only the streaming STDIN/STDOUT forms are modeled; a file/program target is rejected at the
+/// parser. The data itself rides the wire's COPY sub-protocol, so the AST carries only the shape and
+/// the text-format options. `COPY (<query>) TO STDOUT` carries the query in [`query`](Self::query)
+/// instead of a table.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Copy {
-    /// Schema qualifier on the table, when the statement carried one.
+    /// Schema qualifier on the table, when the statement carried one. Empty for the query form.
     pub schema: Option<String>,
-    /// Target (FROM) or source (TO) table.
+    /// Target (FROM) or source (TO) table. Empty when [`query`](Self::query) is set.
     pub table: String,
-    /// Explicit column list; empty means "all columns, in declaration order".
+    /// Explicit column list; empty means "all columns, in declaration order". Empty for the query
+    /// form (the query's projection defines the columns).
     pub columns: Vec<String>,
+    /// `COPY (<query>) TO STDOUT` — the query whose result is exported, in place of a table. Only
+    /// valid with `TO STDOUT`. `None` for the plain table form.
+    pub query: Option<Box<Select>>,
     /// Stream direction: `From` = `FROM STDIN` (bulk load), `To` = `TO STDOUT` (bulk export).
     pub direction: CopyDirection,
     /// Text-format options (delimiter, NULL marker, header).

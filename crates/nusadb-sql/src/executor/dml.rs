@@ -1506,13 +1506,10 @@ pub(super) fn run_copy_from(
 /// line of column names is emitted when `WITH (HEADER)` is set.
 pub(super) fn run_copy_to(
     copy: &ast::Copy,
+    user: &str,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(usize, String), Error> {
-    let table = lookup_copy_table(copy, engine, txn)?;
-    let columns = resolve_copy_columns(copy, &table)?;
-    let rows = scan_rows(&table, engine, txn)?;
-
     // Render one row of fields in the requested format (text or CSV).
     let format_row = |fields: &[Option<&str>]| -> String {
         match copy.format.kind {
@@ -1528,6 +1525,17 @@ pub(super) fn run_copy_to(
             ),
         }
     };
+
+    // `COPY (<query>) TO STDOUT`: analyze + plan + run the query as the COPY user (so it is checked
+    // for privileges and row-level security exactly like a direct SELECT), then render its result.
+    if let Some(query) = &copy.query {
+        return run_copy_query_to(query, user, &format_row, copy.format.header, engine, txn);
+    }
+
+    let table = lookup_copy_table(copy, engine, txn)?;
+    let columns = resolve_copy_columns(copy, &table)?;
+    let rows = scan_rows(&table, engine, txn)?;
+
     let mut out = String::new();
     if copy.format.header {
         let names: Vec<Option<&str>> = columns
@@ -1543,6 +1551,55 @@ pub(super) fn run_copy_to(
             .map(|&i| match row.get(i) {
                 Some(ast::Value::Null) | None => None,
                 Some(value) => Some(crate::display::value_text(value)),
+            })
+            .collect();
+        let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
+        out.push_str(&format_row(&refs));
+        out.push('\n');
+    }
+    Ok((rows.len(), out))
+}
+
+/// `COPY (<query>) TO STDOUT`: analyze + plan + execute `query` as `user` under `txn`, then render its
+/// rows (all projected columns, in order) with `format_row`, prefixed by a header line of column names
+/// when `header` is set.
+fn run_copy_query_to(
+    query: &ast::Select,
+    user: &str,
+    format_row: &dyn Fn(&[Option<&str>]) -> String,
+    header: bool,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(usize, String), Error> {
+    let catalog = super::SessionCatalog {
+        engine,
+        txn,
+        user,
+        // Unqualified names resolve in the default namespace; a query needing another schema must
+        // qualify it (the COPY entry points carry no session search path).
+        search_path: crate::search_path_schemas(None),
+    };
+    let logical = crate::analyze(ast::Statement::Select(query.clone()), &catalog)?;
+    let physical = crate::plan(logical);
+    let ExecutionResult::Rows { columns, rows, .. } = super::execute_in_txn(physical, engine, txn)?
+    else {
+        return Err(Error::Internal(
+            "COPY (query) TO STDOUT: the query did not produce a row set".to_owned(),
+        ));
+    };
+
+    let mut out = String::new();
+    if header {
+        let names: Vec<Option<&str>> = columns.iter().map(|c| Some(c.as_str())).collect();
+        out.push_str(&format_row(&names));
+        out.push('\n');
+    }
+    for row in &rows {
+        let fields: Vec<Option<String>> = row
+            .iter()
+            .map(|value| match value {
+                ast::Value::Null => None,
+                value => Some(crate::display::value_text(value)),
             })
             .collect();
         let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();

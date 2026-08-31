@@ -450,9 +450,10 @@ pub fn copy_from_in(
 pub fn copy_to_in(
     engine: &dyn StorageEngine,
     copy: &ast::Copy,
+    user: &str,
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, String), Error> {
-    run_copy_to(copy, engine, txn)
+    run_copy_to(copy, user, engine, txn)
 }
 
 /// Execute `COPY <table> FROM STDIN`: bulk-load the text-format `data` into the table in a
@@ -490,9 +491,13 @@ pub fn copy_from(engine: &dyn StorageEngine, copy: &ast::Copy, data: &str) -> Re
 ///
 /// # Errors
 /// Propagates lookup and rendering errors; the transaction is rolled back on any failure.
-pub fn copy_to(engine: &dyn StorageEngine, copy: &ast::Copy) -> Result<(usize, String), Error> {
+pub fn copy_to(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    user: &str,
+) -> Result<(usize, String), Error> {
     let txn = engine.begin(IsolationLevel::default())?;
-    match run_copy_to(copy, engine, txn) {
+    match run_copy_to(copy, user, engine, txn) {
         // A failed commit must roll back rather than leak the transaction,
         // mirroring `copy_from` above — even though a read-only COPY TO commits with an empty undo
         // set and so rarely reaches a failing durability point.

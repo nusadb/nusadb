@@ -3242,6 +3242,13 @@ fn parse_copy_stmt(sql: &str) -> Result<ast::Statement, Error> {
     let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
 
     parser.expect_keyword(Keyword::COPY).map_err(syntax)?;
+
+    // `COPY (<query>) TO STDOUT`: a parenthesized query source in place of a table. Detected by the
+    // leading `(` (a table name never starts with one).
+    if parser.peek_token().token == Token::LParen {
+        return parse_copy_query_to(&mut parser, syntax);
+    }
+
     let (schema, table) = table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
 
     let columns = if parser.consume_token(&Token::LParen) {
@@ -3297,7 +3304,48 @@ fn parse_copy_stmt(sql: &str) -> Result<ast::Statement, Error> {
         schema,
         table,
         columns,
+        query: None,
         direction,
+        format,
+    }))
+}
+
+/// Parse `COPY (<query>) TO STDOUT [WITH (opts)]` — the `(` has been peeked but not consumed. Only the
+/// `TO STDOUT` direction is valid for a query source.
+fn parse_copy_query_to(
+    parser: &mut Parser,
+    syntax: impl Fn(sqlparser::parser::ParserError) -> Error,
+) -> Result<ast::Statement, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::Token;
+
+    parser.expect_token(&Token::LParen).map_err(&syntax)?;
+    let query = parser.parse_query().map_err(&syntax)?;
+    parser.expect_token(&Token::RParen).map_err(&syntax)?;
+
+    if !parser.parse_keyword(Keyword::TO) {
+        return unsupported("COPY (query) supports only TO STDOUT");
+    }
+    match parser.next_token().token {
+        Token::Word(w) if w.value.eq_ignore_ascii_case("STDOUT") => {},
+        _ => return unsupported("COPY (query) supports only TO STDOUT"),
+    }
+
+    let format = parse_copy_options(parser)?;
+    loop {
+        match parser.next_token().token {
+            Token::EOF => break,
+            Token::SemiColon => {},
+            other => return Err(Error::Syntax(format!("unexpected trailing token: {other}"))),
+        }
+    }
+    let select = convert_select(*query)?;
+    Ok(ast::Statement::Copy(ast::Copy {
+        schema: None,
+        table: String::new(),
+        columns: Vec::new(),
+        query: Some(Box::new(select)),
+        direction: ast::CopyDirection::To,
         format,
     }))
 }
