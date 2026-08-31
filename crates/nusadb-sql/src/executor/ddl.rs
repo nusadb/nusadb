@@ -262,7 +262,69 @@ pub(super) fn run_create_table(
     // Record the child→parent inheritance edges so a later query on a parent expands to this table.
     // A prior same-named table's edges are cleared on DROP, so there is nothing stale to purge here.
     super::inheritance::record_inheritance(engine, txn, &def.name, &plan.inherits)?;
+    // Range partitioning: a `PARTITION BY RANGE` parent records its key; a `PARTITION OF` partition
+    // validates + records its bound and joins the parent's inheritance set (so a query on the parent
+    // expands over its partitions).
+    if let Some(key_column) = &plan.partition_by {
+        super::partition::record_parent(engine, txn, &def.name, key_column)?;
+    }
+    if let Some(part) = &plan.partition_of {
+        register_partition(&def, part, engine, txn)?;
+    }
     Ok(ExecutionResult::Created(id))
+}
+
+/// Register a `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` partition: the parent must be a
+/// range-partitioned table, the bounds are coerced to the key column's type and must be ordered
+/// (`lo < hi`) and not overlap an existing partition, and the partition joins the parent's inheritance
+/// set so a query on the parent reads its rows.
+fn register_partition(
+    def: &TableDef,
+    part: &crate::planner::PartitionOfPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let key_column =
+        super::partition::parent_key_column(engine, txn, &part.parent)?.ok_or_else(|| {
+            Error::InvalidStatement(format!(
+                "table \"{}\" is not partitioned, so \"{}\" cannot be a partition of it",
+                part.parent, def.name
+            ))
+        })?;
+    let key_ty = def
+        .columns
+        .iter()
+        .find(|c| c.name == key_column)
+        .map(|c| c.ty)
+        .ok_or_else(|| internal_index(0))?;
+    let lo = super::eval::cast_value(part.from.clone(), key_ty)?;
+    let hi = super::eval::cast_value(part.to.clone(), key_ty)?;
+    if super::eval::compare(&lo, &hi) != std::cmp::Ordering::Less {
+        return Err(Error::InvalidStatement(format!(
+            "partition \"{}\" bound lower value must be strictly below the upper value",
+            def.name
+        )));
+    }
+    // Overlap check: `[lo, hi)` must be disjoint from every existing partition of the parent.
+    for existing in super::partition::partitions_of(engine, txn, &part.parent, key_ty)? {
+        let disjoint = super::eval::compare(&hi, &existing.lo) != std::cmp::Ordering::Greater
+            || super::eval::compare(&lo, &existing.hi) != std::cmp::Ordering::Less;
+        if !disjoint {
+            return Err(Error::InvalidStatement(format!(
+                "partition \"{}\" would overlap existing partition \"{}\"",
+                def.name, existing.table
+            )));
+        }
+    }
+    super::partition::record_partition(engine, txn, &def.name, &part.parent, key_ty, &lo, &hi)?;
+    // The partition reads through the parent via the shared inheritance-expansion machinery.
+    super::inheritance::record_inheritance(
+        engine,
+        txn,
+        &def.name,
+        std::slice::from_ref(&part.parent),
+    )?;
+    Ok(())
 }
 
 /// For `CREATE TABLE ... (LIKE src)`, copy `src`'s synthetic width / length checks onto the new table
@@ -788,6 +850,8 @@ pub(super) fn run_drop_table(
             // Remove this table's inheritance edges (as a child of its own parents) so a later
             // same-named table does not inherit stale parent links.
             super::inheritance::remove_edges_for(engine, txn, &plan.table)?;
+            // Same for any partition metadata (parent key or partition bound).
+            super::partition::remove_for(engine, txn, &plan.table)?;
         },
         None => {
             if !plan.if_exists {

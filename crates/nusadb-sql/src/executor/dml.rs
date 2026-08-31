@@ -12,6 +12,19 @@ pub(super) fn run_insert(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
+    // Partition awareness, gated on a cheap "any partitioning at all" probe so a database with no
+    // partitions pays a single catalog lookup and behaves exactly as before. A partitioned *parent*
+    // routes each row to a partition; a *partition* target bound-checks each row. Either way the
+    // streaming `INSERT ... SELECT` fast path (which writes straight into the target, bypassing both)
+    // must not apply.
+    let (partition_key, target_is_partition) = if super::partition::has_any(engine, txn)? {
+        let key = super::partition::parent_key_column(engine, txn, &plan.table.name)?;
+        let is_part = key.is_none()
+            && super::partition::partition_parent(engine, txn, &plan.table.name)?.is_some();
+        (key, is_part)
+    } else {
+        (None, false)
+    };
     // `INSERT ... SELECT` streams its source in bounded batches when that is provably equivalent
     // to the materialized path (P-INSERTSEL-OOM): memory stays O(batch) instead of O(result), so
     // an ETL-sized source no longer trips the `work_mem` guard. Every non-qualifying shape falls
@@ -19,6 +32,8 @@ pub(super) fn run_insert(
     if let InsertSource::Select(select) = &plan.source
         && plan.on_conflict.is_none()
         && plan.returning.is_empty()
+        && partition_key.is_none()
+        && !target_is_partition
     {
         let op = crate::planner::plan_select((**select).clone());
         if insert_select_can_stream(&op, &plan.table, engine, txn)? {
@@ -28,45 +43,53 @@ pub(super) fn run_insert(
     // Each source produces one value tuple per row, in target-`columns` order.
     let value_rows = insert_value_rows(plan, engine, txn)?;
     // `ON CONFLICT DO UPDATE` upserts; everything else (plain INSERT, `DO NOTHING`) inserts.
-    let full_rows = match &plan.on_conflict {
-        Some(OnConflictPlan::DoUpdate {
-            target,
-            assignments,
-            filter,
-        }) => upsert_rows(
-            &plan.table,
-            &plan.columns,
-            value_rows,
-            plan.rls_check.as_ref(),
-            plan.overriding,
-            target,
-            assignments,
-            filter.as_ref(),
-            engine,
-            txn,
-        )?,
-        other => {
-            // A `DO NOTHING` with a stated target must name a real unique/primary-key arbiter — the
-            // reference engine rejects a bad one even when no row collides. Resolving it here is the
-            // validation (the skip itself applies to any unique conflict).
-            if let Some(OnConflictPlan::DoNothing {
-                target: Some(target),
-            }) = other
-            {
-                resolve_arbiter(&plan.table, target, engine)?;
-            }
-            insert_rows(
+    let full_rows = if let Some(key_col) = &partition_key {
+        route_partitioned_insert(plan, key_col, value_rows, engine, txn)?
+    } else {
+        // A direct insert into a partition must land within that partition's bound.
+        if target_is_partition {
+            enforce_partition_bound(plan, &value_rows, engine, txn)?;
+        }
+        match &plan.on_conflict {
+            Some(OnConflictPlan::DoUpdate {
+                target,
+                assignments,
+                filter,
+            }) => upsert_rows(
                 &plan.table,
                 &plan.columns,
                 value_rows,
                 plan.rls_check.as_ref(),
-                plan.view_check.as_ref(),
                 plan.overriding,
-                matches!(other, Some(OnConflictPlan::DoNothing { .. })),
+                target,
+                assignments,
+                filter.as_ref(),
                 engine,
                 txn,
-            )?
-        },
+            )?,
+            other => {
+                // A `DO NOTHING` with a stated target must name a real unique/primary-key arbiter — the
+                // reference engine rejects a bad one even when no row collides. Resolving it here is the
+                // validation (the skip itself applies to any unique conflict).
+                if let Some(OnConflictPlan::DoNothing {
+                    target: Some(target),
+                }) = other
+                {
+                    resolve_arbiter(&plan.table, target, engine)?;
+                }
+                insert_rows(
+                    &plan.table,
+                    &plan.columns,
+                    value_rows,
+                    plan.rls_check.as_ref(),
+                    plan.view_check.as_ref(),
+                    plan.overriding,
+                    matches!(other, Some(OnConflictPlan::DoNothing { .. })),
+                    engine,
+                    txn,
+                )?
+            },
+        }
     };
 
     if plan.returning.is_empty() {
@@ -94,6 +117,150 @@ pub(super) fn run_insert(
             command: RowsCommand::Insert,
         })
     }
+}
+
+/// The value position of the partition key in an `INSERT`'s target list, plus its ordinal and type in
+/// the table. Used to read each row's key for routing / bound checks.
+fn partition_key_locus(
+    table: &TableSchema,
+    columns: &[usize],
+    key_col: &str,
+) -> Result<(usize, ColumnType), Error> {
+    let ordinal = table
+        .columns
+        .iter()
+        .position(|c| c.name == key_col)
+        .ok_or_else(|| internal_index(0))?;
+    let ty = table
+        .columns
+        .get(ordinal)
+        .map(|c| c.ty)
+        .ok_or_else(|| internal_index(ordinal))?;
+    let value_pos = columns
+        .iter()
+        .position(|&o| o == ordinal)
+        .ok_or_else(|| Error::Coded {
+            message: format!(
+                "the partition key \"{key_col}\" must be provided (a defaulted or omitted key is not \
+                 yet routed)"
+            ),
+            sqlstate: "0A000",
+        })?;
+    Ok((value_pos, ty))
+}
+
+/// Route each row of an `INSERT` into a range-partitioned parent to the partition whose `[lo, hi)`
+/// bound contains its key, then insert into those partitions (the parent stores nothing itself). A
+/// row whose key matches no partition, or an omitted key, is refused. `ON CONFLICT` on a partitioned
+/// table is not supported. Returns the inserted full rows (for `RETURNING` / the row count).
+fn route_partitioned_insert(
+    plan: &InsertPlan,
+    key_col: &str,
+    value_rows: Vec<Vec<Option<ast::Value>>>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    if plan.on_conflict.is_some() {
+        return Err(Error::Unsupported(
+            "INSERT ... ON CONFLICT into a partitioned table is not supported".to_owned(),
+        ));
+    }
+    let (key_pos, key_ty) = partition_key_locus(&plan.table, &plan.columns, key_col)?;
+    let partitions = super::partition::partitions_of(engine, txn, &plan.table.name, key_ty)?;
+    // Bucket the rows by target partition, preserving input order within each bucket.
+    let mut buckets: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
+    for row in value_rows {
+        let key = match row.get(key_pos).and_then(Clone::clone) {
+            Some(v) => super::eval::cast_value(v, key_ty)?,
+            None => {
+                return Err(Error::Coded {
+                    message: format!(
+                        "the partition key \"{key_col}\" must be provided (a NULL/defaulted key is \
+                         not yet routed)"
+                    ),
+                    sqlstate: "0A000",
+                });
+            },
+        };
+        let target = partitions
+            .iter()
+            .find(|p| super::partition::contains(&key, &p.lo, &p.hi))
+            .ok_or_else(|| Error::Coded {
+                message: format!(
+                    "no partition of relation \"{}\" found for the inserted row",
+                    plan.table.name
+                ),
+                sqlstate: "23514",
+            })?;
+        match buckets.iter_mut().find(|(name, _)| name == &target.table) {
+            Some((_, rows)) => rows.push(row),
+            None => buckets.push((target.table.clone(), vec![row])),
+        }
+    }
+    let mut inserted = Vec::new();
+    for (part_name, rows) in buckets {
+        let part =
+            engine
+                .lookup_table_as_of(txn, &part_name)?
+                .ok_or_else(|| Error::TableNotFound {
+                    name: part_name.clone(),
+                })?;
+        inserted.extend(insert_rows(
+            &part,
+            &plan.columns,
+            rows,
+            plan.rls_check.as_ref(),
+            plan.view_check.as_ref(),
+            plan.overriding,
+            false,
+            engine,
+            txn,
+        )?);
+    }
+    Ok(inserted)
+}
+
+/// A direct `INSERT` into a partition must land within that partition's `[lo, hi)` bound — the
+/// reference engine refuses a row that belongs to a different partition. A no-op for a non-partition
+/// target.
+fn enforce_partition_bound(
+    plan: &InsertPlan,
+    value_rows: &[Vec<Option<ast::Value>>],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    // A partition's key column and type come from its parent; find the parent (if this is a partition)
+    // by probing the partition catalog with each column's type in turn is unnecessary — the parent
+    // key column names a real column of this table, so resolve it via the recorded parent.
+    let Some(parent) = super::partition::partition_parent(engine, txn, &plan.table.name)? else {
+        return Ok(());
+    };
+    let Some(key_col) = super::partition::parent_key_column(engine, txn, &parent)? else {
+        return Ok(());
+    };
+    let (key_pos, key_ty) = partition_key_locus(&plan.table, &plan.columns, &key_col)?;
+    let Some((_, lo, hi)) =
+        super::partition::partition_bound(engine, txn, &plan.table.name, key_ty)?
+    else {
+        return Ok(());
+    };
+    for row in value_rows {
+        // A range partition never holds a NULL key, so a NULL/omitted key does not belong here.
+        let key = match row.get(key_pos).and_then(Clone::clone) {
+            Some(v) => super::eval::cast_value(v, key_ty)?,
+            None => ast::Value::Null,
+        };
+        if !super::partition::contains(&key, &lo, &hi) {
+            return Err(Error::Coded {
+                message: format!(
+                    "the inserted row does not belong to partition \"{}\"",
+                    plan.table.name
+                ),
+                sqlstate: "23514",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Fill each column omitted from the INSERT target list (`!covered`) of `full` from its `DEFAULT`

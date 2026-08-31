@@ -196,7 +196,7 @@ pub(super) fn decrypt(ciphertext_hex: &str, key: &str) -> Result<String, Error> 
 }
 
 /// Lowercase-hex encode.
-fn to_hex(bytes: &[u8]) -> String {
+pub(super) fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         // `b >> 4` and `b & 0x0f` are always `< 16`, so `from_digit` succeeds.
@@ -207,7 +207,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode lowercase/uppercase hex; `None` on odd length or a non-hex digit.
-fn from_hex(s: &str) -> Option<Vec<u8>> {
+pub(super) fn from_hex(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
         return None;

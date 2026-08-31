@@ -49,15 +49,15 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         Some(sql::OnCommit::DeleteRows) => ast::OnCommit::DeleteRows,
         Some(sql::OnCommit::Drop) => ast::OnCommit::Drop,
     };
-    // `PARTITION BY` / `CLUSTERED BY` change where rows physically live. NusaDB has no table
-    // partitioning yet, so silently dropping the clause and creating an ordinary unpartitioned heap
-    // would mis-store rows and accept out-of-range inserts — the same silent-wrong class as the
-    // TEMPORARY guard above. Reject loudly instead (QA).
-    if ct.partition_by.is_some() {
-        return unsupported(
-            "CREATE TABLE ... PARTITION BY is not supported yet (NusaDB does not partition tables)",
-        );
-    }
+    // `PARTITION BY RANGE (col)` marks a range-partitioned parent; `PARTITION OF parent FOR VALUES
+    // FROM (lo) TO (hi)` a range partition. Both are modelled; other strategies (LIST/HASH), unbounded
+    // (MINVALUE/MAXVALUE), and DEFAULT partitions are rejected loudly rather than silently mis-stored.
+    let partition_by = ct
+        .partition_by
+        .as_deref()
+        .map(convert_partition_by)
+        .transpose()?;
+    let partition_of = convert_partition_of(ct.partition_of.as_ref(), ct.for_values.as_ref())?;
     if ct.clustered_by.is_some() {
         return unsupported("CREATE TABLE ... CLUSTERED BY is not supported");
     }
@@ -70,6 +70,9 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
             // so a `CREATE TEMP TABLE ... AS SELECT` would silently land as a *persistent* table.
             // Reject loudly rather than mis-create it (silent-wrong class).
             return unsupported("CREATE TEMPORARY TABLE ... AS SELECT");
+        }
+        if partition_by.is_some() || partition_of.is_some() {
+            return unsupported("CREATE TABLE ... AS SELECT combined with partitioning");
         }
         if !ct.columns.is_empty() {
             return unsupported(
@@ -105,7 +108,8 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         .inherits
         .as_ref()
         .is_some_and(|parents| !parents.is_empty());
-    if ct.columns.is_empty() && like_source.is_none() && !inherits_present {
+    if ct.columns.is_empty() && like_source.is_none() && !inherits_present && partition_of.is_none()
+    {
         return unsupported("CREATE TABLE with no columns");
     }
     let (schema, name) = table_ref_name(&ct.name)?;
@@ -136,7 +140,79 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         like_source,
         on_commit,
         inherits,
+        partition_by,
+        partition_of,
     }))
+}
+
+/// Convert `PARTITION BY RANGE (col)` on a partitioned parent. sqlparser models the clause as a
+/// function-style expression `RANGE(col)`; only single-column `RANGE` is supported — `LIST`/`HASH`
+/// and a multi-column key are rejected loudly (silently treating them as `RANGE` would mis-route).
+fn convert_partition_by(expr: &sql::Expr) -> Result<ast::PartitionBy, Error> {
+    let sql::Expr::Function(func) = expr else {
+        return unsupported("CREATE TABLE ... PARTITION BY with an unrecognized clause");
+    };
+    let strategy = match func.name.0.last() {
+        Some(part) => part_ident(part)?.value.to_ascii_uppercase(),
+        None => String::new(),
+    };
+    if strategy != "RANGE" {
+        return unsupported(
+            "only PARTITION BY RANGE is supported (LIST / HASH partitioning is not)",
+        );
+    }
+    let sql::FunctionArguments::List(list) = &func.args else {
+        return unsupported("PARTITION BY RANGE needs exactly one key column");
+    };
+    let [sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Identifier(col)))] =
+        list.args.as_slice()
+    else {
+        return unsupported(
+            "PARTITION BY RANGE supports a single simple key column (not an expression or multiple \
+             columns)",
+        );
+    };
+    Ok(ast::PartitionBy {
+        column: fold_ident(col),
+    })
+}
+
+/// Convert `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` on a range partition. Only the
+/// single-column range form with concrete bounds is supported; `IN`/`WITH`/`DEFAULT`, `MINVALUE`/
+/// `MAXVALUE`, and multi-column bounds are rejected loudly.
+fn convert_partition_of(
+    parent: Option<&sql::ObjectName>,
+    for_values: Option<&sql::ForValues>,
+) -> Result<Option<ast::PartitionOf>, Error> {
+    match (parent, for_values) {
+        (None, None) => Ok(None),
+        (Some(_), None) => unsupported("PARTITION OF without a FOR VALUES bound"),
+        (None, Some(_)) => unsupported("FOR VALUES without PARTITION OF"),
+        (Some(parent), Some(for_values)) => {
+            let sql::ForValues::From { from, to } = for_values else {
+                return unsupported(
+                    "only PARTITION OF ... FOR VALUES FROM (lo) TO (hi) is supported (not LIST / \
+                     HASH / DEFAULT partitions)",
+                );
+            };
+            let bound = |bounds: &[sql::PartitionBoundValue],
+                         which: &str|
+             -> Result<ast::Expr, Error> {
+                let [sql::PartitionBoundValue::Expr(expr)] = bounds else {
+                    return unsupported(&format!(
+                        "PARTITION OF range {which} bound must be a single value (MINVALUE/MAXVALUE \
+                         and multi-column bounds are not supported)"
+                    ));
+                };
+                convert_expr(expr.clone())
+            };
+            Ok(Some(ast::PartitionOf {
+                parent: object_name(parent)?,
+                from: bound(from, "lower")?,
+                to: bound(to, "upper")?,
+            }))
+        },
+    }
 }
 
 /// Convert a column definition, returning the [`ast::ColumnDef`] plus any column-level

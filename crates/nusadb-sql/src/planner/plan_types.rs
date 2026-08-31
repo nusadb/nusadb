@@ -648,6 +648,24 @@ pub struct CreateTablePlan {
     /// child→parent edges in the inheritance catalog so a query on a parent expands to its
     /// descendants. Empty for a non-inheriting table.
     pub inherits: Vec<String>,
+    /// `PARTITION BY RANGE (col)` — this table is a range-partitioned parent keyed on the named
+    /// column. The executor records it in the partition catalog; `INSERT` then routes to a partition.
+    pub partition_by: Option<String>,
+    /// `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` — this table is a range partition. The
+    /// analyzer merged the parent's columns into [`columns`](Self::columns); the executor validates
+    /// the parent is partitioned, coerces `[from, to)` to the key type, and records the bound.
+    pub partition_of: Option<PartitionOfPlan>,
+}
+
+/// A resolved `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` bound (single-column range).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionOfPlan {
+    /// The partitioned parent table.
+    pub parent: String,
+    /// Inclusive lower bound literal (coerced to the key column type by the executor).
+    pub from: crate::ast::Value,
+    /// Exclusive upper bound literal (coerced to the key column type by the executor).
+    pub to: crate::ast::Value,
 }
 
 /// A resolved `CHECK` constraint.

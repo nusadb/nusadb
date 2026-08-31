@@ -1,0 +1,74 @@
+# Range partitioning: CREATE TABLE ... PARTITION BY RANGE (col) is a partitioned parent that stores
+# no rows of its own; each partition (CREATE TABLE ... PARTITION OF ... FOR VALUES FROM (lo) TO (hi))
+# holds the rows whose key falls in [lo, hi). An INSERT into the parent routes each row to its
+# partition; a query on the parent reads every partition. Single-column RANGE.
+
+statement ok
+CREATE TABLE ev (id INT, region INT) PARTITION BY RANGE (region)
+
+statement ok
+CREATE TABLE ev_lo PARTITION OF ev FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE ev_hi PARTITION OF ev FOR VALUES FROM (100) TO (200)
+
+# INSERT into the parent routes each row to the partition whose bound contains its key.
+statement ok
+INSERT INTO ev VALUES (1, 50), (2, 150), (3, 10)
+
+# A query on the parent reads all partitions.
+query II
+SELECT id, region FROM ev ORDER BY id
+----
+1  50
+2  150
+3  10
+
+# Each partition holds exactly its routed rows.
+query I
+SELECT id FROM ev_lo ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM ev_hi
+----
+2
+
+# A row that matches no partition is refused (no silent drop).
+statement error no partition
+INSERT INTO ev VALUES (4, 500)
+
+# A direct insert into a partition must fall within that partition's bound.
+statement error does not belong
+INSERT INTO ev_lo VALUES (5, 150)
+
+# Overlapping and non-range partitions are refused.
+statement error
+CREATE TABLE ev_bad PARTITION OF ev FOR VALUES FROM (50) TO (120)
+
+statement error
+CREATE TABLE h (id INT) PARTITION BY HASH (id)
+
+# A constraint on a partitioned parent (which would not be enforced across partitions) is refused.
+statement error
+CREATE TABLE c (id INT PRIMARY KEY, r INT) PARTITION BY RANGE (r)
+
+# UPDATE/DELETE through a partitioned parent is refused (not silently applied to the parent only);
+# use ONLY, or target each partition.
+statement error
+UPDATE ev SET id = 0 WHERE region = 50
+
+# Dropping a parent with partitions is refused; dropping the partitions first then works.
+statement error
+DROP TABLE ev
+
+statement ok
+DROP TABLE ev_lo
+
+statement ok
+DROP TABLE ev_hi
+
+statement ok
+DROP TABLE ev

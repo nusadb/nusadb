@@ -7,6 +7,10 @@ use super::*;
 
 // === DDL ==================================================================
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat CREATE TABLE analysis: LIKE/INHERITS merge, partitioning, schema, constraints"
+)]
 pub(super) fn analyze_create_table(
     mut ct: ast::CreateTable,
     catalog: &dyn Catalog,
@@ -71,6 +75,15 @@ pub(super) fn analyze_create_table(
     // then merge the child's own columns by name. A query on a parent later expands to this table's
     // rows (see the inheritance catalog + the analyzer's scan expansion).
     let inherited_parents = merge_inherited_columns(&mut ct, catalog)?;
+    // `PARTITION OF parent`: a range partition takes the parent's columns and a `[from, to)` bound.
+    // `PARTITION BY RANGE (col)`: a partitioned parent, keyed on an existing column.
+    let partition_of = resolve_partition_of(&mut ct, catalog)?;
+    let partition_by = resolve_partition_by(&ct)?;
+    if partition_by.is_some() && partition_of.is_some() {
+        return Err(Error::Unsupported(
+            "a partition that is itself partitioned (sub-partitioning) is not supported".to_owned(),
+        ));
+    }
     // An unqualified CREATE targets the session's current schema; an explicit qualifier wins. A
     // temporary table instead targets the session's non-durable temp schema — which does NOT change
     // `current_schema`, so a plain CREATE alongside it still lands in the search-path schema.
@@ -107,6 +120,23 @@ pub(super) fn analyze_create_table(
     let foreign_keys = resolve_foreign_keys(&ct, &name_base)?;
     let check_constraints = resolve_check_constraints(&ct, &name_base, catalog)?;
     let defaults = resolve_column_defaults(&ct, &name_base, catalog)?;
+    // A constraint on a partitioned parent would need to be enforced across every partition, which
+    // NusaDB does not propagate yet — so a `UNIQUE`/`PRIMARY KEY`/`CHECK`/`FOREIGN KEY` on the parent
+    // would go silently unenforced on the partitions' rows. Refuse it loudly rather than mis-accept.
+    // The synthetic type-range checks (a narrow integer's bound) are excluded: each partition
+    // regenerates them from its copied columns, so they are enforced where the rows actually live.
+    let explicit_check = check_constraints
+        .iter()
+        .any(|c| !c.name.starts_with(SYNTHETIC_TYPE_CHECK_PREFIX));
+    if partition_by.is_some()
+        && (!unique_constraints.is_empty() || !foreign_keys.is_empty() || explicit_check)
+    {
+        return Err(Error::Unsupported(
+            "a UNIQUE / PRIMARY KEY / CHECK / FOREIGN KEY constraint on a partitioned table is not \
+             supported yet (it would not be enforced across partitions)"
+                .to_owned(),
+        ));
+    }
     Ok(CreateTablePlan {
         schema: target_schema,
         table: ct.name,
@@ -120,7 +150,91 @@ pub(super) fn analyze_create_table(
         like_source: ct.like_source,
         on_commit: ct.on_commit,
         inherits: inherited_parents,
+        partition_by,
+        partition_of,
     })
+}
+
+/// Validate a `PARTITION BY RANGE (col)` key: the column must be one of the table's declared columns.
+/// Returns the key column name (or `None` for a non-partitioned table).
+fn resolve_partition_by(ct: &ast::CreateTable) -> Result<Option<String>, Error> {
+    let Some(pb) = &ct.partition_by else {
+        return Ok(None);
+    };
+    if !ct.columns.iter().any(|c| c.name == pb.column) {
+        return Err(Error::ColumnNotFound {
+            table: ct.name.clone(),
+            column: pb.column.clone(),
+        });
+    }
+    Ok(Some(pb.column.clone()))
+}
+
+/// Resolve a `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)`: the parent must exist, the partition
+/// declares no columns of its own (it takes the parent's), and each bound must be a constant literal.
+/// Sets `ct.columns` to the parent's columns and returns the resolved bound.
+fn resolve_partition_of(
+    ct: &mut ast::CreateTable,
+    catalog: &dyn Catalog,
+) -> Result<Option<crate::planner::PartitionOfPlan>, Error> {
+    let Some(po) = ct.partition_of.clone() else {
+        return Ok(None);
+    };
+    if !ct.columns.is_empty() {
+        return Err(Error::Unsupported(
+            "a partition takes its parent's columns and cannot declare its own".to_owned(),
+        ));
+    }
+    let parent = catalog
+        .lookup_table(&po.parent)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: po.parent.clone(),
+        })?;
+    ct.columns = parent
+        .columns
+        .iter()
+        .map(|c| ast::ColumnDef {
+            name: c.name.clone(),
+            ty: c.ty,
+            udt_name: None,
+            nullable: c.nullable,
+            primary_key: false,
+            unique: false,
+            default: None,
+            default_sql: None,
+            generated: None,
+            serial: false,
+            identity_always: false,
+        })
+        .collect();
+    Ok(Some(crate::planner::PartitionOfPlan {
+        parent: parent.name,
+        from: const_bound_value(&po.from)?,
+        to: const_bound_value(&po.to)?,
+    }))
+}
+
+/// Extract the literal value of a partition bound expression. Only a literal (optionally negated for
+/// a number) is supported; a non-constant bound is refused rather than silently mishandled.
+fn const_bound_value(expr: &ast::Expr) -> Result<ast::Value, Error> {
+    match expr {
+        ast::Expr::Literal(v) => Ok(v.clone()),
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Negate,
+            expr,
+        } => match const_bound_value(expr)? {
+            ast::Value::Int(n) => Ok(ast::Value::Int(-n)),
+            ast::Value::Float(f) => Ok(ast::Value::Float(-f)),
+            ast::Value::Numeric(d) => Ok(ast::Value::Numeric(d.neg())),
+            _ => Err(Error::Unsupported(
+                "a partition bound must be a constant literal".to_owned(),
+            )),
+        },
+        _ => Err(Error::Unsupported(
+            "a partition bound must be a constant literal (an expression bound is not supported)"
+                .to_owned(),
+        )),
+    }
 }
 
 /// Apply `INHERITS (parent, ...)`: prepend the parents' columns (in written order, deduped across

@@ -63,6 +63,7 @@ mod ivm;
 pub mod join;
 mod lock_skip;
 pub mod ops;
+mod partition;
 mod procedure;
 mod recursive;
 pub mod scan;

@@ -58,6 +58,32 @@ pub struct CreateTable {
     /// The child's column list is the parents' columns (deduped by name) followed by its own; a query
     /// on a parent includes this table's rows unless it says `ONLY`. Empty for a non-inheriting table.
     pub inherits: Vec<String>,
+    /// `PARTITION BY RANGE (col)` — this table is a range-partitioned parent keyed on `col`; it holds
+    /// no rows of its own, and `INSERT` routes each row to the partition whose bound contains the key.
+    /// `None` for an ordinary table.
+    pub partition_by: Option<PartitionBy>,
+    /// `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` — this table is a range partition of
+    /// `parent`, holding the rows whose key falls in `[lo, hi)`. It inherits `parent`'s columns.
+    /// `None` for a non-partition table.
+    pub partition_of: Option<PartitionOf>,
+}
+
+/// `PARTITION BY RANGE (column)` on a partitioned parent. Only single-column `RANGE` is modelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionBy {
+    /// The single partition-key column.
+    pub column: String,
+}
+
+/// `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` on a range partition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionOf {
+    /// The partitioned parent table this is a partition of.
+    pub parent: String,
+    /// Inclusive lower bound of this partition's key range.
+    pub from: Expr,
+    /// Exclusive upper bound of this partition's key range.
+    pub to: Expr,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name AS <select>`.

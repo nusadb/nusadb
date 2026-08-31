@@ -119,6 +119,38 @@ fn create_table_inherits_and_from_only_parse() {
 }
 
 #[test]
+fn create_table_partition_range_parses_and_guards() {
+    // `PARTITION BY RANGE (col)` captures the single key column.
+    let ast::Statement::CreateTable(ct) =
+        ok("CREATE TABLE m (id INT, r INT) PARTITION BY RANGE (r)")
+    else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(
+        ct.partition_by.as_ref().map(|p| p.column.as_str()),
+        Some("r")
+    );
+    assert!(ct.partition_of.is_none());
+
+    // `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` captures parent + bounds (no own columns).
+    let ast::Statement::CreateTable(ct) =
+        ok("CREATE TABLE p PARTITION OF m FOR VALUES FROM (0) TO (100)")
+    else {
+        panic!("expected CreateTable");
+    };
+    let po = ct.partition_of.as_ref().expect("partition_of");
+    assert_eq!(po.parent, "m");
+    assert!(ct.partition_by.is_none());
+
+    // Rejections: LIST / HASH strategies, DEFAULT / IN / WITH bounds, and MINVALUE/MAXVALUE.
+    assert!(parse("CREATE TABLE m (id INT) PARTITION BY LIST (id)").is_err());
+    assert!(parse("CREATE TABLE m (id INT) PARTITION BY HASH (id)").is_err());
+    assert!(parse("CREATE TABLE p PARTITION OF m DEFAULT").is_err());
+    assert!(parse("CREATE TABLE p PARTITION OF m FOR VALUES IN (1, 2)").is_err());
+    assert!(parse("CREATE TABLE p PARTITION OF m FOR VALUES FROM (MINVALUE) TO (10)").is_err());
+}
+
+#[test]
 fn create_table_if_not_exists_and_type_mapping() {
     let ast::Statement::CreateTable(ct) = ok(
         "CREATE TABLE IF NOT EXISTS t (a BIGINT, b VARCHAR(20), c DOUBLE PRECISION, \
@@ -5334,11 +5366,15 @@ fn create_temporary_table_as_select_is_rejected() {
 }
 
 #[test]
-fn create_table_partition_by_is_rejected() {
-    // Silently dropping PARTITION BY and creating an ordinary heap would mis-store rows and accept
-    // out-of-range inserts (QA a silent-wrong footgun) — reject it loudly.
+fn create_table_partition_by_unsupported_strategies_are_rejected() {
+    // `PARTITION BY RANGE` is now supported (see `create_table_partition_range_parses_and_guards`);
+    // the strategies that are not still reject loudly rather than silently dropping the clause.
     assert!(matches!(
-        parse("CREATE TABLE t (id INT, d DATE) PARTITION BY RANGE (d)"),
+        parse("CREATE TABLE t (id INT) PARTITION BY LIST (id)"),
+        Err(Error::Unsupported(_)),
+    ));
+    assert!(matches!(
+        parse("CREATE TABLE t (id INT) PARTITION BY HASH (id)"),
         Err(Error::Unsupported(_)),
     ));
 }
