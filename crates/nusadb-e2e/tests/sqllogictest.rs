@@ -423,6 +423,11 @@ fn slt_p1_partition_range() {
 }
 
 #[test]
+fn slt_p1_exclude_constraint() {
+    run_slt("tests/slt/p1_ddl/exclude_constraint.slt");
+}
+
+#[test]
 fn slt_p1_information_schema() {
     run_slt("tests/slt/p1_ddl/information_schema.slt");
 }

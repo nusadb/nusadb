@@ -716,6 +716,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // symmetry keyword. Wrap the lower bound in a marker function so the node parses, and flag it in
     // conversion; `ASYMMETRIC` (the default) is simply dropped.
     rewrite_between_symmetric(&mut tokens)?;
+    // `EXCLUDE (col WITH =, ...)` table constraint: sqlparser has no grammar for it. Rewrite the
+    // equality form to the equivalent `UNIQUE (col, ...)`; other operators are refused.
+    rewrite_exclude_constraint(&mut tokens)?;
     // `CREATE VIEW ... WITH [LOCAL|CASCADED] CHECK OPTION`: sqlparser (0.62) has no grammar for the
     // trailing check-option clause, so strip it here and remember it — the flag is re-attached to the
     // parsed `CreateView` below (a statement-level property, applied after conversion).
@@ -895,6 +898,173 @@ fn rewrite_order_by_using(tokens: &mut Vec<TokenWithSpan>) {
         }
         i += 1;
     }
+}
+
+/// Rewrite an `EXCLUDE` table constraint into the equivalent `UNIQUE` constraint when every operator
+/// is `=` (`EXCLUDE (a WITH =, b WITH =)` ≡ `UNIQUE (a, b)`, matching the reference engine's row-
+/// conflict and NULL semantics). sqlparser has no grammar for `EXCLUDE`, so this runs pre-parse.
+/// Anything the equality reduction cannot express — a non-`=` operator (needs an overlap index), a
+/// `USING` method other than `btree`, a `WHERE` partial predicate, or an expression element — is
+/// refused loudly rather than silently mishandled. The constraint form is told apart from a window
+/// `EXCLUDE` (already stripped) and a SELECT-item `EXCLUDE` by the `WITH` inside its parentheses.
+fn rewrite_exclude_constraint(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
+    use sqlparser::keywords::Keyword;
+    if !tokens.iter().any(|t| word_ci(Some(t), "exclude")) {
+        return Ok(());
+    }
+    let nonws = |toks: &[TokenWithSpan], from: usize| -> Option<usize> {
+        (from + 1..toks.len())
+            .find(|&j| !matches!(toks.get(j).map(|t| &t.token), Some(Token::Whitespace(_))))
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if !word_ci(tokens.get(i), "exclude") {
+            i += 1;
+            continue;
+        }
+        // Optional `USING <method>` between `EXCLUDE` and the element list.
+        let Some(mut open) = nonws(tokens, i) else {
+            break;
+        };
+        let mut method: Option<usize> = None;
+        if word_ci(tokens.get(open), "using") {
+            let Some(m) = nonws(tokens, open) else { break };
+            let Some(after) = nonws(tokens, m) else { break };
+            method = Some(m);
+            open = after;
+        }
+        // The element list opens with `(`; otherwise this `EXCLUDE` is not the constraint form.
+        if !matches!(tokens.get(open).map(|t| &t.token), Some(Token::LParen)) {
+            i += 1;
+            continue;
+        }
+        // Find the matching `)` and whether a `WITH` appears at the list's top level.
+        let mut depth = 0i32;
+        let mut close = None;
+        let mut has_with = false;
+        for (k, tok) in tokens.iter().enumerate().skip(open) {
+            match &tok.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(k);
+                        break;
+                    }
+                },
+                Token::Word(w) if depth == 1 && w.keyword == Keyword::WITH => has_with = true,
+                _ => {},
+            }
+        }
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        if !has_with {
+            // A SELECT-item `EXCLUDE (col, ...)` has no `WITH` — leave it for the ordinary parser.
+            i += 1;
+            continue;
+        }
+        if let Some(m) = method
+            && !word_ci(tokens.get(m), "btree")
+        {
+            return Err(Error::Unsupported(
+                "EXCLUDE USING <method> other than btree is not supported (only the `=` form, \
+                 which is equivalent to a UNIQUE constraint)"
+                    .to_owned(),
+            ));
+        }
+        if let Some(w) = nonws(tokens, close)
+            && word_ci(tokens.get(w), "where")
+        {
+            return Err(Error::Unsupported(
+                "a partial EXCLUDE constraint (WHERE ...) is not supported".to_owned(),
+            ));
+        }
+        let cols = parse_exclude_elements(tokens, open, close)?;
+        // Build `UNIQUE ( <cols> )`, copying the original column tokens (preserving any quoting).
+        let mut repl = Vec::with_capacity(cols.len() * 2 + 3);
+        repl.push(TokenWithSpan::wrap(Token::make_word("UNIQUE", None)));
+        repl.push(TokenWithSpan::wrap(Token::LParen));
+        for (idx, col) in cols.into_iter().enumerate() {
+            if idx > 0 {
+                repl.push(TokenWithSpan::wrap(Token::Comma));
+            }
+            repl.push(col);
+        }
+        repl.push(TokenWithSpan::wrap(Token::RParen));
+        let n = repl.len();
+        let _: Vec<TokenWithSpan> = tokens.splice(i..=close, repl).collect();
+        i += n;
+    }
+    Ok(())
+}
+
+/// Extract the column tokens of an `EXCLUDE` element list (`open`..`close` are the enclosing parens),
+/// requiring each element to be exactly `<column> WITH =`. A non-`=` operator or an expression element
+/// is refused (only the equality reduction to `UNIQUE` is supported).
+fn parse_exclude_elements(
+    tokens: &[TokenWithSpan],
+    open: usize,
+    close: usize,
+) -> Result<Vec<TokenWithSpan>, Error> {
+    use sqlparser::keywords::Keyword;
+    let malformed = || {
+        Error::Syntax("malformed EXCLUDE constraint element (expected `column WITH =`)".to_owned())
+    };
+    let not_eq = || {
+        Error::Unsupported(
+            "EXCLUDE supports only the `=` operator (equivalent to UNIQUE); an overlap or inequality \
+             operator needs index support NusaDB does not have"
+                .to_owned(),
+        )
+    };
+    let mut cols: Vec<TokenWithSpan> = Vec::new();
+    let mut col: Option<TokenWithSpan> = None;
+    let mut seen_with = false;
+    let mut seen_op = false;
+    for (k, tok) in tokens.iter().enumerate().take(close).skip(open + 1) {
+        let _ = k;
+        match &tok.token {
+            Token::Whitespace(_) => {},
+            // Elements are simple `column WITH =`; a parenthesized (expression) element is not.
+            Token::LParen | Token::RParen => {
+                return Err(Error::Unsupported(
+                    "EXCLUDE on an expression is not supported (only simple columns)".to_owned(),
+                ));
+            },
+            Token::Comma => {
+                if col.is_none() || !seen_with || !seen_op {
+                    return Err(malformed());
+                }
+                cols.push(col.take().ok_or_else(malformed)?);
+                seen_with = false;
+                seen_op = false;
+            },
+            _ if col.is_none() => match &tok.token {
+                Token::Word(_) => col = Some(tok.clone()),
+                _ => return Err(malformed()),
+            },
+            _ if !seen_with => match &tok.token {
+                Token::Word(w) if w.keyword == Keyword::WITH => seen_with = true,
+                _ => return Err(malformed()),
+            },
+            _ if !seen_op => match &tok.token {
+                Token::Eq => seen_op = true,
+                _ => return Err(not_eq()),
+            },
+            _ => return Err(malformed()),
+        }
+    }
+    match (col, seen_with, seen_op) {
+        (Some(c), true, true) => cols.push(c),
+        (None, false, false) => {},
+        _ => return Err(malformed()),
+    }
+    if cols.is_empty() {
+        return Err(malformed());
+    }
+    Ok(cols)
 }
 
 /// The marker function the [`rewrite_between_symmetric`] pre-parse wraps a `BETWEEN SYMMETRIC` lower

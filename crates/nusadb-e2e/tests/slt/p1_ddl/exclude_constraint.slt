@@ -1,0 +1,61 @@
+# EXCLUDE constraint (equality form): `EXCLUDE (a WITH =)` rejects two rows whose a values are equal
+# — exactly a UNIQUE constraint, including that NULLs do not conflict. NusaDB reduces the equality
+# form to UNIQUE; operators other than `=` (which would need an overlap index), a USING method other
+# than btree, and a WHERE partial predicate are refused rather than mishandled.
+
+statement ok
+CREATE TABLE t (a INT, EXCLUDE (a WITH =))
+
+statement ok
+INSERT INTO t VALUES (1)
+
+# A duplicate value conflicts.
+statement error duplicate key
+INSERT INTO t VALUES (1)
+
+# NULLs never conflict (like UNIQUE): two NULLs are allowed.
+statement ok
+INSERT INTO t VALUES (NULL), (NULL)
+
+query I
+SELECT count(*) FROM t
+----
+3
+
+# Multi-column, named: the whole (a, b) tuple must be distinct.
+statement ok
+CREATE TABLE t2 (a INT, b INT, CONSTRAINT t2u EXCLUDE (a WITH =, b WITH =))
+
+statement ok
+INSERT INTO t2 VALUES (1, 2), (1, 3)
+
+statement error duplicate key
+INSERT INTO t2 VALUES (1, 2)
+
+query I
+SELECT count(*) FROM t2
+----
+2
+
+# ALTER TABLE ... ADD EXCLUDE (equality form) also reduces to a unique constraint.
+statement ok
+CREATE TABLE t3 (a INT)
+
+statement ok
+ALTER TABLE t3 ADD EXCLUDE (a WITH =)
+
+statement ok
+INSERT INTO t3 VALUES (5)
+
+statement error duplicate key
+INSERT INTO t3 VALUES (5)
+
+# Non-equality / overlap / partial forms are refused loudly.
+statement error
+CREATE TABLE g (a INT, EXCLUDE USING gist (a WITH &&))
+
+statement error
+CREATE TABLE n (a INT, EXCLUDE (a WITH <>))
+
+statement error
+CREATE TABLE w (a INT, EXCLUDE (a WITH =) WHERE (a > 0))

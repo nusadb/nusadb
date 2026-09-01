@@ -119,6 +119,39 @@ fn create_table_inherits_and_from_only_parse() {
 }
 
 #[test]
+fn exclude_equality_constraint_rewrites_to_unique() {
+    // The reduced UNIQUE is located by variant (a narrow-int column also adds a synthetic type-check).
+    let unique = |sql: &str| -> (Option<String>, Vec<String>) {
+        let ast::Statement::CreateTable(ct) = ok(sql) else {
+            panic!("expected CreateTable");
+        };
+        ct.constraints
+            .iter()
+            .find_map(|c| match c {
+                ast::TableConstraint::Unique { name, columns, .. } => {
+                    Some((name.clone(), columns.clone()))
+                },
+                _ => None,
+            })
+            .expect("a Unique constraint")
+    };
+    // `EXCLUDE (a WITH =)` reduces to `UNIQUE (a)`; a named / multi-column form carries through.
+    assert_eq!(
+        unique("CREATE TABLE t (a INT, EXCLUDE (a WITH =))").1,
+        vec!["a".to_owned()]
+    );
+    let (name, columns) =
+        unique("CREATE TABLE t (a INT, b INT, CONSTRAINT u EXCLUDE (a WITH =, b WITH =))");
+    assert_eq!(name.as_deref(), Some("u"));
+    assert_eq!(columns, vec!["a".to_owned(), "b".to_owned()]);
+
+    // Forms the equality reduction cannot express are refused, not silently accepted.
+    assert!(parse("CREATE TABLE t (a INT, EXCLUDE USING gist (a WITH &&))").is_err());
+    assert!(parse("CREATE TABLE t (a INT, EXCLUDE (a WITH <>))").is_err());
+    assert!(parse("CREATE TABLE t (a INT, EXCLUDE (a WITH =) WHERE (a > 0))").is_err());
+}
+
+#[test]
 fn create_table_partition_range_parses_and_guards() {
     // `PARTITION BY RANGE (col)` captures the single key column.
     let ast::Statement::CreateTable(ct) =
