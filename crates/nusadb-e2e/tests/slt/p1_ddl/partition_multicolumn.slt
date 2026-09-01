@@ -1,0 +1,128 @@
+# Multi-column partition keys. RANGE and HASH accept a composite key; the range bound is compared as
+# a tuple (lexicographically). LIST remains single-column.
+
+statement ok
+CREATE TABLE t (a INT, b INT, v TEXT) PARTITION BY RANGE (a, b)
+
+statement ok
+CREATE TABLE p1 PARTITION OF t FOR VALUES FROM (0, 0) TO (0, 100)
+
+statement ok
+CREATE TABLE p2 PARTITION OF t FOR VALUES FROM (0, 100) TO (1, 0)
+
+statement ok
+CREATE TABLE p3 PARTITION OF t FOR VALUES FROM (1, 0) TO (2, 0)
+
+statement ok
+INSERT INTO t VALUES (0, 50, 'a'), (0, 150, 'b'), (1, 5, 'c')
+
+# Each row routes to the partition whose [lo, hi) tuple range contains its (a, b) key.
+query T
+SELECT v FROM p1
+----
+a
+
+query T
+SELECT v FROM p2
+----
+b
+
+query T
+SELECT v FROM p3
+----
+c
+
+# A key exactly on a boundary lands in the upper partition ([lo, hi) is half-open on the tuple).
+statement ok
+INSERT INTO t VALUES (0, 100, 'x')
+
+query T
+SELECT v FROM p2 ORDER BY v
+----
+b
+x
+
+# The parent reads every partition.
+query T
+SELECT v FROM t ORDER BY v
+----
+a
+b
+c
+x
+
+# An overlapping tuple range is refused.
+statement error overlap
+CREATE TABLE pov PARTITION OF t FOR VALUES FROM (0, 50) TO (0, 150)
+
+# A bound with the wrong number of values (not one per key column) is refused.
+statement error one value per key column
+CREATE TABLE pbad PARTITION OF t FOR VALUES FROM (3) TO (4)
+
+# A key matching no partition is refused (no silent drop).
+statement error no partition
+INSERT INTO t VALUES (5, 5, 'z')
+
+# A DEFAULT catch-all works with a composite key too.
+statement ok
+CREATE TABLE tdef PARTITION OF t DEFAULT
+
+statement ok
+INSERT INTO t VALUES (5, 5, 'z')
+
+query T
+SELECT v FROM tdef
+----
+z
+
+# HASH accepts a composite key: every row routes to exactly one partition, so the per-partition
+# counts sum to the whole.
+statement ok
+CREATE TABLE h (a INT, b INT) PARTITION BY HASH (a, b)
+
+statement ok
+CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+
+statement ok
+CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+
+statement ok
+INSERT INTO h SELECT g, g * 2 FROM generate_series(1, 20) g
+
+query I
+SELECT count(*) FROM h
+----
+20
+
+query I
+SELECT (SELECT count(*) FROM h0) + (SELECT count(*) FROM h1)
+----
+20
+
+# LIST is single-column only.
+statement error single key column
+CREATE TABLE l (a INT, b INT) PARTITION BY LIST (a, b)
+
+statement ok
+DROP TABLE p1
+
+statement ok
+DROP TABLE p2
+
+statement ok
+DROP TABLE p3
+
+statement ok
+DROP TABLE tdef
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE h0
+
+statement ok
+DROP TABLE h1
+
+statement ok
+DROP TABLE h

@@ -469,6 +469,11 @@ fn slt_p1_partition_default() {
 }
 
 #[test]
+fn slt_p1_partition_multicolumn() {
+    run_slt("tests/slt/p1_ddl/partition_multicolumn.slt");
+}
+
+#[test]
 fn slt_p1_exclude_constraint() {
     run_slt("tests/slt/p1_ddl/exclude_constraint.slt");
 }

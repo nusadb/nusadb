@@ -153,17 +153,25 @@ fn exclude_equality_constraint_rewrites_to_unique() {
 
 #[test]
 fn create_table_partition_range_parses_and_guards() {
-    // `PARTITION BY {RANGE|LIST|HASH} (col)` captures the strategy + single key column.
-    let strat = |sql: &str| -> (ast::PartitionStrategy, String) {
+    // `PARTITION BY {RANGE|LIST|HASH} (col, ...)` captures the strategy + key columns.
+    let strat = |sql: &str| -> (ast::PartitionStrategy, Vec<String>) {
         let ast::Statement::CreateTable(ct) = ok(sql) else {
             panic!("expected CreateTable");
         };
         let pb = ct.partition_by.expect("partition_by");
-        (pb.strategy, pb.column)
+        (pb.strategy, pb.columns)
     };
     assert_eq!(
         strat("CREATE TABLE m (id INT, r INT) PARTITION BY RANGE (r)"),
-        (ast::PartitionStrategy::Range, "r".to_owned())
+        (ast::PartitionStrategy::Range, vec!["r".to_owned()])
+    );
+    // A multi-column RANGE key captures every column in order.
+    assert_eq!(
+        strat("CREATE TABLE m (a INT, b INT) PARTITION BY RANGE (a, b)"),
+        (
+            ast::PartitionStrategy::Range,
+            vec!["a".to_owned(), "b".to_owned()]
+        )
     );
     assert_eq!(
         strat("CREATE TABLE m (id INT) PARTITION BY LIST (id)").0,
@@ -5544,13 +5552,15 @@ fn create_temporary_table_as_select_is_rejected() {
 
 #[test]
 fn create_table_partition_by_rejects_bad_forms() {
-    // RANGE/LIST/HASH all parse now; a multi-column key and a DEFAULT partition are still refused.
+    // RANGE/LIST/HASH parse (including a multi-column RANGE/HASH key); an unknown strategy and an
+    // expression key are refused.
+    assert!(parse("CREATE TABLE t (a INT, b INT) PARTITION BY RANGE (a, b)").is_ok());
     assert!(matches!(
-        parse("CREATE TABLE t (a INT, b INT) PARTITION BY RANGE (a, b)"),
+        parse("CREATE TABLE t (id INT) PARTITION BY GiST (id)"),
         Err(Error::Unsupported(_)),
     ));
     assert!(matches!(
-        parse("CREATE TABLE t (id INT) PARTITION BY GiST (id)"),
+        parse("CREATE TABLE t (id INT) PARTITION BY RANGE (id + 1)"),
         Err(Error::Unsupported(_)),
     ));
 }

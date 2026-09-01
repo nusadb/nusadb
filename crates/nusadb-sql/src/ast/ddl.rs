@@ -79,24 +79,26 @@ pub enum PartitionStrategy {
     Hash,
 }
 
-/// `PARTITION BY {RANGE|LIST|HASH} (column)` on a partitioned parent (single key column).
+/// `PARTITION BY {RANGE|LIST|HASH} (col, ...)` on a partitioned parent. `RANGE` and `HASH` accept a
+/// multi-column key; `LIST` is single-column (enforced by the analyzer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionBy {
     /// The partitioning strategy.
     pub strategy: PartitionStrategy,
-    /// The single partition-key column.
-    pub column: String,
+    /// The partition-key columns, in order (always non-empty).
+    pub columns: Vec<String>,
 }
 
 /// The bound of a partition, matching its parent's strategy.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionBound {
-    /// `FOR VALUES FROM (from) TO (to)` — the `[from, to)` key range.
+    /// `FOR VALUES FROM (from, ...) TO (to, ...)` — the `[from, to)` key range, compared as a tuple
+    /// (lexicographically) for a multi-column key. Each side has one value per key column.
     Range {
-        /// Inclusive lower bound.
-        from: Expr,
-        /// Exclusive upper bound.
-        to: Expr,
+        /// Inclusive lower bound, one value per key column.
+        from: Vec<Expr>,
+        /// Exclusive upper bound, one value per key column.
+        to: Vec<Expr>,
     },
     /// `FOR VALUES IN (v, ...)` — the explicit key values this partition holds.
     List(Vec<Expr>),

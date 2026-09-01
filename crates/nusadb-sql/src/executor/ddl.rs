@@ -266,7 +266,7 @@ pub(super) fn run_create_table(
     // validates + records its bound and joins the parent's inheritance set (so a query on the parent
     // expands over its partitions).
     if let Some(pb) = &plan.partition_by {
-        super::partition::record_parent(engine, txn, &def.name, &pb.column, pb.strategy)?;
+        super::partition::record_parent(engine, txn, &def.name, &pb.columns, pb.strategy)?;
     }
     if let Some(part) = &plan.partition_of {
         register_partition(&def, part, engine, txn)?;
@@ -294,37 +294,54 @@ fn register_partition(
 
     use crate::planner::PartitionBoundPlan;
 
-    use super::partition::PartitionBound;
-    let key_column =
-        super::partition::parent_key_column(engine, txn, &part.parent)?.ok_or_else(|| {
+    use super::partition::{self, PartitionBound};
+    let key_columns =
+        partition::parent_key_columns(engine, txn, &part.parent)?.ok_or_else(|| {
             Error::InvalidStatement(format!(
                 "table \"{}\" is not partitioned, so \"{}\" cannot be a partition of it",
                 part.parent, def.name
             ))
         })?;
-    let strategy =
-        super::partition::parent_strategy(engine, txn, &part.parent)?.unwrap_or_default();
-    let key_ty = def
-        .columns
+    let strategy = partition::parent_strategy(engine, txn, &part.parent)?.unwrap_or_default();
+    // Resolve each key column's type from the partition's (parent-derived) columns.
+    let key_tys = key_columns
         .iter()
-        .find(|c| c.name == key_column)
-        .map(|c| c.ty)
-        .ok_or_else(|| internal_index(0))?;
+        .map(|kc| {
+            def.columns
+                .iter()
+                .find(|c| &c.name == kc)
+                .map(|c| c.ty)
+                .ok_or_else(|| internal_index(0))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mismatch = |want: &str| {
         Error::InvalidStatement(format!(
             "partition \"{}\" bound does not match parent \"{}\"'s {want} strategy",
             def.name, part.parent
         ))
     };
-    let existing = super::partition::partitions_of(engine, txn, &part.parent, key_ty)?;
+    let existing = partition::partitions_of(engine, txn, &part.parent, &key_tys)?;
     let bound = match &part.bound {
         PartitionBoundPlan::Range { from, to } => {
             if strategy != "range" {
                 return Err(mismatch("non-range"));
             }
-            let lo = super::eval::cast_value(from.clone(), key_ty)?;
-            let hi = super::eval::cast_value(to.clone(), key_ty)?;
-            if super::eval::compare(&lo, &hi) != Ordering::Less {
+            if from.len() != key_tys.len() || to.len() != key_tys.len() {
+                return Err(Error::InvalidStatement(format!(
+                    "partition \"{}\" range bound needs one value per key column ({})",
+                    def.name,
+                    key_tys.len()
+                )));
+            }
+            let cast_tuple = |vals: &[ast::Value]| -> Result<Vec<ast::Value>, Error> {
+                vals.iter()
+                    .zip(&key_tys)
+                    .map(|(v, ty)| super::eval::cast_value(v.clone(), *ty))
+                    .collect()
+            };
+            let lo = cast_tuple(from)?;
+            let hi = cast_tuple(to)?;
+            if partition::compare_tuple(&lo, &hi) != Ordering::Less {
                 return Err(Error::InvalidStatement(format!(
                     "partition \"{}\" lower bound must be strictly below the upper bound",
                     def.name
@@ -332,8 +349,8 @@ fn register_partition(
             }
             for e in &existing {
                 if let PartitionBound::Range { lo: elo, hi: ehi } = &e.bound {
-                    let disjoint = super::eval::compare(&hi, elo) != Ordering::Greater
-                        || super::eval::compare(&lo, ehi) != Ordering::Less;
+                    let disjoint = partition::compare_tuple(&hi, elo) != Ordering::Greater
+                        || partition::compare_tuple(&lo, ehi) != Ordering::Less;
                     if !disjoint {
                         return Err(overlap_err(&def.name, &e.table));
                     }
@@ -345,9 +362,10 @@ fn register_partition(
             if strategy != "list" {
                 return Err(mismatch("non-list"));
             }
+            let one = key_tys.first().copied().ok_or_else(|| internal_index(0))?;
             let coerced = values
                 .iter()
-                .map(|v| super::eval::cast_value(v.clone(), key_ty))
+                .map(|v| super::eval::cast_value(v.clone(), one))
                 .collect::<Result<Vec<_>, _>>()?;
             for e in &existing {
                 if let PartitionBound::List(evals) = &e.bound {
@@ -404,10 +422,7 @@ fn register_partition(
                 )));
             }
             // At most one catch-all per parent.
-            if existing
-                .iter()
-                .any(|e| super::partition::is_default(&e.bound))
-            {
+            if existing.iter().any(|e| partition::is_default(&e.bound)) {
                 return Err(Error::InvalidStatement(format!(
                     "partition \"{}\" conflicts with the existing default partition of \"{}\"",
                     def.name, part.parent
@@ -416,7 +431,7 @@ fn register_partition(
             PartitionBound::Default
         },
     };
-    super::partition::record_partition(engine, txn, &def.name, &part.parent, key_ty, &bound)?;
+    partition::record_partition(engine, txn, &def.name, &part.parent, &key_tys, &bound)?;
     // The partition reads through the parent via the shared inheritance-expansion machinery.
     super::inheritance::record_inheritance(
         engine,
@@ -437,37 +452,48 @@ fn validate_attach_rows(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let Some(key_col) = super::partition::parent_key_column(engine, txn, &parent.name)? else {
+    let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent.name)? else {
         return Ok(());
     };
-    let Some((key_pos, key_ty)) = partition
-        .columns
-        .iter()
-        .enumerate()
-        .find(|(_, c)| c.name == key_col)
-        .map(|(i, c)| (i, c.ty))
-    else {
-        return Ok(());
-    };
-    let Some((_, bound)) = super::partition::partition_bound(engine, txn, &partition.name, key_ty)?
+    // Locate each key column and its type in the partition (whose columns match the parent's).
+    let mut key_pos = Vec::with_capacity(key_cols.len());
+    let mut key_tys = Vec::with_capacity(key_cols.len());
+    for kc in &key_cols {
+        let Some((i, ty)) = partition
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == kc)
+            .map(|(i, c)| (i, c.ty))
+        else {
+            return Ok(());
+        };
+        key_pos.push(i);
+        key_tys.push(ty);
+    }
+    let Some((_, bound)) =
+        super::partition::partition_bound(engine, txn, &partition.name, &key_tys)?
     else {
         return Ok(());
     };
     // A catch-all accepts a row only if no sibling's bound does; a normal partition accepts a row
     // that falls within its own bound.
     let siblings = if super::partition::is_default(&bound) {
-        super::partition::partitions_of(engine, txn, &parent.name, key_ty)?
+        super::partition::partitions_of(engine, txn, &parent.name, &key_tys)?
     } else {
         Vec::new()
     };
     for row in scan_rows(partition, engine, txn)? {
-        let key = row.get(key_pos).cloned().unwrap_or(ast::Value::Null);
+        let key: Vec<ast::Value> = key_pos
+            .iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(ast::Value::Null))
+            .collect();
         let ok = if super::partition::is_default(&bound) {
             !siblings
                 .iter()
-                .any(|s| super::partition::accepts(&key, &s.bound, key_ty))
+                .any(|s| super::partition::accepts(&key, &s.bound, &key_tys))
         } else {
-            super::partition::accepts(&key, &bound, key_ty)
+            super::partition::accepts(&key, &bound, &key_tys)
         };
         if !ok {
             return Err(Error::Coded {

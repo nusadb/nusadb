@@ -161,11 +161,19 @@ fn resolve_partition_by(ct: &ast::CreateTable) -> Result<Option<ast::PartitionBy
     let Some(pb) = &ct.partition_by else {
         return Ok(None);
     };
-    if !ct.columns.iter().any(|c| c.name == pb.column) {
-        return Err(Error::ColumnNotFound {
-            table: ct.name.clone(),
-            column: pb.column.clone(),
-        });
+    // A list-partitioned table has a single key column (the reference engine's rule).
+    if pb.strategy == ast::PartitionStrategy::List && pb.columns.len() != 1 {
+        return Err(Error::Unsupported(
+            "LIST partitioning supports a single key column".to_owned(),
+        ));
+    }
+    for column in &pb.columns {
+        if !ct.columns.iter().any(|c| &c.name == column) {
+            return Err(Error::ColumnNotFound {
+                table: ct.name.clone(),
+                column: column.clone(),
+            });
+        }
     }
     Ok(Some(pb.clone()))
 }
@@ -223,8 +231,11 @@ fn convert_partition_bound(
     use crate::planner::PartitionBoundPlan;
     Ok(match bound {
         ast::PartitionBound::Range { from, to } => PartitionBoundPlan::Range {
-            from: const_bound_value(from)?,
-            to: const_bound_value(to)?,
+            from: from
+                .iter()
+                .map(const_bound_value)
+                .collect::<Result<_, _>>()?,
+            to: to.iter().map(const_bound_value).collect::<Result<_, _>>()?,
         },
         ast::PartitionBound::List(values) => PartitionBoundPlan::List(
             values

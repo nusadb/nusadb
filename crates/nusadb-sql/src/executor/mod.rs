@@ -3458,20 +3458,23 @@ pub fn partition_key_column(
 
 /// Production adapter: the direct partitions of `parent` a query with `constraints` need not scan.
 ///
-/// Resolves the key column's type from the parent's schema, then tests each partition's bound. Used
-/// for [`Catalog::partitions_to_prune`](crate::Catalog::partitions_to_prune).
+/// Only a single-column key is pruned (multi-column pruning is a follow-up): a parent with a
+/// composite key returns an empty set. Resolves the key column's type from the parent's schema, then
+/// tests each partition's bound. Used for
+/// [`Catalog::partitions_to_prune`](crate::Catalog::partitions_to_prune).
 pub fn partitions_to_prune(
     engine: &dyn StorageEngine,
     txn: TxnId,
     parent: &str,
     constraints: &[crate::PruneConstraint],
 ) -> Result<Vec<String>, Error> {
-    let Some(key_col) = partition::parent_key_column(engine, txn, parent)? else {
+    let key_columns = partition::parent_key_columns(engine, txn, parent)?;
+    let Some([key_col]) = key_columns.as_deref() else {
         return Ok(Vec::new());
     };
     let Some(key_ty) = engine
         .lookup_table_as_of(txn, parent)?
-        .and_then(|s| s.columns.iter().find(|c| c.name == key_col).map(|c| c.ty))
+        .and_then(|s| s.columns.iter().find(|c| &c.name == key_col).map(|c| c.ty))
     else {
         return Ok(Vec::new());
     };

@@ -669,12 +669,13 @@ pub struct PartitionOfPlan {
 /// A resolved partition bound (literals coerced to the key column type by the executor).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionBoundPlan {
-    /// `[from, to)` key range.
+    /// `[from, to)` key range, compared as a tuple for a multi-column key. Each side has one literal
+    /// per key column.
     Range {
-        /// Inclusive lower bound literal.
-        from: crate::ast::Value,
-        /// Exclusive upper bound literal.
-        to: crate::ast::Value,
+        /// Inclusive lower bound, one literal per key column.
+        from: Vec<crate::ast::Value>,
+        /// Exclusive upper bound, one literal per key column.
+        to: Vec<crate::ast::Value>,
     },
     /// The explicit key value set this partition holds.
     List(Vec<crate::ast::Value>),
