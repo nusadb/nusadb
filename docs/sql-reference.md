@@ -33,7 +33,8 @@ A quick map from the statement you are looking for to the section that shows it.
 
 | Statement | Section |
 | --- | --- |
-| `CREATE` / `ALTER` / `DROP TABLE`, `CREATE TEMP TABLE`, `CREATE TABLE AS`, `LIKE` | [Tables](#tables), [Altering](#altering) |
+| `CREATE` / `ALTER` / `DROP TABLE`, `CREATE TEMP TABLE`, `CREATE TABLE AS`, `LIKE`, `INHERITS` | [Tables](#tables), [Altering](#altering) |
+| `PARTITION BY RANGE`, `PARTITION OF` | [Partitioned tables](#partitioned-tables) |
 | `CREATE` / `DROP INDEX` | [Indexes](#indexes) |
 | `CREATE` / `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `REFRESH` | [Views](#views-sequences-domains-schemas-databases) |
 | `CREATE` / `DROP SEQUENCE`, `DOMAIN`, `TYPE`, `SCHEMA`, `DATABASE` | [Views, sequences, ...](#views-sequences-domains-schemas-databases) |
@@ -43,12 +44,12 @@ A quick map from the statement you are looking for to the section that shows it.
 | `EXPLAIN` | [Reading a plan](#reading-a-plan-explain) |
 | `CREATE FUNCTION`, `CREATE PROCEDURE`, `CALL`, `DO` | [Routines and triggers](#routines-and-triggers) |
 | `CREATE` / `ALTER` / `DROP TRIGGER` | [Triggers](#triggers) |
-| parameters `$1..$n`, `PREPARE` | [Prepared statements](#prepared-statements) |
+| `PREPARE`, `EXECUTE`, `DEALLOCATE`, parameters `$1..$n` | [Prepared statements](#prepared-statements) |
 | `DECLARE`, `FETCH`, `CLOSE` | [Cursors](#cursors) |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `SET TRANSACTION` | [Transactions and locking](#transactions-and-locking) |
 | `SELECT ... FOR UPDATE`, `LOCK TABLE` | [Row and table locks](#row-and-table-locks) |
 | `LISTEN`, `UNLISTEN`, `NOTIFY` | [Notifications](#notifications) |
-| `ANALYZE`, `VACUUM`, `REINDEX`, `CHECKPOINT` | [Maintenance](#maintenance) |
+| `ANALYZE`, `VACUUM`, `REINDEX`, `CLUSTER`, `CHECKPOINT`, `CREATE EXTENSION` | [Maintenance](#maintenance) |
 | `SHOW TABLES`, `SHOW COLUMNS`, `DESCRIBE`, `information_schema` | [Introspection](#introspection) |
 | `CREATE ROLE`, `GRANT`, `REVOKE`, `SET ROLE`, `CREATE POLICY` | [Access control](#access-control) |
 | `SET`, `SHOW`, `RESET` | [Session settings](#session-settings) |
@@ -330,7 +331,22 @@ DROP TABLE IF EXISTS recent;
 
 Constraints available: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY ... REFERENCES`
 with `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT`, `NO ACTION`; each
-can be written at column or table level. Generated columns are `STORED`.
+can be written at column or table level. Generated columns are `STORED`. Two more unique forms:
+
+```sql
+CREATE TABLE nnd (a INT, b TEXT, UNIQUE NULLS NOT DISTINCT (a));
+INSERT INTO nnd (a) VALUES (NULL);
+INSERT INTO nnd (a) VALUES (NULL);
+-- ERROR 23505: with NULLS NOT DISTINCT, NULLs count as equal; plain UNIQUE allows both
+
+CREATE TABLE bookings (room INT, day DATE, EXCLUDE (room WITH =, day WITH =));
+```
+
+`UNIQUE NULLS NOT DISTINCT` treats NULL keys as equal, so at most one NULL row exists per key; it
+also works through `ALTER TABLE ... ADD`. An `EXCLUDE` constraint is accepted in its equality form
+(every element `column WITH =`), where it is exactly `UNIQUE` on those columns; another operator,
+`USING` a method other than btree, a `WHERE` clause, or an expression element is refused, because
+those need index support the engine does not have.
 
 Temporary tables belong to the session that made them, are invisible to others, and disappear when
 the session ends. `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` are accepted.
@@ -338,6 +354,57 @@ the session ends. `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` are accepted.
 ```sql
 CREATE TEMP TABLE scratch (id INT) ON COMMIT DROP;
 ```
+
+### Partitioned tables
+
+A table can be split by ranges of one column. The parent stores no rows: an insert into it is
+routed to the partition whose range contains the key, a query on it reads every partition, and a
+row that fits no partition is refused.
+
+```sql
+CREATE TABLE events (id INT, region INT) PARTITION BY RANGE (region);
+CREATE TABLE events_lo PARTITION OF events FOR VALUES FROM (0)   TO (100);
+CREATE TABLE events_hi PARTITION OF events FOR VALUES FROM (100) TO (200);
+
+INSERT INTO events VALUES (1, 50), (2, 150);      -- routed to events_lo / events_hi
+SELECT id, region FROM events ORDER BY id;        -- reads both partitions
+
+INSERT INTO events VALUES (3, 500);
+-- ERROR 23514: no partition of relation "events" found for the inserted row
+INSERT INTO events_lo VALUES (4, 150);
+-- ERROR 23514: the inserted row does not belong to partition "events_lo"
+```
+
+Bounds are constant literals, half-open `[lo, hi)`; overlap and `lo >= hi` are refused at
+creation. The partition key must be written on every insert. What is not accepted: `LIST` /
+`HASH` / `DEFAULT` partitions, `MINVALUE` / `MAXVALUE` or multi-column bounds, sub-partitioning, a
+partition declaring its own columns, `UNIQUE` / `PRIMARY KEY` / `CHECK` / `FOREIGN KEY` on the
+parent (they would not span partitions), `INSERT ... ON CONFLICT` into the parent, and `UPDATE` /
+`DELETE` or `DROP TABLE` on a parent that still has partitions; write to the partitions directly.
+
+### Inherited tables
+
+`INHERITS` gives a table its parents' columns in front of its own, and a query on the parent also
+reads every descendant. `ONLY` reads just the named table.
+
+```sql
+CREATE TABLE cities   (name TEXT, pop INT);
+CREATE TABLE capitals (state TEXT) INHERITS (cities);   -- columns: name, pop, state
+
+INSERT INTO cities   VALUES ('Bandung', 2500000);
+INSERT INTO capitals VALUES ('Jakarta', 10000000, 'JK');
+
+SELECT name FROM cities ORDER BY name;        -- Bandung, Jakarta
+SELECT name FROM ONLY cities;                 -- Bandung
+
+UPDATE ONLY cities SET pop = pop + 1;         -- the parent's own rows
+UPDATE cities SET pop = 0;
+-- ERROR 0A000: refused while descendants exist, rather than silently touching only the parent
+```
+
+A child may redeclare an inherited column only with the same type; `NOT NULL` holds only if every
+copy has it. Dropping a parent that still has children is refused (`2BP01`). Row-level security
+applies per table, so each descendant's policies govern its own rows.
 
 ### Altering
 
@@ -386,10 +453,15 @@ CREATE INDEX orders_lower    ON customers ((lower(email)));             -- expre
 CREATE UNIQUE INDEX customers_email ON customers (email);   -- an index needs a name
 CREATE INDEX orders_desc     ON orders (total DESC);
 CREATE INDEX IF NOT EXISTS orders_total ON orders (total) INCLUDE (customer);
+CREATE INDEX orders_btree ON orders USING btree (customer);      -- btree is the default anyway
+CREATE INDEX orders_nulls ON orders (total DESC NULLS FIRST);
 DROP INDEX IF EXISTS orders_desc;
 ```
 
-Index methods are the default B-tree and `hnsw` for vectors. The planner picks an index from
+Index methods are the default B-tree (`USING btree` is accepted and means the same) and `hnsw` for
+vectors. A per-key `NULLS FIRST` / `NULLS LAST` is accepted; it does not change results, because a
+query whose ordering column is nullable is served by an explicit sort that follows the query's own
+`NULLS` clause. The planner picks an index from
 collected statistics, so run `ANALYZE` after a large load (see [Maintenance](#maintenance)).
 
 ### Views, sequences, domains, schemas, databases
@@ -406,6 +478,9 @@ REFRESH MATERIALIZED VIEW daily;
 CREATE SEQUENCE invoice_no START 1000 INCREMENT BY 5;
 SELECT nextval('invoice_no'), currval('invoice_no');
 SELECT setval('invoice_no', 5000);
+ALTER SEQUENCE invoice_no INCREMENT BY 10 MAXVALUE 100000;
+ALTER SEQUENCE invoice_no RESTART WITH 2000;    -- the next nextval is exactly 2000
+ALTER SEQUENCE invoice_no RESTART;              -- back to its START
 DROP SEQUENCE invoice_no;
 
 CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0);
@@ -420,14 +495,29 @@ DROP DATABASE app;
 ```
 
 A view over a single table with no aggregate is auto-updatable: `INSERT`, `UPDATE` and `DELETE`
-through it reach the base table.
+through it reach the base table. With `WITH CHECK OPTION`, a row written through the view must stay
+visible through it:
+
+```sql
+CREATE VIEW small_orders AS
+  SELECT * FROM orders WHERE total < 100 WITH CHECK OPTION;
+INSERT INTO small_orders (customer, total) VALUES (1, 500);
+-- ERROR 44000: new row violates check option for view `small_orders`
+```
+
+The check applies to `INSERT` and `UPDATE` (a `DELETE` cannot make a row invisible-but-present).
+`LOCAL` and `CASCADED` are both accepted and behave the same, since an updatable view sits on one
+base table.
 
 A materialized view holds the result of its last `REFRESH`. Incremental maintenance is opt-in with
 `CREATE MATERIALIZED VIEW ... WITH (incremental = true) AS ...`; a body that cannot be maintained
 incrementally is refused rather than silently downgraded.
 
-Sequence functions take the sequence name as a text literal and may only appear where they are
-evaluated exactly once: a `SELECT` without `FROM`, a `VALUES` row, or a column default.
+`ALTER SEQUENCE` takes any mix of `INCREMENT [BY]`, `MINVALUE` / `NO MINVALUE`, `MAXVALUE` /
+`NO MAXVALUE`, `START [WITH]`, `RESTART [[WITH] n]`, `CACHE n` (accepted, no effect) and
+`CYCLE` / `NO CYCLE`, validates the merged definition, and `IF EXISTS` makes a missing sequence a
+no-op. Sequence functions take the sequence name as a text literal and may only appear where they
+are evaluated exactly once: a `SELECT` without `FROM`, a `VALUES` row, or a column default.
 
 `CREATE DOMAIN` accepts a base type and a `CHECK`; a `DEFAULT` or `COLLATE` on a domain is not
 accepted yet.
@@ -458,6 +548,11 @@ ON CONFLICT DO NOTHING;
 INSERT INTO customers (email, country) VALUES ('ana@example.com', 'SG')
 ON CONFLICT (email) DO UPDATE SET country = EXCLUDED.country
 WHERE customers.country <> EXCLUDED.country;
+
+INSERT INTO tickets (id, note) OVERRIDING SYSTEM VALUE VALUES (99, 'imported');
+-- without OVERRIDING SYSTEM VALUE, writing to a GENERATED ALWAYS identity column is ERROR 428C9.
+-- OVERRIDING USER VALUE is the reverse: on a GENERATED BY DEFAULT column it ignores the supplied
+-- value and takes the sequence's instead.
 
 UPDATE orders o SET total = total * 1.1
 FROM   customers c
@@ -506,12 +601,16 @@ nusadb-cli -c "COPY customers (email, country) FROM STDIN WITH (FORMAT csv, HEAD
 nusadb-cli -c "COPY customers FROM STDIN WITH (DELIMITER '|', NULL '')" < rows.psv
 nusadb-cli -c "COPY customers TO STDOUT" > out.tsv
 nusadb-cli -c "COPY customers (email, country) TO STDOUT WITH (FORMAT csv, HEADER)" > out.csv
+nusadb-cli -c "COPY (SELECT email FROM customers WHERE country = 'ID' ORDER BY email) TO STDOUT WITH (FORMAT csv)" > id.csv
 ```
 
 Options: `FORMAT text | csv`, `DELIMITER 'c'`, `NULL 'string'`, `HEADER`, and for CSV only
-`QUOTE 'c'` and `ESCAPE 'c'`. The text format is tab-delimited with `\N` for NULL. The source or
-target is a table (optionally with a column list), not a query, and binary format is not available.
-A load larger than `--copy-max-bytes` is refused rather than buffered without bound.
+`QUOTE 'c'` and `ESCAPE 'c'`. The text format is tab-delimited with `\N` for NULL. Export takes a
+table (optionally with a column list) or a `(query)`; the query form is `TO STDOUT` only, runs with
+the caller's privileges and row policies like any `SELECT`, and resolves unqualified names in the
+default schema, so qualify names from other schemas. Load takes a table only, and binary format is
+not available. A load larger than `--copy-max-bytes` is refused rather than buffered without
+bound.
 
 ---
 
@@ -543,6 +642,9 @@ HAVING count(o.id) > 2
 ORDER BY orders DESC NULLS LAST
 LIMIT 10 OFFSET 20;
 
+SELECT id FROM orders WHERE total BETWEEN SYMMETRIC 200 AND 50;  -- bounds in either order
+SELECT id, total FROM orders ORDER BY total USING >, id USING <; -- USING < is ASC, USING > is DESC
+
 SELECT DISTINCT ON (customer) customer, total
 FROM   orders ORDER BY customer, total DESC;          -- the biggest order per customer
 
@@ -561,6 +663,10 @@ INTERSECT  SELECT email FROM customers;
 SELECT c.email, o.total
 FROM   customers c
 CROSS JOIN LATERAL (SELECT total FROM orders WHERE customer = c.id ORDER BY total DESC LIMIT 1) o;
+
+SELECT c.email, n
+FROM   customers c
+CROSS JOIN LATERAL generate_series(1, c.id::INT) AS n;   -- a set-returning function may correlate
 
 SELECT * FROM (VALUES (1, 'one'), (2, 'two')) AS v(n, word);
 
@@ -597,6 +703,10 @@ SELECT country, email, spend,
        avg(spend)   OVER (ORDER BY joined ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving
 FROM   customers
 WINDOW w AS (PARTITION BY country ORDER BY spend DESC);
+
+SELECT country, count(*) AS orders,
+       sum(count(*)) OVER () AS total_orders          -- an aggregate may feed a window function
+FROM   customers GROUP BY country;
 ```
 
 Functions: `row_number`, `rank`, `dense_rank`, `ntile`, `cume_dist`, `percent_rank`, `lag`,
@@ -630,6 +740,31 @@ INSERT INTO profiles SELECT id, 'former staff' FROM gone;
 
 `WITH x AS MATERIALIZED (...)` and `NOT MATERIALIZED` are accepted as hints. A data-modifying
 statement with `RETURNING` can be used inside `WITH`.
+
+A recursive walk over a graph that may loop uses `CYCLE` to stop instead of running forever:
+
+```sql
+CREATE TABLE edge (src INT, dst INT);
+INSERT INTO edge VALUES (1,2), (2,3), (3,1);
+
+WITH RECURSIVE walk(id, depth) AS (
+  SELECT 1, 0
+  UNION ALL
+  SELECT e.dst, walk.depth + 1 FROM walk JOIN edge e ON walk.id = e.src
+) CYCLE id SET is_cycle USING path
+SELECT id, depth, is_cycle FROM walk ORDER BY depth;
+--  id | depth | is_cycle
+-- ----+-------+---------
+--   1 |     0 | false
+--   2 |     1 | false
+--   3 |     2 | false
+--   1 |     3 | true
+```
+
+The CTE needs an explicit column list; `CYCLE col SET mark USING path` appends two more columns to
+it: `mark` (true on the row that revisits a value) and `path` (the array of visited values), and
+recursion stops descending past a marked row. One cycle column only, and the boolean marker form
+only.
 
 ### Grouping sets and aggregates with filters
 
@@ -740,10 +875,13 @@ For hybrid search over a vector index and a text match, `rrf_score(rank [, k])` 
 
 ## Routines and triggers
 
-### SQL functions
+### Functions
 
-A function body is a single `SELECT <expression>` without `FROM`; its parameters are `$1..$n`. The
-expression is inlined at each call site, so a function costs nothing at run time.
+A function is `LANGUAGE SQL` (the default) or NusaScript (`LANGUAGE nusascript`; `plpgsql` is
+accepted as an alias). A SQL body is a single `SELECT <expression>` without `FROM`, inlined at
+each call site. A NusaScript body is a `BEGIN ... END` block whose `RETURN <expr>` produces the
+value, coerced to the declared `RETURNS` type; it may run several statements, branch, loop, and
+recurse. Parameters are available by name and as `$1..$n`.
 
 ```sql
 CREATE FUNCTION with_tax(amount NUMERIC) RETURNS NUMERIC
@@ -751,23 +889,32 @@ LANGUAGE SQL AS 'SELECT $1 * 1.11';
 
 CREATE OR REPLACE FUNCTION greet(name TEXT) RETURNS TEXT AS $$ SELECT 'hello, ' || $1 $$;
 
-SELECT with_tax(100), greet('ana');
---  with_tax | greet
--- ----------+------------
---    111.00 | hello, ana
+CREATE FUNCTION fact(n INT) RETURNS INT LANGUAGE plpgsql AS $$
+BEGIN
+  IF n <= 1 THEN
+    RETURN 1;
+  END IF;
+  RETURN n * fact(n - 1);
+END
+$$;
+
+SELECT with_tax(100), greet('ana'), fact(5);
+--  with_tax | greet      | fact
+-- ----------+------------+------
+--    111.00 | hello, ana |  120
 
 DROP FUNCTION greet;          -- by name, without a parameter list
 ```
+
+A NusaScript function whose body ends without reaching a `RETURN <value>` fails with `2F005`, and
+runaway recursion is stopped at a nesting limit rather than overflowing the stack.
 
 ### Procedures and `CALL`
 
 A procedure body is a `$$ ... $$` block of statements. A plain sequence of SQL statements is fine;
 a body that starts with `BEGIN` is a NusaScript block with variables and control flow. Parameters
-are `$1..$n`. `CALL` runs the procedure inside the caller's transaction.
-
-> **Send routine bodies from a driver.** `nusadb-cli` splits a batch on every `;`, including one
-> inside a `$$` body, so a body with more than one statement cannot be created from the shell. Any
-> driver sends the whole `CREATE PROCEDURE` as one statement, which is what the server expects.
+are `$1..$n`. `CALL` runs the procedure inside the caller's transaction. `nusadb-cli` keeps
+`$$ ... $$` bodies intact when splitting a batch, so these work from the shell and from any driver.
 
 ```sql
 CREATE TABLE audit (what TEXT, n INT);
@@ -876,10 +1023,28 @@ DROP TRIGGER log_stock ON stock;
 ```
 
 Syntax: `CREATE [OR REPLACE] TRIGGER name {BEFORE | AFTER} {INSERT | UPDATE | DELETE} [OR ...] ON
-table FOR EACH {ROW | STATEMENT} [WHEN (condition)] <statement>`. The action is one `INSERT`,
-`UPDATE`, `DELETE` or `SELECT`, run in the same transaction as the triggering statement; an error
-in it aborts that statement. Cascading triggers are bounded by a depth limit (`54001`).
-`INSTEAD OF` triggers are not accepted.
+table FOR EACH {ROW | STATEMENT} [WHEN (condition)] <action>`. The action is one `INSERT`,
+`UPDATE`, `DELETE` or `SELECT` statement, or `EXECUTE FUNCTION name()` naming a NusaScript
+function, so several triggers can share one body:
+
+```sql
+CREATE FUNCTION log_stock() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO stock_log (sku, before, after) VALUES (OLD.sku, OLD.qty, NEW.qty);
+END
+$$;
+
+CREATE TRIGGER stock_fn AFTER UPDATE ON stock FOR EACH ROW
+WHEN (NEW.qty <> OLD.qty) EXECUTE FUNCTION log_stock();
+```
+
+The function must take no parameters and have a `BEGIN ... END` body; that is checked when the
+trigger is created, not on first fire. `EXECUTE PROCEDURE` is a synonym. `NEW` and `OLD` are
+available throughout the body, a `RETURN` only ends it, and a `BEFORE` trigger cannot change or
+skip the row either way. Function arguments in the trigger (`EXECUTE FUNCTION f('x')`) are not
+accepted. The action runs in the same transaction as the triggering statement; an error in it
+aborts that statement. Cascading triggers are bounded by a depth limit (`54001`). `INSTEAD OF`
+triggers are not accepted.
 
 ---
 
@@ -887,18 +1052,26 @@ in it aborts that statement. Cascading triggers are bounded by a depth limit (`5
 
 ### Prepared statements
 
-A statement is prepared through the wire protocol, not with SQL: every driver parses a statement
-once and runs it with values for `$1..$n`, and the server caches the plan. `PREPARE` / `EXECUTE` /
-`DEALLOCATE` typed as SQL over a connection are refused with `0A000` and a message that says so.
+Drivers prepare through the wire protocol: a statement is parsed once and run with values for
+`$1..$n`.
 
 ```python
 cur.execute("SELECT email FROM customers WHERE country = $1 ORDER BY email", ["ID"])
 ```
 
-```bash
-# nusadb-cli has no parameter binding; substitute the value into the text instead
-nusadb-cli -c "SELECT email FROM customers WHERE country = 'ID' ORDER BY email"
+The SQL spellings work too, on any connection, which is how the shell binds parameters:
+
+```sql
+PREPARE by_country AS SELECT email FROM customers WHERE country = $1 ORDER BY email;
+EXECUTE by_country('ID');
+EXECUTE by_country('SG');
+DEALLOCATE by_country;       -- or DEALLOCATE ALL
 ```
+
+A prepared statement lives for the connection and survives transaction ends. Only a runnable
+query may be prepared (`SELECT`, set operation, `INSERT`, `UPDATE`, `DELETE`). Executing an
+unknown or deallocated name is `26000`; the wrong number of arguments is `42883`;
+`EXECUTE ... USING` is not accepted.
 
 ### Cursors
 
@@ -989,6 +1162,8 @@ ANALYZE;                  -- every table
 VACUUM;                   -- reclaim row versions no snapshot can see
 VACUUM (FULL, ANALYZE) orders;
 REINDEX TABLE orders;     -- accepted for compatibility; indexes are always consistent, so it is a no-op
+CLUSTER orders;           -- accepted for compatibility; rows are already clustered by row id, so it is a no-op
+CREATE EXTENSION IF NOT EXISTS vector;   -- accepted for compatibility; installs nothing, every type is built in
 CHECKPOINT;               -- fold the log into an image and truncate it; needs a quiet engine
 ```
 
@@ -1028,12 +1203,14 @@ SELECT nusadb_typeof(1.5), nusadb_typeof(now());
 
 `SHOW COLUMNS` returns `column`, `type` and `nullable`. The `nusadb_*` catalogs are plain tables:
 `nusadb_roles (name, superuser, login, createdb, createrole, inherit)`,
-`nusadb_triggers (name, table, timing, events, for_each, when, action, enabled)`,
-`nusadb_policies (table, name, command, roles, using, check, permissive)`,
+`nusadb_triggers (name, table, timing, events, for_each, when, action, enabled, schema)`,
+`nusadb_policies (table, name, command, roles, using, check, permissive, schema)`,
 `nusadb_procedures (name, param_count, out_params, body)`, `nusadb_functions (name, param_count,
-param_names, body)`, `nusadb_matviews (name, def)`, `nusadb_databases (name)`. Only a superuser may
-read a `nusadb_*` catalog; every other role uses `information_schema`. A catalog that has never been
-written to may not exist yet, in which case selecting from it reports `42P01`.
+param_names, body, language, return_type)`, `nusadb_matviews (name, def)`,
+`nusadb_partitions (role, table, aux, lo, hi)`, `nusadb_inheritance (child, parent, seq)`,
+`nusadb_databases (name)`. Only a superuser may read a `nusadb_*` catalog; every other role uses
+`information_schema`. A catalog that has never been written to may not exist yet, in which case
+selecting from it reports `42P01`.
 
 In `nusadb-cli`, `\dt` runs `SHOW TABLES`, `\d name` runs `SHOW COLUMNS FROM name`, and `\l` lists
 databases.
@@ -1311,12 +1488,13 @@ on the message text.
 | `23502` | not-null violation | |
 | `23503` | foreign-key violation | |
 | `23505` | unique violation | |
-| `23514` | check violation | |
+| `23514` | check violation | also a row that fits no partition, or the wrong partition |
 | `25001` | active transaction | `SET TRANSACTION` after the first query |
 | `25P01` | no active transaction | `SAVEPOINT` outside `BEGIN` |
 | `25P02` | transaction aborted | `ROLLBACK`, then start again |
 | `26000` | unknown prepared statement | `PREPARE` it again |
 | `2BP01` | dependent objects exist | drop them, or use `CASCADE` |
+| `2F005` | function ended without `RETURN` | give every path through the body a `RETURN <value>` |
 | `34000` | unknown cursor | |
 | `3F000` | schema does not exist | |
 | `40001` | serialization failure | retry the whole transaction |
@@ -1329,8 +1507,10 @@ on the message text.
 | `42710` / `42723` | object / function already exists | |
 | `42804` | datatype mismatch | cast explicitly |
 | `42846` | cannot coerce | cast explicitly |
-| `42883` | undefined function, or no matching signature | |
+| `42883` | undefined function, or no matching signature | also an `EXECUTE` with the wrong argument count |
+| `428C9` | writing a `GENERATED ALWAYS` column | use `OVERRIDING SYSTEM VALUE`, or omit the column |
 | `42P01` / `42P07` | undefined / duplicate table | |
+| `44000` | row violates a view's `WITH CHECK OPTION` | |
 | `53300` | too many connections | only with `--reject-excess-connections`; back off and retry |
 | `54000` | program limit exceeded | the request must get smaller |
 | `54001` | statement too complex | trigger or procedure recursion limit |
@@ -1439,8 +1619,11 @@ the resident ceiling. See [deployment](deployment.md) before loading a large dat
 
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
-- `PREPARE` / `EXECUTE` / `DEALLOCATE` as SQL over a connection (drivers prepare through the protocol);
-- table partitioning (`PARTITION BY` on `CREATE TABLE`);
+- table partitioning other than single-column `PARTITION BY RANGE` with literal bounds (no `LIST`,
+  `HASH`, `DEFAULT` partitions, `MINVALUE` / `MAXVALUE`, or sub-partitioning);
+- `EXCLUDE` constraints with an operator other than `=`;
+- a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
+- `EXECUTE ... USING`, and arguments to a trigger function;
 - reading one field out of a composite value;
 - dollar-quoted string literals outside a routine body;
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;

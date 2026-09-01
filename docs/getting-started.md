@@ -239,10 +239,9 @@ Values in the JSON format are strings, because the shell prints the protocol's t
 command tag (`SELECT 2`, `INSERT 1`) is printed after aligned and expanded results and omitted for
 CSV and JSON so the output can be fed to another program.
 
-Two things the shell does not do: it has no parameter binding (write the value into the SQL), and it
-splits a batch on every `;`, including one inside a `$$ ... $$` routine body. To create a procedure
-whose body has several statements, send it from a driver; see the
-[SQL reference](sql-reference.md#procedures-and-call).
+To run the same statement with changing values, use `PREPARE` / `EXECUTE`; the shell has no other
+parameter binding. Routine bodies in `$$ ... $$` pass through the shell intact, so procedures and
+functions can be created from here as well as from a driver.
 
 ---
 
@@ -336,7 +335,8 @@ as `$1`, `$2`, ... The result comes back typed (an `INT` column is an integer in
 | Rust | `cargo add nusadb` | sync and async (Tokio) client with a connection pool; `tls` feature |
 | Ruby | `gem install nusadb` | native client |
 | PHP | `composer require nusadb/nusadb` | PDO-style client, pure PHP |
-| Java, .NET | in the source tree | JDBC driver and ADO.NET provider; not yet on Maven Central or NuGet |
+| Java | `com.nusadb:nusadb-jdbc:0.1.0` on Maven Central | JDBC driver; Hibernate dialects ship as `nusadb-hibernate5` / `nusadb-hibernate6` |
+| .NET | in the source tree | ADO.NET provider; not yet on NuGet |
 
 Python:
 
