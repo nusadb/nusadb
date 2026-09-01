@@ -1,0 +1,138 @@
+# DEFAULT partition: the catch-all that holds every row matching no sibling's bound. At most one per
+# parent, not allowed under a HASH parent. An insert that matches no other partition (or a NULL key)
+# routes to it instead of failing; a direct insert into it is refused if the row belongs elsewhere.
+
+statement ok
+CREATE TABLE t (id INT, region INT) PARTITION BY RANGE (region)
+
+statement ok
+CREATE TABLE t0 PARTITION OF t FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE tdef PARTITION OF t DEFAULT
+
+statement ok
+INSERT INTO t VALUES (1, 50), (2, 150), (3, 250)
+
+# In-range rows land in the bounded partition; the rest fall to the catch-all.
+query I
+SELECT id FROM t0 ORDER BY id
+----
+1
+
+query I
+SELECT id FROM tdef ORDER BY id
+----
+2
+3
+
+# The parent still reads every partition, catch-all included.
+query I
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+# At most one default partition.
+statement error conflicts with the existing default partition
+CREATE TABLE tdef2 PARTITION OF t DEFAULT
+
+# A direct insert into the catch-all is refused when the row belongs to a bounded sibling.
+statement error does not belong
+INSERT INTO tdef VALUES (9, 50)
+
+# A direct insert into the catch-all is accepted when the row belongs to no sibling.
+statement ok
+INSERT INTO tdef VALUES (9, 150)
+
+# Pruning keeps the catch-all (it can hold any uncovered key) while still pruning a bounded partition.
+query I
+SELECT id FROM t WHERE region >= 200 ORDER BY id
+----
+3
+
+# A HASH parent has no catch-all — every key hashes to some partition.
+statement ok
+CREATE TABLE h (id INT) PARTITION BY HASH (id)
+
+statement error not allowed under the hash-partitioned parent
+CREATE TABLE hd PARTITION OF h DEFAULT
+
+# LIST + DEFAULT: a non-listed value and a NULL key both route to the catch-all.
+statement ok
+CREATE TABLE l (id INT, g TEXT) PARTITION BY LIST (g)
+
+statement ok
+CREATE TABLE la PARTITION OF l FOR VALUES IN ('x')
+
+statement ok
+CREATE TABLE ld PARTITION OF l DEFAULT
+
+statement ok
+INSERT INTO l VALUES (1, 'x'), (2, 'y'), (3, NULL)
+
+query I
+SELECT id FROM la ORDER BY id
+----
+1
+
+query I
+SELECT id FROM ld ORDER BY id
+----
+2
+3
+
+# ATTACH an existing table as the default; DETACH it back to standalone.
+statement ok
+CREATE TABLE cand (id INT, region INT)
+
+statement ok
+INSERT INTO cand VALUES (5, 999)
+
+statement ok
+ALTER TABLE t DETACH PARTITION tdef
+
+statement ok
+ALTER TABLE t ATTACH PARTITION cand DEFAULT
+
+# An out-of-range insert now routes to the newly attached default.
+statement ok
+INSERT INTO t VALUES (7, 888)
+
+query I
+SELECT id FROM cand ORDER BY id
+----
+5
+7
+
+statement ok
+ALTER TABLE t DETACH PARTITION cand
+
+# With no default, an out-of-range insert is refused again.
+statement error no partition
+INSERT INTO t VALUES (8, 777)
+
+statement ok
+DROP TABLE t0
+
+statement ok
+DROP TABLE tdef
+
+statement ok
+DROP TABLE cand
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE h
+
+statement ok
+DROP TABLE la
+
+statement ok
+DROP TABLE ld
+
+statement ok
+DROP TABLE l

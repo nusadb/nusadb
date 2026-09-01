@@ -685,6 +685,8 @@ pub enum PartitionBoundPlan {
         /// This partition's remainder.
         remainder: u64,
     },
+    /// The catch-all partition: holds every row matching no sibling's bound.
+    Default,
 }
 
 /// A resolved `CHECK` constraint.

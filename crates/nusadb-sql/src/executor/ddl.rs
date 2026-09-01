@@ -395,6 +395,26 @@ fn register_partition(
                 remainder: *remainder,
             }
         },
+        PartitionBoundPlan::Default => {
+            // A hash-partitioned parent has no catch-all — every key hashes to some partition.
+            if strategy == "hash" {
+                return Err(Error::InvalidStatement(format!(
+                    "a DEFAULT partition is not allowed under the hash-partitioned parent \"{}\"",
+                    part.parent
+                )));
+            }
+            // At most one catch-all per parent.
+            if existing
+                .iter()
+                .any(|e| super::partition::is_default(&e.bound))
+            {
+                return Err(Error::InvalidStatement(format!(
+                    "partition \"{}\" conflicts with the existing default partition of \"{}\"",
+                    def.name, part.parent
+                )));
+            }
+            PartitionBound::Default
+        },
     };
     super::partition::record_partition(engine, txn, &def.name, &part.parent, key_ty, &bound)?;
     // The partition reads through the parent via the shared inheritance-expansion machinery.
@@ -433,9 +453,23 @@ fn validate_attach_rows(
     else {
         return Ok(());
     };
+    // A catch-all accepts a row only if no sibling's bound does; a normal partition accepts a row
+    // that falls within its own bound.
+    let siblings = if super::partition::is_default(&bound) {
+        super::partition::partitions_of(engine, txn, &parent.name, key_ty)?
+    } else {
+        Vec::new()
+    };
     for row in scan_rows(partition, engine, txn)? {
         let key = row.get(key_pos).cloned().unwrap_or(ast::Value::Null);
-        if !super::partition::accepts(&key, &bound, key_ty) {
+        let ok = if super::partition::is_default(&bound) {
+            !siblings
+                .iter()
+                .any(|s| super::partition::accepts(&key, &s.bound, key_ty))
+        } else {
+            super::partition::accepts(&key, &bound, key_ty)
+        };
+        if !ok {
             return Err(Error::Coded {
                 message: format!(
                     "an existing row of \"{}\" does not fall within the bound for partition \"{}\"",

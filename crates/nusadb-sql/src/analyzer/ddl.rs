@@ -236,6 +236,7 @@ fn convert_partition_bound(
             modulus: *modulus,
             remainder: *remainder,
         },
+        ast::PartitionBound::Default => PartitionBoundPlan::Default,
     })
 }
 

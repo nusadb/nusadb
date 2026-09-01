@@ -2259,17 +2259,26 @@ fn recognize_alter_partition(sql: &str) -> Option<Result<ast::Statement, Error>>
 }
 
 /// Parse a recognized `ALTER TABLE ... {ATTACH|DETACH} PARTITION ...`. The head (up to the partition
-/// name) is whitespace-delimited identifiers; for `ATTACH` the bound tail after `FOR VALUES` is parsed
-/// by re-parsing a synthetic `CREATE TABLE child PARTITION OF parent <tail>`, reusing the existing
-/// partition-bound grammar and its validation.
+/// name) is whitespace-delimited identifiers; for `ATTACH` the bound tail (`FOR VALUES <...>` or the
+/// bare `DEFAULT`) is parsed by re-parsing a synthetic `CREATE TABLE child PARTITION OF parent <tail>`,
+/// reusing the existing partition-bound grammar and its validation.
 fn parse_alter_partition(trimmed: &str, attach: bool) -> Result<ast::Statement, Error> {
     let low = trimmed.to_ascii_lowercase();
-    // Split the head (identifiers only, no parens) from the bound tail (`ATTACH` only).
+    // Split the head (identifiers only, no parens) from the bound tail (`ATTACH` only). The tail is
+    // either a `FOR VALUES <...>` clause or the bare `DEFAULT` keyword.
     let (head, bound_tail) = if attach {
-        let fv = low.find(" for values").ok_or_else(|| {
-            Error::Unsupported("ATTACH PARTITION requires a `FOR VALUES <bound>` clause".to_owned())
-        })?;
-        (&trimmed[..fv], Some(trimmed[fv + 1..].to_owned()))
+        if let Some(fv) = low.find(" for values") {
+            (&trimmed[..fv], Some(trimmed[fv + 1..].to_owned()))
+        } else if let Some(d) = low
+            .rfind(" default")
+            .filter(|&d| low[d + 1..].trim() == "default")
+        {
+            (&trimmed[..d], Some("DEFAULT".to_owned()))
+        } else {
+            return unsupported(
+                "ATTACH PARTITION requires a `FOR VALUES <bound>` clause or `DEFAULT`",
+            );
+        }
     } else {
         (trimmed, None)
     };

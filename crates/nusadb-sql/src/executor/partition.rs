@@ -31,6 +31,14 @@ pub(super) enum PartitionBound {
     List(Vec<ast::Value>),
     /// `hash(key) mod modulus = remainder`.
     Hash { modulus: u64, remainder: u64 },
+    /// The catch-all partition: holds every row matching no sibling's bound. Never matches via
+    /// [`accepts`] — routing falls back to it only when no other partition accepts the key.
+    Default,
+}
+
+/// Whether `bound` is the catch-all [`PartitionBound::Default`].
+pub(super) const fn is_default(bound: &PartitionBound) -> bool {
+    matches!(bound, PartitionBound::Default)
 }
 
 /// A resolved partition of a parent: its table name and bound.
@@ -237,6 +245,8 @@ pub(super) fn accepts(key: &ast::Value, bound: &PartitionBound, key_ty: ColumnTy
                 && *modulus != 0
                 && value_hash(key, key_ty) % modulus == *remainder
         },
+        // The catch-all never accepts a key directly; routing falls back to it explicitly.
+        PartitionBound::Default => false,
     }
 }
 
@@ -284,6 +294,8 @@ fn excludes(
         PartitionBound::Hash { .. } => {
             matches!(constraint.op, crate::PruneOp::Eq) && !accepts(&v, bound, key_ty)
         },
+        // The catch-all can hold any key no sibling covers, so it can never be pruned.
+        PartitionBound::Default => false,
     }
 }
 
@@ -376,6 +388,7 @@ fn encode_payload(
             ("list", parts.join("|"))
         },
         PartitionBound::Hash { modulus, remainder } => ("hash", format!("{modulus}|{remainder}")),
+        PartitionBound::Default => ("default", String::new()),
     })
 }
 
@@ -404,6 +417,7 @@ fn decode_payload(kind: &str, payload: &str, key_ty: ColumnType) -> Result<Parti
                 remainder: r.parse().map_err(|_| bad())?,
             })
         },
+        "default" => Ok(PartitionBound::Default),
         _ => Err(bad()),
     }
 }

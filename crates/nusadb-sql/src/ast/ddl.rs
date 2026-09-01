@@ -107,6 +107,9 @@ pub enum PartitionBound {
         /// This partition's remainder (`0 <= remainder < modulus`).
         remainder: u64,
     },
+    /// `DEFAULT` — the catch-all partition that holds every row matching no sibling's bound. At most
+    /// one per parent; not allowed under a `HASH` parent.
+    Default,
 }
 
 /// `PARTITION OF parent FOR VALUES ...` — a partition of a partitioned parent.

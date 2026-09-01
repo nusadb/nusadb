@@ -197,8 +197,9 @@ fn create_table_partition_range_parses_and_guards() {
         }
     ));
 
-    // Rejections: a DEFAULT partition and MINVALUE/MAXVALUE range bounds.
-    assert!(parse("CREATE TABLE p PARTITION OF m DEFAULT").is_err());
+    // A DEFAULT partition parses (its own test covers the bound); MINVALUE/MAXVALUE range bounds
+    // are still rejected.
+    assert!(parse("CREATE TABLE p PARTITION OF m DEFAULT").is_ok());
     assert!(parse("CREATE TABLE p PARTITION OF m FOR VALUES FROM (MINVALUE) TO (10)").is_err());
 }
 
@@ -762,8 +763,30 @@ fn alter_table_attach_detach_partition_parses() {
     };
     assert_eq!(partition, "p");
 
-    // ATTACH without a bound is refused.
+    // ATTACH ... DEFAULT (the catch-all) parses with a Default bound.
+    let ast::Statement::AlterTable(a) = ok("ALTER TABLE t ATTACH PARTITION p DEFAULT") else {
+        panic!("expected AlterTable");
+    };
+    assert!(matches!(
+        a.action,
+        ast::AlterTableAction::AttachPartition {
+            bound: ast::PartitionBound::Default,
+            ..
+        }
+    ));
+
+    // ATTACH without a bound (neither FOR VALUES nor DEFAULT) is refused.
     assert!(parse("ALTER TABLE t ATTACH PARTITION p").is_err());
+}
+
+#[test]
+fn create_table_partition_of_default_parses() {
+    let ast::Statement::CreateTable(ct) = ok("CREATE TABLE p PARTITION OF t DEFAULT") else {
+        panic!("expected CreateTable");
+    };
+    let po = ct.partition_of.expect("partition_of");
+    assert_eq!(po.parent, "t");
+    assert!(matches!(po.bound, ast::PartitionBound::Default));
 }
 
 #[test]

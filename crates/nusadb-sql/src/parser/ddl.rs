@@ -179,8 +179,8 @@ fn convert_partition_by(expr: &sql::Expr) -> Result<ast::PartitionBy, Error> {
 }
 
 /// Convert `PARTITION OF parent FOR VALUES ...` into a bound (`FROM..TO` → range, `IN` → list,
-/// `WITH (MODULUS/REMAINDER)` → hash). `DEFAULT`, `MINVALUE`/`MAXVALUE`, and multi-column bounds are
-/// rejected loudly.
+/// `WITH (MODULUS/REMAINDER)` → hash, `DEFAULT` → the catch-all). `MINVALUE`/`MAXVALUE` and
+/// multi-column bounds are rejected loudly.
 fn convert_partition_of(
     parent: Option<&sql::ObjectName>,
     for_values: Option<&sql::ForValues>,
@@ -223,9 +223,7 @@ fn convert_partition_of(
             modulus: *modulus,
             remainder: *remainder,
         },
-        sql::ForValues::Default => {
-            return unsupported("a DEFAULT partition is not supported");
-        },
+        sql::ForValues::Default => ast::PartitionBound::Default,
     };
     Ok(Some(ast::PartitionOf {
         parent: object_name(parent)?,

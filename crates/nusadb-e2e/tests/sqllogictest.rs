@@ -464,6 +464,11 @@ fn slt_p1_partition_attach_detach() {
 }
 
 #[test]
+fn slt_p1_partition_default() {
+    run_slt("tests/slt/p1_ddl/partition_default.slt");
+}
+
+#[test]
 fn slt_p1_exclude_constraint() {
     run_slt("tests/slt/p1_ddl/exclude_constraint.slt");
 }

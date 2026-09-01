@@ -167,34 +167,51 @@ fn route_partitioned_insert(
     }
     let (key_pos, key_ty) = partition_key_locus(&plan.table, &plan.columns, key_col)?;
     let partitions = super::partition::partitions_of(engine, txn, &plan.table.name, key_ty)?;
+    // The catch-all partition (if any) receives every row that matches no other partition's bound,
+    // including a NULL key that no range/hash partition can hold.
+    let default_partition = partitions
+        .iter()
+        .find(|p| super::partition::is_default(&p.bound))
+        .map(|p| p.table.clone());
     // Bucket the rows by target partition, preserving input order within each bucket.
     let mut buckets: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
     for row in value_rows {
-        let key = match row.get(key_pos).and_then(Clone::clone) {
-            Some(v) => super::eval::cast_value(v, key_ty)?,
-            None => {
+        // A matching non-default partition wins; otherwise the row falls to the catch-all. A NULL
+        // key is matched by no bound, so it too routes to the catch-all when one exists.
+        let matched = match row.get(key_pos).and_then(Clone::clone) {
+            Some(v) => {
+                let key = super::eval::cast_value(v, key_ty)?;
+                partitions
+                    .iter()
+                    .find(|p| super::partition::accepts(&key, &p.bound, key_ty))
+                    .map(|p| p.table.clone())
+            },
+            None => None,
+        };
+        let target = match matched.or_else(|| default_partition.clone()) {
+            Some(t) => t,
+            None if row.get(key_pos).and_then(Clone::clone).is_none() => {
                 return Err(Error::Coded {
                     message: format!(
-                        "the partition key \"{key_col}\" must be provided (a NULL/defaulted key is \
-                         not yet routed)"
+                        "the partition key \"{key_col}\" must be provided (a NULL key routes only to \
+                         a DEFAULT partition)"
                     ),
                     sqlstate: "0A000",
                 });
             },
+            None => {
+                return Err(Error::Coded {
+                    message: format!(
+                        "no partition of relation \"{}\" found for the inserted row",
+                        plan.table.name
+                    ),
+                    sqlstate: "23514",
+                });
+            },
         };
-        let target = partitions
-            .iter()
-            .find(|p| super::partition::accepts(&key, &p.bound, key_ty))
-            .ok_or_else(|| Error::Coded {
-                message: format!(
-                    "no partition of relation \"{}\" found for the inserted row",
-                    plan.table.name
-                ),
-                sqlstate: "23514",
-            })?;
-        match buckets.iter_mut().find(|(name, _)| name == &target.table) {
+        match buckets.iter_mut().find(|(name, _)| name == &target) {
             Some((_, rows)) => rows.push(row),
-            None => buckets.push((target.table.clone(), vec![row])),
+            None => buckets.push((target, vec![row])),
         }
     }
     let mut inserted = Vec::new();
@@ -244,12 +261,26 @@ fn enforce_partition_bound(
     else {
         return Ok(());
     };
+    // For a direct insert into the catch-all, the row must belong to NO sibling — a row that fits
+    // another partition's bound belongs there, not the default.
+    let siblings = if super::partition::is_default(&bound) {
+        super::partition::partitions_of(engine, txn, &parent, key_ty)?
+    } else {
+        Vec::new()
+    };
     for row in value_rows {
         let key = match row.get(key_pos).and_then(Clone::clone) {
             Some(v) => super::eval::cast_value(v, key_ty)?,
             None => ast::Value::Null,
         };
-        if !super::partition::accepts(&key, &bound, key_ty) {
+        let ok = if super::partition::is_default(&bound) {
+            !siblings
+                .iter()
+                .any(|s| super::partition::accepts(&key, &s.bound, key_ty))
+        } else {
+            super::partition::accepts(&key, &bound, key_ty)
+        };
+        if !ok {
             return Err(Error::Coded {
                 message: format!(
                     "the inserted row does not belong to partition \"{}\"",
