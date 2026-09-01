@@ -213,8 +213,8 @@ impl Catalog for RecordingCatalog<'_> {
     // Partition pruning is only reached through `any_inheritance` above, which already marks the plan
     // uncacheable — so a pruned plan (which depends on the WHERE constants) is never cached. Forward
     // both to the inner catalog so pruning still applies on the plan-cache path.
-    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
-        self.inner.partition_key_column(table)
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
+        self.inner.partition_key_columns(table)
     }
     fn partitions_to_prune(
         &self,

@@ -295,11 +295,11 @@ fn prune_partitions(
     let Some(filter) = filter else {
         return Ok(descendants.to_vec());
     };
-    let Some(key_col) = catalog.partition_key_column(parent)? else {
+    let Some(key_cols) = catalog.partition_key_columns(parent)? else {
         return Ok(descendants.to_vec());
     };
     let mut constraints = Vec::new();
-    collect_prune_constraints(filter, &key_col, base_qual, &mut constraints);
+    collect_prune_constraints(filter, &key_cols, base_qual, &mut constraints);
     if constraints.is_empty() {
         return Ok(descendants.to_vec());
     }
@@ -314,14 +314,15 @@ fn prune_partitions(
         .collect())
 }
 
-/// Collect `key <op> constant` constraints from the top-level `AND`-conjoined predicates of `filter`.
-/// Only bare comparisons of the partition-key column — referenced unqualified or qualified by
-/// `base_qual` — against a constant literal are collected; anything else (an `OR`, a function, a
-/// different column, a non-constant operand) contributes nothing. This is deliberately conservative:
-/// a partition is pruned only when a collected constraint provably excludes it.
+/// Collect `key <op> constant` constraints from the top-level `AND`-conjoined predicates of `filter`,
+/// each tagged with which key column (by index in `key_cols`) it constrains. Only bare comparisons of
+/// a partition-key column — referenced unqualified or qualified by `base_qual` — against a constant
+/// literal are collected; anything else (an `OR`, a function, a non-key column, a non-constant
+/// operand) contributes nothing. This is deliberately conservative: a partition is pruned only when a
+/// collected constraint provably excludes it.
 fn collect_prune_constraints(
     filter: &ast::Expr,
-    key_col: &str,
+    key_cols: &[String],
     base_qual: &str,
     out: &mut Vec<crate::PruneConstraint>,
 ) {
@@ -331,11 +332,11 @@ fn collect_prune_constraints(
             op: ast::BinaryOp::And,
             right,
         } => {
-            collect_prune_constraints(left, key_col, base_qual, out);
-            collect_prune_constraints(right, key_col, base_qual, out);
+            collect_prune_constraints(left, key_cols, base_qual, out);
+            collect_prune_constraints(right, key_cols, base_qual, out);
         },
         ast::Expr::Binary { left, op, right } => {
-            if let Some(c) = key_constraint(left, *op, right, key_col, base_qual) {
+            if let Some(c) = key_constraint(left, *op, right, key_cols, base_qual) {
                 out.push(c);
             }
         },
@@ -347,18 +348,22 @@ fn collect_prune_constraints(
             high,
             negated: false,
             symmetric: false,
-        } if is_key_column(expr, key_col, base_qual) => {
-            if let Some(value) = prune_const(low) {
-                out.push(crate::PruneConstraint {
-                    op: crate::PruneOp::GtEq,
-                    value,
-                });
-            }
-            if let Some(value) = prune_const(high) {
-                out.push(crate::PruneConstraint {
-                    op: crate::PruneOp::LtEq,
-                    value,
-                });
+        } => {
+            if let Some(key_index) = key_column_index(expr, key_cols, base_qual) {
+                if let Some(value) = prune_const(low) {
+                    out.push(crate::PruneConstraint {
+                        key_index,
+                        op: crate::PruneOp::GtEq,
+                        value,
+                    });
+                }
+                if let Some(value) = prune_const(high) {
+                    out.push(crate::PruneConstraint {
+                        key_index,
+                        op: crate::PruneOp::LtEq,
+                        value,
+                    });
+                }
             }
         },
         _ => {},
@@ -366,40 +371,44 @@ fn collect_prune_constraints(
 }
 
 /// Build a [`PruneConstraint`] from a single comparison, oriented so the key is on the left. Returns
-/// `None` unless exactly one side is the key column and the other is a constant literal, and the
-/// operator is a comparison prunable form.
+/// `None` unless exactly one side is a key column and the other is a constant literal, and the
+/// operator is a prunable comparison.
 fn key_constraint(
     left: &ast::Expr,
     op: ast::BinaryOp,
     right: &ast::Expr,
-    key_col: &str,
+    key_cols: &[String],
     base_qual: &str,
 ) -> Option<crate::PruneConstraint> {
     let prune_op = to_prune_op(op)?;
-    if is_key_column(left, key_col, base_qual) {
-        prune_const(right).map(|value| crate::PruneConstraint {
-            op: prune_op,
-            value,
-        })
-    } else if is_key_column(right, key_col, base_qual) {
-        // `const op key` — flip the operator so it reads `key op' const`.
-        prune_const(left).map(|value| crate::PruneConstraint {
-            op: flip_prune_op(prune_op),
-            value,
-        })
-    } else {
-        None
+    // Try `key <op> const` (key on the left), then `const <op> key` (flip the operator). The first
+    // side that is a key column decides; if its counterpart is not a constant there is no constraint.
+    for (key_side, const_side, flipped) in [(left, right, false), (right, left, true)] {
+        if let Some(key_index) = key_column_index(key_side, key_cols, base_qual) {
+            return prune_const(const_side).map(|value| crate::PruneConstraint {
+                key_index,
+                op: if flipped {
+                    flip_prune_op(prune_op)
+                } else {
+                    prune_op
+                },
+                value,
+            });
+        }
     }
+    None
 }
 
-/// Whether `expr` references the partition-key column: unqualified `key`, or `qual.key` where `qual`
-/// is the base table's effective qualifier (its alias, else its name).
-fn is_key_column(expr: &ast::Expr, key_col: &str, base_qual: &str) -> bool {
-    match expr {
-        ast::Expr::Column(name) => name == key_col,
-        ast::Expr::QualifiedColumn { table, column } => table == base_qual && column == key_col,
-        _ => false,
-    }
+/// The index (in `key_cols`) of the partition-key column `expr` references — unqualified `key`, or
+/// `qual.key` where `qual` is the base table's effective qualifier (its alias, else its name) — or
+/// `None` if `expr` is not one of the key columns.
+fn key_column_index(expr: &ast::Expr, key_cols: &[String], base_qual: &str) -> Option<usize> {
+    let name = match expr {
+        ast::Expr::Column(name) => name.as_str(),
+        ast::Expr::QualifiedColumn { table, column } if table == base_qual => column.as_str(),
+        _ => return None,
+    };
+    key_cols.iter().position(|c| c == name)
 }
 
 /// A constant literal usable as a prune bound: a literal, or a negated numeric literal. `NULL` yields

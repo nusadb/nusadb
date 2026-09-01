@@ -884,7 +884,7 @@ fn analyze_attach_partition(
     bound: &ast::PartitionBound,
     catalog: &dyn Catalog,
 ) -> Result<AlterTablePlan, Error> {
-    if catalog.partition_key_column(&parent.name)?.is_none() {
+    if catalog.partition_key_columns(&parent.name)?.is_none() {
         return Err(Error::Unsupported(format!(
             "table \"{}\" is not partitioned, so a partition cannot be attached to it",
             parent.name
@@ -924,7 +924,7 @@ fn analyze_detach_partition(
     partition: &str,
     catalog: &dyn Catalog,
 ) -> Result<AlterTablePlan, Error> {
-    if catalog.partition_key_column(&parent.name)?.is_none() {
+    if catalog.partition_key_columns(&parent.name)?.is_none() {
         return Err(Error::Unsupported(format!(
             "table \"{}\" is not partitioned, so no partition can be detached from it",
             parent.name

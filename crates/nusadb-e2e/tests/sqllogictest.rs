@@ -149,12 +149,12 @@ impl Catalog for SltCatalog<'_> {
         }
     }
 
-    fn partition_key_column(&self, table: &str) -> Result<Option<String>, nusadb_sql::Error> {
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, nusadb_sql::Error> {
         if let Some(txn) = self.txn {
-            nusadb_sql::partition_key_column(self.engine, txn, table)
+            nusadb_sql::partition_key_columns(self.engine, txn, table)
         } else {
             let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
-            let out = nusadb_sql::partition_key_column(self.engine, txn, table);
+            let out = nusadb_sql::partition_key_columns(self.engine, txn, table);
             let _ = self.engine.commit(txn);
             out
         }

@@ -192,7 +192,7 @@ SELECT count(*) FROM m WHERE a = 3
 ----
 0
 
-# A predicate on a non-leading key column prunes nothing but is still correct.
+# A predicate on a non-leading key column alone prunes nothing but is still correct.
 query T
 SELECT v FROM m WHERE b = 50
 ----
@@ -212,3 +212,75 @@ DROP TABLE m4
 
 statement ok
 DROP TABLE m
+
+# Non-leading pruning: when a partition's leading value is pinned (lo[0] == hi[0]) and the query pins
+# that same value with `=`, the partition reduces to a range on the second column, so a second-column
+# predicate can prune it. Quarterly partitions within a year are the canonical case.
+statement ok
+CREATE TABLE e (y INT, mo INT, v TEXT) PARTITION BY RANGE (y, mo)
+
+statement ok
+CREATE TABLE q1 PARTITION OF e FOR VALUES FROM (2024, 1) TO (2024, 4)
+
+statement ok
+CREATE TABLE q2 PARTITION OF e FOR VALUES FROM (2024, 4) TO (2024, 7)
+
+statement ok
+CREATE TABLE q3 PARTITION OF e FOR VALUES FROM (2024, 7) TO (2024, 10)
+
+statement ok
+CREATE TABLE y25 PARTITION OF e FOR VALUES FROM (2025, 1) TO (2026, 1)
+
+statement ok
+INSERT INTO e VALUES (2024, 2, 'a'), (2024, 5, 'b'), (2024, 8, 'c'), (2025, 3, 'd')
+
+# Pinned leading (y = 2024) plus a second-column predicate prunes to the one quarter.
+query T
+SELECT v FROM e WHERE y = 2024 AND mo = 5
+----
+b
+
+query T
+SELECT v FROM e WHERE y = 2024 AND mo >= 7
+----
+c
+
+query T
+SELECT v FROM e WHERE y = 2024 AND mo BETWEEN 4 AND 6
+----
+b
+
+# A second-column value in no quarter of the pinned year returns nothing.
+query I
+SELECT count(*) FROM e WHERE y = 2024 AND mo = 99
+----
+0
+
+# Without the leading pin, a second-column predicate prunes nothing but stays correct.
+query T
+SELECT v FROM e WHERE mo = 5
+----
+b
+
+# The whole pinned year (no second-column predicate) reads its quarters.
+query T
+SELECT v FROM e WHERE y = 2024 ORDER BY v
+----
+a
+b
+c
+
+statement ok
+DROP TABLE q1
+
+statement ok
+DROP TABLE q2
+
+statement ok
+DROP TABLE q3
+
+statement ok
+DROP TABLE y25
+
+statement ok
+DROP TABLE e

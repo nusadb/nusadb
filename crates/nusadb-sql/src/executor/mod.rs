@@ -3446,14 +3446,14 @@ pub fn inheritance_descendants(
     inheritance::descendants(engine, txn, table)
 }
 
-/// Production adapter: the partition-key column of `table` if it is a partitioned parent. Used for
-/// [`Catalog::partition_key_column`](crate::Catalog::partition_key_column).
-pub fn partition_key_column(
+/// Production adapter: the partition-key columns of `table` if it is a partitioned parent. Used for
+/// [`Catalog::partition_key_columns`](crate::Catalog::partition_key_columns).
+pub fn partition_key_columns(
     engine: &dyn StorageEngine,
     txn: TxnId,
     table: &str,
-) -> Result<Option<String>, Error> {
-    partition::parent_key_column(engine, txn, table)
+) -> Result<Option<Vec<String>>, Error> {
+    partition::parent_key_columns(engine, txn, table)
 }
 
 /// Production adapter: the direct partitions of `parent` a query with `constraints` need not scan.
@@ -4327,8 +4327,8 @@ impl crate::Catalog for ExecCatalog<'_> {
         inheritance::descendants(self.engine, self.txn, table)
     }
 
-    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
-        partition::parent_key_column(self.engine, self.txn, table)
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
+        partition::parent_key_columns(self.engine, self.txn, table)
     }
 
     fn partitions_to_prune(
@@ -4523,8 +4523,8 @@ impl crate::Catalog for SessionCatalog<'_> {
         inheritance::descendants(self.engine, self.txn, table)
     }
 
-    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
-        partition::parent_key_column(self.engine, self.txn, table)
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
+        partition::parent_key_columns(self.engine, self.txn, table)
     }
 
     fn partitions_to_prune(

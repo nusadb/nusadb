@@ -132,17 +132,6 @@ pub(super) fn parent_key_columns(
     Ok(None)
 }
 
-/// The *first* partition key column of `table` if it is a partitioned parent, else `None`. Serves both
-/// as an "is this partitioned?" probe and as the pruning key column (pruning only fires for a
-/// single-column key — see [`prune`]'s caller).
-pub(super) fn parent_key_column(
-    engine: &dyn StorageEngine,
-    txn: TxnId,
-    table: &str,
-) -> Result<Option<String>, Error> {
-    Ok(parent_key_columns(engine, txn, table)?.and_then(|c| c.into_iter().next()))
-}
-
 /// The strategy string of `table` if it is a partitioned parent, else `None`.
 pub(super) fn parent_strategy(
     engine: &dyn StorageEngine,
@@ -289,10 +278,9 @@ pub(super) fn compare_tuple(a: &[ast::Value], b: &[ast::Value]) -> Ordering {
 }
 
 /// The direct partitions of `parent` whose bound provably contains no key satisfying `constraints`
-/// — the partitions a query with those key predicates need not scan. `constraints` are on the
-/// *leading* key column (`key_tys[0]`); each constant is coerced to it. A partition is dropped only
-/// when *some* single constraint alone proves it empty, so the result never changes which rows a query
-/// returns — only how many partitions it scans.
+/// — the partitions a query with those key predicates need not scan. Each `constraint` is tagged with
+/// the key column it constrains. A partition is dropped only when the constraints provably leave it
+/// empty, so the result never changes which rows a query returns — only how many partitions it scans.
 pub(super) fn prune(
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -302,53 +290,103 @@ pub(super) fn prune(
 ) -> Result<Vec<String>, Error> {
     let mut dropped = Vec::new();
     for p in partitions_of(engine, txn, parent, key_tys)? {
-        if constraints.iter().any(|c| excludes(&p.bound, c, key_tys)) {
+        if partition_excluded(&p.bound, constraints, key_tys) {
             dropped.push(p.table);
         }
     }
     Ok(dropped)
 }
 
-/// Whether `bound` provably contains no key whose *leading* column satisfies `constraint` — i.e. the
-/// partition can be skipped. Conservative: returns `false` (keep the partition) whenever the constant
-/// cannot be coerced, is `NULL`, or the strategy/arity admits no static proof.
+/// Whether `bound` provably contains no key satisfying `constraints`. Conservative — returns `false`
+/// (keep the partition) whenever no static proof applies.
 ///
-/// For a single-column key a range bound is `[lo, hi)` (half-open, exact). For a multi-column key the
-/// leading column of every row in a range partition lies in the closed interval `[lo[0], hi[0]]` (a
-/// row with leading `= hi[0]` is possible when the trailing bound allows it), so the leading test uses
-/// that closed interval — a proven superset, which only ever keeps extra partitions, never wrongly
-/// drops one. A multi-column hash cannot be routed from the leading column alone, so it is never
-/// pruned.
-fn excludes(
+/// Leading-column (`key_index == 0`) constraints drive range/list/hash pruning: for a single-column
+/// key a range bound is `[lo, hi)` (half-open, exact); for a multi-column key the leading value of
+/// every row lies in the closed interval `[lo[0], hi[0]]` (a row with leading `= hi[0]` is possible
+/// when the trailing bound allows), so the leading test uses that closed interval — a proven superset.
+///
+/// A *non-leading* (`key_index == 1`) constraint can prune a range partition only when the partition's
+/// leading value is pinned (`lo[0] == hi[0]`) **and** the query pins the leading column to that same
+/// value with `=`: the partition then reduces to a range on the second column — `[lo[1], hi[1])` when
+/// the second column is the last key column (exact), else the closed superset `[lo[1], hi[1]]`.
+fn partition_excluded(
     bound: &PartitionBound,
-    constraint: &crate::PruneConstraint,
+    constraints: &[crate::PruneConstraint],
     key_tys: &[ColumnType],
 ) -> bool {
-    let Some(&key_ty) = key_tys.first() else {
+    let Some(&lead_ty) = key_tys.first() else {
         return false;
     };
     let multi = key_tys.len() > 1;
-    let Ok(v) = super::eval::cast_value(constraint.value.clone(), key_ty) else {
-        return false;
+    // Cast a constraint's constant to a key column's type; `None` if it cannot coerce or is NULL.
+    let cast = |value: &ast::Value, ty: ColumnType| -> Option<ast::Value> {
+        match super::eval::cast_value(value.clone(), ty) {
+            Ok(v) if !matches!(v, ast::Value::Null) => Some(v),
+            _ => None,
+        }
     };
-    if matches!(v, ast::Value::Null) {
-        return false;
-    }
     match bound {
-        PartitionBound::Range { lo, hi } => match (lo.first(), hi.first()) {
-            (Some(lo), Some(hi)) if multi => leading_range_excludes(lo, hi, constraint.op, &v),
-            (Some(lo), Some(hi)) => range_excludes(lo, hi, constraint.op, &v),
-            _ => false,
+        PartitionBound::Range { lo, hi } => {
+            let (Some(lo0), Some(hi0)) = (lo.first(), hi.first()) else {
+                return false;
+            };
+            // Leading-column constraints.
+            for c in constraints.iter().filter(|c| c.key_index == 0) {
+                if let Some(v) = cast(&c.value, lead_ty) {
+                    let excluded = if multi {
+                        leading_range_excludes(lo0, hi0, c.op, &v)
+                    } else {
+                        range_excludes(lo0, hi0, c.op, &v)
+                    };
+                    if excluded {
+                        return true;
+                    }
+                }
+            }
+            // Second-column constraints, only when the leading value is pinned and the query pins it.
+            let leading_pinned = super::eval::compare(lo0, hi0) == Ordering::Equal;
+            let query_pins_leading = constraints.iter().any(|c| {
+                c.key_index == 0
+                    && matches!(c.op, crate::PruneOp::Eq)
+                    && cast(&c.value, lead_ty)
+                        .is_some_and(|v| super::eval::compare(&v, lo0) == Ordering::Equal)
+            });
+            if multi && leading_pinned && query_pins_leading {
+                // The second column is exactly bounded (half-open) only when it is the last key
+                // column; with further columns it is a closed superset.
+                let second_is_last = key_tys.len() == 2;
+                if let (Some(&second_ty), Some(lo1), Some(hi1)) =
+                    (key_tys.get(1), lo.get(1), hi.get(1))
+                {
+                    for c in constraints.iter().filter(|c| c.key_index == 1) {
+                        if let Some(v) = cast(&c.value, second_ty) {
+                            let excluded = if second_is_last {
+                                range_excludes(lo1, hi1, c.op, &v)
+                            } else {
+                                leading_range_excludes(lo1, hi1, c.op, &v)
+                            };
+                            if excluded {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
         },
-        // A value set excludes the constraint when no member of the set satisfies it (single-column).
-        PartitionBound::List(values) => !values.iter().any(|x| op_holds(x, constraint.op, &v)),
-        // A single-column hash partition can be excluded by equality: route the constant and keep the
-        // one partition that would hold it. A multi-column hash needs every key column, so a
-        // leading-only predicate gives no static proof.
+        // A value set (single-column) is excluded when no member satisfies some leading constraint.
+        PartitionBound::List(values) => constraints.iter().filter(|c| c.key_index == 0).any(|c| {
+            cast(&c.value, lead_ty).is_some_and(|v| !values.iter().any(|x| op_holds(x, c.op, &v)))
+        }),
+        // A single-column hash partition can be excluded by a leading equality (route the constant,
+        // keep the one that would hold it). A multi-column hash needs every key column.
         PartitionBound::Hash { .. } => {
             !multi
-                && matches!(constraint.op, crate::PruneOp::Eq)
-                && !accepts(std::slice::from_ref(&v), bound, key_tys)
+                && constraints.iter().filter(|c| c.key_index == 0).any(|c| {
+                    matches!(c.op, crate::PruneOp::Eq)
+                        && cast(&c.value, lead_ty)
+                            .is_some_and(|v| !accepts(std::slice::from_ref(&v), bound, key_tys))
+                })
         },
         // The catch-all can hold any key no sibling covers, so it can never be pruned.
         PartitionBound::Default => false,

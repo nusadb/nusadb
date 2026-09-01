@@ -177,10 +177,11 @@ pub trait Catalog {
         Ok(Vec::new())
     }
 
-    /// The partition-key column of `table` if it is a partitioned parent, else `None`. Default `None`
-    /// (no partitioning); the production adapter reads the partition catalog. Used to find which of a
-    /// query's `WHERE` predicates constrain the key and can therefore prune partitions.
-    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
+    /// The partition-key columns of `table` (in key order) if it is a partitioned parent, else `None`.
+    /// Default `None` (no partitioning); the production adapter reads the partition catalog. Used to
+    /// find which of a query's `WHERE` predicates constrain a key column and can therefore prune
+    /// partitions, and as an "is this partitioned?" probe.
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
         let _ = table;
         Ok(None)
     }
@@ -391,6 +392,9 @@ pub enum PruneOp {
 /// the catalog adapter coerces it to the key column's type when testing bounds.
 #[derive(Debug, Clone)]
 pub struct PruneConstraint {
+    /// Which key column this constrains (0 = leading). Only the leading column drives range/hash
+    /// pruning; a non-leading column can prune a range partition whose leading value is pinned.
+    pub key_index: usize,
     /// The comparison operator, oriented `key op value`.
     pub op: PruneOp,
     /// The constant operand.
