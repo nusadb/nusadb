@@ -262,11 +262,11 @@ pub(super) fn run_create_table(
     // Record the child→parent inheritance edges so a later query on a parent expands to this table.
     // A prior same-named table's edges are cleared on DROP, so there is nothing stale to purge here.
     super::inheritance::record_inheritance(engine, txn, &def.name, &plan.inherits)?;
-    // Range partitioning: a `PARTITION BY RANGE` parent records its key; a `PARTITION OF` partition
+    // Partitioning: a `PARTITION BY` parent records its strategy + key; a `PARTITION OF` partition
     // validates + records its bound and joins the parent's inheritance set (so a query on the parent
     // expands over its partitions).
-    if let Some(key_column) = &plan.partition_by {
-        super::partition::record_parent(engine, txn, &def.name, key_column)?;
+    if let Some(pb) = &plan.partition_by {
+        super::partition::record_parent(engine, txn, &def.name, &pb.column, pb.strategy)?;
     }
     if let Some(part) = &plan.partition_of {
         register_partition(&def, part, engine, txn)?;
@@ -274,16 +274,27 @@ pub(super) fn run_create_table(
     Ok(ExecutionResult::Created(id))
 }
 
-/// Register a `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` partition: the parent must be a
-/// range-partitioned table, the bounds are coerced to the key column's type and must be ordered
-/// (`lo < hi`) and not overlap an existing partition, and the partition joins the parent's inheritance
-/// set so a query on the parent reads its rows.
+/// Register a `PARTITION OF parent FOR VALUES ...` partition: the parent must be partitioned, the
+/// bound's kind must match the parent's strategy, its values are coerced to the key column's type and
+/// validated (range `lo < hi` + non-overlap; list values not already claimed; hash modulus/remainder
+/// consistent), and the partition joins the parent's inheritance set so a query on the parent reads
+/// its rows.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive per-strategy validation match (range/list/hash); splitting would scatter \
+              the bound checks that belong together"
+)]
 fn register_partition(
     def: &TableDef,
     part: &crate::planner::PartitionOfPlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
+    use std::cmp::Ordering;
+
+    use crate::planner::PartitionBoundPlan;
+
+    use super::partition::PartitionBound;
     let key_column =
         super::partition::parent_key_column(engine, txn, &part.parent)?.ok_or_else(|| {
             Error::InvalidStatement(format!(
@@ -291,32 +302,101 @@ fn register_partition(
                 part.parent, def.name
             ))
         })?;
+    let strategy =
+        super::partition::parent_strategy(engine, txn, &part.parent)?.unwrap_or_default();
     let key_ty = def
         .columns
         .iter()
         .find(|c| c.name == key_column)
         .map(|c| c.ty)
         .ok_or_else(|| internal_index(0))?;
-    let lo = super::eval::cast_value(part.from.clone(), key_ty)?;
-    let hi = super::eval::cast_value(part.to.clone(), key_ty)?;
-    if super::eval::compare(&lo, &hi) != std::cmp::Ordering::Less {
-        return Err(Error::InvalidStatement(format!(
-            "partition \"{}\" bound lower value must be strictly below the upper value",
-            def.name
-        )));
-    }
-    // Overlap check: `[lo, hi)` must be disjoint from every existing partition of the parent.
-    for existing in super::partition::partitions_of(engine, txn, &part.parent, key_ty)? {
-        let disjoint = super::eval::compare(&hi, &existing.lo) != std::cmp::Ordering::Greater
-            || super::eval::compare(&lo, &existing.hi) != std::cmp::Ordering::Less;
-        if !disjoint {
-            return Err(Error::InvalidStatement(format!(
-                "partition \"{}\" would overlap existing partition \"{}\"",
-                def.name, existing.table
-            )));
-        }
-    }
-    super::partition::record_partition(engine, txn, &def.name, &part.parent, key_ty, &lo, &hi)?;
+    let mismatch = |want: &str| {
+        Error::InvalidStatement(format!(
+            "partition \"{}\" bound does not match parent \"{}\"'s {want} strategy",
+            def.name, part.parent
+        ))
+    };
+    let existing = super::partition::partitions_of(engine, txn, &part.parent, key_ty)?;
+    let bound = match &part.bound {
+        PartitionBoundPlan::Range { from, to } => {
+            if strategy != "range" {
+                return Err(mismatch("non-range"));
+            }
+            let lo = super::eval::cast_value(from.clone(), key_ty)?;
+            let hi = super::eval::cast_value(to.clone(), key_ty)?;
+            if super::eval::compare(&lo, &hi) != Ordering::Less {
+                return Err(Error::InvalidStatement(format!(
+                    "partition \"{}\" lower bound must be strictly below the upper bound",
+                    def.name
+                )));
+            }
+            for e in &existing {
+                if let PartitionBound::Range { lo: elo, hi: ehi } = &e.bound {
+                    let disjoint = super::eval::compare(&hi, elo) != Ordering::Greater
+                        || super::eval::compare(&lo, ehi) != Ordering::Less;
+                    if !disjoint {
+                        return Err(overlap_err(&def.name, &e.table));
+                    }
+                }
+            }
+            PartitionBound::Range { lo, hi }
+        },
+        PartitionBoundPlan::List(values) => {
+            if strategy != "list" {
+                return Err(mismatch("non-list"));
+            }
+            let coerced = values
+                .iter()
+                .map(|v| super::eval::cast_value(v.clone(), key_ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            for e in &existing {
+                if let PartitionBound::List(evals) = &e.bound {
+                    for v in &coerced {
+                        if evals
+                            .iter()
+                            .any(|x| super::eval::compare(v, x) == Ordering::Equal)
+                        {
+                            return Err(overlap_err(&def.name, &e.table));
+                        }
+                    }
+                }
+            }
+            PartitionBound::List(coerced)
+        },
+        PartitionBoundPlan::Hash { modulus, remainder } => {
+            if strategy != "hash" {
+                return Err(mismatch("non-hash"));
+            }
+            if *modulus == 0 || *remainder >= *modulus {
+                return Err(Error::InvalidStatement(format!(
+                    "partition \"{}\": hash MODULUS must be > 0 and REMAINDER must be < MODULUS",
+                    def.name
+                )));
+            }
+            for e in &existing {
+                if let PartitionBound::Hash {
+                    modulus: em,
+                    remainder: er,
+                } = &e.bound
+                {
+                    if em != modulus {
+                        return Err(Error::InvalidStatement(format!(
+                            "partition \"{}\": every hash partition of \"{}\" must share MODULUS {em}",
+                            def.name, part.parent
+                        )));
+                    }
+                    if er == remainder {
+                        return Err(overlap_err(&def.name, &e.table));
+                    }
+                }
+            }
+            PartitionBound::Hash {
+                modulus: *modulus,
+                remainder: *remainder,
+            }
+        },
+    };
+    super::partition::record_partition(engine, txn, &def.name, &part.parent, key_ty, &bound)?;
     // The partition reads through the parent via the shared inheritance-expansion machinery.
     super::inheritance::record_inheritance(
         engine,
@@ -325,6 +405,13 @@ fn register_partition(
         std::slice::from_ref(&part.parent),
     )?;
     Ok(())
+}
+
+/// A "partition would overlap an existing one" error.
+fn overlap_err(partition: &str, existing: &str) -> Error {
+    Error::InvalidStatement(format!(
+        "partition \"{partition}\" would overlap existing partition \"{existing}\""
+    ))
 }
 
 /// For `CREATE TABLE ... (LIKE src)`, copy `src`'s synthetic width / length checks onto the new table

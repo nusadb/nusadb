@@ -68,22 +68,54 @@ pub struct CreateTable {
     pub partition_of: Option<PartitionOf>,
 }
 
-/// `PARTITION BY RANGE (column)` on a partitioned parent. Only single-column `RANGE` is modelled.
+/// The partitioning strategy of a `PARTITION BY` parent. Single-column only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    /// `PARTITION BY RANGE (col)` — each partition owns a `[from, to)` key range.
+    Range,
+    /// `PARTITION BY LIST (col)` — each partition owns an explicit set of key values.
+    List,
+    /// `PARTITION BY HASH (col)` — each partition owns keys where `hash(key) mod modulus = remainder`.
+    Hash,
+}
+
+/// `PARTITION BY {RANGE|LIST|HASH} (column)` on a partitioned parent (single key column).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionBy {
+    /// The partitioning strategy.
+    pub strategy: PartitionStrategy,
     /// The single partition-key column.
     pub column: String,
 }
 
-/// `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` on a range partition.
+/// The bound of a partition, matching its parent's strategy.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionBound {
+    /// `FOR VALUES FROM (from) TO (to)` — the `[from, to)` key range.
+    Range {
+        /// Inclusive lower bound.
+        from: Expr,
+        /// Exclusive upper bound.
+        to: Expr,
+    },
+    /// `FOR VALUES IN (v, ...)` — the explicit key values this partition holds.
+    List(Vec<Expr>),
+    /// `FOR VALUES WITH (MODULUS m, REMAINDER r)` — keys where `hash(key) mod m = r`.
+    Hash {
+        /// The modulus (shared by all hash partitions of the parent).
+        modulus: u64,
+        /// This partition's remainder (`0 <= remainder < modulus`).
+        remainder: u64,
+    },
+}
+
+/// `PARTITION OF parent FOR VALUES ...` — a partition of a partitioned parent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionOf {
     /// The partitioned parent table this is a partition of.
     pub parent: String,
-    /// Inclusive lower bound of this partition's key range.
-    pub from: Expr,
-    /// Exclusive upper bound of this partition's key range.
-    pub to: Expr,
+    /// This partition's bound (its kind must match the parent's strategy).
+    pub bound: PartitionBound,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name AS <select>`.

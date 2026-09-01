@@ -1,0 +1,115 @@
+# List and hash partitioning.
+#
+# LIST: each partition (FOR VALUES IN (...)) claims a set of key values; an INSERT into the parent
+# routes each row to the partition whose value set contains its key. A value claimed by no partition
+# is refused; a value already claimed by another partition cannot be re-claimed.
+#
+# HASH: each partition (FOR VALUES WITH (MODULUS m, REMAINDER r)) claims the rows whose key hashes
+# to r mod m. Every hash partition must share the modulus, and each remainder is unique. Placement
+# is engine-specific, so the invariant tested is: every row routes to exactly one partition, the
+# parent reads them all, and the per-partition counts sum to the whole.
+
+# --- LIST ---
+
+statement ok
+CREATE TABLE t (id INT, region TEXT) PARTITION BY LIST (region)
+
+statement ok
+CREATE TABLE t_asia PARTITION OF t FOR VALUES IN ('JP', 'ID', 'SG')
+
+statement ok
+CREATE TABLE t_eu PARTITION OF t FOR VALUES IN ('DE', 'FR')
+
+statement ok
+INSERT INTO t VALUES (1, 'ID'), (2, 'FR'), (3, 'JP'), (4, 'DE')
+
+# The parent reads every partition.
+query IT
+SELECT id, region FROM t ORDER BY id
+----
+1  ID
+2  FR
+3  JP
+4  DE
+
+# Each partition holds exactly its routed rows.
+query I
+SELECT id FROM t_asia ORDER BY id
+----
+1
+3
+
+# A value claimed by no partition is refused (no silent drop).
+statement error no partition
+INSERT INTO t VALUES (9, 'US')
+
+# A value already claimed by another partition cannot be re-claimed.
+statement error overlap
+CREATE TABLE t_bad PARTITION OF t FOR VALUES IN ('JP')
+
+# A hash bound on a list parent is refused.
+statement error
+CREATE TABLE t_bad PARTITION OF t FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+
+# --- HASH ---
+
+statement ok
+CREATE TABLE h (id INT, v TEXT) PARTITION BY HASH (id)
+
+statement ok
+CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 3, REMAINDER 0)
+
+statement ok
+CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 3, REMAINDER 1)
+
+statement ok
+CREATE TABLE h2 PARTITION OF h FOR VALUES WITH (MODULUS 3, REMAINDER 2)
+
+statement ok
+INSERT INTO h SELECT g, 'x' FROM generate_series(1, 30) g
+
+# Every row routes to exactly one partition: the parent reads them all.
+query I
+SELECT count(*) FROM h
+----
+30
+
+# The per-partition counts sum to the whole (no row lost, none duplicated).
+query I
+SELECT (SELECT count(*) FROM h0) + (SELECT count(*) FROM h1) + (SELECT count(*) FROM h2)
+----
+30
+
+# Every hash partition must share the modulus.
+statement error MODULUS
+CREATE TABLE hbad PARTITION OF h FOR VALUES WITH (MODULUS 4, REMAINDER 0)
+
+# A remainder already claimed cannot be re-claimed.
+statement error overlap
+CREATE TABLE hbad PARTITION OF h FOR VALUES WITH (MODULUS 3, REMAINDER 0)
+
+# A list bound on a hash parent is refused.
+statement error
+CREATE TABLE hbad PARTITION OF h FOR VALUES IN (1)
+
+# Cleanup: a parent with partitions cannot be dropped until its partitions are.
+statement ok
+DROP TABLE t_asia
+
+statement ok
+DROP TABLE t_eu
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE h0
+
+statement ok
+DROP TABLE h1
+
+statement ok
+DROP TABLE h2
+
+statement ok
+DROP TABLE h

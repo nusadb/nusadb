@@ -155,9 +155,9 @@ pub(super) fn analyze_create_table(
     })
 }
 
-/// Validate a `PARTITION BY RANGE (col)` key: the column must be one of the table's declared columns.
-/// Returns the key column name (or `None` for a non-partitioned table).
-fn resolve_partition_by(ct: &ast::CreateTable) -> Result<Option<String>, Error> {
+/// Validate a `PARTITION BY {RANGE|LIST|HASH} (col)` key: the column must be one of the table's
+/// declared columns. Returns the strategy + key column (or `None` for a non-partitioned table).
+fn resolve_partition_by(ct: &ast::CreateTable) -> Result<Option<ast::PartitionBy>, Error> {
     let Some(pb) = &ct.partition_by else {
         return Ok(None);
     };
@@ -167,16 +167,18 @@ fn resolve_partition_by(ct: &ast::CreateTable) -> Result<Option<String>, Error> 
             column: pb.column.clone(),
         });
     }
-    Ok(Some(pb.column.clone()))
+    Ok(Some(pb.clone()))
 }
 
-/// Resolve a `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)`: the parent must exist, the partition
-/// declares no columns of its own (it takes the parent's), and each bound must be a constant literal.
-/// Sets `ct.columns` to the parent's columns and returns the resolved bound.
+/// Resolve a `PARTITION OF parent FOR VALUES ...`: the parent must exist, the partition declares no
+/// columns of its own (it takes the parent's), and range/list bound values must be constant literals.
+/// Sets `ct.columns` to the parent's columns and returns the resolved bound (its kind is checked
+/// against the parent's strategy by the executor, which reads the recorded strategy).
 fn resolve_partition_of(
     ct: &mut ast::CreateTable,
     catalog: &dyn Catalog,
 ) -> Result<Option<crate::planner::PartitionOfPlan>, Error> {
+    use crate::planner::PartitionBoundPlan;
     let Some(po) = ct.partition_of.clone() else {
         return Ok(None);
     };
@@ -207,10 +209,24 @@ fn resolve_partition_of(
             identity_always: false,
         })
         .collect();
+    let bound = match po.bound {
+        ast::PartitionBound::Range { from, to } => PartitionBoundPlan::Range {
+            from: const_bound_value(&from)?,
+            to: const_bound_value(&to)?,
+        },
+        ast::PartitionBound::List(values) => PartitionBoundPlan::List(
+            values
+                .iter()
+                .map(const_bound_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        ast::PartitionBound::Hash { modulus, remainder } => {
+            PartitionBoundPlan::Hash { modulus, remainder }
+        },
+    };
     Ok(Some(crate::planner::PartitionOfPlan {
         parent: parent.name,
-        from: const_bound_value(&po.from)?,
-        to: const_bound_value(&po.to)?,
+        bound,
     }))
 }
 

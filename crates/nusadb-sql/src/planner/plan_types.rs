@@ -648,9 +648,9 @@ pub struct CreateTablePlan {
     /// child→parent edges in the inheritance catalog so a query on a parent expands to its
     /// descendants. Empty for a non-inheriting table.
     pub inherits: Vec<String>,
-    /// `PARTITION BY RANGE (col)` — this table is a range-partitioned parent keyed on the named
-    /// column. The executor records it in the partition catalog; `INSERT` then routes to a partition.
-    pub partition_by: Option<String>,
+    /// `PARTITION BY {RANGE|LIST|HASH} (col)` — this table is a partitioned parent (strategy + key
+    /// column). The executor records it in the partition catalog; `INSERT` then routes to a partition.
+    pub partition_by: Option<crate::ast::PartitionBy>,
     /// `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` — this table is a range partition. The
     /// analyzer merged the parent's columns into [`columns`](Self::columns); the executor validates
     /// the parent is partitioned, coerces `[from, to)` to the key type, and records the bound.
@@ -662,10 +662,29 @@ pub struct CreateTablePlan {
 pub struct PartitionOfPlan {
     /// The partitioned parent table.
     pub parent: String,
-    /// Inclusive lower bound literal (coerced to the key column type by the executor).
-    pub from: crate::ast::Value,
-    /// Exclusive upper bound literal (coerced to the key column type by the executor).
-    pub to: crate::ast::Value,
+    /// This partition's bound (its kind is validated against the parent's strategy by the executor).
+    pub bound: PartitionBoundPlan,
+}
+
+/// A resolved partition bound (literals coerced to the key column type by the executor).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionBoundPlan {
+    /// `[from, to)` key range.
+    Range {
+        /// Inclusive lower bound literal.
+        from: crate::ast::Value,
+        /// Exclusive upper bound literal.
+        to: crate::ast::Value,
+    },
+    /// The explicit key value set this partition holds.
+    List(Vec<crate::ast::Value>),
+    /// Keys where `hash(key) mod modulus = remainder`.
+    Hash {
+        /// The modulus (shared by all hash partitions of the parent).
+        modulus: u64,
+        /// This partition's remainder.
+        remainder: u64,
+    },
 }
 
 /// A resolved `CHECK` constraint.

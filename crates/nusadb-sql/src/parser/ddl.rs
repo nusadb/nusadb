@@ -145,9 +145,9 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
     }))
 }
 
-/// Convert `PARTITION BY RANGE (col)` on a partitioned parent. sqlparser models the clause as a
-/// function-style expression `RANGE(col)`; only single-column `RANGE` is supported — `LIST`/`HASH`
-/// and a multi-column key are rejected loudly (silently treating them as `RANGE` would mis-route).
+/// Convert `PARTITION BY {RANGE|LIST|HASH} (col)` on a partitioned parent. sqlparser models the
+/// clause as a function-style expression `RANGE(col)`; only a single simple key column is supported
+/// (a multi-column key or an expression key is rejected loudly).
 fn convert_partition_by(expr: &sql::Expr) -> Result<ast::PartitionBy, Error> {
     let sql::Expr::Function(func) = expr else {
         return unsupported("CREATE TABLE ... PARTITION BY with an unrecognized clause");
@@ -156,47 +156,45 @@ fn convert_partition_by(expr: &sql::Expr) -> Result<ast::PartitionBy, Error> {
         Some(part) => part_ident(part)?.value.to_ascii_uppercase(),
         None => String::new(),
     };
-    if strategy != "RANGE" {
-        return unsupported(
-            "only PARTITION BY RANGE is supported (LIST / HASH partitioning is not)",
-        );
-    }
+    let strategy = match strategy.as_str() {
+        "RANGE" => ast::PartitionStrategy::Range,
+        "LIST" => ast::PartitionStrategy::List,
+        "HASH" => ast::PartitionStrategy::Hash,
+        _ => return unsupported("PARTITION BY must be RANGE, LIST, or HASH"),
+    };
     let sql::FunctionArguments::List(list) = &func.args else {
-        return unsupported("PARTITION BY RANGE needs exactly one key column");
+        return unsupported("PARTITION BY needs exactly one key column");
     };
     let [sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Identifier(col)))] =
         list.args.as_slice()
     else {
         return unsupported(
-            "PARTITION BY RANGE supports a single simple key column (not an expression or multiple \
-             columns)",
+            "PARTITION BY supports a single simple key column (not an expression or multiple columns)",
         );
     };
     Ok(ast::PartitionBy {
+        strategy,
         column: fold_ident(col),
     })
 }
 
-/// Convert `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` on a range partition. Only the
-/// single-column range form with concrete bounds is supported; `IN`/`WITH`/`DEFAULT`, `MINVALUE`/
-/// `MAXVALUE`, and multi-column bounds are rejected loudly.
+/// Convert `PARTITION OF parent FOR VALUES ...` into a bound (`FROM..TO` → range, `IN` → list,
+/// `WITH (MODULUS/REMAINDER)` → hash). `DEFAULT`, `MINVALUE`/`MAXVALUE`, and multi-column bounds are
+/// rejected loudly.
 fn convert_partition_of(
     parent: Option<&sql::ObjectName>,
     for_values: Option<&sql::ForValues>,
 ) -> Result<Option<ast::PartitionOf>, Error> {
-    match (parent, for_values) {
-        (None, None) => Ok(None),
-        (Some(_), None) => unsupported("PARTITION OF without a FOR VALUES bound"),
-        (None, Some(_)) => unsupported("FOR VALUES without PARTITION OF"),
-        (Some(parent), Some(for_values)) => {
-            let sql::ForValues::From { from, to } = for_values else {
-                return unsupported(
-                    "only PARTITION OF ... FOR VALUES FROM (lo) TO (hi) is supported (not LIST / \
-                     HASH / DEFAULT partitions)",
-                );
-            };
-            let bound = |bounds: &[sql::PartitionBoundValue],
-                         which: &str|
+    let (parent, for_values) = match (parent, for_values) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => return unsupported("PARTITION OF without a FOR VALUES bound"),
+        (None, Some(_)) => return unsupported("FOR VALUES without PARTITION OF"),
+        (Some(p), Some(fv)) => (p, fv),
+    };
+    let bound = match for_values {
+        sql::ForValues::From { from, to } => {
+            let one = |bounds: &[sql::PartitionBoundValue],
+                       which: &str|
              -> Result<ast::Expr, Error> {
                 let [sql::PartitionBoundValue::Expr(expr)] = bounds else {
                     return unsupported(&format!(
@@ -206,13 +204,33 @@ fn convert_partition_of(
                 };
                 convert_expr(expr.clone())
             };
-            Ok(Some(ast::PartitionOf {
-                parent: object_name(parent)?,
-                from: bound(from, "lower")?,
-                to: bound(to, "upper")?,
-            }))
+            ast::PartitionBound::Range {
+                from: one(from, "lower")?,
+                to: one(to, "upper")?,
+            }
         },
-    }
+        sql::ForValues::In(values) => {
+            if values.is_empty() {
+                return unsupported("PARTITION OF ... FOR VALUES IN () needs at least one value");
+            }
+            let converted = values
+                .iter()
+                .map(|v| convert_expr(v.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            ast::PartitionBound::List(converted)
+        },
+        sql::ForValues::With { modulus, remainder } => ast::PartitionBound::Hash {
+            modulus: *modulus,
+            remainder: *remainder,
+        },
+        sql::ForValues::Default => {
+            return unsupported("a DEFAULT partition is not supported");
+        },
+    };
+    Ok(Some(ast::PartitionOf {
+        parent: object_name(parent)?,
+        bound,
+    }))
 }
 
 /// Convert a column definition, returning the [`ast::ColumnDef`] plus any column-level

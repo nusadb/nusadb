@@ -184,7 +184,7 @@ fn route_partitioned_insert(
         };
         let target = partitions
             .iter()
-            .find(|p| super::partition::contains(&key, &p.lo, &p.hi))
+            .find(|p| super::partition::accepts(&key, &p.bound, key_ty))
             .ok_or_else(|| Error::Coded {
                 message: format!(
                     "no partition of relation \"{}\" found for the inserted row",
@@ -239,18 +239,17 @@ fn enforce_partition_bound(
         return Ok(());
     };
     let (key_pos, key_ty) = partition_key_locus(&plan.table, &plan.columns, &key_col)?;
-    let Some((_, lo, hi)) =
+    let Some((_, bound)) =
         super::partition::partition_bound(engine, txn, &plan.table.name, key_ty)?
     else {
         return Ok(());
     };
     for row in value_rows {
-        // A range partition never holds a NULL key, so a NULL/omitted key does not belong here.
         let key = match row.get(key_pos).and_then(Clone::clone) {
             Some(v) => super::eval::cast_value(v, key_ty)?,
             None => ast::Value::Null,
         };
-        if !super::partition::contains(&key, &lo, &hi) {
+        if !super::partition::accepts(&key, &bound, key_ty) {
             return Err(Error::Coded {
                 message: format!(
                     "the inserted row does not belong to partition \"{}\"",

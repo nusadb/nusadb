@@ -153,33 +153,52 @@ fn exclude_equality_constraint_rewrites_to_unique() {
 
 #[test]
 fn create_table_partition_range_parses_and_guards() {
-    // `PARTITION BY RANGE (col)` captures the single key column.
-    let ast::Statement::CreateTable(ct) =
-        ok("CREATE TABLE m (id INT, r INT) PARTITION BY RANGE (r)")
-    else {
-        panic!("expected CreateTable");
+    // `PARTITION BY {RANGE|LIST|HASH} (col)` captures the strategy + single key column.
+    let strat = |sql: &str| -> (ast::PartitionStrategy, String) {
+        let ast::Statement::CreateTable(ct) = ok(sql) else {
+            panic!("expected CreateTable");
+        };
+        let pb = ct.partition_by.expect("partition_by");
+        (pb.strategy, pb.column)
     };
     assert_eq!(
-        ct.partition_by.as_ref().map(|p| p.column.as_str()),
-        Some("r")
+        strat("CREATE TABLE m (id INT, r INT) PARTITION BY RANGE (r)"),
+        (ast::PartitionStrategy::Range, "r".to_owned())
     );
-    assert!(ct.partition_of.is_none());
+    assert_eq!(
+        strat("CREATE TABLE m (id INT) PARTITION BY LIST (id)").0,
+        ast::PartitionStrategy::List
+    );
+    assert_eq!(
+        strat("CREATE TABLE m (id INT) PARTITION BY HASH (id)").0,
+        ast::PartitionStrategy::Hash
+    );
 
-    // `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` captures parent + bounds (no own columns).
-    let ast::Statement::CreateTable(ct) =
-        ok("CREATE TABLE p PARTITION OF m FOR VALUES FROM (0) TO (100)")
-    else {
-        panic!("expected CreateTable");
+    // `PARTITION OF parent FOR VALUES ...` captures the parent + a bound of the matching kind.
+    let bound = |sql: &str| -> ast::PartitionBound {
+        let ast::Statement::CreateTable(ct) = ok(sql) else {
+            panic!("expected CreateTable");
+        };
+        ct.partition_of.expect("partition_of").bound
     };
-    let po = ct.partition_of.as_ref().expect("partition_of");
-    assert_eq!(po.parent, "m");
-    assert!(ct.partition_by.is_none());
+    assert!(matches!(
+        bound("CREATE TABLE p PARTITION OF m FOR VALUES FROM (0) TO (100)"),
+        ast::PartitionBound::Range { .. }
+    ));
+    assert!(matches!(
+        bound("CREATE TABLE p PARTITION OF m FOR VALUES IN (1, 2, 3)"),
+        ast::PartitionBound::List(v) if v.len() == 3
+    ));
+    assert!(matches!(
+        bound("CREATE TABLE p PARTITION OF m FOR VALUES WITH (MODULUS 4, REMAINDER 1)"),
+        ast::PartitionBound::Hash {
+            modulus: 4,
+            remainder: 1
+        }
+    ));
 
-    // Rejections: LIST / HASH strategies, DEFAULT / IN / WITH bounds, and MINVALUE/MAXVALUE.
-    assert!(parse("CREATE TABLE m (id INT) PARTITION BY LIST (id)").is_err());
-    assert!(parse("CREATE TABLE m (id INT) PARTITION BY HASH (id)").is_err());
+    // Rejections: a DEFAULT partition and MINVALUE/MAXVALUE range bounds.
     assert!(parse("CREATE TABLE p PARTITION OF m DEFAULT").is_err());
-    assert!(parse("CREATE TABLE p PARTITION OF m FOR VALUES IN (1, 2)").is_err());
     assert!(parse("CREATE TABLE p PARTITION OF m FOR VALUES FROM (MINVALUE) TO (10)").is_err());
 }
 
@@ -5434,15 +5453,14 @@ fn create_temporary_table_as_select_is_rejected() {
 }
 
 #[test]
-fn create_table_partition_by_unsupported_strategies_are_rejected() {
-    // `PARTITION BY RANGE` is now supported (see `create_table_partition_range_parses_and_guards`);
-    // the strategies that are not still reject loudly rather than silently dropping the clause.
+fn create_table_partition_by_rejects_bad_forms() {
+    // RANGE/LIST/HASH all parse now; a multi-column key and a DEFAULT partition are still refused.
     assert!(matches!(
-        parse("CREATE TABLE t (id INT) PARTITION BY LIST (id)"),
+        parse("CREATE TABLE t (a INT, b INT) PARTITION BY RANGE (a, b)"),
         Err(Error::Unsupported(_)),
     ));
     assert!(matches!(
-        parse("CREATE TABLE t (id INT) PARTITION BY HASH (id)"),
+        parse("CREATE TABLE t (id INT) PARTITION BY GiST (id)"),
         Err(Error::Unsupported(_)),
     ));
 }

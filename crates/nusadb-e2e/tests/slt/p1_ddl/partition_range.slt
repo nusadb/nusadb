@@ -44,12 +44,13 @@ INSERT INTO ev VALUES (4, 500)
 statement error does not belong
 INSERT INTO ev_lo VALUES (5, 150)
 
-# Overlapping and non-range partitions are refused.
+# An overlapping range partition is refused.
 statement error
 CREATE TABLE ev_bad PARTITION OF ev FOR VALUES FROM (50) TO (120)
 
+# A range partition bound is required on a range parent; a list/hash bound is refused.
 statement error
-CREATE TABLE h (id INT) PARTITION BY HASH (id)
+CREATE TABLE ev_bad PARTITION OF ev FOR VALUES IN (5)
 
 # A constraint on a partitioned parent (which would not be enforced across partitions) is refused.
 statement error

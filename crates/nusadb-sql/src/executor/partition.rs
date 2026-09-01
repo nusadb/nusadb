@@ -1,11 +1,12 @@
-//! Range table partitioning — metadata catalog + `INSERT` routing.
+//! Table partitioning — metadata catalog + `INSERT` routing (RANGE, LIST, HASH).
 //!
-//! `CREATE TABLE m (...) PARTITION BY RANGE (col)` records a *parent* row here; `CREATE TABLE p
-//! PARTITION OF m FOR VALUES FROM (lo) TO (hi)` records a *partition* row (and a child→parent edge in
-//! the inheritance catalog, so a query on the parent expands over its partitions exactly as an
+//! `CREATE TABLE m (...) PARTITION BY {RANGE|LIST|HASH} (col)` records a *parent* row here;
+//! `CREATE TABLE p PARTITION OF m FOR VALUES ...` records a *partition* row (and a child→parent edge
+//! in the inheritance catalog, so a query on the parent expands over its partitions exactly as an
 //! inheritance parent does). The parent table holds no rows of its own: an `INSERT` into it is routed
-//! to the partition whose `[lo, hi)` bound contains the key. Mirrors the trigger/function catalog
-//! pattern — no storage-spine change.
+//! to the partition whose bound accepts the key — a `[lo, hi)` range, an `IN (...)` value set, or
+//! `hash(key) mod modulus = remainder`. Mirrors the trigger/function catalog pattern — no
+//! storage-spine change.
 #![allow(clippy::wildcard_imports)]
 
 use std::cmp::Ordering;
@@ -15,55 +16,75 @@ use super::*;
 /// Engine-scoped system catalog of partition metadata.
 pub(super) const PARTITION_CATALOG: &str = "nusadb_partitions";
 
-/// Five-text-column schema: `(role, table, aux, lo, hi)`.
-/// - a parent row is `("parent", <parent table>, <key column>, "", "")`;
-/// - a partition row is `("part", <partition table>, <parent table>, <lo hex>, <hi hex>)`, where the
-///   bounds are hex of the key value encoded at the key column's type.
+/// Five-text-column schema: `(role, table, aux, kind, payload)`.
+/// - a parent row is `("parent", <parent table>, <key column>, <strategy>, "")`;
+/// - a partition row is `("part", <partition table>, <parent table>, <kind>, <payload>)`, where
+///   `kind` is `range`/`list`/`hash` and `payload` encodes the bound (see [`encode_payload`]).
 const PARTITION_CATALOG_SCHEMA: [ColumnType; 5] = [ColumnType::Text; 5];
 
-/// A resolved partition of a parent: its table name and `[lo, hi)` key bound (decoded to values).
-pub(super) struct PartitionEntry {
-    pub table: String,
-    pub lo: ast::Value,
-    pub hi: ast::Value,
+/// A partition's bound (values already coerced to the key column's type).
+#[derive(Clone)]
+pub(super) enum PartitionBound {
+    /// `[lo, hi)` — a key `k` belongs when `lo <= k < hi`.
+    Range { lo: ast::Value, hi: ast::Value },
+    /// An explicit value set — a key belongs when it equals one of them.
+    List(Vec<ast::Value>),
+    /// `hash(key) mod modulus = remainder`.
+    Hash { modulus: u64, remainder: u64 },
 }
 
-/// Record a `PARTITION BY RANGE (key)` parent.
+/// A resolved partition of a parent: its table name and bound.
+pub(super) struct PartitionEntry {
+    pub table: String,
+    pub bound: PartitionBound,
+}
+
+/// The strategy string stored for a parent (`range`/`list`/`hash`).
+pub(super) const fn strategy_str(s: ast::PartitionStrategy) -> &'static str {
+    match s {
+        ast::PartitionStrategy::Range => "range",
+        ast::PartitionStrategy::List => "list",
+        ast::PartitionStrategy::Hash => "hash",
+    }
+}
+
+/// Record a `PARTITION BY <strategy> (key)` parent.
 pub(super) fn record_parent(
     engine: &dyn StorageEngine,
     txn: TxnId,
     parent: &str,
     key_column: &str,
+    strategy: ast::PartitionStrategy,
 ) -> Result<(), Error> {
     let cat = ensure_catalog(engine, txn)?;
     let row = [
         text("parent"),
         text(parent),
         text(key_column),
-        text(""),
+        text(strategy_str(strategy)),
         text(""),
     ];
     engine.insert(txn, cat, &row::encode(&row, &PARTITION_CATALOG_SCHEMA)?)?;
     Ok(())
 }
 
-/// Record a partition of `parent` with a `[lo, hi)` bound already coerced to the key type.
+/// Record a partition of `parent` with a bound already coerced to the key type.
 pub(super) fn record_partition(
     engine: &dyn StorageEngine,
     txn: TxnId,
     partition: &str,
     parent: &str,
     key_ty: ColumnType,
-    lo: &ast::Value,
-    hi: &ast::Value,
+    bound: &PartitionBound,
 ) -> Result<(), Error> {
     let cat = ensure_catalog(engine, txn)?;
+    let (kind, payload) = encode_payload(bound, key_ty)?;
     let row = [
         text("part"),
         text(partition),
         text(parent),
-        text(&encode_bound(lo, key_ty)?),
-        text(&encode_bound(hi, key_ty)?),
+        text(kind),
+        text(&payload),
     ];
     engine.insert(txn, cat, &row::encode(&row, &PARTITION_CATALOG_SCHEMA)?)?;
     Ok(())
@@ -92,6 +113,20 @@ pub(super) fn parent_key_column(
     Ok(None)
 }
 
+/// The strategy string of `table` if it is a partitioned parent, else `None`.
+pub(super) fn parent_strategy(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: &str,
+) -> Result<Option<String>, Error> {
+    for row in rows(engine, txn)? {
+        if field(&row, 0) == "parent" && field(&row, 1) == table {
+            return Ok(Some(field(&row, 3).to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 /// The partitioned parent of `table` if it is a partition, else `None` (no bound decode needed).
 pub(super) fn partition_parent(
     engine: &dyn StorageEngine,
@@ -106,24 +141,23 @@ pub(super) fn partition_parent(
     Ok(None)
 }
 
-/// The `(parent, lo, hi)` bound of `table` if it is a partition, decoded at `key_ty`.
+/// The `(parent, bound)` of `table` if it is a partition, decoded at `key_ty`.
 pub(super) fn partition_bound(
     engine: &dyn StorageEngine,
     txn: TxnId,
     table: &str,
     key_ty: ColumnType,
-) -> Result<Option<(String, ast::Value, ast::Value)>, Error> {
+) -> Result<Option<(String, PartitionBound)>, Error> {
     for row in rows(engine, txn)? {
         if field(&row, 0) == "part" && field(&row, 1) == table {
-            let lo = decode_bound(field(&row, 3), key_ty)?;
-            let hi = decode_bound(field(&row, 4), key_ty)?;
-            return Ok(Some((field(&row, 2).to_owned(), lo, hi)));
+            let bound = decode_payload(field(&row, 3), field(&row, 4), key_ty)?;
+            return Ok(Some((field(&row, 2).to_owned(), bound)));
         }
     }
     Ok(None)
 }
 
-/// Every partition of `parent`, decoded at `key_ty`, sorted by lower bound.
+/// Every partition of `parent`, decoded at `key_ty`.
 pub(super) fn partitions_of(
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -135,12 +169,10 @@ pub(super) fn partitions_of(
         if field(&row, 0) == "part" && field(&row, 2) == parent {
             out.push(PartitionEntry {
                 table: field(&row, 1).to_owned(),
-                lo: decode_bound(field(&row, 3), key_ty)?,
-                hi: decode_bound(field(&row, 4), key_ty)?,
+                bound: decode_payload(field(&row, 3), field(&row, 4), key_ty)?,
             });
         }
     }
-    out.sort_by(|a, b| super::eval::compare(&a.lo, &b.lo));
     Ok(out)
 }
 
@@ -163,10 +195,37 @@ pub(super) fn remove_for(engine: &dyn StorageEngine, txn: TxnId, table: &str) ->
     Ok(())
 }
 
-/// Whether `key` falls in `[lo, hi)` — the range-partition containment test.
-pub(super) fn contains(key: &ast::Value, lo: &ast::Value, hi: &ast::Value) -> bool {
-    super::eval::compare(key, lo) != Ordering::Less
-        && super::eval::compare(key, hi) == Ordering::Less
+/// Whether `key` belongs in `bound`. `NULL` belongs only to a `LIST` partition that explicitly holds
+/// `NULL`; a range/hash partition never accepts `NULL` (matching the reference engine).
+pub(super) fn accepts(key: &ast::Value, bound: &PartitionBound, key_ty: ColumnType) -> bool {
+    match bound {
+        PartitionBound::Range { lo, hi } => {
+            !matches!(key, ast::Value::Null)
+                && super::eval::compare(key, lo) != Ordering::Less
+                && super::eval::compare(key, hi) == Ordering::Less
+        },
+        PartitionBound::List(values) => values
+            .iter()
+            .any(|v| super::eval::compare(key, v) == Ordering::Equal),
+        PartitionBound::Hash { modulus, remainder } => {
+            !matches!(key, ast::Value::Null)
+                && *modulus != 0
+                && value_hash(key, key_ty) % modulus == *remainder
+        },
+    }
+}
+
+/// A deterministic 64-bit hash of a key value at its column type, for HASH partition routing. Uses
+/// FNV-1a over the value's canonical row encoding — self-contained and stable within an engine build
+/// (the exact partition a key lands in is engine-specific, as it is in the reference engine).
+pub(super) fn value_hash(value: &ast::Value, key_ty: ColumnType) -> u64 {
+    let bytes = row::encode(std::slice::from_ref(value), &[key_ty]).unwrap_or_default();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 // === helpers ==============================================================
@@ -195,14 +254,65 @@ fn rows(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Vec<ast::Value>>, 
     Ok(out)
 }
 
-/// Encode a bound value (already the key type) as hex of its one-column row encoding, so it survives
-/// in a text catalog column and decodes back to the exact typed value.
-fn encode_bound(value: &ast::Value, key_ty: ColumnType) -> Result<String, Error> {
+/// Encode a bound to `(kind, payload)`. Range/list values are hex of their one-column row encoding
+/// (so they survive in a text column and decode back to the exact typed value), pipe-separated; hash
+/// stores `modulus|remainder` as decimals.
+fn encode_payload(
+    bound: &PartitionBound,
+    key_ty: ColumnType,
+) -> Result<(&'static str, String), Error> {
+    Ok(match bound {
+        PartitionBound::Range { lo, hi } => (
+            "range",
+            format!("{}|{}", hex_value(lo, key_ty)?, hex_value(hi, key_ty)?),
+        ),
+        PartitionBound::List(values) => {
+            let parts = values
+                .iter()
+                .map(|v| hex_value(v, key_ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            ("list", parts.join("|"))
+        },
+        PartitionBound::Hash { modulus, remainder } => ("hash", format!("{modulus}|{remainder}")),
+    })
+}
+
+/// Decode a `(kind, payload)` back to a bound at `key_ty`.
+fn decode_payload(kind: &str, payload: &str, key_ty: ColumnType) -> Result<PartitionBound, Error> {
+    let bad = || Error::MalformedTuple { offset: 0 };
+    match kind {
+        "range" => {
+            let (lo, hi) = payload.split_once('|').ok_or_else(bad)?;
+            Ok(PartitionBound::Range {
+                lo: unhex_value(lo, key_ty)?,
+                hi: unhex_value(hi, key_ty)?,
+            })
+        },
+        "list" => {
+            let values = payload
+                .split('|')
+                .map(|h| unhex_value(h, key_ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PartitionBound::List(values))
+        },
+        "hash" => {
+            let (m, r) = payload.split_once('|').ok_or_else(bad)?;
+            Ok(PartitionBound::Hash {
+                modulus: m.parse().map_err(|_| bad())?,
+                remainder: r.parse().map_err(|_| bad())?,
+            })
+        },
+        _ => Err(bad()),
+    }
+}
+
+/// Hex of a single value's row encoding at `key_ty` (round-trips to the exact typed value).
+fn hex_value(value: &ast::Value, key_ty: ColumnType) -> Result<String, Error> {
     let bytes = row::encode(std::slice::from_ref(value), &[key_ty])?;
     Ok(super::crypto::to_hex(&bytes))
 }
 
-fn decode_bound(hex: &str, key_ty: ColumnType) -> Result<ast::Value, Error> {
+fn unhex_value(hex: &str, key_ty: ColumnType) -> Result<ast::Value, Error> {
     let bytes = super::crypto::from_hex(hex).ok_or(Error::MalformedTuple { offset: 0 })?;
     let mut decoded = row::decode(&bytes, &[key_ty])?;
     Ok(decoded.pop().unwrap_or(ast::Value::Null))
@@ -213,7 +323,7 @@ fn ensure_catalog(engine: &dyn StorageEngine, txn: TxnId) -> Result<nusadb_core:
     if let Some(schema) = engine.lookup_table_as_of(txn, PARTITION_CATALOG)? {
         return Ok(schema.id);
     }
-    let columns = ["role", "table", "aux", "lo", "hi"]
+    let columns = ["role", "table", "aux", "kind", "payload"]
         .into_iter()
         .map(|name| ColumnDef {
             name: name.to_owned(),
