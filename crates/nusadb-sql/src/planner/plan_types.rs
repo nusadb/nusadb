@@ -1594,6 +1594,11 @@ pub struct UpdatePlan {
     /// each **post-update** row written *through a checked view* must satisfy, else the update is
     /// rejected (`44000`). `None` for a direct-table UPDATE or a view without the option.
     pub view_check: Option<ViewCheck>,
+    /// For an `UPDATE` on an inheritance/partition parent (without `ONLY`), the per-descendant
+    /// sub-plans the write also applies to — one `UPDATE ONLY <descendant>` plan each, so the write
+    /// propagates down the hierarchy. Empty for an ordinary or `ONLY` update. Each sub-plan is itself
+    /// empty here (no further recursion; the list is already the transitive descendant set).
+    pub propagate: Vec<Self>,
 }
 
 /// A view's `WITH CHECK OPTION` enforcement: the predicate a row written through the view must
@@ -1633,6 +1638,10 @@ pub struct DeletePlan {
     /// `RETURNING` output columns, resolved against the table's columns and evaluated
     /// against each row's **pre-delete** values. Empty when there is no `RETURNING` clause.
     pub returning: Vec<Projection>,
+    /// For a `DELETE` on an inheritance/partition parent (without `ONLY`), the per-descendant
+    /// sub-plans the delete also applies to — one `DELETE FROM ONLY <descendant>` plan each, so the
+    /// delete propagates down the hierarchy. Empty for an ordinary or `ONLY` delete.
+    pub propagate: Vec<Self>,
 }
 
 /// `TRUNCATE`, both forms — the `cascade` flag records whether `CASCADE` was written.

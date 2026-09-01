@@ -3622,11 +3622,64 @@ fn rebuild_post_update_rows(
         .collect())
 }
 
+/// Combine a parent write's result with a descendant sub-plan's, for inheritance/partition
+/// propagation: row counts add; `RETURNING` row sets concatenate (keeping the parent's column
+/// headers). Both operands always share a shape (all sub-plans are the same verb over the same
+/// column set), so a mismatch is an internal invariant break.
+fn combine_write_results(
+    parent: ExecutionResult,
+    child: ExecutionResult,
+) -> Result<ExecutionResult, Error> {
+    Ok(match (parent, child) {
+        (ExecutionResult::Updated(a), ExecutionResult::Updated(b)) => {
+            ExecutionResult::Updated(a + b)
+        },
+        (ExecutionResult::Deleted(a), ExecutionResult::Deleted(b)) => {
+            ExecutionResult::Deleted(a + b)
+        },
+        (
+            ExecutionResult::Rows {
+                columns,
+                mut rows,
+                command,
+            },
+            ExecutionResult::Rows { rows: more, .. },
+        ) => {
+            rows.extend(more);
+            ExecutionResult::Rows {
+                columns,
+                rows,
+                command,
+            }
+        },
+        _ => {
+            return Err(Error::Internal(
+                "mismatched result shapes while propagating a write to descendants".to_owned(),
+            ));
+        },
+    })
+}
+
+pub(super) fn run_update(
+    plan: &UpdatePlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    // An `UPDATE` on an inheritance/partition parent (without `ONLY`) also updates every descendant:
+    // run the parent's own (`ONLY`) update, then each descendant sub-plan, combining the row counts
+    // (or `RETURNING` rows). The common non-parent case has an empty `propagate` and returns directly.
+    let mut result = run_update_single(plan, engine, txn)?;
+    for sub in &plan.propagate {
+        result = combine_write_results(result, run_update_single(sub, engine, txn)?)?;
+    }
+    Ok(result)
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "one cohesive UPDATE pass: match (incl. FROM join), fire triggers, enforce constraints, write"
+    reason = "one contiguous UPDATE path: point-get vs scan, per-row eval, uniqueness, RLS, RETURNING"
 )]
-pub(super) fn run_update(
+fn run_update_single(
     plan: &UpdatePlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -3922,6 +3975,21 @@ pub(super) fn run_update(
 }
 
 pub(super) fn run_delete(
+    plan: &DeletePlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    // A `DELETE` on an inheritance/partition parent (without `ONLY`) also deletes from every
+    // descendant: run the parent's own (`ONLY`) delete, then each descendant sub-plan, combining the
+    // row counts (or `RETURNING` rows). The common non-parent case has an empty `propagate`.
+    let mut result = run_delete_single(plan, engine, txn)?;
+    for sub in &plan.propagate {
+        result = combine_write_results(result, run_delete_single(sub, engine, txn)?)?;
+    }
+    Ok(result)
+}
+
+fn run_delete_single(
     plan: &DeletePlan,
     engine: &dyn StorageEngine,
     txn: TxnId,

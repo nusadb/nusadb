@@ -51,14 +51,8 @@ SELECT name, pop, state FROM ONLY capitals
 ----
 Jakarta  10000  JK
 
-# UPDATE / DELETE through a parent with descendants is refused (0A000) — not silently parent-only.
-statement error
-UPDATE cities SET pop = 0 WHERE name = 'Jakarta'
-
-statement error
-DELETE FROM cities WHERE pop > 0
-
-# ONLY makes the write a plain single-table operation on the parent.
+# ONLY makes the write a plain single-table operation on the parent (propagation is covered at the
+# end, once the join/UPDATE-FROM cases below have used the original descendant rows).
 statement ok
 UPDATE ONLY cities SET pop = 1 WHERE name = 'Springfield'
 
@@ -103,6 +97,24 @@ Springfield  US
 
 statement ok
 DROP TABLE region
+
+# UPDATE / DELETE through the parent propagate to descendants: `Jakarta` lives in `capitals`, yet an
+# UPDATE/DELETE on the parent `cities` reaches it (not silently parent-only).
+statement ok
+UPDATE cities SET pop = 0 WHERE name = 'Jakarta'
+
+query TI
+SELECT name, pop FROM cities WHERE name = 'Jakarta'
+----
+Jakarta  0
+
+statement ok
+DELETE FROM cities WHERE pop = 0
+
+query I
+SELECT count(*) FROM cities WHERE name = 'Jakarta'
+----
+0
 
 # Dropping a parent that still has children is refused; dropping the leaves first then works.
 statement error

@@ -610,11 +610,30 @@ pub(super) fn analyze_insert_value(
 
 // === UPDATE / DELETE ======================================================
 
-/// An `UPDATE`/`DELETE` on an inheritance parent (without `ONLY`) would, in the reference engine,
-/// also modify every descendant table's matching rows. NusaDB does not yet propagate the write down
-/// the hierarchy, so rather than silently touch only the parent (leaving descendant rows wrongly
-/// unchanged), it is refused loudly — use `ONLY` to target just the parent, or write each table.
-/// Gated on the cheap `any_inheritance` probe so a database with no inheritance pays almost nothing.
+/// The transitive inheritance/partition descendants an `UPDATE`/`DELETE` on `table` must also touch,
+/// or empty when it targets nothing extra: an `ONLY` write, a database with no inheritance, or a
+/// non-parent table (including a view). Gated on the cheap `any_inheritance` probe so an ordinary
+/// write pays almost nothing.
+fn write_descendants(
+    only: bool,
+    schema: Option<&str>,
+    table: &str,
+    catalog: &dyn Catalog,
+) -> Result<Vec<String>, Error> {
+    if only || !catalog.any_inheritance()? {
+        return Ok(Vec::new());
+    }
+    // Only a real base table can be an inheritance/partition parent; a view resolves to `None` here.
+    let Some(resolved) = super::lookup_table_ref(schema, table, catalog)? else {
+        return Ok(Vec::new());
+    };
+    catalog.inheritance_descendants(&resolved.name)
+}
+
+/// Defensive guard: `analyze_update`/`analyze_delete` must only ever be handed a single-table write —
+/// either an `ONLY` write or one on a non-parent. A non-`ONLY` write on a parent-with-descendants is
+/// routed through [`analyze_update_stmt`]/[`analyze_delete_stmt`], which build the per-descendant
+/// sub-plans; if one reaches here directly it would silently touch only the parent, so refuse it.
 fn reject_inheritance_write(
     table: &str,
     only: bool,
@@ -622,12 +641,62 @@ fn reject_inheritance_write(
     catalog: &dyn Catalog,
 ) -> Result<(), Error> {
     if !only && catalog.any_inheritance()? && !catalog.inheritance_descendants(table)?.is_empty() {
-        return Err(Error::Unsupported(format!(
-            "{verb} on an inheritance parent (\"{table}\") would also affect its descendant tables, \
-             which is not supported yet — use {verb} ... ONLY {table}, or target each table directly"
+        return Err(Error::Internal(format!(
+            "{verb} on inheritance parent \"{table}\" reached single-table analysis without \
+             propagation (should route through analyze_{}_stmt)",
+            verb.to_ascii_lowercase()
         )));
     }
     Ok(())
+}
+
+/// Analyze an `UPDATE`, propagating to inheritance/partition descendants when the target is a parent
+/// and `ONLY` was not given: the write becomes the parent's own (`ONLY`) update plus one
+/// `UPDATE ONLY <descendant>` sub-plan per transitive descendant, each analyzed in its own right (so
+/// each table's own row-level security and column resolution apply). An ordinary/`ONLY`/non-parent
+/// update analyzes as a single table.
+pub(super) fn analyze_update_stmt(
+    upd: ast::Update,
+    catalog: &dyn Catalog,
+) -> Result<UpdatePlan, Error> {
+    let descendants = write_descendants(upd.only, upd.schema.as_deref(), &upd.table, catalog)?;
+    if descendants.is_empty() {
+        return analyze_update(upd, catalog);
+    }
+    let mut parent = upd.clone();
+    parent.only = true;
+    let mut plan = analyze_update(parent, catalog)?;
+    for descendant in descendants {
+        let mut sub = upd.clone();
+        sub.only = true;
+        sub.schema = None;
+        sub.table = descendant;
+        plan.propagate.push(analyze_update(sub, catalog)?);
+    }
+    Ok(plan)
+}
+
+/// Analyze a `DELETE`, propagating to inheritance/partition descendants — the `DELETE` counterpart of
+/// [`analyze_update_stmt`].
+pub(super) fn analyze_delete_stmt(
+    del: ast::Delete,
+    catalog: &dyn Catalog,
+) -> Result<DeletePlan, Error> {
+    let descendants = write_descendants(del.only, del.schema.as_deref(), &del.table, catalog)?;
+    if descendants.is_empty() {
+        return analyze_delete(del, catalog);
+    }
+    let mut parent = del.clone();
+    parent.only = true;
+    let mut plan = analyze_delete(parent, catalog)?;
+    for descendant in descendants {
+        let mut sub = del.clone();
+        sub.only = true;
+        sub.schema = None;
+        sub.table = descendant;
+        plan.propagate.push(analyze_delete(sub, catalog)?);
+    }
+    Ok(plan)
 }
 
 pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<UpdatePlan, Error> {
@@ -759,6 +828,9 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         // Set by `update_through_view` when the target is a view WITH CHECK OPTION; a direct UPDATE
         // has no view check.
         view_check: None,
+        // Populated by `analyze_update_stmt` for a non-`ONLY` update on an inheritance/partition
+        // parent; a single-table analysis carries none.
+        propagate: Vec::new(),
     })
 }
 
@@ -872,6 +944,9 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
         using_plan,
         filter,
         returning,
+        // Populated by `analyze_delete_stmt` for a non-`ONLY` delete on an inheritance/partition
+        // parent; a single-table analysis carries none.
+        propagate: Vec::new(),
     })
 }
 

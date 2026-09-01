@@ -55,10 +55,22 @@ CREATE TABLE h (id INT) PARTITION BY HASH (id)
 statement error
 CREATE TABLE c (id INT PRIMARY KEY, r INT) PARTITION BY RANGE (r)
 
-# UPDATE/DELETE through a partitioned parent is refused (not silently applied to the parent only);
-# use ONLY, or target each partition.
-statement error
+# UPDATE/DELETE through a partitioned parent propagate to the partitions holding the rows.
+statement ok
 UPDATE ev SET id = 0 WHERE region = 50
+
+query II
+SELECT id, region FROM ev WHERE region = 50
+----
+0  50
+
+statement ok
+DELETE FROM ev WHERE region = 150
+
+query I
+SELECT count(*) FROM ev WHERE region = 150
+----
+0
 
 # Dropping a parent with partitions is refused; dropping the partitions first then works.
 statement error

@@ -900,8 +900,8 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::SetOperation(so) => {
             analyze_set_operation(so, catalog).map(LogicalPlan::SetOperation)
         },
-        ast::Statement::Update(upd) => analyze_update(upd, catalog).map(LogicalPlan::Update),
-        ast::Statement::Delete(del) => analyze_delete(del, catalog).map(LogicalPlan::Delete),
+        ast::Statement::Update(upd) => analyze_update_stmt(upd, catalog).map(LogicalPlan::Update),
+        ast::Statement::Delete(del) => analyze_delete_stmt(del, catalog).map(LogicalPlan::Delete),
         // COPY is parsed but its data rides the wire's COPY sub-protocol, so the
         // executor/wire pipeline drives it rather than the normal plan path.
         ast::Statement::Copy(_) => Err(Error::Unsupported(
