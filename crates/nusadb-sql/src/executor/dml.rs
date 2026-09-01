@@ -752,8 +752,13 @@ fn insert_select_can_stream(
     {
         return Ok(false);
     }
-    let triggers =
-        super::trigger::load_table_triggers(&table.name, ast::TriggerEvent::Insert, engine, txn)?;
+    let triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?;
     if !triggers.is_empty() {
         return Ok(false);
     }
@@ -1133,8 +1138,13 @@ fn insert_rows_with_unique(
     };
     // Triggers: load the INSERT triggers once, fire statement- and row-level BEFORE triggers,
     // then (after the writes) the AFTER triggers. Firing happens here so `COPY FROM` triggers too.
-    let triggers =
-        super::trigger::load_table_triggers(&table.name, ast::TriggerEvent::Insert, engine, txn)?;
+    let triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?;
     triggers.fire_stmt_before(table, engine, txn)?;
     if triggers.has_before_row() {
         for full in &full_rows {
@@ -1414,10 +1424,20 @@ fn upsert_rows(
     // Triggers: an upsert fires INSERT triggers for the inserted rows and UPDATE triggers for
     // the conflicting rows it updates (`OLD`→`NEW`), so audit/maintenance triggers are not bypassed.
     // BEFORE triggers fire before the writes; AFTER triggers after.
-    let insert_triggers =
-        super::trigger::load_table_triggers(&table.name, ast::TriggerEvent::Insert, engine, txn)?;
-    let update_triggers =
-        super::trigger::load_table_triggers(&table.name, ast::TriggerEvent::Update, engine, txn)?;
+    let insert_triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?;
+    let update_triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Update,
+        engine,
+        txn,
+    )?;
     if !inserts.is_empty() {
         insert_triggers.fire_stmt_before(table, engine, txn)?;
     }
@@ -2703,8 +2723,13 @@ fn cascade_delete_children(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let triggers =
-        super::trigger::load_table_triggers(&child.name, ast::TriggerEvent::Delete, engine, txn)?;
+    let triggers = super::trigger::load_table_triggers(
+        &child.schema,
+        &child.name,
+        ast::TriggerEvent::Delete,
+        engine,
+        txn,
+    )?;
     let mut deleted: Vec<Row> = Vec::with_capacity(rows.len());
     for (tid, row) in rows {
         if triggers.has_before_row() {
@@ -2732,8 +2757,13 @@ fn cascade_update_children(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let triggers =
-        super::trigger::load_table_triggers(&child.name, ast::TriggerEvent::Update, engine, txn)?;
+    let triggers = super::trigger::load_table_triggers(
+        &child.schema,
+        &child.name,
+        ast::TriggerEvent::Update,
+        engine,
+        txn,
+    )?;
     let child_types = column_types(child);
     let index_targets = secondary_index_targets(child, engine)?;
     let mut olds: Vec<Row> = Vec::with_capacity(changes.len());
@@ -3648,6 +3678,7 @@ pub(super) fn run_update(
     // Triggers: load UPDATE triggers once; a per-row trigger needs the old row image so
     // `OLD.col` can be bound, so force capture when one exists.
     let triggers = super::trigger::load_table_triggers(
+        &plan.table.schema,
         &plan.table.name,
         ast::TriggerEvent::Update,
         engine,
@@ -3952,6 +3983,7 @@ pub(super) fn run_delete(
     // BEFORE triggers: statement-level once, then row-level for each matched row, before the
     // FK delete actions and the writes.
     let triggers = super::trigger::load_table_triggers(
+        &plan.table.schema,
         &plan.table.name,
         ast::TriggerEvent::Delete,
         engine,
@@ -4644,8 +4676,13 @@ fn commit_merge_deletes(
     if deletes.is_empty() {
         return Ok(());
     }
-    let triggers =
-        super::trigger::load_table_triggers(&table.name, ast::TriggerEvent::Delete, engine, txn)?;
+    let triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Delete,
+        engine,
+        txn,
+    )?;
     let deleted_rows: Vec<Row> = deletes.iter().map(|(_, r)| r.clone()).collect();
     triggers.fire_stmt_before(table, engine, txn)?;
     if triggers.has_before_row() {
@@ -4684,8 +4721,13 @@ fn commit_merge_updates(
     }
     let schema = column_types(table);
     let index_targets = secondary_index_targets(table, engine)?;
-    let triggers =
-        super::trigger::load_table_triggers(&table.name, ast::TriggerEvent::Update, engine, txn)?;
+    let triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Update,
+        engine,
+        txn,
+    )?;
     triggers.fire_stmt_before(table, engine, txn)?;
     if triggers.has_before_row() {
         for (_, old, new) in updates {

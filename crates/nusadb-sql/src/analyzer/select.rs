@@ -692,7 +692,7 @@ fn apply_rls(
     let Some(base) = base_table else {
         return Ok(filter);
     };
-    if catalog.is_superuser() || !catalog.rls_enabled(&base.name)? {
+    if catalog.is_superuser() || !catalog.rls_enabled(&base.schema, &base.name)? {
         return Ok(filter);
     }
     if has_joins {
@@ -701,7 +701,13 @@ fn apply_rls(
             base.name
         )));
     }
-    let policy = build_rls_predicate(&base.name, ast::PolicyCommand::Select, scope, catalog)?;
+    let policy = build_rls_predicate(
+        &base.schema,
+        &base.name,
+        ast::PolicyCommand::Select,
+        scope,
+        catalog,
+    )?;
     Ok(Some(match filter {
         None => policy,
         Some(existing) => and_exprs(existing, policy),
@@ -713,6 +719,7 @@ fn apply_rls(
 /// predicate, narrowed by the `AND` of every applicable restrictive policy's `USING`, or `FALSE`
 /// (default-deny) when no permissive policy applies. See [`combine_rls_policies`].
 pub(super) fn build_rls_predicate(
+    schema: &str,
     table: &str,
     command: ast::PolicyCommand,
     scope: &[ScopedColumn],
@@ -720,7 +727,7 @@ pub(super) fn build_rls_predicate(
 ) -> Result<TypedExpr, Error> {
     // A policy grants row access through its USING predicate; a policy without one (e.g. an
     // INSERT-only WITH CHECK policy) grants no read/select access and is skipped.
-    combine_rls_policies(table, command, scope, catalog, |p| p.using.clone())
+    combine_rls_policies(schema, table, command, scope, catalog, |p| p.using.clone())
 }
 
 /// Build the `WITH CHECK` predicate a non-superuser's written row must satisfy on `table` for a
@@ -729,6 +736,7 @@ pub(super) fn build_rls_predicate(
 /// `WITH CHECK`, or `FALSE` (default-deny) when no permissive policy applies. The executor rejects a
 /// row that fails this. See [`combine_rls_policies`].
 pub(super) fn build_rls_check_predicate(
+    schema: &str,
     table: &str,
     command: ast::PolicyCommand,
     scope: &[ScopedColumn],
@@ -736,7 +744,7 @@ pub(super) fn build_rls_check_predicate(
 ) -> Result<TypedExpr, Error> {
     // The write predicate is the policy's WITH CHECK, or its USING when WITH CHECK is omitted (so a
     // single `USING` policy also constrains the rows the user may write).
-    combine_rls_policies(table, command, scope, catalog, |p| {
+    combine_rls_policies(schema, table, command, scope, catalog, |p| {
         p.check.clone().or_else(|| p.using.clone())
     })
 }
@@ -753,6 +761,7 @@ pub(super) fn build_rls_check_predicate(
 /// predicate is re-parsed and type-checked against `scope` so it filters exactly like a `WHERE`
 /// clause. A policy whose `pick` yields no SQL is skipped.
 fn combine_rls_policies(
+    schema: &str,
     table: &str,
     command: ast::PolicyCommand,
     scope: &[ScopedColumn],
@@ -762,7 +771,7 @@ fn combine_rls_policies(
     let user = catalog.current_user();
     let mut permissive: Option<TypedExpr> = None;
     let mut restrictive: Option<TypedExpr> = None;
-    for policy in catalog.lookup_policies(table)? {
+    for policy in catalog.lookup_policies(schema, table)? {
         let applies_to_command =
             policy.command == ast::PolicyCommand::All || policy.command == command;
         let applies_to_role = policy.roles.is_empty() || policy.roles.iter().any(|r| r == &user);
@@ -2308,12 +2317,21 @@ impl Catalog for CteCatalog<'_> {
         self.inner.is_superuser()
     }
 
-    fn rls_enabled(&self, name: &str) -> Result<bool, Error> {
-        // The synthetic CTE table is derived, never a base table, so it carries no RLS flag.
-        if name == self.name {
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
+        // The synthetic CTE table is derived, never a base table, so it carries no RLS flag — but
+        // only where it actually shadows, which is the same two probes `lookup_table_in` above
+        // names: the `public` arm of the search path, and the session temp schema.
+        //
+        // Matching the bare name alone made this a bypass rather than a guard. A qualified
+        // reference resolves to the real protected table, and a CTE named after it then answered
+        // "no row-level security" for it — with the CTE name chosen by whoever writes the query.
+        if name == self.name
+            && (schema == nusadb_core::PUBLIC_SCHEMA
+                || self.inner.temp_schema().as_deref() == Some(schema))
+        {
             return Ok(false);
         }
-        self.inner.rls_enabled(name)
+        self.inner.rls_enabled(schema, name)
     }
 }
 

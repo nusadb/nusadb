@@ -1381,6 +1381,14 @@ fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) {
             return Ok(());
         };
         let txn = engine.begin(nusadb_core::IsolationLevel::default())?;
+        // The SQL-layer catalogs are not reached by `drop_schema`, and a temp schema name is minted
+        // from a counter that restarts with the process — so a trigger left behind here can be
+        // inherited by a later session handed the same name.
+        if let Err(e) = nusadb_sql::purge_schema_catalogs(engine, txn, name) {
+            let _ = engine.rollback(txn);
+            tracing::warn!(schema = %name, error = %e, "failed to purge temporary schema catalogs");
+            return Ok(());
+        }
         match engine.drop_schema(txn, id, true) {
             Ok(()) => engine.commit(txn),
             Err(e) => {
@@ -2229,7 +2237,14 @@ fn copy_access_verdict(
         },
         Err(_) => return Some("could not verify access for COPY".to_owned()),
     }
-    match nusadb_sql::rls_table_enabled(engine, txn, table) {
+    // The namespace the load will resolve in, matching `lookup_copy_table` and the privilege key
+    // above. A marker is per `(schema, table)` now, so asking by bare name would consult the wrong
+    // one.
+    let rls_schema = copy
+        .schema
+        .as_deref()
+        .unwrap_or(nusadb_core::engine::PUBLIC_SCHEMA);
+    match nusadb_sql::rls_table_enabled(engine, txn, rls_schema, table) {
         Ok(false) => None,
         Ok(true) => Some(format!(
             "row-level security is enabled on `{table}`; COPY is not yet supported under RLS, so it \
@@ -4572,16 +4587,20 @@ impl Catalog for EngineCatalog<'_> {
         self.user.to_owned()
     }
 
-    fn rls_enabled(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, nusadb_sql::Error> {
         // Row-level security: read the table's RLS flag under `txn`'s snapshot. Consulted only
         // for a non-superuser (`is_superuser` short-circuits first).
-        nusadb_sql::rls_table_enabled(self.engine, self.txn, name)
+        nusadb_sql::rls_table_enabled(self.engine, self.txn, schema, name)
     }
 
-    fn lookup_policies(&self, name: &str) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
-        // Row-level security policies for `name` under `txn`'s snapshot. Reached only for a
+    fn lookup_policies(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
+        // Row-level security policies for `schema.name` under `txn`'s snapshot. Reached only for a
         // non-superuser whose query targets this RLS-enabled table.
-        nusadb_sql::lookup_policies_for(self.engine, self.txn, name)
+        nusadb_sql::lookup_policies_for(self.engine, self.txn, schema, name)
     }
 }
 

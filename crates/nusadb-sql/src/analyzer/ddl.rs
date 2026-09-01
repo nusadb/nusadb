@@ -713,6 +713,7 @@ pub(super) fn analyze_alter_table(
         ast::AlterTableAction::EnableRowLevelSecurity => {
             require_rls_admin(catalog, "enable row-level security on a table")?;
             return Ok(AlterTablePlan::SetRls {
+                schema: table.schema,
                 table: table.name,
                 enabled: true,
             });
@@ -720,6 +721,7 @@ pub(super) fn analyze_alter_table(
         ast::AlterTableAction::DisableRowLevelSecurity => {
             require_rls_admin(catalog, "disable row-level security on a table")?;
             return Ok(AlterTablePlan::SetRls {
+                schema: table.schema,
                 table: table.name,
                 enabled: false,
             });
@@ -729,6 +731,7 @@ pub(super) fn analyze_alter_table(
         // DROP TRIGGER); the table itself was resolved above.
         ast::AlterTableAction::EnableTrigger { name } => {
             return Ok(AlterTablePlan::SetTriggerEnabled {
+                schema: table.schema.clone(),
                 table: table.name,
                 name,
                 enabled: true,
@@ -736,6 +739,7 @@ pub(super) fn analyze_alter_table(
         },
         ast::AlterTableAction::DisableTrigger { name } => {
             return Ok(AlterTablePlan::SetTriggerEnabled {
+                schema: table.schema.clone(),
                 table: table.name,
                 name,
                 enabled: false,

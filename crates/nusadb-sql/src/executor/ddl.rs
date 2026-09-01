@@ -501,10 +501,16 @@ fn sql_dependent_naming(
     // function or procedure body when called. Their catalogs key by name, so a definition naming
     // this table and this column is what breaks.
     //
-    // The writers store the table bare today; the qualified arm is there for when they start
-    // qualifying, so that change cannot silently disarm this.
+    // The view and routine catalogs store the table bare; the policy and trigger catalogs now
+    // carry a schema column, which the callers below check against this table's own. The qualified
+    // spelling is still accepted for the catalogs that key by a single name.
     let qualified = format!("{}.{}", table.schema, table.name);
     let names_this_table = |t: &str| t == table.name || t == qualified;
+    // For a catalog with its own schema column: the name must match AND, when the row records a
+    // namespace, it must be this one. Without the second half, renaming a column on `public.t` was
+    // refused because a policy on `app.t` mentioned the name.
+    let owns =
+        |t: &str, s: Option<&String>| names_this_table(t) && s.is_none_or(|s| *s == table.schema);
     let mut views = Vec::new();
     for (catalog, what) in [
         (VIEW_CATALOG, "view"),
@@ -562,9 +568,9 @@ fn sql_dependent_naming(
     }
     // (table, name, command, roles, using, check, permissive) — an orphaned policy fails closed,
     // which locks every non-superuser out of the table rather than leaking rows.
-    for row in scan_text_catalog(engine, txn, POLICY_CATALOG, &[7])? {
-        if let [tbl, name, _, _, using, check, _] = row.as_slice()
-            && names_this_table(tbl)
+    for row in scan_text_catalog(engine, txn, POLICY_CATALOG, &[8, 7])? {
+        if let [tbl, name, _, _, using, check, _, rest @ ..] = row.as_slice()
+            && owns(tbl, rest.first())
             && (sql_mentions_column(using, column) || sql_mentions_column(check, column))
         {
             return Ok(Some(("policy", name.clone())));
@@ -573,9 +579,9 @@ fn sql_dependent_naming(
     // (name, table, timing, events, for_each, when, action, enabled) — with a legacy seven-column
     // row missing the trailing flag. A disabled trigger blocks too: it can be re-enabled at any
     // time, and would come back broken.
-    for row in scan_text_catalog(engine, txn, super::trigger::TRIGGER_CATALOG, &[8, 7])? {
-        if let [name, tbl, _, _, _, when, action, ..] = row.as_slice()
-            && names_this_table(tbl)
+    for row in scan_text_catalog(engine, txn, super::trigger::TRIGGER_CATALOG, &[9, 8, 7])? {
+        if let [name, tbl, _, _, _, when, action, rest @ ..] = row.as_slice()
+            && owns(tbl, rest.get(1))
             && (sql_mentions_column(when, column) || sql_mentions_column(action, column))
         {
             return Ok(Some(("trigger", name.clone())));
@@ -840,8 +846,11 @@ pub(super) fn run_drop_table(
             // Cascade-drop the table's row-level-security policies and its RLS-enabled marker (
             // ): otherwise they orphan the catalog, and a later same-named table cannot
             // re-create a policy of the same name ("policy already exists").
-            super::delete_policies_for_table(engine, txn, &plan.table)?;
-            super::set_table_rls(engine, txn, &plan.table, false)?;
+            super::delete_policies_for_table(engine, txn, &plan.schema, &plan.table)?;
+            super::set_table_rls(engine, txn, &plan.schema, &plan.table, false)?;
+            // Triggers were not cascaded at all, so their rows outlived the table and a later
+            // same-named one inherited them.
+            super::trigger::delete_triggers_for_table(engine, txn, &plan.schema, &plan.table)?;
             // Ownership and grants go with the table. Leaving them behind would hand a later table
             // that reused the name the old one's permissions.
             let owned = format!("{}.{}", plan.schema, plan.table);
@@ -919,6 +928,9 @@ pub(super) fn run_drop_schema(
                 }
             }
             engine.drop_schema(txn, id, plan.cascade)?;
+            // The engine drops the tables; the SQL-layer catalogs live above it and kept their
+            // rows, so recreating the schema inherited policies and triggers nobody declared.
+            super::purge_schema_catalogs(engine, txn, &plan.name)?;
             crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
             crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
         },
@@ -1096,17 +1108,43 @@ pub(super) fn run_alter_table(
     let (table, op) = match plan {
         AlterTablePlan::Noop => return Ok(ExecutionResult::Altered),
         // Row-level-security toggle: a SQL-layer catalog change, not a row rewrite.
-        AlterTablePlan::SetRls { table, enabled } => {
-            super::set_table_rls(engine, txn, &table, enabled)?;
+        AlterTablePlan::SetRls {
+            schema,
+            table,
+            enabled,
+        } => {
+            // Refused here rather than inside `set_table_rls`, which the `DROP TABLE` cascade also
+            // calls: a marker recorded before namespaces covers every same-named table, so
+            // toggling it for one of them cannot be answered — but dropping the table must still
+            // be able to retire it, or the state has no way out.
+            if super::covered_by_unrecorded_namespace(engine, txn, &table)? {
+                return Err(Error::Unsupported(format!(
+                    concat!(
+                        "row-level security on `{0}` was recorded before namespaces were, so it ",
+                        "covers every `{0}` in this engine and cannot be changed for one of them; ",
+                        "drop or recreate `{0}` in the default namespace to retire it"
+                    ),
+                    table
+                )));
+            }
+            super::set_table_rls(engine, txn, &schema, &table, enabled)?;
             return Ok(ExecutionResult::Altered);
         },
         // Trigger toggle: a SQL-layer trigger-catalog change, not a row rewrite.
         AlterTablePlan::SetTriggerEnabled {
+            schema,
             table,
             name,
             enabled,
         } => {
-            super::trigger::set_triggers_enabled(engine, txn, &table, name.as_deref(), enabled)?;
+            super::trigger::set_triggers_enabled(
+                engine,
+                txn,
+                &schema,
+                &table,
+                name.as_deref(),
+                enabled,
+            )?;
             return Ok(ExecutionResult::Altered);
         },
         // ADD PRIMARY KEY / UNIQUE: validate the existing rows satisfy it, then register it.

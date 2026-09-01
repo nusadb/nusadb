@@ -261,13 +261,15 @@ fn a_qualifier_that_cannot_mean_anything_is_refused_as_such() {
 /// A qualifier that the catalog could not honour is refused for that reason, not as unfinished
 /// plumbing.
 ///
-/// Policies and triggers record their table by bare name (`nusadb_policies` and `nusadb_triggers`
-/// both store it as plain text), so one catalog row would serve two same-named tables in different
-/// schemas. Accepting `CREATE POLICY p ON app.t` would parse the qualifier and then govern
-/// `public.t` with it — worse than refusing, because the statement would appear to have worked.
+/// Both catalogs now carry a schema column, so the original blocker — one row serving two
+/// same-named tables in different namespaces — is gone. What is not yet done is the statement side:
+/// nothing resolves the qualifier into a namespace to file the row under, and `CREATE POLICY` in
+/// particular still resolves its table through a lookup that reaches only the default one. So the
+/// refusal stands, and the message still names the catalog because that is where the remaining
+/// work is; it is no longer a hard limit, which is worth knowing before someone quotes it.
 ///
 /// The generic message says a qualifier "does not resolve one yet", which reads as work in
-/// progress. Here the blocker is a missing schema column in the object's own catalog.
+/// progress across the board. These statements have a specific reason, and it is still true.
 #[test]
 fn a_qualifier_the_catalog_cannot_hold_says_so() {
     for (sql, catalog) in [

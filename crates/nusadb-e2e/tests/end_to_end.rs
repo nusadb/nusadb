@@ -160,16 +160,20 @@ impl Catalog for RlsCatalog<'_> {
         self.user.to_owned()
     }
 
-    fn rls_enabled(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, nusadb_sql::Error> {
         let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
-        let enabled = nusadb_sql::rls_table_enabled(self.engine, txn, name);
+        let enabled = nusadb_sql::rls_table_enabled(self.engine, txn, schema, name);
         let _ = self.engine.rollback(txn);
         enabled
     }
 
-    fn lookup_policies(&self, name: &str) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
+    fn lookup_policies(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
         let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
-        let policies = nusadb_sql::lookup_policies_for(self.engine, txn, name);
+        let policies = nusadb_sql::lookup_policies_for(self.engine, txn, schema, name);
         let _ = self.engine.rollback(txn);
         policies
     }

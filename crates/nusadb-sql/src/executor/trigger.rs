@@ -30,22 +30,54 @@ use crate::planner::{AlterTriggerPlan, CreateTriggerPlan, DropTriggerPlan};
 // `pub(super)` so the rename guard can scan for triggers whose WHEN/body name a column.
 pub(super) const TRIGGER_CATALOG: &str = "nusadb_triggers";
 
-/// The eight-text-column schema of [`TRIGGER_CATALOG`].
-const TRIGGER_CATALOG_SCHEMA: [ColumnType; 8] = [ColumnType::Text; 8];
+/// The nine-text-column schema of [`TRIGGER_CATALOG`].
+const TRIGGER_CATALOG_SCHEMA: [ColumnType; 9] = [ColumnType::Text; 9];
 
-/// The pre-`enabled` seven-column schema, kept for reading rows written before the upgrade.
+/// The pre-`schema` eight-column schema, kept for reading rows written before the upgrade.
+const TRIGGER_CATALOG_SCHEMA_PRE_SCHEMA: [ColumnType; 8] = [ColumnType::Text; 8];
+
+/// The pre-`enabled` seven-column schema, kept for reading rows written before that upgrade.
 const TRIGGER_CATALOG_SCHEMA_LEGACY: [ColumnType; 7] = [ColumnType::Text; 7];
 
-/// Decode one trigger-catalog row, tolerating the legacy seven-column width: a row written before
-/// the `enabled` column existed decodes against the legacy schema and is padded with `"t"`
-/// (enabled), which was the only behavior back then. The eight-column decode is tried first, so a
-/// current row can never be mistaken for a legacy one.
+/// Decode one trigger-catalog row, tolerating both earlier widths. The widest decode is tried
+/// first, so a current row can never be mistaken for an older one.
+///
+/// A pre-`enabled` row is padded with `"t"`, the only behaviour back then.
+///
+/// A pre-`schema` row is read as belonging to the default namespace. That is a migration decision
+/// and not a recovered fact: such a row names a table but not the namespace, and `CREATE TRIGGER`
+/// resolved through the session temp schema and search path, so it could have meant another one.
+/// Reading it as any namespace is what let a trigger declared on one table fire on a same-named
+/// table somewhere else — the behaviour this column exists to stop — so the ambiguity is resolved
+/// towards the narrower reading. A trigger created on a table outside the default namespace before
+/// this column existed must be recreated.
+/// [`decode_catalog_row`] for the cross-catalog schema purge, which lives in the parent module.
+pub(super) fn decode_catalog_row_for_purge(bytes: &[u8]) -> Result<Vec<ast::Value>, Error> {
+    decode_catalog_row(bytes)
+}
+
 fn decode_catalog_row(bytes: &[u8]) -> Result<Vec<ast::Value>, Error> {
-    row::decode(bytes, &TRIGGER_CATALOG_SCHEMA).or_else(|_| {
-        let mut row = row::decode(bytes, &TRIGGER_CATALOG_SCHEMA_LEGACY)?;
-        row.push(ast::Value::Text("t".to_owned()));
-        Ok(row)
-    })
+    if let Ok(row) = row::decode(bytes, &TRIGGER_CATALOG_SCHEMA) {
+        return Ok(row);
+    }
+    if let Ok(mut row) = row::decode(bytes, &TRIGGER_CATALOG_SCHEMA_PRE_SCHEMA) {
+        row.push(ast::Value::Text(
+            nusadb_core::engine::PUBLIC_SCHEMA.to_owned(),
+        ));
+        return Ok(row);
+    }
+    let mut row = row::decode(bytes, &TRIGGER_CATALOG_SCHEMA_LEGACY)?;
+    row.push(ast::Value::Text("t".to_owned()));
+    row.push(ast::Value::Text(
+        nusadb_core::engine::PUBLIC_SCHEMA.to_owned(),
+    ));
+    Ok(row)
+}
+
+/// Whether a decoded trigger row is attached to `schema.table`.
+fn trigger_row_is_for(row: &[ast::Value], schema: &str, table: &str) -> bool {
+    matches!((row.get(1), row.get(8)),
+        (Some(ast::Value::Text(t)), Some(ast::Value::Text(s))) if t == table && s == schema)
 }
 
 /// Maximum nesting depth for cascading trigger actions.
@@ -102,7 +134,7 @@ pub(super) fn run_create_trigger(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    if !plan.or_replace && trigger_exists(engine, txn, &plan.table, &plan.name)? {
+    if !plan.or_replace && trigger_exists(engine, txn, &plan.schema, &plan.table, &plan.name)? {
         return Err(Error::TriggerExists {
             name: plan.name.clone(),
             table: plan.table.clone(),
@@ -115,7 +147,7 @@ pub(super) fn run_create_trigger(
         load_trigger_function(func_name, engine, txn)?;
     }
     let cat = ensure_trigger_catalog(engine, txn)?;
-    delete_trigger_row(engine, txn, &plan.table, &plan.name)?;
+    delete_trigger_row(engine, txn, &plan.schema, &plan.table, &plan.name)?;
     let events = plan
         .events
         .iter()
@@ -131,6 +163,7 @@ pub(super) fn run_create_trigger(
         ast::Value::Text(plan.when.clone().unwrap_or_default()),
         ast::Value::Text(plan.action.clone()),
         ast::Value::Text("t".to_owned()),
+        ast::Value::Text(plan.schema.clone()),
     ];
     engine.insert(txn, cat, &row::encode(&row, &TRIGGER_CATALOG_SCHEMA)?)?;
     Ok(ExecutionResult::TriggerCreated)
@@ -144,7 +177,9 @@ pub(super) fn run_alter_trigger(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    if plan.new_name != plan.name && trigger_exists(engine, txn, &plan.table, &plan.new_name)? {
+    if plan.new_name != plan.name
+        && trigger_exists(engine, txn, &plan.schema, &plan.table, &plan.new_name)?
+    {
         return Err(Error::TriggerExists {
             name: plan.new_name.clone(),
             table: plan.table.clone(),
@@ -156,7 +191,7 @@ pub(super) fn run_alter_trigger(
     let mut rewrites = Vec::new();
     while let Some((tid, bytes)) = scan.try_next()? {
         let mut row = decode_catalog_row(&bytes)?;
-        if row_matches(&row, &plan.table, &plan.name) {
+        if row_matches(&row, &plan.schema, &plan.table, &plan.name) {
             *row.first_mut().ok_or_else(|| internal_index(0))? =
                 ast::Value::Text(plan.new_name.clone());
             rewrites.push((tid, row::encode(&row, &TRIGGER_CATALOG_SCHEMA)?));
@@ -182,6 +217,7 @@ pub(super) fn run_alter_trigger(
 pub(super) fn set_triggers_enabled(
     engine: &dyn StorageEngine,
     txn: TxnId,
+    schema: &str,
     table: &str,
     name: Option<&str>,
     enabled: bool,
@@ -205,8 +241,8 @@ pub(super) fn set_triggers_enabled(
     while let Some((tid, bytes)) = scan.try_next()? {
         let mut row = decode_catalog_row(&bytes)?;
         let is_target = name.map_or_else(
-            || matches!(row.get(1), Some(ast::Value::Text(t)) if t == table),
-            |name| row_matches(&row, table, name),
+            || trigger_row_is_for(&row, schema, table),
+            |name| row_matches(&row, schema, table, name),
         );
         if is_target {
             *row.get_mut(7).ok_or_else(|| internal_index(7))? = flag.clone();
@@ -233,7 +269,7 @@ pub(super) fn run_drop_trigger(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    let removed = delete_trigger_row(engine, txn, &plan.table, &plan.name)?;
+    let removed = delete_trigger_row(engine, txn, &plan.schema, &plan.table, &plan.name)?;
     if !removed && !plan.if_exists {
         return Err(Error::TriggerNotFound {
             name: plan.name.clone(),
@@ -252,13 +288,13 @@ fn ensure_trigger_catalog(
     txn: TxnId,
 ) -> Result<nusadb_core::TableId, Error> {
     if let Some(schema) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? {
-        if schema.columns.len() < 8 {
-            upgrade_legacy_catalog(engine, txn, schema.id)?;
+        if schema.columns.len() < 9 {
+            upgrade_legacy_catalog(engine, txn, schema.id, schema.columns.len())?;
         }
         return Ok(schema.id);
     }
     let columns = [
-        "name", "table", "timing", "events", "for_each", "when", "action", "enabled",
+        "name", "table", "timing", "events", "for_each", "when", "action", "enabled", "schema",
     ]
     .into_iter()
     .map(|name| ColumnDef {
@@ -283,6 +319,7 @@ fn upgrade_legacy_catalog(
     engine: &dyn StorageEngine,
     txn: TxnId,
     cat: nusadb_core::TableId,
+    present: usize,
 ) -> Result<(), Error> {
     let mut rewrites = Vec::new();
     let mut scan = engine.scan(txn, cat)?;
@@ -294,15 +331,46 @@ fn upgrade_legacy_catalog(
     for (tid, bytes) in rewrites {
         engine.update(txn, cat, tid, &bytes)?;
     }
-    engine.alter_table(
-        txn,
-        cat,
-        &nusadb_core::AlterOp::AddColumn(ColumnDef {
-            name: "enabled".to_owned(),
-            ty: ColumnType::Text,
-            nullable: false,
-        }),
-    )?;
+    // Add whichever of the later columns this catalog is missing, oldest first, so a catalog at
+    // either earlier width lands at the current one.
+    for name in ["enabled", "schema"].iter().skip(present.saturating_sub(7)) {
+        engine.alter_table(
+            txn,
+            cat,
+            &nusadb_core::AlterOp::AddColumn(ColumnDef {
+                name: (*name).to_owned(),
+                ty: ColumnType::Text,
+                nullable: false,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Remove every trigger declared on `schema.table`, for when the table is dropped.
+///
+/// Without this the rows outlive their table, and a later table of the same name inherits triggers
+/// nobody declared on it — the same shape as the orphaned policies the drop already cleans up.
+pub(super) fn delete_triggers_for_table(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? else {
+        return Ok(());
+    };
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        if trigger_row_is_for(&decode_catalog_row(&bytes)?, schema, table) {
+            victims.push(tid);
+        }
+    }
+    drop(scan);
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
     Ok(())
 }
 
@@ -310,6 +378,7 @@ fn upgrade_legacy_catalog(
 fn trigger_exists(
     engine: &dyn StorageEngine,
     txn: TxnId,
+    schema: &str,
     table: &str,
     name: &str,
 ) -> Result<bool, Error> {
@@ -319,7 +388,7 @@ fn trigger_exists(
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((_, bytes)) = scan.try_next()? {
         let row = decode_catalog_row(&bytes)?;
-        if row_matches(&row, table, name) {
+        if row_matches(&row, schema, table, name) {
             return Ok(true);
         }
     }
@@ -330,6 +399,7 @@ fn trigger_exists(
 fn delete_trigger_row(
     engine: &dyn StorageEngine,
     txn: TxnId,
+    schema: &str,
     table: &str,
     name: &str,
 ) -> Result<bool, Error> {
@@ -340,7 +410,7 @@ fn delete_trigger_row(
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((tid, bytes)) = scan.try_next()? {
         let row = decode_catalog_row(&bytes)?;
-        if row_matches(&row, table, name) {
+        if row_matches(&row, schema, table, name) {
             victims.push(tid);
         }
     }
@@ -351,12 +421,10 @@ fn delete_trigger_row(
     Ok(deleted)
 }
 
-/// Whether a decoded catalog row is the trigger `(table, name)`.
-fn row_matches(row: &[ast::Value], table: &str, name: &str) -> bool {
-    matches!(
-        (row.first(), row.get(1)),
-        (Some(ast::Value::Text(n)), Some(ast::Value::Text(t))) if n == name && t == table
-    )
+/// Whether a decoded catalog row is the trigger `(schema, table, name)`.
+fn row_matches(row: &[ast::Value], schema: &str, table: &str, name: &str) -> bool {
+    trigger_row_is_for(row, schema, table)
+        && matches!(row.first(), Some(ast::Value::Text(n)) if n == name)
 }
 
 // === Firing ===============================================================
@@ -445,6 +513,7 @@ impl TriggerSet {
 /// Load the triggers on `table` that fire on `event`, partitioned by timing × granularity. The fast
 /// path (no trigger catalog, or no matching trigger) costs a single catalog lookup.
 pub(super) fn load_table_triggers(
+    schema: &str,
     table: &str,
     event: ast::TriggerEvent,
     engine: &dyn StorageEngine,
@@ -462,7 +531,7 @@ pub(super) fn load_table_triggers(
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((_, bytes)) = scan.try_next()? {
         let row = decode_catalog_row(&bytes)?;
-        let Some(trig) = decode_trigger(&row, table)? else {
+        let Some(trig) = decode_trigger(&row, schema, table)? else {
             continue;
         };
         // A disabled trigger stays in the catalog but never fires
@@ -498,15 +567,21 @@ pub(super) fn load_table_triggers(
 }
 
 /// Decode one catalog row into a [`StoredTrigger`] if it belongs to `table`; `None` otherwise.
-fn decode_trigger(row: &[ast::Value], table: &str) -> Result<Option<StoredTrigger>, Error> {
+fn decode_trigger(
+    row: &[ast::Value],
+    schema: &str,
+    table: &str,
+) -> Result<Option<StoredTrigger>, Error> {
     let text = |index: usize| -> Result<String, Error> {
         match row.get(index) {
             Some(ast::Value::Text(s)) => Ok(s.clone()),
             _ => Err(Error::MalformedTuple { offset: index }),
         }
     };
-    let owner = text(1)?;
-    if owner != table {
+    // The namespace as well as the name: a row filed against `app.t` must not fire on `public.t`.
+    // Matching on the name alone is what let a trigger declared on one table run on another user's
+    // write to a same-named one, with the writer's privileges.
+    if !trigger_row_is_for(row, schema, table) {
         return Ok(None);
     }
     let timing = match text(2)?.as_str() {

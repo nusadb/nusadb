@@ -135,8 +135,9 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
     // Row-level security: a non-superuser's inserted rows must satisfy the INSERT/ALL policies'
     // WITH CHECK (falling back to USING). Default-deny FALSE when no policy grants the insert, so an
     // RLS-enabled table with no INSERT policy rejects every non-superuser row.
-    let rls_check = if !catalog.is_superuser() && catalog.rls_enabled(&table.name)? {
+    let rls_check = if !catalog.is_superuser() && catalog.rls_enabled(&table.schema, &table.name)? {
         Some(build_rls_check_predicate(
+            &table.schema,
             &table.name,
             ast::PolicyCommand::Insert,
             &single_table_scope(&table),
@@ -679,7 +680,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         // WHERE predicate). Fail closed (deep-gate security). A derived source's schema name is
         // its alias; in the unlikely case that alias collides with an RLS-protected table name the
         // guard merely over-rejects (fail closed) — never a leak.
-        if !catalog.is_superuser() && catalog.rls_enabled(&schema.name)? {
+        if !catalog.is_superuser() && catalog.rls_enabled(&schema.schema, &schema.name)? {
             return Err(Error::Unsupported(format!(
                 "row-level security on `{}` combined with UPDATE ... FROM is not yet supported",
                 schema.name
@@ -725,13 +726,20 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
     // USING grant (AND-injected into the filter, like DELETE), and only to values their WITH CHECK
     // admit (`rls_check`, evaluated against each post-update row by the executor). Default-deny
     // FALSE on both sides when no policy applies.
-    let rls_check = if !catalog.is_superuser() && catalog.rls_enabled(&table.name)? {
-        let using = build_rls_predicate(&table.name, ast::PolicyCommand::Update, &scope, catalog)?;
+    let rls_check = if !catalog.is_superuser() && catalog.rls_enabled(&table.schema, &table.name)? {
+        let using = build_rls_predicate(
+            &table.schema,
+            &table.name,
+            ast::PolicyCommand::Update,
+            &scope,
+            catalog,
+        )?;
         filter = Some(match filter {
             None => using,
             Some(existing) => and_exprs(existing, using),
         });
         Some(build_rls_check_predicate(
+            &table.schema,
             &table.name,
             ast::PolicyCommand::Update,
             &scope,
@@ -821,7 +829,7 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
         // predicate). Fail closed (deep-gate security). A derived source's schema name is its
         // alias; in the unlikely case that alias collides with an RLS-protected table name the guard
         // merely over-rejects (fail closed) — never a leak.
-        if !catalog.is_superuser() && catalog.rls_enabled(&schema.name)? {
+        if !catalog.is_superuser() && catalog.rls_enabled(&schema.schema, &schema.name)? {
             return Err(Error::Unsupported(format!(
                 "row-level security on `{}` combined with DELETE ... USING is not yet supported",
                 schema.name
@@ -845,8 +853,14 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
     // Row-level security: a non-superuser may only delete rows the DELETE/ALL policies grant.
     // DELETE has no WITH CHECK, so injecting the USING predicate is complete (default-deny FALSE
     // when no policy applies, like SELECT).
-    if !catalog.is_superuser() && catalog.rls_enabled(&table.name)? {
-        let policy = build_rls_predicate(&table.name, ast::PolicyCommand::Delete, &scope, catalog)?;
+    if !catalog.is_superuser() && catalog.rls_enabled(&table.schema, &table.name)? {
+        let policy = build_rls_predicate(
+            &table.schema,
+            &table.name,
+            ast::PolicyCommand::Delete,
+            &scope,
+            catalog,
+        )?;
         filter = Some(match filter {
             None => policy,
             Some(existing) => and_exprs(existing, policy),
@@ -910,7 +924,7 @@ pub(super) fn analyze_merge(m: ast::Merge, catalog: &dyn Catalog) -> Result<Merg
     // Row-level security on the MERGE target is not yet wired (the matched UPDATE/DELETE side would
     // not enforce the policies' USING / WITH CHECK that a plain UPDATE/DELETE does). Reject rather
     // than silently bypass RLS for a non-superuser; a superuser bypasses RLS anyway.
-    if !catalog.is_superuser() && catalog.rls_enabled(&table.name)? {
+    if !catalog.is_superuser() && catalog.rls_enabled(&table.schema, &table.name)? {
         return Err(Error::Unsupported(
             "MERGE on a row-level-security protected table is not yet supported".to_owned(),
         ));
@@ -919,7 +933,7 @@ pub(super) fn analyze_merge(m: ast::Merge, catalog: &dyn Catalog) -> Result<Merg
     // non-superuser could read every row of a row-level-security protected source through a matched
     // action's SET / search condition (the same leak class as UPDATE ... FROM / DELETE ... USING).
     // Reject rather than silently leak; a superuser bypasses RLS anyway.
-    if !catalog.is_superuser() && catalog.rls_enabled(&source.name)? {
+    if !catalog.is_superuser() && catalog.rls_enabled(&source.schema, &source.name)? {
         return Err(Error::Unsupported(
             "MERGE USING a row-level security protected source table is not yet supported"
                 .to_owned(),

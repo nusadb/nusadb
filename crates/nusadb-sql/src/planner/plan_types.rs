@@ -774,6 +774,8 @@ pub struct DropViewPlan {
 /// (no lowering needed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTriggerPlan {
+    /// The namespace of the table the trigger is attached to.
+    pub schema: String,
     /// Trigger name (unique per table).
     pub name: String,
     /// Whether `OR REPLACE` was given (replace a same-named trigger on the table).
@@ -795,6 +797,8 @@ pub struct CreateTriggerPlan {
 /// `DROP TRIGGER [IF EXISTS] name ON table`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTriggerPlan {
+    /// The namespace of the table the trigger is attached to.
+    pub schema: String,
     /// Trigger name.
     pub name: String,
     /// The table the trigger is attached to.
@@ -806,6 +810,8 @@ pub struct DropTriggerPlan {
 /// `ALTER TRIGGER name ON table RENAME TO new_name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterTriggerPlan {
+    /// The namespace of the table the trigger is attached to.
+    pub schema: String,
     /// Current trigger name.
     pub name: String,
     /// The table the trigger is attached to.
@@ -885,6 +891,9 @@ pub struct DropFunctionPlan {
 /// table as boolean) and re-analyzed against the table when the policy is enforced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePolicyPlan {
+    /// The namespace of the table the policy governs, so the row cannot answer for a same-named
+    /// table elsewhere.
+    pub schema: String,
     /// Policy name (unique per table).
     pub name: String,
     /// The table the policy governs.
@@ -908,6 +917,9 @@ pub struct CreatePolicyPlan {
 /// `DROP POLICY [IF EXISTS] name ON table`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropPolicyPlan {
+    /// The namespace of the table the policy is attached to — it must match where `CREATE POLICY`
+    /// filed it, or the drop would silently miss.
+    pub schema: String,
     /// Policy name.
     pub name: String,
     /// The table the policy is attached to.
@@ -1114,6 +1126,8 @@ pub enum AlterTablePlan {
     /// SQL-layer catalog. Not a storage-engine schema change, so it does not flow through the
     /// `AlterOp` treaty path.
     SetRls {
+        /// The namespace the target table lives in, so the marker is written where it belongs.
+        schema: String,
         /// The target table's name (already resolved to exist at analysis time).
         table: String,
         /// `true` to enable row-level security, `false` to disable it.
@@ -1122,6 +1136,8 @@ pub enum AlterTablePlan {
     /// `{ENABLE|DISABLE} TRIGGER {name|ALL}` — flip a trigger's enabled flag in the SQL-layer
     /// trigger catalog. Not a storage-engine schema change.
     SetTriggerEnabled {
+        /// The namespace the target table lives in.
+        schema: String,
         /// The target table's name (already resolved to exist at analysis time).
         table: String,
         /// The trigger to toggle, or `None` for every trigger on the table.

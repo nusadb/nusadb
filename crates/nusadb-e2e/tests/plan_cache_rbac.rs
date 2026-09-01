@@ -97,11 +97,15 @@ impl Catalog for RbacCatalog<'_> {
             nusadb_sql::rbac::owns_object(self.engine, txn, self.user, kind, object)
         })
     }
-    fn rls_enabled(&self, name: &str) -> Result<bool, nusadb_sql::Error> {
-        self.with_txn(|txn| nusadb_sql::rls_table_enabled(self.engine, txn, name))
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::rls_table_enabled(self.engine, txn, schema, name))
     }
-    fn lookup_policies(&self, name: &str) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
-        self.with_txn(|txn| nusadb_sql::lookup_policies_for(self.engine, txn, name))
+    fn lookup_policies(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::lookup_policies_for(self.engine, txn, schema, name))
     }
 }
 

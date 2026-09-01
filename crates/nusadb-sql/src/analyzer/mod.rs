@@ -228,12 +228,15 @@ pub trait Catalog {
         true
     }
 
-    /// Whether row-level security is enabled on base table `name`. Default `false` so a
+    /// Whether row-level security is enabled on base table `schema.name`. Default `false` so a
     /// minimal catalog never restricts; the production adapter reads the RLS catalog. Consulted only
     /// for a non-superuser (the caller short-circuits on [`Catalog::is_superuser`] first), so a
     /// superuser session never pays for this lookup.
-    fn rls_enabled(&self, name: &str) -> Result<bool, Error> {
-        let _ = name;
+    ///
+    /// The namespace is part of the question. Asking by bare name alone once meant a marker on
+    /// `public.t` answered for every `t` in the engine.
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
+        let _ = (schema, name);
         Ok(false)
     }
 
@@ -246,8 +249,8 @@ pub trait Catalog {
     /// The row-level-security policies defined on base table `name`. Default empty so a
     /// minimal catalog has none; the production adapter reads the policy catalog. Consulted only for
     /// a non-superuser whose query targets a single RLS-enabled base table.
-    fn lookup_policies(&self, name: &str) -> Result<Vec<PolicyDef>, Error> {
-        let _ = name;
+    fn lookup_policies(&self, schema: &str, name: &str) -> Result<Vec<PolicyDef>, Error> {
+        let _ = (schema, name);
         Ok(Vec::new())
     }
 
@@ -675,18 +678,26 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE/DROP TRIGGER: validate the target table; the action + WHEN bodies
         // are kept as text and re-analyzed (with NEW/OLD bound) when the trigger fires.
         ast::Statement::CreateTrigger(ct) => analyze_create_trigger(ct, catalog),
-        ast::Statement::DropTrigger(dt) => Ok(LogicalPlan::DropTrigger(DropTriggerPlan {
-            name: dt.name,
-            table: dt.table,
-            if_exists: dt.if_exists,
-        })),
+        ast::Statement::DropTrigger(dt) => {
+            let schema = trigger_target_schema(&dt.table, dt.if_exists, catalog)?;
+            Ok(LogicalPlan::DropTrigger(DropTriggerPlan {
+                schema,
+                name: dt.name,
+                table: dt.table,
+                if_exists: dt.if_exists,
+            }))
+        },
         // ALTER TRIGGER ... RENAME TO: existence of the trigger (and absence of the new name) is
         // checked by the executor against the trigger catalog, like DROP TRIGGER.
-        ast::Statement::AlterTrigger(at) => Ok(LogicalPlan::AlterTrigger(AlterTriggerPlan {
-            name: at.name,
-            table: at.table,
-            new_name: at.new_name,
-        })),
+        ast::Statement::AlterTrigger(at) => {
+            let schema = trigger_target_schema(&at.table, false, catalog)?;
+            Ok(LogicalPlan::AlterTrigger(AlterTriggerPlan {
+                schema,
+                name: at.name,
+                table: at.table,
+                new_name: at.new_name,
+            }))
+        },
         // CREATE/DROP PROCEDURE + CALL: the body is kept as text and re-parsed +
         // run (with `$n` bound to the call arguments) by the executor's procedure module.
         ast::Statement::CreateProcedure(cp) => {
@@ -771,7 +782,14 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::CreatePolicy(cp) => analyze_create_policy(cp, catalog),
         ast::Statement::DropPolicy(dp) => {
             require_rls_admin(catalog, "drop a row-level-security policy")?;
+            // Resolved rather than assumed. `CREATE POLICY` files the row under the namespace its
+            // own lookup returns, and naming a constant here was correct only for as long as that
+            // lookup could reach nothing but `public` — a coupling held by a comment, which is
+            // exactly how the trigger side broke: the row moved and the drop kept looking in the
+            // old place, deleting a same-named policy belonging to someone else.
+            let schema = policy_target_schema(&dp.table, dp.if_exists, catalog)?;
             Ok(LogicalPlan::DropPolicy(DropPolicyPlan {
+                schema,
                 name: dp.name,
                 table: dp.table,
                 if_exists: dp.if_exists,
@@ -1040,6 +1058,10 @@ fn analyze_create_trigger(
     // exists for exactly this).
     dcl::require_table_privilege(catalog, &table, ast::Privilege::Trigger)?;
     Ok(LogicalPlan::CreateTrigger(CreateTriggerPlan {
+        // Where the table actually resolved: an unqualified name walks the temp schema and then
+        // the search path, and the row belongs to wherever it landed. Filing it bare is what let a
+        // trigger on one table fire on a same-named table elsewhere.
+        schema: table.schema,
         name: ct.name,
         or_replace: ct.or_replace,
         table: ct.table,
@@ -1537,6 +1559,50 @@ impl Drop for AllowGuard {
     }
 }
 
+/// The namespace a policy statement's table resolves into.
+///
+/// Deliberately the same lookup `analyze_create_policy` uses, so the two cannot answer differently.
+/// `absent_is_ok` keeps `DROP POLICY IF EXISTS` a no-op on a table that does not exist, which is
+/// what it did before the table was consulted at all.
+fn policy_target_schema(
+    table: &str,
+    absent_is_ok: bool,
+    catalog: &dyn Catalog,
+) -> Result<String, Error> {
+    match catalog.lookup_table(table)? {
+        Some(found) => Ok(found.schema),
+        None if absent_is_ok => Ok(nusadb_core::engine::PUBLIC_SCHEMA.to_owned()),
+        None => Err(Error::TableNotFound {
+            name: table.to_owned(),
+        }),
+    }
+}
+
+/// The namespace a trigger statement's table resolves into.
+///
+/// `DROP`/`ALTER TRIGGER` must look for the row where `CREATE TRIGGER` filed it, and that is not
+/// the default namespace: `analyze_create_trigger` resolves through `lookup_table_ref`, which
+/// probes the session temp schema and then the search path. Assuming `public` here made a trigger
+/// on any other namespace undroppable, and pointed the drop at a same-named table's trigger
+/// instead — the same cross-namespace confusion the schema column exists to end, reintroduced from
+/// the other side.
+///
+/// `absent_is_ok` keeps `DROP TRIGGER IF EXISTS` a no-op on a table that does not exist, which is
+/// what it did before the table was consulted at all.
+fn trigger_target_schema(
+    table: &str,
+    absent_is_ok: bool,
+    catalog: &dyn Catalog,
+) -> Result<String, Error> {
+    match lookup_table_ref(None, table, catalog)? {
+        Some(found) => Ok(found.schema),
+        None if absent_is_ok => Ok(nusadb_core::engine::PUBLIC_SCHEMA.to_owned()),
+        None => Err(Error::TableNotFound {
+            name: table.to_owned(),
+        }),
+    }
+}
+
 /// Resolve a table reference `(schema, name)` to its schema, erroring if absent. An explicit
 /// qualifier resolves in that schema; an unqualified name walks the session search path.
 fn resolve_table(
@@ -1548,7 +1614,9 @@ fn resolve_table(
     let table = lookup_table_ref(schema, name, catalog)?.ok_or_else(|| Error::TableNotFound {
         name: qualified_display_opt(schema, name),
     })?;
-    enforce_table_rls(name, catalog)?;
+    // The namespace the table actually resolved into, not the one that was asked for: an
+    // unqualified name walks the search path, and the marker belongs to wherever it landed.
+    enforce_table_rls(&table.schema, name, catalog)?;
     Ok(table)
 }
 
@@ -1559,8 +1627,12 @@ fn resolve_table(
 /// short-circuits on [`Catalog::is_superuser`] first, so a superuser session never pays for the RLS
 /// lookup, and so a minimal catalog (default superuser) is unaffected. Applied at every base-table
 /// resolution site (DML targets via [`resolve_table`], and the `SELECT` `FROM` base).
-pub(super) fn enforce_table_rls(name: &str, catalog: &dyn Catalog) -> Result<(), Error> {
-    if !catalog.is_superuser() && catalog.rls_enabled(name)? {
+pub(super) fn enforce_table_rls(
+    schema: &str,
+    name: &str,
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    if !catalog.is_superuser() && catalog.rls_enabled(schema, name)? {
         return Err(Error::Unsupported(format!(
             "row-level security is enabled on `{name}`; this access is not yet supported under RLS \
              (only single-table reads are policy-filtered), so it is allowed only for a superuser"
@@ -1593,6 +1665,7 @@ fn analyze_create_policy(
         analyze_predicate(Some(expr), &scope, catalog)?;
     }
     Ok(LogicalPlan::CreatePolicy(CreatePolicyPlan {
+        schema: table.schema,
         name: cp.name,
         table: table.name,
         replace: false,
@@ -1618,7 +1691,7 @@ fn analyze_alter_policy(ap: ast::AlterPolicy, catalog: &dyn Catalog) -> Result<L
             name: ap.table.clone(),
         })?;
     let existing = catalog
-        .lookup_policies(&table.name)?
+        .lookup_policies(&table.schema, &table.name)?
         .into_iter()
         .find(|p| p.name == ap.name)
         .ok_or_else(|| {
@@ -1639,6 +1712,7 @@ fn analyze_alter_policy(ap: ast::AlterPolicy, catalog: &dyn Catalog) -> Result<L
         analyze_predicate(Some(expr), &scope, catalog)?;
     }
     Ok(LogicalPlan::CreatePolicy(CreatePolicyPlan {
+        schema: table.schema,
         name: ap.name,
         table: table.name,
         replace: true,

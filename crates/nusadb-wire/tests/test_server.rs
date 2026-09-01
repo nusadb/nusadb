@@ -4710,3 +4710,383 @@ async fn polygon_renders_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// Dropping a table you own must not switch off row-level security on someone else's.
+///
+/// The RLS marker used to record a bare table name, and `DROP TABLE` cleared it by that name. So a
+/// user with no privileges beyond creating a table in the default schema could create one whose
+/// name collided with a protected table in another schema, drop it, and the cascade would clear the
+/// marker guarding the other one. Nothing was reported, and the protected rows became readable to
+/// anyone holding SELECT.
+///
+/// Neither step is privileged: `CREATE TABLE` makes the creator the owner, and `DROP TABLE` is
+/// gated on ownership rather than on superuser. The marker is keyed `(schema, table)` now, so the
+/// drop can only clear its own.
+#[tokio::test]
+async fn dropping_a_same_named_table_does_not_clear_another_schemas_rls() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    async fn outcome(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Option<String> {
+        query(conn, sql).await;
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => err = Some(message),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err
+    }
+
+    /// The rows a read returns, panicking on an error — a refusal here would be a different
+    /// failure than the one under test and must not read as "no rows".
+    async fn rows_of(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Vec<Vec<u8>> {
+        query(conn, sql).await;
+        let mut ids = Vec::new();
+        loop {
+            match next(conn).await {
+                BackendMessage::DataRow { values } => {
+                    ids.push(values[0].clone().expect("non-null id"));
+                },
+                BackendMessage::Error { message, .. } => {
+                    panic!("unexpected error for `{sql}`: {message}")
+                },
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        ids
+    }
+
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
+    for sql in [
+        "CREATE SCHEMA vault",
+        "CREATE TABLE vault.ledger (id INT NOT NULL, owner TEXT)",
+        "INSERT INTO vault.ledger VALUES (91, 'alice'), (92, 'alice')",
+        "ALTER TABLE vault.ledger ENABLE ROW LEVEL SECURITY",
+        // Granted so the read below is refused by row-level security rather than by privileges —
+        // otherwise the test would pass without RLS ever being consulted.
+        "GRANT SELECT ON vault.ledger TO PUBLIC",
+        "CREATE ROLE mallory LOGIN",
+    ] {
+        assert!(outcome(&mut su, sql).await.is_none(), "setup failed: {sql}");
+    }
+
+    let (mut mallory, mallory_handle) = connect(&engine, "mallory").await;
+    assert!(
+        rows_of(&mut mallory, "SELECT id FROM vault.ledger")
+            .await
+            .is_empty(),
+        "the protected table must be unreadable before the attempt, or the test proves nothing"
+    );
+
+    // The whole attack, and every step of it is ordinary.
+    assert!(
+        outcome(&mut mallory, "CREATE TABLE ledger (id INT NOT NULL)")
+            .await
+            .is_none()
+    );
+    assert!(outcome(&mut mallory, "DROP TABLE ledger").await.is_none());
+
+    assert!(
+        rows_of(&mut mallory, "SELECT id FROM vault.ledger")
+            .await
+            .is_empty(),
+        "dropping `public.ledger` cleared the marker protecting `vault.ledger`"
+    );
+
+    terminate_conn(mallory, mallory_handle).await;
+    terminate_conn(su, su_handle).await;
+}
+
+/// A trigger declared on a temporary table must not fire on the durable table it shadows.
+///
+/// The trigger catalog recorded a bare table name, and the firing path matched on that name alone.
+/// So an unprivileged user could create a temp table shadowing any durable one, declare a trigger
+/// on their own temp table — which they own, so it is allowed — and the row would fire on every
+/// write to the durable table by anyone.
+///
+/// The body runs as the *writer*, not the author: a nested statement is analysed under the invoking
+/// user. So the author gets arbitrary SQL executed with the victim's privileges. This test pins the
+/// author's body never running at all; the privilege context is what made it worth more than a
+/// nuisance.
+#[tokio::test]
+async fn a_trigger_on_a_temp_table_does_not_fire_on_the_durable_one() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    async fn outcome(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Option<String> {
+        query(conn, sql).await;
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => err = Some(message),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err
+    }
+
+    async fn count_of(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Vec<Vec<u8>> {
+        query(conn, sql).await;
+        let mut out = Vec::new();
+        loop {
+            match next(conn).await {
+                BackendMessage::DataRow { values } => {
+                    out.push(values[0].clone().expect("non-null"));
+                },
+                BackendMessage::Error { message, .. } => {
+                    panic!("unexpected error for `{sql}`: {message}")
+                },
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        out
+    }
+
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
+    for sql in [
+        "CREATE TABLE victim (id INT NOT NULL)",
+        "CREATE TABLE spy (id INT NOT NULL)",
+        // Ordinary grants: alice may write the table, and may write `spy` herself. The second is
+        // what makes the body's failure a question of *whose* trigger ran rather than of alice's
+        // own rights.
+        "GRANT INSERT ON victim TO PUBLIC",
+        "GRANT INSERT ON spy TO PUBLIC",
+        "GRANT SELECT ON spy TO PUBLIC",
+        "CREATE ROLE mallory LOGIN",
+        "CREATE ROLE alice LOGIN",
+    ] {
+        assert!(outcome(&mut su, sql).await.is_none(), "setup failed: {sql}");
+    }
+
+    {
+        let (mut mallory, mallory_handle) = connect(&engine, "mallory").await;
+        assert!(
+            outcome(&mut mallory, "CREATE TEMP TABLE victim (id INT NOT NULL)")
+                .await
+                .is_none()
+        );
+        // Declared on her own temp table, which she owns — nothing here is illegitimate.
+        assert!(
+            outcome(
+                &mut mallory,
+                "CREATE TRIGGER tg AFTER INSERT ON victim FOR EACH ROW INSERT INTO spy VALUES (1)",
+            )
+            .await
+            .is_none()
+        );
+        // And she can still drop it. The row is filed under her temp namespace, so a drop that
+        // assumed the default one would miss it — leaving a trigger that can be created and never
+        // removed, while the drop deleted a same-named trigger on someone else's table instead.
+        assert!(
+            outcome(&mut mallory, "DROP TRIGGER tg ON victim")
+                .await
+                .is_none(),
+            "a trigger outside the default namespace must still be droppable by its author"
+        );
+        // Recreated, because the rest of the test is about it firing.
+        assert!(
+            outcome(
+                &mut mallory,
+                "CREATE TRIGGER tg AFTER INSERT ON victim FOR EACH ROW INSERT INTO spy VALUES (1)",
+            )
+            .await
+            .is_none()
+        );
+        // Alice writes while mallory's session is still open. Closing it first tears down her
+        // temp schema and purges the row, so the assertion below would hold because the row is
+        // gone rather than because the firing path checks the namespace — the test would pass for
+        // a second reason and stop detecting the defect it is about.
+        let (mut alice, alice_handle) = connect(&engine, "alice").await;
+        assert!(
+            outcome(&mut alice, "INSERT INTO victim VALUES (5)")
+                .await
+                .is_none(),
+            "the write itself is permitted"
+        );
+        terminate_conn(alice, alice_handle).await;
+
+        terminate_conn(mallory, mallory_handle).await;
+    }
+
+    assert!(
+        count_of(&mut su, "SELECT id FROM spy").await.is_empty(),
+        "a trigger on mallory's temp table fired on the durable `public.victim`"
+    );
+
+    terminate_conn(su, su_handle).await;
+}
+
+/// A same-named recursive CTE must not disarm row-level security on a qualified table.
+///
+/// The recursive-CTE catalog shadows a real object of the same unqualified name, and its
+/// row-security answer short-circuited on the name alone — so a qualified reference, which still
+/// resolves to the real base table, was reported unprotected. The guard is narrowed to the two
+/// probes it actually shadows, mirroring `lookup_table_in` beside it.
+///
+/// **The protected table has to appear in the RECURSIVE term.** The anchor is analysed against the
+/// plain catalog, so a query naming it there never reaches the overlay and passes whether the
+/// guard is right or wrong — the shape my first attempt at this test had.
+///
+/// The expected outcome is a refusal, not an empty result: the guard delegating means `apply_rls`
+/// proceeds and then refuses the join it cannot filter. Under the old guard it returned `false` and
+/// `apply_rls` left the scan unfiltered, with no refusal at all — so the error *is* the evidence.
+///
+/// Written against a connection because the in-process test catalog resolves only the default
+/// namespace, so a qualified reference cannot be expressed there at all.
+#[tokio::test]
+async fn a_cte_cannot_disarm_row_security_on_a_qualified_table() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    async fn outcome(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Option<String> {
+        query(conn, sql).await;
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => err = Some(message),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err
+    }
+
+    /// Rows returned, panicking on a refusal.
+    ///
+    /// Counting rows and ignoring an `Error` frame would read a failed statement as "no rows" and
+    /// satisfy the assertion below for the wrong reason — the statement has to actually run for
+    /// its emptiness to mean anything.
+    async fn rows_returned(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> usize {
+        query(conn, sql).await;
+        let mut n = 0;
+        loop {
+            match next(conn).await {
+                BackendMessage::DataRow { .. } => n += 1,
+                BackendMessage::Error { message, .. } => {
+                    panic!("`{sql}` was refused rather than returning rows: {message}")
+                },
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        n
+    }
+
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
+    for sql in [
+        "CREATE SCHEMA vault",
+        "CREATE TABLE vault.ledger (id INT NOT NULL)",
+        "INSERT INTO vault.ledger VALUES (1), (2)",
+        "ALTER TABLE vault.ledger ENABLE ROW LEVEL SECURITY",
+        // Granted, so anything the reader sees is a row-security failure and not a privilege one.
+        "GRANT SELECT ON vault.ledger TO PUBLIC",
+        "CREATE ROLE mallory LOGIN",
+    ] {
+        assert!(outcome(&mut su, sql).await.is_none(), "setup failed: {sql}");
+    }
+
+    let (mut mallory, mallory_handle) = connect(&engine, "mallory").await;
+    assert_eq!(
+        rows_returned(&mut mallory, "SELECT id FROM vault.ledger").await,
+        0,
+        "the table must be unreadable plainly, or the CTE proves nothing"
+    );
+    // The qualified table sits in the recursive term, where the overlay is installed.
+    let refusal = outcome(
+        &mut mallory,
+        "WITH RECURSIVE ledger(id) AS (SELECT 0 UNION ALL SELECT v.id FROM vault.ledger v JOIN ledger c ON c.id = 0) SELECT id FROM ledger",
+    )
+    .await
+    .expect("row-level security must be consulted for `vault.ledger` and refuse the join");
+    assert!(
+        refusal.contains("row-level security"),
+        "refused for some other reason, so the guard was not what stopped it: {refusal}"
+    );
+
+    terminate_conn(mallory, mallory_handle).await;
+    terminate_conn(su, su_handle).await;
+}

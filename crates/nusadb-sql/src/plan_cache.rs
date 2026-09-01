@@ -219,8 +219,8 @@ impl Catalog for RecordingCatalog<'_> {
         }
         Ok(indexes)
     }
-    fn rls_enabled(&self, name: &str) -> Result<bool, Error> {
-        let enabled = self.inner.rls_enabled(name)?;
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
+        let enabled = self.inner.rls_enabled(schema, name)?;
         // An RLS-enabled table bakes a policy predicate into the plan; policy changes are unversioned,
         // so the plan cannot be safely reused — do not cache it.
         if enabled {
@@ -346,8 +346,8 @@ impl Catalog for RecordingCatalog<'_> {
     fn current_user(&self) -> String {
         self.inner.current_user()
     }
-    fn lookup_policies(&self, name: &str) -> Result<Vec<PolicyDef>, Error> {
-        self.inner.lookup_policies(name)
+    fn lookup_policies(&self, schema: &str, name: &str) -> Result<Vec<PolicyDef>, Error> {
+        self.inner.lookup_policies(schema, name)
     }
 }
 

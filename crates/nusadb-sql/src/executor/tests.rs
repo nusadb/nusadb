@@ -3858,3 +3858,375 @@ fn sql_mentions_column_is_whole_word_and_case_insensitive() {
     // Errs toward matching: a string literal counts, which only over-refuses.
     assert!(m("a <> 'b'", "b"));
 }
+
+/// A catalog row written before the schema column still reads, and reads the way the migration
+/// documents.
+///
+/// The three catalogs gained a schema column to stop one row answering for same-named tables in
+/// different namespaces. Rows written before it exist and cannot be re-derived — the name they
+/// recorded does not say which namespace it meant — so each catalog resolves that ambiguity
+/// deliberately, and this pins the resolution rather than leaving it to a comment.
+///
+/// Legacy rows are built here the only way they can be: encoded at the old width and inserted
+/// straight into the catalog table, which is exactly what the previous code left behind.
+#[test]
+fn a_pre_schema_catalog_row_still_reads() {
+    use nusadb_btree::BtreeEngine;
+
+    use super::row;
+    use super::{RLS_CATALOG_SCHEMA_LEGACY, lookup_policies_for, rls_table_enabled};
+
+    let engine = BtreeEngine::new();
+    let txn = engine.begin(IsolationLevel::default()).unwrap();
+
+    // An RLS marker at the old single-column width.
+    let def = TableDef {
+        schema: "public".to_owned(),
+        name: "nusadb_rls".to_owned(),
+        columns: vec![nusadb_core::engine::ColumnDef {
+            name: "table".to_owned(),
+            ty: ColumnType::Text,
+            nullable: false,
+        }],
+    };
+    let cat = engine.create_table(txn, &def).unwrap();
+    let bytes = row::encode(
+        &[Value::Text("ledger".to_owned())],
+        &RLS_CATALOG_SCHEMA_LEGACY,
+    )
+    .unwrap();
+    engine.insert(txn, cat, &bytes).unwrap();
+
+    // Reading matches any namespace, so a table protected before the upgrade stays protected.
+    // Erring the other way would silently switch row-level security off.
+    assert!(rls_table_enabled(&engine, txn, "public", "ledger").unwrap());
+    assert!(rls_table_enabled(&engine, txn, "vault", "ledger").unwrap());
+    assert!(!rls_table_enabled(&engine, txn, "public", "other").unwrap());
+
+    // Clearing is the opposite: only the default namespace may retire a legacy marker, or dropping
+    // `app.ledger` would unprotect `public.ledger` through the row this migration is about.
+    assert!(!super::clear_rls_marker(&engine, txn, "vault", "ledger").unwrap());
+    assert!(rls_table_enabled(&engine, txn, "vault", "ledger").unwrap());
+    assert!(super::clear_rls_marker(&engine, txn, "public", "ledger").unwrap());
+    assert!(!rls_table_enabled(&engine, txn, "public", "ledger").unwrap());
+
+    // A policy row at the old seven-column width reads as belonging to the default namespace,
+    // which is provable rather than assumed: `CREATE POLICY` resolved its table through a
+    // public-only lookup, so no other namespace could have written one.
+    let cols: Vec<nusadb_core::engine::ColumnDef> = [
+        "table",
+        "name",
+        "command",
+        "roles",
+        "using",
+        "check",
+        "permissive",
+    ]
+    .into_iter()
+    .map(|name| nusadb_core::engine::ColumnDef {
+        name: name.to_owned(),
+        ty: ColumnType::Text,
+        nullable: false,
+    })
+    .collect();
+    let pcat = engine
+        .create_table(
+            txn,
+            &TableDef {
+                schema: "public".to_owned(),
+                name: "nusadb_policies".to_owned(),
+                columns: cols,
+            },
+        )
+        .unwrap();
+    let legacy_policy: Vec<Value> = ["ledger", "p", "all", "", "true", "", "t"]
+        .into_iter()
+        .map(|s| Value::Text(s.to_owned()))
+        .collect();
+    let bytes = row::encode(&legacy_policy, &super::POLICY_CATALOG_SCHEMA_LEGACY).unwrap();
+    engine.insert(txn, pcat, &bytes).unwrap();
+
+    assert_eq!(
+        lookup_policies_for(&engine, txn, "public", "ledger")
+            .unwrap()
+            .len(),
+        1,
+        "a legacy policy row belongs to the default namespace"
+    );
+    assert!(
+        lookup_policies_for(&engine, txn, "vault", "ledger")
+            .unwrap()
+            .is_empty(),
+        "and must not govern a same-named table in another one"
+    );
+}
+
+/// A narrow catalog is widened in place, and a row written before the widening still reads.
+///
+/// The three catalogs gained a schema column. `row::decode` stops at the declared column count and
+/// ignores trailing bytes, so a wide row silently decodes narrow — which is what makes the
+/// widest-first fallback work, and equally what would let a stale declared shape drop the new
+/// column on any decode-and-re-encode. The upgrade closes that by rewriting the rows and declaring
+/// the column, so the stored and declared shapes cannot drift apart.
+#[test]
+fn a_narrow_catalog_is_widened_in_place() {
+    use nusadb_btree::BtreeEngine;
+
+    use super::row;
+
+    let engine = BtreeEngine::new();
+    let txn = engine.begin(IsolationLevel::default()).unwrap();
+
+    // A pre-upgrade RLS catalog: one column, one row naming a table and no namespace.
+    let cat = engine
+        .create_table(
+            txn,
+            &TableDef {
+                schema: "public".to_owned(),
+                name: "nusadb_rls".to_owned(),
+                columns: vec![nusadb_core::engine::ColumnDef {
+                    name: "table".to_owned(),
+                    ty: ColumnType::Text,
+                    nullable: false,
+                }],
+            },
+        )
+        .unwrap();
+    let bytes = row::encode(
+        &[Value::Text("ledger".to_owned())],
+        &super::RLS_CATALOG_SCHEMA_LEGACY,
+    )
+    .unwrap();
+    engine.insert(txn, cat, &bytes).unwrap();
+
+    // Writing a marker goes through `ensure`, which upgrades first.
+    super::set_table_rls(&engine, txn, "vault", "book", true).unwrap();
+
+    let widened = engine
+        .lookup_table_as_of(txn, "nusadb_rls")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        widened.columns.len(),
+        2,
+        "the catalog kept its old declared shape while writing rows at the new width"
+    );
+
+    // The new row is namespace-exact...
+    assert!(super::rls_table_enabled(&engine, txn, "vault", "book").unwrap());
+    assert!(!super::rls_table_enabled(&engine, txn, "public", "book").unwrap());
+    // ...and the row rewritten by the upgrade still protects what it protected. Both namespaces,
+    // because that is the whole property: the upgrade must not answer the question the legacy row
+    // left open. Checking only `public` is what let a blanket rewrite convert every legacy marker
+    // to `public` and silently unprotect every pre-upgrade table outside it — reachable by
+    // enabling row-level security on any unrelated table, which is what triggers the upgrade.
+    assert!(super::rls_table_enabled(&engine, txn, "public", "ledger").unwrap());
+    assert!(
+        super::rls_table_enabled(&engine, txn, "vault", "ledger").unwrap(),
+        "the upgrade narrowed a legacy marker to one namespace and unprotected the others"
+    );
+
+    // The widened-unknown row is stored as SQL NULL, not as a reserved schema name. `CREATE SCHEMA
+    // ""` is accepted, so a name-shaped sentinel was reachable by ordinary DDL: enabling RLS on
+    // `"".t` wrote a row indistinguishable from this one and locked out every `t` in the engine.
+    let scanned = {
+        let cat = engine
+            .lookup_table_as_of(txn, "nusadb_rls")
+            .unwrap()
+            .unwrap();
+        let mut rows = Vec::new();
+        let mut scan = engine.scan(txn, cat.id).unwrap();
+        while let Some((_, bytes)) = scan.try_next().unwrap() {
+            rows.push(row::decode(&bytes, &super::RLS_CATALOG_SCHEMA).unwrap());
+        }
+        rows
+    };
+    assert!(
+        scanned
+            .iter()
+            .any(|r| matches!(r.as_slice(), [Value::Text(t), Value::Null] if t == "ledger")),
+        "the unknown namespace must not be spelled with a value a schema could be named: {scanned:?}"
+    );
+}
+
+/// A marker that names no namespace refuses to be toggled, and is retired only by dropping the
+/// table in the default namespace.
+///
+/// Split from the widening test above because it asserts a different thing: not that the catalog
+/// migrates, but what the statements do once it has. The fixture is the same pre-upgrade shape —
+/// a one-column catalog holding a bare marker — reached through `set_table_rls`, which upgrades on
+/// the way in.
+#[test]
+fn an_unrecorded_marker_refuses_a_toggle_but_not_a_drop() {
+    use nusadb_btree::BtreeEngine;
+
+    use super::row;
+
+    /// Answers `lookup_table` and `lookup_table_in` so both a bare and a qualified target can be
+    /// named. Everything else is the trait default: `is_superuser` and `owns_object` are `true`,
+    /// so nothing here says anything about authorization.
+    ///
+    /// One default is live rather than merely unused: `temp_schema` reads the executor
+    /// thread-local shared by every test in this binary, and `lookup_table_ref` probes it before
+    /// the search path. Answering `lookup_table_in` is what put it on that path. It stays inert
+    /// because a fresh engine has no `nusadb_temp_*` schema, so the probe finds nothing — but the
+    /// next person to extend this fixture is the one who would trip it.
+    struct OverEngine<'a>(&'a BtreeEngine);
+    impl Catalog for OverEngine<'_> {
+        fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+            StorageEngine::lookup_table(self.0, name).map_err(Error::from)
+        }
+        fn lookup_table_in(&self, schema: &str, name: &str) -> Result<Option<TableSchema>, Error> {
+            StorageEngine::lookup_table_in(self.0, schema, name).map_err(Error::from)
+        }
+    }
+
+    fn table(schema: &str, name: &str) -> TableDef {
+        TableDef {
+            schema: schema.to_owned(),
+            name: name.to_owned(),
+            columns: vec![nusadb_core::engine::ColumnDef {
+                name: "id".to_owned(),
+                ty: ColumnType::Int,
+                nullable: false,
+            }],
+        }
+    }
+
+    let engine = BtreeEngine::new();
+    let txn = engine.begin(IsolationLevel::default()).unwrap();
+    engine
+        .create_table(txn, &table("public", "ledger"))
+        .unwrap();
+    engine.create_schema(txn, "vault").unwrap();
+    engine.create_table(txn, &table("vault", "ledger")).unwrap();
+
+    let cat = engine
+        .create_table(
+            txn,
+            &TableDef {
+                schema: "public".to_owned(),
+                name: "nusadb_rls".to_owned(),
+                columns: vec![nusadb_core::engine::ColumnDef {
+                    name: "table".to_owned(),
+                    ty: ColumnType::Text,
+                    nullable: false,
+                }],
+            },
+        )
+        .unwrap();
+    let bytes = row::encode(
+        &[Value::Text("ledger".to_owned())],
+        &super::RLS_CATALOG_SCHEMA_LEGACY,
+    )
+    .unwrap();
+    engine.insert(txn, cat, &bytes).unwrap();
+
+    // `ALTER TABLE … {ENABLE|DISABLE} ROW LEVEL SECURITY` refuses: the marker names no namespace,
+    // so toggling it for one of them has no answer that is not a silent guess. Driven through the
+    // executor rather than the helper, because the refusal is the statement's and that is the
+    // distinction the next assertion depends on.
+    let toggle = crate::planner::PhysicalPlan::AlterTable(crate::planner::AlterTablePlan::SetRls {
+        schema: "vault".to_owned(),
+        table: "ledger".to_owned(),
+        enabled: false,
+    });
+    let err = execute_in_txn(toggle, &engine, txn).unwrap_err();
+    assert!(
+        err.to_string().contains("recorded before namespaces"),
+        "disabling must say why it cannot, not report success and change nothing: {err}"
+    );
+
+    // First the complement: dropping a same-named table in ANOTHER namespace must leave the
+    // marker alone. Retiring it from anywhere would unprotect every namespace it covers — the
+    // original defect, reached from the other side, and it would pass every other assertion here.
+    let elsewhere = analyze(
+        parse("DROP TABLE vault.ledger").unwrap(),
+        &OverEngine(&engine),
+    )
+    .unwrap();
+    execute_in_txn(plan(elsewhere), &engine, txn).expect("dropping vault.ledger is permitted");
+    assert!(
+        super::rls_table_enabled(&engine, txn, "public", "ledger").unwrap(),
+        "a drop outside the default namespace retired a marker covering every namespace"
+    );
+
+    // `DROP TABLE` must still retire it, and that is asserted as the statement rather than as the
+    // cascade's helper. The refusal above belongs to the toggle alone: placed inside
+    // `set_table_rls` it caught the drop too, and since the drop is what retires the marker, the
+    // state gained no exit — every same-named table undroppable and the marker unremovable. A test
+    // for the refusal alone passes in that broken state, so both halves are asserted, each at the
+    // layer its statement actually takes.
+    let dropped = analyze(parse("DROP TABLE ledger").unwrap(), &OverEngine(&engine)).unwrap();
+    execute_in_txn(plan(dropped), &engine, txn)
+        .expect("dropping the table in the default namespace must retire an unrecorded marker");
+    assert!(
+        !super::rls_table_enabled(&engine, txn, "vault", "ledger").unwrap(),
+        "and retiring it must release every namespace it covered"
+    );
+}
+
+/// `CREATE POLICY` and `DROP POLICY` must file and look for a row under the same namespace.
+///
+/// Both statements resolve their table through the same lookup, so the row is filed and looked for
+/// under one namespace. `DROP POLICY` used to name the default namespace as a constant instead —
+/// correct only for as long as `CREATE POLICY`'s lookup could reach nothing else, which is a
+/// coupling held by a comment rather than by code.
+///
+/// This test is what showed that: built against a catalog resolving outside `public`, it failed,
+/// and the constant went. The same coupling on the trigger side had already drifted for real — the
+/// row moved with the table, the drop kept looking in `public`, and the trigger became undroppable
+/// while the drop deleted a same-named one belonging to someone else.
+///
+/// Asserted as *equality between the two plans* rather than equality to any particular namespace,
+/// so it keeps holding whatever either side resolves to, and fails the moment they disagree.
+#[test]
+fn create_and_drop_policy_agree_on_the_namespace() {
+    use crate::planner::LogicalPlan;
+
+    /// A catalog whose tables live outside the default namespace.
+    ///
+    /// Without this the fixture resolves everything to `public`, and the assertion below compares
+    /// `"public"` with `"public"` for a reason that has nothing to do with the coupling — it would
+    /// keep passing on the very day `CREATE POLICY` starts resolving and the two sides diverge in
+    /// production. The whole point is to fail then.
+    struct Elsewhere<'a>(&'a MockEngine);
+
+    impl Catalog for Elsewhere<'_> {
+        fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+            Ok(Catalog::lookup_table(self.0, name)?.map(|mut t| {
+                t.schema = "app".to_owned();
+                t
+            }))
+        }
+        fn lookup_table_in(&self, schema: &str, name: &str) -> Result<Option<TableSchema>, Error> {
+            let _ = schema;
+            self.lookup_table(name)
+        }
+        fn search_path(&self) -> Vec<String> {
+            vec!["app".to_owned()]
+        }
+        fn current_schema(&self) -> String {
+            "app".to_owned()
+        }
+    }
+
+    let engine = MockEngine::new();
+    run("CREATE TABLE t (id INT NOT NULL)", &engine).unwrap();
+    let catalog = Elsewhere(&engine);
+
+    let created = analyze(
+        parse("CREATE POLICY p ON t USING (id > 0)").unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    let dropped = analyze(parse("DROP POLICY p ON t").unwrap(), &catalog).unwrap();
+
+    let (LogicalPlan::CreatePolicy(c), LogicalPlan::DropPolicy(d)) = (created, dropped) else {
+        panic!("expected a create and a drop policy plan");
+    };
+    assert_eq!(
+        c.schema, d.schema,
+        "the two statements file and look for the policy row under different namespaces"
+    );
+}
