@@ -289,35 +289,45 @@ pub(super) fn compare_tuple(a: &[ast::Value], b: &[ast::Value]) -> Ordering {
 }
 
 /// The direct partitions of `parent` whose bound provably contains no key satisfying `constraints`
-/// — the partitions a query with those key predicates need not scan. Only ever called for a
-/// single-column key (`key_tys` has one element); each constant is coerced to it. A partition is
-/// dropped only when *some* single constraint alone proves it empty, so the result never changes which
-/// rows a query returns — only how many partitions it scans.
+/// — the partitions a query with those key predicates need not scan. `constraints` are on the
+/// *leading* key column (`key_tys[0]`); each constant is coerced to it. A partition is dropped only
+/// when *some* single constraint alone proves it empty, so the result never changes which rows a query
+/// returns — only how many partitions it scans.
 pub(super) fn prune(
     engine: &dyn StorageEngine,
     txn: TxnId,
     parent: &str,
-    key_ty: ColumnType,
+    key_tys: &[ColumnType],
     constraints: &[crate::PruneConstraint],
 ) -> Result<Vec<String>, Error> {
     let mut dropped = Vec::new();
-    for p in partitions_of(engine, txn, parent, &[key_ty])? {
-        if constraints.iter().any(|c| excludes(&p.bound, c, key_ty)) {
+    for p in partitions_of(engine, txn, parent, key_tys)? {
+        if constraints.iter().any(|c| excludes(&p.bound, c, key_tys)) {
             dropped.push(p.table);
         }
     }
     Ok(dropped)
 }
 
-/// Whether `bound` provably contains no key `k` satisfying `k <op> value` — i.e. the partition can be
-/// skipped for that constraint. Conservative: returns `false` (keep the partition) whenever the
-/// constant cannot be coerced to the key type, is `NULL`, or the strategy admits no static proof.
-/// Single-column only (pruning does not fire for a multi-column key).
+/// Whether `bound` provably contains no key whose *leading* column satisfies `constraint` — i.e. the
+/// partition can be skipped. Conservative: returns `false` (keep the partition) whenever the constant
+/// cannot be coerced, is `NULL`, or the strategy/arity admits no static proof.
+///
+/// For a single-column key a range bound is `[lo, hi)` (half-open, exact). For a multi-column key the
+/// leading column of every row in a range partition lies in the closed interval `[lo[0], hi[0]]` (a
+/// row with leading `= hi[0]` is possible when the trailing bound allows it), so the leading test uses
+/// that closed interval — a proven superset, which only ever keeps extra partitions, never wrongly
+/// drops one. A multi-column hash cannot be routed from the leading column alone, so it is never
+/// pruned.
 fn excludes(
     bound: &PartitionBound,
     constraint: &crate::PruneConstraint,
-    key_ty: ColumnType,
+    key_tys: &[ColumnType],
 ) -> bool {
+    let Some(&key_ty) = key_tys.first() else {
+        return false;
+    };
+    let multi = key_tys.len() > 1;
     let Ok(v) = super::eval::cast_value(constraint.value.clone(), key_ty) else {
         return false;
     };
@@ -326,16 +336,19 @@ fn excludes(
     }
     match bound {
         PartitionBound::Range { lo, hi } => match (lo.first(), hi.first()) {
+            (Some(lo), Some(hi)) if multi => leading_range_excludes(lo, hi, constraint.op, &v),
             (Some(lo), Some(hi)) => range_excludes(lo, hi, constraint.op, &v),
             _ => false,
         },
-        // A value set excludes the constraint when no member of the set satisfies it.
+        // A value set excludes the constraint when no member of the set satisfies it (single-column).
         PartitionBound::List(values) => !values.iter().any(|x| op_holds(x, constraint.op, &v)),
-        // A hash partition can only be excluded by equality: route the constant and keep the one
-        // partition that would hold it. An inequality gives no static hash proof.
+        // A single-column hash partition can be excluded by equality: route the constant and keep the
+        // one partition that would hold it. A multi-column hash needs every key column, so a
+        // leading-only predicate gives no static proof.
         PartitionBound::Hash { .. } => {
-            matches!(constraint.op, crate::PruneOp::Eq)
-                && !accepts(std::slice::from_ref(&v), bound, &[key_ty])
+            !multi
+                && matches!(constraint.op, crate::PruneOp::Eq)
+                && !accepts(std::slice::from_ref(&v), bound, key_tys)
         },
         // The catch-all can hold any key no sibling covers, so it can never be pruned.
         PartitionBound::Default => false,
@@ -369,6 +382,32 @@ fn range_excludes(lo: &ast::Value, hi: &ast::Value, op: crate::PruneOp, v: &ast:
         crate::PruneOp::LtEq => compare(lo, v) == Ordering::Greater,
         // `> v` / `>= v`: every key is `< hi`, so none is `> v` (nor `>= v`) once `v >= hi`.
         crate::PruneOp::Gt | crate::PruneOp::GtEq => compare(v, hi) != Ordering::Less,
+    }
+}
+
+/// Whether a multi-column range partition provably contains no key whose *leading* column satisfies
+/// `key <op> v`, given the leading column lies in the **closed** interval `[lo0, hi0]` (both bounds
+/// possible — see [`excludes`]). A proven superset, so this only ever keeps extra partitions.
+fn leading_range_excludes(
+    lo0: &ast::Value,
+    hi0: &ast::Value,
+    op: crate::PruneOp,
+    v: &ast::Value,
+) -> bool {
+    use super::eval::compare;
+    match op {
+        // `= v`: excluded unless `v` falls in `[lo0, hi0]`.
+        crate::PruneOp::Eq => {
+            !(compare(v, lo0) != Ordering::Less && compare(v, hi0) != Ordering::Greater)
+        },
+        // `< v`: every leading value is `>= lo0`, so none is `< v` once `lo0 >= v`.
+        crate::PruneOp::Lt => compare(lo0, v) != Ordering::Less,
+        // `<= v`: none is `<= v` once `lo0 > v`.
+        crate::PruneOp::LtEq => compare(lo0, v) == Ordering::Greater,
+        // `> v`: every leading value is `<= hi0`, so none is `> v` once `hi0 <= v`.
+        crate::PruneOp::Gt => compare(hi0, v) != Ordering::Greater,
+        // `>= v`: none is `>= v` once `hi0 < v`.
+        crate::PruneOp::GtEq => compare(hi0, v) == Ordering::Less,
     }
 }
 

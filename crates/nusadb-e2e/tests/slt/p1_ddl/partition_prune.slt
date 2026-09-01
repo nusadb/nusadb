@@ -146,3 +146,69 @@ DROP TABLE h1
 
 statement ok
 DROP TABLE h
+
+# Multi-column key: pruning uses the leading key column (a partition's leading values lie in the
+# closed interval [lo[0], hi[0]], so a leading predicate that rules that out prunes it). A predicate
+# on a non-leading column prunes nothing. As always, results must be unchanged.
+statement ok
+CREATE TABLE m (a INT, b INT, v TEXT) PARTITION BY RANGE (a, b)
+
+statement ok
+CREATE TABLE m1 PARTITION OF m FOR VALUES FROM (0, 0) TO (0, 100)
+
+statement ok
+CREATE TABLE m2 PARTITION OF m FOR VALUES FROM (0, 100) TO (1, 0)
+
+statement ok
+CREATE TABLE m3 PARTITION OF m FOR VALUES FROM (1, 0) TO (2, 0)
+
+statement ok
+CREATE TABLE m4 PARTITION OF m FOR VALUES FROM (5, 0) TO (9, 0)
+
+statement ok
+INSERT INTO m VALUES (0, 50, 'a'), (0, 150, 'b'), (1, 5, 'c'), (6, 1, 'd')
+
+# Leading-column equality keeps only the partitions whose leading interval holds the value.
+query T
+SELECT v FROM m WHERE a = 0 ORDER BY v
+----
+a
+b
+
+query T
+SELECT v FROM m WHERE a = 1
+----
+c
+
+# A leading range keeps the upper partitions.
+query T
+SELECT v FROM m WHERE a >= 5
+----
+d
+
+# A leading value covered by no partition returns nothing (every partition pruned).
+query T
+SELECT count(*) FROM m WHERE a = 3
+----
+0
+
+# A predicate on a non-leading key column prunes nothing but is still correct.
+query T
+SELECT v FROM m WHERE b = 50
+----
+a
+
+statement ok
+DROP TABLE m1
+
+statement ok
+DROP TABLE m2
+
+statement ok
+DROP TABLE m3
+
+statement ok
+DROP TABLE m4
+
+statement ok
+DROP TABLE m
