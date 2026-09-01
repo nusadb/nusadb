@@ -177,6 +177,28 @@ pub trait Catalog {
         Ok(Vec::new())
     }
 
+    /// The partition-key column of `table` if it is a partitioned parent, else `None`. Default `None`
+    /// (no partitioning); the production adapter reads the partition catalog. Used to find which of a
+    /// query's `WHERE` predicates constrain the key and can therefore prune partitions.
+    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
+        let _ = table;
+        Ok(None)
+    }
+
+    /// The direct partitions of `parent` whose bound provably contains no key satisfying
+    /// `constraints` — the partitions a query carrying those key predicates need not scan. Default
+    /// empty (no pruning); the production adapter tests each partition's bound. A partition is
+    /// returned only when *some* constraint alone proves it empty, so dropping the returned ones from
+    /// the parent's scan expansion never changes results.
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[PruneConstraint],
+    ) -> Result<Vec<String>, Error> {
+        let _ = (parent, constraints);
+        Ok(Vec::new())
+    }
+
     /// The fields of a user-defined composite type named `name`, as `(field_name, type)` in declared
     /// order, or `None` if no such composite type exists. Default `None` so a minimal catalog has no
     /// composite types; the production adapter reads the composite type registry. Used to type
@@ -346,6 +368,33 @@ pub trait Catalog {
         let _ = (kind, object);
         Ok(true)
     }
+}
+
+/// A comparison operator that can prune partitions: `key <op> constant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneOp {
+    /// `=`
+    Eq,
+    /// `<`
+    Lt,
+    /// `<=`
+    LtEq,
+    /// `>`
+    Gt,
+    /// `>=`
+    GtEq,
+}
+
+/// A single `partition-key <op> constant` constraint extracted from a query's `WHERE`.
+///
+/// Used to prune partitions whose bound provably cannot satisfy it. The constant is the raw literal;
+/// the catalog adapter coerces it to the key column's type when testing bounds.
+#[derive(Debug, Clone)]
+pub struct PruneConstraint {
+    /// The comparison operator, oriented `key op value`.
+    pub op: PruneOp,
+    /// The constant operand.
+    pub value: crate::ast::Value,
 }
 
 /// Re-parse and type-check a stored CHECK predicate against `table`'s columns, for the executor to

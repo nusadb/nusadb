@@ -3446,6 +3446,38 @@ pub fn inheritance_descendants(
     inheritance::descendants(engine, txn, table)
 }
 
+/// Production adapter: the partition-key column of `table` if it is a partitioned parent. Used for
+/// [`Catalog::partition_key_column`](crate::Catalog::partition_key_column).
+pub fn partition_key_column(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: &str,
+) -> Result<Option<String>, Error> {
+    partition::parent_key_column(engine, txn, table)
+}
+
+/// Production adapter: the direct partitions of `parent` a query with `constraints` need not scan.
+///
+/// Resolves the key column's type from the parent's schema, then tests each partition's bound. Used
+/// for [`Catalog::partitions_to_prune`](crate::Catalog::partitions_to_prune).
+pub fn partitions_to_prune(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    parent: &str,
+    constraints: &[crate::PruneConstraint],
+) -> Result<Vec<String>, Error> {
+    let Some(key_col) = partition::parent_key_column(engine, txn, parent)? else {
+        return Ok(Vec::new());
+    };
+    let Some(key_ty) = engine
+        .lookup_table_as_of(txn, parent)?
+        .and_then(|s| s.columns.iter().find(|c| c.name == key_col).map(|c| c.ty))
+    else {
+        return Ok(Vec::new());
+    };
+    partition::prune(engine, txn, parent, key_ty, constraints)
+}
+
 /// Engine-scoped system catalog of `USING hnsw` vector-index declarations. Same `(name, def)`
 /// two-text-column shape as the view catalog; `def` is tab-separated `table`, column ordinal, and
 /// dimension. Only the *declaration* is persisted here — the HNSW graph is rebuilt in memory on
@@ -4289,6 +4321,18 @@ impl crate::Catalog for ExecCatalog<'_> {
         inheritance::descendants(self.engine, self.txn, table)
     }
 
+    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
+        partition::parent_key_column(self.engine, self.txn, table)
+    }
+
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[crate::PruneConstraint],
+    ) -> Result<Vec<String>, Error> {
+        partitions_to_prune(self.engine, self.txn, parent, constraints)
+    }
+
     fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
         lookup_composite(self.engine, self.txn, name)
     }
@@ -4471,6 +4515,18 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
         inheritance::descendants(self.engine, self.txn, table)
+    }
+
+    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
+        partition::parent_key_column(self.engine, self.txn, table)
+    }
+
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[crate::PruneConstraint],
+    ) -> Result<Vec<String>, Error> {
+        partitions_to_prune(self.engine, self.txn, parent, constraints)
     }
 
     fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {

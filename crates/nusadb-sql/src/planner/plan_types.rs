@@ -1210,6 +1210,24 @@ pub enum AlterTablePlan {
         /// Whether `IF EXISTS` was given (a missing constraint is then a no-op).
         if_exists: bool,
     },
+    /// `ATTACH PARTITION child FOR VALUES <bound>` — make an existing standalone table a partition
+    /// of `parent`. The executor validates the bound (kind matches the parent's strategy, no overlap)
+    /// and that every existing child row falls within the bound, then records it.
+    AttachPartition {
+        /// The partitioned parent's schema (its key column drives bound coercion).
+        parent: TableSchema,
+        /// The child table's schema (its columns were checked to match the parent's).
+        partition: TableSchema,
+        /// The partition bound, its constants already extracted.
+        bound: PartitionBoundPlan,
+    },
+    /// `DETACH PARTITION child` — detach `partition` from `parent`, making it an independent table.
+    DetachPartition {
+        /// The partitioned parent's name.
+        parent: String,
+        /// The partition to detach.
+        partition: String,
+    },
     /// `RENAME TO name` — rename the table in the catalog (no row rewrite).
     RenameTable {
         /// Target table id.

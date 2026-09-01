@@ -279,6 +279,171 @@ fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
     }
 }
 
+/// The descendants of a partitioned parent to keep in its scan expansion, given the query's `WHERE`.
+/// If `parent` is a partitioned parent and the filter constrains its key column with constants, the
+/// partitions whose bound provably cannot match are dropped; every other descendant is kept. A
+/// non-partitioned parent (plain `INHERITS`), an absent filter, or no key constraints keep all
+/// descendants. Only *direct* partitions are pruned — a dropped partition's own sub-partitions stay
+/// (keeping them is still correct, just less selective).
+fn prune_partitions(
+    parent: &str,
+    descendants: &[String],
+    filter: Option<&ast::Expr>,
+    base_qual: &str,
+    catalog: &dyn Catalog,
+) -> Result<Vec<String>, Error> {
+    let Some(filter) = filter else {
+        return Ok(descendants.to_vec());
+    };
+    let Some(key_col) = catalog.partition_key_column(parent)? else {
+        return Ok(descendants.to_vec());
+    };
+    let mut constraints = Vec::new();
+    collect_prune_constraints(filter, &key_col, base_qual, &mut constraints);
+    if constraints.is_empty() {
+        return Ok(descendants.to_vec());
+    }
+    let dropped = catalog.partitions_to_prune(parent, &constraints)?;
+    if dropped.is_empty() {
+        return Ok(descendants.to_vec());
+    }
+    Ok(descendants
+        .iter()
+        .filter(|d| !dropped.contains(d))
+        .cloned()
+        .collect())
+}
+
+/// Collect `key <op> constant` constraints from the top-level `AND`-conjoined predicates of `filter`.
+/// Only bare comparisons of the partition-key column — referenced unqualified or qualified by
+/// `base_qual` — against a constant literal are collected; anything else (an `OR`, a function, a
+/// different column, a non-constant operand) contributes nothing. This is deliberately conservative:
+/// a partition is pruned only when a collected constraint provably excludes it.
+fn collect_prune_constraints(
+    filter: &ast::Expr,
+    key_col: &str,
+    base_qual: &str,
+    out: &mut Vec<crate::PruneConstraint>,
+) {
+    match filter {
+        ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::And,
+            right,
+        } => {
+            collect_prune_constraints(left, key_col, base_qual, out);
+            collect_prune_constraints(right, key_col, base_qual, out);
+        },
+        ast::Expr::Binary { left, op, right } => {
+            if let Some(c) = key_constraint(left, *op, right, key_col, base_qual) {
+                out.push(c);
+            }
+        },
+        // A plain `key BETWEEN low AND high` is `key >= low AND key <= high`. `NOT BETWEEN` and the
+        // `SYMMETRIC` form (bounds in either order) are left alone — no static prune.
+        ast::Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+            symmetric: false,
+        } if is_key_column(expr, key_col, base_qual) => {
+            if let Some(value) = prune_const(low) {
+                out.push(crate::PruneConstraint {
+                    op: crate::PruneOp::GtEq,
+                    value,
+                });
+            }
+            if let Some(value) = prune_const(high) {
+                out.push(crate::PruneConstraint {
+                    op: crate::PruneOp::LtEq,
+                    value,
+                });
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Build a [`PruneConstraint`] from a single comparison, oriented so the key is on the left. Returns
+/// `None` unless exactly one side is the key column and the other is a constant literal, and the
+/// operator is a comparison prunable form.
+fn key_constraint(
+    left: &ast::Expr,
+    op: ast::BinaryOp,
+    right: &ast::Expr,
+    key_col: &str,
+    base_qual: &str,
+) -> Option<crate::PruneConstraint> {
+    let prune_op = to_prune_op(op)?;
+    if is_key_column(left, key_col, base_qual) {
+        prune_const(right).map(|value| crate::PruneConstraint {
+            op: prune_op,
+            value,
+        })
+    } else if is_key_column(right, key_col, base_qual) {
+        // `const op key` — flip the operator so it reads `key op' const`.
+        prune_const(left).map(|value| crate::PruneConstraint {
+            op: flip_prune_op(prune_op),
+            value,
+        })
+    } else {
+        None
+    }
+}
+
+/// Whether `expr` references the partition-key column: unqualified `key`, or `qual.key` where `qual`
+/// is the base table's effective qualifier (its alias, else its name).
+fn is_key_column(expr: &ast::Expr, key_col: &str, base_qual: &str) -> bool {
+    match expr {
+        ast::Expr::Column(name) => name == key_col,
+        ast::Expr::QualifiedColumn { table, column } => table == base_qual && column == key_col,
+        _ => false,
+    }
+}
+
+/// A constant literal usable as a prune bound: a literal, or a negated numeric literal. `NULL` yields
+/// `None` (a `= NULL` predicate matches nothing but is handled by the ordinary filter, not pruning).
+fn prune_const(expr: &ast::Expr) -> Option<ast::Value> {
+    match expr {
+        ast::Expr::Literal(ast::Value::Null) => None,
+        ast::Expr::Literal(v) => Some(v.clone()),
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Negate,
+            expr,
+        } => match prune_const(expr)? {
+            ast::Value::Int(n) => Some(ast::Value::Int(-n)),
+            ast::Value::Float(f) => Some(ast::Value::Float(-f)),
+            ast::Value::Numeric(d) => Some(ast::Value::Numeric(d.neg())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Map a comparison operator to its prunable form; non-comparisons yield `None`.
+const fn to_prune_op(op: ast::BinaryOp) -> Option<crate::PruneOp> {
+    match op {
+        ast::BinaryOp::Eq => Some(crate::PruneOp::Eq),
+        ast::BinaryOp::Lt => Some(crate::PruneOp::Lt),
+        ast::BinaryOp::LtEq => Some(crate::PruneOp::LtEq),
+        ast::BinaryOp::Gt => Some(crate::PruneOp::Gt),
+        ast::BinaryOp::GtEq => Some(crate::PruneOp::GtEq),
+        _ => None,
+    }
+}
+
+/// Flip a comparison so `const op key` becomes `key op' const`.
+const fn flip_prune_op(op: crate::PruneOp) -> crate::PruneOp {
+    match op {
+        crate::PruneOp::Eq => crate::PruneOp::Eq,
+        crate::PruneOp::Lt => crate::PruneOp::Gt,
+        crate::PruneOp::LtEq => crate::PruneOp::GtEq,
+        crate::PruneOp::Gt => crate::PruneOp::Lt,
+        crate::PruneOp::GtEq => crate::PruneOp::LtEq,
+    }
+}
+
 /// Resolve a join input (the right side of a `JOIN`): a derived table `JOIN (SELECT ...) AS x`
 /// (increment 3b) — analyzed standalone and inlined via `input_cte` like a CTE — or a named
 /// catalog table. A `LATERAL` join input is analyzed with `left_scope` pushed as the enclosing scope
@@ -440,6 +605,7 @@ pub(super) fn resolve_aux_relation(
 )]
 pub(super) fn resolve_from(
     from: Option<&ast::FromClause>,
+    filter: Option<&ast::Expr>,
     catalog: &dyn Catalog,
     ctes: &[ResolvedCte],
 ) -> Result<ResolvedFrom, Error> {
@@ -504,9 +670,19 @@ pub(super) fn resolve_from(
             // cheap `any_inheritance` probe so a database with no inheritance pays almost nothing.
             let inherited = if !from.base.only && catalog.any_inheritance()? {
                 let descendants = catalog.inheritance_descendants(&schema.name)?;
-                (!descendants.is_empty())
-                    .then(|| expand_inheritance(&schema, &descendants, catalog))
-                    .transpose()?
+                if descendants.is_empty() {
+                    None
+                } else {
+                    // Partition pruning: if `schema` is a partitioned parent and the WHERE constrains
+                    // its key with constants, drop the partitions whose bound provably cannot match.
+                    // The parent branch is always kept (it holds no rows, so scanning it is empty and
+                    // cheap); only provably-empty partition branches are removed, so results are
+                    // unchanged. A non-partitioned inheritance parent prunes nothing.
+                    let base_qual = from.base.alias.as_deref().unwrap_or(schema.name.as_str());
+                    let kept =
+                        prune_partitions(&schema.name, &descendants, filter, base_qual, catalog)?;
+                    Some(expand_inheritance(&schema, &kept, catalog)?)
+                }
             } else {
                 None
             };
@@ -1287,7 +1463,7 @@ fn analyze_select_scoped(
         base_cte,
         joins,
         scope: scope_vec,
-    } = resolve_from(sel.from.as_ref(), catalog, &ctes)?;
+    } = resolve_from(sel.from.as_ref(), sel.filter.as_ref(), catalog, &ctes)?;
     let scope: &[ScopedColumn] = &scope_vec;
 
     // Resolve `GROUP BY` (incl. ROLLUP/CUBE/GROUPING SETS). `group_keys` is the union of

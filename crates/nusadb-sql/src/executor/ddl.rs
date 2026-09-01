@@ -407,6 +407,47 @@ fn register_partition(
     Ok(())
 }
 
+/// Confirm every existing row of a freshly-attached `partition` falls within the bound just recorded
+/// for it — the `ATTACH PARTITION` analogue of the reference engine's partition-constraint scan. A row
+/// whose key lies outside the bound errors with `23514`, and the rollback-aware DDL unwinds the
+/// attach. The bound is read back from the catalog so the exact recorded/coerced form is used.
+fn validate_attach_rows(
+    parent: &TableSchema,
+    partition: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(key_col) = super::partition::parent_key_column(engine, txn, &parent.name)? else {
+        return Ok(());
+    };
+    let Some((key_pos, key_ty)) = partition
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.name == key_col)
+        .map(|(i, c)| (i, c.ty))
+    else {
+        return Ok(());
+    };
+    let Some((_, bound)) = super::partition::partition_bound(engine, txn, &partition.name, key_ty)?
+    else {
+        return Ok(());
+    };
+    for row in scan_rows(partition, engine, txn)? {
+        let key = row.get(key_pos).cloned().unwrap_or(ast::Value::Null);
+        if !super::partition::accepts(&key, &bound, key_ty) {
+            return Err(Error::Coded {
+                message: format!(
+                    "an existing row of \"{}\" does not fall within the bound for partition \"{}\"",
+                    partition.name, partition.name
+                ),
+                sqlstate: "23514",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A "partition would overlap an existing one" error.
 fn overlap_err(partition: &str, existing: &str) -> Error {
     Error::InvalidStatement(format!(
@@ -1352,6 +1393,56 @@ pub(super) fn run_alter_table(
                 }
             }
             engine.add_check_constraint(txn, table.id, &name, predicate_sql.as_bytes())?;
+            return Ok(ExecutionResult::Altered);
+        },
+        // ATTACH PARTITION: validate + record the bound and the child→parent edge (via the same
+        // registration path CREATE ... PARTITION OF uses), then confirm every existing child row falls
+        // within the bound. A stray row errors and the rollback-aware DDL unwinds the registration.
+        AlterTablePlan::AttachPartition {
+            parent,
+            partition,
+            bound,
+        } => {
+            if let Some(existing) =
+                super::partition::partition_parent(engine, txn, &partition.name)?
+            {
+                return Err(Error::InvalidStatement(format!(
+                    "table \"{}\" is already a partition of \"{existing}\"",
+                    partition.name
+                )));
+            }
+            if partition.name == parent.name {
+                return Err(Error::InvalidStatement(
+                    "a table cannot be attached as a partition of itself".to_owned(),
+                ));
+            }
+            let def = TableDef {
+                schema: partition.schema.clone(),
+                name: partition.name.clone(),
+                columns: partition.columns.clone(),
+            };
+            let part = crate::planner::PartitionOfPlan {
+                parent: parent.name.clone(),
+                bound,
+            };
+            register_partition(&def, &part, engine, txn)?;
+            validate_attach_rows(&parent, &partition, engine, txn)?;
+            return Ok(ExecutionResult::Altered);
+        },
+        // DETACH PARTITION: confirm the child really is a partition of this parent, then sever just
+        // that link (its partition-catalog row and its child→parent edge). The table and its rows
+        // survive as an independent table.
+        AlterTablePlan::DetachPartition { parent, partition } => {
+            match super::partition::partition_parent(engine, txn, &partition)? {
+                Some(actual) if actual == parent => {},
+                _ => {
+                    return Err(Error::InvalidStatement(format!(
+                        "table \"{partition}\" is not a partition of \"{parent}\""
+                    )));
+                },
+            }
+            super::partition::remove_partition_entry(engine, txn, &partition)?;
+            super::inheritance::remove_edge(engine, txn, &partition, &parent)?;
             return Ok(ExecutionResult::Altered);
         },
         AlterTablePlan::Apply { table, op } => (table, op),

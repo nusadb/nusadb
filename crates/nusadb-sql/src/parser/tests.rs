@@ -700,6 +700,73 @@ fn alter_table_add_column_with_and_without_keyword() {
 }
 
 #[test]
+fn alter_table_attach_detach_partition_parses() {
+    // ATTACH carries the partition name and a bound whose kind matches the parent's strategy.
+    let ast::Statement::AlterTable(a) =
+        ok("ALTER TABLE t ATTACH PARTITION p FOR VALUES FROM (0) TO (100)")
+    else {
+        panic!("expected AlterTable");
+    };
+    assert_eq!(a.name, "t");
+    let ast::AlterTableAction::AttachPartition { partition, bound } = a.action else {
+        panic!("expected AttachPartition");
+    };
+    assert_eq!(partition, "p");
+    assert!(matches!(bound, ast::PartitionBound::Range { .. }));
+
+    // The three bound forms all parse.
+    let ast::Statement::AlterTable(a) =
+        ok("ALTER TABLE t ATTACH PARTITION p FOR VALUES IN ('a', 'b')")
+    else {
+        panic!("expected AlterTable");
+    };
+    assert!(matches!(
+        a.action,
+        ast::AlterTableAction::AttachPartition {
+            bound: ast::PartitionBound::List(_),
+            ..
+        }
+    ));
+    let ast::Statement::AlterTable(a) =
+        ok("ALTER TABLE t ATTACH PARTITION p FOR VALUES WITH (MODULUS 4, REMAINDER 1)")
+    else {
+        panic!("expected AlterTable");
+    };
+    assert!(matches!(
+        a.action,
+        ast::AlterTableAction::AttachPartition {
+            bound: ast::PartitionBound::Hash {
+                modulus: 4,
+                remainder: 1
+            },
+            ..
+        }
+    ));
+
+    // DETACH carries just the partition name; `IF EXISTS` and name folding are honored.
+    let ast::Statement::AlterTable(a) = ok("ALTER TABLE t DETACH PARTITION p") else {
+        panic!("expected AlterTable");
+    };
+    let ast::AlterTableAction::DetachPartition { partition } = a.action else {
+        panic!("expected DetachPartition");
+    };
+    assert_eq!(partition, "p");
+
+    let ast::Statement::AlterTable(a) = ok("ALTER TABLE IF EXISTS T DETACH PARTITION P") else {
+        panic!("expected AlterTable");
+    };
+    assert!(a.if_exists);
+    assert_eq!(a.name, "t");
+    let ast::AlterTableAction::DetachPartition { partition } = a.action else {
+        panic!("expected DetachPartition");
+    };
+    assert_eq!(partition, "p");
+
+    // ATTACH without a bound is refused.
+    assert!(parse("ALTER TABLE t ATTACH PARTITION p").is_err());
+}
+
+#[test]
 fn alter_table_drop_column_plain_and_if_exists() {
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t DROP COLUMN c") else {
         panic!("expected AlterTable");

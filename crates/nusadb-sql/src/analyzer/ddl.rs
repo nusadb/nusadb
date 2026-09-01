@@ -178,7 +178,6 @@ fn resolve_partition_of(
     ct: &mut ast::CreateTable,
     catalog: &dyn Catalog,
 ) -> Result<Option<crate::planner::PartitionOfPlan>, Error> {
-    use crate::planner::PartitionBoundPlan;
     let Some(po) = ct.partition_of.clone() else {
         return Ok(None);
     };
@@ -209,10 +208,23 @@ fn resolve_partition_of(
             identity_always: false,
         })
         .collect();
-    let bound = match po.bound {
+    let bound = convert_partition_bound(&po.bound)?;
+    Ok(Some(crate::planner::PartitionOfPlan {
+        parent: parent.name,
+        bound,
+    }))
+}
+
+/// Convert a partition bound's AST (whose operands are expressions) into a plan bound (constants),
+/// evaluating each range/list operand to a literal. Shared by `PARTITION OF` and `ATTACH PARTITION`.
+fn convert_partition_bound(
+    bound: &ast::PartitionBound,
+) -> Result<crate::planner::PartitionBoundPlan, Error> {
+    use crate::planner::PartitionBoundPlan;
+    Ok(match bound {
         ast::PartitionBound::Range { from, to } => PartitionBoundPlan::Range {
-            from: const_bound_value(&from)?,
-            to: const_bound_value(&to)?,
+            from: const_bound_value(from)?,
+            to: const_bound_value(to)?,
         },
         ast::PartitionBound::List(values) => PartitionBoundPlan::List(
             values
@@ -220,14 +232,11 @@ fn resolve_partition_of(
                 .map(const_bound_value)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        ast::PartitionBound::Hash { modulus, remainder } => {
-            PartitionBoundPlan::Hash { modulus, remainder }
+        ast::PartitionBound::Hash { modulus, remainder } => PartitionBoundPlan::Hash {
+            modulus: *modulus,
+            remainder: *remainder,
         },
-    };
-    Ok(Some(crate::planner::PartitionOfPlan {
-        parent: parent.name,
-        bound,
-    }))
+    })
 }
 
 /// Extract the literal value of a partition bound expression. Only a literal (optionally negated for
@@ -843,8 +852,81 @@ pub(super) fn analyze_alter_table(
         ast::AlterTableAction::RenameTable { name } => {
             return analyze_rename_table(table.id, &table.schema, &table.name, name, catalog);
         },
+        ast::AlterTableAction::AttachPartition { partition, bound } => {
+            return analyze_attach_partition(table, &partition, &bound, catalog);
+        },
+        ast::AlterTableAction::DetachPartition { partition } => {
+            return analyze_detach_partition(table, &partition, catalog);
+        },
     };
     Ok(AlterTablePlan::Apply { table, op })
+}
+
+/// Resolve `ALTER TABLE parent ATTACH PARTITION child FOR VALUES <bound>`. The parent must be a
+/// partitioned parent and the child an existing table whose columns match the parent's (name + type +
+/// order); the executor then validates the bound against the parent's strategy and that every existing
+/// child row falls within it.
+fn analyze_attach_partition(
+    parent: TableSchema,
+    partition: &str,
+    bound: &ast::PartitionBound,
+    catalog: &dyn Catalog,
+) -> Result<AlterTablePlan, Error> {
+    if catalog.partition_key_column(&parent.name)?.is_none() {
+        return Err(Error::Unsupported(format!(
+            "table \"{}\" is not partitioned, so a partition cannot be attached to it",
+            parent.name
+        )));
+    }
+    let child = catalog
+        .lookup_table(partition)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: partition.to_owned(),
+        })?;
+    // The child's columns must line up with the parent's (same names, types, and order).
+    let columns_match = child.columns.len() == parent.columns.len()
+        && child
+            .columns
+            .iter()
+            .zip(&parent.columns)
+            .all(|(c, p)| c.name == p.name && c.ty == p.ty);
+    if !columns_match {
+        return Err(Error::Unsupported(format!(
+            "table \"{}\" cannot be attached to \"{}\": its columns must match the parent's",
+            child.name, parent.name
+        )));
+    }
+    let bound = convert_partition_bound(bound)?;
+    Ok(AlterTablePlan::AttachPartition {
+        parent,
+        partition: child,
+        bound,
+    })
+}
+
+/// Resolve `ALTER TABLE parent DETACH PARTITION child`. The parent must be partitioned and the child
+/// an existing table; the executor confirms the child is actually a partition of this parent before
+/// severing the link.
+fn analyze_detach_partition(
+    parent: TableSchema,
+    partition: &str,
+    catalog: &dyn Catalog,
+) -> Result<AlterTablePlan, Error> {
+    if catalog.partition_key_column(&parent.name)?.is_none() {
+        return Err(Error::Unsupported(format!(
+            "table \"{}\" is not partitioned, so no partition can be detached from it",
+            parent.name
+        )));
+    }
+    let child = catalog
+        .lookup_table(partition)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: partition.to_owned(),
+        })?;
+    Ok(AlterTablePlan::DetachPartition {
+        parent: parent.name,
+        partition: child.name,
+    })
 }
 
 /// Resolve `ALTER TABLE ... RENAME TO name`: the new name must be free and not collide with a system

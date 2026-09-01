@@ -210,6 +210,20 @@ impl Catalog for RecordingCatalog<'_> {
         self.inner.inheritance_descendants(table)
     }
 
+    // Partition pruning is only reached through `any_inheritance` above, which already marks the plan
+    // uncacheable — so a pruned plan (which depends on the WHERE constants) is never cached. Forward
+    // both to the inner catalog so pruning still applies on the plan-cache path.
+    fn partition_key_column(&self, table: &str) -> Result<Option<String>, Error> {
+        self.inner.partition_key_column(table)
+    }
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[crate::PruneConstraint],
+    ) -> Result<Vec<String>, Error> {
+        self.inner.partitions_to_prune(parent, constraints)
+    }
+
     fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {
         let indexes = self.inner.list_indexes(table)?;
         // A plan that can see an index may lower to an `IndexScan`; index DDL is unversioned, so do

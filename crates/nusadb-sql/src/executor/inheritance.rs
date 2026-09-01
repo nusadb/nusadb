@@ -122,6 +122,34 @@ pub(super) fn remove_edges_for(
     Ok(())
 }
 
+/// Remove a single inheritance edge `child → parent`, leaving every other edge intact — including the
+/// child's own edges to its sub-partitions. Used by `DETACH PARTITION`, which unlinks one partition
+/// from its parent without disturbing the rest of the hierarchy.
+pub(super) fn remove_edge(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    child: &str,
+    parent: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, INHERITANCE_CATALOG)? else {
+        return Ok(());
+    };
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &INHERITANCE_CATALOG_SCHEMA)?;
+        let is_edge = matches!(row.first(), Some(ast::Value::Text(c)) if c == child)
+            && matches!(row.get(1), Some(ast::Value::Text(p)) if p == parent);
+        if is_edge {
+            victims.push(tid);
+        }
+    }
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(())
+}
+
 /// Look up the inheritance catalog, creating it lazily if absent.
 fn ensure_catalog(engine: &dyn StorageEngine, txn: TxnId) -> Result<nusadb_core::TableId, Error> {
     if let Some(schema) = engine.lookup_table_as_of(txn, INHERITANCE_CATALOG)? {

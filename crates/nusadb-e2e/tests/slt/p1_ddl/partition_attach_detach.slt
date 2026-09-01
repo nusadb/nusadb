@@ -1,0 +1,135 @@
+# ATTACH / DETACH PARTITION.
+#
+# ATTACH makes an existing standalone table a partition of a partitioned parent: its columns must
+# match the parent's, its bound must fit the parent's strategy without overlapping a sibling, and
+# every existing row must fall within the bound. After attaching, the parent reads the table's rows
+# and routes inserts to it. DETACH severs that link, leaving the table standalone with its rows.
+
+statement ok
+CREATE TABLE t (id INT, region INT) PARTITION BY RANGE (region)
+
+statement ok
+CREATE TABLE t0 PARTITION OF t FOR VALUES FROM (0) TO (100)
+
+statement ok
+INSERT INTO t VALUES (1, 50)
+
+# A standalone table whose rows all fall within the intended bound.
+statement ok
+CREATE TABLE t_new (id INT, region INT)
+
+statement ok
+INSERT INTO t_new VALUES (10, 150), (11, 199)
+
+statement ok
+ALTER TABLE t ATTACH PARTITION t_new FOR VALUES FROM (100) TO (200)
+
+# The parent now reads the attached table's rows alongside its other partitions'.
+query I
+SELECT id FROM t ORDER BY id
+----
+1
+10
+11
+
+# An insert into the parent routes to the attached partition.
+statement ok
+INSERT INTO t VALUES (12, 150)
+
+query I
+SELECT id FROM t_new ORDER BY id
+----
+10
+11
+12
+
+# A table with a row outside the bound cannot be attached (the reference engine scans it too).
+statement ok
+CREATE TABLE t_stray (id INT, region INT)
+
+statement ok
+INSERT INTO t_stray VALUES (9, 500)
+
+statement error does not fall within
+ALTER TABLE t ATTACH PARTITION t_stray FOR VALUES FROM (200) TO (300)
+
+# A bound overlapping an existing partition is refused.
+statement ok
+CREATE TABLE t_ov (id INT, region INT)
+
+statement error overlap
+ALTER TABLE t ATTACH PARTITION t_ov FOR VALUES FROM (50) TO (150)
+
+# A table whose columns do not match the parent's is refused.
+statement ok
+CREATE TABLE t_mm (id INT, zone TEXT)
+
+statement error columns must match
+ALTER TABLE t ATTACH PARTITION t_mm FOR VALUES FROM (200) TO (300)
+
+# Attaching to a non-partitioned table is refused.
+statement ok
+CREATE TABLE plain (id INT)
+
+statement ok
+CREATE TABLE p_child (id INT)
+
+statement error not partitioned
+ALTER TABLE plain ATTACH PARTITION p_child FOR VALUES IN (1)
+
+# DETACH makes the partition an independent table again: the parent stops reading its rows, and the
+# table keeps them.
+statement ok
+ALTER TABLE t DETACH PARTITION t_new
+
+query I
+SELECT id FROM t ORDER BY id
+----
+1
+
+query I
+SELECT id FROM t_new ORDER BY id
+----
+10
+11
+12
+
+# A detached table can be re-attached.
+statement ok
+ALTER TABLE t ATTACH PARTITION t_new FOR VALUES FROM (100) TO (200)
+
+query I
+SELECT count(*) FROM t
+----
+4
+
+# Detaching a table that is not a partition of the parent is refused.
+statement ok
+ALTER TABLE t DETACH PARTITION t_new
+
+statement error is not a partition
+ALTER TABLE t DETACH PARTITION t_new
+
+statement ok
+DROP TABLE t_new
+
+statement ok
+DROP TABLE t_stray
+
+statement ok
+DROP TABLE t_ov
+
+statement ok
+DROP TABLE t_mm
+
+statement ok
+DROP TABLE p_child
+
+statement ok
+DROP TABLE plain
+
+statement ok
+DROP TABLE t0
+
+statement ok
+DROP TABLE t

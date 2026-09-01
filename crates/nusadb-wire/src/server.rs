@@ -4502,6 +4502,20 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::inheritance_descendants(self.engine, self.txn, table)
     }
 
+    fn partition_key_column(&self, table: &str) -> Result<Option<String>, nusadb_sql::Error> {
+        // The partition-key column of a partitioned parent — which WHERE predicates can prune.
+        nusadb_sql::partition_key_column(self.engine, self.txn, table)
+    }
+
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[nusadb_sql::PruneConstraint],
+    ) -> Result<Vec<String>, nusadb_sql::Error> {
+        // The partitions a query with these key constraints need not scan.
+        nusadb_sql::partitions_to_prune(self.engine, self.txn, parent, constraints)
+    }
+
     fn lookup_function(
         &self,
         name: &str,

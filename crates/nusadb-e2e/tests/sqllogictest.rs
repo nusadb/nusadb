@@ -149,6 +149,32 @@ impl Catalog for SltCatalog<'_> {
         }
     }
 
+    fn partition_key_column(&self, table: &str) -> Result<Option<String>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::partition_key_column(self.engine, txn, table)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::partition_key_column(self.engine, txn, table);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[nusadb_sql::PruneConstraint],
+    ) -> Result<Vec<String>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::partitions_to_prune(self.engine, txn, parent, constraints)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::partitions_to_prune(self.engine, txn, parent, constraints);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
         // The view catalog is a regular table. Reuse the session's open transaction when there is
         // one so a view created earlier in the same explicit transaction is visible; otherwise read
@@ -425,6 +451,16 @@ fn slt_p1_partition_range() {
 #[test]
 fn slt_p1_partition_list_hash() {
     run_slt("tests/slt/p1_ddl/partition_list_hash.slt");
+}
+
+#[test]
+fn slt_p1_partition_prune() {
+    run_slt("tests/slt/p1_ddl/partition_prune.slt");
+}
+
+#[test]
+fn slt_p1_partition_attach_detach() {
+    run_slt("tests/slt/p1_ddl/partition_attach_detach.slt");
 }
 
 #[test]

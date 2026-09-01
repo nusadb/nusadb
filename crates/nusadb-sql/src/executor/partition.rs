@@ -176,6 +176,31 @@ pub(super) fn partitions_of(
     Ok(out)
 }
 
+/// Remove only the partition-catalog row for `partition` (its `("part", partition, …)` row), leaving
+/// any parent row and every other partition untouched — for `DETACH PARTITION`, which severs one
+/// partition without dropping its table.
+pub(super) fn remove_partition_entry(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    partition: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, PARTITION_CATALOG)? else {
+        return Ok(());
+    };
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &PARTITION_CATALOG_SCHEMA)?;
+        if field(&row, 0) == "part" && field(&row, 1) == partition {
+            victims.push(tid);
+        }
+    }
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(())
+}
+
 /// Remove every partition-catalog row naming `table` (as parent or partition), on DROP.
 pub(super) fn remove_for(engine: &dyn StorageEngine, txn: TxnId, table: &str) -> Result<(), Error> {
     let Some(cat) = engine.lookup_table_as_of(txn, PARTITION_CATALOG)? else {
@@ -212,6 +237,83 @@ pub(super) fn accepts(key: &ast::Value, bound: &PartitionBound, key_ty: ColumnTy
                 && *modulus != 0
                 && value_hash(key, key_ty) % modulus == *remainder
         },
+    }
+}
+
+/// The direct partitions of `parent` whose bound provably contains no key satisfying `constraints`
+/// — the partitions a query with those key predicates need not scan. Each constant is coerced to
+/// `key_ty`; a constant that cannot be coerced (or is `NULL`) prunes nothing. A partition is dropped
+/// only when *some* single constraint alone proves it empty, so the result never changes which rows a
+/// query returns — only how many partitions it scans.
+pub(super) fn prune(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    parent: &str,
+    key_ty: ColumnType,
+    constraints: &[crate::PruneConstraint],
+) -> Result<Vec<String>, Error> {
+    let mut dropped = Vec::new();
+    for p in partitions_of(engine, txn, parent, key_ty)? {
+        if constraints.iter().any(|c| excludes(&p.bound, c, key_ty)) {
+            dropped.push(p.table);
+        }
+    }
+    Ok(dropped)
+}
+
+/// Whether `bound` provably contains no key `k` satisfying `k <op> value` — i.e. the partition can be
+/// skipped for that constraint. Conservative: returns `false` (keep the partition) whenever the
+/// constant cannot be coerced to the key type, is `NULL`, or the strategy admits no static proof.
+fn excludes(
+    bound: &PartitionBound,
+    constraint: &crate::PruneConstraint,
+    key_ty: ColumnType,
+) -> bool {
+    let Ok(v) = super::eval::cast_value(constraint.value.clone(), key_ty) else {
+        return false;
+    };
+    if matches!(v, ast::Value::Null) {
+        return false;
+    }
+    match bound {
+        PartitionBound::Range { lo, hi } => range_excludes(lo, hi, constraint.op, &v),
+        // A value set excludes the constraint when no member of the set satisfies it.
+        PartitionBound::List(values) => !values.iter().any(|x| op_holds(x, constraint.op, &v)),
+        // A hash partition can only be excluded by equality: route the constant and keep the one
+        // partition that would hold it. An inequality gives no static hash proof.
+        PartitionBound::Hash { .. } => {
+            matches!(constraint.op, crate::PruneOp::Eq) && !accepts(&v, bound, key_ty)
+        },
+    }
+}
+
+/// Whether `x <op> v` holds (both already the key type).
+fn op_holds(x: &ast::Value, op: crate::PruneOp, v: &ast::Value) -> bool {
+    let c = super::eval::compare(x, v);
+    match op {
+        crate::PruneOp::Eq => c == Ordering::Equal,
+        crate::PruneOp::Lt => c == Ordering::Less,
+        crate::PruneOp::LtEq => c != Ordering::Greater,
+        crate::PruneOp::Gt => c == Ordering::Greater,
+        crate::PruneOp::GtEq => c != Ordering::Less,
+    }
+}
+
+/// Whether the range `[lo, hi)` provably contains no key satisfying `key <op> v`. See the truth table
+/// in the partition-pruning tests for each case.
+fn range_excludes(lo: &ast::Value, hi: &ast::Value, op: crate::PruneOp, v: &ast::Value) -> bool {
+    use super::eval::compare;
+    match op {
+        // `= v`: excluded unless `v` falls in `[lo, hi)`.
+        crate::PruneOp::Eq => {
+            !(compare(v, lo) != Ordering::Less && compare(v, hi) == Ordering::Less)
+        },
+        // `< v`: every key is `>= lo`, so none is `< v` once `lo >= v`.
+        crate::PruneOp::Lt => compare(lo, v) != Ordering::Less,
+        // `<= v`: none is `<= v` once `lo > v`.
+        crate::PruneOp::LtEq => compare(lo, v) == Ordering::Greater,
+        // `> v` / `>= v`: every key is `< hi`, so none is `> v` (nor `>= v`) once `v >= hi`.
+        crate::PruneOp::Gt | crate::PruneOp::GtEq => compare(v, hi) != Ordering::Less,
     }
 }
 

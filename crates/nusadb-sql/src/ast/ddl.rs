@@ -883,6 +883,20 @@ pub enum AlterTableAction {
         /// The trigger to disable, or `None` for `ALL`.
         name: Option<String>,
     },
+    /// `ATTACH PARTITION child FOR VALUES <bound>` — make an existing standalone table a partition of
+    /// this (partitioned) parent, under `bound`. The child's columns must match the parent's.
+    AttachPartition {
+        /// The table to attach as a partition.
+        partition: String,
+        /// The partition bound (its kind must match the parent's strategy).
+        bound: PartitionBound,
+    },
+    /// `DETACH PARTITION child` — detach a partition, making it an independent standalone table
+    /// (it keeps its rows).
+    DetachPartition {
+        /// The partition to detach.
+        partition: String,
+    },
 }
 
 /// A modification applied to an existing column by `ALTER [COLUMN]`.

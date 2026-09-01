@@ -689,6 +689,12 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_alter_sequence(sql) {
         return result;
     }
+    // `ALTER TABLE parent {ATTACH|DETACH} PARTITION child [FOR VALUES <bound>]` — sqlparser rejects
+    // the `FOR VALUES` bound tail, so drive this form ourselves (plain `ALTER TABLE` actions still go
+    // through the generic parser). The bound reuses the `PARTITION OF` grammar via a synthetic parse.
+    if let Some(result) = recognize_alter_partition(sql) {
+        return result;
+    }
     let dialect = NusaParserDialect;
     // `WITH x AS [NOT] MATERIALIZED (...)`: sqlparser only parses the CTE materialization keyword for
     // one specific built-in dialect (a hardcoded `dialect_of!` check a custom `Dialect` cannot opt
@@ -2232,6 +2238,116 @@ fn recognize_drop_matview(sql: &str) -> Option<Result<ast::Statement, Error>> {
         name,
         if_exists,
     })))
+}
+
+/// Recognize `ALTER TABLE [IF EXISTS] parent {ATTACH|DETACH} PARTITION child [FOR VALUES <bound>]`.
+/// sqlparser cannot parse the `FOR VALUES` bound tail of `ATTACH PARTITION`, so drive the whole form
+/// here; every other `ALTER TABLE` action falls through to the generic parser (this returns `None`).
+fn recognize_alter_partition(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if !starts_with_two(trimmed, "alter", "table") {
+        return None;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    let attach = low.contains(" attach partition ");
+    let detach = low.contains(" detach partition ");
+    // Only intercept the ATTACH/DETACH PARTITION forms.
+    if !attach && !detach {
+        return None;
+    }
+    Some(parse_alter_partition(trimmed, attach))
+}
+
+/// Parse a recognized `ALTER TABLE ... {ATTACH|DETACH} PARTITION ...`. The head (up to the partition
+/// name) is whitespace-delimited identifiers; for `ATTACH` the bound tail after `FOR VALUES` is parsed
+/// by re-parsing a synthetic `CREATE TABLE child PARTITION OF parent <tail>`, reusing the existing
+/// partition-bound grammar and its validation.
+fn parse_alter_partition(trimmed: &str, attach: bool) -> Result<ast::Statement, Error> {
+    let low = trimmed.to_ascii_lowercase();
+    // Split the head (identifiers only, no parens) from the bound tail (`ATTACH` only).
+    let (head, bound_tail) = if attach {
+        let fv = low.find(" for values").ok_or_else(|| {
+            Error::Unsupported("ATTACH PARTITION requires a `FOR VALUES <bound>` clause".to_owned())
+        })?;
+        (&trimmed[..fv], Some(trimmed[fv + 1..].to_owned()))
+    } else {
+        (trimmed, None)
+    };
+    let mut words = head.split_whitespace();
+    words.next(); // ALTER
+    words.next(); // TABLE
+    let mut rest: Vec<&str> = words.collect();
+    let if_exists = matches!(
+        rest.as_slice(),
+        [a, b, ..] if a.eq_ignore_ascii_case("if") && b.eq_ignore_ascii_case("exists")
+    );
+    if if_exists {
+        rest.drain(..2);
+    }
+    let keyword = if attach { "attach" } else { "detach" };
+    let [parent_raw, akw, pkw, child_raw] = rest.as_slice() else {
+        return unsupported(
+            "ALTER TABLE ... {ATTACH|DETACH} PARTITION requires `<parent> {ATTACH|DETACH} PARTITION \
+             <partition>`",
+        );
+    };
+    if !akw.eq_ignore_ascii_case(keyword) || !pkw.eq_ignore_ascii_case("partition") {
+        return unsupported("malformed ALTER TABLE ... {ATTACH|DETACH} PARTITION");
+    }
+    let (schema, name) = fold_table_ref_str(parent_raw);
+    let partition = fold_ident_str(child_raw);
+    let action = if attach {
+        let bound =
+            parse_partition_bound_tail(child_raw, parent_raw, &bound_tail.unwrap_or_default())?;
+        ast::AlterTableAction::AttachPartition { partition, bound }
+    } else {
+        ast::AlterTableAction::DetachPartition { partition }
+    };
+    Ok(ast::Statement::AlterTable(ast::AlterTable {
+        schema,
+        name,
+        if_exists,
+        action,
+    }))
+}
+
+/// Parse an `ATTACH PARTITION` bound by re-parsing a synthetic `CREATE TABLE child PARTITION OF parent
+/// <tail>` (the `<tail>` is the `FOR VALUES ...` clause), then lifting its partition bound. Reuses the
+/// exact bound grammar and validation the `PARTITION OF` form already has.
+fn parse_partition_bound_tail(
+    child_raw: &str,
+    parent_raw: &str,
+    bound_tail: &str,
+) -> Result<ast::PartitionBound, Error> {
+    let synth = format!("CREATE TABLE {child_raw} PARTITION OF {parent_raw} {bound_tail}");
+    match parse(&synth)? {
+        ast::Statement::CreateTable(ct) => ct.partition_of.map(|po| po.bound).ok_or_else(|| {
+            Error::Unsupported("ATTACH PARTITION requires a `FOR VALUES <bound>` clause".to_owned())
+        }),
+        _ => unsupported("malformed ATTACH PARTITION bound"),
+    }
+}
+
+/// Fold a bare identifier written in SQL: unquote a `"Quoted"` name (case preserved), else lowercase.
+fn fold_ident_str(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].to_owned()
+    } else {
+        raw.to_ascii_lowercase()
+    }
+}
+
+/// Fold a table reference into `(schema, name)`: `schema.name` splits on the dot (each part folded),
+/// a bare name yields `(None, name)`. A dot inside a quoted identifier is not handled (a documented
+/// limitation shared with the rest of the partition surface, which uses bare names).
+fn fold_table_ref_str(raw: &str) -> (Option<String>, String) {
+    match raw.split_once('.') {
+        Some((schema, name)) if !schema.contains('"') && !name.contains('"') => {
+            (Some(fold_ident_str(schema)), fold_ident_str(name))
+        },
+        _ => (None, fold_ident_str(raw)),
+    }
 }
 
 /// True when `sql` begins with the two given keywords (case-insensitive), the cheap guard the policy

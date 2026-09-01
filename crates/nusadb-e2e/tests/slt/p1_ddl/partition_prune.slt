@@ -1,0 +1,148 @@
+# Partition pruning: a query on a partitioned parent whose WHERE constrains the key column with
+# constants skips the partitions whose bound cannot match. Pruning is an optimization — it must never
+# change results — so these cases assert that every pruning-triggering predicate still returns exactly
+# the rows the reference engine does (a partition wrongly pruned would drop rows and fail here).
+
+statement ok
+CREATE TABLE t (id INT, region INT) PARTITION BY RANGE (region)
+
+statement ok
+CREATE TABLE t0 PARTITION OF t FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE t1 PARTITION OF t FOR VALUES FROM (100) TO (200)
+
+statement ok
+CREATE TABLE t2 PARTITION OF t FOR VALUES FROM (200) TO (300)
+
+statement ok
+INSERT INTO t VALUES (1, 50), (2, 150), (3, 250), (4, 199)
+
+# Equality prunes to a single partition; the row is still found.
+query I
+SELECT id FROM t WHERE region = 150
+----
+2
+
+# A `>=` bound keeps the upper partitions.
+query I
+SELECT id FROM t WHERE region >= 150 ORDER BY id
+----
+2
+3
+4
+
+# A `<` bound keeps the lower partition.
+query I
+SELECT id FROM t WHERE region < 100
+----
+1
+
+# BETWEEN keeps only the covering partition.
+query I
+SELECT id FROM t WHERE region BETWEEN 120 AND 199 ORDER BY id
+----
+2
+4
+
+# A qualified key reference prunes the same way.
+query I
+SELECT id FROM t WHERE t.region = 250
+----
+3
+
+# A flipped comparison (`const op key`) prunes the same way.
+query I
+SELECT id FROM t WHERE 250 = region
+----
+3
+
+# A predicate matching no partition returns nothing (every partition pruned; parent holds no rows).
+query I
+SELECT count(*) FROM t WHERE region > 500
+----
+0
+
+# An `OR` is not a prunable conjunction — all partitions are scanned, and the result is still correct.
+query I
+SELECT id FROM t WHERE region = 50 OR region = 250 ORDER BY id
+----
+1
+3
+
+# LIST pruning: equality keeps only the partition whose value set holds the key.
+statement ok
+CREATE TABLE l (id INT, g TEXT) PARTITION BY LIST (g)
+
+statement ok
+CREATE TABLE l_a PARTITION OF l FOR VALUES IN ('x', 'y')
+
+statement ok
+CREATE TABLE l_b PARTITION OF l FOR VALUES IN ('z')
+
+statement ok
+INSERT INTO l VALUES (1, 'x'), (2, 'z')
+
+query I
+SELECT id FROM l WHERE g = 'x'
+----
+1
+
+query I
+SELECT id FROM l WHERE g = 'z'
+----
+2
+
+# HASH pruning: an equality routes to exactly the partition that would hold the key, so the row is
+# still found (which partition is engine-specific, but the routed-and-pruned partition agree).
+statement ok
+CREATE TABLE h (id INT) PARTITION BY HASH (id)
+
+statement ok
+CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+
+statement ok
+CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+
+statement ok
+INSERT INTO h SELECT g FROM generate_series(1, 20) g
+
+query I
+SELECT id FROM h WHERE id = 7
+----
+7
+
+query I
+SELECT count(*) FROM h WHERE id = 7
+----
+1
+
+statement ok
+DROP TABLE t0
+
+statement ok
+DROP TABLE t1
+
+statement ok
+DROP TABLE t2
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE l_a
+
+statement ok
+DROP TABLE l_b
+
+statement ok
+DROP TABLE l
+
+statement ok
+DROP TABLE h0
+
+statement ok
+DROP TABLE h1
+
+statement ok
+DROP TABLE h
