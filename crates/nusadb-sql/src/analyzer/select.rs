@@ -283,8 +283,9 @@ fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
 /// If `parent` is a partitioned parent and the filter constrains its key column with constants, the
 /// partitions whose bound provably cannot match are dropped; every other descendant is kept. A
 /// non-partitioned parent (plain `INHERITS`), an absent filter, or no key constraints keep all
-/// descendants. Only *direct* partitions are pruned — a dropped partition's own sub-partitions stay
-/// (keeping them is still correct, just less selective).
+/// descendants. A dropped partition's own sub-partition subtree drops with it — every row in a
+/// sub-partition satisfies its ancestor's bound (the bound chain is enforced on insert/attach), so a
+/// bound that provably matches nothing excludes the whole subtree.
 fn prune_partitions(
     parent: &str,
     descendants: &[String],
@@ -303,9 +304,20 @@ fn prune_partitions(
     if constraints.is_empty() {
         return Ok(descendants.to_vec());
     }
-    let dropped = catalog.partitions_to_prune(parent, &constraints)?;
+    let mut dropped = catalog.partitions_to_prune(parent, &constraints)?;
     if dropped.is_empty() {
         return Ok(descendants.to_vec());
+    }
+    // Expand each dropped partition to its whole subtree (a pruned mid-level parent takes its
+    // sub-partitions with it).
+    let mut index = 0;
+    while let Some(name) = dropped.get(index).cloned() {
+        for sub in catalog.inheritance_descendants(&name)? {
+            if !dropped.contains(&sub) {
+                dropped.push(sub);
+            }
+        }
+        index += 1;
     }
     Ok(descendants
         .iter()

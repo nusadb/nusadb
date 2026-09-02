@@ -14,13 +14,13 @@ pub(super) fn run_insert(
 ) -> Result<ExecutionResult, Error> {
     // Partition awareness, gated on a cheap "any partitioning at all" probe so a database with no
     // partitions pays a single catalog lookup and behaves exactly as before. A partitioned *parent*
-    // routes each row to a partition; a *partition* target bound-checks each row. Either way the
+    // routes each row to a partition; a *partition* target bound-checks each row; a sub-partitioned
+    // mid-level parent is both (its own bound chain applies, then it routes downward). Either way the
     // streaming `INSERT ... SELECT` fast path (which writes straight into the target, bypassing both)
     // must not apply.
     let (partition_key, target_is_partition) = if super::partition::has_any(engine, txn)? {
         let key = super::partition::parent_key_columns(engine, txn, &plan.table.name)?;
-        let is_part = key.is_none()
-            && super::partition::partition_parent(engine, txn, &plan.table.name)?.is_some();
+        let is_part = super::partition::partition_parent(engine, txn, &plan.table.name)?.is_some();
         (key, is_part)
     } else {
         (None, false)
@@ -42,14 +42,15 @@ pub(super) fn run_insert(
     }
     // Each source produces one value tuple per row, in target-`columns` order.
     let value_rows = insert_value_rows(plan, engine, txn)?;
+    // A direct insert into a partition must land within that partition's bound chain — including a
+    // sub-partitioned mid-level parent, whose own bounds apply before it routes downward.
+    if target_is_partition {
+        enforce_partition_bound(plan, &value_rows, engine, txn)?;
+    }
     // `ON CONFLICT DO UPDATE` upserts; everything else (plain INSERT, `DO NOTHING`) inserts.
     let full_rows = if let Some(key_cols) = &partition_key {
         route_partitioned_insert(plan, key_cols, value_rows, engine, txn)?
     } else {
-        // A direct insert into a partition must land within that partition's bound.
-        if target_is_partition {
-            enforce_partition_bound(plan, &value_rows, engine, txn)?;
-        }
         match &plan.on_conflict {
             Some(OnConflictPlan::DoUpdate {
                 target,
@@ -167,66 +168,94 @@ fn route_partitioned_insert(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
+    const MAX_DEPTH: usize = 64;
+    /// One routing work item: a parent, its key columns, the rows routed to it, and its depth.
+    type RouteLevel = (String, Vec<String>, Vec<Vec<Option<ast::Value>>>, usize);
     if plan.on_conflict.is_some() {
         return Err(Error::Unsupported(
             "INSERT ... ON CONFLICT into a partitioned table is not supported".to_owned(),
         ));
     }
-    let (key_pos, key_tys) = partition_key_loci(&plan.table, &plan.columns, key_cols)?;
-    let partitions = super::partition::partitions_of(engine, txn, &plan.table.name, &key_tys)?;
-    // The catch-all partition (if any) receives every row that matches no other partition's bound,
-    // including a key with a NULL element that no range/hash partition can hold.
-    let default_partition = partitions
-        .iter()
-        .find(|p| super::partition::is_default(&p.bound))
-        .map(|p| p.table.clone());
-    // Bucket the rows by target partition, preserving input order within each bucket.
-    let mut buckets: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
-    for row in value_rows {
-        // Build the key tuple (an omitted/NULL element stays NULL). A matching non-default partition
-        // wins; otherwise the row falls to the catch-all — a key no bound matches (a NULL element
-        // included) routes there when one exists.
-        let key: Vec<ast::Value> = key_pos
+    // Route level by level: bucket the rows under this parent, then re-bucket any bucket whose
+    // target is itself a sub-partitioned parent until every bucket is a leaf table. Every level
+    // shares the top parent's column list (a partition takes its parent's columns verbatim), so key
+    // positions resolve against `plan.table` at any depth. The depth cap is a defensive backstop —
+    // DDL cannot create a partition cycle (ATTACH refuses one), but a hand-edited catalog could.
+    let mut work: Vec<RouteLevel> =
+        vec![(plan.table.name.clone(), key_cols.to_vec(), value_rows, 0)];
+    let mut leaves: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
+    while let Some((parent_name, level_cols, rows, depth)) = work.pop() {
+        if depth >= MAX_DEPTH {
+            return Err(Error::Internal(format!(
+                "partition routing exceeded {MAX_DEPTH} levels under \"{parent_name}\" (cyclic \
+                 partition metadata?)"
+            )));
+        }
+        let (key_pos, key_tys) = partition_key_loci(&plan.table, &plan.columns, &level_cols)?;
+        let partitions = super::partition::partitions_of(engine, txn, &parent_name, &key_tys)?;
+        // The catch-all partition (if any) receives every row that matches no other partition's
+        // bound, including a key with a NULL element that no range/hash partition can hold.
+        let default_partition = partitions
             .iter()
-            .zip(&key_tys)
-            .map(|(&pos, &ty)| {
-                row.get(pos)
-                    .and_then(Clone::clone)
-                    .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, ty))
-            })
-            .collect::<Result<_, _>>()?;
-        let matched = partitions
-            .iter()
-            .find(|p| super::partition::accepts(&key, &p.bound, &key_tys))
+            .find(|p| super::partition::is_default(&p.bound))
             .map(|p| p.table.clone());
-        let target = match matched.or_else(|| default_partition.clone()) {
-            Some(t) => t,
-            None if key.iter().any(|v| matches!(v, ast::Value::Null)) => {
-                return Err(Error::Coded {
-                    message:
-                        "the partition key has a NULL element, which routes only to a DEFAULT \
-                              partition"
-                            .to_owned(),
-                    sqlstate: "0A000",
-                });
-            },
-            None => {
-                return Err(Error::Coded {
-                    message: format!(
-                        "no partition of relation \"{}\" found for the inserted row",
-                        plan.table.name
-                    ),
-                    sqlstate: "23514",
-                });
-            },
-        };
-        match buckets.iter_mut().find(|(name, _)| name == &target) {
-            Some((_, rows)) => rows.push(row),
-            None => buckets.push((target, vec![row])),
+        // Bucket the rows by target partition, preserving input order within each bucket.
+        let mut buckets: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
+        for row in rows {
+            // Build the key tuple (an omitted/NULL element stays NULL). A matching non-default
+            // partition wins; otherwise the row falls to the catch-all — a key no bound matches (a
+            // NULL element included) routes there when one exists.
+            let key: Vec<ast::Value> = key_pos
+                .iter()
+                .zip(&key_tys)
+                .map(|(&pos, &ty)| {
+                    row.get(pos)
+                        .and_then(Clone::clone)
+                        .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, ty))
+                })
+                .collect::<Result<_, _>>()?;
+            let matched = partitions
+                .iter()
+                .find(|p| super::partition::accepts(&key, &p.bound, &key_tys))
+                .map(|p| p.table.clone());
+            let target = match matched.or_else(|| default_partition.clone()) {
+                Some(t) => t,
+                None if key.iter().any(|v| matches!(v, ast::Value::Null)) => {
+                    return Err(Error::Coded {
+                        message:
+                            "the partition key has a NULL element, which routes only to a DEFAULT \
+                             partition"
+                                .to_owned(),
+                        sqlstate: "0A000",
+                    });
+                },
+                None => {
+                    return Err(Error::Coded {
+                        message: format!(
+                            "no partition of relation \"{parent_name}\" found for the inserted row"
+                        ),
+                        sqlstate: "23514",
+                    });
+                },
+            };
+            match buckets.iter_mut().find(|(name, _)| name == &target) {
+                Some((_, bucket)) => bucket.push(row),
+                None => buckets.push((target, vec![row])),
+            }
+        }
+        // A bucket whose target is itself a partitioned parent routes on down; a leaf inserts.
+        for (target, bucket) in buckets {
+            match super::partition::parent_key_columns(engine, txn, &target)? {
+                Some(sub_cols) => work.push((target, sub_cols, bucket, depth + 1)),
+                None => match leaves.iter_mut().find(|(name, _)| name == &target) {
+                    Some((_, existing)) => existing.extend(bucket),
+                    None => leaves.push((target, bucket)),
+                },
+            }
         }
     }
     let mut inserted = Vec::new();
-    for (part_name, rows) in buckets {
+    for (part_name, rows) in leaves {
         let part =
             engine
                 .lookup_table_as_of(txn, &part_name)?
@@ -248,65 +277,73 @@ fn route_partitioned_insert(
     Ok(inserted)
 }
 
-/// A direct `INSERT` into a partition must land within that partition's `[lo, hi)` bound — the
-/// reference engine refuses a row that belongs to a different partition. A no-op for a non-partition
-/// target.
+/// A direct `INSERT` into a partition must land within that partition's bound — and, under
+/// sub-partitioning, within every ancestor's bound too — the reference engine refuses a row that
+/// belongs to a different partition. A no-op for a non-partition target.
 fn enforce_partition_bound(
     plan: &InsertPlan,
     value_rows: &[Vec<Option<ast::Value>>],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    // A partition's key column and type come from its parent; find the parent (if this is a partition)
-    // by probing the partition catalog with each column's type in turn is unnecessary — the parent
-    // key column names a real column of this table, so resolve it via the recorded parent.
-    let Some(parent) = super::partition::partition_parent(engine, txn, &plan.table.name)? else {
-        return Ok(());
-    };
-    let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent)? else {
-        return Ok(());
-    };
-    let (key_pos, key_tys) = partition_key_loci(&plan.table, &plan.columns, &key_cols)?;
-    let Some((_, bound)) =
-        super::partition::partition_bound(engine, txn, &plan.table.name, &key_tys)?
-    else {
-        return Ok(());
-    };
-    // For a direct insert into the catch-all, the row must belong to NO sibling — a row that fits
-    // another partition's bound belongs there, not the default.
-    let siblings = if super::partition::is_default(&bound) {
-        super::partition::partitions_of(engine, txn, &parent, &key_tys)?
-    } else {
-        Vec::new()
-    };
-    for row in value_rows {
-        let key: Vec<ast::Value> = key_pos
-            .iter()
-            .zip(&key_tys)
-            .map(|(&pos, &ty)| {
-                row.get(pos)
-                    .and_then(Clone::clone)
-                    .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, ty))
-            })
-            .collect::<Result<_, _>>()?;
-        let ok = if super::partition::is_default(&bound) {
-            !siblings
-                .iter()
-                .any(|s| super::partition::accepts(&key, &s.bound, &key_tys))
-        } else {
-            super::partition::accepts(&key, &bound, &key_tys)
+    // A partition's key columns and types come from its parent. Walk the WHOLE ancestor chain: under
+    // sub-partitioning a leaf's rows must satisfy its own bound AND every ancestor's (each level may
+    // key on different columns), exactly as the reference engine's partition constraint does. The
+    // depth cap mirrors the routing backstop (DDL cannot create a cycle; a hand-edited catalog could).
+    const MAX_DEPTH: usize = 64;
+    let mut current = plan.table.name.clone();
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
+            return Ok(());
         };
-        if !ok {
-            return Err(Error::Coded {
-                message: format!(
-                    "the inserted row does not belong to partition \"{}\"",
-                    plan.table.name
-                ),
-                sqlstate: "23514",
-            });
+        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent)? else {
+            return Ok(());
+        };
+        let (key_pos, key_tys) = partition_key_loci(&plan.table, &plan.columns, &key_cols)?;
+        let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
+        else {
+            return Ok(());
+        };
+        // For a direct insert into the catch-all, the row must belong to NO sibling — a row that
+        // fits another partition's bound belongs there, not the default.
+        let siblings = if super::partition::is_default(&bound) {
+            super::partition::partitions_of(engine, txn, &parent, &key_tys)?
+        } else {
+            Vec::new()
+        };
+        for row in value_rows {
+            let key: Vec<ast::Value> = key_pos
+                .iter()
+                .zip(&key_tys)
+                .map(|(&pos, &ty)| {
+                    row.get(pos)
+                        .and_then(Clone::clone)
+                        .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, ty))
+                })
+                .collect::<Result<_, _>>()?;
+            let ok = if super::partition::is_default(&bound) {
+                !siblings
+                    .iter()
+                    .any(|s| super::partition::accepts(&key, &s.bound, &key_tys))
+            } else {
+                super::partition::accepts(&key, &bound, &key_tys)
+            };
+            if !ok {
+                return Err(Error::Coded {
+                    message: format!(
+                        "the inserted row does not belong to partition \"{}\"",
+                        plan.table.name
+                    ),
+                    sqlstate: "23514",
+                });
+            }
         }
+        current = parent;
     }
-    Ok(())
+    Err(Error::Internal(format!(
+        "partition ancestry exceeded {MAX_DEPTH} levels above \"{}\" (cyclic partition metadata?)",
+        plan.table.name
+    )))
 }
 
 /// Fill each column omitted from the INSERT target list (`!covered`) of `full` from its `DEFAULT`

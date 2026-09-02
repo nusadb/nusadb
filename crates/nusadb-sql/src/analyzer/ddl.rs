@@ -77,13 +77,10 @@ pub(super) fn analyze_create_table(
     let inherited_parents = merge_inherited_columns(&mut ct, catalog)?;
     // `PARTITION OF parent`: a range partition takes the parent's columns and a `[from, to)` bound.
     // `PARTITION BY RANGE (col)`: a partitioned parent, keyed on an existing column.
+    // Both may be present: `PARTITION OF top ... PARTITION BY RANGE (col)` declares a sub-partitioned
+    // mid-level parent (it is a partition of `top` and itself partitions on `col`).
     let partition_of = resolve_partition_of(&mut ct, catalog)?;
     let partition_by = resolve_partition_by(&ct)?;
-    if partition_by.is_some() && partition_of.is_some() {
-        return Err(Error::Unsupported(
-            "a partition that is itself partitioned (sub-partitioning) is not supported".to_owned(),
-        ));
-    }
     // An unqualified CREATE targets the session's current schema; an explicit qualifier wins. A
     // temporary table instead targets the session's non-durable temp schema — which does NOT change
     // `current_schema`, so a plain CREATE alongside it still lands in the search-path schema.

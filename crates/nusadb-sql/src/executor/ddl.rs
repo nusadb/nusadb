@@ -443,69 +443,91 @@ fn register_partition(
 }
 
 /// Confirm every existing row of a freshly-attached `partition` falls within the bound just recorded
-/// for it — the `ATTACH PARTITION` analogue of the reference engine's partition-constraint scan. A row
-/// whose key lies outside the bound errors with `23514`, and the rollback-aware DDL unwinds the
-/// attach. The bound is read back from the catalog so the exact recorded/coerced form is used.
+/// for it — and, when the parent is itself a partition (sub-partitioning), within every ancestor's
+/// bound — the `ATTACH PARTITION` analogue of the reference engine's partition-constraint scan. A row
+/// whose key lies outside a bound errors with `23514`, and the rollback-aware DDL unwinds the attach.
+/// Each bound is read back from the catalog so the exact recorded/coerced form is used. The depth cap
+/// mirrors the routing backstop (DDL cannot create a cycle; a hand-edited catalog could).
 fn validate_attach_rows(
     parent: &TableSchema,
     partition: &TableSchema,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent.name)? else {
-        return Ok(());
-    };
-    // Locate each key column and its type in the partition (whose columns match the parent's).
-    let mut key_pos = Vec::with_capacity(key_cols.len());
-    let mut key_tys = Vec::with_capacity(key_cols.len());
-    for kc in &key_cols {
-        let Some((i, ty)) = partition
-            .columns
-            .iter()
-            .enumerate()
-            .find(|(_, c)| &c.name == kc)
-            .map(|(i, c)| (i, c.ty))
+    const MAX_DEPTH: usize = 64;
+    let rows = scan_rows(partition, engine, txn)?;
+    // Walk upward: at each level `current` is the partition whose bound (under `level_parent`) the
+    // rows must satisfy. Level 0 is the freshly-attached table itself.
+    let mut current = partition.name.clone();
+    let mut level_parent = parent.name.clone();
+    for _ in 0..MAX_DEPTH {
+        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &level_parent)?
         else {
             return Ok(());
         };
-        key_pos.push(i);
-        key_tys.push(ty);
-    }
-    let Some((_, bound)) =
-        super::partition::partition_bound(engine, txn, &partition.name, &key_tys)?
-    else {
-        return Ok(());
-    };
-    // A catch-all accepts a row only if no sibling's bound does; a normal partition accepts a row
-    // that falls within its own bound.
-    let siblings = if super::partition::is_default(&bound) {
-        super::partition::partitions_of(engine, txn, &parent.name, &key_tys)?
-    } else {
-        Vec::new()
-    };
-    for row in scan_rows(partition, engine, txn)? {
-        let key: Vec<ast::Value> = key_pos
-            .iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(ast::Value::Null))
-            .collect();
-        let ok = if super::partition::is_default(&bound) {
-            !siblings
+        // Locate each key column and its type in the attached table (all levels share its columns).
+        let mut key_pos = Vec::with_capacity(key_cols.len());
+        let mut key_tys = Vec::with_capacity(key_cols.len());
+        for kc in &key_cols {
+            let Some((i, ty)) = partition
+                .columns
                 .iter()
-                .any(|s| super::partition::accepts(&key, &s.bound, &key_tys))
-        } else {
-            super::partition::accepts(&key, &bound, &key_tys)
+                .enumerate()
+                .find(|(_, c)| &c.name == kc)
+                .map(|(i, c)| (i, c.ty))
+            else {
+                return Ok(());
+            };
+            key_pos.push(i);
+            key_tys.push(ty);
+        }
+        let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
+        else {
+            return Ok(());
         };
-        if !ok {
-            return Err(Error::Coded {
-                message: format!(
-                    "an existing row of \"{}\" does not fall within the bound for partition \"{}\"",
-                    partition.name, partition.name
-                ),
-                sqlstate: "23514",
-            });
+        // A catch-all accepts a row only if no sibling's bound does; a normal partition accepts a
+        // row that falls within its own bound.
+        let siblings = if super::partition::is_default(&bound) {
+            super::partition::partitions_of(engine, txn, &level_parent, &key_tys)?
+        } else {
+            Vec::new()
+        };
+        for row in &rows {
+            let key: Vec<ast::Value> = key_pos
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(ast::Value::Null))
+                .collect();
+            let ok = if super::partition::is_default(&bound) {
+                !siblings
+                    .iter()
+                    .any(|s| super::partition::accepts(&key, &s.bound, &key_tys))
+            } else {
+                super::partition::accepts(&key, &bound, &key_tys)
+            };
+            if !ok {
+                return Err(Error::Coded {
+                    message: format!(
+                        "an existing row of \"{}\" does not fall within the bound for partition \
+                         \"{}\"",
+                        partition.name, current
+                    ),
+                    sqlstate: "23514",
+                });
+            }
+        }
+        // Ascend: the parent may itself be a partition whose bound also applies.
+        match super::partition::partition_parent(engine, txn, &level_parent)? {
+            Some(next) => {
+                current = level_parent;
+                level_parent = next;
+            },
+            None => return Ok(()),
         }
     }
-    Ok(())
+    Err(Error::Internal(format!(
+        "partition ancestry exceeded {MAX_DEPTH} levels above \"{}\" (cyclic partition metadata?)",
+        partition.name
+    )))
 }
 
 /// A "partition would overlap an existing one" error.
@@ -1475,6 +1497,19 @@ pub(super) fn run_alter_table(
                 return Err(Error::InvalidStatement(
                     "a table cannot be attached as a partition of itself".to_owned(),
                 ));
+            }
+            // Under sub-partitioning the child may itself be a partitioned parent, so attaching a
+            // table above its own subtree would close a cycle (routing/expansion would never
+            // terminate). Walk the parent's ancestor chain; finding the child there is a cycle.
+            let mut ancestor = Some(parent.name.clone());
+            while let Some(current) = ancestor {
+                if current == partition.name {
+                    return Err(Error::InvalidStatement(format!(
+                        "attaching \"{}\" under \"{}\" would create a partition cycle",
+                        partition.name, parent.name
+                    )));
+                }
+                ancestor = super::partition::partition_parent(engine, txn, &current)?;
             }
             let def = TableDef {
                 schema: partition.schema.clone(),

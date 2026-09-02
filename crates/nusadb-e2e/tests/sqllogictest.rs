@@ -474,6 +474,11 @@ fn slt_p1_partition_multicolumn() {
 }
 
 #[test]
+fn slt_p1_partition_subpartition() {
+    run_slt("tests/slt/p1_ddl/partition_subpartition.slt");
+}
+
+#[test]
 fn slt_p1_exclude_constraint() {
     run_slt("tests/slt/p1_ddl/exclude_constraint.slt");
 }

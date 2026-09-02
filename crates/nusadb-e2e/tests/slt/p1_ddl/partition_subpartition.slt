@@ -1,0 +1,153 @@
+# Sub-partitioning: a partition may itself be a partitioned parent
+# (CREATE TABLE mid PARTITION OF top FOR VALUES ... PARTITION BY ...). An insert into the top parent
+# routes level by level to a leaf; an insert into the mid parent bound-checks against the mid's own
+# bound then routes down; a direct leaf insert must satisfy the whole ancestor bound chain. A query on
+# any level reads that level's subtree.
+
+statement ok
+CREATE TABLE t (y INT, m INT, v TEXT) PARTITION BY RANGE (y)
+
+statement ok
+CREATE TABLE t24 PARTITION OF t FOR VALUES FROM (2024) TO (2025) PARTITION BY RANGE (m)
+
+statement ok
+CREATE TABLE t24h1 PARTITION OF t24 FOR VALUES FROM (1) TO (7)
+
+statement ok
+CREATE TABLE t24h2 PARTITION OF t24 FOR VALUES FROM (7) TO (13)
+
+statement ok
+CREATE TABLE t25 PARTITION OF t FOR VALUES FROM (2025) TO (2026)
+
+# Rows inserted at the top route through the mid parent to the correct leaf.
+statement ok
+INSERT INTO t VALUES (2024, 3, 'a'), (2024, 9, 'b'), (2025, 5, 'c')
+
+query T
+SELECT v FROM t24h1
+----
+a
+
+query T
+SELECT v FROM t24h2
+----
+b
+
+query T
+SELECT v FROM t25
+----
+c
+
+# The top parent reads every leaf; the mid parent reads its own subtree.
+query T
+SELECT v FROM t ORDER BY v
+----
+a
+b
+c
+
+query T
+SELECT v FROM t24 ORDER BY v
+----
+a
+b
+
+# An insert into the mid parent routes to its sub-partitions.
+statement ok
+INSERT INTO t24 VALUES (2024, 12, 'd')
+
+query T
+SELECT v FROM t24h2 ORDER BY v
+----
+b
+d
+
+# An insert into the mid parent whose row violates the mid's OWN bound is refused.
+statement error does not belong
+INSERT INTO t24 VALUES (2025, 3, 'x')
+
+# A key matching the mid but no sub-partition is refused (the error names the mid).
+statement error no partition of relation "t24"
+INSERT INTO t VALUES (2024, 99, 'x')
+
+# A direct leaf insert must satisfy the whole ancestor chain (here: the mid's y-bound).
+statement error does not belong
+INSERT INTO t24h1 VALUES (2025, 3, 'x')
+
+statement ok
+INSERT INTO t24h1 VALUES (2024, 2, 'e')
+
+# Pruning on the top key drops a pruned mid parent's whole subtree; the results stay correct.
+query I
+SELECT count(*) FROM t WHERE y = 2025
+----
+1
+
+query T
+SELECT v FROM t WHERE y = 2024 AND m >= 7 ORDER BY v
+----
+b
+d
+
+# UPDATE/DELETE through the top parent propagate through both levels.
+statement ok
+UPDATE t SET v = 'A' WHERE y = 2024 AND m = 3
+
+query T
+SELECT v FROM t24h1 ORDER BY v
+----
+A
+e
+
+statement ok
+DELETE FROM t WHERE v = 'd'
+
+query I
+SELECT count(*) FROM t
+----
+4
+
+# Attaching an ancestor under its own subtree is refused (it would create a cycle).
+statement error cycle
+ALTER TABLE t24 ATTACH PARTITION t FOR VALUES FROM (99) TO (100)
+
+# Detaching the mid parent takes its subtree with it; re-attaching restores it.
+statement ok
+ALTER TABLE t DETACH PARTITION t24
+
+query T
+SELECT v FROM t
+----
+c
+
+query I
+SELECT count(*) FROM t24
+----
+3
+
+statement ok
+ALTER TABLE t ATTACH PARTITION t24 FOR VALUES FROM (2024) TO (2025)
+
+query I
+SELECT count(*) FROM t
+----
+4
+
+# A mid parent with sub-partitions cannot be dropped until they are.
+statement error
+DROP TABLE t24
+
+statement ok
+DROP TABLE t24h1
+
+statement ok
+DROP TABLE t24h2
+
+statement ok
+DROP TABLE t24
+
+statement ok
+DROP TABLE t25
+
+statement ok
+DROP TABLE t
