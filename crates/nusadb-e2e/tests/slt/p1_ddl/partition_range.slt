@@ -73,15 +73,13 @@ SELECT count(*) FROM ev WHERE region = 150
 ----
 0
 
-# Dropping a parent with partitions is refused; dropping the partitions first then works.
+# Dropping a partitioned parent drops its partitions with it (they exist only as parts of the
+# parent), no CASCADE needed.
+statement ok
+DROP TABLE ev
+
 statement error
-DROP TABLE ev
+SELECT count(*) FROM ev_lo
 
-statement ok
-DROP TABLE ev_lo
-
-statement ok
-DROP TABLE ev_hi
-
-statement ok
-DROP TABLE ev
+statement error
+SELECT count(*) FROM ev_hi

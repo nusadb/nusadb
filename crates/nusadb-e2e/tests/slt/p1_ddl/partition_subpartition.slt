@@ -133,21 +133,15 @@ SELECT count(*) FROM t
 ----
 4
 
-# A mid parent with sub-partitions cannot be dropped until they are.
-statement error
-DROP TABLE t24
-
-statement ok
-DROP TABLE t24h1
-
-statement ok
-DROP TABLE t24h2
-
-statement ok
-DROP TABLE t24
-
-statement ok
-DROP TABLE t25
-
+# Dropping the top parent drops the whole tree — the mid parent, its sub-partitions, everything.
 statement ok
 DROP TABLE t
+
+statement error
+SELECT count(*) FROM t24
+
+statement error
+SELECT count(*) FROM t24h1
+
+statement error
+SELECT count(*) FROM t25

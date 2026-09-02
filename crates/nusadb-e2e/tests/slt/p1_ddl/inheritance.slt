@@ -116,15 +116,16 @@ SELECT count(*) FROM cities WHERE name = 'Jakarta'
 ----
 0
 
-# Dropping a parent that still has children is refused; dropping the leaves first then works.
+# Dropping an inheritance parent that still has children is refused without CASCADE (the children
+# are independent tables that would be orphaned); CASCADE drops them, transitively.
 statement error
 DROP TABLE cities
 
 statement ok
-DROP TABLE megacaps
+DROP TABLE cities CASCADE
 
-statement ok
-DROP TABLE capitals
+statement error
+SELECT count(*) FROM capitals
 
-statement ok
-DROP TABLE cities
+statement error
+SELECT count(*) FROM megacaps

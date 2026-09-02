@@ -975,16 +975,41 @@ pub(super) fn run_drop_table(
 ) -> Result<ExecutionResult, Error> {
     match engine.lookup_table_as_of_in(txn, &plan.schema, &plan.table)? {
         Some(schema) => {
-            // An inheritance parent cannot be dropped while children depend on it: the children would
-            // be left with columns whose origin is gone. Refuse loudly (drop the inheriting tables
-            // first) rather than orphan them — done before any teardown so a refusal is a no-op.
+            // Child tables (partitions and INHERITS children), checked before any teardown so a
+            // refusal is a no-op. Dropping a *partitioned* parent drops its partitions with it —
+            // they exist only as parts of the parent (the reference engine does the same without
+            // CASCADE). An *INHERITS* parent still refuses a plain drop (the children are
+            // independent tables that would be orphaned); `CASCADE` drops them, transitively.
             let children = super::inheritance::direct_children(engine, txn, &plan.table)?;
             if !children.is_empty() {
-                return Err(Error::DependentObjects(format!(
-                    "cannot drop table \"{}\": {} table(s) inherit from it (drop them first)",
-                    plan.table,
-                    children.len()
-                )));
+                let is_partitioned_parent =
+                    super::partition::parent_key_columns(engine, txn, &plan.table)?.is_some();
+                if !is_partitioned_parent && !plan.cascade {
+                    return Err(Error::DependentObjects(format!(
+                        "cannot drop table \"{}\": {} table(s) inherit from it (drop them first or \
+                         use DROP ... CASCADE)",
+                        plan.table,
+                        children.len()
+                    )));
+                }
+                for child in children {
+                    // A stale edge may name a table that no longer exists; `if_exists` skips it. The
+                    // recursion carries CASCADE so a child's own subtree (a sub-partitioned mid
+                    // parent, an inheriting grandchild) goes with it.
+                    let Some(child_schema) = engine.lookup_table_as_of(txn, &child)? else {
+                        continue;
+                    };
+                    run_drop_table(
+                        &DropTablePlan {
+                            schema: child_schema.schema,
+                            table: child,
+                            if_exists: true,
+                            cascade: true,
+                        },
+                        engine,
+                        txn,
+                    )?;
+                }
             }
             // RESTRICT (A-UR.01b): refuse to drop a table that another table's FOREIGN KEY references,
             // so the FK is not left silently dangling (standard SQL rejects this without CASCADE). A
