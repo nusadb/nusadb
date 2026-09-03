@@ -2304,13 +2304,21 @@ fn parse_alter_partition(trimmed: &str, attach: bool) -> Result<ast::Statement, 
         return unsupported("malformed ALTER TABLE ... {ATTACH|DETACH} PARTITION");
     }
     let (schema, name) = fold_table_ref_str(parent_raw);
-    let partition = fold_ident_str(child_raw);
+    // The child may live in another schema (`ATTACH PARTITION app.p ...`); split its qualifier.
+    let (partition_schema, partition) = fold_table_ref_str(child_raw);
     let action = if attach {
         let bound =
             parse_partition_bound_tail(child_raw, parent_raw, &bound_tail.unwrap_or_default())?;
-        ast::AlterTableAction::AttachPartition { partition, bound }
+        ast::AlterTableAction::AttachPartition {
+            partition_schema,
+            partition,
+            bound,
+        }
     } else {
-        ast::AlterTableAction::DetachPartition { partition }
+        ast::AlterTableAction::DetachPartition {
+            partition_schema,
+            partition,
+        }
     };
     Ok(ast::Statement::AlterTable(ast::AlterTable {
         schema,

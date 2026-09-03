@@ -657,11 +657,14 @@ pub struct CreateTablePlan {
     pub partition_of: Option<PartitionOfPlan>,
 }
 
-/// A resolved `PARTITION OF parent FOR VALUES FROM (lo) TO (hi)` bound (single-column range).
+/// A resolved `PARTITION OF parent FOR VALUES ...` bound.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionOfPlan {
-    /// The partitioned parent table.
+    /// The partitioned parent table's name.
     pub parent: String,
+    /// The schema the parent lives in (resolved at analysis), so the executor can record the
+    /// child→parent inheritance edge under the schema-qualified key.
+    pub parent_schema: String,
     /// This partition's bound (its kind is validated against the parent's strategy by the executor).
     pub bound: PartitionBoundPlan,
 }
@@ -1228,8 +1231,12 @@ pub enum AlterTablePlan {
     DetachPartition {
         /// The partitioned parent's name.
         parent: String,
+        /// The schema the parent lives in (for the schema-qualified inheritance-edge key).
+        parent_schema: String,
         /// The partition to detach.
         partition: String,
+        /// The schema the partition lives in.
+        partition_schema: String,
     },
     /// `RENAME TO name` — rename the table in the catalog (no row rewrite).
     RenameTable {

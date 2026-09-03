@@ -19,8 +19,10 @@ pub(super) fn run_insert(
     // streaming `INSERT ... SELECT` fast path (which writes straight into the target, bypassing both)
     // must not apply.
     let (partition_key, target_is_partition) = if super::partition::has_any(engine, txn)? {
-        let key = super::partition::parent_key_columns(engine, txn, &plan.table.name)?;
-        let is_part = super::partition::partition_parent(engine, txn, &plan.table.name)?.is_some();
+        // Partition metadata is keyed by the schema-qualified name (bare = `public`).
+        let table_key = crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name);
+        let key = super::partition::parent_key_columns(engine, txn, &table_key)?;
+        let is_part = super::partition::partition_parent(engine, txn, &table_key)?.is_some();
         (key, is_part)
     } else {
         (None, false)
@@ -161,6 +163,10 @@ fn partition_key_loci(
 /// bound contains its key, then insert into those partitions (the parent stores nothing itself). A
 /// row whose key matches no partition, or an omitted key, is refused. `ON CONFLICT` on a partitioned
 /// table is not supported. Returns the inserted full rows (for `RETURNING` / the row count).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive routing worklist: per-level bucketing, catch-all fallback, leaf insert"
+)]
 fn route_partitioned_insert(
     plan: &InsertPlan,
     key_cols: &[String],
@@ -181,8 +187,12 @@ fn route_partitioned_insert(
     // shares the top parent's column list (a partition takes its parent's columns verbatim), so key
     // positions resolve against `plan.table` at any depth. The depth cap is a defensive backstop —
     // DDL cannot create a partition cycle (ATTACH refuses one), but a hand-edited catalog could.
-    let mut work: Vec<RouteLevel> =
-        vec![(plan.table.name.clone(), key_cols.to_vec(), value_rows, 0)];
+    let mut work: Vec<RouteLevel> = vec![(
+        crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name),
+        key_cols.to_vec(),
+        value_rows,
+        0,
+    )];
     let mut leaves: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
     while let Some((parent_name, level_cols, rows, depth)) = work.pop() {
         if depth >= MAX_DEPTH {
@@ -256,12 +266,17 @@ fn route_partitioned_insert(
     }
     let mut inserted = Vec::new();
     for (part_name, rows) in leaves {
-        let part =
-            engine
-                .lookup_table_as_of(txn, &part_name)?
-                .ok_or_else(|| Error::TableNotFound {
-                    name: part_name.clone(),
-                })?;
+        // The leaf's bucket key is schema-qualified; split it back into the table's coordinates.
+        let (leaf_schema, leaf_name) = crate::analyzer::split_qualified(&part_name);
+        let part = engine
+            .lookup_table_as_of_in(
+                txn,
+                leaf_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+                leaf_name,
+            )?
+            .ok_or_else(|| Error::TableNotFound {
+                name: part_name.clone(),
+            })?;
         inserted.extend(insert_rows(
             &part,
             &plan.columns,
@@ -291,7 +306,8 @@ fn enforce_partition_bound(
     // key on different columns), exactly as the reference engine's partition constraint does. The
     // depth cap mirrors the routing backstop (DDL cannot create a cycle; a hand-edited catalog could).
     const MAX_DEPTH: usize = 64;
-    let mut current = plan.table.name.clone();
+    // Partition metadata is keyed by the schema-qualified name; the chain stays in key space.
+    let mut current = crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name);
     for _ in 0..MAX_DEPTH {
         let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
             return Ok(());

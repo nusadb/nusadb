@@ -221,7 +221,9 @@ fn expand_inheritance(
 ) -> Result<SelectPlan, Error> {
     let cols: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
     let branch = |table: &str| ast::SelectBody::Select(Box::new(inheritance_branch(&cols, table)));
-    let mut body = branch(&parent.name);
+    // Every branch takes a schema-qualified key (bare = `public`) so a descendant living in another
+    // schema resolves to exactly the recorded table, not a search-path lookalike.
+    let mut body = branch(&super::qualified_display(&parent.schema, &parent.name));
     for descendant in descendants {
         body = ast::SelectBody::SetOp {
             op: ast::SetOp::Union,
@@ -241,8 +243,11 @@ fn expand_inheritance(
     )
 }
 
-/// One `SELECT col1, col2, ... FROM ONLY <table>` branch of an inheritance-expansion union.
+/// One `SELECT col1, col2, ... FROM ONLY <table>` branch of an inheritance-expansion union. `table`
+/// is a schema-qualified edge key (bare = `public`), split back into an explicit qualifier so the
+/// branch reads exactly the recorded table.
 fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
+    let (schema, name) = super::split_qualified(table);
     ast::Select {
         with: Vec::new(),
         distinct: None,
@@ -255,8 +260,8 @@ fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
             .collect(),
         from: Some(ast::FromClause {
             base: ast::TableRef {
-                schema: None,
-                name: table.to_owned(),
+                schema: schema.map(str::to_owned),
+                name: name.to_owned(),
                 alias: None,
                 subquery: None,
                 values: None,
@@ -531,7 +536,8 @@ fn resolve_join_input(
     // exactly as when it is the FROM base — otherwise the join would silently see only the parent's
     // own rows. Inline the same parent+descendants union as a derived-table join input.
     if !table.only && catalog.any_inheritance()? {
-        let descendants = catalog.inheritance_descendants(&schema.name)?;
+        let descendants = catalog
+            .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
         if !descendants.is_empty() {
             let plan = expand_inheritance(&schema, &descendants, catalog)?;
             return Ok((schema, Some(Box::new(plan))));
@@ -605,7 +611,8 @@ pub(super) fn resolve_aux_relation(
         // UPDATE/DELETE source must contribute its descendants' rows, exactly like a FROM base or a
         // JOIN input — otherwise the write would silently see only the parent's own rows.
         if !base.only && catalog.any_inheritance()? {
-            let descendants = catalog.inheritance_descendants(&schema.name)?;
+            let descendants = catalog
+                .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
             if !descendants.is_empty() {
                 let plan = expand_inheritance(&schema, &descendants, catalog)?;
                 return Ok((schema, Some(plan)));
@@ -690,7 +697,10 @@ pub(super) fn resolve_from(
             // not re-expand, and each branch applies its own table's row-level security. Gated on the
             // cheap `any_inheritance` probe so a database with no inheritance pays almost nothing.
             let inherited = if !from.base.only && catalog.any_inheritance()? {
-                let descendants = catalog.inheritance_descendants(&schema.name)?;
+                let descendants = catalog.inheritance_descendants(&super::qualified_display(
+                    &schema.schema,
+                    &schema.name,
+                ))?;
                 if descendants.is_empty() {
                     None
                 } else {
@@ -700,8 +710,13 @@ pub(super) fn resolve_from(
                     // cheap); only provably-empty partition branches are removed, so results are
                     // unchanged. A non-partitioned inheritance parent prunes nothing.
                     let base_qual = from.base.alias.as_deref().unwrap_or(schema.name.as_str());
-                    let kept =
-                        prune_partitions(&schema.name, &descendants, filter, base_qual, catalog)?;
+                    let kept = prune_partitions(
+                        &super::qualified_display(&schema.schema, &schema.name),
+                        &descendants,
+                        filter,
+                        base_qual,
+                        catalog,
+                    )?;
                     Some(expand_inheritance(&schema, &kept, catalog)?)
                 }
             } else {

@@ -2,8 +2,10 @@
 //!
 //! `CREATE TABLE child (...) INHERITS (parent, ...)` records one `(child, parent, seq)` row per parent
 //! in an engine-scoped system catalog `nusadb_inheritance`, mirroring the trigger/function catalog
-//! pattern — no storage-spine change. A query on a parent then expands to the parent plus its
-//! transitive descendants (see the analyzer's scan expansion), unless the reference says `ONLY`.
+//! pattern — no storage-spine change. Both endpoints are schema-qualified keys (`schema.name`, bare
+//! for `public` — so keys recorded before namespaces existed read back unchanged). A query on a
+//! parent then expands to the parent plus its transitive descendants (see the analyzer's scan
+//! expansion), unless the reference says `ONLY`.
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::HashSet;

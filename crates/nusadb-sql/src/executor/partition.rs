@@ -7,7 +7,9 @@
 //! to the partition whose bound accepts the key tuple — a `[lo, hi)` range (compared lexicographically
 //! for a multi-column key), an `IN (...)` value set, or `hash(key) mod modulus = remainder` — or to
 //! the `DEFAULT` catch-all when no other bound matches. `RANGE`/`HASH` allow a multi-column key;
-//! `LIST` is single-column. Mirrors the trigger/function catalog pattern — no storage-spine change.
+//! `LIST` is single-column. Every table in this catalog is keyed by its schema-qualified name
+//! (`schema.name`, bare for `public`), so same-named tables across schemas keep separate metadata.
+//! Mirrors the trigger/function catalog pattern — no storage-spine change.
 #![allow(clippy::wildcard_imports)]
 
 use std::cmp::Ordering;

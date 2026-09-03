@@ -479,6 +479,11 @@ fn slt_p1_partition_subpartition() {
 }
 
 #[test]
+fn slt_p1_inheritance_schema() {
+    run_slt("tests/slt/p1_ddl/inheritance_schema.slt");
+}
+
+#[test]
 fn slt_p1_exclude_constraint() {
     run_slt("tests/slt/p1_ddl/exclude_constraint.slt");
 }

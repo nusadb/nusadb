@@ -232,8 +232,12 @@ fn convert_partition_of(
         },
         sql::ForValues::Default => ast::PartitionBound::Default,
     };
+    // The parent may live in another schema (`PARTITION OF app.m`); carry the qualifier so the
+    // analyzer resolves it like any other table reference.
+    let (schema, parent) = table_ref_name(parent)?;
     Ok(Some(ast::PartitionOf {
-        parent: object_name(parent)?,
+        schema,
+        parent,
         bound,
     }))
 }

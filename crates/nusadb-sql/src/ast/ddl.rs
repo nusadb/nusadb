@@ -117,6 +117,9 @@ pub enum PartitionBound {
 /// `PARTITION OF parent FOR VALUES ...` — a partition of a partitioned parent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionOf {
+    /// The parent's explicit schema qualifier (`Some` for `schema.parent`), or `None` for a bare
+    /// name resolved through the session search path.
+    pub schema: Option<String>,
     /// The partitioned parent table this is a partition of.
     pub parent: String,
     /// This partition's bound (its kind must match the parent's strategy).
@@ -891,6 +894,8 @@ pub enum AlterTableAction {
     /// `ATTACH PARTITION child FOR VALUES <bound>` — make an existing standalone table a partition of
     /// this (partitioned) parent, under `bound`. The child's columns must match the parent's.
     AttachPartition {
+        /// The child's explicit schema qualifier, or `None` for a search-path-resolved bare name.
+        partition_schema: Option<String>,
         /// The table to attach as a partition.
         partition: String,
         /// The partition bound (its kind must match the parent's strategy).
@@ -899,6 +904,8 @@ pub enum AlterTableAction {
     /// `DETACH PARTITION child` — detach a partition, making it an independent standalone table
     /// (it keeps its rows).
     DetachPartition {
+        /// The child's explicit schema qualifier, or `None` for a search-path-resolved bare name.
+        partition_schema: Option<String>,
         /// The partition to detach.
         partition: String,
     },

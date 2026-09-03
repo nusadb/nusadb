@@ -191,10 +191,12 @@ fn resolve_partition_of(
             "a partition takes its parent's columns and cannot declare its own".to_owned(),
         ));
     }
-    let parent = catalog
-        .lookup_table(&po.parent)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: po.parent.clone(),
+    // An explicit qualifier (`PARTITION OF app.m`) wins; a bare name walks the search path.
+    let parent =
+        super::lookup_table_ref(po.schema.as_deref(), &po.parent, catalog)?.ok_or_else(|| {
+            Error::TableNotFound {
+                name: super::qualified_display_opt(po.schema.as_deref(), &po.parent),
+            }
         })?;
     ct.columns = parent
         .columns
@@ -216,6 +218,7 @@ fn resolve_partition_of(
     let bound = convert_partition_bound(&po.bound)?;
     Ok(Some(crate::planner::PartitionOfPlan {
         parent: parent.name,
+        parent_schema: parent.schema,
         bound,
     }))
 }
@@ -320,7 +323,9 @@ fn merge_inherited_columns(
                 merged.push(inherited_col(col));
             }
         }
-        parents.push(parent.name.clone());
+        // The recorded edge key is schema-qualified (bare for `public`) so same-named parents in
+        // different schemas keep separate descendant sets.
+        parents.push(super::qualified_display(&parent.schema, &parent.name));
     }
     for col in std::mem::take(&mut ct.columns) {
         if let Some(slot) = merged.iter_mut().find(|c| c.name == col.name) {
@@ -861,11 +866,29 @@ pub(super) fn analyze_alter_table(
         ast::AlterTableAction::RenameTable { name } => {
             return analyze_rename_table(table.id, &table.schema, &table.name, name, catalog);
         },
-        ast::AlterTableAction::AttachPartition { partition, bound } => {
-            return analyze_attach_partition(table, &partition, &bound, catalog);
+        ast::AlterTableAction::AttachPartition {
+            partition_schema,
+            partition,
+            bound,
+        } => {
+            return analyze_attach_partition(
+                table,
+                partition_schema.as_deref(),
+                &partition,
+                &bound,
+                catalog,
+            );
         },
-        ast::AlterTableAction::DetachPartition { partition } => {
-            return analyze_detach_partition(table, &partition, catalog);
+        ast::AlterTableAction::DetachPartition {
+            partition_schema,
+            partition,
+        } => {
+            return analyze_detach_partition(
+                table,
+                partition_schema.as_deref(),
+                &partition,
+                catalog,
+            );
         },
     };
     Ok(AlterTablePlan::Apply { table, op })
@@ -877,20 +900,26 @@ pub(super) fn analyze_alter_table(
 /// child row falls within it.
 fn analyze_attach_partition(
     parent: TableSchema,
+    partition_schema: Option<&str>,
     partition: &str,
     bound: &ast::PartitionBound,
     catalog: &dyn Catalog,
 ) -> Result<AlterTablePlan, Error> {
-    if catalog.partition_key_columns(&parent.name)?.is_none() {
+    if catalog
+        .partition_key_columns(&super::qualified_display(&parent.schema, &parent.name))?
+        .is_none()
+    {
         return Err(Error::Unsupported(format!(
             "table \"{}\" is not partitioned, so a partition cannot be attached to it",
             parent.name
         )));
     }
-    let child = catalog
-        .lookup_table(partition)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: partition.to_owned(),
+    // An explicit qualifier (`ATTACH PARTITION app.p`) wins; a bare name walks the search path.
+    let child =
+        super::lookup_table_ref(partition_schema, partition, catalog)?.ok_or_else(|| {
+            Error::TableNotFound {
+                name: super::qualified_display_opt(partition_schema, partition),
+            }
         })?;
     // The child's columns must line up with the parent's (same names, types, and order).
     let columns_match = child.columns.len() == parent.columns.len()
@@ -918,23 +947,31 @@ fn analyze_attach_partition(
 /// severing the link.
 fn analyze_detach_partition(
     parent: TableSchema,
+    partition_schema: Option<&str>,
     partition: &str,
     catalog: &dyn Catalog,
 ) -> Result<AlterTablePlan, Error> {
-    if catalog.partition_key_columns(&parent.name)?.is_none() {
+    if catalog
+        .partition_key_columns(&super::qualified_display(&parent.schema, &parent.name))?
+        .is_none()
+    {
         return Err(Error::Unsupported(format!(
             "table \"{}\" is not partitioned, so no partition can be detached from it",
             parent.name
         )));
     }
-    let child = catalog
-        .lookup_table(partition)?
-        .ok_or_else(|| Error::TableNotFound {
-            name: partition.to_owned(),
+    // An explicit qualifier (`DETACH PARTITION app.p`) wins; a bare name walks the search path.
+    let child =
+        super::lookup_table_ref(partition_schema, partition, catalog)?.ok_or_else(|| {
+            Error::TableNotFound {
+                name: super::qualified_display_opt(partition_schema, partition),
+            }
         })?;
     Ok(AlterTablePlan::DetachPartition {
         parent: parent.name,
+        parent_schema: parent.schema,
         partition: child.name,
+        partition_schema: child.schema,
     })
 }
 

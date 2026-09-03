@@ -3471,7 +3471,15 @@ pub fn partitions_to_prune(
     let Some(key_columns) = partition::parent_key_columns(engine, txn, parent)? else {
         return Ok(Vec::new());
     };
-    let Some(schema) = engine.lookup_table_as_of(txn, parent)? else {
+    // `parent` is the schema-qualified metadata key (bare = `public`); split it back into the
+    // table's coordinates to resolve the key column types.
+    let (parent_schema, parent_name) = crate::analyzer::split_qualified(parent);
+    let Some(schema) = engine.lookup_table_as_of_in(
+        txn,
+        parent_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+        parent_name,
+    )?
+    else {
         return Ok(Vec::new());
     };
     let key_tys = key_columns

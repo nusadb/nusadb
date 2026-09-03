@@ -717,7 +717,10 @@ fn alter_table_attach_detach_partition_parses() {
         panic!("expected AlterTable");
     };
     assert_eq!(a.name, "t");
-    let ast::AlterTableAction::AttachPartition { partition, bound } = a.action else {
+    let ast::AlterTableAction::AttachPartition {
+        partition, bound, ..
+    } = a.action
+    else {
         panic!("expected AttachPartition");
     };
     assert_eq!(partition, "p");
@@ -756,7 +759,7 @@ fn alter_table_attach_detach_partition_parses() {
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t DETACH PARTITION p") else {
         panic!("expected AlterTable");
     };
-    let ast::AlterTableAction::DetachPartition { partition } = a.action else {
+    let ast::AlterTableAction::DetachPartition { partition, .. } = a.action else {
         panic!("expected DetachPartition");
     };
     assert_eq!(partition, "p");
@@ -766,7 +769,7 @@ fn alter_table_attach_detach_partition_parses() {
     };
     assert!(a.if_exists);
     assert_eq!(a.name, "t");
-    let ast::AlterTableAction::DetachPartition { partition } = a.action else {
+    let ast::AlterTableAction::DetachPartition { partition, .. } = a.action else {
         panic!("expected DetachPartition");
     };
     assert_eq!(partition, "p");

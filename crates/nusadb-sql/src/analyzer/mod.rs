@@ -168,19 +168,21 @@ pub trait Catalog {
         Ok(false)
     }
 
-    /// The transitive inheritance descendants of `table` (children, grandchildren, …), by name, each
-    /// once. Default empty so a minimal catalog has no inheritance; the production adapter reads the
-    /// inheritance catalog. Used to expand a query on a parent into a union over it and its
-    /// descendants.
+    /// The transitive inheritance descendants of `table` (children, grandchildren, …), each once.
+    /// `table` and the returned names are schema-qualified edge keys (`qualified_display`:
+    /// `schema.name`, bare for `public`). Default empty so a minimal catalog has no inheritance; the
+    /// production adapter reads the inheritance catalog. Used to expand a query on a parent into a
+    /// union over it and its descendants.
     fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
         let _ = table;
         Ok(Vec::new())
     }
 
     /// The partition-key columns of `table` (in key order) if it is a partitioned parent, else `None`.
-    /// Default `None` (no partitioning); the production adapter reads the partition catalog. Used to
-    /// find which of a query's `WHERE` predicates constrain a key column and can therefore prune
-    /// partitions, and as an "is this partitioned?" probe.
+    /// `table` is a schema-qualified metadata key (`qualified_display`). Default `None` (no
+    /// partitioning); the production adapter reads the partition catalog. Used to find which of a
+    /// query's `WHERE` predicates constrain a key column and can therefore prune partitions, and as
+    /// an "is this partitioned?" probe.
     fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
         let _ = table;
         Ok(None)
@@ -1484,13 +1486,24 @@ pub(super) fn enforce_system_catalog(name: &str, catalog: &dyn Catalog) -> Resul
     Ok(())
 }
 
-/// A table reference for an error message: `schema.name` when qualified by a non-default schema,
-/// otherwise the bare name.
-pub(super) fn qualified_display(schema: &str, name: &str) -> String {
+/// A table reference for an error message — and the catalog key for inheritance/partition edges:
+/// `schema.name` when qualified by a non-default schema, otherwise the bare name (so every key
+/// recorded before namespaces existed, which is necessarily a `public` table, reads back unchanged).
+pub(crate) fn qualified_display(schema: &str, name: &str) -> String {
     if schema == nusadb_core::PUBLIC_SCHEMA {
         name.to_owned()
     } else {
         format!("{schema}.{name}")
+    }
+}
+
+/// Split a [`qualified_display`] key back into `(schema, name)`: `app.t` → `(Some("app"), "t")`, a
+/// bare name → `(None, name)` (the default `public` schema). The inverse holds only for identifiers
+/// without a literal dot — the same trade-off every dotted catalog key in the engine makes.
+pub(crate) fn split_qualified(key: &str) -> (Option<&str>, &str) {
+    match key.split_once('.') {
+        Some((schema, name)) => (Some(schema), name),
+        None => (None, key),
     }
 }
 

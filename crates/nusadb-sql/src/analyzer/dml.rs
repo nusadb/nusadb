@@ -627,7 +627,9 @@ fn write_descendants(
     let Some(resolved) = super::lookup_table_ref(schema, table, catalog)? else {
         return Ok(Vec::new());
     };
-    catalog.inheritance_descendants(&resolved.name)
+    // Edges are keyed by the schema-qualified name (bare = `public`); the returned descendants are
+    // such keys too.
+    catalog.inheritance_descendants(&super::qualified_display(&resolved.schema, &resolved.name))
 }
 
 /// Defensive guard: `analyze_update`/`analyze_delete` must only ever be handed a single-table write —
@@ -667,10 +669,13 @@ pub(super) fn analyze_update_stmt(
     parent.only = true;
     let mut plan = analyze_update(parent, catalog)?;
     for descendant in descendants {
+        // The descendant is a schema-qualified edge key; split it so the sub-plan targets exactly
+        // the recorded table (not a search-path lookalike).
+        let (sub_schema, sub_name) = super::split_qualified(&descendant);
         let mut sub = upd.clone();
         sub.only = true;
-        sub.schema = None;
-        sub.table = descendant;
+        sub.schema = sub_schema.map(str::to_owned);
+        sub_name.clone_into(&mut sub.table);
         plan.propagate.push(analyze_update(sub, catalog)?);
     }
     Ok(plan)
@@ -690,15 +695,21 @@ pub(super) fn analyze_delete_stmt(
     parent.only = true;
     let mut plan = analyze_delete(parent, catalog)?;
     for descendant in descendants {
+        // As in `analyze_update_stmt`: split the qualified edge key into the sub-plan's target.
+        let (sub_schema, sub_name) = super::split_qualified(&descendant);
         let mut sub = del.clone();
         sub.only = true;
-        sub.schema = None;
-        sub.table = descendant;
+        sub.schema = sub_schema.map(str::to_owned);
+        sub_name.clone_into(&mut sub.table);
         plan.propagate.push(analyze_delete(sub, catalog)?);
     }
     Ok(plan)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat UPDATE analysis: RLS, assignment typing, FROM sources, RETURNING"
+)]
 pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<UpdatePlan, Error> {
     // The system-catalog namespace is reserved: a user UPDATE of e.g. `nusadb_policies`
     // could widen a policy's USING predicate and bypass RLS.
@@ -714,7 +725,12 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             name: super::qualified_display_opt(upd.schema.as_deref(), &upd.table),
         });
     };
-    reject_inheritance_write(&table.name, upd.only, "UPDATE", catalog)?;
+    reject_inheritance_write(
+        &super::qualified_display(&table.schema, &table.name),
+        upd.only,
+        "UPDATE",
+        catalog,
+    )?;
     // UPDATE needs the privilege on the table, or a column-scoped UPDATE grant on each SET column.
     let update_columns: Vec<&str> = upd.assignments.iter().map(|a| a.column.as_str()).collect();
     super::dcl::require_column_privilege(catalog, &table, &update_columns, ast::Privilege::Update)?;
@@ -871,7 +887,12 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
             name: super::qualified_display_opt(del.schema.as_deref(), &del.table),
         });
     };
-    reject_inheritance_write(&table.name, del.only, "DELETE", catalog)?;
+    reject_inheritance_write(
+        &super::qualified_display(&table.schema, &table.name),
+        del.only,
+        "DELETE",
+        catalog,
+    )?;
     super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Delete)?;
     // As for UPDATE: a `WHERE` or `RETURNING` reads rows, so it additionally needs SELECT.
     if del.filter.is_some() || !del.returning.is_empty() {

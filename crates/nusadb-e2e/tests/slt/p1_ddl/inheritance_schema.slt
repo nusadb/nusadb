@@ -1,0 +1,151 @@
+# Schema-qualified inheritance/partition edges: metadata is keyed by `schema.name` (bare for
+# `public`), so same-named tables across schemas keep separate descendant sets, and a partition may
+# live in a different schema than its parent.
+
+statement ok
+CREATE SCHEMA app
+
+# Same-named INHERITS parents across schemas stay independent.
+statement ok
+CREATE TABLE p (id INT, v TEXT)
+
+statement ok
+CREATE TABLE c1 (extra INT) INHERITS (p)
+
+statement ok
+INSERT INTO p VALUES (1, 'parent')
+
+statement ok
+INSERT INTO c1 VALUES (2, 'child', 9)
+
+statement ok
+CREATE TABLE app.p (id INT, v TEXT)
+
+statement ok
+INSERT INTO app.p VALUES (10, 'app')
+
+# public.p reads its own rows plus its child's; app.p reads only itself.
+query I
+SELECT id FROM p ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM app.p
+----
+10
+
+# An UPDATE through public.p reaches its child but never the same-named app.p.
+statement ok
+UPDATE p SET v = 'UP' WHERE id = 2
+
+query T
+SELECT v FROM app.p
+----
+app
+
+# A partition may live in another schema than its parent; the parent reads and routes to it.
+statement ok
+CREATE TABLE m (a INT, v TEXT) PARTITION BY RANGE (a)
+
+statement ok
+CREATE TABLE app.m1 PARTITION OF m FOR VALUES FROM (0) TO (10)
+
+statement ok
+CREATE TABLE m2 PARTITION OF m FOR VALUES FROM (10) TO (20)
+
+statement ok
+INSERT INTO m VALUES (5, 'x'), (15, 'y')
+
+query T
+SELECT v FROM m ORDER BY v
+----
+x
+y
+
+query T
+SELECT v FROM app.m1
+----
+x
+
+# A direct insert into the cross-schema partition is still bound-checked.
+statement error does not belong
+INSERT INTO app.m1 VALUES (15, 'z')
+
+# A same-named partitioned parent in another schema (with a qualified PARTITION OF) is independent.
+statement ok
+CREATE TABLE app.m (a INT, v TEXT) PARTITION BY RANGE (a)
+
+statement ok
+CREATE TABLE app.mm1 PARTITION OF app.m FOR VALUES FROM (0) TO (99)
+
+statement ok
+INSERT INTO app.m VALUES (7, 'w')
+
+query T
+SELECT v FROM app.m
+----
+w
+
+# app.m's bounds are its own: a key public.m would accept is refused here.
+statement error no partition of relation "app.m"
+INSERT INTO app.m VALUES (150, 'q')
+
+# public.m is untouched by the same-named parent's tree.
+query T
+SELECT v FROM m ORDER BY v
+----
+x
+y
+
+# ATTACH/DETACH accept a schema-qualified partition name.
+statement ok
+ALTER TABLE m DETACH PARTITION app.m1
+
+query T
+SELECT v FROM m
+----
+y
+
+query T
+SELECT v FROM app.m1
+----
+x
+
+statement ok
+ALTER TABLE m ATTACH PARTITION app.m1 FOR VALUES FROM (0) TO (10)
+
+query I
+SELECT count(*) FROM m
+----
+2
+
+# Dropping one schema's tree leaves the same-named other alone.
+statement ok
+DROP TABLE app.m
+
+statement error
+SELECT count(*) FROM app.mm1
+
+query I
+SELECT count(*) FROM m
+----
+2
+
+statement ok
+DROP TABLE m
+
+statement ok
+DROP TABLE p CASCADE
+
+query I
+SELECT id FROM app.p
+----
+10
+
+statement ok
+DROP TABLE app.p
+
+statement ok
+DROP SCHEMA app

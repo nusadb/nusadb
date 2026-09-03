@@ -261,12 +261,25 @@ pub(super) fn run_create_table(
     copy_like_width_checks(plan.like_source.as_deref(), id, engine, txn)?;
     // Record the child→parent inheritance edges so a later query on a parent expands to this table.
     // A prior same-named table's edges are cleared on DROP, so there is nothing stale to purge here.
-    super::inheritance::record_inheritance(engine, txn, &def.name, &plan.inherits)?;
+    // Both endpoints use the schema-qualified key (bare for `public`; the parents in `plan.inherits`
+    // were qualified at analysis) so same-named tables across schemas keep separate edges.
+    super::inheritance::record_inheritance(
+        engine,
+        txn,
+        &crate::analyzer::qualified_display(&def.schema, &def.name),
+        &plan.inherits,
+    )?;
     // Partitioning: a `PARTITION BY` parent records its strategy + key; a `PARTITION OF` partition
     // validates + records its bound and joins the parent's inheritance set (so a query on the parent
     // expands over its partitions).
     if let Some(pb) = &plan.partition_by {
-        super::partition::record_parent(engine, txn, &def.name, &pb.columns, pb.strategy)?;
+        super::partition::record_parent(
+            engine,
+            txn,
+            &crate::analyzer::qualified_display(&def.schema, &def.name),
+            &pb.columns,
+            pb.strategy,
+        )?;
     }
     if let Some(part) = &plan.partition_of {
         register_partition(&def, part, engine, txn)?;
@@ -295,14 +308,17 @@ fn register_partition(
     use crate::planner::PartitionBoundPlan;
 
     use super::partition::{self, PartitionBound};
+    // Partition metadata is keyed by the schema-qualified name (bare = `public`) so same-named
+    // tables across schemas keep separate partition sets.
+    let parent_key = crate::analyzer::qualified_display(&part.parent_schema, &part.parent);
     let key_columns =
-        partition::parent_key_columns(engine, txn, &part.parent)?.ok_or_else(|| {
+        partition::parent_key_columns(engine, txn, &parent_key)?.ok_or_else(|| {
             Error::InvalidStatement(format!(
                 "table \"{}\" is not partitioned, so \"{}\" cannot be a partition of it",
                 part.parent, def.name
             ))
         })?;
-    let strategy = partition::parent_strategy(engine, txn, &part.parent)?.unwrap_or_default();
+    let strategy = partition::parent_strategy(engine, txn, &parent_key)?.unwrap_or_default();
     // Resolve each key column's type from the partition's (parent-derived) columns.
     let key_tys = key_columns
         .iter()
@@ -320,7 +336,7 @@ fn register_partition(
             def.name, part.parent
         ))
     };
-    let existing = partition::partitions_of(engine, txn, &part.parent, &key_tys)?;
+    let existing = partition::partitions_of(engine, txn, &parent_key, &key_tys)?;
     let bound = match &part.bound {
         PartitionBoundPlan::Range { from, to } => {
             if strategy != "range" {
@@ -431,13 +447,15 @@ fn register_partition(
             PartitionBound::Default
         },
     };
-    partition::record_partition(engine, txn, &def.name, &part.parent, &key_tys, &bound)?;
-    // The partition reads through the parent via the shared inheritance-expansion machinery.
+    let def_key = crate::analyzer::qualified_display(&def.schema, &def.name);
+    partition::record_partition(engine, txn, &def_key, &parent_key, &key_tys, &bound)?;
+    // The partition reads through the parent via the shared inheritance-expansion machinery. The
+    // edge endpoints use the same schema-qualified keys.
     super::inheritance::record_inheritance(
         engine,
         txn,
-        &def.name,
-        std::slice::from_ref(&part.parent),
+        &def_key,
+        std::slice::from_ref(&parent_key),
     )?;
     Ok(())
 }
@@ -457,9 +475,10 @@ fn validate_attach_rows(
     const MAX_DEPTH: usize = 64;
     let rows = scan_rows(partition, engine, txn)?;
     // Walk upward: at each level `current` is the partition whose bound (under `level_parent`) the
-    // rows must satisfy. Level 0 is the freshly-attached table itself.
-    let mut current = partition.name.clone();
-    let mut level_parent = parent.name.clone();
+    // rows must satisfy. Level 0 is the freshly-attached table itself. All partition metadata is
+    // keyed by the schema-qualified name, so the walk stays in key space.
+    let mut current = crate::analyzer::qualified_display(&partition.schema, &partition.name);
+    let mut level_parent = crate::analyzer::qualified_display(&parent.schema, &parent.name);
     for _ in 0..MAX_DEPTH {
         let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &level_parent)?
         else {
@@ -980,10 +999,11 @@ pub(super) fn run_drop_table(
             // they exist only as parts of the parent (the reference engine does the same without
             // CASCADE). An *INHERITS* parent still refuses a plain drop (the children are
             // independent tables that would be orphaned); `CASCADE` drops them, transitively.
-            let children = super::inheritance::direct_children(engine, txn, &plan.table)?;
+            let table_key = crate::analyzer::qualified_display(&plan.schema, &plan.table);
+            let children = super::inheritance::direct_children(engine, txn, &table_key)?;
             if !children.is_empty() {
                 let is_partitioned_parent =
-                    super::partition::parent_key_columns(engine, txn, &plan.table)?.is_some();
+                    super::partition::parent_key_columns(engine, txn, &table_key)?.is_some();
                 if !is_partitioned_parent && !plan.cascade {
                     return Err(Error::DependentObjects(format!(
                         "cannot drop table \"{}\": {} table(s) inherit from it (drop them first or \
@@ -993,16 +1013,17 @@ pub(super) fn run_drop_table(
                     )));
                 }
                 for child in children {
-                    // A stale edge may name a table that no longer exists; `if_exists` skips it. The
-                    // recursion carries CASCADE so a child's own subtree (a sub-partitioned mid
-                    // parent, an inheriting grandchild) goes with it.
-                    let Some(child_schema) = engine.lookup_table_as_of(txn, &child)? else {
-                        continue;
-                    };
+                    // The edge key is schema-qualified (bare = `public`); split it back into the
+                    // child's own coordinates. A stale edge may name a table that no longer exists;
+                    // `if_exists` skips it. The recursion carries CASCADE so a child's own subtree
+                    // (a sub-partitioned mid parent, an inheriting grandchild) goes with it.
+                    let (child_schema, child_name) = crate::analyzer::split_qualified(&child);
                     run_drop_table(
                         &DropTablePlan {
-                            schema: child_schema.schema,
-                            table: child,
+                            schema: child_schema
+                                .unwrap_or(nusadb_core::PUBLIC_SCHEMA)
+                                .to_owned(),
+                            table: child_name.to_owned(),
                             if_exists: true,
                             cascade: true,
                         },
@@ -1092,10 +1113,11 @@ pub(super) fn run_drop_table(
             crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
             crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
             // Remove this table's inheritance edges (as a child of its own parents) so a later
-            // same-named table does not inherit stale parent links.
-            super::inheritance::remove_edges_for(engine, txn, &plan.table)?;
+            // same-named table does not inherit stale parent links. Edges are keyed by the
+            // schema-qualified name (`table_key`, computed above).
+            super::inheritance::remove_edges_for(engine, txn, &table_key)?;
             // Same for any partition metadata (parent key or partition bound).
-            super::partition::remove_for(engine, txn, &plan.table)?;
+            super::partition::remove_for(engine, txn, &table_key)?;
         },
         None => {
             if !plan.if_exists {
@@ -1510,15 +1532,18 @@ pub(super) fn run_alter_table(
             partition,
             bound,
         } => {
-            if let Some(existing) =
-                super::partition::partition_parent(engine, txn, &partition.name)?
+            // Partition metadata is keyed by the schema-qualified name (bare = `public`).
+            let partition_key =
+                crate::analyzer::qualified_display(&partition.schema, &partition.name);
+            let parent_key = crate::analyzer::qualified_display(&parent.schema, &parent.name);
+            if let Some(existing) = super::partition::partition_parent(engine, txn, &partition_key)?
             {
                 return Err(Error::InvalidStatement(format!(
                     "table \"{}\" is already a partition of \"{existing}\"",
                     partition.name
                 )));
             }
-            if partition.name == parent.name {
+            if partition_key == parent_key {
                 return Err(Error::InvalidStatement(
                     "a table cannot be attached as a partition of itself".to_owned(),
                 ));
@@ -1526,9 +1551,9 @@ pub(super) fn run_alter_table(
             // Under sub-partitioning the child may itself be a partitioned parent, so attaching a
             // table above its own subtree would close a cycle (routing/expansion would never
             // terminate). Walk the parent's ancestor chain; finding the child there is a cycle.
-            let mut ancestor = Some(parent.name.clone());
+            let mut ancestor = Some(parent_key);
             while let Some(current) = ancestor {
-                if current == partition.name {
+                if current == partition_key {
                     return Err(Error::InvalidStatement(format!(
                         "attaching \"{}\" under \"{}\" would create a partition cycle",
                         partition.name, parent.name
@@ -1543,6 +1568,7 @@ pub(super) fn run_alter_table(
             };
             let part = crate::planner::PartitionOfPlan {
                 parent: parent.name.clone(),
+                parent_schema: parent.schema.clone(),
                 bound,
             };
             register_partition(&def, &part, engine, txn)?;
@@ -1552,17 +1578,25 @@ pub(super) fn run_alter_table(
         // DETACH PARTITION: confirm the child really is a partition of this parent, then sever just
         // that link (its partition-catalog row and its child→parent edge). The table and its rows
         // survive as an independent table.
-        AlterTablePlan::DetachPartition { parent, partition } => {
-            match super::partition::partition_parent(engine, txn, &partition)? {
-                Some(actual) if actual == parent => {},
+        AlterTablePlan::DetachPartition {
+            parent,
+            parent_schema,
+            partition,
+            partition_schema,
+        } => {
+            // Partition metadata and edges are keyed by the schema-qualified name.
+            let partition_key = crate::analyzer::qualified_display(&partition_schema, &partition);
+            let parent_key = crate::analyzer::qualified_display(&parent_schema, &parent);
+            match super::partition::partition_parent(engine, txn, &partition_key)? {
+                Some(actual) if actual == parent_key => {},
                 _ => {
                     return Err(Error::InvalidStatement(format!(
                         "table \"{partition}\" is not a partition of \"{parent}\""
                     )));
                 },
             }
-            super::partition::remove_partition_entry(engine, txn, &partition)?;
-            super::inheritance::remove_edge(engine, txn, &partition, &parent)?;
+            super::partition::remove_partition_entry(engine, txn, &partition_key)?;
+            super::inheritance::remove_edge(engine, txn, &partition_key, &parent_key)?;
             return Ok(ExecutionResult::Altered);
         },
         AlterTablePlan::Apply { table, op } => (table, op),
