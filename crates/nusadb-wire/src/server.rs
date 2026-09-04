@@ -4513,6 +4513,38 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::inheritance_partition_fingerprint(self.engine, self.txn)
     }
 
+    // User-defined type registries. Without these forwards a composite/enum type resolves in-process
+    // but silently "does not exist" over the wire — a cast, a composite column write, or `(col).field`
+    // would be refused on a connection while the same SQL works embedded.
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, nusadb_sql::Error> {
+        nusadb_sql::lookup_composite(self.engine, self.txn, name)
+    }
+
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, nusadb_sql::Error> {
+        nusadb_sql::lookup_composite_column(self.engine, self.txn, schema, table, column)
+    }
+
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, nusadb_sql::Error> {
+        nusadb_sql::lookup_enum_column(self.engine, self.txn, schema, table, column)
+    }
+
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, nusadb_sql::Error> {
+        nusadb_sql::lookup_enum(self.engine, self.txn, name)
+    }
+
     fn partitions_to_prune(
         &self,
         parent: &str,

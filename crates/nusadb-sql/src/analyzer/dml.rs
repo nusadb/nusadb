@@ -752,11 +752,15 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         .map(|f| resolve_update_from(f, catalog))
         .transpose()?;
     // When the target is aliased (`UPDATE t AS x`), the SET values and WHERE reference it by the
-    // alias (which shadows the table name), so build the scope under the alias qualifier.
-    let mut scope = upd
-        .alias
-        .as_deref()
-        .map_or_else(|| scope_of(&table), |alias| scope_of_aliased(&table, alias));
+    // alias (which shadows the table name), so build the scope under the alias qualifier. Built via
+    // `base_scope` (ungated) so composite/enum columns carry their type names — `(col).field` in the
+    // WHERE / SET expressions resolves exactly as it does in a SELECT.
+    let mut scope = base_scope(
+        &table,
+        upd.alias.as_deref().unwrap_or(&table.name),
+        catalog,
+        false,
+    )?;
     let mut from_table: Option<TableSchema> = None;
     let mut from_plan: Option<Box<SelectPlan>> = None;
     if let Some((schema, qualifier, plan)) = from {
@@ -909,11 +913,14 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
         .transpose()?;
     // When the target is aliased (`DELETE FROM t AS x`), the WHERE (and USING join) reference it by
     // the alias, which shadows the table name — so build the target scope under the alias qualifier,
-    // exactly as `UPDATE t AS x` does.
-    let mut scope = del
-        .alias
-        .as_deref()
-        .map_or_else(|| scope_of(&table), |alias| scope_of_aliased(&table, alias));
+    // exactly as `UPDATE t AS x` does. Built via `base_scope` (ungated) so composite/enum columns
+    // carry their type names — `(col).field` in the WHERE resolves exactly as in a SELECT.
+    let mut scope = base_scope(
+        &table,
+        del.alias.as_deref().unwrap_or(&table.name),
+        catalog,
+        false,
+    )?;
     let mut using_table: Option<TableSchema> = None;
     let mut using_plan: Option<Box<SelectPlan>> = None;
     if let Some((schema, qualifier, plan)) = using {

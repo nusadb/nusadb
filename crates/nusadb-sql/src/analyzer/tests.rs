@@ -738,13 +738,12 @@ fn subquery_arity_and_type_are_checked() {
 }
 
 #[test]
-fn row_constructor_rejected_until_executor_path() {
+fn row_constructor_analyzes_as_anonymous_composite() {
+    // `ROW(a, b)` builds an anonymous composite carried in the canonical text form; the plan is a
+    // plain text-typed projection (the composite machinery formats `(v1,v2)` at evaluation).
     assert!(
-        matches!(
-            plan("SELECT ROW(id, name) FROM users", &catalog()),
-            Err(Error::Unsupported(_))
-        ),
-        "ROW(...) should still be Unsupported",
+        plan("SELECT ROW(id, name) FROM users", &catalog()).is_ok(),
+        "a bare ROW(...) constructor analyzes",
     );
 }
 

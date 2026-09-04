@@ -175,6 +175,65 @@ impl Catalog for SltCatalog<'_> {
         }
     }
 
+    // User-defined type registries (composite + enum), so `ROW(...)::T`, `(col).field`, and enum
+    // casts resolve here exactly as they do on the wire.
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::lookup_composite(self.engine, txn, name)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::lookup_composite(self.engine, txn, name);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
+    fn lookup_composite_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::lookup_composite_column(self.engine, txn, schema, table, column)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::lookup_composite_column(self.engine, txn, schema, table, column);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
+    fn lookup_enum_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<String>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::lookup_enum_column(self.engine, txn, schema, table, column)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::lookup_enum_column(self.engine, txn, schema, table, column);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
+    fn enum_labels(&self, name: &str) -> Result<Option<Vec<String>>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::lookup_enum(self.engine, txn, name)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::lookup_enum(self.engine, txn, name);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
         // The view catalog is a regular table. Reuse the session's open transaction when there is
         // one so a view created earlier in the same explicit transaction is visible; otherwise read
@@ -741,6 +800,11 @@ fn slt_p10_int_overflow() {
 #[test]
 fn slt_p10_bool_cast() {
     run_slt("tests/slt/p10_types/bool_cast.slt");
+}
+
+#[test]
+fn slt_p10_row_composite() {
+    run_slt("tests/slt/p10_types/row_composite.slt");
 }
 
 #[test]

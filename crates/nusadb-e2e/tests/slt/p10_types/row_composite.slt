@@ -1,0 +1,101 @@
+# ROW(...) constructor and composite (row) types.
+#
+# A bare ROW(a, b, ...) builds an anonymous composite carried in the canonical `(v1,v2)` text form
+# (field types inferred; a NULL field formats as empty; a field needing quotes gets them). A declared
+# composite type (CREATE TYPE ... AS (...)) supports ROW(...)::T construction, the '(a,b)'::T text
+# cast, storage in a table column, `(col).field` access — including in an UPDATE/DELETE WHERE — and
+# composite comparison.
+
+# Bare ROW: canonical text form, NULL field, quoting, nesting.
+query T
+SELECT ROW(1, 'a')
+----
+(1,a)
+
+query T
+SELECT ROW(1, NULL)
+----
+(1,)
+
+query T
+SELECT ROW(1, 'a b')
+----
+(1,"a b")
+
+query T
+SELECT ROW(1, ROW(2, 3))
+----
+(1,"(2,3)")
+
+# ROW over table columns, and ROW = ROW comparison in a WHERE.
+statement ok
+CREATE TABLE rt (a INT, b TEXT)
+
+statement ok
+INSERT INTO rt VALUES (1, 'x'), (2, 'y')
+
+query T
+SELECT ROW(a, b) FROM rt ORDER BY a
+----
+(1,x)
+(2,y)
+
+query I
+SELECT count(*) FROM rt WHERE ROW(a, b) = ROW(1, 'x')
+----
+1
+
+# A declared composite type: construction, text cast, storage, field access.
+statement ok
+CREATE TYPE pair AS (x INT, y TEXT)
+
+statement ok
+CREATE TABLE ct (id INT, p pair)
+
+statement ok
+INSERT INTO ct VALUES (1, ROW(7, 'seven')::pair), (2, '(8,eight)'::pair)
+
+query T
+SELECT p FROM ct ORDER BY id
+----
+(7,seven)
+(8,eight)
+
+query I
+SELECT (p).x FROM ct ORDER BY id
+----
+7
+8
+
+query T
+SELECT (ROW(9, 'nine')::pair).y
+----
+nine
+
+# Field access works in an UPDATE / DELETE WHERE exactly as in a SELECT.
+statement ok
+UPDATE ct SET p = ROW(70, 'seventy')::pair WHERE (p).x = 7
+
+query T
+SELECT (p).y FROM ct ORDER BY id
+----
+seventy
+eight
+
+statement ok
+DELETE FROM ct WHERE (p).x = 8
+
+query I
+SELECT count(*) FROM ct
+----
+1
+
+# An unknown field on an anonymous record is refused (it has no declared field names).
+statement error
+SELECT (ROW(1, 'a')).f1
+
+statement ok
+DROP TABLE rt
+
+statement ok
+DROP TABLE ct

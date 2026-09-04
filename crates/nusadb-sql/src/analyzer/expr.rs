@@ -465,12 +465,11 @@ pub(super) fn analyze_expr_agg(
             type_name,
             try_cast,
         } => analyze_cast_named(expr, type_name, *try_cast, scope, catalog, aggregates),
-        // ROW(...) is parsed but row-value comparison/evaluation is not yet wired — except as the
-        // operand of a cast to a composite type (`ROW(...)::T`), handled in `analyze_cast_named`.
-        ast::Expr::Row(_) => Err(Error::Unsupported(
-            "ROW(...) constructor is parsed but the executor path is not yet implemented"
-                .to_owned(),
-        )),
+        // `ROW(a, b, ...)` — an anonymous composite value. Each field types itself and the value is
+        // carried in the canonical `(f1,f2,…)` text form, exactly like `ROW(...)::T` with the field
+        // types inferred instead of declared. (`ROW(...)::T` itself is handled in
+        // `analyze_cast_named`, which validates against the named type's declared fields.)
+        ast::Expr::Row(items) => analyze_row_constructor(items, scope, catalog, aggregates),
         // A window function is only valid where the SELECT pipeline supplies a window stage
         // (the projection path lifts it before expression analysis); anywhere else there is
         // no execution path for it, so reject it here.
@@ -591,6 +590,17 @@ pub(super) fn analyze_expr_agg(
                             .iter()
                             .map(|item| analyze_expr(item, scope, catalog, None))
                             .collect::<Result<Vec<_>, _>>()?
+                    },
+                    // A row value under any other aggregate would need a composite *value* to sum,
+                    // order, or collect — the reference engine rejects `max(record)` too. Refuse it
+                    // rather than let the anonymous constructor's text form aggregate as if it were
+                    // an ordinary string.
+                    (_, Some(ast::Expr::Row(_))) => {
+                        return Err(Error::Unsupported(format!(
+                            "a row value cannot be aggregated by {}() (only COUNT tallies a row \
+                             value)",
+                            func.name()
+                        )));
                     },
                     _ => Vec::new(),
                 };
@@ -3816,6 +3826,41 @@ const fn comparison_op_symbol(op: ast::BinaryOp) -> &'static str {
 /// `(expr).field` — extract one field of a composite value. The operand's composite type is resolved
 /// statically ([`composite_type_of`]); the field is looked up by name (a miss is a loud error), and
 /// the executor parses the operand's canonical text form and returns that field.
+/// `ROW(a, b, ...)` with no target type: analyze each field with no hint (its own type wins), allow
+/// a bare `NULL` field (it formats as the empty canonical field regardless of type), and build the
+/// same [`CompositeExpr::Construct`] the typed `ROW(...)::T` path uses — so evaluation, formatting,
+/// and quoting are shared. The value's enclosing type is `Text` (the canonical `(f1,f2,…)` form).
+fn analyze_row_constructor(
+    items: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let mut fields = Vec::with_capacity(items.len());
+    let mut field_types = Vec::with_capacity(items.len());
+    for item in items {
+        // A bare `NULL` field has no type context of its own; type it as text — the canonical form
+        // writes a NULL field as empty either way.
+        let field = if matches!(item, ast::Expr::Literal(ast::Value::Null)) {
+            TypedExpr {
+                kind: TypedExprKind::Literal(ast::Value::Null),
+                ty: ColumnType::Text,
+            }
+        } else {
+            analyze_expr_agg(item, scope, catalog, None, aggregates.as_deref_mut())?
+        };
+        field_types.push(field.ty);
+        fields.push(field);
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::Composite(Box::new(CompositeExpr::Construct {
+            fields,
+            field_types,
+        })),
+        ty: ColumnType::Text,
+    })
+}
+
 fn analyze_field_access(
     base: &ast::Expr,
     field: &str,

@@ -3767,6 +3767,10 @@ pub(super) fn projection_name(expr: &ast::Expr) -> String {
         ast::Expr::Cast { expr, .. } => projection_name(expr),
         ast::Expr::Case { .. } => "case".to_owned(),
         ast::Expr::Coalesce(_) => "coalesce".to_owned(),
+        // An anonymous composite constructor names its column `row`, as the reference engine does.
+        ast::Expr::Row(_) => "row".to_owned(),
+        // `(expr).field` names its column after the extracted field, as the reference engine does.
+        ast::Expr::FieldAccess { field, .. } => field.clone(),
         _ => "?column?".to_owned(),
     }
 }
