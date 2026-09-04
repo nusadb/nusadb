@@ -3446,6 +3446,41 @@ pub fn inheritance_descendants(
     inheritance::descendants(engine, txn, table)
 }
 
+/// Production adapter: a stable, order-independent fingerprint of the inheritance + partition
+/// catalogs, for [`Catalog::inheritance_fingerprint`](crate::Catalog::inheritance_fingerprint).
+///
+/// Each row hashes independently (FNV-1a over its stored bytes, seeded per catalog) and the row
+/// hashes combine by wrapping addition, so physical row order — which MVCC churn can permute without
+/// any logical change — does not affect the value. `0` when neither catalog exists. Cost is a scan of
+/// two catalogs whose row counts equal the number of inheritance edges + partitions, so a cached-plan
+/// revalidation stays cheap.
+pub fn inheritance_partition_fingerprint(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<u64, Error> {
+    let mut acc: u64 = 0;
+    let mut count: u64 = 0;
+    for (seed, name) in [
+        (0x9e37_79b9_7f4a_7c15_u64, inheritance::INHERITANCE_CATALOG),
+        (0x517c_c1b7_2722_0a95_u64, partition::PARTITION_CATALOG),
+    ] {
+        let Some(cat) = engine.lookup_table_as_of(txn, name)? else {
+            continue;
+        };
+        let mut scan = engine.scan(txn, cat.id)?;
+        while let Some((_, bytes)) = scan.try_next()? {
+            let mut hash = seed ^ 0xcbf2_9ce4_8422_2325;
+            for &b in bytes.iter() {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            acc = acc.wrapping_add(hash);
+            count += 1;
+        }
+    }
+    Ok(acc ^ count)
+}
+
 /// Production adapter: the partition-key columns of `table` if it is a partitioned parent. Used for
 /// [`Catalog::partition_key_columns`](crate::Catalog::partition_key_columns).
 pub fn partition_key_columns(
@@ -4339,6 +4374,10 @@ impl crate::Catalog for ExecCatalog<'_> {
         partition::parent_key_columns(self.engine, self.txn, table)
     }
 
+    fn inheritance_fingerprint(&self) -> Result<u64, Error> {
+        inheritance_partition_fingerprint(self.engine, self.txn)
+    }
+
     fn partitions_to_prune(
         &self,
         parent: &str,
@@ -4533,6 +4572,10 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
         partition::parent_key_columns(self.engine, self.txn, table)
+    }
+
+    fn inheritance_fingerprint(&self) -> Result<u64, Error> {
+        inheritance_partition_fingerprint(self.engine, self.txn)
     }
 
     fn partitions_to_prune(

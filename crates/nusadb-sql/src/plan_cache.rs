@@ -69,6 +69,11 @@ struct CachedPlan {
     privilege_checks: Vec<PrivilegeCheck>,
     /// Every ownership decision the analysis consulted, re-verified the same way.
     ownership_checks: Vec<OwnershipCheck>,
+    /// The inheritance/partition metadata fingerprint at plan time, `Some` when the analysis
+    /// consulted that metadata (a parent expansion, a partition prune, or merely probing a database
+    /// that has edges). Re-checked on reuse: any new edge, attach/detach, or bound change moves the
+    /// fingerprint and discards the entry. `None` for a plan that never consulted it.
+    inheritance_fingerprint: Option<u64>,
     plan: PhysicalPlan,
 }
 
@@ -124,6 +129,11 @@ struct RecordingCatalog<'a> {
     /// that depends on either cannot be safely invalidated by the fingerprint — such plans are not
     /// cached at all (conservative: it also skips index-bearing tables whose plan chose a seq scan).
     saw_unversioned_dep: Cell<bool>,
+    /// Set if the analysis consulted inheritance/partition metadata (which changes without bumping any
+    /// table's schema version). Unlike an unversioned dependency this does **not** bar caching: the
+    /// entry records [`Catalog::inheritance_fingerprint`] and a cache hit re-checks it, so the plan is
+    /// reusable until any edge or bound changes.
+    saw_inheritance: Cell<bool>,
     /// Every privilege decision the analysis asked for, captured with its result so a cache hit can
     /// re-verify it against the live catalog (module rule 4). These do **not** bar caching.
     privilege_checks: RefCell<Vec<PrivilegeCheck>>,
@@ -139,6 +149,7 @@ impl<'a> RecordingCatalog<'a> {
             saw_view: Cell::new(false),
             saw_function: Cell::new(false),
             saw_unversioned_dep: Cell::new(false),
+            saw_inheritance: Cell::new(false),
             privilege_checks: RefCell::new(Vec::new()),
             ownership_checks: RefCell::new(Vec::new()),
         }
@@ -194,26 +205,27 @@ impl Catalog for RecordingCatalog<'_> {
     }
 
     fn any_inheritance(&self) -> Result<bool, Error> {
-        let any = self.inner.any_inheritance()?;
-        // A query's shape depends on the current inheritance edges (which parent expands to which
-        // descendants), and those change without bumping any table's schema version. Once inheritance
-        // exists, a plan that consulted it cannot be safely reused across a later inheritance change,
-        // so mark it uncacheable — a database with no inheritance pays nothing.
-        if any {
-            self.saw_unversioned_dep.set(true);
-        }
-        Ok(any)
+        // A query's shape can depend on the current inheritance/partition edges (which parent expands
+        // to which descendants, which partitions prune), and those change without bumping any table's
+        // schema version. Rather than bar caching, remember that this metadata was consulted: the
+        // entry then records the metadata fingerprint and a cache hit re-checks it, so the plan is
+        // reused until any edge or bound changes. Recorded even when the answer is `false` — the
+        // empty state fingerprints as 0, so creating the *first* edge also invalidates plans built
+        // when there was none (they would otherwise skip an expansion they now need).
+        self.saw_inheritance.set(true);
+        self.inner.any_inheritance()
     }
 
     fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
-        self.saw_unversioned_dep.set(true);
+        self.saw_inheritance.set(true);
         self.inner.inheritance_descendants(table)
     }
 
-    // Partition pruning is only reached through `any_inheritance` above, which already marks the plan
-    // uncacheable — so a pruned plan (which depends on the WHERE constants) is never cached. Forward
-    // both to the inner catalog so pruning still applies on the plan-cache path.
+    // Partition pruning bakes the expansion's branch set from the WHERE constants (part of the cache
+    // key, the SQL text) and the partition bounds/edges (covered by the metadata fingerprint) — so a
+    // pruned plan is safely reusable while the fingerprint holds.
     fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
+        self.saw_inheritance.set(true);
         self.inner.partition_key_columns(table)
     }
     fn partitions_to_prune(
@@ -221,7 +233,11 @@ impl Catalog for RecordingCatalog<'_> {
         parent: &str,
         constraints: &[crate::PruneConstraint],
     ) -> Result<Vec<String>, Error> {
+        self.saw_inheritance.set(true);
         self.inner.partitions_to_prune(parent, constraints)
+    }
+    fn inheritance_fingerprint(&self) -> Result<u64, Error> {
+        self.inner.inheritance_fingerprint()
     }
 
     fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {
@@ -466,17 +482,24 @@ pub fn plan_cached(
     // search_path` changes which schema a bare name binds to.
     let key = cache_key(catalog, sql);
     if let Some(entry) = cache.entries.get(&key) {
-        // Reuse only while every referenced table is at its recorded schema version AND every
-        // privilege/ownership decision the analysis made still holds against the live catalog — the
-        // latter re-checked from the current snapshot, so a committed `REVOKE` (even one made in
+        // Reuse only while every referenced table is at its recorded schema version, the
+        // inheritance/partition metadata fingerprint (when the plan consulted it) is unmoved, AND
+        // every privilege/ownership decision the analysis made still holds against the live catalog —
+        // the latter re-checked from the current snapshot, so a committed `REVOKE` (even one made in
         // another session's transaction) is seen and the plan is not served.
+        let inheritance_unchanged = match entry.inheritance_fingerprint {
+            None => true,
+            Some(recorded) => catalog.inheritance_fingerprint()? == recorded,
+        };
         if fingerprint_unchanged(engine, &entry.fingerprint)
+            && inheritance_unchanged
             && access_checks_still_hold(catalog, entry)?
         {
             cache.hits += 1;
             return Ok(entry.plan.clone());
         }
-        // Stale: a referenced table changed schema, or a privilege was revoked since this was planned.
+        // Stale: a referenced table changed schema, an inheritance/partition edge or bound moved,
+        // or a privilege was revoked since this was planned.
         cache.entries.remove(&key);
     }
     cache.misses += 1;
@@ -485,6 +508,13 @@ pub fn plan_cached(
     let cacheable = !recorder.saw_view.get()
         && !recorder.saw_function.get()
         && !recorder.saw_unversioned_dep.get();
+    // A plan that consulted inheritance/partition metadata records its fingerprint (from the same
+    // snapshot the analysis used) so reuse can detect any later edge or bound change.
+    let inheritance_fingerprint = if recorder.saw_inheritance.get() {
+        Some(catalog.inheritance_fingerprint()?)
+    } else {
+        None
+    };
     let ids = recorder.tables.into_inner();
     if cacheable
         && !ids.is_empty()
@@ -499,6 +529,7 @@ pub fn plan_cached(
                 fingerprint,
                 privilege_checks: recorder.privilege_checks.into_inner(),
                 ownership_checks: recorder.ownership_checks.into_inner(),
+                inheritance_fingerprint,
                 plan: physical.clone(),
             },
         );

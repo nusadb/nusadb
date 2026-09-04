@@ -4507,6 +4507,12 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::partition_key_columns(self.engine, self.txn, table)
     }
 
+    fn inheritance_fingerprint(&self) -> Result<u64, nusadb_sql::Error> {
+        // The plan cache records this for a plan that consulted inheritance metadata and re-checks
+        // it on reuse, so such plans stay cacheable while any edge/bound change invalidates them.
+        nusadb_sql::inheritance_partition_fingerprint(self.engine, self.txn)
+    }
+
     fn partitions_to_prune(
         &self,
         parent: &str,

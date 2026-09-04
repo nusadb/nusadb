@@ -54,6 +54,37 @@ impl Catalog for EngineCatalog<'_> {
         }
         Ok(out)
     }
+
+    // Inheritance/partition metadata, forwarded through a throwaway transaction (each statement here
+    // runs in auto-commit) so parent expansion and the plan cache's metadata fingerprint see the
+    // real catalogs — mirrors the wire server's catalog.
+    fn any_inheritance(&self) -> Result<bool, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::inheritance_any(self.0, txn);
+        let _ = self.0.commit(txn);
+        out
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::inheritance_descendants(self.0, txn, table);
+        let _ = self.0.commit(txn);
+        out
+    }
+
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::partition_key_columns(self.0, txn, table);
+        let _ = self.0.commit(txn);
+        out
+    }
+
+    fn inheritance_fingerprint(&self) -> Result<u64, nusadb_sql::Error> {
+        let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
+        let out = nusadb_sql::inheritance_partition_fingerprint(self.0, txn);
+        let _ = self.0.commit(txn);
+        out
+    }
 }
 
 /// Run a DDL/DML statement straight through (no caching).
@@ -170,6 +201,85 @@ fn plans_over_an_indexed_table_are_not_cached() {
     let _ = run_cached(&engine, &mut cache, sql);
     assert_eq!(cache.hits(), 0, "indexed-table plans are not cached");
     assert_eq!(cache.misses(), 2);
+}
+
+#[test]
+fn inheritance_elsewhere_keeps_plans_cacheable() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE parent (a INT)");
+    run(&engine, "CREATE TABLE child (b INT) INHERITS (parent)");
+    run(&engine, "CREATE TABLE u (a INT)");
+    run(&engine, "INSERT INTO u VALUES (1), (2)");
+    let mut cache = PlanCache::new();
+
+    // Inheritance exists in the database, but this read touches none of it: the plan records the
+    // metadata fingerprint and is served from the cache on the second run (the old behavior barred
+    // caching entirely once any edge existed).
+    let sql = "SELECT a FROM u WHERE a > 0";
+    let first = run_cached(&engine, &mut cache, sql);
+    let second = run_cached(&engine, &mut cache, sql);
+    assert_eq!(first, second);
+    assert_eq!(
+        cache.hits(),
+        1,
+        "plain plan stays cacheable beside inheritance"
+    );
+    assert_eq!(cache.misses(), 1);
+
+    // A parent expansion is cacheable the same way.
+    let sql = "SELECT a FROM parent";
+    let _ = run_cached(&engine, &mut cache, sql);
+    let _ = run_cached(&engine, &mut cache, sql);
+    assert_eq!(
+        cache.hits(),
+        2,
+        "expanded parent plan is served from the cache"
+    );
+    assert_eq!(cache.misses(), 2);
+}
+
+#[test]
+fn a_new_edge_invalidates_cached_plans() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE t (a INT)");
+    run(&engine, "INSERT INTO t VALUES (1)");
+    let mut cache = PlanCache::new();
+
+    // Cached while the database has no inheritance at all (fingerprint 0).
+    let sql = "SELECT a FROM t";
+    let first = run_cached(&engine, &mut cache, sql);
+    assert_eq!(first.len(), 1);
+    assert_eq!(cache.misses(), 1);
+
+    // The FIRST edge appears, making `t` a parent. The cached plan has no expansion, so serving it
+    // would silently drop the child's rows — the fingerprint moved from 0, so it is discarded.
+    run(&engine, "CREATE TABLE tc (b INT) INHERITS (t)");
+    run(&engine, "INSERT INTO tc VALUES (2, 20)");
+    let expanded = run_cached(&engine, &mut cache, sql);
+    assert_eq!(cache.hits(), 0, "the pre-inheritance plan was not reused");
+    assert_eq!(cache.misses(), 2);
+    assert_eq!(
+        expanded.len(),
+        2,
+        "the re-planned read sees the child's row"
+    );
+
+    // The expanded plan is itself cached ...
+    let again = run_cached(&engine, &mut cache, sql);
+    assert_eq!(cache.hits(), 1);
+    assert_eq!(again.len(), 2);
+
+    // ... and a further edge (a grandchild) invalidates it again.
+    run(&engine, "CREATE TABLE tgc (c INT) INHERITS (tc)");
+    run(&engine, "INSERT INTO tgc VALUES (3, 30, 300)");
+    let deeper = run_cached(&engine, &mut cache, sql);
+    assert_eq!(cache.hits(), 1, "the two-table expansion was not reused");
+    assert_eq!(cache.misses(), 3);
+    assert_eq!(
+        deeper.len(),
+        3,
+        "the re-planned read sees the grandchild's row"
+    );
 }
 
 /// A catalog with a configurable `search_path` over the real engine, for the

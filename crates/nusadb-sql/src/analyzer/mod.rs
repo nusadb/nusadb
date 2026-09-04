@@ -188,6 +188,15 @@ pub trait Catalog {
         Ok(None)
     }
 
+    /// A stable fingerprint of the inheritance + partition metadata (edges, key columns, bounds):
+    /// any change to either catalog yields a different value, and `0` when none exists. Order of
+    /// catalog rows does not matter. The plan cache records it for a plan that consulted inheritance
+    /// metadata and re-checks it on reuse, so such plans stay cacheable yet a new edge / attach /
+    /// detach / bound change invalidates them. Default `0` (no metadata, never changes).
+    fn inheritance_fingerprint(&self) -> Result<u64, Error> {
+        Ok(0)
+    }
+
     /// The direct partitions of `parent` whose bound provably contains no key satisfying
     /// `constraints` — the partitions a query carrying those key predicates need not scan. Default
     /// empty (no pruning); the production adapter tests each partition's bound. A partition is
