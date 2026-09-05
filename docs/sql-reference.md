@@ -148,8 +148,24 @@ SELECT now()                                   AS instant,
        to_char(now(), 'YYYY-MM-DD HH24:MI')    AS formatted;
 ```
 
-The session time zone is UTC and cannot be changed. `AT TIME ZONE` accepts `UTC` and numeric
-offsets such as `+07:00`; named zones with daylight-saving rules are not available.
+The session time zone defaults to UTC and can be changed with `SET TIME ZONE` (equivalently
+`SET timezone = ...`). Supported zones are `UTC`/`GMT` and fixed offsets: a bare `'+07'` means
+seven hours east, a colon form such as `'+05:30'` follows the POSIX convention (five and a half
+hours *west*), and a number or `INTERVAL` value counts hours east. `SET TIME ZONE LOCAL`,
+`SET TIME ZONE DEFAULT`, and `RESET timezone` restore UTC. The zone shifts how `timestamptz`
+values render and how input without an explicit offset is read, along with `CURRENT_TIME`,
+`CURRENT_DATE`, `LOCALTIMESTAMP`, wall-clock casts, `EXTRACT`, `date_trunc`, and `to_char`.
+Region names such as `'Asia/Jakarta'` are refused: they need a time-zone database (daylight-saving
+rules) that the engine does not carry. `AT TIME ZONE` accepts `UTC` and numeric offsets such as
+`+07:00` under the same rule.
+
+```sql
+SET TIME ZONE '+07';
+SELECT TIMESTAMPTZ '2026-08-30 12:00:00+00';  -- 2026-08-30 19:00:00+07
+SELECT TIMESTAMPTZ '2026-08-30 12:00:00';     -- read as +07 wall time
+SHOW timezone;                                -- <+07>-07
+RESET timezone;
+```
 
 ### JSON
 

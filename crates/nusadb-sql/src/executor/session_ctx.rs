@@ -34,6 +34,12 @@ thread_local! {
     /// The current statement's session context, pinned by [`set_session_context`]. `None` before
     /// any statement has pinned one on this thread (e.g. a direct evaluator unit test).
     static SESSION_CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
+
+    /// The current statement's session time zone as seconds east of UTC, pinned together with the
+    /// session context — and *also* by the analyzer (from [`Catalog::session_timezone`]
+    /// (crate::Catalog::session_timezone)) so plan-time constant evaluation observes the same zone
+    /// the executor will. `0` (UTC) before anything has pinned one on this thread.
+    static STATEMENT_TZ_OFFSET: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 /// A snapshot of the session state the niladic session functions read.
@@ -70,6 +76,37 @@ pub(super) fn set_session_context(
             temp_schema: temp_schema.map(ToOwned::to_owned),
         });
     });
+    pin_statement_timezone(settings.get("timezone").map(String::as_str));
+}
+
+/// Pin the statement's session time zone from the canonical `timezone` setting.
+///
+/// `None`, an unset variable, or an unparseable value all mean UTC. Called when the session
+/// context is pinned and by the analyzer, so parse/plan-time evaluation and execution agree on
+/// the zone.
+pub fn pin_statement_timezone(setting: Option<&str>) {
+    let offset = setting
+        .and_then(crate::temporal::session_zone_offset)
+        .unwrap_or(0);
+    STATEMENT_TZ_OFFSET.with(|cell| cell.set(offset));
+}
+
+/// The pinned session time zone as seconds east of UTC (`0` when nothing has pinned one).
+///
+/// Read by every zone-dependent rendering/interpretation site: `timestamptz` text forms, its
+/// wall-clock casts and field extraction, and the zone-local niladic time functions.
+pub fn statement_tz_offset_secs() -> i64 {
+    STATEMENT_TZ_OFFSET.with(std::cell::Cell::get)
+}
+
+/// The pinned session's canonical `timezone` setting, if one is set — what the default
+/// [`Catalog::session_timezone`](crate::Catalog::session_timezone) reports for the embedded path.
+pub(super) fn current_timezone_setting() -> Option<String> {
+    SESSION_CONTEXT.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|ctx| ctx.settings.get("timezone").cloned())
+    })
 }
 
 /// Pin just the session user (no session variables, defaults for database/schema), for an execution

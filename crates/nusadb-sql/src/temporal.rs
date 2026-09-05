@@ -402,6 +402,55 @@ pub fn format_timestamptz(micros: i64) -> String {
     format!("{}+00", format_timestamp(micros))
 }
 
+/// Format a UTC instant as local wall time in a zone `offset_east_secs` east of UTC.
+///
+/// Renders `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM[:SS]]`, with minutes/seconds in the offset suffix
+/// appended only when nonzero (the reference engine's rendering: `+07`, `-05:30`).
+#[must_use]
+pub fn format_timestamptz_at(micros: i64, offset_east_secs: i64) -> String {
+    let local = micros.saturating_add(offset_east_secs.saturating_mul(MICROS_PER_SEC));
+    let time = format_timestamp(local);
+    let sign = if offset_east_secs < 0 { '-' } else { '+' };
+    let abs = offset_east_secs.abs();
+    let (h, m, s) = (abs / 3600, (abs % 3600) / 60, abs % 60);
+    if s != 0 {
+        format!("{time}{sign}{h:02}:{m:02}:{s:02}")
+    } else if m != 0 {
+        format!("{time}{sign}{h:02}:{m:02}")
+    } else {
+        format!("{time}{sign}{h:02}")
+    }
+}
+
+/// Parse a timestamptz like [`parse_timestamptz`], but with the session zone as the default.
+///
+/// A **missing** offset is read as local wall time in a zone `offset_east_secs` east of UTC (the
+/// session time zone) instead of UTC. An explicit offset (or `Z`) in the string still wins.
+#[must_use]
+pub fn parse_timestamptz_at(s: &str, offset_east_secs: i64) -> Option<i64> {
+    let s = s.trim();
+    if has_explicit_offset(s) {
+        parse_timestamp_inner(s, true)
+    } else {
+        parse_timestamp_inner(s, true)?.checked_sub(offset_east_secs.checked_mul(MICROS_PER_SEC)?)
+    }
+}
+
+/// Whether a timestamp string carries its own zone — a trailing `Z` or a `±HH[[:]MM]` offset after
+/// the time part. Decides if the session time zone applies to the value.
+#[must_use]
+pub fn has_explicit_offset(s: &str) -> bool {
+    let s = s.trim();
+    if s.ends_with('Z') {
+        return true;
+    }
+    let time_part = match s.find(['T', ' ']) {
+        Some(sep) => &s[sep + 1..],
+        None => return false,
+    };
+    find_offset_sign(time_part).is_some()
+}
+
 fn parse_timestamp_inner(s: &str, allow_offset: bool) -> Option<i64> {
     // Split date and time on the first 'T' or space. A date with no time part (`2024-03-15`) is a
     // timestamp at midnight, the same as the reference engine (`TIMESTAMP '2024-03-15'` → `2024-03-15 00:00:00`).
@@ -474,6 +523,189 @@ pub fn parse_zone_offset(off: &str) -> Option<i64> {
 /// Floored division + modulo (handles negative `micros` so pre-epoch timestamps format correctly).
 const fn div_floor_mod(a: i64, b: i64) -> (i64, i64) {
     (a.div_euclid(b), a.rem_euclid(b))
+}
+
+// ---- Session time zone setting ---------------------------------------------------------------
+
+/// Why a `SET TIME ZONE` / `SET timezone` value was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionZoneError {
+    /// The value names no time zone this engine can parse (bad syntax or offset out of range).
+    Invalid,
+    /// The value is an IANA-style zone name (`Region/City`), which needs a time-zone database this
+    /// engine does not carry — only `UTC`/`GMT` and fixed offsets are supported.
+    NeedsTzDatabase,
+}
+
+/// The largest fixed session-zone displacement accepted, in hours — the reference engine's bound.
+const MAX_ZONE_DISP_HOURS: i64 = 15;
+
+/// Validate a session time-zone value and canonicalize it to the form `SHOW timezone` reports.
+///
+/// Returns `(canonical, offset_east_secs)`. Accepted forms, matching the reference engine's
+/// reading of each:
+///
+/// - `UTC` / `GMT` / `Etc/UTC` / `Etc/GMT` (case-insensitive) — offset `0`.
+/// - A bare number (hours, from `SET TIME ZONE 7` / `SET TIME ZONE 5.5`) — **east** of UTC,
+///   canonicalized to the POSIX display `<+05:30>-05:30`.
+/// - `±HH` (no colon) — a zone-abbreviation spelling, **east** of UTC (`+07` is UTC+7),
+///   canonicalized to the POSIX display `<+07>-07`.
+/// - `±HH:MM[:SS]` (with colon) — a POSIX offset spec, whose sign is the **opposite** of ISO
+///   (`+05:30` is 5½ hours *west*); kept verbatim as its own canonical form.
+/// - An IANA-style name (`Asia/Jakarta`) is refused with [`SessionZoneError::NeedsTzDatabase`];
+///   anything else with [`SessionZoneError::Invalid`].
+///
+/// # Errors
+/// See the variants of [`SessionZoneError`].
+pub fn parse_session_timezone(value: &str) -> Result<(String, i64), SessionZoneError> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("utc") {
+        return Ok(("UTC".to_owned(), 0));
+    }
+    if v.eq_ignore_ascii_case("gmt") {
+        return Ok(("GMT".to_owned(), 0));
+    }
+    if v.eq_ignore_ascii_case("etc/utc") {
+        return Ok(("Etc/UTC".to_owned(), 0));
+    }
+    if v.eq_ignore_ascii_case("etc/gmt") {
+        return Ok(("Etc/GMT".to_owned(), 0));
+    }
+    // A bare number of hours east of UTC (`SET TIME ZONE 7`, `SET TIME ZONE 5.5`).
+    if let Ok(hours) = v.parse::<f64>() {
+        if !hours.is_finite() || hours.abs() > 24.0 {
+            return Err(SessionZoneError::Invalid);
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "bounded to ±24 hours just above, so minutes fit far inside i64"
+        )]
+        let minutes = (hours * 60.0).round() as i64;
+        if minutes.abs() > MAX_ZONE_DISP_HOURS * 60 + 59 {
+            return Err(SessionZoneError::Invalid);
+        }
+        let offset = minutes * 60;
+        return Ok((posix_zone_display(offset), offset));
+    }
+    // `±HH` with no colon is a zone-abbreviation spelling: ISO sign, east of UTC.
+    if let Some((sign, digits)) = split_sign(v)
+        && !digits.is_empty()
+        && digits.len() <= 2
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        let hours: i64 = digits.parse().map_err(|_| SessionZoneError::Invalid)?;
+        if hours > MAX_ZONE_DISP_HOURS {
+            return Err(SessionZoneError::Invalid);
+        }
+        let offset = sign * hours * 3600;
+        return Ok((posix_zone_display(offset), offset));
+    }
+    // `±HH:MM[:SS]` is a POSIX offset spec: its sign is the opposite of ISO (`+` is west of UTC).
+    if let Some((sign, rest)) = split_sign(v)
+        && rest.contains(':')
+    {
+        let mut it = rest.split(':');
+        let (h, m, s) = (
+            parse_zone_part(it.next(), 2)?,
+            parse_zone_part(it.next(), 2)?,
+            it.next().map_or(Ok(0), |p| parse_zone_part(Some(p), 2))?,
+        );
+        if it.next().is_some() || h > MAX_ZONE_DISP_HOURS || m > 59 || s > 59 {
+            return Err(SessionZoneError::Invalid);
+        }
+        let offset = -sign * (h * 3600 + m * 60 + s);
+        let mut canonical = format!("{}{h:02}:{m:02}", if sign < 0 { '-' } else { '+' });
+        if s != 0 {
+            let _ = std::fmt::Write::write_fmt(&mut canonical, format_args!(":{s:02}"));
+        }
+        return Ok((canonical, offset));
+    }
+    // An IANA-style `Region/City` name would need a time-zone database.
+    if v.contains('/')
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'+' | b'-'))
+    {
+        return Err(SessionZoneError::NeedsTzDatabase);
+    }
+    Err(SessionZoneError::Invalid)
+}
+
+/// The east-of-UTC offset a canonical [`parse_session_timezone`] form denotes, or `None` for a
+/// string that is not one of its outputs (an unset or hand-poked variable falls back to UTC).
+#[must_use]
+pub fn session_zone_offset(canonical: &str) -> Option<i64> {
+    let v = canonical.trim();
+    if ["utc", "gmt", "etc/utc", "etc/gmt"]
+        .iter()
+        .any(|z| v.eq_ignore_ascii_case(z))
+    {
+        return Some(0);
+    }
+    // `<+05:30>-05:30` — the POSIX display; the bracketed abbreviation carries the ISO offset.
+    if let Some(inner) = v.strip_prefix('<').and_then(|r| r.split('>').next()) {
+        let (sign, rest) = split_sign(inner)?;
+        let mut it = rest.split(':');
+        let h: i64 = it.next()?.parse().ok()?;
+        let m: i64 = it.next().map_or(Some(0), |p| p.parse().ok())?;
+        return Some(sign * (h * 3600 + m * 60));
+    }
+    // `±HH:MM[:SS]` — the POSIX offset spec, sign flipped from ISO.
+    let (sign, rest) = split_sign(v)?;
+    let mut it = rest.split(':');
+    let h: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next().map_or(Some(0), |p| p.parse().ok())?;
+    let s: i64 = it.next().map_or(Some(0), |p| p.parse().ok())?;
+    Some(-sign * (h * 3600 + m * 60 + s))
+}
+
+/// The canonical `timezone` setting string denoting a fixed east-of-UTC offset — what a path that
+/// only holds the pinned offset (not the original setting) hands back to the analyzer's pin.
+#[must_use]
+pub fn zone_setting_for_offset(offset_east_secs: i64) -> String {
+    posix_zone_display(offset_east_secs)
+}
+
+/// Render a fixed east-of-UTC offset as the reference engine's POSIX zone display:
+/// `<+05:30>-05:30` (the bracketed abbreviation uses the ISO sign, the spec part the opposite).
+fn posix_zone_display(offset_east_secs: i64) -> String {
+    let iso = zone_hhmm(offset_east_secs, false);
+    let posix = zone_hhmm(offset_east_secs, true);
+    format!("<{iso}>{posix}")
+}
+
+/// `±HH[:MM]` for an offset, in ISO sign (east positive) or flipped (POSIX) form.
+fn zone_hhmm(offset_east_secs: i64, flip_sign: bool) -> String {
+    let shown = if flip_sign {
+        -offset_east_secs
+    } else {
+        offset_east_secs
+    };
+    let sign = if shown < 0 { '-' } else { '+' };
+    let abs = shown.abs();
+    let (h, m) = (abs / 3600, (abs % 3600) / 60);
+    if m != 0 {
+        format!("{sign}{h:02}:{m:02}")
+    } else {
+        format!("{sign}{h:02}")
+    }
+}
+
+/// Split a leading `+`/`-` sign off a zone string: `(±1, rest)`.
+fn split_sign(v: &str) -> Option<(i64, &str)> {
+    match v.as_bytes().first()? {
+        b'+' => Some((1, v.get(1..)?)),
+        b'-' => Some((-1, v.get(1..)?)),
+        _ => None,
+    }
+}
+
+/// One `HH`/`MM`/`SS` component of a POSIX offset spec: all digits, at most `max_len` long.
+fn parse_zone_part(part: Option<&str>, max_len: usize) -> Result<i64, SessionZoneError> {
+    let p = part.ok_or(SessionZoneError::Invalid)?;
+    if p.is_empty() || p.len() > max_len || !p.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SessionZoneError::Invalid);
+    }
+    p.parse().map_err(|_| SessionZoneError::Invalid)
 }
 
 // ---- Field extraction / truncation / age ---------------------------------------------
@@ -696,7 +928,15 @@ fn extract_zone_field(field: &str, offset_east_secs: i64) -> Option<f64> {
 /// wall clock, since the engine's session zone is UTC).
 #[must_use]
 pub fn extract_timestamptz_field(field: &str, micros: i64, offset_east_secs: i64) -> Option<f64> {
-    extract_zone_field(field, offset_east_secs).or_else(|| extract_from_micros(field, micros))
+    extract_zone_field(field, offset_east_secs).or_else(|| {
+        // Calendar fields read the zone-local wall clock; `epoch` alone stays the true UTC epoch.
+        let shift = if field == "epoch" {
+            0
+        } else {
+            offset_east_secs.saturating_mul(MICROS_PER_SEC)
+        };
+        extract_from_micros(field, micros.saturating_add(shift))
+    })
 }
 
 /// `EXTRACT(field FROM timetz)` for a packed `timetz`.
@@ -900,8 +1140,15 @@ pub fn extract_decimal_timestamptz_field(
     micros: i64,
     offset_east_secs: i64,
 ) -> Option<crate::numeric::Decimal> {
-    extract_decimal_zone_field(field, offset_east_secs)
-        .or_else(|| extract_decimal_from_micros(field, micros))
+    extract_decimal_zone_field(field, offset_east_secs).or_else(|| {
+        // Calendar fields read the zone-local wall clock; `epoch` alone stays the true UTC epoch.
+        let shift = if field == "epoch" {
+            0
+        } else {
+            offset_east_secs.saturating_mul(MICROS_PER_SEC)
+        };
+        extract_decimal_from_micros(field, micros.saturating_add(shift))
+    })
 }
 
 /// `EXTRACT(field FROM timetz)` as an exact `numeric`.
@@ -1854,6 +2101,101 @@ pub fn format_uuid(bytes: &[u8; 16]) -> String {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_timezone_forms_match_the_reference_engine() {
+        // Names: canonical case, offset 0.
+        assert_eq!(parse_session_timezone("utc"), Ok(("UTC".to_owned(), 0)));
+        assert_eq!(parse_session_timezone("GMT"), Ok(("GMT".to_owned(), 0)));
+        assert_eq!(
+            parse_session_timezone("etc/utc"),
+            Ok(("Etc/UTC".to_owned(), 0))
+        );
+        // A bare `±HH` is a zone-abbreviation spelling: ISO sign (east), POSIX display.
+        assert_eq!(
+            parse_session_timezone("+07"),
+            Ok(("<+07>-07".to_owned(), 7 * 3600))
+        );
+        assert_eq!(
+            parse_session_timezone("-08"),
+            Ok(("<-08>+08".to_owned(), -8 * 3600))
+        );
+        // `±HH:MM` is a POSIX offset spec: the sign is the OPPOSITE of ISO (`+` is west).
+        assert_eq!(
+            parse_session_timezone("+05:30"),
+            Ok(("+05:30".to_owned(), -(5 * 3600 + 1800)))
+        );
+        assert_eq!(
+            parse_session_timezone("-05:30"),
+            Ok(("-05:30".to_owned(), 5 * 3600 + 1800))
+        );
+        // A number is an hour count east of UTC.
+        assert_eq!(
+            parse_session_timezone("5.5"),
+            Ok(("<+05:30>-05:30".to_owned(), 5 * 3600 + 1800))
+        );
+        assert_eq!(
+            parse_session_timezone("-8"),
+            Ok(("<-08>+08".to_owned(), -8 * 3600))
+        );
+        // Errors: garbage and 4-digit offsets are invalid; an IANA name needs a tz database.
+        assert_eq!(
+            parse_session_timezone("zzz"),
+            Err(SessionZoneError::Invalid)
+        );
+        assert_eq!(
+            parse_session_timezone("+0530"),
+            Err(SessionZoneError::Invalid)
+        );
+        assert_eq!(
+            parse_session_timezone("+16"),
+            Err(SessionZoneError::Invalid)
+        );
+        assert_eq!(
+            parse_session_timezone("Asia/Jakarta"),
+            Err(SessionZoneError::NeedsTzDatabase)
+        );
+        // Every canonical form parses back to its own offset.
+        for v in ["utc", "GMT", "+07", "-08", "+05:30", "-05:30", "5.5", "-8"] {
+            let (canonical, offset) = parse_session_timezone(v).unwrap();
+            assert_eq!(
+                session_zone_offset(&canonical),
+                Some(offset),
+                "round-trip for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamptz_at_renders_and_parses_on_the_session_wall_clock() {
+        let noon = parse_timestamptz("2024-01-01 12:00:00+00").unwrap();
+        assert_eq!(format_timestamptz_at(noon, 0), "2024-01-01 12:00:00+00");
+        assert_eq!(
+            format_timestamptz_at(noon, 7 * 3600),
+            "2024-01-01 19:00:00+07"
+        );
+        assert_eq!(
+            format_timestamptz_at(noon, -(5 * 3600 + 1800)),
+            "2024-01-01 06:30:00-05:30"
+        );
+        // A missing offset is session-local wall time; an explicit offset (or Z) wins.
+        assert_eq!(
+            parse_timestamptz_at("2024-01-01 12:00:00", 7 * 3600),
+            parse_timestamptz("2024-01-01 05:00:00+00")
+        );
+        assert_eq!(
+            parse_timestamptz_at("2024-01-01 12:00:00+00", 7 * 3600),
+            Some(noon)
+        );
+        assert_eq!(
+            parse_timestamptz_at("2024-01-01 12:00:00Z", 7 * 3600),
+            Some(noon)
+        );
+        assert!(has_explicit_offset("2024-01-01 12:00:00+07"));
+        assert!(has_explicit_offset("2024-01-01 12:00:00Z"));
+        assert!(!has_explicit_offset("2024-01-01 12:00:00"));
+        assert!(!has_explicit_offset("2024-01-01"));
+    }
 
     #[test]
     fn date_round_trips() {

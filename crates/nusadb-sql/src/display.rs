@@ -24,7 +24,11 @@ pub fn value_text(v: &Value) -> String {
         Value::Date(d) => temporal::format_date(*d),
         Value::Time(t) => temporal::format_time(*t),
         Value::Timestamp(t) => temporal::format_timestamp(*t),
-        Value::TimestampTz(t) => temporal::format_timestamptz(*t),
+        // An instant renders on the session-local wall clock with the session zone's offset
+        // (`+00` under the default UTC).
+        Value::TimestampTz(t) => {
+            temporal::format_timestamptz_at(*t, crate::executor::statement_tz_offset_secs())
+        },
         Value::TimeTz(t) => temporal::format_timetz(*t),
         Value::Uuid(u) => temporal::format_uuid(u),
         Value::Macaddr(m) => crate::macaddr::format(*m),

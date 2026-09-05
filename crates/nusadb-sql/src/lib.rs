@@ -58,18 +58,19 @@ pub use batch::{
 pub use error::{Error, INTERNAL_ERROR};
 pub use executor::{
     CursorStore, ExecutionResult, PreparedStore, Row, RowSink, RowsCommand, Session, SpillConfig,
-    StreamOutcome, auto_analyze_stale_tables, catalog_approx_row_count, catalog_list_indexes,
-    catalog_table_stats, check_settable_parameter, copy_from, copy_from_in, copy_to, copy_to_in,
-    describe_column_types, describe_columns, execute, execute_in_txn, execute_in_txn_as,
-    execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_cursors,
-    execute_in_txn_as_streaming_with_prepared, execute_in_txn_as_streaming_with_settings,
-    execute_in_txn_as_with_settings, inheritance_any, inheritance_descendants,
-    inheritance_partition_fingerprint, is_cursor_plan, is_prepare_plan, lookup_composite,
-    lookup_composite_column, lookup_enum, lookup_enum_column, lookup_function_definition,
-    lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
-    maintenance_work_mem, parse_work_mem, partition_key_columns, partitions_to_prune,
-    purge_schema_catalogs, rls_table_enabled, set_maintenance_work_mem, set_spill_config,
-    set_work_mem, show_session_variable, work_mem,
+    StreamOutcome, auto_analyze_stale_tables, canonicalize_timezone_setting,
+    catalog_approx_row_count, catalog_list_indexes, catalog_table_stats, check_settable_parameter,
+    copy_from, copy_from_in, copy_to, copy_to_in, describe_column_types, describe_columns, execute,
+    execute_in_txn, execute_in_txn_as, execute_in_txn_as_streaming,
+    execute_in_txn_as_streaming_with_cursors, execute_in_txn_as_streaming_with_prepared,
+    execute_in_txn_as_streaming_with_settings, execute_in_txn_as_with_settings, inheritance_any,
+    inheritance_descendants, inheritance_partition_fingerprint, is_cursor_plan, is_prepare_plan,
+    lookup_composite, lookup_composite_column, lookup_enum, lookup_enum_column,
+    lookup_function_definition, lookup_policies_for, lookup_view_check_option, lookup_view_columns,
+    lookup_view_definition, maintenance_work_mem, parse_work_mem, partition_key_columns,
+    partitions_to_prune, pin_statement_timezone, purge_schema_catalogs, rls_table_enabled,
+    set_maintenance_work_mem, set_spill_config, set_work_mem, show_session_variable,
+    statement_tz_offset_secs, work_mem,
 };
 
 /// The bootstrap database superuser, which bypasses row-level security.

@@ -884,9 +884,10 @@ fn parse_bound(s: &str, kind: RangeKind) -> Result<Option<ast::Value>, ()> {
         RangeKind::Num => ast::Value::Numeric(crate::numeric::Decimal::parse(s).ok_or(())?),
         RangeKind::Date => ast::Value::Date(crate::temporal::parse_date(s).ok_or(())?),
         RangeKind::Ts => ast::Value::Timestamp(crate::temporal::parse_timestamp(s).ok_or(())?),
-        RangeKind::TsTz => {
-            ast::Value::TimestampTz(crate::temporal::parse_timestamptz(s).ok_or(())?)
-        },
+        RangeKind::TsTz => ast::Value::TimestampTz(
+            crate::temporal::parse_timestamptz_at(s, crate::executor::statement_tz_offset_secs())
+                .ok_or(())?,
+        ),
     };
     Ok(Some(v))
 }

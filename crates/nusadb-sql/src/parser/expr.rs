@@ -106,6 +106,23 @@ pub(super) fn convert_typed_literal(
             crate::temporal::parse_timestamp(&value).map(ast::Value::Timestamp)
         },
         ColumnType::TimestampTz => {
+            // A literal with no explicit offset is wall time in the SESSION time zone, which is
+            // not known at parse time (parsing happens before the statement's session context is
+            // pinned, and a cached plan may be replayed under a different `SET TIME ZONE`). Defer
+            // it to a runtime cast — the evaluator interprets it under the pinned zone. A literal
+            // carrying its own offset (or `Z`) is session-independent and folds here as before.
+            if !crate::temporal::has_explicit_offset(&value) {
+                // Reject a malformed literal now (same error surface as the folding path); the
+                // parse result is discarded, the cast re-parses under the session zone.
+                if crate::temporal::parse_timestamptz(&value).is_none() {
+                    return Err(Error::InvalidValue { ty, value });
+                }
+                return Ok(ast::Expr::Cast {
+                    expr: Box::new(ast::Expr::Literal(ast::Value::Text(value))),
+                    target: ColumnType::TimestampTz,
+                    try_cast: false,
+                });
+            }
             crate::temporal::parse_timestamptz(&value).map(ast::Value::TimestampTz)
         },
         ColumnType::TimeTz => crate::temporal::parse_timetz(&value).map(ast::Value::TimeTz),

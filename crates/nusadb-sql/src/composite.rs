@@ -179,7 +179,10 @@ fn parse_field(s: &str, ty: ColumnType) -> Option<ast::Value> {
         ColumnType::Time => ast::Value::Time(crate::temporal::parse_time(s)?),
         ColumnType::TimeTz => ast::Value::TimeTz(crate::temporal::parse_timetz(s)?),
         ColumnType::Timestamp => ast::Value::Timestamp(crate::temporal::parse_timestamp(s)?),
-        ColumnType::TimestampTz => ast::Value::TimestampTz(crate::temporal::parse_timestamptz(s)?),
+        ColumnType::TimestampTz => ast::Value::TimestampTz(crate::temporal::parse_timestamptz_at(
+            s,
+            crate::executor::statement_tz_offset_secs(),
+        )?),
         ColumnType::Uuid => ast::Value::Uuid(crate::temporal::parse_uuid(s)?),
         ColumnType::Macaddr => ast::Value::Macaddr(crate::macaddr::parse(s)?),
         ColumnType::Macaddr8 => ast::Value::Macaddr8(crate::macaddr8::parse(s)?),

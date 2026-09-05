@@ -935,11 +935,21 @@ where
                                     &mut shutdown,
                                     copy_from_max_bytes,
                                     &copy_actor,
+                                    settings_snapshot(&settings, &database)
+                                        .get("timezone")
+                                        .cloned(),
                                 )
                                 .await?
                             },
                             nusadb_sql::ast::CopyDirection::To => {
-                                handle_copy_out(&mut conn, &engine, copy, &copy_actor).await?
+                                handle_copy_out(
+                                    &mut conn,
+                                    &engine,
+                                    copy,
+                                    &copy_actor,
+                                    settings_snapshot(&settings, &database).get("timezone").cloned(),
+                                )
+                                .await?
                             },
                         }
                     };
@@ -1506,6 +1516,10 @@ where
 /// `CopyData` stream until `CopyDone` (or `CopyFail`), then bulk-load it. Returns the row count, or
 /// an error message to relay to the client. Wire I/O errors propagate; a load failure (bad row,
 /// constraint, client abort) returns `Err(message)` without tearing down the connection.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the COPY sub-protocol's per-statement context (connection, engine, statement,               timeouts, size cap, actor, session zone) — each a distinct concern"
+)]
 async fn handle_copy_in<S>(
     conn: &mut Connection<S>,
     engine: &Arc<dyn StorageEngine>,
@@ -1514,6 +1528,7 @@ async fn handle_copy_in<S>(
     shutdown: &mut Option<watch::Receiver<bool>>,
     max_bytes: Option<usize>,
     actor: &str,
+    timezone: Option<String>,
 ) -> io::Result<Result<usize, String>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1570,6 +1585,9 @@ where
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
     let result = tokio::task::spawn_blocking(move || {
+        // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
+        // a `timestamptz` field with no explicit offset is read as session-local wall time.
+        nusadb_sql::pin_statement_timezone(timezone.as_deref());
         // The access check runs in the SAME transaction as the load, so a REVOKE that lands after
         // the pre-upload fast-fail check still bites — there is no window between "allowed" and
         // "written" for a concurrent change to slip through.
@@ -1613,6 +1631,7 @@ async fn handle_copy_out<S>(
     engine: &Arc<dyn StorageEngine>,
     copy: nusadb_sql::ast::Copy,
     actor: &str,
+    timezone: Option<String>,
 ) -> io::Result<Result<usize, String>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1621,6 +1640,9 @@ where
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
     let rendered = tokio::task::spawn_blocking(move || {
+        // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
+        // `timestamptz` fields render on the session-local wall clock like every other output.
+        nusadb_sql::pin_statement_timezone(timezone.as_deref());
         // Check and render in one transaction, so the rows streamed out are exactly the ones the
         // access check was evaluated against.
         let txn = engine
@@ -3838,10 +3860,18 @@ fn apply_set_variable(
     nusadb_sql::check_settable_parameter(&sv.name)?;
     // A parameter name is case-insensitive; store it folded so it reaches the slot the engine
     // reads (a quoted `"TimeZone"` keeps its case through the parser).
-    let sv = nusadb_sql::ast::SetVariable {
+    let mut sv = nusadb_sql::ast::SetVariable {
         name: sv.name.to_ascii_lowercase(),
         ..sv
     };
+    // `timezone` is validated and canonicalized at SET time (shared logic with the embedded
+    // session): the stored form is what `SHOW timezone` reports and what every zone-dependent
+    // temporal path parses back, so an unusable value is refused loudly here.
+    if sv.name == "timezone"
+        && let Some(value) = &sv.value
+    {
+        sv.value = Some(nusadb_sql::canonicalize_timezone_setting(value)?);
+    }
     if sv
         .name
         .eq_ignore_ascii_case("default_transaction_isolation")
@@ -4382,6 +4412,10 @@ struct EngineCatalog<'a> {
     /// the session context is pinned, so the catalog reads it from its own settings rather than the
     /// thread-local — otherwise a temp table would be invisible to the statement that queries it.
     temp_schema: Option<String>,
+    /// The connection's `timezone` setting (canonical form), forwarded to the analyzer so
+    /// plan-time constant evaluation pins THIS connection's zone (the thread-local session
+    /// context may hold another connection's on a reused pool thread).
+    timezone: Option<String>,
     /// The resolved session (effective roles + superuser flag), computed once and reused for every
     /// privilege question this statement asks. A fresh `EngineCatalog` is built per statement over a
     /// fixed transaction snapshot, so the cache is exactly statement-scoped and never outlives the
@@ -4404,12 +4438,14 @@ impl<'a> EngineCatalog<'a> {
         let temp_schema = settings
             .get(nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING)
             .cloned();
+        let timezone = settings.get("timezone").cloned();
         Self {
             engine,
             txn,
             user,
             search_path,
             temp_schema,
+            timezone,
             resolved: std::cell::RefCell::new(None),
         }
     }
@@ -4435,6 +4471,10 @@ impl Catalog for EngineCatalog<'_> {
 
     fn temp_schema(&self) -> Option<String> {
         self.temp_schema.clone()
+    }
+
+    fn session_timezone(&self) -> Option<String> {
+        self.timezone.clone()
     }
 
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
@@ -4788,7 +4828,13 @@ fn value_to_field(value: Value) -> Option<Vec<u8>> {
         Value::Date(d) => Some(nusadb_sql::temporal::format_date(d).into_bytes()),
         Value::Time(t) => Some(nusadb_sql::temporal::format_time(t).into_bytes()),
         Value::Timestamp(t) => Some(nusadb_sql::temporal::format_timestamp(t).into_bytes()),
-        Value::TimestampTz(t) => Some(nusadb_sql::temporal::format_timestamptz(t).into_bytes()),
+        // An instant renders on the session-local wall clock, with the session zone's offset
+        // (`+00` under the default UTC). The pinned zone belongs to this statement: encoding runs
+        // on the same blocking task that executed it.
+        Value::TimestampTz(t) => Some(
+            nusadb_sql::temporal::format_timestamptz_at(t, nusadb_sql::statement_tz_offset_secs())
+                .into_bytes(),
+        ),
         Value::TimeTz(t) => Some(nusadb_sql::temporal::format_timetz(t).into_bytes()),
         Value::Uuid(u) => Some(nusadb_sql::temporal::format_uuid(&u).into_bytes()),
         Value::Macaddr(m) => Some(nusadb_sql::macaddr::format(m).into_bytes()),

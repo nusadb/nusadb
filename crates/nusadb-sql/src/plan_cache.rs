@@ -188,6 +188,13 @@ impl Catalog for RecordingCatalog<'_> {
         self.inner.temp_schema()
     }
 
+    fn session_timezone(&self) -> Option<String> {
+        // Forward the session time zone for the same reason as `temp_schema`: the default reads
+        // the thread-local session context, which is stale on a reused pool thread — the analyzer
+        // must pin THIS connection's zone before folding temporal constants.
+        self.inner.session_timezone()
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, Error> {
         let view = self.inner.lookup_view(name)?;
         if view.is_some() {
@@ -562,6 +569,13 @@ fn cache_key(catalog: &dyn Catalog, sql: &str) -> String {
     for schema in catalog.search_path() {
         key.push_str(&schema);
         key.push('\u{1}');
+    }
+    // The session time zone joins the key: a plan may fold a zone-dependent temporal constant
+    // (`TIMESTAMPTZ '…'` with no offset, a `timestamptz` wall-clock cast), so a session that ran
+    // `SET TIME ZONE` must miss and re-plan under the new zone rather than be served instants
+    // interpreted under the old one.
+    if let Some(tz) = catalog.session_timezone() {
+        key.push_str(&tz);
     }
     key.push('\u{0}');
     key.push_str(sql);

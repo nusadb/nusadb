@@ -8826,7 +8826,14 @@ fn b450_clock_functions_end_to_end() {
                 rows[0][2],
                 Value::Date(i32::try_from(micros.div_euclid(micros_per_day)).unwrap())
             );
-            assert_eq!(rows[0][3], Value::Time(micros.rem_euclid(micros_per_day)));
+            // CURRENT_TIME is a `timetz` carrying the session zone (UTC by default here).
+            assert_eq!(
+                rows[0][3],
+                Value::TimeTz(nusadb_sql::temporal::pack_timetz(
+                    micros.rem_euclid(micros_per_day),
+                    0
+                ))
+            );
         },
         other => panic!("expected rows, got {other:?}"),
     }

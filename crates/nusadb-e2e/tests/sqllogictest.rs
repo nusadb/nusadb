@@ -54,6 +54,9 @@ struct SltCatalog<'a> {
     /// The session's ordered `search_path` schemas (from `SET search_path`), so a bare name resolves
     /// through them in order before `public`.
     search_path: Vec<String>,
+    /// The session's `timezone` setting, handed to the analyzer's pin explicitly — statements may
+    /// run on different runner threads, so the thread-local default cannot be trusted here.
+    timezone: Option<String>,
 }
 
 impl SltCatalog<'_> {
@@ -90,6 +93,10 @@ impl Catalog for SltCatalog<'_> {
 
     fn search_path(&self) -> Vec<String> {
         self.search_path.clone()
+    }
+
+    fn session_timezone(&self) -> Option<String> {
+        self.timezone.clone()
     }
 
     fn list_indexes(&self, name: &str) -> Result<Vec<IndexInfo>, nusadb_sql::Error> {
@@ -275,6 +282,7 @@ impl sqllogictest::DB for SltConnection {
             engine: self.engine,
             txn: self.session.current_txn(),
             search_path: self.session.search_path(),
+            timezone: self.session.session_timezone(),
         };
         let logical = analyze(stmt, &catalog)?;
         let physical = plan(logical);
@@ -422,7 +430,11 @@ fn format_value(v: &Value) -> String {
         Value::Date(d) => temporal::format_date(*d),
         Value::Time(t) => temporal::format_time(*t),
         Value::Timestamp(t) => temporal::format_timestamp(*t),
-        Value::TimestampTz(t) => temporal::format_timestamptz(*t),
+        // An instant renders on the session-local wall clock (`+00` under the default UTC),
+        // matching the engine's own display path.
+        Value::TimestampTz(t) => {
+            temporal::format_timestamptz_at(*t, nusadb_sql::statement_tz_offset_secs())
+        },
         Value::TimeTz(t) => temporal::format_timetz(*t),
         Value::Uuid(u) => temporal::format_uuid(u),
         Value::Macaddr(m) => nusadb_sql::macaddr::format(*m),
@@ -815,6 +827,11 @@ fn slt_p10_row_composite() {
 #[test]
 fn slt_p10_enum_cross_type() {
     run_slt("tests/slt/p10_types/enum_cross_type.slt");
+}
+
+#[test]
+fn slt_p10_session_timezone() {
+    run_slt("tests/slt/p10_types/session_timezone.slt");
 }
 
 #[test]

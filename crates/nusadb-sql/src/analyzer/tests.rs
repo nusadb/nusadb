@@ -2145,7 +2145,8 @@ fn clock_functions_resolve_to_temporal_types() {
         ("SELECT NOW()", ColumnType::TimestampTz),
         ("SELECT CURRENT_TIMESTAMP", ColumnType::TimestampTz),
         ("SELECT CURRENT_DATE", ColumnType::Date),
-        ("SELECT CURRENT_TIME", ColumnType::Time),
+        // CURRENT_TIME carries the session zone, like the reference engine.
+        ("SELECT CURRENT_TIME", ColumnType::TimeTz),
     ] {
         let LogicalPlan::Select(p) = plan(sql, &MockCatalog::new()).unwrap() else {
             panic!("expected Select plan for `{sql}`");

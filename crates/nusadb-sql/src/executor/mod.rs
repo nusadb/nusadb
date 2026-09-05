@@ -46,6 +46,39 @@ pub(crate) fn current_temp_schema() -> Option<String> {
     session_ctx::current_temp_schema()
 }
 pub use session_ctx::check_settable_parameter;
+pub use session_ctx::{pin_statement_timezone, statement_tz_offset_secs};
+
+/// The pinned session's canonical `timezone` setting, if one is set — wrapped like
+/// [`current_temp_schema`] so the `session_ctx` module stays private to the executor.
+pub(crate) fn current_timezone_setting() -> Option<String> {
+    session_ctx::current_timezone_setting()
+}
+
+/// Validate a `SET timezone` / `SET TIME ZONE` value and return the canonical form to store.
+///
+/// The canonical form is exactly what `SHOW timezone` then reports and what the zone-dependent
+/// temporal paths parse back. Shared by the embedded session and the wire server so the two
+/// cannot drift.
+///
+/// # Errors
+/// `0A000` for an IANA-style region name (this engine carries no time-zone database) and `22023`
+/// for a value that names no zone at all.
+pub fn canonicalize_timezone_setting(value: &str) -> Result<String, Error> {
+    match crate::temporal::parse_session_timezone(value) {
+        Ok((canonical, _)) => Ok(canonical),
+        Err(crate::temporal::SessionZoneError::NeedsTzDatabase) => {
+            Err(Error::Unsupported(format!(
+                "time zone \"{value}\" is a region name, which needs a time-zone database this \
+                 engine does not carry — supported: UTC, GMT, and fixed offsets (e.g. '+07', \
+                 '-05:30', or a numeric hour count)"
+            )))
+        },
+        Err(crate::temporal::SessionZoneError::Invalid) => Err(Error::Coded {
+            message: format!("invalid value for parameter \"TimeZone\": \"{value}\""),
+            sqlstate: "22023", // invalid_parameter_value
+        }),
+    }
+}
 mod stats;
 
 // Operator submodules (ADR 007), glob-re-exported below. agg/join remain stubs whose operators
@@ -850,6 +883,7 @@ pub fn execute_in_txn_as_streaming_with_prepared(
                 search_path: crate::search_path_schemas(
                     settings.get("search_path").map(String::as_str),
                 ),
+                timezone: settings.get("timezone").cloned(),
             };
             let logical = crate::analyze(bound, &catalog)?;
             let physical = crate::plan(logical);
@@ -1513,6 +1547,14 @@ impl<'engine> Session<'engine> {
         crate::search_path_schemas(self.variables.get("search_path").map(String::as_str))
     }
 
+    /// The session's `timezone` setting in canonical form, if set — for a caller that analyzes
+    /// statements itself and must hand [`Catalog::session_timezone`](crate::Catalog) the value of
+    /// THIS session (the thread-local default lags on a fresh or shared thread).
+    #[must_use]
+    pub fn session_timezone(&self) -> Option<String> {
+        self.variables.get("timezone").cloned()
+    }
+
     /// Execute one plan in this session's transaction context.
     pub fn execute(&mut self, plan: PhysicalPlan) -> Result<ExecutionResult, Error> {
         // A read-only `SELECT` in auto-commit may be served from / stored in the result cache.
@@ -1748,6 +1790,7 @@ impl<'engine> Session<'engine> {
             txn,
             user: &self.current_user,
             search_path: self.search_path(),
+            timezone: self.variables.get("timezone").cloned(),
         };
         let logical = crate::analyze(stmt, &catalog)?;
         let physical = crate::plan(logical);
@@ -1890,6 +1933,15 @@ impl<'engine> Session<'engine> {
                 ),
                 sqlstate: "22023", // invalid_parameter_value
             });
+        }
+        // `timezone` is validated and canonicalized at SET time: the stored form is exactly what
+        // `SHOW timezone` reports and what the zone-dependent temporal paths parse back, so an
+        // unusable value must be refused here rather than silently rendering everything in UTC.
+        let mut value = value;
+        if name == "timezone"
+            && let Some(v) = &value
+        {
+            value = Some(canonicalize_timezone_setting(v)?);
         }
         let is_search_path = name == "search_path";
         match value {
@@ -4516,6 +4568,10 @@ struct SessionCatalog<'a> {
     /// in a re-analyzed statement (`EXECUTE`, a direct [`Session`] call) resolves through them in
     /// order before `public`.
     search_path: Vec<String>,
+    /// The session's `timezone` setting, handed to the analyzer's pin explicitly — the thread-local
+    /// default would lag one statement behind a `SET TIME ZONE` (it is re-pinned only when the
+    /// NEXT statement executes, after this analysis).
+    timezone: Option<String>,
 }
 
 impl crate::Catalog for SessionCatalog<'_> {
@@ -4533,6 +4589,10 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn search_path(&self) -> Vec<String> {
         self.search_path.clone()
+    }
+
+    fn session_timezone(&self) -> Option<String> {
+        self.timezone.clone()
     }
 
     fn list_indexes(&self, table: &str) -> Result<Vec<crate::IndexInfo>, Error> {

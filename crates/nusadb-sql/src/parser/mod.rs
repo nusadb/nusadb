@@ -5049,8 +5049,76 @@ fn convert_set_statement(set: sql::Set) -> Result<ast::Statement, Error> {
         sql::Set::ParenthesizedAssignments { .. } | sql::Set::MultipleAssignments { .. } => {
             unsupported("SET with multiple variables")
         },
+        sql::Set::SetTimeZone { local, value } => convert_set_time_zone(local, &value),
         other => unsupported(&format!("SET statement `{other}`")),
     }
+}
+
+/// Convert `SET TIME ZONE <value>` — an alias for `SET timezone TO <value>`. `LOCAL` and
+/// `DEFAULT` both reset to the session default; a string passes through verbatim (the executor
+/// validates it), a number is the hour count east of UTC, and an `INTERVAL` is converted to that
+/// hour count (so its ISO sign survives the trip — a `±HH:MM` *string* means the opposite,
+/// POSIX-signed zone).
+fn convert_set_time_zone(local: bool, value: &sql::Expr) -> Result<ast::Statement, Error> {
+    fn set_tz(value: Option<String>) -> ast::Statement {
+        ast::Statement::SetVariable(ast::SetVariable {
+            name: "timezone".to_owned(),
+            value,
+        })
+    }
+    if local {
+        return Ok(set_tz(None));
+    }
+    let rendered = match value {
+        // `LOCAL` and `DEFAULT` both reset to the session default (sqlparser hands `LOCAL`
+        // through as a bare identifier value rather than via its `local` flag).
+        sql::Expr::Identifier(id)
+            if id.value.eq_ignore_ascii_case("default")
+                || id.value.eq_ignore_ascii_case("local") =>
+        {
+            return Ok(set_tz(None));
+        },
+        // `SET TIME ZONE -8` — a negated hour count.
+        sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Minus,
+            expr,
+        } => format!("-{}", set_value_text(expr)?),
+        sql::Expr::Interval(iv) => {
+            // The interval value is a plain literal here (`INTERVAL '+07:00' HOUR TO MINUTE`).
+            // An `HH:MM`-shaped body already names its own units, so the leading field is only
+            // appended to a bare number — `convert_interval` would append it unconditionally.
+            let sql::Expr::Value(v) = &*iv.value else {
+                return unsupported("SET TIME ZONE INTERVAL with a non-literal value");
+            };
+            let raw = match &v.value {
+                sql::Value::SingleQuotedString(s) => s.clone(),
+                sql::Value::Number(n, _) => n.clone(),
+                other => return unsupported(&format!("SET TIME ZONE INTERVAL `{other}`")),
+            };
+            let text = match iv.leading_field {
+                Some(ref field) if !raw.contains(':') && !raw.trim().contains(' ') => {
+                    format!("{raw} {}", expr::interval_field_unit(field))
+                },
+                _ => raw,
+            };
+            let parsed = crate::interval::Interval::parse(&text).ok_or(Error::InvalidValue {
+                ty: nusadb_core::ColumnType::Interval,
+                value: text,
+            })?;
+            if parsed.months != 0 {
+                return unsupported("SET TIME ZONE INTERVAL with a months component");
+            }
+            let minutes = (i64::from(parsed.days) * 86_400_000_000 + parsed.micros) / 60_000_000;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a zone displacement is a handful of hours; minutes fit f64 exactly"
+            )]
+            let hours = minutes as f64 / 60.0;
+            format!("{hours}")
+        },
+        other => set_value_text(other)?,
+    };
+    Ok(set_tz(Some(rendered)))
 }
 
 fn convert_set_variable(

@@ -570,10 +570,26 @@ fn eval_scalar_function(
         F::Now | F::CurrentTimestamp | F::StatementTimestamp => {
             return Ok(ast::Value::TimestampTz(super::clock::statement_now_micros()));
         },
-        F::CurrentDate => return Ok(ast::Value::Date(super::clock::statement_today())),
-        F::CurrentTime => return Ok(ast::Value::Time(super::clock::statement_time_of_day())),
+        // The calendar-reading clock built-ins observe the session-local wall clock (the pinned
+        // instant shifted by the session zone); `CURRENT_TIME` carries the zone (a `timetz`).
+        F::CurrentDate => {
+            let wall = super::clock::statement_now_micros().saturating_add(session_zone_micros());
+            let days = wall.div_euclid(super::clock::MICROS_PER_DAY);
+            return Ok(ast::Value::Date(
+                i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX }),
+            ));
+        },
+        F::CurrentTime => {
+            let wall = super::clock::statement_now_micros().saturating_add(session_zone_micros());
+            return Ok(ast::Value::TimeTz(crate::temporal::pack_timetz(
+                wall.rem_euclid(super::clock::MICROS_PER_DAY),
+                super::statement_tz_offset_secs(),
+            )));
+        },
         F::LocalTimestamp => {
-            return Ok(ast::Value::Timestamp(super::clock::statement_now_micros()));
+            return Ok(ast::Value::Timestamp(
+                super::clock::statement_now_micros().saturating_add(session_zone_micros()),
+            ));
         },
         // The niladic session-user built-ins read the statement's pinned session user.
         F::CurrentUser | F::SessionUser => {
@@ -1087,7 +1103,7 @@ fn eval_scalar_function(
         },
         (F::MakeTimestamptz, [Int(y), Int(mo), Int(d), Int(h), Int(mi), Int(s)]) => {
             crate::temporal::make_timestamp(*y, *mo, *d, *h, *mi, *s)
-                .map(ast::Value::TimestampTz)
+                .map(|wall| ast::Value::TimestampTz(wall.saturating_sub(session_zone_micros())))
                 .ok_or_else(|| {
                     Error::DatetimeOverflow(format!(
                         "make_timestamptz(): {y}-{mo}-{d} {h}:{mi}:{s} is not valid"
@@ -1572,7 +1588,9 @@ fn extract_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
         // error, like the reference engine). The `tz` variants read the offset — the session zone is
         // UTC, so a `timestamptz` instant carries a zero offset.
         V::Timestamp(m) => crate::temporal::extract_from_micros(field, *m),
-        V::TimestampTz(m) => crate::temporal::extract_timestamptz_field(field, *m, 0),
+        V::TimestampTz(m) => {
+            crate::temporal::extract_timestamptz_field(field, *m, super::statement_tz_offset_secs())
+        },
         V::Time(t) => crate::temporal::extract_time_field(field, *t),
         V::TimeTz(packed) => crate::temporal::extract_timetz_field(field, *packed),
         V::Interval(iv) => crate::temporal::extract_interval_field(
@@ -1605,7 +1623,11 @@ fn extract_decimal_value(field: &str, src: &ast::Value) -> Result<ast::Value, Er
         V::Date(days) => super::clock::day_start_micros(*days)
             .and_then(|micros| crate::temporal::extract_decimal_from_micros(field, micros)),
         V::Timestamp(m) => crate::temporal::extract_decimal_from_micros(field, *m),
-        V::TimestampTz(m) => crate::temporal::extract_decimal_timestamptz_field(field, *m, 0),
+        V::TimestampTz(m) => crate::temporal::extract_decimal_timestamptz_field(
+            field,
+            *m,
+            super::statement_tz_offset_secs(),
+        ),
         V::Time(t) => crate::temporal::extract_decimal_time_field(field, *t),
         V::TimeTz(packed) => crate::temporal::extract_decimal_timetz_field(field, *packed),
         V::Interval(iv) => crate::temporal::extract_decimal_interval_field(
@@ -1626,14 +1648,19 @@ fn extract_decimal_value(field: &str, src: &ast::Value) -> Result<ast::Value, Er
 /// `DATE_TRUNC(field, src)` — `src` floored to the named precision, preserving its temporal type.
 fn date_trunc_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> {
     use ast::Value as V;
+    // A `timestamptz` truncates on the session-local wall clock (shift in, truncate, shift
+    // back), so a day/hour boundary is the session zone's, not UTC's.
     let (micros, is_tz) = match src {
         V::Timestamp(m) => (*m, false),
         V::TimestampTz(m) => (*m, true),
         _ => return Ok(V::Null),
     };
-    let truncated = crate::temporal::date_trunc_micros(field, micros).ok_or_else(|| {
-        Error::InvalidParameterValue(format!("DATE_TRUNC field `{field}` is not supported"))
-    })?;
+    let shift = if is_tz { session_zone_micros() } else { 0 };
+    let truncated = crate::temporal::date_trunc_micros(field, micros.saturating_add(shift))
+        .ok_or_else(|| {
+            Error::InvalidParameterValue(format!("DATE_TRUNC field `{field}` is not supported"))
+        })?
+        .saturating_sub(shift);
     Ok(if is_tz {
         V::TimestampTz(truncated)
     } else {
@@ -1647,10 +1674,15 @@ fn age_value(end: &ast::Value, start: Option<&ast::Value>) -> Result<ast::Value,
     let (end_micros, start_micros) = if let Some(start) = start {
         (temporal_to_micros(end)?, temporal_to_micros(start)?)
     } else {
-        let today_midnight = super::clock::day_start_micros(super::clock::statement_today())
-            .ok_or_else(|| {
-                Error::DatetimeOverflow("AGE(): statement date out of range".to_owned())
-            })?;
+        // "Today" is the session zone's calendar day (like CURRENT_DATE), at its midnight.
+        let wall_now = super::clock::statement_now_micros().saturating_add(session_zone_micros());
+        let today = {
+            let days = wall_now.div_euclid(super::clock::MICROS_PER_DAY);
+            i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX })
+        };
+        let today_midnight = super::clock::day_start_micros(today).ok_or_else(|| {
+            Error::DatetimeOverflow("AGE(): statement date out of range".to_owned())
+        })?;
         (today_midnight, temporal_to_micros(end)?)
     };
     let (months, days, micros) = crate::temporal::calendar_age(end_micros, start_micros);
@@ -1703,6 +1735,13 @@ fn at_time_zone_value(value: &ast::Value, zone: &ast::Value) -> Result<ast::Valu
     }
 }
 
+/// The session time zone's east-of-UTC shift in microseconds — added to a `timestamptz` UTC
+/// instant to obtain the session-local wall clock that every calendar-reading operation (cast,
+/// `EXTRACT`, `DATE_TRUNC`, `TO_CHAR`, `AGE`, the niladic clock functions) observes.
+fn session_zone_micros() -> i64 {
+    super::statement_tz_offset_secs() * 1_000_000
+}
+
 /// The east-of-UTC offset in microseconds for an `AT TIME ZONE` zone string: `0` for `UTC`/`GMT`/`Z`
 /// (case-insensitive), else the offset of the fixed-offset zone the string names, or `None` for a
 /// named DST zone (which would need a time-zone database).
@@ -1742,7 +1781,9 @@ fn temporal_to_micros(v: &ast::Value) -> Result<i64, Error> {
     match v {
         V::Date(days) => super::clock::day_start_micros(*days)
             .ok_or_else(|| Error::DatetimeOverflow("AGE(): date out of range".to_owned())),
-        V::Timestamp(m) | V::TimestampTz(m) => Ok(*m),
+        V::Timestamp(m) => Ok(*m),
+        // An instant is read on the session-local wall clock — AGE compares calendar fields.
+        V::TimestampTz(m) => Ok(m.saturating_add(session_zone_micros())),
         _ => Err(Error::FunctionArgs(
             "AGE() requires a date or timestamp argument".to_owned(),
         )),
@@ -1765,7 +1806,9 @@ fn to_char_value(value: &ast::Value, fmt: &str) -> ast::Value {
     }
     let micros = match value {
         V::Date(days) => super::clock::day_start_micros(*days),
-        V::Timestamp(m) | V::TimestampTz(m) => Some(*m),
+        V::Timestamp(m) => Some(*m),
+        // An instant renders its session-local wall-clock fields.
+        V::TimestampTz(m) => Some(m.saturating_add(session_zone_micros())),
         V::Time(t) => Some(*t),
         _ => None,
     };
@@ -2084,15 +2127,17 @@ fn to_date_value(text: &str, fmt: &str) -> Result<ast::Value, Error> {
     Ok(ast::Value::Date(days))
 }
 
-/// `TO_TIMESTAMP(text, fmt)` — parse `text` per `fmt` into a `TIMESTAMPTZ` (the instant read in the
-/// session zone, fixed at UTC here), matching the reference engine.
+/// `TO_TIMESTAMP(text, fmt)` — parse `text` per `fmt` into a `TIMESTAMPTZ`: the parsed wall time
+/// is read as being in the session zone, matching the reference engine.
 fn to_timestamp_value(text: &str, fmt: &str) -> Result<ast::Value, Error> {
     let micros =
         crate::temporal::parse_with_pattern(text, fmt).ok_or_else(|| Error::InvalidValue {
             ty: nusadb_core::ColumnType::TimestampTz,
             value: text.to_owned(),
         })?;
-    Ok(ast::Value::TimestampTz(micros))
+    Ok(ast::Value::TimestampTz(
+        micros.saturating_sub(session_zone_micros()),
+    ))
 }
 
 /// `to_timestamp(epoch_seconds)` — a UNIX epoch (seconds since 1970-01-01 UTC, fractional allowed)
@@ -4672,9 +4717,11 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Text(s), ColumnType::Timestamp) => crate::temporal::parse_timestamp(s)
             .map(ast::Value::Timestamp)
             .ok_or_else(|| invalid_cast(s, ColumnType::Timestamp)),
-        (ast::Value::Text(s), ColumnType::TimestampTz) => crate::temporal::parse_timestamptz(s)
-            .map(ast::Value::TimestampTz)
-            .ok_or_else(|| invalid_cast(s, ColumnType::TimestampTz)),
+        (ast::Value::Text(s), ColumnType::TimestampTz) => {
+            crate::temporal::parse_timestamptz_at(s, super::statement_tz_offset_secs())
+                .map(ast::Value::TimestampTz)
+                .ok_or_else(|| invalid_cast(s, ColumnType::TimestampTz))
+        },
         (ast::Value::Text(s), ColumnType::Uuid) => crate::temporal::parse_uuid(s)
             .map(ast::Value::Uuid)
             .ok_or_else(|| invalid_cast(s, ColumnType::Uuid)),
@@ -4747,9 +4794,9 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Timestamp(t), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::temporal::format_timestamp(*t)))
         },
-        (ast::Value::TimestampTz(t), ColumnType::Text) => {
-            Ok(ast::Value::Text(crate::temporal::format_timestamptz(*t)))
-        },
+        (ast::Value::TimestampTz(t), ColumnType::Text) => Ok(ast::Value::Text(
+            crate::temporal::format_timestamptz_at(*t, super::statement_tz_offset_secs()),
+        )),
         (ast::Value::Uuid(u), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::temporal::format_uuid(u)))
         },
@@ -4767,26 +4814,39 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         // (floor of whole days since the epoch) and TIME-of-day (micros within the day); a DATE
         // widens to midnight. `div_euclid`/`rem_euclid` floor toward negative infinity so dates
         // before the epoch land on the correct day with a non-negative time-of-day.
-        // TIMESTAMP ↔ TIMESTAMPTZ. Both are micros since the epoch and the session time zone is
-        // fixed at UTC, so the instant is preserved and only the type's rendering changes: a
-        // `timestamptz` prints its `+00` offset, a `timestamp` does not.
-        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => Ok(ast::Value::Timestamp(*t)),
-        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => Ok(ast::Value::TimestampTz(*t)),
-        (ast::Value::Timestamp(t) | ast::Value::TimestampTz(t), ColumnType::Date) => {
-            i32::try_from(t.div_euclid(MICROS_PER_DAY))
+        // TIMESTAMP ↔ TIMESTAMPTZ move through the session-local wall clock: an instant becomes
+        // the wall time the session zone shows for it, and a wall time is read as being in the
+        // session zone. Under the default UTC both are the identity.
+        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => Ok(ast::Value::Timestamp(
+            t.saturating_add(session_zone_micros()),
+        )),
+        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => Ok(ast::Value::TimestampTz(
+            t.saturating_sub(session_zone_micros()),
+        )),
+        (ast::Value::Timestamp(t), ColumnType::Date) => i32::try_from(t.div_euclid(MICROS_PER_DAY))
+            .map(ast::Value::Date)
+            .map_err(|_| invalid_cast(&t.to_string(), ColumnType::Date)),
+        // An instant's date / time-of-day are its session-local wall-clock fields.
+        (ast::Value::TimestampTz(t), ColumnType::Date) => {
+            let wall = t.saturating_add(session_zone_micros());
+            i32::try_from(wall.div_euclid(MICROS_PER_DAY))
                 .map(ast::Value::Date)
-                .map_err(|_| invalid_cast(&t.to_string(), ColumnType::Date))
+                .map_err(|_| invalid_cast(&wall.to_string(), ColumnType::Date))
         },
-        (ast::Value::Timestamp(t) | ast::Value::TimestampTz(t), ColumnType::Time) => {
+        (ast::Value::Timestamp(t), ColumnType::Time) => {
             Ok(ast::Value::Time(t.rem_euclid(MICROS_PER_DAY)))
         },
+        (ast::Value::TimestampTz(t), ColumnType::Time) => Ok(ast::Value::Time(
+            t.saturating_add(session_zone_micros())
+                .rem_euclid(MICROS_PER_DAY),
+        )),
         (ast::Value::Date(d), ColumnType::Timestamp) => i64::from(*d)
             .checked_mul(MICROS_PER_DAY)
             .map(ast::Value::Timestamp)
             .ok_or_else(|| invalid_cast(&crate::temporal::format_date(*d), ColumnType::Timestamp)),
         (ast::Value::Date(d), ColumnType::TimestampTz) => i64::from(*d)
             .checked_mul(MICROS_PER_DAY)
-            .map(ast::Value::TimestampTz)
+            .map(|midnight| ast::Value::TimestampTz(midnight.saturating_sub(session_zone_micros())))
             .ok_or_else(|| {
                 invalid_cast(&crate::temporal::format_date(*d), ColumnType::TimestampTz)
             }),
@@ -8795,7 +8855,9 @@ mod tests {
     #[test]
     fn clock_functions_are_statement_stable() {
         // After pinning the statement clock, repeated reads — and the date/time split — must all
-        // agree on one instant (SQL statement stability).
+        // agree on one instant (SQL statement stability). Pin the default UTC zone: another test
+        // on this thread may have left a non-zero session-zone pin behind.
+        super::super::session_ctx::pin_statement_timezone(None);
         super::super::clock::set_statement_now();
         let now1 = eval(
             &scalar(ScalarFunc::Now, vec![], ColumnType::TimestampTz),
@@ -8822,7 +8884,7 @@ mod tests {
         )
         .unwrap();
         let time = eval(
-            &scalar(ScalarFunc::CurrentTime, vec![], ColumnType::Time),
+            &scalar(ScalarFunc::CurrentTime, vec![], ColumnType::TimeTz),
             &vec![],
         )
         .unwrap();
@@ -8832,7 +8894,14 @@ mod tests {
             date,
             Value::Date(i32::try_from(micros.div_euclid(micros_per_day)).unwrap())
         );
-        assert_eq!(time, Value::Time(micros.rem_euclid(micros_per_day)));
+        // CURRENT_TIME is a `timetz` carrying the session zone (UTC here).
+        assert_eq!(
+            time,
+            Value::TimeTz(crate::temporal::pack_timetz(
+                micros.rem_euclid(micros_per_day),
+                0
+            ))
+        );
     }
 
     // ----- math functions -----

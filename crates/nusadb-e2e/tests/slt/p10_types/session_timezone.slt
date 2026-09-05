@@ -1,0 +1,159 @@
+# SET TIME ZONE / SET timezone — the session time zone for `timestamptz`. Supported zones:
+# UTC/GMT and fixed offsets (a bare `±HH` abbreviation is ISO-signed east; a `±HH:MM` POSIX spec
+# is the opposite sign; a number or INTERVAL is an hour count east). An IANA region name is
+# refused loudly (no time-zone database). Every calendar-reading operation observes the zone.
+
+statement ok
+SET TIME ZONE 'UTC'
+
+query T
+SHOW timezone
+----
+UTC
+
+query T
+SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00'::text
+----
+2024-01-01 12:00:00+00
+
+statement ok
+SET TIME ZONE '+07'
+
+query T
+SHOW timezone
+----
+<+07>-07
+
+# Rendering shifts to the session wall clock; input with no offset is read in the session zone.
+query T
+SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00'::text
+----
+2024-01-01 19:00:00+07
+
+query T
+SELECT TIMESTAMPTZ '2024-01-01 12:00:00'::text
+----
+2024-01-01 12:00:00+07
+
+query T
+SELECT '2024-01-01 12:00:00'::timestamptz::text
+----
+2024-01-01 12:00:00+07
+
+# Wall-clock casts and calendar fields observe the zone; epoch stays the true UTC epoch.
+query T
+SELECT (TIMESTAMPTZ '2024-01-01 12:00:00+00')::timestamp::text
+----
+2024-01-01 19:00:00
+
+query T
+SELECT (TIMESTAMPTZ '2024-01-01 20:00:00+00')::date::text
+----
+2024-01-02
+
+query I
+SELECT EXTRACT(hour FROM TIMESTAMPTZ '2024-01-01 20:30:00+00')
+----
+3
+
+query I
+SELECT EXTRACT(timezone FROM TIMESTAMPTZ '2024-01-01 00:00:00')
+----
+25200
+
+query T
+SELECT EXTRACT(epoch FROM TIMESTAMPTZ '1970-01-01 00:00:00+00')::text
+----
+0.000000
+
+query T
+SELECT date_trunc('day', TIMESTAMPTZ '2024-01-01 20:30:00+00')::text
+----
+2024-01-02 00:00:00+07
+
+query T
+SELECT to_char(TIMESTAMPTZ '2024-01-01 20:30:00+00', 'YYYY-MM-DD HH24:MI')
+----
+2024-01-02 03:30
+
+# The POSIX `±HH:MM` string form flips the sign (`+05:30` is 5½ hours WEST).
+statement ok
+SET timezone = '+05:30'
+
+query T
+SHOW timezone
+----
++05:30
+
+query T
+SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00'::text
+----
+2024-01-01 06:30:00-05:30
+
+# A number of hours east; INTERVAL likewise (both canonicalize to the POSIX display).
+statement ok
+SET TIME ZONE 5.5
+
+query T
+SHOW timezone
+----
+<+05:30>-05:30
+
+statement ok
+SET TIME ZONE INTERVAL '+07:00' HOUR TO MINUTE
+
+query T
+SHOW timezone
+----
+<+07>-07
+
+# LOCAL / DEFAULT / RESET all restore the default (UTC).
+statement ok
+SET TIME ZONE LOCAL
+
+query T
+SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00'::text
+----
+2024-01-01 12:00:00+00
+
+statement ok
+SET TIME ZONE '-08'
+
+statement ok
+RESET timezone
+
+query T
+SHOW timezone
+----
+UTC
+
+# A value naming no zone is refused; an IANA region name is refused loudly (no tz database).
+statement error invalid value for parameter "TimeZone"
+SET TIME ZONE 'zzz'
+
+statement error invalid value for parameter "TimeZone"
+SET TIME ZONE '+0530'
+
+statement error time-zone database
+SET TIME ZONE 'Asia/Jakarta'
+
+# A stored timestamptz is an instant: written under one zone, it reads back shifted in another.
+statement ok
+CREATE TABLE tz_t (id INT PRIMARY KEY, at TIMESTAMPTZ)
+
+statement ok
+SET TIME ZONE '+07'
+
+statement ok
+INSERT INTO tz_t VALUES (1, '2024-01-01 12:00:00')
+
+statement ok
+SET TIME ZONE 'UTC'
+
+query T
+SELECT at::text FROM tz_t
+----
+2024-01-01 05:00:00+00
+
+statement ok
+DROP TABLE tz_t

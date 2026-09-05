@@ -393,7 +393,11 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             out.extend_from_slice(&t.to_le_bytes());
         },
         (ast::Value::Text(s), ColumnType::TimestampTz) => {
-            let t = crate::temporal::parse_timestamptz(s).ok_or_else(|| invalid(ty, s))?;
+            let t = crate::temporal::parse_timestamptz_at(
+                s,
+                crate::executor::statement_tz_offset_secs(),
+            )
+            .ok_or_else(|| invalid(ty, s))?;
             out.extend_from_slice(&t.to_le_bytes());
         },
         (ast::Value::Text(s), ColumnType::Uuid) => {

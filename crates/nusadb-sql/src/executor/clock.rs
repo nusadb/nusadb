@@ -41,18 +41,6 @@ pub(super) fn statement_now_micros() -> i64 {
     })
 }
 
-/// Days since the Unix epoch (proleptic Gregorian) for the pinned statement instant. Floored, so a
-/// pre-epoch instant lands on the calendar day that contains it.
-pub(super) fn statement_today() -> i32 {
-    let days = statement_now_micros().div_euclid(MICROS_PER_DAY);
-    i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX })
-}
-
-/// Microseconds since midnight for the pinned statement instant, always in `[0, MICROS_PER_DAY)`.
-pub(super) fn statement_time_of_day() -> i64 {
-    statement_now_micros().rem_euclid(MICROS_PER_DAY)
-}
-
 /// Microseconds since the epoch at midnight of `days` (days since the epoch). `None` on overflow —
 /// only reachable for dates near the i64 micros limit (year ~294247), never for realistic data.
 pub(super) fn day_start_micros(days: i32) -> Option<i64> {

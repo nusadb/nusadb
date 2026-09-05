@@ -101,6 +101,15 @@ pub trait Catalog {
         crate::executor::current_temp_schema()
     }
 
+    /// The session's `timezone` setting in its canonical stored form, if the session carries one
+    /// (`None` = UTC). [`analyze`] pins it for the statement so plan-time constant evaluation and
+    /// the plan cache observe the same zone the executor will. Default reads the executor session
+    /// context (the embedded path, whose pin persists across its statements); the wire adapter
+    /// overrides it from the connection's settings snapshot.
+    fn session_timezone(&self) -> Option<String> {
+        crate::executor::current_timezone_setting()
+    }
+
     /// The secondary indexes declared on `table`, for index-scan planning. Default empty so
     /// a minimal catalog — or one whose engine has no indexes — simply plans sequential scans; the
     /// production adapter overrides it to expose the engine's indexes. Called only for a real base
@@ -601,6 +610,11 @@ fn pad_fixed_char_output(plan: &mut SelectPlan) {
     reason = "flat one-arm-per-statement dispatch; length tracks the statement set, not complexity"
 )]
 pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Error> {
+    // Pin the session time zone before any expression is analyzed: constant evaluation during
+    // analysis/planning (and the executor after it, which re-pins the same value) must interpret
+    // and render zone-dependent temporal values in the SAME zone, or a folded constant would
+    // disagree with its per-row evaluation.
+    crate::executor::pin_statement_timezone(catalog.session_timezone().as_deref());
     match stmt {
         ast::Statement::CreateTable(ct) => {
             analyze_create_table(ct, catalog).map(LogicalPlan::CreateTable)
