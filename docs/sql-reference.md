@@ -883,6 +883,7 @@ SELECT d::DATE FROM generate_series(DATE '2026-01-01', DATE '2026-01-07', INTERV
 SELECT n FROM generate_series(1, 5) AS n;
 SELECT word FROM regexp_split_to_table('a b  c', '\s+') AS word;
 SELECT part, i FROM string_to_table('x,y,z', ',') WITH ORDINALITY AS t(part, i);
+SELECT unnest(ARRAY[30, 10, 20]) AS v ORDER BY v DESC;   -- the sort runs on the expanded rows
 ```
 
 ### Reading a plan (`EXPLAIN`)
