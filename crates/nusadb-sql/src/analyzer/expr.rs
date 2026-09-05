@@ -660,6 +660,8 @@ pub(super) fn analyze_coalesce(
     if args.is_empty() {
         return Err(Error::FunctionArgs("COALESCE with no arguments".to_owned()));
     }
+    // Two different enum types have no common type — refuse before unifying (42846).
+    reject_mixed_enum_operands("COALESCE", args.iter(), scope, catalog)?;
     // Resolve the non-NULL arguments to a common result type first. A bare `NULL` literal carries no
     // type of its own, so it is deferred and typed from that result — this lets a leading `NULL`
     // infer from a later argument (e.g. `COALESCE(NULL, 7)`), which left-to-right typing cannot.
@@ -2540,6 +2542,9 @@ fn analyze_conditional_function(
 ) -> Result<TypedExpr, Error> {
     use ast::ScalarFunc as F;
     let name = func.name();
+    // Two different enum types have no common type — refuse before unifying (42846). The reference
+    // engine spells the function upper-case in this message.
+    reject_mixed_enum_operands(&name.to_uppercase(), args.iter(), scope, catalog)?;
     let (min, max) = if func == F::Nullif {
         (2, 2)
     } else {
@@ -3775,9 +3780,86 @@ fn enum_type_of(
         ast::Expr::CastNamed { type_name, .. } if catalog.enum_labels(type_name)?.is_some() => {
             Some(type_name.clone())
         },
+        // MIN/MAX return one of their input values unchanged, so they carry the argument's enum
+        // type — `min(m) = min(p)` across two enum types must be caught like `m = p` is.
+        ast::Expr::Aggregate {
+            func: ast::AggregateFunc::Min | ast::AggregateFunc::Max,
+            arg: Some(arg),
+            ..
+        } => enum_type_of(arg, scope, catalog)?,
+        // CASE / COALESCE / GREATEST / LEAST / NULLIF return one of their value operands; their own
+        // analysis rejects mixing two different enum types (42846), so the first enum-typed operand
+        // is representative of the whole expression.
+        ast::Expr::Case {
+            branches, default, ..
+        } => {
+            let mut found = None;
+            for branch in branches {
+                if let Some(t) = enum_type_of(&branch.then, scope, catalog)? {
+                    found = Some(t);
+                    break;
+                }
+            }
+            if found.is_none()
+                && let Some(default) = default
+            {
+                found = enum_type_of(default, scope, catalog)?;
+            }
+            found
+        },
+        ast::Expr::Coalesce(items) => {
+            let mut found = None;
+            for item in items {
+                if let Some(t) = enum_type_of(item, scope, catalog)? {
+                    found = Some(t);
+                    break;
+                }
+            }
+            found
+        },
+        ast::Expr::ScalarFunction {
+            func: ast::ScalarFunc::Greatest | ast::ScalarFunc::Least | ast::ScalarFunc::Nullif,
+            args,
+        } => {
+            let mut found = None;
+            for arg in args {
+                if let Some(t) = enum_type_of(arg, scope, catalog)? {
+                    found = Some(t);
+                    break;
+                }
+            }
+            found
+        },
         _ => None,
     };
     Ok(name)
+}
+
+/// The CASE/COALESCE/GREATEST/LEAST/NULLIF mixed-enum guard: if two of `exprs` are statically typed
+/// as *different* enum types, refuse with `42846` — the reference engine has no conversion between
+/// two enum types, and letting them unify silently would compare unrelated ordinals.
+fn reject_mixed_enum_operands<'a>(
+    what: &str,
+    exprs: impl Iterator<Item = &'a ast::Expr>,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    let mut first: Option<String> = None;
+    for expr in exprs {
+        if let Some(t) = enum_type_of(expr, scope, catalog)? {
+            match &first {
+                None => first = Some(t),
+                Some(f) if *f != t => {
+                    return Err(Error::Coded {
+                        message: format!("{what} could not convert type {t} to {f}"),
+                        sqlstate: "42846",
+                    });
+                },
+                Some(_) => {},
+            }
+        }
+    }
+    Ok(())
 }
 
 /// If `operand` is a bare text literal, resolve it to the value of enum type `enum_type` (an unknown
@@ -4010,6 +4092,14 @@ pub(super) fn analyze_case(
     catalog: &dyn Catalog,
     mut aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
+    // Two different enum types among the result branches have no common type — refuse before
+    // unifying (42846), or the branches would silently compare/return unrelated ordinals.
+    reject_mixed_enum_operands(
+        "CASE/WHEN",
+        branches.iter().map(|b| &b.then).chain(default),
+        scope,
+        catalog,
+    )?;
     // For the simple form, every `when` must be comparable to the operand.
     // For the searched form, every `when` must be boolean.
     let operand_typed = match operand {

@@ -1,0 +1,76 @@
+# Enum cross-type guards. Two different enum types never compare or unify: a direct comparison — or
+# one through the value-preserving shapes MIN/MAX, CASE, COALESCE, GREATEST/LEAST, NULLIF — is
+# `42883` (no operator), and mixing two enum types inside CASE/COALESCE/GREATEST/LEAST/NULLIF is
+# `42846` (no conversion). Same-type uses keep working, including text-literal coercion through
+# those shapes.
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
+
+statement ok
+CREATE TYPE prio AS ENUM ('low', 'mid', 'high')
+
+statement ok
+CREATE TABLE et (m mood, p prio)
+
+statement ok
+INSERT INTO et VALUES ('ok', 'low'), ('happy', 'high')
+
+# Direct cross-type comparison has no operator.
+statement error operator does not exist
+SELECT m = p FROM et
+
+# ... and MIN/MAX carry their argument's enum type, so the same guard fires through them.
+statement error operator does not exist
+SELECT min(m) = min(p) FROM et
+
+# A text literal still coerces to the enum through MIN/MAX.
+query T
+SELECT (min(m) = 'ok')::text FROM et
+----
+true
+
+query T
+SELECT (max(m) > 'sad')::text FROM et
+----
+true
+
+# MIN/MAX order by declaration position, not label bytes ('happy' < 'ok' alphabetically).
+query TT
+SELECT min(m), max(m) FROM et
+----
+ok  happy
+
+# Mixing two enum types in CASE / COALESCE / GREATEST / NULLIF has no conversion.
+statement error could not convert
+SELECT CASE WHEN true THEN 'ok'::mood ELSE 'low'::prio END
+
+statement error could not convert
+SELECT COALESCE('ok'::mood, 'low'::prio)
+
+statement error could not convert
+SELECT GREATEST('ok'::mood, 'low'::prio)
+
+statement error could not convert
+SELECT NULLIF('ok'::mood, 'low'::prio)
+
+# The enum type survives CASE / COALESCE, so a cross-type comparison beyond them is still caught.
+statement error operator does not exist
+SELECT (CASE WHEN true THEN m ELSE m END) = p FROM et
+
+statement error operator does not exist
+SELECT COALESCE(m) = p FROM et
+
+# Same-type shapes keep working.
+query T
+SELECT CASE WHEN true THEN 'ok'::mood ELSE 'sad'::mood END
+----
+ok
+
+query T
+SELECT GREATEST('ok'::mood, 'sad'::mood)
+----
+ok
+
+statement ok
+DROP TABLE et

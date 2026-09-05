@@ -808,6 +808,11 @@ fn slt_p10_row_composite() {
 }
 
 #[test]
+fn slt_p10_enum_cross_type() {
+    run_slt("tests/slt/p10_types/enum_cross_type.slt");
+}
+
+#[test]
 fn slt_p10_json() {
     run_slt("tests/slt/p10_types/json.slt");
 }
