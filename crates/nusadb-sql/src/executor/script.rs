@@ -297,7 +297,8 @@ fn message_text(value: &ast::Value) -> String {
         ast::Value::Null => "NULL".to_owned(),
         ast::Value::Bool(b) => b.to_string(),
         ast::Value::Int(n) => n.to_string(),
-        ast::Value::Float(f) => f.to_string(),
+        // Canonical float rendering (exponent form + `Infinity`/`NaN`), same as every output path.
+        ast::Value::Float(f) => crate::display::format_float(*f),
         other => format!("{other:?}"),
     }
 }

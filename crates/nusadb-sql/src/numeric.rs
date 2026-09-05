@@ -426,16 +426,17 @@ impl Decimal {
     }
 
     /// Lossy conversion to `f64` (for mixed Numeric/Float arithmetic + stats).
+    ///
+    /// Goes through the exact decimal text and the (correctly rounded) float parser: converting as
+    /// `mantissa as f64 / 10^scale` rounds twice — once at the mantissa cast, once at the division —
+    /// which lands one ulp off the nearest double for mantissas beyond 2^53 (e.g. a 19-digit
+    /// literal), where the reference engine converts exactly.
     #[must_use]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "intentional lossy Numeric->f64 for mixed-type arithmetic + stats"
-    )]
     pub fn to_f64(self) -> f64 {
         if self.is_nan() {
             return f64::NAN;
         }
-        (self.mantissa as f64) / 10f64.powi(i32::from(self.scale))
+        self.format().parse().unwrap_or(f64::NAN)
     }
 
     /// Truncating conversion to `i64` (drops the fractional part). `None` if the integer part

@@ -4773,7 +4773,9 @@ fn value_to_field(value: Value) -> Option<Vec<u8>> {
             b"false".to_vec()
         }),
         Value::Int(i) => Some(i.to_string().into_bytes()),
-        Value::Float(f) => Some(f.to_string().into_bytes()),
+        // The canonical float rendering (shortest round-trip, `1e+20`-style exponent form,
+        // `Infinity`/`NaN`) — Rust's own `to_string` would write `inf` and never use an exponent.
+        Value::Float(f) => Some(nusadb_sql::display::format_float(f).into_bytes()),
         // Full-text values render as their stored canonical text, like plain text.
         Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) | Value::Xml(s) => {
             Some(s.into_bytes())
