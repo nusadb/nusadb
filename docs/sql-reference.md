@@ -375,9 +375,21 @@ CREATE TABLE orders (
 );
 
 CREATE TABLE IF NOT EXISTS archive (LIKE orders);   -- copy the shape, not the rows
+CREATE TABLE archive2 (LIKE orders INCLUDING ALL);  -- also defaults, checks, keys, indexes
 CREATE TABLE recent AS SELECT * FROM orders WHERE total > 100;
 DROP TABLE IF EXISTS recent;
 ```
+
+The bare `LIKE` copies columns with their types, widths and `NOT NULL`. The options add more:
+`INCLUDING DEFAULTS` (a `SERIAL` column's default keeps drawing from the source's sequence),
+`INCLUDING CONSTRAINTS` (user `CHECK`s), `INCLUDING INDEXES` (primary key, unique constraints and
+secondary indexes, renamed onto the new table), `INCLUDING IDENTITY` (with a fresh sequence),
+`INCLUDING GENERATED`, and `INCLUDING ALL` for everything. `COMMENTS`, `STATISTICS`, `STORAGE`
+and `COMPRESSION` are accepted with nothing to copy. Foreign keys are never copied.
+
+`CREATE UNLOGGED TABLE` is accepted; the table is stored like any other. The keyword elsewhere
+trades crash durability for write speed, and this engine's write-ahead log is its only durable
+copy, so the table simply keeps full durability — queries behave identically.
 
 Constraints available: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY ... REFERENCES`
 with `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT`, `NO ACTION`; each

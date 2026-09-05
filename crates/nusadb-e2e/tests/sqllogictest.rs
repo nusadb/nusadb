@@ -475,6 +475,11 @@ fn slt_p1_session_guc() {
 }
 
 #[test]
+fn slt_p1_create_like_including() {
+    run_slt("tests/slt/p1_ddl/create_like_including.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }

@@ -699,6 +699,10 @@ pub struct CreateTablePlan {
     /// `src`'s columns into `columns`; the executor additionally copies `src`'s synthetic width /
     /// length checks so the declared width (lost by the runtime `ColumnType`) is preserved.
     pub like_source: Option<String>,
+    /// The `LIKE` clause's `INCLUDING`/`EXCLUDING` options — which of the source's properties the
+    /// executor copies beyond columns and width checks (defaults, user checks, keys/indexes,
+    /// identity, generated expressions). All-false for the bare `LIKE` form.
+    pub like_options: ast::LikeOptions,
     /// The temporary table's `ON COMMIT` disposition (see [`ast::OnCommit`]). Carried through the plan
     /// for completeness and diagnostics; the end-of-transaction action itself is fired by the wire
     /// layer, which owns the per-connection transaction boundaries. Always

@@ -26,6 +26,34 @@ pub enum OnCommit {
     Drop,
 }
 
+/// The `INCLUDING` options of `CREATE TABLE (LIKE src INCLUDING ...)`.
+///
+/// Selects which of `src`'s properties are copied beyond its columns. `EXCLUDING` (the default
+/// for every option) leaves an option `false`; `INCLUDING ALL` sets every one.
+/// `COMMENTS`/`STATISTICS`/`STORAGE`/`COMPRESSION` are accepted in the syntax but carry no flag:
+/// this engine stores nothing under them to copy (comments are accepted and discarded; the
+/// physical knobs do not exist).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent INCLUDING option, not a state machine"
+)]
+pub struct LikeOptions {
+    /// `INCLUDING DEFAULTS` — copy column `DEFAULT` expressions (a `SERIAL` column's default keeps
+    /// pointing at the SOURCE table's sequence, exactly like the reference engine).
+    pub defaults: bool,
+    /// `INCLUDING CONSTRAINTS` — copy user `CHECK` constraints (with their original names).
+    pub constraints: bool,
+    /// `INCLUDING INDEXES` — copy `PRIMARY KEY`/`UNIQUE` constraints and secondary indexes, renamed
+    /// onto the new table.
+    pub indexes: bool,
+    /// `INCLUDING IDENTITY` — copy `GENERATED ... AS IDENTITY` columns' identity property, with a
+    /// fresh backing sequence for the new table.
+    pub identity: bool,
+    /// `INCLUDING GENERATED` — copy `GENERATED ALWAYS AS (...) STORED` generation expressions.
+    pub generated: bool,
+}
+
 /// `CREATE TABLE name (columns...)`.
 // Not `Eq`: a table-level `CHECK` constraint carries an `Expr`, which is only `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +78,8 @@ pub struct CreateTable {
     /// catalog at analysis (the parser has no catalog), and the width-enforcing checks are copied at
     /// execution, so the copy preserves the declared width the runtime `ColumnType` alone would lose.
     pub like_source: Option<String>,
+    /// The `INCLUDING`/`EXCLUDING` options given with `LIKE` (all `false` for the bare form).
+    pub like_options: LikeOptions,
     /// `ON COMMIT {PRESERVE ROWS | DELETE ROWS | DROP}` — the end-of-transaction disposition of a
     /// temporary table (see [`OnCommit`]). [`PreserveRows`](OnCommit::PreserveRows) for the default /
     /// an ordinary table. A non-default action on a non-temporary table is rejected by the analyzer.

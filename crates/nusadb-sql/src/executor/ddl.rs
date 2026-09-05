@@ -258,7 +258,14 @@ pub(super) fn run_create_table(
         &format!("{}.{}", def.schema, def.name),
         &super::session_ctx::current_user(),
     )?;
-    copy_like_width_checks(plan.like_source.as_deref(), id, engine, txn)?;
+    copy_like_metadata(
+        plan.like_source.as_deref(),
+        plan.like_options,
+        id,
+        &def,
+        engine,
+        txn,
+    )?;
     // Record the child→parent inheritance edges so a later query on a parent expands to this table.
     // A prior same-named table's edges are cleared on DROP, so there is nothing stale to purge here.
     // Both endpoints use the schema-qualified key (bare for `public`; the parents in `plan.inherits`
@@ -556,15 +563,28 @@ fn overlap_err(partition: &str, existing: &str) -> Error {
     ))
 }
 
-/// For `CREATE TABLE ... (LIKE src)`, copy `src`'s synthetic width / length checks onto the new table
-/// `id`. The analyzer already copied `src`'s columns, but the declared width of a narrow integer or
-/// bounded string lives only in these generated checks (every integer stores as i64), not in the
-/// runtime type — so without this the copy would silently accept values the source rejects. The
-/// copied columns keep `src`'s names, so each predicate is valid as-is, and the constraint names are
-/// per-table, so reusing them on the new table cannot collide.
-fn copy_like_width_checks(
+/// For `CREATE TABLE ... (LIKE src [INCLUDING ...])`, copy `src`'s metadata onto the new table.
+///
+/// Always copied: `src`'s synthetic width / length checks — the analyzer already copied the
+/// columns, but the declared width of a narrow integer or bounded string lives only in these
+/// generated checks (every integer stores as i64), not in the runtime type, so without this the
+/// copy would silently accept values the source rejects. The copied columns keep `src`'s names, so
+/// each predicate is valid as-is, and the constraint names are per-table, so reusing them cannot
+/// collide.
+///
+/// Per [`ast::LikeOptions`]: user `CHECK` constraints keep their original names (`CONSTRAINTS`);
+/// `PRIMARY KEY` / `UNIQUE` constraints and secondary indexes are re-declared under the new
+/// table's name — a leading `<src>_` in the name is swapped for `<new>_`, the reference engine's
+/// visible renaming (`INDEXES`); column defaults are copied per class — a plain `DEFAULT` and a
+/// `SERIAL` sentinel under `DEFAULTS` (the serial keeps pointing at the SOURCE's sequence, exactly
+/// like the reference engine), a `GENERATED ... AS IDENTITY` column under `IDENTITY` with a FRESH
+/// backing sequence, and a `GENERATED ALWAYS AS (...) STORED` expression under `GENERATED` (it
+/// references this table's own columns, so the text is valid verbatim).
+fn copy_like_metadata(
     like_source: Option<&str>,
+    options: ast::LikeOptions,
     id: nusadb_core::TableId,
+    def: &nusadb_core::TableDef,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -574,11 +594,101 @@ fn copy_like_width_checks(
     let Some(src) = engine.lookup_table_as_of(txn, source)? else {
         return Ok(());
     };
+    // The reference engine's visible renaming: a PK/UNIQUE/index named after the source table is
+    // re-derived from the new table's name; any other name is kept (a clash errors loudly).
+    let renamed = |name: &str| -> String {
+        name.strip_prefix(&format!("{}_", src.name))
+            .map_or_else(|| name.to_owned(), |rest| format!("{}_{rest}", def.name))
+    };
+    let mut backing = std::collections::HashSet::new();
     for c in engine.list_constraints(src.id)? {
-        if c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
-            && let Some(bytes) = &c.expr
-        {
-            engine.add_check_constraint(txn, id, &c.name, bytes)?;
+        if let Some(index) = c.index {
+            backing.insert(index);
+        }
+        match c.kind {
+            nusadb_core::ConstraintKind::Check => {
+                let synthetic = c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+                if (synthetic || options.constraints)
+                    && let Some(bytes) = &c.expr
+                {
+                    engine.add_check_constraint(txn, id, &c.name, bytes)?;
+                }
+            },
+            nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
+                if options.indexes =>
+            {
+                engine.add_unique_constraint(
+                    txn,
+                    id,
+                    &renamed(&c.name),
+                    &c.columns,
+                    c.kind == nusadb_core::ConstraintKind::PrimaryKey,
+                    c.nulls_not_distinct,
+                )?;
+            },
+            // FOREIGN KEYs are never copied by LIKE (the reference engine's rule).
+            _ => {},
+        }
+    }
+    if options.indexes {
+        for index in engine.list_indexes(src.id)? {
+            // Constraint-backing indexes were re-created by the PK/UNIQUE declarations above.
+            if engine
+                .lookup_index(&index.name)?
+                .is_some_and(|iid| backing.contains(&iid))
+            {
+                continue;
+            }
+            engine.create_index(
+                txn,
+                &nusadb_core::engine::IndexDef {
+                    name: renamed(&index.name),
+                    table: id,
+                    ..index
+                },
+            )?;
+        }
+    }
+    if options.defaults || options.identity || options.generated {
+        let src_key = super::coldefault::catalog_key(&src.schema, &src.name);
+        let new_key = super::coldefault::catalog_key(&def.schema, &def.name);
+        for (column, sql) in super::coldefault::load_defaults(&src_key, engine, txn)? {
+            if let Some(seq) = super::coldefault::identity_always_sequence(&sql) {
+                // `GENERATED ALWAYS AS IDENTITY`: copied only under INCLUDING IDENTITY, with a
+                // fresh backing sequence — the reference engine never shares an identity sequence.
+                if options.identity {
+                    let fresh = super::coldefault::sequence_name(&def.name, &column);
+                    let seq_def = nusadb_core::engine::SequenceDef {
+                        name: fresh.clone(),
+                        start: 1,
+                        increment: 1,
+                        min_value: 1,
+                        max_value: i64::MAX,
+                        cycle: false,
+                    };
+                    let _ = seq;
+                    engine.create_sequence(txn, &seq_def)?;
+                    super::seqcatalog::record(engine, txn, &seq_def)?;
+                    super::coldefault::set_default(
+                        &new_key,
+                        &column,
+                        &super::coldefault::identity_always_default_sql(&fresh),
+                        engine,
+                        txn,
+                    )?;
+                }
+            } else if super::coldefault::generated_expr(&sql).is_some() {
+                // `GENERATED ALWAYS AS (...) STORED`: the expression references this table's own
+                // columns (same names), so the stored text is valid verbatim.
+                if options.generated {
+                    super::coldefault::set_default(&new_key, &column, &sql, engine, txn)?;
+                }
+            } else if options.defaults {
+                // A plain DEFAULT, or a SERIAL / BY DEFAULT identity sentinel: copied verbatim —
+                // the serial's default keeps drawing from the SOURCE table's sequence, the
+                // reference engine's documented INCLUDING DEFAULTS behavior.
+                super::coldefault::set_default(&new_key, &column, &sql, engine, txn)?;
+            }
         }
     }
     Ok(())

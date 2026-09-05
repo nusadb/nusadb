@@ -735,6 +735,14 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `WITH RECURSIVE t(...) AS (...) CYCLE c SET mark USING path ...`: sqlparser errors at `CYCLE`,
     // so strip each such clause here and re-attach it to the matching CTE after parsing.
     let cte_cycles = strip_cte_cycle(&mut tokens)?;
+    // `CREATE UNLOGGED TABLE`: sqlparser has no grammar for the keyword. The table is created
+    // WAL-logged like any other — this engine's WAL is its only durable copy, so honouring the
+    // keyword as a plain table keeps every query identical while promising MORE durability than
+    // the reference engine's unlogged contract (which truncates the table on crash), never less.
+    strip_unlogged_table(&mut tokens);
+    // `LIKE src {INCLUDING | EXCLUDING} <option>`: sqlparser cannot parse the option list in the
+    // parenthesized form, so strip it here and re-attach the collected options after parsing.
+    let like_options = strip_like_including(&mut tokens)?;
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -751,10 +759,146 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
             if !cte_cycles.is_empty() {
                 apply_cte_cycles(&mut stmt, cte_cycles)?;
             }
+            if let Some(options) = like_options {
+                stmt = apply_like_options(stmt, options)?;
+            }
             Ok(stmt)
         },
         0 => Err(Error::Empty),
         n => Err(Error::MultipleStatements(n)),
+    }
+}
+
+/// Detect and remove the `UNLOGGED` keyword of `CREATE UNLOGGED TABLE` (sqlparser has no grammar
+/// for it). Only the exact statement-leading `CREATE UNLOGGED TABLE` run is matched, so an
+/// identifier or string elsewhere is never touched. See the call site for why dropping the
+/// keyword is honest here.
+fn strip_unlogged_table(tokens: &mut Vec<TokenWithSpan>) {
+    let meaningful: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+    if let [c, u, t, ..] = meaningful.as_slice()
+        && word_ci(tokens.get(*c), "create")
+        && word_ci(tokens.get(*u), "unlogged")
+        && word_ci(tokens.get(*t), "table")
+    {
+        tokens.remove(*u);
+    }
+}
+
+/// Detect and remove every `{INCLUDING | EXCLUDING} <option>` pair after a `LIKE` clause in a
+/// `CREATE TABLE` statement (sqlparser has no grammar for the parenthesized form's option list),
+/// returning the collected [`ast::LikeOptions`]. `INCLUDING ALL` turns every option on;
+/// `EXCLUDING` (and absence) leaves an option off. `COMMENTS`/`STATISTICS`/`STORAGE`/`COMPRESSION`
+/// are accepted without a flag — the engine stores nothing under them to copy. An unknown option
+/// word is a syntax error, exactly like the reference engine. The caller re-attaches the options
+/// via [`apply_like_options`].
+fn strip_like_including(
+    tokens: &mut Vec<TokenWithSpan>,
+) -> Result<Option<ast::LikeOptions>, Error> {
+    fn meaningful(tokens: &[TokenWithSpan]) -> Vec<usize> {
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+    // Only a CREATE ... TABLE statement has the clause; `INCLUDING`/`EXCLUDING` are not part of
+    // any expression grammar, so nothing else can be mis-matched once guarded here.
+    {
+        let m = meaningful(tokens);
+        let is_table_kw = |i: usize| m.get(i).is_some_and(|&p| word_ci(tokens.get(p), "table"));
+        if !(m.first().is_some_and(|&p| word_ci(tokens.get(p), "create"))
+            && (is_table_kw(1) || is_table_kw(2) || is_table_kw(3)))
+        {
+            return Ok(None);
+        }
+    }
+    let mut options = ast::LikeOptions::default();
+    let mut stripped = false;
+    loop {
+        let m = meaningful(tokens);
+        let mut saw_like = false;
+        let mut found = None;
+        for (k, &pos) in m.iter().enumerate() {
+            if word_ci(tokens.get(pos), "like") {
+                saw_like = true;
+            }
+            if !saw_like {
+                continue;
+            }
+            let including = word_ci(tokens.get(pos), "including");
+            if !including && !word_ci(tokens.get(pos), "excluding") {
+                continue;
+            }
+            let Some(&opt_pos) = m.get(k + 1) else {
+                return Err(Error::Syntax(format!(
+                    "expected an option after {}",
+                    if including { "INCLUDING" } else { "EXCLUDING" }
+                )));
+            };
+            let Some(Token::Word(w)) = tokens.get(opt_pos).map(|t| &t.token) else {
+                return Err(Error::Syntax(
+                    "expected an option word after INCLUDING/EXCLUDING".to_owned(),
+                ));
+            };
+            let opt = w.value.to_ascii_lowercase();
+            match opt.as_str() {
+                "defaults" => options.defaults = including,
+                "constraints" => options.constraints = including,
+                "indexes" => options.indexes = including,
+                "identity" => options.identity = including,
+                "generated" => options.generated = including,
+                // Accepted with nothing stored under them to copy: comments are accepted and
+                // discarded at COMMENT time, and the physical knobs do not exist in this engine.
+                "comments" | "statistics" | "storage" | "compression" => {},
+                "all" => {
+                    options = if including {
+                        ast::LikeOptions {
+                            defaults: true,
+                            constraints: true,
+                            indexes: true,
+                            identity: true,
+                            generated: true,
+                        }
+                    } else {
+                        ast::LikeOptions::default()
+                    };
+                },
+                other => {
+                    return Err(Error::Syntax(format!(
+                        "syntax error at or near \"{other}\" — LIKE options are ALL, DEFAULTS, \
+                         CONSTRAINTS, INDEXES, IDENTITY, GENERATED, COMMENTS, STATISTICS, \
+                         STORAGE, COMPRESSION"
+                    )));
+                },
+            }
+            found = Some((pos, opt_pos));
+            break;
+        }
+        let Some((pos, opt_pos)) = found else { break };
+        tokens.drain(pos..=opt_pos);
+        stripped = true;
+    }
+    Ok(if stripped { Some(options) } else { None })
+}
+
+/// Re-attach stripped `LIKE ... INCLUDING/EXCLUDING` options to the parsed `CREATE TABLE`. Valid
+/// only when the statement actually has a `LIKE` clause; anywhere else is a surface error.
+fn apply_like_options(
+    stmt: ast::Statement,
+    options: ast::LikeOptions,
+) -> Result<ast::Statement, Error> {
+    match stmt {
+        ast::Statement::CreateTable(mut ct) if ct.like_source.is_some() => {
+            ct.like_options = options;
+            Ok(ast::Statement::CreateTable(ct))
+        },
+        _ => unsupported("INCLUDING/EXCLUDING options outside CREATE TABLE (LIKE ...)"),
     }
 }
 

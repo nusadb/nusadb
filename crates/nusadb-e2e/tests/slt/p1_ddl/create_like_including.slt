@@ -1,0 +1,173 @@
+# CREATE TABLE (LIKE src [INCLUDING ...]) — the bare form copies columns (type, width, NOT NULL);
+# the options copy more: DEFAULTS (a SERIAL default keeps drawing from the SOURCE's sequence),
+# CONSTRAINTS (user CHECKs, original names), INDEXES (PK/UNIQUE/secondary, renamed onto the new
+# table), IDENTITY (fresh sequence), GENERATED (expression verbatim). INCLUDING ALL = everything.
+# CREATE UNLOGGED TABLE is accepted; the table stays WAL-logged (more durable than the reference
+# engine's unlogged contract, never less).
+
+statement ok
+CREATE UNLOGGED TABLE t_unlogged (id INT)
+
+statement ok
+INSERT INTO t_unlogged VALUES (1)
+
+query I
+SELECT id FROM t_unlogged
+----
+1
+
+statement ok
+CREATE TABLE t_base (id INT PRIMARY KEY, n TEXT DEFAULT 'x', big BIGINT UNIQUE, CONSTRAINT pos_id CHECK (id > 0))
+
+statement ok
+CREATE INDEX t_base_n_idx ON t_base (n)
+
+# Bare LIKE: columns only — no default, no PK, no check.
+statement ok
+CREATE TABLE t_bare (LIKE t_base)
+
+statement ok
+INSERT INTO t_bare (id) VALUES (-5)
+
+query IT
+SELECT id, n FROM t_bare
+----
+-5 NULL
+
+statement ok
+INSERT INTO t_bare (id) VALUES (-5)
+
+# INCLUDING ALL: defaults, PK, unique, user check, secondary index all arrive.
+statement ok
+CREATE TABLE t_all (LIKE t_base INCLUDING ALL)
+
+statement ok
+INSERT INTO t_all (id) VALUES (1)
+
+query IT
+SELECT id, n FROM t_all
+----
+1 x
+
+statement error duplicate
+INSERT INTO t_all (id) VALUES (1)
+
+statement error check
+INSERT INTO t_all (id) VALUES (-1)
+
+statement error duplicate
+INSERT INTO t_all (id, big) VALUES (2, 7), (3, 7)
+
+# The copied PK/UNIQUE/index take the new table's name prefix; the CHECK keeps its own name.
+query TT rowsort
+SELECT constraint_name, constraint_type FROM information_schema.table_constraints
+WHERE table_name = 't_all' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'CHECK')
+----
+pos_id  CHECK
+t_all_big_key  UNIQUE
+t_all_pkey  PRIMARY KEY
+
+# INCLUDING DEFAULTS only: default arrives, no PK/check.
+statement ok
+CREATE TABLE t_def (LIKE t_base INCLUDING DEFAULTS)
+
+statement ok
+INSERT INTO t_def (id) VALUES (-1)
+
+query T
+SELECT n FROM t_def
+----
+x
+
+# INCLUDING INDEXES only: PK arrives, no default/check.
+statement ok
+CREATE TABLE t_idx (LIKE t_base INCLUDING INDEXES)
+
+statement ok
+INSERT INTO t_idx (id) VALUES (-1)
+
+statement error duplicate
+INSERT INTO t_idx (id) VALUES (-1)
+
+query T
+SELECT n FROM t_idx
+----
+NULL
+
+# INCLUDING CONSTRAINTS only: the user CHECK arrives.
+statement ok
+CREATE TABLE t_con (LIKE t_base INCLUDING CONSTRAINTS)
+
+statement error check
+INSERT INTO t_con (id) VALUES (-1)
+
+# A SERIAL source under INCLUDING DEFAULTS shares the source's sequence (the reference behavior).
+statement ok
+CREATE TABLE s (id SERIAL, v TEXT)
+
+statement ok
+CREATE TABLE s2 (LIKE s INCLUDING DEFAULTS)
+
+statement ok
+INSERT INTO s (v) VALUES ('a')
+
+statement ok
+INSERT INTO s2 (v) VALUES ('b')
+
+query I
+SELECT id FROM s2
+----
+2
+
+# EXCLUDING is accepted; an unknown option is a loud syntax error.
+statement ok
+CREATE TABLE t_ex (LIKE t_base EXCLUDING INDEXES)
+
+statement error LIKE options
+CREATE TABLE t_bad (LIKE t_base INCLUDING BOGUS)
+
+# The generated width check still guards a LIKE copy (bare form): a SMALLINT column keeps its range.
+statement ok
+CREATE TABLE w (sm SMALLINT)
+
+statement ok
+CREATE TABLE w2 (LIKE w)
+
+statement error
+INSERT INTO w2 VALUES (99999)
+
+statement ok
+DROP TABLE t_unlogged
+
+statement ok
+DROP TABLE w2
+
+statement ok
+DROP TABLE w
+
+statement ok
+DROP TABLE t_ex
+
+statement ok
+DROP TABLE s2
+
+statement ok
+DROP TABLE s
+
+statement ok
+DROP TABLE t_con
+
+statement ok
+DROP TABLE t_idx
+
+statement ok
+DROP TABLE t_def
+
+statement ok
+DROP TABLE t_all
+
+statement ok
+DROP TABLE t_bare
+
+statement ok
+DROP TABLE t_base

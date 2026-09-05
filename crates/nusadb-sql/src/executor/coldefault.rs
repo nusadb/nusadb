@@ -55,6 +55,14 @@ pub(super) fn generated_expr(default_sql: &str) -> Option<&str> {
     default_sql.strip_prefix(GENERATED_PREFIX)
 }
 
+/// If `default_sql` is specifically a `GENERATED ALWAYS AS IDENTITY` sentinel, the backing sequence
+/// name; otherwise `None`. Distinguishes the always-identity class (which `LIKE ... INCLUDING
+/// IDENTITY` copies with a fresh sequence) from the `SERIAL` / by-default sentinel (which
+/// `INCLUDING DEFAULTS` copies verbatim, sharing the source's sequence).
+pub(super) fn identity_always_sequence(default_sql: &str) -> Option<&str> {
+    default_sql.strip_prefix(IDENTITY_ALWAYS_PREFIX)
+}
+
 /// The column ordinals of `table`'s STORED generated columns. Their stored values are recomputed
 /// from other columns on every write ([`column_fills`] → `ColumnFill::Generated`), so an `UPDATE`
 /// that assigns a generated column's dependency changes the generated column even though it is not

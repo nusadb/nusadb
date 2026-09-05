@@ -90,14 +90,13 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
             if_not_exists: ct.if_not_exists,
         }));
     }
-    // `CREATE TABLE t (LIKE src)` copies `src`'s columns. The basic form only — the `INCLUDING`
-    // options (defaults / constraints / indexes) are a separate feature, so a `DEFAULTS` option is
-    // rejected loudly rather than silently ignored.
+    // `CREATE TABLE t (LIKE src)` copies `src`'s columns. The `INCLUDING`/`EXCLUDING` options of
+    // the parenthesized form are stripped and re-attached by the parse() pre-pass (sqlparser has
+    // no grammar for them); the plain form's own DEFAULTS marker maps onto the same option.
+    let mut like_defaults = false;
     let like_source = match &ct.like {
         Some(sql::CreateTableLikeKind::Parenthesized(l) | sql::CreateTableLikeKind::Plain(l)) => {
-            if l.defaults.is_some() {
-                return unsupported("CREATE TABLE (LIKE ... INCLUDING/EXCLUDING DEFAULTS)");
-            }
+            like_defaults = l.defaults == Some(sql::CreateTableLikeDefaults::Including);
             Some(object_name(&l.name)?)
         },
         None => None,
@@ -138,6 +137,10 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
         if_not_exists: ct.if_not_exists,
         temporary: ct.temporary,
         like_source,
+        like_options: ast::LikeOptions {
+            defaults: like_defaults,
+            ..ast::LikeOptions::default()
+        },
         on_commit,
         inherits,
         partition_by,

@@ -145,6 +145,7 @@ pub(super) fn analyze_create_table(
         if_not_exists: ct.if_not_exists,
         temporary: ct.temporary,
         like_source: ct.like_source,
+        like_options: ct.like_options,
         on_commit: ct.on_commit,
         inherits: inherited_parents,
         partition_by,
