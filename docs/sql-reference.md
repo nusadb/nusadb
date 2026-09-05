@@ -1577,12 +1577,13 @@ RESET ALL;
 | `max_autocommit_retries` | how many times a single auto-commit statement is retried on `40001` |
 | `hnsw_ef_search` | candidate list size for vector index search; higher is more accurate and slower |
 | `default_transaction_isolation` | isolation level for the next transactions in this session |
-| `client_encoding`, `datestyle`, `timezone`, `standard_conforming_strings` | accepted and echoed back; the engine is UTF-8, ISO dates, UTC |
+| `timezone` (also `SET TIME ZONE`) | the session time zone: `UTC`, `GMT`, or a fixed offset; see [Dates, times and intervals](#dates-times-and-intervals) |
+| `client_encoding`, `datestyle`, `standard_conforming_strings` | accepted and echoed back; the engine is UTF-8, ISO dates |
 | `server_version`, `server_encoding`, `integer_datetimes` | read-only (`55P02` on `SET`) |
 | `<class>.<name>` | application-defined; any dotted name |
 
-An unrecognised parameter name is an error (`42704`) rather than a silent no-op.
-`SET LOCAL`, `SET TIME ZONE` and `SET NAMES` are not accepted.
+An unrecognised parameter name is an error (`42704`) rather than a silent no-op, and a bad value
+for a known parameter is `22023`. `SET LOCAL` and `SET NAMES` are not accepted.
 
 ---
 
@@ -1750,7 +1751,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - dollar-quoted string literals outside a routine body;
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
 - `INSTEAD OF` triggers;
-- `SET TIME ZONE`, `SET LOCAL`, `SET NAMES`;
+- `SET LOCAL`, `SET NAMES`, and an IANA region name as the session time zone;
 - index methods other than B-tree and HNSW;
 - locale collations (only `"C"` / `"POSIX"`);
 - `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;
