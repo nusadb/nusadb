@@ -97,13 +97,30 @@ fn decode_param_names(text: &str) -> Vec<String> {
 }
 
 /// A decoded function-catalog row.
-struct DecodedFunction {
-    name: String,
+pub(super) struct DecodedFunction {
+    pub(super) name: String,
     param_count: usize,
     param_names: Vec<String>,
-    language: ast::FunctionLanguage,
-    return_type: ColumnType,
-    body: String,
+    pub(super) language: ast::FunctionLanguage,
+    pub(super) return_type: ColumnType,
+    pub(super) body: String,
+}
+
+/// Every function-catalog row, decoded — for `information_schema.routines`. Empty when the catalog
+/// does not exist yet.
+pub(super) fn all_functions(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<DecodedFunction>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, FUNCTION_CATALOG)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        out.push(decode_function_row(&bytes)?);
+    }
+    Ok(out)
 }
 
 /// Parse a stored return-type string back to a [`ColumnType`], defaulting to `TEXT` for an absent

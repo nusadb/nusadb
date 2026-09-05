@@ -3227,7 +3227,167 @@ pub(super) fn run_info_schema(
         V::TablePrivileges => info_schema_table_privileges(engine, txn),
         V::ApplicableRoles => info_schema_applicable_roles(engine, txn),
         V::EnabledRoles => info_schema_enabled_roles(engine, txn),
+        V::ReferentialConstraints => info_schema_referential_constraints(engine, txn),
+        V::CheckConstraints => info_schema_check_constraints(engine, txn),
+        V::Routines => info_schema_routines(engine, txn),
+        V::Sequences => info_schema_sequences(engine, txn),
     }
+}
+
+/// The standard `information_schema` rule text for a referential action.
+const fn fk_rule_text(action: nusadb_core::FkAction) -> &'static str {
+    match action {
+        nusadb_core::FkAction::NoAction => "NO ACTION",
+        nusadb_core::FkAction::Restrict => "RESTRICT",
+        nusadb_core::FkAction::Cascade => "CASCADE",
+        nusadb_core::FkAction::SetNull => "SET NULL",
+        nusadb_core::FkAction::SetDefault => "SET DEFAULT",
+    }
+}
+
+/// `information_schema.referential_constraints`: one row per FOREIGN KEY, with the parent's
+/// PRIMARY KEY / UNIQUE constraint it references and the ON UPDATE / ON DELETE rules.
+/// `match_option` is always `NONE` (the only match form in surface).
+fn info_schema_referential_constraints(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    for name in &engine.list_tables_as_of(txn)? {
+        if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
+            continue;
+        }
+        let Some(schema) = engine.lookup_table(name)? else {
+            continue;
+        };
+        for fk in engine.list_foreign_keys(schema.id)? {
+            // `list_foreign_keys` reports keys touching the table from either side; keep only the
+            // ones this table declares (child side) so each constraint appears once.
+            if fk.child_table != schema.id {
+                continue;
+            }
+            // The referenced unique constraint: the parent's PRIMARY KEY / UNIQUE over exactly the
+            // referenced columns. NULL when it cannot be resolved (defensive; the engine required it
+            // at ADD FOREIGN KEY time).
+            let unique_name = engine
+                .list_constraints(fk.parent_table)?
+                .into_iter()
+                .find(|c| {
+                    matches!(
+                        c.kind,
+                        nusadb_core::engine::ConstraintKind::PrimaryKey
+                            | nusadb_core::engine::ConstraintKind::Unique
+                    ) && c.columns == fk.parent_columns
+                })
+                .map(|c| c.name);
+            rows.push(vec![
+                ast::Value::Text("nusadb".to_owned()),
+                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(fk.name),
+                ast::Value::Text("nusadb".to_owned()),
+                ast::Value::Text("public".to_owned()),
+                unique_name.map_or(ast::Value::Null, ast::Value::Text),
+                ast::Value::Text("NONE".to_owned()),
+                ast::Value::Text(fk_rule_text(fk.on_update).to_owned()),
+                ast::Value::Text(fk_rule_text(fk.on_delete).to_owned()),
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
+/// `information_schema.check_constraints`: one row per user CHECK constraint with its predicate
+/// text. Synthetic type-bound checks (a VARCHAR(n) length / narrow-int range) are an implementation
+/// detail of the declared type and stay hidden, as in `table_constraints`.
+fn info_schema_check_constraints(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    for name in &engine.list_tables_as_of(txn)? {
+        if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
+            continue;
+        }
+        let Some(schema) = engine.lookup_table(name)? else {
+            continue;
+        };
+        for c in engine.list_constraints(schema.id)? {
+            if !matches!(c.kind, nusadb_core::engine::ConstraintKind::Check)
+                || c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+            {
+                continue;
+            }
+            let clause = c
+                .expr
+                .as_deref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            rows.push(vec![
+                ast::Value::Text("nusadb".to_owned()),
+                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(c.name),
+                ast::Value::Text(clause),
+            ]);
+        }
+    }
+    Ok(rows)
+}
+
+/// `information_schema.routines`: one row per SQL function and procedure. A function reports its
+/// return type and language; a procedure has no return type (`data_type` NULL) and is always `SQL`.
+fn info_schema_routines(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    for f in super::function::all_functions(engine, txn)? {
+        let language = match f.language {
+            ast::FunctionLanguage::Sql => "SQL",
+            ast::FunctionLanguage::NusaScript => "NUSASCRIPT",
+        };
+        rows.push(vec![
+            ast::Value::Text("nusadb".to_owned()),
+            ast::Value::Text("public".to_owned()),
+            ast::Value::Text(f.name),
+            ast::Value::Text("FUNCTION".to_owned()),
+            ast::Value::Text(info_schema_data_type(f.return_type).to_owned()),
+            ast::Value::Text(language.to_owned()),
+            ast::Value::Text(f.body),
+        ]);
+    }
+    for (name, body) in super::procedure::all_procedures(engine, txn)? {
+        rows.push(vec![
+            ast::Value::Text("nusadb".to_owned()),
+            ast::Value::Text("public".to_owned()),
+            ast::Value::Text(name),
+            ast::Value::Text("PROCEDURE".to_owned()),
+            ast::Value::Null,
+            ast::Value::Text("SQL".to_owned()),
+            ast::Value::Text(body),
+        ]);
+    }
+    Ok(rows)
+}
+
+/// `information_schema.sequences`: one row per sequence recorded in the sequence shadow catalog
+/// (mirrored at CREATE/ALTER time — a sequence created before the catalog existed is absent until
+/// altered). Every sequence is a 64-bit integer counter, so the numeric columns are fixed.
+fn info_schema_sequences(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    for def in super::seqcatalog::list(engine, txn)? {
+        rows.push(vec![
+            ast::Value::Text("nusadb".to_owned()),
+            ast::Value::Text("public".to_owned()),
+            ast::Value::Text(def.name),
+            ast::Value::Text("bigint".to_owned()),
+            ast::Value::Int(64),
+            ast::Value::Int(2),
+            ast::Value::Int(0),
+            ast::Value::Text(def.start.to_string()),
+            ast::Value::Text(def.min_value.to_string()),
+            ast::Value::Text(def.max_value.to_string()),
+            ast::Value::Text(def.increment.to_string()),
+            ast::Value::Text(if def.cycle { "YES" } else { "NO" }.to_owned()),
+        ]);
+    }
+    Ok(rows)
 }
 
 /// `information_schema.table_privileges`: one row per privilege granted on a table.

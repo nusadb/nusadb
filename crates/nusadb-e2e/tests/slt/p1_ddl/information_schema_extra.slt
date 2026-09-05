@@ -1,0 +1,87 @@
+# The four reflection views beyond the original set: referential_constraints (FOREIGN KEYs with
+# their referenced unique constraint and rules), check_constraints (user CHECK clauses),
+# routines (functions + procedures), and sequences (mirrored at CREATE/ALTER SEQUENCE time).
+
+statement ok
+CREATE TABLE parent (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE child (id INT PRIMARY KEY, pid INT, CONSTRAINT child_fk FOREIGN KEY (pid) REFERENCES parent (id) ON DELETE CASCADE ON UPDATE SET NULL)
+
+query TTTTT
+SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule
+FROM information_schema.referential_constraints
+----
+child_fk  parent_pkey  NONE  SET NULL  CASCADE
+
+statement ok
+CREATE TABLE priced (v INT, CONSTRAINT pos_check CHECK (v > 0))
+
+query TT
+SELECT constraint_name, check_clause FROM information_schema.check_constraints
+----
+pos_check  v > 0
+
+statement ok
+CREATE FUNCTION add_one(x INT) RETURNS INT AS 'SELECT x + 1' LANGUAGE SQL
+
+query TTTT
+SELECT routine_name, routine_type, data_type, external_language FROM information_schema.routines
+----
+add_one  FUNCTION  integer  SQL
+
+statement ok
+CREATE SEQUENCE sq START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CYCLE
+
+query TTIIITTTTT
+SELECT sequence_name, data_type, numeric_precision, numeric_precision_radix, numeric_scale,
+       start_value, minimum_value, maximum_value, increment, cycle_option
+FROM information_schema.sequences
+----
+sq  bigint  64  2  0  5  1  100  2  YES
+
+# ALTER SEQUENCE updates the view; DROP removes the row.
+statement ok
+ALTER SEQUENCE sq INCREMENT BY 7 NO CYCLE
+
+query TT
+SELECT increment, cycle_option FROM information_schema.sequences
+----
+7  NO
+
+statement ok
+DROP SEQUENCE sq
+
+query I
+SELECT count(*) FROM information_schema.sequences
+----
+0
+
+# A SERIAL column's backing sequence is listed too, and leaves with its table.
+statement ok
+CREATE TABLE s (id SERIAL)
+
+query T
+SELECT sequence_name FROM information_schema.sequences
+----
+s_id_seq
+
+statement ok
+DROP TABLE s
+
+query I
+SELECT count(*) FROM information_schema.sequences
+----
+0
+
+statement ok
+DROP FUNCTION add_one
+
+statement ok
+DROP TABLE priced
+
+statement ok
+DROP TABLE child
+
+statement ok
+DROP TABLE parent

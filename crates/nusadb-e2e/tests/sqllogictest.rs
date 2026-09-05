@@ -548,6 +548,11 @@ fn slt_p1_exclude_constraint() {
 }
 
 #[test]
+fn slt_p1_information_schema_extra() {
+    run_slt("tests/slt/p1_ddl/information_schema_extra.slt");
+}
+
+#[test]
 fn slt_p1_information_schema() {
     run_slt("tests/slt/p1_ddl/information_schema.slt");
 }

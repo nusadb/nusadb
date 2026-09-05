@@ -68,6 +68,7 @@ mod procedure;
 mod recursive;
 pub mod scan;
 mod script;
+mod seqcatalog;
 mod spill_setop;
 mod spill_sort;
 mod trigger;

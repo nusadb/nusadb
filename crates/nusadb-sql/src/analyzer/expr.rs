@@ -3950,6 +3950,44 @@ fn analyze_field_access(
     catalog: &dyn Catalog,
     aggregates: Option<&mut Vec<AggregateCall>>,
 ) -> Result<TypedExpr, Error> {
+    // An anonymous record's fields are named `f1..fN`, as the reference engine names them:
+    // `(ROW(1,'a')).f1` reads the first field. Any other name — or an out-of-range ordinal — is
+    // refused with the reference engine's own error (`42703`).
+    if let ast::Expr::Row(items) = base {
+        let base_typed = analyze_row_constructor(items, scope, catalog, aggregates)?;
+        let TypedExprKind::Composite(construct) = &base_typed.kind else {
+            return Err(Error::Internal(
+                "a ROW(...) base did not analyze to a composite construct".to_owned(),
+            ));
+        };
+        let CompositeExpr::Construct { field_types, .. } = construct.as_ref() else {
+            return Err(Error::Internal(
+                "a ROW(...) base did not analyze to a composite construct".to_owned(),
+            ));
+        };
+        let field_types = field_types.clone();
+        let index = field
+            .strip_prefix('f')
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= field_types.len())
+            .map(|n| n - 1)
+            .ok_or_else(|| Error::Coded {
+                message: format!("could not identify column \"{field}\" in record data type"),
+                sqlstate: "42703",
+            })?;
+        let field_ty = field_types
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::Internal("record field index out of range".to_owned()))?;
+        return Ok(TypedExpr {
+            kind: TypedExprKind::Composite(Box::new(CompositeExpr::Field {
+                base: Box::new(base_typed),
+                field_types,
+                index,
+            })),
+            ty: super::expr_type(field_ty),
+        });
+    }
     let Some(fields) = composite_type_of(base, scope, catalog)? else {
         return Err(Error::InvalidStatement(format!(
             "field access `.{field}` requires an operand of a known composite type (a composite \

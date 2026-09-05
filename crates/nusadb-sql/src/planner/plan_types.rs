@@ -33,6 +33,15 @@ pub enum InfoSchemaView {
     ApplicableRoles,
     /// `information_schema.enabled_roles` — one row per role the current session effectively holds.
     EnabledRoles,
+    /// `information_schema.referential_constraints` — one row per FOREIGN KEY with the referenced
+    /// unique constraint and the ON UPDATE / ON DELETE rules.
+    ReferentialConstraints,
+    /// `information_schema.check_constraints` — one row per CHECK constraint with its clause.
+    CheckConstraints,
+    /// `information_schema.routines` — one row per SQL function / procedure.
+    Routines,
+    /// `information_schema.sequences` — one row per sequence with its bounds and increment.
+    Sequences,
 }
 
 impl InfoSchemaView {
@@ -50,6 +59,10 @@ impl InfoSchemaView {
             Self::TablePrivileges => "table_privileges",
             Self::ApplicableRoles => "applicable_roles",
             Self::EnabledRoles => "enabled_roles",
+            Self::ReferentialConstraints => "referential_constraints",
+            Self::CheckConstraints => "check_constraints",
+            Self::Routines => "routines",
+            Self::Sequences => "sequences",
         }
     }
 
@@ -62,6 +75,10 @@ impl InfoSchemaView {
     /// The synthetic `TableSchema` for this view — defines the column names and types the view
     /// exposes. All columns are nullable to match SQL standard semantics.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat column list per view; splitting would scatter the view definitions"
+    )]
     pub fn table_schema(self) -> nusadb_core::TableSchema {
         use nusadb_core::{ColumnDef, ColumnType, TableSchema};
         // All `information_schema` columns are nullable TEXT, except a couple of integer ones; these
@@ -149,6 +166,46 @@ impl InfoSchemaView {
             ],
             Self::ApplicableRoles => vec![text("grantee"), text("role_name"), text("is_grantable")],
             Self::EnabledRoles => vec![text("role_name")],
+            Self::ReferentialConstraints => vec![
+                text("constraint_catalog"),
+                text("constraint_schema"),
+                text("constraint_name"),
+                text("unique_constraint_catalog"),
+                text("unique_constraint_schema"),
+                text("unique_constraint_name"),
+                text("match_option"),
+                text("update_rule"),
+                text("delete_rule"),
+            ],
+            Self::CheckConstraints => vec![
+                text("constraint_catalog"),
+                text("constraint_schema"),
+                text("constraint_name"),
+                text("check_clause"),
+            ],
+            Self::Routines => vec![
+                text("routine_catalog"),
+                text("routine_schema"),
+                text("routine_name"),
+                text("routine_type"),
+                text("data_type"),
+                text("external_language"),
+                text("routine_definition"),
+            ],
+            Self::Sequences => vec![
+                text("sequence_catalog"),
+                text("sequence_schema"),
+                text("sequence_name"),
+                text("data_type"),
+                int("numeric_precision"),
+                int("numeric_precision_radix"),
+                int("numeric_scale"),
+                text("start_value"),
+                text("minimum_value"),
+                text("maximum_value"),
+                text("increment"),
+                text("cycle_option"),
+            ],
         };
         TableSchema {
             schema: "public".to_owned(),
@@ -173,6 +230,10 @@ impl InfoSchemaView {
             "information_schema.table_privileges" => Some(Self::TablePrivileges),
             "information_schema.applicable_roles" => Some(Self::ApplicableRoles),
             "information_schema.enabled_roles" => Some(Self::EnabledRoles),
+            "information_schema.referential_constraints" => Some(Self::ReferentialConstraints),
+            "information_schema.check_constraints" => Some(Self::CheckConstraints),
+            "information_schema.routines" => Some(Self::Routines),
+            "information_schema.sequences" => Some(Self::Sequences),
             _ => None,
         }
     }

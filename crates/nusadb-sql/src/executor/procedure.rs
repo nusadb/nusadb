@@ -202,6 +202,28 @@ fn ensure_procedure_catalog(
     Ok(engine.create_table(txn, &def)?)
 }
 
+/// Every procedure's `(name, body)` — for `information_schema.routines`. Empty when the catalog
+/// does not exist yet.
+pub(super) fn all_procedures(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, String)>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, PROCEDURE_CATALOG)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &PROCEDURE_CATALOG_SCHEMA)?;
+        if let (Some(ast::Value::Text(name)), Some(ast::Value::Text(body))) =
+            (row.first(), row.get(3))
+        {
+            out.push((name.clone(), body.clone()));
+        }
+    }
+    Ok(out)
+}
+
 /// Whether a procedure named `name` exists.
 fn procedure_exists(engine: &dyn StorageEngine, txn: TxnId, name: &str) -> Result<bool, Error> {
     Ok(load_procedure(engine, txn, name)?.is_some())

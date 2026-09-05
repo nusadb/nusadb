@@ -90,9 +90,22 @@ SELECT count(*) FROM ct
 ----
 1
 
-# An unknown field on an anonymous record is refused (it has no declared field names).
-statement error
+# An anonymous record's fields are named f1..fN; an out-of-range ordinal is refused.
+query I
 SELECT (ROW(1, 'a')).f1
+----
+1
+
+query T
+SELECT (ROW(1, 'a')).f2
+----
+a
+
+statement error could not identify column
+SELECT (ROW(1, 'a')).f3
+
+statement error could not identify column
+SELECT (ROW(1, 'a')).x
 
 statement ok
 DROP TABLE rt

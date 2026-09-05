@@ -227,17 +227,17 @@ pub(super) fn run_create_table(
     // default, so INSERT's `lookup_sequence` resolves.
     for (_, sql) in &plan.defaults {
         if let Some(seq) = super::coldefault::serial_sequence(sql) {
-            engine.create_sequence(
-                txn,
-                &nusadb_core::engine::SequenceDef {
-                    name: seq.to_owned(),
-                    start: 1,
-                    increment: 1,
-                    min_value: 1,
-                    max_value: i64::MAX,
-                    cycle: false,
-                },
-            )?;
+            let def = nusadb_core::engine::SequenceDef {
+                name: seq.to_owned(),
+                start: 1,
+                increment: 1,
+                min_value: 1,
+                max_value: i64::MAX,
+                cycle: false,
+            };
+            engine.create_sequence(txn, &def)?;
+            // Mirror it so `information_schema.sequences` lists serial-backing sequences too.
+            super::seqcatalog::record(engine, txn, &def)?;
         }
     }
     // Persist column DEFAULTs / SERIAL sentinels in the SQL-layer catalog so INSERT can fill
@@ -1087,6 +1087,7 @@ pub(super) fn run_drop_table(
                     && let Some(id) = engine.lookup_sequence(seq)?
                 {
                     engine.drop_sequence(txn, id)?;
+                    super::seqcatalog::remove(engine, txn, seq)?;
                 }
             }
             super::coldefault::delete_defaults_for_table(&default_key, engine, txn)?;
@@ -1213,6 +1214,8 @@ pub(super) fn run_create_sequence(
         return Ok(ExecutionResult::SequenceCreated);
     }
     engine.create_sequence(txn, &plan.def)?;
+    // Mirror the definition so `information_schema.sequences` can enumerate it.
+    super::seqcatalog::record(engine, txn, &plan.def)?;
     Ok(ExecutionResult::SequenceCreated)
 }
 
@@ -1222,7 +1225,10 @@ pub(super) fn run_drop_sequence(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     match engine.lookup_sequence(&plan.name)? {
-        Some(id) => engine.drop_sequence(txn, id)?,
+        Some(id) => {
+            engine.drop_sequence(txn, id)?;
+            super::seqcatalog::remove(engine, txn, &plan.name)?;
+        },
         None => {
             if !plan.if_exists {
                 return Err(Error::SequenceNotFound {
@@ -1240,7 +1246,10 @@ pub(super) fn run_alter_sequence(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     match engine.lookup_sequence(&plan.name)? {
-        Some(id) => engine.alter_sequence(txn, id, &plan.change)?,
+        Some(id) => {
+            engine.alter_sequence(txn, id, &plan.change)?;
+            super::seqcatalog::apply_change(engine, txn, &plan.name, &plan.change)?;
+        },
         None => {
             if !plan.if_exists {
                 return Err(Error::SequenceNotFound {
