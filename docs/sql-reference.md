@@ -34,7 +34,7 @@ A quick map from the statement you are looking for to the section that shows it.
 | Statement | Section |
 | --- | --- |
 | `CREATE` / `ALTER` / `DROP TABLE`, `CREATE TEMP TABLE`, `CREATE TABLE AS`, `LIKE`, `INHERITS` | [Tables](#tables), [Altering](#altering) |
-| `PARTITION BY RANGE`, `PARTITION OF` | [Partitioned tables](#partitioned-tables) |
+| `PARTITION BY`, `PARTITION OF`, `ATTACH` / `DETACH PARTITION` | [Partitioned tables](#partitioned-tables) |
 | `CREATE` / `DROP INDEX` | [Indexes](#indexes) |
 | `CREATE` / `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `REFRESH` | [Views](#views-sequences-domains-schemas-databases) |
 | `CREATE` / `DROP SEQUENCE`, `DOMAIN`, `TYPE`, `SCHEMA`, `DATABASE` | [Views, sequences, ...](#views-sequences-domains-schemas-databases) |
@@ -296,9 +296,43 @@ DROP TABLE t;
 DROP TYPE point3;
 ```
 
-An enum value outside its label list is rejected on insert (`22P02`). A composite value is written
-and read as a whole, in its `'(a,b,c)'` text form; reading a single field out of it is not available
-yet.
+An enum value outside its label list is rejected on insert (`22P02`). Enum comparison and
+`MIN` / `MAX` follow the declaration order of the labels, not the label text, and mixing two
+different enum types in a comparison, `CASE`, `COALESCE`, `GREATEST` / `LEAST` or `NULLIF` is
+refused (`42883` / `42846`) rather than compared by position.
+
+A composite value is written as `ROW(...)` or in its `'(a,b,c)'` text form, and a single field is
+read back with `(value).field`:
+
+```sql
+CREATE TYPE pair AS (x INT, y TEXT);
+CREATE TABLE cpx (id INT, p pair);
+INSERT INTO cpx VALUES (1, ROW(7, 'seven')::pair), (2, '(8,eight)'::pair);
+
+SELECT id, (p).x, (p).y FROM cpx ORDER BY id;
+--  id | x | y
+-- ----+---+-------
+--   1 | 7 | seven
+--   2 | 8 | eight
+
+UPDATE cpx SET p = ROW(70, 'seventy')::pair WHERE (p).x = 7;
+DELETE FROM cpx WHERE (p).x = 8;
+```
+
+A bare `ROW(a, b)` with no cast is an anonymous record: it renders in the canonical text form
+(`(1,"a b")`), compares field by field, and its fields are read as `.f1 .. .fN`:
+
+```sql
+SELECT ROW(1, 'a b') AS r, (ROW(1, 'a')).f2 AS second;
+--        r        | second
+-- ---------------+-------
+--  (1,"a b")     | a
+SELECT (ROW(1, 'a')).f3;
+-- ERROR 42703: could not identify column "f3" in record data type
+```
+
+A row value can be compared (`ROW(a, b) = ROW(1, 'x')`) and counted, but not aggregated by
+`sum` / `min` / `max`.
 
 ---
 
@@ -357,9 +391,9 @@ CREATE TEMP TABLE scratch (id INT) ON COMMIT DROP;
 
 ### Partitioned tables
 
-A table can be split by ranges of one column. The parent stores no rows: an insert into it is
-routed to the partition whose range contains the key, a query on it reads every partition, and a
-row that fits no partition is refused.
+A table can be split by ranges, by value lists, or by hash. The parent stores no rows: an insert
+into it is routed to the matching partition, a query on it reads the partitions the `WHERE` clause
+cannot rule out, and a row that fits no partition is refused.
 
 ```sql
 CREATE TABLE events (id INT, region INT) PARTITION BY RANGE (region);
@@ -368,6 +402,7 @@ CREATE TABLE events_hi PARTITION OF events FOR VALUES FROM (100) TO (200);
 
 INSERT INTO events VALUES (1, 50), (2, 150);      -- routed to events_lo / events_hi
 SELECT id, region FROM events ORDER BY id;        -- reads both partitions
+SELECT id FROM events WHERE region = 42;          -- prunes: only events_lo is scanned
 
 INSERT INTO events VALUES (3, 500);
 -- ERROR 23514: no partition of relation "events" found for the inserted row
@@ -375,12 +410,65 @@ INSERT INTO events_lo VALUES (4, 150);
 -- ERROR 23514: the inserted row does not belong to partition "events_lo"
 ```
 
-Bounds are constant literals, half-open `[lo, hi)`; overlap and `lo >= hi` are refused at
-creation. The partition key must be written on every insert. What is not accepted: `LIST` /
-`HASH` / `DEFAULT` partitions, `MINVALUE` / `MAXVALUE` or multi-column bounds, sub-partitioning, a
-partition declaring its own columns, `UNIQUE` / `PRIMARY KEY` / `CHECK` / `FOREIGN KEY` on the
-parent (they would not span partitions), `INSERT ... ON CONFLICT` into the parent, and `UPDATE` /
-`DELETE` or `DROP TABLE` on a parent that still has partitions; write to the partitions directly.
+The three strategies, plus a catch-all partition:
+
+```sql
+CREATE TABLE traffic (id INT, region TEXT) PARTITION BY LIST (region);
+CREATE TABLE traffic_asia PARTITION OF traffic FOR VALUES IN ('ID', 'SG', 'JP');
+CREATE TABLE traffic_rest PARTITION OF traffic DEFAULT;
+INSERT INTO traffic VALUES (1, 'ID'), (2, 'US'), (3, NULL);   -- 2 and 3 land in traffic_rest
+
+CREATE TABLE loads (id INT, v TEXT) PARTITION BY HASH (id);
+CREATE TABLE loads_0 PARTITION OF loads FOR VALUES WITH (MODULUS 3, REMAINDER 0);
+CREATE TABLE loads_1 PARTITION OF loads FOR VALUES WITH (MODULUS 3, REMAINDER 1);
+CREATE TABLE loads_2 PARTITION OF loads FOR VALUES WITH (MODULUS 3, REMAINDER 2);
+```
+
+A range key may span several columns, compared as a tuple, and a partition may itself be
+partitioned:
+
+```sql
+CREATE TABLE metrics (y INT, mo INT, v TEXT) PARTITION BY RANGE (y, mo);
+CREATE TABLE metrics_q2 PARTITION OF metrics FOR VALUES FROM (2026, 4) TO (2026, 7);
+
+CREATE TABLE logs (y INT, mo INT) PARTITION BY RANGE (y);
+CREATE TABLE logs_2026 PARTITION OF logs
+  FOR VALUES FROM (2026) TO (2027) PARTITION BY RANGE (mo);
+CREATE TABLE logs_2026_h1 PARTITION OF logs_2026 FOR VALUES FROM (1) TO (7);
+```
+
+An existing table with matching columns can be attached, and a partition detached into an
+ordinary table:
+
+```sql
+CREATE TABLE events_archive (id INT, region INT);
+ALTER TABLE events ATTACH PARTITION events_archive FOR VALUES FROM (200) TO (300);
+ALTER TABLE events DETACH PARTITION events_archive;
+```
+
+Worth knowing:
+
+- Range bounds are constant literals, half-open `[lo, hi)`, compared per tuple, so a multi-column
+  key exactly on a boundary belongs to the upper partition. Overlap, `lo >= hi`, wrong bound
+  arity, and a bound kind that does not match the parent's strategy are refused at creation, and
+  `ATTACH` scans the table first and refuses if an existing row falls outside the bound.
+- The `DEFAULT` partition takes every row no sibling accepts, including a NULL key (a NULL key
+  with no default partition is refused, since no range, list or hash bound matches NULL). A hash
+  parent takes no default, and a new sibling whose bound overlaps rows already in the default is
+  refused.
+- `UPDATE` and `DELETE` on the parent reach every partition; `ONLY` restricts them to the parent
+  itself. An `UPDATE` that changes the partition key does not move the row between partitions, so
+  change the key by delete-and-insert.
+- The partition key must be written on every insert; the planner prunes partitions using `WHERE`
+  conditions of the shape `key = / < / <= / > / >= constant` and `key BETWEEN a AND b`, which shows
+  in `EXPLAIN` as fewer scanned partitions.
+- `DROP TABLE` on the parent drops the whole partition tree with it.
+- Parent and partitions may live in different schemas; qualified names work everywhere.
+
+Not accepted: an expression as a partition key, `LIST` with more than one key column,
+`MINVALUE` / `MAXVALUE` bounds, non-literal bounds, a partition declaring its own columns,
+`UNIQUE` / `PRIMARY KEY` / `CHECK` / `FOREIGN KEY` on a partitioned parent (they would not span
+partitions), and `INSERT ... ON CONFLICT` into a partitioned table.
 
 ### Inherited tables
 
@@ -397,14 +485,15 @@ INSERT INTO capitals VALUES ('Jakarta', 10000000, 'JK');
 SELECT name FROM cities ORDER BY name;        -- Bandung, Jakarta
 SELECT name FROM ONLY cities;                 -- Bandung
 
-UPDATE ONLY cities SET pop = pop + 1;         -- the parent's own rows
-UPDATE cities SET pop = 0;
--- ERROR 0A000: refused while descendants exist, rather than silently touching only the parent
+UPDATE cities SET pop = pop + 1;              -- reaches capitals too
+UPDATE ONLY cities SET pop = 0;               -- just the parent's own rows
+DELETE FROM cities WHERE pop = 0;             -- likewise propagates; ONLY restricts
 ```
 
 A child may redeclare an inherited column only with the same type; `NOT NULL` holds only if every
-copy has it. Dropping a parent that still has children is refused (`2BP01`). Row-level security
-applies per table, so each descendant's policies govern its own rows.
+copy has it. Dropping a parent that still has children is refused (`2BP01`); `DROP TABLE ...
+CASCADE` drops the descendants with it. Row-level security applies per table, so each descendant's
+policies govern its own rows.
 
 ### Altering
 
@@ -516,7 +605,8 @@ incrementally is refused rather than silently downgraded.
 `ALTER SEQUENCE` takes any mix of `INCREMENT [BY]`, `MINVALUE` / `NO MINVALUE`, `MAXVALUE` /
 `NO MAXVALUE`, `START [WITH]`, `RESTART [[WITH] n]`, `CACHE n` (accepted, no effect) and
 `CYCLE` / `NO CYCLE`, validates the merged definition, and `IF EXISTS` makes a missing sequence a
-no-op. Sequence functions take the sequence name as a text literal and may only appear where they
+no-op. `information_schema.sequences` lists every sequence with its bounds (a sequence created on
+an older release appears there after its first `ALTER SEQUENCE`). Sequence functions take the sequence name as a text literal and may only appear where they
 are evaluated exactly once: a `SELECT` without `FROM`, a `VALUES` row, or a column default.
 
 `CREATE DOMAIN` accepts a base type and a `CHECK`; a `DEFAULT` or `COLLATE` on a domain is not
@@ -1193,6 +1283,14 @@ SELECT * FROM information_schema.table_privileges;
 SELECT * FROM information_schema.applicable_roles;
 SELECT * FROM information_schema.enabled_roles;
 
+SELECT constraint_name, unique_constraint_name, update_rule, delete_rule
+FROM   information_schema.referential_constraints;    -- foreign keys and their rules
+SELECT constraint_name, check_clause FROM information_schema.check_constraints;
+SELECT routine_name, routine_type, data_type, external_language
+FROM   information_schema.routines;                   -- functions and procedures
+SELECT sequence_name, start_value, increment, cycle_option
+FROM   information_schema.sequences;
+
 SELECT * FROM nusadb_databases;       -- every database in this server
 SELECT * FROM nusadb_triggers;        -- likewise nusadb_roles, nusadb_policies, nusadb_procedures,
                                       -- nusadb_functions, nusadb_matviews
@@ -1208,7 +1306,7 @@ SELECT nusadb_typeof(1.5), nusadb_typeof(now());
 `nusadb_procedures (name, param_count, out_params, body)`, `nusadb_functions (name, param_count,
 param_names, body, language, return_type)`, `nusadb_matviews (name, def)`,
 `nusadb_partitions (role, table, aux, lo, hi)`, `nusadb_inheritance (child, parent, seq)`,
-`nusadb_databases (name)`. Only a superuser may read a `nusadb_*` catalog; every other role uses
+`nusadb_sequences`, `nusadb_databases (name)`. Only a superuser may read a `nusadb_*` catalog; every other role uses
 `information_schema`. A catalog that has never been written to may not exist yet, in which case
 selecting from it reports `42P01`.
 
@@ -1554,6 +1652,13 @@ only the number of digits kept differs. Round explicitly when a specific scale m
 input text are not preserved. Keep the original text in a `TEXT` column when byte fidelity matters,
 such as a signed payload.
 
+### Floating-point text output is canonical
+
+A `REAL` / `DOUBLE PRECISION` value renders in the shortest form that reads back to the same
+number, switching to exponent notation outside `0.0001 .. 10^15` (`1e+20`, `2.5e-07`), and the
+non-finite values render `Infinity`, `-Infinity` and `NaN`. The same rendering is used in query
+results, casts to text and array elements, so the three always agree.
+
 ### Assigning between `TIMESTAMP` and `TIMESTAMPTZ`
 
 A value of either type can be assigned to a column of the other and the instant passes through
@@ -1619,12 +1724,12 @@ the resident ceiling. See [deployment](deployment.md) before loading a large dat
 
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
-- table partitioning other than single-column `PARTITION BY RANGE` with literal bounds (no `LIST`,
-  `HASH`, `DEFAULT` partitions, `MINVALUE` / `MAXVALUE`, or sub-partitioning);
+- an expression as a partition key, `LIST` partitioning over several columns, `MINVALUE` /
+  `MAXVALUE` partition bounds, and `INSERT ... ON CONFLICT` into a partitioned table;
 - `EXCLUDE` constraints with an operator other than `=`;
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;
-- reading one field out of a composite value;
+- aggregating a row value with anything but `count`;
 - dollar-quoted string literals outside a routine body;
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
 - `INSTEAD OF` triggers;
