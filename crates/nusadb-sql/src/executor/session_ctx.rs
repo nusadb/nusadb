@@ -216,6 +216,9 @@ pub(super) fn builtin_guc_static_default(name: &str) -> Option<&'static str> {
         "standard_conforming_strings" | "integer_datetimes" => "on",
         "datestyle" => "ISO, MDY",
         "timezone" => "UTC",
+        // The engine sends no sub-error messages at all, so every threshold is trivially honoured;
+        // the parameter exists for client tooling that sets it, reporting the standard default.
+        "client_min_messages" => "notice",
         // Reported for `SHOW search_path` when the session has not `SET` it — the standard default.
         // A `$user` schema does not exist here, so name resolution simply falls through to `public`
         // (its effective behavior), while the reported value matches the reference engine.
@@ -260,6 +263,7 @@ pub fn check_settable_parameter(name: &str) -> Result<(), Error> {
                 | crate::retry::MAX_AUTOCOMMIT_RETRIES
                 // Reported parameters a session may still set.
                 | "client_encoding"
+                | "client_min_messages"
                 | "standard_conforming_strings"
                 | "datestyle"
                 | "timezone"

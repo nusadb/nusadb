@@ -1562,6 +1562,8 @@ SET statement_timeout = '30s';         -- a bare number is milliseconds; 0 disab
 SET max_autocommit_retries = 50;       -- 0 turns the server-side retry off; capped at 100
 SET hnsw_ef_search = 100;
 SET default_transaction_isolation = 'serializable';
+SET TIME ZONE '+07';                   -- session zone: UTC/GMT or a fixed offset
+SET client_min_messages = warning;     -- client message threshold
 SET myapp.tenant = '7';                -- application variables need a class prefix
 SELECT current_setting('myapp.tenant');
 SHOW search_path;
@@ -1578,6 +1580,7 @@ RESET ALL;
 | `hnsw_ef_search` | candidate list size for vector index search; higher is more accurate and slower |
 | `default_transaction_isolation` | isolation level for the next transactions in this session |
 | `timezone` (also `SET TIME ZONE`) | the session time zone: `UTC`, `GMT`, or a fixed offset; see [Dates, times and intervals](#dates-times-and-intervals) |
+| `client_min_messages` | client message threshold (`debug5`..`error`); the engine sends no sub-error messages, so any level is honoured |
 | `client_encoding`, `datestyle`, `standard_conforming_strings` | accepted and echoed back; the engine is UTF-8, ISO dates |
 | `server_version`, `server_encoding`, `integer_datetimes` | read-only (`55P02` on `SET`) |
 | `<class>.<name>` | application-defined; any dotted name |

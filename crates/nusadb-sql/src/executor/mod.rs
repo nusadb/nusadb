@@ -54,6 +54,34 @@ pub(crate) fn current_timezone_setting() -> Option<String> {
     session_ctx::current_timezone_setting()
 }
 
+/// Validate a `SET client_min_messages` value and return the canonical (lowercase) level.
+///
+/// The level set is the reference engine's: `debug5`..`debug1` (bare `debug` = `debug2`), `log`,
+/// `notice`, `warning`, `error` — case-insensitive. The engine sends no sub-error messages, so
+/// every threshold is trivially honoured; validating here keeps a typo loud instead of stored.
+/// Shared by the embedded session and the wire server so the two cannot drift.
+///
+/// # Errors
+/// `22023` for a value outside the level set.
+pub fn canonicalize_client_min_messages(value: &str) -> Result<String, Error> {
+    let folded = value.to_ascii_lowercase();
+    let canonical = match folded.as_str() {
+        // A bare `debug` is the reference engine's alias for `debug2`.
+        "debug" => "debug2".to_owned(),
+        "debug5" | "debug4" | "debug3" | "debug2" | "debug1" | "log" | "notice" | "warning"
+        | "error" => folded,
+        _ => {
+            return Err(Error::Coded {
+                message: format!(
+                    "invalid value for parameter \"client_min_messages\": \"{value}\""
+                ),
+                sqlstate: "22023", // invalid_parameter_value
+            });
+        },
+    };
+    Ok(canonical)
+}
+
 /// Validate a `SET timezone` / `SET TIME ZONE` value and return the canonical form to store.
 ///
 /// The canonical form is exactly what `SHOW timezone` then reports and what the zone-dependent
@@ -1942,6 +1970,12 @@ impl<'engine> Session<'engine> {
             && let Some(v) = &value
         {
             value = Some(canonicalize_timezone_setting(v)?);
+        }
+        // Same loud SET-time validation for the message-threshold level.
+        if name == "client_min_messages"
+            && let Some(v) = &value
+        {
+            value = Some(canonicalize_client_min_messages(v)?);
         }
         let is_search_path = name == "search_path";
         match value {

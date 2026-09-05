@@ -3872,6 +3872,12 @@ fn apply_set_variable(
     {
         sv.value = Some(nusadb_sql::canonicalize_timezone_setting(value)?);
     }
+    // Same loud SET-time validation for the message-threshold level.
+    if sv.name == "client_min_messages"
+        && let Some(value) = &sv.value
+    {
+        sv.value = Some(nusadb_sql::canonicalize_client_min_messages(value)?);
+    }
     if sv
         .name
         .eq_ignore_ascii_case("default_transaction_isolation")

@@ -1,0 +1,58 @@
+# SET client_min_messages — the client message-threshold level. The engine sends no sub-error
+# messages at all, so every threshold is trivially honoured; the parameter exists for client
+# tooling. Values are the reference engine's level set, case-insensitive, stored lowercase;
+# a bare `debug` is the `debug2` alias; anything else is refused loudly at SET time.
+
+query T
+SHOW client_min_messages
+----
+notice
+
+statement ok
+SET client_min_messages TO warning
+
+query T
+SHOW client_min_messages
+----
+warning
+
+statement ok
+SET client_min_messages = 'ERROR'
+
+query T
+SHOW client_min_messages
+----
+error
+
+statement ok
+SET client_min_messages TO debug
+
+query T
+SHOW client_min_messages
+----
+debug2
+
+statement ok
+SET client_min_messages TO 'NoTiCe'
+
+query T
+SHOW client_min_messages
+----
+notice
+
+statement error invalid value for parameter "client_min_messages"
+SET client_min_messages TO panic
+
+statement error invalid value for parameter "client_min_messages"
+SET client_min_messages TO 'bogus'
+
+statement ok
+SET client_min_messages TO debug3
+
+statement ok
+RESET client_min_messages
+
+query T
+SHOW client_min_messages
+----
+notice

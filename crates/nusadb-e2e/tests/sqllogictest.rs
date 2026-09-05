@@ -470,6 +470,11 @@ fn slt_p1_create_drop() {
 }
 
 #[test]
+fn slt_p1_session_guc() {
+    run_slt("tests/slt/p1_ddl/session_guc.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }
