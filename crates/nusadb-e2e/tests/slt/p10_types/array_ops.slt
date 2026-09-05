@@ -208,3 +208,25 @@ query T
 SELECT CAST(ARRAY[1, CAST(NULL AS INT)] @> ARRAY[1] AS TEXT)
 ----
 true
+
+# A set-returning SELECT item may be ORDER BY'd: the sort runs after the expansion (its values do
+# not exist on the source row), keys rewritten to the output column.
+query I
+SELECT generate_series(3, 1, -1) ORDER BY 1
+----
+1
+2
+3
+
+query I
+SELECT unnest(ARRAY[30, 10, 20]) ORDER BY 1 DESC
+----
+30
+20
+10
+
+query I
+SELECT generate_series(1, 3) ORDER BY 1 LIMIT 2
+----
+1
+2

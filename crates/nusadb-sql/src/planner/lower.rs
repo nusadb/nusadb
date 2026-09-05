@@ -478,7 +478,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             k,
             filter,
         };
-    } else if !select.order_by.is_empty() {
+    } else if !select.order_by.is_empty() && !select.sort_after_projection {
         // `FOR UPDATE ... SKIP LOCKED` fills its LIMIT from *lockable* rows — the executor skips a
         // row another txn holds locked and keeps scanning. A capped ordered index scan can't honour
         // that, so it is disqualified below; the Sort+SeqScan path is kept instead.
@@ -499,8 +499,8 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             // rows are ever consumed — let the executor select them without a full O(N log N) sort.
             op = PhysicalOperator::Sort {
                 input: Box::new(op),
-                keys: select.order_by,
-                limit_ties: ties_cap,
+                keys: std::mem::take(&mut select.order_by),
+                limit_ties: ties_cap.clone(),
                 top_n: top_n_hint,
             };
         }
@@ -532,6 +532,17 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             columns: select.projection,
         }
     };
+    // A sort whose keys reference the projected output (a set-returning SELECT item — its values
+    // exist only after `ProjectSet` expands them) runs here, above the projection. The analyzer
+    // rewrote every key to a `Column` of its output position, so they evaluate against these rows.
+    if select.sort_after_projection && !select.order_by.is_empty() {
+        op = PhysicalOperator::Sort {
+            input: Box::new(op),
+            keys: std::mem::take(&mut select.order_by),
+            limit_ties: ties_cap,
+            top_n: top_n_hint,
+        };
+    }
     // DISTINCT dedupes the projected output rows, so it sits above `Project`
     // (and below `Limit`, which caps the already-deduped stream).
     if select.distinct {

@@ -3867,6 +3867,10 @@ fn eval_math(func: ast::ScalarFunc, vals: &[ast::Value]) -> Result<ast::Value, E
         F::Atan2 => Float(f(0).atan2(f(1))),
         // COT = 1/tan; tan(0) is finite so this yields ±inf at multiples of pi, matching f64 semantics.
         F::Cot => Float(f(0).tan().recip()),
+        // CBRT via the libm cube root. The reference engine computes pow(|x|, 1/3), whose last-ulp
+        // rounding is platform-libm-specific (glibc: cbrt(27) = 3.0000000000000004; this route: the
+        // exact 3) — a 1-ulp cross-platform artifact, not reproducible bit-for-bit, documented as a
+        // known differential divergence.
         F::Cbrt => Float(f(0).cbrt()),
         F::Sinh => Float(f(0).sinh()),
         F::Cosh => Float(f(0).cosh()),

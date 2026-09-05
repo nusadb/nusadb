@@ -1666,10 +1666,13 @@ fn navigate(value: J, path: &[&str]) -> Option<J> {
     Some(cur)
 }
 
-/// Render a JSON value as SQL text: a string yields its raw contents, everything else its JSON form.
+/// Render a JSON value as SQL text: a string yields its raw contents, a container renders in the
+/// spaced display form (`[1, 2, 3]`, `{"a": 1}`) the reference engine uses for an extracted
+/// object/array, and every other scalar its JSON form.
 fn scalar_text(v: &J) -> String {
     match v {
         J::String(s) => s.clone(),
+        other @ (J::Object(_) | J::Array(_)) => display_form(&to_text(other)),
         other => to_text(other),
     }
 }

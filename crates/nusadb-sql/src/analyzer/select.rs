@@ -138,6 +138,7 @@ fn analyze_values_table(
         projection,
         filter: None,
         order_by: Vec::new(),
+        sort_after_projection: false,
         limit: None,
         limit_with_ties: false,
         offset: None,
@@ -190,6 +191,7 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
         projection,
         filter: None,
         order_by: Vec::new(),
+        sort_after_projection: false,
         limit: None,
         limit_with_ties: false,
         offset: None,
@@ -1287,6 +1289,7 @@ pub(super) fn analyze_set_operation(
             nulls: item.nulls,
         });
     }
+
     let (columns, column_types) = cols.into_iter().unzip();
     Ok(SetOpPlan {
         tree,
@@ -1701,6 +1704,31 @@ fn analyze_select_scoped(
         });
     }
 
+    // A sort key that is (or contains) the set-returning SELECT item can only be ordered AFTER
+    // `ProjectSet` expands it — its values do not exist on the source row. When any key is the SRF
+    // item, rewrite EVERY key to the output column of the projection item it matches and mark the
+    // plan to sort above the projection; a key matching no projected item would reference a source
+    // row the post-projection sort no longer sees, so it is refused loudly.
+    let sort_after_projection = order_by
+        .iter()
+        .any(|k| matches!(k.expr.kind, TypedExprKind::SetReturning { .. }));
+    if sort_after_projection {
+        for key in &mut order_by {
+            let Some(pos) = projection.iter().position(|p| p.expr == key.expr) else {
+                return Err(Error::Unsupported(
+                    "ORDER BY beside a set-returning SELECT item may only reference the selected \
+                     columns"
+                        .to_owned(),
+                ));
+            };
+            let ty = projection.get(pos).map_or(key.expr.ty, |p| p.expr.ty);
+            key.expr = TypedExpr {
+                kind: TypedExprKind::Column(pos),
+                ty,
+            };
+        }
+    }
+
     // Rebase output expressions onto the synthesized post-aggregation row
     // `[group keys ++ aggregate results]`: group-key columns become
     // `AggregateRef(k)`, aggregate refs shift past the group keys, and any
@@ -1837,6 +1865,7 @@ fn analyze_select_scoped(
         projection,
         filter,
         order_by,
+        sort_after_projection,
         limit: sel.limit,
         limit_with_ties,
         offset: sel.offset,

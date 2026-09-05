@@ -1457,6 +1457,10 @@ pub enum InsertSource {
 
 /// `SELECT` — source resolved, projection and predicates type-checked.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent plan property (DISTINCT/WITH TIES/post-projection sort), not a state machine"
+)]
 pub struct SelectPlan {
     /// Resolved base source table; `None` for a `SELECT` without `FROM` or one whose base source is
     /// a CTE (see `from_cte`).
@@ -1494,6 +1498,11 @@ pub struct SelectPlan {
     /// `ORDER BY` keys, in priority order. For an aggregated `SELECT` these
     /// reference the synthesized post-aggregation row (see `aggregates`).
     pub order_by: Vec<OrderByKey>,
+    /// When `true`, the `order_by` keys reference the PROJECTED output row (each rewritten to a
+    /// [`TypedExprKind::Column`] of its output position) and the sort runs above the projection —
+    /// used when a key is the set-returning SELECT item, whose values exist only after `ProjectSet`
+    /// expands them. `false` for the ordinary source-row sort below the projection.
+    pub sort_after_projection: bool,
     /// `LIMIT` row cap.
     pub limit: Option<u64>,
     /// `OFFSET` — rows to skip before `LIMIT`. `None` for none.
