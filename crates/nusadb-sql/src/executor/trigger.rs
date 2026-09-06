@@ -1113,7 +1113,7 @@ fn sub_script_stmt(stmt: &mut ScriptStmt, refs: &RowRefs<'_>) -> Result<(), Erro
             sub_expr(high, refs)?;
             sub_script_stmts(body, refs)
         },
-        ScriptStmt::Raise(expr) => sub_expr(expr, refs),
+        ScriptStmt::Perform(expr) | ScriptStmt::Raise(expr) => sub_expr(expr, refs),
         // A trigger function's RETURN value is a row the side-effect firing model discards, so
         // neutralize it to a bare RETURN: it still stops the routine (preserving control flow)
         // without evaluating a `NEW`/`OLD` row reference the executor cannot produce as a value.

@@ -480,6 +480,11 @@ fn slt_p1_create_like_including() {
 }
 
 #[test]
+fn slt_p1_surface_gaps_batch() {
+    run_slt("tests/slt/p1_ddl/surface_gaps_batch.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }

@@ -78,6 +78,9 @@ pub(crate) enum ScriptStmt {
         /// Loop body.
         body: Vec<Self>,
     },
+    /// `PERFORM expr` — evaluate an expression and discard the result (the reference dialect's
+    /// spelling for a call made for its side effects).
+    Perform(ast::Expr),
     /// `RAISE expr` — abort the procedure with the message `expr` evaluates to.
     Raise(ast::Expr),
     /// `RETURN [expr]` — stop the routine. A procedure uses the bare `RETURN` (`None`); a function
@@ -218,6 +221,10 @@ fn parse_one(parser: &mut Parser) -> Result<ScriptStmt, Error> {
         Some("for") => {
             parser.next_token();
             parse_for(parser)
+        },
+        Some("perform") => {
+            parser.next_token();
+            Ok(ScriptStmt::Perform(parse_expr(parser)?))
         },
         Some("raise") => {
             parser.next_token();

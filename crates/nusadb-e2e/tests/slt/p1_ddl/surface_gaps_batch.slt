@@ -1,0 +1,157 @@
+# The final loud-unsupported batch: RENAME COLUMN carries the column's default across; CREATE
+# INDEX accepts the reference engine's access-method names (hash/brin as declared kinds, gin/
+# gist/spgist backed by the same tree; unknown method = 42704); the prefix root operators |/
+# and ||/ bind looser than arithmetic and tighter than comparison; make_interval() takes named
+# arguments; FOR UPDATE covers an inheritance parent (parent + descendants); DO bodies accept
+# PERFORM (evaluate + discard).
+
+statement ok
+CREATE TABLE syn (id SERIAL PRIMARY KEY, age INT, status TEXT DEFAULT 'active', score NUMERIC(6,2) DEFAULT 0)
+
+statement ok
+ALTER TABLE syn RENAME COLUMN score TO points
+
+statement ok
+INSERT INTO syn (age) VALUES (1)
+
+query TT
+SELECT points::text, status FROM syn
+----
+0.00 active
+
+statement ok
+UPDATE syn SET points = age * 1.5 WHERE age IS NOT NULL
+
+query T
+SELECT points::text FROM syn
+----
+1.50
+
+# A SERIAL sentinel also survives a rename of its own (non-key) column: same backing sequence.
+statement ok
+CREATE TABLE ser (n SERIAL, v TEXT)
+
+statement ok
+ALTER TABLE ser RENAME COLUMN n TO num
+
+statement ok
+INSERT INTO ser (v) VALUES ('a')
+
+statement ok
+INSERT INTO ser (v) VALUES ('b')
+
+query I
+SELECT num FROM ser WHERE v = 'b'
+----
+2
+
+statement ok
+DROP TABLE ser
+
+# A key column's rename is still refused loudly (the constraint records it by name).
+statement error refers to it by name
+ALTER TABLE syn RENAME COLUMN id TO ident
+
+statement ok
+CREATE TABLE t_idx (id INT, n TEXT, j JSONB)
+
+statement ok
+CREATE INDEX i_h ON t_idx USING hash (n)
+
+statement ok
+CREATE INDEX i_g ON t_idx USING gin (j)
+
+statement ok
+CREATE INDEX i_br ON t_idx USING brin (id)
+
+statement error access method "bogus" does not exist
+CREATE INDEX i_bad ON t_idx USING bogus (id)
+
+statement ok
+INSERT INTO t_idx VALUES (1, 'a', '{}')
+
+query T
+SELECT n FROM t_idx WHERE n = 'a'
+----
+a
+
+query T
+SELECT (|/ 25.0)::text
+----
+5
+
+query T
+SELECT (|/ 25.0 + 11)::text
+----
+6
+
+query T
+SELECT (2 * |/ 25.0)::text
+----
+10
+
+query T
+SELECT (|/ 25.0 = 5)::text
+----
+true
+
+query T
+SELECT (||/ 27.0 > 2.9)::text
+----
+true
+
+query T
+SELECT make_interval(days => 5, hours => 3)::text
+----
+5 days 03:00:00
+
+query T
+SELECT make_interval(1, months => 3)::text
+----
+1 year 3 mons
+
+statement error specified more than once
+SELECT make_interval(years => 1, years => 2)
+
+statement error no parameter
+SELECT make_interval(bogus => 1)
+
+statement ok
+CREATE TABLE t_parent (id INT PRIMARY KEY, n TEXT)
+
+statement ok
+CREATE TABLE t_kid () INHERITS (t_parent)
+
+statement ok
+INSERT INTO t_parent VALUES (1, 'p')
+
+statement ok
+INSERT INTO t_kid VALUES (2, 'c')
+
+# FOR UPDATE on the parent locks matched rows across the parent and its descendants; the child's
+# row is visible and lockable through the parent scan.
+query I
+SELECT id FROM t_parent WHERE id = 2 FOR UPDATE
+----
+2
+
+query I rowsort
+SELECT id FROM t_parent FOR UPDATE
+----
+1
+2
+
+statement ok
+DO 'BEGIN PERFORM 1; END'
+
+statement ok
+DROP TABLE t_kid
+
+statement ok
+DROP TABLE t_parent
+
+statement ok
+DROP TABLE t_idx
+
+statement ok
+DROP TABLE syn

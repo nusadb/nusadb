@@ -182,13 +182,26 @@ impl Dialect for NusaParserDialect {
         // here as a prefix operator (there is no numeric prefix factorial in NusaDB's surface, so the
         // spelling is unambiguous). A `@@` in infix position (the full-text match) is untouched — the
         // hooks fire only in prefix position.
-        let op = match parser.peek_token().token {
-            Token::AtAt => sql::UnaryOperator::DoubleAt,
-            Token::DoubleExclamationMark => sql::UnaryOperator::PGPrefixFactorial,
+        // Prefix `|/` (square root) and `||/` (cube root) — sqlparser gates them behind the
+        // reference dialect's type-id, so recognize them here. Their operand binds at the
+        // "any other operator" level: LOOSER than arithmetic (`|/ 25 + 11` roots 36) but TIGHTER
+        // than comparison (`|/ 25 = 5` compares the root) — a raw level between Eq (20) and
+        // PlusMinus (30), which no named [`Precedence`] variant provides.
+        const PREFIX_ROOT_PREC: u8 = 21;
+        let (op, prec) = match parser.peek_token().token {
+            Token::AtAt => (
+                sql::UnaryOperator::DoubleAt,
+                self.prec_value(Precedence::PlusMinus),
+            ),
+            Token::DoubleExclamationMark => (
+                sql::UnaryOperator::PGPrefixFactorial,
+                self.prec_value(Precedence::PlusMinus),
+            ),
+            Token::PGSquareRoot => (sql::UnaryOperator::PGSquareRoot, PREFIX_ROOT_PREC),
+            Token::PGCubeRoot => (sql::UnaryOperator::PGCubeRoot, PREFIX_ROOT_PREC),
             _ => return None,
         };
         parser.next_token();
-        let prec = self.prec_value(Precedence::PlusMinus);
         Some(parser.parse_subexpr(prec).map(|expr| sql::Expr::UnaryOp {
             op,
             expr: Box::new(expr),

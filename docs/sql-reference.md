@@ -552,9 +552,11 @@ ALTER TABLE orders DISABLE ROW LEVEL SECURITY;
 
 `ALTER TABLE t DISABLE TRIGGER name` and `ENABLE TRIGGER name` are shown under [Triggers](#triggers).
 
-`RENAME COLUMN` succeeds when nothing else records the column by name. If a user-defined check,
-foreign key, index, default, view, trigger or policy refers to it, the rename is refused and the
-error names what is in the way. Drop that object, rename, and recreate it.
+`RENAME COLUMN` carries the column's own `DEFAULT` (including a `SERIAL` sentinel — the backing
+sequence keeps its name) across the rename. It succeeds when nothing else records the column by
+name; if a user-defined check, foreign key, index, view, trigger or policy refers to it, the
+rename is refused and the error names what is in the way. Drop that object, rename, and recreate
+it.
 
 Not accepted: `ADD COLUMN ... FIRST | AFTER`, an inline `CHECK` or `REFERENCES` on `ADD COLUMN`,
 `DROP COLUMN ... CASCADE`, dropping several columns in one statement, `ADD CONSTRAINT ... NOT VALID`,
@@ -575,8 +577,10 @@ CREATE INDEX orders_nulls ON orders (total DESC NULLS FIRST);
 DROP INDEX IF EXISTS orders_desc;
 ```
 
-Index methods are the default B-tree (`USING btree` is accepted and means the same) and `hnsw` for
-vectors. A per-key `NULLS FIRST` / `NULLS LAST` is accepted; it does not change results, because a
+Index methods: the scalar structure is always the B-tree. `USING btree` names it explicitly;
+`USING hash` and `USING brin` record the declared method with the same tree answering the scans
+(it covers at least what those methods promise); `USING gin`, `gist` and `spgist` back onto the
+default tree; `USING hnsw` selects the vector index. An unknown method is an error (`42704`). A per-key `NULLS FIRST` / `NULLS LAST` is accepted; it does not change results, because a
 query whose ordering column is nullable is served by an explicit sort that follows the query's own
 `NULLS` clause. The planner picks an index from
 collected statistics, so run `ANALYZE` after a large load (see [Maintenance](#maintenance)).
@@ -1239,7 +1243,8 @@ Locks never wait. A row someone else has locked fails immediately with `40001`, 
 implied; `SKIP LOCKED` steps over such rows instead, which is the usual shape for a job queue.
 
 ```sql
-SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;      -- also on an inheritance parent (locks
+                                                   -- matched rows in parent and children)
 SELECT * FROM orders ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;   -- claim one job
 SELECT * FROM orders FOR UPDATE OF orders NOWAIT;
 SELECT * FROM orders FOR SHARE;
@@ -1366,7 +1371,8 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 
 ### Numeric
 
-`abs`, `round`, `trunc`, `ceil`, `ceiling`, `floor`, `sign`, `mod`, `div`, `power`, `pow`, `sqrt`,
+`abs`, `round`, `trunc`, `ceil`, `ceiling`, `floor`, `sign`, `mod`, `div`, `power`, `pow`, `sqrt`
+(also the prefix `|/` operator; `||/` is `cbrt`),
 `cbrt`, `exp`, `ln`, `log` (`log(x)` is base 10, `log(b, x)` is base `b`), `log10`, `sin`, `cos`,
 `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`,
 `degrees`, `radians`, `pi`, `gcd`, `lcm`, `factorial`, `bit_count`, `to_hex`, `to_number`,
@@ -1382,7 +1388,8 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 `now`, `transaction_timestamp`, `statement_timestamp`, `current_timestamp`, `current_date`,
 `current_time`, `localtimestamp`, `date_trunc`, `date_part`, `EXTRACT(field FROM x)`, `date_bin`,
 `age`, `to_char`, `to_date`, `to_timestamp`, `make_date`, `make_time`, `make_timestamp`,
-`make_timestamptz`, `make_interval`, `justify_days`, `justify_hours`, `justify_interval`,
+`make_timestamptz`, `make_interval` (positional or named: `make_interval(days => 5)`),
+`justify_days`, `justify_hours`, `justify_interval`,
 `x AT TIME ZONE zone`.
 
 `EXTRACT` fields: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `dow`,

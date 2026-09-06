@@ -364,9 +364,31 @@ pub(super) fn analyze_create_index(
             ));
         }
     }
-    let vector = match ci.using.as_deref() {
-        Some("hnsw") => Some(analyze_hnsw_index(&ci, &table)?),
-        _ => None,
+    let vector = if ci.using.as_deref() == Some("hnsw") {
+        Some(analyze_hnsw_index(&ci, &table)?)
+    } else {
+        // A VECTOR column is indexed by the `hnsw` vector index; a scalar method over the
+        // opaque vector bytes would index nothing a query can use, so it stays refused.
+        if let Some(col) = ci.columns.iter().find(|c| {
+            table
+                .columns
+                .iter()
+                .any(|tc| tc.name == **c && matches!(tc.ty, ColumnType::Vector(_)))
+        }) {
+            return Err(Error::Unsupported(format!(
+                "an index on VECTOR column \"{col}\" requires USING hnsw"
+            )));
+        }
+        None
+    };
+    // The declared access method: `hash` and `brin` are recorded as the index's kind; `gin`,
+    // `gist`, and `spgist` have no distinct structure here, so they back onto the default tree.
+    // Either way the same B-tree answers the scans, which covers at least what each method
+    // promises — results are identical, only the physical layout differs from the reference.
+    let kind = match ci.using.as_deref() {
+        Some("hash") => IndexKind::Hash,
+        Some("brin") => IndexKind::Brin,
+        _ => IndexKind::BTree,
     };
     Ok(CreateIndexPlan {
         def: IndexDef {
@@ -376,7 +398,7 @@ pub(super) fn analyze_create_index(
             key_exprs: ci.key_exprs,
             predicate: ci.predicate,
             include: ci.include,
-            kind: IndexKind::BTree,
+            kind,
             unique: ci.unique,
         },
         vector,

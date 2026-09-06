@@ -226,6 +226,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
     // base row. The analyzer only sets `row_lock` for the simple single-table shape.
     let row_lock = select.row_lock;
     let lock_table = select.table.clone();
+    let lock_tables = std::mem::take(&mut select.lock_tables);
     let lock_predicate = select.filter.clone();
     // Width of the row the running operator produces, tracked so each join can
     // NULL-pad the correct number of left columns for unmatched right rows.
@@ -593,15 +594,26 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
     }
     // `FOR UPDATE` / `FOR SHARE`: wrap the finished pipeline so the executor locks every
     // matched base row before producing output. Only set for the validated single-table shape.
-    if let (Some((mode, skip_locked, nowait)), Some(table)) = (row_lock, lock_table) {
-        op = PhysicalOperator::LockRows {
-            input: Box::new(op),
-            table,
-            predicate: lock_predicate,
-            mode,
-            skip_locked,
-            nowait,
+    if let Some((mode, skip_locked, nowait)) = row_lock {
+        // The ordinary single-table lock targets the base table; an inheritance parent's expanded
+        // scan targets the parent plus each kept descendant — one `LockRows` per table, all with
+        // the same predicate (a descendant's leading columns are its parent's, so the resolved
+        // ordinals line up).
+        let targets = if lock_tables.is_empty() {
+            lock_table.into_iter().collect()
+        } else {
+            lock_tables
         };
+        for table in targets {
+            op = PhysicalOperator::LockRows {
+                input: Box::new(op),
+                table,
+                predicate: lock_predicate.clone(),
+                mode,
+                skip_locked,
+                nowait,
+            };
+        }
     }
     // Projection pushdown: run last, on the finished tree, so a reference from any pipeline
     // layer is visible. A no-op unless the plan is the simple single-table shape — see `pushdown`.

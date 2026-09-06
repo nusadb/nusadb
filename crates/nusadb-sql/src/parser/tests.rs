@@ -373,13 +373,27 @@ fn create_index_accepts_explicit_btree_and_rejects_other_scalar_methods() {
         panic!("expected CreateIndex");
     };
     assert!(ci.using.is_none());
-    // Every other access method is a distinct structure the engine does not build.
-    for method in ["hash", "gin", "gist", "brin"] {
-        assert!(
-            parse(&format!("CREATE INDEX i ON t USING {method} (id)")).is_err(),
-            "USING {method} must be rejected"
-        );
+    // The reference engine's access-method names are accepted and carried through: the same
+    // B-tree structure answers the scans (`hash`/`brin` as the declared kind, the rest as the
+    // default), so declaring one is never wrong — only an unknown method errors (42704).
+    for method in ["hash", "gin", "gist", "spgist", "brin"] {
+        let ast::Statement::CreateIndex(ci) =
+            ok(&format!("CREATE INDEX i ON t USING {method} (id)"))
+        else {
+            panic!("expected CreateIndex for USING {method}");
+        };
+        assert_eq!(ci.using.as_deref(), Some(method));
     }
+    assert!(
+        matches!(
+            parse("CREATE INDEX i ON t USING bogus (id)"),
+            Err(Error::Coded {
+                sqlstate: "42704",
+                ..
+            })
+        ),
+        "an unknown access method is undefined_object"
+    );
 }
 
 #[test]
@@ -619,11 +633,11 @@ fn create_index_accepts_functional_partial_asc_desc_and_rejects_nulls_udf_shapes
         assert_eq!(ci.columns, vec!["a".to_owned()], "for {sql}");
     }
 
-    // Still rejected: `USING <method>` (a non-default access method), a qualified column key, and an
-    // operator class. (Per-column `ASC`/`DESC`/`NULLS FIRST/LAST` are accepted — covered above and in
-    // `create_index_accepts_per_key_asc_desc_and_nulls_ordering`.)
+    // Still rejected: a qualified column key and an operator class. (Per-column
+    // `ASC`/`DESC`/`NULLS FIRST/LAST` are accepted — covered above and in
+    // `create_index_accepts_per_key_asc_desc_and_nulls_ordering`; access methods are covered in
+    // `create_index_accepts_explicit_btree_and_rejects_other_scalar_methods`.)
     for sql in [
-        "CREATE INDEX i ON t USING HASH (a)",
         "CREATE INDEX i ON t (t.a)",
         "CREATE INDEX i ON t (a varchar_pattern_ops)",
     ] {

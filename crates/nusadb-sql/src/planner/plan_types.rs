@@ -1568,6 +1568,10 @@ pub struct SelectPlan {
     /// the second is `NOWAIT` (report a held row as `lock_not_available` rather than a retryable
     /// serialization conflict). At most one of the two is set. `None` = no row locking.
     pub row_lock: Option<(nusadb_core::engine::RowLockMode, bool, bool)>,
+    /// The lock targets when [`row_lock`](Self::row_lock) covers an inheritance parent whose scan
+    /// expanded over its descendants: the parent plus each kept descendant. Empty for the ordinary
+    /// single-table lock, whose one target is [`table`](Self::table).
+    pub lock_tables: Vec<TableSchema>,
     /// `WITH ORDINALITY` on a `FROM` set-returning function: when `true`, this plan is a
     /// set-returning derived table whose `ProjectSet` appends a 1-based `ordinality` column. The
     /// analyzer sets it only for such a derived table (and requires a set-returning projection);

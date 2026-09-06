@@ -68,11 +68,21 @@ CREATE INDEX ix_b ON ix(b)
 statement error
 ALTER TABLE ix RENAME COLUMN b TO c
 
+# A column's OWN default moves with the rename (it is filed under the column name); only a
+# reference from another object still blocks.
 statement ok
 CREATE TABLE df (a TEXT, b TEXT DEFAULT 'd')
 
-statement error
+statement ok
 ALTER TABLE df RENAME COLUMN b TO c
+
+statement ok
+INSERT INTO df (a) VALUES ('x')
+
+query T
+SELECT c FROM df
+----
+d
 
 statement ok
 CREATE TABLE par (id INT PRIMARY KEY)

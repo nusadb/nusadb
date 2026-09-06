@@ -780,12 +780,11 @@ fn refuse_rename_with_dependents(
         engine,
         txn,
     )? {
-        // The column's own default moves with it, and a generated column's expression may read
-        // this column from elsewhere in the table — that expression is evaluated on every write.
-        if owner == column {
-            return Err(refuse("default expression on column", column));
-        }
-        if let Some(expr) = super::coldefault::generated_expr(&sql)
+        // The column's own default is filed under the column name and moves with the rename (the
+        // caller re-files it); only a GENERATED expression elsewhere in the table that reads this
+        // column still blocks — that expression is re-evaluated on every write.
+        if owner != column
+            && let Some(expr) = super::coldefault::generated_expr(&sql)
             && sql_mentions_column(expr, column)
         {
             return Err(refuse("generated column", &owner));
@@ -1792,6 +1791,16 @@ pub(super) fn run_alter_table(
                 let new_name = old_name.replacen(&old_stem, &new_stem, 1);
                 let new_predicate = predicate.replace(&format!("\"{from}\""), &format!("\"{to}\""));
                 engine.add_check_constraint(txn, table.id, &new_name, new_predicate.as_bytes())?;
+            }
+            // The column's own DEFAULT (or SERIAL / identity / generated sentinel) is filed under
+            // the column name — re-file it under the new name so an INSERT keeps filling it. A
+            // serial's backing sequence keeps its old name, exactly like the reference engine.
+            let key = super::coldefault::catalog_key(&table.schema, &table.name);
+            for (owner, sql) in super::coldefault::load_defaults(&key, engine, txn)? {
+                if owner == from {
+                    super::coldefault::drop_default(&key, &from, engine, txn)?;
+                    super::coldefault::set_default(&key, to, &sql, engine, txn)?;
+                }
             }
             return Ok(ExecutionResult::Altered);
         },

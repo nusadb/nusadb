@@ -366,6 +366,18 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
             };
             convert_number(&format!("-{n}")).map(ast::Expr::Literal)
         },
+        // `|/ x` / `||/ x` — the prefix square/cube-root operators, spellings of sqrt()/cbrt().
+        sql::Expr::UnaryOp {
+            op: op @ (sql::UnaryOperator::PGSquareRoot | sql::UnaryOperator::PGCubeRoot),
+            expr,
+        } => Ok(ast::Expr::ScalarFunction {
+            func: if op == sql::UnaryOperator::PGSquareRoot {
+                ast::ScalarFunc::Sqrt
+            } else {
+                ast::ScalarFunc::Cbrt
+            },
+            args: vec![convert_expr(*expr)?],
+        }),
         sql::Expr::UnaryOp { op, expr } => Ok(ast::Expr::Unary {
             op: convert_unary_op(op)?,
             expr: Box::new(convert_expr(*expr)?),
@@ -1211,6 +1223,18 @@ pub(super) fn convert_function_call(function: sql::Function) -> Result<ast::Expr
         return unsupported("DISTINCT / ALL is only valid on aggregate functions");
     }
 
+    // `make_interval()` is commonly called by name (`days => 5, hours => 3`); map named
+    // arguments onto the positional order `[years, months, weeks, days, hours, mins, secs]`
+    // with `0` defaults. Leading positional arguments fill the first slots, like the reference
+    // engine's mixed notation; a positional argument after a named one is refused.
+    if name == "make_interval"
+        && arg_list
+            .args
+            .iter()
+            .any(|a| matches!(a, sql::FunctionArg::Named { .. }))
+    {
+        return convert_make_interval_named(arg_list.args);
+    }
     let mut args = Vec::with_capacity(arg_list.args.len());
     for arg in arg_list.args {
         let expr = match arg {
@@ -2177,6 +2201,68 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
         other => return unsupported(&format!("binary operator `{other}`")),
     };
     Ok(mapped)
+}
+
+/// Convert a `make_interval()` call using named notation (`days => 5`) into the positional
+/// [`ast::ScalarFunc::MakeInterval`] call: each named argument lands in its parameter's slot of
+/// `[years, months, weeks, days, hours, mins, secs]`, unfilled slots default to `0`, and leading
+/// positional arguments fill the first slots (mixed notation). A positional argument after a
+/// named one, an unknown parameter name, or a doubly-specified parameter is refused loudly.
+fn convert_make_interval_named(args: Vec<sql::FunctionArg>) -> Result<ast::Expr, Error> {
+    const SLOTS: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+    let mut values: [Option<ast::Expr>; 7] = [const { None }; 7];
+    let mut positional = 0usize;
+    let mut saw_named = false;
+    for arg in args {
+        match arg {
+            sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) => {
+                if saw_named {
+                    return Err(Error::Syntax(
+                        "positional argument cannot follow named argument".to_owned(),
+                    ));
+                }
+                let Some(slot) = values.get_mut(positional) else {
+                    return Err(Error::FunctionArgs(
+                        "make_interval() takes at most 7 arguments".to_owned(),
+                    ));
+                };
+                *slot = Some(convert_expr(e)?);
+                positional += 1;
+            },
+            sql::FunctionArg::Named {
+                name,
+                arg: sql::FunctionArgExpr::Expr(e),
+                ..
+            } => {
+                saw_named = true;
+                let folded = name.value.to_ascii_lowercase();
+                let Some(slot) = SLOTS.iter().position(|s| *s == folded) else {
+                    return Err(Error::FunctionArgs(format!(
+                        "make_interval() has no parameter \"{}\" — the parameters are years,                          months, weeks, days, hours, mins, secs",
+                        name.value
+                    )));
+                };
+                if values.get(slot).is_some_and(Option::is_some) {
+                    return Err(Error::Syntax(format!(
+                        "make_interval() parameter \"{folded}\" specified more than once"
+                    )));
+                }
+                if let Some(v) = values.get_mut(slot) {
+                    *v = Some(convert_expr(e)?);
+                }
+            },
+            other => {
+                return unsupported(&format!("make_interval() argument `{other}`"));
+            },
+        }
+    }
+    Ok(ast::Expr::ScalarFunction {
+        func: ast::ScalarFunc::MakeInterval,
+        args: values
+            .into_iter()
+            .map(|v| v.unwrap_or(ast::Expr::Literal(ast::Value::Int(0))))
+            .collect(),
+    })
 }
 
 pub(super) fn convert_unary_op(op: sql::UnaryOperator) -> Result<ast::UnaryOp, Error> {

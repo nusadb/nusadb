@@ -14,6 +14,11 @@ pub(super) struct ResolvedFrom {
     /// Inlined plan when the base source is a non-recursive CTE. Mutually exclusive with
     /// `table`; its output columns form the base scope.
     base_cte: Option<SelectPlan>,
+    /// When the FROM base is an inheritance parent whose scan was expanded over its descendants:
+    /// the resolved lock targets (parent first, then the kept descendants) a `FOR UPDATE` /
+    /// `FOR SHARE` must cover. Empty for every other base — including a real CTE/view, whose rows
+    /// have no single lockable origin.
+    expanded_lock_tables: Vec<TableSchema>,
     /// Resolved joins, in order.
     joins: Vec<JoinPlan>,
     /// Column scope `[base cols ++ join0 cols ++ ...]`, indexed by row ordinal.
@@ -153,6 +158,7 @@ fn analyze_values_table(
         recursive_ctes: Vec::new(),
         modifying_ctes: Vec::new(),
         row_lock: None,
+        lock_tables: Vec::new(),
         ordinality: false,
         extra_columns: Vec::new(),
     })
@@ -206,6 +212,7 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
         recursive_ctes: Vec::new(),
         modifying_ctes: Vec::new(),
         row_lock: None,
+        lock_tables: Vec::new(),
         ordinality: false,
         extra_columns: Vec::new(),
     })
@@ -643,10 +650,13 @@ pub(super) fn resolve_from(
         return Ok(ResolvedFrom {
             table: None,
             base_cte: None,
+            expanded_lock_tables: Vec::new(),
             joins: Vec::new(),
             scope: Vec::new(),
         });
     };
+    // The lock targets recorded when the base turns out to be an expanded inheritance parent.
+    let mut expanded_lock_tables: Vec<TableSchema> = Vec::new();
     // The base source: a CTE (shadows a same-named table) or a catalog table. A non-recursive CTE
     // is inlined via `base_cte`; a recursive one resolves to its synthetic table (scanned at
     // execution from the working-set registry), so it takes the plain-table path.
@@ -719,6 +729,20 @@ pub(super) fn resolve_from(
                         base_qual,
                         catalog,
                     )?;
+                    // Record the lock targets for a FOR UPDATE / FOR SHARE over this parent:
+                    // the parent itself plus each kept descendant, resolved now (a descendant
+                    // name is schema-qualified for a non-public schema, bare for public).
+                    for name in
+                        std::iter::once(super::qualified_display(&schema.schema, &schema.name))
+                            .chain(kept.iter().cloned())
+                    {
+                        let (sch, tbl) = name
+                            .split_once('.')
+                            .map_or((nusadb_core::PUBLIC_SCHEMA, name.as_str()), |(s, t)| (s, t));
+                        if let Some(resolved) = catalog.lookup_table_in(sch, tbl)? {
+                            expanded_lock_tables.push(resolved);
+                        }
+                    }
                     Some(expand_inheritance(&schema, &kept, catalog)?)
                 }
             } else {
@@ -843,6 +867,7 @@ pub(super) fn resolve_from(
     Ok(ResolvedFrom {
         // A CTE base is carried in `base_cte` and inlined by the planner, not scanned as a table.
         table: if base_cte.is_some() { None } else { Some(base) },
+        expanded_lock_tables,
         base_cte,
         joins,
         scope,
@@ -1500,6 +1525,7 @@ fn analyze_select_scoped(
     let ResolvedFrom {
         table,
         base_cte,
+        expanded_lock_tables,
         joins,
         scope: scope_vec,
     } = resolve_from(sel.from.as_ref(), sel.filter.as_ref(), catalog, &ctes)?;
@@ -1801,9 +1827,7 @@ fn analyze_select_scoped(
     // `FOR UPDATE` / `FOR SHARE`: allowed only on a single base table with no
     // join / aggregate / GROUP BY / DISTINCT / window and a subquery-free predicate, so the executor
     // can lock exactly the matched base rows.
-    let simple_shape = table.is_some()
-        && base_cte.is_none()
-        && joins.is_empty()
+    let plain_clauses = joins.is_empty()
         && !distinct
         && distinct_on.is_empty()
         && aggregates.is_empty()
@@ -1813,6 +1837,11 @@ fn analyze_select_scoped(
         && having.is_none()
         && recursive_ctes.is_empty()
         && modifying_ctes.is_empty();
+    let simple_shape = table.is_some() && base_cte.is_none() && plain_clauses;
+    // An inheritance parent's scan expands over its descendants (`base_cte` carries the union),
+    // but the lock targets are still known base tables — the parent plus each kept descendant —
+    // so `FOR UPDATE` stays supported: the executor locks the matched rows in every one.
+    let lockable_shape = simple_shape || (!expanded_lock_tables.is_empty() && plain_clauses);
     // The single base table's exposed name (its alias if aliased, else the name as written) — what a
     // `FOR UPDATE OF <name>` must match. `None` when there is no FROM (then any OF is rejected).
     let base_qualifier = sel
@@ -1821,10 +1850,16 @@ fn analyze_select_scoped(
         .map(|f| f.base.alias.clone().unwrap_or_else(|| f.base.name.clone()));
     let row_lock = analyze_row_lock(
         sel.lock.as_ref(),
-        simple_shape,
+        lockable_shape,
         filter.as_ref(),
         base_qualifier.as_deref(),
     )?;
+    // The lock targets for the expanded-parent case; empty when `table` itself is the one target.
+    let lock_tables = if row_lock.is_some() && !simple_shape {
+        expanded_lock_tables
+    } else {
+        Vec::new()
+    };
 
     // `FETCH FIRST n ROWS WITH TIES`: the tie set is defined by the ORDER BY, and
     // the tie trim runs on the sorted, pre-projection rows. It therefore requires an ORDER BY and is
@@ -1880,6 +1915,7 @@ fn analyze_select_scoped(
         recursive_ctes,
         modifying_ctes,
         row_lock,
+        lock_tables,
         ordinality: false,
         extra_columns,
     })

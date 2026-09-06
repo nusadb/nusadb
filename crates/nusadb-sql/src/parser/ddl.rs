@@ -790,19 +790,36 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
     if ci.concurrently {
         return unsupported("CREATE INDEX CONCURRENTLY");
     }
-    // `USING <method>` names the access method. The engine's only scalar index is a B-tree, so an
-    // explicit `USING btree` names the default and is accepted exactly as if no `USING` clause were
-    // given; `hnsw` selects the vector index. Every other method (`hash`, `gin`, `gist`, `brin`, ...)
-    // is a distinct structure the engine does not build, so it stays rejected.
+    // `USING <method>` names the access method. The scalar index structure is always the engine's
+    // B-tree: `USING btree` names it explicitly; `hash` and `brin` are carried as the index's
+    // declared kind (metadata — the backing tree answers at least what those methods promise);
+    // `gin`, `gist`, and `spgist` have no distinct structure here and back onto the same tree
+    // (declared kind B-tree). `hnsw` selects the vector index. Anything else is refused loudly.
     let using = match &ci.using {
         None | Some(sql::IndexType::BTree) => None,
-        Some(sql::IndexType::Custom(method)) if method.value.eq_ignore_ascii_case("hnsw") => {
-            Some("hnsw".to_owned())
+        Some(sql::IndexType::Hash) => Some("hash".to_owned()),
+        Some(sql::IndexType::GIN) => Some("gin".to_owned()),
+        Some(sql::IndexType::GiST) => Some("gist".to_owned()),
+        Some(sql::IndexType::SPGiST) => Some("spgist".to_owned()),
+        Some(sql::IndexType::BRIN) => Some("brin".to_owned()),
+        Some(sql::IndexType::Custom(method)) => {
+            let m = method.value.to_ascii_lowercase();
+            match m.as_str() {
+                "hnsw" | "brin" | "hash" | "gin" | "gist" | "spgist" => Some(m),
+                _ => {
+                    // The reference engine's error class for an unknown access method.
+                    return Err(Error::Coded {
+                        message: format!("access method \"{m}\" does not exist"),
+                        sqlstate: "42704", // undefined_object
+                    });
+                },
+            }
         },
-        Some(_) => {
-            return unsupported(
-                "CREATE INDEX USING <method> (only the default B-tree and `hnsw` are supported)",
-            );
+        Some(other) => {
+            return Err(Error::Coded {
+                message: format!("access method \"{other}\" does not exist"),
+                sqlstate: "42704", // undefined_object
+            });
         },
     };
     if ci.nulls_distinct.is_some() {

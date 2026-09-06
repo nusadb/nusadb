@@ -199,6 +199,11 @@ fn exec_one(
             }
             Ok(Flow::Normal)
         },
+        ScriptStmt::Perform(expr) => {
+            // Evaluated for its side effects (nextval(), a function call); the value is discarded.
+            eval_value(expr, env, params, engine, txn)?;
+            Ok(Flow::Normal)
+        },
         ScriptStmt::Raise(expr) => {
             let value = eval_value(expr, env, params, engine, txn)?;
             Err(Error::Raised(message_text(&value)))
