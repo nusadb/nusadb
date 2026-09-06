@@ -1754,6 +1754,12 @@ is detected). Without a spill directory, a stage over `--work-mem` fails with an
 limit, the bytes involved and how to raise it, and the server stays responsive. Aggregation,
 `DISTINCT` and window functions do not spill yet; they fail at the budget.
 
+### `TABLESAMPLE` does not sample yet
+
+`TABLESAMPLE SYSTEM (n)` and `BERNOULLI (n)` are accepted for compatibility but currently return
+every row, whatever `n` says. Do not rely on them for sampling; use `ORDER BY random() LIMIT n`
+for a random subset until real sampling lands.
+
 ### Capacity is bounded by memory
 
 Table pages live in memory and are not evicted to disk, so a database's working set must fit inside
@@ -1780,6 +1786,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;
 - full-text configurations other than `simple` and `english`, phrase search, prefix matching;
 - `IGNORE NULLS` / `RESPECT NULLS` on window functions;
-- multi-dimensional arrays;
+- storing a multi-dimensional array in a column (a multi-dimensional `ARRAY[[1,2],[3,4]]` value
+  works inside a query, with `array_ndims` and `[i][j]` subscripts);
 - a `DEFAULT` or `COLLATE` on a domain;
 - `LANGUAGE` other than `SQL` for functions and procedures.
