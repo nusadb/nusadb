@@ -2712,7 +2712,8 @@ fn collect_scan_tables<'a>(
         | PhysicalOperator::GroupAggregate { input, .. }
         | PhysicalOperator::GroupingSetsAggregate { input, .. }
         | PhysicalOperator::Window { input, .. }
-        | PhysicalOperator::LockRows { input, .. } => {
+        | PhysicalOperator::LockRows { input, .. }
+        | PhysicalOperator::Sample { input, .. } => {
             collect_scan_tables(input, found, count);
         },
         PhysicalOperator::NestedLoopJoin { left, right, .. }
@@ -3067,6 +3068,10 @@ fn format_op(
         },
         PhysicalOperator::Filter { input, .. } => {
             lines.push(format!("{indent}Filter"));
+            lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
+        },
+        PhysicalOperator::Sample { input, percent, .. } => {
+            lines.push(format!("{indent}Sample ({percent}%)"));
             lines.extend(format_op(input, depth + 1, ctx, actuals, engine, txn));
         },
         PhysicalOperator::LockRows {

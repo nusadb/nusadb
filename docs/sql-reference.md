@@ -485,8 +485,9 @@ Worth knowing:
   parent takes no default, and a new sibling whose bound overlaps rows already in the default is
   refused.
 - `UPDATE` and `DELETE` on the parent reach every partition; `ONLY` restricts them to the parent
-  itself. An `UPDATE` that changes the partition key does not move the row between partitions, so
-  change the key by delete-and-insert.
+  itself. An `UPDATE` that would move a row out of its partition's bound is refused (`23514`,
+  naming the partition) — rows are never left stranded where the pruning layer would miss them.
+  Change the key by delete-and-insert; row movement on `UPDATE` is not built.
 - The partition key must be written on every insert; the planner prunes partitions using `WHERE`
   conditions of the shape `key = / < / <= / > / >= constant` and `key BETWEEN a AND b`, which shows
   in `EXPLAIN` as fewer scanned partitions.
@@ -1754,11 +1755,15 @@ is detected). Without a spill directory, a stage over `--work-mem` fails with an
 limit, the bytes involved and how to raise it, and the server stays responsive. Aggregation,
 `DISTINCT` and window functions do not spill yet; they fail at the budget.
 
-### `TABLESAMPLE` does not sample yet
+### `TABLESAMPLE` samples per row
 
-`TABLESAMPLE SYSTEM (n)` and `BERNOULLI (n)` are accepted for compatibility but currently return
-every row, whatever `n` says. Do not rely on them for sampling; use `ORDER BY random() LIMIT n`
-for a random subset until real sampling lands.
+`TABLESAMPLE BERNOULLI (n)` and `SYSTEM (n)` keep each row with probability `n`%, drawn before
+the `WHERE` filter runs. Both methods sample per row here — elsewhere `SYSTEM` samples storage
+pages, a physical grouping this engine's in-memory pages do not reproduce; any subset is a valid
+sample and the 0% / 100% endpoints agree exactly. `REPEATABLE (seed)` makes the draw
+deterministic across repeated scans. A percentage outside `[0, 100]` is `2202H`; an unknown
+method is `42704`. Supported on a base table (including an inheritance parent); not on a CTE,
+view, derived table, or JOIN input.
 
 ### Capacity is bounded by memory
 

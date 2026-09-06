@@ -147,6 +147,8 @@ pub(crate) fn estimate_rows(op: &PhysicalOperator, ctx: Option<&ScanStats>) -> f
         | PhysicalOperator::DistinctOn { input, .. }
         // `LockRows` (FOR UPDATE/SHARE) returns its input unchanged.
         | PhysicalOperator::LockRows { input, .. }
+        // `Sample` scales rows by its fraction; the coarse passthrough keeps EXPLAIN populated.
+        | PhysicalOperator::Sample { input, .. }
         // Window appends columns; the row count is unchanged.
         | PhysicalOperator::Window { input, .. } => estimate_rows(input, ctx),
         // Multi-table shapes: a coarse product / sum keeps EXPLAIN populated even
@@ -209,6 +211,7 @@ pub(crate) fn estimate_cost(op: &PhysicalOperator, ctx: Option<&ScanStats>) -> f
         | PhysicalOperator::DistinctOn { input, .. }
         | PhysicalOperator::Window { input, .. }
         | PhysicalOperator::LockRows { input, .. }
+        | PhysicalOperator::Sample { input, .. }
         | PhysicalOperator::ScalarAggregate { input, .. }
         | PhysicalOperator::GroupAggregate { input, .. }
         | PhysicalOperator::GroupingSetsAggregate { input, .. }

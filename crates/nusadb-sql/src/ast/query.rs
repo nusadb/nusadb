@@ -243,6 +243,21 @@ pub struct TableRef {
     /// inheritance descendants. `false` (the default) means a query on an inheritance parent also sees
     /// descendant rows. Only meaningful for a named table.
     pub only: bool,
+    /// `TABLESAMPLE {BERNOULLI | SYSTEM} (percent) [REPEATABLE (seed)]` on a named table: scan a
+    /// random subset of the rows. Both methods sample per row here (the reference engine's SYSTEM
+    /// samples pages; any subset is a valid sample, and the 0%%/100%% endpoints agree exactly).
+    /// `None` = read every row.
+    pub sample: Option<TableSample>,
+}
+
+/// A `TABLESAMPLE` clause on a named table (see [`TableRef::sample`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableSample {
+    /// Fraction of rows to keep, as the written percentage in `[0, 100]`.
+    pub percent: f64,
+    /// `REPEATABLE (seed)` — the sampling RNG's seed, making the sample deterministic across
+    /// repeated scans. `None` draws a fresh seed per statement.
+    pub seed: Option<f64>,
 }
 
 /// One join in a [`FromClause`].

@@ -485,6 +485,11 @@ fn slt_p1_surface_gaps_batch() {
 }
 
 #[test]
+fn slt_p1_partition_update_key_guard() {
+    run_slt("tests/slt/p1_ddl/partition_update_key_guard.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }

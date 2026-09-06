@@ -1512,6 +1512,48 @@ fn execute_op_inner(
                 .then(|| super::lock_skip::scope(table.id, lock_held_elsewhere));
             execute_op(input, engine, txn)
         },
+        PhysicalOperator::Sample {
+            input,
+            percent,
+            seed,
+        } => {
+            let rows = execute_op(input, engine, txn)?;
+            let fraction = *percent / 100.0;
+            if fraction <= 0.0 {
+                return Ok(Vec::new());
+            }
+            if fraction >= 1.0 {
+                return Ok(rows);
+            }
+            // splitmix64 over a per-statement (or REPEATABLE) seed: each row draws a uniform in
+            // [0, 1) and survives when it falls under the requested fraction — a Bernoulli sample.
+            // Deliberately NOT the session's seedable RANDOM() stream: sampling must not perturb
+            // (or be perturbed by) SETSEED-driven query randomness.
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss,
+                reason = "seed bits are an opaque RNG state; the 53-bit mantissa quotient is the                           standard uniform-in-[0,1) construction"
+            )]
+            {
+                let mut state = seed.map_or_else(
+                    || super::clock::statement_now_micros() as u64 ^ 0x9E37_79B9_7F4A_7C15,
+                    f64::to_bits,
+                );
+                let mut out = Vec::new();
+                for row in rows {
+                    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    let mut z = state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^= z >> 31;
+                    let uniform = (z >> 11) as f64 / (1u64 << 53) as f64;
+                    if uniform < fraction {
+                        out.push(row);
+                    }
+                }
+                Ok(out)
+            }
+        },
         PhysicalOperator::Filter { input, predicate } => {
             let rows = execute_op(input, engine, txn)?;
             // WHERE and HAVING both lower to a Filter; pre-resolve any uncorrelated subquery in the

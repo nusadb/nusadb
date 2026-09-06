@@ -245,8 +245,10 @@ pub(super) fn convert_table_ref(factor: &sql::TableFactor) -> Result<ast::TableR
             name,
             alias,
             args: None,
+            sample,
             ..
         } => {
+            let sample = convert_table_sample(sample.as_ref())?;
             // `FROM ONLY t`: sqlparser parses the `ONLY` keyword as a table named `only` with `t` as an
             // implicit alias. Recognize that shape and read it as `ONLY t` — scan only the named table's
             // own rows, not its inheritance descendants. (A table genuinely named `only` must be
@@ -263,6 +265,7 @@ pub(super) fn convert_table_ref(factor: &sql::TableFactor) -> Result<ast::TableR
                     column_aliases: Vec::new(),
                     with_ordinality: false,
                     only: true,
+                    sample,
                 });
             }
             let alias = convert_table_alias(alias.as_ref())?;
@@ -278,9 +281,91 @@ pub(super) fn convert_table_ref(factor: &sql::TableFactor) -> Result<ast::TableR
                 column_aliases: Vec::new(),
                 with_ordinality: false,
                 only: false,
+                sample,
             })
         },
         _ => unsupported("FROM item that is not a plain table (subquery, function, ...)"),
+    }
+}
+
+/// Convert a `TABLESAMPLE` clause: `BERNOULLI` / `SYSTEM` with a literal percentage in `[0, 100]`
+/// and an optional `REPEATABLE (seed)`. An unknown method is the reference engine's `42704`; a
+/// percentage outside the range is its `2202H`. Both methods sample per row here (SYSTEM's
+/// page-level grouping is a physical detail; any subset is a valid sample and the endpoints agree).
+fn convert_table_sample(
+    sample: Option<&sql::TableSampleKind>,
+) -> Result<Option<ast::TableSample>, Error> {
+    let Some(
+        sql::TableSampleKind::BeforeTableAlias(ts) | sql::TableSampleKind::AfterTableAlias(ts),
+    ) = sample
+    else {
+        return Ok(None);
+    };
+    if let Some(method) = &ts.name {
+        let m = method.to_string().to_ascii_lowercase();
+        if m != "bernoulli" && m != "system" {
+            return Err(Error::Coded {
+                message: format!("tablesample method \"{m}\" does not exist"),
+                sqlstate: "42704", // undefined_object
+            });
+        }
+    }
+    if ts.bucket.is_some() || ts.offset.is_some() {
+        return unsupported("TABLESAMPLE BUCKET / OFFSET");
+    }
+    let Some(quantity) = &ts.quantity else {
+        return unsupported("TABLESAMPLE without a percentage");
+    };
+    // An unrecognized method name parses as a function call in quantity position
+    // (`TABLESAMPLE foobar (50)`); surface it as the reference engine's unknown-method error.
+    if let sql::Expr::Function(f) = &quantity.value {
+        return Err(Error::Coded {
+            message: format!(
+                "tablesample method \"{}\" does not exist",
+                f.name.to_string().to_ascii_lowercase()
+            ),
+            sqlstate: "42704", // undefined_object
+        });
+    }
+    let percent = sample_number(&quantity.value).ok_or_else(|| {
+        Error::Unsupported("TABLESAMPLE percentage must be a numeric literal".to_owned())
+    })?;
+    if !(0.0..=100.0).contains(&percent) {
+        return Err(Error::Coded {
+            message: "sample percentage must be between 0 and 100".to_owned(),
+            sqlstate: "2202H", // invalid_tablesample_argument
+        });
+    }
+    let seed = match &ts.seed {
+        Some(seed) => match &seed.value.value {
+            sql::Value::Number(n, _) => Some(n.parse::<f64>().map_err(|_| {
+                Error::Unsupported(
+                    "TABLESAMPLE REPEATABLE seed must be a numeric literal".to_owned(),
+                )
+            })?),
+            _ => {
+                return Err(Error::Unsupported(
+                    "TABLESAMPLE REPEATABLE seed must be a numeric literal".to_owned(),
+                ));
+            },
+        },
+        None => None,
+    };
+    Ok(Some(ast::TableSample { percent, seed }))
+}
+
+/// A numeric literal (possibly negated) inside a `TABLESAMPLE` clause, as `f64`.
+fn sample_number(expr: &sql::Expr) -> Option<f64> {
+    match expr {
+        sql::Expr::Value(v) => match &v.value {
+            sql::Value::Number(n, _) => n.parse().ok(),
+            _ => None,
+        },
+        sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Minus,
+            expr,
+        } => sample_number(expr).map(|n| -n),
+        _ => None,
     }
 }
 
@@ -426,6 +511,7 @@ fn convert_derived_table_factor(
             column_aliases,
             with_ordinality: false,
             only: false,
+            sample: None,
         });
     }
     // `(SELECT ... UNION/INTERSECT/EXCEPT ...) AS x` is a set-operation derived table — carry the
@@ -447,6 +533,7 @@ fn convert_derived_table_factor(
             column_aliases,
             with_ordinality: false,
             only: false,
+            sample: None,
         });
     }
     let body = convert_select(subquery.clone())?;
@@ -462,6 +549,7 @@ fn convert_derived_table_factor(
         column_aliases,
         with_ordinality: false,
         only: false,
+        sample: None,
     })
 }
 
@@ -605,6 +693,7 @@ fn srf_derived_table(
         column_aliases,
         with_ordinality,
         only: false,
+        sample: None,
     }
 }
 

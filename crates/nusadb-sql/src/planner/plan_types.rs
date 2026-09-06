@@ -1572,6 +1572,9 @@ pub struct SelectPlan {
     /// expanded over its descendants: the parent plus each kept descendant. Empty for the ordinary
     /// single-table lock, whose one target is [`table`](Self::table).
     pub lock_tables: Vec<TableSchema>,
+    /// `TABLESAMPLE` on the base table: keep each scanned row with probability `percent/100`
+    /// before any filter runs (the reference engine's sampling point). `None` = read every row.
+    pub sample: Option<ast::TableSample>,
     /// `WITH ORDINALITY` on a `FROM` set-returning function: when `true`, this plan is a
     /// set-returning derived table whose `ProjectSet` appends a 1-based `ordinality` column. The
     /// analyzer sets it only for such a derived table (and requires a set-returning projection);
@@ -2687,6 +2690,17 @@ pub enum PhysicalOperator {
         /// simple single-table shape by the planner's projection-pushdown pass
         /// (`planner::pushdown`).
         columns: Vec<usize>,
+    },
+    /// `TABLESAMPLE`: keep each input row with probability `percent/100`, drawn from a
+    /// deterministic PRNG when `seed` is given (`REPEATABLE`), a per-statement seed otherwise.
+    /// Wraps the base scan, before any filter — the reference engine's sampling point.
+    Sample {
+        /// The sampled row source (the base scan).
+        input: Box<Self>,
+        /// Percentage of rows to keep, in `[0, 100]`.
+        percent: f64,
+        /// `REPEATABLE (seed)` — fixed RNG seed; `None` draws one per statement.
+        seed: Option<f64>,
     },
     /// Index scan over a named index: yields the visible rows whose key falls in
     /// `[lo, hi]`, in ascending key order. The executor encodes the bound *values* into the index's

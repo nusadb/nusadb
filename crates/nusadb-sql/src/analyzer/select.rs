@@ -159,6 +159,7 @@ fn analyze_values_table(
         modifying_ctes: Vec::new(),
         row_lock: None,
         lock_tables: Vec::new(),
+        sample: None,
         ordinality: false,
         extra_columns: Vec::new(),
     })
@@ -213,6 +214,7 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
         modifying_ctes: Vec::new(),
         row_lock: None,
         lock_tables: Vec::new(),
+        sample: None,
         ordinality: false,
         extra_columns: Vec::new(),
     })
@@ -279,6 +281,7 @@ fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
                 column_aliases: Vec::new(),
                 with_ordinality: false,
                 only: true,
+                sample: None,
             },
             joins: Vec::new(),
         }),
@@ -1848,6 +1851,23 @@ fn analyze_select_scoped(
         .from
         .as_ref()
         .map(|f| f.base.alias.clone().unwrap_or_else(|| f.base.name.clone()));
+    // `TABLESAMPLE` applies to a real base table's scan. A CTE/view/derived base has no base scan
+    // to sample, and an inheritance-expanded parent samples per branch — refused loudly until
+    // built. A sampled JOIN input is likewise refused (the parser attaches the clause per factor).
+    let sample = sel.from.as_ref().and_then(|f| f.base.sample.clone());
+    if sample.is_some() && table.is_none() && expanded_lock_tables.is_empty() {
+        return Err(Error::Unsupported(
+            "TABLESAMPLE is supported on a base table only (not a CTE, view, or derived table)"
+                .to_owned(),
+        ));
+    }
+    if let Some(f) = sel.from.as_ref()
+        && f.joins.iter().any(|j| j.table.sample.is_some())
+    {
+        return Err(Error::Unsupported(
+            "TABLESAMPLE on a JOIN input is not supported".to_owned(),
+        ));
+    }
     let row_lock = analyze_row_lock(
         sel.lock.as_ref(),
         lockable_shape,
@@ -1916,6 +1936,7 @@ fn analyze_select_scoped(
         modifying_ctes,
         row_lock,
         lock_tables,
+        sample,
         ordinality: false,
         extra_columns,
     })

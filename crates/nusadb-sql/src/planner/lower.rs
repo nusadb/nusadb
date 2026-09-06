@@ -299,6 +299,17 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
         };
         (width, op)
     };
+    // `TABLESAMPLE` wraps the base source, before the filter — the sampled subset is what the
+    // WHERE then narrows, exactly like the reference engine. An inheritance parent's expanded
+    // union is sampled as a whole: a per-row Bernoulli draw over the union equals drawing per
+    // branch. (The analyzer only lets a sample through on a base table or expanded parent.)
+    if let Some(sample) = select.sample.take() {
+        op = PhysicalOperator::Sample {
+            input: Box::new(op),
+            percent: sample.percent,
+            seed: sample.seed,
+        };
+    }
     // Predicate pushdown: when joins follow, push each `WHERE` conjunct that references only
     // the base table's columns down onto the base scan, below the joins, so fewer rows enter the
     // join. Sound only when every join is base-preserving (Inner/Left/Cross): the base columns keep

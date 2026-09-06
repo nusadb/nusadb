@@ -295,6 +295,91 @@ fn route_partitioned_insert(
 /// A direct `INSERT` into a partition must land within that partition's bound — and, under
 /// sub-partitioning, within every ancestor's bound too — the reference engine refuses a row that
 /// belongs to a different partition. A no-op for a non-partition target.
+/// `UPDATE` guard against silent row loss: refuse a new row image whose partition key leaves the
+/// target partition's bound (walking the whole ancestor chain, like the INSERT-side check). The
+/// reference engine would move the row to the accepting sibling; accepting the write here instead
+/// would strand the row in a partition whose bound the pruning layer trusts — a query whose
+/// `WHERE` constrains the key would then prune the very partition holding the row and silently
+/// lose it. A row in the catch-all DEFAULT partition is refused only when a non-default sibling
+/// claims its new key (the catch-all legitimately holds everything else).
+///
+/// # Errors
+/// `23514` naming the partition, when any post-update row violates the constraint.
+fn enforce_update_partition_bound(
+    table: &TableSchema,
+    to_update: &[(Tid, Option<Row>, Row)],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    const MAX_DEPTH: usize = 64;
+    if to_update.is_empty() || !super::partition::has_any(engine, txn)? {
+        return Ok(());
+    }
+    let mut current = crate::analyzer::qualified_display(&table.schema, &table.name);
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
+            return Ok(());
+        };
+        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent)? else {
+            return Ok(());
+        };
+        // Key positions by name in the row layout — a partition takes its parent's columns.
+        let mut key_pos = Vec::with_capacity(key_cols.len());
+        let mut key_tys = Vec::with_capacity(key_cols.len());
+        for key_col in &key_cols {
+            let Some((pos, def)) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name == *key_col)
+            else {
+                return Ok(());
+            };
+            key_pos.push(pos);
+            key_tys.push(def.ty);
+        }
+        let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
+        else {
+            return Ok(());
+        };
+        let is_default = super::partition::is_default(&bound);
+        // The DEFAULT partition's constraint is "no sibling claims the key" — load them once.
+        let siblings = if is_default {
+            super::partition::partitions_of(engine, txn, &parent, &key_tys)?
+        } else {
+            Vec::new()
+        };
+        for (_, _, new_row) in to_update {
+            let key: Vec<ast::Value> = key_pos
+                .iter()
+                .map(|&pos| new_row.get(pos).cloned().unwrap_or(ast::Value::Null))
+                .collect();
+            let violates = if is_default {
+                siblings.iter().any(|p| {
+                    !super::partition::is_default(&p.bound)
+                        && super::partition::accepts(&key, &p.bound, &key_tys)
+                })
+            } else {
+                !super::partition::accepts(&key, &bound, &key_tys)
+            };
+            if violates {
+                return Err(Error::Coded {
+                    message: format!(
+                        "new row for relation \"{}\" violates partition constraint — the updated \
+                         partition key leaves this partition's bound, and moving a row between \
+                         partitions on UPDATE is not supported; DELETE the row and re-INSERT it \
+                         through the parent instead",
+                        table.name
+                    ),
+                    sqlstate: "23514", // check_violation
+                });
+            }
+        }
+        current = parent;
+    }
+    Ok(())
+}
+
 fn enforce_partition_bound(
     plan: &InsertPlan,
     value_rows: &[Vec<Option<ast::Value>>],
@@ -3942,6 +4027,11 @@ fn run_update_single(
             result_rows.push(row);
         }
     }
+    // A SET may not move a row out of its partition's bound: the pruning layer trusts the bound,
+    // so a stranded row would silently vanish from any query whose WHERE prunes by the key. The
+    // reference engine moves the row to the right sibling; until that row movement is built, the
+    // assignment is refused LOUDLY (its own class, so a client can tell this from a plain CHECK).
+    enforce_update_partition_bound(&plan.table, &to_update, engine, txn)?;
     // BEFORE triggers: fire statement-level once, then row-level for each matched row, before
     // any constraint check or write.
     triggers.fire_stmt_before(&plan.table, engine, txn)?;
