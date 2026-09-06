@@ -1097,7 +1097,8 @@ the caller's statement fails.
 
 NusaScript statements: `DECLARE name TYPE [DEFAULT expr]`, `SET name = expr`,
 `IF ... THEN ... [ELSIF ...] [ELSE ...] END IF`, `WHILE cond LOOP ... END LOOP`,
-`FOR i IN low TO high LOOP ... END LOOP`, `RAISE 'message'` (reported as `P0001`), `RETURN`, and any
+`FOR i IN low TO high LOOP ... END LOOP`, `RAISE 'message'` (reported as `P0001`), `RETURN`,
+`PERFORM expr` (evaluate and discard, for a call made for its side effects), and any
 SQL data statement. An `EXCEPTION WHEN OTHERS THEN` handler rolls the body's writes back to a
 savepoint and runs in their place. Variables may be referenced by name inside embedded SQL; a
 column of the same name wins. `LANGUAGE SQL` is the only language.
@@ -1774,7 +1775,6 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
 - `INSTEAD OF` triggers;
 - `SET LOCAL`, `SET NAMES`, and an IANA region name as the session time zone;
-- index methods other than B-tree and HNSW;
 - locale collations (only `"C"` / `"POSIX"`);
 - `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;
