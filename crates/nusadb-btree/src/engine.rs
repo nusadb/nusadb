@@ -3627,12 +3627,25 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .get(&table.0)
             .ok_or_else(|| table_not_found(table))?;
         {
-            // A row write holds the shared table intention.
+            // A row write holds the shared table intention — and the row's EXCLUSIVE lock, the
+            // same lock an explicit `FOR UPDATE` takes. Without it a writer would sail past a
+            // held row lock (MVCC admission alone only sees other *writers*), silently defeating
+            // the lost-update protection the lock promises. No-wait: a held lock is an immediate
+            // conflict; re-acquisition by the locking transaction itself is free.
             let mut txns = self.txns.lock().map_err(|_| poisoned())?;
             if !txns.txns.contains_key(&txn.0) {
                 return Err(unknown_txn(txn));
             }
             txns.lock_table_intention(txn.0, table.0)?;
+            txns.acquire_lock(
+                txn.0,
+                LockId::Row {
+                    table: table.0,
+                    page: tid.page.0,
+                    slot: tid.slot.0,
+                },
+                true,
+            )?;
         }
         let row_id = row_id_of(tid);
         // Under the table latch: read the newest version, admit, park, install, log — one
@@ -3708,12 +3721,23 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .get(&table.0)
             .ok_or_else(|| table_not_found(table))?;
         {
-            // A row write holds the shared table intention.
+            // A row write holds the shared table intention — and the row's exclusive lock, for
+            // the same reason as `update`: a held `FOR UPDATE` lock must make a concurrent
+            // delete conflict rather than sail past it.
             let mut txns = self.txns.lock().map_err(|_| poisoned())?;
             if !txns.txns.contains_key(&txn.0) {
                 return Err(unknown_txn(txn));
             }
             txns.lock_table_intention(txn.0, table.0)?;
+            txns.acquire_lock(
+                txn.0,
+                LockId::Row {
+                    table: table.0,
+                    page: tid.page.0,
+                    slot: tid.slot.0,
+                },
+                true,
+            )?;
         }
         let row_id = row_id_of(tid);
         // The tree opens AFTER the latch: only latch holders move the root (see `update`).

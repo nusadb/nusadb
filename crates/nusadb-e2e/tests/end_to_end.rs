@@ -4627,6 +4627,103 @@ fn explicit_transaction_commit_persists() {
 }
 
 #[test]
+fn for_update_limit_locks_only_the_returned_rows() {
+    // A `LIMIT n FOR UPDATE` locks exactly the first n rows in query order — not every match.
+    // Locking the whole table would starve every other worker of the documented job-queue
+    // pattern (`ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`): the second claimer must get the
+    // NEXT row, not an empty set.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE q (id INT PRIMARY KEY)");
+    run(&engine, "INSERT INTO q VALUES (1), (2), (3)");
+
+    let mut a = Session::new(&engine);
+    a.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        rows(
+            a.execute(build_plan(
+                &engine,
+                "SELECT id FROM q ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+            ))
+            .unwrap()
+        ),
+        vec![vec![Value::Int(1)]],
+    );
+
+    // A second worker claims the NEXT row; a third scan sees both remaining rows.
+    let mut b = Session::new(&engine);
+    b.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        rows(
+            b.execute(build_plan(
+                &engine,
+                "SELECT id FROM q ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+            ))
+            .unwrap()
+        ),
+        vec![vec![Value::Int(2)]],
+        "the second claimer takes the next lockable row — id 1 is held, ids 2 and 3 are free",
+    );
+    let mut c = Session::new(&engine);
+    c.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        rows(
+            c.execute(build_plan(
+                &engine,
+                "SELECT id FROM q ORDER BY id FOR UPDATE SKIP LOCKED",
+            ))
+            .unwrap()
+        ),
+        vec![vec![Value::Int(3)]],
+        "after two LIMIT-1 claims exactly one row remains lockable",
+    );
+}
+
+#[test]
+fn row_lock_blocks_a_concurrent_writer() {
+    // A held `FOR UPDATE` lock must make a concurrent UPDATE/DELETE of that row conflict (the
+    // no-wait 40001), not sail past it — otherwise the lost-update protection the lock promises
+    // is silently void: the locker computes on a row another writer overwrites mid-flight.
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE q (id INT PRIMARY KEY, v INT)");
+    run(&engine, "INSERT INTO q VALUES (1, 10), (2, 20)");
+
+    let mut a = Session::new(&engine);
+    a.execute(build_plan(&engine, "BEGIN")).unwrap();
+    a.execute(build_plan(
+        &engine,
+        "SELECT id FROM q WHERE id = 1 FOR UPDATE",
+    ))
+    .unwrap();
+
+    let mut b = Session::new(&engine);
+    b.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        b.execute(build_plan(&engine, "UPDATE q SET v = 99 WHERE id = 1"))
+            .expect_err("updating a row another txn holds FOR UPDATE must conflict")
+            .sqlstate(),
+        "40001",
+    );
+    b.execute(build_plan(&engine, "ROLLBACK")).unwrap();
+    let mut b2 = Session::new(&engine);
+    b2.execute(build_plan(&engine, "BEGIN")).unwrap();
+    assert_eq!(
+        b2.execute(build_plan(&engine, "DELETE FROM q WHERE id = 1"))
+            .expect_err("deleting a row another txn holds FOR UPDATE must conflict")
+            .sqlstate(),
+        "40001",
+    );
+    b2.execute(build_plan(&engine, "ROLLBACK")).unwrap();
+
+    // A free row stays writable, and the locker itself may still write its own locked row.
+    let mut c = Session::new(&engine);
+    c.execute(build_plan(&engine, "UPDATE q SET v = 21 WHERE id = 2"))
+        .unwrap();
+    a.execute(build_plan(&engine, "UPDATE q SET v = 11 WHERE id = 1"))
+        .unwrap();
+    a.execute(build_plan(&engine, "COMMIT")).unwrap();
+}
+
+#[test]
 fn for_update_skip_locked_skips_a_row_another_txn_holds() {
     // SKIP LOCKED (the job-queue pattern): a row whose lock another transaction holds is skipped,
     // not waited on and not aborted, so the query fills from the lockable rows. Verified against the

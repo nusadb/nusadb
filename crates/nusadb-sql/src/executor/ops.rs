@@ -1464,6 +1464,8 @@ fn execute_op_inner(
             mode,
             skip_locked,
             nowait,
+            order_by,
+            lock_cap,
         } => {
             // `FOR UPDATE` / `FOR SHARE`: take a row lock on every base row that satisfies the
             // predicate, then return the pipeline's rows unchanged. The analyzer guarantees a
@@ -1483,16 +1485,51 @@ fn execute_op_inner(
             // conflict (`40001`) to `55P03` is what tells a client this is a genuine "row is locked",
             // not a transient conflict to retry — matching how the reference engine classifies it.
             let mut lock_held_elsewhere: HashSet<Tid> = HashSet::new();
+            // Candidates are walked in the query's ORDER BY order so a row cap locks exactly the
+            // first rows the query returns; without the lock the sort/limit above would return
+            // them anyway, so the ordering work is the same.
+            let mut candidates: Vec<(Tid, Row)> = Vec::new();
             for (tid, row) in super::scan::scan_table(table, engine, txn)? {
                 let matched = match predicate {
                     Some(pred) => matches!(eval::eval(pred, &row)?, ast::Value::Bool(true)),
                     None => true,
                 };
-                if !matched {
+                if matched {
+                    candidates.push((tid, row));
+                }
+            }
+            if !order_by.is_empty() {
+                let mut decorated: Vec<(Vec<ast::Value>, (Tid, Row))> =
+                    Vec::with_capacity(candidates.len());
+                for (tid, row) in candidates {
+                    decorated.push((eval_sort_keys(order_by, &row)?, (tid, row)));
+                }
+                decorated.sort_by(|(a, _), (b, _)| {
+                    order_by
+                        .iter()
+                        .zip(a.iter().zip(b.iter()))
+                        .map(|(k, (x, y))| eval::compare_order_key(x, y, k.ascending, k.nulls))
+                        .find(|o| *o != std::cmp::Ordering::Equal)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                candidates = decorated.into_iter().map(|(_, pair)| pair).collect();
+            }
+            // Lock up to the row cap (offset + limit): a `LIMIT 1` job-queue claim locks ONE row,
+            // leaving the rest for other workers — locking every match would starve them all.
+            let cap = lock_cap.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+            let mut locked = 0usize;
+            for (tid, _) in candidates {
+                if locked >= cap {
+                    // Beyond the cap nothing is locked; the limit above never outputs these rows.
+                    // Under SKIP LOCKED they must also be HIDDEN, or the limit would refill its
+                    // quota with unlocked rows past the skipped ones.
+                    if *skip_locked {
+                        lock_held_elsewhere.insert(tid);
+                    }
                     continue;
                 }
                 match engine.lock_row(txn, table.id, tid, *mode) {
-                    Ok(()) => {},
+                    Ok(()) => locked += 1,
                     Err(nusadb_core::Error::SerializationConflict { .. }) if *skip_locked => {
                         lock_held_elsewhere.insert(tid);
                     },

@@ -228,6 +228,22 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
     let lock_table = select.table.clone();
     let lock_tables = std::mem::take(&mut select.lock_tables);
     let lock_predicate = select.filter.clone();
+    // The lock scan's walk order and row cap, captured before the sort/limit consume them: a
+    // `LIMIT n FOR UPDATE` locks only the first `offset + n` lockable rows in query order — not
+    // every match (locking the whole table would starve every other job-queue worker).
+    let lock_order = if row_lock.is_some() {
+        select.order_by.clone()
+    } else {
+        Vec::new()
+    };
+    let lock_cap = if select.limit_with_ties {
+        // WITH TIES extends past the cap by the tie group; lock every match rather than guess.
+        None
+    } else {
+        select
+            .limit
+            .map(|n| n.saturating_add(select.offset.unwrap_or(0)))
+    };
     // Width of the row the running operator produces, tracked so each join can
     // NULL-pad the correct number of left columns for unmatched right rows.
     // The base source is a set operation (`(SELECT ... UNION ...) AS x`), inline `VALUES` rows, a
@@ -623,6 +639,8 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
                 mode,
                 skip_locked,
                 nowait,
+                order_by: lock_order.clone(),
+                lock_cap,
             };
         }
     }

@@ -1243,6 +1243,10 @@ until `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`).
 
 Locks never wait. A row someone else has locked fails immediately with `40001`, so `NOWAIT` is
 implied; `SKIP LOCKED` steps over such rows instead, which is the usual shape for a job queue.
+A held row lock also blocks writers: an `UPDATE` or `DELETE` that touches the locked row fails
+with the same immediate `40001` until the locking transaction ends. With `LIMIT n`, only the
+first `n` rows in query order are locked — a `LIMIT 1 ... SKIP LOCKED` claim takes one row and
+leaves the rest for other workers.
 
 ```sql
 SELECT * FROM orders WHERE id = 1 FOR UPDATE;      -- also on an inheritance parent (locks

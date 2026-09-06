@@ -2752,6 +2752,14 @@ pub enum PhysicalOperator {
         /// `lock_not_available` (`55P03`, non-retryable) instead of the default no-wait
         /// serialization conflict (`40001`, retryable). At most one of `skip_locked`/`nowait` is set.
         nowait: bool,
+        /// The query's `ORDER BY` keys: the lock scan walks candidates in this order, so a
+        /// `LIMIT` locks exactly the first rows the query returns. Empty = scan order.
+        order_by: Vec<OrderByKey>,
+        /// `offset + limit` when the query is row-capped: lock only that many rows (walked in
+        /// `order_by` order, skipping held rows under `SKIP LOCKED`) instead of every match —
+        /// the reference engine's behavior, and what keeps a job-queue worker from locking the
+        /// whole table. `None` = lock every matched row.
+        lock_cap: Option<u64>,
     },
     /// Produces exactly one row with no columns — the source for a `SELECT`
     /// without a `FROM` clause (e.g. `SELECT 1`).
