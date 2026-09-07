@@ -490,6 +490,11 @@ fn slt_p1_partition_update_key_guard() {
 }
 
 #[test]
+fn slt_p1_partition_upsert() {
+    run_slt("tests/slt/p1_ddl/partition_upsert.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }

@@ -290,6 +290,7 @@ pub(super) fn run_create_table(
     }
     if let Some(part) = &plan.partition_of {
         register_partition(&def, part, engine, txn)?;
+        propagate_parent_unique_constraints(&def, id, part, false, engine, txn)?;
     }
     Ok(ExecutionResult::Created(id))
 }
@@ -299,6 +300,119 @@ pub(super) fn run_create_table(
 /// validated (range `lo < hi` + non-overlap; list values not already claimed; hash modulus/remainder
 /// consistent), and the partition joins the parent's inheritance set so a query on the parent reads
 /// its rows.
+/// Copy the partitioned parent's `PRIMARY KEY` / `UNIQUE` constraints onto a partition joining
+/// it (at `CREATE TABLE ... PARTITION OF` or `ATTACH PARTITION`). The analyzer only admits a
+/// parent constraint that includes every partition-key column, so equal keys always route to the
+/// same partition and per-partition enforcement is globally sound. The copy takes the partition's
+/// name prefix (`orders_pkey` on parent `orders` becomes `orders_q1_pkey` on partition
+/// `orders_q1`). `validate` is set on ATTACH, whose partition may already hold rows — they must
+/// satisfy the constraint before it is declared; a partition that already declares an equivalent
+/// constraint (same columns, kind, and NULLS treatment) keeps its own.
+fn propagate_parent_unique_constraints(
+    def: &nusadb_core::TableDef,
+    id: nusadb_core::TableId,
+    part: &crate::planner::PartitionOfPlan,
+    validate: bool,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(parent) = engine.lookup_table_as_of_in(txn, &part.parent_schema, &part.parent)? else {
+        return Ok(());
+    };
+    let existing = engine.list_constraints(id)?;
+    for c in engine.list_constraints(parent.id)? {
+        let primary = matches!(c.kind, nusadb_core::ConstraintKind::PrimaryKey);
+        if !(primary || matches!(c.kind, nusadb_core::ConstraintKind::Unique)) {
+            continue;
+        }
+        let already = existing.iter().any(|e| {
+            e.kind == c.kind
+                && e.columns == c.columns
+                && e.nulls_not_distinct == c.nulls_not_distinct
+        });
+        if already {
+            continue;
+        }
+        if validate {
+            let schema = engine
+                .lookup_table_as_of_in(txn, &def.schema, &def.name)?
+                .ok_or_else(|| Error::TableNotFound {
+                    name: def.name.clone(),
+                })?;
+            // A parent PRIMARY KEY lands on the attached table too, so its key columns must be
+            // declared NOT NULL there — the reference engine's requirement and error class.
+            if primary {
+                for key_col in &c.columns {
+                    if schema
+                        .columns
+                        .iter()
+                        .any(|col| &col.name == key_col && col.nullable)
+                    {
+                        return Err(Error::Coded {
+                            message: format!(
+                                "column \"{key_col}\" in child table must be marked NOT NULL"
+                            ),
+                            sqlstate: "42804", // datatype_mismatch
+                        });
+                    }
+                }
+            }
+            validate_add_unique_constraint(
+                &schema,
+                &c.columns,
+                primary,
+                c.nulls_not_distinct,
+                engine,
+                txn,
+            )?;
+        }
+        let renamed = c
+            .name
+            .strip_prefix(&format!("{}_", parent.name))
+            .map_or_else(
+                || format!("{}_{}", def.name, c.name),
+                |rest| format!("{}_{rest}", def.name),
+            );
+        let index = engine.add_unique_constraint(
+            txn,
+            id,
+            &renamed,
+            &c.columns,
+            primary,
+            c.nulls_not_distinct,
+        )?;
+        // Backfill the backing index with the partition's existing rows (ATTACH may bring a
+        // populated table), exactly like ALTER TABLE ADD CONSTRAINT: the index is the uniqueness
+        // probe's access path, so a pre-existing key it does not cover would let a later
+        // duplicate insert sail past the probe. A fresh `PARTITION OF` table is empty, so the
+        // scan is a no-op there.
+        if let Some(schema) = engine.lookup_table_as_of_in(txn, &def.schema, &def.name)? {
+            let backing = nusadb_core::engine::IndexDef {
+                name: renamed,
+                table: id,
+                columns: c.columns.clone(),
+                key_exprs: Vec::new(),
+                predicate: None,
+                include: Vec::new(),
+                kind: nusadb_core::engine::IndexKind::BTree,
+                unique: true,
+            };
+            if let Some(target) = dml::build_index_target(index, &schema, &backing) {
+                for (tid, row) in scan_table(&schema, engine, txn)? {
+                    dml::insert_into_indexes(
+                        std::slice::from_ref(&target),
+                        &row,
+                        tid,
+                        engine,
+                        txn,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one cohesive per-strategy validation match (range/list/hash); splitting would scatter \
@@ -1691,6 +1805,7 @@ pub(super) fn run_alter_table(
             };
             register_partition(&def, &part, engine, txn)?;
             validate_attach_rows(&parent, &partition, engine, txn)?;
+            propagate_parent_unique_constraints(&def, partition.id, &part, true, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // DETACH PARTITION: confirm the child really is a partition of this parent, then sever just

@@ -1,0 +1,99 @@
+# INSERT ... ON CONFLICT into a partitioned table: rows route to their partition first, then the
+# statement's upsert action runs against that leaf. The parent may declare a PRIMARY KEY / UNIQUE
+# that includes every partition-key column (equal keys route identically, so per-partition
+# enforcement is globally sound); each partition inherits it at CREATE PARTITION OF / ATTACH.
+
+statement ok
+CREATE TABLE up (id INT PRIMARY KEY, v TEXT) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE up_lo PARTITION OF up FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE up_hi PARTITION OF up FOR VALUES FROM (100) TO (200)
+
+# The parent constraint must include the partition key.
+statement error must include all partitioning columns
+CREATE TABLE bad (id INT, k INT, PRIMARY KEY (id)) PARTITION BY RANGE (k)
+
+statement ok
+INSERT INTO up VALUES (1, 'a'), (150, 'x')
+
+# The inherited key enforces on the partition (routed and direct).
+statement error duplicate
+INSERT INTO up VALUES (1, 'dup')
+
+statement error duplicate
+INSERT INTO up_lo VALUES (1, 'dup-direct')
+
+statement ok
+INSERT INTO up VALUES (1, 'skip') ON CONFLICT DO NOTHING
+
+# One statement may upsert into several partitions.
+statement ok
+INSERT INTO up VALUES (1, 'b1'), (150, 'y1'), (2, 'new') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+
+query IT
+SELECT id, v FROM up ORDER BY id
+----
+1 b1
+2 new
+150 y1
+
+query IT
+INSERT INTO up VALUES (1, 'c') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v RETURNING id, v
+----
+1 c
+
+# The conditional form leaves the row alone when its WHERE says no.
+statement ok
+INSERT INTO up VALUES (1, 'd') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE up.v = 'nope'
+
+query T
+SELECT v FROM up WHERE id = 1
+----
+c
+
+# A DO UPDATE may not move the row out of its partition; a bad arbiter is refused loudly.
+statement error row movement is not supported
+INSERT INTO up VALUES (1, 'move') ON CONFLICT (id) DO UPDATE SET id = 150
+
+statement error no unique or primary key constraint matching
+INSERT INTO up VALUES (1, 'z') ON CONFLICT (v) DO UPDATE SET v = 'q'
+
+statement error does not exist
+INSERT INTO up VALUES (1, 'z') ON CONFLICT ON CONSTRAINT nope DO UPDATE SET v = 'q'
+
+# ATTACH inherits the parent key: a populated table is validated + its index backfilled, so a
+# later duplicate of a PRE-existing key still conflicts. A nullable key column is refused.
+statement ok
+CREATE TABLE seg (id INT NOT NULL, v TEXT)
+
+statement ok
+INSERT INTO seg VALUES (250, 'p')
+
+statement ok
+ALTER TABLE up ATTACH PARTITION seg FOR VALUES FROM (200) TO (300)
+
+statement error duplicate
+INSERT INTO up VALUES (250, 'dup')
+
+statement ok
+INSERT INTO up VALUES (250, 'up2') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+
+query T
+SELECT v FROM up WHERE id = 250
+----
+up2
+
+statement ok
+CREATE TABLE segnull (id INT, v TEXT)
+
+statement error must be marked NOT NULL
+ALTER TABLE up ATTACH PARTITION segnull FOR VALUES FROM (300) TO (400)
+
+statement ok
+DROP TABLE segnull
+
+statement ok
+DROP TABLE up

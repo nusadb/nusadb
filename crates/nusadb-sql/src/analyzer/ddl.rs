@@ -117,22 +117,38 @@ pub(super) fn analyze_create_table(
     let foreign_keys = resolve_foreign_keys(&ct, &name_base)?;
     let check_constraints = resolve_check_constraints(&ct, &name_base, catalog)?;
     let defaults = resolve_column_defaults(&ct, &name_base, catalog)?;
-    // A constraint on a partitioned parent would need to be enforced across every partition, which
-    // NusaDB does not propagate yet — so a `UNIQUE`/`PRIMARY KEY`/`CHECK`/`FOREIGN KEY` on the parent
-    // would go silently unenforced on the partitions' rows. Refuse it loudly rather than mis-accept.
-    // The synthetic type-range checks (a narrow integer's bound) are excluded: each partition
-    // regenerates them from its copied columns, so they are enforced where the rows actually live.
+    // A CHECK / FOREIGN KEY on a partitioned parent would need cross-partition enforcement, which
+    // NusaDB does not propagate yet — refuse loudly rather than mis-accept. The synthetic
+    // type-range checks (a narrow integer's bound) are excluded: each partition regenerates them
+    // from its copied columns, so they are enforced where the rows actually live.
     let explicit_check = check_constraints
         .iter()
         .any(|c| !c.name.starts_with(SYNTHETIC_TYPE_CHECK_PREFIX));
-    if partition_by.is_some()
-        && (!unique_constraints.is_empty() || !foreign_keys.is_empty() || explicit_check)
-    {
+    if partition_by.is_some() && (!foreign_keys.is_empty() || explicit_check) {
         return Err(Error::Unsupported(
-            "a UNIQUE / PRIMARY KEY / CHECK / FOREIGN KEY constraint on a partitioned table is not \
-             supported yet (it would not be enforced across partitions)"
+            "a CHECK / FOREIGN KEY constraint on a partitioned table is not supported yet (it \
+             would not be enforced across partitions)"
                 .to_owned(),
         ));
+    }
+    // A PRIMARY KEY / UNIQUE on the parent IS supported when it includes every partition-key
+    // column: equal keys then always route to the same partition, so per-partition enforcement
+    // (the executor copies the constraint onto each partition) is globally sound — the reference
+    // engine's rule and error class for the excluded case.
+    if let Some(pb) = &partition_by {
+        for uc in &unique_constraints {
+            if let Some(missing) = pb.columns.iter().find(|k| !uc.columns.contains(k)) {
+                return Err(Error::Coded {
+                    message: format!(
+                        "unique constraint on partitioned table must include all partitioning \
+                         columns — \"{missing}\" is part of the partition key but not of the \
+                         constraint \"{}\"",
+                        uc.name
+                    ),
+                    sqlstate: "0A000",
+                });
+            }
+        }
     }
     Ok(CreateTablePlan {
         schema: target_schema,

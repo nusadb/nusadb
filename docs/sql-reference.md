@@ -494,10 +494,17 @@ Worth knowing:
 - `DROP TABLE` on the parent drops the whole partition tree with it.
 - Parent and partitions may live in different schemas; qualified names work everywhere.
 
+A partitioned parent may declare a `PRIMARY KEY` / `UNIQUE` constraint when it includes every
+partition-key column (equal keys always route to the same partition, so per-partition enforcement
+is globally sound); each partition inherits it at `CREATE TABLE ... PARTITION OF` and at
+`ATTACH PARTITION` (existing rows are validated first, and a nullable primary-key column in the
+attached table is refused). With that in place, `INSERT ... ON CONFLICT` works on the parent:
+rows route to their partition first, then the upsert action runs against that leaf. A `DO UPDATE`
+that would move the row out of its partition is refused (row movement is not built).
+
 Not accepted: an expression as a partition key, `LIST` with more than one key column,
-`MINVALUE` / `MAXVALUE` bounds, non-literal bounds, a partition declaring its own columns,
-`UNIQUE` / `PRIMARY KEY` / `CHECK` / `FOREIGN KEY` on a partitioned parent (they would not span
-partitions), and `INSERT ... ON CONFLICT` into a partitioned table.
+`MINVALUE` / `MAXVALUE` bounds, non-literal bounds, a partition declaring its own columns, and
+`CHECK` / `FOREIGN KEY` on a partitioned parent (they would not span partitions).
 
 ### Inherited tables
 
@@ -1780,8 +1787,8 @@ the resident ceiling. See [deployment](deployment.md) before loading a large dat
 
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
-- an expression as a partition key, `LIST` partitioning over several columns, `MINVALUE` /
-  `MAXVALUE` partition bounds, and `INSERT ... ON CONFLICT` into a partitioned table;
+- an expression as a partition key, `LIST` partitioning over several columns, and `MINVALUE` /
+  `MAXVALUE` partition bounds;
 - `EXCLUDE` constraints with an operator other than `=`;
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;

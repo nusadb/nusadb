@@ -177,11 +177,7 @@ fn route_partitioned_insert(
     const MAX_DEPTH: usize = 64;
     /// One routing work item: a parent, its key columns, the rows routed to it, and its depth.
     type RouteLevel = (String, Vec<String>, Vec<Vec<Option<ast::Value>>>, usize);
-    if plan.on_conflict.is_some() {
-        return Err(Error::Unsupported(
-            "INSERT ... ON CONFLICT into a partitioned table is not supported".to_owned(),
-        ));
-    }
+
     // Route level by level: bucket the rows under this parent, then re-bucket any bucket whose
     // target is itself a sub-partitioned parent until every bucket is a leaf table. Every level
     // shares the top parent's column list (a partition takes its parent's columns verbatim), so key
@@ -277,17 +273,49 @@ fn route_partitioned_insert(
             .ok_or_else(|| Error::TableNotFound {
                 name: part_name.clone(),
             })?;
-        inserted.extend(insert_rows(
-            &part,
-            &plan.columns,
-            rows,
-            plan.rls_check.as_ref(),
-            plan.view_check.as_ref(),
-            plan.overriding,
-            false,
-            engine,
-            txn,
-        )?);
+        // Route first, then run the statement's INSERT / upsert action against the leaf the rows
+        // landed in: the parent's key constraints exist on every partition (propagated at
+        // partition create/attach), so the conflict arbiter resolves locally — and because the
+        // arbiter includes the partition key, a conflicting row can only ever live in the same
+        // leaf the new row routes to.
+        let routed = match &plan.on_conflict {
+            Some(OnConflictPlan::DoUpdate {
+                target,
+                assignments,
+                filter,
+            }) => upsert_rows(
+                &part,
+                &plan.columns,
+                rows,
+                plan.rls_check.as_ref(),
+                plan.overriding,
+                target,
+                assignments,
+                filter.as_ref(),
+                engine,
+                txn,
+            )?,
+            other => {
+                if let Some(OnConflictPlan::DoNothing {
+                    target: Some(target),
+                }) = other
+                {
+                    resolve_arbiter(&part, target, engine)?;
+                }
+                insert_rows(
+                    &part,
+                    &plan.columns,
+                    rows,
+                    plan.rls_check.as_ref(),
+                    plan.view_check.as_ref(),
+                    plan.overriding,
+                    matches!(other, Some(OnConflictPlan::DoNothing { .. })),
+                    engine,
+                    txn,
+                )?
+            },
+        };
+        inserted.extend(routed);
     }
     Ok(inserted)
 }
@@ -307,12 +335,13 @@ fn route_partitioned_insert(
 /// `23514` naming the partition, when any post-update row violates the constraint.
 fn enforce_update_partition_bound(
     table: &TableSchema,
-    to_update: &[(Tid, Option<Row>, Row)],
+    new_rows: &[&Row],
+    via_upsert: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
     const MAX_DEPTH: usize = 64;
-    if to_update.is_empty() || !super::partition::has_any(engine, txn)? {
+    if new_rows.is_empty() || !super::partition::has_any(engine, txn)? {
         return Ok(());
     }
     let mut current = crate::analyzer::qualified_display(&table.schema, &table.name);
@@ -349,7 +378,7 @@ fn enforce_update_partition_bound(
         } else {
             Vec::new()
         };
-        for (_, _, new_row) in to_update {
+        for new_row in new_rows {
             let key: Vec<ast::Value> = key_pos
                 .iter()
                 .map(|&pos| new_row.get(pos).cloned().unwrap_or(ast::Value::Null))
@@ -363,6 +392,16 @@ fn enforce_update_partition_bound(
                 !super::partition::accepts(&key, &bound, &key_tys)
             };
             if violates {
+                if via_upsert {
+                    // The reference engine's class for a DO UPDATE that would move the row.
+                    return Err(Error::Coded {
+                        message: format!(
+                            "invalid ON CONFLICT DO UPDATE: the assignment would move the row                              out of partition \"{}\" (row movement is not supported)",
+                            table.name
+                        ),
+                        sqlstate: "0A000",
+                    });
+                }
                 return Err(Error::Coded {
                     message: format!(
                         "new row for relation \"{}\" violates partition constraint — the updated \
@@ -1622,6 +1661,12 @@ fn upsert_rows(
         engine,
         txn,
     )?;
+    // A DO UPDATE assignment may not move the row out of its partition's bound either — the same
+    // stranding the plain-UPDATE guard refuses (the reference engine refuses the move here too).
+    {
+        let new_rows: Vec<&Row> = updates.iter().map(|(_, _, row)| row).collect();
+        enforce_update_partition_bound(table, &new_rows, true, engine, txn)?;
+    }
     if !inserts.is_empty() {
         insert_triggers.fire_stmt_before(table, engine, txn)?;
     }
@@ -1707,13 +1752,16 @@ fn resolve_arbiter(
         .collect();
     match target {
         ConflictArbiter::Constraint(name) => {
-            let constraint = constraints.iter().find(|c| &c.name == name).ok_or_else(|| {
-                nusadb_core::Error::ConstraintViolation(format!(
-                    "ON CONFLICT ON CONSTRAINT \"{name}\": no unique or primary key constraint with \
-                     that name on \"{}\"",
-                    table.name
-                ))
-            })?;
+            let constraint = constraints
+                .iter()
+                .find(|c| &c.name == name)
+                .ok_or_else(|| Error::Coded {
+                    message: format!(
+                        "constraint \"{name}\" for table \"{}\" does not exist",
+                        table.name
+                    ),
+                    sqlstate: "42704", // undefined_object
+                })?;
             constraint_ordinals(table, &constraint.columns)
         },
         ConflictArbiter::Columns(ordinals) => {
@@ -1726,11 +1774,14 @@ fn resolve_arbiter(
                     return constraint_ordinals(table, &constraint.columns);
                 }
             }
-            Err(nusadb_core::Error::ConstraintViolation(format!(
-                "ON CONFLICT target columns do not match any unique or primary key constraint on \"{}\"",
-                table.name
-            ))
-            .into())
+            Err(Error::Coded {
+                message: format!(
+                    "there is no unique or primary key constraint matching the ON CONFLICT \
+                     specification on \"{}\"",
+                    table.name
+                ),
+                sqlstate: "42P10", // invalid_column_reference
+            })
         },
     }
 }
@@ -4031,7 +4082,10 @@ fn run_update_single(
     // so a stranded row would silently vanish from any query whose WHERE prunes by the key. The
     // reference engine moves the row to the right sibling; until that row movement is built, the
     // assignment is refused LOUDLY (its own class, so a client can tell this from a plain CHECK).
-    enforce_update_partition_bound(&plan.table, &to_update, engine, txn)?;
+    {
+        let new_rows: Vec<&Row> = to_update.iter().map(|(_, _, row)| row).collect();
+        enforce_update_partition_bound(&plan.table, &new_rows, false, engine, txn)?;
+    }
     // BEFORE triggers: fire statement-level once, then row-level for each matched row, before
     // any constraint check or write.
     triggers.fire_stmt_before(&plan.table, engine, txn)?;
