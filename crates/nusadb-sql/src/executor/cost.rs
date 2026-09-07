@@ -100,9 +100,40 @@ pub(crate) fn estimate_rows(op: &PhysicalOperator, ctx: Option<&ScanStats>) -> f
     match op {
         // An index scan only returns rows that exist, so the table row count is a safe upper bound;
         // a bound-aware estimate is a refinement once histograms drive index selection.
-        PhysicalOperator::SeqScan { table, .. } | PhysicalOperator::IndexScan { table, .. } => ctx
+        PhysicalOperator::SeqScan { table, .. } => ctx
             .filter(|c| c.schema.id == table.id)
             .map_or(0.0, ScanStats::row_count),
+        PhysicalOperator::IndexScan {
+            table,
+            unique_point,
+            limit,
+            lo,
+            hi,
+            ..
+        } => {
+            let full = ctx
+                .filter(|c| c.schema.id == table.id)
+                .map_or(0.0, ScanStats::row_count);
+            // A unique point lookup matches at most one row — reporting the table's row count
+            // for it made every `EXPLAIN` of a primary-key fetch look like a full scan.
+            if *unique_point {
+                full.min(1.0)
+            } else if let Some(n) = limit {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "ordered-scan caps beyond 2^52 rows are not realistic"
+                )]
+                full.min(*n as f64)
+            } else if matches!(lo, std::ops::Bound::Unbounded)
+                && matches!(hi, std::ops::Bound::Unbounded)
+            {
+                full
+            } else {
+                // A bounded (non-unique) key range: without per-key statistics use the default
+                // predicate selectivity rather than pretending the whole table comes back.
+                full * DEFAULT_SELECTIVITY
+            }
+        },
         PhysicalOperator::Filter { input, predicate } => {
             let inrows = estimate_rows(input, ctx);
             let sel = ctx.map_or(DEFAULT_SELECTIVITY, |c| selectivity(predicate, c));
