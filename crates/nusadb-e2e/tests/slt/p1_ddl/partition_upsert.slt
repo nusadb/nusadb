@@ -55,7 +55,7 @@ SELECT v FROM up WHERE id = 1
 c
 
 # A DO UPDATE may not move the row out of its partition; a bad arbiter is refused loudly.
-statement error row movement is not supported
+statement error row movement applies to plain UPDATE only
 INSERT INTO up VALUES (1, 'move') ON CONFLICT (id) DO UPDATE SET id = 150
 
 statement error no unique or primary key constraint matching

@@ -333,24 +333,24 @@ fn route_partitioned_insert(
 ///
 /// # Errors
 /// `23514` naming the partition, when any post-update row violates the constraint.
-fn enforce_update_partition_bound(
+fn partition_bound_violations(
     table: &TableSchema,
     new_rows: &[&Row],
-    via_upsert: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<Vec<bool>, Error> {
     const MAX_DEPTH: usize = 64;
+    let mut mask = vec![false; new_rows.len()];
     if new_rows.is_empty() || !super::partition::has_any(engine, txn)? {
-        return Ok(());
+        return Ok(mask);
     }
     let mut current = crate::analyzer::qualified_display(&table.schema, &table.name);
     for _ in 0..MAX_DEPTH {
         let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
-            return Ok(());
+            return Ok(mask);
         };
         let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent)? else {
-            return Ok(());
+            return Ok(mask);
         };
         // Key positions by name in the row layout — a partition takes its parent's columns.
         let mut key_pos = Vec::with_capacity(key_cols.len());
@@ -362,14 +362,14 @@ fn enforce_update_partition_bound(
                 .enumerate()
                 .find(|(_, c)| c.name == *key_col)
             else {
-                return Ok(());
+                return Ok(mask);
             };
             key_pos.push(pos);
             key_tys.push(def.ty);
         }
         let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
         else {
-            return Ok(());
+            return Ok(mask);
         };
         let is_default = super::partition::is_default(&bound);
         // The DEFAULT partition's constraint is "no sibling claims the key" — load them once.
@@ -378,7 +378,7 @@ fn enforce_update_partition_bound(
         } else {
             Vec::new()
         };
-        for new_row in new_rows {
+        for (i, new_row) in new_rows.iter().enumerate() {
             let key: Vec<ast::Value> = key_pos
                 .iter()
                 .map(|&pos| new_row.get(pos).cloned().unwrap_or(ast::Value::Null))
@@ -391,32 +391,13 @@ fn enforce_update_partition_bound(
             } else {
                 !super::partition::accepts(&key, &bound, &key_tys)
             };
-            if violates {
-                if via_upsert {
-                    // The reference engine's class for a DO UPDATE that would move the row.
-                    return Err(Error::Coded {
-                        message: format!(
-                            "invalid ON CONFLICT DO UPDATE: the assignment would move the row                              out of partition \"{}\" (row movement is not supported)",
-                            table.name
-                        ),
-                        sqlstate: "0A000",
-                    });
-                }
-                return Err(Error::Coded {
-                    message: format!(
-                        "new row for relation \"{}\" violates partition constraint — the updated \
-                         partition key leaves this partition's bound, and moving a row between \
-                         partitions on UPDATE is not supported; DELETE the row and re-INSERT it \
-                         through the parent instead",
-                        table.name
-                    ),
-                    sqlstate: "23514", // check_violation
-                });
+            if violates && let Some(slot) = mask.get_mut(i) {
+                *slot = true;
             }
         }
         current = parent;
     }
-    Ok(())
+    Ok(mask)
 }
 
 fn enforce_partition_bound(
@@ -1047,6 +1028,7 @@ fn insert_select_streaming(
             txn,
             Some(unique),
         )?
+        .0
         .len();
         Ok(())
     };
@@ -1174,6 +1156,7 @@ pub(super) fn insert_rows(
         txn,
         None,
     )
+    .map(|(rows, _)| rows)
 }
 
 /// Encode `rows` against `schema` and write them in one engine call, returning the new tids.
@@ -1255,7 +1238,7 @@ fn insert_rows_with_unique(
     engine: &dyn StorageEngine,
     txn: TxnId,
     mut deferred: Option<&mut DeferredUnique>,
-) -> Result<Vec<Row>, Error> {
+) -> Result<(Vec<Row>, Vec<Tid>), Error> {
     // Column DEFAULTs / SERIAL: a column omitted from the target list — or written as
     // an explicit `DEFAULT` cell (`None`) — is filled by its default expression or its sequence (if
     // any) rather than NULL. Loaded once for the batch.
@@ -1435,7 +1418,7 @@ fn insert_rows_with_unique(
     // Incremental view maintenance: append the projected rows to any IVM view over this
     // table.
     super::ivm::maintain_on_change(&table.name, &full_rows, &[], engine, txn)?;
-    Ok(full_rows)
+    Ok((full_rows, tids))
 }
 
 /// Execute `INSERT ... ON CONFLICT (target) DO UPDATE SET ... [WHERE ...]` — the upsert.
@@ -1665,7 +1648,18 @@ fn upsert_rows(
     // stranding the plain-UPDATE guard refuses (the reference engine refuses the move here too).
     {
         let new_rows: Vec<&Row> = updates.iter().map(|(_, _, row)| row).collect();
-        enforce_update_partition_bound(table, &new_rows, true, engine, txn)?;
+        let mask = partition_bound_violations(table, &new_rows, engine, txn)?;
+        if mask.iter().any(|&violates| violates) {
+            // The reference engine's class: a DO UPDATE may not move the row between partitions.
+            return Err(Error::Coded {
+                message: format!(
+                    "invalid ON CONFLICT DO UPDATE: the assignment would move the row out of \
+                     partition \"{}\" (row movement applies to plain UPDATE only)",
+                    table.name
+                ),
+                sqlstate: "0A000",
+            });
+        }
     }
     if !inserts.is_empty() {
         insert_triggers.fire_stmt_before(table, engine, txn)?;
@@ -1857,6 +1851,7 @@ pub(super) fn run_copy_from(
             txn,
             Some(unique),
         )?
+        .0
         .len();
         Ok(())
     };
@@ -3910,6 +3905,9 @@ pub(super) fn run_update(
     // An `UPDATE` on an inheritance/partition parent (without `ONLY`) also updates every descendant:
     // run the parent's own (`ONLY`) update, then each descendant sub-plan, combining the row counts
     // (or `RETURNING` rows). The common non-parent case has an empty `propagate` and returns directly.
+    // The movement registry keeps a row this statement moved between partitions from being
+    // re-matched by a later branch's scan (each row is visited once, like the reference engine).
+    let _moves = super::move_skip::scope();
     let mut result = run_update_single(plan, engine, txn)?;
     for sub in &plan.propagate {
         result = combine_write_results(result, run_update_single(sub, engine, txn)?)?;
@@ -4032,6 +4030,11 @@ fn run_update_single(
         reject_explicit_generated(&plan.table, &fills, &set_cols)?;
     }
     for (tid, row) in rows {
+        // A row this statement's own row movement just inserted here is already final — a later
+        // branch re-matching it would double-apply the SET (and double its RETURNING row).
+        if super::move_skip::moved_here(plan.table.id, tid) {
+            continue;
+        }
         if plan.from.is_some() {
             // Join: find the first FROM row matching the WHERE over the concatenated row; apply the
             // SET against that combined row. No match → the target row is left unchanged.
@@ -4078,13 +4081,28 @@ fn run_update_single(
             result_rows.push(row);
         }
     }
-    // A SET may not move a row out of its partition's bound: the pruning layer trusts the bound,
-    // so a stranded row would silently vanish from any query whose WHERE prunes by the key. The
-    // reference engine moves the row to the right sibling; until that row movement is built, the
-    // assignment is refused LOUDLY (its own class, so a client can tell this from a plain CHECK).
-    {
+    // Row movement: a SET whose new image leaves this partition's bound is performed as a DELETE
+    // here plus an INSERT routed through the topmost parent (the reference engine's behavior) —
+    // never an in-place write that would strand the row where the pruning layer misses it. Moved
+    // entries stay in `to_update` (RETURNING order and the BEFORE UPDATE row triggers, which fire
+    // for moved rows too, are position-based); the apply loop below diverts them.
+    let moved_mask = {
         let new_rows: Vec<&Row> = to_update.iter().map(|(_, _, row)| row).collect();
-        enforce_update_partition_bound(&plan.table, &new_rows, false, engine, txn)?;
+        partition_bound_violations(&plan.table, &new_rows, engine, txn)?
+    };
+    // A direct `UPDATE <partition>` names the partition as the statement's target, so a row may
+    // not leave it — the reference engine refuses rather than moves (movement applies only when
+    // the update arrived THROUGH the parent, whose tree the row stays inside).
+    if !plan.partition_via_parent && moved_mask.iter().any(|&moved| moved) {
+        return Err(Error::Coded {
+            message: format!(
+                "new row for relation \"{}\" violates partition constraint — the updated \
+                 partition key leaves this partition's bound; UPDATE the partitioned parent \
+                 instead to move the row",
+                plan.table.name
+            ),
+            sqlstate: "23514", // check_violation
+        });
     }
     // BEFORE triggers: fire statement-level once, then row-level for each matched row, before
     // any constraint check or write.
@@ -4175,7 +4193,18 @@ fn run_update_single(
     }
     // RETURNING projects each updated row's *post-update* values.
     let mut returned: Vec<Row> = Vec::new();
-    for (tid, old, new_row) in &to_update {
+    let mut moved: Vec<(Tid, Option<Row>, Row)> = Vec::new();
+    for (i, (tid, old, new_row)) in to_update.iter().enumerate() {
+        if moved_mask.get(i).copied().unwrap_or(false) {
+            // Row movement: delete-from-source + routed insert, applied after this loop so the
+            // in-place updates land first. RETURNING still projects the moved row's new image
+            // here, in matched order.
+            moved.push((*tid, old.clone(), new_row.clone()));
+            if !plan.returning.is_empty() {
+                returned.push(project_row(&plan.returning, new_row)?);
+            }
+            continue;
+        }
         let bytes = row::encode(new_row, &schema)?;
         let new_tid = engine.update(txn, plan.table.id, *tid, &bytes)?;
         // Add the new row version's secondary-index entries. The old tid's entries are
@@ -4195,9 +4224,19 @@ fn run_update_single(
             returned.push(project_row(&plan.returning, new_row)?);
         }
     }
-    // AFTER triggers: row-level for each updated row, then statement-level once.
+    // Row movement happens after the in-place applies: DELETE from this partition + INSERT
+    // routed through the topmost parent (uniqueness enforced in the destination). The reference
+    // firing order applies: the moved rows already fired BEFORE UPDATE above; the movement fires
+    // DELETE triggers here and INSERT triggers in the destination — never AFTER UPDATE.
+    if !moved.is_empty() {
+        move_rows_across_partitions(&plan.table, &moved, plan.rls_check.as_ref(), engine, txn)?;
+    }
+    // AFTER triggers: row-level for each updated-in-place row, then statement-level once.
     if triggers.has_after_row() {
-        for (_, old, new_row) in &to_update {
+        for (i, (_, old, new_row)) in to_update.iter().enumerate() {
+            if moved_mask.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             triggers.fire_row_after(&plan.table, old.as_deref(), Some(new_row), engine, txn)?;
         }
     }
@@ -4205,7 +4244,14 @@ fn run_update_single(
     // Incremental view maintenance: an UPDATE is a delete of the old image + insert of the
     // new one on each IVM view (old images captured above via `has_ivm`).
     if has_ivm {
-        let new_rows: Vec<Row> = to_update.iter().map(|(_, _, new)| new.clone()).collect();
+        // A moved row leaves this table: its old image is removed here and its new image is
+        // accounted to the destination (inside the movement's insert path).
+        let new_rows: Vec<Row> = to_update
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !moved_mask.get(*i).copied().unwrap_or(false))
+            .map(|(_, (_, _, new))| new.clone())
+            .collect();
         let old_rows: Vec<Row> = to_update
             .iter()
             .filter_map(|(_, old, _)| old.clone())
@@ -4222,6 +4268,148 @@ fn run_update_single(
             command: RowsCommand::Update,
         })
     }
+}
+
+/// Perform row movement for a plain `UPDATE` on a partition: each moved row is deleted from the
+/// source partition and inserted through the topmost partitioned ancestor's routing, landing in
+/// the partition whose bound accepts its new key (uniqueness, RLS and index maintenance run in
+/// the destination's ordinary insert path). Trigger firing follows the reference engine's row
+/// movement: the caller already fired BEFORE UPDATE on the source; this fires the source's DELETE
+/// row triggers (when the old image is available) and the destination's INSERT row triggers —
+/// AFTER UPDATE never fires for a moved row.
+fn move_rows_across_partitions(
+    source: &TableSchema,
+    moved: &[(Tid, Option<Row>, Row)],
+    rls_check: Option<&crate::planner::TypedExpr>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    // The topmost partitioned ancestor: routing starts there, so a multi-level tree re-routes
+    // through every level's key.
+    let mut root_key = crate::analyzer::qualified_display(&source.schema, &source.name);
+    while let Some(parent) = super::partition::partition_parent(engine, txn, &root_key)? {
+        root_key = parent;
+    }
+    let (root_schema, root_name) = crate::analyzer::split_qualified(&root_key);
+    let root = engine
+        .lookup_table_as_of_in(
+            txn,
+            root_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+            root_name,
+        )?
+        .ok_or_else(|| Error::TableNotFound {
+            name: root_key.clone(),
+        })?;
+    let delete_triggers = super::trigger::load_table_triggers(
+        &source.schema,
+        &source.name,
+        ast::TriggerEvent::Delete,
+        engine,
+        txn,
+    )?;
+    let all_columns: Vec<usize> = (0..source.columns.len()).collect();
+    for (tid, old, new_row) in moved {
+        if delete_triggers.has_before_row()
+            && let Some(old) = old
+        {
+            delete_triggers.fire_row_before(source, Some(old), None, engine, txn)?;
+        }
+        engine.delete(txn, source.id, *tid)?;
+        // Route the new image from the root; the accepting leaf runs the ordinary insert path.
+        let leaf_key = route_row_to_leaf(&root, new_row, engine, txn)?;
+        let (leaf_schema, leaf_name) = crate::analyzer::split_qualified(&leaf_key);
+        let leaf = engine
+            .lookup_table_as_of_in(
+                txn,
+                leaf_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+                leaf_name,
+            )?
+            .ok_or_else(|| Error::TableNotFound {
+                name: leaf_key.clone(),
+            })?;
+        // The ordinary insert path enforces uniqueness/RLS/checks, maintains indexes, fires the
+        // destination's INSERT triggers, and maintains its IVM views — exactly what the moved row
+        // needs; the returned tid feeds the movement registry so a later branch of this same
+        // statement does not re-match the row.
+        let value_row: Vec<Option<ast::Value>> = new_row.iter().cloned().map(Some).collect();
+        let (_, tids) = insert_rows_with_unique(
+            &leaf,
+            &all_columns,
+            vec![value_row],
+            rls_check,
+            None,
+            None,
+            false,
+            engine,
+            txn,
+            None,
+        )?;
+        for new_tid in tids {
+            super::move_skip::record(leaf.id, new_tid);
+        }
+        if delete_triggers.has_after_row()
+            && let Some(old) = old
+        {
+            delete_triggers.fire_row_after(source, Some(old), None, engine, txn)?;
+        }
+    }
+    Ok(())
+}
+
+/// The leaf partition (schema-qualified key) that accepts `row` when routed from partitioned
+/// parent `root`, walking sub-partitioned levels downward. Errors like a routed INSERT when no
+/// partition accepts the key.
+fn route_row_to_leaf(
+    root: &TableSchema,
+    row: &Row,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<String, Error> {
+    const MAX_DEPTH: usize = 64;
+    let mut current = crate::analyzer::qualified_display(&root.schema, &root.name);
+    for _ in 0..MAX_DEPTH {
+        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &current)? else {
+            return Ok(current);
+        };
+        let mut key = Vec::with_capacity(key_cols.len());
+        let mut key_tys = Vec::with_capacity(key_cols.len());
+        for key_col in &key_cols {
+            let Some((pos, def)) = root
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| &c.name == key_col)
+            else {
+                return Ok(current);
+            };
+            key.push(row.get(pos).cloned().unwrap_or(ast::Value::Null));
+            key_tys.push(def.ty);
+        }
+        let partitions = super::partition::partitions_of(engine, txn, &current, &key_tys)?;
+        let matched = partitions
+            .iter()
+            .find(|p| super::partition::accepts(&key, &p.bound, &key_tys))
+            .or_else(|| {
+                partitions
+                    .iter()
+                    .find(|p| super::partition::is_default(&p.bound))
+            })
+            .map(|p| p.table.clone());
+        match matched {
+            Some(next) => current = next,
+            None => {
+                return Err(Error::Coded {
+                    message: format!(
+                        "no partition of relation \"{current}\" found for the moved row"
+                    ),
+                    sqlstate: "23514",
+                });
+            },
+        }
+    }
+    Err(Error::Internal(format!(
+        "partition routing exceeded {MAX_DEPTH} levels under \"{current}\" (cyclic partition          metadata?)"
+    )))
 }
 
 pub(super) fn run_delete(

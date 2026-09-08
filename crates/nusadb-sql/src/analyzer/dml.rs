@@ -698,7 +698,10 @@ pub(super) fn analyze_update_stmt(
         sub.only = true;
         sub.schema = sub_schema.map(str::to_owned);
         sub_name.clone_into(&mut sub.table);
-        plan.propagate.push(analyze_update(sub, catalog)?);
+        let mut sub_plan = analyze_update(sub, catalog)?;
+        // Reached through the parent: a bound-leaving new image moves to its sibling partition.
+        sub_plan.partition_via_parent = true;
+        plan.propagate.push(sub_plan);
     }
     Ok(plan)
 }
@@ -873,6 +876,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         // Populated by `analyze_update_stmt` for a non-`ONLY` update on an inheritance/partition
         // parent; a single-table analysis carries none.
         propagate: Vec::new(),
+        partition_via_parent: false,
     })
 }
 

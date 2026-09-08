@@ -1727,6 +1727,11 @@ pub struct UpdatePlan {
     /// propagates down the hierarchy. Empty for an ordinary or `ONLY` update. Each sub-plan is itself
     /// empty here (no further recursion; the list is already the transitive descendant set).
     pub propagate: Vec<Self>,
+    /// `true` on a propagate sub-plan reached THROUGH its parent (`UPDATE parent ...`): a new row
+    /// image leaving the partition's bound then MOVES to the accepting sibling. `false` for a
+    /// direct `UPDATE <partition>`, which refuses the move (`23514`) exactly like the reference
+    /// engine — the statement's target table must keep the row.
+    pub partition_via_parent: bool,
 }
 
 /// A view's `WITH CHECK OPTION` enforcement: the predicate a row written through the view must

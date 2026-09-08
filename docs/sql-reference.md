@@ -485,9 +485,12 @@ Worth knowing:
   parent takes no default, and a new sibling whose bound overlaps rows already in the default is
   refused.
 - `UPDATE` and `DELETE` on the parent reach every partition; `ONLY` restricts them to the parent
-  itself. An `UPDATE` that would move a row out of its partition's bound is refused (`23514`,
-  naming the partition) — rows are never left stranded where the pruning layer would miss them.
-  Change the key by delete-and-insert; row movement on `UPDATE` is not built.
+  itself. An `UPDATE` through the parent that changes a row's partition key MOVES the row to the
+  accepting partition (performed as a delete plus a routed insert: the destination enforces
+  uniqueness, and the source's `DELETE` plus the destination's `INSERT` row triggers fire — never
+  `AFTER UPDATE`). A direct `UPDATE` on a partition refuses the move (`23514`): the named target
+  must keep the row, exactly like the reference engine. `ON CONFLICT DO UPDATE` may not move a
+  row either.
 - The partition key must be written on every insert; the planner prunes partitions using `WHERE`
   conditions of the shape `key = / < / <= / > / >= constant` and `key BETWEEN a AND b`, which shows
   in `EXPLAIN` as fewer scanned partitions.
@@ -500,7 +503,8 @@ is globally sound); each partition inherits it at `CREATE TABLE ... PARTITION OF
 `ATTACH PARTITION` (existing rows are validated first, and a nullable primary-key column in the
 attached table is refused). With that in place, `INSERT ... ON CONFLICT` works on the parent:
 rows route to their partition first, then the upsert action runs against that leaf. A `DO UPDATE`
-that would move the row out of its partition is refused (row movement is not built).
+that would move the row out of its partition is refused; a plain `UPDATE` through the parent
+moves it (see the partitioning section).
 
 Not accepted: an expression as a partition key, `LIST` with more than one key column,
 `MINVALUE` / `MAXVALUE` bounds, non-literal bounds, a partition declaring its own columns, and

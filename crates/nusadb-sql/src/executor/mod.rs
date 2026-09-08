@@ -123,6 +123,7 @@ mod instrument;
 mod ivm;
 pub mod join;
 mod lock_skip;
+mod move_skip;
 pub mod ops;
 mod partition;
 mod procedure;

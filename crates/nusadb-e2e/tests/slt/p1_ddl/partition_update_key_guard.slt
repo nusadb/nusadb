@@ -1,7 +1,8 @@
-# An UPDATE may not move a row out of its partition's bound (23514, loud): the pruning layer
-# trusts the bound, so a stranded row would silently vanish from key-constrained queries — the
-# exact silent row loss this guards against. TABLESAMPLE keeps each row with probability n%,
-# deterministic under REPEATABLE; 0/100 are exact; bad percent = 2202H, unknown method = 42704.
+# UPDATE through a partitioned parent MOVES a row whose new key leaves its partition's bound
+# (delete-from-source + routed insert, like the reference engine); a direct UPDATE on the
+# partition itself refuses the move (23514) — the named target must keep the row. TABLESAMPLE
+# keeps each row with probability n%, deterministic under REPEATABLE; 0/100 are exact; bad
+# percent = 2202H, unknown method = 42704.
 
 statement ok
 CREATE TABLE gp (id INT, k INT) PARTITION BY RANGE (k)
@@ -18,37 +19,56 @@ CREATE TABLE gp_def PARTITION OF gp DEFAULT
 statement ok
 INSERT INTO gp VALUES (1, 50), (2, 250)
 
-statement error violates partition constraint
+# Via the parent: the row moves to the accepting sibling and stays findable by its key.
+statement ok
 UPDATE gp SET k = 150 WHERE id = 1
 
-statement error violates partition constraint
-UPDATE gp_lo SET k = 150 WHERE id = 1
+query II
+SELECT id, k FROM gp_hi
+----
+1 150
 
-# A row in the DEFAULT partition may take any key no sibling claims; a sibling-claimed key is
-# refused (it would belong in that sibling).
+query I
+SELECT count(*) FROM gp WHERE k = 150
+----
+1
+
+# Directly on the partition: refused loudly, the row stays put.
+statement error violates partition constraint
+UPDATE gp_hi SET k = 20 WHERE id = 1
+
+# DEFAULT partition both ways: out to a claiming sibling, and in from a sibling.
+statement ok
+UPDATE gp SET k = 120 WHERE id = 2
+
+query II
+SELECT id, k FROM gp_hi ORDER BY id
+----
+1 150
+2 120
+
 statement ok
 UPDATE gp SET k = 300 WHERE id = 2
 
-statement error violates partition constraint
-UPDATE gp SET k = 120 WHERE id = 2
-
-# In-bound key updates and non-key updates pass, and the row stays findable by its key.
-statement ok
-UPDATE gp SET k = 60 WHERE id = 1
-
-statement ok
-UPDATE gp SET id = 9 WHERE id = 1
-
-query I
-SELECT count(*) FROM gp WHERE k = 60
+query II
+SELECT id, k FROM gp_def
 ----
-1
+2 300
+
+# RETURNING projects the moved image exactly once; a multi-row shift crosses bounds cleanly.
+query II
+UPDATE gp SET k = 90 WHERE id = 1 RETURNING id, k
+----
+1 90
+
+statement ok
+UPDATE gp SET k = k + 100 WHERE k < 400
 
 query II rowsort
 SELECT id, k FROM gp
 ----
-2 300
-9 60
+1 190
+2 400
 
 statement ok
 CREATE TABLE ts6 (i INT)
