@@ -1414,7 +1414,7 @@ pub(super) fn view_lookup_key(
 /// Resolve a non-materialized view name to its analyzed body by parsing + analyzing its stored SQL,
 /// so it can be inlined in place of a `FROM` base. Errors with `TableNotFound` if `name` is
 /// neither a base table nor a view, or `Unsupported` if view nesting is too deep (a cycle).
-fn resolve_view(name: &str, catalog: &dyn Catalog) -> Result<SelectPlan, Error> {
+pub(super) fn resolve_view(name: &str, catalog: &dyn Catalog) -> Result<SelectPlan, Error> {
     const MAX_VIEW_DEPTH: u32 = 64;
     let Some(sql) = catalog.lookup_view(name)? else {
         return Err(Error::TableNotFound {
@@ -2635,7 +2635,11 @@ impl Catalog for CteCatalog<'_> {
 
 /// Build a CTE's output [`TableSchema`] from its planned projection plus an optional explicit
 /// column-name list. CTE columns are conservatively typed as nullable.
-fn cte_schema(name: &str, explicit: &[String], plan: &SelectPlan) -> Result<TableSchema, Error> {
+pub(super) fn cte_schema(
+    name: &str,
+    explicit: &[String],
+    plan: &SelectPlan,
+) -> Result<TableSchema, Error> {
     let base_width = plan.projection.len();
     // A set-returning function may append extra columns (a pair function's value column, or a
     // multi-array unnest's further arrays), then `WITH ORDINALITY` adds the counter — in that order,

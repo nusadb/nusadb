@@ -47,6 +47,7 @@ pub(crate) fn current_temp_schema() -> Option<String> {
 }
 pub use session_ctx::check_settable_parameter;
 pub use session_ctx::{pin_statement_timezone, statement_tz_offset_secs};
+pub use trigger::view_has_instead_of_trigger;
 
 /// The pinned session's canonical `timezone` setting, if one is set — wrapped like
 /// [`current_temp_schema`] so the `session_ctx` module stays private to the executor.
@@ -2311,6 +2312,7 @@ fn dispatch(
         PhysicalPlan::CreateDomain(p) => run_create_domain(&p, engine, txn),
         PhysicalPlan::DropDomain(p) => run_drop_domain(&p, engine, txn),
         PhysicalPlan::CreateTrigger(p) => trigger::run_create_trigger(&p, engine, txn),
+        PhysicalPlan::InsteadOfDml(p) => dml::run_instead_of_dml(&p, engine, txn),
         PhysicalPlan::DropTrigger(p) => trigger::run_drop_trigger(&p, engine, txn),
         PhysicalPlan::AlterTrigger(p) => trigger::run_alter_trigger(&p, engine, txn),
         PhysicalPlan::CreateProcedure(p) => procedure::run_create_procedure(&p, engine, txn),
@@ -2778,6 +2780,13 @@ fn format_plan(
         PhysicalPlan::DropDomain(p) => vec![format!("{indent}DropDomain: {}", p.name)],
         PhysicalPlan::CreateTrigger(p) => {
             vec![format!("{indent}CreateTrigger: {} ON {}", p.name, p.table)]
+        },
+        PhysicalPlan::InsteadOfDml(p) => {
+            vec![format!(
+                "{indent}InsteadOfDml: {} ON VIEW {}",
+                p.event.as_str(),
+                p.view.name
+            )]
         },
         PhysicalPlan::AlterTrigger(p) => {
             vec![format!(
@@ -4443,6 +4452,14 @@ impl crate::Catalog for ExecCatalog<'_> {
         lookup_view_definition(self.engine, self.txn, name)
     }
 
+    fn has_instead_of_trigger(
+        &self,
+        name: &str,
+        event: crate::ast::TriggerEvent,
+    ) -> Result<bool, Error> {
+        trigger::view_has_instead_of_trigger(self.engine, self.txn, name, event)
+    }
+
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {
         lookup_view_columns(self.engine, self.txn, name)
     }
@@ -4649,6 +4666,14 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn lookup_view(&self, name: &str) -> Result<Option<String>, Error> {
         lookup_view_definition(self.engine, self.txn, name)
+    }
+
+    fn has_instead_of_trigger(
+        &self,
+        name: &str,
+        event: crate::ast::TriggerEvent,
+    ) -> Result<bool, Error> {
+        trigger::view_has_instead_of_trigger(self.engine, self.txn, name, event)
     }
 
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {

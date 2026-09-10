@@ -1,0 +1,90 @@
+# INSTEAD OF triggers on views: the trigger firing REPLACES the write (row-level only, no WHEN).
+# NEW is the proposed view row, OLD the current one; RETURNING projects NEW (INSERT/UPDATE) or
+# OLD (DELETE). BEFORE/AFTER on a view and INSTEAD OF on a table are refused (42809).
+
+statement ok
+CREATE TABLE base (id INT PRIMARY KEY, v TEXT)
+
+statement ok
+CREATE VIEW vw AS SELECT id, v FROM base WHERE id < 1000
+
+statement ok
+CREATE TRIGGER vw_ins INSTEAD OF INSERT ON vw FOR EACH ROW INSERT INTO base VALUES (NEW.id, NEW.v)
+
+statement ok
+CREATE TRIGGER vw_upd INSTEAD OF UPDATE ON vw FOR EACH ROW UPDATE base SET v = NEW.v WHERE id = OLD.id
+
+statement ok
+CREATE TRIGGER vw_del INSTEAD OF DELETE ON vw FOR EACH ROW DELETE FROM base WHERE id = OLD.id
+
+statement ok
+INSERT INTO vw VALUES (1, 'a'), (2, 'b')
+
+query IT
+SELECT id, v FROM base ORDER BY id
+----
+1 a
+2 b
+
+# An unnamed view column arrives as NULL (views carry no defaults).
+statement ok
+INSERT INTO vw (id) VALUES (3)
+
+query T
+SELECT v FROM base WHERE id = 3
+----
+NULL
+
+statement ok
+UPDATE vw SET v = 'B' WHERE id = 2
+
+query T
+SELECT v FROM base WHERE id = 2
+----
+B
+
+statement ok
+DELETE FROM vw WHERE id = 1
+
+query I
+SELECT count(*) FROM base
+----
+2
+
+query IT
+INSERT INTO vw VALUES (4, 'r') RETURNING id, v
+----
+4 r
+
+query I
+DELETE FROM vw WHERE id = 4 RETURNING id
+----
+4
+
+# Wrong shapes are refused loudly.
+statement error views need INSTEAD OF triggers
+CREATE TRIGGER bad1 BEFORE INSERT ON vw FOR EACH ROW INSERT INTO base VALUES (0, 'x')
+
+statement error INSTEAD OF triggers attach to views
+CREATE TRIGGER bad2 INSTEAD OF INSERT ON base FOR EACH ROW INSERT INTO base VALUES (0, 'x')
+
+statement error must be FOR EACH ROW
+CREATE TRIGGER bad3 INSTEAD OF INSERT ON vw FOR EACH STATEMENT INSERT INTO base VALUES (0, 'x')
+
+statement error cannot have WHEN
+CREATE TRIGGER bad4 INSTEAD OF INSERT ON vw FOR EACH ROW WHEN (NEW.id > 0) INSERT INTO base VALUES (0, 'x')
+
+statement ok
+DROP TRIGGER vw_ins ON vw
+
+statement ok
+DROP TRIGGER vw_upd ON vw
+
+statement ok
+DROP TRIGGER vw_del ON vw
+
+statement ok
+DROP VIEW vw
+
+statement ok
+DROP TABLE base

@@ -4270,6 +4270,137 @@ fn run_update_single(
     }
 }
 
+/// Execute DML on a view whose `INSTEAD OF` trigger replaces the write: build the `NEW`/`OLD`
+/// view rows, fire the trigger for each, and report the row count (or `RETURNING` projection) —
+/// nothing else is written by the statement itself; whatever the trigger's action does IS the
+/// write, exactly the reference engine's contract.
+pub(super) fn run_instead_of_dml(
+    plan: &crate::planner::InsteadOfDmlPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    let set = super::trigger::load_table_triggers(
+        &plan.view.schema,
+        &plan.view.name,
+        plan.event,
+        engine,
+        txn,
+    )?;
+    if !set.has_instead_row() {
+        // The trigger was dropped between analysis and execution — refuse rather than guess.
+        return Err(Error::Coded {
+            message: format!(
+                "view \"{}\" no longer has an INSTEAD OF {} trigger",
+                plan.view.name,
+                plan.event.as_str()
+            ),
+            sqlstate: "55000", // object_not_in_prerequisite_state
+        });
+    }
+    let view_types: Vec<ColumnType> = plan.view.columns.iter().map(|c| c.ty).collect();
+    let empty: Row = Vec::new();
+    // The affected rows, paired as (OLD, NEW) per event shape.
+    let mut fired: Vec<(Option<Row>, Option<Row>)> = Vec::new();
+    match plan.event {
+        ast::TriggerEvent::Insert => {
+            let mut new_rows: Vec<Row> = Vec::new();
+            if let Some(source) = &plan.source {
+                let op = crate::planner::plan_select((**source).clone());
+                for row in execute_op(&op, engine, txn)? {
+                    let mut full: Row = view_types.iter().map(|_| ast::Value::Null).collect();
+                    for (value, &pos) in row.into_iter().zip(&plan.source_columns) {
+                        let ty = view_types.get(pos).copied().unwrap_or(ColumnType::Text);
+                        if let Some(slot) = full.get_mut(pos) {
+                            *slot = super::eval::cast_value(value, ty)?;
+                        }
+                    }
+                    new_rows.push(full);
+                }
+            } else {
+                for row in &plan.rows {
+                    let mut full = Vec::with_capacity(row.len());
+                    for (expr, &ty) in row.iter().zip(&view_types) {
+                        let value = eval::eval(expr, &empty)?;
+                        full.push(super::eval::cast_value(value, ty)?);
+                    }
+                    new_rows.push(full);
+                }
+            }
+            for new_row in new_rows {
+                set.fire_row_instead(&plan.view, None, Some(&new_row), engine, txn)?;
+                fired.push((None, Some(new_row)));
+            }
+        },
+        ast::TriggerEvent::Update => {
+            for old_row in instead_of_old_rows(plan, engine, txn)? {
+                let mut new_row = old_row.clone();
+                for (pos, expr) in &plan.assignments {
+                    let ty = view_types.get(*pos).copied().unwrap_or(ColumnType::Text);
+                    let value = super::eval::cast_value(eval::eval(expr, &old_row)?, ty)?;
+                    if let Some(slot) = new_row.get_mut(*pos) {
+                        *slot = value;
+                    }
+                }
+                set.fire_row_instead(&plan.view, Some(&old_row), Some(&new_row), engine, txn)?;
+                fired.push((Some(old_row), Some(new_row)));
+            }
+        },
+        ast::TriggerEvent::Delete => {
+            for old_row in instead_of_old_rows(plan, engine, txn)? {
+                set.fire_row_instead(&plan.view, Some(&old_row), None, engine, txn)?;
+                fired.push((Some(old_row), None));
+            }
+        },
+    }
+    let count = fired.len();
+    if plan.returning.is_empty() {
+        return Ok(match plan.event {
+            ast::TriggerEvent::Insert => ExecutionResult::Inserted(count),
+            ast::TriggerEvent::Update => ExecutionResult::Updated(count),
+            ast::TriggerEvent::Delete => ExecutionResult::Deleted(count),
+        });
+    }
+    // RETURNING projects NEW (INSERT/UPDATE) or OLD (DELETE), like the reference engine.
+    let mut rows = Vec::with_capacity(count);
+    for (old_row, new_row) in &fired {
+        let subject = new_row.as_ref().or(old_row.as_ref()).unwrap_or(&empty);
+        rows.push(project_row(&plan.returning, subject)?);
+    }
+    Ok(ExecutionResult::Rows {
+        columns: plan.returning.iter().map(|p| p.name.clone()).collect(),
+        rows,
+        command: match plan.event {
+            ast::TriggerEvent::Insert => RowsCommand::Insert,
+            ast::TriggerEvent::Update => RowsCommand::Update,
+            ast::TriggerEvent::Delete => RowsCommand::Delete,
+        },
+    })
+}
+
+/// The `OLD` view rows an instead-of UPDATE/DELETE affects: the view body's output, narrowed by
+/// the statement's `WHERE` (resolved over the view's output columns).
+fn instead_of_old_rows(
+    plan: &crate::planner::InsteadOfDmlPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    let Some(body) = &plan.view_body else {
+        return Ok(Vec::new());
+    };
+    let op = crate::planner::plan_select((**body).clone());
+    let rows = execute_op(&op, engine, txn)?;
+    let Some(filter) = &plan.filter else {
+        return Ok(rows);
+    };
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        if matches!(eval::eval(filter, &row)?, ast::Value::Bool(true)) {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
+}
+
 /// Perform row movement for a plain `UPDATE` on a partition: each moved row is deleted from the
 /// source partition and inserted through the topmost partitioned ancestor's routing, landing in
 /// the partition whose bound accepts its new key (uniqueness, RLS and index maintenance run in

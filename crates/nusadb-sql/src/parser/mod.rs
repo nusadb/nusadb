@@ -3304,9 +3304,7 @@ fn parse_create_trigger(sql: &str) -> Result<ast::Statement, Error> {
     } else if parser.parse_keyword(Keyword::AFTER) {
         ast::TriggerTiming::After
     } else if parser.parse_keywords(&[Keyword::INSTEAD, Keyword::OF]) {
-        return unsupported(
-            "INSTEAD OF triggers require updatable views, which NusaDB does not support",
-        );
+        ast::TriggerTiming::InsteadOf
     } else {
         return unsupported("trigger timing must be BEFORE or AFTER");
     };

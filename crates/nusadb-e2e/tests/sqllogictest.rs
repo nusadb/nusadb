@@ -241,6 +241,21 @@ impl Catalog for SltCatalog<'_> {
         }
     }
 
+    fn has_instead_of_trigger(
+        &self,
+        name: &str,
+        event: nusadb_sql::ast::TriggerEvent,
+    ) -> Result<bool, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::view_has_instead_of_trigger(self.engine, txn, name, event)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::view_has_instead_of_trigger(self.engine, txn, name, event);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
         // The view catalog is a regular table. Reuse the session's open transaction when there is
         // one so a view created earlier in the same explicit transaction is visible; otherwise read
@@ -957,6 +972,11 @@ fn slt_p9_window_exclude() {
 #[test]
 fn slt_p11_materialized_view() {
     run_slt("tests/slt/p11_views/materialized.slt");
+}
+
+#[test]
+fn slt_p11_instead_of_trigger() {
+    run_slt("tests/slt/p11_views/instead_of_trigger.slt");
 }
 
 #[test]

@@ -397,16 +397,20 @@ fn reentrant_before_update_of_the_same_row_aborts_rather_than_losing_the_trigger
 }
 
 #[test]
-fn instead_of_trigger_is_rejected() {
+fn instead_of_trigger_on_a_table_is_rejected() {
+    // INSTEAD OF attaches to a VIEW (it replaces the write); on a real table it is the wrong
+    // object kind — the reference engine's class (42809), not a missing feature.
     let engine = BtreeEngine::new();
     setup(&engine);
-    assert!(matches!(
+    assert_eq!(
         run_try(
             &engine,
             "CREATE TRIGGER bad INSTEAD OF INSERT ON t FOR EACH ROW INSERT INTO audit VALUES ('x', 1)",
-        ),
-        Err(Error::Unsupported(_))
-    ));
+        )
+        .expect_err("INSTEAD OF on a table must be refused")
+        .sqlstate(),
+        "42809",
+    );
 }
 
 #[test]

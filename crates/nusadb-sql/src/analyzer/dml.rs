@@ -1186,6 +1186,205 @@ fn analyze_merge_matched_action(
     }
 }
 
+// === INSTEAD OF triggers ==================================================
+//
+// DML on a view with an `INSTEAD OF` trigger plans as trigger firings: the statement itself
+// writes nothing. The analyzer resolves everything against the view's OUTPUT columns (the
+// trigger's `NEW`/`OLD` row shape).
+
+/// The view's synthetic schema (its output columns) plus its body plan, for the instead-of path.
+fn instead_of_view(
+    view_name: &str,
+    key: &str,
+    catalog: &dyn Catalog,
+) -> Result<(TableSchema, SelectPlan), Error> {
+    let body = super::select::resolve_view(key, catalog)?;
+    let explicit = catalog.lookup_view_columns(key)?;
+    let schema = super::select::cte_schema(view_name, &explicit, &body)?;
+    Ok((schema, body))
+}
+
+/// `INSERT` into a view with an `INSTEAD OF INSERT` trigger: normalize the rows to the full view
+/// width (a column the statement does not name is a typed NULL — views carry no defaults), or
+/// carry the SELECT source with its column mapping.
+pub(super) fn analyze_instead_of_insert(
+    ins: ast::Insert,
+    key: &str,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, Error> {
+    let (schema, _body) = instead_of_view(&ins.table, key, catalog)?;
+    if ins.on_conflict.is_some() {
+        return Err(Error::Unsupported(
+            "ON CONFLICT on a view with an INSTEAD OF trigger".to_owned(),
+        ));
+    }
+    // Explicit column list -> view ordinals; empty = all columns in view order.
+    let targets: Vec<usize> = if ins.columns.is_empty() {
+        (0..schema.columns.len()).collect()
+    } else {
+        ins.columns
+            .iter()
+            .map(|name| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(|| Error::ColumnNotFound {
+                        column: name.clone(),
+                        table: schema.name.clone(),
+                    })
+            })
+            .collect::<Result<_, _>>()?
+    };
+    let returning = analyze_returning(&ins.returning, &schema, catalog)?;
+    let null_for = |ty| TypedExpr {
+        kind: crate::planner::TypedExprKind::Literal(ast::Value::Null),
+        ty,
+    };
+    let mut rows: Vec<Vec<TypedExpr>> = Vec::new();
+    let mut source: Option<Box<SelectPlan>> = None;
+    match ins.source {
+        ast::InsertSource::Values(value_rows) => {
+            for value_row in value_rows {
+                if value_row.len() != targets.len() {
+                    return Err(Error::InvalidStatement(format!(
+                        "INSERT has {} expressions but {} target columns",
+                        value_row.len(),
+                        targets.len()
+                    )));
+                }
+                let mut full: Vec<TypedExpr> =
+                    schema.columns.iter().map(|c| null_for(c.ty)).collect();
+                for (cell, &pos) in value_row.into_iter().zip(&targets) {
+                    let ty = schema.columns.get(pos).map_or(ColumnType::Text, |c| c.ty);
+                    let typed = match cell {
+                        // A per-cell DEFAULT on a view is a NULL (views carry no defaults).
+                        None => null_for(ty),
+                        Some(expr) => super::analyze_expr(&expr, &[], catalog, Some(ty))?,
+                    };
+                    if let Some(slot) = full.get_mut(pos) {
+                        *slot = typed;
+                    }
+                }
+                rows.push(full);
+            }
+        },
+        ast::InsertSource::Select(select) => {
+            let plan = super::select::analyze_select((*select).clone(), catalog)?;
+            if plan.projection.len() != targets.len() {
+                return Err(Error::InvalidStatement(format!(
+                    "INSERT source has {} columns but {} target columns",
+                    plan.projection.len(),
+                    targets.len()
+                )));
+            }
+            source = Some(Box::new(plan));
+        },
+        ast::InsertSource::DefaultValues => {
+            rows.push(schema.columns.iter().map(|c| null_for(c.ty)).collect());
+        },
+    }
+    Ok(LogicalPlan::InsteadOfDml(Box::new(
+        crate::planner::InsteadOfDmlPlan {
+            view: schema,
+            event: ast::TriggerEvent::Insert,
+            rows,
+            source,
+            source_columns: targets,
+            view_body: None,
+            filter: None,
+            assignments: Vec::new(),
+            returning,
+        },
+    )))
+}
+
+/// `UPDATE` on a view with an `INSTEAD OF UPDATE` trigger: `OLD` rows come from the view body
+/// narrowed by the statement's `WHERE`; `NEW` applies the `SET` over each `OLD` row.
+pub(super) fn analyze_instead_of_update(
+    upd: &ast::Update,
+    key: &str,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, Error> {
+    if upd.from.is_some() {
+        return Err(Error::Unsupported(
+            "UPDATE ... FROM on a view with an INSTEAD OF trigger".to_owned(),
+        ));
+    }
+    let (schema, body) = instead_of_view(&upd.table, key, catalog)?;
+    let scope = super::scope_of_aliased(&schema, upd.alias.as_deref().unwrap_or(&upd.table));
+    let filter = upd
+        .filter
+        .as_ref()
+        .map(|f| super::analyze_expr(f, &scope, catalog, Some(ColumnType::Bool)))
+        .transpose()?;
+    let mut assignments = Vec::with_capacity(upd.assignments.len());
+    for assignment in &upd.assignments {
+        let Some(pos) = schema
+            .columns
+            .iter()
+            .position(|c| c.name == assignment.column)
+        else {
+            return Err(Error::ColumnNotFound {
+                column: assignment.column.clone(),
+                table: schema.name,
+            });
+        };
+        let ty = schema.columns.get(pos).map_or(ColumnType::Text, |c| c.ty);
+        let value = super::analyze_expr(&assignment.value, &scope, catalog, Some(ty))?;
+        assignments.push((pos, value));
+    }
+    let returning = analyze_returning(&upd.returning, &schema, catalog)?;
+    Ok(LogicalPlan::InsteadOfDml(Box::new(
+        crate::planner::InsteadOfDmlPlan {
+            view: schema,
+            event: ast::TriggerEvent::Update,
+            rows: Vec::new(),
+            source: None,
+            source_columns: Vec::new(),
+            view_body: Some(Box::new(body)),
+            filter,
+            assignments,
+            returning,
+        },
+    )))
+}
+
+/// `DELETE` on a view with an `INSTEAD OF DELETE` trigger: `OLD` rows come from the view body
+/// narrowed by the statement's `WHERE`.
+pub(super) fn analyze_instead_of_delete(
+    del: &ast::Delete,
+    key: &str,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, Error> {
+    if del.using.is_some() {
+        return Err(Error::Unsupported(
+            "DELETE ... USING on a view with an INSTEAD OF trigger".to_owned(),
+        ));
+    }
+    let (schema, body) = instead_of_view(&del.table, key, catalog)?;
+    let scope = super::scope_of_aliased(&schema, &del.table);
+    let filter = del
+        .filter
+        .as_ref()
+        .map(|f| super::analyze_expr(f, &scope, catalog, Some(ColumnType::Bool)))
+        .transpose()?;
+    let returning = analyze_returning(&del.returning, &schema, catalog)?;
+    Ok(LogicalPlan::InsteadOfDml(Box::new(
+        crate::planner::InsteadOfDmlPlan {
+            view: schema,
+            event: ast::TriggerEvent::Delete,
+            rows: Vec::new(),
+            source: None,
+            source_columns: Vec::new(),
+            view_body: Some(Box::new(body)),
+            filter,
+            assignments: Vec::new(),
+            returning,
+        },
+    )))
+}
+
 // === Updatable views =====================================================
 //
 // An INSERT/UPDATE/DELETE whose target is an *auto-updatable* view rewrites onto the view's base

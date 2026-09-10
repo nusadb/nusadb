@@ -4528,6 +4528,14 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::lookup_view_definition(self.engine, self.txn, name)
     }
 
+    fn has_instead_of_trigger(
+        &self,
+        name: &str,
+        event: nusadb_sql::ast::TriggerEvent,
+    ) -> Result<bool, nusadb_sql::Error> {
+        nusadb_sql::view_has_instead_of_trigger(self.engine, self.txn, name, event)
+    }
+
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, nusadb_sql::Error> {
         // Explicit `CREATE VIEW name (cols)` list, so the inlined view body is renamed positionally.
         nusadb_sql::lookup_view_columns(self.engine, self.txn, name)

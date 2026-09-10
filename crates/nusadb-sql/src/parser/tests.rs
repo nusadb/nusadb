@@ -3330,9 +3330,11 @@ fn create_and_drop_trigger_parse() {
     };
     assert_eq!(ct.action, "EXECUTE FUNCTION audit()");
 
-    // Rejections: INSTEAD OF (no updatable views), a bad timing, a non-data action statement,
+    // Rejections: a bad timing, a non-data action statement,
     // EXECUTE that names neither FUNCTION nor PROCEDURE, and trigger-function arguments (TG_ARGV).
-    assert!(parse("CREATE TRIGGER x INSTEAD OF INSERT ON t INSERT INTO a VALUES (1)").is_err());
+    // INSTEAD OF now parses (it is validated against the target object at execution); the
+    // timing must still be one of the three keywords.
+    assert!(parse("CREATE TRIGGER x INSTEAD OF INSERT ON t INSERT INTO a VALUES (1)").is_ok());
     assert!(parse("CREATE TRIGGER x DURING INSERT ON t INSERT INTO a VALUES (1)").is_err());
     assert!(parse("CREATE TRIGGER x AFTER INSERT ON t CREATE TABLE z (a INT)").is_err());
     assert!(parse("CREATE TRIGGER x AFTER INSERT ON t EXECUTE log()").is_err());

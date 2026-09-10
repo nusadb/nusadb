@@ -1179,8 +1179,20 @@ trigger is created, not on first fire. `EXECUTE PROCEDURE` is a synonym. `NEW` a
 available throughout the body, a `RETURN` only ends it, and a `BEFORE` trigger cannot change or
 skip the row either way. Function arguments in the trigger (`EXECUTE FUNCTION f('x')`) are not
 accepted. The action runs in the same transaction as the triggering statement; an error in it
-aborts that statement. Cascading triggers are bounded by a depth limit (`54001`). `INSTEAD OF`
-triggers are not accepted.
+aborts that statement. Cascading triggers are bounded by a depth limit (`54001`).
+
+`INSTEAD OF` triggers attach to a view and REPLACE the write: DML on the view fires the trigger
+per row (with `NEW` as the proposed view row and `OLD` as the current one) and touches nothing
+else — whatever the trigger's action does is the write. They win over the auto-updatable rewrite,
+are row-level only, take no `WHEN` condition, and `RETURNING` projects `NEW` (INSERT/UPDATE) or
+`OLD` (DELETE). `BEFORE`/`AFTER` on a view and `INSTEAD OF` on a table are refused (`42809`).
+
+```sql
+CREATE VIEW active AS SELECT id, v FROM items WHERE NOT hidden;
+CREATE TRIGGER active_ins INSTEAD OF INSERT ON active
+  FOR EACH ROW INSERT INTO items VALUES (NEW.id, NEW.v, false);
+INSERT INTO active VALUES (1, 'a');            -- runs the trigger's INSERT instead
+```
 
 ---
 
@@ -1799,7 +1811,6 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - aggregating a row value with anything but `count`;
 - dollar-quoted string literals outside a routine body;
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
-- `INSTEAD OF` triggers;
 - `SET LOCAL`, `SET NAMES`, and an IANA region name as the session time zone;
 - locale collations (only `"C"` / `"POSIX"`);
 - `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;

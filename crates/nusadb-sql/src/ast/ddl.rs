@@ -382,6 +382,9 @@ pub enum TriggerTiming {
     Before,
     /// `AFTER` — fire after the row has been written.
     After,
+    /// `INSTEAD OF` — on a VIEW only: the trigger REPLACES the write (nothing else runs).
+    /// Row-level only, no `WHEN` guard — the reference engine's rules.
+    InsteadOf,
 }
 
 impl TriggerTiming {
@@ -391,6 +394,7 @@ impl TriggerTiming {
         match self {
             Self::Before => "before",
             Self::After => "after",
+            Self::InsteadOf => "instead of",
         }
     }
 }
@@ -459,7 +463,7 @@ impl TriggerForEach {
 /// It is either a single SQL data statement (INSERT/UPDATE/DELETE/SELECT) or
 /// `EXECUTE FUNCTION name()`, which runs a NusaScript function's body (side-effect semantics: the
 /// function's `RETURN` value is ignored, so a `BEFORE` trigger cannot modify or skip the row).
-/// `INSTEAD OF` triggers (which require updatable views) are rejected at the parser.
+/// `INSTEAD OF` triggers attach to a VIEW and replace the write entirely (row-level only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTrigger {
     /// Trigger name (unique per table).

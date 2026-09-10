@@ -70,7 +70,8 @@ pub use executor::{
     lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
     maintenance_work_mem, parse_work_mem, partition_key_columns, partitions_to_prune,
     pin_statement_timezone, purge_schema_catalogs, rls_table_enabled, set_maintenance_work_mem,
-    set_spill_config, set_work_mem, show_session_variable, statement_tz_offset_secs, work_mem,
+    set_spill_config, set_work_mem, show_session_variable, statement_tz_offset_secs,
+    view_has_instead_of_trigger, work_mem,
 };
 
 /// The bootstrap database superuser, which bypasses row-level security.

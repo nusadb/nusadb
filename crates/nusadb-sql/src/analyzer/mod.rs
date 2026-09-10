@@ -137,6 +137,19 @@ pub trait Catalog {
         Ok(0)
     }
 
+    /// Whether view `name` (a `view_lookup_key`) has an `INSTEAD OF` trigger for `event` — the
+    /// analyzer then plans the DML as trigger firings instead of the auto-updatable rewrite.
+    /// Default `false` (test doubles without a trigger store). Every DML-on-view plan is already
+    /// non-cacheable (`lookup_view` marks it), so a trigger created later is always seen.
+    fn has_instead_of_trigger(
+        &self,
+        name: &str,
+        event: crate::ast::TriggerEvent,
+    ) -> Result<bool, Error> {
+        let _ = (name, event);
+        Ok(false)
+    }
+
     /// The defining SQL of a non-materialized view named `name`, or `None` if no such view exists.
     /// Default `None` so a minimal catalog has no views; the production adapter reads the view
     /// catalog. The analyzer inlines the parsed body in place of a `FROM` base, like a CTE.
@@ -966,7 +979,17 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 cascade: t.cascade,
             }))
         },
-        ast::Statement::Insert(ins) => analyze_insert(ins, catalog).map(LogicalPlan::Insert),
+        ast::Statement::Insert(ins) => {
+            // An INSTEAD OF trigger on a view replaces the write entirely — it wins over the
+            // auto-updatable rewrite, so check before ordinary insert analysis.
+            if let Some(key) = select::view_lookup_key(ins.schema.as_deref(), &ins.table, catalog)?
+                && catalog.has_instead_of_trigger(&key, ast::TriggerEvent::Insert)?
+            {
+                dml::analyze_instead_of_insert(ins, &key, catalog)
+            } else {
+                analyze_insert(ins, catalog).map(LogicalPlan::Insert)
+            }
+        },
         ast::Statement::Select(sel) => analyze_select(sel, catalog).map(|mut p| {
             pad_fixed_char_output(&mut p);
             LogicalPlan::Select(Box::new(p))
@@ -978,8 +1001,24 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::SetOperation(so) => {
             analyze_set_operation(so, catalog).map(LogicalPlan::SetOperation)
         },
-        ast::Statement::Update(upd) => analyze_update_stmt(upd, catalog).map(LogicalPlan::Update),
-        ast::Statement::Delete(del) => analyze_delete_stmt(del, catalog).map(LogicalPlan::Delete),
+        ast::Statement::Update(upd) => {
+            if let Some(key) = select::view_lookup_key(upd.schema.as_deref(), &upd.table, catalog)?
+                && catalog.has_instead_of_trigger(&key, ast::TriggerEvent::Update)?
+            {
+                dml::analyze_instead_of_update(&upd, &key, catalog)
+            } else {
+                analyze_update_stmt(upd, catalog).map(LogicalPlan::Update)
+            }
+        },
+        ast::Statement::Delete(del) => {
+            if let Some(key) = select::view_lookup_key(del.schema.as_deref(), &del.table, catalog)?
+                && catalog.has_instead_of_trigger(&key, ast::TriggerEvent::Delete)?
+            {
+                dml::analyze_instead_of_delete(&del, &key, catalog)
+            } else {
+                analyze_delete_stmt(del, catalog).map(LogicalPlan::Delete)
+            }
+        },
         // COPY is parsed but its data rides the wire's COPY sub-protocol, so the
         // executor/wire pipeline drives it rather than the normal plan path.
         ast::Statement::Copy(_) => Err(Error::Unsupported(
@@ -1129,17 +1168,30 @@ fn analyze_create_trigger(
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, Error> {
     enforce_system_catalog(&ct.table, catalog)?;
-    // The target table must exist (resolve discards the schema — the executor re-resolves at fire
-    // time under the live snapshot).
-    let table = resolve_table(None, &ct.table, catalog)?;
-    // Attaching a trigger needs the TRIGGER privilege on the table (the grantable right that
-    // exists for exactly this).
-    dcl::require_table_privilege(catalog, &table, ast::Privilege::Trigger)?;
+    // An `INSTEAD OF` trigger attaches to a VIEW (the executor validates timing × object kind);
+    // a `BEFORE`/`AFTER` trigger attaches to a real table. Resolve accordingly — a view has no
+    // TableSchema, so its privilege ride is the view object's TRIGGER grant (owner-checked by
+    // `require_table_privilege`'s object fallback is not available; views are owned objects, and
+    // only their owner or a superuser may attach — enforced by the executor's view lookup under
+    // the caller's rights).
+    let schema = if let Some(key) = select::view_lookup_key(None, &ct.table, catalog)? {
+        // The stored key is schema-qualified for a non-public schema, bare for public.
+        crate::analyzer::split_qualified(&key)
+            .0
+            .unwrap_or(nusadb_core::PUBLIC_SCHEMA)
+            .to_owned()
+    } else {
+        let table = resolve_table(None, &ct.table, catalog)?;
+        // Attaching a trigger needs the TRIGGER privilege on the table (the grantable right that
+        // exists for exactly this).
+        dcl::require_table_privilege(catalog, &table, ast::Privilege::Trigger)?;
+        table.schema
+    };
     Ok(LogicalPlan::CreateTrigger(CreateTriggerPlan {
         // Where the table actually resolved: an unqualified name walks the temp schema and then
         // the search path, and the row belongs to wherever it landed. Filing it bare is what let a
         // trigger on one table fire on a same-named table elsewhere.
-        schema: table.schema,
+        schema,
         name: ct.name,
         or_replace: ct.or_replace,
         table: ct.table,
@@ -1683,12 +1735,23 @@ fn trigger_target_schema(
     absent_is_ok: bool,
     catalog: &dyn Catalog,
 ) -> Result<String, Error> {
-    match lookup_table_ref(None, table, catalog)? {
-        Some(found) => Ok(found.schema),
-        None if absent_is_ok => Ok(nusadb_core::engine::PUBLIC_SCHEMA.to_owned()),
-        None => Err(Error::TableNotFound {
+    if let Some(found) = lookup_table_ref(None, table, catalog)? {
+        return Ok(found.schema);
+    }
+    // The target may be a VIEW (an INSTEAD OF trigger's home); its stored key is
+    // schema-qualified for a non-public schema, bare for public.
+    if let Some(key) = select::view_lookup_key(None, table, catalog)? {
+        return Ok(crate::analyzer::split_qualified(&key)
+            .0
+            .unwrap_or(nusadb_core::engine::PUBLIC_SCHEMA)
+            .to_owned());
+    }
+    if absent_is_ok {
+        Ok(nusadb_core::engine::PUBLIC_SCHEMA.to_owned())
+    } else {
+        Err(Error::TableNotFound {
             name: table.to_owned(),
-        }),
+        })
     }
 }
 

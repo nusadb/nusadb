@@ -293,6 +293,8 @@ pub enum LogicalPlan {
     DropDomain(ast::DropDomain),
     /// `CREATE [OR REPLACE] TRIGGER ...` — a triggered SQL action to persist.
     CreateTrigger(CreateTriggerPlan),
+    /// DML on a view whose `INSTEAD OF` trigger replaces the write.
+    InsteadOfDml(Box<InsteadOfDmlPlan>),
     /// `DROP TRIGGER [IF EXISTS] name ON table`.
     DropTrigger(DropTriggerPlan),
     /// `ALTER TRIGGER name ON table RENAME TO new_name`.
@@ -1734,6 +1736,36 @@ pub struct UpdatePlan {
     pub partition_via_parent: bool,
 }
 
+/// DML on a view carrying an `INSTEAD OF` trigger: the trigger firings REPLACE the write.
+///
+/// No base table is touched by the statement itself. The reference engine's semantics: row-level
+/// only, `NEW` is the proposed view row (INSERT/UPDATE), `OLD` the current view row
+/// (UPDATE/DELETE), and the statement reports the count of rows the triggers fired for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsteadOfDmlPlan {
+    /// The view's synthetic schema (its output column names + types) — the trigger's `NEW`/`OLD`
+    /// row shape, and the scope `RETURNING` resolves against. `schema`/`name` locate the trigger.
+    pub view: TableSchema,
+    /// Which DML event fires the trigger.
+    pub event: ast::TriggerEvent,
+    /// INSERT: literal rows, already normalized to the FULL view width in column order (an
+    /// unnamed column is a typed NULL — views carry no defaults). Empty for a SELECT source or
+    /// for UPDATE/DELETE.
+    pub rows: Vec<Vec<TypedExpr>>,
+    /// INSERT ... SELECT: the source query; its output arity matches `source_columns`.
+    pub source: Option<Box<SelectPlan>>,
+    /// The view-column ordinal each source-query output position lands in (INSERT ... SELECT).
+    pub source_columns: Vec<usize>,
+    /// UPDATE/DELETE: the view body's plan, producing the candidate `OLD` rows.
+    pub view_body: Option<Box<SelectPlan>>,
+    /// UPDATE/DELETE: the statement's `WHERE` over the view's output columns.
+    pub filter: Option<TypedExpr>,
+    /// UPDATE: `(view column ordinal, value)` pairs, resolved over the `OLD` view row.
+    pub assignments: Vec<(usize, TypedExpr)>,
+    /// `RETURNING` over the view columns: projects `NEW` (INSERT/UPDATE) or `OLD` (DELETE).
+    pub returning: Vec<Projection>,
+}
+
 /// A view's `WITH CHECK OPTION` enforcement: the predicate a row written through the view must
 /// satisfy, plus the view's name for the error message.
 #[derive(Debug, Clone, PartialEq)]
@@ -2499,6 +2531,8 @@ pub enum PhysicalPlan {
     DropDomain(ast::DropDomain),
     /// `CREATE [OR REPLACE] TRIGGER ...` — a triggered SQL action to persist.
     CreateTrigger(CreateTriggerPlan),
+    /// DML on a view whose `INSTEAD OF` trigger replaces the write.
+    InsteadOfDml(Box<InsteadOfDmlPlan>),
     /// `DROP TRIGGER [IF EXISTS] name ON table`.
     DropTrigger(DropTriggerPlan),
     /// `ALTER TRIGGER name ON table RENAME TO new_name`.

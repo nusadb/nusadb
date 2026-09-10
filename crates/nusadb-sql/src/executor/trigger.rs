@@ -140,6 +140,41 @@ pub(super) fn run_create_trigger(
             table: plan.table.clone(),
         });
     }
+    // `INSTEAD OF` attaches to a VIEW (it replaces the write), is row-level only, and takes no
+    // `WHEN` guard; `BEFORE`/`AFTER` attach to a real table — the reference engine's rules.
+    let view_key = crate::analyzer::qualified_display(&plan.schema, &plan.table);
+    let is_view = super::lookup_view_definition(engine, txn, &view_key)?.is_some();
+    if matches!(plan.timing, ast::TriggerTiming::InsteadOf) {
+        if !is_view {
+            return Err(Error::Coded {
+                message: format!(
+                    "\"{}\" is a table — INSTEAD OF triggers attach to views",
+                    plan.table
+                ),
+                sqlstate: "42809", // wrong_object_type
+            });
+        }
+        if !matches!(plan.for_each, ast::TriggerForEach::Row) {
+            return Err(Error::Coded {
+                message: "INSTEAD OF triggers must be FOR EACH ROW".to_owned(),
+                sqlstate: "0A000",
+            });
+        }
+        if plan.when.is_some() {
+            return Err(Error::Coded {
+                message: "INSTEAD OF triggers cannot have WHEN conditions".to_owned(),
+                sqlstate: "0A000",
+            });
+        }
+    } else if is_view {
+        return Err(Error::Coded {
+            message: format!(
+                "\"{}\" is a view — views need INSTEAD OF triggers, not BEFORE/AFTER",
+                plan.table
+            ),
+            sqlstate: "42809", // wrong_object_type
+        });
+    }
     // An `EXECUTE FUNCTION` action names a function that must already exist and be a callable
     // NusaScript routine — validate now (as the reference engine does at CREATE TRIGGER time)
     // rather than only when the trigger first fires.
@@ -436,6 +471,8 @@ pub(super) struct TriggerSet {
     after_row: Vec<StoredTrigger>,
     before_stmt: Vec<StoredTrigger>,
     after_stmt: Vec<StoredTrigger>,
+    /// `INSTEAD OF ... FOR EACH ROW` (views only): fires in place of the write.
+    instead_row: Vec<StoredTrigger>,
 }
 
 impl TriggerSet {
@@ -447,6 +484,7 @@ impl TriggerSet {
             && self.after_row.is_empty()
             && self.before_stmt.is_empty()
             && self.after_stmt.is_empty()
+            && self.instead_row.is_empty()
     }
 
     /// Whether any per-row trigger fires before the write (gates the before-row loop).
@@ -508,6 +546,42 @@ impl TriggerSet {
     ) -> Result<(), Error> {
         fire_each(&self.after_row, table, old, new, engine, txn)
     }
+
+    /// Whether any `INSTEAD OF ... FOR EACH ROW` trigger replaces the write.
+    pub(super) const fn has_instead_row(&self) -> bool {
+        !self.instead_row.is_empty()
+    }
+
+    /// Fire the `INSTEAD OF ... FOR EACH ROW` triggers for one proposed row — the write itself.
+    pub(super) fn fire_row_instead(
+        &self,
+        table: &TableSchema,
+        old: Option<&[ast::Value]>,
+        new: Option<&[ast::Value]>,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<(), Error> {
+        fire_each(&self.instead_row, table, old, new, engine, txn)
+    }
+}
+
+/// Whether the view at `key` (schema-qualified; bare = `public`) has an enabled `INSTEAD OF`
+/// trigger for `event` — the analyzer's gate for planning view DML as trigger firings.
+pub fn view_has_instead_of_trigger(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    key: &str,
+    event: ast::TriggerEvent,
+) -> Result<bool, Error> {
+    let (schema, name) = crate::analyzer::split_qualified(key);
+    let set = load_table_triggers(
+        schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+        name,
+        event,
+        engine,
+        txn,
+    )?;
+    Ok(set.has_instead_row())
 }
 
 /// Load the triggers on `table` that fire on `event`, partitioned by timing × granularity. The fast
@@ -524,6 +598,7 @@ pub(super) fn load_table_triggers(
         after_row: Vec::new(),
         before_stmt: Vec::new(),
         after_stmt: Vec::new(),
+        instead_row: Vec::new(),
     };
     let Some(cat) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? else {
         return Ok(set);
@@ -545,6 +620,9 @@ pub(super) fn load_table_triggers(
         match (trig.timing, trig.for_each) {
             (ast::TriggerTiming::Before, ast::TriggerForEach::Row) => set.before_row.push(trig),
             (ast::TriggerTiming::After, ast::TriggerForEach::Row) => set.after_row.push(trig),
+            // INSTEAD OF is row-level only (enforced at CREATE); a statement-granularity row
+            // in the catalog can only come from a hand-edited store — bucket it the same.
+            (ast::TriggerTiming::InsteadOf, _) => set.instead_row.push(trig),
             (ast::TriggerTiming::Before, ast::TriggerForEach::Statement) => {
                 set.before_stmt.push(trig);
             },
@@ -586,6 +664,7 @@ fn decode_trigger(
     }
     let timing = match text(2)?.as_str() {
         "before" => ast::TriggerTiming::Before,
+        "instead of" => ast::TriggerTiming::InsteadOf,
         _ => ast::TriggerTiming::After,
     };
     let events: Vec<ast::TriggerEvent> = text(3)?

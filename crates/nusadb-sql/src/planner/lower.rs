@@ -61,6 +61,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::CreateDomain(p) => PhysicalPlan::CreateDomain(p),
         LogicalPlan::DropDomain(p) => PhysicalPlan::DropDomain(p),
         LogicalPlan::CreateTrigger(p) => PhysicalPlan::CreateTrigger(p),
+        LogicalPlan::InsteadOfDml(p) => PhysicalPlan::InsteadOfDml(p),
         LogicalPlan::DropTrigger(p) => PhysicalPlan::DropTrigger(p),
         LogicalPlan::AlterTrigger(p) => PhysicalPlan::AlterTrigger(p),
         LogicalPlan::CreateProcedure(p) => PhysicalPlan::CreateProcedure(p),

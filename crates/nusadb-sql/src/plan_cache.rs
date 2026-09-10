@@ -188,6 +188,16 @@ impl Catalog for RecordingCatalog<'_> {
         self.inner.temp_schema()
     }
 
+    fn has_instead_of_trigger(
+        &self,
+        name: &str,
+        event: crate::ast::TriggerEvent,
+    ) -> Result<bool, Error> {
+        // Forward: the wrapped catalog holds the real trigger store. The plan is already
+        // non-cacheable (any view DML consulted `lookup_view` first).
+        self.inner.has_instead_of_trigger(name, event)
+    }
+
     fn session_timezone(&self) -> Option<String> {
         // Forward the session time zone for the same reason as `temp_schema`: the default reads
         // the thread-local session context, which is stale on a reused pool thread — the analyzer
