@@ -914,6 +914,12 @@ fn eval_scalar_function(
         (F::PlaintoTsquery, [Text(text)]) => {
             ast::Value::Tsquery(crate::fts::plainto_tsquery("english", text)?)
         },
+        (F::PhrasetoTsquery, [Text(config), Text(text)]) => {
+            ast::Value::Tsquery(crate::fts::phraseto_tsquery(config, text)?)
+        },
+        (F::PhrasetoTsquery, [Text(text)]) => {
+            ast::Value::Tsquery(crate::fts::phraseto_tsquery("english", text)?)
+        },
         // Relevance ranking: the two-argument forms use the default normalization (0); the optional
         // third argument is the normalization bit-mask. The score is a `real` (float4). The document
         // and query are the native `tsvector`/`tsquery` (a text operand is accepted too).
@@ -950,6 +956,22 @@ fn eval_scalar_function(
         // NUMNODE(tsquery) → node count; STRIP(tsvector) → lexemes only; SETWEIGHT(tsvector, weight)
         // → every position reweighted. A text operand is accepted too (parsed as the target type).
         (F::Numnode, [ast::Value::Tsquery(q) | Text(q)]) => Int(i64::from(crate::fts::numnode(q)?)),
+        // TSQUERY_PHRASE(a, b[, distance]) — the function form of `tsquery <-> tsquery`.
+        (
+            F::TsqueryPhrase,
+            [
+                ast::Value::Tsquery(a) | Text(a),
+                ast::Value::Tsquery(b) | Text(b),
+            ],
+        ) => ast::Value::Tsquery(crate::fts::tsquery_phrase(a, b, 1)?),
+        (
+            F::TsqueryPhrase,
+            [
+                ast::Value::Tsquery(a) | Text(a),
+                ast::Value::Tsquery(b) | Text(b),
+                Int(n),
+            ],
+        ) => ast::Value::Tsquery(crate::fts::tsquery_phrase(a, b, *n)?),
         (F::Strip, [ast::Value::Tsvector(v) | Text(v)]) => {
             ast::Value::Tsvector(crate::fts::strip(v)?)
         },
@@ -6030,6 +6052,13 @@ fn apply_binary(
         {
             Ok(geom_distance_op(left, right))
         },
+        // Full-text `tsquery <-> tsquery` — join with a phrase operator at distance 1.
+        Op::VectorL2Distance
+            if matches!(left, ast::Value::Tsquery(_))
+                || matches!(right, ast::Value::Tsquery(_)) =>
+        {
+            ts_phrase_op(left, right)
+        },
         Op::VectorL2Distance => vector_distance_op("<->", crate::vector::l2_distance, left, right),
         Op::VectorNegInnerProduct => {
             vector_distance_op("<#>", crate::vector::neg_inner_product, left, right)
@@ -6486,6 +6515,18 @@ fn ts_concat_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Err
 
 /// The `&&` operator over a full-text operand: `tsquery && tsquery` is AND. A `NULL` operand yields
 /// `NULL`.
+/// `tsquery <-> tsquery` — join two queries with a phrase operator at distance 1. A text
+/// operand is accepted too (parsed as a `tsquery`); a `NULL` operand yields `NULL`.
+fn ts_phrase_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
+    use ast::Value::{Null, Text, Tsquery};
+    match (left, right) {
+        (Tsquery(a) | Text(a), Tsquery(b) | Text(b)) => {
+            crate::fts::tsquery_phrase(a, b, 1).map(Tsquery)
+        },
+        _ => Ok(Null),
+    }
+}
+
 fn ts_and_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error> {
     use ast::Value::{Null, Tsquery};
     match (left, right) {

@@ -1502,7 +1502,14 @@ pub(super) fn analyze_scalar_function(
         // with one argument the default configuration applies (rejected at evaluation until a
         // non-`simple` configuration exists).
         F::ToTsvector => ScalarSig::Fixed(&[Text], &[Text], ColumnType::Tsvector),
-        F::ToTsquery | F::PlaintoTsquery => ScalarSig::Fixed(&[Text], &[Text], ColumnType::Tsquery),
+        F::ToTsquery | F::PlaintoTsquery | F::PhrasetoTsquery => {
+            ScalarSig::Fixed(&[Text], &[Text], ColumnType::Tsquery)
+        },
+        F::TsqueryPhrase => ScalarSig::Fixed(
+            &[ColumnType::Tsquery, ColumnType::Tsquery],
+            &[Int],
+            ColumnType::Tsquery,
+        ),
         // TS_RANK / TS_RANK_CD(tsvector, tsquery [, normalization INT]) → the relevance score as a
         // REAL. The optional third argument is the normalization bit-mask.
         F::TsRank | F::TsRankCd => ScalarSig::Fixed(
@@ -5037,6 +5044,17 @@ pub(super) fn analyze_binary(
             left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
         }
     }
+    // `tsquery <-> tsquery` — a bare string literal next to a tsquery operand is unambiguous
+    // there and coerces to a tsquery (the vector/geometry `<->` overloads take no string
+    // operand), keeping `q <-> 'fox'` usable without a cast.
+    if op == ast::BinaryOp::VectorL2Distance {
+        if left_typed.ty == ColumnType::Tsquery {
+            right_typed = coerce_text_literal_to(right_typed, ColumnType::Tsquery);
+        }
+        if right_typed.ty == ColumnType::Tsquery {
+            left_typed = coerce_text_literal_to(left_typed, ColumnType::Tsquery);
+        }
+    }
     // `&&` (overlap) and the boundary operators `-|-` / `&<` / `&>` over ranges have only a
     // range/range form, so a bare string literal next to a range operand is unambiguous and coerces
     // to that range's kind. (`@>`/`<@` do not: a literal there could be the range or one element, so
@@ -5263,9 +5281,10 @@ pub(super) fn check_binary(
         Op::Concat if left == ColumnType::Tsvector && right == ColumnType::Tsvector => {
             Ok(ColumnType::Tsvector)
         },
-        // Full-text `tsquery || tsquery` (OR) and `tsquery && tsquery` (AND) both yield a `tsquery`
-        // (the executor distinguishes the two). Checked before the bit/geometry/range/array arms.
-        Op::Concat | Op::ArrayOverlap
+        // Full-text `tsquery || tsquery` (OR), `tsquery && tsquery` (AND), and
+        // `tsquery <-> tsquery` (phrase) all yield a `tsquery` (the executor distinguishes
+        // them). Checked before the bit/geometry/range/array/vector arms.
+        Op::Concat | Op::ArrayOverlap | Op::VectorL2Distance
             if left == ColumnType::Tsquery && right == ColumnType::Tsquery =>
         {
             Ok(ColumnType::Tsquery)

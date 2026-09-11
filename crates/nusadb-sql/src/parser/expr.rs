@@ -1607,6 +1607,8 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "to_tsvector" => F::ToTsvector,
         "to_tsquery" => F::ToTsquery,
         "plainto_tsquery" => F::PlaintoTsquery,
+        "phraseto_tsquery" => F::PhrasetoTsquery,
+        "tsquery_phrase" => F::TsqueryPhrase,
         "ts_rank" => F::TsRank,
         "ts_rank_cd" => F::TsRankCd,
         "numnode" => F::Numnode,

@@ -997,6 +997,12 @@ pub enum ScalarFunc {
     /// `PLAINTO_TSQUERY([config,] text)` — tokenize plain text into an AND-of-lexemes `tsquery`
     /// (F1).
     PlaintoTsquery,
+    /// `PHRASETO_TSQUERY([config,] text)` — tokenize plain text into a phrase-chained `tsquery`
+    /// whose distances mirror the token positions (F1).
+    PhrasetoTsquery,
+    /// `TSQUERY_PHRASE(a, b [, distance])` — join two `tsquery` values with a phrase operator
+    /// (the function form of `tsquery <-> tsquery`).
+    TsqueryPhrase,
     /// `TS_RANK(tsvector, tsquery [, normalization])` — the term-frequency relevance score as a
     /// `REAL`.
     TsRank,
@@ -1293,6 +1299,8 @@ impl ScalarFunc {
             Self::ToTsvector => "to_tsvector",
             Self::ToTsquery => "to_tsquery",
             Self::PlaintoTsquery => "plainto_tsquery",
+            Self::PhrasetoTsquery => "phraseto_tsquery",
+            Self::TsqueryPhrase => "tsquery_phrase",
             Self::TsRank => "ts_rank",
             Self::TsRankCd => "ts_rank_cd",
             Self::Numnode => "numnode",

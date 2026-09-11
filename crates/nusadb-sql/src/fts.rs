@@ -10,8 +10,9 @@
 //! input: **`simple`** (lowercase only) and **`english`** (the Snowball stopword list plus a
 //! from-scratch Snowball English / Porter2 stemmer, `english` being the reference engine's default configuration).
 //! Honest scope (anti-silent-wrong): other configurations, the reference engine's compound token classes
-//! (email/url/host/file, hyphenated compounds), phrase search (`<->`), and weight/prefix suffixes
-//! are rejected loudly rather than producing near-but-not-equal results.
+//! (email/url/host/file, hyphenated compounds), and weight/prefix suffixes are rejected loudly
+//! rather than producing near-but-not-equal results. Phrase search (`<->`/`<N>`,
+//! `phraseto_tsquery`, `tsquery_phrase`) is implemented with position-accurate matching.
 
 use crate::error::Error;
 
@@ -25,6 +26,17 @@ fn syntax_error(input: &str) -> Error {
     Error::Coded {
         message: format!("syntax error in tsquery: {input:?}"),
         sqlstate: "42601",
+    }
+}
+
+/// The reference engine's error for a phrase distance outside `0..=16384` (`22023`
+/// `invalid_parameter_value`).
+fn phrase_distance_error() -> Error {
+    Error::Coded {
+        message: "distance in phrase operator must be an integer value between zero and 16384 \
+                  inclusive"
+            .to_owned(),
+        sqlstate: "22023",
     }
 }
 
@@ -776,22 +788,25 @@ pub fn tsvector_concat(left: &str, right: &str) -> Result<String, Error> {
     Ok(canonicalize_entries(combined))
 }
 
-/// `numnode(tsquery)` — the number of nodes (lexemes plus `&`/`|`/`!` operators) in a `tsquery`. The
+/// `numnode(tsquery)` — the number of nodes (lexemes plus `&`/`|`/`!`/`<->` operators) in a `tsquery`. The
 /// empty query has none. `numnode('(cat & dog) | !fox')` = 6.
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed `tsquery`, or [`Error::Unsupported`] for an
-/// unimplemented phrase/weight form.
+/// unimplemented weight form.
 pub fn numnode(input: &str) -> Result<i32, Error> {
     Ok(parse_tsquery_operand(input)?.map_or(0, |query| count_nodes(&query)))
 }
 
-/// Count the nodes of a parsed query: each lexeme and each `&`/`|`/`!` operator is one node.
+/// Count the nodes of a parsed query: each lexeme and each `&`/`|`/`!`/`<->` operator is one
+/// node.
 fn count_nodes(query: &TsQuery) -> i32 {
     match query {
         TsQuery::Lexeme(_) => 1,
         TsQuery::Not(inner) => 1 + count_nodes(inner),
-        TsQuery::And(a, b) | TsQuery::Or(a, b) => 1 + count_nodes(a) + count_nodes(b),
+        TsQuery::And(a, b) | TsQuery::Or(a, b) | TsQuery::Phrase(_, a, b) => {
+            1 + count_nodes(a) + count_nodes(b)
+        },
     }
 }
 
@@ -801,7 +816,7 @@ fn count_nodes(query: &TsQuery) -> i32 {
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed `tsquery`, or [`Error::Unsupported`] for an
-/// unimplemented phrase/weight form.
+/// unimplemented weight form.
 fn parse_tsquery_operand(input: &str) -> Result<Option<TsQuery>, Error> {
     if input.trim().is_empty() {
         return Ok(None);
@@ -814,7 +829,7 @@ fn parse_tsquery_operand(input: &str) -> Result<Option<TsQuery>, Error> {
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed operand, or [`Error::Unsupported`] for an
-/// unimplemented phrase/weight form.
+/// unimplemented weight form.
 pub fn ts_and(left: &str, right: &str) -> Result<String, Error> {
     combine(left, right, TsQuery::And)
 }
@@ -824,7 +839,7 @@ pub fn ts_and(left: &str, right: &str) -> Result<String, Error> {
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed operand, or [`Error::Unsupported`] for an
-/// unimplemented phrase/weight form.
+/// unimplemented weight form.
 pub fn ts_or(left: &str, right: &str) -> Result<String, Error> {
     combine(left, right, TsQuery::Or)
 }
@@ -847,7 +862,7 @@ fn combine(
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed operand, or [`Error::Unsupported`] for an
-/// unimplemented phrase/weight form.
+/// unimplemented weight form.
 pub fn ts_not(input: &str) -> Result<String, Error> {
     let negated = parse_tsquery_operand(input)?.map(|q| TsQuery::Not(Box::new(q)));
     Ok(render_or_empty(negated.as_ref()))
@@ -862,22 +877,95 @@ fn render_or_empty(query: Option<&TsQuery>) -> String {
     })
 }
 
-/// A parsed `tsquery`: the boolean structure over lexemes.
+/// The positions at which a query node matches under phrase (positional) evaluation: a finite
+/// list of `[lo, hi]` extents, or — for a negated operand, which matches "everywhere else" — the
+/// cofinite complement of the end positions in `exc` (each excluded match spanning `width`).
+enum Extents {
+    Fin(Vec<(i64, i64)>),
+    Cofin {
+        exc: std::collections::BTreeSet<i64>,
+        width: i64,
+    },
+}
+
+impl Extents {
+    /// Whether no extent matches (a cofinite set always has matches).
+    const fn is_empty(&self) -> bool {
+        matches!(self, Self::Fin(list) if list.is_empty())
+    }
+}
+
+/// Combine the two operand extents of `L <n> R`: the result spans `[lo_L, hi_R]` wherever `R`
+/// starts exactly `n` past `L`'s end. A cofinite operand contributes its width-`w` extent at
+/// every non-excluded position, so the join stays finite unless both sides are cofinite.
+fn phrase_extents(n: i64, left: Extents, right: Extents) -> Extents {
+    match (left, right) {
+        (Extents::Fin(ls), Extents::Fin(rs)) => {
+            let mut out = Vec::new();
+            for &(llo, lhi) in &ls {
+                for &(rlo, rhi) in &rs {
+                    if rlo - lhi == n {
+                        out.push((llo, rhi));
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            Extents::Fin(out)
+        },
+        (Extents::Fin(ls), Extents::Cofin { exc, width }) => Extents::Fin(
+            ls.into_iter()
+                .map(|(llo, lhi)| (llo, lhi + n + width))
+                .filter(|&(_, hi)| !exc.contains(&hi))
+                .collect(),
+        ),
+        (Extents::Cofin { exc, width }, Extents::Fin(rs)) => Extents::Fin(
+            rs.into_iter()
+                .filter(|&(rlo, _)| !exc.contains(&(rlo - n)))
+                .map(|(rlo, rhi)| (rlo - n - width, rhi))
+                .collect(),
+        ),
+        (Extents::Cofin { exc: le, width: lw }, Extents::Cofin { exc: re, width: rw }) => {
+            let mut exc = re;
+            for e in le {
+                exc.insert(e + n + rw);
+            }
+            Extents::Cofin {
+                exc,
+                width: lw + n + rw,
+            }
+        },
+    }
+}
+
+/// The result of dictionary-normalizing one query node: a kept node carrying the extra phrase
+/// distance that dropped-stopword neighbors contribute at each edge (`lpad`, `rpad`), or a
+/// fully-dropped node with the total span it covered.
+enum Normalized {
+    Kept(TsQuery, u32, u32),
+    Dropped(u32),
+}
+
+/// A parsed `tsquery`: the boolean/phrase structure over lexemes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TsQuery {
     Lexeme(String),
     Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
+    /// `L <n> R` — `R` starts exactly `n` positions past `L`'s end (`<->` is `<1>`).
+    Phrase(u32, Box<Self>, Box<Self>),
 }
 
 impl TsQuery {
-    /// Binding strength for canonical printing: `|` loosest, then `&`, then `!`/atoms.
+    /// Binding strength for canonical printing: `|` loosest, then `&`, then `<->`, then
+    /// `!`/atoms.
     const fn precedence(&self) -> u8 {
         match self {
             Self::Or(..) => 1,
             Self::And(..) => 2,
-            Self::Not(_) | Self::Lexeme(_) => 3,
+            Self::Phrase(..) => 3,
+            Self::Not(_) | Self::Lexeme(_) => 4,
         }
     }
 
@@ -888,12 +976,35 @@ impl TsQuery {
             Self::Lexeme(lexeme) => out.push_str(&quote_lexeme(lexeme)),
             Self::Not(inner) => {
                 out.push('!');
-                if inner.precedence() < 3 {
+                if inner.precedence() < 4 {
                     out.push_str("( ");
                     inner.render(out);
                     out.push_str(" )");
                 } else {
                     inner.render(out);
+                }
+            },
+            Self::Phrase(distance, left, right) => {
+                for (i, side) in [left, right].into_iter().enumerate() {
+                    if i > 0 {
+                        if *distance == 1 {
+                            out.push_str(" <-> ");
+                        } else {
+                            out.push_str(" <");
+                            out.push_str(&distance.to_string());
+                            out.push_str("> ");
+                        }
+                    }
+                    // The reference form keeps a nested right-hand phrase parenthesized
+                    // (`'a' <-> ( 'b' <-> 'c' )`), so the right side needs parens at equal
+                    // precedence too.
+                    if side.precedence() < 3 + u8::from(i == 1) {
+                        out.push_str("( ");
+                        side.render(out);
+                        out.push_str(" )");
+                    } else {
+                        side.render(out);
+                    }
                 }
             },
             Self::And(left, right) | Self::Or(left, right) => {
@@ -918,31 +1029,157 @@ impl TsQuery {
         }
     }
 
-    /// Whether the query matches a set membership test over `lexemes`.
-    fn matches(&self, lexemes: &std::collections::HashSet<String>) -> bool {
+    /// Whether the query matches `doc` — set membership for the boolean operators, position
+    /// arithmetic (via [`Self::extents`]) as soon as a phrase operator is involved.
+    fn matches(&self, doc: &DocMap<'_>) -> bool {
         match self {
-            Self::Lexeme(lexeme) => lexemes.contains(lexeme),
-            Self::Not(inner) => !inner.matches(lexemes),
-            Self::And(left, right) => left.matches(lexemes) && right.matches(lexemes),
-            Self::Or(left, right) => left.matches(lexemes) || right.matches(lexemes),
+            Self::Lexeme(lexeme) => doc.contains_key(lexeme.as_str()),
+            Self::Not(inner) => !inner.matches(doc),
+            Self::And(left, right) => left.matches(doc) && right.matches(doc),
+            Self::Or(left, right) => left.matches(doc) || right.matches(doc),
+            Self::Phrase(..) => !self.extents(doc).is_empty(),
         }
     }
 
-    /// Normalize every lexeme under `config`, eliding dropped stopwords the way the reference engine does: an elided
-    /// operand of `&`/`|` collapses the node to its other side, an elided `!` argument drops the
-    /// negation, and a fully-elided query becomes `None` (the empty query).
-    fn normalize(self, config: Config) -> Option<Self> {
+    /// The `[lo, hi]` position extents at which this node matches `doc`, for phrase evaluation.
+    ///
+    /// A lexeme matches at `[p, p]` for each stored position (a position-less lexeme has no
+    /// extents, so a phrase never matches a stripped document — like the reference engine);
+    /// `L <n> R` matches at `[lo_L, hi_R]` wherever `R` starts exactly `n` past `L`'s end; `!x`
+    /// matches at every position `x` does not end at — a cofinite set, including positions
+    /// outside the document, which is how `'b' @@ !'a' <-> 'b'` holds; `&` keeps the extents
+    /// common to both sides, `|` either side's.
+    fn extents(&self, doc: &DocMap<'_>) -> Extents {
         match self {
-            Self::Lexeme(lexeme) => normalize_lexeme(config, &lexeme).map(Self::Lexeme),
-            Self::Not(inner) => inner.normalize(config).map(|q| Self::Not(Box::new(q))),
-            Self::And(left, right) => match (left.normalize(config), right.normalize(config)) {
-                (Some(l), Some(r)) => Some(Self::And(Box::new(l), Box::new(r))),
-                (one, other) => one.or(other),
+            Self::Lexeme(lexeme) => {
+                Extents::Fin(doc.get(lexeme.as_str()).map_or_else(Vec::new, |positions| {
+                    positions
+                        .iter()
+                        .map(|wp| (i64::from(wp.pos), i64::from(wp.pos)))
+                        .collect()
+                }))
             },
-            Self::Or(left, right) => match (left.normalize(config), right.normalize(config)) {
-                (Some(l), Some(r)) => Some(Self::Or(Box::new(l), Box::new(r))),
-                (one, other) => one.or(other),
+            Self::Not(inner) => match inner.extents(doc) {
+                Extents::Fin(list) => Extents::Cofin {
+                    exc: list.into_iter().map(|(_, hi)| hi).collect(),
+                    width: 0,
+                },
+                Extents::Cofin { exc, .. } => {
+                    Extents::Fin(exc.into_iter().map(|p| (p, p)).collect())
+                },
             },
+            Self::And(left, right) => match (left.extents(doc), right.extents(doc)) {
+                (Extents::Fin(a), Extents::Fin(b)) => {
+                    let keep: std::collections::BTreeSet<(i64, i64)> = b.into_iter().collect();
+                    Extents::Fin(
+                        a.into_iter()
+                            .filter(|extent| keep.contains(extent))
+                            .collect(),
+                    )
+                },
+                (Extents::Fin(a), Extents::Cofin { exc, .. })
+                | (Extents::Cofin { exc, .. }, Extents::Fin(a)) => Extents::Fin(
+                    a.into_iter()
+                        .filter(|&(_, hi)| !exc.contains(&hi))
+                        .collect(),
+                ),
+                (Extents::Cofin { exc: a, width }, Extents::Cofin { exc: b, .. }) => {
+                    Extents::Cofin {
+                        exc: a.union(&b).copied().collect(),
+                        width,
+                    }
+                },
+            },
+            Self::Or(left, right) => match (left.extents(doc), right.extents(doc)) {
+                (Extents::Fin(mut a), Extents::Fin(b)) => {
+                    a.extend(b);
+                    a.sort_unstable();
+                    a.dedup();
+                    Extents::Fin(a)
+                },
+                (Extents::Fin(a), Extents::Cofin { exc, width })
+                | (Extents::Cofin { exc, width }, Extents::Fin(a)) => {
+                    let ends: std::collections::BTreeSet<i64> =
+                        a.iter().map(|&(_, hi)| hi).collect();
+                    Extents::Cofin {
+                        exc: exc.into_iter().filter(|p| !ends.contains(p)).collect(),
+                        width,
+                    }
+                },
+                (Extents::Cofin { exc: a, width }, Extents::Cofin { exc: b, .. }) => {
+                    Extents::Cofin {
+                        exc: a.intersection(&b).copied().collect(),
+                        width,
+                    }
+                },
+            },
+            Self::Phrase(distance, left, right) => {
+                phrase_extents(i64::from(*distance), left.extents(doc), right.extents(doc))
+            },
+        }
+    }
+
+    /// Normalize every lexeme under `config`, eliding dropped stopwords the way the reference
+    /// engine does: an elided operand of `&`/`|` collapses the node to its other side, an elided
+    /// `!` argument drops the negation, and an elided phrase operand folds the span it covered
+    /// into the surrounding distances (`supernovae <-> the <-> stars` -> `'supernova' <2>
+    /// 'star'`). A fully-elided query is [`Normalized::Dropped`] (the empty query).
+    fn normalize(self, config: Config) -> Normalized {
+        match self {
+            Self::Lexeme(lexeme) => normalize_lexeme(config, &lexeme)
+                .map_or(Normalized::Dropped(0), |kept| {
+                    Normalized::Kept(Self::Lexeme(kept), 0, 0)
+                }),
+            Self::Not(inner) => match inner.normalize(config) {
+                Normalized::Kept(q, lpad, rpad) => {
+                    Normalized::Kept(Self::Not(Box::new(q)), lpad, rpad)
+                },
+                dropped @ Normalized::Dropped(_) => dropped,
+            },
+            Self::And(left, right) => {
+                Self::normalize_bool(left.normalize(config), right.normalize(config), Self::And)
+            },
+            Self::Or(left, right) => {
+                Self::normalize_bool(left.normalize(config), right.normalize(config), Self::Or)
+            },
+            Self::Phrase(distance, left, right) => {
+                match (left.normalize(config), right.normalize(config)) {
+                    (Normalized::Kept(l, ll, lr), Normalized::Kept(r, rl, rr)) => {
+                        let d = distance
+                            .saturating_add(lr)
+                            .saturating_add(rl)
+                            .min(MAXENTRYPOS);
+                        Normalized::Kept(Self::Phrase(d, Box::new(l), Box::new(r)), ll, rr)
+                    },
+                    (Normalized::Kept(l, ll, lr), Normalized::Dropped(w)) => {
+                        Normalized::Kept(l, ll, lr.saturating_add(distance).saturating_add(w))
+                    },
+                    (Normalized::Dropped(w), Normalized::Kept(r, rl, rr)) => {
+                        Normalized::Kept(r, w.saturating_add(distance).saturating_add(rl), rr)
+                    },
+                    (Normalized::Dropped(a), Normalized::Dropped(b)) => {
+                        Normalized::Dropped(a.saturating_add(distance).saturating_add(b))
+                    },
+                }
+            },
+        }
+    }
+
+    /// Combine two normalized `&`/`|` operands: both kept rebuilds the node (edge pads reset — a
+    /// phrase distance never crosses a boolean operator), one kept collapses to that side (its
+    /// own pads intact), both dropped stays dropped.
+    fn normalize_bool(
+        left: Normalized,
+        right: Normalized,
+        combine: fn(Box<Self>, Box<Self>) -> Self,
+    ) -> Normalized {
+        match (left, right) {
+            (Normalized::Kept(l, ..), Normalized::Kept(r, ..)) => {
+                Normalized::Kept(combine(Box::new(l), Box::new(r)), 0, 0)
+            },
+            (kept @ Normalized::Kept(..), Normalized::Dropped(_))
+            | (Normalized::Dropped(_), kept @ Normalized::Kept(..)) => kept,
+            (Normalized::Dropped(_), Normalized::Dropped(_)) => Normalized::Dropped(0),
         }
     }
 }
@@ -955,11 +1192,13 @@ enum QueryToken {
     Not,
     Open,
     Close,
+    /// `<->` (distance 1) or `<N>`.
+    Phrase(u32),
 }
 
-/// Lex a `tsquery` input: `&`/`|`/`!`/parens, `'...'` quoted lexemes (with `''` escapes), and bare
-/// words (alphanumeric runs). `<->`/`<N>` phrase operators and `:...` weight suffixes are rejected
-/// loudly (follow-ups).
+/// Lex a `tsquery` input: `&`/`|`/`!`/parens, the `<->`/`<N>` phrase operators, `'...'` quoted
+/// lexemes (with `''` escapes), and bare words (alphanumeric runs). `:...` weight suffixes are
+/// rejected loudly (follow-up).
 ///
 /// `lowercase` case-folds each lexeme (the dictionary path, used by `to_tsquery`); when `false` the
 /// lexemes are kept verbatim, as the bare `'…'::tsquery` literal cast keeps them.
@@ -992,9 +1231,8 @@ fn lex_tsquery(input: &str, lowercase: bool) -> Result<Vec<QueryToken>, Error> {
                 tokens.push(QueryToken::Close);
             },
             '<' => {
-                return Err(Error::Unsupported(
-                    "tsquery phrase operator `<->` is not implemented (follow-up)".to_owned(),
-                ));
+                chars.next();
+                tokens.push(QueryToken::Phrase(lex_phrase_distance(&mut chars, input)?));
             },
             ':' => {
                 return Err(Error::Unsupported(
@@ -1049,7 +1287,44 @@ fn lex_tsquery(input: &str, lowercase: bool) -> Result<Vec<QueryToken>, Error> {
     Ok(tokens)
 }
 
-/// Recursive-descent parser over the lexed tokens, the reference engine's precedence: `|` < `&` < `!`.
+/// Lex the tail of a phrase operator after its `<`: `->` is distance 1, a digit run its value
+/// (at most 16384, the reference engine's ceiling — beyond it is its `22023`); anything else is
+/// a `42601` syntax error.
+fn lex_phrase_distance(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    input: &str,
+) -> Result<u32, Error> {
+    let distance = if chars.peek() == Some(&'-') {
+        chars.next();
+        1
+    } else {
+        let mut digits = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                digits.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            return Err(syntax_error(input));
+        }
+        digits
+            .parse::<u32>()
+            .ok()
+            .filter(|&n| n <= MAXENTRYPOS)
+            .ok_or_else(phrase_distance_error)?
+    };
+    if chars.next() == Some('>') {
+        Ok(distance)
+    } else {
+        Err(syntax_error(input))
+    }
+}
+
+/// Recursive-descent parser over the lexed tokens, the reference engine's precedence:
+/// `|` < `&` < `<->` < `!`.
 struct QueryParser<'a> {
     tokens: &'a [QueryToken],
     pos: usize,
@@ -1068,11 +1343,22 @@ impl QueryParser<'_> {
     }
 
     fn and_expr(&mut self) -> Result<TsQuery, Error> {
-        let mut left = self.unary()?;
+        let mut left = self.phrase_expr()?;
         while matches!(self.tokens.get(self.pos), Some(QueryToken::And)) {
             self.pos += 1;
-            let right = self.unary()?;
+            let right = self.phrase_expr()?;
             left = TsQuery::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn phrase_expr(&mut self) -> Result<TsQuery, Error> {
+        let mut left = self.unary()?;
+        while let Some(QueryToken::Phrase(distance)) = self.tokens.get(self.pos) {
+            let distance = *distance;
+            self.pos += 1;
+            let right = self.unary()?;
+            left = TsQuery::Phrase(distance, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
@@ -1135,7 +1421,7 @@ fn parse_tsquery_with_case(input: &str, lowercase: bool) -> Result<TsQuery, Erro
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed query, or [`Error::Unsupported`] for the
-/// unimplemented phrase/weight operators.
+/// unimplemented weight operators.
 pub fn parse_tsquery(input: &str) -> Result<String, Error> {
     let mut out = String::new();
     parse_tsquery_with_case(input, false)?.render(&mut out);
@@ -1144,16 +1430,17 @@ pub fn parse_tsquery(input: &str) -> Result<String, Error> {
 
 /// `to_tsquery(config, text)` — parse a boolean lexeme query into the reference engine's canonical text form.
 ///
-/// The grammar is `&`/`|`/`!`/parens over quoted or bare lexemes. Under `english` each lexeme is
+/// The grammar is `&`/`|`/`!`/`<->`/`<N>`/parens over quoted or bare lexemes. Under `english`
+/// each lexeme is
 /// stemmed and stopwords are elided from the boolean structure (`'the & fat'` -> `'fat'`); a query
 /// left empty by elision yields the empty query, which matches nothing — like the reference engine.
 ///
 /// # Errors
-/// [`Error::Unsupported`] for an unimplemented configuration or a phrase/weight operator;
+/// [`Error::Unsupported`] for an unimplemented configuration or a weight operator;
 /// a `42601`-coded [`Error::Coded`] for a malformed query (like the reference engine's `syntax error in tsquery`).
 pub fn to_tsquery(config: &str, text: &str) -> Result<String, Error> {
     let config = check_config(config)?;
-    let Some(query) = parse_tsquery_ast(text)?.normalize(config) else {
+    let Normalized::Kept(query, ..) = parse_tsquery_ast(text)?.normalize(config) else {
         return Ok(String::new());
     };
     let mut out = String::new();
@@ -1184,85 +1471,75 @@ pub fn plainto_tsquery(config: &str, text: &str) -> Result<String, Error> {
     Ok(out)
 }
 
-/// Parse a `tsvector` text form into its lexeme set (positions and any `A`-`D` weight suffixes are
-/// accepted and ignored — they do not affect a boolean match). Accepts both the canonical quoted
-/// form and bare lexemes (`fox:1 quick`), like the reference engine's `::tsvector` cast.
-fn tsvector_lexemes(input: &str) -> Result<std::collections::HashSet<String>, Error> {
-    let bad = || Error::Coded {
-        message: format!("syntax error in tsvector: {input:?}"),
-        sqlstate: "42601",
-    };
-    let mut lexemes = std::collections::HashSet::new();
-    let mut chars = input.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() {
-            chars.next();
-            continue;
-        }
-        let mut lexeme = String::new();
-        if c == '\'' {
-            chars.next();
-            loop {
-                match chars.next() {
-                    Some('\'') => {
-                        if chars.peek() == Some(&'\'') {
-                            chars.next();
-                            lexeme.push('\'');
-                        } else {
-                            break;
-                        }
-                    },
-                    Some(c) => lexeme.push(c),
-                    None => return Err(bad()),
-                }
-            }
-        } else {
-            while let Some(&c) = chars.peek() {
-                if c.is_whitespace() || c == ':' || c == '\'' {
-                    break;
-                }
-                lexeme.push(c);
-                chars.next();
-            }
-        }
-        if lexeme.is_empty() {
-            return Err(bad());
-        }
-        // Optional `:positions` — digits, commas, and A-D weight letters; ignored for matching.
-        if chars.peek() == Some(&':') {
-            chars.next();
-            let mut any = false;
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_digit() || c == ',' || matches!(c, 'A'..='D' | 'a'..='d') || c == '*'
-                {
-                    any = true;
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if !any {
-                return Err(bad());
-            }
-        }
-        lexemes.insert(lexeme);
+/// `phraseto_tsquery(config, text)` — plain text into a position-mirroring phrase query.
+///
+/// The lexemes are chained with phrase operators whose distances mirror the token positions, so
+/// the query matches the words in that exact arrangement. A dropped stopword widens the gap:
+/// `phraseto_tsquery('english', 'The Cat and the Rat')` -> `'cat' <3> 'rat'`. Empty (or
+/// all-stopword) input yields the empty query.
+///
+/// # Errors
+/// [`Error::Unsupported`] for an unimplemented configuration.
+pub fn phraseto_tsquery(config: &str, text: &str) -> Result<String, Error> {
+    let config = check_config(config)?;
+    let mut query: Option<(TsQuery, u32)> = None;
+    for (token, position) in tokenize_simple(text) {
+        let Some(lexeme) = normalize_lexeme(config, &token) else {
+            continue; // a stopword: dropped, but the position gap it leaves still counts
+        };
+        let node = TsQuery::Lexeme(lexeme);
+        query = Some(match query {
+            None => (node, position),
+            Some((chain, last)) => (
+                TsQuery::Phrase(
+                    position.saturating_sub(last),
+                    Box::new(chain),
+                    Box::new(node),
+                ),
+                position,
+            ),
+        });
     }
-    Ok(lexemes)
+    let query = query.map(|(chain, _)| chain);
+    Ok(render_or_empty(query.as_ref()))
 }
 
-/// The `@@` match: does `tsvector` (text form) satisfy `tsquery` (text form)? An empty query
-/// matches nothing; an empty tsvector can still satisfy a negated query (`!'x'`), like the reference engine.
+/// `tsquery_phrase(a, b[, distance])` and the `tsquery <-> tsquery` operator — join two queries
+/// with a phrase operator at `distance` (default 1); an empty operand is the identity (the other
+/// side alone).
+///
+/// # Errors
+/// A `42601`-coded [`Error::Coded`] for a malformed operand, [`Error::Unsupported`] for an
+/// unimplemented weight suffix, or a `22023`-coded [`Error::Coded`] for a distance outside
+/// `0..=16384`.
+pub fn tsquery_phrase(left: &str, right: &str, distance: i64) -> Result<String, Error> {
+    let distance = u32::try_from(distance)
+        .ok()
+        .filter(|&n| n <= MAXENTRYPOS)
+        .ok_or_else(phrase_distance_error)?;
+    let joined = match (parse_tsquery_operand(left)?, parse_tsquery_operand(right)?) {
+        (Some(l), Some(r)) => Some(TsQuery::Phrase(distance, Box::new(l), Box::new(r))),
+        (one, other) => one.or(other),
+    };
+    Ok(render_or_empty(joined.as_ref()))
+}
+
+/// The `@@` match: does `tsvector` (text form) satisfy `tsquery` (text form)?
+///
+/// An empty query matches nothing; an empty tsvector can still satisfy a negated query
+/// (`!'x'`), like the reference engine. Phrase operators (`<->`/`<N>`) match on the stored
+/// positions, so a stripped (position-less) document never satisfies a phrase.
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed tsvector/tsquery, or [`Error::Unsupported`]
-/// for the unimplemented phrase/weight forms.
+/// for the unimplemented weight forms.
 pub fn ts_match(tsvector: &str, tsquery: &str) -> Result<bool, Error> {
     if tsquery.trim().is_empty() {
         return Ok(false);
     }
-    let lexemes = tsvector_lexemes(tsvector)?;
+    let entries = parse_tsvector_entries(tsvector)?;
     let query = parse_tsquery_ast(tsquery)?;
-    Ok(query.matches(&lexemes))
+    Ok(query.matches(&build_map(&entries)))
 }
 
 // ===== Relevance ranking: `ts_rank` / `ts_rank_cd` =====
@@ -1338,9 +1615,9 @@ struct TsvEntry {
 /// A lexeme lookup over a parsed `tsvector`: lexeme -> its positions.
 type DocMap<'a> = std::collections::HashMap<&'a str, &'a [WordPos]>;
 
-/// Parse a `tsvector` text form into its entries, keeping positions and weights (unlike
-/// [`tsvector_lexemes`], which only needs the lexeme set). Accepts the canonical quoted form and
-/// bare lexemes; a `:positions` list is `<number><weight?>` items separated by commas.
+/// Parse a `tsvector` text form into its entries, keeping positions and weights. Accepts the
+/// canonical quoted form and bare lexemes; a `:positions` list is `<number><weight?>` items
+/// separated by commas.
 fn parse_tsvector_entries(input: &str) -> Result<Vec<TsvEntry>, Error> {
     let bad = || Error::Coded {
         message: format!("syntax error in tsvector: {input:?}"),
@@ -1451,7 +1728,7 @@ fn collect_operands(q: &TsQuery, out: &mut std::collections::BTreeSet<String>) {
             out.insert(l.clone());
         },
         TsQuery::Not(inner) => collect_operands(inner, out),
-        TsQuery::And(a, b) | TsQuery::Or(a, b) => {
+        TsQuery::And(a, b) | TsQuery::Or(a, b) | TsQuery::Phrase(_, a, b) => {
             collect_operands(a, out);
             collect_operands(b, out);
         },
@@ -1568,7 +1845,7 @@ fn calc_rank(entries: &[TsvEntry], query: &TsQuery, method: i32) -> f32 {
     }
     let operands: Vec<String> = ops.into_iter().collect();
     let map = build_map(entries);
-    let mut res = if matches!(query, TsQuery::And(..)) {
+    let mut res = if matches!(query, TsQuery::And(..) | TsQuery::Phrase(..)) {
         calc_rank_and(&map, &operands)
     } else {
         calc_rank_or(&map, &operands)
@@ -1603,7 +1880,7 @@ fn calc_rank(entries: &[TsvEntry], query: &TsQuery, method: i32) -> f32 {
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed `tsvector`/`tsquery`, or [`Error::Unsupported`]
-/// for an unimplemented `tsquery` phrase/weight form.
+/// for an unimplemented `tsquery` weight form.
 pub fn ts_rank(tsvector: &str, tsquery: &str, method: i32) -> Result<f32, Error> {
     if tsquery.trim().is_empty() {
         return Ok(0.0);
@@ -1647,14 +1924,23 @@ fn get_docrep(map: &DocMap<'_>, operands: &[String]) -> Vec<DocRep> {
     doc
 }
 
-/// Whether the query is satisfied by the set of operand lexemes seen so far in a candidate cover.
-/// `!` is treated as satisfied (the reference engine does not evaluate negation when scanning for covers).
-fn cover_eval(q: &TsQuery, present: &std::collections::HashSet<&str>) -> bool {
+/// Whether the query is satisfied by the operand occurrences seen so far in a candidate cover.
+/// `!` is treated as satisfied (the reference engine does not evaluate negation when scanning
+/// for covers); a phrase operator checks the real positions, so a cover only forms where the
+/// words actually sit at the phrase distance — `ts_rank_cd('a x b', 'a <-> b')` is 0.
+fn cover_eval(q: &TsQuery, present: &std::collections::HashMap<&str, Vec<WordPos>>) -> bool {
     match q {
-        TsQuery::Lexeme(l) => present.contains(l.as_str()),
+        TsQuery::Lexeme(l) => present.contains_key(l.as_str()),
         TsQuery::Not(_) => true,
         TsQuery::And(a, b) => cover_eval(a, present) && cover_eval(b, present),
         TsQuery::Or(a, b) => cover_eval(a, present) || cover_eval(b, present),
+        TsQuery::Phrase(..) => {
+            let view: DocMap<'_> = present
+                .iter()
+                .map(|(lexeme, positions)| (*lexeme, positions.as_slice()))
+                .collect();
+            !q.extents(&view).is_empty()
+        },
     }
 }
 
@@ -1672,7 +1958,8 @@ struct Ext {
 /// position, then contract from that top downward to the tightest left edge.
 fn next_cover(doc: &[DocRep], operands: &[String], query: &TsQuery, ext: &mut Ext) -> bool {
     loop {
-        let mut present: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut present: std::collections::HashMap<&str, Vec<WordPos>> =
+            std::collections::HashMap::new();
         ext.p = u32::MAX;
         ext.q = 0;
         let mut found = false;
@@ -1683,7 +1970,10 @@ fn next_cover(doc: &[DocRep], operands: &[String], query: &TsQuery, ext: &mut Ex
             let Some(name) = operands.get(d.item) else {
                 break;
             };
-            present.insert(name.as_str());
+            present.entry(name.as_str()).or_default().push(WordPos {
+                pos: d.pos,
+                weight: d.weight,
+            });
             if cover_eval(query, &present) {
                 ext.q = d.pos;
                 ext.end = i;
@@ -1700,11 +1990,14 @@ fn next_cover(doc: &[DocRep], operands: &[String], query: &TsQuery, ext: &mut Ex
         let mut begin = ext.pos;
         let mut j = lastpos;
         loop {
-            if let Some((pos, name)) = doc
+            if let Some((pos, weight, name)) = doc
                 .get(j)
-                .and_then(|d| operands.get(d.item).map(|n| (d.pos, n.as_str())))
+                .and_then(|d| operands.get(d.item).map(|n| (d.pos, d.weight, n.as_str())))
             {
-                present.insert(name);
+                present
+                    .entry(name)
+                    .or_default()
+                    .push(WordPos { pos, weight });
                 if cover_eval(query, &present) {
                     ext.p = pos;
                     ext.begin = j;
@@ -1810,7 +2103,7 @@ fn calc_rank_cd(entries: &[TsvEntry], query: &TsQuery, method: i32) -> f32 {
 ///
 /// # Errors
 /// A `42601`-coded [`Error::Coded`] for a malformed `tsvector`/`tsquery`, or [`Error::Unsupported`]
-/// for an unimplemented `tsquery` phrase/weight form.
+/// for an unimplemented `tsquery` weight form.
 pub fn ts_rank_cd(tsvector: &str, tsquery: &str, method: i32) -> Result<f32, Error> {
     if tsquery.trim().is_empty() {
         return Ok(0.0);
@@ -2004,11 +2297,7 @@ mod tests {
                 other => panic!("expected 42601 for {bad:?}, got {other:?}"),
             }
         }
-        // Phrase / weight forms are loud Unsupported, not silent misparse.
-        assert!(matches!(
-            to_tsquery("simple", "a <-> b"),
-            Err(Error::Unsupported(_))
-        ));
+        // Weight forms are loud Unsupported, not silent misparse.
         assert!(matches!(
             to_tsquery("simple", "a:*"),
             Err(Error::Unsupported(_))
@@ -2046,6 +2335,165 @@ mod tests {
     /// Assert two `real` scores are equal to within a float4 epsilon.
     fn approx(got: f32, want: f32) {
         assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn phrase_cast_renders_canonically() {
+        // Every pair pinned against the reference engine (differential corpus Q-fts-phrase).
+        for (input, expect) in [
+            ("a <-> b", "'a' <-> 'b'"),
+            ("a <2> b", "'a' <2> 'b'"),
+            ("a <0> b", "'a' <0> 'b'"),
+            ("a <1> b", "'a' <-> 'b'"),
+            ("a <16384> b", "'a' <16384> 'b'"),
+            ("(a | b) <-> c", "( 'a' | 'b' ) <-> 'c'"),
+            ("(a & b) <-> c", "( 'a' & 'b' ) <-> 'c'"),
+            ("!a <-> b", "!'a' <-> 'b'"),
+            ("!(a | b) <-> c", "!( 'a' | 'b' ) <-> 'c'"),
+            ("a <-> b <-> c", "'a' <-> 'b' <-> 'c'"),
+            ("a <-> (b <-> c)", "'a' <-> ( 'b' <-> 'c' )"),
+            ("a <-> b & c", "'a' <-> 'b' & 'c'"),
+            ("a & b <-> c", "'a' & 'b' <-> 'c'"),
+            ("!a <-> b | c", "!'a' <-> 'b' | 'c'"),
+            ("!(a <-> b)", "!( 'a' <-> 'b' )"),
+        ] {
+            assert_eq!(parse_tsquery(input).unwrap(), expect, "input {input:?}");
+        }
+        assert_eq!(numnode("a <-> b").unwrap(), 3);
+        assert_eq!(numnode("a <-> b <-> c").unwrap(), 5);
+        assert_eq!(numnode("(a | b) <-> c").unwrap(), 5);
+    }
+
+    #[test]
+    fn phrase_distance_limits_match_the_reference() {
+        // 16384 is the ceiling; above it is the reference engine's 22023, a garbled operator or
+        // missing operand its 42601.
+        let over = parse_tsquery("a <16385> b").expect_err("over-limit distance");
+        assert_eq!(over.sqlstate(), "22023");
+        let missing = parse_tsquery("a <-> ").expect_err("missing operand");
+        assert_eq!(missing.sqlstate(), "42601");
+        let garbled = parse_tsquery("a <x> b").expect_err("garbled operator");
+        assert_eq!(garbled.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn english_phrase_elision_folds_stopword_spans() {
+        // Dropped stopwords widen the surviving phrase distance, like the reference engine.
+        for (input, expect) in [
+            ("the <-> cat", "'cat'"),
+            ("cat <-> the", "'cat'"),
+            ("supernovae <-> the <-> stars", "'supernova' <2> 'star'"),
+            ("cat <2> the <3> dog", "'cat' <5> 'dog'"),
+            ("the <-> cat <-> dog", "'cat' <-> 'dog'"),
+            ("cat <-> (dog <-> the)", "'cat' <-> 'dog'"),
+            ("cats <-> (the <-> rats)", "'cat' <2> 'rat'"),
+            ("(cat <-> the) <2> dog", "'cat' <3> 'dog'"),
+            ("fatal <-> rats", "'fatal' <-> 'rat'"),
+            ("the <-> the", ""),
+        ] {
+            assert_eq!(
+                to_tsquery("english", input).unwrap(),
+                expect,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phrase_match_is_position_accurate() {
+        // The whole battery is pinned against the reference engine (corpus Q-fts-phrase).
+        let doc = |text| to_tsvector("simple", text).unwrap();
+        for (text, query, expect) in [
+            ("a b c", "a <-> b", true),
+            ("a b c", "a <-> c", false),
+            ("a b c", "a <2> c", true),
+            ("a a", "a <0> a", true),
+            // AND inside a phrase needs a shared position, not co-occurrence.
+            ("a b c", "(a & b) <-> c", false),
+            ("x b, x c", "(b & c) <-> x", false),
+            ("a b c", "(a | b) <-> c", true),
+            // A negated operand holds wherever the word is absent — including positions
+            // outside the document.
+            ("a b", "a <-> !b", false),
+            ("a c", "a <-> !b", true),
+            ("a", "a <-> !b", true),
+            ("b x", "!a <-> b", true),
+            ("a b", "!a <-> b", false),
+            ("c b", "!a <-> b", true),
+            ("x y", "!a <-> !b", true),
+            // A nested phrase spans edge-to-edge: the distance runs from the left operand's
+            // end to the right operand's start.
+            ("a b c", "a <2> (b <-> c)", false),
+            ("a b c", "(a <-> b) <-> c", true),
+            ("a b c", "!(a <-> b) <-> c", false),
+            ("x b c", "!(a <-> b) <-> c", true),
+        ] {
+            assert_eq!(
+                ts_match(&doc(text), query).unwrap(),
+                expect,
+                "doc {text:?} query {query:?}"
+            );
+        }
+        // A stripped (position-less) document never satisfies a phrase; the empty document
+        // still satisfies a fully negated one.
+        let stripped = strip(&doc("a b")).unwrap();
+        assert!(!ts_match(&stripped, "a <-> b").unwrap());
+        assert!(ts_match("", "!a <-> !b").unwrap());
+    }
+
+    #[test]
+    fn phraseto_tsquery_chains_by_position() {
+        assert_eq!(
+            phraseto_tsquery("english", "The Fat Rats").unwrap(),
+            "'fat' <-> 'rat'"
+        );
+        // The dropped stopwords leave a gap the distance preserves.
+        assert_eq!(
+            phraseto_tsquery("english", "The Cat and the Rat").unwrap(),
+            "'cat' <3> 'rat'"
+        );
+        assert_eq!(phraseto_tsquery("simple", "a b").unwrap(), "'a' <-> 'b'");
+        assert_eq!(phraseto_tsquery("english", "cat").unwrap(), "'cat'");
+        assert_eq!(phraseto_tsquery("english", "the").unwrap(), "");
+    }
+
+    #[test]
+    fn tsquery_phrase_joins_with_identity_for_empty() {
+        assert_eq!(tsquery_phrase("cat", "dog", 1).unwrap(), "'cat' <-> 'dog'");
+        assert_eq!(
+            tsquery_phrase("cat", "dog", 10).unwrap(),
+            "'cat' <10> 'dog'"
+        );
+        assert_eq!(
+            tsquery_phrase("cat & fox", "dog", 1).unwrap(),
+            "( 'cat' & 'fox' ) <-> 'dog'"
+        );
+        assert_eq!(tsquery_phrase("cat", "", 1).unwrap(), "'cat'");
+        assert_eq!(tsquery_phrase("", "dog", 1).unwrap(), "'dog'");
+        assert_eq!(
+            tsquery_phrase("cat", "dog", 16385).unwrap_err().sqlstate(),
+            "22023"
+        );
+    }
+
+    #[test]
+    fn phrase_rank_paths_match_the_reference() {
+        // ts_rank routes a phrase through the proximity (AND) path; ts_rank_cd only forms a
+        // cover where the words actually sit at the phrase distance.
+        let doc = to_tsvector("simple", "a b c").unwrap();
+        assert_eq!(
+            format!("{:?}", ts_rank(&doc, "a <-> b", 0).unwrap()),
+            "0.09910322"
+        );
+        assert_eq!(
+            format!("{:?}", ts_rank_cd(&doc, "a <-> b", 0).unwrap()),
+            "0.1"
+        );
+        let apart = to_tsvector("simple", "a x b").unwrap();
+        assert_eq!(
+            format!("{:?}", ts_rank_cd(&apart, "a <-> b", 0).unwrap()),
+            "0.0"
+        );
     }
 
     #[test]

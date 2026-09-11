@@ -1,8 +1,8 @@
 # p13_functions/fts — full-text search (P10 F1): to_tsvector / to_tsquery / plainto_tsquery and the
 # `@@` match. Two configurations, both byte-exact with PG for plain-word input: `simple` (lowercase
 # only) and `english` (Snowball stopwords + Snowball English stemmer; also the default for the
-# 1-argument forms, matching PG's stock default_text_search_config). Other configurations, phrase
-# `<->`, and weight suffixes are loud errors.
+# 1-argument forms, matching PG's stock default_text_search_config). Other configurations and
+# weight suffixes are loud errors; phrase search is position-accurate.
 
 # to_tsvector: canonical form — lexemes sorted, quoted, 1-based ascending positions.
 query T
@@ -131,12 +131,71 @@ SELECT to_tsvector('english', 'the42 12 the')
 ----
 '12':2 'the42':1
 
-# Honest loud errors: an unknown configuration, phrase search, malformed tsquery.
+# --- Phrase search: <-> / <N>, phraseto_tsquery, tsquery_phrase ---
+
+query T
+SELECT 'a <2> b'::tsquery
+----
+'a' <2> 'b'
+
+query T
+SELECT to_tsquery('english', 'supernovae <-> the <-> stars')
+----
+'supernova' <2> 'star'
+
+query T
+SELECT phraseto_tsquery('english', 'The Cat and the Rat')
+----
+'cat' <3> 'rat'
+
+query T
+SELECT tsquery_phrase('cat'::tsquery, 'dog'::tsquery, 10)
+----
+'cat' <10> 'dog'
+
+query T
+SELECT 'cat'::tsquery <-> 'dog'::tsquery
+----
+'cat' <-> 'dog'
+
+query B
+SELECT to_tsvector('simple', 'a b c') @@ 'a <2> c'::tsquery
+----
+1
+
+query B
+SELECT to_tsvector('simple', 'a b c') @@ 'a <-> c'::tsquery
+----
+0
+
+query B
+SELECT strip(to_tsvector('simple', 'a b')) @@ 'a <-> b'::tsquery
+----
+0
+
+query B
+SELECT to_tsvector('english', 'many fatal rats') @@ phraseto_tsquery('english', 'fatal rats')
+----
+1
+
+query R
+SELECT ts_rank_cd(to_tsvector('simple', 'a x b'), 'a <-> b'::tsquery)
+----
+0.000
+
+# A phrase distance above 16384 and a missing operand are loud errors.
+statement error
+SELECT 'a <16385> b'::tsquery
+
+statement error
+SELECT 'a <-> '::tsquery
+
+# Honest loud errors: an unknown configuration, a weight suffix, malformed tsquery.
 statement error
 SELECT to_tsvector('french', 'foxes')
 
 statement error
-SELECT to_tsquery('simple', 'fox <-> quick')
+SELECT to_tsquery('simple', 'fox:A')
 
 # Malformed tsquery is a syntax error, like PG.
 statement error

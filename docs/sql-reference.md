@@ -1000,10 +1000,15 @@ WHERE  to_tsvector(body) @@ plainto_tsquery('red fox')
 ORDER  BY score DESC;
 ```
 
-Query operators: `&` and, `|` or, `!` not, with parentheses. `to_tsquery` takes that syntax;
-`plainto_tsquery` takes plain words and ANDs them. Ranking: `ts_rank`, `ts_rank_cd`;
-`setweight(vector, 'A')` marks lexemes, `strip(vector)` drops positions. Other configurations,
-phrase search (`<->`), and prefix matching are refused with a clear error rather than approximated.
+Query operators: `&` and, `|` or, `!` not, `<->` / `<N>` phrase (followed-by at exactly N
+positions), with parentheses. `to_tsquery` takes that syntax; `plainto_tsquery` takes plain words
+and ANDs them; `phraseto_tsquery` takes plain words and chains them into a phrase whose distances
+mirror the word positions (`phraseto_tsquery('the cat and the rat')` is `'cat' <3> 'rat'`).
+`tsquery_phrase(a, b [, distance])` and `a <-> b` join two queries into a phrase. Phrase matching
+is position-accurate: `to_tsvector('a b c') @@ 'a <2> c'` holds, `'a <-> c'` does not, and a
+`strip()`-ed vector never matches a phrase. Ranking: `ts_rank`, `ts_rank_cd`;
+`setweight(vector, 'A')` marks lexemes, `strip(vector)` drops positions. Other configurations
+and prefix matching are refused with a clear error rather than approximated.
 For hybrid search over a vector index and a text match, `rrf_score(rank [, k])` fuses two rankings.
 
 ---
@@ -1477,7 +1482,8 @@ Aggregates: `json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`.
 
 ### Full-text search
 
-`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `ts_rank`, `ts_rank_cd`, `setweight`, `strip`,
+`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`, `tsquery_phrase`, `ts_rank`,
+`ts_rank_cd`, `setweight`, `strip`,
 `numnode`, `rrf_score`.
 
 ### Hashing, encryption, identifiers
@@ -1815,7 +1821,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - locale collations (only `"C"` / `"POSIX"`);
 - `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;
-- full-text configurations other than `simple` and `english`, phrase search, prefix matching;
+- full-text configurations other than `simple` and `english`, and full-text prefix matching;
 - `IGNORE NULLS` / `RESPECT NULLS` on window functions;
 - storing a multi-dimensional array in a column (a multi-dimensional `ARRAY[[1,2],[3,4]]` value
   works inside a query, with `array_ndims` and `[i][j]` subscripts);
