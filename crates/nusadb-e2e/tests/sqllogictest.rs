@@ -875,6 +875,11 @@ fn slt_p10_session_timezone() {
 }
 
 #[test]
+fn slt_p10_set_local() {
+    run_slt("tests/slt/p10_types/set_local.slt");
+}
+
+#[test]
 fn slt_p10_json() {
     run_slt("tests/slt/p10_types/json.slt");
 }

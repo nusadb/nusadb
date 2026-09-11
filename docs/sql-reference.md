@@ -1640,7 +1640,14 @@ RESET ALL;
 | `<class>.<name>` | application-defined; any dotted name |
 
 An unrecognised parameter name is an error (`42704`) rather than a silent no-op, and a bad value
-for a known parameter is `22023`. `SET LOCAL` and `SET NAMES` are not accepted.
+for a known parameter is `22023`. `SET NAMES` is not accepted.
+
+`SET LOCAL name = value` scopes the assignment to the current transaction: the value holds until
+`COMMIT` or `ROLLBACK`, then reverts (outside a transaction block it has no effect). A plain
+`SET` inside a transaction is itself transactional — it survives `COMMIT` but is undone by
+`ROLLBACK`, and a later session-scoped `SET` beats an earlier `SET LOCAL` at commit. `SET LOCAL
+TIME ZONE` works the same way. Parameter changes made after a `SAVEPOINT` are not undone by
+`ROLLBACK TO SAVEPOINT` (only full transaction end settles them).
 
 ---
 
@@ -1817,7 +1824,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - aggregating a row value with anything but `count`;
 - dollar-quoted string literals outside a routine body;
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
-- `SET LOCAL`, `SET NAMES`, and an IANA region name as the session time zone;
+- `SET NAMES`, and an IANA region name as the session time zone;
 - locale collations (only `"C"` / `"POSIX"`);
 - `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;

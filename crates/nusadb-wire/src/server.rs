@@ -2503,8 +2503,8 @@ fn run_query_streaming(
     // unused, so the connection side immediately sees an empty row stream.
     let control = match &stmt {
         Statement::BeginTransaction(ts) => Some(begin_txn(engine, state, settings, ts)),
-        Statement::Commit => Some(commit_txn(engine, state)),
-        Statement::Rollback => Some(rollback_txn(engine, state)),
+        Statement::Commit => Some(commit_txn(engine, state, settings)),
+        Statement::Rollback => Some(rollback_txn(engine, state, settings)),
         Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
         // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` (P-ISOLATION): session default in
         // autocommit, re-begin in an untouched transaction, refused after any query.
@@ -2539,7 +2539,7 @@ fn run_query_streaming(
     // Session-variable control over-wire: handled against this connection's GUC store.
     match stmt {
         Statement::SetVariable(sv) => {
-            let result = apply_set_variable(settings, sv);
+            let result = apply_set_variable(settings, sv, in_transaction_block(&state));
             return StreamedRun::Done((
                 result
                     .map(|r| command_tag(&r))
@@ -3760,8 +3760,8 @@ fn run_query_txn(
     rewrite_database_catalog(&mut stmt, cluster);
     match stmt {
         Statement::BeginTransaction(ts) => begin_txn(engine, state, settings, &ts),
-        Statement::Commit => commit_txn(engine, state),
-        Statement::Rollback => rollback_txn(engine, state),
+        Statement::Commit => commit_txn(engine, state, settings),
+        Statement::Rollback => rollback_txn(engine, state, settings),
         // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` (P-ISOLATION): session default in
         // autocommit, re-begin in an untouched transaction, refused after any query.
         Statement::SetTransaction(ts) => set_transaction_txn(engine, settings, &ts, state),
@@ -3771,7 +3771,10 @@ fn run_query_txn(
         // Session-variable control: handled against this connection's GUC store, not the
         // executor (which has no per-connection session). `SET` records / `RESET` clears; `SHOW` reads
         // back the value (with built-in defaults) — kept consistent with `current_setting`.
-        Statement::SetVariable(sv) => (apply_set_variable(settings, sv), state),
+        Statement::SetVariable(sv) => {
+            let result = apply_set_variable(settings, sv, in_transaction_block(&state));
+            (result, state)
+        },
         Statement::Show(name) => {
             let mut snapshot = settings.lock().map(|s| s.clone()).unwrap_or_default();
             stamp_transaction_isolation(&mut snapshot, state);
@@ -3836,22 +3839,124 @@ fn effective_user(
     assumed_role(settings).unwrap_or_else(|| login_user.to_owned())
 }
 
+/// Key prefix for the pre-transaction value of a parameter touched inside the open transaction
+/// block (`ROLLBACK` restores these; `COMMIT` restores what `SET LOCAL` left). The `\u{0}`
+/// prefix keeps the key out of a client's reach, like the reserved connection keys.
+const TXN_GUC_BACKUP_PREFIX: &str = "\u{0}txn_guc_backup.";
+
+/// Key prefix for the last *session-scoped* (plain `SET`/`RESET`) value per parameter inside the
+/// open transaction block — the value `COMMIT` keeps.
+const TXN_GUC_PENDING_PREFIX: &str = "\u{0}txn_guc_pending.";
+
+/// Encode an optional parameter value for a reserved transaction-state key (`s<value>` = was
+/// set, `n` = was unset) — the store holds plain strings.
+fn encode_guc_state(value: Option<&str>) -> String {
+    value.map_or_else(|| "n".to_owned(), |v| format!("s{v}"))
+}
+
+/// Decode [`encode_guc_state`].
+fn decode_guc_state(encoded: &str) -> Option<String> {
+    encoded.strip_prefix('s').map(ToOwned::to_owned)
+}
+
+/// Settle the connection's transaction-scoped parameter state at transaction end: on commit a
+/// parameter whose last write was session-scoped keeps that value and everything `SET LOCAL`
+/// left reverts; on rollback every touched parameter reverts to its pre-transaction value.
+fn end_txn_gucs(settings: &std::sync::Mutex<HashMap<String, String>>, committed: bool) {
+    let Ok(mut store) = settings.lock() else {
+        return;
+    };
+    let touched: Vec<(String, String)> = store
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix(TXN_GUC_BACKUP_PREFIX)
+                .map(|name| (name.to_owned(), v.clone()))
+        })
+        .collect();
+    for (name, backup) in touched {
+        let pending = store
+            .get(&format!("{TXN_GUC_PENDING_PREFIX}{name}"))
+            .cloned();
+        let settled = if committed {
+            pending.map_or_else(|| decode_guc_state(&backup), |p| decode_guc_state(&p))
+        } else {
+            decode_guc_state(&backup)
+        };
+        match settled {
+            Some(v) => {
+                store.insert(name, v);
+            },
+            None => {
+                store.remove(&name);
+            },
+        }
+    }
+    store.retain(|k, _| {
+        !k.starts_with(TXN_GUC_BACKUP_PREFIX) && !k.starts_with(TXN_GUC_PENDING_PREFIX)
+    });
+}
+
+/// Record the pre-transaction value of `name` (first write wins) and, for a session-scoped
+/// write, the value that survives `COMMIT`. The caller holds the lock.
+fn record_txn_guc(
+    store: &mut HashMap<String, String>,
+    name: &str,
+    new_value: Option<&str>,
+    local: bool,
+) {
+    let backup_key = format!("{TXN_GUC_BACKUP_PREFIX}{name}");
+    if !store.contains_key(&backup_key) {
+        let original = encode_guc_state(store.get(name).map(String::as_str));
+        store.insert(backup_key, original);
+    }
+    if !local {
+        store.insert(
+            format!("{TXN_GUC_PENDING_PREFIX}{name}"),
+            encode_guc_state(new_value),
+        );
+    }
+}
+
+/// `RESET ALL`: clear every parameter the connection set. The reserved connection keys are
+/// stamped by the server, not by the client, so they survive — resetting the database would make
+/// `current_database()` lie, and resetting the temp-schema key would strand this connection's
+/// temp tables (analysis would stop resolving them). Inside a transaction block the wipe is
+/// itself transactional (the reference engine reverts a `RESET ALL` when the transaction
+/// aborts); the NUL-prefix check also keeps the transaction-scoped parameter state recorded here.
+fn reset_all_gucs(settings: &std::sync::Mutex<HashMap<String, String>>, in_txn: bool) {
+    let Ok(mut store) = settings.lock() else {
+        return;
+    };
+    if in_txn {
+        let names: Vec<String> = store
+            .keys()
+            .filter(|k| !k.starts_with('\u{0}'))
+            .cloned()
+            .collect();
+        for name in names {
+            record_txn_guc(&mut store, &name, None, false);
+        }
+    }
+    store.retain(|k, _| k.starts_with('\u{0}'));
+}
+
 fn apply_set_variable(
     settings: &std::sync::Mutex<HashMap<String, String>>,
     sv: nusadb_sql::ast::SetVariable,
+    in_txn: bool,
 ) -> Result<ExecutionResult, nusadb_sql::Error> {
+    // The reserved connection-state keys are written only by the server itself. Letting a
+    // client `SET` one would forge connection state — `SET "nusadb.assumed_role" = …` must not
+    // become a role switch that skipped the executor's authorization.
+    if sv.name.eq_ignore_ascii_case(ASSUMED_ROLE_SETTING) || sv.name.starts_with('\u{0}') {
+        return Err(nusadb_sql::Error::Coded {
+            message: format!("parameter \"{}\" cannot be changed", sv.name),
+            sqlstate: "55P02", // cant_change_runtime_param
+        });
+    }
     // `RESET ALL` clears every parameter the connection set, rather than naming one.
     if sv.value.is_none() && sv.name.eq_ignore_ascii_case("all") {
-        if let Ok(mut store) = settings.lock() {
-            // The reserved connection keys are stamped by the server, not by the client, so they
-            // survive: resetting the database would make `current_database()` lie, and resetting the
-            // temp-schema key would strand this connection's temp tables (analysis would stop
-            // resolving them).
-            store.retain(|k, _| {
-                k == nusadb_sql::CONNECTION_DATABASE_SETTING
-                    || k == nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING
-            });
-        }
+        reset_all_gucs(settings, in_txn);
         return Ok(ExecutionResult::VariableSet);
     }
     // A client sets parameters over this path rather than through `Session`, so the same
@@ -3934,7 +4039,15 @@ fn apply_set_variable(
             sqlstate: "22023", // invalid_parameter_value
         });
     }
+    // `SET LOCAL` outside a transaction block has no effect (the reference engine warns and
+    // applies nothing — this engine sends no sub-error messages).
+    if sv.local && !in_txn {
+        return Ok(ExecutionResult::VariableSet);
+    }
     if let Ok(mut store) = settings.lock() {
+        if in_txn {
+            record_txn_guc(&mut store, &sv.name, sv.value.as_deref(), sv.local);
+        }
         match sv.value {
             Some(value) => {
                 store.insert(sv.name, value);
@@ -4183,17 +4296,24 @@ fn begin_txn(
 fn commit_txn(
     engine: &dyn StorageEngine,
     state: TxnState,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     match state {
         TxnState::Active { txn, .. } => match engine.commit(txn) {
-            Ok(()) => (Ok(ExecutionResult::TransactionCommitted), TxnState::Auto),
+            Ok(()) => {
+                end_txn_gucs(settings, true);
+                (Ok(ExecutionResult::TransactionCommitted), TxnState::Auto)
+            },
             Err(e) => {
                 let _ = engine.rollback(txn);
+                end_txn_gucs(settings, false);
                 (Err(e.into()), TxnState::Auto)
             },
         },
+        // Committing a failed transaction rolls it back — parameters revert with it.
         TxnState::Failed { txn, .. } => {
             let _ = engine.rollback(txn);
+            end_txn_gucs(settings, false);
             (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
         },
         TxnState::Auto => (Ok(ExecutionResult::TransactionCommitted), TxnState::Auto),
@@ -4204,10 +4324,12 @@ fn commit_txn(
 fn rollback_txn(
     engine: &dyn StorageEngine,
     state: TxnState,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     if let Some(txn) = state.open_txn() {
         let _ = engine.rollback(txn);
     }
+    end_txn_gucs(settings, false);
     (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
 }
 
@@ -4992,6 +5114,93 @@ mod timeout_tests {
     /// check has to bite here too: an unknown parameter stored on a real connection would never be
     /// honoured, and would look like it had been. The two paths share one check, so they cannot
     /// disagree about which parameters exist.
+    /// Forging connection state via `SET` must be refused: the assumed role is written only by
+    /// the executor-authorized `SET ROLE` path, and the NUL-prefixed reserved keys only by the
+    /// server.
+    #[test]
+    fn set_over_the_wire_rejects_the_reserved_connection_keys() {
+        let settings = settings_with(&[]);
+        for name in [
+            "nusadb.assumed_role",
+            "NusaDB.Assumed_Role",
+            "\u{0}conn_database",
+        ] {
+            let err = apply_set_variable(
+                &settings,
+                nusadb_sql::ast::SetVariable {
+                    name: (*name).to_owned(),
+                    value: Some("root".to_owned()),
+                    local: false,
+                },
+                false,
+            )
+            .expect_err("a reserved connection key must be refused");
+            match err {
+                nusadb_sql::Error::Coded { sqlstate, .. } => assert_eq!(sqlstate, "55P02"),
+                other => panic!("expected 55P02 for {name}, got {other:?}"),
+            }
+        }
+        assert!(settings.lock().expect("settings").is_empty());
+    }
+
+    /// The transaction-scoped parameter model over the wire: `SET LOCAL` reverts at transaction
+    /// end, a plain `SET` survives `COMMIT` but not `ROLLBACK`, and a later session-scoped `SET`
+    /// beats an earlier `SET LOCAL` at commit.
+    #[test]
+    fn set_local_reverts_at_transaction_end_over_the_wire() {
+        let settings = settings_with(&[("timezone", "UTC")]);
+        let set = |value: &str, local: bool, in_txn: bool| {
+            apply_set_variable(
+                &settings,
+                nusadb_sql::ast::SetVariable {
+                    name: "timezone".to_owned(),
+                    value: Some(value.to_owned()),
+                    local,
+                },
+                in_txn,
+            )
+            .expect("SET timezone");
+        };
+        let shown = || {
+            settings
+                .lock()
+                .expect("settings")
+                .get("timezone")
+                .cloned()
+                .expect("timezone present")
+        };
+        // SET LOCAL: visible inside the block, gone after COMMIT.
+        set("+07", true, true);
+        assert_eq!(shown(), "<+07>-07");
+        end_txn_gucs(&settings, true);
+        assert_eq!(shown(), "UTC");
+        // Plain SET: survives COMMIT…
+        set("+03", false, true);
+        end_txn_gucs(&settings, true);
+        assert_eq!(shown(), "<+03>-03");
+        // …but a ROLLBACK undoes it.
+        set("+05", false, true);
+        end_txn_gucs(&settings, false);
+        assert_eq!(shown(), "<+03>-03");
+        // A later session-scoped SET beats an earlier SET LOCAL at commit.
+        set("+07", true, true);
+        set("+09", false, true);
+        assert_eq!(shown(), "<+09>-09");
+        end_txn_gucs(&settings, true);
+        assert_eq!(shown(), "<+09>-09");
+        // SET LOCAL outside a transaction block has no effect.
+        set("+11", true, false);
+        assert_eq!(shown(), "<+09>-09");
+        // No transaction-state keys leak past transaction end.
+        assert!(
+            settings
+                .lock()
+                .expect("settings")
+                .keys()
+                .all(|k| !k.starts_with('\u{0}'))
+        );
+    }
+
     #[test]
     fn set_over_the_wire_rejects_a_parameter_the_engine_does_not_read() {
         let settings = settings_with(&[]);
@@ -5001,7 +5210,9 @@ mod timeout_tests {
                 nusadb_sql::ast::SetVariable {
                     name: name.to_owned(),
                     value: value.map(ToOwned::to_owned),
+                    local: false,
                 },
+                false,
             )
         };
         let code = |name: &str, value: Option<&str>| match set(name, value) {

@@ -911,11 +911,11 @@ fn session_variable_statements_analyze() {
     // /SET/RESET/SHOW now analyze into session-variable plans.
     assert!(matches!(
         plan("SET search_path = 'public'", &catalog()),
-        Ok(LogicalPlan::SetVariable { name, value: Some(v) }) if name == "search_path" && v == "public",
+        Ok(LogicalPlan::SetVariable { name, value: Some(v), .. }) if name == "search_path" && v == "public",
     ));
     assert!(matches!(
         plan("RESET search_path", &catalog()),
-        Ok(LogicalPlan::SetVariable { name, value: None }) if name == "search_path",
+        Ok(LogicalPlan::SetVariable { name, value: None, .. }) if name == "search_path",
     ));
     assert!(matches!(
         plan("SHOW search_path", &catalog()),

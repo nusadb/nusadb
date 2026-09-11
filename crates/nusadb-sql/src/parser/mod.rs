@@ -2304,6 +2304,7 @@ fn recognize_reset(sql: &str) -> Option<Result<ast::Statement, Error>> {
     Some(Ok(ast::Statement::SetVariable(ast::SetVariable {
         name: name.to_ascii_lowercase(),
         value: None,
+        local: false,
     })))
 }
 
@@ -5196,10 +5197,17 @@ fn convert_set_statement(set: sql::Set) -> Result<ast::Statement, Error> {
             variable,
             values,
         } => {
-            if scope.is_some() || hivevar {
-                return unsupported("SET LOCAL / SET HIVEVAR");
+            if hivevar {
+                return unsupported("SET HIVEVAR");
             }
-            convert_set_variable(&variable, &values)
+            // `SET LOCAL` scopes the assignment to the current transaction; `SET SESSION` is
+            // the explicit spelling of the default.
+            let local = match scope {
+                Some(sql::ContextModifier::Local) => true,
+                Some(sql::ContextModifier::Global) => return unsupported("SET GLOBAL"),
+                Some(sql::ContextModifier::Session) | None => false,
+            };
+            convert_set_variable(&variable, &values, local)
         },
         sql::Set::ParenthesizedAssignments { .. } | sql::Set::MultipleAssignments { .. } => {
             unsupported("SET with multiple variables")
@@ -5209,21 +5217,19 @@ fn convert_set_statement(set: sql::Set) -> Result<ast::Statement, Error> {
     }
 }
 
-/// Convert `SET TIME ZONE <value>` — an alias for `SET timezone TO <value>`. `LOCAL` and
-/// `DEFAULT` both reset to the session default; a string passes through verbatim (the executor
-/// validates it), a number is the hour count east of UTC, and an `INTERVAL` is converted to that
-/// hour count (so its ISO sign survives the trip — a `±HH:MM` *string* means the opposite,
-/// POSIX-signed zone).
+/// Convert `SET [LOCAL] TIME ZONE <value>` — an alias for `SET [LOCAL] timezone TO <value>`. A
+/// `LOCAL` scope makes the assignment transaction-lived; a `LOCAL` or `DEFAULT` *value* resets
+/// to the session default; a string passes through verbatim (the executor validates it), a
+/// number is the hour count east of UTC, and an `INTERVAL` is converted to that hour count (so
+/// its ISO sign survives the trip — a `±HH:MM` *string* means the opposite, POSIX-signed zone).
 fn convert_set_time_zone(local: bool, value: &sql::Expr) -> Result<ast::Statement, Error> {
-    fn set_tz(value: Option<String>) -> ast::Statement {
+    let set_tz = move |value: Option<String>| {
         ast::Statement::SetVariable(ast::SetVariable {
             name: "timezone".to_owned(),
             value,
+            local,
         })
-    }
-    if local {
-        return Ok(set_tz(None));
-    }
+    };
     let rendered = match value {
         // `LOCAL` and `DEFAULT` both reset to the session default (sqlparser hands `LOCAL`
         // through as a bare identifier value rather than via its `local` flag).
@@ -5279,6 +5285,7 @@ fn convert_set_time_zone(local: bool, value: &sql::Expr) -> Result<ast::Statemen
 fn convert_set_variable(
     name: &sql::ObjectName,
     value: &[sql::Expr],
+    local: bool,
 ) -> Result<ast::Statement, Error> {
     let name = guc_name(name)?;
     // `search_path` is a list: `SET search_path TO a, public` carries several values — render
@@ -5291,6 +5298,7 @@ fn convert_set_variable(
         return Ok(ast::Statement::SetVariable(ast::SetVariable {
             name,
             value: Some(parts.join(", ")),
+            local,
         }));
     }
     let [value] = value else {
@@ -5304,6 +5312,7 @@ fn convert_set_variable(
     Ok(ast::Statement::SetVariable(ast::SetVariable {
         name,
         value: rendered,
+        local,
     }))
 }
 

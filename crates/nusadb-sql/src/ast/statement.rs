@@ -470,13 +470,16 @@ pub enum AccessMode {
     ReadWrite,
 }
 
-/// `SET name = value` / `RESET name` — a session-variable assignment.
+/// `SET [LOCAL] name = value` / `RESET name` — a session-variable assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetVariable {
     /// Variable name, folded to lowercase.
     pub name: String,
     /// `Some(text)` for `SET name = value`; `None` for `RESET name`.
     pub value: Option<String>,
+    /// `SET LOCAL` — the assignment lasts only until the current transaction ends (outside a
+    /// transaction block it has no effect, like the reference engine).
+    pub local: bool,
 }
 
 /// `COMMENT ON {TABLE | COLUMN} <object> IS {'text' | NULL}`.

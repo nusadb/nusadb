@@ -366,12 +366,15 @@ pub enum LogicalPlan {
     RollbackToSavepoint(String),
     /// `RELEASE [SAVEPOINT] name` — discard a named savepoint, keeping its writes.
     ReleaseSavepoint(String),
-    /// `SET name = value` (`value: Some`) / `RESET name` (`value: None`) — a session variable.
+    /// `SET [LOCAL] name = value` (`value: Some`) / `RESET name` (`value: None`) — a session
+    /// variable.
     SetVariable {
         /// Variable name, folded to lowercase.
         name: String,
         /// New value for `SET`, or `None` to `RESET` it to the unset default.
         value: Option<String>,
+        /// `SET LOCAL`: the assignment reverts when the current transaction ends.
+        local: bool,
     },
     /// `SHOW name` — report a session variable's current value.
     ShowVariable(String),
@@ -2605,12 +2608,14 @@ pub enum PhysicalPlan {
     RollbackToSavepoint(String),
     /// `RELEASE [SAVEPOINT] name` — discard a named savepoint, keeping its writes.
     ReleaseSavepoint(String),
-    /// `SET name = value` / `RESET name` — a session variable.
+    /// `SET [LOCAL] name = value` / `RESET name` — a session variable.
     SetVariable {
         /// Variable name, folded to lowercase.
         name: String,
         /// New value for `SET`, or `None` to `RESET` it to the unset default.
         value: Option<String>,
+        /// `SET LOCAL`: the assignment reverts when the current transaction ends.
+        local: bool,
     },
     /// `SHOW name` — report a session variable's current value.
     ShowVariable(String),

@@ -1063,6 +1063,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::SetVariable(sv) => Ok(LogicalPlan::SetVariable {
             name: sv.name,
             value: sv.value,
+            local: sv.local,
         }),
         // SHOW: report the session variable's current value.
         ast::Statement::Show(name) => Ok(LogicalPlan::ShowVariable(name)),

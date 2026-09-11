@@ -1077,6 +1077,11 @@ pub struct Session<'engine> {
     /// Generic session-variable store for `SET`/`RESET`/`SHOW`. Variables are
     /// remembered and echoed back, and read by `current_setting(name)`.
     variables: HashMap<String, String>,
+    /// Transaction-scoped parameter state: the pre-transaction value of every variable touched
+    /// inside the open transaction (restored on `ROLLBACK`, and on `COMMIT` for `SET LOCAL`),
+    /// plus the last *session-scoped* (plain `SET`/`RESET`) value, which is what survives a
+    /// `COMMIT`. Empty outside a transaction block.
+    txn_gucs: TxnGucState,
     /// The session user reported by `CURRENT_USER`/`SESSION_USER` and used to evaluate row-level
     /// security policies. Defaults to [`session_ctx::DEFAULT_USER`]; authentication does not yet
     /// feed a per-connection user into the SQL session (a documented follow-up).
@@ -1104,6 +1109,17 @@ pub struct Session<'engine> {
     /// Whether this session has created its temporary schema (a `CREATE TEMP TABLE` succeeded), so
     /// [`drop_temp_schema`](Self::drop_temp_schema) knows there is one to drop on disconnect.
     temp_schema_created: bool,
+}
+
+/// A [`Session`]'s transaction-scoped parameter state (see `Session::txn_gucs`).
+#[derive(Default)]
+struct TxnGucState {
+    /// Pre-transaction value of every variable touched inside the open transaction
+    /// (`None` = it was unset). First write wins — this is what `ROLLBACK` restores.
+    backup: HashMap<String, Option<String>>,
+    /// The last *session-scoped* (plain `SET`/`RESET`) value per variable — what `COMMIT`
+    /// keeps. A variable only ever written with `SET LOCAL` has no entry here.
+    pending: HashMap<String, Option<String>>,
 }
 
 /// Process-global source of per-session ids. Monotonic, so each [`Session`] names a distinct
@@ -1464,6 +1480,7 @@ impl<'engine> Session<'engine> {
         Self {
             engine,
             current_txn: None,
+            txn_gucs: TxnGucState::default(),
             default_isolation: IsolationLevel::default(),
             default_read_only: false,
             txn_read_only: false,
@@ -1599,7 +1616,9 @@ impl<'engine> Session<'engine> {
             PhysicalPlan::Savepoint(name) => self.savepoint(&name),
             PhysicalPlan::RollbackToSavepoint(name) => self.rollback_to_savepoint(&name),
             PhysicalPlan::ReleaseSavepoint(name) => self.release_savepoint(&name),
-            PhysicalPlan::SetVariable { name, value } => self.set_variable(name, value),
+            PhysicalPlan::SetVariable { name, value, local } => {
+                self.set_variable(name, value, local)
+            },
             PhysicalPlan::ShowVariable(name) => Ok(self.show_variable(&name)),
             // Prepared-statement control needs the session's statement store.
             PhysicalPlan::Prepare {
@@ -1909,8 +1928,20 @@ impl<'engine> Session<'engine> {
         &mut self,
         name: String,
         value: Option<String>,
+        local: bool,
     ) -> Result<ExecutionResult, Error> {
         if value.is_none() && name.eq_ignore_ascii_case("all") {
+            // Inside a transaction block the wipe is itself transactional (the reference
+            // engine reverts a `RESET ALL` when the transaction aborts).
+            if self.current_txn.is_some() {
+                for (key, old) in &self.variables {
+                    self.txn_gucs
+                        .backup
+                        .entry(key.clone())
+                        .or_insert_with(|| Some(old.clone()));
+                    self.txn_gucs.pending.insert(key.clone(), None);
+                }
+            }
             self.variables.clear();
             self.current_schema = crate::current_schema_for_search_path(None);
             return Ok(ExecutionResult::VariableSet);
@@ -1980,6 +2011,22 @@ impl<'engine> Session<'engine> {
             value = Some(canonicalize_client_min_messages(v)?);
         }
         let is_search_path = name == "search_path";
+        if self.current_txn.is_some() {
+            // Record the pre-transaction value once per variable; a plain (session-scoped)
+            // assignment also records the value that survives `COMMIT`. `SET LOCAL` only
+            // changes the live value — both paths revert on `ROLLBACK`.
+            self.txn_gucs
+                .backup
+                .entry(name.clone())
+                .or_insert_with(|| self.variables.get(&name).cloned());
+            if !local {
+                self.txn_gucs.pending.insert(name.clone(), value.clone());
+            }
+        } else if local {
+            // `SET LOCAL` outside a transaction block has no effect (the reference engine
+            // warns and applies nothing — this engine sends no sub-error messages).
+            return Ok(ExecutionResult::VariableSet);
+        }
         match value {
             Some(v) => {
                 self.variables.insert(name, v);
@@ -2057,12 +2104,45 @@ impl<'engine> Session<'engine> {
         })
     }
 
+    /// Settle the transaction-scoped parameter state at transaction end. On `COMMIT` a variable
+    /// whose last write was session-scoped (plain `SET`/`RESET`) keeps that value and everything
+    /// `SET LOCAL` left reverts to its pre-transaction value; on `ROLLBACK` every touched
+    /// variable reverts.
+    fn end_txn_gucs(&mut self, committed: bool) {
+        if self.txn_gucs.backup.is_empty() {
+            self.txn_gucs.pending.clear();
+            return;
+        }
+        let backup = std::mem::take(&mut self.txn_gucs.backup);
+        let pending = std::mem::take(&mut self.txn_gucs.pending);
+        for (name, original) in backup {
+            let settled = if committed {
+                pending.get(&name).cloned().unwrap_or(original)
+            } else {
+                original
+            };
+            match settled {
+                Some(v) => {
+                    self.variables.insert(name, v);
+                },
+                None => {
+                    self.variables.remove(&name);
+                },
+            }
+        }
+        self.current_schema = crate::current_schema_for_search_path(
+            self.variables.get("search_path").map(String::as_str),
+        );
+    }
+
     fn begin(&mut self, characteristics: TxnCharacteristics) -> Result<ExecutionResult, Error> {
         if self.current_txn.is_some() {
             return Err(Error::ActiveTransaction(
                 "nested BEGIN — already inside a transaction".to_owned(),
             ));
         }
+        self.txn_gucs.backup.clear();
+        self.txn_gucs.pending.clear();
         // Explicit BEGIN characteristics win; otherwise fall back to the session defaults.
         let isolation = characteristics.isolation.unwrap_or(self.default_isolation);
         let read_only = characteristics.read_only.unwrap_or(self.default_read_only);
@@ -2107,9 +2187,11 @@ impl<'engine> Session<'engine> {
         if let Err(e) = self.engine.commit(txn) {
             let _ = self.engine.rollback(txn);
             self.txn_read_only = false;
+            self.end_txn_gucs(false);
             return Err(e.into());
         }
         self.txn_read_only = false;
+        self.end_txn_gucs(true);
         Ok(ExecutionResult::TransactionCommitted)
     }
 
@@ -2119,6 +2201,7 @@ impl<'engine> Session<'engine> {
         })?;
         self.engine.rollback(txn)?;
         self.txn_read_only = false;
+        self.end_txn_gucs(false);
         Ok(ExecutionResult::TransactionRolledBack)
     }
 

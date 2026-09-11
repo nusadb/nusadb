@@ -1,0 +1,147 @@
+# SET LOCAL — transaction-scoped parameters. A `SET LOCAL` holds until the transaction ends,
+# then reverts; a plain `SET` inside a transaction survives COMMIT but is undone by ROLLBACK; a
+# later session-scoped SET beats an earlier SET LOCAL at commit. Outside a transaction block,
+# SET LOCAL has no effect.
+
+statement ok
+SET TIME ZONE 'UTC'
+
+statement ok
+BEGIN
+
+statement ok
+SET LOCAL timezone = '+07'
+
+query T
+SHOW timezone
+----
+<+07>-07
+
+statement ok
+COMMIT
+
+query T
+SHOW timezone
+----
+UTC
+
+# Plain SET reverts on ROLLBACK.
+statement ok
+BEGIN
+
+statement ok
+SET timezone = '+03'
+
+statement ok
+ROLLBACK
+
+query T
+SHOW timezone
+----
+UTC
+
+# Plain SET survives COMMIT.
+statement ok
+BEGIN
+
+statement ok
+SET timezone = '+03'
+
+statement ok
+COMMIT
+
+query T
+SHOW timezone
+----
+<+03>-03
+
+# A later session-scoped SET beats an earlier SET LOCAL at commit.
+statement ok
+BEGIN
+
+statement ok
+SET LOCAL timezone = '+07'
+
+statement ok
+SET timezone = '+09'
+
+statement ok
+COMMIT
+
+query T
+SHOW timezone
+----
+<+09>-09
+
+# SET LOCAL outside a transaction block has no effect.
+statement ok
+SET LOCAL timezone = '+05'
+
+query T
+SHOW timezone
+----
+<+09>-09
+
+# SET LOCAL TIME ZONE is the same statement with the alias spelling.
+statement ok
+BEGIN
+
+statement ok
+SET LOCAL TIME ZONE '+07'
+
+query T
+SHOW timezone
+----
+<+07>-07
+
+statement ok
+ROLLBACK
+
+query T
+SHOW timezone
+----
+<+09>-09
+
+# current_setting() tracks the local value too.
+statement ok
+BEGIN
+
+statement ok
+SET LOCAL work_mem = '8MB'
+
+query T
+SELECT current_setting('work_mem')
+----
+8MB
+
+statement ok
+COMMIT
+
+# RESET inside an aborted transaction is undone with it.
+statement ok
+SET client_min_messages = 'warning'
+
+statement ok
+BEGIN
+
+statement ok
+RESET client_min_messages
+
+query T
+SHOW client_min_messages
+----
+notice
+
+statement ok
+ROLLBACK
+
+query T
+SHOW client_min_messages
+----
+warning
+
+statement ok
+RESET client_min_messages
+
+statement ok
+SET TIME ZONE 'UTC'

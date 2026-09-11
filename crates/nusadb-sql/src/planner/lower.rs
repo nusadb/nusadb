@@ -111,7 +111,9 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Savepoint(name) => PhysicalPlan::Savepoint(name),
         LogicalPlan::RollbackToSavepoint(name) => PhysicalPlan::RollbackToSavepoint(name),
         LogicalPlan::ReleaseSavepoint(name) => PhysicalPlan::ReleaseSavepoint(name),
-        LogicalPlan::SetVariable { name, value } => PhysicalPlan::SetVariable { name, value },
+        LogicalPlan::SetVariable { name, value, local } => {
+            PhysicalPlan::SetVariable { name, value, local }
+        },
         LogicalPlan::ShowVariable(name) => PhysicalPlan::ShowVariable(name),
         LogicalPlan::ShowTables => PhysicalPlan::ShowTables,
         LogicalPlan::ShowColumns(schema) => PhysicalPlan::ShowColumns(schema),
