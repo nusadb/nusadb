@@ -22,6 +22,8 @@ use crate::ast;
 
 mod fold;
 mod join;
+
+pub(crate) use join::collect_columns;
 mod lower;
 mod plan_types;
 mod pushdown;

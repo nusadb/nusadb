@@ -565,6 +565,11 @@ fn slt_p1_partition_minmax() {
 }
 
 #[test]
+fn slt_p1_partition_expr_key() {
+    run_slt("tests/slt/p1_ddl/partition_expr_key.slt");
+}
+
+#[test]
 fn slt_p1_partition_list_hash() {
     run_slt("tests/slt/p1_ddl/partition_list_hash.slt");
 }

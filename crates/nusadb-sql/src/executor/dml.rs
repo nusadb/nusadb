@@ -21,7 +21,7 @@ pub(super) fn run_insert(
     let (partition_key, target_is_partition) = if super::partition::has_any(engine, txn)? {
         // Partition metadata is keyed by the schema-qualified name (bare = `public`).
         let table_key = crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name);
-        let key = super::partition::parent_key_columns(engine, txn, &table_key)?;
+        let key = super::partition::parent_key_parts(engine, txn, &table_key)?;
         let is_part = super::partition::partition_parent(engine, txn, &table_key)?.is_some();
         (key, is_part)
     } else {
@@ -122,41 +122,147 @@ pub(super) fn run_insert(
     }
 }
 
-/// For each partition-key column, its value position in an `INSERT`'s target list plus its type in the
-/// table. Used to read each row's key tuple for routing / bound checks. A key column omitted from the
-/// target list is refused (a defaulted/omitted key is not yet routed).
-fn partition_key_loci(
+/// A compiled partition-key slot against an `INSERT`'s value tuple (`plan.columns` order): a
+/// column key's value position, or an expression key's typed evaluator (which runs over a
+/// synthetic full-width row assembled from the provided values).
+enum ValueKeySlot {
+    Column {
+        value_pos: usize,
+        ty: ColumnType,
+    },
+    Expression {
+        typed: crate::planner::TypedExpr,
+        ty: ColumnType,
+        /// The table ordinals the expression reads — each must be provided by the statement.
+        refs: Vec<usize>,
+    },
+}
+
+/// The key column types of compiled value slots.
+fn value_slot_types(slots: &[ValueKeySlot]) -> Vec<ColumnType> {
+    slots
+        .iter()
+        .map(|s| match s {
+            ValueKeySlot::Column { ty, .. } | ValueKeySlot::Expression { ty, .. } => *ty,
+        })
+        .collect()
+}
+
+/// Compile the key parts against an `INSERT`'s provided-value layout. A column key must be
+/// provided explicitly (loud, as before); an expression key requires every column it references
+/// to be provided — routing does not evaluate defaults.
+fn compile_value_key(
     table: &TableSchema,
     columns: &[usize],
-    key_cols: &[String],
-) -> Result<(Vec<usize>, Vec<ColumnType>), Error> {
-    let mut positions = Vec::with_capacity(key_cols.len());
-    let mut types = Vec::with_capacity(key_cols.len());
-    for key_col in key_cols {
-        let ordinal = table
-            .columns
-            .iter()
-            .position(|c| &c.name == key_col)
-            .ok_or_else(|| internal_index(0))?;
-        let ty = table
-            .columns
-            .get(ordinal)
-            .map(|c| c.ty)
-            .ok_or_else(|| internal_index(ordinal))?;
-        let value_pos = columns
-            .iter()
-            .position(|&o| o == ordinal)
-            .ok_or_else(|| Error::Coded {
-                message: format!(
-                    "the partition key \"{key_col}\" must be provided (a defaulted or omitted key is \
-                     not yet routed)"
-                ),
-                sqlstate: "0A000",
-            })?;
-        positions.push(value_pos);
-        types.push(ty);
+    key_parts: &[super::partition::KeyPart],
+) -> Result<Vec<ValueKeySlot>, Error> {
+    let mut slots = Vec::with_capacity(key_parts.len());
+    for part in key_parts {
+        match part {
+            super::partition::KeyPart::Column(key_col) => {
+                let ordinal = table
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == key_col)
+                    .ok_or_else(|| internal_index(0))?;
+                let ty = table
+                    .columns
+                    .get(ordinal)
+                    .map(|c| c.ty)
+                    .ok_or_else(|| internal_index(ordinal))?;
+                let value_pos =
+                    columns
+                        .iter()
+                        .position(|&o| o == ordinal)
+                        .ok_or_else(|| Error::Coded {
+                            message: format!(
+                                "the partition key \"{key_col}\" must be provided (a defaulted or \
+                             omitted key is not yet routed)"
+                            ),
+                            sqlstate: "0A000",
+                        })?;
+                slots.push(ValueKeySlot::Column { value_pos, ty });
+            },
+            super::partition::KeyPart::Expression(sql) => {
+                let typed = crate::analyzer::analyze_index_key_expr(sql, table, &EmptyCatalog)?;
+                let mut refs = Vec::new();
+                crate::planner::collect_columns(&typed, &mut refs);
+                refs.sort_unstable();
+                refs.dedup();
+                if let Some(&missing) = refs.iter().find(|r| !columns.contains(r)) {
+                    let col = table.columns.get(missing).map_or("?", |c| c.name.as_str());
+                    return Err(Error::Coded {
+                        message: format!(
+                            "the partition key expression {sql} references column \"{col}\", \
+                             which must be provided (a defaulted or omitted key input is not yet \
+                             routed)"
+                        ),
+                        sqlstate: "0A000",
+                    });
+                }
+                let ty = typed.ty;
+                slots.push(ValueKeySlot::Expression { typed, ty, refs });
+            },
+        }
     }
-    Ok((positions, types))
+    Ok(slots)
+}
+
+/// The key tuple of one `INSERT` value row under compiled [`ValueKeySlot`]s. `fill` maps each
+/// value position to its table ordinal (`plan.columns`); a full-width row is assembled only when
+/// an expression slot needs one. A referenced value that is a per-row `DEFAULT` placeholder is
+/// refused loudly (routing does not evaluate defaults).
+fn value_key_of_row(
+    slots: &[ValueKeySlot],
+    row: &[Option<ast::Value>],
+    table: &TableSchema,
+    fill: &[usize],
+) -> Result<Vec<ast::Value>, Error> {
+    let mut full: Option<Row> = None;
+    slots
+        .iter()
+        .map(|slot| match slot {
+            ValueKeySlot::Column { value_pos, ty } => row
+                .get(*value_pos)
+                .and_then(Clone::clone)
+                .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, *ty)),
+            ValueKeySlot::Expression { typed, refs, .. } => {
+                if let Some(&hole) = refs.iter().find(|&&r| {
+                    fill.iter()
+                        .position(|&o| o == r)
+                        .and_then(|vp| row.get(vp))
+                        .is_none_or(Option::is_none)
+                }) {
+                    let col = table.columns.get(hole).map_or("?", |c| c.name.as_str());
+                    return Err(Error::Coded {
+                        message: format!(
+                            "the partition key expression references column \"{col}\", whose \
+                             value is DEFAULT here (routing does not evaluate defaults)"
+                        ),
+                        sqlstate: "0A000",
+                    });
+                }
+                if full.is_none() {
+                    let mut assembled = vec![ast::Value::Null; table.columns.len()];
+                    for (value_pos, &ordinal) in fill.iter().enumerate() {
+                        if let Some(Some(v)) = row.get(value_pos)
+                            && let Some(cell) = assembled.get_mut(ordinal)
+                        {
+                            let ty = table
+                                .columns
+                                .get(ordinal)
+                                .map_or(ColumnType::Text, |c| c.ty);
+                            *cell = super::eval::cast_value(v.clone(), ty)?;
+                        }
+                    }
+                    full = Some(assembled);
+                }
+                full.as_ref().map_or(Ok(ast::Value::Null), |assembled| {
+                    super::eval::eval(typed, assembled)
+                })
+            },
+        })
+        .collect()
 }
 
 /// Route each row of an `INSERT` into a range-partitioned parent to the partition whose `[lo, hi)`
@@ -169,14 +275,19 @@ fn partition_key_loci(
 )]
 fn route_partitioned_insert(
     plan: &InsertPlan,
-    key_cols: &[String],
+    key_parts: &[super::partition::KeyPart],
     value_rows: Vec<Vec<Option<ast::Value>>>,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
     const MAX_DEPTH: usize = 64;
-    /// One routing work item: a parent, its key columns, the rows routed to it, and its depth.
-    type RouteLevel = (String, Vec<String>, Vec<Vec<Option<ast::Value>>>, usize);
+    /// One routing work item: a parent, its key parts, the rows routed to it, and its depth.
+    type RouteLevel = (
+        String,
+        Vec<super::partition::KeyPart>,
+        Vec<Vec<Option<ast::Value>>>,
+        usize,
+    );
 
     // Route level by level: bucket the rows under this parent, then re-bucket any bucket whose
     // target is itself a sub-partitioned parent until every bucket is a leaf table. Every level
@@ -185,19 +296,20 @@ fn route_partitioned_insert(
     // DDL cannot create a partition cycle (ATTACH refuses one), but a hand-edited catalog could.
     let mut work: Vec<RouteLevel> = vec![(
         crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name),
-        key_cols.to_vec(),
+        key_parts.to_vec(),
         value_rows,
         0,
     )];
     let mut leaves: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
-    while let Some((parent_name, level_cols, rows, depth)) = work.pop() {
+    while let Some((parent_name, level_parts, rows, depth)) = work.pop() {
         if depth >= MAX_DEPTH {
             return Err(Error::Internal(format!(
                 "partition routing exceeded {MAX_DEPTH} levels under \"{parent_name}\" (cyclic \
                  partition metadata?)"
             )));
         }
-        let (key_pos, key_tys) = partition_key_loci(&plan.table, &plan.columns, &level_cols)?;
+        let slots = compile_value_key(&plan.table, &plan.columns, &level_parts)?;
+        let key_tys = value_slot_types(&slots);
         let partitions = super::partition::partitions_of(engine, txn, &parent_name, &key_tys)?;
         // The catch-all partition (if any) receives every row that matches no other partition's
         // bound, including a key with a NULL element that no range/hash partition can hold.
@@ -211,15 +323,7 @@ fn route_partitioned_insert(
             // Build the key tuple (an omitted/NULL element stays NULL). A matching non-default
             // partition wins; otherwise the row falls to the catch-all — a key no bound matches (a
             // NULL element included) routes there when one exists.
-            let key: Vec<ast::Value> = key_pos
-                .iter()
-                .zip(&key_tys)
-                .map(|(&pos, &ty)| {
-                    row.get(pos)
-                        .and_then(Clone::clone)
-                        .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, ty))
-                })
-                .collect::<Result<_, _>>()?;
+            let key = value_key_of_row(&slots, &row, &plan.table, &plan.columns)?;
             let matched = partitions
                 .iter()
                 .find(|p| super::partition::accepts(&key, &p.bound, &key_tys))
@@ -251,8 +355,8 @@ fn route_partitioned_insert(
         }
         // A bucket whose target is itself a partitioned parent routes on down; a leaf inserts.
         for (target, bucket) in buckets {
-            match super::partition::parent_key_columns(engine, txn, &target)? {
-                Some(sub_cols) => work.push((target, sub_cols, bucket, depth + 1)),
+            match super::partition::parent_key_parts(engine, txn, &target)? {
+                Some(sub_parts) => work.push((target, sub_parts, bucket, depth + 1)),
                 None => match leaves.iter_mut().find(|(name, _)| name == &target) {
                     Some((_, existing)) => existing.extend(bucket),
                     None => leaves.push((target, bucket)),
@@ -349,24 +453,14 @@ fn partition_bound_violations(
         let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
             return Ok(mask);
         };
-        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent)? else {
+        let Some(key_parts) = super::partition::parent_key_parts(engine, txn, &parent)? else {
             return Ok(mask);
         };
-        // Key positions by name in the row layout — a partition takes its parent's columns.
-        let mut key_pos = Vec::with_capacity(key_cols.len());
-        let mut key_tys = Vec::with_capacity(key_cols.len());
-        for key_col in &key_cols {
-            let Some((pos, def)) = table
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.name == *key_col)
-            else {
-                return Ok(mask);
-            };
-            key_pos.push(pos);
-            key_tys.push(def.ty);
-        }
+        // Compile against the row layout — a partition takes its parent's columns.
+        let Some(slots) = super::partition::compile_key_for_row(&key_parts, table)? else {
+            return Ok(mask);
+        };
+        let key_tys = super::partition::slot_types(&slots);
         let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
         else {
             return Ok(mask);
@@ -379,10 +473,7 @@ fn partition_bound_violations(
             Vec::new()
         };
         for (i, new_row) in new_rows.iter().enumerate() {
-            let key: Vec<ast::Value> = key_pos
-                .iter()
-                .map(|&pos| new_row.get(pos).cloned().unwrap_or(ast::Value::Null))
-                .collect();
+            let key = super::partition::key_of_row(&slots, new_row)?;
             let violates = if is_default {
                 siblings.iter().any(|p| {
                     !super::partition::is_default(&p.bound)
@@ -417,10 +508,11 @@ fn enforce_partition_bound(
         let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
             return Ok(());
         };
-        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &parent)? else {
+        let Some(key_parts) = super::partition::parent_key_parts(engine, txn, &parent)? else {
             return Ok(());
         };
-        let (key_pos, key_tys) = partition_key_loci(&plan.table, &plan.columns, &key_cols)?;
+        let slots = compile_value_key(&plan.table, &plan.columns, &key_parts)?;
+        let key_tys = value_slot_types(&slots);
         let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
         else {
             return Ok(());
@@ -433,15 +525,7 @@ fn enforce_partition_bound(
             Vec::new()
         };
         for row in value_rows {
-            let key: Vec<ast::Value> = key_pos
-                .iter()
-                .zip(&key_tys)
-                .map(|(&pos, &ty)| {
-                    row.get(pos)
-                        .and_then(Clone::clone)
-                        .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, ty))
-                })
-                .collect::<Result<_, _>>()?;
+            let key = value_key_of_row(&slots, row, &plan.table, &plan.columns)?;
             let ok = if super::partition::is_default(&bound) {
                 !siblings
                     .iter()
@@ -4499,23 +4583,14 @@ fn route_row_to_leaf(
     const MAX_DEPTH: usize = 64;
     let mut current = crate::analyzer::qualified_display(&root.schema, &root.name);
     for _ in 0..MAX_DEPTH {
-        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &current)? else {
+        let Some(key_parts) = super::partition::parent_key_parts(engine, txn, &current)? else {
             return Ok(current);
         };
-        let mut key = Vec::with_capacity(key_cols.len());
-        let mut key_tys = Vec::with_capacity(key_cols.len());
-        for key_col in &key_cols {
-            let Some((pos, def)) = root
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| &c.name == key_col)
-            else {
-                return Ok(current);
-            };
-            key.push(row.get(pos).cloned().unwrap_or(ast::Value::Null));
-            key_tys.push(def.ty);
-        }
+        let Some(slots) = super::partition::compile_key_for_row(&key_parts, root)? else {
+            return Ok(current);
+        };
+        let key = super::partition::key_of_row(&slots, row)?;
+        let key_tys = super::partition::slot_types(&slots);
         let partitions = super::partition::partitions_of(engine, txn, &current, &key_tys)?;
         let matched = partitions
             .iter()

@@ -379,7 +379,11 @@ pub(super) fn remap_columns(expr: &mut TypedExpr, shift: usize) {
     clippy::too_many_lines,
     reason = "one exhaustive recursion arm per expression variant"
 )]
-pub(super) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "re-exported crate-wide as `planner::collect_columns` for partition-key compilation"
+)]
+pub(crate) fn collect_columns(expr: &TypedExpr, out: &mut Vec<usize>) {
     match &expr.kind {
         TypedExprKind::Column(index) => out.push(*index),
         // An `OuterColumn` indexes an enclosing query's row, not this join's input, so it is not a

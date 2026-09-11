@@ -111,12 +111,28 @@ pub enum PartitionStrategy {
 
 /// `PARTITION BY {RANGE|LIST|HASH} (col, ...)` on a partitioned parent. `RANGE` and `HASH` accept a
 /// multi-column key; `LIST` is single-column (enforced by the analyzer).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartitionBy {
     /// The partitioning strategy.
     pub strategy: PartitionStrategy,
-    /// The partition-key columns, in order (always non-empty).
-    pub columns: Vec<String>,
+    /// The partition-key parts, in order (always non-empty).
+    pub keys: Vec<PartitionKey>,
+}
+
+/// One declared part of a partition key: a plain column, or a parenthesized expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionKey {
+    /// A key column, by name.
+    Column(String),
+    /// A key expression (`PARTITION BY RANGE ((k % 10))`): the converted expression for
+    /// analysis, plus its SQL text for the partition catalog (re-analyzed wherever key values
+    /// are computed, like a stored CHECK predicate).
+    Expression {
+        /// The parsed expression.
+        expr: Box<Expr>,
+        /// Its canonical SQL text, parenthesized.
+        sql: String,
+    },
 }
 
 /// One element of a range-partition bound tuple: a constant expression, or an unbounded marker.

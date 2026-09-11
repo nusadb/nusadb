@@ -515,7 +515,13 @@ ten up, and a multi-column bound can pin the leading column and leave the rest o
 (`42804`), and a bound whose lower side is not strictly below its upper is an empty range
 (`42P17`).
 
-Not accepted: an expression as a partition key, `LIST` with more than one key column,
+A partition key part may also be a parenthesized expression — `PARTITION BY RANGE ((k % 10))`,
+`HASH ((a + b))`, or mixed with columns as in `RANGE (a, (b * 2))`. The expression must be
+stable (a volatile key would route the same row differently each time; `42P17`), every column it
+reads must be provided in the `INSERT` (routing does not evaluate defaults), and a unique
+constraint can never cover an expression key, so declaring one on such a parent is refused.
+
+Not accepted: `LIST` with more than one key column,
 non-literal bounds, a partition declaring its own columns, and
 `CHECK` / `FOREIGN KEY` on a partitioned parent (they would not span partitions).
 
@@ -1825,7 +1831,7 @@ the resident ceiling. See [deployment](deployment.md) before loading a large dat
 
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
-- an expression as a partition key, and `LIST` partitioning over several columns;
+- `LIST` partitioning over several columns;
 - `EXCLUDE` constraints with an operator other than `=`;
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;

@@ -280,11 +280,21 @@ pub(super) fn run_create_table(
     // validates + records its bound and joins the parent's inheritance set (so a query on the parent
     // expands over its partitions).
     if let Some(pb) = &plan.partition_by {
+        let parts: Vec<super::partition::KeyPart> = pb
+            .keys
+            .iter()
+            .map(|k| match k {
+                ast::PartitionKey::Column(name) => super::partition::KeyPart::Column(name.clone()),
+                ast::PartitionKey::Expression { sql, .. } => {
+                    super::partition::KeyPart::Expression(sql.clone())
+                },
+            })
+            .collect();
         super::partition::record_parent(
             engine,
             txn,
             &crate::analyzer::qualified_display(&def.schema, &def.name),
-            &pb.columns,
+            &parts,
             pb.strategy,
         )?;
     }
@@ -432,25 +442,25 @@ fn register_partition(
     // Partition metadata is keyed by the schema-qualified name (bare = `public`) so same-named
     // tables across schemas keep separate partition sets.
     let parent_key = crate::analyzer::qualified_display(&part.parent_schema, &part.parent);
-    let key_columns =
-        partition::parent_key_columns(engine, txn, &parent_key)?.ok_or_else(|| {
-            Error::InvalidStatement(format!(
-                "table \"{}\" is not partitioned, so \"{}\" cannot be a partition of it",
-                part.parent, def.name
-            ))
-        })?;
+    let key_parts = partition::parent_key_parts(engine, txn, &parent_key)?.ok_or_else(|| {
+        Error::InvalidStatement(format!(
+            "table \"{}\" is not partitioned, so \"{}\" cannot be a partition of it",
+            part.parent, def.name
+        ))
+    })?;
     let strategy = partition::parent_strategy(engine, txn, &parent_key)?.unwrap_or_default();
-    // Resolve each key column's type from the partition's (parent-derived) columns.
-    let key_tys = key_columns
-        .iter()
-        .map(|kc| {
-            def.columns
-                .iter()
-                .find(|c| &c.name == kc)
-                .map(|c| c.ty)
-                .ok_or_else(|| internal_index(0))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Resolve each key part's type against the new partition's (parent-derived) columns — the
+    // table exists by now on both the CREATE and ATTACH paths, so an expression key analyzes
+    // against its real schema.
+    let part_schema = engine
+        .lookup_table_as_of_in(txn, &def.schema, &def.name)?
+        .ok_or_else(|| Error::TableNotFound {
+            name: def.name.clone(),
+        })?;
+    let key_tys = match partition::compile_key_for_row(&key_parts, &part_schema)? {
+        Some(slots) => partition::slot_types(&slots),
+        None => return Err(internal_index(0)),
+    };
     let mismatch = |want: &str| {
         Error::InvalidStatement(format!(
             "partition \"{}\" bound does not match parent \"{}\"'s {want} strategy",
@@ -612,26 +622,15 @@ fn validate_attach_rows(
     let mut current = crate::analyzer::qualified_display(&partition.schema, &partition.name);
     let mut level_parent = crate::analyzer::qualified_display(&parent.schema, &parent.name);
     for _ in 0..MAX_DEPTH {
-        let Some(key_cols) = super::partition::parent_key_columns(engine, txn, &level_parent)?
+        let Some(key_parts) = super::partition::parent_key_parts(engine, txn, &level_parent)?
         else {
             return Ok(());
         };
-        // Locate each key column and its type in the attached table (all levels share its columns).
-        let mut key_pos = Vec::with_capacity(key_cols.len());
-        let mut key_tys = Vec::with_capacity(key_cols.len());
-        for kc in &key_cols {
-            let Some((i, ty)) = partition
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| &c.name == kc)
-                .map(|(i, c)| (i, c.ty))
-            else {
-                return Ok(());
-            };
-            key_pos.push(i);
-            key_tys.push(ty);
-        }
+        // Compile against the attached table (all levels share its columns).
+        let Some(slots) = super::partition::compile_key_for_row(&key_parts, partition)? else {
+            return Ok(());
+        };
+        let key_tys = super::partition::slot_types(&slots);
         let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
         else {
             return Ok(());
@@ -644,10 +643,7 @@ fn validate_attach_rows(
             Vec::new()
         };
         for row in &rows {
-            let key: Vec<ast::Value> = key_pos
-                .iter()
-                .map(|&i| row.get(i).cloned().unwrap_or(ast::Value::Null))
-                .collect();
+            let key = super::partition::key_of_row(&slots, row)?;
             let ok = if super::partition::is_default(&bound) {
                 !siblings
                     .iter()

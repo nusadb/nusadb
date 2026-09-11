@@ -171,17 +171,31 @@ fn convert_partition_by(expr: &sql::Expr) -> Result<ast::PartitionBy, Error> {
     if list.args.is_empty() {
         return unsupported("PARTITION BY needs at least one key column");
     }
-    let mut columns = Vec::with_capacity(list.args.len());
+    let mut keys = Vec::with_capacity(list.args.len());
     for arg in &list.args {
-        let sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Identifier(col))) = arg
-        else {
-            return unsupported(
-                "PARTITION BY supports simple key columns only (not an expression key)",
-            );
+        let sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(expr)) = arg else {
+            return unsupported("PARTITION BY with a named or wildcard argument");
         };
-        columns.push(fold_ident(col));
+        keys.push(match expr {
+            sql::Expr::Identifier(col) => ast::PartitionKey::Column(fold_ident(col)),
+            // An expression key: the reference grammar takes a bare column, a function call, or
+            // a parenthesized expression (`PARTITION BY RANGE ((k % 10))`) — a bare `k % 10`
+            // stays refused. The SQL text is kept for the partition catalog; re-analyzed
+            // wherever key values are computed.
+            other @ (sql::Expr::Nested(_) | sql::Expr::Function(_)) => {
+                ast::PartitionKey::Expression {
+                    expr: Box::new(convert_expr(other.clone())?),
+                    sql: other.to_string(),
+                }
+            },
+            _ => {
+                return unsupported(
+                    "PARTITION BY key must be a column, a function call, or a parenthesized                      expression",
+                );
+            },
+        });
     }
-    Ok(ast::PartitionBy { strategy, columns })
+    Ok(ast::PartitionBy { strategy, keys })
 }
 
 /// Convert `PARTITION OF parent FOR VALUES ...` into a bound (`FROM..TO` → range, `IN` → list,

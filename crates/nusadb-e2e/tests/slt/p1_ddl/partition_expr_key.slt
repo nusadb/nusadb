@@ -1,0 +1,101 @@
+# Expression partition keys: PARTITION BY RANGE ((k % 10)) routes by the expression's value,
+# re-evaluated on UPDATE (row movement). Every column an expression reads must be provided in
+# the INSERT (routing does not evaluate defaults), a volatile expression is refused, and a
+# unique constraint can never cover an expression key.
+
+statement ok
+CREATE TABLE ek (k INT, v TEXT) PARTITION BY RANGE ((k % 10))
+
+statement ok
+CREATE TABLE ek_lo PARTITION OF ek FOR VALUES FROM (0) TO (5)
+
+statement ok
+CREATE TABLE ek_hi PARTITION OF ek FOR VALUES FROM (5) TO (10)
+
+statement ok
+INSERT INTO ek VALUES (3, 'a'), (12, 'b'), (7, 'c'), (26, 'd')
+
+# 12 % 10 = 2 -> ek_lo; 26 % 10 = 6 -> ek_hi.
+query I
+SELECT k FROM ek_lo ORDER BY k
+----
+3
+12
+
+query I
+SELECT k FROM ek_hi ORDER BY k
+----
+7
+26
+
+# UPDATE re-evaluates the expression and moves the row: 12 -> 17 lands in ek_hi (17 % 10 = 7).
+statement ok
+UPDATE ek SET k = 17 WHERE k = 12
+
+query I
+SELECT k FROM ek_hi ORDER BY k
+----
+7
+17
+26
+
+# The parent still sees every row through a filter (pruning stays correct with expression keys).
+query I
+SELECT count(*) FROM ek WHERE k >= 7
+----
+3
+
+# HASH over an expression.
+statement ok
+CREATE TABLE eh (a INT, b INT) PARTITION BY HASH ((a + b))
+
+statement ok
+CREATE TABLE eh0 PARTITION OF eh FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+
+statement ok
+CREATE TABLE eh1 PARTITION OF eh FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+
+statement ok
+INSERT INTO eh VALUES (1, 2), (2, 1), (3, 3)
+
+query I
+SELECT count(*) FROM eh
+----
+3
+
+# (1,2) and (2,1) share a key value (3), so they land in the same leaf.
+query I
+SELECT count(DISTINCT tbl) FROM (
+  SELECT CASE WHEN a + b = 3 THEN 'x' ELSE 'y' END AS tbl FROM eh
+) s
+----
+2
+
+# Mixed column + expression key.
+statement ok
+CREATE TABLE emix (a INT, b INT) PARTITION BY RANGE (a, (b * 2))
+
+statement ok
+CREATE TABLE emix1 PARTITION OF emix FOR VALUES FROM (1, 0) TO (1, 10)
+
+statement ok
+INSERT INTO emix VALUES (1, 4)
+
+statement error
+INSERT INTO emix VALUES (1, 5)
+
+query I
+SELECT count(*) FROM emix1
+----
+1
+
+# A volatile key expression is refused.
+statement error
+CREATE TABLE ev (k INT) PARTITION BY RANGE ((k + (random() * 0)::INT))
+
+# A unique constraint can never cover an expression key.
+statement error
+CREATE TABLE eu (k INT PRIMARY KEY) PARTITION BY RANGE ((k % 10))
+
+statement ok
+DROP TABLE ek, eh, emix CASCADE

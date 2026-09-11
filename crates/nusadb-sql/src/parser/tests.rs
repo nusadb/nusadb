@@ -153,13 +153,22 @@ fn exclude_equality_constraint_rewrites_to_unique() {
 
 #[test]
 fn create_table_partition_range_parses_and_guards() {
-    // `PARTITION BY {RANGE|LIST|HASH} (col, ...)` captures the strategy + key columns.
+    // `PARTITION BY {RANGE|LIST|HASH} (part, ...)` captures the strategy + key parts (a plain
+    // column by name, an expression by its SQL text).
     let strat = |sql: &str| -> (ast::PartitionStrategy, Vec<String>) {
         let ast::Statement::CreateTable(ct) = ok(sql) else {
             panic!("expected CreateTable");
         };
         let pb = ct.partition_by.expect("partition_by");
-        (pb.strategy, pb.columns)
+        let keys = pb
+            .keys
+            .iter()
+            .map(|k| match k {
+                ast::PartitionKey::Column(name) => name.clone(),
+                ast::PartitionKey::Expression { sql, .. } => sql.clone(),
+            })
+            .collect();
+        (pb.strategy, keys)
     };
     assert_eq!(
         strat("CREATE TABLE m (id INT, r INT) PARTITION BY RANGE (r)"),
@@ -180,6 +189,11 @@ fn create_table_partition_range_parses_and_guards() {
     assert_eq!(
         strat("CREATE TABLE m (id INT) PARTITION BY HASH (id)").0,
         ast::PartitionStrategy::Hash
+    );
+    // An expression key keeps its parenthesized SQL text.
+    assert_eq!(
+        strat("CREATE TABLE m (k INT) PARTITION BY RANGE ((k % 10))"),
+        (ast::PartitionStrategy::Range, vec!["(k % 10)".to_owned()])
     );
 
     // `PARTITION OF parent FOR VALUES ...` captures the parent + a bound of the matching kind.
@@ -5587,9 +5601,11 @@ fn create_temporary_table_as_select_is_rejected() {
 
 #[test]
 fn create_table_partition_by_rejects_bad_forms() {
-    // RANGE/LIST/HASH parse (including a multi-column RANGE/HASH key); an unknown strategy and an
-    // expression key are refused.
+    // RANGE/LIST/HASH parse (including a multi-column RANGE/HASH key); an unknown strategy is
+    // refused, and an expression key needs its own parentheses (the reference grammar) — a bare
+    // `id + 1` stays refused.
     assert!(parse("CREATE TABLE t (a INT, b INT) PARTITION BY RANGE (a, b)").is_ok());
+    assert!(parse("CREATE TABLE t (id INT) PARTITION BY RANGE ((id + 1))").is_ok());
     assert!(matches!(
         parse("CREATE TABLE t (id INT) PARTITION BY GiST (id)"),
         Err(Error::Unsupported(_)),

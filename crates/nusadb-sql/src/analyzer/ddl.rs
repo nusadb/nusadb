@@ -80,7 +80,7 @@ pub(super) fn analyze_create_table(
     // Both may be present: `PARTITION OF top ... PARTITION BY RANGE (col)` declares a sub-partitioned
     // mid-level parent (it is a partition of `top` and itself partitions on `col`).
     let partition_of = resolve_partition_of(&mut ct, catalog)?;
-    let partition_by = resolve_partition_by(&ct)?;
+    let partition_by = resolve_partition_by(&ct, catalog)?;
     // An unqualified CREATE targets the session's current schema; an explicit qualifier wins. A
     // temporary table instead targets the session's non-durable temp schema — which does NOT change
     // `current_schema`, so a plain CREATE alongside it still lands in the search-path schema.
@@ -137,7 +137,15 @@ pub(super) fn analyze_create_table(
     // engine's rule and error class for the excluded case.
     if let Some(pb) = &partition_by {
         for uc in &unique_constraints {
-            if let Some(missing) = pb.columns.iter().find(|k| !uc.columns.contains(k)) {
+            // An expression key can never be a constraint column, so any unique constraint on an
+            // expression-keyed parent is refused with the same class.
+            let missing = pb.keys.iter().find_map(|k| match k {
+                ast::PartitionKey::Column(name) => {
+                    (!uc.columns.contains(name)).then_some(name.as_str())
+                },
+                ast::PartitionKey::Expression { sql, .. } => Some(sql.as_str()),
+            });
+            if let Some(missing) = missing {
                 return Err(Error::Coded {
                     message: format!(
                         "unique constraint on partitioned table must include all partitioning \
@@ -169,24 +177,44 @@ pub(super) fn analyze_create_table(
     })
 }
 
-/// Validate a `PARTITION BY {RANGE|LIST|HASH} (col)` key: the column must be one of the table's
-/// declared columns. Returns the strategy + key column (or `None` for a non-partitioned table).
-fn resolve_partition_by(ct: &ast::CreateTable) -> Result<Option<ast::PartitionBy>, Error> {
+/// Validate a `PARTITION BY {RANGE|LIST|HASH} (part, ...)` key: a column part must be one of the
+/// table's declared columns; an expression part must type-check against them and be stable —
+/// a volatile key would route the same row differently on every evaluation. Returns the strategy
+/// + key parts (or `None` for a non-partitioned table).
+fn resolve_partition_by(
+    ct: &ast::CreateTable,
+    catalog: &dyn Catalog,
+) -> Result<Option<ast::PartitionBy>, Error> {
     let Some(pb) = &ct.partition_by else {
         return Ok(None);
     };
     // A list-partitioned table has a single key column (the reference engine's rule).
-    if pb.strategy == ast::PartitionStrategy::List && pb.columns.len() != 1 {
+    if pb.strategy == ast::PartitionStrategy::List && pb.keys.len() != 1 {
         return Err(Error::Unsupported(
             "LIST partitioning supports a single key column".to_owned(),
         ));
     }
-    for column in &pb.columns {
-        if !ct.columns.iter().any(|c| &c.name == column) {
-            return Err(Error::ColumnNotFound {
-                table: ct.name.clone(),
-                column: column.clone(),
-            });
+    let scope = create_table_scope(ct);
+    for key in &pb.keys {
+        match key {
+            ast::PartitionKey::Column(column) => {
+                if !ct.columns.iter().any(|c| &c.name == column) {
+                    return Err(Error::ColumnNotFound {
+                        table: ct.name.clone(),
+                        column: column.clone(),
+                    });
+                }
+            },
+            ast::PartitionKey::Expression { expr, .. } => {
+                let typed = analyze_expr(expr, &scope, catalog, None)?;
+                if !super::expr_is_ivm_stable(&typed) {
+                    return Err(Error::Coded {
+                        message: "functions in partition key expression must be marked IMMUTABLE"
+                            .to_owned(),
+                        sqlstate: "42P17", // invalid_object_definition
+                    });
+                }
+            },
         }
     }
     Ok(Some(pb.clone()))

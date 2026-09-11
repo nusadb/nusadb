@@ -29,6 +29,109 @@ const KEY_SEP: char = '\u{1f}';
 ///   `kind` is `range`/`list`/`hash`/`default` and `payload` encodes the bound (see [`encode_payload`]).
 const PARTITION_CATALOG_SCHEMA: [ColumnType; 5] = [ColumnType::Text; 5];
 
+/// One declared part of a partition key: a plain column (by name), or a parenthesized
+/// expression stored as canonical SQL — re-analyzed against the table's columns wherever key
+/// values are computed, exactly like a stored CHECK predicate.
+#[derive(Clone)]
+pub(super) enum KeyPart {
+    Column(String),
+    Expression(String),
+}
+
+/// Marker prefixing an expression part in the catalog's `aux` field (a control character never
+/// starts an identifier, so the two entry kinds cannot collide).
+const EXPR_MARK: char = '\u{2}';
+
+impl KeyPart {
+    fn encode(&self) -> String {
+        match self {
+            Self::Column(name) => name.clone(),
+            Self::Expression(sql) => format!("{EXPR_MARK}{sql}"),
+        }
+    }
+
+    fn decode(entry: &str) -> Self {
+        entry.strip_prefix(EXPR_MARK).map_or_else(
+            || Self::Column(entry.to_owned()),
+            |sql| Self::Expression(sql.to_owned()),
+        )
+    }
+
+    /// The single-string view: a column's name, or an expression's SQL text (which can never
+    /// collide with an identifier — pruning and is-partitioned checks key off this).
+    pub(super) fn display(&self) -> &str {
+        match self {
+            Self::Column(name) => name,
+            Self::Expression(sql) => sql,
+        }
+    }
+}
+
+/// A compiled partition-key slot against a table's full row layout: a column's ordinal, or an
+/// expression analyzed to a typed evaluator.
+pub(super) enum KeySlot {
+    Column {
+        pos: usize,
+        ty: ColumnType,
+    },
+    Expression {
+        typed: crate::planner::TypedExpr,
+        ty: ColumnType,
+    },
+}
+
+/// Compile `parts` against `table`'s full row layout. `None` when a named key column is absent
+/// from the table (the caller treats the table as not participating, as before).
+pub(super) fn compile_key_for_row(
+    parts: &[KeyPart],
+    table: &TableSchema,
+) -> Result<Option<Vec<KeySlot>>, Error> {
+    let mut slots = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            KeyPart::Column(name) => {
+                let Some((pos, def)) = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| &c.name == name)
+                else {
+                    return Ok(None);
+                };
+                slots.push(KeySlot::Column { pos, ty: def.ty });
+            },
+            KeyPart::Expression(sql) => {
+                let typed =
+                    crate::analyzer::analyze_index_key_expr(sql, table, &super::dml::EmptyCatalog)?;
+                let ty = typed.ty;
+                slots.push(KeySlot::Expression { typed, ty });
+            },
+        }
+    }
+    Ok(Some(slots))
+}
+
+/// The key column types of compiled slots (an expression slot's type is its result type).
+pub(super) fn slot_types(slots: &[KeySlot]) -> Vec<ColumnType> {
+    slots
+        .iter()
+        .map(|s| match s {
+            KeySlot::Column { ty, .. } | KeySlot::Expression { ty, .. } => *ty,
+        })
+        .collect()
+}
+
+/// The key tuple of one full-width row under the compiled slots.
+pub(super) fn key_of_row(slots: &[KeySlot], row: &Row) -> Result<Vec<ast::Value>, Error> {
+    slots
+        .iter()
+        .map(|s| match s {
+            KeySlot::Column { pos, .. } => Ok(row.get(*pos).cloned().unwrap_or(ast::Value::Null)),
+            KeySlot::Expression { typed, .. } => super::eval::eval(typed, row),
+        })
+        .collect()
+}
+
 /// One element of a range bound tuple: a concrete value, or an unbounded marker. `Min`
 /// (`MINVALUE`) sorts below every value and `Max` (`MAXVALUE`) above, so a marker opens that
 /// side of the range; every element after a marker repeats it (enforced at parse).
@@ -82,14 +185,19 @@ pub(super) fn record_parent(
     engine: &dyn StorageEngine,
     txn: TxnId,
     parent: &str,
-    key_columns: &[String],
+    key_parts: &[KeyPart],
     strategy: ast::PartitionStrategy,
 ) -> Result<(), Error> {
     let cat = ensure_catalog(engine, txn)?;
+    let aux = key_parts
+        .iter()
+        .map(KeyPart::encode)
+        .collect::<Vec<_>>()
+        .join(&KEY_SEP.to_string());
     let row = [
         text("parent"),
         text(parent),
-        text(&key_columns.join(&KEY_SEP.to_string())),
+        text(&aux),
         text(strategy_str(strategy)),
         text(""),
     ];
@@ -128,21 +236,33 @@ pub(super) fn has_any(engine: &dyn StorageEngine, txn: TxnId) -> Result<bool, Er
     Ok(engine.scan(txn, cat.id)?.try_next()?.is_some())
 }
 
-/// The partition key columns of `table` if it is a partitioned parent, else `None` (always non-empty
-/// when `Some`).
+/// The partition key parts of `table` if it is a partitioned parent, else `None` (always
+/// non-empty when `Some`).
+pub(super) fn parent_key_parts(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: &str,
+) -> Result<Option<Vec<KeyPart>>, Error> {
+    for row in rows(engine, txn)? {
+        if field(&row, 0) == "parent" && field(&row, 1) == table {
+            return Ok(Some(
+                field(&row, 2).split(KEY_SEP).map(KeyPart::decode).collect(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// The single-string view of [`parent_key_parts`]: a column's name, or an expression's SQL text.
+/// Kept for the is-partitioned checks and pruning-constraint matching (an expression's text never
+/// collides with a column identifier, so a WHERE predicate simply never maps onto it).
 pub(super) fn parent_key_columns(
     engine: &dyn StorageEngine,
     txn: TxnId,
     table: &str,
 ) -> Result<Option<Vec<String>>, Error> {
-    for row in rows(engine, txn)? {
-        if field(&row, 0) == "parent" && field(&row, 1) == table {
-            return Ok(Some(
-                field(&row, 2).split(KEY_SEP).map(str::to_owned).collect(),
-            ));
-        }
-    }
-    Ok(None)
+    Ok(parent_key_parts(engine, txn, table)?
+        .map(|parts| parts.iter().map(|p| p.display().to_owned()).collect()))
 }
 
 /// The strategy string of `table` if it is a partitioned parent, else `None`.

@@ -1381,7 +1381,7 @@ fn ivm_base_table(body: &SelectPlan) -> Option<String> {
 /// the same value for the same base row. Rejects subqueries, correlated/aggregate references, scalar
 /// UDFs (which may be non-deterministic), set-returning calls, and volatile built-ins (`NOW`,
 /// `RANDOM`, `gen_random_uuid`, session functions, …); recurses through every other node's children.
-fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
+pub(super) fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
     use crate::planner::TypedExprKind as K;
     match &expr.kind {
         K::Literal(_) | K::Column(_) => true,
