@@ -470,24 +470,35 @@ fn register_partition(
                     key_tys.len()
                 )));
             }
-            let cast_tuple = |vals: &[ast::Value]| -> Result<Vec<ast::Value>, Error> {
-                vals.iter()
-                    .zip(&key_tys)
-                    .map(|(v, ty)| super::eval::cast_value(v.clone(), *ty))
-                    .collect()
-            };
-            let lo = cast_tuple(from)?;
-            let hi = cast_tuple(to)?;
-            if partition::compare_tuple(&lo, &hi) != Ordering::Less {
-                return Err(Error::InvalidStatement(format!(
-                    "partition \"{}\" lower bound must be strictly below the upper bound",
-                    def.name
-                )));
+            let cast_edges =
+                |edges: &[crate::planner::RangeEdgePlan]| -> Result<Vec<partition::RangeEdge>, Error> {
+                    edges
+                        .iter()
+                        .zip(&key_tys)
+                        .map(|(e, ty)| {
+                            Ok(match e {
+                                crate::planner::RangeEdgePlan::Value(v) => partition::RangeEdge::Value(
+                                    super::eval::cast_value(v.clone(), *ty)?,
+                                ),
+                                crate::planner::RangeEdgePlan::MinValue => partition::RangeEdge::Min,
+                                crate::planner::RangeEdgePlan::MaxValue => partition::RangeEdge::Max,
+                            })
+                        })
+                        .collect()
+                };
+            let lo = cast_edges(from)?;
+            let hi = cast_edges(to)?;
+            if partition::compare_edge_tuples(&lo, &hi) != Ordering::Less {
+                // The reference engine's shape: an empty `[lo, hi)` is `42P17`.
+                return Err(Error::Coded {
+                    message: format!("empty range bound specified for partition \"{}\"", def.name),
+                    sqlstate: "42P17", // invalid_object_definition
+                });
             }
             for e in &existing {
                 if let PartitionBound::Range { lo: elo, hi: ehi } = &e.bound {
-                    let disjoint = partition::compare_tuple(&hi, elo) != Ordering::Greater
-                        || partition::compare_tuple(&lo, ehi) != Ordering::Less;
+                    let disjoint = partition::compare_edge_tuples(&hi, elo) != Ordering::Greater
+                        || partition::compare_edge_tuples(&lo, ehi) != Ordering::Less;
                     if !disjoint {
                         return Err(overlap_err(&def.name, &e.table));
                     }

@@ -119,6 +119,20 @@ pub struct PartitionBy {
     pub columns: Vec<String>,
 }
 
+/// One element of a range-partition bound tuple: a constant expression, or an unbounded marker.
+///
+/// `MINVALUE` sorts below every value and `MAXVALUE` above, so `FROM (MINVALUE)` opens the range
+/// downward and `TO (MAXVALUE)` upward. Every element after a marker must repeat that marker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeBoundValue {
+    /// A constant bound expression.
+    Expr(Expr),
+    /// `MINVALUE` — below every value.
+    MinValue,
+    /// `MAXVALUE` — above every value.
+    MaxValue,
+}
+
 /// The bound of a partition, matching its parent's strategy.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionBound {
@@ -126,9 +140,9 @@ pub enum PartitionBound {
     /// (lexicographically) for a multi-column key. Each side has one value per key column.
     Range {
         /// Inclusive lower bound, one value per key column.
-        from: Vec<Expr>,
+        from: Vec<RangeBoundValue>,
         /// Exclusive upper bound, one value per key column.
-        to: Vec<Expr>,
+        to: Vec<RangeBoundValue>,
     },
     /// `FOR VALUES IN (v, ...)` — the explicit key values this partition holds.
     List(Vec<Expr>),

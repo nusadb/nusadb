@@ -560,6 +560,11 @@ fn slt_p1_partition_range() {
 }
 
 #[test]
+fn slt_p1_partition_minmax() {
+    run_slt("tests/slt/p1_ddl/partition_minmax.slt");
+}
+
+#[test]
 fn slt_p1_partition_list_hash() {
     run_slt("tests/slt/p1_ddl/partition_list_hash.slt");
 }

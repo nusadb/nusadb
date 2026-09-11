@@ -739,16 +739,28 @@ pub struct PartitionOfPlan {
     pub bound: PartitionBoundPlan,
 }
 
+/// One element of a resolved range-partition bound tuple: a constant, or an unbounded marker
+/// (`MINVALUE` sorts below every value, `MAXVALUE` above).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeEdgePlan {
+    /// A constant bound value.
+    Value(crate::ast::Value),
+    /// `MINVALUE` — below every value.
+    MinValue,
+    /// `MAXVALUE` — above every value.
+    MaxValue,
+}
+
 /// A resolved partition bound (literals coerced to the key column type by the executor).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionBoundPlan {
     /// `[from, to)` key range, compared as a tuple for a multi-column key. Each side has one literal
     /// per key column.
     Range {
-        /// Inclusive lower bound, one literal per key column.
-        from: Vec<crate::ast::Value>,
-        /// Exclusive upper bound, one literal per key column.
-        to: Vec<crate::ast::Value>,
+        /// Inclusive lower bound, one element per key column.
+        from: Vec<RangeEdgePlan>,
+        /// Exclusive upper bound, one element per key column.
+        to: Vec<RangeEdgePlan>,
     },
     /// The explicit key value set this partition holds.
     List(Vec<crate::ast::Value>),

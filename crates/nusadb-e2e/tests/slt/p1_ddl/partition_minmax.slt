@@ -1,0 +1,115 @@
+# MINVALUE / MAXVALUE range-partition bounds: a marker opens that side of the range (MINVALUE
+# below every value, MAXVALUE above), every element after a marker must repeat it, and an empty
+# range (lo >= hi) is refused.
+
+statement ok
+CREATE TABLE pmm (k INT, v TEXT) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE pmm_low PARTITION OF pmm FOR VALUES FROM (MINVALUE) TO (0)
+
+statement ok
+CREATE TABLE pmm_mid PARTITION OF pmm FOR VALUES FROM (0) TO (10)
+
+statement ok
+CREATE TABLE pmm_high PARTITION OF pmm FOR VALUES FROM (10) TO (MAXVALUE)
+
+statement ok
+INSERT INTO pmm VALUES (-100, 'a'), (-1, 'b'), (0, 'c'), (9, 'd'), (10, 'e'), (100000, 'f')
+
+query IT
+SELECT k, v FROM pmm_low ORDER BY k
+----
+-100 a
+-1 b
+
+query IT
+SELECT k, v FROM pmm_mid ORDER BY k
+----
+0 c
+9 d
+
+query IT
+SELECT k, v FROM pmm_high ORDER BY k
+----
+10 e
+100000 f
+
+# Row movement across an unbounded partition still works.
+statement ok
+UPDATE pmm SET k = -5 WHERE k = 9
+
+query I
+SELECT k FROM pmm_low ORDER BY k
+----
+-100
+-5
+-1
+
+# Overlap with an unbounded side is caught.
+statement error
+CREATE TABLE pmm_bad PARTITION OF pmm FOR VALUES FROM (MINVALUE) TO (-50)
+
+# An empty range (lower not strictly below upper) is refused.
+statement error
+CREATE TABLE pmm_empty PARTITION OF pmm FOR VALUES FROM (MAXVALUE) TO (MAXVALUE)
+
+# A fully-open partition covers everything.
+statement ok
+CREATE TABLE pall (k INT) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE pall_all PARTITION OF pall FOR VALUES FROM (MINVALUE) TO (MAXVALUE)
+
+statement ok
+INSERT INTO pall VALUES (42), (-42)
+
+query I
+SELECT count(*) FROM pall_all
+----
+2
+
+# Multi-column: a bound may pin the leading column and leave the rest open; every element after
+# a marker must repeat that marker.
+statement ok
+CREATE TABLE pmc (a INT, b INT) PARTITION BY RANGE (a, b)
+
+statement ok
+CREATE TABLE pmc_one PARTITION OF pmc FOR VALUES FROM (1, MINVALUE) TO (1, MAXVALUE)
+
+statement ok
+CREATE TABLE pmc_next PARTITION OF pmc FOR VALUES FROM (2, MINVALUE) TO (3, MAXVALUE)
+
+statement ok
+INSERT INTO pmc VALUES (1, -999), (1, 999), (2, 5), (3, 5)
+
+query I
+SELECT count(*) FROM pmc_one
+----
+2
+
+query I
+SELECT count(*) FROM pmc_next
+----
+2
+
+statement error
+CREATE TABLE pmc_bad PARTITION OF pmc FOR VALUES FROM (MINVALUE, 0) TO (5, 5)
+
+# DETACH then re-ATTACH keeps the marker bound intact.
+statement ok
+ALTER TABLE pmm DETACH PARTITION pmm_high
+
+statement ok
+ALTER TABLE pmm ATTACH PARTITION pmm_high FOR VALUES FROM (10) TO (MAXVALUE)
+
+statement ok
+INSERT INTO pmm VALUES (99999, 'g')
+
+query I
+SELECT count(*) FROM pmm_high
+----
+3
+
+statement ok
+DROP TABLE pmm, pall, pmc CASCADE

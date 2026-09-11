@@ -185,8 +185,9 @@ fn convert_partition_by(expr: &sql::Expr) -> Result<ast::PartitionBy, Error> {
 }
 
 /// Convert `PARTITION OF parent FOR VALUES ...` into a bound (`FROM..TO` → range, `IN` → list,
-/// `WITH (MODULUS/REMAINDER)` → hash, `DEFAULT` → the catch-all). `MINVALUE`/`MAXVALUE` and
-/// multi-column bounds are rejected loudly.
+/// `WITH (MODULUS/REMAINDER)` → hash, `DEFAULT` → the catch-all). A range bound element may be
+/// `MINVALUE`/`MAXVALUE`; every element after a marker must repeat that marker (the reference
+/// engine's `42804`).
 fn convert_partition_of(
     parent: Option<&sql::ObjectName>,
     for_values: Option<&sql::ForValues>,
@@ -199,24 +200,48 @@ fn convert_partition_of(
     };
     let bound = match for_values {
         sql::ForValues::From { from, to } => {
-            // Each side is one value per key column; every value must be a plain literal expression
-            // (MINVALUE/MAXVALUE unbounded markers are not supported).
-            let tuple = |bounds: &[sql::PartitionBoundValue],
-                         which: &str|
-             -> Result<Vec<ast::Expr>, Error> {
-                bounds
-                    .iter()
-                    .map(|b| match b {
-                        sql::PartitionBoundValue::Expr(expr) => convert_expr(expr.clone()),
-                        _ => unsupported(&format!(
-                            "PARTITION OF range {which} bound does not support MINVALUE/MAXVALUE"
-                        )),
-                    })
-                    .collect()
-            };
+            // Each side is one value per key column: a plain literal expression, or an unbounded
+            // MINVALUE/MAXVALUE marker. Once a marker appears, every following element must repeat
+            // the same marker — otherwise the trailing values would silently never matter.
+            let tuple =
+                |bounds: &[sql::PartitionBoundValue]| -> Result<Vec<ast::RangeBoundValue>, Error> {
+                    let mut out = Vec::with_capacity(bounds.len());
+                    let mut marker: Option<&sql::PartitionBoundValue> = None;
+                    for b in bounds {
+                        if let Some(m) = marker
+                            && b != m
+                        {
+                            let name = if matches!(m, sql::PartitionBoundValue::MinValue) {
+                                "MINVALUE"
+                            } else {
+                                "MAXVALUE"
+                            };
+                            return Err(Error::Coded {
+                                message: format!(
+                                    "every bound following {name} must also be {name}"
+                                ),
+                                sqlstate: "42804", // datatype_mismatch — the reference engine's class
+                            });
+                        }
+                        out.push(match b {
+                            sql::PartitionBoundValue::Expr(expr) => {
+                                ast::RangeBoundValue::Expr(convert_expr(expr.clone())?)
+                            },
+                            sql::PartitionBoundValue::MinValue => {
+                                marker = Some(b);
+                                ast::RangeBoundValue::MinValue
+                            },
+                            sql::PartitionBoundValue::MaxValue => {
+                                marker = Some(b);
+                                ast::RangeBoundValue::MaxValue
+                            },
+                        });
+                    }
+                    Ok(out)
+                };
             ast::PartitionBound::Range {
-                from: tuple(from, "lower")?,
-                to: tuple(to, "upper")?,
+                from: tuple(from)?,
+                to: tuple(to)?,
             }
         },
         sql::ForValues::In(values) => {

@@ -29,13 +29,24 @@ const KEY_SEP: char = '\u{1f}';
 ///   `kind` is `range`/`list`/`hash`/`default` and `payload` encodes the bound (see [`encode_payload`]).
 const PARTITION_CATALOG_SCHEMA: [ColumnType; 5] = [ColumnType::Text; 5];
 
+/// One element of a range bound tuple: a concrete value, or an unbounded marker. `Min`
+/// (`MINVALUE`) sorts below every value and `Max` (`MAXVALUE`) above, so a marker opens that
+/// side of the range; every element after a marker repeats it (enforced at parse).
+#[derive(Clone, PartialEq)]
+pub(super) enum RangeEdge {
+    Value(ast::Value),
+    Min,
+    Max,
+}
+
 /// A partition's bound (values already coerced to the key column types).
 #[derive(Clone)]
 pub(super) enum PartitionBound {
-    /// `[lo, hi)` — a key tuple `k` belongs when `lo <= k < hi` (lexicographic tuple order).
+    /// `[lo, hi)` — a key tuple `k` belongs when `lo <= k < hi` (lexicographic tuple order,
+    /// with `Min`/`Max` markers below/above everything).
     Range {
-        lo: Vec<ast::Value>,
-        hi: Vec<ast::Value>,
+        lo: Vec<RangeEdge>,
+        hi: Vec<RangeEdge>,
     },
     /// An explicit value set (single-column) — a key belongs when it equals one of them.
     List(Vec<ast::Value>),
@@ -247,8 +258,8 @@ pub(super) fn accepts(key: &[ast::Value], bound: &PartitionBound, key_tys: &[Col
     match bound {
         PartitionBound::Range { lo, hi } => {
             !key.iter().any(|v| matches!(v, ast::Value::Null))
-                && compare_tuple(key, lo) != Ordering::Less
-                && compare_tuple(key, hi) == Ordering::Less
+                && compare_key_to_edges(key, lo) != Ordering::Less
+                && compare_key_to_edges(key, hi) == Ordering::Less
         },
         PartitionBound::List(values) => {
             // LIST is single-column: compare the sole key element to each listed value.
@@ -268,15 +279,46 @@ pub(super) fn accepts(key: &[ast::Value], bound: &PartitionBound, key_tys: &[Col
     }
 }
 
-/// Lexicographic comparison of two key tuples (element-by-element, first difference wins).
-pub(super) fn compare_tuple(a: &[ast::Value], b: &[ast::Value]) -> Ordering {
+/// Compare a key tuple to a range bound tuple: a `Min` element is below every key value and
+/// `Max` above, so the comparison decides at the first marker.
+pub(super) fn compare_key_to_edges(key: &[ast::Value], edges: &[RangeEdge]) -> Ordering {
+    for (k, e) in key.iter().zip(edges) {
+        let c = match e {
+            RangeEdge::Min => Ordering::Greater,
+            RangeEdge::Max => Ordering::Less,
+            RangeEdge::Value(v) => super::eval::compare(k, v),
+        };
+        if c != Ordering::Equal {
+            return c;
+        }
+    }
+    key.len().cmp(&edges.len())
+}
+
+/// Compare two range bound tuples (for the overlap and empty-range checks): `Min` is below
+/// every value and `Max` above; two like markers are equal.
+pub(super) fn compare_edge_tuples(a: &[RangeEdge], b: &[RangeEdge]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
-        match super::eval::compare(x, y) {
-            Ordering::Equal => {},
-            other => return other,
+        let c = match (x, y) {
+            (RangeEdge::Min, RangeEdge::Min) | (RangeEdge::Max, RangeEdge::Max) => Ordering::Equal,
+            (RangeEdge::Min, _) | (_, RangeEdge::Max) => Ordering::Less,
+            (RangeEdge::Max, _) | (_, RangeEdge::Min) => Ordering::Greater,
+            (RangeEdge::Value(v), RangeEdge::Value(w)) => super::eval::compare(v, w),
+        };
+        if c != Ordering::Equal {
+            return c;
         }
     }
     a.len().cmp(&b.len())
+}
+
+/// Compare a concrete value to one bound element (`Min` below it, `Max` above it).
+fn cmp_value_edge(v: &ast::Value, e: &RangeEdge) -> Ordering {
+    match e {
+        RangeEdge::Min => Ordering::Greater,
+        RangeEdge::Max => Ordering::Less,
+        RangeEdge::Value(x) => super::eval::compare(v, x),
+    }
 }
 
 /// The direct partitions of `parent` whose bound provably contains no key satisfying `constraints`
@@ -346,12 +388,14 @@ fn partition_excluded(
                 }
             }
             // Second-column constraints, only when the leading value is pinned and the query pins it.
-            let leading_pinned = super::eval::compare(lo0, hi0) == Ordering::Equal;
+            let leading_pinned =
+                compare_edge_tuples(std::slice::from_ref(lo0), std::slice::from_ref(hi0))
+                    == Ordering::Equal;
             let query_pins_leading = constraints.iter().any(|c| {
                 c.key_index == 0
                     && matches!(c.op, crate::PruneOp::Eq)
                     && cast(&c.value, lead_ty)
-                        .is_some_and(|v| super::eval::compare(&v, lo0) == Ordering::Equal)
+                        .is_some_and(|v| cmp_value_edge(&v, lo0) == Ordering::Equal)
             });
             if multi && leading_pinned && query_pins_leading {
                 // The second column is exactly bounded (half-open) only when it is the last key
@@ -408,20 +452,20 @@ fn op_holds(x: &ast::Value, op: crate::PruneOp, v: &ast::Value) -> bool {
 }
 
 /// Whether the range `[lo, hi)` provably contains no key satisfying `key <op> v`. See the truth table
-/// in the partition-pruning tests for each case.
-fn range_excludes(lo: &ast::Value, hi: &ast::Value, op: crate::PruneOp, v: &ast::Value) -> bool {
-    use super::eval::compare;
+/// in the partition-pruning tests for each case. A `Min`/`Max` marker sits below/above every
+/// value, so an unbounded side simply never proves exclusion in that direction.
+fn range_excludes(lo: &RangeEdge, hi: &RangeEdge, op: crate::PruneOp, v: &ast::Value) -> bool {
     match op {
         // `= v`: excluded unless `v` falls in `[lo, hi)`.
         crate::PruneOp::Eq => {
-            !(compare(v, lo) != Ordering::Less && compare(v, hi) == Ordering::Less)
+            !(cmp_value_edge(v, lo) != Ordering::Less && cmp_value_edge(v, hi) == Ordering::Less)
         },
         // `< v`: every key is `>= lo`, so none is `< v` once `lo >= v`.
-        crate::PruneOp::Lt => compare(lo, v) != Ordering::Less,
+        crate::PruneOp::Lt => cmp_value_edge(v, lo) != Ordering::Greater,
         // `<= v`: none is `<= v` once `lo > v`.
-        crate::PruneOp::LtEq => compare(lo, v) == Ordering::Greater,
+        crate::PruneOp::LtEq => cmp_value_edge(v, lo) == Ordering::Less,
         // `> v` / `>= v`: every key is `< hi`, so none is `> v` (nor `>= v`) once `v >= hi`.
-        crate::PruneOp::Gt | crate::PruneOp::GtEq => compare(v, hi) != Ordering::Less,
+        crate::PruneOp::Gt | crate::PruneOp::GtEq => cmp_value_edge(v, hi) != Ordering::Less,
     }
 }
 
@@ -429,25 +473,25 @@ fn range_excludes(lo: &ast::Value, hi: &ast::Value, op: crate::PruneOp, v: &ast:
 /// `key <op> v`, given the leading column lies in the **closed** interval `[lo0, hi0]` (both bounds
 /// possible — see [`excludes`]). A proven superset, so this only ever keeps extra partitions.
 fn leading_range_excludes(
-    lo0: &ast::Value,
-    hi0: &ast::Value,
+    lo0: &RangeEdge,
+    hi0: &RangeEdge,
     op: crate::PruneOp,
     v: &ast::Value,
 ) -> bool {
-    use super::eval::compare;
     match op {
         // `= v`: excluded unless `v` falls in `[lo0, hi0]`.
         crate::PruneOp::Eq => {
-            !(compare(v, lo0) != Ordering::Less && compare(v, hi0) != Ordering::Greater)
+            !(cmp_value_edge(v, lo0) != Ordering::Less
+                && cmp_value_edge(v, hi0) != Ordering::Greater)
         },
         // `< v`: every leading value is `>= lo0`, so none is `< v` once `lo0 >= v`.
-        crate::PruneOp::Lt => compare(lo0, v) != Ordering::Less,
+        crate::PruneOp::Lt => cmp_value_edge(v, lo0) != Ordering::Greater,
         // `<= v`: none is `<= v` once `lo0 > v`.
-        crate::PruneOp::LtEq => compare(lo0, v) == Ordering::Greater,
+        crate::PruneOp::LtEq => cmp_value_edge(v, lo0) == Ordering::Less,
         // `> v`: every leading value is `<= hi0`, so none is `> v` once `hi0 <= v`.
-        crate::PruneOp::Gt => compare(hi0, v) != Ordering::Greater,
+        crate::PruneOp::Gt => cmp_value_edge(v, hi0) != Ordering::Less,
         // `>= v`: none is `>= v` once `hi0 < v`.
-        crate::PruneOp::GtEq => compare(hi0, v) == Ordering::Less,
+        crate::PruneOp::GtEq => cmp_value_edge(v, hi0) == Ordering::Greater,
     }
 }
 
@@ -501,7 +545,11 @@ fn encode_payload(
     Ok(match bound {
         PartitionBound::Range { lo, hi } => (
             "range",
-            format!("{}|{}", hex_tuple(lo, key_tys)?, hex_tuple(hi, key_tys)?),
+            format!(
+                "{}|{}",
+                encode_edges(lo, key_tys)?,
+                encode_edges(hi, key_tys)?
+            ),
         ),
         PartitionBound::List(values) => {
             let one = key_tys.first().copied().unwrap_or(ColumnType::Text);
@@ -527,8 +575,8 @@ fn decode_payload(
         "range" => {
             let (lo, hi) = payload.split_once('|').ok_or_else(bad)?;
             Ok(PartitionBound::Range {
-                lo: unhex_tuple(lo, key_tys)?,
-                hi: unhex_tuple(hi, key_tys)?,
+                lo: decode_edges(lo, key_tys)?,
+                hi: decode_edges(hi, key_tys)?,
             })
         },
         "list" => {
@@ -549,6 +597,61 @@ fn decode_payload(
         "default" => Ok(PartitionBound::Default),
         _ => Err(bad()),
     }
+}
+
+/// Encode one side of a range bound. All-concrete tuples keep the plain hex form (so existing
+/// catalog rows stay readable); a side carrying `MINVALUE`/`MAXVALUE` markers is prefixed with a
+/// per-column flag string (`v` value / `n` min / `x` max) and `@`, and only the concrete values
+/// are row-encoded (`@` never appears in hex, so the two forms cannot be confused).
+fn encode_edges(edges: &[RangeEdge], key_tys: &[ColumnType]) -> Result<String, Error> {
+    let mut flags = String::with_capacity(edges.len());
+    let mut values = Vec::new();
+    let mut tys = Vec::new();
+    for (e, ty) in edges.iter().zip(key_tys) {
+        match e {
+            RangeEdge::Value(v) => {
+                flags.push('v');
+                values.push(v.clone());
+                tys.push(*ty);
+            },
+            RangeEdge::Min => flags.push('n'),
+            RangeEdge::Max => flags.push('x'),
+        }
+    }
+    let hex = hex_tuple(&values, &tys)?;
+    if flags.bytes().all(|b| b == b'v') {
+        Ok(hex)
+    } else {
+        Ok(format!("{flags}@{hex}"))
+    }
+}
+
+/// Decode one side of a range bound (see [`encode_edges`]); a payload with no `@` is the legacy
+/// all-concrete form.
+fn decode_edges(payload: &str, key_tys: &[ColumnType]) -> Result<Vec<RangeEdge>, Error> {
+    let bad = || Error::MalformedTuple { offset: 0 };
+    let Some((flags, hex)) = payload.split_once('@') else {
+        return Ok(unhex_tuple(payload, key_tys)?
+            .into_iter()
+            .map(RangeEdge::Value)
+            .collect());
+    };
+    let tys: Vec<ColumnType> = flags
+        .chars()
+        .zip(key_tys)
+        .filter(|(f, _)| *f == 'v')
+        .map(|(_, ty)| *ty)
+        .collect();
+    let mut values = unhex_tuple(hex, &tys)?.into_iter();
+    flags
+        .chars()
+        .map(|f| match f {
+            'v' => values.next().map(RangeEdge::Value).ok_or_else(bad),
+            'n' => Ok(RangeEdge::Min),
+            'x' => Ok(RangeEdge::Max),
+            _ => Err(bad()),
+        })
+        .collect()
 }
 
 /// Hex of a value tuple's row encoding at `key_tys` (round-trips to the exact typed tuple).

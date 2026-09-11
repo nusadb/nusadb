@@ -205,10 +205,26 @@ fn create_table_partition_range_parses_and_guards() {
         }
     ));
 
-    // A DEFAULT partition parses (its own test covers the bound); MINVALUE/MAXVALUE range bounds
-    // are still rejected.
+    // A DEFAULT partition parses (its own test covers the bound); MINVALUE/MAXVALUE markers
+    // parse as unbounded range edges, and an element after a marker must repeat that marker.
     assert!(parse("CREATE TABLE p PARTITION OF m DEFAULT").is_ok());
-    assert!(parse("CREATE TABLE p PARTITION OF m FOR VALUES FROM (MINVALUE) TO (10)").is_err());
+    assert!(matches!(
+        parse("CREATE TABLE p PARTITION OF m FOR VALUES FROM (MINVALUE) TO (10)"),
+        Ok(ast::Statement::CreateTable(ct)) if matches!(
+            &ct.partition_of,
+            Some(po) if matches!(
+                &po.bound,
+                ast::PartitionBound::Range { from, .. }
+                    if from == &[ast::RangeBoundValue::MinValue]
+            )
+        )
+    ));
+    assert_eq!(
+        parse("CREATE TABLE p PARTITION OF m FOR VALUES FROM (MINVALUE, 0) TO (5, 5)")
+            .expect_err("a value after MINVALUE must repeat the marker")
+            .sqlstate(),
+        "42804",
+    );
 }
 
 #[test]

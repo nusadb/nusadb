@@ -508,8 +508,15 @@ rows route to their partition first, then the upsert action runs against that le
 that would move the row out of its partition is refused; a plain `UPDATE` through the parent
 moves it (see the partitioning section).
 
+A range bound element may be `MINVALUE` or `MAXVALUE` to leave that side open —
+`FROM (MINVALUE) TO (0)` holds every key below zero, `FROM (10) TO (MAXVALUE)` everything from
+ten up, and a multi-column bound can pin the leading column and leave the rest open
+(`FROM (1, MINVALUE) TO (1, MAXVALUE)`). Every element after a marker must repeat that marker
+(`42804`), and a bound whose lower side is not strictly below its upper is an empty range
+(`42P17`).
+
 Not accepted: an expression as a partition key, `LIST` with more than one key column,
-`MINVALUE` / `MAXVALUE` bounds, non-literal bounds, a partition declaring its own columns, and
+non-literal bounds, a partition declaring its own columns, and
 `CHECK` / `FOREIGN KEY` on a partitioned parent (they would not span partitions).
 
 ### Inherited tables
@@ -1818,8 +1825,7 @@ the resident ceiling. See [deployment](deployment.md) before loading a large dat
 
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
-- an expression as a partition key, `LIST` partitioning over several columns, and `MINVALUE` /
-  `MAXVALUE` partition bounds;
+- an expression as a partition key, and `LIST` partitioning over several columns;
 - `EXCLUDE` constraints with an operator other than `=`;
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;

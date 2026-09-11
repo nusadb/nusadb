@@ -246,13 +246,19 @@ fn convert_partition_bound(
     bound: &ast::PartitionBound,
 ) -> Result<crate::planner::PartitionBoundPlan, Error> {
     use crate::planner::PartitionBoundPlan;
+    let edge = |b: &ast::RangeBoundValue| -> Result<crate::planner::RangeEdgePlan, Error> {
+        Ok(match b {
+            ast::RangeBoundValue::Expr(expr) => {
+                crate::planner::RangeEdgePlan::Value(const_bound_value(expr)?)
+            },
+            ast::RangeBoundValue::MinValue => crate::planner::RangeEdgePlan::MinValue,
+            ast::RangeBoundValue::MaxValue => crate::planner::RangeEdgePlan::MaxValue,
+        })
+    };
     Ok(match bound {
         ast::PartitionBound::Range { from, to } => PartitionBoundPlan::Range {
-            from: from
-                .iter()
-                .map(const_bound_value)
-                .collect::<Result<_, _>>()?,
-            to: to.iter().map(const_bound_value).collect::<Result<_, _>>()?,
+            from: from.iter().map(edge).collect::<Result<_, _>>()?,
+            to: to.iter().map(edge).collect::<Result<_, _>>()?,
         },
         ast::PartitionBound::List(values) => PartitionBoundPlan::List(
             values
