@@ -117,8 +117,10 @@ SELECT 'hello' || ' ' || 'world' AS greeting,
        encode('\xdeadbeef'::BYTEA, 'base64') AS b64;
 ```
 
-A quote inside a literal is doubled: `'it''s'`. Dollar quoting (`$$ ... $$`) is accepted only for
-routine bodies, not for ordinary string literals.
+A quote inside a literal is doubled: `'it''s'`. Dollar quoting — `$$ ... $$` or a tagged
+`$tag$ ... $tag$` — is an ordinary string literal usable anywhere a quoted string is (routine
+bodies included): no escape processing at all, so quotes and backslashes pass through verbatim,
+and a tagged form can contain `$$` itself.
 
 ### Booleans and UUIDs
 
@@ -1822,7 +1824,6 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;
 - aggregating a row value with anything but `count`;
-- dollar-quoted string literals outside a routine body;
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
 - `SET NAMES`, and an IANA region name as the session time zone;
 - locale collations (only `"C"` / `"POSIX"`);

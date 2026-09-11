@@ -1,0 +1,72 @@
+# Dollar-quoted string literals: $$...$$ and $tag$...$tag$ are ordinary string literals with no
+# escape processing, usable anywhere a quoted string is — expressions, typed literals, DML.
+
+query T
+SELECT $$hello$$
+----
+hello
+
+# No escape processing: quotes and backslashes pass through verbatim.
+query T
+SELECT $$it's a 'quoted' \n literal$$
+----
+it's a 'quoted' \n literal
+
+# A tagged form can contain $$ itself.
+query T
+SELECT $tag$contains $$ inside$tag$
+----
+contains $$ inside
+
+# A lone dollar sign inside the body is fine.
+query T
+SELECT $$a$b$$
+----
+a$b
+
+# Works as a function argument and in comparisons.
+query I
+SELECT length($$abcde$$)
+----
+5
+
+query B
+SELECT $$x$$ = 'x'
+----
+1
+
+# Casts and typed literals.
+query I
+SELECT $$41$$::INT + 1
+----
+42
+
+query T
+SELECT TIMESTAMP $$2024-01-02 03:04:05$$::text
+----
+2024-01-02 03:04:05
+
+query T
+SELECT INTERVAL $$1 day$$::text
+----
+1 day
+
+# In DML: insert and filter through a dollar-quoted value.
+statement ok
+CREATE TABLE dq_t (id INT PRIMARY KEY, s TEXT)
+
+statement ok
+INSERT INTO dq_t VALUES (1, $$first'row$$), (2, $body$second$body$)
+
+query T
+SELECT s FROM dq_t WHERE s = $$first'row$$
+----
+first'row
+
+query T
+SELECT s FROM dq_t WHERE s LIKE $$sec%$$
+----
+second
+
+statement ok
+DROP TABLE dq_t

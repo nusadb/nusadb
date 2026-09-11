@@ -175,6 +175,10 @@ pub(super) fn convert_interval(interval: sql::Interval) -> Result<ast::Expr, Err
             ..
         }) => s,
         sql::Expr::Value(sql::ValueWithSpan {
+            value: sql::Value::DollarQuotedString(dq),
+            ..
+        }) => dq.value,
+        sql::Expr::Value(sql::ValueWithSpan {
             value: sql::Value::Number(n, _),
             ..
         }) => n,
@@ -263,6 +267,7 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                 | sql::Value::DoubleQuotedString(s)
                 | sql::Value::EscapedStringLiteral(s)
                 | sql::Value::UnicodeStringLiteral(s) => s,
+                sql::Value::DollarQuotedString(dq) => dq.value,
                 other => return unsupported(&format!("typed literal value `{other}`")),
             };
             convert_typed_literal(&ts.data_type, value)
@@ -1341,6 +1346,7 @@ fn like_escape_char(escape_char: Option<sql::ValueWithSpan>) -> Result<Option<ch
         | sql::Value::DoubleQuotedString(s)
         | sql::Value::EscapedStringLiteral(s)
         | sql::Value::UnicodeStringLiteral(s) => s,
+        sql::Value::DollarQuotedString(dq) => dq.value,
         other => return unsupported(&format!("LIKE ESCAPE value `{other}`")),
     };
     let mut chars = s.chars();
@@ -1988,6 +1994,9 @@ pub(super) fn convert_value(value: sql::Value) -> Result<ast::Value, Error> {
         // E'…' / U&'…' arrive already unescaped from the tokenizer.
         | sql::Value::EscapedStringLiteral(s)
         | sql::Value::UnicodeStringLiteral(s) => Ok(ast::Value::Text(s)),
+        // `$$…$$` / `$tag$…$tag$` — a dollar-quoted string is an ordinary string literal (no
+        // escape processing at all), usable anywhere one is.
+        sql::Value::DollarQuotedString(dq) => Ok(ast::Value::Text(dq.value)),
         // `B'1011'` is a bit-string literal (each character a bit); `X'1a'` is a hex-string literal
         // (four bits per hex digit). Both become a `BIT` value.
         sql::Value::SingleQuotedByteStringLiteral(s) => crate::bit::parse(&s)

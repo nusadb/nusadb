@@ -880,6 +880,11 @@ fn slt_p10_set_local() {
 }
 
 #[test]
+fn slt_p10_dollar_quoted() {
+    run_slt("tests/slt/p10_types/dollar_quoted.slt");
+}
+
+#[test]
 fn slt_p10_json() {
     run_slt("tests/slt/p10_types/json.slt");
 }
