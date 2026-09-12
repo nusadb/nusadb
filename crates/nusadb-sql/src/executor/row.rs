@@ -34,6 +34,30 @@ pub type Row = Vec<ast::Value>;
 
 const TAG_NULL: u8 = 0;
 const TAG_PRESENT: u8 = 1;
+/// An array element that is itself an array (a multidimensional array's sub-array), encoded
+/// recursively with the same element type.
+const TAG_ARRAY: u8 = 2;
+
+/// The most dimensions an array value may have (the standard engines' limit). Every nested path —
+/// text parsing, the constructor, casting, encoding and decoding — is bounded by it, so a hostile
+/// `{{{{…}}}}` literal or a corrupt tuple can never recurse the stack out.
+pub(crate) const MAX_ARRAY_DIMS: usize = 6;
+
+/// The typed error for an array deeper than [`MAX_ARRAY_DIMS`].
+pub(crate) fn array_dims_exceeded(dims: usize) -> Error {
+    Error::LimitExceeded(format!(
+        "number of array dimensions ({dims}) exceeds the maximum allowed ({MAX_ARRAY_DIMS})"
+    ))
+}
+
+/// Why an array text literal failed to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArrayTextError {
+    /// Not a well-formed `{...}` literal (unbalanced braces, unterminated quote, stray character).
+    Malformed,
+    /// Nested deeper than [`MAX_ARRAY_DIMS`] (the offending depth).
+    TooDeep(usize),
+}
 
 /// Encode `row` into the opaque byte form the storage engine accepts.
 ///
@@ -499,13 +523,13 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
         },
         // ARRAY: an ARRAY[...] value, or a `{a,b,c}` array text literal.
         (ast::Value::Array(items), ColumnType::Array(elem)) => {
-            encode_array(items, elem.column_type(), out)?;
+            encode_array(items, elem.column_type(), out, 1)?;
         },
         (ast::Value::Text(s), ColumnType::Array(elem)) => {
             // Parse `{a,b,c}` + coerce each token to the element type via the shared helper.
             let elem_ty = elem.column_type();
             let items = super::eval::parse_text_array(s, elem_ty)?;
-            encode_array(&items, elem_ty, out)?;
+            encode_array(&items, elem_ty, out, 1)?;
         },
         // VECTOR: `[count u32]` then each component as a little-endian f32. A `[..]` text
         // literal is parsed first. Both forms are checked against the column's declared dimension.
@@ -532,47 +556,146 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
 }
 
 /// Encode an array: `[count u32]` then each element as `[tag(1)]` + (if present) its scalar
-/// encoding. Each element is coerced to `elem_ty` via [`encode_value`].
-fn encode_array(items: &[ast::Value], elem_ty: ColumnType, out: &mut Vec<u8>) -> Result<(), Error> {
+/// encoding. Each element is coerced to `elem_ty` via [`encode_value`]. `depth` is this array's
+/// nesting level (1 = the column value itself); past [`MAX_ARRAY_DIMS`] is a typed error.
+fn encode_array(
+    items: &[ast::Value],
+    elem_ty: ColumnType,
+    out: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), Error> {
+    if depth > MAX_ARRAY_DIMS {
+        return Err(array_dims_exceeded(depth));
+    }
     let count = u32::try_from(items.len())
         .map_err(|_| Error::LimitExceeded("array longer than 4 G elements".to_owned()))?;
     out.extend_from_slice(&count.to_le_bytes());
     for item in items {
-        if matches!(item, ast::Value::Null) {
-            out.push(TAG_NULL);
-        } else {
-            out.push(TAG_PRESENT);
-            encode_value(item, elem_ty, out)?;
+        match item {
+            ast::Value::Null => out.push(TAG_NULL),
+            // A sub-array of a multidimensional value nests recursively at the same element type.
+            ast::Value::Array(sub) => {
+                out.push(TAG_ARRAY);
+                encode_array(sub, elem_ty, out, depth + 1)?;
+            },
+            _ => {
+                out.push(TAG_PRESENT);
+                encode_value(item, elem_ty, out)?;
+            },
         }
     }
     Ok(())
+}
+
+/// Decode one array payload (`[count u32]` then tagged elements) at `elem_ty`, recursively for
+/// nested sub-arrays. Returns the items and the position past the payload. `depth` is this
+/// array's nesting level; the encoder never writes past [`MAX_ARRAY_DIMS`], so deeper bytes are
+/// corruption (and the bound keeps a corrupt tuple from recursing without limit).
+fn decode_array_items(
+    bytes: &[u8],
+    pos: usize,
+    elem_ty: ColumnType,
+    depth: usize,
+) -> Result<(Vec<ast::Value>, usize), Error> {
+    if depth > MAX_ARRAY_DIMS {
+        return Err(Error::MalformedTuple { offset: pos });
+    }
+    let count = u32::from_le_bytes(read_array::<4>(bytes, pos)?) as usize;
+    let mut p = pos + 4;
+    // Each element is at least its 1-byte tag, so a `count` larger than the bytes that remain is
+    // corrupt — reject up front rather than spinning the loop.
+    if count > bytes.len().saturating_sub(p) {
+        return Err(Error::MalformedTuple { offset: pos });
+    }
+    let mut items = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let tag = *bytes.get(p).ok_or(Error::MalformedTuple { offset: p })?;
+        p += 1;
+        match tag {
+            TAG_NULL => items.push(ast::Value::Null),
+            TAG_PRESENT => {
+                let (v, next) = decode_value(bytes, p, elem_ty)?;
+                items.push(v);
+                p = next;
+            },
+            TAG_ARRAY => {
+                let (sub, next) = decode_array_items(bytes, p, elem_ty, depth + 1)?;
+                items.push(ast::Value::Array(sub));
+                p = next;
+            },
+            // An unknown element tag is corruption (matches the top-level decode).
+            _ => return Err(Error::MalformedTuple { offset: p - 1 }),
+        }
+    }
+    Ok((items, p))
 }
 
 /// Parse an array text literal `{a,b,c}` into text elements (the bare token `NULL` →
 /// `Value::Null`). Each element is coerced to the column's element type at encode time. A
 /// double-quoted element (`{"a,b","x\"y"}`) is taken literally with `\` escapes removed and is always
 /// text (a quoted `"null"` is the string, not the null token) — the inverse of [`crate::display`]'s
-/// array rendering, so the form round-trips. Nested/multidimensional forms are not supported here.
+/// array rendering, so the form round-trips. A `{`-opened element is a nested sub-array
+/// (multidimensional form), parsed in place one level deeper — never past [`MAX_ARRAY_DIMS`].
+///
+/// This is the lenient form (`None` for any failure) used where a bad literal simply yields
+/// `NULL`; [`parse_array_text_checked`] tells a malformed literal from an over-deep one.
 pub(crate) fn parse_array_text(s: &str) -> Option<Vec<ast::Value>> {
-    let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
-    if inner.trim().is_empty() {
-        return Some(Vec::new());
+    parse_array_text_checked(s).ok()
+}
+
+/// [`parse_array_text`] with the failure reason, so a cast can raise the dimension limit as its
+/// own typed error rather than an "invalid input" one.
+pub(crate) fn parse_array_text_checked(s: &str) -> Result<Vec<ast::Value>, ArrayTextError> {
+    let mut chars = s.trim().chars().peekable();
+    if chars.next() != Some('{') {
+        return Err(ArrayTextError::Malformed);
+    }
+    let elems = parse_array_body(&mut chars, 1)?;
+    skip_array_spaces(&mut chars);
+    // Anything after the outermost closing brace is malformed.
+    if chars.next().is_some() {
+        return Err(ArrayTextError::Malformed);
+    }
+    Ok(elems)
+}
+
+/// Parse the elements after an opening `{` up to and including the matching `}`. `depth` is the
+/// nesting level of this array (1 = outermost); a `{` inside opens a sub-array one level deeper,
+/// and past [`MAX_ARRAY_DIMS`] the literal is refused before any further recursion — the bound on
+/// the parser's stack use is this constant, not the input.
+fn parse_array_body(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    depth: usize,
+) -> Result<Vec<ast::Value>, ArrayTextError> {
+    if depth > MAX_ARRAY_DIMS {
+        return Err(ArrayTextError::TooDeep(depth));
     }
     let mut elems = Vec::new();
-    let mut chars = inner.chars().peekable();
+    skip_array_spaces(chars);
+    if chars.peek() == Some(&'}') {
+        chars.next();
+        return Ok(elems);
+    }
     loop {
-        skip_array_spaces(&mut chars);
-        elems.push(parse_one_array_element(&mut chars)?);
-        skip_array_spaces(&mut chars);
+        skip_array_spaces(chars);
+        let elem = if chars.peek() == Some(&'{') {
+            chars.next();
+            ast::Value::Array(parse_array_body(chars, depth + 1)?)
+        } else {
+            parse_one_array_element(chars).ok_or(ArrayTextError::Malformed)?
+        };
+        elems.push(elem);
+        skip_array_spaces(chars);
         match chars.next() {
             // A comma separates elements; the loop continues to the next one.
             Some(',') => {},
-            None => break,
-            // A stray character after an element (e.g. a closing quote mid-token) is malformed.
-            Some(_) => return None,
+            // The matching close brace ends this array.
+            Some('}') => return Ok(elems),
+            // A stray character after an element (e.g. a closing quote mid-token), or running out of
+            // input before the close brace, is malformed.
+            _ => return Err(ArrayTextError::Malformed),
         }
     }
-    Some(elems)
 }
 
 /// Consume any run of whitespace between array elements and delimiters.
@@ -582,10 +705,11 @@ fn skip_array_spaces(chars: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
-/// Parse one array element, starting at its first non-space character. A `"`-quoted element reads to
-/// the matching unescaped quote (`\` escapes the next character) and is always text; an unquoted run
-/// reads up to the next `,`, trims, and maps the bare token `NULL` to [`ast::Value::Null`]. Returns
-/// `None` on an unterminated quote.
+/// Parse one scalar array element, starting at its first non-space character (a `{`-opened
+/// sub-array is handled by [`parse_array_body`]). A `"`-quoted element reads to the matching
+/// unescaped quote (`\` escapes the next character) and is always text; an unquoted run reads up to
+/// the next `,` or the closing `}`, trims, and maps the bare token `NULL` to [`ast::Value::Null`].
+/// Returns `None` on an unterminated quote.
 fn parse_one_array_element(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<ast::Value> {
     if chars.peek() == Some(&'"') {
         chars.next();
@@ -601,7 +725,7 @@ fn parse_one_array_element(chars: &mut std::iter::Peekable<std::str::Chars>) -> 
     } else {
         let mut buf = String::new();
         while let Some(&c) = chars.peek() {
-            if c == ',' {
+            if c == ',' || c == '}' {
                 break;
             }
             buf.push(c);
@@ -935,31 +1059,10 @@ fn decode_value(bytes: &[u8], pos: usize, ty: ColumnType) -> Result<(ast::Value,
                 pos + 16,
             ))
         },
-        // ARRAY: [count u32] then each element as [tag(1)] + (if present) its scalar encoding.
+        // ARRAY: [count u32] then each element as [tag(1)] + its encoding — a scalar for
+        // TAG_PRESENT, a recursive sub-array for TAG_ARRAY.
         ColumnType::Array(elem) => {
-            let count = u32::from_le_bytes(read_array::<4>(bytes, pos)?) as usize;
-            let mut p = pos + 4;
-            // Each element is at least its 1-byte present/NULL tag, so a `count` larger than the
-            // bytes that remain is corrupt — reject up front rather than spinning the loop.
-            if count > bytes.len().saturating_sub(p) {
-                return Err(Error::MalformedTuple { offset: pos });
-            }
-            let mut items = Vec::with_capacity(count.min(1024));
-            let elem_ty = elem.column_type();
-            for _ in 0..count {
-                let tag = *bytes.get(p).ok_or(Error::MalformedTuple { offset: p })?;
-                p += 1;
-                match tag {
-                    TAG_NULL => items.push(ast::Value::Null),
-                    TAG_PRESENT => {
-                        let (v, next) = decode_value(bytes, p, elem_ty)?;
-                        items.push(v);
-                        p = next;
-                    },
-                    // An unknown element tag is corruption (matches the top-level decode).
-                    _ => return Err(Error::MalformedTuple { offset: p - 1 }),
-                }
-            }
+            let (items, p) = decode_array_items(bytes, pos, elem.column_type(), 1)?;
             Ok((ast::Value::Array(items), p))
         },
         // VECTOR: [count u32] then count little-endian f32 components. The stored count must
@@ -1052,8 +1155,11 @@ pub(crate) fn array_elem_of(items: &[ast::Value]) -> ArrayElem {
     items
         .iter()
         .find(|v| !matches!(v, ast::Value::Null))
-        .and_then(|v| ArrayElem::from_column_type(runtime_type_of(v)))
-        .unwrap_or(ArrayElem::Int)
+        .map_or(ArrayElem::Int, |v| match v {
+            // A multidimensional value's element type is its leaves' type, one level down.
+            ast::Value::Array(inner) => array_elem_of(inner),
+            other => ArrayElem::from_column_type(runtime_type_of(other)).unwrap_or(ArrayElem::Int),
+        })
 }
 
 /// Element type of an array literal, requiring every non-NULL element to share one runtime type:
@@ -1080,13 +1186,20 @@ pub(crate) fn array_elem_checked(items: &[ast::Value]) -> Result<ArrayElem, Erro
         }
     }
     Ok(elem
-        .and_then(ArrayElem::from_column_type)
+        .and_then(|ty| match ty {
+            // Sub-arrays of a multidimensional literal: the leaf type is the element type.
+            ColumnType::Array(e) => Some(e),
+            other => ArrayElem::from_column_type(other),
+        })
         .unwrap_or(ArrayElem::Int))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{array_elem_checked, decode, encode};
+    use super::{
+        ArrayTextError, TAG_ARRAY, TAG_PRESENT, array_elem_checked, decode, encode,
+        parse_array_text_checked,
+    };
     use crate::ast::Value;
     use crate::error::Error;
     use nusadb_core::ColumnType;
@@ -1102,6 +1215,19 @@ mod tests {
         assert_eq!(
             array_elem_checked(&[Value::Text("a".to_owned())]).unwrap(),
             ArrayElem::Text
+        );
+        // A multidimensional literal reports its leaves' type, and mismatched sub-arrays are
+        // rejected like mismatched scalars.
+        assert_eq!(
+            array_elem_checked(&[Value::Array(vec![Value::Text("a".to_owned())])]).unwrap(),
+            ArrayElem::Text
+        );
+        assert!(
+            array_elem_checked(&[
+                Value::Array(vec![Value::Int(1)]),
+                Value::Array(vec![Value::Text("a".to_owned())]),
+            ])
+            .is_err()
         );
         // Empty / all-NULL default to Int (matching array_elem_of).
         assert_eq!(array_elem_checked(&[]).unwrap(), ArrayElem::Int);
@@ -1344,6 +1470,91 @@ mod tests {
         // Empty array + a NULL element round-trip.
         let bytes = encode(&[Value::Text("{}".to_owned())], &schema).unwrap();
         assert_eq!(decode(&bytes, &schema).unwrap(), vec![Value::Array(vec![])]);
+    }
+
+    #[test]
+    fn roundtrip_multidimensional_array() {
+        use nusadb_core::engine::ArrayElem;
+        let schema = vec![ColumnType::Array(ArrayElem::Int)];
+        let grid = Value::Array(vec![
+            Value::Array(vec![Value::Int(1), Value::Null]),
+            Value::Array(vec![Value::Int(3), Value::Int(4)]),
+        ]);
+        // An ARRAY[[..],[..]] value nests through the encoder and back unchanged.
+        let bytes = encode(std::slice::from_ref(&grid), &schema).unwrap();
+        assert_eq!(decode(&bytes, &schema).unwrap(), vec![grid]);
+        // The nested text form parses to the same value (and the same bytes).
+        let from_text = encode(&[Value::Text("{{1,NULL},{3,4}}".to_owned())], &schema).unwrap();
+        assert_eq!(from_text, bytes);
+        // Three levels deep, with a quoted text leaf holding braces.
+        let schema = vec![ColumnType::Array(ArrayElem::Text)];
+        let deep = Value::Array(vec![Value::Array(vec![Value::Array(vec![Value::Text(
+            "{a,b}".to_owned(),
+        )])])]);
+        let bytes = encode(std::slice::from_ref(&deep), &schema).unwrap();
+        assert_eq!(decode(&bytes, &schema).unwrap(), vec![deep.clone()]);
+        let from_text = encode(&[Value::Text(r#"{{{"{a,b}"}}}"#.to_owned())], &schema).unwrap();
+        assert_eq!(decode(&from_text, &schema).unwrap(), vec![deep]);
+        // A ragged text form is rejected, never stored jagged.
+        let schema = vec![ColumnType::Array(ArrayElem::Int)];
+        let ragged = encode(&[Value::Text("{{1,2},{3}}".to_owned())], &schema);
+        assert!(matches!(ragged, Err(Error::InvalidValue { .. })));
+        let mixed = encode(&[Value::Text("{{1,2},3}".to_owned())], &schema);
+        assert!(matches!(mixed, Err(Error::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn array_depth_is_bounded_everywhere() {
+        use nusadb_core::engine::ArrayElem;
+        let schema = vec![ColumnType::Array(ArrayElem::Int)];
+        // Exactly the limit parses, encodes and decodes.
+        let six = format!("{}1{}", "{".repeat(6), "}".repeat(6));
+        let bytes = encode(&[Value::Text(six)], &schema).unwrap();
+        let mut v = decode(&bytes, &schema).unwrap().remove(0);
+        let mut dims = 0;
+        while let Value::Array(items) = v {
+            dims += 1;
+            v = items.into_iter().next().unwrap();
+        }
+        assert_eq!(dims, 6);
+        // One past the limit is refused by the text parser with the depth reason (a typed
+        // 54000-class error at the encoder), and a pathological literal never recurses deeper
+        // than the limit regardless of length.
+        let seven = format!("{}1{}", "{".repeat(7), "}".repeat(7));
+        assert_eq!(
+            parse_array_text_checked(&seven),
+            Err(ArrayTextError::TooDeep(7))
+        );
+        assert!(matches!(
+            encode(&[Value::Text(seven)], &schema),
+            Err(Error::LimitExceeded(_))
+        ));
+        let huge = format!("{}1{}", "{".repeat(100_000), "}".repeat(100_000));
+        assert_eq!(
+            parse_array_text_checked(&huge),
+            Err(ArrayTextError::TooDeep(7))
+        );
+        // A value built in memory past the limit is refused by the encoder too.
+        let mut deep = Value::Int(1);
+        for _ in 0..7 {
+            deep = Value::Array(vec![deep]);
+        }
+        assert!(matches!(
+            encode(&[deep], &schema),
+            Err(Error::LimitExceeded(_))
+        ));
+        // Corrupt bytes nesting past the limit are malformed, not a stack overflow: an array of one
+        // TAG_ARRAY element, repeated deeper than the limit.
+        let mut corrupt = vec![TAG_PRESENT];
+        for _ in 0..7 {
+            corrupt.extend_from_slice(&1u32.to_le_bytes());
+            corrupt.push(TAG_ARRAY);
+        }
+        corrupt.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode(&corrupt, &schema),
+            Err(Error::MalformedTuple { .. })
+        ));
     }
 
     #[test]

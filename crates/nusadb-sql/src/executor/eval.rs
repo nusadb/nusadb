@@ -306,6 +306,12 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
                 values.push(eval(elem, row)?);
             }
             check_rectangular_array(&values)?;
+            // Bottom-up evaluation builds the inner arrays first, so checking each constructor's
+            // own depth bounds the whole value.
+            let dims = array_dimensions(&values).len();
+            if dims > crate::executor::row::MAX_ARRAY_DIMS {
+                return Err(crate::executor::row::array_dims_exceeded(dims));
+            }
             Ok(ast::Value::Array(values))
         },
         TypedExprKind::Subscript { base, index } => eval_subscript(base, index, row),
@@ -4652,12 +4658,25 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
     if matches!(value, ast::Value::Null) {
         return Ok(ast::Value::Null);
     }
+    // array -> array: cast each leaf to the target element type (`ARRAY['1']::INT[]` is an int
+    // array, not a relabelled text array), recursing into a multidimensional value's sub-arrays.
+    // Taken by value ahead of the borrowing match below so the vector moves instead of cloning.
     // The value is converted against the physical target (a length-checked `VARCHAR(n)`/`CHAR(n)` cast
     // is desugared to `substring(cast(x AS text), 1, n)` in the parser and never reaches here, so
     // collapsing VarChar/Char → Text is harmless). The *declared* width is kept so a narrowing integer
     // cast can enforce its range below.
     let declared = target;
     let target = target.physical();
+    let value = match (value, target) {
+        (ast::Value::Array(items), ColumnType::Array(elem)) => {
+            check_rectangular_array(&items)?;
+            return Ok(ast::Value::Array(cast_array_tokens(
+                items,
+                elem.column_type(),
+            )?));
+        },
+        (other, _) => other,
+    };
     let result = match (&value, target) {
         // Identity casts (incl. the temporal + UUID types).
         (ast::Value::Bool(_), ColumnType::Bool)
@@ -4677,8 +4696,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         | (ast::Value::Tsquery(_), ColumnType::Tsquery)
         | (ast::Value::Xml(_), ColumnType::Xml)
         | (ast::Value::Interval(_), ColumnType::Interval)
-        | (ast::Value::Bytes(_), ColumnType::Bytes)
-        | (ast::Value::Array(_), ColumnType::Array(_)) => Ok(value),
+        | (ast::Value::Bytes(_), ColumnType::Bytes) => Ok(value),
         // GEOMETRY casts to the same geometric kind unchanged; a different kind is a cast error
         // (caught by the fallthrough below).
         (ast::Value::Geometry(g), ColumnType::Geometry(kind)) if g.kind() == kind => Ok(value),
@@ -5006,10 +5024,39 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
 /// Parse a `{...}` array text literal and cast each element to `elem_ty`. Shared
 /// by `CAST(... AS T[])` and the row encoder's text→array coercion (one parse+cast path).
 pub(super) fn parse_text_array(s: &str, elem_ty: ColumnType) -> Result<Vec<ast::Value>, Error> {
-    crate::executor::row::parse_array_text(s)
-        .ok_or_else(|| invalid_cast(s, ColumnType::Array(elem_array_marker(elem_ty))))?
+    use crate::executor::row::{ArrayTextError, parse_array_text_checked};
+    let tokens = match parse_array_text_checked(s) {
+        Ok(tokens) => tokens,
+        Err(ArrayTextError::TooDeep(dims)) => {
+            return Err(crate::executor::row::array_dims_exceeded(dims));
+        },
+        Err(ArrayTextError::Malformed) => {
+            return Err(invalid_cast(
+                s,
+                ColumnType::Array(elem_array_marker(elem_ty)),
+            ));
+        },
+    };
+    // A ragged multidimensional text form is malformed, like the reference engine. The check
+    // recurses through every level itself, so one call covers the whole value.
+    check_rectangular_array(&tokens)?;
+    cast_array_tokens(tokens, elem_ty)
+}
+
+/// Cast parsed array tokens to the element type, recursing into nested sub-arrays (a
+/// multidimensional value casts each leaf, not the sub-array itself). The caller has already
+/// checked the value is rectangular; its depth is bounded by wherever it was built (constructor,
+/// text parser or tuple decoder), so this recursion is bounded too.
+fn cast_array_tokens(
+    tokens: Vec<ast::Value>,
+    elem_ty: ColumnType,
+) -> Result<Vec<ast::Value>, Error> {
+    tokens
         .into_iter()
-        .map(|tok| cast_value(tok, elem_ty))
+        .map(|tok| match tok {
+            ast::Value::Array(sub) => Ok(ast::Value::Array(cast_array_tokens(sub, elem_ty)?)),
+            other => cast_value(other, elem_ty),
+        })
         .collect()
 }
 

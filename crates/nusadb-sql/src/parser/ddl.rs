@@ -711,8 +711,9 @@ fn aliased_type(name: &sql::ObjectName) -> Option<ColumnType> {
     })
 }
 
-/// Map a sqlparser array type (`INT[]`, `TEXT[]`, …) to [`ColumnType::Array`]. The element
-/// must be a supported scalar (no nested arrays / NUMERIC / JSON elements yet).
+/// Map a sqlparser array type (`INT[]`, `TEXT[]`, `INT[][]`, …) to [`ColumnType::Array`]. The
+/// leaf element must be a supported scalar (no NUMERIC / JSON elements yet); extra `[]`
+/// dimensions name the same array type.
 pub(super) fn array_type(elem: &sql::ArrayElemTypeDef) -> Result<ColumnType, Error> {
     use sql::ArrayElemTypeDef as A;
     let inner = match elem {
@@ -721,6 +722,11 @@ pub(super) fn array_type(elem: &sql::ArrayElemTypeDef) -> Result<ColumnType, Err
         },
         A::None => return unsupported("array without an element type"),
     };
+    // Extra `[]` dimensions collapse (`INT[][]` is the same type as `INT[]`): declared
+    // dimensionality is documentation, and any array column stores arrays of any depth.
+    if let ColumnType::Array(e) = inner {
+        return Ok(ColumnType::Array(e));
+    }
     nusadb_core::engine::ArrayElem::from_column_type(inner).map_or_else(
         || unsupported(&format!("array of `{inner:?}` (only scalar element types)")),
         |e| Ok(ColumnType::Array(e)),

@@ -198,7 +198,11 @@ The `?` operator is not available because `?` is reserved for query parameters; 
 
 ### Arrays
 
-One-dimensional arrays of any scalar type.
+Arrays of any scalar type, one-dimensional or multidimensional. `INT[][]` names the same
+type as `INT[]`: the declared number of dimensions is documentation, and a column of either
+spelling stores an array of any depth. A multidimensional value is rectangular — every
+sub-array at a level has the same length — and a ragged value such as `ARRAY[[1,2],[3]]` or
+`'{{1,2},{3}}'` is refused.
 
 ```sql
 CREATE TABLE posts (id INT, tags TEXT[]);
@@ -215,6 +219,23 @@ SELECT array_append(tags, 'new'), array_to_string(tags, ', '), string_to_array('
 FROM   posts;
 SELECT ARRAY[1,2] || ARRAY[3] AS joined, ARRAY[1,2] && ARRAY[2,9] AS overlaps, ARRAY[1] <@ ARRAY[1,2] AS contained;
 ```
+
+Multidimensional values nest in both the constructor and the text form, subscript one
+dimension per `[i]`, and flatten through `unnest`. A subscript that stops short of a scalar
+(`grid[1]` on a two-dimensional value) is `NULL`; a slice keeps the outer dimension.
+
+```sql
+CREATE TABLE boards (id INT, grid INT[][]);
+INSERT INTO boards VALUES (1, ARRAY[[1,2],[3,4]]), (2, '{{5,6,7}}');
+
+SELECT id, grid, grid[2][1], array_ndims(grid), array_dims(grid), array_length(grid, 2)
+FROM   boards;                       -- {{1,2},{3,4}}  3  2  [1:2][1:2]  2
+
+SELECT ARRAY[['1','2']]::INT[][];    -- a cast converts every leaf
+```
+
+Element search, append, overlap, containment and `= ANY` are defined over one dimension
+and are refused on a multidimensional operand.
 
 ### Ranges
 
@@ -1843,7 +1864,5 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;
 - full-text configurations other than `simple` and `english`, and full-text prefix matching;
 - `IGNORE NULLS` / `RESPECT NULLS` on window functions;
-- storing a multi-dimensional array in a column (a multi-dimensional `ARRAY[[1,2],[3,4]]` value
-  works inside a query, with `array_ndims` and `[i][j]` subscripts);
 - a `DEFAULT` or `COLLATE` on a domain;
 - `LANGUAGE` other than `SQL` for functions and procedures.

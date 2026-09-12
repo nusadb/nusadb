@@ -960,6 +960,11 @@ fn slt_p10_array_ops() {
 }
 
 #[test]
+fn slt_p10_array_multidim() {
+    run_slt("tests/slt/p10_types/array_multidim.slt");
+}
+
+#[test]
 fn slt_p13_json_set_returning() {
     run_slt("tests/slt/p13_functions/json_set_returning.slt");
 }

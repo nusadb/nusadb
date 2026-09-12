@@ -1,0 +1,142 @@
+# p10_types/array_multidim — multidimensional array columns (`INT[][]`, `TEXT[][]`).
+# Covers: the `[][]` type spelling (same type as `[]`), storing ARRAY[[..]] values and nested
+# `{{..}}` text literals, canonical display, dimension functions on stored values, chained
+# subscripts, slices, unnest flattening, element-wise CAST, and the rectangular-array rule.
+
+statement ok
+CREATE TABLE m (id INT NOT NULL, grid INT[][], names TEXT[][])
+
+statement ok
+INSERT INTO m VALUES
+  (1, ARRAY[[1,2],[3,4]], ARRAY[['a','b'],['c','d']]),
+  (2, '{{10,20,30}}', '{{"x y",z}}'),
+  (3, ARRAY[5,6], NULL),
+  (4, '{{1,NULL},{NULL,4}}', '{{"{a,b}","q\"t"}}')
+
+# Canonical nested {…} display; a one-dimensional value still fits the same column.
+query ITT
+SELECT id, grid, names FROM m ORDER BY id
+----
+1  {{1,2},{3,4}}  {{a,b},{c,d}}
+2  {{10,20,30}}  {{"x y",z}}
+3  {5,6}  NULL
+4  {{1,NULL},{NULL,4}}  {{"{a,b}","q\"t"}}
+
+# Dimension functions see the stored shape.
+query IITII
+SELECT id, array_ndims(grid), array_dims(grid), array_length(grid, 2), cardinality(grid)
+FROM m ORDER BY id
+----
+1  2  [1:2][1:2]  2  4
+2  2  [1:1][1:3]  3  3
+3  1  [1:2]  NULL  2
+4  2  [1:2][1:2]  2  4
+
+# Chained subscripts reach a leaf; a lone subscript on a 2-D value is NULL (no scalar reached);
+# too many subscripts on a 1-D value is NULL too.
+query IIII
+SELECT id, grid[2][1], grid[1], grid[1][2] FROM m ORDER BY id
+----
+1  3  NULL  2
+2  NULL  NULL  20
+3  NULL  5  NULL
+4  NULL  NULL  NULL
+
+# Text leaves keep their quoting-sensitive content.
+query TT
+SELECT names[1][1], names[1][2] FROM m WHERE id = 4
+----
+{a,b}  q"t
+
+# A slice keeps the outer dimension.
+query T
+SELECT grid[2:2] FROM m WHERE id = 1
+----
+{{3,4}}
+
+# unnest flattens row-major.
+query I
+SELECT unnest(grid) FROM m WHERE id = 1 ORDER BY 1
+----
+1
+2
+3
+4
+
+# Equality and a stored-value UPDATE.
+query I
+SELECT id FROM m WHERE grid = ARRAY[[10,20,30]]
+----
+2
+
+statement ok
+UPDATE m SET grid = ARRAY[[9,9],[8,8]] WHERE id = 1
+
+query II
+SELECT grid[1][1], grid[2][2] FROM m WHERE id = 1
+----
+9  8
+
+# Three dimensions.
+statement ok
+INSERT INTO m VALUES (5, ARRAY[[[1],[2]],[[3],[4]]], NULL)
+
+query ITI
+SELECT array_ndims(grid), array_dims(grid), grid[2][1][1] FROM m WHERE id = 5
+----
+3  [1:2][1:2][1:1]  3
+
+# Ragged or mixed shapes are refused loudly — a constructor, a text literal, and a mix.
+statement error
+INSERT INTO m VALUES (9, ARRAY[[1,2],[3]], NULL)
+
+statement error
+INSERT INTO m VALUES (9, '{{1,2},{3}}', NULL)
+
+statement error
+INSERT INTO m VALUES (9, '{{1,2},3}', NULL)
+
+# At most six dimensions, in every form: the text literal, the constructor, and a stored value.
+query I
+SELECT array_ndims('{{{{{{1}}}}}}'::INT[])
+----
+6
+
+statement error
+SELECT '{{{{{{{1}}}}}}}'::INT[]
+
+statement error
+SELECT ARRAY[[[[[[[1]]]]]]]
+
+statement error
+INSERT INTO m VALUES (9, '{{{{{{{1}}}}}}}', NULL)
+
+# CAST array -> array converts each leaf (nested included), and refuses a bad leaf.
+query T
+SELECT ARRAY[['1','2'],['3','4']]::INT[][]
+----
+{{1,2},{3,4}}
+
+query I
+SELECT (ARRAY['7']::INT[])[1] + 1
+----
+8
+
+statement error
+SELECT ARRAY['x']::INT[]
+
+# `INT[][]` is the same type as `INT[]`: a 2-D value stores into a `[]` column and vice versa.
+statement ok
+CREATE TABLE one (v INT[])
+
+statement ok
+INSERT INTO one VALUES (ARRAY[[1,2],[3,4]]), ('{{5},{6}}')
+
+query TI
+SELECT v, array_ndims(v) FROM one ORDER BY v
+----
+{{1,2},{3,4}}  2
+{{5},{6}}  2
+
+statement ok
+DROP TABLE m, one

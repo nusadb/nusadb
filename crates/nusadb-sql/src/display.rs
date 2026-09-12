@@ -141,8 +141,7 @@ pub fn array_text(items: &[Value]) -> String {
 fn push_array_element(out: &mut String, item: &Value) {
     match item {
         Value::Null => out.push_str("NULL"),
-        // A nested array nests bare; NusaDB has no multidimensional arrays today, but keep the form
-        // correct rather than quoting the inner braces.
+        // A nested array (a multidimensional value's sub-array) nests bare, never quoted.
         Value::Array(_) => out.push_str(&value_text(item)),
         _ => {
             let text = value_text(item);
