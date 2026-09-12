@@ -26,6 +26,7 @@
 use core::any::TypeId;
 use sqlparser::ast as sql;
 use sqlparser::dialect::{Dialect, GenericDialect, Precedence};
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
@@ -542,6 +543,11 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // Re-narrow the identifier lexicon to NusaDB's surface before anything else, so the gate
     // covers every path (the VACUUM / COMMENT recognizers below as well as the generic parser).
     reject_widened_lexicon(sql)?;
+    // Refuse a statement nested deeper than the parser accepts BEFORE the generic parser (or any
+    // recognizer below) builds an AST from it: a very deeply nested expression would otherwise
+    // overflow the stack when the tree is analyzed, evaluated, or dropped, aborting the whole
+    // process. This is a flat token scan, so it cannot itself recurse.
+    reject_excessive_nesting(sql)?;
     // `VACUUM` is not in the generic tokenizer's statement grammar, so recognize
     // the bare, table-less form (and `EXPLAIN VACUUM`) ourselves first.
     if let Some(stmt) = recognize_vacuum(sql) {
@@ -4407,6 +4413,213 @@ fn convert_close(cursor: sql::CloseCursor) -> ast::Statement {
         sql::CloseCursor::All => ast::CloseTarget::All,
         sql::CloseCursor::Specific { name } => ast::CloseTarget::Name(fold_ident(&name)),
     })
+}
+
+/// The maximum statement nesting depth the parser accepts. Real queries nest a handful of levels;
+/// this cap sits far above any human- or tool-generated SQL yet well below the depth at which
+/// recursion over the AST (analysis, evaluation, or `Drop`) runs the worker stack out and aborts
+/// the process. Measured: the pipeline overflows a default worker stack near two hundred levels, so
+/// the cap keeps a wide margin.
+const MAX_NESTING_DEPTH: usize = 100;
+
+/// One open-bracket level while scanning for nesting depth. The spine depth reached here is
+/// `base + chain + operand`.
+struct NestLevel {
+    /// The spine depth just outside this bracket level (everything enclosing it).
+    base: usize,
+    /// Low-precedence connective steps chained at this level (`AND`/`OR`/`UNION`/...): each extends
+    /// the spine and begins a fresh operand, so a wide `a = 1 AND b = 2 AND ...` counts one level per
+    /// condition, not two.
+    chain: usize,
+    /// The depth of the operand currently being built (comparisons, arithmetic, casts, nested
+    /// brackets). Reset by a connective and by a sibling separator (comma, or CASE's WHEN/THEN/ELSE).
+    operand: usize,
+}
+
+impl NestLevel {
+    /// The spine depth reached at this level so far.
+    const fn depth(&self) -> usize {
+        self.base + self.chain + self.operand
+    }
+}
+
+/// A token that adds an AST level when it is not a word, bracket, or comma: every operator symbol
+/// (`+ - * / :: = < > || -> @> ~ ...`, and a bare `:`, which is the JSON-access operator and nests
+/// left-deep like `::`). Leaves that also arrive as non-word tokens (numbers, string literals, `.`,
+/// `;`, `\\`, placeholders, whitespace, EOF) do not — note `.` (compound identifiers) is a flat list,
+/// not per-token nesting. Unlisted tokens count as operators, so a token variant added by a future
+/// `sqlparser` can only make the estimate more conservative, never let a deep tree through.
+const fn token_adds_depth(token: &Token) -> bool {
+    !matches!(
+        token,
+        Token::EOF
+            | Token::Whitespace(_)
+            | Token::Number(..)
+            | Token::Char(_)
+            | Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::TripleSingleQuotedString(_)
+            | Token::TripleDoubleQuotedString(_)
+            | Token::DollarQuotedString(_)
+            | Token::SingleQuotedByteStringLiteral(_)
+            | Token::DoubleQuotedByteStringLiteral(_)
+            | Token::TripleSingleQuotedByteStringLiteral(_)
+            | Token::TripleDoubleQuotedByteStringLiteral(_)
+            | Token::SingleQuotedRawStringLiteral(_)
+            | Token::DoubleQuotedRawStringLiteral(_)
+            | Token::TripleSingleQuotedRawStringLiteral(_)
+            | Token::TripleDoubleQuotedRawStringLiteral(_)
+            | Token::NationalStringLiteral(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::HexStringLiteral(_)
+            | Token::Placeholder(_)
+            | Token::Period
+            | Token::SemiColon
+            | Token::Backslash
+    )
+}
+
+/// Push a new bracket- or `CASE`-level whose spine sits one above the current operand position, or
+/// reject if that would exceed [`MAX_NESTING_DEPTH`].
+fn nest_push(stack: &mut Vec<NestLevel>) -> Result<(), Error> {
+    let base = stack.last().map_or(0, NestLevel::depth) + 1;
+    if base > MAX_NESTING_DEPTH {
+        return Err(Error::NestingTooDeep {
+            limit: MAX_NESTING_DEPTH,
+        });
+    }
+    stack.push(NestLevel {
+        base,
+        chain: 0,
+        operand: 0,
+    });
+    Ok(())
+}
+
+/// Pop a bracket- or `CASE`-level, carrying the closed sub-tree's depth into the enclosing operand
+/// so a value that becomes the left operand of a following operator keeps its depth. A close with
+/// only the base level open (an unmatched `)`/`END`, which the real parser will reject) is a no-op.
+fn nest_pop(stack: &mut Vec<NestLevel>) {
+    if stack.len() > 1 {
+        let subtree = stack.pop().map_or(0, |l| l.depth());
+        if let Some(parent) = stack.last_mut() {
+            let anchor = parent.base + parent.chain;
+            parent.operand = parent.operand.max(subtree.saturating_sub(anchor));
+        }
+    }
+}
+
+/// Reject a statement whose structural nesting exceeds [`MAX_NESTING_DEPTH`], in one flat O(n) token
+/// pass with no recursion of its own. The running estimate is a safe upper bound on the AST depth.
+/// Brackets AND `CASE ... END` nest with a stack: opening pushes a level one above the current
+/// operand, and closing carries the closed sub-tree's depth into the enclosing operand (so a
+/// left-deep `(a) + b + c`, and a `CASE` nested inside a `THEN`/`ELSE` arm, are both counted). A
+/// low-precedence connective (`AND`/`OR`/`UNION`/...) extends the spine and starts a fresh operand;
+/// every other operator or nesting keyword deepens the current operand; and a sibling separator
+/// (comma, or CASE's `WHEN`/`THEN`/`ELSE`, which begin a new arm at the CASE level) resets it.
+/// Over-counting is safe: it only rejects sooner, and the cap keeps a wide margin over any real
+/// query.
+fn reject_excessive_nesting(sql: &str) -> Result<(), Error> {
+    let tokens = Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    let mut stack = vec![NestLevel {
+        base: 0,
+        chain: 0,
+        operand: 0,
+    }];
+    let too_deep = || Error::NestingTooDeep {
+        limit: MAX_NESTING_DEPTH,
+    };
+    for token in &tokens {
+        match token {
+            Token::LParen | Token::LBracket | Token::LBrace => nest_push(&mut stack)?,
+            Token::RParen | Token::RBracket | Token::RBrace => nest_pop(&mut stack),
+            Token::Comma => {
+                if let Some(top) = stack.last_mut() {
+                    top.chain = 0;
+                    top.operand = 0;
+                }
+            },
+            Token::Word(w) if w.quote_style.is_none() => match w.keyword {
+                // `CASE ... END` nests like a bracket: its arm expressions (and any `CASE` nested in
+                // one) sit a level under it, so a `THEN`/`ELSE`-nested `CASE` chain is counted rather
+                // than slipping past a per-level reset. A stray `END` (e.g. `END` as `COMMIT`) with
+                // only the base level open is a no-op.
+                Keyword::CASE => nest_push(&mut stack)?,
+                Keyword::END => nest_pop(&mut stack),
+                // Sibling separators between CASE arms reset the level like a comma.
+                Keyword::WHEN | Keyword::THEN | Keyword::ELSE => {
+                    if let Some(top) = stack.last_mut() {
+                        top.chain = 0;
+                        top.operand = 0;
+                    }
+                },
+                // Low-precedence connectives extend the spine and begin a fresh operand.
+                Keyword::AND
+                | Keyword::OR
+                | Keyword::XOR
+                | Keyword::UNION
+                | Keyword::INTERSECT
+                | Keyword::EXCEPT => {
+                    if let Some(top) = stack.last_mut() {
+                        top.chain += 1;
+                        top.operand = 0;
+                        if top.depth() > MAX_NESTING_DEPTH {
+                            return Err(too_deep());
+                        }
+                    }
+                },
+                // Other nesting keywords deepen the current operand. This list mirrors the keyword
+                // operators sqlparser's `parse_infix`/`parse_prefix` recognise (the ones that
+                // continue an expression by consuming another operand); a clause/statement keyword
+                // (`FROM`, `JOIN`, ...) instead ends the current expression, so it correctly adds no
+                // depth. Revisit on a sqlparser upgrade. (`ANY`/`ALL`/`SOME` are not counted: as a
+                // set-op modifier they add nothing, and as a quantified comparison the comparison
+                // operator and the bracketed operand already count.)
+                Keyword::NOT
+                | Keyword::BETWEEN
+                | Keyword::LIKE
+                | Keyword::ILIKE
+                | Keyword::SIMILAR
+                | Keyword::RLIKE
+                | Keyword::REGEXP
+                | Keyword::IN
+                | Keyword::IS
+                | Keyword::CAST
+                | Keyword::TRY_CAST
+                | Keyword::SAFE_CAST
+                | Keyword::EXISTS
+                | Keyword::OVERLAPS
+                | Keyword::COLLATE
+                | Keyword::INTERVAL
+                | Keyword::AT
+                | Keyword::OPERATOR
+                | Keyword::NOTNULL
+                | Keyword::MEMBER => {
+                    if let Some(top) = stack.last_mut() {
+                        top.operand += 1;
+                        if top.depth() > MAX_NESTING_DEPTH {
+                            return Err(too_deep());
+                        }
+                    }
+                },
+                // Identifiers, literals spelled as words, and statement/clause keywords are leaves.
+                _ => {},
+            },
+            other if token_adds_depth(other) => {
+                if let Some(top) = stack.last_mut() {
+                    top.operand += 1;
+                    if top.depth() > MAX_NESTING_DEPTH {
+                        return Err(too_deep());
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    Ok(())
 }
 
 /// Reject identifier tokens outside NusaDB's documented surface (follow-up).

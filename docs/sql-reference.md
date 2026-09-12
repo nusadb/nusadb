@@ -1866,3 +1866,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - `IGNORE NULLS` / `RESPECT NULLS` on window functions;
 - a `DEFAULT` or `COLLATE` on a domain;
 - `LANGUAGE` other than `SQL` for functions and procedures.
+
+A statement may nest expressions and subqueries up to a fixed depth; one nested far past any
+practical query (a hundred levels) is refused with `54001` before it is parsed, rather than risking
+the stack. Ordinary queries are nowhere near this bound.

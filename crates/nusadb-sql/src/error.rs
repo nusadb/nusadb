@@ -364,6 +364,15 @@ pub enum Error {
         limit: usize,
     },
 
+    /// A statement whose expression / query nesting is deeper than the parser accepts. Rejected up
+    /// front, before the deeply nested tree is built, so that walking it (analysis, evaluation, or
+    /// simply dropping it) cannot overflow the stack and abort the whole process.
+    #[error("statement nesting exceeds the maximum depth ({limit})")]
+    NestingTooDeep {
+        /// The maximum accepted nesting depth.
+        limit: usize,
+    },
+
     /// `CREATE PROCEDURE` named a procedure that already exists (and no `OR REPLACE` was given).
     #[error("procedure `{name}` already exists")]
     ProcedureExists {
@@ -600,7 +609,9 @@ impl Error {
             // The engine has not built this. The only variant that may say so; see its doc.
             Self::Unsupported(_) => "0A000", // feature_not_supported
             // statement_too_complex — the nesting limit, not a fault.
-            Self::TriggerRecursionLimit { .. } | Self::ProcedureRecursionLimit { .. } => "54001",
+            Self::TriggerRecursionLimit { .. }
+            | Self::ProcedureRecursionLimit { .. }
+            | Self::NestingTooDeep { .. } => "54001",
             // raise_exception — the user's own RAISE from a procedure body. Reporting this as an
             // engine fault is the single most misleading code here: the statement did exactly what
             // it was told to.

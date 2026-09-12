@@ -6050,3 +6050,137 @@ fn overlaps_requires_two_element_rows() {
         "OVERLAPS rejects a non-2-element row"
     );
 }
+
+// --- Nesting-depth guard -----------------------------------------------
+
+/// A statement nested past the depth cap is refused with `NestingTooDeep`, not by overflowing the
+/// stack. Every shape here parses on a loop-based path in the underlying tokenizer, so without the
+/// guard the deep tree would overflow when analyzed, evaluated, or dropped.
+#[test]
+fn deeply_nested_statements_are_refused_not_crashed() {
+    // Each entry builds an expression far deeper than the cap. 20_000 levels is well past the depth
+    // that overflows a worker stack, and the guard's flat scan handles it without recursing.
+    let deep: Vec<String> = vec![
+        format!("SELECT {}1{}", "(".repeat(20_000), ")".repeat(20_000)), // parentheses
+        format!("SELECT {}1{}", "ARRAY[".repeat(20_000), "]".repeat(20_000)), // array constructor
+        format!("SELECT ARRAY{}1{}", "[".repeat(20_000), "]".repeat(20_000)), // bracket form
+        format!("SELECT 1{}", "::INT".repeat(20_000)),                   // cast chain
+        format!("SELECT 1{}", "+1".repeat(20_000)),                      // arithmetic chain
+        format!("SELECT 1 {}", "OR 1 ".repeat(20_000)),                  // boolean chain
+        format!("SELECT 1 {}", "BETWEEN 0 AND 9 ".repeat(20_000)),       // BETWEEN chain
+        format!("SELECT 'a' {}", "LIKE 'a' ".repeat(20_000)),            // LIKE chain
+        format!("SELECT 'a' {}", "RLIKE 'a' ".repeat(20_000)),           // RLIKE chain
+        format!("SELECT 'a' {}", "REGEXP 'a' ".repeat(20_000)),          // REGEXP chain
+        format!("SELECT 1{}", " IN (1)".repeat(20_000)),                 // IN chain
+        format!("SELECT a{}", ":b".repeat(20_000)),                      // JSON-access `:` chain
+        format!(
+            "SELECT {}1{}",
+            "CAST(".repeat(20_000),
+            " AS INT)".repeat(20_000)
+        ), // nested CAST
+        format!("{}SELECT 1{}", "(".repeat(20_000), ")".repeat(20_000)), // nested subquery parens
+        format!("SELECT 1 {}", "UNION SELECT 1 ".repeat(20_000)),        // set-op chain
+        format!(
+            "SELECT {}1{}",
+            "CASE WHEN 1 = 1 THEN ".repeat(20_000),
+            " END".repeat(20_000)
+        ), // CASE nested through THEN arms (no brackets)
+        format!(
+            "SELECT {}1{}",
+            "CASE WHEN 1 = 1 THEN 0 ELSE ".repeat(20_000),
+            " END".repeat(20_000)
+        ), // CASE nested through ELSE arms
+        format!("SELECT 1 {}", "XOR 1 ".repeat(20_000)),                 // logical XOR chain
+        format!(
+            "SELECT TIMESTAMP '2020-01-01 00:00:00' {}",
+            "AT TIME ZONE 'UTC' ".repeat(20_000)
+        ), // AT TIME ZONE chain
+    ];
+    for sql in &deep {
+        let head: String = sql.chars().take(24).collect();
+        assert!(
+            matches!(parse(sql), Err(Error::NestingTooDeep { .. })),
+            "expected NestingTooDeep for a deeply nested statement starting `{head}`"
+        );
+    }
+}
+
+/// The guard measures depth, not breadth: a very WIDE but shallow statement parses fine. These would
+/// be broken by any cap that counted commas, function calls, or list elements as nesting.
+#[test]
+fn wide_but_shallow_statements_are_accepted() {
+    // A 4000-element IN list.
+    let in_list = format!(
+        "SELECT 1 IN ({})",
+        (0..4000)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    parse(&in_list).expect("a wide IN list is shallow, not deep");
+
+    // A 2000-row VALUES.
+    let values = format!(
+        "INSERT INTO t VALUES {}",
+        (0..2000)
+            .map(|n| format!("({n})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    parse(&values).expect("a wide VALUES is shallow, not deep");
+
+    // A 1000-item projection, each a small expression.
+    let projection = format!(
+        "SELECT {}",
+        (0..1000)
+            .map(|n| format!("a{n} + {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    parse(&projection).expect("a wide projection is shallow, not deep");
+
+    // A 1000-branch flat CASE (WHEN/THEN are siblings, not nesting).
+    let case = format!(
+        "SELECT CASE {} ELSE 0 END",
+        (0..1000)
+            .map(|n| format!("WHEN a = {n} THEN {n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    parse(&case).expect("a wide CASE is shallow, not deep");
+
+    // A moderate UNION of one-row selects. A set-op chain is a genuine left-deep tree, so unlike a
+    // comma list its depth is the branch count; a chain far past the cap is refused (see the deep
+    // test), but an ordinary union parses.
+    let union = (0..40)
+        .map(|_| "SELECT 1")
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    parse(&union).expect("a 40-branch UNION ALL is within the cap");
+}
+
+/// A long flat chain of `AND` predicates is shallow (a connective chain, one level per
+/// condition), not the double-counted depth a naive operator tally would report; 80 must parse.
+#[test]
+fn a_wide_anded_predicate_is_accepted() {
+    let preds = (0..80)
+        .map(|n| format!("c{n} = {n}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    parse(&format!("SELECT * FROM t WHERE {preds}"))
+        .expect("80 ANDed conditions are within the cap");
+}
+
+/// Ordinary nesting depths that real queries reach are accepted unchanged.
+#[test]
+fn moderate_nesting_is_accepted() {
+    // ~20 levels of mixed brackets and boolean operators.
+    let nested = format!(
+        "SELECT * FROM t WHERE {}a = 1{}",
+        "(".repeat(20),
+        " OR b = 2)".repeat(20)
+    );
+    parse(&nested).expect("~20 levels of nesting is well within the cap");
+    // A handful of nested subqueries.
+    parse("SELECT (SELECT (SELECT (SELECT 1)))").expect("four nested subqueries parse");
+}
