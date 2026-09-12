@@ -1,0 +1,82 @@
+# p12_txn/advisory_locks — session-scoped advisory locks, single-session behavior.
+# Cross-session exclusion and release-on-disconnect need two live sessions and are covered by the
+# Rust test tests/advisory_locks.rs; this file covers what one connection can observe: acquiring,
+# re-entrancy, unlock accounting, the two-integer key form, unlock-all, and the refusals.
+
+# Acquire a free lock, and re-enter it (same session always succeeds).
+query I
+SELECT nusadb_try_advisory_lock(100)
+----
+1
+
+query I
+SELECT nusadb_try_advisory_lock(100)
+----
+1
+
+# Each unlock releases one hold and reports that this session held it.
+query I
+SELECT nusadb_advisory_unlock(100)
+----
+1
+
+query I
+SELECT nusadb_advisory_unlock(100)
+----
+1
+
+# Unlocking a key with no remaining hold reports false.
+query I
+SELECT nusadb_advisory_unlock(100)
+----
+0
+
+# The two-integer key form is accepted and independent of the single-key form.
+query II
+SELECT nusadb_try_advisory_lock(1, 2), nusadb_try_advisory_lock(200)
+----
+1 1
+
+# unlock_all releases everything this session holds and returns true.
+query I
+SELECT nusadb_advisory_unlock_all()
+----
+1
+
+# After unlock_all, the previously held keys report no remaining hold.
+query I
+SELECT nusadb_advisory_unlock(200)
+----
+0
+
+# A NULL key is an error (a lock has no key).
+statement error
+SELECT nusadb_try_advisory_lock(NULL)
+
+# Wrong arity is an error.
+statement error
+SELECT nusadb_try_advisory_lock(1, 2, 3)
+
+# The blocking, shared, and transaction-scoped variants are recognized and refused with a clear
+# message rather than silently doing nothing.
+statement error
+SELECT nusadb_advisory_lock(1)
+
+statement error
+SELECT nusadb_try_advisory_lock_shared(1)
+
+statement error
+SELECT nusadb_advisory_xact_lock(1)
+
+# An advisory call in a per-row context is refused (it must be evaluated exactly once), and does not
+# take the lock: after the failed statement the key is still free to acquire.
+statement error
+SELECT nusadb_try_advisory_lock(300) FROM (VALUES (1), (2), (3)) AS t(x)
+
+query I
+SELECT nusadb_try_advisory_lock(300)
+----
+1
+
+statement ok
+SELECT nusadb_advisory_unlock_all()

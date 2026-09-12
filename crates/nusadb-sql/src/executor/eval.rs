@@ -639,6 +639,17 @@ fn eval_scalar_function(
                 func.name()
             )));
         },
+        // Advisory-lock built-ins are side-effecting and session-scoped, resolved once before the
+        // per-row loop (`resolve_sequence_calls`) exactly like the sequence built-ins. Reaching the
+        // per-row evaluator means the call sits in a per-row context (scan/WHERE/UPDATE), where a
+        // lock taken once and broadcast to every row would be wrong — reject it loudly.
+        F::TryAdvisoryLock | F::AdvisoryUnlock | F::AdvisoryUnlockAll => {
+            return Err(Error::Unsupported(format!(
+                "{}() is only supported where it is evaluated once — a SELECT without FROM; it \
+                 cannot be used in a per-row query (scan, WHERE, or UPDATE)",
+                func.name()
+            )));
+        },
         // CONCAT / CONCAT_WS skip NULL arguments instead of propagating NULL, so they cannot use
         // the NULL-strict collection below.
         F::Concat => return eval_concat(args, row),

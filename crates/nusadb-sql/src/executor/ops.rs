@@ -704,15 +704,16 @@ pub(crate) fn contains_subquery(expr: &TypedExpr) -> bool {
     }
 }
 
-/// Whether `expr` contains a sequence built-in (`nextval`/`currval`/`setval`) anywhere in its own
-/// scope. Lets a caller skip the clone + [`resolve_sequence_calls`] for the common sequence-free
-/// case. A sequence call inside a *subquery* is that subquery's own concern, so descent stops at
+/// Whether `expr` contains a built-in that [`resolve_sequence_calls`] must resolve before the
+/// per-row loop — a sequence (`nextval`/`currval`/`setval`) or an advisory-lock built-in — anywhere
+/// in its own scope. Lets a caller skip the clone + [`resolve_sequence_calls`] for the common case
+/// with neither. Such a call inside a *subquery* is that subquery's own concern, so descent stops at
 /// subquery boundaries (mirroring [`contains_subquery`]).
 pub(crate) fn contains_sequence_call(expr: &TypedExpr) -> bool {
     use crate::planner::TypedExprKind as K;
     match &expr.kind {
         K::ScalarFunction { func, args } => {
-            func.is_sequence() || args.iter().any(contains_sequence_call)
+            func.is_sequence() || func.is_advisory() || args.iter().any(contains_sequence_call)
         },
         K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {
             contains_sequence_call(left) || contains_sequence_call(right)
@@ -929,14 +930,77 @@ pub(super) fn resolve_sequence_calls(
         | K::OuterColumn { .. }
         | K::AggregateRef(_) => {},
     }
-    // Resolve this node if it is itself a sequence built-in.
-    if let K::ScalarFunction { func, args } = &expr.kind
-        && func.is_sequence()
-    {
-        let value = eval_sequence_call(*func, args, engine)?;
-        expr.kind = K::Literal(ast::Value::Int(value));
+    // Resolve this node if it is itself a sequence or advisory built-in — both are side-effecting
+    // and must be evaluated exactly once, which this pre-pass (run only in a single-evaluation
+    // context) guarantees.
+    if let K::ScalarFunction { func, args } = &expr.kind {
+        if func.is_sequence() {
+            let value = eval_sequence_call(*func, args, engine)?;
+            expr.kind = K::Literal(ast::Value::Int(value));
+        } else if func.is_advisory() {
+            let value = eval_advisory_call(*func, args)?;
+            expr.kind = K::Literal(value);
+        }
     }
     Ok(())
+}
+
+/// Evaluate one advisory-lock built-in against the process-global registry, returning its `BOOL`
+/// result. The owning session is this connection's unique temporary-schema name (the stable
+/// per-session token both the embedded and wire paths carry); a bare execution path with no session
+/// identity cannot hold session-scoped locks and is refused. A single argument is the `bigint` lock
+/// key; two arguments are a `(int, int)` pair combined into one `bigint` the same way the reference
+/// engine does (`hi << 32 | lo`), so the two-argument and one-argument forms address distinct keys.
+fn eval_advisory_call(func: ast::ScalarFunc, args: &[TypedExpr]) -> Result<ast::Value, Error> {
+    let session = crate::executor::current_temp_schema().ok_or_else(|| {
+        Error::Unsupported(
+            "advisory locks require a session (this execution path has no session identity)"
+                .to_owned(),
+        )
+    })?;
+    if matches!(func, ast::ScalarFunc::AdvisoryUnlockAll) {
+        crate::executor::advisory::unlock_all(&session);
+        return Ok(ast::Value::Bool(true));
+    }
+    let key = advisory_key(func, args)?;
+    let held = match func {
+        ast::ScalarFunc::TryAdvisoryLock => crate::executor::advisory::try_lock(key, &session),
+        ast::ScalarFunc::AdvisoryUnlock => crate::executor::advisory::unlock(key, &session),
+        _ => unreachable!("caller dispatches only advisory built-ins"),
+    };
+    Ok(ast::Value::Bool(held))
+}
+
+/// The `bigint` lock key for an advisory call: the single `bigint` argument, or a `(int, int)` pair
+/// combined as `hi << 32 | (lo & 0xffff_ffff)`. A `NULL` key is an error (a lock has no key).
+fn advisory_key(func: ast::ScalarFunc, args: &[TypedExpr]) -> Result<i64, Error> {
+    let empty: Row = Vec::new();
+    let as_int = |e: &TypedExpr| -> Result<i64, Error> {
+        match eval::eval(e, &empty)? {
+            ast::Value::Int(v) => Ok(v),
+            ast::Value::Null => Err(Error::InvalidParameterValue(format!(
+                "{}() lock key must not be NULL",
+                func.name()
+            ))),
+            _ => Err(Error::FunctionArgs(format!(
+                "{}() lock key must be an integer",
+                func.name()
+            ))),
+        }
+    };
+    match args {
+        [key] => as_int(key),
+        [hi, lo] => {
+            let hi = as_int(hi)?;
+            let lo = as_int(lo)?;
+            Ok((hi << 32) | (lo & 0xffff_ffff))
+        },
+        _ => Err(Error::ArityMismatch {
+            context: format!("function `{}`", func.name()),
+            expected: 2,
+            found: args.len(),
+        }),
+    }
 }
 
 /// Evaluate one sequence built-in against the engine, returning its `INT` result. The first

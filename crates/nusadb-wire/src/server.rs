@@ -1374,6 +1374,9 @@ where
         let engine = Arc::clone(&engine);
         let _ = tokio::task::spawn_blocking(move || {
             drop_temp_schema(engine.as_ref(), &temp_schema_name);
+            // Release any advisory locks this connection held, keyed by the same per-connection
+            // temporary-schema name the lock functions use, so they never outlive the connection.
+            nusadb_sql::release_advisory_locks(&temp_schema_name);
         })
         .await;
     }

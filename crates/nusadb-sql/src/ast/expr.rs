@@ -1037,6 +1037,17 @@ pub enum ScalarFunc {
     /// `value` as `INT`. With `is_called = false` the *next* [`NEXTVAL`](Self::SequenceNext) returns
     /// `value` itself; the default `true` returns `value + increment`. Side-effecting like `NEXTVAL`.
     SequenceSet,
+    /// `NUSADB_TRY_ADVISORY_LOCK(key)` / `(key_hi, key_lo)` — take the session-scoped advisory lock
+    /// named by the integer key(s) without waiting, returning `BOOL`: `true` if acquired (or already
+    /// held by this session, re-entrant), `false` if another session holds it. Side-effecting and
+    /// session-scoped, so resolved once before the per-row loop like the sequence built-ins.
+    TryAdvisoryLock,
+    /// `NUSADB_ADVISORY_UNLOCK(key)` / `(key_hi, key_lo)` — release one hold of the session's advisory
+    /// lock, returning `BOOL`: `true` if this session held it, `false` otherwise.
+    AdvisoryUnlock,
+    /// `NUSADB_ADVISORY_UNLOCK_ALL()` — release every advisory lock this session holds; returns
+    /// `BOOL` `true`.
+    AdvisoryUnlockAll,
     /// `MACADDR8_SET7BIT(macaddr8)` — set the `0x02` (locally-administered) bit of the first byte,
     /// returning the modified `MACADDR8`.
     Macaddr8Set7bit,
@@ -1310,6 +1321,9 @@ impl ScalarFunc {
             Self::SequenceNext => "nextval",
             Self::SequenceCurrent => "currval",
             Self::SequenceSet => "setval",
+            Self::TryAdvisoryLock => "nusadb_try_advisory_lock",
+            Self::AdvisoryUnlock => "nusadb_advisory_unlock",
+            Self::AdvisoryUnlockAll => "nusadb_advisory_unlock_all",
             Self::Macaddr8Set7bit => "macaddr8_set7bit",
             Self::PointCtor => "point",
             Self::BoxCtor => "box",
@@ -1332,6 +1346,17 @@ impl ScalarFunc {
         matches!(
             self,
             Self::SequenceNext | Self::SequenceCurrent | Self::SequenceSet
+        )
+    }
+
+    /// Whether this is a session-scoped advisory-lock built-in — side-effecting and resolved once
+    /// against the process-global lock registry, like the sequence built-ins, rather than by the
+    /// pure per-row evaluator.
+    #[must_use]
+    pub const fn is_advisory(self) -> bool {
+        matches!(
+            self,
+            Self::TryAdvisoryLock | Self::AdvisoryUnlock | Self::AdvisoryUnlockAll
         )
     }
 

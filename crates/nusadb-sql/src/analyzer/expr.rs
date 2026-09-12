@@ -757,6 +757,15 @@ fn analyze_udf_call(
     if let Some(func) = sequence_func_by_name(name) {
         return analyze_sequence_function(func, name, args, scope, catalog, aggregates);
     }
+    // Advisory-lock built-ins are likewise recognized by name (not sqlparser keywords). The built
+    // ones are analyzed here; a name in the same family that is not yet built is refused with a
+    // clear pointer rather than falling through to the generic "function not found".
+    if let Some(func) = advisory_func_by_name(name) {
+        return analyze_advisory_function(func, name, args, scope, catalog, aggregates);
+    }
+    if let Some(err) = advisory_family_refusal(name) {
+        return Err(err);
+    }
     let Some((arg_types, return_type)) = crate::udf::scalar_udf_signature(name) else {
         // Not a Rust UDF — try a SQL scalar function, inlined in place of the call.
         if let Some(func) = catalog.lookup_function(name)? {
@@ -854,6 +863,86 @@ fn analyze_sequence_function(
     Ok(TypedExpr {
         kind: TypedExprKind::ScalarFunction { func, args: typed },
         ty: ColumnType::Int,
+    })
+}
+
+/// Map a (case-insensitive) function name to its advisory-lock built-in, or `None` if it is not
+/// one of the built operations.
+const fn advisory_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
+    if name.eq_ignore_ascii_case("nusadb_try_advisory_lock") {
+        Some(ast::ScalarFunc::TryAdvisoryLock)
+    } else if name.eq_ignore_ascii_case("nusadb_advisory_unlock") {
+        Some(ast::ScalarFunc::AdvisoryUnlock)
+    } else if name.eq_ignore_ascii_case("nusadb_advisory_unlock_all") {
+        Some(ast::ScalarFunc::AdvisoryUnlockAll)
+    } else {
+        None
+    }
+}
+
+/// A refusal for an advisory-lock name in the family that is recognised but not built: the blocking
+/// (`nusadb_advisory_lock`), shared-mode (`..._shared`), and transaction-scoped (`..._xact_...`)
+/// variants. Returns `None` for a name outside the family (so a genuine unknown function still
+/// reaches the UDF path and its own "not found" error).
+fn advisory_family_refusal(name: &str) -> Option<Error> {
+    let lower = name.to_ascii_lowercase();
+    let in_family =
+        lower.starts_with("nusadb_advisory_") || lower.starts_with("nusadb_try_advisory_");
+    if !in_family {
+        return None;
+    }
+    Some(Error::Unsupported(format!(
+        "advisory-lock function `{name}` is not built; the available operations are \
+         nusadb_try_advisory_lock(key), nusadb_advisory_unlock(key), and \
+         nusadb_advisory_unlock_all() (session-scoped, exclusive, non-blocking)"
+    )))
+}
+
+/// Analyze an advisory-lock built-in call. `nusadb_try_advisory_lock`/`nusadb_advisory_unlock` take
+/// either a single `bigint` key or a `(int, int)` pair; `nusadb_advisory_unlock_all` takes none. All
+/// return `BOOL`. The lock/unlock against the process-global registry happens at execution time (the
+/// call is a [`TypedExprKind::ScalarFunction`], resolved only where it is evaluated exactly once).
+fn analyze_advisory_function(
+    func: ast::ScalarFunc,
+    name: &str,
+    args: &[ast::Expr],
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+    mut aggregates: Option<&mut Vec<AggregateCall>>,
+) -> Result<TypedExpr, Error> {
+    let (min, max): (usize, usize) = match func {
+        ast::ScalarFunc::TryAdvisoryLock | ast::ScalarFunc::AdvisoryUnlock => (1, 2),
+        ast::ScalarFunc::AdvisoryUnlockAll => (0, 0),
+        _ => unreachable!("caller passes only advisory built-ins"),
+    };
+    if args.len() < min || args.len() > max {
+        return Err(Error::ArityMismatch {
+            context: format!("function `{name}`"),
+            expected: max,
+            found: args.len(),
+        });
+    }
+    let mut typed = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let expr = analyze_expr_agg(
+            arg,
+            scope,
+            catalog,
+            Some(ColumnType::Int),
+            aggregates.as_deref_mut(),
+        )?;
+        if !assignable(ColumnType::Int, expr.ty) {
+            return Err(Error::TypeMismatch {
+                context: format!("argument {} to function `{name}`", i + 1),
+                expected: ColumnType::Int,
+                found: expr.ty,
+            });
+        }
+        typed.push(expr);
+    }
+    Ok(TypedExpr {
+        kind: TypedExprKind::ScalarFunction { func, args: typed },
+        ty: ColumnType::Bool,
     })
 }
 
@@ -1389,6 +1478,11 @@ pub(super) fn analyze_scalar_function(
         // by `analyze_sequence_function` before this typed-builtin table, so they never reach here.
         F::SequenceNext | F::SequenceCurrent | F::SequenceSet => {
             unreachable!("sequence built-ins are analyzed before the scalar signature table")
+        },
+        // Advisory-lock built-ins likewise arrive as generic function calls and are analyzed by
+        // `analyze_advisory_function` before this table, so they never reach here.
+        F::TryAdvisoryLock | F::AdvisoryUnlock | F::AdvisoryUnlockAll => {
+            unreachable!("advisory built-ins are analyzed before the scalar signature table")
         },
         // ASCII takes one TEXT argument and returns INT (the LENGTH family is intercepted by
         // `analyze_text_polymorphic` above — Text-or-BYTEA).

@@ -1325,6 +1325,26 @@ LOCK TABLE orders, customers IN ACCESS SHARE MODE;
 
 `LOCK TABLE` accepts `ACCESS SHARE` and `ACCESS EXCLUSIVE`; the other modes are refused.
 
+### Advisory locks
+
+An advisory lock is a cooperative lock named by an integer key you choose; the engine attaches no
+meaning to the key, so it is up to the application to agree on what a key stands for. A lock is held
+by a session and is released automatically when the session ends. Acquiring never waits, matching
+the engine's no-wait locking: it either takes the lock or reports that another session holds it.
+
+```sql
+SELECT nusadb_try_advisory_lock(42);        -- true if taken (or already held by this session)
+SELECT nusadb_try_advisory_lock(1, 2);      -- two int keys combine into one bigint key
+SELECT nusadb_advisory_unlock(42);          -- release one hold; true if this session held it
+SELECT nusadb_advisory_unlock_all();        -- release every advisory lock this session holds
+```
+
+A session may take the same lock more than once; an equal number of unlocks releases it. A lock
+call must be evaluated exactly once, so it is written as a `SELECT` without `FROM` and is refused in
+a per-row position (a scan, `WHERE`, or an `UPDATE` assignment). The blocking `nusadb_advisory_lock`,
+the shared-mode `..._shared`, and the transaction-scoped `..._xact_...` variants are not built and
+are refused with a clear message.
+
 ---
 
 ## Notifications

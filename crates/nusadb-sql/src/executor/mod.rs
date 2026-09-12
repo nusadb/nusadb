@@ -47,6 +47,14 @@ pub(crate) fn current_temp_schema() -> Option<String> {
 }
 pub use session_ctx::check_settable_parameter;
 pub use session_ctx::{pin_statement_timezone, statement_tz_offset_secs};
+
+/// Release every advisory lock held by a session, by its `session_token`.
+///
+/// The token is the session's unique temporary-schema name. Called when a connection ends, so a
+/// client's advisory locks never outlive it; safe to call for a session that holds none.
+pub fn release_advisory_locks(session_token: &str) {
+    advisory::unlock_all(session_token);
+}
 pub use trigger::view_has_instead_of_trigger;
 
 /// The pinned session's canonical `timezone` setting, if one is set — wrapped like
@@ -112,6 +120,7 @@ mod stats;
 
 // Operator submodules (ADR 007), glob-re-exported below. agg/join remain stubs whose operators
 // currently live in `ops` (a follow-up may hoist them into their own files).
+mod advisory;
 pub mod agg;
 pub(crate) mod coldefault;
 mod dcl;
@@ -1428,13 +1437,18 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// may be non-deterministic). These are the exact-case [`ast::ScalarFunc`] variant names plus
 /// `ScalarUdf`, so a genuine volatile call is never missed; an incidental match (e.g. a quoted
 /// identifier) only skips caching, which is always safe.
-const VOLATILE_PLAN_MARKERS: [&str; 20] = [
+const VOLATILE_PLAN_MARKERS: [&str; 23] = [
     "ScalarUdf",
     // Sequence built-ins advance / read engine + session state per call, so a memoized result would
     // hand out a stale (or duplicate) value — never cache a plan that mentions one.
     "SequenceNext",
     "SequenceCurrent",
     "SequenceSet",
+    // Advisory-lock built-ins mutate / read process-global lock state per call; a memoized result
+    // would take or report a lock that another session's state has since changed.
+    "TryAdvisoryLock",
+    "AdvisoryUnlock",
+    "AdvisoryUnlockAll",
     "Now",
     "StatementTimestamp",
     "LocalTimestamp",
@@ -2307,6 +2321,9 @@ impl Drop for Session<'_> {
             // otherwise leak the txn inside the engine.
             let _ = self.engine.rollback(txn);
         }
+        // Release any advisory locks this session held, so they never outlive it. Keyed by the
+        // session's temporary-schema name, the same token the lock functions use.
+        advisory::unlock_all(&self.temp_schema_name());
     }
 }
 

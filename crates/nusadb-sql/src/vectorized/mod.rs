@@ -485,10 +485,10 @@ fn expr_is_vectorizable(expr: &TypedExpr) -> bool {
                     .all(|b| expr_is_vectorizable(&b.when) && expr_is_vectorizable(&b.then))
                 && default.as_deref().is_none_or(expr_is_vectorizable)
         },
-        // A sequence built-in is side-effecting / session-stateful and must be resolved by the row
-        // path (`resolve_sequence_calls`, which enforces the single-evaluation rule); it never
-        // vectorizes, so a projection carrying one falls back to the row path.
-        K::ScalarFunction { func, .. } if func.is_sequence() => false,
+        // A sequence or advisory-lock built-in is side-effecting / session-stateful and must be
+        // resolved by the row path (`resolve_sequence_calls`, which enforces the single-evaluation
+        // rule); it never vectorizes, so a projection carrying one falls back to the row path.
+        K::ScalarFunction { func, .. } if func.is_sequence() || func.is_advisory() => false,
         // A scalar UDF is vectorizable iff its arguments are: the vectorized evaluator reuses
         // the row evaluator, which invokes the registered function per row.
         K::Coalesce(args)

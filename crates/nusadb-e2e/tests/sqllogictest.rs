@@ -1080,6 +1080,11 @@ fn slt_p12_savepoint_errors() {
 }
 
 #[test]
+fn slt_p12_advisory_locks() {
+    run_slt("tests/slt/p12_txn/advisory_locks.slt");
+}
+
+#[test]
 fn slt_p13_math() {
     run_slt("tests/slt/p13_functions/math.slt");
 }
