@@ -1009,8 +1009,12 @@ that cannot use an HNSW index says so (`exact scan, no HNSW index for vector_l2_
 ## Full-text search
 
 Text is turned into a `tsvector` (a sorted list of lexemes with positions) and matched against a
-`tsquery` with `@@`. Two configurations exist: `simple` lower-cases words, and `english` (the
-default) also removes stop words and stems.
+`tsquery` with `@@`. Three configurations exist: `simple` lower-cases words; `english` (the default)
+also removes stop words and stems; and `indonesian` removes Indonesian stop words and applies a
+dictionary-free, rule-based Indonesian stemmer, so inflected forms of one root match each other
+(`membaca`, `dibaca`, `bacaan` all reduce to `baca`). Being dictionary-free, the Indonesian stemmer
+cannot always recover a root that was formed by consonant elision (`memakan`) or one that merely
+looks affixed (`sekolah`); it reduces such words consistently regardless, which keeps matching sound.
 
 ```sql
 CREATE TABLE articles (id INT PRIMARY KEY, body TEXT);
@@ -1882,7 +1886,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - locale collations (only `"C"` / `"POSIX"`);
 - `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;
-- full-text configurations other than `simple` and `english`, and full-text prefix matching;
+- full-text configurations other than `simple`, `english`, and `indonesian`, and full-text prefix matching;
 - `IGNORE NULLS` / `RESPECT NULLS` on window functions;
 - a `DEFAULT` or `COLLATE` on a domain;
 - `LANGUAGE` other than `SQL` for functions and procedures.

@@ -1020,6 +1020,11 @@ fn slt_p13_fts() {
 }
 
 #[test]
+fn slt_p13_fts_indonesian() {
+    run_slt("tests/slt/p13_functions/fts_indonesian.slt");
+}
+
+#[test]
 fn slt_p11_plain_view() {
     run_slt("tests/slt/p11_views/plain.slt");
 }

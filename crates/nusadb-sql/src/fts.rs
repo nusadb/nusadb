@@ -47,6 +47,10 @@ enum Config {
     Simple,
     /// The reference engine's `english`: the Snowball stopword list plus the Snowball English (Porter2) stemmer.
     English,
+    /// NusaDB's `indonesian`: an Indonesian stopword list plus a dictionary-free, rule-based
+    /// (Nazief-Adriani style) Indonesian stemmer. The reference engine has no Indonesian
+    /// configuration, so this is NusaDB's own; see [`indonesian`].
+    Indonesian,
 }
 
 /// Resolve a configuration name; any other name is a loud reject (not near-parity).
@@ -55,10 +59,12 @@ fn check_config(config: &str) -> Result<Config, Error> {
         Ok(Config::Simple)
     } else if config.eq_ignore_ascii_case("english") {
         Ok(Config::English)
+    } else if config.eq_ignore_ascii_case("indonesian") {
+        Ok(Config::Indonesian)
     } else {
         Err(Error::ObjectNotFound(format!(
             "text search configuration {config:?} does not exist (available: 'simple', \
-             'english')"
+             'english', 'indonesian')"
         )))
     }
 }
@@ -76,6 +82,15 @@ fn normalize_lexeme(config: Config, lexeme: &str) -> Option<String> {
                 None
             } else {
                 Some(porter2::stem(lexeme))
+            }
+        },
+        Config::Indonesian => {
+            if lexeme.chars().any(|c| c.is_ascii_digit()) {
+                Some(lexeme.to_owned())
+            } else if is_stopword_id(lexeme) {
+                None
+            } else {
+                Some(indonesian::stem(lexeme))
             }
         },
     }
@@ -571,6 +586,384 @@ mod porter2 {
             .map(|c| if c == 'Y' { 'y' } else { c })
             .collect()
     }
+}
+
+/// The `indonesian` text-search configuration's stopword list and stemmer.
+///
+/// The reference engine ships no Indonesian configuration, so there is no external output to match:
+/// NusaDB provides its own. The stemmer is dictionary-free and rule-based, in the Nazief-Adriani
+/// confix-stripping style — it removes an inflectional particle, then a possessive pronoun, then a
+/// derivational suffix, then up to three derivational prefixes with the standard morphological
+/// (assimilation) rules. It is deterministic, which is the property full-text search needs: a query
+/// word and a document word reduce to the same lexeme, so inflected forms of one root match each
+/// other. Being dictionary-free it cannot always recover the historically-elided letter of an
+/// ambiguous `mem-`/`meng-` form, nor tell a genuine root that merely looks affixed (e.g. `sekolah`)
+/// from a real prefix; it stems such words consistently anyway, which keeps search matching sound
+/// even where the recovered stem is not the true root. The unit tests pin this behavior.
+mod indonesian {
+    const fn is_vowel(c: u8) -> bool {
+        matches!(c, b'a' | b'e' | b'i' | b'o' | b'u')
+    }
+
+    /// Vowel count, a proxy for syllables: a root normally keeps at least two.
+    fn syllables(w: &str) -> usize {
+        w.bytes().filter(|&c| is_vowel(c)).count()
+    }
+
+    /// A candidate stem is only accepted if it still looks like a word: at least two letters, at
+    /// least one of them a vowel.
+    fn plausible(w: &str) -> bool {
+        w.len() >= 2 && w.bytes().any(is_vowel)
+    }
+
+    /// Strip `suffix` from `w` only if what remains is still plausible.
+    fn strip<'a>(w: &'a str, suffix: &str) -> Option<&'a str> {
+        w.strip_suffix(suffix).filter(|r| plausible(r))
+    }
+
+    /// Strip `prefix` from `w` only if the remainder keeps two syllables — a real root minimum that
+    /// stops a root beginning like a prefix (e.g. `pergi`, `perlu`) from being stripped to one
+    /// syllable. The monosyllabic `menge-`/`penge-` roots are handled before this and are exempt.
+    fn strip_pre_root<'a>(w: &'a str, prefix: &str) -> Option<&'a str> {
+        w.strip_prefix(prefix).filter(|r| syllables(r) >= 2)
+    }
+
+    /// Remove one inflectional particle (`-lah`/`-kah`/`-tah`/`-pun`).
+    fn remove_particle(w: &str) -> &str {
+        for s in ["lah", "kah", "tah", "pun"] {
+            if let Some(r) = strip(w, s) {
+                return r;
+            }
+        }
+        w
+    }
+
+    /// Remove one possessive pronoun (`-ku`/`-mu`/`-nya`). `-nya` is checked before `-mu`/`-ku`.
+    fn remove_possessive(w: &str) -> &str {
+        for s in ["nya", "ku", "mu"] {
+            if let Some(r) = strip(w, s) {
+                return r;
+            }
+        }
+        w
+    }
+
+    /// The two-letter class of `w`'s leading prefix, for the forbidden prefix+suffix check.
+    fn prefix_class(w: &str) -> &'static str {
+        for p in ["di", "ke", "se", "be", "te", "me", "pe"] {
+            if w.starts_with(p) {
+                return p;
+            }
+        }
+        ""
+    }
+
+    /// The derivational suffix `w` ends with (`kan`/`an`/`i`), for the forbidden-combination check.
+    fn suffix_class(w: &str) -> &'static str {
+        if w.ends_with("kan") {
+            "kan"
+        } else if w.ends_with("an") {
+            "an"
+        } else if w.ends_with('i') {
+            "i"
+        } else {
+            ""
+        }
+    }
+
+    /// Prefix+suffix pairs Indonesian morphology does not form; when the word carries such a pair the
+    /// suffix is left in place (the prefix, not the suffix, is the real affix).
+    fn forbidden(prefix: &str, suffix: &str) -> bool {
+        [
+            ("be", "i"),
+            ("di", "an"),
+            ("ke", "i"),
+            ("ke", "an"),
+            ("me", "an"),
+            ("se", "i"),
+            ("se", "kan"),
+        ]
+        .contains(&(prefix, suffix))
+    }
+
+    /// Remove a derivational suffix (`-kan`/`-an`/`-i`). `-kan` is tried before `-an`; `-i` is not
+    /// stripped after a vowel (a diphthong ending like `pantai` keeps it).
+    fn remove_suffix(w: &str) -> &str {
+        // A derivational suffix is only removed if the remaining stem still has two syllables, so a
+        // two-syllable root that merely ends in these letters (e.g. `makan`, `jalan`) is left whole.
+        if let Some(r) = strip(w, "kan").filter(|r| syllables(r) >= 2) {
+            return r;
+        }
+        if let Some(r) = strip(w, "an").filter(|r| syllables(r) >= 2) {
+            return r;
+        }
+        if let Some(r) = w.strip_suffix('i')
+            && syllables(r) >= 2
+            && !r.bytes().last().is_some_and(is_vowel)
+        {
+            return r;
+        }
+        w
+    }
+
+    /// Restore the consonant elided after a nasal prefix: `men-`/`pen-` before a vowel came from a
+    /// `t-` root, `mem-`/`pem-` before a vowel from a `p-` root. Before a consonant nothing was
+    /// elided.
+    fn restore(rest: &str, consonant: char) -> String {
+        if rest.bytes().next().is_some_and(is_vowel) {
+            format!("{consonant}{rest}")
+        } else {
+            rest.to_owned()
+        }
+    }
+
+    /// Remove one derivational prefix with its assimilation rule, returning the shorter form (which
+    /// may have an elided consonant restored). Returns the word unchanged when it carries no
+    /// recognized prefix or removal would leave an implausible stem.
+    fn remove_prefix(w: &str) -> String {
+        // A monosyllabic root takes `menge-`/`penge-` (e.g. `mengecat` -> `cat`).
+        for p in ["menge", "penge"] {
+            if let Some(r) = w.strip_prefix(p)
+                && plausible(r)
+            {
+                return r.to_owned();
+            }
+        }
+        // `meny-`/`peny-` always come from an `s-` root.
+        for p in ["meny", "peny"] {
+            if let Some(r) = w.strip_prefix(p) {
+                let restored = format!("s{r}");
+                if syllables(&restored) >= 2 {
+                    return restored;
+                }
+            }
+        }
+        // `meng-`/`peng-`: strip only. Which of a `k-` root or a vowel-initial root produced a
+        // vowel-initial remainder is dictionary-dependent, so the prefix is removed without guessing.
+        for p in ["meng", "peng"] {
+            if let Some(r) = strip_pre_root(w, p) {
+                return r.to_owned();
+            }
+        }
+        // `men-`/`pen-` before a vowel restore a `t-` root; `mem-`/`pem-` before a vowel a `p-` root.
+        for (p, c) in [("men", 't'), ("pen", 't')] {
+            if let Some(r) = w.strip_prefix(p) {
+                let restored = restore(r, c);
+                if syllables(&restored) >= 2 {
+                    return restored;
+                }
+            }
+        }
+        for (p, c) in [("mem", 'p'), ("pem", 'p')] {
+            if let Some(r) = w.strip_prefix(p) {
+                let restored = restore(r, c);
+                if syllables(&restored) >= 2 {
+                    return restored;
+                }
+            }
+        }
+        // `belajar`/`pelajar` are the fixed `bel-`/`pel-` forms; otherwise these fall to `be-`/`pe-`.
+        for p in ["belajar", "pelajar"] {
+            if w.starts_with(p) {
+                return w.replacen(&p[..3], "", 1);
+            }
+        }
+        // Plain and second-order prefixes.
+        for p in [
+            "ter", "ber", "per", "di", "ke", "se", "me", "pe", "be", "te",
+        ] {
+            if let Some(r) = strip_pre_root(w, p) {
+                return r.to_owned();
+            }
+        }
+        w.to_owned()
+    }
+
+    /// Stem one lowercased Indonesian word by confix stripping. Non-ASCII or short (<= 2 syllable)
+    /// words are returned unchanged.
+    pub(super) fn stem(word: &str) -> String {
+        if !word.is_ascii() || syllables(word) <= 2 {
+            return word.to_owned();
+        }
+        let after_particle = remove_particle(word);
+        let after_possessive = remove_possessive(after_particle);
+        // Whether a forbidden prefix+suffix pair is present decides whether the suffix is the real
+        // affix: if it is forbidden, the suffix stays and only the prefix is stripped.
+        let keep_suffix = forbidden(
+            prefix_class(after_possessive),
+            suffix_class(after_possessive),
+        );
+        // Remove up to three stacked prefixes first, so a root that ends in a suffix's letters
+        // (e.g. `makan` in `dimakan`) is exposed before suffix removal can over-strip it.
+        let mut cur = after_possessive.to_owned();
+        for _ in 0..3 {
+            let next = remove_prefix(&cur);
+            if next == cur || syllables(&next) == 0 {
+                break;
+            }
+            cur = next;
+        }
+        // Then a single derivational suffix, unless a forbidden pair kept it.
+        if !keep_suffix {
+            let stemmed = remove_suffix(&cur).to_owned();
+            cur = stemmed;
+        }
+        if plausible(&cur) {
+            cur
+        } else {
+            word.to_owned()
+        }
+    }
+}
+
+/// The Indonesian stopword list — the common function words dropped from an `indonesian` tsvector.
+/// Sorted for binary search.
+const STOPWORDS_ID: &[&str] = &[
+    "acara",
+    "ada",
+    "adalah",
+    "adanya",
+    "agar",
+    "akan",
+    "aku",
+    "amat",
+    "antara",
+    "apa",
+    "apabila",
+    "apakah",
+    "atas",
+    "atau",
+    "bagai",
+    "bagaimana",
+    "bagi",
+    "bahkan",
+    "bahwa",
+    "banyak",
+    "banyaknya",
+    "beberapa",
+    "begini",
+    "begitu",
+    "belum",
+    "berapa",
+    "bila",
+    "bisa",
+    "boleh",
+    "buat",
+    "bukan",
+    "dahulu",
+    "dalam",
+    "dan",
+    "dapat",
+    "dari",
+    "demi",
+    "demikian",
+    "dengan",
+    "di",
+    "dia",
+    "dini",
+    "hampir",
+    "hanya",
+    "harus",
+    "hingga",
+    "ia",
+    "ialah",
+    "ini",
+    "itu",
+    "jadi",
+    "jangan",
+    "jika",
+    "juga",
+    "kalau",
+    "kami",
+    "kamu",
+    "kan",
+    "kapan",
+    "karena",
+    "ke",
+    "kecuali",
+    "kemudian",
+    "kepada",
+    "kita",
+    "lagi",
+    "lain",
+    "lalu",
+    "lebih",
+    "maka",
+    "mana",
+    "masih",
+    "maupun",
+    "melainkan",
+    "memang",
+    "mengapa",
+    "mereka",
+    "merupakan",
+    "meski",
+    "meskipun",
+    "mungkin",
+    "namun",
+    "nya",
+    "oleh",
+    "pada",
+    "padahal",
+    "paling",
+    "para",
+    "pun",
+    "saat",
+    "saja",
+    "sama",
+    "sambil",
+    "sampai",
+    "sangat",
+    "saya",
+    "sebab",
+    "sebagai",
+    "sebuah",
+    "sedang",
+    "sedangkan",
+    "segera",
+    "sehingga",
+    "sejak",
+    "sekali",
+    "sekarang",
+    "selain",
+    "selama",
+    "seluruh",
+    "sementara",
+    "sendiri",
+    "seorang",
+    "sepanjang",
+    "seperti",
+    "serta",
+    "sesuatu",
+    "setelah",
+    "setiap",
+    "siapa",
+    "sini",
+    "situ",
+    "suatu",
+    "sudah",
+    "supaya",
+    "tak",
+    "tanpa",
+    "tapi",
+    "telah",
+    "tentang",
+    "terhadap",
+    "tersebut",
+    "tetapi",
+    "tiap",
+    "tidak",
+    "untuk",
+    "walau",
+    "walaupun",
+    "yaitu",
+    "yakni",
+    "yang",
+];
+
+/// Whether `word` (lowercased) is an Indonesian stopword.
+fn is_stopword_id(word: &str) -> bool {
+    STOPWORDS_ID.binary_search(&word).is_ok()
 }
 
 /// Tokenize `text` under the `simple` configuration: maximal alphanumeric runs, lowercased, with
@@ -2658,5 +3051,89 @@ mod tests {
                 .parse::<f64>()
                 .unwrap_or_else(|_| f64::from(r)),
         )
+    }
+
+    #[test]
+    fn indonesian_stemmer_roots_common_derivations() {
+        // Helper: the single lexeme of to_tsvector('indonesian', word).
+        let stem = |w: &str| -> String {
+            let v = to_tsvector("indonesian", w).unwrap();
+            v.split('\'').nth(1).unwrap_or("").to_owned()
+        };
+        // Regular derivations reduce to their root across prefixes and suffixes.
+        for (word, root) in [
+            ("makanan", "makan"),
+            ("dimakan", "makan"),
+            ("makananku", "makan"),
+            ("membaca", "baca"),
+            ("pembaca", "baca"),
+            ("dibaca", "baca"),
+            ("bacaan", "baca"),
+            ("membacakan", "baca"),
+            ("menulis", "tulis"),
+            ("penulis", "tulis"),
+            ("tulisan", "tulis"),
+            ("ditulis", "tulis"),
+            ("menyapu", "sapu"),
+            ("penyapu", "sapu"),
+            ("disapu", "sapu"),
+            ("mengambil", "ambil"),
+            ("pengambilan", "ambil"),
+            ("diambil", "ambil"),
+            ("belajar", "ajar"),
+            ("pelajaran", "ajar"),
+            ("mengajar", "ajar"),
+            ("diajar", "ajar"),
+            ("berlari", "lari"),
+            ("pelari", "lari"),
+            ("berjalan", "jalan"),
+            ("perjalanan", "jalan"),
+            ("terbaik", "baik"),
+            ("menghitung", "hitung"),
+            ("penghitungan", "hitung"),
+            ("mencari", "cari"),
+            ("pencarian", "cari"),
+            ("dicari", "cari"),
+            ("memukul", "pukul"),
+            ("dipukul", "pukul"),
+            ("mengecat", "cat"),
+            ("permainan", "main"),
+            ("dimainkan", "main"),
+            ("rumahnya", "rumah"),
+            ("bukuku", "buku"),
+        ] {
+            assert_eq!(stem(word), root, "stem({word})");
+        }
+        // A short root (<= 2 syllables) and a genuine root that merely begins like a prefix are left
+        // whole rather than over-stripped.
+        assert_eq!(stem("makan"), "makan");
+        assert_eq!(stem("buku"), "buku");
+        assert_eq!(stem("pergi"), "pergi");
+    }
+
+    #[test]
+    fn indonesian_drops_stopwords_and_keeps_positions() {
+        // `yang`, `di`, `dan` are stopwords: dropped, but their positions stay consumed.
+        assert_eq!(
+            to_tsvector("indonesian", "buku yang dibaca").unwrap(),
+            "'baca':3 'buku':1"
+        );
+        assert_eq!(to_tsvector("indonesian", "dan di ke").unwrap(), "");
+    }
+
+    #[test]
+    fn indonesian_query_matches_inflected_document() {
+        // A query root matches an inflected document word because both reduce to the same lexeme.
+        let doc = to_tsvector("indonesian", "Mereka membaca buku itu").unwrap();
+        assert!(ts_match(&doc, &to_tsquery("indonesian", "baca").unwrap()).unwrap());
+        assert!(ts_match(&doc, &to_tsquery("indonesian", "membaca").unwrap()).unwrap());
+        // plainto_tsquery stems each word and ANDs them.
+        assert!(ts_match(&doc, &plainto_tsquery("indonesian", "dibaca").unwrap()).unwrap());
+    }
+
+    #[test]
+    fn indonesian_unknown_config_still_rejected_but_indonesian_accepted() {
+        assert!(to_tsvector("indonesian", "buku").is_ok());
+        assert!(to_tsvector("klingon", "buku").is_err());
     }
 }

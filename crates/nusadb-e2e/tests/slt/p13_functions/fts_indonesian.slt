@@ -1,0 +1,50 @@
+# p13_functions/fts_indonesian — the `indonesian` full-text configuration. NusaDB's own
+# (the reference engine ships no Indonesian config): an Indonesian stopword list plus a
+# dictionary-free, rule-based Indonesian stemmer. The point is deterministic matching — inflected
+# forms of one root reduce to the same lexeme.
+
+# to_tsvector stems each word and drops stopwords (`yang`, `di` here), positions consumed.
+query T
+SELECT to_tsvector('indonesian', 'Buku yang dibaca anak')
+----
+'anak':4 'baca':3 'buku':1
+
+# Prefixes and suffixes over one root all reduce to that root.
+query T
+SELECT to_tsvector('indonesian', 'membaca dibaca bacaan')
+----
+'baca':1,2,3
+
+# A short root and one that merely begins like a prefix are left whole.
+query T
+SELECT to_tsvector('indonesian', 'makan pergi buku')
+----
+'buku':3 'makan':1 'pergi':2
+
+# to_tsquery stems its operands.
+query T
+SELECT to_tsquery('indonesian', 'membaca & buku')
+----
+'baca' & 'buku'
+
+# A query root matches an inflected document word (both reduce to `baca`).
+query I
+SELECT (to_tsvector('indonesian', 'Mereka membaca buku') @@ to_tsquery('indonesian', 'baca'))::int
+----
+1
+
+# An inflected query matches too, and plainto_tsquery ANDs stemmed words.
+query I
+SELECT (to_tsvector('indonesian', 'Mereka membaca buku') @@ plainto_tsquery('indonesian', 'dibaca buku'))::int
+----
+1
+
+# A word not present does not match.
+query I
+SELECT (to_tsvector('indonesian', 'Mereka membaca buku') @@ to_tsquery('indonesian', 'menulis'))::int
+----
+0
+
+# An unknown configuration is still a loud error.
+statement error
+SELECT to_tsvector('klingon', 'buku')
