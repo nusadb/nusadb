@@ -457,6 +457,45 @@ fn apply_memory_config(args: &Args) -> Result<MemoryCeilings, Box<dyn std::error
     })
 }
 
+/// A future that resolves when the process should shut down: Ctrl-C, or — on Unix — SIGTERM (the
+/// signal `docker stop` and Kubernetes send), whichever arrives first. Logs which was received. A
+/// SIGTERM handler that cannot be installed degrades to Ctrl-C only rather than failing start-up.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => match r {
+                        Ok(()) => tracing::info!("Ctrl-C received — shutting down gracefully"),
+                        Err(e) => tracing::error!("failed to listen for Ctrl-C: {e}"),
+                    },
+                    _ = term.recv() => {
+                        tracing::info!("SIGTERM received — shutting down gracefully");
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}");
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    tracing::error!("failed to listen for Ctrl-C: {e}");
+                } else {
+                    tracing::info!("Ctrl-C received — shutting down gracefully");
+                }
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("failed to listen for Ctrl-C: {e}");
+        } else {
+            tracing::info!("Ctrl-C received — shutting down gracefully");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -565,15 +604,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // Graceful shutdown on Ctrl-C: stop accepting, drain in-flight connections, then exit.
-    let shutdown = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!("failed to listen for Ctrl-C: {e}");
-        } else {
-            tracing::info!("Ctrl-C received — shutting down gracefully");
-        }
-    };
-    serve_cluster_with_shutdown(listener, cluster, config, shutdown).await?;
+    // Graceful shutdown: stop accepting, drain in-flight connections, then exit. Triggered by
+    // Ctrl-C and, on Unix, by SIGTERM — the signal `docker stop` and Kubernetes send, so an
+    // orchestrated stop drains cleanly and exits 0 instead of being killed after the grace period.
+    serve_cluster_with_shutdown(listener, cluster, config, wait_for_shutdown()).await?;
 
     if let Some(task) = metrics_task {
         task.abort();

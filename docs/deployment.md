@@ -32,7 +32,7 @@ the database.
 | `--idle-timeout` | `0` | Close a connection idle this many seconds. `0` is no limit. |
 | `--handshake-timeout` | `60` | Drop a connection that has not finished the start-up and authentication exchange within this many seconds, so a stalled client cannot hold a slot. |
 | `--statement-timeout` | `0` | Cancel any statement running longer than this many seconds (`57014`). Sessions can lower it with `SET statement_timeout`. |
-| `--drain-timeout` | `30` | On Ctrl-C, wait this long for in-flight connections to finish before aborting them. `0` waits indefinitely. |
+| `--drain-timeout` | `30` | On Ctrl-C or SIGTERM (the signal `docker stop` and Kubernetes send), wait this long for in-flight connections to finish before aborting them, then exit cleanly. `0` waits indefinitely. |
 | `--mem-budget` | `0` | Total memory budget in bytes. `0` auto-detects on Linux as the smaller of host RAM and the cgroup limit, so a container limit is honoured; on other systems `0` means no budget. The budget derives the limits below. |
 | `--max-resident-bytes` | derived | Ceiling on each database's in-memory page store; a row insert past it is refused with an error naming the limit. Derived from the memory budget (floor 256 MiB); unlimited when no budget is known. |
 | `--work-mem` | `0` | Per-query memory for one sort, aggregate or join stage. Past it a stage spills (with `--spill-dir`) or fails with an error naming the limit. `0` is unlimited unless a budget derives a value. |
@@ -126,6 +126,21 @@ Three details worth knowing:
   it, because recovery rebuilds the store from the checkpoint image, which holds only live rows.
 - Once the ceiling has been hit, the remedies are raising it, using a larger host, or reloading the
   live rows into a fresh data directory.
+
+### A single row must fit in one page (about 8 KB)
+
+Rows are stored whole inside one 8 KB B-tree leaf; there are no overflow or out-of-line (TOAST)
+pages yet. A row whose encoded form exceeds the single-leaf capacity (8139 bytes) is refused with an
+error that names both sizes, rather than stored:
+
+```text
+ERROR XX000: tuple of 8205 bytes exceeds the single-leaf capacity of 8139 bytes
+(overflow pages are a later feature)
+```
+
+This bounds the total encoded size of a row, so a very large `text`, `json`, `bytea`, or array value
+cannot be stored inline past that limit. Split such values across rows, or keep large blobs outside
+the database, until overflow pages land.
 
 ### One query, one transaction, one load
 
