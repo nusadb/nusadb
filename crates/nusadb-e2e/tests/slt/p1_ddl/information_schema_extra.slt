@@ -30,6 +30,24 @@ SELECT routine_name, routine_type, data_type, external_language FROM information
 ----
 add_one  FUNCTION  integer  SQL
 
+# A procedure reports the language its body is written in — NUSASCRIPT for a BEGIN…END script body,
+# SQL for a plain statement body — the same distinction a function's row already draws.
+statement ok
+CREATE TABLE plog (n INT)
+
+statement ok
+CREATE PROCEDURE plog_script() AS $$ BEGIN INSERT INTO plog VALUES (1); END $$
+
+statement ok
+CREATE PROCEDURE plog_sql() AS $$ INSERT INTO plog VALUES (2) $$
+
+query TTT
+SELECT routine_name, routine_type, external_language FROM information_schema.routines
+WHERE routine_type = 'PROCEDURE' ORDER BY routine_name
+----
+plog_script  PROCEDURE  NUSASCRIPT
+plog_sql  PROCEDURE  SQL
+
 statement ok
 CREATE SEQUENCE sq START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CYCLE
 

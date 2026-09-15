@@ -3496,13 +3496,21 @@ fn info_schema_routines(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Ro
         ]);
     }
     for (name, body) in super::procedure::all_procedures(engine, txn)? {
+        // A procedure's language is not stored, but its body reveals it: a script `BEGIN … END`
+        // block runs through the interpreter, a plain statement list is SQL. Report it the same way
+        // a function does, rather than always claiming SQL.
+        let language = if crate::parser::is_script(&body) {
+            "NUSASCRIPT"
+        } else {
+            "SQL"
+        };
         rows.push(vec![
             ast::Value::Text("nusadb".to_owned()),
             ast::Value::Text("public".to_owned()),
             ast::Value::Text(name),
             ast::Value::Text("PROCEDURE".to_owned()),
             ast::Value::Null,
-            ast::Value::Text("SQL".to_owned()),
+            ast::Value::Text(language.to_owned()),
             ast::Value::Text(body),
         ]);
     }
