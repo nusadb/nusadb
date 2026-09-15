@@ -215,26 +215,29 @@ fn sweep_stale_spill_files(dir: &str) {
     }
 }
 
-/// Resolve the effective `USER:PASSWORD` credential pairs. `--auth-user` pairs take
-/// precedence; with none, fall back to the `NUSADB_USER` + `NUSADB_PASSWORD` env pair (so a
-/// container can require auth without baking a secret into the image). No pairs and no env → empty
-/// (trust-on-startup). Setting only one of the two env values is a configuration error. Pure (env is
-/// read by the caller) so the precedence/error logic is unit-testable.
+/// Resolve the effective `USER:PASSWORD` credential pairs. The `NUSADB_USER` + `NUSADB_PASSWORD`
+/// env pair is one more credential, equivalent to a single `--auth-user`, so it is *added* to the
+/// `--auth-user` list rather than replaced by it: a container can set the root credential in the
+/// environment while also passing `--auth-user` for application users, and all of them can log in.
+/// No pairs and no env → empty (trust-on-startup). Setting only one of the two env values is a
+/// configuration error. Pure (env is read by the caller) so the merge/error logic is unit-testable.
 fn resolve_auth_pairs(
     cli_pairs: &[String],
     env_user: Option<String>,
     env_password: Option<String>,
 ) -> Result<Vec<String>, String> {
-    if !cli_pairs.is_empty() {
-        return Ok(cli_pairs.to_vec());
-    }
-    match (env_user, env_password) {
-        (Some(user), Some(password)) => Ok(vec![format!("{user}:{password}")]),
+    let env_pair = match (env_user, env_password) {
+        (Some(user), Some(password)) => Some(format!("{user}:{password}")),
         (Some(_), None) | (None, Some(_)) => {
-            Err("set both NUSADB_USER and NUSADB_PASSWORD (or neither), not just one".to_owned())
+            return Err(
+                "set both NUSADB_USER and NUSADB_PASSWORD (or neither), not just one".to_owned(),
+            );
         },
-        (None, None) => Ok(Vec::new()),
-    }
+        (None, None) => None,
+    };
+    let mut pairs = cli_pairs.to_vec();
+    pairs.extend(env_pair);
+    Ok(pairs)
 }
 
 /// Build the optional SCRAM credential store from the resolved credential pairs (see
@@ -621,14 +624,19 @@ mod tests {
     use super::resolve_auth_pairs;
 
     #[test]
-    fn cli_pairs_take_precedence_over_env() {
+    fn env_credential_is_added_to_cli_pairs() {
+        // The env pair is another credential, not a fallback: with `--auth-user` present it is still
+        // usable, so an env root and a CLI app user can both log in.
         let r = resolve_auth_pairs(
             &["admin:secret".to_owned()],
             Some("envuser".to_owned()),
             Some("envpass".to_owned()),
         )
         .unwrap();
-        assert_eq!(r, vec!["admin:secret".to_owned()]);
+        assert_eq!(
+            r,
+            vec!["admin:secret".to_owned(), "envuser:envpass".to_owned()]
+        );
     }
 
     #[test]
