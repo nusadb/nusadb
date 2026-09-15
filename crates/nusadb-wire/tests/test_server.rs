@@ -1611,6 +1611,58 @@ async fn copy_to_stdout_streams_rows() {
     handle.await.unwrap().unwrap();
 }
 
+/// `COPY ... TO STDOUT` renders a boolean as the interchange `t`/`f` — the form the load side reads
+/// back — rather than the `true`/`false` display text a `SELECT` would show.
+#[tokio::test]
+async fn copy_to_stdout_renders_booleans_as_t_f() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, engine));
+    let mut conn = Connection::new(client);
+
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+    query(&mut conn, "CREATE TABLE flags (id INT NOT NULL, ok BOOL)").await;
+    let _ = next(&mut conn).await;
+    let _ = next(&mut conn).await;
+    query(&mut conn, "INSERT INTO flags VALUES (1, true), (2, false)").await;
+    let _ = next(&mut conn).await;
+    let _ = next(&mut conn).await;
+
+    query(&mut conn, "COPY flags (id, ok) TO STDOUT").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::CopyOutResponse { columns: 2 }
+    );
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::CopyData {
+            data: b"1\tt\n2\tf\n".to_vec()
+        }
+    );
+    assert_eq!(next(&mut conn).await, BackendMessage::CopyDone);
+    assert_eq!(next(&mut conn).await, cc("COPY 2"));
+    consume_until_ready(&mut conn).await;
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
 /// `COPY FROM STDIN` aborts once the cumulative `CopyData` exceeds the configured byte cap
 /// instead of buffering without bound. The session stays in protocol sync and nothing is loaded.
 #[tokio::test]

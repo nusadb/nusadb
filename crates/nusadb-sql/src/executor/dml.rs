@@ -2012,6 +2012,16 @@ pub(super) fn run_copy_from(
     Ok(inserted)
 }
 
+/// Render a value for `COPY ... TO`: a boolean is `t`/`f` — the interchange form the load side
+/// (`parse_copy_field`) reads back and the form a bulk export is expected to carry — and every other
+/// type keeps its ordinary display text.
+fn copy_value_text(value: &ast::Value) -> String {
+    match value {
+        ast::Value::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
+        other => crate::display::value_text(other),
+    }
+}
+
 /// Execute `COPY <table> TO STDOUT`: render the table's visible rows in the text format,
 /// returning the row count and the rendered payload (newline-terminated lines). A leading header
 /// line of column names is emitted when `WITH (HEADER)` is set.
@@ -2061,7 +2071,7 @@ pub(super) fn run_copy_to(
             .iter()
             .map(|&i| match row.get(i) {
                 Some(ast::Value::Null) | None => None,
-                Some(value) => Some(crate::display::value_text(value)),
+                Some(value) => Some(copy_value_text(value)),
             })
             .collect();
         let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
@@ -2117,7 +2127,7 @@ fn run_copy_query_to(
             .iter()
             .map(|value| match value {
                 ast::Value::Null => None,
-                value => Some(crate::display::value_text(value)),
+                value => Some(copy_value_text(value)),
             })
             .collect();
         let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
