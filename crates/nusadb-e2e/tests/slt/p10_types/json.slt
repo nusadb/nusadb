@@ -841,3 +841,15 @@ query T
 SELECT CAST(JSONB_PATH_QUERY_ARRAY('[1,"x",true]'::JSONB, '$[*] ? (@.type() == "string")') AS TEXT)
 ----
 ["x"]
+
+# A bare NULL argument to json_build_array becomes JSON null, with no cast needed (it used to be
+# rejected as an indeterminate NULL, forcing an explicit `NULL::text`).
+query T
+SELECT JSON_BUILD_ARRAY(1, 'a', NULL)
+----
+[1, "a", null]
+
+query T
+SELECT JSONB_BUILD_ARRAY(NULL, NULL)
+----
+[null, null]

@@ -1967,15 +1967,27 @@ fn analyze_json_construct(
             args.len()
         )));
     }
+    // A bare NULL argument becomes JSON `null`, so its SQL type is immaterial — accept it without a
+    // cast, the way the reference engine does, instead of rejecting it as an indeterminate NULL.
+    // Confined to the array/scalar forms: an object builder's *key* must not be null, so its
+    // arguments keep the ordinary typing that rejects a bare NULL there.
+    let allow_bare_null = matches!(func, F::ToJson | F::JsonBuildArray);
     let mut typed = Vec::with_capacity(args.len());
     for arg in args {
-        typed.push(analyze_expr_agg(
-            arg,
-            scope,
-            catalog,
-            None,
-            aggregates.as_deref_mut(),
-        )?);
+        if allow_bare_null && matches!(arg, ast::Expr::Literal(ast::Value::Null)) {
+            typed.push(TypedExpr {
+                kind: TypedExprKind::Literal(ast::Value::Null),
+                ty: ColumnType::Text,
+            });
+        } else {
+            typed.push(analyze_expr_agg(
+                arg,
+                scope,
+                catalog,
+                None,
+                aggregates.as_deref_mut(),
+            )?);
+        }
     }
     Ok(TypedExpr {
         kind: TypedExprKind::ScalarFunction { func, args: typed },
