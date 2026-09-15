@@ -1,0 +1,37 @@
+# p2_dml/returning_scale — RETURNING must project each value at its column's declared scale, the
+# same value a later read decodes. An UPDATE whose SET expression produces a higher-scale result
+# (total * 1.1) previously returned the un-rescaled value (132.000) while storing the rescaled one
+# (132.00), so RETURNING disagreed with the stored row.
+
+statement ok
+CREATE TABLE m (id INT, total NUMERIC(10,2))
+
+statement ok
+INSERT INTO m VALUES (1, 120.00)
+
+# The computed 132.000 is rescaled to the column's scale before RETURNING sees it.
+query T
+UPDATE m SET total = total * 1.1 WHERE id = 1 RETURNING total
+----
+132.00
+
+# The stored value agrees with what RETURNING reported.
+query T
+SELECT total FROM m WHERE id = 1
+----
+132.00
+
+# INSERT ... RETURNING likewise reports the column-scaled value, not the literal's own scale
+# (padding a shorter literal, and dropping a trailing zero past the scale).
+query IT
+INSERT INTO m VALUES (2, 5.7) RETURNING id, total
+----
+2	5.70
+
+query IT
+INSERT INTO m VALUES (3, 3.400) RETURNING id, total
+----
+3	3.40
+
+statement ok
+DROP TABLE m

@@ -665,6 +665,11 @@ fn slt_p2_implicit_coercion() {
 }
 
 #[test]
+fn slt_p2_returning_scale() {
+    run_slt("tests/slt/p2_dml/returning_scale.slt");
+}
+
+#[test]
 fn slt_p3_where_orderby_limit() {
     run_slt("tests/slt/p3_filter/where_orderby_limit.slt");
 }

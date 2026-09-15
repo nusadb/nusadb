@@ -110,7 +110,7 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
         // key of the wrong type that a correctly-typed `=` lookup never finds: a silent row-miss
         // through the index, PRIMARY KEY included. The full column type is used, so a NUMERIC is
         // rescaled to the column's scale exactly as storage does.
-        (V::Int(_) | V::Float(_) | V::Text(_), T::Numeric { .. })
+        (V::Int(_) | V::Numeric(_) | V::Float(_) | V::Text(_), T::Numeric { .. })
         | (V::Int(_) | V::Numeric(_) | V::Text(_), T::Float)
         | (
             V::Text(_),
