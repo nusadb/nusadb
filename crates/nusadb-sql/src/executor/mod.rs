@@ -684,15 +684,16 @@ pub fn show_session_variable(name: &str, settings: &HashMap<String, String>) -> 
     let value = settings
         .get(name)
         .cloned()
-        .or_else(|| {
-            if matches!(
-                name,
-                "transaction_isolation" | "default_transaction_isolation"
-            ) {
+        .or_else(|| match name {
+            "transaction_isolation" | "default_transaction_isolation" => {
                 Some(isolation_guc_text(IsolationLevel::default()).to_owned())
-            } else {
-                session_ctx::builtin_guc_static_default(name).map(ToOwned::to_owned)
-            }
+            },
+            // A memory/timeout GUC read after a `RESET` (or never set) reports its effective default
+            // rather than an empty string: the process work-memory budget (or spill threshold), and
+            // `0` for a disabled statement timeout.
+            "work_mem" => Some(ops::format_work_mem(ops::reported_work_mem())),
+            "statement_timeout" => Some("0".to_owned()),
+            _ => session_ctx::builtin_guc_static_default(name).map(ToOwned::to_owned),
         })
         .unwrap_or_default();
     ExecutionResult::Rows {
@@ -2083,13 +2084,16 @@ impl<'engine> Session<'engine> {
     /// [`session_ctx::builtin_guc_static_default`] (so `SHOW` and `current_setting` agree). Returns
     /// `None` for an unknown variable, leaving the empty-string fallback in place.
     fn builtin_guc_default(&self, name: &str) -> Option<String> {
-        if matches!(
-            name,
-            "transaction_isolation" | "default_transaction_isolation"
-        ) {
-            return Some(isolation_guc_text(self.default_isolation).to_owned());
+        match name {
+            "transaction_isolation" | "default_transaction_isolation" => {
+                Some(isolation_guc_text(self.default_isolation).to_owned())
+            },
+            // A memory/timeout GUC read after a `RESET` (or never set) reports its effective default
+            // rather than an empty string — the same values the wire `SHOW` path reports.
+            "work_mem" => Some(ops::format_work_mem(ops::reported_work_mem())),
+            "statement_timeout" => Some("0".to_owned()),
+            _ => session_ctx::builtin_guc_static_default(name).map(ToOwned::to_owned),
         }
-        session_ctx::builtin_guc_static_default(name).map(ToOwned::to_owned)
     }
 
     fn savepoint(&self, name: &str) -> Result<ExecutionResult, Error> {

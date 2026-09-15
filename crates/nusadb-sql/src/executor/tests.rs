@@ -550,6 +550,30 @@ fn parse_work_mem_follows_pg_units() {
     }
 }
 
+#[test]
+fn format_work_mem_renders_the_largest_clean_unit_and_round_trips() {
+    for (bytes, text) in [
+        (0_usize, "0"),
+        (64 * 1024 * 1024, "64MB"),
+        (4 * 1024 * 1024, "4MB"),
+        (8 * 1024, "8kB"),
+        (2 * 1024 * 1024 * 1024, "2GB"),
+        (1536 * 1024, "1536kB"), // 1.5 MB is not a whole MB, so it falls to kB
+        (500, "500B"),           // not a whole kB
+    ] {
+        assert_eq!(
+            super::format_work_mem(bytes),
+            text,
+            "format_work_mem({bytes})"
+        );
+        // A kB/MB/GB rendering (and "0") round-trips back through the SET parser; a bare-byte
+        // rendering has no SET unit and parses to None, which is fine — it is never a stored value.
+        if let Some(parsed) = super::parse_work_mem(text) {
+            assert_eq!(parsed, bytes, "round-trip {text:?}");
+        }
+    }
+}
+
 /// The executor budget — both the per-stage materialization check and the recursive-CTE guard —
 /// must honour a session `SET work_mem`, not only the process-wide `--work-mem` default it used to
 /// read exclusively (the decisive probe: a recursion far above `SET work_mem` completed regardless

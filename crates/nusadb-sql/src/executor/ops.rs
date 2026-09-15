@@ -1334,6 +1334,41 @@ pub fn work_mem() -> usize {
     WORK_MEM.load(Ordering::Relaxed)
 }
 
+/// The work-memory budget to report for `SHOW work_mem` when no session override is in play.
+///
+/// The process-default per-query budget when one is set, else the spill threshold when spill-to-disk
+/// is configured (the effective memory bound), else `0` (no per-query limit). Reported as a value the
+/// `SET` parser reads back, so a `SHOW` after a `RESET` no longer renders an empty string.
+#[must_use]
+pub fn reported_work_mem() -> usize {
+    let budget = work_mem();
+    if budget != 0 {
+        return budget;
+    }
+    super::spill::spill_config().map_or(0, |c| c.threshold_bytes)
+}
+
+/// Format a memory-GUC byte count the way [`parse_work_mem`] reads it back (binary `kB`/`MB`/`GB`).
+///
+/// `67108864` → `"64MB"`, `4194304` → `"4MB"`, `8192` → `"8kB"`, `0` → `"0"`. A size that is not a
+/// whole multiple of the larger unit falls to the next unit down.
+#[must_use]
+pub fn format_work_mem(bytes: usize) -> String {
+    const K: usize = 1024;
+    if bytes == 0 {
+        return "0".to_owned();
+    }
+    if bytes.is_multiple_of(K * K * K) {
+        format!("{}GB", bytes / (K * K * K))
+    } else if bytes.is_multiple_of(K * K) {
+        format!("{}MB", bytes / (K * K))
+    } else if bytes.is_multiple_of(K) {
+        format!("{}kB", bytes / K)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 /// Fallback for [`maintenance_work_mem`] when it is not set: bounds a `CREATE INDEX` backfill's
 /// buffered entries so the build stays within a modest footprint on any host.
 const DEFAULT_MAINTENANCE_WORK_MEM: usize = 64 << 20; // 64 MiB

@@ -56,3 +56,31 @@ query T
 SHOW client_min_messages
 ----
 notice
+
+# work_mem and statement_timeout report their effective default after a RESET (or when never set),
+# not an empty string. With no per-query budget and no spill configured the budget is unlimited (0).
+query T
+SHOW statement_timeout
+----
+0
+
+query T
+SHOW work_mem
+----
+0
+
+statement ok
+SET work_mem = '16MB'
+
+query T
+SHOW work_mem
+----
+16MB
+
+statement ok
+RESET work_mem
+
+query T
+SHOW work_mem
+----
+0
