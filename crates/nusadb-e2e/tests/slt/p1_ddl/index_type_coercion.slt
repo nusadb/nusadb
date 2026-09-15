@@ -1,0 +1,107 @@
+# p1_ddl/index_type_coercion — an index on a NUMERIC or TIMESTAMPTZ (etc.) column must find a row
+# whose value entered as a different runtime type (int literal to NUMERIC, text literal to
+# TIMESTAMPTZ). The value adopts the column type before it is indexed, so the index key matches both
+# the stored form and the query-side lookup key. Regression for a silent index row-miss.
+
+statement ok
+CREATE TABLE ix (id INT, v NUMERIC(12,2))
+
+statement ok
+CREATE INDEX ix_v ON ix (v)
+
+# id 1 enters `45` (int), id 2 enters `45.00` (numeric) — both are the value 45.00 in the column.
+statement ok
+INSERT INTO ix VALUES (1, 45), (2, 45.00)
+
+# The index lookup must find BOTH rows, identical to the sequential scan.
+query I
+SELECT id FROM ix WHERE v = 45 ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM ix WHERE v + 0 = 45 ORDER BY id
+----
+1
+2
+
+# Range predicates over the index must not miss the int-entered row either.
+query I
+SELECT id FROM ix WHERE v BETWEEN 40 AND 50 ORDER BY id
+----
+1
+2
+
+# A NUMERIC PRIMARY KEY (a unique index) — a row entered with an int literal is found by PK lookup.
+statement ok
+CREATE TABLE pk1 (v NUMERIC(10,2) PRIMARY KEY, n TEXT)
+
+statement ok
+INSERT INTO pk1 VALUES (100, 'hundred')
+
+query T
+SELECT n FROM pk1 WHERE v = 100
+----
+hundred
+
+query T
+SELECT n FROM pk1 WHERE v = 100.00
+----
+hundred
+
+statement ok
+UPDATE pk1 SET n = 'seratus' WHERE v = 100
+
+query T
+SELECT n FROM pk1 WHERE v = 100
+----
+seratus
+
+# A TIMESTAMPTZ index — a row whose value entered as a text literal is found by an equality that
+# uses the index.
+statement ok
+CREATE TABLE ts (id INT, t TIMESTAMPTZ)
+
+statement ok
+CREATE INDEX ts_t ON ts (t)
+
+statement ok
+INSERT INTO ts VALUES (1, '2026-01-02 00:00:00+00'), (2, TIMESTAMPTZ '2026-01-02 00:00:00+00')
+
+query I
+SELECT id FROM ts WHERE t = TIMESTAMPTZ '2026-01-02 00:00:00+00' ORDER BY id
+----
+1
+2
+
+# A FLOAT index likewise: an int literal into a double column must be found through the index.
+statement ok
+CREATE TABLE fx (id INT, f DOUBLE PRECISION)
+
+statement ok
+CREATE INDEX fx_f ON fx (f)
+
+statement ok
+INSERT INTO fx VALUES (1, 45), (2, 45.0)
+
+query I
+SELECT id FROM fx WHERE f = 45 ORDER BY id
+----
+1
+2
+
+# A bare decimal literal (a NUMERIC value) into the FLOAT column must also index under a float key,
+# so a float-typed probe that uses the index finds it.
+statement ok
+INSERT INTO fx VALUES (3, 45.0)
+
+query I
+SELECT id FROM fx WHERE f = CAST(45.0 AS DOUBLE PRECISION) ORDER BY id
+----
+1
+2
+3
+
+statement ok
+DROP TABLE ix, pk1, ts, fx

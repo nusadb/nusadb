@@ -94,12 +94,39 @@ pub(crate) fn encode(row: &[ast::Value], schema: &[ColumnType]) -> Result<Vec<u8
 /// Takes one value at a time so a caller with the column types in any shape — a `ColumnType` slice
 /// or a `ColumnDef` list — can drive it without materializing a second one per row.
 pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
-    match (&value, ty.physical()) {
-        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => {
-            *value = ast::Value::Timestamp(*t);
+    use ColumnType as T;
+    use ast::Value as V;
+    match (&*value, ty.physical()) {
+        (V::TimestampTz(t), T::Timestamp) => {
+            *value = V::Timestamp(*t);
         },
-        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => {
-            *value = ast::Value::TimestampTz(*t);
+        (V::Timestamp(t), T::TimestampTz) => {
+            *value = V::TimestampTz(*t);
+        },
+        // A value whose runtime type differs from the column's stored type is coerced to the column
+        // type here — before the index key, uniqueness check, RLS, and RETURNING ever see the row —
+        // so all of them (and the stored bytes, and a later read) agree. Without this, e.g. an INT
+        // written to a NUMERIC column, or a text literal to a TIMESTAMPTZ column, is indexed under a
+        // key of the wrong type that a correctly-typed `=` lookup never finds: a silent row-miss
+        // through the index, PRIMARY KEY included. The full column type is used, so a NUMERIC is
+        // rescaled to the column's scale exactly as storage does.
+        (V::Int(_) | V::Float(_) | V::Text(_), T::Numeric { .. })
+        | (V::Int(_) | V::Numeric(_) | V::Text(_), T::Float)
+        | (
+            V::Text(_),
+            T::TimestampTz
+            | T::Timestamp
+            | T::Date
+            | T::Time
+            | T::TimeTz
+            | T::Interval
+            | T::Uuid
+            | T::Macaddr
+            | T::Macaddr8,
+        ) => {
+            if let Ok(coerced) = super::eval::cast_value(value.clone(), ty) {
+                *value = coerced;
+            }
         },
         _ => {},
     }

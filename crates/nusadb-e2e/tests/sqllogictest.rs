@@ -570,6 +570,11 @@ fn slt_p1_partition_expr_key() {
 }
 
 #[test]
+fn slt_p1_index_type_coercion() {
+    run_slt("tests/slt/p1_ddl/index_type_coercion.slt");
+}
+
+#[test]
 fn slt_p1_partition_list_hash() {
     run_slt("tests/slt/p1_ddl/partition_list_hash.slt");
 }
