@@ -206,3 +206,21 @@ SELECT INTERVAL 'nan months'
 
 statement error
 SELECT INTERVAL 'inf months'
+
+# One-letter `s` (seconds) abbreviation is accepted, like the spelled-out `seconds` — trimming a
+# trailing `s` used to erase it to nothing and reject `0 s`.
+query T
+SELECT INTERVAL '0 s'
+----
+00:00:00
+
+query T
+SELECT INTERVAL '5 s'
+----
+00:00:05
+
+# Mixed abbreviated units and the one-letter `s` in one literal.
+query T
+SELECT INTERVAL '1 hr 30 min 15 s'
+----
+01:30:15

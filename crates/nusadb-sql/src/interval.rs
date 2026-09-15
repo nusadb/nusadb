@@ -288,14 +288,23 @@ impl Interval {
             }
             let unit = tokens.next()?;
             let (whole, frac) = (n.trunc(), n.fract());
-            match unit.trim_end_matches('s').to_ascii_lowercase().as_str() {
-                "year" | "yr" => months += n * 12.0,
-                "mon" | "month" => months += n,
-                "week" | "wk" => days += n * 7.0,
-                "day" => days += n,
-                "hour" | "hr" => add_time(whole, frac, 3600 * MICROS_PER_SEC, &mut micros_whole)?,
-                "min" | "minute" => add_time(whole, frac, 60 * MICROS_PER_SEC, &mut micros_whole)?,
-                "sec" | "second" => add_time(whole, frac, MICROS_PER_SEC, &mut micros_whole)?,
+            // Match the unit spelled out — singular, plural, and abbreviation — rather than
+            // stripping a trailing `s`, which erased the one-letter `s` (seconds) abbreviation down
+            // to nothing and rejected `0 s`.
+            match unit.to_ascii_lowercase().as_str() {
+                "year" | "years" | "yr" | "yrs" => months += n * 12.0,
+                "mon" | "mons" | "month" | "months" => months += n,
+                "week" | "weeks" | "wk" | "wks" => days += n * 7.0,
+                "day" | "days" => days += n,
+                "hour" | "hours" | "hr" | "hrs" => {
+                    add_time(whole, frac, 3600 * MICROS_PER_SEC, &mut micros_whole)?;
+                },
+                "min" | "mins" | "minute" | "minutes" => {
+                    add_time(whole, frac, 60 * MICROS_PER_SEC, &mut micros_whole)?;
+                },
+                "s" | "sec" | "secs" | "second" | "seconds" => {
+                    add_time(whole, frac, MICROS_PER_SEC, &mut micros_whole)?;
+                },
                 _ => return None,
             }
             saw_any = true;
