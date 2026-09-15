@@ -1546,9 +1546,10 @@ fn insert_through_view(
         ));
     }
     if !ins.returning.is_empty() {
-        return Err(Error::Unsupported(
-            "INSERT ... RETURNING through a view is not supported yet".to_owned(),
-        ));
+        // RETURNING names the view's columns; it can be projected only when the view exposes every
+        // base column under its own name, so the retargeted base INSERT resolves those same names.
+        // A renaming or subsetting view is refused, as its RETURNING could not be resolved.
+        require_full_identity_view(&view, &ins.table, catalog)?;
     }
     let base_columns = if ins.columns.is_empty() {
         // No column list: the target is every view column, in view order.
@@ -1601,7 +1602,7 @@ fn require_full_identity_view(
 ) -> Result<(), Error> {
     if view.col_map.iter().any(|(out, base)| out != base) {
         return Err(Error::Unsupported(format!(
-            "UPDATE/DELETE through view `{view_name}` that renames a column is not supported yet"
+            "a write through view `{view_name}` that renames a column is not supported yet"
         )));
     }
     let base = super::lookup_table_ref(view.base_schema.as_deref(), &view.base_table, catalog)?
@@ -1615,7 +1616,7 @@ fn require_full_identity_view(
         .any(|col| !exposed.contains(col.name.as_str()))
     {
         return Err(Error::Unsupported(format!(
-            "UPDATE/DELETE through view `{view_name}` that exposes only some base columns is not \
+            "a write through view `{view_name}` that exposes only some base columns is not \
              supported yet"
         )));
     }
@@ -1630,11 +1631,9 @@ fn update_through_view(
     view_name: &str,
     catalog: &dyn Catalog,
 ) -> Result<UpdatePlan, Error> {
-    if !upd.returning.is_empty() {
-        return Err(Error::Unsupported(
-            "UPDATE ... RETURNING through a view is not supported yet".to_owned(),
-        ));
-    }
+    // RETURNING flows through unchanged: the identity check below guarantees the view exposes every
+    // base column under its own name, so RETURNING (which names view columns) resolves against the
+    // retargeted base table.
     require_full_identity_view(&view, view_name, catalog)?;
     let check_option = view.check_option;
     let view_filter = view.filter.clone();
@@ -1665,11 +1664,8 @@ fn delete_through_view(
     view_name: &str,
     catalog: &dyn Catalog,
 ) -> Result<DeletePlan, Error> {
-    if !del.returning.is_empty() {
-        return Err(Error::Unsupported(
-            "DELETE ... RETURNING through a view is not supported yet".to_owned(),
-        ));
-    }
+    // RETURNING flows through: the identity check guarantees every base column is exposed under its
+    // own name, so RETURNING resolves against the retargeted base table.
     require_full_identity_view(&view, view_name, catalog)?;
     del.filter = and_filters(del.filter.take(), view.filter);
     del.schema = view.base_schema;

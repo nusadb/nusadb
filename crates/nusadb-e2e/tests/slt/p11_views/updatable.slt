@@ -40,6 +40,23 @@ SELECT id, v FROM bt ORDER BY id
 ----
 1 99
 
+# --- RETURNING through an identity view (exposes every base column under its own name) projects
+# the affected rows, mapped back to the view's columns ---
+query II
+INSERT INTO bv VALUES (6, 60) RETURNING id, v
+----
+6 60
+
+query II
+UPDATE bv SET v = 61 WHERE id = 6 RETURNING id, v
+----
+6 61
+
+query II
+DELETE FROM bv WHERE id = 6 RETURNING id, v
+----
+6 61
+
 # --- A row-filtered view only exposes (and so only mutates) matching rows ---
 statement ok
 CREATE TABLE t (id INT, status INT, note TEXT)
@@ -122,7 +139,8 @@ UPDATE sv SET a = 9
 statement error
 UPDATE rv SET x = 1
 
-# RETURNING through a view is not supported yet (a loud refusal, not a wrong answer).
+# RETURNING through a non-identity view (sv omits base column c) cannot be projected — a loud
+# refusal, not a wrong answer. (Through an identity view it works — see bv above.)
 statement error
 INSERT INTO sv VALUES (5, 6) RETURNING a
 
