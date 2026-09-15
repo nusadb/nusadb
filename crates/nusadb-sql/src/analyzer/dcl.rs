@@ -226,6 +226,18 @@ pub(super) fn require_superuser(catalog: &dyn Catalog, action: &str) -> Result<(
     )))
 }
 
+/// Creating a database or a schema needs the `CREATEDB` attribute (or superuser). A schema is a
+/// namespace a plain login role must not be able to mint, so it is gated by the same attribute
+/// that gates a database rather than left open. Fail-closed: a role without it is refused.
+pub(super) fn require_createdb(catalog: &dyn Catalog, action: &str) -> Result<(), Error> {
+    if catalog.may_create_database()? {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied(format!(
+        "permission denied to {action}: the CREATEDB attribute is required"
+    )))
+}
+
 /// Resolve a table or sequence name written in a `GRANT` into the canonical `schema.name` the
 /// privilege catalog keys on.
 ///

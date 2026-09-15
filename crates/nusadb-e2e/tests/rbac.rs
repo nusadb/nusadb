@@ -123,6 +123,10 @@ impl Catalog for RbacCatalog<'_> {
         self.with_txn(|txn| nusadb_sql::rbac::may_create_role(self.engine, txn, self.user))
     }
 
+    fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::rbac::may_create_database(self.engine, txn, self.user))
+    }
+
     fn may_administer_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
         self.with_txn(|txn| {
             nusadb_sql::rbac::may_administer_role(self.engine, txn, self.user, role)
@@ -778,6 +782,23 @@ fn a_schema_can_be_dropped_by_its_creator() {
     // app creates and then drops its own schema.
     ok_as(&engine, "app", "CREATE SCHEMA mine");
     ok_as(&engine, "app", "DROP SCHEMA mine");
+}
+
+/// Creating a database or a schema needs the CREATEDB attribute (or superuser): a bare login role
+/// is refused both, and the same statements succeed once the attribute is granted. A schema is a
+/// namespace, gated like a database rather than left open to every role.
+#[test]
+fn create_database_and_schema_need_createdb() {
+    let engine = fixture();
+    // `app` holds nothing: both are refused, naming the missing attribute.
+    denied_as(&engine, "app", "CREATE SCHEMA app_schema");
+    denied_as(&engine, "app", "CREATE DATABASE app_db");
+    // Granting CREATEDB opens both.
+    root(&engine, "ALTER ROLE app CREATEDB");
+    ok_as(&engine, "app", "CREATE SCHEMA app_schema");
+    ok_as(&engine, "app", "CREATE DATABASE app_db");
+    // The superuser is never gated.
+    ok_as(&engine, ROOT, "CREATE SCHEMA root_schema");
 }
 
 /// B4 — `DROP DATABASE` is superuser-only.

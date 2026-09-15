@@ -4692,6 +4692,10 @@ impl crate::Catalog for ExecCatalog<'_> {
         crate::rbac::may_create_role(self.engine, self.txn, &self.user)
     }
 
+    fn may_create_database(&self) -> Result<bool, Error> {
+        crate::rbac::may_create_database(self.engine, self.txn, &self.user)
+    }
+
     fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
         crate::rbac::may_administer_role(self.engine, self.txn, &self.user, role)
     }
@@ -4894,6 +4898,10 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn may_create_role(&self) -> Result<bool, Error> {
         crate::rbac::may_create_role(self.engine, self.txn, self.user)
+    }
+
+    fn may_create_database(&self) -> Result<bool, Error> {
+        crate::rbac::may_create_database(self.engine, self.txn, self.user)
     }
 
     fn may_administer_role(&self, role: &str) -> Result<bool, Error> {

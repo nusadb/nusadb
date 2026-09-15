@@ -1535,6 +1535,27 @@ pub fn may_create_role(engine: &dyn StorageEngine, txn: TxnId, user: &str) -> Re
         .any(|r| r.create_role && effective.contains(&r.name)))
 }
 
+/// Whether `user` may create a database or a schema — a superuser, or a role holding `CREATEDB`.
+///
+/// A schema is a namespace, so minting one is gated by the same attribute that gates minting a
+/// database rather than left open to every login role. A role without it is refused.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn may_create_database(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+) -> Result<bool, Error> {
+    let (effective, superuser) = resolve_session(engine, txn, user)?;
+    if superuser {
+        return Ok(true);
+    }
+    Ok(all_roles(engine, txn)?
+        .into_iter()
+        .any(|r| r.create_db && effective.contains(&r.name)))
+}
+
 /// Whether `user` may administer `role` — grant membership in it, or drop it.
 ///
 /// True for a superuser, for a role with the `CREATEROLE` attribute, and for a member holding the

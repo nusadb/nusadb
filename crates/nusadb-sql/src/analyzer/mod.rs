@@ -378,6 +378,11 @@ pub trait Catalog {
         Ok(true)
     }
 
+    /// Whether the session may create a database or a schema — holds `CREATEDB`, or is a superuser.
+    fn may_create_database(&self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
     /// Whether the session may grant membership in, alter, or drop `role`.
     fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
         let _ = role;
@@ -890,10 +895,16 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::AlterPolicy(ap) => analyze_alter_policy(ap, catalog),
         // CREATE/DROP SCHEMA: the catalog/engine path exists, so resolve the
         // statement shape; the executor calls the engine (and resolves the name → id for DROP).
-        ast::Statement::CreateSchema(cs) => Ok(LogicalPlan::CreateSchema(CreateSchemaPlan {
-            name: cs.name,
-            if_not_exists: cs.if_not_exists,
-        })),
+        ast::Statement::CreateSchema(cs) => {
+            // A schema is a namespace, not a private object like a table — minting one is gated by
+            // the CREATEDB attribute (or superuser), so a plain login role cannot carve out schemas
+            // at will. The creator owns what it makes and may drop it (see DROP SCHEMA above).
+            dcl::require_createdb(catalog, "create a schema")?;
+            Ok(LogicalPlan::CreateSchema(CreateSchemaPlan {
+                name: cs.name,
+                if_not_exists: cs.if_not_exists,
+            }))
+        },
         ast::Statement::DropSchema(ds) => {
             // Owner-or-superuser only, like DROP TABLE — otherwise any role empties another's
             // schema by going one level up. A missing schema under IF EXISTS still no-ops in the
@@ -907,10 +918,16 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         },
         // CREATE/ALTER DATABASE: NusaDB is single-database per data dir, so these are accepted as a
         // compatibility no-op (no catalog work) — the executor just reports success.
-        ast::Statement::CreateDatabase(cd) => Ok(LogicalPlan::CreateDatabase(CreateDatabasePlan {
-            name: cd.name,
-            if_not_exists: cd.if_not_exists,
-        })),
+        ast::Statement::CreateDatabase(cd) => {
+            // Gated by the CREATEDB attribute (or superuser), so an unprivileged login role cannot
+            // create databases — even though the statement is a single-database compatibility no-op,
+            // its acceptance must still respect the privilege it claims to honour.
+            dcl::require_createdb(catalog, "create a database")?;
+            Ok(LogicalPlan::CreateDatabase(CreateDatabasePlan {
+                name: cd.name,
+                if_not_exists: cd.if_not_exists,
+            }))
+        },
         ast::Statement::AlterDatabase(ad) => Ok(LogicalPlan::AlterDatabase(AlterDatabasePlan {
             name: ad.name,
         })),
