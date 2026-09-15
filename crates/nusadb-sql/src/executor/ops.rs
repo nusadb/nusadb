@@ -4968,6 +4968,10 @@ pub(super) fn output_columns(op: &PhysicalOperator) -> Vec<String> {
         },
         PhysicalOperator::Limit { input, .. }
         | PhysicalOperator::Distinct { input }
+        // A `Sort` only reorders rows, so it keeps its input's columns. It sits on TOP of the
+        // projection when an ORDER BY key is a set-returning SELECT item (whose values exist only
+        // after `ProjectSet` expands them); without this arm such a query announces no columns.
+        | PhysicalOperator::Sort { input, .. }
         // `LockRows` (FOR UPDATE/SHARE) yields its input's rows unchanged.
         | PhysicalOperator::LockRows { input, .. } => output_columns(input),
         // The output columns of a `WITH RECURSIVE` query are its body's.
@@ -4996,6 +5000,8 @@ pub(super) fn output_column_types(op: &PhysicalOperator) -> Vec<ColumnType> {
         },
         PhysicalOperator::Limit { input, .. }
         | PhysicalOperator::Distinct { input }
+        // Parallel to `output_columns`: a `Sort` above the projection keeps its input's types.
+        | PhysicalOperator::Sort { input, .. }
         | PhysicalOperator::LockRows { input, .. } => output_column_types(input),
         PhysicalOperator::WithRecursive { body, .. }
         | PhysicalOperator::WithModifying { body, .. } => output_column_types(body),

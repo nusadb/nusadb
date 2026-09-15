@@ -2683,6 +2683,68 @@ async fn copy_query_to_stdout_is_gated_by_the_querys_analysis() {
     terminate_conn(su, su_handle).await;
 }
 
+/// A set-returning function in the SELECT list with ORDER BY on its output must stream every
+/// expanded row over the wire, not just report the count. The plan is `Sort` above `ProjectSet`;
+/// the streaming path reported `SELECT 3` while delivering zero `DataRow`s.
+#[tokio::test]
+async fn srf_with_order_by_streams_every_row() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, engine));
+    let mut conn = Connection::new(client);
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+
+    query(
+        &mut conn,
+        "SELECT unnest(ARRAY[30,10,20]) AS v ORDER BY v DESC",
+    )
+    .await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::RowDescription {
+            columns: vec!["v".to_owned()]
+        }
+    );
+    let mut rows = Vec::new();
+    let tag = loop {
+        match next(&mut conn).await {
+            BackendMessage::DataRow { values } => rows.push(values),
+            BackendMessage::CommandComplete { tag } => break tag,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(b"30".to_vec())],
+            vec![Some(b"20".to_vec())],
+            vec![Some(b"10".to_vec())],
+        ],
+        "every expanded, sorted row must be delivered"
+    );
+    assert_eq!(tag, "SELECT 3");
+    consume_until_ready(&mut conn).await;
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
 /// Close a connection and join its task.
 async fn terminate_conn(
     mut conn: Connection<tokio::io::DuplexStream>,
