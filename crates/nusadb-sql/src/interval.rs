@@ -239,10 +239,30 @@ impl Interval {
     }
 
     /// Apply both [`Self::justify_hours`] and [`Self::justify_days`] so days land in `[-29, 29]` and
-    /// the time part in `(-24h, 24h)` (`JUSTIFY_INTERVAL`, B-fn).
+    /// the time part in `(-24h, 24h)`, then reconcile signs so all three fields point the same way
+    /// (`JUSTIFY_INTERVAL`, B-fn). The sign pass is what turns `1 month -1 hour` into `29 days
+    /// 23:00:00` instead of leaving a positive month beside a negative hour: a field that disagrees
+    /// with the larger one borrows a whole unit from it.
     #[must_use]
     pub fn justify_interval(&self) -> Self {
-        self.justify_hours().justify_days()
+        let mut r = self.justify_hours().justify_days();
+        // `days`/`months` are bounded by the two justify passes, so these `± 30` / `± 1` adjustments
+        // (guarded by the sign checks) cannot overflow.
+        if r.months > 0 && (r.days < 0 || (r.days == 0 && r.micros < 0)) {
+            r.days += 30;
+            r.months -= 1;
+        } else if r.months < 0 && (r.days > 0 || (r.days == 0 && r.micros > 0)) {
+            r.days -= 30;
+            r.months += 1;
+        }
+        if r.days > 0 && r.micros < 0 {
+            r.micros += MICROS_PER_DAY;
+            r.days -= 1;
+        } else if r.days < 0 && r.micros > 0 {
+            r.micros -= MICROS_PER_DAY;
+            r.days += 1;
+        }
+        r
     }
 
     /// Parse an interval literal: a sequence of `N unit` terms (`unit` is one of
@@ -538,5 +558,27 @@ mod tests {
         // Negative components keep their sign in range.
         let neg = p("-35 days").justify_days();
         assert_eq!((neg.months, neg.days, neg.micros), (-1, -5, 0));
+    }
+
+    #[test]
+    fn justify_interval_reconciles_mixed_signs() {
+        // A positive month beside a negative hour is borrowed down: 1 mon -1 h → 29 days 23 h.
+        let a = p("1 month -1 hour").justify_interval();
+        assert_eq!(
+            (a.months, a.days, a.micros),
+            (0, 29, 23 * 3_600 * 1_000_000)
+        );
+        // Symmetric on the negative side: -1 mon 1 h → -29 days -23 h.
+        let b = p("-1 month 1 hour").justify_interval();
+        assert_eq!(
+            (b.months, b.days, b.micros),
+            (0, -29, -23 * 3_600 * 1_000_000)
+        );
+        // A positive day beside a negative time borrows a day: 1 day -1 h → 23 h.
+        let c = p("1 day -1 hour").justify_interval();
+        assert_eq!((c.months, c.days, c.micros), (0, 0, 23 * 3_600 * 1_000_000));
+        // Already-consistent signs are untouched.
+        let d = p("1 month 1 day 1 hour").justify_interval();
+        assert_eq!((d.months, d.days, d.micros), (1, 1, 3_600 * 1_000_000));
     }
 }

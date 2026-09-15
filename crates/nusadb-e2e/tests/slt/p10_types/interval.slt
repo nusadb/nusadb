@@ -224,3 +224,15 @@ query T
 SELECT INTERVAL '1 hr 30 min 15 s'
 ----
 01:30:15
+
+# justify_interval reconciles a mixed-sign interval: a positive month beside a negative hour is
+# borrowed down so every field points the same way.
+query T
+SELECT justify_interval(INTERVAL '1 month -1 hour')
+----
+29 days 23:00:00
+
+query T
+SELECT justify_interval(INTERVAL '1 day -1 hour')
+----
+23:00:00
