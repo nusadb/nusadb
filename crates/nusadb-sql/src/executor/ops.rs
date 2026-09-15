@@ -4335,42 +4335,114 @@ fn group_step(
     i64::try_from(if at_start { lo } else { hi }).unwrap_or(i64::MAX)
 }
 
-/// The i64 comparison key of a `RANGE` ordering value, or `None` for `NULL` (outside any value range)
-/// or an unsupported type. An integer is itself; a `DATE` is its midnight micros; a `TIMESTAMP[TZ]`
-/// is its micros — so an integer or temporal ordering both compare as i64 (the analyzer restricts a
-/// `RANGE` value offset to those column types).
-fn range_key(v: &ast::Value) -> Option<i64> {
+/// A `RANGE` frame comparison key.
+///
+/// An integer/temporal ordering compares as `i64` (micros for a temporal), a `NUMERIC` ordering as an
+/// exact `Decimal`, a `FLOAT` ordering as `f64`. The ordering column has one type, so every key a
+/// frame compares is the same variant.
+#[derive(Clone, Copy)]
+enum RangeKey {
+    Int(i64),
+    Dec(crate::numeric::Decimal),
+    Float(f64),
+}
+
+impl RangeKey {
+    /// Order two keys of the same variant (mismatched variants never arise — one ordering column).
+    fn compare(self, other: Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a.cmp(&b),
+            (Self::Dec(a), Self::Dec(b)) => a.compare(&b),
+            (Self::Float(a), Self::Float(b)) => a.total_cmp(&b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+/// The comparison key of a `RANGE` ordering value, or `None` for `NULL` (outside any value range) or
+/// an unsupported type.
+///
+/// An integer is itself; a `DATE` is its midnight micros; a `TIMESTAMP[TZ]` is its micros; a
+/// `NUMERIC` is its exact decimal; a `FLOAT` is itself — the column types the analyzer permits for a
+/// `RANGE` value offset.
+fn range_key(v: &ast::Value) -> Option<RangeKey> {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     match v {
-        ast::Value::Int(i) => Some(*i),
-        ast::Value::Date(d) => i64::from(*d).checked_mul(MICROS_PER_DAY),
-        ast::Value::Timestamp(t) | ast::Value::TimestampTz(t) => Some(*t),
+        ast::Value::Int(i) => Some(RangeKey::Int(*i)),
+        ast::Value::Date(d) => i64::from(*d).checked_mul(MICROS_PER_DAY).map(RangeKey::Int),
+        ast::Value::Timestamp(t) | ast::Value::TimestampTz(t) => Some(RangeKey::Int(*t)),
+        ast::Value::Numeric(d) => Some(RangeKey::Dec(*d)),
+        ast::Value::Float(f) => Some(RangeKey::Float(*f)),
         _ => None,
     }
 }
 
-/// The boundary i64 key for a `RANGE` bound: the current key minus the offset for `PRECEDING`, plus it
-/// for `FOLLOWING`. An integer offset shifts an integer key; an `INTERVAL` offset shifts a temporal
-/// (micros) key. `None` on i64 overflow.
-fn range_boundary(cur_key: i64, off: &ast::Value, preceding: bool, ascending: bool) -> Option<i64> {
+/// A `RANGE` offset over a `NUMERIC` ordering as a [`Decimal`](crate::numeric::Decimal) — a bare
+/// integer literal (`100 PRECEDING`) is exact.
+const fn decimal_range_offset(off: &ast::Value) -> Option<crate::numeric::Decimal> {
+    match off {
+        ast::Value::Numeric(d) => Some(*d),
+        ast::Value::Int(n) => Some(crate::numeric::Decimal::from_i64(*n)),
+        _ => None,
+    }
+}
+
+/// A `RANGE` offset over a `FLOAT` ordering as `f64`.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "an integer RANGE offset over a float ordering column converts to f64; a magnitude past 2^53 loses only sub-unit precision, immaterial for a frame boundary"
+)]
+fn float_range_offset(off: &ast::Value) -> Option<f64> {
+    match off {
+        ast::Value::Float(f) => Some(*f),
+        ast::Value::Numeric(d) => Some(d.to_f64()),
+        ast::Value::Int(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
+/// The boundary key for a `RANGE` bound: the current key minus the offset for `PRECEDING`, plus it for
+/// `FOLLOWING`.
+///
+/// An integer offset shifts an integer key; an `INTERVAL` offset shifts a temporal (micros) key; a
+/// numeric offset shifts a `NUMERIC` (exact decimal) or `FLOAT` key. `None` on overflow or a
+/// key/offset kind mismatch.
+fn range_boundary(
+    cur_key: RangeKey,
+    off: &ast::Value,
+    preceding: bool,
+    ascending: bool,
+) -> Option<RangeKey> {
     // The boundary subtracts the offset for a preceding bound under ASC ordering, and for a following
     // bound under DESC ordering (where preceding rows have *larger* keys). Otherwise it adds.
     let subtract = ascending == preceding;
-    match off {
-        ast::Value::Int(n) => {
-            if subtract {
-                cur_key.checked_sub(*n)
+    match cur_key {
+        RangeKey::Int(k) => match off {
+            ast::Value::Int(n) => Some(RangeKey::Int(if subtract {
+                k.checked_sub(*n)?
             } else {
-                cur_key.checked_add(*n)
-            }
+                k.checked_add(*n)?
+            })),
+            ast::Value::Interval(iv) => {
+                let iv = if subtract { iv.checked_neg()? } else { *iv };
+                Some(RangeKey::Int(crate::temporal::add_interval_to_micros(
+                    k, iv.months, iv.days, iv.micros,
+                )))
+            },
+            _ => None,
         },
-        ast::Value::Interval(iv) => {
-            let iv = if subtract { iv.checked_neg()? } else { *iv };
-            Some(crate::temporal::add_interval_to_micros(
-                cur_key, iv.months, iv.days, iv.micros,
-            ))
+        RangeKey::Dec(k) => {
+            let o = decimal_range_offset(off)?;
+            Some(RangeKey::Dec(if subtract {
+                k.checked_sub(&o)?
+            } else {
+                k.checked_add(&o)?
+            }))
         },
-        _ => None,
+        RangeKey::Float(k) => {
+            let o = float_range_offset(off)?;
+            Some(RangeKey::Float(if subtract { k - o } else { k + o }))
+        },
     }
 }
 
@@ -4382,7 +4454,7 @@ fn range_boundary(cur_key: i64, off: &ast::Value, preceding: bool, ascending: bo
 /// `-1` (end, none within) for an empty result.
 fn range_scan(
     ordered: &[(Vec<ast::Value>, usize)],
-    boundary: i64,
+    boundary: RangeKey,
     at_start: bool,
     ascending: bool,
 ) -> i64 {
@@ -4394,11 +4466,12 @@ fn range_scan(
     };
     let len = ordered.len();
     // A row is "reached"/"within" when its key is on the inside of the boundary for the sort order.
-    let in_frame = |key: i64| {
+    let in_frame = |key: RangeKey| {
+        let ord = key.compare(boundary);
         if at_start == ascending {
-            key >= boundary
+            ord != std::cmp::Ordering::Less // key >= boundary
         } else {
-            key <= boundary
+            ord != std::cmp::Ordering::Greater // key <= boundary
         }
     };
     if at_start {

@@ -295,12 +295,35 @@ SELECT COALESCE(id, -1), SUM(v) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND 
 3   30
 -1  20
 
-# A float ordering column with a RANGE offset is still rejected (loud, not silent-wrong).
+# A NUMERIC ordering column supports a RANGE value offset (the offset is a numeric or integer
+# literal), computed by exact decimal arithmetic over the ordering value.
+statement ok
+CREATE TABLE nr (n NUMERIC(10,2), v INT)
+
+statement ok
+INSERT INTO nr VALUES (1.00, 10), (2.50, 20), (3.00, 30), (5.00, 40)
+
+query I
+SELECT SUM(v) OVER (ORDER BY n RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM nr ORDER BY n
+----
+10
+30
+50
+40
+
+# A FLOAT ordering column likewise supports a RANGE value offset.
 statement ok
 CREATE TABLE fr (f FLOAT, v INT)
 
-statement error
-SELECT SUM(v) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM fr
+statement ok
+INSERT INTO fr VALUES (1.0, 10), (2.0, 20), (5.0, 40)
+
+query I
+SELECT SUM(v) OVER (ORDER BY f RANGE BETWEEN 1.0 PRECEDING AND 1.0 FOLLOWING) FROM fr ORDER BY f
+----
+30
+30
+40
 
 # --- RANGE value-offset over a DESC ordering: the frame is still by ORDER BY VALUE, but "preceding"
 # rows now have LARGER keys, so the boundary direction reverses. Reuses rw

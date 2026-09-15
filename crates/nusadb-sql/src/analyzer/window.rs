@@ -516,10 +516,11 @@ fn const_range_offset(
     })?;
     let int_ordered = matches!(order_ty, T::SmallInt | T::Int | T::BigInt);
     let temporal = matches!(order_ty, T::Date | T::Timestamp | T::TimestampTz);
-    if !int_ordered && !temporal {
+    let numeric_ordered = matches!(order_ty, T::Numeric { .. } | T::Float);
+    if !int_ordered && !temporal && !numeric_ordered {
         return Err(Error::Unsupported(format!(
             "a RANGE frame value offset over a {order_ty:?} ordering is not yet supported \
-             (only an integer or date/time ordering column)"
+             (only an integer, numeric, or date/time ordering column)"
         )));
     }
     let ast::Expr::Literal(value) = expr else {
@@ -527,17 +528,29 @@ fn const_range_offset(
             "a RANGE frame offset must be a literal value".to_owned(),
         ));
     };
+    let nonneg_dec = |d: &crate::numeric::Decimal| {
+        d.compare(&crate::numeric::Decimal::ZERO) != std::cmp::Ordering::Less
+    };
     let ok = match value {
-        V::Int(n) if int_ordered => *n >= 0,
+        // A bare integer literal is a valid offset for an integer or a numeric ordering.
+        V::Int(n) if int_ordered || numeric_ordered => *n >= 0,
+        V::Numeric(d) if numeric_ordered => nonneg_dec(d),
+        V::Float(f) if numeric_ordered => *f >= 0.0,
         V::Interval(iv) if temporal => iv.months >= 0 && iv.days >= 0 && iv.micros >= 0,
         _ => false,
     };
     if ok {
         Ok(value.clone())
     } else {
+        let expected = if temporal {
+            "INTERVAL"
+        } else if numeric_ordered {
+            "numeric"
+        } else {
+            "integer"
+        };
         Err(Error::InvalidStatement(format!(
-            "a RANGE frame offset over a {order_ty:?} ordering must be a non-negative {} literal",
-            if temporal { "INTERVAL" } else { "integer" }
+            "a RANGE frame offset over a {order_ty:?} ordering must be a non-negative {expected} literal"
         )))
     }
 }
