@@ -437,6 +437,44 @@ fn serializable_prevents_write_skew() {
     );
 }
 
+/// Drive two concurrent **phantom** write-skew transactions at `level`: each full-scans the table (a
+/// predicate read of the whole relation), then INSERTS a *new* row the other's snapshot cannot see.
+/// Two such transactions committing together is a phantom write skew — each should have observed the
+/// other's new row. Returns whether **both** committed.
+fn both_commit_phantom_write_skew(level: IsolationLevel) -> bool {
+    let e = BtreeEngine::new();
+    let table = make_table(&e, 2); // seed keys 0, 1
+    let ta = e.begin(level).unwrap();
+    let tb = e.begin(level).unwrap();
+    // Each reads the whole table via a full scan (the phantom-relevant predicate) ...
+    let _snap_a = snapshot(&e, ta, table);
+    let _snap_b = snapshot(&e, tb, table);
+    // ... then inserts a distinct new row the other's snapshot cannot see (disjoint keys, so there is
+    // no write-write conflict — only the read-write phantom antidependency).
+    let ia = e.insert(ta, table, &encode(10, &[100]));
+    let ib = e.insert(tb, table, &encode(11, &[200]));
+    let ca = e.commit(ta);
+    let cb = e.commit(tb);
+    ia.is_ok() && ib.is_ok() && ca.is_ok() && cb.is_ok()
+}
+
+#[test]
+fn serializable_prevents_phantom_write_skew() {
+    // Two concurrent transactions each full-scan the table and then insert a new row the other never
+    // saw — a phantom write skew over rows that did not exist at scan time. SERIALIZABLE must abort
+    // at least one (a full-scan relation predicate conflicts with the concurrent insert).
+    assert!(
+        !both_commit_phantom_write_skew(IsolationLevel::Serializable),
+        "SERIALIZABLE allowed a phantom write skew — both inserting transactions committed"
+    );
+    // REPEATABLE READ (snapshot isolation) permits it by design — the contrast proves the test
+    // exercises the read-write phantom path, not a write-write conflict (the inserts are disjoint).
+    assert!(
+        both_commit_phantom_write_skew(IsolationLevel::RepeatableRead),
+        "REPEATABLE READ should permit a phantom write skew (snapshot isolation)"
+    );
+}
+
 /// Drive a deterministic **multi-key** write-skew ring at `level`: three concurrent transactions
 /// each read every key (overlapping reads via a full scan), then each appends to its own key
 /// (pairwise-disjoint writes). Any two of them committing together is a write skew (their reads

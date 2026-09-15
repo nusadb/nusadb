@@ -898,6 +898,15 @@ struct TxnState {
     /// rows from a frozen `SERIALIZABLE` reader.) Empty for every other level: `REPEATABLE READ`
     /// is snapshot isolation, which permits write-skew by design.
     reads: HashSet<(u64, u64)>,
+    /// The tables this transaction read through a **full scan** — a predicate read of the whole
+    /// relation — tracked **only under `SERIALIZABLE`**. At commit, if a concurrent transaction that
+    /// committed after this one's snapshot inserted a row into any of these tables, that is a
+    /// read-write antidependency over a row that did not exist at scan time (a phantom): the reader
+    /// aborts (40001). This extends the row-level check to new rows for a sequential scan, matching a
+    /// relation-level predicate lock. A finer index-range predicate for an index scan is the further
+    /// refinement; an index/point read records no relation predicate here. Empty for every other
+    /// level (snapshot isolation permits phantoms by design).
+    predicate_reads: HashSet<u64>,
     /// Every lock this transaction holds, released when it ends (commit, rollback, or abort).
     locks: Vec<LockId>,
     /// The per-table write versions observed at `begin` — tracked **only under `SERIALIZABLE`**
@@ -2810,6 +2819,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 level,
                 pinned,
                 reads: HashSet::new(),
+                predicate_reads: HashSet::new(),
                 locks: Vec::new(),
                 // The FINISHED-instant versions at begin (SSI narrowing) — empty for
                 // levels that never validate reads.
@@ -3825,9 +3835,11 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 Ok(())
             })?;
         }
-        // Record the read set for a SERIALIZABLE transaction so a later concurrent write to one of
-        // these rows aborts this one at commit.
-        if !read_ids.is_empty()
+        // Record the read set for a SERIALIZABLE transaction: the individual rows (so a later
+        // concurrent modification of one aborts this txn at commit) and the table as a full-scan
+        // predicate (so a later concurrent INSERT of a new matching row — a phantom — aborts it too,
+        // even when the scan saw no rows yet).
+        if serializable
             && let Some(state) = self
                 .txns
                 .lock()
@@ -3835,6 +3847,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 .txns
                 .get_mut(&txn.0)
         {
+            state.predicate_reads.insert(table.0);
             state
                 .reads
                 .extend(read_ids.into_iter().map(|row_id| (table.0, row_id)));
@@ -5346,46 +5359,57 @@ impl BtreeEngine {
     /// can reach is recycled under it.
     fn serializable_read_conflict(&self, txn: u64) -> Result<bool> {
         let cat = self.catalog.read().map_err(|_| poisoned())?;
-        let (reads, pinned, active, staged) = {
+        let (reads, predicate_reads, pinned, active, staged) = {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
             let Some(state) = txns.txns.get(&txn) else {
                 return Ok(false);
             };
-            if !matches!(state.level, IsolationLevel::Serializable) || state.reads.is_empty() {
+            if !matches!(state.level, IsolationLevel::Serializable)
+                || (state.reads.is_empty() && state.predicate_reads.is_empty())
+            {
                 return Ok(false);
             }
             // SSI narrowing: a table whose write version has not moved since this
             // transaction began provably had no concurrent committer (or stager) write a row
             // in it — no stamp in it can conflict, so every read of it skips validation. The
             // read-mostly workload validates nothing; the check degrades gracefully to the
-            // full per-row walk only for tables that were actually written concurrently.
+            // full per-row walk only for tables that were actually written concurrently. Applied to
+            // both the row read set and the full-scan predicate set.
+            let write_moved = |table: u64| {
+                // Skip only when the STAGED-instant version equals the FINISHED-instant
+                // version this reader saw at begin: any writer staged since — including
+                // one still mid-fsync, whose rows the reader could not see — breaks the
+                // equality and forces full validation.
+                let staged_now = txns
+                    .table_write_versions_staged
+                    .get(&table)
+                    .copied()
+                    .unwrap_or(0);
+                let finished_at_begin = state
+                    .write_versions_at_begin
+                    .get(&table)
+                    .copied()
+                    .unwrap_or(0);
+                staged_now != finished_at_begin
+            };
             let reads: Vec<(u64, u64)> = state
                 .reads
                 .iter()
                 .copied()
-                .filter(|&(table, _)| {
-                    // Skip only when the STAGED-instant version equals the FINISHED-instant
-                    // version this reader saw at begin: any writer staged since — including
-                    // one still mid-fsync, whose rows the reader could not see — breaks the
-                    // equality and forces full validation.
-                    let staged_now = txns
-                        .table_write_versions_staged
-                        .get(&table)
-                        .copied()
-                        .unwrap_or(0);
-                    let finished_at_begin = state
-                        .write_versions_at_begin
-                        .get(&table)
-                        .copied()
-                        .unwrap_or(0);
-                    staged_now != finished_at_begin
-                })
+                .filter(|&(table, _)| write_moved(table))
                 .collect();
-            if reads.is_empty() {
+            let predicate_reads: Vec<u64> = state
+                .predicate_reads
+                .iter()
+                .copied()
+                .filter(|&table| write_moved(table))
+                .collect();
+            if reads.is_empty() && predicate_reads.is_empty() {
                 return Ok(false);
             }
             (
                 reads,
+                predicate_reads,
                 state.pinned.clone(),
                 txns.active.clone(),
                 txns.staged.clone(),
@@ -5435,6 +5459,29 @@ impl BtreeEngine {
                     break; // a purged slot is unreachable by construction; nothing older to check
                 };
                 meta = prev.meta;
+            }
+        }
+        // Phantom check for a full-scan predicate read: a row whose newest version was created by a
+        // concurrent-committed transaction (a stamp this reader's snapshot cannot see) is a new row
+        // that would have fallen inside the scan's whole-relation predicate — a read-write
+        // antidependency over a row that did not exist at scan time. A relation-level predicate
+        // conflicts with any such insert. (Concurrent modification / deletion of a row this reader
+        // already saw is caught by the row-level walk above; this walk's job is the NEW rows.)
+        for &table in &predicate_reads {
+            let Some(t) = cat.tables.get(&table) else {
+                continue; // the table was dropped; nothing left to conflict on
+            };
+            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let mut phantom = false;
+            tree.scan_with(|row_id, value| {
+                let (meta, _) = mvcc::decode_row(value).ok_or_else(|| corrupt_row(row_id))?;
+                if conflicting(meta.xmin) {
+                    phantom = true;
+                }
+                Ok(())
+            })?;
+            if phantom {
+                return Ok(true);
             }
         }
         Ok(false)
