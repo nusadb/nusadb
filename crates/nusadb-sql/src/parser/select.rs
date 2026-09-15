@@ -413,26 +413,21 @@ pub(super) fn convert_from_item(factor: &sql::TableFactor) -> Result<ast::TableR
         ..
     } = factor
     {
-        return desugar_table_function(
-            name,
-            &table_args.args,
-            alias.as_ref(),
-            *with_ordinality,
-            false,
-        );
+        return desugar_table_function(name, &table_args.args, alias.as_ref(), *with_ordinality);
     }
     // `JOIN LATERAL func(args) [AS x]` — sqlparser models a lateral function call as its own
     // `Function` factor (distinct from the `Table { args }` base form above). Desugar it the same
-    // way, but mark the derived table `LATERAL` so its arguments may reference columns to its left.
+    // way; the derived table is marked `LATERAL` by the desugaring regardless (a table function is
+    // implicitly lateral), so the explicit `lateral` flag here is redundant.
     if let sql::TableFactor::Function {
-        lateral,
         name,
         args,
         with_ordinality,
         alias,
+        ..
     } = factor
     {
-        return desugar_table_function(name, args, alias.as_ref(), *with_ordinality, *lateral);
+        return desugar_table_function(name, args, alias.as_ref(), *with_ordinality);
     }
     // `FROM UNNEST(array) [AS x[(col)]]` — sqlparser models UNNEST as its own table factor, not the
     // generic function form, so route it through the dedicated desugaring.
@@ -563,7 +558,6 @@ fn desugar_table_function(
     args: &[sql::FunctionArg],
     alias: Option<&sql::TableAlias>,
     with_ordinality: bool,
-    lateral: bool,
 ) -> Result<ast::TableRef, Error> {
     // Rebuild the call as an ordinary function expression so the normal conversion maps a known
     // set-returning function to its `SetReturning` node (and an unknown name is rejected there).
@@ -595,7 +589,6 @@ fn desugar_table_function(
         table_alias,
         column_aliases,
         with_ordinality,
-        lateral,
     ))
 }
 
@@ -636,7 +629,6 @@ fn desugar_unnest(
         table_alias,
         column_aliases,
         with_ordinality,
-        false,
     ))
 }
 
@@ -649,7 +641,6 @@ fn srf_derived_table(
     table_alias: String,
     column_aliases: Vec<String>,
     with_ordinality: bool,
-    lateral: bool,
 ) -> ast::TableRef {
     // A pair function (`jsonb_each`) names its two columns `key` and `value`, not after the
     // relation — the value half is appended by the analyzer, so only the key is named here.
@@ -689,7 +680,11 @@ fn srf_derived_table(
         subquery: Some(Box::new(select)),
         values: None,
         set_op: None,
-        lateral,
+        // A `FROM` table function is always implicitly `LATERAL`: its arguments may reference columns
+        // of FROM items to its left (`FROM t, unnest(t.arr)`), with or without the keyword. The
+        // analyzer allows such a lateral relation as the first FROM item too (it then references
+        // nothing), unlike an explicit `LATERAL (SELECT ...)`.
+        lateral: true,
         column_aliases,
         with_ordinality,
         only: false,

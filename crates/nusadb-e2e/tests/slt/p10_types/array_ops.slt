@@ -230,3 +230,28 @@ SELECT generate_series(1, 3) ORDER BY 1 LIMIT 2
 ----
 1
 2
+
+# --- implicit LATERAL: a table function in a comma-separated FROM sees the columns of the item to
+# its left, without the LATERAL keyword (as the reference engine allows). Rows whose array is empty
+# or NULL contribute nothing (inner-join semantics). ---
+query II
+SELECT id, tag FROM t, unnest(tags) AS u(tag) ORDER BY id, tag
+----
+1 10
+1 20
+1 30
+
+# The explicit CROSS JOIN LATERAL form is equivalent.
+query II
+SELECT id, tag FROM t CROSS JOIN LATERAL unnest(tags) AS u(tag) ORDER BY id, tag
+----
+1 10
+1 20
+1 30
+
+# A table function is still valid as the first (only) FROM item — it then references nothing.
+query I
+SELECT tag FROM unnest(ARRAY[5, 6]) AS u(tag) ORDER BY tag
+----
+5
+6

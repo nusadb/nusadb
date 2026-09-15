@@ -33,7 +33,10 @@ fn resolve_derived_base(
     subquery: &ast::Select,
     catalog: &dyn Catalog,
 ) -> Result<(TableSchema, Option<SelectPlan>), Error> {
-    if base.lateral {
+    // A `LATERAL` derived table cannot be the first FROM item — there is nothing to its left. A
+    // table function is implicitly `LATERAL` (the parser marks it) but is allowed first: as the
+    // first item it simply references nothing, exactly as `FROM unnest(arr)` does.
+    if base.lateral && !is_table_function_ref(base) {
         return Err(Error::InvalidStatement(
             "a LATERAL derived table cannot be the first item in FROM".to_owned(),
         ));
@@ -487,6 +490,26 @@ const fn flip_prune_op(op: crate::PruneOp) -> crate::PruneOp {
 /// catalog table. A `LATERAL` join input is analyzed with `left_scope` pushed as the enclosing scope
 /// (increment 3c) so its references to columns on its left resolve to `OuterColumn`s; a CTE
 /// referenced in a `JOIN` is not yet supported.
+/// Whether `table` is a `FROM` table function (`unnest(a)`, `generate_series(...)`, `jsonb_each(x)`,
+/// etc.), which the parser desugars to a derived table wrapping a single set-returning projection
+/// over no `FROM`. Such a relation is *implicitly* `LATERAL`: its arguments may reference columns
+/// from FROM items to its left without the keyword, as the reference engine allows (`FROM t,
+/// unnest(t.arr)`). A derived table with a real `FROM`, or one projecting anything else, is not a
+/// table function and keeps ordinary (non-lateral) resolution.
+fn is_table_function_ref(table: &ast::TableRef) -> bool {
+    let Some(subquery) = &table.subquery else {
+        return false;
+    };
+    subquery.from.is_none()
+        && matches!(
+            subquery.projection.as_slice(),
+            [ast::SelectItem::Expr {
+                expr: ast::Expr::SetReturning { .. },
+                ..
+            }]
+        )
+}
+
 fn resolve_join_input(
     table: &ast::TableRef,
     catalog: &dyn Catalog,
@@ -506,9 +529,10 @@ fn resolve_join_input(
         return Ok((schema, Some(Box::new(plan))));
     }
     if let Some(subquery) = &table.subquery {
-        // For `LATERAL`, push the columns to this join's left as the enclosing scope so the
-        // subquery body can correlate to them (resolved to `OuterColumn`s the executor binds per
-        // left row); the guard pops the scope when this resolution returns (increment 3c).
+        // For `LATERAL` (which a `FROM` table function carries implicitly — the parser marks it),
+        // push the columns to this join's left as the enclosing scope so the subquery body can
+        // correlate to them (resolved to `OuterColumn`s the executor binds per left row); the guard
+        // pops the scope when this resolution returns (increment 3c).
         let _outer = table.lateral.then(|| push_outer_scope(left_scope));
         let plan = apply_ordinality(analyze_select((**subquery).clone(), catalog)?, table)?;
         let schema = cte_schema(&table.name, &table.column_aliases, &plan)?;
