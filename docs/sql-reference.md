@@ -1268,7 +1268,8 @@ unknown or deallocated name is `26000`; the wrong number of arguments is `42883`
 
 ### Cursors
 
-A cursor reads a result in pieces inside a transaction.
+A cursor reads a result in pieces. Its rows are captured when the cursor is declared, so it pages
+through a stable snapshot.
 
 ```sql
 BEGIN;
@@ -1280,7 +1281,10 @@ CLOSE c;
 COMMIT;
 ```
 
-Cursors are forward-only and are closed when the transaction ends. Fetching from an unknown
+A cursor is session-scoped: it may be declared with or without an open transaction, and it stays
+open across `COMMIT` and `ROLLBACK` until an explicit `CLOSE` (or the session ends) — it is not
+bound to the transaction that declared it. A `SCROLL` cursor fetches in any direction (`NEXT`,
+`PRIOR`, `FIRST`, `LAST`, `ABSOLUTE`, `RELATIVE`, `FORWARD`/`BACKWARD`). Fetching from an unknown
 cursor is `34000`.
 
 ---
