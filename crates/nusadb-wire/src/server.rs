@@ -911,18 +911,23 @@ where
             FrontendMessage::Query { sql } => {
                 failed = false; // a simple query abandons any half-built extended pipeline
                 if let Some(copy) = copy_statement(&sql) {
-                    // COPY ... FROM STDIN / TO STDOUT drives the COPY sub-protocol. COPY does not pass
-                    // through the RLS-aware analyzer, so refuse it on an RLS-enabled table for a
-                    // non-superuser — fail closed, never bypass the policy.
+                    // COPY ... FROM STDIN / TO STDOUT drives the COPY sub-protocol. The table form
+                    // does not pass through the RLS-aware analyzer, so refuse it on an RLS-enabled
+                    // table for a non-superuser — fail closed, never bypass the policy. The query
+                    // form (`COPY (<query>) TO STDOUT`) DOES go through analysis — which enforces
+                    // per-table privileges and row-level security as the COPY user, exactly like a
+                    // direct SELECT — so the flat table-level check (keyed on an empty table name
+                    // for the query form) is neither applicable nor sufficient and is skipped here.
                     // Checked as the role the session currently acts as, so a `SET ROLE` does not
                     // leave COPY evaluating against the login role's privileges.
                     let copy_actor = effective_user(&user, &settings);
-                    let outcome = if let Some(msg) = copy_rls_block(
-                        engine.as_ref(),
-                        &copy,
-                        &copy_actor,
-                        copy.direction,
-                    ) {
+                    let outcome = if copy.query.is_none()
+                        && let Some(msg) = copy_rls_block(
+                            engine.as_ref(),
+                            &copy,
+                            &copy_actor,
+                            copy.direction,
+                        ) {
                         Err(msg)
                     } else {
                         match copy.direction {

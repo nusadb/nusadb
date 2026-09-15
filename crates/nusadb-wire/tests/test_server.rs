@@ -2559,6 +2559,130 @@ async fn copy_is_refused_without_the_matching_table_privilege() {
     terminate_conn(su, su_handle).await;
 }
 
+/// `COPY (<query>) TO STDOUT` is gated by the query's own analysis, not by a flat table check.
+///
+/// The query form carries no table name — the object it reads is whatever the inner SELECT names.
+/// The dispatch gate that guards the table form keys its privilege check on that (empty) table name,
+/// so before the fix every `COPY (SELECT ...) TO STDOUT` was refused with `permission denied on
+/// table ` (empty) even for the table's owner. The query form must instead be analyzed exactly like
+/// a direct SELECT: refused when the role lacks SELECT on the referenced table, and streamed once it
+/// holds it.
+#[tokio::test]
+async fn copy_query_to_stdout_is_gated_by_the_querys_analysis() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    /// Drain a plain statement, returning the error message if one arrived.
+    async fn outcome(conn: &mut Connection<tokio::io::DuplexStream>, sql: &str) -> Option<String> {
+        query(conn, sql).await;
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => err = Some(message),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err
+    }
+
+    /// Drive a `COPY ... TO STDOUT`: `Ok` with the concatenated `CopyData` payload, or `Err` with
+    /// the relayed error message.
+    async fn copy_out(
+        conn: &mut Connection<tokio::io::DuplexStream>,
+        sql: &str,
+    ) -> Result<Vec<u8>, String> {
+        query(conn, sql).await;
+        let mut payload = Vec::new();
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::CopyData { data } => payload.extend_from_slice(&data),
+                BackendMessage::Error { message, .. } => err = Some(message),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err.map_or(Ok(payload), Err)
+    }
+
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
+    assert!(
+        outcome(
+            &mut su,
+            "CREATE TABLE ledger (id INT NOT NULL, amount INT NOT NULL)"
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        outcome(&mut su, "INSERT INTO ledger VALUES (1, 10), (2, 20)")
+            .await
+            .is_none()
+    );
+    assert!(outcome(&mut su, "CREATE ROLE reader LOGIN").await.is_none());
+
+    // No grant yet: the query form is refused because its analysis raises SELECT on `ledger`, not
+    // because of a flat (empty-named) table check.
+    let (mut reader, reader_handle) = connect(&engine, "reader").await;
+    let refused = copy_out(
+        &mut reader,
+        "COPY (SELECT id, amount FROM ledger) TO STDOUT",
+    )
+    .await
+    .expect_err("COPY (query) must be refused without SELECT on the referenced table");
+    assert!(
+        refused.contains("permission denied"),
+        "refusal should name the privilege, got: {refused}"
+    );
+
+    // Granting SELECT opens it — the empty-table-name check no longer denies the owner-equivalent.
+    assert!(
+        outcome(&mut su, "GRANT SELECT ON ledger TO reader")
+            .await
+            .is_none()
+    );
+    let streamed = copy_out(
+        &mut reader,
+        "COPY (SELECT id, amount FROM ledger ORDER BY id) TO STDOUT",
+    )
+    .await
+    .expect("COPY (query) should stream once SELECT is granted");
+    assert_eq!(
+        streamed, b"1\t10\n2\t20\n",
+        "the query form must stream exactly the SELECT's rows"
+    );
+
+    terminate_conn(reader, reader_handle).await;
+    terminate_conn(su, su_handle).await;
+}
+
 /// Close a connection and join its task.
 async fn terminate_conn(
     mut conn: Connection<tokio::io::DuplexStream>,
