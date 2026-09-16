@@ -598,6 +598,10 @@ ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders DISABLE ROW LEVEL SECURITY;
 ```
 
+Enabling or disabling row-level security is reserved to a superuser, even for the table's owner:
+the toggle governs whose rows every role can see, so it is administered centrally rather than left
+to whoever happens to own the table. A non-superuser owner is refused with `42501`.
+
 `ALTER TABLE t DISABLE TRIGGER name` and `ENABLE TRIGGER name` are shown under [Triggers](#triggers).
 
 `RENAME COLUMN` carries the column's own `DEFAULT` (including a `SERIAL` sentinel — the backing
