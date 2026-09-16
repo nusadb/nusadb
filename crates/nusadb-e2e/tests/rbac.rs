@@ -990,6 +990,75 @@ fn column_select_grant_allows_a_column_free_count() {
 }
 
 #[test]
+fn column_select_grant_satisfies_a_filtered_update() {
+    let engine = column_fixture();
+    root(&engine, "GRANT UPDATE (b) ON t TO clerk");
+    root(&engine, "GRANT SELECT (a) ON t TO clerk");
+    // The WHERE reads only the granted column `a` and the SET writes the granted column `b`: the
+    // column grants alone satisfy it, with no table-wide SELECT (matching the reference engine).
+    ok_as(&engine, "clerk", "UPDATE t SET b = 5 WHERE a = 1");
+    // RETURNING a granted column is likewise covered.
+    ok_as(
+        &engine,
+        "clerk",
+        "UPDATE t SET b = 6 WHERE a = 1 RETURNING a",
+    );
+    // A predicate over the ungranted `secret` is a read of it — still denied.
+    denied_as(&engine, "clerk", "UPDATE t SET b = 5 WHERE secret = 99");
+    // RETURNING the ungranted column is denied too.
+    denied_as(
+        &engine,
+        "clerk",
+        "UPDATE t SET b = 5 WHERE a = 1 RETURNING secret",
+    );
+    // A wildcard RETURNING reads every column — a partial grant cannot cover it.
+    denied_as(
+        &engine,
+        "clerk",
+        "UPDATE t SET b = 5 WHERE a = 1 RETURNING *",
+    );
+    // A subquery predicate is indeterminate, so it conservatively falls back to table-wide SELECT.
+    denied_as(
+        &engine,
+        "clerk",
+        "UPDATE t SET b = 5 WHERE a = (SELECT max(a) FROM t)",
+    );
+}
+
+#[test]
+fn column_select_grant_matches_a_predicate_column_case_exactly() {
+    let engine = BtreeEngine::new();
+    // A quoted, case-preserving column is distinct from its lowercase sibling, so grants and
+    // predicate reads must match case-exactly — a read of "SECRET" must not slip past a grant on
+    // `secret`.
+    root(
+        &engine,
+        "CREATE TABLE cf (b INT, secret INT, \"SECRET\" INT)",
+    );
+    root(&engine, "INSERT INTO cf VALUES (1, 2, 3)");
+    root(&engine, "CREATE ROLE clerk LOGIN");
+    root(&engine, "GRANT UPDATE (b) ON cf TO clerk");
+    root(&engine, "GRANT SELECT (secret) ON cf TO clerk");
+    // The granted lowercase `secret` reads.
+    ok_as(&engine, "clerk", "UPDATE cf SET b = 5 WHERE secret = 2");
+    // The quoted "SECRET" is a different column the role holds no SELECT on — denied, not matched to
+    // the `secret` grant.
+    denied_as(&engine, "clerk", "UPDATE cf SET b = 5 WHERE \"SECRET\" = 3");
+}
+
+#[test]
+fn column_select_grant_satisfies_a_filtered_delete() {
+    let engine = column_fixture();
+    root(&engine, "GRANT DELETE ON t TO clerk");
+    root(&engine, "GRANT SELECT (a) ON t TO clerk");
+    // The WHERE reads only the granted column `a`: DELETE plus the column grant is enough.
+    ok_as(&engine, "clerk", "DELETE FROM t WHERE a = 1");
+    // Re-seed and confirm a predicate over the ungranted column is still denied.
+    root(&engine, "INSERT INTO t VALUES (1, 2, 99)");
+    denied_as(&engine, "clerk", "DELETE FROM t WHERE secret = 99");
+}
+
+#[test]
 fn no_column_grant_still_denies_the_whole_table() {
     let engine = column_fixture();
     // `clerk` holds nothing: neither a bare column read nor `count(*)` is allowed.
