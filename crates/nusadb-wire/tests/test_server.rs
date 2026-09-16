@@ -1526,10 +1526,15 @@ async fn copy_from_stdin_bad_row_aborts_the_load() {
     conn.write_frame(&FrontendMessage::CopyDone.encode().unwrap())
         .await
         .unwrap();
-    assert!(matches!(
-        next(&mut conn).await,
-        BackendMessage::Error { .. }
-    ));
+    // The value error reports the data-exception class (22...), not the generic internal-error
+    // code — a client can tell a bad value from an engine fault.
+    match next(&mut conn).await {
+        BackendMessage::Error { code, .. } => assert!(
+            code.starts_with("22"),
+            "an invalid COPY value should report a 22-class SQLSTATE, got {code}"
+        ),
+        other => panic!("expected an error, got {other:?}"),
+    }
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::ReadyForQuery(TxnStatus::Idle)
@@ -1548,6 +1553,121 @@ async fn copy_from_stdin_bad_row_aborts_the_load() {
         next(&mut conn).await,
         BackendMessage::ReadyForQuery(TxnStatus::Idle)
     );
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// A COPY that violates a unique/primary key reports the integrity-violation class (`23505`), not
+/// the generic internal-error code — a client can branch on a duplicate the same as for an INSERT.
+#[tokio::test]
+async fn copy_from_stdin_duplicate_key_reports_integrity_class() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, engine));
+    let mut conn = Connection::new(client);
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+    query(&mut conn, "CREATE TABLE u (id INT PRIMARY KEY)").await;
+    let _ = next(&mut conn).await;
+    let _ = next(&mut conn).await;
+    query(&mut conn, "INSERT INTO u VALUES (1)").await;
+    let _ = next(&mut conn).await;
+    let _ = next(&mut conn).await;
+
+    query(&mut conn, "COPY u FROM STDIN").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::CopyInResponse { columns: 0 }
+    );
+    // Loading id 1 again collides with the existing primary key.
+    conn.write_frame(
+        &FrontendMessage::CopyData {
+            data: b"1\n".to_vec(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    conn.write_frame(&FrontendMessage::CopyDone.encode().unwrap())
+        .await
+        .unwrap();
+    match next(&mut conn).await {
+        BackendMessage::Error { code, .. } => {
+            assert_eq!(
+                code, "23505",
+                "a duplicate key in COPY should report unique_violation"
+            )
+        },
+        other => panic!("expected an error, got {other:?}"),
+    }
+    consume_until_ready(&mut conn).await;
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// `CHECKPOINT` inside a transaction block cannot quiesce the engine (this connection's own
+/// transaction is active), so it reports the prerequisite-state class (`55000`), not the generic
+/// internal-error code the raw I/O error would map to.
+#[tokio::test]
+async fn checkpoint_inside_a_transaction_reports_prerequisite_state() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, engine));
+    let mut conn = Connection::new(client);
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "u".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+    query(&mut conn, "BEGIN").await;
+    assert_eq!(next(&mut conn).await, cc("BEGIN"));
+    consume_until_ready_in_txn(&mut conn).await;
+
+    query(&mut conn, "CHECKPOINT").await;
+    match next(&mut conn).await {
+        BackendMessage::Error { code, .. } => assert_eq!(
+            code, "55000",
+            "CHECKPOINT inside a transaction should report object_not_in_prerequisite_state"
+        ),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    // Drain to the next ReadyForQuery (any transaction status) — the error's aftermath is not what
+    // this test asserts.
+    loop {
+        if matches!(next(&mut conn).await, BackendMessage::ReadyForQuery(_)) {
+            break;
+        }
+    }
 
     conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
         .await

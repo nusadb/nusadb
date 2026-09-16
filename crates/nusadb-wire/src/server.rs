@@ -928,7 +928,9 @@ where
                             &copy_actor,
                             copy.direction,
                         ) {
-                        Err(msg)
+                        // The COPY access gate refuses on privilege / RLS / reserved-namespace
+                        // grounds — an access-control refusal (`42501`), not an engine fault.
+                        Err((msg, "42501"))
                     } else {
                         match copy.direction {
                             nusadb_sql::ast::CopyDirection::From => {
@@ -966,8 +968,8 @@ where
                             conn.write_frame(&command_complete(&format!("COPY {count}")).encode()?)
                                 .await?;
                         },
-                        Err(message) => {
-                            conn.write_frame(&error_response(&message).encode()?)
+                        Err((message, code)) => {
+                            conn.write_frame(&error_response_coded(&message, code).encode()?)
                                 .await?;
                         },
                     }
@@ -1537,7 +1539,7 @@ async fn handle_copy_in<S>(
     max_bytes: Option<usize>,
     actor: &str,
     timezone: Option<String>,
-) -> io::Result<Result<usize, String>>
+) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1556,7 +1558,10 @@ where
     let mut overflow = false;
     loop {
         let Some(frame) = read_next(conn, idle_timeout, shutdown).await? else {
-            return Ok(Err("connection closed during COPY FROM".to_owned()));
+            return Ok(Err((
+                "connection closed during COPY FROM".to_owned(),
+                "08006", // connection_failure
+            )));
         };
         match FrontendMessage::decode(&frame).map_err(io::Error::other)? {
             FrontendMessage::CopyData { data } => {
@@ -1573,22 +1578,36 @@ where
             },
             FrontendMessage::CopyDone => break,
             FrontendMessage::CopyFail { message } => {
-                return Ok(Err(format!("COPY aborted by client: {message}")));
+                return Ok(Err((
+                    format!("COPY aborted by client: {message}"),
+                    "57014", // query_canceled — the client asked to stop
+                )));
             },
             // Any other message mid-copy is a protocol violation; abort the load.
-            _ => return Ok(Err("unexpected message during COPY FROM".to_owned())),
+            _ => {
+                return Ok(Err((
+                    "unexpected message during COPY FROM".to_owned(),
+                    "08P01", // protocol_violation
+                )));
+            },
         }
     }
     if overflow {
         // `overflow` is only set in the `Some(max)` arm, so the cap is known.
-        return Ok(Err(format!(
-            "COPY data exceeds the {}-byte limit",
-            max_bytes.unwrap_or(0)
+        return Ok(Err((
+            format!(
+                "COPY data exceeds the {}-byte limit",
+                max_bytes.unwrap_or(0)
+            ),
+            "53400", // configuration_limit_exceeded
         )));
     }
 
     let Ok(data) = String::from_utf8(buf) else {
-        return Ok(Err("COPY data is not valid UTF-8".to_owned()));
+        return Ok(Err((
+            "COPY data is not valid UTF-8".to_owned(),
+            "22021", // character_not_in_repertoire
+        )));
     };
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
@@ -1601,7 +1620,7 @@ where
         // "written" for a concurrent change to slip through.
         let txn = engine
             .begin(IsolationLevel::default())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| (e.to_string(), e.sqlstate()))?;
         if let Some(msg) = copy_access_verdict(
             engine.as_ref(),
             txn,
@@ -1610,24 +1629,27 @@ where
             nusadb_sql::ast::CopyDirection::From,
         ) {
             let _ = engine.rollback(txn);
-            return Err(msg);
+            return Err((msg, "42501")); // access-control refusal
         }
+        // A load failure — a value the column type rejects (`22P02`), a duplicate key (`23505`),
+        // and so on — carries its own SQLSTATE, so the client sees the real class rather than the
+        // generic internal-error code.
         match nusadb_sql::copy_from_in(engine.as_ref(), &copy, &data, txn) {
             Ok(count) => match engine.commit(txn) {
                 Ok(()) => Ok(count),
                 Err(e) => {
                     let _ = engine.rollback(txn);
-                    Err(e.to_string())
+                    Err((e.to_string(), e.sqlstate()))
                 },
             },
             Err(e) => {
                 let _ = engine.rollback(txn);
-                Err(e.to_string())
+                Err((e.to_string(), e.sqlstate()))
             },
         }
     })
     .await
-    .unwrap_or_else(|_join| Err("internal execution error".to_owned()));
+    .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR)));
     Ok(result)
 }
 
@@ -1640,7 +1662,7 @@ async fn handle_copy_out<S>(
     copy: nusadb_sql::ast::Copy,
     actor: &str,
     timezone: Option<String>,
-) -> io::Result<Result<usize, String>>
+) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1655,7 +1677,7 @@ where
         // access check was evaluated against.
         let txn = engine
             .begin(IsolationLevel::default())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| (e.to_string(), e.sqlstate()))?;
         // The table form's SELECT-privilege check is raised here because table COPY never reaches the
         // analyzer. The query form (`COPY (<query>) TO STDOUT`) DOES go through analysis — which
         // enforces per-table privileges and row-level security as the COPY user — so the flat
@@ -1670,19 +1692,19 @@ where
             )
         {
             let _ = engine.rollback(txn);
-            return Err(msg);
+            return Err((msg, "42501")); // access-control refusal
         }
-        let out =
-            nusadb_sql::copy_to_in(engine.as_ref(), &copy, &actor, txn).map_err(|e| e.to_string());
+        let out = nusadb_sql::copy_to_in(engine.as_ref(), &copy, &actor, txn)
+            .map_err(|e| (e.to_string(), e.sqlstate()));
         let _ = engine.rollback(txn); // read-only: nothing to commit
         out
     })
     .await
-    .unwrap_or_else(|_join| Err("internal execution error".to_owned()));
+    .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR)));
 
     let (count, payload) = match rendered {
         Ok(out) => out,
-        Err(message) => return Ok(Err(message)),
+        Err(err) => return Ok(Err(err)),
     };
     conn.write_frame(&BackendMessage::CopyOutResponse { columns }.encode()?)
         .await?;
@@ -4350,10 +4372,20 @@ fn checkpoint_txn(
     engine: &dyn StorageEngine,
     state: TxnState,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
-    let result = engine
-        .checkpoint()
-        .map(|()| ExecutionResult::CheckpointDone)
-        .map_err(Into::into);
+    let result = match engine.checkpoint() {
+        Ok(()) => Ok(ExecutionResult::CheckpointDone),
+        // The engine needs a quiesced state; a connection with its own open transaction is exactly
+        // why it cannot quiesce. That is a prerequisite-state failure the caller can act on (commit
+        // or roll back, then retry), not an engine fault — report `55000` rather than the generic
+        // internal-error class the raw I/O error would map to.
+        Err(_) if in_transaction_block(&state) => Err(nusadb_sql::Error::Coded {
+            message: "CHECKPOINT requires a quiesced engine; it cannot run inside a transaction \
+                      block (COMMIT or ROLLBACK first)"
+                .to_owned(),
+            sqlstate: "55000", // object_not_in_prerequisite_state
+        }),
+        Err(e) => Err(e.into()),
+    };
     (result, state)
 }
 
