@@ -939,6 +939,9 @@ pub struct CreateProcedurePlan {
     pub or_replace: bool,
     /// The number of declared `IN` parameters (the call must supply exactly this many arguments).
     pub param_count: usize,
+    /// The `IN` parameter names, in declaration order, so a NusaScript body may reference them by
+    /// name (`FOR i IN lo TO hi`) as well as positionally (`$1`..`$n`).
+    pub param_names: Vec<String>,
     /// The `OUT` parameter names, in declaration order; `CALL` returns their final values.
     pub out_params: Vec<String>,
     /// The procedure body as raw SQL.

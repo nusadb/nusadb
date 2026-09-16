@@ -787,7 +787,7 @@ fn fire_trigger_function(
     let def = load_trigger_function(func_name, engine, txn)?;
     let mut block = crate::parser::parse_script(&def.body)?;
     sub_script_block(&mut block, refs)?;
-    super::script::run_block(&block, &[], engine, txn)?;
+    super::script::run_block(&block, &[], &[], engine, txn)?;
     Ok(())
 }
 

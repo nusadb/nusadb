@@ -81,14 +81,15 @@ const fn decode_language(text: &str) -> ast::FunctionLanguage {
 }
 
 /// Join parameter names for the `param_names` catalog column. Names are lowercase-folded identifiers,
-/// so a comma never appears inside one; an empty list stores as the empty string.
-fn encode_param_names(names: &[String]) -> String {
+/// so a comma never appears inside one; an empty list stores as the empty string. Shared with the
+/// procedure catalog, which stores its `IN` parameter names the same way.
+pub(super) fn encode_param_names(names: &[String]) -> String {
     names.join(",")
 }
 
 /// Split the `param_names` catalog column back into names. The empty string is no names (a
 /// zero-parameter function, or a legacy row).
-fn decode_param_names(text: &str) -> Vec<String> {
+pub(super) fn decode_param_names(text: &str) -> Vec<String> {
     if text.is_empty() {
         Vec::new()
     } else {

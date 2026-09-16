@@ -226,6 +226,33 @@ fn for_loop_iterates_an_integer_range() {
 }
 
 #[test]
+fn procedure_in_parameters_are_referenced_by_name() {
+    let engine = BtreeEngine::new();
+    setup(&engine);
+    // The FOR bounds reference the IN parameters by NAME (`lo`/`hi`), not only positionally as
+    // `$1`/`$2` — the interpreter seeds the parameters into the variable environment by name.
+    run(
+        &engine,
+        "CREATE PROCEDURE fill_named(lo INT, hi INT) AS $$
+         BEGIN
+           FOR k IN lo TO hi LOOP
+             INSERT INTO out VALUES ('k', k);
+           END LOOP;
+         END
+         $$",
+    );
+    run(&engine, "CALL fill_named(2, 4)");
+    assert_eq!(
+        rows(&engine, "SELECT n FROM out ORDER BY n"),
+        vec![
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+}
+
+#[test]
 fn exception_handler_rolls_back_body_and_recovers() {
     let engine = BtreeEngine::new();
     setup(&engine);

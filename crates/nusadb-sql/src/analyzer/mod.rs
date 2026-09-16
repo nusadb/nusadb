@@ -798,7 +798,12 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // run (with `$n` bound to the call arguments) by the executor's procedure module.
         ast::Statement::CreateProcedure(cp) => {
             enforce_system_catalog(&cp.name, catalog)?;
-            let param_count = cp.params.iter().filter(|p| !p.out).count();
+            let param_names: Vec<String> = cp
+                .params
+                .iter()
+                .filter(|p| !p.out)
+                .map(|p| p.name.clone())
+                .collect();
             let out_params = cp
                 .params
                 .iter()
@@ -808,7 +813,8 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             Ok(LogicalPlan::CreateProcedure(CreateProcedurePlan {
                 name: cp.name,
                 or_replace: cp.or_replace,
-                param_count,
+                param_count: param_names.len(),
+                param_names,
                 out_params,
                 body: cp.body,
             }))

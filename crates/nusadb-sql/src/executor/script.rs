@@ -50,10 +50,17 @@ pub(super) type Env = HashMap<String, ast::Value>;
 pub(super) fn run_block(
     block: &ScriptBlock,
     params: &[ast::Value],
+    param_names: &[String],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Env, Error> {
     let mut env = Env::new();
+    // Seed the parameters by name so the body may reference them as `n` as well as positionally as
+    // `$1`..`$n` (the same as a function body). A caller with no named parameters passes an empty
+    // slice, leaving only the positional binding.
+    for (name, value) in param_names.iter().zip(params) {
+        env.insert(name.clone(), value.clone());
+    }
     exec_block(block, &mut env, params, engine, txn)?;
     Ok(env)
 }
