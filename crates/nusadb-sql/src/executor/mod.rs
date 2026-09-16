@@ -693,6 +693,7 @@ pub fn show_session_variable(name: &str, settings: &HashMap<String, String>) -> 
             // `0` for a disabled statement timeout.
             "work_mem" => Some(ops::format_work_mem(ops::reported_work_mem())),
             "statement_timeout" => Some("0".to_owned()),
+            "max_autocommit_retries" => Some(crate::retry::default_retries().to_string()),
             _ => session_ctx::builtin_guc_static_default(name).map(ToOwned::to_owned),
         })
         .unwrap_or_default();
@@ -2092,6 +2093,7 @@ impl<'engine> Session<'engine> {
             // rather than an empty string — the same values the wire `SHOW` path reports.
             "work_mem" => Some(ops::format_work_mem(ops::reported_work_mem())),
             "statement_timeout" => Some("0".to_owned()),
+            "max_autocommit_retries" => Some(crate::retry::default_retries().to_string()),
             _ => session_ctx::builtin_guc_static_default(name).map(ToOwned::to_owned),
         }
     }

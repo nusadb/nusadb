@@ -43,6 +43,13 @@ pub const MAX_AUTOCOMMIT_RETRIES: &str = "max_autocommit_retries";
 /// one-or-two-retry case in the sub-millisecond range.
 const DEFAULT_RETRIES: u32 = 50;
 
+/// The retry budget a `SHOW max_autocommit_retries` reports when the session has not `SET` it — the
+/// same default [`budget`] applies, so the value shown matches the protection actually in force.
+#[must_use]
+pub const fn default_retries() -> u32 {
+    DEFAULT_RETRIES
+}
+
 /// Largest budget a session may ask for. That there *is* a ceiling is part of the contract: a
 /// statement nobody can win must eventually give up and say so, rather than occupying its connection
 /// indefinitely while looking to the application like a slow query.

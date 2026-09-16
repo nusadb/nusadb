@@ -84,3 +84,10 @@ query T
 SHOW work_mem
 ----
 0
+
+# max_autocommit_retries reports its effective default (the auto-commit conflict-retry budget in
+# force) when the session has not SET it — not an empty string.
+query T
+SHOW max_autocommit_retries
+----
+50
