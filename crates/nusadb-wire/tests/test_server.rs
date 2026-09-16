@@ -1613,7 +1613,7 @@ async fn copy_from_stdin_duplicate_key_reports_integrity_class() {
             assert_eq!(
                 code, "23505",
                 "a duplicate key in COPY should report unique_violation"
-            )
+            );
         },
         other => panic!("expected an error, got {other:?}"),
     }
