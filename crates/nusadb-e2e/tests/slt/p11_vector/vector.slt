@@ -282,3 +282,26 @@ SELECT id FROM v5 ORDER BY emb <-> '[1,0,0]', id
 
 statement ok
 DROP TABLE v5
+
+# A dimensionless `::vector` cast infers the dimension from the value (the unmodified vector type),
+# so a bare cast works and matches the dimensioned form.
+query T
+SELECT '[1,0,0]'::vector
+----
+[1,0,0]
+
+# The distance operators/functions accept the dimensionless cast on either side.
+query R
+SELECT '[1,0,0]'::vector <=> '[1,0,0]'::vector
+----
+0.000
+
+query R
+SELECT l2_distance('[3,4]'::vector, '[0,0]'::vector)
+----
+5.000
+
+# A VECTOR *column* still requires an explicit dimension — the dimensionless form is a cast-only
+# convenience, not a storable column shape.
+statement error
+CREATE TABLE novec (v VECTOR)

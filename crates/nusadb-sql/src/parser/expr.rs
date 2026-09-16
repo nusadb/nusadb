@@ -686,6 +686,16 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                     truncated
                 });
             }
+            // A cast to bare `VECTOR` (no dimension) infers the dimension from the value:
+            // `'[1,0,0]'::vector` is a 3-element vector. `Vector(0)` is the infer sentinel, valid
+            // only as a cast target — a VECTOR *column* still requires an explicit dimension.
+            if super::ddl::is_bare_vector(&data_type) {
+                return Ok(ast::Expr::Cast {
+                    expr: Box::new(convert_expr(*expr)?),
+                    target: ColumnType::Vector(0),
+                    try_cast,
+                });
+            }
             // A cast target that is not a built-in type but a bare user-defined type name
             // (e.g. a composite type `x::addr`) defers to the analyzer via `CastNamed`; a genuinely
             // unknown type still surfaces the original "unsupported type" error.

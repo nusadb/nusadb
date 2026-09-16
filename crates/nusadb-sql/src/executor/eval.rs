@@ -5079,7 +5079,9 @@ fn elem_array_marker(elem_ty: ColumnType) -> nusadb_core::engine::ArrayElem {
 
 /// Reject a vector whose component count does not match the column's declared `VECTOR(dim)`.
 fn check_vector_dim(got: usize, dim: u32) -> Result<(), Error> {
-    if got as u64 == u64::from(dim) {
+    // `dim == 0` is the dimensionless-cast infer sentinel (`'[..]'::vector`): any length is accepted,
+    // the value keeping its own dimension. A declared VECTOR column always carries a positive `dim`.
+    if dim == 0 || got as u64 == u64::from(dim) {
         Ok(())
     } else {
         Err(Error::InvalidValue {

@@ -733,6 +733,13 @@ pub(super) fn array_type(elem: &sql::ArrayElemTypeDef) -> Result<ColumnType, Err
     )
 }
 
+/// Whether a cast target is the bare `VECTOR` type with no dimension (`x::vector`) — a dimensionless
+/// vector whose dimension is inferred from the value at cast time. A `VECTOR(n)` (with a modifier)
+/// or any non-vector type is not a match.
+pub(super) fn is_bare_vector(ty: &sql::DataType) -> bool {
+    matches!(ty, sql::DataType::Custom(name, modifiers) if is_vector_name(name) && modifiers.is_empty())
+}
+
 /// Whether a custom-type name is `VECTOR` (case-insensitive, unqualified).
 fn is_vector_name(name: &sql::ObjectName) -> bool {
     matches!(
