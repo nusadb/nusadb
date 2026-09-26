@@ -21,6 +21,11 @@ pub enum WalRecord {
     CommitTxn {
         /// Transaction being committed.
         txn: TxnId,
+        /// Wall-clock time of the commit as milliseconds since the Unix epoch, so a log can be
+        /// replayed up to a moment in time. `0` for a record written before the field existed:
+        /// the field is appended after the transaction id, and a reader that predates it stops
+        /// after the id, so logs stay readable in both directions.
+        unix_ms: u64,
     },
     /// Marks the abort of transaction `txn`; its effects must be undone on recovery.
     AbortTxn {
@@ -114,9 +119,10 @@ impl WalRecord {
                 buf.push(TAG_BEGIN);
                 buf.extend_from_slice(&txn.0.to_le_bytes());
             },
-            Self::CommitTxn { txn } => {
+            Self::CommitTxn { txn, unix_ms } => {
                 buf.push(TAG_COMMIT);
                 buf.extend_from_slice(&txn.0.to_le_bytes());
+                buf.extend_from_slice(&unix_ms.to_le_bytes());
             },
             Self::AbortTxn { txn } => {
                 buf.push(TAG_ABORT);
@@ -169,8 +175,11 @@ impl WalRecord {
             TAG_BEGIN => Self::BeginTxn {
                 txn: TxnId(cur.u64()?),
             },
-            TAG_COMMIT => Self::CommitTxn {
-                txn: TxnId(cur.u64()?),
+            TAG_COMMIT => {
+                let txn = TxnId(cur.u64()?);
+                // Absent on records written before commits carried a time.
+                let unix_ms = cur.u64().unwrap_or(0);
+                Self::CommitTxn { txn, unix_ms }
             },
             TAG_ABORT => Self::AbortTxn {
                 txn: TxnId(cur.u64()?),

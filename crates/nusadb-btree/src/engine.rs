@@ -1228,7 +1228,7 @@ impl BtreeEngine {
         let mut aborted: HashSet<u64> = HashSet::new();
         for record in records {
             match record {
-                WalRecord::CommitTxn { txn } => {
+                WalRecord::CommitTxn { txn, .. } => {
                     committed.insert(txn.0);
                 },
                 WalRecord::AbortTxn { txn } => {
@@ -1245,7 +1245,7 @@ impl BtreeEngine {
         let mut max_txn: u64 = 0;
         for record in records {
             match record {
-                WalRecord::CommitTxn { txn } | WalRecord::AbortTxn { txn } => {
+                WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } => {
                     max_txn = max_txn.max(txn.0);
                 },
                 WalRecord::Put { .. } => {
@@ -2535,6 +2535,7 @@ impl BtreeEngine {
         let mut records: Vec<WalRecord> = ops.iter().map(LoggedOp::to_record).collect();
         records.push(WalRecord::CommitTxn {
             txn: TxnId(synthetic_txn),
+            unix_ms: unix_time_ms(),
         });
         Ok(records)
     }
@@ -2744,6 +2745,14 @@ impl Drop for AdmissionPause<'_> {
     }
 }
 
+/// The wall clock as milliseconds since the Unix epoch, stamped on every commit marker so a log
+/// can later be replayed up to a moment in time. A clock set before 1970 reads as `0`, the same
+/// value a record written before commits carried a time decodes to.
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
 
 /// Append the commit marker for `txn`, honoring the DST WAL-append fault point. In production
 /// (no `dst-fault`) this is a plain `writer.append`; under `dst-fault`, an armed one-shot fault
@@ -2767,7 +2776,10 @@ fn append_commit_marker(
     }
     #[cfg(not(feature = "dst-fault"))]
     let _ = engine; // the fault point is compiled out in production builds
-    writer.append(&WalRecord::CommitTxn { txn })
+    writer.append(&WalRecord::CommitTxn {
+        txn,
+        unix_ms: unix_time_ms(),
+    })
 }
 
 impl TxnDomain {

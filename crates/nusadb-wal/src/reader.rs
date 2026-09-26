@@ -358,7 +358,10 @@ mod tests {
                         offset: 16,
                         image: format!("row-{i}-payload").into_bytes(),
                     },
-                    WalRecord::CommitTxn { txn: TxnId(i + 1) },
+                    WalRecord::CommitTxn {
+                        txn: TxnId(i + 1),
+                        unix_ms: 0,
+                    },
                 ]
             })
             .collect()

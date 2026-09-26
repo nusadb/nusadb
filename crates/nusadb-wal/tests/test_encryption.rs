@@ -25,7 +25,10 @@ fn sample() -> Vec<WalRecord> {
             offset: 16,
             image: b"sensitive-redo-image".to_vec(),
         },
-        WalRecord::CommitTxn { txn: TxnId(1) },
+        WalRecord::CommitTxn {
+            txn: TxnId(1),
+            unix_ms: 0,
+        },
     ]
 }
 

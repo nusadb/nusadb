@@ -20,7 +20,10 @@ fn sample() -> Vec<WalRecord> {
             offset: 16,
             image: b"abc".to_vec(),
         },
-        WalRecord::CommitTxn { txn: TxnId(1) },
+        WalRecord::CommitTxn {
+            txn: TxnId(1),
+            unix_ms: 0,
+        },
     ]
 }
 
@@ -109,7 +112,10 @@ fn mixed_stored_and_compressed_log_round_trips() {
             page: PageId(9),
             image: vec![0xCD; 4096],
         }, // compressed
-        WalRecord::CommitTxn { txn: TxnId(1) }, // stored
+        WalRecord::CommitTxn {
+            txn: TxnId(1),
+            unix_ms: 0,
+        }, // stored
     ];
     let bytes = write_log(&records);
     let replayed: Vec<WalRecord> = WalReader::new(Cursor::new(bytes))

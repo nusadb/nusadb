@@ -78,7 +78,10 @@ fn measure(record: &WalRecord, iters: usize) -> (usize, usize, u128) {
 fn main() {
     let iters = 100_000usize;
 
-    let control = WalRecord::CommitTxn { txn: TxnId(42) }; // 9 bytes → stored
+    let control = WalRecord::CommitTxn {
+        txn: TxnId(42),
+        unix_ms: 0,
+    }; // 17 bytes → stored
     let large = WalRecord::FullPageWrite {
         txn: TxnId(42),
         page: PageId(7),

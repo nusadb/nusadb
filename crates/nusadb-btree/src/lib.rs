@@ -2761,7 +2761,11 @@ mod tests {
                 .to_record(),
             )
             .unwrap();
-            w.append(&WalRecord::CommitTxn { txn: TxnId(1) }).unwrap();
+            w.append(&WalRecord::CommitTxn {
+                txn: TxnId(1),
+                unix_ms: 0,
+            })
+            .unwrap();
             w.append(&WalRecord::AbortTxn { txn: TxnId(1) }).unwrap();
             // Txn 2: a genuinely committed table, proving replay itself still works.
             w.append(
@@ -2773,7 +2777,11 @@ mod tests {
                 .to_record(),
             )
             .unwrap();
-            w.append(&WalRecord::CommitTxn { txn: TxnId(2) }).unwrap();
+            w.append(&WalRecord::CommitTxn {
+                txn: TxnId(2),
+                unix_ms: 0,
+            })
+            .unwrap();
             w.flush().unwrap();
         }
 

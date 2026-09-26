@@ -290,7 +290,11 @@ mod tests {
         // instead of one write per record. `into_inner` also drains, so no bytes are lost.
         let mut w = WalWriter::new(Vec::new());
         w.append(&WalRecord::BeginTxn { txn: TxnId(1) }).unwrap();
-        w.append(&WalRecord::CommitTxn { txn: TxnId(1) }).unwrap();
+        w.append(&WalRecord::CommitTxn {
+            txn: TxnId(1),
+            unix_ms: 0,
+        })
+        .unwrap();
         assert!(
             w.get_ref().is_empty(),
             "records buffer until flush, not written per append"
@@ -300,7 +304,11 @@ mod tests {
         assert!(after_flush > 0, "flush drains the buffer to the sink");
 
         // A further append re-buffers; the sink is unchanged until the next drain.
-        w.append(&WalRecord::CommitTxn { txn: TxnId(2) }).unwrap();
+        w.append(&WalRecord::CommitTxn {
+            txn: TxnId(2),
+            unix_ms: 0,
+        })
+        .unwrap();
         assert_eq!(
             w.get_ref().len(),
             after_flush,
@@ -320,8 +328,20 @@ mod tests {
             replayed.as_slice(),
             [
                 (_, WalRecord::BeginTxn { txn: TxnId(1) }),
-                (_, WalRecord::CommitTxn { txn: TxnId(1) }),
-                (_, WalRecord::CommitTxn { txn: TxnId(2) }),
+                (
+                    _,
+                    WalRecord::CommitTxn {
+                        txn: TxnId(1),
+                        unix_ms: 0
+                    }
+                ),
+                (
+                    _,
+                    WalRecord::CommitTxn {
+                        txn: TxnId(2),
+                        unix_ms: 0
+                    }
+                ),
             ]
         ));
     }
