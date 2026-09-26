@@ -73,6 +73,13 @@ handler rolls back before deciding whether to retry — but a handler that inste
 *statement* on a connection in this state will get `25P02` again for every attempt, because nothing
 clears it but ending the transaction. Nothing in class `25` is retryable in place.
 
+A statement that fails inside a transaction leaves nothing of itself behind. Whatever it wrote
+before the failure — rows, index entries, trigger side effects, maintained view rows — is undone
+as part of the refusal, so the transaction holds exactly the effects of its successful statements.
+Over the wire the transaction is then aborted (`25P02`) as described above; an embedded session
+keeps it open, and a `ROLLBACK TO SAVEPOINT` in either case lands on a state the failed statement
+never touched.
+
 (`25006`, *read-only transaction*, is defined but not reachable over the wire: `BEGIN READ ONLY`
 and `SET TRANSACTION READ ONLY` are refused up front with `0A000` — see the note below.)
 

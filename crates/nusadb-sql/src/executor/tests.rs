@@ -4254,3 +4254,22 @@ fn create_and_drop_policy_agree_on_the_namespace() {
         "the two statements file and look for the policy row under different namespaces"
     );
 }
+
+// --- Statement atomicity --------------------
+
+#[test]
+fn statement_depth_recovers_after_a_panicking_statement() {
+    let engine = setup();
+    let txn = engine.begin(IsolationLevel::default()).unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::run_statement_atomically(&engine, txn, || -> Result<(), Error> {
+            panic!("a statement that unwinds")
+        })
+    }));
+    assert!(unwound.is_err());
+    // The level taken for the panicking statement is released on unwind, so the next statement
+    // on this thread is outermost again and takes its own savepoint.
+    assert_eq!(super::statement_depth(), 0);
+    assert!(super::run_statement_atomically(&engine, txn, || Ok::<(), Error>(())).is_ok());
+    assert_eq!(super::statement_depth(), 0);
+}

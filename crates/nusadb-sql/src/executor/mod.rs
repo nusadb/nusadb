@@ -613,8 +613,7 @@ pub fn execute_in_txn(
     // auto-commit. `dispatch` must NOT do this — it recurses for `Batch` desugars and is re-entered
     // by triggers / stored-procedure / DO bodies, which run within the SAME statement snapshot
     // `execute_in_txn` is never re-entered per-operator, so it fires once.
-    engine.begin_statement(txn)?;
-    match plan {
+    run_statement_atomically(engine, txn, || match plan {
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
@@ -622,7 +621,7 @@ pub fn execute_in_txn(
             "transaction-control plan reached an entry point with no session".to_owned(),
         )),
         other => dispatch(other, engine, txn),
-    }
+    })
 }
 
 /// Like [`execute_in_txn`], but runs as session `user`.
@@ -724,16 +723,16 @@ pub fn execute_in_txn_as_streaming(
 ) -> Result<StreamOutcome, Error> {
     session_ctx::set_session_user(user);
     if let PhysicalPlan::Select(op, _est) = plan {
-        // Streaming SELECT skips `execute_in_txn`, so refresh the RC/RU statement snapshot here too
-        // A stale-snapshot read is only a SELECT, but keeping every
-        // protocol's reads on one statement snapshot is the whole point.
-        engine.begin_statement(txn)?;
-        // Mirror `dispatch`'s per-statement clock pin (bypassed here because we skip `dispatch`).
-        clock::set_statement_now();
-        // Pin the engine + transaction for a NusaScript function call in the streamed projection
-        // (this path skips `execute_in_txn`, where the buffered path pins it).
-        let _exec_ctx = eval::bind_exec_context(engine, txn);
-        return stream_select_rows(&op, engine, txn, sink);
+        // Streaming SELECT skips `execute_in_txn`, so it takes the statement snapshot and mark
+        // here: keeping every protocol's reads on one statement snapshot is the whole point.
+        return run_statement_atomically(engine, txn, || {
+            // Mirror `dispatch`'s per-statement clock pin (bypassed here because we skip `dispatch`).
+            clock::set_statement_now();
+            // Pin the engine + transaction for a NusaScript function call in the streamed
+            // projection (this path skips `execute_in_txn`, where the buffered path pins it).
+            let _exec_ctx = eval::bind_exec_context(engine, txn);
+            stream_select_rows(&op, engine, txn, sink)
+        });
     }
     // Capture the row shape before the plan is consumed so a replayed RETURNING set is typed.
     let types = describe_column_types(&plan);
@@ -761,14 +760,15 @@ pub fn execute_in_txn_as_streaming_with_settings(
 ) -> Result<StreamOutcome, Error> {
     session_ctx::set_session_user_with_settings(user, settings);
     if let PhysicalPlan::Select(op, _est) = plan {
-        // Streaming SELECT skips `execute_in_txn` — refresh the RC/RU statement snapshot here too
-        // So the extended-query streaming path stays on one snapshot.
-        engine.begin_statement(txn)?;
-        clock::set_statement_now();
-        // Pin the engine + transaction for a NusaScript function call in the streamed projection
-        // (this path skips `execute_in_txn`, where the buffered path pins it).
-        let _exec_ctx = eval::bind_exec_context(engine, txn);
-        return stream_select_rows(&op, engine, txn, sink);
+        // Streaming SELECT skips `execute_in_txn`, so it takes the statement snapshot and mark
+        // here, keeping the extended-query streaming path on one snapshot.
+        return run_statement_atomically(engine, txn, || {
+            clock::set_statement_now();
+            // Pin the engine + transaction for a NusaScript function call in the streamed
+            // projection (this path skips `execute_in_txn`, where the buffered path pins it).
+            let _exec_ctx = eval::bind_exec_context(engine, txn);
+            stream_select_rows(&op, engine, txn, sink)
+        });
     }
     // Capture the row shape before the plan is consumed so a replayed RETURNING set is typed.
     let types = describe_column_types(&plan);
@@ -1794,10 +1794,10 @@ impl<'engine> Session<'engine> {
             Some(&self.temp_schema_name()),
         );
         if let Some(txn) = self.current_txn {
-            // Refresh the READ COMMITTED statement snapshot.
-            self.engine.begin_statement(txn)?;
             let read_only = self.txn_read_only;
-            self.analyze_plan_dispatch(stmt, txn, read_only)
+            run_statement_atomically(self.engine, txn, || {
+                self.analyze_plan_dispatch(stmt, txn, read_only)
+            })
         } else {
             // Auto-commit, so this retries its own serialization conflicts exactly as a directly
             // submitted statement does (see [`crate::retry`]). Running the same statement through
@@ -1916,9 +1916,9 @@ impl<'engine> Session<'engine> {
         );
         clock::set_statement_now();
         if let Some(txn) = self.current_txn {
-            // Refresh the READ COMMITTED statement snapshot so this SELECT's reads are consistent.
-            self.engine.begin_statement(txn)?;
-            stream_select_rows(op, self.engine, txn, sink)
+            run_statement_atomically(self.engine, txn, || {
+                stream_select_rows(op, self.engine, txn, sink)
+            })
         } else {
             let txn = self.engine.begin(self.default_isolation)?;
             match stream_select_rows(op, self.engine, txn, sink) {
@@ -2250,12 +2250,10 @@ impl<'engine> Session<'engine> {
             ));
         }
         if let Some(txn) = self.current_txn {
-            // Inside an explicit transaction: refresh the READ COMMITTED statement snapshot so
-            // every read in this statement sees ONE consistent view, then
-            // run the statement, do *not* commit. On error the transaction stays open so the caller
-            // can choose ROLLBACK (matching standard SQL semantics).
-            self.engine.begin_statement(txn)?;
-            dispatch(plan, self.engine, txn)
+            // Inside an explicit transaction: run the statement under its own snapshot and
+            // savepoint, do *not* commit. On error the statement's partial writes are undone and
+            // the transaction stays open so the caller can choose ROLLBACK (standard SQL).
+            run_statement_atomically(self.engine, txn, || dispatch(plan, self.engine, txn))
         } else {
             // Auto-commit: one transaction per statement, at the session default isolation — its
             // `begin` already takes a fresh snapshot, so it needs no `begin_statement`.
@@ -2330,6 +2328,121 @@ impl Drop for Session<'_> {
         // Release any advisory locks this session held, so they never outlive it. Keyed by the
         // session's temporary-schema name, the same token the lock functions use.
         advisory::unlock_all(&self.temp_schema_name());
+    }
+}
+
+/// The savepoint every statement runs under while its transaction is open. A NUL byte keeps it
+/// apart from any name SQL can spell, so a client's `ROLLBACK TO` / `RELEASE` never reaches it.
+const STATEMENT_SAVEPOINT: &str = "\0statement";
+
+thread_local! {
+    /// Nesting depth of [`run_statement_atomically`] on this thread. Only the outermost level owns
+    /// the statement savepoint: a body that re-enters an entry point (a procedure body running its
+    /// statements, a script) must not replace the outer mark with its own, or the outer release
+    /// would find it gone.
+    static STATEMENT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of [`STATEMENT_DEPTH`], released on drop. Unwinding releases it too: the wire server
+/// runs statements on pooled threads that outlive a panicking task, and a level left behind
+/// would silently turn every later statement on that thread into a nested one with no savepoint.
+struct StatementDepthGuard {
+    /// Whether this level is the thread's outermost statement, the one that owns the savepoint.
+    outermost: bool,
+}
+
+impl StatementDepthGuard {
+    fn enter() -> Self {
+        let outermost = STATEMENT_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current + 1);
+            current == 0
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for StatementDepthGuard {
+    fn drop(&mut self) {
+        STATEMENT_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// The current statement nesting depth on this thread, for the unwind-safety test.
+#[cfg(test)]
+fn statement_depth() -> u32 {
+    STATEMENT_DEPTH.with(std::cell::Cell::get)
+}
+
+/// The statement savepoint while its statement runs. Disarmed once the statement has returned
+/// (its outcome is then handled explicitly); still armed when the statement unwinds, in which
+/// case dropping it undoes and forgets the mark, so a panicking statement leaves neither its
+/// partial writes nor a stray savepoint on the transaction.
+struct StatementMark<'a> {
+    engine: &'a dyn StorageEngine,
+    txn: TxnId,
+    armed: bool,
+}
+
+impl Drop for StatementMark<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.engine.rollback_to(self.txn, STATEMENT_SAVEPOINT);
+            let _ = self.engine.release_savepoint(self.txn, STATEMENT_SAVEPOINT);
+        }
+    }
+}
+
+/// Run one statement atomically inside `txn`: refresh the statement snapshot, mark a savepoint,
+/// and when the statement fails roll the transaction back to that mark before returning the
+/// error. A refused statement then leaves nothing behind — no heap rows, index entries, trigger
+/// side effects or maintained view rows from the part that ran before the failure — while the
+/// transaction itself stays open for the caller to continue or roll back. On success the mark is
+/// released, so the savepoint stack the client manages is exactly as it left it.
+///
+/// Only the outermost level on a thread owns the mark. A statement re-entered from inside another
+/// (a procedure or script body, a `COPY` of a query) runs under the outer mark: its failure either
+/// propagates and is undone with the outer statement, or is caught by a script `EXCEPTION` block,
+/// which keeps its own savepoint and rolls the body back itself.
+fn run_statement_atomically<T>(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    body: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let level = StatementDepthGuard::enter();
+    engine.begin_statement(txn)?;
+    if !level.outermost {
+        return body();
+    }
+    engine.savepoint(txn, STATEMENT_SAVEPOINT)?;
+    let mut mark = StatementMark {
+        engine,
+        txn,
+        armed: true,
+    };
+    let outcome = body();
+    mark.armed = false;
+    match outcome {
+        Ok(value) => {
+            engine.release_savepoint(txn, STATEMENT_SAVEPOINT)?;
+            Ok(value)
+        },
+        Err(error) => {
+            // The statement's own error is the one to report. Should the undo itself fail, the
+            // transaction is no worse than before this mark existed and the caller still learns
+            // the statement failed; a real undo failure is logged so it is never silent, while a
+            // transaction the engine has already ended has nothing left to undo.
+            match engine.rollback_to(txn, STATEMENT_SAVEPOINT) {
+                Ok(()) | Err(nusadb_core::Error::UnknownTransaction { .. }) => {},
+                Err(undo) => {
+                    tracing::warn!(error = %undo, "could not undo a failed statement's writes");
+                },
+            }
+            if let Err(release) = engine.release_savepoint(txn, STATEMENT_SAVEPOINT) {
+                tracing::debug!(error = %release, "statement savepoint release failed");
+            }
+            Err(error)
+        },
     }
 }
 
