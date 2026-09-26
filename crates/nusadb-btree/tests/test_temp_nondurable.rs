@@ -6,7 +6,7 @@
 //! survive a restart, by either recovery path:
 //!
 //!   * **WAL replay** — nothing was ever logged, so replay cannot resurrect it.
-//!   * **Checkpoint image** — `emit_image_records` filters it out, so a reopen from the image
+//!   * **Checkpoint image** — `emit_image` filters it out, so a reopen from the image
 //!     cannot resurrect it either.
 //!
 //! Meanwhile a *durable* table created in the same session must be wholly unaffected — its rows

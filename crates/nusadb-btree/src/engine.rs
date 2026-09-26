@@ -2669,14 +2669,15 @@ impl BtreeEngine {
         reason = "a flat one-family-per-block emitter mirroring replay_op; splitting it would \
                   scatter the image's dependency order"
     )]
-    fn emit_image_records(
+    fn emit_image(
         cat: &Catalog,
         seqs: &SeqDomain,
         store: &MemPageStore,
         synthetic_txn: u64,
         stamp: u64,
-    ) -> Result<Vec<WalRecord>> {
-        let mut ops: Vec<LoggedOp> = Vec::new();
+        sink: &mut dyn FnMut(&WalRecord) -> Result<()>,
+    ) -> Result<()> {
+        let mut emit = |op: LoggedOp| sink(&op.to_record());
         let mut sorted_ns: Vec<_> = cat.namespaces.iter().collect();
         sorted_ns.sort_by_key(|(id, _)| **id);
         for (id, name) in sorted_ns {
@@ -2684,11 +2685,11 @@ impl BtreeEngine {
             if !cat.ns_is_durable(*id) {
                 continue;
             }
-            ops.push(LoggedOp::SchemaCreate {
+            emit(LoggedOp::SchemaCreate {
                 txn: synthetic_txn,
                 id: *id,
                 name: name.clone(),
-            });
+            })?;
         }
         // Non-durable (temp) tables are excluded from the checkpoint image entirely — this single
         // filter keeps both the schema-declaration loop and the rows loop below from emitting them,
@@ -2717,39 +2718,40 @@ impl BtreeEngine {
                 name: schema.name.clone(),
                 columns: schema.columns.clone(),
             };
-            ops.push(LoggedOp::CreateTable {
+            emit(LoggedOp::CreateTable {
                 txn: synthetic_txn,
                 table: **id,
                 def: def_of(first),
-            });
+            })?;
             for (version, schema) in versions {
-                ops.push(LoggedOp::AlterSchema {
+                emit(LoggedOp::AlterSchema {
                     txn: synthetic_txn,
                     table: **id,
                     version: *version,
                     def: def_of(schema),
-                });
+                })?;
             }
         }
         for (id, t) in &sorted_tables {
             let tree = ClusteredTree::open(store, t.root_id());
-            for (row_id, value) in tree.scan()? {
-                let Some((meta, tuple)) = mvcc::decode_row(&value) else {
+            // Streamed row by row: the image of a large table never sits in memory whole.
+            tree.scan_with(|row_id, value| {
+                let Some((meta, tuple)) = mvcc::decode_row(value) else {
                     return Err(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("nusadb-btree: undecodable row {row_id} in table {id}"),
                     )));
                 };
                 if meta.xmax != mvcc::NO_XMAX {
-                    continue; // committed-dead: a settled delete no future view can see
+                    return Ok(()); // committed-dead: a settled delete no future view can see
                 }
-                ops.push(LoggedOp::Insert {
+                emit(LoggedOp::Insert {
                     txn: synthetic_txn,
                     table: **id,
                     row_id,
                     tuple: tuple.to_vec(),
-                });
-            }
+                })
+            })?;
         }
         let mut sorted_indexes: Vec<_> = cat.indexes.iter().collect();
         sorted_indexes.sort_by_key(|(id, _)| **id);
@@ -2758,21 +2760,21 @@ impl BtreeEngine {
             if !cat.index_is_durable(*id) {
                 continue;
             }
-            ops.push(LoggedOp::CreateIndex {
+            emit(LoggedOp::CreateIndex {
                 txn: synthetic_txn,
                 index: *id,
                 def: idx.def.clone(),
-            });
+            })?;
             let data = idx.data.read().map_err(|_| poisoned())?;
             for (key, rows) in &data.entries {
                 for (row_id, metas) in rows {
                     if metas.iter().any(|m| m.xmax == mvcc::NO_XMAX) {
-                        ops.push(LoggedOp::IndexInsert {
+                        emit(LoggedOp::IndexInsert {
                             txn: synthetic_txn,
                             index: *id,
                             row_id: *row_id,
                             key: key.clone(),
-                        });
+                        })?;
                     }
                 }
             }
@@ -2787,7 +2789,7 @@ impl BtreeEngine {
                 continue;
             }
             for u in uniques {
-                ops.push(LoggedOp::AddUnique {
+                emit(LoggedOp::AddUnique {
                     txn: synthetic_txn,
                     table: *table,
                     index: u.index,
@@ -2795,7 +2797,7 @@ impl BtreeEngine {
                     columns: u.columns.clone(),
                     primary: u.primary,
                     nulls_not_distinct: u.nulls_not_distinct,
-                });
+                })?;
             }
         }
         let mut sorted_checks: Vec<_> = cat.checks.iter().collect();
@@ -2805,12 +2807,12 @@ impl BtreeEngine {
                 continue;
             }
             for c in checks {
-                ops.push(LoggedOp::AddCheck {
+                emit(LoggedOp::AddCheck {
                     txn: synthetic_txn,
                     table: *table,
                     name: c.name.clone(),
                     expr: c.expr.clone(),
-                });
+                })?;
             }
         }
         let mut sorted_fks: Vec<_> = cat.foreign_keys.values().collect();
@@ -2819,7 +2821,7 @@ impl BtreeEngine {
             if !(cat.table_is_durable(fk.child_table) && cat.table_is_durable(fk.parent_table)) {
                 continue;
             }
-            ops.push(LoggedOp::AddFk {
+            emit(LoggedOp::AddFk {
                 txn: synthetic_txn,
                 name: fk.name.clone(),
                 child_table: fk.child_table,
@@ -2829,7 +2831,7 @@ impl BtreeEngine {
                 child_index: fk.child_index,
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
-            });
+            })?;
         }
         // Only stats for tables that still exist go into the image — a safety net so an orphaned
         // stats entry (from any cause, not only the drop path above) can never become a permanent,
@@ -2841,29 +2843,27 @@ impl BtreeEngine {
             .collect();
         sorted_stats.sort_by_key(|(table, _)| **table);
         for (table, stats) in sorted_stats {
-            ops.push(LoggedOp::SetStats {
+            emit(LoggedOp::SetStats {
                 txn: synthetic_txn,
                 table: *table,
                 stats: stats.clone(),
-            });
+            })?;
         }
         let mut sorted_seqs: Vec<_> = seqs.sequences.iter().collect();
         sorted_seqs.sort_by_key(|(id, _)| **id);
         for (id, seq) in sorted_seqs {
-            ops.push(LoggedOp::SeqCreate {
+            emit(LoggedOp::SeqCreate {
                 id: *id,
                 def: seq.def.clone(),
-            });
+            })?;
             if let Some(value) = seq.current {
-                ops.push(LoggedOp::SeqSet { id: *id, value });
+                emit(LoggedOp::SeqSet { id: *id, value })?;
             }
         }
-        let mut records: Vec<WalRecord> = ops.iter().map(LoggedOp::to_record).collect();
-        records.push(WalRecord::CommitTxn {
+        sink(&WalRecord::CommitTxn {
             txn: TxnId(synthetic_txn),
             unix_ms: stamp,
-        });
-        Ok(records)
+        })
     }
 
     /// Queue the overflow chain pages `retired` released, if any, for purge to free once `txn`
@@ -3028,21 +3028,33 @@ impl BtreeEngine {
         };
         let mut wal = wal_mutex.lock().map_err(|_| poisoned())?;
         let covered_lsn = wal.writer.next_lsn().0.saturating_sub(1);
-        let records = Self::emit_image_records(&cat, &seqs, &self.store, synthetic_txn, stamp)?;
-        // Phase 1: complete image at the scratch path, fsynced before it may earn its name.
+        // Phase 1: complete image at the scratch path, fsynced before it may earn its name. The
+        // records stream straight into the writer as they are produced, so the checkpoint's own
+        // memory stays at the writer's buffer whatever the size of the database.
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
-        {
+        let written: Result<()> = (|| {
             let mut file = File::create(&tmp)?;
             std::io::Write::write_all(&mut file, &ckpt_header_bytes(covered_lsn))?;
             let mut writer = WalWriter::new(file);
-            for record in &records {
-                writer.append(record)?;
-            }
+            Self::emit_image(
+                &cat,
+                &seqs,
+                &self.store,
+                synthetic_txn,
+                stamp,
+                &mut |record| writer.append(record).map(|_| ()),
+            )?;
             // Drain the writer's append buffer to the file, then fsync — the image is durable
             // before its rename can make it authoritative.
             writer.flush()?;
             writer.get_mut().sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            // A partial image is never renamed; leave nothing behind for the next open to tidy.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
         // Phase 2: the atomic publish — a named image is complete by construction. Fsync the
         // containing directory so the rename itself is durable before phase 3 destroys the only
@@ -4541,7 +4553,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 name: name.to_owned(),
             },
         )?;
-        // Non-durable: no `SchemaCreate` is written to the WAL, and `emit_image_records` excludes it
+        // Non-durable: no `SchemaCreate` is written to the WAL, and `emit_image` excludes it
         // from the checkpoint image, so it never survives recovery/restart.
         Ok(SchemaId(id))
     }
