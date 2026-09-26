@@ -2115,6 +2115,18 @@ fn index_not_found(index: IndexId) -> Error {
     ))
 }
 
+/// Whether an index range can hold no key at all: its lower bound lies past its upper bound, or
+/// the two meet on a key one side excludes. `BTreeMap::range` panics on such a range, and a
+/// predicate such as `k > 500 AND k < 100` spells one legitimately, so it is answered empty.
+fn index_range_is_empty(lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
+    match (lo, hi) {
+        (Bound::Included(l), Bound::Included(h)) => l > h,
+        (Bound::Included(l) | Bound::Excluded(l), Bound::Excluded(h))
+        | (Bound::Excluded(l), Bound::Included(h)) => l >= h,
+        _ => false,
+    }
+}
+
 /// Borrow a `Bound<Vec<u8>>` as a `Bound<&[u8]>` for `BTreeMap::range`.
 const fn as_slice_bound(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
     match b {
@@ -4589,10 +4601,15 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
             let tree = ClusteredTree::open(&self.store, t.root_id());
-            for (_key, entry_rows) in data
-                .entries
-                .range::<[u8], _>((as_slice_bound(&lo), as_slice_bound(&hi)))
-            {
+            let entries: Box<dyn Iterator<Item = _>> = if index_range_is_empty(&lo, &hi) {
+                Box::new(std::iter::empty())
+            } else {
+                Box::new(
+                    data.entries
+                        .range::<[u8], _>((as_slice_bound(&lo), as_slice_bound(&hi))),
+                )
+            };
+            for (_key, entry_rows) in entries {
                 for (&row_id, metas) in entry_rows {
                     if !IndexData::entry_visible(metas, &view) {
                         continue;
@@ -5257,13 +5274,18 @@ impl BtreeEngine {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
             let tree = ClusteredTree::open(&self.store, t.root_id());
-            let range = data
-                .entries
-                .range::<[u8], _>((as_slice_bound(lo), as_slice_bound(hi)));
-            // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed.
-            let entries: Box<dyn Iterator<Item = _>> = match direction {
-                ScanDirection::Forward => Box::new(range),
-                ScanDirection::Backward => Box::new(range.rev()),
+            // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed;
+            // a range that can hold no key is answered empty rather than handed to it.
+            let entries: Box<dyn Iterator<Item = _>> = if index_range_is_empty(lo, hi) {
+                Box::new(std::iter::empty())
+            } else {
+                let range = data
+                    .entries
+                    .range::<[u8], _>((as_slice_bound(lo), as_slice_bound(hi)));
+                match direction {
+                    ScanDirection::Forward => Box::new(range),
+                    ScanDirection::Backward => Box::new(range.rev()),
+                }
             };
             'walk: for (_key, entry_rows) in entries {
                 for (&row_id, metas) in entry_rows {
