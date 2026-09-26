@@ -1188,9 +1188,10 @@ fn insert_value_rows(
             // the vectorized and row paths produce identical results, so a wrong estimate can only
             // mis-route, never corrupt.
             let est_scan_rows = select
-                .table_stats
-                .as_ref()
-                .map(|s| s.row_count)
+                .joins
+                .is_empty()
+                .then(|| select.table_stats.as_ref().map(|s| s.row_count))
+                .flatten()
                 .or(select.approx_scan_rows);
             let op = crate::planner::plan_select((**select).clone());
             match run_select(&op, est_scan_rows, engine, txn)? {

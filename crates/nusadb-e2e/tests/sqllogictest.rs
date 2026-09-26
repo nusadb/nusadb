@@ -64,6 +64,39 @@ impl SltCatalog<'_> {
         self.resolve_in(nusadb_core::PUBLIC_SCHEMA, name)
     }
 
+    /// The table's SQL-maintained secondary indexes, the ones safe to scan.
+    fn scannable_indexes(&self, schema: &TableSchema) -> Result<Vec<IndexInfo>, nusadb_sql::Error> {
+        // Constraint-backing (PK/UNIQUE/FK) indexes are enforced by scanning and not maintained on
+        // write, so they are unsafe to scan: expose only SQL-maintained secondary indexes.
+        let backing: std::collections::HashSet<_> = self
+            .engine
+            .list_constraints(schema.id)?
+            .into_iter()
+            .filter_map(|c| c.index)
+            .collect();
+        let mut out = Vec::new();
+        for def in self.engine.list_indexes(schema.id)? {
+            if self
+                .engine
+                .lookup_index(&def.name)?
+                .is_some_and(|id| backing.contains(&id))
+            {
+                continue;
+            }
+            // A functional/expression key or partial predicate is unsafe as a scan candidate;
+            // mirror the production `catalog_list_indexes` exclusion.
+            if !def.key_exprs.is_empty() || def.predicate.is_some() {
+                continue;
+            }
+            out.push(IndexInfo {
+                name: def.name,
+                columns: def.columns,
+                unique: def.unique,
+            });
+        }
+        Ok(out)
+    }
+
     fn resolve_in(
         &self,
         schema: &str,
@@ -103,35 +136,18 @@ impl Catalog for SltCatalog<'_> {
         let Some(schema) = self.resolve(name)? else {
             return Ok(Vec::new());
         };
-        // Constraint-backing (PK/UNIQUE/FK) indexes are enforced by scanning and not maintained on
-        // write, so they are unsafe to scan — expose only SQL-maintained secondary indexes.
-        let backing: std::collections::HashSet<_> = self
-            .engine
-            .list_constraints(schema.id)?
-            .into_iter()
-            .filter_map(|c| c.index)
-            .collect();
-        let mut out = Vec::new();
-        for def in self.engine.list_indexes(schema.id)? {
-            if self
-                .engine
-                .lookup_index(&def.name)?
-                .is_some_and(|id| backing.contains(&id))
-            {
-                continue;
-            }
-            // A functional/expression key or partial predicate is unsafe as a scan candidate —
-            // mirror the production `catalog_list_indexes` exclusion.
-            if !def.key_exprs.is_empty() || def.predicate.is_some() {
-                continue;
-            }
-            out.push(IndexInfo {
-                name: def.name,
-                columns: def.columns,
-                unique: def.unique,
-            });
-        }
-        Ok(out)
+        self.scannable_indexes(&schema)
+    }
+
+    fn list_indexes_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<IndexInfo>, nusadb_sql::Error> {
+        let Some(table) = self.resolve_in(schema, name)? else {
+            return Ok(Vec::new());
+        };
+        self.scannable_indexes(&table)
     }
 
     fn any_inheritance(&self) -> Result<bool, nusadb_sql::Error> {

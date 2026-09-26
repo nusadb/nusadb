@@ -1566,8 +1566,9 @@ pub struct SelectPlan {
     /// catalog does not expose any.
     pub indexes: Vec<IndexMeta>,
     /// The base table's ANALYZE statistics, when available. The planner uses them for
-    /// cost-based plan selection — currently the index-vs-sequential-scan choice. `None` for a CTE
-    /// base, an un-analyzed table, or a catalog that exposes no stats (then planning is heuristic).
+    /// cost-based plan selection: currently the index-vs-sequential-scan choice, for the base
+    /// scan alone and for a conjunct pushed onto it below a join. `None` for a CTE base, an
+    /// un-analyzed table, or a catalog that exposes no stats (then planning is heuristic).
     pub table_stats: Option<nusadb_core::TableStats>,
     /// The base table's `O(1)` approximate live-row count, when the catalog exposes one — the
     /// vectorized-routing cardinality fallback used when [`table_stats`](Self::table_stats) is
@@ -1673,6 +1674,13 @@ pub struct JoinPlan {
     /// right)` (filling the left slot from the right when the left is NULL), which is correct for a
     /// RIGHT/FULL join's unmatched rows and a no-op for INNER/LEFT. Empty for `ON`/`CROSS` joins.
     pub coalesce: Vec<(usize, usize)>,
+    /// Secondary indexes on the joined table, resolved to its own column ordinals, so the planner
+    /// can serve a `WHERE` conjunct pushed onto this side from an index instead of a full scan.
+    /// Empty for a derived-table input or a table without indexes.
+    pub indexes: Vec<IndexMeta>,
+    /// The joined table's ANALYZE statistics, when available, gating the index-vs-scan choice
+    /// for a conjunct pushed onto this side. `None` for a derived input or an un-analyzed table.
+    pub table_stats: Option<nusadb_core::TableStats>,
     /// For a derived-table join input `JOIN (SELECT ...) AS x`, the inlined subquery plan whose
     /// output forms this join's right side; `None` for a named table (scanned via `table`).
     pub input_cte: Option<Box<SelectPlan>>,

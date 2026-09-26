@@ -91,9 +91,10 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             // the engine's O(1) approximate count when the table was never analyzed, so a large
             // un-analyzed table still vectorizes.
             let est_scan_rows = p
-                .table_stats
-                .as_ref()
-                .map(|s| s.row_count)
+                .joins
+                .is_empty()
+                .then(|| p.table_stats.as_ref().map(|s| s.row_count))
+                .flatten()
                 .or(p.approx_scan_rows);
             PhysicalPlan::Select(plan_select(*p), est_scan_rows)
         },
@@ -359,6 +360,10 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
                     && matches!(column_side(c, base_width), Side::Left)
             });
         if let Some(pushed) = rebuild_and(pushable) {
+            // The pushed conjuncts may map onto one of the base table's indexes: narrow the
+            // scan with it, keeping the full conjunct set as the filter above (the index only
+            // narrows the row source, exactly as in the single-table case).
+            op = index_narrowed(op, &select.indexes, select.table_stats.as_ref(), &pushed);
             op = PhysicalOperator::Filter {
                 input: Box::new(op),
                 predicate: pushed,
@@ -425,6 +430,7 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
                 });
             if let Some(mut pushed) = rebuild_and(pushable) {
                 remap_columns(&mut pushed, left_width);
+                right = index_narrowed(right, &join.indexes, join.table_stats.as_ref(), &pushed);
                 right = PhysicalOperator::Filter {
                     input: Box::new(right),
                     predicate: pushed,
@@ -881,6 +887,27 @@ pub(super) fn try_index_scan(
     None
 }
 
+/// A plain table scan narrowed by an index that `predicate` (a conjunct set pushed onto that
+/// scan) maps onto; any other operator, or no usable index, comes back unchanged. The caller
+/// keeps `predicate` as a filter above, so the index only trims the rows that enter it. With
+/// `stats` the index is taken only when estimated cheaper than the full scan, exactly as for a
+/// single-table query: a bound that keeps most of the table (`id < huge`) stays a scan.
+fn index_narrowed(
+    scan: PhysicalOperator,
+    indexes: &[IndexMeta],
+    stats: Option<&nusadb_core::TableStats>,
+    predicate: &TypedExpr,
+) -> PhysicalOperator {
+    match scan {
+        PhysicalOperator::SeqScan { table, columns } => {
+            let scan_stats = stats.map(|st| crate::executor::cost::ScanStats::new(&table, st));
+            try_index_scan(&table, indexes, predicate, scan_stats.as_ref())
+                .unwrap_or(PhysicalOperator::SeqScan { table, columns })
+        },
+        other => other,
+    }
+}
+
 /// Sort-elimination: when the query's `ORDER BY … LIMIT` is a prefix of some scannable index's key
 /// columns, all in the **same** direction, over `NOT NULL` columns, the index already yields
 /// exactly that order. Emit a `LIMIT`-capped ordered scan of it (forward for `ASC`, backward for
@@ -911,6 +938,26 @@ fn try_ordered_index_scan(
     // The already-computed top-N cap is `Some(offset + limit)` only when a plain `LIMIT` (no
     // `WITH TIES`/`DISTINCT`/set-returning projection) bounds the rows — exactly the gate we need.
     let cap = usize::try_from(top_n_cap?).ok()?;
+    // Under statistics the cost gate keeps a wide range on a sequential scan, which is right for
+    // a full read but not here: the cap bounds the ordered scan to `cap` rows however wide the
+    // range, while the scan-and-sort reads everything. So a filtered plain scan is first lifted
+    // onto the index of the ordering column, gate aside, and then judged like any other.
+    let lifted = if let PhysicalOperator::Filter { input, predicate } = op
+        && let PhysicalOperator::SeqScan { table, .. } = input.as_ref()
+    {
+        let (_, order_col) = ordered_scan_direction(table, order_by)?;
+        indexes
+            .iter()
+            .filter(|meta| meta.columns == [order_col])
+            .find_map(|meta| try_index_scan(table, std::slice::from_ref(meta), predicate, None))
+            .map(|scan| PhysicalOperator::Filter {
+                input: Box::new(scan),
+                predicate: predicate.clone(),
+            })
+    } else {
+        None
+    };
+    let op = lifted.as_ref().unwrap_or(op);
     // A `WHERE` on the ordering column that the index range already answers exactly: the retained
     // `Filter` drops nothing the bounds let through, so capping the ordered scan at the LIMIT still
     // yields the right rows. Any other shape between the sort and the scan keeps the `Sort`.

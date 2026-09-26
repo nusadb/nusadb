@@ -4701,6 +4701,26 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::catalog_approx_row_count(self.engine, self.txn, name)
     }
 
+    fn list_indexes_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<IndexInfo>, nusadb_sql::Error> {
+        nusadb_sql::catalog_list_indexes_in(self.engine, self.txn, schema, name)
+    }
+
+    fn table_stats_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<nusadb_core::TableStats>, nusadb_sql::Error> {
+        nusadb_sql::catalog_table_stats_in(self.engine, self.txn, schema, name)
+    }
+
+    fn approx_row_count_in(&self, schema: &str, name: &str) -> Result<u64, nusadb_sql::Error> {
+        nusadb_sql::catalog_approx_row_count_in(self.engine, self.txn, schema, name)
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, nusadb_sql::Error> {
         // Non-materialized views: read the stored defining SQL so the analyzer can inline it.
         nusadb_sql::lookup_view_definition(self.engine, self.txn, name)

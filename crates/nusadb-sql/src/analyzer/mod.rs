@@ -137,6 +137,32 @@ pub trait Catalog {
         Ok(0)
     }
 
+    /// [`list_indexes`](Self::list_indexes) for the table identified as `(schema, name)`, the key
+    /// the analyzer holds once a reference is resolved. A bare name would go back through the
+    /// search path and could land on a same-named table in another schema, so the production
+    /// adapters override this to resolve by the pair; the default serves single-namespace test
+    /// doubles.
+    fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<IndexInfo>, Error> {
+        let _ = schema;
+        self.list_indexes(name)
+    }
+
+    /// [`table_stats`](Self::table_stats) for the table identified as `(schema, name)`.
+    fn table_stats_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<nusadb_core::TableStats>, Error> {
+        let _ = schema;
+        self.table_stats(name)
+    }
+
+    /// [`approx_row_count`](Self::approx_row_count) for the table identified as `(schema, name)`.
+    fn approx_row_count_in(&self, schema: &str, name: &str) -> Result<u64, Error> {
+        let _ = schema;
+        self.approx_row_count(name)
+    }
+
     /// Whether view `name` (a `view_lookup_key`) has an `INSTEAD OF` trigger for `event` — the
     /// analyzer then plans the DML as trigger firings instead of the auto-updatable rewrite.
     /// Default `false` (test doubles without a trigger store). Every DML-on-view plan is already

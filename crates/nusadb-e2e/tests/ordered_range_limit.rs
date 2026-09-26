@@ -21,6 +21,16 @@ impl Catalog for EngineCatalog<'_> {
         self.0.lookup_table(name).map_err(Into::into)
     }
 
+    fn table_stats(
+        &self,
+        name: &str,
+    ) -> Result<Option<nusadb_core::TableStats>, nusadb_sql::Error> {
+        let Some(schema) = self.0.lookup_table(name)? else {
+            return Ok(None);
+        };
+        self.0.table_stats(schema.id).map_err(Into::into)
+    }
+
     fn list_indexes(&self, name: &str) -> Result<Vec<IndexInfo>, nusadb_sql::Error> {
         let Some(schema) = self.0.lookup_table(name)? else {
             return Ok(Vec::new());
@@ -196,4 +206,22 @@ fn a_range_that_can_hold_no_key_is_empty_not_a_crash() {
     ] {
         assert_eq!(ints(&engine, sql), Vec::<i64>::new(), "{sql}");
     }
+}
+
+#[test]
+fn a_wide_range_under_statistics_still_takes_the_capped_ordered_scan() {
+    let engine = fixture();
+    // The range keeps almost every row, so the cost gate would leave a full read on the
+    // sequential scan; with ORDER BY on the same column and a LIMIT, the capped index scan
+    // reads only the limit and wins regardless.
+    run(&engine, "ANALYZE t");
+    let sql = "SELECT k FROM t WHERE k BETWEEN 1 AND 998 ORDER BY k DESC LIMIT 7";
+    let plan = text(&engine, &format!("EXPLAIN {sql}"));
+    assert!(plan.contains("IndexScan: t using t_k"), "{plan}");
+    assert!(!plan.contains("Sort"), "{plan}");
+    let mut expected: Vec<i64> = (0..1000).map(|i| (i * 7) % 1000).collect();
+    expected.retain(|k| (1..=998).contains(k));
+    expected.sort_unstable_by(|a, b| b.cmp(a));
+    expected.truncate(7);
+    assert_eq!(ints(&engine, sql), expected);
 }

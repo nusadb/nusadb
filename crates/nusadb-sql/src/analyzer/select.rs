@@ -19,6 +19,11 @@ pub(super) struct ResolvedFrom {
     /// `FOR SHARE` must cover. Empty for every other base — including a real CTE/view, whose rows
     /// have no single lockable origin.
     expanded_lock_tables: Vec<TableSchema>,
+    /// Whether `table` is a real catalog table, as opposed to the synthetic schema a recursive,
+    /// modifying or materialized CTE resolves to under its own name. Only a real table's
+    /// indexes and statistics may be looked up: a CTE that shadows an indexed table must never
+    /// be scanned through that table's index.
+    base_is_real_table: bool,
     /// Resolved joins, in order.
     joins: Vec<JoinPlan>,
     /// Column scope `[base cols ++ join0 cols ++ ...]`, indexed by row ordinal.
@@ -678,6 +683,7 @@ pub(super) fn resolve_from(
             table: None,
             base_cte: None,
             expanded_lock_tables: Vec::new(),
+            base_is_real_table: false,
             joins: Vec::new(),
             scope: Vec::new(),
         });
@@ -882,11 +888,24 @@ pub(super) fn resolve_from(
                 }
             }
         }
+        // A real table's indexes and statistics travel with the join so a conjunct pushed onto
+        // this side can use one. A derived input has none, and a CTE resolved under its own
+        // name must not borrow those of a table it shadows.
+        let (indexes, table_stats) = if join_gates {
+            (
+                resolve_table_indexes(Some(&joined), catalog)?,
+                catalog.table_stats_in(&joined.schema, &joined.name)?,
+            )
+        } else {
+            (Vec::new(), None)
+        };
         joins.push(JoinPlan {
             table: joined,
             kind: join.kind,
             on,
             coalesce: coalesce_pairs,
+            indexes,
+            table_stats,
             input_cte: join_cte,
             lateral: join.table.lateral,
         });
@@ -896,6 +915,7 @@ pub(super) fn resolve_from(
         table: if base_cte.is_some() { None } else { Some(base) },
         expanded_lock_tables,
         base_cte,
+        base_is_real_table: base_gates,
         joins,
         scope,
     })
@@ -1553,6 +1573,7 @@ fn analyze_select_scoped(
         table,
         base_cte,
         expanded_lock_tables,
+        base_is_real_table,
         joins,
         scope: scope_vec,
     } = resolve_from(sel.from.as_ref(), sel.filter.as_ref(), catalog, &ctes)?;
@@ -1833,18 +1854,21 @@ fn analyze_select_scoped(
 
     // Resolve the base table's indexes so the planner can consider an index scan. Done here,
     // while the catalog is in hand; the planner is pure and only sees the resolved metadata.
-    let indexes = resolve_table_indexes(table.as_ref(), catalog)?;
-    // Fetch the base table's ANALYZE stats for cost-based planning — single-table SELECTs
-    // only (a join's per-table stats are not yet threaded). `None` leaves planning heuristic.
-    let table_stats = match (table.as_ref(), joins.is_empty()) {
-        (Some(schema), true) => catalog.table_stats(&schema.name)?,
-        _ => None,
+    // Only a real catalog table has them: a CTE resolved under its own name would otherwise be
+    // scanned through the index of a table it shadows.
+    let catalog_table = table.as_ref().filter(|_| base_is_real_table);
+    let indexes = resolve_table_indexes(catalog_table, catalog)?;
+    // Fetch the base table's ANALYZE stats for cost-based planning: the index-vs-scan choice
+    // for the base scan, alone or under a join. `None` leaves planning heuristic.
+    let table_stats = match catalog_table {
+        Some(schema) => catalog.table_stats_in(&schema.schema, &schema.name)?,
+        None => None,
     };
     // The `O(1)` approximate row count of the same single base table — the vectorized-routing
     // cardinality fallback the planner uses when there are no `ANALYZE` stats (so a large un-analyzed
     // table still vectorizes). `0` (the default / no cheap estimate) leaves the fallback off.
-    let approx_scan_rows = match (table.as_ref(), joins.is_empty()) {
-        (Some(schema), true) => match catalog.approx_row_count(&schema.name)? {
+    let approx_scan_rows = match (catalog_table, joins.is_empty()) {
+        (Some(schema), true) => match catalog.approx_row_count_in(&schema.schema, &schema.name)? {
             0 => None,
             n => Some(n),
         },
@@ -2015,7 +2039,7 @@ fn resolve_table_indexes(
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    for info in catalog.list_indexes(&schema.name)? {
+    for info in catalog.list_indexes_in(&schema.schema, &schema.name)? {
         let mut columns = Vec::with_capacity(info.columns.len());
         let mut ok = true;
         for col in &info.columns {
@@ -2551,6 +2575,17 @@ struct CteCatalog<'a> {
     schema: &'a TableSchema,
 }
 
+impl CteCatalog<'_> {
+    /// Whether `(schema, name)` denotes the synthetic recursive-CTE table rather than a real
+    /// object: the CTE's unqualified name, reached through the `public` probe or the session's
+    /// temp-schema probe. A genuine other-schema qualifier still denotes a real base table.
+    fn shadows(&self, schema: &str, name: &str) -> bool {
+        name == self.name
+            && (schema == nusadb_core::PUBLIC_SCHEMA
+                || self.inner.temp_schema().as_deref() == Some(schema))
+    }
+}
+
 impl Catalog for CteCatalog<'_> {
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         if name == self.name {
@@ -2565,10 +2600,7 @@ impl Catalog for CteCatalog<'_> {
         // temp-schema probe (`lookup_table_ref` tries the session temp schema first) — so the CTE
         // name must win for BOTH, or a session temp table of the same name would hijack the CTE's
         // self-reference. A genuine other-schema qualifier still denotes a real base table.
-        if name == self.name
-            && (schema == nusadb_core::PUBLIC_SCHEMA
-                || self.inner.temp_schema().as_deref() == Some(schema))
-        {
+        if self.shadows(schema, name) {
             return Ok(Some(self.schema.clone()));
         }
         self.inner.lookup_table_in(schema, name)
@@ -2594,6 +2626,33 @@ impl Catalog for CteCatalog<'_> {
             return Ok(Vec::new());
         }
         self.inner.list_indexes(table)
+    }
+
+    fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<IndexInfo>, Error> {
+        // The same shadowing as `lookup_table_in`: the CTE has no indexes, and a real table of
+        // its name in another schema keeps its own.
+        if self.shadows(schema, name) {
+            return Ok(Vec::new());
+        }
+        self.inner.list_indexes_in(schema, name)
+    }
+
+    fn table_stats_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<nusadb_core::TableStats>, Error> {
+        if self.shadows(schema, name) {
+            return Ok(None);
+        }
+        self.inner.table_stats_in(schema, name)
+    }
+
+    fn approx_row_count_in(&self, schema: &str, name: &str) -> Result<u64, Error> {
+        if self.shadows(schema, name) {
+            return Ok(0);
+        }
+        self.inner.approx_row_count_in(schema, name)
     }
 
     fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {

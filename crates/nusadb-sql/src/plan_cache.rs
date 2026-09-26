@@ -276,12 +276,27 @@ impl Catalog for RecordingCatalog<'_> {
         Ok(enabled)
     }
 
+    fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<IndexInfo>, Error> {
+        let indexes = self.inner.list_indexes_in(schema, name)?;
+        // The same rule as `list_indexes`: a plan that can see an index is not cached.
+        if !indexes.is_empty() {
+            self.saw_unversioned_dep.set(true);
+        }
+        Ok(indexes)
+    }
+
     // Everything else delegates unchanged.
     fn table_stats(&self, table: &str) -> Result<Option<TableStats>, Error> {
         self.inner.table_stats(table)
     }
     fn approx_row_count(&self, table: &str) -> Result<u64, Error> {
         self.inner.approx_row_count(table)
+    }
+    fn table_stats_in(&self, schema: &str, name: &str) -> Result<Option<TableStats>, Error> {
+        self.inner.table_stats_in(schema, name)
+    }
+    fn approx_row_count_in(&self, schema: &str, name: &str) -> Result<u64, Error> {
+        self.inner.approx_row_count_in(schema, name)
     }
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {
         self.inner.lookup_view_columns(name)

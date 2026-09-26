@@ -3642,6 +3642,31 @@ pub fn catalog_list_indexes(
     let Some(schema) = engine.lookup_table_as_of(txn, name)? else {
         return Ok(Vec::new());
     };
+    scannable_indexes_of(engine, &schema)
+}
+
+/// [`catalog_list_indexes`] for the table identified as `(schema, name)`: the key the analyzer
+/// holds once a reference is resolved, which never goes back through the search path.
+///
+/// # Errors
+/// Propagates storage/decode errors.
+pub fn catalog_list_indexes_in(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    name: &str,
+) -> Result<Vec<crate::IndexInfo>, Error> {
+    let Some(table) = engine.lookup_table_as_of_in(txn, schema, name)? else {
+        return Ok(Vec::new());
+    };
+    scannable_indexes_of(engine, &table)
+}
+
+/// The indexes of `schema` the planner may scan through.
+fn scannable_indexes_of(
+    engine: &dyn StorageEngine,
+    schema: &TableSchema,
+) -> Result<Vec<crate::IndexInfo>, Error> {
     let mut out = Vec::new();
     for def in engine.list_indexes(schema.id)? {
         let Some(id) = engine.lookup_index(&def.name)? else {
@@ -3687,6 +3712,22 @@ pub fn catalog_table_stats(
     engine.table_stats(schema.id).map_err(Into::into)
 }
 
+/// [`catalog_table_stats`] for the table identified as `(schema, name)`.
+///
+/// # Errors
+/// Propagates storage/decode errors.
+pub fn catalog_table_stats_in(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    name: &str,
+) -> Result<Option<nusadb_core::TableStats>, Error> {
+    let Some(table) = engine.lookup_table_as_of_in(txn, schema, name)? else {
+        return Ok(None);
+    };
+    engine.table_stats(table.id).map_err(Into::into)
+}
+
 /// The `O(1)` approximate live-row count of table `name` under `txn`'s snapshot — the shared body of
 /// every production `Catalog::approx_row_count` adapter.
 ///
@@ -3704,6 +3745,22 @@ pub fn catalog_approx_row_count(
         return Ok(0);
     };
     engine.approx_row_count(schema.id).map_err(Into::into)
+}
+
+/// [`catalog_approx_row_count`] for the table identified as `(schema, name)`.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn catalog_approx_row_count_in(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    name: &str,
+) -> Result<u64, Error> {
+    let Some(table) = engine.lookup_table_as_of_in(txn, schema, name)? else {
+        return Ok(0);
+    };
+    engine.approx_row_count(table.id).map_err(Into::into)
 }
 
 /// The defining SQL of the non-materialized view `name`, read from the view catalog under `txn`'s
@@ -4701,6 +4758,22 @@ impl crate::Catalog for ExecCatalog<'_> {
         catalog_approx_row_count(self.engine, self.txn, table)
     }
 
+    fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<crate::IndexInfo>, Error> {
+        catalog_list_indexes_in(self.engine, self.txn, schema, name)
+    }
+
+    fn table_stats_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<nusadb_core::TableStats>, Error> {
+        catalog_table_stats_in(self.engine, self.txn, schema, name)
+    }
+
+    fn approx_row_count_in(&self, schema: &str, name: &str) -> Result<u64, Error> {
+        catalog_approx_row_count_in(self.engine, self.txn, schema, name)
+    }
+
     fn lookup_view(&self, name: &str) -> Result<Option<String>, Error> {
         lookup_view_definition(self.engine, self.txn, name)
     }
@@ -4919,6 +4992,22 @@ impl crate::Catalog for SessionCatalog<'_> {
 
     fn approx_row_count(&self, table: &str) -> Result<u64, Error> {
         catalog_approx_row_count(self.engine, self.txn, table)
+    }
+
+    fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<crate::IndexInfo>, Error> {
+        catalog_list_indexes_in(self.engine, self.txn, schema, name)
+    }
+
+    fn table_stats_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<nusadb_core::TableStats>, Error> {
+        catalog_table_stats_in(self.engine, self.txn, schema, name)
+    }
+
+    fn approx_row_count_in(&self, schema: &str, name: &str) -> Result<u64, Error> {
+        catalog_approx_row_count_in(self.engine, self.txn, schema, name)
     }
 
     fn lookup_view(&self, name: &str) -> Result<Option<String>, Error> {

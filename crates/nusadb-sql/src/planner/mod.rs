@@ -732,28 +732,78 @@ mod tests {
     }
 
     #[test]
-    fn join_query_pushes_base_predicate_and_keeps_seqscan() {
+    fn join_query_serves_a_pushed_base_predicate_from_an_index() {
         // `WHERE t.a = 5` references only the base table `t`, so predicate pushdown moves it
-        // below the join onto `t`'s scan — no Filter remains above the join. The base stays a
-        // SeqScan; v1 never swaps a join base for an index scan, even though `a` is indexed.
+        // below the join onto `t`'s scan, and since `a` is indexed the scan under that pushed
+        // Filter is an IndexScan with the point bound; no Filter remains above the join.
         let PhysicalOperator::Project { input, .. } =
             indexed_select_op("SELECT * FROM t JOIN s ON t.a = s.a WHERE t.a = 5")
         else {
             panic!("expected Project at the root");
         };
-        let PhysicalOperator::HashJoin { left, .. } = *input else {
+        let PhysicalOperator::HashJoin { left, right, .. } = *input else {
             panic!(
                 "expected HashJoin directly under Project (pushed-down predicate leaves no Filter)"
             );
         };
-        // The pushed predicate wraps the join's left (base) input, which is still a SeqScan.
         let PhysicalOperator::Filter { input: scan, .. } = *left else {
             panic!("expected the pushed Filter on the join's left input");
         };
+        let PhysicalOperator::IndexScan { index, lo, hi, .. } = *scan else {
+            panic!("expected the pushed predicate to narrow the base scan through its index");
+        };
+        assert_eq!(index, "t_a_idx");
+        assert_eq!(lo, Bound::Included(vec![crate::ast::Value::Int(5)]));
+        assert_eq!(hi, Bound::Included(vec![crate::ast::Value::Int(5)]));
         assert!(
-            matches!(*scan, PhysicalOperator::SeqScan { .. }),
-            "join base must not be replaced by an index scan in v1"
+            matches!(*right, PhysicalOperator::SeqScan { .. }),
+            "nothing is pushed onto the right input"
         );
+    }
+
+    #[test]
+    fn join_query_serves_a_pushed_right_predicate_from_the_right_tables_index() {
+        // `t` is the joined-in table here and `t.a = 5` is a right-only conjunct: it is pushed
+        // onto the right input and, in the right input's own column space, maps onto `t_a_idx`.
+        let PhysicalOperator::Project { input, .. } =
+            indexed_select_op("SELECT * FROM s JOIN t ON s.a = t.a WHERE t.a = 5")
+        else {
+            panic!("expected Project at the root");
+        };
+        let PhysicalOperator::HashJoin { left, right, .. } = *input else {
+            panic!("expected HashJoin directly under Project");
+        };
+        assert!(
+            matches!(*left, PhysicalOperator::SeqScan { .. }),
+            "nothing is pushed onto the base"
+        );
+        let PhysicalOperator::Filter { input: scan, .. } = *right else {
+            panic!("expected the right-only conjunct pushed onto the right input");
+        };
+        let PhysicalOperator::IndexScan { index, lo, hi, .. } = *scan else {
+            panic!("expected the pushed predicate to narrow the right scan through its index");
+        };
+        assert_eq!(index, "t_a_idx");
+        assert_eq!(lo, Bound::Included(vec![crate::ast::Value::Int(5)]));
+        assert_eq!(hi, Bound::Included(vec![crate::ast::Value::Int(5)]));
+    }
+
+    #[test]
+    fn left_join_right_predicate_stays_above_and_the_right_scan_keeps_its_full_scan() {
+        // A LEFT join null-extends its right side, so `t.a = 5` cannot move below it and the
+        // right input stays a bare SeqScan even though `a` is indexed.
+        let PhysicalOperator::Project { input, .. } =
+            indexed_select_op("SELECT * FROM s LEFT JOIN t ON s.a = t.a WHERE t.a = 5")
+        else {
+            panic!("expected Project at the root");
+        };
+        let PhysicalOperator::Filter { input, .. } = *input else {
+            panic!("expected the predicate kept above the outer join");
+        };
+        let PhysicalOperator::HashJoin { right, .. } = *input else {
+            panic!("expected HashJoin under the Filter");
+        };
+        assert!(matches!(*right, PhysicalOperator::SeqScan { .. }));
     }
 
     #[test]
