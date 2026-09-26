@@ -881,14 +881,16 @@ pub(super) fn try_index_scan(
     None
 }
 
-/// Sort-elimination: when the base is a plain table scan and the query's `ORDER BY … LIMIT` is a
-/// prefix of some scannable index's key columns — all in the **same** direction, over `NOT NULL`
-/// columns — the index already yields exactly that order. Emit a `LIMIT`-capped ordered scan of it
-/// (forward for `ASC`, backward for `DESC`) so the executor stops after `offset + limit` rows, and
-/// let the caller drop the `Sort`. Returns `None` (keep the `Sort`) for any shape not covered: a
-/// non-`SeqScan` base (a `WHERE`/join/aggregate/window sits between the scan and the sort), a mix of
-/// `ASC` and `DESC` keys, a nullable ordering column, no bounding `LIMIT`, a non-column sort key, or
-/// no matching index.
+/// Sort-elimination: when the query's `ORDER BY … LIMIT` is a prefix of some scannable index's key
+/// columns, all in the **same** direction, over `NOT NULL` columns, the index already yields
+/// exactly that order. Emit a `LIMIT`-capped ordered scan of it (forward for `ASC`, backward for
+/// `DESC`) so the executor stops after `offset + limit` rows, and let the caller drop the `Sort`.
+/// Two bases qualify: a plain table scan, and a `WHERE` on the ordering column that the index range
+/// already answers exactly (the retained `Filter` then drops nothing the bounds let through, so the
+/// cap still yields the right rows). Returns `None` (keep the `Sort`) for any other shape: a join,
+/// aggregate or window between the scan and the sort, a `WHERE` the bounds do not answer exactly, a
+/// mix of `ASC` and `DESC` keys, a nullable ordering column, no bounding `LIMIT`, a non-column sort
+/// key, or no matching index.
 fn try_ordered_index_scan(
     op: &PhysicalOperator,
     order_by: &[OrderByKey],
@@ -896,7 +898,6 @@ fn try_ordered_index_scan(
     top_n_cap: Option<u64>,
     skip_locked: bool,
 ) -> Option<PhysicalOperator> {
-    use nusadb_core::engine::ScanDirection;
     // `FOR UPDATE ... SKIP LOCKED` must fill its LIMIT from *lockable* rows: the executor skips a
     // row another txn holds locked mid-scan and keeps going. A capped ordered index scan can't do
     // that — the engine stops after `cap` *visible* rows in key order with no notion of locks, so a
@@ -907,44 +908,53 @@ fn try_ordered_index_scan(
     if skip_locked {
         return None;
     }
+    // The already-computed top-N cap is `Some(offset + limit)` only when a plain `LIMIT` (no
+    // `WITH TIES`/`DISTINCT`/set-returning projection) bounds the rows — exactly the gate we need.
+    let cap = usize::try_from(top_n_cap?).ok()?;
+    // A `WHERE` on the ordering column that the index range already answers exactly: the retained
+    // `Filter` drops nothing the bounds let through, so capping the ordered scan at the LIMIT still
+    // yields the right rows. Any other shape between the sort and the scan keeps the `Sort`.
+    if let PhysicalOperator::Filter { input, predicate } = op
+        && let PhysicalOperator::IndexScan {
+            table,
+            index,
+            lo,
+            hi,
+            unique_point,
+            limit: None,
+            ..
+        } = input.as_ref()
+    {
+        let (direction, order_col) = ordered_scan_direction(table, order_by)?;
+        let meta = indexes.iter().find(|meta| meta.name == *index)?;
+        if meta.columns != [order_col]
+            || !predicate_is_exactly_the_index_range(predicate, order_col, table)
+        {
+            return None;
+        }
+        return Some(PhysicalOperator::Filter {
+            input: Box::new(PhysicalOperator::IndexScan {
+                table: table.clone(),
+                index: index.clone(),
+                lo: lo.clone(),
+                hi: hi.clone(),
+                unique_point: *unique_point,
+                direction,
+                limit: Some(cap),
+            }),
+            predicate: predicate.clone(),
+        });
+    }
     // A plain `SeqScan` here means nothing (filter/join/aggregate/window) wraps the base scan — the
     // order-by keys refer directly to the base row's columns.
     let PhysicalOperator::SeqScan { table, .. } = op else {
         return None;
     };
-    // The already-computed top-N cap is `Some(offset + limit)` only when a plain `LIMIT` (no
-    // `WITH TIES`/`DISTINCT`/set-returning projection) bounds the rows — exactly the gate we need.
-    let cap = usize::try_from(top_n_cap?).ok()?;
-    // The scan direction is the shared direction of every key: all ascending → forward, all
-    // descending → backward. A mix cannot be served by one ordered scan.
-    let ascending = order_by.first()?.ascending;
-    let mut order_cols: Vec<usize> = Vec::with_capacity(order_by.len());
-    for key in order_by {
-        if key.ascending != ascending {
-            return None;
-        }
-        let TypedExprKind::Column(ordinal) = key.expr.kind else {
-            return None;
-        };
-        // Only safe over a `NOT NULL` column: with no NULLs present, the index's null placement
-        // cannot disagree with the SQL default null ordering the `ORDER BY` implies.
-        if table.columns.get(ordinal)?.nullable {
-            return None;
-        }
-        order_cols.push(ordinal);
-    }
-    if order_cols.is_empty() {
-        return None;
-    }
+    let (direction, order_cols) = ordered_scan_keys(table, order_by)?;
     // A scannable index whose leading key columns are exactly these, in order, provides the order.
     let index = indexes
         .iter()
         .find(|meta| meta.columns.starts_with(&order_cols))?;
-    let direction = if ascending {
-        ScanDirection::Forward
-    } else {
-        ScanDirection::Backward
-    };
     Some(PhysicalOperator::IndexScan {
         table: table.clone(),
         index: index.name.clone(),
@@ -954,6 +964,108 @@ fn try_ordered_index_scan(
         direction,
         limit: Some(cap),
     })
+}
+
+/// The scan direction and column ordinals an `ORDER BY` asks of an ordered index scan: every key a
+/// bare `NOT NULL` column, all in one direction. `None` for a mix of directions, an expression key,
+/// a nullable column (the index's null placement could disagree with the SQL default), or no keys.
+fn ordered_scan_keys(
+    table: &TableSchema,
+    order_by: &[OrderByKey],
+) -> Option<(nusadb_core::engine::ScanDirection, Vec<usize>)> {
+    use nusadb_core::engine::ScanDirection;
+    let ascending = order_by.first()?.ascending;
+    let mut order_cols: Vec<usize> = Vec::with_capacity(order_by.len());
+    for key in order_by {
+        if key.ascending != ascending {
+            return None;
+        }
+        let TypedExprKind::Column(ordinal) = key.expr.kind else {
+            return None;
+        };
+        if table.columns.get(ordinal)?.nullable {
+            return None;
+        }
+        order_cols.push(ordinal);
+    }
+    if order_cols.is_empty() {
+        return None;
+    }
+    let direction = if ascending {
+        ScanDirection::Forward
+    } else {
+        ScanDirection::Backward
+    };
+    Some((direction, order_cols))
+}
+
+/// [`ordered_scan_keys`] for the single-column case a range index serves: the one ordering column.
+fn ordered_scan_direction(
+    table: &TableSchema,
+    order_by: &[OrderByKey],
+) -> Option<(nusadb_core::engine::ScanDirection, usize)> {
+    let (direction, cols) = ordered_scan_keys(table, order_by)?;
+    match cols[..] {
+        [col] => Some((direction, col)),
+        _ => None,
+    }
+}
+
+/// Whether `predicate` is exactly the range an index on `col` was given for it, so a scan capped
+/// at the LIMIT still returns the right rows. The index bounds keep only the first lower and the
+/// first upper bound they meet and leave every other conjunct to the retained `Filter`, so this
+/// accepts precisely the shapes that leave nothing behind: one `BETWEEN`, one equality, or at most
+/// one lower and one upper comparison, all on `col`, all with literals the index key can hold.
+fn predicate_is_exactly_the_index_range(
+    predicate: &TypedExpr,
+    col: usize,
+    table: &TableSchema,
+) -> bool {
+    let Some(col_ty) = table.columns.get(col).map(|c| c.ty) else {
+        return false;
+    };
+    let mut conjuncts = Vec::new();
+    collect_and_conjuncts(predicate, &mut conjuncts);
+    let (mut lower, mut upper) = (0_usize, 0_usize);
+    for conjunct in &conjuncts {
+        if let TypedExprKind::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+            symmetric: false,
+        } = &conjunct.kind
+            && let TypedExprKind::Column(ord) = expr.kind
+            && ord == col
+            && let (TypedExprKind::Literal(low_value), TypedExprKind::Literal(high_value)) =
+                (&low.kind, &high.kind)
+            && is_index_safe_value(low_value)
+            && is_index_safe_value(high_value)
+            && coerce_index_bound(low_value, col_ty).is_some()
+            && coerce_index_bound(high_value, col_ty).is_some()
+        {
+            lower += 1;
+            upper += 1;
+            continue;
+        }
+        let Some((ord, op, value)) = col_op_literal(conjunct) else {
+            return false;
+        };
+        if ord != col || !is_index_safe_value(value) || coerce_index_bound(value, col_ty).is_none()
+        {
+            return false;
+        }
+        match op {
+            ast::BinaryOp::Eq => {
+                lower += 1;
+                upper += 1;
+            },
+            ast::BinaryOp::Gt | ast::BinaryOp::GtEq => lower += 1,
+            ast::BinaryOp::Lt | ast::BinaryOp::LtEq => upper += 1,
+            _ => return false,
+        }
+    }
+    !conjuncts.is_empty() && lower <= 1 && upper <= 1
 }
 
 /// Flatten a predicate's top-level `AND` chain into its conjuncts (a non-`AND` node is one

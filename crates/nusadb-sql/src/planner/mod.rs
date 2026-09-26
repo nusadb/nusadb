@@ -584,6 +584,58 @@ mod tests {
     }
 
     #[test]
+    fn range_and_order_by_on_the_indexed_column_caps_the_scan() {
+        // The WHERE is exactly the index range, so the retained Filter drops nothing the bounds let
+        // through: the ordered scan can stop at the LIMIT and the Sort goes.
+        let root =
+            indexed_select_op("SELECT * FROM t WHERE a BETWEEN 10 AND 50 ORDER BY a DESC LIMIT 5");
+        assert!(!plan_has_sort(&root), "the Sort must be eliminated");
+        let PhysicalOperator::Limit { input, count, .. } = root else {
+            panic!("expected a Limit at the root");
+        };
+        assert_eq!(count, 5);
+        let PhysicalOperator::Project { input, .. } = *input else {
+            panic!("expected Project below Limit");
+        };
+        let PhysicalOperator::Filter { input, .. } = *input else {
+            panic!("expected the WHERE filter kept above the scan");
+        };
+        let PhysicalOperator::IndexScan {
+            index,
+            direction,
+            limit,
+            lo,
+            hi,
+            ..
+        } = *input
+        else {
+            panic!("expected a capped IndexScan base");
+        };
+        assert_eq!(index, "t_a_idx");
+        assert_eq!(direction, nusadb_core::engine::ScanDirection::Backward);
+        assert_eq!(limit, Some(5));
+        assert_eq!(lo, Bound::Included(vec![crate::ast::Value::Int(10)]));
+        assert_eq!(hi, Bound::Included(vec![crate::ast::Value::Int(50)]));
+    }
+
+    #[test]
+    fn a_range_the_index_does_not_answer_exactly_keeps_the_sort() {
+        // Two lower bounds: the index keeps only the first, the Filter removes more rows than the
+        // bounds do, so a capped scan would come up short. Same for a conjunct on another column.
+        for sql in [
+            "SELECT * FROM t WHERE a > 10 AND a > 20 ORDER BY a LIMIT 5",
+            "SELECT * FROM t WHERE a > 10 AND b = 'x' ORDER BY a LIMIT 5",
+            "SELECT * FROM t WHERE a = 7 AND a < 20 ORDER BY a LIMIT 5",
+            "SELECT * FROM t WHERE a BETWEEN 1 AND 9 AND a > 3 ORDER BY a LIMIT 5",
+            "SELECT * FROM t WHERE a NOT BETWEEN 1 AND 9 ORDER BY a LIMIT 5",
+            "SELECT * FROM t WHERE a > 10 OR a < 3 ORDER BY a LIMIT 5",
+        ] {
+            let root = indexed_select_op(sql);
+            assert!(plan_has_sort(&root), "{sql}: the Sort must be kept");
+        }
+    }
+
+    #[test]
     fn skip_locked_order_by_limit_keeps_sort() {
         // `FOR UPDATE ... SKIP LOCKED` fills its LIMIT from *lockable* rows — the executor skips a
         // row another txn holds locked mid-scan and keeps going. A capped ordered index scan caps
