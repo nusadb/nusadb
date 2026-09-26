@@ -15,8 +15,11 @@ use nusadb_core::{Lsn, Result};
 use crate::crypto::WalCipher;
 use crate::record::WalRecord;
 
-/// Refuse to allocate for a record claiming to be larger than this (corrupt length guard).
-const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+/// The largest record body the reader accepts.
+///
+/// A frame claiming more is treated as a corrupt length rather than allocated for, so the writer
+/// refuses to produce one: a record past this size could be written but never read back.
+pub const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 /// The result of [`WalReader::read_record_checked`].
 ///

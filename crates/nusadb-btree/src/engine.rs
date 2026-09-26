@@ -49,13 +49,21 @@ use nusadb_core::{
 use nusadb_wal::{WalRecord, WalWriter};
 
 use crate::mvcc::{self, ReadView, RowMeta, UndoVersion};
-use crate::node;
 use crate::store::MemPageStore;
 use crate::tree::ClusteredTree;
 use crate::wal::{self, LoggedOp};
 
-/// The largest user tuple the engine accepts: one leaf entry minus the MVCC header.
-const MAX_USER_TUPLE: usize = node::MAX_TUPLE - mvcc::META;
+/// Tuple bytes one batch-insert log record carries at most; a batch of larger total is logged as
+/// several records. Half the reader's record cap leaves room for framing and a row that does
+/// not compress.
+const BATCH_LOG_BYTES: usize = nusadb_wal::MAX_RECORD_BYTES / 2;
+
+/// The largest user tuple the engine accepts.
+///
+/// A tuple past one leaf entry lives in an overflow chain; this bound keeps a single row well
+/// inside one log record and one checkpoint image record, and a larger one is refused loudly
+/// rather than silently truncated.
+pub const MAX_USER_TUPLE: usize = 32 * 1024 * 1024;
 
 /// Bytes charged per written row *on top of* its logical tuple length, so the per-transaction write
 /// ceiling reflects the row's real retained footprint rather than only its logical bytes. Each write
@@ -122,7 +130,9 @@ impl std::fmt::Debug for Wal {
 ///    DDL holds `write` (drains every in-flight operation)
 /// 3. `TableState::write` (per table) — tree writes; never two tables at once
 /// 4. `IndexState::data` (per index, `RwLock`) — never two indexes at once
-/// 5. `dropped` — the purge queue of dropped trees
+/// 5. `dropped` — the purge queue of dropped trees; `retired`, the queue of overflow chains
+///    awaiting reclamation, ranks here too (taken under a table latch, and by purge before the
+///    reclamation gate, never after it)
 /// 6. `txns` — transaction + lock manager (O(1) critical sections)
 /// 7. `seqs` — sequences
 /// 8. `reclaim` (`RwLock`) — the undo arena, doubling as the **reclamation gate**: every
@@ -154,6 +164,9 @@ pub struct BtreeEngine {
     /// Rank 5: trees of committed-dropped tables awaiting page reclamation by purge. An
     /// entry is removed on rollback (the drop was undone) or once purge frees the pages.
     dropped: Mutex<Vec<DroppedPages>>,
+    /// Overflow chains rows stopped referencing, queued for purge: freed once the transaction
+    /// that retired them is settled, so no reader can still hold a stub that pointed at them.
+    retired: Mutex<Vec<RetiredPages>>,
     /// Rank 6: the transaction + lock manager.
     txns: Mutex<TxnDomain>,
     /// Rank 7: sequences. **Non-transactional** counters: every advance is fsynced to
@@ -560,6 +573,15 @@ struct PurgeSnapshot {
     /// The next transaction id at the snapshot: any stamp at or past it began afterwards.
     horizon: u64,
 }
+
+/// Overflow chain pages a row no longer references, queued for purge: reclaimed once `txn` (the
+/// transaction whose update, delete or rollback retired them) is settled.
+#[derive(Debug)]
+struct RetiredPages {
+    txn: u64,
+    pages: Vec<nusadb_core::PageId>,
+}
+
 /// A sequence: its definition and the last value handed out (`None` before the first
 /// `nextval`).
 #[derive(Debug, Clone)]
@@ -1384,9 +1406,12 @@ impl BtreeEngine {
                 if let Some(t) = cat.tables.get_mut(table) {
                     let value = mvcc::encode_row(RowMeta::fresh(*txn), tuple);
                     let mut tree = ClusteredTree::open(store, t.root_id());
-                    // Upsert: a savepoint-compensation Update may follow a logged Delete.
-                    if tree.get(*row_id)?.is_some() {
-                        tree.update(*row_id, &value)?;
+                    // Upsert: a savepoint-compensation Update may follow a logged Delete. Recovery
+                    // has no readers, so a chain the update retires is freed at once.
+                    if tree.get_stored(*row_id)?.is_some() {
+                        for page in tree.update(*row_id, &value)?.0 {
+                            store.deallocate_page(page)?;
+                        }
                     } else {
                         tree.insert(*row_id, &value)?;
                         let w = t.write.get_mut().map_err(|_| poisoned())?;
@@ -1403,7 +1428,11 @@ impl BtreeEngine {
                 if let Some(t) = cat.tables.get_mut(table) {
                     let tree = ClusteredTree::open(store, t.root_id());
                     // Tolerant: a compensation Delete may target an already-absent row.
-                    let _ = tree.delete(*row_id)?;
+                    if let Some(retired) = tree.delete(*row_id)? {
+                        for page in retired.0 {
+                            store.deallocate_page(page)?;
+                        }
+                    }
                     t.set_root(tree.root());
                 }
             },
@@ -2149,8 +2178,8 @@ fn tuple_too_large(len: usize) -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
-            "nusadb-btree: tuple of {len} bytes exceeds the single-leaf capacity of \
-             {MAX_USER_TUPLE} bytes (overflow pages are a later phase)"
+            "nusadb-btree: tuple of {len} bytes exceeds the maximum row size of {MAX_USER_TUPLE} \
+             bytes"
         ),
     ))
 }
@@ -2560,6 +2589,28 @@ impl BtreeEngine {
         Ok(records)
     }
 
+    /// Queue the overflow chain pages `retired` released, if any, for purge to free once `txn`
+    /// is settled: a reader that began before then may still hold the stub that named them.
+    fn retire_pages(&self, txn: u64, retired: crate::tree::Retired) -> Result<()> {
+        if retired.0.is_empty() {
+            return Ok(());
+        }
+        self.retired
+            .lock()
+            .map_err(|_| poisoned())?
+            .push(RetiredPages {
+                txn,
+                pages: retired.0,
+            });
+        Ok(())
+    }
+
+    /// Page slots currently on the store's free list: every page a drop, a rollback, purge or a
+    /// retired overflow chain handed back and nothing has reused yet. Observability for tests.
+    pub fn free_pages(&self) -> Result<usize> {
+        self.store.free_pages()
+    }
+
     /// The current byte length of the durable log on disk: how much write history a restart
     /// would replay, and the quantity a runtime checkpoint policy compares against its threshold.
     /// Frames still sitting in the writer's append buffer are not counted; that is at most one
@@ -2762,6 +2813,25 @@ impl Drop for AdmissionPause<'_> {
             }
         }
         self.0.txn_ended.notify_all();
+    }
+}
+
+/// The tuple bytes of a row's head version, from the bytes its leaf holds: borrowed for an inline
+/// row, reassembled from its overflow chain into `scratch` for a chained one. Called only once
+/// the header has decided the head is the visible version, so an invisible chained row is never
+/// reassembled.
+fn head_tuple<'a>(
+    tree: &ClusteredTree<'_>,
+    row_id: u64,
+    stored: &'a [u8],
+    overflow: bool,
+    scratch: &'a mut Vec<u8>,
+) -> Result<&'a [u8]> {
+    if overflow {
+        tree.materialize_stored_into(stored, true, scratch)?;
+        scratch.get(mvcc::META..).ok_or_else(|| corrupt_row(row_id))
+    } else {
+        stored.get(mvcc::META..).ok_or_else(|| corrupt_row(row_id))
     }
 }
 
@@ -3688,7 +3758,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 return Err(tuple_too_large(tuple.len()));
             }
         }
-        self.check_resident_memory()?;
+        self.check_resident_memory(tuples.iter().map(|t| t.len() as u64).sum())?;
         let total: u64 = tuples
             .iter()
             .map(|t| t.len() as u64 + PER_ROW_WRITE_OVERHEAD)
@@ -3731,14 +3801,34 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             tids.push(tid_of(row_id));
         }
         // Built from the borrowed tuples — no deep clone of the statement's rows while the
-        // writer latch is held. Skipped for a non-durable (temp) table.
+        // writer latch is held. Skipped for a non-durable (temp) table. The batch is logged in
+        // runs of at most `BATCH_LOG_BYTES` of tuple bytes: rows may be megabytes each, and one
+        // record holding the whole batch could exceed what a reader accepts, which would make the
+        // log unreadable after the fact. Recovery replays consecutive batch records in order.
         if cat.table_is_durable(table.0) {
-            self.log(&wal::insert_batch_record(
-                txn.0,
-                table.0,
-                first_row_id,
-                tuples,
-            ))?;
+            let mut start = 0_usize;
+            while start < tuples.len() {
+                let mut end = start;
+                let mut bytes = 0_usize;
+                while end < tuples.len() {
+                    // Each row costs its bytes plus the 4-byte length the record frames it with,
+                    // so a run of tiny rows is bounded too.
+                    let next = tuples.get(end).map_or(0, Vec::len) + 4;
+                    if end > start && bytes + next > BATCH_LOG_BYTES {
+                        break;
+                    }
+                    bytes += next;
+                    end += 1;
+                }
+                let offset = u64::try_from(start).map_err(|_| poisoned())?;
+                self.log(&wal::insert_batch_record(
+                    txn.0,
+                    table.0,
+                    first_row_id + offset,
+                    tuples.get(start..end).unwrap_or(&[]),
+                ))?;
+                start = end;
+            }
         }
         Ok(tids)
     }
@@ -3753,7 +3843,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // the streamed-bulk-load case the per-transaction ceiling misses — many small committed
         // batches, each under the per-transaction limit but accumulating resident. Only `insert` is
         // gated, so `DELETE`/`TRUNCATE` stay available to free space at the ceiling.
-        self.check_resident_memory()?;
+        self.check_resident_memory(tuple.len() as u64)?;
         // Bound this transaction's uncommitted write memory before mutating anything, so an
         // oversized bulk load aborts loudly rather than OOM-killing the server (no-op when no
         // limit is configured). Charge the real retained footprint (logical bytes + fixed per-row
@@ -3876,8 +3966,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
             tuple,
         );
-        tree.update(row_id, &new_value)?;
+        let retired = tree.update(row_id, &new_value)?;
         t.set_root(tree.root());
+        self.retire_pages(txn.0, retired)?;
         self.push_undo(
             txn.0,
             UndoOp::Updated {
@@ -3928,7 +4019,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let row_id = row_id_of(tid);
         // The tree opens AFTER the latch: only latch holders move the root (see `update`).
         let _w = t.write.lock().map_err(|_| poisoned())?;
-        let mut tree = ClusteredTree::open(&self.store, t.root_id());
+        let tree = ClusteredTree::open(&self.store, t.root_id());
         let old_value = tree.get(row_id)?.ok_or_else(|| tuple_not_found(tid))?;
         let (meta, old_tuple) = mvcc::decode_row(&old_value).ok_or_else(|| corrupt_row(row_id))?;
         // Charge the old row retained in the undo log against the per-transaction ceiling before
@@ -3951,7 +4042,11 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
             old_tuple,
         );
-        tree.update(row_id, &new_value)?;
+        // Only the version header changes: rewrite it in place, chain and all untouched.
+        let header = new_value
+            .get(..mvcc::META)
+            .ok_or_else(|| corrupt_row(row_id))?;
+        tree.update_prefix(row_id, header)?;
         t.set_root(tree.root());
         self.push_undo(
             txn.0,
@@ -4000,13 +4095,19 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         {
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
             let tree = ClusteredTree::open(&self.store, t.root_id());
-            tree.scan_with(|row_id, value| {
-                let (meta, tuple) = mvcc::decode_row(value).ok_or_else(|| corrupt_row(row_id))?;
-                if let Some(visible) = mvcc::visible_tuple(meta, tuple, &undo.arena, &view) {
-                    rows.push((tid_of(row_id), SharedTuple::from(visible)));
-                    if serializable {
-                        read_ids.push(row_id);
-                    }
+            let mut scratch = Vec::new();
+            tree.scan_stored_with(|row_id, stored, overflow| {
+                let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
+                let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
+                    Some(mvcc::Visible::Head) => {
+                        head_tuple(&tree, row_id, stored, overflow, &mut scratch)?
+                    },
+                    Some(mvcc::Visible::Arena(tuple)) => tuple,
+                    None => return Ok(()),
+                };
+                rows.push((tid_of(row_id), SharedTuple::from(visible)));
+                if serializable {
+                    read_ids.push(row_id);
                 }
                 Ok(())
             })?;
@@ -4056,11 +4157,17 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let tree = ClusteredTree::open(&self.store, t.root_id());
         // Visitor walk (single-copy), same as `scan`.
         let mut rows: Vec<(Tid, SharedTuple)> = Vec::new();
-        tree.scan_with(|row_id, value| {
-            let (meta, tuple) = mvcc::decode_row(value).ok_or_else(|| corrupt_row(row_id))?;
-            if let Some(visible) = mvcc::visible_tuple(meta, tuple, &undo.arena, &view) {
-                rows.push((tid_of(row_id), SharedTuple::from(visible)));
-            }
+        let mut scratch = Vec::new();
+        tree.scan_stored_with(|row_id, stored, overflow| {
+            let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
+            let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
+                Some(mvcc::Visible::Head) => {
+                    head_tuple(&tree, row_id, stored, overflow, &mut scratch)?
+                },
+                Some(mvcc::Visible::Arena(tuple)) => tuple,
+                None => return Ok(()),
+            };
+            rows.push((tid_of(row_id), SharedTuple::from(visible)));
             Ok(())
         })?;
         Ok(Box::new(VecScan {
@@ -4446,9 +4553,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             {
                 let tree = ClusteredTree::open(&self.store, t.root_id());
                 for other in others {
-                    if let Some(value) = tree.get(other)? {
+                    if let Some((stored, _)) = tree.get_stored(other)? {
                         let (meta, _) =
-                            mvcc::decode_row(&value).ok_or_else(|| corrupt_row(other))?;
+                            mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(other))?;
                         if meta.xmax == mvcc::NO_XMAX {
                             return Err(Error::ConstraintViolation(format!(
                                 "duplicate key violates unique index {name}"
@@ -4622,14 +4729,19 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     if !IndexData::entry_visible(metas, &view) {
                         continue;
                     }
-                    let Some(value) = tree.get(row_id)? else {
+                    let Some((stored, overflow)) = tree.get_stored(row_id)? else {
                         continue;
                     };
-                    let (meta, tuple) =
-                        mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
-                    if let Some(visible) = mvcc::visible_tuple(meta, tuple, &undo.arena, &view) {
-                        rows.push((tid_of(row_id), SharedTuple::from(visible)));
-                    }
+                    let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+                    let mut scratch = Vec::new();
+                    let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
+                        Some(mvcc::Visible::Head) => {
+                            head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?
+                        },
+                        Some(mvcc::Visible::Arena(tuple)) => tuple,
+                        None => continue,
+                    };
+                    rows.push((tid_of(row_id), SharedTuple::from(visible)));
                 }
             }
         }
@@ -5179,12 +5291,14 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         };
         let tree = ClusteredTree::open(&self.store, t.root_id());
         let mut count: u64 = 0;
-        for (row_id, value) in tree.scan()? {
-            let (meta, _) = mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
+        // Headers only: a chained row's chain is never touched, so this needs no reclamation gate.
+        tree.scan_stored_with(|row_id, stored, _| {
+            let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
             if meta.xmax == mvcc::NO_XMAX && !active.contains(&meta.xmin) {
                 count += 1;
             }
-        }
+            Ok(())
+        })?;
         Ok(count)
     }
 
@@ -5300,12 +5414,19 @@ impl BtreeEngine {
                     if !IndexData::entry_visible(metas, &view) {
                         continue;
                     }
-                    let Some(value) = tree.get(row_id)? else {
+                    let Some((stored, overflow)) = tree.get_stored(row_id)? else {
                         continue;
                     };
-                    let (meta, tuple) =
-                        mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
-                    if let Some(visible) = mvcc::visible_tuple(meta, tuple, &undo.arena, &view) {
+                    let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+                    let mut scratch = Vec::new();
+                    let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
+                        Some(mvcc::Visible::Head) => {
+                            head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?
+                        },
+                        Some(mvcc::Visible::Arena(tuple)) => tuple,
+                        None => continue,
+                    };
+                    {
                         rows.push((tid_of(row_id), SharedTuple::from(visible)));
                         if serializable {
                             read_ids.push(row_id);
@@ -5392,12 +5513,14 @@ impl BtreeEngine {
     /// growth into a graceful reject rather than an OOM. Only `insert` (a row write) consults the
     /// ceiling, so a `CREATE INDEX` — which builds through `index_insert`, not `insert` — is
     /// deliberately not gated by it and keeps its prior behavior.
-    fn check_resident_memory(&self) -> Result<()> {
+    fn check_resident_memory(&self, incoming: u64) -> Result<()> {
         let Some(limit) = self.max_total_resident_bytes else {
             return Ok(());
         };
         let resident = self.resident_bytes()?;
-        if resident >= limit {
+        // The incoming bytes count too: a row that spills into an overflow chain can be
+        // megabytes, and admitting it on the footprint before it lands would overshoot by that.
+        if resident >= limit || resident.saturating_add(incoming) > limit {
             return Err(resident_memory_exceeded(limit, resident));
         }
         Ok(())
@@ -5625,10 +5748,10 @@ impl BtreeEngine {
                 continue; // the table was dropped; nothing left to conflict on
             };
             let tree = ClusteredTree::open(&self.store, t.root_id());
-            let Some(value) = tree.get(row_id)? else {
+            let Some((stored, _)) = tree.get_stored(row_id)? else {
                 continue;
             };
-            let (mut meta, _) = mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
+            let (mut meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
             loop {
                 // A concurrent-committed creation or deletion of a version above what we read is a
                 // read-write antidependency.
@@ -5662,8 +5785,8 @@ impl BtreeEngine {
             };
             let tree = ClusteredTree::open(&self.store, t.root_id());
             let mut phantom = false;
-            tree.scan_with(|row_id, value| {
-                let (meta, _) = mvcc::decode_row(value).ok_or_else(|| corrupt_row(row_id))?;
+            tree.scan_stored_with(|row_id, stored, _| {
+                let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
                 if conflicting(meta.xmin) {
                     phantom = true;
                 }
@@ -5707,11 +5830,11 @@ impl BtreeEngine {
             if !IndexData::entry_visible(metas, view) {
                 continue;
             }
-            let Some(value) = tree.get(row_id)? else {
+            let Some((stored, _)) = tree.get_stored(row_id)? else {
                 continue;
             };
-            let (meta, tuple) = mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
-            if mvcc::visible_tuple(meta, tuple, &undo.arena, view).is_some() {
+            let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+            if mvcc::visible_version(meta, &undo.arena, view).is_some() {
                 out.push(row_id);
             }
         }
@@ -5736,7 +5859,9 @@ impl BtreeEngine {
                     if let Some(t) = cat.get().tables.get(&table) {
                         let _w = t.write.lock().map_err(|_| poisoned())?;
                         let tree = ClusteredTree::open(store, t.root_id());
-                        tree.delete(row_id)?;
+                        if let Some(retired) = tree.delete(row_id)? {
+                            self.retire_pages(txn, retired)?;
+                        }
                         t.set_root(tree.root());
                     }
                 },
@@ -5749,8 +5874,9 @@ impl BtreeEngine {
                     if let Some(t) = cat.get().tables.get(&table) {
                         let _w = t.write.lock().map_err(|_| poisoned())?;
                         let mut tree = ClusteredTree::open(store, t.root_id());
-                        tree.update(row_id, &old)?;
+                        let retired = tree.update(row_id, &old)?;
                         t.set_root(tree.root());
+                        self.retire_pages(txn, retired)?;
                     }
                     // Restoring `old` disconnected the slot this update parked from every
                     // chain. Queue it for purge to free once the abort settles — freeing here
@@ -5765,8 +5891,20 @@ impl BtreeEngine {
                 UndoOp::Deleted { table, row_id, old } => {
                     if let Some(t) = cat.get().tables.get(&table) {
                         let _w = t.write.lock().map_err(|_| poisoned())?;
-                        let mut tree = ClusteredTree::open(store, t.root_id());
-                        tree.update(row_id, &old)?;
+                        let tree = ClusteredTree::open(store, t.root_id());
+                        // The delete only stamped `xmax`; clear it again. The undo pointer is
+                        // taken from the header as it is NOW, not from `old`: purge may have
+                        // unchained the row's history since, and reviving a freed slot index
+                        // would later free another row's version.
+                        let (old_meta, _) =
+                            mvcc::decode_row(&old).ok_or_else(|| corrupt_row(row_id))?;
+                        let Some((stored, _)) = tree.get_stored(row_id)? else {
+                            return Err(corrupt_row(row_id));
+                        };
+                        let (mut meta, _) =
+                            mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+                        meta.xmax = old_meta.xmax;
+                        tree.update_prefix(row_id, &mvcc::encode_row(meta, &[]))?;
                         t.set_root(tree.root());
                     }
                 },
@@ -6033,33 +6171,42 @@ impl BtreeEngine {
                     // leaves stay chained here) and the `undo=NO_UNDO` rewrite is byte-identical in
                     // size (never splits). Read the batch's rows first, then reclaim under the same
                     // hold, so the in-batch reclamation never disturbs its own scan.
-                    let mut tree = ClusteredTree::open(&self.store, t.root_id());
-                    tree.scan_from_with(cursor, |row_id, value| {
-                        batch.push((row_id, value.to_vec()));
+                    let tree = ClusteredTree::open(&self.store, t.root_id());
+                    // Headers only: a chained row's chain is never reassembled here, so the pass
+                    // holds the gate for the leaf walk, not for the size of the rows.
+                    tree.scan_from_stored_with(cursor, |row_id, stored, _| {
+                        batch.push((row_id, stored.to_vec()));
                         last_key = Some(row_id);
                         Ok(batch.len() < PURGE_ROW_BATCH)
                     })?;
-                    for (row_id, value) in &batch {
-                        let (meta, tuple) =
-                            mvcc::decode_row(value).ok_or_else(|| corrupt_row(*row_id))?;
+                    for (row_id, stored) in &batch {
+                        let (meta, _) =
+                            mvcc::decode_row(stored).ok_or_else(|| corrupt_row(*row_id))?;
                         if meta.xmax != mvcc::NO_XMAX && settled(meta.xmax) {
                             // Every view sees the delete: the row and its whole history are dead.
                             stats.versions_reclaimed += Self::free_chain(&mut undo, meta.undo);
-                            tree.delete(*row_id)?;
+                            // Under the reclamation gate no scan is mid-walk, and every view
+                            // sees the delete, so the row's overflow chain is freed at once.
+                            if let Some(retired) = tree.delete(*row_id)? {
+                                for page in retired.0 {
+                                    self.store.deallocate_page(page)?;
+                                    stats.pages_reclaimed += 1;
+                                }
+                            }
                             removed_rows.insert(*row_id);
                             stats.rows_removed += 1;
                         } else if meta.undo != mvcc::NO_UNDO && settled(meta.xmin) {
                             // Every view sees the newest version: nobody walks the chain below it.
                             stats.versions_reclaimed += Self::free_chain(&mut undo, meta.undo);
-                            let unchained = mvcc::encode_row(
+                            let header = mvcc::encode_row(
                                 RowMeta {
                                     xmin: meta.xmin,
                                     xmax: meta.xmax,
                                     undo: mvcc::NO_UNDO,
                                 },
-                                tuple,
+                                &[],
                             );
-                            tree.update(*row_id, &unchained)?;
+                            tree.update_prefix(*row_id, &header)?;
                         }
                     }
                 } // release the writer latch + reclamation gate — writers interleave here
@@ -6141,6 +6288,23 @@ impl BtreeEngine {
             }
             *dropped = keep;
         }
+        // Retired overflow chains: same gate, same settlement rule as a dropped tree.
+        {
+            let mut retired = self.retired.lock().map_err(|_| poisoned())?;
+            let _gate = self.reclaim.write().map_err(|_| poisoned())?;
+            let mut keep: Vec<RetiredPages> = Vec::with_capacity(retired.len());
+            for entry in retired.drain(..) {
+                if settled(entry.txn) {
+                    for page in entry.pages {
+                        self.store.deallocate_page(page)?;
+                        stats.pages_reclaimed += 1;
+                    }
+                } else {
+                    keep.push(entry);
+                }
+            }
+            *retired = keep;
+        }
         Ok(stats)
     }
 
@@ -6167,8 +6331,13 @@ impl BtreeEngine {
         let mut out = Vec::new();
         for (&table_id, t) in &cat.tables {
             let tree = ClusteredTree::open(&self.store, t.root_id());
-            for (row_id, value) in tree.scan()? {
-                let (mut meta, _) = mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
+            let mut heads = Vec::new();
+            tree.scan_stored_with(|row_id, stored, _| {
+                let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
+                heads.push((row_id, meta));
+                Ok(())
+            })?;
+            for (row_id, mut meta) in heads {
                 loop {
                     let xmax = (meta.xmax != mvcc::NO_XMAX).then_some(TxnId(meta.xmax));
                     out.push((TableId(table_id), tid_of(row_id), TxnId(meta.xmin), xmax));

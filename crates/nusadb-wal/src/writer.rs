@@ -148,6 +148,15 @@ impl<W: Write> WalWriter<W> {
             None => None,
         };
         let body = sealed.as_deref().unwrap_or(&self.body);
+        // A body the reader would refuse as an implausible length must never reach the log: it
+        // would be written fine and then stall or fail every later recovery at that frame.
+        if body.len() > crate::reader::MAX_RECORD_BYTES {
+            return Err(nusadb_core::Error::Io(std::io::Error::other(format!(
+                "WAL record body of {} bytes exceeds the {} byte maximum a reader accepts",
+                body.len(),
+                crate::reader::MAX_RECORD_BYTES
+            ))));
+        }
         // The frame's length prefix is a `u32`; a body that does not fit would silently truncate it
         // and corrupt the log, so reject it rather than write a malformed frame.
         let body_len = u32::try_from(body.len()).map_err(|_| {

@@ -55,6 +55,15 @@ impl MemPageStore {
         Ok((pages.len() as u64).saturating_mul(PAGE_SIZE as u64))
     }
 
+    /// How many page slots sit on the free list, recycled for the next allocation. Observability
+    /// for tests that check pages come back.
+    ///
+    /// # Errors
+    /// Fails only on a poisoned free-list lock.
+    pub fn free_pages(&self) -> Result<usize> {
+        Ok(self.free.lock().map_err(|_| poisoned())?.len())
+    }
+
     /// The slot for `id`, cloned out so the directory lock is released before the page copy.
     fn slot(&self, id: PageId) -> Result<Slot> {
         let index = usize::try_from(id.0).map_err(|_| bad_page(id))?;

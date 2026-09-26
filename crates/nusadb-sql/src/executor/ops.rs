@@ -2410,15 +2410,15 @@ pub(super) fn warm_vector_index(
 
 /// System catalog persisting each `USING hnsw` graph as a serialized blob, so a restart loads the
 /// graph instead of rebuilding it. The blob is split across rows shaped `(name TEXT, chunk_no INT,
-/// data BYTEA)` — keyed by index name, ordered by `chunk_no` — because the btree stores each tuple in
-/// a single leaf (no overflow pages yet), so one row could not hold a realistic graph (a few hundred
-/// vectors at 128+ dimensions is well over the ~8 KB leaf capacity).
+/// data BYTEA)` — keyed by index name, ordered by `chunk_no`. The format predates overflow chains,
+/// when a row had to fit one leaf; chunked rows stay small and cheap to rewrite, so the layout is
+/// kept.
 // The chunked-format catalog uses a distinct name from any earlier single-tuple `…_graphs` table,
 // so a fresh 3-column table is always created and an old table (a different shape) is never touched.
 const VECTOR_GRAPH_CATALOG: &str = "nusadb_vector_index_graph_chunks";
 const VECTOR_GRAPH_SCHEMA: [ColumnType; 3] = [ColumnType::Text, ColumnType::Int, ColumnType::Bytes];
-/// Max bytes of graph blob per catalog row, chosen well under the btree single-leaf tuple capacity
-/// (~8 KB) to leave room for the row's name, chunk number, and encoding framing.
+/// Max bytes of graph blob per catalog row, chosen so a chunk row stays inline in one leaf (about
+/// 8 KB) with room for the row's name, chunk number, and encoding framing.
 const VECTOR_GRAPH_CHUNK: usize = 6000;
 /// Blob header magic (`"NVGX"` little-endian) and format version. An unrecognized magic or version
 /// makes the load fall back to a rebuild rather than misread an old or foreign blob.

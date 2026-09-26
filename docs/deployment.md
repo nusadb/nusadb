@@ -130,20 +130,20 @@ Three details worth knowing:
 - Once the ceiling has been hit, the remedies are raising it, using a larger host, or reloading the
   live rows into a fresh data directory.
 
-### A single row must fit in one page (about 8 KB)
+### Row size
 
-Rows are stored whole inside one 8 KB B-tree leaf; there are no overflow or out-of-line (TOAST)
-pages yet. A row whose encoded form exceeds the single-leaf capacity (8139 bytes) is refused with an
-error that names both sizes, rather than stored:
+A row is stored inline in its 8 KB B-tree leaf while it fits (about 8 KB encoded); a larger row
+is spread over a chain of overflow pages and the leaf keeps a small stub, so a large `text`,
+`json`, `bytea` or array value is stored whole. Reading such a row reassembles it from its chain,
+which costs one page read per 8 KB of the value, and a version-only rewrite (a delete stamp, a
+purge pass) touches the stub alone. A row's encoded size is capped at 32 MiB; a larger one is
+refused with an error naming both sizes, never truncated:
 
 ```text
-ERROR XX000: tuple of 8205 bytes exceeds the single-leaf capacity of 8139 bytes
-(overflow pages are a later feature)
+ERROR XX000: tuple of 40000000 bytes exceeds the maximum row size of 33554432 bytes
 ```
 
-This bounds the total encoded size of a row, so a very large `text`, `json`, `bytea`, or array value
-cannot be stored inline past that limit. Split such values across rows, or keep large blobs outside
-the database, until overflow pages land.
+Overflow pages count toward the resident-memory ceiling like any other page.
 
 ### One query, one transaction, one load
 

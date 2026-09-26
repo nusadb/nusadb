@@ -13,8 +13,14 @@
 //! atomic per-page reads. Finer-grained (per-page/OLC) writer latching is a later phase.
 //!
 //! Limitations (documented, by phase design): single-version (no MVCC), not durable (no
-//! redo WAL / recovery — a later phase), deletes do not merge underfull leaves (space reclaim), and a
-//! tuple must fit one leaf ([`node::MAX_TUPLE`] — TOAST-style overflow later).
+//! redo WAL / recovery — a later phase), and deletes do not merge underfull leaves (space reclaim).
+//!
+//! A value larger than one leaf entry ([`node::MAX_TUPLE`]) is stored in an overflow chain of
+//! pages and the leaf keeps a stub (see `node`). The chain is written before the stub is
+//! published, and a chain a row no longer references (after an update or a delete) is handed back
+//! to the caller as [`Retired`] pages rather than freed here: readers walk the tree with no latch,
+//! so a chain may only be reused once every reader that could hold its stub is gone, which the
+//! engine's purge decides.
 
 use nusadb_core::traits::Page;
 use nusadb_core::{PageId, PageStore, Result};
@@ -39,17 +45,23 @@ impl std::fmt::Debug for ClusteredTree<'_> {
     }
 }
 
-/// The engine-level error for a tuple too large for one leaf (has no overflow pages).
+/// The largest value a chain can hold. The stub records the length as a `u32`, and a reader
+/// reserves memory for that length, so it is capped well below what the field could spell.
+pub const MAX_CHAINED: usize = 256 * 1024 * 1024;
+
+/// The error for a value too large even for an overflow chain.
 fn tuple_too_large(len: usize) -> nusadb_core::Error {
     nusadb_core::Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        format!(
-            "nusadb-btree: tuple of {len} bytes exceeds the single-leaf capacity of {} bytes \
-             (overflow pages are a later phase)",
-            node::MAX_TUPLE
-        ),
+        format!("nusadb-btree: tuple of {len} bytes exceeds the maximum of {MAX_CHAINED} bytes"),
     ))
 }
+
+/// Overflow chain pages a row stopped referencing. They are safe to free only once no reader can
+/// still hold the stub that pointed at them; the tree hands them to its caller for that decision.
+#[must_use = "retired chain pages must be queued for reclamation or they leak"]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Retired(pub Vec<PageId>);
 
 /// Internal-corruption error: a structural invariant did not hold. Never expected; loud.
 fn corrupt(msg: &str) -> nusadb_core::Error {
@@ -130,60 +142,293 @@ impl<'s> ClusteredTree<'s> {
     /// ([`node::leaf_find`] borrows from the page; profiling found the old form materializing
     /// every entry of the leaf per lookup).
     pub fn get(&self, key: u64) -> Result<Option<Vec<u8>>> {
+        match self.get_stored(key)? {
+            Some((stored, overflow)) => self.materialize_stored(&stored, overflow).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The bytes the leaf holds under `key` and whether they are an overflow stub, without
+    /// reassembling a chained value. The first [`node::OVERFLOW_INLINE_PREFIX`] bytes are the
+    /// value's own in either case, so a caller that needs only the row's header reads nothing
+    /// else; [`materialize_stored`](Self::materialize_stored) completes the value on demand.
+    pub fn get_stored(&self, key: u64) -> Result<Option<(Vec<u8>, bool)>> {
         let leaf = self.descend_read(key)?;
-        Ok(node::leaf_find(&leaf, key).map(<[u8]>::to_vec))
+        Ok(node::leaf_find(&leaf, key).map(|(stored, overflow)| (stored.to_vec(), overflow)))
+    }
+
+    /// The full value behind what [`get_stored`](Self::get_stored) or a stored-bytes scan
+    /// handed out: the bytes themselves for an inline value, the reassembled chain for a stub.
+    pub fn materialize_stored(&self, stored: &[u8], overflow: bool) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.materialize_stored_into(stored, overflow, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`materialize_stored`](Self::materialize_stored) into a caller-owned buffer, which is
+    /// cleared first and keeps its allocation across rows.
+    pub fn materialize_stored_into(
+        &self,
+        stored: &[u8],
+        overflow: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        out.clear();
+        if overflow {
+            self.materialize_into(stored, out)
+        } else {
+            out.extend_from_slice(stored);
+            Ok(())
+        }
     }
 
     /// Insert `tuple` under `key`. `key` must not already exist (row-ids are engine-minted and
-    /// monotonic, so a duplicate is an internal error, reported loudly).
+    /// monotonic, so a duplicate is an internal error, reported loudly). A chained value's chain
+    /// is written only after the leaf is found and the key checked, so a refused insert leaves
+    /// no pages behind.
     pub fn insert(&mut self, key: u64, tuple: &[u8]) -> Result<()> {
-        if tuple.len() > node::MAX_TUPLE {
-            return Err(tuple_too_large(tuple.len()));
-        }
         let (path, leaf_id, leaf) = self.descend(key)?;
         let mut entries = node::leaf_entries(&leaf);
-        let Err(at) = entries.binary_search_by_key(&key, |(k, _)| *k) else {
+        let Err(at) = entries.binary_search_by_key(&key, |e| e.key) else {
             return Err(corrupt("duplicate row-id insert"));
         };
-        entries.insert(at, (key, tuple.to_vec()));
+        let entry = self.make_entry(key, tuple)?;
+        let unpublished = entry.clone();
+        entries.insert(at, entry);
+        // Only a failed plain rewrite leaves the stub certainly unpublished; a split may already
+        // have written the stub into a reachable sibling before failing, and then the chain
+        // must stay.
+        let fits = Self::fits_one_leaf(&leaf, &entries);
         self.write_leaf_or_split(&path, leaf_id, &leaf, &entries)
+            .inspect_err(|_| {
+                if fits {
+                    self.discard_unpublished(&unpublished);
+                }
+            })
     }
 
-    /// Replace the tuple under `key` (which must exist) with `tuple`.
-    pub fn update(&mut self, key: u64, tuple: &[u8]) -> Result<()> {
-        if tuple.len() > node::MAX_TUPLE {
-            return Err(tuple_too_large(tuple.len()));
-        }
+    /// Whether `entries` rewrite `leaf` in place, without a split.
+    fn fits_one_leaf(leaf: &Page, entries: &[node::Entry]) -> bool {
+        let mut probe = *leaf;
+        node::write_leaf_entries(&mut probe, entries)
+    }
+
+    /// Replace the tuple under `key` (which must exist) with `tuple`. Returns the overflow chain
+    /// the old value used, if any, for the caller to reclaim once no reader can hold its stub.
+    pub fn update(&mut self, key: u64, tuple: &[u8]) -> Result<Retired> {
         let (path, leaf_id, leaf) = self.descend(key)?;
         let mut entries = node::leaf_entries(&leaf);
-        match entries.binary_search_by_key(&key, |(k, _)| *k) {
-            Ok(pos) => {
-                if let Some(slot) = entries.get_mut(pos) {
-                    slot.1 = tuple.to_vec();
-                }
-            },
-            Err(_) => return Err(corrupt("update of a missing row-id")),
-        }
+        let Ok(pos) = entries.binary_search_by_key(&key, |e| e.key) else {
+            return Err(corrupt("update of a missing row-id"));
+        };
+        let Some(slot) = entries.get_mut(pos) else {
+            return Err(corrupt("update slot out of range"));
+        };
+        let retired = self.retired_chain(slot)?;
+        *slot = self.make_entry(key, tuple)?;
+        let unpublished = slot.clone();
+        let fits = Self::fits_one_leaf(&leaf, &entries);
         self.write_leaf_or_split(&path, leaf_id, &leaf, &entries)
+            .inspect_err(|_| {
+                if fits {
+                    self.discard_unpublished(&unpublished);
+                }
+            })?;
+        Ok(retired)
     }
 
-    /// Remove the entry under `key`; `Ok(true)` if it existed. Leaves are not merged when they
-    /// underfill (reclaims space); an empty leaf simply stays in the chain.
-    pub fn delete(&self, key: u64) -> Result<bool> {
+    /// Hand back the chain of an entry that was never published: the leaf write that would have
+    /// made it visible failed, so nothing can reference its pages.
+    fn discard_unpublished(&self, entry: &node::Entry) {
+        if let Ok(Retired(pages)) = self.retired_chain(entry) {
+            for page in pages {
+                let _ = self.store.deallocate_page(page);
+            }
+        }
+    }
+
+    /// Remove the entry under `key`; `Ok(Some(retired))` if it existed, carrying the overflow
+    /// chain it used (empty for an inline value), `Ok(None)` if absent. Leaves are not merged when
+    /// they underfill (reclaims space); an empty leaf simply stays in the chain.
+    pub fn delete(&self, key: u64) -> Result<Option<Retired>> {
         let (_, leaf_id, leaf) = self.descend(key)?;
         let mut entries = node::leaf_entries(&leaf);
-        match entries.binary_search_by_key(&key, |(k, _)| *k) {
+        match entries.binary_search_by_key(&key, |e| e.key) {
             Ok(pos) => {
-                entries.remove(pos);
+                let removed = entries.remove(pos);
+                let retired = self.retired_chain(&removed)?;
                 let mut page = leaf;
                 if !node::write_leaf_entries(&mut page, &entries) {
                     return Err(corrupt("shrunken leaf failed to serialize"));
                 }
                 self.store.write_page(leaf_id, &page)?;
-                Ok(true)
+                Ok(Some(retired))
             },
-            Err(_) => Ok(false),
+            Err(_) => Ok(None),
         }
+    }
+
+    /// Overwrite the first `prefix.len()` bytes of the value under `key` in place. For a chained
+    /// value that is its inline prefix, so the chain is untouched and nothing is retired; the
+    /// entry keeps its size, so the leaf never splits. The engine uses this for every rewrite
+    /// that changes only a row's version header.
+    pub fn update_prefix(&self, key: u64, prefix: &[u8]) -> Result<()> {
+        let (_, leaf_id, leaf) = self.descend(key)?;
+        let mut entries = node::leaf_entries(&leaf);
+        let Ok(pos) = entries.binary_search_by_key(&key, |e| e.key) else {
+            return Err(corrupt("prefix update of a missing row-id"));
+        };
+        let Some(slot) = entries.get_mut(pos) else {
+            return Err(corrupt("prefix update slot out of range"));
+        };
+        if slot.overflow && prefix.len() > node::OVERFLOW_INLINE_PREFIX {
+            return Err(corrupt("prefix update reaches into an overflow chain"));
+        }
+        let Some(head) = slot.stored.get_mut(..prefix.len()) else {
+            return Err(corrupt("prefix update exceeds the stored value"));
+        };
+        head.copy_from_slice(prefix);
+        let mut page = leaf;
+        if !node::write_leaf_entries(&mut page, &entries) {
+            return Err(corrupt("same-size rewrite failed to serialize"));
+        }
+        self.store.write_page(leaf_id, &page)
+    }
+
+    /// The leaf entry for `tuple`: the value inline when it fits, otherwise a stub over a freshly
+    /// written overflow chain. The chain is complete on disk before the stub can be published.
+    fn make_entry(&self, key: u64, tuple: &[u8]) -> Result<node::Entry> {
+        if tuple.len() <= node::MAX_TUPLE {
+            return Ok(node::Entry {
+                key,
+                stored: tuple.to_vec(),
+                overflow: false,
+            });
+        }
+        if tuple.len() > MAX_CHAINED {
+            return Err(tuple_too_large(tuple.len()));
+        }
+        let Some((prefix, rest)) = tuple.split_at_checked(node::OVERFLOW_INLINE_PREFIX) else {
+            return Err(corrupt("a chained value must carry its inline prefix"));
+        };
+        let first = self.write_chain(rest)?;
+        let total = u32::try_from(tuple.len()).map_err(|_| tuple_too_large(tuple.len()))?;
+        Ok(node::Entry {
+            key,
+            stored: node::encode_stub(prefix, total, first),
+            overflow: true,
+        })
+    }
+
+    /// Write `bytes` over freshly allocated chain pages, last page first so every `next` link
+    /// points at a page already written; returns the first page. Pages allocated before a
+    /// failure are handed straight back: nothing ever referenced them.
+    fn write_chain(&self, bytes: &[u8]) -> Result<PageId> {
+        let chunks: Vec<&[u8]> = bytes.chunks(node::OVERFLOW_PAYLOAD).collect();
+        let mut ids = Vec::with_capacity(chunks.len());
+        let written = (|| -> Result<Option<PageId>> {
+            for _ in &chunks {
+                ids.push(self.store.allocate_page()?);
+            }
+            let mut next: Option<PageId> = None;
+            for (id, chunk) in ids.iter().zip(&chunks).rev() {
+                let mut page = [0u8; nusadb_core::PAGE_SIZE];
+                node::init_overflow(&mut page, chunk, next);
+                self.store.write_page(*id, &page)?;
+                next = Some(*id);
+            }
+            Ok(next)
+        })();
+        match written {
+            Ok(Some(first)) => Ok(first),
+            Ok(None) => Err(corrupt("an overflow chain needs at least one page")),
+            Err(e) => {
+                for id in ids {
+                    let _ = self.store.deallocate_page(id);
+                }
+                Err(e)
+            },
+        }
+    }
+
+    /// How many chain pages a value of `total` bytes occupies.
+    const fn chain_len(total: usize) -> usize {
+        let chained = total.saturating_sub(node::OVERFLOW_INLINE_PREFIX);
+        let pages = chained.div_ceil(node::OVERFLOW_PAYLOAD);
+        if pages == 0 { 1 } else { pages }
+    }
+
+    /// The chain pages an entry references: empty for an inline value.
+    fn retired_chain(&self, entry: &node::Entry) -> Result<Retired> {
+        if !entry.overflow {
+            return Ok(Retired::default());
+        }
+        let Some((_, total, first)) = node::decode_stub(&entry.stored) else {
+            return Err(corrupt("malformed overflow stub"));
+        };
+        Ok(Retired(self.chain_pages(first, total)?))
+    }
+
+    /// Every page of the chain starting at `first`, for a value of `total` bytes. A chain that
+    /// runs past the length its stub promises is corrupt (a cycle, or a stale link), never
+    /// followed further.
+    fn chain_pages(&self, first: PageId, total: usize) -> Result<Vec<PageId>> {
+        let expected = Self::chain_len(total);
+        let mut out = Vec::with_capacity(expected);
+        let mut at = Some(first);
+        while let Some(id) = at {
+            if out.len() >= expected {
+                return Err(corrupt("overflow chain is longer than its stub promises"));
+            }
+            let page = self.store.read_page(id)?;
+            if !node::is_overflow(&page) {
+                return Err(corrupt("overflow chain points at a non-chain page"));
+            }
+            out.push(id);
+            at = node::overflow_next(&page);
+        }
+        Ok(out)
+    }
+
+    /// Reassemble a chained value from its stub: the inline prefix, then the chain's payloads.
+    fn materialize(&self, stub: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.materialize_into(stub, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`materialize`](Self::materialize) into `out`, which must be empty. The walk is bounded
+    /// by the page count the stub's length implies, so a corrupt chain (a cycle, a stale link,
+    /// or empty pages) is reported rather than followed; the length itself is trusted only up to
+    /// the largest value a chain may hold.
+    fn materialize_into(&self, stub: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        let Some((prefix, total, first)) = node::decode_stub(stub) else {
+            return Err(corrupt("malformed overflow stub"));
+        };
+        if total > MAX_CHAINED {
+            return Err(corrupt("overflow stub promises more than a chain can hold"));
+        }
+        let expected = Self::chain_len(total);
+        out.reserve(total.min(MAX_CHAINED));
+        out.extend_from_slice(prefix);
+        let mut at = Some(first);
+        let mut pages = 0_usize;
+        while let Some(id) = at {
+            if pages >= expected {
+                return Err(corrupt("overflow chain is longer than its stub promises"));
+            }
+            let page = self.store.read_page(id)?;
+            if !node::is_overflow(&page) {
+                return Err(corrupt("overflow chain points at a non-chain page"));
+            }
+            out.extend_from_slice(node::overflow_payload(&page));
+            pages += 1;
+            at = node::overflow_next(&page);
+        }
+        if out.len() != total {
+            return Err(corrupt("overflow chain length does not match its stub"));
+        }
+        Ok(())
     }
 
     /// Every `(key, tuple)` in key order — the full-table scan (leftmost descent, then the leaf
@@ -208,6 +453,27 @@ impl<'s> ClusteredTree<'s> {
     where
         F: FnMut(u64, &[u8]) -> Result<()>,
     {
+        self.scan_stored_with(|key, stored, overflow| {
+            if overflow {
+                // A chained value is reassembled into a scratch buffer per row; the
+                // single-copy path stays single-copy for every inline row.
+                self.materialize(stored).and_then(|value| f(key, &value))
+            } else {
+                f(key, stored)
+            }
+        })
+    }
+
+    /// [`scan_with`](Self::scan_with) without reassembling chained values: `f` gets each
+    /// entry's stored bytes and whether they are a stub. A consumer that decides from the row's
+    /// header first (which both forms carry inline) reads a chain only for the rows it keeps.
+    ///
+    /// # Errors
+    /// Propagates page-store read errors and any error `f` returns.
+    pub fn scan_stored_with<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8], bool) -> Result<()>,
+    {
         // Leftmost leaf: descend routing every interior by "less than any separator".
         let mut at = self.root;
         let mut page = self.store.read_page(at)?;
@@ -219,9 +485,9 @@ impl<'s> ClusteredTree<'s> {
         }
         loop {
             let mut result = Ok(());
-            node::for_each_leaf_entry(&page, |key, tuple| {
+            node::for_each_leaf_entry(&page, |key, stored, overflow| {
                 if result.is_ok() {
-                    result = f(key, tuple);
+                    result = f(key, stored, overflow);
                 }
             });
             result?;
@@ -246,13 +512,31 @@ impl<'s> ClusteredTree<'s> {
     where
         F: FnMut(u64, &[u8]) -> Result<bool>,
     {
+        self.scan_from_stored_with(start, |key, stored, overflow| {
+            if overflow {
+                self.materialize(stored).and_then(|value| f(key, &value))
+            } else {
+                f(key, stored)
+            }
+        })
+    }
+
+    /// [`scan_from_with`](Self::scan_from_with) without reassembling chained values, as
+    /// [`scan_stored_with`](Self::scan_stored_with) is to [`scan_with`](Self::scan_with).
+    ///
+    /// # Errors
+    /// Propagates page-store read errors and any error the visitor returns.
+    pub fn scan_from_stored_with<F>(&self, start: u64, mut f: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8], bool) -> Result<bool>,
+    {
         let (_, _, leaf) = self.descend(start)?;
         let mut page = leaf;
         let mut first = true;
         loop {
             let mut stop = false;
             let mut err = None;
-            node::for_each_leaf_entry(&page, |key, tuple| {
+            node::for_each_leaf_entry(&page, |key, stored, overflow| {
                 if stop || err.is_some() {
                     return;
                 }
@@ -261,7 +545,7 @@ impl<'s> ClusteredTree<'s> {
                 if first && key < start {
                     return;
                 }
-                match f(key, tuple) {
+                match f(key, stored, overflow) {
                     Ok(true) => {},
                     Ok(false) => stop = true,
                     Err(e) => err = Some(e),
@@ -282,7 +566,8 @@ impl<'s> ClusteredTree<'s> {
         Ok(())
     }
 
-    /// Every page id reachable from the root — the whole tree, for page reclamation.
+    /// Every page id reachable from the root — the whole tree, overflow chains included, for
+    /// page reclamation.
     ///
     /// Walks level by level: each level is fully covered by following right links from its
     /// leftmost node, so siblings whose separators were split-published (or not yet) are all
@@ -296,6 +581,20 @@ impl<'s> ClusteredTree<'s> {
             loop {
                 let page = self.store.read_page(at)?;
                 out.push(at);
+                if node::is_leaf(&page) {
+                    let mut stubs = Vec::new();
+                    node::for_each_leaf_entry(&page, |_, stored, overflow| {
+                        if overflow {
+                            stubs.push(stored.to_vec());
+                        }
+                    });
+                    for stub in stubs {
+                        let Some((_, total, first)) = node::decode_stub(&stub) else {
+                            return Err(corrupt("malformed overflow stub"));
+                        };
+                        out.extend(self.chain_pages(first, total)?);
+                    }
+                }
                 if next_level.is_none() && !node::is_leaf(&page) {
                     next_level = Some(
                         node::interior_entries(&page)
@@ -321,14 +620,14 @@ impl<'s> ClusteredTree<'s> {
     /// rows and one near-`MAX_TUPLE` row), spuriously failing a legal insert. Worse, no *single*
     /// split point may exist (`[small, huge, small]` fits no two pages), so the overflow is
     /// packed first-fit into as many chunks as needed: chunk 0 stays in the split node, each
-    /// later chunk becomes a new right sibling. Every entry fits a page alone (`MAX_TUPLE` is
-    /// enforced at the insert/update boundary), so the packing always succeeds.
+    /// later chunk becomes a new right sibling. Every entry fits a page alone (a value past
+    /// `MAX_TUPLE` is stored as a stub), so the packing always succeeds.
     fn write_leaf_or_split(
         &mut self,
         path: &[(PageId, Page)],
         leaf_id: PageId,
         leaf: &Page,
-        entries: &[(u64, Vec<u8>)],
+        entries: &[node::Entry],
     ) -> Result<()> {
         let mut page = *leaf;
         if node::write_leaf_entries(&mut page, entries) {
@@ -336,11 +635,11 @@ impl<'s> ClusteredTree<'s> {
             return Ok(());
         }
         // First-fit chunking by byte size, order-preserving; each chunk fits one page.
-        let mut chunks: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
-        let mut current: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut chunks: Vec<Vec<node::Entry>> = Vec::new();
+        let mut current: Vec<node::Entry> = Vec::new();
         let mut used = 0_usize;
         for entry in entries {
-            let size = node::leaf_entry_size(&entry.1);
+            let size = node::leaf_entry_size(&entry.stored);
             if !current.is_empty() && used + size > node::LEAF_CAPACITY {
                 chunks.push(std::mem::take(&mut current));
                 used = 0;
@@ -375,7 +674,7 @@ impl<'s> ClusteredTree<'s> {
             node::init_leaf(&mut fresh);
             if let (Some(right_id), Some(right_chunk)) = (ids.get(index + 1), chunks.get(index + 1))
             {
-                let separator = right_chunk.first().map_or(node::INF_KEY, |(k, _)| *k);
+                let separator = right_chunk.first().map_or(node::INF_KEY, |e| e.key);
                 node::set_right_link(&mut fresh, Some(*right_id));
                 node::set_high_key(&mut fresh, separator);
                 publishes.push((*id, separator, *right_id));

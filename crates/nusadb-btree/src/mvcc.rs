@@ -25,6 +25,10 @@ pub const NO_UNDO: u64 = u64::MAX;
 /// Bytes the [`RowMeta`] header occupies in front of the tuple in a leaf value.
 pub const META: usize = 24;
 
+// The header is exactly what an overflow stub keeps inline, so a version's visibility is decided
+// without touching its chain.
+const _: () = assert!(META == crate::node::OVERFLOW_INLINE_PREFIX);
+
 /// The fixed per-version header stored in front of the tuple bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowMeta {
@@ -117,13 +121,46 @@ pub fn visible_tuple<'a>(
     arena: &'a [Option<UndoVersion>],
     view: &ReadView,
 ) -> Option<&'a [u8]> {
+    match visible_version(leaf_meta, arena, view)? {
+        Visible::Head => Some(leaf_tuple),
+        Visible::Arena(tuple) => Some(tuple),
+    }
+}
+
+/// Which version of a row a view sees, decided from the leaf header alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visible<'a> {
+    /// The version in the leaf itself; its tuple bytes are read (or reassembled) only now.
+    Head,
+    /// An older version parked in the undo arena, with its tuple bytes.
+    Arena(&'a [u8]),
+}
+
+/// Resolve which version `view` sees without touching the head's tuple bytes.
+///
+/// The walk needs only the leaf header and the arena, so a row whose head lives in an overflow
+/// chain costs nothing to skip when it is invisible, and is reassembled only when it is the
+/// visible version.
+#[must_use]
+pub fn visible_version<'a>(
+    leaf_meta: RowMeta,
+    arena: &'a [Option<UndoVersion>],
+    view: &ReadView,
+) -> Option<Visible<'a>> {
     let mut meta = leaf_meta;
-    let mut tuple = leaf_tuple;
+    let mut at_head = true;
+    let mut tuple: &'a [u8] = &[];
     loop {
         if view.sees(meta.xmin) {
             // This is the newest version whose creator the view sees; its xmax decides.
             let deleted = meta.xmax != NO_XMAX && view.sees(meta.xmax);
-            return if deleted { None } else { Some(tuple) };
+            return if deleted {
+                None
+            } else if at_head {
+                Some(Visible::Head)
+            } else {
+                Some(Visible::Arena(tuple))
+            };
         }
         if meta.undo == NO_UNDO {
             return None; // The row did not exist for this view.
@@ -133,5 +170,6 @@ pub fn visible_tuple<'a>(
         let prev = arena.get(usize::try_from(meta.undo).ok()?)?.as_ref()?;
         meta = prev.meta;
         tuple = prev.tuple.as_slice();
+        at_head = false;
     }
 }

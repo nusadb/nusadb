@@ -22,6 +22,8 @@ pub mod record;
 pub mod writer;
 
 pub use group_commit::GroupCommit;
-pub use reader::{MidLogHole, ReadOutcome, RecoveredPrefix, WalReader, recover_prefix};
+pub use reader::{
+    MAX_RECORD_BYTES, MidLogHole, ReadOutcome, RecoveredPrefix, WalReader, recover_prefix,
+};
 pub use record::WalRecord;
 pub use writer::WalWriter;

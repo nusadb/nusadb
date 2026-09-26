@@ -76,7 +76,7 @@ pub mod store;
 pub mod tree;
 pub mod wal;
 
-pub use engine::{BtreeEngine, CheckpointOutcome, PurgeStats, VersionMetadata};
+pub use engine::{BtreeEngine, CheckpointOutcome, MAX_USER_TUPLE, PurgeStats, VersionMetadata};
 
 #[cfg(test)]
 mod tests {
@@ -2443,17 +2443,65 @@ mod tests {
         assert_eq!(engine.list_tables().unwrap(), vec!["alpha".to_owned()]);
     }
 
-    /// An oversized tuple is refused loudly (single-leaf capacity; overflow pages are a later
-    /// phase) — never truncated or silently dropped.
+    /// A tuple larger than one leaf lives in an overflow chain and round-trips through every
+    /// read path, survives header-only rewrites (delete stamps, purge), and hands its pages back
+    /// once nothing can reference them.
     #[test]
-    fn oversized_tuple_is_refused() {
+    fn large_tuples_live_in_overflow_chains_and_round_trip() {
+        let engine = BtreeEngine::new();
+        let txn = engine.begin(RC).unwrap();
+        let table = engine.create_table(txn, &table_def("t")).unwrap();
+        let big: Vec<u8> = (0..nusadb_core::PAGE_SIZE * 3)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let edge = vec![7u8; nusadb_core::PAGE_SIZE + 1];
+        let tid_big = engine.insert(txn, table, &big).unwrap();
+        let tid_small = engine.insert(txn, table, b"small").unwrap();
+        let tid_edge = engine.insert(txn, table, &edge).unwrap();
+        engine.commit(txn).unwrap();
+
+        let reader = engine.begin(RC).unwrap();
+        let mut seen = Vec::new();
+        let mut scan = engine.scan(reader, table).unwrap();
+        while let Some((_, tuple)) = scan.try_next().unwrap() {
+            seen.push(tuple.to_vec());
+        }
+        assert_eq!(seen, vec![big, b"small".to_vec(), edge]);
+        engine.commit(reader).unwrap();
+
+        // Replace the chained row with an even larger one, then with an inline one.
+        let bigger = vec![9u8; nusadb_core::PAGE_SIZE * 5];
+        let txn = engine.begin(RC).unwrap();
+        engine.update(txn, table, tid_big, &bigger).unwrap();
+        engine.commit(txn).unwrap();
+        let txn = engine.begin(RC).unwrap();
+        engine.update(txn, table, tid_edge, b"now inline").unwrap();
+        engine.delete(txn, table, tid_small).unwrap();
+        engine.commit(txn).unwrap();
+        let reader = engine.begin(RC).unwrap();
+        let mut seen = Vec::new();
+        let mut scan = engine.scan(reader, table).unwrap();
+        while let Some((_, tuple)) = scan.try_next().unwrap() {
+            seen.push(tuple.to_vec());
+        }
+        assert_eq!(seen, vec![bigger, b"now inline".to_vec()]);
+        engine.commit(reader).unwrap();
+
+        // Purge frees the chains the update and the delete retired, and the dead row's.
+        let stats = engine.purge().unwrap();
+        assert!(stats.pages_reclaimed > 0, "{stats:?}");
+    }
+
+    /// A tuple past the engine's own maximum is still refused loudly, never truncated.
+    #[test]
+    fn a_tuple_past_the_maximum_row_size_is_refused() {
         let engine = BtreeEngine::new();
         let txn = engine.begin(RC).unwrap();
         let table = engine.create_table(txn, &table_def("t")).unwrap();
         let err = engine
-            .insert(txn, table, &vec![0u8; nusadb_core::PAGE_SIZE])
-            .expect_err("a page-sized tuple cannot fit a leaf");
-        assert!(err.to_string().contains("exceeds the single-leaf capacity"));
+            .insert(txn, table, &vec![0u8; crate::engine::MAX_USER_TUPLE + 1])
+            .expect_err("a tuple past the maximum is refused");
+        assert!(err.to_string().contains("exceeds the maximum row size"));
         engine.rollback(txn).unwrap();
     }
 
