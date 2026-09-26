@@ -1215,6 +1215,53 @@ mod checkpoint_tests {
         ));
     }
 
+    /// The documented restore: a checkpoint image copied into a registered database's directory
+    /// opens as that point in time through the manager, so the server serves the restored data.
+    #[test]
+    fn a_checkpoint_image_copied_into_a_registered_database_restores_it() {
+        let live = tempfile::tempdir().unwrap();
+        let (engine, table) = open_engine(&live);
+        let _ = write_past_threshold(&engine, table);
+        engine.checkpoint().unwrap();
+        let rows_at_backup = count_rows(&engine, table);
+        // Writes after the backup point stay in the live database only.
+        let txn = engine.begin(RC).unwrap();
+        engine.insert(txn, table, b"after-backup").unwrap();
+        engine.commit(txn).unwrap();
+
+        let restored_root = tempfile::tempdir().unwrap();
+        let manager = DatabaseManager::open(
+            restored_root.path(),
+            "nusadb",
+            None,
+            None,
+            AutoAnalyzeConfig {
+                interval: None,
+                scale: 0.0,
+                base: 0,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(manager.create("shop", false).unwrap());
+        std::fs::copy(
+            live.path().join("btree.wal.ckpt"),
+            base_dir(restored_root.path(), "shop").join("btree.wal.ckpt"),
+        )
+        .unwrap();
+        let restored = manager.open("shop").unwrap().expect("registered database");
+        let restored_table = restored.lookup_table("t").unwrap().unwrap();
+        let txn = restored.begin(RC).unwrap();
+        let mut scan = restored.scan(txn, restored_table.id).unwrap();
+        let mut rows = 0;
+        while scan.try_next().unwrap().is_some() {
+            rows += 1;
+        }
+        drop(scan);
+        restored.commit(txn).unwrap();
+        assert_eq!(rows, rows_at_backup);
+    }
+
     #[test]
     fn in_memory_engine_has_no_log_to_bound() {
         let engine = BtreeEngine::new();

@@ -9,8 +9,9 @@ What it has today:
   savepoints, and rollback
 - a clustered B-link/B+tree storage engine: 8 KB pages held in memory, rows in the leaves keyed by
   an engine-minted row id, and no-wait row locks
-- write-ahead logging with crash recovery (CRC32 per record, lz4-compressed) and checkpoints; on
-  restart the engine loads the last checkpoint image and replays the log after it
+- write-ahead logging with crash recovery (CRC32 per record, lz4-compressed) and checkpoints: a
+  background worker folds the log into a fresh image as it grows, restart loads the last image and
+  replays only the log after it, and a copy of the image is a consistent backup
 - a cost-based SQL engine (parser on top of `sqlparser-rs`, analyzer, planner with histogram/MCV
   statistics and predicate/projection pushdown, and a vectorized executor with spill-to-disk for
   sorts and hash joins)

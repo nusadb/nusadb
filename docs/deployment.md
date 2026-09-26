@@ -369,11 +369,35 @@ It requires a quiesced engine: it refuses, naming how many transactions are stil
 transaction is open, including one on the connection issuing it. Run it from a connection in
 autocommit at a quiet moment; a load with continuously overlapping transactions may need a retry.
 
-**Backup.** The whole database is the `--data-dir` tree. With the server stopped, or from a
-filesystem snapshot for a consistent point-in-time copy, archive that directory; restore by
-extracting it and starting the server against it. Alternatively export each table over a connection
-with `COPY table TO STDOUT` and reload with `COPY table FROM STDIN`. There is no built-in scheduled
-backup, point-in-time recovery, or replication.
+**Backup.** A checkpoint image is a complete copy of one database as of its checkpoint, and the
+engine only ever replaces it by an atomic rename, so a copy of the image is a consistent
+point-in-time backup even while the server keeps writing. Per database:
+
+```bash
+NUSADB_PASSWORD=... nusadb-cli --user nusadb-root -d shop -c "CHECKPOINT"
+cp "$DATA_DIR/base/shop/btree.wal.ckpt" /backups/shop-$(date +%F).ckpt
+```
+
+The backup holds every transaction committed before the `CHECKPOINT`; what commits afterwards is
+in the log tail only. The background checkpoint worker refreshes the image on its own as the log
+grows, so a copy taken without an explicit `CHECKPOINT` is still consistent, just older.
+
+**Restore.** The database must be registered in the cluster (it is, if it was created there; in a
+fresh data directory run `CREATE DATABASE shop` first), and its directory must hold no log
+(`btree.wal`): with the server stopped, remove that database's log if one exists, place the copy,
+and start the server. It opens the image with an empty log tail.
+
+```bash
+rm -f "$DATA_DIR/base/shop/btree.wal" "$DATA_DIR/base/shop/btree.wal.ckpt"
+cp /backups/shop-2026-09-26.ckpt "$DATA_DIR/base/shop/btree.wal.ckpt"
+nusadb-server --data-dir "$DATA_DIR"
+```
+
+A `btree.wal` left in place would be replayed on top of the image, which is not a restore. For a
+whole-cluster copy with the server stopped, archive the `--data-dir` tree and extract it in place.
+Logical export with `COPY table TO STDOUT` and reload with `COPY table FROM STDIN` remains
+available. There is no built-in scheduled backup, point-in-time recovery to an arbitrary instant,
+or replication.
 
 ---
 
