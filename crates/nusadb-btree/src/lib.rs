@@ -76,7 +76,7 @@ pub mod store;
 pub mod tree;
 pub mod wal;
 
-pub use engine::{BtreeEngine, PurgeStats, VersionMetadata};
+pub use engine::{BtreeEngine, CheckpointOutcome, PurgeStats, VersionMetadata};
 
 #[cfg(test)]
 mod tests {

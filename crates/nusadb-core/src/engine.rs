@@ -847,6 +847,14 @@ pub trait StorageEngine: Send + Sync {
     /// Begin a new transaction at `level`, returning its id.
     fn begin(&self, level: IsolationLevel) -> Result<TxnId>;
 
+    /// Whether [`begin`](StorageEngine::begin) would currently wait rather than return at once,
+    /// because the engine is holding new transactions back for a moment (a checkpoint draining the
+    /// active set). A caller that must never block, such as a network reactor thread, checks this
+    /// and hands the work to a thread that may wait. The default never pauses.
+    fn admission_paused(&self) -> bool {
+        false
+    }
+
     /// Begin a new **statement** within `txn`: refresh the `READ COMMITTED` / `READ UNCOMMITTED`
     /// statement snapshot so that every table read in this statement observes ONE consistent view
     /// (standard RC — "one snapshot per statement"). Without it, a statement touching two tables (a

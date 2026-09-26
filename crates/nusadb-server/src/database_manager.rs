@@ -279,19 +279,70 @@ pub(crate) struct CheckpointConfig {
     pub(crate) threshold_bytes: u64,
     /// Wait between attempts.
     pub(crate) interval: Duration,
+    /// After [`BUSY_TICKS_BEFORE_PAUSE`] consecutive busy refusals, hold new transactions for at
+    /// most this long so the running ones drain and the checkpoint can run; `None` never pauses.
+    pub(crate) max_pause: Option<Duration>,
 }
 
 impl CheckpointConfig {
-    /// Build the policy from the two server flags; `0` on either disables it (no thread is
-    /// spawned), matching the other background workers' `0 = off` convention.
-    pub(crate) const fn from_flags(threshold_bytes: u64, interval_secs: u64) -> Option<Self> {
+    /// Build the policy from the server flags; `0` for the threshold or the interval disables it
+    /// (no thread is spawned) and `0` for the pause keeps the worker opportunistic only, matching
+    /// the other background workers' `0 = off` convention.
+    pub(crate) const fn from_flags(
+        threshold_bytes: u64,
+        interval_secs: u64,
+        max_pause_secs: u64,
+    ) -> Option<Self> {
         match (threshold_bytes, interval_secs) {
             (0, _) | (_, 0) => None,
             (threshold_bytes, secs) => Some(Self {
                 threshold_bytes,
                 interval: Duration::from_secs(secs),
+                // Capped: a pause is a stall every client feels, and one longer than a minute
+                // would never be what an operator meant.
+                max_pause: match max_pause_secs {
+                    0 => None,
+                    p => Some(Duration::from_secs(if p > MAX_PAUSE_SECS {
+                        MAX_PAUSE_SECS
+                    } else {
+                        p
+                    })),
+                },
             }),
         }
+    }
+}
+
+/// The longest admission pause the flag accepts, in seconds.
+const MAX_PAUSE_SECS: u64 = 60;
+
+/// Consecutive busy ticks after which the worker stops hoping for a quiet instant and pauses
+/// admission for one. Three ticks at the default interval is fifteen seconds of a log past its
+/// threshold on an engine that never goes quiet, which is the workload the pause exists for.
+const BUSY_TICKS_BEFORE_PAUSE: u32 = 3;
+
+/// A pause defeated by a transaction that outlives it doubles the busy ticks required before the
+/// next one, up to this many doublings (192 ticks, sixteen minutes at the default interval), so a
+/// client idle inside `BEGIN` costs the other clients a stall a few times an hour, not every tick.
+const MAX_PAUSE_BACKOFF_DOUBLINGS: u32 = 6;
+
+/// Whether the next attempt should pause admission: only once `consecutive_busy` refusals have
+/// shown the engine will not go quiet on its own, backed off by the `defeated` pauses before it,
+/// and only when a pause budget is configured.
+const fn should_pause(
+    consecutive_busy: u32,
+    defeated: u32,
+    max_pause: Option<Duration>,
+) -> Option<Duration> {
+    let doublings = if defeated > MAX_PAUSE_BACKOFF_DOUBLINGS {
+        MAX_PAUSE_BACKOFF_DOUBLINGS
+    } else {
+        defeated
+    };
+    let required = BUSY_TICKS_BEFORE_PAUSE << doublings;
+    match max_pause {
+        Some(budget) if consecutive_busy >= required => Some(budget),
+        _ => None,
     }
 }
 
@@ -306,19 +357,25 @@ enum CheckpointTick {
         /// Current log length.
         len: u64,
     },
-    /// A checkpoint ran: the log went from `before` to `after` bytes.
+    /// A checkpoint ran: the log went from `before` to `after` bytes, after holding new
+    /// transactions for `paused` (zero when no pause was needed).
     Done {
         /// Log length before the checkpoint.
         before: u64,
         /// Log length after the truncation.
         after: u64,
+        /// How long admission was held before the checkpoint began.
+        paused: Duration,
     },
-    /// The engine refused because transactions were active; expected under load, retried later.
+    /// The engine did not go quiet: either a plain refusal (transactions active, no pause
+    /// attempted) or a pause whose budget ran out with transactions still running. Retried later.
     Busy {
         /// Log length at the refusal.
         len: u64,
-        /// The engine's refusal, naming the active-transaction count.
-        error: nusadb_core::Error,
+        /// Transactions still active, when known.
+        active: Option<usize>,
+        /// The pause budget that was spent, when a pause was attempted.
+        paused: Option<Duration>,
     },
     /// The checkpoint attempt failed for another reason (disk full, permissions); logged, retried.
     Failed {
@@ -330,7 +387,11 @@ enum CheckpointTick {
 /// One policy evaluation: read the log length and checkpoint if it is past `threshold_bytes`.
 /// It never invents a second durability path: the only write it can cause is the engine's own
 /// gated `checkpoint()`, whose refusal is the safe outcome.
-fn checkpoint_tick(engine: &BtreeEngine, threshold_bytes: u64) -> CheckpointTick {
+fn checkpoint_tick(
+    engine: &BtreeEngine,
+    threshold_bytes: u64,
+    pause: Option<Duration>,
+) -> CheckpointTick {
     let before = match engine.wal_len() {
         Ok(Some(len)) => len,
         Ok(None) => return CheckpointTick::NoLog,
@@ -339,12 +400,48 @@ fn checkpoint_tick(engine: &BtreeEngine, threshold_bytes: u64) -> CheckpointTick
     if before < threshold_bytes {
         return CheckpointTick::BelowThreshold { len: before };
     }
+    pause.map_or_else(
+        || checkpoint_plain(engine, before),
+        |budget| checkpoint_paused(engine, before, budget),
+    )
+}
+
+/// The log length after a checkpoint, for the log line; a failed read reports zero rather than
+/// turning a completed checkpoint into an error.
+fn log_len_after(engine: &BtreeEngine) -> u64 {
+    engine.wal_len().ok().flatten().unwrap_or(0)
+}
+
+/// The opportunistic attempt: the engine's own checkpoint, refused while transactions are active.
+fn checkpoint_plain(engine: &BtreeEngine, before: u64) -> CheckpointTick {
     match engine.checkpoint() {
-        Ok(()) => {
-            let after = engine.wal_len().ok().flatten().unwrap_or(0);
-            CheckpointTick::Done { before, after }
+        Ok(()) => CheckpointTick::Done {
+            before,
+            after: log_len_after(engine),
+            paused: Duration::ZERO,
         },
-        Err(error) if is_quiesce_refusal(&error) => CheckpointTick::Busy { len: before, error },
+        Err(error) if is_quiesce_refusal(&error) => CheckpointTick::Busy {
+            len: before,
+            active: None,
+            paused: None,
+        },
+        Err(error) => CheckpointTick::Failed { error },
+    }
+}
+
+/// The escalated attempt: hold new transactions for up to `budget` so the running ones drain.
+fn checkpoint_paused(engine: &BtreeEngine, before: u64, budget: Duration) -> CheckpointTick {
+    match engine.checkpoint_with_admission_pause(budget) {
+        Ok(nusadb_btree::CheckpointOutcome::Done { waited }) => CheckpointTick::Done {
+            before,
+            after: log_len_after(engine),
+            paused: waited,
+        },
+        Ok(nusadb_btree::CheckpointOutcome::StillBusy { active, waited }) => CheckpointTick::Busy {
+            len: before,
+            active: Some(active),
+            paused: Some(waited),
+        },
         Err(error) => CheckpointTick::Failed { error },
     }
 }
@@ -364,27 +461,58 @@ fn spawn_checkpoint_scheduler(engine: &Arc<BtreeEngine>, db: &str, policy: Check
     let spawned = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            let mut consecutive_busy: u32 = 0;
+            let mut defeated_pauses: u32 = 0;
             loop {
                 std::thread::sleep(policy.interval);
                 let Some(engine) = weak.upgrade() else { break };
-                match checkpoint_tick(&engine, policy.threshold_bytes) {
+                let pause = should_pause(consecutive_busy, defeated_pauses, policy.max_pause);
+                match checkpoint_tick(&engine, policy.threshold_bytes, pause) {
                     CheckpointTick::NoLog => break,
                     CheckpointTick::BelowThreshold { len } => {
+                        consecutive_busy = 0;
                         tracing::trace!(db = %db, log_bytes = len, "checkpoint tick: below threshold");
                     },
-                    CheckpointTick::Done { before, after } => {
+                    CheckpointTick::Done {
+                        before,
+                        after,
+                        paused,
+                    } => {
+                        consecutive_busy = 0;
+                        defeated_pauses = 0;
                         tracing::info!(
                             db = %db,
                             before_bytes = before,
                             after_bytes = after,
+                            paused_ms = paused.as_millis(),
                             "runtime checkpoint folded the log into a fresh image"
                         );
                     },
-                    CheckpointTick::Busy { len, error } => {
+                    CheckpointTick::Busy {
+                        len,
+                        active,
+                        paused: Some(waited),
+                    } => {
+                        // Start the count over and back off: the next pause waits for more busy
+                        // ticks, so one long transaction does not stall every client every tick.
+                        consecutive_busy = 0;
+                        defeated_pauses = defeated_pauses.saturating_add(1);
+                        tracing::warn!(
+                            db = %db,
+                            log_bytes = len,
+                            active_transactions = active.unwrap_or(0),
+                            paused_ms = waited.as_millis(),
+                            "checkpoint could not drain the engine within its pause budget: a \
+                             transaction is being held open (an idle client inside BEGIN?); the \
+                             log keeps growing until it ends"
+                        );
+                    },
+                    CheckpointTick::Busy { len, .. } => {
+                        consecutive_busy = consecutive_busy.saturating_add(1);
                         tracing::debug!(
                             db = %db,
                             log_bytes = len,
-                            error = %error,
+                            consecutive_busy,
                             "checkpoint tick: engine busy, retrying next tick"
                         );
                     },
@@ -1141,14 +1269,19 @@ mod checkpoint_tests {
 
     #[test]
     fn zero_on_either_flag_disables_the_policy() {
-        assert_eq!(CheckpointConfig::from_flags(0, 5), None);
-        assert_eq!(CheckpointConfig::from_flags(1024, 0), None);
+        assert_eq!(CheckpointConfig::from_flags(0, 5, 2), None);
+        assert_eq!(CheckpointConfig::from_flags(1024, 0, 2), None);
         assert_eq!(
-            CheckpointConfig::from_flags(1024, 5),
+            CheckpointConfig::from_flags(1024, 5, 2),
             Some(CheckpointConfig {
                 threshold_bytes: 1024,
                 interval: Duration::from_secs(5),
+                max_pause: Some(Duration::from_secs(2)),
             })
+        );
+        assert_eq!(
+            CheckpointConfig::from_flags(1024, 5, 0).map(|c| c.max_pause),
+            Some(None)
         );
     }
 
@@ -1157,7 +1290,7 @@ mod checkpoint_tests {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _) = open_engine(&dir);
         let before = engine.wal_len().unwrap().unwrap();
-        let tick = checkpoint_tick(&engine, THRESHOLD);
+        let tick = checkpoint_tick(&engine, THRESHOLD, None);
         assert!(
             matches!(tick, CheckpointTick::BelowThreshold { len } if len == before),
             "{tick:?}"
@@ -1173,8 +1306,8 @@ mod checkpoint_tests {
         let wal_path = dir.path().join("btree.wal");
         assert!(std::fs::metadata(&wal_path).unwrap().len() >= THRESHOLD);
 
-        let tick = checkpoint_tick(&engine, THRESHOLD);
-        let CheckpointTick::Done { before, after } = tick else {
+        let tick = checkpoint_tick(&engine, THRESHOLD, None);
+        let CheckpointTick::Done { before, after, .. } = tick else {
             panic!("expected a checkpoint, got {tick:?}");
         };
         assert_eq!(before, grown);
@@ -1197,7 +1330,7 @@ mod checkpoint_tests {
         let open_txn = engine.begin(RC).unwrap();
         let len_before = engine.wal_len().unwrap().unwrap();
 
-        let tick = checkpoint_tick(&engine, THRESHOLD);
+        let tick = checkpoint_tick(&engine, THRESHOLD, None);
         assert!(
             matches!(tick, CheckpointTick::Busy { len, .. } if len == len_before),
             "{tick:?}"
@@ -1210,7 +1343,7 @@ mod checkpoint_tests {
 
         engine.commit(open_txn).unwrap();
         assert!(matches!(
-            checkpoint_tick(&engine, THRESHOLD),
+            checkpoint_tick(&engine, THRESHOLD, None),
             CheckpointTick::Done { .. }
         ));
     }
@@ -1262,11 +1395,83 @@ mod checkpoint_tests {
         assert_eq!(rows, rows_at_backup);
     }
 
+    /// With a pause budget, a transaction that ends within it lets the checkpoint run; one that
+    /// outlives it is reported as busy with the pause spent, and the log is untouched.
+    #[test]
+    fn a_paused_tick_drains_a_short_transaction_and_reports_a_long_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table) = open_engine(&dir);
+        let _ = write_past_threshold(&engine, table);
+        let engine = std::sync::Arc::new(engine);
+
+        let open_txn = engine.begin(RC).unwrap();
+        let ender = {
+            let engine = std::sync::Arc::clone(&engine);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                engine.commit(open_txn).unwrap();
+            })
+        };
+        let tick = checkpoint_tick(&engine, THRESHOLD, Some(Duration::from_secs(5)));
+        assert!(
+            matches!(tick, CheckpointTick::Done { paused, .. } if paused >= Duration::from_millis(100)),
+            "{tick:?}"
+        );
+        ender.join().unwrap();
+
+        let _ = write_past_threshold(&engine, table);
+        let len_before = engine.wal_len().unwrap().unwrap();
+        let held = engine.begin(RC).unwrap();
+        let tick = checkpoint_tick(&engine, THRESHOLD, Some(Duration::from_millis(100)));
+        assert!(
+            matches!(
+                tick,
+                CheckpointTick::Busy {
+                    active: Some(1),
+                    paused: Some(_),
+                    ..
+                }
+            ),
+            "{tick:?}"
+        );
+        assert_eq!(engine.wal_len().unwrap().unwrap(), len_before);
+        engine.commit(held).unwrap();
+    }
+
+    #[test]
+    fn the_pause_is_used_only_after_repeated_busy_ticks_and_only_when_configured() {
+        let budget = Some(Duration::from_secs(2));
+        assert_eq!(should_pause(0, 0, budget), None);
+        assert_eq!(should_pause(BUSY_TICKS_BEFORE_PAUSE - 1, 0, budget), None);
+        assert_eq!(should_pause(BUSY_TICKS_BEFORE_PAUSE, 0, budget), budget);
+        assert_eq!(should_pause(u32::MAX, 0, None), None);
+    }
+
+    #[test]
+    fn a_defeated_pause_backs_off_exponentially_up_to_a_cap() {
+        let budget = Some(Duration::from_secs(2));
+        // One defeat doubles the busy ticks required; six defeats cap the doubling.
+        assert_eq!(should_pause(BUSY_TICKS_BEFORE_PAUSE, 1, budget), None);
+        assert_eq!(should_pause(BUSY_TICKS_BEFORE_PAUSE * 2, 1, budget), budget);
+        assert_eq!(should_pause(BUSY_TICKS_BEFORE_PAUSE * 4, 2, budget), budget);
+        let capped = BUSY_TICKS_BEFORE_PAUSE << MAX_PAUSE_BACKOFF_DOUBLINGS;
+        assert_eq!(should_pause(capped - 1, 50, budget), None);
+        assert_eq!(should_pause(capped, 50, budget), budget);
+    }
+
+    #[test]
+    fn the_pause_flag_is_capped_at_a_minute() {
+        assert_eq!(
+            CheckpointConfig::from_flags(1024, 5, 3600).and_then(|c| c.max_pause),
+            Some(Duration::from_mins(1))
+        );
+    }
+
     #[test]
     fn in_memory_engine_has_no_log_to_bound() {
         let engine = BtreeEngine::new();
         assert!(matches!(
-            checkpoint_tick(&engine, THRESHOLD),
+            checkpoint_tick(&engine, THRESHOLD, None),
             CheckpointTick::NoLog
         ));
     }

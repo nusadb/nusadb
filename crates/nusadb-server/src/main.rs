@@ -199,6 +199,14 @@ struct Args {
     /// `--checkpoint-threshold-bytes`. `0` disables the worker. Defaults to 5 seconds.
     #[arg(long, default_value_t = 5)]
     checkpoint_interval: u64,
+
+    /// When the log is past its threshold and the engine has refused the worker three times in
+    /// a row because transactions were always active, hold new transactions for at most this
+    /// many seconds so the running ones end and the checkpoint can run; a transaction held open
+    /// longer than that defeats the pause and the worker tries again later. `0` never pauses
+    /// (the worker only ever waits for a quiet instant). Defaults to 2 seconds.
+    #[arg(long, default_value_t = 2)]
+    checkpoint_max_pause: u64,
 }
 
 /// `0` means "disabled / unbounded"; any other value is that many seconds.
@@ -537,6 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = database_manager::CheckpointConfig::from_flags(
         args.checkpoint_threshold_bytes,
         args.checkpoint_interval,
+        args.checkpoint_max_pause,
     );
     // The physical multi-database cluster: each database is its own engine under `base/<db>/`,
     // bootstrapping the default database on a fresh data directory. Dead-version reclamation is

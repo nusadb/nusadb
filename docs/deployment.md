@@ -44,6 +44,7 @@ the database.
 | `--autoanalyze-scale` / `--autoanalyze-threshold` | `0.1` / `50` | A table is re-analyzed once its writes since the last analyze exceed `threshold + scale * rows`. |
 | `--checkpoint-threshold-bytes` | `67108864` (64 MiB) | Log length past which the background checkpoint worker folds a database's log into a fresh image and truncates it. `0` disables the worker. |
 | `--checkpoint-interval` | `5` | Seconds between the checkpoint worker's checks of each database's log. `0` disables the worker. |
+| `--checkpoint-max-pause` | `2` | Once the log is past its threshold and three checks in a row found transactions active, hold new transactions for at most this many seconds (capped at 60) so the checkpoint can run. `0` never pauses. |
 | `--metrics-listen` | none | Serve Prometheus metrics on this address, for example `127.0.0.1:9100`. |
 | `--storage-engine` | `btree` | The only value. A data directory written by the removed `lsm` engine is refused with a migration hint. |
 
@@ -351,10 +352,16 @@ automatically when a database is opened with a log past a few megabytes.
 While the server runs, a background worker per database checks the log every
 `--checkpoint-interval` seconds and, once it is longer than `--checkpoint-threshold-bytes`
 (64 MiB by default), takes the same checkpoint `CHECKPOINT` would. That checkpoint needs a
-moment with no transaction active, so on a busy engine the worker just tries again at the next
-interval: with a single writer or a bursty load such moments are frequent and the log stays
-bounded; under continuously overlapping transactions from many connections they can be rare, and
-the log keeps growing until one appears. Each checkpoint rewrites the whole image while the
+moment with no transaction active. With a single writer or a bursty load such moments are
+frequent and the worker simply waits for one. Under continuously overlapping transactions from
+many connections they can be rare, so after three consecutive refusals the worker makes one: it
+holds new transactions for at most `--checkpoint-max-pause` seconds (2 by default), lets the
+running ones end, checkpoints, and resumes. Clients see a short wait on their next `BEGIN` or
+autocommit statement, never an error. A transaction held open longer than the pause budget, such
+as an idle client inside `BEGIN`, defeats the pause: the worker logs a warning with the active
+count, doubles the number of busy checks it waits before pausing again (up to about sixteen
+minutes between attempts), and the log keeps growing until that transaction ends. The pause is
+capped at 60 seconds. Each checkpoint rewrites the whole image while the
 engine is paused, so its cost grows with the database, not with the log: on a large database
 raise the threshold so the pause is paid less often. Watch the server log at `info` for
 `runtime checkpoint folded the log` and at `debug` for the busy retries. Set either flag to `0` to

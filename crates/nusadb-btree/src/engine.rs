@@ -34,10 +34,9 @@ use std::fs::File;
 use std::io::Seek;
 use std::ops::Bound;
 use std::path::Path;
-#[cfg(feature = "dst-fault")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use nusadb_core::engine::{
     AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, ScanDirection, SequenceChange,
@@ -142,6 +141,13 @@ impl std::fmt::Debug for Wal {
 #[derive(Debug, Default)]
 pub struct BtreeEngine {
     store: MemPageStore,
+    /// Signalled whenever a transaction leaves `active` and whenever admission resumes. `begin`
+    /// waits on it while admission is paused; a checkpoint that pauses admission waits on it for
+    /// the active set to drain. Always used with the `txns` mutex.
+    txn_ended: Condvar,
+    /// Lock-free mirror of "admission is paused" for callers that must not block: set while at
+    /// least one pausing checkpoint holds new transactions, cleared when the last one resumes.
+    admission_paused_flag: AtomicBool,
     /// Rank 2: tables, indexes, constraints, namespaces, stats — the schema. DML holds `read`
     /// (fully parallel), DDL holds `write`.
     catalog: RwLock<Catalog>,
@@ -269,6 +275,10 @@ struct TxnDomain {
     txns: HashMap<u64, TxnState>,
     /// Transactions begun and not yet ended — the raw material of every read view.
     active: HashSet<u64>,
+    /// While non-zero, `begin` waits: that many checkpoints are draining the active set so they
+    /// can run on a quiesced engine under sustained load. Each one counts itself out, and wakes
+    /// every waiter, on every exit, including failure.
+    admission_paused: u32,
     next_txn_id: u64,
     /// The no-wait lock table (`LOCK TABLE` · `FOR UPDATE/SHARE` · uniqueness
     /// keys): row, key and table locks in distinct namespaces, held until the owning transaction
@@ -340,6 +350,7 @@ impl Default for TxnDomain {
         Self {
             txns: HashMap::new(),
             active: HashSet::new(),
+            admission_paused: 0,
             // Transaction id 0 is reserved: `mvcc::NO_XMAX` (= 0) marks a live version, so a
             // real transaction may never stamp an xmax of 0.
             next_txn_id: 1,
@@ -1676,7 +1687,12 @@ impl BtreeEngine {
     /// for the caller to fold into the `O(1)` approximate row counters and the auto-analyze churn
     /// tally via [`apply_commit_deltas`] — which the caller does **after** releasing the `txns` lock,
     /// since that update takes the (lower-rank) catalog guard.
-    fn finish_commit(t: &mut TxnDomain, txn: TxnId, data_version: &AtomicU64) -> CommitDeltas {
+    fn finish_commit(
+        t: &mut TxnDomain,
+        txn: TxnId,
+        data_version: &AtomicU64,
+        txn_ended: &Condvar,
+    ) -> CommitDeltas {
         let mut deltas = CommitDeltas {
             net: HashMap::new(),
             churn: HashMap::new(),
@@ -1689,6 +1705,10 @@ impl BtreeEngine {
             }
         }
         t.active.remove(&txn.0);
+        // Only a pausing checkpoint ever waits here; skip the wake on the plain commit path.
+        if t.admission_paused > 0 {
+            txn_ended.notify_all();
+        }
         deltas
     }
 
@@ -2533,6 +2553,66 @@ impl BtreeEngine {
         Ok(Some(wal.writer.get_ref().metadata()?.len()))
     }
 
+    /// [`checkpoint`](Self::checkpoint) for an engine that never goes quiet on its own: pause
+    /// admission of new transactions, wait up to `max_wait` for the running ones to end, take the
+    /// checkpoint on the drained engine, and resume. The checkpoint itself is the same gated code;
+    /// nothing here adds a second durability path.
+    ///
+    /// New `begin` calls block for at most `max_wait` plus the checkpoint's own duration.
+    /// Transactions already running are never touched, so a client sitting inside an open
+    /// transaction keeps the engine from draining: after `max_wait` the attempt gives up with
+    /// [`CheckpointOutcome::StillBusy`], admission resumes, and nothing has been written. The
+    /// in-memory engine reports the same unsupported error as the plain call, before pausing.
+    pub fn checkpoint_with_admission_pause(&self, max_wait: Duration) -> Result<CheckpointOutcome> {
+        if self.wal.is_none() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "nusadb-btree: the in-memory engine has no log to checkpoint",
+            )));
+        }
+        let started = Instant::now();
+        // A budget the clock cannot represent is treated as the largest one it can.
+        let deadline = started
+            .checked_add(max_wait)
+            .unwrap_or_else(|| started + Duration::from_hours(1));
+        // Only the `txns` lock is held while waiting, and the wait releases it: committers and
+        // aborters (which take `txns` after their own higher-ranked locks) proceed and wake us.
+        // The guard that counts this pause out again is armed before counting in, so no exit
+        // path below can leave admission held (a decrement with nothing counted in is a no-op).
+        let _resume = AdmissionPause(self);
+        let still_active = {
+            let mut t = self.txns.lock().map_err(|_| poisoned())?;
+            t.admission_paused += 1;
+            self.admission_paused_flag.store(true, Ordering::Release);
+            loop {
+                if t.active.is_empty() {
+                    break 0;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break t.active.len();
+                }
+                let (guard, _) = self
+                    .txn_ended
+                    .wait_timeout(t, deadline - now)
+                    .map_err(|_| poisoned())?;
+                t = guard;
+            }
+        };
+        if still_active > 0 {
+            return Ok(CheckpointOutcome::StillBusy {
+                active: still_active,
+                waited: started.elapsed(),
+            });
+        }
+        // Between releasing `txns` and the checkpoint re-taking it, only `begin` could grow the
+        // active set, and `begin` is paused: the checkpoint's own quiescence check passes.
+        self.checkpoint()?;
+        Ok(CheckpointOutcome::Done {
+            waited: started.elapsed(),
+        })
+    }
+
     /// Fold the whole committed state into an on-disk image and truncate the log — so the next
     /// recovery replays the image plus only the records written after it, and the data
     /// directory stops growing with write history.
@@ -2625,6 +2705,45 @@ impl BtreeEngine {
         Ok(())
     }
 }
+
+/// What [`BtreeEngine::checkpoint_with_admission_pause`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    /// The active set drained within the pause and the checkpoint ran; `waited` is the time
+    /// admission was held before the checkpoint started.
+    Done {
+        /// How long new transactions were held before the checkpoint began.
+        waited: Duration,
+    },
+    /// `active` transactions were still running when the pause budget ran out; admission has
+    /// resumed and nothing was written.
+    StillBusy {
+        /// Transactions still active at the deadline.
+        active: usize,
+        /// How long new transactions were held before giving up.
+        waited: Duration,
+    },
+}
+
+/// Counts one pausing checkpoint out of admission when dropped, so every exit from it (success,
+/// a busy deadline, or an error out of the checkpoint itself) wakes the waiting `begin` calls
+/// once no other pause remains.
+struct AdmissionPause<'a>(&'a BtreeEngine);
+
+impl Drop for AdmissionPause<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock here means another thread panicked holding `txns`; the process is
+        // already fail-stopping on that path, and there is nothing safer to do than let it.
+        if let Ok(mut t) = self.0.txns.lock() {
+            t.admission_paused = t.admission_paused.saturating_sub(1);
+            if t.admission_paused == 0 {
+                self.0.admission_paused_flag.store(false, Ordering::Release);
+            }
+        }
+        self.0.txn_ended.notify_all();
+    }
+}
+
 
 /// Append the commit marker for `txn`, honoring the DST WAL-append fault point. In production
 /// (no `dst-fault`) this is a plain `writer.append`; under `dst-fault`, an armed one-shot fault
@@ -2812,8 +2931,18 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         Ok(())
     }
 
+    fn admission_paused(&self) -> bool {
+        self.admission_paused_flag.load(Ordering::Acquire)
+    }
+
     fn begin(&self, level: IsolationLevel) -> Result<TxnId> {
         let mut t = self.txns.lock().map_err(|_| poisoned())?;
+        // A checkpoint draining the active set holds new transactions here, never for longer than
+        // its bounded pause plus the checkpoint itself; the wait releases the lock, so the
+        // transactions already running end normally and wake it.
+        while t.admission_paused > 0 {
+            t = self.txn_ended.wait(t).map_err(|_| poisoned())?;
+        }
         let id = t.next_txn_id;
         t.next_txn_id += 1;
         t.active.insert(id);
@@ -2913,7 +3042,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     // In-memory, stage and finish coincide: bump both instants under one lock hold.
                     t.bump_staged_versions(txn.0);
                     t.bump_finished_versions(txn.0);
-                    Self::finish_commit(&mut t, txn, &self.data_version)
+                    Self::finish_commit(&mut t, txn, &self.data_version, &self.txn_ended)
                 };
                 // Fold the net row change into the approximate counters with `txns` released.
                 self.apply_commit_deltas(&deltas)?;
@@ -2933,7 +3062,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     let mut t = self.txns.lock().map_err(|_| poisoned())?;
                     if t.txns.get(&txn.0).is_some_and(|s| s.undo.is_empty()) {
                         // A write-free commit changes no row count — the delta map is empty.
-                        let _ = Self::finish_commit(&mut t, txn, &self.data_version);
+                        let _ =
+                            Self::finish_commit(&mut t, txn, &self.data_version, &self.txn_ended);
                         return Ok(());
                     }
                 }
@@ -3012,7 +3142,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // The writes become visible to new readers here — bump the FINISHED instant while the
         // state (and its undo) is still present.
         t.bump_finished_versions(txn.0);
-        let deltas = Self::finish_commit(&mut t, txn, &self.data_version);
+        let deltas = Self::finish_commit(&mut t, txn, &self.data_version, &self.txn_ended);
         drop(t); // release `txns` before the approximate-counter update takes the catalog guard
         self.apply_commit_deltas(&deltas)?;
         Ok(())
@@ -5328,6 +5458,9 @@ impl BtreeEngine {
             std::process::abort();
         };
         t.active.remove(&txn.0);
+        if t.admission_paused > 0 {
+            self.txn_ended.notify_all();
+        }
         t.release_locks(txn.0, &locks);
 
         // 3. Best-effort durable bookkeeping — MUST NOT abort the process on failure, or a full disk

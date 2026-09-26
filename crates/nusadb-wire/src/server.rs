@@ -921,13 +921,23 @@ where
                     // Checked as the role the session currently acts as, so a `SET ROLE` does not
                     // leave COPY evaluating against the login role's privileges.
                     let copy_actor = effective_user(&user, &settings);
-                    let outcome = if copy.query.is_none()
-                        && let Some(msg) = copy_rls_block(
-                            engine.as_ref(),
-                            &copy,
-                            &copy_actor,
-                            copy.direction,
-                        ) {
+                    // The gate opens a short read transaction; while the engine holds new
+                    // transactions back for a checkpoint, take it on the blocking pool rather
+                    // than parking this reactor thread.
+                    let gate = if copy.query.is_some() {
+                        None
+                    } else if engine.admission_paused() {
+                        let (engine, copy, actor) =
+                            (Arc::clone(&engine), copy.clone(), copy_actor.clone());
+                        tokio::task::spawn_blocking(move || {
+                            copy_rls_block(engine.as_ref(), &copy, &actor, copy.direction)
+                        })
+                        .await
+                        .unwrap_or_else(|_| Some("could not verify access for COPY".to_owned()))
+                    } else {
+                        copy_rls_block(engine.as_ref(), &copy, &copy_actor, copy.direction)
+                    };
+                    let outcome = if let Some(msg) = gate {
                         // The COPY access gate refuses on privilege / RLS / reserved-namespace
                         // grounds — an access-control refusal (`42501`), not an engine fault.
                         Err((msg, "42501"))
@@ -3050,7 +3060,13 @@ where
         !params.is_empty() || connection_temp_schema_exists(engine.as_ref(), settings);
     let from_less = nusadb_sql::ast::from_less_pure_select(&stmt);
     let point_get = !from_less && nusadb_sql::ast::point_get_candidate(&stmt);
-    if from_less || point_get {
+    // While the engine holds new transactions back (a checkpoint draining the active set), an
+    // inline statement would park this reactor thread in `begin`, and with it every other
+    // connection sharing the thread, including the ones whose COMMIT the checkpoint is waiting
+    // for. Such a statement takes the pool path instead, where waiting is harmless. A pause that
+    // starts between this check and the inline `begin` still parks the thread, but for a bounded
+    // time: the pause budget plus one checkpoint.
+    if (from_less || point_get) && !engine.admission_paused() {
         // Keep the parsed statement for the (rare) punt re-dispatch; candidates that don't
         // punt pay one small AST clone.
         let backup = point_get.then(|| stmt.clone());
