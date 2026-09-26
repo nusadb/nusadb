@@ -44,21 +44,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build server + cli (release)
         run: cargo build --release --target ${{ matrix.target }} -p nusadb-server -p nusadb-cli
+      # Every copy is strict: a missing server or shell binary fails the job instead of
+      # shipping an archive without it while the run stays green.
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           BIN_DIR="target/${{ matrix.target }}/release"
           NAME="nusadb-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$NAME"
-          cp "$BIN_DIR/nusadb-server${{ matrix.ext }}" "$NAME/" 2>/dev/null || true
-          cp "$BIN_DIR/nusa-cli${{ matrix.ext }}" "$NAME/" 2>/dev/null || \
-            cp "$BIN_DIR/nusadb-cli${{ matrix.ext }}" "$NAME/" 2>/dev/null || true
-          cp README.md LICENSE "$NAME/" 2>/dev/null || true
+          cp "$BIN_DIR/nusadb-server${{ matrix.ext }}" "$NAME/"
+          cp "$BIN_DIR/nusadb-cli${{ matrix.ext }}" "$NAME/"
+          cp README.md LICENSE "$NAME/"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             7z a "dist/$NAME.zip" "$NAME"
           else
             tar czf "dist/$NAME.tar.gz" "$NAME"
+          fi
+      # Prove the archive holds both binaries (and that they run, where the runner can
+      # execute the target) before it is offered for release.
+      - name: Verify archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="nusadb-${{ github.ref_name }}-${{ matrix.target }}"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            LIST=$(7z l "dist/$NAME.zip")
+          else
+            LIST=$(tar tzf "dist/$NAME.tar.gz")
+          fi
+          for bin in nusadb-server nusadb-cli; do
+            grep -q "$NAME/$bin${{ matrix.ext }}" <<<"$LIST" || { echo "missing $bin in archive"; exit 1; }
+          done
+          if [[ "${{ matrix.target }}" != "aarch64-unknown-linux-gnu" ]]; then
+            "$NAME/nusadb-server${{ matrix.ext }}" --version
+            "$NAME/nusadb-cli${{ matrix.ext }}" --version
           fi
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
