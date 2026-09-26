@@ -217,6 +217,17 @@ pub struct BtreeEngine {
     /// The time stamped on the last commit recovery accepted at open, `0` when it accepted
     /// none past the image.
     recovered_commit_ms: u64,
+    /// A standby: the engine applies log segments shipped from a primary and refuses to commit
+    /// writes of its own or advance a sequence, so its history stays the primary's.
+    standby: AtomicBool,
+    /// The highest ended transaction id among the records recovered at open or applied since:
+    /// on a standby, the id its own image is stamped with, since that id has ended on the
+    /// primary and can never be reused or rolled back there.
+    last_applied_txn: AtomicU64,
+    /// Set when an apply replayed records into memory but could not make them durable in the
+    /// standby's log: memory is ahead of the log, and every further apply is refused until a
+    /// restart replays the log afresh.
+    apply_failed: AtomicBool,
     /// DST fault point (compiled only under the `dst-fault` feature — never in production
     /// builds): when armed, the next group-leader fsync reports failure AFTER the buffer
     /// reached the file, modeling the fsyncgate shape (the kernel had the bytes, `fsync`
@@ -1115,6 +1126,122 @@ impl BtreeEngine {
         self.recovered_up_to
     }
 
+    /// Make the engine a standby, or promote it: a standby serves reads, applies the segments
+    /// a primary archives ([`apply_shipped_segment`](Self::apply_shipped_segment)), and refuses
+    /// to commit a write or advance a sequence of its own. Promotion is `set_standby(false)`;
+    /// the engine then continues the primary's history as its own.
+    pub fn set_standby(&self, standby: bool) {
+        self.standby.store(standby, Ordering::Release);
+    }
+
+    /// Whether the engine is a standby.
+    pub fn is_standby(&self) -> bool {
+        self.standby.load(Ordering::Acquire)
+    }
+
+    /// Apply one archived log segment shipped from the primary this standby follows: the
+    /// records past the position already applied are replayed onto the store and appended to
+    /// this engine's own log under their primary positions, so they survive a restart. The
+    /// segment must follow directly on what is applied (a segment that starts past it is a gap
+    /// and is refused; one that overlaps, as a crash between archiving and truncation leaves,
+    /// is applied once). A transaction that begins in a segment ends in it, since the primary
+    /// checkpoints only on a quiet engine; puts without an ending belong to a transaction the
+    /// primary's crash cut off and are skipped, as the primary's own recovery skipped them. A
+    /// segment with a torn tail (still being copied in) applies nothing until it is complete.
+    /// New transactions are held for at most `max_wait` while the running ones end; if they do
+    /// not, nothing is applied.
+    ///
+    /// # Errors
+    /// Refused on a writable engine, on a corrupt segment, on a gap, or after an earlier apply
+    /// could not make its records durable; propagates replay and log errors.
+    pub fn apply_shipped_segment(&self, bytes: &[u8], max_wait: Duration) -> Result<ShipOutcome> {
+        let refuse =
+            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+        if !self.is_standby() {
+            return Err(Error::ReadOnly(
+                "only a standby applies shipped segments; this engine is writable".to_owned(),
+            ));
+        }
+        let Some(wal_mutex) = &self.wal else {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "nusadb-btree: the in-memory engine has no log to ship into",
+            )));
+        };
+        let prefix = nusadb_wal::recover_prefix(bytes).map_err(|hole| {
+            refuse(format!(
+                "nusadb-btree: the shipped segment is corrupt at byte {}",
+                hole.at
+            ))
+        })?;
+        if usize::try_from(prefix.good_bytes).is_ok_and(|good| good < bytes.len()) {
+            // A torn tail: a segment still being copied in. Applying its prefix could split a
+            // transaction whose commit lies in the torn part, so nothing is applied until the
+            // segment is complete.
+            tracing::warn!(
+                good_bytes = prefix.good_bytes,
+                total_bytes = bytes.len(),
+                "the shipped segment has a torn tail; waiting for a complete copy"
+            );
+            return Ok(ShipOutcome::NothingNew);
+        }
+        if self.apply_failed.load(Ordering::Acquire) {
+            return Err(refuse(
+                "nusadb-btree: an earlier apply could not make its records durable; restart the \
+                 standby so its log is replayed afresh"
+                    .to_owned(),
+            ));
+        }
+        let applied = self.wal_last_lsn()?.unwrap_or(0);
+        let Shipped {
+            positions,
+            records,
+            replay,
+        } = records_past(prefix.records, applied);
+        let Some(&first) = positions.first() else {
+            return Ok(ShipOutcome::NothingNew);
+        };
+        if first > applied + 1 {
+            return Err(refuse(format!(
+                "nusadb-btree: the shipped segment starts at log position {first} but this \
+                 standby has applied up to {applied}; the segment in between is missing"
+            )));
+        }
+        let (_hold, still_active, waited) = self.hold_admission_until_quiet(max_wait)?;
+        if still_active > 0 {
+            return Ok(ShipOutcome::StillBusy {
+                active: still_active,
+                waited,
+            });
+        }
+        warn_cut_off_transactions(&records);
+        // The commit gate keeps a checkpoint out from the replay to the append: an image taken
+        // in between would hold the rows under the old position and the appended records would
+        // replay them a second time at the next open.
+        let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
+        self.replay(&replay)?;
+        self.data_version.fetch_add(1, Ordering::SeqCst);
+        // Durable under the primary's positions: a restart replays them from this log like any
+        // committed history, and the next segment must follow on the last of them. A failure
+        // here leaves memory ahead of the log; further applies and checkpoints are refused
+        // until a restart, and the image stamp is not raised by what never became durable.
+        let last = match append_shipped(wal_mutex, applied, &positions, &records) {
+            Ok(last) => last,
+            Err(e) => {
+                self.apply_failed.store(true, Ordering::Release);
+                return Err(e);
+            },
+        };
+        self.last_applied_txn
+            .fetch_max(highest_ended_txn(&replay), Ordering::AcqRel);
+        Ok(ShipOutcome::Applied {
+            records: records.len(),
+            first,
+            last,
+            waited,
+        })
+    }
+
     /// Number the next log record past `lsn`, whatever the log holds now. A restore uses it to
     /// start the restored database's history past every position its archive already names.
     fn advance_lsn_past(&self, lsn: u64) -> Result<()> {
@@ -1165,7 +1292,13 @@ impl BtreeEngine {
     /// # Errors
     /// Propagates file I/O errors and reports an undecodable foreign record loudly.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None)
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None, false)
+    }
+
+    /// [`open`](Self::open) as a standby: the engine is read-only from the first moment, so the
+    /// checkpoint recovery may take at open is stamped like every other standby image.
+    pub fn open_standby(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None, true)
     }
 
     /// [`open`](Self::open) with a checkpoint archive: every checkpoint, the one recovery may
@@ -1179,7 +1312,7 @@ impl BtreeEngine {
         path: impl AsRef<Path>,
         archive: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, archive)
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, archive, false)
     }
 
     /// [`open`](Self::open), replaying the log only up to `target`: every record past a log
@@ -1189,15 +1322,17 @@ impl BtreeEngine {
     /// exactly that state and the later records are gone. An image already past the target is
     /// refused; a restore then starts from an older archived image.
     pub fn open_until(path: impl AsRef<Path>, target: RecoveryTarget) -> Result<Self> {
-        Self::open_impl(path.as_ref(), target, None)
+        Self::open_impl(path.as_ref(), target, None, false)
     }
 
     fn open_impl(
         path: &Path,
         target: RecoveryTarget,
         archive: Option<std::path::PathBuf>,
+        standby: bool,
     ) -> Result<Self> {
         let mut engine = Self::new();
+        engine.standby = AtomicBool::new(standby);
         if let Some(dir) = &archive
             && dir.is_dir()
         {
@@ -1285,6 +1420,7 @@ impl BtreeEngine {
             Err(e) => return Err(e.into()),
         }
         engine.replay(&records)?;
+        engine.last_applied_txn = AtomicU64::new(highest_ended_txn(&records));
         // Truncate the torn tail (if any) BEFORE appending: records written after garbage would
         // be unreachable to every future recovery.
         let file = std::fs::OpenOptions::new()
@@ -1447,7 +1583,7 @@ impl BtreeEngine {
                 },
             }
         }
-        let engine = Self::open_impl(scratch, target, None)?;
+        let engine = Self::open_impl(scratch, target, None, false)?;
         let cut = engine.recovered_up_to();
         // Seal the target state into one image whose position lies past every position the
         // archive names, so the restored database's history can never be chained onto by a
@@ -1943,6 +2079,15 @@ impl BtreeEngine {
     /// fails, the mutating call errors out with the transaction effectively abort-only: a
     /// `rollback` reverts the applied change and memory/log converge again.
     fn log(&self, record: &WalRecord) -> Result<()> {
+        // A standby's log holds the primary's records at the primary's positions and nothing
+        // else: a record of its own would shift the position the next shipped segment is
+        // judged against, and its transaction id lies in the primary's future. Every write
+        // fails here, at its log step, before the in-memory change can be kept.
+        if self.is_standby() {
+            return Err(Error::ReadOnly(
+                "this server is a standby; writes are refused until it is promoted".to_owned(),
+            ));
+        }
         if let Some(wal) = &self.wal {
             let mut wal = wal.lock().map_err(|_| poisoned())?;
             wal.writer.append(record)?;
@@ -2919,6 +3064,53 @@ impl BtreeEngine {
                 "nusadb-btree: the in-memory engine has no log to checkpoint",
             )));
         }
+        let (_resume, still_active, waited) = self.hold_admission_until_quiet(max_wait)?;
+        if still_active > 0 {
+            return Ok(CheckpointOutcome::StillBusy {
+                active: still_active,
+                waited,
+            });
+        }
+        // Between releasing `txns` and the checkpoint re-taking it, only `begin` could grow the
+        // active set, and `begin` is paused: the checkpoint's own quiescence check passes.
+        self.checkpoint()?;
+        Ok(CheckpointOutcome::Done { waited })
+    }
+
+    /// A standby commits nothing of its own: a transaction that wrote is rolled back here,
+    /// exactly like a conflict, so its rows never reach the log the primary's history fills.
+    /// A read-only transaction, or any transaction on a primary, passes with the commit gate
+    /// handed back.
+    fn refuse_standby_write<'g>(
+        &self,
+        txn: TxnId,
+        gate: std::sync::MutexGuard<'g, ()>,
+    ) -> Result<std::sync::MutexGuard<'g, ()>> {
+        if !self.is_standby() {
+            return Ok(gate);
+        }
+        let state = {
+            let mut t = self.txns.lock().map_err(|_| poisoned())?;
+            if t.txns.get(&txn.0).is_none_or(|s| s.undo.is_empty()) {
+                return Ok(gate);
+            }
+            t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))?
+        };
+        drop(gate);
+        self.abort(txn, state);
+        Err(Error::ReadOnly(
+            "this server is a standby; writes are refused until it is promoted".to_owned(),
+        ))
+    }
+
+    /// Hold new transactions and wait up to `max_wait` for the running ones to end. Returns the
+    /// guard that resumes admission when dropped, how many transactions were still active when
+    /// the wait ended (zero: the engine is quiet and stays so while the guard lives), and how
+    /// long the wait took.
+    fn hold_admission_until_quiet(
+        &self,
+        max_wait: Duration,
+    ) -> Result<(AdmissionPause<'_>, usize, Duration)> {
         let started = Instant::now();
         // A budget the clock cannot represent is treated as the largest one it can.
         let deadline = started
@@ -2928,7 +3120,7 @@ impl BtreeEngine {
         // aborters (which take `txns` after their own higher-ranked locks) proceed and wake us.
         // The guard that counts this pause out again is armed before counting in, so no exit
         // path below can leave admission held (a decrement with nothing counted in is a no-op).
-        let _resume = AdmissionPause(self);
+        let resume = AdmissionPause(self);
         let still_active = {
             let mut t = self.txns.lock().map_err(|_| poisoned())?;
             t.admission_paused += 1;
@@ -2948,18 +3140,7 @@ impl BtreeEngine {
                 t = guard;
             }
         };
-        if still_active > 0 {
-            return Ok(CheckpointOutcome::StillBusy {
-                active: still_active,
-                waited: started.elapsed(),
-            });
-        }
-        // Between releasing `txns` and the checkpoint re-taking it, only `begin` could grow the
-        // active set, and `begin` is paused: the checkpoint's own quiescence check passes.
-        self.checkpoint()?;
-        Ok(CheckpointOutcome::Done {
-            waited: started.elapsed(),
-        })
+        Ok((resume, still_active, started.elapsed()))
     }
 
     /// Fold the whole committed state into an on-disk image and truncate the log — so the next
@@ -3017,8 +3198,23 @@ impl BtreeEngine {
         }
         // The image's records ride a synthetic transaction with a fresh id, consumed here so
         // no later live transaction can collide with the image's commit marker.
-        let synthetic_txn = txns.next_txn_id;
-        txns.next_txn_id += 1;
+        // A standby hands its own ids to readers, and those ids lie in the primary's future: an
+        // image stamped with one could later meet the primary's abort of the same id, and
+        // recovery would drop the image. So a standby stamps its image with the last id it
+        // applied, which ended on the primary and can never be reused or rolled back there.
+        if self.apply_failed.load(Ordering::Acquire) {
+            return Err(Error::Io(std::io::Error::other(
+                "nusadb-btree: an earlier apply could not make its records durable; an image now \
+                 would hold them under the wrong position. Restart the standby",
+            )));
+        }
+        let synthetic_txn = if self.is_standby() {
+            self.last_applied_txn.load(Ordering::Acquire)
+        } else {
+            let id = txns.next_txn_id;
+            txns.next_txn_id += 1;
+            id
+        };
         let seqs = self.seqs.lock().map_err(|_| poisoned())?;
         let Some(wal_mutex) = &self.wal else {
             return Err(Error::Io(std::io::Error::new(
@@ -3082,6 +3278,120 @@ impl BtreeEngine {
         file.sync_all()?;
         Ok(())
     }
+}
+
+/// What [`BtreeEngine::apply_shipped_segment`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipOutcome {
+    /// The segment held nothing past what was already applied.
+    NothingNew,
+    /// `records` new records, at positions `first..=last`, were replayed and made durable after
+    /// admission was held for `waited`.
+    Applied {
+        /// Records applied.
+        records: usize,
+        /// The first position applied.
+        first: u64,
+        /// The last position applied, now the standby's position.
+        last: u64,
+        /// How long new transactions were held before the apply began.
+        waited: Duration,
+    },
+    /// `active` transactions were still running when the wait ran out; nothing was applied and
+    /// the segment stays due.
+    StillBusy {
+        /// Transactions still active at the deadline.
+        active: usize,
+        /// How long new transactions were held before giving up.
+        waited: Duration,
+    },
+}
+
+/// The log segments a primary has archived under `archive` past position `after`.
+///
+/// Oldest first, each with the position it covers. A read of the archive only: nothing is
+/// tidied or moved, since the archive belongs to the primary.
+///
+/// # Errors
+/// Propagates directory read errors.
+pub fn shipped_segments_after(
+    archive: &Path,
+    after: u64,
+) -> Result<Vec<(u64, std::path::PathBuf)>> {
+    let (_, segments) = list_archive_readonly(archive)?;
+    Ok(segments
+        .into_iter()
+        .filter(|&lsn| lsn > after)
+        .map(|lsn| (lsn, archive.join(format!("{lsn:020}.log"))))
+        .collect())
+}
+
+/// The position of the newest image a primary has archived under `archive`, if any.
+///
+/// # Errors
+/// Propagates directory read errors.
+pub fn newest_archived_image(archive: &Path) -> Result<Option<u64>> {
+    let (images, _) = list_archive_readonly(archive)?;
+    Ok(images.last().copied())
+}
+
+/// Seed a standby's empty database directory from a primary's archive.
+///
+/// The newest readable archived image is copied in as the directory's image, so an open of
+/// `out_wal` starts at that position and [`BtreeEngine::apply_shipped_segment`] takes it
+/// forward from the segments archived after it. Returns the position the image covers.
+///
+/// # Errors
+/// Refused when the directory already holds a log or an image, or when the archive holds no
+/// readable image; propagates copy errors.
+pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
+    let refuse =
+        |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    if out_wal.exists() || ckpt_path(out_wal).exists() {
+        return Err(refuse(format!(
+            "nusadb-btree: {} already holds a log or an image; a standby is seeded into an \
+             empty database directory",
+            out_wal.display()
+        )));
+    }
+    let (images, _) = list_archive_readonly(archive)?;
+    for &lsn in images.iter().rev() {
+        let image = archive.join(format!("{lsn:020}.ckpt"));
+        if read_checkpoint_image(&image).is_ok() {
+            copy_file(&image, &ckpt_path(out_wal))?;
+            if let Some(dir) = out_wal.parent() {
+                sync_dir(dir)?;
+            }
+            return Ok(lsn);
+        }
+        tracing::warn!(image = %image.display(), "skipping an unreadable archived image");
+    }
+    Err(refuse(format!(
+        "nusadb-btree: no readable image in {} to seed a standby from",
+        archive.display()
+    )))
+}
+
+/// The archived images and log segments in `dir`, each as its covered log position, sorted,
+/// touching nothing.
+fn list_archive_readonly(dir: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut images = Vec::new();
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let lsn = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<u64>().ok());
+        match (lsn, path.extension().and_then(|e| e.to_str())) {
+            (Some(lsn), Some("ckpt")) => images.push(lsn),
+            (Some(lsn), Some("log")) => segments.push(lsn),
+            _ => {},
+        }
+    }
+    images.sort_unstable();
+    segments.sort_unstable();
+    Ok((images, segments))
 }
 
 /// What [`BtreeEngine::checkpoint_with_admission_pause`] did.
@@ -3201,6 +3511,125 @@ fn mid_log_hole_error(path: &Path, hole: &nusadb_wal::MidLogHole) -> Error {
             path.display()
         ),
     ))
+}
+
+/// What a shipped segment contributes past the position already applied.
+struct Shipped {
+    /// The positions to append to the standby's own log, all past the applied position.
+    positions: Vec<u64>,
+    /// The records at those positions.
+    records: Vec<WalRecord>,
+    /// The records to replay: every record of a transaction whose end marker lies past the
+    /// applied position, including its puts at or below it, plus the non-transactional records
+    /// past it. A standby's durable log may end between a transaction's puts and its commit
+    /// (a crash mid-append), so the position alone would leave those puts behind.
+    replay: Vec<WalRecord>,
+}
+
+/// Split a shipped segment's records at the position already applied.
+fn records_past(records: Vec<(nusadb_core::Lsn, WalRecord)>, applied: u64) -> Shipped {
+    let mut ends: HashMap<u64, u64> = HashMap::new();
+    for (lsn, record) in &records {
+        if let WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } = record {
+            let end = ends.entry(txn.0).or_insert(0);
+            *end = (*end).max(lsn.0);
+        }
+    }
+    let mut out = Shipped {
+        positions: Vec::new(),
+        records: Vec::new(),
+        replay: Vec::new(),
+    };
+    for (lsn, record) in records {
+        let past = lsn.0 > applied;
+        let replay = match &record {
+            WalRecord::Put { .. } => match LoggedOp::from_record(&record) {
+                Some(op) if !op.is_non_transactional() => {
+                    ends.get(&op.txn()).is_some_and(|&end| end > applied)
+                },
+                _ => past,
+            },
+            _ => past,
+        };
+        if replay {
+            out.replay.push(record.clone());
+        }
+        if past {
+            out.positions.push(lsn.0);
+            out.records.push(record);
+        }
+    }
+    out
+}
+
+/// A transaction that begins in a shipped segment ends in it: the primary checkpoints only on
+/// a quiet engine. Among the records past the applied position, a put with no ending is a
+/// transaction the primary's crash cut off, whose records recovery there kept without a
+/// marker; replay skips it, as the primary's own recovery did. Each such transaction is named
+/// in the log. (A copy that stopped exactly on a record boundary looks the same at that
+/// moment; a later complete copy still applies the transaction whole, since replay takes every
+/// record of a transaction whose ending is new.)
+fn warn_cut_off_transactions(records: &[WalRecord]) {
+    let mut ended: HashSet<u64> = HashSet::new();
+    let mut open: HashSet<u64> = HashSet::new();
+    for record in records {
+        match record {
+            WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } => {
+                ended.insert(txn.0);
+            },
+            WalRecord::Put { .. } => {
+                if let Some(op) = LoggedOp::from_record(record)
+                    && !op.is_non_transactional()
+                {
+                    open.insert(op.txn());
+                }
+            },
+            _ => {},
+        }
+    }
+    for txn in open.iter().filter(|txn| !ended.contains(txn)) {
+        tracing::warn!(
+            txn,
+            "the shipped segment holds a transaction that never ended in it (cut off by a \
+             crash on the primary, or a copy that stopped short); its records are skipped \
+             unless a later copy ends it"
+        );
+    }
+}
+
+/// Append the applied records to the standby's own log under their primary positions, flushed
+/// and fsynced; returns the last position written.
+fn append_shipped(
+    wal_mutex: &Mutex<Wal>,
+    applied: u64,
+    positions: &[u64],
+    records: &[WalRecord],
+) -> Result<u64> {
+    let sync = {
+        let mut wal = wal_mutex.lock().map_err(|_| poisoned())?;
+        for (lsn, record) in positions.iter().zip(records) {
+            wal.writer.advance_past(nusadb_core::Lsn(lsn - 1));
+            wal.writer.append(record)?;
+        }
+        wal.writer.flush()?;
+        Arc::clone(&wal.sync)
+    };
+    // The fsync runs off the lock, on the shared handle, like a commit's.
+    sync.sync_all()?;
+    Ok(positions.last().copied().unwrap_or(applied))
+}
+
+/// The highest transaction id the records end (a commit or abort marker), `0` when they end
+/// none. A put alone does not count: its transaction may still be aborted later.
+fn highest_ended_txn(records: &[WalRecord]) -> u64 {
+    records
+        .iter()
+        .map(|record| match record {
+            WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } => txn.0,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The time stamped on an image's own commit marker, `None` when the records hold none.
@@ -3981,6 +4410,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 return Err(unknown_txn(txn));
             }
         }
+        let gate = self.refuse_standby_write(txn, gate)?;
         // SERIALIZABLE read-write antidependency check: if a row
         // this transaction read was modified by a concurrent transaction that has since committed,
         // the schedule is not serializable — abort it (the caller retries), undoing its writes
@@ -4173,7 +4603,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         };
         // Compensations are appended and the memory undo applied under one catalog guard, so
         // replay's view of catalog-shaped inverses can never interleave with a concurrent DDL.
-        self.rollback_tail(txn, tail, true)
+        // A standby logged nothing for these ops (every write of its own is refused at its log
+        // step), so there is nothing to compensate and nothing it may append.
+        self.rollback_tail(txn, tail, !self.is_standby())
     }
 
     fn release_savepoint(&self, txn: TxnId, name: &str) -> Result<()> {
@@ -4593,20 +5025,28 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             return Err(schema_not_found(id));
         };
         cat.ns_by_name.remove(&name);
-        self.log_op(
-            &cat,
-            &LoggedOp::SchemaDrop {
-                txn: txn.0,
-                id: id.0,
-                name: name.clone(),
-            },
-        )?;
+        // The undo entry goes in before the log append, like every other write: a refused or
+        // failed append then leaves a transaction whose rollback restores the namespace.
         // The non-durable marker is deliberately NOT cleared here — same reasoning as `drop_table`:
         // a rolled-back `DROP SCHEMA` restores the namespace via `UndoOp::DroppedSchema`, and a
         // cleared marker would make the restored temp schema (and any table recreated under it by a
         // compensation) look durable and survive recovery. A committed drop leaves a harmless,
         // bounded stale id; rollback of a CREATE prunes its own id in `undo_ops`.
-        self.push_undo(txn.0, UndoOp::DroppedSchema { id: id.0, name })?;
+        self.push_undo(
+            txn.0,
+            UndoOp::DroppedSchema {
+                id: id.0,
+                name: name.clone(),
+            },
+        )?;
+        self.log_op(
+            &cat,
+            &LoggedOp::SchemaDrop {
+                txn: txn.0,
+                id: id.0,
+                name,
+            },
+        )?;
         Ok(())
     }
 
@@ -5152,6 +5592,11 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn sequence_next(&self, id: SequenceId) -> Result<i64> {
+        if self.is_standby() {
+            return Err(Error::ReadOnly(
+                "this server is a standby; sequences advance on the primary".to_owned(),
+            ));
+        }
         let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
         let seq = seqs
             .sequences
@@ -6521,6 +6966,12 @@ impl BtreeEngine {
         //    be logged, that sequence may resurrect on recovery — a rare, benign anomaly we accept
         //    over killing every connection. The disk-full error surfaces to the client that hit it;
         //    the server keeps serving every other connection.
+        // A standby logs nothing of its own: nothing of this transaction reached the log (its
+        // writes were refused at their log step, and the in-memory ones are undone above), so
+        // there is nothing a marker would exclude.
+        if self.is_standby() {
+            return;
+        }
         if let Err(e) = self.log(&WalRecord::AbortTxn { txn }) {
             eprintln!("nusadb-btree: WARN — could not log advisory AbortTxn for {txn:?}: {e}");
         }

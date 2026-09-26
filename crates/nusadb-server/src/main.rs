@@ -233,6 +233,54 @@ struct Args {
     /// lie past the last checkpoint. Copy it from the running or stopped source first.
     #[arg(long, requires = "restore_database")]
     restore_live_log: Option<String>,
+
+    /// Serve as a read-only standby of the primary whose `--wal-archive-dir` root this is: every
+    /// database the primary archives is seeded here from its newest archived image and kept up
+    /// to date from the segments the primary's checkpoints archive. Writes, CREATE DATABASE and
+    /// DROP DATABASE are refused. To promote, stop the server and start it without this flag
+    /// (and with a fresh `--wal-archive-dir` of its own if it should archive).
+    #[arg(long, conflicts_with_all = ["restore_database", "wal_archive_dir"])]
+    standby_from: Option<String>,
+
+    /// How often (seconds) a standby looks for new archived segments. Defaults to 5 seconds.
+    #[arg(long, default_value_t = 5, requires = "standby_from")]
+    standby_poll: u64,
+
+    /// How long (seconds) a standby may hold new transactions while the running ones end so a
+    /// segment can be applied. Defaults to 2 seconds.
+    #[arg(long, default_value_t = 2, requires = "standby_from")]
+    standby_max_pause: u64,
+}
+
+/// The log-bounding, archiving and standby settings the flags describe: the runtime checkpoint
+/// policy that bounds each database's log on a long-lived server (0 = off), the archive root,
+/// and the standby policy.
+fn durability_options(args: &Args) -> database_manager::DurabilityOptions {
+    database_manager::DurabilityOptions {
+        checkpoint: database_manager::CheckpointConfig::from_flags(
+            args.checkpoint_threshold_bytes,
+            args.checkpoint_interval,
+            args.checkpoint_max_pause,
+        ),
+        wal_archive: args.wal_archive_dir.as_ref().map(std::path::PathBuf::from),
+        standby: standby_config(args),
+    }
+}
+
+/// The standby policy the `--standby-*` flags describe, announced in the log; `None` for a
+/// primary.
+fn standby_config(args: &Args) -> Option<database_manager::StandbyConfig> {
+    let cfg = database_manager::StandbyConfig::from_flags(
+        args.standby_from.as_deref(),
+        args.standby_poll,
+        args.standby_max_pause,
+    )?;
+    tracing::info!(
+        archive = %cfg.root.display(),
+        poll_secs = args.standby_poll,
+        "serving as a read-only standby of the primary archiving into this root"
+    );
+    Some(cfg)
 }
 
 /// Rebuild `name` as of the requested target from the archive, into its empty directory.
@@ -669,12 +717,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scale: args.autoanalyze_scale,
         base: args.autoanalyze_threshold,
     };
-    // Runtime checkpoint policy: bound each database's log on a long-lived server (0 = off).
-    let checkpoint = database_manager::CheckpointConfig::from_flags(
-        args.checkpoint_threshold_bytes,
-        args.checkpoint_interval,
-        args.checkpoint_max_pause,
-    );
     // The physical multi-database cluster: each database is its own engine under `base/<db>/`,
     // bootstrapping the default database on a fresh data directory. Dead-version reclamation is
     // the per-database purge scheduler the manager wires as each engine opens.
@@ -684,8 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ceilings.max_txn_write_bytes,
         ceilings.max_resident_bytes,
         autoanalyze,
-        checkpoint,
-        args.wal_archive_dir.as_ref().map(std::path::PathBuf::from),
+        durability_options(&args),
     )?;
     // Offline restore: rebuild one database from its archive and exit without serving.
     if let Some(name) = &args.restore_database {

@@ -478,6 +478,47 @@ few hundred megabytes at most.
 
 ---
 
+### Standby (log shipping)
+
+A second server can follow a primary through the primary's checkpoint archive:
+
+```bash
+# primary
+nusadb-server --data-dir /var/lib/nusadb --wal-archive-dir /srv/nusadb-archive \
+  --checkpoint-threshold-bytes 16777216 --checkpoint-interval 5
+# standby (a different data directory; the archive root is shared or replicated to it)
+nusadb-server --data-dir /var/lib/nusadb-standby --standby-from /srv/nusadb-archive --listen 0.0.0.0:5679
+```
+
+On start the standby registers every database the primary archives, seeds each empty database
+directory from the newest archived image, and from then on applies every log segment the
+primary's checkpoints archive, in order, once. It serves reads on every database. A write
+statement is refused with SQLSTATE `25006`, sequences do not advance, and `CREATE DATABASE` and
+`DROP DATABASE` are refused. Between polls (`--standby-poll`, default 5 seconds) new
+transactions are held for at most `--standby-max-pause` seconds so the running ones end before
+a segment is applied; a transaction held open longer defers the segment to the next poll.
+
+The standby lags the primary by the primary's checkpoint cadence: a segment reaches the archive
+only when the primary checkpoints, so set `--checkpoint-threshold-bytes` and
+`--checkpoint-interval` on the primary to the lag you can accept. The standby keeps what it has
+applied in its own log under the primary's positions, so it survives a restart and continues
+from where it was. If the primary is restored to an earlier point (which forks its archive) or
+segments are pruned, the standby logs that the archive has moved past it and stops applying;
+empty its database directories and start it again to seed afresh.
+
+A standby's own log holds the primary's records at the primary's positions and nothing else, so
+`--standby-from` cannot be combined with `--wal-archive-dir`. When the archive root is replicated to
+the standby's host rather than shared, each segment must land atomically (copied under a scratch
+name and renamed into place): a segment whose copy is still in progress is left alone until it is
+complete. A transaction the primary's crash cut off, whose records its recovery kept without an
+ending, is skipped by the standby the way the primary's own recovery skipped it.
+
+To promote the standby, stop it and start it again without `--standby-from` (add a
+`--wal-archive-dir` of its own if it should archive): it opens every database writable and
+continues the primary's history from the last applied position. Point the old primary's
+clients at it, and do not start the old primary against the same archive root again without
+moving that archive aside, or the two histories would meet in one archive.
+
 ## Upgrades
 
 Replace the binary (or pull a newer image tag) and restart the service; recovery replays the log, so

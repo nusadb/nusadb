@@ -90,6 +90,9 @@ pub(crate) struct DatabaseManager {
     /// Root of the write-ahead-log archive (`--wal-archive-dir`); each database archives its
     /// checkpoints under `<root>/<database>/`. `None` keeps no archive.
     wal_archive: Option<PathBuf>,
+    /// Set when this server is a standby following a primary's archive: every database is
+    /// read-only, seeded from `<root>/<database>/` and kept up to date by its apply scheduler.
+    standby: Option<StandbyConfig>,
     state: Mutex<ManagerState>,
 }
 
@@ -111,9 +114,13 @@ impl DatabaseManager {
         max_txn_write_bytes: Option<u64>,
         max_resident_bytes: Option<u64>,
         autoanalyze: AutoAnalyzeConfig,
-        checkpoint: Option<CheckpointConfig>,
-        wal_archive: Option<PathBuf>,
+        durability: DurabilityOptions,
     ) -> io::Result<Self> {
+        let DurabilityOptions {
+            checkpoint,
+            wal_archive,
+            standby,
+        } = durability;
         let root = data_dir.as_ref().to_path_buf();
         let default_name = default_name.into();
         // Detect the legacy single-database layout (a WAL at the root) before creating `base/`.
@@ -122,6 +129,32 @@ impl DatabaseManager {
         std::fs::create_dir_all(root.join("base"))?;
 
         let mut databases = load_catalog(&root)?;
+        if let Some(cfg) = &standby {
+            if legacy_root {
+                return Err(io::Error::other(
+                    "a standby needs the per-database layout; this data directory is the legacy \
+                     single-database one",
+                ));
+            }
+            // Every database the primary archives exists here too, seeded from its newest
+            // archived image when its directory is still empty.
+            for name in archived_database_names(&cfg.root)? {
+                let wal = base_dir(&root, &name).join("btree.wal");
+                if !wal.exists() && !wal.with_extension("wal.ckpt").exists() {
+                    std::fs::create_dir_all(base_dir(&root, &name))?;
+                    let covered = nusadb_btree::seed_standby(&cfg.root.join(&name), &wal)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    tracing::info!(database = %name, position = covered, "standby seeded from the primary's archive");
+                }
+                databases.insert(name);
+            }
+            // The default database exists on every cluster, standby included, so a connection
+            // that names no database has somewhere to go; it follows the primary's archive of
+            // it once one appears.
+            std::fs::create_dir_all(base_dir(&root, &default_name))?;
+            databases.insert(default_name.clone());
+            save_catalog(&root, &databases)?;
+        }
         if databases.is_empty() {
             // Fresh (or legacy) cluster: register the default database so a first connection has
             // somewhere to go. A fresh cluster also creates its `base/<default>/` directory; a legacy
@@ -142,11 +175,17 @@ impl DatabaseManager {
             autoanalyze,
             checkpoint,
             wal_archive,
+            standby,
             state: Mutex::new(ManagerState {
                 databases,
                 engines: HashMap::new(),
             }),
         })
+    }
+
+    /// Whether this server is a standby (read-only, following a primary's archive).
+    pub(crate) const fn is_standby(&self) -> bool {
+        self.standby.is_some()
     }
 
     /// The WAL path of a registered database, for an offline restore into its directory; `None`
@@ -210,8 +249,13 @@ impl DatabaseManager {
         // the composition root's job).
         let engine = Arc::new(
             // The archive goes in with the open: recovery may checkpoint before returning, and
-            // that checkpoint must archive the segment it truncates like any other.
-            BtreeEngine::open_with_archive(wal, self.archive_dir(name))
+            // that checkpoint must archive the segment it truncates like any other. A standby
+            // opens as one from the first moment for the same reason.
+            if self.is_standby() {
+                BtreeEngine::open_standby(wal)
+            } else {
+                BtreeEngine::open_with_archive(wal, self.archive_dir(name))
+            }
                 // Apply the per-transaction and global resident write ceilings as the engine opens;
                 // `None` leaves each unbounded (the pre-flag behavior). Both checks short-circuit
                 // before any locking when unset, so an unconfigured server pays nothing. Applying the
@@ -231,10 +275,17 @@ impl DatabaseManager {
         );
         spawn_purge_scheduler(&engine, name);
         // Keep this database's planner statistics fresh in the background (no-op if disabled).
-        spawn_analyze_scheduler(&engine, name, self.autoanalyze);
+        // (A standby cannot write statistics; ANALYZE is a write, refused like any other.)
+        if !self.is_standby() {
+            spawn_analyze_scheduler(&engine, name, self.autoanalyze);
+        }
         // Bound the log on a server that never restarts (no thread when disabled).
         if let Some(policy) = self.checkpoint {
             spawn_checkpoint_scheduler(&engine, name, policy);
+        }
+        // A standby applies what the primary archives and commits nothing of its own.
+        if let Some(cfg) = &self.standby {
+            spawn_standby_scheduler(&engine, name, cfg);
         }
         let engine: Arc<dyn StorageEngine> = engine;
         state.engines.insert(name.to_owned(), Arc::clone(&engine));
@@ -302,6 +353,227 @@ fn spawn_purge_scheduler(engine: &Arc<BtreeEngine>, db: &str) {
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "purge scheduler did not start; run purge manually");
     }
+}
+
+/// How a standby follows its primary: where the primary's archive root is, how often each
+/// database looks for new segments, and how long new transactions may be held while a segment
+/// waits for the running ones to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StandbyConfig {
+    /// The primary's `--wal-archive-dir` root, one subdirectory per database.
+    pub(crate) root: PathBuf,
+    /// How often each database polls the archive for new segments.
+    pub(crate) poll: Duration,
+    /// The longest a segment holds new transactions while the running ones end.
+    pub(crate) max_pause: Duration,
+}
+
+impl StandbyConfig {
+    /// The standby policy the `--standby-*` flags describe; `None` without a root.
+    pub(crate) fn from_flags(
+        root: Option<&str>,
+        poll_secs: u64,
+        max_pause_secs: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            root: PathBuf::from(root?),
+            poll: Duration::from_secs(poll_secs.max(1)),
+            max_pause: Duration::from_secs(max_pause_secs.min(MAX_PAUSE_SECS)),
+        })
+    }
+}
+
+/// The databases a primary has archived under `root`: one subdirectory each, leaving out the
+/// `<name>.dropped-<moment>` directories of dropped databases and anything that is not a
+/// valid database name.
+fn archived_database_names(root: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_valid_database_name(&name) && !name.contains(".dropped-") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// What one standby poll of a database's archive did.
+#[derive(Debug)]
+enum StandbyTick {
+    /// Nothing new past the applied position.
+    Idle {
+        /// The applied position.
+        position: u64,
+    },
+    /// `segments` segments holding `records` records were applied; the position is now `position`.
+    Applied {
+        /// Segments applied this tick.
+        segments: usize,
+        /// Records applied this tick.
+        records: usize,
+        /// The applied position afterwards.
+        position: u64,
+    },
+    /// A running transaction outlived the pause budget; the segment stays due for the next tick.
+    Busy {
+        /// Transactions still active at the deadline.
+        active: usize,
+        /// How long new transactions were held.
+        waited: Duration,
+    },
+    /// The archive holds an image past the applied position but no segment chain reaching it:
+    /// the primary's history was rebased (a restore) or segments were pruned. Applying stops
+    /// until the standby is seeded again from the archive.
+    Behind {
+        /// The applied position.
+        position: u64,
+        /// The newest archived image.
+        image: u64,
+    },
+    /// An apply failed (a corrupt segment, a gap, an I/O error); logged and retried.
+    Failed {
+        /// The failure.
+        error: nusadb_core::Error,
+    },
+}
+
+/// One poll: apply, in order, every segment archived past the standby's position.
+fn standby_tick(engine: &BtreeEngine, archive: &Path, max_pause: Duration) -> StandbyTick {
+    let position = match engine.wal_last_lsn() {
+        Ok(Some(position)) => position,
+        Ok(None) => {
+            return StandbyTick::Failed {
+                error: nusadb_core::Error::Io(io::Error::other(
+                    "the in-memory engine cannot follow a primary",
+                )),
+            };
+        },
+        Err(error) => return StandbyTick::Failed { error },
+    };
+    // A database the primary has not checkpointed yet has no archive directory: nothing to
+    // follow until one appears.
+    if !archive.is_dir() {
+        return StandbyTick::Idle { position };
+    }
+    let segments = match nusadb_btree::shipped_segments_after(archive, position) {
+        Ok(segments) => segments,
+        Err(error) => return StandbyTick::Failed { error },
+    };
+    if segments.is_empty() {
+        return match nusadb_btree::newest_archived_image(archive) {
+            Ok(Some(image)) if image > position => StandbyTick::Behind { position, image },
+            Ok(_) => StandbyTick::Idle { position },
+            Err(error) => StandbyTick::Failed { error },
+        };
+    }
+    let mut applied_segments = 0;
+    let mut applied_records = 0;
+    let mut position = position;
+    for (_, path) in segments {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return StandbyTick::Failed {
+                    error: error.into(),
+                };
+            },
+        };
+        match engine.apply_shipped_segment(&bytes, max_pause) {
+            Ok(nusadb_btree::ShipOutcome::Applied { records, last, .. }) => {
+                applied_segments += 1;
+                applied_records += records;
+                position = last;
+            },
+            Ok(nusadb_btree::ShipOutcome::NothingNew) => {},
+            Ok(nusadb_btree::ShipOutcome::StillBusy { active, waited }) => {
+                return StandbyTick::Busy { active, waited };
+            },
+            Err(error) => return StandbyTick::Failed { error },
+        }
+    }
+    if applied_segments == 0 {
+        StandbyTick::Idle { position }
+    } else {
+        StandbyTick::Applied {
+            segments: applied_segments,
+            records: applied_records,
+            position,
+        }
+    }
+}
+
+/// Follow the primary's archive for one database: a detached thread holding only a weak handle,
+/// so it ends when the engine is dropped.
+fn spawn_standby_scheduler(engine: &Arc<BtreeEngine>, db: &str, cfg: &StandbyConfig) {
+    let weak = Arc::downgrade(engine);
+    let db = db.to_owned();
+    let archive = cfg.root.join(&db);
+    let (poll, max_pause) = (cfg.poll, cfg.max_pause);
+    let thread_name = format!("standby-{db}");
+    let db_in_thread = db.clone();
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let db = db_in_thread;
+            loop {
+                std::thread::sleep(poll);
+                let Some(engine) = weak.upgrade() else { break };
+                match standby_tick(&engine, &archive, max_pause) {
+                    StandbyTick::Idle { position } => {
+                        tracing::trace!(db = %db, position, "standby tick: nothing new");
+                    },
+                    StandbyTick::Applied {
+                        segments,
+                        records,
+                        position,
+                    } => {
+                        tracing::info!(db = %db, segments, records, position, "standby applied the primary's segments");
+                    },
+                    StandbyTick::Busy { active, waited } => {
+                        tracing::warn!(
+                            db = %db,
+                            active_transactions = active,
+                            paused_ms = waited.as_millis(),
+                            "standby could not apply a segment: a transaction is being held open; \
+                             retrying next tick"
+                        );
+                    },
+                    StandbyTick::Behind { position, image } => {
+                        tracing::error!(
+                            db = %db,
+                            position,
+                            newest_image = image,
+                            "the primary's archive has moved past this standby without a segment \
+                             chain to follow (a restore on the primary, or pruned segments); seed \
+                             the standby again from the archive"
+                        );
+                    },
+                    StandbyTick::Failed { error } => {
+                        tracing::warn!(db = %db, error = %error, "standby apply failed; retrying next tick");
+                    },
+                }
+                drop(engine);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(db = %db, error = %e, "could not start the standby scheduler thread");
+    }
+}
+
+/// The log-bounding, archiving and standby settings a cluster opens with.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DurabilityOptions {
+    /// Runtime checkpoint policy; `None` never checkpoints in the background.
+    pub(crate) checkpoint: Option<CheckpointConfig>,
+    /// Root of the write-ahead-log archive; `None` keeps no archive.
+    pub(crate) wal_archive: Option<PathBuf>,
+    /// Follow a primary's archive as a read-only standby; `None` serves as a primary.
+    pub(crate) standby: Option<StandbyConfig>,
 }
 
 /// Policy for the background runtime checkpoint: fold the log into a checkpoint image once it
@@ -664,6 +936,12 @@ impl DatabaseCluster for DatabaseManager {
         if !is_valid_database_name(name) {
             return Err(ClusterError::InvalidName(name.to_owned()));
         }
+        if self.is_standby() {
+            return Err(ClusterError::Protected(
+                "this server is a standby; databases are created and dropped on the primary"
+                    .to_owned(),
+            ));
+        }
         let mut state = self.state.lock().map_err(poisoned)?;
         if state.databases.contains(name) {
             return if if_not_exists {
@@ -696,6 +974,12 @@ impl DatabaseCluster for DatabaseManager {
     ) -> Result<bool, ClusterError> {
         if name == connected {
             return Err(ClusterError::InUse(name.to_owned()));
+        }
+        if self.is_standby() {
+            return Err(ClusterError::Protected(
+                "this server is a standby; databases are created and dropped on the primary"
+                    .to_owned(),
+            ));
         }
         if name == self.default_name {
             return Err(ClusterError::Protected(format!(
@@ -820,8 +1104,15 @@ mod tests {
     };
 
     fn manager(dir: &Path) -> DatabaseManager {
-        DatabaseManager::open(dir, "nusadb", None, None, NO_AUTOANALYZE, None, None)
-            .expect("open cluster")
+        DatabaseManager::open(
+            dir,
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            DurabilityOptions::default(),
+        )
+        .expect("open cluster")
     }
 
     #[test]
@@ -879,8 +1170,7 @@ mod tests {
             Some(40),
             None,
             NO_AUTOANALYZE,
-            None,
-            None,
+            DurabilityOptions::default(),
         )
         .expect("open cluster");
         let engine = bounded.open("nusadb").unwrap().expect("default engine");
@@ -919,8 +1209,7 @@ mod tests {
             None,
             None,
             NO_AUTOANALYZE,
-            None,
-            None,
+            DurabilityOptions::default(),
         )
         .expect("open cluster");
         let e2 = free.open("nusadb").unwrap().expect("default engine");
@@ -962,8 +1251,7 @@ mod tests {
             None,
             Some(1),
             NO_AUTOANALYZE,
-            None,
-            None,
+            DurabilityOptions::default(),
         )
         .expect("open cluster");
         let engine = bounded.open("nusadb").unwrap().expect("default engine");
@@ -988,8 +1276,7 @@ mod tests {
             None,
             None,
             NO_AUTOANALYZE,
-            None,
-            None,
+            DurabilityOptions::default(),
         )
         .expect("open cluster");
         let e2 = free.open("nusadb").unwrap().expect("default engine");
@@ -1072,6 +1359,113 @@ mod tests {
     }
 
     #[test]
+    fn a_standby_cluster_follows_the_primary_archive_and_refuses_ddl() {
+        use nusadb_core::engine::{ColumnDef, TableDef};
+        use nusadb_core::{ColumnType, IsolationLevel};
+        let primary_dir = tempfile::tempdir().unwrap();
+        let archive_root = primary_dir.path().join("archive");
+        let primary = DatabaseManager::open(
+            primary_dir.path().join("data"),
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            DurabilityOptions {
+                checkpoint: None,
+                wal_archive: Some(archive_root.clone()),
+                standby: None,
+            },
+        )
+        .expect("open primary");
+        primary.create("shop", false).unwrap();
+        let engine = primary.open("shop").unwrap().expect("shop engine");
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let table = engine
+            .create_table(
+                txn,
+                &TableDef {
+                    schema: "public".to_owned(),
+                    name: "t".to_owned(),
+                    columns: vec![ColumnDef {
+                        name: "v".to_owned(),
+                        ty: ColumnType::Bytes,
+                        nullable: false,
+                    }],
+                },
+            )
+            .unwrap();
+        engine.insert(txn, table, b"one").unwrap();
+        engine.commit(txn).unwrap();
+        engine.checkpoint().unwrap();
+
+        // The standby registers and seeds `shop` from the archive, opens it read-only.
+        let standby_dir = tempfile::tempdir().unwrap();
+        let cfg = StandbyConfig::from_flags(archive_root.to_str(), 3600, 2).unwrap();
+        let standby = DatabaseManager::open(
+            standby_dir.path(),
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            DurabilityOptions {
+                checkpoint: None,
+                wal_archive: None,
+                standby: Some(cfg.clone()),
+            },
+        )
+        .expect("open standby");
+        assert!(standby.list().contains(&"shop".to_owned()));
+        assert!(matches!(
+            standby.create("other", false),
+            Err(ClusterError::Protected(_))
+        ));
+        assert!(matches!(
+            standby.drop_database("shop", false, "nusadb"),
+            Err(ClusterError::Protected(_))
+        ));
+        let rows = |e: &dyn StorageEngine| {
+            let txn = e.begin(IsolationLevel::ReadCommitted).unwrap();
+            let mut scan = e.scan(txn, table).unwrap();
+            let mut out = Vec::new();
+            while let Some((_, tuple)) = scan.try_next().unwrap() {
+                out.push(tuple.to_vec());
+            }
+            e.commit(txn).unwrap();
+            out.sort();
+            out
+        };
+        // The seeded directory, driven tick by tick (the scheduler thread runs the same tick).
+        let wal = base_dir(standby_dir.path(), "shop").join("btree.wal");
+        let btree = BtreeEngine::open(&wal).unwrap();
+        btree.set_standby(true);
+        assert_eq!(rows(&btree), vec![b"one".to_vec()]);
+        assert!(matches!(
+            standby_tick(&btree, &archive_root.join("shop"), cfg.max_pause),
+            StandbyTick::Idle { .. }
+        ));
+        // The primary writes on and checkpoints; one tick brings the standby level.
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        engine.insert(txn, table, b"two").unwrap();
+        engine.commit(txn).unwrap();
+        engine.checkpoint().unwrap();
+        assert!(matches!(
+            standby_tick(&btree, &archive_root.join("shop"), cfg.max_pause),
+            StandbyTick::Applied { segments: 1, .. }
+        ));
+        assert_eq!(rows(&btree), vec![b"one".to_vec(), b"two".to_vec()]);
+        drop(btree);
+        // Opened through the manager, the database is a standby: its writes are refused.
+        let follower = standby.open("shop").unwrap().expect("standby shop engine");
+        assert_eq!(rows(&*follower), vec![b"one".to_vec(), b"two".to_vec()]);
+        let txn = follower.begin(IsolationLevel::ReadCommitted).unwrap();
+        assert!(matches!(
+            follower.insert(txn, table, b"local"),
+            Err(nusadb_core::Error::ReadOnly(_))
+        ));
+        follower.rollback(txn).unwrap();
+    }
+
+    #[test]
     fn drop_moves_the_archive_aside_so_a_recreated_database_starts_its_own() {
         let tmp = tempfile::tempdir().unwrap();
         let archive_root = tmp.path().join("archive");
@@ -1081,8 +1475,11 @@ mod tests {
             None,
             None,
             NO_AUTOANALYZE,
-            None,
-            Some(archive_root.clone()),
+            DurabilityOptions {
+                checkpoint: None,
+                wal_archive: Some(archive_root.clone()),
+                standby: None,
+            },
         )
         .expect("open cluster");
         m.create("shop", false).unwrap();
@@ -1316,8 +1713,15 @@ mod tests {
             scale: 0.1,
             base: 50,
         };
-        let m = DatabaseManager::open(tmp.path(), "nusadb", None, None, config, None, None)
-            .expect("open cluster");
+        let m = DatabaseManager::open(
+            tmp.path(),
+            "nusadb",
+            None,
+            None,
+            config,
+            DurabilityOptions::default(),
+        )
+        .expect("open cluster");
         let engine = m.open("nusadb").unwrap().expect("default engine");
 
         // Load a table past the threshold (100 rows > 50 + 0.1*100 = 60) WITHOUT a manual ANALYZE.
@@ -1515,8 +1919,7 @@ mod checkpoint_tests {
                 scale: 0.0,
                 base: 0,
             },
-            None,
-            None,
+            DurabilityOptions::default(),
         )
         .unwrap();
         assert!(manager.create("shop", false).unwrap());

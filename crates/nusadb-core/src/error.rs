@@ -131,6 +131,11 @@ pub enum Error {
     /// a dependency conflict the caller resolves with `CASCADE` (SQLSTATE `2BP01`).
     #[error("dependent objects still exist: {0}")]
     DependentObjectsExist(String),
+
+    /// The engine serves a read-only copy (a standby applying a primary's log) and refuses to
+    /// commit a write or advance a sequence (SQLSTATE `25006`).
+    #[error("read-only engine: {0}")]
+    ReadOnly(String),
 }
 
 impl Error {
@@ -147,6 +152,7 @@ impl Error {
             Self::SerializationConflict { .. } => "40001",
             Self::Deadlock { .. } => "40P01",
             Self::DependentObjectsExist(_) => "2BP01",
+            Self::ReadOnly(_) => "25006",
             Self::ConstraintViolation(message) => constraint_sqlstate(message),
             _ => "XX000",
         }
