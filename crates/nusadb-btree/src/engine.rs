@@ -552,6 +552,14 @@ struct DroppedPages {
     root: nusadb_core::PageId,
 }
 
+/// What a purge pass judges settlement by, taken at one instant by `purge_snapshot`.
+#[derive(Debug)]
+struct PurgeSnapshot {
+    pinned: Vec<ReadView>,
+    active: HashSet<u64>,
+    /// The next transaction id at the snapshot: any stamp at or past it began afterwards.
+    horizon: u64,
+}
 /// A sequence: its definition and the last value handed out (`None` before the first
 /// `nextval`).
 #[derive(Debug, Clone)]
@@ -5962,21 +5970,46 @@ impl BtreeEngine {
     ///
     /// # Errors
     /// Propagates page-store I/O errors and corruption-class decode failures.
+    pub fn purge(&self) -> Result<PurgeStats> {
+        let snapshot = self.purge_snapshot()?;
+        self.purge_with(snapshot)
+    }
+
+    /// The settlement snapshot a purge pass judges by: the views pinned right now, the
+    /// transactions active right now, and the id horizon at this instant. A pass may run any
+    /// time later against it; whatever begins after the snapshot is simply unknown to it and is
+    /// never treated as settled.
+    fn purge_snapshot(&self) -> Result<PurgeSnapshot> {
+        let txns = self.txns.lock().map_err(|_| poisoned())?;
+        Ok(PurgeSnapshot {
+            pinned: txns.txns.values().map(|t| t.pinned.clone()).collect(),
+            active: txns.active.clone(),
+            horizon: txns.next_txn_id,
+        })
+    }
+
+    /// [`purge`](Self::purge) against a snapshot taken earlier by
+    /// [`purge_snapshot`](Self::purge_snapshot).
     #[allow(
         clippy::too_many_lines,
         reason = "one linear pass: batched row reclamation, then index-entry sweep, orphan-slot \
                   reclamation, and dropped-tree reclamation — splitting the phases would scatter \
                   the shared `settled` snapshot they all read"
     )]
-    pub fn purge(&self) -> Result<PurgeStats> {
+    fn purge_with(&self, snapshot: PurgeSnapshot) -> Result<PurgeStats> {
         let mut stats = PurgeStats::default();
         let cat = self.catalog.read().map_err(|_| poisoned())?;
-        let (pinned, active) = {
-            let txns = self.txns.lock().map_err(|_| poisoned())?;
-            let pinned: Vec<ReadView> = txns.txns.values().map(|t| t.pinned.clone()).collect();
-            (pinned, txns.active.clone())
-        };
-        let settled = |x: u64| !active.contains(&x) && pinned.iter().all(|v| v.sees(x));
+        let PurgeSnapshot {
+            pinned,
+            active,
+            horizon,
+        } = snapshot;
+        // A stamp is settled only when the snapshot can vouch for it: minted before the horizon
+        // (a transaction that began after the snapshot is neither in `active` nor pinned by any
+        // view it holds, and would otherwise pass vacuously while still running), not active,
+        // and seen as ended by every pinned view.
+        let settled =
+            |x: u64| x < horizon && !active.contains(&x) && pinned.iter().all(|v| v.sees(x));
 
         for (&table, t) in &cat.tables {
             let mut removed_rows: HashSet<u64> = HashSet::new();
@@ -6173,4 +6206,57 @@ pub struct PurgeStats {
     pub tables_reclaimed: usize,
     /// Pages returned to the store's free list from reclaimed trees.
     pub pages_reclaimed: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use nusadb_core::engine::{ColumnDef, TableDef};
+    use nusadb_core::{ColumnType, IsolationLevel, StorageEngine};
+
+    use super::*;
+
+    /// Purge must never settle a stamp minted after its snapshot: such a transaction is neither
+    /// in the snapshot's active set nor pinned by any view it holds, so without the id horizon it
+    /// would pass vacuously while still running, and the version a concurrent reader needs would
+    /// be freed under it (a scan then loses the row).
+    #[test]
+    fn purge_never_settles_a_stamp_minted_after_its_snapshot() {
+        let engine = BtreeEngine::new();
+        let level = IsolationLevel::ReadCommitted;
+        let setup = engine.begin(level).unwrap();
+        let table = engine
+            .create_table(
+                setup,
+                &TableDef {
+                    schema: "public".to_owned(),
+                    name: "t".to_owned(),
+                    columns: vec![ColumnDef {
+                        name: "v".to_owned(),
+                        ty: ColumnType::Bytes,
+                        nullable: false,
+                    }],
+                },
+            )
+            .unwrap();
+        let tid = engine.insert(setup, table, &[1]).unwrap();
+        engine.commit(setup).unwrap();
+        let snapshot = engine.purge_snapshot().unwrap(); // nothing running at this instant
+        let updater = engine.begin(level).unwrap(); // minted after the snapshot
+        engine.update(updater, table, tid, &[2]).unwrap(); // parks [1] in the arena
+        let reader = engine.begin(level).unwrap(); // its view still needs [1]
+        let stats = engine.purge_with(snapshot).unwrap();
+        assert_eq!(
+            stats.versions_reclaimed, 0,
+            "purge freed a version created after its snapshot"
+        );
+        engine.commit(updater).unwrap();
+        let mut scan = engine.scan(reader, table).unwrap();
+        let (_, tuple) = scan
+            .try_next()
+            .unwrap()
+            .expect("the reader's version is still there");
+        assert_eq!(tuple.as_ref(), &[1]);
+        assert!(scan.try_next().unwrap().is_none());
+        engine.commit(reader).unwrap();
+    }
 }
