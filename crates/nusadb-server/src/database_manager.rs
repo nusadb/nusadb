@@ -84,6 +84,9 @@ pub(crate) struct DatabaseManager {
     max_resident_bytes: Option<u64>,
     /// Auto-analyze policy applied to every database's background scheduler as its engine opens.
     autoanalyze: AutoAnalyzeConfig,
+    /// Runtime checkpoint policy applied to every database as its engine opens; `None` leaves the
+    /// log growing until an operator issues `CHECKPOINT` or the server restarts.
+    checkpoint: Option<CheckpointConfig>,
     state: Mutex<ManagerState>,
 }
 
@@ -105,6 +108,7 @@ impl DatabaseManager {
         max_txn_write_bytes: Option<u64>,
         max_resident_bytes: Option<u64>,
         autoanalyze: AutoAnalyzeConfig,
+        checkpoint: Option<CheckpointConfig>,
     ) -> io::Result<Self> {
         let root = data_dir.as_ref().to_path_buf();
         let default_name = default_name.into();
@@ -132,6 +136,7 @@ impl DatabaseManager {
             max_txn_write_bytes,
             max_resident_bytes,
             autoanalyze,
+            checkpoint,
             state: Mutex::new(ManagerState {
                 databases,
                 engines: HashMap::new(),
@@ -190,6 +195,10 @@ impl DatabaseManager {
         spawn_purge_scheduler(&engine, name);
         // Keep this database's planner statistics fresh in the background (no-op if disabled).
         spawn_analyze_scheduler(&engine, name, self.autoanalyze);
+        // Bound the log on a server that never restarts (no thread when disabled).
+        if let Some(policy) = self.checkpoint {
+            spawn_checkpoint_scheduler(&engine, name, policy);
+        }
         let engine: Arc<dyn StorageEngine> = engine;
         state.engines.insert(name.to_owned(), Arc::clone(&engine));
         Ok(engine)
@@ -255,6 +264,139 @@ fn spawn_purge_scheduler(engine: &Arc<BtreeEngine>, db: &str) {
         });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "purge scheduler did not start; run purge manually");
+    }
+}
+
+/// Policy for the background runtime checkpoint: fold the log into a checkpoint image once it
+/// has grown past `threshold_bytes`, checking every `interval`. It reuses the engine's own
+/// stop-the-world `checkpoint()`, which refuses while any transaction is active, so a tick that
+/// lands on a busy engine simply retries next time; the log is bounded whenever the workload
+/// leaves quiesced instants (single-writer and bursty loads do; continuously overlapping
+/// multi-connection saturation may not, and then only `CHECKPOINT` at a quiet moment helps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CheckpointConfig {
+    /// Log length that arms a checkpoint attempt.
+    pub(crate) threshold_bytes: u64,
+    /// Wait between attempts.
+    pub(crate) interval: Duration,
+}
+
+impl CheckpointConfig {
+    /// Build the policy from the two server flags; `0` on either disables it (no thread is
+    /// spawned), matching the other background workers' `0 = off` convention.
+    pub(crate) const fn from_flags(threshold_bytes: u64, interval_secs: u64) -> Option<Self> {
+        match (threshold_bytes, interval_secs) {
+            (0, _) | (_, 0) => None,
+            (threshold_bytes, secs) => Some(Self {
+                threshold_bytes,
+                interval: Duration::from_secs(secs),
+            }),
+        }
+    }
+}
+
+/// What one checkpoint tick observed and did. Separated from the thread loop so the policy is
+/// testable synchronously against a real engine.
+#[derive(Debug)]
+enum CheckpointTick {
+    /// The engine has no durable log (in-memory); nothing to bound, the scheduler can stop.
+    NoLog,
+    /// The log is still under the threshold; nothing done.
+    BelowThreshold {
+        /// Current log length.
+        len: u64,
+    },
+    /// A checkpoint ran: the log went from `before` to `after` bytes.
+    Done {
+        /// Log length before the checkpoint.
+        before: u64,
+        /// Log length after the truncation.
+        after: u64,
+    },
+    /// The engine refused because transactions were active; expected under load, retried later.
+    Busy {
+        /// Log length at the refusal.
+        len: u64,
+        /// The engine's refusal, naming the active-transaction count.
+        error: nusadb_core::Error,
+    },
+    /// The checkpoint attempt failed for another reason (disk full, permissions); logged, retried.
+    Failed {
+        /// The failure.
+        error: nusadb_core::Error,
+    },
+}
+
+/// One policy evaluation: read the log length and checkpoint if it is past `threshold_bytes`.
+/// It never invents a second durability path: the only write it can cause is the engine's own
+/// gated `checkpoint()`, whose refusal is the safe outcome.
+fn checkpoint_tick(engine: &BtreeEngine, threshold_bytes: u64) -> CheckpointTick {
+    let before = match engine.wal_len() {
+        Ok(Some(len)) => len,
+        Ok(None) => return CheckpointTick::NoLog,
+        Err(error) => return CheckpointTick::Failed { error },
+    };
+    if before < threshold_bytes {
+        return CheckpointTick::BelowThreshold { len: before };
+    }
+    match engine.checkpoint() {
+        Ok(()) => {
+            let after = engine.wal_len().ok().flatten().unwrap_or(0);
+            CheckpointTick::Done { before, after }
+        },
+        Err(error) if is_quiesce_refusal(&error) => CheckpointTick::Busy { len: before, error },
+        Err(error) => CheckpointTick::Failed { error },
+    }
+}
+
+/// The engine signals "not quiesced" as an I/O would-block error; every other error is a real
+/// failure worth an operator's attention.
+fn is_quiesce_refusal(error: &nusadb_core::Error) -> bool {
+    matches!(error, nusadb_core::Error::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
+}
+
+/// Run the runtime checkpoint policy for one btree database: a detached thread holding only a
+/// weak reference (it exits when the engine drops), sleeping `interval` between ticks.
+fn spawn_checkpoint_scheduler(engine: &Arc<BtreeEngine>, db: &str, policy: CheckpointConfig) {
+    let weak = Arc::downgrade(engine);
+    let db = db.to_owned();
+    let thread_name = format!("checkpoint-{db}");
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            loop {
+                std::thread::sleep(policy.interval);
+                let Some(engine) = weak.upgrade() else { break };
+                match checkpoint_tick(&engine, policy.threshold_bytes) {
+                    CheckpointTick::NoLog => break,
+                    CheckpointTick::BelowThreshold { len } => {
+                        tracing::trace!(db = %db, log_bytes = len, "checkpoint tick: below threshold");
+                    },
+                    CheckpointTick::Done { before, after } => {
+                        tracing::info!(
+                            db = %db,
+                            before_bytes = before,
+                            after_bytes = after,
+                            "runtime checkpoint folded the log into a fresh image"
+                        );
+                    },
+                    CheckpointTick::Busy { len, error } => {
+                        tracing::debug!(
+                            db = %db,
+                            log_bytes = len,
+                            error = %error,
+                            "checkpoint tick: engine busy, retrying next tick"
+                        );
+                    },
+                    CheckpointTick::Failed { error } => {
+                        tracing::warn!(db = %db, error = %error, "runtime checkpoint failed");
+                    },
+                }
+                drop(engine);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "checkpoint scheduler did not start; issue CHECKPOINT manually");
     }
 }
 
@@ -401,11 +543,14 @@ impl DatabaseCluster for DatabaseManager {
             };
         }
         // Refuse if another connection still holds this database's engine (its directory is about
-        // to be removed). The purge scheduler briefly upgrades its weak handle during a pass, so
-        // holders are counted through a weak handle after dropping the cache's reference: a
-        // transient purge hold drains within the grace window, while a connection's hold persists
-        // — only the latter is `InUse`. Waiting until the count reaches zero also guarantees the
-        // engine (and its open WAL handle) is fully dropped before the directory is removed.
+        // to be removed). The background workers (purge, analyze, checkpoint) briefly upgrade their
+        // weak handle during a pass, so holders are counted through a weak handle after dropping
+        // the cache's reference: a transient worker hold drains within the grace window, while a
+        // connection's hold persists, and only the latter is `InUse`. A checkpoint of a large
+        // database can outlast the window; the drop is then refused as `InUse` with the cache entry
+        // restored and nothing deleted, and a retry after the checkpoint succeeds. Waiting until
+        // the count reaches zero also guarantees the engine (and its open WAL handle) is fully
+        // dropped before the directory is removed.
         if let Some(engine) = state.engines.get(name) {
             let weak = Arc::downgrade(engine);
             state.engines.remove(name);
@@ -500,7 +645,8 @@ mod tests {
     };
 
     fn manager(dir: &Path) -> DatabaseManager {
-        DatabaseManager::open(dir, "nusadb", None, None, NO_AUTOANALYZE).expect("open cluster")
+        DatabaseManager::open(dir, "nusadb", None, None, NO_AUTOANALYZE, None)
+            .expect("open cluster")
     }
 
     #[test]
@@ -552,8 +698,9 @@ mod tests {
 
         // Bounded: the ceiling reaches the engine and rejects the oversized transaction.
         let tmp = tempfile::tempdir().unwrap();
-        let bounded = DatabaseManager::open(tmp.path(), "nusadb", Some(40), None, NO_AUTOANALYZE)
-            .expect("open cluster");
+        let bounded =
+            DatabaseManager::open(tmp.path(), "nusadb", Some(40), None, NO_AUTOANALYZE, None)
+                .expect("open cluster");
         let engine = bounded.open("nusadb").unwrap().expect("default engine");
         let setup = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let table = engine.create_table(setup, &def).unwrap();
@@ -584,7 +731,7 @@ mod tests {
 
         // Unbounded (default): the same sixth row inserts fine, confirming the flag is what bounds.
         let tmp2 = tempfile::tempdir().unwrap();
-        let free = DatabaseManager::open(tmp2.path(), "nusadb", None, None, NO_AUTOANALYZE)
+        let free = DatabaseManager::open(tmp2.path(), "nusadb", None, None, NO_AUTOANALYZE, None)
             .expect("open cluster");
         let e2 = free.open("nusadb").unwrap().expect("default engine");
         let s2 = e2.begin(IsolationLevel::ReadCommitted).unwrap();
@@ -619,8 +766,9 @@ mod tests {
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let bounded = DatabaseManager::open(tmp.path(), "nusadb", None, Some(1), NO_AUTOANALYZE)
-            .expect("open cluster");
+        let bounded =
+            DatabaseManager::open(tmp.path(), "nusadb", None, Some(1), NO_AUTOANALYZE, None)
+                .expect("open cluster");
         let engine = bounded.open("nusadb").unwrap().expect("default engine");
         let setup = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let table = engine.create_table(setup, &def).unwrap();
@@ -637,7 +785,7 @@ mod tests {
 
         // Unbounded (default): the same insert succeeds, confirming the flag is what bounds.
         let tmp2 = tempfile::tempdir().unwrap();
-        let free = DatabaseManager::open(tmp2.path(), "nusadb", None, None, NO_AUTOANALYZE)
+        let free = DatabaseManager::open(tmp2.path(), "nusadb", None, None, NO_AUTOANALYZE, None)
             .expect("open cluster");
         let e2 = free.open("nusadb").unwrap().expect("default engine");
         let s2 = e2.begin(IsolationLevel::ReadCommitted).unwrap();
@@ -898,8 +1046,8 @@ mod tests {
             scale: 0.1,
             base: 50,
         };
-        let m =
-            DatabaseManager::open(tmp.path(), "nusadb", None, None, config).expect("open cluster");
+        let m = DatabaseManager::open(tmp.path(), "nusadb", None, None, config, None)
+            .expect("open cluster");
         let engine = m.open("nusadb").unwrap().expect("default engine");
 
         // Load a table past the threshold (100 rows > 50 + 0.1*100 = 60) WITHOUT a manual ANALYZE.
@@ -929,5 +1077,150 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use nusadb_core::engine::{ColumnDef, TableDef};
+    use nusadb_core::{ColumnType, IsolationLevel};
+
+    use super::*;
+
+    const RC: IsolationLevel = IsolationLevel::ReadCommitted;
+    const THRESHOLD: u64 = 64 * 1024;
+
+    fn open_engine(dir: &tempfile::TempDir) -> (BtreeEngine, nusadb_core::TableId) {
+        let engine = BtreeEngine::open(dir.path().join("btree.wal")).unwrap();
+        let txn = engine.begin(RC).unwrap();
+        let table = engine
+            .create_table(
+                txn,
+                &TableDef {
+                    schema: "public".to_owned(),
+                    name: "t".to_owned(),
+                    columns: vec![ColumnDef {
+                        name: "v".to_owned(),
+                        ty: ColumnType::Bytes,
+                        nullable: false,
+                    }],
+                },
+            )
+            .unwrap();
+        engine.commit(txn).unwrap();
+        (engine, table)
+    }
+
+    /// Autocommit-style writes until the on-disk log is past `THRESHOLD`; returns the log length
+    /// reached and the number of rows committed.
+    fn write_past_threshold(engine: &BtreeEngine, table: nusadb_core::TableId) -> (u64, usize) {
+        let payload = vec![0xAB_u8; 1024];
+        let mut rows = 0;
+        loop {
+            let txn = engine.begin(RC).unwrap();
+            engine.insert(txn, table, &payload).unwrap();
+            engine.commit(txn).unwrap();
+            rows += 1;
+            let len = engine.wal_len().unwrap().unwrap();
+            if len >= THRESHOLD {
+                return (len, rows);
+            }
+        }
+    }
+
+    fn count_rows(engine: &BtreeEngine, table: nusadb_core::TableId) -> usize {
+        let txn = engine.begin(RC).unwrap();
+        let mut scan = engine.scan(txn, table).unwrap();
+        let mut rows = 0;
+        while scan.try_next().unwrap().is_some() {
+            rows += 1;
+        }
+        engine.commit(txn).unwrap();
+        rows
+    }
+
+    #[test]
+    fn zero_on_either_flag_disables_the_policy() {
+        assert_eq!(CheckpointConfig::from_flags(0, 5), None);
+        assert_eq!(CheckpointConfig::from_flags(1024, 0), None);
+        assert_eq!(
+            CheckpointConfig::from_flags(1024, 5),
+            Some(CheckpointConfig {
+                threshold_bytes: 1024,
+                interval: Duration::from_secs(5),
+            })
+        );
+    }
+
+    #[test]
+    fn tick_below_threshold_leaves_the_log_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = open_engine(&dir);
+        let before = engine.wal_len().unwrap().unwrap();
+        let tick = checkpoint_tick(&engine, THRESHOLD);
+        assert!(
+            matches!(tick, CheckpointTick::BelowThreshold { len } if len == before),
+            "{tick:?}"
+        );
+        assert_eq!(engine.wal_len().unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn tick_past_threshold_shrinks_the_log_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table) = open_engine(&dir);
+        let (grown, rows_written) = write_past_threshold(&engine, table);
+        let wal_path = dir.path().join("btree.wal");
+        assert!(std::fs::metadata(&wal_path).unwrap().len() >= THRESHOLD);
+
+        let tick = checkpoint_tick(&engine, THRESHOLD);
+        let CheckpointTick::Done { before, after } = tick else {
+            panic!("expected a checkpoint, got {tick:?}");
+        };
+        assert_eq!(before, grown);
+        assert!(after < before, "log did not shrink: {before} -> {after}");
+        // The file itself, not a proxy: the truncated log is what a restart would replay.
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), after);
+        assert!(after < THRESHOLD);
+        // The image now carries the rows: a reopen replays image + empty tail and sees every
+        // committed write.
+        drop(engine);
+        let reopened = BtreeEngine::open(&wal_path).unwrap();
+        assert_eq!(count_rows(&reopened, table), rows_written);
+    }
+
+    #[test]
+    fn tick_on_a_busy_engine_is_refused_and_retries_after_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table) = open_engine(&dir);
+        let _ = write_past_threshold(&engine, table);
+        let open_txn = engine.begin(RC).unwrap();
+        let len_before = engine.wal_len().unwrap().unwrap();
+
+        let tick = checkpoint_tick(&engine, THRESHOLD);
+        assert!(
+            matches!(tick, CheckpointTick::Busy { len, .. } if len == len_before),
+            "{tick:?}"
+        );
+        assert_eq!(
+            engine.wal_len().unwrap().unwrap(),
+            len_before,
+            "busy tick must not touch the log"
+        );
+
+        engine.commit(open_txn).unwrap();
+        assert!(matches!(
+            checkpoint_tick(&engine, THRESHOLD),
+            CheckpointTick::Done { .. }
+        ));
+    }
+
+    #[test]
+    fn in_memory_engine_has_no_log_to_bound() {
+        let engine = BtreeEngine::new();
+        assert!(matches!(
+            checkpoint_tick(&engine, THRESHOLD),
+            CheckpointTick::NoLog
+        ));
     }
 }

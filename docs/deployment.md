@@ -42,6 +42,8 @@ the database.
 | `--copy-max-bytes` | derived | Ceiling on one `COPY ... FROM STDIN`. Derived as about 20% of the budget, capped at 1 GiB; `0` is unbounded. |
 | `--autoanalyze-interval` | `60` | Seconds between sweeps of the background worker that re-analyzes tables whose statistics went stale. `0` disables it. |
 | `--autoanalyze-scale` / `--autoanalyze-threshold` | `0.1` / `50` | A table is re-analyzed once its writes since the last analyze exceed `threshold + scale * rows`. |
+| `--checkpoint-threshold-bytes` | `67108864` (64 MiB) | Log length past which the background checkpoint worker folds a database's log into a fresh image and truncates it. `0` disables the worker. |
+| `--checkpoint-interval` | `5` | Seconds between the checkpoint worker's checks of each database's log. `0` disables the worker. |
 | `--metrics-listen` | none | Serve Prometheus metrics on this address, for example `127.0.0.1:9100`. |
 | `--storage-engine` | `btree` | The only value. A data directory written by the removed `lsm` engine is refused with a migration hint. |
 
@@ -346,8 +348,17 @@ image file beside the log and truncates the log, so the data directory holds liv
 write history since the last checkpoint, and recovery replays only that tail. A checkpoint is taken
 automatically when a database is opened with a log past a few megabytes.
 
-While the server runs, nothing checkpoints automatically, so a long-lived server keeps appending.
-Bound the log and the restart time by issuing `CHECKPOINT` from a cron job over an otherwise idle
+While the server runs, a background worker per database checks the log every
+`--checkpoint-interval` seconds and, once it is longer than `--checkpoint-threshold-bytes`
+(64 MiB by default), takes the same checkpoint `CHECKPOINT` would. That checkpoint needs a
+moment with no transaction active, so on a busy engine the worker just tries again at the next
+interval: with a single writer or a bursty load such moments are frequent and the log stays
+bounded; under continuously overlapping transactions from many connections they can be rare, and
+the log keeps growing until one appears. Each checkpoint rewrites the whole image while the
+engine is paused, so its cost grows with the database, not with the log: on a large database
+raise the threshold so the pause is paid less often. Watch the server log at `info` for
+`runtime checkpoint folded the log` and at `debug` for the busy retries. Set either flag to `0` to
+turn the worker off and instead issue `CHECKPOINT` from a cron job over an otherwise idle
 connection:
 
 ```bash

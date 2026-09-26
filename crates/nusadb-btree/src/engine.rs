@@ -2519,6 +2519,20 @@ impl BtreeEngine {
         Ok(records)
     }
 
+    /// The current byte length of the durable log on disk: how much write history a restart
+    /// would replay, and the quantity a runtime checkpoint policy compares against its threshold.
+    /// Frames still sitting in the writer's append buffer are not counted; that is at most one
+    /// buffer behind, noise at the megabyte thresholds such a policy uses.
+    ///
+    /// `None` for the in-memory engine, which has no log.
+    pub fn wal_len(&self) -> Result<Option<u64>> {
+        let Some(wal_mutex) = &self.wal else {
+            return Ok(None);
+        };
+        let wal = wal_mutex.lock().map_err(|_| poisoned())?;
+        Ok(Some(wal.writer.get_ref().metadata()?.len()))
+    }
+
     /// Fold the whole committed state into an on-disk image and truncate the log — so the next
     /// recovery replays the image plus only the records written after it, and the data
     /// directory stops growing with write history.
@@ -2594,10 +2608,10 @@ impl BtreeEngine {
         // other copy of the data (a crash after an un-synced rename could otherwise lose both).
         std::fs::rename(&tmp, &named)?;
         #[cfg(unix)]
-        if let Some(dir) = wal.path.parent() {
-            if let Ok(dir) = File::open(dir) {
-                let _ = dir.sync_all();
-            }
+        if let Some(dir) = wal.path.parent()
+            && let Ok(dir) = File::open(dir)
+        {
+            let _ = dir.sync_all();
         }
         // Phase 3: the log prefix the image covers is gone. Drain any frames still buffered in the
         // writer (all ≤ the watermark, so recovery would discard them anyway) so the truncation

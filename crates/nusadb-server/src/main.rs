@@ -186,6 +186,19 @@ struct Args {
     /// trigger (see `--autoanalyze-scale`), so small tables are not re-analyzed on trivial churn.
     #[arg(long, default_value_t = 50)]
     autoanalyze_threshold: u64,
+
+    /// Log length (bytes) past which the background checkpoint worker folds a database's
+    /// write-ahead log into a fresh checkpoint image and truncates it, so a server that never
+    /// restarts keeps its log, and its eventual recovery time, bounded. The worker reuses the same
+    /// checkpoint as `CHECKPOINT`, which needs a moment with no transaction active: on a busy
+    /// engine it simply retries at the next interval. `0` disables the worker. Defaults to 64 MiB.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    checkpoint_threshold_bytes: u64,
+
+    /// How often (seconds) the background checkpoint worker checks each database's log against
+    /// `--checkpoint-threshold-bytes`. `0` disables the worker. Defaults to 5 seconds.
+    #[arg(long, default_value_t = 5)]
+    checkpoint_interval: u64,
 }
 
 /// `0` means "disabled / unbounded"; any other value is that many seconds.
@@ -520,6 +533,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scale: args.autoanalyze_scale,
         base: args.autoanalyze_threshold,
     };
+    // Runtime checkpoint policy: bound each database's log on a long-lived server (0 = off).
+    let checkpoint = database_manager::CheckpointConfig::from_flags(
+        args.checkpoint_threshold_bytes,
+        args.checkpoint_interval,
+    );
     // The physical multi-database cluster: each database is its own engine under `base/<db>/`,
     // bootstrapping the default database on a fresh data directory. Dead-version reclamation is
     // the per-database purge scheduler the manager wires as each engine opens.
@@ -530,6 +548,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ceilings.max_txn_write_bytes,
             ceilings.max_resident_bytes,
             autoanalyze,
+            checkpoint,
         )?);
     tracing::info!(
         data_dir = %args.data_dir,
