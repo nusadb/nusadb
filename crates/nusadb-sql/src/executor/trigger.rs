@@ -409,6 +409,40 @@ pub(super) fn delete_triggers_for_table(
     Ok(())
 }
 
+/// `ALTER TABLE … RENAME TO`: re-key every trigger of `schema.old` to `schema.new`, so the renamed
+/// table keeps firing them and the old name carries none.
+pub(super) fn rename_triggers_for_table(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? else {
+        return Ok(());
+    };
+    let mut moving = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = decode_catalog_row(&bytes)?;
+        if trigger_row_is_for(&row, schema, old) {
+            moving.push((tid, row));
+        }
+    }
+    drop(scan);
+    for (tid, mut row) in moving {
+        engine.delete(txn, cat.id, tid)?;
+        if let Some(table) = row.get_mut(1) {
+            *table = ast::Value::Text(new.to_owned());
+        }
+        // `decode_catalog_row` pads a legacy row to the current width, so every row re-encodes at
+        // the nine-column schema.
+        let bytes = row::encode(&row, &TRIGGER_CATALOG_SCHEMA)?;
+        engine.insert(txn, cat.id, &bytes)?;
+    }
+    Ok(())
+}
+
 /// Whether a trigger named `name` exists on `table`.
 fn trigger_exists(
     engine: &dyn StorageEngine,

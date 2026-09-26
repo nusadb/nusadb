@@ -516,6 +516,33 @@ fn renaming_a_table_carries_its_ownership_and_grants() {
 }
 
 #[test]
+fn renaming_a_table_carries_its_column_grants_and_dropping_it_clears_them() {
+    let engine = BtreeEngine::new();
+    root(&engine, "CREATE ROLE app LOGIN");
+    root(&engine, "CREATE ROLE reader LOGIN");
+    ok_as(&engine, "app", "CREATE TABLE t (id INT, secret INT)");
+    ok_as(&engine, "app", "INSERT INTO t VALUES (1, 42)");
+    ok_as(&engine, "app", "GRANT SELECT (id) ON t TO reader");
+    assert_eq!(rows(ok_as(&engine, "reader", "SELECT id FROM t")).len(), 1);
+    denied_as(&engine, "reader", "SELECT secret FROM t");
+
+    ok_as(&engine, "app", "ALTER TABLE t RENAME TO t2");
+    // The column grant follows the table, and stays scoped to its column.
+    assert_eq!(rows(ok_as(&engine, "reader", "SELECT id FROM t2")).len(), 1);
+    denied_as(&engine, "reader", "SELECT secret FROM t2");
+    // The vacated name carries nothing.
+    root(&engine, "CREATE TABLE t (id INT, secret INT)");
+    denied_as(&engine, "reader", "SELECT id FROM t");
+
+    // Dropping a table clears its column grants too, so a successor of the same name inherits none.
+    root(&engine, "DROP TABLE t");
+    ok_as(&engine, "app", "GRANT SELECT (id) ON t2 TO reader");
+    ok_as(&engine, "app", "DROP TABLE t2");
+    ok_as(&engine, "app", "CREATE TABLE t2 (id INT, secret INT)");
+    denied_as(&engine, "reader", "SELECT id FROM t2");
+}
+
+#[test]
 fn a_cascade_revoke_terminates_on_a_grantor_cycle() {
     let engine = fixture();
     root(&engine, "CREATE ROLE a LOGIN");

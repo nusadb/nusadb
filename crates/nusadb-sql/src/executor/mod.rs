@@ -4500,6 +4500,40 @@ pub(super) fn delete_policies_for_table(
     Ok(())
 }
 
+/// `ALTER TABLE … RENAME TO`: re-key every policy of `schema.old` to `schema.new`, so the renamed
+/// table keeps its policies and the old name carries none.
+pub(super) fn rename_policies_for_table(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, POLICY_CATALOG)? else {
+        return Ok(());
+    };
+    let mut moving = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = decode_policy_row(&bytes)?;
+        if policy_row_is_for(&row, schema, old) {
+            moving.push((tid, row));
+        }
+    }
+    drop(scan);
+    for (tid, mut row) in moving {
+        engine.delete(txn, cat.id, tid)?;
+        if let Some(table) = row.first_mut() {
+            *table = ast::Value::Text(new.to_owned());
+        }
+        // `decode_policy_row` appends the schema to a legacy row, so every row re-encodes at the
+        // current width.
+        let bytes = row::encode(&row, &POLICY_CATALOG_SCHEMA)?;
+        engine.insert(txn, cat.id, &bytes)?;
+    }
+    Ok(())
+}
+
 /// `CREATE POLICY`: persist a validated policy. A duplicate name on the same table is a
 /// (standard SQL) error, so a policy is never silently overwritten. When `p.replace` is set (an
 /// `ALTER POLICY` lowered to a row rewrite), any existing policy of the same name is dropped first.
@@ -5580,6 +5614,41 @@ pub fn lookup_enum_column(
 ) -> Result<Option<String>, Error> {
     let key = composite_column_key(schema, table, column);
     load_view_def(engine, txn, ENUM_COLUMN_CATALOG, &key)
+}
+
+/// `ALTER TABLE … RENAME TO`: re-key the enum and composite type tags of `schema.old`'s columns
+/// under `schema.new`, so its columns keep resolving their labels and fields and a later table
+/// taking the old name starts with none.
+pub(super) fn rename_column_type_tags(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), Error> {
+    let old_prefix = format!("{schema}{ENUM_LABEL_SEP}{old}{ENUM_LABEL_SEP}");
+    let new_prefix = format!("{schema}{ENUM_LABEL_SEP}{new}{ENUM_LABEL_SEP}");
+    for catalog in [ENUM_COLUMN_CATALOG, COMPOSITE_COLUMN_CATALOG] {
+        let Some(cat) = engine.lookup_table_as_of(txn, catalog)? else {
+            continue;
+        };
+        let mut moving = Vec::new();
+        let mut scan = engine.scan(txn, cat.id)?;
+        while let Some((tid, bytes)) = scan.try_next()? {
+            let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+            if let [ast::Value::Text(key), ast::Value::Text(value)] = row.as_slice()
+                && let Some(column) = key.strip_prefix(&old_prefix)
+            {
+                moving.push((tid, format!("{new_prefix}{column}"), value.clone()));
+            }
+        }
+        drop(scan);
+        for (tid, key, value) in moving {
+            engine.delete(txn, cat.id, tid)?;
+            store_view_def(engine, txn, catalog, &key, &value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove every per-column enum row for base table `(schema, table)`. Mirrors

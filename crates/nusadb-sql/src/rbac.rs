@@ -1287,22 +1287,41 @@ pub fn delete_grants_on(
     kind: ObjectKind,
     object: &str,
 ) -> Result<(), Error> {
-    let Some(cat) = engine.lookup_table_as_of(txn, PRIVILEGE_CATALOG)? else {
-        return Ok(());
-    };
-    let mut victims = Vec::new();
-    let mut scan = engine.scan(txn, cat.id)?;
-    while let Some((tid, bytes)) = scan.try_next()? {
-        let row = row::decode(&bytes, &PRIVILEGE_SCHEMA)?;
-        if matches!((row.get(1), row.get(2)),
-            (Some(ast::Value::Text(k)), Some(ast::Value::Text(o)))
-                if k == kind.as_str() && o == object)
-        {
-            victims.push(tid);
+    if let Some(cat) = engine.lookup_table_as_of(txn, PRIVILEGE_CATALOG)? {
+        let mut victims = Vec::new();
+        let mut scan = engine.scan(txn, cat.id)?;
+        while let Some((tid, bytes)) = scan.try_next()? {
+            let row = row::decode(&bytes, &PRIVILEGE_SCHEMA)?;
+            if matches!((row.get(1), row.get(2)),
+                (Some(ast::Value::Text(k)), Some(ast::Value::Text(o)))
+                    if k == kind.as_str() && o == object)
+            {
+                victims.push(tid);
+            }
+        }
+        drop(scan);
+        for tid in victims {
+            engine.delete(txn, cat.id, tid)?;
         }
     }
-    for tid in victims {
-        engine.delete(txn, cat.id, tid)?;
+    // A table's column-level grants go with its table-wide ones: left behind, a later table that
+    // reused the name would inherit them. Checked on its own so a table that only ever had
+    // column grants is cleaned too.
+    if kind == ObjectKind::Table
+        && let Some(cat) = engine.lookup_table_as_of(txn, COLUMN_PRIVILEGE_CATALOG)?
+    {
+        let mut victims = Vec::new();
+        let mut scan = engine.scan(txn, cat.id)?;
+        while let Some((tid, bytes)) = scan.try_next()? {
+            let row = row::decode(&bytes, &COLUMN_PRIVILEGE_SCHEMA)?;
+            if matches!(row.get(1), Some(ast::Value::Text(o)) if o == object) {
+                victims.push(tid);
+            }
+        }
+        drop(scan);
+        for tid in victims {
+            engine.delete(txn, cat.id, tid)?;
+        }
     }
     Ok(())
 }
@@ -1322,13 +1341,27 @@ fn rename_object_grants(
         .into_iter()
         .filter(|g| g.kind == kind && g.object == from)
         .collect();
-    if moving.is_empty() {
+    // Column-level grants key by the same `schema.table` name and move with it; only a table has
+    // them, and `delete_grants_on` removes them together with the table-wide rows.
+    let moving_columns: Vec<ColumnGrantRecord> = if kind == ObjectKind::Table {
+        all_column_grants(engine, txn)?
+            .into_iter()
+            .filter(|g| g.object == from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if moving.is_empty() && moving_columns.is_empty() {
         return Ok(());
     }
     delete_grants_on(engine, txn, kind, from)?;
     for mut record in moving {
         to.clone_into(&mut record.object);
         insert_grant(engine, txn, &record)?;
+    }
+    for mut record in moving_columns {
+        to.clone_into(&mut record.object);
+        insert_column_grant(engine, txn, &record)?;
     }
     Ok(())
 }

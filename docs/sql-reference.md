@@ -610,6 +610,15 @@ name; if a user-defined check, foreign key, index, view, trigger or policy refer
 rename is refused and the error names what is in the way. Drop that object, rename, and recreate
 it.
 
+`RENAME TO` keeps the table's schema and takes everything filed under the table's name with it:
+ownership and grants (table- and column-level), row-level security and its policies, triggers,
+column defaults (`DEFAULT`, `SERIAL`, `IDENTITY`, `GENERATED`) and the enum or composite type of
+its columns. A table later created under the old name starts with none of them. The rename is
+refused, naming the object, while a view, materialized view, function, procedure, policy predicate
+or trigger body spells the table's name, while an incrementally maintained view or a vector index
+is built on it, or while it is a partition, a partitioned parent, or part of an inheritance chain:
+those find the table by name and would stop resolving. Drop that object, rename, and recreate it.
+
 Not accepted: `ADD COLUMN ... FIRST | AFTER`, an inline `CHECK` or `REFERENCES` on `ADD COLUMN`,
 `DROP COLUMN ... CASCADE`, dropping several columns in one statement, `ADD CONSTRAINT ... NOT VALID`,
 `ALTER COLUMN ... TYPE ... USING <expr>`, `ALTER COLUMN ... ADD GENERATED AS IDENTITY`, and a

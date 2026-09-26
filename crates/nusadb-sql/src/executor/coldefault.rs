@@ -279,6 +279,26 @@ pub(super) fn delete_defaults_for_table(
     Ok(())
 }
 
+/// `ALTER TABLE … RENAME TO`: re-file every default of `old` (a catalog key) under `new`, so the
+/// renamed table keeps its `DEFAULT` / `SERIAL` / `IDENTITY` / `GENERATED` columns and a later
+/// table taking the old name starts with none.
+pub(super) fn rename_defaults_for_table(
+    old: &str,
+    new: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let defaults = load_defaults(old, engine, txn)?;
+    if defaults.is_empty() {
+        return Ok(());
+    }
+    delete_defaults_for_table(old, engine, txn)?;
+    for (column, sql) in defaults {
+        set_default(new, &column, &sql, engine, txn)?;
+    }
+    Ok(())
+}
+
 /// Load `table`'s defaults as `(column, default SQL)` pairs. The fast path (no catalog, or no default
 /// for `table`) costs a single catalog lookup.
 pub(super) fn load_defaults(

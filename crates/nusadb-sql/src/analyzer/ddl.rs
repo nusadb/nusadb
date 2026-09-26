@@ -1048,6 +1048,7 @@ fn analyze_rename_table(
         from: format!("{schema}.{current_name}"),
         schema: schema.to_owned(),
         name,
+        old: current_name.to_owned(),
     })
 }
 

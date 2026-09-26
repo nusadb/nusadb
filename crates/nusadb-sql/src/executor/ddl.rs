@@ -815,10 +815,109 @@ fn copy_like_metadata(
     Ok(())
 }
 
-/// Register one `FOREIGN KEY` on child table `child_id` (shared by CREATE TABLE and
-/// ALTER TABLE ADD CONSTRAINT). Resolves the parent table against the live catalog and declares the
-/// constraint — the engine validates the parent has a `PRIMARY KEY`. v1 references the parent's
-/// `PRIMARY KEY` only: an explicit `REFERENCES parent(cols)` that is not exactly the parent's PK, or
+/// `ALTER TABLE … RENAME TO` is refused while an object that can only find the table by re-reading
+/// its own SQL text would be left pointing at the old name — the shape `RENAME COLUMN` uses. The
+/// catalogs keyed by a structured `(schema, table)` pair are not judged here: their rows travel with
+/// the rename. What blocks is a view, materialized view, function, procedure, policy predicate or
+/// trigger body that spells the table's name, an incrementally maintained view built on it, a
+/// vector index declared on it, partition or inheritance metadata naming it, and a row-security
+/// marker recorded before namespaces were, which covers every schema's table of this name and so
+/// cannot be moved for one of them.
+fn refuse_table_rename_with_dependents(
+    schema: &str,
+    old: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let refuse = |what: &str, name: &str| {
+        Error::DependentObjects(format!(
+            "cannot rename table \"{old}\": {what} \"{name}\" refers to it by name and would stop \
+             resolving — drop it, rename the table, then declare it again"
+        ))
+    };
+    let qualified = format!("{schema}.{old}");
+    let display = crate::analyzer::qualified_display(schema, old);
+    let mentions =
+        |sql: &str| sql_mentions_column(sql, old) || sql_mentions_column(sql, &qualified);
+    if super::covered_by_unrecorded_namespace(engine, txn, old)? {
+        return Err(Error::DependentObjects(format!(
+            "cannot rename table \"{old}\": its row-security marker was recorded without a \
+             namespace and covers every schema's table of this name — disable and re-enable row \
+             level security on it first"
+        )));
+    }
+    for (catalog, what) in [
+        (VIEW_CATALOG, "view"),
+        (MATVIEW_CATALOG, "materialized view"),
+    ] {
+        for row in scan_text_catalog(engine, txn, catalog, &[2])? {
+            if let [name, def] = row.as_slice()
+                && mentions(def)
+            {
+                return Err(refuse(what, name));
+            }
+        }
+    }
+    for (catalog, what, widths) in [
+        (
+            super::function::FUNCTION_CATALOG,
+            "function",
+            &[4usize, 3][..],
+        ),
+        (super::procedure::PROCEDURE_CATALOG, "procedure", &[4][..]),
+    ] {
+        for row in scan_text_catalog(engine, txn, catalog, widths)? {
+            if let (Some(name), Some(body)) = (row.first(), row.last())
+                && mentions(body)
+            {
+                return Err(refuse(what, name));
+            }
+        }
+    }
+    // A predicate or body that spells the table's name breaks whether the policy or trigger is on
+    // this table (its row moves, its text does not) or on another.
+    for row in scan_text_catalog(engine, txn, POLICY_CATALOG, &[8, 7])? {
+        if let [_, name, _, _, using, check, ..] = row.as_slice()
+            && (mentions(using) || mentions(check))
+        {
+            return Err(refuse("policy", name));
+        }
+    }
+    for row in scan_text_catalog(engine, txn, super::trigger::TRIGGER_CATALOG, &[9, 8, 7])? {
+        if let [name, _, _, _, _, when, action, ..] = row.as_slice()
+            && (mentions(when) || mentions(action))
+        {
+            return Err(refuse("trigger", name));
+        }
+    }
+    for index in super::list_vector_indexes(engine, txn)? {
+        if index.table == old {
+            return Err(refuse("vector index", &index.name));
+        }
+    }
+    if super::ivm::has_views_for_base(engine, txn, old)? {
+        return Err(Error::DependentObjects(format!(
+            "cannot rename table \"{old}\": a materialized view is incrementally maintained from \
+             it and would stop following it — drop the view, rename the table, then declare it again"
+        )));
+    }
+    for row in scan_text_catalog(engine, txn, super::partition::PARTITION_CATALOG, &[5])? {
+        if let [role, table, aux, ..] = row.as_slice()
+            && (table == &display || (role == "part" && aux == &display))
+        {
+            return Err(refuse("partition metadata", table));
+        }
+    }
+    for row in scan_text_catalog(engine, txn, super::inheritance::INHERITANCE_CATALOG, &[3])? {
+        if let [child, parent, _] = row.as_slice()
+            && (child == &display || parent == &display)
+        {
+            return Err(refuse("inheritance link", child));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse to rename a column that something else records by name.
 ///
 /// A column name is written down in more places than the table's own schema: a constraint keeps its
@@ -1704,18 +1803,24 @@ pub(super) fn run_alter_table(
             dml::enforce_fk_on_child_write(&table, &existing, &[], engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
-        // RENAME TO: a catalog-only rename, no row rewrite.
+        // RENAME TO: a catalog-only rename, no row rewrite — but the engine's catalog is not the
+        // only one that knows the table. Every SQL-layer catalog keyed by the table's name either
+        // travels with it below or, when it can only find the table by re-reading SQL text, blocks
+        // the rename first. Nothing may stay attached to the old name: a later table created with
+        // that name would inherit it, and the renamed table would lose it.
         AlterTablePlan::RenameTable {
             table,
             name,
             from,
             schema,
+            old,
         } => {
             let to = format!("{schema}.{name}");
-            engine.alter_table(txn, table, &AlterOp::RenameTable { name })?;
-            // Carry ownership and grants to the new name. Without this the renamed table reads as
-            // unowned — which resolves to the bootstrap superuser — locking its owner out, and the
-            // stale rows under the old name would be inherited by whatever is created with it next.
+            refuse_table_rename_with_dependents(&schema, &old, engine, txn)?;
+            engine.alter_table(txn, table, &AlterOp::RenameTable { name: name.clone() })?;
+            // Ownership and grants (table- and column-level): without this the renamed table
+            // reads as unowned — which resolves to the bootstrap superuser — locking its owner
+            // out, and the stale rows would be inherited by whatever next takes the old name.
             crate::rbac::rename_owned_object(
                 engine,
                 txn,
@@ -1723,6 +1828,23 @@ pub(super) fn run_alter_table(
                 &from,
                 &to,
             )?;
+            // Row-level security: the policies and the enabled marker. Leaving them behind would
+            // fail the renamed table open (every row visible) and arm the old name.
+            super::rename_policies_for_table(engine, txn, &schema, &old, &name)?;
+            if super::rls_table_enabled(engine, txn, &schema, &old)? {
+                super::set_table_rls(engine, txn, &schema, &old, false)?;
+                super::set_table_rls(engine, txn, &schema, &name, true)?;
+            }
+            super::trigger::rename_triggers_for_table(engine, txn, &schema, &old, &name)?;
+            // Column defaults (DEFAULT / SERIAL / IDENTITY / GENERATED) and the enum and composite
+            // type tags of columns, both filed under the table's name.
+            super::coldefault::rename_defaults_for_table(
+                &super::coldefault::catalog_key(&schema, &old),
+                &super::coldefault::catalog_key(&schema, &name),
+                engine,
+                txn,
+            )?;
+            super::rename_column_type_tags(engine, txn, &schema, &old, &name)?;
             return Ok(ExecutionResult::Altered);
         },
         // DROP CONSTRAINT [IF EXISTS]. A missing constraint is a no-op only with IF EXISTS;

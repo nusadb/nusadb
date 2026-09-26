@@ -1336,6 +1336,9 @@ pub enum AlterTablePlan {
         from: String,
         /// The schema the table lives in; the rename keeps it, so the new key is `schema.name`.
         schema: String,
+        /// The table's bare name before the rename, for the catalogs keyed by `(schema, name)`
+        /// whose rows travel with the table.
+        old: String,
     },
 }
 
