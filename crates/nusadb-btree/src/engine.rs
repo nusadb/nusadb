@@ -207,6 +207,16 @@ pub struct BtreeEngine {
     /// space at the ceiling. Set once at construction via
     /// [`BtreeEngine::with_max_total_resident_bytes`].
     max_total_resident_bytes: Option<u64>,
+    /// Where each checkpoint archives the log segment it truncates and the image it publishes,
+    /// so the database can later be restored to any moment those segments cover. `None` keeps
+    /// no archive (the default).
+    wal_archive: Option<std::path::PathBuf>,
+    /// The last log position recovery accepted at open: everything durable for a plain open,
+    /// the cut point for a bounded one.
+    recovered_up_to: u64,
+    /// The time stamped on the last commit recovery accepted at open, `0` when it accepted
+    /// none past the image.
+    recovered_commit_ms: u64,
     /// DST fault point (compiled only under the `dst-fault` feature — never in production
     /// builds): when armed, the next group-leader fsync reports failure AFTER the buffer
     /// reached the file, modeling the fsyncgate shape (the kernel had the bytes, `fsync`
@@ -1099,6 +1109,33 @@ impl BtreeEngine {
         self
     }
 
+    /// The last log position recovery accepted when this engine opened: everything durable for
+    /// a plain open, the cut point for a bounded one.
+    pub const fn recovered_up_to(&self) -> u64 {
+        self.recovered_up_to
+    }
+
+    /// Number the next log record past `lsn`, whatever the log holds now. A restore uses it to
+    /// start the restored database's history past every position its archive already names.
+    fn advance_lsn_past(&self, lsn: u64) -> Result<()> {
+        let Some(wal_mutex) = &self.wal else {
+            return Ok(());
+        };
+        let mut wal = wal_mutex.lock().map_err(|_| poisoned())?;
+        wal.writer.advance_past(nusadb_core::Lsn(lsn));
+        Ok(())
+    }
+
+    /// The position of the last record written to the durable log, `None` for the in-memory
+    /// engine. A restore target given as a log position refers to these numbers.
+    pub fn wal_last_lsn(&self) -> Result<Option<u64>> {
+        let Some(wal_mutex) = &self.wal else {
+            return Ok(None);
+        };
+        let wal = wal_mutex.lock().map_err(|_| poisoned())?;
+        Ok(Some(wal.writer.next_lsn().0.saturating_sub(1)))
+    }
+
     /// Current resident footprint (bytes) the global resident-memory ceiling
     /// ([`with_max_total_resident_bytes`](Self::with_max_total_resident_bytes)) bounds: the
     /// in-memory page store **plus** the secondary/backing indexes, whose entries live in memory
@@ -1128,16 +1165,74 @@ impl BtreeEngine {
     /// # Errors
     /// Propagates file I/O errors and reports an undecodable foreign record loudly.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let engine = Self::new();
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None)
+    }
+
+    /// [`open`](Self::open) with a checkpoint archive: every checkpoint, the one recovery may
+    /// take at open included, keeps the log segment it truncates in `archive` as
+    /// `<covered lsn>.log` and links (or copies) the image it publishes there as
+    /// `<covered lsn>.ckpt`. Together the files let
+    /// [`restore_from_archive`](Self::restore_from_archive) rebuild the database as of any log
+    /// position or moment they cover. The archive must be given here, not attached later: a
+    /// checkpoint taken before it is known would truncate a segment the archive never sees.
+    pub fn open_with_archive(
+        path: impl AsRef<Path>,
+        archive: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, archive)
+    }
+
+    /// [`open`](Self::open), replaying the log only up to `target`: every record past a log
+    /// position, or every record from the first commit stamped after a moment, is left out, and
+    /// a transaction without its commit marker inside the replayed prefix counts as never
+    /// committed. The state that results is then checkpointed at once, so the directory holds
+    /// exactly that state and the later records are gone. An image already past the target is
+    /// refused; a restore then starts from an older archived image.
+    pub fn open_until(path: impl AsRef<Path>, target: RecoveryTarget) -> Result<Self> {
+        Self::open_impl(path.as_ref(), target, None)
+    }
+
+    fn open_impl(
+        path: &Path,
+        target: RecoveryTarget,
+        archive: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let mut engine = Self::new();
+        if let Some(dir) = &archive
+            && dir.is_dir()
+        {
+            settle_pending_fork(dir)?;
+        }
+        engine.wal_archive = archive;
         // A checkpoint image, when present, replaces the log prefix it covers: recovery replays
         // the image's records first, then only the log records with an LSN past the image's
         // watermark. A leftover `.ckpt.tmp` is a checkpoint that crashed before its atomic
         // rename — never named, never authoritative — and is simply removed.
         let _ = std::fs::remove_file(ckpt_tmp_path(path));
+        // A restore that crashed before or during its publish leaves its scratch files
+        // behind; nothing reads them.
+        let scratch = restore_scratch_path(path);
+        let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
+        let _ = std::fs::remove_file(ckpt_path(&scratch));
+        let _ = std::fs::remove_file(scratch);
         let (mut records, covered_lsn) = read_checkpoint_image(&ckpt_path(path))?;
+        let image_time = image_commit_time(&records);
+        if let Some(image_time) = image_time
+            && target.is_before(covered_lsn, image_time)
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "nusadb-btree: the checkpoint image at {} is already past the restore target; \
+                     restore from an older archived image",
+                    path.display()
+                ),
+            )));
+        }
         let mut last_good: u64 = 0;
         let mut last_lsn: u64 = covered_lsn;
+        let mut accepted_up_to: u64 = covered_lsn;
+        let mut accepted_commit_ms: u64 = image_time.unwrap_or(0);
         // Recovery must distinguish a torn *tail* (a crash mid-append — safe to truncate to the last
         // good record) from a *hole in the middle* of the log (bit-rot / a bad sector). Since the WAL
         // is the sole durable copy of the database (no checkpoint, volatile pages), truncating at a
@@ -1154,35 +1249,37 @@ impl BtreeEngine {
                     // Records at or before the image's watermark are already inside the image
                     // (a crash between the image rename and the log truncation leaves them
                     // behind); replaying them again would double-apply.
+                    let mut past_target = false;
                     for (lsn, record) in prefix.records {
-                        if lsn.0 > covered_lsn {
-                            records.push(record);
+                        // New records are numbered past every position the log has ever
+                        // held, replayed or not, so nothing written later can collide with a
+                        // record recovery skipped.
+                        last_lsn = last_lsn.max(lsn.0);
+                        if past_target {
+                            continue;
                         }
+                        // Positions must climb: a record at or below the last accepted one is
+                        // a copy (an archive segment overlapping its predecessor after a crash
+                        // between archiving and truncation, or a live log re-appended to a
+                        // restore), never a new write, and is replayed once.
+                        if lsn.0 <= accepted_up_to {
+                            continue;
+                        }
+                        // The records run in commit order, so the first one past the target
+                        // ends the replayed prefix; what follows is not part of the target.
+                        if target.excludes(lsn.0, &record) {
+                            past_target = true;
+                            continue;
+                        }
+                        accepted_up_to = lsn.0;
+                        if let WalRecord::CommitTxn { unix_ms, .. } = &record {
+                            accepted_commit_ms = *unix_ms;
+                        }
+                        records.push(record);
                     }
-                    last_lsn = last_lsn.max(prefix.last_lsn);
                     last_good = prefix.good_bytes;
                 },
-                Err(hole) => {
-                    let after = hole.next_valid_at.map_or_else(
-                        || {
-                            "no valid record prefix at all (an incompatible/older WAL format, or \
-                             corruption from the first byte)"
-                                .to_owned()
-                        },
-                        |at| format!("with valid records after it (next at byte {at})"),
-                    );
-                    return Err(nusadb_core::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "nusadb-btree: WAL corruption in the MIDDLE of the log at byte {} of {}, \
-                             {after} — refusing to open (truncating here would silently lose every \
-                             committed transaction past the corruption). Restore the WAL from a \
-                             backup or repair it before reopening.",
-                            hole.at,
-                            path.display()
-                        ),
-                    )));
-                },
+                Err(hole) => return Err(mid_log_hole_error(path, &hole)),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
             Err(e) => return Err(e.into()),
@@ -1204,12 +1301,22 @@ impl BtreeEngine {
         let mut writer_file = file;
         writer_file.seek(std::io::SeekFrom::End(0))?;
         let writer = WalWriter::resume(writer_file, nusadb_core::Lsn(last_lsn + 1));
-        let mut engine = engine;
+        engine.recovered_up_to = accepted_up_to;
+        engine.recovered_commit_ms = accepted_commit_ms;
         engine.wal = Some(Mutex::new(Wal {
             writer,
             sync,
             path: path.to_path_buf(),
         }));
+        // The archive must belong to this history: one that already names a position past
+        // everything this log has seen was written by another line (a database dropped and
+        // created again under the same name, or a restore that never got published), and
+        // checkpointing into it would silently land on names it already holds.
+        if let Some(dir) = &engine.wal_archive
+            && dir.is_dir()
+        {
+            refuse_foreign_archive(dir, last_lsn)?;
+        }
         // A log that has grown past the threshold is folded into a fresh checkpoint image now,
         // while the engine is provably quiesced (no transaction has begun yet): the next open
         // replays the image plus an empty suffix instead of this whole history. Best-effort by
@@ -1221,7 +1328,176 @@ impl BtreeEngine {
         {
             tracing::warn!(error = %e, "open-time auto-checkpoint failed; continuing without it");
         }
+        // A bounded replay left records past the target in the log; the checkpoint folds the
+        // recovered state into a fresh image and truncates them, so the directory now IS the
+        // target state and a later plain open cannot resurrect what was cut.
+        if !matches!(target, RecoveryTarget::Latest) {
+            engine.checkpoint_stamped(engine.seal_stamp())?;
+        }
         Ok(engine)
+    }
+
+    /// The time an image sealing the recovered state should carry: that of the last commit it
+    /// holds, so a later restore to a moment at or after that commit lands on the image itself.
+    fn seal_stamp(&self) -> u64 {
+        if self.recovered_commit_ms == 0 {
+            unix_time_ms()
+        } else {
+            self.recovered_commit_ms
+        }
+    }
+
+    /// Rebuild a database directory as of `target` from an archive written by
+    /// [`open_with_archive`](Self::open_with_archive): the newest archived image not past the
+    /// target, then every archived log segment after it (and `live_log`, the database's current
+    /// log, when the target lies past the last checkpoint), replayed up to the target and sealed
+    /// into a fresh image at `out_wal`'s directory, which must not yet hold a log or an image.
+    ///
+    /// The segments must join up: a segment whose first record lies beyond the end of the one
+    /// before it is a gap (a pruned segment, or a live log copied after a checkpoint the archive
+    /// lacks), and the restore is refused rather than replayed across it. Segments that overlap
+    /// are fine; each record is replayed once.
+    ///
+    /// The restore forks the archive's history at the target: every archived segment and image
+    /// past the cut point is moved into `superseded-<moment>/` under the archive, and the sealed
+    /// image is archived in their place, so a database served again from the restored
+    /// directory with the same archive continues one consistent line, and a later restore to a
+    /// point the cut removed is refused (its records are gone) instead of resurrected.
+    pub fn restore_from_archive(
+        archive: &Path,
+        target: RecoveryTarget,
+        out_wal: &Path,
+        live_log: Option<&Path>,
+    ) -> Result<()> {
+        let refuse =
+            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+        if out_wal.exists() || ckpt_path(out_wal).exists() {
+            return Err(refuse(format!(
+                "nusadb-btree: {} already holds a log or an image; restore into an empty database \
+                 directory",
+                out_wal.display()
+            )));
+        }
+        // The restore is built under a scratch name and renamed into place only once the
+        // archive has been forked, so a crash partway leaves a directory that opens as nothing
+        // rather than one that could be served against a half-forked archive. Whatever an
+        // earlier attempt left under that name is garbage.
+        let scratch = restore_scratch_path(out_wal);
+        let _ = std::fs::remove_file(&scratch);
+        let _ = std::fs::remove_file(ckpt_path(&scratch));
+        let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
+        // A fork an earlier restore left unfinished is settled before the archive is read.
+        settle_pending_fork(archive)?;
+        let outcome = Self::restore_into(archive, target, &scratch, out_wal, live_log);
+        if outcome.is_err() {
+            // A half-built destination would be refused by the next attempt; leave it empty,
+            // and leave the archive either forked or untouched, never in between.
+            let _ = std::fs::remove_file(&scratch);
+            let _ = std::fs::remove_file(ckpt_path(&scratch));
+            let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
+            let _ = settle_pending_fork(archive);
+        }
+        outcome
+    }
+
+    /// The body of [`restore_from_archive`](Self::restore_from_archive): build the restored
+    /// database at `scratch`, fork the archive, then publish it at `out_wal`.
+    fn restore_into(
+        archive: &Path,
+        target: RecoveryTarget,
+        scratch: &Path,
+        out_wal: &Path,
+        live_log: Option<&Path>,
+    ) -> Result<()> {
+        let refuse =
+            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+        let (images, segments) = list_archive(archive)?;
+        let forks = fork_records(archive)?;
+        let (base, target) = choose_base_image(archive, target, &images, &forks)?;
+        std::fs::copy(archive.join(format!("{base:020}.ckpt")), ckpt_path(scratch))?;
+        let chain = assemble_log(archive, target, scratch, base, &segments, live_log)?;
+        if !chain.reached {
+            // An image past where the chain ends means the history went on but the segments
+            // that carry it are gone (pruned, or lost); stopping short would restore less than
+            // the target without saying so.
+            if let Some(&past) = images.iter().rfind(|&&l| l > chain.end) {
+                return Err(refuse(format!(
+                    "nusadb-btree: the archive's history continues to at least log position \
+                     {past} but the segments after {} are missing; the target cannot be reached",
+                    chain.end
+                )));
+            }
+            match target {
+                RecoveryTarget::Latest => {},
+                RecoveryTarget::Lsn(bound) => {
+                    return Err(refuse(format!(
+                        "nusadb-btree: the history in {} ends at log position {}, before the \
+                         restore target {bound}; pass the database's current log to reach it",
+                        archive.display(),
+                        chain.end
+                    )));
+                },
+                RecoveryTarget::Time { unix_ms } => {
+                    tracing::warn!(
+                        target_unix_ms = unix_ms,
+                        reached_lsn = chain.end,
+                        "the archived history ends before the restore target; the restore holds \
+                         everything up to its end"
+                    );
+                },
+            }
+        }
+        let engine = Self::open_impl(scratch, target, None)?;
+        let cut = engine.recovered_up_to();
+        // Seal the target state into one image whose position lies past every position the
+        // archive names, so the restored database's history can never be chained onto by a
+        // file of the line it replaces, and never reuses one of their names. The image covers
+        // the position before the next record, so that position itself must lie past them.
+        let highest = images
+            .iter()
+            .chain(segments.iter())
+            .copied()
+            .fold(cut, u64::max)
+            .max(chain.live_last)
+            .max(engine.wal_last_lsn()?.unwrap_or(0));
+        let past_highest = highest.checked_add(1).ok_or_else(|| {
+            refuse("nusadb-btree: the archive's positions leave no room past them".to_owned())
+        })?;
+        engine.advance_lsn_past(past_highest)?;
+        // The image carries the time of the last commit it holds, so a restore run again to
+        // the same moment lands on this image and yields exactly this state.
+        engine.checkpoint_stamped(engine.seal_stamp())?;
+        let sealed_covers = engine.wal_last_lsn()?.unwrap_or(0);
+        drop(engine);
+        if sealed_covers <= highest {
+            return Err(refuse(format!(
+                "nusadb-btree: the sealed image covers {sealed_covers}, not past the archive's \
+                 highest position {highest}"
+            )));
+        }
+        // The fork, journaled: the marker names what a crash must finish. The sealed image is
+        // archived first, so a fork found unfinished later is completed only when the cut state
+        // it leads to exists, and is forgotten otherwise.
+        let fork = PendingFork {
+            cut,
+            sealed: sealed_covers,
+            superseded: superseded_dir_name(archive),
+        };
+        fork.write(archive)?;
+        archive_image(
+            &ckpt_path(scratch),
+            &archive.join(format!("{sealed_covers:020}.ckpt")),
+        )?;
+        sync_dir(archive)?;
+        fork.record(archive)?;
+        fork.complete(archive)?;
+        // Publish: the image first (it alone is the database), then the empty log.
+        std::fs::rename(ckpt_path(scratch), ckpt_path(out_wal))?;
+        std::fs::rename(scratch, out_wal)?;
+        if let Some(dir) = out_wal.parent() {
+            sync_dir(dir)?;
+        }
+        PendingFork::clear(archive)
     }
 
     /// DST-only (`dst-fault` feature): arm the fault point so the NEXT group-leader fsync
@@ -2398,6 +2674,7 @@ impl BtreeEngine {
         seqs: &SeqDomain,
         store: &MemPageStore,
         synthetic_txn: u64,
+        stamp: u64,
     ) -> Result<Vec<WalRecord>> {
         let mut ops: Vec<LoggedOp> = Vec::new();
         let mut sorted_ns: Vec<_> = cat.namespaces.iter().collect();
@@ -2584,7 +2861,7 @@ impl BtreeEngine {
         let mut records: Vec<WalRecord> = ops.iter().map(LoggedOp::to_record).collect();
         records.push(WalRecord::CommitTxn {
             txn: TxnId(synthetic_txn),
-            unix_ms: unix_time_ms(),
+            unix_ms: stamp,
         });
         Ok(records)
     }
@@ -2712,6 +2989,18 @@ impl BtreeEngine {
                   truncate and be silently dropped"
     )]
     pub fn checkpoint(&self) -> Result<()> {
+        self.checkpoint_stamped(unix_time_ms())
+    }
+
+    /// [`checkpoint`](Self::checkpoint) with the image's commit marker stamped `stamp` rather
+    /// than the clock: the time of the state the image holds, when that is not now.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "every guard IS the stop-the-world quiesce: all four must be held until the log \
+                  truncate completes, or a transaction could slip in between the image and the \
+                  truncate and be silently dropped"
+    )]
+    fn checkpoint_stamped(&self, stamp: u64) -> Result<()> {
         // Rank order: commit_gate -> catalog(write) -> txns -> seqs -> wal.
         let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
         let cat = self.catalog.write().map_err(|_| poisoned())?;
@@ -2739,7 +3028,7 @@ impl BtreeEngine {
         };
         let mut wal = wal_mutex.lock().map_err(|_| poisoned())?;
         let covered_lsn = wal.writer.next_lsn().0.saturating_sub(1);
-        let records = Self::emit_image_records(&cat, &seqs, &self.store, synthetic_txn)?;
+        let records = Self::emit_image_records(&cat, &seqs, &self.store, synthetic_txn, stamp)?;
         // Phase 1: complete image at the scratch path, fsynced before it may earn its name.
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
@@ -2768,8 +3057,13 @@ impl BtreeEngine {
         // Phase 3: the log prefix the image covers is gone. Drain any frames still buffered in the
         // writer (all ≤ the watermark, so recovery would discard them anyway) so the truncation
         // does not strand them, then rewind the file. The LSN counter is NOT reset, so suffix
-        // records stay past the watermark.
+        // records stay past the watermark. With an archive configured, the segment about to be
+        // truncated and the image just published are kept there first: a failure here leaves
+        // image plus full log, which the next open reads correctly, and nothing is archived twice.
         wal.writer.flush()?;
+        if let Some(dir) = &self.wal_archive {
+            archive_checkpoint(dir, &wal.path, &named, covered_lsn)?;
+        }
         let file = wal.writer.get_mut();
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
@@ -2833,6 +3127,585 @@ fn head_tuple<'a>(
     } else {
         stored.get(mvcc::META..).ok_or_else(|| corrupt_row(row_id))
     }
+}
+
+/// How far [`BtreeEngine::open_until`] replays the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryTarget {
+    /// Everything durable: the ordinary open.
+    Latest,
+    /// Every record at or before this log position.
+    Lsn(u64),
+    /// Every commit stamped at or before this moment (milliseconds since the Unix epoch), in
+    /// commit order: the first commit stamped later ends the replay, whatever its clock says
+    /// about the ones after it.
+    Time {
+        /// The moment, as milliseconds since the Unix epoch.
+        unix_ms: u64,
+    },
+}
+
+impl RecoveryTarget {
+    /// Whether an image covering `covered_lsn`, whose own commit is stamped `image_time`, is
+    /// already past this target and so cannot be the base of a replay to it.
+    const fn is_before(self, covered_lsn: u64, image_time: u64) -> bool {
+        match self {
+            Self::Latest => false,
+            Self::Lsn(lsn) => covered_lsn > lsn,
+            Self::Time { unix_ms } => image_time > unix_ms,
+        }
+    }
+
+    /// Whether `record` at `lsn` is the first record past this target, ending the replay.
+    const fn excludes(self, lsn: u64, record: &WalRecord) -> bool {
+        match self {
+            Self::Latest => false,
+            Self::Lsn(bound) => lsn > bound,
+            Self::Time { unix_ms } => {
+                matches!(record, WalRecord::CommitTxn { unix_ms: at, .. } if *at > unix_ms)
+            },
+        }
+    }
+}
+
+/// The refusal for corruption in the middle of a log: truncating there would silently lose
+/// every committed transaction past it.
+fn mid_log_hole_error(path: &Path, hole: &nusadb_wal::MidLogHole) -> Error {
+    let after = hole.next_valid_at.map_or_else(
+        || {
+            "no valid record prefix at all (an incompatible/older WAL format, or corruption \
+             from the first byte)"
+                .to_owned()
+        },
+        |at| format!("with valid records after it (next at byte {at})"),
+    );
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "nusadb-btree: WAL corruption in the MIDDLE of the log at byte {} of {}, {after} — \
+             refusing to open (truncating here would silently lose every committed transaction \
+             past the corruption). Restore the WAL from a backup or repair it before reopening.",
+            hole.at,
+            path.display()
+        ),
+    ))
+}
+
+/// The time stamped on an image's own commit marker, `None` when the records hold none.
+fn image_commit_time(records: &[WalRecord]) -> Option<u64> {
+    records.iter().find_map(|r| match r {
+        WalRecord::CommitTxn { unix_ms, .. } => Some(*unix_ms),
+        _ => None,
+    })
+}
+
+/// Keep the log segment a checkpoint is about to truncate, and the image it published, in the
+/// archive as `<covered lsn>.log` and `<covered lsn>.ckpt`. A file already there under that
+/// name is the same segment or image archived by an earlier attempt (a checkpoint that failed
+/// after archiving, or one that found nothing new to fold) and is left alone. Everything is
+/// durable before this returns, so the truncation that follows never outruns the archive.
+fn archive_checkpoint(dir: &Path, log: &Path, image: &Path, covered_lsn: u64) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let segment = dir.join(format!("{covered_lsn:020}.log"));
+    if std::fs::metadata(log)?.len() > 0 && !segment.exists() {
+        // The log is about to be truncated in place, so the segment must be a copy, never a
+        // link to it.
+        copy_file(log, &segment)?;
+    }
+    archive_image(image, &dir.join(format!("{covered_lsn:020}.ckpt")))?;
+    sync_dir(dir)
+}
+
+/// Place the published image at `to`: a hard link when the file system allows (an image is
+/// only ever replaced by rename, never rewritten, so the link stays the complete old file),
+/// otherwise a copy. An image already at `to` covers the same position, so it is the same
+/// state and stays.
+fn archive_image(image: &Path, to: &Path) -> Result<()> {
+    if to.exists() || std::fs::hard_link(image, to).is_ok() {
+        return Ok(());
+    }
+    copy_file(image, to)
+}
+
+/// Copy `from` to `to` through a scratch name, fsynced and renamed into place, so `to` is
+/// never seen half written.
+fn copy_file(from: &Path, to: &Path) -> Result<()> {
+    let scratch = to.with_extension("tmp");
+    std::fs::copy(from, &scratch)?;
+    File::open(&scratch)?.sync_all()?;
+    std::fs::rename(&scratch, to)?;
+    Ok(())
+}
+
+/// Make a directory's entries durable, where the platform lets a directory be synced.
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// The archived images and log segments in `dir`, each as its covered log position, sorted.
+fn list_archive(dir: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut images = Vec::new();
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let lsn = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<u64>().ok());
+        match (lsn, path.extension().and_then(|e| e.to_str())) {
+            (Some(lsn), Some("ckpt")) => images.push(lsn),
+            (Some(lsn), Some("log")) => segments.push(lsn),
+            // A copy that crashed before its rename; nothing reads it.
+            (Some(_), Some("tmp")) => {
+                let _ = std::fs::remove_file(&path);
+            },
+            _ => {},
+        }
+    }
+    images.sort_unstable();
+    segments.sort_unstable();
+    Ok((images, segments))
+}
+
+/// The newest archived image that is not past the target, judged by its position and, for a
+/// moment in time, by the time its own commit carries. An image that sealed a fork holds the
+/// state at the fork's cut, so for a position target it also stands for every position from
+/// that cut up to its own. An image that cannot be read is skipped with a warning rather than
+/// blocking every target behind it. Returns the image and the target to replay to: the
+/// requested one, or the image's own position when the image stands in for the cut.
+fn choose_base_image(
+    archive: &Path,
+    target: RecoveryTarget,
+    images: &[u64],
+    forks: &[ForkRecord],
+) -> Result<(u64, RecoveryTarget)> {
+    for &lsn in images.iter().rev() {
+        let image = archive.join(format!("{lsn:020}.ckpt"));
+        let seals_cut_at_or_before = |bound: u64| {
+            forks
+                .iter()
+                .any(|fork| fork.sealed == lsn && fork.cut <= bound)
+        };
+        match read_checkpoint_image(&image) {
+            Ok((records, covered)) => {
+                let time = image_commit_time(&records).unwrap_or(0);
+                // A position between the fork's cut and the sealed image is the image itself:
+                // the line holds nothing in between. Past the image, the request stands.
+                if matches!(target, RecoveryTarget::Lsn(bound)
+                    if bound < lsn && seals_cut_at_or_before(bound))
+                {
+                    return Ok((lsn, RecoveryTarget::Lsn(lsn)));
+                }
+                if !target.is_before(covered, time) {
+                    return Ok((lsn, target));
+                }
+            },
+            Err(e) => {
+                tracing::warn!(image = %image.display(), error = %e, "skipping an unreadable archived image");
+            },
+        }
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "nusadb-btree: no archived image in {} is at or before the restore target",
+            archive.display()
+        ),
+    )))
+}
+
+/// What [`assemble_log`] wrote.
+struct AssembledChain {
+    /// The chain is known to reach the target.
+    reached: bool,
+    /// The last position the chain holds.
+    end: u64,
+    /// The last position in the live log, read or not; `0` without one.
+    live_last: u64,
+}
+
+/// Write the log to replay over the base image at `out`: every archived segment after the base,
+/// in order, then the live log, each required to start no later than one past where the
+/// previous one ended, and no further than the target needs.
+fn assemble_log(
+    archive: &Path,
+    target: RecoveryTarget,
+    out: &Path,
+    base: u64,
+    segments: &[u64],
+    live_log: Option<&Path>,
+) -> Result<AssembledChain> {
+    let refuse =
+        |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    let corrupt = |source: &Path, hole: nusadb_wal::MidLogHole| {
+        let after = if hole.next_valid_at.is_some() {
+            "with records after it"
+        } else {
+            "with no valid record at all"
+        };
+        refuse(format!(
+            "nusadb-btree: {} is corrupt at byte {} {after}; the restore cannot use it",
+            source.display(),
+            hole.at
+        ))
+    };
+    let mut file = File::create(out)?;
+    let mut end = base;
+    let mut reached = false;
+    let mut live_last = 0;
+    let mut sources: Vec<std::path::PathBuf> = segments
+        .iter()
+        .filter(|&&l| l > base)
+        .map(|l| archive.join(format!("{l:020}.log")))
+        .collect();
+    if let Some(live) = live_log {
+        sources.push(live.to_path_buf());
+    }
+    for source in sources {
+        // A position target is met once the history reaches it; a moment can only be known
+        // met by reading on, so the chain must stay whole up to the record past it.
+        if let RecoveryTarget::Lsn(bound) = target
+            && end >= bound
+        {
+            break;
+        }
+        let bytes = std::fs::read(&source)?;
+        let is_live = live_log.is_some_and(|live| live == source);
+        let Some(span) = log_span(&bytes, target).map_err(|hole| corrupt(&source, hole))? else {
+            continue; // an empty segment covers nothing
+        };
+        if is_live {
+            live_last = span.last;
+        }
+        if span.first > end + 1 {
+            return Err(refuse(format!(
+                "nusadb-btree: the archive has a gap before {}: it starts at log position {} \
+                 but the history ends at {end}; the segment in between is missing",
+                source.display(),
+                span.first
+            )));
+        }
+        if span.opens_past_target {
+            reached = true;
+            break; // everything the target keeps is already in hand
+        }
+        // Only the valid prefix: a torn tail is what recovery would discard anyway, and kept
+        // in the middle of the chain it would read as a hole.
+        let good = usize::try_from(span.good_bytes).unwrap_or(bytes.len());
+        std::io::Write::write_all(&mut file, bytes.get(..good).unwrap_or(&bytes))?;
+        end = end.max(span.last);
+        if span.reaches_target {
+            reached = true;
+            break;
+        }
+    }
+    file.sync_all()?;
+    if let RecoveryTarget::Lsn(bound) = target
+        && end >= bound
+    {
+        reached = true;
+    }
+    // A live log the chain never needed still names positions the restored line must leave
+    // behind, or a stale copy of it could one day chain onto the new line.
+    if let Some(live) = live_log
+        && live_last == 0
+    {
+        let bytes = std::fs::read(live)?;
+        if let Some(span) = log_span(&bytes, target).map_err(|hole| corrupt(live, hole))? {
+            live_last = span.last;
+        }
+    }
+    Ok(AssembledChain {
+        reached,
+        end,
+        live_last,
+    })
+}
+
+/// The marker a restore writes into the archive before moving files aside, naming what a crash
+/// must finish: the cut, the sealed image that stands in for the moved files, and the
+/// directory they move into.
+struct PendingFork {
+    cut: u64,
+    sealed: u64,
+    superseded: String,
+}
+
+impl PendingFork {
+    const MARKER: &'static str = "fork.pending";
+
+    fn marker(archive: &Path) -> std::path::PathBuf {
+        archive.join(Self::MARKER)
+    }
+
+    /// Make the marker durable before any file moves.
+    fn write(&self, archive: &Path) -> Result<()> {
+        let marker = Self::marker(archive);
+        let scratch = marker.with_extension("pending.tmp");
+        let body = format!(
+            "cut={}\nsealed={}\nsuperseded={}\n",
+            self.cut, self.sealed, self.superseded
+        );
+        std::fs::write(&scratch, body)?;
+        File::open(&scratch)?.sync_all()?;
+        std::fs::rename(&scratch, &marker)?;
+        sync_dir(archive)
+    }
+
+    /// Record the fork for good in the archive's `forks` file, once its sealed image is durable
+    /// there: a record for an image that never arrived would vouch for whatever later took
+    /// that name. A record already present is not repeated.
+    fn record(&self, archive: &Path) -> Result<()> {
+        if fork_records(archive)?
+            .iter()
+            .any(|fork| fork.sealed == self.sealed && fork.cut == self.cut)
+        {
+            return Ok(());
+        }
+        let path = archive.join(FORKS_FILE);
+        // A crash mid-append can leave a torn last line; start the new record on its own line
+        // rather than on the torn one.
+        let torn = std::fs::read(&path)
+            .is_ok_and(|bytes| !bytes.is_empty() && bytes.last() != Some(&b'\n'));
+        let mut records = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let line = format!(
+            "{}cut={} sealed={}\n",
+            if torn { "\n" } else { "" },
+            self.cut,
+            self.sealed
+        );
+        std::io::Write::write_all(&mut records, line.as_bytes())?;
+        records.sync_all()?;
+        sync_dir(archive)
+    }
+
+    /// The marker left in `archive`, if any.
+    fn read(archive: &Path) -> Result<Option<Self>> {
+        let text = match std::fs::read_to_string(Self::marker(archive)) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        };
+        let parsed = (|| {
+            Some(Self {
+                cut: field("cut")?.parse().ok()?,
+                sealed: field("sealed")?.parse().ok()?,
+                superseded: field("superseded")?.to_owned(),
+            })
+        })();
+        parsed.map(Some).ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "nusadb-btree: the fork marker {} is unreadable; remove it once the archive \
+                     has been checked by hand",
+                    Self::marker(archive).display()
+                ),
+            ))
+        })
+    }
+
+    /// Move every image and segment past the cut, other than the sealed image, into the
+    /// superseded directory, made durable. Files already moved are simply absent.
+    fn complete(&self, archive: &Path) -> Result<()> {
+        let (images, segments) = list_archive(archive)?;
+        let superseded = archive.join(&self.superseded);
+        let mut moved = false;
+        for (lsn, ext) in images
+            .iter()
+            .map(|l| (*l, "ckpt"))
+            .chain(segments.iter().map(|l| (*l, "log")))
+        {
+            if lsn > self.cut && lsn != self.sealed {
+                std::fs::create_dir_all(&superseded)?;
+                let name = format!("{lsn:020}.{ext}");
+                std::fs::rename(archive.join(&name), superseded.join(&name))?;
+                moved = true;
+            }
+        }
+        if moved {
+            sync_dir(&superseded)?;
+            sync_dir(archive)?;
+        }
+        Ok(())
+    }
+
+    /// Remove the marker: the fork is done.
+    fn clear(archive: &Path) -> Result<()> {
+        match std::fs::remove_file(Self::marker(archive)) {
+            Ok(()) => sync_dir(archive),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Refuse an archive that already names a position past everything a log has seen: it was
+/// written by another line.
+fn refuse_foreign_archive(dir: &Path, last_lsn: u64) -> Result<()> {
+    let (images, segments) = list_archive(dir)?;
+    let named = images
+        .iter()
+        .chain(segments.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    if named > last_lsn {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "nusadb-btree: the archive {} already holds history to log position {named}, \
+                 past this database's {last_lsn}; it belongs to another line. Move it aside, or \
+                 restore this database from it",
+                dir.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// The archive's record of every fork: one `cut=<n> sealed=<n>` line per restore, appended
+/// before the fork's first move.
+const FORKS_FILE: &str = "forks";
+
+/// A fork recorded in the archive: the image at `sealed` holds the state as of `cut`.
+struct ForkRecord {
+    cut: u64,
+    sealed: u64,
+}
+
+/// Every fork recorded in `archive`, oldest first; a line that does not parse is skipped. Two
+/// records naming one sealed image with different cuts contradict each other and are refused.
+fn fork_records(archive: &Path) -> Result<Vec<ForkRecord>> {
+    let text = match std::fs::read_to_string(archive.join(FORKS_FILE)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let records: Vec<ForkRecord> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let cut = fields.next()?.strip_prefix("cut=")?.parse().ok()?;
+            let sealed = fields.next()?.strip_prefix("sealed=")?.parse().ok()?;
+            Some(ForkRecord { cut, sealed })
+        })
+        .collect();
+    if let Some(record) = records.iter().find(|a| {
+        records
+            .iter()
+            .any(|b| b.sealed == a.sealed && b.cut != a.cut)
+    }) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "nusadb-btree: the fork records in {} name the image at {} with more than one \
+                 cut; check the archive by hand before restoring from it",
+                archive.join(FORKS_FILE).display(),
+                record.sealed
+            ),
+        )));
+    }
+    Ok(records)
+}
+
+/// Finish or forget a fork an interrupted restore left in `archive`. With the sealed image
+/// archived, the cut state exists and the moves are completed; without it nothing was moved
+/// yet (the image is archived before the first move), so the marker is simply dropped and the
+/// archive stands as it was.
+fn settle_pending_fork(archive: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(PendingFork::marker(archive).with_extension("pending.tmp"));
+    let Some(fork) = PendingFork::read(archive)? else {
+        return Ok(());
+    };
+    if archive.join(format!("{:020}.ckpt", fork.sealed)).exists() {
+        tracing::warn!(
+            cut = fork.cut,
+            superseded = %fork.superseded,
+            "finishing a fork an interrupted restore left behind"
+        );
+        fork.record(archive)?;
+        fork.complete(archive)?;
+    } else {
+        tracing::warn!(
+            cut = fork.cut,
+            "dropping a fork an interrupted restore never started"
+        );
+    }
+    PendingFork::clear(archive)
+}
+
+/// A directory name under `archive` that no earlier fork used, for the files a restore cuts
+/// away.
+fn superseded_dir_name(archive: &Path) -> String {
+    let stamp = unix_time_ms();
+    let first = format!("superseded-{stamp}");
+    if !archive.join(&first).exists() {
+        return first;
+    }
+    (1..=u32::MAX)
+        .map(|n| format!("superseded-{stamp}-{n}"))
+        .find(|name| !archive.join(name).exists())
+        .unwrap_or(first)
+}
+
+/// Where a restore builds the database before publishing it at `out_wal`.
+fn restore_scratch_path(out_wal: &Path) -> std::path::PathBuf {
+    let mut name = out_wal.as_os_str().to_owned();
+    name.push(".restoring");
+    std::path::PathBuf::from(name)
+}
+
+/// What a log segment's valid records cover, judged against a restore target.
+struct LogSpan {
+    /// The first record's position.
+    first: u64,
+    /// The last record's position.
+    last: u64,
+    /// The bytes up to the end of the last valid record.
+    good_bytes: u64,
+    /// The segment's first decisive record (any record for a position target, the first commit
+    /// marker for a moment; commits sit in the log in commit order) already lies past the
+    /// target, so nothing in the segment is kept.
+    opens_past_target: bool,
+    /// A record in the segment lies past the target, so no later segment is needed.
+    reaches_target: bool,
+}
+
+/// The span of the valid records in a log file's bytes: `None` when it holds none, an error
+/// when corruption sits in the middle of it (a torn tail is simply left out of the span).
+fn log_span(
+    bytes: &[u8],
+    target: RecoveryTarget,
+) -> core::result::Result<Option<LogSpan>, nusadb_wal::MidLogHole> {
+    let prefix = nusadb_wal::recover_prefix(bytes)?;
+    let Some(first) = prefix.records.first().map(|(lsn, _)| lsn.0) else {
+        return Ok(None);
+    };
+    let decisive = prefix.records.iter().find(|(_, record)| {
+        matches!(target, RecoveryTarget::Lsn(_)) || matches!(record, WalRecord::CommitTxn { .. })
+    });
+    Ok(Some(LogSpan {
+        first,
+        last: prefix.last_lsn,
+        good_bytes: prefix.good_bytes,
+        opens_past_target: decisive.is_some_and(|(lsn, record)| target.excludes(lsn.0, record)),
+        reaches_target: prefix
+            .records
+            .iter()
+            .any(|(lsn, record)| target.excludes(lsn.0, record)),
+    }))
 }
 
 /// The wall clock as milliseconds since the Unix epoch, stamped on every commit marker so a log

@@ -87,6 +87,14 @@ impl<W: Write> WalWriter<W> {
         }
     }
 
+    /// Leave every position at or below `lsn` behind: the next record is numbered past it. A
+    /// position already past `lsn` stays where it is.
+    pub const fn advance_past(&mut self, lsn: Lsn) {
+        if self.next_lsn <= lsn.0 {
+            self.next_lsn = lsn.0.saturating_add(1);
+        }
+    }
+
     /// Wrap `inner`, resuming LSN assignment at `start` (e.g. after recovery).
     #[must_use]
     pub fn resume(inner: W, start: Lsn) -> Self {

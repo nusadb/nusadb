@@ -207,6 +207,134 @@ struct Args {
     /// (the worker only ever waits for a quiet instant). Defaults to 2 seconds.
     #[arg(long, default_value_t = 2)]
     checkpoint_max_pause: u64,
+
+    /// Archive every checkpoint's log segment and image under this directory, one subdirectory
+    /// per database, so a database can later be restored to any moment the archive covers
+    /// (`--restore-database`). Unset keeps no archive.
+    #[arg(long)]
+    wal_archive_dir: Option<String>,
+
+    /// Instead of serving: rebuild this database as of `--restore-to-time` or `--restore-to-lsn`
+    /// from `--wal-archive-dir` into its (empty) directory under the data directory, then exit.
+    #[arg(long, requires = "wal_archive_dir")]
+    restore_database: Option<String>,
+
+    /// The moment to restore to: RFC 3339 in UTC (`2026-09-26T10:30:00Z`, fractional seconds
+    /// allowed) or milliseconds since the Unix epoch. Every commit stamped at or before it is
+    /// kept, in commit order.
+    #[arg(long, conflicts_with = "restore_to_lsn", requires = "restore_database")]
+    restore_to_time: Option<String>,
+
+    /// The log position to restore to: every record at or before it is kept.
+    #[arg(long, requires = "restore_database")]
+    restore_to_lsn: Option<u64>,
+
+    /// The database's current log file, appended after the archived segments, so the target may
+    /// lie past the last checkpoint. Copy it from the running or stopped source first.
+    #[arg(long, requires = "restore_database")]
+    restore_live_log: Option<String>,
+}
+
+/// Rebuild `name` as of the requested target from the archive, into its empty directory.
+fn restore_database(
+    manager: &database_manager::DatabaseManager,
+    name: &str,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = match (&args.restore_to_time, args.restore_to_lsn) {
+        (Some(time), None) => nusadb_btree::RecoveryTarget::Time {
+            unix_ms: parse_target_time(time)
+                .ok_or("--restore-to-time must be RFC 3339 UTC or milliseconds since the epoch")?,
+        },
+        (None, Some(lsn)) => nusadb_btree::RecoveryTarget::Lsn(lsn),
+        (None, None) => nusadb_btree::RecoveryTarget::Latest,
+        (Some(_), Some(_)) => return Err("give one restore target, not both".into()),
+    };
+    let wal = manager
+        .registered_wal_path(name)
+        .ok_or_else(|| format!("database {name} is not registered; create it first"))?;
+    let archive = manager
+        .archive_dir(name)
+        .ok_or("--wal-archive-dir is required for a restore")?;
+    if let Some(parent) = wal.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    nusadb_btree::BtreeEngine::restore_from_archive(
+        &archive,
+        target,
+        &wal,
+        args.restore_live_log.as_deref().map(std::path::Path::new),
+    )?;
+    tracing::info!(
+        database = name,
+        archive = %archive.display(),
+        ?target,
+        "database restored from its archive; start the server to serve it"
+    );
+    Ok(())
+}
+
+/// A restore moment: milliseconds since the Unix epoch, or RFC 3339 in UTC
+/// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`). `None` for anything else.
+fn parse_target_time(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Ok(ms) = text.parse::<u64>() {
+        return Some(ms);
+    }
+    let body = text.strip_suffix('Z')?;
+    let (date, clock) = body.split_once('T')?;
+    let mut date_parts = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (year, month, day) = (
+        date_parts.next()??,
+        date_parts.next()??,
+        date_parts.next()??,
+    );
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let (clock, millis) = match clock.split_once('.') {
+        Some((c, frac)) => {
+            let digits: String = frac.chars().take(3).collect();
+            if digits.is_empty() || !frac.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let scale = 10_u64.pow(u32::try_from(3 - digits.len()).ok()?);
+            (c, digits.parse::<u64>().ok()? * scale)
+        },
+        None => (clock, 0),
+    };
+    let mut clock_parts = clock.split(':').map(|p| p.parse::<u64>().ok());
+    let (hour, minute, second) = (
+        clock_parts.next()??,
+        clock_parts.next()??,
+        clock_parts.next()??,
+    );
+    if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = u64::try_from(days).ok()? * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(secs * 1000 + millis)
 }
 
 /// `0` means "disabled / unbounded"; any other value is that many seconds.
@@ -550,15 +678,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The physical multi-database cluster: each database is its own engine under `base/<db>/`,
     // bootstrapping the default database on a fresh data directory. Dead-version reclamation is
     // the per-database purge scheduler the manager wires as each engine opens.
-    let cluster: Arc<dyn nusadb_wire::DatabaseCluster> =
-        Arc::new(database_manager::DatabaseManager::open(
-            &args.data_dir,
-            nusadb_wire::cluster::DEFAULT_DATABASE,
-            ceilings.max_txn_write_bytes,
-            ceilings.max_resident_bytes,
-            autoanalyze,
-            checkpoint,
-        )?);
+    let manager = database_manager::DatabaseManager::open(
+        &args.data_dir,
+        nusadb_wire::cluster::DEFAULT_DATABASE,
+        ceilings.max_txn_write_bytes,
+        ceilings.max_resident_bytes,
+        autoanalyze,
+        checkpoint,
+        args.wal_archive_dir.as_ref().map(std::path::PathBuf::from),
+    )?;
+    // Offline restore: rebuild one database from its archive and exit without serving.
+    if let Some(name) = &args.restore_database {
+        restore_database(&manager, name, &args)?;
+        return Ok(());
+    }
+    let cluster: Arc<dyn nusadb_wire::DatabaseCluster> = Arc::new(manager);
     tracing::info!(
         data_dir = %args.data_dir,
         storage_engine = ?args.storage_engine,
@@ -650,6 +784,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::resolve_auth_pairs;
+
+    #[test]
+    fn restore_time_parses_rfc3339_utc_and_epoch_millis() {
+        assert_eq!(super::parse_target_time("0"), Some(0));
+        assert_eq!(
+            super::parse_target_time("1700000000123"),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(super::parse_target_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            super::parse_target_time("2026-09-26T10:30:00Z"),
+            Some(1_790_418_600_000)
+        );
+        assert_eq!(
+            super::parse_target_time("2026-09-26T10:30:00.25Z"),
+            Some(1_790_418_600_250)
+        );
+        assert_eq!(
+            super::parse_target_time("2000-02-29T23:59:59Z"),
+            Some(951_868_799_000)
+        );
+        assert_eq!(super::parse_target_time("2026-09-26T10:30:00"), None);
+        assert_eq!(super::parse_target_time("2026-13-01T00:00:00Z"), None);
+        assert_eq!(super::parse_target_time("2026-02-29T00:00:00Z"), None);
+        assert!(super::parse_target_time("2024-02-29T00:00:00Z").is_some());
+        assert_eq!(super::parse_target_time("1969-12-31T23:59:59Z"), None);
+        assert_eq!(super::parse_target_time("99999-01-01T00:00:00Z"), None);
+        assert_eq!(super::parse_target_time("yesterday"), None);
+    }
 
     #[test]
     fn env_credential_is_added_to_cli_pairs() {

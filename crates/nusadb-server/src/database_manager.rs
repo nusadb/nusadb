@@ -87,6 +87,9 @@ pub(crate) struct DatabaseManager {
     /// Runtime checkpoint policy applied to every database as its engine opens; `None` leaves the
     /// log growing until an operator issues `CHECKPOINT` or the server restarts.
     checkpoint: Option<CheckpointConfig>,
+    /// Root of the write-ahead-log archive (`--wal-archive-dir`); each database archives its
+    /// checkpoints under `<root>/<database>/`. `None` keeps no archive.
+    wal_archive: Option<PathBuf>,
     state: Mutex<ManagerState>,
 }
 
@@ -109,6 +112,7 @@ impl DatabaseManager {
         max_resident_bytes: Option<u64>,
         autoanalyze: AutoAnalyzeConfig,
         checkpoint: Option<CheckpointConfig>,
+        wal_archive: Option<PathBuf>,
     ) -> io::Result<Self> {
         let root = data_dir.as_ref().to_path_buf();
         let default_name = default_name.into();
@@ -137,11 +141,42 @@ impl DatabaseManager {
             max_resident_bytes,
             autoanalyze,
             checkpoint,
+            wal_archive,
             state: Mutex::new(ManagerState {
                 databases,
                 engines: HashMap::new(),
             }),
         })
+    }
+
+    /// The WAL path of a registered database, for an offline restore into its directory; `None`
+    /// for a name the cluster does not know.
+    pub(crate) fn registered_wal_path(&self, name: &str) -> Option<PathBuf> {
+        let state = self.state.lock().ok()?;
+        state
+            .databases
+            .contains(name)
+            .then(|| self.db_wal_path(name))
+    }
+
+    /// Move the archive directory of `name`, if any, to `<name>.dropped-<moment>` beside it.
+    fn set_archive_aside(&self, name: &str) -> Result<(), ClusterError> {
+        let Some(archive) = self.archive_dir(name) else {
+            return Ok(());
+        };
+        if !archive.is_dir() {
+            return Ok(());
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let aside = archive.with_file_name(format!("{name}.dropped-{stamp}"));
+        std::fs::rename(&archive, &aside).map_err(|e| ClusterError::Io(e.to_string()))
+    }
+
+    /// The archive directory of database `name` under the configured archive root, if any.
+    pub(crate) fn archive_dir(&self, name: &str) -> Option<PathBuf> {
+        self.wal_archive.as_ref().map(|root| root.join(name))
     }
 
     /// The WAL path for database `name` (`btree.wal`): under `base/<name>/`, or at the root for
@@ -174,7 +209,9 @@ impl DatabaseManager {
         // Vacuum's btree equivalent is purge, scheduled right here ('s contract: scheduling is
         // the composition root's job).
         let engine = Arc::new(
-            BtreeEngine::open(wal)
+            // The archive goes in with the open: recovery may checkpoint before returning, and
+            // that checkpoint must archive the segment it truncates like any other.
+            BtreeEngine::open_with_archive(wal, self.archive_dir(name))
                 // Apply the per-transaction and global resident write ceilings as the engine opens;
                 // `None` leaves each unbounded (the pre-flag behavior). Both checks short-circuit
                 // before any locking when unset, so an unconfigured server pays nothing. Applying the
@@ -642,6 +679,9 @@ impl DatabaseCluster for DatabaseManager {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| ClusterError::Io(e.to_string()))?;
         }
+        // Likewise an archive a partial drop left under this name: it is another history's,
+        // and the new engine would refuse to open against it.
+        self.set_archive_aside(name)?;
         std::fs::create_dir_all(&dir).map_err(|e| ClusterError::Io(e.to_string()))?;
         state.databases.insert(name.to_owned());
         save_catalog(&self.root, &state.databases).map_err(|e| ClusterError::Io(e.to_string()))?;
@@ -701,6 +741,13 @@ impl DatabaseCluster for DatabaseManager {
         // an orphan directory (harmless — re-`CREATE` reuses it) rather than a dangling catalog entry.
         std::fs::remove_dir_all(base_dir(&self.root, name))
             .map_err(|e| ClusterError::Io(e.to_string()))?;
+        // The archive is the dropped database's history, not the name's: a database created
+        // again under this name starts its own, and an engine refuses to open against an
+        // archive of another line. Keep the old one aside for restores. The database is gone
+        // either way; a failure here is reported, and `CREATE` moves the leftover aside itself.
+        if let Err(e) = self.set_archive_aside(name) {
+            tracing::warn!(database = name, error = %e, "the dropped database's archive could not be moved aside");
+        }
         Ok(true)
     }
 
@@ -773,7 +820,7 @@ mod tests {
     };
 
     fn manager(dir: &Path) -> DatabaseManager {
-        DatabaseManager::open(dir, "nusadb", None, None, NO_AUTOANALYZE, None)
+        DatabaseManager::open(dir, "nusadb", None, None, NO_AUTOANALYZE, None, None)
             .expect("open cluster")
     }
 
@@ -826,9 +873,16 @@ mod tests {
 
         // Bounded: the ceiling reaches the engine and rejects the oversized transaction.
         let tmp = tempfile::tempdir().unwrap();
-        let bounded =
-            DatabaseManager::open(tmp.path(), "nusadb", Some(40), None, NO_AUTOANALYZE, None)
-                .expect("open cluster");
+        let bounded = DatabaseManager::open(
+            tmp.path(),
+            "nusadb",
+            Some(40),
+            None,
+            NO_AUTOANALYZE,
+            None,
+            None,
+        )
+        .expect("open cluster");
         let engine = bounded.open("nusadb").unwrap().expect("default engine");
         let setup = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let table = engine.create_table(setup, &def).unwrap();
@@ -859,8 +913,16 @@ mod tests {
 
         // Unbounded (default): the same sixth row inserts fine, confirming the flag is what bounds.
         let tmp2 = tempfile::tempdir().unwrap();
-        let free = DatabaseManager::open(tmp2.path(), "nusadb", None, None, NO_AUTOANALYZE, None)
-            .expect("open cluster");
+        let free = DatabaseManager::open(
+            tmp2.path(),
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            None,
+            None,
+        )
+        .expect("open cluster");
         let e2 = free.open("nusadb").unwrap().expect("default engine");
         let s2 = e2.begin(IsolationLevel::ReadCommitted).unwrap();
         let tbl2 = e2.create_table(s2, &def).unwrap();
@@ -894,9 +956,16 @@ mod tests {
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let bounded =
-            DatabaseManager::open(tmp.path(), "nusadb", None, Some(1), NO_AUTOANALYZE, None)
-                .expect("open cluster");
+        let bounded = DatabaseManager::open(
+            tmp.path(),
+            "nusadb",
+            None,
+            Some(1),
+            NO_AUTOANALYZE,
+            None,
+            None,
+        )
+        .expect("open cluster");
         let engine = bounded.open("nusadb").unwrap().expect("default engine");
         let setup = engine.begin(IsolationLevel::ReadCommitted).unwrap();
         let table = engine.create_table(setup, &def).unwrap();
@@ -913,8 +982,16 @@ mod tests {
 
         // Unbounded (default): the same insert succeeds, confirming the flag is what bounds.
         let tmp2 = tempfile::tempdir().unwrap();
-        let free = DatabaseManager::open(tmp2.path(), "nusadb", None, None, NO_AUTOANALYZE, None)
-            .expect("open cluster");
+        let free = DatabaseManager::open(
+            tmp2.path(),
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            None,
+            None,
+        )
+        .expect("open cluster");
         let e2 = free.open("nusadb").unwrap().expect("default engine");
         let s2 = e2.begin(IsolationLevel::ReadCommitted).unwrap();
         let tbl2 = e2.create_table(s2, &def).unwrap();
@@ -992,6 +1069,71 @@ mod tests {
             Err(ClusterError::NotFound("shop".to_owned()))
         );
         assert!(!m.drop_database("shop", true, "nusadb").unwrap());
+    }
+
+    #[test]
+    fn drop_moves_the_archive_aside_so_a_recreated_database_starts_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_root = tmp.path().join("archive");
+        let m = DatabaseManager::open(
+            tmp.path().join("data"),
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            None,
+            Some(archive_root.clone()),
+        )
+        .expect("open cluster");
+        m.create("shop", false).unwrap();
+        let engine = m.open("shop").unwrap().expect("shop engine");
+        engine.checkpoint().unwrap();
+        drop(engine);
+        assert!(archive_root.join("shop").is_dir());
+
+        assert!(m.drop_database("shop", false, "nusadb").unwrap());
+        assert!(!archive_root.join("shop").exists());
+        let aside = std::fs::read_dir(&archive_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with("shop.dropped-"))
+            .expect("the old archive was moved aside");
+        assert!(
+            std::fs::read_dir(archive_root.join(aside))
+                .unwrap()
+                .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "ckpt")),
+            "the old history's images travel with it"
+        );
+
+        // The name is free again and the new database archives into a fresh directory.
+        m.create("shop", false).unwrap();
+        let engine = m.open("shop").unwrap().expect("new shop engine");
+        engine.checkpoint().unwrap();
+        assert!(archive_root.join("shop").is_dir());
+        drop(engine);
+
+        // A drop that died after removing the storage but before moving the archive aside
+        // leaves the archive under the name; `CREATE` moves it aside itself.
+        assert!(m.drop_database("shop", false, "nusadb").unwrap());
+        let aside: Vec<String> = std::fs::read_dir(&archive_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("shop.dropped-"))
+            .collect();
+        std::fs::rename(
+            archive_root.join(aside.iter().max().unwrap()),
+            archive_root.join("shop"),
+        )
+        .unwrap();
+        m.create("shop", false).unwrap();
+        let moved: Vec<String> = std::fs::read_dir(&archive_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("shop.dropped-"))
+            .collect();
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        let engine = m.open("shop").unwrap().expect("third shop engine");
+        engine.checkpoint().unwrap();
     }
 
     /// A legacy single-database data directory written by the removed `lsm` engine (its
@@ -1174,7 +1316,7 @@ mod tests {
             scale: 0.1,
             base: 50,
         };
-        let m = DatabaseManager::open(tmp.path(), "nusadb", None, None, config, None)
+        let m = DatabaseManager::open(tmp.path(), "nusadb", None, None, config, None, None)
             .expect("open cluster");
         let engine = m.open("nusadb").unwrap().expect("default engine");
 
@@ -1373,6 +1515,7 @@ mod checkpoint_tests {
                 scale: 0.0,
                 base: 0,
             },
+            None,
             None,
         )
         .unwrap();

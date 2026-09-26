@@ -44,6 +44,8 @@ the database.
 | `--autoanalyze-scale` / `--autoanalyze-threshold` | `0.1` / `50` | A table is re-analyzed once its writes since the last analyze exceed `threshold + scale * rows`. |
 | `--checkpoint-threshold-bytes` | `67108864` (64 MiB) | Log length past which the background checkpoint worker folds a database's log into a fresh image and truncates it. `0` disables the worker. |
 | `--checkpoint-interval` | `5` | Seconds between the checkpoint worker's checks of each database's log. `0` disables the worker. |
+| `--wal-archive-dir` | none | Archive every checkpoint's log segment and image under this directory, one subdirectory per database, for point-in-time recovery. |
+| `--restore-database` / `--restore-to-time` / `--restore-to-lsn` / `--restore-live-log` | none | Offline: rebuild one database from its archive as of a moment or a log position, then exit. See [Point-in-time recovery](#point-in-time-recovery). |
 | `--checkpoint-max-pause` | `2` | Once the log is past its threshold and three checks in a row found transactions active, hold new transactions for at most this many seconds (capped at 60) so the checkpoint can run. `0` never pauses. |
 | `--metrics-listen` | none | Serve Prometheus metrics on this address, for example `127.0.0.1:9100`. |
 | `--storage-engine` | `btree` | The only value. A data directory written by the removed `lsm` engine is refused with a migration hint. |
@@ -403,8 +405,76 @@ nusadb-server --data-dir "$DATA_DIR"
 A `btree.wal` left in place would be replayed on top of the image, which is not a restore. For a
 whole-cluster copy with the server stopped, archive the `--data-dir` tree and extract it in place.
 Logical export with `COPY table TO STDOUT` and reload with `COPY table FROM STDIN` remains
-available. There is no built-in scheduled backup, point-in-time recovery to an arbitrary instant,
-or replication.
+available. There is no built-in scheduled backup or replication.
+
+### Point-in-time recovery
+
+With `--wal-archive-dir DIR`, every checkpoint keeps two files under `DIR/<database>/` before it
+truncates the log: `<lsn>.log`, the log segment it folded (every record up to log position
+`<lsn>`), and `<lsn>.ckpt`, the image it published, linked rather than copied where the file
+system allows. The archive therefore holds a base image plus an unbroken chain of segments, and
+every commit record carries the moment it committed. Prune old images and the segments before
+them once you no longer need to restore that far back; keep the newest image and everything after
+it.
+
+To restore, stop the server if the target database is live, make sure its directory holds no
+log or image (a fresh `CREATE DATABASE`, or remove `btree.wal` and `btree.wal.ckpt` from
+`base/<db>/`), and run the server in restore mode:
+
+```bash
+nusadb-server --data-dir "$DATA_DIR" --wal-archive-dir /archive \
+  --restore-database shop --restore-to-time 2026-09-26T10:30:00Z
+```
+
+The moment is RFC 3339 in UTC or milliseconds since the Unix epoch; `--restore-to-lsn N`
+restores to a log position instead, and neither restores to the newest archived point. Every
+commit at or before the target is kept, in commit order: the first commit stamped later ends the
+replay, and a transaction without its commit inside that prefix never happened. The result is
+sealed into a fresh image in the database directory; start the server normally to serve it.
+
+The archive ends at the last checkpoint. To restore to a moment after it, pass the database's
+current log as well (`--restore-live-log "$DATA_DIR/base/shop/btree.wal"`, copied from the
+source first); the tail of that file is replayed after the archived segments. Issuing
+`CHECKPOINT` before taking a copy of the archive gives it the freshest point.
+
+The segments must join up: if one in the middle was pruned, or one is corrupt in the middle,
+the restore refuses rather than replay across it, and so does a chain that ends before an
+image that proves the history went on. A target log position the archive never reaches is
+refused too; a target moment past the end of the archive succeeds with everything the archive
+holds, and the log says where the history actually ended.
+
+A restore also forks the archive at its target. The segments and images after that point
+(including the segment that spans it) move into a `superseded-<moment>/` directory under the
+archive, and the sealed image, numbered past everything the archive names, takes their place.
+Serving the restored database with the same archive then continues one consistent history, and a
+later restore into the part that was cut is refused because those records no longer exist on
+this line. Points between the last image before the cut and the cut itself are on that moved
+segment too, so they are refused after a fork; issue `CHECKPOINT` before a restore whose target
+lies far behind the last checkpoint if you may want the moments just before it later. The
+restored directory is built under a scratch name and renamed into place only after the fork,
+and the fork itself is journaled in a `fork.pending` marker that the next restore or server
+start finishes or discards, so an interrupted restore leaves nothing that could be served and
+no half-forked archive; run it again and it lands on the same state. Every fork is also
+recorded in the archive's `forks` file.
+
+An archive belongs to one history. An engine refuses to open against an archive that already
+names a position past its own log, which is what a database dropped and created again under the
+same name would meet; `DROP DATABASE` therefore moves the database's archive aside as
+`<name>.dropped-<moment>/` under the archive root (and `CREATE DATABASE` does the same with one
+a partial drop left behind). To restore a dropped database, copy that directory under a separate
+root where it is named after the database again, for example `/tmp/archive/shop/`, create the
+database, and restore into its empty directory with `--wal-archive-dir /tmp/archive`. Then keep
+serving it with that root as its archive, or move the server root's `<root>/shop/` aside before
+switching back, so the recreated database's short history never mixes with the restored one.
+
+Restore from a copy of the archive, or from one no server is writing into: a restore tidies the
+archive it reads (scratch copies, unfinished forks), which would trip a checkpoint running into
+it at the same moment. That checkpoint fails safely, leaving the image and the full log, but the
+restore should not race it.
+
+The whole chain of segments after the base image is read into memory during a restore, so keep
+images frequent enough (the checkpoint worker's threshold) that the chain between them stays a
+few hundred megabytes at most.
 
 ---
 
