@@ -104,33 +104,47 @@ on a laptop and wrong for anything reachable by others; the start-up log says so
 NusaDB defaults small and scales up explicitly: a fresh install stays healthy on a host with about
 2 GB of RAM and one or two cores, and a larger machine raises the limits on purpose.
 
-### Table data is bounded by memory
+### Table data: a page cache over the checkpoint image
 
-Table pages live in memory and are made durable through the write-ahead log; pages are not evicted
-to disk. Once a database's resident store reaches its ceiling (`--max-resident-bytes`, derived from
-the memory budget when unset), further row inserts are refused with an error that names the limit
-and the bytes resident:
+Table pages live in a page cache backed by the last checkpoint image. The image holds every
+page of the database; a page is read from it on first use, so a restart does not load the whole
+database before serving, and a page that has not changed since the last checkpoint (a clean page)
+can leave the cache again when memory is needed. A page changed since the last checkpoint (a
+dirty page) stays in memory until the next checkpoint publishes an image that holds it, because
+the write-ahead log and the image are the only durable copies of the data.
+
+`--max-resident-bytes` (derived from the memory budget when unset) bounds the cache. Clean pages are
+evicted first; once dirty pages and secondary index entries reach the bound, the next insert or
+update is refused before it starts (a write already under way always completes) with an error that
+names the limit and the bytes held:
 
 ```text
-ERROR XX000: out of memory: the in-memory store reached its resident-memory limit of
-858993440 bytes (859001088 bytes resident); free rows (DELETE/TRUNCATE), raise the limit,
-or use a larger host
+ERROR XX000: out of memory: the engine reached its resident-memory limit of 858993440 bytes
+(859001088 bytes held: pages changed since the last checkpoint plus index entries); let a
+checkpoint run, free rows (DELETE/TRUNCATE), raise the limit, or use a larger host
 ```
 
-Size against the ceiling, not against total RAM. With the default derivation the ceiling is about a
-fifth of the memory budget: measured, an 859 MB ceiling inside a 4 GB container, which held roughly
-2 to 3 million rows of about 220 bytes. A dataset larger than the ceiling does not load slowly; it
-does not load, and the first sign is the insert refusal itself, mid-load.
+Reads keep working at the bound: a page loaded for a read may briefly overshoot it and is the first
+to leave again. The remedy for a refused write is a checkpoint (the background worker runs one when
+the log passes `--checkpoint-threshold-bytes` or when changed pages fill half the cache, or issue
+`CHECKPOINT`), after which every page is clean and the cache can grow again. So the bound sizes the
+working set of changes between checkpoints, not the database: on a host with a bound well below the
+data, set the checkpoint threshold so a checkpoint runs before the changes fill the cache.
 
-Three details worth knowing:
+`DELETE`, `TRUNCATE`, `CREATE INDEX` and the background purge are not refused at the bound, so
+space can always be freed; a large `DELETE` is still capped per transaction by
+`--max-txn-write-bytes`, and the purge stops early to let a checkpoint run once changed pages
+fill half the cache.
 
-- Updates and index builds are not gated by the ceiling, so an update-heavy workload already at the
-  limit can still grow past it.
-- Deleting rows frees pages for reuse but does not lower the resident meter within a running
-  process; page memory is recycled rather than returned. A restart after a checkpoint does lower
-  it, because recovery rebuilds the store from the checkpoint image, which holds only live rows.
-- Once the ceiling has been hit, the remedies are raising it, using a larger host, or reloading the
-  live rows into a fresh data directory.
+Two things still live in memory whatever the bound:
+
+- Secondary index entries (B-tree indexes on columns, vector indexes). They are rebuilt from the
+  image's index records at open and count against the bound.
+- Every dirty page, as above. A checkpoint writes the whole image (every live page, changed or
+  not), so its cost grows with the database, not with the changes.
+
+Deleting rows frees pages for reuse and lowers the count the next image carries; page memory
+within a running process is recycled through the cache rather than returned to the OS.
 
 ### Row size
 

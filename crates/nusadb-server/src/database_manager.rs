@@ -706,7 +706,10 @@ fn checkpoint_tick(
         Ok(None) => return CheckpointTick::NoLog,
         Err(error) => return CheckpointTick::Failed { error },
     };
-    if before < threshold_bytes {
+    // Two reasons to checkpoint: the log has grown past the threshold, or the pages changed
+    // since the last checkpoint fill half the page cache (they cannot leave it until an image
+    // holds them, and writes stop when they fill it).
+    if before < threshold_bytes && !engine.page_cache_needs_checkpoint() {
         return CheckpointTick::BelowThreshold { len: before };
     }
     pause.map_or_else(

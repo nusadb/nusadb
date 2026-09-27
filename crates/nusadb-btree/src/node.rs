@@ -180,6 +180,31 @@ pub fn for_each_leaf_entry<'a>(page: &'a Page, mut f: impl FnMut(u64, &'a [u8], 
     }
 }
 
+/// Point every row header in a leaf at no older version.
+///
+/// Sets the undo link of each entry (the third field of the header every inline row and overflow
+/// stub starts with) to "none". The links are indexes into the running process's version arena,
+/// meaningless in any other process, so a page copied out of the process (a checkpoint image)
+/// carries none; the image is taken with no transaction active, so no reader needs an older
+/// version. Non-leaf pages are left as they are.
+pub fn clear_undo_links(page: &mut Page) {
+    if !is_leaf(page) {
+        return;
+    }
+    let none = crate::mvcc::NO_UNDO.to_le_bytes();
+    let mut at = LEAF_ENTRIES;
+    for _ in 0..count(page) {
+        let (len, _) = entry_len(page, at);
+        let start = at + LEAF_ENTRY_HEADER;
+        if len >= crate::mvcc::META
+            && let Some(link) = page.get_mut(start + 16..start + 24)
+        {
+            link.copy_from_slice(&none);
+        }
+        at = start + len;
+    }
+}
+
 /// The bytes stored under `key` in a leaf, borrowed from the page, and whether they are an
 /// overflow stub — `None` if absent.
 ///

@@ -57,6 +57,7 @@ const TAG_SCHEMA_DROP: u8 = 20;
 const TAG_INDEX_UNSTAMP: u8 = 21;
 const TAG_INSERT_BATCH: u8 = 22;
 const TAG_SEQ_ALTER: u8 = 23;
+const TAG_TABLE_ROOT: u8 = 24;
 
 /// One logical, replayable operation of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +320,16 @@ pub enum LoggedOp {
         /// The namespace name (for the by-name index).
         name: String,
     },
+    /// Image only: table `table`'s clustered tree is rooted at page `root` of the image's page
+    /// section, so its `CreateTable` opens that tree instead of creating an empty one.
+    TableRoot {
+        /// Table id.
+        table: u64,
+        /// Root page id in the image's page section.
+        root: u64,
+        /// The next row id the table hands out; the rows in the pages carry the earlier ones.
+        next_row_id: u64,
+    },
 }
 
 impl LoggedOp {
@@ -351,7 +362,8 @@ impl LoggedOp {
             Self::SeqCreate { .. }
             | Self::SeqDrop { .. }
             | Self::SeqSet { .. }
-            | Self::SeqAlter { .. } => 0,
+            | Self::SeqAlter { .. }
+            | Self::TableRoot { .. } => 0,
         }
     }
 
@@ -366,6 +378,7 @@ impl LoggedOp {
                 | Self::SeqDrop { .. }
                 | Self::SeqSet { .. }
                 | Self::SeqAlter { .. }
+                | Self::TableRoot { .. }
         )
     }
 
@@ -533,6 +546,15 @@ impl LoggedOp {
             },
             Self::SeqDrop { id } => {
                 push_key(&mut key, TAG_SEQ_DROP, 0, *id, None);
+            },
+            Self::TableRoot {
+                table,
+                root,
+                next_row_id,
+            } => {
+                push_key(&mut key, TAG_TABLE_ROOT, 0, *table, None);
+                value.extend_from_slice(&root.to_le_bytes());
+                value.extend_from_slice(&next_row_id.to_le_bytes());
             },
             Self::SeqSet { id, value: v } => {
                 push_key(&mut key, TAG_SEQ_SET, 0, *id, None);
@@ -736,6 +758,11 @@ impl LoggedOp {
                 def: decode_sequence_def(value)?,
             },
             TAG_SEQ_DROP => Self::SeqDrop { id: table },
+            TAG_TABLE_ROOT => Self::TableRoot {
+                table,
+                root: read_u64(value, 0)?,
+                next_row_id: read_u64(value, 8)?,
+            },
             TAG_SEQ_SET => Self::SeqSet {
                 id: table,
                 value: read_i64(value, 0)?,
@@ -1400,5 +1427,24 @@ mod index_def_codec_tests {
         );
         // And the full record round-trips identically.
         assert_eq!(decode_index_def(&full).as_ref(), Some(&def));
+    }
+}
+
+#[cfg(test)]
+mod image_record_tests {
+    use super::{LoggedOp, roundtrip_check};
+
+    /// The image-only table root record round-trips through the log record shape, and names
+    /// no transaction.
+    #[test]
+    fn table_root_round_trips() {
+        let op = LoggedOp::TableRoot {
+            table: 7,
+            root: 1234,
+            next_row_id: 98_765,
+        };
+        assert!(roundtrip_check(&op));
+        assert_eq!(op.txn(), 0);
+        assert!(op.is_non_transactional());
     }
 }

@@ -49,7 +49,7 @@ use nusadb_core::{
 use nusadb_wal::{WalRecord, WalWriter};
 
 use crate::mvcc::{self, ReadView, RowMeta, UndoVersion};
-use crate::store::MemPageStore;
+use crate::store::{PageFile, PagedStore};
 use crate::tree::ClusteredTree;
 use crate::wal::{self, LoggedOp};
 
@@ -150,7 +150,7 @@ impl std::fmt::Debug for Wal {
 /// [`ReadView`] equates "ended and present" with committed, so the order is load-bearing.
 #[derive(Debug, Default)]
 pub struct BtreeEngine {
-    store: MemPageStore,
+    store: PagedStore,
     /// Signalled whenever a transaction leaves `active` and whenever admission resumes. `begin`
     /// waits on it while admission is paused; a checkpoint that pauses admission waits on it for
     /// the active set to drain. Always used with the `txns` mutex.
@@ -196,16 +196,13 @@ pub struct BtreeEngine {
     /// cannot grow until the OS OOM-kills the whole server, taking every client down with it. Set
     /// once at construction via [`BtreeEngine::with_max_txn_write_bytes`].
     max_txn_write_bytes: Option<u64>,
-    /// Optional ceiling (bytes) on the in-memory page store's total resident footprint. `None` (the
-    /// default) imposes no limit and leaves behavior unchanged; `Some(limit)` makes a row `insert`
-    /// that would grow the store past `limit` fail loudly with [`Error::OutOfMemory`] and abort the
-    /// transaction — so a bulk load bigger than RAM (e.g. a multi-million-row COPY streamed as many
-    /// committed batches, each under the per-transaction ceiling but accumulating resident) is
-    /// rejected gracefully instead of growing until the OS OOM-kills the whole server. Unlike the
-    /// per-transaction ceiling this bounds *committed-resident* data across the whole store. Only
-    /// `insert` (the monotonic-growth path) is gated, so `DELETE`/`TRUNCATE` stay available to free
-    /// space at the ceiling. Set once at construction via
-    /// [`BtreeEngine::with_max_total_resident_bytes`].
+    /// Optional ceiling (bytes) on what the engine holds that no eviction can release: pages
+    /// changed since the last checkpoint plus secondary index entries. It also bounds the page
+    /// cache, whose clean pages are evicted to stay under it. `None` (the default) imposes no limit.
+    /// With `Some(limit)`, a row `insert` or `update` that would start with that footprint at the
+    /// limit fails with [`Error::OutOfMemory`] before touching anything; a write already under way
+    /// always completes. `DELETE`, `TRUNCATE`, index builds and purge are not refused, so space can
+    /// always be freed. Set once at construction via [`BtreeEngine::with_max_total_resident_bytes`].
     max_total_resident_bytes: Option<u64>,
     /// Where each checkpoint archives the log segment it truncates and the image it publishes,
     /// so the database can later be restored to any moment those segments cover. `None` keeps
@@ -252,6 +249,10 @@ pub struct BtreeEngine {
 /// in-flight operation.
 #[derive(Debug, Default)]
 struct Catalog {
+    /// Roots (and next row ids) a physical image declared for tables not yet created during
+    /// its replay: the `CreateTable` that follows opens the tree at that root instead of
+    /// creating an empty one, and resumes row ids past the rows the pages hold.
+    pending_roots: HashMap<u64, (u64, u64)>,
     tables: HashMap<u64, TableState>,
     by_name: HashMap<(String, String), u64>,
     next_table_id: u64,
@@ -1105,19 +1106,32 @@ impl BtreeEngine {
         self
     }
 
-    /// Set the global resident-memory ceiling (bytes) on the in-memory page store, returning the
-    /// engine. `None` (the default) means unlimited. With `Some(limit)`, a row `insert` that would
-    /// grow the store's total resident page memory past `limit` is rejected with
-    /// [`Error::OutOfMemory`] and aborts its transaction, so a bulk load larger than RAM degrades to
-    /// a loud error instead of an OS OOM-kill of the whole server. Complements
+    /// Set the resident-memory ceiling (bytes), returning the engine: it bounds the page cache
+    /// (clean pages are evicted to stay under it) and refuses a row `insert` or `update` with
+    /// [`Error::OutOfMemory`] once pages changed since the last checkpoint plus index entries
+    /// reach it. `None` (the default) means unlimited. Complements
     /// [`with_max_txn_write_bytes`](Self::with_max_txn_write_bytes): that bounds one in-flight
-    /// transaction, this bounds committed-resident data across the store. Intended to be called once,
-    /// right after [`new`](Self::new) / [`open`](Self::open), before the engine is shared — so
-    /// recovery (which does not go through `insert`) always completes unbounded.
+    /// transaction, this bounds what the whole engine holds. Intended to be called once, right after
+    /// [`new`](Self::new) / [`open`](Self::open), before the engine is shared, so recovery always
+    /// completes unbounded.
     #[must_use]
-    pub const fn with_max_total_resident_bytes(mut self, limit: Option<u64>) -> Self {
+    pub fn with_max_total_resident_bytes(mut self, limit: Option<u64>) -> Self {
         self.max_total_resident_bytes = limit;
+        self.store.set_capacity_bytes(limit);
         self
+    }
+
+    /// Bytes the engine holds that no eviction can release: dirty pages (they differ from the
+    /// last image) and every secondary index entry. The resident ceiling is enforced against
+    /// this, since clean pages leave the cache on demand.
+    fn pinned_bytes(&self) -> Result<u64> {
+        let mut total = self.store.dirty_bytes();
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        for idx in cat.indexes.values() {
+            let bytes = idx.data.read().map_err(|_| poisoned())?.bytes;
+            total = total.saturating_add(bytes);
+        }
+        Ok(total)
     }
 
     /// The last log position recovery accepted when this engine opened: everything durable for
@@ -1350,7 +1364,12 @@ impl BtreeEngine {
         let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
         let _ = std::fs::remove_file(ckpt_path(&scratch));
         let _ = std::fs::remove_file(scratch);
-        let (mut records, covered_lsn) = read_checkpoint_image(&ckpt_path(path))?;
+        let ImageContents {
+            mut records,
+            covered_lsn,
+            pages,
+        } = read_checkpoint_image(&ckpt_path(path))?;
+        engine.attach_image_pages(path, pages)?;
         let image_time = image_commit_time(&records);
         if let Some(image_time) = image_time
             && target.is_before(covered_lsn, image_time)
@@ -1471,6 +1490,22 @@ impl BtreeEngine {
             engine.checkpoint_stamped(engine.seal_stamp())?;
         }
         Ok(engine)
+    }
+
+    /// Back the store with a physical image's page section, when the image has one: replay of
+    /// its records then opens the tables at their roots, and every page loads from the image
+    /// on first use.
+    fn attach_image_pages(&self, path: &Path, pages: Option<ImagePages>) -> Result<()> {
+        if let Some(pages) = pages {
+            self.store.attach(PageFile::open(
+                &ckpt_path(path),
+                pages.offset,
+                pages.page_count,
+                pages.directory,
+                pages.checksums,
+            )?)?;
+        }
+        Ok(())
     }
 
     /// The time an image sealing the recovered state should carry: that of the last commit it
@@ -1726,12 +1761,26 @@ impl BtreeEngine {
     fn replay_op(
         cat: &mut Catalog,
         seqs: &mut SeqDomain,
-        store: &MemPageStore,
+        store: &PagedStore,
         op: &LoggedOp,
     ) -> Result<()> {
         match op {
+            LoggedOp::TableRoot {
+                table,
+                root,
+                next_row_id,
+            } => {
+                cat.pending_roots.insert(*table, (*root, *next_row_id));
+            },
             LoggedOp::CreateTable { txn: _, table, def } => {
-                let tree = ClusteredTree::create(store)?;
+                // A physical image names the table's root; its pages are already in the store.
+                let (tree, next_row_id) = match cat.pending_roots.remove(table) {
+                    Some((root, next_row_id)) => (
+                        ClusteredTree::open(store, nusadb_core::PageId(root)),
+                        next_row_id,
+                    ),
+                    None => (ClusteredTree::create(store)?, 0),
+                };
                 let schema = TableSchema {
                     id: TableId(*table),
                     schema: def.schema.clone(),
@@ -1747,7 +1796,7 @@ impl BtreeEngine {
                         root: AtomicU64::new(tree.root().0),
                         approx_rows: AtomicU64::new(TableState::APPROX_UNINIT),
                         churn_since_analyze: AtomicU64::new(0),
-                        write: Mutex::new(TableWrite::default()),
+                        write: Mutex::new(TableWrite { next_row_id }),
                         schema_version: 0,
                         schema_history: std::iter::once((0, schema)).collect(),
                     },
@@ -2124,11 +2173,13 @@ impl BtreeEngine {
             LoggedOp::SchemaCreate { id, .. } | LoggedOp::SchemaDrop { id, .. } => {
                 cat.ns_is_durable(*id)
             },
-            // The sequence family is non-transactional and always durable.
+            // The sequence family is non-transactional and always durable; the image-only
+            // records never reach the live log but are durable by definition.
             LoggedOp::SeqCreate { .. }
             | LoggedOp::SeqDrop { .. }
             | LoggedOp::SeqSet { .. }
-            | LoggedOp::SeqAlter { .. } => true,
+            | LoggedOp::SeqAlter { .. }
+            | LoggedOp::TableRoot { .. } => true,
         };
         if durable {
             self.log(&op.to_record())?;
@@ -2653,8 +2704,9 @@ fn txn_memory_exceeded(limit: u64, attempted: u64) -> Error {
 /// OOM-kills the server. `DELETE`/`TRUNCATE` stay available to free space.
 fn resident_memory_exceeded(limit: u64, resident: u64) -> Error {
     Error::OutOfMemory(format!(
-        "the in-memory store reached its resident-memory limit of {limit} bytes ({resident} bytes \
-         resident); free rows (DELETE/TRUNCATE), raise the limit, or use a larger host"
+        "the engine reached its resident-memory limit of {limit} bytes ({resident} bytes held: \
+         pages changed since the last checkpoint plus index entries); let a checkpoint run, free \
+         rows (DELETE/TRUNCATE), raise the limit, or use a larger host"
     ))
 }
 
@@ -2679,25 +2731,54 @@ const AUTO_CHECKPOINT_ON_OPEN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Checkpoint image header magic.
 const CKPT_MAGIC: &[u8; 4] = b"NCKP";
-/// Checkpoint image format version.
-const CKPT_VERSION: u32 = 1;
-/// The checksummed part of the header: magic (4) + version (4) + covered-LSN watermark (8).
+/// The logical image format: replayable records only, rows included (still readable).
+const CKPT_VERSION_LOGICAL: u32 = 1;
+/// The physical image format written today: header, then every page of the store, then the
+/// logical records (catalog, table roots, free list, index entries, constraints, statistics,
+/// sequences) that replay on top of those pages.
+const CKPT_VERSION: u32 = 2;
+/// The checksummed part of a v1 header: magic (4) + version (4) + covered-LSN watermark (8).
 const CKPT_HEADER_CHECKSUMMED_LEN: usize = 16;
-/// Full header length: the checksummed prefix plus its CRC32 (4).
+/// Full v1 header length: the checksummed prefix plus its CRC32 (4).
 const CKPT_HEADER_LEN: usize = CKPT_HEADER_CHECKSUMMED_LEN + 4;
+/// The checksummed part of a v2 header: the v1 fields plus the page id space (8) and the
+/// number of live pages the image holds (8).
+const CKPT_V2_HEADER_CHECKSUMMED_LEN: usize = 32;
+/// Full v2 header length.
+const CKPT_V2_HEADER_LEN: usize = CKPT_V2_HEADER_CHECKSUMMED_LEN + 4;
 
 /// The 20-byte checkpoint header: `NCKP` + version + covered-LSN + CRC32(of the first 16). The
 /// CRC covers `covered_lsn` specifically — a single flipped bit there would otherwise silently
 /// change which committed log records recovery skips, with no error, exactly the silent-data-loss
 /// the log's own header CRC was added to prevent.
-fn ckpt_header_bytes(covered_lsn: u64) -> [u8; CKPT_HEADER_LEN] {
-    let mut header = [0u8; CKPT_HEADER_LEN];
+fn ckpt_header_bytes(covered_lsn: u64, page_count: u64, live: u64) -> [u8; CKPT_V2_HEADER_LEN] {
+    let mut header = [0u8; CKPT_V2_HEADER_LEN];
     header[0..4].copy_from_slice(CKPT_MAGIC);
     header[4..8].copy_from_slice(&CKPT_VERSION.to_le_bytes());
     header[8..16].copy_from_slice(&covered_lsn.to_le_bytes());
-    let crc = crc32fast::hash(&header[0..CKPT_HEADER_CHECKSUMMED_LEN]);
-    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    header[16..24].copy_from_slice(&page_count.to_le_bytes());
+    header[24..32].copy_from_slice(&live.to_le_bytes());
+    let crc = crc32fast::hash(&header[0..CKPT_V2_HEADER_CHECKSUMMED_LEN]);
+    header[32..36].copy_from_slice(&crc.to_le_bytes());
     header
+}
+
+/// Where a physical image's pages lie: the page id space, the ids it holds (ascending), and
+/// the offset of the first page.
+struct ImagePages {
+    page_count: u64,
+    directory: Vec<u64>,
+    checksums: Vec<u32>,
+    offset: u64,
+}
+
+/// What a checkpoint image holds: its logical records, the log position it covers, and for a
+/// physical image where its page section lies.
+struct ImageContents {
+    records: Vec<WalRecord>,
+    covered_lsn: u64,
+    /// The page section; `None` for a logical image.
+    pages: Option<ImagePages>,
 }
 
 /// The image path beside the log: `<wal>.ckpt`.
@@ -2722,10 +2803,17 @@ fn ckpt_tmp_path(wal: &Path) -> std::path::PathBuf {
 /// validation failure here is bit-rot or tampering — and by the time an image exists the log
 /// prefix it covers is gone, so falling back to the log would silently lose everything the
 /// image holds. Refuse loudly instead, the same stance recovery takes on a mid-log hole.
-fn read_checkpoint_image(path: &Path) -> Result<(Vec<WalRecord>, u64)> {
-    let buf = match std::fs::read(path) {
-        Ok(buf) => buf,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ImageContents {
+                records: Vec::new(),
+                covered_lsn: 0,
+                pages: None,
+            });
+        },
         Err(e) => return Err(e.into()),
     };
     let corrupt = |what: &str| {
@@ -2740,55 +2828,121 @@ fn read_checkpoint_image(path: &Path) -> Result<(Vec<WalRecord>, u64)> {
             ),
         ))
     };
-    let Some((header, body)) = buf.split_at_checked(CKPT_HEADER_LEN) else {
-        return Err(corrupt("truncated header"));
-    };
-    let (checksummed, crc_bytes) = header.split_at(CKPT_HEADER_CHECKSUMMED_LEN);
-    // Validate the header CRC before trusting any field it protects — above all `covered_lsn`,
-    // which decides which committed records recovery skips. Full-array destructuring keeps this
-    // panic-free (no range index into a slice).
-    let checksummed = <[u8; CKPT_HEADER_CHECKSUMMED_LEN]>::try_from(checksummed)
-        .map_err(|_| corrupt("short header"))?;
-    let stored_crc = u32::from_le_bytes(<[u8; 4]>::try_from(crc_bytes).unwrap_or([0; 4]));
-    if crc32fast::hash(&checksummed) != stored_crc {
-        return Err(corrupt("header checksum mismatch"));
-    }
-    let [
-        m0,
-        m1,
-        m2,
-        m3,
-        v0,
-        v1,
-        v2,
-        v3,
-        l0,
-        l1,
-        l2,
-        l3,
-        l4,
-        l5,
-        l6,
-        l7,
-    ] = checksummed;
-    if [m0, m1, m2, m3] != *CKPT_MAGIC {
+    let len = file.metadata()?.len();
+    let mut prefix = [0u8; 8];
+    if file.read_exact(&mut prefix).is_err() || prefix[0..4] != *CKPT_MAGIC {
         return Err(corrupt("bad magic"));
     }
-    let version = u32::from_le_bytes([v0, v1, v2, v3]);
-    if version != CKPT_VERSION {
-        return Err(corrupt("unsupported format version"));
+    let version = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+    let (checksummed_len, header_len) = match version {
+        CKPT_VERSION_LOGICAL => (CKPT_HEADER_CHECKSUMMED_LEN, CKPT_HEADER_LEN),
+        CKPT_VERSION => (CKPT_V2_HEADER_CHECKSUMMED_LEN, CKPT_V2_HEADER_LEN),
+        _ => return Err(corrupt("unsupported format version")),
+    };
+    let mut header = vec![0u8; header_len];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)
+        .map_err(|_| corrupt("truncated header"))?;
+    let (checksummed, crc_bytes) = header.split_at(checksummed_len);
+    // Validate the header CRC before trusting any field it protects — above all `covered_lsn`,
+    // which decides which committed log records recovery skips.
+    let stored = u32::from_le_bytes(crc_bytes.try_into().map_err(|_| corrupt("short header"))?);
+    if crc32fast::hash(checksummed) != stored {
+        return Err(corrupt("header checksum mismatch"));
     }
-    let covered_lsn = u64::from_le_bytes([l0, l1, l2, l3, l4, l5, l6, l7]);
-    let prefix = nusadb_wal::recover_prefix(body).map_err(|_| corrupt("corrupt record body"))?;
+    let field = |at: usize| {
+        checksummed
+            .get(at..at + 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let covered_lsn = field(8).ok_or_else(|| corrupt("short header"))?;
+    let pages = if version == CKPT_VERSION {
+        let page_count = field(16).ok_or_else(|| corrupt("short header"))?;
+        let live = field(24).ok_or_else(|| corrupt("short header"))?;
+        Some(read_page_section(
+            &mut file,
+            len,
+            header_len as u64,
+            page_count,
+            live,
+            &corrupt,
+        )?)
+    } else {
+        None
+    };
+    let mut body = Vec::new();
+    file.read_to_end(&mut body)?;
+    let prefix = nusadb_wal::recover_prefix(&body).map_err(|_| corrupt("corrupt record body"))?;
     // A torn tail is a valid state for a crash-interrupted LOG; an image was fsynced complete
     // before it got its name, so trailing garbage is corruption, not a crash artifact.
     if prefix.good_bytes != body.len() as u64 {
         return Err(corrupt("trailing bytes after the last valid record"));
     }
-    Ok((
-        prefix.records.into_iter().map(|(_, r)| r).collect(),
+    Ok(ImageContents {
+        records: prefix.records.into_iter().map(|(_, r)| r).collect(),
         covered_lsn,
-    ))
+        pages,
+    })
+}
+
+/// Read a physical image's directory and page checksum table, checking both, and leave `file`
+/// positioned at the logical records that follow. The pages themselves are not read.
+fn read_page_section(
+    file: &mut File,
+    len: u64,
+    header_len: u64,
+    page_count: u64,
+    live: u64,
+    corrupt: &dyn Fn(&str) -> Error,
+) -> Result<ImagePages> {
+    use std::io::{Read, Seek, SeekFrom};
+    let dir_bytes = live
+        .checked_mul(8)
+        .filter(|&b| b <= len)
+        .ok_or_else(|| corrupt("page directory larger than the image"))?;
+    let mut raw = vec![0u8; usize::try_from(dir_bytes).map_err(|_| corrupt("page directory"))?];
+    file.read_exact(&mut raw)
+        .map_err(|_| corrupt("truncated page directory"))?;
+    let directory: Vec<u64> = raw
+        .chunks_exact(8)
+        .filter_map(|c| c.try_into().ok().map(u64::from_le_bytes))
+        .collect();
+    if !directory.is_sorted_by(|a, b| a < b) || directory.last().is_some_and(|&id| id >= page_count)
+    {
+        return Err(corrupt("page directory out of order or out of range"));
+    }
+    let offset = header_len + dir_bytes;
+    let page_bytes = live
+        .checked_mul(nusadb_core::PAGE_SIZE as u64)
+        .and_then(|b| b.checked_add(offset))
+        .filter(|&end| end <= len)
+        .ok_or_else(|| corrupt("truncated page section"))?;
+    file.seek(SeekFrom::Start(page_bytes))?;
+    // After the pages: a CRC32 per page, then one CRC32 over the directory and that table.
+    let table_bytes =
+        usize::try_from(live.saturating_mul(4)).map_err(|_| corrupt("page checksum table"))?;
+    let mut table = vec![0u8; table_bytes + 4];
+    file.read_exact(&mut table)
+        .map_err(|_| corrupt("truncated page checksum table"))?;
+    let (table, stored) = table.split_at(table_bytes);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&raw);
+    hasher.update(table);
+    let stored = u32::from_le_bytes(stored.try_into().map_err(|_| corrupt("page checksum"))?);
+    if hasher.finalize() != stored {
+        return Err(corrupt("page directory checksum mismatch"));
+    }
+    let checksums: Vec<u32> = table
+        .chunks_exact(4)
+        .filter_map(|c| c.try_into().ok().map(u32::from_le_bytes))
+        .collect();
+    Ok(ImagePages {
+        page_count,
+        directory,
+        checksums,
+        offset,
+    })
 }
 
 impl BtreeEngine {
@@ -2817,12 +2971,13 @@ impl BtreeEngine {
     fn emit_image(
         cat: &Catalog,
         seqs: &SeqDomain,
-        store: &MemPageStore,
         synthetic_txn: u64,
         stamp: u64,
         sink: &mut dyn FnMut(&WalRecord) -> Result<()>,
     ) -> Result<()> {
         let mut emit = |op: LoggedOp| sink(&op.to_record());
+        // The pages themselves precede these records in the image; the records say which page
+        // roots each table, so nothing is re-inserted at open.
         let mut sorted_ns: Vec<_> = cat.namespaces.iter().collect();
         sorted_ns.sort_by_key(|(id, _)| **id);
         for (id, name) in sorted_ns {
@@ -2863,6 +3018,11 @@ impl BtreeEngine {
                 name: schema.name.clone(),
                 columns: schema.columns.clone(),
             };
+            emit(LoggedOp::TableRoot {
+                table: **id,
+                root: t.root_id().0,
+                next_row_id: t.write.lock().map_err(|_| poisoned())?.next_row_id,
+            })?;
             emit(LoggedOp::CreateTable {
                 txn: synthetic_txn,
                 table: **id,
@@ -2876,27 +3036,6 @@ impl BtreeEngine {
                     def: def_of(schema),
                 })?;
             }
-        }
-        for (id, t) in &sorted_tables {
-            let tree = ClusteredTree::open(store, t.root_id());
-            // Streamed row by row: the image of a large table never sits in memory whole.
-            tree.scan_with(|row_id, value| {
-                let Some((meta, tuple)) = mvcc::decode_row(value) else {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("nusadb-btree: undecodable row {row_id} in table {id}"),
-                    )));
-                };
-                if meta.xmax != mvcc::NO_XMAX {
-                    return Ok(()); // committed-dead: a settled delete no future view can see
-                }
-                emit(LoggedOp::Insert {
-                    txn: synthetic_txn,
-                    table: **id,
-                    row_id,
-                    tuple: tuple.to_vec(),
-                })
-            })?;
         }
         let mut sorted_indexes: Vec<_> = cat.indexes.iter().collect();
         sorted_indexes.sort_by_key(|(id, _)| **id);
@@ -3025,6 +3164,104 @@ impl BtreeEngine {
                 pages: retired.0,
             });
         Ok(())
+    }
+
+    /// The first page id never handed out: the number of pages a physical image carries.
+    pub fn page_count(&self) -> u64 {
+        self.store.page_count()
+    }
+
+    /// Bytes of resident pages that differ from the last image and so cannot be evicted.
+    pub fn dirty_page_bytes(&self) -> u64 {
+        self.store.dirty_bytes()
+    }
+
+    /// Rename the complete image at `tmp` over `named` and back the store with its pages. The
+    /// store releases the image being replaced across the rename (a platform may refuse to
+    /// replace an open file) and gets it back if the rename fails.
+    fn publish_image(
+        &self,
+        tmp: &Path,
+        named: &Path,
+        page_count: u64,
+        live: Vec<u64>,
+        new_checksums: Vec<u32>,
+    ) -> Result<()> {
+        let offset = CKPT_V2_HEADER_LEN as u64 + live.len() as u64 * 8;
+        // Where the platform keeps an open file valid across a rename, open the new image
+        // before it, so a failure to open cannot leave the store without its pages afterwards.
+        #[cfg(unix)]
+        let early = Some(PageFile::open(
+            tmp,
+            offset,
+            page_count,
+            live.clone(),
+            new_checksums.clone(),
+        )?);
+        #[cfg(not(unix))]
+        let early: Option<PageFile> = None;
+        let previous = self.store.detach()?;
+        // A platform that refuses to replace an open file gets the old one closed first; it is
+        // reopened from the still-named image if the rename fails.
+        #[cfg(not(unix))]
+        let previous = previous.map(|pages| pages.reopen_spec());
+        if let Err(e) = std::fs::rename(tmp, named) {
+            let _ = std::fs::remove_file(tmp);
+            // The old image is still in place and still the published one: keep serving from
+            // it, leaving every page that changed since it was taken dirty.
+            if let Some(previous) = previous {
+                #[cfg(not(unix))]
+                let previous = previous.open(named)?;
+                self.store.reattach(previous)?;
+            }
+            return Err(e.into());
+        }
+        let pages = match early {
+            Some(pages) => pages,
+            None => PageFile::open(named, offset, page_count, live, new_checksums)?,
+        };
+        self.store.attach(pages)?;
+        // Every resident page is clean now: shrink the cache back under its bound at once
+        // rather than at the next page load.
+        self.store.trim()?;
+        Ok(())
+    }
+
+    /// Write a physical image's page section to `file`: the directory of live page ids, then
+    /// those pages in the same order, straight from the cache or the previous image (the section
+    /// a later open reads pages from on demand; free pages are left out, and an id the directory
+    /// does not name is free), then a CRC32 per page and one CRC32 over the directory and that
+    /// table. Each page copy drops its rows' undo links: they index this process's version
+    /// arena, and with no transaction active no reader needs an older version. Returns the file
+    /// and the page checksums.
+    fn write_page_section(&self, file: File, live: &[u64]) -> Result<(File, Vec<u32>)> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        let mut section = crc32fast::Hasher::new();
+        for id in live {
+            let bytes = id.to_le_bytes();
+            section.update(&bytes);
+            out.write_all(&bytes)?;
+        }
+        let checksums =
+            self.store
+                .write_pages_to(&mut out, live, &crate::node::clear_undo_links)?;
+        for crc in &checksums {
+            let bytes = crc.to_le_bytes();
+            section.update(&bytes);
+            out.write_all(&bytes)?;
+        }
+        out.write_all(&section.finalize().to_le_bytes())?;
+        let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+        Ok((file, checksums))
+    }
+
+    /// Whether pages changed since the last checkpoint fill half the resident ceiling or more:
+    /// a checkpoint makes them clean again before writes run out of room. Always `false`
+    /// without a ceiling.
+    pub fn page_cache_needs_checkpoint(&self) -> bool {
+        self.max_total_resident_bytes
+            .is_some_and(|limit| self.store.dirty_bytes().saturating_mul(2) >= limit)
     }
 
     /// Page slots currently on the store's free list: every page a drop, a rollback, purge or a
@@ -3182,6 +3419,13 @@ impl BtreeEngine {
                   truncate and be silently dropped"
     )]
     fn checkpoint_stamped(&self, stamp: u64) -> Result<()> {
+        // Free the pages of settled dropped trees and retired overflow chains first, so they
+        // stay out of the image instead of riding it until a later purge. Only that cheap tail
+        // of a purge runs here, not the row sweep. Best effort: the image is correct either
+        // way, only larger.
+        if let Err(e) = self.reclaim_settled_pages() {
+            tracing::warn!(error = %e, "page reclamation before a checkpoint failed; checkpointing anyway");
+        }
         // Rank order: commit_gate -> catalog(write) -> txns -> seqs -> wal.
         let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
         let cat = self.catalog.write().map_err(|_| poisoned())?;
@@ -3229,18 +3473,21 @@ impl BtreeEngine {
         // memory stays at the writer's buffer whatever the size of the database.
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
+        let page_count = self.store.page_count();
+        let live = self.store.live_ids()?;
+        let mut new_checksums: Vec<u32> = Vec::new();
         let written: Result<()> = (|| {
             let mut file = File::create(&tmp)?;
-            std::io::Write::write_all(&mut file, &ckpt_header_bytes(covered_lsn))?;
-            let mut writer = WalWriter::new(file);
-            Self::emit_image(
-                &cat,
-                &seqs,
-                &self.store,
-                synthetic_txn,
-                stamp,
-                &mut |record| writer.append(record).map(|_| ()),
+            std::io::Write::write_all(
+                &mut file,
+                &ckpt_header_bytes(covered_lsn, page_count, live.len() as u64),
             )?;
+            let (file, checksums) = self.write_page_section(file, &live)?;
+            new_checksums = checksums;
+            let mut writer = WalWriter::new(file);
+            Self::emit_image(&cat, &seqs, synthetic_txn, stamp, &mut |record| {
+                writer.append(record).map(|_| ())
+            })?;
             // Drain the writer's append buffer to the file, then fsync — the image is durable
             // before its rename can make it authoritative.
             writer.flush()?;
@@ -3255,7 +3502,10 @@ impl BtreeEngine {
         // Phase 2: the atomic publish — a named image is complete by construction. Fsync the
         // containing directory so the rename itself is durable before phase 3 destroys the only
         // other copy of the data (a crash after an un-synced rename could otherwise lose both).
-        std::fs::rename(&tmp, &named)?;
+        // The store reads pages from the image being replaced; release it across the rename
+        // (a platform may refuse to replace an open file) and back the store with the new one.
+        // Under the quiesce no page is read in between.
+        self.publish_image(&tmp, &named, page_count, live, new_checksums)?;
         #[cfg(unix)]
         if let Some(dir) = wal.path.parent()
             && let Ok(dir) = File::open(dir)
@@ -3732,7 +3982,8 @@ fn choose_base_image(
                 .any(|fork| fork.sealed == lsn && fork.cut <= bound)
         };
         match read_checkpoint_image(&image) {
-            Ok((records, covered)) => {
+            Ok(contents) => {
+                let (records, covered) = (contents.records, contents.covered_lsn);
                 let time = image_commit_time(&records).unwrap_or(0);
                 // A position between the fork's cut and the sealed image is the image itself:
                 // the line holds nothing in between. Past the image, the request stands.
@@ -5162,12 +5413,11 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if tuple.len() > MAX_USER_TUPLE {
             return Err(tuple_too_large(tuple.len()));
         }
-        // Bound the global resident footprint before growing it: once the in-memory page store has
-        // reached the configured ceiling, refuse a new row rather than letting committed data
-        // accumulate until the OS OOM-kills the server (a no-op when no ceiling is set). This bounds
-        // the streamed-bulk-load case the per-transaction ceiling misses — many small committed
-        // batches, each under the per-transaction limit but accumulating resident. Only `insert` is
-        // gated, so `DELETE`/`TRUNCATE` stay available to free space at the ceiling.
+        // Bound what the engine holds before growing it: once changed pages plus index entries have
+        // reached the configured ceiling, refuse a new row (a no-op when no ceiling is set). This
+        // bounds the streamed-bulk-load case the per-transaction ceiling misses: many small committed
+        // batches, each under the per-transaction limit but accumulating. `insert` and `update` are
+        // gated; `DELETE`/`TRUNCATE` stay available to free space at the ceiling.
         self.check_resident_memory(tuple.len() as u64)?;
         // Bound this transaction's uncommitted write memory before mutating anything, so an
         // oversized bulk load aborts loudly rather than OOM-killing the server (no-op when no
@@ -5222,6 +5472,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         }
         // Charge the new version's real footprint against the per-transaction ceiling (see `insert`).
         self.charge_txn_memory(txn.0, tuple.len() as u64 + PER_ROW_WRITE_OVERHEAD)?;
+        // The resident ceiling is enforced here, before the tree is touched: the page store
+        // never refuses part way through a split, so the refusal belongs at the boundary.
+        self.check_resident_memory(tuple.len() as u64)?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let t = cat
             .tables
@@ -6833,21 +7086,19 @@ impl BtreeEngine {
         Ok(())
     }
 
-    /// Reject a row `insert` when the resident footprint has grown to the configured global
-    /// resident-memory ceiling, **before** the write mutates anything — so a rejection leaves no
-    /// partial state and the transaction aborts through the ordinary undo path. `None` limit (the
-    /// default) takes no lock and never rejects, keeping the common bulk-write path at its exact
-    /// prior cost. The footprint is the page store **plus the in-memory indexes**
-    /// ([`resident_bytes`](Self::resident_bytes)): a bulk load into a table with a `PRIMARY
-    /// KEY`/`UNIQUE`/secondary index grows those maps too, and counting them here is what turns that
-    /// growth into a graceful reject rather than an OOM. Only `insert` (a row write) consults the
-    /// ceiling, so a `CREATE INDEX` — which builds through `index_insert`, not `insert` — is
-    /// deliberately not gated by it and keeps its prior behavior.
+    /// Reject a row `insert` or `update` when what cannot be evicted has grown to the configured
+    /// ceiling, **before** the write mutates anything, so a rejection leaves no partial state and
+    /// the transaction aborts through the ordinary undo path. The page store itself never refuses
+    /// (a split must never stop half way), which is why the refusal lives at this boundary. `None`
+    /// limit (the default) never rejects. The footprint is pages changed since the last checkpoint
+    /// plus the in-memory indexes ([`pinned_bytes`](Self::pinned_bytes)); clean pages do not count,
+    /// since the cache evicts them. A `CREATE INDEX`, which builds through `index_insert`, is not
+    /// gated and keeps its prior behavior.
     fn check_resident_memory(&self, incoming: u64) -> Result<()> {
         let Some(limit) = self.max_total_resident_bytes else {
             return Ok(());
         };
-        let resident = self.resident_bytes()?;
+        let resident = self.pinned_bytes()?;
         // The incoming bytes count too: a row that spills into an overflow chain can be
         // megabytes, and admitting it on the footprint before it lands would overshoot by that.
         if resident >= limit || resident.saturating_add(incoming) > limit {
@@ -7485,7 +7736,21 @@ impl BtreeEngine {
         let settled =
             |x: u64| x < horizon && !active.contains(&x) && pinned.iter().all(|v| v.sees(x));
 
+        // A pass that dirties pages faster than a checkpoint can clean them would grow the page
+        // cache without bound (the pass holds the catalog, so no checkpoint can interleave). It
+        // stops once the changed pages fill half the cache, after the current table's index
+        // sweep so no removed row leaves an entry behind; the next pass resumes (settlement is
+        // monotone, so nothing is lost by stopping).
+        let mut yield_to_checkpoint = false;
         for (&table, t) in &cat.tables {
+            // A pass that starts, or reaches a table, under pressure changes nothing more. While
+            // the pressure lasts (a long transaction holding off the checkpoint, say) passes stop
+            // here, and the tables after this one wait for the next checkpoint: nothing can be
+            // purged without changing pages.
+            if self.page_cache_needs_checkpoint() {
+                tracing::debug!("purge stops early: changed pages fill the page cache");
+                break;
+            }
             let mut removed_rows: HashSet<u64> = HashSet::new();
             // Incremental row reclamation: process the tree in row-id batches, dropping the writer
             // latch and reclamation gate between batches so a concurrent writer interleaves instead
@@ -7498,6 +7763,12 @@ impl BtreeEngine {
             let mut cursor = 0u64;
             let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(PURGE_ROW_BATCH);
             loop {
+                // Checked before a batch as well as after one, so a pass under pressure never
+                // dirties another batch.
+                if self.page_cache_needs_checkpoint() {
+                    yield_to_checkpoint = true;
+                    break;
+                }
                 batch.clear();
                 let mut last_key = None;
                 {
@@ -7550,6 +7821,10 @@ impl BtreeEngine {
                 if batch.len() < PURGE_ROW_BATCH {
                     break;
                 }
+                if self.page_cache_needs_checkpoint() {
+                    yield_to_checkpoint = true;
+                    break;
+                }
                 match last_key {
                     Some(k) => cursor = k.saturating_add(1),
                     None => break,
@@ -7579,6 +7854,10 @@ impl BtreeEngine {
                 data.bytes = data.bytes.saturating_sub(removed_bytes);
                 data.alive.retain(|r, _| !removed_rows.contains(r));
             }
+            if yield_to_checkpoint || self.page_cache_needs_checkpoint() {
+                tracing::debug!("purge stops early: changed pages fill the page cache");
+                break;
+            }
         }
 
         // Orphaned arena slots (aborted UPDATEs disconnected their parked versions): freed once
@@ -7603,6 +7882,18 @@ impl BtreeEngine {
             }
         }
 
+        self.reclaim_dropped_and_retired(&settled, &mut stats)?;
+        Ok(stats)
+    }
+
+    /// Free the pages of dropped trees and retired overflow chains whose transactions `settled`
+    /// vouches for: the page-reclaiming tail of a purge pass. The caller holds the catalog read
+    /// guard, as a purge pass does.
+    fn reclaim_dropped_and_retired(
+        &self,
+        settled: &dyn Fn(u64) -> bool,
+        stats: &mut PurgeStats,
+    ) -> Result<()> {
         // Dropped trees: processed in place under the dropped-queue lock (so a concurrent
         // rollback un-queueing its table serializes with this pass) and the reclamation gate
         // (so no in-flight scan of a just-dropped table can touch a deallocated page).
@@ -7641,7 +7932,24 @@ impl BtreeEngine {
             }
             *retired = keep;
         }
-        Ok(stats)
+        Ok(())
+    }
+
+    /// Free the pages every settled dropped tree and retired overflow chain holds, without the
+    /// row and index sweep of a full purge: what a checkpoint runs first, so those pages stay
+    /// out of the image. Returns the pages freed.
+    fn reclaim_settled_pages(&self) -> Result<usize> {
+        let PurgeSnapshot {
+            pinned,
+            active,
+            horizon,
+        } = self.purge_snapshot()?;
+        let settled =
+            |x: u64| x < horizon && !active.contains(&x) && pinned.iter().all(|v| v.sees(x));
+        let _cat = self.catalog.read().map_err(|_| poisoned())?;
+        let mut stats = PurgeStats::default();
+        self.reclaim_dropped_and_retired(&settled, &mut stats)?;
+        Ok(stats.pages_reclaimed)
     }
 
     /// Pages currently allocated in the backing store — observability for purge verification
