@@ -116,12 +116,7 @@ fn history() -> History {
 /// call here wants the whole history.
 fn restored(h: &History, target: RecoveryTarget, live: bool) -> Vec<Vec<u8>> {
     let archive = tempfile::tempdir().unwrap();
-    for entry in std::fs::read_dir(h.archive.path()).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            std::fs::copy(entry.path(), archive.path().join(entry.file_name())).unwrap();
-        }
-    }
+    copy_tree(h.archive.path(), archive.path());
     let out = tempfile::tempdir().unwrap();
     let out_wal = out.path().join("btree.wal");
     let live_log = h.dir.path().join("btree.wal");
@@ -149,7 +144,36 @@ fn every_checkpoint_leaves_a_segment_and_an_image_in_the_archive() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 4, "{names:?}");
+    // Two images with their segment lists, two log segments, and the pages directory.
+    assert_eq!(names.len(), 7, "{names:?}");
+    let mut in_pages: Vec<String> = std::fs::read_dir(h.archive.path().join("pages"))
+        .unwrap()
+        .map(|e| {
+            e.unwrap()
+                .path()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    in_pages.sort();
+    // Every segment an archived image lists is in the pages directory, and nothing else is.
+    let mut listed: Vec<String> = names
+        .iter()
+        .filter(|n| n.ends_with(".segments"))
+        .flat_map(|n| {
+            std::fs::read_to_string(h.archive.path().join(n))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    listed.sort();
+    listed.dedup();
+    assert!(!listed.is_empty());
+    assert_eq!(listed, in_pages);
     let with_ext = |ext: &str| {
         names
             .iter()
@@ -162,6 +186,7 @@ fn every_checkpoint_leaves_a_segment_and_an_image_in_the_archive() {
     };
     assert_eq!(with_ext("ckpt"), 2);
     assert_eq!(with_ext("log"), 2);
+    assert_eq!(with_ext("segments"), 2);
 }
 
 #[test]
@@ -265,9 +290,12 @@ fn is_log(name: &str) -> bool {
 }
 
 fn archive_names(archive: &tempfile::TempDir) -> Vec<String> {
+    // The images and log segments; the pages directory and the images' segment lists are left
+    // out.
     let mut names: Vec<String> = std::fs::read_dir(archive.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "pages" && !n.ends_with(".segments"))
         .collect();
     names.sort();
     names
@@ -665,7 +693,7 @@ fn an_interrupted_restore_run_again_yields_the_same_rows() {
     let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(h.archive.path())
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "pages"))
         .collect();
     dirs.sort();
     let superseded = dirs.first().unwrap().clone();
@@ -952,4 +980,18 @@ fn a_fork_that_never_sealed_leaves_no_record_behind() {
     )
     .expect_err("contradicting fork records");
     assert!(err.to_string().contains("more than one cut"), "{err}");
+}
+
+/// Copy the directory tree `from` into `to`: files and the archive's pages subdirectory.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }

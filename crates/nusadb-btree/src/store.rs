@@ -138,26 +138,64 @@ fn poisoned() -> nusadb_core::Error {
     ))
 }
 
-/// The page section of a published checkpoint image.
+/// Where a published checkpoint image keeps its pages: one or more read-only segment files.
 ///
-/// The image holds only live pages: a directory of their ids in ascending order, then the pages
-/// in that order, the `n`-th page at `offset + n * PAGE_SIZE`. Ids below `page_count` that the
-/// directory does not name were free when the image was taken. Read-only: the image is complete
-/// when it is named and is only ever replaced by the next checkpoint's rename.
+/// An image of the single-file format holds its own pages, the `n`-th live page at `offset + n *
+/// PAGE_SIZE` of the image file: one segment. A segmented image names segment files in the pages
+/// directory beside the log; each live page sits at a slot of one of them, and a checkpoint only
+/// writes the pages that changed since the image before it into a new segment, naming the older
+/// segments for the rest. Every segment is complete before an image names it and is never
+/// rewritten. Ids below `page_count` that the directory does not name were free when the image
+/// was taken.
 #[derive(Debug)]
 pub struct PageFile {
-    file: File,
-    offset: u64,
+    segments: Vec<Segment>,
     page_count: u64,
+    /// Live page ids, ascending.
     directory: Vec<u64>,
+    /// Where each page of `directory` is, in the same order.
+    locations: Vec<Location>,
     /// CRC32 of each page, in directory order: a page whose bytes no longer match is refused.
     checksums: Vec<u32>,
 }
 
+/// One file of pages.
+#[derive(Debug)]
+struct Segment {
+    path: std::path::PathBuf,
+    /// The segment's name in the pages directory; `None` for the pages of a single-file image.
+    name: Option<String>,
+    file: File,
+    /// The byte offset of slot 0.
+    base: u64,
+    /// Slots the file holds.
+    slots: u64,
+}
+
+/// Where one page of an image is: a segment and the slot within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Location {
+    /// Index into the image's segment list.
+    pub segment: u32,
+    /// Page slot within the segment.
+    pub slot: u32,
+}
+
+/// An unchanged page's place in the current image, to be named again by the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carried {
+    /// The segment's index in the current image's list (see [`PagedStore::image_segments`]).
+    pub segment: u32,
+    /// Page slot within the segment.
+    pub slot: u32,
+    /// The page's CRC32.
+    pub checksum: u32,
+}
+
 impl PageFile {
-    /// Open the page section of the image at `path`: the pages named by `directory` (ascending
-    /// ids) stored from `offset`, within an id space of `page_count`, each checked against its
-    /// entry in `checksums`.
+    /// Open the page section of a single-file image at `path`: the pages named by `directory`
+    /// (ascending ids) stored from `offset`, within an id space of `page_count`, each checked
+    /// against its entry in `checksums`.
     ///
     /// # Errors
     /// Propagates the open error.
@@ -168,21 +206,92 @@ impl PageFile {
         directory: Vec<u64>,
         checksums: Vec<u32>,
     ) -> Result<Self> {
+        let slots = directory.len() as u64;
+        let locations =
+            (0..directory.len())
+                .map(|n| {
+                    u32::try_from(n).map(|slot| Location { segment: 0, slot }).map_err(|_| {
+                    nusadb_core::Error::Io(std::io::Error::other(
+                        "nusadb-btree: the image holds more pages than one segment can address",
+                    ))
+                })
+                })
+                .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            file: File::open(path)?,
-            offset,
+            segments: vec![Segment {
+                path: path.to_path_buf(),
+                name: None,
+                file: File::open(path)?,
+                base: offset,
+                slots,
+            }],
             page_count,
             directory,
+            locations,
             checksums,
         })
     }
 
-    /// Close the file, keeping what is needed to open the same section again.
+    /// Open the pages of a segmented image: `names` are segment files in `dir`, and the `n`-th
+    /// page of `directory` sits at `locations[n]`.
+    ///
+    /// # Errors
+    /// Fails when a named segment is missing (the image cannot be served without it) or on
+    /// other open errors.
+    pub fn open_segments(
+        dir: &Path,
+        names: &[String],
+        page_count: u64,
+        directory: Vec<u64>,
+        locations: Vec<Location>,
+        checksums: Vec<u32>,
+    ) -> Result<Self> {
+        let mut segments = Vec::with_capacity(names.len());
+        for name in names {
+            let path = segment_path(dir, name);
+            let file = File::open(&path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    nusadb_core::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "nusadb-btree: the checkpoint image names the page segment {} but it \
+                             is missing; copy the image together with its pages directory",
+                            path.display()
+                        ),
+                    ))
+                } else {
+                    e.into()
+                }
+            })?;
+            let slots = file.metadata()?.len() / PAGE_SIZE as u64;
+            segments.push(Segment {
+                path,
+                name: Some(name.clone()),
+                file,
+                base: 0,
+                slots,
+            });
+        }
+        Ok(Self {
+            segments,
+            page_count,
+            directory,
+            locations,
+            checksums,
+        })
+    }
+
+    /// Close the files, keeping what is needed to open the same section again.
     pub fn reopen_spec(self) -> PageFileSpec {
         PageFileSpec {
-            offset: self.offset,
+            segments: self
+                .segments
+                .into_iter()
+                .map(|s| (s.path, s.name, s.base, s.slots))
+                .collect(),
             page_count: self.page_count,
             directory: self.directory,
+            locations: self.locations,
             checksums: self.checksums,
         }
     }
@@ -192,24 +301,53 @@ impl PageFile {
         self.page_count
     }
 
+    /// Each segment this image reads from, in order: its name (`None` for the pages of a
+    /// single-file image) and the slots it holds.
+    pub fn segment_list(&self) -> Vec<(Option<String>, u64)> {
+        self.segments
+            .iter()
+            .map(|s| (s.name.clone(), s.slots))
+            .collect()
+    }
+
     /// Whether the image holds page `id`.
     fn holds(&self, id: u64) -> bool {
         self.directory.binary_search(&id).is_ok()
     }
 
+    /// Where page `id` is, when it lies in a named segment.
+    fn carried(&self, id: u64) -> Option<Carried> {
+        let n = self.directory.binary_search(&id).ok()?;
+        let location = self.locations.get(n)?;
+        // Only a page in a named segment can be named again by the next image.
+        self.segments
+            .get(location.segment as usize)?
+            .name
+            .as_ref()?;
+        Some(Carried {
+            segment: location.segment,
+            slot: location.slot,
+            checksum: *self.checksums.get(n)?,
+        })
+    }
+
     fn read(&self, id: u64) -> Result<Page> {
-        let slot = self
+        let n = self
             .directory
             .binary_search(&id)
             .map_err(|_| bad_page(PageId(id)))?;
-        let mut page = [0u8; PAGE_SIZE];
-        let at = u64::try_from(slot)
-            .ok()
-            .and_then(|slot| slot.checked_mul(PAGE_SIZE as u64))
-            .and_then(|rel| self.offset.checked_add(rel))
+        let location = self.locations.get(n).ok_or_else(|| bad_page(PageId(id)))?;
+        let segment = self
+            .segments
+            .get(location.segment as usize)
             .ok_or_else(|| bad_page(PageId(id)))?;
-        read_exact_at(&self.file, &mut page, at)?;
-        let expected = self.checksums.get(slot).copied();
+        let mut page = [0u8; PAGE_SIZE];
+        let at = u64::from(location.slot)
+            .checked_mul(PAGE_SIZE as u64)
+            .and_then(|rel| segment.base.checked_add(rel))
+            .ok_or_else(|| bad_page(PageId(id)))?;
+        read_exact_at(&segment.file, &mut page, at)?;
+        let expected = self.checksums.get(n).copied();
         if expected != Some(crc32fast::hash(&page)) {
             return Err(nusadb_core::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -223,28 +361,44 @@ impl PageFile {
     }
 }
 
-/// A page section's layout without its open file: see [`PageFile::reopen_spec`].
+/// The file of the segment `name` in the pages directory `dir`.
+pub fn segment_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{name}.seg"))
+}
+
+/// A page section's layout without its open files: see [`PageFile::reopen_spec`].
 #[derive(Debug)]
 pub struct PageFileSpec {
-    offset: u64,
+    segments: Vec<(std::path::PathBuf, Option<String>, u64, u64)>,
     page_count: u64,
     directory: Vec<u64>,
+    locations: Vec<Location>,
     checksums: Vec<u32>,
 }
 
 impl PageFileSpec {
-    /// Open the section again from the image at `path`.
+    /// Open the section again from the same files.
     ///
     /// # Errors
     /// Propagates the open error.
-    pub fn open(self, path: &Path) -> Result<PageFile> {
-        PageFile::open(
-            path,
-            self.offset,
-            self.page_count,
-            self.directory,
-            self.checksums,
-        )
+    pub fn open(self) -> Result<PageFile> {
+        let mut segments = Vec::with_capacity(self.segments.len());
+        for (path, name, base, slots) in self.segments {
+            segments.push(Segment {
+                file: File::open(&path)?,
+                path,
+                name,
+                base,
+                slots,
+            });
+        }
+        Ok(PageFile {
+            segments,
+            page_count: self.page_count,
+            directory: self.directory,
+            locations: self.locations,
+            checksums: self.checksums,
+        })
     }
 }
 
@@ -618,6 +772,40 @@ impl PagedStore {
     pub fn reattach(&self, pages: PageFile) -> Result<()> {
         *self.file.write().map_err(|_| poisoned())? = Some(pages);
         Ok(())
+    }
+
+    /// For each id of `ids`, where the current image already holds it unchanged: not changed
+    /// since that image (neither dirty nor spilled) and stored in a named segment. `None` for a
+    /// page the next image must write. Runs under the checkpoint's quiesce.
+    ///
+    /// # Errors
+    /// Fails only on a poisoned lock.
+    pub fn carried_locations(&self, ids: &[u64]) -> Result<Vec<Option<Carried>>> {
+        let file = self.file.read().map_err(|_| poisoned())?;
+        let Some(pages) = file.as_ref() else {
+            return Ok(vec![None; ids.len()]);
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let unchanged = match self.locate(id)? {
+                Located::Resident(frame) => !frame.dirty.load(Ordering::Acquire),
+                Located::Spilled(..) => false,
+                Located::Image => true,
+            };
+            out.push(if unchanged { pages.carried(id) } else { None });
+        }
+        Ok(out)
+    }
+
+    /// The segments the current image reads from, in its own order (a [`Carried`] segment is an
+    /// index into this list): each one's name (`None` for the pages of a single-file image) and
+    /// the slots it holds.
+    ///
+    /// # Errors
+    /// Fails only on a poisoned lock.
+    pub fn image_segments(&self) -> Result<Vec<(Option<String>, u64)>> {
+        let file = self.file.read().map_err(|_| poisoned())?;
+        Ok(file.as_ref().map_or_else(Vec::new, PageFile::segment_list))
     }
 
     /// The ids of every live page (allocated and not free), ascending: the directory a

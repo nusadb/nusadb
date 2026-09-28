@@ -60,8 +60,8 @@ fn a_copy_of_the_checkpoint_image_restores_the_state_as_of_the_checkpoint() {
     insert(&engine, table, b"before-1");
     insert(&engine, table, b"before-2");
 
-    // The backup point: checkpoint, then copy the image. Writes that follow belong to the live
-    // database only.
+    // The backup point: checkpoint, then copy the image and its pages directory. Writes that
+    // follow belong to the live database only.
     engine.checkpoint().unwrap();
     let backup = tempfile::tempdir().unwrap();
     std::fs::copy(
@@ -69,6 +69,7 @@ fn a_copy_of_the_checkpoint_image_restores_the_state_as_of_the_checkpoint() {
         backup.path().join("btree.wal.ckpt"),
     )
     .unwrap();
+    copy_pages(live.path(), backup.path());
     insert(&engine, table, b"after");
     assert_eq!(
         payloads(&engine, table),
@@ -112,7 +113,7 @@ fn the_image_is_stable_while_the_engine_keeps_writing_and_checkpointing() {
 
     // Hold the image open as a backup tool would, then let the engine write and checkpoint
     // again: the new image is published by rename, so the open handle still reads the old,
-    // complete image.
+    // complete image, and the segments it reads from stay until the checkpoint after next.
     let mut held = std::fs::File::open(live.path().join("btree.wal.ckpt")).unwrap();
     insert(&engine, table, b"v2");
     engine.checkpoint().unwrap();
@@ -120,8 +121,20 @@ fn the_image_is_stable_while_the_engine_keeps_writing_and_checkpointing() {
     let mut out = std::fs::File::create(backup.path().join("btree.wal.ckpt")).unwrap();
     std::io::copy(&mut held, &mut out).unwrap();
     drop(out);
+    copy_pages(live.path(), backup.path());
 
     let restored = BtreeEngine::open(backup.path().join("btree.wal")).unwrap();
     let t = restored.lookup_table("t").unwrap().unwrap();
     assert_eq!(payloads(&restored, t.id), vec![b"v1".to_vec()]);
+}
+
+/// Copy the pages directory of the database in `from` into `to`, as a backup does with the image.
+fn copy_pages(from: &std::path::Path, to: &std::path::Path) {
+    let source = from.join("btree.wal.pages");
+    let target = to.join("btree.wal.pages");
+    std::fs::create_dir_all(&target).unwrap();
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+    }
 }

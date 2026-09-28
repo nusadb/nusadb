@@ -106,10 +106,11 @@ NusaDB defaults small and scales up explicitly: a fresh install stays healthy on
 
 ### Table data: a page cache over the checkpoint image
 
-Table pages live in a page cache backed by the last checkpoint image. The image holds every
-page of the database; a page is read from it on first use, so a restart does not load the whole
-database before serving, and a page that has not changed since the last checkpoint (a clean page)
-can leave the cache again when memory is needed. A page changed since the last checkpoint (a
+Table pages live in a page cache backed by the last checkpoint image. The image
+(`btree.wal.ckpt`) names every page of the database and where it lies in the page segments of
+the pages directory beside it (`btree.wal.pages/`); a page is read from there on first use, so a
+restart does not load the whole database before serving, and a page that has not changed since
+the last checkpoint (a clean page) can leave the cache again when memory is needed. A page changed since the last checkpoint (a
 dirty page) is not in the image yet. When the cache holds nothing clean to evict, a dirty page is
 written to a scratch file beside the log (`btree.wal.spill`) and leaves memory; it is read back
 from there when needed. The scratch file is not a durable copy: recovery never reads it, and it is
@@ -147,8 +148,12 @@ Index entries (the primary key index, B-tree indexes on columns, vector indexes)
 memory whatever the bound. They are rebuilt from the image's index records at open and count
 against the bound.
 
-A checkpoint writes the whole image (every live page, changed or not), so its cost grows with the
-database, not with the changes.
+A checkpoint writes only the pages changed since the one before it, into a new segment, and a
+new image that names the older segments for every other page. Its cost grows with the changes,
+plus the image's directory of pages (20 bytes per page) and its index entries. Once the segments
+an image still names would hold more than twice the live pages (plus a fixed slack of 1024
+pages), or more than 32 segments, the
+checkpoint writes every page afresh into one segment instead, so dead pages on disk stay bounded.
 
 Deleting rows frees pages for reuse and lowers the count the next image carries; page memory
 within a running process is recycled through the cache rather than returned to the OS.
@@ -384,9 +389,10 @@ autocommit statement, never an error. A transaction held open longer than the pa
 as an idle client inside `BEGIN`, defeats the pause: the worker logs a warning with the active
 count, doubles the number of busy checks it waits before pausing again (up to about sixteen
 minutes between attempts), and the log keeps growing until that transaction ends. The pause is
-capped at 60 seconds. Each checkpoint rewrites the whole image while the
-engine is paused, so its cost grows with the database, not with the log: on a large database
-raise the threshold so the pause is paid less often. Watch the server log at `info` for
+capped at 60 seconds. Each checkpoint writes the pages changed since the last one, the image's
+page directory and its index entries while the engine is paused, and now and then every page
+(see the page cache section above); on a large database with many indexes, raise the threshold
+so the pause is paid less often. Watch the server log at `info` for
 `runtime checkpoint folded the log` and at `debug` for the busy retries. Set either flag to `0` to
 turn the worker off and instead issue `CHECKPOINT` from a cron job over an otherwise idle
 connection:
@@ -399,14 +405,26 @@ It requires a quiesced engine: it refuses, naming how many transactions are stil
 transaction is open, including one on the connection issuing it. Run it from a connection in
 autocommit at a quiet moment; a load with continuously overlapping transactions may need a retry.
 
-**Backup.** A checkpoint image is a complete copy of one database as of its checkpoint, and the
-engine only ever replaces it by an atomic rename, so a copy of the image is a consistent
-point-in-time backup even while the server keeps writing. Per database:
+**Backup.** A checkpoint image together with the page segments it names is a complete copy of
+one database as of its checkpoint. The engine only ever replaces the image by an atomic rename
+and never rewrites a segment, so a copy of both is a consistent point-in-time backup even while
+the server keeps writing. Take the image first, then the pages directory. The segments of an
+image stay on disk until the checkpoint after the one that replaces it (a restart removes them
+sooner: at open only the published image's segments are kept), so the safe way is a hard-link
+snapshot on the same file system, which takes milliseconds, and then a copy of the snapshot
+wherever it should go. Per database:
 
 ```bash
 NUSADB_PASSWORD=... nusadb-cli --user nusadb-root -d shop -c "CHECKPOINT"
-cp "$DATA_DIR/base/shop/btree.wal.ckpt" /backups/shop-$(date +%F).ckpt
+snap=/data/snapshots/shop-$(date +%F)       # on the same file system as $DATA_DIR
+mkdir -p "$snap/btree.wal.pages"
+ln "$DATA_DIR/base/shop/btree.wal.ckpt" "$snap/btree.wal.ckpt"
+ln "$DATA_DIR/base/shop/btree.wal.pages/"*.seg "$snap/btree.wal.pages/"
+cp -r "$snap" /backups/                     # then copy it anywhere
 ```
+
+A copy that misses a segment its image names is refused when opened, naming the segment, never
+read with pages missing.
 
 The backup holds every transaction committed before the `CHECKPOINT`; what commits afterwards is
 in the log tail only. The background checkpoint worker refreshes the image on its own as the log
@@ -418,8 +436,10 @@ fresh data directory run `CREATE DATABASE shop` first), and its directory must h
 and start the server. It opens the image with an empty log tail.
 
 ```bash
-rm -f "$DATA_DIR/base/shop/btree.wal" "$DATA_DIR/base/shop/btree.wal.ckpt"
-cp /backups/shop-2026-09-26.ckpt "$DATA_DIR/base/shop/btree.wal.ckpt"
+rm -rf "$DATA_DIR/base/shop/btree.wal" "$DATA_DIR/base/shop/btree.wal.ckpt" \
+  "$DATA_DIR/base/shop/btree.wal.pages"
+cp -r /backups/shop-2026-09-26/btree.wal.pages "$DATA_DIR/base/shop/"
+cp /backups/shop-2026-09-26/btree.wal.ckpt "$DATA_DIR/base/shop/btree.wal.ckpt"
 nusadb-server --data-dir "$DATA_DIR"
 ```
 
@@ -432,15 +452,36 @@ available. There is no built-in scheduled backup or replication.
 
 With `--wal-archive-dir DIR`, every checkpoint keeps two files under `DIR/<database>/` before it
 truncates the log: `<lsn>.log`, the log segment it folded (every record up to log position
-`<lsn>`), and `<lsn>.ckpt`, the image it published, linked rather than copied where the file
-system allows. The archive therefore holds a base image plus an unbroken chain of segments, and
-every commit record carries the moment it committed. Prune old images and the segments before
-them once you no longer need to restore that far back; keep the newest image and everything after
-it.
+`<lsn>`), and `<lsn>.ckpt`, the image it published, with the page segments that image names
+under `DIR/<database>/pages/` and their names, one per line, in `<lsn>.segments`; files are
+linked rather than copied where the file system allows. The archive therefore holds a base image
+plus an unbroken chain of log segments, and every commit record carries the moment it committed.
+Prune old images (with their `.segments` lists) and the log segments before them once you no
+longer need to restore that far back; keep the newest image and everything after it. Then remove
+a page segment only when no `.segments` list left in `DIR/<database>/` names it:
+
+```bash
+set -e
+cd /archive/shop
+ls pages/*.seg > /tmp/segments            # list the segments first,
+ls ./*.segments > /dev/null                # (stop if there is no list at all)
+cat ./*.segments | sort -u > /tmp/keep     # then read the lists
+while read -r f; do
+  grep -qxF "$(basename "$f" .seg)" /tmp/keep || rm "$f"
+done < /tmp/segments
+```
+
+The order matters while the server runs: an image's list is written before any segment it names
+reaches `pages/`, so a segment present when the listing was taken is already named by a list
+read after it.
+
+A restore moves the images of the history it cuts away into a `superseded-*` directory together
+with their lists; their page segments stay in `pages/`, where the rule above removes them once no
+kept list names them.
 
 To restore, stop the server if the target database is live, make sure its directory holds no
-log or image (a fresh `CREATE DATABASE`, or remove `btree.wal` and `btree.wal.ckpt` from
-`base/<db>/`), and run the server in restore mode:
+log or image (a fresh `CREATE DATABASE`, or remove `btree.wal`, `btree.wal.ckpt` and
+`btree.wal.pages` from `base/<db>/`), and run the server in restore mode:
 
 ```bash
 nusadb-server --data-dir "$DATA_DIR" --wal-archive-dir /archive \

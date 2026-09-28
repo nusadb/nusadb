@@ -419,14 +419,19 @@ fn a_damaged_page_or_directory_is_refused() {
     let wal = dir.path().join("btree.wal");
     let image = dir.path().join("btree.wal.ckpt");
     let clean = std::fs::read(&image).unwrap();
-    // Header: 36 bytes; live count at 24..32; directory follows; then the pages.
-    let live = u64::from_le_bytes(clean[24..32].try_into().unwrap());
-    let pages_at = 36 + usize::try_from(live).unwrap() * 8;
+    // The first checkpoint writes every page into one segment.
+    let segments: Vec<_> = std::fs::read_dir(dir.path().join("btree.wal.pages"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    let segment = &segments[0];
+    let pages = std::fs::read(segment).unwrap();
     // A byte inside the last page (a leaf holding rows).
-    let mut damaged = clean.clone();
-    let at = pages_at + usize::try_from(live - 1).unwrap() * PAGE_SIZE + PAGE_SIZE / 2;
+    let mut damaged = pages.clone();
+    let at = pages.len() - PAGE_SIZE / 2;
     damaged[at] ^= 0x40;
-    std::fs::write(&image, &damaged).unwrap();
+    std::fs::write(segment, &damaged).unwrap();
     let engine = BtreeEngine::open(&wal).unwrap();
     let txn = engine.begin(RC).unwrap();
     // The damaged page is refused wherever it is first read: opening the scan or a later row.
@@ -446,9 +451,11 @@ fn a_damaged_page_or_directory_is_refused() {
     );
     let _ = engine.rollback(txn);
     drop(engine);
-    // A byte inside the directory.
+    std::fs::write(segment, &pages).unwrap();
+    // A byte inside the directory: past the 44-byte header and the segment table.
     let mut damaged = clean;
-    damaged[36] ^= 0x01;
+    let name_len = usize::from(u16::from_le_bytes([damaged[44], damaged[45]]));
+    damaged[44 + 2 + name_len + 3] ^= 0x01;
     std::fs::write(&image, &damaged).unwrap();
     let err = BtreeEngine::open(&wal).unwrap_err().to_string();
     assert!(err.contains("invalid"), "{err}");

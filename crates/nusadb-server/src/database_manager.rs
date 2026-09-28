@@ -1926,11 +1926,22 @@ mod checkpoint_tests {
         )
         .unwrap();
         assert!(manager.create("shop", false).unwrap());
+        // A backup is the image plus the pages directory it reads from.
+        let target = base_dir(restored_root.path(), "shop");
         std::fs::copy(
             live.path().join("btree.wal.ckpt"),
-            base_dir(restored_root.path(), "shop").join("btree.wal.ckpt"),
+            target.join("btree.wal.ckpt"),
         )
         .unwrap();
+        std::fs::create_dir_all(target.join("btree.wal.pages")).unwrap();
+        for entry in std::fs::read_dir(live.path().join("btree.wal.pages")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(
+                entry.path(),
+                target.join("btree.wal.pages").join(entry.file_name()),
+            )
+            .unwrap();
+        }
         let restored = manager.open("shop").unwrap().expect("registered database");
         let restored_table = restored.lookup_table("t").unwrap().unwrap();
         let txn = restored.begin(RC).unwrap();

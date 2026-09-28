@@ -1515,15 +1515,18 @@ impl BtreeEngine {
     /// its records then opens the tables at their roots, and every page loads from the image
     /// on first use.
     fn attach_image_pages(&self, path: &Path, pages: Option<ImagePages>) -> Result<()> {
+        let dir = pages_dir(path);
+        let mut keep = Vec::new();
         if let Some(pages) = pages {
-            self.store.attach(PageFile::open(
-                &ckpt_path(path),
-                pages.offset,
-                pages.page_count,
-                pages.directory,
-                pages.checksums,
-            )?)?;
+            if let PageLayout::Segments { names, .. } = &pages.layout {
+                keep.clone_from(names);
+            }
+            self.store
+                .attach(open_page_file(&ckpt_path(path), &dir, pages)?)?;
         }
+        // A segment the published image does not read from was left by a checkpoint that
+        // failed or crashed before naming it, or belongs to an image already replaced.
+        remove_unreferenced_segments(&dir, keep.iter());
         Ok(())
     }
 
@@ -1619,6 +1622,10 @@ impl BtreeEngine {
         let _ = std::fs::remove_file(&scratch);
         let _ = std::fs::remove_file(ckpt_path(&scratch));
         let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
+        let _ = std::fs::remove_dir_all(pages_dir(&scratch));
+        // A restore that crashed between moving its pages into place and its image leaves
+        // segments no image names.
+        let _ = std::fs::remove_dir_all(pages_dir(out_wal));
         // A fork an earlier restore left unfinished is settled before the archive is read.
         settle_pending_fork(archive)?;
         let outcome = Self::restore_into(archive, target, &scratch, out_wal, live_log);
@@ -1628,6 +1635,7 @@ impl BtreeEngine {
             let _ = std::fs::remove_file(&scratch);
             let _ = std::fs::remove_file(ckpt_path(&scratch));
             let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
+            let _ = std::fs::remove_dir_all(pages_dir(&scratch));
             let _ = settle_pending_fork(archive);
         }
         outcome
@@ -1647,7 +1655,13 @@ impl BtreeEngine {
         let (images, segments) = list_archive(archive)?;
         let forks = fork_records(archive)?;
         let (base, target) = choose_base_image(archive, target, &images, &forks)?;
-        std::fs::copy(archive.join(format!("{base:020}.ckpt")), ckpt_path(scratch))?;
+        let base_image = archive.join(format!("{base:020}.ckpt"));
+        link_segments(
+            &archive.join(ARCHIVE_PAGES),
+            &image_segment_names(&base_image)?,
+            &pages_dir(scratch),
+        )?;
+        std::fs::copy(base_image, ckpt_path(scratch))?;
         let chain = assemble_log(archive, target, scratch, base, &segments, live_log)?;
         if !chain.reached {
             // An image past where the chain ends means the history went on but the segments
@@ -1717,6 +1731,12 @@ impl BtreeEngine {
             superseded: superseded_dir_name(archive),
         };
         fork.write(archive)?;
+        archive_segments(
+            &pages_dir(scratch),
+            &image_segment_names(&ckpt_path(scratch))?,
+            archive,
+            sealed_covers,
+        )?;
         archive_image(
             &ckpt_path(scratch),
             &archive.join(format!("{sealed_covers:020}.ckpt")),
@@ -1724,7 +1744,14 @@ impl BtreeEngine {
         sync_dir(archive)?;
         fork.record(archive)?;
         fork.complete(archive)?;
-        // Publish: the image first (it alone is the database), then the empty log.
+        // Publish: the pages, then the image (with them, the database), then the empty log.
+        if pages_dir(scratch).exists() {
+            std::fs::rename(pages_dir(scratch), pages_dir(out_wal))?;
+            // The pages must be in place durably before the image that names them is.
+            if let Some(dir) = out_wal.parent() {
+                sync_dir(dir)?;
+            }
+        }
         std::fs::rename(ckpt_path(scratch), ckpt_path(out_wal))?;
         std::fs::rename(scratch, out_wal)?;
         if let Some(dir) = out_wal.parent() {
@@ -2804,10 +2831,20 @@ const AUTO_CHECKPOINT_ON_OPEN_BYTES: u64 = 8 * 1024 * 1024;
 const CKPT_MAGIC: &[u8; 4] = b"NCKP";
 /// The logical image format: replayable records only, rows included (still readable).
 const CKPT_VERSION_LOGICAL: u32 = 1;
-/// The physical image format written today: header, then every page of the store, then the
+/// The single-file physical image format: header, then every page of the store, then the
 /// logical records (catalog, table roots, free list, index entries, constraints, statistics,
-/// sequences) that replay on top of those pages.
+/// sequences) that replay on top of those pages. Still readable.
 const CKPT_VERSION: u32 = 2;
+/// The segmented physical image format written today: header, the names of the page segments
+/// it reads from, where each live page lies in them, then the same logical records. The pages
+/// themselves live in immutable segment files in the pages directory beside the log.
+const CKPT_VERSION_SEGMENTED: u32 = 3;
+/// The checksummed part of a v3 header: the v2 fields plus the number of segments it names.
+const CKPT_V3_HEADER_CHECKSUMMED_LEN: usize = 40;
+/// Full v3 header length.
+const CKPT_V3_HEADER_LEN: usize = CKPT_V3_HEADER_CHECKSUMMED_LEN + 4;
+/// Bytes of one v3 directory entry: page id (8), segment index (4), slot (4), CRC32 (4).
+const CKPT_V3_ENTRY_LEN: usize = 20;
 /// The checksummed part of a v1 header: magic (4) + version (4) + covered-LSN watermark (8).
 const CKPT_HEADER_CHECKSUMMED_LEN: usize = 16;
 /// Full v1 header length: the checksummed prefix plus its CRC32 (4).
@@ -2818,29 +2855,240 @@ const CKPT_V2_HEADER_CHECKSUMMED_LEN: usize = 32;
 /// Full v2 header length.
 const CKPT_V2_HEADER_LEN: usize = CKPT_V2_HEADER_CHECKSUMMED_LEN + 4;
 
-/// The 20-byte checkpoint header: `NCKP` + version + covered-LSN + CRC32(of the first 16). The
-/// CRC covers `covered_lsn` specifically — a single flipped bit there would otherwise silently
-/// change which committed log records recovery skips, with no error, exactly the silent-data-loss
-/// the log's own header CRC was added to prevent.
-fn ckpt_header_bytes(covered_lsn: u64, page_count: u64, live: u64) -> [u8; CKPT_V2_HEADER_LEN] {
-    let mut header = [0u8; CKPT_V2_HEADER_LEN];
-    header[0..4].copy_from_slice(CKPT_MAGIC);
-    header[4..8].copy_from_slice(&CKPT_VERSION.to_le_bytes());
-    header[8..16].copy_from_slice(&covered_lsn.to_le_bytes());
-    header[16..24].copy_from_slice(&page_count.to_le_bytes());
-    header[24..32].copy_from_slice(&live.to_le_bytes());
-    let crc = crc32fast::hash(&header[0..CKPT_V2_HEADER_CHECKSUMMED_LEN]);
-    header[32..36].copy_from_slice(&crc.to_le_bytes());
-    header
-}
-
-/// Where a physical image's pages lie: the page id space, the ids it holds (ascending), and
-/// the offset of the first page.
+/// Where a physical image's pages lie: the page id space, the ids it holds (ascending) with
+/// their checksums, and either the offset of the first page in the image itself or the
+/// segments and slots that hold them.
 struct ImagePages {
     page_count: u64,
     directory: Vec<u64>,
     checksums: Vec<u32>,
-    offset: u64,
+    layout: PageLayout,
+}
+
+/// The most segments one image may name before the next checkpoint writes every page afresh.
+const MAX_IMAGE_SEGMENTS: usize = 32;
+
+/// What the next image reads from, as decided by `plan_segments`.
+struct SegmentPlan {
+    /// The segments the image lists, in index order; the new segment, if any, last.
+    names: Vec<String>,
+    /// Where each live page is, in directory order.
+    locations: Vec<crate::store::Location>,
+    /// Each live page's CRC32, in directory order.
+    checksums: Vec<u32>,
+    /// Directory positions of the pages the new segment holds, in slot order.
+    to_write: Vec<usize>,
+    /// The new segment, when any page changed.
+    new_name: Option<String>,
+}
+
+impl SegmentPlan {
+    /// Remove the new segment of a checkpoint that failed before any image named it.
+    fn discard_new(&self, dir: &Path) {
+        if let Some(name) = &self.new_name {
+            let _ = std::fs::remove_file(crate::store::segment_path(dir, name));
+        }
+    }
+}
+
+/// Write a v3 image's header, segment table and page directory, with the CRC over both.
+fn write_segment_directory(
+    out: &mut impl std::io::Write,
+    covered_lsn: u64,
+    page_count: u64,
+    live: &[u64],
+    plan: &SegmentPlan,
+) -> Result<()> {
+    out.write_all(&ckpt_v3_header_bytes(
+        covered_lsn,
+        page_count,
+        live.len() as u64,
+        plan.names.len() as u64,
+    ))?;
+    let mut hasher = crc32fast::Hasher::new();
+    for name in &plan.names {
+        let len = u16::try_from(name.len())
+            .map_err(|_| Error::Io(std::io::Error::other("nusadb-btree: segment name too long")))?;
+        hasher.update(&len.to_le_bytes());
+        hasher.update(name.as_bytes());
+        out.write_all(&len.to_le_bytes())?;
+        out.write_all(name.as_bytes())?;
+    }
+    for ((id, location), crc) in live.iter().zip(&plan.locations).zip(&plan.checksums) {
+        let mut entry = [0u8; CKPT_V3_ENTRY_LEN];
+        entry[0..8].copy_from_slice(&id.to_le_bytes());
+        entry[8..12].copy_from_slice(&location.segment.to_le_bytes());
+        entry[12..16].copy_from_slice(&location.slot.to_le_bytes());
+        entry[16..20].copy_from_slice(&crc.to_le_bytes());
+        hasher.update(&entry);
+        out.write_all(&entry)?;
+    }
+    out.write_all(&hasher.finalize().to_le_bytes())?;
+    Ok(())
+}
+
+/// A name no segment in `dir` or in the archive has had: the position the image covers and a
+/// stamp that only grows within the process and starts from the clock, marked `-full` when the
+/// segment holds every live page.
+fn new_segment_name(covered_lsn: u64, full: bool, dir: &Path, archive: Option<&Path>) -> String {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let mut stamp = LAST
+        .fetch_max(now, Ordering::AcqRel)
+        .max(now)
+        .saturating_add(1);
+    loop {
+        LAST.fetch_max(stamp, Ordering::AcqRel);
+        let name = format!(
+            "{covered_lsn:020}-{stamp:016x}{}",
+            if full { "-full" } else { "" }
+        );
+        let taken = crate::store::segment_path(dir, &name).exists()
+            || archive.is_some_and(|a| {
+                crate::store::segment_path(&a.join(ARCHIVE_PAGES), &name).exists()
+            });
+        if !taken {
+            return name;
+        }
+        stamp = stamp.saturating_add(1);
+    }
+}
+
+/// The subdirectory of an archive that holds the page segments its images read from.
+const ARCHIVE_PAGES: &str = "pages";
+
+/// Remove every segment file in `dir` whose name is not in `keep`. Best effort: a file that
+/// cannot be removed now is removed by a later checkpoint or open.
+fn remove_unreferenced_segments<'a>(dir: &Path, keep: impl Iterator<Item = &'a String>) {
+    let keep: HashSet<&str> = keep.map(String::as_str).collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".seg"))
+        else {
+            continue;
+        };
+        if is_segment_name(name) && !keep.contains(name) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    // A copy into this directory that crashed leaves `<segment>.tmp` behind; no image reads it.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".tmp"))
+            .is_some_and(is_segment_name)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Place each segment `names` lists from the pages directory `from` into `to`: a hard link
+/// where the file system allows (a segment is never rewritten), otherwise a copy. A segment
+/// already there is the same file (names are never reused) and stays.
+fn link_segments(from: &Path, names: &[String], to: &Path) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+    for name in names {
+        let target = crate::store::segment_path(to, name);
+        if target.exists() {
+            continue;
+        }
+        let source = crate::store::segment_path(from, name);
+        if std::fs::hard_link(&source, &target).is_err() {
+            copy_file(&source, &target)?;
+        }
+    }
+    sync_dir(to)
+}
+
+/// Keep the segments an image reads from in the archive's pages directory, before the image
+/// itself is archived as `<covered lsn>.ckpt`, so an archived image always finds them. Beside it
+/// goes `<covered lsn>.segments`, the image's segment names one per line, so the archive can be
+/// pruned by what its kept images name. The list is durable before any segment it names is
+/// linked in, so a prune that lists the segments first and then reads the lists never removes
+/// one an image is about to name. Both are written only while that image is not archived yet:
+/// an image already there keeps the list that was written for it.
+fn archive_segments(dir: &Path, names: &[String], archive: &Path, covered_lsn: u64) -> Result<()> {
+    std::fs::create_dir_all(archive)?;
+    if archive.join(format!("{covered_lsn:020}.ckpt")).exists() {
+        return Ok(());
+    }
+    write_segment_list(archive, names, covered_lsn)?;
+    link_segments(dir, names, &archive.join(ARCHIVE_PAGES))
+}
+
+/// Write `<covered lsn>.segments` in `archive`: `names`, one per line, made durable by name.
+fn write_segment_list(archive: &Path, names: &[String], covered_lsn: u64) -> Result<()> {
+    let list = archive.join(format!("{covered_lsn:020}.segments"));
+    let scratch = list.with_extension("segments.tmp");
+    let mut text = String::new();
+    for name in names {
+        text.push_str(name);
+        text.push('\n');
+    }
+    std::fs::write(&scratch, text)?;
+    File::open(&scratch)?.sync_all()?;
+    std::fs::rename(&scratch, &list)?;
+    sync_dir(archive)
+}
+
+/// The segments the image at `image` reads from; empty for an image that holds its own pages
+/// or none.
+fn image_segment_names(image: &Path) -> Result<Vec<String>> {
+    Ok(match read_checkpoint_image(image)?.pages {
+        Some(ImagePages {
+            layout: PageLayout::Segments { names, .. },
+            ..
+        }) => names,
+        _ => Vec::new(),
+    })
+}
+
+/// Where the pages of an image are stored.
+enum PageLayout {
+    /// In the image file, from this offset, in directory order.
+    Inline { offset: u64 },
+    /// In the named segment files, page `n` of the directory at `locations[n]`.
+    Segments {
+        names: Vec<String>,
+        locations: Vec<crate::store::Location>,
+    },
+}
+
+/// The v3 header: `NCKP` + version + covered LSN + page id space + live pages + segment count +
+/// CRC32 of the fields before it.
+fn ckpt_v3_header_bytes(
+    covered_lsn: u64,
+    page_count: u64,
+    live: u64,
+    segments: u64,
+) -> [u8; CKPT_V3_HEADER_LEN] {
+    let mut header = [0u8; CKPT_V3_HEADER_LEN];
+    header[0..4].copy_from_slice(CKPT_MAGIC);
+    header[4..8].copy_from_slice(&CKPT_VERSION_SEGMENTED.to_le_bytes());
+    header[8..16].copy_from_slice(&covered_lsn.to_le_bytes());
+    header[16..24].copy_from_slice(&page_count.to_le_bytes());
+    header[24..32].copy_from_slice(&live.to_le_bytes());
+    header[32..40].copy_from_slice(&segments.to_le_bytes());
+    let crc = crc32fast::hash(&header[0..CKPT_V3_HEADER_CHECKSUMMED_LEN]);
+    header[40..44].copy_from_slice(&crc.to_le_bytes());
+    header
 }
 
 /// What a checkpoint image holds: its logical records, the log position it covers, and for a
@@ -2860,6 +3108,7 @@ fn remove_leftover_scratch(path: &Path) {
     let scratch = restore_scratch_path(path);
     let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
     let _ = std::fs::remove_file(ckpt_path(&scratch));
+    let _ = std::fs::remove_dir_all(pages_dir(&scratch));
     let _ = std::fs::remove_file(scratch);
 }
 
@@ -2937,6 +3186,7 @@ fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
     let (checksummed_len, header_len) = match version {
         CKPT_VERSION_LOGICAL => (CKPT_HEADER_CHECKSUMMED_LEN, CKPT_HEADER_LEN),
         CKPT_VERSION => (CKPT_V2_HEADER_CHECKSUMMED_LEN, CKPT_V2_HEADER_LEN),
+        CKPT_VERSION_SEGMENTED => (CKPT_V3_HEADER_CHECKSUMMED_LEN, CKPT_V3_HEADER_LEN),
         _ => return Err(corrupt("unsupported format version")),
     };
     let mut header = vec![0u8; header_len];
@@ -2967,6 +3217,13 @@ fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
             page_count,
             live,
             &corrupt,
+        )?)
+    } else if version == CKPT_VERSION_SEGMENTED {
+        let page_count = field(16).ok_or_else(|| corrupt("short header"))?;
+        let live = field(24).ok_or_else(|| corrupt("short header"))?;
+        let segments = field(32).ok_or_else(|| corrupt("short header"))?;
+        Some(read_segment_directory(
+            &mut file, len, page_count, live, segments, &corrupt,
         )?)
     } else {
         None
@@ -3041,8 +3298,138 @@ fn read_page_section(
         page_count,
         directory,
         checksums,
-        offset,
+        layout: PageLayout::Inline { offset },
     })
+}
+
+/// Read a segmented image's segment names and page directory, checking the CRC over both, and
+/// leave `file` positioned at the logical records that follow.
+fn read_segment_directory(
+    file: &mut File,
+    len: u64,
+    page_count: u64,
+    live: u64,
+    segments: u64,
+    corrupt: &dyn Fn(&str) -> Error,
+) -> Result<ImagePages> {
+    use std::io::Read;
+    let mut hasher = crc32fast::Hasher::new();
+    // Each name costs at least its two length bytes, so the count is bounded by the file.
+    if segments.saturating_mul(2) > len {
+        return Err(corrupt("segment table larger than the image"));
+    }
+    let mut names = Vec::with_capacity(usize::try_from(segments).unwrap_or(0));
+    for _ in 0..segments {
+        let mut len_bytes = [0u8; 2];
+        file.read_exact(&mut len_bytes)
+            .map_err(|_| corrupt("truncated segment table"))?;
+        hasher.update(&len_bytes);
+        let mut name = vec![0u8; usize::from(u16::from_le_bytes(len_bytes))];
+        file.read_exact(&mut name)
+            .map_err(|_| corrupt("truncated segment table"))?;
+        hasher.update(&name);
+        let name = String::from_utf8(name).map_err(|_| corrupt("segment name"))?;
+        if !is_segment_name(&name) {
+            return Err(corrupt("segment name"));
+        }
+        names.push(name);
+    }
+    let dir_bytes = live
+        .checked_mul(CKPT_V3_ENTRY_LEN as u64)
+        .filter(|&b| b <= len)
+        .ok_or_else(|| corrupt("page directory larger than the image"))?;
+    let mut raw = vec![0u8; usize::try_from(dir_bytes).map_err(|_| corrupt("page directory"))?];
+    file.read_exact(&mut raw)
+        .map_err(|_| corrupt("truncated page directory"))?;
+    hasher.update(&raw);
+    let mut stored = [0u8; 4];
+    file.read_exact(&mut stored)
+        .map_err(|_| corrupt("truncated page directory"))?;
+    if hasher.finalize() != u32::from_le_bytes(stored) {
+        return Err(corrupt("page directory checksum mismatch"));
+    }
+    let mut directory = Vec::with_capacity(raw.len() / CKPT_V3_ENTRY_LEN);
+    let mut locations = Vec::with_capacity(raw.len() / CKPT_V3_ENTRY_LEN);
+    let mut checksums = Vec::with_capacity(raw.len() / CKPT_V3_ENTRY_LEN);
+    for entry in raw.chunks_exact(CKPT_V3_ENTRY_LEN) {
+        let word = |at: usize, n: usize| entry.get(at..at + n);
+        let id = word(0, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes);
+        let segment = word(8, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes);
+        let slot = word(12, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes);
+        let crc = word(16, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes);
+        let (Some(id), Some(segment), Some(slot), Some(crc)) = (id, segment, slot, crc) else {
+            return Err(corrupt("page directory entry"));
+        };
+        if segment as usize >= names.len() {
+            return Err(corrupt(
+                "page directory names a segment the image does not list",
+            ));
+        }
+        directory.push(id);
+        locations.push(crate::store::Location { segment, slot });
+        checksums.push(crc);
+    }
+    if !directory.is_sorted_by(|a, b| a < b) || directory.last().is_some_and(|&id| id >= page_count)
+    {
+        return Err(corrupt("page directory out of order or out of range"));
+    }
+    Ok(ImagePages {
+        page_count,
+        directory,
+        checksums,
+        layout: PageLayout::Segments { names, locations },
+    })
+}
+
+/// Whether `name` is one this engine gives a segment: a log position, a dash, a hex stamp, and
+/// an optional `-full` mark. Nothing else is ever read or removed as a segment.
+fn is_segment_name(name: &str) -> bool {
+    let base = name.strip_suffix("-full").unwrap_or(name);
+    let Some((position, stamp)) = base.split_once('-') else {
+        return false;
+    };
+    position.len() == 20
+        && position.bytes().all(|b| b.is_ascii_digit())
+        && !stamp.is_empty()
+        && stamp.len() <= 16
+        && stamp.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Open the pages of an image whose single-file pages lie in `image`, or whose segments lie in
+/// `dir`.
+fn open_page_file(image: &Path, dir: &Path, pages: ImagePages) -> Result<PageFile> {
+    match pages.layout {
+        PageLayout::Inline { offset } => PageFile::open(
+            image,
+            offset,
+            pages.page_count,
+            pages.directory,
+            pages.checksums,
+        ),
+        PageLayout::Segments { names, locations } => PageFile::open_segments(
+            dir,
+            &names,
+            pages.page_count,
+            pages.directory,
+            locations,
+            pages.checksums,
+        ),
+    }
+}
+
+/// The pages directory beside the log: `<wal>.pages`, where segment files live.
+fn pages_dir(wal: &Path) -> std::path::PathBuf {
+    let mut p = wal.as_os_str().to_owned();
+    p.push(".pages");
+    p.into()
 }
 
 impl BtreeEngine {
@@ -3277,49 +3664,74 @@ impl BtreeEngine {
         self.store.dirty_bytes()
     }
 
-    /// Rename the complete image at `tmp` over `named` and back the store with its pages. The
-    /// store releases the image being replaced across the rename (a platform may refuse to
-    /// replace an open file) and gets it back if the rename fails.
+    /// Rename the complete image at `tmp` over `named` and back the store with its pages, which
+    /// lie in `dir`. The store releases the image being replaced across the rename (a platform
+    /// may refuse to replace an open file) and gets it back if the rename fails.
+    ///
+    /// `new_segment` is the segment this checkpoint wrote: it is removed when the rename fails
+    /// (no image names it), and never once the rename succeeded, since the published image
+    /// then reads from it even if a later step fails.
     fn publish_image(
         &self,
         tmp: &Path,
         named: &Path,
-        page_count: u64,
-        live: Vec<u64>,
-        new_checksums: Vec<u32>,
+        dir: &Path,
+        pages: ImagePages,
+        new_segment: Option<&str>,
     ) -> Result<()> {
-        let offset = CKPT_V2_HEADER_LEN as u64 + live.len() as u64 * 8;
-        // Where the platform keeps an open file valid across a rename, open the new image
+        // Where the platform keeps an open file valid across a rename, open the new pages
         // before it, so a failure to open cannot leave the store without its pages afterwards.
+        // Before the rename nothing names the new image or segment: a failure leaves neither.
+        let discard = || {
+            let _ = std::fs::remove_file(tmp);
+            if let Some(name) = new_segment {
+                let _ = std::fs::remove_file(crate::store::segment_path(dir, name));
+            }
+        };
         #[cfg(unix)]
-        let early = Some(PageFile::open(
-            tmp,
-            offset,
-            page_count,
-            live.clone(),
-            new_checksums.clone(),
-        )?);
+        let early = match open_page_file(tmp, dir, pages) {
+            Ok(pages) => Some(pages),
+            Err(e) => {
+                discard();
+                return Err(e);
+            },
+        };
         #[cfg(not(unix))]
-        let early: Option<PageFile> = None;
-        let previous = self.store.detach()?;
+        let (early, pages): (Option<PageFile>, ImagePages) = (None, pages);
+        let previous = match self.store.detach() {
+            Ok(previous) => previous,
+            Err(e) => {
+                discard();
+                return Err(e);
+            },
+        };
         // A platform that refuses to replace an open file gets the old one closed first; it is
-        // reopened from the still-named image if the rename fails.
+        // reopened from the same files if the rename fails.
         #[cfg(not(unix))]
         let previous = previous.map(|pages| pages.reopen_spec());
         if let Err(e) = std::fs::rename(tmp, named) {
-            let _ = std::fs::remove_file(tmp);
+            discard();
             // The old image is still in place and still the published one: keep serving from
             // it, leaving every page that changed since it was taken dirty.
             if let Some(previous) = previous {
                 #[cfg(not(unix))]
-                let previous = previous.open(named)?;
+                let previous = previous.open()?;
                 self.store.reattach(previous)?;
             }
             return Err(e.into());
         }
+        #[cfg(unix)]
+        let pages = early;
+        #[cfg(not(unix))]
         let pages = match early {
             Some(pages) => pages,
-            None => PageFile::open(named, offset, page_count, live, new_checksums)?,
+            None => open_page_file(named, dir, pages)?,
+        };
+        #[cfg(unix)]
+        let Some(pages) = pages else {
+            return Err(Error::Io(std::io::Error::other(
+                "nusadb-btree: the new image's pages were not opened",
+            )));
         };
         self.store.attach(pages)?;
         // Every resident page is clean now: shrink the cache back under its bound at once
@@ -3328,33 +3740,174 @@ impl BtreeEngine {
         Ok(())
     }
 
-    /// Write a physical image's page section to `file`: the directory of live page ids, then
-    /// those pages in the same order, straight from the cache or the previous image (the section
-    /// a later open reads pages from on demand; free pages are left out, and an id the directory
-    /// does not name is free), then a CRC32 per page and one CRC32 over the directory and that
-    /// table. Each page copy drops its rows' undo links: they index this process's version
-    /// arena, and with no transaction active no reader needs an older version. Returns the file
-    /// and the page checksums.
-    fn write_page_section(&self, file: File, live: &[u64]) -> Result<(File, Vec<u32>)> {
-        use std::io::Write;
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-        let mut section = crc32fast::Hasher::new();
-        for id in live {
-            let bytes = id.to_le_bytes();
-            section.update(&bytes);
-            out.write_all(&bytes)?;
+    /// Publish the image written at `tmp` for `plan` (see [`publish_image`](Self::publish_image))
+    /// and return the segments it reads from.
+    fn publish_plan(
+        &self,
+        tmp: &Path,
+        named: &Path,
+        dir: &Path,
+        page_count: u64,
+        live: Vec<u64>,
+        plan: SegmentPlan,
+    ) -> Result<Vec<String>> {
+        let names = plan.names.clone();
+        let new_segment = plan.new_name;
+        let pages = ImagePages {
+            page_count,
+            directory: live,
+            checksums: plan.checksums,
+            layout: PageLayout::Segments {
+                names: plan.names,
+                locations: plan.locations,
+            },
+        };
+        self.publish_image(tmp, named, dir, pages, new_segment.as_deref())?;
+        Ok(names)
+    }
+
+    /// Decide what the next image reads from: every live page the current image holds
+    /// unchanged keeps its segment and slot, and the rest go to one new segment. All pages are
+    /// written afresh (a `-full` segment) when the current image has no segments, when the
+    /// segments still named would hold more than twice the live pages, or when there would be
+    /// more than [`MAX_IMAGE_SEGMENTS`] of them, so dead pages and open files stay bounded.
+    fn plan_segments(&self, live: &[u64], covered_lsn: u64, dir: &Path) -> Result<SegmentPlan> {
+        let mut carried = self.store.carried_locations(live)?;
+        let current = self.store.image_segments()?;
+        // The current image's segments still named, by their index in its list.
+        let kept_indexes: Vec<u32> = carried
+            .iter()
+            .flatten()
+            .map(|c| c.segment)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut kept: Vec<String> = kept_indexes
+            .iter()
+            .filter_map(|&i| current.get(i as usize).and_then(|(name, _)| name.clone()))
+            .collect();
+        let changed = carried.iter().filter(|c| c.is_none()).count() as u64;
+        let kept_slots: u64 = kept_indexes
+            .iter()
+            .filter_map(|&i| current.get(i as usize).map(|(_, slots)| *slots))
+            .sum();
+        let live_count = live.len() as u64;
+        let full = kept.is_empty()
+            || kept.len() != kept_indexes.len()
+            || kept.len() + usize::from(changed > 0) > MAX_IMAGE_SEGMENTS
+            || kept_slots.saturating_add(changed)
+                > live_count.saturating_mul(2).saturating_add(1024);
+        if full {
+            carried.fill(None);
+            kept.clear();
         }
+        let to_write: Vec<usize> = carried
+            .iter()
+            .enumerate()
+            .filter_map(|(n, c)| c.is_none().then_some(n))
+            .collect();
+        let new_name = if to_write.is_empty() {
+            None
+        } else {
+            Some(new_segment_name(
+                covered_lsn,
+                full,
+                dir,
+                self.wal_archive.as_deref(),
+            ))
+        };
+        let too_many = || {
+            Error::Io(std::io::Error::other(
+                "nusadb-btree: an image cannot name that many segments or pages",
+            ))
+        };
+        // Old index in the current image to index in the new one.
+        let index_of: HashMap<u32, u32> = kept_indexes
+            .iter()
+            .enumerate()
+            .map(|(n, &old)| u32::try_from(n).map(|new| (old, new)))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| too_many())?;
+        let new_index = u32::try_from(kept.len()).map_err(|_| too_many())?;
+        let mut locations = Vec::with_capacity(live.len());
+        let mut checksums = Vec::with_capacity(live.len());
+        let mut next_slot: u32 = 0;
+        for c in &carried {
+            if let Some(c) = c {
+                let segment = index_of.get(&c.segment).copied().ok_or_else(|| {
+                    Error::Io(std::io::Error::other(
+                        "nusadb-btree: a carried page names a segment the plan does not keep",
+                    ))
+                })?;
+                locations.push(crate::store::Location {
+                    segment,
+                    slot: c.slot,
+                });
+                checksums.push(c.checksum);
+            } else {
+                locations.push(crate::store::Location {
+                    segment: new_index,
+                    slot: next_slot,
+                });
+                next_slot = next_slot.checked_add(1).ok_or_else(|| {
+                    Error::Io(std::io::Error::other(
+                        "nusadb-btree: too many pages for one segment",
+                    ))
+                })?;
+                checksums.push(0); // filled in when the page is written
+            }
+        }
+        let mut names = kept;
+        if let Some(name) = &new_name {
+            names.push(name.clone());
+        }
+        Ok(SegmentPlan {
+            names,
+            locations,
+            checksums,
+            to_write,
+            new_name,
+        })
+    }
+
+    /// Write the pages `plan` does not carry into its new segment, fsynced before any image can
+    /// name it, and record their checksums in the plan. Each page copy drops its rows' undo
+    /// links: they index this process's version arena, and with no transaction active no reader
+    /// needs an older version.
+    fn write_new_segment(&self, dir: &Path, live: &[u64], plan: &mut SegmentPlan) -> Result<()> {
+        let Some(name) = &plan.new_name else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(dir)?;
+        // The directory's own entry must be durable before an image can name what is in it.
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent)?;
+        }
+        let path = crate::store::segment_path(dir, name);
+        let ids: Vec<u64> = plan
+            .to_write
+            .iter()
+            .filter_map(|&n| live.get(n).copied())
+            .collect();
+        let mut out = std::io::BufWriter::with_capacity(
+            1 << 20,
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?,
+        );
         let checksums =
             self.store
-                .write_pages_to(&mut out, live, &crate::node::clear_undo_links)?;
-        for crc in &checksums {
-            let bytes = crc.to_le_bytes();
-            section.update(&bytes);
-            out.write_all(&bytes)?;
-        }
-        out.write_all(&section.finalize().to_le_bytes())?;
+                .write_pages_to(&mut out, &ids, &crate::node::clear_undo_links)?;
         let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-        Ok((file, checksums))
+        file.sync_all()?;
+        sync_dir(dir)?;
+        for (&n, crc) in plan.to_write.iter().zip(checksums) {
+            if let Some(slot) = plan.checksums.get_mut(n) {
+                *slot = crc;
+            }
+        }
+        Ok(())
     }
 
     /// Whether pages changed since the last checkpoint fill half the resident ceiling or more:
@@ -3581,17 +4134,24 @@ impl BtreeEngine {
         // memory stays at the writer's buffer whatever the size of the database.
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
+        let dir = pages_dir(&wal.path);
         let page_count = self.store.page_count();
         let live = self.store.live_ids()?;
-        let mut new_checksums: Vec<u32> = Vec::new();
+        // The segments the image being replaced reads from stay on disk until the checkpoint
+        // after this one, so a copy of that image taken just before this checkpoint still finds
+        // them.
+        let replaced: Vec<String> = self
+            .store
+            .image_segments()?
+            .into_iter()
+            .filter_map(|(name, _)| name)
+            .collect();
+        let mut plan = self.plan_segments(&live, covered_lsn, &dir)?;
         let written: Result<()> = (|| {
-            let mut file = File::create(&tmp)?;
-            std::io::Write::write_all(
-                &mut file,
-                &ckpt_header_bytes(covered_lsn, page_count, live.len() as u64),
-            )?;
-            let (file, checksums) = self.write_page_section(file, &live)?;
-            new_checksums = checksums;
+            self.write_new_segment(&dir, &live, &mut plan)?;
+            let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+            write_segment_directory(&mut file, covered_lsn, page_count, &live, &plan)?;
+            let file = file.into_inner().map_err(|e| Error::Io(e.into_error()))?;
             let mut writer = WalWriter::new(file);
             Self::emit_image(&cat, &seqs, synthetic_txn, stamp, &mut |record| {
                 writer.append(record).map(|_| ())
@@ -3605,6 +4165,7 @@ impl BtreeEngine {
         if let Err(e) = written {
             // A partial image is never renamed; leave nothing behind for the next open to tidy.
             let _ = std::fs::remove_file(&tmp);
+            plan.discard_new(&dir);
             return Err(e);
         }
         // Phase 2: the atomic publish — a named image is complete by construction. Fsync the
@@ -3613,7 +4174,7 @@ impl BtreeEngine {
         // The store reads pages from the image being replaced; release it across the rename
         // (a platform may refuse to replace an open file) and back the store with the new one.
         // Under the quiesce no page is read in between.
-        self.publish_image(&tmp, &named, page_count, live, new_checksums)?;
+        let names = self.publish_plan(&tmp, &named, &dir, page_count, live, plan)?;
         #[cfg(unix)]
         if let Some(dir) = wal.path.parent()
             && let Ok(dir) = File::open(dir)
@@ -3627,13 +4188,16 @@ impl BtreeEngine {
         // truncated and the image just published are kept there first: a failure here leaves
         // image plus full log, which the next open reads correctly, and nothing is archived twice.
         wal.writer.flush()?;
-        if let Some(dir) = &self.wal_archive {
-            archive_checkpoint(dir, &wal.path, &named, covered_lsn)?;
+        if let Some(archive) = &self.wal_archive {
+            archive_segments(&dir, &names, archive, covered_lsn)?;
+            archive_checkpoint(archive, &wal.path, &named, covered_lsn)?;
         }
         let file = wal.writer.get_mut();
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
         file.sync_all()?;
+        // Segments neither this image nor the one it replaced reads from are garbage now.
+        remove_unreferenced_segments(&dir, names.iter().chain(replaced.iter()));
         Ok(())
     }
 }
@@ -3715,7 +4279,9 @@ pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
     let (images, _) = list_archive_readonly(archive)?;
     for &lsn in images.iter().rev() {
         let image = archive.join(format!("{lsn:020}.ckpt"));
-        if read_checkpoint_image(&image).is_ok() {
+        if let Ok(names) = image_segment_names(&image) {
+            // The segments first: an image in place always finds them.
+            link_segments(&archive.join(ARCHIVE_PAGES), &names, &pages_dir(out_wal))?;
             copy_file(&image, &ckpt_path(out_wal))?;
             if let Some(dir) = out_wal.parent() {
                 sync_dir(dir)?;
@@ -4331,6 +4897,12 @@ impl PendingFork {
                 std::fs::create_dir_all(&superseded)?;
                 let name = format!("{lsn:020}.{ext}");
                 std::fs::rename(archive.join(&name), superseded.join(&name))?;
+                // The image's segment list goes with it; its segments stay in the archive's
+                // pages directory, which the lists of the images kept still refer to.
+                let list = format!("{lsn:020}.segments");
+                if ext == "ckpt" && archive.join(&list).exists() {
+                    std::fs::rename(archive.join(&list), superseded.join(&list))?;
+                }
                 moved = true;
             }
         }
