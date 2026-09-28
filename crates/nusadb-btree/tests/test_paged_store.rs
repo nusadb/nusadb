@@ -131,8 +131,9 @@ fn dirty_pages_stay_until_a_checkpoint_and_the_cache_refuses_to_grow_past_them()
     let capacity = 48 * PAGE_SIZE as u64;
     let engine = BtreeEngine::open(dir.path().join("btree.wal"))
         .unwrap()
+        .without_page_spill()
         .with_max_total_resident_bytes(Some(capacity));
-    // Write far more than the cache can hold dirty: the growth is refused, not spilled.
+    // With spill off, write far more than the cache can hold dirty: the growth is refused.
     let mut refused = false;
     for batch in 0..40 {
         let txn = engine.begin(RC).unwrap();
@@ -534,6 +535,7 @@ fn purge_yields_to_a_checkpoint_under_page_cache_pressure() {
     let capacity = 64 * PAGE_SIZE as u64;
     let engine = BtreeEngine::open(dir.path().join("btree.wal"))
         .unwrap()
+        .without_page_spill()
         .with_max_total_resident_bytes(Some(capacity));
     let txn = engine.begin(RC).unwrap();
     let mut scan = engine.scan(txn, table).unwrap();

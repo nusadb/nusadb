@@ -110,38 +110,45 @@ Table pages live in a page cache backed by the last checkpoint image. The image 
 page of the database; a page is read from it on first use, so a restart does not load the whole
 database before serving, and a page that has not changed since the last checkpoint (a clean page)
 can leave the cache again when memory is needed. A page changed since the last checkpoint (a
-dirty page) stays in memory until the next checkpoint publishes an image that holds it, because
-the write-ahead log and the image are the only durable copies of the data.
+dirty page) is not in the image yet. When the cache holds nothing clean to evict, a dirty page is
+written to a scratch file beside the log (`btree.wal.spill`) and leaves memory; it is read back
+from there when needed. The scratch file is not a durable copy: recovery never reads it, and it is
+emptied at open (on Linux and macOS it is unlinked as soon as it is created, so it does not appear
+in the directory). The write-ahead log and the image remain the only durable copies of the data,
+and the next checkpoint writes every changed page into the new image and empties the scratch file.
 
-`--max-resident-bytes` (derived from the memory budget when unset) bounds the cache. Clean pages are
-evicted first; once dirty pages and secondary index entries reach the bound, the next insert or
-update is refused before it starts (a write already under way always completes) with an error that
-names the limit and the bytes held:
+`--max-resident-bytes` (derived from the memory budget when unset) bounds the cache. Clean pages
+are evicted first, then dirty pages spill, so the pages changed between checkpoints are bounded
+by disk rather than memory. The scratch file grows to at most the pages changed since the last
+checkpoint, which the checkpoint threshold keeps in proportion to the log. What still counts
+against the bound is index entries; once they reach it, the next insert or update is
+refused before it starts (a write already under way always completes) with an error that names
+the limit and the bytes held:
 
 ```text
 ERROR XX000: out of memory: the engine reached its resident-memory limit of 858993440 bytes
-(859001088 bytes held: pages changed since the last checkpoint plus index entries); let a
-checkpoint run, free rows (DELETE/TRUNCATE), raise the limit, or use a larger host
+(859001088 bytes held by index entries); free rows (DELETE/TRUNCATE), drop indexes that are not
+needed, raise the limit, or use a larger host
 ```
 
 Reads keep working at the bound: a page loaded for a read may briefly overshoot it and is the first
-to leave again. The remedy for a refused write is a checkpoint (the background worker runs one when
-the log passes `--checkpoint-threshold-bytes` or when changed pages fill half the cache, or issue
-`CHECKPOINT`), after which every page is clean and the cache can grow again. So the bound sizes the
-working set of changes between checkpoints, not the database: on a host with a bound well below the
-data, set the checkpoint threshold so a checkpoint runs before the changes fill the cache.
+to leave again. If the scratch file cannot be written (a full disk), the page stays in memory and
+the cache grows past the bound until the next checkpoint instead of failing the write.
 
 `DELETE`, `TRUNCATE`, `CREATE INDEX` and the background purge are not refused at the bound, so
 space can always be freed; a large `DELETE` is still capped per transaction by
-`--max-txn-write-bytes`, and the purge stops early to let a checkpoint run once changed pages
-fill half the cache.
+`--max-txn-write-bytes`.
 
-Two things still live in memory whatever the bound:
+A table scan reads the table a batch of rows at a time rather than loading it whole, so a
+full scan of a table larger than memory stays within the cache. A scan still open when its
+transaction commits or rolls back (a cursor left open) is read to its end at that moment.
 
-- Secondary index entries (B-tree indexes on columns, vector indexes). They are rebuilt from the
-  image's index records at open and count against the bound.
-- Every dirty page, as above. A checkpoint writes the whole image (every live page, changed or
-  not), so its cost grows with the database, not with the changes.
+Index entries (the primary key index, B-tree indexes on columns, vector indexes) still live in
+memory whatever the bound. They are rebuilt from the image's index records at open and count
+against the bound.
+
+A checkpoint writes the whole image (every live page, changed or not), so its cost grows with the
+database, not with the changes.
 
 Deleting rows frees pages for reuse and lowers the count the next image carries; page memory
 within a running process is recycled through the cache rather than returned to the OS.

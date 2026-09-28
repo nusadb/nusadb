@@ -1049,8 +1049,10 @@ mod tests {
 
         // Reopen with a ceiling well BELOW the recovered footprint: recovery must still complete.
         let ceiling = footprint / 2;
+        // Spill off: with it on, changed pages would leave memory and the insert below succeed.
         let engine = BtreeEngine::open(&path)
             .unwrap()
+            .without_page_spill()
             .with_max_total_resident_bytes(Some(ceiling));
         let scan = engine.begin(RC).unwrap();
         let table = engine.lookup_table("t").unwrap().unwrap();

@@ -1114,14 +1114,26 @@ impl BtreeEngine {
         self
     }
 
+    /// Keep changed pages in memory until the next checkpoint instead of spilling them, so the
+    /// resident ceiling refuses writes once they fill it. Call right after
+    /// [`open`](Self::open), before any write.
+    #[must_use]
+    pub fn without_page_spill(self) -> Self {
+        if let Err(e) = self.store.disable_spill() {
+            tracing::warn!(error = %e, "could not turn page spill off");
+        }
+        self
+    }
+
     /// Set the resident-memory ceiling (bytes), returning the engine: it bounds the page cache
-    /// (clean pages are evicted to stay under it) and refuses a row `insert` or `update` with
-    /// [`Error::OutOfMemory`] once pages changed since the last checkpoint plus index entries
-    /// reach it. `None` (the default) means unlimited. Complements
-    /// [`with_max_txn_write_bytes`](Self::with_max_txn_write_bytes): that bounds one in-flight
-    /// transaction, this bounds what the whole engine holds. Intended to be called once, right after
-    /// [`new`](Self::new) / [`open`](Self::open), before the engine is shared, so recovery always
-    /// completes unbounded.
+    /// (clean pages are evicted to stay under it, and on an engine opened on a path, changed
+    /// pages spill to a scratch file beside the log when nothing clean is left to evict) and
+    /// refuses a row `insert` or `update` with [`Error::OutOfMemory`] once index entries, plus
+    /// the changed pages that cannot spill, reach it. `None` (the default) means unlimited.
+    /// Complements [`with_max_txn_write_bytes`](Self::with_max_txn_write_bytes): that bounds one
+    /// in-flight transaction, this bounds what the whole engine holds. Intended to be called
+    /// once, right after [`new`](Self::new) / [`open`](Self::open), before the engine is shared,
+    /// so recovery always completes unbounded.
     #[must_use]
     pub fn with_max_total_resident_bytes(mut self, limit: Option<u64>) -> Self {
         self.max_total_resident_bytes = limit;
@@ -1129,11 +1141,16 @@ impl BtreeEngine {
         self
     }
 
-    /// Bytes the engine holds that no eviction can release: dirty pages (they differ from the
-    /// last image) and every secondary index entry. The resident ceiling is enforced against
-    /// this, since clean pages leave the cache on demand.
+    /// Bytes the engine holds that no eviction can release: dirty pages when they cannot spill
+    /// (they differ from the last image) and every secondary index entry. The resident ceiling
+    /// is enforced against this, since clean pages leave the cache on demand.
     fn pinned_bytes(&self) -> Result<u64> {
-        let mut total = self.store.dirty_bytes();
+        // Changed pages count only when they cannot leave memory; with a spill file they can.
+        let mut total = if self.store.can_spill() {
+            0
+        } else {
+            self.store.dirty_bytes()
+        };
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         for idx in cat.indexes.values() {
             let bytes = idx.data.read().map_err(|_| poisoned())?.bytes;
@@ -1355,6 +1372,7 @@ impl BtreeEngine {
     ) -> Result<Self> {
         let mut engine = Self::new();
         engine.standby = AtomicBool::new(standby);
+        engine.store.enable_spill(open_spill_file(path)?)?;
         if let Some(dir) = &archive
             && dir.is_dir()
         {
@@ -1363,15 +1381,8 @@ impl BtreeEngine {
         engine.wal_archive = archive;
         // A checkpoint image, when present, replaces the log prefix it covers: recovery replays
         // the image's records first, then only the log records with an LSN past the image's
-        // watermark. A leftover `.ckpt.tmp` is a checkpoint that crashed before its atomic
-        // rename — never named, never authoritative — and is simply removed.
-        let _ = std::fs::remove_file(ckpt_tmp_path(path));
-        // A restore that crashed before or during its publish leaves its scratch files
-        // behind; nothing reads them.
-        let scratch = restore_scratch_path(path);
-        let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
-        let _ = std::fs::remove_file(ckpt_path(&scratch));
-        let _ = std::fs::remove_file(scratch);
+        // watermark.
+        remove_leftover_scratch(path);
         let ImageContents {
             mut records,
             covered_lsn,
@@ -2750,14 +2761,23 @@ fn txn_memory_exceeded(limit: u64, attempted: u64) -> Error {
     ))
 }
 
-/// The loud error an `insert` hits when the in-memory page store has grown to the configured global
-/// resident-memory ceiling — so the write aborts gracefully instead of growing until the OS
-/// OOM-kills the server. `DELETE`/`TRUNCATE` stay available to free space.
-fn resident_memory_exceeded(limit: u64, resident: u64) -> Error {
+/// The loud error an `insert` hits when what the engine cannot evict has grown to the configured
+/// global resident-memory ceiling, so the write aborts gracefully instead of growing until the
+/// OS kills the server. `DELETE`/`TRUNCATE` stay available to free space. `pages_counted` says
+/// whether changed pages count (they do only when they cannot spill); only then can a
+/// checkpoint lower the figure.
+fn resident_memory_exceeded(limit: u64, resident: u64, pages_counted: bool) -> Error {
+    if pages_counted {
+        return Error::OutOfMemory(format!(
+            "the engine reached its resident-memory limit of {limit} bytes ({resident} bytes \
+             held: pages changed since the last checkpoint plus index entries); let a checkpoint \
+             run, free rows (DELETE/TRUNCATE), raise the limit, or use a larger host"
+        ));
+    }
     Error::OutOfMemory(format!(
-        "the engine reached its resident-memory limit of {limit} bytes ({resident} bytes held: \
-         pages changed since the last checkpoint plus index entries); let a checkpoint run, free \
-         rows (DELETE/TRUNCATE), raise the limit, or use a larger host"
+        "the engine reached its resident-memory limit of {limit} bytes ({resident} bytes held by \
+         index entries); free rows (DELETE/TRUNCATE), drop indexes that are not needed, raise the \
+         limit, or use a larger host"
     ))
 }
 
@@ -2830,6 +2850,35 @@ struct ImageContents {
     covered_lsn: u64,
     /// The page section; `None` for a logical image.
     pages: Option<ImagePages>,
+}
+
+/// Remove what a crashed checkpoint or restore left beside the log: a `.ckpt.tmp` is a checkpoint
+/// that crashed before its atomic rename (never named, never authoritative), and a restore that
+/// crashed before or during its publish leaves its scratch files behind. Nothing reads them.
+fn remove_leftover_scratch(path: &Path) {
+    let _ = std::fs::remove_file(ckpt_tmp_path(path));
+    let scratch = restore_scratch_path(path);
+    let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
+    let _ = std::fs::remove_file(ckpt_path(&scratch));
+    let _ = std::fs::remove_file(scratch);
+}
+
+/// The scratch file changed pages may leave memory for, beside the log (`<wal>.spill`). It is
+/// never read by recovery; where the platform allows, it is unlinked at once and vanishes with
+/// the process.
+fn open_spill_file(wal: &Path) -> Result<File> {
+    let mut path = wal.as_os_str().to_owned();
+    path.push(".spill");
+    let path = std::path::PathBuf::from(path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+    Ok(file)
 }
 
 /// The image path beside the log: `<wal>.ckpt`.
@@ -3222,7 +3271,8 @@ impl BtreeEngine {
         self.store.page_count()
     }
 
-    /// Bytes of resident pages that differ from the last image and so cannot be evicted.
+    /// Bytes of resident pages that differ from the last image (they leave memory only by
+    /// spilling).
     pub fn dirty_page_bytes(&self) -> u64 {
         self.store.dirty_bytes()
     }
@@ -3311,8 +3361,15 @@ impl BtreeEngine {
     /// a checkpoint makes them clean again before writes run out of room. Always `false`
     /// without a ceiling.
     pub fn page_cache_needs_checkpoint(&self) -> bool {
-        self.max_total_resident_bytes
-            .is_some_and(|limit| self.store.dirty_bytes().saturating_mul(2) >= limit)
+        !self.store.can_spill()
+            && self
+                .max_total_resident_bytes
+                .is_some_and(|limit| self.store.dirty_bytes().saturating_mul(2) >= limit)
+    }
+
+    /// Bytes of changed pages held in the spill file (they leave it at the next checkpoint).
+    pub fn spilled_page_bytes(&self) -> u64 {
+        self.store.spilled_bytes()
     }
 
     /// Page slots currently on the store's free list: every page a drop, a rollback, purge or a
@@ -7357,9 +7414,10 @@ impl BtreeEngine {
     /// ceiling, **before** the write mutates anything, so a rejection leaves no partial state and
     /// the transaction aborts through the ordinary undo path. The page store itself never refuses
     /// (a split must never stop half way), which is why the refusal lives at this boundary. `None`
-    /// limit (the default) never rejects. The footprint is pages changed since the last checkpoint
-    /// plus the in-memory indexes ([`pinned_bytes`](Self::pinned_bytes)); clean pages do not count,
-    /// since the cache evicts them. A `CREATE INDEX`, which builds through `index_insert`, is not
+    /// limit (the default) never rejects. The footprint is pages changed since the last
+    /// checkpoint that cannot spill plus the in-memory indexes
+    /// ([`pinned_bytes`](Self::pinned_bytes)); clean pages do not count, since the cache evicts
+    /// them. A `CREATE INDEX`, which builds through `index_insert`, is not
     /// gated and keeps its prior behavior.
     fn check_resident_memory(&self, incoming: u64) -> Result<()> {
         let Some(limit) = self.max_total_resident_bytes else {
@@ -7369,7 +7427,11 @@ impl BtreeEngine {
         // The incoming bytes count too: a row that spills into an overflow chain can be
         // megabytes, and admitting it on the footprint before it lands would overshoot by that.
         if resident >= limit || resident.saturating_add(incoming) > limit {
-            return Err(resident_memory_exceeded(limit, resident));
+            return Err(resident_memory_exceeded(
+                limit,
+                resident,
+                !self.store.can_spill(),
+            ));
         }
         Ok(())
     }

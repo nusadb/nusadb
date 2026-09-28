@@ -249,6 +249,138 @@ impl PageFileSpec {
 }
 
 #[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, at)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        let n = file.seek_write(&buf[done..], at + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "short write to the spill file",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Changed pages that left memory: a scratch file of page slots and where each page sits. Never
+/// durable and never read by recovery (the log and the image are the durable copies); it only
+/// keeps a changed page off the heap until the next checkpoint writes it into an image.
+#[derive(Debug, Default)]
+struct Spill {
+    file: Option<File>,
+    /// Page id to its slot and the generation of the copy written there.
+    slots: HashMap<u64, (u64, u64)>,
+    free_slots: Vec<u64>,
+    next_slot: u64,
+    /// Stamped on every copy written, so a reader can tell whether the copy it loaded is still
+    /// the latest one.
+    next_generation: u64,
+    /// The last write failed: the warning is logged once per run of failures, not per page.
+    failing: bool,
+}
+
+/// Where the current copy of a page is, as `locate` found it.
+enum Located {
+    Resident(Arc<Frame>),
+    Spilled(Box<Page>, u64),
+    Image,
+}
+
+/// Where a copy of a page handed to `insert_frame` came from, which decides whether it may
+/// become the resident copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Written by the caller: it is the newest copy by definition.
+    Fresh,
+    /// Read from the image: valid only while no spilled copy exists.
+    Image,
+    /// Read from the spill with this generation: valid only while that copy is still the latest.
+    Spill(u64),
+}
+
+impl Spill {
+    /// Write `page` for `id` into a slot. Fails only on I/O.
+    fn put(&mut self, id: u64, page: &Page) -> std::io::Result<()> {
+        let Some(file) = &self.file else {
+            return Err(std::io::Error::other("no spill file"));
+        };
+        let existing = self.slots.get(&id).map(|&(slot, _)| slot);
+        let slot = match existing {
+            Some(slot) => slot,
+            None => self.free_slots.pop().unwrap_or_else(|| {
+                let slot = self.next_slot;
+                self.next_slot += 1;
+                slot
+            }),
+        };
+        if let Err(e) = write_all_at(file, page, slot * PAGE_SIZE as u64) {
+            // A slot taken for this write goes back, so a failed write leaks no file space.
+            if existing.is_none() {
+                self.free_slots.push(slot);
+            }
+            if !self.failing {
+                self.failing = true;
+                tracing::warn!(
+                    error = %e,
+                    "could not write a changed page to the spill file; changed pages stay in \
+                     memory until writes succeed again"
+                );
+            }
+            return Err(e);
+        }
+        self.failing = false;
+        self.next_generation += 1;
+        self.slots.insert(id, (slot, self.next_generation));
+        Ok(())
+    }
+
+    /// The spilled copy of `id` and its generation, if there is one.
+    fn get(&self, id: u64) -> std::io::Result<Option<(Page, u64)>> {
+        let (Some(file), Some(&(slot, generation))) = (&self.file, self.slots.get(&id)) else {
+            return Ok(None);
+        };
+        let mut page = [0u8; PAGE_SIZE];
+        read_exact_at(file, &mut page, slot * PAGE_SIZE as u64)?;
+        Ok(Some((page, generation)))
+    }
+
+    /// Whether a copy of `id` from `source` is still the latest one.
+    fn admits(&self, id: u64, source: Source) -> bool {
+        match source {
+            Source::Fresh => true,
+            Source::Image => !self.slots.contains_key(&id),
+            Source::Spill(generation) => self.slots.get(&id).is_some_and(|&(_, g)| g == generation),
+        }
+    }
+
+    /// Forget `id`'s spilled copy (it is resident again, freed, or in a new image).
+    fn remove(&mut self, id: u64) {
+        if let Some((slot, _)) = self.slots.remove(&id) {
+            self.free_slots.push(slot);
+        }
+    }
+
+    /// Forget every spilled copy and give the file's space back.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.free_slots.clear();
+        self.next_slot = 0;
+        if let Some(file) = &self.file {
+            let _ = file.set_len(0);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, at)
@@ -284,13 +416,16 @@ struct Frame {
 /// published checkpoint image.
 ///
 /// A page not resident is loaded from the image on first use; a page that differs from the image
-/// (dirty) stays resident until the next checkpoint publishes an image that holds it, after which
-/// every page is clean again. Under a capacity, clean pages are evicted by the clock (second-
-/// chance) rule to make room; dirty pages are never evicted. The store itself never refuses a page:
-/// a tree operation (a split writes several pages) must never stop half way, so a cache full of
-/// dirty pages simply grows past its capacity, and the engine refuses new writes at an operation
-/// boundary instead, from what cannot be evicted. Without a capacity, nothing is evicted and the
-/// store behaves like an in-memory one that merely loads lazily. Without an image (the in-memory
+/// (dirty) stays out of the image until the next checkpoint publishes one that holds it, after
+/// which every page is clean again. Under a capacity, clean pages are evicted by the clock
+/// (second-chance) rule to make room. When every resident page is dirty, a dirty page is written
+/// to the spill file, if one is enabled, and leaves memory; it comes back from there as a dirty
+/// page. The spill is scratch space, never durable and never read by recovery. The store itself
+/// never refuses a page: a tree operation (a split writes several pages) must never stop half
+/// way, so without a spill a cache full of dirty pages simply grows past its capacity, and the
+/// engine refuses new writes at an operation boundary instead, from what cannot be evicted.
+/// Without a capacity, nothing is evicted and the store behaves like an in-memory one that
+/// merely loads lazily. Without an image (the in-memory
 /// engine, or a database before its first checkpoint) every page is resident.
 ///
 /// Latching mirrors [`MemPageStore`]: the frame directory is read-locked for the lookup, each
@@ -320,6 +455,9 @@ pub struct PagedStore {
     dirty_frames: AtomicU64,
     /// The image's page section, when the store is backed by one.
     file: RwLock<Option<PageFile>>,
+    /// Changed pages evicted to scratch space. Taken after the directory and a frame latch,
+    /// never before them.
+    spill: Mutex<Spill>,
 }
 
 #[allow(
@@ -328,8 +466,9 @@ pub struct PagedStore {
 )]
 impl PagedStore {
     /// Bound the cache to `bytes` of page frames (`None`: unbounded). Clean pages are evicted to
-    /// stay under it; dirty pages never leave the cache, so it can exceed the bound while they
-    /// fill it (the engine refuses new writes at an operation boundary then).
+    /// stay under it, and dirty pages spill when a spill file is enabled. Without one, dirty pages
+    /// stay, so the cache can exceed the bound while they fill it (the engine refuses new writes
+    /// at an operation boundary then).
     pub fn set_capacity_bytes(&self, bytes: Option<u64>) {
         let frames = bytes.map_or(0, |b| b / PAGE_SIZE as u64);
         self.capacity_frames.store(frames, Ordering::Release);
@@ -366,7 +505,44 @@ impl PagedStore {
         Ok((frames.len() as u64).saturating_mul(PAGE_SIZE as u64))
     }
 
-    /// Bytes of resident frames that differ from the image and so cannot be evicted.
+    /// Let changed pages leave memory for `file` (a scratch file the store owns from now on)
+    /// when no clean page can be evicted. Without it a changed page stays resident until the
+    /// next checkpoint.
+    ///
+    /// # Errors
+    /// Fails only on a poisoned lock.
+    pub fn enable_spill(&self, file: File) -> Result<()> {
+        let mut spill = self.spill.lock().map_err(|_| poisoned())?;
+        spill.file = Some(file);
+        Ok(())
+    }
+
+    /// Keep changed pages in memory from now on (they stay until the next checkpoint). Has no
+    /// effect once a page has been spilled, since the spill then holds its only copy.
+    ///
+    /// # Errors
+    /// Fails only on a poisoned lock.
+    pub fn disable_spill(&self) -> Result<()> {
+        let mut spill = self.spill.lock().map_err(|_| poisoned())?;
+        if spill.slots.is_empty() {
+            spill.file = None;
+        }
+        Ok(())
+    }
+
+    /// Whether changed pages may leave memory.
+    pub fn can_spill(&self) -> bool {
+        self.spill.lock().is_ok_and(|spill| spill.file.is_some())
+    }
+
+    /// Bytes of changed pages held in the spill file.
+    pub fn spilled_bytes(&self) -> u64 {
+        self.spill.lock().map_or(0, |spill| {
+            (spill.slots.len() as u64).saturating_mul(PAGE_SIZE as u64)
+        })
+    }
+
+    /// Bytes of resident frames that differ from the image: they leave memory only by spilling.
     pub fn dirty_bytes(&self) -> u64 {
         self.dirty_frames
             .load(Ordering::Acquire)
@@ -410,6 +586,8 @@ impl PagedStore {
         }
         self.next_id.fetch_max(pages.page_count, Ordering::AcqRel);
         *self.file.write().map_err(|_| poisoned())? = Some(pages);
+        // Every spilled page was written into this image: nothing is spilled any more.
+        self.spill.lock().map_err(|_| poisoned())?.clear();
         Ok(())
     }
 
@@ -468,25 +646,35 @@ impl PagedStore {
         let file = self.file.read().map_err(|_| poisoned())?;
         let mut checksums = Vec::with_capacity(ids.len());
         for &id in ids {
-            let resident = self
-                .frames
-                .read()
-                .map_err(|_| poisoned())?
-                .get(&id)
-                .cloned();
-            let mut page = if let Some(frame) = resident {
-                *frame.data.read().map_err(|_| poisoned())?
-            } else {
-                match file.as_ref() {
+            let mut page = match self.locate(id)? {
+                Located::Resident(frame) => *frame.data.read().map_err(|_| poisoned())?,
+                Located::Spilled(page, _) => *page,
+                Located::Image => match file.as_ref() {
                     Some(pages) if pages.holds(id) => pages.read(id)?,
                     _ => return Err(bad_page(PageId(id))),
-                }
+                },
             };
             fix(&mut page);
             checksums.push(crc32fast::hash(&page));
             out.write_all(&page)?;
         }
         Ok(checksums)
+    }
+
+    /// Where the current copy of `id` is: resident, spilled, or (neither) the image. Both are
+    /// looked up under one hold of the directory lock, which every move between memory and the
+    /// spill takes for writing, so a page in transit is never missed. When neither holds it,
+    /// the image's copy is current: a changed page is always resident or spilled.
+    fn locate(&self, id: u64) -> Result<Located> {
+        let frames = self.frames.read().map_err(|_| poisoned())?;
+        if let Some(frame) = frames.get(&id) {
+            return Ok(Located::Resident(Arc::clone(frame)));
+        }
+        let spilled = self.spill.lock().map_err(|_| poisoned())?.get(id)?;
+        drop(frames);
+        Ok(spilled.map_or(Located::Image, |(page, generation)| {
+            Located::Spilled(Box::new(page), generation)
+        }))
     }
 
     fn resident(&self, id: u64) -> Result<Option<Arc<Frame>>> {
@@ -502,7 +690,13 @@ impl PagedStore {
     /// is at its capacity. `None` when a frame for `id` is already resident (a racing load or
     /// write got there first); the caller then goes through that frame. When nothing can be
     /// evicted the frame goes in anyway: refusing here could stop a tree operation half way.
-    fn insert_frame(&self, id: u64, page: &Page, dirty: bool) -> Result<Option<Arc<Frame>>> {
+    fn insert_frame(
+        &self,
+        id: u64,
+        page: &Page,
+        dirty: bool,
+        source: Source,
+    ) -> Result<Option<Arc<Frame>>> {
         self.make_room()?;
         let frame = Arc::new(Frame {
             data: RwLock::new(*page),
@@ -514,6 +708,16 @@ impl PagedStore {
             if frames.contains_key(&id) {
                 return Ok(None);
             }
+            // A copy loaded while a newer one was spilled (or re-spilled) is stale: refuse it,
+            // and the caller loads again. Checked and settled under the directory lock, which
+            // every spill write also holds.
+            let mut spill = self.spill.lock().map_err(|_| poisoned())?;
+            if !spill.admits(id, source) {
+                return Ok(None);
+            }
+            // The page is resident again: its spilled copy, if any, is stale from here on.
+            spill.remove(id);
+            drop(spill);
             frames.insert(id, Arc::clone(&frame));
             if dirty {
                 self.dirty_frames.fetch_add(1, Ordering::AcqRel);
@@ -553,8 +757,9 @@ impl PagedStore {
             if len < capacity {
                 return Ok(());
             }
-            // Nothing is evictable while every resident page is dirty: skip the sweep.
-            if self.dirty_frames.load(Ordering::Acquire) >= len {
+            // While every resident page is dirty, only spilling can make room.
+            let spill_dirty = self.dirty_frames.load(Ordering::Acquire) >= len;
+            if spill_dirty && !self.can_spill() {
                 return Ok(());
             }
             let mut clock = self.clock.lock().map_err(|_| poisoned())?;
@@ -567,21 +772,31 @@ impl PagedStore {
                 let Some(frame) = frames.get(&id).cloned() else {
                     continue; // evicted or freed already
                 };
-                if frame.dirty.load(Ordering::Acquire)
-                    || frame.referenced.swap(false, Ordering::AcqRel)
-                {
+                let dirty = frame.dirty.load(Ordering::Acquire);
+                if (dirty && !spill_dirty) || frame.referenced.swap(false, Ordering::AcqRel) {
                     clock.push_back(id);
                     continue;
                 }
                 // Evict only a frame no one is reading or writing right now, and only if it is
                 // still clean under its latch: a writer marks dirty while holding it.
-                let Ok(_latch) = frame.data.try_write() else {
+                let Ok(latch) = frame.data.try_write() else {
                     clock.push_back(id);
                     continue;
                 };
                 if frame.dirty.load(Ordering::Acquire) {
-                    clock.push_back(id);
-                    continue;
+                    if !spill_dirty {
+                        clock.push_back(id);
+                        continue;
+                    }
+                    // Write the page out and register it before the frame leaves the directory,
+                    // so whoever looks next finds it in the spill. A failed write keeps it
+                    // resident: the store never fails a caller because of the spill.
+                    let spilled = self.spill.lock().map_err(|_| poisoned())?.put(id, &latch);
+                    if spilled.is_err() {
+                        clock.push_back(id);
+                        break;
+                    }
+                    self.dirty_frames.fetch_sub(1, Ordering::AcqRel);
                 }
                 frames.remove(&id);
                 evicted = true;
@@ -603,7 +818,8 @@ impl PagedStore {
 impl PageStore for PagedStore {
     fn read_page(&self, id: PageId) -> Result<Page> {
         loop {
-            if let Some(frame) = self.resident(id.0)? {
+            let located = self.locate(id.0)?;
+            if let Located::Resident(frame) = located {
                 frame.referenced.store(true, Ordering::Release);
                 let page = frame.data.read().map_err(|_| poisoned())?;
                 return Ok(*page);
@@ -611,16 +827,19 @@ impl PageStore for PagedStore {
             if self.free.lock().map_err(|_| poisoned())?.1.contains(&id.0) {
                 return Err(bad_page(id));
             }
-            let page = {
+            // A changed page that was spilled comes back as a changed page.
+            let (page, dirty, source) = if let Located::Spilled(page, generation) = located {
+                (*page, true, Source::Spill(generation))
+            } else {
                 let file = self.file.read().map_err(|_| poisoned())?;
                 match file.as_ref() {
-                    Some(pages) if pages.holds(id.0) => pages.read(id.0)?,
+                    Some(pages) if pages.holds(id.0) => (pages.read(id.0)?, false, Source::Image),
                     _ => return Err(bad_page(id)),
                 }
             };
-            // The image's copy is what a fresh clean frame holds; return it directly. A racing
-            // load or write that made the page resident first is read on the next pass.
-            if self.insert_frame(id.0, &page, false)?.is_some() {
+            // A fresh frame holds exactly this copy; return it directly. A racing load or write
+            // that made the page resident first is read on the next pass.
+            if self.insert_frame(id.0, &page, dirty, source)?.is_some() {
                 return Ok(page);
             }
         }
@@ -645,7 +864,10 @@ impl PageStore for PagedStore {
                 }
                 return Ok(());
             }
-            if self.insert_frame(id.0, page, true)?.is_some() {
+            if self
+                .insert_frame(id.0, page, true, Source::Fresh)?
+                .is_some()
+            {
                 return Ok(());
             }
         }
@@ -662,7 +884,7 @@ impl PageStore for PagedStore {
         };
         let id = recycled.unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::AcqRel));
         let zero = [0u8; PAGE_SIZE];
-        let inserted = match self.insert_frame(id, &zero, true) {
+        let inserted = match self.insert_frame(id, &zero, true, Source::Fresh) {
             Ok(Some(_)) => Ok(()),
             Ok(None) => self.write_page(PageId(id), &zero),
             Err(e) => Err(e),
@@ -689,6 +911,7 @@ impl PageStore for PagedStore {
             {
                 self.dirty_frames.fetch_sub(1, Ordering::AcqRel);
             }
+            self.spill.lock().map_err(|_| poisoned())?.remove(id.0);
         }
         let mut free = self.free.lock().map_err(|_| poisoned())?;
         if free.1.insert(id.0) {
@@ -699,5 +922,126 @@ impl PageStore for PagedStore {
 
     fn fsync(&self) -> Result<()> {
         Ok(()) // Durability is the log's and the image's; the cache itself is volatile.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_of(byte: u8) -> Page {
+        [byte; PAGE_SIZE]
+    }
+
+    /// A store of `capacity` frames that spills to a scratch file.
+    fn spilling(capacity: u64) -> PagedStore {
+        let store = PagedStore::default();
+        store.set_capacity_bytes(Some(capacity * PAGE_SIZE as u64));
+        store.enable_spill(tempfile::tempfile().unwrap()).unwrap();
+        store
+    }
+
+    /// Write `count` fresh pages, so the pages written before them spill.
+    fn crowd_out(store: &PagedStore, count: u64) {
+        for _ in 0..count {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, &page_of(0xEE)).unwrap();
+        }
+    }
+
+    /// A copy loaded before the page was changed and spilled again is refused, as is an image
+    /// copy while a spilled one exists: only the newest copy can become resident.
+    #[test]
+    fn a_stale_copy_never_replaces_a_newer_spilled_one() {
+        let store = spilling(4);
+        let id = store.allocate_page().unwrap();
+        store.write_page(id, &page_of(1)).unwrap();
+        crowd_out(&store, 8);
+        let Located::Spilled(stale, first) = store.locate(id.0).unwrap() else {
+            panic!("the page was not spilled");
+        };
+        assert_eq!(*stale, page_of(1));
+        // Load it back, change it, and push it out again: a newer spilled copy.
+        store.read_page(id).unwrap();
+        store.write_page(id, &page_of(2)).unwrap();
+        crowd_out(&store, 8);
+        let Located::Spilled(_, second) = store.locate(id.0).unwrap() else {
+            panic!("the page was not spilled again");
+        };
+        assert_ne!(first, second);
+        // The copy read before the change must not be installed, from the spill or the image.
+        assert!(
+            store
+                .insert_frame(id.0, &stale, true, Source::Spill(first))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .insert_frame(id.0, &stale, false, Source::Image)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.read_page(id).unwrap(), page_of(2));
+    }
+
+    /// A spill write that fails keeps the page in memory, takes no slot, and the store keeps
+    /// serving every page.
+    #[test]
+    fn a_failed_spill_write_keeps_the_page_and_leaks_no_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spill");
+        std::fs::write(&path, b"").unwrap();
+        let store = PagedStore::default();
+        store.set_capacity_bytes(Some(4 * PAGE_SIZE as u64));
+        // Opened read-only: every spill write fails.
+        store.enable_spill(File::open(&path).unwrap()).unwrap();
+        let ids: Vec<PageId> = (0..12)
+            .map(|i| {
+                let id = store.allocate_page().unwrap();
+                store.write_page(id, &page_of(i)).unwrap();
+                id
+            })
+            .collect();
+        assert_eq!(store.spilled_bytes(), 0);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.read_page(*id).unwrap(), page_of(i as u8));
+        }
+        let (next_slot, free_slots) = {
+            let spill = store.spill.lock().unwrap();
+            (spill.next_slot, spill.free_slots.clone())
+        };
+        assert_eq!(next_slot, 1, "only one slot was ever taken");
+        assert_eq!(free_slots, vec![0], "and it went back");
+    }
+
+    /// A spilled page comes back as a changed page and leaves the spill; freeing a spilled page
+    /// drops its copy.
+    #[test]
+    fn spilled_pages_come_back_changed_and_free_their_slot() {
+        let store = spilling(4);
+        let ids: Vec<PageId> = (0..12)
+            .map(|i| {
+                let id = store.allocate_page().unwrap();
+                store.write_page(id, &page_of(i)).unwrap();
+                id
+            })
+            .collect();
+        assert!(store.spilled_bytes() > 0);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.read_page(*id).unwrap(), page_of(i as u8));
+        }
+        let spilled_before = store.spilled_bytes();
+        let victim = ids
+            .iter()
+            .copied()
+            .find(|id| matches!(store.locate(id.0).unwrap(), Located::Spilled(..)))
+            .unwrap();
+        store.deallocate_page(victim).unwrap();
+        assert_eq!(
+            store.spilled_bytes(),
+            spilled_before - PAGE_SIZE as u64,
+            "a freed page keeps no spilled copy"
+        );
     }
 }
