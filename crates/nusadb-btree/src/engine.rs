@@ -133,7 +133,9 @@ impl std::fmt::Debug for Wal {
 /// 5. `dropped` — the purge queue of dropped trees; `retired`, the queue of overflow chains
 ///    awaiting reclamation, ranks here too (taken under a table latch, and by purge before the
 ///    reclamation gate, never after it)
-/// 6. `txns` — transaction + lock manager (O(1) critical sections)
+/// 6. `txns`: transaction + lock manager (O(1) critical sections); `scan_views`, the registry
+///    of open streaming scans, is taken under it or alone, and a scan's own state lock is taken
+///    with neither held (a writer drains its transaction's open scans before its other locks)
 /// 7. `seqs` — sequences
 /// 8. `reclaim` (`RwLock`) — the undo arena, doubling as the **reclamation gate**: every
 ///    chain-walking reader holds `read` across its walk; purge holds `write` while freeing
@@ -150,7 +152,8 @@ impl std::fmt::Debug for Wal {
 /// [`ReadView`] equates "ended and present" with committed, so the order is load-bearing.
 #[derive(Debug, Default)]
 pub struct BtreeEngine {
-    store: PagedStore,
+    /// Shared with every open streaming scan, which reads pages after the call that opened it.
+    store: Arc<PagedStore>,
     /// Signalled whenever a transaction leaves `active` and whenever admission resumes. `begin`
     /// waits on it while admission is paused; a checkpoint that pauses admission waits on it for
     /// the active set to drain. Always used with the `txns` mutex.
@@ -172,8 +175,13 @@ pub struct BtreeEngine {
     /// Rank 7: sequences. **Non-transactional** counters: every advance is fsynced to
     /// the log before the value escapes, and rollback never rewinds one (gap semantics).
     seqs: Mutex<SeqDomain>,
-    /// Rank 8: the undo arena behind the reclamation gate (see the struct docs).
-    reclaim: RwLock<UndoDomain>,
+    /// Rank 8: the undo arena behind the reclamation gate (see the struct docs). Shared with every
+    /// open streaming scan, which takes the gate for each batch it reads.
+    reclaim: Arc<RwLock<UndoDomain>>,
+    /// The read views of the streaming scans open right now. Purge treats each as pinned, so a
+    /// version, an overflow chain or a dropped tree a scan may still reach is never freed under it,
+    /// even after its transaction moved on to a fresh statement view. Taken after `txns`.
+    scan_views: Arc<Mutex<ScanViews>>,
     /// Rank 1: makes [`SERIALIZABLE` antidependency check → commit-marker append → `staged`
     /// insert] atomic across committers. Without it two symmetric write-skew transactions could
     /// each pass the check before either stages — the check must observe every earlier
@@ -1508,6 +1516,49 @@ impl BtreeEngine {
         Ok(())
     }
 
+    /// Before `txn` updates or deletes a row of `table` (or, with `None`, rolls back, wholly or to
+    /// a savepoint, which may undo writes in any table), read every streaming scan it has open there
+    /// to its end: the rows it has not read yet are then the versions as of when it opened, as a
+    /// scan read whole at open would give, not versions this write or undo produces. Taken with
+    /// no other lock held.
+    fn drain_open_scans(&self, txn: TxnId, table: Option<TableId>) -> Result<()> {
+        let open: Vec<Arc<Mutex<StreamState>>> = {
+            let views = self.scan_views.lock().map_err(|_| poisoned())?;
+            views
+                .views
+                .values()
+                .filter(|scan| scan.txn == txn.0 && table.is_none_or(|t| scan.table == t.0))
+                .filter_map(|scan| scan.state.upgrade())
+                .collect()
+        };
+        // Drain every scan even when one fails, so each is either complete or marked broken.
+        let mut first = Ok(());
+        for state in open {
+            let drained = state
+                .lock()
+                .map_err(|_| poisoned())
+                .and_then(|mut s| s.drain());
+            if first.is_ok() {
+                first = drained;
+            }
+        }
+        first
+    }
+
+    /// When `txn` commits or rolls back, read every streaming scan it still has open to its end
+    /// and release its pin: a scan never reaches the store after its transaction is over, so
+    /// nothing it could read survives a checkpoint as pages no one frees. Its remaining rows are
+    /// served from its buffer. Never fails the commit or rollback: a scan that cannot be read to
+    /// its end is closed with an error on its next read instead. Taken with no other lock held.
+    fn finish_open_scans(&self, txn: TxnId) {
+        if let Err(e) = self.drain_open_scans(txn, None) {
+            tracing::warn!(txn = txn.0, error = %e, "an open scan could not be read ahead of its transaction's end");
+        }
+        if let Ok(mut views) = self.scan_views.lock() {
+            views.views.retain(|_, scan| scan.txn != txn.0);
+        }
+    }
+
     /// The time an image sealing the recovered state should carry: that of the last commit it
     /// holds, so a later restore to a moment at or after that commit lands on the image itself.
     fn seal_stamp(&self) -> u64 {
@@ -2366,7 +2417,7 @@ impl BtreeEngine {
                             columns: state.schema.columns.clone(),
                         },
                     }];
-                    let tree = ClusteredTree::open(&self.store, state.root_id());
+                    let tree = ClusteredTree::open(&*self.store, state.root_id());
                     for (row_id, value) in tree.scan()? {
                         let (meta, tuple) =
                             mvcc::decode_row(&value).ok_or_else(|| corrupt_row(row_id))?;
@@ -4560,8 +4611,180 @@ impl TxnDomain {
     }
 }
 
-/// The scan the treaty hands back: the rows visible under the caller's read view, materialized
-/// at open in row-id order (a stable snapshot for the scan's lifetime).
+/// The streaming scans open right now, keyed by a registration number: each one's view (pinned
+/// against purge) and a handle on its state, so a writer can drain the scans its own transaction
+/// has open on a table before it changes that table.
+#[derive(Debug, Default)]
+struct ScanViews {
+    next: u64,
+    views: HashMap<u64, OpenScan>,
+}
+
+/// One open streaming scan as the registry sees it.
+#[derive(Debug)]
+struct OpenScan {
+    /// The view purge treats as pinned: the scan's view with its own transaction counted as not
+    /// yet seen, so nothing that transaction later drops or rewrites is freed under the scan.
+    pin: ReadView,
+    txn: u64,
+    table: u64,
+    state: std::sync::Weak<Mutex<StreamState>>,
+}
+
+impl ScanViews {
+    /// Register an open scan; the returned key unregisters it.
+    fn register(views: &Mutex<Self>, scan: OpenScan) -> Result<u64> {
+        let mut guard = views.lock().map_err(|_| poisoned())?;
+        let key = guard.next;
+        guard.next = guard.next.wrapping_add(1);
+        guard.views.insert(key, scan);
+        drop(guard);
+        Ok(key)
+    }
+
+    /// The views purge must treat as pinned.
+    fn pins(&self) -> impl Iterator<Item = ReadView> + '_ {
+        self.views.values().map(|scan| scan.pin.clone())
+    }
+}
+
+/// Rows a streaming scan keeps per batch, the tuple bytes after which a batch ends early, and the
+/// entries it may visit in one batch (visible or not) before it yields the reclamation gate.
+const STREAM_BATCH_ROWS: usize = 1024;
+const STREAM_BATCH_BYTES: usize = 1 << 20;
+const STREAM_BATCH_VISITS: usize = 8192;
+
+/// A table scan that reads the tree a batch at a time. Each batch walks the leaves from the row id
+/// after the last one visited, under the reclamation gate for that batch only, and keeps the rows
+/// visible under the scan's read view. The view stays registered with purge for the scan's life,
+/// so nothing a later batch may reach is freed in between, and a B-link walk from a row id finds
+/// every row at or past it however the tree split meanwhile. It reads exactly what a scan read
+/// whole at open would: rows inserted later have row ids at or past `end` and are never reached,
+/// and before its own transaction updates or deletes a row of the table, the scan is drained into
+/// its buffer (see [`BtreeEngine::drain_open_scans`]).
+struct StreamScan {
+    state: Arc<Mutex<StreamState>>,
+    views: Arc<Mutex<ScanViews>>,
+    key: u64,
+}
+
+/// A streaming scan's position and buffered rows.
+struct StreamState {
+    store: Arc<PagedStore>,
+    reclaim: Arc<RwLock<UndoDomain>>,
+    view: ReadView,
+    root: nusadb_core::PageId,
+    /// The first row id the scan does not read: the table's next row id when it opened.
+    end: u64,
+    /// The first row id the next batch reads from.
+    cursor: u64,
+    done: bool,
+    /// A drain failed part way: what is buffered may be incomplete, so every later read fails.
+    broken: bool,
+    buffered: std::collections::VecDeque<(Tid, SharedTuple)>,
+}
+
+impl std::fmt::Debug for StreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamState")
+            .field("cursor", &self.cursor)
+            .field("end", &self.end)
+            .field("done", &self.done)
+            .field("buffered", &self.buffered.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamState {
+    /// Read the next batch of visible rows into the buffer.
+    fn fill(&mut self) -> Result<()> {
+        let undo = self.reclaim.read().map_err(|_| poisoned())?;
+        let tree = ClusteredTree::open(&*self.store, self.root);
+        let mut scratch = Vec::new();
+        let mut last = None;
+        let mut bytes = 0_usize;
+        let mut visits = 0_usize;
+        let mut full = false;
+        let mut past_end = false;
+        let end = self.end;
+        let buffered = &mut self.buffered;
+        let view = &self.view;
+        tree.scan_from_stored_with(self.cursor, |row_id, stored, overflow| {
+            if row_id >= end {
+                past_end = true;
+                return Ok(false);
+            }
+            last = Some(row_id);
+            visits += 1;
+            let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
+            if let Some(visible) = match mvcc::visible_version(meta, &undo.arena, view) {
+                Some(mvcc::Visible::Head) => {
+                    Some(head_tuple(&tree, row_id, stored, overflow, &mut scratch)?)
+                },
+                Some(mvcc::Visible::Arena(tuple)) => Some(tuple),
+                None => None,
+            } {
+                bytes = bytes.saturating_add(visible.len());
+                buffered.push_back((tid_of(row_id), SharedTuple::from(visible)));
+            }
+            full = buffered.len() >= STREAM_BATCH_ROWS
+                || bytes >= STREAM_BATCH_BYTES
+                || visits >= STREAM_BATCH_VISITS;
+            Ok(!full)
+        })?;
+        match last {
+            Some(row_id) if full && !past_end && row_id < u64::MAX => self.cursor = row_id + 1,
+            _ => self.done = true,
+        }
+        Ok(())
+    }
+
+    /// Read the next batch; a failure closes the scan, since the batch may be half buffered.
+    fn fill_or_break(&mut self) -> Result<()> {
+        let filled = self.fill();
+        if filled.is_err() {
+            self.broken = true;
+            self.done = true;
+            self.buffered.clear();
+        }
+        filled
+    }
+
+    /// Read every remaining row into the buffer.
+    fn drain(&mut self) -> Result<()> {
+        while !self.done {
+            self.fill_or_break()?;
+        }
+        Ok(())
+    }
+}
+
+impl TupleScan for StreamScan {
+    fn try_next(&mut self) -> Result<Option<(Tid, SharedTuple)>> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        if state.broken {
+            return Err(Error::Io(std::io::Error::other(
+                "the scan could not be read ahead of its transaction's write and is closed",
+            )));
+        }
+        while state.buffered.is_empty() && !state.done {
+            state.fill_or_break()?;
+        }
+        Ok(state.buffered.pop_front())
+    }
+}
+
+impl Drop for StreamScan {
+    fn drop(&mut self) {
+        if let Ok(mut views) = self.views.lock() {
+            views.views.remove(&self.key);
+        }
+    }
+}
+
+/// The scan the treaty hands back for a SERIALIZABLE transaction: the rows visible under the
+/// caller's read view, materialized at open in row-id order (a stable snapshot for the scan's
+/// lifetime).
 struct VecScan {
     rows: std::vec::IntoIter<(Tid, SharedTuple)>,
 }
@@ -4650,6 +4873,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn commit(&self, txn: TxnId) -> Result<()> {
+        self.finish_open_scans(txn);
         // The commit gate makes [SSI check → marker append → staged insert] one atomic step
         // across committers: the check must observe every earlier committer as staged or
         // committed, or two symmetric write-skew transactions could each pass their check
@@ -4674,10 +4898,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 // (e.g. a page-store I/O error). The transaction is intact and un-staged, so roll
                 // it back ourselves before surfacing the error — a forgotten caller rollback must
                 // not strand it in `active` with its locks held.
-                let state = {
-                    let mut t = self.txns.lock().map_err(|_| poisoned())?;
-                    t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))?
-                };
+                let state = self.take_txn(txn)?;
                 drop(gate);
                 self.abort(txn, state);
                 return Err(e);
@@ -4686,11 +4907,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if conflict {
             // Abort exactly like ROLLBACK (same neutralization of non-transactional side effects),
             // then surface the conflict — consistent with SSI's abort-at-commit discipline.
-            let state = {
-                let mut t = self.txns.lock().map_err(|_| poisoned())?;
-                t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))?
-                // The transaction stays in `active` until the undo completes (see `abort`).
-            };
+            // The transaction stays in `active` until the undo completes (see `abort`).
+            let state = self.take_txn(txn)?;
             drop(gate);
             self.abort(txn, state);
             return Err(Error::SerializationConflict { txn });
@@ -4747,10 +4965,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                             // could not be appended (e.g. ENOSPC). Nothing is staged yet and the
                             // transaction is intact, so roll it back ourselves before surfacing the
                             // error — never leave it stranded in `active` with its locks held.
-                            let state = {
-                                let mut t = self.txns.lock().map_err(|_| poisoned())?;
-                                t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))?
-                            };
+                            let state = self.take_txn(txn)?;
                             drop(gate);
                             self.abort(txn, state);
                             return Err(e);
@@ -4817,6 +5032,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn rollback(&self, txn: TxnId) -> Result<()> {
+        self.finish_open_scans(txn);
         let state = {
             let mut t = self.txns.lock().map_err(|_| poisoned())?;
             t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))?
@@ -4838,6 +5054,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn rollback_to(&self, txn: TxnId, name: &str) -> Result<()> {
+        self.drain_open_scans(txn, None)?;
         let tail = {
             let mut t = self.txns.lock().map_err(|_| poisoned())?;
             let txn_state = t.txns.get_mut(&txn.0).ok_or_else(|| unknown_txn(txn))?;
@@ -4929,7 +5146,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn create_table(&self, txn: TxnId, def: &TableDef) -> Result<TableId> {
-        let tree = ClusteredTree::create(&self.store)?;
+        let tree = ClusteredTree::create(&*self.store)?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             self.store.deallocate_page(tree.root())?;
@@ -5358,7 +5575,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let mut w = t.write.lock().map_err(|_| poisoned())?;
         let first_row_id = w.next_row_id;
         w.next_row_id += tuples.len() as u64;
-        let mut tree = ClusteredTree::open(&self.store, t.root_id());
+        let mut tree = ClusteredTree::open(&*self.store, t.root_id());
         let mut tids = Vec::with_capacity(tuples.len());
         for (i, tuple) in tuples.iter().enumerate() {
             let row_id = first_row_id + i as u64;
@@ -5444,7 +5661,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let row_id = w.next_row_id;
         w.next_row_id += 1;
         let value = mvcc::encode_row(RowMeta::fresh(txn.0), tuple);
-        let mut tree = ClusteredTree::open(&self.store, t.root_id());
+        let mut tree = ClusteredTree::open(&*self.store, t.root_id());
         tree.insert(row_id, &value)?;
         t.set_root(tree.root());
         self.push_undo(
@@ -5470,6 +5687,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if tuple.len() > MAX_USER_TUPLE {
             return Err(tuple_too_large(tuple.len()));
         }
+        self.drain_open_scans(txn, Some(table))?;
         // Charge the new version's real footprint against the per-transaction ceiling (see `insert`).
         self.charge_txn_memory(txn.0, tuple.len() as u64 + PER_ROW_WRITE_OVERHEAD)?;
         // The resident ceiling is enforced here, before the tree is touched: the page store
@@ -5506,7 +5724,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // atomic same-table step (two admitted writers over one row are impossible). The tree
         // opens AFTER the latch: only latch holders move the root, so it cannot go stale here.
         let _w = t.write.lock().map_err(|_| poisoned())?;
-        let mut tree = ClusteredTree::open(&self.store, t.root_id());
+        let mut tree = ClusteredTree::open(&*self.store, t.root_id());
         let old_value = tree.get(row_id)?.ok_or_else(|| tuple_not_found(tid))?;
         let (old_meta, old_tuple) =
             mvcc::decode_row(&old_value).ok_or_else(|| corrupt_row(row_id))?;
@@ -5570,6 +5788,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn delete(&self, txn: TxnId, table: TableId, tid: Tid) -> Result<()> {
+        self.drain_open_scans(txn, Some(table))?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let t = cat
             .tables
@@ -5597,7 +5816,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let row_id = row_id_of(tid);
         // The tree opens AFTER the latch: only latch holders move the root (see `update`).
         let _w = t.write.lock().map_err(|_| poisoned())?;
-        let tree = ClusteredTree::open(&self.store, t.root_id());
+        let tree = ClusteredTree::open(&*self.store, t.root_id());
         let old_value = tree.get(row_id)?.ok_or_else(|| tuple_not_found(tid))?;
         let (meta, old_tuple) = mvcc::decode_row(&old_value).ok_or_else(|| corrupt_row(row_id))?;
         // Charge the old row retained in the undo log against the per-transaction ceiling before
@@ -5651,18 +5870,66 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .tables
             .get(&table.0)
             .ok_or_else(|| table_not_found(table))?;
-        let (view, serializable) = {
+        let (view, serializable, registration) = {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
             let level = txns
                 .txns
                 .get(&txn.0)
                 .map(|t| t.level)
                 .ok_or_else(|| unknown_txn(txn))?;
-            (
-                txns.view_for(txn.0)?,
-                matches!(level, IsolationLevel::Serializable),
-            )
+            let view = txns.view_for(txn.0)?;
+            let serializable = matches!(level, IsolationLevel::Serializable);
+            // A streaming scan registers its view before `txns` is released, so no purge
+            // snapshot can fall between the view being taken and it being pinned.
+            let registration = if serializable {
+                None
+            } else {
+                let mut pin = view.clone();
+                pin.active.insert(txn.0);
+                pin.own = u64::MAX;
+                let state = Arc::new(Mutex::new(StreamState {
+                    store: Arc::clone(&self.store),
+                    reclaim: Arc::clone(&self.reclaim),
+                    view: view.clone(),
+                    root: t.root_id(),
+                    end: 0,
+                    cursor: 0,
+                    done: false,
+                    broken: false,
+                    buffered: std::collections::VecDeque::new(),
+                }));
+                let key = ScanViews::register(
+                    &self.scan_views,
+                    OpenScan {
+                        pin,
+                        txn: txn.0,
+                        table: table.0,
+                        state: Arc::downgrade(&state),
+                    },
+                )?;
+                Some((key, state))
+            };
+            (view, serializable, registration)
         };
+        // Outside SERIALIZABLE the rows stream: the scan reads the tree a batch at a time from
+        // the row id after the last one it read, so a table larger than memory never sits in
+        // memory whole. A SERIALIZABLE scan records every row it reads for the commit-time
+        // antidependency check, so it keeps reading the table whole at open.
+        if let Some((key, state)) = registration {
+            // The scan exists from here on, so its registration is removed however this ends.
+            let scan = StreamScan {
+                state,
+                views: Arc::clone(&self.scan_views),
+                key,
+            };
+            // Row ids only grow: every row inserted after this point gets an id at or past this
+            // one, so the scan stops there and never reads a row inserted after it opened. An
+            // update or delete keeps the row's id; those are handled by draining the scan before
+            // its own transaction writes the table. (Read after the view: load-bearing.)
+            let end = t.write.lock().map_err(|_| poisoned())?.next_row_id;
+            scan.state.lock().map_err(|_| poisoned())?.end = end;
+            return Ok(Box::new(scan));
+        }
         // Latch-free tree walk under the reclamation gate: B-link keeps a concurrent split
         // structurally safe, MVCC stamps hide uncommitted versions, and holding `read` on the
         // gate keeps every undo slot this walk can reach pinned (purge holds `write` to free).
@@ -5672,7 +5939,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let mut read_ids: Vec<u64> = Vec::new();
         {
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
-            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let tree = ClusteredTree::open(&*self.store, t.root_id());
             let mut scratch = Vec::new();
             tree.scan_stored_with(|row_id, stored, overflow| {
                 let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
@@ -5732,7 +5999,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             txns.fresh_view(txn.0)
         };
         let undo = self.reclaim.read().map_err(|_| poisoned())?;
-        let tree = ClusteredTree::open(&self.store, t.root_id());
+        let tree = ClusteredTree::open(&*self.store, t.root_id());
         // Visitor walk (single-copy), same as `scan`.
         let mut rows: Vec<(Tid, SharedTuple)> = Vec::new();
         let mut scratch = Vec::new();
@@ -6134,7 +6401,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             if !others.is_empty()
                 && let Some(t) = cat.tables.get(&table.0)
             {
-                let tree = ClusteredTree::open(&self.store, t.root_id());
+                let tree = ClusteredTree::open(&*self.store, t.root_id());
                 for other in others {
                     if let Some((stored, _)) = tree.get_stored(other)? {
                         let (meta, _) =
@@ -6298,7 +6565,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
-            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let tree = ClusteredTree::open(&*self.store, t.root_id());
             let entries: Box<dyn Iterator<Item = _>> = if index_range_is_empty(&lo, &hi) {
                 Box::new(std::iter::empty())
             } else {
@@ -6872,7 +7139,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
             txns.active.clone()
         };
-        let tree = ClusteredTree::open(&self.store, t.root_id());
+        let tree = ClusteredTree::open(&*self.store, t.root_id());
         let mut count: u64 = 0;
         // Headers only: a chained row's chain is never touched, so this needs no reclamation gate.
         tree.scan_stored_with(|row_id, stored, _| {
@@ -6978,7 +7245,7 @@ impl BtreeEngine {
         {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
-            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let tree = ClusteredTree::open(&*self.store, t.root_id());
             // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed;
             // a range that can hold no key is answered empty rather than handed to it.
             let entries: Box<dyn Iterator<Item = _>> = if index_range_is_empty(lo, hi) {
@@ -7146,6 +7413,12 @@ impl BtreeEngine {
             }
             self.undo_ops(&mut CatalogRef::Read(&cat), txn.0, ops)
         }
+    }
+
+    /// Take `txn`'s state out of the transaction table, for an abort of a failed commit.
+    fn take_txn(&self, txn: TxnId) -> Result<TxnState> {
+        let mut t = self.txns.lock().map_err(|_| poisoned())?;
+        t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))
     }
 
     /// Undo `txn`'s applied writes, release its locks, and neutralize any non-transactional side
@@ -7334,7 +7607,7 @@ impl BtreeEngine {
             let Some(t) = cat.tables.get(&table) else {
                 continue; // the table was dropped; nothing left to conflict on
             };
-            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let tree = ClusteredTree::open(&*self.store, t.root_id());
             let Some((stored, _)) = tree.get_stored(row_id)? else {
                 continue;
             };
@@ -7370,7 +7643,7 @@ impl BtreeEngine {
             let Some(t) = cat.tables.get(&table) else {
                 continue; // the table was dropped; nothing left to conflict on
             };
-            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let tree = ClusteredTree::open(&*self.store, t.root_id());
             let mut phantom = false;
             tree.scan_stored_with(|row_id, stored, _| {
                 let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;
@@ -7409,7 +7682,7 @@ impl BtreeEngine {
             return Ok(Vec::new());
         };
         let undo = self.reclaim.read().map_err(|_| poisoned())?;
-        let tree = ClusteredTree::open(&self.store, t.root_id());
+        let tree = ClusteredTree::open(&*self.store, t.root_id());
         let mut out = Vec::new();
         for (&row_id, metas) in row_ids {
             // Entry stamps first (does the reader's visible version of this row carry THIS
@@ -7439,7 +7712,7 @@ impl BtreeEngine {
         reason = "a flat one-arm-per-undo-op dispatcher; splitting it would scatter the                   rollback semantics"
     )]
     fn undo_ops(&self, cat: &mut CatalogRef<'_>, txn: u64, mut ops: Vec<UndoOp>) -> Result<()> {
-        let store = &self.store;
+        let store: &PagedStore = &self.store;
         while let Some(op) = ops.pop() {
             match op {
                 UndoOp::Inserted { table, row_id } => {
@@ -7503,13 +7776,15 @@ impl BtreeEngine {
                         let root = state.root_id();
                         cat.by_name
                             .remove(&(state.schema.schema.clone(), state.schema.name));
-                        // The tree was never visible to a committed state: free its pages now
-                        // (an aborted CREATE TABLE must not leak them). The catalog write guard
-                        // excludes every reader (all hold `read`), so no scan can be walking it.
-                        let tree = ClusteredTree::open(store, root);
-                        for page in tree.pages()? {
-                            store.deallocate_page(page)?;
-                        }
+                        // The tree was never visible to a committed state, but a streaming scan
+                        // the transaction opened on it may still be alive (it holds no catalog
+                        // guard between batches). Queue it like a dropped tree: purge frees it
+                        // once no open scan's view can reach it, so an aborted CREATE TABLE
+                        // still leaks nothing.
+                        self.dropped
+                            .lock()
+                            .map_err(|_| poisoned())?
+                            .push(DroppedPages { txn, root });
                     }
                 },
                 UndoOp::DroppedTable { table, state } => {
@@ -7706,8 +7981,10 @@ impl BtreeEngine {
     /// never treated as settled.
     fn purge_snapshot(&self) -> Result<PurgeSnapshot> {
         let txns = self.txns.lock().map_err(|_| poisoned())?;
+        let mut pinned: Vec<ReadView> = txns.txns.values().map(|t| t.pinned.clone()).collect();
+        pinned.extend(self.scan_views.lock().map_err(|_| poisoned())?.pins());
         Ok(PurgeSnapshot {
-            pinned: txns.txns.values().map(|t| t.pinned.clone()).collect(),
+            pinned,
             active: txns.active.clone(),
             horizon: txns.next_txn_id,
         })
@@ -7778,7 +8055,7 @@ impl BtreeEngine {
                     // leaves stay chained here) and the `undo=NO_UNDO` rewrite is byte-identical in
                     // size (never splits). Read the batch's rows first, then reclaim under the same
                     // hold, so the in-batch reclamation never disturbs its own scan.
-                    let tree = ClusteredTree::open(&self.store, t.root_id());
+                    let tree = ClusteredTree::open(&*self.store, t.root_id());
                     // Headers only: a chained row's chain is never reassembled here, so the pass
                     // holds the gate for the leaf walk, not for the size of the rows.
                     tree.scan_from_stored_with(cursor, |row_id, stored, _| {
@@ -7903,7 +8180,7 @@ impl BtreeEngine {
             let mut keep: Vec<DroppedPages> = Vec::with_capacity(dropped.len());
             for entry in dropped.drain(..) {
                 if settled(entry.txn) {
-                    let tree = ClusteredTree::open(&self.store, entry.root);
+                    let tree = ClusteredTree::open(&*self.store, entry.root);
                     for page in tree.pages()? {
                         self.store.deallocate_page(page)?;
                         stats.pages_reclaimed += 1;
@@ -7974,7 +8251,7 @@ impl BtreeEngine {
         let undo = self.reclaim.read().map_err(|_| poisoned())?;
         let mut out = Vec::new();
         for (&table_id, t) in &cat.tables {
-            let tree = ClusteredTree::open(&self.store, t.root_id());
+            let tree = ClusteredTree::open(&*self.store, t.root_id());
             let mut heads = Vec::new();
             tree.scan_stored_with(|row_id, stored, _| {
                 let (meta, _) = mvcc::decode_row(stored).ok_or_else(|| corrupt_row(row_id))?;

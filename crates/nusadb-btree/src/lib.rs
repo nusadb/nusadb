@@ -2470,6 +2470,7 @@ mod tests {
             seen.push(tuple.to_vec());
         }
         assert_eq!(seen, vec![big, b"small".to_vec(), edge]);
+        drop(scan);
         engine.commit(reader).unwrap();
 
         // Replace the chained row with an even larger one, then with an inline one.
@@ -2488,6 +2489,8 @@ mod tests {
             seen.push(tuple.to_vec());
         }
         assert_eq!(seen, vec![bigger, b"now inline".to_vec()]);
+        // An open scan keeps what its view may still read; close it before purging.
+        drop(scan);
         engine.commit(reader).unwrap();
 
         // Purge frees the chains the update and the delete retired, and the dead row's.
@@ -3469,17 +3472,19 @@ mod tests {
     }
 
     /// A committed DROP TABLE's pages are reclaimed once the drop settles; an aborted
-    /// CREATE TABLE frees its tree immediately; the store's live-page count proves both.
+    /// CREATE TABLE's tree is reclaimed by the next purge (a streaming scan the transaction
+    /// opened may still hold it until then); the store's live-page count proves both.
     #[test]
     fn e5_purge_reclaims_dropped_table_pages() {
         let engine = BtreeEngine::new();
         let baseline = engine.live_pages().unwrap();
 
-        // Aborted CREATE TABLE: pages come back on rollback, no purge needed.
+        // Aborted CREATE TABLE: the tree is queued at rollback and the next purge frees it.
         let txn = engine.begin(RC).unwrap();
         engine.create_table(txn, &table_def("ephemeral")).unwrap();
         assert!(engine.live_pages().unwrap() > baseline);
         engine.rollback(txn).unwrap();
+        assert_eq!(engine.purge().unwrap().tables_reclaimed, 1);
         assert_eq!(engine.live_pages().unwrap(), baseline);
 
         // Committed DROP of a multi-page table: purge reclaims the whole tree.
