@@ -659,6 +659,56 @@ impl PagedStore {
         Ok((frames.len() as u64).saturating_mul(PAGE_SIZE as u64))
     }
 
+    /// Run `f` on page `id` where it sits, under its frame's read latch, without copying it out.
+    /// A page not resident is loaded first (and read from that copy). The caller must keep every
+    /// writer of this page out while `f` runs (the engine's index latch does), since a frame
+    /// evicted meanwhile is not looked up again; `f` may read other pages of the store but must
+    /// not write this one.
+    ///
+    /// # Errors
+    /// Propagates the load's errors.
+    pub fn with_page<R>(&self, id: PageId, f: impl FnOnce(&Page) -> R) -> Result<R> {
+        if let Some(frame) = self.resident(id.0)? {
+            frame.referenced.store(true, Ordering::Release);
+            let page = frame.data.read().map_err(|_| poisoned())?;
+            return Ok(f(&page));
+        }
+        let page = self.read_page(id)?;
+        Ok(f(&page))
+    }
+
+    /// Change page `id` where it sits, under its frame's write latch: `f` returns its result and
+    /// whether it changed the page, which then counts as changed. `f` must not touch the store.
+    ///
+    /// # Errors
+    /// Propagates the load's errors.
+    pub fn modify_page<R>(&self, id: PageId, f: impl FnOnce(&mut Page) -> (R, bool)) -> Result<R> {
+        if id.0 >= self.next_id.load(Ordering::Acquire) {
+            return Err(bad_page(id));
+        }
+        let mut f = Some(f);
+        loop {
+            if let Some(frame) = self.resident(id.0)? {
+                let mut target = frame.data.write().map_err(|_| poisoned())?;
+                // Evicted between the lookup and the latch: find the frame the id has now.
+                if !self.is_registered(id.0, &frame)? {
+                    continue;
+                }
+                let Some(f) = f.take() else {
+                    return Err(bad_page(id));
+                };
+                let (out, changed) = f(&mut target);
+                frame.referenced.store(true, Ordering::Release);
+                if changed && !frame.dirty.swap(true, Ordering::AcqRel) {
+                    self.dirty_frames.fetch_add(1, Ordering::AcqRel);
+                }
+                return Ok(out);
+            }
+            // Make it resident, then change it in place on the next pass.
+            self.read_page(id)?;
+        }
+    }
+
     /// Let changed pages leave memory for `file` (a scratch file the store owns from now on)
     /// when no clean page can be evicted. Without it a changed page stays resident until the
     /// next checkpoint.

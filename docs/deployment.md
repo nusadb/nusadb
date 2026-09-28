@@ -122,9 +122,9 @@ and the next checkpoint writes every changed page into the new image and empties
 are evicted first, then dirty pages spill, so the pages changed between checkpoints are bounded
 by disk rather than memory. The scratch file grows to at most the pages changed since the last
 checkpoint, which the checkpoint threshold keeps in proportion to the log. What still counts
-against the bound is index entries; once they reach it, the next insert or update is
-refused before it starts (a write already under way always completes) with an error that names
-the limit and the bytes held:
+against the bound is the few index entries too large for an index page, and notes of index
+entries awaiting purge (see below); once they reach it, the next insert or update is refused before it starts (a write already under way
+always completes) with an error that names the limit and the bytes held:
 
 ```text
 ERROR XX000: out of memory: the engine reached its resident-memory limit of 858993440 bytes
@@ -144,13 +144,20 @@ A table scan reads the table a batch of rows at a time rather than loading it wh
 full scan of a table larger than memory stays within the cache. A scan still open when its
 transaction commits or rolls back (a cursor left open) is read to its end at that moment.
 
-Index entries (the primary key index, B-tree indexes on columns, vector indexes) still live in
-memory whatever the bound. They are rebuilt from the image's index records at open and count
-against the bound.
+B-tree index entries, the primary key's included, live in pages too: each index is a tree of
+pages ordered by key, plus a map from row to key, both in the page cache and carried by the
+image like table pages, so a restart does not rebuild them. An entry too large for an index page
+(a key of roughly 2 KB or more) is kept in memory instead, carried by the image as a record, and
+counts against the bound. So does a small note per index entry an `UPDATE` moved to a new key,
+kept until the background purge removes the old entry; a long-running transaction delays that
+purge, so heavy key-changing updates under one can grow it. Writing through an index costs a little more than it did when indexes
+lived in memory: a bulk load into a table with a primary key and one more index runs about a
+fifth slower, while lookups are as fast. Vector indexes (`USING hnsw`) are held in memory by the
+SQL layer whatever the bound, and reloaded from their saved graphs at open.
 
 A checkpoint writes only the pages changed since the one before it, into a new segment, and a
 new image that names the older segments for every other page. Its cost grows with the changes,
-plus the image's directory of pages (20 bytes per page) and its index entries. Once the segments
+plus the image's directory of pages (20 bytes per page). Once the segments
 an image still names would hold more than twice the live pages (plus a fixed slack of 1024
 pages), or more than 32 segments, the
 checkpoint writes every page afresh into one segment instead, so dead pages on disk stay bounded.
@@ -389,10 +396,9 @@ autocommit statement, never an error. A transaction held open longer than the pa
 as an idle client inside `BEGIN`, defeats the pause: the worker logs a warning with the active
 count, doubles the number of busy checks it waits before pausing again (up to about sixteen
 minutes between attempts), and the log keeps growing until that transaction ends. The pause is
-capped at 60 seconds. Each checkpoint writes the pages changed since the last one, the image's
-page directory and its index entries while the engine is paused, and now and then every page
-(see the page cache section above); on a large database with many indexes, raise the threshold
-so the pause is paid less often. Watch the server log at `info` for
+capped at 60 seconds. Each checkpoint writes the pages changed since the last one and the image's
+page directory while the engine is paused, and now and then every page (see the page cache
+section above); on a large database, raise the threshold so the pause is paid less often. Watch the server log at `info` for
 `runtime checkpoint folded the log` and at `debug` for the busy retries. Set either flag to `0` to
 turn the worker off and instead issue `CHECKPOINT` from a cron job over an otherwise idle
 connection:

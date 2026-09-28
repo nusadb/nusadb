@@ -425,7 +425,7 @@ Once any `--auth-user` is set, `nusadb-root` must be listed too or it cannot con
 | `ERROR 25P02: current transaction is aborted` | an earlier statement in the transaction failed | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) and start over |
 | `ERROR 42804: type mismatch ...` | NusaDB does not coerce between unrelated types | cast explicitly: `value::BIGINT` |
 | `ERROR 0A000: unsupported SQL construct: ...` | recognised but not built | the message names the construct; see the reference's "Not accepted" list |
-| `ERROR XX000: out of memory: the engine reached its resident-memory limit ...` | the pages changed since the last checkpoint plus the index entries reached the memory ceiling | let a checkpoint run (`CHECKPOINT`), raise `--max-resident-bytes`, use a larger host, or free rows |
+| `ERROR XX000: out of memory: the engine reached its resident-memory limit ...` | what the engine cannot move out of memory (index entries too large for an index page, and notes of index entries awaiting purge) reached the memory ceiling | raise `--max-resident-bytes`, use a larger host, free rows, or drop indexes that are not needed |
 | `COPY ... FROM STDIN` refused at the prompt | the keyboard is already the session's input | use `nusadb-cli -c "COPY ..." < file` |
 
 ---

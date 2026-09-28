@@ -70,6 +70,7 @@
 //! differential byte-parity as the cluster layer lands.
 
 mod engine;
+pub mod keytree;
 pub mod mvcc;
 pub mod node;
 pub mod store;

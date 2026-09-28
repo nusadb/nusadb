@@ -48,6 +48,7 @@ use nusadb_core::{
 };
 use nusadb_wal::{WalRecord, WalWriter};
 
+use crate::keytree::{self, KeyTree};
 use crate::mvcc::{self, ReadView, RowMeta, UndoVersion};
 use crate::store::{PageFile, PagedStore};
 use crate::tree::ClusteredTree;
@@ -261,6 +262,9 @@ struct Catalog {
     /// its replay: the `CreateTable` that follows opens the tree at that root instead of
     /// creating an empty one, and resumes row ids past the rows the pages hold.
     pending_roots: HashMap<u64, (u64, u64)>,
+    /// Image only: index roots (entries tree, row-to-key map) named by `IndexRoot` records,
+    /// taken by the `CreateIndex` that follows.
+    pending_index_roots: HashMap<u64, (u64, u64)>,
     tables: HashMap<u64, TableState>,
     by_name: HashMap<(String, String), u64>,
     next_table_id: u64,
@@ -587,12 +591,15 @@ struct TableWrite {
     next_row_id: u64,
 }
 
-/// A dropped table's tree, queued for purge: pages are only reclaimed once the dropping
-/// transaction is settled (committed and visible to every view).
+/// A dropped table's tree, or a dropped index's two trees, queued for purge: pages are only
+/// reclaimed once the dropping transaction is settled (committed and visible to every view).
 #[derive(Debug)]
 struct DroppedPages {
     txn: u64,
+    /// The table's clustered tree, or the index's entries tree.
     root: nusadb_core::PageId,
+    /// For an index, its row-to-key map; `None` for a table.
+    alive_root: Option<nusadb_core::PageId>,
 }
 
 /// What a purge pass judges settlement by, taken at one instant by `purge_snapshot`.
@@ -775,30 +782,46 @@ struct IndexState {
     data: RwLock<IndexData>,
 }
 
-/// One index's entries, guarded by [`IndexState::data`].
-#[derive(Debug, Default)]
+/// One index's entries, guarded by [`IndexState::data`]. The entries live in pages: a
+/// [`KeyTree`] ordered by `(key, row)` whose value is the entry's visibility ranges, and a second
+/// one keyed by the row id alone mapping each row to its one alive key (the reverse map
+/// `index_insert` consults to stamp a row's previous key). Both are only read or changed under
+/// the index latch, so they need no latch of their own and pages they drop are freed at once. An
+/// entry too large for an index page (a very long key, or a row whose key moved back and forth
+/// under long-lived snapshots) is kept in memory in `big` instead; every read looks in both,
+/// merged in order.
+#[derive(Debug)]
 struct IndexData {
-    entries: BTreeMap<Vec<u8>, BTreeMap<u64, Vec<EntryMeta>>>,
-    /// The one alive (not dead-stamped) key per row — the reverse map `index_insert` consults to
-    /// stamp a row's previous key in O(1).
-    alive: HashMap<u64, Vec<u8>>,
-    /// A running estimate of this index's resident heap footprint, maintained by the mutation
-    /// methods ([`index_entry_bytes`] added on each range pushed, subtracted on each removed) so
-    /// [`BtreeEngine::resident_bytes`] can fold indexes into the global ceiling without walking the
-    /// map. Held here (not a global atomic) so it travels with the index across drop / rollback.
+    root: nusadb_core::PageId,
+    alive_root: nusadb_core::PageId,
+    big: BTreeMap<Vec<u8>, BTreeMap<u64, Vec<EntryMeta>>>,
+    /// Rows whose alive key is too long for the row-to-key map's pages.
+    alive_big: HashMap<u64, Vec<u8>>,
+    /// Every `(key, row)` holding a dead-stamped range: what purge visits for settled stamps,
+    /// instead of walking the index.
+    dead: HashMap<Vec<u8>, HashSet<u64>>,
+    /// Resident bytes of what this index keeps in memory (`big`, `alive_big` and `dead`),
+    /// maintained on each change so [`BtreeEngine::resident_bytes`] can fold it into the global
+    /// ceiling without a walk. The entries in pages are the page cache's to bound.
     bytes: u64,
 }
 
-/// Estimated resident bytes one index range (a `(key, row_id)` entry plus its reverse-map slot)
-/// retains: the key is held twice — in the sorted map and in the `alive` reverse map — plus a fixed
-/// per-range structural cost (Vec headers, tree/hash nodes, the MVCC stamps). A deliberately
-/// conservative over-estimate: the resident ceiling should fire a little early (safe) rather than
-/// late (OOM). The precise figure does not matter — the ceiling *share* is what calibrates the
-/// bound; this only has to be maintained symmetrically so the counter never drifts.
+/// Estimated resident bytes an in-memory entry or dead-set slot retains beyond its key: map and
+/// hash nodes, vector headers, the stamps. A deliberate over-estimate; it only has to be
+/// maintained symmetrically so the counter never drifts.
 const PER_INDEX_ENTRY_BYTES: u64 = 128;
 
 const fn index_entry_bytes(key_len: usize) -> u64 {
     key_len as u64 * 2 + PER_INDEX_ENTRY_BYTES
+}
+
+/// Free every page of `state`'s trees: for an index no reader can reach any more.
+fn free_index_pages(store: &PagedStore, state: &IndexState) -> Result<()> {
+    let pages = state.data.read().map_err(|_| poisoned())?.pages(store)?;
+    for page in pages {
+        store.deallocate_page(page)?;
+    }
+    Ok(())
 }
 
 /// One visibility range of an index entry: the transaction that created it and (if dead-stamped)
@@ -812,7 +835,28 @@ struct EntryMeta {
     xmax: u64,
 }
 
-/// What one [`IndexState::apply_insert`] actually did — recorded by the caller so the inverse is
+/// The ranges of one entry as stored in an index page: 16 bytes each, `xmin` then `xmax`.
+fn encode_metas(metas: &[EntryMeta]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(metas.len() * 16);
+    for m in metas {
+        out.extend_from_slice(&m.xmin.to_le_bytes());
+        out.extend_from_slice(&m.xmax.to_le_bytes());
+    }
+    out
+}
+
+fn decode_metas(bytes: &[u8]) -> Vec<EntryMeta> {
+    bytes
+        .chunks_exact(16)
+        .filter_map(|c| {
+            let xmin = u64::from_le_bytes(c.get(..8)?.try_into().ok()?);
+            let xmax = u64::from_le_bytes(c.get(8..)?.try_into().ok()?);
+            Some(EntryMeta { xmin, xmax })
+        })
+        .collect()
+}
+
+/// What one [`IndexData::apply_insert`] actually did, recorded by the caller so the inverse is
 /// exact.
 enum AppliedInsert {
     /// The row's alive entry already carries this key (a same-key `UPDATE` re-insert: the old and
@@ -827,6 +871,32 @@ enum AppliedInsert {
 }
 
 impl IndexData {
+    /// A new, empty index: an empty entries tree and an empty row-to-key map.
+    fn create(store: &PagedStore) -> Result<Self> {
+        let root = KeyTree::create(store)?.root();
+        let alive_root = KeyTree::create(store)?.root();
+        Ok(Self::open(root, alive_root))
+    }
+
+    /// The index whose trees are rooted at `root` and `alive_root`.
+    fn open(root: nusadb_core::PageId, alive_root: nusadb_core::PageId) -> Self {
+        Self {
+            root,
+            alive_root,
+            big: BTreeMap::new(),
+            alive_big: HashMap::new(),
+            dead: HashMap::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Every page the index's trees hold.
+    fn pages(&self, store: &PagedStore) -> Result<Vec<nusadb_core::PageId>> {
+        let mut pages = KeyTree::open(store, self.root).pages()?;
+        pages.extend(KeyTree::open(store, self.alive_root).pages()?);
+        Ok(pages)
+    }
+
     /// Whether the entry with ranges `metas` is visible under `view`: any range visible.
     fn entry_visible(metas: &[EntryMeta], view: &ReadView) -> bool {
         metas
@@ -834,118 +904,446 @@ impl IndexData {
             .any(|m| view.sees(m.xmin) && (m.xmax == mvcc::NO_XMAX || !view.sees(m.xmax)))
     }
 
+    /// The ranges under `(key, row)`, if the entry exists.
+    fn load(&self, store: &PagedStore, key: &[u8], row: u64) -> Result<Option<Vec<EntryMeta>>> {
+        if let Some(metas) = self.big.get(key).and_then(|rows| rows.get(&row)) {
+            return Ok(Some(metas.clone()));
+        }
+        Ok(KeyTree::open(store, self.root)
+            .get(key, row)?
+            .map(|v| decode_metas(&v)))
+    }
+
+    /// Store `metas` under `(key, row)`: in the pages when the entry fits one, in memory when not,
+    /// and nowhere when empty. Keeps the dead set and the byte count in step.
+    fn save(
+        &mut self,
+        store: &PagedStore,
+        key: &[u8],
+        row: u64,
+        metas: &[EntryMeta],
+    ) -> Result<()> {
+        let was_big = self.big_remove(key, row);
+        let mut tree = KeyTree::open(store, self.root);
+        if metas.is_empty() {
+            if !was_big {
+                tree.delete(key, row)?;
+            }
+        } else {
+            let value = encode_metas(metas);
+            if keytree::fits(key.len(), value.len()) {
+                tree.put(key, row, &value)?;
+            } else {
+                if !was_big {
+                    tree.delete(key, row)?;
+                }
+                self.bytes = self
+                    .bytes
+                    .saturating_add(index_entry_bytes(key.len()) + 16 * metas.len() as u64);
+                self.big
+                    .entry(key.to_vec())
+                    .or_default()
+                    .insert(row, metas.to_vec());
+            }
+        }
+        self.root = tree.root();
+        if metas.iter().any(|m| m.xmax != mvcc::NO_XMAX) {
+            if self.dead.entry(key.to_vec()).or_default().insert(row) {
+                self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
+            }
+        } else if let Some(rows) = self.dead.get_mut(key)
+            && rows.remove(&row)
+        {
+            if rows.is_empty() {
+                self.dead.remove(key);
+            }
+            self.bytes = self.bytes.saturating_sub(index_entry_bytes(key.len()));
+        }
+        Ok(())
+    }
+
+    /// Drop `(key, row)` from the in-memory entries; whether it was there.
+    fn big_remove(&mut self, key: &[u8], row: u64) -> bool {
+        let Some(rows) = self.big.get_mut(key) else {
+            return false;
+        };
+        let Some(metas) = rows.remove(&row) else {
+            return false;
+        };
+        if rows.is_empty() {
+            self.big.remove(key);
+        }
+        self.bytes = self
+            .bytes
+            .saturating_sub(index_entry_bytes(key.len()) + 16 * metas.len() as u64);
+        true
+    }
+
+    /// The row's alive key, from the row-to-key map.
+    fn alive_key(&self, store: &PagedStore, row: u64) -> Result<Option<Vec<u8>>> {
+        if let Some(key) = self.alive_big.get(&row) {
+            return Ok(Some(key.clone()));
+        }
+        KeyTree::open(store, self.alive_root).get(&row.to_be_bytes(), 0)
+    }
+
+    /// Point the row-to-key map at `key` for `row`.
+    fn set_alive(&mut self, store: &PagedStore, row: u64, key: &[u8]) -> Result<()> {
+        let mut map = KeyTree::open(store, self.alive_root);
+        if keytree::fits(8, key.len()) {
+            map.put(&row.to_be_bytes(), 0, key)?;
+            if let Some(old) = self.alive_big.remove(&row) {
+                self.bytes = self.bytes.saturating_sub(index_entry_bytes(old.len()));
+            }
+        } else {
+            map.delete(&row.to_be_bytes(), 0)?;
+            self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
+            if let Some(old) = self.alive_big.insert(row, key.to_vec()) {
+                self.bytes = self.bytes.saturating_sub(index_entry_bytes(old.len()));
+            }
+        }
+        self.alive_root = map.root();
+        Ok(())
+    }
+
+    /// Drop `row` from the row-to-key map.
+    fn clear_alive(&mut self, store: &PagedStore, row: u64) -> Result<()> {
+        if let Some(old) = self.alive_big.remove(&row) {
+            self.bytes = self.bytes.saturating_sub(index_entry_bytes(old.len()));
+        }
+        let mut map = KeyTree::open(store, self.alive_root);
+        map.delete(&row.to_be_bytes(), 0)?;
+        self.alive_root = map.root();
+        Ok(())
+    }
+
+    /// Call `f(key, row, ranges)` for every entry whose key lies within `lo..hi`, ordered by
+    /// `(key, row)` (descending when `backward`), until it returns `false`: the pages and the
+    /// in-memory entries merged.
+    fn scan<F>(
+        &self,
+        store: &PagedStore,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        backward: bool,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], u64, &[EntryMeta]) -> Result<bool>,
+    {
+        let mut big: Vec<(&[u8], u64, &[EntryMeta])> = if self.big.is_empty() {
+            Vec::new()
+        } else {
+            self.big
+                .range::<[u8], _>((lo, hi))
+                .flat_map(|(k, rows)| {
+                    rows.iter()
+                        .map(move |(r, m)| (k.as_slice(), *r, m.as_slice()))
+                })
+                .collect()
+        };
+        if backward {
+            big.reverse();
+        }
+        let before = |a: (&[u8], u64), b: (&[u8], u64)| if backward { a > b } else { a < b };
+        let mut next_big = 0;
+        let mut stopped = false;
+        KeyTree::open(store, self.root).scan(lo, hi, backward, |key, row, value| {
+            while let Some(&(bk, br, bm)) = big.get(next_big) {
+                if !before((bk, br), (key, row)) {
+                    break;
+                }
+                next_big += 1;
+                if !f(bk, br, bm)? {
+                    stopped = true;
+                    return Ok(false);
+                }
+            }
+            if f(key, row, &decode_metas(value))? {
+                Ok(true)
+            } else {
+                stopped = true;
+                Ok(false)
+            }
+        })?;
+        if !stopped {
+            for &(bk, br, bm) in big.get(next_big..).unwrap_or_default() {
+                if !f(bk, br, bm)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Call `visit(row, ranges)` for the entries whose key lies within `lo..hi`, keys ascending
+    /// (descending when `backward`) and, in both directions, the rows under one key ascending,
+    /// until it returns `false`.
+    fn walk_rows(
+        &self,
+        store: &PagedStore,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        backward: bool,
+        visit: &mut dyn FnMut(u64, &[EntryMeta]) -> Result<bool>,
+    ) -> Result<()> {
+        if !backward {
+            return self.scan(store, lo, hi, false, |_, row, metas| visit(row, metas));
+        }
+        // Backward, one key at a time: find the next key below the last one, then visit its rows
+        // in a forward walk of just that key, so no key's rows are ever buffered.
+        let mut upper: Option<Vec<u8>> = None;
+        loop {
+            let hi_now = upper.as_deref().map_or(hi, Bound::Excluded);
+            let mut next_key: Option<Vec<u8>> = None;
+            self.scan(store, lo, hi_now, true, |key, _, _| {
+                next_key = Some(key.to_vec());
+                Ok(false)
+            })?;
+            let Some(key) = next_key else {
+                return Ok(());
+            };
+            let mut stopped = false;
+            self.scan(
+                store,
+                Bound::Included(&key),
+                Bound::Included(&key),
+                false,
+                |_, row, metas| {
+                    if visit(row, metas)? {
+                        Ok(true)
+                    } else {
+                        stopped = true;
+                        Ok(false)
+                    }
+                },
+            )?;
+            if stopped {
+                return Ok(());
+            }
+            upper = Some(key);
+        }
+    }
+
+    /// Every `(key, row)` of the dead set.
+    fn dead_pairs(&self) -> Vec<(Vec<u8>, u64)> {
+        self.dead
+            .iter()
+            .flat_map(|(key, rows)| rows.iter().map(move |&row| (key.clone(), row)))
+            .collect()
+    }
+
+    /// The rows under exactly `key`, with their ranges.
+    fn rows_for(&self, store: &PagedStore, key: &[u8]) -> Result<Vec<(u64, Vec<EntryMeta>)>> {
+        let mut out = Vec::new();
+        self.scan(
+            store,
+            Bound::Included(key),
+            Bound::Included(key),
+            false,
+            |_, row, metas| {
+                out.push((row, metas.to_vec()));
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
     /// Apply one entry insert by `txn`. A same-key re-insert over the row's alive entry is a
     /// no-op; a key move dead-stamps the old key's alive range and pushes a fresh range under the
     /// new key (appending, never overwriting, so a re-used key keeps its older ranges for pinned
     /// snapshots). Shared by the live path and WAL replay, so recovery re-derives the same state.
-    fn apply_insert(&mut self, key: &[u8], row_id: u64, txn: u64) -> AppliedInsert {
-        let stamped = match self.alive.get(&row_id) {
-            Some(old_key) if old_key.as_slice() == key => return AppliedInsert::Noop,
+    fn apply_insert(
+        &mut self,
+        store: &PagedStore,
+        key: &[u8],
+        row_id: u64,
+        txn: u64,
+    ) -> Result<AppliedInsert> {
+        let stamped = match self.alive_key(store, row_id)? {
+            Some(old_key) if old_key.as_slice() == key => return Ok(AppliedInsert::Noop),
             Some(old_key) => {
-                let old_key = old_key.clone();
-                if let Some(meta) = self
-                    .entries
-                    .get_mut(&old_key)
-                    .and_then(|rows| rows.get_mut(&row_id))
-                    .and_then(|metas| metas.iter_mut().rfind(|m| m.xmax == mvcc::NO_XMAX))
-                {
-                    meta.xmax = txn;
+                if let Some(mut metas) = self.load(store, &old_key, row_id)? {
+                    if let Some(meta) = metas.iter_mut().rfind(|m| m.xmax == mvcc::NO_XMAX) {
+                        meta.xmax = txn;
+                    }
+                    self.save(store, &old_key, row_id, &metas)?;
                 }
                 Some(old_key)
             },
             None => None,
         };
-        self.entries
-            .entry(key.to_vec())
-            .or_default()
-            .entry(row_id)
-            .or_default()
-            .push(EntryMeta {
-                xmin: txn,
-                xmax: mvcc::NO_XMAX,
-            });
-        self.alive.insert(row_id, key.to_vec());
-        self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
-        AppliedInsert::Inserted { stamped }
+        let mut metas = self.load(store, key, row_id)?.unwrap_or_default();
+        metas.push(EntryMeta {
+            xmin: txn,
+            xmax: mvcc::NO_XMAX,
+        });
+        self.save(store, key, row_id, &metas)?;
+        self.set_alive(store, row_id, key)?;
+        Ok(AppliedInsert::Inserted { stamped })
     }
 
     /// Remove the alive range `txn` pushed — the exact inverse of an
     /// [`AppliedInsert::Inserted`] — and clear the reverse map if it pointed here.
-    fn remove_inserted(&mut self, key: &[u8], row_id: u64, txn: u64) {
-        if let Some(rows) = self.entries.get_mut(key) {
-            if let Some(metas) = rows.get_mut(&row_id) {
-                if let Some(pos) = metas
-                    .iter()
-                    .rposition(|m| m.xmin == txn && m.xmax == mvcc::NO_XMAX)
-                {
-                    metas.remove(pos);
-                    self.bytes = self.bytes.saturating_sub(index_entry_bytes(key.len()));
-                }
-                if metas.is_empty() {
-                    rows.remove(&row_id);
-                }
+    fn remove_inserted(
+        &mut self,
+        store: &PagedStore,
+        key: &[u8],
+        row_id: u64,
+        txn: u64,
+    ) -> Result<()> {
+        if let Some(mut metas) = self.load(store, key, row_id)? {
+            if let Some(pos) = metas
+                .iter()
+                .rposition(|m| m.xmin == txn && m.xmax == mvcc::NO_XMAX)
+            {
+                metas.remove(pos);
             }
-            if rows.is_empty() {
-                self.entries.remove(key);
-            }
+            self.save(store, key, row_id, &metas)?;
         }
-        if self.alive.get(&row_id).is_some_and(|k| k.as_slice() == key) {
-            self.alive.remove(&row_id);
+        if self
+            .alive_key(store, row_id)?
+            .is_some_and(|k| k.as_slice() == key)
+        {
+            self.clear_alive(store, row_id)?;
         }
+        Ok(())
     }
 
     /// Apply one physical entry removal (the raw `index_delete` treaty call): drop the row's
     /// alive range under `key`, and clear the reverse map if it pointed here. Returns the removed
     /// range's stamps, if one existed.
-    fn apply_delete(&mut self, key: &[u8], row_id: u64) -> Option<EntryMeta> {
-        let removed = self.entries.get_mut(key).and_then(|rows| {
-            let metas = rows.get_mut(&row_id)?;
-            let pos = metas.iter().rposition(|m| m.xmax == mvcc::NO_XMAX)?;
-            let meta = metas.remove(pos);
-            if metas.is_empty() {
-                rows.remove(&row_id);
-            }
-            Some(meta)
-        });
-        if removed.is_some() {
-            self.bytes = self.bytes.saturating_sub(index_entry_bytes(key.len()));
+    fn apply_delete(
+        &mut self,
+        store: &PagedStore,
+        key: &[u8],
+        row_id: u64,
+    ) -> Result<Option<EntryMeta>> {
+        let Some(mut metas) = self.load(store, key, row_id)? else {
+            return Ok(None);
+        };
+        let Some(pos) = metas.iter().rposition(|m| m.xmax == mvcc::NO_XMAX) else {
+            return Ok(None);
+        };
+        let removed = metas.remove(pos);
+        self.save(store, key, row_id, &metas)?;
+        if self
+            .alive_key(store, row_id)?
+            .is_some_and(|k| k.as_slice() == key)
+        {
+            self.clear_alive(store, row_id)?;
         }
-        if self.entries.get(key).is_some_and(BTreeMap::is_empty) {
-            self.entries.remove(key);
-        }
-        if removed.is_some() && self.alive.get(&row_id).is_some_and(|k| k.as_slice() == key) {
-            self.alive.remove(&row_id);
-        }
-        removed
+        Ok(Some(removed))
     }
 
     /// Apply one dead-stamp reversal: revive the range `txn` stamped (the inverse of the stamp
-    /// [`apply_insert`] placed) and point the reverse map back at it.
-    fn apply_unstamp(&mut self, key: &[u8], row_id: u64, txn: u64) {
-        if let Some(meta) = self
-            .entries
-            .get_mut(key)
-            .and_then(|rows| rows.get_mut(&row_id))
-            .and_then(|metas| metas.iter_mut().rfind(|m| m.xmax == txn))
-        {
-            meta.xmax = mvcc::NO_XMAX;
-            self.alive.insert(row_id, key.to_vec());
-        }
+    /// [`apply_insert`](Self::apply_insert) placed) and point the reverse map back at it.
+    fn apply_unstamp(
+        &mut self,
+        store: &PagedStore,
+        key: &[u8],
+        row_id: u64,
+        txn: u64,
+    ) -> Result<()> {
+        let Some(mut metas) = self.load(store, key, row_id)? else {
+            return Ok(());
+        };
+        let Some(meta) = metas.iter_mut().rfind(|m| m.xmax == txn) else {
+            return Ok(());
+        };
+        meta.xmax = mvcc::NO_XMAX;
+        self.save(store, key, row_id, &metas)?;
+        self.set_alive(store, row_id, key)
     }
 
-    /// Push a previously removed range back — the inverse of [`apply_delete`], used when a physical
-    /// entry removal rolls back. Re-earns the reverse-map slot only for an alive range.
-    fn restore_deleted(&mut self, key: Vec<u8>, row_id: u64, meta: EntryMeta) {
-        self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
-        self.entries
-            .entry(key.clone())
+    /// Push a previously removed range back (the inverse of [`apply_delete`](Self::apply_delete)),
+    /// used when a physical entry removal rolls back. Re-earns the reverse-map slot only for an
+    /// alive range.
+    fn restore_deleted(
+        &mut self,
+        store: &PagedStore,
+        key: &[u8],
+        row_id: u64,
+        meta: EntryMeta,
+    ) -> Result<()> {
+        let mut metas = self.load(store, key, row_id)?.unwrap_or_default();
+        metas.push(meta);
+        self.save(store, key, row_id, &metas)?;
+        if meta.xmax == mvcc::NO_XMAX {
+            self.set_alive(store, row_id, key)?;
+        }
+        Ok(())
+    }
+
+    /// Put an alive entry the image carries outside its pages straight into the in-memory
+    /// entries (the row-to-key map in the pages already names it).
+    fn restore_image_entry(&mut self, key: &[u8], row_id: u64, txn: u64) {
+        // A key too long for the row-to-key map's pages was held in memory there too.
+        if !keytree::fits(8, key.len()) {
+            self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()));
+            self.alive_big.insert(row_id, key.to_vec());
+        }
+        let metas = self
+            .big
+            .entry(key.to_vec())
             .or_default()
             .entry(row_id)
-            .or_default()
-            .push(meta);
-        if meta.xmax == mvcc::NO_XMAX {
-            self.alive.insert(row_id, key);
+            .or_default();
+        metas.push(EntryMeta {
+            xmin: txn,
+            xmax: mvcc::NO_XMAX,
+        });
+        self.bytes = self.bytes.saturating_add(index_entry_bytes(key.len()) + 16);
+    }
+
+    /// Reclaim what purge may: every range of a row in `removed` (its base row is gone), and
+    /// every dead-stamped range whose stamp `settled` vouches for. Visits only the dead set and
+    /// the removed rows' alive entries, never the whole index. Returns the ranges removed.
+    fn purge(
+        &mut self,
+        store: &PagedStore,
+        removed: &HashSet<u64>,
+        settled: &dyn Fn(u64) -> bool,
+    ) -> Result<usize> {
+        let mut targets: Vec<(Vec<u8>, u64)> = self.dead_pairs();
+        for &row in removed {
+            if let Some(key) = self.alive_key(store, row)? {
+                targets.push((key, row));
+            }
         }
+        targets.sort_unstable();
+        targets.dedup();
+        let mut count = 0;
+        for (key, row) in targets {
+            let Some(mut metas) = self.load(store, &key, row)? else {
+                continue;
+            };
+            let before = metas.len();
+            metas.retain(|m| {
+                !(removed.contains(&row) || (m.xmax != mvcc::NO_XMAX && settled(m.xmax)))
+            });
+            if metas.len() != before {
+                count += before - metas.len();
+                self.save(store, &key, row, &metas)?;
+            }
+        }
+        for &row in removed {
+            self.clear_alive(store, row)?;
+        }
+        Ok(count)
+    }
+
+    /// Drop every dead-stamped range. Only for a quiesced engine (a checkpoint: no transaction
+    /// active, no scan open), when every stamp is settled.
+    fn drop_dead_ranges(&mut self, store: &PagedStore) -> Result<()> {
+        let dead = self.dead_pairs();
+        for (key, row) in dead {
+            if let Some(mut metas) = self.load(store, &key, row)? {
+                metas.retain(|m| m.xmax == mvcc::NO_XMAX);
+                self.save(store, &key, row, &metas)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1530,6 +1928,20 @@ impl BtreeEngine {
         Ok(())
     }
 
+    /// Queue `state`'s trees for purge to free once `txn` settles.
+    fn queue_index_pages(&self, txn: u64, state: &IndexState) -> Result<()> {
+        let data = state.data.read().map_err(|_| poisoned())?;
+        self.dropped
+            .lock()
+            .map_err(|_| poisoned())?
+            .push(DroppedPages {
+                txn,
+                root: data.root,
+                alive_root: Some(data.alive_root),
+            });
+        Ok(())
+    }
+
     /// Before `txn` updates or deletes a row of `table` (or, with `None`, rolls back, wholly or to
     /// a savepoint, which may undo writes in any table), read every streaming scan it has open there
     /// to its end: the rows it has not read yet are then the versions as of when it opened, as a
@@ -1986,21 +2398,53 @@ impl BtreeEngine {
                     t.set_root(tree.root());
                 }
             },
+            LoggedOp::IndexRoot {
+                index,
+                root,
+                alive_root,
+            } => {
+                cat.pending_index_roots.insert(*index, (*root, *alive_root));
+            },
             LoggedOp::CreateIndex { txn: _, index, def } => {
+                // A physical image names the index's trees; their pages are already in the store.
+                let data = match cat.pending_index_roots.remove(index) {
+                    Some((root, alive_root)) => {
+                        IndexData::open(nusadb_core::PageId(root), nusadb_core::PageId(alive_root))
+                    },
+                    None => IndexData::create(store)?,
+                };
                 cat.idx_by_name.insert(def.name.clone(), *index);
-                cat.indexes.insert(
+                if let Some(old) = cat.indexes.insert(
                     *index,
                     IndexState {
                         def: def.clone(),
                         complete: true,
-                        data: RwLock::new(IndexData::default()),
+                        data: RwLock::new(data),
                     },
-                );
+                ) {
+                    // A re-created id replaces what an earlier record built: its pages go.
+                    free_index_pages(store, &old)?;
+                }
                 cat.next_index_id = cat.next_index_id.max(*index + 1);
             },
             LoggedOp::DropIndex { txn: _, index } => {
                 if let Some(state) = cat.indexes.remove(index) {
                     cat.idx_by_name.remove(&state.def.name);
+                    // Recovery has no readers: the dropped index's pages are free at once.
+                    free_index_pages(store, &state)?;
+                }
+            },
+            LoggedOp::IndexImageEntry {
+                txn,
+                index,
+                row_id,
+                key,
+            } => {
+                if let Some(idx) = cat.indexes.get_mut(index) {
+                    idx.data
+                        .get_mut()
+                        .map_err(|_| poisoned())?
+                        .restore_image_entry(key, *row_id, *txn);
                 }
             },
             LoggedOp::IndexInsert {
@@ -2015,7 +2459,7 @@ impl BtreeEngine {
                     idx.data
                         .get_mut()
                         .map_err(|_| poisoned())?
-                        .apply_insert(key, *row_id, *txn);
+                        .apply_insert(store, key, *row_id, *txn)?;
                 }
             },
             LoggedOp::IndexDelete {
@@ -2029,7 +2473,7 @@ impl BtreeEngine {
                     idx.data
                         .get_mut()
                         .map_err(|_| poisoned())?
-                        .apply_delete(key, *row_id);
+                        .apply_delete(store, key, *row_id)?;
                 }
             },
             LoggedOp::IndexUnstamp {
@@ -2042,7 +2486,7 @@ impl BtreeEngine {
                     idx.data
                         .get_mut()
                         .map_err(|_| poisoned())?
-                        .apply_unstamp(key, *row_id, *txn);
+                        .apply_unstamp(store, key, *row_id, *txn)?;
                 }
             },
             LoggedOp::AddUnique {
@@ -2258,7 +2702,9 @@ impl BtreeEngine {
             LoggedOp::DropIndex { index, .. }
             | LoggedOp::IndexInsert { index, .. }
             | LoggedOp::IndexDelete { index, .. }
-            | LoggedOp::IndexUnstamp { index, .. } => cat.index_is_durable(*index),
+            | LoggedOp::IndexUnstamp { index, .. }
+            | LoggedOp::IndexImageEntry { index, .. }
+            | LoggedOp::IndexRoot { index, .. } => cat.index_is_durable(*index),
             LoggedOp::SchemaCreate { id, .. } | LoggedOp::SchemaDrop { id, .. } => {
                 cat.ns_is_durable(*id)
             },
@@ -2490,31 +2936,30 @@ impl BtreeEngine {
                     }];
                     let mut alive_last = Vec::new();
                     let data = state.data.read().map_err(|_| poisoned())?;
-                    for (key, rows) in &data.entries {
-                        for (&row_id, metas) in rows {
+                    data.scan(
+                        &self.store,
+                        Bound::Unbounded,
+                        Bound::Unbounded,
+                        false,
+                        |key, row_id, metas| {
                             // One record per (key, row): post-recovery there are no pinned
                             // pre-drop snapshots, so only the alive range matters — replaying
                             // the insert re-derives an equivalent single range.
+                            let op = LoggedOp::IndexInsert {
+                                txn: txn.0,
+                                index: *index,
+                                row_id,
+                                key: key.to_vec(),
+                            };
                             if metas.iter().any(|m| m.xmax == mvcc::NO_XMAX) {
-                                alive_last.push((key, row_id));
+                                alive_last.push(op);
                             } else {
-                                comps.push(LoggedOp::IndexInsert {
-                                    txn: txn.0,
-                                    index: *index,
-                                    row_id,
-                                    key: key.clone(),
-                                });
+                                comps.push(op);
                             }
-                        }
-                    }
-                    for (key, row_id) in alive_last {
-                        comps.push(LoggedOp::IndexInsert {
-                            txn: txn.0,
-                            index: *index,
-                            row_id,
-                            key: key.clone(),
-                        });
-                    }
+                            Ok(true)
+                        },
+                    )?;
+                    comps.extend(alive_last);
                     comps
                 },
                 UndoOp::IndexInserted {
@@ -3531,16 +3976,23 @@ impl BtreeEngine {
             if !cat.index_is_durable(*id) {
                 continue;
             }
+            // The entries live in the image's pages; the index opens its trees at these roots.
+            // Only entries too large for an index page ride as records.
+            let data = idx.data.read().map_err(|_| poisoned())?;
+            emit(LoggedOp::IndexRoot {
+                index: *id,
+                root: data.root.0,
+                alive_root: data.alive_root.0,
+            })?;
             emit(LoggedOp::CreateIndex {
                 txn: synthetic_txn,
                 index: *id,
                 def: idx.def.clone(),
             })?;
-            let data = idx.data.read().map_err(|_| poisoned())?;
-            for (key, rows) in &data.entries {
+            for (key, rows) in &data.big {
                 for (row_id, metas) in rows {
                     if metas.iter().any(|m| m.xmax == mvcc::NO_XMAX) {
-                        emit(LoggedOp::IndexInsert {
+                        emit(LoggedOp::IndexImageEntry {
                             txn: synthetic_txn,
                             index: *id,
                             row_id: *row_id,
@@ -4135,6 +4587,15 @@ impl BtreeEngine {
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
         let dir = pages_dir(&wal.path);
+        // Under the quiesce every dead-stamp is settled (no transaction is active and no scan is
+        // open), so dead index ranges are dropped before the pages are written: an image never
+        // carries ranges a restart could not find again to purge.
+        for idx in cat.indexes.values() {
+            idx.data
+                .write()
+                .map_err(|_| poisoned())?
+                .drop_dead_ranges(&self.store)?;
+        }
         let page_count = self.store.page_count();
         let live = self.store.live_ids()?;
         // The segments the image being replaced reads from stay on disk until the checkpoint
@@ -5868,6 +6329,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .push(DroppedPages {
                 txn: txn.0,
                 root: state.root_id(),
+                alive_root: None,
             });
         self.push_undo(
             txn.0,
@@ -6922,7 +7384,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 // Complete from birth: the creating statement backfills existing rows in the same
                 // transaction, and every later write maintains the entries.
                 complete: true,
-                data: RwLock::new(IndexData::default()),
+                data: RwLock::new(IndexData::create(&self.store)?),
             },
         );
         self.push_undo(txn.0, UndoOp::CreatedIndex { index: id })?;
@@ -6953,6 +7415,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // temp-table index correctly skips the WAL here.
         let parent_durable = cat.table_is_durable(state.def.table.0);
         cat.idx_by_name.remove(&state.def.name);
+        // Queue the trees for page reclamation; purge frees them once this txn settles, and the
+        // rollback path removes the entry again.
+        self.queue_index_pages(txn.0, &state)?;
         self.push_undo(txn.0, UndoOp::DroppedIndex { index: id.0, state })?;
         if parent_durable {
             self.log_op(
@@ -7014,19 +7479,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // so an UPDATE that re-inserts the same key after deleting the old entry is fine.
         if unique && !backing {
             let others: Vec<u64> = data
-                .entries
-                .get(key)
-                .map(|rows| {
-                    rows.iter()
-                        // Only an alive range can conflict: a dead-stamped one belongs to a
-                        // superseded version of its row (the row has since moved to another key).
-                        .filter(|&(&r, metas)| {
-                            r != row_id && metas.iter().any(|m| m.xmax == mvcc::NO_XMAX)
-                        })
-                        .map(|(&r, _)| r)
-                        .collect()
-                })
-                .unwrap_or_default();
+                .rows_for(&self.store, key)?
+                .into_iter()
+                // Only an alive range can conflict: a dead-stamped one belongs to a superseded
+                // version of its row (the row has since moved to another key).
+                .filter(|(r, metas)| *r != row_id && metas.iter().any(|m| m.xmax == mvcc::NO_XMAX))
+                .map(|(r, _)| r)
+                .collect();
             if !others.is_empty()
                 && let Some(t) = cat.tables.get(&table.0)
             {
@@ -7045,7 +7504,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             }
         }
         let owned = key.to_vec();
-        let applied = data.apply_insert(&owned, row_id, txn.0);
+        let applied = data.apply_insert(&self.store, &owned, row_id, txn.0)?;
         // A same-key re-insert (an UPDATE that did not move the key) changed nothing, so nothing
         // may be undone — recording an undo for it is exactly the
         // Bug (rollback would strip the committed entry).
@@ -7104,7 +7563,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .get(&index.0)
             .ok_or_else(|| index_not_found(index))?;
         let mut data = idx.data.write().map_err(|_| poisoned())?;
-        let removed = data.apply_delete(key, row_id);
+        let removed = data.apply_delete(&self.store, key, row_id)?;
         if let Some(meta) = removed {
             self.push_undo(
                 txn.0,
@@ -7195,33 +7654,33 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
             let tree = ClusteredTree::open(&*self.store, t.root_id());
-            let entries: Box<dyn Iterator<Item = _>> = if index_range_is_empty(&lo, &hi) {
-                Box::new(std::iter::empty())
-            } else {
-                Box::new(
-                    data.entries
-                        .range::<[u8], _>((as_slice_bound(&lo), as_slice_bound(&hi))),
-                )
-            };
-            for (_key, entry_rows) in entries {
-                for (&row_id, metas) in entry_rows {
-                    if !IndexData::entry_visible(metas, &view) {
-                        continue;
-                    }
-                    let Some((stored, overflow)) = tree.get_stored(row_id)? else {
-                        continue;
-                    };
-                    let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
-                    let mut scratch = Vec::new();
-                    let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
-                        Some(mvcc::Visible::Head) => {
-                            head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?
-                        },
-                        Some(mvcc::Visible::Arena(tuple)) => tuple,
-                        None => continue,
-                    };
-                    rows.push((tid_of(row_id), SharedTuple::from(visible)));
-                }
+            if !index_range_is_empty(&lo, &hi) {
+                data.scan(
+                    &self.store,
+                    as_slice_bound(&lo),
+                    as_slice_bound(&hi),
+                    false,
+                    |_key, row_id, metas| {
+                        if !IndexData::entry_visible(metas, &view) {
+                            return Ok(true);
+                        }
+                        let Some((stored, overflow)) = tree.get_stored(row_id)? else {
+                            return Ok(true);
+                        };
+                        let (meta, _) =
+                            mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+                        let mut scratch = Vec::new();
+                        let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
+                            Some(mvcc::Visible::Head) => {
+                                head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?
+                            },
+                            Some(mvcc::Visible::Arena(tuple)) => tuple,
+                            None => return Ok(true),
+                        };
+                        rows.push((tid_of(row_id), SharedTuple::from(visible)));
+                        Ok(true)
+                    },
+                )?;
             }
         }
         Ok(Box::new(VecScan {
@@ -7875,48 +8334,39 @@ impl BtreeEngine {
             let data = idx.data.read().map_err(|_| poisoned())?;
             let undo = self.reclaim.read().map_err(|_| poisoned())?;
             let tree = ClusteredTree::open(&*self.store, t.root_id());
-            // `BTreeMap::range` is double-ended, so a backward scan is the same walk reversed;
-            // a range that can hold no key is answered empty rather than handed to it.
-            let entries: Box<dyn Iterator<Item = _>> = if index_range_is_empty(lo, hi) {
-                Box::new(std::iter::empty())
-            } else {
-                let range = data
-                    .entries
-                    .range::<[u8], _>((as_slice_bound(lo), as_slice_bound(hi)));
-                match direction {
-                    ScanDirection::Forward => Box::new(range),
-                    ScanDirection::Backward => Box::new(range.rev()),
+            // A range that can hold no key is answered empty rather than walked. Each entry
+            // is resolved to its row as the walk goes; returning `false` stops it (a `LIMIT`-capped
+            // ordered scan needs only the first `limit` visible rows in key order).
+            let mut visit = |row_id: u64, metas: &[EntryMeta]| -> Result<bool> {
+                if !IndexData::entry_visible(metas, &view) {
+                    return Ok(true);
                 }
+                let Some((stored, overflow)) = tree.get_stored(row_id)? else {
+                    return Ok(true);
+                };
+                let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+                let mut scratch = Vec::new();
+                let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
+                    Some(mvcc::Visible::Head) => {
+                        head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?
+                    },
+                    Some(mvcc::Visible::Arena(tuple)) => tuple,
+                    None => return Ok(true),
+                };
+                rows.push((tid_of(row_id), SharedTuple::from(visible)));
+                if serializable {
+                    read_ids.push(row_id);
+                }
+                Ok(limit.is_none_or(|cap| rows.len() < cap))
             };
-            'walk: for (_key, entry_rows) in entries {
-                for (&row_id, metas) in entry_rows {
-                    if !IndexData::entry_visible(metas, &view) {
-                        continue;
-                    }
-                    let Some((stored, overflow)) = tree.get_stored(row_id)? else {
-                        continue;
-                    };
-                    let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
-                    let mut scratch = Vec::new();
-                    let visible = match mvcc::visible_version(meta, &undo.arena, &view) {
-                        Some(mvcc::Visible::Head) => {
-                            head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?
-                        },
-                        Some(mvcc::Visible::Arena(tuple)) => tuple,
-                        None => continue,
-                    };
-                    {
-                        rows.push((tid_of(row_id), SharedTuple::from(visible)));
-                        if serializable {
-                            read_ids.push(row_id);
-                        }
-                        // A `LIMIT`-capped ordered scan needs only the first `limit` visible rows in
-                        // key order — the rest cannot precede them — so stop the walk once collected.
-                        if limit.is_some_and(|cap| rows.len() >= cap) {
-                            break 'walk;
-                        }
-                    }
-                }
+            if !index_range_is_empty(lo, hi) {
+                data.walk_rows(
+                    &self.store,
+                    as_slice_bound(lo),
+                    as_slice_bound(hi),
+                    direction == ScanDirection::Backward,
+                    &mut visit,
+                )?;
             }
         }
         // Record the read set for a SERIALIZABLE transaction: an
@@ -8312,16 +8762,17 @@ impl BtreeEngine {
             return Ok(Vec::new());
         };
         let data = idx.data.read().map_err(|_| poisoned())?;
-        let Some(row_ids) = data.entries.get(key) else {
+        let row_ids = data.rows_for(&self.store, key)?;
+        if row_ids.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         let undo = self.reclaim.read().map_err(|_| poisoned())?;
         let tree = ClusteredTree::open(&*self.store, t.root_id());
         let mut out = Vec::new();
-        for (&row_id, metas) in row_ids {
+        for (row_id, metas) in row_ids {
             // Entry stamps first (does the reader's visible version of this row carry THIS
             // key?), then the base row — the same 2-hop rule as `index_scan`.
-            if !IndexData::entry_visible(metas, view) {
+            if !IndexData::entry_visible(&metas, view) {
                 continue;
             }
             let Some((stored, _)) = tree.get_stored(row_id)? else {
@@ -8418,7 +8869,11 @@ impl BtreeEngine {
                         self.dropped
                             .lock()
                             .map_err(|_| poisoned())?
-                            .push(DroppedPages { txn, root });
+                            .push(DroppedPages {
+                                txn,
+                                root,
+                                alive_root: None,
+                            });
                     }
                 },
                 UndoOp::DroppedTable { table, state } => {
@@ -8438,9 +8893,18 @@ impl BtreeEngine {
                     let cat = cat.get_mut()?;
                     if let Some(state) = cat.indexes.remove(&index) {
                         cat.idx_by_name.remove(&state.def.name);
+                        // Its trees go the way an aborted CREATE TABLE's does: queued, freed by
+                        // purge once the transaction settles.
+                        self.queue_index_pages(txn, &state)?;
                     }
                 },
                 UndoOp::DroppedIndex { index, state } => {
+                    // The drop is undone: the trees are live again, so un-queue their reclamation.
+                    let root = state.data.read().map_err(|_| poisoned())?.root;
+                    self.dropped
+                        .lock()
+                        .map_err(|_| poisoned())?
+                        .retain(|d| d.root != root);
                     let cat = cat.get_mut()?;
                     cat.idx_by_name.insert(state.def.name.clone(), index);
                     cat.indexes.insert(index, state);
@@ -8453,11 +8917,11 @@ impl BtreeEngine {
                 } => {
                     if let Some(idx) = cat.get().indexes.get(&index) {
                         let mut data = idx.data.write().map_err(|_| poisoned())?;
-                        data.remove_inserted(&key, row_id, txn);
+                        data.remove_inserted(store, &key, row_id, txn)?;
                         // Revive the previous alive range this insert dead-stamped (the row's
                         // key move is being undone).
                         if let Some(old_key) = stamped {
-                            data.apply_unstamp(&old_key, row_id, txn);
+                            data.apply_unstamp(store, &old_key, row_id, txn)?;
                         }
                     }
                 },
@@ -8469,7 +8933,7 @@ impl BtreeEngine {
                 } => {
                     if let Some(idx) = cat.get().indexes.get(&index) {
                         let mut data = idx.data.write().map_err(|_| poisoned())?;
-                        data.restore_deleted(key, row_id, meta);
+                        data.restore_deleted(store, &key, row_id, meta)?;
                     }
                 },
                 UndoOp::AddedConstraint { table, name } => {
@@ -8742,28 +9206,11 @@ impl BtreeEngine {
                 }
             }
             for idx in cat.indexes.values().filter(|i| i.def.table.0 == table) {
+                // A range is reclaimed with its removed row, or once its dead-stamp is settled
+                // (every present and future view sees the supersession: nobody can resolve this
+                // key to that row through it anymore).
                 let mut data = idx.data.write().map_err(|_| poisoned())?;
-                let mut removed_bytes = 0_u64;
-                data.entries.retain(|key, rows| {
-                    let cost = index_entry_bytes(key.len());
-                    rows.retain(|r, metas| {
-                        // A range is reclaimed with its removed row, or once its dead-stamp is
-                        // settled (every present and future view sees the supersession — nobody
-                        // can resolve this key to that row through it anymore).
-                        let before = metas.len();
-                        metas.retain(|m| {
-                            !(removed_rows.contains(r)
-                                || (m.xmax != mvcc::NO_XMAX && settled(m.xmax)))
-                        });
-                        let removed = before - metas.len();
-                        stats.index_entries_removed += removed;
-                        removed_bytes = removed_bytes.saturating_add(removed as u64 * cost);
-                        !metas.is_empty()
-                    });
-                    !rows.is_empty()
-                });
-                data.bytes = data.bytes.saturating_sub(removed_bytes);
-                data.alive.retain(|r, _| !removed_rows.contains(r));
+                stats.index_entries_removed += data.purge(&self.store, &removed_rows, &settled)?;
             }
             if yield_to_checkpoint || self.page_cache_needs_checkpoint() {
                 tracing::debug!("purge stops early: changed pages fill the page cache");
@@ -8814,12 +9261,21 @@ impl BtreeEngine {
             let mut keep: Vec<DroppedPages> = Vec::with_capacity(dropped.len());
             for entry in dropped.drain(..) {
                 if settled(entry.txn) {
-                    let tree = ClusteredTree::open(&*self.store, entry.root);
-                    for page in tree.pages()? {
+                    let pages = match entry.alive_root {
+                        None => {
+                            stats.tables_reclaimed += 1;
+                            ClusteredTree::open(&*self.store, entry.root).pages()?
+                        },
+                        Some(alive_root) => {
+                            let mut pages = KeyTree::open(&self.store, entry.root).pages()?;
+                            pages.extend(KeyTree::open(&self.store, alive_root).pages()?);
+                            pages
+                        },
+                    };
+                    for page in pages {
                         self.store.deallocate_page(page)?;
                         stats.pages_reclaimed += 1;
                     }
-                    stats.tables_reclaimed += 1;
                 } else {
                     keep.push(entry);
                 }

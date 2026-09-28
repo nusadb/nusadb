@@ -58,6 +58,8 @@ const TAG_INDEX_UNSTAMP: u8 = 21;
 const TAG_INSERT_BATCH: u8 = 22;
 const TAG_SEQ_ALTER: u8 = 23;
 const TAG_TABLE_ROOT: u8 = 24;
+const TAG_INDEX_ROOT: u8 = 25;
+const TAG_INDEX_IMAGE_ENTRY: u8 = 26;
 
 /// One logical, replayable operation of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +332,30 @@ pub enum LoggedOp {
         /// The next row id the table hands out; the rows in the pages carry the earlier ones.
         next_row_id: u64,
     },
+    /// Image only: index `index`'s entries tree is rooted at page `root` and its row-to-key map
+    /// at `alive_root`, both in the image's pages, so its `CreateIndex` opens them instead of
+    /// creating empty ones.
+    IndexRoot {
+        /// Index id.
+        index: u64,
+        /// Root page of the entries tree.
+        root: u64,
+        /// Root page of the row-to-key map.
+        alive_root: u64,
+    },
+    /// Image only: an alive entry of index `index` too large for an index page, which the
+    /// pages therefore do not hold. Replayed straight into the index's in-memory entries: the
+    /// row-to-key map in the pages already names it.
+    IndexImageEntry {
+        /// Transaction whose commit publishes the entry (the image's own).
+        txn: u64,
+        /// Index id.
+        index: u64,
+        /// Row id.
+        row_id: u64,
+        /// Encoded index key.
+        key: Vec<u8>,
+    },
 }
 
 impl LoggedOp {
@@ -346,6 +372,7 @@ impl LoggedOp {
             | Self::CreateIndex { txn, .. }
             | Self::DropIndex { txn, .. }
             | Self::IndexInsert { txn, .. }
+            | Self::IndexImageEntry { txn, .. }
             | Self::IndexDelete { txn, .. }
             | Self::IndexUnstamp { txn, .. }
             | Self::AddUnique { txn, .. }
@@ -363,7 +390,8 @@ impl LoggedOp {
             | Self::SeqDrop { .. }
             | Self::SeqSet { .. }
             | Self::SeqAlter { .. }
-            | Self::TableRoot { .. } => 0,
+            | Self::TableRoot { .. }
+            | Self::IndexRoot { .. } => 0,
         }
     }
 
@@ -379,6 +407,7 @@ impl LoggedOp {
                 | Self::SeqSet { .. }
                 | Self::SeqAlter { .. }
                 | Self::TableRoot { .. }
+                | Self::IndexRoot { .. }
         )
     }
 
@@ -555,6 +584,24 @@ impl LoggedOp {
                 push_key(&mut key, TAG_TABLE_ROOT, 0, *table, None);
                 value.extend_from_slice(&root.to_le_bytes());
                 value.extend_from_slice(&next_row_id.to_le_bytes());
+            },
+            Self::IndexRoot {
+                index,
+                root,
+                alive_root,
+            } => {
+                push_key(&mut key, TAG_INDEX_ROOT, 0, *index, None);
+                value.extend_from_slice(&root.to_le_bytes());
+                value.extend_from_slice(&alive_root.to_le_bytes());
+            },
+            Self::IndexImageEntry {
+                txn,
+                index,
+                row_id,
+                key: entry,
+            } => {
+                push_key(&mut key, TAG_INDEX_IMAGE_ENTRY, *txn, *index, Some(*row_id));
+                value.extend_from_slice(entry);
             },
             Self::SeqSet { id, value: v } => {
                 push_key(&mut key, TAG_SEQ_SET, 0, *id, None);
@@ -762,6 +809,17 @@ impl LoggedOp {
                 table,
                 root: read_u64(value, 0)?,
                 next_row_id: read_u64(value, 8)?,
+            },
+            TAG_INDEX_ROOT => Self::IndexRoot {
+                index: table,
+                root: read_u64(value, 0)?,
+                alive_root: read_u64(value, 8)?,
+            },
+            TAG_INDEX_IMAGE_ENTRY => Self::IndexImageEntry {
+                txn,
+                index: table,
+                row_id: read_u64(rest, 16)?,
+                key: value.clone(),
             },
             TAG_SEQ_SET => Self::SeqSet {
                 id: table,
@@ -1446,5 +1504,28 @@ mod image_record_tests {
         assert!(roundtrip_check(&op));
         assert_eq!(op.txn(), 0);
         assert!(op.is_non_transactional());
+    }
+
+    /// The image-only index records round-trip: the root record owns no transaction, the entry
+    /// record belongs to the image's.
+    #[test]
+    fn index_image_records_round_trip() {
+        let root = LoggedOp::IndexRoot {
+            index: 3,
+            root: 11,
+            alive_root: 12,
+        };
+        assert!(roundtrip_check(&root));
+        assert_eq!(root.txn(), 0);
+        assert!(root.is_non_transactional());
+        let entry = LoggedOp::IndexImageEntry {
+            txn: 44,
+            index: 3,
+            row_id: 9,
+            key: vec![7; 5000],
+        };
+        assert!(roundtrip_check(&entry));
+        assert_eq!(entry.txn(), 44);
+        assert!(!entry.is_non_transactional());
     }
 }
