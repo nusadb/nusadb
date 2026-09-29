@@ -1768,7 +1768,12 @@ impl BtreeEngine {
         archive: Option<std::path::PathBuf>,
         standby: bool,
     ) -> Result<Self> {
+        // First, before any file of the database is read, created or removed: nobody else may
+        // have it open.
+        let dir_lock = lock_database(path)?;
         let mut engine = Self::new();
+        // The store holds it: it lives as long as anything can still reach the database's files.
+        engine.store.hold_lock(dir_lock)?;
         engine.standby = AtomicBool::new(standby);
         engine.store.enable_spill(open_spill_file(path)?)?;
         if let Some(dir) = &archive
@@ -2019,6 +2024,13 @@ impl BtreeEngine {
     ) -> Result<()> {
         let refuse =
             |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+        // Held until the restore is published: no server may open the database meanwhile.
+        if let Some(dir) = out_wal.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
+        }
+        let _target_lock = lock_database(out_wal)?;
         if out_wal.exists() || ckpt_path(out_wal).exists() {
             return Err(refuse(format!(
                 "nusadb-btree: {} already holds a log or an image; restore into an empty database \
@@ -2048,6 +2060,7 @@ impl BtreeEngine {
             let _ = std::fs::remove_file(ckpt_path(&scratch));
             let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
             let _ = std::fs::remove_dir_all(pages_dir(&scratch));
+            let _ = std::fs::remove_file(lock_path(&scratch));
             let _ = settle_pending_fork(archive);
         }
         outcome
@@ -2169,6 +2182,7 @@ impl BtreeEngine {
         if let Some(dir) = out_wal.parent() {
             sync_dir(dir)?;
         }
+        let _ = std::fs::remove_file(lock_path(scratch));
         PendingFork::clear(archive)
     }
 
@@ -3545,6 +3559,40 @@ struct ImageContents {
     pages: Option<ImagePages>,
 }
 
+/// Take the exclusive lock on the database whose log is `wal`.
+///
+/// The lock is the file `<wal>.lock`, created if needed (its directory must exist). It is refused
+/// while another holder has it, in another process or in this one: two writers on one database
+/// would interleave its log and remove each other's page segments. The lock is released when the
+/// returned file is dropped, and by the operating system when the process ends, however it ends.
+/// An engine takes it when it opens; anything else that changes or removes a database's files (a
+/// restore, a seed, removing a dropped database's directory) takes it first.
+///
+/// # Errors
+/// Refused as above; propagates I/O errors.
+pub fn lock_database(wal: &Path) -> Result<File> {
+    let path = lock_path(wal);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "nusadb-btree: the database at {} is already open in another process (it holds \
+                 {}); stop that process before opening it here",
+                wal.display(),
+                path.display()
+            ),
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// Remove what a crashed checkpoint or restore left beside the log: a `.ckpt.tmp` is a checkpoint
 /// that crashed before its atomic rename (never named, never authoritative), and a restore that
 /// crashed before or during its publish leaves its scratch files behind. Nothing reads them.
@@ -3554,7 +3602,15 @@ fn remove_leftover_scratch(path: &Path) {
     let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
     let _ = std::fs::remove_file(ckpt_path(&scratch));
     let _ = std::fs::remove_dir_all(pages_dir(&scratch));
+    let _ = std::fs::remove_file(lock_path(&scratch));
     let _ = std::fs::remove_file(scratch);
+}
+
+/// The database lock file beside the log: `<wal>.lock`.
+fn lock_path(wal: &Path) -> std::path::PathBuf {
+    let mut path = wal.as_os_str().to_owned();
+    path.push(".lock");
+    std::path::PathBuf::from(path)
 }
 
 /// The scratch file changed pages may leave memory for, beside the log (`<wal>.spill`). It is
@@ -4730,6 +4786,13 @@ pub fn newest_archived_image(archive: &Path) -> Result<Option<u64>> {
 pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
     let refuse =
         |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    // Held until the seed is in place: no server may open the database meanwhile.
+    if let Some(dir) = out_wal.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _target_lock = lock_database(out_wal)?;
     if out_wal.exists() || ckpt_path(out_wal).exists() {
         return Err(refuse(format!(
             "nusadb-btree: {} already holds a log or an image; a standby is seeded into an \

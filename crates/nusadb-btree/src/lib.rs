@@ -79,7 +79,7 @@ pub mod wal;
 
 pub use engine::{
     BtreeEngine, CheckpointOutcome, MAX_USER_TUPLE, PurgeStats, RecoveryTarget, ShipOutcome,
-    VersionMetadata, newest_archived_image, seed_standby, shipped_segments_after,
+    VersionMetadata, lock_database, newest_archived_image, seed_standby, shipped_segments_after,
 };
 
 #[cfg(test)]

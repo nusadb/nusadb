@@ -69,6 +69,10 @@ struct ManagerState {
 /// A cluster of physically-isolated databases, each a `BtreeEngine` under `base/<db>/`.
 pub(crate) struct DatabaseManager {
     root: PathBuf,
+    /// The exclusive lock on `<root>/global/cluster.lock`, held for the server's life so no second
+    /// server runs on the same data directory. The operating system releases it when the process
+    /// ends, however it ends.
+    _cluster_lock: std::fs::File,
     default_name: String,
     /// Back-compat: a pre-multi-database data directory has its WAL at the root rather than under
     /// `base/`. When that layout is detected, the default database's engine stays at the root so
@@ -126,6 +130,9 @@ impl DatabaseManager {
         // Detect the legacy single-database layout (a WAL at the root) before creating `base/`.
         let legacy_root = root.join("nusadb.wal").exists();
         std::fs::create_dir_all(root.join("global"))?;
+        // Before anything under the data directory is read or written: no other server may be
+        // running on it.
+        let cluster_lock = lock_cluster(&root)?;
         std::fs::create_dir_all(root.join("base"))?;
 
         let mut databases = load_catalog(&root)?;
@@ -168,6 +175,7 @@ impl DatabaseManager {
 
         Ok(Self {
             root,
+            _cluster_lock: cluster_lock,
             default_name,
             legacy_root,
             max_txn_write_bytes,
@@ -958,6 +966,8 @@ impl DatabaseCluster for DatabaseManager {
         // so a fresh database always starts empty and never resurrects a dropped database's data.
         let dir = base_dir(&self.root, name);
         if dir.exists() {
+            // Nobody may have the orphan open: another process holding it keeps it.
+            let _lock = lock_database_dir(&dir, name)?;
             std::fs::remove_dir_all(&dir).map_err(|e| ClusterError::Io(e.to_string()))?;
         }
         // Likewise an archive a partial drop left under this name: it is another history's,
@@ -1022,12 +1032,22 @@ impl DatabaseCluster for DatabaseManager {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        // The database's lock before anything changes: a process outside this server that has it
+        // open keeps it, and the drop is refused with the catalog and the directory untouched.
+        let dir = base_dir(&self.root, name);
+        let lock = if dir.exists() {
+            Some(lock_database_dir(&dir, name)?)
+        } else {
+            None
+        };
         state.databases.remove(name);
         save_catalog(&self.root, &state.databases).map_err(|e| ClusterError::Io(e.to_string()))?;
         // Remove the database's storage last: the catalog no longer lists it, so a crash here leaves
         // an orphan directory (harmless — re-`CREATE` reuses it) rather than a dangling catalog entry.
-        std::fs::remove_dir_all(base_dir(&self.root, name))
-            .map_err(|e| ClusterError::Io(e.to_string()))?;
+        if lock.is_some() {
+            std::fs::remove_dir_all(&dir).map_err(|e| ClusterError::Io(e.to_string()))?;
+        }
+        drop(lock);
         // The archive is the dropped database's history, not the name's: a database created
         // again under this name starts its own, and an engine refuses to open against an
         // archive of another line. Keep the old one aside for restores. The database is gone
@@ -1058,6 +1078,43 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> ClusterError {
 /// The on-disk directory for database `name`: `<root>/base/<name>`.
 fn base_dir(root: &Path, name: &str) -> PathBuf {
     root.join("base").join(name)
+}
+
+/// Take the lock of the database stored in `dir` (named `name`), refusing it as in use when
+/// another process has that database open.
+fn lock_database_dir(dir: &Path, name: &str) -> Result<std::fs::File, ClusterError> {
+    nusadb_btree::lock_database(&dir.join("btree.wal")).map_err(|e| match e {
+        nusadb_core::Error::Io(io) if io.kind() == io::ErrorKind::WouldBlock => {
+            ClusterError::InUse(name.to_owned())
+        },
+        other => ClusterError::Io(other.to_string()),
+    })
+}
+
+/// Take the exclusive lock on `<root>/global/cluster.lock`, creating the file if needed.
+/// Refused when another server holds it: two servers on one data directory would rewrite each
+/// other's catalog and write the same databases.
+fn lock_cluster(root: &Path) -> io::Result<std::fs::File> {
+    let path = root.join("global").join("cluster.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "the data directory {} is already in use by another nusadb-server (it holds {}); \
+                 stop that server before starting one here",
+                root.display(),
+                path.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// The cluster catalog file: `<root>/global/databases`.
@@ -1116,6 +1173,57 @@ mod tests {
             DurabilityOptions::default(),
         )
         .expect("open cluster")
+    }
+
+    /// A second server on a data directory in use is refused at startup, before it reads or
+    /// writes anything there, and starts once the first one is gone.
+    #[test]
+    fn a_second_server_on_one_data_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = manager(dir.path());
+        let err = DatabaseManager::open(
+            dir.path(),
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            DurabilityOptions::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            err.to_string()
+                .contains("already in use by another nusadb-server"),
+            "{err}"
+        );
+        drop(first);
+        let again = manager(dir.path());
+        assert!(again.open("nusadb").unwrap().is_some());
+    }
+
+    /// `DROP DATABASE` leaves a database another process has open alone: refused as in use, its
+    /// directory untouched, and dropped once that process lets it go.
+    #[test]
+    fn dropping_a_database_another_process_has_open_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manager(dir.path());
+        assert!(m.create("shop", false).unwrap());
+        let wal = base_dir(dir.path(), "shop").join("btree.wal");
+        let outside = nusadb_btree::BtreeEngine::open(&wal).unwrap();
+        let err = m.drop_database("shop", false, "nusadb").unwrap_err();
+        assert!(
+            matches!(err, ClusterError::InUse(ref n) if n == "shop"),
+            "{err:?}"
+        );
+        assert!(base_dir(dir.path(), "shop").exists());
+        assert!(
+            m.list().contains(&"shop".to_owned()),
+            "a refused drop changes nothing"
+        );
+        drop(outside);
+        assert!(m.drop_database("shop", false, "nusadb").unwrap());
+        assert!(!base_dir(dir.path(), "shop").exists());
     }
 
     #[test]

@@ -696,6 +696,31 @@ async fn wait_for_shutdown() {
     }
 }
 
+/// Open the cluster under the data directory, or end the process with the reason said plainly
+/// (a data directory another server is using, or one that cannot be read): the operator acts on
+/// this message.
+fn open_cluster(
+    args: &Args,
+    ceilings: &MemoryCeilings,
+    autoanalyze: database_manager::AutoAnalyzeConfig,
+) -> database_manager::DatabaseManager {
+    match database_manager::DatabaseManager::open(
+        &args.data_dir,
+        nusadb_wire::cluster::DEFAULT_DATABASE,
+        ceilings.max_txn_write_bytes,
+        ceilings.max_resident_bytes,
+        autoanalyze,
+        durability_options(args),
+    ) {
+        Ok(manager) => manager,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot open the data directory");
+            eprintln!("nusadb-server: {e}");
+            std::process::exit(1);
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -720,14 +745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The physical multi-database cluster: each database is its own engine under `base/<db>/`,
     // bootstrapping the default database on a fresh data directory. Dead-version reclamation is
     // the per-database purge scheduler the manager wires as each engine opens.
-    let manager = database_manager::DatabaseManager::open(
-        &args.data_dir,
-        nusadb_wire::cluster::DEFAULT_DATABASE,
-        ceilings.max_txn_write_bytes,
-        ceilings.max_resident_bytes,
-        autoanalyze,
-        durability_options(&args),
-    )?;
+    let manager = open_cluster(&args, &ceilings, autoanalyze);
     // Offline restore: rebuild one database from its archive and exit without serving.
     if let Some(name) = &args.restore_database {
         restore_database(&manager, name, &args)?;

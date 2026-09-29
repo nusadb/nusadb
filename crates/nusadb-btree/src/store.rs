@@ -612,6 +612,10 @@ pub struct PagedStore {
     /// Changed pages evicted to scratch space. Taken after the directory and a frame latch,
     /// never before them.
     spill: Mutex<Spill>,
+    /// The database's exclusive lock file, when the store belongs to a database opened on a
+    /// path: held as long as the store, so as long as anything (a scan outliving its engine,
+    /// say) can still reach the database's files.
+    lock: Mutex<Option<File>>,
 }
 
 #[allow(
@@ -707,6 +711,15 @@ impl PagedStore {
             // Make it resident, then change it in place on the next pass.
             self.read_page(id)?;
         }
+    }
+
+    /// Hold the database's lock `file` for as long as this store lives.
+    ///
+    /// # Errors
+    /// Fails only on a poisoned lock.
+    pub fn hold_lock(&self, file: File) -> Result<()> {
+        *self.lock.lock().map_err(|_| poisoned())? = Some(file);
+        Ok(())
     }
 
     /// Let changed pages leave memory for `file` (a scratch file the store owns from now on)

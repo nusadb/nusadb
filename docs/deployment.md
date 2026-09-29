@@ -22,7 +22,7 @@ the database.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:5678` | TCP listen address for the wire protocol. |
-| `--data-dir` | `./data` | Durable data directory: the write-ahead log and checkpoint image of every database, under `base/<name>/`. Created if absent. |
+| `--data-dir` | `./data` | Durable data directory: the write-ahead log, checkpoint image and page segments of every database, under `base/<name>/`. Created if absent. One server at a time: a second server started on a directory in use exits at once, saying so. |
 | `--auth-user USER:PASSWORD` | none | Require SCRAM-SHA-256 for this user. Repeatable. Once **any** is set, every connection must authenticate; with none, the server trusts every client and logs a warning. |
 | `NUSADB_USER` + `NUSADB_PASSWORD` (environment) | none | The same as one `--auth-user`, for containers. Setting only one of the pair is a start-up error. |
 | `--tls-cert` / `--tls-key` | none | PEM certificate chain and private key; TLS is on when both are set, on the same port. |
@@ -410,6 +410,16 @@ NUSADB_PASSWORD=... nusadb-cli --user nusadb-root -c "CHECKPOINT"
 It requires a quiesced engine: it refuses, naming how many transactions are still active, while any
 transaction is open, including one on the connection issuing it. Run it from a connection in
 autocommit at a quiet moment; a load with continuously overlapping transactions may need a retry.
+
+**One server per data directory.** A running server holds an exclusive lock on
+`global/cluster.lock`, and each open database one on `base/<db>/btree.wal.lock` (on a data
+directory of the older single-database layout, `nusadb.wal.lock` at its root). A second server
+started on the same directory exits at once with a message naming the lock; a restore or a
+standby seed into a database that is open is refused, and so is `DROP DATABASE` of a database
+another process has open. The operating system releases the locks when the holder ends, even
+when it is killed, so there is never a stale lock to remove by hand. The lock files themselves
+stay; they are empty and harmless. Keep the data directory on a local file system: on some
+network file systems these locks are not enforced across machines.
 
 **Backup.** A checkpoint image together with the page segments it names is a complete copy of
 one database as of its checkpoint. The engine only ever replaces the image by an atomic rename

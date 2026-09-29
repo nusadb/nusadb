@@ -257,9 +257,19 @@ fn applied_segments_survive_a_restart_and_promotion_makes_a_primary() {
 
 #[test]
 fn seeding_refuses_a_directory_that_already_holds_a_database() {
-    let p = primary();
-    let err = seed_standby(p.archive.path(), &p.dir.path().join("btree.wal"))
-        .expect_err("the primary's own directory");
+    let Primary {
+        dir,
+        archive,
+        engine,
+        ..
+    } = primary();
+    let wal = dir.path().join("btree.wal");
+    // While the primary has it open, the lock refuses first.
+    let err = seed_standby(archive.path(), &wal).expect_err("the primary's open directory");
+    assert!(err.to_string().contains("already open"), "{err}");
+    // Closed, the directory still holds a database.
+    drop(engine);
+    let err = seed_standby(archive.path(), &wal).expect_err("the primary's own directory");
     assert!(err.to_string().contains("already holds"), "{err}");
 }
 
@@ -336,8 +346,13 @@ fn a_transaction_cut_off_by_a_primary_crash_is_skipped_not_fatal() {
     let orphan = engine.begin(RC).unwrap();
     engine.insert(orphan, table, b"never-ended").unwrap();
     insert(&engine, table, b"p3-a");
-    // The crash: the engine is never dropped, so no rollback marker is ever written.
+    // The crash: the engine is never dropped, so no rollback marker is ever written. The
+    // restart opens the files as the crash left them; a copy stands in for them, since the
+    // forgotten engine still holds the database lock a dead process would have released.
     std::mem::forget(engine);
+    let crashed = dir;
+    let dir = tempfile::tempdir().unwrap();
+    copy_tree(crashed.path(), dir.path());
     let engine = BtreeEngine::open_with_archive(
         dir.path().join("btree.wal"),
         Some(archive.path().to_path_buf()),
@@ -606,4 +621,23 @@ fn a_standby_log_cut_between_a_put_and_its_commit_loses_no_rows() {
     drop(standby);
     let reopened = BtreeEngine::open_standby(&wal).unwrap();
     assert_eq!(payloads(&reopened, p.table), expected);
+}
+
+/// Copy the directory tree `from` into `to`, leaving out lock files (a restarted process holds
+/// its own).
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".lock") {
+            continue;
+        }
+        let target = to.join(&name);
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
