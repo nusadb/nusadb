@@ -60,6 +60,7 @@ const TAG_SEQ_ALTER: u8 = 23;
 const TAG_TABLE_ROOT: u8 = 24;
 const TAG_INDEX_ROOT: u8 = 25;
 const TAG_INDEX_IMAGE_ENTRY: u8 = 26;
+const TAG_FREE_AT_OPEN: u8 = 27;
 
 /// One logical, replayable operation of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +344,12 @@ pub enum LoggedOp {
         /// Root page of the row-to-key map.
         alive_root: u64,
     },
+    /// Image only: pages the image carries that no durable object owns (a temporary table's and
+    /// its indexes' pages, alive when the image was taken): free them at open.
+    FreeAtOpen {
+        /// The page ids to free.
+        pages: Vec<u64>,
+    },
     /// Image only: an alive entry of index `index` too large for an index page, which the
     /// pages therefore do not hold. Replayed straight into the index's in-memory entries: the
     /// row-to-key map in the pages already names it.
@@ -391,7 +398,8 @@ impl LoggedOp {
             | Self::SeqSet { .. }
             | Self::SeqAlter { .. }
             | Self::TableRoot { .. }
-            | Self::IndexRoot { .. } => 0,
+            | Self::IndexRoot { .. }
+            | Self::FreeAtOpen { .. } => 0,
         }
     }
 
@@ -408,6 +416,7 @@ impl LoggedOp {
                 | Self::SeqAlter { .. }
                 | Self::TableRoot { .. }
                 | Self::IndexRoot { .. }
+                | Self::FreeAtOpen { .. }
         )
     }
 
@@ -602,6 +611,12 @@ impl LoggedOp {
             } => {
                 push_key(&mut key, TAG_INDEX_IMAGE_ENTRY, *txn, *index, Some(*row_id));
                 value.extend_from_slice(entry);
+            },
+            Self::FreeAtOpen { pages } => {
+                push_key(&mut key, TAG_FREE_AT_OPEN, 0, 0, None);
+                for page in pages {
+                    value.extend_from_slice(&page.to_le_bytes());
+                }
             },
             Self::SeqSet { id, value: v } => {
                 push_key(&mut key, TAG_SEQ_SET, 0, *id, None);
@@ -814,6 +829,17 @@ impl LoggedOp {
                 index: table,
                 root: read_u64(value, 0)?,
                 alive_root: read_u64(value, 8)?,
+            },
+            TAG_FREE_AT_OPEN => {
+                if value.len() % 8 != 0 {
+                    return None;
+                }
+                Self::FreeAtOpen {
+                    pages: value
+                        .chunks_exact(8)
+                        .filter_map(|c| c.try_into().ok().map(u64::from_le_bytes))
+                        .collect(),
+                }
             },
             TAG_INDEX_IMAGE_ENTRY => Self::IndexImageEntry {
                 txn,
@@ -1518,6 +1544,13 @@ mod image_record_tests {
         assert!(roundtrip_check(&root));
         assert_eq!(root.txn(), 0);
         assert!(root.is_non_transactional());
+        let free = LoggedOp::FreeAtOpen {
+            pages: vec![3, 900, u64::MAX - 1],
+        };
+        assert!(roundtrip_check(&free));
+        assert_eq!(free.txn(), 0);
+        assert!(free.is_non_transactional());
+        assert!(roundtrip_check(&LoggedOp::FreeAtOpen { pages: Vec::new() }));
         let entry = LoggedOp::IndexImageEntry {
             txn: 44,
             index: 3,

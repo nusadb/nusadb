@@ -1990,6 +1990,43 @@ impl BtreeEngine {
         self.fault.lock().ok().and_then(|fault| fault.clone())
     }
 
+    /// Under a checkpoint's quiesce every dead-stamp is settled (no transaction is active and no
+    /// scan is open), so dead index ranges are dropped before the pages are written: an image
+    /// never carries ranges a restart could not find again to purge. A failure part way stops
+    /// the engine.
+    fn drop_all_dead_ranges(&self, cat: &Catalog) -> Result<()> {
+        for idx in cat.indexes.values() {
+            let dropped = idx
+                .data
+                .write()
+                .map_err(|_| poisoned())
+                .and_then(|mut data| data.drop_dead_ranges(&self.store));
+            self.guarded(dropped)?;
+        }
+        Ok(())
+    }
+
+    /// Every page a temporary (non-durable) table or an index on one holds: the image carries
+    /// them, since they are live, but no durable object owns them, so they are freed at open.
+    fn temporary_pages(&self, cat: &Catalog) -> Result<Vec<u64>> {
+        let mut pages = Vec::new();
+        for (&id, t) in &cat.tables {
+            if !cat.table_is_durable(id) {
+                let tree = ClusteredTree::open(&*self.store, t.root_id());
+                pages.extend(tree.pages()?.into_iter().map(|p| p.0));
+            }
+        }
+        for idx in cat.indexes.values() {
+            if !cat.table_is_durable(idx.def.table.0) {
+                let data = idx.data.read().map_err(|_| poisoned())?;
+                pages.extend(data.pages(&self.store)?.into_iter().map(|p| p.0));
+            }
+        }
+        // In id order, so the image is the same bytes whichever order the catalog maps iterate.
+        pages.sort_unstable();
+        Ok(pages)
+    }
+
     /// Queue `state`'s trees for purge to free once `txn` settles.
     fn queue_index_pages(&self, txn: u64, state: &IndexState) -> Result<()> {
         let data = state.data.read().map_err(|_| poisoned())?;
@@ -2505,6 +2542,13 @@ impl BtreeEngine {
                     free_index_pages(store, &state)?;
                 }
             },
+            LoggedOp::FreeAtOpen { pages } => {
+                // Pages a temporary object held when the image was taken: no durable object
+                // names them, so they are free from the start.
+                for &page in pages {
+                    store.deallocate_page(nusadb_core::PageId(page))?;
+                }
+            },
             LoggedOp::IndexImageEntry {
                 txn,
                 index,
@@ -2785,7 +2829,8 @@ impl BtreeEngine {
             | LoggedOp::SeqDrop { .. }
             | LoggedOp::SeqSet { .. }
             | LoggedOp::SeqAlter { .. }
-            | LoggedOp::TableRoot { .. } => true,
+            | LoggedOp::TableRoot { .. }
+            | LoggedOp::FreeAtOpen { .. } => true,
         };
         if durable {
             self.log(&op.to_record())?;
@@ -3380,6 +3425,9 @@ struct ImagePages {
     checksums: Vec<u32>,
     layout: PageLayout,
 }
+
+/// Page ids per `FreeAtOpen` record of an image.
+const FREE_AT_OPEN_CHUNK: usize = 8192;
 
 /// The most segments one image may name before the next checkpoint writes every page afresh.
 const MAX_IMAGE_SEGMENTS: usize = 32;
@@ -4026,9 +4074,17 @@ impl BtreeEngine {
         seqs: &SeqDomain,
         synthetic_txn: u64,
         stamp: u64,
+        free_at_open: &[u64],
         sink: &mut dyn FnMut(&WalRecord) -> Result<()>,
     ) -> Result<()> {
         let mut emit = |op: LoggedOp| sink(&op.to_record());
+        // Pages of temporary objects the image carries all the same: freed at open. In chunks,
+        // so no one record grows with a large temporary table.
+        for chunk in free_at_open.chunks(FREE_AT_OPEN_CHUNK) {
+            emit(LoggedOp::FreeAtOpen {
+                pages: chunk.to_vec(),
+            })?;
+        }
         // The pages themselves precede these records in the image; the records say which page
         // roots each table, so nothing is re-inserted at open.
         let mut sorted_ns: Vec<_> = cat.namespaces.iter().collect();
@@ -4714,17 +4770,8 @@ impl BtreeEngine {
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
         let dir = pages_dir(&wal.path);
-        // Under the quiesce every dead-stamp is settled (no transaction is active and no scan is
-        // open), so dead index ranges are dropped before the pages are written: an image never
-        // carries ranges a restart could not find again to purge.
-        for idx in cat.indexes.values() {
-            let dropped = idx
-                .data
-                .write()
-                .map_err(|_| poisoned())
-                .and_then(|mut data| data.drop_dead_ranges(&self.store));
-            self.guarded(dropped)?;
-        }
+        self.drop_all_dead_ranges(&cat)?;
+        let temporary = self.temporary_pages(&cat)?;
         let page_count = self.store.page_count();
         let live = self.store.live_ids()?;
         // The segments the image being replaced reads from stay on disk until the checkpoint
@@ -4743,9 +4790,14 @@ impl BtreeEngine {
             write_segment_directory(&mut file, covered_lsn, page_count, &live, &plan)?;
             let file = file.into_inner().map_err(|e| Error::Io(e.into_error()))?;
             let mut writer = WalWriter::new(file);
-            Self::emit_image(&cat, &seqs, synthetic_txn, stamp, &mut |record| {
-                writer.append(record).map(|_| ())
-            })?;
+            Self::emit_image(
+                &cat,
+                &seqs,
+                synthetic_txn,
+                stamp,
+                &temporary,
+                &mut |record| writer.append(record).map(|_| ()),
+            )?;
             // Drain the writer's append buffer to the file, then fsync — the image is durable
             // before its rename can make it authoritative.
             writer.flush()?;

@@ -411,3 +411,113 @@ fn temp_table_index_is_nondurable_and_drop_leaks_nothing() {
     );
     assert_eq!(scan_payloads(&engine, keep.id), vec![b"keep-a".to_vec()]);
 }
+
+/// A durable table `keep` with `rows` rows, and, when `temp_rows > 0`, a temporary table with that
+/// many rows and an index over them; checkpointed while the temporary table is alive, then
+/// closed. Returns the live pages after reopening.
+fn live_pages_after_restart(rows: u64, temp_rows: u64) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = dir.path().join("btree.wal");
+    {
+        let engine = BtreeEngine::open(&wal).unwrap();
+        let txn = engine.begin(RC).unwrap();
+        let keep = engine
+            .create_table(txn, &one_col(nusadb_core::PUBLIC_SCHEMA, "keep"))
+            .unwrap();
+        for i in 0..rows {
+            engine
+                .insert(txn, keep, format!("keep-{i:06}").as_bytes())
+                .unwrap();
+        }
+        if temp_rows > 0 {
+            engine.create_temp_schema(txn, TEMP_SCHEMA).unwrap();
+            let temp = engine
+                .create_table(txn, &one_col(TEMP_SCHEMA, "scratch"))
+                .unwrap();
+            let index = engine
+                .create_index(
+                    txn,
+                    &IndexDef {
+                        name: "scratch_v".to_owned(),
+                        table: temp,
+                        columns: vec!["v".to_owned()],
+                        key_exprs: Vec::new(),
+                        predicate: None,
+                        include: Vec::new(),
+                        kind: IndexKind::BTree,
+                        unique: false,
+                    },
+                )
+                .unwrap();
+            for i in 0..temp_rows {
+                let v = format!("temp-{i:06}-{}", "x".repeat(150)).into_bytes();
+                let tid = engine.insert(txn, temp, &v).unwrap();
+                engine.index_insert(txn, index, &v, tid).unwrap();
+            }
+        }
+        engine.commit(txn).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    let engine = BtreeEngine::open(&wal).unwrap();
+    engine.live_pages().unwrap()
+}
+
+/// Pages a temporary table and its index held when a checkpoint ran are not carried past a
+/// restart: the reopened database holds exactly the pages its durable tables need.
+#[test]
+fn temporary_pages_caught_by_a_checkpoint_are_freed_at_restart() {
+    let with_temp = live_pages_after_restart(500, 5000);
+    let without = live_pages_after_restart(500, 0);
+    assert_eq!(
+        with_temp,
+        without,
+        "{} pages of the temporary table outlived the restart",
+        with_temp.saturating_sub(without)
+    );
+}
+
+/// Within the session a temporary table stays whole across checkpoints: its pages are only
+/// named for freeing in the image, freed by the next open, never under the live session.
+#[test]
+fn a_temporary_table_stays_whole_across_checkpoints_in_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = dir.path().join("btree.wal");
+    let temp;
+    let durable;
+    {
+        let engine = BtreeEngine::open(&wal).unwrap();
+        let txn = engine.begin(RC).unwrap();
+        engine.create_temp_schema(txn, TEMP_SCHEMA).unwrap();
+        temp = engine
+            .create_table(txn, &one_col(TEMP_SCHEMA, "scratch"))
+            .unwrap();
+        durable = engine
+            .create_table(txn, &one_col(nusadb_core::PUBLIC_SCHEMA, "keep"))
+            .unwrap();
+        for i in 0..3000_u32 {
+            engine
+                .insert(
+                    txn,
+                    temp,
+                    format!("temp-{i:05}-{}", "y".repeat(120)).as_bytes(),
+                )
+                .unwrap();
+        }
+        engine.insert(txn, durable, b"keep").unwrap();
+        engine.commit(txn).unwrap();
+        engine.checkpoint().unwrap();
+        assert_eq!(scan_payloads(&engine, temp).len(), 3000);
+        let txn = engine.begin(RC).unwrap();
+        engine
+            .insert(txn, temp, b"after the first checkpoint")
+            .unwrap();
+        engine.commit(txn).unwrap();
+        engine.checkpoint().unwrap();
+        assert_eq!(scan_payloads(&engine, temp).len(), 3001);
+    }
+    let engine = BtreeEngine::open(&wal).unwrap();
+    assert_eq!(scan_payloads(&engine, durable), vec![b"keep".to_vec()]);
+    assert!(engine.lookup_table("scratch").unwrap().is_none());
+    let pages = engine.live_pages().unwrap();
+    assert!(pages <= 4, "{pages} pages after the temporary table went");
+}
