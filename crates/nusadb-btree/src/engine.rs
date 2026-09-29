@@ -230,6 +230,13 @@ pub struct BtreeEngine {
     /// on a standby, the id its own image is stamped with, since that id has ended on the
     /// primary and can never be reused or rolled back there.
     last_applied_txn: AtomicU64,
+    /// Set, with the error that caused it, when a storage error struck in the middle of a change
+    /// to the trees, an index or an undo: memory may then disagree with the log, so the engine
+    /// refuses all further work (and above all never checkpoints) until it is restarted, which
+    /// rebuilds it from its log and last image.
+    fault: Mutex<Option<String>>,
+    /// Whether `fault` is set: checked on every operation without taking its lock.
+    faulted: AtomicBool,
     /// Set when an apply replayed records into memory but could not make them durable in the
     /// standby's log: memory is ahead of the log, and every further apply is refused until a
     /// restart replays the log afresh.
@@ -1599,6 +1606,7 @@ impl BtreeEngine {
                 "only a standby applies shipped segments; this engine is writable".to_owned(),
             ));
         }
+        self.ensure_healthy()?;
         let Some(wal_mutex) = &self.wal else {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1656,7 +1664,9 @@ impl BtreeEngine {
         // in between would hold the rows under the old position and the appended records would
         // replay them a second time at the next open.
         let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
-        self.replay(&replay)?;
+        // A replay that fails part way leaves memory ahead of the log: the standby stops.
+        let replayed = self.replay(&replay);
+        self.guarded(replayed)?;
         self.data_version.fetch_add(1, Ordering::SeqCst);
         // Durable under the primary's positions: a restart replays them from this log like any
         // committed history, and the next segment must follow on the last of them. A failure
@@ -1931,6 +1941,53 @@ impl BtreeEngine {
         // failed or crashed before naming it, or belongs to an image already replaced.
         remove_unreferenced_segments(&dir, keep.iter());
         Ok(())
+    }
+
+    /// Stop the engine after `error` struck in the middle of a change: record why, log it, and
+    /// hand back the error the caller reports. Every later operation is refused (see
+    /// [`ensure_healthy`](Self::ensure_healthy)).
+    fn fail_stop(&self, error: &Error) -> Error {
+        let reason = error.to_string();
+        if let Ok(mut fault) = self.fault.lock()
+            && fault.is_none()
+        {
+            *fault = Some(reason.clone());
+        }
+        self.faulted.store(true, Ordering::Release);
+        tracing::error!(
+            error = %reason,
+            "a storage error interrupted a change; the database refuses all work until it is \
+             restarted, which recovers it from its log"
+        );
+        stopped_error(&reason)
+    }
+
+    /// Run a change to the trees, an index or an undo: an error from it stops the engine.
+    fn guarded<T>(&self, change: Result<T>) -> Result<T> {
+        change.map_err(|e| self.fail_stop(&e))
+    }
+
+    /// Refuse to go on once the engine has stopped after a storage error.
+    fn ensure_healthy(&self) -> Result<()> {
+        if !self.faulted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reason = self
+            .fault
+            .lock()
+            .ok()
+            .and_then(|fault| fault.clone())
+            .unwrap_or_default();
+        Err(stopped_error(&reason))
+    }
+
+    /// Why the engine stopped, if a storage error interrupted a change: it then refuses all work
+    /// until it is restarted.
+    pub fn fault(&self) -> Option<String> {
+        if !self.faulted.load(Ordering::Acquire) {
+            return None;
+        }
+        self.fault.lock().ok().and_then(|fault| fault.clone())
     }
 
     /// Queue `state`'s trees for purge to free once `txn` settles.
@@ -3559,6 +3616,14 @@ struct ImageContents {
     pages: Option<ImagePages>,
 }
 
+/// The error every operation gets once the engine stopped after a storage error.
+fn stopped_error(reason: &str) -> Error {
+    Error::Io(std::io::Error::other(format!(
+        "nusadb-btree: the database stopped after a storage error interrupted a change ({reason}); \
+         restart it to recover from its log"
+    )))
+}
+
 /// Take the exclusive lock on the database whose log is `wal`.
 ///
 /// The lock is the file `<wal>.lock`, created if needed (its directory must exist). It is refused
@@ -4588,6 +4653,9 @@ impl BtreeEngine {
                   truncate and be silently dropped"
     )]
     fn checkpoint_stamped(&self, stamp: u64) -> Result<()> {
+        // Never after a storage error interrupted a change: the image would make memory that
+        // may disagree with the log the durable truth.
+        self.ensure_healthy()?;
         // Free the pages of settled dropped trees and retired overflow chains first, so they
         // stay out of the image instead of riding it until a later purge. Only that cheap tail
         // of a purge runs here, not the row sweep. Best effort: the image is correct either
@@ -4599,6 +4667,9 @@ impl BtreeEngine {
         let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
         let cat = self.catalog.write().map_err(|_| poisoned())?;
         let mut txns = self.txns.lock().map_err(|_| poisoned())?;
+        // Again under the quiesce: a background pass that failed part way while this checkpoint
+        // waited for the catalog has stopped the engine by now.
+        self.ensure_healthy()?;
         if !txns.active.is_empty() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -4647,10 +4718,12 @@ impl BtreeEngine {
         // open), so dead index ranges are dropped before the pages are written: an image never
         // carries ranges a restart could not find again to purge.
         for idx in cat.indexes.values() {
-            idx.data
+            let dropped = idx
+                .data
                 .write()
-                .map_err(|_| poisoned())?
-                .drop_dead_ranges(&self.store)?;
+                .map_err(|_| poisoned())
+                .and_then(|mut data| data.drop_dead_ranges(&self.store));
+            self.guarded(dropped)?;
         }
         let page_count = self.store.page_count();
         let live = self.store.live_ids()?;
@@ -5956,6 +6029,7 @@ impl TupleScan for VecScan {
 )]
 impl nusadb_core::StorageEngine for BtreeEngine {
     fn begin_statement(&self, txn: TxnId) -> Result<()> {
+        self.ensure_healthy()?;
         let mut t = self.txns.lock().map_err(|_| poisoned())?;
         // Refresh the statement snapshot for READ COMMITTED / READ UNCOMMITTED so this statement's
         // reads see a fresh, consistent view. REPEATABLE READ / SERIALIZABLE
@@ -5979,6 +6053,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn begin(&self, level: IsolationLevel) -> Result<TxnId> {
+        self.ensure_healthy()?;
         let mut t = self.txns.lock().map_err(|_| poisoned())?;
         // A checkpoint draining the active set holds new transactions here, never for longer than
         // its bounded pause plus the checkpoint itself; the wait releases the lock, so the
@@ -6026,6 +6101,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn commit(&self, txn: TxnId) -> Result<()> {
+        self.ensure_healthy()?;
         self.finish_open_scans(txn);
         // The commit gate makes [SSI check → marker append → staged insert] one atomic step
         // across committers: the check must observe every earlier committer as staged or
@@ -6207,6 +6283,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn rollback_to(&self, txn: TxnId, name: &str) -> Result<()> {
+        self.ensure_healthy()?;
         self.drain_open_scans(txn, None)?;
         let tail = {
             let mut t = self.txns.lock().map_err(|_| poisoned())?;
@@ -6299,6 +6376,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn create_table(&self, txn: TxnId, def: &TableDef) -> Result<TableId> {
+        self.ensure_healthy()?;
         let tree = ClusteredTree::create(&*self.store)?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
@@ -6367,6 +6445,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn drop_table(&self, txn: TxnId, table: TableId) -> Result<()> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -6487,6 +6566,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn alter_table(&self, txn: TxnId, table: TableId, op: &AlterOp) -> Result<()> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -6556,6 +6636,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn create_schema(&self, txn: TxnId, name: &str) -> Result<SchemaId> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -6586,6 +6667,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn create_temp_schema(&self, txn: TxnId, name: &str) -> Result<SchemaId> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -6613,6 +6695,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn drop_schema(&self, txn: TxnId, id: SchemaId, cascade: bool) -> Result<()> {
+        self.ensure_healthy()?;
         // Collect the member tables first (releasing the guard) so RESTRICT can reject before
         // any mutation and CASCADE can drop them through the normal `drop_table` path.
         let (name, members) = {
@@ -6687,6 +6770,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn insert_batch(&self, txn: TxnId, table: TableId, tuples: &[Vec<u8>]) -> Result<Vec<Tid>> {
+        self.ensure_healthy()?;
         // The loop this amortizes does nothing for zero rows, so neither may the batch: no
         // ceiling check, no lock intention, no empty log record.
         if tuples.is_empty() {
@@ -6734,7 +6818,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         for (i, tuple) in tuples.iter().enumerate() {
             let row_id = first_row_id + i as u64;
             let value = mvcc::encode_row(RowMeta::fresh(txn.0), tuple);
-            tree.insert(row_id, &value)?;
+            self.guarded(tree.insert(row_id, &value))?;
             // Publish the root per row, exactly as the loop of single inserts does, so a failure
             // part-way never discards a root move a split already made.
             t.set_root(tree.root());
@@ -6781,6 +6865,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn insert(&self, txn: TxnId, table: TableId, tuple: &[u8]) -> Result<Tid> {
+        self.ensure_healthy()?;
         if tuple.len() > MAX_USER_TUPLE {
             return Err(tuple_too_large(tuple.len()));
         }
@@ -6816,7 +6901,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         w.next_row_id += 1;
         let value = mvcc::encode_row(RowMeta::fresh(txn.0), tuple);
         let mut tree = ClusteredTree::open(&*self.store, t.root_id());
-        tree.insert(row_id, &value)?;
+        self.guarded(tree.insert(row_id, &value))?;
         t.set_root(tree.root());
         self.push_undo(
             txn.0,
@@ -6838,6 +6923,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn update(&self, txn: TxnId, table: TableId, tid: Tid, tuple: &[u8]) -> Result<Tid> {
+        self.ensure_healthy()?;
         if tuple.len() > MAX_USER_TUPLE {
             return Err(tuple_too_large(tuple.len()));
         }
@@ -6916,7 +7002,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
             tuple,
         );
-        let retired = tree.update(row_id, &new_value)?;
+        let retired = self.guarded(tree.update(row_id, &new_value))?;
         t.set_root(tree.root());
         self.retire_pages(txn.0, retired)?;
         self.push_undo(
@@ -6942,6 +7028,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn delete(&self, txn: TxnId, table: TableId, tid: Tid) -> Result<()> {
+        self.ensure_healthy()?;
         self.drain_open_scans(txn, Some(table))?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let t = cat
@@ -6997,7 +7084,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let header = new_value
             .get(..mvcc::META)
             .ok_or_else(|| corrupt_row(row_id))?;
-        tree.update_prefix(row_id, header)?;
+        self.guarded(tree.update_prefix(row_id, header))?;
         t.set_root(tree.root());
         self.push_undo(
             txn.0,
@@ -7019,6 +7106,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn scan(&self, txn: TxnId, table: TableId) -> Result<Box<dyn TupleScan>> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let t = cat
             .tables
@@ -7134,6 +7222,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn scan_committed(&self, txn: TxnId, table: TableId) -> Result<Box<dyn TupleScan>> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let t = cat
             .tables
@@ -7190,6 +7279,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn create_sequence(&self, txn: TxnId, def: &SequenceDef) -> Result<SequenceId> {
+        self.ensure_healthy()?;
         // Rank order: the txn check (rank 6) precedes the sequence latch (rank 7).
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7242,6 +7332,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn drop_sequence(&self, txn: TxnId, id: SequenceId) -> Result<()> {
+        self.ensure_healthy()?;
         // Rank order: the txn check (rank 6) precedes the sequence latch (rank 7).
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7266,6 +7357,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn sequence_next(&self, id: SequenceId) -> Result<i64> {
+        self.ensure_healthy()?;
         if self.is_standby() {
             return Err(Error::ReadOnly(
                 "this server is a standby; sequences advance on the primary".to_owned(),
@@ -7308,6 +7400,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn sequence_set(&self, id: SequenceId, value: i64) -> Result<()> {
+        self.ensure_healthy()?;
         let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
         let seq = seqs
             .sequences
@@ -7325,6 +7418,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn alter_sequence(&self, txn: TxnId, id: SequenceId, change: &SequenceChange) -> Result<()> {
+        self.ensure_healthy()?;
         // Rank order: the txn check (rank 6) precedes the sequence latch (rank 7).
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7424,6 +7518,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn create_index(&self, txn: TxnId, def: &IndexDef) -> Result<IndexId> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7463,6 +7558,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn drop_index(&self, txn: TxnId, id: IndexId) -> Result<()> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7515,6 +7611,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn index_insert(&self, txn: TxnId, index: IndexId, key: &[u8], tid: Tid) -> Result<()> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7567,7 +7664,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             }
         }
         let owned = key.to_vec();
-        let applied = data.apply_insert(&self.store, &owned, row_id, txn.0)?;
+        let applied = self.guarded(data.apply_insert(&self.store, &owned, row_id, txn.0))?;
         // A same-key re-insert (an UPDATE that did not move the key) changed nothing, so nothing
         // may be undone — recording an undo for it is exactly the
         // Bug (rollback would strip the committed entry).
@@ -7616,6 +7713,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn index_delete(&self, txn: TxnId, index: IndexId, key: &[u8], tid: Tid) -> Result<()> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7626,7 +7724,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .get(&index.0)
             .ok_or_else(|| index_not_found(index))?;
         let mut data = idx.data.write().map_err(|_| poisoned())?;
-        let removed = data.apply_delete(&self.store, key, row_id)?;
+        let removed = self.guarded(data.apply_delete(&self.store, key, row_id))?;
         if let Some(meta) = removed {
             self.push_undo(
                 txn.0,
@@ -7690,6 +7788,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         lo: Bound<Vec<u8>>,
         hi: Bound<Vec<u8>>,
     ) -> Result<Box<dyn TupleScan>> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         // Latest-committed visibility (a fresh view), never the frozen snapshot: a uniqueness probe
         // must see a key another transaction committed after this one began (mirrors `scan_committed`).
@@ -7760,6 +7859,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         primary: bool,
         nulls_not_distinct: bool,
     ) -> Result<IndexId> {
+        self.ensure_healthy()?;
         // Create the backing unique index first (it takes the state latch internally). If the
         // single-PK check below rejects this, the index was created within this transaction and
         // is undone when the caller rolls back (the undo contract carried over from the predecessor engine).
@@ -7828,6 +7928,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         name: &str,
         expr: &[u8],
     ) -> Result<()> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -7868,6 +7969,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn drop_constraint(&self, txn: TxnId, table: TableId, name: &str) -> Result<()> {
+        self.ensure_healthy()?;
         // A CHECK constraint has no backing index — handle it first.
         let backing_index = {
             let mut cat = self.catalog.write().map_err(|_| poisoned())?;
@@ -8055,6 +8157,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn add_foreign_key(&self, txn: TxnId, def: &ForeignKeyDef) -> Result<IndexId> {
+        self.ensure_healthy()?;
         // Validate under a brief read guard before creating the backing index.
         let parent_index = {
             let cat = self.catalog.read().map_err(|_| poisoned())?;
@@ -8143,6 +8246,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn fk_check(&self, txn: TxnId, name: &str, key: &[u8]) -> Result<()> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let view = {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
@@ -8168,6 +8272,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn fk_on_delete(&self, txn: TxnId, parent_table: TableId, parent_key: &[u8]) -> Result<u64> {
+        self.ensure_healthy()?;
         // Under the read guard: gather the dependent child rows per FK referencing this parent.
         let mut cascade: Vec<(u64, u64)> = Vec::new();
         {
@@ -8225,6 +8330,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn analyze_table(&self, txn: TxnId, table: TableId, stats: &TableStats) -> Result<()> {
+        self.ensure_healthy()?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
@@ -8276,6 +8382,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn row_count(&self, table: TableId) -> Result<u64> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let t = cat
             .tables
@@ -8361,6 +8468,7 @@ impl BtreeEngine {
         direction: ScanDirection,
         limit: Option<usize>,
     ) -> Result<Box<dyn TupleScan>> {
+        self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
         let (view, serializable) = {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
@@ -8467,6 +8575,7 @@ impl BtreeEngine {
     /// section). Tolerates an unknown transaction exactly like the old in-latch
     /// `if let Some(t) = txns.get_mut(..)` did.
     fn push_undo(&self, txn: u64, op: UndoOp) -> Result<()> {
+        self.ensure_healthy()?;
         if let Some(t) = self.txns.lock().map_err(|_| poisoned())?.txns.get_mut(&txn) {
             t.undo.push(op);
         }
@@ -8547,6 +8656,14 @@ impl BtreeEngine {
     /// # Errors
     /// Propagates WAL append/fsync and page-store failures.
     fn rollback_tail(&self, txn: TxnId, ops: Vec<UndoOp>, compensate: bool) -> Result<()> {
+        // The ops have already left the transaction's undo list: whatever stops this part way
+        // (a compensation that cannot be logged, an undo that cannot be applied) leaves memory
+        // disagreeing with the log, so it stops the engine.
+        let undone = self.apply_rollback_tail(txn, ops, compensate);
+        self.guarded(undone)
+    }
+
+    fn apply_rollback_tail(&self, txn: TxnId, ops: Vec<UndoOp>, compensate: bool) -> Result<()> {
         if Self::undo_needs_catalog_write(&ops) {
             let mut cat = self.catalog.write().map_err(|_| poisoned())?;
             if compensate {
@@ -8576,9 +8693,8 @@ impl BtreeEngine {
     /// its versions is physically gone. Locks release last too, so a constraint path guarded by
     /// a key lock never observes a mid-undo index state.
     ///
-    /// Always succeeds or stops the process: the in-memory undo cannot fail except on a poisoned
-    /// lock (an already-undefined state), where the only sound response is `process::abort`, and the
-    /// durable bookkeeping afterwards is best-effort.
+    /// Always ends the transaction: an undo that fails stops the engine instead (see
+    /// [`fail_stop`](Self::fail_stop)), and the durable bookkeeping afterwards is best-effort.
     fn abort(&self, txn: TxnId, state: TxnState) {
         let locks = state.locks;
         let undo = state.undo;
@@ -8591,22 +8707,15 @@ impl BtreeEngine {
             })
             .collect();
 
-        // 1. Physically erase this transaction's versions FIRST. In Stage-1/2 the page store is
-        //    volatile (WAL is the only durable medium), so the undo touches only in-memory state and
-        //    CANNOT fail on a full disk — it fails only on a poisoned mutex, which is genuinely
-        //    unrecoverable. Doing it before any fallible WAL append means a full disk can never
-        //    strand the undo half-done, which was the dirty-read hazard the old ordering guarded
-        //    against by killing the process.
-        if self.rollback_tail(txn, undo, false).is_err() {
-            // The only failure mode here is a poisoned mutex: another thread panicked mid-mutation,
-            // so engine state is already undefined and the process cannot continue safely.
-            // `process::abort` (not `panic!`) — a panic in the server's `spawn_blocking` task is
-            // caught by the runtime and would keep serving corrupt state.
-            eprintln!(
-                "nusadb-btree: FATAL — transaction abort undo failed (poisoned lock); aborting so \
-                 recovery rebuilds a clean state on restart"
-            );
-            std::process::abort();
+        // 1. Physically erase this transaction's versions FIRST, before any fallible log append,
+        //    so a full disk can never strand the undo half-done. The undo writes no log of its
+        //    own; it can still fail on a page that cannot be read (from the image or the spill)
+        //    or on a poisoned lock. `rollback_tail` then stops the engine: it serves nothing more
+        //    until a restart rebuilds it from the log, while the teardown below still runs so the
+        //    transaction does not stay stranded with its locks.
+        //    An engine already stopped leaves memory as it is: the restart rebuilds it anyway.
+        if !self.faulted.load(Ordering::Acquire) {
+            let _ = self.rollback_tail(txn, undo, false);
         }
 
         // 2. Versions are gone, so the transaction may now safely leave `active` and drop its locks.
@@ -9132,7 +9241,10 @@ impl BtreeEngine {
     /// # Errors
     /// Propagates page-store I/O errors and corruption-class decode failures.
     pub fn purge(&self) -> Result<PurgeStats> {
+        self.ensure_healthy()?;
         let snapshot = self.purge_snapshot()?;
+        // Purge rewrites rows and index entries in place: a failure part way stops the engine
+        // (inside `purge_with`, before the catalog is released).
         self.purge_with(snapshot)
     }
 
@@ -9160,8 +9272,23 @@ impl BtreeEngine {
                   the shared `settled` snapshot they all read"
     )]
     fn purge_with(&self, snapshot: PurgeSnapshot) -> Result<PurgeStats> {
-        let mut stats = PurgeStats::default();
         let cat = self.catalog.read().map_err(|_| poisoned())?;
+        // A pass that fails part way stops the engine while it still holds the catalog, so no
+        // checkpoint (which needs the catalog exclusively) can publish the half-done pass.
+        let pass = self.purge_pass(&cat, snapshot);
+        let pass = self.guarded(pass);
+        drop(cat);
+        pass
+    }
+
+    /// The body of [`purge_with`](Self::purge_with), under the catalog guard it holds.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one purge pass: row sweep, index sweep and arena reclaim share their settlement \
+                  snapshot and batch cursor"
+    )]
+    fn purge_pass(&self, cat: &Catalog, snapshot: PurgeSnapshot) -> Result<PurgeStats> {
+        let mut stats = PurgeStats::default();
         let PurgeSnapshot {
             pinned,
             active,

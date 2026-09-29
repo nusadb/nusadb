@@ -411,6 +411,26 @@ It requires a quiesced engine: it refuses, naming how many transactions are stil
 transaction is open, including one on the connection issuing it. Run it from a connection in
 autocommit at a quiet moment; a load with continuously overlapping transactions may need a retry.
 
+**When a storage error interrupts a change.** If reading or writing a page fails while a row,
+an index entry, a rollback or the background purge is changing it (a damaged page on disk, an
+unreadable page of the scratch file), or the log cannot take the records a `ROLLBACK TO
+SAVEPOINT` must write (a full disk), the database stops: from then on every statement against it,
+new transactions included, fails with
+
+```text
+ERROR XX000: i/o error: nusadb-btree: the database stopped after a storage error interrupted a
+change (<the error>); restart it to recover from its log
+```
+
+and the server log holds the same error at `ERROR`. Memory may then disagree with the log, so
+the stopped database never checkpoints: its image stays exactly as the last good checkpoint left
+it. Other databases on the same server keep running. Fix the cause (check the disk, restore the
+damaged files from a backup), then restart the server: the database is rebuilt from its last
+image and its log, with every committed transaction and nothing of the interrupted one. An error
+while a statement only reads a page fails that statement alone and stops nothing; the background
+purge, though, walks every table and changes rows as it goes, so a damaged page it meets stops
+the database within one purge interval even if no statement touches that page.
+
 **One server per data directory.** A running server holds an exclusive lock on
 `global/cluster.lock`, and each open database one on `base/<db>/btree.wal.lock` (on a data
 directory of the older single-database layout, `nusadb.wal.lock` at its root). A second server
