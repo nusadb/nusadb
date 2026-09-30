@@ -64,7 +64,7 @@ impl TemporalKind for TimestampTzKind {
     const DATA_TYPE: ColumnType = ColumnType::TimestampTz;
 }
 
-/// `TIME WITH TIME ZONE` — the packed local-time + zone `i64` (see [`crate::temporal`], P-TIMETZ).
+/// `TIME WITH TIME ZONE`: the packed local-time + zone `i64` (see [`crate::temporal`]).
 #[derive(Debug, Clone, Copy)]
 pub struct TimeTzKind;
 impl TemporalKind for TimeTzKind {

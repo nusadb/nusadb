@@ -26,7 +26,7 @@ pub enum WireError {
     InvalidString,
     /// A count or length field exceeds the width its on-wire prefix reserves — e.g. more than
     /// 65 535 columns/fields in one message, or a field longer than `u32::MAX` — so it cannot be
-    /// encoded without truncating the prefix and desyncing the stream (N1 G21).
+    /// encoded without truncating the prefix and desyncing the stream.
     #[error("a message field is too large to encode within its length prefix")]
     FieldTooLarge,
     /// A TLS server configuration could not be built (bad certificate or key).

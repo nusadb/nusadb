@@ -276,7 +276,7 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
         sql::Expr::Interval(interval) => convert_interval(interval),
         sql::Expr::Nested(inner) => convert_expr(*inner),
         // `<expr> COLLATE "C"/"POSIX"` is a no-op — NusaDB already sorts text by byte value — so it
-        // reduces to the inner expression; a locale collation is rejected loudly (D-COLLATE).
+        // reduces to the inner expression; a locale collation is rejected loudly.
         sql::Expr::Collate { expr, collation } => {
             require_byte_order_collation(&collation)?;
             convert_expr(*expr)
@@ -468,8 +468,8 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
         },
         // ILIKE is case-insensitive LIKE. The matcher folds case per character (rather than
         // lower-casing both sides up front), so a `_` still matches one source character even when a
-        // letter's lowercase form has a different length, and an alphabetic `ESCAPE` keeps its meaning
-        // (deep-gate #12).
+        // letter's lowercase form has a different length, and an alphabetic `ESCAPE` keeps its
+        // meaning.
         sql::Expr::ILike {
             negated,
             any,
@@ -519,7 +519,7 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ast::Expr::ArrayLiteral(elems))
         },
-        // `base[index]` array element access and `base[i:j]` array slice (B-fn). sqlparser
+        // `base[index]` array element access and `base[i:j]` array slice. sqlparser
         // 0.62 models chained subscripts as one access chain (`a[1][2]` = root + two links); fold
         // the chain left-to-right. A `.field` composite access is out of surface.
         sql::Expr::CompoundFieldAccess { root, access_chain } => {
@@ -2167,10 +2167,10 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
         B::BitwiseAnd => ast::BinaryOp::BitAnd,
         B::BitwiseOr => ast::BinaryOp::BitOr,
         B::PGBitwiseXor => ast::BinaryOp::BitXor,
-        // Integer bit-shifts `<<` / `>>` (B-fn).
+        // Integer bit-shifts `<<` / `>>`.
         B::PGBitwiseShiftLeft => ast::BinaryOp::ShiftLeft,
         B::PGBitwiseShiftRight => ast::BinaryOp::ShiftRight,
-        // Array overlap `&&` — whether two arrays share any element (B-fn).
+        // Array overlap `&&`, whether two arrays share any element.
         B::PGOverlap => ast::BinaryOp::ArrayOverlap,
         // String concatenation `||`.
         B::StringConcat => ast::BinaryOp::Concat,
@@ -2215,7 +2215,7 @@ pub(super) fn convert_binary_op(op: sql::BinaryOperator) -> Result<ast::BinaryOp
             "&>" => ast::BinaryOp::RangeNotExtendLeft,
             other => return unsupported(&format!("binary operator `{other}`")),
         },
-        // Full-text search match `@@` (F1).
+        // Full-text search match `@@`.
         B::AtAt => ast::BinaryOp::TsMatch,
         // JSON path exists `@?`.
         B::AtQuestion => ast::BinaryOp::JsonPathExists,

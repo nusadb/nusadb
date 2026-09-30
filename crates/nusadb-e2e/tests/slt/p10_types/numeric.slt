@@ -50,13 +50,13 @@ SELECT MIN(amount) FROM prices
 ----
 0.01
 
-# Division rounds half-away-from-zero, keeping ~16+ significant digits (P0-R2-1).
+# Division rounds half-away-from-zero, keeping ~16+ significant digits.
 query T
 SELECT CAST('10' AS NUMERIC) / CAST('3' AS NUMERIC) AS third
 ----
 3.3333333333333333
 
-# --- N8: NUMERIC division result scale matches the reference engine's `select_div_scale` ---
+# --- NUMERIC division result scale matches the reference engine's `select_div_scale` ---
 # The scale is chosen for at least 16 significant digits of the quotient, never fewer than either
 # input's scale. Values / scales below are the reference engine's, captured live.
 query T

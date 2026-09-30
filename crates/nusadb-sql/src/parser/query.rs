@@ -55,7 +55,7 @@ pub(super) fn convert_query(query: sql::Query) -> Result<ast::Statement, Error> 
 /// row set flows through the VALUES-derived-table relation. Its `ORDER BY`/`LIMIT` bind to the
 /// combined result; the output columns are named `column1`, `column2`, … (as for a VALUES relation).
 fn convert_top_level_values(query: sql::Query) -> Result<ast::Statement, Error> {
-    // Reject OFFSET / FETCH / locks (no silent drop, G20); ORDER BY + LIMIT are consumed below.
+    // Reject OFFSET / FETCH / locks (no silent drop); ORDER BY + LIMIT are consumed below.
     reject_query_envelope(&query, false)?;
     let order_by = convert_order_by(query.order_by)?;
     let (raw_limit, _, _) = split_limit_clause(query.limit_clause)?;
@@ -126,7 +126,7 @@ pub(super) fn convert_with(with: Option<sql::With>) -> Result<Vec<ast::Cte>, Err
         .collect()
 }
 
-/// Convert one sqlparser `Cte` into the internal [`ast::Cte`] (non-recursive recursive).
+/// Convert one sqlparser `Cte` into the internal [`ast::Cte`] (non-recursive or recursive).
 pub(super) fn convert_cte(cte: sql::Cte, recursive: bool) -> Result<ast::Cte, Error> {
     // `AS [NOT] MATERIALIZED` is a planner hint that never changes results, so both spellings are
     // accepted and the hint carries no effect. A CTE is inlined by default and materialized (run once)
@@ -279,7 +279,7 @@ pub(super) fn convert_cte_body(
 /// Reject `Query`-envelope clauses outside the Stage-4 surface.
 ///
 /// Exhaustively destructures the `Query` (by reference) so a future sqlparser field cannot be
-/// silently dropped (G5, G20): `body`/`order_by`/`limit` are consumed by the caller; every other
+/// silently dropped: `body`/`order_by`/`limit` are consumed by the caller; every other
 /// clause is rejected here rather than parsed-and-ignored — historically `offset`/`fetch`/`locks`/
 /// `limit_by`/`for_clause` were discarded, so `... OFFSET 5` returned from offset 0 and
 /// `... FOR UPDATE` took no lock.
@@ -302,7 +302,7 @@ pub(super) fn reject_query_envelope(query: &sql::Query, allow_locks: bool) -> Re
     // `convert_select` / the CTE + set-op operand paths take the limit clause out before calling
     // this function, so on those paths it is always `None`. A set-operation envelope keeps
     // its `LIMIT` (consumed by the caller) but cannot carry OFFSET / `LIMIT ... BY` — reject them
-    // here (no silent drop, G20; prevents `UNION ... OFFSET n` from being silently ignored).
+    // here (no silent drop; this prevents `UNION ... OFFSET n` from being silently ignored).
     match &limit_clause {
         None => {},
         Some(sql::LimitClause::LimitOffset {
@@ -334,7 +334,7 @@ pub(super) fn reject_query_envelope(query: &sql::Query, allow_locks: bool) -> Re
         );
     }
     // `allow_locks` callers (plain SELECT) consume `locks` themselves via `convert_locks`; the
-    // set-operation paths cannot model row locking, so they reject it here (no silent drop, G20).
+    // set-operation paths cannot model row locking, so they reject it here (no silent drop).
     if !allow_locks && !locks.is_empty() {
         return unsupported("row locking (FOR UPDATE / FOR SHARE)");
     }

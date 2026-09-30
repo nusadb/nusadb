@@ -31,13 +31,13 @@ pub(super) fn build_join(
         }
     }
 
-    // ON-clause predicate pushdown. For an INNER join, `ON` is equivalent to
-    // `WHERE`, so a residual conjunct referencing only one input can be evaluated before the join
-    // rather than on every emitted pair. A selective single-side predicate — e.g. `o1.id < 1000`
-    // in a self-join `o1 ⋈ o2 ON o1.customer_id = o2.customer_id AND o1.id < o2.id AND o1.id < 1000`
-    // — then shrinks that input from O(n) to O(selective) rows before the hash join, so the join's
-    // output collapses from O(n × fan-out) intermediate pairs to a small set (QA measured the
-    // un-pushed form growing supra-linearly: 118×→210× the reference engine at 3M→8M rows). Outer joins keep such
+    // ON-clause predicate pushdown. For an INNER join, `ON` is equivalent to `WHERE`, so a residual
+    // conjunct referencing only one input can be evaluated before the join rather than on every
+    // emitted pair. A selective single-side predicate, e.g. `o1.id < 1000` in a self-join `o1 ⋈ o2
+    // ON o1.customer_id = o2.customer_id AND o1.id < o2.id AND o1.id < 1000`, then shrinks that
+    // input from O(n) to O(selective) rows before the hash join, so the join's output collapses
+    // from O(n × fan-out) intermediate pairs to a small set (the un-pushed form measured growing
+    // supra-linearly: 118×→210× the reference engine at 3M→8M rows). Outer joins keep such
     // predicates in the residual: a predicate on an outer join's preserved side must not drop its
     // rows, so only the unambiguously-safe INNER case is pushed. A subquery-bearing conjunct is
     // never pushed (it may correlate to the joined row, and the right-side shift below assumes no
@@ -190,15 +190,15 @@ pub(super) fn classify_conjunct(
 }
 
 /// Only types whose value-equality the executor can hash **compare-compatibly** (equal values ⇒
-/// equal key atoms) are eligible as hash keys. widened this from the
-/// original `Int`/`Bool`/`Text`: `BIGINT` is the standard ID type, so almost every real-world
-/// equi-join was silently falling to the O(n²) nested loop (QA: 5k×5k = ~6s, 300k×300k = hung).
-/// The integer widths share one runtime `i64`; the temporals are exact integer counts (TIMETZ's
-/// packed form compares exactly); UUID/BYTEA are exact bytes; NUMERIC canonicalizes through the
-/// trimmed exact decimal (`1.0` = `1.00`). `Float` stays excluded (NaN / `-0.0` hashing hazards),
-/// as do `Interval` (mixed-unit equality: `1 mon` = `30 days`), `Json`, and the containers. Such
-/// joins fall back to nested-loop, which evaluates equality through the standard evaluator.
-/// Called with [`ColumnType::physical`] types.
+/// equal key atoms) are eligible as hash keys. This was widened from the original
+/// `Int`/`Bool`/`Text`: `BIGINT` is the standard ID type, so almost every real-world equi-join was
+/// silently falling to the O(n²) nested loop (measured: 5k×5k = ~6s, 300k×300k = hung). The integer
+/// widths share one runtime `i64`; the temporals are exact integer counts (TIMETZ's packed form
+/// compares exactly); UUID/BYTEA are exact bytes; NUMERIC canonicalizes through the trimmed exact
+/// decimal (`1.0` = `1.00`). `Float` stays excluded (NaN / `-0.0` hashing hazards), as do
+/// `Interval` (mixed-unit equality: `1 mon` = `30 days`), `Json`, and the containers. Such joins
+/// fall back to nested-loop, which evaluates equality through the standard evaluator. Called with
+/// [`ColumnType::physical`] types.
 pub(super) const fn is_hashable_key_type(ty: ColumnType) -> bool {
     matches!(
         ty,

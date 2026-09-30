@@ -1,6 +1,6 @@
 //! Columnar batch model — the vectorized executor's unit of data.
 //!
-//! The Stage 4 executor processes data column-at-a-time in fixed-size batches of
+//! The executor processes data column-at-a-time in fixed-size batches of
 //! [`BATCH_SIZE`](crate::BATCH_SIZE) rows rather than one [`Row`](crate::Row) at a
 //! time. A [`RecordBatch`] is a [`Schema`] paired with one columnar [`Array`] per
 //! field; every operator consumes and produces `RecordBatch`es.

@@ -1207,7 +1207,7 @@ pub(super) fn analyze_scalar_function(
     ) {
         return analyze_array_mutate(func, args, scope, catalog, aggregates);
     }
-    // ARRAY_REPLACE(arr, from, to) takes a polymorphic array plus two element-typed values (B-fn).
+    // ARRAY_REPLACE(arr, from, to) takes a polymorphic array plus two element-typed values.
     if matches!(func, F::ArrayReplace) {
         return analyze_array_replace(func, args, scope, catalog, aggregates);
     }
@@ -1245,7 +1245,7 @@ pub(super) fn analyze_scalar_function(
         });
     }
     // ISFINITE(value) accepts a NUMERIC or temporal value of any of several types, so it is not
-    // expressible with the fixed table; it always yields BOOL (B-fn).
+    // expressible with the fixed table; it always yields BOOL.
     if matches!(func, F::IsFinite) {
         let name = func.name();
         let [arg_expr] = args else {
@@ -1308,7 +1308,7 @@ pub(super) fn analyze_scalar_function(
     }
     // FORMAT(fmt, ...) takes a TEXT format string plus arguments of any type substituted into its
     // `%s`/`%I`/`%L` specifiers; the arguments are not table-shaped and NULL is not propagated, so it
-    // is handled directly (B-fn).
+    // is handled directly.
     if matches!(func, F::Format) {
         let name = func.name();
         let Some((fmt_expr, rest)) = args.split_first() else {
@@ -1591,7 +1591,7 @@ pub(super) fn analyze_scalar_function(
         },
         // JSONB_PATH_MATCH(json, path) → BOOL (or NULL).
         F::JsonbPathMatch => ScalarSig::Fixed(&[ColumnType::Json, Text], &[], ColumnType::Bool),
-        // Full-text search (F1): TO_TSVECTOR/TO_TSQUERY/PLAINTO_TSQUERY([config,] text) → the
+        // Full-text search: TO_TSVECTOR/TO_TSQUERY/PLAINTO_TSQUERY([config,] text) → the
         // canonical tsvector/tsquery text form. The optional leading argument is the configuration;
         // with one argument the default configuration applies (rejected at evaluation until a
         // non-`simple` configuration exists).
@@ -1669,7 +1669,7 @@ pub(super) fn analyze_scalar_function(
         F::Overlay => ScalarSig::Fixed(&[Text, Text, Int], &[Int], Text),
         // POSITION(sub IN s) and STRPOS(s, sub) both take two TEXT arguments → INT.
         F::Position | F::Strpos => ScalarSig::Fixed(&[Text, Text], &[], Int),
-        // TO_NUMBER(text, format) → NUMERIC (B-fn).
+        // TO_NUMBER(text, format) → NUMERIC.
         F::ToNumber => ScalarSig::Fixed(&[Text, Text], &[], NUMERIC_ANY),
         F::Lpad | F::Rpad => ScalarSig::Fixed(&[Text, Int], &[Text], Text),
         F::LTrim | F::RTrim | F::BTrim => ScalarSig::Fixed(&[Text], &[Text], Text),
@@ -1740,15 +1740,15 @@ pub(super) fn analyze_scalar_function(
             &[Int, Int, Int, Int, Int, Int, ColumnType::Float],
             ColumnType::Interval,
         ),
-        // JUSTIFY_DAYS / JUSTIFY_HOURS / JUSTIFY_INTERVAL(interval) → interval (B-fn).
+        // JUSTIFY_DAYS / JUSTIFY_HOURS / JUSTIFY_INTERVAL(interval) → interval.
         F::JustifyDays | F::JustifyHours | F::JustifyInterval => {
             ScalarSig::Fixed(&[ColumnType::Interval], &[], ColumnType::Interval)
         },
-        // SCALE / MIN_SCALE(numeric) → int; TRIM_SCALE(numeric) → numeric (B-fn). The unconstrained
+        // SCALE / MIN_SCALE(numeric) → int; TRIM_SCALE(numeric) → numeric. The unconstrained
         // `NUMERIC` param (`precision: 0`) accepts any Int/Float/Numeric argument.
         F::Scale | F::MinScale => ScalarSig::Fixed(&[NUMERIC_ANY], &[], Int),
         F::TrimScale => ScalarSig::Fixed(&[NUMERIC_ANY], &[], NUMERIC_ANY),
-        // ENCODE(bytea, format) → text; DECODE(text, format) → bytea (B-fn).
+        // ENCODE(bytea, format) → text; DECODE(text, format) → bytea.
         // ENCODE(bytea, format)→text and CONVERT_FROM(bytea, encoding)→text share the (Bytes, Text)→
         // Text shape; DECODE(text, format)→bytea and CONVERT_TO(text, encoding)→bytea share
         // (Text, Text)→Bytes. The executor distinguishes them by function.
@@ -2349,7 +2349,7 @@ fn analyze_json_extract_path(
 }
 
 /// Analyze `ARRAY_REPLACE(arr, from, to)`: a polymorphic array plus two values of its element type;
-/// the result keeps `arr`'s array type (B-fn).
+/// the result keeps `arr`'s array type.
 fn analyze_array_replace(
     func: ast::ScalarFunc,
     args: &[ast::Expr],
@@ -3191,7 +3191,7 @@ fn analyze_subscript(
     })
 }
 
-/// Analyze a `base[lower:upper]` array slice (B-fn): `base` must be array-typed and each present
+/// Analyze a `base[lower:upper]` array slice: `base` must be array-typed and each present
 /// bound must be `Int`. The result is the *array* type itself (a slice of an array is an array). Each
 /// bound is optional (`a[2:]`, `a[:3]`, `a[:]`).
 fn analyze_array_slice(
@@ -3720,7 +3720,7 @@ fn analyze_format_function(
     let (value_expr, format_expr) = expect_two_args(args, name)?;
     let value = analyze_expr_agg(value_expr, scope, catalog, None, aggregates.as_deref_mut())?;
     let value_ok = if func == F::ToChar {
-        // TO_CHAR formats a temporal value, an interval, or a number (B-fn).
+        // TO_CHAR formats a temporal value, an interval, or a number.
         matches!(
             value.ty,
             Date | ColumnType::Time | Timestamp | ColumnType::TimestampTz | ColumnType::Interval
@@ -5671,7 +5671,7 @@ pub(super) fn check_json_path_exists(
     }
 }
 
-/// Type rule for `@@` (F1): both operands are the text forms of a `tsvector`/`tsquery` (either
+/// Type rule for `@@`: both operands are the text forms of a `tsvector`/`tsquery` (either
 /// order, like the reference engine), so both must be `TEXT`; the result is the `BOOL` match.
 pub(super) fn check_ts_match(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
     // `@@` also overloads as a jsonpath predicate check: a JSON document on the left, a jsonpath text
@@ -6493,7 +6493,7 @@ pub(super) fn check_bitwise(
 
 /// Type rule for array overlap `&&`: both operands must be arrays of the *same* element type; the
 /// result is `BOOL` (whether they share any element). A bare `NULL` operand is typed from its sibling
-/// earlier (B-fn).
+/// earlier.
 pub(super) fn check_array_overlap(
     left: ColumnType,
     right: ColumnType,

@@ -1875,17 +1875,18 @@ limit, the bytes involved and how to raise it, and the server stays responsive. 
 ### `TABLESAMPLE` samples per row
 
 `TABLESAMPLE BERNOULLI (n)` and `SYSTEM (n)` keep each row with probability `n`%, drawn before
-the `WHERE` filter runs. Both methods sample per row here — elsewhere `SYSTEM` samples storage
-pages, a physical grouping this engine's in-memory pages do not reproduce; any subset is a valid
+the `WHERE` filter runs. Both methods sample per row here. Elsewhere `SYSTEM` samples storage
+pages, a physical grouping this engine does not reproduce; any subset is a valid
 sample and the 0% / 100% endpoints agree exactly. `REPEATABLE (seed)` makes the draw
 deterministic across repeated scans. A percentage outside `[0, 100]` is `2202H`; an unknown
 method is `42704`. Supported on a base table (including an inheritance parent); not on a CTE,
 view, derived table, or JOIN input.
 
-### Capacity is bounded by memory
+### Capacity and memory
 
-Table pages live in memory and are not evicted to disk, so a database's working set must fit inside
-the resident ceiling. See [deployment](deployment.md) before loading a large dataset.
+Table pages live in a page cache over the last checkpoint image: pages are loaded on first use,
+clean pages are evicted and changed pages spill to a scratch file, so table data is bounded by
+disk. See [deployment](deployment.md) for what still has to fit in memory.
 
 ---
 

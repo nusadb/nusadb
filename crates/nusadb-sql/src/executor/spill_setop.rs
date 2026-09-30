@@ -8,9 +8,9 @@
 //! (reusing the external merge sort, [`sorted_input`](super::spill_sort::sorted_input)), and
 //! each node is a streaming sorted-merge of its two child cursors. The merge output is itself sorted
 //! on all columns, so nodes compose up the tree without ever materializing an intermediate operand.
-//! Like the rest of Phase 1, the *final* result is still collected into a `Vec<Row>` (end-to-end
-//! output bounding is Fase 2); the win is that the operands and the de-dup set no longer live in
-//! memory simultaneously.
+//! The *final* result of this operator is still collected into a `Vec<Row>` (streamed statements
+//! then drain it into their sink); the win is that the operands and the de-dup set no longer
+//! live in memory simultaneously.
 //!
 //! # Correctness
 //! Two facts (the same ones spilling `DISTINCT` relies on) reduce set membership to comparing

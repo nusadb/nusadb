@@ -231,7 +231,7 @@ unsafe fn filter_f64_avx2(values: &[f64], op: CmpOp, scalar: f64) -> Vec<bool> {
     out
 }
 
-// --- Reduction kernels (A-PERF.AGG5a): MIN / MAX / SUM over a dense `i64` column ----------
+// --- Reduction kernels: MIN / MAX / SUM over a dense `i64` column ----------
 //
 // Integer MIN/MAX are order-independent and overflow-free, and integer SUM is associative with an
 // exact `i128` result, so for all three the AVX2 and scalar paths agree bit-for-bit AND match the
@@ -239,7 +239,7 @@ unsafe fn filter_f64_avx2(values: &[f64], op: CmpOp, scalar: f64) -> Vec<bool> {
 // SUM reorders the adds (FP is not associative) and `_mm256_min_pd`'s NaN handling differs from
 // the row path's total-order compare, either of which would make a query's result depend on
 // whether the CPU has AVX2 — and bit-exact batch=row results are a correctness / determinism
-// invariant for the engine (the design, 2026-06-14).
+// invariant for the engine.
 
 /// Minimum / maximum of an `i64` column, or `None` for an empty column. Order-independent, so the
 /// AVX2 and scalar paths agree exactly.
@@ -332,7 +332,7 @@ unsafe fn reduce_i64_avx2(values: &[i64], want_min: bool) -> i64 {
     }
 }
 
-/// Exact sum of an `i64` column, widened to `i128` (A-PERF.AGG5a / F2a). Integer addition is
+/// Exact sum of an `i64` column, widened to `i128`. Integer addition is
 /// associative, so the AVX2 block reduction returns the **same bits** as the sequential scalar
 /// fold — this is what lets `SUM(INT)` take the SIMD path without violating the batch=row
 /// determinism invariant, unlike float SUM. `0` for an empty column (the caller maps an empty
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(max_i64(&[]), None);
     }
 
-    // --- SUM kernel (A-PERF.AGG5a / F2a): exact i128, bit-identical to the scalar fold ---
+    // --- SUM kernel: exact i128, bit-identical to the scalar fold ---
 
     #[test]
     fn sum_i128_dispatch_matches_scalar() {

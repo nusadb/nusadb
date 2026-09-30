@@ -151,7 +151,7 @@ pub enum ColumnType {
     /// Time of day with time zone — one packed `i64` carrying both the as-entered local time
     /// and its zone offset: `utc_equivalent_micros * 2^18 + (zone_west_secs + 2^17)`, chosen so
     /// plain `i64` ordering compares by the UTC-equivalent instant with the zone as tie-break
-    /// (P-TIMETZ; see `nusadb-sql`'s `temporal` module for the pack/unpack helpers).
+    /// (see `nusadb-sql`'s `temporal` module for the pack/unpack helpers).
     TimeTz,
     /// 128-bit UUID, stored as 16 bytes.
     Uuid,

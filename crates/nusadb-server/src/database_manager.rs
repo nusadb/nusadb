@@ -37,7 +37,7 @@ use nusadb_core::StorageEngine;
 use nusadb_wire::{ClusterError, DatabaseCluster, is_valid_database_name};
 
 /// Which storage engine the cluster runs. The clustered B-link/B+tree engine (ADR 008) is the
-/// sole engine (owner decision, 2026-07-08): the former `lsm` value is no longer accepted, so a
+/// sole engine: the former `lsm` value is no longer accepted, so a
 /// stale script passing it fails loudly at argument parsing instead of silently running the
 /// wrong engine. Every database directory records its engine in an `engine` marker file; a
 /// directory recorded (or inferred) as `lsm` is refused at open — its data needs a dump/restore
@@ -848,7 +848,7 @@ fn spawn_checkpoint_scheduler(engine: &Arc<BtreeEngine>, db: &str, policy: Check
     }
 }
 
-/// Configuration for the background auto-analyze scheduler (D-AUTO-ANALYZE): how often to sweep for
+/// Configuration for the background auto-analyze scheduler: how often to sweep for
 /// tables whose statistics have gone stale, and the scale-factor + threshold that decides staleness.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AutoAnalyzeConfig {

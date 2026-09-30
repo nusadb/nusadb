@@ -525,7 +525,7 @@ fn failed_commit_rolls_back_instead_of_leaking_txn() {
 // --- work_mem session tunability ------------------------------------
 
 #[test]
-fn parse_work_mem_follows_pg_units() {
+fn parse_work_mem_follows_the_reference_units() {
     for (input, expect) in [
         ("4MB", Some(4 * 1024 * 1024)),
         ("512kB", Some(512 * 1024)),
@@ -600,11 +600,11 @@ fn set_work_mem_governs_the_statement_budget() {
         "expected OutOfMemory, got {err:?}"
     );
     // The message must cite the SESSION budget (1024 bytes), proving the SET was honoured —
-    // QA's finding was precisely that the message cited the server default instead.
+    // The bug was precisely that the message cited the server default instead.
     let msg = err.to_string();
     assert!(msg.contains("1024"), "budget in message: {msg}");
 
-    // The recursive-CTE guard (the reported finding) reads the same session budget.
+    // The recursive-CTE guard reads the same session budget.
     let err = session_run(
         &mut session,
         &engine,
@@ -757,7 +757,7 @@ fn seeded_users() -> MockEngine {
     engine
 }
 
-/// Phase 1 oracle: `stream_op` must yield exactly what `execute_op` does, in the same order —
+/// Streaming oracle: `stream_op` must yield exactly what `execute_op` does, in the same order:
 /// linear operators stream, blocking ones fall back to materialize. The materializing path is the
 /// oracle.
 fn assert_stream_eq_execute(sql: &str, engine: &MockEngine) {
@@ -1392,7 +1392,7 @@ fn top_n_sort_is_result_identical_to_full_sort() {
         }
     }
 
-    // The finding's exact repro plans (and EXPLAINs) as a bounded top-N, not a full sort.
+    // The reported repro plans (and EXPLAINs) as a bounded top-N, not a full sort.
     let plan = explain_lines("EXPLAIN SELECT id FROM t ORDER BY id LIMIT 5", &engine).join("\n");
     assert!(
         plan.contains("Sort (1 key(s)) top-5"),
@@ -1439,7 +1439,7 @@ fn top_n_ranking_window_is_result_identical_to_full() {
         }
     }
 
-    // The plan shows the bounded window (EXPLAIN diagnostic QA uses).
+    // The plan shows the bounded window (an EXPLAIN diagnostic).
     let plan = explain_lines(
         "EXPLAIN SELECT id, row_number() OVER (ORDER BY grp) FROM t ORDER BY grp LIMIT 3",
         &engine,
@@ -2715,7 +2715,7 @@ fn vectorized_path_matches_row_path() {
         "SELECT COUNT(*), COUNT(age), SUM(age), MIN(age), MAX(age) FROM users",
         "SELECT SUM(age) FROM users WHERE active = TRUE",
         "SELECT MIN(score), MAX(score), SUM(score) FROM users",
-        // Grouped aggregates (A-PERF.AGG6 / F2c) — the vectorized GroupedAggregate must match the
+        // Grouped aggregates: the vectorized GroupedAggregate must match the
         // row path's output multiset AND its first-seen emission order (hence no ORDER BY on the
         // first two), including float SUM rounding, DISTINCT, and NULL-valued inputs.
         "SELECT active, COUNT(*) FROM users GROUP BY active",
@@ -2985,7 +2985,7 @@ fn apj2_int_key_path_evidence() {
 
     assert_eq!(generic_matches, int_matches);
     println!(
-        "AP-J2 evidence over {N} rows ({generic_matches} matches):\n\
+        "join key encoding over {N} rows ({generic_matches} matches):\n\
          generic build {} ns/row · generic probe {} ns/row\n\
          int     build {} ns/row · int     probe {} ns/row",
         per_row(generic_build),
@@ -3182,7 +3182,7 @@ fn parallel_grouped_aggregate_matches_sequential_bit_for_bit() {
     }
 }
 
-/// (QA, silent-wrong): with an ORDER BY and no explicit frame, the
+/// Once silently wrong: with an ORDER BY and no explicit frame, the
 /// default window frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` — so
 /// `LAST_VALUE` runs through the current peer group (not "last of partition") and
 /// `NTH_VALUE(v, n)` is NULL until the frame holds `n` rows. Ties share a frame end (peers);
@@ -3413,17 +3413,17 @@ fn surface_batch_multi_drop_and_select_into() {
     assert!(parse("SELECT v INTO TEMPORARY t2 FROM src").is_err());
 }
 
-/// Gaps (QA routing): `||`/CONCAT coerce textout-able scalars to text. The two differ on booleans,
+/// Gaps: `||`/CONCAT coerce textout-able scalars to text. The two differ on booleans,
 /// matching the reference engine: `CONCAT`/`CONCAT_WS` use the type output function (`t`/`f`), while
 /// the `||` operator coerces via the text cast (`true`/`false`, like `::text`). A bare JSON
 /// number/boolean casts to the numeric/bool target while objects/arrays/strings stay refused;
 /// `LENGTH`/`OCTET_LENGTH` over BYTEA count octets, `BIT_LENGTH` 8x.
 #[test]
-fn q47_concat_coerce_json_scalar_cast_bytea_length() {
+fn concat_coerce_json_scalar_cast_bytea_length() {
     let engine = MockEngine::new();
     let one = |sql: &str| rows_of(run(sql, &engine).unwrap()).1.remove(0).remove(0);
 
-    // QA's exact pins.
+    // The exact reported pins.
     assert_eq!(one("SELECT 'x' || 5"), Value::Text("x5".into()));
     assert_eq!(
         one("SELECT CONCAT('a', 1, TRUE)"),
@@ -3446,7 +3446,7 @@ fn q47_concat_coerce_json_scalar_cast_bytea_length() {
     // CAST keeps its own boolean rendering — the output function differs by design.
     assert_eq!(one("SELECT CAST(TRUE AS TEXT)"), Value::Text("true".into()));
 
-    // QA's exact pin + kind coverage; non-scalars stay loudly refused.
+    // The exact reported pin plus kind coverage; non-scalars stay loudly refused.
     assert_eq!(one("SELECT ('[1,2,3]'::jsonb->0)::int"), Value::Int(1));
     assert_eq!(
         one("SELECT ('{\"a\": 2.5}'::jsonb->'a')::float"),
@@ -3642,17 +3642,17 @@ fn char_length_overflow_is_string_truncation_or_blank_trimmed() {
     assert_eq!(lens, vec![vec![Value::Int(2)], vec![Value::Int(2)]]);
 }
 
-/// (QA): a `DELETE ... RETURNING` CTE — the archive-then-remove pattern —
+/// A `DELETE ... RETURNING` CTE, the archive-then-remove pattern,
 /// runs once, its returned rows form the relation, and the deletion is real. INSERT/UPDATE
 /// CTEs already worked; DELETE was rejected only because a stale parser comment predated the
 /// vendored parser gaining the variant.
 #[test]
-fn q50_delete_returning_cte() {
+fn delete_returning_cte() {
     let engine = MockEngine::new();
     run("CREATE TABLE live (id INT, v INT)", &engine).unwrap();
     run("INSERT INTO live VALUES (1, 10), (2, 20), (3, 30)", &engine).unwrap();
 
-    // QA's exact shape: the deleted rows form the CTE relation, and the deletion is real.
+    // The exact reported shape: the deleted rows form the CTE relation, and the deletion is real.
     let sql = "WITH d AS (DELETE FROM live WHERE v >= 20 RETURNING id, v) \
                SELECT id, v FROM d ORDER BY id";
     let (_, rows) = rows_of(run(sql, &engine).unwrap());
@@ -3678,11 +3678,11 @@ fn q50_delete_returning_cte() {
     assert!(run("WITH d AS (DELETE FROM live) SELECT 1", &engine).is_err());
 }
 
-/// (QA): a WITH prefix on a top-level `INSERT ... SELECT` — completing the
+/// A WITH prefix on a top-level `INSERT ... SELECT`, completing the
 /// archive-then-remove pattern end-to-end: the DELETE's RETURNING rows flow through the CTE
 /// into the INSERT, the deletion is real, and the archive receives exactly those rows.
 #[test]
-fn q51_with_prefix_on_insert() {
+fn with_prefix_on_insert() {
     let engine = MockEngine::new();
     run("CREATE TABLE live2 (id INT, v INT)", &engine).unwrap();
     run("CREATE TABLE archive2 (id INT, v INT)", &engine).unwrap();
@@ -3732,15 +3732,15 @@ fn q51_with_prefix_on_insert() {
 
 /// Gaps: `TIME ± INTERVAL` wraps within the 24-hour clock using the interval's sub-day
 /// microseconds (whole days/months contribute nothing to a clock time), `TIME - TIME` is the
-/// signed elapsed INTERVAL (QA-pinned); and a set operation's described
-/// column type is the branches' UNIFIED type, not the leftmost leaf's (
-/// `1 UNION 2.5` is a NUMERIC column, top-level and as a derived table).
+/// signed elapsed INTERVAL; and a set operation's described
+/// column type is the branches' UNIFIED type, not the leftmost leaf's
+/// (`1 UNION 2.5` is a NUMERIC column, top-level and as a derived table).
 #[test]
-fn q52_time_interval_arith_and_union_type_unify() {
+fn time_interval_arith_and_union_type_unify() {
     let engine = MockEngine::new();
     let one = |sql: &str| rows_of(run(sql, &engine).unwrap()).1.remove(0).remove(0);
 
-    // QA's exact case: 23:00 + 2h wraps to 01:00.
+    // The exact reported case: 23:00 + 2h wraps to 01:00.
     assert_eq!(
         one("SELECT (TIME '23:00' + INTERVAL '2 hours')::text"),
         Value::Text("01:00:00".into())
@@ -3754,7 +3754,7 @@ fn q52_time_interval_arith_and_union_type_unify() {
         one("SELECT (TIME '01:00' + INTERVAL '1 day 2 hours')::text"),
         Value::Text("03:00:00".into())
     );
-    // A pathologically large interval must not overflow (audit catch): the sub-day reduction
+    // A pathologically large interval must not overflow: the sub-day reduction
     // happens before the add, so the wrapped clock time is exact — never panic, never garbage.
     assert_eq!(
         one("SELECT (TIME '12:00' + INTERVAL '9223372036854 seconds')::text"),
@@ -3802,11 +3802,11 @@ fn q52_time_interval_arith_and_union_type_unify() {
 /// positional INT form is untouched), and an untyped `NULL` types from context under `NOT`
 /// and as an `IN` probe (both evaluate to NULL, three-valued).
 #[test]
-fn q52_substring_regex_and_null_type_infer() {
+fn substring_regex_and_null_type_infer() {
     let engine = MockEngine::new();
     let one = |sql: &str| rows_of(run(sql, &engine).unwrap()).1.remove(0).remove(0);
 
-    // QA's exact cases: whole match without groups, first capture group with one.
+    // The exact reported cases: whole match without groups, first capture group with one.
     assert_eq!(
         one("SELECT substring('foobar' FROM 'o.b')"),
         Value::Text("oob".into())

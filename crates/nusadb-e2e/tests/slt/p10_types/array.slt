@@ -47,7 +47,7 @@ SELECT CAST('{7,8,9}' AS INT[])
 statement error
 INSERT INTO t VALUES (9, '{1,notanumber}', '{}')
 
-# --- Empty ARRAY[] takes its element type from an enclosing cast/hint (B-fn) ---
+# --- Empty ARRAY[] takes its element type from an enclosing cast/hint ---
 query T
 SELECT CAST(ARRAY[] AS INT[])
 ----
@@ -68,7 +68,7 @@ NULL
 statement error
 SELECT ARRAY[]
 
-# --- Array slice a[i:j] (B-fn): 1-based, inclusive ---
+# --- Array slice a[i:j]: 1-based, inclusive ---
 query T
 SELECT (ARRAY[10, 20, 30, 40, 50])[2:4]
 ----

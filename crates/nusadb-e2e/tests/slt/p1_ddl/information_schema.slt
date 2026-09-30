@@ -29,7 +29,7 @@ nusadb public
 
 # --- information_schema.columns: one row per column, with ordinal / type / nullability ---
 # data_type uses the standard SQL spelling (integer/text/numeric) so driver/ORM reflection maps
-# the type correctly (K2) — not the short SHOW COLUMNS form.
+# the type correctly, not the short SHOW COLUMNS form.
 query TITT
 SELECT column_name, ordinal_position, data_type, is_nullable
 FROM information_schema.columns WHERE table_name = 'emp' ORDER BY ordinal_position
@@ -38,7 +38,7 @@ id 1 integer NO
 name 2 text YES
 salary 3 numeric YES
 
-# Reflection columns (K2): character_maximum_length for VARCHAR/CHAR; numeric_precision/scale for
+# Reflection columns: character_maximum_length for VARCHAR/CHAR; numeric_precision/scale for
 # NUMERIC; NULL otherwise.
 statement ok
 CREATE TABLE reflect (a VARCHAR(20), b NUMERIC(10,2), c INT, d CHAR(5))
@@ -52,7 +52,7 @@ b NULL 10 2
 c NULL NULL NULL
 d 5 NULL NULL
 
-# column_default (K7): the DEFAULT expression as SQL text; NULL when the column has none; a SERIAL
+# column_default: the DEFAULT expression as SQL text; NULL when the column has none; a SERIAL
 # column reports its nextval('<sequence>') default.
 statement ok
 CREATE TABLE defs (id SERIAL, status TEXT DEFAULT 'active', n INT)
@@ -73,7 +73,7 @@ WHERE table_name = 'emp' AND column_name = 'name'
 2
 
 # --- information_schema.schemata: public + the synthetic information_schema + every CREATE SCHEMA
-# namespace (NS3), sorted by name ---
+# namespace, sorted by name ---
 query TT
 SELECT catalog_name, schema_name FROM information_schema.schemata ORDER BY schema_name
 ----

@@ -587,7 +587,7 @@ fn stats_routed_hash_fold_under_spill_matches() {
     let queries = [
         "SELECT k, COUNT(*), SUM(v), MIN(v), MAX(v) FROM gg GROUP BY k",
         "SELECT k, k2, COUNT(*), SUM(v) FROM gg GROUP BY k, k2",
-        // The audit-caught shape: a WHERE above a projection-narrowed scan (column k pruned,
+        // The shape: a WHERE above a projection-narrowed scan (column k pruned,
         // so the group key's narrowed ordinal differs from its source ordinal) — the NDV
         // lookup must map through the scan's kept columns, not misread a pruned column.
         "SELECT k2, COUNT(*), SUM(v) FROM gg WHERE v > 0 GROUP BY k2",
@@ -619,7 +619,7 @@ fn stats_routed_hash_fold_under_spill_matches() {
         assert_eq!(sorted_path, want, "sort fold mismatch for `{sql}`");
     }
 
-    // Route-flip regression for the audit-caught mis-map: group key `k2` (NDV 7, ~2.5KB state)
+    // Route-flip regression for the mis-map: group key `k2` (NDV 7, ~2.5KB state)
     // sits AFTER the pruned column `k` (NDV ~5000, ~1.8MB) in the table. With a 16KB budget the
     // correct mapping fires the hash arm; the old bug read `k`'s NDV through the Filter-wrapped
     // narrowed scan and would have routed to sort (counter unchanged).

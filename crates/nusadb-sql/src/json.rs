@@ -1,4 +1,4 @@
-//! JSON / JSONB value support for the `JSON` column type (phase 3).
+//! JSON / JSONB value support for the `JSON` column type.
 //!
 //! A JSON value is stored as its **canonical text** (see [`ast::Value::Json`](crate::ast::Value::Json)):
 //! parsed with `serde_json`, then re-serialized by [`to_text`]. Object keys are emitted in the

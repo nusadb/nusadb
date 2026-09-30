@@ -340,7 +340,7 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
         // parameter type, then invoke the Rust function. The analyzer only checks *assignability*
         // (e.g. an INT argument may reach a FLOAT parameter, or a NUMERIC literal a FLOAT one), so the
         // executor must coerce here to honour the `ScalarUdfFn` contract that values arrive already in
-        // the declared types (deep-gate). The declared types were captured into the plan node at
+        // the declared types. The declared types were captured into the plan node at
         // analysis time, so no per-row registry read is needed. `cast_value` passes `NULL` through.
         TypedExprKind::ScalarUdf {
             name,
@@ -681,7 +681,7 @@ fn eval_scalar_function(
         // rather than propagate it away.
         F::ArrayFill => return eval_array_fill(args, row),
         // FORMAT substitutes its arguments into specifiers itself (a NULL renders per specifier, not
-        // by propagating), so it skips the NULL-strict collection (B-fn).
+        // by propagating), so it skips the NULL-strict collection.
         F::Format => return eval_format(args, row),
         // JSONB_SET_LAX treats a NULL new_value as meaningful (per its null_value_treatment), so it
         // must see its arguments rather than propagate the first NULL away.
@@ -910,7 +910,7 @@ fn eval_scalar_function(
         (F::JsonbExists, [ast::Value::Json(s) | Text(s), Text(key)]) => {
             ast::Value::Bool(crate::json::has_key(s, key))
         },
-        // Full-text search (F1): the two-argument forms name their configuration explicitly; the
+        // Full-text search: the two-argument forms name their configuration explicitly; the
         // one-argument forms use the default configuration, `english` — the same default as the reference engine's
         // stock `default_text_search_config`.
         (F::ToTsvector, [Text(config), Text(text)]) => {
@@ -1100,9 +1100,9 @@ fn eval_scalar_function(
         (F::ToChar, [src, Text(fmt)]) => to_char_value(src, fmt),
         (F::ToDate, [Text(s), Text(fmt)]) => to_date_value(s, fmt)?,
         (F::ToTimestamp, [Text(s), Text(fmt)]) => to_timestamp_value(s, fmt)?,
-        // `to_timestamp(epoch_seconds)` → TIMESTAMPTZ (QA category-D).
+        // `to_timestamp(epoch_seconds)` → TIMESTAMPTZ.
         (F::ToTimestamp, [epoch]) => to_timestamp_epoch(epoch)?,
-        // `to_number(text, format)` → NUMERIC: read the digits/sign/decimal point (B-fn).
+        // `to_number(text, format)` → NUMERIC: read the digits/sign/decimal point.
         (F::ToNumber, [Text(s), Text(_fmt)]) => to_number_value(s)?,
         // MAKE_DATE(year, month, day) → DATE, erroring on a non-existent calendar day.
         (F::MakeDate, [Int(y), Int(m), Int(d)]) => crate::temporal::make_date(*y, *m, *d)
@@ -1172,13 +1172,13 @@ fn eval_scalar_function(
             ))
         },
         // JUSTIFY_DAYS / JUSTIFY_HOURS / JUSTIFY_INTERVAL(interval) — roll 30 days → 1 month and/or
-        // 24 hours → 1 day, keeping each lower field signed and in range (B-fn).
+        // 24 hours → 1 day, keeping each lower field signed and in range.
         (F::JustifyDays, [ast::Value::Interval(iv)]) => ast::Value::Interval(iv.justify_days()),
         (F::JustifyHours, [ast::Value::Interval(iv)]) => ast::Value::Interval(iv.justify_hours()),
         (F::JustifyInterval, [ast::Value::Interval(iv)]) => {
             ast::Value::Interval(iv.justify_interval())
         },
-        // SCALE / MIN_SCALE(numeric) → int; TRIM_SCALE(numeric) → numeric (B-fn). An INT argument
+        // SCALE / MIN_SCALE(numeric) → int; TRIM_SCALE(numeric) → numeric. An INT argument
         // coerces to a scale-0 decimal, so all three are zero-scale for it.
         (F::Scale, [ast::Value::Numeric(d)]) => ast::Value::Int(i64::from(d.scale)),
         (F::Scale | F::MinScale, [Int(_)]) => Int(0),
@@ -1186,9 +1186,9 @@ fn eval_scalar_function(
         (F::TrimScale, [ast::Value::Numeric(d)]) => ast::Value::Numeric(d.trim_scale()),
         (F::TrimScale, [Int(i)]) => ast::Value::Numeric(crate::numeric::Decimal::from_i64(*i)),
         // ISFINITE(value) — always true for the (finite-only) NUMERIC / temporal values here; a NULL
-        // argument already returned NULL via the strict collection above (B-fn).
+        // argument already returned NULL via the strict collection above.
         (F::IsFinite, [_]) => ast::Value::Bool(true),
-        // ENCODE(bytea, format) → text (`hex` / `escape`); DECODE(text, format) → bytea (B-fn).
+        // ENCODE(bytea, format) → text (`hex` / `escape`); DECODE(text, format) → bytea.
         (F::Encode, [ast::Value::Bytes(b), Text(fmt)]) => Text(encode_bytea(b, fmt)?),
         (F::Decode, [Text(s), Text(fmt)]) => ast::Value::Bytes(decode_bytea(s, fmt)?),
         (F::ConvertTo, [Text(s), Text(enc)]) => {
@@ -1897,7 +1897,7 @@ struct NumFormat {
     sign: SignMode,
 }
 
-/// `TO_CHAR(numeric, fmt)` — render a number through a digit-picture format (B-fn).
+/// `TO_CHAR(numeric, fmt)`: render a number through a digit-picture format.
 ///
 /// Supported picture characters: `9` (a digit whose leading positions are suppressed to spaces),
 /// `0` (a digit position that forces zero-fill from itself rightward), `.` / `D` (the decimal
@@ -2211,7 +2211,7 @@ fn to_timestamp_epoch(secs: &ast::Value) -> Result<ast::Value, Error> {
     Ok(ast::Value::TimestampTz(micros))
 }
 
-/// `TO_NUMBER(text, format)` — parse a formatted number into a `NUMERIC` (B-fn).
+/// `TO_NUMBER(text, format)`: parse a formatted number into a `NUMERIC`.
 ///
 /// The format string declares intent but is read leniently: the value is recovered by scanning
 /// `text` for its digits, sign, and decimal point while ignoring group separators, currency symbols,
@@ -3233,7 +3233,7 @@ fn eval_array_mutate(
     })
 }
 
-/// `ARRAY_REPLACE(arr, from, to)` — `arr` with every element equal to `from` replaced by `to` (B-fn).
+/// `ARRAY_REPLACE(arr, from, to)`: `arr` with every element equal to `from` replaced by `to`.
 /// A NULL `from` matches the array's NULL elements; a NULL array operand yields NULL.
 fn eval_array_replace(args: &[TypedExpr], row: &Row) -> Result<ast::Value, Error> {
     let [arr_expr, from_expr, to_expr] = args else {
@@ -3271,7 +3271,7 @@ fn value_eq(a: &ast::Value, b: &ast::Value) -> bool {
     }
 }
 
-/// `FORMAT(fmt, ...)` (B-fn): substitute the trailing arguments into the format string's specifiers.
+/// `FORMAT(fmt, ...)`: substitute the trailing arguments into the format string's specifiers.
 ///
 /// Supported specifiers: `%s` (the argument as plain text; a NULL renders as the empty string), `%I`
 /// (as a SQL identifier, like `QUOTE_IDENT`; a NULL is an error), `%L` (as a SQL literal, like
@@ -4591,7 +4591,7 @@ fn index_one_level(base: &TypedExpr, index: &TypedExpr, row: &Row) -> Result<ast
         .unwrap_or(ast::Value::Null))
 }
 
-/// Evaluate a `base[lower:upper]` array slice (B-fn): a 1-based, inclusive sub-array. An omitted bound
+/// Evaluate a `base[lower:upper]` array slice: a 1-based, inclusive sub-array. An omitted bound
 /// defaults to the array's first (`lower`) / last (`upper`) element; bounds are clamped to the array
 /// so an out-of-range slice yields the in-range overlap (or an empty array), matching SQL array
 /// semantics. A `NULL` array or a present-but-`NULL` bound yields `NULL`.
@@ -4861,7 +4861,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Geometry(g), ColumnType::Text) => {
             Ok(ast::Value::Text(crate::geometry::format(g)))
         },
-        // Temporal narrowing/widening (QA category-D): a TIMESTAMP[TZ] splits into its DATE
+        // Temporal narrowing/widening: a TIMESTAMP[TZ] splits into its DATE
         // (floor of whole days since the epoch) and TIME-of-day (micros within the day); a DATE
         // widens to midnight. `div_euclid`/`rem_euclid` floor toward negative infinity so dates
         // before the epoch land on the correct day with a non-negative time-of-day.
@@ -4919,7 +4919,7 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             Ok(ast::Value::Numeric(cast_to_numeric(d, precision, scale)?))
         },
         // SQL `CAST(numeric AS integer)` rounds half-away-from-zero (`2.6 -> 3`, `-2.5 -> -3`),
-        // matching the float -> int cast above — not truncation toward zero (QA differential).
+        // matching the float -> int cast above, not truncation toward zero.
         (ast::Value::Numeric(d), ColumnType::Int) => d
             .to_i64_rounded()
             .map(ast::Value::Int)
@@ -5140,11 +5140,10 @@ fn cast_to_numeric(
 }
 
 /// `ENCODE(bytea, format)` — render raw bytes as text in the `hex` (lowercase, no `\x` prefix) or
-/// `escape` (NUL and high-bit bytes as `\nnn` octal, backslash doubled, everything else raw) format
-/// (B-fn).
-/// Accept only the `UTF8` encoding (the engine's native text encoding) for `convert_to`/
-/// `convert_from`. `UTF8` and `UTF-8` are the same encoding; any other is rejected loudly rather than
-/// silently mis-transcoded.
+/// `escape` (NUL and high-bit bytes as `\nnn` octal, backslash doubled, everything else raw)
+/// format. Accept only the `UTF8` encoding (the engine's native text encoding) for `convert_to`/
+/// `convert_from`. `UTF8` and `UTF-8` are the same encoding; any other is rejected loudly rather
+/// than silently mis-transcoded.
 fn require_utf8_encoding(encoding: &str) -> Result<(), Error> {
     let normalized = encoding.trim().to_ascii_uppercase().replace('-', "");
     if normalized == "UTF8" {
@@ -5198,7 +5197,7 @@ const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encode raw bytes as standard base-64 text (RFC 4648, with `=` padding) — the `base64` form of
-/// `ENCODE` (B-fn). Each 3-byte group becomes 4 output characters; a 1- or 2-byte tail is padded.
+/// `ENCODE`. Each 3-byte group becomes 4 output characters; a 1- or 2-byte tail is padded.
 /// The reference engine wraps the output into lines of at most 76 characters, emitting a newline
 /// after every 76th output character (so a total that is an exact multiple of 76 ends with a
 /// trailing newline). `DECODE(..., 'base64')` ignores the embedded newlines, so the round-trip is
@@ -5237,7 +5236,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Decode standard base-64 text (RFC 4648) into raw bytes — the `base64` form of `DECODE` (B-fn).
+/// Decode standard base-64 text (RFC 4648) into raw bytes, the `base64` form of `DECODE`.
 /// ASCII whitespace between characters is ignored; any other non-alphabet byte is an error.
 fn base64_decode(text: &str) -> Result<Vec<u8>, Error> {
     /// Map an alphabet byte to its 6-bit value, or `None` for a non-alphabet byte.
@@ -5276,7 +5275,7 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, Error> {
 }
 
 /// `DECODE(text, format)` — parse text in the `hex` or `escape` format into raw bytes; the inverse of
-/// [`encode_bytea`] (B-fn).
+/// [`encode_bytea`].
 fn decode_bytea(s: &str, format: &str) -> Result<Vec<u8>, Error> {
     match format.to_ascii_lowercase().as_str() {
         "hex" => {
@@ -5575,7 +5574,7 @@ fn like_match(subject: &str, pattern: &str, escape: Option<char>, case_insensiti
     // For `ILIKE`, a literal pattern character matches a source character case-insensitively. This is
     // folded per character (not by lower-casing the whole strings), so a `_` still matches exactly one
     // source character even when a letter's lowercase form has a different length, and the `ESCAPE`
-    // character keeps its case (deep-gate #12).
+    // character keeps its case.
     let char_eq =
         |p: char, s: char| p == s || (case_insensitive && p.to_lowercase().eq(s.to_lowercase()));
     let (mut ti, mut pi) = (0usize, 0usize);
@@ -6504,7 +6503,7 @@ fn geom_predicate_op(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -
     ast::Value::Bool(result)
 }
 
-/// Evaluate `@@` (F1): the left operand is the `tsvector` text form and the right the `tsquery`
+/// Evaluate `@@`: the left operand is the `tsvector` text form and the right the `tsquery`
 /// text form; if that orientation fails to parse, the swapped orientation (`tsquery @@ tsvector`,
 /// which the reference engine also accepts) is tried before reporting the original error. A `NULL` operand yields
 /// `NULL`. The reference engine's `text @@ text` implicit-conversion overload (tokenize both sides) is not
@@ -6596,7 +6595,7 @@ fn ts_and_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error>
     }
 }
 
-/// Evaluate an integer bitwise operator `&` / `|` / `<<` / `>>` (B-fn). A `NULL` operand yields
+/// Evaluate an integer bitwise operator `&` / `|` / `<<` / `>>`. A `NULL` operand yields
 /// `NULL`; otherwise both operands are `INT` (the analyzer enforces this). The shift amount is taken
 /// modulo 64 (the `i64` bit width) so a large or negative count is total rather than undefined,
 /// matching the wrapping shift of common SQL engines. `>>` is an arithmetic (sign-preserving) shift.
@@ -6812,7 +6811,7 @@ fn apply_inet_arithmetic(
     }
 }
 
-/// Evaluate array overlap `a && b` (B-fn): `TRUE` if the two arrays share at least one element. A
+/// Evaluate array overlap `a && b`: `TRUE` if the two arrays share at least one element. A
 /// `NULL` array operand yields `NULL`; element comparison treats two `NULL` elements as unequal (a
 /// `NULL` element never makes an overlap), matching `ARRAY_POSITION`'s search semantics.
 fn apply_array_overlap(left: &ast::Value, right: &ast::Value) -> ast::Value {
@@ -7549,7 +7548,7 @@ fn interval_arith(
         // microseconds — a whole-day (or month) component contributes nothing to a clock time,
         // matching the reference. `time - time` is the elapsed
         // interval, signed.
-        // The interval is reduced modulo one day FIRST (audit catch: `iv.micros` is an
+        // The interval is reduced modulo one day FIRST (`iv.micros` is an
         // unbounded i64, so adding it raw could overflow into wrap-garbage — a silent wrong
         // clock time in release); both operands are then < MICROS_PER_DAY and the sum cannot
         // overflow. This is also the stated semantics exactly: only the sub-day part matters.
@@ -7665,7 +7664,7 @@ fn numeric_op(
     // The exact result would exceed NUMERIC's 38-significant-digit capacity (`i128` mantissa —
     // the cap most engines besides the reference engine's arbitrary-precision NUMERIC declare). Loud, with the
     // standard out-of-range code, so an app sees a documented limit rather than a generic error
-    // (lifting the cap is an the design design decision).
+    // (lifting the cap would be a deliberate design change).
     let overflow = || Error::Coded {
         message: "numeric value exceeds the 38-digit precision limit".to_owned(),
         sqlstate: "22003", // numeric_value_out_of_range
@@ -8218,7 +8217,7 @@ mod tests {
     }
 
     #[test]
-    fn to_char_numeric_digit_pictures_match_pg() {
+    fn to_char_numeric_digit_pictures_match_the_reference() {
         // Integer + fraction picture: digits fit exactly, fraction rounded/padded, leading sign space.
         assert_eq!(
             run_text(ScalarFunc::ToChar, vec![num("1234.5"), txt("9999.99")]),
@@ -8308,7 +8307,7 @@ mod tests {
     }
 
     #[test]
-    fn to_char_numeric_fill_mode_and_separators_match_pg() {
+    fn to_char_numeric_fill_mode_and_separators_match_the_reference() {
         // Every expectation here was read off a side-by-side run against the reference engine.
         let ch = |value: TypedExpr, fmt: &str| -> String {
             match run_text(ScalarFunc::ToChar, vec![value, txt(fmt)]) {
@@ -8359,7 +8358,7 @@ mod tests {
     }
 
     #[test]
-    fn to_char_numeric_anchored_sign_matches_pg() {
+    fn to_char_numeric_anchored_sign_matches_the_reference() {
         // Every expectation here was read off a side-by-side run against the reference engine.
         let ch = |value: TypedExpr, fmt: &str| -> String {
             match run_text(ScalarFunc::ToChar, vec![value, txt(fmt)]) {
@@ -9342,7 +9341,7 @@ mod tests {
         );
     }
 
-    // ----- ENCODE / DECODE base64 (B-fn) -----
+    // ----- ENCODE / DECODE base64 -----
 
     #[test]
     fn base64_encode_matches_rfc4648_vectors() {
@@ -9409,7 +9408,7 @@ mod tests {
         assert!(base64_decode("Zm9v*").is_err());
     }
 
-    // ----- TO_NUMBER (B-fn) -----
+    // ----- TO_NUMBER -----
 
     #[test]
     fn to_number_reads_digits_sign_and_decimal() {

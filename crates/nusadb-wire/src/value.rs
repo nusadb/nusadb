@@ -54,7 +54,7 @@ pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
         Value::Date(d) => d.to_be_bytes().to_vec(),
         // TIME, TIMESTAMP, and TIMESTAMPTZ are each a microsecond count in an `i64`.
         Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => t.to_be_bytes().to_vec(),
-        // TIMETZ carries its zone (P-TIMETZ): local time-of-day micros + zone seconds west of
+        // TIMETZ carries its zone: local time-of-day micros + zone seconds west of
         // UTC, mirroring the reference engine's binary timetz layout, so a typed client keeps the entered offset.
         Value::TimeTz(packed) => {
             let local = nusadb_sql::temporal::timetz_local_micros(*packed);

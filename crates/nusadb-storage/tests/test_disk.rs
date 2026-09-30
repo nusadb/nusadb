@@ -299,7 +299,7 @@ fn read_pages_into_batches_a_contiguous_run() {
 
 #[test]
 fn out_of_range_page_id_is_rejected_not_aliased() {
-    // G1: a page id at/beyond the high-water mark was never allocated. Reading or writing it
+    // A page id at/beyond the high-water mark was never allocated. Reading or writing it
     // must error rather than aliasing a live slot or writing a sparse hole past end-of-file.
     let dir = nusadb_test_utils::temp_dir();
     let dm = DiskManager::open(dir.path().join("g1.db")).unwrap();
@@ -320,7 +320,7 @@ fn out_of_range_page_id_is_rejected_not_aliased() {
 
 #[test]
 fn double_deallocate_is_idempotent() {
-    // G2: deallocating the same id twice must not push it onto the free list twice — otherwise
+    // Deallocating the same id twice must not push it onto the free list twice, otherwise
     // two allocate_page calls would hand back the same physical slot (two logical pages, one slot).
     let dir = nusadb_test_utils::temp_dir();
     let dm = DiskManager::open(dir.path().join("g2.db")).unwrap();

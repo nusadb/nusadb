@@ -1,5 +1,5 @@
-//! [`GroupedAggregate`] (A-PERF.AGG6 / F2c): vectorized hash `GROUP BY` over a child batch
-//! stream — the largest gap the F2 design closed, since grouped aggregation previously forced the
+//! [`GroupedAggregate`]: vectorized hash `GROUP BY` over a child batch
+//! stream, the largest gap closed here, since grouped aggregation previously forced the
 //! whole plan back onto the row path.
 //!
 //! The operator covers bare-column group keys and columnar-foldable calls (the
@@ -7,7 +7,7 @@
 //! `GROUPING`/`ARRAY_AGG`/two-argument statistics). Keys and argument values are read straight
 //! off the batch columns via [`value_at`] — the same per-element conversion `batch_to_rows` uses
 //! — and fold through the row path's own machinery: [`GroupIndex`] (one hash/equality contract
-//! for both group-by paths, per the F2c "coordinate with the row-path hash group-by" rule),
+//! for both group-by paths, so the vectorized one never drifts from the row path),
 //! [`fold_value`] / [`fold_count_star`], and [`finalize_aggregate`]. Same values, same code, same
 //! row order ⇒ the output multiset **and** the first-seen emission order are bit-identical to
 //! `run_group_aggregate_streamed` on every CPU.

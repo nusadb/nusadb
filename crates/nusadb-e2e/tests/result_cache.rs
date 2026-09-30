@@ -115,7 +115,7 @@ fn cacheable_selects_populate_but_volatile_ones_do_not() {
     exec(&mut s, &engine, "SELECT now() FROM t");
     assert_eq!(s.result_cache_len(), 1, "NOW() must not be cached");
     // AGE(ts) is relative to the current date, so its result must not be cached across days
-    // (deep-gate) — even with a constant argument.
+    // even with a constant argument.
     exec(
         &mut s,
         &engine,

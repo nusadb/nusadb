@@ -1,9 +1,9 @@
 //! [`ParallelGroupedAggregate`] (morsel-parallel scan): hash `GROUP BY` over a bare table
 //! scan, folded by worker threads — the first parallel operator, attacking the grouping/hash
-//! residual QA measured once the scan itself went single-copy.
+//! residual measured once the scan itself went single-copy.
 //!
 //! The caller's thread is the **producer**: it walks the engine's single [`TupleScan`] cursor
-//! (the treaty stays untouched — the design's "no treaty change" constraint) and deals fixed-size
+//! (the storage treaty stays unchanged) and deals fixed-size
 //! chunks of [`SharedTuple`]s round-robin to N workers over bounded channels. Each **worker**
 //! decodes its chunks through the same typed-builder batch decode the sequential path uses
 //! ([`RecordBatchScan`]) and folds them into its own [`GroupIndex`] partial — the same

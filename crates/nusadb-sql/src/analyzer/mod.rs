@@ -77,7 +77,7 @@ pub trait Catalog {
         }
     }
 
-    /// The ordered schemas an unqualified name resolves through (NS3, the session `search_path`),
+    /// The ordered schemas an unqualified name resolves through (the session `search_path`),
     /// first to last. The default is `[public]`; the production adapter reports the connection's
     /// `SET search_path = …` list (always ending in `public`).
     fn search_path(&self) -> Vec<String> {
@@ -754,7 +754,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 if_exists: dv.if_exists,
             }))
         },
-        // CREATE TYPE ... AS ENUM (B-ENUM): validate the labels (at least one, distinct) and persist.
+        // CREATE TYPE ... AS ENUM: validate the labels (at least one, distinct) and persist.
         ast::Statement::CreateEnum(ce) => {
             if ce.labels.is_empty() {
                 return Err(Error::InvalidStatement(
@@ -1512,7 +1512,7 @@ const fn is_volatile_scalar_func(func: ast::ScalarFunc) -> bool {
             // `AGE(value)` (one-argument) is relative to the current date, so a view projecting it
             // cannot be incrementally maintained: stored rows would keep the age computed at insert
             // time and drift stale across days. Mirrors the result-cache volatility list so the two
-            // denylists do not disagree (deep-gate sibling).
+            // denylists do not disagree.
             | F::Age
             | F::CurrentUser
             | F::SessionUser
@@ -1596,8 +1596,8 @@ pub const SYNTHETIC_TYPE_CHECK_PREFIX: &str = "nusadb_typeck_";
 /// The RLS and view catalogs are ordinary engine tables, so without this guard any authenticated
 /// user could read or rewrite them with plain SQL — e.g. `INSERT` a permissive policy into
 /// `nusadb_policies`, `DELETE` the `nusadb_rls` toggle rows, or widen a policy with `UPDATE` —
-/// silently disabling row-level security for every table (the system-catalog DML bypass the design
-/// demonstrated). Applied at every site a user statement resolves, creates, drops, or alters a
+/// silently disabling row-level security for every table (the system-catalog DML bypass).
+/// Applied at every site a user statement resolves, creates, drops, or alters a
 /// table by name (DML targets, `SELECT`/join bases, DDL, and view names, which back onto tables);
 /// engine-internal accesses go through the catalog port / executor directly and are unaffected.
 /// Superusers keep full access (introspection + administration escape hatch).

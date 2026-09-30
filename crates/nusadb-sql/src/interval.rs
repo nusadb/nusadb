@@ -1,4 +1,4 @@
-//! `INTERVAL` type — a calendar duration (phase 5).
+//! `INTERVAL` type: a calendar duration.
 //!
 //! Represented as three independent components — **months**, **days**, and
 //! **microseconds** — because a month and a day are not fixed multiples of microseconds (months
@@ -210,7 +210,7 @@ impl Interval {
         })
     }
 
-    /// Normalize so every 30 days rolls up into one month (`JUSTIFY_DAYS`, B-fn); the day field keeps
+    /// Normalize so every 30 days rolls up into one month (`JUSTIFY_DAYS`); the day field keeps
     /// its sign in `[-29, 29]`. Overflow of the month field saturates rather than wrapping.
     #[must_use]
     pub const fn justify_days(&self) -> Self {
@@ -221,7 +221,7 @@ impl Interval {
         }
     }
 
-    /// Normalize so every 24 hours rolls up into one day (`JUSTIFY_HOURS`, B-fn); the micro field
+    /// Normalize so every 24 hours rolls up into one day (`JUSTIFY_HOURS`); the micro field
     /// keeps its sign in `(-24h, 24h)`. Overflow of the day field saturates rather than wrapping.
     #[must_use]
     pub fn justify_hours(&self) -> Self {
@@ -240,7 +240,7 @@ impl Interval {
 
     /// Apply both [`Self::justify_hours`] and [`Self::justify_days`] so days land in `[-29, 29]` and
     /// the time part in `(-24h, 24h)`, then reconcile signs so all three fields point the same way
-    /// (`JUSTIFY_INTERVAL`, B-fn). The sign pass is what turns `1 month -1 hour` into `29 days
+    /// (`JUSTIFY_INTERVAL`). The sign pass is what turns `1 month -1 hour` into `29 days
     /// 23:00:00` instead of leaving a positive month beside a negative hour: a field that disagrees
     /// with the larger one borrows a whole unit from it.
     #[must_use]
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn clock_components_out_of_range_are_rejected() {
-        // G18: minutes/seconds must be 0..=59 and components non-negative — otherwise a nonsense
+        // Minutes/seconds must be 0..=59 and components non-negative, otherwise a nonsense
         // clock term parses to a bogus duration. Hours are unbounded.
         assert!(Interval::parse("1:99:00").is_none());
         assert!(Interval::parse("1:00:99").is_none());

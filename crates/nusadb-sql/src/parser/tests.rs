@@ -488,7 +488,7 @@ fn create_index_folds_unquoted_identifiers_and_preserves_quoted() {
 
 #[test]
 fn select_clauses_outside_surface_are_rejected_not_ignored() {
-    // G5: these were parsed and silently discarded, so the query ran with the wrong semantics.
+    // These were parsed and silently discarded, so the query ran with the wrong semantics.
     // OFFSET and FETCH FIRST now parse — removed from this list.
     // (FOR UPDATE/SHARE also parse here)
     // A plain LIMIT (in surface) still parses.
@@ -561,7 +561,7 @@ fn fetch_first_and_limit_together_is_rejected() {
 #[test]
 fn collate_c_and_posix_are_accepted_as_byte_order_no_ops() {
     // NusaDB sorts text by byte value, which is exactly the SQL-standard `C` / `POSIX` collation, so
-    // requesting it changes nothing and must parse (D-COLLATE) — at the column and expression level.
+    // requesting it changes nothing and must parse, at the column and expression level.
     for sql in [
         "CREATE TABLE t (name TEXT COLLATE \"C\")",
         "CREATE TABLE t (name TEXT COLLATE \"POSIX\")",
@@ -603,7 +603,7 @@ fn offset_bare_without_rows_keyword() {
 
 #[test]
 fn union_with_offset_is_rejected() {
-    // OFFSET on a set-operation envelope must be rejected (G20 — no silent drop).
+    // OFFSET on a set-operation envelope must be rejected (no silent drop).
     assert!(matches!(
         parse("SELECT a FROM t UNION SELECT a FROM t OFFSET 5 ROWS"),
         Err(Error::Unsupported(_)),
@@ -612,7 +612,7 @@ fn union_with_offset_is_rejected() {
 
 #[test]
 fn union_with_fetch_first_is_rejected() {
-    // FETCH FIRST on a set-operation envelope must be rejected (G20 — no silent drop).
+    // FETCH FIRST on a set-operation envelope must be rejected (no silent drop).
     assert!(matches!(
         parse("SELECT a FROM t UNION SELECT a FROM t FETCH FIRST 5 ROWS ONLY"),
         Err(Error::Unsupported(_)),
@@ -1333,7 +1333,7 @@ fn create_sequence_rejects_owned_by() {
     assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
 }
 
-// B-UT2.DDL24: `INCREMENT n` (no `BY`) was rejected whenever it did not lead sqlparser's fixed
+// `INCREMENT n` (no `BY`) was rejected whenever it did not lead sqlparser's fixed
 // canonical option order (e.g. `START 100 INCREMENT 5`) — `NusaDB: syntax error: Expected: end of
 // statement, found: INCREMENT`. NusaDB now drives `CREATE SEQUENCE` itself, accepting the six
 // options in any order and either spelling of `INCREMENT`/`INCREMENT BY`.
@@ -3773,7 +3773,7 @@ fn unknown_function_parses_for_udf_resolution() {
 }
 
 #[test]
-fn b448_string_functions_parse() {
+fn string_functions_parse() {
     let cases = [
         ("SELECT CONCAT(a, b, c) FROM t", ast::ScalarFunc::Concat, 3),
         (
@@ -3800,7 +3800,7 @@ fn b448_string_functions_parse() {
 }
 
 #[test]
-fn b449_regex_functions_parse() {
+fn regex_functions_parse() {
     let cases = [
         (
             "SELECT REGEXP_REPLACE(s, 'a', 'b') FROM t",
@@ -3828,7 +3828,7 @@ fn b449_regex_functions_parse() {
 }
 
 #[test]
-fn b453_55_math_functions_parse() {
+fn math_functions_parse() {
     let cases = [
         ("SELECT ABS(x) FROM t", ast::ScalarFunc::Abs, 1),
         ("SELECT ROUND(x, 2) FROM t", ast::ScalarFunc::Round, 2),
@@ -3854,7 +3854,7 @@ fn b453_55_math_functions_parse() {
 }
 
 #[test]
-fn b456_random_functions_parse() {
+fn random_functions_parse() {
     let ast::Expr::ScalarFunction { func, args } = first_projection("SELECT RANDOM() FROM t")
     else {
         panic!("expected ScalarFunction");
@@ -3870,7 +3870,7 @@ fn b456_random_functions_parse() {
 }
 
 #[test]
-fn b457_conditional_functions_parse() {
+fn conditional_functions_parse() {
     let cases = [
         ("SELECT NULLIF(a, b) FROM t", ast::ScalarFunc::Nullif, 2),
         (
@@ -5774,7 +5774,7 @@ fn notify_channel_and_payload() {
     assert!(parse("NOTIFY").is_err());
 }
 
-// --- Full-text search: @@ and to_tsvector/to_tsquery (F1) ---------
+// --- Full-text search: @@ and to_tsvector/to_tsquery ---------
 
 #[test]
 fn ts_match_operator_and_functions_parse() {
@@ -5858,7 +5858,7 @@ fn sqlparser062_new_forms_reject_loudly() {
 /// `= ANY` / `<> ALL` ride the optimized IN / NOT IN (semi/anti-join) path; every other
 /// operator becomes the general quantified comparison.
 #[test]
-fn b127_quantified_subquery_single_paren() {
+fn quantified_subquery_single_paren() {
     let f = select_filter("SELECT * FROM t WHERE x = ANY (SELECT a FROM u)");
     assert!(matches!(f, ast::Expr::InSubquery { negated: false, .. }));
     let f = select_filter("SELECT * FROM t WHERE x <> ALL (SELECT a FROM u)");
@@ -5986,7 +5986,7 @@ fn point_get_candidate_gate_allow_and_deny() {
     }
 }
 
-/// The collation contract (the design decision): text ordering is bytewise (`C`)
+/// The collation contract: text ordering is bytewise (`C`)
 /// BY DESIGN and documented; a `COLLATE` clause must reject loudly, never be silently dropped.
 #[test]
 fn collate_clause_rejects_loudly() {

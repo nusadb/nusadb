@@ -643,7 +643,7 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_alter_trigger(sql) {
         return result;
     }
-    // `CREATE TYPE name AS ENUM (...)` / `DROP TYPE ...` (B-ENUM) — sqlparser 0.51 only models the
+    // `CREATE TYPE name AS ENUM (...)` / `DROP TYPE ...`: sqlparser 0.51 only models the
     // composite `CREATE TYPE name AS (...)` form and has no `DROP TYPE`, so drive these ourselves.
     if let Some(result) = recognize_create_type_enum(sql) {
         return result;
@@ -701,7 +701,7 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     }
     // `CREATE SEQUENCE ...` — sqlparser's own grammar accepts the six options in only one fixed
     // order and would reject e.g. `START 100 INCREMENT 5`; drive it ourselves so any order (and
-    // `INCREMENT` without `BY`) is accepted, matching the reference engine (B-UT2.DDL24).
+    // `INCREMENT` without `BY`) is accepted, matching the reference engine.
     if let Some(result) = recognize_create_sequence(sql) {
         return result;
     }
@@ -2773,7 +2773,7 @@ fn parse_alter_policy(sql: &str) -> Result<ast::Statement, Error> {
 /// generic parser. sqlparser's own `CREATE SEQUENCE` grammar only accepts its six options
 /// (`INCREMENT`, `MINVALUE`/`MAXVALUE`, `START`, `CACHE`, `CYCLE`) in that one fixed order — real
 /// SQL (and the reference engine) accepts them in any order, and `INCREMENT n` without `BY` is
-/// valid wherever `INCREMENT` appears, not just first. See `B-UT2.DDL24`.
+/// valid wherever `INCREMENT` appears, not just first.
 fn recognize_create_sequence(sql: &str) -> Option<Result<ast::Statement, Error>> {
     (starts_with_two(sql, "create", "sequence")
         || starts_with_three(sql, "create", "temp", "sequence")
@@ -2978,7 +2978,7 @@ fn recognize_alter_trigger(sql: &str) -> Option<Result<ast::Statement, Error>> {
     starts_with_two(sql, "alter", "trigger").then(|| parse_alter_trigger(sql))
 }
 
-/// Recognize `CREATE TYPE name AS ENUM (...)` (B-ENUM); `None` for the composite `AS (...)` form (the
+/// Recognize `CREATE TYPE name AS ENUM (...)`; `None` for the composite `AS (...)` form (the
 /// generic parser handles that) or any other statement.
 fn recognize_create_type_enum(sql: &str) -> Option<Result<ast::Statement, Error>> {
     if !starts_with_two(sql, "create", "type") {
@@ -2993,7 +2993,7 @@ fn recognize_create_type_enum(sql: &str) -> Option<Result<ast::Statement, Error>
     is_enum.then(|| parse_create_type_enum(sql))
 }
 
-/// Recognize `DROP TYPE [IF EXISTS] name` (B-ENUM).
+/// Recognize `DROP TYPE [IF EXISTS] name`.
 fn recognize_drop_type(sql: &str) -> Option<Result<ast::Statement, Error>> {
     starts_with_two(sql, "drop", "type").then(|| parse_drop_type(sql))
 }
@@ -3061,7 +3061,7 @@ fn parse_alter_database(sql: &str) -> Result<ast::Statement, Error> {
     Ok(ast::Statement::AlterDatabase(ast::AlterDatabase { name }))
 }
 
-/// Drive `CREATE TYPE name AS ENUM ('a', 'b', ...)` (B-ENUM). The labels are single-quoted string
+/// Drive `CREATE TYPE name AS ENUM ('a', 'b', ...)`. The labels are single-quoted string
 /// literals in declaration order; a trailing comma before `)` is allowed.
 fn parse_create_type_enum(sql: &str) -> Result<ast::Statement, Error> {
     use sqlparser::keywords::Keyword;
@@ -3125,7 +3125,7 @@ fn convert_create_composite(
     }))
 }
 
-/// Drive `DROP TYPE [IF EXISTS] name` (B-ENUM).
+/// Drive `DROP TYPE [IF EXISTS] name`.
 fn parse_drop_type(sql: &str) -> Result<ast::Statement, Error> {
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::ParserError;
@@ -4324,7 +4324,7 @@ fn table_and_column(name: &sql::ObjectName) -> Result<(String, String), Error> {
     }
 }
 
-/// Reject any SQL construct the Stage 4 parser does not model.
+/// Reject any SQL construct the parser does not model.
 fn unsupported<T>(what: &str) -> Result<T, Error> {
     Err(Error::Unsupported(what.to_owned()))
 }
@@ -4707,7 +4707,7 @@ fn fold_part(part: &sql::ObjectNamePart) -> Result<String, Error> {
 }
 
 /// Accept a `COLLATE <name>` clause only when it names the byte-order collation NusaDB already uses
-/// (`C` / `POSIX`), as a no-op; otherwise reject it loudly (D-COLLATE).
+/// (`C` / `POSIX`), as a no-op; otherwise reject it loudly.
 ///
 /// NusaDB sorts text by byte value — deterministic, and all a single-node OLTP target needs — which
 /// is exactly the SQL-standard `C` / `POSIX` collation. So `COLLATE "C"` / `"POSIX"` asks for what
@@ -5272,7 +5272,7 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
         },
         sql::Statement::Set(set) => convert_set_statement(set),
         sql::Statement::ShowVariable { variable } => convert_show_variable(&variable),
-        // `SHOW DATABASES` is out of surface (dropped 2026-07-06: `SHOW` reads only a configuration
+        // `SHOW DATABASES` is out of surface (`SHOW` reads only a configuration
         // parameter; the cluster listing lives in the `nusadb_databases` catalog). sqlparser 0.62
         // parses it as a first-class statement — route it to the same session-side
         // unknown-parameter rejection (42704) it got in 0.51 via `ShowVariable(["DATABASES"])`.

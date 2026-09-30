@@ -819,7 +819,7 @@ fn insert_returning_reflects_the_stored_coerced_value_not_the_input() {
     assert_eq!(returned, stored);
 
     // The value is stored rescaled, so an equality predicate on the rescaled value finds the row
-    // (the un-coerced 123.4565 does not) — closes the QA differential "WHERE n=123.457 misses" claim.
+    // (the un-coerced 123.4565 does not). This closes the "WHERE n=123.457 misses" gap.
     assert_eq!(
         rows(run(&engine, "SELECT id FROM m WHERE n = 123.457")).len(),
         1
@@ -1441,7 +1441,7 @@ fn order_by_position_and_alias_sort_correctly() {
 }
 
 #[test]
-fn b135_order_by_nulls_first_last_places_nulls() {
+fn order_by_nulls_first_last_places_nulls() {
     // Explicit NULLS FIRST/LAST pins NULL placement regardless of ASC/DESC. A secondary
     // `id` key makes the NULL-row tie-break deterministic (independent of scan order).
     let engine = BtreeEngine::new();
@@ -1484,7 +1484,7 @@ fn b135_order_by_nulls_first_last_places_nulls() {
 }
 
 #[test]
-fn b138_like_escape_matches_literal_wildcards() {
+fn like_escape_matches_literal_wildcards() {
     // ESCAPE 'c' makes `c%`/`c_` match a literal `%`/`_` instead of a wildcard.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, s TEXT)");
@@ -1521,7 +1521,7 @@ fn b138_like_escape_matches_literal_wildcards() {
 }
 
 #[test]
-fn b145_array_literal_and_subscript_end_to_end() {
+fn array_literal_and_subscript_end_to_end() {
     // ARRAY[...] constructor and 1-based subscript.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, a INT, b INT)");
@@ -1602,7 +1602,7 @@ fn quantified_any_all_over_a_runtime_array_column() {
 }
 
 #[test]
-fn b459_array_ops_and_unnest_end_to_end() {
+fn array_ops_and_unnest_end_to_end() {
     // Cardinality, `||` concat, ARRAY_AGG, and UNNEST against the real engine.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, v INT)");
@@ -1681,7 +1681,7 @@ fn array_agg_and_string_agg_order_by() {
 
 #[test]
 fn create_type_enum_and_use_as_a_column() {
-    // B-ENUM — CREATE TYPE ... AS ENUM registers a user-defined type usable as a column type
+    // CREATE TYPE ... AS ENUM registers a user-defined type usable as a column type
     // (stored as TEXT); DROP TYPE removes it; an unknown type name on a column is a loud error.
     let engine = BtreeEngine::new();
     run(
@@ -1920,7 +1920,7 @@ fn create_domain_gives_a_column_its_base_type_not_null_and_checks() {
 
 #[test]
 fn added_scalar_functions_justify_days_encode_decode_regexp_matches() {
-    // B-fn — newly added scalar functions: justify_days, encode/decode (bytea), regexp_matches.
+    // Newly added scalar functions: justify_days, encode/decode (bytea), regexp_matches.
     let engine = BtreeEngine::new();
     let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
 
@@ -1994,7 +1994,7 @@ fn regexp_dot_matches_newline_by_default_like_the_reference_engine() {
 }
 
 #[test]
-fn regexp_substr_matches_pg_signature() {
+fn regexp_substr_matches_the_reference_signature() {
     // regexp_substr(string, pattern [, start int [, N int [, flags [, subexpr]]]]) — the 3rd argument
     // is a 1-based START position (integer), NOT flags (flags are 5th). Every expected value below is
     // from the live reference engine (v16).
@@ -2062,7 +2062,7 @@ fn regexp_substr_matches_pg_signature() {
 }
 
 #[test]
-fn regexp_count_matches_pg_signature() {
+fn regexp_count_matches_the_reference_signature() {
     // regexp_count(string, pattern [, start int [, flags]]) — the 3rd argument is a 1-based START
     // position (integer), NOT flags. Expected values are from the live reference engine (v16).
     let engine = BtreeEngine::new();
@@ -2094,7 +2094,7 @@ fn regexp_count_matches_pg_signature() {
 }
 
 #[test]
-fn regexp_instr_matches_pg_signature() {
+fn regexp_instr_matches_the_reference_signature() {
     // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) — the 3rd/4th
     // args are integer start/occurrence, not flags. Returns a 1-based character position (0 = none).
     // Expected values are from the live reference engine (v16).
@@ -2168,8 +2168,8 @@ fn regexp_instr_matches_pg_signature() {
 #[test]
 fn regexp_matches_is_set_returning_with_the_global_flag() {
     // regexp_matches is a set-returning function: with the `g` flag it yields one row per match (each
-    // a TEXT[] of the capture groups), not a single first-match row. (QA finding: the `g` form was
-    // silently returning only the first match.)
+    // a TEXT[] of the capture groups), not a single first-match row. (The `g` form once silently
+    // returned only the first match.)
     let engine = BtreeEngine::new();
     let arrays = |sql: &str| -> Vec<Value> {
         rows(run(&engine, sql))
@@ -2213,7 +2213,7 @@ fn regexp_matches_is_set_returning_with_the_global_flag() {
 
 #[test]
 fn numeric_precision_out_of_range_is_rejected_not_clamped() {
-    // K5 — a NUMERIC precision/scale beyond the catalog's u8 limit is rejected, not silently clamped
+    // A NUMERIC precision/scale beyond the catalog's u8 limit is rejected, not silently clamped
     // to 255 (a clamp would round values to the wrong scale).
     let engine = BtreeEngine::new();
     assert!(run_try(&engine, "CREATE TABLE a (n NUMERIC(300, 5))").is_err());
@@ -2236,7 +2236,7 @@ fn numeric_precision_out_of_range_is_rejected_not_clamped() {
 }
 
 #[test]
-fn bitwise_xor_and_power_operators_match_pg() {
+fn bitwise_xor_and_power_operators_match_the_reference() {
     // /: `#` is the reference engine's integer XOR (the generic tokenizer's Sharp is parsed
     // by the dialect hook), and `^` is the reference engine's exponentiation — a double-precision result, associating
     // left-to-right like the reference engine — lowered to the `power()` built-in.
@@ -2370,13 +2370,13 @@ fn set_operation_arity_mismatch_is_a_class_42_not_an_internal_error() {
 
 #[test]
 fn timetz_literal_insert_cast_and_round_trip() {
-    // K3 — TIME WITH TIME ZONE was DDL-only: a text literal would not insert and `timetz::text`
+    // TIME WITH TIME ZONE was DDL-only: a text literal would not insert and `timetz::text`
     // was unsupported. A timetz value now stores from a text literal and casts both directions.
     let engine = BtreeEngine::new();
     let one = |sql: &str| -> Value { rows(run(&engine, sql)).swap_remove(0).swap_remove(0) };
 
-    // `'HH:MM:SS+OFFSET'::timetz` keeps its zone (P-TIMETZ, faithful to the reference engine) and renders back with
-    // the offset it was entered with.
+    // `'HH:MM:SS+OFFSET'::timetz` keeps its zone (faithful to the reference engine) and renders
+    // back with the offset it was entered with.
     assert_eq!(
         one("SELECT '13:45:30+07'::timetz::text"),
         Value::Text("13:45:30+07".to_owned())
@@ -2405,7 +2405,7 @@ fn timetz_literal_insert_cast_and_round_trip() {
 
 #[test]
 fn create_table_accepts_extended_type_aliases() {
-    // B-types — types NusaDB does not model natively (currency, object-id, network, bit-string,
+    // Types NusaDB does not model natively (currency, object-id, network, bit-string,
     // geometric, range, full-text, XML) are accepted on a column and stored as a base type, so a
     // wide schema loads. A genuinely unknown type name is still rejected.
     let engine = BtreeEngine::new();
@@ -2464,7 +2464,7 @@ fn create_table_accepts_extended_type_aliases() {
 
 #[test]
 fn integer_arithmetic_errors_on_overflow_instead_of_wrapping() {
-    // K1 — integer arithmetic must error on i64 overflow, not silently wrap (a wrapped
+    // Integer arithmetic must error on i64 overflow, not silently wrap (a wrapped
     // counter/financial value is silent data corruption). Matches standard 22003 behaviour.
     let engine = BtreeEngine::new();
 
@@ -2609,7 +2609,7 @@ fn array_and_json_containment_operators() {
 
 #[test]
 fn json_build_array_constructs_a_json_array() {
-    // QA differential limitation: json_build_array / jsonb_build_array were unknown functions. They
+    // Once a gap: json_build_array / jsonb_build_array were unknown functions. They
     // build a JSON array from the arguments in order; a NULL argument becomes JSON `null` (not a
     // propagated SQL NULL), any arity is accepted (including none), and elements keep their type.
     // (A bare untyped NULL is a separate, pre-existing limitation; a typed NULL flows through.)
@@ -2639,7 +2639,7 @@ fn json_build_array_constructs_a_json_array() {
 }
 
 #[test]
-fn b458_json_set_returning_functions_end_to_end() {
+fn json_set_returning_functions_end_to_end() {
     // /c — json_array_elements + jsonb_path_query against the real engine.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE j (id INT NOT NULL, doc JSON)");
@@ -2669,7 +2669,7 @@ fn b458_json_set_returning_functions_end_to_end() {
 }
 
 #[test]
-fn b134_within_group_ordered_set_aggregates() {
+fn within_group_ordered_set_aggregates() {
     // PERCENTILE_CONT / PERCENTILE_DISC / MODE WITHIN GROUP.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, v INT, m INT)");
@@ -3108,8 +3108,8 @@ fn truncate_empties_the_table() {
 #[test]
 fn truncate_restart_identity_resets_the_serial_sequence() {
     // `TRUNCATE ... RESTART IDENTITY` resets the backing SERIAL sequence so the next insert
-    // restarts at 1; plain TRUNCATE (CONTINUE IDENTITY) keeps the sequence advancing. (QA finding
-    // Previously the clause was accepted but silently ignored.)
+    // restarts at 1; plain TRUNCATE (CONTINUE IDENTITY) keeps the sequence advancing. (The clause
+    // was once accepted but silently ignored.)
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id SERIAL PRIMARY KEY, v INT)");
     run(&engine, "INSERT INTO t (v) VALUES (10), (20)");
@@ -4068,7 +4068,7 @@ fn cast_supports_common_conversions() {
 #[test]
 fn numeric_to_integer_cast_rounds_half_away_from_zero() {
     // CAST(numeric AS integer) rounds half-away-from-zero (matching the float -> int cast), not
-    // truncate toward zerofound by the QA differential suite.
+    // truncation toward zero.
     let engine = BtreeEngine::new();
     assert_eq!(
         rows(run(
@@ -4094,7 +4094,7 @@ fn numeric_to_integer_cast_rounds_half_away_from_zero() {
 
 #[test]
 fn date_integer_arithmetic_and_date_difference() {
-    // Date arithmetic (QA differential): `date + int` adds whole days -> DATE
+    // Date arithmetic: `date + int` adds whole days -> DATE
     // (commutative), `date - int` -> DATE, and `date - date` -> the day count as INTEGER.
     let engine = BtreeEngine::new();
     let d = |s: &str| Value::Date(nusadb_sql::temporal::parse_date(s).unwrap());
@@ -4123,7 +4123,7 @@ fn date_integer_arithmetic_and_date_difference() {
 
 #[test]
 fn interval_times_integer_scales_each_component() {
-    // Interval scaling (QA differential §Limitasi): `interval * integer` scales every component
+    // Interval scaling: `interval * integer` scales every component
     // (commutative); each unit is scaled independently (no remainder spill).
     use nusadb_sql::interval::Interval;
     let engine = BtreeEngine::new();
@@ -4157,8 +4157,8 @@ fn interval_times_integer_scales_each_component() {
 
 #[test]
 fn varchar_cast_truncates_to_its_declared_length() {
-    // An explicit `::varchar(n)` / `CAST(... AS VARCHAR(n))` truncates to n characters (QA
-    // differential); a non-text value casts to text first, and NULL stays NULL.
+    // An explicit `::varchar(n)` / `CAST(... AS VARCHAR(n))` truncates to n characters; a
+    // non-text value casts to text first, and NULL stays NULL.
     let engine = BtreeEngine::new();
     let t = |s: &str| Value::Text(s.to_owned());
     assert_eq!(
@@ -4193,8 +4193,8 @@ fn varchar_cast_truncates_to_its_declared_length() {
 
 #[test]
 fn char_cast_truncates_to_its_declared_length() {
-    // A fixed `::char(n)` / `CAST(... AS CHAR(n))` truncates to n characters too (QA differential
-    // #9): truncate when longer, leave shorter text unchanged (NusaDB does not blank-pad a short
+    // A fixed `::char(n)` / `CAST(... AS CHAR(n))` truncates to n characters too:
+    // truncate when longer, leave shorter text unchanged (NusaDB does not blank-pad a short
     // value out to n). CHAR(n) is blank-padded (bpchar) — trailing blanks are insignificant and the
     // cast strips them — but every input here is blank-free, so truncation is the only visible
     // effect; the trailing-blank semantics are covered in the p1_ddl/varchar_length SLT.
@@ -4226,7 +4226,7 @@ fn char_cast_truncates_to_its_declared_length() {
 
 #[test]
 fn array_text_quotes_special_elements_and_round_trips() {
-    // QA differential #11: array -> text must quote + escape an element containing a delimiter,
+    // Array -> text must quote + escape an element containing a delimiter,
     // quote, backslash, or whitespace (and one that spells NULL) so the `{...}` form re-parses to the
     // same elements. A plain element stays bare; a genuine NULL element is the bare token.
     let engine = BtreeEngine::new();
@@ -4256,7 +4256,7 @@ fn array_text_quotes_special_elements_and_round_trips() {
 
 #[test]
 fn generate_series_as_a_from_table_function() {
-    // A set-returning function in FROM (QA): `FROM generate_series(a, b)` produces one row
+    // A set-returning function in FROM: `FROM generate_series(a, b)` produces one row
     // per value, usable with aliases, WHERE/ORDER, aggregates, and joins.
     let engine = BtreeEngine::new();
     // Bare table function — one column named after the function.
@@ -4308,7 +4308,7 @@ fn generate_series_as_a_from_table_function() {
 
 #[test]
 fn unnest_as_a_from_table_function() {
-    // QA differential limitation: `FROM unnest(array)` produces one row per element (the inconsistency
+    // Once a gap: `FROM unnest(array)` produces one row per element (the inconsistency
     // with generate_series, which already worked in FROM). Covers bare form, alias + column alias, an
     // aggregate over the elements, and a join.
     let engine = BtreeEngine::new();
@@ -4450,7 +4450,7 @@ fn unnest_multi_array_single_array_regression() {
 
 #[test]
 fn avg_over_an_exact_type_is_exact_numeric_not_lossy_float() {
-    // QA Temuan-4: AVG over an integer (or NUMERIC) column is exact NUMERIC, not a lossy f64.
+    // AVG over an integer (or NUMERIC) column is exact NUMERIC, not a lossy f64.
     // avg(1, 2, 5) = 8/3 must be the exact numeric quotient, not the f64 8.0/3.0.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE m (v INT NOT NULL)");
@@ -4847,7 +4847,7 @@ fn explicit_transaction_rollback_discards() {
     assert_eq!(result, vec![vec![Value::Int(1)]]);
 }
 
-/// (QA CRITICAL, 2026-07-09) — the exact reported repro: an
+/// The exact reported repro: an
 /// UPDATE that does not move any indexed key, rolled back, must leave the committed row
 /// reachable through EVERY index path (the PK point-lookup and the secondary index), matching
 /// the reference behaviour. The bug made the row vanish from index reads while the heap kept it.
@@ -5223,7 +5223,7 @@ fn repeatable_read_indexed_select_is_snapshot_stable_after_concurrent_update() {
 
 #[test]
 fn drop_table_frees_its_indexes_and_constraints_for_recreation() {
-    // A-UR.01: DROP TABLE must also drop the table's PRIMARY KEY/UNIQUE backing index and any
+    // DROP TABLE must also drop the table's PRIMARY KEY/UNIQUE backing index and any
     // secondary index, so re-creating the same table (an idempotent migration / redeploy) does not
     // fail with "index `<t>_pkey` already exists" — the index/constraint namespace is global.
     let engine = BtreeEngine::new();
@@ -5245,7 +5245,7 @@ fn drop_table_frees_its_indexes_and_constraints_for_recreation() {
 
 #[test]
 fn repeatable_read_insert_rejects_a_concurrently_committed_duplicate_key() {
-    // A-QA1b: a uniqueness / PRIMARY KEY check must see the latest committed state, not the txn's
+    // A uniqueness / PRIMARY KEY check must see the latest committed state, not the txn's
     // frozen snapshot. A REPEATABLE READ txn that began before another committed the same key would
     // otherwise insert a duplicate (its snapshot never sees the other row).
     let engine = BtreeEngine::new();
@@ -5278,7 +5278,7 @@ fn repeatable_read_insert_rejects_a_concurrently_committed_duplicate_key() {
 
 #[test]
 fn repeatable_read_upsert_do_update_rejects_a_concurrently_committed_duplicate_key() {
-    // A-QA1d: an ON CONFLICT DO UPDATE that moves a UNIQUE column onto a value another txn committed
+    // An ON CONFLICT DO UPDATE that moves a UNIQUE column onto a value another txn committed
     // after a frozen REPEATABLE READ snapshot must be rejected — mirrors the INSERT/UPDATE/MERGE fix.
     let engine = BtreeEngine::new();
     run(
@@ -5315,7 +5315,7 @@ fn repeatable_read_upsert_do_update_rejects_a_concurrently_committed_duplicate_k
 
 #[test]
 fn repeatable_read_update_rejects_a_concurrently_committed_duplicate_key() {
-    // A-QA1b (UPDATE path): an UPDATE that moves a row onto a key another transaction committed after a
+    // The UPDATE path: an UPDATE that moves a row onto a key another transaction committed after a
     // frozen REPEATABLE READ snapshot must be rejected — the snapshot-based check cannot see that row.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
@@ -6001,7 +6001,7 @@ fn inner_join_on_clause_pushdown_preserves_results() {
         "INSERT INTO orders VALUES (1,100),(2,100),(3,100),(4,200),(5,200)",
     );
 
-    // The QA self-join shape: same customer, o1.id < o2.id. Same-customer ordered pairs:
+    // A self-join shape: same customer, o1.id < o2.id. Same-customer ordered pairs:
     // customer 100 → (1,2),(1,3),(2,3) = 3; customer 200 → (4,5) = 1; total 4.
     let base = "SELECT count(*) FROM orders o1 JOIN orders o2 \
                 ON o1.customer_id = o2.customer_id AND o1.id < o2.id";
@@ -6156,7 +6156,7 @@ fn a_correlated_subquery_in_update_set_is_rejected_not_silently_nulled() {
 
 #[test]
 fn drop_table_drops_its_hnsw_vector_index() {
-    // A-UR.01c: a USING hnsw vector index lives in the SQL-layer catalog (not the engine index
+    // A USING hnsw vector index lives in the SQL-layer catalog (not the engine index
     // namespace); DROP TABLE must remove it so a later same-named table + index does not collide with
     // the orphaned declaration.
     let engine = BtreeEngine::new();
@@ -6182,7 +6182,7 @@ fn drop_table_drops_its_hnsw_vector_index() {
 
 #[test]
 fn drop_table_rejects_a_parent_still_referenced_by_a_foreign_key() {
-    // A-UR.01b: dropping a table another table's FOREIGN KEY references is rejected (RESTRICT) so the
+    // Dropping a table another table's FOREIGN KEY references is rejected (RESTRICT) so the
     // FK is not left silently dangling. Dropping the child first frees the parent.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE parent (id INT PRIMARY KEY)");
@@ -6202,7 +6202,7 @@ fn drop_table_rejects_a_parent_still_referenced_by_a_foreign_key() {
 
 #[test]
 fn drop_table_drops_its_foreign_key_so_a_child_table_can_be_recreated() {
-    // A-UR.01: a table declaring a FOREIGN KEY must remain droppable, and the drop must remove the FK
+    // A table declaring a FOREIGN KEY must remain droppable, and the drop must remove the FK
     // (and its child-side index) so re-creating the child does not collide on the auto-named FK/index.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE parent (id INT PRIMARY KEY)");
@@ -6378,7 +6378,7 @@ fn scalar_aggregates_fold_the_whole_table() {
 }
 
 #[test]
-fn b133_aggregate_distinct_dedupes_per_group() {
+fn aggregate_distinct_dedupes_per_group() {
     // DISTINCT inside an aggregate folds each distinct non-NULL value once.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, v INT, g INT)");
@@ -6905,7 +6905,7 @@ fn cross_using_and_natural_joins_run() {
 
 #[test]
 fn using_natural_join_coalesce_probe() {
-    // The QA-flagged shapes: a USING/NATURAL join must produce ONE merged
+    // The reported shapes: a USING/NATURAL join must produce ONE merged
     // join column, so `SELECT *` has the coalesced column count, a bare `k` is unambiguous, and a
     // LEFT JOIN USING NULL-pads the non-key columns while keeping the shared key from the left.
     let engine = BtreeEngine::new();
@@ -7262,7 +7262,7 @@ fn window_functions_rank_and_aggregate_over_partitions() {
 
 #[test]
 fn grouping_sets_with_only_empty_sets_yields_one_row_per_set() {
-    // Regression (the design #7): `GROUPING SETS ((), ())` has an empty key union but must still
+    // Regression: `GROUPING SETS ((), ())` has an empty key union but must still
     // produce one grand-total row per listed set, not collapse to a single scalar aggregate.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (v INT NOT NULL)");
@@ -8374,7 +8374,7 @@ fn secondary_index_maintained_on_dml() {
 
 #[test]
 fn index_scan_operator_reads_in_key_order_with_backfill() {
-    // Stage 3: build an IndexScan plan directly and execute it. Rows inserted BEFORE the
+    // Build an IndexScan plan directly and execute it. Rows inserted BEFORE the
     // index exercise CREATE INDEX backfill; the scan returns rows in ascending key order, and
     // range/equality bounds work via the order-preserving key encoding.
     use nusadb_sql::{PhysicalOperator, PhysicalPlan, execute};
@@ -8431,7 +8431,7 @@ fn index_scan_operator_reads_in_key_order_with_backfill() {
 
 #[test]
 fn planner_chooses_index_scan_and_returns_correct_rows() {
-    // Stage 4: with an index on the table, a WHERE equality/range on the indexed
+    // With an index on the table, a WHERE equality/range on the indexed
     // column makes the planner pick an IndexScan in place of the SeqScan — while still returning
     // exactly the rows a sequential scan + filter would.
     let engine = BtreeEngine::new();
@@ -8604,7 +8604,7 @@ fn scalar_string_functions_end_to_end() {
 }
 
 #[test]
-fn b448_string_functions_end_to_end() {
+fn string_functions_end_to_end() {
     // CONCAT/CONCAT_WS (NULL-skipping), LEFT/RIGHT, SPLIT_PART, REVERSE end-to-end.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, a TEXT, b TEXT)");
@@ -8659,7 +8659,7 @@ fn b448_string_functions_end_to_end() {
 }
 
 #[test]
-fn b449_regex_functions_end_to_end() {
+fn regex_functions_end_to_end() {
     // REGEXP_REPLACE / REGEXP_MATCH end-to-end.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, s TEXT)");
@@ -8697,7 +8697,7 @@ fn b449_regex_functions_end_to_end() {
 }
 
 #[test]
-fn b451_date_time_functions_end_to_end() {
+fn date_time_functions_end_to_end() {
     // EXTRACT / DATE_TRUNC / AGE over a real TIMESTAMP column.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, ts TIMESTAMP)");
@@ -8814,7 +8814,7 @@ fn date_trunc_over_a_date_column_yields_a_timestamptz() {
 }
 
 #[test]
-fn b452_to_char_to_date_to_timestamp_end_to_end() {
+fn to_char_to_date_to_timestamp_end_to_end() {
     // TO_CHAR formats; TO_DATE / TO_TIMESTAMP parse, round-tripping a timestamp.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, ts TIMESTAMP)");
@@ -8895,7 +8895,7 @@ fn b452_to_char_to_date_to_timestamp_end_to_end() {
 }
 
 #[test]
-fn b450_clock_functions_end_to_end() {
+fn clock_functions_end_to_end() {
     // Niladic clock functions are statement-stable: one instant for the whole statement.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL)");
@@ -8937,12 +8937,12 @@ fn b450_clock_functions_end_to_end() {
 }
 
 #[test]
-fn p12_row_level_security_enable_disable_end_to_end() {
+fn row_level_security_enable_disable_end_to_end() {
     // ENABLE ROW LEVEL SECURITY makes a table default-deny for a non-superuser: reads with no
     // applicable policy return zero rows (filtered, never errored, never silently exposed), while
     // writes and not-yet-supported read shapes (JOINs over the RLS table) are refused. A superuser
     // bypasses RLS; DISABLE restores access. (Policy-granted reads are covered by
-    // `p12_create_policy_filters_rows_end_to_end`.)
+    // `create_policy_filters_rows_end_to_end`.)
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, owner TEXT)");
     run(&engine, "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')");
@@ -9004,12 +9004,12 @@ fn p12_row_level_security_enable_disable_end_to_end() {
          SELECT id FROM c",
         // UPDATE ... FROM and DELETE ... USING are de-facto joins over the RLS source `t`: a
         // non-superuser must not read its rows through the SET/WHERE, so they are refused too
-        // (deep-gate security — previously the source was scanned unfiltered).
+        // (previously the source was scanned unfiltered).
         "UPDATE dst SET k = t.id FROM t WHERE dst.k = t.id",
         "DELETE FROM dst USING t WHERE dst.k = t.id",
         // MERGE USING the RLS table `t` as source is the same leak: the source is scanned
-        // unfiltered, so a matched action's SET would expose its rows. Refused (deep-gate
-        // A-G09.15 security — the target-only RLS check previously let the source through).
+        // unfiltered, so a matched action's SET would expose its rows. Refused (the target-only RLS
+        // check once let the source through).
         "MERGE INTO dst USING t ON dst.k = t.id WHEN MATCHED THEN UPDATE SET k = t.id",
     ] {
         assert!(
@@ -9024,7 +9024,7 @@ fn p12_row_level_security_enable_disable_end_to_end() {
 }
 
 #[test]
-fn p12_create_policy_filters_rows_end_to_end() {
+fn create_policy_filters_rows_end_to_end() {
     // A CREATE POLICY ... USING (...) grants a non-superuser row-filtered SELECT on an
     // RLS-enabled table; with no applicable policy the table is default-deny (zero rows).
     let engine = BtreeEngine::new();
@@ -9096,7 +9096,7 @@ fn p12_create_policy_filters_rows_end_to_end() {
 }
 
 #[test]
-fn p12_restrictive_policy_narrows_access_end_to_end() {
+fn restrictive_policy_narrows_access_end_to_end() {
     // A RESTRICTIVE policy narrows (AND) what a PERMISSIVE policy grants (OR), per the
     // SQL-standard row-level-security model: alice may read her own rows (permissive) but only the
     // non-classified ones (restrictive). A restrictive policy alone never grants access.
@@ -9167,7 +9167,7 @@ fn p12_restrictive_policy_narrows_access_end_to_end() {
 }
 
 #[test]
-fn p12_alter_policy_end_to_end() {
+fn alter_policy_end_to_end() {
     // ALTER POLICY changes a policy's USING and/or TO in place, keeping the command and kind.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE doc (id INT NOT NULL, owner TEXT)");
@@ -9255,7 +9255,7 @@ fn p12_alter_policy_end_to_end() {
 }
 
 #[test]
-fn p12_alter_policy_preserves_kind_end_to_end() {
+fn alter_policy_preserves_kind_end_to_end() {
     // ALTER POLICY must not change a policy's permissive/restrictive kind: a restrictive policy
     // stays restrictive (AND-narrowing) after an ALTER that only touches its roles.
     let engine = BtreeEngine::new();
@@ -9319,7 +9319,7 @@ fn p12_alter_policy_preserves_kind_end_to_end() {
 }
 
 #[test]
-fn p12_rls_admin_requires_superuser_end_to_end() {
+fn rls_admin_requires_superuser_end_to_end() {
     // Row-level-security administration (CREATE/ALTER/DROP POLICY and ENABLE/DISABLE RLS) is
     // reserved to superusers. Otherwise a non-superuser — the very session RLS constrains — could
     // lift its own restrictions (disable RLS, loosen a policy, or self-grant) and read everything.
@@ -9389,7 +9389,7 @@ fn p12_rls_admin_requires_superuser_end_to_end() {
 }
 
 #[test]
-fn p12_rls_no_bypass_via_subquery_or_setop_end_to_end() {
+fn rls_no_bypass_via_subquery_or_setop_end_to_end() {
     // A policy filters the RLS table wherever it is read, so a non-superuser cannot launder
     // forbidden rows out through a subquery, set operation, or CTE. Every query block over the base
     // table enforces the policy independently.
@@ -9436,7 +9436,7 @@ fn p12_rls_no_bypass_via_subquery_or_setop_end_to_end() {
 }
 
 #[test]
-fn p12_restrictive_with_check_narrows_writes_end_to_end() {
+fn restrictive_with_check_narrows_writes_end_to_end() {
     // A RESTRICTIVE WITH CHECK policy narrows what a PERMISSIVE WITH CHECK grants on writes:
     // alice may insert rows she owns (permissive) but only non-classified ones (restrictive).
     let engine = BtreeEngine::new();
@@ -9491,7 +9491,7 @@ fn p12_restrictive_with_check_narrows_writes_end_to_end() {
 }
 
 #[test]
-fn p12_delete_policy_filters_rows_end_to_end() {
+fn delete_policy_filters_rows_end_to_end() {
     // A non-superuser may DELETE only the rows a DELETE/ALL policy grants; with no applicable
     // policy the table is default-deny, so nothing is deleted (never an error, never a full wipe).
     let engine = BtreeEngine::new();
@@ -9546,7 +9546,7 @@ fn p12_delete_policy_filters_rows_end_to_end() {
 }
 
 #[test]
-fn p12_insert_with_check_end_to_end() {
+fn insert_with_check_end_to_end() {
     // A non-superuser's INSERT must satisfy the INSERT/ALL policies' WITH CHECK; with no
     // applicable policy the table is default-deny, so every non-superuser INSERT is rejected.
     let engine = BtreeEngine::new();
@@ -9597,7 +9597,7 @@ fn p12_insert_with_check_end_to_end() {
 }
 
 #[test]
-fn p12_update_with_check_end_to_end() {
+fn update_with_check_end_to_end() {
     // UPDATE applies USING (which rows are updatable) AND WITH CHECK (the post-update row must
     // still satisfy the policy, so a row cannot be updated to escape it). With `FOR UPDATE USING`,
     // the USING also serves as the WITH CHECK.
@@ -9648,7 +9648,7 @@ fn p12_update_with_check_end_to_end() {
 }
 
 #[test]
-fn p12_session_functions_end_to_end() {
+fn session_functions_end_to_end() {
     // CURRENT_USER / SESSION_USER report the session user (statement-stable); `USER` is a
     // synonym; current_setting(name) reads SET variables and is NULL when unset.
     let engine = BtreeEngine::new();
@@ -9739,7 +9739,7 @@ fn p12_session_functions_end_to_end() {
 }
 
 #[test]
-fn b453_55_math_functions_end_to_end() {
+fn math_functions_end_to_end() {
     // Math functions run through the full pipeline, types preserved.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, n INT, f FLOAT)");
@@ -9794,7 +9794,7 @@ fn b453_55_math_functions_end_to_end() {
 }
 
 #[test]
-fn b457_conditional_functions_end_to_end() {
+fn conditional_functions_end_to_end() {
     // NULLIF / GREATEST / LEAST with NULL-skipping semantics.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, a INT, b INT)");
@@ -9825,7 +9825,7 @@ fn b457_conditional_functions_end_to_end() {
 }
 
 #[test]
-fn b456_random_setseed_end_to_end() {
+fn random_setseed_end_to_end() {
     // RANDOM() volatile FLOAT in [0,1); SETSEED makes the sequence reproducible.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL)");
@@ -9858,7 +9858,7 @@ fn b456_random_setseed_end_to_end() {
 }
 
 #[test]
-fn b140_regex_match_operator_end_to_end() {
+fn regex_match_operator_end_to_end() {
     // `~`/`~*`/`!~`/`!~*` regex match in a WHERE predicate, full pipeline.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, s TEXT)");
@@ -9900,7 +9900,7 @@ fn b140_regex_match_operator_end_to_end() {
 }
 
 #[test]
-fn b139_similar_to_end_to_end() {
+fn similar_to_end_to_end() {
     // SIMILAR TO is an anchored, SQL-syntax regex match (full pipeline).
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, s TEXT)");
@@ -9949,7 +9949,7 @@ fn b139_similar_to_end_to_end() {
 }
 
 #[test]
-fn b458a_json_path_operators_end_to_end() {
+fn json_path_operators_end_to_end() {
     // #> / #>> path access over a JSON column, full pipeline.
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL, doc JSON)");
@@ -10349,7 +10349,7 @@ fn json_key_existence_operators_end_to_end() {
 }
 
 #[test]
-fn b132_aggregate_filter_end_to_end() {
+fn aggregate_filter_end_to_end() {
     // Aggregate FILTER (WHERE pred): only matching rows contribute, per aggregate.
     let engine = BtreeEngine::new();
     run(
@@ -10398,7 +10398,7 @@ fn b132_aggregate_filter_end_to_end() {
 // --- decimal literals are exact NUMERIC, with consistent coercion ---
 
 #[test]
-fn p0_4_decimal_literal_is_exact_numeric() {
+fn decimal_literal_is_exact_numeric() {
     let engine = BtreeEngine::new();
     // 0.1 + 0.2 is exactly 0.3 as NUMERIC — not the 0.30000000000000004 an f64 literal gives.
     let dec = |s: &str| Value::Numeric(nusadb_sql::numeric::Decimal::parse(s).expect("decimal"));
@@ -10409,7 +10409,7 @@ fn p0_4_decimal_literal_is_exact_numeric() {
 }
 
 #[test]
-fn p0_4_decimal_in_between_case_typecheck_and_filter() {
+fn decimal_in_between_case_typecheck_and_filter() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT, v FLOAT)");
     for (i, v) in [(1, "0.5"), (2, "1.5"), (3, "2.5")] {
@@ -10432,7 +10432,7 @@ fn p0_4_decimal_in_between_case_typecheck_and_filter() {
 }
 
 #[test]
-fn p0_4_mixed_numeric_case_aggregate_drops_no_rows() {
+fn mixed_numeric_case_aggregate_drops_no_rows() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (v FLOAT)");
     for v in ["1.0", "2.0", "3.0"] {
@@ -10466,7 +10466,7 @@ fn p0_4_mixed_numeric_case_aggregate_drops_no_rows() {
 }
 
 #[test]
-fn p0_4_numeric_value_through_vectorized_float_projection() {
+fn numeric_value_through_vectorized_float_projection() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT, f FLOAT)");
     run(
@@ -10475,7 +10475,7 @@ fn p0_4_numeric_value_through_vectorized_float_projection() {
     );
     // A FLOAT-typed expression that evaluates to a NUMERIC literal value (COALESCE filling a NULL
     // with 0.5; a CASE with a decimal branch) must round-trip through the vectorized batch path
-    // without erroring in row->batch conversion (V-1), and the row and batch paths must agree
+    // without erroring in row->batch conversion, and the row and batch paths must agree
     // (both FLOAT, not NUMERIC-by-table-size).
     for sql in [
         "SELECT COALESCE(f, 0.5) FROM t ORDER BY id",

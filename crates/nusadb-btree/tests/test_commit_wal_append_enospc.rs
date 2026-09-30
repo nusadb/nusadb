@@ -115,7 +115,7 @@ fn commit_wal_append_enospc_rolls_back_cleanly_and_the_engine_survives() {
     );
 }
 
-/// D-STABLE-ENOSPC rec #3: a restart while the disk is *still* full, then freed, must leave no
+/// A restart while the disk is *still* full, then freed, must leave no
 /// half-baked state. This composes recovery with the disk-full path: the engine reopens (recovery
 /// replays the durable prefix), the very first post-recovery commit hits ENOSPC and fails cleanly
 /// (recovery's state untouched), and once space frees the engine resumes committing durably — with

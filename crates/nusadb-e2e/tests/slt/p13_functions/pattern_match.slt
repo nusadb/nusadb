@@ -122,15 +122,14 @@ SELECT NULL ILIKE 'abc'
 NULL
 
 # A single `_` matches exactly one character even when a letter's lowercase form has a different
-# length — `'İ'` (U+0130) lowercases to two code points, which a LOWER()-based ILIKE would break
-# (deep-gate #12).
+# length: `'İ'` (U+0130) lowercases to two code points, which a LOWER()-based ILIKE would break.
 query T
 SELECT 'İ' ILIKE '_'
 ----
 1
 
 # An alphabetic ESCAPE keeps its case under ILIKE: `X` escapes the next char (a literal `z`), and the
-# letters still match case-insensitively — a LOWER()-based ILIKE would lose the escape (deep-gate #12).
+# letters still match case-insensitively; a LOWER()-based ILIKE would lose the escape.
 query T
 SELECT 'AZ' ILIKE 'aXz' ESCAPE 'X'
 ----

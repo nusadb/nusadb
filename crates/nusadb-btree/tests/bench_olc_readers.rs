@@ -2,7 +2,7 @@
 //! plus single-writer insert cost over one shared clustered tree — the workload a per-page
 //! seqlock (OLC read half) would have to beat.
 //!
-//! Permanent record of the 2026-07-12 decision: a full OLC read path WAS built and measured
+//! Why the read path has no OLC: a full OLC read path WAS built and measured
 //! against this probe on the 8-core Windows dev host — per-page seqlock slots (atomic-word
 //! pages, version-validated unlatched reads), a zero-copy validated descent for `get`, and a
 //! lock-free segmented slot directory (descent wrote ZERO shared cache lines) — and REJECTED:
@@ -11,10 +11,10 @@
 //! atomic-word page copy. On this host the random-key descent is memory-latency-bound, not
 //! latch-bound, so removing reader-side synchronization bought nothing measurable. Revisit if
 //! a many-core rig shows the read plateau is synchronization (re-run this probe there), or
-//! together with the zero-copy scan decode (R2 stage-2), which amortizes the seqlock's copy
+//! together with the zero-copy scan decode, which amortizes the seqlock's copy
 //! cost by not copying at all.
 //!
-//! `cargo test -p nusadb-btree --release --test bench_w1b_olc_readers -- --ignored --nocapture`
+//! `cargo test -p nusadb-btree --release --test bench_olc_readers -- --ignored --nocapture`
 
 #![allow(
     clippy::unwrap_used,
@@ -38,7 +38,7 @@ fn tuple(key: u64) -> Vec<u8> {
 
 #[test]
 #[ignore = "manual perf probe — run with --release -- --ignored --nocapture"]
-fn w1b_olc_concurrent_point_get_scaling() {
+fn olc_concurrent_point_get_scaling() {
     let store = Arc::new(MemPageStore::default());
     let mut tree = ClusteredTree::create(&*store).unwrap();
     let t = Instant::now();

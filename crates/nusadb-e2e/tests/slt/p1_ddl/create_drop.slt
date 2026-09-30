@@ -145,7 +145,7 @@ FIX DROP DATABASE nusadb
 statement error
 SELECT * FROM temp_u
 
-# --- DROP SCHEMA RESTRICT / CASCADE (NS3) ---
+# --- DROP SCHEMA RESTRICT / CASCADE ---
 statement ok
 CREATE SCHEMA s1
 

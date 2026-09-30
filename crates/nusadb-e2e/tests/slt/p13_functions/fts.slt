@@ -1,8 +1,8 @@
-# p13_functions/fts — full-text search (P10 F1): to_tsvector / to_tsquery / plainto_tsquery and the
-# `@@` match. Two configurations, both byte-exact with PG for plain-word input: `simple` (lowercase
-# only) and `english` (Snowball stopwords + Snowball English stemmer; also the default for the
-# 1-argument forms, matching PG's stock default_text_search_config). Other configurations and
-# weight suffixes are loud errors; phrase search is position-accurate.
+# p13_functions/fts: full-text search with to_tsvector / to_tsquery / plainto_tsquery and the `@@`
+# match. Two configurations, both byte-exact with the reference engine for plain-word input:
+# `simple` (lowercase only) and `english` (Snowball stopwords + Snowball English stemmer; also the
+# default for the 1-argument forms, matching the reference engine's stock default). Other
+# configurations and weight suffixes are loud errors; phrase search is position-accurate.
 
 # to_tsvector: canonical form — lexemes sorted, quoted, 1-based ascending positions.
 query T
@@ -68,7 +68,7 @@ SELECT id FROM docs WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'd
 ----
 3
 
-# The swapped orientation (tsquery @@ tsvector) is accepted, like PG.
+# The swapped orientation (tsquery @@ tsvector) is accepted, like the reference engine.
 query I
 SELECT id FROM docs WHERE to_tsquery('simple', 'fox') @@ to_tsvector('simple', body) ORDER BY id
 ----
@@ -86,7 +86,7 @@ SELECT (to_tsvector('simple', 'x') @@ NULL) IS NULL
 1
 
 # The english configuration: Snowball stemming, stopwords dropped but their positions consumed.
-# (The canonical example from PG's own documentation.)
+# (The canonical example from the reference engine's documentation.)
 query T
 SELECT to_tsvector('english', 'a fat  cat sat on a mat - it ate a fat rats')
 ----
@@ -97,7 +97,7 @@ SELECT to_tsvector('english', 'The quick brown foxes jumped over the lazy dogs')
 ----
 'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2
 
-# The 1-argument forms default to english, like PG's stock default_text_search_config.
+# The 1-argument forms default to english, like the reference engine's stock default.
 query T
 SELECT to_tsvector('The quick brown foxes jumped over the lazy dogs')
 ----
@@ -125,7 +125,7 @@ SELECT id FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('english', 
 ----
 1
 
-# Digit-bearing tokens skip the stopword/stem pipeline (PG's numword class uses simple).
+# Digit-bearing tokens skip the stopword/stem pipeline (the numword class uses simple).
 query T
 SELECT to_tsvector('english', 'the42 12 the')
 ----
@@ -197,21 +197,21 @@ SELECT to_tsvector('french', 'foxes')
 statement error
 SELECT to_tsquery('simple', 'fox:A')
 
-# Malformed tsquery is a syntax error, like PG.
+# Malformed tsquery is a syntax error, like the reference engine.
 statement error
 SELECT to_tsquery('simple', 'fox &')
 
 # --- Relevance ranking: ts_rank / ts_rank_cd ---
 
-# PG's documented single-term score, 0.1 / (pi^2/6) = 0.06079271 (the query type rounds to 3dp;
-# the exact float4 text is pinned in the fts unit tests).
+# The reference engine's documented single-term score, 0.1 / (pi^2/6) = 0.06079271 (the query type
+# rounds to 3dp; the exact float4 text is pinned in the fts unit tests).
 query R
 SELECT ts_rank(to_tsvector('simple', 'fox'), to_tsquery('simple', 'fox'))
 ----
 0.061
 
 # Two adjacent default-weight terms AND together: sqrt(0.1*0.1*word_distance(1)) = 0.09910322,
-# the value measured on PG16.
+# the value measured on the reference engine.
 query R
 SELECT ts_rank(to_tsvector('simple', 'a b'), to_tsquery('simple', 'a & b'))
 ----
@@ -239,7 +239,7 @@ SELECT ts_rank(to_tsvector('simple', 'cat'), to_tsquery('simple', 'fox'))
 0.000
 
 # The three-argument form takes a normalization bit-mask (2 = divide by document length):
-# 0.09910322/2 = 0.04955161 (PG16 value; the harness rounds to 3dp).
+# 0.09910322/2 = 0.04955161 (the reference engine's value; the harness rounds to 3dp).
 query R
 SELECT ts_rank(to_tsvector('simple', 'a b'), to_tsquery('simple', 'a & b'), 2)
 ----
@@ -340,7 +340,7 @@ SELECT count(DISTINCT v) FROM (VALUES ('apple:1'::tsvector), ('banana:1'::tsvect
 2
 
 # ============================================================================
-# F1 follow-up: type-specific tsvector/tsquery functions and operators.
+# Type-specific tsvector/tsquery functions and operators.
 # Every expected value is the reference-engine oracle.
 # ============================================================================
 

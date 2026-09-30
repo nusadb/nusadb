@@ -219,7 +219,7 @@ fn fixture() -> BtreeEngine {
 fn denies_until_granted_and_denies_again_after_revoke() {
     let engine = fixture();
 
-    // This is the finding being closed: a connected role used to reach everything.
+    // Without this check a connected role would reach everything.
     denied_as(&engine, "app", "SELECT id FROM orders");
     denied_as(&engine, "app", "INSERT INTO orders VALUES (3, 300)");
 
@@ -438,7 +438,7 @@ fn a_view_is_not_a_way_around_the_check_on_its_base_table() {
     );
 }
 
-// === Regressions for the bypasses the pre-push audit found ===============
+// === Regressions for privilege bypasses ===============
 
 #[test]
 fn a_nested_body_does_not_run_as_superuser() {
@@ -749,7 +749,7 @@ fn table_privileges_view_lists_what_was_granted() {
 // Six ways the first RBAC cut let a non-superuser reach past its grants. Each test drives the
 // real enforcement path and fails on the pre-fix code.
 
-/// B1 — a `CREATEROLE` role cannot grant itself a SUPERUSER role and thereby become superuser.
+/// A `CREATEROLE` role cannot grant itself a SUPERUSER role and thereby become superuser.
 /// Minting a superuser was already blocked; membership was the unguarded second door.
 #[test]
 fn createrole_cannot_escalate_via_membership_in_a_superuser_role() {
@@ -762,7 +762,7 @@ fn createrole_cannot_escalate_via_membership_in_a_superuser_role() {
     denied_as(&engine, "app", "SELECT id FROM orders");
 }
 
-/// B2 — the bootstrap superuser's name is reserved, so no catalog role can be created under it to
+/// The bootstrap superuser's name is reserved, so no catalog role can be created under it to
 /// inherit ownership of every unowned object.
 #[test]
 fn the_bootstrap_superuser_name_is_reserved() {
@@ -775,7 +775,7 @@ fn the_bootstrap_superuser_name_is_reserved() {
     );
 }
 
-/// B3 — `CREATE TABLE AS` records the creator as owner, so the creator can read its own table.
+/// `CREATE TABLE AS` records the creator as owner, so the creator can read its own table.
 #[test]
 fn create_table_as_is_owned_by_its_creator() {
     let engine = fixture();
@@ -787,7 +787,7 @@ fn create_table_as_is_owned_by_its_creator() {
     assert_eq!(got.len(), 2);
 }
 
-/// B4 — `DROP SCHEMA` is owner-or-superuser only: a role cannot drop another's schema.
+/// `DROP SCHEMA` is owner-or-superuser only: a role cannot drop another's schema.
 #[test]
 fn drop_schema_requires_ownership() {
     let engine = fixture();
@@ -799,7 +799,7 @@ fn drop_schema_requires_ownership() {
     ok_as(&engine, ROOT, "DROP SCHEMA victim CASCADE");
 }
 
-/// B4 — a schema's own creator (not only a superuser) may drop it, because CREATE SCHEMA now
+/// A schema's own creator (not only a superuser) may drop it, because CREATE SCHEMA now
 /// records ownership.
 #[test]
 fn a_schema_can_be_dropped_by_its_creator() {
@@ -828,14 +828,14 @@ fn create_database_and_schema_need_createdb() {
     ok_as(&engine, ROOT, "CREATE SCHEMA root_schema");
 }
 
-/// B4 — `DROP DATABASE` is superuser-only.
+/// `DROP DATABASE` is superuser-only.
 #[test]
 fn drop_database_requires_superuser() {
     let engine = fixture();
     denied_as(&engine, "app", "DROP DATABASE nusadb");
 }
 
-/// B6 — `ANALYZE` needs SELECT on the table: it reads every row and persists column values.
+/// `ANALYZE` needs SELECT on the table: it reads every row and persists column values.
 #[test]
 fn analyze_requires_select_privilege() {
     let engine = fixture();
@@ -845,7 +845,7 @@ fn analyze_requires_select_privilege() {
     ok_as(&engine, "app", "ANALYZE orders");
 }
 
-/// W7 — `REVOKE` of a non-existent role is a loud error, like its `GRANT` twin, not a silent
+/// `REVOKE` of a non-existent role is a loud error, like its `GRANT` twin, not a silent
 /// no-op.
 #[test]
 fn revoke_of_a_missing_role_is_an_error() {
@@ -857,7 +857,7 @@ fn revoke_of_a_missing_role_is_an_error() {
     );
 }
 
-/// B5 — dropping a schema CASCADE clears its member tables' grants, so a later same-named table
+/// Dropping a schema CASCADE clears its member tables' grants, so a later same-named table
 /// does not inherit the dropped one's permissions. Without the cleanup a role keeps SELECT on the
 /// reincarnated table.
 #[test]

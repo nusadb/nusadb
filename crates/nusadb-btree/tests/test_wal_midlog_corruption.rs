@@ -1,7 +1,7 @@
 //! Recovery must distinguish a torn WAL *tail* (a crash mid-append — safe to truncate to the last
 //! good record) from a *hole in the middle* of the log (bit-rot / a bad sector).
 //!
-//! The WAL is the sole durable copy of the database in phase 1 (no checkpoint, volatile pages), so
+//! Every committed change since the last checkpoint exists only in the WAL, so
 //! truncating at a mid-log hole would silently lose every committed transaction past it AND destroy
 //! the still-intact evidence. A hole must therefore make `open`
 //! REFUSE loudly and leave the file untouched; only a genuine torn tail may be truncated.

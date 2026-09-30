@@ -51,7 +51,7 @@ SELECT grp, COUNT(DISTINCT v), SUM(DISTINCT v) FROM m GROUP BY grp
 a  2  30
 b  2  70
 
-# DISTINCT dedup is consistent with comparison (A-perf hash bucket): different NUMERIC scales of the
+# DISTINCT dedup is consistent with comparison (hash bucket): different NUMERIC scales of the
 # same value count once (1.0 == 1.00 == 1; 2.5 == 2.50) -> 2 distinct, summing to 3.5.
 statement ok
 CREATE TABLE dn (x NUMERIC)

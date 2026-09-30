@@ -25,7 +25,7 @@ pub(super) fn run_select(
     let est_scan_rows = est_scan_rows.or_else(|| join_scan_estimate(op, engine));
     // Route to the vectorized batch path when it is force-enabled (the opt-in test/override flag) or
     // when the plan-time scanned-row estimate is large enough to amortize the batch overhead (
-    // selective routing, the design recommendation: ≥ VECTORIZED_MIN_ROWS). Otherwise use the row-at-a-time
+    // selective routing: ≥ VECTORIZED_MIN_ROWS). Otherwise use the row-at-a-time
     // path. Both produce identical rows; `vectorized::execute` itself falls back to the row path for
     // any plan shape it does not support, so an over-eager route is at worst a wasted try. The
     // estimate is computed at plan time, so this adds no run-time stats fetch on the default path.
@@ -115,7 +115,7 @@ fn estimated_group_state_bytes(
     /// Key `Vec<Value>` + accumulator vector + hash-index slot, deliberately generous.
     const EST_GROUP_STATE_BYTES: u64 = 360;
     // The ordinals in `group_keys` index `input`'s row layout, which must be exactly the
-    // scan's — descend only layout-preserving operators to reach it (audit catch: a
+    // scan's, so descend only layout-preserving operators to reach it (a
     // Filter-wrapped narrowed scan otherwise read the WRONG column's NDV, and a low-NDV
     // misread would route an over-budget aggregate to the unbounded hash arm). Anything
     // layout-changing refuses: the sort fold needs no estimate.
@@ -3859,8 +3859,8 @@ fn info_schema_columns(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row
 
 /// The standard `information_schema.columns.data_type` name for a column type. These are the
 /// SQL-standard / common spellings drivers and ORMs expect (`integer`, not `int`), distinct from the
-/// short names `SHOW COLUMNS` renders. `SMALLINT`/`BIGINT` round-trip to their own names (K4/K6
-/// integer fidelity); `INT` and the unnamed narrow widths (`TINYINT`/`MEDIUMINT`) report `integer`.
+/// short names `SHOW COLUMNS` renders. `SMALLINT`/`BIGINT` round-trip to their own names; `INT`
+/// and the unnamed narrow widths (`TINYINT`/`MEDIUMINT`) report `integer`.
 pub(crate) const fn info_schema_data_type(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::Bool => "boolean",

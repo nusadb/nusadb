@@ -233,7 +233,7 @@ fn bind_with_lying_counts_errors_without_speculative_overalloc() {
 
 #[test]
 fn row_description_with_too_many_columns_is_rejected_not_truncated() {
-    // N1 / G21: a column count past u16::MAX must error, not truncate the count prefix (which
+    // A column count past u16::MAX must error, not truncate the count prefix (which
     // would make the decoder read too few columns and desync the stream).
     let columns: Vec<String> = (0..=u16::MAX as usize).map(|i| format!("c{i}")).collect();
     let msg = BackendMessage::RowDescription { columns };
@@ -242,7 +242,7 @@ fn row_description_with_too_many_columns_is_rejected_not_truncated() {
 
 #[test]
 fn data_row_with_too_many_fields_is_rejected() {
-    // N1 / G21: a field count past u16::MAX must error rather than truncate its count prefix.
+    // A field count past u16::MAX must error rather than truncate its count prefix.
     let values: Vec<Option<Vec<u8>>> = vec![Some(Vec::new()); u16::MAX as usize + 1];
     let msg = BackendMessage::DataRow { values };
     assert!(matches!(msg.encode(), Err(WireError::FieldTooLarge)));

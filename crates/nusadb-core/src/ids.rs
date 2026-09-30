@@ -7,8 +7,7 @@ use bytemuck::{Pod, Zeroable};
 
 /// Identifies a single 8 KiB page in physical storage.
 ///
-/// Page IDs are dense, monotonically increasing, and **never reused** during Stage 1.
-/// Free-list reuse is introduced later under the same `PageId` type.
+/// Page IDs are dense. A store may hand a deallocated id out again from its free list.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable)]
 pub struct PageId(pub u64);

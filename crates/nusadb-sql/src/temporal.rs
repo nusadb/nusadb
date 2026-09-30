@@ -299,7 +299,7 @@ fn parse_fraction(frac: &str) -> Option<i64> {
 // ---- TimeTz ------------------------------------------------------------------------------------
 //
 // A `TIMETZ` value is one packed `i64` carrying BOTH the as-entered local time-of-day and its
-// zone offset (P-TIMETZ): `packed = utc_equivalent_micros * 2^18 + (zone_west_secs + 2^17)`.
+// zone offset: `packed = utc_equivalent_micros * 2^18 + (zone_west_secs + 2^17)`.
 // The packing is chosen so plain `i64` ordering implements the reference engine's `timetz_cmp` exactly — primary
 // by the UTC-equivalent instant (deliberately NOT normalized into one day, like the reference engine), tie-broken
 // by zone west-of-UTC — so the executor's compare / hash / order-preserving index-key / spill
@@ -335,7 +335,7 @@ pub const fn timetz_local_micros(packed: i64) -> i64 {
 
 /// Parse a `timetz` `HH:MM:SS[.ffffff][Z|±HH[:MM]]` into the packed local-time + zone form.
 ///
-/// The offset is **kept** (P-TIMETZ), so the value renders back with the zone it was entered
+/// The offset is **kept**, so the value renders back with the zone it was entered
 /// with, exactly like the reference engine. A missing offset (or `Z`) is UTC (`+00`).
 #[must_use]
 pub fn parse_timetz(s: &str) -> Option<i64> {
@@ -826,7 +826,7 @@ const fn iso_weeks_in_year(y: i64) -> i64 {
     }
 }
 
-/// `EXTRACT(field FROM interval)` (QA category-D).
+/// `EXTRACT(field FROM interval)`.
 ///
 /// An INTERVAL carries independent `months`, `days`, and `micros` fields; `epoch` is the total
 /// seconds using the calendar-agnostic convention of 30-day months and 365.25-day years (whole years
@@ -2270,9 +2270,9 @@ mod tests {
     }
 
     #[test]
-    fn timetz_keeps_its_zone_and_orders_like_pg() {
-        // P-TIMETZ: the entered offset is kept and rendered back (faithful to the reference engine) — whole hours
-        // short (`+07`), minutes long (`+05:30`), UTC/`Z`/missing as `+00`.
+    fn timetz_keeps_its_zone_and_orders_like_the_reference() {
+        // The entered offset is kept and rendered back (faithful to the reference engine): whole
+        // hours short (`+07`), minutes long (`+05:30`), UTC/`Z`/missing as `+00`.
         let fmt = |s: &str| format_timetz(parse_timetz(s).unwrap());
         assert_eq!(fmt("13:45:30+07"), "13:45:30+07");
         assert_eq!(fmt("09:15:00+05:30"), "09:15:00+05:30");
@@ -2601,7 +2601,7 @@ mod tests {
                 parse_timestamp(&format!("{s} 00:00:00")).unwrap(),
             )
         };
-        // Earlier month = January (31): the finding's own case.
+        // Earlier month = January (31): the reported case.
         assert_eq!(age("2024-03-01", "2023-01-15"), (13, 17, 0));
         // Earlier month = November (30).
         assert_eq!(age("2024-01-01", "2023-11-30"), (1, 1, 0));

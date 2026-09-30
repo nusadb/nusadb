@@ -1,6 +1,5 @@
 //! Cost estimation: predicate selectivity and operator cardinality from
-//! ANALYZE statistics (technique from the design
-//! `Research_Result/nusadb_cardinality_estimation_sketches.md` §2).
+//! ANALYZE statistics.
 //!
 //! Given the per-column [`ColumnStats`] that the `stats` module produced (NDV, MCV
 //! list, equi-depth histogram, null count) plus the table's authoritative row

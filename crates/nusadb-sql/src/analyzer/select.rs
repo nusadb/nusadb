@@ -491,9 +491,9 @@ const fn flip_prune_op(op: crate::PruneOp) -> crate::PruneOp {
 }
 
 /// Resolve a join input (the right side of a `JOIN`): a derived table `JOIN (SELECT ...) AS x`
-/// (increment 3b) — analyzed standalone and inlined via `input_cte` like a CTE — or a named
+/// (analyzed standalone and inlined via `input_cte` like a CTE) or a named
 /// catalog table. A `LATERAL` join input is analyzed with `left_scope` pushed as the enclosing scope
-/// (increment 3c) so its references to columns on its left resolve to `OuterColumn`s; a CTE
+/// so its references to columns on its left resolve to `OuterColumn`s; a CTE
 /// referenced in a `JOIN` is not yet supported.
 /// Whether `table` is a `FROM` table function (`unnest(a)`, `generate_series(...)`, `jsonb_each(x)`,
 /// etc.), which the parser desugars to a derived table wrapping a single set-returning projection
@@ -537,7 +537,7 @@ fn resolve_join_input(
         // For `LATERAL` (which a `FROM` table function carries implicitly — the parser marks it),
         // push the columns to this join's left as the enclosing scope so the subquery body can
         // correlate to them (resolved to `OuterColumn`s the executor binds per left row); the guard
-        // pops the scope when this resolution returns (increment 3c).
+        // pops the scope when this resolution returns.
         let _outer = table.lateral.then(|| push_outer_scope(left_scope));
         let plan = apply_ordinality(analyze_select((**subquery).clone(), catalog)?, table)?;
         let schema = cte_schema(&table.name, &table.column_aliases, &plan)?;
@@ -813,7 +813,7 @@ pub(super) fn resolve_from(
     for join in &from.joins {
         // A LATERAL join input correlates to the columns to its left, so resolve it against the
         // scope built so far. A right/full lateral join is meaningless (the right side depends on
-        // the left), so only inner/left/cross lateral joins are allowed (increment 3c).
+        // the left), so only inner/left/cross lateral joins are allowed.
         if join.table.lateral && matches!(join.kind, ast::JoinKind::Right | ast::JoinKind::Full) {
             return Err(Error::Unsupported(
                 "a RIGHT/FULL JOIN LATERAL is not supported".to_owned(),

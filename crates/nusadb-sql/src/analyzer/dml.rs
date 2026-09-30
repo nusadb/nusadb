@@ -935,7 +935,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
     if let Some((schema, qualifier, plan)) = from {
         // A FROM source is a de-facto join: like SELECT's RLS+JOIN refusal, a non-superuser must not
         // read an RLS-protected source table (its rows would otherwise leak through the SET values or
-        // WHERE predicate). Fail closed (deep-gate security). A derived source's schema name is
+        // WHERE predicate). Fail closed. A derived source's schema name is
         // its alias; in the unlikely case that alias collides with an RLS-protected table name the
         // guard merely over-rejects (fail closed) — never a leak.
         if !catalog.is_superuser() && catalog.rls_enabled(&schema.schema, &schema.name)? {
@@ -1103,7 +1103,7 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
     if let Some((schema, qualifier, plan)) = using {
         // A USING source is a de-facto join: like SELECT's RLS+JOIN refusal, a non-superuser must not
         // read an RLS-protected source table (its rows would otherwise leak through the WHERE
-        // predicate). Fail closed (deep-gate security). A derived source's schema name is its
+        // predicate). Fail closed. A derived source's schema name is its
         // alias; in the unlikely case that alias collides with an RLS-protected table name the guard
         // merely over-rejects (fail closed) — never a leak.
         if !catalog.is_superuser() && catalog.rls_enabled(&schema.schema, &schema.name)? {

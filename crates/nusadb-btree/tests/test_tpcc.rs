@@ -1109,10 +1109,10 @@ fn perf_cell_shaped(
 /// Measured TPC-C throughput baseline: the spec-mix workload, timed, across
 /// {in-memory, durable-WAL} × {READ COMMITTED, SERIALIZABLE} × {1, 4 workers}. Numbers are
 /// machine-relative — they are recorded with the hardware
-/// spec, and the public-claim floor remains the cheap-VM run the plan mandates. Run via
+/// spec; the public figure is the run on a small VM. Run via
 /// `cargo tpcc-bench` (release; the debug gate skips it).
 #[test]
-#[ignore = "timed perf baseline; run via `cargo tpcc-bench` (release) and record in output_testing"]
+#[ignore = "timed perf baseline; run via `cargo tpcc-bench` (release)"]
 fn tpcc_perf_baseline() {
     for (label, durable) in [("in-memory", false), ("durable-wal", true)] {
         for level in [IsolationLevel::ReadCommitted, IsolationLevel::Serializable] {

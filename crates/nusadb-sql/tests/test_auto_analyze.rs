@@ -1,4 +1,4 @@
-//! `auto_analyze_stale_tables` (D-AUTO-ANALYZE): the off-query-path policy that keeps the planner's
+//! `auto_analyze_stale_tables`: the off-query-path policy that keeps the planner's
 //! statistics fresh must analyse a table once its write churn crosses the scale-factor threshold
 //! `base + scale * approx_row_count`, populate its statistics, reset its churn, and leave a lightly
 //! churned (tiny) table untouched. Proven end-to-end against a real engine so the whole pipeline —

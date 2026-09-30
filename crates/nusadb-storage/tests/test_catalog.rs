@@ -111,7 +111,7 @@ fn drop_then_reopen() {
 
 #[test]
 fn drop_reclaims_surplus_catalog_pages() {
-    // G14: when the catalog blob shrinks (e.g. after dropping many tables) the tail pages it no
+    // When the catalog blob shrinks (e.g. after dropping many tables) the tail pages it no
     // longer needs must be deallocated, not left allocated and stamped CATALOG_MAGIC where the
     // free-list scan can never reclaim them (a permanent orphan leak on every DDL).
     let dir = nusadb_test_utils::temp_dir();

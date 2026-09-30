@@ -41,7 +41,7 @@ SELECT id FROM s WHERE name = 'big'
 ----
 100
 
-# --- An explicit value advances the sequence so a later auto value cannot collide (deep-gate #9b) ---
+# --- An explicit value advances the sequence so a later auto value cannot collide ---
 statement ok
 CREATE TABLE adv (id SERIAL PRIMARY KEY, v INT)
 
@@ -123,7 +123,7 @@ SELECT id, v FROM su WHERE k = 1
 ----
 1 10
 
-# An explicit serial value through the upsert insert path also advances the sequence (deep-gate #9b).
+# An explicit serial value through the upsert insert path also advances the sequence.
 statement ok
 INSERT INTO su (id, k, v) VALUES (7, 2, 20) ON CONFLICT (k) DO UPDATE SET v = 999
 

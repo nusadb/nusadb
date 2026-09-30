@@ -1,4 +1,4 @@
-# p11_views/plain — non-materialized views (M6): the body re-evaluates on every read.
+# p11_views/plain: non-materialized views: the body re-evaluates on every read.
 
 statement ok
 CREATE TABLE emp (id INT NOT NULL, dept INT, salary INT)
@@ -163,7 +163,7 @@ SELECT * FROM ine_m
 2
 
 # Matview IF NOT EXISTS over an existing PLAIN view must also no-op — a backing table would
-# otherwise silently shadow the view (audit catch).
+# otherwise silently shadow the view.
 statement ok
 CREATE MATERIALIZED VIEW IF NOT EXISTS ine_v AS SELECT id FROM emp
 

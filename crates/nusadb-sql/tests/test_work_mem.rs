@@ -96,7 +96,7 @@ fn work_mem_budget_enforced_then_reset() {
     run(engine, &mut session, "SELECT * FROM tiny")
         .expect("a small materialized stage fits under the budget");
 
-    // `INSERT ... SELECT` streams its source in batches (P-INSERTSEL-OOM): the same budget that
+    // `INSERT ... SELECT` streams its source in batches: the same budget that
     // refuses materializing `SELECT * FROM big` admits copying `big` into a plain table, because
     // the streaming path holds only one batch at a time. The whole-result copy is what OOMed an
     // ETL-sized backfill before.
@@ -121,7 +121,7 @@ fn work_mem_budget_enforced_then_reset() {
         },
     }
 
-    // Multi-batch streaming (source > one 1024-row batch), the QA ETL shape: grow the copy to
+    // Multi-batch streaming (source > one 1024-row batch), an ETL shape: grow the copy to
     // 1200 rows, then stream all of them into a third table — two batches — still under the same
     // tight budget.
     for _ in 0..2 {
@@ -293,8 +293,8 @@ fn work_mem_budget_enforced_then_reset() {
 
     // A hash join's OUTPUT streams: with a budget that admits the tiny
     // build side but NOT the joined output, a LIMIT and an aggregate over the join both succeed —
-    // the join holds its build side plus one probe row, never the whole matched output (QA: even
-    // `LIMIT 5` over a joined 1M table OOMed because the output materialized first).
+    // the join holds its build side plus one probe row, never the whole matched output (even
+    // `LIMIT 5` over a joined 1M table ran out of memory because the output materialized first).
     set_work_mem(0);
     run(engine, &mut session, "CREATE TABLE keys (k INT)").unwrap();
     for k in 0..10 {

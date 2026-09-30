@@ -769,13 +769,13 @@ impl BackendMessage {
     }
 }
 
-/// Write a `u16` count prefix, erroring (not truncating) when `len > u16::MAX` (N1 / G21).
+/// Write a `u16` count prefix, erroring (not truncating) when `len > u16::MAX`.
 fn put_u16_count(buf: &mut BytesMut, len: usize) -> Result<(), WireError> {
     buf.put_u16(u16::try_from(len).map_err(|_| WireError::FieldTooLarge)?);
     Ok(())
 }
 
-/// Write a `u32` length prefix, erroring (not truncating) when `len > u32::MAX` (N1 / G21).
+/// Write a `u32` length prefix, erroring (not truncating) when `len > u32::MAX`.
 fn put_u32_len(buf: &mut BytesMut, len: usize) -> Result<(), WireError> {
     buf.put_u32(u32::try_from(len).map_err(|_| WireError::FieldTooLarge)?);
     Ok(())

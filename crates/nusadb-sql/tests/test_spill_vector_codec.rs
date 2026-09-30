@@ -1,5 +1,5 @@
-//! End-to-end spill of a `VECTOR` column (the design finding on `executor/spill/codec.rs` tag-15). The
-//! spill codec's `Vector` path is exercised in production when a vector workload spills under a
+//! End-to-end spill of a `VECTOR` column through `executor/spill/codec.rs` (tag 15). The spill
+//! codec's `Vector` path is exercised in production when a vector workload spills under a
 //! tight memory budget (the 1 vCPU / 1 GB target), yet only the byte round-trip was covered. This
 //! drives a real spilling `ORDER BY` whose rows carry `VECTOR(3)` values through `encode_row` /
 //! `decode_row`, and asserts the result equals the in-memory path.

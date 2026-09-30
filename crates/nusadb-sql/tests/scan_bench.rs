@@ -1,8 +1,7 @@
-//! Manual scan-throughput probe (A-PERF.SCAN, QA finding `QA_agg_perf_simd_reverify_d7eed161.md`):
-//! QA measured aggregate scans at ~1.47µs/row on the durable engine (the comparison ratios live
-//! in that QA report) with the fold no longer the bottleneck. This probe splits the cost between the raw engine scan (tuple rehydration
-//! plus MVCC materialization) and the SQL layer, on the durable engine where committed tuples are
-//! lazy (the QA configuration).
+//! Manual scan-throughput probe: aggregate scans measured at ~1.47µs/row on the durable engine,
+//! with the fold no longer the bottleneck. This probe splits the cost between the raw engine scan
+//! (tuple rehydration plus MVCC materialization) and the SQL layer, on the durable engine where
+//! committed tuples are lazy.
 //!
 //! NOT a CI gate — `#[ignore]`d; run manually:
 //! `cargo test -p nusadb-sql --release --test scan_bench -- --ignored --nocapture`
@@ -56,7 +55,7 @@ fn scan_throughput_probe() {
     )
     .unwrap();
     // A separate text table keeps the longitudinal numbers of `t` comparable across runs while
-    // still probing the text decode path (R2 stage 2b).
+    // still probing the text decode path.
     run(engine, &mut session, "CREATE TABLE txt (tag TEXT, val INT)").unwrap();
 
     let t0 = Instant::now();
@@ -166,7 +165,7 @@ fn scan_throughput_probe() {
         "SELECT COUNT(*) FROM t",
         "SELECT SUM(val) FROM t",
         "SELECT grp, COUNT(*), SUM(val) FROM t GROUP BY grp",
-        // The text decode path (R2 stage 2b): GROUP BY on a TEXT column.
+        // The text decode path: GROUP BY on a TEXT column.
         "SELECT tag, COUNT(*) FROM txt GROUP BY tag",
     ] {
         for round in 1..=3 {

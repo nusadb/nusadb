@@ -891,7 +891,7 @@ fn within_group_rejects_bad_fraction_type_and_order() {
 
 #[test]
 fn plain_begin_still_executes() {
-    // Plain BEGIN/COMMIT/ROLLBACK must keep planning (no regression from).
+    // Plain BEGIN/COMMIT/ROLLBACK must keep planning.
     assert!(matches!(
         plan("BEGIN", &catalog()),
         Ok(LogicalPlan::BeginTransaction(_)),
@@ -967,7 +967,7 @@ fn begin_and_set_transaction_carry_characteristics() {
 #[test]
 fn select_for_update_locks_single_table_else_unsupported() {
     // FOR UPDATE / FOR SHARE on a single base table is now accepted, including
-    // SKIP LOCKED (the job-queue pattern, QA scale/production register).
+    // SKIP LOCKED (the job-queue pattern).
     for sql in [
         "SELECT * FROM users FOR UPDATE",
         "SELECT * FROM users FOR SHARE",
@@ -1132,7 +1132,7 @@ fn delete_using_resolves_into_plan() {
     ));
 }
 
-// --- WITH / CTE (non-recursive recursive) ----------------
+// --- WITH / CTE (non-recursive and recursive) ----------------
 
 #[test]
 fn non_recursive_cte_resolves_against_its_columns() {
@@ -2288,7 +2288,7 @@ fn to_char_rejects_non_temporal_and_to_date_rejects_non_text() {
 // --- string functions -------------------------------------------
 
 #[test]
-fn b448_functions_accept_well_typed_calls() {
+fn functions_accept_well_typed_calls() {
     for sql in [
         "SELECT CONCAT(name, name) FROM users",
         "SELECT CONCAT(name, name, name) FROM users",
@@ -2303,7 +2303,7 @@ fn b448_functions_accept_well_typed_calls() {
 }
 
 #[test]
-fn b448_functions_reject_wrong_types() {
+fn functions_reject_wrong_types() {
     // CONCAT coerces textout-able scalars: `age` INT is now accepted...
     assert!(plan("SELECT CONCAT(name, age) FROM users", &catalog()).is_ok());
     // ...but a type with its own concatenation semantics (BYTEA) still is not.
@@ -2327,7 +2327,7 @@ fn b448_functions_reject_wrong_types() {
 }
 
 #[test]
-fn b448_functions_reject_wrong_arity() {
+fn functions_reject_wrong_arity() {
     // CONCAT / CONCAT_WS need at least one argument.
     assert!(matches!(
         plan("SELECT CONCAT() FROM users", &catalog()),
@@ -2347,7 +2347,7 @@ fn b448_functions_reject_wrong_arity() {
 // --- regex functions --------------------------------------------
 
 #[test]
-fn b449_regex_functions_accept_and_typecheck() {
+fn regex_functions_accept_and_typecheck() {
     // Well-typed calls resolve; REGEXP_MATCH yields TEXT[] (usable in a projection).
     for sql in [
         "SELECT REGEXP_REPLACE(name, 'a', 'b') FROM users",
@@ -2375,7 +2375,7 @@ fn b449_regex_functions_accept_and_typecheck() {
 // --- math functions ------------------------------------------
 
 #[test]
-fn b453_55_math_accept_and_result_types() {
+fn math_accept_and_result_types() {
     // INT/FLOAT args accepted; result types propagate (ABS preserves, SQRT is FLOAT).
     for sql in [
         "SELECT ABS(age) FROM users",   // age INT -> INT
@@ -2395,7 +2395,7 @@ fn b453_55_math_accept_and_result_types() {
 }
 
 #[test]
-fn b453_55_math_reject_wrong_type_and_arity() {
+fn math_reject_wrong_type_and_arity() {
     // Non-numeric argument.
     assert!(matches!(
         plan("SELECT ABS(name) FROM users", &catalog()),
@@ -2420,7 +2420,7 @@ fn b453_55_math_reject_wrong_type_and_arity() {
 // --- conditional functions --------------------------------------
 
 #[test]
-fn b457_conditional_accept_and_reject() {
+fn conditional_accept_and_reject() {
     // Same-type / unifiable arguments accept; result type usable.
     for sql in [
         "SELECT NULLIF(age, 0) FROM users",
@@ -2446,7 +2446,7 @@ fn b457_conditional_accept_and_reject() {
 // --- RANDOM / SETSEED -------------------------------------------
 
 #[test]
-fn b456_random_setseed_types_and_arity() {
+fn random_setseed_types_and_arity() {
     // RANDOM() -> FLOAT (usable in arithmetic); SETSEED(x) -> BOOL.
     assert!(plan("SELECT RANDOM() FROM users", &catalog()).is_ok());
     assert!(plan("SELECT RANDOM() * 100 FROM users", &catalog()).is_ok());
@@ -2465,7 +2465,7 @@ fn b456_random_setseed_types_and_arity() {
 // --- JSON path operators #> / #>> ------------------------------
 
 #[test]
-fn b458a_json_path_operators() {
+fn json_path_operators() {
     // JSON #> text[] -> JSON; #>> text[] -> TEXT (usable downstream).
     assert!(
         plan(

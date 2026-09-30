@@ -1,4 +1,4 @@
-//! Pull-based streaming execution for the linear pipeline (Phase 1).
+//! Pull-based streaming execution for the linear pipeline.
 //!
 //! [`execute_op`] materializes every operator into a full `Vec<Row>`, so a subtree holds all its
 //! intermediate rows at once. This module adds a [`RowSource`] — a forward-only pull cursor — for
@@ -79,11 +79,10 @@ fn counted<'a>(op: &PhysicalOperator, src: Box<dyn RowSource + 'a>) -> Box<dyn R
     }
 }
 
-/// The `(start, stop, step)` of a `ProjectSet` that is exactly the integer
-/// `generate_series(<int literal>, <int literal> [, <int literal>])` over `OneRow` — the shape a
-/// lazy counting source streams in O(1) memory (the SRF-source residual of P-INSERTSEL-OOM /
-/// ). Anything else — temporal series, expression bounds, `WITH ORDINALITY`, extra
-/// projection columns — returns `None` and takes the materializing path unchanged.
+/// The `(start, stop, step)` of a `ProjectSet` that is exactly the integer `generate_series(<int
+/// literal>, <int literal> [, <int literal>])` over `OneRow`, the shape a lazy counting source
+/// streams in O(1) memory. Anything else (temporal series, expression bounds, `WITH ORDINALITY`,
+/// extra projection columns) returns `None` and takes the materializing path unchanged.
 pub(super) fn lazy_int_series(op: &PhysicalOperator) -> Option<(i64, i64, i64)> {
     let PhysicalOperator::ProjectSet {
         input,
@@ -435,7 +434,7 @@ pub(super) fn stream_op<'a>(
         //
         // With spill configured (the server default), the build side is collected under the
         // spill budget FIRST (residual): if it fits, the join streams
-        // exactly as above — QA measured `LIMIT 5` over `orders(1M) JOIN dim(100)` OOMing here
+        // exactly as above. `LIMIT 5` over `orders(1M) JOIN dim(100)` ran out of memory here
         // because this arm used to be disabled whenever spill was on, falling back to the
         // materializing path that buffered the whole 1M-row probe input. Only a build side that
         // genuinely overflows the budget takes the blocking grace partitioning (which streams

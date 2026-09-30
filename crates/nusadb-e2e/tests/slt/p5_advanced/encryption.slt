@@ -1,4 +1,4 @@
-# p5_advanced/encryption — column-level encrypt()/decrypt() (B-enc.01).
+# p5_advanced/encryption: column-level encrypt()/decrypt().
 #
 # Values are encrypted in the SQL layer and stored as opaque hex ciphertext;
 # the engine never sees plaintext (ADR 003). The cipher is deterministic AEAD

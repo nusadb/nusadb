@@ -1,6 +1,6 @@
-//! (QA critical): equi-joins on `BIGINT`/`SMALLINT`/`NUMERIC` (and the
+//! Equi-joins on `BIGINT`/`SMALLINT`/`NUMERIC` (and the
 //! other exact types) must plan a `HashJoin`, not the O(n²) `NestedLoopJoin` — `BIGINT` is the
-//! standard ID type, so before this fix almost every real-world join was quadratic (QA measured
+//! standard ID type, so before this fix almost every real-world join was quadratic (measured
 //! 5k×5k ≈ 6s; 300k×300k hung). The hash is **compare-compatible** by construction: every widened
 //! key type maps values the evaluator calls equal to equal `KeyAtom`s (NUMERIC canonicalizes
 //! through the trimmed exact decimal, so `1.0` joins `1.00`).

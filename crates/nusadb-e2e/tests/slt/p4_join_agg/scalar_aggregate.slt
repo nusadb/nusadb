@@ -64,7 +64,7 @@ SELECT COALESCE(SUM(v), 0) FROM empty
 statement error
 SELECT id, COUNT(*) FROM nums
 
-# AVG(Int) accumulates the exact i128 sum and divides once (G22 / V1). With x = {2^53, 1, 1} the
+# AVG(Int) accumulates the exact i128 sum and divides once. With x = {2^53, 1, 1} the
 # exact sum is 9007199254740994 and the mean ≈ 3002399751580331.33 (> ...331). A naive f64 running
 # sum would drop both 1s when added to 2^53 (→ 9007199254740992) and give ≈ ...330.67 (< ...331),
 # so this boolean pins the accurate path without asserting an exact float.

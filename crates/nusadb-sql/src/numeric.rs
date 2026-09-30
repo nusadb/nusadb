@@ -1,4 +1,4 @@
-//! Exact fixed-point decimal for the `NUMERIC` / `DECIMAL` types (phase 2).
+//! Exact fixed-point decimal for the `NUMERIC` / `DECIMAL` types.
 //!
 //! A [`Decimal`] is `mantissa * 10^(-scale)` with an `i128` mantissa, so values up to 38 significant
 //! digits are represented and arithmetic is **exact** (addition/subtraction/multiplication never
@@ -480,7 +480,7 @@ impl Decimal {
     }
 
     /// The fewest fractional digits needed to represent this value exactly — i.e. the scale left
-    /// after dropping trailing zeros (`12.340` → 2, `120` → 0, `0.000` → 0). `MIN_SCALE` (B-fn).
+    /// after dropping trailing zeros (`12.340` → 2, `120` → 0, `0.000` → 0). `MIN_SCALE`.
     #[must_use]
     pub const fn min_scale(&self) -> u8 {
         if self.is_nan() {
@@ -496,7 +496,7 @@ impl Decimal {
     }
 
     /// This value with trailing fractional zeros removed (`12.340` → `12.34`), denoting the same
-    /// number at the smallest scale. `TRIM_SCALE` (B-fn).
+    /// number at the smallest scale. `TRIM_SCALE`.
     #[must_use]
     pub const fn trim_scale(&self) -> Self {
         if self.is_nan() {
@@ -587,7 +587,7 @@ mod tests {
             d("10").checked_div(&d("3")).unwrap(),
             d("3.3333333333333333")
         );
-        // The money case from the audit: 2.00 / 3 carries ≥16 significant digits of the quotient.
+        // The money case: 2.00 / 3 carries ≥16 significant digits of the quotient.
         // The reference engine's rule gives scale 20 here (not the old fixed max(2,0)+16 = 18).
         assert_eq!(
             d("2.00").checked_div(&d("3")).unwrap(),

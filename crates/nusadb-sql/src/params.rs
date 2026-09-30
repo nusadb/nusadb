@@ -73,7 +73,7 @@ fn decode_param(raw: Option<&[u8]>) -> Result<ast::Value, Error> {
 /// placeholder index + 1, or 0 if it has none.
 ///
 /// Used by the extended-query `Describe(Statement)` path to report an accurate
-/// `ParameterDescription` count instead of hard-coding 0 (G7). Mirrors the expression coverage
+/// `ParameterDescription` count instead of hard-coding 0. Mirrors the expression coverage
 /// of [`bind_parameters`] (it walks the same nodes that binding substitutes).
 #[must_use]
 pub fn parameter_count(stmt: &ast::Statement) -> usize {

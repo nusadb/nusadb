@@ -308,7 +308,7 @@ pub(super) fn convert_column_def(
     let mut serial = serial_kind(&col.data_type);
     // An unresolved bare custom type name (e.g. a user-defined `ENUM`) is deferred: the executor
     // resolves it against the type catalog at CREATE TABLE time, with `TEXT` as the storage
-    // placeholder (B-ENUM). Built-in / aliased / serial types resolve here as usual.
+    // placeholder. Built-in / aliased / serial types resolve here as usual.
     let (ty, udt_name) = if serial {
         (ColumnType::Int, None)
     } else {
@@ -405,7 +405,7 @@ pub(super) fn convert_column_def(
                 identity_always = matches!(generated_as, sql::GeneratedAs::Always);
             },
             // Column-level `COLLATE`: accept the byte-order `C`/`POSIX` (a no-op, since NusaDB
-            // already sorts text by byte value) and reject a locale collation loudly (D-COLLATE).
+            // already sorts text by byte value) and reject a locale collation loudly.
             sql::ColumnOption::Collation(name) => require_byte_order_collation(name)?,
             other => return unsupported(&format!("column constraint `{other}`")),
         }
@@ -435,7 +435,7 @@ pub(super) fn convert_column_def(
 }
 
 /// The bare user-defined type name to defer to the executor when `convert_data_type` rejects a
-/// column type (B-ENUM): a single-identifier `Custom` type with no modifiers (e.g. an `ENUM` name).
+/// column type: a single-identifier `Custom` type with no modifiers (e.g. an `ENUM` name).
 /// `None` for anything else — a modifier'd or multi-part name is not a user-defined type reference,
 /// so the original "unsupported type" error stands.
 pub(super) fn deferred_udt_name(ty: &sql::DataType) -> Option<String> {
@@ -489,7 +489,7 @@ fn char_length_check(
 
 /// Desugar a narrow integer type (`SMALLINT`/`INT`/`TINYINT`/`MEDIUMINT` and spelling variants) into
 /// a synthetic range `CHECK ("col" BETWEEN lo AND hi)` so a value outside the declared width is
-/// rejected at write time rather than silently stored (K4/K6). Every integer is stored as a 64-bit
+/// rejected at write time rather than silently stored. Every integer is stored as a 64-bit
 /// [`ColumnType::Int`]; the declared width's bounds are enforced here by reusing the existing CHECK
 /// machinery — exactly like the `VARCHAR(n)` length limit. `BIGINT`/`INT8` (the full `i64`) and any
 /// non-integer type need no check. NULL passes (CHECK is not FALSE), so the bound applies only to
@@ -575,13 +575,13 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
     use sql::DataType as D;
     let mapped = match ty {
         D::Bool | D::Boolean => ColumnType::Bool,
-        // SMALLINT/BIGINT keep their declared type so it round-trips in DDL / information_schema
-        // (K4/K6 integer fidelity); the value range is still enforced by the synthetic CHECK from
+        // SMALLINT/BIGINT keep their declared type so it round-trips in DDL / information_schema;
+        // the value range is still enforced by the synthetic CHECK from
         // `int_range_check`. TINYINT/MEDIUMINT have no standard catalog name, so they stay `Int`.
         D::SmallInt(_) | D::Int2(_) => ColumnType::SmallInt,
         D::BigInt(_) | D::Int8(_) => ColumnType::BigInt,
         D::TinyInt(_) | D::MediumInt(_) | D::Int(_) | D::Int4(_) | D::Integer(_) => ColumnType::Int,
-        // REAL / FLOAT4 keep their declared type so it round-trips in DDL / information_schema (K4/K6),
+        // REAL / FLOAT4 keep their declared type so it round-trips in DDL / information_schema,
         // stored identically to the 64-bit FLOAT; FLOAT8 / DOUBLE PRECISION and a bare FLOAT(p) are the
         // double type.
         D::Real | D::Float4 => ColumnType::Real,
@@ -628,7 +628,7 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         // Exact decimal: `NUMERIC`/`DECIMAL`/`DEC` with optional `(p[, s])`.
         D::Numeric(info) | D::Decimal(info) | D::Dec(info) => exact_numeric_type(info)?,
         // JSON and JSONB are both stored as canonical text, but keep their declared type so it
-        // round-trips in DDL / information_schema (K4/K6).
+        // round-trips in DDL / information_schema.
         D::JSON => ColumnType::Json,
         D::JSONB => ColumnType::Jsonb,
         // Calendar duration. A field-qualified `INTERVAL YEAR TO MONTH` or a precision'd
@@ -677,7 +677,7 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
         },
         // A custom (named) type: a standard SQL type NusaDB does not model natively (currency,
         // object-id, network, bit-string, geometric, range, full-text, XML) maps onto a base storage
-        // type so schemas using it still load (B-types); a genuinely unknown name is still rejected.
+        // type so schemas using it still load; a genuinely unknown name is still rejected.
         D::Custom(name, _) => {
             return aliased_type(name)
                 .ok_or_else(|| Error::ObjectNotFound(format!("type `{name}` does not exist")));
@@ -688,7 +688,7 @@ pub(super) fn convert_data_type(ty: &sql::DataType) -> Result<ColumnType, Error>
 }
 
 /// Map a standard SQL type NusaDB does not model natively onto the closest base storage type, so a
-/// schema using it still loads (migration / compatibility, B-types). The value is stored in its base
+/// schema using it still loads (migration / compatibility). The value is stored in its base
 /// form — native semantics (geometric / range / network / full-text operators, currency formatting)
 /// are a follow-up. `None` for an unrecognized name (a genuine unknown type stays an error rather
 /// than silently becoming text).

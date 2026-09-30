@@ -144,21 +144,10 @@ mod seqcatalog;
 mod spill_setop;
 mod spill_sort;
 mod trigger;
-// Spill-to-disk substrate. The consumers (streaming `RowSource`, grace hash join, external
-// merge sort) land in later commits; this commit is the
-// foundation, so most of it is exercised only by its own unit tests until then.
-#[allow(
-    dead_code,
-    reason = "Phase 0 foundation; first operator consumer lands in the next commit"
-)]
+// Spill-to-disk subsystem: a bounded memory budget, then temp-file runs for the operators that
+// would otherwise hold their whole input.
 mod spill;
-// Phase 1: pull-based streaming for the linear pipeline. The consumer (the spilling grace hash
-// join / external sort) lands next; for now `stream_op` is exercised by an oracle test that asserts
-// it yields exactly what `execute_op` does.
-#[allow(
-    dead_code,
-    reason = "Phase 1 streaming substrate; the spilling-operator consumer lands in the next commit"
-)]
+// Pull-based streaming for the linear pipeline.
 mod stream;
 use agg::*;
 use ddl::*;
@@ -176,7 +165,7 @@ pub use spill::{SpillConfig, set_spill_config};
 
 /// Whether spill-to-disk is configured for this process. Crate-visible so the vectorized
 /// group-by routing can defer to the row path's bounded-memory sort-based group-by whenever spill
-/// is on (A-PERF.AGG6) instead of holding O(groups) state past the budget.
+/// is on instead of holding O(groups) state past the budget.
 pub(crate) fn spill_is_configured() -> bool {
     spill::spill_config().is_some()
 }
@@ -364,14 +353,14 @@ pub enum ExecutionResult {
     RoleSet(Option<String>),
 }
 
-/// A push-based receiver for a streamed statement's output (Phase 2 streaming output).
+/// A push-based receiver for a streamed statement's output.
 ///
 /// [`Session::execute_streaming`] drives this instead of collecting a `Vec<Row>`: [`columns`] is
 /// called exactly once (before any row) for a row-producing statement, then [`row`] is called once
 /// per output row **as it is produced**. A `SELECT` whose top operator is linear (scan/filter/
 /// project/limit) is delivered one row at a time, so the executor never holds the whole result at
 /// once; a blocking top operator (sort/aggregate/distinct/set-op) still materializes once internally
-/// (spilling under `work_mem` per Phase 1) but is drained into the sink without a second copy.
+/// (spilling under `work_mem`) but is drained into the sink without a second copy.
 ///
 /// A sink that fails (e.g. a wire-layer write error) aborts the statement: the error propagates and,
 /// in auto-commit, rolls the implicit transaction back.
@@ -442,7 +431,7 @@ pub fn execute(plan: PhysicalPlan, engine: &dyn StorageEngine) -> Result<Executi
     }
 }
 
-/// Auto-analyze policy (D-AUTO-ANALYZE): keep the planner's statistics fresh without a manual
+/// Auto-analyze policy: keep the planner's statistics fresh without a manual
 /// `ANALYZE`.
 ///
 /// Runs `ANALYZE` on every table whose write churn since its last analyze has crossed the
@@ -703,7 +692,7 @@ pub fn show_session_variable(name: &str, settings: &HashMap<String, String>) -> 
     }
 }
 
-/// Streaming counterpart of [`execute_in_txn_as`] (Phase 2).
+/// Streaming counterpart of [`execute_in_txn_as`].
 ///
 /// Delivers a `SELECT`'s rows to `sink` one at a time instead of returning a `Vec`, so the wire
 /// server can write `DataRow` frames to the socket as rows are produced rather than buffering the
@@ -853,8 +842,8 @@ pub fn execute_in_txn_as_streaming_with_cursors(
     }
 }
 
-/// Whether `plan` is a prepared-statement statement (`PREPARE`/`EXECUTE`/`DEALLOCATE`), which needs a
-/// per-connection [`PreparedStore`] rather than the stateless execution path.
+/// Whether `plan` is a prepared-statement command (`PREPARE`/`EXECUTE`/`DEALLOCATE`), which needs
+/// a per-connection [`PreparedStore`] rather than the stateless execution path.
 #[must_use]
 pub const fn is_prepare_plan(plan: &PhysicalPlan) -> bool {
     matches!(
@@ -1469,7 +1458,7 @@ const VOLATILE_PLAN_MARKERS: [&str; 23] = [
     // `AGE(ts)` (one-argument) is relative to the current date, so its result must not be cached
     // across days (the two-argument form is deterministic, but the plan rendering cannot distinguish
     // them by name; skipping the cache for both is safe). The CamelCase `Age` is case-sensitive, so a
-    // lowercase column named `age` (or words like `average`/`page`) never collides (deep-gate).
+    // lowercase column named `age` (or words like `average`/`page`) never collides.
     "Age",
 ];
 
@@ -1868,7 +1857,7 @@ impl<'engine> Session<'engine> {
     }
 
     /// Execute one plan, delivering any output rows to `sink` one at a time instead of collecting
-    /// them into a `Vec` (Phase 2 streaming output).
+    /// them into a `Vec`.
     ///
     /// A plain `SELECT` streams row-by-row through `stream_op` (bounded to a
     /// single row for a linear pipeline; a blocking top operator still materializes once but spills
@@ -2463,7 +2452,7 @@ const fn plan_modifies_data(plan: &PhysicalPlan) -> bool {
     )
 }
 
-/// Stream a `SELECT` operator's output rows into `sink` (Phase 2). Emits the column names once,
+/// Stream a `SELECT` operator's output rows into `sink`. Emits the column names once,
 /// then pulls rows one at a time from [`stream_op`](stream::stream_op) — which streams the linear
 /// pipeline truly and materializes only an inherently blocking top operator (which spills under
 /// `work_mem`). Yields exactly the rows the buffered `run_select` would, in the same order.
@@ -2593,7 +2582,7 @@ fn dispatch(
         PhysicalPlan::DropIndex(p) => run_drop_index(&p, engine, txn),
         PhysicalPlan::SetOperation(p) => run_set_operation(&p, engine, txn),
         // The analyzer already resolved the target's existence. Persisting the comment in catalog
-        // metadata is optional treaty work (DoD), so accept it as a metadata no-op for now.
+        // metadata is optional treaty work, so accept it as a metadata no-op for now.
         PhysicalPlan::Comment(_) => Ok(ExecutionResult::Commented),
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
@@ -2874,7 +2863,7 @@ fn plan_tree_json(lines: &[String]) -> serde_json::Value {
 }
 
 /// The scanned-row count at or above which a supported single-table SELECT is routed to the
-/// vectorized batch path by default (selective routing, per the the design recommendation). The batch
+/// vectorized batch path by default (selective routing). The batch
 /// path's columnar materialization only pays off at scale — measured a ~13–15% win at 100k rows and
 /// parity at ~10k — so smaller scans stay on the
 /// row path, where they are at least as fast. The metric is the *scanned* row count (the rows the
@@ -4036,7 +4025,7 @@ pub(super) fn delete_vector_index(
     delete_view_def(engine, txn, VECTOR_INDEX_CATALOG, name)
 }
 
-/// Remove every `USING hnsw` vector index declared on `table_name` (A-UR.01c), so a
+/// Remove every `USING hnsw` vector index declared on `table_name`, so a
 /// `DROP TABLE` does not leave an orphaned vector-index declaration behind (a later same-named table
 /// would otherwise inherit a stale index). Names are collected before deleting so the catalog scan is
 /// not mutated mid-iteration.
@@ -5215,7 +5204,7 @@ fn run_create_materialized_view(
 ) -> Result<ExecutionResult, Error> {
     // IF NOT EXISTS must also no-op on an existing PLAIN view (it has no backing table, so the
     // table lookup below cannot see it) — otherwise the new backing table would silently shadow
-    // the view (audit catch: reads resolve tables before views).
+    // the view (reads resolve tables before views).
     if p.if_not_exists && load_view_def(engine, txn, VIEW_CATALOG, &p.name)?.is_some() {
         return Ok(ExecutionResult::MaterializedViewCreated);
     }
@@ -5400,7 +5389,7 @@ fn run_create_table_as(
     Ok(ExecutionResult::Created(table_id))
 }
 
-/// `CREATE [OR REPLACE] VIEW name AS <select>` (M6, non-materialized): record the defining SQL in the
+/// `CREATE [OR REPLACE] VIEW name AS <select>` (non-materialized): record the defining SQL in the
 /// view catalog so reads can inline it; no backing table is created. `OR REPLACE` overwrites an
 /// existing view; otherwise the analyzer has already rejected a name clash.
 fn run_create_view(
@@ -5511,7 +5500,7 @@ fn run_drop_view(
 }
 
 /// Engine-scoped system catalog of user-defined `ENUM` types: `(name, def)` where `def` is the
-/// labels joined by [`ENUM_LABEL_SEP`] in declaration order (B-ENUM). Same `(name, def)` text shape
+/// labels joined by [`ENUM_LABEL_SEP`] in declaration order. Same `(name, def)` text shape
 /// as [`VIEW_CATALOG`].
 const ENUM_CATALOG: &str = "nusadb_enums";
 
@@ -5519,7 +5508,7 @@ const ENUM_CATALOG: &str = "nusadb_enums";
 /// which does not occur in ordinary enum labels.
 const ENUM_LABEL_SEP: char = '\u{1f}';
 
-/// `CREATE TYPE name AS ENUM (...)` — persist the label set (B-ENUM). Rejects a name already taken by
+/// `CREATE TYPE name AS ENUM (...)`: persist the label set. Rejects a name already taken by
 /// an enum or an existing table, mirroring catalog-object uniqueness.
 fn run_create_enum(
     p: &ast::CreateEnum,
@@ -5539,7 +5528,7 @@ fn run_create_enum(
     Ok(ExecutionResult::TypeCreated)
 }
 
-/// `DROP TYPE [IF EXISTS] name` — forget a user-defined enum (B-ENUM) or composite type. Both share
+/// `DROP TYPE [IF EXISTS] name`: forget a user-defined enum or composite type. Both share
 /// the one type namespace, so this drops whichever the name denotes. A composite type still
 /// referenced by a table column is refused with a dependency error (naming the table + column),
 /// mirroring the reference engine's `DROP TYPE` dependency check.
@@ -5579,7 +5568,7 @@ fn run_drop_type(
     Ok(ExecutionResult::TypeDropped)
 }
 
-/// The ordered labels of a user-defined enum type, or `None` if no such type exists (B-ENUM).
+/// The ordered labels of a user-defined enum type, or `None` if no such type exists.
 pub fn lookup_enum(
     engine: &dyn StorageEngine,
     txn: TxnId,

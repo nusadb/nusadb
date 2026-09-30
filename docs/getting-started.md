@@ -297,8 +297,8 @@ ANALYZE;              -- every table
 ```
 
 Before loading a large dataset, read the capacity section of [deployment](deployment.md): table
-pages live in memory and a dataset larger than the resident ceiling is refused mid-load rather than
-loaded slowly.
+pages are cached and evicted, but a few index structures stay in memory and count against the
+resident bound.
 
 ---
 

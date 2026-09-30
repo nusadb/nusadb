@@ -194,7 +194,7 @@ pub(crate) struct Acc {
     any_seen: bool,
     // For `DISTINCT` aggregates: the non-`NULL` argument values already folded into this
     // accumulator, bucketed by [`distinct_hash`] so a duplicate is found in O(1) amortized instead of
-    // an O(n) scan of every prior value (the old `Vec` made `COUNT(DISTINCT)` O(n²) — A-perf). The
+    // an O(n) scan of every prior value (the old `Vec` made `COUNT(DISTINCT)` O(n²)). The
     // hash only has to satisfy "compare-equal ⇒ same bucket"; correctness is still decided by
     // [`eval::compare`] within the bucket, so a hash collision costs a comparison, never correctness.
     // Empty (and unused) for non-DISTINCT calls.
@@ -381,7 +381,7 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
             } else if matches!(call.result_ty, ColumnType::Numeric { .. }) {
                 // AVG over an exact type (Int / NUMERIC) is exact NUMERIC — `AVG(int)` divides the
                 // exact i128 sum, never an f64-accumulated one, so it stays exact past 2^53 and
-                // matches the NUMERIC division precision (Temuan-4). The sum comes from the i128
+                // matches the NUMERIC division precision. The sum comes from the i128
                 // accumulator for an integer argument or the Decimal accumulator for a NUMERIC one.
                 let sum = if call.arg.as_ref().is_some_and(|a| is_integer(a.ty)) {
                     crate::numeric::Decimal::from_i128(acc.int_sum)
@@ -1122,7 +1122,7 @@ pub(super) fn sliding_window_aggregate(
     Ok(true)
 }
 
-/// Hash a group-key tuple compatibly with [`group_keys_equal`] (A-PERF.AGG1): keys that compare
+/// Hash a group-key tuple compatibly with [`group_keys_equal`]: keys that compare
 /// equal must land in the same bucket, so the equality probe stays authoritative (a collision
 /// costs one comparison, never correctness). Each element delegates to [`distinct_hash`], which
 /// was built for exactly this invariant and already handles the traps a naive `f64`-bits hash
@@ -1138,7 +1138,7 @@ pub(super) fn sliding_window_aggregate(
 /// key repertoire contains.
 /// A fixed-seed [`ahash::AHasher`] for the hot bucketing hashes (`GROUP BY` keys, `DISTINCT`
 /// aggregate values). ahash is ~3-5× faster than the standard `DefaultHasher` (SipHash-1-3) for the
-/// short keys these paths hash per row — the residual cost QA measured on `GROUP BY`.
+/// short keys these paths hash per row, the residual cost measured on `GROUP BY`.
 ///
 /// Fixed seeds keep it **deterministic**, which the bucketing invariant requires: two values that
 /// [`eval::compare`] calls equal canonicalize to the same bytes here and so must hash to the same
@@ -1169,7 +1169,7 @@ pub(super) fn group_key_hash(key: &[ast::Value]) -> u64 {
 }
 
 /// Evaluate an aggregate argument / group key, fast-pathing the ubiquitous plain column reference
-/// (`sum(col)`, `GROUP BY col`) past the expression interpreter (A-PERF.AGG2). Mirrors
+/// (`sum(col)`, `GROUP BY col`) past the expression interpreter. Mirrors
 /// [`eval::eval`]'s `Column` arm exactly, including the malformed-tuple error.
 fn eval_arg(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
     if let crate::planner::TypedExprKind::Column(index) = expr.kind {
@@ -1181,11 +1181,10 @@ fn eval_arg(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
     eval::eval(expr, row)
 }
 
-/// First-seen-ordered group states with a hash index over the keys (A-PERF.AGG1): find-or-create
+/// First-seen-ordered group states with a hash index over the keys: find-or-create
 /// is O(1) amortized instead of a linear scan per row (O(rows × groups)). Emission order stays
-/// the `states` insertion order. Shared with the vectorized `GroupedAggregate` (A-PERF.AGG6) so
-/// both group-by paths probe **one** hash/equality contract — the F2c "coordinate with the
-/// row-path hash group-by, don't duplicate it" requirement.
+/// the `states` insertion order. Shared with the vectorized `GroupedAggregate` so
+/// both group-by paths probe **one** hash/equality contract instead of two that could drift.
 pub(crate) struct GroupIndex {
     states: Vec<(Vec<ast::Value>, Vec<Acc>)>,
     index: HashMap<u64, Vec<usize>>,
@@ -1349,7 +1348,7 @@ pub(crate) fn merge_acc(into: &mut Acc, from: Acc, call: &AggregateCall) -> Resu
 }
 
 /// Fold one row into a `COUNT(*)` accumulator — the argument-less arm of [`accumulate_row`],
-/// exposed for the vectorized grouped fold (A-PERF.AGG6), which has no row to pass. Identical to
+/// exposed for the vectorized grouped fold, which has no row to pass. Identical to
 /// that arm: every row counts, NULLs included.
 pub(crate) const fn fold_count_star(acc: &mut Acc) {
     acc.count += 1;
@@ -1541,7 +1540,7 @@ pub(super) fn accumulate_row(
 
 /// Fold one already-evaluated argument `value` into `acc` — the value-level step of
 /// [`accumulate_row`]'s single-argument arm, factored out so the vectorized columnar fold
-/// (A-PERF.AGG5b) can feed values straight off a column array in row order without materializing
+/// can feed values straight off a column array in row order without materializing
 /// rows, and still run **this exact code**. `row` is consulted only by a
 /// `STRING_AGG … ORDER BY`'s sort keys (a no-op when the call has no `ORDER BY`, which is the only
 /// shape the columnar caller sends).
@@ -1593,7 +1592,7 @@ pub(crate) fn fold_value(
             // can now feed one SUM/AVG, e.g. `SUM(CASE WHEN c THEN 0.5 ELSE 1
             // END)`. `sum` is the f64 total a FLOAT-typed result reads.
             acc.sum += value_as_f64(&value);
-            // Exact i128 total for an INT-typed result (G22).
+            // Exact i128 total for an INT-typed result.
             if let ast::Value::Int(i) = &value {
                 acc.int_sum = acc.int_sum.wrapping_add(i128::from(*i));
             }
@@ -1661,7 +1660,7 @@ pub(crate) fn fold_value(
             }
         },
         // BIT_AND/BIT_OR/BIT_XOR fold the non-NULL integers bitwise. The identity is
-        // all-ones for AND, 0 for OR/XOR (B-fn).
+        // all-ones for AND, 0 for OR/XOR.
         F::BitAnd => {
             if let ast::Value::Int(i) = value {
                 acc.bit_fold = Some(acc.bit_fold.unwrap_or(!0) & i);
@@ -1853,7 +1852,7 @@ const fn value_as_decimal(v: &ast::Value) -> Option<crate::numeric::Decimal> {
 }
 
 /// Error for a NUMERIC SUM/AVG that overflowed the `i128` mantissa. Also raised by the
-/// vectorized `SUM(INT)` path (A-PERF.AGG5a), which must fail identically to the row path.
+/// vectorized `SUM(INT)` path, which must fail identically to the row path.
 pub(crate) fn numeric_overflow() -> Error {
     Error::ArgumentOutOfDomain("numeric aggregate overflow".to_owned())
 }
@@ -2093,9 +2092,9 @@ mod tests {
         );
     }
 
-    /// The hash-index invariant the streamed group-by relies on (A-PERF.AGG1): any two keys
+    /// The hash-index invariant the streamed group-by relies on: any two keys
     /// [`crate::executor::ops::group_keys_equal`] calls equal must land in the same hash bucket.
-    /// Includes the adversarial rows a naive `f64`-bits hash gets wrong (the audit-caught set):
+    /// Includes the adversarial rows a naive `f64`-bits hash gets wrong:
     /// `-0.0`/`+0.0`, differing NaN payloads, and equal high-precision `Int`/`Numeric` values
     /// whose `mantissa as f64` rounds differently across scales. `Float`-vs-`Int`/`Numeric` pairs
     /// are deliberately absent: a single evaluated key expression never mixes those families

@@ -129,7 +129,7 @@ fn build_named_windows(
     Ok(map)
 }
 
-/// Reject `SELECT` clauses outside the Stage 4 surface.
+/// Reject `SELECT` clauses outside the supported surface.
 ///
 /// Exhaustively destructures the `Select` so a future sqlparser field cannot be silently ignored:
 /// the clauses `convert_bare_select` actually consumes are bound with `_`; every other

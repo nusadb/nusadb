@@ -246,7 +246,7 @@ async fn connection_limit_fast_rejects_with_53300_when_configured() {
     let mut first = Connection::new(TcpStream::connect(addr).await.unwrap());
     startup(&mut first).await;
 
-    // The second is refused immediately with 53300 (P-CONNCAP fast-reject) instead of queueing.
+    // The second is refused immediately with 53300 (fast-reject) instead of queueing.
     let mut second = Connection::new(TcpStream::connect(addr).await.unwrap());
     let refused = tokio::time::timeout(Duration::from_secs(2), second.read_frame())
         .await

@@ -1,4 +1,4 @@
-# p5_advanced/alter_table — ALTER TABLE column operations end-to-end (B-ddl.01).
+# p5_advanced/alter_table: ALTER TABLE column operations end-to-end.
 #
 # Exercises every operation the AlterOp treaty models: ADD / DROP / RENAME
 # COLUMN, ALTER COLUMN TYPE, SET / DROP NOT NULL — including the row rewrites

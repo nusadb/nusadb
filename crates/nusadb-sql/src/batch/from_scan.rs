@@ -111,7 +111,7 @@ impl RecordBatchScan {
 
     /// Pull and decode the next batch, or `Ok(None)` once the scan is exhausted.
     ///
-    /// AP3 batch-decode (R2 stage 2): each tuple's fields append straight to per-column TYPED
+    /// Batch decode: each tuple's fields append straight to per-column TYPED
     /// builders — the hot fixed-width types (integers, floats, booleans) parse through the same
     /// leaf readers `decode_value` uses and land as raw `Option<T>` without ever constructing an
     /// `ast::Value`; every other type falls back to the shared value codec and the ordinary
@@ -207,7 +207,7 @@ impl<T: PrimitiveType> PrimitiveBuilder<T> {
     }
 }
 
-/// One column's batch accumulator (R2 stage 2). The fixed-width variants build their value vector and
+/// One column's batch accumulator. The fixed-width variants build their value vector and
 /// validity directly ([`PrimitiveBuilder`]); `Values` is the fallback through the shared value codec +
 /// [`build_column`](super::convert::columns_to_batch) tail for every other type — so the fast path and
 /// the fallback cannot disagree on the format (both parse through `executor::row`'s single set of
@@ -216,7 +216,7 @@ enum ColumnBuilder {
     Int(PrimitiveBuilder<i64>),
     Float(PrimitiveBuilder<f64>),
     Bool(PrimitiveBuilder<bool>),
-    /// Text-family columns (R2 stage 2b): bytes append straight into the offsets+data buffers —
+    /// Text-family columns: bytes append straight into the offsets+data buffers, with
     /// no per-value `String`.
     Text(StringBuilder),
     Values {
@@ -379,7 +379,7 @@ mod tests {
         VecScan { tuples, pos: 0 }
     }
 
-    /// R2 stage 2: the typed-builder batch must be cell-for-cell identical to what the
+    /// The typed-builder batch must be cell-for-cell identical to what the
     /// row-decode + transpose path produces — across the fast fixed-width types (int family,
     /// float family, bool), the fallback types (text, numeric, date), and NULLs in every column.
     #[test]

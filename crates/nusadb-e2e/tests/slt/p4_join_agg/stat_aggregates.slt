@@ -157,7 +157,7 @@ SELECT CAST(BIT_OR(n) AS TEXT) FROM t WHERE g = 99
 ----
 NULL
 
-# --- BIT_XOR (B-fn) ---
+# --- BIT_XOR ---
 # Group 1 n = {2, 4, 6}: 010 ^ 100 ^ 110 = 000 = 0.
 query I
 SELECT BIT_XOR(n) FROM t WHERE g = 1

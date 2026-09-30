@@ -146,8 +146,9 @@ SELECT TO_CHAR(TIMESTAMP '2024-06-15 14:30:45', 'Mon DD, YYYY')
 ----
 Jun 15, 2024
 
-# The full month name (`Month`) is blank-padded to 9 characters (the width of "September"), like PG;
-# the result below is `June` followed by five spaces. The abbreviation `Mon` is not padded.
+# The full month name (`Month`) is blank-padded to 9 characters (the width of "September"), like the
+# reference engine; the result below is `June` followed by five spaces. The abbreviation `Mon` is
+# not padded.
 query T
 SELECT TO_CHAR(DATE '2024-06-15', 'Month') || '|'
 ----
@@ -372,7 +373,7 @@ SELECT MAKE_TIME(NULL, 0, 0)
 ----
 NULL
 
-# --- TIMESTAMP::DATE / ::TIME and DATE::TIMESTAMP casts (QA category-D) ---
+# --- TIMESTAMP::DATE / ::TIME and DATE::TIMESTAMP casts ---
 query T
 SELECT CAST(TIMESTAMP '2024-06-15 13:45:30' AS DATE)
 ----

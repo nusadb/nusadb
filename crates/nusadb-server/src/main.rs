@@ -37,7 +37,7 @@ struct Args {
     data_dir: String,
 
     /// Storage engine for every database in the cluster: the clustered B-link/B+tree engine
-    /// (ADR 008) — the sole engine (owner decision, 2026-07-08). `btree` is the only accepted
+    /// (ADR 008), the sole engine. `btree` is the only accepted
     /// value; the flag remains so existing `--storage-engine btree` invocations keep working,
     /// while the removed `lsm` value fails loudly at parse. A data directory written by the
     /// removed lsm engine is refused at open with a migration hint.
@@ -64,7 +64,7 @@ struct Args {
     /// Refuse a connection past --max-connections immediately with SQLSTATE 53300
     /// (`too many clients already`, the reference engine's behaviour) instead of queueing it until a slot frees
     /// (the default). Pick this when clients run behind a pool that should retry/back off on an
-    /// honest error rather than hang in the accept backlog during a connection storm. (P-CONNCAP)
+    /// honest error rather than hang in the accept backlog during a connection storm.
     #[arg(long, default_value_t = false)]
     reject_excess_connections: bool,
 
@@ -156,16 +156,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     max_txn_write_bytes: u64,
 
-    /// Global resident-memory ceiling (bytes) for each database's in-memory page store. Once its
-    /// total footprint reaches this, a row `INSERT` is failed with an honest out-of-memory error
-    /// instead of the store growing until the host OOM-kills the server. Unlike
-    /// `--max-txn-write-bytes` (one in-flight transaction) this bounds *committed-resident* data
-    /// across the whole store — the streamed bulk load that accumulates past the per-transaction
-    /// ceiling. `DELETE`/`TRUNCATE` stay available at the ceiling so space can be freed. `0` (the
-    /// default) derives a protective ceiling from the memory budget (floor 256 MiB) when a budget is
-    /// known — the engine's page share, reduced because the meter counts logical page bytes while the
-    /// real footprint runs larger, so the ceiling trips before the OS out-of-memory killer would —
-    /// and is unlimited only when no budget can be determined (a non-Linux host with no
+    /// Memory bound (bytes) for each database's page cache. Clean pages are evicted first, then
+    /// pages changed since the last checkpoint spill to a scratch file, so table data is bounded by
+    /// disk. What cannot leave memory (index entries too large for an index page and notes of
+    /// entries awaiting purge) counts against it; once that reaches the bound the next insert or
+    /// update fails with an out-of-memory error instead of the process growing until the host
+    /// kills it. `DELETE`/`TRUNCATE` stay available so space can be freed. `0` (the default)
+    /// derives a bound from the memory budget (floor 256 MiB) when a budget is known, and is
+    /// unlimited only when no budget can be determined (a non-Linux host with no
     /// `--mem-budget`). A non-zero value overrides the derived default.
     #[arg(long, default_value_t = 0)]
     max_resident_bytes: u64,
@@ -466,7 +464,7 @@ async fn serve_metrics(listener: TcpListener, metrics: std::sync::Arc<Metrics>) 
             Ok((socket, _peer)) => socket,
             Err(e) => {
                 // Back off briefly so a persistent accept error (e.g. fd exhaustion) does not spin
-                // this loop at 100% CPU (round-3 audit).
+                // this loop at 100% CPU.
                 tracing::warn!("metrics endpoint accept error: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;

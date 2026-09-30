@@ -28,7 +28,7 @@ pub(super) fn run_insert(
         (None, false)
     };
     // `INSERT ... SELECT` streams its source in bounded batches when that is provably equivalent
-    // to the materialized path (P-INSERTSEL-OOM): memory stays O(batch) instead of O(result), so
+    // to the materialized path: memory stays O(batch) instead of O(result), so
     // an ETL-sized source no longer trips the `work_mem` guard. Every non-qualifying shape falls
     // through to the materialized path below, which enforces `work_mem` loudly.
     if let InsertSource::Select(select) = &plan.source
@@ -760,7 +760,7 @@ fn finalize_updated_row(
 }
 
 /// After inserting `full_rows`, advance each `SERIAL`/`IDENTITY` column's sequence past the largest
-/// explicit value any row supplied for it (deep-gate #9b). A row that overrides a serial
+/// explicit value any row supplied for it. A row that overrides a serial
 /// column with an explicit value would otherwise leave the sequence behind, so the next auto-generated
 /// value would collide with the override — fatal for a `SERIAL PRIMARY KEY`. The sequence only moves
 /// forward (never below its current value); the advance is non-transactional, matching `nextval`.
@@ -1080,8 +1080,8 @@ fn stream_safe_source(op: &PhysicalOperator, target: nusadb_core::TableId) -> bo
     }
 }
 
-/// Stream an `INSERT ... SELECT` source into the target in [`INSERT_SELECT_BATCH`]-row batches
-/// (P-INSERTSEL-OOM): pull a batch from the streaming source, push it through [`insert_rows`],
+/// Stream an `INSERT ... SELECT` source into the target in [`INSERT_SELECT_BATCH`]-row batches:
+/// pull a batch from the streaming source, push it through [`insert_rows`],
 /// repeat. Memory is O(batch) instead of O(result), so a multi-million-row backfill no longer
 /// trips the `work_mem` guard. Only reached when [`insert_select_can_stream`] proved per-batch
 /// insertion equivalent to whole-statement insertion.
@@ -1490,8 +1490,8 @@ fn insert_rows_with_unique(
         }
     }
     // A row that supplied an explicit value for a SERIAL column must push its sequence forward so a
-    // later auto-generated value cannot collide (deep-gate #9b). A `DEFAULT` cell is not explicit —
-    // it already advanced the sequence via `apply_column_fills` — so `any_explicit`, not `covered`.
+    // later auto-generated value cannot collide. A `DEFAULT` cell is not explicit:
+    // it already advanced the sequence via `apply_column_fills`, so `any_explicit`, not `covered`.
     advance_serials_past_explicit(&fills, &any_explicit, &full_rows, engine)?;
 
     if triggers.has_after_row() {
@@ -1673,7 +1673,7 @@ fn upsert_rows(
             .map(|(_, _, row)| row.clone())
             .chain(inserts.iter().cloned())
             .collect();
-        // Serialize concurrent same-key writers before the snapshot scan (A-QA1d): a
+        // Serialize concurrent same-key writers before the snapshot scan: a
         // `DO UPDATE` matched arm that moves a key, like INSERT/UPDATE/MERGE, needs the no-wait key
         // lock or two overlapping upserts could both commit a duplicate.
         lock_unique_keys(table, &written, engine, txn)?;
@@ -1777,7 +1777,7 @@ fn upsert_rows(
         let tid = engine.insert(txn, table.id, &bytes)?;
         insert_into_indexes(&index_targets, row, tid, engine, txn)?;
     }
-    // An inserted row that supplied an explicit SERIAL value advances its sequence too (deep-gate #9b),
+    // An inserted row that supplied an explicit SERIAL value advances its sequence too,
     // matching the plain INSERT path.
     advance_serials_past_explicit(&fills, &covered, &inserts, engine)?;
 
@@ -2536,7 +2536,7 @@ fn enforce_unique_over_rows(
 }
 
 /// Reject a rewritten row whose new key collides with a row another transaction committed after this
-/// txn's snapshot (A-QA1b, the UPDATE / MERGE matched-update analogue of `enforce_unique_on_insert`).
+/// txn's snapshot (the UPDATE / MERGE matched-update analogue of `enforce_unique_on_insert`).
 /// The snapshot-based [`enforce_unique_over_rows`] cannot see such a row under REPEATABLE READ /
 /// SERIALIZABLE. Checks the `new_rows` keys against the *latest-committed* state minus the rows this
 /// statement itself rewrites, plus the new rows among themselves. The key lock the caller already
@@ -3045,7 +3045,7 @@ pub(super) fn enforce_check_on_write(
 }
 
 /// Cascade-delete `rows` from `child`, firing the child table's row-level DELETE triggers around
-/// each write (deep-gate #4). A referential action must not bypass the child's
+/// each write. A referential action must not bypass the child's
 /// audit/validation triggers the way a raw `engine.delete` would. Statement-level child triggers are
 /// intentionally not fired: a cascade is a side effect of the parent statement, and firing them
 /// inside the per-parent-row enforcement loop would fire them more than once.
@@ -3073,7 +3073,7 @@ fn cascade_delete_children(
         }
         deleted.push(row);
     }
-    // Incremental view maintenance (deep-gate #16): remove the cascade-deleted rows from any view over
+    // Incremental view maintenance: remove the cascade-deleted rows from any view over
     // the child. The child's secondary-index entries are left in place — the per-tid
     // visibility filter hides them, and VACUUM reclaims them — exactly as `run_delete` does.
     super::ivm::maintain_on_change(&child.name, &[], &deleted, engine, txn)?;
@@ -3081,7 +3081,7 @@ fn cascade_delete_children(
 }
 
 /// Cascade-update `changes` (each `(tid, old, new)`) on `child`, firing the child table's row-level
-/// UPDATE triggers around each write (deep-gate #4) — for `ON ... CASCADE` (key rewrite) and
+/// UPDATE triggers around each write, for `ON ... CASCADE` (key rewrite) and
 /// `ON ... SET NULL`. See [`cascade_delete_children`] for why statement-level triggers are not fired.
 fn cascade_update_children(
     child: &TableSchema,
@@ -3119,7 +3119,7 @@ fn cascade_update_children(
         olds.push(old);
         news.push(new);
     }
-    // Incremental view maintenance (deep-gate #16): apply the cascade rewrite's delta to any view over
+    // Incremental view maintenance: apply the cascade rewrite's delta to any view over
     // the child, so a materialized view does not go stale after a cascade.
     super::ivm::maintain_on_change(&child.name, &news, &olds, engine, txn)?;
     Ok(())
@@ -4232,12 +4232,12 @@ fn run_update_single(
     // FOREIGN KEY: each updated row must still reference an existing parent…
     let updated_rows: Vec<Row> = to_update.iter().map(|(_, _, new)| new.clone()).collect();
     if needs_unique {
-        // Serialize concurrent writers of the same key before the snapshot-based uniqueness check
-        // (deep-gate #7): two UPDATEs that set different rows to the *same* new key each scan
-        // a snapshot blind to the other and would both commit a duplicate. The no-wait key lock over
+        // Serialize concurrent writers of the same key before the snapshot-based uniqueness check:
+        // two UPDATEs that set different rows to the *same* new key each scan a
+        // snapshot blind to the other and would both commit a duplicate. The no-wait key lock over
         // the rows actually written makes the second writer abort here, exactly as the INSERT path
-        // (`enforce_unique_on_insert`) does. (The deeper frozen-snapshot case under RR/SER is the
-        // engine-level A-QA1b.)
+        // (`enforce_unique_on_insert`) does. (The deeper frozen-snapshot case under RR/SER is
+        // handled by the engine.)
         lock_unique_keys(&plan.table, &updated_rows, engine, txn)?;
         let rewritten: HashSet<Tid> = to_update.iter().map(|(tid, _, _)| *tid).collect();
         // Fast path: probe each constraint's backing index for the new keys in O(log n) under the
@@ -5461,8 +5461,8 @@ fn commit_merge_updates(
     // UNIQUE over the post-merge target state: deletes removed, updates applied (fresh inserts are
     // checked separately by `insert_rows` against the already-updated table).
     if table_has_unique_constraint(table, engine)? {
-        // Serialize concurrent writers of the same key before the snapshot scan (/ deep-gate
-        // #7): two MERGE statements that update different rows to the *same* new key each scan a
+        // Serialize concurrent writers of the same key before the snapshot scan:
+        // two MERGE statements that update different rows to the *same* new key each scan a
         // snapshot blind to the other and would both commit a duplicate. The no-wait key lock over
         // the rows actually written makes the second writer abort, exactly as the INSERT path does.
         lock_unique_keys(table, &new_rows, engine, txn)?;
@@ -5480,7 +5480,7 @@ fn commit_merge_updates(
             );
         }
         enforce_unique_over_rows(table, &result_rows, engine)?;
-        // A-QA1b: also reject a new key that collides with a row another txn committed after a frozen
+        // Also reject a new key that collides with a row another txn committed after a frozen
         // RR/SER snapshot — the snapshot-based check above cannot see it. The rewritten set is the
         // matched UPDATE *and* DELETE tids (their old keys no longer occupy the space).
         let mut rewritten = deleted_tids;

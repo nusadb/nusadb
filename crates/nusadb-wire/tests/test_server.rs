@@ -90,12 +90,12 @@ async fn point_get_runs_inline_and_fallback_stays_correct() {
     let mut conn = Connection::new(client);
     start_session(&mut conn).await;
 
-    query(&mut conn, "CREATE TABLE pg3 (id INT PRIMARY KEY, v TEXT)").await;
+    query(&mut conn, "CREATE TABLE pt3 (id INT PRIMARY KEY, v TEXT)").await;
     assert_eq!(next(&mut conn).await, cc("CREATE TABLE"));
     consume_until_ready(&mut conn).await;
     query(
         &mut conn,
-        "INSERT INTO pg3 VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "INSERT INTO pt3 VALUES (1, 'a'), (2, 'b'), (3, 'c')",
     )
     .await;
     assert_eq!(next(&mut conn).await, cc("INSERT 3"));
@@ -104,7 +104,7 @@ async fn point_get_runs_inline_and_fallback_stays_correct() {
     // The unique-key lookup: exactly one row, and the inline counter must advance (tests share
     // the process, so assert a monotonic increase, not an exact delta).
     let before = nusadb_wire::server::inline_point_get_count();
-    query(&mut conn, "SELECT v FROM pg3 WHERE id = 2").await;
+    query(&mut conn, "SELECT v FROM pt3 WHERE id = 2").await;
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::RowDescription {
@@ -129,7 +129,7 @@ async fn point_get_runs_inline_and_fallback_stays_correct() {
     assert_eq!(next(&mut conn).await, cc("BEGIN"));
     consume_until_ready_in_txn(&mut conn).await;
     let before_txn = nusadb_wire::server::inline_point_get_count();
-    query(&mut conn, "SELECT v FROM pg3 WHERE id = 3").await;
+    query(&mut conn, "SELECT v FROM pt3 WHERE id = 3").await;
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::RowDescription {
@@ -149,13 +149,13 @@ async fn point_get_runs_inline_and_fallback_stays_correct() {
     assert_eq!(next(&mut conn).await, cc("COMMIT"));
     consume_until_ready(&mut conn).await;
 
-    // The TRUE PUNT path (audit): an equality conjunct on a NON-indexed column IS a
+    // The TRUE PUNT path: an equality conjunct on a NON-indexed column IS a
     // syntactic candidate, but it plans to a SeqScan — the plan-shape gate refuses INSIDE the
     // inline attempt and re-dispatches the cloned statement to the pool. The result must be
     // exact and the fires counter must NOT advance (the extended-query tests never touch the
     // simple-query inline gate, so the counter is quiet across this window).
     let before_punt = nusadb_wire::server::inline_point_get_count();
-    query(&mut conn, "SELECT id FROM pg3 WHERE v = 'a'").await;
+    query(&mut conn, "SELECT id FROM pt3 WHERE v = 'a'").await;
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::RowDescription {
@@ -178,7 +178,7 @@ async fn point_get_runs_inline_and_fallback_stays_correct() {
 
     // A range predicate is not even a candidate (no equality conjunct) — it skips the inline
     // branch entirely and answers from the pool: two rows in key order.
-    query(&mut conn, "SELECT v FROM pg3 WHERE id > 1 ORDER BY id").await;
+    query(&mut conn, "SELECT v FROM pt3 WHERE id > 1 ORDER BY id").await;
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::RowDescription {
@@ -201,7 +201,7 @@ async fn point_get_runs_inline_and_fallback_stays_correct() {
     consume_until_ready(&mut conn).await;
 
     // A miss on the inline path is an empty, well-formed result — not an error.
-    query(&mut conn, "SELECT v FROM pg3 WHERE id = 99").await;
+    query(&mut conn, "SELECT v FROM pt3 WHERE id = 99").await;
     assert_eq!(
         next(&mut conn).await,
         BackendMessage::RowDescription {
@@ -426,7 +426,7 @@ async fn explicit_transactions_over_the_wire() {
     handle.await.unwrap().unwrap();
 }
 
-/// Savepoints over the wire (A-UR.03): `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` work inside a
+/// Savepoints over the wire: `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` work inside a
 /// transaction; `ROLLBACK TO SAVEPOINT` undoes only the work after the savepoint and recovers a
 /// failed transaction; a savepoint outside a transaction block is rejected.
 #[tokio::test]
@@ -620,7 +620,7 @@ async fn full_session_over_the_wire() {
 }
 
 /// `SET` / `SHOW` / `RESET` work over the wire against a per-connection GUC store, and
-/// `current_setting` reflects an earlier `SET` — closing the QA gap where `SHOW <guc>` over the wire
+/// `current_setting` reflects an earlier `SET`: closing the gap where `SHOW <guc>` over the wire
 /// was rejected with "session-control requires a Session".
 #[tokio::test]
 async fn set_show_and_reset_session_variable_over_the_wire() {
@@ -995,7 +995,7 @@ async fn reused_prepared_statement_returns_each_parameters_rows() {
     handle.await.unwrap().unwrap();
 }
 
-/// G6: `Describe(Portal)` must report row metadata WITHOUT executing the statement — a mutating
+/// `Describe(Portal)` must report row metadata WITHOUT executing the statement: a mutating
 /// statement must not take effect until `Execute`.
 #[tokio::test]
 async fn describe_portal_does_not_execute_the_statement() {
@@ -1135,7 +1135,7 @@ async fn describe_portal_does_not_execute_the_statement() {
     handle.await.unwrap().unwrap();
 }
 
-/// G7: Describe(Statement) reports the real number of `$n` placeholders in the prepared statement,
+/// Describe(Statement) reports the real number of `$n` placeholders in the prepared statement,
 /// not a hard-coded 0, so a driver that introspects parameter count binds correctly.
 #[tokio::test]
 async fn describe_statement_reports_parameter_count() {
@@ -2929,7 +2929,7 @@ async fn terminate_conn(
     handle.await.unwrap().unwrap();
 }
 
-/// A multi-row `SELECT` streams every row to the socket in order (Phase 2): `RowDescription`,
+/// A multi-row `SELECT` streams every row to the socket in order: `RowDescription`,
 /// then one `DataRow` per row, then `CommandComplete` with the right count — the streamed frame
 /// sequence is exactly what the buffered path produced.
 #[tokio::test]
@@ -3097,7 +3097,7 @@ async fn typed_row_description_negotiated_by_minor() {
 /// `INSERT/UPDATE ... RETURNING` runs buffered then replays its row set into the wire sink, but it
 /// must still advertise the projection's real per-column types — like a streamed SELECT — rather than
 /// letting every column default to text. A strict-typed driver relies on `RETURNING id` being an
-/// integer, not a string (QA RETURNING-type finding).
+/// integer, not a string.
 #[tokio::test]
 async fn returning_row_description_is_typed() {
     use nusadb_core::ColumnType;
@@ -3146,7 +3146,7 @@ async fn returning_row_description_is_typed() {
 
 /// Protocol 1.2: an `ARRAY` column's type tag carries its element type for a `minor >= 2` connection
 /// (so a client decodes the elements at their real type), while a `minor = 1` connection keeps the
-/// plain `0x0F` ARRAY tag — backward compatible (array-elem-text finding).
+/// plain `0x0F` ARRAY tag, so it stays backward compatible.
 #[tokio::test]
 async fn array_column_tag_carries_element_type_at_minor_2() {
     use nusadb_core::{ArrayElem, ColumnType};
@@ -3299,7 +3299,7 @@ async fn query_response_is_coalesced_into_a_single_write() {
     handle.await.unwrap().unwrap();
 }
 
-/// P-ISOLATION: the isolation level is honored over the wire, requested any of the three ways.
+/// the isolation level is honored over the wire, requested any of the three ways.
 ///
 /// Observable behavior, not just a command tag: a REPEATABLE READ transaction keeps its snapshot
 /// while a concurrent connection commits a row — under the old code every wire transaction ran

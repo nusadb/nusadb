@@ -1,8 +1,8 @@
-# p1_ddl/int_range — narrow integer width is enforced AND the declared type round-trips (K4/K6).
+# p1_ddl/int_range: narrow integer width is enforced AND the declared type round-trips.
 #
 # SMALLINT / INT / TINYINT / MEDIUMINT are stored as a 64-bit INT, but a value outside the declared
 # width is rejected at write time via a desugared range CHECK ("col" BETWEEN lo AND hi) rather than
-# silently stored (the K4/K6 silent-overflow bug). BIGINT spans the full i64 and needs no check.
+# silently stored (a silent-overflow bug). BIGINT spans the full i64 and needs no check.
 # NULL is always allowed (a CHECK is not violated by NULL). SMALLINT/BIGINT additionally keep their
 # declared type so it round-trips in SHOW COLUMNS / information_schema (no longer collapsed to INT).
 
@@ -56,7 +56,7 @@ SELECT id, s FROM t WHERE s IS NOT NULL ORDER BY id
 1 32767
 2 -32768
 
-# Declared-type fidelity (K4/K6): SMALLINT and BIGINT round-trip in SHOW COLUMNS instead of
+# Declared-type fidelity: SMALLINT and BIGINT round-trip in SHOW COLUMNS instead of
 # collapsing to INT; plain INT still renders INT.
 query TTI
 SHOW COLUMNS FROM t

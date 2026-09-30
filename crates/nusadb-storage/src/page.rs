@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn try_from_bytes_rejects_overlapping_slots() {
-        // G26: a forged page whose two slots cover the same bytes would alias one tuple as two.
+        // A forged page whose two slots cover the same bytes would alias one tuple as two.
         // The per-slot bound check passes (both lie within [fso, PAGE_SIZE)); the disjointness
         // check must reject it. A genuine two-tuple page is still accepted.
         let mut good = Page::init(PageId(3));

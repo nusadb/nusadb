@@ -70,8 +70,8 @@ SELECT t FROM events WHERE id = 3
 statement error
 INSERT INTO events VALUES (4, '2024-99-99', NULL, NULL, NULL)
 
-# --- A timestamp literal with no time part is midnight (PG parity); this also makes age() work on
-# date-only timestamp literals (Q deep-probe #5: age(TIMESTAMP '…') no longer errors). ---
+# --- A timestamp literal with no time part is midnight (as in the reference engine); this also
+# makes age() work on date-only timestamp literals (age(TIMESTAMP '…') no longer errors). ---
 query T
 SELECT TIMESTAMP '2024-03-15'
 ----
@@ -89,7 +89,7 @@ SELECT age(TIMESTAMP '2024-03-15', TIMESTAMP '2020-01-10')::text
 4 years 2 mons 5 days
 
 # --- AT TIME ZONE: TIMESTAMP<->TIMESTAMPTZ conversion for UTC and fixed offsets.
-# A fixed-offset *string* follows PG's POSIX sign convention — `'+05:00'` names a zone five hours
+# A fixed-offset *string* follows the POSIX sign convention: `'+05:00'` names a zone five hours
 # WEST of UTC (UTC-5), the opposite of ISO 8601. A named DST zone is rejected. ---
 
 # TIMESTAMP AT TIME ZONE 'UTC' reads the wall clock as UTC -> the same instant as a timestamptz.
@@ -98,7 +98,8 @@ SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE 'UTC')::text
 ----
 2024-01-01 12:00:00+00
 
-# '+05:00' is UTC-5 (POSIX), so wall 12:00 there is 17:00 UTC (matches PG, not the ISO 07:00).
+# '+05:00' is UTC-5 (POSIX), so wall 12:00 there is 17:00 UTC (as the reference engine has it,
+# not the ISO 07:00).
 query T
 SELECT (TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE '+05:00')::text
 ----

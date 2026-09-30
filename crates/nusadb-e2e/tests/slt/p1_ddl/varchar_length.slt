@@ -1,4 +1,4 @@
-# p1_ddl/varchar_length — VARCHAR(n) / CHAR(n) length is enforced (D3, friend-QA R44) and the
+# p1_ddl/varchar_length: VARCHAR(n) / CHAR(n) length is enforced and the
 # declared type round-trips in DDL.
 #
 # VARCHAR(n)/CHAR(n) are stored as TEXT but keep n so `SHOW COLUMNS` reports the declared type. The
@@ -91,8 +91,8 @@ SELECT count(*) FROM c WHERE k = 'ab'
 2
 
 # --- CHAR(n) column bpchar end-to-end: length / equality / DISTINCT / GROUP BY all see the canonical
-# (trimmed) value, so trailing blanks never split a group or inflate a distinct count (QA pin
-# ). 'ab', 'ab ', 'ab   ' all store 'ab'; 'cd' is the only other value. ---
+# (trimmed) value, so trailing blanks never split a group or inflate a distinct count.
+# 'ab', 'ab ', 'ab   ' all store 'ab'; 'cd' is the only other value. ---
 statement ok
 CREATE TABLE cb (k CHAR(5))
 
@@ -127,7 +127,7 @@ SELECT k, count(*) FROM cb GROUP BY k ORDER BY k
 ab  3
 cd  1
 
-# --- CHAR(n) / bpchar CAST: trailing blanks are insignificant for length + equality (QA re-surface).
+# --- CHAR(n) / bpchar CAST: trailing blanks are insignificant for length + equality.
 # `x::char(n)` truncates to n then trims trailing spaces (its canonical form), so length() ignores
 # trailing blanks and two values comparing equal after trimming are equal — the blank-padded
 # semantics. VARCHAR(n) keeps trailing blanks (varying). ---

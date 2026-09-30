@@ -58,7 +58,7 @@ pub(super) fn count_table(
 
 /// Like [`scan_table`], but with *latest-committed* visibility (plus this txn's own writes) for a
 /// uniqueness check that must not miss a row another transaction committed after a frozen REPEATABLE
-/// READ / SERIALIZABLE snapshot (A-QA1b). Keeps the `Tid` so a caller can exclude the rows it is itself
+/// READ / SERIALIZABLE snapshot. Keeps the `Tid` so a caller can exclude the rows it is itself
 /// rewriting.
 pub(super) fn scan_table_committed(
     table: &TableSchema,
@@ -75,7 +75,7 @@ pub(super) fn scan_table_committed(
     Ok(out)
 }
 
-/// Materialize a table's rows for a uniqueness / `PRIMARY KEY` constraint check (A-QA1b): unlike
+/// Materialize a table's rows for a uniqueness / `PRIMARY KEY` constraint check: unlike
 /// [`scan_rows`], this reads the *latest committed* state (plus this txn's own writes) rather than the
 /// txn's frozen snapshot, so a row another transaction committed after a REPEATABLE READ / SERIALIZABLE
 /// txn began is still seen and a duplicate key is rejected.

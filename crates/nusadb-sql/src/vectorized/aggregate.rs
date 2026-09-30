@@ -6,7 +6,7 @@
 //! ([`simd`](crate::vectorized::simd)); `COUNT` is a null-skipping tally. Any other call whose
 //! argument is a bare column (`FLOAT`/`NUMERIC` SUM/AVG/MIN/MAX, `DISTINCT`, ordered-set, …)
 //! folds **directly over the column** through the row path's own accumulate/finalize code
-//! (A-PERF.AGG5b) — sequential, so float rounding is bit-identical — without materializing a
+//! (sequential, so float rounding is bit-identical) without materializing a
 //! `Vec<Row>`. Only a call that truly needs rows (computed argument, `FILTER`, second argument,
 //! `ORDER BY`, `GROUPING`, `ARRAY_AGG`) falls back to the shared row evaluator
 //! ([`fold_aggregates`](crate::executor::agg::fold_aggregates)) over materialized rows.
@@ -16,8 +16,7 @@
 //! integer `SUM`/`AVG`) take the SIMD path. `FLOAT` `SUM` and `FLOAT` `MIN`/`MAX` deliberately stay
 //! scalar — a SIMD `f64` SUM reorders the (non-associative) adds and `_mm256_min_pd` mishandles
 //! `NaN`, either of which would make a query's result depend on the host's instruction set.
-//! Bit-exact batch=row results are a correctness/determinism invariant for the engine
-//! (2026-06-14).
+//! Bit-exact batch=row results are a correctness/determinism invariant for the engine.
 
 use std::sync::Arc;
 
@@ -85,7 +84,7 @@ fn int_values(batches: &[RecordBatch], idx: usize) -> Option<Vec<i64>> {
 }
 
 /// The non-null values of column `idx` as `i64`s when the column is one of the integer-backed
-/// temporal types, plus the constructor back to the column's value variant (A-PERF.AGG5c / F2d).
+/// temporal types, plus the constructor back to the column's value variant.
 /// `Date` widens from its `i32` day count (order-preserving, lossless); `Time`/`Timestamp`/
 /// `TimestampTz` are microsecond counts; `TimeTz`'s packed form orders exactly like the timetz
 /// comparison, so an `i64` MIN/MAX picks the correct element. `None` for any other column type.
@@ -177,9 +176,9 @@ fn simd_aggregate(
     match call.func {
         F::Count => Some(Ok(ast::Value::Int(nonnull_count(batches, idx)?))),
         // MIN/MAX over an INT or integer-backed temporal column reduce bit-exactly via SIMD
-        // (order-independent, no overflow; A-PERF.AGG5c widened the temporal family onto the same
-        // i64 kernels). A FLOAT/NUMERIC column returns `None` → the row path, whose total-order
-        // compare handles NaN exactly and which the SIMD float min/max would not match.
+        // (order-independent, no overflow; the temporal family shares the same i64 kernels). A
+        // FLOAT/NUMERIC column returns `None` → the row path, whose total-order compare handles NaN
+        // exactly and which the SIMD float min/max would not match.
         F::Min | F::Max => {
             let (vals, wrap): TemporalColumn = match int_values(batches, idx) {
                 Some(vals) => (vals, ast::Value::Int),
@@ -192,7 +191,7 @@ fn simd_aggregate(
             };
             Some(Ok(m.map_or(ast::Value::Null, wrap)))
         },
-        // SUM over an integer column with an integer result (A-PERF.AGG5a / F2a): integer addition
+        // SUM over an integer column with an integer result: integer addition
         // is associative, so the SIMD block reduction equals the row path's sequential `i128`
         // accumulator bit-for-bit, and the finalize is the row path's exact contract — `i64` on
         // success, the same overflow error otherwise. A NUMERIC-typed result (decimal
@@ -210,7 +209,7 @@ fn simd_aggregate(
         },
         // AVG over an integer column with the NUMERIC result the analyzer assigns it: the exact
         // `i128` sum divides by the non-NULL count through the same Decimal division as the row
-        // path's finalize (G22 — exact past 2^53). Any other typing falls through to the row path.
+        // path's finalize (exact past 2^53). Any other typing falls through to the row path.
         F::Avg if is_integer(arg.ty) && matches!(call.result_ty, ColumnType::Numeric { .. }) => {
             let vals = int_values(batches, idx)?;
             if vals.is_empty() {
@@ -245,7 +244,7 @@ pub(super) enum ColumnarShape {
 /// argument, `FILTER` (row predicate), a second argument, `ORDER BY` sort keys, `GROUPING` (folds
 /// no values), or `ARRAY_AGG` (keeps NULLs; folds outside the single-value path). Shared by the
 /// scalar [`columnar_fold`] and the grouped operator
-/// ([`super::GroupedAggregate`], A-PERF.AGG6) so both admit exactly the same call shapes.
+/// ([`super::GroupedAggregate`]) so both admit exactly the same call shapes.
 pub(super) fn columnar_call_shape(call: &AggregateCall) -> Option<ColumnarShape> {
     use ast::AggregateFunc as F;
     if call.filter.is_some() || call.arg2.is_some() || !call.order_by.is_empty() {
@@ -273,7 +272,7 @@ pub(super) fn columnar_call_shape(call: &AggregateCall) -> Option<ColumnarShape>
     }
 }
 
-/// Fold one non-SIMD-eligible call **directly over its argument column** (A-PERF.AGG5b / F2b), or
+/// Fold one non-SIMD-eligible call **directly over its argument column**, or
 /// `None` when [`columnar_call_shape`] says the call needs row evaluation. The column's values
 /// feed [`fold_value`] + [`finalize_aggregate`] — the very code the row path runs, in the same
 /// row order — so the result is bit-identical to `batch_to_rows` + `fold_aggregates` (float SUM's
@@ -327,7 +326,7 @@ impl Operator for ScalarAggregate {
                 value?
             } else if let Some(value) = columnar_fold(call, &batches) {
                 // Not SIMD-eligible but a bare-column argument: fold the column directly through
-                // the row path's own accumulate/finalize code (A-PERF.AGG5b) — bit-identical,
+                // the row path's own accumulate/finalize code, bit-identical,
                 // no `Vec<Row>`.
                 value?
             } else {
@@ -482,7 +481,7 @@ mod tests {
         }
     }
 
-    /// A-PERF.AGG5c / F2d: MIN/MAX over the integer-backed temporal columns takes the SIMD i64
+    /// MIN/MAX over the integer-backed temporal columns takes the SIMD i64
     /// kernels and matches the row-path fold exactly (the scalar oracle), NULLs skipped, empty →
     /// NULL. TIMETZ exercises the packed representation, whose i64 order is the timetz order.
     #[test]
@@ -524,9 +523,9 @@ mod tests {
         }
     }
 
-    /// A-PERF.AGG5a / F2a: SUM (integer result) and AVG (NUMERIC result) over an integer column
+    /// SUM (integer result) and AVG (NUMERIC result) over an integer column
     /// take the exact-i128 SIMD kernel and match the row-path fold bit-for-bit — including values
-    /// past 2^53, where an f64-accumulated sum would silently round (G22).
+    /// past 2^53, where an f64-accumulated sum would silently round.
     #[test]
     fn sum_avg_int_matches_row_path_oracle() {
         use ast::AggregateFunc::{Avg, Sum};
@@ -559,7 +558,7 @@ mod tests {
         }
     }
 
-    /// A-PERF.AGG5b / F2b: every bare-column call the SIMD kernels do not cover folds directly
+    /// Every bare-column call the SIMD kernels do not cover folds directly
     /// over the column and must equal the row-path fold exactly — float adversaries (NaN, ±0.0,
     /// ±inf: sequential rounding + total-order MIN/MAX), exact NUMERIC past 2^53, DISTINCT dedup,
     /// TEXT MIN/MAX, and an ordered-set percentile. Results compare via `Debug` (Value's
@@ -661,7 +660,7 @@ mod tests {
         }
     }
 
-    /// A-PERF.AGG5a: an integer SUM that overflows `i64` fails on the SIMD path with **the same
+    /// An integer SUM that overflows `i64` fails on the SIMD path with **the same
     /// error** the row path raises — never a wrapped or truncated value.
     #[test]
     fn sum_int_overflow_errors_like_the_row_path() {

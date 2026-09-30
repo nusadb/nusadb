@@ -851,8 +851,8 @@ fn encode_numeric(
     Ok(())
 }
 
-/// Read one field's NULL/PRESENT tag: `(present, payload position)` — the tag step the
-/// vectorized typed builders walk tuples with (R2 stage 2). Same semantics as the inline tag
+/// Read one field's NULL/PRESENT tag: `(present, payload position)`, the tag step the
+/// vectorized typed builders walk tuples with. Same semantics as the inline tag
 /// handling in [`decode`]/[`decode_projected`], including the error offset for an unknown tag.
 #[inline]
 pub(crate) fn field_tag(bytes: &[u8], pos: usize) -> Result<(bool, usize), Error> {
@@ -866,7 +866,7 @@ pub(crate) fn field_tag(bytes: &[u8], pos: usize) -> Result<(bool, usize), Error
     }
 }
 
-/// The shared leaf readers (R2 stage 2): [`decode_value`] and the vectorized typed builders both
+/// The shared leaf readers: [`decode_value`] and the vectorized typed builders both
 /// parse fixed-width payloads through these, so the row and columnar paths read identical bytes
 /// by construction. Each returns `(value, next position)`.
 #[inline]
@@ -891,7 +891,7 @@ pub(crate) fn read_f64_field(bytes: &[u8], pos: usize) -> Result<(f64, usize), E
     Ok((f64::from_le_bytes(arr), pos + 8))
 }
 
-/// Text leaf reader (R2 stage 2b): a length-prefixed, UTF-8-validated **borrowed** `&str` and
+/// Text leaf reader: a length-prefixed, UTF-8-validated **borrowed** `&str` and
 /// the next position — the caller decides whether to own it ([`decode_value`] builds a `String`;
 /// the vectorized text builder appends the bytes straight into its offsets+data buffers).
 #[inline]
@@ -910,7 +910,7 @@ pub(crate) fn read_text_field(bytes: &[u8], pos: usize) -> Result<(&str, usize),
 }
 
 /// Decode one PRESENT field's payload at `pos` (the byte after its tag) — the entry the
-/// vectorized builders' fallback uses for non-fixed-width types (R2 stage 2).
+/// vectorized builders' fallback uses for non-fixed-width types.
 #[inline]
 pub(crate) fn decode_present_value(
     bytes: &[u8],

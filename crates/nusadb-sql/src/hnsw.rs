@@ -1,5 +1,5 @@
 //! In-memory HNSW (Hierarchical Navigable Small World) approximate nearest-neighbour index for
-//! `VECTOR(n)` columns — **increment 1: the standalone algorithm core + its recall oracle**.
+//! `VECTOR(n)` columns: the algorithm core and its recall oracle.
 //!
 //! The current KNN path (`ORDER BY v <=> q LIMIT k`) is an exact `O(n·dim)` scan per query. HNSW
 //! trades a small, bounded loss of recall for roughly logarithmic search by navigating a multi-layer

@@ -3,7 +3,8 @@
 //!
 //! Every leaf value carries a [`RowMeta`] header (`xmin`, `xmax`, undo pointer); superseded
 //! versions live in the engine's undo arena; readers resolve visibility through a [`ReadView`]
-//! (see [`crate::mvcc`]). Snapshot discipline matches the predecessor engine's (removed 2026-07-09; its semantics were kept so the engine swap changed no observable behavior): `READ COMMITTED` /
+//! (see [`crate::mvcc`]). Snapshot discipline matches the one the engine has always
+//! exposed: `READ COMMITTED` /
 //! `READ UNCOMMITTED` take a **fresh view at every read** (statement-level), `REPEATABLE READ` /
 //! `SERIALIZABLE` pin the view taken at `BEGIN`. `REPEATABLE READ` is snapshot isolation (write
 //! skew permitted — snapshot isolation's documented contract). `SERIALIZABLE` adds a **row-level read-write
@@ -116,7 +117,7 @@ impl std::fmt::Debug for Wal {
 ///
 /// [`BtreeEngine::new`] is in-memory (tests, scratch work); [`BtreeEngine::open`] is durable —
 /// every committed transaction survives `kill -9` (see [`crate::wal`]). See the crate docs for
-/// the design shape and the per-phase limitations.
+/// the design shape.
 ///
 /// # Latching discipline (the global `Mutex<State>` is gone)
 ///
@@ -352,9 +353,9 @@ struct TxnDomain {
     /// visible to new readers (`finish_commit`). Snapshotted at a `SERIALIZABLE` reader's
     /// BEGIN. The skip fires only when `staged_now == finished_at_begin` — a writer anywhere in
     /// the staged-but-unfinished window (whose writes the reader cannot see but whose commit
-    /// already outranks the reader's) makes the two differ, forcing full validation. Audit
-    /// catch: a single stage-time map let a reader that began during a writer's fsync inherit
-    /// the bump into its baseline while not seeing the rows — hiding a write-skew abort.
+    /// already outranks the reader's) makes the two differ, forcing full validation.
+    /// Without this, a single stage-time map let a reader that began during a writer's fsync
+    /// inherit the bump into its baseline while not seeing the rows, hiding a write-skew abort.
     table_write_versions_finished: HashMap<u64, u64>,
 }
 
@@ -6147,7 +6148,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         t.next_txn_id += 1;
         t.active.insert(id);
         // Snapshot the FINISHED-instant versions (only when the check will consult them —
-        // audit perf note: never clone on the non-SERIALIZABLE fast path).
+        // never clone on the non-SERIALIZABLE fast path).
         let write_versions = if matches!(level, IsolationLevel::Serializable) {
             t.table_write_versions_finished.clone()
         } else {

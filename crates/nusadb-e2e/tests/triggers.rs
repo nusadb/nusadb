@@ -77,7 +77,7 @@ fn after_insert_row_trigger_fires_per_row_with_new_binding() {
 
 #[test]
 fn before_insert_row_trigger_fires_before_the_write() {
-    // A-G09.11: a BEFORE INSERT row trigger fires before the new row is written. Proven by having the
+    // a BEFORE INSERT row trigger fires before the new row is written. Proven by having the
     // trigger record the table's row count: it observes the PRE-insert count (1), not the post (2).
     let engine = BtreeEngine::new();
     setup(&engine);
@@ -372,7 +372,7 @@ fn recursion_limit_aborts_runaway_cascade() {
 
 #[test]
 fn reentrant_before_update_of_the_same_row_aborts_rather_than_losing_the_trigger_write() {
-    // A-G09.11b: a BEFORE UPDATE row trigger whose body updates the *same row* is the dangerous
+    // a BEFORE UPDATE row trigger whose body updates the *same row* is the dangerous
     // re-entrant case — the parent's write loop holds the row's pre-trigger tid, so a "completed"
     // trigger write could be silently overwritten (last-writer-wins, trigger change lost). It cannot
     // complete: the parent applies the row write only *after* the BEFORE trigger returns, so the

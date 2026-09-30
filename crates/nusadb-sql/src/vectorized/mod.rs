@@ -227,7 +227,7 @@ fn try_build(
             };
             Box::new(ScalarAggregate::new(child, calls.clone()))
         },
-        // Grouped aggregate (GROUP BY, A-PERF.AGG6 / F2c): the vectorized hash group-by covers
+        // Grouped aggregate (GROUP BY): the vectorized hash group-by covers
         // bare-column keys + columnar-foldable calls, sharing the row path's GroupIndex + fold
         // machinery so the output multiset AND first-seen emission order are identical. When
         // spill-to-disk is configured, the row path's bounded-memory sort-based group-by is
@@ -309,7 +309,7 @@ fn try_build(
     Ok(Some(built))
 }
 
-/// The R5 parallel attempt shared by the grouped and scalar aggregate arms: engage
+/// The parallel attempt shared by the grouped and scalar aggregate arms: engage
 /// [`ParallelGroupedAggregate`] when the aggregate sits over a (filtered) table scan and every
 /// gate passes, else `None` (the caller builds the sequential operator).
 #[allow(

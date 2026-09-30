@@ -159,7 +159,7 @@ mod search_path_tests {
         assert_eq!(cs(Some("  app  ")), "app");
         assert_eq!(cs(Some("'app'")), "app");
         assert_eq!(cs(Some("\"app\"")), "app");
-        // A list takes the first entry (NS3 current-schema model).
+        // A list takes the first entry.
         assert_eq!(cs(Some("app, public")), "app");
         assert_eq!(cs(Some("reporting,app,public")), "reporting");
     }

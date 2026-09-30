@@ -55,7 +55,7 @@ fn tuple(key: u64) -> Vec<u8> {
 
 #[test]
 #[ignore = "manual perf probe — run with --release -- --ignored --nocapture"]
-fn r4_point_get_hop_split() {
+fn point_get_hop_split() {
     // ---- production 2-hop path: engine + unique index maintained like the SQL layer does ----
     let engine = BtreeEngine::new();
     let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();

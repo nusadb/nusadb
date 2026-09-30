@@ -34,16 +34,16 @@
 //! cadence is wired at the composition root. Structural reclamation of empty/underfull
 //! leaf *pages* (they stay in the chain today) arrives with page-store persistence.
 //!
-//! Below it, **secondary indexes, payload = row-id**, on top of the durable
-//! engine. The full treaty index family is live — `create_index`/`drop_index` (rollback-aware
-//! DDL), `index_insert`/`index_delete` (buffered with the transaction, undone on rollback,
-//! WAL-logged for recovery), `index_scan` (ascending key order over `[lo, hi]`; every entry is
-//! a **pointer** resolved against the caller's read view at the clustered heap — the 2-hop of
-//! ADR 008 §D2 · so stale entries filter out naturally), plus `lookup_index`/`list_indexes`/
-//! `index_is_complete` and `txn_isolation` (the SQL layer's guard against index scans under a
-//! frozen snapshot), and — since the constraint/catalog family landed (//! unblocking CREATE TABLE / the QA SQL-verify) — the full constraint/catalog surface:
+//! Below it, **secondary indexes, payload = row-id**, on top of the durable engine. The full treaty
+//! index family is live: `create_index`/`drop_index` (rollback-aware DDL),
+//! `index_insert`/`index_delete` (buffered with the transaction, undone on rollback, WAL-logged for
+//! recovery), `index_scan` (ascending key order over `[lo, hi]`; every entry is a **pointer**
+//! resolved against the caller's read view at the clustered heap, the 2-hop of ADR 008 §D2, so
+//! stale entries filter out naturally), plus `lookup_index`/`list_indexes`/`index_is_complete` and
+//! `txn_isolation` (the SQL layer's guard against index scans under a frozen snapshot), and
+//! the full constraint/catalog surface:
 //! `add_unique_constraint` (PK/UNIQUE with backing unique index, at-most-one-PK),
-//! `add_check_constraint`, `drop_constraint` (FK-RESTRICT guard), the **sequence family**
+//! `add_check_constraint`, `drop_constraint` (FK-RESTRICT guard),
 //! **DDL evolution** (`alter_table` — ADD/DROP/RENAME column, RENAME table, ALTER TYPE,
 //! SET/DROP NOT NULL, schema-versioned + `schema_for_version`/`current_schema_version`; the SQL
 //! layer eagerly rewrites rows on ALTER so no per-row lazy migration is needed — plus
@@ -53,21 +53,15 @@
 //! before the value escapes so a crash never repeats one; a rolled-back create is neutralized
 //! by an equally-durable drop record), `list_constraints`/
 //! `has_unique_constraint`, `add_foreign_key`/`list_foreign_keys`/`fk_check`/`fk_on_delete`
-//! (cascade one level), `analyze_table`/`table_stats`/`row_count`, and version-0
-//! `schema_for_version`/`current_schema_version` (no ALTER yet). All rollback-aware,
+//! (cascade one level), and `analyze_table`/`table_stats`/`row_count`. All rollback-aware,
 //! WAL-durable, savepoint-compensated. Unique indexes byte-check against **live** heap rows,
 //! with constraint-**backing** indexes exempt (the SQL layer owns the semantics).
-//! Entries live in a sorted
-//! in-memory map rebuilt from the WAL on open — the page-native key-bytes B-link index tree
-//! rides in with page-store persistence (phase 2), when *any* structure stops being
-//! log-rebuilt. Durability semantics unchanged: commit-fsync durability point, committed-only
-//! two-pass replay, torn-tail truncation, savepoint compensation (now covering index ops and
-//! re-logging live rows/entries for dropped tables/indexes so replay never resurrects them
-//! empty). Remaining limitations, each owned by a later phase: empty/underfull leaf pages stay
-//! chained until page-store persistence brings structural deletion; a tuple must fit one leaf
-//! after the 24-byte version header (overflow pages later); purge scheduling is the caller's
-//! for now. Correctness gates: unit invariants + isolation + crash tests now,
-//! differential byte-parity as the cluster layer lands.
+//! Index entries live in page-resident B+trees loaded lazily like table pages; only an entry too
+//! large for a page slot (over about 2 KB) is kept in memory. Durability: commit-fsync
+//! durability point, committed-only two-pass replay after the checkpoint image, torn-tail
+//! truncation, savepoint compensation (covering index operations and re-logging live rows and
+//! entries for dropped tables and indexes so replay never resurrects them empty). A tuple too
+//! large for a leaf goes to an overflow page chain. Purge scheduling is the caller's.
 
 mod engine;
 pub mod keytree;
@@ -205,7 +199,7 @@ mod tests {
         );
     }
 
-    /// The audit-caught staged-window schedule (SSI narrowing, durable engine): a reader
+    /// The staged-window schedule (SSI narrowing, durable engine): a reader
     /// that BEGINS while a writer is staged-but-mid-fsync cannot see the writer rows, yet the
     /// writer commit outranks it — so if the reader read the OLD row it MUST abort. A single
     /// stage-instant version map let the reader inherit the writer bump into its baseline and
@@ -606,7 +600,7 @@ mod tests {
         engine.commit(check).unwrap();
     }
 
-    /// The audit-caught split bug: variable-length tuples mean a COUNT-midpoint split can leave
+    /// Split regression: variable-length tuples mean a COUNT-midpoint split can leave
     /// a half that still overflows. The split point is byte-sized (first-fit chunking), so a
     /// legal near-`MAX_TUPLE` insert next to small rows must succeed — including the
     /// `[small, huge, small]` shape where NO single two-way split exists (three leaves).
@@ -616,7 +610,7 @@ mod tests {
         let txn = engine.begin(RC).unwrap();
         let table = engine.create_table(txn, &table_def("t")).unwrap();
 
-        // Audit scenario: 10 B, 1000 B, then 7200 B — the count midpoint would pair the two
+        // Scenario: 10 B, 1000 B, then 7200 B: the count midpoint would pair the two
         // biggest in one half and fail.
         engine.insert(txn, table, &[1u8; 10]).unwrap();
         engine.insert(txn, table, &[2u8; 1000]).unwrap();
@@ -1122,7 +1116,7 @@ mod tests {
 
     #[test]
     fn write_charge_counts_per_row_footprint_not_just_logical_bytes() {
-        // D0-footprint: the ceiling must account for each row's real retained footprint (MVCC header,
+        // The ceiling must account for each row's real retained footprint (MVCC header,
         // slot, undo record), not only its logical tuple bytes — otherwise a flood of tiny rows piles
         // up past the ceiling before Σtuple.len() reaches it. A ceiling set above one tuple's logical
         // size but below its charged footprint must reject the very first insert.
@@ -1191,7 +1185,7 @@ mod tests {
     fn churn_since_analyze_counts_absolute_write_ops_and_resets_on_analyze() {
         use nusadb_core::engine::TableStats;
 
-        // The auto-analyze churn tally (D-AUTO-ANALYZE): every committed insert/update/delete counts
+        // The auto-analyze churn tally: every committed insert/update/delete counts
         // — absolute, not net, so an update or an insert+delete of the same row still ages the stats
         // — a rolled-back write never counts, and ANALYZE resets it to zero.
         let engine = BtreeEngine::new();
@@ -1742,7 +1736,7 @@ mod tests {
         );
     }
 
-    /// (btree treaty completion, L1): two transactions requesting the same uniqueness-key
+    /// Two transactions requesting the same uniqueness-key
     /// lock — the second aborts immediately (no-wait 40001, never blocks); a different key does
     /// not conflict, and the key frees when the holder ends.
     #[test]
@@ -1905,7 +1899,7 @@ mod tests {
         engine.commit(r).unwrap();
     }
 
-    /// (btree treaty completion, L1): `LOCK TABLE ACCESS EXCLUSIVE` excludes concurrent
+    /// `LOCK TABLE ACCESS EXCLUSIVE` excludes concurrent
     /// row writes (their shared intention conflicts) and vice versa.
     #[test]
     fn lock_table_access_exclusive_excludes_writers() {
@@ -1939,7 +1933,7 @@ mod tests {
         engine.commit(b).unwrap();
     }
 
-    /// Index-entry MVCC (btree treaty completion, L1): an `UPDATE` that moves a row to a new key
+    /// Index-entry MVCC: an `UPDATE` that moves a row to a new key
     /// leaves exactly ONE visible entry per reader — the new key for fresh snapshots, the old key
     /// for a snapshot pinned before the move — never both. The row keeps its address across
     /// versions, so only the entry stamps can witness the key move.
@@ -2086,7 +2080,7 @@ mod tests {
         engine.commit(check).unwrap();
     }
 
-    /// (QA CRITICAL, 2026-07-09): an UPDATE that does NOT
+    /// An UPDATE that does NOT
     /// move the indexed key re-inserts the same key (the SQL layer re-inserts every index entry
     /// on UPDATE). That re-insert must be a no-op: the committed entry keeps serving concurrent
     /// readers while the update is uncommitted, and a ROLLBACK must leave it untouched — the
@@ -2115,7 +2109,7 @@ mod tests {
             engine.index_insert(updater, idx, &[7], tid).unwrap();
 
             // A concurrent reader must still find the row via the index while the update is
-            // uncommitted (QA fact #1: this failed BEFORE the rollback too).
+            // uncommitted (this failed before the rollback too).
             let reader = engine.begin(RC).unwrap();
             assert_eq!(
                 collect_index(&engine, reader, idx, Bound::Unbounded, Bound::Unbounded).len(),
@@ -2518,7 +2512,7 @@ mod tests {
     /// engine without any shutdown) — rows, updates, deletes, DDL, and Tid identity all come
     /// back on reopen, and the reopened engine keeps working (new writes get fresh row-ids).
     #[test]
-    fn e3_committed_transactions_survive_reopen() {
+    fn committed_transactions_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -2567,7 +2561,7 @@ mod tests {
     /// A transaction with no commit marker in the log — a crash mid-transaction — is fully
     /// invisible after recovery, even though its op records are in the durable prefix.
     #[test]
-    fn e3_uncommitted_transactions_are_lost_on_reopen() {
+    fn uncommitted_transactions_are_lost_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -2603,7 +2597,7 @@ mod tests {
     /// must replay to the post-rollback state — the undone ops' records stay in the log, so the
     /// logged compensations are what makes recovery converge.
     #[test]
-    fn e3_savepoint_compensations_replay_correctly() {
+    fn savepoint_compensations_replay_correctly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -2642,7 +2636,7 @@ mod tests {
     /// the file is truncated to the good prefix on open, and — critically — writes committed
     /// AFTER the recovery are readable by the NEXT recovery (nothing stranded behind garbage).
     #[test]
-    fn e3_torn_tail_is_truncated_and_log_stays_appendable() {
+    fn torn_tail_is_truncated_and_log_stays_appendable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -2694,7 +2688,7 @@ mod tests {
     /// (aborted) transaction's DDL leaves no trace — plus rollback works identically on the
     /// durable engine.
     #[test]
-    fn e3_ddl_and_rollback_replay_on_durable_engine() {
+    fn ddl_and_rollback_replay_on_durable_engine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -2725,7 +2719,7 @@ mod tests {
     /// Log codec: encode→decode is the identity for every `LoggedOp` shape (pins the on-disk
     /// format against accidental drift).
     #[test]
-    fn e3_logged_op_codec_round_trips() {
+    fn logged_op_codec_round_trips() {
         let ops = [
             wal::LoggedOp::Insert {
                 txn: 7,
@@ -2794,12 +2788,12 @@ mod tests {
         }
     }
 
-    /// Audit corner (last marker wins): a commit whose fsync failed can leave a durable
+    /// Corner case (last marker wins): a commit whose fsync failed can leave a durable
     /// `CommitTxn` marker for a transaction the caller then rolled back — the trailing
     /// `AbortTxn` must override it, or recovery would resurrect a rolled-back transaction.
     /// Pinned with a hand-crafted log, since a real fsync failure can't be forced portably.
     #[test]
-    fn e3_trailing_abort_overrides_durable_commit_marker() {
+    fn trailing_abort_overrides_durable_commit_marker() {
         use nusadb_core::TxnId;
         use nusadb_wal::{WalRecord, WalWriter};
 
@@ -2882,7 +2876,7 @@ mod tests {
     /// bounds work, a unique index rejects a duplicate pointing at a live row but accepts one
     /// whose old row was deleted (stale entries don't count), and catalog methods answer.
     #[test]
-    fn e4_index_insert_scan_bounds_and_unique() {
+    fn index_insert_scan_bounds_and_unique() {
         let engine = BtreeEngine::new();
         let txn = engine.begin(RC).unwrap();
         let table = engine.create_table(txn, &table_def("t")).unwrap();
@@ -3043,7 +3037,7 @@ mod tests {
     /// caller's read view, so another transaction's uncommitted row stays invisible through the
     /// index, and a pinned snapshot keeps seeing its version through the chain.
     #[test]
-    fn e4_index_scan_respects_read_views() {
+    fn index_scan_respects_read_views() {
         let engine = BtreeEngine::new();
         let setup = engine.begin(RC).unwrap();
         let table = engine.create_table(setup, &table_def("t")).unwrap();
@@ -3088,7 +3082,7 @@ mod tests {
     /// Rollback: aborted index DDL and entries vanish; a savepoint-rolled-back `drop_index`
     /// returns with all its entries.
     #[test]
-    fn e4_index_rollback_and_savepoint_restore() {
+    fn index_rollback_and_savepoint_restore() {
         let engine = BtreeEngine::new();
         let setup = engine.begin(RC).unwrap();
         let table = engine.create_table(setup, &table_def("t")).unwrap();
@@ -3137,7 +3131,7 @@ mod tests {
     /// uncommitted index work is lost; a savepoint-rolled-back `drop_index` replays to the
     /// restored index WITH entries (the compensation re-logs them).
     #[test]
-    fn e4_indexes_survive_reopen() {
+    fn indexes_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -3186,12 +3180,11 @@ mod tests {
         engine.commit(check).unwrap();
     }
 
-    /// Fix pin (audit follow-up found while building compensations): a DROP TABLE undone
-    /// by ROLLBACK TO SAVEPOINT inside a later-COMMITTED transaction must replay to the table
-    /// WITH its rows — the compensating `CreateTable` alone would resurrect it empty, because
-    /// replay's `DropTable` discarded the rows.
+    /// A DROP TABLE undone by ROLLBACK TO SAVEPOINT inside a later-COMMITTED transaction must
+    /// replay to the table WITH its rows: the compensating `CreateTable` alone would resurrect it
+    /// empty, because replay's `DropTable` discarded the rows.
     #[test]
-    fn e4_dropped_table_savepoint_rows_survive_reopen() {
+    fn dropped_table_savepoint_rows_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 
@@ -3223,7 +3216,7 @@ mod tests {
 
     /// Log codec: identity for every index-op shape (extends the pin).
     #[test]
-    fn e4_index_op_codec_round_trips() {
+    fn index_op_codec_round_trips() {
         let ops = [
             wal::LoggedOp::CreateIndex {
                 txn: 3,
@@ -3277,7 +3270,7 @@ mod tests {
     /// snapshot pins them, purge frees every superseded version, and the freed arena slots are
     /// reused by the next update instead of growing the arena.
     #[test]
-    fn e5_purge_reclaims_settled_history_and_reuses_slots() {
+    fn purge_reclaims_settled_history_and_reuses_slots() {
         let engine = BtreeEngine::new();
         let setup = engine.begin(RC).unwrap();
         let table = engine.create_table(setup, &table_def("t")).unwrap();
@@ -3306,7 +3299,7 @@ mod tests {
     /// must resume across batches (via its cursor) and still reclaim every settled version and read
     /// back every row. Uses more than `PURGE_ROW_BATCH` rows to force the multi-batch path.
     #[test]
-    fn e5_purge_reclaims_across_many_batches() {
+    fn purge_reclaims_across_many_batches() {
         let engine = BtreeEngine::new();
         let n = (crate::engine::PURGE_ROW_BATCH + 900) as u64; // > 2 batches
         let setup = engine.begin(RC).unwrap();
@@ -3413,7 +3406,7 @@ mod tests {
     /// reclaims nothing while it lives, the old value keeps reading through the chain, and the
     /// moment the snapshot ends the history is reclaimable.
     #[test]
-    fn e5_purge_respects_pinned_snapshots() {
+    fn purge_respects_pinned_snapshots() {
         let engine = BtreeEngine::new();
         let setup = engine.begin(RC).unwrap();
         let table = engine.create_table(setup, &table_def("t")).unwrap();
@@ -3444,7 +3437,7 @@ mod tests {
     /// A settled delete is removed physically — the leaf entry disappears, its chain is
     /// freed, and its stale index entries are swept; an unsettled delete stays.
     #[test]
-    fn e5_purge_removes_dead_rows_and_stale_index_entries() {
+    fn purge_removes_dead_rows_and_stale_index_entries() {
         let engine = BtreeEngine::new();
         let setup = engine.begin(RC).unwrap();
         let table = engine.create_table(setup, &table_def("t")).unwrap();
@@ -3478,7 +3471,7 @@ mod tests {
     /// CREATE TABLE's tree is reclaimed by the next purge (a streaming scan the transaction
     /// opened may still hold it until then); the store's live-page count proves both.
     #[test]
-    fn e5_purge_reclaims_dropped_table_pages() {
+    fn purge_reclaims_dropped_table_pages() {
         let engine = BtreeEngine::new();
         let baseline = engine.live_pages().unwrap();
 
@@ -3519,7 +3512,7 @@ mod tests {
     /// X durability: purge is unlogged, so a reopen replays the full committed history and
     /// converges to the same visible state; purging again after recovery works too.
     #[test]
-    fn e5_purge_is_recovery_transparent() {
+    fn purge_is_recovery_transparent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.wal");
 

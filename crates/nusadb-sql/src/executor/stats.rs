@@ -1,5 +1,4 @@
-//! Sketch-based column statistics for `ANALYZE` (technique from
-//! the design`Research_Result/nusadb_cardinality_estimation_sketches.md`).
+//! Sketch-based column statistics for `ANALYZE`.
 //!
 //! Per the stats treaty (ADR 003) the SQL layer *computes* per-column
 //! statistics and hands the engine opaque bytes; the engine only stores them

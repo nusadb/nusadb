@@ -281,9 +281,9 @@ pub enum LogicalPlan {
     CreateView(CreatePlainViewPlan),
     /// `DROP [MATERIALIZED] VIEW` — drops the materialized view's backing table.
     DropView(DropViewPlan),
-    /// `CREATE TYPE name AS ENUM (...)` — persist a user-defined enum type (B-ENUM).
+    /// `CREATE TYPE name AS ENUM (...)`: persist a user-defined enum type.
     CreateEnum(ast::CreateEnum),
-    /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM / composite).
+    /// `DROP TYPE [IF EXISTS] name`: drop a user-defined type (enum or composite).
     DropType(ast::DropType),
     /// `CREATE TYPE name AS (field type, ...)` — persist a user-defined composite (row) type.
     CreateComposite(ast::CreateComposite),
@@ -788,7 +788,7 @@ pub struct CheckSpec {
     pub predicate_sql: String,
 }
 
-/// `CREATE MATERIALIZED VIEW name AS <select>` (M6, logical).
+/// `CREATE MATERIALIZED VIEW name AS <select>` (logical).
 ///
 /// `body` is the analyzed `SELECT`; `columns` is its derived output schema (name + type), with any
 /// explicit column-name override already applied. Materialization (run the body, store the rows)
@@ -2075,8 +2075,7 @@ pub enum TypedExprKind {
         /// backslash when there is no `ESCAPE` clause; `None` means escaping is disabled (an explicit
         /// `ESCAPE ''`), so `%`/`_` are always wildcards.
         escape: Option<char>,
-        /// `true` for `ILIKE`: letters match case-insensitively, per character in the matcher
-        /// (deep-gate #12).
+        /// `true` for `ILIKE`: letters match case-insensitively, per character in the matcher.
         case_insensitive: bool,
     },
     /// `expr ~ pattern` / `~*` / `!~` / `!~*` — POSIX regular-expression match. Both
@@ -2128,7 +2127,7 @@ pub enum TypedExprKind {
         /// The 1-based index (`Int`).
         index: Box<TypedExpr>,
     },
-    /// `base[lower:upper]` — a 1-based inclusive array slice (B-fn). `base` is array-typed and the
+    /// `base[lower:upper]`: a 1-based inclusive array slice. `base` is array-typed and the
     /// bounds are `Int`; the result is the same array type. An omitted bound defaults to the array's
     /// first / last element.
     ArraySlice {
@@ -2176,7 +2175,7 @@ pub enum TypedExprKind {
         /// Argument expressions, in positional order (already checked against the declared types).
         args: Vec<TypedExpr>,
         /// The UDF's declared parameter types, captured at analysis time so the executor coerces each
-        /// argument to the contract type without a per-row registry read (deep-gate).
+        /// argument to the contract type without a per-row registry read.
         arg_types: Vec<ColumnType>,
     },
     /// A call to a NusaScript function, run by the interpreter per row (unlike a `SQL` function, which
@@ -2548,9 +2547,9 @@ pub enum PhysicalPlan {
     CreateView(CreatePlainViewPlan),
     /// `DROP [MATERIALIZED] VIEW` — drops the materialized view's backing table.
     DropView(DropViewPlan),
-    /// `CREATE TYPE name AS ENUM (...)` — persist a user-defined enum type (B-ENUM).
+    /// `CREATE TYPE name AS ENUM (...)`: persist a user-defined enum type.
     CreateEnum(ast::CreateEnum),
-    /// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM / composite).
+    /// `DROP TYPE [IF EXISTS] name`: drop a user-defined type (enum or composite).
     DropType(ast::DropType),
     /// `CREATE TYPE name AS (field type, ...)` — persist a user-defined composite (row) type.
     CreateComposite(ast::CreateComposite),

@@ -1,4 +1,4 @@
-//! Full-text search (F1): the `simple` text-search configuration, canonical
+//! Full-text search: the `simple` text-search configuration, canonical
 //! `tsvector`/`tsquery` text values, and the `@@` match.
 //!
 //! Values are carried as `TEXT` in the reference engine's canonical form — a `tsvector` is
@@ -1973,11 +1973,11 @@ const MAXENTRYPOS: u32 = MAX_POSITION + 1;
 /// (the reference engine's `POSNULL`, shared by the OR and AND paths).
 const POSNULL: [WordPos; 1] = [WordPos { pos: 0, weight: 0 }];
 
-/// The reference engine's word-distance weighting for the AND (proximity) score: adjacent occurrences score near 1
-/// and the value decays logistically with the gap — `1 / (1.005 + 0.05·e^(d/1.5 − 2))` — bottoming
-/// out at essentially nothing past 100 positions. (an earlier `1/d²`
-/// stand-in diverged from the reference engine by ~4.6× at distance 9; the QA differential pinned this form —
-/// adjacent 0.09910322, distance-2 0.098500855, distance-9 0.05174401.)
+/// The reference engine's word-distance weighting for the AND (proximity) score: adjacent
+/// occurrences score near 1 and the value decays logistically with the gap, `1 / (1.005 +
+/// 0.05·e^(d/1.5 − 2))`, bottoming out at essentially nothing past 100 positions. (An earlier
+/// `1/d²` stand-in diverged from the reference engine by ~4.6× at distance 9; a differential test
+/// pinned this form: adjacent 0.09910322, distance-2 0.098500855, distance-9 0.05174401.)
 #[allow(
     clippy::suboptimal_flops,
     reason = "the fused multiply-add would change the double rounding versus the reference engine's separate \
@@ -2511,7 +2511,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_tsvector_matches_pg_simple_output() {
+    fn to_tsvector_matches_the_reference_simple_output() {
         // The reference engine: SELECT to_tsvector('simple', 'The quick brown fox') -> 'brown':3 'fox':4 'quick':2 'the':1
         assert_eq!(
             to_tsvector("simple", "The quick brown fox").unwrap(),
@@ -2654,7 +2654,7 @@ mod tests {
     }
 
     #[test]
-    fn to_tsquery_canonicalizes_like_pg() {
+    fn to_tsquery_canonicalizes_like_the_reference() {
         // The reference engine: SELECT to_tsquery('simple', 'fox & quick') -> 'fox' & 'quick'
         assert_eq!(
             to_tsquery("simple", "fox & quick").unwrap(),
@@ -2732,7 +2732,7 @@ mod tests {
 
     #[test]
     fn phrase_cast_renders_canonically() {
-        // Every pair pinned against the reference engine (differential corpus Q-fts-phrase).
+        // Every pair pinned against the reference engine (a differential corpus).
         for (input, expect) in [
             ("a <-> b", "'a' <-> 'b'"),
             ("a <2> b", "'a' <2> 'b'"),
@@ -2794,7 +2794,7 @@ mod tests {
 
     #[test]
     fn phrase_match_is_position_accurate() {
-        // The whole battery is pinned against the reference engine (corpus Q-fts-phrase).
+        // The whole battery is pinned against the reference engine (a differential corpus).
         let doc = |text| to_tsvector("simple", text).unwrap();
         for (text, query, expect) in [
             ("a b c", "a <-> b", true),
@@ -2890,7 +2890,7 @@ mod tests {
     }
 
     #[test]
-    fn ts_rank_scores_match_the_pg_algorithm() {
+    fn ts_rank_scores_match_the_reference_algorithm() {
         // The canonical single-term score the reference engine documents: 0.1 / (pi^2/6).
         approx(ts_rank("'fox':1", "'fox'", 0).unwrap(), 0.060_792_71);
         // It renders as the shortest float4 decimal, exactly like the reference engine.
@@ -2899,8 +2899,8 @@ mod tests {
             "0.06079271"
         );
 
-        // AND (proximity) scores, every expectation measured on the reference engine itself (the QA differential
-        // fornot hand-derived, which is how the original 1/d² error
+        // AND (proximity) scores, every expectation measured on the reference engine itself,
+        // not hand-derived (which is how the original 1/d² error
         // slipped through): sqrt(0.1·0.1·word_distance(d)).
         approx(
             ts_rank("'a':1 'b':2", "'a' & 'b'", 0).unwrap(),
@@ -2951,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn tsvector_functions_match_pg() {
+    fn tsvector_functions_match_the_reference() {
         // length = distinct lexeme count; strip drops positions/weights (sorted, quoted).
         assert_eq!(tsvector_length("cat:1 dog:2,3 fox:4").unwrap(), 3);
         assert_eq!(tsvector_length("cat dog cat").unwrap(), 2);
@@ -3016,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn tsquery_combine_renders_like_pg() {
+    fn tsquery_combine_renders_like_the_reference() {
         // OR / AND / NOT combine, case preserved (the operands are already canonical values).
         assert_eq!(ts_or("'cat'", "'dog'").unwrap(), "'cat' | 'dog'");
         assert_eq!(ts_and("'cat'", "'dog'").unwrap(), "'cat' & 'dog'");

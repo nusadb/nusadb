@@ -203,7 +203,7 @@ SELECT aa.k, x, y FROM aa JOIN bb ON aa.k = bb.k WHERE y = 'b1' ORDER BY aa.k
 ----
 1  a1  b1
 
-# SOUNDNESS on a MULTI-join chain (the audit counterexample): a right-side WHERE on the INNER join
+# SOUNDNESS on a MULTI-join chain (a known counterexample): a right-side WHERE on the INNER join
 # must NOT be pushed below it when a DOWNSTREAM FULL join null-extends that table. j1⋈j2 = (1,x1,y1);
 # FULL JOIN j3 emits that row plus j3's orphan (2,z2) with a NULL-extended left; `j2.y='y1'` filters
 # the NULL row ABOVE the FULL join → exactly one result row. (Pushing y='y1' below the inner join

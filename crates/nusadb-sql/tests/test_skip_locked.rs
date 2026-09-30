@@ -1,4 +1,4 @@
-//! `FOR UPDATE ... SKIP LOCKED` — the job-queue pattern (QA scale/production register).
+//! `FOR UPDATE ... SKIP LOCKED`: the job-queue pattern.
 //!
 //! Workers claim rows without blocking on each other: a matched row whose lock another
 //! transaction holds is skipped (excluded from the locks taken and from the output) instead of

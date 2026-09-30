@@ -42,6 +42,7 @@ impl MemBudget {
     }
 
     /// Bytes currently accounted for.
+    #[cfg(test)]
     pub(in crate::executor) const fn used(&self) -> usize {
         self.used
     }

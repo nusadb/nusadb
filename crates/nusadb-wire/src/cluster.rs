@@ -165,7 +165,7 @@ impl DatabaseCluster for SingleDatabase {
     }
 }
 
-/// Whether `name` is a valid physical-database name (DB1 security).
+/// Whether `name` is a valid physical-database name.
 ///
 /// A non-empty, ≤63-char identifier of lowercase ASCII letters, digits, and underscores starting
 /// with a letter or underscore. This is deliberately strict — the name becomes a directory under

@@ -110,7 +110,7 @@ impl StringArray {
     }
 }
 
-/// Incremental [`StringArray`] builder (R2 stage 2b): values append as borrowed `&str` straight
+/// Incremental [`StringArray`] builder: values append as borrowed `&str` straight
 /// into the shared offsets+data buffers — no per-value `String` allocation. The vectorized scan's
 /// text columns fill through this; `from_options` remains for callers that already own `String`s.
 pub(super) struct StringBuilder {

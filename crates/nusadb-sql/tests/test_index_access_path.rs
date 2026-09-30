@@ -283,7 +283,7 @@ fn layout_rewrites_keep_indexes_covering() {
     assert_eq!(got, vec![vec![Value::Int(25)]]);
 }
 
-/// Acceptance probe: point-get by `PRIMARY KEY` at 500k rows — QA measured the `SeqScan` plan at
+/// Acceptance probe: point-get by `PRIMARY KEY` at 500k rows. The `SeqScan` plan measured
 /// 1272ms; the `IndexScan` plan must answer in well under a millisecond. `#[ignore]`d (manual):
 /// `cargo test -p nusadb-sql --release --test test_index_access_path -- --ignored --nocapture`
 #[test]

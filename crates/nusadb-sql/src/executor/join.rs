@@ -167,10 +167,10 @@ pub(crate) fn run_hash_join(
     Ok(out)
 }
 
-/// [`run_hash_join`] with a **streamed probe** (residual): identical
-/// output, but the probe (left) side is pulled row by row instead of being materialized first —
-/// QA measured `orders(1M) JOIN dim(100)` `OOMing` purely on the probe-input `Vec` even though the
-/// build side was tiny. Peak memory is O(build + output), not O(probe + build + output).
+/// [`run_hash_join`] with a **streamed probe** (residual): identical output, but the probe (left)
+/// side is pulled row by row instead of being materialized first. `orders(1M) JOIN dim(100)` was
+/// measured running out of memory purely on the probe-input `Vec` even though the build side was
+/// tiny. Peak memory is O(build + output), not O(probe + build + output).
 pub(super) fn run_hash_join_streamed(
     left_src: &mut dyn super::stream::RowSource,
     right_rows: &[Row],
@@ -492,7 +492,7 @@ impl<'a> PartitionSet<'a> {
 ///
 /// A hash-join bucket map keyed by the build rows' join key, hashed with `ahash` — ~3-5× faster
 /// than the standard `DefaultHasher` (SipHash-1-3) for the short key tuples a join probes once per
-/// row (the residual join cost QA measured). The map only *buckets*: membership is always decided
+/// row (the residual join cost measured). The map only *buckets*: membership is always decided
 /// by key equality (`HashMap`'s own `Eq`), so a collision costs one comparison and the choice of
 /// non-cryptographic hash never changes a join result. A **random** seed is used (not a fixed one)
 /// so it keeps exactly the hash-flooding resistance the std default provides over user-controlled

@@ -141,7 +141,7 @@ pub enum Expr {
         /// `true` for `ILIKE` — letters match case-insensitively. Done in the matcher (not by
         /// lower-casing both sides), so a single `_` still matches one source character even when a
         /// letter's lowercase form has a different length (e.g. `'İ'`), and an alphabetic `ESCAPE`
-        /// character keeps its meaning (deep-gate #12).
+        /// character keeps its meaning.
         case_insensitive: bool,
     },
     /// `CASE` expression — both **simple** form
@@ -283,7 +283,7 @@ pub enum Expr {
         /// The index expression (1-based per SQL array semantics).
         index: Box<Self>,
     },
-    /// `base[lower:upper]` — a 1-based inclusive array slice (B-fn). Either bound may be omitted
+    /// `base[lower:upper]`: a 1-based inclusive array slice. Either bound may be omitted
     /// (`a[2:]`, `a[:3]`, `a[:]`), defaulting to the array's first / last element. The result is an
     /// array of the same element type.
     ArraySlice {
@@ -599,7 +599,7 @@ pub enum ScalarFunc {
     /// `TO_TIMESTAMP(text, format)` — parse `text` per `format` into a `TIMESTAMPTZ`.
     ToTimestamp,
     /// `TO_NUMBER(text, format)` — parse a formatted number `text` into a `NUMERIC`, reading the
-    /// digits, sign, and decimal point and ignoring group separators / currency / padding (B-fn).
+    /// digits, sign, and decimal point and ignoring group separators / currency / padding.
     ToNumber,
     /// `MAKE_DATE(year, month, day)` — build a `DATE` from integer fields; errors on a non-existent
     /// calendar day.
@@ -616,24 +616,24 @@ pub enum ScalarFunc {
     /// `MAKE_INTERVAL([years [, months [, weeks [, days [, hours [, mins [, secs]]]]]]])` — build an
     /// `INTERVAL` from the (positional) field values, each defaulting to `0`.
     MakeInterval,
-    /// `JUSTIFY_DAYS(interval)` — normalize an `INTERVAL` so every 30 days becomes one month (B-fn).
+    /// `JUSTIFY_DAYS(interval)`: normalize an `INTERVAL` so every 30 days becomes one month.
     JustifyDays,
-    /// `JUSTIFY_HOURS(interval)` — normalize an `INTERVAL` so every 24 hours becomes one day (B-fn).
+    /// `JUSTIFY_HOURS(interval)`: normalize an `INTERVAL` so every 24 hours becomes one day.
     JustifyHours,
-    /// `JUSTIFY_INTERVAL(interval)` — apply both `JUSTIFY_DAYS` and `JUSTIFY_HOURS` (B-fn).
+    /// `JUSTIFY_INTERVAL(interval)`: apply both `JUSTIFY_DAYS` and `JUSTIFY_HOURS`.
     JustifyInterval,
-    /// `SCALE(numeric)` — the declared scale (count of fractional digits) of a `NUMERIC` (B-fn).
+    /// `SCALE(numeric)`: the declared scale (count of fractional digits) of a `NUMERIC`.
     Scale,
-    /// `MIN_SCALE(numeric)` — the fewest fractional digits needed to represent the value (B-fn).
+    /// `MIN_SCALE(numeric)`: the fewest fractional digits needed to represent the value.
     MinScale,
-    /// `TRIM_SCALE(numeric)` — the value with trailing fractional zeros removed (B-fn).
+    /// `TRIM_SCALE(numeric)`: the value with trailing fractional zeros removed.
     TrimScale,
     /// `ISFINITE(value)` — whether a `NUMERIC` / temporal value is finite (always true here, since no
-    /// infinite values are representable); `NULL` propagates (B-fn).
+    /// infinite values are representable); `NULL` propagates.
     IsFinite,
-    /// `ENCODE(bytea, format)` — render a `BYTEA` as `TEXT` in `hex`/`escape`/`base64` (B-fn).
+    /// `ENCODE(bytea, format)`: render a `BYTEA` as `TEXT` in `hex`/`escape`/`base64`.
     Encode,
-    /// `DECODE(text, format)` — parse a `TEXT` in `hex`/`escape`/`base64` into a `BYTEA` (B-fn).
+    /// `DECODE(text, format)`: parse a `TEXT` in `hex`/`escape`/`base64` into a `BYTEA`.
     Decode,
     /// `CONVERT_TO(text, encoding)` — the bytes of `text` in `encoding` as `BYTEA`. Only `UTF8` (the
     /// engine's native encoding) is supported; any other encoding is rejected.
@@ -742,8 +742,7 @@ pub enum ScalarFunc {
     /// default) trailing text after the last identifier is an error; otherwise it is ignored.
     ParseIdent,
     /// `FORMAT(fmt, ...)` — a format string with `%s` (text), `%I` (identifier), `%L` (literal), and
-    /// `%%` (a literal `%`) specifiers substituted by the trailing arguments in order, as `TEXT`
-    /// (B-fn).
+    /// `%%` (a literal `%`) specifiers substituted by the trailing arguments in order, as `TEXT`.
     Format,
     /// `NUM_NONNULLS(...)` — count of the non-`NULL` arguments, as `INT` (any argument types).
     NumNonNulls,
@@ -806,16 +805,16 @@ pub enum ScalarFunc {
     /// `arr`'s type.
     ArrayRemove,
     /// `ARRAY_REPLACE(arr, from, to)` — `arr` with every element equal to `from` replaced by `to`;
-    /// result keeps `arr`'s type (B-fn).
+    /// result keeps `arr`'s type.
     ArrayReplace,
     /// `TRIM_ARRAY(arr, n)` — `arr` with its last `n` elements removed; result keeps `arr`'s type.
     /// `n` must be between 0 and the array's length.
     TrimArray,
     /// `ARRAY_POSITIONS(arr, elem)` — an `INT[]` of every 1-based index where `elem` occurs in `arr`
-    /// (empty array if none; `NULL` if `arr` is `NULL`) (B-fn).
+    /// (empty array if none; `NULL` if `arr` is `NULL`).
     ArrayPositions,
     /// `ARRAY_NDIMS(arr)` — the number of array dimensions (always `1` here for a non-empty array;
-    /// `NULL` for an empty array), as `INT` (B-fn).
+    /// `NULL` for an empty array), as `INT`.
     ArrayNdims,
     /// `L2_DISTANCE(a, b)` — Euclidean distance between two `VECTOR(n)`s, as `FLOAT`.
     L2Distance,
@@ -986,19 +985,18 @@ pub enum ScalarFunc {
     JsonbPathQueryArray,
     /// `JSONB_EXISTS(json, key)` — whether `key` is a top-level object key, an array string element,
     /// or equals a scalar string, as `BOOL`. The function form of the `?` operator, which the
-    /// tokenizer cannot expose as an operator (it reserves `?` for parameters) (Q-jsonb-exists).
+    /// tokenizer cannot expose as an operator (it reserves `?` for parameters).
     JsonbExists,
-    /// `TO_TSVECTOR([config,] text)` — tokenize `text` into the canonical `tsvector` text form
-    /// (full-text search F1). Only the `simple` configuration is implemented.
+    /// `TO_TSVECTOR([config,] text)`: tokenize `text` into the canonical `tsvector` text form.
+    /// Only the `simple` configuration is implemented.
     ToTsvector,
     /// `TO_TSQUERY([config,] text)` — parse a boolean lexeme query into the canonical `tsquery`
-    /// text form (F1).
+    /// text form.
     ToTsquery,
-    /// `PLAINTO_TSQUERY([config,] text)` — tokenize plain text into an AND-of-lexemes `tsquery`
-    /// (F1).
+    /// `PLAINTO_TSQUERY([config,] text)`: tokenize plain text into an AND-of-lexemes `tsquery`.
     PlaintoTsquery,
     /// `PHRASETO_TSQUERY([config,] text)` — tokenize plain text into a phrase-chained `tsquery`
-    /// whose distances mirror the token positions (F1).
+    /// whose distances mirror the token positions.
     PhrasetoTsquery,
     /// `TSQUERY_PHRASE(a, b [, distance])` — join two `tsquery` values with a phrase operator
     /// (the function form of `tsquery <-> tsquery`).
@@ -1009,14 +1007,13 @@ pub enum ScalarFunc {
     /// `TS_RANK_CD(tsvector, tsquery [, normalization])` — the cover-density relevance score as a
     /// `REAL`.
     TsRankCd,
-    /// `NUMNODE(tsquery)` — the number of nodes (lexemes plus operators) in a `tsquery`, as `INT`
-    /// (F1).
+    /// `NUMNODE(tsquery)`: the number of nodes (lexemes plus operators) in a `tsquery`, as `INT`.
     Numnode,
     /// `STRIP(tsvector)` — the `tsvector` with positions and weights removed, keeping the distinct
-    /// lexemes only (F1).
+    /// lexemes only.
     Strip,
     /// `SETWEIGHT(tsvector, weight)` — the `tsvector` with every position's weight class set to
-    /// `weight` (`A`/`B`/`C`/`D`) (F1).
+    /// `weight` (`A`/`B`/`C`/`D`).
     Setweight,
     /// `RRF_SCORE(rank [, k])` — the Reciprocal Rank Fusion contribution `1/(k + rank)` as a
     /// `FLOAT`, `k` defaulting to 60 (the standard constant). Summed across ranked lists (each
@@ -1611,7 +1608,7 @@ pub enum AggregateFunc {
     /// Result `INT`.
     BitOr,
     /// `BIT_XOR(expr)` — bitwise XOR of the non-`NULL` integer inputs; `NULL` for an empty group.
-    /// Result `INT` (B-fn).
+    /// Result `INT`.
     BitXor,
     /// `STDDEV_POP(expr)` — population standard deviation of the non-`NULL` numeric inputs (divisor
     /// `n`); `NULL` for an empty group. Result `FLOAT`.
@@ -1734,7 +1731,7 @@ pub enum Value {
     /// Timestamp with time zone — microseconds since the Unix epoch, normalized to UTC.
     TimestampTz(i64),
     /// Time of day with time zone — one packed `i64` carrying both the as-entered local time and
-    /// its zone offset (P-TIMETZ): `utc_equivalent_micros * 2^18 + (zone_west_secs + 2^17)`, so
+    /// its zone offset: `utc_equivalent_micros * 2^18 + (zone_west_secs + 2^17)`, so
     /// plain `i64` ordering compares by instant with the zone as tie-break. Build/inspect it with
     /// [`temporal::pack_timetz`](crate::temporal::pack_timetz) and friends — never interpret the
     /// raw value as microseconds.
@@ -1824,11 +1821,11 @@ pub enum BinaryOp {
     BitOr,
     /// `#` — bitwise XOR of two integers, as `INT` (the reference engine's XOR spelling).
     BitXor,
-    /// `<<` — left bit-shift of an integer by an integer count, as `INT` (B-fn).
+    /// `<<`: left bit-shift of an integer by an integer count, as `INT`.
     ShiftLeft,
-    /// `>>` — right (arithmetic) bit-shift of an integer by an integer count, as `INT` (B-fn).
+    /// `>>`: right (arithmetic) bit-shift of an integer by an integer count, as `INT`.
     ShiftRight,
-    /// `&&` — array overlap: whether two arrays share any element, as `BOOL` (B-fn).
+    /// `&&`: array overlap: whether two arrays share any element, as `BOOL`.
     ArrayOverlap,
     /// `||` — string concatenation. Both operands are text; the result is text.
     Concat,
@@ -1869,7 +1866,7 @@ pub enum BinaryOp {
     /// as `FLOAT`. See [`crate::vector::l1_distance`].
     VectorL1Distance,
     /// Full-text `@@` — does the left `tsvector` (canonical text form) match the right `tsquery`
-    /// (text form), as `BOOL` (F1)? Either operand order is accepted, like the reference engine.
+    /// (text form), as `BOOL`? Either operand order is accepted, like the reference engine.
     TsMatch,
     /// JSON path exists `@?` — does the right `jsonpath` return any item for the left JSON value, as
     /// `BOOL`? An unsupported or invalid path is a loud runtime error, like `jsonb_path_exists`.

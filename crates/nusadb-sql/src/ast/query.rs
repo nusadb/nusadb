@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// One entry in a `WITH` clause: `name [(cols)] AS (body)` (non-recursive recursive).
+/// One entry in a `WITH` clause: `name [(cols)] AS (body)` (non-recursive or recursive).
 ///
 /// The body is a query for a read CTE, or a data-modifying statement for `WITH x AS (INSERT/UPDATE …
 /// RETURNING …)`. For `WITH RECURSIVE` (`recursive = true`) the query body is `anchor

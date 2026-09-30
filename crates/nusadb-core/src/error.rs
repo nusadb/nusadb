@@ -164,7 +164,7 @@ impl Error {
 /// The variant deliberately carries its kind inside the message string (see its doc), and every
 /// message is an engine-owned constant, so classifying on the kind words is stable: a losing
 /// concurrent duplicate-key writer must reach client middleware as `23505` (unique violation) —
-/// the same code the reference behaviour produces — not the opaque `XX000` (QA minor).
+/// the same code the reference behaviour produces, not the opaque `XX000`.
 fn constraint_sqlstate(message: &str) -> &'static str {
     if message.contains("already exists") || message.contains("cannot drop") {
         // A catalog-shape conflict (declaring a duplicate constraint, dropping a referenced
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn retryable_errors_map_to_standard_sqlstates() {
         // A serialization conflict and a deadlock must carry the standard retryable SQLSTATE codes so
-        // client retry middleware classifies them (B-QA SQLSTATE); everything else is XX000.
+        // client retry middleware classifies them (SQLSTATE); everything else is XX000.
         assert_eq!(
             Error::SerializationConflict { txn: TxnId(1) }.sqlstate(),
             "40001"
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn constraint_violations_map_to_their_integrity_sqlstates() {
         // A losing concurrent duplicate-key writer must reach client middleware as 23505 —
-        // the standard unique-violation code — never the opaque XX000 (QA minor).
+        // the standard unique-violation code, never the opaque XX000.
         let cv = |m: &str| Error::ConstraintViolation(m.to_owned());
         assert_eq!(
             cv("duplicate key violates unique index u").sqlstate(),

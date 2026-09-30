@@ -54,7 +54,7 @@ pub(crate) fn rows_to_batch(schema: &Arc<Schema>, rows: Vec<Row>) -> Result<Reco
 }
 
 /// Build a [`RecordBatch`] from already-columnar value accumulators — the tail of
-/// [`rows_to_batch`], and the direct entry for the AP3 batch-decode scan, which fills the
+/// [`rows_to_batch`], and the direct entry for the batch-decode scan, which fills the
 /// per-column accumulators straight from the tuple codec without ever materializing rows.
 pub(crate) fn columns_to_batch(
     schema: &Arc<Schema>,
@@ -120,7 +120,7 @@ pub(crate) fn batch_to_rows(batch: &RecordBatch) -> Vec<Row> {
 
 /// The [`ast::Value`] of `array` at `index` (the inverse of [`build_column`]). A null slot
 /// — or a defensively-unexpected downcast failure — yields [`ast::Value::Null`]. Exposed so the
-/// vectorized columnar aggregate fold (A-PERF.AGG5b) reads single elements with **exactly** the
+/// vectorized columnar aggregate fold reads single elements with **exactly** the
 /// conversion [`batch_to_rows`] would have used.
 pub(crate) fn value_at(array: &dyn Array, index: usize) -> ast::Value {
     if array.is_null(index) {

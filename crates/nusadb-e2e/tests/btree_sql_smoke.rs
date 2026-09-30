@@ -1,8 +1,8 @@
-//! The `--storage-engine btree` SQL bridge (design requirement, user order 2026-07-05): real SQL
+//! The `--storage-engine btree` SQL bridge: real SQL
 //! strings through `parse → analyze → plan → execute` against the clustered B-link/B+tree
-//! engine — the `DoD` that unblocks the QA SQL-verify.
+//! engine.
 //!
-//! Covers exactly what QA reported broken: `CREATE TABLE` without a PK (used to fail with
+//! Covers exactly what was reported broken: `CREATE TABLE` without a PK (used to fail with
 //! `add_check_constraint is not implemented`), with a PK (`add_unique_constraint`), the
 //! INSERT/SELECT/`WHERE pk = ?` smoke path, constraint *enforcement* (unique + check + FK,
 //! which the SQL layer drives through `list_constraints`), and durability of it all across a
@@ -98,18 +98,18 @@ fn rows(result: ExecutionResult) -> Vec<Vec<Value>> {
     }
 }
 
-/// The QA `DoD`, statement for statement: CREATE TABLE without a PK, with a PK, INSERT,
+/// The acceptance list, statement for statement: CREATE TABLE without a PK, with a PK, INSERT,
 /// SELECT, and the point lookup `WHERE pk = ?`.
 #[test]
 fn create_table_insert_select_point_lookup() {
     let engine = BtreeEngine::new();
 
-    // The exact statement QA reported failing (`add_check_constraint not implemented`).
+    // The exact statement reported failing (`add_check_constraint not implemented`).
     run(&engine, "CREATE TABLE plain (id INT, v INT)");
     run(&engine, "INSERT INTO plain VALUES (1, 10), (2, 20)");
     assert_eq!(rows(run(&engine, "SELECT v FROM plain")).len(), 2);
 
-    // And the PK form QA reported failing (`add_unique_constraint not implemented`).
+    // And the PK form reported failing (`add_unique_constraint not implemented`).
     run(
         &engine,
         "CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL, qty INT)",
@@ -819,7 +819,7 @@ fn polygon_value_survives_reopen() {
     );
 }
 
-/// The the design sequence `DoD` via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
+/// Sequences via real SQL: `SERIAL PRIMARY KEY`, `GENERATED ALWAYS AS IDENTITY`, and
 /// bare `CREATE SEQUENCE` all work on the btree engine (each used to fail with
 /// `create_sequence is not implemented`), auto-assigned ids are monotonic, and — the critical
 /// property — a crash never repeats an id: post-recovery inserts continue past every id handed
@@ -831,7 +831,7 @@ fn serial_identity_and_sequences_work_and_never_repeat_after_crash() {
 
     {
         let engine = BtreeEngine::open(&path).unwrap();
-        // The exact statements QA reported failing.
+        // The exact statements reported failing.
         run(&engine, "CREATE TABLE d (id SERIAL PRIMARY KEY, v TEXT)");
         run(
             &engine,
@@ -877,7 +877,7 @@ fn serial_identity_and_sequences_work_and_never_repeat_after_crash() {
     run(&engine, "CREATE SEQUENCE counter");
 }
 
-/// The the design sequence-value `DoD` via real SQL: `nextval`/`currval`/`setval` advance, read, and set a
+/// Sequence values via real SQL: `nextval`/`currval`/`setval` advance, read, and set a
 /// user `CREATE SEQUENCE`; an advance is durable across a crash (a value never repeats); and the
 /// side-effecting calls are loud-rejected in a per-row context rather than silently under-advancing.
 #[test]
@@ -958,8 +958,8 @@ fn nextval_currval_setval_advance_read_and_survive_crash() {
     );
 }
 
-/// The the design+QA DDL-evolution `DoD` via real SQL: `ALTER TABLE` (ADD/DROP/RENAME COLUMN, RENAME
-/// TABLE) and `CREATE SCHEMA` (both reported by QA as `XX000: ... not implemented by this
+/// DDL evolution via real SQL: `ALTER TABLE` (ADD/DROP/RENAME COLUMN, RENAME
+/// TABLE) and `CREATE SCHEMA` (both reported as `XX000: ... not implemented by this
 /// StorageEngine`) now work on the btree engine, with existing rows migrated correctly and the
 /// whole DDL-evolved catalog surviving a crash-reopen.
 #[test]

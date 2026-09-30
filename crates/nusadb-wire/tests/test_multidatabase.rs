@@ -1,4 +1,4 @@
-//! Multiple databases over the wire (physical model, DB2/DB3/DB4/DB6): a connection is routed to its
+//! Multiple databases over the wire (physical model): a connection is routed to its
 //! startup database's engine, `CREATE`/`DROP DATABASE` act on the cluster, databases are isolated,
 //! and an unknown database is refused at startup.
 
@@ -488,7 +488,7 @@ async fn database_ops_are_refused_inside_a_transaction_block() {
     server.abort();
 }
 
-// --- LISTEN / NOTIFY async pub/sub (phase 2) --------------------------
+// --- LISTEN / NOTIFY async pub/sub --------------------------
 
 /// Read the next backend frame, expecting an asynchronous `NotificationResponse`. Returns
 /// `(pid, channel, payload)`.

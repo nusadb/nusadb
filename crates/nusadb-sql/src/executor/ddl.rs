@@ -126,7 +126,7 @@ pub(super) fn run_create_table(
     if plan.temporary && engine.lookup_schema(&plan.schema)?.is_none() {
         engine.create_temp_schema(txn, &plan.schema)?;
     }
-    // Resolve any deferred user-defined column type (B-ENUM): it must name a registered ENUM, which
+    // Resolve any deferred user-defined column type: it must name a registered ENUM, which
     // is stored as its `TEXT` placeholder. An unresolved name is a loud error (caught here, not at
     // parse time, because only the executor can read the type catalog). The enum's label set is
     // captured so a membership CHECK can be registered below (the column stores as TEXT, so without
@@ -1361,7 +1361,7 @@ pub(super) fn run_drop_table(
                     )?;
                 }
             }
-            // RESTRICT (A-UR.01b): refuse to drop a table that another table's FOREIGN KEY references,
+            // RESTRICT: refuse to drop a table that another table's FOREIGN KEY references,
             // so the FK is not left silently dangling (standard SQL rejects this without CASCADE). A
             // self-referencing FK (child == parent) does not block — it drops with the table.
             // CASCADE drops those referencing constraints instead — the standard's
@@ -1389,7 +1389,7 @@ pub(super) fn run_drop_table(
                 }
             }
             // Drop the table's indexes and constraints so the global index/constraint namespace is
-            // freed (A-UR.01): otherwise a later same-named table fails to recreate its PRIMARY KEY
+            // freed: otherwise a later same-named table fails to recreate its PRIMARY KEY
             // ("index `<t>_pkey` already exists"), breaking idempotent migrations / redeploys. A
             // PRIMARY KEY/UNIQUE/FK constraint's drop also drops its backing index, so only the
             // *secondary* (non-backing) indexes are dropped directly here — avoiding a double drop.
@@ -1420,7 +1420,7 @@ pub(super) fn run_drop_table(
                 }
             }
             super::coldefault::delete_defaults_for_table(&default_key, engine, txn)?;
-            // Drop any `USING hnsw` vector index declared on the table (A-UR.01c), which
+            // Drop any `USING hnsw` vector index declared on the table, which
             // lives in the SQL-layer catalog rather than the engine's index namespace.
             super::delete_vector_indexes_for_table(engine, txn, &plan.table)?;
             // Scrub the table's per-column composite-type rows so a later same-named table cannot

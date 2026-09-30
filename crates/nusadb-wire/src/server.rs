@@ -143,7 +143,7 @@ pub struct ServerConfig {
     /// Maximum number of connections served concurrently. Excess connections wait (queued in the
     /// kernel backlog) until a slot frees. `None` is unbounded.
     pub max_connections: Option<usize>,
-    /// What happens to a connection past [`max_connections`](Self::max_connections) (P-CONNCAP):
+    /// What happens to a connection past [`max_connections`](Self::max_connections):
     /// `false` (default) queues it until a slot frees — graceful, but a connection storm shows up
     /// as client-side hangs; `true` refuses it immediately with SQLSTATE `53300`
     /// (`too_many_connections`, the reference engine's behaviour), so a pool sees an honest error instead of a
@@ -250,7 +250,7 @@ where
 /// Propagates listener accept errors. Per-connection errors are logged, not propagated.
 #[allow(
     clippy::too_many_lines,
-    reason = "one linear accept loop: slot policy (queue vs fast-reject, P-CONNCAP), accept, and \
+    reason = "one linear accept loop: slot policy (queue vs fast-reject), accept, and \
               the per-connection spawn; splitting it would scatter the loop's shutdown/permit \
               interplay across helpers"
 )]
@@ -275,7 +275,7 @@ where
     // Connection limiter: a permit per in-flight connection, held for its lifetime.
     let limiter = config.max_connections.map(|n| Arc::new(Semaphore::new(n)));
     if let Some(n) = config.max_connections {
-        // Expose the effective limit + policy (P-CONNCAP) so an operator can see what a
+        // Expose the effective limit + policy so an operator can see what a
         // connection storm will do without reading the source.
         tracing::info!(
             max_connections = n,
@@ -293,7 +293,7 @@ where
         // In queue mode, reserve a connection slot first: when the limit is reached this
         // waits here, so a surplus connection simply stays in the kernel accept backlog until a
         // slot frees. In reject mode the slot is probed *after* accept, so the surplus connection
-        // can be refused with an honest error instead of queueing (P-CONNCAP).
+        // can be refused with an honest error instead of queueing.
         let queued_permit = match &limiter {
             Some(sem) if !config.reject_excess_connections => {
                 let acquired = tokio::select! {
@@ -321,7 +321,7 @@ where
                 match Arc::clone(sem).try_acquire_owned() {
                     Ok(permit) => Some(permit),
                     Err(_no_slot) => {
-                        // Fast-reject (P-CONNCAP): tell the client `53300 too many clients` and
+                        // Fast-reject: tell the client `53300 too many clients` and
                         // close, exactly what the reference engine does — a pool retries/backs off instead of
                         // hanging in the backlog. Runs in its own task (the TLS handshake, when
                         // configured, must complete before the error is readable) so a slow
@@ -340,7 +340,7 @@ where
 
         // Disable Nagle's algorithm so a small request/response is not delayed waiting to coalesce
         // with more data — the protocol is request/response, so Nagle (interacting with delayed-ACK)
-        // adds tens of milliseconds per round trip to a point query (A-NET.1). A failure to set the
+        // adds tens of milliseconds per round trip to a point query. A failure to set the
         // option is non-fatal: the connection still works, just with Nagle left on.
         if let Err(e) = socket.set_nodelay(true) {
             tracing::debug!("set_nodelay failed on accepted connection: {e}");
@@ -458,8 +458,8 @@ where
     .await
 }
 
-/// Refuse a connection that arrived past `max_connections` in reject mode (fast-reject,
-/// P-CONNCAP): complete the (optional) TLS handshake so the error is readable by the client's
+/// Refuse a connection that arrived past `max_connections` in reject mode (fast-reject):
+/// complete the (optional) TLS handshake so the error is readable by the client's
 /// protocol stack, send SQLSTATE `53300` (`too_many_connections`, the reference engine's message), and close.
 /// Best-effort and bounded by the handshake timeout: any failure just drops the socket, which is
 /// where this connection was headed anyway.
@@ -658,7 +658,7 @@ where
 
 /// Drive one client connection against a [`DatabaseCluster`]: after the startup handshake, the
 /// connection's requested database name is resolved to one engine (the connection then only ever
-/// touches that engine — physical isolation, DB2). A request for a database that does not exist is
+/// touches that engine, for physical isolation). A request for a database that does not exist is
 /// refused with a fatal `3D000` before the query loop.
 #[allow(
     clippy::too_many_lines,
@@ -1009,7 +1009,7 @@ where
                     // moved into the streaming call, so the temp-table hook can fire after the commit.
                     let old_state = txn_state;
                     let on_commit_create = detect_on_commit_create(&sql, &temp_schema_name);
-                    // Stream the result's rows to the socket as they are produced (Phase 2):
+                    // Stream the result's rows to the socket as they are produced:
                     // `RowDescription`, then each `DataRow` as the executor yields it, then
                     // `CommandComplete` — bounding the wire layer's memory to the channel capacity
                     // instead of buffering the whole result set. The frame sequence and bytes are
@@ -2317,7 +2317,7 @@ fn copy_access_verdict(
 }
 
 /// Bound on the number of result frames buffered in flight between the blocking executor thread and
-/// the async socket writer (Phase 2). A full channel back-pressures the executor (its
+/// the async socket writer. A full channel back-pressures the executor (its
 /// `blocking_send` parks) until the writer drains, so a large result set never piles up in memory.
 const ROW_STREAM_CHANNEL_CAP: usize = 16;
 
@@ -2363,7 +2363,7 @@ enum StreamedRun {
     Punt(nusadb_sql::PlanCache),
 }
 
-/// frames over a bounded channel (Phase 2 streaming output). Runs on the `spawn_blocking`
+/// frames over a bounded channel. Runs on the `spawn_blocking`
 /// executor thread, so it uses `blocking_send`; a closed receiver (the writer stopped — client gone
 /// or a socket write failed) surfaces as an error that aborts the statement.
 /// How a [`ChannelSink`]'s overflow chunks travel. `Pool` is the ordinary blocking-thread
@@ -2489,7 +2489,7 @@ fn stream_command_tag(outcome: &StreamOutcome) -> String {
 }
 
 /// Run one statement against `engine` as `user`, streaming any output rows into `tx` as backend
-/// frames (Phase 2). Mirrors [`run_query`]'s one-transaction-per-statement discipline (analyze
+/// frames. Mirrors [`run_query`]'s one-transaction-per-statement discipline (analyze
 /// and execute share a snapshot, then auto-commit or roll back). Returns the `CommandComplete` tag on
 /// success. Runs on a blocking thread; `tx` is dropped on return, closing the channel.
 #[allow(
@@ -2521,7 +2521,7 @@ fn run_query_streaming(
     // Parsed (and parameter-bound) by the caller on the reactor — a parse error never reaches
     // this function.
     let mut stmt = stmt;
-    // CREATE/DROP DATABASE are cluster operations handled by the server, not the engine (DB3/DB4).
+    // CREATE/DROP DATABASE are cluster operations handled by the server, not the engine.
     // They produce a command tag (no rows), like a transaction-control statement.
     if let Some(result) =
         intercept_database_stmt(cluster, database, in_transaction_block(&state), &stmt)
@@ -2546,7 +2546,7 @@ fn run_query_streaming(
         Statement::Commit => Some(commit_txn(engine, state, settings)),
         Statement::Rollback => Some(rollback_txn(engine, state, settings)),
         Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
-        // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` (P-ISOLATION): session default in
+        // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`: session default in
         // autocommit, re-begin in an untouched transaction, refused after any query.
         Statement::SetTransaction(ts) => Some(set_transaction_txn(engine, settings, ts, state)),
         savepoint @ (Statement::Savepoint(_)
@@ -3274,8 +3274,8 @@ enum TxnState {
         txn: TxnId,
         /// Whether any statement (or savepoint operation) has run inside this transaction. The
         /// engine fixes isolation at `begin`, so `SET TRANSACTION ISOLATION LEVEL` is honored by
-        /// re-beginning the transaction — observably equivalent **only** while it is untouched
-        /// (the reference engine likewise requires it "before any query"); afterwards it is refused (P-ISOLATION).
+        /// re-beginning the transaction, observably equivalent **only** while it is untouched (the
+        /// reference engine likewise requires it "before any query"); afterwards it is refused.
         dirty: bool,
         /// The level the engine transaction was begun with, carried so `SHOW
         /// transaction_isolation` / `current_setting` report the level actually enforced,
@@ -3335,7 +3335,7 @@ fn stamp_transaction_isolation(snapshot: &mut HashMap<String, String>, state: Tx
     );
 }
 
-/// The isolation level the connection's next transaction begins with (P-ISOLATION): an explicit
+/// The isolation level the connection's next transaction begins with: an explicit
 /// `SET default_transaction_isolation` / `SET [SESSION CHARACTERISTICS AS] TRANSACTION ISOLATION
 /// LEVEL` recorded in the GUC store wins; otherwise the engine default. An unparseable stored
 /// value cannot happen ([`apply_set_variable`] validates the GUC on `SET`), but fail safe to the
@@ -3379,7 +3379,7 @@ const fn isolation_guc_text(level: IsolationLevel) -> &'static str {
     }
 }
 
-/// `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` over the wire (P-ISOLATION).
+/// `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` over the wire.
 ///
 /// - In autocommit: records the isolation as the connection's `default_transaction_isolation`
 ///   GUC, so every later `BEGIN` / auto-committed statement begins at that level (both spellings
@@ -3795,7 +3795,7 @@ fn run_query_txn(
         Ok(stmt) => stmt,
         Err(e) => return (Err(e), state),
     };
-    // CREATE/DROP DATABASE are cluster operations handled by the server, not the engine (DB3/DB4).
+    // CREATE/DROP DATABASE are cluster operations handled by the server, not the engine.
     if let Some(result) =
         intercept_database_stmt(cluster, database, in_transaction_block(&state), &stmt)
     {
@@ -3808,7 +3808,7 @@ fn run_query_txn(
         Statement::BeginTransaction(ts) => begin_txn(engine, state, settings, &ts),
         Statement::Commit => commit_txn(engine, state, settings),
         Statement::Rollback => rollback_txn(engine, state, settings),
-        // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` (P-ISOLATION): session default in
+        // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`: session default in
         // autocommit, re-begin in an untouched transaction, refused after any query.
         Statement::SetTransaction(ts) => set_transaction_txn(engine, settings, &ts, state),
         savepoint @ (Statement::Savepoint(_)
@@ -3848,7 +3848,7 @@ fn run_query_txn(
 /// value, `None` (RESET) clears it. A poisoned lock is treated as empty (the connection is already
 /// being torn down on any panic that would poison it).
 ///
-/// `default_transaction_isolation` is validated on write (P-ISOLATION): the value steers what
+/// `default_transaction_isolation` is validated on write: the value steers what
 /// isolation later transactions actually begin with, so a typo must fail loudly here rather than
 /// silently fall back to the default level at `BEGIN`.
 /// The reserved settings key holding the role a `SET ROLE` switched this connection to.
@@ -4250,7 +4250,7 @@ const fn in_transaction_block(state: &TxnState) -> bool {
     !matches!(state, TxnState::Auto)
 }
 
-/// Intercept `CREATE`/`DROP DATABASE` at the wire (model B, DB3/DB4): these are cluster operations a
+/// Intercept `CREATE`/`DROP DATABASE` at the wire: these are cluster operations a
 /// single-engine SQL executor cannot perform, so the server runs them against its [`DatabaseCluster`]
 /// — mirroring the `SET`/`SHOW` interception. Returns `Some(result)` when `stmt` is a database
 /// statement (the caller skips the executor), `None` otherwise. `connected` is the connection's
@@ -4291,7 +4291,7 @@ fn intercept_database_stmt(
 
 /// `BEGIN [ISOLATION LEVEL ...]`: open a transaction in `Auto` — at the explicitly requested
 /// isolation, falling back to the connection's `default_transaction_isolation` GUC, then the
-/// engine default (P-ISOLATION). Otherwise keep the open one (a redundant `BEGIN` is a no-op,
+/// engine default. Otherwise keep the open one (a redundant `BEGIN` is a no-op,
 /// not an error; the reference engine ignores its characteristics with a warning). `BEGIN READ ONLY` is refused
 /// loudly — the wire layer does not enforce access modes yet, and silently opening a writable
 /// "read-only" transaction would be worse than an error.
@@ -4409,7 +4409,7 @@ fn checkpoint_txn(
 /// transaction. Outside a transaction block (`Auto`) all three error, like the standard. In a failed
 /// transaction only `ROLLBACK TO SAVEPOINT` is allowed — and on success it *recovers* the transaction
 /// (back to `Active`), undoing the statement that aborted it; the others stay rejected until the block
-/// ends. `name` is the savepoint identifier carried by the statement (A-UR.03).
+/// ends. `name` is the savepoint identifier carried by the statement.
 fn savepoint_txn(
     engine: &dyn StorageEngine,
     stmt: &nusadb_sql::ast::Statement,
@@ -5076,7 +5076,7 @@ fn error_response(message: &str) -> BackendMessage {
     error_response_coded(message, INTERNAL_ERROR)
 }
 
-/// An `ErrorResponse` carrying an explicit SQLSTATE class code (B-QA SQLSTATE). A serialization
+/// An `ErrorResponse` carrying an explicit SQLSTATE class code. A serialization
 /// conflict (`40001`) / deadlock (`40P01`) reaches client retry middleware as a *retryable* error
 /// rather than the opaque `XX000`.
 fn error_response_coded(message: &str, code: &str) -> BackendMessage {

@@ -1,4 +1,4 @@
-# p11_views/materialized — CREATE / query / DROP MATERIALIZED VIEW (M6, snapshot semantics).
+# p11_views/materialized: CREATE / query / DROP MATERIALIZED VIEW (snapshot semantics).
 
 statement ok
 CREATE TABLE sales (region TEXT, amt INT)
@@ -33,7 +33,7 @@ SELECT region, total FROM region_totals ORDER BY region
 east 40
 west 20
 
-# REFRESH recomputes the stored rows from the current base table (M6).
+# REFRESH recomputes the stored rows from the current base table.
 statement ok
 REFRESH MATERIALIZED VIEW region_totals
 

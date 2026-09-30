@@ -218,7 +218,7 @@ pub struct ColumnDef {
     pub ty: ColumnType,
     /// A user-defined type name (e.g. an `ENUM` created by `CREATE TYPE`) the parser could not
     /// resolve to a built-in type, carried so the executor can resolve it against the type catalog at
-    /// `CREATE TABLE` time (B-ENUM). `ty` holds the placeholder storage type (`TEXT`); `None` for an
+    /// `CREATE TABLE` time. `ty` holds the placeholder storage type (`TEXT`); `None` for an
     /// ordinary built-in type.
     pub udt_name: Option<String>,
     /// Whether the column accepts `NULL`. `NOT NULL` and `PRIMARY KEY` clear this.
@@ -348,7 +348,7 @@ pub struct DropView {
     pub if_exists: bool,
 }
 
-/// `CREATE TYPE name AS ENUM ('a', 'b', ...)` — a user-defined enumerated type (B-ENUM). Stored as a
+/// `CREATE TYPE name AS ENUM ('a', 'b', ...)`: a user-defined enumerated type. Stored as a
 /// catalog object; a column of this type is stored as `TEXT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateEnum {
@@ -371,7 +371,7 @@ pub struct CreateComposite {
     pub fields: Vec<(String, String)>,
 }
 
-/// `DROP TYPE [IF EXISTS] name` — drop a user-defined type (B-ENUM).
+/// `DROP TYPE [IF EXISTS] name`: drop a user-defined type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropType {
     /// Type name.

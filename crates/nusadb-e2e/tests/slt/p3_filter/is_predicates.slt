@@ -42,7 +42,7 @@ SELECT id FROM pairs WHERE a IS DISTINCT FROM 1 ORDER BY id
 4
 
 # Two bare NULL literals: well-defined (NULLs are never distinct), not an ambiguous-type
-# error (G9). The plain form is FALSE, the negated form TRUE.
+# error. The plain form is FALSE, the negated form TRUE.
 query II
 SELECT NULL IS DISTINCT FROM NULL, NULL IS NOT DISTINCT FROM NULL
 ----
@@ -86,7 +86,7 @@ SELECT id FROM flags WHERE (id = 2) IS TRUE
 statement error
 SELECT 1 IS TRUE
 
-# --- Untyped NULL (B-fn) ---
+# --- Untyped NULL ---
 # IS [NOT] NULL only inspects nullness, so a bare NULL operand needs no type context.
 query T
 SELECT NULL IS NULL

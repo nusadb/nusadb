@@ -1,4 +1,4 @@
-# p12_txn/for_update — SELECT ... FOR UPDATE / FOR SHARE row locking (friend-QA R44 D2).
+# p12_txn/for_update: SELECT ... FOR UPDATE / FOR SHARE row locking.
 #
 # FOR UPDATE/SHARE takes a row lock on each matched base row (the lost-update escape hatch). The
 # locking is transparent to the result: the SELECT returns its rows unchanged. Within an explicit

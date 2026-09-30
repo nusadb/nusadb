@@ -100,7 +100,7 @@ fn pushdown_simple(op: &mut PhysicalOperator) {
 /// aggregate indexes its output layout (group keys ++ results), which does not depend on how the
 /// input rows are laid out, and is left untouched.
 ///
-/// The payoff is largest exactly where QA measured the scan being slow at scale: a full-table
+/// The payoff is largest exactly where the scan was measured slow at scale: a full-table
 /// `count(*)` referenced no column at all yet decoded every column of every row; it now decodes
 /// only the table's first column (the row codec must still walk to *some* column, so ordinal 0 is
 /// the cheapest), and `sum(one_col)` decodes one column instead of the full width.
