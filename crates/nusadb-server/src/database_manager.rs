@@ -993,8 +993,8 @@ impl DatabaseCluster for DatabaseManager {
         let dir = base_dir(&self.root, name);
         if dir.exists() {
             // Nobody may have the orphan open: another process holding it keeps it.
-            let _lock = lock_database_dir(&dir, name)?;
-            std::fs::remove_dir_all(&dir).map_err(|e| ClusterError::Io(e.to_string()))?;
+            let lock = lock_database_dir(&dir, name)?;
+            remove_locked_database_dir(&dir, lock).map_err(|e| ClusterError::Io(e.to_string()))?;
         }
         // Likewise an archive a partial drop left under this name: it is another history's,
         // and the new engine would refuse to open against it.
@@ -1071,10 +1071,9 @@ impl DatabaseCluster for DatabaseManager {
         save_catalog(&self.root, &state.databases).map_err(|e| ClusterError::Io(e.to_string()))?;
         // Remove the database's storage last: the catalog no longer lists it, so a crash here leaves
         // an orphan directory (harmless — re-`CREATE` reuses it) rather than a dangling catalog entry.
-        if lock.is_some() {
-            std::fs::remove_dir_all(&dir).map_err(|e| ClusterError::Io(e.to_string()))?;
+        if let Some(lock) = lock {
+            remove_locked_database_dir(&dir, lock).map_err(|e| ClusterError::Io(e.to_string()))?;
         }
-        drop(lock);
         // The archive is the dropped database's history, not the name's: a database created
         // again under this name starts its own, and an engine refuses to open against an
         // archive of another line. Keep the old one aside for restores. The database is gone
@@ -1116,6 +1115,35 @@ fn lock_database_dir(dir: &Path, name: &str) -> Result<std::fs::File, ClusterErr
         },
         other => ClusterError::Io(other.to_string()),
     })
+}
+
+/// Remove the directory of a database whose lock `lock` is held. Everything but the lock file goes
+/// first, with the lock still held so no other process can open the database meanwhile; then the
+/// lock is released and the lock file and the directory go. Some systems refuse to delete a file
+/// while a handle to it is open, so the lock file is removed only after its handle is closed.
+fn remove_locked_database_dir(dir: &Path, lock: std::fs::File) -> io::Result<()> {
+    let mut lock_file = dir.join("btree.wal").into_os_string();
+    lock_file.push(".lock");
+    let lock_file = PathBuf::from(lock_file);
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == lock_file {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else if kind.is_symlink() {
+            // A link is removed, never followed; a link to a directory on Windows needs
+            // `remove_dir`.
+            std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    drop(lock);
+    std::fs::remove_dir_all(dir)
 }
 
 /// Take the exclusive lock on `<root>/global/cluster.lock`, creating the file if needed.
@@ -1766,6 +1794,23 @@ mod tests {
             assert_eq!(rows, vec![vec![val]], "{db} sees only its own row");
             engine.commit(txn).unwrap();
         }
+    }
+
+    /// A locked database directory is removed whole: its files and subdirectories while the lock
+    /// is held, then the lock file itself once released.
+    #[test]
+    fn a_locked_database_directory_is_removed_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("db");
+        std::fs::create_dir_all(dir.join("btree.wal.pages")).unwrap();
+        std::fs::write(dir.join("btree.wal"), b"log").unwrap();
+        std::fs::write(dir.join("btree.wal.ckpt"), b"image").unwrap();
+        std::fs::write(dir.join("btree.wal.pages").join("0.seg"), b"pages").unwrap();
+        let lock = lock_database_dir(&dir, "db").unwrap();
+        assert!(dir.join("btree.wal.lock").exists());
+
+        remove_locked_database_dir(&dir, lock).unwrap();
+        assert!(!dir.exists());
     }
 
     /// The health list reports a database that stopped after a storage error, and only that one:
