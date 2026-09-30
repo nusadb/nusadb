@@ -506,10 +506,10 @@ struct TableState {
     /// Absolute write churn since this table's stats were last refreshed by `ANALYZE`: the count of
     /// row operations (`inserts + updates + deletes`) each commit applies, reset to `0` when
     /// [`analyze_table`](StorageEngine::analyze_table) stores fresh stats. Unlike
-    /// [`approx_rows`](TableState::approx_rows) this is *absolute*, not net — a table churned heavily
-    /// but kept the same size still needs re-analysing, so an update and an insert+delete both count.
-    /// Consumed by auto-analyze to decide when the planner's histogram/MCV statistics have gone stale
-    /// (D-AUTO-ANALYZE). A hint only — a slightly stale value never affects correctness.
+    /// [`approx_rows`](TableState::approx_rows) this is *absolute*, not net, a table churned
+    /// heavily but kept the same size still needs re-analysing, so an update and an insert+delete
+    /// both count. Consumed by auto-analyze to decide when the planner's histogram/MCV statistics
+    /// have gone stale. A hint only: a slightly stale value never affects correctness.
     churn_since_analyze: AtomicU64,
     /// Rank 3 — the per-table writer latch: tree mutations, row-id minting, and the WAL append
     /// of each row op run under it, so same-table writes (and their log records) are totally
@@ -1948,17 +1948,23 @@ impl BtreeEngine {
     /// [`ensure_healthy`](Self::ensure_healthy)).
     fn fail_stop(&self, error: &Error) -> Error {
         let reason = error.to_string();
-        if let Ok(mut fault) = self.fault.lock()
-            && fault.is_none()
-        {
-            *fault = Some(reason.clone());
-        }
+        // A poisoned lock still logs: the error must never go unreported.
+        let first = self.fault.lock().map_or(true, |mut fault| {
+            let first = fault.is_none();
+            if first {
+                *fault = Some(reason.clone());
+            }
+            first
+        });
         self.faulted.store(true, Ordering::Release);
-        tracing::error!(
-            error = %reason,
-            "a storage error interrupted a change; the database refuses all work until it is \
-             restarted, which recovers it from its log"
-        );
+        // Logged once, for the error that stopped it; later ones are its consequences.
+        if first {
+            tracing::error!(
+                error = %reason,
+                "a storage error interrupted a change; the database refuses all work until it is \
+                 restarted, which recovers it from its log"
+            );
+        }
         stopped_error(&reason)
     }
 
@@ -2004,6 +2010,26 @@ impl BtreeEngine {
             self.guarded(dropped)?;
         }
         Ok(())
+    }
+
+    /// Every page of the trees and overflow chains still waiting in the purge queues.
+    fn queued_pages(&self) -> Result<Vec<u64>> {
+        let mut pages = Vec::new();
+        for entry in self.dropped.lock().map_err(|_| poisoned())?.iter() {
+            // A tree that cannot be walked (a damaged page) is left out: its pages then outlive a
+            // restart, which is better than a checkpoint that fails every time until one.
+            match self.dropped_tree_pages(entry) {
+                Ok(tree) => pages.extend(tree.into_iter().map(|p| p.0)),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "a tree queued for purge could not be walked; its pages stay in the image"
+                ),
+            }
+        }
+        for entry in self.retired.lock().map_err(|_| poisoned())?.iter() {
+            pages.extend(entry.pages.iter().map(|p| p.0));
+        }
+        Ok(pages)
     }
 
     /// Every page a temporary (non-durable) table or an index on one holds: the image carries
@@ -2543,8 +2569,9 @@ impl BtreeEngine {
                 }
             },
             LoggedOp::FreeAtOpen { pages } => {
-                // Pages a temporary object held when the image was taken: no durable object
-                // names them, so they are free from the start.
+                // Pages a temporary object held, or a tree or chain still queued for purge, when
+                // the image was taken: no durable object names them, so they are free from the
+                // start.
                 for &page in pages {
                     store.deallocate_page(nusadb_core::PageId(page))?;
                 }
@@ -4722,6 +4749,11 @@ impl BtreeEngine {
         // Rank order: commit_gate -> catalog(write) -> txns -> seqs -> wal.
         let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
         let cat = self.catalog.write().map_err(|_| poisoned())?;
+        // Trees and chains still queued for purge (a drop that committed after the reclamation
+        // above): the image carries their pages, but nothing will own them after a restart, when
+        // the queues are gone. Read here, between the catalog (which every push to the queues
+        // needs) and `txns`, as the lock ranks require.
+        let queued = self.queued_pages()?;
         let mut txns = self.txns.lock().map_err(|_| poisoned())?;
         // Again under the quiesce: a background pass that failed part way while this checkpoint
         // waited for the catalog has stopped the engine by now.
@@ -4771,7 +4803,10 @@ impl BtreeEngine {
         let named = ckpt_path(&wal.path);
         let dir = pages_dir(&wal.path);
         self.drop_all_dead_ranges(&cat)?;
-        let temporary = self.temporary_pages(&cat)?;
+        let mut unowned = self.temporary_pages(&cat)?;
+        unowned.extend(queued);
+        unowned.sort_unstable();
+        unowned.dedup();
         let page_count = self.store.page_count();
         let live = self.store.live_ids()?;
         // The segments the image being replaced reads from stay on disk until the checkpoint
@@ -4790,14 +4825,9 @@ impl BtreeEngine {
             write_segment_directory(&mut file, covered_lsn, page_count, &live, &plan)?;
             let file = file.into_inner().map_err(|e| Error::Io(e.into_error()))?;
             let mut writer = WalWriter::new(file);
-            Self::emit_image(
-                &cat,
-                &seqs,
-                synthetic_txn,
-                stamp,
-                &temporary,
-                &mut |record| writer.append(record).map(|_| ()),
-            )?;
+            Self::emit_image(&cat, &seqs, synthetic_txn, stamp, &unowned, &mut |record| {
+                writer.append(record).map(|_| ())
+            })?;
             // Drain the writer's append buffer to the file, then fsync — the image is durable
             // before its rename can make it authoritative.
             writer.flush()?;
@@ -9500,48 +9530,80 @@ impl BtreeEngine {
         {
             let mut dropped = self.dropped.lock().map_err(|_| poisoned())?;
             let _gate = self.reclaim.write().map_err(|_| poisoned())?;
+            // An entry leaves the queue only once its pages are known: a tree that cannot be
+            // walked stays queued for a later pass, rather than being forgotten and its pages
+            // leaked. After any failure every later entry stays queued untouched. An entry whose
+            // pages were partly freed when a deallocation failed is not requeued, since a retry
+            // would free its first pages twice.
             let mut keep: Vec<DroppedPages> = Vec::with_capacity(dropped.len());
-            for entry in dropped.drain(..) {
-                if settled(entry.txn) {
-                    let pages = match entry.alive_root {
-                        None => {
-                            stats.tables_reclaimed += 1;
-                            ClusteredTree::open(&*self.store, entry.root).pages()?
-                        },
-                        Some(alive_root) => {
-                            let mut pages = KeyTree::open(&self.store, entry.root).pages()?;
-                            pages.extend(KeyTree::open(&self.store, alive_root).pages()?);
-                            pages
-                        },
-                    };
-                    for page in pages {
-                        self.store.deallocate_page(page)?;
-                        stats.pages_reclaimed += 1;
-                    }
-                } else {
+            let mut failure = None;
+            for entry in std::mem::take(&mut *dropped) {
+                if failure.is_some() || !settled(entry.txn) {
                     keep.push(entry);
+                    continue;
+                }
+                match self.dropped_tree_pages(&entry) {
+                    Ok(pages) => {
+                        if entry.alive_root.is_none() {
+                            stats.tables_reclaimed += 1;
+                        }
+                        failure = self.deallocate_all(pages, stats).err();
+                    },
+                    Err(e) => {
+                        failure = Some(e);
+                        keep.push(entry);
+                    },
                 }
             }
             *dropped = keep;
+            if let Some(e) = failure {
+                return Err(e);
+            }
         }
         // Retired overflow chains: same gate, same settlement rule as a dropped tree.
         {
             let mut retired = self.retired.lock().map_err(|_| poisoned())?;
             let _gate = self.reclaim.write().map_err(|_| poisoned())?;
             let mut keep: Vec<RetiredPages> = Vec::with_capacity(retired.len());
-            for entry in retired.drain(..) {
-                if settled(entry.txn) {
-                    for page in entry.pages {
-                        self.store.deallocate_page(page)?;
-                        stats.pages_reclaimed += 1;
-                    }
-                } else {
+            let mut failure = None;
+            for entry in std::mem::take(&mut *retired) {
+                if failure.is_some() || !settled(entry.txn) {
                     keep.push(entry);
+                } else {
+                    failure = self.deallocate_all(entry.pages, stats).err();
                 }
             }
             *retired = keep;
+            if let Some(e) = failure {
+                return Err(e);
+            }
         }
         Ok(())
+    }
+
+    /// Deallocate `pages`, counting each one freed, and stop at the first failure.
+    fn deallocate_all(
+        &self,
+        pages: Vec<nusadb_core::PageId>,
+        stats: &mut PurgeStats,
+    ) -> Result<()> {
+        for page in pages {
+            self.store.deallocate_page(page)?;
+            stats.pages_reclaimed += 1;
+        }
+        Ok(())
+    }
+
+    /// Every page of the dropped tree (a table's, or an index's two) queued as `entry`.
+    fn dropped_tree_pages(&self, entry: &DroppedPages) -> Result<Vec<nusadb_core::PageId>> {
+        match entry.alive_root {
+            None => ClusteredTree::open(&*self.store, entry.root).pages(),
+            Some(alive_root) => {
+                let mut pages = KeyTree::open(&self.store, entry.root).pages()?;
+                pages.extend(KeyTree::open(&self.store, alive_root).pages()?);
+                Ok(pages)
+            },
+        }
     }
 
     /// Free the pages every settled dropped tree and retired overflow chain holds, without the
@@ -9636,6 +9698,105 @@ mod tests {
     use nusadb_core::{ColumnType, IsolationLevel, StorageEngine};
 
     use super::*;
+
+    fn t_def() -> TableDef {
+        TableDef {
+            schema: "public".to_owned(),
+            name: "t".to_owned(),
+            columns: vec![ColumnDef {
+                name: "v".to_owned(),
+                ty: ColumnType::Bytes,
+                nullable: false,
+            }],
+        }
+    }
+
+    /// Live pages of a database that only ever held an empty catalog, checkpointed and reopened.
+    fn empty_database_pages() -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("btree.wal");
+        BtreeEngine::open(&wal).unwrap().checkpoint().unwrap();
+        BtreeEngine::open(&wal).unwrap().live_pages().unwrap()
+    }
+
+    /// A dropped table still waiting for purge when a checkpoint runs leaves no page behind a
+    /// restart: its queue entry is gone then, so the image names its pages for freeing at open.
+    #[test]
+    fn a_tree_still_queued_at_a_checkpoint_is_freed_at_open() {
+        let level = IsolationLevel::ReadCommitted;
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("btree.wal");
+        {
+            let engine = BtreeEngine::open(&wal).unwrap();
+            let txn = engine.begin(level).unwrap();
+            let table = engine.create_table(txn, &t_def()).unwrap();
+            for i in 0..3000_u32 {
+                engine
+                    .insert(
+                        txn,
+                        table,
+                        format!("row-{i:05}-{}", "z".repeat(100)).as_bytes(),
+                    )
+                    .unwrap();
+            }
+            engine.commit(txn).unwrap();
+            let txn = engine.begin(level).unwrap();
+            engine.drop_table(txn, table).unwrap();
+            engine.commit(txn).unwrap();
+            // As if the drop committed after the checkpoint's own reclamation ran: still queued.
+            engine.dropped.lock().unwrap()[0].txn = u64::MAX;
+            engine.checkpoint().unwrap();
+            assert_eq!(engine.dropped.lock().unwrap().len(), 1);
+        }
+        let reopened = BtreeEngine::open(&wal).unwrap();
+        assert_eq!(reopened.live_pages().unwrap(), empty_database_pages());
+    }
+
+    /// A queued tree whose pages cannot be read stays queued, with every entry after it, instead
+    /// of being dropped from the queue and its pages leaked.
+    #[test]
+    fn a_queued_tree_that_cannot_be_walked_stays_queued() {
+        let level = IsolationLevel::ReadCommitted;
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("btree.wal");
+        {
+            let engine = BtreeEngine::open(&wal).unwrap();
+            let txn = engine.begin(level).unwrap();
+            let table = engine.create_table(txn, &t_def()).unwrap();
+            for i in 0..3000_u32 {
+                engine
+                    .insert(
+                        txn,
+                        table,
+                        format!("row-{i:05}-{}", "z".repeat(100)).as_bytes(),
+                    )
+                    .unwrap();
+            }
+            engine.commit(txn).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let engine = BtreeEngine::open(&wal).unwrap();
+        let table = engine.lookup_table("t").unwrap().unwrap().id;
+        let txn = engine.begin(level).unwrap();
+        engine.drop_table(txn, table).unwrap();
+        engine.commit(txn).unwrap();
+        // Damage the image's pages on disk; the dropped tree was never loaded, so walking it
+        // reads them.
+        for entry in std::fs::read_dir(dir.path().join("btree.wal.pages")).unwrap() {
+            let path = entry.unwrap().path();
+            let mut bytes = std::fs::read(&path).unwrap();
+            for page in 0..bytes.len() / nusadb_core::PAGE_SIZE {
+                bytes[page * nusadb_core::PAGE_SIZE + 100] ^= 0x33;
+            }
+            std::fs::write(&path, bytes).unwrap();
+        }
+        assert!(engine.purge().is_err());
+        assert_eq!(
+            engine.dropped.lock().unwrap().len(),
+            1,
+            "the entry stays queued"
+        );
+    }
 
     /// Purge must never settle a stamp minted after its snapshot: such a transaction is neither
     /// in the snapshot's active set nor pinned by any view it holds, so without the id horizon it

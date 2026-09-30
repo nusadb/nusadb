@@ -1,15 +1,16 @@
-//! Durable redo WAL for the clustered engine (phase 1: logical redo + full replay).
+//! Durable redo WAL for the clustered engine: logical redo records replayed after the checkpoint
+//! image.
 //!
-//! **Ordering (phase-1 honesty):** each mutating operation is applied to the in-memory structure
-//! **first** and its log record appended **after** (the engine's per-object write latch keeps the
-//! two adjacent and, per object, in the same order as replay). This is the *opposite* of
-//! write-ahead ordering, and it is safe **only because the page store is volatile in phase 1** —
-//! the WAL is the sole durable medium, so no unlogged change can ever reach durable storage ahead
-//! of its record, and only the log's own commit ordering matters. **This must become true
-//! write-ahead (log-before-apply) before the disk-backed page store lands** — once pages are
-//! flushed, an apply-before-log window is a real durability hole. `COMMIT` appends its marker and
-//! then **fsyncs** — that fsync is the durability point. Recovery replays the log in two passes:
-//! pass 1 collects the committed transaction set (a `CommitTxn` marker in the durable prefix),
+//! **Ordering:** each mutating operation is applied to its page **first** and its log record
+//! appended **after** (the engine's per-object write latch keeps the two adjacent and, per object,
+//! in the same order as replay). This is the *opposite* of write-ahead ordering, and it is safe
+//! only because a page reaches durable storage solely through a checkpoint image, which is taken
+//! under a quiesce with no transaction active, so every change it holds is already logged. Dirty
+//! pages spilled under memory pressure go to a scratch file recovery never reads. **Any path that
+//! writes pages back outside a checkpoint must first make this ordering write-ahead**
+//! (log-before-apply): otherwise an apply-before-log window is a real durability hole. `COMMIT`
+//! appends its marker and then **fsyncs**; that fsync is the durability point. Recovery replays
+//! the log in two passes: pass 1 collects the committed transaction set (a `CommitTxn` marker in the durable prefix),
 //! pass 2 re-applies, in log order, only the operations of committed transactions. Uncommitted
 //! tails need no undo — their operations are simply never replayed — and a partial `ROLLBACK TO
 //! SAVEPOINT` inside a later-committed transaction is logged as **compensation operations** (the
@@ -345,7 +346,8 @@ pub enum LoggedOp {
         alive_root: u64,
     },
     /// Image only: pages the image carries that no durable object owns (a temporary table's and
-    /// its indexes' pages, alive when the image was taken): free them at open.
+    /// its indexes' pages, trees and chains still waiting for purge when the image was taken):
+    /// free them at open.
     FreeAtOpen {
         /// The page ids to free.
         pages: Vec<u64>,
