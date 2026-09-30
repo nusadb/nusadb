@@ -458,7 +458,11 @@ fn build_auth(pairs: &[String]) -> Result<Option<Arc<AuthStore>>, Box<dyn std::e
 
 /// A tiny Prometheus scrape endpoint: respond to any request with the current metrics in the text
 /// exposition format. Runs until the task is aborted (on server shutdown).
-async fn serve_metrics(listener: TcpListener, metrics: std::sync::Arc<Metrics>) {
+async fn serve_metrics(
+    listener: TcpListener,
+    metrics: std::sync::Arc<Metrics>,
+    manager: std::sync::Arc<database_manager::DatabaseManager>,
+) {
     loop {
         let mut socket = match listener.accept().await {
             Ok((socket, _peer)) => socket,
@@ -471,6 +475,7 @@ async fn serve_metrics(listener: TcpListener, metrics: std::sync::Arc<Metrics>) 
             },
         };
         let metrics = std::sync::Arc::clone(&metrics);
+        let manager = std::sync::Arc::clone(&manager);
         tokio::spawn(async move {
             // Bound the whole exchange with a timeout: an unauthenticated client that connects
             // and never finishes sending (slowloris) must not park this task — and leak the socket /
@@ -480,7 +485,8 @@ async fn serve_metrics(listener: TcpListener, metrics: std::sync::Arc<Metrics>) 
                 // Best-effort read of the request; its contents are ignored.
                 let mut scratch = [0u8; 1024];
                 let _ = socket.read(&mut scratch).await;
-                let body = metrics.render_prometheus();
+                let mut body = metrics.render_prometheus();
+                body.push_str(&render_database_health(&manager.database_health()));
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -496,6 +502,33 @@ async fn serve_metrics(listener: TcpListener, metrics: std::sync::Arc<Metrics>) 
             }
         });
     }
+}
+
+/// Render the per-database stopped gauge in the Prometheus text format: `1` for a database that
+/// stopped after a storage error interrupted a change (it refuses all work until a restart), `0`
+/// for one that serves. Only databases opened since the server started are listed.
+fn render_database_health(health: &[(String, bool)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(
+        "# HELP nusadb_database_stopped 1 when the database stopped after a storage error \
+         interrupted a change and refuses work until a restart.\n\
+         # TYPE nusadb_database_stopped gauge\n",
+    );
+    for (name, stopped) in health {
+        // Database names are restricted to identifier characters, but escape what the label
+        // syntax reserves anyway.
+        let label = name
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        // Each write targets a String, so the formatting cannot fail.
+        let _ = writeln!(
+            out,
+            "nusadb_database_stopped{{database=\"{label}\"}} {}",
+            u8::from(*stopped)
+        );
+    }
+    out
 }
 
 /// Apply the **process-global** memory configuration once at startup.
@@ -749,7 +782,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         restore_database(&manager, name, &args)?;
         return Ok(());
     }
-    let cluster: Arc<dyn nusadb_wire::DatabaseCluster> = Arc::new(manager);
+    let manager = Arc::new(manager);
+    let cluster: Arc<dyn nusadb_wire::DatabaseCluster> = manager.clone();
     tracing::info!(
         data_dir = %args.data_dir,
         storage_engine = ?args.storage_engine,
@@ -821,6 +855,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(tokio::spawn(serve_metrics(
                 metrics_listener,
                 Arc::clone(&metrics),
+                Arc::clone(&manager),
             )))
         },
         None => None,
@@ -840,7 +875,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_auth_pairs;
+    use super::{render_database_health, resolve_auth_pairs};
+
+    #[test]
+    fn database_health_renders_one_gauge_per_database() {
+        let text =
+            render_database_health(&[("nusadb".to_owned(), false), ("shop".to_owned(), true)]);
+        assert!(text.contains("# TYPE nusadb_database_stopped gauge"));
+        assert!(text.contains("nusadb_database_stopped{database=\"nusadb\"} 0\n"));
+        assert!(text.contains("nusadb_database_stopped{database=\"shop\"} 1\n"));
+        // Well-formed exposition: every line is a comment or `name{labels} value`.
+        for line in text.lines() {
+            assert!(
+                line.starts_with('#') || line.split(' ').count() == 2,
+                "{line}"
+            );
+        }
+        // With nothing open, only the header is rendered.
+        assert_eq!(render_database_health(&[]).lines().count(), 2);
+    }
 
     #[test]
     fn restore_time_parses_rfc3339_utc_and_epoch_millis() {

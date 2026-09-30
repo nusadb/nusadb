@@ -370,10 +370,14 @@ The endpoint is unauthenticated, so bind it to a private address.
 | `nusadb_connections_active` | gauge | connections currently open |
 | `nusadb_queries_total` | counter | statements executed |
 | `nusadb_query_errors_total` | counter | statements that returned an error |
+| `nusadb_database_stopped{database="..."}` | gauge | `1` once that database has stopped after a storage error, `0` while it serves; listed for each database opened since start |
 
-That is enough to see whether the server is up and busy, and not enough for latency analysis:
-there are no duration histograms, per-database counters, or storage metrics yet, and no
-serialization-conflict counter, so track `40001` retries from the application side.
+Alert on `nusadb_database_stopped == 1`: a stopped database refuses every statement until the
+server restarts (see "When a storage error interrupts a change" under
+[Checkpoints, backup and restore](#checkpoints-backup-and-restore)).
+The rest is enough to see whether the server is up and busy, and not enough for latency analysis:
+there are no duration histograms, per-database query counters, or other storage metrics yet, and
+no serialization-conflict counter, so track `40001` retries from the application side.
 
 ---
 
@@ -422,7 +426,8 @@ ERROR XX000: i/o error: nusadb-btree: the database stopped after a storage error
 change (<the error>); restart it to recover from its log
 ```
 
-and the server log holds the same error at `ERROR`. Memory may then disagree with the log, so
+and the server log holds the same error at `ERROR`; the metrics endpoint reports it as
+`nusadb_database_stopped{database="<name>"} 1`. Memory may then disagree with the log, so
 the stopped database never checkpoints: its image stays exactly as the last good checkpoint left
 it. Other databases on the same server keep running. Fix the cause (check the disk, restore the
 damaged files from a backup), then restart the server: the database is rebuilt from its last

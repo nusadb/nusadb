@@ -29,7 +29,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use nusadb_btree::BtreeEngine;
@@ -64,6 +64,9 @@ struct ManagerState {
     /// Engines opened so far, keyed by database name. Absent until the first connection opens one.
     /// Type-erased: the whole surface above this point is engine-agnostic by construction.
     engines: HashMap<String, Arc<dyn StorageEngine>>,
+    /// The same engines, concretely typed and weakly held, so the metrics endpoint can ask each
+    /// whether it stopped after a storage error without keeping a dropped database alive.
+    health: HashMap<String, Weak<BtreeEngine>>,
 }
 
 /// A cluster of physically-isolated databases, each a `BtreeEngine` under `base/<db>/`.
@@ -187,6 +190,7 @@ impl DatabaseManager {
             state: Mutex::new(ManagerState {
                 databases,
                 engines: HashMap::new(),
+                health: HashMap::new(),
             }),
         })
     }
@@ -234,6 +238,25 @@ impl DatabaseManager {
         } else {
             base_dir(&self.root, name).join("btree.wal")
         }
+    }
+
+    /// Every database opened since the server started, sorted by name, with whether it stopped
+    /// after a storage error interrupted a change (it then refuses all work until a restart).
+    pub(crate) fn database_health(&self) -> Vec<(String, bool)> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut health: Vec<(String, bool)> = state
+            .health
+            .iter()
+            .filter_map(|(name, engine)| {
+                engine
+                    .upgrade()
+                    .map(|engine| (name.clone(), engine.fault().is_some()))
+            })
+            .collect();
+        health.sort_unstable();
+        health
     }
 
     /// Lazily open `name`'s engine, caching it. The caller holds `state` locked.
@@ -295,6 +318,9 @@ impl DatabaseManager {
         if let Some(cfg) = &self.standby {
             spawn_standby_scheduler(&engine, name, cfg);
         }
+        state
+            .health
+            .insert(name.to_owned(), Arc::downgrade(&engine));
         let engine: Arc<dyn StorageEngine> = engine;
         state.engines.insert(name.to_owned(), Arc::clone(&engine));
         Ok(engine)
@@ -1041,6 +1067,7 @@ impl DatabaseCluster for DatabaseManager {
             None
         };
         state.databases.remove(name);
+        state.health.remove(name);
         save_catalog(&self.root, &state.databases).map_err(|e| ClusterError::Io(e.to_string()))?;
         // Remove the database's storage last: the catalog no longer lists it, so a crash here leaves
         // an orphan directory (harmless — re-`CREATE` reuses it) rather than a dangling catalog entry.
@@ -1740,6 +1767,85 @@ mod tests {
             engine.commit(txn).unwrap();
         }
     }
+
+    /// The health list reports a database that stopped after a storage error, and only that one:
+    /// another database on the same server keeps serving and is reported healthy.
+    #[test]
+    fn database_health_reports_a_stopped_database_and_no_other() {
+        use nusadb_core::engine::{IsolationLevel, TableDef};
+        use nusadb_core::{ColumnDef, ColumnType, PAGE_SIZE};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        m.create("shop", false).unwrap();
+        assert!(m.database_health().is_empty(), "nothing is open yet");
+
+        // Give `shop` a checkpointed table, written before the manager opens it, so every page
+        // lives in the image's segments; then damage every page there.
+        let wal = base_dir(tmp.path(), "shop").join("btree.wal");
+        {
+            let engine = BtreeEngine::open(&wal).unwrap();
+            let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+            let def = TableDef {
+                schema: "public".to_owned(),
+                name: "t".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "v".to_owned(),
+                    ty: ColumnType::Bytes,
+                    nullable: false,
+                }],
+            };
+            let table = engine.create_table(txn, &def).unwrap();
+            for i in 0..2000_u32 {
+                engine.insert(txn, table, &i.to_le_bytes()).unwrap();
+            }
+            engine.commit(txn).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let pages = PathBuf::from(format!("{}.pages", wal.display()));
+        for entry in std::fs::read_dir(pages).unwrap() {
+            let path = entry.unwrap().path();
+            let mut bytes = std::fs::read(&path).unwrap();
+            for page in 0..bytes.len() / PAGE_SIZE {
+                bytes[page * PAGE_SIZE + PAGE_SIZE / 2] ^= 0x5A;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+
+        let shop = m.open("shop").unwrap().unwrap();
+        let main = m.open("nusadb").unwrap().unwrap();
+        // Both are listed once open. `shop` may already be stopped here: its background purge
+        // can reach a damaged page before the insert below does.
+        let names: Vec<String> = m.database_health().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["nusadb", "shop"]);
+
+        // A change to `shop` reaches a damaged page (unless the purge already did) and stops it.
+        let table = shop.lookup_table("t").unwrap().unwrap().id;
+        let err = shop
+            .begin(IsolationLevel::ReadCommitted)
+            .and_then(|txn| {
+                let result = shop.insert(txn, table, b"new");
+                let _ = shop.rollback(txn);
+                result
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stopped after a storage error"), "{err}");
+        assert_eq!(
+            m.database_health(),
+            vec![("nusadb".to_owned(), false), ("shop".to_owned(), true)]
+        );
+
+        // The other database still serves.
+        let txn = main.begin(IsolationLevel::ReadCommitted).unwrap();
+        main.commit(txn).unwrap();
+
+        // A dropped database leaves the list.
+        drop(shop);
+        assert!(m.drop_database("shop", false, "nusadb").unwrap());
+        assert_eq!(m.database_health(), vec![("nusadb".to_owned(), false)]);
+    }
+
     /// A btree-engine cluster round-trips through the same `DatabaseCluster` surface — the
     /// seam is engine-agnostic — and stamps the `engine` marker in the database directory.
     #[test]
