@@ -20,6 +20,16 @@ use nusadb_sql::{
     set_spill_config, set_work_mem,
 };
 
+/// The spill configuration and work memory are process-wide, so each test here holds this lock
+/// for its whole run; otherwise one test could reset them in the middle of the other.
+static SPILL_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spill_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPILL_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Minimal analyzer catalog over the engine's latest-committed schema.
 struct Cat<'a>(&'a dyn StorageEngine);
 impl Catalog for Cat<'_> {
@@ -48,6 +58,7 @@ fn rows(engine: &dyn StorageEngine, session: &mut Session, sql: &str) -> Vec<Row
 
 #[test]
 fn grace_join_matches_in_memory_for_every_kind_then_resets() {
+    let _spill = spill_config_lock();
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
 
@@ -125,14 +136,15 @@ fn grace_join_matches_in_memory_for_every_kind_then_resets() {
     set_spill_config(None);
 }
 
-/// Residual (QA): with spill configured (the server default) and a small
+/// Residual: with spill configured (the server default) and a small
 /// `work_mem`, a join whose PROBE side is far bigger than the budget — but whose build side is a
 /// tiny dim table — must stream: `LIMIT` and aggregates over it hold O(build), never O(probe).
 /// Before the fix the streaming arm was disabled whenever spill was on, so the materializing
-/// path buffered the whole probe input and the stage tripped `work_mem` (QA: `orders(1M) JOIN
-/// dim(100)` OOM even with `LIMIT 5`).
+/// path buffered the whole probe input and the stage tripped `work_mem` (`orders(1M) JOIN
+/// dim(100)` ran out of memory even with `LIMIT 5`).
 #[test]
 fn big_probe_small_build_streams_under_work_mem() {
+    let _spill = spill_config_lock();
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
 
@@ -172,7 +184,7 @@ fn big_probe_small_build_streams_under_work_mem() {
     }));
     set_work_mem(64 * 1024);
 
-    // LIMIT over the join: the exact QA repro shape.
+    // LIMIT over the join: the exact reported shape.
     let got = rows(
         engine,
         &mut session,

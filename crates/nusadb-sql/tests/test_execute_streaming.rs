@@ -1,4 +1,4 @@
-//! `Session::execute_streaming` (Phase 2 streaming output) must deliver, through a push
+//! `Session::execute_streaming` must deliver, through a push
 //! [`RowSink`], exactly the rows that the buffered `Session::execute` returns — for a linear `SELECT`
 //! (truly streamed), a blocking top operator (`ORDER BY`/`DISTINCT`, materialized once then drained),
 //! with spill on and off, inside an explicit transaction, and it must report a non-row statement as
@@ -18,6 +18,16 @@ use nusadb_sql::{
     Catalog, Error, ExecutionResult, IndexInfo, RowSink, RowsCommand, Session, SpillConfig,
     StreamOutcome, analyze, parse, plan, set_spill_config,
 };
+
+/// The spill configuration is process-wide, so the tests that change it take this lock for their
+/// whole run; otherwise one test could switch spill off in the middle of another.
+static SPILL_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spill_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPILL_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct Cat<'a>(&'a dyn StorageEngine);
 impl Catalog for Cat<'_> {
@@ -101,6 +111,7 @@ fn buffered(
 
 #[test]
 fn execute_streaming_matches_buffered_execute() {
+    let _spill = spill_config_lock();
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
 
@@ -264,7 +275,7 @@ fn execute_streaming_resolves_bare_select_sequence_calls() {
         sink.rows.into_iter().flatten().collect()
     };
 
-    // nextval advances 1, 2 on the streamed path (the exact form QA saw rejected via a driver).
+    // nextval advances 1, 2 on the streamed path (the exact form a driver saw rejected).
     assert_eq!(
         streamed(&mut session, "SELECT nextval('s')"),
         vec![Value::Int(1)]
@@ -298,7 +309,7 @@ fn execute_streaming_resolves_bare_select_sequence_calls() {
 fn execute_streaming_returning_reports_real_column_types() {
     // INSERT/UPDATE ... RETURNING streams through the buffered path then replays into the sink, so it
     // must still advertise the projection's real per-column types — like a streamed SELECT — instead
-    // of letting every column default to text (QA RETURNING-type finding). A non-text column reported
+    // of letting every column default to text. A non-text column reported
     // as text would hand a strict-typed driver a string for `RETURNING id`.
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut session = Session::new(engine);
@@ -491,6 +502,7 @@ fn selfjoin_build_side_flip_scale_evidence() {
 /// identical. Fresh sessions per phase defeat the per-session result cache.
 #[test]
 fn parallel_group_aggregate_under_spill_requires_bounded_stats() {
+    let _spill = spill_config_lock();
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut setup = Session::new(engine);
     run(engine, &mut setup, "CREATE TABLE g (k INT, v INT)");
@@ -549,6 +561,7 @@ fn parallel_group_aggregate_under_spill_requires_bounded_stats() {
 /// past the budget (tiny-budget case) stays on the sort-based fold.
 #[test]
 fn stats_routed_hash_fold_under_spill_matches() {
+    let _spill = spill_config_lock();
     let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
     let mut setup = Session::new(engine);
     run(engine, &mut setup, "CREATE TABLE gg (k INT, k2 INT, v INT)");
