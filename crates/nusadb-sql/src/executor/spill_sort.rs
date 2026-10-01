@@ -56,11 +56,26 @@ pub(super) fn sorted_input(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<SortedInput, Error> {
+    sorted_rows(
+        super::stream::stream_op(input, engine, txn)?.as_mut(),
+        keys,
+        config,
+    )
+}
+
+/// [`sorted_input`] over rows pulled from any `source`, which it drains before returning.
+///
+/// # Errors
+/// Propagates source, spill-file I/O, and key-evaluation errors.
+pub(super) fn sorted_rows(
+    src: &mut dyn super::stream::RowSource,
+    keys: &[OrderByKey],
+    config: &super::spill::SpillConfig,
+) -> Result<SortedInput, Error> {
     let seq = SORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut runs: Vec<super::spill::SpillReader> = Vec::new();
     let mut buf: Vec<Row> = Vec::new();
     let mut budget = super::spill::MemBudget::new(config.threshold_bytes);
-    let mut src = super::stream::stream_op(input, engine, txn)?;
 
     while let Some(row) = src.try_next()? {
         if !budget.admit(&row) {

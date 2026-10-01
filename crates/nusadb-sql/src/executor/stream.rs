@@ -456,6 +456,21 @@ pub(super) fn stream_op<'a>(
                 ))),
             }
         },
+        // A window over a partition larger than the budget evaluates from disk (see
+        // `spill_window`); the limit-aware ranking window keeps its bounded top-N path.
+        PhysicalOperator::Window {
+            input,
+            windows,
+            top_n: None,
+        } => match super::spill::spill_config() {
+            Some(cfg) => Ok(counted(
+                op,
+                super::spill_window::window_source(input, windows, &cfg, engine, txn)?,
+            )),
+            None => Ok(Box::new(Materialized(
+                execute_op(op, engine, txn)?.into_iter(),
+            ))),
+        },
         PhysicalOperator::Distinct { input } => match super::spill::spill_config() {
             Some(cfg) => Ok(counted(
                 op,

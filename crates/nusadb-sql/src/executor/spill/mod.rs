@@ -28,4 +28,4 @@ pub use context::{SpillConfig, set_spill_config};
 // `spill::<submodule>::` paths.
 pub(in crate::executor) use budget::MemBudget;
 pub(in crate::executor) use context::spill_config;
-pub(in crate::executor) use file::{SpillReader, SpillWriter};
+pub(in crate::executor) use file::{SharedSpill, SpillCursor, SpillReader, SpillWriter};

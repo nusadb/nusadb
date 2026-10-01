@@ -143,6 +143,7 @@ mod script;
 mod seqcatalog;
 mod spill_setop;
 mod spill_sort;
+mod spill_window;
 mod trigger;
 // Spill-to-disk subsystem: a bounded memory budget, then temp-file runs for the operators that
 // would otherwise hold their whole input.

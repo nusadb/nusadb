@@ -95,6 +95,81 @@ impl SpillWriter {
     }
 }
 
+impl SpillWriter {
+    /// Flush the buffered writes and share the file between any number of independent cursors
+    /// ([`SharedSpill::cursor`]). The file is deleted once the [`SharedSpill`] and every cursor
+    /// opened from it are gone.
+    ///
+    /// # Errors
+    /// [`Error::Core`] wrapping the underlying I/O error.
+    pub(in crate::executor) fn into_shared(mut self) -> Result<SharedSpill, Error> {
+        self.writer.flush().map_err(io_error)?;
+        self.handed_off = true;
+        Ok(SharedSpill {
+            path: std::rc::Rc::new(SharedPath(self.path.clone())),
+        })
+    }
+}
+
+/// Deletes a shared spill file once its last holder is gone.
+struct SharedPath(PathBuf);
+
+impl Drop for SharedPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A finished spill file that several cursors read independently, each from the start.
+pub(in crate::executor) struct SharedSpill {
+    path: std::rc::Rc<SharedPath>,
+}
+
+impl SharedSpill {
+    /// A new cursor positioned at the first row.
+    ///
+    /// # Errors
+    /// [`Error::Core`] wrapping the underlying I/O error if the file cannot be opened.
+    pub(in crate::executor) fn cursor(&self) -> Result<SpillCursor, Error> {
+        let file = File::open(&self.path.0).map_err(io_error)?;
+        Ok(SpillCursor {
+            _path: std::rc::Rc::clone(&self.path),
+            reader: BufReader::new(file),
+        })
+    }
+}
+
+/// One forward-only reader over a [`SharedSpill`]; keeps the file alive while it exists.
+pub(in crate::executor) struct SpillCursor {
+    _path: std::rc::Rc<SharedPath>,
+    reader: BufReader<File>,
+}
+
+impl SpillCursor {
+    /// Read the next row, or `Ok(None)` at end of file.
+    ///
+    /// # Errors
+    /// [`Error::Core`] for an I/O error, or [`Error::MalformedTuple`] if the record is corrupt.
+    pub(in crate::executor) fn read_row(&mut self) -> Result<Option<Row>, Error> {
+        read_row_from(&mut self.reader)
+    }
+}
+
+/// Read one length-prefixed row record from `reader`, or `Ok(None)` at a clean end of file.
+fn read_row_from(reader: &mut BufReader<File>) -> Result<Option<Row>, Error> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {},
+        // A clean EOF exactly at a record boundary is the normal end of the run.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(io_error(e)),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).map_err(io_error)?;
+    Ok(Some(codec::decode_row(&bytes)?))
+}
+
 impl Drop for SpillWriter {
     fn drop(&mut self) {
         if !self.handed_off {
@@ -123,17 +198,7 @@ impl SpillReader {
     /// # Errors
     /// [`Error::Core`] for an I/O error, or [`Error::MalformedTuple`] if the record is corrupt.
     pub(in crate::executor) fn read_row(&mut self) -> Result<Option<Row>, Error> {
-        let mut len_buf = [0u8; 4];
-        match self.reader.read_exact(&mut len_buf) {
-            Ok(()) => {},
-            // A clean EOF exactly at a record boundary is the normal end of the run.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(io_error(e)),
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut bytes = vec![0u8; len];
-        self.reader.read_exact(&mut bytes).map_err(io_error)?;
-        Ok(Some(codec::decode_row(&bytes)?))
+        read_row_from(&mut self.reader)
     }
 
     /// Read the next opaque record written by [`SpillWriter::write_bytes`], or `Ok(None)` at end of

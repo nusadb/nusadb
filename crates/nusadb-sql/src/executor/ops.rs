@@ -1990,20 +1990,23 @@ fn execute_op_inner(
             windows,
             top_n,
         } => {
-            let input_rows = match top_n {
-                // Limit-aware ranking window: the planner proved every
-                // window is ranking-only over a single partition sharing one order, and the outer
-                // LIMIT wants only the first `m` rows in that order — so compute over just the `m`
-                // smallest rows (bounded memory, no full materialization). A ranking value at
-                // position `k` depends only on rows at positions `≤ k`, so ranking over the first
-                // `m` rows is identical to the full computation for those rows.
-                Some(m) => {
-                    let order = windows.first().map_or(&[][..], |w| &w.order);
-                    top_n_rows(input, order, *m, engine, txn)?
-                },
-                None => execute_op(input, engine, txn)?,
-            };
-            run_window(input_rows, windows)
+            // Limit-aware ranking window: the planner proved every
+            // window is ranking-only over a single partition sharing one order, and the outer
+            // LIMIT wants only the first `m` rows in that order, so compute over just the `m`
+            // smallest rows (bounded memory, no full materialization). A ranking value at
+            // position `k` depends only on rows at positions `≤ k`, so ranking over the first
+            // `m` rows is identical to the full computation for those rows.
+            if let Some(m) = top_n {
+                let order = windows.first().map_or(&[][..], |w| &w.order);
+                return run_window(top_n_rows(input, order, *m, engine, txn)?, windows);
+            }
+            // With spill configured, partitions larger than the budget evaluate from disk.
+            if let Some(cfg) = super::spill::spill_config() {
+                return collect_rows(
+                    super::spill_window::window_source(input, windows, &cfg, engine, txn)?.as_mut(),
+                );
+            }
+            run_window(execute_op(input, engine, txn)?, windows)
         },
         PhysicalOperator::NestedLoopJoin {
             left,
@@ -4133,6 +4136,33 @@ pub(super) fn run_window(input_rows: Vec<Row>, windows: &[WindowExpr]) -> Result
     Ok(out)
 }
 
+/// The aggregate call a window aggregate folds with, or `None` for any other window function.
+pub(super) fn window_aggregate_call(window: &WindowExpr) -> Option<AggregateCall> {
+    match &window.func {
+        ast::WindowFunc::Aggregate(func) => Some(AggregateCall {
+            func: *func,
+            arg: window.args.first().cloned(),
+            result_ty: window.result_ty,
+            // Window aggregates do not carry DISTINCT, an ordered-set fraction, or the
+            // two-argument statistical forms; those are grouped-aggregate clauses.
+            // `FILTER` they do carry, and it means what it means for a grouped aggregate:
+            // a row contributes only when the predicate holds.
+            distinct: false,
+            fraction: None,
+            ordered_set_descending: false,
+            hypothetical_args: Vec::new(),
+            ordered_set_keys: Vec::new(),
+            filter: window.filter.clone(),
+            separator: None,
+            arg2: None,
+            order_by: Vec::new(),
+            row_args: Vec::new(),
+            grouping_args: Vec::new(),
+        }),
+        _ => None,
+    }
+}
+
 /// Compute one window function's value for every input row (returned in input
 /// order). Rows are bucketed by `PARTITION BY`; within a partition they are
 /// ordered by the window `ORDER BY` and the function is applied with the default
@@ -4183,29 +4213,7 @@ pub(super) fn compute_window(rows: &[Row], window: &WindowExpr) -> Result<Vec<as
 
     // Built once, not per partition: nothing in it depends on the bucket, and rebuilding it there
     // would clone the argument and filter expressions for every partition.
-    let aggregate_call = match &window.func {
-        W::Aggregate(func) => Some(AggregateCall {
-            func: *func,
-            arg: window.args.first().cloned(),
-            result_ty: window.result_ty,
-            // Window aggregates do not carry DISTINCT, an ordered-set fraction, or the
-            // two-argument statistical forms — those are grouped-aggregate clauses.
-            // `FILTER` they do carry, and it means what it means for a grouped aggregate:
-            // a row contributes only when the predicate holds.
-            distinct: false,
-            fraction: None,
-            ordered_set_descending: false,
-            hypothetical_args: Vec::new(),
-            ordered_set_keys: Vec::new(),
-            filter: window.filter.clone(),
-            separator: None,
-            arg2: None,
-            order_by: Vec::new(),
-            row_args: Vec::new(),
-            grouping_args: Vec::new(),
-        }),
-        _ => None,
-    };
+    let aggregate_call = window_aggregate_call(window);
 
     for bucket in &partitions {
         crate::cancel::check()?;
