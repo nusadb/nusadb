@@ -107,7 +107,7 @@ fn join_scan_estimate(op: &PhysicalOperator, engine: &dyn StorageEngine) -> Opti
 /// `group_keys`: the key columns' NDV product (plus a NULL group per nullable key) times a
 /// conservative per-group state size. `None` when the input is not a single analyzed table or
 /// any key is not a bare column — the caller then uses the estimate-free sort-based fold.
-fn estimated_group_state_bytes(
+pub(super) fn estimated_group_state_bytes(
     input: &PhysicalOperator,
     group_keys: &[TypedExpr],
     engine: &dyn StorageEngine,
@@ -1431,9 +1431,12 @@ pub fn parse_work_mem(value: &str) -> Option<usize> {
 /// the process default; `SET`-time validation rejects such values, so this is defense in depth,
 /// not a policy.
 pub(super) fn effective_work_mem() -> usize {
-    super::session_ctx::setting("work_mem")
-        .and_then(|v| parse_work_mem(&v))
-        .unwrap_or_else(work_mem)
+    session_work_mem().unwrap_or_else(work_mem)
+}
+
+/// The `work_mem` this session set with `SET`, if any (`None` when it relies on the server's).
+pub(super) fn session_work_mem() -> Option<usize> {
+    super::session_ctx::setting("work_mem").and_then(|v| parse_work_mem(&v))
 }
 
 /// Estimated heap + inline bytes of one value: the enum's own size plus the heap a
@@ -1486,6 +1489,15 @@ pub(super) fn enforce_work_mem(rows: &[Row]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Drain a row source into a `Vec`: the materializing form of a streaming operator.
+fn collect_rows(source: &mut dyn super::stream::RowSource) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    while let Some(row) = source.try_next()? {
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Execute one physical operator into a fully-materialized row set, enforcing the per-query
@@ -1894,7 +1906,7 @@ fn execute_op_inner(
         PhysicalOperator::Distinct { input } => {
             if let Some(cfg) = super::spill::spill_config() {
                 // Spill-to-disk: sort on all columns, emit one row per adjacent-equal run.
-                return sort_based_distinct(input, &cfg, engine, txn);
+                return collect_rows(&mut sort_based_distinct(input, &cfg, engine, txn)?);
             }
             let rows = execute_op(input, engine, txn)?;
             Ok(dedupe_rows(rows))
@@ -1948,9 +1960,9 @@ fn execute_op_inner(
                 match estimated_group_state_bytes(input, group_keys, engine) {
                     Some(est) if est <= budget / 2 => super::agg::note_stats_hash_agg(),
                     _ => {
-                        return sort_based_group_aggregate(
+                        return collect_rows(&mut sort_based_group_aggregate(
                             input, group_keys, calls, &cfg, engine, txn,
-                        );
+                        )?);
                     },
                 }
             }
@@ -4995,23 +5007,23 @@ pub(super) fn group_keys_equal(a: &[ast::Value], b: &[ast::Value]) -> bool {
 /// Spilling `DISTINCT`: bound working memory to ~`threshold_bytes` by sorting the input on
 /// **all** output columns (external merge sort, [`spill_sort::sorted_input`]) and emitting the first
 /// row of each adjacent-equal run. Duplicates land next to each other after the sort, so a single
-/// trailing `prev` row suffices to deduplicate — never the whole input at once.
+/// trailing `prev` row suffices to deduplicate, never the whole input or output at once.
 ///
 /// The sort keys are synthesized `Column(i)` references for `i in 0..width`. Their `ty` is a
 /// sort-only placeholder: [`eval`](crate::executor::eval::eval) resolves a `Column` ref by indexing
 /// the row and [`compare_order_key`](crate::executor::eval::compare_order_key) compares the resulting
-/// `Value` — neither reads the expression's declared type. Adjacent-run equality reuses
+/// `Value`; neither reads the expression's declared type. Adjacent-run equality reuses
 /// [`group_keys_equal`] (`NULL` is not distinct from `NULL`), matching the in-memory `dedupe_rows`
 /// predicate, so the result is the same multiset (order is unspecified for `DISTINCT`).
 ///
 /// # Errors
 /// Propagates streaming, spill-file I/O, and key-evaluation errors.
-fn sort_based_distinct(
+pub(super) fn sort_based_distinct(
     input: &PhysicalOperator,
     config: &super::spill::SpillConfig,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<Vec<Row>, Error> {
+) -> Result<SortedDistinct, Error> {
     use crate::planner::{OrderByKey, TypedExpr, TypedExprKind};
 
     let width = output_columns(input).len();
@@ -5026,32 +5038,50 @@ fn sort_based_distinct(
             nulls: ast::NullOrdering::Default,
         })
         .collect();
+    Ok(SortedDistinct {
+        sorted: super::spill_sort::sorted_input(input, &keys, config, engine, txn)?,
+        width,
+        prev: None,
+    })
+}
 
-    let mut sorted = super::spill_sort::sorted_input(input, &keys, config, engine, txn)?;
-    let mut out: Vec<Row> = Vec::new();
-    while let Some(row) = sorted.try_next()? {
-        // Adjacent-run dedup correctness depends on the sort covering *every* output column: if
-        // `width` under-counts the real row width, two true duplicates could be interleaved by a
-        // distinct row that ties on the sorted prefix and so escape de-duplication. The planner
-        // always seats `Distinct` directly above `Project`/`ProjectSet`, so `width` equals the row
-        // width — assert it so a future plan shape that breaks the invariant fails loudly in tests
-        // rather than silently returning duplicates.
-        debug_assert_eq!(
-            row.len(),
-            width,
-            "spilling DISTINCT sorts on all {width} columns, but a row has {} — the sort key would \
-             miss a column and adjacent-run dedup could keep duplicates",
-            row.len()
-        );
-        // The previously emitted distinct row is `out.last()`; comparing against it (instead of a
-        // cloned `prev`) drops one row clone per distinct output row — meaningful for a large
-        // DISTINCT result under a tight memory budget.
-        if out.last().is_some_and(|prev| group_keys_equal(prev, &row)) {
-            continue; // duplicate of the previously emitted row
+/// The output of [`sort_based_distinct`]: each distinct row once, as the sorted input streams past.
+pub(super) struct SortedDistinct {
+    sorted: super::spill_sort::SortedInput,
+    width: usize,
+    /// The last row emitted; a row equal to it is a duplicate.
+    prev: Option<Row>,
+}
+
+impl super::stream::RowSource for SortedDistinct {
+    fn try_next(&mut self) -> Result<Option<Row>, Error> {
+        while let Some(row) = self.sorted.try_next()? {
+            // Adjacent-run dedup correctness depends on the sort covering *every* output column: if
+            // `width` under-counts the real row width, two true duplicates could be interleaved by
+            // a distinct row that ties on the sorted prefix and so escape de-duplication. The
+            // planner always seats `Distinct` directly above `Project`/`ProjectSet`, so `width`
+            // equals the row width; assert it so a future plan shape that breaks the invariant
+            // fails loudly in tests rather than silently returning duplicates.
+            debug_assert_eq!(
+                row.len(),
+                self.width,
+                "spilling DISTINCT sorts on all {} columns, but a row has {}: the sort key would \
+                 miss a column and adjacent-run dedup could keep duplicates",
+                self.width,
+                row.len()
+            );
+            if self
+                .prev
+                .as_ref()
+                .is_some_and(|prev| group_keys_equal(prev, &row))
+            {
+                continue; // duplicate of the previously emitted row
+            }
+            self.prev = Some(row.clone());
+            return Ok(Some(row));
         }
-        out.push(row);
+        Ok(None)
     }
-    Ok(out)
 }
 
 /// Walk the pipeline to find the `Project` that names the output columns.

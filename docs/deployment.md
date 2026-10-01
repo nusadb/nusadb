@@ -34,9 +34,9 @@ the database.
 | `--statement-timeout` | `0` | Cancel any statement running longer than this many seconds (`57014`). Sessions can lower it with `SET statement_timeout`. |
 | `--drain-timeout` | `30` | On Ctrl-C or SIGTERM (the signal `docker stop` and Kubernetes send), wait this long for in-flight connections to finish before aborting them, then exit cleanly. `0` waits indefinitely. |
 | `--mem-budget` | `0` | Total memory budget in bytes. `0` auto-detects on Linux as the smaller of host RAM and the cgroup limit, so a container limit is honoured; on other systems `0` means no budget. The budget derives the limits below. |
-| `--max-resident-bytes` | derived | Ceiling on each database's in-memory page store; a row insert past it is refused with an error naming the limit. Derived from the memory budget (floor 256 MiB); unlimited when no budget is known. |
+| `--max-resident-bytes` | derived | Bound on each database's page cache: clean pages are evicted and changed pages spill past it, and an insert or update is refused only once what cannot leave memory reaches it (see [Table data](#table-data-a-page-cache-over-the-checkpoint-image)). Derived from the memory budget (floor 256 MiB); unlimited when no budget is known. |
 | `--work-mem` | `0` | Per-query memory for one sort, aggregate or join stage. Past it a stage spills (with `--spill-dir`) or fails with an error naming the limit. `0` is unlimited unless a budget derives a value. |
-| `--spill-dir` | none | Directory for transient spill files. Sorts and hash joins over `--work-mem` stream to it instead of failing. Stale files from a crash are removed at start-up. |
+| `--spill-dir` | none | Directory for transient spill files. Sorts, `DISTINCT`, `GROUP BY`, set operations and hash joins over `--work-mem` stream to it instead of failing. Stale files from a crash are removed at start-up. |
 | `--maintenance-work-mem` | `0` | Bytes of index entries a `CREATE INDEX` buffers before flushing a sorted batch. `0` uses a built-in bound. |
 | `--max-txn-write-bytes` | `0` | Ceiling on the uncommitted writes one transaction may buffer; past it the transaction fails with `XX000` instead of growing until the host kills the process. `0` derives 25% of the budget (floor 128 MiB). |
 | `--copy-max-bytes` | derived | Ceiling on one `COPY ... FROM STDIN`. Derived as about 20% of the budget, capped at 1 GiB; `0` is unbounded. |
@@ -186,12 +186,15 @@ The other three limits bound what a single client can do to the server:
 
 | Limit | Flag | Past it |
 | --- | --- | --- |
-| one executor stage (sort, aggregate, join) | `--work-mem` | spills to `--spill-dir` for sorts and hash joins; otherwise fails with a message naming the limit and the flag |
+| one executor stage (sort, aggregate, join) | `--work-mem` | spills to `--spill-dir` for sorts, `DISTINCT`, `GROUP BY`, set operations and hash joins; otherwise fails with a message naming the limit and the flag |
 | one transaction's uncommitted writes | `--max-txn-write-bytes` | the transaction fails with `XX000` |
 | one `COPY ... FROM STDIN` | `--copy-max-bytes` | the load is aborted; split it or raise the flag |
 
-Aggregation, `DISTINCT` and window functions do not spill yet; at the budget they fail rather than
-swap. A failed query leaves the server responsive, which is the point.
+A spilled sort, `DISTINCT` or `GROUP BY` streams its result to the client straight from the merge
+of its spill files, so a result larger than `--work-mem` is fine. Window functions, `DISTINCT ON`
+and `ROLLUP` / `CUBE` / `GROUPING SETS` do not spill yet; at the budget they fail rather than swap.
+A failed query leaves the server responsive, which is the point. A session's `SET work_mem` moves
+both the budget and the point where spilling starts.
 
 On Linux all of these derive from `--mem-budget`, which auto-detects the host or container limit, so
 a container with a memory limit gets sensible ceilings with no flags. On other systems set

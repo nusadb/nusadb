@@ -165,6 +165,74 @@ fn execute_streaming_matches_buffered_execute() {
     set_spill_config(None);
 }
 
+/// A sort, a `DISTINCT` and a `GROUP BY` whose results are far larger than `work_mem` stream
+/// their output off the merge of their spilled runs: the statement succeeds and returns exactly
+/// the rows an unbounded run does (a sort in the same order). Collecting such a result in memory
+/// would fail the statement on the budget.
+#[test]
+fn blocking_operators_stream_results_larger_than_work_mem() {
+    let _spill = spill_config_lock();
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    run(
+        engine,
+        &mut session,
+        "CREATE TABLE big (id INT, g INT, s TEXT)",
+    );
+    for start in (0..6000).step_by(500) {
+        let values = (start..start + 500)
+            .map(|i: i64| format!("({i}, {}, 'row-{:05}-padding-padding')", i % 1500, 6000 - i))
+            .collect::<Vec<_>>()
+            .join(",");
+        run(
+            engine,
+            &mut session,
+            &format!("INSERT INTO big VALUES {values}"),
+        );
+    }
+    let queries = [
+        ("SELECT s, id FROM big ORDER BY s", true),
+        ("SELECT DISTINCT s FROM big", false),
+        (
+            "SELECT g, COUNT(*), SUM(id), MAX(s) FROM big GROUP BY g",
+            false,
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT DISTINCT g FROM big) AS d",
+            false,
+        ),
+    ];
+    let streamed = |session: &mut Session, sql: &str| {
+        let mut sink = Collect::default();
+        session
+            .execute_streaming(planned(engine, sql), &mut sink)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        sink.rows
+    };
+    for (sql, ordered) in queries {
+        set_spill_config(None);
+        run(engine, &mut session, "RESET work_mem");
+        let mut want = streamed(&mut session, sql);
+
+        // The session's own budget: it is both the limit and the point where spilling starts.
+        set_spill_config(Some(SpillConfig {
+            dir: std::env::temp_dir(),
+            threshold_bytes: 64 * 1024 * 1024,
+        }));
+        run(engine, &mut session, "SET work_mem = '16kB'");
+        let mut got = streamed(&mut session, sql);
+        run(engine, &mut session, "RESET work_mem");
+        set_spill_config(None);
+
+        if !ordered {
+            want.sort_by_key(|r| format!("{r:?}"));
+            got.sort_by_key(|r| format!("{r:?}"));
+        }
+        assert!(!want.is_empty(), "{sql} produced no rows");
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
 /// (hash-join build-side selection): a self-join whose LEFT carries a selective
 /// pushed-down filter — the gated left-build flip's canonical shape — must stream exactly the
 /// buffered result, BOTH before ANALYZE (no statistics → the gate stays off, default

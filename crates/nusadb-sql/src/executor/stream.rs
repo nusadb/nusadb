@@ -6,11 +6,12 @@
 //! join or external sort, landing next) can draw rows one at a time and bound its own memory rather
 //! than receive a pre-materialized Vec.
 //!
-//! Inherently blocking operators (sort, aggregate, join, window, set-op, recursive CTE, …) are
-//! materialized once via [`execute_op`] and streamed back through [`Materialized`]. So [`stream_op`]
-//! is a faithful drop-in: it yields exactly the rows `execute_op` would, in the same order — it only
-//! changes *when* memory is held. Converting the blocking operators to spill internally is later
-//! work in this phase.
+//! With spill configured, a sort, a `DISTINCT` and a sort-based `GROUP BY` stream their output off
+//! the merge of their spilled runs, a hash join streams its probe side, and a scalar or hash-folded
+//! aggregate pulls its input. The remaining blocking operators (window, `DISTINCT ON`, grouping
+//! sets, recursive CTE, …) are materialized once via [`execute_op`] and streamed back through
+//! [`Materialized`]. Either way [`stream_op`] yields exactly the rows `execute_op` would, in the
+//! same order; it only changes *when* memory is held.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -35,6 +36,15 @@ struct Materialized(std::vec::IntoIter<Row>);
 impl RowSource for Materialized {
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
         Ok(self.0.next())
+    }
+}
+
+/// Streams an external merge sort's output as the merge produces it.
+struct SortedSource(super::spill_sort::SortedInput);
+
+impl RowSource for SortedSource {
+    fn try_next(&mut self) -> Result<Option<Row>, Error> {
+        self.0.try_next()
     }
 }
 
@@ -397,18 +407,63 @@ pub(super) fn stream_op<'a>(
                 };
             Ok(counted(op, Box::new(Materialized(vec![out].into_iter()))))
         },
-        // A group aggregate likewise folds its streamed input into per-group accumulators —
-        // O(groups) memory instead of O(input). When spill is configured, defer to `execute_op`
-        // (the sort-based spilling group-by) so the bounded-memory contract for huge group
-        // counts is preserved.
+        // A group aggregate likewise folds its streamed input into per-group accumulators:
+        // O(groups) memory instead of O(input). With spill configured, a group count the
+        // statistics do not bound within half the budget takes the sort-based fold instead, and
+        // its groups stream out as they finish, so neither the input nor the output is held.
         PhysicalOperator::GroupAggregate {
             input,
             group_keys,
             calls,
-        } if super::spill::spill_config().is_none() => {
+        } => {
+            if let Some(cfg) = super::spill::spill_config() {
+                let budget = u64::try_from(cfg.threshold_bytes).unwrap_or(u64::MAX);
+                match super::ops::estimated_group_state_bytes(input, group_keys, engine) {
+                    Some(est) if est <= budget / 2 => super::agg::note_stats_hash_agg(),
+                    _ => {
+                        return Ok(counted(
+                            op,
+                            Box::new(super::agg::sort_based_group_aggregate(
+                                input, group_keys, calls, &cfg, engine, txn,
+                            )?),
+                        ));
+                    },
+                }
+            }
             let mut child = stream_op(input, engine, txn)?;
             let out = super::agg::run_group_aggregate_streamed(child.as_mut(), group_keys, calls)?;
             Ok(counted(op, Box::new(Materialized(out.into_iter()))))
+        },
+        // With spill configured, a sort and a DISTINCT stream their output straight off the merge
+        // of their sorted runs, so a result larger than the budget never sits in memory. The sort
+        // shapes the merge cannot serve (a top-N, `WITH TIES`, a subquery in a key) keep the
+        // materializing path.
+        PhysicalOperator::Sort {
+            input,
+            keys,
+            limit_ties: None,
+            top_n: None,
+        } if !keys.iter().any(|k| contains_subquery(&k.expr)) => {
+            match super::spill::spill_config() {
+                Some(cfg) => Ok(counted(
+                    op,
+                    Box::new(SortedSource(super::spill_sort::sorted_input(
+                        input, keys, &cfg, engine, txn,
+                    )?)),
+                )),
+                None => Ok(Box::new(Materialized(
+                    execute_op(op, engine, txn)?.into_iter(),
+                ))),
+            }
+        },
+        PhysicalOperator::Distinct { input } => match super::spill::spill_config() {
+            Some(cfg) => Ok(counted(
+                op,
+                Box::new(super::ops::sort_based_distinct(input, &cfg, engine, txn)?),
+            )),
+            None => Ok(Box::new(Materialized(
+                execute_op(op, engine, txn)?.into_iter(),
+            ))),
         },
         // A literal integer `generate_series` in FROM streams lazily (O(1) state) instead of
         // materializing every element — the common ETL source shape.

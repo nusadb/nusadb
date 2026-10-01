@@ -49,13 +49,13 @@ pub(super) fn external_sort(
 ///
 /// # Errors
 /// Propagates streaming, spill-file I/O, and key-evaluation errors.
-pub(super) fn sorted_input<'a>(
+pub(super) fn sorted_input(
     input: &PhysicalOperator,
-    keys: &'a [OrderByKey],
+    keys: &[OrderByKey],
     config: &super::spill::SpillConfig,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<SortedInput<'a>, Error> {
+) -> Result<SortedInput, Error> {
     let seq = SORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut runs: Vec<super::spill::SpillReader> = Vec::new();
     let mut buf: Vec<Row> = Vec::new();
@@ -84,12 +84,12 @@ pub(super) fn sorted_input<'a>(
 
 /// A forward cursor over the fully-sorted rows: either an in-memory buffer (input fit the budget) or
 /// a k-way merge of on-disk runs.
-pub(super) enum SortedInput<'a> {
+pub(super) enum SortedInput {
     Memory(std::vec::IntoIter<Row>),
-    Merge(MergeCursor<'a>),
+    Merge(MergeCursor),
 }
 
-impl SortedInput<'_> {
+impl SortedInput {
     /// The next sorted row, or `Ok(None)` at end.
     ///
     /// # Errors
@@ -103,17 +103,14 @@ impl SortedInput<'_> {
 }
 
 /// Lazy k-way merge of sorted on-disk runs via a min-heap over the run heads.
-pub(super) struct MergeCursor<'a> {
+pub(super) struct MergeCursor {
     runs: Vec<super::spill::SpillReader>,
     heap: BinaryHeap<Reverse<Head>>,
-    keys: &'a [OrderByKey],
+    keys: Vec<OrderByKey>,
 }
 
-impl<'a> MergeCursor<'a> {
-    fn new(
-        mut runs: Vec<super::spill::SpillReader>,
-        keys: &'a [OrderByKey],
-    ) -> Result<Self, Error> {
+impl MergeCursor {
+    fn new(mut runs: Vec<super::spill::SpillReader>, keys: &[OrderByKey]) -> Result<Self, Error> {
         let mut heap = BinaryHeap::new();
         for run in 0..runs.len() {
             if let Some(reader) = runs.get_mut(run)
@@ -126,7 +123,11 @@ impl<'a> MergeCursor<'a> {
                 }));
             }
         }
-        Ok(Self { runs, heap, keys })
+        Ok(Self {
+            runs,
+            heap,
+            keys: keys.to_vec(),
+        })
     }
 
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
@@ -139,7 +140,7 @@ impl<'a> MergeCursor<'a> {
             && let Some(row) = reader.read_row()?
         {
             self.heap.push(Reverse(Head {
-                keys: eval_keys(self.keys, &row)?,
+                keys: eval_keys(&self.keys, &row)?,
                 run,
                 row,
             }));

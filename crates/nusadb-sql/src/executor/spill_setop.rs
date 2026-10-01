@@ -86,12 +86,12 @@ fn cmp_rows(a: &Row, b: &Row) -> Ordering {
 }
 
 /// A forward, sorted cursor over a set-op (sub)tree: a sorted leaf, or a merge node.
-enum SetSource<'a> {
-    Leaf(SortedInput<'a>),
-    Node(Box<SetMerge<'a>>),
+enum SetSource {
+    Leaf(SortedInput),
+    Node(Box<SetMerge>),
 }
 
-impl SetSource<'_> {
+impl SetSource {
     fn next_row(&mut self) -> Result<Option<Row>, Error> {
         match self {
             Self::Leaf(src) => src.try_next(),
@@ -102,14 +102,14 @@ impl SetSource<'_> {
 
 /// A [`SetSource`] with one row of look-ahead, so a merge can compare and count run boundaries on its
 /// children's heads without consuming them.
-struct Peek<'a> {
-    src: SetSource<'a>,
+struct Peek {
+    src: SetSource,
     head: Option<Row>,
     primed: bool,
 }
 
-impl<'a> Peek<'a> {
-    const fn new(src: SetSource<'a>) -> Self {
+impl Peek {
+    const fn new(src: SetSource) -> Self {
         Self {
             src,
             head: None,
@@ -175,18 +175,18 @@ enum Heads {
 }
 
 /// A streaming sorted-merge of two sorted child cursors under one set operator.
-struct SetMerge<'a> {
+struct SetMerge {
     op: ast::SetOp,
     all: bool,
-    left: Peek<'a>,
-    right: Peek<'a>,
+    left: Peek,
+    right: Peek,
     /// Last value emitted (non-`ALL` `UNION` dedup against the previous output row).
     last: Option<Row>,
     /// Remaining identical copies still to emit for the current value (`ALL` multiset counts).
     pending: Option<(Row, usize)>,
 }
 
-impl SetMerge<'_> {
+impl SetMerge {
     /// The next merged row, or `None` at end. Drains buffered `ALL` repeats first, then advances the
     /// per-operator merge.
     fn next_row(&mut self) -> Result<Option<Row>, Error> {
@@ -337,13 +337,13 @@ impl SetMerge<'_> {
 ///
 /// # Errors
 /// Propagates run-generation (streaming + spill I/O) and key-evaluation errors.
-fn build_stream<'a>(
+fn build_stream(
     tree: &SetOpTree<PhysicalOperator>,
-    keys: &'a [OrderByKey],
+    keys: &[OrderByKey],
     config: &super::spill::SpillConfig,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<Peek<'a>, Error> {
+) -> Result<Peek, Error> {
     let src = match tree {
         SetOpTree::Leaf(op) => SetSource::Leaf(super::spill_sort::sorted_input(
             op, keys, config, engine, txn,

@@ -25,21 +25,23 @@ pub(super) fn note_stats_hash_agg() {
 }
 
 /// Spilling group-by: sort the input by the group keys via the external merge sort (which
-/// spills to disk under the work-memory budget), then fold *adjacent* groups in one streaming pass —
-/// so only one group's rows plus the merge heads are held in memory, not the whole input or every
-/// group at once. Result is the same multiset as [`run_group_aggregate_streamed`]: rows sharing a group key
-/// are adjacent after sorting (`group_keys_equal` ⇒ they compare equal ⇒ they sort together).
+/// spills to disk under the work-memory budget), then fold *adjacent* groups in one streaming pass.
+/// Only the current group's accumulators and the merge heads are held in memory, never the input,
+/// a whole group's rows, or the output. Result is the same multiset as
+/// [`run_group_aggregate_streamed`]: rows sharing a group key are adjacent after sorting
+/// (`group_keys_equal` ⇒ they compare equal ⇒ they sort together), and each group folds its rows
+/// through the same [`accumulate_row`] steps [`fold_aggregates`] takes.
 ///
 /// # Errors
 /// Propagates streaming, spill-file, sort, and aggregate-evaluation errors.
-pub(super) fn sort_based_group_aggregate(
+pub(super) fn sort_based_group_aggregate<'a>(
     input: &PhysicalOperator,
-    group_keys: &[TypedExpr],
-    calls: &[AggregateCall],
+    group_keys: &'a [TypedExpr],
+    calls: &'a [AggregateCall],
     config: &super::spill::SpillConfig,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<Vec<Row>, Error> {
+) -> Result<SortedGroups<'a>, Error> {
     // Sort by every group key (ascending, default NULL placement — only adjacency matters here).
     let order: Vec<crate::planner::OrderByKey> = group_keys
         .iter()
@@ -49,37 +51,62 @@ pub(super) fn sort_based_group_aggregate(
             nulls: ast::NullOrdering::Default,
         })
         .collect();
-    let mut sorted = super::spill_sort::sorted_input(input, &order, config, engine, txn)?;
+    Ok(SortedGroups {
+        sorted: super::spill_sort::sorted_input(input, &order, config, engine, txn)?,
+        group_keys,
+        calls,
+        current: None,
+    })
+}
 
-    let mut out = Vec::new();
-    let mut group: Vec<Row> = Vec::new();
-    let mut current: Option<Vec<ast::Value>> = None;
-    while let Some(row) = sorted.try_next()? {
-        let key = group_keys
-            .iter()
-            .map(|k| eval_arg(k, &row))
-            .collect::<Result<Vec<_>, _>>()?;
-        let same_group = current
-            .as_ref()
-            .is_some_and(|prev| group_keys_equal(prev, &key));
-        if !same_group {
-            // Group boundary: emit the just-finished group (if any), then start a new one.
-            if let Some(prev) = current.take() {
-                let mut out_row = prev;
-                out_row.extend(fold_aggregates(calls, &group)?);
-                out.push(out_row);
-                group.clear();
-            }
-            current = Some(key);
+/// The output of [`sort_based_group_aggregate`]: one row per group, folded as the sorted input
+/// streams past.
+pub(super) struct SortedGroups<'a> {
+    sorted: super::spill_sort::SortedInput,
+    group_keys: &'a [TypedExpr],
+    calls: &'a [AggregateCall],
+    /// The group being folded: its key and its accumulators.
+    current: Option<(Vec<ast::Value>, Vec<Acc>)>,
+}
+
+impl SortedGroups<'_> {
+    /// The finished output row of one group: its key followed by each aggregate's value.
+    fn finish(&self, (key, accs): (Vec<ast::Value>, Vec<Acc>)) -> Result<Row, Error> {
+        let mut out_row = key;
+        for (acc, call) in accs.into_iter().zip(self.calls) {
+            out_row.push(finalize_aggregate(acc, call)?);
         }
-        group.push(row);
+        Ok(out_row)
     }
-    if let Some(prev) = current {
-        let mut out_row = prev;
-        out_row.extend(fold_aggregates(calls, &group)?);
-        out.push(out_row);
+}
+
+impl super::stream::RowSource for SortedGroups<'_> {
+    fn try_next(&mut self) -> Result<Option<Row>, Error> {
+        while let Some(row) = self.sorted.try_next()? {
+            let key = self
+                .group_keys
+                .iter()
+                .map(|k| eval_arg(k, &row))
+                .collect::<Result<Vec<_>, _>>()?;
+            let finished = match &self.current {
+                Some((prev, _)) if group_keys_equal(prev, &key) => None,
+                // Group boundary: the row opens the next group and the previous one is done.
+                _ => self
+                    .current
+                    .replace((key, vec![Acc::default(); self.calls.len()])),
+            };
+            if let Some((_, accs)) = &mut self.current {
+                accumulate_row(accs, self.calls, &row)?;
+            }
+            if let Some(group) = finished {
+                return self.finish(group).map(Some);
+            }
+        }
+        self.current
+            .take()
+            .map(|group| self.finish(group))
+            .transpose()
     }
-    Ok(out)
 }
 
 /// Multi-grouping-set aggregation over a **pulled row stream** (/ the

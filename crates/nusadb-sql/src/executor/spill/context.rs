@@ -34,9 +34,16 @@ pub fn set_spill_config(config: Option<SpillConfig>) {
     }
 }
 
-/// The active spill configuration, or `None` when spill-to-disk is disabled.
+/// The active spill configuration, or `None` when spill-to-disk is disabled. A session that set
+/// its own non-zero `work_mem` spills at that size: the budget an operator fails at and the point
+/// it starts spilling must be the same number, or a lowered `work_mem` would fail queries that
+/// could have spilled.
 pub(in crate::executor) fn spill_config() -> Option<SpillConfig> {
-    SPILL_CONFIG.read().ok().and_then(|g| g.clone())
+    let mut config = SPILL_CONFIG.read().ok().and_then(|g| g.clone())?;
+    if let Some(session) = super::super::ops::session_work_mem().filter(|&bytes| bytes > 0) {
+        config.threshold_bytes = session;
+    }
+    Some(config)
 }
 
 #[cfg(test)]
@@ -55,6 +62,23 @@ mod tests {
         let got = spill_config().expect("just set");
         assert_eq!(got.dir, PathBuf::from("scratch"));
         assert_eq!(got.threshold_bytes, 4096);
+
+        // A session's own `work_mem` moves the spill point with the budget it fails at; `0` (no
+        // budget) and no setting at all keep the server's threshold.
+        let session = |work_mem: Option<&str>| {
+            let settings: std::collections::HashMap<String, String> = work_mem
+                .map(|v| ("work_mem".to_owned(), v.to_owned()))
+                .into_iter()
+                .collect();
+            crate::executor::session_ctx::set_session_context("u", &settings, "db", "public", None);
+        };
+        session(Some("64kB"));
+        assert_eq!(spill_config().expect("set").threshold_bytes, 64 * 1024);
+        session(Some("0"));
+        assert_eq!(spill_config().expect("set").threshold_bytes, 4096);
+        session(None);
+        assert_eq!(spill_config().expect("set").threshold_bytes, 4096);
+
         set_spill_config(None);
         assert!(spill_config().is_none(), "cleared");
     }
