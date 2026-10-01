@@ -1703,14 +1703,16 @@ fn execute_op_inner(
             }
         },
         PhysicalOperator::Filter { input, predicate } => {
-            let rows = execute_op(input, engine, txn)?;
             // WHERE and HAVING both lower to a Filter; pre-resolve any uncorrelated subquery in the
             // predicate once before scanning rows. Any subquery left after that is
             // correlated and is resolved per row against the bound outer row.
             let predicate = resolved_expr(predicate, engine, txn)?;
             let correlated = contains_subquery(&predicate);
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
+            // Pull the input through the streaming cursor, so only the rows that pass are held:
+            // a selective WHERE over a large table no longer materializes the whole table first.
+            let mut rows = super::stream::stream_op(input, engine, txn)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.try_next()? {
                 let verdict = if correlated {
                     eval_correlated(&predicate, &row, engine, txn)?
                 } else {

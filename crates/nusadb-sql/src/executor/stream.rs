@@ -432,6 +432,8 @@ pub(super) fn stream_op<'a>(
             }
             let mut child = stream_op(input, engine, txn)?;
             let out = super::agg::run_group_aggregate_streamed(child.as_mut(), group_keys, calls)?;
+            // The groups are held whole here, so they answer to the budget like any stage.
+            super::ops::enforce_work_mem(&out)?;
             Ok(counted(op, Box::new(Materialized(out.into_iter()))))
         },
         // With spill configured, a sort and a DISTINCT stream their output straight off the merge

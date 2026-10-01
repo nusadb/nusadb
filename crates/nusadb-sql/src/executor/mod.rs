@@ -5169,7 +5169,7 @@ fn replace_rows(
     txn: TxnId,
     table_id: nusadb_core::TableId,
     schema: &[ColumnType],
-    rows: &[Row],
+    next_row: &mut dyn FnMut() -> Result<Option<Row>, Error>,
 ) -> Result<(), Error> {
     let mut old = Vec::new();
     let mut scan = engine.scan(txn, table_id)?;
@@ -5188,12 +5188,15 @@ fn replace_rows(
         Some(table) => dml::secondary_index_targets(&table, engine)?,
         None => Vec::new(),
     };
-    for row in rows {
-        let tid = engine.insert(txn, table_id, &row::encode(row, schema)?)?;
-        dml::insert_into_indexes(&index_targets, row, tid, engine, txn)?;
+    while let Some(row) = next_row()? {
+        let tid = engine.insert(txn, table_id, &row::encode(&row, schema)?)?;
+        dml::insert_into_indexes(&index_targets, &row, tid, engine, txn)?;
     }
     Ok(())
 }
+
+/// Monotonic id for refresh spill file names (process-local uniqueness; not persisted).
+static REFRESH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `CREATE MATERIALIZED VIEW`: run the body once and store its rows in a backing table named
 /// after the view, so reads are ordinary table scans, and record its defining SQL so it can be
@@ -5239,10 +5242,11 @@ fn run_create_materialized_view(
         &format!("{}.{}", def.schema, def.name),
         &session_ctx::current_user(),
     )?;
-    let rows = execute_op(&p.body, engine, txn)?;
+    // The backing table is new, so the body cannot read it: stream the rows straight in.
     let schema: Vec<ColumnType> = p.columns.iter().map(|(_, ty)| *ty).collect();
-    for row in &rows {
-        engine.insert(txn, table_id, &row::encode(row, &schema)?)?;
+    let mut rows = stream::stream_op(&p.body, engine, txn)?;
+    while let Some(row) = rows.try_next()? {
+        engine.insert(txn, table_id, &row::encode(&row, &schema)?)?;
     }
     store_view_def(engine, txn, MATVIEW_CATALOG, &p.name, &p.definition_sql)?;
     // Register for incremental maintenance when the body is IVM-eligible; otherwise the view
@@ -5381,11 +5385,12 @@ fn run_create_table_as(
         &format!("{}.{}", def.schema, def.name),
         &session_ctx::current_user(),
     )?;
-    // Compute the source rows before inserting; the body never reads the new (empty) table.
-    let rows = execute_op(&p.body, engine, txn)?;
+    // Stream the source rows straight into the new table: the body never reads the new (empty)
+    // table, so inserting as the rows arrive is the same as inserting them all at the end.
     let schema: Vec<ColumnType> = p.columns.iter().map(|(_, ty)| *ty).collect();
-    for row in &rows {
-        engine.insert(txn, table_id, &row::encode(row, &schema)?)?;
+    let mut rows = stream::stream_op(&p.body, engine, txn)?;
+    while let Some(row) = rows.try_next()? {
+        engine.insert(txn, table_id, &row::encode(&row, &schema)?)?;
     }
     Ok(ExecutionResult::Created(table_id))
 }
@@ -5465,10 +5470,37 @@ fn run_refresh_materialized_view(
             "materialized view definition is not a SELECT".to_owned(),
         ));
     };
-    let rows = execute_op(&op, engine, txn)?;
     let schema = column_types(&table);
-    replace_rows(engine, txn, table.id, &schema, &rows)?;
-    Ok(ExecutionResult::MaterializedViewRefreshed(rows.len()))
+    // The new rows are complete before any old one is deleted: the query may read the view's own
+    // table. With spill configured they wait in a spill file rather than in memory.
+    let mut source = stream::stream_op(&op, engine, txn)?;
+    let mut count = 0usize;
+    if let Some(cfg) = spill::spill_config() {
+        let seq = REFRESH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = cfg.dir.join(format!(
+            "nusadb-spill-refresh-{}-{seq}.tmp",
+            std::process::id()
+        ));
+        let mut writer = spill::SpillWriter::create(path)?;
+        while let Some(row) = source.try_next()? {
+            writer.write_row(&row)?;
+            count += 1;
+        }
+        drop(source);
+        let mut reader = writer.into_reader()?;
+        replace_rows(engine, txn, table.id, &schema, &mut || reader.read_row())?;
+    } else {
+        let mut rows = Vec::new();
+        while let Some(row) = source.try_next()? {
+            rows.push(row);
+        }
+        drop(source);
+        ops::enforce_work_mem(&rows)?;
+        count = rows.len();
+        let mut rows = rows.into_iter();
+        replace_rows(engine, txn, table.id, &schema, &mut || Ok(rows.next()))?;
+    }
+    Ok(ExecutionResult::MaterializedViewRefreshed(count))
 }
 
 /// `DROP [MATERIALIZED] VIEW` — drop the view's backing table and forget its definition (sqlparser

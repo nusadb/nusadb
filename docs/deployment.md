@@ -198,7 +198,14 @@ partition larger than the budget, `RANGE` and `GROUPS` frames with an offset, `E
 still fail at the budget, as does a `ROWS` frame wider than the budget; split such a partition
 with `PARTITION BY`.
 `DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` do not spill yet; at the budget they fail
-rather than swap.
+rather than swap. `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `INSERT ... SELECT` stream
+the query's rows into the table as they come, so a large result over a table scan does not have to
+fit either (`INSERT ... SELECT` falls back to holding the result when the query reads the target
+table, has a subquery, or the target has triggers, foreign keys or incrementally maintained views).
+A query that reads through an index range still holds the rows of that range.
+`REFRESH MATERIALIZED VIEW` keeps the new rows in a spill file until the old ones are replaced.
+`UPDATE ... FROM` and `DELETE ... USING` over a subquery, and `DECLARE CURSOR`, still hold the
+subquery's or cursor's whole result.
 A failed query leaves the server responsive, which is the point. A session's `SET work_mem` moves
 both the budget and the point where spilling starts.
 

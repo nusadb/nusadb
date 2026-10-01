@@ -1007,11 +1007,12 @@ fn duplicate_key_error(kind: &str, name: &str, columns: &[String]) -> Error {
 /// Streaming interleaves reads of the source with writes to the target, so it must be provably
 /// equivalent to the materialized path. That holds only when **all** of:
 ///
-/// - The source pipeline is a whitelist of truly streaming operators (seq-scan / filter /
-///   project / limit — exactly what [`stream_op`](super::stream::stream_op) streams without
-///   materializing; joins, aggregates, sorts, SRF projections, and set operations buffer
-///   internally and are excluded) — **none of whose scans read the target table**, and none of
-///   whose expressions carry a subquery (a subquery re-scans at eval time). A single
+/// - The source pipeline is a whitelist of operators [`stream_op`](super::stream::stream_op)
+///   streams without materializing: seq-scan, filter, project and limit, plus (with spill
+///   configured) sort, `DISTINCT`, aggregates and window, which drain their input before their
+///   first row. Joins, SRF projections and set operations are excluded. **None of its scans may
+///   read the target table**, and none of its expressions may carry a subquery (a subquery
+///   re-scans at eval time). A single
 ///   already-open scan of the target would be Halloween-safe (the version list is snapshotted at
 ///   scan open), but re-scans (join inner, subquery) would observe our own fresh inserts; ruling
 ///   the target out entirely keeps the proof local.
@@ -1056,12 +1057,13 @@ fn insert_select_can_stream(
     Ok(true)
 }
 
-/// Whether `op` is a pipeline of truly streaming operators that never reads `target` and carries
-/// no subquery (see [`insert_select_can_stream`]). The whitelist is exactly the set
-/// [`stream_op`](super::stream::stream_op) streams without materializing — including the lazy
-/// literal-integer `generate_series` source — anything else (joins, aggregates, sorts, general
-/// SRF projections, …) it buffers via `execute_op`, so streaming them here would buy nothing and
-/// dodge the `work_mem` guard. Fails closed on operators outside the list.
+/// Whether `op` is a pipeline of streaming operators that never reads `target` and carries no
+/// subquery (see [`insert_select_can_stream`]). The whitelist is the set
+/// [`stream_op`](super::stream::stream_op) streams without materializing: the linear operators,
+/// the lazy literal-integer `generate_series` source, and (with spill configured) sorts,
+/// `DISTINCT`, aggregates and windows. Anything else (joins, general SRF projections, set
+/// operations, …) it buffers via `execute_op`, so streaming them here would buy nothing and dodge
+/// the `work_mem` guard. Fails closed on operators outside the list.
 fn stream_safe_source(op: &PhysicalOperator, target: nusadb_core::TableId) -> bool {
     use super::ops::contains_subquery;
     match op {
@@ -1076,8 +1078,43 @@ fn stream_safe_source(op: &PhysicalOperator, target: nusadb_core::TableId) -> bo
             columns.iter().all(|p| !contains_subquery(&p.expr)) && stream_safe_source(input, target)
         },
         PhysicalOperator::Limit { input, .. } => stream_safe_source(input, target),
+        // With spill configured these stream their output too (a sort, `DISTINCT`, sort-based
+        // `GROUP BY` and window from their spill files), and each drains its whole input before
+        // producing a row. They qualify on the same terms: no scan of the target and no subquery
+        // anywhere in their expressions.
+        PhysicalOperator::Sort {
+            input,
+            limit_ties: None,
+            top_n: None,
+            ..
+        }
+        | PhysicalOperator::Distinct { input }
+        | PhysicalOperator::GroupAggregate { input, .. }
+        | PhysicalOperator::ScalarAggregate { input, .. }
+        | PhysicalOperator::Window {
+            input, top_n: None, ..
+        } => {
+            super::spill::spill_config().is_some()
+                && stream_safe_source(input, target)
+                && !mentions_subquery(op)
+        },
         _ => false,
     }
+}
+
+/// Whether any expression in `op` (or below it) may hold a subquery. Checked on the operator's
+/// debug form, which names every expression variant: a false hit only keeps the statement on the
+/// materializing path.
+fn mentions_subquery(op: &PhysicalOperator) -> bool {
+    let rendered = format!("{op:?}");
+    [
+        "ScalarSubquery",
+        "Exists",
+        "InSubquery",
+        "QuantifiedSubquery",
+    ]
+    .iter()
+    .any(|variant| rendered.contains(variant))
 }
 
 /// Stream an `INSERT ... SELECT` source into the target in [`INSERT_SELECT_BATCH`]-row batches:
