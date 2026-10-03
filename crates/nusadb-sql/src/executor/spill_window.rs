@@ -8,12 +8,12 @@
 //!
 //! A partition that fits the budget is evaluated in memory by [`compute_window`] itself. A larger
 //! one is written to a spill file and evaluated as it streams back, with independent cursors over
-//! the file for the functions that look ahead (a peer group's end, a `LEAD`, a frame's last row).
-//! That covers the ranking and distribution functions, `LAG`/`LEAD` with a constant offset, and
-//! the value and aggregate functions over frames that start at the partition (or, for the value
-//! functions, a few rows back) and end at the current row, its peers, a few rows ahead or the
-//! partition end. Other frames over a partition larger than the budget would need the whole
-//! partition in memory, so they fail with the budget error instead.
+//! the file for the functions that look ahead or behind: the ranking and distribution functions,
+//! `LAG`/`LEAD` with a constant offset, running aggregates from the partition start, any `ROWS`,
+//! `RANGE` or `GROUPS` frame (holding just the frame's rows), and aggregates from the current row
+//! to the partition end (computed backwards). What still needs memory past the budget is a frame
+//! wider than the budget, `LAG`/`LEAD` with an offset that varies per row, and `NTH_VALUE` with
+//! such a position over a `ROWS` or default frame; those fail with the budget error.
 //!
 //! Rows leave in partition order rather than input order; a query that orders its result has a
 //! `Sort` above the window, which the planner always places there.
@@ -276,7 +276,7 @@ impl<'a> WindowPass<'a> {
         let evaluators = self
             .windows
             .iter()
-            .map(|w| evaluator(w, &shared, len, self.config.threshold_bytes))
+            .map(|w| evaluator(w, &shared, len, &self.config))
             .collect::<Result<Vec<_>, _>>()?;
         self.large = Some(LargePartition {
             rows: shared.cursor()?,
@@ -366,8 +366,9 @@ fn evaluator<'a>(
     window: &'a WindowExpr,
     file: &SharedSpill,
     len: usize,
-    budget: usize,
+    config: &SpillConfig,
 ) -> Result<Box<dyn Evaluator + 'a>, Error> {
+    let budget = config.threshold_bytes;
     let unsupported = || {
         Error::Core(nusadb_core::Error::OutOfMemory(format!(
             "query work_mem of {budget} bytes exceeded: a window partition larger than the budget \
@@ -415,8 +416,11 @@ fn evaluator<'a>(
             {
                 return Ok(Box::new(value));
             }
+            if let Some(sliding) = Sliding::new(window, None, file, len, budget)? {
+                return Ok(Box::new(sliding));
+            }
             Ok(Box::new(
-                Sliding::new(window, None, file, len, budget)?.ok_or_else(unsupported)?,
+                PeerSliding::new(window, None, file, len, budget)?.ok_or_else(unsupported)?,
             ))
         },
         W::Aggregate(_) => {
@@ -435,10 +439,22 @@ fn evaluator<'a>(
                         window, call, file, len, hi,
                     )?))
                 },
-                _ => Ok(Box::new(
-                    Sliding::new(window, window_aggregate_call(window), file, len, budget)?
-                        .ok_or_else(unsupported)?,
-                )),
+                _ => {
+                    if let Some(call) = window_aggregate_call(window)
+                        && let Some(reversed) = Reversed::try_new(window, &call, file, config)?
+                    {
+                        return Ok(Box::new(reversed));
+                    }
+                    if let Some(sliding) =
+                        Sliding::new(window, window_aggregate_call(window), file, len, budget)?
+                    {
+                        return Ok(Box::new(sliding));
+                    }
+                    Ok(Box::new(
+                        PeerSliding::new(window, window_aggregate_call(window), file, len, budget)?
+                            .ok_or_else(unsupported)?,
+                    ))
+                },
             }
         },
     }
@@ -1158,5 +1174,476 @@ impl Evaluator for Sliding<'_> {
             },
         };
         target.map_or(Ok(ast::Value::Null), |(_, r, _)| eval::eval(value_expr, r))
+    }
+}
+
+/// One row held by [`PeerSliding`]: its partition position, the row, its ordering key and the
+/// number of its peer group (rows with equal ordering keys share one, counted from 0).
+struct PeerRow {
+    pos: usize,
+    row: Row,
+    key: Vec<ast::Value>,
+    group: usize,
+}
+
+/// A `RANGE` or `GROUPS` frame (any bounds, `EXCLUDE` included) over a partition read from disk.
+/// The rows from the frame start (or the current row, if earlier) to the frame end are held with
+/// their peer group numbers; each bound is found the way [`frame_bounds`] finds it in memory, and
+/// since both bounds only move forward the held rows drop off the front. Memory is the frame's
+/// width, so a frame wider than the budget fails with the budget error.
+struct PeerSliding<'a> {
+    window: &'a WindowExpr,
+    frame: &'a crate::planner::WindowFrame,
+    call: Option<AggregateCall>,
+    len: usize,
+    budget: usize,
+    held: VecDeque<PeerRow>,
+    held_bytes: usize,
+    ahead: SpillCursor,
+    /// Rows read from `ahead` so far.
+    read: usize,
+    /// The ordering key and group number of the last row read.
+    last: Option<(Vec<ast::Value>, usize)>,
+}
+
+impl<'a> PeerSliding<'a> {
+    /// `None` unless the window has an explicit peer-based (`RANGE` / `GROUPS`) frame.
+    fn new(
+        window: &'a WindowExpr,
+        call: Option<AggregateCall>,
+        file: &SharedSpill,
+        len: usize,
+        budget: usize,
+    ) -> Result<Option<Self>, Error> {
+        let Some(frame) = window.frame.as_ref().filter(|f| f.peer_based) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            window,
+            frame,
+            call,
+            len,
+            budget,
+            held: VecDeque::new(),
+            held_bytes: 0,
+            ahead: file.cursor()?,
+            read: 0,
+            last: None,
+        }))
+    }
+
+    /// Read one more row into the held window; `false` at the partition's end.
+    fn read_one(&mut self) -> Result<bool, Error> {
+        let Some(row) = self.ahead.read_row()? else {
+            return Ok(false);
+        };
+        let key = order_key(&self.window.order, &row)?;
+        let group = match &self.last {
+            Some((prev, group)) if group_keys_equal(prev, &key) => *group,
+            Some((_, group)) => group + 1,
+            None => 0,
+        };
+        self.last = Some((key.clone(), group));
+        self.held_bytes += row_bytes(&row) + row_bytes(&key);
+        self.held.push_back(PeerRow {
+            pos: self.read,
+            row,
+            key,
+            group,
+        });
+        self.read += 1;
+        Ok(true)
+    }
+
+    /// Read until the last row held satisfies `done` (the frame end lies behind it) or the
+    /// partition ends.
+    fn read_until(&mut self, done: impl Fn(&PeerRow) -> bool) -> Result<(), Error> {
+        while self.held.back().is_none_or(|last| !done(last)) {
+            if !self.read_one()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `RANGE` key of an ordering key: its first value, `None` when `NULL` or unsupported.
+    fn range_of(key: &[ast::Value]) -> Option<super::ops::RangeKey> {
+        key.first().and_then(super::ops::range_key)
+    }
+
+    /// Whether a row's `RANGE` key is on the inside of `boundary` for a start (`at_start`) or end
+    /// bound, as the in-memory range scan decides it.
+    fn reaches(
+        descending: bool,
+        key: &[ast::Value],
+        boundary: super::ops::RangeKey,
+        at_start: bool,
+    ) -> bool {
+        let ascending = !descending;
+        Self::range_of(key).is_some_and(|k| {
+            let ord = k.compare(boundary);
+            if at_start == ascending {
+                ord != std::cmp::Ordering::Less
+            } else {
+                ord != std::cmp::Ordering::Greater
+            }
+        })
+    }
+}
+
+impl Evaluator for PeerSliding<'_> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per frame bound kind, mirroring frame_bounds"
+    )]
+    fn value(&mut self, k: usize, row: &Row) -> Result<ast::Value, Error> {
+        // The current row and its peer group.
+        while self.read <= k {
+            if !self.read_one()? {
+                break;
+            }
+        }
+        let Some(current) = self.held.iter().find(|r| r.pos == k) else {
+            return Ok(ast::Value::Null);
+        };
+        let group = current.group;
+        let current_key = current.key.clone();
+        let last_pos = self.len.saturating_sub(1);
+        // The current peer group's last position: read until a row of a later group is held.
+        self.read_until(|r| r.group > group)?;
+        let peer_lo = self
+            .held
+            .iter()
+            .find(|r| r.group == group)
+            .map_or(k, |r| r.pos);
+        let peer_hi = self
+            .held
+            .iter()
+            .rev()
+            .find(|r| r.group == group)
+            .map_or(k, |r| r.pos);
+        let descending = self.frame.range_descending;
+        let ascending = !descending;
+        let ranged = matches!(
+            self.frame.start,
+            FrameBound::RangePreceding(_) | FrameBound::RangeFollowing(_)
+        ) || matches!(
+            self.frame.end,
+            FrameBound::RangePreceding(_) | FrameBound::RangeFollowing(_)
+        );
+        let current_range = Self::range_of(&current_key);
+        // A NULL current ordering value frames only its peers.
+        let (lo, hi) = if ranged && current_range.is_none() {
+            (Some(peer_lo), Some(peer_hi))
+        } else {
+            let group_at = |this: &Self, target: usize, first: bool| -> Option<usize> {
+                let mut rows = this.held.iter().filter(|r| r.group == target);
+                if first { rows.next() } else { rows.next_back() }.map(|r| r.pos)
+            };
+            let boundary = |off: &ast::Value, preceding: bool| {
+                current_range
+                    .and_then(|cur| super::ops::range_boundary(cur, off, preceding, ascending))
+            };
+            let lo = match &self.frame.start {
+                FrameBound::UnboundedPreceding => Some(0),
+                FrameBound::CurrentRow => Some(peer_lo),
+                FrameBound::Preceding(n) => {
+                    let target = group.saturating_sub(usize::try_from(*n).unwrap_or(usize::MAX));
+                    group_at(self, target, true)
+                },
+                FrameBound::Following(n) => {
+                    let n = usize::try_from(*n).unwrap_or(usize::MAX);
+                    let target = group.saturating_add(n);
+                    self.read_until(|r| r.group > target)?;
+                    // Past the last group the bound clamps to the last group.
+                    let last_group = self.held.back().map_or(group, |r| r.group.min(target));
+                    group_at(self, last_group, true)
+                },
+                FrameBound::RangePreceding(off) | FrameBound::RangeFollowing(off) => {
+                    let preceding = matches!(self.frame.start, FrameBound::RangePreceding(_));
+                    // An overflowing boundary lies before the partition (PRECEDING) or after it.
+                    match boundary(off, preceding) {
+                        // Before the partition: its first row with a value (NULLs are outside).
+                        None if preceding => Some(
+                            self.held
+                                .iter()
+                                .find(|r| Self::range_of(&r.key).is_some())
+                                .map_or(self.len, |r| r.pos),
+                        ),
+                        None => Some(self.len),
+                        Some(b) => {
+                            self.read_until(|r| Self::reaches(descending, &r.key, b, true))?;
+                            Some(
+                                self.held
+                                    .iter()
+                                    .find(|r| Self::reaches(descending, &r.key, b, true))
+                                    .map_or(self.len, |r| r.pos),
+                            )
+                        },
+                    }
+                },
+                FrameBound::UnboundedFollowing => Some(last_pos),
+            };
+            let hi = match &self.frame.end {
+                FrameBound::UnboundedFollowing => {
+                    self.read_until(|_| false)?;
+                    Some(last_pos)
+                },
+                FrameBound::CurrentRow => Some(peer_hi),
+                FrameBound::Following(n) => {
+                    let target = group.saturating_add(usize::try_from(*n).unwrap_or(usize::MAX));
+                    self.read_until(|r| r.group > target)?;
+                    let last_group = self.held.back().map_or(group, |r| r.group.min(target));
+                    group_at(self, last_group, false)
+                },
+                FrameBound::Preceding(n) => {
+                    let target = group.saturating_sub(usize::try_from(*n).unwrap_or(usize::MAX));
+                    group_at(self, target, false)
+                },
+                FrameBound::RangePreceding(off) | FrameBound::RangeFollowing(off) => {
+                    let preceding = matches!(self.frame.end, FrameBound::RangePreceding(_));
+                    match boundary(off, preceding) {
+                        None if preceding => None,
+                        // After the partition: its last row with a value (NULLs are outside).
+                        None => {
+                            self.read_until(|_| false)?;
+                            self.held
+                                .iter()
+                                .rev()
+                                .find(|r| Self::range_of(&r.key).is_some())
+                                .map(|r| r.pos)
+                        },
+                        Some(b) => {
+                            // Read past the last row within the boundary: a later row outside it
+                            // (a NULL ordering value included, since the NULLs sort together at
+                            // one end and a non-NULL current row is not among them), or the end.
+                            self.read_until(|r| !Self::reaches(descending, &r.key, b, false))?;
+                            self.held
+                                .iter()
+                                .rev()
+                                .find(|r| Self::reaches(descending, &r.key, b, false))
+                                .map(|r| r.pos)
+                        },
+                    }
+                },
+                FrameBound::UnboundedPreceding => Some(0),
+            };
+            (lo, hi)
+        };
+        // Rows before both the frame start and the current row are never needed again.
+        let keep_from = lo.unwrap_or(k).min(k);
+        while self.held.front().is_some_and(|r| r.pos < keep_from) {
+            if let Some(gone) = self.held.pop_front() {
+                self.held_bytes = self
+                    .held_bytes
+                    .saturating_sub(row_bytes(&gone.row) + row_bytes(&gone.key));
+            }
+        }
+        if self.budget != 0 && self.held.len() > 1 && self.held_bytes > self.budget {
+            return Err(Error::Core(nusadb_core::Error::OutOfMemory(format!(
+                "query work_mem of {} bytes exceeded: the window frame of {} holds {} bytes; use \
+                 a narrower frame or raise work_mem (SET work_mem / --work-mem)",
+                self.budget,
+                sql_name(&self.window.func),
+                self.held_bytes
+            ))));
+        }
+        let in_frame = |pos: usize| match (lo, hi) {
+            (Some(lo), Some(hi)) => lo <= pos && pos <= hi && lo <= last_pos,
+            _ => false,
+        };
+        if let Some(call) = &self.call {
+            let frame = self.held.iter().filter(|r| {
+                in_frame(r.pos)
+                    && match self.frame.exclude {
+                        ast::WindowExclude::NoOthers => true,
+                        ast::WindowExclude::CurrentRow => r.pos != k,
+                        ast::WindowExclude::Group => r.group != group,
+                        ast::WindowExclude::Ties => r.pos == k || r.group != group,
+                    }
+            });
+            return Ok(super::agg::fold_aggregates(
+                std::slice::from_ref(call),
+                frame.map(|r| &r.row),
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or(ast::Value::Null));
+        }
+        let Some(value_expr) = self.window.args.first() else {
+            return Ok(ast::Value::Null);
+        };
+        let mut frame = self.held.iter().filter(|r| in_frame(r.pos));
+        let target = match self.window.func {
+            W::FirstValue => frame.next(),
+            W::LastValue => frame.next_back(),
+            _ => match self
+                .window
+                .args
+                .get(1)
+                .map(|e| eval::eval(e, row))
+                .transpose()?
+            {
+                Some(ast::Value::Int(n)) if n >= 1 => {
+                    usize::try_from(n - 1).ok().and_then(|i| frame.nth(i))
+                },
+                _ => None,
+            },
+        };
+        target.map_or(Ok(ast::Value::Null), |r| eval::eval(value_expr, &r.row))
+    }
+}
+
+/// An aggregate over a frame from the current row (or its first peer) to the partition's end,
+/// computed backwards: read in reverse, that frame runs from the start through the current row
+/// (or its last peer), which one accumulator folds as it goes. The values are written per
+/// partition position and sorted back into partition order. Only for aggregates whose value does
+/// not depend on the order rows are folded in (a floating-point sum can round differently).
+struct Reversed {
+    values: SortedInput,
+}
+
+impl Reversed {
+    /// `None` unless the frame and aggregate qualify.
+    fn try_new(
+        window: &WindowExpr,
+        call: &AggregateCall,
+        file: &SharedSpill,
+        config: &SpillConfig,
+    ) -> Result<Option<Self>, Error> {
+        let Some(frame) = &window.frame else {
+            return Ok(None);
+        };
+        if !matches!(frame.start, FrameBound::CurrentRow)
+            || !matches!(frame.end, FrameBound::UnboundedFollowing)
+            || !matches!(frame.exclude, ast::WindowExclude::NoOthers)
+        {
+            return Ok(None);
+        }
+        let order_free = match call.func {
+            ast::AggregateFunc::Count | ast::AggregateFunc::Min | ast::AggregateFunc::Max => true,
+            ast::AggregateFunc::Sum | ast::AggregateFunc::Avg => {
+                !matches!(call.result_ty, ColumnType::Float)
+            },
+            _ => false,
+        };
+        if !order_free {
+            return Ok(None);
+        }
+        // The partition in reverse: each row tagged with its partition position, sorted on it
+        // descending.
+        let mut tagged = PositionTagged {
+            rows: file.cursor()?,
+            next: 0,
+        };
+        let descending = OrderByKey {
+            expr: crate::planner::TypedExpr {
+                kind: crate::planner::TypedExprKind::Column(0),
+                ty: ColumnType::BigInt,
+            },
+            ascending: false,
+            nulls: ast::NullOrdering::Default,
+        };
+        let mut backwards = super::spill_sort::sorted_rows(&mut tagged, &[descending], config)?;
+        let seq = WINDOW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut out = SpillWriter::create(config.dir.join(format!(
+            "nusadb-spill-window-{}-{seq}.tmp",
+            std::process::id()
+        )))?;
+        let mut acc = super::agg::Acc::reversed();
+        // The positions of the current peer group (for a RANGE / GROUPS frame) awaiting its value:
+        // a peer group's rows are adjacent in the partition, so its lowest and highest position.
+        let mut group: Option<(i64, i64)> = None;
+        let mut group_key: Option<Vec<ast::Value>> = None;
+        let flush = |out: &mut SpillWriter, span: Option<(i64, i64)>, value: &ast::Value| {
+            if let Some((lo, hi)) = span {
+                for pos in lo..=hi {
+                    out.write_row(&[ast::Value::Int(pos), value.clone()])?;
+                }
+            }
+            Ok::<_, Error>(())
+        };
+        let mut seen = 0usize;
+        while let Some(mut tagged_row) = backwards.try_next()? {
+            seen += 1;
+            if seen.is_multiple_of(1024) {
+                crate::cancel::check()?;
+            }
+            let pos = match tagged_row.first() {
+                Some(ast::Value::Int(pos)) => *pos,
+                _ => return Err(Error::Internal("window row lost its position".to_owned())),
+            };
+            let row: Row = tagged_row.drain(1..).collect();
+            if frame.peer_based {
+                let key = order_key(&window.order, &row)?;
+                if group_key
+                    .as_ref()
+                    .is_some_and(|k| !group_keys_equal(k, &key))
+                {
+                    let value = super::agg::finalize_aggregate(acc.clone(), call)?;
+                    flush(&mut out, group.take(), &value)?;
+                }
+                group_key = Some(key);
+                RunningAggregate::fold(&mut acc, call, &row)?;
+                group = Some(group.map_or((pos, pos), |(lo, hi)| (lo.min(pos), hi.max(pos))));
+            } else {
+                RunningAggregate::fold(&mut acc, call, &row)?;
+                let value = super::agg::finalize_aggregate(acc.clone(), call)?;
+                out.write_row(&[ast::Value::Int(pos), value])?;
+            }
+        }
+        if group.is_some() {
+            let value = super::agg::finalize_aggregate(acc, call)?;
+            flush(&mut out, group.take(), &value)?;
+        }
+        let ascending = OrderByKey {
+            expr: crate::planner::TypedExpr {
+                kind: crate::planner::TypedExprKind::Column(0),
+                ty: ColumnType::BigInt,
+            },
+            ascending: true,
+            nulls: ast::NullOrdering::Default,
+        };
+        let mut written = ReaderRows(out.into_reader()?);
+        let values = super::spill_sort::sorted_rows(&mut written, &[ascending], config)?;
+        Ok(Some(Self { values }))
+    }
+}
+
+impl Evaluator for Reversed {
+    fn value(&mut self, _k: usize, _row: &Row) -> Result<ast::Value, Error> {
+        Ok(self
+            .values
+            .try_next()?
+            .and_then(|mut pair| pair.pop())
+            .unwrap_or(ast::Value::Null))
+    }
+}
+
+/// The rows of a partition file, each prefixed with its partition position.
+struct PositionTagged {
+    rows: SpillCursor,
+    next: i64,
+}
+
+impl RowSource for PositionTagged {
+    fn try_next(&mut self) -> Result<Option<Row>, Error> {
+        let Some(row) = self.rows.read_row()? else {
+            return Ok(None);
+        };
+        let mut tagged = Vec::with_capacity(row.len() + 1);
+        tagged.push(ast::Value::Int(self.next));
+        tagged.extend(row);
+        self.next += 1;
+        Ok(Some(tagged))
+    }
+}
+
+/// The rows of a finished spill file.
+struct ReaderRows(super::spill::SpillReader);
+
+impl RowSource for ReaderRows {
+    fn try_next(&mut self) -> Result<Option<Row>, Error> {
+        self.0.read_row()
     }
 }

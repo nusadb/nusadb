@@ -1869,15 +1869,14 @@ connection.
 A sort, `DISTINCT`, `GROUP BY`, set operation or hash join whose input exceeds the work-memory
 budget streams the overflow to the spill directory when one is configured (`--spill-dir`, or
 automatically on a Linux host where the budget is detected), and a spilled sort, `DISTINCT` or
-`GROUP BY` streams its result back from there, so the result may be larger than the budget.
-Without a spill directory, a stage over `--work-mem` fails with an error naming the limit, the
-bytes involved and how to raise it, and the server stays responsive. Window functions evaluate
-each partition in memory when it fits and from disk when it does not; over a partition larger than
-the budget, `RANGE`/`GROUPS` frames with an offset, `EXCLUDE` on such frames, frames from
-`CURRENT ROW` to `UNBOUNDED FOLLOWING` for aggregates, and a `ROWS` frame wider than the budget
-still fail.
-`DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` spill as well.
-`SET work_mem` moves both the budget and the point where spilling starts.
+`GROUP BY` streams its result back from there, so the result may be larger than the budget. Without
+a spill directory, a stage over `--work-mem` fails with an error naming the limit, the bytes
+involved and how to raise it, and the server stays responsive. Window functions evaluate each
+partition in memory when it fits and from disk when it does not; over a partition larger than the
+budget only a frame holding more rows than the budget, and `lag`/`lead` with an offset that changes
+per row or `nth_value` with such a position over a `ROWS` or default frame, fail. `DISTINCT ON` and
+`ROLLUP` / `CUBE` / `GROUPING SETS` spill as well. `SET work_mem` moves both the budget and the
+point where spilling starts.
 
 ### `TABLESAMPLE` samples per row
 

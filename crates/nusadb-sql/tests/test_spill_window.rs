@@ -143,15 +143,38 @@ const SLIDING: &[&str] = &[
     "SELECT id, first_value(v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING) FROM w",
     "SELECT id, last_value(v) OVER (ORDER BY id ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING) FROM w",
     "SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w",
+    // Frames to the partition's end, computed backwards.
+    "SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+    "SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+    "SELECT id, count(v) OVER (ORDER BY x DESC GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), min(v) OVER (ORDER BY x DESC GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), max(v) OVER (ORDER BY x DESC GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+    "SELECT id, avg(v) OVER (PARTITION BY p ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+];
+
+/// `RANGE` and `GROUPS` frames: served from disk while each frame fits the budget.
+const PEER: &[&str] = &[
+    "SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) FROM w",
+    "SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM w",
+    "SELECT id, count(*) OVER (ORDER BY x DESC RANGE BETWEEN 1 PRECEDING AND 3 FOLLOWING) FROM w",
+    "SELECT id, sum(x) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w",
+    "SELECT id, sum(id) OVER (ORDER BY x GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING) FROM w",
+    "SELECT id, count(*) OVER (ORDER BY x GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM w",
+    "SELECT id, count(*) OVER (ORDER BY x DESC GROUPS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) FROM w",
+    "SELECT id, sum(id) OVER (ORDER BY x RANGE BETWEEN CURRENT ROW AND CURRENT ROW EXCLUDE CURRENT ROW) FROM w",
+    "SELECT id, sum(id) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM w",
+    "SELECT id, sum(id) OVER (ORDER BY x RANGE BETWEEN 2 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM w",
+    "SELECT id, first_value(id) OVER (ORDER BY x RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM w",
+    "SELECT id, last_value(id) OVER (ORDER BY x GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM w",
+    "SELECT id, nth_value(id, 3) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
+    "SELECT id, sum(id) OVER (ORDER BY v RANGE BETWEEN 50 PRECEDING AND 50 FOLLOWING) FROM w",
+    "SELECT id, count(*) OVER (ORDER BY v DESC RANGE BETWEEN 20 PRECEDING AND CURRENT ROW) FROM w",
+    "SELECT id, max(v) OVER (PARTITION BY p ORDER BY x RANGE BETWEEN 4 PRECEDING AND 1 FOLLOWING) FROM w",
 ];
 
 /// Frames that need the whole partition in memory: served when partitions fit, refused when not.
 const PARTITION_BOUND: &[&str] = &[
-    "SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) FROM w",
-    "SELECT id, sum(x) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w",
-    "SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+    "SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING AND 2 FOLLOWING) FROM w",
+    "SELECT id, sum(x::FLOAT8) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
     "SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM w",
-    "SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
 ];
 
 #[test]
@@ -182,7 +205,12 @@ fn spilled_windows_match_the_in_memory_window() {
         );
     }
 
-    for sql in STREAMABLE.iter().chain(SLIDING).chain(PARTITION_BOUND) {
+    for sql in STREAMABLE
+        .iter()
+        .chain(SLIDING)
+        .chain(PEER)
+        .chain(PARTITION_BOUND)
+    {
         set_spill_config(None);
         let want = buffered(engine, &mut session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert!(!want.is_empty(), "{sql}");
@@ -199,7 +227,8 @@ fn spilled_windows_match_the_in_memory_window() {
             );
         }
         // 2 KiB: every partition is evaluated from disk, while a frame of a few rows still fits.
-        spill(2048);
+        // A RANGE / GROUPS frame spans dozens of rows here, so it needs a little more room.
+        spill(if PEER.contains(sql) { 256 * 1024 } else { 2048 });
         let from_disk = streamed(engine, &mut session, sql);
         if PARTITION_BOUND.contains(sql) {
             let err = from_disk.expect_err(sql).to_string();
@@ -223,6 +252,8 @@ fn spilled_windows_match_the_in_memory_window() {
     }
     set_spill_config(None);
 
+    edge_values(engine, &mut session);
+
     // No spill file outlives its query.
     let leftover = std::fs::read_dir(std::env::temp_dir())
         .unwrap()
@@ -234,4 +265,88 @@ fn spilled_windows_match_the_in_memory_window() {
         })
         .count();
     assert_eq!(leftover, 0, "spill files left behind");
+}
+
+/// Values that compare equal but differ, and RANGE offsets that overflow at the ends of BIGINT
+/// (see the call site).
+fn edge_values(engine: &'static BtreeEngine, session: &mut Session) {
+    // Values that compare equal but differ (`1.0` / `1.00`, `1 day` / `24 hours`): MIN and MAX keep
+    // the earliest, also when a frame to the partition's end is computed backwards. And RANGE
+    // offsets that overflow at the ends of BIGINT: a FOLLOWING start past every value leaves the
+    // frame empty, a PRECEDING end before every value too.
+    run(
+        engine,
+        session,
+        "CREATE TABLE e (id INT, n NUMERIC, iv INTERVAL, b BIGINT, b2 BIGINT)",
+    );
+    let edge = (0..3000_i64)
+        .map(|i| {
+            let n = if i % 2 == 0 { "1.0" } else { "1.00" };
+            let iv = if i % 2 == 0 { "1 day" } else { "24 hours" };
+            let b = match i {
+                0..10 => format!("{}", i64::MIN + i),
+                2990.. => format!("{}", i64::MAX - (2999 - i)),
+                _ => i.to_string(),
+            };
+            // `b2` is `b` with a NULL every 11th row, so NULLs sit beside the overflowing ends.
+            let b2 = if i % 11 == 0 {
+                "NULL".to_owned()
+            } else {
+                b.clone()
+            };
+            format!("({i}, {n}, '{iv}', {b}, {b2})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    run(engine, session, &format!("INSERT INTO e VALUES {edge}"));
+    for sql in [
+        "SELECT id, min(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM e",
+        "SELECT id, max(iv) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM e",
+        "SELECT id, max(n) OVER (ORDER BY id % 7 GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM e",
+        "SELECT id, sum(id) OVER (ORDER BY b RANGE BETWEEN 3 FOLLOWING AND 5 FOLLOWING) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY b RANGE BETWEEN 5 PRECEDING AND 2 PRECEDING) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY b DESC RANGE BETWEEN 2 FOLLOWING AND 4 FOLLOWING) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY b2 NULLS FIRST RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY b2 RANGE BETWEEN CURRENT ROW AND 5 FOLLOWING) FROM e",
+        "SELECT id, sum(id) OVER (ORDER BY b2 DESC NULLS LAST RANGE BETWEEN 3 PRECEDING AND 1 FOLLOWING) FROM e",
+    ] {
+        set_spill_config(None);
+        let want = buffered(engine, session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        spill(256 * 1024);
+        let got = streamed(engine, session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        // Compared by debug form: `1.0` and `1.00` are equal values, but which one a row gets
+        // is the point.
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{sql}");
+    }
+    set_spill_config(None);
+    let last = buffered(
+        engine,
+        session,
+        "SELECT id, count(*) OVER (ORDER BY b RANGE BETWEEN 3 FOLLOWING AND 5 FOLLOWING) FROM e",
+    )
+    .unwrap();
+    for row in &last {
+        if let [Value::Int(id), Value::Int(count)] = row.as_slice()
+            && *id >= 2997
+        {
+            assert_eq!(
+                *count, 0,
+                "the frame past the largest value is empty (id {id})"
+            );
+        }
+    }
+    // An overflowing PRECEDING start is the first row with a value, not the NULLs before it.
+    let first = buffered(
+        engine,
+        session,
+        "SELECT id, count(*) OVER (ORDER BY b2 NULLS FIRST RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) \
+         FROM e",
+    )
+    .unwrap();
+    assert!(
+        first
+            .iter()
+            .any(|r| matches!(r.as_slice(), [Value::Int(1), Value::Int(1)])),
+        "the smallest value's frame holds only itself"
+    );
 }

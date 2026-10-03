@@ -4383,7 +4383,7 @@ fn group_step(
 /// exact `Decimal`, a `FLOAT` ordering as `f64`. The ordering column has one type, so every key a
 /// frame compares is the same variant.
 #[derive(Clone, Copy)]
-enum RangeKey {
+pub(super) enum RangeKey {
     Int(i64),
     Dec(crate::numeric::Decimal),
     Float(f64),
@@ -4391,7 +4391,7 @@ enum RangeKey {
 
 impl RangeKey {
     /// Order two keys of the same variant (mismatched variants never arise — one ordering column).
-    fn compare(self, other: Self) -> std::cmp::Ordering {
+    pub(super) fn compare(self, other: Self) -> std::cmp::Ordering {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => a.cmp(&b),
             (Self::Dec(a), Self::Dec(b)) => a.compare(&b),
@@ -4407,7 +4407,7 @@ impl RangeKey {
 /// An integer is itself; a `DATE` is its midnight micros; a `TIMESTAMP[TZ]` is its micros; a
 /// `NUMERIC` is its exact decimal; a `FLOAT` is itself — the column types the analyzer permits for a
 /// `RANGE` value offset.
-fn range_key(v: &ast::Value) -> Option<RangeKey> {
+pub(super) fn range_key(v: &ast::Value) -> Option<RangeKey> {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     match v {
         ast::Value::Int(i) => Some(RangeKey::Int(*i)),
@@ -4449,7 +4449,7 @@ fn float_range_offset(off: &ast::Value) -> Option<f64> {
 /// An integer offset shifts an integer key; an `INTERVAL` offset shifts a temporal (micros) key; a
 /// numeric offset shifts a `NUMERIC` (exact decimal) or `FLOAT` key. `None` on overflow or a
 /// key/offset kind mismatch.
-fn range_boundary(
+pub(super) fn range_boundary(
     cur_key: RangeKey,
     off: &ast::Value,
     preceding: bool,
@@ -4599,8 +4599,28 @@ fn frame_bounds(
                 let Some(boundary) =
                     cur_key.and_then(|cur| range_boundary(cur, o, preceding, ascending))
                 else {
-                    // Offset arithmetic overflowed: the bound is the partition edge on that side.
-                    return if at_start { 0 } else { len - 1 };
+                    // Offset arithmetic overflowed: the boundary lies beyond every value, before
+                    // the partition for a PRECEDING bound and after it for a FOLLOWING one. A start
+                    // before the partition is its first row with a value and an end after it its
+                    // last (rows with a NULL value are outside any value range); a start after it
+                    // or an end before it leaves the frame empty.
+                    let valued = |j: &usize| {
+                        ordered
+                            .get(*j)
+                            .and_then(|(keys, _)| keys.first())
+                            .and_then(range_key)
+                            .is_some()
+                    };
+                    let rows = usize::try_from(len).unwrap_or(0);
+                    let at = |j: Option<usize>, none: i64| {
+                        j.map_or(none, |j| i64::try_from(j).unwrap_or(i64::MAX))
+                    };
+                    return match (preceding, at_start) {
+                        (true, true) => at((0..rows).find(valued), len),
+                        (true, false) => -1,
+                        (false, true) => len,
+                        (false, false) => at((0..rows).rev().find(valued), -1),
+                    };
                 };
                 range_scan(ordered, boundary, at_start, ascending)
             },

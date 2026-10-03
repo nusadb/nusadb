@@ -231,6 +231,9 @@ pub(crate) struct Acc {
     dec_sum: Option<crate::numeric::Decimal>,
     min: Option<ast::Value>,
     max: Option<ast::Value>,
+    // MIN/MAX keep the first of equal values they meet (`1.0` and `1.00` compare equal); a fold
+    // that meets the rows in reverse sets this so the last one met, the earliest row, wins.
+    later_ties_win: bool,
     any_seen: bool,
     // For `DISTINCT` aggregates: the non-`NULL` argument values already folded into this
     // accumulator, bucketed by [`distinct_hash`] so a duplicate is found in O(1) amortized instead of
@@ -273,6 +276,17 @@ pub(crate) struct Acc {
     sum_x: f64,
     sum_x2: f64,
     sum_xy: f64,
+}
+
+impl Acc {
+    /// An accumulator for a fold that meets its rows in reverse: among equal MIN/MAX values the
+    /// last one met (the earliest row) wins, as the forward fold keeps the first one.
+    pub(super) fn reversed() -> Self {
+        Self {
+            later_ties_win: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Acc {
@@ -1647,20 +1661,20 @@ pub(crate) fn fold_value(
             acc.count += 1;
         },
         F::Min => {
-            if acc
-                .min
-                .as_ref()
-                .is_none_or(|cur| eval::compare(&value, cur) == std::cmp::Ordering::Less)
-            {
+            let tie = acc.later_ties_win;
+            if acc.min.as_ref().is_none_or(|cur| {
+                let ord = eval::compare(&value, cur);
+                ord == std::cmp::Ordering::Less || (tie && ord == std::cmp::Ordering::Equal)
+            }) {
                 acc.min = Some(value);
             }
         },
         F::Max => {
-            if acc
-                .max
-                .as_ref()
-                .is_none_or(|cur| eval::compare(&value, cur) == std::cmp::Ordering::Greater)
-            {
+            let tie = acc.later_ties_win;
+            if acc.max.as_ref().is_none_or(|cur| {
+                let ord = eval::compare(&value, cur);
+                ord == std::cmp::Ordering::Greater || (tie && ord == std::cmp::Ordering::Equal)
+            }) {
                 acc.max = Some(value);
             }
         },

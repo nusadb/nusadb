@@ -192,19 +192,20 @@ The other three limits bound what a single client can do to the server:
 
 A spilled sort, `DISTINCT` or `GROUP BY` streams its result to the client straight from the merge of
 its spill files, so a result larger than `--work-mem` is fine. Window functions spill too: each
-partition is evaluated in memory when it fits and from its spill file when it does not. Over a
-partition larger than the budget, `RANGE` and `GROUPS` frames with an offset, `EXCLUDE` on a `RANGE`
-or `GROUPS` frame, and aggregates over frames from `CURRENT ROW` to `UNBOUNDED FOLLOWING` still fail
-at the budget, as does a `ROWS` frame wider than the budget; split such a partition with
-`PARTITION BY`. `DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` spill as well.
-`CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `INSERT ... SELECT` stream the query's rows into
-the table as they come, so a large result does not have to fit either (`INSERT ... SELECT` falls
-back to holding the result when the query reads the target table, has a subquery, or the target has
-triggers, foreign keys or incrementally maintained views). `REFRESH MATERIALIZED VIEW` keeps the new
-rows in a spill file until the old ones are replaced. `UPDATE ... FROM` and `DELETE ... USING` over
-a subquery, and `DECLARE CURSOR`, still hold the subquery's or cursor's whole result. A failed query
-leaves the server responsive, which is the point. A session's `SET work_mem` moves both the budget
-and the point where spilling starts.
+partition is evaluated in memory when it fits and from its spill file when it does not. What has to
+fit is one frame: a frame that holds more rows than the budget (say
+`ROWS BETWEEN 100000 PRECEDING AND CURRENT ROW`, or a floating-point `sum` or `avg` from
+`CURRENT ROW` to `UNBOUNDED FOLLOWING`) fails at the budget, as do `lag`/`lead` with an offset that
+changes from row to row and `nth_value` with such a position over a `ROWS` or default frame; split
+such a partition with `PARTITION BY`. `DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` spill as
+well. `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `INSERT ... SELECT` stream the query's rows
+into the table as they come, so a large result does not have to fit either (`INSERT ... SELECT`
+falls back to holding the result when the query reads the target table, has a subquery, or the
+target has triggers, foreign keys or incrementally maintained views). `REFRESH MATERIALIZED VIEW`
+keeps the new rows in a spill file until the old ones are replaced. `UPDATE ... FROM` and
+`DELETE ... USING` over a subquery, and `DECLARE CURSOR`, still hold the subquery's or cursor's
+whole result. A failed query leaves the server responsive, which is the point. A session's
+`SET work_mem` moves both the budget and the point where spilling starts.
 
 On Linux all of these derive from `--mem-budget`, which auto-detects the host or container limit, so
 a container with a memory limit gets sensible ceilings with no flags. On other systems set
