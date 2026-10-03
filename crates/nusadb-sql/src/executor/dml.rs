@@ -1067,7 +1067,11 @@ fn insert_select_can_stream(
 fn stream_safe_source(op: &PhysicalOperator, target: nusadb_core::TableId) -> bool {
     use super::ops::contains_subquery;
     match op {
-        PhysicalOperator::SeqScan { table, .. } => table.id != target,
+        // An index range streams from the engine's index cursor (drained before its own
+        // transaction writes the scanned table, which here is never the target anyway).
+        PhysicalOperator::SeqScan { table, .. } | PhysicalOperator::IndexScan { table, .. } => {
+            table.id != target
+        },
         // A literal integer `generate_series` source streams lazily (see
         // [`stream::lazy_int_series`]) — no table read at all.
         PhysicalOperator::ProjectSet { .. } => super::stream::lazy_int_series(op).is_some(),

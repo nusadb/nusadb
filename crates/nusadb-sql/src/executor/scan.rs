@@ -147,6 +147,74 @@ pub(super) fn scan_rows_projected(
     Ok(out)
 }
 
+/// [`index_scan_rows`] as a stream: rows are decoded as the engine's index cursor yields them,
+/// with the same `SKIP LOCKED` filtering and row cap.
+///
+/// # Errors
+/// [`Error::IndexNotFound`] for an unknown index; propagates key-encoding and storage errors.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the IndexScan operator's own field set, like index_scan_rows"
+)]
+pub(super) fn index_scan_source(
+    table: &TableSchema,
+    index: &str,
+    lo: &std::ops::Bound<Vec<ast::Value>>,
+    hi: &std::ops::Bound<Vec<ast::Value>>,
+    direction: nusadb_core::engine::ScanDirection,
+    limit: Option<usize>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<IndexScanSource, Error> {
+    let id = engine
+        .lookup_index(index)?
+        .ok_or_else(|| Error::IndexNotFound {
+            name: index.to_owned(),
+        })?;
+    let scan = engine.index_scan_directed_limited(
+        txn,
+        id,
+        encode_key_bound(lo)?,
+        encode_key_bound(hi)?,
+        direction,
+        limit,
+    )?;
+    Ok(IndexScanSource {
+        scan,
+        table: table.id,
+        schema: column_types(table),
+        remaining: limit,
+    })
+}
+
+/// The rows of an index range, decoded one at a time (see [`index_scan_source`]).
+pub(super) struct IndexScanSource {
+    scan: Box<dyn nusadb_core::TupleScan>,
+    table: nusadb_core::TableId,
+    schema: Vec<ColumnType>,
+    remaining: Option<usize>,
+}
+
+impl super::stream::RowSource for IndexScanSource {
+    fn try_next(&mut self) -> Result<Option<Row>, Error> {
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+        while let Some((tid, tuple)) = self.scan.try_next()? {
+            crate::cancel::check()?;
+            // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`).
+            if super::lock_skip::skipped(self.table, tid) {
+                continue;
+            }
+            if let Some(remaining) = self.remaining.as_mut() {
+                *remaining -= 1;
+            }
+            return Ok(Some(row::decode(&tuple, &self.schema)?));
+        }
+        Ok(None)
+    }
+}
+
 /// Materialize the visible rows of `table` whose `index` key falls in `[lo, hi]`, in ascending key
 /// order. The bound *values* are encoded into the index's order-preserving key
 /// bytes; the engine maps each in-range entry to a row and applies MVCC visibility.

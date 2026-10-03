@@ -25,8 +25,14 @@ impl Catalog for Cat<'_> {
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }
-    fn list_indexes(&self, _: &str) -> Result<Vec<IndexInfo>, Error> {
-        Ok(Vec::new())
+    fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {
+        let txn = self
+            .0
+            .begin(nusadb_core::IsolationLevel::ReadCommitted)
+            .map_err(Error::from)?;
+        let out = nusadb_sql::catalog_list_indexes(self.0, txn, table);
+        let _ = self.0.commit(txn);
+        out
     }
 }
 
@@ -82,6 +88,15 @@ const STATEMENTS: &[(&str, &str)] = &[
         "INSERT INTO sink_w SELECT id, rank() OVER (ORDER BY g) FROM src",
         "SELECT * FROM sink_w",
     ),
+    // A key range read through the primary-key index.
+    (
+        "CREATE TABLE out_5 AS SELECT * FROM keyed WHERE id >= 100 AND id <= 4800",
+        "SELECT * FROM out_5",
+    ),
+    (
+        "INSERT INTO sink_k SELECT s FROM keyed WHERE id >= 10 AND id <= 5000",
+        "SELECT * FROM sink_k",
+    ),
 ];
 
 #[test]
@@ -114,6 +129,9 @@ fn query_consuming_statements_work_past_work_mem() {
             "CREATE TABLE sink_s (s TEXT)",
             "CREATE TABLE sink_d (g INT)",
             "CREATE TABLE sink_w (id INT, r INT)",
+            "CREATE TABLE sink_k (s TEXT)",
+            "CREATE TABLE keyed (id INT PRIMARY KEY, s TEXT)",
+            "INSERT INTO keyed SELECT id, s FROM src",
         ] {
             run(engine, &mut session, ddl).unwrap();
         }
@@ -125,6 +143,13 @@ fn query_consuming_statements_work_past_work_mem() {
             run(engine, &mut session, "SET work_mem = '16kB'").unwrap();
         }
         let mut got = Vec::new();
+        // The key ranges below must read through the primary-key index.
+        let plan = rows(
+            engine,
+            &mut session,
+            "EXPLAIN SELECT * FROM keyed WHERE id >= 100 AND id <= 4800",
+        );
+        assert!(format!("{plan:?}").contains("IndexScan"), "{plan:?}");
         for (statement, read_back) in STATEMENTS {
             run(engine, &mut session, statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
             run(engine, &mut session, "RESET work_mem").unwrap();

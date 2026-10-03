@@ -101,6 +101,17 @@ pub(crate) fn execute(
     Ok(Some(rows))
 }
 
+/// Whether `op` is an aggregate's output, possibly filtered (`HAVING`) or projected.
+fn sorts_aggregate_output(op: &PhysicalOperator) -> bool {
+    match op {
+        PhysicalOperator::GroupAggregate { .. } | PhysicalOperator::ScalarAggregate { .. } => true,
+        PhysicalOperator::Filter { input, .. } | PhysicalOperator::Project { input, .. } => {
+            sorts_aggregate_output(input)
+        },
+        _ => false,
+    }
+}
+
 /// Translate a physical SELECT subtree into a vectorized operator tree, or `Ok(None)` if any node or
 /// expression is outside what the vectorized operators support (then the caller uses the row path).
 /// Supported: `SeqScan`, `Filter`, `Project`, `Limit`, `Sort`, `ScalarAggregate`,
@@ -161,6 +172,16 @@ fn try_build(
             // The `WITH TIES` tie trim is only implemented on the row path, so
             // fall back to it rather than vectorizing a sort that would drop the trailing peers.
             if limit_ties.is_some() {
+                return Ok(None);
+            }
+            // A full sort holds its whole input here; with spill configured the row path's
+            // external merge sort bounds it instead. A top-N keeps only its `m` rows either way,
+            // and an aggregate's output is held by the aggregate's own gates (under spill the
+            // grouped form vectorizes only when statistics bound its groups).
+            if top_n.is_none()
+                && crate::executor::spill_is_configured()
+                && !sorts_aggregate_output(input)
+            {
                 return Ok(None);
             }
             let keys = resolve_sort_agg_refs(keys, input);

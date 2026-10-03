@@ -331,6 +331,21 @@ pub(super) fn stream_op<'a>(
                 }),
             ))
         },
+        // An index range streams from the engine's index cursor rather than being collected first.
+        PhysicalOperator::IndexScan {
+            table,
+            index,
+            lo,
+            hi,
+            direction,
+            limit,
+            ..
+        } => Ok(counted(
+            op,
+            Box::new(super::scan::index_scan_source(
+                table, index, lo, hi, *direction, *limit, engine, txn,
+            )?),
+        )),
         PhysicalOperator::Filter { input, predicate } => {
             // Pre-resolve any uncorrelated subquery once; a correlated one stays for
             // per-row resolution — exactly as the materializing Filter arm does.
