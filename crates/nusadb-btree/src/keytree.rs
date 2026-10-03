@@ -785,6 +785,47 @@ impl<'s> KeyTree<'s> {
         }
     }
 
+    /// Call `f(key, row, value)` for every entry after `(key, row)` = `after` whose key is within
+    /// `hi`, in ascending `(key, row)` order, until it returns `false`. The walk starts at the leaf
+    /// holding that position, so resuming a range never re-reads the entries before it.
+    ///
+    /// # Errors
+    /// Propagates page-store errors and a malformed page.
+    pub fn scan_after<F>(&self, after: (&[u8], u64), hi: Bound<&[u8]>, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], u64, &[u8]) -> Result<bool>,
+    {
+        let above_hi = |key: &[u8]| match hi {
+            Bound::Included(b) => key > b,
+            Bound::Excluded(b) => key >= b,
+            Bound::Unbounded => false,
+        };
+        let (_, mut leaf_id) = self.descend(&Target::At(after.0, after.1))?;
+        loop {
+            let next = self
+                .store
+                .with_page(leaf_id, |page| -> Result<Option<u64>> {
+                    let count = get_u16(page, OFF_COUNT)?;
+                    for i in 0..count {
+                        let at = slot(page, LEAF_HEADER, i)?;
+                        let (key, row) = key_row(page, at)?;
+                        if (key, row) <= after {
+                            continue;
+                        }
+                        if above_hi(key) || !f(key, row, leaf_value(page, at)?)? {
+                            return Ok(None);
+                        }
+                    }
+                    let link = get_u64(page, OFF_NEXT)?;
+                    Ok((link != NO_LINK).then_some(link))
+                })??;
+            match next {
+                Some(link) => leaf_id = PageId(link),
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// Every page of the tree.
     ///
     /// # Errors

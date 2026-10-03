@@ -137,7 +137,9 @@ impl std::fmt::Debug for Wal {
 ///    reclamation gate, never after it)
 /// 6. `txns`: transaction + lock manager (O(1) critical sections); `scan_views`, the registry
 ///    of open streaming scans, is taken under it or alone, and a scan's own state lock is taken
-///    with neither held (a writer drains its transaction's open scans before its other locks)
+///    with neither held (a writer drains its transaction's open scans before its other locks;
+///    `index_insert` / `index_delete` drain index streams holding only `catalog` read, and a
+///    draining index stream then takes `IndexState::data` read and `reclaim` read, in rank order)
 /// 7. `seqs` — sequences
 /// 8. `reclaim` (`RwLock`) — the undo arena, doubling as the **reclamation gate**: every
 ///    chain-walking reader holds `read` across its walk; purge holds `write` while freeing
@@ -787,7 +789,7 @@ struct IndexState {
     complete: bool,
     /// Rank 4 — the per-index latch: scans hold `read`, and every entry mutation (including its
     /// uniqueness pre-check and WAL append, which must be atomic with the apply) holds `write`.
-    data: RwLock<IndexData>,
+    data: Arc<RwLock<IndexData>>,
 }
 
 /// One index's entries, guarded by [`IndexState::data`]. The entries live in pages: a
@@ -1076,6 +1078,59 @@ impl IndexData {
         })?;
         if !stopped {
             for &(bk, br, bm) in big.get(next_big..).unwrap_or_default() {
+                if !f(bk, br, bm)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`scan`](Self::scan) forward from just past the entry `(key, row)` = `after` to `hi`: the
+    /// pages are entered at that position rather than at the start of its key, so a range resumed
+    /// inside one key's many rows never re-reads the rows before it.
+    fn scan_after<F>(
+        &self,
+        store: &PagedStore,
+        after: (&[u8], u64),
+        hi: Bound<&[u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], u64, &[EntryMeta]) -> Result<bool>,
+    {
+        // The in-memory entries past `after`, merged lazily so a resumed batch reads only what
+        // it reaches.
+        let mut big = self
+            .big
+            .range::<[u8], _>((Bound::Included(after.0), hi))
+            .flat_map(|(k, rows)| {
+                rows.iter()
+                    .map(move |(r, m)| (k.as_slice(), *r, m.as_slice()))
+            })
+            .filter(|&(k, r, _)| (k, r) > after)
+            .peekable();
+        let mut stopped = false;
+        KeyTree::open(store, self.root).scan_after(after, hi, |key, row, value| {
+            while let Some(&(bk, br, bm)) = big.peek() {
+                if (bk, br) >= (key, row) {
+                    break;
+                }
+                big.next();
+                if !f(bk, br, bm)? {
+                    stopped = true;
+                    return Ok(false);
+                }
+            }
+            if f(key, row, &decode_metas(value))? {
+                Ok(true)
+            } else {
+                stopped = true;
+                Ok(false)
+            }
+        })?;
+        if !stopped {
+            for (bk, br, bm) in big {
                 if !f(bk, br, bm)? {
                     break;
                 }
@@ -2097,6 +2152,71 @@ impl BtreeEngine {
         first
     }
 
+    /// Register a streaming scan of `range` on the table rooted at `root` under `view`. Called
+    /// with `txns` held, so no purge snapshot falls between the view being taken and it being
+    /// pinned.
+    fn register_index_stream(
+        &self,
+        txn: TxnId,
+        view: &ReadView,
+        root: nusadb_core::PageId,
+        table: u64,
+        range: IndexRange,
+    ) -> Result<(u64, Arc<Mutex<StreamState>>)> {
+        let mut pin = view.clone();
+        pin.active.insert(txn.0);
+        pin.own = u64::MAX;
+        let state = Arc::new(Mutex::new(StreamState {
+            store: Arc::clone(&self.store),
+            reclaim: Arc::clone(&self.reclaim),
+            view: view.clone(),
+            root,
+            end: 0,
+            cursor: 0,
+            done: false,
+            broken: false,
+            buffered: std::collections::VecDeque::new(),
+            index: Some(range),
+        }));
+        let key = ScanViews::register(
+            &self.scan_views,
+            OpenScan {
+                pin,
+                txn: txn.0,
+                table,
+                index: true,
+                state: Arc::downgrade(&state),
+            },
+        )?;
+        Ok((key, state))
+    }
+
+    /// Read to its end every index range scan `txn` has open on `table`: called before `txn`
+    /// inserts into the table or changes an entry of one of its indexes, since an index scan
+    /// (unlike a table scan) would otherwise reach the rows and entries that write adds.
+    fn drain_open_index_scans(&self, txn: TxnId, table: TableId) -> Result<()> {
+        let open: Vec<Arc<Mutex<StreamState>>> = {
+            let views = self.scan_views.lock().map_err(|_| poisoned())?;
+            views
+                .views
+                .values()
+                .filter(|scan| scan.index && scan.txn == txn.0 && scan.table == table.0)
+                .filter_map(|scan| scan.state.upgrade())
+                .collect()
+        };
+        let mut first = Ok(());
+        for state in open {
+            let drained = state
+                .lock()
+                .map_err(|_| poisoned())
+                .and_then(|mut s| s.drain());
+            if first.is_ok() {
+                first = drained;
+            }
+        }
+        first
+    }
+
     /// When `txn` commits or rolls back, read every streaming scan it still has open to its end
     /// and release its pin: a scan never reaches the store after its transaction is over, so
     /// nothing it could read survives a checkpoint as pages no one frees. Its remaining rows are
@@ -2554,7 +2674,7 @@ impl BtreeEngine {
                     IndexState {
                         def: def.clone(),
                         complete: true,
-                        data: RwLock::new(data),
+                        data: Arc::new(RwLock::new(data)),
                     },
                 ) {
                     // A re-created id replaces what an earlier record built: its pages go.
@@ -2585,7 +2705,7 @@ impl BtreeEngine {
             } => {
                 if let Some(idx) = cat.indexes.get_mut(index) {
                     idx.data
-                        .get_mut()
+                        .write()
                         .map_err(|_| poisoned())?
                         .restore_image_entry(key, *row_id, *txn);
                 }
@@ -2600,7 +2720,7 @@ impl BtreeEngine {
                 // so recovery converges without stamps ever entering the log.
                 if let Some(idx) = cat.indexes.get_mut(index) {
                     idx.data
-                        .get_mut()
+                        .write()
                         .map_err(|_| poisoned())?
                         .apply_insert(store, key, *row_id, *txn)?;
                 }
@@ -2614,7 +2734,7 @@ impl BtreeEngine {
                 // Tolerant: a compensation delete may target an already-absent entry.
                 if let Some(idx) = cat.indexes.get_mut(index) {
                     idx.data
-                        .get_mut()
+                        .write()
                         .map_err(|_| poisoned())?
                         .apply_delete(store, key, *row_id)?;
                 }
@@ -2627,7 +2747,7 @@ impl BtreeEngine {
             } => {
                 if let Some(idx) = cat.indexes.get_mut(index) {
                     idx.data
-                        .get_mut()
+                        .write()
                         .map_err(|_| poisoned())?
                         .apply_unstamp(store, key, *row_id, *txn)?;
                 }
@@ -5937,6 +6057,9 @@ struct OpenScan {
     pin: ReadView,
     txn: u64,
     table: u64,
+    /// An index range scan, which (unlike a table scan) can reach rows its own transaction
+    /// inserts after it opened, so it is also drained before that transaction inserts.
+    index: bool,
     state: std::sync::Weak<Mutex<StreamState>>,
 }
 
@@ -5991,6 +6114,17 @@ struct StreamState {
     /// A drain failed part way: what is buffered may be incomplete, so every later read fails.
     broken: bool,
     buffered: std::collections::VecDeque<(Tid, SharedTuple)>,
+    /// For an index range scan: the index walked in place of the table's row-id order.
+    index: Option<IndexRange>,
+}
+
+/// An index range a streaming scan walks a batch at a time, in `(key, row)` order.
+struct IndexRange {
+    data: Arc<RwLock<IndexData>>,
+    lo: Bound<Vec<u8>>,
+    hi: Bound<Vec<u8>>,
+    /// The last entry the previous batch visited; the next batch starts just past it.
+    resume: Option<(Vec<u8>, u64)>,
 }
 
 impl std::fmt::Debug for StreamState {
@@ -6007,6 +6141,9 @@ impl std::fmt::Debug for StreamState {
 impl StreamState {
     /// Read the next batch of visible rows into the buffer.
     fn fill(&mut self) -> Result<()> {
+        if self.index.is_some() {
+            return self.fill_from_index();
+        }
         let undo = self.reclaim.read().map_err(|_| poisoned())?;
         let tree = ClusteredTree::open(&*self.store, self.root);
         let mut scratch = Vec::new();
@@ -6044,6 +6181,76 @@ impl StreamState {
         match last {
             Some(row_id) if full && !past_end && row_id < u64::MAX => self.cursor = row_id + 1,
             _ => self.done = true,
+        }
+        Ok(())
+    }
+
+    /// Read the next batch of an index range scan: the entries after the last one visited, each
+    /// resolved to its row through the same two visibility hops as a whole-range index scan (the
+    /// entry's own stamps, then the base row under the scan's view).
+    fn fill_from_index(&mut self) -> Result<()> {
+        let Some(range) = self.index.as_mut() else {
+            self.done = true;
+            return Ok(());
+        };
+        let data = Arc::clone(&range.data);
+        let data = data.read().map_err(|_| poisoned())?;
+        let undo = self.reclaim.read().map_err(|_| poisoned())?;
+        let tree = ClusteredTree::open(&*self.store, self.root);
+        let resume = range.resume.take();
+        let view = &self.view;
+        let buffered = &mut self.buffered;
+        let mut next_resume = None;
+        let mut bytes = 0_usize;
+        let mut visits = 0_usize;
+        let mut visit = |key: &[u8], row: u64, metas: &[EntryMeta]| -> Result<bool> {
+            visits += 1;
+            if IndexData::entry_visible(metas, view)
+                && let Some((stored, overflow)) = tree.get_stored(row)?
+            {
+                let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row))?;
+                let mut scratch = Vec::new();
+                let visible = match mvcc::visible_version(meta, &undo.arena, view) {
+                    Some(mvcc::Visible::Head) => {
+                        Some(head_tuple(&tree, row, &stored, overflow, &mut scratch)?)
+                    },
+                    Some(mvcc::Visible::Arena(tuple)) => Some(tuple),
+                    None => None,
+                };
+                if let Some(visible) = visible {
+                    bytes = bytes.saturating_add(visible.len());
+                    buffered.push_back((tid_of(row), SharedTuple::from(visible)));
+                }
+            }
+            let full = buffered.len() >= STREAM_BATCH_ROWS
+                || bytes >= STREAM_BATCH_BYTES
+                || visits >= STREAM_BATCH_VISITS;
+            if full {
+                next_resume = Some((key.to_vec(), row));
+            }
+            Ok(!full)
+        };
+        // A later batch enters the index just past the last entry the previous one visited.
+        match &resume {
+            Some((key, row)) => data.scan_after(
+                &self.store,
+                (key.as_slice(), *row),
+                as_slice_bound(&range.hi),
+                &mut visit,
+            )?,
+            None => data.scan(
+                &self.store,
+                as_slice_bound(&range.lo),
+                as_slice_bound(&range.hi),
+                false,
+                &mut visit,
+            )?,
+        }
+        drop(undo);
+        drop(data);
+        match next_resume {
+            Some(position) => range.resume = Some(position),
+            None => self.done = true,
         }
         Ok(())
     }
@@ -7222,6 +7429,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     done: false,
                     broken: false,
                     buffered: std::collections::VecDeque::new(),
+                    index: None,
                 }));
                 let key = ScanViews::register(
                     &self.scan_views,
@@ -7229,6 +7437,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                         pin,
                         txn: txn.0,
                         table: table.0,
+                        index: false,
                         state: Arc::downgrade(&state),
                     },
                 )?;
@@ -7625,7 +7834,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 // Complete from birth: the creating statement backfills existing rows in the same
                 // transaction, and every later write maintains the entries.
                 complete: true,
-                data: RwLock::new(IndexData::create(&self.store)?),
+                data: Arc::new(RwLock::new(IndexData::create(&self.store)?)),
             },
         );
         self.push_undo(txn.0, UndoOp::CreatedIndex { index: id })?;
@@ -7705,6 +7914,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .get(&index.0)
             .ok_or_else(|| index_not_found(index))?;
         let (unique, table, name) = (idx.def.unique, idx.def.table, idx.def.name.as_str());
+        self.drain_open_index_scans(txn, table)?;
         // A **constraint-backing** index is exempted from the byte-level uniqueness check (a
         // deliberate layering choice): PRIMARY KEY / UNIQUE semantics are owned by the SQL layer's
         // scan-based checks + key locks (NULL keys never conflict; a statement may pass through
@@ -7806,6 +8016,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .indexes
             .get(&index.0)
             .ok_or_else(|| index_not_found(index))?;
+        self.drain_open_index_scans(txn, idx.def.table)?;
         let mut data = idx.data.write().map_err(|_| poisoned())?;
         let removed = self.guarded(data.apply_delete(&self.store, key, row_id))?;
         if let Some(meta) = removed {
@@ -8553,18 +8764,6 @@ impl BtreeEngine {
     ) -> Result<Box<dyn TupleScan>> {
         self.ensure_healthy()?;
         let cat = self.catalog.read().map_err(|_| poisoned())?;
-        let (view, serializable) = {
-            let txns = self.txns.lock().map_err(|_| poisoned())?;
-            let level = txns
-                .txns
-                .get(&txn.0)
-                .map(|t| t.level)
-                .ok_or_else(|| unknown_txn(txn))?;
-            (
-                txns.view_for(txn.0)?,
-                matches!(level, IsolationLevel::Serializable),
-            )
-        };
         let idx = cat
             .indexes
             .get(&index.0)
@@ -8574,6 +8773,44 @@ impl BtreeEngine {
             .tables
             .get(&table_id)
             .ok_or_else(|| table_not_found(idx.def.table))?;
+        let (view, serializable, registration) = {
+            let txns = self.txns.lock().map_err(|_| poisoned())?;
+            let level = txns
+                .txns
+                .get(&txn.0)
+                .map(|t| t.level)
+                .ok_or_else(|| unknown_txn(txn))?;
+            let view = txns.view_for(txn.0)?;
+            let serializable = matches!(level, IsolationLevel::Serializable);
+            // A forward scan of a whole range streams, like a table scan: its view is pinned
+            // with purge before `txns` is released and it walks the index a batch at a time. A
+            // capped or backward scan reads only what its `ORDER BY ... LIMIT` needs, and a
+            // SERIALIZABLE one records its read set, so those still read at open.
+            let registration = if serializable
+                || limit.is_some()
+                || direction == ScanDirection::Backward
+                || index_range_is_empty(lo, hi)
+                || matches!((lo, hi), (Bound::Included(l), Bound::Included(h)) if l == h)
+            {
+                None
+            } else {
+                let range = IndexRange {
+                    data: Arc::clone(&idx.data),
+                    lo: lo.clone(),
+                    hi: hi.clone(),
+                    resume: None,
+                };
+                Some(self.register_index_stream(txn, &view, t.root_id(), table_id, range)?)
+            };
+            (view, serializable, registration)
+        };
+        if let Some((key, state)) = registration {
+            return Ok(Box::new(StreamScan {
+                state,
+                views: Arc::clone(&self.scan_views),
+                key,
+            }));
+        }
         // Ordered key walk over `[lo, hi]` — ascending for a forward scan, descending (the same rows
         // reversed) for a backward one. Two visibility hops per entry: the ENTRY's own
         // stamps first — the row keeps its address across versions, so only the stamps can tell
