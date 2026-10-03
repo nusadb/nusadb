@@ -31,6 +31,19 @@ mod pushdown;
 use join::*;
 pub use lower::{plan, plan_select};
 
+/// The hashable equalities between the first `left_width` columns and the rest that `predicate`
+/// requires (its top-level `AND` conjuncts of the form `left = right`), as hash-join keys. Rows
+/// that satisfy `predicate` agree on every key, so the keys narrow the candidates a predicate is
+/// evaluated on without changing which rows match.
+pub(crate) fn equi_keys(predicate: &TypedExpr, left_width: usize) -> Vec<HashKey> {
+    let mut conjuncts = Vec::new();
+    join::split_conjuncts(predicate.clone(), &mut conjuncts);
+    conjuncts
+        .into_iter()
+        .filter_map(|c| join::classify_conjunct(c, left_width).ok())
+        .collect()
+}
+
 /// Match a single-table `WHERE` to an equality/range index access path, without cost statistics —
 /// the crate-internal entry the executor's DML find-path uses to turn `WHERE pk = const` into an
 /// [`PhysicalOperator::IndexScan`] point lookup. Returns `None` to keep a sequential scan. (A

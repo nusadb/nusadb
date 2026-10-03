@@ -3897,6 +3897,91 @@ pub(super) fn remove_departed_index_entries(
 
 // === UPDATE / DELETE ======================================================
 
+/// Rows indexed by their values for a predicate's equi-keys (see [`crate::planner::equi_keys`]):
+/// the rows a predicate over `left ++ right` can match for one probe row, in their original
+/// order, so a "first match" or "any match" loop over them sees exactly the rows a full scan would
+/// find matching, in the same order.
+struct KeyedRows {
+    keys: Vec<crate::planner::HashKey>,
+    map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>>,
+    left_width: usize,
+}
+
+impl KeyedRows {
+    /// Index `rows` (the right side, `left_width` columns after the left one), or `None` when
+    /// `predicate` has no usable equi-key.
+    fn right(
+        predicate: Option<&TypedExpr>,
+        rows: &[Row],
+        left_width: usize,
+    ) -> Result<Option<Self>, Error> {
+        let keys = predicate.map_or_else(Vec::new, |p| crate::planner::equi_keys(p, left_width));
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let mut map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>> = HashMap::new();
+        let mut padded: Row = vec![ast::Value::Null; left_width];
+        for (index, row) in rows.iter().enumerate() {
+            padded.truncate(left_width);
+            padded.extend_from_slice(row);
+            if let Some(key) = super::join::key_atoms(&keys, &padded, super::join::KeySide::Right)?
+            {
+                map.entry(key).or_default().push(index);
+            }
+        }
+        Ok(Some(Self {
+            keys,
+            map,
+            left_width,
+        }))
+    }
+
+    /// Index `rows` (the left side), or `None` when `predicate` has no usable equi-key.
+    fn left<'r>(
+        predicate: &TypedExpr,
+        rows: impl Iterator<Item = &'r Row>,
+        left_width: usize,
+    ) -> Result<Option<Self>, Error> {
+        let keys = crate::planner::equi_keys(predicate, left_width);
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let mut map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>> = HashMap::new();
+        for (index, row) in rows.enumerate() {
+            if let Some(key) = super::join::key_atoms(&keys, row, super::join::KeySide::Left)? {
+                map.entry(key).or_default().push(index);
+            }
+        }
+        Ok(Some(Self {
+            keys,
+            map,
+            left_width,
+        }))
+    }
+
+    /// The indexed right rows a left `row` can match, in order.
+    fn for_left(&self, row: &Row) -> Result<&[usize], Error> {
+        Ok(
+            super::join::key_atoms(&self.keys, row, super::join::KeySide::Left)?
+                .and_then(|key| self.map.get(&key))
+                .map_or(&[][..], Vec::as_slice),
+        )
+    }
+
+    /// The indexed left rows a right `row` can match, in order. `padded` is a scratch row the
+    /// caller reuses across calls.
+    fn for_right(&self, row: &Row, padded: &mut Row) -> Result<&[usize], Error> {
+        padded.clear();
+        padded.resize(self.left_width, ast::Value::Null);
+        padded.extend_from_slice(row);
+        Ok(
+            super::join::key_atoms(&self.keys, padded, super::join::KeySide::Right)?
+                .and_then(|key| self.map.get(&key))
+                .map_or(&[][..], Vec::as_slice),
+        )
+    }
+}
+
 /// Run an inlined derived-relation plan — the source of `UPDATE ... FROM (VALUES/SELECT ...)` or
 /// `DELETE ... USING (...)` — within the current transaction and collect its rows. Executed once per
 /// statement (not per target row), against the same `txn` snapshot as the rest of the statement.
@@ -4165,6 +4250,13 @@ fn run_update_single(
         let set_cols: HashSet<usize> = assignments.iter().map(|a| a.column).collect();
         reject_explicit_generated(&plan.table, &fills, &set_cols)?;
     }
+    // The FROM rows keyed by the WHERE's equalities between target and FROM columns, so each
+    // target row is tested only against the FROM rows that can match it rather than all of them.
+    let from_index = if plan.from.is_some() {
+        KeyedRows::right(filter.as_ref(), &from_rows, plan.table.columns.len())?
+    } else {
+        None
+    };
     for (tid, row) in rows {
         // A row this statement's own row movement just inserted here is already final — a later
         // branch re-matching it would double-apply the SET (and double its RETURNING row).
@@ -4175,7 +4267,16 @@ fn run_update_single(
             // Join: find the first FROM row matching the WHERE over the concatenated row; apply the
             // SET against that combined row. No match → the target row is left unchanged.
             let mut applied = false;
-            for frow in &from_rows {
+            let candidates: Box<dyn Iterator<Item = &Row>> = match &from_index {
+                Some(index) => Box::new(
+                    index
+                        .for_left(&row)?
+                        .iter()
+                        .filter_map(|&i| from_rows.get(i)),
+                ),
+                None => Box::new(from_rows.iter()),
+            };
+            for frow in candidates {
                 let mut combined = row.clone();
                 combined.extend(frow.iter().cloned());
                 if predicate_matches(filter.as_ref(), &combined)? {
@@ -4727,9 +4828,24 @@ fn run_delete_single(
     // Collect the matching rows first, so foreign keys pointing at this table can be enforced
     // (RESTRICT) or propagated (CASCADE) before any parent row is removed.
     let mut to_delete: Vec<(Tid, Row)> = Vec::new();
+    // The USING rows keyed by the WHERE's equalities between target and USING columns.
+    let using_index = if plan.using.is_some() {
+        KeyedRows::right(filter.as_ref(), &using_rows, plan.table.columns.len())?
+    } else {
+        None
+    };
     for (tid, row) in rows {
         let matched = if plan.using.is_some() {
-            using_rows.iter().try_fold(false, |hit, urow| {
+            let candidates: Box<dyn Iterator<Item = &Row>> = match &using_index {
+                Some(index) => Box::new(
+                    index
+                        .for_left(&row)?
+                        .iter()
+                        .filter_map(|&i| using_rows.get(i)),
+                ),
+                None => Box::new(using_rows.iter()),
+            };
+            candidates.into_iter().try_fold(false, |hit, urow| {
                 if hit {
                     return Ok(true);
                 }
@@ -5218,10 +5334,27 @@ pub(super) fn run_merge(
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
     let enum_info = enum_columns_info(&plan.table, engine, txn)?;
 
+    // The target rows keyed by the ON condition's equalities between target and source columns,
+    // so each source row is tested only against the target rows that can match it.
+    let target_index = KeyedRows::left(
+        &plan.on,
+        target_rows.iter().map(|(_, row)| row),
+        plan.table.columns.len(),
+    )?;
+    let mut padded: Row = Vec::new();
     for srow in &source_rows {
         // The first target row the ON condition matches (over `target ++ source`).
         let mut hit: Option<(Tid, Row)> = None;
-        for (tid, trow) in &target_rows {
+        let candidates: Box<dyn Iterator<Item = &(Tid, Row)>> = match &target_index {
+            Some(index) => Box::new(
+                index
+                    .for_right(srow, &mut padded)?
+                    .iter()
+                    .filter_map(|&i| target_rows.get(i)),
+            ),
+            None => Box::new(target_rows.iter()),
+        };
+        for (tid, trow) in candidates {
             let mut combined = trow.clone();
             combined.extend(srow.iter().cloned());
             if matches!(eval::eval(&plan.on, &combined)?, ast::Value::Bool(true)) {
@@ -5298,6 +5431,8 @@ pub(super) fn run_merge(
         // Reused across probes so the inner loop does not allocate a row buffer per (target, source)
         // pair; each iteration rewinds it to the target half and appends the source row.
         let mut probe: Row = Vec::with_capacity(plan.table.columns.len() + null_source.len());
+        let source_index =
+            KeyedRows::right(Some(&plan.on), &source_rows, plan.table.columns.len())?;
         for (tid, trow) in &target_rows {
             // A row in `matched_targets` is settled. A row absent from it is NOT yet known to be
             // unmatched — the classify loop stops at the first target row each source row hits, so a
@@ -5306,7 +5441,16 @@ pub(super) fn run_merge(
                 continue;
             }
             let mut matched = false;
-            for srow in &source_rows {
+            let candidates: Box<dyn Iterator<Item = &Row>> = match &source_index {
+                Some(index) => Box::new(
+                    index
+                        .for_left(trow)?
+                        .iter()
+                        .filter_map(|&i| source_rows.get(i)),
+                ),
+                None => Box::new(source_rows.iter()),
+            };
+            for srow in candidates {
                 probe.clear();
                 probe.extend(trow.iter().cloned());
                 probe.extend(srow.iter().cloned());
