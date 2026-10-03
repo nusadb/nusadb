@@ -1876,7 +1876,7 @@ each partition in memory when it fits and from disk when it does not; over a par
 the budget, `RANGE`/`GROUPS` frames with an offset, `EXCLUDE` on such frames, frames from
 `CURRENT ROW` to `UNBOUNDED FOLLOWING` for aggregates, and a `ROWS` frame wider than the budget
 still fail.
-`DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` do not spill yet; they fail at the budget.
+`DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` spill as well.
 `SET work_mem` moves both the budget and the point where spilling starts.
 
 ### `TABLESAMPLE` samples per row

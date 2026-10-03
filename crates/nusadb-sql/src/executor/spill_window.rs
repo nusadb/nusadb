@@ -45,10 +45,7 @@ pub(super) fn window_source<'a>(
     engine: &'a dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Box<dyn RowSource + 'a>, Error> {
-    let mut source: Box<dyn RowSource + 'a> = Box::new(Numbered {
-        inner: super::stream::stream_op(input, engine, txn)?,
-        next: 0,
-    });
+    let mut source = numbered(super::stream::stream_op(input, engine, txn)?);
     let mut start = 0;
     while let Some(first) = windows.get(start) {
         let len = windows
@@ -62,6 +59,27 @@ pub(super) fn window_source<'a>(
         start += len;
     }
     Ok(Box::new(Unnumbered(source)))
+}
+
+/// `source` with each row's position in it appended as a trailing `Int` column, the last sort key
+/// that makes an external sort keep tied rows in input order.
+pub(super) fn numbered<'a>(source: Box<dyn RowSource + 'a>) -> Box<dyn RowSource + 'a> {
+    Box::new(Numbered {
+        inner: source,
+        next: 0,
+    })
+}
+
+/// The sort key on the trailing position column of rows `width` wide (position included).
+pub(super) const fn position_key(width: usize) -> OrderByKey {
+    OrderByKey {
+        expr: crate::planner::TypedExpr {
+            kind: crate::planner::TypedExprKind::Column(width.saturating_sub(1)),
+            ty: nusadb_core::ColumnType::BigInt,
+        },
+        ascending: true,
+        nulls: ast::NullOrdering::Default,
+    }
 }
 
 /// Appends each row's position in the input as a trailing `Int` column.
@@ -82,7 +100,7 @@ impl RowSource for Numbered<'_> {
 }
 
 /// Drops the trailing position column [`Numbered`] added.
-struct Unnumbered<'a>(Box<dyn RowSource + 'a>);
+pub(super) struct Unnumbered<'a>(pub(super) Box<dyn RowSource + 'a>);
 
 impl RowSource for Unnumbered<'_> {
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
@@ -95,9 +113,9 @@ impl RowSource for Unnumbered<'_> {
 }
 
 /// Yields `first`, then the rest of `rest`.
-struct Chain<'a> {
-    first: Option<Row>,
-    rest: Box<dyn RowSource + 'a>,
+pub(super) struct Chain<'a> {
+    pub(super) first: Option<Row>,
+    pub(super) rest: Box<dyn RowSource + 'a>,
 }
 
 impl RowSource for Chain<'_> {
@@ -154,14 +172,7 @@ impl<'a> WindowPass<'a> {
             })
             .collect();
         keys.extend(shared.map(|w| w.order.clone()).unwrap_or_default());
-        keys.push(OrderByKey {
-            expr: crate::planner::TypedExpr {
-                kind: crate::planner::TypedExprKind::Column(position),
-                ty: nusadb_core::ColumnType::BigInt,
-            },
-            ascending: true,
-            nulls: ast::NullOrdering::Default,
-        });
+        keys.push(position_key(position + 1));
         let mut all = Chain {
             first: Some(first),
             rest: input,

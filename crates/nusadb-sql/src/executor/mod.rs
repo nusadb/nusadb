@@ -141,6 +141,7 @@ mod recursive;
 pub mod scan;
 mod script;
 mod seqcatalog;
+mod spill_grouping;
 mod spill_setop;
 mod spill_sort;
 mod spill_window;

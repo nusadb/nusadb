@@ -1914,6 +1914,12 @@ fn execute_op_inner(
             Ok(dedupe_rows(rows))
         },
         PhysicalOperator::DistinctOn { input, keys } => {
+            if let Some(cfg) = super::spill::spill_config() {
+                return collect_rows(
+                    super::spill_grouping::distinct_on_source(input, keys, &cfg, engine, txn)?
+                        .as_mut(),
+                );
+            }
             // Keep the first input row per distinct key tuple; "first" follows the ORDER BY
             // the planner placed beneath this. NULL is not distinct from NULL (group_keys_equal).
             let rows = execute_op(input, engine, txn)?;
@@ -1977,6 +1983,20 @@ fn execute_op_inner(
             grouping_sets,
             calls,
         } => {
+            if let Some(cfg) = super::spill::spill_config() {
+                return collect_rows(
+                    super::spill_grouping::grouping_sets_source(
+                        input,
+                        group_keys,
+                        grouping_sets,
+                        calls,
+                        &cfg,
+                        engine,
+                        txn,
+                    )?
+                    .as_mut(),
+                );
+            }
             // One streamed pass folding into per-set per-group accumulators — O(sum of groups)
             // memory instead of O(input) (the residual).
             let mut child = super::stream::stream_op(input, engine, txn)?;

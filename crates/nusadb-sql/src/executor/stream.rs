@@ -31,7 +31,7 @@ pub(super) trait RowSource {
 }
 
 /// Adapts a fully-materialized `Vec<Row>` (a blocking operator's result) to a [`RowSource`].
-struct Materialized(std::vec::IntoIter<Row>);
+pub(super) struct Materialized(pub(super) std::vec::IntoIter<Row>);
 
 impl RowSource for Materialized {
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
@@ -40,7 +40,7 @@ impl RowSource for Materialized {
 }
 
 /// Streams an external merge sort's output as the merge produces it.
-struct SortedSource(super::spill_sort::SortedInput);
+pub(super) struct SortedSource(pub(super) super::spill_sort::SortedInput);
 
 impl RowSource for SortedSource {
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
@@ -483,6 +483,39 @@ pub(super) fn stream_op<'a>(
             Some(cfg) => Ok(counted(
                 op,
                 super::spill_window::window_source(input, windows, &cfg, engine, txn)?,
+            )),
+            None => Ok(Box::new(Materialized(
+                execute_op(op, engine, txn)?.into_iter(),
+            ))),
+        },
+        // With spill configured, `DISTINCT ON` and grouping sets bound their memory too (see
+        // `spill_grouping`).
+        PhysicalOperator::DistinctOn { input, keys } => match super::spill::spill_config() {
+            Some(cfg) => Ok(counted(
+                op,
+                super::spill_grouping::distinct_on_source(input, keys, &cfg, engine, txn)?,
+            )),
+            None => Ok(Box::new(Materialized(
+                execute_op(op, engine, txn)?.into_iter(),
+            ))),
+        },
+        PhysicalOperator::GroupingSetsAggregate {
+            input,
+            group_keys,
+            grouping_sets,
+            calls,
+        } => match super::spill::spill_config() {
+            Some(cfg) => Ok(counted(
+                op,
+                super::spill_grouping::grouping_sets_source(
+                    input,
+                    group_keys,
+                    grouping_sets,
+                    calls,
+                    &cfg,
+                    engine,
+                    txn,
+                )?,
             )),
             None => Ok(Box::new(Materialized(
                 execute_op(op, engine, txn)?.into_iter(),

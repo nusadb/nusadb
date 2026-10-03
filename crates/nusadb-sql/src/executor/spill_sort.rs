@@ -7,6 +7,9 @@
 //! [`compare_order_key`](crate::executor::eval::compare_order_key) ordering drives both run
 //! generation and the merge.
 //!
+//! The merge is stable: rows with equal keys leave in input order, as the in-memory sort leaves
+//! them.
+//!
 //! Like the grace hash join, this bounds the *working set* (one run + the merge heads), not
 //! the final output `Vec<Row>`; end-to-end output bounding is the streaming-output phase (Fase 2).
 
@@ -209,7 +212,7 @@ struct Head {
 
 impl PartialEq for Head {
     fn eq(&self, other: &Self) -> bool {
-        self.keys == other.keys
+        self.cmp(other) == Ordering::Equal
     }
 }
 impl Eq for Head {}
@@ -219,8 +222,13 @@ impl PartialOrd for Head {
     }
 }
 impl Ord for Head {
+    /// Equal keys order by run: runs are cut from the input in order and each is sorted stably,
+    /// so the merge is stable too and ties leave in input order, exactly as the in-memory sort
+    /// leaves them.
     fn cmp(&self, other: &Self) -> Ordering {
-        self.keys.cmp(&other.keys)
+        self.keys
+            .cmp(&other.keys)
+            .then_with(|| self.run.cmp(&other.run))
     }
 }
 

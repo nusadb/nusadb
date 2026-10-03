@@ -51,25 +51,38 @@ pub(super) fn sort_based_group_aggregate<'a>(
             nulls: ast::NullOrdering::Default,
         })
         .collect();
-    Ok(SortedGroups {
-        sorted: super::spill_sort::sorted_input(input, &order, config, engine, txn)?,
-        group_keys,
+    Ok(SortedGroups::over(
+        super::spill_sort::sorted_input(input, &order, config, engine, txn)?,
+        std::borrow::Cow::Borrowed(group_keys),
         calls,
-        current: None,
-    })
+    ))
 }
 
 /// The output of [`sort_based_group_aggregate`]: one row per group, folded as the sorted input
 /// streams past.
 pub(super) struct SortedGroups<'a> {
     sorted: super::spill_sort::SortedInput,
-    group_keys: &'a [TypedExpr],
+    group_keys: std::borrow::Cow<'a, [TypedExpr]>,
     calls: &'a [AggregateCall],
     /// The group being folded: its key and its accumulators.
     current: Option<(Vec<ast::Value>, Vec<Acc>)>,
 }
 
-impl SortedGroups<'_> {
+impl<'a> SortedGroups<'a> {
+    /// Fold `sorted`, already ordered so equal `group_keys` are adjacent, group by group.
+    pub(super) const fn over(
+        sorted: super::spill_sort::SortedInput,
+        group_keys: std::borrow::Cow<'a, [TypedExpr]>,
+        calls: &'a [AggregateCall],
+    ) -> Self {
+        Self {
+            sorted,
+            group_keys,
+            calls,
+            current: None,
+        }
+    }
+
     /// The finished output row of one group: its key followed by each aggregate's value.
     fn finish(&self, (key, accs): (Vec<ast::Value>, Vec<Acc>)) -> Result<Row, Error> {
         let mut out_row = key;
@@ -185,7 +198,7 @@ pub(super) fn run_grouping_sets_aggregate_streamed(
 /// the `group_keys` indices the call names (leftmost = most-significant bit); `active` are the key
 /// indices this grouping set still groups by. A bit is `1` when its key was *grouped away* (not in
 /// `active`), `0` when present — so `GROUPING(a, b)` over the set `{a}` yields `0b01` = `1`.
-fn grouping_mask(grouping_args: &[usize], active: &[usize]) -> i64 {
+pub(super) fn grouping_mask(grouping_args: &[usize], active: &[usize]) -> i64 {
     let n = grouping_args.len();
     let mut mask = 0i64;
     for (pos, key_idx) in grouping_args.iter().enumerate() {
