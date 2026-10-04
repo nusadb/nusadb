@@ -29,6 +29,54 @@ pub(super) fn scan_table(
     Ok(out)
 }
 
+/// A DML statement's target rows: those a point lookup found, or a table scan read one row at a
+/// time with exactly [`scan_table`]'s visibility, so a statement over a large table does not hold
+/// every row it passes over. A scan never reads rows its own transaction writes after it opened.
+pub(super) enum TargetRows {
+    Found(std::vec::IntoIter<(Tid, Row)>),
+    Scan {
+        scan: Box<dyn nusadb_core::engine::TupleScan>,
+        table: nusadb_core::TableId,
+        schema: Vec<ColumnType>,
+    },
+}
+
+impl TargetRows {
+    /// Every visible row of `table`, streamed.
+    pub(super) fn scan(
+        table: &TableSchema,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<Self, Error> {
+        Ok(Self::Scan {
+            scan: engine.scan(txn, table.id)?,
+            table: table.id,
+            schema: column_types(table),
+        })
+    }
+
+    /// The next target row.
+    pub(super) fn try_next(&mut self) -> Result<Option<(Tid, Row)>, Error> {
+        match self {
+            Self::Found(rows) => Ok(rows.next()),
+            Self::Scan {
+                scan,
+                table,
+                schema,
+            } => {
+                while let Some((tid, tuple)) = scan.try_next()? {
+                    crate::cancel::check()?;
+                    if super::lock_skip::skipped(*table, tid) {
+                        continue;
+                    }
+                    return Ok(Some((tid, row::decode(&tuple, schema)?)));
+                }
+                Ok(None)
+            },
+        }
+    }
+}
+
 /// Count the visible rows of `table` **without decoding any row bytes** — the `COUNT(*)` fast-path.
 /// Same visibility as [`scan_table`] (the engine applies MVCC per tuple, plus `SKIP LOCKED` and the
 /// recursive-CTE working set), so the count is exactly what folding over the decoded rows would

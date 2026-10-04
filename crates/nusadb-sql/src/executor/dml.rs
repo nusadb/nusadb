@@ -3,6 +3,7 @@
 //! Split verbatim out of `executor/mod.rs` (ADR 007). Siblings resolve via `use super::*`.
 #![allow(clippy::wildcard_imports)]
 
+use super::dml_join::KeyedRows;
 use super::*;
 
 // === INSERT ===============================================================
@@ -3897,89 +3898,28 @@ pub(super) fn remove_departed_index_entries(
 
 // === UPDATE / DELETE ======================================================
 
-/// Rows indexed by their values for a predicate's equi-keys (see [`crate::planner::equi_keys`]):
-/// the rows a predicate over `left ++ right` can match for one probe row, in their original
-/// order, so a "first match" or "any match" loop over them sees exactly the rows a full scan would
-/// find matching, in the same order.
-struct KeyedRows {
-    keys: Vec<crate::planner::HashKey>,
-    map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>>,
-    left_width: usize,
-}
-
-impl KeyedRows {
-    /// Index `rows` (the right side, `left_width` columns after the left one), or `None` when
-    /// `predicate` has no usable equi-key.
-    fn right(
-        predicate: Option<&TypedExpr>,
-        rows: &[Row],
-        left_width: usize,
-    ) -> Result<Option<Self>, Error> {
-        let keys = predicate.map_or_else(Vec::new, |p| crate::planner::equi_keys(p, left_width));
-        if keys.is_empty() {
-            return Ok(None);
-        }
-        let mut map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>> = HashMap::new();
-        let mut padded: Row = vec![ast::Value::Null; left_width];
-        for (index, row) in rows.iter().enumerate() {
-            padded.truncate(left_width);
-            padded.extend_from_slice(row);
-            if let Some(key) = super::join::key_atoms(&keys, &padded, super::join::KeySide::Right)?
-            {
-                map.entry(key).or_default().push(index);
-            }
-        }
-        Ok(Some(Self {
-            keys,
-            map,
-            left_width,
-        }))
-    }
-
-    /// Index `rows` (the left side), or `None` when `predicate` has no usable equi-key.
-    fn left<'r>(
-        predicate: &TypedExpr,
-        rows: impl Iterator<Item = &'r Row>,
-        left_width: usize,
-    ) -> Result<Option<Self>, Error> {
-        let keys = crate::planner::equi_keys(predicate, left_width);
-        if keys.is_empty() {
-            return Ok(None);
-        }
-        let mut map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>> = HashMap::new();
-        for (index, row) in rows.enumerate() {
-            if let Some(key) = super::join::key_atoms(&keys, row, super::join::KeySide::Left)? {
-                map.entry(key).or_default().push(index);
-            }
-        }
-        Ok(Some(Self {
-            keys,
-            map,
-            left_width,
-        }))
-    }
-
-    /// The indexed right rows a left `row` can match, in order.
-    fn for_left(&self, row: &Row) -> Result<&[usize], Error> {
-        Ok(
-            super::join::key_atoms(&self.keys, row, super::join::KeySide::Left)?
-                .and_then(|key| self.map.get(&key))
-                .map_or(&[][..], Vec::as_slice),
-        )
-    }
-
-    /// The indexed left rows a right `row` can match, in order. `padded` is a scratch row the
-    /// caller reuses across calls.
-    fn for_right(&self, row: &Row, padded: &mut Row) -> Result<&[usize], Error> {
-        padded.clear();
-        padded.resize(self.left_width, ast::Value::Null);
-        padded.extend_from_slice(row);
-        Ok(
-            super::join::key_atoms(&self.keys, padded, super::join::KeySide::Right)?
-                .and_then(|key| self.map.get(&key))
-                .map_or(&[][..], Vec::as_slice),
-        )
-    }
+/// The source of an `UPDATE ... FROM` / `DELETE ... USING`: the derived relation `sub` when there is
+/// one, else the rows of `table`; `None` without a source. Held in memory while it fits the work
+/// budget, else spilled (see [`super::dml_join`]).
+fn join_source(
+    sub: Option<&crate::planner::SelectPlan>,
+    table: Option<&TableSchema>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Option<super::dml_join::JoinSource>, Error> {
+    let Some(table) = table else {
+        return Ok(None);
+    };
+    let source = if let Some(sub) = sub {
+        let op = crate::planner::plan_select(sub.clone());
+        let mut rows = super::stream::stream_op(&op, engine, txn)?;
+        super::dml_join::JoinSource::load(&mut *rows)?
+    } else {
+        super::dml_join::JoinSource::load(&mut super::dml_join::TableRows(TargetRows::scan(
+            table, engine, txn,
+        )?))?
+    };
+    Ok(Some(source))
 }
 
 /// Run an inlined derived-relation plan — the source of `UPDATE ... FROM (VALUES/SELECT ...)` or
@@ -4152,15 +4092,15 @@ fn run_update_single(
     // below is re-applied unchanged, so the index path only narrows the candidate set to a superset.
     // `via_index` records that the whole-table image (`result_rows`) was NOT materialized, so the
     // uniqueness fallback rebuilds it on demand (see `enforce_unique_over_rows` call below).
-    let (rows, via_index) = match plan
+    let (mut rows, via_index) = match plan
         .from
         .is_none()
         .then(|| try_point_get_rows(&plan.table, plan.filter.as_ref(), engine, txn))
         .transpose()?
         .flatten()
     {
-        Some(rows) => (rows, true),
-        None => (scan_table(&plan.table, engine, txn)?, false),
+        Some(rows) => (TargetRows::Found(rows.into_iter()), true),
+        None => (TargetRows::scan(&plan.table, engine, txn)?, false),
     };
     // Compute the post-update state first: matched rows take their new values, unmatched rows stay.
     // PRIMARY KEY / UNIQUE must hold over the *whole* resulting table (a new key may collide with an
@@ -4205,11 +4145,7 @@ fn run_update_single(
     let track_old =
         is_fk_parent || !index_targets.is_empty() || triggers.needs_old_image() || has_ivm;
     let mut to_update: Vec<(Tid, Option<Row>, Row)> = Vec::new();
-    let mut result_rows: Vec<Row> = if needs_unique {
-        Vec::with_capacity(rows.len())
-    } else {
-        Vec::new()
-    };
+    let mut result_rows: Vec<Row> = Vec::new();
     // The matched rows' pre-update images, for the committed-state uniqueness re-check's
     // rewritten-key exclusion. Only kept when uniqueness is enforced.
     let mut old_for_unique: Vec<Row> = Vec::new();
@@ -4217,16 +4153,7 @@ fn run_update_single(
     // once; each target row uses the first FROM row the WHERE (over `target ++ from`) matches.
     // The FROM source rows: a derived source (`FROM (VALUES ...)` / `(SELECT ...)`) runs its inlined
     // plan; a named source is scanned; a plain UPDATE has none.
-    let from_rows: Vec<Row> = if let Some(from_plan) = &plan.from_plan {
-        materialize_subplan(from_plan, engine, txn)?
-    } else if let Some(from_table) = &plan.from {
-        scan_table(from_table, engine, txn)?
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let from_rows = join_source(plan.from_plan.as_deref(), plan.from.as_ref(), engine, txn)?;
     // Resolve any *uncorrelated* subquery in the SET values / WHERE to a literal once, before the
     // per-row loop (for UPDATE) — e.g. `SET x = (SELECT max(v) FROM other)`. There is no per-row
     // pass here, so defer-correlated keeps a correlated subquery (one referencing the target row) in
@@ -4250,72 +4177,74 @@ fn run_update_single(
         let set_cols: HashSet<usize> = assignments.iter().map(|a| a.column).collect();
         reject_explicit_generated(&plan.table, &fills, &set_cols)?;
     }
-    // The FROM rows keyed by the WHERE's equalities between target and FROM columns, so each
-    // target row is tested only against the FROM rows that can match it rather than all of them.
-    let from_index = if plan.from.is_some() {
-        KeyedRows::right(filter.as_ref(), &from_rows, plan.table.columns.len())?
-    } else {
-        None
-    };
-    for (tid, row) in rows {
-        // A row this statement's own row movement just inserted here is already final — a later
-        // branch re-matching it would double-apply the SET (and double its RETURNING row).
-        if super::move_skip::moved_here(plan.table.id, tid) {
-            continue;
-        }
-        if plan.from.is_some() {
-            // Join: find the first FROM row matching the WHERE over the concatenated row; apply the
-            // SET against that combined row. No match → the target row is left unchanged.
-            let mut applied = false;
-            let candidates: Box<dyn Iterator<Item = &Row>> = match &from_index {
-                Some(index) => Box::new(
-                    index
-                        .for_left(&row)?
-                        .iter()
-                        .filter_map(|&i| from_rows.get(i)),
-                ),
-                None => Box::new(from_rows.iter()),
-            };
-            for frow in candidates {
-                let mut combined = row.clone();
-                combined.extend(frow.iter().cloned());
-                if predicate_matches(filter.as_ref(), &combined)? {
-                    let old = track_old.then(|| row.clone());
-                    let new_row = finalize_updated_row(
-                        apply_assignments_ctx(&assignments, &plan.table, row.clone(), &combined)?,
-                        &fills,
-                        &plan.table,
-                        &enum_info,
-                    )?;
-                    if needs_unique {
-                        result_rows.push(new_row.clone());
-                        old_for_unique.push(row.clone());
-                    }
-                    to_update.push((tid, old, new_row));
-                    applied = true;
-                    break;
+    if let Some(from_rows) = from_rows {
+        // Join: each target row takes the first FROM row matching the WHERE over the concatenated
+        // row and applies the SET against that combined row. No match leaves the row unchanged.
+        super::dml_join::join_each(
+            rows,
+            from_rows,
+            filter.as_ref(),
+            plan.table.columns.len(),
+            &mut |tid, row, candidates| {
+                // A row this statement's own row movement just inserted here is already final.
+                if super::move_skip::moved_here(plan.table.id, tid) {
+                    return Ok(());
                 }
+                while let Some(frow) = candidates.next_row()? {
+                    let mut combined = row.clone();
+                    combined.extend(frow.iter().cloned());
+                    if predicate_matches(filter.as_ref(), &combined)? {
+                        let old = track_old.then(|| row.clone());
+                        let new_row = finalize_updated_row(
+                            apply_assignments_ctx(
+                                &assignments,
+                                &plan.table,
+                                row.clone(),
+                                &combined,
+                            )?,
+                            &fills,
+                            &plan.table,
+                            &enum_info,
+                        )?;
+                        if needs_unique {
+                            result_rows.push(new_row.clone());
+                            old_for_unique.push(row);
+                        }
+                        to_update.push((tid, old, new_row));
+                        return Ok(());
+                    }
+                }
+                if needs_unique {
+                    result_rows.push(row);
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        while let Some((tid, row)) = rows.try_next()? {
+            // A row this statement's own row movement just inserted here is already final — a later
+            // branch re-matching it would double-apply the SET (and double its RETURNING row).
+            if super::move_skip::moved_here(plan.table.id, tid) {
+                continue;
             }
-            if !applied && needs_unique {
+            if predicate_matches(filter.as_ref(), &row)? {
+                let old = track_old.then(|| row.clone());
+                if needs_unique {
+                    old_for_unique.push(row.clone());
+                }
+                let new_row = finalize_updated_row(
+                    apply_assignments(&assignments, &plan.table, row)?,
+                    &fills,
+                    &plan.table,
+                    &enum_info,
+                )?;
+                if needs_unique {
+                    result_rows.push(new_row.clone());
+                }
+                to_update.push((tid, old, new_row));
+            } else if needs_unique {
                 result_rows.push(row);
             }
-        } else if predicate_matches(filter.as_ref(), &row)? {
-            let old = track_old.then(|| row.clone());
-            if needs_unique {
-                old_for_unique.push(row.clone());
-            }
-            let new_row = finalize_updated_row(
-                apply_assignments(&assignments, &plan.table, row)?,
-                &fills,
-                &plan.table,
-                &enum_info,
-            )?;
-            if needs_unique {
-                result_rows.push(new_row.clone());
-            }
-            to_update.push((tid, old, new_row));
-        } else if needs_unique {
-            result_rows.push(row);
         }
     }
     // Row movement: a SET whose new image leaves this partition's bound is performed as a DELETE
@@ -4795,28 +4724,19 @@ fn run_delete_single(
     // (`DELETE FROM t WHERE pk = const`) — `O(log n)` instead of a full-table `scan_table`. Only for
     // a plain `DELETE` (a `USING` join needs the whole target relation); the per-row `WHERE` below is
     // re-applied unchanged, so the index path only narrows the candidate set to a correct superset.
-    let rows = match plan
+    let mut rows = match plan
         .using
         .is_none()
         .then(|| try_point_get_rows(&plan.table, plan.filter.as_ref(), engine, txn))
         .transpose()?
         .flatten()
     {
-        Some(rows) => rows,
-        None => scan_table(&plan.table, engine, txn)?,
+        Some(rows) => TargetRows::Found(rows.into_iter()),
+        None => TargetRows::scan(&plan.table, engine, txn)?,
     };
     // `DELETE ... USING <src>`: the USING rows the WHERE joins against. A target row is
     // deleted if it matches the WHERE over `target ++ using` for *any* USING row.
-    let using_rows: Vec<Row> = if let Some(using_plan) = &plan.using_plan {
-        materialize_subplan(using_plan, engine, txn)?
-    } else if let Some(using_table) = &plan.using {
-        scan_table(using_table, engine, txn)?
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let using_rows = join_source(plan.using_plan.as_deref(), plan.using.as_ref(), engine, txn)?;
     // Resolve any uncorrelated subquery in the WHERE to a literal once, before the per-row loop —
     // e.g. `DELETE FROM t WHERE id IN (SELECT id FROM stale)`. Defer-correlated keeps a correlated
     // subquery in place to be rejected at eval (no per-row pass here), not mis-resolved to NULL.
@@ -4828,36 +4748,30 @@ fn run_delete_single(
     // Collect the matching rows first, so foreign keys pointing at this table can be enforced
     // (RESTRICT) or propagated (CASCADE) before any parent row is removed.
     let mut to_delete: Vec<(Tid, Row)> = Vec::new();
-    // The USING rows keyed by the WHERE's equalities between target and USING columns.
-    let using_index = if plan.using.is_some() {
-        KeyedRows::right(filter.as_ref(), &using_rows, plan.table.columns.len())?
-    } else {
-        None
-    };
-    for (tid, row) in rows {
-        let matched = if plan.using.is_some() {
-            let candidates: Box<dyn Iterator<Item = &Row>> = match &using_index {
-                Some(index) => Box::new(
-                    index
-                        .for_left(&row)?
-                        .iter()
-                        .filter_map(|&i| using_rows.get(i)),
-                ),
-                None => Box::new(using_rows.iter()),
-            };
-            candidates.into_iter().try_fold(false, |hit, urow| {
-                if hit {
-                    return Ok(true);
+    if let Some(using_rows) = using_rows {
+        // A target row is deleted when the WHERE over `target ++ using` matches any USING row.
+        super::dml_join::join_each(
+            rows,
+            using_rows,
+            filter.as_ref(),
+            plan.table.columns.len(),
+            &mut |tid, row, candidates| {
+                while let Some(urow) = candidates.next_row()? {
+                    let mut combined = row.clone();
+                    combined.extend(urow.iter().cloned());
+                    if predicate_matches(filter.as_ref(), &combined)? {
+                        to_delete.push((tid, row));
+                        return Ok(());
+                    }
                 }
-                let mut combined = row.clone();
-                combined.extend(urow.iter().cloned());
-                predicate_matches(filter.as_ref(), &combined)
-            })?
-        } else {
-            predicate_matches(filter.as_ref(), &row)?
-        };
-        if matched {
-            to_delete.push((tid, row));
+                Ok(())
+            },
+        )?;
+    } else {
+        while let Some((tid, row)) = rows.try_next()? {
+            if predicate_matches(filter.as_ref(), &row)? {
+                to_delete.push((tid, row));
+            }
         }
     }
     // BEFORE triggers: statement-level once, then row-level for each matched row, before the
