@@ -1875,8 +1875,8 @@ automatically on a Linux host where the budget is detected), and a spilled sort,
 a spill directory, a stage over `--work-mem` fails with an error naming the limit, the bytes
 involved and how to raise it, and the server stays responsive. Window functions evaluate each
 partition in memory when it fits and from disk when it does not; over a partition larger than the
-budget only a frame holding more rows than the budget, and `lag`/`lead` with an offset that changes
-per row or `nth_value` with such a position over a `ROWS` or default frame, fail. `DISTINCT ON` and
+budget only an aggregate frame, or a `RANGE` / `GROUPS` frame with an offset, holding more rows than
+the budget fails. `DISTINCT ON` and
 `ROLLUP` / `CUBE` / `GROUPING SETS` spill as well. `SET work_mem` moves both the budget and the
 point where spilling starts.
 

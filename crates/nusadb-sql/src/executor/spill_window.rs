@@ -11,18 +11,24 @@
 //! the file for the functions that look ahead or behind: the ranking and distribution functions,
 //! `LAG`/`LEAD` with a constant offset, running aggregates from the partition start, any `ROWS`,
 //! `RANGE` or `GROUPS` frame (holding just the frame's rows), and aggregates from the current row
-//! to the partition end (computed backwards). What still needs memory past the budget is a frame
-//! wider than the budget, `LAG`/`LEAD` with an offset that varies per row, and `NTH_VALUE` with
-//! such a position over a `ROWS` or default frame; those fail with the budget error.
+//! to the partition end (computed backwards). `LAG` / `LEAD` with an offset that varies per row and
+//! `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` over a `ROWS` or default frame read the row they need
+//! from a copy of the partition readable by position, so they hold no rows at all. What still needs
+//! memory past the budget is an aggregate frame, or a `RANGE` / `GROUPS` frame with an offset,
+//! wider than the budget; those fail with the budget error.
 //!
 //! Rows leave in partition order rather than input order; a query that orders its result has a
 //! `Sort` above the window, which the planner always places there.
 
 #![allow(clippy::wildcard_imports)]
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
-use super::spill::{MemBudget, SharedSpill, SpillConfig, SpillCursor, SpillWriter};
+use super::spill::{
+    MemBudget, RandomSpill, RandomSpillWriter, SharedSpill, SpillConfig, SpillCursor, SpillWriter,
+};
 use super::spill_sort::SortedInput;
 use super::stream::RowSource;
 use super::*;
@@ -273,10 +279,15 @@ impl<'a> WindowPass<'a> {
             }
         }
         let shared = writer.into_shared()?;
+        let mut random = RandomCopy {
+            file: &shared,
+            config: &self.config,
+            copy: None,
+        };
         let evaluators = self
             .windows
             .iter()
-            .map(|w| evaluator(w, &shared, len, &self.config))
+            .map(|w| evaluator(w, &mut random, len))
             .collect::<Result<Vec<_>, _>>()?;
         self.large = Some(LargePartition {
             rows: shared.cursor()?,
@@ -364,10 +375,11 @@ fn sql_name(func: &ast::WindowFunc) -> String {
 /// frame needs the whole partition in memory.
 fn evaluator<'a>(
     window: &'a WindowExpr,
-    file: &SharedSpill,
+    random: &mut RandomCopy<'_>,
     len: usize,
-    config: &SpillConfig,
 ) -> Result<Box<dyn Evaluator + 'a>, Error> {
+    let file = random.file;
+    let config = random.config;
     let budget = config.threshold_bytes;
     let unsupported = || {
         Error::Core(nusadb_core::Error::OutOfMemory(format!(
@@ -400,7 +412,8 @@ fn evaluator<'a>(
                 Some(expr) => match &expr.kind {
                     crate::planner::TypedExprKind::Literal(ast::Value::Int(n)) => *n,
                     crate::planner::TypedExprKind::Literal(ast::Value::Null) => 1,
-                    _ => return Err(unsupported()),
+                    // An offset that varies per row reads its target by position.
+                    _ => return Ok(Box::new(Positional::shift(window, random.rows()?, len))),
                 },
             };
             let delta = if matches!(window.func, W::Lag) {
@@ -411,17 +424,7 @@ fn evaluator<'a>(
             Ok(Box::new(Shift::new(window, file, delta)?))
         },
         W::FirstValue | W::LastValue | W::NthValue => {
-            if let Some((lo, hi)) = frame_shape(window)
-                && let Some(value) = FrameValue::new(window, file, len, lo, hi)?
-            {
-                return Ok(Box::new(value));
-            }
-            if let Some(sliding) = Sliding::new(window, None, file, len, budget)? {
-                return Ok(Box::new(sliding));
-            }
-            Ok(Box::new(
-                PeerSliding::new(window, None, file, len, budget)?.ok_or_else(unsupported)?,
-            ))
+            frame_navigation(window, random, len)?.ok_or_else(unsupported)
         },
         W::Aggregate(_) => {
             let exclusion = window
@@ -458,6 +461,271 @@ fn evaluator<'a>(
             }
         },
     }
+}
+
+/// Monotonic id for the by-position copies of spilled partitions (process-local uniqueness).
+static RANDOM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A spilled partition, and a copy of it readable by position made the first time a window needs
+/// one; every window of the partition shares that copy.
+struct RandomCopy<'f> {
+    file: &'f SharedSpill,
+    config: &'f SpillConfig,
+    copy: Option<Rc<RefCell<RandomSpill>>>,
+}
+
+impl RandomCopy<'_> {
+    fn rows(&mut self) -> Result<Rc<RefCell<RandomSpill>>, Error> {
+        if let Some(copy) = &self.copy {
+            return Ok(Rc::clone(copy));
+        }
+        let seq = RANDOM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut writer = RandomSpillWriter::create(
+            &self.config.dir,
+            &format!("nusadb-spill-window-{}-random-{seq}", std::process::id()),
+        )?;
+        let mut cursor = self.file.cursor()?;
+        let mut written = 0usize;
+        while let Some(row) = cursor.read_row()? {
+            writer.write_row(&row)?;
+            written += 1;
+            if written.is_multiple_of(1024) {
+                crate::cancel::check()?;
+            }
+        }
+        let copy = Rc::new(RefCell::new(writer.finish()?));
+        self.copy = Some(Rc::clone(&copy));
+        Ok(copy)
+    }
+}
+
+/// Where a frame bound lies for the row at position `k`, as [`frame_bounds`] places it.
+#[derive(Clone, Copy)]
+enum Edge {
+    First,
+    Last,
+    /// The current row (`ROWS`), or for a `RANGE` / `GROUPS` frame the current row's first peer
+    /// (as a start) or last peer (as an end).
+    Current,
+    /// `n` rows before the current row.
+    Before(u64),
+    /// `n` rows after the current row.
+    After(u64),
+}
+
+/// A frame whose bounds are positions computable row by row: any `ROWS` frame, the default frame,
+/// and a `RANGE` / `GROUPS` frame bounded only by the partition ends and the current row.
+#[derive(Clone, Copy)]
+struct Span {
+    start: Edge,
+    end: Edge,
+    peer_based: bool,
+}
+
+impl Span {
+    fn of(window: &WindowExpr) -> Option<Self> {
+        let Some(frame) = &window.frame else {
+            let end = if window.order.is_empty() {
+                Edge::Last
+            } else {
+                Edge::Current
+            };
+            return Some(Self {
+                start: Edge::First,
+                end,
+                peer_based: true,
+            });
+        };
+        let edge = |bound: &FrameBound| match bound {
+            FrameBound::UnboundedPreceding => Some(Edge::First),
+            FrameBound::UnboundedFollowing => Some(Edge::Last),
+            FrameBound::CurrentRow => Some(Edge::Current),
+            FrameBound::Preceding(n) if !frame.peer_based => Some(Edge::Before(*n)),
+            FrameBound::Following(n) if !frame.peer_based => Some(Edge::After(*n)),
+            _ => None,
+        };
+        Some(Self {
+            start: edge(&frame.start)?,
+            end: edge(&frame.end)?,
+            peer_based: frame.peer_based,
+        })
+    }
+
+    const fn needs_peers(self) -> bool {
+        self.peer_based
+            && (matches!(self.start, Edge::Current) || matches!(self.end, Edge::Current))
+    }
+}
+
+/// Window functions that read one row chosen per current row, through a copy of the partition
+/// readable by position, so they hold no rows whatever the offset or the frame width: `LAG` /
+/// `LEAD` whose offset varies per row, and `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` over a
+/// [`Span`] frame.
+struct Positional<'a> {
+    window: &'a WindowExpr,
+    rows: Rc<RefCell<RandomSpill>>,
+    len: usize,
+    /// The frame, for the frame-reading functions; `None` for `LAG` / `LEAD`.
+    span: Option<Span>,
+    peers: Option<Peers<'a>>,
+    /// The current row's peer group, `peer_lo..peer_end`.
+    peer_lo: usize,
+    peer_end: usize,
+}
+
+impl<'a> Positional<'a> {
+    const fn shift(window: &'a WindowExpr, rows: Rc<RefCell<RandomSpill>>, len: usize) -> Self {
+        Self {
+            window,
+            rows,
+            len,
+            span: None,
+            peers: None,
+            peer_lo: 0,
+            peer_end: 0,
+        }
+    }
+
+    fn in_frame(
+        window: &'a WindowExpr,
+        rows: Rc<RefCell<RandomSpill>>,
+        len: usize,
+        span: Span,
+        peers: Option<Peers<'a>>,
+    ) -> Self {
+        Self {
+            span: Some(span),
+            peers,
+            ..Self::shift(window, rows, len)
+        }
+    }
+
+    /// The frame of row `k` as `(first, last)` positions, or `None` when it is empty.
+    fn frame(&mut self, span: Span, k: usize) -> Result<Option<(usize, usize)>, Error> {
+        if k >= self.peer_end {
+            self.peer_lo = k;
+            self.peer_end = match self.peers.as_mut() {
+                Some(peers) => peers.group_of(k, |_| Ok(()))?,
+                None => k + 1,
+            };
+        }
+        let len = i64::try_from(self.len).unwrap_or(i64::MAX);
+        let at = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let ki = at(k);
+        let off = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        let pos = |edge: Edge, start: bool| match edge {
+            Edge::First => 0,
+            Edge::Last => len - 1,
+            Edge::Current if span.peer_based && start => at(self.peer_lo),
+            Edge::Current if span.peer_based => at(self.peer_end) - 1,
+            Edge::Current => ki,
+            Edge::Before(n) => ki.saturating_sub(off(n)),
+            Edge::After(n) => ki.saturating_add(off(n)),
+        };
+        let lo = pos(span.start, true).max(0);
+        let hi = pos(span.end, false).min(len - 1);
+        Ok((lo <= hi).then(|| {
+            (
+                usize::try_from(lo).unwrap_or(0),
+                usize::try_from(hi).unwrap_or(0),
+            )
+        }))
+    }
+
+    /// The integer the expression gives for the current row, or `None` for anything else.
+    fn int_arg(&self, index: usize, row: &Row) -> Result<Option<i64>, Error> {
+        match self.window.args.get(index) {
+            Some(expr) => match eval::eval(expr, row)? {
+                ast::Value::Int(n) => Ok(Some(n)),
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+}
+
+impl Evaluator for Positional<'_> {
+    fn value(&mut self, k: usize, row: &Row) -> Result<ast::Value, Error> {
+        let Some(value_expr) = self.window.args.first() else {
+            return Ok(ast::Value::Null);
+        };
+        let target = match self.span {
+            None => {
+                let offset = self.int_arg(1, row)?.unwrap_or(1);
+                let delta = if matches!(self.window.func, W::Lag) {
+                    offset.checked_neg().unwrap_or(0)
+                } else {
+                    offset
+                };
+                i64::try_from(k)
+                    .ok()
+                    .and_then(|cur| cur.checked_add(delta))
+                    .and_then(|p| usize::try_from(p).ok())
+                    .filter(|&t| t < self.len)
+            },
+            Some(span) => {
+                let frame = self.frame(span, k)?;
+                match self.window.func {
+                    W::FirstValue => frame.map(|(lo, _)| lo),
+                    W::LastValue => frame.map(|(_, hi)| hi),
+                    _ => match (self.int_arg(1, row)?, frame) {
+                        (Some(n), Some((lo, hi))) if n >= 1 => usize::try_from(n - 1)
+                            .ok()
+                            .and_then(|i| lo.checked_add(i))
+                            .filter(|&t| t <= hi),
+                        _ => None,
+                    },
+                }
+            },
+        };
+        let found = match target {
+            Some(t) => self.rows.borrow_mut().get(t)?,
+            None => None,
+        };
+        match found {
+            Some(target) => eval::eval(value_expr, &target),
+            // Out of range: the default argument evaluated at the current row, else NULL.
+            None => self
+                .window
+                .args
+                .get(2)
+                .map_or(Ok(ast::Value::Null), |default| eval::eval(default, row)),
+        }
+    }
+}
+
+/// `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` over a spilled partition, or `None` for a frame no
+/// streamed evaluator covers.
+fn frame_navigation<'a>(
+    window: &'a WindowExpr,
+    random: &mut RandomCopy<'_>,
+    len: usize,
+) -> Result<Option<Box<dyn Evaluator + 'a>>, Error> {
+    let file = random.file;
+    if let Some((lo, hi)) = frame_shape(window)
+        && let Some(value) = FrameValue::new(window, file, len, lo, hi)?
+    {
+        return Ok(Some(Box::new(value)));
+    }
+    // Every `ROWS` frame is a span, so what is left is a `RANGE` / `GROUPS` frame with an offset.
+    if let Some(span) = Span::of(window) {
+        let peers = span
+            .needs_peers()
+            .then(|| Peers::new(&window.order, file))
+            .transpose()?;
+        return Ok(Some(Box::new(Positional::in_frame(
+            window,
+            random.rows()?,
+            len,
+            span,
+            peers,
+        ))));
+    }
+    let Some(sliding) = PeerSliding::new(window, None, file, len, random.config.threshold_bytes)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Box::new(sliding)))
 }
 
 /// The order-key values of `row` under `order`.

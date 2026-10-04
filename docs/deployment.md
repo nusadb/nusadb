@@ -193,12 +193,14 @@ The other three limits bound what a single client can do to the server:
 A spilled sort, `DISTINCT` or `GROUP BY` streams its result to the client straight from the merge of
 its spill files, so a result larger than `--work-mem` is fine. Window functions spill too: each
 partition is evaluated in memory when it fits and from its spill file when it does not. What has to
-fit is one frame: a frame that holds more rows than the budget (say
-`ROWS BETWEEN 100000 PRECEDING AND CURRENT ROW`, or a floating-point `sum` or `avg` from
-`CURRENT ROW` to `UNBOUNDED FOLLOWING`) fails at the budget, as do `lag`/`lead` with an offset that
-changes from row to row and `nth_value` with such a position over a `ROWS` or default frame; split
-such a partition with `PARTITION BY`. `DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS` spill as
-well. `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `INSERT ... SELECT` stream the query's rows
+fit is one frame of an aggregate, or of a `RANGE` / `GROUPS` frame with an offset: one that holds
+more rows than the budget (say `sum(x) OVER (ROWS BETWEEN 100000 PRECEDING AND CURRENT ROW)`, or a
+floating-point `sum` or `avg` from `CURRENT ROW` to `UNBOUNDED FOLLOWING`) fails at the budget;
+split such a partition with `PARTITION BY`. `lag`, `lead`, `first_value`, `last_value` and
+`nth_value` read the row they need from disk over a `ROWS` frame, the default frame, or a `RANGE` /
+`GROUPS` frame bounded by `UNBOUNDED` and `CURRENT ROW`, so neither the frame's width nor an offset
+or position that changes per row is limited. `DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS`
+spill as well. `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `INSERT ... SELECT` stream the query's rows
 into the table as they come, so a large result does not have to fit either (`INSERT ... SELECT`
 falls back to holding the result when the query reads the target table, has a subquery, or the
 target has triggers, foreign keys or incrementally maintained views). `REFRESH MATERIALIZED VIEW`

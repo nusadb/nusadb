@@ -113,6 +113,19 @@ const STREAMABLE: &[&str] = &[
     "SELECT id, last_value(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w",
     "SELECT id, last_value(v) OVER (PARTITION BY p) FROM w",
     "SELECT id, nth_value(v, 2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w",
+    // Navigation that reads one row chosen per current row: an offset or position that varies
+    // per row, and frames of any width.
+    "SELECT id, lag(v, id % 5) OVER (ORDER BY id), lead(v, x % 4, -1) OVER (PARTITION BY p ORDER BY id) FROM w",
+    "SELECT id, lag(v, x - 25, -9) OVER (ORDER BY x), lead(v, v) OVER (ORDER BY id) FROM w",
+    "SELECT id, nth_value(v, id % 6 + 1) OVER (ORDER BY id), nth_value(v, x % 3) OVER (ORDER BY x) FROM w",
+    "SELECT id, nth_value(v, id % 4 + 1) OVER (), nth_value(id, p + 1) OVER (PARTITION BY p) FROM w",
+    "SELECT id, nth_value(v, 3) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING) FROM w",
+    "SELECT id, nth_value(v, 1500) OVER (ORDER BY id ROWS BETWEEN 2000 PRECEDING AND 2000 FOLLOWING) FROM w",
+    "SELECT id, nth_value(v, p + 1) OVER (PARTITION BY p ORDER BY x ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+    "SELECT id, nth_value(v, 2) OVER (ORDER BY x RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w",
+    "SELECT id, first_value(id) OVER (ORDER BY x GROUPS BETWEEN CURRENT ROW AND CURRENT ROW), last_value(id) OVER (ORDER BY x DESC RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM w",
+    "SELECT id, last_value(v) OVER (ORDER BY id ROWS BETWEEN 2000 PRECEDING AND 1000 PRECEDING) FROM w",
+    "SELECT id, first_value(v) OVER (ORDER BY id ROWS BETWEEN 1000 FOLLOWING AND 2500 FOLLOWING) FROM w",
     // Aggregates over frames that start at the partition.
     "SELECT id, sum(x) OVER (), count(*) OVER (PARTITION BY p), avg(v) OVER (PARTITION BY p) FROM w",
     "SELECT id, sum(x) OVER (ORDER BY id), sum(x) OVER (ORDER BY x) FROM w",
