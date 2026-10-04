@@ -202,9 +202,10 @@ well. `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `INSERT ... SELECT` stre
 into the table as they come, so a large result does not have to fit either (`INSERT ... SELECT`
 falls back to holding the result when the query reads the target table, has a subquery, or the
 target has triggers, foreign keys or incrementally maintained views). `REFRESH MATERIALIZED VIEW`
-keeps the new rows in a spill file until the old ones are replaced. `UPDATE ... FROM` and
-`DELETE ... USING` over a subquery, and `DECLARE CURSOR`, still hold the subquery's or cursor's
-whole result. A failed query leaves the server responsive, which is the point. A session's
+keeps the new rows in a spill file until the old ones are replaced. A cursor over a `SELECT` whose
+result is larger than `--work-mem` keeps its rows in a spill file, which `FETCH` reads by position
+in any direction and `CLOSE` removes. `UPDATE ... FROM` and `DELETE ... USING` over a subquery
+still hold the subquery's whole result. A failed query leaves the server responsive, which is the point. A session's
 `SET work_mem` moves both the budget and the point where spilling starts.
 
 On Linux all of these derive from `--mem-budget`, which auto-detects the host or container limit, so

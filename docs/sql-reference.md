@@ -1282,7 +1282,9 @@ unknown or deallocated name is `26000`; the wrong number of arguments is `42883`
 ### Cursors
 
 A cursor reads a result in pieces. Its rows are captured when the cursor is declared, so it pages
-through a stable snapshot.
+through a stable snapshot. With a spill directory configured, a `SELECT` result larger than
+`work_mem` is kept on disk rather than in memory (a `UNION`, `INTERSECT` or `EXCEPT` result is still
+held in memory).
 
 ```sql
 BEGIN;

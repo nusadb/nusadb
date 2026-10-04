@@ -226,6 +226,167 @@ impl Drop for SpillReader {
     }
 }
 
+/// Builds a [`RandomSpill`]: rows appended to a data file, each row's byte offset to a second file
+/// of fixed 8-byte records, so any row can later be found without holding anything per row.
+pub(in crate::executor) struct RandomSpillWriter {
+    data: SpillWriter,
+    offsets: SpillWriter,
+    at: u64,
+    len: usize,
+}
+
+impl RandomSpillWriter {
+    /// Create the two files as `<stem>.rows` and `<stem>.offsets` in `dir`.
+    ///
+    /// # Errors
+    /// [`Error::Core`] wrapping the underlying I/O error.
+    pub(in crate::executor) fn create(dir: &std::path::Path, stem: &str) -> Result<Self, Error> {
+        Ok(Self {
+            data: SpillWriter::create(dir.join(format!("{stem}.rows")))?,
+            offsets: SpillWriter::create(dir.join(format!("{stem}.offsets")))?,
+            at: 0,
+            len: 0,
+        })
+    }
+
+    /// Append one row.
+    ///
+    /// # Errors
+    /// [`Error::Core`] wrapping the underlying I/O error.
+    pub(in crate::executor) fn write_row(&mut self, row: &[ast::Value]) -> Result<(), Error> {
+        let bytes = codec::encode_row(row)?;
+        self.data.write_bytes(&bytes)?;
+        self.offsets
+            .writer
+            .write_all(&self.at.to_le_bytes())
+            .map_err(io_error)?;
+        self.at += 4 + bytes.len() as u64;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Finish writing and open the files for reading by position.
+    ///
+    /// # Errors
+    /// [`Error::Core`] wrapping the underlying I/O error.
+    pub(in crate::executor) fn finish(mut self) -> Result<RandomSpill, Error> {
+        self.data.writer.flush().map_err(io_error)?;
+        self.offsets.writer.flush().map_err(io_error)?;
+        let data = File::open(&self.data.path).map_err(io_error)?;
+        let offsets = File::open(&self.offsets.path).map_err(io_error)?;
+        self.data.handed_off = true;
+        self.offsets.handed_off = true;
+        Ok(RandomSpill {
+            data_path: self.data.path.clone(),
+            offsets_path: self.offsets.path.clone(),
+            data: BufReader::new(data),
+            offsets: BufReader::new(offsets),
+            offsets_at: 0,
+            next: Some(0),
+            data_end: self.at,
+            len: self.len,
+        })
+    }
+}
+
+/// Rows on disk read back by position; deletes its files on drop.
+///
+/// Reading rows in order costs no seek: the data reader stays on the row after the last one read.
+/// A jump moves both readers relative to where they are, so a short step (a backward fetch) stays
+/// inside their buffers.
+#[derive(Debug)]
+pub(in crate::executor) struct RandomSpill {
+    data_path: PathBuf,
+    offsets_path: PathBuf,
+    data: BufReader<File>,
+    offsets: BufReader<File>,
+    /// Where the offsets reader is, in bytes.
+    offsets_at: u64,
+    /// The row the data reader is on, or `None` after a failed read left it somewhere unknown.
+    next: Option<usize>,
+    /// The data file's length: where the reader is after the last row.
+    data_end: u64,
+    len: usize,
+}
+
+impl RandomSpill {
+    /// How many rows it holds.
+    pub(in crate::executor) const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The row at `index`, or `Ok(None)` past the end.
+    ///
+    /// # Errors
+    /// [`Error::Core`] for an I/O error or a file that ends before row `index`, or
+    /// [`Error::MalformedTuple`] if the record is corrupt.
+    pub(in crate::executor) fn get(&mut self, index: usize) -> Result<Option<Row>, Error> {
+        use std::io::{Seek, SeekFrom};
+        if index >= self.len {
+            return Ok(None);
+        }
+        // The reader's position is unknown until this read succeeds.
+        let next = self.next.take();
+        match next {
+            Some(next) if next == index => {},
+            Some(next) => {
+                let here = self.offset_of(next)?;
+                let target = self.offset_of(index)?;
+                self.data
+                    .seek_relative(relative(here, target))
+                    .map_err(io_error)?;
+            },
+            None => {
+                let target = self.offset_of(index)?;
+                self.data.seek(SeekFrom::Start(target)).map_err(io_error)?;
+            },
+        }
+        let row = read_row_from(&mut self.data)?.ok_or_else(|| {
+            io_error(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("spill file ends before row {index} of {}", self.len),
+            ))
+        })?;
+        self.next = Some(index + 1);
+        Ok(Some(row))
+    }
+
+    /// The byte offset of row `index` in the data file (`data_end` for the row after the last).
+    fn offset_of(&mut self, index: usize) -> Result<u64, Error> {
+        if index >= self.len {
+            return Ok(self.data_end);
+        }
+        let want = index as u64 * 8;
+        let mut at = [0u8; 8];
+        let read = self
+            .offsets
+            .seek_relative(relative(self.offsets_at, want))
+            .and_then(|()| self.offsets.read_exact(&mut at));
+        // After a failed seek or read the reader's position is unknown; re-anchor it absolutely.
+        self.offsets_at = if read.is_ok() {
+            want + 8
+        } else {
+            use std::io::Seek;
+            self.offsets.rewind().map_err(io_error)?;
+            0
+        };
+        read.map_err(io_error)?;
+        Ok(u64::from_le_bytes(at))
+    }
+}
+
+/// The signed distance from byte `from` to byte `to`.
+fn relative(from: u64, to: u64) -> i64 {
+    i64::try_from(i128::from(to) - i128::from(from)).unwrap_or(i64::MAX)
+}
+
+impl Drop for RandomSpill {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.data_path);
+        let _ = std::fs::remove_file(&self.offsets_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -288,5 +449,46 @@ mod tests {
         let writer = SpillWriter::create(scratch_path()).expect("create");
         let mut reader = writer.into_reader().expect("into_reader");
         assert!(reader.read_row().expect("read").is_none());
+    }
+
+    #[test]
+    fn random_spill_reads_any_row_and_cleans_up() {
+        let dir = std::env::temp_dir();
+        let scratch = scratch_path();
+        let stem = scratch
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_owned();
+        let rows: Vec<Row> = (0..500_i64)
+            .map(|i| {
+                vec![
+                    ast::Value::Int(i),
+                    ast::Value::Text("x".repeat(usize::try_from(i % 9).unwrap())),
+                ]
+            })
+            .collect();
+        let mut writer = RandomSpillWriter::create(&dir, &stem).unwrap();
+        for row in &rows {
+            writer.write_row(row).unwrap();
+        }
+        let mut spill = writer.finish().unwrap();
+        assert_eq!(spill.len(), 500);
+        // Jumps, then in-order runs forward and backward mixed with jumps.
+        let forward = 0..500;
+        let backward = (0..500).rev();
+        let order = [499, 0, 250, 1, 498, 250]
+            .into_iter()
+            .chain(forward)
+            .chain(backward)
+            .chain([3, 4, 5, 400, 401, 2, 1, 0, 499]);
+        for index in order {
+            assert_eq!(spill.get(index).unwrap().as_ref(), rows.get(index));
+        }
+        assert!(spill.get(500).unwrap().is_none());
+        let data = dir.join(format!("{stem}.rows"));
+        assert!(data.exists());
+        drop(spill);
+        assert!(!data.exists() && !dir.join(format!("{stem}.offsets")).exists());
     }
 }

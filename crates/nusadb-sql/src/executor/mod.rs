@@ -808,11 +808,24 @@ pub fn execute_in_txn_as_streaming_with_cursors(
         PhysicalPlan::DeclareCursor { name, query, .. } => {
             // Types before the plan is consumed, then materialize the rows in this transaction.
             let col_types = describe_column_types(&query);
-            let ExecutionResult::Rows { columns, rows, .. } = execute_in_txn(*query, engine, txn)?
-            else {
-                return Err(Error::Internal(
-                    "a cursor's query did not produce a row set".to_owned(),
-                ));
+            let (columns, rows) = if let PhysicalPlan::Select(op, _) = &*query
+                && let Some(config) = spill::spill_config()
+            {
+                let rows = run_statement_atomically(engine, txn, || {
+                    clock::set_statement_now();
+                    let _exec_ctx = eval::bind_exec_context(engine, txn);
+                    capture_cursor_rows(op, &config, engine, txn)
+                })?;
+                (output_columns(op), rows)
+            } else {
+                let ExecutionResult::Rows { columns, rows, .. } =
+                    execute_in_txn(*query, engine, txn)?
+                else {
+                    return Err(Error::Internal(
+                        "a cursor's query did not produce a row set".to_owned(),
+                    ));
+                };
+                (columns, CursorData::Memory(rows))
             };
             store.declare(name, columns, col_types, rows);
             Ok(StreamOutcome::Other(ExecutionResult::CursorDeclared))
@@ -1203,32 +1216,64 @@ struct Cursor {
     /// untyped row description.
     col_types: Vec<ColumnType>,
     /// Every row of the cursor's query, captured at `DECLARE`.
-    rows: Vec<Row>,
+    rows: CursorData,
     /// The last-returned row index: `-1` before the first row, `i` on row `i` (`0`-based), and
     /// `rows.len()` after the last row.
     pos: i64,
 }
 
+/// A cursor's captured rows: in memory, or (past the work-memory budget, with spill configured)
+/// on disk, read back by position.
+#[derive(Debug)]
+enum CursorData {
+    Memory(Vec<Row>),
+    Spilled(spill::RandomSpill),
+}
+
+impl CursorData {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Memory(rows) => rows.len(),
+            Self::Spilled(spill) => spill.len(),
+        }
+    }
+
+    fn get(&mut self, index: usize) -> Result<Option<Row>, Error> {
+        match self {
+            Self::Memory(rows) => Ok(rows.get(index).cloned()),
+            Self::Spilled(spill) => spill.get(index),
+        }
+    }
+}
+
+/// Check for a cancelled statement once every 1024 rows a `FETCH` has collected.
+fn check_cancel_every(collected: usize) -> Result<(), Error> {
+    if collected > 0 && collected.is_multiple_of(1024) {
+        crate::cancel::check()?;
+    }
+    Ok(())
+}
+
 impl Cursor {
-    /// The row count as a signed index bound (a materialized cursor never holds more than `i64::MAX`
-    /// rows).
+    /// The row count as a signed index bound (a cursor never holds more than `i64::MAX` rows).
     fn len(&self) -> i64 {
         i64::try_from(self.rows.len()).unwrap_or(i64::MAX)
     }
 
     /// The row at signed 0-based index `idx`, cloned; `None` when `idx` is outside `0..len`.
-    fn clone_row(&self, idx: i64) -> Option<Row> {
-        usize::try_from(idx)
-            .ok()
-            .and_then(|i| self.rows.get(i))
-            .cloned()
+    fn clone_row(&mut self, idx: i64) -> Result<Option<Row>, Error> {
+        match usize::try_from(idx) {
+            Ok(i) => self.rows.get(i),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Step forward up to `count` rows, stopping (positioned after the last row) at the end.
-    fn forward(&mut self, count: i64) -> Vec<Row> {
+    fn forward(&mut self, count: i64) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
         for _ in 0..count {
-            if let Some(row) = self.clone_row(self.pos + 1) {
+            check_cancel_every(out.len())?;
+            if let Some(row) = self.clone_row(self.pos + 1)? {
                 self.pos += 1;
                 out.push(row);
             } else {
@@ -1236,15 +1281,16 @@ impl Cursor {
                 break;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Step backward up to `count` rows (nearest-first), stopping (positioned before the first row)
     /// at the start.
-    fn backward(&mut self, count: i64) -> Vec<Row> {
+    fn backward(&mut self, count: i64) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
         for _ in 0..count {
-            if let Some(row) = self.clone_row(self.pos - 1) {
+            check_cancel_every(out.len())?;
+            if let Some(row) = self.clone_row(self.pos - 1)? {
                 self.pos -= 1;
                 out.push(row);
             } else {
@@ -1252,59 +1298,61 @@ impl Cursor {
                 break;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Every remaining row forward; the cursor ends up *after* the last row (unlike a count fetch,
     /// which stops *on* its last returned row).
-    fn forward_all(&mut self) -> Vec<Row> {
+    fn forward_all(&mut self) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
-        while let Some(row) = self.clone_row(self.pos + 1) {
+        while let Some(row) = self.clone_row(self.pos + 1)? {
+            check_cancel_every(out.len())?;
             self.pos += 1;
             out.push(row);
         }
         self.pos = self.len();
-        out
+        Ok(out)
     }
 
     /// Every remaining row backward (nearest-first); the cursor ends up before the first row.
-    fn backward_all(&mut self) -> Vec<Row> {
+    fn backward_all(&mut self) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
-        while let Some(row) = self.clone_row(self.pos - 1) {
+        while let Some(row) = self.clone_row(self.pos - 1)? {
+            check_cancel_every(out.len())?;
             self.pos -= 1;
             out.push(row);
         }
         self.pos = -1;
-        out
+        Ok(out)
     }
 
     /// Land on signed 0-based index `idx`, returning that one row (or nothing when out of range).
-    fn land(&mut self, idx: i64) -> Vec<Row> {
-        if let Some(row) = self.clone_row(idx) {
+    fn land(&mut self, idx: i64) -> Result<Vec<Row>, Error> {
+        if let Some(row) = self.clone_row(idx)? {
             self.pos = idx;
-            vec![row]
+            Ok(vec![row])
         } else {
             self.pos = if idx < 0 { -1 } else { self.len() };
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
     /// `ABSOLUTE n`: 1-based from the start, or from the end when negative; `0` sits before the first
     /// row and returns nothing.
-    fn absolute(&mut self, n: i64) -> Vec<Row> {
+    fn absolute(&mut self, n: i64) -> Result<Vec<Row>, Error> {
         match n.cmp(&0) {
             std::cmp::Ordering::Greater => self.land(n - 1),
             std::cmp::Ordering::Less => self.land(self.len() + n),
             std::cmp::Ordering::Equal => {
                 self.pos = -1;
-                Vec::new()
+                Ok(Vec::new())
             },
         }
     }
 
     /// Apply a `FETCH` direction, returning the rows it yields and advancing the position. Backward
     /// directions yield rows in reverse (nearest-first), matching the reference engine.
-    fn fetch(&mut self, direction: ast::FetchDir) -> Vec<Row> {
+    fn fetch(&mut self, direction: ast::FetchDir) -> Result<Vec<Row>, Error> {
         use ast::FetchDir as D;
         let last = self.len() - 1;
         match direction {
@@ -1365,7 +1413,7 @@ impl CursorStore {
         name: String,
         columns: Vec<String>,
         col_types: Vec<ColumnType>,
-        rows: Vec<Row>,
+        rows: CursorData,
     ) {
         self.cursors.insert(
             name,
@@ -1384,7 +1432,7 @@ impl CursorStore {
             .cursors
             .get_mut(name)
             .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))?;
-        let rows = cursor.fetch(direction);
+        let rows = cursor.fetch(direction)?;
         Ok(CursorRows {
             columns: cursor.columns.clone(),
             col_types: cursor.col_types.clone(),
@@ -1750,12 +1798,29 @@ impl<'engine> Session<'engine> {
         query: PhysicalPlan,
     ) -> Result<ExecutionResult, Error> {
         let col_types = describe_column_types(&query);
+        if matches!(query, PhysicalPlan::Select(..)) {
+            // Pin the session context first: the spill threshold is the session's `work_mem`.
+            self.pin_statement_context();
+        }
+        if let PhysicalPlan::Select(op, _) = &query
+            && let Some(config) = spill::spill_config()
+        {
+            clock::set_statement_now();
+            let rows = self.run_read(|txn| {
+                let _exec_ctx = eval::bind_exec_context(self.engine, txn);
+                capture_cursor_rows(op, &config, self.engine, txn)
+            })?;
+            self.cursors
+                .declare(name, output_columns(op), col_types, rows);
+            return Ok(ExecutionResult::CursorDeclared);
+        }
         let ExecutionResult::Rows { columns, rows, .. } = self.run_within_txn(query)? else {
             return Err(Error::Internal(
                 "a cursor's query did not produce a row set".to_owned(),
             ));
         };
-        self.cursors.declare(name, columns, col_types, rows);
+        self.cursors
+            .declare(name, columns, col_types, CursorData::Memory(rows));
         Ok(ExecutionResult::CursorDeclared)
     }
 
@@ -1898,6 +1963,13 @@ impl<'engine> Session<'engine> {
     ) -> Result<StreamOutcome, Error> {
         // Pin the session context + wall clock for the statement, exactly as `run_within_txn` /
         // `dispatch` do for the buffered path.
+        self.pin_statement_context();
+        clock::set_statement_now();
+        self.run_read(|txn| stream_select_rows(op, self.engine, txn, sink))
+    }
+
+    /// Pin this session's user, settings, database and schema for the statement about to run.
+    fn pin_statement_context(&self) {
         session_ctx::set_session_context(
             &self.current_user,
             &self.variables,
@@ -1905,14 +1977,17 @@ impl<'engine> Session<'engine> {
             &self.current_schema,
             Some(&self.temp_schema_name()),
         );
-        clock::set_statement_now();
+    }
+
+    /// Run a read-only `body` under the session's transaction context: inside an explicit
+    /// transaction under its own statement mark, else in a one-statement transaction committed
+    /// once `body` has finished.
+    fn run_read<T>(&self, body: impl FnOnce(TxnId) -> Result<T, Error>) -> Result<T, Error> {
         if let Some(txn) = self.current_txn {
-            run_statement_atomically(self.engine, txn, || {
-                stream_select_rows(op, self.engine, txn, sink)
-            })
+            run_statement_atomically(self.engine, txn, || body(txn))
         } else {
             let txn = self.engine.begin(self.default_isolation)?;
-            match stream_select_rows(op, self.engine, txn, sink) {
+            match body(txn) {
                 Ok(outcome) => match self.engine.commit(txn) {
                     Ok(()) => Ok(outcome),
                     // A failed auto-commit must roll the transaction back, not leak it.
@@ -2480,6 +2555,50 @@ fn stream_select_rows(
         count,
         command: RowsCommand::Select,
     })
+}
+
+/// Monotonic id for cursor spill file names (process-local uniqueness; not persisted).
+static CURSOR_SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A cursor's rows, pulled from `op` as a stream: held in memory while they fit the budget, else
+/// written to a spill file a `FETCH` reads back by position.
+///
+/// # Errors
+/// Propagates evaluation, storage and spill-file errors.
+fn capture_cursor_rows(
+    op: &PhysicalOperator,
+    config: &spill::SpillConfig,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<CursorData, Error> {
+    let mut source = stream::stream_op(op, engine, txn)?;
+    let mut budget = spill::MemBudget::new(config.threshold_bytes);
+    let mut held = Vec::new();
+    let overflow = loop {
+        match source.try_next()? {
+            Some(row) if budget.admit(&row) => held.push(row),
+            Some(row) => break row,
+            None => return Ok(CursorData::Memory(held)),
+        }
+    };
+    let seq = CURSOR_SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut writer = spill::RandomSpillWriter::create(
+        &config.dir,
+        &format!("nusadb-spill-cursor-{}-{seq}", std::process::id()),
+    )?;
+    for row in held.iter().chain(std::iter::once(&overflow)) {
+        writer.write_row(row)?;
+    }
+    drop(held);
+    let mut written = 0usize;
+    while let Some(row) = source.try_next()? {
+        writer.write_row(&row)?;
+        written += 1;
+        if written.is_multiple_of(1024) {
+            crate::cancel::check()?;
+        }
+    }
+    Ok(CursorData::Spilled(writer.finish()?))
 }
 
 #[allow(
