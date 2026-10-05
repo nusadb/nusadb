@@ -3,7 +3,6 @@
 //! Split verbatim out of `executor/mod.rs` (ADR 007). Siblings resolve via `use super::*`.
 #![allow(clippy::wildcard_imports)]
 
-use super::dml_join::KeyedRows;
 use super::*;
 
 // === INSERT ===============================================================
@@ -3922,24 +3921,6 @@ fn join_source(
     Ok(Some(source))
 }
 
-/// Run an inlined derived-relation plan — the source of `UPDATE ... FROM (VALUES/SELECT ...)` or
-/// `DELETE ... USING (...)` — within the current transaction and collect its rows. Executed once per
-/// statement (not per target row), against the same `txn` snapshot as the rest of the statement.
-fn materialize_subplan(
-    plan: &crate::planner::SelectPlan,
-    engine: &dyn StorageEngine,
-    txn: TxnId,
-) -> Result<Vec<Row>, Error> {
-    let op = crate::planner::plan_select(plan.clone());
-    match run_select(&op, None, engine, txn)? {
-        ExecutionResult::Rows { rows, .. } => Ok(rows),
-        // `run_select` always yields `Rows`; anything else is an internal invariant break.
-        _ => Err(Error::Internal(
-            "a derived UPDATE/DELETE source did not produce a row set".to_owned(),
-        )),
-    }
-}
-
 /// Find an UPDATE/DELETE's target rows through a **unique point lookup** — an `O(log n)` index probe
 /// in place of the `O(n)` full [`scan_table`].
 ///
@@ -5214,23 +5195,19 @@ pub(super) fn run_merge(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     use crate::planner::MergeWhen;
-    let target_rows = scan_table(&plan.table, engine, txn)?;
-    // A derived `USING (VALUES ...)` / `USING (SELECT ...)` source runs its inlined plan; a plain
-    // named source is scanned (mirrors `UPDATE ... FROM` / `DELETE ... USING`).
-    let source_rows: Vec<Row> = if let Some(source_plan) = &plan.source_plan {
-        materialize_subplan(source_plan, engine, txn)?
-    } else {
-        scan_table(&plan.source, engine, txn)?
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect()
-    };
+    // The source: a derived `USING (VALUES ...)` / `USING (SELECT ...)` runs its inlined plan, a
+    // named source is scanned; held in memory while it fits the work budget, else spilled.
+    let source = join_source(plan.source_plan.as_deref(), Some(&plan.source), engine, txn)?
+        .ok_or_else(|| Error::Internal("a MERGE without a source".to_owned()))?;
     let null_target = vec![ast::Value::Null; plan.table.columns.len()];
+    let null_source = vec![ast::Value::Null; plan.source.columns.len()];
 
-    let mut ops = MergeOps {
+    // Both callbacks below stage into these.
+    let ops = std::cell::RefCell::new(MergeOps {
         updates: Vec::new(),
         deletes: Vec::new(),
-    };
+    });
+    let count = std::cell::Cell::new(0usize);
     // NOT-MATCHED inserts grouped by their target-column list so each group is one `insert_rows` batch.
     let mut insert_groups: HashMap<Vec<usize>, Vec<Row>> = HashMap::new();
     let mut affected: HashSet<Tid> = HashSet::new();
@@ -5240,48 +5217,17 @@ pub(super) fn run_merge(
         .whens
         .iter()
         .any(|w| matches!(w, MergeWhen::NotMatchedBySource { .. }));
-    // Target rows the ON condition matched, so the `NOT MATCHED BY SOURCE` pass can skip re-probing
-    // them. Only the FIRST hit per source row lands here, so absence does not prove "unmatched".
-    let mut matched_targets: HashSet<Tid> = HashSet::new();
-    let mut count = 0usize;
     // Generated columns: a matched UPDATE recomputes them; `fills` is a no-op when none exist.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
     let enum_info = enum_columns_info(&plan.table, engine, txn)?;
 
-    // The target rows keyed by the ON condition's equalities between target and source columns,
-    // so each source row is tested only against the target rows that can match it.
-    let target_index = KeyedRows::left(
-        &plan.on,
-        target_rows.iter().map(|(_, row)| row),
-        plan.table.columns.len(),
-    )?;
-    let mut padded: Row = Vec::new();
-    for srow in &source_rows {
-        // The first target row the ON condition matches (over `target ++ source`).
-        let mut hit: Option<(Tid, Row)> = None;
-        let candidates: Box<dyn Iterator<Item = &(Tid, Row)>> = match &target_index {
-            Some(index) => Box::new(
-                index
-                    .for_right(srow, &mut padded)?
-                    .iter()
-                    .filter_map(|&i| target_rows.get(i)),
-            ),
-            None => Box::new(target_rows.iter()),
-        };
-        for (tid, trow) in candidates {
-            let mut combined = trow.clone();
-            combined.extend(srow.iter().cloned());
-            if matches!(eval::eval(&plan.on, &combined)?, ast::Value::Bool(true)) {
-                hit = Some((*tid, trow.clone()));
-                break;
-            }
-        }
+    // A source row with the first target row its ON condition matched: the first matching WHEN
+    // MATCHED clause acts on that target row; with no match, the first matching WHEN NOT MATCHED
+    // clause inserts.
+    let mut each_source = |srow: Row, hit: Option<(Tid, Row)>| -> Result<(), Error> {
         if let Some((tid, trow)) = hit {
-            if has_by_source {
-                matched_targets.insert(tid);
-            }
             let mut combined = trow.clone();
-            combined.extend(srow.iter().cloned());
+            combined.extend(srow);
             for when in &plan.whens {
                 let MergeWhen::Matched { pred, action } = when else {
                     continue;
@@ -5304,14 +5250,14 @@ pub(super) fn run_merge(
                     tid,
                     &trow,
                     &combined,
-                    &mut ops,
+                    &mut ops.borrow_mut(),
                 )?;
-                count += 1;
+                count.set(count.get() + 1);
                 break;
             }
         } else {
             let mut combined = null_target.clone();
-            combined.extend(srow.iter().cloned());
+            combined.extend(srow);
             for when in &plan.whens {
                 let MergeWhen::NotMatched {
                     pred,
@@ -5332,79 +5278,84 @@ pub(super) fn run_merge(
                     .entry(columns.clone())
                     .or_default()
                     .push(value_row);
-                count += 1;
+                count.set(count.get() + 1);
                 break;
             }
         }
-    }
-
-    // `WHEN NOT MATCHED BY SOURCE` drives off the target instead of the source: it fires for a target
-    // row that NO source row matched. That is a second O(target x source) probe, hence the gate.
-    if has_by_source {
-        let null_source = vec![ast::Value::Null; plan.source.columns.len()];
-        // Reused across probes so the inner loop does not allocate a row buffer per (target, source)
-        // pair; each iteration rewinds it to the target half and appends the source row.
-        let mut probe: Row = Vec::with_capacity(plan.table.columns.len() + null_source.len());
-        let source_index =
-            KeyedRows::right(Some(&plan.on), &source_rows, plan.table.columns.len())?;
-        for (tid, trow) in &target_rows {
-            // A row in `matched_targets` is settled. A row absent from it is NOT yet known to be
-            // unmatched — the classify loop stops at the first target row each source row hits, so a
-            // later target row matching that same source row never got recorded. Probe it in full.
-            if matched_targets.contains(tid) {
+        Ok(())
+    };
+    // `WHEN NOT MATCHED BY SOURCE` fires for a target row that NO source row matched. No source row
+    // is there to read, so the source half of the evaluation row is NULL (the mirror of the NULL
+    // target half a `WHEN NOT MATCHED` insert evaluates against).
+    let mut unmatched = |tid: Tid, trow: Row| -> Result<(), Error> {
+        let mut combined = trow.clone();
+        combined.extend(null_source.iter().cloned());
+        for when in &plan.whens {
+            let MergeWhen::NotMatchedBySource { pred, action } = when else {
                 continue;
-            }
-            let mut matched = false;
-            let candidates: Box<dyn Iterator<Item = &Row>> = match &source_index {
-                Some(index) => Box::new(
-                    index
-                        .for_left(trow)?
-                        .iter()
-                        .filter_map(|&i| source_rows.get(i)),
-                ),
-                None => Box::new(source_rows.iter()),
             };
-            for srow in candidates {
-                probe.clear();
-                probe.extend(trow.iter().cloned());
-                probe.extend(srow.iter().cloned());
-                if matches!(eval::eval(&plan.on, &probe)?, ast::Value::Bool(true)) {
-                    matched = true;
-                    break;
-                }
-            }
-            if matched {
+            if !predicate_matches(pred.as_ref(), &combined)? {
                 continue;
             }
-            // No source row to read, so the source half of the evaluation row is NULL — the mirror of
-            // the NULL target half a `WHEN NOT MATCHED` insert evaluates against.
-            let mut combined = trow.clone();
-            combined.extend(null_source.iter().cloned());
-            for when in &plan.whens {
-                let MergeWhen::NotMatchedBySource { pred, action } = when else {
-                    continue;
-                };
-                if !predicate_matches(pred.as_ref(), &combined)? {
-                    continue;
-                }
-                // No cardinality check here: every entry of `affected` comes from a matched clause,
-                // which requires a hit, and this row had none — so it cannot already be affected.
-                // The `break` below keeps a second BY SOURCE clause from firing on the same row.
-                stage_merge_matched_action(
-                    action,
-                    &plan.table,
-                    &fills,
-                    &enum_info,
-                    *tid,
-                    trow,
-                    &combined,
-                    &mut ops,
-                )?;
-                count += 1;
-                break;
-            }
+            // No cardinality check here: every entry of `affected` comes from a matched clause,
+            // which requires a hit, and this row had none, so it cannot already be affected.
+            // The `break` below keeps a second BY SOURCE clause from firing on the same row.
+            stage_merge_matched_action(
+                action,
+                &plan.table,
+                &fills,
+                &enum_info,
+                tid,
+                &trow,
+                &combined,
+                &mut ops.borrow_mut(),
+            )?;
+            count.set(count.get() + 1);
+            break;
         }
+        Ok(())
+    };
+    super::dml_join::merge_each(
+        TargetRows::scan(&plan.table, engine, txn)?,
+        source,
+        &mut super::dml_join::Merge {
+            on: &plan.on,
+            left_width: plan.table.columns.len(),
+            by_source: has_by_source,
+            each_source: &mut each_source,
+            unmatched: &mut unmatched,
+        },
+    )?;
+    let ops = ops.into_inner();
+    let count = count.get();
+    // UNIQUE / PRIMARY KEY need the whole post-merge table checked only when an UPDATE can change
+    // one of their columns (a generated column counts, since any assignment recomputes it).
+    let mut set_cols: HashSet<usize> = plan
+        .whens
+        .iter()
+        .filter_map(|when| match when {
+            MergeWhen::Matched {
+                action: crate::planner::MergeMatchedAction::Update { assignments },
+                ..
+            }
+            | MergeWhen::NotMatchedBySource {
+                action: crate::planner::MergeMatchedAction::Update { assignments },
+                ..
+            } => Some(assignments),
+            _ => None,
+        })
+        .flatten()
+        .map(|a| a.column)
+        .collect();
+    if !set_cols.is_empty() {
+        set_cols.extend(super::coldefault::generated_column_ordinals(
+            &plan.table,
+            engine,
+            txn,
+        )?);
     }
+    let needs_unique = table_has_unique_constraint(&plan.table, engine)?
+        && update_touches_unique_columns(&plan.table, &set_cols, engine)?;
 
     // Apply DELETE, then UPDATE, then INSERT — so the inserts' constraint checks see the updated
     // state (a not-matched insert never collides with a row a matched clause just changed/removed).
@@ -5413,7 +5364,7 @@ pub(super) fn run_merge(
         &plan.table,
         &ops.updates,
         &ops.deletes,
-        &target_rows,
+        needs_unique,
         engine,
         txn,
     )?;
@@ -5528,13 +5479,13 @@ fn commit_merge_deletes(
 
 /// Commit a `MERGE`'s matched-UPDATE set with the same enforcement a plain `UPDATE` performs:
 /// triggers, UNIQUE (over the resulting target state, with the deletes removed), CHECK, foreign keys
-/// (child + parent-update), secondary indexes, and IVM. The `deletes`/`target_rows` are used
-/// only to project the post-merge state for the uniqueness check.
+/// (child + parent-update), secondary indexes, and IVM. The `deletes` and `needs_unique` are used
+/// only for the uniqueness check, which runs when an update can change a unique column.
 fn commit_merge_updates(
     table: &TableSchema,
     updates: &[(Tid, Row, Row)],
     deletes: &[(Tid, Row)],
-    target_rows: &[(Tid, Row)],
+    needs_unique: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -5559,7 +5510,7 @@ fn commit_merge_updates(
     let new_rows: Vec<Row> = updates.iter().map(|(_, _, n)| n.clone()).collect();
     // UNIQUE over the post-merge target state: deletes removed, updates applied (fresh inserts are
     // checked separately by `insert_rows` against the already-updated table).
-    if table_has_unique_constraint(table, engine)? {
+    if needs_unique {
         // Serialize concurrent writers of the same key before the snapshot scan:
         // two MERGE statements that update different rows to the *same* new key each scan a
         // snapshot blind to the other and would both commit a duplicate. The no-wait key lock over
@@ -5567,8 +5518,10 @@ fn commit_merge_updates(
         lock_unique_keys(table, &new_rows, engine, txn)?;
         let deleted_tids: HashSet<Tid> = deletes.iter().map(|(t, _)| *t).collect();
         let updated: HashMap<Tid, &Row> = updates.iter().map(|(t, _, n)| (*t, n)).collect();
-        let mut result_rows: Vec<Row> = Vec::with_capacity(target_rows.len());
-        for (tid, row) in target_rows {
+        // The deletes are already applied, so a fresh scan no longer sees those rows; the updates
+        // are not yet, so their new images replace the scanned ones.
+        let mut result_rows: Vec<Row> = Vec::new();
+        for (tid, row) in &scan_table(table, engine, txn)? {
             if deleted_tids.contains(tid) {
                 continue;
             }

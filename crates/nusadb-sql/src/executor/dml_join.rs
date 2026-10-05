@@ -43,7 +43,6 @@ const MAX_DEPTH: u32 = 3;
 pub(super) struct KeyedRows {
     keys: Vec<crate::planner::HashKey>,
     map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>>,
-    left_width: usize,
 }
 
 impl KeyedRows {
@@ -77,53 +76,13 @@ impl KeyedRows {
                 map.entry(key).or_default().push(index);
             }
         }
-        Ok(Self {
-            keys,
-            map,
-            left_width,
-        })
-    }
-
-    /// Index `rows` (the left side), or `None` when `predicate` has no usable equi-key.
-    pub(super) fn left<'r>(
-        predicate: &TypedExpr,
-        rows: impl Iterator<Item = &'r Row>,
-        left_width: usize,
-    ) -> Result<Option<Self>, Error> {
-        let keys = crate::planner::equi_keys(predicate, left_width);
-        if keys.is_empty() {
-            return Ok(None);
-        }
-        let mut map: HashMap<Vec<super::join::KeyAtom>, Vec<usize>> = HashMap::new();
-        for (index, row) in rows.enumerate() {
-            if let Some(key) = super::join::key_atoms(&keys, row, super::join::KeySide::Left)? {
-                map.entry(key).or_default().push(index);
-            }
-        }
-        Ok(Some(Self {
-            keys,
-            map,
-            left_width,
-        }))
+        Ok(Self { keys, map })
     }
 
     /// The indexed right rows a left `row` can match, in order.
     pub(super) fn for_left(&self, row: &Row) -> Result<&[usize], Error> {
         Ok(
             super::join::key_atoms(&self.keys, row, super::join::KeySide::Left)?
-                .and_then(|key| self.map.get(&key))
-                .map_or(&[][..], Vec::as_slice),
-        )
-    }
-
-    /// The indexed left rows a right `row` can match, in order. `padded` is a scratch row the
-    /// caller reuses across calls.
-    pub(super) fn for_right(&self, row: &Row, padded: &mut Row) -> Result<&[usize], Error> {
-        padded.clear();
-        padded.resize(self.left_width, ast::Value::Null);
-        padded.extend_from_slice(row);
-        Ok(
-            super::join::key_atoms(&self.keys, padded, super::join::KeySide::Right)?
                 .and_then(|key| self.map.get(&key))
                 .map_or(&[][..], Vec::as_slice),
         )
@@ -332,7 +291,8 @@ pub(super) fn join_each(
             }
             Ok(())
         },
-        PartitionRows::OnDisk { source, mut target } => {
+        PartitionRows::OnDisk { source, target } => {
+            let mut target = target.cursor()?;
             while let Some(tagged) = target.read_row()? {
                 crate::cancel::check()?;
                 let (tid, row) = untag(tagged)?;
@@ -359,7 +319,7 @@ pub(super) enum PartitionRows {
     },
     OnDisk {
         source: SharedSpill,
-        target: SpillCursor,
+        target: SharedSpill,
     },
 }
 
@@ -476,8 +436,8 @@ impl Split<'_> {
                 continue;
             }
             handle(PartitionRows::OnDisk {
-                target: part.target.cursor()?,
                 source: part.source,
+                target: part.target,
             })?;
         }
         Ok(())
@@ -547,4 +507,218 @@ impl RowSource for TableRows {
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
         Ok(self.0.try_next()?.map(|(_, row)| row))
     }
+}
+
+/// What [`merge_each`] does with one source row and the first target row it matched, if any.
+pub(super) type EachSource<'e> = dyn FnMut(Row, Option<(Tid, Row)>) -> Result<(), Error> + 'e;
+
+/// What [`merge_each`] does with a target row no source row matched.
+pub(super) type EachUnmatched<'e> = dyn FnMut(Tid, Row) -> Result<(), Error> + 'e;
+
+/// The condition and callbacks of one `MERGE`.
+pub(super) struct Merge<'m, 'e> {
+    /// The `ON` condition over `target ++ source`.
+    pub(super) on: &'m TypedExpr,
+    /// The target's width.
+    pub(super) left_width: usize,
+    /// Whether a `WHEN NOT MATCHED BY SOURCE` clause needs the unmatched target rows.
+    pub(super) by_source: bool,
+    pub(super) each_source: &'m mut EachSource<'e>,
+    pub(super) unmatched: &'m mut EachUnmatched<'e>,
+}
+
+impl Merge<'_, '_> {
+    /// Whether `ON` holds for `target ++ source`, built in `scratch` (reused across pairs).
+    fn matches(&self, scratch: &mut Row, target: &Row, source: &Row) -> Result<bool, Error> {
+        scratch.clear();
+        scratch.extend(target.iter().cloned());
+        scratch.extend(source.iter().cloned());
+        Ok(matches!(
+            eval::eval(self.on, scratch)?,
+            ast::Value::Bool(true)
+        ))
+    }
+}
+
+/// Run a `MERGE`'s join: every source row is handed to `each_source` with the first target row (in
+/// scan order) its `ON` condition matches, and, when `by_source` is set, every target row no source
+/// row matches is handed to `unmatched` as the target is read. Over a source held in memory the
+/// source rows come in their order once every target row has been read; over a spilled source the
+/// same happens one partition at a time.
+///
+/// # Errors
+/// Propagates scan, spill-file and evaluation errors, and any error a callback returns.
+pub(super) fn merge_each(
+    mut targets: TargetRows,
+    source: JoinSource,
+    merge: &mut Merge<'_, '_>,
+) -> Result<(), Error> {
+    let file = match source {
+        JoinSource::Memory(rows) => {
+            let index = KeyedRows::right(Some(merge.on), &rows, merge.left_width)?;
+            return merge_held(rows, index.as_ref(), &mut || targets.try_next(), merge);
+        },
+        JoinSource::Spilled(file) => file,
+    };
+    let Some(config) = spill::spill_config() else {
+        return Err(Error::Internal(
+            "a MERGE source was spilled without a spill directory".to_owned(),
+        ));
+    };
+    let keys = crate::planner::equi_keys(merge.on, merge.left_width);
+    if keys.is_empty() {
+        // No equality to key on: the targets go to disk too and each side reads the other.
+        let mut writer = spill_file(&config)?;
+        let mut tagged = Tagged(targets);
+        while let Some(row) = tagged.try_next()? {
+            writer.write_row(&row)?;
+        }
+        return merge_on_disk(&file, &writer.into_shared()?, merge);
+    }
+    let split = Split {
+        keys: &keys,
+        left_width: merge.left_width,
+        config: &config,
+    };
+    let by_source = merge.by_source;
+    let parts = {
+        let each_source = &mut *merge.each_source;
+        let unmatched = &mut *merge.unmatched;
+        // A row whose key is `NULL` matches nothing, so it is settled at once.
+        split.split(
+            &mut FileRows(file.cursor()?),
+            &mut Tagged(targets),
+            0,
+            &mut |row| each_source(row, None),
+            &mut |tagged| {
+                if by_source {
+                    let (tid, row) = untag(tagged)?;
+                    unmatched(tid, row)?;
+                }
+                Ok(())
+            },
+        )?
+    };
+    drop(file);
+    split.each_partition(parts, &mut |part| match part {
+        PartitionRows::Held { source, mut target } => {
+            let index = KeyedRows::with_keys(keys.clone(), &source, merge.left_width)?;
+            merge_held(
+                source,
+                Some(&index),
+                &mut || target.read_row()?.map(untag).transpose(),
+                merge,
+            )
+        },
+        PartitionRows::OnDisk { source, target } => merge_on_disk(&source, &target, merge),
+    })
+}
+
+/// [`merge_each`] over source rows held in memory (keyed by `index` when the condition has
+/// equalities) and target rows from `next_target`.
+fn merge_held(
+    source: Vec<Row>,
+    index: Option<&KeyedRows>,
+    next_target: &mut dyn FnMut() -> Result<Option<(Tid, Row)>, Error>,
+    merge: &mut Merge<'_, '_>,
+) -> Result<(), Error> {
+    let mut hits: Vec<Option<(Tid, Row)>> = vec![None; source.len()];
+    let mut scratch = Row::new();
+    while let Some((tid, row)) = next_target()? {
+        crate::cancel::check()?;
+        let picks = match index {
+            Some(index) => Some(index.for_left(&row)?),
+            None => None,
+        };
+        let count = picks.map_or(source.len(), <[usize]>::len);
+        let mut matched = false;
+        for n in 0..count {
+            if n > 0 && n.is_multiple_of(1024) {
+                crate::cancel::check()?;
+            }
+            let i = match picks {
+                Some(picks) => match picks.get(n) {
+                    Some(&i) => i,
+                    None => break,
+                },
+                None => n,
+            };
+            let Some(srow) = source.get(i) else {
+                break;
+            };
+            // A source row that already has its first target needs this pair only to learn
+            // whether the target matched anything, and only when that is asked.
+            let settled = hits.get(i).is_some_and(Option::is_some);
+            if settled && (matched || !merge.by_source) {
+                continue;
+            }
+            if merge.matches(&mut scratch, &row, srow)? {
+                matched = true;
+                if let Some(hit @ None) = hits.get_mut(i) {
+                    *hit = Some((tid, row.clone()));
+                }
+            }
+        }
+        if merge.by_source && !matched {
+            (merge.unmatched)(tid, row)?;
+        }
+    }
+    for (srow, hit) in source.into_iter().zip(hits) {
+        (merge.each_source)(srow, hit)?;
+    }
+    Ok(())
+}
+
+/// [`merge_each`] with both sides on disk (`target` holds tagged rows): each source row reads the
+/// targets up to its first match, and each target row reads the sources until one matches.
+fn merge_on_disk(
+    source: &SharedSpill,
+    target: &SharedSpill,
+    merge: &mut Merge<'_, '_>,
+) -> Result<(), Error> {
+    let mut scratch = Row::new();
+    let mut sources = source.cursor()?;
+    while let Some(srow) = sources.read_row()? {
+        crate::cancel::check()?;
+        let mut targets = target.cursor()?;
+        let mut hit = None;
+        let mut read = 0usize;
+        while let Some(tagged) = targets.read_row()? {
+            read += 1;
+            if read.is_multiple_of(1024) {
+                crate::cancel::check()?;
+            }
+            let (tid, row) = untag(tagged)?;
+            if merge.matches(&mut scratch, &row, &srow)? {
+                hit = Some((tid, row));
+                break;
+            }
+        }
+        (merge.each_source)(srow, hit)?;
+    }
+    if !merge.by_source {
+        return Ok(());
+    }
+    let mut targets = target.cursor()?;
+    while let Some(tagged) = targets.read_row()? {
+        crate::cancel::check()?;
+        let (tid, row) = untag(tagged)?;
+        let mut sources = source.cursor()?;
+        let mut matched = false;
+        let mut read = 0usize;
+        while let Some(srow) = sources.read_row()? {
+            read += 1;
+            if read.is_multiple_of(1024) {
+                crate::cancel::check()?;
+            }
+            if merge.matches(&mut scratch, &row, &srow)? {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            (merge.unmatched)(tid, row)?;
+        }
+    }
+    Ok(())
 }

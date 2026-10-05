@@ -1,8 +1,9 @@
-//! `UPDATE ... FROM` and `DELETE ... USING` whose source is larger than `work_mem` spill it, given
-//! a spill directory, and must change exactly the rows an unbounded run changes: the same rows, and
-//! for an UPDATE with several matching source rows the same first one. The source mixes a key held
-//! by over a thousand rows (larger than the budget at every split), keys spread over many
-//! partitions, and `NULL` keys; conditions with no equality to key on read the source from disk.
+//! `UPDATE ... FROM`, `DELETE ... USING` and `MERGE` whose source is larger than `work_mem` spill
+//! it, given a spill directory, and must end exactly as an unbounded run ends: the same rows
+//! changed (for an UPDATE with several matching source rows, by the same first one), or the same
+//! error. The source mixes a key held by over a thousand rows (larger than the budget at every
+//! split), keys spread over many partitions, and `NULL` keys; conditions with no equality to key on
+//! read the source from disk.
 //!
 //! `spill_config` is process-wide, so this binary holds a single test.
 
@@ -42,6 +43,15 @@ fn run(engine: &dyn StorageEngine, session: &mut Session, sql: &str) -> Executio
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
+fn try_run(
+    engine: &dyn StorageEngine,
+    session: &mut Session,
+    sql: &str,
+) -> Result<ExecutionResult, Error> {
+    let logical = analyze(parse(sql)?, &Cat(engine))?;
+    session.execute(plan(logical))
+}
+
 fn rows(engine: &dyn StorageEngine, session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     let ExecutionResult::Rows { mut rows, .. } = run(engine, session, sql) else {
         panic!("expected rows from: {sql}");
@@ -61,6 +71,35 @@ const STATEMENTS: &[&str] = &[
     "DELETE FROM t USING s WHERE t.name = s.name AND t.k = s.k",
     "DELETE FROM t USING (SELECT k FROM s WHERE v % 7 = 1) AS s WHERE t.k = s.k",
     "DELETE FROM t USING s WHERE t.v > s.v + 990",
+    // MERGE over a source with one row per key (a repeated key would affect a row twice).
+    "MERGE INTO t USING (SELECT DISTINCT ON (k) * FROM s ORDER BY k, v) AS s ON t.k = s.k \
+     WHEN MATCHED AND s.v > 500 THEN UPDATE SET v = s.v WHEN MATCHED THEN DELETE \
+     WHEN NOT MATCHED THEN INSERT (k, v, name) VALUES (s.k, s.v, s.name)",
+    "MERGE INTO t USING (SELECT DISTINCT ON (k) * FROM s ORDER BY k, v DESC) AS s ON t.k = s.k AND t.name = s.name \
+     WHEN MATCHED THEN UPDATE SET v = s.v + 1 \
+     WHEN NOT MATCHED BY SOURCE AND t.v % 3 = 0 THEN DELETE \
+     WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = -1",
+    "MERGE INTO t USING (SELECT k, v, name FROM s WHERE v % 50 = 0) AS s ON t.k + 1000 = s.v \
+     WHEN MATCHED THEN UPDATE SET name = s.name WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v) \
+     WHEN NOT MATCHED BY SOURCE AND t.k = 7 THEN DELETE",
+    "MERGE INTO t USING (SELECT DISTINCT ON (v) * FROM s ORDER BY v, k) AS s ON t.v > s.v * 2 AND t.v <= s.v * 2 + 2 AND t.name = 'n1' \
+     WHEN MATCHED THEN UPDATE SET v = 0 WHEN NOT MATCHED BY SOURCE AND t.v % 7 = 0 THEN DELETE",
+    // Each source row matches several target rows (and no target two source rows): it takes the
+    // first in scan order.
+    "MERGE INTO t USING (SELECT DISTINCT ON (v) *, repeat('x', 400) AS pad FROM s WHERE v % 10 = 0 ORDER BY v, k) AS s \
+     ON t.v > s.v * 2 AND t.v <= s.v * 2 + 6 \
+     WHEN MATCHED THEN UPDATE SET v = s.v + t.v WHEN NOT MATCHED BY SOURCE AND t.v % 9 = 0 THEN DELETE",
+    // A source key that matches many target rows: the source row takes its first one; and a
+    // source with repeated keys, which must fail the same way.
+    "MERGE INTO t USING (SELECT DISTINCT ON (k) * FROM s ORDER BY k, v) AS s ON t.k = s.k \
+     WHEN MATCHED AND t.k = 7 THEN UPDATE SET v = s.v + t.v",
+    // One key larger than the budget at every split, its rows told apart by the rest of ON.
+    "MERGE INTO t USING (SELECT DISTINCT ON (v) *, repeat('x', 400) AS pad FROM s WHERE k = 7 AND v % 10 = 0 ORDER BY v, name) AS s \
+     ON t.k = s.k AND t.v > s.v * 2 AND t.v <= s.v * 2 + 15 \
+     WHEN MATCHED THEN UPDATE SET name = s.name \
+     WHEN NOT MATCHED AND s.v % 4 = 0 THEN INSERT (k, v) VALUES (s.k, s.v) \
+     WHEN NOT MATCHED BY SOURCE AND t.k = 7 AND t.v % 3 = 0 THEN DELETE",
+    "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v",
 ];
 
 fn setup(engine: &dyn StorageEngine, session: &mut Session) {
@@ -122,12 +161,20 @@ fn spilled_dml_joins_change_exactly_what_unbounded_ones_do() {
                 }));
                 run(engine, &mut session, "SET work_mem = '16kB'");
             }
-            run(engine, &mut session, statement);
+            let outcome = try_run(engine, &mut session, statement);
             run(engine, &mut session, "RESET work_mem");
             set_spill_config(None);
-            tables.push(rows(engine, &mut session, "SELECT k, v, name FROM t"));
+            tables.push(match outcome {
+                Ok(_) => Ok(rows(engine, &mut session, "SELECT k, v, name FROM t")),
+                Err(e) => Err(e.to_string()),
+            });
         }
         assert_eq!(tables[0], tables[1], "{statement}");
+        if statement.ends_with("SET v = s.v") {
+            assert!(tables[0].is_err(), "{statement} should affect a row twice");
+        } else {
+            assert!(tables[0].is_ok(), "{statement}: {:?}", tables[0]);
+        }
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
             0,

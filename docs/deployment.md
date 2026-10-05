@@ -206,14 +206,15 @@ falls back to holding the result when the query reads the target table, has a su
 target has triggers, foreign keys or incrementally maintained views). `REFRESH MATERIALIZED VIEW`
 keeps the new rows in a spill file until the old ones are replaced. A cursor over a `SELECT` whose
 result is larger than `--work-mem` keeps its rows in a spill file, which `FETCH` reads by position
-in any direction and `CLOSE` removes. `UPDATE` and `DELETE` read their target table as a stream,
-and the source of an `UPDATE ... FROM` or `DELETE ... USING` that outgrows `--work-mem` is spilled:
+in any direction and `CLOSE` removes. `UPDATE`, `DELETE` and `MERGE` read their target table as a
+stream, and the source of an `UPDATE ... FROM`, `DELETE ... USING` or `MERGE` that outgrows
+`--work-mem` is spilled:
 split by the join's equality key into partitions joined one at a time, or read from disk for each
 target row when the condition has no equality. Such a statement still holds the rows it changes
-until it applies them (as every write does until commit), and an `UPDATE` that sets a `UNIQUE` or
-primary-key column holds the table's new image to check it. `MERGE` still holds its source and
-target. A failed query leaves the server responsive, which is the point. A session's
-`SET work_mem` moves both the budget and the point where spilling starts.
+until it applies them (as every write does until commit), and an `UPDATE` or `MERGE` that sets a
+`UNIQUE` or primary-key column holds the table's new image to check it. A failed query leaves the
+server responsive, which is the point. A session's `SET work_mem` moves both the budget and the
+point where spilling starts.
 
 On Linux all of these derive from `--mem-budget`, which auto-detects the host or container limit, so
 a container with a memory limit gets sensible ceilings with no flags. On other systems set
