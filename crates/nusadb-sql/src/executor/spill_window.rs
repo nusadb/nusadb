@@ -1588,6 +1588,12 @@ struct PeerSliding<'a> {
     read: usize,
     /// The ordering key and group number of the last row read.
     last: Option<(Vec<ast::Value>, usize)>,
+    /// An aggregate with an exact sliding form, over the live frame `slide_lo..slide_hi`.
+    slide: Option<super::agg::SlideState>,
+    slide_lo: usize,
+    slide_hi: usize,
+    /// Where the search for a `RANGE` frame's start resumes: the start only moves forward.
+    range_start: usize,
 }
 
 impl<'a> PeerSliding<'a> {
@@ -1605,7 +1611,6 @@ impl<'a> PeerSliding<'a> {
         Ok(Some(Self {
             window,
             frame,
-            call,
             len,
             budget,
             held: VecDeque::new(),
@@ -1613,7 +1618,84 @@ impl<'a> PeerSliding<'a> {
             ahead: file.cursor()?,
             read: 0,
             last: None,
+            slide: call
+                .as_ref()
+                .filter(|_| matches!(frame.exclude, ast::WindowExclude::NoOthers))
+                .and_then(super::agg::SlideState::new),
+            call,
+            slide_lo: 0,
+            slide_hi: 0,
+            range_start: 0,
         }))
+    }
+
+    /// The held row at partition position `pos`; held rows have consecutive positions.
+    fn at(&self, pos: usize) -> Option<&PeerRow> {
+        let first = self.held.front()?.pos;
+        self.held.get(pos.checked_sub(first)?)
+    }
+
+    /// The position of the first (`first`) or last row of peer group `group` among the held rows.
+    fn group_edge(&self, group: usize, first: bool) -> Option<usize> {
+        let row = if first {
+            self.held
+                .get(self.held.partition_point(|r| r.group < group))
+        } else {
+            self.held
+                .partition_point(|r| r.group <= group)
+                .checked_sub(1)
+                .and_then(|i| self.held.get(i))
+        };
+        row.filter(|r| r.group == group).map(|r| r.pos)
+    }
+
+    /// Slide the aggregate state to the frame `[lo, hi]` and give its value. Both edges only move
+    /// forward; should one ever move back, the state is rebuilt over the frame.
+    fn slide_to(&mut self, lo: usize, hi: usize) -> Result<ast::Value, Error> {
+        let (Some(call), Some(state)) = (self.call.as_ref(), self.slide.as_mut()) else {
+            return Err(Error::Internal(
+                "a window slide without its state".to_owned(),
+            ));
+        };
+        let argument = |row: &PeerRow| {
+            call.arg
+                .as_ref()
+                .map_or(Ok(ast::Value::Null), |arg| eval::eval(arg, &row.row))
+        };
+        let first = self.held.front().map_or(0, |r| r.pos);
+        // Rebuild when an edge moved back, the frames do not overlap, or the rows still to be
+        // removed are no longer held. A frame start only moves back past the previous frame's end
+        // (an empty frame, or the `NULL` peers after the valued rows), where the frames do not
+        // overlap; the other two cases keep a wrong frame from going unnoticed.
+        if lo < self.slide_lo
+            || hi + 1 < self.slide_hi
+            || lo >= self.slide_hi
+            || self.slide_lo < first
+        {
+            *state = super::agg::SlideState::new(call)
+                .ok_or_else(|| Error::Internal("a window slide lost its form".to_owned()))?;
+            self.slide_lo = lo;
+            self.slide_hi = lo;
+        }
+        while self.slide_hi <= hi {
+            let row = self
+                .slide_hi
+                .checked_sub(first)
+                .and_then(|i| self.held.get(i))
+                .ok_or_else(|| Error::Internal("a window frame row was not held".to_owned()))?;
+            state.add(self.slide_hi, argument(row)?)?;
+            self.slide_hi += 1;
+        }
+        while self.slide_lo < lo {
+            let row = self
+                .slide_lo
+                .checked_sub(first)
+                .and_then(|i| self.held.get(i))
+                .ok_or_else(|| Error::Internal("a window frame row was not held".to_owned()))?;
+            state.remove(self.slide_lo, || argument(row))?;
+            self.slide_lo += 1;
+        }
+        state.value(self.slide_hi - self.slide_lo, call)
     }
 
     /// Read one more row into the held window; `false` at the partition's end.
@@ -1687,7 +1769,7 @@ impl Evaluator for PeerSliding<'_> {
                 break;
             }
         }
-        let Some(current) = self.held.iter().find(|r| r.pos == k) else {
+        let Some(current) = self.at(k) else {
             return Ok(ast::Value::Null);
         };
         let group = current.group;
@@ -1695,17 +1777,8 @@ impl Evaluator for PeerSliding<'_> {
         let last_pos = self.len.saturating_sub(1);
         // The current peer group's last position: read until a row of a later group is held.
         self.read_until(|r| r.group > group)?;
-        let peer_lo = self
-            .held
-            .iter()
-            .find(|r| r.group == group)
-            .map_or(k, |r| r.pos);
-        let peer_hi = self
-            .held
-            .iter()
-            .rev()
-            .find(|r| r.group == group)
-            .map_or(k, |r| r.pos);
+        let peer_lo = self.group_edge(group, true).unwrap_or(k);
+        let peer_hi = self.group_edge(group, false).unwrap_or(k);
         let descending = self.frame.range_descending;
         let ascending = !descending;
         let ranged = matches!(
@@ -1720,10 +1793,7 @@ impl Evaluator for PeerSliding<'_> {
         let (lo, hi) = if ranged && current_range.is_none() {
             (Some(peer_lo), Some(peer_hi))
         } else {
-            let group_at = |this: &Self, target: usize, first: bool| -> Option<usize> {
-                let mut rows = this.held.iter().filter(|r| r.group == target);
-                if first { rows.next() } else { rows.next_back() }.map(|r| r.pos)
-            };
+            let group_at = |this: &Self, target: usize, first: bool| this.group_edge(target, first);
             let boundary = |off: &ast::Value, preceding: bool| {
                 current_range
                     .and_then(|cur| super::ops::range_boundary(cur, off, preceding, ascending))
@@ -1757,12 +1827,18 @@ impl Evaluator for PeerSliding<'_> {
                         None => Some(self.len),
                         Some(b) => {
                             self.read_until(|r| Self::reaches(descending, &r.key, b, true))?;
-                            Some(
-                                self.held
-                                    .iter()
-                                    .find(|r| Self::reaches(descending, &r.key, b, true))
-                                    .map_or(self.len, |r| r.pos),
-                            )
+                            // No row before the previous start reaches a later start, so the
+                            // search resumes there.
+                            let first = self.held.front().map_or(0, |r| r.pos);
+                            let from = self.range_start.saturating_sub(first);
+                            let start = self
+                                .held
+                                .iter()
+                                .skip(from)
+                                .find(|r| Self::reaches(descending, &r.key, b, true))
+                                .map_or(self.len, |r| r.pos);
+                            self.range_start = start;
+                            Some(start)
                         },
                     }
                 },
@@ -1814,6 +1890,14 @@ impl Evaluator for PeerSliding<'_> {
             };
             (lo, hi)
         };
+        let frame = match (lo, hi) {
+            (Some(lo), Some(hi)) if lo <= hi && lo <= last_pos => Some((lo, hi.min(last_pos))),
+            _ => None,
+        };
+        let slid = match (frame, self.slide.is_some()) {
+            (Some((lo, hi)), true) => Some(self.slide_to(lo, hi)?),
+            _ => None,
+        };
         // Rows before both the frame start and the current row are never needed again.
         let keep_from = lo.unwrap_or(k).min(k);
         while self.held.front().is_some_and(|r| r.pos < keep_from) {
@@ -1823,14 +1907,22 @@ impl Evaluator for PeerSliding<'_> {
                     .saturating_sub(row_bytes(&gone.row) + row_bytes(&gone.key));
             }
         }
-        if self.budget != 0 && self.held.len() > 1 && self.held_bytes > self.budget {
+        let held_bytes = self.held_bytes
+            + self
+                .slide
+                .as_ref()
+                .map_or(0, super::agg::SlideState::held_bytes);
+        if self.budget != 0 && self.held.len() > 1 && held_bytes > self.budget {
             return Err(Error::Core(nusadb_core::Error::OutOfMemory(format!(
                 "query work_mem of {} bytes exceeded: the window frame of {} holds {} bytes; use \
                  a narrower frame or raise work_mem (SET work_mem / --work-mem)",
                 self.budget,
                 sql_name(&self.window.func),
-                self.held_bytes
+                held_bytes
             ))));
+        }
+        if let Some(value) = slid {
+            return Ok(value);
         }
         let in_frame = |pos: usize| match (lo, hi) {
             (Some(lo), Some(hi)) => lo <= pos && pos <= hi && lo <= last_pos,
@@ -1857,10 +1949,12 @@ impl Evaluator for PeerSliding<'_> {
         let Some(value_expr) = self.window.args.first() else {
             return Ok(ast::Value::Null);
         };
-        let mut frame = self.held.iter().filter(|r| in_frame(r.pos));
+        let Some((lo, hi)) = frame else {
+            return Ok(ast::Value::Null);
+        };
         let target = match self.window.func {
-            W::FirstValue => frame.next(),
-            W::LastValue => frame.next_back(),
+            W::FirstValue => Some(lo),
+            W::LastValue => Some(hi),
             _ => match self
                 .window
                 .args
@@ -1868,13 +1962,16 @@ impl Evaluator for PeerSliding<'_> {
                 .map(|e| eval::eval(e, row))
                 .transpose()?
             {
-                Some(ast::Value::Int(n)) if n >= 1 => {
-                    usize::try_from(n - 1).ok().and_then(|i| frame.nth(i))
-                },
+                Some(ast::Value::Int(n)) if n >= 1 => usize::try_from(n - 1)
+                    .ok()
+                    .and_then(|i| lo.checked_add(i))
+                    .filter(|&t| t <= hi),
                 _ => None,
             },
         };
-        target.map_or(Ok(ast::Value::Null), |r| eval::eval(value_expr, &r.row))
+        target
+            .and_then(|t| self.at(t))
+            .map_or(Ok(ast::Value::Null), |r| eval::eval(value_expr, &r.row))
     }
 }
 
