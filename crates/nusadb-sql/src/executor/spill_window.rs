@@ -14,8 +14,9 @@
 //! to the partition end (computed backwards). `LAG` / `LEAD` with an offset that varies per row and
 //! `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` over a `ROWS` or default frame read the row they need
 //! from a copy of the partition readable by position, so they hold no rows at all. What still needs
-//! memory past the budget is an aggregate frame, or a `RANGE` / `GROUPS` frame with an offset,
-//! wider than the budget; those fail with the budget error.
+//! memory past the budget is a `RANGE` / `GROUPS` frame with an offset, or a `ROWS` frame of an
+//! aggregate without an exact sliding form (see [`SlidingAggregate`]), wider than the budget; those
+//! fail with the budget error.
 //!
 //! Rows leave in partition order rather than input order; a query that orders its result has a
 //! `Sort` above the window, which the planner always places there.
@@ -447,6 +448,12 @@ fn evaluator<'a>(
                         && let Some(reversed) = Reversed::try_new(window, &call, file, config)?
                     {
                         return Ok(Box::new(reversed));
+                    }
+                    if let Some(call) = window_aggregate_call(window)
+                        && let Some(sliding) =
+                            SlidingAggregate::new(window, call, file, len, budget)?
+                    {
+                        return Ok(Box::new(sliding));
                     }
                     if let Some(sliding) =
                         Sliding::new(window, window_aggregate_call(window), file, len, budget)?
@@ -1286,13 +1293,161 @@ impl Evaluator for RunningAggregate<'_> {
     }
 }
 
-/// Any other `ROWS` frame: the rows of the current frame held in a window that slides with the
-/// current row (its bounds only move forward), each value computed over the frame the way the
-/// in-memory path computes it. Memory is the frame's width, so a frame wider than the budget fails
-/// with the budget error.
+/// The offsets of a `ROWS` frame's bounds from the current row (`None` for a partition end), or
+/// `None` for a `RANGE` / `GROUPS` frame.
+fn rows_offsets(frame: &crate::planner::WindowFrame) -> Option<(Option<i64>, Option<i64>)> {
+    if frame.peer_based {
+        return None;
+    }
+    let offset = |bound: &FrameBound| -> Option<Option<i64>> {
+        let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        match bound {
+            FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => Some(None),
+            FrameBound::CurrentRow => Some(Some(0)),
+            FrameBound::Preceding(v) => Some(Some(-n(*v))),
+            FrameBound::Following(v) => Some(Some(n(*v))),
+            FrameBound::RangePreceding(_) | FrameBound::RangeFollowing(_) => None,
+        }
+    };
+    Some((offset(&frame.start)?, offset(&frame.end)?))
+}
+
+/// The inclusive `[lo, hi]` positions of the `ROWS` frame of row `k` in a partition of `len` rows,
+/// or `None` when it is empty, as [`frame_bounds`] places them.
+fn rows_frame(
+    start: Option<i64>,
+    end: Option<i64>,
+    k: usize,
+    len: usize,
+) -> Option<(usize, usize)> {
+    let at = |base: usize, rel: i64| i64::try_from(base).unwrap_or(i64::MAX).saturating_add(rel);
+    let last = i64::try_from(len).unwrap_or(i64::MAX) - 1;
+    let lo = start.map_or(0, |rel| at(k, rel)).max(0);
+    let hi = end.map_or(last, |rel| at(k, rel)).min(last);
+    if lo > hi {
+        return None;
+    }
+    Some((usize::try_from(lo).ok()?, usize::try_from(hi).ok()?))
+}
+
+/// An aggregate over a `ROWS` frame without `EXCLUDE` that has an exact sliding form (see
+/// [`SlideState`]): each row entering the frame is added and each row leaving it removed, read by
+/// two cursors that only move forward, so a row costs O(1) whatever the frame's width, exactly as
+/// the in-memory path computes it. Only a `MIN` / `MAX` keeps values, at most one per frame row;
+/// past the budget it fails with the budget error.
+struct SlidingAggregate {
+    call: AggregateCall,
+    state: super::agg::SlideState,
+    len: usize,
+    start: Option<i64>,
+    end: Option<i64>,
+    budget: usize,
+    ahead: SpillCursor,
+    /// Reads the rows leaving the frame, for the aggregates that need their values.
+    behind: Option<SpillCursor>,
+    /// The live frame is the half-open `[lo, hi)`.
+    lo: usize,
+    hi: usize,
+}
+
+impl SlidingAggregate {
+    /// `None` unless the window has a `ROWS` frame without `EXCLUDE` and `call` slides exactly.
+    fn new(
+        window: &WindowExpr,
+        call: AggregateCall,
+        file: &SharedSpill,
+        len: usize,
+        budget: usize,
+    ) -> Result<Option<Self>, Error> {
+        let Some(frame) = window
+            .frame
+            .as_ref()
+            .filter(|f| matches!(f.exclude, ast::WindowExclude::NoOthers))
+        else {
+            return Ok(None);
+        };
+        let Some((start, end)) = rows_offsets(frame) else {
+            return Ok(None);
+        };
+        let Some(state) = super::agg::SlideState::new(&call) else {
+            return Ok(None);
+        };
+        let behind = state.reads_leaving().then(|| file.cursor()).transpose()?;
+        Ok(Some(Self {
+            call,
+            state,
+            len,
+            start,
+            end,
+            budget,
+            ahead: file.cursor()?,
+            behind,
+            lo: 0,
+            hi: 0,
+        }))
+    }
+
+    /// The aggregate's argument for `row` (`NULL` for `count(*)`, which never reads it).
+    fn argument(call: &AggregateCall, row: &Row) -> Result<ast::Value, Error> {
+        call.arg
+            .as_ref()
+            .map_or(Ok(ast::Value::Null), |arg| eval::eval(arg, row))
+    }
+}
+
+impl Evaluator for SlidingAggregate {
+    fn value(&mut self, k: usize, _row: &Row) -> Result<ast::Value, Error> {
+        let Some((lo, hi)) = rows_frame(self.start, self.end, k, self.len) else {
+            return super::agg::finalize_aggregate(super::agg::Acc::default(), &self.call);
+        };
+        while self.hi <= hi {
+            let row = self.ahead.read_row()?.ok_or_else(|| {
+                Error::Internal("a window frame ran past its partition".to_owned())
+            })?;
+            self.state.add(self.hi, Self::argument(&self.call, &row)?)?;
+            self.hi += 1;
+            self.check_budget()?;
+        }
+        while self.lo < lo {
+            let leaving = match self.behind.as_mut() {
+                Some(behind) => behind.read_row()?,
+                None => None,
+            };
+            let call = &self.call;
+            self.state.remove(self.lo, || {
+                leaving
+                    .as_ref()
+                    .map_or(Ok(ast::Value::Null), |row| Self::argument(call, row))
+            })?;
+            self.lo += 1;
+        }
+        self.state.value(self.hi - self.lo, &self.call)
+    }
+}
+
+impl SlidingAggregate {
+    /// Fail with the budget error once a `MIN` / `MAX` holds more than the budget.
+    fn check_budget(&self) -> Result<(), Error> {
+        if self.budget != 0 && self.state.held_bytes() > self.budget {
+            return Err(Error::Core(nusadb_core::Error::OutOfMemory(format!(
+                "query work_mem of {} bytes exceeded: the window frame of {} holds {} bytes; use \
+                     a narrower frame or raise work_mem (SET work_mem / --work-mem)",
+                self.budget,
+                sql_name(&ast::WindowFunc::Aggregate(self.call.func)),
+                self.state.held_bytes()
+            ))));
+        }
+        Ok(())
+    }
+}
+
+/// Any other aggregate over a `ROWS` frame (one without an exact sliding form, or with `EXCLUDE`):
+/// the rows of the current frame held in a window that slides with the current row (its bounds only
+/// move forward), each value folded over the frame the way the in-memory path folds it. Memory is
+/// the frame's width, so a frame wider than the budget fails with the budget error.
 struct Sliding<'a> {
     window: &'a WindowExpr,
-    call: Option<AggregateCall>,
+    call: AggregateCall,
     len: usize,
     /// The frame start relative to the current row, or `None` for the partition's first row.
     start: Option<i64>,
@@ -1309,7 +1464,7 @@ struct Sliding<'a> {
 }
 
 impl<'a> Sliding<'a> {
-    /// `None` unless the window has an explicit `ROWS` frame.
+    /// `None` unless the window is an aggregate with an explicit `ROWS` frame.
     fn new(
         window: &'a WindowExpr,
         call: Option<AggregateCall>,
@@ -1317,20 +1472,10 @@ impl<'a> Sliding<'a> {
         len: usize,
         budget: usize,
     ) -> Result<Option<Self>, Error> {
-        let Some(frame) = window.frame.as_ref().filter(|f| !f.peer_based) else {
+        let (Some(call), Some(frame)) = (call, window.frame.as_ref()) else {
             return Ok(None);
         };
-        let offset = |bound: &FrameBound| -> Option<Option<i64>> {
-            let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-            match bound {
-                FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => Some(None),
-                FrameBound::CurrentRow => Some(Some(0)),
-                FrameBound::Preceding(v) => Some(Some(-n(*v))),
-                FrameBound::Following(v) => Some(Some(n(*v))),
-                FrameBound::RangePreceding(_) | FrameBound::RangeFollowing(_) => None,
-            }
-        };
-        let (Some(start), Some(end)) = (offset(&frame.start), offset(&frame.end)) else {
+        let Some((start, end)) = rows_offsets(frame) else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -1351,19 +1496,17 @@ impl<'a> Sliding<'a> {
 
 impl Evaluator for Sliding<'_> {
     fn value(&mut self, k: usize, row: &Row) -> Result<ast::Value, Error> {
-        let at =
-            |base: usize, rel: i64| i64::try_from(base).unwrap_or(i64::MAX).saturating_add(rel);
-        let last = i64::try_from(self.len).unwrap_or(i64::MAX) - 1;
-        let lo = self.start.map_or(0, |rel| at(k, rel)).max(0);
-        let hi = self.end.map_or(last, |rel| at(k, rel)).min(last);
+        let Some((lo, hi)) = rows_frame(self.start, self.end, k, self.len) else {
+            return super::agg::finalize_aggregate(super::agg::Acc::default(), &self.call);
+        };
         // Read up to the frame end, keeping only rows at or past the frame start.
-        while i64::try_from(self.read).unwrap_or(i64::MAX) <= hi {
+        while self.read <= hi {
             let Some(next) = self.ahead.read_row()? else {
                 break;
             };
             let pos = self.read;
             self.read += 1;
-            if i64::try_from(pos).unwrap_or(i64::MAX) >= lo {
+            if pos >= lo {
                 // Peers matter only to an exclusion; skip their keys otherwise.
                 let key = if matches!(self.exclude, ast::WindowExclude::NoOthers) {
                     Vec::new()
@@ -1374,11 +1517,7 @@ impl Evaluator for Sliding<'_> {
                 self.held.push_back((pos, next, key));
             }
         }
-        while self
-            .held
-            .front()
-            .is_some_and(|(pos, _, _)| i64::try_from(*pos).unwrap_or(i64::MAX) < lo)
-        {
+        while self.held.front().is_some_and(|(pos, _, _)| *pos < lo) {
             if let Some((_, gone, key)) = self.held.pop_front() {
                 self.held_bytes = self
                     .held_bytes
@@ -1394,54 +1533,31 @@ impl Evaluator for Sliding<'_> {
                 self.held_bytes
             ))));
         }
-        let in_frame = |pos: usize| i64::try_from(pos).is_ok_and(|p| lo <= p && p <= hi);
-        if let Some(call) = &self.call {
-            // EXCLUDE drops the current row, its peers, or its peers but itself; inside a ROWS
-            // frame the peers are exactly the held rows with an equal ordering key.
-            let current = if matches!(self.exclude, ast::WindowExclude::NoOthers) {
-                Vec::new()
-            } else {
-                order_key(&self.window.order, row)?
-            };
-            let frame = self.held.iter().filter(|(pos, _, key)| {
-                in_frame(*pos)
-                    && match self.exclude {
-                        ast::WindowExclude::NoOthers => true,
-                        ast::WindowExclude::CurrentRow => *pos != k,
-                        ast::WindowExclude::Group => !group_keys_equal(key, &current),
-                        ast::WindowExclude::Ties => *pos == k || !group_keys_equal(key, &current),
-                    }
-            });
-            return Ok(super::agg::fold_aggregates(
-                std::slice::from_ref(call),
+        // EXCLUDE drops the current row, its peers, or its peers but itself; inside a ROWS frame
+        // the peers are exactly the held rows with an equal ordering key.
+        let current = if matches!(self.exclude, ast::WindowExclude::NoOthers) {
+            Vec::new()
+        } else {
+            order_key(&self.window.order, row)?
+        };
+        let frame = self.held.iter().filter(|(pos, _, key)| {
+            (lo..=hi).contains(pos)
+                && match self.exclude {
+                    ast::WindowExclude::NoOthers => true,
+                    ast::WindowExclude::CurrentRow => *pos != k,
+                    ast::WindowExclude::Group => !group_keys_equal(key, &current),
+                    ast::WindowExclude::Ties => *pos == k || !group_keys_equal(key, &current),
+                }
+        });
+        Ok(
+            super::agg::fold_aggregates(
+                std::slice::from_ref(&self.call),
                 frame.map(|(_, r, _)| r),
             )?
             .into_iter()
             .next()
-            .unwrap_or(ast::Value::Null));
-        }
-        // The value functions read the frame as the bounds select it; EXCLUDE does not apply.
-        let Some(value_expr) = self.window.args.first() else {
-            return Ok(ast::Value::Null);
-        };
-        let mut frame = self.held.iter().filter(|(pos, _, _)| in_frame(*pos));
-        let target = match self.window.func {
-            W::FirstValue => frame.next(),
-            W::LastValue => frame.next_back(),
-            _ => match self
-                .window
-                .args
-                .get(1)
-                .map(|e| eval::eval(e, row))
-                .transpose()?
-            {
-                Some(ast::Value::Int(n)) if n >= 1 => {
-                    usize::try_from(n - 1).ok().and_then(|i| frame.nth(i))
-                },
-                _ => None,
-            },
-        };
-        target.map_or(Ok(ast::Value::Null), |(_, r, _)| eval::eval(value_expr, r))
+            .unwrap_or(ast::Value::Null),
+        )
     }
 }
 

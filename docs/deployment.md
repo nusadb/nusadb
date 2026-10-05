@@ -193,10 +193,13 @@ The other three limits bound what a single client can do to the server:
 A spilled sort, `DISTINCT` or `GROUP BY` streams its result to the client straight from the merge of
 its spill files, so a result larger than `--work-mem` is fine. Window functions spill too: each
 partition is evaluated in memory when it fits and from its spill file when it does not. What has to
-fit is one frame of an aggregate, or of a `RANGE` / `GROUPS` frame with an offset: one that holds
-more rows than the budget (say `sum(x) OVER (ROWS BETWEEN 100000 PRECEDING AND CURRENT ROW)`, or a
-floating-point `sum` or `avg` from `CURRENT ROW` to `UNBOUNDED FOLLOWING`) fails at the budget;
-split such a partition with `PARTITION BY`. `lag`, `lead`, `first_value`, `last_value` and
+fit is one frame in a few cases: a `RANGE` / `GROUPS` frame with an offset, an aggregate over a
+`ROWS` frame that uses `EXCLUDE` or has no exact running form (a floating-point `sum` or `avg`,
+`array_agg`, `string_agg`, statistics), and a `min` or `max` whose values keep rising (or falling)
+across a wide frame. One that holds more rows than the budget fails at the budget; split such a
+partition with `PARTITION BY`. `count`, `sum`, `avg`, `min` and `max` over any other `ROWS` frame
+add the row entering the frame and drop the row leaving it, so a frame of any width costs the
+same per row. `lag`, `lead`, `first_value`, `last_value` and
 `nth_value` read the row they need from disk over a `ROWS` frame, the default frame, or a `RANGE` /
 `GROUPS` frame bounded by `UNBOUNDED` and `CURRENT ROW`, so neither the frame's width nor an offset
 or position that changes per row is limited. `DISTINCT ON` and `ROLLUP` / `CUBE` / `GROUPING SETS`

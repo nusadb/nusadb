@@ -988,6 +988,7 @@ pub(super) fn fold_aggregates_streamed(
 
 /// The aggregate functions whose value over a sliding frame is maintainable in O(1) per frame-edge
 /// move — reproducing [`finalize_aggregate`] over the frame EXACTLY. See [`sliding_window_aggregate`].
+#[derive(Clone, Copy)]
 enum SlideKind {
     CountStar, // count(*): the frame width (NULLs included)
     CountExpr, // count(expr): non-NULL values
@@ -998,29 +999,198 @@ enum SlideKind {
     Max,       // MAX via a monotonic (decreasing) deque
 }
 
+/// The state of an aggregate over a sliding frame: rows enter at the high edge and leave at the low
+/// edge, both only moving forward, and [`SlideState::value`] reproduces [`finalize_aggregate`] over
+/// the rows inside exactly.
+pub(super) struct SlideState {
+    kind: SlideKind,
+    /// Non-NULL value count (SUM/AVG `any_seen` + AVG divisor + count(expr)).
+    count: i64,
+    int_sum: i128,
+    dec_sum: crate::numeric::Decimal,
+    /// Monotonic deque of (pos, value) for MIN/MAX. Positions increase front-to-back, so a position
+    /// leaving the frame is only ever the front.
+    deque: std::collections::VecDeque<(usize, ast::Value)>,
+    deque_bytes: usize,
+}
+
+impl SlideState {
+    /// The state for `call`, or `None` when it has no exact sliding form: a `FILTER` (the slide never
+    /// sees the predicate), a row-value COUNT, or a SUM/AVG over a FLOAT result (a running total
+    /// would drift under add/subtract and diverge from the from-scratch fold).
+    pub(super) const fn new(call: &AggregateCall) -> Option<Self> {
+        use crate::ast::AggregateFunc as F;
+        if call.filter.is_some() {
+            return None;
+        }
+        let kind = match call.func {
+            F::Count if !call.row_args.is_empty() => return None,
+            F::Count if call.arg.is_none() => SlideKind::CountStar,
+            F::Count => SlideKind::CountExpr,
+            F::Min => SlideKind::Min,
+            F::Max => SlideKind::Max,
+            F::Sum if is_integer(call.result_ty) => SlideKind::SumInt,
+            F::Sum if matches!(call.result_ty, ColumnType::Numeric { .. }) => SlideKind::SumDec,
+            F::Avg if matches!(call.result_ty, ColumnType::Numeric { .. }) => SlideKind::Avg,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            count: 0,
+            int_sum: 0,
+            dec_sum: crate::numeric::Decimal::ZERO,
+            deque: std::collections::VecDeque::new(),
+            deque_bytes: 0,
+        })
+    }
+
+    /// Whether leaving rows need their value (MIN/MAX and COUNT(*) do not).
+    pub(super) const fn reads_leaving(&self) -> bool {
+        matches!(
+            self.kind,
+            SlideKind::CountExpr | SlideKind::SumInt | SlideKind::SumDec | SlideKind::Avg
+        )
+    }
+
+    /// Bytes the MIN/MAX deque holds (the only state that grows with the frame).
+    pub(super) const fn held_bytes(&self) -> usize {
+        self.deque_bytes
+    }
+
+    /// The row at `pos`, whose argument value is `value`, enters the frame.
+    pub(super) fn add(&mut self, pos: usize, value: ast::Value) -> Result<(), Error> {
+        let is_null = matches!(value, ast::Value::Null);
+        match self.kind {
+            SlideKind::CountStar => {},
+            SlideKind::CountExpr => {
+                if !is_null {
+                    self.count += 1;
+                }
+            },
+            SlideKind::SumInt => {
+                if let ast::Value::Int(i) = value {
+                    self.int_sum = self.int_sum.wrapping_add(i128::from(i));
+                    self.count += 1;
+                }
+            },
+            SlideKind::SumDec | SlideKind::Avg => {
+                if let Some(d) = value_as_decimal(&value) {
+                    self.dec_sum = self.dec_sum.checked_add(&d).ok_or_else(numeric_overflow)?;
+                    self.int_sum = self.int_sum.wrapping_add(match value {
+                        ast::Value::Int(i) => i128::from(i),
+                        _ => 0,
+                    });
+                    self.count += 1;
+                }
+            },
+            SlideKind::Min | SlideKind::Max => {
+                if !is_null {
+                    let drop = if matches!(self.kind, SlideKind::Min) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                    while self
+                        .deque
+                        .back()
+                        .is_some_and(|(_, v)| eval::compare(v, &value) == drop)
+                    {
+                        if let Some((_, gone)) = self.deque.pop_back() {
+                            self.deque_bytes = self
+                                .deque_bytes
+                                .saturating_sub(super::ops::row_bytes(std::slice::from_ref(&gone)));
+                        }
+                    }
+                    self.deque_bytes += super::ops::row_bytes(std::slice::from_ref(&value));
+                    self.deque.push_back((pos, value));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// The row at `pos` leaves the frame; `value` gives its argument value when
+    /// [`reads_leaving`](Self::reads_leaving) says it is needed.
+    pub(super) fn remove(
+        &mut self,
+        pos: usize,
+        value: impl FnOnce() -> Result<ast::Value, Error>,
+    ) -> Result<(), Error> {
+        match self.kind {
+            SlideKind::CountStar => {},
+            SlideKind::CountExpr => {
+                if !matches!(value()?, ast::Value::Null) {
+                    self.count -= 1;
+                }
+            },
+            SlideKind::SumInt => {
+                if let ast::Value::Int(i) = value()? {
+                    self.int_sum = self.int_sum.wrapping_sub(i128::from(i));
+                    self.count -= 1;
+                }
+            },
+            SlideKind::SumDec | SlideKind::Avg => {
+                let value = value()?;
+                if let Some(d) = value_as_decimal(&value) {
+                    self.dec_sum = self.dec_sum.checked_sub(&d).ok_or_else(numeric_overflow)?;
+                    self.int_sum = self.int_sum.wrapping_sub(match value {
+                        ast::Value::Int(i) => i128::from(i),
+                        _ => 0,
+                    });
+                    self.count -= 1;
+                }
+            },
+            SlideKind::Min | SlideKind::Max => {
+                if self.deque.front().is_some_and(|(at, _)| *at == pos)
+                    && let Some((_, gone)) = self.deque.pop_front()
+                {
+                    self.deque_bytes = self
+                        .deque_bytes
+                        .saturating_sub(super::ops::row_bytes(std::slice::from_ref(&gone)));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// The aggregate over the `width` rows currently in the frame.
+    pub(super) fn value(&self, width: usize, call: &AggregateCall) -> Result<ast::Value, Error> {
+        if matches!(self.kind, SlideKind::CountStar) {
+            return Ok(ast::Value::Int(i64::try_from(width).unwrap_or(i64::MAX)));
+        }
+        let front = self.deque.front().map(|(_, v)| v.clone());
+        let (min, max) = match self.kind {
+            SlideKind::Min => (front, None),
+            SlideKind::Max => (None, front),
+            _ => (None, None),
+        };
+        let acc = Acc {
+            count: self.count,
+            any_seen: self.count > 0,
+            int_sum: self.int_sum,
+            dec_sum: Some(self.dec_sum),
+            min,
+            max,
+            ..Acc::default()
+        };
+        finalize_aggregate(acc, call)
+    }
+}
+
 /// Evaluate an explicit-frame window aggregate in O(n) total with a sliding accumulator, when `call`
 /// is one whose add/remove (or monotonic-deque) form reproduces [`finalize_aggregate`] over the
-/// frame EXACTLY. Returns `Ok(false)` for any other aggregate, so the caller folds each frame from
-/// scratch. This is the Leis'15 removable-aggregate optimisation for `ROWS` frames: the previous
-/// per-row re-fold was O(n·w) in the frame width `w`, which a swinging `ROWS BETWEEN x PRECEDING AND
-/// y FOLLOWING` (or `MIN`/`MAX`) drove toward O(n²) as `w` grew (
-/// swinging-frame case).
+/// frame EXACTLY (see [`SlideState`]). Returns `Ok(false)` for any other aggregate, so the caller
+/// folds each frame from scratch. This is the Leis'15 removable-aggregate optimisation for `ROWS`
+/// frames: the previous per-row re-fold was O(n·w) in the frame width `w`, which a swinging `ROWS
+/// BETWEEN x PRECEDING AND y FOLLOWING` (or `MIN`/`MAX`) drove toward O(n²) as `w` grew.
 ///
 /// `frame_at(k)` is the inclusive `[lo, hi]` frame for row `k`, or `None` when the frame is empty.
 /// The frames MUST be monotonic — both edges non-decreasing in `k`, and any empty frames confined to
 /// the ends — which holds for `ROWS` frames (the caller restricts to those). `value_at(pos)`
 /// evaluates the aggregate argument at ordered position `pos`; `emit(k, value)` receives each result.
 ///
-/// SUM/AVG are handled only for exact integer/`NUMERIC` results — a FLOAT running total would drift
-/// under add/subtract and diverge from the from-scratch fold, so those fall back.
-///
 /// # Errors
 /// Propagates argument-evaluation and numeric-overflow errors.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one add-arm and one remove-arm per supported aggregate kind; the length tracks that \
-              fixed set and splitting it would only scatter the tightly-coupled slide state"
-)]
 pub(super) fn sliding_window_aggregate(
     call: &AggregateCall,
     n: usize,
@@ -1028,150 +1198,28 @@ pub(super) fn sliding_window_aggregate(
     value_at: impl Fn(usize) -> Result<ast::Value, Error>,
     mut emit: impl FnMut(usize, ast::Value) -> Result<(), Error>,
 ) -> Result<bool, Error> {
-    use crate::ast::AggregateFunc as F;
-    // A `FILTER` decides per row whether that row contributes at all, but the slide only ever sees
-    // `value_at(pos)` — it has no way to ask. Accepting one here would silently count and sum the
-    // rows the filter excludes, so hand these back to the caller's from-scratch fold, which applies
-    // the predicate. (Same reason `call_is_parallel_mergeable` excludes a filtered call.)
-    if call.filter.is_some() {
+    let Some(mut state) = SlideState::new(call) else {
         return Ok(false);
-    }
-    let kind = match call.func {
-        // A row-value COUNT has no `arg` to slide over and is not a COUNT(*); it has no sliding
-        // form, so the caller keeps the general per-frame fold.
-        F::Count if !call.row_args.is_empty() => return Ok(false),
-        F::Count if call.arg.is_none() => SlideKind::CountStar,
-        F::Count => SlideKind::CountExpr,
-        F::Min => SlideKind::Min,
-        F::Max => SlideKind::Max,
-        F::Sum if is_integer(call.result_ty) => SlideKind::SumInt,
-        F::Sum if matches!(call.result_ty, ColumnType::Numeric { .. }) => SlideKind::SumDec,
-        F::Avg if matches!(call.result_ty, ColumnType::Numeric { .. }) => SlideKind::Avg,
-        _ => return Ok(false),
     };
-
-    let mut count: i64 = 0; // non-NULL value count (SUM/AVG `any_seen` + AVG divisor + count(expr))
-    let mut int_sum: i128 = 0;
-    let mut dec_sum = crate::numeric::Decimal::ZERO;
-    // Monotonic deque of (pos, value) for MIN/MAX. Positions increase front-to-back, so a position
-    // leaving the frame is only ever the front.
-    let mut deque: std::collections::VecDeque<(usize, ast::Value)> =
-        std::collections::VecDeque::new();
     let mut cur_lo = 0usize; // live frame is the half-open [cur_lo, cur_hi)
     let mut cur_hi = 0usize;
-
     for k in 0..n {
         let Some((lo, hi)) = frame_at(k) else {
             // Empty frame (only ever at the ends for a ROWS frame): the empty-aggregate value.
             emit(k, finalize_aggregate(Acc::default(), call)?)?;
             continue;
         };
-        let hi_ex = hi + 1;
         // Advance the high edge: add each row entering the frame.
-        while cur_hi < hi_ex {
-            let value = value_at(cur_hi)?;
-            let is_null = matches!(value, ast::Value::Null);
-            match kind {
-                SlideKind::CountStar => {},
-                SlideKind::CountExpr => {
-                    if !is_null {
-                        count += 1;
-                    }
-                },
-                SlideKind::SumInt => {
-                    if let ast::Value::Int(i) = value {
-                        int_sum = int_sum.wrapping_add(i128::from(i));
-                        count += 1;
-                    }
-                },
-                SlideKind::SumDec | SlideKind::Avg => {
-                    if let Some(d) = value_as_decimal(&value) {
-                        dec_sum = dec_sum.checked_add(&d).ok_or_else(numeric_overflow)?;
-                        int_sum = int_sum.wrapping_add(match value {
-                            ast::Value::Int(i) => i128::from(i),
-                            _ => 0,
-                        });
-                        count += 1;
-                    }
-                },
-                SlideKind::Min => {
-                    if !is_null {
-                        while deque.back().is_some_and(|(_, v)| {
-                            eval::compare(v, &value) == std::cmp::Ordering::Greater
-                        }) {
-                            deque.pop_back();
-                        }
-                        deque.push_back((cur_hi, value));
-                    }
-                },
-                SlideKind::Max => {
-                    if !is_null {
-                        while deque.back().is_some_and(|(_, v)| {
-                            eval::compare(v, &value) == std::cmp::Ordering::Less
-                        }) {
-                            deque.pop_back();
-                        }
-                        deque.push_back((cur_hi, value));
-                    }
-                },
-            }
+        while cur_hi <= hi {
+            state.add(cur_hi, value_at(cur_hi)?)?;
             cur_hi += 1;
         }
         // Advance the low edge: remove each row leaving the frame.
         while cur_lo < lo {
-            match kind {
-                SlideKind::CountStar => {},
-                SlideKind::CountExpr => {
-                    if !matches!(value_at(cur_lo)?, ast::Value::Null) {
-                        count -= 1;
-                    }
-                },
-                SlideKind::SumInt => {
-                    if let ast::Value::Int(i) = value_at(cur_lo)? {
-                        int_sum = int_sum.wrapping_sub(i128::from(i));
-                        count -= 1;
-                    }
-                },
-                SlideKind::SumDec | SlideKind::Avg => {
-                    let value = value_at(cur_lo)?;
-                    if let Some(d) = value_as_decimal(&value) {
-                        dec_sum = dec_sum.checked_sub(&d).ok_or_else(numeric_overflow)?;
-                        int_sum = int_sum.wrapping_sub(match value {
-                            ast::Value::Int(i) => i128::from(i),
-                            _ => 0,
-                        });
-                        count -= 1;
-                    }
-                },
-                SlideKind::Min | SlideKind::Max => {
-                    if deque.front().is_some_and(|(pos, _)| *pos == cur_lo) {
-                        deque.pop_front();
-                    }
-                },
-            }
+            state.remove(cur_lo, || value_at(cur_lo))?;
             cur_lo += 1;
         }
-        let value = if matches!(kind, SlideKind::CountStar) {
-            ast::Value::Int(i64::try_from(cur_hi - cur_lo).unwrap_or(i64::MAX))
-        } else {
-            let front = deque.front().map(|(_, v)| v.clone());
-            let (min, max) = match kind {
-                SlideKind::Min => (front, None),
-                SlideKind::Max => (None, front),
-                _ => (None, None),
-            };
-            let acc = Acc {
-                count,
-                any_seen: count > 0,
-                int_sum,
-                dec_sum: Some(dec_sum),
-                min,
-                max,
-                ..Acc::default()
-            };
-            finalize_aggregate(acc, call)?
-        };
-        emit(k, value)?;
+        emit(k, state.value(cur_hi - cur_lo, call)?)?;
     }
     Ok(true)
 }
