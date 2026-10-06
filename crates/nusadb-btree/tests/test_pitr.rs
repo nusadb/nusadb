@@ -144,8 +144,10 @@ fn every_checkpoint_leaves_a_segment_and_an_image_in_the_archive() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    // Two images with their segment lists, two log segments, and the pages directory.
-    assert_eq!(names.len(), 7, "{names:?}");
+    // Two images with their segment lists, two log segments, the pages directory and the
+    // archive's format file.
+    assert_eq!(names.len(), 8, "{names:?}");
+    assert!(names.contains(&"format".to_owned()), "{names:?}");
     let mut in_pages: Vec<String> = std::fs::read_dir(h.archive.path().join("pages"))
         .unwrap()
         .map(|e| {
@@ -290,12 +292,12 @@ fn is_log(name: &str) -> bool {
 }
 
 fn archive_names(archive: &tempfile::TempDir) -> Vec<String> {
-    // The images and log segments; the pages directory and the images' segment lists are left
-    // out.
+    // The images and log segments; the pages directory, the images' segment lists and the
+    // archive's format file are left out.
     let mut names: Vec<String> = std::fs::read_dir(archive.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "pages" && !n.ends_with(".segments"))
+        .filter(|n| n != "pages" && n != "format" && !n.ends_with(".segments"))
         .collect();
     names.sort();
     names

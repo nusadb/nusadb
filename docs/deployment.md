@@ -485,13 +485,17 @@ wherever it should go. Per database:
 NUSADB_PASSWORD=... nusadb-cli --user nusadb-root -d shop -c "CHECKPOINT"
 snap=/data/snapshots/shop-$(date +%F)       # on the same file system as $DATA_DIR
 mkdir -p "$snap/btree.wal.pages"
+ln "$DATA_DIR/base/shop/btree.wal.format" "$snap/btree.wal.format"
 ln "$DATA_DIR/base/shop/btree.wal.ckpt" "$snap/btree.wal.ckpt"
 ln "$DATA_DIR/base/shop/btree.wal.pages/"*.seg "$snap/btree.wal.pages/"
 cp -r "$snap" /backups/                     # then copy it anywhere
 ```
 
 A copy that misses a segment its image names is refused when opened, naming the segment, never
-read with pages missing.
+read with pages missing. `btree.wal.format` records the data format the copy is in (see
+[Upgrades](#upgrades)), so a release too old for it refuses it instead of misreading it; the
+server writes it the first time it opens a database, so it exists for any database opened since
+the upgrade to a release that records formats.
 
 The backup holds every transaction committed before the `CHECKPOINT`; what commits afterwards is
 in the log tail only. The background checkpoint worker refreshes the image on its own as the log
@@ -504,9 +508,10 @@ and start the server. It opens the image with an empty log tail.
 
 ```bash
 rm -rf "$DATA_DIR/base/shop/btree.wal" "$DATA_DIR/base/shop/btree.wal.ckpt" \
-  "$DATA_DIR/base/shop/btree.wal.pages"
+  "$DATA_DIR/base/shop/btree.wal.pages" "$DATA_DIR/base/shop/btree.wal.format"
 cp -r /backups/shop-2026-09-26/btree.wal.pages "$DATA_DIR/base/shop/"
 cp /backups/shop-2026-09-26/btree.wal.ckpt "$DATA_DIR/base/shop/btree.wal.ckpt"
+cp /backups/shop-2026-09-26/btree.wal.format "$DATA_DIR/base/shop/btree.wal.format"
 nusadb-server --data-dir "$DATA_DIR"
 ```
 
@@ -650,9 +655,50 @@ moving that archive aside, or the two histories would meet in one archive.
 
 ## Upgrades
 
-Replace the binary (or pull a newer image tag) and restart the service; recovery replays the log, so
-a clean restart keeps every committed transaction. Read the release notes before restarting an
-existing data directory on a new version: the on-disk format may still change before 1.0. Each
-database directory records which engine wrote it, and one written by the removed `lsm` engine is
-refused rather than misread; migrate it by exporting from the last release that shipped that engine
-and reloading into a fresh `--data-dir`.
+**Upgrading.** Stop the server, back up the data directory (see
+[Backup](#checkpoints-backup-and-restore)), replace the binary (or pull a newer image tag) and start
+the server again. Recovery replays the log, so a clean restart keeps every committed transaction.
+
+**Data format.** The files of a data directory are written in a numbered data format, and every
+directory records which one:
+
+| File | Holds |
+| --- | --- |
+| `global/format` | the cluster format: the `global/` and `base/<db>/` layout and the database catalog |
+| `base/<db>/btree.wal.format` | the data format of that database: its log, checkpoint image, page segments, and page and row layouts |
+| `<archive>/<db>/format` | the data format of a `--wal-archive-dir` archive |
+
+Each file also names the release that last wrote it, for example:
+
+```text
+nusadb data format 1
+written by nusadb 0.1.0
+```
+
+On start-up the server checks the cluster format and the data format of every database before it
+opens any database or records anything, and the engine checks again when a database opens. What
+happens depends on how the recorded format compares with the one the release writes:
+
+- **The same format.** The directory opens normally.
+- **An older format.** The release upgrades it in place, one format at a time, when the database
+  opens, and records each step as it completes, so an upgrade that is interrupted resumes where it
+  stopped. Back up first: an upgraded directory cannot be opened by the older release again.
+- **A newer format** (an older binary started on data a newer one wrote). The server refuses to
+  start, names the format and the release that wrote it, and changes nothing. Start it with that
+  release or a newer one. Downgrades are not supported; to go back, restore the backup taken before
+  the upgrade.
+
+A directory written before formats were recorded has no format files; it is format 1 and is stamped
+the first time a release that records formats opens it.
+
+**When the format changes.** A release that changes how anything on disk is written, in a way an
+older release cannot read, raises the format number, and its release notes say so. Patch releases
+(`0.1.x`, and `1.x.y` after 1.0) never change the format. Before 1.0 a minor release (`0.2.0`)
+may; after 1.0 only a major release does. A new release always reads the formats of the releases
+before it, upgrading them in place, unless its release notes name a format it no longer reads; such
+a directory is then refused with a message saying so, and is moved by exporting it with a release
+that reads it (`COPY table TO STDOUT`) and loading it into a fresh `--data-dir`.
+
+A database directory written by the removed `lsm` engine is refused the same way rather than
+misread; migrate it by exporting from the last release that shipped that engine and reloading into
+a fresh `--data-dir`.

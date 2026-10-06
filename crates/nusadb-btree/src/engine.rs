@@ -1837,14 +1837,18 @@ impl BtreeEngine {
         // First, before any file of the database is read, created or removed: nobody else may
         // have it open.
         let dir_lock = lock_database(path)?;
+        // Then the data format, before anything else of the database is read: a directory written
+        // in a newer format is refused untouched (an older release would mistake log records it
+        // does not know for a torn tail and cut them off).
+        crate::format::check_format(path)?;
         let mut engine = Self::new();
         // The store holds it: it lives as long as anything can still reach the database's files.
         engine.store.hold_lock(dir_lock)?;
         engine.standby = AtomicBool::new(standby);
         engine.store.enable_spill(open_spill_file(path)?)?;
-        if let Some(dir) = &archive
-            && dir.is_dir()
-        {
+        if let Some(dir) = &archive {
+            // An archive this engine will write to records the format of what it holds.
+            crate::format::stamp_archive(dir)?;
             settle_pending_fork(dir)?;
         }
         engine.wal_archive = archive;
@@ -2288,9 +2292,11 @@ impl BtreeEngine {
         let _ = std::fs::remove_file(ckpt_path(&scratch));
         let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
         let _ = std::fs::remove_dir_all(pages_dir(&scratch));
+        remove_format_files(&scratch);
         // A restore that crashed between moving its pages into place and its image leaves
         // segments no image names.
         let _ = std::fs::remove_dir_all(pages_dir(out_wal));
+        crate::format::check_archive(archive)?;
         // A fork an earlier restore left unfinished is settled before the archive is read.
         settle_pending_fork(archive)?;
         let outcome = Self::restore_into(archive, target, &scratch, out_wal, live_log);
@@ -2302,6 +2308,7 @@ impl BtreeEngine {
             let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
             let _ = std::fs::remove_dir_all(pages_dir(&scratch));
             let _ = std::fs::remove_file(lock_path(&scratch));
+            remove_format_files(&scratch);
             let _ = settle_pending_fork(archive);
         }
         outcome
@@ -2418,6 +2425,11 @@ impl BtreeEngine {
                 sync_dir(dir)?;
             }
         }
+        // The format file before the image, so the published database never lacks it.
+        std::fs::rename(
+            crate::format::format_path(scratch),
+            crate::format::format_path(out_wal),
+        )?;
         std::fs::rename(ckpt_path(scratch), ckpt_path(out_wal))?;
         std::fs::rename(scratch, out_wal)?;
         if let Some(dir) = out_wal.parent() {
@@ -2512,7 +2524,7 @@ impl BtreeEngine {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "a flat one-arm-per-op replay dispatcher; splitting it would only scatter                   the recovery semantics"
+        reason = "a flat one-arm-per-op replay dispatcher; splitting it would only scatter the recovery semantics"
     )]
     fn replay_op(
         cat: &mut Catalog,
@@ -3110,7 +3122,7 @@ impl BtreeEngine {
     /// op records stay in the log.
     #[allow(
         clippy::too_many_lines,
-        reason = "a flat one-arm-per-undo-op inverse table; splitting it would scatter the                   compensation semantics"
+        reason = "a flat one-arm-per-undo-op inverse table; splitting it would scatter the compensation semantics"
     )]
     fn log_compensations(&self, cat: &Catalog, txn: TxnId, undone: &[UndoOp]) -> Result<()> {
         if self.wal.is_none() {
@@ -3864,7 +3876,17 @@ fn remove_leftover_scratch(path: &Path) {
     let _ = std::fs::remove_file(ckpt_path(&scratch));
     let _ = std::fs::remove_dir_all(pages_dir(&scratch));
     let _ = std::fs::remove_file(lock_path(&scratch));
+    remove_format_files(&scratch);
     let _ = std::fs::remove_file(scratch);
+}
+
+/// Remove the format file of a restore's scratch database and its scratch copy.
+fn remove_format_files(scratch: &Path) {
+    let format = crate::format::format_path(scratch);
+    let mut tmp = format.clone().into_os_string();
+    tmp.push(".tmp");
+    let _ = std::fs::remove_file(tmp);
+    let _ = std::fs::remove_file(format);
 }
 
 /// The database lock file beside the log: `<wal>.lock`.
@@ -3949,6 +3971,17 @@ fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
         CKPT_VERSION_LOGICAL => (CKPT_HEADER_CHECKSUMMED_LEN, CKPT_HEADER_LEN),
         CKPT_VERSION => (CKPT_V2_HEADER_CHECKSUMMED_LEN, CKPT_V2_HEADER_LEN),
         CKPT_VERSION_SEGMENTED => (CKPT_V3_HEADER_CHECKSUMMED_LEN, CKPT_V3_HEADER_LEN),
+        newer if newer > CKPT_VERSION_SEGMENTED => {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "nusadb-btree: checkpoint image {} is in image version {newer}, written by a \
+                     newer release; this release reads image versions {CKPT_VERSION_SEGMENTED} \
+                     and older. Open the database with the release that wrote it or a newer one",
+                    path.display()
+                ),
+            )));
+        },
         _ => return Err(corrupt("unsupported format version")),
     };
     let mut header = vec![0u8; header_len];
@@ -5033,6 +5066,7 @@ pub fn shipped_segments_after(
     archive: &Path,
     after: u64,
 ) -> Result<Vec<(u64, std::path::PathBuf)>> {
+    crate::format::check_archive(archive)?;
     let (_, segments) = list_archive_readonly(archive)?;
     Ok(segments
         .into_iter()
@@ -5076,11 +5110,14 @@ pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
             out_wal.display()
         )));
     }
+    // The seeded directory is in the archive's format; opening it upgrades it if that is older.
+    let format = crate::format::archive_format(archive)?;
     let (images, _) = list_archive_readonly(archive)?;
     for &lsn in images.iter().rev() {
         let image = archive.join(format!("{lsn:020}.ckpt"));
         if let Ok(names) = image_segment_names(&image) {
-            // The segments first: an image in place always finds them.
+            // The format, then the segments: an image in place always finds them.
+            crate::format::write_format(out_wal, format)?;
             link_segments(&archive.join(ARCHIVE_PAGES), &names, &pages_dir(out_wal))?;
             copy_file(&image, &ckpt_path(out_wal))?;
             if let Some(dir) = out_wal.parent() {
@@ -9286,7 +9323,7 @@ impl BtreeEngine {
     /// undoing transaction is still in `active` (its versions invisible) until `abort` ends it.
     #[allow(
         clippy::too_many_lines,
-        reason = "a flat one-arm-per-undo-op dispatcher; splitting it would scatter the                   rollback semantics"
+        reason = "a flat one-arm-per-undo-op dispatcher; splitting it would scatter the rollback semantics"
     )]
     fn undo_ops(&self, cat: &mut CatalogRef<'_>, txn: u64, mut ops: Vec<UndoOp>) -> Result<()> {
         let store: &PagedStore = &self.store;

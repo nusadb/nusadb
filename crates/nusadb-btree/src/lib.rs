@@ -64,6 +64,7 @@
 //! large for a leaf goes to an overflow page chain. Purge scheduling is the caller's.
 
 mod engine;
+pub mod format;
 pub mod keytree;
 pub mod mvcc;
 pub mod node;

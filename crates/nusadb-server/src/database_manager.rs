@@ -136,9 +136,16 @@ impl DatabaseManager {
         // Before anything under the data directory is read or written: no other server may be
         // running on it.
         let cluster_lock = lock_cluster(&root)?;
-        std::fs::create_dir_all(root.join("base"))?;
-
+        check_cluster_format(&root)?;
         let mut databases = load_catalog(&root)?;
+        // Every database's data format is checked now, so a release older than the data is refused
+        // at start-up rather than at the first connection to each database, and before this
+        // release records itself anywhere.
+        for name in &databases {
+            check_database_format(&database_wal(&root, legacy_root, &default_name, name))?;
+        }
+        stamp_cluster_format(&root)?;
+        std::fs::create_dir_all(root.join("base"))?;
         if let Some(cfg) = &standby {
             if legacy_root {
                 return Err(io::Error::other(
@@ -233,11 +240,7 @@ impl DatabaseManager {
     /// The WAL path for database `name` (`btree.wal`): under `base/<name>/`, or at the root for
     /// the default database under the legacy single-database layout.
     fn db_wal_path(&self, name: &str) -> PathBuf {
-        if self.legacy_root && name == self.default_name {
-            self.root.join("btree.wal")
-        } else {
-            base_dir(&self.root, name).join("btree.wal")
-        }
+        database_wal(&self.root, self.legacy_root, &self.default_name, name)
     }
 
     /// Every database opened since the server started, sorted by name, with whether it stopped
@@ -1172,6 +1175,108 @@ fn lock_cluster(root: &Path) -> io::Result<std::fs::File> {
     }
 }
 
+/// The cluster layout format this release writes: the `global/` and `base/<db>/` layout and the
+/// database catalog in `global/databases`.
+pub(crate) const CLUSTER_FORMAT_VERSION: u32 = 1;
+
+/// The text of `global/format` for this release.
+fn cluster_format_text() -> String {
+    format!(
+        "nusadb cluster format {CLUSTER_FORMAT_VERSION}\nwritten by nusadb {}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The log of database `name`: under `base/<name>/`, or at the root for the default database of a
+/// legacy single-database layout.
+fn database_wal(root: &Path, legacy_root: bool, default_name: &str, name: &str) -> PathBuf {
+    if legacy_root && name == default_name {
+        root.join("btree.wal")
+    } else {
+        base_dir(root, name).join("btree.wal")
+    }
+}
+
+/// Refuse a cluster laid out in a newer format than this release writes. A cluster with no
+/// `global/format` was laid out before the format was recorded, in format 1. Runs under the cluster
+/// lock, before anything else is read.
+fn check_cluster_format(root: &Path) -> io::Result<()> {
+    let path = root.join("global").join("format");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let mut lines = text.lines();
+            let version = lines
+                .next()
+                .and_then(|line| line.strip_prefix("nusadb cluster format "))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{} is not a cluster format file", path.display()),
+                    )
+                })?;
+            if version > CLUSTER_FORMAT_VERSION {
+                let writer = lines
+                    .next()
+                    .and_then(|line| line.strip_prefix("written by "))
+                    .unwrap_or("a newer release");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the data directory {} is in cluster format {version}, written by \
+                         {writer}; this release (nusadb {}) reads cluster format \
+                         {CLUSTER_FORMAT_VERSION} and older. Start it with the release that wrote \
+                         it or a newer one; nothing was changed",
+                        root.display(),
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                ));
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// Record this release's cluster format and version in `global/format`, once every check passed.
+fn stamp_cluster_format(root: &Path) -> io::Result<()> {
+    let path = root.join("global").join("format");
+    let text = cluster_format_text();
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        let scratch = path.with_extension("tmp");
+        std::fs::write(&scratch, &text)?;
+        std::fs::File::open(&scratch)?.sync_all()?;
+        std::fs::rename(&scratch, &path)?;
+        #[cfg(unix)]
+        std::fs::File::open(root.join("global"))?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Refuse at start-up a database whose data format is newer than this release reads; the engine
+/// repeats the check (and upgrades an older format) when the database is opened.
+fn check_database_format(wal: &Path) -> io::Result<()> {
+    let found =
+        nusadb_btree::format::read_format(wal).map_err(|e| io::Error::other(e.to_string()))?;
+    if let Some(version) = found
+        && version > nusadb_btree::format::FORMAT_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the database at {} is in data format {version}; this release (nusadb {}) reads \
+                 data format {} and older. Start the server with the release that wrote it or a \
+                 newer one; nothing was changed",
+                wal.display(),
+                env!("CARGO_PKG_VERSION"),
+                nusadb_btree::format::FORMAT_VERSION,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The cluster catalog file: `<root>/global/databases`.
 fn catalog_path(root: &Path) -> PathBuf {
     root.join("global").join("databases")
@@ -1719,6 +1824,96 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("lsm engine"), "{message}");
         assert!(message.contains("no longer ships"), "{message}");
+    }
+
+    fn try_manager(dir: &Path) -> io::Result<DatabaseManager> {
+        DatabaseManager::open(
+            dir,
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            DurabilityOptions::default(),
+        )
+    }
+
+    #[test]
+    fn a_cluster_records_its_format_and_one_in_a_newer_format_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(manager(tmp.path()));
+        let stamp = tmp.path().join("global").join("format");
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap(),
+            cluster_format_text()
+        );
+
+        std::fs::write(
+            &stamp,
+            format!(
+                "nusadb cluster format {}\nwritten by nusadb 9.0.0\n",
+                CLUSTER_FORMAT_VERSION + 1
+            ),
+        )
+        .unwrap();
+        let catalog = std::fs::read(tmp.path().join("global").join("databases")).unwrap();
+        let Err(err) = try_manager(tmp.path()) else {
+            panic!("a newer cluster format must be refused");
+        };
+        let message = err.to_string();
+        assert!(message.contains("written by nusadb 9.0.0"), "{message}");
+        assert!(message.contains("nothing was changed"), "{message}");
+        assert_eq!(
+            std::fs::read(tmp.path().join("global").join("databases")).unwrap(),
+            catalog
+        );
+    }
+
+    #[test]
+    fn a_cluster_from_before_the_format_was_recorded_is_stamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(manager(tmp.path()));
+        let stamp = tmp.path().join("global").join("format");
+        std::fs::remove_file(&stamp).unwrap();
+        drop(manager(tmp.path()));
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap(),
+            cluster_format_text()
+        );
+    }
+
+    #[test]
+    fn a_database_in_a_newer_data_format_is_refused_at_start_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let m = manager(tmp.path());
+            m.open("nusadb").unwrap();
+        }
+        let wal = base_dir(tmp.path(), "nusadb").join("btree.wal");
+        let mut name = wal.as_os_str().to_owned();
+        name.push(".format");
+        std::fs::write(
+            std::path::PathBuf::from(name),
+            format!(
+                "nusadb data format {}\nwritten by nusadb 9.0.0\n",
+                nusadb_btree::format::FORMAT_VERSION + 1
+            ),
+        )
+        .unwrap();
+        let cluster_stamp = tmp.path().join("global").join("format");
+        std::fs::write(
+            &cluster_stamp,
+            "nusadb cluster format 1\nwritten by nusadb 0.0.1\n",
+        )
+        .unwrap();
+        let Err(err) = try_manager(tmp.path()) else {
+            panic!("a database in a newer data format must be refused at start-up");
+        };
+        assert!(err.to_string().contains("data format"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&cluster_stamp).unwrap(),
+            "nusadb cluster format 1\nwritten by nusadb 0.0.1\n",
+            "a refused start-up records nothing"
+        );
     }
 
     #[test]

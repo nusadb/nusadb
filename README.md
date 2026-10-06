@@ -35,7 +35,9 @@ crash-recovery bug can be replayed from a single seed. Alongside it there's a SQ
 isolation and crash-recovery suites, and fuzz targets.
 
 Status: pre-1.0 (`0.1.0`). The engine, transactions, SQL, and the wire protocol all work, but the
-APIs and the on-disk format may still change before 1.0.
+APIs and the on-disk format may still change before 1.0. Every data directory records its format, so
+a newer release upgrades an older directory in place and an older release refuses one it cannot
+read (see [Upgrades](docs/deployment.md#upgrades)).
 
 ## Build
 

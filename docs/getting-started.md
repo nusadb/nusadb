@@ -444,7 +444,12 @@ Once any `--auth-user` is set, `nusadb-root` must be listed too or it cannot con
 
 ## Upgrading from an older data directory
 
-Each database directory records which storage engine wrote it. A directory written by the removed
+A data directory records the data format its files are written in. A newer release opens a
+directory written by an older one and upgrades it in place; an older release refuses a directory a
+newer one wrote, without changing it. Back up before upgrading; the full policy is under
+[Upgrades](deployment.md#upgrades) in the deployment guide.
+
+Each database directory also records which storage engine wrote it. A directory written by the removed
 `lsm` engine is refused at start-up rather than misread. To migrate: start the last release that
 still shipped that engine, export your data (`COPY` per table), start this release with a fresh
 `--data-dir`, and restore.
