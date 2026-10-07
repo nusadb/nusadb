@@ -220,6 +220,10 @@ pub struct BtreeEngine {
     /// so the database can later be restored to any moment those segments cover. `None` keeps
     /// no archive (the default).
     wal_archive: Option<std::path::PathBuf>,
+    /// Backups under way. While any is, a checkpoint leaves the page segments it no longer needs
+    /// on disk (the next checkpoint without one removes them), so a backup copying the segments
+    /// of an image never finds one gone. Checkpoints take it around their removal.
+    backups: Mutex<usize>,
     /// The last log position recovery accepted at open: everything durable for a plain open,
     /// the cut point for a bounded one.
     recovered_up_to: u64,
@@ -3889,6 +3893,168 @@ fn remove_format_files(scratch: &Path) {
     let _ = std::fs::remove_file(format);
 }
 
+/// What [`prune_archive`] removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Archived images removed.
+    pub images: usize,
+    /// Archived log segments removed.
+    pub logs: usize,
+    /// Page segments no remaining image reads from, removed.
+    pub page_segments: usize,
+    /// Superseded histories (left by restores) removed.
+    pub superseded: usize,
+}
+
+/// Prune a database's checkpoint archive to what a restore to any moment from `keep_from` needs.
+///
+/// `keep_from` is in milliseconds since the Unix epoch. Removed are the images before the newest
+/// image archived at or before that moment, the log segments that image already covers, the page
+/// segments no remaining image reads from, and superseded histories set aside before it. The
+/// image chosen as the base is never removed, so the archive always holds one to restore from. An image's
+/// moment is when it was archived (its file's modification time).
+///
+/// Run it while no restore uses the archive. Checkpoints may keep archiving meanwhile: the page
+/// segments are listed before the segment lists are read, every list present keeps what it names
+/// (the list of an image being archived included), and a list is durable before any segment it
+/// names is linked in, so a segment an image is about to name is never removed. A
+/// standby following the archive must have applied the removed log segments, or it stops and has
+/// to be seeded again.
+///
+/// # Errors
+/// Refused while a restore's fork of the archive is unfinished, or for an archive in a newer
+/// data format; propagates I/O errors.
+pub fn prune_archive(archive: &Path, keep_from: u64) -> Result<PruneStats> {
+    crate::format::check_archive(archive)?;
+    if PendingFork::read(archive)?.is_some() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "nusadb-btree: a restore's fork of {} is unfinished; it is settled when a \
+                 database opens with the archive, and the archive can be pruned after that",
+                archive.display()
+            ),
+        )));
+    }
+    let mut stats = PruneStats::default();
+    let (images, segments) = list_archive_readonly(archive)?;
+    let archived_at = |path: &Path| -> Result<u64> {
+        let modified = std::fs::metadata(path)?.modified()?;
+        Ok(modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)))
+    };
+    let mut base = None;
+    for &lsn in &images {
+        if archived_at(&archive.join(format!("{lsn:020}.ckpt")))? <= keep_from {
+            base = Some(lsn);
+        }
+    }
+    if let Some(base) = base {
+        for &lsn in images.iter().filter(|&&lsn| lsn < base) {
+            std::fs::remove_file(archive.join(format!("{lsn:020}.ckpt")))?;
+            let _ = std::fs::remove_file(archive.join(format!("{lsn:020}.segments")));
+            stats.images += 1;
+        }
+        // A log segment `<lsn>.log` holds the records up to `lsn`; the base image holds them all.
+        for &lsn in segments.iter().filter(|&&lsn| lsn <= base) {
+            std::fs::remove_file(archive.join(format!("{lsn:020}.log")))?;
+            stats.logs += 1;
+        }
+        sync_dir(archive)?;
+    }
+    // Page segments: list the files first, then what the remaining images read from.
+    let pages = archive.join(ARCHIVE_PAGES);
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&pages) {
+        for entry in entries {
+            let path = entry?.path();
+            if let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".seg"))
+                .filter(|n| is_segment_name(n))
+            {
+                files.push((name.to_owned(), path));
+            }
+        }
+    }
+    // Every segment list in the archive keeps what it names, including the list of an image a
+    // checkpoint is archiving right now: its list and segments are in place before its image.
+    // A list below the base with no image of its own is what a checkpoint that stopped before
+    // archiving its image left; it names nothing a restore can reach.
+    let mut keep: HashSet<String> = HashSet::new();
+    let (remaining, _) = list_archive_readonly(archive)?;
+    for entry in std::fs::read_dir(archive)? {
+        let path = entry?.path();
+        let Some(lsn) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".segments"))
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if base.is_some_and(|base| lsn < base) && !remaining.contains(&lsn) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        keep.extend(std::fs::read_to_string(&path)?.lines().map(str::to_owned));
+    }
+    for lsn in remaining {
+        // An image archived before segment lists were kept: read its names from the image.
+        if !archive.join(format!("{lsn:020}.segments")).exists() {
+            keep.extend(image_segment_names(
+                &archive.join(format!("{lsn:020}.ckpt")),
+            )?);
+        }
+    }
+    for (name, path) in files {
+        if !keep.contains(&name) {
+            std::fs::remove_file(path)?;
+            stats.page_segments += 1;
+        }
+    }
+    if stats.page_segments > 0 {
+        sync_dir(&pages)?;
+    }
+    // Histories a restore set aside, once older than the window.
+    for entry in std::fs::read_dir(archive)? {
+        let path = entry?.path();
+        let superseded = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("superseded-"));
+        if superseded && path.is_dir() && archived_at(&path)? <= keep_from {
+            std::fs::remove_dir_all(&path)?;
+            stats.superseded += 1;
+        }
+    }
+    Ok(stats)
+}
+
+/// What [`BtreeEngine::backup_into`] copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// The log position the copied image covers.
+    pub covered_lsn: u64,
+    /// When the last transaction the image holds committed, if it holds one.
+    pub image_unix_ms: Option<u64>,
+    /// How many page segments the copy reads from.
+    pub segments: usize,
+}
+
+/// Releases a backup's pin on the page segments when dropped.
+struct BackupPin<'a>(&'a Mutex<usize>);
+
+impl Drop for BackupPin<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut backups) = self.0.lock() {
+            *backups = backups.saturating_sub(1);
+        }
+    }
+}
+
 /// The database lock file beside the log: `<wal>.lock`.
 fn lock_path(wal: &Path) -> std::path::PathBuf {
     let mut path = wal.as_os_str().to_owned();
@@ -4881,6 +5047,92 @@ impl BtreeEngine {
         self.checkpoint_stamped(unix_time_ms())
     }
 
+    /// Copy this database, as of its newest checkpoint image, to the database at `out_wal`: the
+    /// image, the page segments it reads from and the data format file, which is everything a
+    /// database needs to open. Nothing of the live database is changed and no transaction waits.
+    /// `out_wal`'s directory must hold no database yet.
+    ///
+    /// The segments are hard links where the file system allows (a segment is never rewritten)
+    /// and copies otherwise; the image is copied through a handle opened before anything else,
+    /// so a checkpoint publishing a newer image meanwhile cannot change it, and the segments it
+    /// reads from stay on disk until the copy is done. What committed after that image is in
+    /// the log only and is not part of the copy; checkpoint first for a copy that is current.
+    ///
+    /// # Errors
+    /// Refused for the in-memory engine, for a database with no checkpoint image yet, and when
+    /// `out_wal` already holds a database; propagates I/O errors.
+    pub fn backup_into(&self, out_wal: &Path) -> Result<BackupInfo> {
+        let refuse =
+            |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+        let Some(wal_mutex) = &self.wal else {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "nusadb-btree: the in-memory engine has nothing on disk to back up",
+            )));
+        };
+        let wal = wal_mutex.lock().map_err(|_| poisoned())?.path.clone();
+        if out_wal.exists() || ckpt_path(out_wal).exists() {
+            return Err(refuse(format!(
+                "nusadb-btree: {} already holds a database; back up into an empty directory",
+                out_wal.display()
+            )));
+        }
+        if let Some(dir) = out_wal.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Pin the segments first, then open the image: whichever image is newest by then, its
+        // segments stay until the pin is released.
+        *self.backups.lock().map_err(|_| poisoned())? += 1;
+        let release = BackupPin(&self.backups);
+        let mut image = match File::open(ckpt_path(&wal)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(refuse(format!(
+                    "nusadb-btree: the database at {} has no checkpoint image yet; run a \
+                     checkpoint first",
+                    wal.display()
+                )));
+            },
+            Err(e) => return Err(e.into()),
+        };
+        let scratch = ckpt_tmp_path(out_wal);
+        let copied: Result<BackupInfo> = (|| {
+            {
+                let mut out = File::create(&scratch)?;
+                std::io::copy(&mut image, &mut out)?;
+                out.sync_all()?;
+            }
+            let contents = read_checkpoint_image(&scratch)?;
+            let names = match &contents.pages {
+                Some(ImagePages {
+                    layout: PageLayout::Segments { names, .. },
+                    ..
+                }) => names.clone(),
+                _ => Vec::new(),
+            };
+            link_segments(&pages_dir(&wal), &names, &pages_dir(out_wal))?;
+            crate::format::write_format(out_wal, crate::format::FORMAT_VERSION)?;
+            std::fs::rename(&scratch, ckpt_path(out_wal))?;
+            if let Some(dir) = out_wal.parent().filter(|d| !d.as_os_str().is_empty()) {
+                sync_dir(dir)?;
+            }
+            Ok(BackupInfo {
+                covered_lsn: contents.covered_lsn,
+                image_unix_ms: image_commit_time(&contents.records),
+                segments: names.len(),
+            })
+        })();
+        drop(release);
+        if copied.is_err() {
+            let _ = std::fs::remove_file(&scratch);
+            let _ = std::fs::remove_dir_all(pages_dir(out_wal));
+            let _ = std::fs::remove_file(crate::format::format_path(out_wal));
+        }
+        copied
+    }
+
     /// [`checkpoint`](Self::checkpoint) with the image's commit marker stamped `stamp` rather
     /// than the clock: the time of the state the image holds, when that is not now.
     #[allow(
@@ -5022,8 +5274,13 @@ impl BtreeEngine {
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
         file.sync_all()?;
-        // Segments neither this image nor the one it replaced reads from are garbage now.
-        remove_unreferenced_segments(&dir, names.iter().chain(replaced.iter()));
+        // Segments neither this image nor the one it replaced reads from are garbage now, unless
+        // a backup is copying them.
+        let backups = self.backups.lock().map_err(|_| poisoned())?;
+        if *backups == 0 {
+            remove_unreferenced_segments(&dir, names.iter().chain(replaced.iter()));
+        }
+        drop(backups);
         Ok(())
     }
 }
@@ -10116,5 +10373,50 @@ mod tests {
         assert_eq!(tuple.as_ref(), &[1]);
         assert!(scan.try_next().unwrap().is_none());
         engine.commit(reader).unwrap();
+    }
+
+    /// While a backup holds its pin, a checkpoint leaves the segments it no longer needs on
+    /// disk; the first checkpoint after the pin is released removes them.
+    #[test]
+    fn a_backup_pin_keeps_replaced_segments_until_it_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("btree.wal");
+        let engine = BtreeEngine::open(&wal).unwrap();
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let table = engine.create_table(txn, &t_def()).unwrap();
+        let tid = engine.insert(txn, table, &[0; 400]).unwrap();
+        engine.commit(txn).unwrap();
+        engine.checkpoint().unwrap();
+        let segments = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(pages_dir(&wal))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let first = segments();
+        // Rewrite the row and checkpoint until the first image's segments are no longer read.
+        let rewrite = |n: u8| {
+            let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+            engine.update(txn, table, tid, &[n; 400]).unwrap();
+            engine.commit(txn).unwrap();
+            engine.checkpoint().unwrap();
+        };
+        *engine.backups.lock().unwrap() += 1;
+        let pin = BackupPin(&engine.backups);
+        for n in 1..6 {
+            rewrite(n);
+        }
+        let pinned = segments();
+        assert!(
+            first.iter().all(|name| pinned.contains(name)),
+            "a pinned segment was removed: {first:?} -> {pinned:?}"
+        );
+        drop(pin);
+        rewrite(9);
+        rewrite(10);
+        let after = segments();
+        assert!(after.len() < pinned.len(), "{pinned:?} -> {after:?}");
     }
 }

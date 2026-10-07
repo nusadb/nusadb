@@ -45,6 +45,10 @@ the database.
 | `--checkpoint-threshold-bytes` | `67108864` (64 MiB) | Log length past which the background checkpoint worker folds a database's log into a fresh image and truncates it. `0` disables the worker. |
 | `--checkpoint-interval` | `5` | Seconds between the checkpoint worker's checks of each database's log. `0` disables the worker. |
 | `--wal-archive-dir` | none | Archive every checkpoint's log segment and image under this directory, one subdirectory per database, for point-in-time recovery. |
+| `--wal-archive-retain` | `0` | Prune the archive hourly to what a restore to any moment in the last this many seconds needs (see [Point-in-time recovery](#point-in-time-recovery)). `0` keeps everything. |
+| `--backup-dir` | none | Take a backup of every database into this directory on a schedule (see [Scheduled backups](#scheduled-backups)). |
+| `--backup-interval` | `86400` | Seconds between scheduled backups; the first is taken one interval after start-up. |
+| `--backup-keep` | `7` | How many complete scheduled backups to keep; older ones are removed after each new one. |
 | `--restore-database` / `--restore-to-time` / `--restore-to-lsn` / `--restore-live-log` | none | Offline: rebuild one database from its archive as of a moment or a log position, then exit. See [Point-in-time recovery](#point-in-time-recovery). |
 | `--checkpoint-max-pause` | `2` | Once the log is past its threshold and three checks in a row found transactions active, hold new transactions for at most this many seconds (capped at 60) so the checkpoint can run. `0` never pauses. |
 | `--metrics-listen` | none | Serve Prometheus metrics on this address, for example `127.0.0.1:9100`. |
@@ -397,8 +401,13 @@ The endpoint is unauthenticated, so bind it to a private address.
 | `nusadb_queries_total` | counter | statements executed |
 | `nusadb_query_errors_total` | counter | statements that returned an error |
 | `nusadb_database_stopped{database="..."}` | gauge | `1` once that database has stopped after a storage error, `0` while it serves; listed for each database opened since start |
+| `nusadb_backup_last_success_timestamp_seconds` | gauge | when the last scheduled backup completed (`0` before the first) |
+| `nusadb_backup_last_duration_seconds` | gauge | how long the last completed backup took |
+| `nusadb_backup_failures_total` | counter | scheduled backups that failed |
+| `nusadb_archive_prune_failures_total` | counter | archive prunes that failed |
 
-Alert on `nusadb_database_stopped == 1`: a stopped database refuses every statement until the
+With scheduled backups on, alert when `time() - nusadb_backup_last_success_timestamp_seconds`
+exceeds about twice `--backup-interval`. Alert on `nusadb_database_stopped == 1`: a stopped database refuses every statement until the
 server restarts (see "When a storage error interrupts a change" under
 [Checkpoints, backup and restore](#checkpoints-backup-and-restore)).
 The rest is enough to see whether the server is up and busy, and not enough for latency analysis:
@@ -518,7 +527,54 @@ nusadb-server --data-dir "$DATA_DIR"
 A `btree.wal` left in place would be replayed on top of the image, which is not a restore. For a
 whole-cluster copy with the server stopped, archive the `--data-dir` tree and extract it in place.
 Logical export with `COPY table TO STDOUT` and reload with `COPY table FROM STDIN` remains
-available. There is no built-in scheduled backup or replication.
+available.
+
+### Scheduled backups
+
+With `--backup-dir DIR`, the server backs up every database every `--backup-interval` seconds
+and keeps the newest `--backup-keep`. Each backup is a directory named for its moment in UTC,
+laid out like a data directory:
+
+```text
+DIR/20261007T020000Z/
+  BACKUP                      manifest: release, moment, and per database its log position and image time
+  global/databases            the cluster catalog
+  global/format               the cluster format
+  base/<db>/btree.wal.ckpt    each database's checkpoint image,
+  base/<db>/btree.wal.pages/  the page segments it reads from,
+  base/<db>/btree.wal.format  and its data format
+```
+
+For each database the server first takes a checkpoint, holding new transactions for at most
+`--checkpoint-max-pause` seconds so the running ones end, and then copies the image it just
+published, so the backup holds everything committed up to that moment. If a transaction stays
+open past the pause, the backup copies the last image instead and the log says how old it is.
+Taking a backup does not stop the server or block queries: page segments are hard-linked where
+`DIR` is on the same file system as the data directory (milliseconds, and no extra space until
+the database changes) and copied otherwise, and a checkpoint that runs meanwhile leaves the
+segments being copied in place. Databases are copied one after another, so each is consistent on
+its own, not as of one moment across databases.
+
+A backup is built under `DIR/.partial-<moment>` and renamed to its final name only once complete,
+so a directory with a moment name always holds a whole backup; a backup that fails (logged, and
+counted in `nusadb_backup_failures_total`) leaves nothing behind and is tried again at the next
+interval. Nothing else in `DIR` is touched, so `DIR` can be synchronised elsewhere as it is. A
+backup opens every database it copies (a database is otherwise opened by its first connection),
+and `DROP DATABASE` of a database being copied waits for the copy and reports it is in use if
+it does not finish in time.
+
+**Restoring a scheduled backup.** Stop the server and copy the backup into an empty data
+directory, then start the server on it:
+
+```bash
+cp -a "$BACKUP_DIR/20261007T020000Z" /data/nusadb-restored
+rm /data/nusadb-restored/BACKUP
+nusadb-server --data-dir /data/nusadb-restored
+```
+
+To restore one database only, place its `base/<db>/` files as under [Restore](#checkpoints-backup-and-restore)
+above. A backup holds what was committed when it was taken; with `--wal-archive-dir` as well, a
+point-in-time restore reaches any later moment the archive covers.
 
 ### Point-in-time recovery
 
@@ -528,9 +584,18 @@ truncates the log: `<lsn>.log`, the log segment it folded (every record up to lo
 under `DIR/<database>/pages/` and their names, one per line, in `<lsn>.segments`; files are
 linked rather than copied where the file system allows. The archive therefore holds a base image
 plus an unbroken chain of log segments, and every commit record carries the moment it committed.
-Prune old images (with their `.segments` lists) and the log segments before them once you no
-longer need to restore that far back; keep the newest image and everything after it. Then remove
-a page segment only when no `.segments` list left in `DIR/<database>/` names it:
+With `--wal-archive-retain SECONDS`, the server prunes the archive at start-up and then every
+hour to what a restore to any moment in that window needs: for each database it keeps the newest
+image archived before the window and everything after it, and removes the older images, the log
+segments that image covers, the page segments no remaining image reads from, the `superseded-*`
+histories set aside before the window, and the archives of databases dropped before it. An
+image's moment is when it was archived. A standby following the archive must stay within the
+window: if it has not applied a segment that is pruned, it stops and has to be seeded again.
+
+Without the flag the archive keeps everything. To prune by hand, remove old images (with their
+`.segments` lists) and the log segments before them once you no longer need to restore that far
+back; keep the newest image and everything after it. Then remove a page segment only when no
+`.segments` list left in `DIR/<database>/` names it:
 
 ```bash
 set -e

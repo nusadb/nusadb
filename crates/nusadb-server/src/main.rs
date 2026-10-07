@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::time::Duration;
 
+mod backup;
 mod database_manager;
 mod tuning;
 
@@ -240,6 +241,28 @@ struct Args {
     #[arg(long, conflicts_with_all = ["restore_database", "wal_archive_dir"])]
     standby_from: Option<String>,
 
+    /// Take a backup of every database into this directory on a schedule: each backup is a
+    /// directory named for its UTC moment, laid out like a data directory, built under a
+    /// `.partial-` name and renamed only once complete. Unset takes no scheduled backups.
+    #[arg(long)]
+    backup_dir: Option<String>,
+
+    /// Time between scheduled backups, in seconds (the first one is taken one interval after
+    /// start-up). Defaults to a day.
+    #[arg(long, default_value_t = 86_400, requires = "backup_dir")]
+    backup_interval: u64,
+
+    /// How many complete backups to keep; older ones are removed after each new one. Defaults
+    /// to 7.
+    #[arg(long, default_value_t = 7, requires = "backup_dir")]
+    backup_keep: usize,
+
+    /// Prune the checkpoint archive hourly to what a restore to any moment in the last this many
+    /// seconds needs, and remove the archives of databases dropped before then. `0` (the
+    /// default) keeps the whole archive.
+    #[arg(long, default_value_t = 0, requires = "wal_archive_dir")]
+    wal_archive_retain: u64,
+
     /// How often (seconds) a standby looks for new archived segments. Defaults to 5 seconds.
     #[arg(long, default_value_t = 5, requires = "standby_from")]
     standby_poll: u64,
@@ -456,12 +479,34 @@ fn build_auth(pairs: &[String]) -> Result<Option<Arc<AuthStore>>, Box<dyn std::e
     Ok(Some(Arc::new(AuthStore::from_passwords(creds)?)))
 }
 
+/// Start the scheduled backups and archive pruning the `--backup-*` and `--wal-archive-retain`
+/// flags ask for, returning the status the metrics endpoint reports.
+fn spawn_backups(
+    args: &Args,
+    manager: &Arc<database_manager::DatabaseManager>,
+) -> Arc<backup::BackupStatus> {
+    let status = Arc::new(backup::BackupStatus::default());
+    backup::spawn(
+        Arc::clone(manager),
+        args.backup_dir.as_ref().map(|dir| backup::BackupConfig {
+            dir: std::path::PathBuf::from(dir),
+            interval: Duration::from_secs(args.backup_interval.max(1)),
+            keep: args.backup_keep.max(1),
+            max_pause: Duration::from_secs(args.checkpoint_max_pause),
+        }),
+        (args.wal_archive_retain > 0).then(|| Duration::from_secs(args.wal_archive_retain)),
+        Arc::clone(&status),
+    );
+    status
+}
+
 /// A tiny Prometheus scrape endpoint: respond to any request with the current metrics in the text
 /// exposition format. Runs until the task is aborted (on server shutdown).
 async fn serve_metrics(
     listener: TcpListener,
     metrics: std::sync::Arc<Metrics>,
     manager: std::sync::Arc<database_manager::DatabaseManager>,
+    backups: std::sync::Arc<backup::BackupStatus>,
 ) {
     loop {
         let mut socket = match listener.accept().await {
@@ -476,6 +521,7 @@ async fn serve_metrics(
         };
         let metrics = std::sync::Arc::clone(&metrics);
         let manager = std::sync::Arc::clone(&manager);
+        let backups = std::sync::Arc::clone(&backups);
         tokio::spawn(async move {
             // Bound the whole exchange with a timeout: an unauthenticated client that connects
             // and never finishes sending (slowloris) must not park this task — and leak the socket /
@@ -487,6 +533,7 @@ async fn serve_metrics(
                 let _ = socket.read(&mut scratch).await;
                 let mut body = metrics.render_prometheus();
                 body.push_str(&render_database_health(&manager.database_health()));
+                body.push_str(&backups.render());
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -783,6 +830,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let manager = Arc::new(manager);
+    let backup_status = spawn_backups(&args, &manager);
     let cluster: Arc<dyn nusadb_wire::DatabaseCluster> = manager.clone();
     tracing::info!(
         data_dir = %args.data_dir,
@@ -856,6 +904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics_listener,
                 Arc::clone(&metrics),
                 Arc::clone(&manager),
+                Arc::clone(&backup_status),
             )))
         },
         None => None,

@@ -217,6 +217,51 @@ impl DatabaseManager {
             .then(|| self.db_wal_path(name))
     }
 
+    /// The root of the checkpoint archive (`--wal-archive-dir`), one subdirectory per database.
+    pub(crate) fn archive_root(&self) -> Option<&Path> {
+        self.wal_archive.as_deref()
+    }
+
+    /// The data directory this cluster lives in.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Every registered database name, sorted.
+    pub(crate) fn database_names(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|s| s.databases.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The engine of database `name`, opened if it is not yet, with its log's path relative to the
+    /// data directory; `None` when no such database is registered.
+    pub(crate) fn engine_with_path(
+        &self,
+        name: &str,
+    ) -> io::Result<Option<(Arc<BtreeEngine>, PathBuf)>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("database manager state poisoned"))?;
+        if !state.databases.contains(name) {
+            return Ok(None);
+        }
+        self.engine_for(&mut state, name)?;
+        let engine = state
+            .health
+            .get(name)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| io::Error::other(format!("database {name} closed while opening")))?;
+        drop(state);
+        let wal = self.db_wal_path(name);
+        let relative = wal
+            .strip_prefix(&self.root)
+            .map_or_else(|_| wal.clone(), Path::to_path_buf);
+        Ok(Some((engine, relative)))
+    }
+
     /// Move the archive directory of `name`, if any, to `<name>.dropped-<moment>` beside it.
     fn set_archive_aside(&self, name: &str) -> Result<(), ClusterError> {
         let Some(archive) = self.archive_dir(name) else {
@@ -695,7 +740,7 @@ const fn should_pause(
 /// What one checkpoint tick observed and did. Separated from the thread loop so the policy is
 /// testable synchronously against a real engine.
 #[derive(Debug)]
-enum CheckpointTick {
+pub(crate) enum CheckpointTick {
     /// The engine has no durable log (in-memory); nothing to bound, the scheduler can stop.
     NoLog,
     /// The log is still under the threshold; nothing done.
@@ -733,7 +778,7 @@ enum CheckpointTick {
 /// One policy evaluation: read the log length and checkpoint if it is past `threshold_bytes`.
 /// It never invents a second durability path: the only write it can cause is the engine's own
 /// gated `checkpoint()`, whose refusal is the safe outcome.
-fn checkpoint_tick(
+pub(crate) fn checkpoint_tick(
     engine: &BtreeEngine,
     threshold_bytes: u64,
     pause: Option<Duration>,
