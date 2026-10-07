@@ -5052,10 +5052,10 @@ impl BtreeEngine {
     /// database needs to open. Nothing of the live database is changed and no transaction waits.
     /// `out_wal`'s directory must hold no database yet.
     ///
-    /// The segments are hard links where the file system allows (a segment is never rewritten)
-    /// and copies otherwise; the image is copied through a handle opened before anything else,
-    /// so a checkpoint publishing a newer image meanwhile cannot change it, and the segments it
-    /// reads from stay on disk until the copy is done. What committed after that image is in
+    /// The image and its segments are hard links where the file system allows (neither is ever
+    /// rewritten: an image is only replaced by a rename) and copies otherwise, so a checkpoint
+    /// publishing a newer image meanwhile cannot change the copy, and the segments it reads from
+    /// stay on disk until the copy is done. What committed after that image is in
     /// the log only and is not part of the copy; checkpoint first for a copy that is current.
     ///
     /// # Errors
@@ -5082,24 +5082,31 @@ impl BtreeEngine {
         {
             std::fs::create_dir_all(dir)?;
         }
-        // Pin the segments first, then open the image: whichever image is newest by then, its
-        // segments stay until the pin is released.
+        // Pin the segments first, then link (or copy) the image: whichever image is newest by
+        // then, its segments stay until the pin is released.
         *self.backups.lock().map_err(|_| poisoned())? += 1;
         let release = BackupPin(&self.backups);
-        let mut image = match File::open(ckpt_path(&wal)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(refuse(format!(
-                    "nusadb-btree: the database at {} has no checkpoint image yet; run a \
-                     checkpoint first",
-                    wal.display()
-                )));
-            },
-            Err(e) => return Err(e.into()),
-        };
+        if !ckpt_path(&wal).exists() {
+            return Err(refuse(format!(
+                "nusadb-btree: the database at {} has no checkpoint image yet; run a checkpoint \
+                 first",
+                wal.display()
+            )));
+        }
         let scratch = ckpt_tmp_path(out_wal);
+        // Never write through a leftover scratch file: it may be a link to a live image.
+        match std::fs::remove_file(&scratch) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.into()),
+        }
         let copied: Result<BackupInfo> = (|| {
-            {
+            // An image is only ever replaced by a rename, never rewritten, so a hard link is a
+            // stable copy of whichever image is current, and holds no handle a checkpoint's rename
+            // could trip over (a platform may refuse to replace an open file). Across file
+            // systems the image is copied instead.
+            if std::fs::hard_link(ckpt_path(&wal), &scratch).is_err() {
+                let mut image = File::open(ckpt_path(&wal))?;
                 let mut out = File::create(&scratch)?;
                 std::io::copy(&mut image, &mut out)?;
                 out.sync_all()?;

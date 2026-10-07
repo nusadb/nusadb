@@ -373,3 +373,36 @@ fn pruning_keeps_what_an_image_being_archived_names() {
     assert!(!left.contains(&format!("{:020}.segments", 1)), "{left:?}");
     assert!(left.contains(&format!("{:020}.segments", 3)), "{left:?}");
 }
+
+/// A backup's scratch image left by an earlier, interrupted backup may be a hard link to the live
+/// image; a new backup into the same place never writes through it.
+#[test]
+fn a_leftover_scratch_link_to_the_live_image_is_never_written_through() {
+    let live = tempfile::tempdir().unwrap();
+    let wal = live.path().join("btree.wal");
+    let engine = BtreeEngine::open(&wal).unwrap();
+    let table = create(&engine);
+    insert(&engine, table, 0, 40);
+    engine.checkpoint().unwrap();
+    let image = live.path().join("btree.wal.ckpt");
+    let before = std::fs::read(&image).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let copy = out.path().join("btree.wal");
+    std::fs::hard_link(&image, out.path().join("btree.wal.ckpt.tmp")).unwrap();
+    engine.backup_into(&copy).unwrap();
+    assert_eq!(
+        std::fs::read(&image).unwrap(),
+        before,
+        "the live image changed"
+    );
+    drop(engine);
+    assert_eq!(
+        numbers(&BtreeEngine::open(&wal).unwrap()),
+        (0..40).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        numbers(&BtreeEngine::open(&copy).unwrap()),
+        (0..40).collect::<Vec<_>>()
+    );
+}
