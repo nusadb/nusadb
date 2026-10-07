@@ -21,7 +21,7 @@ use nusadb_core::{IsolationLevel, StorageEngine, TableSchema, TxnId};
 use nusadb_sql::ast::Value;
 use nusadb_sql::{
     Catalog, ExecutionResult, INTERNAL_ERROR, IndexInfo, RowSink, RowsCommand, StreamOutcome,
-    analyze, bind_parameters, describe_column_types, describe_columns,
+    analyze, bind_parameters_typed, describe_column_types, describe_columns,
     execute_in_txn_as_streaming_with_settings, execute_in_txn_as_with_settings, parameter_count,
     parse, plan, show_session_variable,
 };
@@ -822,7 +822,8 @@ where
     // `Describe`/`Execute` lazily run the portal once (caching its result) and stream it, and
     // `Sync` ends the pipeline with `ReadyForQuery`. After an error the server skips messages until
     // the next `Sync` (skip-until-Sync error semantics), tracked by `failed`.
-    let mut statements: HashMap<String, String> = HashMap::new();
+    // Each prepared statement's SQL and the parameter type tags its `Parse` declared.
+    let mut statements: HashMap<String, (String, Vec<u8>)> = HashMap::new();
     let mut portals: HashMap<String, Portal> = HashMap::new();
     let mut failed = false;
     // Explicit-transaction state across statements on this connection (transaction-over-wire). The
@@ -1020,7 +1021,7 @@ where
                         &cluster,
                         &database,
                         sql,
-                        &[], // simple query: no bound parameters
+                        &BoundParams::default(), // simple query: no bound parameters
                         user.clone(),
                         Arc::clone(&cancel_token),
                         statement_timeout,
@@ -1079,11 +1080,15 @@ where
                     .await?;
                 idle = true;
             },
-            FrontendMessage::Parse { name, sql, .. } => {
+            FrontendMessage::Parse {
+                name,
+                sql,
+                param_types,
+            } => {
                 if failed {
                     continue;
                 }
-                statements.insert(name, sql);
+                statements.insert(name, (sql, param_types));
                 conn.write_frame(&BackendMessage::ParseComplete.encode()?)
                     .await?;
             },
@@ -1096,12 +1101,15 @@ where
                 if failed {
                     continue;
                 }
-                if let Some(sql) = statements.get(&statement) {
+                if let Some((sql, types)) = statements.get(&statement) {
                     portals.insert(
                         portal,
                         Portal {
                             sql: sql.clone(),
-                            params,
+                            params: BoundParams {
+                                values: params,
+                                types: types.clone(),
+                            },
                             result_formats,
                             result: None,
                         },
@@ -1119,7 +1127,7 @@ where
                 }
                 match target {
                     DescribeTarget::Statement => {
-                        if let Some(sql) = statements.get(&name) {
+                        if let Some((sql, _)) = statements.get(&name) {
                             // Report the real number of `$n` placeholders, not a hard-coded 0.
                             // A statement that fails to parse describes as 0 params — its parse
                             // error surfaces later at Execute. Row metadata stays per-portal (NoData).
@@ -1751,12 +1759,35 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// A portal's `$n` parameter values as `Bind` supplied them, with the type tags the statement's
+/// `Parse` declared (empty when it declared none, so each value's type is inferred from its text).
+#[derive(Debug, Clone, Default)]
+struct BoundParams {
+    values: Vec<Option<Vec<u8>>>,
+    types: Vec<u8>,
+}
+
+impl BoundParams {
+    /// Substitute the values into `stmt`'s placeholders, each bound as its declared type.
+    fn bind(
+        &self,
+        stmt: nusadb_sql::ast::Statement,
+    ) -> Result<nusadb_sql::ast::Statement, nusadb_sql::Error> {
+        bind_parameters_typed(stmt, &self.values, &self.types)
+    }
+
+    /// Whether no parameter is bound.
+    const fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
 /// A bound portal: the resolved SQL, its bound parameters, and its lazily-executed result.
 struct Portal {
     /// SQL resolved from the prepared statement at `Bind` time.
     sql: String,
-    /// Wire-format `$n` parameter values supplied by `Bind`.
-    params: Vec<Option<Vec<u8>>>,
+    /// The `$n` parameter values `Bind` supplied, with their declared types.
+    params: BoundParams,
     /// Per-column result format codes from `Bind`: `0` = text, `1` = binary. Empty = all
     /// text; a single entry applies to every column.
     result_formats: Vec<u16>,
@@ -1811,7 +1842,7 @@ async fn run_blocking(
     cluster: &Arc<dyn DatabaseCluster>,
     database: &str,
     sql: String,
-    params: Vec<Option<Vec<u8>>>,
+    params: BoundParams,
     user: String,
     cancel: nusadb_sql::cancel::CancelToken,
     statement_timeout: Option<Duration>,
@@ -1892,7 +1923,7 @@ async fn describe_portal(
     let acting_user = acting_user.to_owned();
     let settings = settings.clone();
     tokio::task::spawn_blocking(move || {
-        let stmt = bind_parameters(parse(&sql)?, &params)?;
+        let stmt = params.bind(parse(&sql)?)?;
         // Describe resolves the row shape without running the statement, but analysis still
         // needs a transaction to resolve schema visibility. Use a short read-only
         // transaction and roll it back — Describe must have no side effects. The **acting** user
@@ -3002,8 +3033,8 @@ async fn stream_query_to_conn<S>(
     database: &str,
     sql: String,
     // Bound `$n` parameters. Empty for the simple-query path; the extended-query (portal) path passes
-    // the values `Bind` supplied. `bind_parameters` accepts the wire-format bytes directly.
-    params: &[Option<Vec<u8>>],
+    // the values `Bind` supplied, which `BoundParams::bind` binds as their declared types.
+    params: &BoundParams,
     user: String,
     cancel: nusadb_sql::cancel::CancelToken,
     statement_timeout: Option<Duration>,
@@ -3028,7 +3059,7 @@ where
     // Parse on the reactor (pure CPU, microseconds) — the parse error path writes its response
     // here exactly as the blocking path used to after the join, and the parsed statement drives
     // the inline gate below.
-    let stmt = match parse(&sql).and_then(|s| bind_parameters(s, params)) {
+    let stmt = match parse(&sql).and_then(|s| params.bind(s)) {
         Ok(stmt) => stmt,
         Err(e) => {
             conn.write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
@@ -3107,7 +3138,7 @@ where
                     // Reachable: the `from_less` gate keeps no backup, and a serialization
                     // conflict punts from either gate. Re-parsing is the fallback — do NOT turn
                     // this arm into a panic on the assumption that only point-gets punt.
-                    None => match parse(&sql).and_then(|s| bind_parameters(s, params)) {
+                    None => match parse(&sql).and_then(|s| params.bind(s)) {
                         Ok(stmt) => stmt,
                         Err(e) => {
                             conn.write_frame(
@@ -3785,13 +3816,13 @@ fn run_query_txn(
     cluster: &dyn DatabaseCluster,
     database: &str,
     sql: &str,
-    params: &[Option<Vec<u8>>],
+    params: &BoundParams,
     user: &str,
     state: TxnState,
     settings: &std::sync::Mutex<HashMap<String, String>>,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     use nusadb_sql::ast::Statement;
-    let mut stmt = match parse(sql).and_then(|s| bind_parameters(s, params)) {
+    let mut stmt = match parse(sql).and_then(|s| params.bind(s)) {
         Ok(stmt) => stmt,
         Err(e) => return (Err(e), state),
     };

@@ -161,7 +161,7 @@ pub enum FrontendMessage {
         name: String,
         /// SQL text of the statement.
         sql: String,
-        /// Declared parameter type tags, in order (currently always empty).
+        /// Declared parameter type tags, in placeholder order (§9.2 tags; empty or `0x00` = inferred).
         param_types: Vec<u8>,
     },
     /// Extended query: bind `statement` into a portal `portal` with `params`. Parameter

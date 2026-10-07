@@ -399,8 +399,9 @@ Backend replies: `ParseComplete` (`1`), `BindComplete` (`2`), `CloseComplete` (`
 
 ### 10.1 Flow
 1. `Parse` stores SQL under a statement name (empty `name` = the unnamed statement). The server
-   replies `ParseComplete`. `param_types` are placeholder type-tag hints, in order; in 1.0 they
-   are not required and MAY be empty (the server infers parameter types from value text, §10.4).
+   replies `ParseComplete`. `param_types` declares each placeholder's type as a §9.2 type tag, in
+   order (`$1` first). It MAY be empty or shorter than the number of placeholders; a placeholder
+   with no tag, or tag `0x00`, has its type inferred from its value text (§10.4).
 2. `Bind` creates a portal from a statement plus parameter values and result-format codes. The
    server replies `BindComplete`. `params` is a `Fields` list (§4.3); each present field is the
    parameter's value in text format (§10.4). An empty `portal`/`statement` name is the unnamed
@@ -431,14 +432,21 @@ The `result_formats` list (`0` = text, `1` = binary) selects per-column output e
 - N codes → one per output column (a missing/extra entry defaults to text).
 Any code other than `1` is treated as text. Binary fields use §11.2.
 
-### 10.4 Parameter binding (1.0)
-Parameter values in `Bind` arrive in text format (the same bytes a text `DataRow` carries).
-The server substitutes each `$n` placeholder with the decoded literal before analysis. In 1.0 the
-value's type is inferred from its text: integer, then float, then boolean (`true`/`t`/`TRUE`,
-`false`/`f`/`FALSE`), else text. A numeric-looking value bound to a `TEXT` column would mis-infer —
-bind such a value with an explicit `CAST` in the SQL. `NULL` is the `Fields` NULL marker. (Precise
-type-directed binding from declared `param_types` is a forward-compatible follow-up; it will not
-change this layout.)
+### 10.4 Parameter binding
+Parameter values in `Bind` arrive in text format (the same bytes a text `DataRow` carries, §11.1).
+Each is bound by the type `Parse` declared for its placeholder:
+
+| declared tag | bound as |
+| --- | --- |
+| `TEXT` (`0x05`) | text, whatever the value looks like (`"00123"` stays `00123`) |
+| `INT` (`0x02`), `FLOAT` (`0x03`), `BOOL` (`0x01`) | exactly that type; a value that is not one (`"abc"` for `INT`) is refused with `22023` |
+| `NUMERIC`, `BYTES`, `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `JSON` | the value text cast to that type, exactly as `CAST('…' AS type)` would convert it |
+| `ARRAY` (`0x0F`, or `0x80 \| element`), `VECTOR` (`0x10`) | text, converted where it is used (an assignment to an array or vector column) |
+| none, or `0x00` | inferred from the text: integer, then float, then boolean (`true`/`t`/`TRUE`, `false`/`f`/`FALSE`), else text |
+
+A tag outside §9.2 is refused with `22023`. `NULL` is the `Fields` NULL marker whatever the declared
+type. Inference keeps clients that declare no types working, but it reads a numeric-looking value
+meant for a `TEXT` column as a number; clients SHOULD declare their parameters' types.
 
 ## 11. Value formats
 

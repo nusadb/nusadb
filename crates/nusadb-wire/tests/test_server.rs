@@ -5448,3 +5448,153 @@ async fn a_cte_cannot_disarm_row_security_on_a_qualified_table() {
     terminate_conn(mallory, mallory_handle).await;
     terminate_conn(su, su_handle).await;
 }
+
+/// Send `msg` on `conn`.
+async fn send<S: AsyncRead + AsyncWrite + Unpin>(conn: &mut Connection<S>, msg: FrontendMessage) {
+    conn.write_frame(&msg.encode().unwrap()).await.unwrap();
+}
+
+/// Read up to and including the next `ReadyForQuery`, returning everything before it.
+async fn until_ready<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+) -> Vec<BackendMessage> {
+    let mut out = Vec::new();
+    loop {
+        match next(conn).await {
+            BackendMessage::ReadyForQuery(_) => return out,
+            other => out.push(other),
+        }
+    }
+}
+
+/// Parse `sql` with `types`, bind `values`, execute and sync; everything the server answered.
+async fn run_typed<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    sql: &str,
+    types: Vec<u8>,
+    values: &[&str],
+) -> Vec<BackendMessage> {
+    send(
+        conn,
+        FrontendMessage::Parse {
+            name: String::new(),
+            sql: sql.to_owned(),
+            param_types: types,
+        },
+    )
+    .await;
+    send(
+        conn,
+        FrontendMessage::Bind {
+            portal: String::new(),
+            statement: String::new(),
+            params: values.iter().map(|v| Some(v.as_bytes().to_vec())).collect(),
+            result_formats: vec![],
+        },
+    )
+    .await;
+    send(
+        conn,
+        FrontendMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        },
+    )
+    .await;
+    send(conn, FrontendMessage::Sync).await;
+    until_ready(conn).await
+}
+
+/// A parameter declared `TEXT` binds as text even when it looks like a number, and the other
+/// declared types bind as exactly those types; an undeclared parameter's type is still inferred
+/// from its text, and a value that is not of its declared type is refused.
+#[tokio::test]
+async fn declared_parameter_types_bind_as_declared() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+    query(
+        &mut conn,
+        "CREATE TABLE t (s TEXT, n INT, d DATE, amount NUMERIC(10, 2), ok BOOL)",
+    )
+    .await;
+    until_ready(&mut conn).await;
+
+    // TEXT, INT, DATE, NUMERIC, BOOL.
+    let answer = run_typed(
+        &mut conn,
+        "INSERT INTO t VALUES ($1, $2, $3, $4, $5)",
+        vec![0x05, 0x02, 0x07, 0x04, 0x01],
+        &["00123", "42", "2026-10-07", "12.5", "true"],
+    )
+    .await;
+    assert!(answer.contains(&cc("INSERT 1")), "{answer:?}");
+    // Compare against a declared TEXT parameter that looks like a float.
+    let answer = run_typed(
+        &mut conn,
+        "INSERT INTO t (s) VALUES ($1)",
+        vec![0x05],
+        &["1e3"],
+    )
+    .await;
+    assert!(answer.contains(&cc("INSERT 1")), "{answer:?}");
+
+    query(
+        &mut conn,
+        "SELECT s, n, d, amount, ok FROM t WHERE s = '00123'",
+    )
+    .await;
+    let rows = until_ready(&mut conn).await;
+    let row = rows
+        .iter()
+        .find_map(|m| match m {
+            BackendMessage::DataRow { values } => Some(values.clone()),
+            _ => None,
+        })
+        .expect("the row with s = '00123'");
+    let text: Vec<String> = row
+        .into_iter()
+        .map(|v| String::from_utf8(v.unwrap()).unwrap())
+        .collect();
+    assert_eq!(text, ["00123", "42", "2026-10-07", "12.50", "true"]);
+
+    // A typed TEXT parameter compares as text.
+    let answer = run_typed(
+        &mut conn,
+        "SELECT count(*) FROM t WHERE s = $1",
+        vec![0x05],
+        &["1e3"],
+    )
+    .await;
+    assert!(
+        answer.contains(&BackendMessage::DataRow {
+            values: vec![Some(b"1".to_vec())]
+        }),
+        "{answer:?}"
+    );
+
+    // Undeclared: inferred from the text, as before (a number into TEXT is refused).
+    let answer = run_typed(&mut conn, "INSERT INTO t (s) VALUES ($1)", vec![], &["007"]).await;
+    assert!(
+        answer
+            .iter()
+            .any(|m| matches!(m, BackendMessage::Error { .. })),
+        "{answer:?}"
+    );
+
+    // A value that is not of its declared type, and an unknown tag, are refused.
+    for (types, value) in [
+        (vec![0x02], "abc"),
+        (vec![0x01], "maybe"),
+        (vec![0x7E], "x"),
+    ] {
+        let answer = run_typed(&mut conn, "SELECT $1", types, &[value]).await;
+        let error = format!("{answer:?}");
+        assert!(error.contains("parameter $1"), "{error}");
+    }
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

@@ -6,12 +6,10 @@
 //! corresponding literal *before* analysis, so the rest of the pipeline
 //! (analyzer, planner, executor) sees an ordinary parameterless statement.
 //!
-//! Values arrive in text format (the same bytes a `DataRow` carries). Their type
-//! is inferred from the text — integer, then float, then boolean, else text —
-//! which covers the common driver cases. A value whose text is numeric but whose
-//! target column is `TEXT` would be mis-inferred; binding such a value should use
-//! an explicit `CAST`. (Precise type-directed binding via declared parameter
-//! types is a follow-up.)
+//! Values arrive in text format (the same bytes a `DataRow` carries). A client that declares
+//! each parameter's type (the `Parse` message's type tags) has it bound as exactly that type
+//! ([`bind_parameters_typed`]); an undeclared parameter's type is inferred from its text:
+//! integer, then float, then boolean, else text.
 
 use crate::ast;
 use crate::error::Error;
@@ -23,15 +21,92 @@ use crate::error::Error;
 /// [`Error::Unsupported`] if a referenced parameter has no bound value, or a
 /// value is not valid UTF-8.
 pub fn bind_parameters(
-    mut stmt: ast::Statement,
+    stmt: ast::Statement,
     params: &[Option<Vec<u8>>],
 ) -> Result<ast::Statement, Error> {
-    let decoded = params
+    bind_parameters_typed(stmt, params, &[])
+}
+
+/// [`bind_parameters`] with the declared type tag of each parameter.
+///
+/// The tags are the wire protocol's one-byte column type tags, in placeholder order. A parameter
+/// declared `TEXT` binds as text whatever its
+/// value looks like, `INT` / `FLOAT` / `BOOL` as exactly that, and the other scalar types as a cast
+/// of the value's text to the type, so it converts exactly as a written `CAST` would. `ARRAY` and
+/// `VECTOR` values bind as text and convert where they are used. A parameter with no declared type
+/// (tag `0x00`, or past the end of `types`) has its type inferred from its text.
+///
+/// # Errors
+/// As [`bind_parameters`]; [`Error::InvalidParameterValue`] for an unknown type tag or a value
+/// that is not valid for its declared `INT`, `FLOAT` or `BOOL` type.
+pub fn bind_parameters_typed(
+    mut stmt: ast::Statement,
+    params: &[Option<Vec<u8>>],
+    types: &[u8],
+) -> Result<ast::Statement, Error> {
+    let bound = params
         .iter()
-        .map(|p| decode_param(p.as_deref()))
+        .enumerate()
+        .map(|(i, p)| bind_param(i, p.as_deref(), types.get(i).copied().unwrap_or(0)))
         .collect::<Result<Vec<_>, _>>()?;
-    substitute_stmt(&mut stmt, &decoded)?;
+    substitute_stmt(&mut stmt, &bound)?;
     Ok(stmt)
+}
+
+/// One wire-format parameter as the expression that replaces its placeholder.
+fn bind_param(index: usize, raw: Option<&[u8]>, tag: u8) -> Result<ast::Expr, Error> {
+    use nusadb_core::ColumnType as T;
+    let Some(bytes) = raw else {
+        return Ok(ast::Expr::Literal(ast::Value::Null));
+    };
+    if tag == 0 {
+        return decode_param(Some(bytes)).map(ast::Expr::Literal);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        Error::InvalidParameterValue(format!("parameter ${} is not valid UTF-8", index + 1))
+    })?;
+    let invalid = |ty: &str| {
+        Error::InvalidParameterValue(format!(
+            "parameter ${} is declared {ty}, but its value {text:?} is not one",
+            index + 1
+        ))
+    };
+    let cast = |target: T| ast::Expr::Cast {
+        expr: Box::new(ast::Expr::Literal(ast::Value::Text(text.to_owned()))),
+        target,
+        try_cast: false,
+    };
+    Ok(match tag {
+        0x01 => ast::Expr::Literal(ast::Value::Bool(match text {
+            "true" | "t" | "TRUE" => true,
+            "false" | "f" | "FALSE" => false,
+            _ => return Err(invalid("BOOL")),
+        })),
+        0x02 => ast::Expr::Literal(ast::Value::Int(text.parse().map_err(|_| invalid("INT"))?)),
+        0x03 => ast::Expr::Literal(ast::Value::Float(
+            text.parse().map_err(|_| invalid("FLOAT"))?,
+        )),
+        0x04 => cast(T::Numeric {
+            precision: 0,
+            scale: 0,
+        }),
+        0x05 | 0x0F | 0x10 | 0x80..=0xFF => ast::Expr::Literal(ast::Value::Text(text.to_owned())),
+        0x06 => cast(T::Bytes),
+        0x07 => cast(T::Date),
+        0x08 => cast(T::Time),
+        0x09 => cast(T::TimeTz),
+        0x0A => cast(T::Timestamp),
+        0x0B => cast(T::TimestampTz),
+        0x0C => cast(T::Interval),
+        0x0D => cast(T::Uuid),
+        0x0E => cast(T::Json),
+        other => {
+            return Err(Error::InvalidParameterValue(format!(
+                "parameter ${} has the unknown type tag 0x{other:02X}",
+                index + 1
+            )));
+        },
+    })
 }
 
 /// Substitute the positional parameters (`$1`..`$n`) in `stmt` with `values` (SQL-level `EXECUTE`,
@@ -43,7 +118,8 @@ pub fn substitute_values(
     mut stmt: ast::Statement,
     values: &[ast::Value],
 ) -> Result<ast::Statement, Error> {
-    substitute_stmt(&mut stmt, values)?;
+    let literals: Vec<ast::Expr> = values.iter().cloned().map(ast::Expr::Literal).collect();
+    substitute_stmt(&mut stmt, &literals)?;
     Ok(stmt)
 }
 
@@ -547,7 +623,7 @@ pub(crate) fn substitute_param_exprs(
     }
 }
 
-fn substitute_stmt(stmt: &mut ast::Statement, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_stmt(stmt: &mut ast::Statement, params: &[ast::Expr]) -> Result<(), Error> {
     match stmt {
         ast::Statement::Select(select) => substitute_select(select, params),
         ast::Statement::SetOperation(set) => substitute_set_body(&mut set.body, params),
@@ -592,7 +668,7 @@ fn substitute_stmt(stmt: &mut ast::Statement, params: &[ast::Value]) -> Result<(
     }
 }
 
-fn substitute_merge(merge: &mut ast::Merge, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_merge(merge: &mut ast::Merge, params: &[ast::Expr]) -> Result<(), Error> {
     substitute_expr(&mut merge.on, params)?;
     for when in &mut merge.whens {
         match when {
@@ -616,7 +692,7 @@ fn substitute_merge(merge: &mut ast::Merge, params: &[ast::Value]) -> Result<(),
     Ok(())
 }
 
-fn substitute_set_body(body: &mut ast::SelectBody, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_set_body(body: &mut ast::SelectBody, params: &[ast::Expr]) -> Result<(), Error> {
     match body {
         ast::SelectBody::Select(select) => substitute_select(select, params),
         ast::SelectBody::SetOp { left, right, .. } => {
@@ -626,7 +702,7 @@ fn substitute_set_body(body: &mut ast::SelectBody, params: &[ast::Value]) -> Res
     }
 }
 
-fn substitute_select(select: &mut ast::Select, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_select(select: &mut ast::Select, params: &[ast::Expr]) -> Result<(), Error> {
     for cte in &mut select.with {
         match &mut cte.body {
             ast::CteBody::Query(q) => substitute_set_body(q, params)?,
@@ -653,7 +729,7 @@ fn substitute_select(select: &mut ast::Select, params: &[ast::Value]) -> Result<
     Ok(())
 }
 
-fn substitute_table_ref(table: &mut ast::TableRef, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_table_ref(table: &mut ast::TableRef, params: &[ast::Expr]) -> Result<(), Error> {
     if let Some(subquery) = &mut table.subquery {
         substitute_select(subquery, params)?;
     }
@@ -668,7 +744,7 @@ fn substitute_table_ref(table: &mut ast::TableRef, params: &[ast::Value]) -> Res
     Ok(())
 }
 
-fn substitute_from(from: Option<&mut ast::FromClause>, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_from(from: Option<&mut ast::FromClause>, params: &[ast::Expr]) -> Result<(), Error> {
     if let Some(from) = from {
         substitute_table_ref(&mut from.base, params)?;
         for join in &mut from.joins {
@@ -681,7 +757,7 @@ fn substitute_from(from: Option<&mut ast::FromClause>, params: &[ast::Value]) ->
     Ok(())
 }
 
-fn substitute_returning(items: &mut [ast::SelectItem], params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_returning(items: &mut [ast::SelectItem], params: &[ast::Expr]) -> Result<(), Error> {
     for item in items {
         if let ast::SelectItem::Expr { expr, .. } = item {
             substitute_expr(expr, params)?;
@@ -690,7 +766,7 @@ fn substitute_returning(items: &mut [ast::SelectItem], params: &[ast::Value]) ->
     Ok(())
 }
 
-fn substitute_group_by(group_by: &mut ast::GroupBy, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_group_by(group_by: &mut ast::GroupBy, params: &[ast::Expr]) -> Result<(), Error> {
     match group_by {
         ast::GroupBy::Expressions(keys) => {
             for key in keys {
@@ -711,7 +787,7 @@ fn substitute_group_by(group_by: &mut ast::GroupBy, params: &[ast::Value]) -> Re
     }
 }
 
-fn substitute_opt(expr: Option<&mut ast::Expr>, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_opt(expr: Option<&mut ast::Expr>, params: &[ast::Expr]) -> Result<(), Error> {
     expr.map_or(Ok(()), |e| substitute_expr(e, params))
 }
 
@@ -719,13 +795,13 @@ fn substitute_opt(expr: Option<&mut ast::Expr>, params: &[ast::Value]) -> Result
     clippy::too_many_lines,
     reason = "flat one-arm-per-expression-variant walker; length tracks the AST"
 )]
-fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Expr]) -> Result<(), Error> {
     match expr {
         ast::Expr::Parameter(n) => {
             let value = params.get(*n).cloned().ok_or_else(|| {
                 Error::UndefinedParameter(format!("parameter ${} was not bound", *n + 1))
             })?;
-            *expr = ast::Expr::Literal(value);
+            *expr = value;
             Ok(())
         },
         ast::Expr::Literal(_) | ast::Expr::Column(_) | ast::Expr::QualifiedColumn { .. } => Ok(()),
@@ -846,7 +922,7 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Value]) -> Result<(), Er
     }
 }
 
-fn substitute_within_group(wg: &mut ast::WithinGroup, params: &[ast::Value]) -> Result<(), Error> {
+fn substitute_within_group(wg: &mut ast::WithinGroup, params: &[ast::Expr]) -> Result<(), Error> {
     for arg in &mut wg.args {
         substitute_expr(arg, params)?;
     }
@@ -858,7 +934,7 @@ fn substitute_within_group(wg: &mut ast::WithinGroup, params: &[ast::Value]) -> 
 
 fn substitute_window_frame(
     frame: Option<&mut ast::WindowFrame>,
-    params: &[ast::Value],
+    params: &[ast::Expr],
 ) -> Result<(), Error> {
     let Some(frame) = frame else { return Ok(()) };
     substitute_frame_bound(&mut frame.start, params)?;
@@ -870,7 +946,7 @@ fn substitute_window_frame(
 
 fn substitute_frame_bound(
     bound: &mut ast::WindowFrameBound,
-    params: &[ast::Value],
+    params: &[ast::Expr],
 ) -> Result<(), Error> {
     match bound {
         ast::WindowFrameBound::Preceding(e) | ast::WindowFrameBound::Following(e) => {

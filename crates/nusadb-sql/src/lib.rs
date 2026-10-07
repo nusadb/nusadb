@@ -133,7 +133,7 @@ pub fn current_schema_for_search_path(search_path: Option<&str>) -> String {
         .next()
         .unwrap_or_else(|| nusadb_core::PUBLIC_SCHEMA.to_owned())
 }
-pub use params::{bind_parameters, parameter_count};
+pub use params::{bind_parameters, bind_parameters_typed, parameter_count};
 pub use parser::parse;
 pub use plan_cache::{PlanCache, plan_cached};
 pub use planner::{LogicalPlan, PhysicalOperator, PhysicalPlan, plan, plan_is_inline_point_get};
