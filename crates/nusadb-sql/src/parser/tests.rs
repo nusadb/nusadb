@@ -4485,6 +4485,32 @@ fn rejects_out_of_surface_identifiers() {
 }
 
 #[test]
+fn an_operator_right_after_an_identifier_ends_it() {
+    // `#` and `@` start operators; written without a space after a column they end the identifier
+    // rather than joining it.
+    for (tight, spaced) in [
+        (
+            "SELECT payload#>'{a}' FROM t",
+            "SELECT payload #> '{a}' FROM t",
+        ),
+        (
+            "SELECT payload#>>'{a}' FROM t",
+            "SELECT payload #>> '{a}' FROM t",
+        ),
+        (
+            "SELECT payload@>'{}' FROM t",
+            "SELECT payload @> '{}' FROM t",
+        ),
+        (
+            "SELECT a FROM t WHERE tags@>'{x}'",
+            "SELECT a FROM t WHERE tags @> '{x}'",
+        ),
+    ] {
+        assert_eq!(ok(tight), ok(spaced), "{tight}");
+    }
+}
+
+#[test]
 fn rejects_non_double_quote_delimited_identifiers() {
     // NusaDB documents only `"..."` for quoted identifiers; backtick / bracket delimiters are
     // tokenized by `GenericDialect` but outside the surface.

@@ -4641,10 +4641,14 @@ fn reject_widened_lexicon(sql: &str) -> Result<(), Error> {
         match word.quote_style {
             None => {
                 let mut chars = word.value.chars();
+                // `GenericDialect` also reads `#` and `@` inside a word, so `payload#>'{a}'` comes
+                // out as the word `payload#`; the parse itself ends the identifier there and reads
+                // the operator. Only a word that starts with them (`@t`, `#x`) is an identifier
+                // outside the surface.
                 let ok = chars
                     .next()
                     .is_some_and(|c| NusaDialect.is_identifier_start(c))
-                    && chars.all(|c| NusaDialect.is_identifier_part(c));
+                    && chars.all(|c| NusaDialect.is_identifier_part(c) || c == '#' || c == '@');
                 if !ok {
                     return unsupported(&format!(
                         "identifier `{}` outside NusaDB's surface \
