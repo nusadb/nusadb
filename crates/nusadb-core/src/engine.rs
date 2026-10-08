@@ -92,6 +92,20 @@ pub enum RowLockMode {
     Exclusive,
 }
 
+/// What [`StorageEngine::lock_row_current`] found once the row lock was held: whether the version the
+/// caller's snapshot read is still the row's newest committed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockedRow {
+    /// No transaction the snapshot cannot see has written the row: the version the caller read is
+    /// the newest.
+    Unchanged,
+    /// A transaction the snapshot cannot see (one that committed after it) updated the row. This is
+    /// the newest version's tuple, which the lock now covers.
+    Updated(Vec<u8>),
+    /// A transaction the snapshot cannot see deleted the row.
+    Deleted,
+}
+
 /// Strength of an explicit table lock requested via `LOCK TABLE`.
 ///
 /// The two extremes of the SQL table-lock hierarchy. `AccessExclusive` (taken by `DROP`/`ALTER`/
@@ -1070,9 +1084,33 @@ pub trait StorageEngine: Send + Sync {
     /// The default is a no-op returning `Ok(())`, so an engine without locking — and the SQL
     /// layer's in-memory test double — need not implement it. The production engine
     /// overrides this to take a real row-level lock.
+    ///
+    /// The lock alone does not say whether the version the caller read is still current: a
+    /// transaction that committed after the caller's snapshot may already have updated or deleted
+    /// the row and released its lock. `SELECT ... FOR UPDATE` must use
+    /// [`lock_row_current`](Self::lock_row_current), which reports that.
     fn lock_row(&self, txn: TxnId, table: TableId, tid: Tid, mode: RowLockMode) -> Result<()> {
         let _ = (txn, table, tid, mode);
         Ok(())
+    }
+
+    /// [`lock_row`](Self::lock_row), then report whether the row changed since `txn`'s snapshot
+    /// (the statement's snapshot under `READ COMMITTED`, the transaction's otherwise): unchanged,
+    /// updated (with the newest version, now locked), or deleted. Deciding what a change means
+    /// (skip the row, use the newest version, or fail with a serialization conflict) is the
+    /// caller's.
+    ///
+    /// The default locks and reports [`LockedRow::Unchanged`], correct for an engine without
+    /// concurrent writers (e.g. the in-memory test double).
+    fn lock_row_current(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        tid: Tid,
+        mode: RowLockMode,
+    ) -> Result<LockedRow> {
+        self.lock_row(txn, table, tid, mode)?;
+        Ok(LockedRow::Unchanged)
     }
 
     /// Acquire a table-level lock on `table` for `txn` — the engine side of `LOCK TABLE`.

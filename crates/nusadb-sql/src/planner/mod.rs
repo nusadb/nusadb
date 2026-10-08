@@ -664,12 +664,18 @@ mod tests {
             plan_has_sort(&root),
             "SKIP LOCKED must keep the Sort, not eliminate it into a capped IndexScan"
         );
-        // Plain `FOR UPDATE` (no SKIP LOCKED) still gets the elimination: no rows are skipped, so the
-        // capped ordered scan returns exactly the LIMIT rows in order and stays correct there.
+        // Plain `FOR UPDATE` keeps the Sort too: under READ COMMITTED a row that changed after the
+        // snapshot and no longer matches is hidden, so the capped scan could also fall short.
         let plain = indexed_select_op("SELECT * FROM t ORDER BY a ASC LIMIT 20 FOR UPDATE");
         assert!(
-            !plan_has_sort(&plain),
-            "plain FOR UPDATE keeps the sort-elimination win"
+            plan_has_sort(&plain),
+            "plain FOR UPDATE must keep the Sort as well"
+        );
+        // A query that locks nothing still gets the elimination.
+        let unlocked = indexed_select_op("SELECT * FROM t ORDER BY a ASC LIMIT 20");
+        assert!(
+            !plan_has_sort(&unlocked),
+            "an unlocked query keeps the sort-elimination win"
         );
     }
 

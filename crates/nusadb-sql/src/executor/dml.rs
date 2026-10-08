@@ -3652,7 +3652,7 @@ pub(super) fn backfill_index_streaming(
         // Honor a statement timeout / cancel at row granularity on a long build, and skip a row a
         // concurrent transaction holds locked — matching the scan the per-row backfill used.
         crate::cancel::check()?;
-        if super::lock_skip::skipped(table.id, tid) {
+        if super::lock_skip::hidden(table.id, tid) {
             continue;
         }
         let row = row::decode(&tuple, &schema)?;
@@ -3808,7 +3808,7 @@ fn backfill_index_external_sort(
     // Phase 1: stream the table, generating a sorted run each time the buffer fills the budget.
     while let Some((tid, tuple)) = scan.try_next()? {
         crate::cancel::check()?;
-        if super::lock_skip::skipped(table.id, tid) {
+        if super::lock_skip::hidden(table.id, tid) {
             continue;
         }
         let row = row::decode(&tuple, &schema)?;

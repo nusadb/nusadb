@@ -43,6 +43,34 @@ impl Catalog for IndexedCat<'_> {
     }
 }
 
+/// Like [`Cat`], but answers inheritance from the engine (as the production wire catalog does), so
+/// a query on a parent expands to it and its descendants.
+struct InheritCat<'a>(&'a dyn StorageEngine, TxnId);
+impl Catalog for InheritCat<'_> {
+    fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+        self.0.lookup_table(name).map_err(Into::into)
+    }
+    fn list_indexes(&self, _: &str) -> Result<Vec<IndexInfo>, Error> {
+        Ok(Vec::new())
+    }
+    fn any_inheritance(&self) -> Result<bool, Error> {
+        nusadb_sql::inheritance_any(self.0, self.1)
+    }
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
+        nusadb_sql::inheritance_descendants(self.0, self.1, table)
+    }
+}
+
+/// Like [`run_in`], but through [`InheritCat`].
+fn run_in_inherit(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    sql: &str,
+) -> Result<ExecutionResult, Error> {
+    let logical = analyze(parse(sql)?, &InheritCat(engine, txn))?;
+    execute_in_txn(plan(logical), engine, txn)
+}
+
 /// Run one statement inside `txn`, returning its result (no commit/rollback here).
 fn run_in(engine: &dyn StorageEngine, txn: TxnId, sql: &str) -> Result<ExecutionResult, Error> {
     let logical = analyze(parse(sql)?, &Cat(engine))?;
@@ -210,4 +238,92 @@ fn skip_locked_limit_fills_past_a_locked_row_within_the_cap() {
 
     let _ = engine.rollback(worker1);
     let _ = engine.rollback(worker2);
+}
+
+#[test]
+fn a_row_changed_after_a_fixed_snapshot_is_a_conflict_not_a_stale_lock() {
+    // The reported sequence: B's REPEATABLE READ snapshot sees the job queued; A updates it and
+    // commits, freeing the lock; B's `FOR UPDATE` (with or without SKIP LOCKED) must not hand back
+    // the old version as locked.
+    for lock in ["FOR UPDATE", "FOR UPDATE SKIP LOCKED"] {
+        for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
+            let engine = BtreeEngine::new();
+            run(
+                &engine,
+                "CREATE TABLE job (id INT NOT NULL, status TEXT NOT NULL, PRIMARY KEY (id))",
+            );
+            run(&engine, "INSERT INTO job VALUES (1, 'queued')");
+            let b = engine.begin(level).unwrap();
+            run_in(&engine, b, "SELECT count(*) FROM job").unwrap();
+            run(&engine, "UPDATE job SET status = 'done' WHERE id = 1");
+            let got = run_in(
+                &engine,
+                b,
+                &format!("SELECT id FROM job WHERE status = 'queued' {lock}"),
+            );
+            assert!(
+                matches!(
+                    got,
+                    Err(Error::Core(
+                        nusadb_core::Error::SerializationConflict { .. }
+                    ))
+                ),
+                "{level:?} {lock}: {got:?}"
+            );
+            engine.rollback(b).unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_inheritance_parent_keeps_each_tables_lock_decisions() {
+    // `FOR UPDATE` on a parent nests one lock step per table. The child's rows a lock step leaves
+    // out must stay out while the parent's own step runs.
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE p (id INT NOT NULL, st TEXT NOT NULL)",
+    );
+    run(&engine, "CREATE TABLE c () INHERITS (p)");
+    run(&engine, "INSERT INTO c VALUES (3, 'q'), (4, 'q')");
+    run(&engine, "INSERT INTO p VALUES (10, 'q'), (11, 'q')");
+    let holder = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+    assert_eq!(
+        ids(run_in(&engine, holder, "SELECT id FROM c WHERE id = 3 FOR UPDATE").unwrap()),
+        vec![3]
+    );
+    let worker = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+    let claimed = run_in_inherit(
+        &engine,
+        worker,
+        "SELECT id FROM p WHERE st = 'q' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+    )
+    .unwrap();
+    assert_eq!(
+        ids(claimed),
+        vec![4],
+        "the row another transaction holds is skipped"
+    );
+    engine.rollback(worker).unwrap();
+    engine.rollback(holder).unwrap();
+
+    // A child row changed after a REPEATABLE READ snapshot is a conflict through the parent too.
+    let reader = engine.begin(IsolationLevel::RepeatableRead).unwrap();
+    run_in(&engine, reader, "SELECT count(*) FROM p").unwrap();
+    run(&engine, "UPDATE c SET st = 'done' WHERE id = 4");
+    let got = run_in_inherit(
+        &engine,
+        reader,
+        "SELECT id FROM p WHERE st = 'q' FOR UPDATE",
+    );
+    assert!(
+        matches!(
+            got,
+            Err(Error::Core(
+                nusadb_core::Error::SerializationConflict { .. }
+            ))
+        ),
+        "{got:?}"
+    );
+    engine.rollback(reader).unwrap();
 }

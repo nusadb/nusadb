@@ -185,17 +185,18 @@ struct ScanSource {
 
 impl RowSource for ScanSource {
     fn try_next(&mut self) -> Result<Option<Row>, Error> {
-        let (tid, tuple) = loop {
+        let tuple = loop {
             let Some((tid, tuple)) = self.scan.try_next()? else {
                 return Ok(None);
             };
-            // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`): a row another transaction holds
-            // locked is invisible to this pipeline.
-            if !super::lock_skip::skipped(self.table, tid) {
-                break (tid, tuple);
+            // Under a `LockRows` guard (see `scan_table`): a hidden row is skipped, a replaced one
+            // reads as its newer version.
+            match super::lock_skip::resolve(self.table, tid) {
+                super::lock_skip::Seen::Hide => {},
+                super::lock_skip::Seen::Replace(newer) => break newer,
+                super::lock_skip::Seen::Keep => break tuple,
             }
         };
-        let _ = tid;
         // Cooperative cancellation, matching the materializing `scan_table`.
         crate::cancel::check()?;
         if self.keep.is_empty() {

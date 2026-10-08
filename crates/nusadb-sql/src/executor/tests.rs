@@ -37,6 +37,11 @@ struct MockState {
     /// Number of `rollback` calls the engine has seen — a leak test asserts the SQL layer rolls a
     /// failed commit back instead of stranding the transaction.
     rollback_count: u32,
+    /// What `lock_row_current` reports per row: a [`LockedRow`] outcome, or `None` for a lock
+    /// another transaction holds. Rows not listed are unchanged.
+    lock_outcomes: HashMap<Tid, Option<nusadb_core::engine::LockedRow>>,
+    /// The isolation level `txn_isolation` reports (the engine default when unset).
+    isolation: Option<IsolationLevel>,
 }
 
 struct MockTable {
@@ -60,6 +65,8 @@ impl MockEngine {
                 begin_statements: 0,
                 fail_commit: false,
                 rollback_count: 0,
+                lock_outcomes: HashMap::new(),
+                isolation: None,
             }),
         }
     }
@@ -84,6 +91,24 @@ impl StorageEngine for MockEngine {
         s.next_txn_id += 1;
         Ok(id)
     }
+    fn lock_row_current(
+        &self,
+        txn: TxnId,
+        _table: TableId,
+        tid: Tid,
+        _mode: nusadb_core::engine::RowLockMode,
+    ) -> CoreResult<nusadb_core::engine::LockedRow> {
+        match self.state.lock().unwrap().lock_outcomes.get(&tid) {
+            Some(Some(outcome)) => Ok(outcome.clone()),
+            Some(None) => Err(CoreError::SerializationConflict { txn }),
+            None => Ok(nusadb_core::engine::LockedRow::Unchanged),
+        }
+    }
+
+    fn txn_isolation(&self, _txn: TxnId) -> Option<IsolationLevel> {
+        Some(self.state.lock().unwrap().isolation.unwrap_or_default())
+    }
+
     fn begin_statement(&self, _txn: TxnId) -> CoreResult<()> {
         // No MVCC snapshots in this in-memory double: every read already sees latest state. Count
         // the calls so a test can assert the refresh fires at the execution choke-point.
@@ -4272,4 +4297,194 @@ fn statement_depth_recovers_after_a_panicking_statement() {
     assert_eq!(super::statement_depth(), 0);
     assert!(super::run_statement_atomically(&engine, txn, || Ok::<(), Error>(())).is_ok());
     assert_eq!(super::statement_depth(), 0);
+}
+
+// --- FOR UPDATE / FOR SHARE: rows that changed after the snapshot -----------------------------
+
+mod lock_rows_changed_since_snapshot {
+    use nusadb_core::engine::LockedRow;
+    use nusadb_core::{IsolationLevel, StorageEngine, Tid};
+
+    use super::{MockEngine, rows_of, run};
+    use crate::ast::Value;
+    use crate::error::Error;
+
+    /// `jobs(id, status, note)` with ids 1..=4, all queued.
+    fn jobs() -> MockEngine {
+        let engine = MockEngine::new();
+        run(
+            "CREATE TABLE jobs (id INT NOT NULL, status TEXT NOT NULL, note TEXT)",
+            &engine,
+        )
+        .unwrap();
+        run(
+            "INSERT INTO jobs VALUES (1, 'queued', 'a'), (2, 'queued', 'b'), (3, 'queued', 'c'), (4, 'queued', 'd')",
+            &engine,
+        )
+        .unwrap();
+        engine
+    }
+
+    fn schema(engine: &MockEngine) -> Vec<nusadb_core::ColumnType> {
+        let table = engine.lookup_table("jobs").unwrap().unwrap();
+        table.columns.iter().map(|c| c.ty).collect()
+    }
+
+    /// The tid of job `id`.
+    fn tid(engine: &MockEngine, id: i64) -> Tid {
+        let table = engine.lookup_table("jobs").unwrap().unwrap();
+        let state = engine.state.lock().unwrap();
+        let types = schema_types(&table);
+        state.tables_by_id[&table.id]
+            .rows
+            .iter()
+            .find(|(_, tuple)| {
+                super::super::row::decode(tuple, &types).unwrap()[0] == Value::Int(id)
+            })
+            .map(|(tid, _)| *tid)
+            .unwrap()
+    }
+
+    fn schema_types(table: &nusadb_core::TableSchema) -> Vec<nusadb_core::ColumnType> {
+        table.columns.iter().map(|c| c.ty).collect()
+    }
+
+    /// Job `id` as another transaction left it.
+    fn version(engine: &MockEngine, id: i64, status: &str, note: &str) -> LockedRow {
+        let row = vec![
+            Value::Int(id),
+            Value::Text(status.to_owned()),
+            Value::Text(note.to_owned()),
+        ];
+        LockedRow::Updated(super::super::row::encode(&row, &schema(engine)).unwrap())
+    }
+
+    fn script(engine: &MockEngine, id: i64, outcome: Option<LockedRow>) {
+        let tid = tid(engine, id);
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .lock_outcomes
+            .insert(tid, outcome);
+    }
+
+    fn claim(engine: &MockEngine, sql: &str) -> Result<Vec<Vec<Value>>, Error> {
+        run(sql, engine).map(|result| rows_of(result).1)
+    }
+
+    const CLAIM: &str = "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1";
+
+    #[test]
+    fn read_committed_skips_a_row_that_no_longer_matches_and_takes_the_next() {
+        for lock in ["FOR UPDATE", "FOR UPDATE SKIP LOCKED"] {
+            let engine = jobs();
+            script(&engine, 1, Some(version(&engine, 1, "done", "a")));
+            assert_eq!(
+                claim(&engine, &format!("{CLAIM} {lock}")).unwrap(),
+                vec![vec![Value::Int(2)]],
+                "{lock}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_committed_returns_the_newest_version_of_a_row_that_still_matches() {
+        let engine = jobs();
+        script(&engine, 1, Some(version(&engine, 1, "queued", "changed")));
+        let got = claim(
+            &engine,
+            "SELECT id, note FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![vec![Value::Int(1), Value::Text("changed".to_owned())]]
+        );
+    }
+
+    #[test]
+    fn read_committed_skips_a_deleted_row() {
+        let engine = jobs();
+        script(&engine, 1, Some(LockedRow::Deleted));
+        script(&engine, 2, Some(LockedRow::Deleted));
+        assert_eq!(
+            claim(&engine, &format!("{CLAIM} FOR UPDATE")).unwrap(),
+            vec![vec![Value::Int(3)]]
+        );
+    }
+
+    #[test]
+    fn a_fixed_snapshot_makes_a_changed_row_a_serialization_conflict() {
+        for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
+            for lock in ["FOR UPDATE", "FOR UPDATE SKIP LOCKED", "FOR SHARE"] {
+                for outcome in [Some(LockedRow::Deleted), None] {
+                    let engine = jobs();
+                    engine.state.lock().unwrap().isolation = Some(level);
+                    let outcome = outcome.unwrap_or_else(|| version(&engine, 1, "done", "a"));
+                    script(&engine, 1, Some(outcome));
+                    let err = claim(&engine, &format!("{CLAIM} {lock}")).unwrap_err();
+                    assert!(
+                        matches!(
+                            err,
+                            Error::Core(nusadb_core::Error::SerializationConflict { .. })
+                        ),
+                        "{level:?} {lock}: {err:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_locked_elsewhere_is_skipped_or_a_conflict_as_before() {
+        let engine = jobs();
+        script(&engine, 1, None);
+        assert_eq!(
+            claim(&engine, &format!("{CLAIM} FOR UPDATE SKIP LOCKED")).unwrap(),
+            vec![vec![Value::Int(2)]]
+        );
+        assert!(matches!(
+            claim(&engine, &format!("{CLAIM} FOR UPDATE")),
+            Err(Error::Core(
+                nusadb_core::Error::SerializationConflict { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_changed_row_that_now_sorts_later_is_still_the_row_returned() {
+        // Job 1 is the first by `note` in the snapshot, so it is the one locked; its newest version
+        // sorts last. The pipeline must still return job 1 (the row it locked, at its new values),
+        // never job 2, which nobody locked.
+        let engine = jobs();
+        script(&engine, 1, Some(version(&engine, 1, "queued", "z")));
+        let got = claim(
+            &engine,
+            "SELECT id, note FROM jobs WHERE status = 'queued' ORDER BY note LIMIT 1 FOR UPDATE",
+        )
+        .unwrap();
+        assert_eq!(got, vec![vec![Value::Int(1), Value::Text("z".to_owned())]]);
+    }
+
+    #[test]
+    fn the_output_is_exactly_the_rows_locked() {
+        // Every row ties on the sort key, so the pipeline's own sort may order them differently
+        // from the lock step; the rows past the cap are hidden, so the limit still returns the
+        // row that was locked.
+        let engine = jobs();
+        script(&engine, 1, Some(version(&engine, 1, "done", "a")));
+        let got = claim(
+            &engine,
+            "SELECT id FROM jobs ORDER BY status LIMIT 2 FOR UPDATE",
+        )
+        .unwrap();
+        let ids: Vec<Value> = got.into_iter().map(|r| r[0].clone()).collect();
+        assert_eq!(ids.len(), 2);
+        // Row 1 changed but still matches (no WHERE), so it is locked and read as its new version.
+        assert!(
+            ids.contains(&Value::Int(1)) && ids.contains(&Value::Int(2)),
+            "{ids:?}"
+        );
+    }
 }

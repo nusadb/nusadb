@@ -19,11 +19,15 @@ pub(super) fn scan_table(
         // Cooperative cancellation: a statement timeout / cancel request aborts a long scan
         // at the next row boundary rather than running to completion.
         crate::cancel::check()?;
-        // `FOR UPDATE ... SKIP LOCKED`: a row another transaction holds locked is invisible to
-        // this pipeline (no-op unless a LockRows guard is active).
-        if super::lock_skip::skipped(table.id, tid) {
-            continue;
-        }
+        // Under a `FOR UPDATE` / `FOR SHARE` guard (no-op otherwise): a row the lock step left
+        // out (held elsewhere under SKIP LOCKED, past the cap, changed and no longer matching) is
+        // invisible to this pipeline, and a changed row that still matches reads as its newest
+        // version.
+        let tuple = match super::lock_skip::resolve(table.id, tid) {
+            super::lock_skip::Seen::Hide => continue,
+            super::lock_skip::Seen::Replace(newer) => newer,
+            super::lock_skip::Seen::Keep => tuple,
+        };
         out.push((tid, row::decode(&tuple, &schema)?));
     }
     Ok(out)
@@ -66,9 +70,11 @@ impl TargetRows {
             } => {
                 while let Some((tid, tuple)) = scan.try_next()? {
                     crate::cancel::check()?;
-                    if super::lock_skip::skipped(*table, tid) {
-                        continue;
-                    }
+                    let tuple = match super::lock_skip::resolve(*table, tid) {
+                        super::lock_skip::Seen::Hide => continue,
+                        super::lock_skip::Seen::Replace(newer) => newer,
+                        super::lock_skip::Seen::Keep => tuple,
+                    };
                     return Ok(Some((tid, row::decode(&tuple, schema)?)));
                 }
                 Ok(None)
@@ -95,8 +101,8 @@ pub(super) fn count_table(
     let mut count = 0usize;
     while let Some((tid, _tuple)) = scan.try_next()? {
         crate::cancel::check()?;
-        // `FOR UPDATE ... SKIP LOCKED`: a row another transaction holds locked is invisible here.
-        if super::lock_skip::skipped(table.id, tid) {
+        // A row a `LockRows` guard hides is invisible here; a replaced one still counts once.
+        if super::lock_skip::hidden(table.id, tid) {
             continue;
         }
         count += 1;
@@ -186,10 +192,12 @@ pub(super) fn scan_rows_projected(
     let mut out = Vec::new();
     while let Some((tid, tuple)) = scan.try_next()? {
         crate::cancel::check()?;
-        // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`).
-        if super::lock_skip::skipped(table.id, tid) {
-            continue;
-        }
+        // Under a `FOR UPDATE` / `FOR SHARE` guard: hidden or replaced (see `scan_table`).
+        let tuple = match super::lock_skip::resolve(table.id, tid) {
+            super::lock_skip::Seen::Hide => continue,
+            super::lock_skip::Seen::Replace(newer) => newer,
+            super::lock_skip::Seen::Keep => tuple,
+        };
         out.push(row::decode_projected(&tuple, &schema, columns)?);
     }
     Ok(out)
@@ -250,10 +258,12 @@ impl super::stream::RowSource for IndexScanSource {
         }
         while let Some((tid, tuple)) = self.scan.try_next()? {
             crate::cancel::check()?;
-            // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`).
-            if super::lock_skip::skipped(self.table, tid) {
-                continue;
-            }
+            // Under a `FOR UPDATE` / `FOR SHARE` guard: hidden or replaced (see `scan_table`).
+            let tuple = match super::lock_skip::resolve(self.table, tid) {
+                super::lock_skip::Seen::Hide => continue,
+                super::lock_skip::Seen::Replace(newer) => newer,
+                super::lock_skip::Seen::Keep => tuple,
+            };
             if let Some(remaining) = self.remaining.as_mut() {
                 *remaining -= 1;
             }
@@ -309,10 +319,12 @@ pub(super) fn index_scan_rows(
     )?;
     let mut out = Vec::new();
     while let Some((tid, tuple)) = scan.try_next()? {
-        // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`).
-        if super::lock_skip::skipped(table.id, tid) {
-            continue;
-        }
+        // Under a `FOR UPDATE` / `FOR SHARE` guard: hidden or replaced (see `scan_table`).
+        let tuple = match super::lock_skip::resolve(table.id, tid) {
+            super::lock_skip::Seen::Hide => continue,
+            super::lock_skip::Seen::Replace(newer) => newer,
+            super::lock_skip::Seen::Keep => tuple,
+        };
         out.push(row::decode(&tuple, &schema)?);
         if let Some(cap) = limit
             && out.len() >= cap
@@ -345,10 +357,12 @@ pub(super) fn index_scan_table(
     let mut out = Vec::new();
     while let Some((tid, tuple)) = scan.try_next()? {
         crate::cancel::check()?;
-        // `FOR UPDATE ... SKIP LOCKED` (see `scan_table`).
-        if super::lock_skip::skipped(table.id, tid) {
-            continue;
-        }
+        // Under a `FOR UPDATE` / `FOR SHARE` guard: hidden or replaced (see `scan_table`).
+        let tuple = match super::lock_skip::resolve(table.id, tid) {
+            super::lock_skip::Seen::Hide => continue,
+            super::lock_skip::Seen::Replace(newer) => newer,
+            super::lock_skip::Seen::Keep => tuple,
+        };
         out.push((tid, row::decode(&tuple, &schema)?));
     }
     Ok(out)

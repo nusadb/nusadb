@@ -40,8 +40,9 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use nusadb_core::engine::{
-    AlterOp, IndexDef, IndexKind, IsolationLevel, RowLockMode, ScanDirection, SequenceChange,
-    SequenceDef, SequenceRestart, SharedTuple, TableDef, TableLockMode, TableStats, Tid, TupleScan,
+    AlterOp, IndexDef, IndexKind, IsolationLevel, LockedRow, RowLockMode, ScanDirection,
+    SequenceChange, SequenceDef, SequenceRestart, SharedTuple, TableDef, TableLockMode, TableStats,
+    Tid, TupleScan,
 };
 use nusadb_core::{
     Constraint, ConstraintKind, Error, FkAction, ForeignKeyDef, IndexId, PageStore, Result,
@@ -6930,6 +6931,59 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
             matches!(mode, RowLockMode::Exclusive),
         )
+    }
+
+    fn lock_row_current(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        tid: Tid,
+        mode: RowLockMode,
+    ) -> Result<LockedRow> {
+        // With the row lock held no other transaction can write the row (a writer takes the same
+        // lock), so its newest version is settled: whoever wrote it has committed, or it is this
+        // transaction's own. A version the snapshot cannot see was committed after the snapshot
+        // was taken, while the row lock was free; the caller read an older version.
+        let snapshot = {
+            let mut t = self.txns.lock().map_err(|_| poisoned())?;
+            if !t.txns.contains_key(&txn.0) {
+                return Err(unknown_txn(txn));
+            }
+            t.lock_table_intention(txn.0, table.0)?;
+            t.acquire_lock(
+                txn.0,
+                LockId::Row {
+                    table: table.0,
+                    page: tid.page.0,
+                    slot: tid.slot.0,
+                },
+                matches!(mode, RowLockMode::Exclusive),
+            )?;
+            t.view_for(txn.0)?
+        };
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        let t = cat
+            .tables
+            .get(&table.0)
+            .ok_or_else(|| table_not_found(table))?;
+        let row_id = row_id_of(tid);
+        let tree = ClusteredTree::open(&*self.store, t.root_id());
+        let Some((stored, overflow)) = tree.get_stored(row_id)? else {
+            // Purged: deleted long enough ago that no transaction needs it.
+            return Ok(LockedRow::Deleted);
+        };
+        let (meta, _) = mvcc::decode_row(&stored).ok_or_else(|| corrupt_row(row_id))?;
+        if meta.xmax != mvcc::NO_XMAX {
+            // A delete the snapshot sees would have kept the row out of the caller's read, so this
+            // one came after it.
+            return Ok(LockedRow::Deleted);
+        }
+        if snapshot.sees(meta.xmin) {
+            return Ok(LockedRow::Unchanged);
+        }
+        let mut scratch = Vec::new();
+        let tuple = head_tuple(&tree, row_id, &stored, overflow, &mut scratch)?;
+        Ok(LockedRow::Updated(tuple.to_vec()))
     }
 
     fn lock_key(&self, txn: TxnId, table: TableId, key_hash: u64, mode: RowLockMode) -> Result<()> {

@@ -1,46 +1,86 @@
-//! Thread-local "skip these base rows" set for `FOR UPDATE ... SKIP LOCKED` (the job-queue
-//! pattern: workers claim rows without blocking on each other).
+//! Thread-local per-row overrides for `SELECT ... FOR UPDATE` / `FOR SHARE`.
 //!
-//! [`LockRows`](super::PhysicalOperator::LockRows) populates the set with the tids whose row lock
-//! another transaction holds, then executes its inner pipeline under the returned guard; every
-//! base-scan path consults [`skipped`] so a skipped row never reaches the output — and a `LIMIT`
-//! above the scan therefore fills up from lockable rows, like the reference engine. A thread-local is safe here for
-//! the same reason as [`recursive::working_set`](super::recursive): a statement executes on one
-//! blocking-pool thread end to end.
+//! [`LockRows`](super::PhysicalOperator::LockRows) records, per base row, whether its pipeline must
+//! hide it (another transaction holds its lock under `SKIP LOCKED`, it lies past the lock cap, or
+//! it changed after the snapshot and no longer matches) or read its newer version (it changed and
+//! still matches), then executes the pipeline under the returned guard. Every base-scan path
+//! consults [`resolve`], so a hidden row never reaches the output, a `LIMIT` above the scan fills
+//! up from the rows actually locked, and a locked row reads as its newest version. A thread-local
+//! is safe here for the same reason as [`recursive::working_set`](super::recursive): a statement
+//! executes on one blocking-pool thread end to end.
 //!
-//! Known scope: the guard covers every scan of the target table while the pipeline runs, so a
-//! (rare) subquery in the SELECT list that re-reads the same table also skips those rows; the
-//! analyzer already keeps the lockable shape simple (single table, subquery-free WHERE).
+//! The overrides are kept per table: a `FOR UPDATE` over an inheritance parent nests one
+//! `LockRows` per table, and each must see its own decisions and leave the others' in place.
+//!
+//! Known scope: a guard covers every scan of its table while the pipeline runs, so a (rare)
+//! subquery in the SELECT list that re-reads the same table sees the same overrides; the analyzer
+//! already keeps the lockable shape simple (subquery-free WHERE).
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-use nusadb_core::{TableId, Tid};
+use nusadb_core::{SharedTuple, TableId, Tid};
+
+/// Per row of a locked table: `None` hides it, a tuple replaces it.
+type Overrides = HashMap<Tid, Option<SharedTuple>>;
 
 thread_local! {
-    static SKIP: RefCell<Option<(TableId, HashSet<Tid>)>> = const { RefCell::new(None) };
+    static OVERRIDES: RefCell<HashMap<TableId, Overrides>> = RefCell::new(HashMap::new());
 }
 
-/// RAII guard: clears the skip set when the `LockRows` execution ends.
-pub(super) struct SkipGuard;
+/// RAII guard: when the `LockRows` execution ends, restores what its table's overrides were before
+/// it (nothing, unless an enclosing `LockRows` locked the same table).
+pub(super) struct OverrideGuard {
+    table: TableId,
+    previous: Option<Overrides>,
+}
 
-impl Drop for SkipGuard {
+impl Drop for OverrideGuard {
     fn drop(&mut self) {
-        SKIP.with(|slot| *slot.borrow_mut() = None);
+        OVERRIDES.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match self.previous.take() {
+                Some(previous) => {
+                    slot.insert(self.table, previous);
+                },
+                None => {
+                    slot.remove(&self.table);
+                },
+            }
+        });
     }
 }
 
-/// Install the skip set for `table` for the lifetime of the returned guard.
-pub(super) fn scope(table: TableId, tids: HashSet<Tid>) -> SkipGuard {
-    SKIP.with(|slot| *slot.borrow_mut() = Some((table, tids)));
-    SkipGuard
+/// Install `overrides` for `table` for the lifetime of the returned guard: a tid mapped to `None`
+/// is hidden from every scan of `table`, one mapped to a tuple reads as that tuple.
+pub(super) fn scope(table: TableId, overrides: Overrides) -> OverrideGuard {
+    let previous = OVERRIDES.with(|slot| slot.borrow_mut().insert(table, overrides));
+    OverrideGuard { table, previous }
 }
 
-/// Whether `tid` of `table` is currently being skipped (`SKIP LOCKED`).
-pub(super) fn skipped(table: TableId, tid: Tid) -> bool {
-    SKIP.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|(t, set)| *t == table && set.contains(&tid))
-    })
+/// How a scan sees a row while a `LockRows` guard is active.
+pub(super) enum Seen {
+    /// As the scan read it.
+    Keep,
+    /// Not at all: another transaction holds it locked (`SKIP LOCKED`), it lies past the lock
+    /// cap, or it changed after the snapshot and no longer matches.
+    Hide,
+    /// As this newer version: it changed after the snapshot and still matches.
+    Replace(SharedTuple),
+}
+
+/// How a scan of `table` sees `tid` (always [`Seen::Keep`] with no guard active).
+pub(super) fn resolve(table: TableId, tid: Tid) -> Seen {
+    OVERRIDES.with(
+        |slot| match slot.borrow().get(&table).and_then(|o| o.get(&tid)) {
+            Some(None) => Seen::Hide,
+            Some(Some(tuple)) => Seen::Replace(SharedTuple::clone(tuple)),
+            None => Seen::Keep,
+        },
+    )
+}
+
+/// Whether `tid` of `table` is hidden from scans (see [`resolve`]).
+pub(super) fn hidden(table: TableId, tid: Tid) -> bool {
+    matches!(resolve(table, tid), Seen::Hide)
 }

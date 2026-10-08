@@ -516,17 +516,14 @@ pub fn plan_select(select: SelectPlan) -> PhysicalOperator {
             filter,
         };
     } else if !select.order_by.is_empty() && !select.sort_after_projection {
-        // `FOR UPDATE ... SKIP LOCKED` fills its LIMIT from *lockable* rows — the executor skips a
-        // row another txn holds locked and keeps scanning. A capped ordered index scan can't honour
-        // that, so it is disqualified below; the Sort+SeqScan path is kept instead.
-        let skip_locked = matches!(row_lock, Some((_, true, _)));
-        if let Some(ordered) = try_ordered_index_scan(
-            &op,
-            &select.order_by,
-            &select.indexes,
-            top_n_hint,
-            skip_locked,
-        ) {
+        // `FOR UPDATE` / `FOR SHARE` fills its LIMIT from the rows it actually locked: the
+        // executor hides a row it could not lock or that changed and no longer matches, and keeps
+        // scanning. A capped ordered index scan can't honour that, so it is disqualified below;
+        // the Sort+SeqScan path is kept instead.
+        let locking = row_lock.is_some();
+        if let Some(ordered) =
+            try_ordered_index_scan(&op, &select.order_by, &select.indexes, top_n_hint, locking)
+        {
             // The ORDER BY is a prefix of a scannable index's key — the ordered scan provides the
             // order and stops at the LIMIT, so the Sort is dropped entirely.
             op = ordered;
@@ -923,16 +920,16 @@ fn try_ordered_index_scan(
     order_by: &[OrderByKey],
     indexes: &[IndexMeta],
     top_n_cap: Option<u64>,
-    skip_locked: bool,
+    locking: bool,
 ) -> Option<PhysicalOperator> {
-    // `FOR UPDATE ... SKIP LOCKED` must fill its LIMIT from *lockable* rows: the executor skips a
-    // row another txn holds locked mid-scan and keeps going. A capped ordered index scan can't do
-    // that — the engine stops after `cap` *visible* rows in key order with no notion of locks, so a
-    // locked row inside the cap would drop the result below the LIMIT even though lockable rows
-    // remain past it. Keep the Sort+SeqScan path (which skips locked rows as it scans, then sorts
-    // and limits the survivors) whenever SKIP LOCKED is in force. Plain `FOR UPDATE` (no skip) is
-    // unaffected — with no rows skipped, the capped scan returns exactly the LIMIT rows in order.
-    if skip_locked {
+    // `FOR UPDATE` / `FOR SHARE` must fill its LIMIT from the rows it locked: the executor hides a
+    // row another transaction holds locked (`SKIP LOCKED`) or one that changed after the snapshot
+    // and no longer matches, and keeps going. A capped ordered index scan can't do that: the
+    // engine stops after `cap` *visible* rows in key order with no notion of locks, so a hidden row
+    // inside the cap would drop the result below the LIMIT even though lockable rows remain past
+    // it. Keep the Sort+SeqScan path whenever rows are locked; the lock step scans the whole table
+    // for its candidates anyway, so the capped scan would save little.
+    if locking {
         return None;
     }
     // The already-computed top-N cap is `Some(offset + limit)` only when a plain `LIMIT` (no

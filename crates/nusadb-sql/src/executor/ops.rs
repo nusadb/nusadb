@@ -1579,8 +1579,9 @@ fn execute_op_inner(
             lock_cap,
         } => {
             // `FOR UPDATE` / `FOR SHARE`: take a row lock on every base row that satisfies the
-            // predicate, then return the pipeline's rows unchanged. The analyzer guarantees a
-            // single-table shape and a subquery-free predicate, so the WHERE evaluates against the
+            // predicate, then return the pipeline's rows, each read as the version that was locked
+            // (see below). One `LockRows` covers one table (an inheritance parent nests one per
+            // table), and the predicate is subquery-free, so the WHERE evaluates against the
             // scanned base row directly. The lock is held until the transaction ends; the lock
             // manager is no-wait, so a concurrent writer of a locked row aborts with a serialization
             // conflict rather than blocking (the lost-update escape hatch).
@@ -1595,7 +1596,19 @@ fn execute_op_inner(
             // conflict without waiting; re-tagging it from the default retryable serialization
             // conflict (`40001`) to `55P03` is what tells a client this is a genuine "row is locked",
             // not a transient conflict to retry — matching how the reference engine classifies it.
-            let mut lock_held_elsewhere: HashSet<Tid> = HashSet::new();
+            //
+            // A row can also change after the snapshot this statement read: another transaction
+            // updated or deleted it and committed while its lock was free. Taking the lock then
+            // succeeds, but the version read is no longer the row. `lock_row_current` reports that,
+            // and it is handled as the isolation level requires: under REPEATABLE READ and
+            // SERIALIZABLE it is a serialization conflict (the transaction's snapshot cannot see
+            // the row it would lock); under READ COMMITTED the newest version is checked against
+            // the WHERE again: it is returned when it still matches, and the row is left out when
+            // it does not (or was deleted), so a LIMIT moves on to the next candidate.
+            //
+            // The pipeline then runs under a guard that applies those decisions to every scan of
+            // the table: rows to leave out are hidden, changed rows read as their newest version.
+            let mut overrides: HashMap<Tid, Option<nusadb_core::SharedTuple>> = HashMap::new();
             // Candidates are walked in the query's ORDER BY order so a row cap locks exactly the
             // first rows the query returns; without the lock the sort/limit above would return
             // them anyway, so the ordering work is the same.
@@ -1625,24 +1638,56 @@ fn execute_op_inner(
                 });
                 candidates = decorated.into_iter().map(|(_, pair)| pair).collect();
             }
+            let snapshot_is_fixed = matches!(
+                engine.txn_isolation(txn),
+                Some(
+                    nusadb_core::IsolationLevel::RepeatableRead
+                        | nusadb_core::IsolationLevel::Serializable
+                )
+            );
+            let schema = column_types(table);
             // Lock up to the row cap (offset + limit): a `LIMIT 1` job-queue claim locks ONE row,
             // leaving the rest for other workers — locking every match would starve them all.
             let cap = lock_cap.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
             let mut locked = 0usize;
             for (tid, _) in candidates {
                 if locked >= cap {
-                    // Beyond the cap nothing is locked; the limit above never outputs these rows.
-                    // Under SKIP LOCKED they must also be HIDDEN, or the limit would refill its
-                    // quota with unlocked rows past the skipped ones.
-                    if *skip_locked {
-                        lock_held_elsewhere.insert(tid);
-                    }
+                    // Beyond the cap nothing is locked, so nothing beyond it may be output: hide
+                    // it, and the limit above returns exactly the rows locked, whatever order a
+                    // changed row now sorts in.
+                    overrides.insert(tid, None);
                     continue;
                 }
-                match engine.lock_row(txn, table.id, tid, *mode) {
-                    Ok(()) => locked += 1,
+                match engine.lock_row_current(txn, table.id, tid, *mode) {
+                    Ok(nusadb_core::engine::LockedRow::Unchanged) => locked += 1,
+                    Ok(
+                        nusadb_core::engine::LockedRow::Updated(_)
+                        | nusadb_core::engine::LockedRow::Deleted,
+                    ) if snapshot_is_fixed => {
+                        return Err(Error::Core(nusadb_core::Error::SerializationConflict {
+                            txn,
+                        }));
+                    },
+                    Ok(nusadb_core::engine::LockedRow::Updated(tuple)) => {
+                        let newest = row::decode(&tuple, &schema)?;
+                        let still_matches = match predicate {
+                            Some(pred) => {
+                                matches!(eval::eval(pred, &newest)?, ast::Value::Bool(true))
+                            },
+                            None => true,
+                        };
+                        if still_matches {
+                            overrides.insert(tid, Some(nusadb_core::SharedTuple::from(tuple)));
+                            locked += 1;
+                        } else {
+                            overrides.insert(tid, None);
+                        }
+                    },
+                    Ok(nusadb_core::engine::LockedRow::Deleted) => {
+                        overrides.insert(tid, None);
+                    },
                     Err(nusadb_core::Error::SerializationConflict { .. }) if *skip_locked => {
-                        lock_held_elsewhere.insert(tid);
+                        overrides.insert(tid, None);
                     },
                     Err(nusadb_core::Error::SerializationConflict { .. }) if *nowait => {
                         return Err(Error::Coded {
@@ -1656,8 +1701,8 @@ fn execute_op_inner(
                     Err(e) => return Err(e.into()),
                 }
             }
-            let _guard = (!lock_held_elsewhere.is_empty())
-                .then(|| super::lock_skip::scope(table.id, lock_held_elsewhere));
+            let _guard =
+                (!overrides.is_empty()).then(|| super::lock_skip::scope(table.id, overrides));
             execute_op(input, engine, txn)
         },
         PhysicalOperator::Sample {
