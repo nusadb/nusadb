@@ -333,3 +333,82 @@ fn do_update_honest_rejects() {
         .is_err()
     );
 }
+
+#[test]
+fn a_key_written_as_text_conflicts_with_the_stored_value_of_its_type() {
+    // A key value written as an untyped literal only takes its column's type when stored; the
+    // conflict probe and the uniqueness checks must see it as that type, or an upsert inserts a
+    // second row with the same key.
+    let keys = [
+        ("DATE", "'2026-09-15'", "DATE '2026-09-15'"),
+        (
+            "TIMESTAMP",
+            "'2026-09-15 10:00:00'",
+            "TIMESTAMP '2026-09-15 10:00:00'",
+        ),
+        (
+            "TIMESTAMPTZ",
+            "'2026-09-15 10:00:00+00'",
+            "CAST('2026-09-15 10:00:00+00' AS TIMESTAMPTZ)",
+        ),
+        (
+            "UUID",
+            "'00000000-0000-0000-0000-000000000001'",
+            "CAST('00000000-0000-0000-0000-000000000001' AS UUID)",
+        ),
+        ("NUMERIC", "'1.50'", "1.50"),
+        ("BOOL", "'true'", "TRUE"),
+        ("BYTEA", "'\\x00ff'", "CAST('\\x00ff' AS BYTEA)"),
+        ("TIME", "'10:00:00'", "CAST('10:00:00' AS TIME)"),
+        (
+            "MACADDR",
+            "'08:00:2b:01:02:03'",
+            "CAST('08-00-2B-01-02-03' AS MACADDR)",
+        ),
+    ];
+    for (ty, untyped, typed) in keys {
+        for (key, target) in [
+            ("PRIMARY KEY (k)", "(k)"),
+            ("PRIMARY KEY (a, k)", "(a, k)"),
+            ("UNIQUE (a, k)", "(a, k)"),
+        ] {
+            for (action, want) in [("DO UPDATE SET v = EXCLUDED.v", 3), ("DO NOTHING", 1)] {
+                let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+                let mut session = Session::new(engine);
+                exec(
+                    engine,
+                    &mut session,
+                    &format!("CREATE TABLE t (a INT NOT NULL, k {ty} NOT NULL, v INT, {key})"),
+                );
+                exec(
+                    engine,
+                    &mut session,
+                    &format!("INSERT INTO t VALUES (1, {untyped}, 1)"),
+                );
+                for (value, v) in [(untyped, 2), (typed, 3)] {
+                    exec(
+                        engine,
+                        &mut session,
+                        &format!(
+                            "INSERT INTO t VALUES (1, {value}, {v}) ON CONFLICT {target} {action}"
+                        ),
+                    );
+                }
+                assert_eq!(
+                    rows(engine, &mut session, "SELECT v FROM t"),
+                    vec![vec![Value::Int(want)]],
+                    "{ty} {key} {action}"
+                );
+                assert!(
+                    try_exec(
+                        engine,
+                        &mut session,
+                        &format!("INSERT INTO t VALUES (1, {untyped}, 9)")
+                    )
+                    .is_err(),
+                    "{ty} {key}: a plain duplicate is refused"
+                );
+            }
+        }
+    }
+}

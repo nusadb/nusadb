@@ -1434,6 +1434,7 @@ fn insert_rows_with_unique(
             if let Some((enum_type, labels)) = enum_info.get(idx).and_then(Option::as_ref) {
                 row::coerce_enum(value, labels, enum_type)?;
             }
+            stored_form(value, *ty)?;
         }
         full_rows.push(full);
     }
@@ -1547,6 +1548,45 @@ fn insert_rows_with_unique(
     Ok((full_rows, tids))
 }
 
+/// Turn a value supplied as text for a column of another type (an untyped literal such as
+/// `'2026-09-15'` for a `DATE`, or a text parameter) into the column's own type: the value it reads
+/// back as once stored. Without this the row would only take its column's type when encoded,
+/// so a uniqueness or `ON CONFLICT` check made before that compares text with the stored value and
+/// misses a duplicate. A malformed value fails here with the same error the write would raise.
+///
+/// Only the types whose values have an index-key encoding are converted. Any other type keeps its
+/// text until it is stored, as before: its typed values cannot be index keys yet.
+fn stored_form(value: &mut ast::Value, ty: ColumnType) -> Result<(), Error> {
+    let keyable = matches!(
+        ty,
+        ColumnType::Bool
+            | ColumnType::Int
+            | ColumnType::SmallInt
+            | ColumnType::BigInt
+            | ColumnType::Float
+            | ColumnType::Real
+            | ColumnType::Numeric { .. }
+            | ColumnType::Bytes
+            | ColumnType::Date
+            | ColumnType::Time
+            | ColumnType::TimeTz
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Uuid
+            | ColumnType::Macaddr
+            | ColumnType::Macaddr8
+    );
+    if !keyable || !matches!(value, ast::Value::Text(_)) {
+        return Ok(());
+    }
+    let schema = [ty];
+    let stored = row::decode(&row::encode(std::slice::from_ref(value), &schema)?, &schema)?;
+    if let Some(typed) = stored.into_iter().next() {
+        *value = typed;
+    }
+    Ok(())
+}
+
 /// Execute `INSERT ... ON CONFLICT (target) DO UPDATE SET ... [WHERE ...]` — the upsert.
 ///
 /// Each proposed row that collides (on the arbiter's `PRIMARY KEY`/`UNIQUE` key) with an existing
@@ -1606,6 +1646,7 @@ fn upsert_rows(
             });
         }
     }
+    let schema = column_types(table);
     // Materialize the proposed rows in full-table layout.
     let mut proposed: Vec<Row> = Vec::with_capacity(value_rows.len());
     for values in value_rows {
@@ -1627,12 +1668,21 @@ fn upsert_rows(
             }
         }
         apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
+        // Each value in its column's own type, exactly as a plain INSERT prepares it, so the
+        // conflict probe and the uniqueness checks below compare it with the stored rows.
+        for (idx, (value, ty)) in full.iter_mut().zip(&schema).enumerate() {
+            row::adopt_column_type(value, *ty);
+            row::coerce_char_length(value, *ty)?;
+            if let Some((enum_type, labels)) = enum_info.get(idx).and_then(Option::as_ref) {
+                row::coerce_enum(value, labels, enum_type)?;
+            }
+            stored_form(value, *ty)?;
+        }
         proposed.push(full);
     }
 
     let key_ordinals = resolve_arbiter(table, target, engine)?;
     let existing = scan_table(table, engine, txn)?;
-    let schema = column_types(table);
     let index_targets = secondary_index_targets(table, engine)?;
 
     // Each conflicting row's `(tid, old image, new image)` — the old image feeds UPDATE triggers
