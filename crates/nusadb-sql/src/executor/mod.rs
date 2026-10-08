@@ -1478,7 +1478,8 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// session-dependent built-ins (`NOW`, `RANDOM`, `CURRENT_USER`, …) and user-defined functions (which
 /// may be non-deterministic). These are the exact-case [`ast::ScalarFunc`] variant names plus
 /// `ScalarUdf`, so a genuine volatile call is never missed; an incidental match (e.g. a quoted
-/// identifier) only skips caching, which is always safe.
+/// identifier) only skips caching, which is always safe. Keep in step with the analyzer's
+/// `is_volatile_scalar_func`.
 const VOLATILE_PLAN_MARKERS: [&str; 23] = [
     "ScalarUdf",
     // Sequence built-ins advance / read engine + session state per call, so a memoized result would
@@ -3786,19 +3787,17 @@ fn scannable_indexes_of(
         if !engine.index_is_complete(id)? {
             continue;
         }
-        // A functional/expression key (`key_exprs`) or a partial predicate makes this index
-        // unsafe as an equality/range scan candidate: the planner encodes scan bounds from the
-        // query's plain-column values in ascending key order, which would not match a key computed
-        // from an expression, nor an index that holds only the rows satisfying a predicate. Such
-        // indexes are still maintained (and enforce uniqueness) — they are simply not offered as a
-        // scan path, so the query falls back to a sequential scan, which is correct. (Matching a
-        // functional index to a `WHERE lower(s) = …` predicate is possible future work.)
-        if !def.key_exprs.is_empty() || def.predicate.is_some() {
+        // A partial index holds only the rows satisfying its predicate, so a scan through it could
+        // miss rows: it is maintained (and enforces uniqueness) but not offered as a scan path. An
+        // index keyed on expressions is offered; the planner uses it only for a predicate on the
+        // same expression.
+        if def.predicate.is_some() {
             continue;
         }
         out.push(crate::IndexInfo {
             name: def.name,
             columns: def.columns,
+            key_exprs: def.key_exprs,
             unique: def.unique,
         });
     }

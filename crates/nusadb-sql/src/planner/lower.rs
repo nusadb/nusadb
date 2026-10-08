@@ -772,15 +772,30 @@ pub(super) fn try_index_scan(
         let mut prefix: Vec<ast::Value> = Vec::new();
         let mut range: Option<(RangeSide, RangeSide)> = None;
         let mut selectivity = 1.0_f64;
-        for &col in &index.columns {
-            // The index-key encoding is per the column's type, so a bound value must be coerced
+        // The key's parts: its columns, or its expressions for an index keyed on expressions.
+        let parts: Vec<(KeyPart<'_>, ColumnType)> = if index.key_exprs.is_empty() {
+            let mut parts = Vec::with_capacity(index.columns.len());
+            for &col in &index.columns {
+                let Some(column) = table.columns.get(col) else {
+                    break;
+                };
+                parts.push((KeyPart::Column(col), column.ty));
+            }
+            parts
+        } else {
+            index
+                .key_exprs
+                .iter()
+                .map(|e| (KeyPart::Expr(e), e.ty))
+                .collect()
+        };
+        for (part, ty) in &parts {
+            // The index-key encoding is per the key part's type, so a bound value must be coerced
             // to it (e.g. an integer bound on a NUMERIC column), or its bytes would not line up.
-            let Some(column) = table.columns.get(col) else {
-                break;
-            };
-            let found = column_bounds(&conjuncts, col, stats);
-            // Equality extends the key prefix; it must coerce exactly to the column type.
-            if let Some(key_val) = found.eq.and_then(|v| coerce_index_bound(v, column.ty)) {
+            let ty = *ty;
+            let found = key_part_bounds(&conjuncts, part, stats);
+            // Equality extends the key prefix; it must coerce exactly to the part's type.
+            if let Some(key_val) = found.eq.and_then(|v| coerce_index_bound(v, ty)) {
                 prefix.push(key_val);
                 selectivity *= found.eq_selectivity;
                 continue;
@@ -789,10 +804,10 @@ pub(super) fn try_index_scan(
             // unbounded (the retained filter removes the extra rows: a superset scan).
             let lo = found
                 .lo
-                .and_then(|(v, inc)| coerce_index_bound(v, column.ty).map(|c| (c, inc)));
+                .and_then(|(v, inc)| coerce_index_bound(v, ty).map(|c| (c, inc)));
             let hi = found
                 .hi
-                .and_then(|(v, inc)| coerce_index_bound(v, column.ty).map(|c| (c, inc)));
+                .and_then(|(v, inc)| coerce_index_bound(v, ty).map(|c| (c, inc)));
             if lo.is_some() || hi.is_some() {
                 selectivity *= found.range_selectivity;
                 range = Some((lo, hi));
@@ -832,13 +847,13 @@ pub(super) fn try_index_scan(
 
         // Equality on every column of a UNIQUE index matches at most one row: the property the
         // reactor-inline point-get gate requires.
-        let unique_point = index.unique && range.is_none() && prefix.len() == index.columns.len();
+        let unique_point = index.unique && range.is_none() && prefix.len() == parts.len();
         let scan = PhysicalOperator::IndexScan {
             table: table.clone(),
             index: index.name.clone(),
             lo,
             hi,
-            key_columns: index.columns.len(),
+            key_columns: parts.len(),
             unique_point,
             direction: nusadb_core::engine::ScanDirection::Forward,
             limit: None,
@@ -871,9 +886,39 @@ struct ColumnBounds<'a> {
     range_selectivity: f64,
 }
 
-fn column_bounds<'a>(
+/// One part of an index key: a table column, or a key expression of an index keyed on expressions.
+enum KeyPart<'a> {
+    Column(usize),
+    Expr(&'a TypedExpr),
+}
+
+impl KeyPart<'_> {
+    /// Whether `expr` is this key part: the same column, or the same resolved expression.
+    fn is(&self, expr: &TypedExpr) -> bool {
+        match self {
+            Self::Column(col) => matches!(expr.kind, TypedExprKind::Column(ord) if ord == *col),
+            Self::Expr(key) => expr == *key,
+        }
+    }
+
+    /// A conjunct `part <op> literal` (or `literal <op> part`, flipped) as `(op, literal)`.
+    fn op_literal<'e>(&self, conjunct: &'e TypedExpr) -> Option<(ast::BinaryOp, &'e ast::Value)> {
+        let TypedExprKind::Binary { left, op, right } = &conjunct.kind else {
+            return None;
+        };
+        match (&left.kind, &right.kind) {
+            (_, TypedExprKind::Literal(value)) if self.is(left) => Some((*op, value)),
+            (TypedExprKind::Literal(value), _) if self.is(right) => {
+                Some((flip_comparison(*op)?, value))
+            },
+            _ => None,
+        }
+    }
+}
+
+fn key_part_bounds<'a>(
     conjuncts: &[&'a TypedExpr],
-    col: usize,
+    part: &KeyPart<'_>,
     stats: Option<&crate::executor::cost::ScanStats>,
 ) -> ColumnBounds<'a> {
     let mut found = ColumnBounds {
@@ -894,8 +939,7 @@ fn column_bounds<'a>(
             negated: false,
             symmetric: false,
         } = &conjunct.kind
-            && let TypedExprKind::Column(ord) = expr.kind
-            && ord == col
+            && part.is(expr)
             && let (TypedExprKind::Literal(low_value), TypedExprKind::Literal(high_value)) =
                 (&low.kind, &high.kind)
             && is_index_safe_value(low_value)
@@ -908,10 +952,10 @@ fn column_bounds<'a>(
             found.hi.get_or_insert((high_value, true));
             continue;
         }
-        let Some((ord, op, value)) = col_op_literal(conjunct) else {
+        let Some((op, value)) = part.op_literal(conjunct) else {
             continue;
         };
-        if ord != col || !is_index_safe_value(value) {
+        if !is_index_safe_value(value) {
             continue;
         }
         let conjunct_selectivity =

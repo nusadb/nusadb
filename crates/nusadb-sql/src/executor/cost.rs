@@ -362,7 +362,13 @@ fn binary_selectivity(
         },
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
             let Some((index, value, flipped)) = column_and_literal(left, right) else {
-                return DEFAULT_SELECTIVITY;
+                // `expression <op> literal` (an indexed expression, say) has no column
+                // statistics, so it gets the same per-operator default as a column without them.
+                return if is_literal(left) == is_literal(right) {
+                    DEFAULT_SELECTIVITY
+                } else {
+                    comparison_default(op)
+                };
             };
             let Some((cs, ty)) = ctx.column(index) else {
                 return comparison_default(op);
@@ -549,6 +555,10 @@ fn between_selectivity(
         _ => DEFAULT_RANGE,
     };
     if negated { 1.0 - sel } else { sel }
+}
+
+const fn is_literal(expr: &TypedExpr) -> bool {
+    matches!(expr.kind, TypedExprKind::Literal(_))
 }
 
 /// Destructure `col <op> literal` (or the flipped `literal <op> col`). Returns

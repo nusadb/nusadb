@@ -3982,8 +3982,9 @@ fn join_source(
 /// matches at most one row, and the caller always re-applies the full `WHERE` per row), so no
 /// qualifying row is missed and no extra row is affected. Restricting to a unique *point* lookup
 /// also bounds the result to ≤1 row, so there is no scan-order difference to reason about versus a
-/// sequential scan. Only the safe, complete, plain-column indexes ([`catalog_list_indexes`] already
-/// drops functional / partial / still-building indexes) are offered as a path.
+/// sequential scan. Only the complete, plain-column indexes are offered as a path
+/// ([`catalog_list_indexes`] already drops partial and still-building indexes; one keyed on
+/// expressions has no key columns and is skipped here).
 fn try_point_get_rows(
     table: &TableSchema,
     filter: Option<&TypedExpr>,
@@ -4010,6 +4011,7 @@ fn try_point_get_rows(
             metas.push(crate::planner::IndexMeta {
                 name: info.name,
                 columns,
+                key_exprs: Vec::new(),
                 unique: info.unique,
             });
         }

@@ -1645,14 +1645,18 @@ pub struct ModifyingCteDef {
     pub plan: Box<LogicalPlan>,
 }
 
-/// A base-table index, resolved for planning: its name plus the table-column ordinals it keys, in
-/// index order. The resolved form of [`crate::analyzer::IndexInfo`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A base-table index, resolved for planning: its name plus the table-column ordinals or the key
+/// expressions it keys, in index order. The resolved form of [`crate::analyzer::IndexInfo`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexMeta {
     /// Index name, passed to [`PhysicalOperator::IndexScan`] and resolved to an `IndexId` at exec.
     pub name: String,
-    /// Key column ordinals into `table.columns`, in index order.
+    /// Key column ordinals into `table.columns`, in index order. Empty for an index keyed on
+    /// expressions.
     pub columns: Vec<usize>,
+    /// The key expressions, resolved against the table, for an index keyed on expressions; empty
+    /// for a column index. A query predicate on the same expression can use the index.
+    pub key_exprs: Vec<TypedExpr>,
     /// Whether the index enforces key uniqueness (from [`crate::analyzer::IndexInfo::unique`]).
     pub unique: bool,
 }

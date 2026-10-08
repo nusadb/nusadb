@@ -2040,6 +2040,28 @@ fn resolve_table_indexes(
     };
     let mut out = Vec::new();
     for info in catalog.list_indexes_in(&schema.schema, &schema.name)? {
+        if !info.key_exprs.is_empty() {
+            // Keyed on expressions: resolve each against the table, exactly as writes compute the
+            // key. One that no longer analyzes makes the index unusable for scans, and so does one
+            // whose value depends on the session or the moment (`now()`, `random()`, the time
+            // zone): the key a write stored would not be the one a lookup computes.
+            let key_exprs: Result<Vec<TypedExpr>, Error> = info
+                .key_exprs
+                .iter()
+                .map(|sql| super::analyze_index_key_expr(sql, schema, catalog))
+                .collect();
+            if let Ok(key_exprs) = key_exprs
+                && key_exprs.iter().all(super::expr_is_index_immutable)
+            {
+                out.push(IndexMeta {
+                    name: info.name,
+                    columns: Vec::new(),
+                    key_exprs,
+                    unique: info.unique,
+                });
+            }
+            continue;
+        }
         let mut columns = Vec::with_capacity(info.columns.len());
         let mut ok = true;
         for col in &info.columns {
@@ -2053,6 +2075,7 @@ fn resolve_table_indexes(
             out.push(IndexMeta {
                 name: info.name,
                 columns,
+                key_exprs: Vec::new(),
                 unique: info.unique,
             });
         }

@@ -646,6 +646,18 @@ query whose ordering column is nullable is served by an explicit sort that follo
 `NULLS` clause. The planner picks an index from
 collected statistics, so run `ANALYZE` after a large load (see [Maintenance](#maintenance)).
 
+An expression index serves a `WHERE` comparison against a constant on exactly the same expression
+(`lower(email) = 'a@x.org'` uses `orders_lower` above; `upper(email) = ...` does not). There are no
+statistics on an expression, so an equality is assumed selective and takes the index, while a range
+on it is assumed to keep a third of the rows and, once the table is analyzed, runs as a sequential
+scan. An expression whose value depends on the session or the moment is never used to
+answer a query, because the key stored when a row was written need not be the value a later query
+computes: anything that reads the current time or a random value (`now()`, `random()`), and
+anything involving a `TIMESTAMPTZ` or `TIMETZ` value, which the session's `TimeZone` setting
+changes (`CAST(ts AS DATE)`, `extract(hour FROM ts)`). Index such a value through a stored
+generated column instead. A partial index keeps only the rows that satisfy its predicate,
+so it is maintained and enforces uniqueness but is never used to answer a query.
+
 ### Views, sequences, domains, schemas, databases
 
 ```sql

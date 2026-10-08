@@ -580,8 +580,11 @@ pub struct FunctionDef {
 pub struct IndexInfo {
     /// Index name, used to resolve the `IndexId` at execution time.
     pub name: String,
-    /// Key column names, in index order.
+    /// Key column names, in index order. Empty for an index keyed on expressions.
     pub columns: Vec<String>,
+    /// The key expressions (SQL text), in index order, for an index keyed on expressions; empty
+    /// for a column index.
+    pub key_exprs: Vec<String>,
     /// Whether the index enforces key uniqueness — an equality bound covering the whole key
     /// then matches at most one row, which the reactor-inline point-get gate relies on.
     pub unique: bool,
@@ -1431,7 +1434,28 @@ fn ivm_base_table(body: &SelectPlan) -> Option<String> {
 /// UDFs (which may be non-deterministic), set-returning calls, and volatile built-ins (`NOW`,
 /// `RANDOM`, `gen_random_uuid`, session functions, …); recurses through every other node's children.
 pub(super) fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
+    expr_all(expr, &|_| true)
+}
+
+/// Whether an index key expression yields the same value for the same row in every session, so a
+/// key written by one session is found by a lookup in another: [`expr_is_ivm_stable`], and nothing
+/// in it is a `TIMESTAMPTZ`/`TIMETZ` value, which the session time zone turns into a different
+/// date, text or field (`CAST(ts AS DATE)`, `extract(hour FROM ts)`, a cast of text to
+/// `TIMESTAMPTZ`).
+pub(crate) fn expr_is_index_immutable(expr: &TypedExpr) -> bool {
+    expr_all(expr, &|node| {
+        !matches!(node.ty, ColumnType::TimestampTz | ColumnType::TimeTz)
+    })
+}
+
+/// Whether every node of `expr` is deterministic for a given row (see [`expr_is_ivm_stable`]) and
+/// satisfies `ok`.
+fn expr_all(expr: &TypedExpr, ok: &dyn Fn(&TypedExpr) -> bool) -> bool {
     use crate::planner::TypedExprKind as K;
+    let all = |e: &TypedExpr| expr_all(e, ok);
+    if !ok(expr) {
+        return false;
+    }
     match &expr.kind {
         K::Literal(_) | K::Column(_) => true,
         // Non-deterministic / context-dependent / can't-incrementalize nodes.
@@ -1444,68 +1468,60 @@ pub(super) fn expr_is_ivm_stable(expr: &TypedExpr) -> bool {
         | K::Exists { .. }
         | K::InSubquery { .. }
         | K::QuantifiedSubquery { .. } => false,
-        K::ScalarFunction { func, args } => {
-            !is_volatile_scalar_func(*func) && args.iter().all(expr_is_ivm_stable)
-        },
+        K::ScalarFunction { func, args } => !is_volatile_scalar_func(*func) && args.iter().all(all),
         K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {
-            expr_is_ivm_stable(left) && expr_is_ivm_stable(right)
+            all(left) && all(right)
         },
-        K::QuantifiedArray { expr, array, .. } => {
-            expr_is_ivm_stable(expr) && expr_is_ivm_stable(array)
-        },
+        K::QuantifiedArray { expr, array, .. } => all(expr) && all(array),
         K::Unary { expr, .. }
         | K::IsNull { expr, .. }
         | K::IsJson { operand: expr, .. }
         | K::IsBool { expr, .. }
-        | K::Cast(expr, _) => expr_is_ivm_stable(expr),
-        K::InList { expr, list, .. } => {
-            expr_is_ivm_stable(expr) && list.iter().all(expr_is_ivm_stable)
-        },
+        | K::Cast(expr, _) => all(expr),
+        K::InList { expr, list, .. } => all(expr) && list.iter().all(all),
         K::Between {
             expr, low, high, ..
-        } => expr_is_ivm_stable(expr) && expr_is_ivm_stable(low) && expr_is_ivm_stable(high),
-        K::Overlaps { s1, e1, s2, e2 } => {
-            expr_is_ivm_stable(s1)
-                && expr_is_ivm_stable(e1)
-                && expr_is_ivm_stable(s2)
-                && expr_is_ivm_stable(e2)
-        },
+        } => all(expr) && all(low) && all(high),
+        K::Overlaps { s1, e1, s2, e2 } => all(s1) && all(e1) && all(s2) && all(e2),
         K::Like { expr, pattern, .. }
         | K::SimilarTo { expr, pattern, .. }
-        | K::RegexMatch { expr, pattern, .. } => {
-            expr_is_ivm_stable(expr) && expr_is_ivm_stable(pattern)
-        },
+        | K::RegexMatch { expr, pattern, .. } => all(expr) && all(pattern),
         K::Case {
             operand,
             branches,
             default,
         } => {
-            operand.as_deref().is_none_or(expr_is_ivm_stable)
-                && branches
-                    .iter()
-                    .all(|b| expr_is_ivm_stable(&b.when) && expr_is_ivm_stable(&b.then))
-                && default.as_deref().is_none_or(expr_is_ivm_stable)
+            operand.as_deref().is_none_or(all)
+                && branches.iter().all(|b| all(&b.when) && all(&b.then))
+                && default.as_deref().is_none_or(all)
         },
-        K::Coalesce(args) | K::ArrayLiteral(args) => args.iter().all(expr_is_ivm_stable),
-        K::Crypto { value, key, .. } => expr_is_ivm_stable(value) && expr_is_ivm_stable(key),
-        K::Subscript { base, index } => expr_is_ivm_stable(base) && expr_is_ivm_stable(index),
+        K::Coalesce(args) | K::ArrayLiteral(args) => args.iter().all(all),
+        K::Crypto { value, key, .. } => all(value) && all(key),
+        K::Subscript { base, index } => all(base) && all(index),
         K::ArraySlice { base, lower, upper } => {
-            expr_is_ivm_stable(base)
-                && lower.as_deref().is_none_or(expr_is_ivm_stable)
-                && upper.as_deref().is_none_or(expr_is_ivm_stable)
+            all(base) && lower.as_deref().is_none_or(all) && upper.as_deref().is_none_or(all)
         },
         // Composite operations are deterministic — stable if every child is.
-        K::Composite(op) => op.children().into_iter().all(expr_is_ivm_stable),
+        K::Composite(op) => op.children().into_iter().all(all),
     }
 }
 
 /// Whether a scalar built-in is volatile (a fresh/contextual value per evaluation), so a view using
-/// it cannot be incrementally maintained.
+/// it cannot be incrementally maintained and an index keyed on it cannot answer a lookup. The same
+/// built-ins the result cache refuses to memoize (`VOLATILE_PLAN_MARKERS` in the executor).
 const fn is_volatile_scalar_func(func: ast::ScalarFunc) -> bool {
     use ast::ScalarFunc as F;
     matches!(
         func,
         F::Now
+            | F::StatementTimestamp
+            | F::LocalTimestamp
+            | F::SequenceNext
+            | F::SequenceCurrent
+            | F::SequenceSet
+            | F::TryAdvisoryLock
+            | F::AdvisoryUnlock
+            | F::AdvisoryUnlockAll
             | F::CurrentTimestamp
             | F::CurrentDate
             | F::CurrentTime

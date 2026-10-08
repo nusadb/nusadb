@@ -64,6 +64,7 @@ impl Catalog for EngineCatalog<'_> {
             out.push(IndexInfo {
                 name: def.name,
                 columns: def.columns,
+                key_exprs: Vec::new(),
                 unique: def.unique,
             });
         }

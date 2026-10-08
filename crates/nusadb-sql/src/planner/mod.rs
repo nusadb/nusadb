@@ -452,6 +452,7 @@ mod tests {
                 vec![IndexInfo {
                     name: "t_a_idx".to_owned(),
                     columns: vec!["a".to_owned()],
+                    key_exprs: Vec::new(),
                     unique: self.1,
                 }]
             } else {

@@ -399,7 +399,7 @@ fn explicit_index_still_plans_and_answers() {
 /// crucially, a partial index must not hide the rows it does not cover. (Production path: the
 /// harness catalog delegates to `catalog_list_indexes`.)
 #[test]
-fn partial_and_functional_indexes_are_not_scan_candidates() {
+fn a_partial_index_is_not_a_scan_candidate() {
     let (engine, mut session) = fresh();
     run(
         engine,
@@ -429,7 +429,7 @@ fn partial_and_functional_indexes_are_not_scan_candidates() {
     )
     .unwrap();
 
-    // Neither index is offered → SeqScan.
+    // The partial index is not offered (and the expression index does not cover `a`) → SeqScan.
     let plan = explain(engine, &mut session, "SELECT id FROM t WHERE a = 2");
     assert!(
         plan.contains("SeqScan") && !plan.contains("IndexScan"),
@@ -697,4 +697,383 @@ fn composite_keys_of_text_numeric_and_date_match_a_scan() {
     let indexed = rows(run(engine, &mut session, "SELECT * FROM ck ORDER BY v").unwrap());
     let scanned = rows(run(engine, &mut session, "SELECT * FROM cn ORDER BY v").unwrap());
     assert_eq!(indexed, scanned);
+}
+
+/// Indexes keyed on expressions, one per key kind: the comparisons the differential runs on each.
+const EXPRESSION_KEYS: &[(&str, &[&str])] = &[
+    (
+        "lower(s)",
+        &[
+            "= 's7'",
+            "= 'S7'",
+            "= 'missing'",
+            "< 's2'",
+            "BETWEEN 's1' AND 's3'",
+        ],
+    ),
+    ("payload->>'k'", &["= 'k3'", "= 'k99'", ">= 'k8'"]),
+    ("a + b", &["= 7", "= 0", "> 10", "= 7.0", "= '7'"]),
+    ("si + si", &["= 4", "= 9", "< 3"]),
+    ("a * 2", &["= 8", "= 9", "= 4.0"]),
+    ("n * 2", &["= 3", "= 3.00", "= 2.5", "> 10"]),
+    ("n + a", &["= 4.5", "= 5"]),
+    ("f * 2", &["= 3", "= 3.0", "< 2"]),
+    ("d + 1", &["= DATE '2024-01-05'", "> DATE '2024-01-20'"]),
+    ("coalesce(s, 'none')", &["= 'none'", "= 's4'"]),
+    ("CAST(a AS TEXT)", &["= '3'", "= 3"]),
+    ("length(s)", &["= 2", "= 3", "> 2"]),
+    ("abs(a - 5)", &["= 2", "= 0"]),
+    (
+        "CASE WHEN a > 3 THEN 'hi' ELSE 'lo' END",
+        &["= 'hi'", "= 'lo'"],
+    ),
+    (
+        "upper(s) || '-' || CAST(b AS TEXT)",
+        &["= 'S7-1'", "> 'S5'"],
+    ),
+    ("a + b, lower(s)", &["= 7"]),
+];
+
+/// Two copies of the same rows: `ex` with one index per [`EXPRESSION_KEYS`] entry, `nx` without,
+/// both changed after the indexes were built.
+fn expression_tables() -> (&'static BtreeEngine, Session<'static>) {
+    let (engine, mut session) = fresh();
+    for table in ["ex", "nx"] {
+        run(
+            engine,
+            &mut session,
+            &format!(
+                "CREATE TABLE {table} (id INT PRIMARY KEY, a INT, b INT, si SMALLINT, \
+                 n NUMERIC(10, 2), f DOUBLE PRECISION, d DATE, s TEXT, payload JSONB)"
+            ),
+        )
+        .unwrap();
+        run(
+            engine,
+            &mut session,
+            &format!(
+                "INSERT INTO {table} SELECT i, i % 9, i % 4, CAST(i % 5 AS SMALLINT), \
+                 CAST(i AS NUMERIC(10, 2)) / 4, CAST(i AS DOUBLE PRECISION) / 2, \
+                 DATE '2024-01-01' + i % 30, \
+                 CASE WHEN i % 11 = 0 THEN NULL WHEN i % 2 = 0 THEN 's' || (i % 13) ELSE 'S' || (i % 13) END, \
+                 CASE WHEN i % 7 = 0 THEN CAST('{{}}' AS JSONB) \
+                      ELSE CAST('{{\"k\": \"k' || (i % 10) || '\"}}' AS JSONB) END \
+                 FROM generate_series(1, 300) AS g(i)"
+            ),
+        )
+        .unwrap();
+    }
+    for (i, (key, _)) in EXPRESSION_KEYS.iter().enumerate() {
+        run(
+            engine,
+            &mut session,
+            &format!("CREATE INDEX ex_k{i} ON ex (({key}))").replace(", lower", "), (lower"),
+        )
+        .unwrap();
+    }
+    // Rows written after the build, changed and deleted rows keep every index in step.
+    for table in ["ex", "nx"] {
+        for sql in [
+            format!(
+                "INSERT INTO {table} VALUES (1000, 3, 4, 2, 1.5, 1.5, DATE '2024-01-05', 's7', CAST('{{\"k\": \"k3\"}}' AS JSONB))"
+            ),
+            format!("UPDATE {table} SET s = 's7', a = a + 1 WHERE id % 10 = 3"),
+            format!(
+                "UPDATE {table} SET payload = CAST('{{\"k\": \"k99\"}}' AS JSONB) WHERE id % 50 = 1"
+            ),
+            format!("DELETE FROM {table} WHERE id % 17 = 5"),
+        ] {
+            run(engine, &mut session, &sql).unwrap();
+        }
+    }
+    (engine, session)
+}
+
+#[test]
+fn an_expression_index_serves_its_expression_and_returns_the_same_rows_as_a_scan() {
+    // The index key is evaluated per row on write; a predicate on the same expression is served by
+    // that index and must return exactly the rows of the same query over an unindexed copy, for
+    // every key type and for a literal of another type than the expression (coerced or refused).
+    let (engine, mut session) = expression_tables();
+    let mut indexed = 0;
+    let mut total = 0;
+    for (key, comparisons) in EXPRESSION_KEYS {
+        let lead = key.split(", lower").next().unwrap_or(key);
+        for cmp in *comparisons {
+            let p = format!("{lead} {cmp}");
+            // A comparison the analyzer refuses has no plan; both tables must refuse it alike.
+            let plan = run(
+                engine,
+                &mut session,
+                &format!("EXPLAIN SELECT id FROM ex WHERE {p}"),
+            )
+            .map(|r| format!("{:?}", rows(r)))
+            .unwrap_or_default();
+            total += 1;
+            if plan.contains("IndexScan") {
+                indexed += 1;
+            }
+            let query = |t: &str| format!("SELECT id FROM {t} WHERE {p} ORDER BY id");
+            let got = run(engine, &mut session, &query("ex"));
+            let want = run(engine, &mut session, &query("nx"));
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(rows(got), rows(want), "{p}: {plan}"),
+                (Err(got), Err(want)) => assert_eq!(got.to_string(), want.to_string(), "{p}"),
+                (got, want) => panic!("{p}: indexed {got:?} vs scan {want:?}\n{plan}"),
+            }
+        }
+    }
+    assert!(
+        indexed * 3 >= total * 2,
+        "{indexed} of {total} predicates used an index"
+    );
+
+    let plan = explain(
+        engine,
+        &mut session,
+        "SELECT id FROM ex WHERE payload->>'k' = 'k3'",
+    );
+    assert!(plan.contains("IndexScan: ex using ex_k1"), "{plan}");
+    let plan = explain(
+        engine,
+        &mut session,
+        "SELECT id FROM ex WHERE 'k3' = payload->>'k'",
+    );
+    assert!(plan.contains("IndexScan: ex using ex_k1"), "{plan}");
+    // Pushed onto either side of a join, the expression is that table's own: the index serves it
+    // and the joined rows match the same join over unindexed copies.
+    run(engine, &mut session, "CREATE TABLE ny AS SELECT * FROM nx").unwrap();
+    for (p, flip) in [("lower(X.s) = 's7'", false), ("X.a + X.b = 7", true)] {
+        let sql = |x: &str| {
+            let (l, r) = if flip { (x, "ny") } else { ("ny", x) };
+            let p = p.replace("X.", &format!("{x}."));
+            format!(
+                "SELECT {l}.id, {r}.id FROM {l} JOIN {r} ON {l}.id = {r}.id + 1 WHERE {p} ORDER BY 1"
+            )
+        };
+        let plan = explain(engine, &mut session, &sql("ex"));
+        assert!(plan.contains("IndexScan: ex using"), "{p}: {plan}");
+        let got = rows(run(engine, &mut session, &sql("ex")).unwrap());
+        assert!(!got.is_empty(), "{p}");
+        assert_eq!(
+            got,
+            rows(run(engine, &mut session, &sql("nx")).unwrap()),
+            "{p}"
+        );
+    }
+    // A literal on the left flips the comparison: `'s2' > lower(s)` is `lower(s) < 's2'`.
+    for p in ["'s2' > lower(s)", "'k8' <= payload->>'k'", "10 < a + b"] {
+        let plan = explain(
+            engine,
+            &mut session,
+            &format!("SELECT id FROM ex WHERE {p}"),
+        );
+        assert!(plan.contains("IndexScan"), "{p}: {plan}");
+        let query = |t: &str| format!("SELECT id FROM {t} WHERE {p} ORDER BY id");
+        let got = rows(run(engine, &mut session, &query("ex")).unwrap());
+        assert!(!got.is_empty(), "{p}");
+        assert_eq!(
+            got,
+            rows(run(engine, &mut session, &query("nx")).unwrap()),
+            "{p}"
+        );
+    }
+}
+
+#[test]
+fn a_unique_expression_index_is_a_point_lookup_only_on_its_whole_key() {
+    let (engine, mut session) = fresh();
+    run(
+        engine,
+        &mut session,
+        "CREATE TABLE eu (id INT PRIMARY KEY, a INT, s TEXT)",
+    )
+    .unwrap();
+    run(
+        engine,
+        &mut session,
+        "INSERT INTO eu VALUES (1, 1, 'X'), (2, 2, 'x'), (3, 3, 'y')",
+    )
+    .unwrap();
+    run(
+        engine,
+        &mut session,
+        "CREATE UNIQUE INDEX eu_k ON eu ((lower(s)), (a * 10))",
+    )
+    .unwrap();
+    // Equality on the first key expression alone matches two rows.
+    let got = rows(
+        run(
+            engine,
+            &mut session,
+            "SELECT id FROM eu WHERE lower(s) = 'x' ORDER BY id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    let got = rows(
+        run(
+            engine,
+            &mut session,
+            "SELECT id FROM eu WHERE lower(s) = 'x' AND a * 10 = 20",
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, vec![vec![Value::Int(2)]]);
+    // Only equality on every key expression bounds the lookup to one row.
+    let point = |sql: &str| {
+        let logical = analyze(parse(sql).unwrap(), &Cat { engine }).unwrap();
+        nusadb_sql::plan_is_inline_point_get(&plan(logical))
+    };
+    assert!(point(
+        "SELECT id FROM eu WHERE lower(s) = 'x' AND a * 10 = 20"
+    ));
+    assert!(!point("SELECT id FROM eu WHERE lower(s) = 'x'"));
+    let err = run(engine, &mut session, "INSERT INTO eu VALUES (4, 1, 'x')");
+    assert!(err.is_err(), "the unique key (x, 10) already exists");
+}
+
+#[test]
+fn an_expression_index_is_chosen_by_cost_once_the_table_is_analyzed() {
+    // With statistics an equality on an indexed expression is still estimated selective (no column
+    // statistics describe the expression, so the per-operator default applies) and takes the index;
+    // a predicate on a different expression does not.
+    let (engine, mut session) = fresh();
+    run(
+        engine,
+        &mut session,
+        "CREATE TABLE ea (id INT PRIMARY KEY, a INT, b INT, payload JSONB)",
+    )
+    .unwrap();
+    run(
+        engine,
+        &mut session,
+        "INSERT INTO ea SELECT i, i % 100, i % 7, CAST('{\"k\": \"k' || (i % 500) || '\"}' AS JSONB) \
+         FROM generate_series(1, 5000) AS g(i)",
+    )
+    .unwrap();
+    run(
+        engine,
+        &mut session,
+        "CREATE INDEX ea_k ON ea ((payload->>'k'))",
+    )
+    .unwrap();
+    run(engine, &mut session, "CREATE INDEX ea_sum ON ea ((a + b))").unwrap();
+    run(engine, &mut session, "ANALYZE ea").unwrap();
+    for (p, index) in [("payload->>'k' = 'k42'", "ea_k"), ("a + b = 50", "ea_sum")] {
+        let plan = explain(
+            engine,
+            &mut session,
+            &format!("SELECT id FROM ea WHERE {p}"),
+        );
+        assert!(
+            plan.contains(&format!("IndexScan: ea using {index}")),
+            "{p}: {plan}"
+        );
+    }
+    for p in ["payload->>'j' = 'k42'", "a - b = 50", "b + a = 50"] {
+        let plan = explain(
+            engine,
+            &mut session,
+            &format!("SELECT id FROM ea WHERE {p}"),
+        );
+        assert!(!plan.contains("IndexScan"), "{p}: {plan}");
+    }
+    let got = rows(
+        run(
+            engine,
+            &mut session,
+            "SELECT count(*) FROM ea WHERE payload->>'k' = 'k42'",
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, vec![vec![Value::Int(10)]]);
+}
+
+#[test]
+fn an_expression_that_depends_on_the_session_or_the_moment_is_not_a_scan_path() {
+    // A key computed under one session time zone is not the value a session in another zone
+    // computes for the same row, and `now()` / `random()` change between write and read: such an
+    // index is maintained but never scanned, so every zone reads the rows a scan reads.
+    let (engine, mut session) = fresh();
+    for table in ["tz", "tn"] {
+        run(
+            engine,
+            &mut session,
+            &format!(
+                "CREATE TABLE {table} (id INT PRIMARY KEY, ts TIMESTAMPTZ, lt TIMESTAMP, a INT)"
+            ),
+        )
+        .unwrap();
+        run(
+            engine,
+            &mut session,
+            &format!(
+                "INSERT INTO {table} SELECT i, \
+                 CAST('2024-01-01 00:00:00+00' AS TIMESTAMPTZ) + i * INTERVAL '3 hours', \
+                 CAST('2024-01-01 00:00:00' AS TIMESTAMP) + i * INTERVAL '3 hours', i % 10 \
+                 FROM generate_series(1, 200) AS g(i)"
+            ),
+        )
+        .unwrap();
+    }
+    run(engine, &mut session, "SET TIME ZONE 'UTC'").unwrap();
+    let keys = [
+        "CAST(ts AS DATE)",
+        "CAST(ts AS TEXT)",
+        "extract(hour FROM ts)",
+        "CAST(lt AS TIMESTAMPTZ)",
+        "a + random()",
+        "CAST(now() AS DATE)",
+        "CAST(lt AS DATE)",
+        "CAST(random() * 10 AS INT)",
+        "CAST(localtimestamp AS DATE)",
+        "localtimestamp",
+    ];
+    for (i, key) in keys.iter().enumerate() {
+        run(
+            engine,
+            &mut session,
+            &format!("CREATE INDEX tz_k{i} ON tz (({key}))"),
+        )
+        .unwrap();
+    }
+    let predicates = [
+        "CAST(ts AS DATE) = DATE '2024-01-05'",
+        "CAST(ts AS TEXT) > '2024-01-05'",
+        "extract(hour FROM ts) = 5",
+        "CAST(lt AS TIMESTAMPTZ) = CAST('2024-01-02 03:00:00+00' AS TIMESTAMPTZ)",
+        "CAST(lt AS DATE) = DATE '2024-01-05'",
+    ];
+    for zone in ["UTC", "+07", "-08"] {
+        run(engine, &mut session, &format!("SET TIME ZONE '{zone}'")).unwrap();
+        for p in predicates {
+            let query = |t: &str| format!("SELECT id FROM {t} WHERE {p} ORDER BY id");
+            let got = rows(run(engine, &mut session, &query("tz")).unwrap());
+            let want = rows(run(engine, &mut session, &query("tn")).unwrap());
+            assert_eq!(got, want, "{zone}: {p}");
+        }
+    }
+    let moment = [
+        "a + random() > 5",
+        "CAST(now() AS DATE) = DATE '2024-01-05'",
+        "CAST(random() * 10 AS INT) = 3",
+        "CAST(localtimestamp AS DATE) = DATE '2024-01-05'",
+        "localtimestamp > TIMESTAMP '2024-01-05 00:00:00'",
+    ];
+    for p in predicates[..4].iter().chain(&moment) {
+        let plan = explain(
+            engine,
+            &mut session,
+            &format!("SELECT id FROM tz WHERE {p}"),
+        );
+        assert!(!plan.contains("IndexScan"), "{p}: {plan}");
+    }
+    // An index on an expression with no zone or moment in it is still a scan path.
+    let plan = explain(
+        engine,
+        &mut session,
+        "SELECT id FROM tz WHERE CAST(lt AS DATE) = DATE '2024-01-05'",
+    );
+    assert!(plan.contains("IndexScan: tz using tz_k6"), "{plan}");
 }
