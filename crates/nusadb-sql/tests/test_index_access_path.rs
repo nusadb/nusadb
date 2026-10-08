@@ -448,3 +448,253 @@ fn partial_and_functional_indexes_are_not_scan_candidates() {
     got.sort_unstable();
     assert_eq!(got, vec![2, 7, 12, 17, 22, 27]);
 }
+
+#[test]
+fn a_composite_index_serves_a_key_prefix_and_returns_the_same_rows_as_a_scan() {
+    // Equality on the leading columns, optionally followed by a range on the next one, is served by
+    // the composite index (primary key or secondary); the rows are exactly those of the same query
+    // over an unindexed copy.
+    let (engine, mut session) = fresh();
+    for (table, keys) in [("ix", ", PRIMARY KEY (ws, ent, d)"), ("nx", "")] {
+        run(
+            engine,
+            &mut session,
+            &format!("CREATE TABLE {table} (ws INT NOT NULL, ent INT NOT NULL, d INT NOT NULL, tag TEXT, v INT{keys})"),
+        )
+        .unwrap();
+        // Several rows per prefix, NULLs in the secondary key, and prefixes on both sides of every
+        // bound the predicates use.
+        run(
+            engine,
+            &mut session,
+            &format!(
+                "INSERT INTO {table} SELECT i % 4, (i / 4) % 5, i / 20, \
+                 CASE i % 3 WHEN 0 THEN 'a' WHEN 1 THEN 'b' ELSE NULL END, i % 7 \
+                 FROM generate_series(0, 399) AS g(i)"
+            ),
+        )
+        .unwrap();
+    }
+    run(engine, &mut session, "CREATE INDEX ix_tag_v ON ix (tag, v)").unwrap();
+    run(engine, &mut session, "ANALYZE ix").unwrap();
+
+    let mut predicates = Vec::new();
+    for ws in [0, 2, 5] {
+        predicates.push(format!("ws = {ws}"));
+        predicates.push(format!("ws > {ws}"));
+        for ent in [0, 3] {
+            predicates.push(format!("ws = {ws} AND ent = {ent}"));
+            predicates.push(format!("ws = {ws} AND ent >= {ent}"));
+            predicates.push(format!("ws = {ws} AND ent < {ent}"));
+            for op in ["=", "<", "<=", ">", ">="] {
+                predicates.push(format!("ws = {ws} AND ent = {ent} AND d {op} 10"));
+            }
+            predicates.push(format!("ws = {ws} AND ent = {ent} AND d BETWEEN 5 AND 12"));
+        }
+    }
+    for tag in ["a", "b"] {
+        predicates.push(format!("tag = '{tag}'"));
+        predicates.push(format!("tag = '{tag}' AND v = 3"));
+        predicates.push(format!("tag = '{tag}' AND v > 4"));
+    }
+    let mut indexed = 0;
+    for p in &predicates {
+        let plan = explain(engine, &mut session, &format!("SELECT * FROM ix WHERE {p}"));
+        if plan.contains("IndexScan") {
+            indexed += 1;
+        }
+        let got = rows(
+            run(
+                engine,
+                &mut session,
+                &format!("SELECT * FROM ix WHERE {p} ORDER BY ws, ent, d"),
+            )
+            .unwrap(),
+        );
+        let want = rows(
+            run(
+                engine,
+                &mut session,
+                &format!("SELECT * FROM nx WHERE {p} ORDER BY ws, ent, d"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(got, want, "{p}: {plan}");
+    }
+    // A bound that keeps most of the table (`ws > 0`) is rightly left to a scan by the cost gate.
+    assert!(
+        indexed * 4 >= predicates.len() * 3,
+        "{indexed} of {} predicates used an index",
+        predicates.len()
+    );
+
+    // The full primary key is a unique point lookup; a prefix is a range over the same index.
+    let point = explain(
+        engine,
+        &mut session,
+        "SELECT v FROM ix WHERE ws = 1 AND ent = 2 AND d = 3",
+    );
+    assert!(point.contains("IndexScan: ix using ix_pkey"), "{point}");
+    let prefix = explain(
+        engine,
+        &mut session,
+        "SELECT v FROM ix WHERE ws = 1 AND ent = 2",
+    );
+    assert!(prefix.contains("IndexScan: ix using ix_pkey"), "{prefix}");
+    let secondary = explain(
+        engine,
+        &mut session,
+        "SELECT v FROM ix WHERE tag = 'a' AND v = 2",
+    );
+    assert!(
+        secondary.contains("IndexScan: ix using ix_tag_v"),
+        "{secondary}"
+    );
+}
+
+#[test]
+fn the_index_bounding_the_most_columns_serves_the_query() {
+    let (engine, mut session) = fresh();
+    // With a single-column index on the leading column also available, the index that bounds the
+    // most columns serves the query.
+    let setup = [
+        "CREATE TABLE z (a INT NOT NULL, b INT NOT NULL, c INT)",
+        "INSERT INTO z SELECT i % 50, i % 7, i FROM generate_series(1, 2000) AS g(i)",
+        "CREATE INDEX z_a ON z (a)",
+        "CREATE INDEX z_ab ON z (a, b)",
+        "ANALYZE z",
+    ];
+    for sql in setup {
+        run(engine, &mut session, sql).unwrap();
+    }
+    let both = explain(
+        engine,
+        &mut session,
+        "SELECT c FROM z WHERE a = 1 AND b = 2",
+    );
+    assert!(both.contains("IndexScan: z using z_ab"), "{both}");
+}
+
+#[test]
+fn a_unique_point_lookup_beats_a_longer_non_unique_match() {
+    let (engine, mut session) = fresh();
+    for sql in [
+        "CREATE TABLE acct (id INT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL, v INT)",
+        "INSERT INTO acct SELECT i, 't' || (i % 5), CASE i % 2 WHEN 0 THEN 'on' ELSE 'off' END, i FROM generate_series(1, 500) AS g(i)",
+        "CREATE INDEX acct_tenant_status ON acct (tenant, status)",
+        "ANALYZE acct",
+    ] {
+        run(engine, &mut session, sql).unwrap();
+    }
+    let sql = "SELECT v FROM acct WHERE id = 42 AND tenant = 't2' AND status = 'on'";
+    let plan = explain(engine, &mut session, sql);
+    assert!(plan.contains("IndexScan: acct using acct_pkey"), "{plan}");
+    assert_eq!(
+        rows(run(engine, &mut session, sql).unwrap()),
+        vec![vec![Value::Int(42)]]
+    );
+    // The UPDATE finds its row through the same unique lookup.
+    run(
+        engine,
+        &mut session,
+        "UPDATE acct SET v = 0 WHERE id = 42 AND tenant = 't2' AND status = 'on'",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(run(engine, &mut session, sql).unwrap()),
+        vec![vec![Value::Int(0)]]
+    );
+}
+
+#[test]
+fn composite_keys_of_text_numeric_and_date_match_a_scan() {
+    let (engine, mut session) = fresh();
+    for (table, keys) in [("ck", ", PRIMARY KEY (name, amount, day)"), ("cn", "")] {
+        run(
+            engine,
+            &mut session,
+            &format!("CREATE TABLE {table} (name TEXT NOT NULL, amount NUMERIC NOT NULL, day DATE NOT NULL, v INT{keys})"),
+        )
+        .unwrap();
+        run(
+            engine,
+            &mut session,
+            &format!(
+                "INSERT INTO {table} SELECT 'n' || (i % 6), CAST(i % 4 AS NUMERIC) / 2, \
+                 CAST('2026-01-01' AS DATE) + (i / 12), i FROM generate_series(0, 479) AS g(i)"
+            ),
+        )
+        .unwrap();
+    }
+    run(engine, &mut session, "ANALYZE ck").unwrap();
+    let predicates = [
+        "name = 'n2'",
+        "name > 'n2'",
+        "name BETWEEN 'n1' AND 'n3'",
+        "name = 'n2' AND amount = 0.5",
+        "name = 'n2' AND amount > 0.5",
+        "name = 'n2' AND amount <= 1",
+        "name = 'n2' AND amount = 1.5 AND day = '2026-01-05'",
+        "name = 'n2' AND amount = 1.5 AND day > '2026-01-10'",
+        "name = 'n2' AND amount = 1.5 AND day BETWEEN '2026-01-03' AND '2026-01-12'",
+    ];
+    for p in predicates {
+        let got = rows(
+            run(
+                engine,
+                &mut session,
+                &format!("SELECT * FROM ck WHERE {p} ORDER BY v"),
+            )
+            .unwrap(),
+        );
+        let want = rows(
+            run(
+                engine,
+                &mut session,
+                &format!("SELECT * FROM cn WHERE {p} ORDER BY v"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(got, want, "{p}");
+    }
+    // UPDATE and DELETE through the full key and through a prefix.
+    for (table_sql, check) in [
+        (
+            "UPDATE TABLE_NAME SET v = -1 WHERE name = 'n3' AND amount = 1 AND day = '2026-01-02'",
+            "v = -1",
+        ),
+        (
+            "UPDATE TABLE_NAME SET v = -2 WHERE name = 'n4' AND amount = 0.5",
+            "v = -2",
+        ),
+        ("DELETE FROM TABLE_NAME WHERE name = 'n5'", "name = 'n5'"),
+        (
+            "DELETE FROM TABLE_NAME WHERE name = 'n1' AND amount > 0.5",
+            "name = 'n1'",
+        ),
+    ] {
+        for t in ["ck", "cn"] {
+            run(engine, &mut session, &table_sql.replace("TABLE_NAME", t)).unwrap();
+        }
+        let got = rows(
+            run(
+                engine,
+                &mut session,
+                &format!("SELECT * FROM ck WHERE {check} ORDER BY v"),
+            )
+            .unwrap(),
+        );
+        let want = rows(
+            run(
+                engine,
+                &mut session,
+                &format!("SELECT * FROM cn WHERE {check} ORDER BY v"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(got, want, "{table_sql}");
+    }
+    let indexed = rows(run(engine, &mut session, "SELECT * FROM ck ORDER BY v").unwrap());
+    let scanned = rows(run(engine, &mut session, "SELECT * FROM cn ORDER BY v").unwrap());
+    assert_eq!(indexed, scanned);
+}

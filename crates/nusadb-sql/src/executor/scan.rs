@@ -217,6 +217,7 @@ pub(super) fn index_scan_source(
     index: &str,
     lo: &std::ops::Bound<Vec<ast::Value>>,
     hi: &std::ops::Bound<Vec<ast::Value>>,
+    key_columns: usize,
     direction: nusadb_core::engine::ScanDirection,
     limit: Option<usize>,
     engine: &dyn StorageEngine,
@@ -227,14 +228,8 @@ pub(super) fn index_scan_source(
         .ok_or_else(|| Error::IndexNotFound {
             name: index.to_owned(),
         })?;
-    let scan = engine.index_scan_directed_limited(
-        txn,
-        id,
-        encode_key_bound(lo)?,
-        encode_key_bound(hi)?,
-        direction,
-        limit,
-    )?;
+    let (lo_key, hi_key) = encode_key_range(lo, hi, key_columns)?;
+    let scan = engine.index_scan_directed_limited(txn, id, lo_key, hi_key, direction, limit)?;
     Ok(IndexScanSource {
         scan,
         table: table.id,
@@ -290,6 +285,7 @@ pub(super) fn index_scan_rows(
     index: &str,
     lo: &std::ops::Bound<Vec<ast::Value>>,
     hi: &std::ops::Bound<Vec<ast::Value>>,
+    key_columns: usize,
     direction: nusadb_core::engine::ScanDirection,
     limit: Option<usize>,
     engine: &dyn StorageEngine,
@@ -309,14 +305,8 @@ pub(super) fn index_scan_rows(
     // of locks — so a locked row skipped below could otherwise make the count fall short of `limit`.
     // With that path excluded the skip set is never populated for this scan (a plain `FOR UPDATE`
     // does not skip), so the `skipped` check below never fires and the cap is exact.
-    let mut scan = engine.index_scan_directed_limited(
-        txn,
-        id,
-        encode_key_bound(lo)?,
-        encode_key_bound(hi)?,
-        direction,
-        limit,
-    )?;
+    let (lo_key, hi_key) = encode_key_range(lo, hi, key_columns)?;
+    let mut scan = engine.index_scan_directed_limited(txn, id, lo_key, hi_key, direction, limit)?;
     let mut out = Vec::new();
     while let Some((tid, tuple)) = scan.try_next()? {
         // Under a `FOR UPDATE` / `FOR SHARE` guard: hidden or replaced (see `scan_table`).
@@ -344,6 +334,7 @@ pub(super) fn index_scan_table(
     index: &str,
     lo: &std::ops::Bound<Vec<ast::Value>>,
     hi: &std::ops::Bound<Vec<ast::Value>>,
+    key_columns: usize,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Vec<(Tid, Row)>, Error> {
@@ -353,7 +344,8 @@ pub(super) fn index_scan_table(
             name: index.to_owned(),
         })?;
     let schema = column_types(table);
-    let mut scan = engine.index_scan(txn, id, encode_key_bound(lo)?, encode_key_bound(hi)?)?;
+    let (lo_key, hi_key) = encode_key_range(lo, hi, key_columns)?;
+    let mut scan = engine.index_scan(txn, id, lo_key, hi_key)?;
     let mut out = Vec::new();
     while let Some((tid, tuple)) = scan.try_next()? {
         crate::cancel::check()?;
@@ -368,14 +360,102 @@ pub(super) fn index_scan_table(
     Ok(out)
 }
 
-/// Encode a key-bound's prefix values into the order-preserving index-key bytes the engine compares.
-fn encode_key_bound(
-    bound: &std::ops::Bound<Vec<ast::Value>>,
-) -> Result<std::ops::Bound<Vec<u8>>, Error> {
+/// One side of an encoded index-key range.
+type KeyBound = std::ops::Bound<Vec<u8>>;
+
+/// Encode a scan's key bounds into the order-preserving index-key bytes the engine compares.
+///
+/// A bound may name only a prefix of a `key_columns`-column key (`a = 1` on an index over
+/// `(a, b)`), and then it covers every key that starts with it. Each encoded field starts with a
+/// tag byte below `PAST_PREFIX`, so every key extending `prefix` sorts before
+/// `prefix ++ PAST_PREFIX`: an inclusive upper bound becomes "below that", and an exclusive lower
+/// bound "from there". A bound naming the whole key, which nothing extends, stays as it is, so an
+/// equality on the whole key remains the engine's point read.
+fn encode_key_range(
+    lo: &std::ops::Bound<Vec<ast::Value>>,
+    hi: &std::ops::Bound<Vec<ast::Value>>,
+    key_columns: usize,
+) -> Result<(KeyBound, KeyBound), Error> {
     use std::ops::Bound;
-    Ok(match bound {
+    const PAST_PREFIX: u8 = 0x02;
+    let encode = |values: &[ast::Value], past: bool| -> Result<Vec<u8>, Error> {
+        let mut key = index_key::encode_index_key(values)?;
+        if past {
+            key.push(PAST_PREFIX);
+        }
+        Ok(key)
+    };
+    let lo = match lo {
         Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(values) => Bound::Included(index_key::encode_index_key(values)?),
-        Bound::Excluded(values) => Bound::Excluded(index_key::encode_index_key(values)?),
-    })
+        Bound::Included(values) => Bound::Included(encode(values, false)?),
+        Bound::Excluded(values) if values.len() < key_columns => {
+            Bound::Included(encode(values, true)?)
+        },
+        Bound::Excluded(values) => Bound::Excluded(encode(values, false)?),
+    };
+    let hi = match hi {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(values) if values.len() < key_columns => {
+            Bound::Excluded(encode(values, true)?)
+        },
+        Bound::Included(values) => Bound::Included(encode(values, false)?),
+        Bound::Excluded(values) => Bound::Excluded(encode(values, false)?),
+    };
+    Ok((lo, hi))
+}
+
+#[cfg(test)]
+mod key_range_tests {
+    use std::ops::Bound;
+
+    use super::encode_key_range;
+    use crate::ast::Value;
+
+    fn key(values: &[Value]) -> Vec<u8> {
+        super::index_key::encode_index_key(values).unwrap()
+    }
+
+    #[test]
+    fn a_whole_key_equality_stays_a_point_read() {
+        let k = vec![Value::Int(1), Value::Int(2)];
+        let (lo, hi) =
+            encode_key_range(&Bound::Included(k.clone()), &Bound::Included(k.clone()), 2).unwrap();
+        assert_eq!(
+            (lo, hi),
+            (Bound::Included(key(&k)), Bound::Included(key(&k)))
+        );
+        let one = vec![Value::Int(7)];
+        let (lo, hi) = encode_key_range(
+            &Bound::Excluded(one.clone()),
+            &Bound::Excluded(one.clone()),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            (lo, hi),
+            (Bound::Excluded(key(&one)), Bound::Excluded(key(&one)))
+        );
+    }
+
+    #[test]
+    fn a_prefix_covers_every_key_that_starts_with_it() {
+        let p = vec![Value::Int(1)];
+        let mut past = key(&p);
+        past.push(0x02);
+        let (lo, hi) =
+            encode_key_range(&Bound::Included(p.clone()), &Bound::Included(p.clone()), 2).unwrap();
+        assert_eq!(
+            (lo, hi),
+            (Bound::Included(key(&p)), Bound::Excluded(past.clone()))
+        );
+        let (lo, _) = encode_key_range(&Bound::Excluded(p.clone()), &Bound::Unbounded, 2).unwrap();
+        assert_eq!(lo, Bound::Included(past));
+        // Every extension of the prefix, NULL or not, sorts inside the range.
+        for second in [Value::Null, Value::Int(i64::MIN), Value::Int(i64::MAX)] {
+            let full = key(&[Value::Int(1), second]);
+            let mut upper = key(&p);
+            upper.push(0x02);
+            assert!(full >= key(&p) && full < upper);
+        }
+    }
 }

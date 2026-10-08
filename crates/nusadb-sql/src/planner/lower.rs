@@ -750,10 +750,12 @@ fn window_top_n_cap(select: &SelectPlan) -> Option<u64> {
 }
 
 /// Try to lower the base scan of a single (join-free) table to a [`PhysicalOperator::IndexScan`]
-/// when `filter` constrains the leading column of a **single-column** index. Returns the
-/// scan, or `None` to keep the `SeqScan`. The caller always re-applies the full `filter` above, so
-/// the returned scan only has to be a *superset* of the qualifying rows — which it is, exactly, for
-/// the value types handled here.
+/// when `filter` bounds a prefix of an index's key: equality on its leading columns, optionally
+/// followed by a range on the next one. A single-column index is the one-column case. Of the
+/// usable indexes, the one that bounds the most columns wins (equality before a range, then the
+/// most selective). Returns the scan, or `None` to keep the `SeqScan`. The caller always re-applies
+/// the full `filter` above, so the returned scan only has to be a *superset* of the qualifying
+/// rows, which it is for the value types handled here.
 pub(super) fn try_index_scan(
     table: &TableSchema,
     indexes: &[IndexMeta],
@@ -764,124 +766,183 @@ pub(super) fn try_index_scan(
     let mut conjuncts = Vec::new();
     collect_and_conjuncts(filter, &mut conjuncts);
 
+    // The best candidate so far: its rank (see below), selectivity, and the scan.
+    let mut best: Option<((bool, usize, bool), f64, PhysicalOperator)> = None;
     for index in indexes {
-        // v1: single-column indexes only. A multi-column index's key is the *concatenation* of all
-        // its columns, so a leading-column-only bound would need prefix-range semantics (follow-up).
-        let [col] = index.columns[..] else { continue };
-
-        let mut eq: Option<&ast::Value> = None;
-        let mut lo: Option<(&ast::Value, bool)> = None; // (value, inclusive)
-        let mut hi: Option<(&ast::Value, bool)> = None;
-        // Combined selectivity of the conjuncts that bound this index's column, for the cost-based
-        // index-vs-seq decision. Each bounding conjunct multiplies in (they are AND-ed).
-        let mut bound_selectivity = 1.0_f64;
-        for conjunct in &conjuncts {
-            // `col BETWEEN low AND high` is exactly `col >= low AND col <= high` — normalize it
-            // into the same inclusive range bounds so the very common BETWEEN spelling (dates,
-            // pagination) drives the index too (the BETWEEN form full-scanned
-            // while the spelled-out form planned an IndexScan). `NOT BETWEEN` is not a contiguous
-            // range and stays in the retained filter.
-            if let TypedExprKind::Between {
-                expr,
-                low,
-                high,
-                negated: false,
-                // A `SYMMETRIC` BETWEEN's bounds may be reversed (`low > high`), so it is not a
-                // contiguous `[low, high]` range — leave it in the retained filter, evaluated
-                // correctly by `eval_between`, rather than pushing a wrong index range.
-                symmetric: false,
-            } = &conjunct.kind
-                && let TypedExprKind::Column(ord) = expr.kind
-                && ord == col
-                && let (TypedExprKind::Literal(low_value), TypedExprKind::Literal(high_value)) =
-                    (&low.kind, &high.kind)
-                && is_index_safe_value(low_value)
-                && is_index_safe_value(high_value)
-            {
-                if let Some(ctx) = stats {
-                    bound_selectivity *= crate::executor::cost::selectivity(conjunct, ctx);
-                }
-                lo.get_or_insert((low_value, true));
-                hi.get_or_insert((high_value, true));
-                continue;
-            }
-            let Some((ord, op, value)) = col_op_literal(conjunct) else {
-                continue;
+        let mut prefix: Vec<ast::Value> = Vec::new();
+        let mut range: Option<(RangeSide, RangeSide)> = None;
+        let mut selectivity = 1.0_f64;
+        for &col in &index.columns {
+            // The index-key encoding is per the column's type, so a bound value must be coerced
+            // to it (e.g. an integer bound on a NUMERIC column), or its bytes would not line up.
+            let Some(column) = table.columns.get(col) else {
+                break;
             };
-            if ord != col || !is_index_safe_value(value) {
+            let found = column_bounds(&conjuncts, col, stats);
+            // Equality extends the key prefix; it must coerce exactly to the column type.
+            if let Some(key_val) = found.eq.and_then(|v| coerce_index_bound(v, column.ty)) {
+                prefix.push(key_val);
+                selectivity *= found.eq_selectivity;
                 continue;
             }
-            if let Some(ctx) = stats {
-                bound_selectivity *= crate::executor::cost::selectivity(conjunct, ctx);
+            // A range on the next column ends the prefix. A side that cannot coerce becomes
+            // unbounded (the retained filter removes the extra rows: a superset scan).
+            let lo = found
+                .lo
+                .and_then(|(v, inc)| coerce_index_bound(v, column.ty).map(|c| (c, inc)));
+            let hi = found
+                .hi
+                .and_then(|(v, inc)| coerce_index_bound(v, column.ty).map(|c| (c, inc)));
+            if lo.is_some() || hi.is_some() {
+                selectivity *= found.range_selectivity;
+                range = Some((lo, hi));
             }
-            // Keep the first bound seen on each side; the retained `Filter` removes anything a
-            // looser bound lets through, so this is correctness-safe (just less selective).
-            match op {
-                ast::BinaryOp::Eq => eq = Some(value),
-                ast::BinaryOp::Gt => {
-                    lo.get_or_insert((value, false));
-                },
-                ast::BinaryOp::GtEq => {
-                    lo.get_or_insert((value, true));
-                },
-                ast::BinaryOp::Lt => {
-                    hi.get_or_insert((value, false));
-                },
-                ast::BinaryOp::LtEq => {
-                    hi.get_or_insert((value, true));
-                },
-                _ => {},
-            }
+            break;
+        }
+        if prefix.is_empty() && range.is_none() {
+            continue;
         }
 
-        // An equality bound on this (single-column, hence whole-key) index of a UNIQUE index
-        // matches at most one row — the property the reactor-inline point-get gate requires.
-        let unique_point = eq.is_some() && index.unique;
-        // The index-key encoding is per the column's type, so a bound value must be coerced to it
-        // (e.g. an integer bound on a NUMERIC column), or its bytes would not line up with the keys.
-        let col_ty = table.columns.get(col)?.ty;
-        // Equality is the tightest bound (`lo == hi`, both inclusive). Otherwise use whatever
-        // open/closed range bounds the predicate supplied; skip the index if it gave neither.
-        let (lo_bound, hi_bound) = if let Some(value) = eq {
-            // An equality bound must coerce exactly to the column type, or the index cannot serve it.
-            let Some(key_val) = coerce_index_bound(value, col_ty) else {
-                continue;
-            };
-            let key = vec![key_val];
-            (Bound::Included(key.clone()), Bound::Included(key))
-        } else if lo.is_some() || hi.is_some() {
-            // Coerce each range side; a side that cannot coerce becomes `Unbounded` (the retained
-            // filter still removes the extra rows — a superset scan, which is correctness-safe).
-            let lo_c = lo.and_then(|(v, inc)| coerce_index_bound(v, col_ty).map(|c| (c, inc)));
-            let hi_c = hi.and_then(|(v, inc)| coerce_index_bound(v, col_ty).map(|c| (c, inc)));
-            if lo_c.is_none() && hi_c.is_none() {
-                continue; // neither bound survived coercion → the index cannot serve this predicate
-            }
-            (range_bound(lo_c), range_bound(hi_c))
-        } else {
-            continue;
-        };
-
         // Cost-based gate: when stats are available, only take the index if it is estimated
-        // cheaper than scanning the whole table — a barely-selective bound is better served by a
-        // sequential scan. Without stats the bound stays selective enough by assumption (heuristic).
+        // cheaper than scanning the whole table: a barely-selective bound is better served by a
+        // sequential scan. Without stats the bound stays selective enough by assumption.
         if let Some(ctx) = stats
-            && !crate::executor::cost::prefers_index_scan(ctx.row_count(), bound_selectivity)
+            && !crate::executor::cost::prefers_index_scan(ctx.row_count(), selectivity)
         {
             continue;
         }
 
-        return Some(PhysicalOperator::IndexScan {
+        // A bound on a key prefix covers every key that starts with it (the executor encodes it
+        // that way); a range on the next column extends the prefix by that column's bound.
+        let side = |bound: Option<(ast::Value, bool)>| match bound {
+            Some((value, inclusive)) => {
+                let mut key = prefix.clone();
+                key.push(value);
+                if inclusive {
+                    Bound::Included(key)
+                } else {
+                    Bound::Excluded(key)
+                }
+            },
+            None if prefix.is_empty() => Bound::Unbounded,
+            None => Bound::Included(prefix.clone()),
+        };
+        let (lo_side, hi_side) = range.clone().unwrap_or((None, None));
+        let (lo, hi) = (side(lo_side), side(hi_side));
+
+        // Equality on every column of a UNIQUE index matches at most one row: the property the
+        // reactor-inline point-get gate requires.
+        let unique_point = index.unique && range.is_none() && prefix.len() == index.columns.len();
+        let scan = PhysicalOperator::IndexScan {
             table: table.clone(),
             index: index.name.clone(),
-            lo: lo_bound,
-            hi: hi_bound,
+            lo,
+            hi,
+            key_columns: index.columns.len(),
             unique_point,
             direction: nusadb_core::engine::ScanDirection::Forward,
             limit: None,
-        });
+        };
+        // A unique point lookup reads at most one row, so it beats any other candidate (and the
+        // DML find path takes only that shape); then the most columns bound by equality, then a
+        // range after them, then the most selective.
+        let rank = (unique_point, prefix.len(), range.is_some());
+        let better = best
+            .as_ref()
+            .is_none_or(|(r, sel, _)| rank > *r || (rank == *r && selectivity < *sel));
+        if better {
+            best = Some((rank, selectivity, scan));
+        }
     }
-    None
+    best.map(|(_, _, scan)| scan)
+}
+
+/// One side of a range on an index column: the coerced value and whether it is inclusive.
+type RangeSide = Option<(ast::Value, bool)>;
+
+/// The bounds `conjuncts` put on column `col`: an equality value, a lower and an upper range bound
+/// (`(value, inclusive)`), and the combined selectivity of the equality conjuncts and of the range
+/// conjuncts, so only the ones a scan actually uses count toward its cost.
+struct ColumnBounds<'a> {
+    eq: Option<&'a ast::Value>,
+    lo: Option<(&'a ast::Value, bool)>,
+    hi: Option<(&'a ast::Value, bool)>,
+    eq_selectivity: f64,
+    range_selectivity: f64,
+}
+
+fn column_bounds<'a>(
+    conjuncts: &[&'a TypedExpr],
+    col: usize,
+    stats: Option<&crate::executor::cost::ScanStats>,
+) -> ColumnBounds<'a> {
+    let mut found = ColumnBounds {
+        eq: None,
+        lo: None,
+        hi: None,
+        eq_selectivity: 1.0,
+        range_selectivity: 1.0,
+    };
+    for conjunct in conjuncts {
+        // `col BETWEEN low AND high` is exactly `col >= low AND col <= high`, so it drives the
+        // index too. `NOT BETWEEN` is not a contiguous range, and a `SYMMETRIC` BETWEEN's bounds
+        // may be reversed: both stay in the retained filter.
+        if let TypedExprKind::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+            symmetric: false,
+        } = &conjunct.kind
+            && let TypedExprKind::Column(ord) = expr.kind
+            && ord == col
+            && let (TypedExprKind::Literal(low_value), TypedExprKind::Literal(high_value)) =
+                (&low.kind, &high.kind)
+            && is_index_safe_value(low_value)
+            && is_index_safe_value(high_value)
+        {
+            if let Some(ctx) = stats {
+                found.range_selectivity *= crate::executor::cost::selectivity(conjunct, ctx);
+            }
+            found.lo.get_or_insert((low_value, true));
+            found.hi.get_or_insert((high_value, true));
+            continue;
+        }
+        let Some((ord, op, value)) = col_op_literal(conjunct) else {
+            continue;
+        };
+        if ord != col || !is_index_safe_value(value) {
+            continue;
+        }
+        let conjunct_selectivity =
+            stats.map_or(1.0, |ctx| crate::executor::cost::selectivity(conjunct, ctx));
+        if op == ast::BinaryOp::Eq {
+            found.eq_selectivity *= conjunct_selectivity;
+        } else {
+            found.range_selectivity *= conjunct_selectivity;
+        }
+        // Keep the first bound seen on each side; the retained `Filter` removes anything a looser
+        // bound lets through, so this is correctness-safe (just less selective).
+        match op {
+            ast::BinaryOp::Eq => {
+                found.eq.get_or_insert(value);
+            },
+            ast::BinaryOp::Gt => {
+                found.lo.get_or_insert((value, false));
+            },
+            ast::BinaryOp::GtEq => {
+                found.lo.get_or_insert((value, true));
+            },
+            ast::BinaryOp::Lt => {
+                found.hi.get_or_insert((value, false));
+            },
+            ast::BinaryOp::LtEq => {
+                found.hi.get_or_insert((value, true));
+            },
+            _ => {},
+        }
+    }
+    found
 }
 
 /// A plain table scan narrowed by an index that `predicate` (a conjunct set pushed onto that
@@ -964,6 +1025,7 @@ fn try_ordered_index_scan(
             index,
             lo,
             hi,
+            key_columns,
             unique_point,
             limit: None,
             ..
@@ -982,6 +1044,7 @@ fn try_ordered_index_scan(
                 index: index.clone(),
                 lo: lo.clone(),
                 hi: hi.clone(),
+                key_columns: *key_columns,
                 unique_point: *unique_point,
                 direction,
                 limit: Some(cap),
@@ -1004,6 +1067,7 @@ fn try_ordered_index_scan(
         index: index.name.clone(),
         lo: Bound::Unbounded,
         hi: Bound::Unbounded,
+        key_columns: index.columns.len(),
         unique_point: false,
         direction,
         limit: Some(cap),
@@ -1156,15 +1220,6 @@ const fn flip_comparison(op: ast::BinaryOp) -> Option<ast::BinaryOp> {
         ast::BinaryOp::GtEq => ast::BinaryOp::LtEq,
         _ => return None,
     })
-}
-
-/// Build a key bound from an optional coerced `(value, inclusive)`; `None` → `Unbounded`.
-fn range_bound(bound: Option<(ast::Value, bool)>) -> Bound<Vec<ast::Value>> {
-    match bound {
-        Some((value, true)) => Bound::Included(vec![value]),
-        Some((value, false)) => Bound::Excluded(vec![value]),
-        None => Bound::Unbounded,
-    }
 }
 
 /// Whether `value`'s order-preserving index-key bytes compare *exactly* like the value itself, so an

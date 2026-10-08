@@ -4023,10 +4023,17 @@ fn try_point_get_rows(
             index,
             lo,
             hi,
+            key_columns,
             unique_point: true,
             ..
         }) => Ok(Some(index_scan_table(
-            table, &index, &lo, &hi, engine, txn,
+            table,
+            &index,
+            &lo,
+            &hi,
+            key_columns,
+            engine,
+            txn,
         )?)),
         _ => Ok(None),
     }

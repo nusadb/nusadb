@@ -8394,6 +8394,7 @@ fn index_scan_operator_reads_in_key_order_with_backfill() {
                 index: "t_v".to_owned(),
                 lo,
                 hi,
+                key_columns: 1,
                 unique_point: false,
                 direction: nusadb_core::engine::ScanDirection::Forward,
                 limit: None,

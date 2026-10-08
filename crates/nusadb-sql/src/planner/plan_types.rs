@@ -2784,6 +2784,9 @@ pub enum PhysicalOperator {
         lo: std::ops::Bound<Vec<ast::Value>>,
         /// Upper key bound; `Unbounded` for an open end.
         hi: std::ops::Bound<Vec<ast::Value>>,
+        /// How many columns the index key has. A bound with fewer values names a key prefix and
+        /// covers every key that starts with it.
+        key_columns: usize,
         /// Whether this scan is a *unique point lookup* — an equality bound covering the whole
         /// key of a unique index, so it matches **at most one row**. Informational: the executor
         /// scans identically either way; the reactor-inline point-get gate

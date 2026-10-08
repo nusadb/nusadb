@@ -338,13 +338,22 @@ pub(super) fn stream_op<'a>(
             index,
             lo,
             hi,
+            key_columns,
             direction,
             limit,
             ..
         } => Ok(counted(
             op,
             Box::new(super::scan::index_scan_source(
-                table, index, lo, hi, *direction, *limit, engine, txn,
+                table,
+                index,
+                lo,
+                hi,
+                *key_columns,
+                *direction,
+                *limit,
+                engine,
+                txn,
             )?),
         )),
         PhysicalOperator::Filter { input, predicate } => {
