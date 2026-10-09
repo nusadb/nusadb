@@ -3237,101 +3237,217 @@ fn null_fk_changes(
 
 /// Enforce referential actions when the rows in `deleting` are about to be removed from `table`:
 /// for each foreign key pointing at `table`, find the child rows referencing a deleted key and
-/// apply `NO ACTION`/`RESTRICT` (reject), `CASCADE` (delete the children, one level), or `SET NULL`
-/// (null the child FK columns). `SET DEFAULT` needs a column DEFAULT clause and is rejected for
-/// honesty. Cascade writes fire the child's row triggers (see [`cascade_delete_children`]).
+/// apply `RESTRICT` (reject), `CASCADE` (delete the children, and in turn apply the actions of the
+/// foreign keys pointing at *them*, to any depth), `SET NULL` (null the child FK columns) or
+/// `NO ACTION` (reject, unless the dependant is itself removed by this statement). `SET DEFAULT`
+/// needs a column DEFAULT clause and is rejected for honesty. Cascade writes fire the child's row
+/// triggers (see [`cascade_delete_children`]).
 ///
-/// `deleting` is the whole delete set of this statement, tids included, because for a
-/// self-referencing table the child being scanned *is* this table: without subtracting the rows
-/// that are themselves on their way out, every one of them counts as a reason not to remove it, and
-/// emptying such a table is impossible. The subtraction is by tid rather than by key — a key is
-/// only unique within a table, and for any other child table these tids belong to something else.
+/// The cascades are walked breadth first through a growing list rather than by recursion, so a
+/// long chain of rows referencing one another (a self-referencing table holding a linked list, say)
+/// cannot exhaust the stack. Nothing is written until the walk is over.
 ///
-/// The same subtraction is what the three actions want. A row already leaving must not be
-/// cascade-deleted a second time, and must not be updated to `NULL` on its way out — which would
-/// fire an update trigger on a row that is about to disappear.
+/// Every row this statement removes, at any depth, is held in one set and is never counted as a
+/// dependant. That is what lets a self-referencing table be emptied (otherwise every row is a
+/// reason not to remove another), what stops a cycle of references from being followed forever,
+/// and what keeps a row from being cascade-deleted twice. `NO ACTION` and `SET NULL` are settled
+/// against the finished set: a dependant some other path of the statement removes neither blocks
+/// the delete nor is updated on its way out. Rows are told apart by `(table, tid)`: a tid is only
+/// unique within its table.
 fn enforce_fk_on_parent_delete(
     table: &TableSchema,
     deleting: &[(Tid, Row)],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let fks: Vec<_> = engine
-        .list_foreign_keys(table.id)?
-        .into_iter()
-        .filter(|fk| fk.parent_table == table.id)
-        .collect();
-    if fks.is_empty() {
+    // Most tables are referenced by nothing: then a delete owes no foreign key any work.
+    if deleting.is_empty() || !table_is_fk_parent(table, engine)? {
         return Ok(());
     }
-    for fk in fks {
-        // The parent key this FK references (a non-PK UNIQUE or the PRIMARY KEY) — resolved per FK,
-        // since different FKs pointing at this table may reference different parent keys.
-        let Some(parent_ordinals) = fk_parent_ordinals(table, &fk, engine)? else {
-            continue; // This FK references the PK, but the parent has none — nothing references it.
-        };
-        let deleted_keys: Vec<Vec<ast::Value>> = deleting
-            .iter()
-            .filter_map(|(_, r)| unique_key(r, &parent_ordinals, false))
-            .collect();
-        if deleted_keys.is_empty() {
-            continue;
-        }
-        let child = schema_by_id(engine, fk.child_table)?.ok_or_else(|| {
-            nusadb_core::Error::ConstraintViolation(format!(
-                "foreign key \"{}\": child table is missing",
-                fk.name
-            ))
-        })?;
-        let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
-        let child_rows = scan_table(&child, engine, txn)?;
-        // Self-referencing: the rows this statement is removing are not dependants of it.
-        let leaving: std::collections::BTreeSet<Tid> = if fk.child_table == table.id {
-            deleting.iter().map(|(tid, _)| *tid).collect()
-        } else {
-            std::collections::BTreeSet::new()
-        };
-        let referencing: Vec<(Tid, Row)> = child_rows
+    let mut walk = DeleteWalk {
+        leaving: deleting.iter().map(|(tid, _)| (table.id, *tid)).collect(),
+        ..DeleteWalk::default()
+    };
+    let mut cascades = walk.step(table, deleting, engine, txn)?;
+    let mut next = 0;
+    while let Some((child, rows)) = cascades.get(next) {
+        let found = walk.step(child, rows, engine, txn)?;
+        cascades.extend(found);
+        next += 1;
+    }
+    walk.finish(cascades, engine, txn)
+}
+
+/// Rows of one table that a delete cascades to.
+type CascadeBatch = (TableSchema, Vec<(Tid, Row)>);
+
+/// Rewrites `(tid, old, new)` of rows in one table.
+type RewriteBatch = (TableSchema, Vec<(Tid, Row, Row)>);
+
+/// What [`enforce_fk_on_parent_delete`] has found so far.
+#[derive(Default)]
+struct DeleteWalk {
+    /// Every `(table, tid)` this statement removes.
+    leaving: HashSet<(nusadb_core::TableId, Tid)>,
+    /// `NO ACTION` dependants, each with the index in `messages` of the error to report if it is
+    /// still there at the end.
+    blocked: Vec<((nusadb_core::TableId, Tid), usize)>,
+    messages: Vec<String>,
+    /// `SET NULL` rewrites by row: the child table, the row as read, and the columns to null (the
+    /// union over every foreign key that nulls it, so the row is rewritten once).
+    nulls: Vec<(nusadb_core::TableId, Tid, Row, Vec<usize>)>,
+    null_index: HashMap<(nusadb_core::TableId, Tid), usize>,
+    /// The schema of each table with a `SET NULL` rewrite.
+    null_tables: HashMap<nusadb_core::TableId, TableSchema>,
+}
+
+impl DeleteWalk {
+    /// The foreign keys pointing at `table`, for its rows in `removed`. Returns the cascade
+    /// deletes found, to be walked on from.
+    fn step(
+        &mut self,
+        table: &TableSchema,
+        removed: &[(Tid, Row)],
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<Vec<CascadeBatch>, Error> {
+        let mut cascades = Vec::new();
+        let fks: Vec<_> = engine
+            .list_foreign_keys(table.id)?
             .into_iter()
-            .filter(|(ctid, crow)| {
-                !leaving.contains(ctid)
-                    && unique_key(crow, &child_ordinals, false)
-                        .is_some_and(|ckey| deleted_keys.iter().any(|dk| unique_key_eq(dk, &ckey)))
-            })
+            .filter(|fk| fk.parent_table == table.id)
             .collect();
-        if referencing.is_empty() {
-            continue;
-        }
-        match fk.on_delete {
-            nusadb_core::FkAction::NoAction | nusadb_core::FkAction::Restrict => {
-                return Err(nusadb_core::Error::ConstraintViolation(format!(
+        for fk in fks {
+            // The parent key this FK references (a non-PK UNIQUE or the PRIMARY KEY), resolved per
+            // FK, since different FKs pointing at this table may reference different parent keys.
+            let Some(parent_ordinals) = fk_parent_ordinals(table, &fk, engine)? else {
+                continue; // This FK references the PK, but the parent has none.
+            };
+            let deleted_keys: Vec<Vec<ast::Value>> = removed
+                .iter()
+                .filter_map(|(_, r)| unique_key(r, &parent_ordinals, false))
+                .collect();
+            if deleted_keys.is_empty() {
+                continue;
+            }
+            let child = schema_by_id(engine, fk.child_table)?.ok_or_else(|| {
+                nusadb_core::Error::ConstraintViolation(format!(
+                    "foreign key \"{}\": child table is missing",
+                    fk.name
+                ))
+            })?;
+            let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
+            let referencing: Vec<(Tid, Row)> = scan_table(&child, engine, txn)?
+                .into_iter()
+                .filter(|(ctid, crow)| {
+                    !self.leaving.contains(&(child.id, *ctid))
+                        && unique_key(crow, &child_ordinals, false).is_some_and(|ckey| {
+                            deleted_keys.iter().any(|dk| unique_key_eq(dk, &ckey))
+                        })
+                })
+                .collect();
+            if referencing.is_empty() {
+                continue;
+            }
+            let violation = || {
+                format!(
                     "delete on \"{}\" violates foreign key \"{}\": {} dependent row(s) in \"{}\"",
                     table.name,
                     fk.name,
                     referencing.len(),
                     child.name
-                ))
-                .into());
-            },
-            nusadb_core::FkAction::Cascade => {
-                cascade_delete_children(&child, referencing, engine, txn)?;
-            },
-            // ON DELETE SET NULL: null the child's FK columns (a row rewrite the SQL layer owns).
-            nusadb_core::FkAction::SetNull => {
-                let changes = null_fk_changes(referencing, &child_ordinals)?;
-                cascade_update_children(&child, changes, engine, txn)?;
-            },
-            // SET DEFAULT needs a column DEFAULT clause, which the CREATE TABLE surface does not
-            // yet carry — reject honestly rather than silently nulling.
-            nusadb_core::FkAction::SetDefault => {
-                return Err(Error::Unsupported(format!(
-                    "foreign key \"{}\" ON DELETE SET DEFAULT is not supported (no column DEFAULT)",
-                    fk.name
-                )));
-            },
+                )
+            };
+            match fk.on_delete {
+                nusadb_core::FkAction::Restrict => {
+                    return Err(nusadb_core::Error::ConstraintViolation(violation()).into());
+                },
+                nusadb_core::FkAction::NoAction => {
+                    let message = self.messages.len();
+                    self.messages.push(violation());
+                    self.blocked.extend(
+                        referencing
+                            .iter()
+                            .map(|(tid, _)| ((child.id, *tid), message)),
+                    );
+                },
+                nusadb_core::FkAction::Cascade => {
+                    self.leaving
+                        .extend(referencing.iter().map(|(tid, _)| (child.id, *tid)));
+                    cascades.push((child, referencing));
+                },
+                nusadb_core::FkAction::SetNull => {
+                    for (tid, row) in referencing {
+                        let key = (child.id, tid);
+                        if let Some(&at) = self.null_index.get(&key) {
+                            if let Some((_, _, _, columns)) = self.nulls.get_mut(at) {
+                                columns.extend(&child_ordinals);
+                            }
+                        } else {
+                            self.null_index.insert(key, self.nulls.len());
+                            self.nulls
+                                .push((child.id, tid, row, child_ordinals.clone()));
+                        }
+                    }
+                    self.null_tables.entry(child.id).or_insert(child);
+                },
+                // SET DEFAULT needs a column DEFAULT clause, which the CREATE TABLE surface does
+                // not yet carry: reject honestly rather than silently nulling.
+                nusadb_core::FkAction::SetDefault => {
+                    return Err(Error::Unsupported(format!(
+                        "foreign key \"{}\" ON DELETE SET DEFAULT is not supported (no column DEFAULT)",
+                        fk.name
+                    )));
+                },
+            }
         }
+        Ok(cascades)
     }
-    Ok(())
+
+    /// Settle the walk: refuse a `NO ACTION` dependant that stays, null the `SET NULL` ones that
+    /// stay, and delete the cascaded rows.
+    fn finish(
+        self,
+        cascades: Vec<CascadeBatch>,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<(), Error> {
+        if let Some((_, message)) = self
+            .blocked
+            .iter()
+            .find(|(row, _)| !self.leaving.contains(row))
+        {
+            let message = self.messages.get(*message).cloned().unwrap_or_default();
+            return Err(nusadb_core::Error::ConstraintViolation(message).into());
+        }
+        // One rewrite per child table, of the rows that stay.
+        let mut by_table: Vec<RewriteBatch> = Vec::new();
+        let mut null_tables = self.null_tables;
+        for (child_id, tid, row, columns) in self.nulls {
+            if self.leaving.contains(&(child_id, tid)) {
+                continue;
+            }
+            let mut new = row.clone();
+            for ordinal in columns {
+                set_at(&mut new, ordinal, ast::Value::Null)?;
+            }
+            match by_table.iter_mut().find(|(t, _)| t.id == child_id) {
+                Some((_, changes)) => changes.push((tid, row, new)),
+                None => {
+                    if let Some(child) = null_tables.remove(&child_id) {
+                        by_table.push((child, vec![(tid, row, new)]));
+                    }
+                },
+            }
+        }
+        for (child, changes) in by_table {
+            cascade_update_children(&child, changes, engine, txn)?;
+        }
+        for (child, rows) in cascades {
+            cascade_delete_children(&child, rows, engine, txn)?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether any foreign key in the catalog points at `table` (i.e. `table` is an FK parent). Lets
