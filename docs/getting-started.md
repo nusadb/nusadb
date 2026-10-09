@@ -201,13 +201,15 @@ nusadb-cli [OPTIONS]
   -W, --password <PASSWORD>  Password; prefer NUSADB_PASSWORD in the environment
   -c, --command <COMMAND>    Run one batch of SQL (statements separated by ;) and exit
   -f, --file <FILE>          Run the SQL in a file and exit
+      --on-error-stop        With -c or -f, stop at the first statement that fails
   -F, --format <FORMAT>      aligned (default), expanded, csv, or json
       --tls                  Connect using TLS; requires --tls-ca
       --tls-ca <PATH>        PEM certificate to trust (a private CA or self-signed cert); implies --tls
       --tls-domain <NAME>    Server name to verify the certificate against (default: the host)
 ```
 
-Interactively, a statement runs when a line ends with `;`, so a statement may span lines. Command
+Interactively, a statement runs when a line ends with `;` (a comment may follow it), so a statement
+may span lines, and a line with several statements runs each of them. Command
 history is kept in `~/.nusadb_history`. Meta-commands, typed alone on a line:
 
 | Command | Does |
@@ -307,7 +309,11 @@ resident bound.
 Both batch forms behave the same way: `-c` takes a statement list and `-f` takes a file. A server
 error is printed to standard error and the remaining statements still run, but the process then
 exits non-zero, so a script that loads data in stages stops at the failed stage instead of continuing
-as though it had worked.
+as though it had worked. With `--on-error-stop` the statements after the failing one do not run
+either, so a provisioning script is never left half applied past its first error.
+
+Comments (`-- …` to the end of the line, and `/* … */`, which may nest) can go anywhere in a
+script: a `;` inside one does not end a statement, and a part holding only comments is skipped.
 
 ```bash
 set -eu

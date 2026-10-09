@@ -305,3 +305,70 @@ async fn copy_out_without_a_sink_is_refused_and_drains() {
 
     server.abort();
 }
+
+/// A script with comments around and between its statements, `;` inside comments, and a
+/// comment-only tail runs every statement; `--on-error-stop` ends it at the first failure.
+// Multi-threaded: the CLI runs as a child process the test waits on, while the server answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_runs_with_comments_and_stops_on_error_when_asked() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let server = tokio::spawn(serve(listener, engine));
+
+    let dir = std::env::temp_dir().join(format!("nusadb-cli-script-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("init.sql");
+    std::fs::write(
+        &script,
+        "-- schema; for the app\n\
+         CREATE TABLE s (v INT); /* first; row */\n\
+         INSERT INTO s VALUES (1);\n\
+         INSERT INTO nowhere VALUES (2);\n\
+         /* a /* nested; */ note */ INSERT INTO s VALUES (3);\n\
+         -- the end;\n",
+    )
+    .unwrap();
+    let cli = env!("CARGO_BIN_EXE_nusadb-cli");
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(cli);
+        cmd.args(["--host", &addr.to_string(), "--user", "u", "--file"])
+            .arg(&script)
+            .args(extra);
+        cmd.output().unwrap()
+    };
+    let count = |expected: &str| {
+        let out = std::process::Command::new(cli)
+            .args(["--host", &addr.to_string(), "--user", "u", "-F", "csv"])
+            .args(["--command", "SELECT count(*) FROM s"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(expected),
+            "{out:?}"
+        );
+    };
+
+    let all = run(&[]);
+    assert_eq!(all.status.code(), Some(1), "one statement failed: {all:?}");
+    let stderr = String::from_utf8_lossy(&all.stderr);
+    assert_eq!(
+        stderr.matches("ERROR").count(),
+        1,
+        "only the bad insert fails: {stderr}"
+    );
+    count("\n2\n");
+
+    std::process::Command::new(cli)
+        .args(["--host", &addr.to_string(), "--user", "u"])
+        .args(["--command", "DROP TABLE s"])
+        .output()
+        .unwrap();
+    let stopped = run(&["--on-error-stop"]);
+    assert_eq!(stopped.status.code(), Some(1), "{stopped:?}");
+    // The statement after the failure did not run.
+    count("\n1\n");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    server.abort();
+}

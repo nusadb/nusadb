@@ -5598,3 +5598,94 @@ async fn declared_parameter_types_bind_as_declared() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// Statements the connection loop classifies by their first word (transaction control, `COPY`,
+/// `LISTEN`/`NOTIFY`, a temporary table with `ON COMMIT`) behave the same with comments before them.
+#[tokio::test]
+async fn a_leading_comment_does_not_change_how_a_statement_runs() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    async fn run<S: AsyncRead + AsyncWrite + Unpin>(
+        conn: &mut Connection<S>,
+        sql: &str,
+    ) -> (Vec<BackendMessage>, TxnStatus) {
+        query(conn, sql).await;
+        let mut got = Vec::new();
+        loop {
+            match next(conn).await {
+                BackendMessage::ReadyForQuery(status) => return (got, status),
+                other => got.push(other),
+            }
+        }
+    }
+
+    run(&mut conn, "CREATE TABLE t (id INT NOT NULL)").await;
+    let (got, status) = run(&mut conn, "-- open a transaction\nBEGIN").await;
+    assert_eq!((got, status), (vec![cc("BEGIN")], TxnStatus::InTransaction));
+    run(&mut conn, "INSERT INTO t VALUES (1)").await;
+    let (got, status) = run(&mut conn, "/* undo it */ ROLLBACK -- done").await;
+    assert_eq!((got, status), (vec![cc("ROLLBACK")], TxnStatus::Idle));
+    let (got, _) = run(
+        &mut conn,
+        "/* a /* nested */ note */ SELECT count(*) FROM t",
+    )
+    .await;
+    assert!(got.contains(&cc("SELECT 1")), "{got:?}");
+    assert!(
+        got.iter().any(|m| matches!(m, BackendMessage::DataRow { values } if values == &vec![Some(b"0".to_vec())])),
+        "the rolled-back row is gone: {got:?}"
+    );
+
+    query(&mut conn, "-- bulk load\nCOPY t FROM STDIN").await;
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::CopyInResponse { columns: 0 }
+    );
+    conn.write_frame(
+        &FrontendMessage::CopyData {
+            data: b"5\n6\n".to_vec(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    conn.write_frame(&FrontendMessage::CopyDone.encode().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(next(&mut conn).await, cc("COPY 2"));
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::ReadyForQuery(TxnStatus::Idle)
+    );
+
+    let (got, _) = run(&mut conn, "-- subscribe\nLISTEN ch").await;
+    assert_eq!(got, vec![cc("LISTEN")]);
+    let (got, _) = run(&mut conn, "/* ping */ NOTIFY ch, 'hi'").await;
+    assert!(got.contains(&cc("NOTIFY")), "{got:?}");
+
+    run(
+        &mut conn,
+        "-- scratch\nCREATE TEMPORARY TABLE scratch (v INT) ON /* each */ COMMIT DELETE ROWS",
+    )
+    .await;
+    run(&mut conn, "BEGIN").await;
+    run(&mut conn, "INSERT INTO scratch VALUES (1)").await;
+    // The commit is recognized as one through its comment, so the ON COMMIT action fires.
+    run(&mut conn, "/* done */ COMMIT").await;
+    let (got, _) = run(&mut conn, "SELECT count(*) FROM scratch").await;
+    assert!(
+        got.iter().any(|m| matches!(m, BackendMessage::DataRow { values } if values == &vec![Some(b"0".to_vec())])),
+        "ON COMMIT DELETE ROWS emptied the table: {got:?}"
+    );
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

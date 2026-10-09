@@ -1444,7 +1444,10 @@ fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) {
 /// normal execute path handles every other statement). The cheap prefix check avoids parsing every
 /// simple query twice.
 fn copy_statement(sql: &str) -> Option<nusadb_sql::ast::Copy> {
-    if !sql.trim_start().get(..4)?.eq_ignore_ascii_case("copy") {
+    if !nusadb_sql::skip_leading_comments(sql)
+        .get(..4)?
+        .eq_ignore_ascii_case("copy")
+    {
         return None;
     }
     match parse(sql) {
@@ -1459,7 +1462,7 @@ fn copy_statement(sql: &str) -> Option<nusadb_sql::ast::Copy> {
 /// some other statement and returns `None`.
 fn pubsub_statement(sql: &str) -> Option<nusadb_sql::ast::Statement> {
     use nusadb_sql::ast::Statement;
-    let head = sql.trim_start();
+    let head = nusadb_sql::skip_leading_comments(sql);
     let looks_pubsub = ["listen", "unlisten", "notify"].iter().any(|kw| {
         head.get(..kw.len())
             .is_some_and(|p| p.eq_ignore_ascii_case(kw))
@@ -3534,7 +3537,7 @@ enum TxnControl {
 /// `RELEASE`/`START`/`END`/`ABORT` prefix reaches the parse.
 fn txn_control_kind(sql: &str) -> Option<TxnControl> {
     use nusadb_sql::ast::Statement;
-    let head = sql.trim_start();
+    let head = nusadb_sql::skip_leading_comments(sql);
     let looks = [
         "begin",
         "start",
@@ -3597,14 +3600,16 @@ struct OnCommitRegistry {
 /// ordinary create, `ON COMMIT PRESERVE ROWS`, or a non-temp table (which the analyzer rejects
 /// anyway). A cheap prefix/substring guard avoids parsing every statement.
 fn detect_on_commit_create(sql: &str, temp_schema: &str) -> Option<OnCommitEntry> {
-    let head = sql.trim_start();
+    let head = nusadb_sql::skip_leading_comments(sql);
     if !head
         .get(..6)
         .is_some_and(|p| p.eq_ignore_ascii_case("create"))
     {
         return None;
     }
-    if !sql.to_ascii_lowercase().contains("on commit") {
+    // A loose guard (`ON` and `COMMIT` may be split by a line break or a comment); the parse
+    // below decides.
+    if !sql.to_ascii_lowercase().contains("commit") {
         return None;
     }
     let nusadb_sql::ast::Statement::CreateTable(ct) = parse(sql).ok()? else {

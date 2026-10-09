@@ -35,6 +35,8 @@ use nusadb_core::ColumnType;
 use crate::ast;
 use crate::error::Error;
 
+mod comments;
+pub use comments::skip_leading_comments;
 mod dcl;
 mod ddl;
 mod dml;
@@ -540,6 +542,10 @@ fn recognize_vector_distance_op(parser: &Parser) -> Option<(&'static str, usize)
     reason = "a flat chain of statement recognizers; length tracks the number of statement forms               custom-parsed, not branching depth"
 )]
 pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
+    // A comment before, after or inside the statement must not change which statement it is: the
+    // recognizers below read its first and last words.
+    let blanked = comments::blank_comments(sql);
+    let sql: &str = &blanked;
     // Re-narrow the identifier lexicon to NusaDB's surface before anything else, so the gate
     // covers every path (the VACUUM / COMMENT recognizers below as well as the generic parser).
     reject_widened_lexicon(sql)?;

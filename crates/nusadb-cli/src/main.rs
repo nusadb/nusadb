@@ -14,8 +14,7 @@ use std::sync::Arc;
 use clap::Parser;
 use nusadb_cli::{
     CopyIo, META_HELP, Meta, OutputFormat, collect_result, collect_result_with_copy, format_result,
-    handshake, is_complete_statement, parse_meta, split_statements, strip_terminator,
-    tls_client_config,
+    handshake, is_complete_statement, parse_meta, split_statements, tls_client_config,
 };
 use nusadb_wire::{Connection, FrontendMessage};
 use rustls::pki_types::ServerName;
@@ -54,6 +53,11 @@ struct Args {
     /// Run the SQL in a file and exit (statements separated by `;`).
     #[arg(short, long)]
     file: Option<PathBuf>,
+
+    /// With --command or --file: stop at the first statement that fails instead of running the
+    /// rest. The exit status is non-zero either way when a statement failed.
+    #[arg(long)]
+    on_error_stop: bool,
 
     /// Output format: aligned, expanded, csv, or json.
     #[arg(short = 'F', long, default_value = "aligned")]
@@ -112,6 +116,7 @@ async fn run_batch<S>(
     conn: &mut Connection<S>,
     sql: &str,
     format: OutputFormat,
+    stop_on_error: bool,
 ) -> std::io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -142,6 +147,9 @@ where
             } else {
                 println!("{line}");
             }
+        }
+        if stop_on_error && result.error.is_some() {
+            break;
         }
     }
     Ok(all_ok)
@@ -204,7 +212,7 @@ where
                     buf.push_str(&line);
                     buf.push('\n');
                     if is_complete_statement(&buf) {
-                        break strip_terminator(&buf).to_owned();
+                        break buf.clone();
                     }
                 },
                 // Ctrl-C abandons the statement in progress and returns to a fresh prompt.
@@ -218,17 +226,17 @@ where
             }
         };
 
-        if sql_owned.is_empty() {
-            continue;
-        }
         let _ = rl.add_history_entry(buf.trim());
-        match collect_result(conn, &sql_owned).await {
-            Ok(result) => {
-                for line in format_result(&result, format) {
-                    println!("{line}");
-                }
-            },
-            Err(e) => eprintln!("error: {e}"),
+        // One line may hold several statements, or only a comment.
+        for stmt in split_statements(&sql_owned) {
+            match collect_result(conn, &stmt).await {
+                Ok(result) => {
+                    for line in format_result(&result, format) {
+                        println!("{line}");
+                    }
+                },
+                Err(e) => eprintln!("error: {e}"),
+            }
         }
     }
 
@@ -269,10 +277,16 @@ where
 
     let mut batch_ok = true;
     if let Some(command) = &args.command {
-        batch_ok = run_batch(&mut conn, strip_bom(command), args.format).await?;
+        batch_ok = run_batch(
+            &mut conn,
+            strip_bom(command),
+            args.format,
+            args.on_error_stop,
+        )
+        .await?;
     } else if let Some(path) = &args.file {
         let body = std::fs::read_to_string(path)?;
-        batch_ok = run_batch(&mut conn, strip_bom(&body), args.format).await?;
+        batch_ok = run_batch(&mut conn, strip_bom(&body), args.format, args.on_error_stop).await?;
     } else {
         repl(&mut conn, args.format, &args.database).await?;
     }
@@ -369,6 +383,7 @@ mod batch_exit_tests {
             &mut conn,
             "CREATE TABLE t (id INT); INSERT INTO t VALUES (1)",
             OutputFormat::Aligned,
+            false,
         )
         .await
         .unwrap();
@@ -379,6 +394,7 @@ mod batch_exit_tests {
             &mut conn,
             "INSERT INTO t VALUES (2); SELECT nope FROM missing; INSERT INTO t VALUES (3)",
             OutputFormat::Aligned,
+            false,
         )
         .await
         .unwrap();
@@ -386,9 +402,14 @@ mod batch_exit_tests {
             !ok,
             "a batch containing a server error must report not-clean"
         );
-        let clean = run_batch(&mut conn, "SELECT count(*) FROM t", OutputFormat::Aligned)
-            .await
-            .unwrap();
+        let clean = run_batch(
+            &mut conn,
+            "SELECT count(*) FROM t",
+            OutputFormat::Aligned,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(clean, "the session stays usable after a failed statement");
         // And the statements around the failure really applied: rows 1, 2 and 3 all landed.
         let count = nusadb_cli::collect_result(&mut conn, "SELECT count(*) FROM t")

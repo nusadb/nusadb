@@ -1853,6 +1853,13 @@ compared with a `BIGINT` column in `IN (subquery)`, which requires both sides to
 `Users` and `users` name the same table; `"Users"` (double-quoted) keeps its case and is a
 different name. Identifiers are ASCII letters, digits and `_`.
 
+### Comments may go anywhere
+
+`-- …` runs to the end of the line and `/* … */` may span lines and nest
+(`/* outer /* inner */ still a comment */`). A comment may come before, after or inside any
+statement without changing it. Inside a string, a quoted identifier or a `$$ … $$` body the same
+characters are plain text.
+
 ### Materialized views are snapshots
 
 A materialized view holds the result from the last `REFRESH`. Incremental maintenance is opt-in with

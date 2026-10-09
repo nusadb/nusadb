@@ -671,10 +671,69 @@ fn dollar_delimiter_at(chars: &[char], i: usize) -> Option<(String, usize)> {
 ///
 /// Semicolons inside single- or double-quoted strings (with `''`/`""` doubling) do not split, nor do
 /// semicolons inside a dollar-quoted string (`$$ … $$` or `$tag$ … $tag$`) — so a function or
-/// procedure body written with dollar-quoting survives as one statement. Whitespace-only fragments
-/// are dropped; trailing input without a `;` is returned as a final statement.
+/// procedure body written with dollar-quoting survives as one statement. A semicolon inside a
+/// comment (`-- …` to the end of the line, or `/* … */`, which nests) does not split either; the
+/// comment stays with the statement text. Fragments holding only whitespace and comments are
+/// dropped; trailing input without a `;` is returned as a final statement.
 #[must_use]
 pub fn split_statements(input: &str) -> Vec<String> {
+    scan_statements(input).0
+}
+
+/// Whether the quote at `chars[quote]` opens an `E'…'` string (backslash escapes): an `e` or `E`
+/// right before it that does not end a longer word.
+fn opens_escape_string(chars: &[char], quote: usize) -> bool {
+    let at = |back: usize| quote.checked_sub(back).and_then(|p| chars.get(p)).copied();
+    at(1).is_some_and(|e| e == 'e' || e == 'E')
+        && !at(2).is_some_and(|b| b.is_alphanumeric() || b == '_' || b == '$')
+}
+
+/// When a comment starts at `chars[start]` (`--` to the end of the line, or `/* … */`, which nests),
+/// append it to `cur` and return the index just past it, plus whether it was closed (a block comment
+/// can run to the end of the input). `None` when no comment starts there.
+fn copy_comment(chars: &[char], start: usize, cur: &mut String) -> Option<(usize, bool)> {
+    let mut i = start;
+    match (chars.get(i), chars.get(i + 1)) {
+        (Some('-'), Some('-')) => {
+            while let Some(&c) = chars.get(i) {
+                if c == '\n' {
+                    break;
+                }
+                cur.push(c);
+                i += 1;
+            }
+            Some((i, true))
+        },
+        (Some('/'), Some('*')) => {
+            let mut depth = 0usize;
+            while let Some(&c) = chars.get(i) {
+                let next = chars.get(i + 1).copied();
+                if c == '/' && next == Some('*') {
+                    depth += 1;
+                    cur.push_str("/*");
+                    i += 2;
+                } else if c == '*' && next == Some('/') {
+                    depth -= 1;
+                    cur.push_str("*/");
+                    i += 2;
+                    if depth == 0 {
+                        return Some((i, true));
+                    }
+                } else {
+                    cur.push(c);
+                    i += 1;
+                }
+            }
+            Some((i, false))
+        },
+        _ => None,
+    }
+}
+
+/// [`split_statements`], plus whether the input ends with a statement terminator: its last `;` is
+/// outside any string, quoted identifier, dollar-quoted body and comment, and only whitespace and
+/// comments follow it.
+fn scan_statements(input: &str) -> (Vec<String>, bool) {
     let chars: Vec<char> = input.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -683,6 +742,12 @@ pub fn split_statements(input: &str) -> Vec<String> {
     // The tag of the dollar-quoted string currently open (empty for `$$`), or `None` when not inside
     // one; only its matching `$tag$` closes it, and quotes/semicolons are literal within.
     let mut dollar_tag: Option<String> = None;
+    // Whether the statement being collected has anything besides whitespace and comments.
+    let mut has_code = false;
+    let mut terminated = false;
+    let mut open_comment = false;
+    // Whether the single-quoted string being read is an `E'…'` string (backslash escapes).
+    let mut escape_string = false;
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
         if let Some(tag) = &dollar_tag {
@@ -699,8 +764,31 @@ pub fn split_statements(input: &str) -> Vec<String> {
             i += 1;
             continue;
         }
+        if !in_single
+            && !in_double
+            && let Some((after, closed)) = copy_comment(&chars, i, &mut cur)
+        {
+            i = after;
+            open_comment = !closed;
+            continue;
+        }
+        if !c.is_whitespace() && c != ';' {
+            has_code = true;
+            terminated = false;
+        }
         match c {
+            '\\' if in_single && escape_string => {
+                // Inside `E'…'` a backslash escapes the next character, a quote included.
+                cur.push(c);
+                if let Some(&next) = chars.get(i + 1) {
+                    cur.push(next);
+                }
+                i += 2;
+            },
             '\'' if !in_double => {
+                if !in_single {
+                    escape_string = opens_escape_string(&chars, i);
+                }
                 cur.push(c);
                 if in_single && chars.get(i + 1) == Some(&'\'') {
                     cur.push('\''); // escaped '' — stays inside the string
@@ -731,10 +819,12 @@ pub fn split_statements(input: &str) -> Vec<String> {
                 }
             },
             ';' if !in_single && !in_double => {
-                if !cur.trim().is_empty() {
+                if has_code {
                     out.push(cur.trim().to_owned());
                 }
                 cur.clear();
+                has_code = false;
+                terminated = true;
                 i += 1;
             },
             _ => {
@@ -743,10 +833,11 @@ pub fn split_statements(input: &str) -> Vec<String> {
             },
         }
     }
-    if !cur.trim().is_empty() {
+    let open = in_single || in_double || dollar_tag.is_some() || open_comment;
+    if has_code {
         out.push(cur.trim().to_owned());
     }
-    out
+    (out, terminated && !open)
 }
 
 /// A REPL meta-command — handled client-side, never sent verbatim to the server.
@@ -799,16 +890,7 @@ pub fn parse_meta(line: &str) -> Option<Meta> {
 /// holds, the REPL keeps reading continuation lines.
 #[must_use]
 pub fn is_complete_statement(buf: &str) -> bool {
-    buf.trim_end().ends_with(';')
-}
-
-/// Strip the trailing `;` terminator (and surrounding whitespace) from a completed statement.
-///
-/// The server's parser is fed one bare statement, exactly as it was before multi-line input.
-#[must_use]
-pub fn strip_terminator(buf: &str) -> &str {
-    let trimmed = buf.trim();
-    trimmed.strip_suffix(';').map_or(trimmed, str::trim_end)
+    scan_statements(buf).1
 }
 
 #[cfg(test)]
@@ -842,7 +924,7 @@ mod tls_tests {
 mod tests {
     use super::{
         Meta, OutputFormat, QueryResult, format_result, is_complete_statement, parse_meta,
-        split_statements, strip_terminator,
+        split_statements,
     };
 
     /// A two-column, two-row result with one NULL — the fixture for the format tests.
@@ -896,15 +978,6 @@ mod tests {
         assert!(is_complete_statement("select 1;"));
         assert!(is_complete_statement("select 1\nfrom t;  \n"));
         assert!(!is_complete_statement("")); // nothing yet
-    }
-
-    #[test]
-    fn the_terminator_is_stripped_before_sending() {
-        assert_eq!(strip_terminator("select 1;"), "select 1");
-        assert_eq!(strip_terminator("select 1 ;  "), "select 1");
-        assert_eq!(strip_terminator("select 1\nfrom t;\n"), "select 1\nfrom t");
-        // No terminator (e.g. a one-shot --command): returned trimmed, unchanged.
-        assert_eq!(strip_terminator("  select 1  "), "select 1");
     }
 
     #[test]
@@ -989,6 +1062,51 @@ mod tests {
         ] {
             assert_eq!(format_result(&ddl, f), vec!["CREATE TABLE".to_owned()]);
         }
+    }
+
+    #[test]
+    fn comments_do_not_split_and_comment_only_fragments_are_dropped() {
+        assert_eq!(
+            split_statements("-- a; b\nSELECT 1; /* c; d */ SELECT 2 -- e;\n; -- tail;"),
+            vec!["-- a; b\nSELECT 1", "/* c; d */ SELECT 2 -- e;"]
+        );
+        assert_eq!(
+            split_statements("/* a /* b; */ c; */ SELECT 1"),
+            vec!["/* a /* b; */ c; */ SELECT 1"]
+        );
+        assert!(split_statements("-- only;\n/* comments; */").is_empty());
+        // An escaped quote in an `E'…'` string does not end it, so the comment marker is text.
+        assert_eq!(
+            split_statements("SELECT E'don\\'t -- ; x'; SELECT 2"),
+            vec!["SELECT E'don\\'t -- ; x'", "SELECT 2"]
+        );
+        // A plain string has no backslash escapes: `name'` closes it.
+        assert_eq!(
+            split_statements("SELECT name'a\\'; SELECT 2"),
+            vec!["SELECT name'a\\'", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1; /* nothing */; -- nor here\n; SELECT 2"),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+        // Markers inside quotes are text.
+        assert_eq!(
+            split_statements("SELECT '--'; SELECT '/*'; SELECT 2"),
+            vec!["SELECT '--'", "SELECT '/*'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn a_statement_is_complete_at_a_terminator_outside_comments_and_quotes() {
+        assert!(is_complete_statement("SELECT 1;"));
+        assert!(is_complete_statement("SELECT 1; -- note"));
+        assert!(is_complete_statement("SELECT 1; /* note */\n"));
+        assert!(!is_complete_statement("-- note;"));
+        assert!(!is_complete_statement("SELECT 1 /* ; */"));
+        assert!(!is_complete_statement("SELECT ';'"));
+        assert!(!is_complete_statement("SELECT 1; SELECT 2"));
+        assert!(!is_complete_statement("SELECT 1; /* still open ;"));
+        assert!(!is_complete_statement("DO $$ SELECT 1; $$"));
     }
 
     #[test]
