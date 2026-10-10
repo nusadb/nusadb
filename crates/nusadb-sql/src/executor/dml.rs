@@ -3172,6 +3172,49 @@ fn fk_parent_ordinals(
     }
 }
 
+/// Lock the parent key `key` (at `ordinals` of `parent`) that a foreign key references. A child
+/// write holds the lock shared for each parent it points at; a parent delete, or an update that
+/// changes a referenced key, holds it exclusive for the key it removes. The engine's locks do not
+/// wait, so of a child write and a parent change racing on one key, whichever locks second fails
+/// with a serialization conflict and neither commits beside the other. Writes that do not touch the
+/// key (a child of another parent, a parent update of other columns) take no conflicting lock.
+fn lock_referenced_key(
+    parent: &TableSchema,
+    ordinals: &[usize],
+    key: &[ast::Value],
+    mode: nusadb_core::engine::RowLockMode,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let columns: Vec<String> = ordinals
+        .iter()
+        .filter_map(|&i| parent.columns.get(i).map(|c| c.name.clone()))
+        .collect();
+    engine.lock_key(txn, parent.id, unique_key_hash(parent, &columns, key), mode)?;
+    Ok(())
+}
+
+/// [`lock_referenced_key`] in exclusive mode for each parent key a delete or key change removes.
+fn lock_removed_keys(
+    parent: &TableSchema,
+    ordinals: &[usize],
+    keys: &[Vec<ast::Value>],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    for key in keys {
+        lock_referenced_key(
+            parent,
+            ordinals,
+            key,
+            nusadb_core::engine::RowLockMode::Exclusive,
+            engine,
+            txn,
+        )?;
+    }
+    Ok(())
+}
+
 /// Enforce that every foreign key on `table` references an existing parent row, for the rows being
 /// written by an INSERT/UPDATE. A row whose FK columns contain a `NULL` does not reference
 /// anything (MATCH SIMPLE) and is skipped. Scan-based (the SQL layer owns row decoding); an
@@ -3216,7 +3259,23 @@ pub(super) fn enforce_fk_on_child_write(
             ))
             .into());
         };
-        let parent_rows = scan_rows(&parent, engine, txn)?;
+        // Hold each referenced parent key before looking for it, then look in the latest committed
+        // state rather than this transaction's snapshot: a parent deleted after the snapshot was
+        // taken is gone, and once the key is held no other transaction can remove it before this
+        // one ends.
+        for row in rows {
+            if let Some(key) = unique_key(row, &child_ordinals, false) {
+                lock_referenced_key(
+                    &parent,
+                    &parent_key,
+                    &key,
+                    nusadb_core::engine::RowLockMode::Shared,
+                    engine,
+                    txn,
+                )?;
+            }
+        }
+        let parent_rows = scan_rows_committed(&parent, engine, txn)?;
         // Rows this statement is adding to the parent table count as parents. They only can be
         // when the key points back at this same table; a key to another table is unaffected by
         // what this statement writes here.
@@ -3584,6 +3643,7 @@ impl DeleteWalk {
             if deleted_keys.is_empty() {
                 continue;
             }
+            lock_removed_keys(table, &parent_ordinals, &deleted_keys, engine, txn)?;
             let child = schema_by_id(engine, fk.child_table)?.ok_or_else(|| {
                 nusadb_core::Error::ConstraintViolation(format!(
                     "foreign key \"{}\": child table is missing",
@@ -3591,7 +3651,9 @@ impl DeleteWalk {
                 ))
             })?;
             let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
-            let referencing: Vec<(Tid, Row)> = scan_table(&child, engine, txn)?
+            // The latest committed children, not the snapshot's: a child committed after this
+            // transaction's snapshot still references the key.
+            let referencing: Vec<(Tid, Row)> = scan_table_committed(&child, engine, txn)?
                 .into_iter()
                 .filter(|(ctid, crow)| {
                     !self.leaving.contains(&(child.id, *ctid))
@@ -3845,7 +3907,10 @@ fn enforce_fk_on_parent_update(
         if moving.is_empty() {
             continue;
         }
-        let child_rows = scan_table(&child, engine, txn)?;
+        let old_keys: Vec<Vec<ast::Value>> = moving.iter().map(|(old, _)| old.clone()).collect();
+        lock_removed_keys(table, &parent_ordinals, &old_keys, engine, txn)?;
+        // The latest committed children, as for a delete.
+        let child_rows = scan_table_committed(&child, engine, txn)?;
         for (old_key, new_key) in moving {
             let referencing: Vec<(Tid, Row)> = child_rows
                 .iter()
