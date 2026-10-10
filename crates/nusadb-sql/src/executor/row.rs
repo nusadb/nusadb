@@ -110,6 +110,8 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
         // key of the wrong type that a correctly-typed `=` lookup never finds: a silent row-miss
         // through the index, PRIMARY KEY included. The full column type is used, so a NUMERIC is
         // rescaled to the column's scale exactly as storage does.
+        // A text written to a JSON / JSONB column becomes the document it spells, so a CHECK
+        // comparing it with a JSON value sees a JSON value too.
         (V::Int(_) | V::Numeric(_) | V::Float(_) | V::Text(_), T::Numeric { .. })
         | (V::Int(_) | V::Numeric(_) | V::Text(_), T::Float)
         | (
@@ -122,7 +124,8 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
             | T::Interval
             | T::Uuid
             | T::Macaddr
-            | T::Macaddr8,
+            | T::Macaddr8
+            | T::Json,
         ) => {
             if let Ok(coerced) = super::eval::cast_value(value.clone(), ty) {
                 *value = coerced;

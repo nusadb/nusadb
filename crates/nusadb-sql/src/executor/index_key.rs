@@ -92,7 +92,8 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         // MACADDR8 is eight fixed big-endian bytes, so lexicographic order is EUI-64 order.
         ast::Value::Macaddr8(bytes) => out.extend_from_slice(bytes),
         // Text / BYTEA: byte-stuffed and 0x00-terminated so a prefix sorts before its extensions.
-        ast::Value::Text(s) => encode_ordered_bytes(s.as_bytes(), out),
+        // JSON / JSONB is keyed by its canonical text: the same bytes and order `compare` uses for it.
+        ast::Value::Text(s) | ast::Value::Json(s) => encode_ordered_bytes(s.as_bytes(), out),
         ast::Value::Bytes(b) => encode_ordered_bytes(b, out),
         // NUMERIC: a fixed-width canonical decimal layout (see `encode_numeric`).
         ast::Value::Numeric(d) => encode_numeric(d, out)?,
@@ -102,8 +103,7 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         // No v1 order-preserving form. INET/CIDR join here because their network order is not a
         // byte order (the masked prefix is compared before the mask), so a lexicographic key would
         // mis-order them; equality-only indexing is a follow-up.
-        ast::Value::Json(_)
-        | ast::Value::Interval(_)
+        ast::Value::Interval(_)
         | ast::Value::Array(_)
         | ast::Value::Vector(_)
         | ast::Value::Inet(_)
@@ -116,7 +116,7 @@ fn encode_non_null(value: &ast::Value, out: &mut Vec<u8>) -> Result<(), Error> {
         | ast::Value::Tsquery(_)
         | ast::Value::Xml(_) => {
             return Err(Error::Unsupported(
-                "JSON / INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE / GEOMETRY / \
+                "INTERVAL / ARRAY / VECTOR / INET / CIDR / BIT / RANGE / GEOMETRY / \
                  TSVECTOR / TSQUERY / XML columns cannot yet be index keys"
                     .to_owned(),
             ));
@@ -394,7 +394,14 @@ mod tests {
 
     #[test]
     fn unsupported_key_types_are_rejected() {
-        assert!(encode_index_key(&[ast::Value::Json("{}".to_owned())]).is_err());
         assert!(encode_index_key(&[ast::Value::Array(vec![ast::Value::Int(1)])]).is_err());
+        assert!(encode_index_key(&[ast::Value::Bit(vec![true])]).is_err());
+    }
+
+    #[test]
+    fn json_keys_by_its_canonical_text() {
+        let json = |s: &str| encode_index_key(&[ast::Value::Json(s.to_owned())]).unwrap();
+        assert_eq!(json(r#"{"a": 1}"#), json(r#"{"a": 1}"#));
+        assert!(json("[1]") < json(r#"{"a": 1}"#));
     }
 }

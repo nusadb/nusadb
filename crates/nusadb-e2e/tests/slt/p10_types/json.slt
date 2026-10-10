@@ -853,3 +853,62 @@ query T
 SELECT JSONB_BUILD_ARRAY(NULL, NULL)
 ----
 [null, null]
+
+# A text written to a JSON / JSONB column (a literal, a DEFAULT, an UPDATE value) is the document it
+# spells by the time a CHECK or a trigger sees it.
+statement ok
+CREATE TABLE jck (id INT PRIMARY KEY, f JSONB NOT NULL DEFAULT '{}', CONSTRAINT jck_nonempty CHECK (f <> CAST('{}' AS JSONB)))
+
+statement error violates check constraint
+INSERT INTO jck (id) VALUES (1)
+
+statement error violates check constraint
+INSERT INTO jck (id, f) VALUES (2, '{}')
+
+statement error violates check constraint
+INSERT INTO jck (id, f) VALUES (3, CAST('{}' AS JSONB))
+
+statement ok
+INSERT INTO jck (id, f) VALUES (4, '{"a": 1}')
+
+statement error violates check constraint
+UPDATE jck SET f = '{}' WHERE id = 4
+
+statement ok
+CREATE FUNCTION jck_immutable() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.f IS DISTINCT FROM OLD.f THEN RAISE 'f is immutable'; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER jck_immutable BEFORE UPDATE ON jck FOR EACH ROW EXECUTE FUNCTION jck_immutable()
+
+statement error f is immutable
+UPDATE jck SET f = '{"b": 2}' WHERE id = 4
+
+statement ok
+UPDATE jck SET f = '{"a":1}' WHERE id = 4
+
+query T
+SELECT f FROM jck
+----
+{"a": 1}
+
+# A JSON / JSONB column can be an index key: its canonical form, so spellings of one document
+# find each other through the index.
+statement ok
+CREATE TABLE jidx (id INT, j JSONB)
+
+statement ok
+CREATE INDEX jidx_j ON jidx (j)
+
+statement ok
+INSERT INTO jidx VALUES (1, '{"a": 1, "b": 2}'), (2, CAST('[1, 2]' AS JSONB))
+
+query I
+SELECT id FROM jidx WHERE j = CAST('{"b":2,"a":1}' AS JSONB)
+----
+1
+
+query I
+SELECT id FROM jidx ORDER BY j
+----
+2
+1
