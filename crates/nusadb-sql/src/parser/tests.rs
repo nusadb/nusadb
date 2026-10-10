@@ -4396,11 +4396,21 @@ fn is_json_does_not_mis_rewrite_json_data() {
         Err(Error::InvalidStatement(_))
     ));
 
-    // `IS JSON` chained directly before another postfix/ternary operator is rejected with a clear
-    // message (parenthesise instead) — never leaking the internal sentinel as an "unknown column".
+    // `IS JSON` followed by another `IS` test chains like any two `IS` tests.
+    assert!(matches!(
+        {
+            let ast::Statement::Select(s) = ok("SELECT * FROM t WHERE x IS JSON IS NULL") else {
+                panic!("expected Select");
+            };
+            s.filter
+        },
+        Some(ast::Expr::IsNull { expr, negated: false }) if matches!(*expr, ast::Expr::IsJson { .. })
+    ));
+    // `IS JSON` chained directly before a tighter-binding operator is rejected with a clear
+    // message (parenthesise instead), never leaking the internal sentinel as an "unknown column".
     for sql in [
-        "SELECT * FROM t WHERE x IS JSON IS NULL",
         "SELECT * FROM t WHERE x IS JSON BETWEEN a AND b",
+        "SELECT * FROM t WHERE x IS JSON IN (a, b)",
     ] {
         let err = parse(sql).expect_err(sql).to_string();
         assert!(

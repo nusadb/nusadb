@@ -218,16 +218,16 @@ pub(super) const fn interval_field_unit(field: &sql::DateTimeField) -> &'static 
 pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
     match expr {
         // A surviving `IS JSON` sentinel reaching here means the predicate was chained directly
-        // before another postfix/ternary operator (`x IS JSON IS NULL`, `x IS JSON BETWEEN a AND b`)
-        // whose node shape the spine re-association does not descend through, so the synthetic name
-        // leaked. Reject it clearly — never surface the internal name as an "unknown column" — and
-        // point at the parenthesised form, which parses fine: `(x IS JSON) IS NULL`.
+        // before an operator that binds tighter than `IS` (`x IS JSON BETWEEN a AND b`), which
+        // took the sentinel as its own operand, so the synthetic name leaked. Reject it clearly,
+        // never surfacing the internal name as an "unknown column", and point at the
+        // parenthesised form, which parses fine.
         sql::Expr::Identifier(ident)
             if ident.quote_style.is_none() && ident.value.starts_with(super::IS_JSON_PREFIX) =>
         {
             unsupported(
-                "IS JSON written directly before another operator (IS/BETWEEN/IN/LIKE …) is not \
-                 supported; parenthesise it, e.g. `(x IS JSON) IS NULL`",
+                "IS JSON written directly before another operator (BETWEEN/IN/LIKE …) is not \
+                 supported; parenthesise it, e.g. `(x IS JSON) BETWEEN a AND b`",
             )
         },
         // The niladic keywords `current_schema` / `current_catalog` are parsed as bare identifiers

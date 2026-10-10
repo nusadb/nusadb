@@ -107,3 +107,40 @@ NULL
 # A genuinely untypable composite NULL is still rejected.
 statement error
 SELECT NULL + NULL
+
+# IS [NOT] DISTINCT FROM binds tighter than NOT, AND and OR, and looser than comparison and
+# arithmetic: its right operand ends at the boolean operator.
+query B
+SELECT 1 IS DISTINCT FROM 2 OR 3 IS DISTINCT FROM 3
+----
+1
+
+query B
+SELECT 'a' IS DISTINCT FROM 'b' AND 1 <> 2
+----
+1
+
+query B
+SELECT 1 IS DISTINCT FROM 2 AND FALSE
+----
+0
+
+query B
+SELECT NULL IS NOT DISTINCT FROM NULL OR FALSE
+----
+1
+
+query B
+SELECT NOT 1 IS DISTINCT FROM 1
+----
+1
+
+query B
+SELECT 3 is distinct from 1 + 2
+----
+0
+
+query B
+SELECT TRUE IS DISTINCT FROM 1 = 2
+----
+1

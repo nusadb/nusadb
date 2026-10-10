@@ -217,6 +217,10 @@ impl Dialect for NusaParserDialect {
         expr: &sql::Expr,
         precedence: u8,
     ) -> Option<Result<sql::Expr, sqlparser::parser::ParserError>> {
+        if let Some(parsed) = parse_is_distinct_from(parser, expr, self.prec_value(Precedence::Is))
+        {
+            return Some(parsed);
+        }
         // Vector distance operators `<->` (L2), `<#>` (negative inner product) and `<+>` (L1).
         // With geometric types off (the surface this wrapper reports), the tokenizer never fuses
         // these into single tokens: it emits `<` then `->`/`#>` (Arrow/HashArrow), or `<` `+` `>`.
@@ -497,6 +501,51 @@ fn recognize_json_exists_op(parser: &Parser) -> Option<(&'static str, usize)> {
         Token::Ampersand => Some(("?&", 2)),
         _ => Some(("?", 1)),
     }
+}
+
+/// `IS [NOT] DISTINCT FROM` at the parser's position, bound like the other `IS` tests: its right
+/// operand stops at a looser operator, so `a IS DISTINCT FROM b OR c` is
+/// `(a IS DISTINCT FROM b) OR c`. The generic parser reads the right operand as a whole
+/// expression, swallowing the `OR`. `None` when the next tokens are not this test.
+fn parse_is_distinct_from(
+    parser: &mut Parser,
+    expr: &sql::Expr,
+    is_precedence: u8,
+) -> Option<Result<sql::Expr, sqlparser::parser::ParserError>> {
+    if !matches!(&parser.peek_nth_token_ref(0).token, sqlparser::tokenizer::Token::Word(w) if w.keyword == Keyword::IS)
+    {
+        return None;
+    }
+    let negated = match (
+        &parser.peek_nth_token_ref(1).token,
+        &parser.peek_nth_token_ref(2).token,
+    ) {
+        (sqlparser::tokenizer::Token::Word(a), _) if a.keyword == Keyword::DISTINCT => false,
+        (sqlparser::tokenizer::Token::Word(a), sqlparser::tokenizer::Token::Word(b))
+            if a.keyword == Keyword::NOT && b.keyword == Keyword::DISTINCT =>
+        {
+            true
+        },
+        _ => return None,
+    };
+    let keywords: &[Keyword] = if negated {
+        &[Keyword::IS, Keyword::NOT, Keyword::DISTINCT, Keyword::FROM]
+    } else {
+        &[Keyword::IS, Keyword::DISTINCT, Keyword::FROM]
+    };
+    if !parser.parse_keywords(keywords) {
+        return None;
+    }
+    let right = match parser.parse_subexpr(is_precedence) {
+        Ok(right) => Box::new(right),
+        Err(e) => return Some(Err(e)),
+    };
+    let left = Box::new(expr.clone());
+    Some(Ok(if negated {
+        sql::Expr::IsNotDistinctFrom(left, right)
+    } else {
+        sql::Expr::IsDistinctFrom(left, right)
+    }))
 }
 
 /// Recognize a vector distance operator at the current parser position, where the next token is a
