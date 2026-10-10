@@ -117,7 +117,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
                 });
             }
             for (proj, column) in plan.projection.iter().zip(&target_columns) {
-                if !assignable(column.ty, proj.expr.ty) {
+                if !super::typecheck::assignable_to_column(column.ty, proj.expr.ty) {
                     return Err(Error::TypeMismatch {
                         context: format!("INSERT ... SELECT into column `{}`", column.name),
                         expected: column.ty,

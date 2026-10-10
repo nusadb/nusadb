@@ -70,3 +70,29 @@ INSERT INTO ct(a) VALUES ('xyz')
 
 statement ok
 DROP TABLE ct
+
+# A write converts a DATE into a timestamp column (midnight) and a NUMERIC or FLOAT into an integer
+# column (rounded, range-checked), in VALUES, INSERT ... SELECT and UPDATE alike.
+statement ok
+CREATE TABLE asg (id INT PRIMARY KEY, ts TIMESTAMP, tz TIMESTAMPTZ, n INT, s SMALLINT, d DATE)
+
+statement ok
+INSERT INTO asg (id, ts, tz, n) VALUES (1, CAST('2026-01-02' AS DATE), CAST('2026-01-03' AS DATE), CAST(2.5 AS NUMERIC))
+
+statement ok
+INSERT INTO asg (id, n, d) SELECT 2, CAST(4.4 AS FLOAT), CAST('2026-02-01' AS DATE)
+
+statement ok
+UPDATE asg SET ts = d, n = n + 0.6 WHERE id = 2
+
+query ITTI rowsort
+SELECT id, CAST(ts AS TEXT), CAST(tz AS DATE), n FROM asg
+----
+1 2026-01-02 00:00:00 2026-01-03 3
+2 2026-02-01 00:00:00 NULL 5
+
+statement error out of range
+INSERT INTO asg (id, s) VALUES (3, CAST(40000.2 AS NUMERIC))
+
+statement error invalid Int value
+INSERT INTO asg (id, n) VALUES (4, CAST(1e20 AS FLOAT))

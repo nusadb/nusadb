@@ -782,7 +782,7 @@ fn finalize_updated_row(
         set_at(&mut row, index, value)?;
     }
     for (index, (value, column)) in row.iter_mut().zip(&table.columns).enumerate() {
-        row::adopt_column_type(value, column.ty);
+        row::adopt_column_type(value, column.ty)?;
         // Enforce the `VARCHAR(n)`/`CHAR(n)` length after the SET assignments, matching INSERT.
         row::coerce_char_length(value, column.ty)?;
         // Resolve a text value assigned to an enum column into its ordinal (22P02 if unknown).
@@ -1502,7 +1502,7 @@ fn insert_rows_with_unique(
         // type here, before uniqueness/RLS/`RETURNING` ever see the row — so all three agree with
         // what a later read decodes.
         for (idx, (value, ty)) in full.iter_mut().zip(&schema).enumerate() {
-            row::adopt_column_type(value, *ty);
+            row::adopt_column_type(value, *ty)?;
             // A `VARCHAR(n)`/`CHAR(n)` value over the declared length errors (`22001`) here, before
             // the row is written, unless the overflow is all trailing blanks (then it is truncated).
             row::coerce_char_length(value, *ty)?;
@@ -1812,7 +1812,7 @@ fn upsert_rows(
         // Each value in its column's own type, exactly as a plain INSERT prepares it, so the
         // conflict probe and the uniqueness checks below compare it with the stored rows.
         for (idx, (value, ty)) in full.iter_mut().zip(&schema).enumerate() {
-            row::adopt_column_type(value, *ty);
+            row::adopt_column_type(value, *ty)?;
             row::coerce_char_length(value, *ty)?;
             if let Some((enum_type, labels)) = enum_info.get(idx).and_then(Option::as_ref) {
                 row::coerce_enum(value, labels, enum_type)?;

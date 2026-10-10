@@ -8,7 +8,7 @@ use super::*;
 // === Type rules ===========================================================
 
 pub(super) fn check_assignable(column: &ColumnDef, value: &TypedExpr) -> Result<(), Error> {
-    if assignable(column.ty, value.ty) {
+    if assignable_to_column(column.ty, value.ty) {
         Ok(())
     } else {
         Err(Error::TypeMismatch {
@@ -17,6 +17,25 @@ pub(super) fn check_assignable(column: &ColumnDef, value: &TypedExpr) -> Result<
             found: value.ty,
         })
     }
+}
+
+/// Whether a `source`-typed value may be stored into a `target`-typed column by `INSERT`/`UPDATE`:
+/// [`assignable`], plus the assignment casts a write performs that an expression context does not
+/// (a function argument, say): a `DATE` into a timestamp column (midnight), and a `NUMERIC` or
+/// `FLOAT` into an integer column (rounded, range-checked). The write converts the value in
+/// `row::adopt_column_type`.
+pub(super) fn assignable_to_column(target: ColumnType, source: ColumnType) -> bool {
+    assignable(target, source)
+        || matches!(
+            (target.physical(), source.physical()),
+            (
+                ColumnType::Timestamp | ColumnType::TimestampTz,
+                ColumnType::Date
+            ) | (
+                ColumnType::Int,
+                ColumnType::Numeric { .. } | ColumnType::Float
+            )
+        )
 }
 
 /// Whether a `source`-typed value may be stored into a `target`-typed column.

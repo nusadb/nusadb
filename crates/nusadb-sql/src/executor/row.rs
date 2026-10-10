@@ -93,7 +93,7 @@ pub(crate) fn encode(row: &[ast::Value], schema: &[ColumnType]) -> Result<Vec<u8
 ///
 /// Takes one value at a time so a caller with the column types in any shape — a `ColumnType` slice
 /// or a `ColumnDef` list — can drive it without materializing a second one per row.
-pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
+pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) -> Result<(), Error> {
     use ColumnType as T;
     use ast::Value as V;
     match (&*value, ty.physical()) {
@@ -112,6 +112,11 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
         // rescaled to the column's scale exactly as storage does.
         // A text written to a JSON / JSONB column becomes the document it spells, so a CHECK
         // comparing it with a JSON value sees a JSON value too.
+        // A DATE written to a timestamp column is its midnight; a NUMERIC or FLOAT written to an
+        // integer column is rounded and range-checked by the cast, whose error is the write's.
+        (V::Date(_), T::Timestamp | T::TimestampTz) | (V::Numeric(_) | V::Float(_), T::Int) => {
+            *value = super::eval::cast_value(value.clone(), ty)?;
+        },
         (V::Int(_) | V::Numeric(_) | V::Float(_) | V::Text(_), T::Numeric { .. })
         | (V::Int(_) | V::Numeric(_) | V::Text(_), T::Float)
         | (
@@ -133,6 +138,7 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) {
         },
         _ => {},
     }
+    Ok(())
 }
 
 /// Apply a `VARCHAR(n)` / `CHAR(n)` column's declared length to a text value about to be written,
