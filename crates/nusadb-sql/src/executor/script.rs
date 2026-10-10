@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::parser::{ScriptBlock, ScriptStmt};
+use crate::parser::{ScriptBlock, ScriptStmt, TriggerReturn};
 
 /// Maximum `WHILE` iterations before a loop is aborted as non-terminating.
 const MAX_LOOP_ITERS: u64 = 1_000_000;
@@ -40,6 +40,14 @@ enum Flow {
     /// `RETURN` was hit — stop the enclosing routine, carrying the returned value (`None` for a bare
     /// `RETURN`, as a procedure uses; `Some` for a function's `RETURN expr`).
     Return(Option<ast::Value>),
+    /// A trigger function's `RETURN NEW` / `OLD` / `NULL`: stop, naming the row to proceed with.
+    ReturnRow(TriggerReturn),
+}
+
+impl Flow {
+    const fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
 }
 
 /// The variable environment: declared name → current value.
@@ -65,6 +73,22 @@ pub(super) fn run_block(
     Ok(env)
 }
 
+/// Run a trigger function's block over a seeded environment (the trigger variables and the new
+/// row's fields), returning the final environment and the row its `RETURN` named: `None` when the
+/// body ended, or stopped at a bare `RETURN`, without naming one.
+pub(super) fn run_trigger_block(
+    block: &ScriptBlock,
+    mut env: Env,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(Env, Option<TriggerReturn>), Error> {
+    let returned = match exec_block(block, &mut env, &[], engine, txn)? {
+        Flow::ReturnRow(row) => Some(row),
+        Flow::Normal | Flow::Return(_) => None,
+    };
+    Ok((env, returned))
+}
+
 /// Run a parsed NusaScript block as a *function* body: execute it and yield the value of the
 /// `RETURN expr` that stopped it, coerced to the declared return type. Reaching the end of the body —
 /// or a bare `RETURN` with no value — without returning a value is an error: a function must return
@@ -85,7 +109,7 @@ pub(super) fn run_function_block(
     }
     match exec_block(block, &mut env, params, engine, txn)? {
         Flow::Return(Some(value)) => super::eval::cast_value(value, return_ty),
-        Flow::Return(None) | Flow::Normal => Err(Error::Coded {
+        Flow::Return(None) | Flow::ReturnRow(_) | Flow::Normal => Err(Error::Coded {
             message: "control reached end of function without RETURN".to_owned(),
             sqlstate: "2F005",
         }),
@@ -129,8 +153,9 @@ fn exec_stmts(
     txn: TxnId,
 ) -> Result<Flow, Error> {
     for stmt in stmts {
-        if let Flow::Return(value) = exec_one(stmt, env, params, engine, txn)? {
-            return Ok(Flow::Return(value));
+        let flow = exec_one(stmt, env, params, engine, txn)?;
+        if !flow.is_normal() {
+            return Ok(flow);
         }
     }
     Ok(Flow::Normal)
@@ -176,8 +201,9 @@ fn exec_one(
                         "NusaScript WHILE loop exceeded the iteration limit".to_owned(),
                     ));
                 }
-                if let Flow::Return(value) = exec_stmts(body, env, params, engine, txn)? {
-                    return Ok(Flow::Return(value));
+                let flow = exec_stmts(body, env, params, engine, txn)?;
+                if !flow.is_normal() {
+                    return Ok(flow);
                 }
             }
             Ok(Flow::Normal)
@@ -200,8 +226,9 @@ fn exec_one(
                     ));
                 }
                 env.insert(var.clone(), ast::Value::Int(i));
-                if let Flow::Return(value) = exec_stmts(body, env, params, engine, txn)? {
-                    return Ok(Flow::Return(value));
+                let flow = exec_stmts(body, env, params, engine, txn)?;
+                if !flow.is_normal() {
+                    return Ok(flow);
                 }
             }
             Ok(Flow::Normal)
@@ -222,6 +249,7 @@ fn exec_one(
             };
             Ok(Flow::Return(value))
         },
+        ScriptStmt::ReturnRow(row) => Ok(Flow::ReturnRow(*row)),
         ScriptStmt::Block(block) => exec_block(block, env, params, engine, txn),
         ScriptStmt::Sql(sql) => {
             let bound = bind((**sql).clone(), env, params, engine, txn)?;

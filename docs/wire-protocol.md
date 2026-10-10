@@ -562,6 +562,7 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
   | `23` | integrity constraint violation | `23502` NOT NULL, `23505` unique, `23503` foreign key |
   | `25` | the transaction is in the wrong state for this statement | `25P02` transaction is aborted — send `ROLLBACK`; `25P01` no transaction is open; `25001` this statement cannot run here (inside a transaction block, or after a query has already run in it); `25006` the transaction is READ ONLY |
   | `26` | invalid SQL statement name | `26000` no such prepared statement — re-prepare it |
+  | `27` | triggered data change violation | `27000` a `BEFORE` trigger skipped or re-keyed a row a referential action writes |
   | `2B` | dependent objects still exist | `2BP01` — resolve with `CASCADE` |
   | `2F` | SQL routine exception | `2F005` a function body finished without returning a value |
   | `34` | invalid cursor name | `34000` no such portal |

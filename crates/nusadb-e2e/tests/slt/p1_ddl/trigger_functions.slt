@@ -1,0 +1,536 @@
+# A trigger function sees the trigger variables (TG_OP, TG_NAME, TG_WHEN, TG_LEVEL, TG_TABLE_NAME,
+# TG_TABLE_SCHEMA), and a BEFORE ... FOR EACH ROW function decides the row the write goes on with:
+# NEW as the body left it, OLD, or NULL to skip the row.
+
+statement ok
+CREATE TABLE tlog (op TEXT, name TEXT, timing TEXT, lvl TEXT, tbl TEXT, sch TEXT)
+
+statement ok
+CREATE FUNCTION log_event() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO tlog VALUES (TG_OP, TG_NAME, TG_WHEN, TG_LEVEL, TG_TABLE_NAME, TG_TABLE_SCHEMA); RETURN NEW; END $$
+
+statement ok
+CREATE SCHEMA app
+
+statement ok
+CREATE TABLE app.acct (id INT PRIMARY KEY, v INT)
+
+statement ok
+SET search_path = app, public
+
+statement ok
+CREATE TRIGGER a_row AFTER INSERT OR UPDATE OR DELETE ON acct FOR EACH ROW EXECUTE FUNCTION log_event()
+
+statement ok
+CREATE TRIGGER b_stmt BEFORE INSERT OR UPDATE OR DELETE ON acct FOR EACH STATEMENT EXECUTE FUNCTION log_event()
+
+statement ok
+SET search_path = public
+
+statement ok
+INSERT INTO app.acct VALUES (1, 10)
+
+statement ok
+UPDATE app.acct SET v = 11
+
+statement ok
+DELETE FROM app.acct
+
+query TTTTTT
+SELECT op, name, timing, lvl, tbl, sch FROM tlog ORDER BY op, lvl
+----
+DELETE a_row AFTER ROW acct app
+DELETE b_stmt BEFORE STATEMENT acct app
+INSERT a_row AFTER ROW acct app
+INSERT b_stmt BEFORE STATEMENT acct app
+UPDATE a_row AFTER ROW acct app
+UPDATE b_stmt BEFORE STATEMENT acct app
+
+# One guard function for two events, branching on TG_OP.
+statement ok
+CREATE TABLE guarded (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO guarded VALUES (1, 1)
+
+statement ok
+CREATE FUNCTION guard() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF TG_OP = 'DELETE' THEN RAISE 'deletes are blocked'; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER guard BEFORE UPDATE OR DELETE ON guarded FOR EACH ROW EXECUTE FUNCTION guard()
+
+statement error deletes are blocked
+DELETE FROM guarded
+
+statement ok
+UPDATE guarded SET v = 2
+
+query II
+SELECT id, v FROM guarded
+----
+1 2
+
+# An inherited partition trigger reports the partition the row is in; a row moving between
+# partitions is a DELETE in its old partition and an INSERT in its new one.
+statement ok
+DELETE FROM tlog
+
+statement ok
+CREATE TABLE ev (k INT NOT NULL, v INT) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE ev_1 PARTITION OF ev FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ev_2 PARTITION OF ev FOR VALUES IN (2)
+
+statement ok
+CREATE TRIGGER ev_log AFTER INSERT OR DELETE ON ev FOR EACH ROW EXECUTE FUNCTION log_event()
+
+statement ok
+INSERT INTO ev VALUES (1, 0)
+
+statement ok
+UPDATE ev SET k = 2
+
+query TT
+SELECT op, tbl FROM tlog ORDER BY op DESC, tbl
+----
+INSERT ev_1
+INSERT ev_2
+DELETE ev_1
+
+# RETURN NULL in a BEFORE row trigger skips the row: not written, no AFTER trigger.
+statement ok
+DELETE FROM tlog
+
+statement ok
+CREATE TABLE skip_t (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE FUNCTION skip_odd() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF TG_OP = 'DELETE' THEN IF OLD.id % 2 = 1 THEN RETURN NULL; END IF; RETURN OLD; END IF; IF NEW.id % 2 = 1 THEN RETURN NULL; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER skip_odd BEFORE INSERT OR UPDATE OR DELETE ON skip_t FOR EACH ROW EXECUTE FUNCTION skip_odd()
+
+statement ok
+CREATE TRIGGER skip_log AFTER INSERT ON skip_t FOR EACH ROW EXECUTE FUNCTION log_event()
+
+statement count 2
+INSERT INTO skip_t VALUES (1, 0), (2, 0), (3, 0), (4, 0)
+
+query I
+SELECT id FROM skip_t ORDER BY id
+----
+2
+4
+
+query I
+SELECT count(*) FROM tlog
+----
+2
+
+statement ok
+DROP TRIGGER skip_odd ON skip_t
+
+statement ok
+INSERT INTO skip_t VALUES (1, 0), (3, 0)
+
+statement ok
+CREATE TRIGGER skip_odd BEFORE INSERT OR UPDATE OR DELETE ON skip_t FOR EACH ROW EXECUTE FUNCTION skip_odd()
+
+statement ok
+UPDATE skip_t SET v = 9
+
+query II
+SELECT id, v FROM skip_t ORDER BY id
+----
+1 0
+2 9
+3 0
+4 9
+
+statement ok
+DELETE FROM skip_t
+
+query I
+SELECT id FROM skip_t ORDER BY id
+----
+1
+3
+
+# RETURN NEW from a BEFORE DELETE trigger: NEW is null in a delete, so the row is kept.
+statement ok
+CREATE FUNCTION keep_on_delete() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN RETURN NEW; END $$
+
+statement ok
+CREATE TABLE keep_t (id INT)
+
+statement ok
+INSERT INTO keep_t VALUES (1)
+
+statement ok
+CREATE TRIGGER keep BEFORE DELETE ON keep_t FOR EACH ROW EXECUTE FUNCTION keep_on_delete()
+
+statement ok
+DELETE FROM keep_t
+
+query I
+SELECT count(*) FROM keep_t
+----
+1
+
+# A BEFORE row trigger can rewrite NEW: by `NEW.col := ...` or `SET NEW.col = ...`, with the value
+# converted to the column's type, generated columns recomputed and constraints checked on the result.
+statement ok
+CREATE TABLE stamp (id INT PRIMARY KEY, v INT NOT NULL, tag TEXT, twice INT GENERATED ALWAYS AS (v * 2) STORED, CHECK (v < 1000))
+
+statement ok
+CREATE FUNCTION scale() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.v := NEW.v * 10; SET NEW.tag = TG_OP; IF NEW.id = 9 THEN NEW.v := '77'; END IF; IF NEW.id = 8 THEN NEW.v := NULL; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER scale BEFORE INSERT OR UPDATE ON stamp FOR EACH ROW EXECUTE FUNCTION scale()
+
+statement ok
+INSERT INTO stamp (id, v) VALUES (1, 5), (9, 1)
+
+query IITI
+SELECT id, v, tag, twice FROM stamp ORDER BY id
+----
+1 50 INSERT 100
+9 77 INSERT 154
+
+statement ok
+UPDATE stamp SET v = 6 WHERE id = 1
+
+query IIT
+SELECT id, v, tag FROM stamp WHERE id = 1
+----
+1 60 UPDATE
+
+statement error NULL assigned to NOT NULL column
+INSERT INTO stamp (id, v) VALUES (8, 1)
+
+statement error violates check constraint
+INSERT INTO stamp (id, v) VALUES (2, 500)
+
+# A rewritten key is checked for uniqueness, and indexes follow the rewritten row.
+statement ok
+CREATE TABLE ukey (id INT PRIMARY KEY, code INT UNIQUE, note TEXT)
+
+statement ok
+CREATE INDEX ukey_note ON ukey (note)
+
+statement ok
+INSERT INTO ukey VALUES (1, 1, 'a'), (2, 2, 'b')
+
+statement ok
+CREATE FUNCTION recode() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.code := 1; NEW.note := 'z'; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER recode BEFORE UPDATE ON ukey FOR EACH ROW EXECUTE FUNCTION recode()
+
+statement error duplicate key
+UPDATE ukey SET note = 'c' WHERE id = 2
+
+statement ok
+UPDATE ukey SET note = 'c' WHERE id = 1
+
+query IIT
+SELECT id, code, note FROM ukey WHERE note = 'z'
+----
+1 1 z
+
+# RETURN OLD from a BEFORE UPDATE keeps the row as it was.
+statement ok
+CREATE FUNCTION freeze() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN RETURN OLD; END $$
+
+statement ok
+CREATE TABLE frozen (id INT, v INT)
+
+statement ok
+INSERT INTO frozen VALUES (1, 1)
+
+statement ok
+CREATE TRIGGER freeze BEFORE UPDATE ON frozen FOR EACH ROW EXECUTE FUNCTION freeze()
+
+statement ok
+UPDATE frozen SET v = 2
+
+query II
+SELECT id, v FROM frozen
+----
+1 1
+
+# A body that rewrites NEW and ends without RETURN goes on with NEW as rewritten.
+statement ok
+CREATE FUNCTION bump() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN DECLARE d INT DEFAULT 0; d := 1; NEW.v := NEW.v + d; END $$
+
+statement ok
+CREATE TABLE bumped (v INT)
+
+statement ok
+CREATE TRIGGER bump BEFORE INSERT ON bumped FOR EACH ROW EXECUTE FUNCTION bump()
+
+statement ok
+INSERT INTO bumped VALUES (1)
+
+query I
+SELECT v FROM bumped
+----
+2
+
+# A rewrite can move a row to another partition.
+statement ok
+CREATE FUNCTION to_two() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.k := 2; RETURN NEW; END $$
+
+statement ok
+CREATE TABLE mv (k INT NOT NULL, v INT) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE mv_1 PARTITION OF mv FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE mv_2 PARTITION OF mv FOR VALUES IN (2)
+
+statement ok
+INSERT INTO mv VALUES (1, 0)
+
+statement ok
+CREATE TRIGGER to_two BEFORE UPDATE ON mv FOR EACH ROW EXECUTE FUNCTION to_two()
+
+statement ok
+UPDATE mv SET v = 5
+
+query I
+SELECT count(*) FROM mv_2 WHERE v = 5
+----
+1
+
+# A BEFORE DELETE trigger that skips a moving row keeps it where it was: not moved, not returned.
+statement ok
+CREATE FUNCTION pin_odd() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF OLD.id % 2 = 1 THEN RETURN NULL; END IF; RETURN OLD; END $$
+
+statement ok
+CREATE TABLE pm (k INT NOT NULL, id INT) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE pm_1 PARTITION OF pm FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE pm_2 PARTITION OF pm FOR VALUES IN (2)
+
+statement ok
+INSERT INTO pm VALUES (1, 1), (1, 2), (1, 3)
+
+statement ok
+CREATE TRIGGER pin_odd BEFORE DELETE ON pm FOR EACH ROW EXECUTE FUNCTION pin_odd()
+
+query I
+UPDATE pm SET k = 2 RETURNING id
+----
+2
+
+query II
+SELECT k, id FROM pm ORDER BY id
+----
+1 1
+2 2
+1 3
+
+statement ok
+INSERT INTO pm VALUES (1, 4), (1, 5)
+
+statement count 1
+UPDATE pm SET k = 2 WHERE id >= 4
+
+# A trigger function returns NEW, OLD or NULL only, and NEW exists only where the event has one.
+statement ok
+CREATE FUNCTION bad_return() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN RETURN 1; END $$
+
+statement ok
+CREATE TABLE bad_t (v INT)
+
+statement ok
+CREATE TRIGGER bad_return BEFORE INSERT ON bad_t FOR EACH ROW EXECUTE FUNCTION bad_return()
+
+statement error must return NEW, OLD or NULL
+INSERT INTO bad_t VALUES (1)
+
+# In a function shared by several events, the row an event lacks reads as null.
+statement ok
+CREATE FUNCTION both_rows() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO tlog (op, name) VALUES (TG_OP, COALESCE(CAST(OLD.v AS TEXT), 'none') || '/' || COALESCE(CAST(NEW.v AS TEXT), 'none')); RETURN NULL; END $$
+
+statement ok
+CREATE TABLE both_t (v INT)
+
+statement ok
+CREATE TRIGGER both_rows AFTER INSERT OR DELETE ON both_t FOR EACH ROW EXECUTE FUNCTION both_rows()
+
+statement ok
+DELETE FROM tlog
+
+statement ok
+INSERT INTO both_t VALUES (4)
+
+statement ok
+DELETE FROM both_t
+
+query TT
+SELECT op, name FROM tlog ORDER BY op
+----
+DELETE 4/none
+INSERT none/4
+
+# A trigger that skips a row a cascade must change is refused: the row would break the key.
+statement ok
+CREATE TABLE par (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE chi (p INT REFERENCES par (id) ON DELETE CASCADE)
+
+statement ok
+INSERT INTO par VALUES (1)
+
+statement ok
+INSERT INTO chi VALUES (1)
+
+statement ok
+CREATE FUNCTION no_delete() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN RETURN NULL; END $$
+
+statement ok
+CREATE TRIGGER no_delete BEFORE DELETE ON chi FOR EACH ROW EXECUTE FUNCTION no_delete()
+
+statement error skipped a row a referential action must change
+DELETE FROM par
+
+query I
+SELECT count(*) FROM chi
+----
+1
+
+# A trigger on a referencing table may change other columns of a row an ON UPDATE action writes
+# (CHECK still applies), but not its keys: the action computed them.
+statement ok
+CREATE TABLE upar (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE uchi (p INT REFERENCES upar (id) ON UPDATE CASCADE, touched INT CHECK (touched < 100))
+
+statement ok
+CREATE TABLE nchi (p INT REFERENCES upar (id) ON UPDATE SET NULL)
+
+statement ok
+INSERT INTO upar VALUES (1)
+
+statement ok
+INSERT INTO uchi VALUES (1, 0)
+
+statement ok
+CREATE FUNCTION touch() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.touched := COALESCE(OLD.touched, 0) + 1; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER touch BEFORE UPDATE ON uchi FOR EACH ROW EXECUTE FUNCTION touch()
+
+statement ok
+UPDATE upar SET id = 2
+
+query II
+SELECT p, touched FROM uchi
+----
+2 1
+
+statement ok
+CREATE FUNCTION overflow() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.touched := 500; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER touch2 BEFORE UPDATE ON uchi FOR EACH ROW EXECUTE FUNCTION overflow()
+
+statement error violates check constraint
+UPDATE upar SET id = 3
+
+statement ok
+DROP TRIGGER touch2 ON uchi
+
+statement ok
+CREATE FUNCTION keep_old() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN RETURN OLD; END $$
+
+statement ok
+CREATE TRIGGER keep_old BEFORE UPDATE ON uchi FOR EACH ROW EXECUTE FUNCTION keep_old()
+
+statement error changed a key of a row a referential action writes
+UPDATE upar SET id = 3
+
+statement ok
+DROP TRIGGER keep_old ON uchi
+
+statement ok
+CREATE FUNCTION repoint() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.p := 99; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER repoint BEFORE UPDATE ON uchi FOR EACH ROW EXECUTE FUNCTION repoint()
+
+statement error changed a key of a row a referential action writes
+UPDATE upar SET id = 3
+
+statement ok
+DROP TRIGGER repoint ON uchi
+
+statement ok
+INSERT INTO nchi VALUES (2)
+
+statement ok
+CREATE TRIGGER repoint BEFORE UPDATE ON nchi FOR EACH ROW EXECUTE FUNCTION repoint()
+
+statement error changed a key of a row a referential action writes
+UPDATE upar SET id = 3
+
+query I
+SELECT count(*) FROM uchi WHERE p NOT IN (SELECT id FROM upar)
+----
+0
+
+# A serial value a trigger writes moves the sequence past it.
+statement ok
+CREATE TABLE ser (id SERIAL PRIMARY KEY, v INT)
+
+statement ok
+CREATE FUNCTION pick_id() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.v = 0 THEN NEW.id := 100; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER pick_id BEFORE INSERT ON ser FOR EACH ROW EXECUTE FUNCTION pick_id()
+
+statement ok
+INSERT INTO ser (v) VALUES (0)
+
+statement ok
+INSERT INTO ser (v) VALUES (1)
+
+query I
+SELECT id FROM ser WHERE v = 1
+----
+101
+
+# A row other rows reference cannot be kept from moving once its new key reached them.
+statement ok
+CREATE TABLE mvp (k INT NOT NULL, id INT, PRIMARY KEY (k, id)) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE mvp_1 PARTITION OF mvp FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE mvp_2 PARTITION OF mvp FOR VALUES IN (2)
+
+statement ok
+INSERT INTO mvp VALUES (1, 1)
+
+statement ok
+CREATE TABLE mvc (k INT, id INT, FOREIGN KEY (k, id) REFERENCES mvp_1 (k, id) ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO mvc VALUES (1, 1)
+
+statement ok
+CREATE TRIGGER pin BEFORE DELETE ON mvp_1 FOR EACH ROW EXECUTE FUNCTION keep_on_delete()
+
+statement error kept in place a row whose key
+UPDATE mvp SET k = 2

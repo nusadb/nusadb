@@ -3,6 +3,7 @@
 //! Split verbatim out of `executor/mod.rs` (ADR 007). Siblings resolve via `use super::*`.
 #![allow(clippy::wildcard_imports)]
 
+use super::trigger::BeforeRow;
 use super::*;
 
 // === INSERT ===============================================================
@@ -792,6 +793,45 @@ fn finalize_updated_row(
     Ok(row)
 }
 
+/// What [`conform_trigger_row`] needs of a table, loaded once per statement.
+pub(super) struct ConformContext {
+    fills: Vec<Option<super::coldefault::ColumnFill>>,
+    enum_info: Vec<Option<(String, Vec<String>)>>,
+}
+
+impl ConformContext {
+    pub(super) fn load(
+        table: &TableSchema,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            fills: super::coldefault::column_fills(table, engine, txn)?,
+            enum_info: enum_columns_info(table, engine, txn)?,
+        })
+    }
+}
+
+/// Bring a row a `BEFORE` trigger rewrote back to the table's stored form, as the statement's own
+/// rows were: generated columns recomputed from the new values, `NOT NULL`, lengths and enum labels
+/// enforced.
+pub(super) fn conform_trigger_row(
+    table: &TableSchema,
+    row: Row,
+    context: &ConformContext,
+) -> Result<Row, Error> {
+    let mut row = finalize_updated_row(row, &context.fills, table, &context.enum_info)?;
+    for (value, column) in row.iter_mut().zip(&table.columns) {
+        if matches!(value, ast::Value::Null) && !column.nullable {
+            return Err(Error::NotNullViolation {
+                column: column.name.clone(),
+            });
+        }
+        stored_form(value, column.ty)?;
+    }
+    Ok(row)
+}
+
 /// After inserting `full_rows`, advance each `SERIAL`/`IDENTITY` column's sequence past the largest
 /// explicit value any row supplied for it. A row that overrides a serial
 /// column with an explicit value would otherwise leave the sequence behind, so the next auto-generated
@@ -1475,6 +1515,19 @@ fn insert_rows_with_unique(
         }
         full_rows.push(full);
     }
+    // Triggers: load the INSERT triggers once, fire statement- and row-level BEFORE triggers (a
+    // row trigger may rewrite or skip a row, so they run before the checks below), then (after the
+    // writes) the AFTER triggers. Firing happens here so `COPY FROM` triggers too.
+    let triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?
+    .statement_triggers_if(fire_statement_triggers);
+    triggers.fire_stmt_before(table, engine, txn)?;
+    triggers.fire_rows_before(table, &mut full_rows, |row| (None, Some(row)), engine, txn)?;
     // Row-level security WITH CHECK: every row a non-superuser writes must satisfy the
     // applicable policies. Checked before any tuple is written, so a violation aborts the whole
     // INSERT (the transaction rolls back). `None` for a superuser / RLS-free table.
@@ -1506,22 +1559,6 @@ fn insert_rows_with_unique(
     } else {
         full_rows
     };
-    // Triggers: load the INSERT triggers once, fire statement- and row-level BEFORE triggers,
-    // then (after the writes) the AFTER triggers. Firing happens here so `COPY FROM` triggers too.
-    let triggers = super::trigger::load_table_triggers(
-        &table.schema,
-        &table.name,
-        ast::TriggerEvent::Insert,
-        engine,
-        txn,
-    )?
-    .statement_triggers_if(fire_statement_triggers);
-    triggers.fire_stmt_before(table, engine, txn)?;
-    if triggers.has_before_row() {
-        for full in &full_rows {
-            triggers.fire_row_before(table, None, Some(full), engine, txn)?;
-        }
-    }
 
     match deferred.as_deref_mut() {
         Some(collector) => collector.admit_batch(table, &full_rows, engine, txn)?,
@@ -1572,7 +1609,15 @@ fn insert_rows_with_unique(
     // A row that supplied an explicit value for a SERIAL column must push its sequence forward so a
     // later auto-generated value cannot collide. A `DEFAULT` cell is not explicit:
     // it already advanced the sequence via `apply_column_fills`, so `any_explicit`, not `covered`.
-    advance_serials_past_explicit(&fills, &any_explicit, &full_rows, engine)?;
+    // A BEFORE row trigger may have written any column, a serial one included.
+    let written_by_triggers: HashSet<usize>;
+    let explicit = if triggers.has_before_row() {
+        written_by_triggers = (0..table.columns.len()).collect();
+        &written_by_triggers
+    } else {
+        &any_explicit
+    };
+    advance_serials_past_explicit(&fills, explicit, &full_rows, engine)?;
 
     if triggers.has_after_row() {
         for full in &full_rows {
@@ -1623,6 +1668,64 @@ fn stored_form(value: &mut ast::Value, ty: ColumnType) -> Result<(), Error> {
         *value = typed;
     }
     Ok(())
+}
+
+/// Fire an upsert's `BEFORE ... FOR EACH ROW` triggers (INSERT ones on the rows it inserts, UPDATE
+/// ones on the rows it updates), drop the rows a trigger skipped from `inserts` / `updates`, and
+/// return the remaining affected rows, as the triggers left them, in proposal `order`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "both trigger sets and both row sets of one upsert, with their shared order"
+)]
+fn fire_upsert_before_rows(
+    table: &TableSchema,
+    insert_triggers: &super::trigger::TriggerSet,
+    update_triggers: &super::trigger::TriggerSet,
+    order: &[(bool, usize)],
+    inserts: &mut Vec<Row>,
+    updates: &mut Vec<(Tid, Row, Row)>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    let mut kept_inserts = vec![true; inserts.len()];
+    if insert_triggers.has_before_row() {
+        for (row, kept) in inserts.iter_mut().zip(&mut kept_inserts) {
+            *kept = insert_triggers.fire_row_before(table, None, Some(row), engine, txn)?
+                == BeforeRow::Proceed;
+        }
+    }
+    let mut kept_updates = vec![true; updates.len()];
+    if update_triggers.has_before_row() {
+        for ((_, old, new), kept) in updates.iter_mut().zip(&mut kept_updates) {
+            *kept = update_triggers.fire_row_before(table, Some(old), Some(new), engine, txn)?
+                == BeforeRow::Proceed;
+        }
+    }
+    let affected = order
+        .iter()
+        .filter_map(|&(update, i)| {
+            if update {
+                kept_updates
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| updates.get(i).map(|(_, _, new)| new.clone()))
+                    .flatten()
+            } else {
+                kept_inserts
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| inserts.get(i).cloned())
+                    .flatten()
+            }
+        })
+        .collect();
+    let mut keep = kept_inserts.into_iter();
+    inserts.retain(|_| keep.next().unwrap_or(true));
+    let mut keep = kept_updates.into_iter();
+    updates.retain(|_| keep.next().unwrap_or(true));
+    Ok(affected)
 }
 
 /// Execute `INSERT ... ON CONFLICT (target) DO UPDATE SET ... [WHERE ...]` — the upsert.
@@ -1728,7 +1831,9 @@ fn upsert_rows(
     // (`OLD.col`) and the delete side of IVM.
     let mut updates: Vec<(Tid, Row, Row)> = Vec::new();
     let mut inserts: Vec<Row> = Vec::new();
-    let mut affected: Vec<Row> = Vec::new();
+    // Where each affected row sits, in proposal order: `(true, i)` for `updates[i]`, `(false, i)`
+    // for `inserts[i]`.
+    let mut order: Vec<(bool, usize)> = Vec::new();
     // Keys already updated/inserted this statement — a second proposed row on the same key is an
     // error (a single upsert may not affect one row twice), matching the standard upsert semantics.
     let mut affected_keys: Vec<Vec<ast::Value>> = Vec::new();
@@ -1739,8 +1844,8 @@ fn upsert_rows(
         // enforcement on the resulting insert.
         let Some(key) = unique_key(&prow, &key_ordinals, false) else {
             // A NULL arbiter key never collides (NULLs are distinct) → plain insert.
-            inserts.push(prow.clone());
-            affected.push(prow);
+            order.push((false, inserts.len()));
+            inserts.push(prow);
             continue;
         };
         if affected_keys.iter().any(|seen| unique_key_eq(seen, &key)) {
@@ -1770,14 +1875,51 @@ fn upsert_rows(
             // Recompute generated columns against the updated row, like plain UPDATE.
             let new_row = finalize_updated_row(new_row, &fills, table, &enum_info)?;
             affected_keys.push(key);
-            updates.push((*tid, erow.clone(), new_row.clone()));
-            affected.push(new_row);
+            order.push((true, updates.len()));
+            updates.push((*tid, erow.clone(), new_row));
         } else {
             affected_keys.push(key);
-            inserts.push(prow.clone());
-            affected.push(prow);
+            order.push((false, inserts.len()));
+            inserts.push(prow);
         }
     }
+
+    // Triggers: an upsert fires INSERT triggers for the inserted rows and UPDATE triggers for
+    // the conflicting rows it updates (`OLD`→`NEW`), so audit/maintenance triggers are not bypassed.
+    // BEFORE triggers fire before the constraint checks and the writes, and may rewrite or skip a
+    // row; AFTER triggers fire after the writes.
+    let insert_triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?
+    .statement_triggers_if(fire_statement_triggers);
+    let update_triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Update,
+        engine,
+        txn,
+    )?
+    .statement_triggers_if(fire_statement_triggers);
+    if !inserts.is_empty() {
+        insert_triggers.fire_stmt_before(table, engine, txn)?;
+    }
+    if !updates.is_empty() {
+        update_triggers.fire_stmt_before(table, engine, txn)?;
+    }
+    let affected = fire_upsert_before_rows(
+        table,
+        &insert_triggers,
+        &update_triggers,
+        &order,
+        &mut inserts,
+        &mut updates,
+        engine,
+        txn,
+    )?;
 
     // Row-level security WITH CHECK: every affected (inserted or updated) row must satisfy the
     // applicable policies. Checked before any write, so a violation aborts the whole statement.
@@ -1842,25 +1984,6 @@ fn upsert_rows(
     enforce_fk_on_child_write(table, &affected, &affected, engine, txn)?;
     enforce_check_on_write(table, &affected, engine)?;
 
-    // Triggers: an upsert fires INSERT triggers for the inserted rows and UPDATE triggers for
-    // the conflicting rows it updates (`OLD`→`NEW`), so audit/maintenance triggers are not bypassed.
-    // BEFORE triggers fire before the writes; AFTER triggers after.
-    let insert_triggers = super::trigger::load_table_triggers(
-        &table.schema,
-        &table.name,
-        ast::TriggerEvent::Insert,
-        engine,
-        txn,
-    )?
-    .statement_triggers_if(fire_statement_triggers);
-    let update_triggers = super::trigger::load_table_triggers(
-        &table.schema,
-        &table.name,
-        ast::TriggerEvent::Update,
-        engine,
-        txn,
-    )?
-    .statement_triggers_if(fire_statement_triggers);
     // A DO UPDATE assignment may not move the row out of its partition's bound either — the same
     // stranding the plain-UPDATE guard refuses (the reference engine refuses the move here too).
     {
@@ -1876,22 +1999,6 @@ fn upsert_rows(
                 ),
                 sqlstate: "0A000",
             });
-        }
-    }
-    if !inserts.is_empty() {
-        insert_triggers.fire_stmt_before(table, engine, txn)?;
-    }
-    if !updates.is_empty() {
-        update_triggers.fire_stmt_before(table, engine, txn)?;
-    }
-    if insert_triggers.has_before_row() {
-        for row in &inserts {
-            insert_triggers.fire_row_before(table, None, Some(row), engine, txn)?;
-        }
-    }
-    if update_triggers.has_before_row() {
-        for (_, old, new) in &updates {
-            update_triggers.fire_row_before(table, Some(old), Some(new), engine, txn)?;
         }
     }
 
@@ -1911,7 +2018,14 @@ fn upsert_rows(
     }
     // An inserted row that supplied an explicit SERIAL value advances its sequence too,
     // matching the plain INSERT path.
-    advance_serials_past_explicit(&fills, &covered, &inserts, engine)?;
+    let written_by_triggers: HashSet<usize>;
+    let explicit = if insert_triggers.has_before_row() {
+        written_by_triggers = (0..table.columns.len()).collect();
+        &written_by_triggers
+    } else {
+        &covered
+    };
+    advance_serials_past_explicit(&fills, explicit, &inserts, engine)?;
 
     if insert_triggers.has_after_row() {
         for row in &inserts {
@@ -3219,6 +3333,37 @@ pub(super) fn enforce_check_on_write(
     Ok(())
 }
 
+/// The error for a `BEFORE` row trigger that skipped (returned `NULL` for) a row a referential
+/// action must change: leaving it would break the foreign key the action enforces.
+fn skipped_referential_action(child: &TableSchema) -> Error {
+    Error::Coded {
+        message: format!(
+            "a BEFORE trigger on \"{}\" skipped a row a referential action must change",
+            child.name
+        ),
+        sqlstate: "27000",
+    }
+}
+
+/// The columns of `table` in a foreign key it declares or in a unique key.
+fn key_columns(table: &TableSchema, engine: &dyn StorageEngine) -> Result<Vec<usize>, Error> {
+    let mut columns = Vec::new();
+    for fk in engine.list_foreign_keys(table.id)? {
+        if fk.child_table == table.id {
+            columns.extend(constraint_ordinals(table, &fk.child_columns)?);
+        }
+    }
+    for c in engine.list_constraints(table.id)? {
+        if matches!(
+            c.kind,
+            nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
+        ) {
+            columns.extend(constraint_ordinals(table, &c.columns)?);
+        }
+    }
+    Ok(columns)
+}
+
 /// Cascade-delete `rows` from `child`, firing the child table's row-level DELETE triggers around
 /// each write. A referential action must not bypass the child's
 /// audit/validation triggers the way a raw `engine.delete` would. Statement-level child triggers are
@@ -3239,8 +3384,8 @@ fn cascade_delete_children(
     )?;
     let mut deleted: Vec<Row> = Vec::with_capacity(rows.len());
     for (tid, row) in rows {
-        if triggers.has_before_row() {
-            triggers.fire_row_before(child, Some(&row), None, engine, txn)?;
+        if triggers.fire_row_before(child, Some(&row), None, engine, txn)? == BeforeRow::Skip {
+            return Err(skipped_referential_action(child));
         }
         engine.delete(txn, child.id, tid)?;
         if triggers.has_after_row() {
@@ -3273,11 +3418,36 @@ fn cascade_update_children(
     )?;
     let child_types = column_types(child);
     let index_targets = secondary_index_targets(child, engine)?;
+    // A BEFORE trigger may change other columns of the row the action writes, but not its keys:
+    // the action computed the foreign key values, and no uniqueness check runs here.
+    let keys = if triggers.has_before_row() {
+        key_columns(child, engine)?
+    } else {
+        Vec::new()
+    };
     let mut olds: Vec<Row> = Vec::with_capacity(changes.len());
     let mut news: Vec<Row> = Vec::with_capacity(changes.len());
-    for (tid, old, new) in changes {
-        if triggers.has_before_row() {
-            triggers.fire_row_before(child, Some(&old), Some(&new), engine, txn)?;
+    for (tid, old, mut new) in changes {
+        let computed = triggers.has_before_row().then(|| new.clone());
+        if triggers.fire_row_before(child, Some(&old), Some(&mut new), engine, txn)?
+            == BeforeRow::Skip
+        {
+            return Err(skipped_referential_action(child));
+        }
+        if let Some(computed) = computed
+            && computed != new
+        {
+            if keys.iter().any(|&i| computed.get(i) != new.get(i)) {
+                return Err(Error::Coded {
+                    message: format!(
+                        "a BEFORE trigger on \"{}\" changed a key of a row a referential action \
+                         writes",
+                        child.name
+                    ),
+                    sqlstate: "27000",
+                });
+            }
+            enforce_check_on_write(child, std::slice::from_ref(&new), engine)?;
         }
         let bytes = row::encode(&new, &child_types)?;
         let new_tid = engine.update(txn, child.id, tid, &bytes)?;
@@ -4383,8 +4553,21 @@ fn run_update_single(
     // generated column's stored value is recomputed from its dependencies on any assignment, so it
     // can change without being assigned directly — folding all generated columns in (conservatively)
     // keeps a generated key/index column from ever being mis-classified as untouched.
+    // Triggers: load UPDATE triggers once; a per-row trigger needs the old row image so
+    // `OLD.col` can be bound, so force capture when one exists.
+    let triggers = super::trigger::load_table_triggers(
+        &plan.table.schema,
+        &plan.table.name,
+        ast::TriggerEvent::Update,
+        engine,
+        txn,
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     let mut set_cols: HashSet<usize> = plan.assignments.iter().map(|a| a.column).collect();
-    if !set_cols.is_empty() {
+    if triggers.has_before_row() {
+        // A BEFORE row trigger may rewrite any column of the new row.
+        set_cols.extend(0..plan.table.columns.len());
+    } else if !set_cols.is_empty() {
         set_cols.extend(super::coldefault::generated_column_ordinals(
             &plan.table,
             engine,
@@ -4396,22 +4579,25 @@ fn run_update_single(
     let is_fk_parent = table_is_fk_parent(&plan.table, engine)?;
     let mut index_targets = secondary_index_targets(&plan.table, engine)?;
     index_targets.retain(|target| index_target_touched_by_set(target, &set_cols));
-    // Triggers: load UPDATE triggers once; a per-row trigger needs the old row image so
-    // `OLD.col` can be bound, so force capture when one exists.
-    let triggers = super::trigger::load_table_triggers(
-        &plan.table.schema,
-        &plan.table.name,
-        ast::TriggerEvent::Update,
-        engine,
-        txn,
-    )?
-    .statement_triggers_if(fire_statement_triggers);
     // Track each matched row's pre-update value when a changed PRIMARY KEY must propagate to FK
     // children, its old secondary-index entries must be removed, a row trigger binds
     // `OLD`, or an IVM view over this table needs the delete side of the delta.
     let has_ivm = super::ivm::has_views_for_base(engine, txn, &plan.table.name)?;
-    let track_old =
-        is_fk_parent || !index_targets.is_empty() || triggers.needs_old_image() || has_ivm;
+    // An update through a partitioned parent may move a row, which fires the source partition's
+    // DELETE row triggers with the old row.
+    let track_old = is_fk_parent
+        || !index_targets.is_empty()
+        || triggers.needs_old_image()
+        || has_ivm
+        || (plan.partition_via_parent
+            && super::trigger::load_table_triggers(
+                &plan.table.schema,
+                &plan.table.name,
+                ast::TriggerEvent::Delete,
+                engine,
+                txn,
+            )?
+            .needs_old_image());
     let mut to_update: Vec<(Tid, Option<Row>, Row)> = Vec::new();
     let mut result_rows: Vec<Row> = Vec::new();
     // The matched rows' pre-update images, for the committed-state uniqueness re-check's
@@ -4515,11 +4701,30 @@ fn run_update_single(
             }
         }
     }
+    // BEFORE triggers: fire statement-level once, then row-level for each matched row, before
+    // any constraint check, partition check or write. A row trigger may rewrite the new row or skip
+    // it, so the images the uniqueness check carries are taken again from what remains.
+    triggers.fire_stmt_before(&plan.table, engine, txn)?;
+    if triggers.has_before_row() {
+        triggers.fire_rows_before(
+            &plan.table,
+            &mut to_update,
+            |(_, old, new)| (old.as_deref(), Some(new)),
+            engine,
+            txn,
+        )?;
+        if needs_unique {
+            old_for_unique = to_update
+                .iter()
+                .filter_map(|(_, old, _)| old.clone())
+                .collect();
+        }
+    }
     // Row movement: a SET whose new image leaves this partition's bound is performed as a DELETE
     // here plus an INSERT routed through the topmost parent (the reference engine's behavior) —
     // never an in-place write that would strand the row where the pruning layer misses it. Moved
-    // entries stay in `to_update` (RETURNING order and the BEFORE UPDATE row triggers, which fire
-    // for moved rows too, are position-based); the apply loop below diverts them.
+    // entries stay in `to_update` (RETURNING order is position-based); the apply loop below
+    // diverts them.
     let moved_mask = {
         let new_rows: Vec<&Row> = to_update.iter().map(|(_, _, row)| row).collect();
         partition_bound_violations(&plan.table, &new_rows, engine, txn)?
@@ -4537,14 +4742,6 @@ fn run_update_single(
             ),
             sqlstate: "23514", // check_violation
         });
-    }
-    // BEFORE triggers: fire statement-level once, then row-level for each matched row, before
-    // any constraint check or write.
-    triggers.fire_stmt_before(&plan.table, engine, txn)?;
-    if triggers.has_before_row() {
-        for (_, old, new_row) in &to_update {
-            triggers.fire_row_before(&plan.table, old.as_deref(), Some(new_row), engine, txn)?;
-        }
     }
     // Row-level security WITH CHECK: each post-update row must satisfy the applicable policies.
     // Checked before any write, so a violation aborts the whole UPDATE (the transaction rolls back).
@@ -4598,7 +4795,8 @@ fn run_update_single(
             // materialized — rebuild it now (a full scan, unavoidable for this check) so the fallback
             // sees exactly the rows the scan path would have.
             let whole_table;
-            let result_rows = if via_index {
+            // A BEFORE row trigger may have rewritten or skipped rows the image was built from.
+            let result_rows = if via_index || triggers.has_before_row() {
                 whole_table = rebuild_post_update_rows(&plan.table, &to_update, engine, txn)?;
                 &whole_table
             } else {
@@ -4626,7 +4824,7 @@ fn run_update_single(
         enforce_fk_on_parent_update(&plan.table, &fk_changes, engine, txn)?;
     }
     // RETURNING projects each updated row's *post-update* values.
-    let mut returned: Vec<Row> = Vec::new();
+    let mut returned: Vec<(Tid, Row)> = Vec::new();
     let mut moved: Vec<(Tid, Option<Row>, Row)> = Vec::new();
     for (i, (tid, old, new_row)) in to_update.iter().enumerate() {
         if moved_mask.get(i).copied().unwrap_or(false) {
@@ -4635,7 +4833,7 @@ fn run_update_single(
             // here, in matched order.
             moved.push((*tid, old.clone(), new_row.clone()));
             if !plan.returning.is_empty() {
-                returned.push(project_row(&plan.returning, new_row)?);
+                returned.push((*tid, project_row(&plan.returning, new_row)?));
             }
             continue;
         }
@@ -4655,16 +4853,26 @@ fn run_update_single(
             insert_into_indexes(&index_targets, new_row, new_tid, engine, txn)?;
         }
         if !plan.returning.is_empty() {
-            returned.push(project_row(&plan.returning, new_row)?);
+            returned.push((*tid, project_row(&plan.returning, new_row)?));
         }
     }
     // Row movement happens after the in-place applies: DELETE from this partition + INSERT
     // routed through the topmost parent (uniqueness enforced in the destination). The reference
     // firing order applies: the moved rows already fired BEFORE UPDATE above; the movement fires
     // DELETE triggers here and INSERT triggers in the destination — never AFTER UPDATE.
-    if !moved.is_empty() {
-        move_rows_across_partitions(&plan.table, &moved, plan.rls_check.as_ref(), engine, txn)?;
-    }
+    // A row whose move a BEFORE DELETE trigger skipped stays where it was, unchanged.
+    let unmoved = if moved.is_empty() {
+        HashSet::new()
+    } else {
+        move_rows_across_partitions(
+            &plan.table,
+            &moved,
+            plan.rls_check.as_ref(),
+            is_fk_parent,
+            engine,
+            txn,
+        )?
+    };
     // AFTER triggers: row-level for each updated-in-place row, then statement-level once.
     if triggers.has_after_row() {
         for (i, (_, old, new_row)) in to_update.iter().enumerate() {
@@ -4688,17 +4896,22 @@ fn run_update_single(
             .collect();
         let old_rows: Vec<Row> = to_update
             .iter()
+            .filter(|(tid, _, _)| !unmoved.contains(tid))
             .filter_map(|(_, old, _)| old.clone())
             .collect();
         super::ivm::maintain_on_change(&plan.table.name, &new_rows, &old_rows, engine, txn)?;
     }
-    let updated = to_update.len();
+    let updated = to_update.len() - unmoved.len();
     if plan.returning.is_empty() {
         Ok(ExecutionResult::Updated(updated))
     } else {
         Ok(ExecutionResult::Rows {
             columns: plan.returning.iter().map(|p| p.name.clone()).collect(),
-            rows: returned,
+            rows: returned
+                .into_iter()
+                .filter(|(tid, _)| !unmoved.contains(tid))
+                .map(|(_, row)| row)
+                .collect(),
             command: RowsCommand::Update,
         })
     }
@@ -4841,14 +5054,17 @@ fn instead_of_old_rows(
 /// the destination's ordinary insert path). Trigger firing follows the reference engine's row
 /// movement: the caller already fired BEFORE UPDATE on the source; this fires the source's DELETE
 /// row triggers (when the old image is available) and the destination's INSERT row triggers —
-/// AFTER UPDATE never fires for a moved row.
+/// AFTER UPDATE never fires for a moved row. Returns the rows a BEFORE DELETE trigger kept from
+/// moving: they stay in the source, unchanged. On a table other rows reference (`is_fk_parent`)
+/// that is refused instead, since the referential actions already applied the new key.
 fn move_rows_across_partitions(
     source: &TableSchema,
     moved: &[(Tid, Option<Row>, Row)],
     rls_check: Option<&crate::planner::TypedExpr>,
+    is_fk_parent: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<HashSet<Tid>, Error> {
     // The topmost partitioned ancestor: routing starts there, so a multi-level tree re-routes
     // through every level's key.
     let mut root_key = crate::analyzer::qualified_display(&source.schema, &source.name);
@@ -4873,11 +5089,26 @@ fn move_rows_across_partitions(
         txn,
     )?;
     let all_columns: Vec<usize> = (0..source.columns.len()).collect();
+    let mut unmoved = HashSet::new();
     for (tid, old, new_row) in moved {
         if delete_triggers.has_before_row()
             && let Some(old) = old
+            && delete_triggers.fire_row_before(source, Some(old), None, engine, txn)?
+                == BeforeRow::Skip
         {
-            delete_triggers.fire_row_before(source, Some(old), None, engine, txn)?;
+            // The referencing rows already follow the moved row's new key.
+            if is_fk_parent {
+                return Err(Error::Coded {
+                    message: format!(
+                        "a BEFORE DELETE trigger on \"{}\" kept in place a row whose key the \
+                         referencing rows already follow",
+                        source.name
+                    ),
+                    sqlstate: "27000",
+                });
+            }
+            unmoved.insert(*tid);
+            continue;
         }
         engine.delete(txn, source.id, *tid)?;
         // The move is a delete and then an insert: the delete's AFTER row triggers run first.
@@ -4921,7 +5152,7 @@ fn move_rows_across_partitions(
             super::move_skip::record(leaf.id, new_tid);
         }
     }
-    Ok(())
+    Ok(unmoved)
 }
 
 /// The leaf partition (schema-qualified key) that accepts `row` when routed from partitioned
@@ -5063,11 +5294,13 @@ fn run_delete_single(
     )?
     .statement_triggers_if(fire_statement_triggers);
     triggers.fire_stmt_before(&plan.table, engine, txn)?;
-    if triggers.has_before_row() {
-        for (_, row) in &to_delete {
-            triggers.fire_row_before(&plan.table, Some(row), None, engine, txn)?;
-        }
-    }
+    triggers.fire_rows_before(
+        &plan.table,
+        &mut to_delete,
+        |(_, row)| (Some(row), None),
+        engine,
+        txn,
+    )?;
     let deleted_rows: Vec<Row> = to_delete.iter().map(|(_, row)| row.clone()).collect();
     enforce_fk_on_parent_delete(&plan.table, &to_delete, engine, txn)?;
 
@@ -5624,8 +5857,8 @@ pub(super) fn run_merge(
             unmatched: &mut unmatched,
         },
     )?;
-    let ops = ops.into_inner();
-    let count = count.get();
+    let mut ops = ops.into_inner();
+    let mut count = count.get();
     // UNIQUE / PRIMARY KEY need the whole post-merge table checked only when an UPDATE can change
     // one of their columns (a generated column counts, since any assignment recomputes it).
     let mut set_cols: HashSet<usize> = plan
@@ -5657,10 +5890,11 @@ pub(super) fn run_merge(
 
     // Apply DELETE, then UPDATE, then INSERT — so the inserts' constraint checks see the updated
     // state (a not-matched insert never collides with a row a matched clause just changed/removed).
-    commit_merge_deletes(&plan.table, &ops.deletes, engine, txn)?;
-    commit_merge_updates(
+    // A row a BEFORE trigger skipped is not merged, so it leaves the count.
+    count -= commit_merge_deletes(&plan.table, &mut ops.deletes, engine, txn)?;
+    count -= commit_merge_updates(
         &plan.table,
-        &ops.updates,
+        &mut ops.updates,
         &ops.deletes,
         needs_unique,
         engine,
@@ -5673,7 +5907,8 @@ pub(super) fn run_merge(
             .into_iter()
             .map(|r| r.into_iter().map(Some).collect())
             .collect();
-        insert_rows(
+        let offered = value_rows.len();
+        let inserted = insert_rows(
             &plan.table,
             &columns,
             value_rows,
@@ -5685,6 +5920,7 @@ pub(super) fn run_merge(
             txn,
             true,
         )?;
+        count -= offered - inserted.len();
     }
     Ok(ExecutionResult::Merged(count))
 }
@@ -5738,15 +5974,16 @@ fn stage_merge_matched_action(
 }
 
 /// Commit a `MERGE`'s matched-DELETE set with the same enforcement a plain `DELETE` performs:
-/// triggers, parent-side foreign-key actions, and IVM.
+/// triggers, parent-side foreign-key actions, and IVM. Returns how many rows a `BEFORE` trigger
+/// skipped (removed from `deletes`).
 fn commit_merge_deletes(
     table: &TableSchema,
-    deletes: &[(Tid, Row)],
+    deletes: &mut Vec<(Tid, Row)>,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<usize, Error> {
     if deletes.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let triggers = super::trigger::load_table_triggers(
         &table.schema,
@@ -5755,41 +5992,39 @@ fn commit_merge_deletes(
         engine,
         txn,
     )?;
-    let deleted_rows: Vec<Row> = deletes.iter().map(|(_, r)| r.clone()).collect();
     triggers.fire_stmt_before(table, engine, txn)?;
-    if triggers.has_before_row() {
-        for (_, row) in deletes {
-            triggers.fire_row_before(table, Some(row), None, engine, txn)?;
-        }
-    }
+    let staged = deletes.len();
+    triggers.fire_rows_before(table, deletes, |(_, row)| (Some(row), None), engine, txn)?;
+    let deleted_rows: Vec<Row> = deletes.iter().map(|(_, r)| r.clone()).collect();
     enforce_fk_on_parent_delete(table, deletes, engine, txn)?;
-    for (tid, _) in deletes {
+    for (tid, _) in deletes.iter() {
         engine.delete(txn, table.id, *tid)?;
     }
     if triggers.has_after_row() {
-        for (_, row) in deletes {
+        for (_, row) in deletes.iter() {
             triggers.fire_row_after(table, Some(row), None, engine, txn)?;
         }
     }
     triggers.fire_stmt_after(table, engine, txn)?;
     super::ivm::maintain_on_change(&table.name, &[], &deleted_rows, engine, txn)?;
-    Ok(())
+    Ok(staged - deletes.len())
 }
 
 /// Commit a `MERGE`'s matched-UPDATE set with the same enforcement a plain `UPDATE` performs:
 /// triggers, UNIQUE (over the resulting target state, with the deletes removed), CHECK, foreign keys
 /// (child + parent-update), secondary indexes, and IVM. The `deletes` and `needs_unique` are used
-/// only for the uniqueness check, which runs when an update can change a unique column.
+/// only for the uniqueness check, which runs when an update can change a unique column. Returns how
+/// many rows a `BEFORE` trigger skipped (removed from `updates`).
 fn commit_merge_updates(
     table: &TableSchema,
-    updates: &[(Tid, Row, Row)],
+    updates: &mut Vec<(Tid, Row, Row)>,
     deletes: &[(Tid, Row)],
     needs_unique: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<usize, Error> {
     if updates.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let schema = column_types(table);
     let index_targets = secondary_index_targets(table, engine)?;
@@ -5801,11 +6036,14 @@ fn commit_merge_updates(
         txn,
     )?;
     triggers.fire_stmt_before(table, engine, txn)?;
-    if triggers.has_before_row() {
-        for (_, old, new) in updates {
-            triggers.fire_row_before(table, Some(old), Some(new), engine, txn)?;
-        }
-    }
+    let staged = updates.len();
+    triggers.fire_rows_before(
+        table,
+        updates,
+        |(_, old, new)| (Some(old), Some(new)),
+        engine,
+        txn,
+    )?;
     let new_rows: Vec<Row> = updates.iter().map(|(_, _, n)| n.clone()).collect();
     // UNIQUE over the post-merge target state: deletes removed, updates applied (fresh inserts are
     // checked separately by `insert_rows` against the already-updated table).
@@ -5848,7 +6086,7 @@ fn commit_merge_updates(
     if table_is_fk_parent(table, engine)? {
         enforce_fk_on_parent_update(table, updates, engine, txn)?;
     }
-    for (tid, old, new) in updates {
+    for (tid, old, new) in updates.iter() {
         let bytes = row::encode(new, &schema)?;
         let new_tid = engine.update(txn, table.id, *tid, &bytes)?;
         if !index_targets.is_empty() {
@@ -5857,7 +6095,7 @@ fn commit_merge_updates(
         }
     }
     if triggers.has_after_row() {
-        for (_, old, new) in updates {
+        for (_, old, new) in updates.iter() {
             triggers.fire_row_after(table, Some(old), Some(new), engine, txn)?;
         }
     }
@@ -5866,7 +6104,7 @@ fn commit_merge_updates(
         let olds: Vec<Row> = updates.iter().map(|(_, o, _)| o.clone()).collect();
         super::ivm::maintain_on_change(&table.name, &new_rows, &olds, engine, txn)?;
     }
-    Ok(())
+    Ok(staged - updates.len())
 }
 
 /// Evaluate a `RETURNING` projection list against one affected row. The projections'

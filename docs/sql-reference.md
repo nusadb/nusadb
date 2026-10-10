@@ -1193,7 +1193,7 @@ DROP PROCEDURE countdown;
 `CALL loud(-1)` on a body without a handler reports `P0001: raised exception: negative input` and
 the caller's statement fails.
 
-NusaScript statements: `DECLARE name TYPE [DEFAULT expr]`, `SET name = expr`,
+NusaScript statements: `DECLARE name TYPE [DEFAULT expr]`, `SET name = expr` (or `name := expr`),
 `IF ... THEN ... [ELSIF ...] [ELSE ...] END IF`, `WHILE cond LOOP ... END LOOP`,
 `FOR i IN low TO high LOOP ... END LOOP`, `RAISE 'message'` (reported as `P0001`), `RETURN`,
 `PERFORM expr` (evaluate and discard, for a call made for its side effects), and any
@@ -1250,9 +1250,10 @@ table FOR EACH {ROW | STATEMENT} [WHEN (condition)] <action>`. The action is one
 function, so several triggers can share one body:
 
 ```sql
-CREATE FUNCTION log_stock() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION log_stock() RETURNS trigger LANGUAGE nusascript AS $$
 BEGIN
   INSERT INTO stock_log (sku, before, after) VALUES (OLD.sku, OLD.qty, NEW.qty);
+  RETURN NEW;
 END
 $$;
 
@@ -1261,10 +1262,53 @@ WHEN (NEW.qty <> OLD.qty) EXECUTE FUNCTION log_stock();
 ```
 
 The function must take no parameters and have a `BEGIN ... END` body; that is checked when the
-trigger is created, not on first fire. `EXECUTE PROCEDURE` is a synonym. `NEW` and `OLD` are
-available throughout the body, a `RETURN` only ends it, and a `BEFORE` trigger cannot change or
-skip the row either way. Function arguments in the trigger (`EXECUTE FUNCTION f('x')`) are not
-accepted. The action runs in the same transaction as the triggering statement; an error in it
+trigger is created, not on first fire. `EXECUTE PROCEDURE` is a synonym. Function arguments in
+the trigger (`EXECUTE FUNCTION f('x')`) are not accepted.
+
+Inside the body, `OLD.col` and `NEW.col` read the rows of the firing; the row an event does not
+have (`OLD` in an `INSERT`, `NEW` in a `DELETE`, both in a statement trigger) reads as `NULL`.
+These variables describe the firing:
+
+| Variable | Value |
+| --- | --- |
+| `TG_OP` | `INSERT`, `UPDATE` or `DELETE` |
+| `TG_NAME` | the trigger's name |
+| `TG_WHEN` | `BEFORE`, `AFTER` or `INSTEAD OF` |
+| `TG_LEVEL` | `ROW` or `STATEMENT` |
+| `TG_TABLE_NAME`, `TG_RELNAME` | the table the row is in (the partition, for a trigger on a partitioned table) |
+| `TG_TABLE_SCHEMA` | that table's schema |
+| `TG_NARGS` | `0` |
+
+A column of a table the body queries shadows a variable of the same name.
+
+In a `BEFORE ... FOR EACH ROW` trigger the body decides the row the write goes on with. It can
+assign `NEW` fields (`NEW.col := expr` or `SET NEW.col = expr`; the value is converted to the
+column's type) and then `RETURN NEW`; `RETURN OLD` writes the old row instead (for an `UPDATE`,
+the row stays as it was); `RETURN NULL` skips the row: it is not written, not counted, and no
+later trigger fires for it. In a `DELETE`, `NEW` is null, so `RETURN NEW` also skips the row. A
+body that ends, or stops at a bare `RETURN`, without naming a row goes on with `NEW` as assigned
+(for a `DELETE`, the row is deleted). A rewritten row is checked like any written row: generated
+columns are recomputed, and `NOT NULL`, `CHECK`, unique and foreign keys apply to the new values.
+Returning anything else is an error (`42804`). The return value of an `AFTER` or statement
+trigger is ignored. A `BEFORE` trigger on a referencing table may change other columns of a row
+an `ON DELETE` or `ON UPDATE` action writes (its `CHECK` constraints still apply), but skipping
+that row or changing its foreign or unique key columns is refused (`27000`), since the action
+computed them. So is a `BEFORE DELETE` trigger that keeps in place a row moving between partitions
+when other rows reference it: they already follow its new key.
+
+```sql
+CREATE FUNCTION stamp() RETURNS trigger LANGUAGE nusascript AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE 'rows are never deleted';
+  END IF;
+  NEW.changed_at := now();
+  RETURN NEW;
+END
+$$;
+```
+
+The action runs in the same transaction as the triggering statement; an error in it
 aborts that statement. Cascading triggers are bounded by a depth limit (`54001`).
 
 On a partitioned table, a row-level trigger runs for the rows of every partition below it,

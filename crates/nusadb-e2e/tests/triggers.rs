@@ -694,3 +694,113 @@ fn execute_function_missing_function_is_rejected_at_create() {
         "expected UnknownFunction, got {err:?}"
     );
 }
+
+/// The affected-row count after `sql`.
+fn affected(engine: &BtreeEngine, sql: &str) -> usize {
+    match run(engine, sql) {
+        ExecutionResult::Inserted(n)
+        | ExecutionResult::Updated(n)
+        | ExecutionResult::Deleted(n)
+        | ExecutionResult::Merged(n) => n,
+        other => panic!("expected a row count, got {other:?}"),
+    }
+}
+
+#[test]
+fn rows_a_before_trigger_skips_leave_the_statement_count() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE s (id INT PRIMARY KEY, v INT)");
+    run(
+        &engine,
+        "CREATE FUNCTION skip_odd() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN \
+         IF COALESCE(NEW.id, OLD.id) % 2 = 1 THEN RETURN NULL; END IF; \
+         IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; RETURN NEW; END $$",
+    );
+    run(
+        &engine,
+        "CREATE TRIGGER skip_odd BEFORE INSERT OR UPDATE OR DELETE ON s FOR EACH ROW \
+         EXECUTE FUNCTION skip_odd()",
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            "INSERT INTO s VALUES (1, 0), (2, 0), (3, 0), (4, 0)"
+        ),
+        2
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            "INSERT INTO s VALUES (2, 1), (5, 1), (6, 1) ON CONFLICT (id) DO UPDATE SET v = 1"
+        ),
+        2
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            "MERGE INTO s USING (VALUES (2), (7), (8)) AS src (id) ON s.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = 2 WHEN NOT MATCHED THEN INSERT VALUES (src.id, 2)"
+        ),
+        2
+    );
+    match run(&engine, "SELECT id, v FROM s ORDER BY id") {
+        ExecutionResult::Rows { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Int(2)],
+                vec![Value::Int(4), Value::Int(0)],
+                vec![Value::Int(6), Value::Int(1)],
+                vec![Value::Int(8), Value::Int(2)],
+            ]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Make an odd row exist (bypassing the trigger) so UPDATE and DELETE have one to skip.
+    run(&engine, "ALTER TABLE s DISABLE TRIGGER skip_odd");
+    run(&engine, "INSERT INTO s VALUES (9, 0)");
+    run(&engine, "ALTER TABLE s ENABLE TRIGGER skip_odd");
+    assert_eq!(affected(&engine, "UPDATE s SET v = 3"), 4);
+    match run(
+        &engine,
+        "UPDATE s SET v = 4 WHERE id IN (8, 9) RETURNING id",
+    ) {
+        ExecutionResult::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(8)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    assert_eq!(affected(&engine, "DELETE FROM s"), 4);
+    // Only the odd row the DELETE trigger skipped is left.
+    match run(&engine, "SELECT id FROM s") {
+        ExecutionResult::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(9)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_skipped_merge_delete_leaves_the_row_and_the_count() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE m (id INT PRIMARY KEY)");
+    run(&engine, "INSERT INTO m VALUES (1), (2), (3)");
+    run(
+        &engine,
+        "CREATE FUNCTION keep_odd() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN \
+         IF OLD.id % 2 = 1 THEN RETURN NULL; END IF; RETURN OLD; END $$",
+    );
+    run(
+        &engine,
+        "CREATE TRIGGER keep_odd BEFORE DELETE ON m FOR EACH ROW EXECUTE FUNCTION keep_odd()",
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            "MERGE INTO m USING (VALUES (1), (2), (3)) AS src (id) ON m.id = src.id \
+             WHEN MATCHED THEN DELETE"
+        ),
+        1
+    );
+    match run(&engine, "SELECT id FROM m ORDER BY id") {
+        ExecutionResult::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}

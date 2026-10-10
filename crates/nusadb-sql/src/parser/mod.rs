@@ -48,7 +48,7 @@ use ddl::*;
 use dml::*;
 use expr::*;
 use query::*;
-pub(crate) use script::{ScriptBlock, ScriptStmt, is_script, parse_script};
+pub(crate) use script::{ScriptBlock, ScriptStmt, TriggerReturn, is_script, parse_script};
 use select::*;
 
 /// NusaDB's SQL dialect — the documented identifier surface.

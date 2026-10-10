@@ -17,7 +17,7 @@
 use std::cell::Cell;
 
 use super::*;
-use crate::parser::{ScriptBlock, ScriptStmt};
+use crate::parser::{ScriptBlock, ScriptStmt, TriggerReturn};
 use crate::planner::{AlterTriggerPlan, CreateTriggerPlan, DropTriggerPlan};
 
 /// Engine-scoped system catalog of trigger definitions. Eight text columns:
@@ -515,6 +515,10 @@ fn row_matches(row: &[ast::Value], schema: &str, table: &str, name: &str) -> boo
 /// The triggers relevant to one DML statement on a table, partitioned by timing × granularity, loaded
 /// once per statement so the per-row firing loop carries no catalog cost.
 pub(super) struct TriggerSet {
+    /// The event the statement performs (what `TG_OP` reports).
+    event: ast::TriggerEvent,
+    /// What conforming a row a trigger rewrote takes of the table, loaded at the first rewrite.
+    conform: std::cell::OnceCell<super::dml::ConformContext>,
     before_row: Vec<StoredTrigger>,
     after_row: Vec<StoredTrigger>,
     before_stmt: Vec<StoredTrigger>,
@@ -558,7 +562,15 @@ impl TriggerSet {
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
-        fire_each(&self.before_stmt, table, None, None, engine, txn)
+        fire_each(
+            &self.before_stmt,
+            self.event,
+            table,
+            None,
+            None,
+            engine,
+            txn,
+        )
     }
 
     /// This set, keeping its statement-level triggers only when `keep` is set. A statement that
@@ -581,19 +593,78 @@ impl TriggerSet {
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
-        fire_each(&self.after_stmt, table, None, None, engine, txn)
+        fire_each(&self.after_stmt, self.event, table, None, None, engine, txn)
     }
 
-    /// Fire the `BEFORE ... FOR EACH ROW` triggers for one affected row.
+    /// Fire the `BEFORE ... FOR EACH ROW` triggers for one affected row. A trigger function may
+    /// rewrite the new row (`NEW.col := ...` then `RETURN NEW`), which `new` then holds, conformed
+    /// to the table as a written row is; or return `NULL`, which skips the row: the caller must
+    /// then leave it unwritten, and the triggers after the skipping one do not run.
     pub(super) fn fire_row_before(
         &self,
         table: &TableSchema,
         old: Option<&[ast::Value]>,
-        new: Option<&[ast::Value]>,
+        mut new: Option<&mut Vec<ast::Value>>,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<BeforeRow, Error> {
+        let mut rewritten = false;
+        for trig in &self.before_row {
+            let current = new.as_deref().map(Vec::as_slice);
+            match fire_one(trig, self.event, table, old, current, engine, txn)? {
+                Fired::Proceed => {},
+                Fired::Skip => return Ok(BeforeRow::Skip),
+                Fired::Replace(row) => {
+                    if let Some(slot) = new.as_deref_mut() {
+                        *slot = row;
+                        rewritten = true;
+                    }
+                },
+            }
+        }
+        if rewritten && let Some(slot) = new {
+            if self.conform.get().is_none() {
+                let _ = self
+                    .conform
+                    .set(super::dml::ConformContext::load(table, engine, txn)?);
+            }
+            if let Some(context) = self.conform.get() {
+                let row = std::mem::take(slot);
+                *slot = super::dml::conform_trigger_row(table, row, context)?;
+            }
+        }
+        Ok(BeforeRow::Proceed)
+    }
+
+    /// Fire the `BEFORE ... FOR EACH ROW` triggers over a statement's rows, in order, dropping the
+    /// rows a trigger skipped. `parts` splits an item into its old row and its new row.
+    pub(super) fn fire_rows_before<T>(
+        &self,
+        table: &TableSchema,
+        rows: &mut Vec<T>,
+        parts: RowParts<T>,
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
-        fire_each(&self.before_row, table, old, new, engine, txn)
+        if !self.has_before_row() {
+            return Ok(());
+        }
+        let mut failure = None;
+        rows.retain_mut(|item| {
+            if failure.is_some() {
+                return true;
+            }
+            let (old, new) = parts(item);
+            match self.fire_row_before(table, old, new, engine, txn) {
+                Ok(BeforeRow::Proceed) => true,
+                Ok(BeforeRow::Skip) => false,
+                Err(e) => {
+                    failure = Some(e);
+                    true
+                },
+            }
+        });
+        failure.map_or(Ok(()), Err)
     }
 
     /// Fire the `AFTER ... FOR EACH ROW` triggers for one affected row.
@@ -605,7 +676,7 @@ impl TriggerSet {
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
-        fire_each(&self.after_row, table, old, new, engine, txn)
+        fire_each(&self.after_row, self.event, table, old, new, engine, txn)
     }
 
     /// Whether any `INSTEAD OF ... FOR EACH ROW` trigger replaces the write.
@@ -622,8 +693,30 @@ impl TriggerSet {
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
-        fire_each(&self.instead_row, table, old, new, engine, txn)
+        fire_each(&self.instead_row, self.event, table, old, new, engine, txn)
     }
+}
+
+/// Splits a staged row item into its old row and its (mutable) new row.
+pub(super) type RowParts<T> = fn(&mut T) -> (Option<&[ast::Value]>, Option<&mut Vec<ast::Value>>);
+
+/// What the `BEFORE ... FOR EACH ROW` triggers decided for one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BeforeRow {
+    /// Write the row (as the triggers left it).
+    Proceed,
+    /// A trigger returned `NULL`: leave the row unwritten.
+    Skip,
+}
+
+/// What one trigger firing asks of the row it fired for (heeded for `BEFORE ... FOR EACH ROW`).
+enum Fired {
+    /// Go on with the row unchanged.
+    Proceed,
+    /// Go on with this row in place of the new row.
+    Replace(Vec<ast::Value>),
+    /// Skip the row.
+    Skip,
 }
 
 /// Whether the view at `key` (schema-qualified; bare = `public`) has an enabled `INSTEAD OF`
@@ -655,6 +748,8 @@ pub(super) fn load_table_triggers(
     txn: TxnId,
 ) -> Result<TriggerSet, Error> {
     let mut set = TriggerSet {
+        event,
+        conform: std::cell::OnceCell::new(),
         before_row: Vec::new(),
         after_row: Vec::new(),
         before_stmt: Vec::new(),
@@ -971,6 +1066,7 @@ fn decode_trigger(
 /// Fire each trigger in `bucket` for the given `(old, new)` row binding.
 fn fire_each(
     bucket: &[StoredTrigger],
+    event: ast::TriggerEvent,
     table: &TableSchema,
     old: Option<&[ast::Value]>,
     new: Option<&[ast::Value]>,
@@ -978,7 +1074,7 @@ fn fire_each(
     txn: TxnId,
 ) -> Result<(), Error> {
     for trig in bucket {
-        fire_one(trig, table, old, new, engine, txn)?;
+        fire_one(trig, event, table, old, new, engine, txn)?;
     }
     Ok(())
 }
@@ -987,32 +1083,36 @@ fn fire_each(
 /// `NEW`/`OLD` bound. Runs re-entrantly in the same transaction, behind the recursion guard.
 fn fire_one(
     trig: &StoredTrigger,
+    event: ast::TriggerEvent,
     table: &TableSchema,
     old: Option<&[ast::Value]>,
     new: Option<&[ast::Value]>,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<Fired, Error> {
     let _guard = DepthGuard::enter()?;
-    let refs = RowRefs {
+    let mut refs = RowRefs {
         schema: table,
         old,
         new,
+        function_body: false,
     };
     if let Some(when) = &trig.when
         && !eval_when(when, &refs, engine, txn)?
     {
-        return Ok(());
+        return Ok(Fired::Proceed);
     }
-    // `EXECUTE FUNCTION name()`: run the function's NusaScript body with `NEW`/`OLD` bound.
+    // `EXECUTE FUNCTION name()`: run the function's NusaScript body with `NEW`/`OLD` and the
+    // trigger variables bound.
     if let Some(func_name) = execute_function_target(&trig.action) {
-        return fire_trigger_function(func_name, &refs, engine, txn);
+        refs.function_body = true;
+        return fire_trigger_function(func_name, trig, event, &refs, engine, txn);
     }
     let mut stmt = crate::parse(&trig.action)?;
     substitute_row_refs(&mut stmt, &refs)?;
     let logical = crate::analyze(stmt, &ExecCatalog::new(engine, txn))?;
     super::dispatch(crate::plan(logical), engine, txn)?;
-    Ok(())
+    Ok(Fired::Proceed)
 }
 
 /// If `action` is the canonical `EXECUTE FUNCTION <name>()` form, return the function name. The
@@ -1048,21 +1148,104 @@ fn load_trigger_function(
     Ok(def)
 }
 
-/// Fire an `EXECUTE FUNCTION` trigger: run the function's NusaScript body in the caller's transaction
-/// with `NEW`/`OLD` bound. Side-effect semantics — the body's `RETURN` stops it but its value is
-/// discarded, so (like the existing statement-action form) a `BEFORE` trigger cannot modify or skip
-/// the row. Runs behind the shared depth guard, so cascades are still bounded.
+/// Fire an `EXECUTE FUNCTION` trigger: run the function's NusaScript body in the caller's
+/// transaction with `OLD` bound to the old row's values, `NEW` to a record of variables the body may
+/// assign (`NEW.col := ...`), and the trigger variables (`TG_OP`, `TG_NAME`, `TG_WHEN`, `TG_LEVEL`,
+/// `TG_TABLE_NAME`, `TG_TABLE_SCHEMA`, `TG_RELNAME`, `TG_NARGS`). The row its `RETURN` names is
+/// what a `BEFORE ... FOR EACH ROW` firing goes on with: `NEW` as the body left it, `OLD`, or
+/// `NULL` to skip the row; a body that ends without naming one goes on with `NEW` as left. Runs
+/// behind the shared depth guard, so cascades are still bounded.
 fn fire_trigger_function(
     func_name: &str,
+    trig: &StoredTrigger,
+    event: ast::TriggerEvent,
     refs: &RowRefs<'_>,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<Fired, Error> {
     let def = load_trigger_function(func_name, engine, txn)?;
     let mut block = crate::parser::parse_script(&def.body)?;
     sub_script_block(&mut block, refs)?;
-    super::script::run_block(&block, &[], &[], engine, txn)?;
-    Ok(())
+    let mut env = trigger_variables(trig, event, refs.schema);
+    if let Some(new) = refs.new {
+        for (column, value) in refs.schema.columns.iter().zip(new) {
+            env.insert(new_field(&column.name), value.clone());
+        }
+    }
+    let (env, returned) = super::script::run_trigger_block(&block, env, engine, txn)?;
+    let Some(new) = refs.new else {
+        // A DELETE: the row goes unless the body returned `NULL` (or `NEW`, which is null here).
+        return Ok(match returned {
+            Some(TriggerReturn::Null | TriggerReturn::New) => Fired::Skip,
+            Some(TriggerReturn::Old) | None => Fired::Proceed,
+        });
+    };
+    match returned {
+        Some(TriggerReturn::Null) => Ok(Fired::Skip),
+        Some(TriggerReturn::Old) => Ok(refs
+            .old
+            .map_or(Fired::Skip, |old| Fired::Replace(old.to_vec()))),
+        Some(TriggerReturn::New) | None => {
+            let mut row = new.to_vec();
+            let mut changed = false;
+            for (column, slot) in refs.schema.columns.iter().zip(row.iter_mut()) {
+                let Some(value) = env.get(&new_field(&column.name)) else {
+                    continue;
+                };
+                if value != slot {
+                    *slot = match value {
+                        ast::Value::Null => ast::Value::Null,
+                        value => super::eval::cast_value(value.clone(), column.ty)?,
+                    };
+                    changed = true;
+                }
+            }
+            Ok(if changed {
+                Fired::Replace(row)
+            } else {
+                Fired::Proceed
+            })
+        },
+    }
+}
+
+/// The variable holding field `column` of the `NEW` record in a trigger function's environment.
+fn new_field(column: &str) -> String {
+    format!("new.{column}")
+}
+
+/// The trigger variables a trigger function sees, describing the firing.
+fn trigger_variables(
+    trig: &StoredTrigger,
+    event: ast::TriggerEvent,
+    table: &TableSchema,
+) -> super::script::Env {
+    let text = |s: &str| ast::Value::Text(s.to_owned());
+    let op = match event {
+        ast::TriggerEvent::Insert => "INSERT",
+        ast::TriggerEvent::Update => "UPDATE",
+        ast::TriggerEvent::Delete => "DELETE",
+    };
+    let when = match trig.timing {
+        ast::TriggerTiming::Before => "BEFORE",
+        ast::TriggerTiming::After => "AFTER",
+        ast::TriggerTiming::InsteadOf => "INSTEAD OF",
+    };
+    let level = match trig.for_each {
+        ast::TriggerForEach::Row => "ROW",
+        ast::TriggerForEach::Statement => "STATEMENT",
+    };
+    super::script::Env::from([
+        ("tg_op".to_owned(), text(op)),
+        ("tg_name".to_owned(), text(&trig.name)),
+        ("tg_when".to_owned(), text(when)),
+        ("tg_level".to_owned(), text(level)),
+        ("tg_table_name".to_owned(), text(&table.name)),
+        ("tg_table_schema".to_owned(), text(&table.schema)),
+        ("tg_relname".to_owned(), text(&table.name)),
+        // A trigger passes no arguments (`EXECUTE FUNCTION f()` only).
+        ("tg_nargs".to_owned(), ast::Value::Int(0)),
+    ])
 }
 
 /// Evaluate a `WHEN (cond)` guard against the bound row: `SELECT (cond)` after substitution. A `TRUE`
@@ -1087,25 +1270,25 @@ fn eval_when(
 
 // === NEW/OLD substitution =================================================
 
-/// The `NEW`/`OLD` row binding for one firing — resolves `new.col` / `old.col` to literal values.
+/// The `NEW`/`OLD` row binding for one firing: resolves `new.col` / `old.col` to literal values,
+/// or, in a trigger function's body (`function_body`), `new.col` to the variable the body may
+/// assign and a row the event lacks to null.
 struct RowRefs<'a> {
     schema: &'a TableSchema,
     old: Option<&'a [ast::Value]>,
     new: Option<&'a [ast::Value]>,
+    function_body: bool,
 }
 
 impl RowRefs<'_> {
-    /// Resolve a qualified column to its bound value: `Some(value)` for a `new.`/`old.` reference,
+    /// Resolve a qualified column to what replaces it: `Some(expr)` for a `new.`/`old.` reference,
     /// `None` for any other qualifier (left untouched — it refers to a real table/alias).
-    fn resolve(&self, qualifier: &str, column: &str) -> Result<Option<ast::Value>, Error> {
+    fn resolve(&self, qualifier: &str, column: &str) -> Result<Option<ast::Expr>, Error> {
         let (row, which) = match qualifier {
             "new" => (self.new, "NEW"),
             "old" => (self.old, "OLD"),
             _ => return Ok(None),
         };
-        let row = row.ok_or_else(|| {
-            Error::InvalidStatement(format!("{which} is not available in this trigger event"))
-        })?;
         let index = self
             .schema
             .columns
@@ -1115,11 +1298,24 @@ impl RowRefs<'_> {
                 table: self.schema.name.clone(),
                 column: column.to_owned(),
             })?;
+        let Some(row) = row else {
+            // A trigger function shared by several events reads the row its event lacks (`OLD`
+            // in an INSERT, `NEW` in a DELETE) as null, so a branch on `TG_OP` can name both.
+            if self.function_body {
+                return Ok(Some(ast::Expr::Literal(ast::Value::Null)));
+            }
+            return Err(Error::InvalidStatement(format!(
+                "{which} is not available in this trigger event"
+            )));
+        };
         let value = row
             .get(index)
             .cloned()
             .ok_or_else(|| internal_index(index))?;
-        Ok(Some(value))
+        if self.function_body && which == "NEW" {
+            return Ok(Some(ast::Expr::Column(new_field(column))));
+        }
+        Ok(Some(ast::Expr::Literal(value)))
     }
 }
 
@@ -1271,8 +1467,8 @@ fn sub_opt(expr: Option<&mut ast::Expr>, refs: &RowRefs<'_>) -> Result<(), Error
 fn sub_expr(expr: &mut ast::Expr, refs: &RowRefs<'_>) -> Result<(), Error> {
     match expr {
         ast::Expr::QualifiedColumn { table, column } => {
-            if let Some(value) = refs.resolve(&table.to_ascii_lowercase(), column)? {
-                *expr = ast::Expr::Literal(value);
+            if let Some(bound) = refs.resolve(&table.to_ascii_lowercase(), column)? {
+                *expr = bound;
             }
             Ok(())
         },
@@ -1442,9 +1638,34 @@ fn sub_script_stmts(stmts: &mut [ScriptStmt], refs: &RowRefs<'_>) -> Result<(), 
 }
 
 fn sub_script_stmt(stmt: &mut ScriptStmt, refs: &RowRefs<'_>) -> Result<(), Error> {
+    // A trigger function returns the row the firing goes on with: `NEW`, `OLD` or `NULL`.
+    if let ScriptStmt::Return(value) = stmt {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let row = match value {
+            ast::Expr::Column(name) if name == "new" => TriggerReturn::New,
+            ast::Expr::Column(name) if name == "old" => TriggerReturn::Old,
+            ast::Expr::Literal(ast::Value::Null) => TriggerReturn::Null,
+            _ => {
+                return Err(Error::Coded {
+                    message: "a trigger function must return NEW, OLD or NULL".to_owned(),
+                    sqlstate: "42804",
+                });
+            },
+        };
+        *stmt = ScriptStmt::ReturnRow(row);
+        return Ok(());
+    }
     match stmt {
         ScriptStmt::Declare { default, .. } => sub_opt(default.as_mut(), refs),
-        ScriptStmt::Assign { value, .. } => sub_expr(value, refs),
+        ScriptStmt::Assign { name, value } => {
+            // `NEW.col := ...` must name a column of the row, in an event that has a new row.
+            if let Some(column) = name.strip_prefix("new.") {
+                refs.resolve("new", column)?;
+            }
+            sub_expr(value, refs)
+        },
         ScriptStmt::If { arms, els } => {
             for (cond, body) in arms {
                 sub_expr(cond, refs)?;
@@ -1467,13 +1688,8 @@ fn sub_script_stmt(stmt: &mut ScriptStmt, refs: &RowRefs<'_>) -> Result<(), Erro
             sub_script_stmts(body, refs)
         },
         ScriptStmt::Perform(expr) | ScriptStmt::Raise(expr) => sub_expr(expr, refs),
-        // A trigger function's RETURN value is a row the side-effect firing model discards, so
-        // neutralize it to a bare RETURN: it still stops the routine (preserving control flow)
-        // without evaluating a `NEW`/`OLD` row reference the executor cannot produce as a value.
-        ScriptStmt::Return(value) => {
-            *value = None;
-            Ok(())
-        },
+        // Rewritten above.
+        ScriptStmt::Return(_) | ScriptStmt::ReturnRow(_) => Ok(()),
         ScriptStmt::Sql(stmt) => substitute_row_refs(stmt, refs),
         ScriptStmt::Block(block) => sub_script_block(block, refs),
     }

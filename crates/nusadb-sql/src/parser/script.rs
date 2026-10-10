@@ -45,9 +45,10 @@ pub(crate) enum ScriptStmt {
         /// Initial value expression, or `None` for `NULL`.
         default: Option<ast::Expr>,
     },
-    /// `SET name = expr` — assign to a variable.
+    /// `SET name = expr` or `name := expr`: assign to a variable. In a trigger function the
+    /// target may also be a field of the new row, `NEW.col` (named `new.col` here).
     Assign {
-        /// Target variable name (folded).
+        /// Target variable name (folded; `record.field` for a qualified target).
         name: String,
         /// Value expression.
         value: ast::Expr,
@@ -86,11 +87,26 @@ pub(crate) enum ScriptStmt {
     /// `RETURN [expr]` — stop the routine. A procedure uses the bare `RETURN` (`None`); a function
     /// uses `RETURN expr` to yield its result value.
     Return(Option<ast::Expr>),
+    /// A trigger function's `RETURN NEW` / `RETURN OLD` / `RETURN NULL`: which row the firing
+    /// write proceeds with. Never produced by the parser; trigger firing rewrites a `RETURN` into it.
+    ReturnRow(TriggerReturn),
     /// An embedded SQL data statement (`INSERT`/`UPDATE`/`DELETE`/`SELECT`/`CALL`). Boxed because an
     /// [`ast::Statement`] is far larger than the other variants.
     Sql(Box<ast::Statement>),
     /// A nested `BEGIN ... [EXCEPTION ...] END` block.
     Block(ScriptBlock),
+}
+
+/// The row a trigger function returns: the (possibly modified) new row, the old row, or none
+/// (`NULL`), which skips the row in a `BEFORE ... FOR EACH ROW` trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerReturn {
+    /// `RETURN NEW`.
+    New,
+    /// `RETURN OLD`.
+    Old,
+    /// `RETURN NULL`.
+    Null,
 }
 
 /// Whether a procedure body is a NusaScript block (begins with the `BEGIN` keyword) rather than a
@@ -244,6 +260,8 @@ fn parse_one(parser: &mut Parser) -> Result<ScriptStmt, Error> {
             };
             Ok(ScriptStmt::Return(value))
         },
+        // `name := expr` / `record.field := expr`.
+        Some(_) if is_walrus_assignment(parser) => parse_assign(parser),
         // Anything else is an embedded SQL data statement.
         _ => {
             let stmt = parser.parse_statement().map_err(syntax)?;
@@ -265,10 +283,29 @@ fn parse_declare(parser: &mut Parser) -> Result<ScriptStmt, Error> {
     Ok(ScriptStmt::Declare { name, default })
 }
 
-/// `SET name = expr`.
+/// Whether the statement at the current position is `name := ...` or `record.field := ...`.
+fn is_walrus_assignment(parser: &Parser) -> bool {
+    match parser.peek_nth_token_ref(1).token {
+        Token::Assignment => true,
+        Token::Period => {
+            matches!(parser.peek_nth_token_ref(2).token, Token::Word(_))
+                && matches!(parser.peek_nth_token_ref(3).token, Token::Assignment)
+        },
+        _ => false,
+    }
+}
+
+/// `name = expr` or `name := expr` (after `SET`, or the `:=` statement form); `name` may be a
+/// `record.field` pair.
 fn parse_assign(parser: &mut Parser) -> Result<ScriptStmt, Error> {
-    let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
-    parser.expect_token(&Token::Eq).map_err(syntax)?;
+    let mut name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+    if parser.consume_token(&Token::Period) {
+        let field = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+        name = format!("{name}.{field}");
+    }
+    if !parser.consume_token(&Token::Assignment) {
+        parser.expect_token(&Token::Eq).map_err(syntax)?;
+    }
     let value = parse_expr(parser)?;
     Ok(ScriptStmt::Assign { name, value })
 }
