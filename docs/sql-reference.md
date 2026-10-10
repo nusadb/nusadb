@@ -617,6 +617,14 @@ column's `DEFAULT` filled in, must satisfy them, or the statement leaves nothing
 column keeps the limits of its type, as a column declared in `CREATE TABLE` does: the range of a
 `TINYINT`, `SMALLINT`, `MEDIUMINT` or `INTEGER`, and the length of a `VARCHAR(n)` or `CHAR(n)`.
 
+On a partitioned table, or a table with inheritance children, a column change (`ADD`, `DROP`,
+`RENAME`, `TYPE`, `SET`/`DROP NOT NULL`, `SET`/`DROP DEFAULT`) applies to every table below it, so
+their rows stay readable through it. A partition takes all its columns from its parent: adding,
+dropping, renaming or retyping one on the partition is refused (`42P16`). An inheritance child may
+add columns of its own, but cannot drop, rename or retype one its parent has, and neither kind of
+child can drop a `NOT NULL` its parent declares. A column in a partition key (at any level) cannot
+be dropped, renamed or retyped.
+
 `ALTER TABLE t DISABLE TRIGGER name` and `ENABLE TRIGGER name` are shown under [Triggers](#triggers).
 
 `RENAME COLUMN` carries the column's own `DEFAULT` (including a `SERIAL` sentinel — the backing

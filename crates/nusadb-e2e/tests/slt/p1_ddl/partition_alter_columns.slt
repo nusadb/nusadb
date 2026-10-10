@@ -1,0 +1,176 @@
+# A column change on a partitioned table, or on a table with inheritance children, applies to every
+# table below it: their rows are read through it, so their columns must stay its columns.
+
+statement ok
+CREATE TABLE pa (k INT NOT NULL, d INT NOT NULL, a INT, b TEXT) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE pa_1 PARTITION OF pa FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE pa_2 PARTITION OF pa FOR VALUES IN (2) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE pa_2_lo PARTITION OF pa_2 FOR VALUES FROM (0) TO (100)
+
+statement ok
+INSERT INTO pa VALUES (1, 5, 10, 'x'), (2, 6, 20, 'y')
+
+statement ok
+ALTER TABLE pa ADD COLUMN c INT DEFAULT 7
+
+query IIITI
+SELECT k, d, a, b, c FROM pa ORDER BY k
+----
+1 5 10 x 7
+2 6 20 y 7
+
+query I
+SELECT c FROM pa_2_lo
+----
+7
+
+statement ok
+INSERT INTO pa (k, d, a) VALUES (2, 7, 30)
+
+query II
+SELECT a, c FROM pa_2_lo WHERE d = 7
+----
+30 7
+
+# The new column's own limits and constraints reach the partitions.
+statement ok
+ALTER TABLE pa ADD COLUMN q SMALLINT CHECK (q > 0)
+
+statement error nusadb_typeck_q
+INSERT INTO pa VALUES (1, 8, 1, 'z', 1, 40000)
+
+statement error violates check constraint
+INSERT INTO pa VALUES (2, 8, 1, 'z', 1, -1)
+
+statement ok
+ALTER TABLE pa DROP COLUMN b
+
+query IIIII
+SELECT k, d, a, c, q FROM pa ORDER BY k, d
+----
+1 5 10 7 NULL
+2 6 20 7 NULL
+2 7 30 7 NULL
+
+statement ok
+ALTER TABLE pa RENAME COLUMN a TO amount
+
+query I
+SELECT amount FROM pa_1
+----
+10
+
+statement ok
+ALTER TABLE pa ALTER COLUMN amount TYPE BIGINT
+
+statement ok
+INSERT INTO pa (k, d, amount) VALUES (1, 9, 10000000000)
+
+query I
+SELECT amount FROM pa_1 WHERE d = 9
+----
+10000000000
+
+statement ok
+ALTER TABLE pa ALTER COLUMN amount SET DEFAULT 3
+
+statement ok
+INSERT INTO pa_1 (k, d) VALUES (1, 10)
+
+query I
+SELECT amount FROM pa WHERE d = 10
+----
+3
+
+statement ok
+ALTER TABLE pa ALTER COLUMN c SET NOT NULL
+
+statement error NULL
+INSERT INTO pa_2 (k, d, c) VALUES (2, 11, NULL)
+
+statement error is NOT NULL in its parent
+ALTER TABLE pa_1 ALTER COLUMN c DROP NOT NULL
+
+statement ok
+ALTER TABLE pa ALTER COLUMN c DROP NOT NULL
+
+statement ok
+INSERT INTO pa_2 (k, d, c) VALUES (2, 11, NULL)
+
+# A partition-key column, at any level, stays as it is.
+statement error part of the partition key
+ALTER TABLE pa DROP COLUMN k
+
+statement error part of the partition key
+ALTER TABLE pa ALTER COLUMN d TYPE BIGINT
+
+statement error part of the partition key
+ALTER TABLE pa RENAME COLUMN d TO day
+
+statement ok
+CREATE TABLE empty_p (k INT NOT NULL, v INT) PARTITION BY LIST (k)
+
+statement error part of the partition key
+ALTER TABLE empty_p DROP COLUMN k
+
+# A partition takes its columns from its parent.
+statement error cannot add column
+ALTER TABLE pa_1 ADD COLUMN extra INT
+
+statement error cannot drop inherited column
+ALTER TABLE pa_1 DROP COLUMN amount
+
+statement error cannot rename inherited column
+ALTER TABLE pa_2_lo RENAME COLUMN amount TO x
+
+statement error cannot change the type of inherited column
+ALTER TABLE pa_1 ALTER COLUMN amount TYPE TEXT
+
+# Inheritance children follow their parent too, and may add columns of their own.
+statement ok
+CREATE TABLE ip (a INT)
+
+statement ok
+CREATE TABLE ic (b INT) INHERITS (ip)
+
+statement ok
+INSERT INTO ic VALUES (1, 2)
+
+statement ok
+ALTER TABLE ip ADD COLUMN c INT DEFAULT 9
+
+query III
+SELECT a, b, c FROM ic
+----
+1 2 9
+
+query II
+SELECT a, c FROM ip
+----
+1 9
+
+statement ok
+ALTER TABLE ic ADD COLUMN own INT
+
+statement error cannot drop inherited column
+ALTER TABLE ic DROP COLUMN a
+
+statement ok
+ALTER TABLE ip ADD COLUMN own INT
+
+statement error different type
+ALTER TABLE ip ADD COLUMN b TEXT
+
+statement ok
+ALTER TABLE ip DROP COLUMN c
+
+query III
+SELECT a, b, own FROM ic
+----
+1 2 NULL

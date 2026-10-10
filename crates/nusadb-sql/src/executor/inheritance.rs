@@ -66,6 +66,29 @@ pub(super) fn direct_children(
     Ok(children)
 }
 
+/// The direct parents of `child` (the tables its `INHERITS` clause or `PARTITION OF` names).
+/// Returns an empty list when the catalog does not exist yet or `child` has no parent.
+pub(super) fn direct_parents(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    child: &str,
+) -> Result<Vec<String>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, INHERITANCE_CATALOG)? else {
+        return Ok(Vec::new());
+    };
+    let mut parents = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &INHERITANCE_CATALOG_SCHEMA)?;
+        if let (Some(ast::Value::Text(c)), Some(ast::Value::Text(p))) = (row.first(), row.get(1))
+            && c == child
+        {
+            parents.push(p.clone());
+        }
+    }
+    Ok(parents)
+}
+
 /// Whether any inheritance edge exists at all — the cheap gate that lets a database with no
 /// inheritance skip per-table descendant probes. Costs a single catalog lookup + first-row read.
 pub(super) fn has_any(engine: &dyn StorageEngine, txn: TxnId) -> Result<bool, Error> {

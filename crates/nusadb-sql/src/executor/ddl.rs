@@ -2094,7 +2094,24 @@ pub(super) fn run_alter_table(
         AlterTablePlan::AddColumnWithConstraints { add, constraints } => {
             run_alter_table(*add, engine, txn)?;
             for constraint in constraints {
+                // The column's type-range check: the partitions and children that just gained
+                // the column take it too (constraint propagation leaves these out, since each
+                // table derives them from its own columns when it is created).
+                let type_check = match &constraint {
+                    AlterTablePlan::AddCheck {
+                        table,
+                        name,
+                        predicate_sql,
+                        ..
+                    } if name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) => {
+                        Some((table.clone(), name.clone(), predicate_sql.clone()))
+                    },
+                    _ => None,
+                };
                 run_alter_table(constraint, engine, txn)?;
+                if let Some((table, name, predicate_sql)) = type_check {
+                    copy_type_check_below(&table, &name, &predicate_sql, engine, txn)?;
+                }
             }
             return Ok(ExecutionResult::Altered);
         },
@@ -2391,27 +2408,44 @@ pub(super) fn run_alter_table(
         },
         AlterTablePlan::Apply { table, op } => (table, op),
     };
+    // A column change on a table with partitions or inheritance children applies to each of
+    // them too: their rows are read through it, so their columns must stay its columns.
+    refuse_inherited_column_change(&table, &op, engine, txn)?;
+    let below = column_change_descendants(&table, &op, engine, txn)?;
+    apply_column_op(&table, &op, engine, txn)?;
+    for (child, child_op) in &below {
+        apply_column_op(child, child_op, engine, txn)?;
+    }
+    Ok(ExecutionResult::Altered)
+}
 
+/// Apply one column change to `table` alone.
+fn apply_column_op(
+    table: &TableSchema,
+    op: &AlterColumnOp,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
     // SET/DROP DEFAULT are SQL-layer column-default catalog edits — no engine layout change.
-    match &op {
+    match op {
         AlterColumnOp::SetDefault {
             column,
             default_sql,
         } => {
             super::coldefault::set_default(&table.name, column, default_sql, engine, txn)?;
-            return Ok(ExecutionResult::Altered);
+            return Ok(());
         },
         AlterColumnOp::DropDefault { column } => {
             super::coldefault::drop_default(&table.name, column, engine, txn)?;
-            return Ok(ExecutionResult::Altered);
+            return Ok(());
         },
         _ => {},
     }
 
-    let old_types = column_types(&table);
-    let core_op = match &op {
+    let old_types = column_types(table);
+    let core_op = match op {
         AlterColumnOp::AddColumn(column) => {
-            rewrite_add_column(&table, column, &old_types, engine, txn)?;
+            rewrite_add_column(table, column, &old_types, engine, txn)?;
             AlterOp::AddColumn(ColumnDef {
                 name: column.name.clone(),
                 ty: column.ty,
@@ -2419,35 +2453,35 @@ pub(super) fn run_alter_table(
             })
         },
         AlterColumnOp::DropColumn { index } => {
-            let name = column_name(&table, *index)?;
+            let name = column_name(table, *index)?;
             // The column's type-range checks go with it; left behind, they would name a column the
             // next write cannot find.
-            for (check, _) in synthetic_type_checks_on_column(&table, &name, engine)? {
+            for (check, _) in synthetic_type_checks_on_column(table, &name, engine)? {
                 engine.drop_constraint(txn, table.id, &check)?;
             }
-            rewrite_drop_column(&table, *index, &old_types, engine, txn)?;
+            rewrite_drop_column(table, *index, &old_types, engine, txn)?;
             // Clear any persisted default for the dropped column, so a later re-add of the same
             // name does not inherit the stale default (the catalog keys by column name).
             super::coldefault::drop_default(&table.name, &name, engine, txn)?;
             AlterOp::DropColumn { name }
         },
         AlterColumnOp::SetType { index, ty } => {
-            rewrite_set_type(&table, *index, *ty, &old_types, engine, txn)?;
+            rewrite_set_type(table, *index, *ty, &old_types, engine, txn)?;
             AlterOp::AlterColumnType {
-                column: column_name(&table, *index)?,
+                column: column_name(table, *index)?,
                 ty: *ty,
             }
         },
         AlterColumnOp::RenameColumn { index, to } => {
-            let from = column_name(&table, *index)?;
-            refuse_rename_with_dependents(&table, &from, engine, txn)?;
+            let from = column_name(table, *index)?;
+            refuse_rename_with_dependents(table, &from, engine, txn)?;
             // The engine's synthetic type-check(s) on this column name it in their predicate, so they
             // must move with the rename. They cannot be regenerated from the column's runtime type
             // (the declared width lives only in the predicate — every integer stores as i64), so the
             // stored predicate is rewritten by re-quoting the new name. Drop before the rename, re-add
             // after, all in this txn: drop clears the old dependency, the rename lands, the rewritten
             // check re-enforces the same bound under the new name.
-            let synthetic = synthetic_type_checks_on_column(&table, &from, engine)?;
+            let synthetic = synthetic_type_checks_on_column(table, &from, engine)?;
             for c in &synthetic {
                 engine.drop_constraint(txn, table.id, &c.0)?;
             }
@@ -2479,16 +2513,16 @@ pub(super) fn run_alter_table(
                     super::coldefault::set_default(&key, to, &sql, engine, txn)?;
                 }
             }
-            return Ok(ExecutionResult::Altered);
+            return Ok(());
         },
         AlterColumnOp::SetNotNull { index } => {
-            ensure_no_nulls(&table, *index, engine, txn)?;
+            ensure_no_nulls(table, *index, engine, txn)?;
             AlterOp::SetNotNull {
-                column: column_name(&table, *index)?,
+                column: column_name(table, *index)?,
             }
         },
         AlterColumnOp::DropNotNull { index } => AlterOp::DropNotNull {
-            column: column_name(&table, *index)?,
+            column: column_name(table, *index)?,
         },
         // Handled (and returned) above — they touch only the SQL-layer default catalog.
         AlterColumnOp::SetDefault { .. } | AlterColumnOp::DropDefault { .. } => {
@@ -2497,7 +2531,259 @@ pub(super) fn run_alter_table(
     };
 
     engine.alter_table(txn, table.id, &core_op)?;
-    Ok(ExecutionResult::Altered)
+    Ok(())
+}
+
+/// Add the type-range check `name` (`predicate_sql`) of a column just added to `table` to every
+/// partition and inheritance child below it that does not have it, validating their rows.
+fn copy_type_check_below(
+    table: &TableSchema,
+    name: &str,
+    predicate_sql: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if !super::inheritance::has_any(engine, txn)? {
+        return Ok(());
+    }
+    let key = crate::analyzer::qualified_display(&table.schema, &table.name);
+    for child_key in super::inheritance::descendants(engine, txn, &key)? {
+        let (schema, child_name) = crate::analyzer::split_qualified(&child_key);
+        let Some(child) = engine.lookup_table_as_of_in(
+            txn,
+            schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+            child_name,
+        )?
+        else {
+            continue;
+        };
+        if engine
+            .list_constraints(child.id)?
+            .iter()
+            .any(|c| c.name == name)
+        {
+            continue;
+        }
+        let predicate =
+            crate::analyzer::analyze_check_predicate(predicate_sql, &child, &dml::EmptyCatalog)?;
+        for row in &scan_rows(&child, engine, txn)? {
+            if matches!(eval::eval(&predicate, row)?, ast::Value::Bool(false)) {
+                return Err(nusadb_core::Error::ConstraintViolation(format!(
+                    "check constraint \"{name}\" is violated by an existing row in \"{}\"",
+                    child.name
+                ))
+                .into());
+            }
+        }
+        engine.add_check_constraint(txn, child.id, name, predicate_sql.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// The column a column change names, by name (`None` for `ADD COLUMN`, which names a new one).
+fn changed_column(table: &TableSchema, op: &AlterColumnOp) -> Result<Option<String>, Error> {
+    Ok(match op {
+        AlterColumnOp::AddColumn(_) => None,
+        AlterColumnOp::DropColumn { index }
+        | AlterColumnOp::RenameColumn { index, .. }
+        | AlterColumnOp::SetType { index, .. }
+        | AlterColumnOp::SetNotNull { index }
+        | AlterColumnOp::DropNotNull { index } => Some(column_name(table, *index)?),
+        AlterColumnOp::SetDefault { column, .. } | AlterColumnOp::DropDefault { column } => {
+            Some(column.clone())
+        },
+    })
+}
+
+/// Refuse a column change made directly on a partition or an inheritance child that would part
+/// it from its parent: a partition takes every column from its parent, so it cannot add, drop,
+/// rename or retype one; an inheritance child may add its own columns, but not drop, rename or
+/// retype one its parent has; and neither may drop a `NOT NULL` its parent declares.
+fn refuse_inherited_column_change(
+    table: &TableSchema,
+    op: &AlterColumnOp,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if !super::inheritance::has_any(engine, txn)? {
+        return Ok(());
+    }
+    let key = crate::analyzer::qualified_display(&table.schema, &table.name);
+    let parents = super::inheritance::direct_parents(engine, txn, &key)?;
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let refused = |message: String| {
+        Err(Error::Coded {
+            message,
+            sqlstate: "42P16", // invalid_table_definition
+        })
+    };
+    if let AlterColumnOp::AddColumn(column) = op {
+        if super::partition::partition_parent(engine, txn, &key)?.is_some() {
+            return refused(format!(
+                "cannot add column \"{}\" to partition \"{}\"; add it to the partitioned table",
+                column.name, table.name
+            ));
+        }
+        return Ok(());
+    }
+    let Some(name) = changed_column(table, op)? else {
+        return Ok(());
+    };
+    for parent_key in parents {
+        let (schema, parent_name) = crate::analyzer::split_qualified(&parent_key);
+        let Some(parent) = engine.lookup_table_as_of_in(
+            txn,
+            schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+            parent_name,
+        )?
+        else {
+            continue;
+        };
+        let Some(inherited) = parent.columns.iter().find(|c| c.name == name) else {
+            continue;
+        };
+        let what = match op {
+            AlterColumnOp::DropColumn { .. } => "drop",
+            AlterColumnOp::RenameColumn { .. } => "rename",
+            AlterColumnOp::SetType { .. } => "change the type of",
+            AlterColumnOp::DropNotNull { .. } if !inherited.nullable => {
+                return refused(format!(
+                    "column \"{name}\" of \"{}\" is NOT NULL in its parent \"{}\"",
+                    table.name, parent.name
+                ));
+            },
+            _ => continue,
+        };
+        return refused(format!(
+            "cannot {what} inherited column \"{name}\" of \"{}\"; change it on \"{}\"",
+            table.name, parent.name
+        ));
+    }
+    Ok(())
+}
+
+/// The partitions and inheritance children below `table`, each with the column change `op` as it
+/// applies to it: the same change, naming the column by its position there. A child that lacks the
+/// column is left alone, and so is one that already has a column `ADD COLUMN` adds, with the same
+/// type (an inheritance child may declare it itself). A column in the partition key of the table
+/// or of a partitioned table below it cannot be dropped, renamed or retyped.
+fn column_change_descendants(
+    table: &TableSchema,
+    op: &AlterColumnOp,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(TableSchema, AlterColumnOp)>, Error> {
+    let key = crate::analyzer::qualified_display(&table.schema, &table.name);
+    let name = changed_column(table, op)?;
+    let reshapes = matches!(
+        op,
+        AlterColumnOp::DropColumn { .. }
+            | AlterColumnOp::RenameColumn { .. }
+            | AlterColumnOp::SetType { .. }
+    );
+    // The table's own partition key, even before it has partitions.
+    if reshapes && let Some(name) = &name {
+        refuse_partition_key_column(&key, name, engine, txn)?;
+    }
+    if !super::inheritance::has_any(engine, txn)? {
+        return Ok(Vec::new());
+    }
+    let below = super::inheritance::descendants(engine, txn, &key)?;
+    if below.is_empty() {
+        return Ok(Vec::new());
+    }
+    if reshapes && let Some(name) = &name {
+        for partitioned in &below {
+            refuse_partition_key_column(partitioned, name, engine, txn)?;
+        }
+    }
+    let mut out = Vec::with_capacity(below.len());
+    for child_key in below {
+        let (schema, child_name) = crate::analyzer::split_qualified(&child_key);
+        let Some(child) = engine.lookup_table_as_of_in(
+            txn,
+            schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+            child_name,
+        )?
+        else {
+            continue;
+        };
+        let position = |name: &str| child.columns.iter().position(|c| c.name == name);
+        let child_op = match (op, name.as_deref().and_then(position)) {
+            (AlterColumnOp::AddColumn(column), _) => {
+                match child.columns.iter().find(|c| c.name == column.name) {
+                    Some(existing) if existing.ty == column.ty => continue,
+                    Some(_) => {
+                        return Err(Error::Coded {
+                            message: format!(
+                                "child table \"{}\" has a column \"{}\" of a different type",
+                                child.name, column.name
+                            ),
+                            sqlstate: "42804", // datatype_mismatch
+                        });
+                    },
+                    None => AlterColumnOp::AddColumn(column.clone()),
+                }
+            },
+            (_, None) => continue,
+            (AlterColumnOp::DropColumn { .. }, Some(index)) => AlterColumnOp::DropColumn { index },
+            (AlterColumnOp::RenameColumn { to, .. }, Some(index)) => AlterColumnOp::RenameColumn {
+                index,
+                to: to.clone(),
+            },
+            (AlterColumnOp::SetType { ty, .. }, Some(index)) => {
+                AlterColumnOp::SetType { index, ty: *ty }
+            },
+            (AlterColumnOp::SetNotNull { .. }, Some(index)) => AlterColumnOp::SetNotNull { index },
+            (AlterColumnOp::DropNotNull { .. }, Some(index)) => {
+                AlterColumnOp::DropNotNull { index }
+            },
+            (
+                AlterColumnOp::SetDefault {
+                    column,
+                    default_sql,
+                },
+                Some(_),
+            ) => AlterColumnOp::SetDefault {
+                column: column.clone(),
+                default_sql: default_sql.clone(),
+            },
+            (AlterColumnOp::DropDefault { column }, Some(_)) => AlterColumnOp::DropDefault {
+                column: column.clone(),
+            },
+        };
+        out.push((child, child_op));
+    }
+    Ok(out)
+}
+
+/// Refuse dropping, renaming or retyping `column` when the partitioned table at `key` (if it is
+/// one) partitions by it: its partitions' bounds are written in that column.
+fn refuse_partition_key_column(
+    key: &str,
+    column: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(parts) = super::partition::parent_key_parts(engine, txn, key)? else {
+        return Ok(());
+    };
+    let named = parts.iter().any(|part| match part {
+        super::partition::KeyPart::Column(c) => c == column,
+        super::partition::KeyPart::Expression(sql) => sql_mentions_column(sql, column),
+    });
+    if named {
+        return Err(Error::Coded {
+            message: format!(
+                "column \"{column}\" is part of the partition key of \"{key}\" and cannot be \
+                 dropped, renamed or have its type changed"
+            ),
+            sqlstate: "42P16", // invalid_table_definition
+        });
+    }
+    Ok(())
 }
 
 /// Validate that `table`'s existing rows satisfy a `PRIMARY KEY`/`UNIQUE` constraint about to be
