@@ -117,7 +117,7 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
     for col in ct.columns {
         let (column, lifted) = convert_column_def(&col, true)?;
         columns.push(column);
-        // Column-level CHECK / REFERENCES are lifted to table constraints.
+        // Column-level CHECK / REFERENCES and named keys are lifted to table constraints.
         constraints.extend(lifted);
     }
     for constraint in ct.constraints {
@@ -284,10 +284,10 @@ fn convert_partition_of(
     }))
 }
 
-/// Convert a column definition, returning the [`ast::ColumnDef`] plus any column-level
-/// `CHECK`/`REFERENCES` constraints lifted to table constraints. Column-local
-/// options (`NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT`, `GENERATED`) are folded into the
-/// `ColumnDef` itself.
+/// Convert a column definition, returning the [`ast::ColumnDef`] plus the column-level constraints
+/// lifted to table constraints: `CHECK`, `REFERENCES`, and a `PRIMARY KEY` / `UNIQUE` given a name
+/// with `CONSTRAINT name`. Column-local options (`NOT NULL`, an unnamed `PRIMARY KEY` / `UNIQUE`,
+/// `DEFAULT`, `GENERATED`) are folded into the `ColumnDef` itself.
 ///
 /// `synth_type_checks` controls whether the synthetic type-bound CHECKs (a `VARCHAR(n)` length limit
 /// or a narrow-integer range) are lifted.
@@ -328,19 +328,35 @@ pub(super) fn convert_column_def(
     let mut generated = None;
     let mut lifted = Vec::new();
     for opt in &col.options {
-        // `CONSTRAINT name` before a column constraint names the CHECK / REFERENCES it becomes.
-        let constraint_name = opt.name.as_ref().map(fold_ident);
+        // `CONSTRAINT name` before a column constraint names the CHECK, REFERENCES or key it
+        // becomes.
+        let mut constraint_name = opt.name.as_ref().map(fold_ident);
         match &opt.option {
             sql::ColumnOption::NotNull => nullable = false,
             sql::ColumnOption::Null => {},
             // `PRIMARY KEY` implies `NOT NULL`; a bare `UNIQUE` does not. (sqlparser 0.62 models
             // these as dedicated constraint structs; index hints / characteristics on a
             // column-level key were ignored in 0.51 and still are.)
+            // A named key becomes a table constraint carrying the name; an unnamed one stays a
+            // column flag, named by the table's default rule.
             sql::ColumnOption::PrimaryKey(_) => {
-                primary_key = true;
                 nullable = false;
+                match constraint_name.take() {
+                    Some(key_name) => lifted.push(ast::TableConstraint::PrimaryKey {
+                        name: Some(key_name),
+                        columns: vec![name.clone()],
+                    }),
+                    None => primary_key = true,
+                }
             },
-            sql::ColumnOption::Unique(_) => unique = true,
+            sql::ColumnOption::Unique(_) => match constraint_name.take() {
+                Some(key_name) => lifted.push(ast::TableConstraint::Unique {
+                    name: Some(key_name),
+                    columns: vec![name.clone()],
+                    nulls_not_distinct: false,
+                }),
+                None => unique = true,
+            },
             // `DEFAULT <expr>`. Capture the canonical SQL text too (like CHECK's
             // `predicate_sql`) so the executor can persist + re-parse it per write.
             sql::ColumnOption::Default(expr) => {
@@ -1327,8 +1343,9 @@ pub(super) fn convert_alter_op(
             if column_position.is_some() {
                 return unsupported("ALTER TABLE ADD COLUMN ... FIRST|AFTER");
             }
-            // The column's CHECK / REFERENCES and its type-range check (a narrow integer's bounds, a
-            // VARCHAR(n) length) travel with it and are added in the same statement.
+            // The column's CHECK / REFERENCES / named UNIQUE and its type-range check (a narrow
+            // integer's bounds, a VARCHAR(n) length) travel with it and are added in the same
+            // statement.
             let (column, constraints) = convert_column_def(&column_def, true)?;
             Ok(ast::AlterTableAction::AddColumn {
                 column,

@@ -828,7 +828,11 @@ pub(super) fn analyze_alter_table(
             if_not_exists,
             constraints,
         } => {
-            if column.primary_key {
+            if column.primary_key
+                || constraints
+                    .iter()
+                    .any(|c| matches!(c, ast::TableConstraint::PrimaryKey { .. }))
+            {
                 return Err(Error::Unsupported(
                     "ALTER TABLE ADD COLUMN ... PRIMARY KEY is not supported \
                      (no analysis-time constraint catalog hook yet)"
