@@ -101,3 +101,17 @@ query T
 SELECT table_name FROM information_schema.views ORDER BY table_name
 ----
 active_emp
+
+# The information_schema views can be joined, to each other and to a table.
+statement ok
+CREATE TABLE isj (id INT PRIMARY KEY, note TEXT)
+
+query TT
+SELECT c.table_name, c.column_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_name = c.table_name WHERE c.table_name = 'isj' AND c.column_name = 'id'
+----
+isj id
+
+query TT rowsort
+SELECT t.table_name, k.column_name FROM information_schema.tables t LEFT JOIN information_schema.key_column_usage k ON k.table_name = t.table_name WHERE t.table_name = 'isj'
+----
+isj id

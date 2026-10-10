@@ -569,6 +569,34 @@ fn resolve_join_input(
             )),
         };
     }
+    // An `information_schema` view joined in is read as `(SELECT * FROM information_schema.x)`,
+    // whose FROM base produces the view's rows; give it an alias to qualify its columns.
+    if let Some(view) = crate::planner::InfoSchemaView::from_full_name(&table.name) {
+        let mut base = table.clone();
+        base.alias = None;
+        base.column_aliases = Vec::new();
+        base.lateral = false;
+        let select = ast::Select {
+            with: Vec::new(),
+            distinct: None,
+            projection: vec![ast::SelectItem::Wildcard],
+            from: Some(ast::FromClause {
+                base,
+                joins: Vec::new(),
+            }),
+            filter: None,
+            group_by: ast::GroupBy::Expressions(Vec::new()),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            limit_with_ties: false,
+            offset: None,
+            lock: None,
+        };
+        let plan = analyze_select(select, catalog)?;
+        let schema = cte_schema(&view.table_schema().name, &table.column_aliases, &plan)?;
+        return Ok((schema, Some(Box::new(plan))));
+    }
     // The right side of a JOIN is read like any other source, so it needs SELECT in its own right —
     // otherwise joining to a table would be a way to read one the session may not read directly.
     let schema = resolve_table(table.schema.as_deref(), &table.name, catalog)?;
