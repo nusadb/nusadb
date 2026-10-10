@@ -686,7 +686,7 @@ fn resolve_join_input(
         };
     }
     // An `information_schema` view joined in is read as `(SELECT * FROM information_schema.x)`,
-    // whose FROM base produces the view's rows; give it an alias to qualify its columns.
+    // whose FROM base produces the view's rows; qualified by its alias, or by the view's own name.
     if let Some(view) = crate::planner::InfoSchemaView::from_full_name(&table.name) {
         let mut base = table.clone();
         base.alias = None;
@@ -710,7 +710,7 @@ fn resolve_join_input(
             lock: None,
         };
         let plan = analyze_select(select, catalog)?;
-        let schema = cte_schema(&view.table_schema().name, &table.column_aliases, &plan)?;
+        let schema = cte_schema(view.view_name(), &table.column_aliases, &plan)?;
         return Ok((schema, Some(Box::new(plan))));
     }
     // The right side of a JOIN is read like any other source, so it needs SELECT in its own right —
@@ -961,7 +961,11 @@ pub(super) fn resolve_from(
             });
         }
     };
-    let base_qualifier = from.base.alias.clone().unwrap_or_else(|| base.name.clone());
+    // An unaliased `information_schema` view is qualified by its own name (`tables.table_name`).
+    let base_qualifier = from.base.alias.clone().unwrap_or_else(|| {
+        crate::planner::InfoSchemaView::from_full_name(&base.name)
+            .map_or_else(|| base.name.clone(), |view| view.view_name().to_owned())
+    });
     // Only a real base table gates its columns by SELECT privilege; a view/CTE/derived source was
     // authorized (or not) when its own body was analyzed, so re-gating its columns here would deny a
     // role that may read the underlying table but was never granted the view.
@@ -969,6 +973,9 @@ pub(super) fn resolve_from(
     let mut scope: Vec<ScopedColumn> =
         super::base_scope(&base, &base_qualifier, catalog, base_gates)?;
     let mut joins = Vec::with_capacity(from.joins.len());
+    // Each FROM item's qualifier names it once: a repeat would leave `name.col` and `name.*`
+    // meaning either source.
+    let mut qualifiers = vec![base_qualifier];
     for join in &from.joins {
         // A LATERAL join input correlates to the columns to its left, so resolve it against the
         // scope built so far. A right/full lateral join is meaningless (the right side depends on
@@ -984,6 +991,15 @@ pub(super) fn resolve_from(
             .alias
             .clone()
             .unwrap_or_else(|| joined.name.clone());
+        if qualifiers.contains(&qualifier) {
+            return Err(Error::Coded {
+                message: format!(
+                    "table name \"{qualifier}\" specified more than once; give one of them an alias"
+                ),
+                sqlstate: "42712", // duplicate_alias
+            });
+        }
+        qualifiers.push(qualifier.clone());
         // Columns to the LEFT of this join (the running scope) end here; the joined table's
         // columns follow. `USING`/`NATURAL` reference both sides by this boundary.
         let left_width = scope.len();
@@ -2073,6 +2089,17 @@ fn analyze_select_scoped(
     {
         return Err(Error::Unsupported(
             "TABLESAMPLE on a JOIN input is not supported".to_owned(),
+        ));
+    }
+    // An information_schema view is computed, not stored: it has no rows to lock.
+    if sel.lock.is_some()
+        && sel
+            .from
+            .as_ref()
+            .is_some_and(|f| crate::planner::InfoSchemaView::from_full_name(&f.base.name).is_some())
+    {
+        return Err(Error::Unsupported(
+            "FOR UPDATE / FOR SHARE cannot lock the rows of an information_schema view".to_owned(),
         ));
     }
     let row_lock = analyze_row_lock(
