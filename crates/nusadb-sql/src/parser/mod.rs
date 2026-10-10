@@ -5456,12 +5456,17 @@ fn convert_set_statement(set: sql::Set) -> Result<ast::Statement, Error> {
         sql::Set::SetTransaction {
             modes,
             snapshot,
-            session: _,
+            session,
         } => {
             if snapshot.is_some() {
                 return unsupported("SET TRANSACTION SNAPSHOT");
             }
-            convert_transaction_modes(modes).map(ast::Statement::SetTransaction)
+            let settings = convert_transaction_modes(modes)?;
+            Ok(if session {
+                ast::Statement::SetSessionCharacteristics(settings)
+            } else {
+                ast::Statement::SetTransaction(settings)
+            })
         },
         sql::Set::SingleAssignment {
             scope,

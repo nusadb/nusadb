@@ -3421,6 +3421,19 @@ async fn transaction_isolation_is_settable_over_the_wire() {
     );
     ok(&mut a, "ROLLBACK").await;
 
+    // Outside a transaction SET TRANSACTION has nothing to configure: refused, and the session's
+    // default is left as it was (SET SESSION CHARACTERISTICS is the form that changes it).
+    query(&mut a, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await;
+    assert!(
+        matches!(next(&mut a).await, BackendMessage::Error { ref code, .. } if code == "25P01")
+    );
+    assert_eq!(
+        next(&mut a).await,
+        BackendMessage::ReadyForQuery(TxnStatus::Idle)
+    );
+    query(&mut a, "SHOW transaction_isolation").await;
+    assert_eq!(one_cell(&mut a).await, "read committed");
+
     // READ ONLY is refused loudly rather than silently opening a writable transaction.
     query(&mut a, "BEGIN READ ONLY").await;
     assert!(matches!(next(&mut a).await, BackendMessage::Error { .. }));

@@ -780,3 +780,24 @@ fn introspection_plans_advertise_the_types_they_send() {
         }
     }
 }
+
+/// A streamed `SELECT` uses the open transaction up like a buffered one: `SET TRANSACTION` after it
+/// is refused, so the transaction (and the snapshot and locks it already holds) is never replaced.
+#[test]
+fn a_streamed_select_uses_the_transaction_up() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    run(engine, &mut session, "CREATE TABLE t (a INT)");
+    run(engine, &mut session, "BEGIN");
+    let mut sink = Collect::default();
+    session
+        .execute_streaming(planned(engine, "SELECT a FROM t FOR UPDATE"), &mut sink)
+        .unwrap();
+    let err = session
+        .execute(planned(
+            engine,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        ))
+        .expect_err("the transaction has run a statement");
+    assert_eq!(err.sqlstate(), "25001");
+}

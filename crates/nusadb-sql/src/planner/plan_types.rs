@@ -358,8 +358,11 @@ pub enum LogicalPlan {
     Commit,
     /// `ROLLBACK` — abort the explicit transaction.
     Rollback,
-    /// `SET TRANSACTION` — update the session's default transaction characteristics.
+    /// `SET TRANSACTION`: set the current transaction's characteristics, before its first
+    /// statement.
     SetTransaction(TxnCharacteristics),
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION`: set the session's default characteristics.
+    SetSessionCharacteristics(TxnCharacteristics),
     /// `SAVEPOINT name` — mark a rollback point in the current transaction.
     Savepoint(String),
     /// `ROLLBACK TO [SAVEPOINT] name` — undo back to a named savepoint.
@@ -2639,8 +2642,11 @@ pub enum PhysicalPlan {
     Commit,
     /// `ROLLBACK` — abort the explicit transaction.
     Rollback,
-    /// `SET TRANSACTION` — update the session's default transaction characteristics.
+    /// `SET TRANSACTION`: set the current transaction's characteristics, before its first
+    /// statement.
     SetTransaction(TxnCharacteristics),
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION`: set the session's default characteristics.
+    SetSessionCharacteristics(TxnCharacteristics),
     /// `SAVEPOINT name` — mark a rollback point in the current transaction.
     Savepoint(String),
     /// `ROLLBACK TO [SAVEPOINT] name` — undo back to a named savepoint.

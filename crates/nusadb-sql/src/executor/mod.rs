@@ -427,7 +427,8 @@ pub fn execute(plan: PhysicalPlan, engine: &dyn StorageEngine) -> Result<Executi
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
-        | PhysicalPlan::SetTransaction(_) => Err(Error::Internal(
+        | PhysicalPlan::SetTransaction(_)
+        | PhysicalPlan::SetSessionCharacteristics(_) => Err(Error::Internal(
             "transaction-control plan reached an entry point with no session".to_owned(),
         )),
         other => Session::new(engine).execute(other),
@@ -609,7 +610,8 @@ pub fn execute_in_txn(
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
-        | PhysicalPlan::SetTransaction(_) => Err(Error::Internal(
+        | PhysicalPlan::SetTransaction(_)
+        | PhysicalPlan::SetSessionCharacteristics(_) => Err(Error::Internal(
             "transaction-control plan reached an entry point with no session".to_owned(),
         )),
         other => dispatch(other, engine, txn),
@@ -1090,6 +1092,9 @@ pub struct Session<'engine> {
     default_read_only: bool,
     /// Whether the currently-active explicit transaction is read-only (set at `BEGIN`).
     txn_read_only: bool,
+    /// The transaction that has run a statement, if any: once the open transaction has,
+    /// `SET TRANSACTION` is refused.
+    used_txn: Option<TxnId>,
     /// Generic session-variable store for `SET`/`RESET`/`SHOW`. Variables are
     /// remembered and echoed back, and read by `current_setting(name)`.
     variables: HashMap<String, String>,
@@ -1541,6 +1546,7 @@ impl<'engine> Session<'engine> {
             default_isolation: IsolationLevel::default(),
             default_read_only: false,
             txn_read_only: false,
+            used_txn: None,
             variables: HashMap::new(),
             current_user: session_ctx::DEFAULT_USER.to_owned(),
             current_database: "nusadb".to_owned(),
@@ -1661,6 +1667,7 @@ impl<'engine> Session<'engine> {
 
     /// Execute one plan in this session's transaction context.
     pub fn execute(&mut self, plan: PhysicalPlan) -> Result<ExecutionResult, Error> {
+        self.note_statement(&plan);
         // A read-only `SELECT` in auto-commit may be served from / stored in the result cache.
         if matches!(plan, PhysicalPlan::Select(..)) && self.current_txn.is_none() {
             return self.execute_select_cached(plan);
@@ -1670,6 +1677,7 @@ impl<'engine> Session<'engine> {
             PhysicalPlan::Commit => self.commit(),
             PhysicalPlan::Rollback => self.rollback(),
             PhysicalPlan::SetTransaction(c) => self.set_transaction(c),
+            PhysicalPlan::SetSessionCharacteristics(c) => Ok(self.set_session_characteristics(c)),
             PhysicalPlan::Savepoint(name) => self.savepoint(&name),
             PhysicalPlan::RollbackToSavepoint(name) => self.rollback_to_savepoint(&name),
             PhysicalPlan::ReleaseSavepoint(name) => self.release_savepoint(&name),
@@ -1948,6 +1956,7 @@ impl<'engine> Session<'engine> {
         // Only a plain SELECT can stream; route everything else through the buffered path and replay
         // any rows into the sink so behaviour is identical to `execute`.
         if let PhysicalPlan::Select(op, _est) = plan {
+            self.used_txn = self.current_txn;
             return self.stream_select(&op, sink);
         }
         // Capture the row shape before the plan is consumed so a replayed RETURNING set is typed.
@@ -2240,28 +2249,62 @@ impl<'engine> Session<'engine> {
         Ok(ExecutionResult::TransactionBegun)
     }
 
+    /// Record that the open transaction has run `plan`, unless `plan` only sets characteristics:
+    /// after that `SET TRANSACTION` is refused.
+    const fn note_statement(&mut self, plan: &PhysicalPlan) {
+        if !matches!(
+            plan,
+            PhysicalPlan::SetTransaction(_) | PhysicalPlan::SetSessionCharacteristics(_)
+        ) {
+            self.used_txn = self.current_txn;
+        }
+    }
+
+    /// `SET TRANSACTION`: configure the open transaction before its first statement. The engine
+    /// fixes isolation at BEGIN, so the still-empty engine transaction is replaced by one with the
+    /// requested level (nothing has run, so the two cannot be told apart). After a statement it is
+    /// refused (`25001`); outside a transaction there is nothing to configure (`25P01`), and
+    /// `SET SESSION CHARACTERISTICS` is the form that sets later transactions' defaults.
     fn set_transaction(
         &mut self,
         characteristics: TxnCharacteristics,
     ) -> Result<ExecutionResult, Error> {
-        // The engine fixes a transaction's isolation/access mode at BEGIN, so SET TRANSACTION can
-        // only configure transactions started later — matching the SQL rule that it precedes the
-        // transaction's first statement. Reject it inside an active transaction rather than
-        // silently ignoring it.
-        if self.current_txn.is_some() {
-            return Err(Error::ActiveTransaction(
-                "SET TRANSACTION must run before the transaction's first statement; \
-                 characteristics are fixed at BEGIN"
+        let Some(txn) = self.current_txn else {
+            return Err(Error::NoActiveTransaction(
+                "SET TRANSACTION can only be used inside a transaction; use SET SESSION \
+                 CHARACTERISTICS AS TRANSACTION to change the session's default"
                     .to_owned(),
             ));
+        };
+        if self.used_txn == Some(txn) {
+            return Err(Error::ActiveTransaction(
+                "SET TRANSACTION must run before the transaction's first statement".to_owned(),
+            ));
         }
+        if let Some(isolation) = characteristics.isolation {
+            self.engine.rollback(txn)?;
+            self.current_txn = None;
+            self.current_txn = Some(self.engine.begin(isolation)?);
+        }
+        if let Some(read_only) = characteristics.read_only {
+            self.txn_read_only = read_only;
+        }
+        Ok(ExecutionResult::TransactionCharacteristicsSet)
+    }
+
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION`: the defaults later transactions begin with.
+    /// The open transaction, if any, keeps its own.
+    const fn set_session_characteristics(
+        &mut self,
+        characteristics: TxnCharacteristics,
+    ) -> ExecutionResult {
         if let Some(isolation) = characteristics.isolation {
             self.default_isolation = isolation;
         }
         if let Some(read_only) = characteristics.read_only {
             self.default_read_only = read_only;
         }
-        Ok(ExecutionResult::TransactionCharacteristicsSet)
+        ExecutionResult::TransactionCharacteristicsSet
     }
 
     fn commit(&mut self) -> Result<ExecutionResult, Error> {
@@ -2711,6 +2754,7 @@ fn dispatch(
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
         | PhysicalPlan::SetTransaction(_)
+        | PhysicalPlan::SetSessionCharacteristics(_)
         | PhysicalPlan::Savepoint(_)
         | PhysicalPlan::RollbackToSavepoint(_)
         | PhysicalPlan::ReleaseSavepoint(_)
@@ -3215,6 +3259,9 @@ fn format_plan(
         PhysicalPlan::Commit => vec![format!("{indent}Commit")],
         PhysicalPlan::Rollback => vec![format!("{indent}Rollback")],
         PhysicalPlan::SetTransaction(_) => vec![format!("{indent}SetTransaction")],
+        PhysicalPlan::SetSessionCharacteristics(_) => {
+            vec![format!("{indent}SetSessionCharacteristics")]
+        },
         PhysicalPlan::Savepoint(name) => vec![format!("{indent}Savepoint {name}")],
         PhysicalPlan::RollbackToSavepoint(name) => {
             vec![format!("{indent}RollbackToSavepoint {name}")]

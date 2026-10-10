@@ -51,4 +51,4 @@ p1_ddl/create_drop.slt:84           CREATE DATABASE refused `0A000`: needs the s
 # "before the transaction's first statement" allows), while `Session` refuses whenever a
 # transaction is active. The corpus pins the stricter embedded rule. Which one is right is a
 # decision, not a defect to be quietly patched here.
-p12_txn/isolation_levels.slt:70     SET TRANSACTION in an untouched txn: accepted over the wire, refused by `Session`; corpus expects the refusal
+p12_txn/isolation_levels.slt:99     BEGIN READ ONLY: refused over the wire, which does not enforce access modes yet

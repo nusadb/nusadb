@@ -1414,8 +1414,11 @@ SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE;   -- se
 ```
 
 The default isolation level is `READ COMMITTED`. A statement outside `BEGIN` runs in its own
-transaction. After an error inside a transaction, every further statement is refused with `25P02`
-until `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`).
+transaction. `SET TRANSACTION` configures the open transaction and must come before its first
+statement (`25001` after it); outside a transaction it is refused (`25P01`).
+`SET SESSION CHARACTERISTICS AS TRANSACTION` sets the default for transactions begun later.
+After an error inside a transaction, every further statement is refused with `25P02` until
+`ROLLBACK` (or `ROLLBACK TO SAVEPOINT`).
 
 ### Row and table locks
 

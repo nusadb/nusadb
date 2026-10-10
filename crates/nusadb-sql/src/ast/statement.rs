@@ -344,8 +344,12 @@ pub enum Statement {
     RollbackToSavepoint(String),
     /// `RELEASE [SAVEPOINT] name` — discard a named savepoint.
     ReleaseSavepoint(String),
-    /// `SET [SESSION] TRANSACTION ...` — set characteristics for the transaction.
+    /// `SET TRANSACTION ...`: set characteristics for the current transaction, before its first
+    /// statement.
     SetTransaction(TransactionSettings),
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION ...`: set the defaults later transactions of the
+    /// session begin with.
+    SetSessionCharacteristics(TransactionSettings),
     /// `LISTEN channel` — subscribe this connection to a notification channel. The channel name is
     /// a folded identifier. The server owns the cross-connection registry, so this is intercepted at
     /// the wire layer rather than executed by the SQL engine.

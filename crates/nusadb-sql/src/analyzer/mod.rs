@@ -1105,11 +1105,14 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 "LISTEN/UNLISTEN/NOTIFY are only valid on a live client connection".to_owned(),
             ))
         },
-        // SET TRANSACTION updates the session's default characteristics for subsequently-started
-        // transactions.
+        // SET TRANSACTION configures the transaction it runs in; SET SESSION CHARACTERISTICS the
+        // session's defaults for transactions begun later.
         ast::Statement::SetTransaction(settings) => {
             Ok(LogicalPlan::SetTransaction(txn_characteristics(&settings)))
         },
+        ast::Statement::SetSessionCharacteristics(settings) => Ok(
+            LogicalPlan::SetSessionCharacteristics(txn_characteristics(&settings)),
+        ),
         // SET/RESET session variables: the session keeps a generic variable store; carry the
         // name + value (None = RESET) through to the executor.
         ast::Statement::SetVariable(sv) => Ok(LogicalPlan::SetVariable {

@@ -5146,20 +5146,44 @@ fn read_only_transaction_blocks_writes_but_allows_reads() {
 }
 
 #[test]
-fn set_transaction_sets_the_session_read_only_default() {
-    // SET TRANSACTION READ ONLY makes subsequent auto-commit writes in the session fail.
+fn session_characteristics_set_the_default_and_set_transaction_the_open_transaction() {
     let engine = BtreeEngine::new();
     run(&engine, "CREATE TABLE t (id INT NOT NULL)");
-
     let mut session = Session::new(&engine);
+    let mut exec = |sql: &str| session.execute(build_plan(&engine, sql));
+
+    // Outside a transaction there is nothing for SET TRANSACTION to configure.
+    let err = exec("SET TRANSACTION READ ONLY").expect_err("no transaction is open");
+    assert_eq!(err.sqlstate(), "25P01");
+    exec("INSERT INTO t VALUES (1)").unwrap();
+
+    // Before the transaction's first statement it applies to that transaction only.
+    exec("BEGIN").unwrap();
+    exec("SET TRANSACTION READ ONLY").unwrap();
     assert!(matches!(
-        session
-            .execute(build_plan(&engine, "SET TRANSACTION READ ONLY"))
-            .unwrap(),
-        ExecutionResult::TransactionCharacteristicsSet,
+        exec("INSERT INTO t VALUES (2)"),
+        Err(nusadb_sql::Error::ReadOnlyTransaction(_)),
     ));
+    exec("ROLLBACK").unwrap();
+    exec("INSERT INTO t VALUES (2)").unwrap();
+
+    // Setting the session's default does not use the open transaction up.
+    exec("BEGIN").unwrap();
+    exec("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED").unwrap();
+    exec("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap();
+    exec("ROLLBACK").unwrap();
+
+    // After a statement it is too late.
+    exec("BEGIN").unwrap();
+    exec("SELECT id FROM t").unwrap();
+    let err = exec("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").expect_err("too late");
+    assert_eq!(err.sqlstate(), "25001");
+    exec("ROLLBACK").unwrap();
+
+    // SET SESSION CHARACTERISTICS sets the default every later transaction begins with.
+    exec("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").unwrap();
     assert!(matches!(
-        session.execute(build_plan(&engine, "INSERT INTO t VALUES (1)")),
+        exec("INSERT INTO t VALUES (3)"),
         Err(nusadb_sql::Error::ReadOnlyTransaction(_)),
     ));
 }

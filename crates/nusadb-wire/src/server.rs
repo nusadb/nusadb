@@ -2580,9 +2580,10 @@ fn run_query_streaming(
         Statement::Commit => Some(commit_txn(engine, state, settings)),
         Statement::Rollback => Some(rollback_txn(engine, state, settings)),
         Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
-        // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`: session default in
-        // autocommit, re-begin in an untouched transaction, refused after any query.
-        Statement::SetTransaction(ts) => Some(set_transaction_txn(engine, settings, ts, state)),
+        // `SET TRANSACTION ...`: re-begin in an untouched transaction, refused after any query
+        // or outside a transaction. `SET SESSION CHARACTERISTICS ...` sets the session default.
+        Statement::SetTransaction(ts) => Some(set_transaction_txn(engine, ts, state)),
+        Statement::SetSessionCharacteristics(ts) => Some(session_default(settings, ts, state)),
         savepoint @ (Statement::Savepoint(_)
         | Statement::RollbackToSavepoint(_)
         | Statement::ReleaseSavepoint(_)) => Some(savepoint_txn(engine, savepoint, state)),
@@ -3413,12 +3414,10 @@ const fn isolation_guc_text(level: IsolationLevel) -> &'static str {
     }
 }
 
-/// `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...` over the wire.
+/// `SET TRANSACTION ...` over the wire.
 ///
-/// - In autocommit: records the isolation as the connection's `default_transaction_isolation`
-///   GUC, so every later `BEGIN` / auto-committed statement begins at that level (both spellings
-///   land here — the session default — matching the embedded `Session`; a documented deviation
-///   from the reference engine's txn-scoped plain `SET TRANSACTION`, which is a no-op warning outside a block).
+/// - Outside a transaction: refused with SQLSTATE `25P01`; there is no transaction to configure
+///   (`SET SESSION CHARACTERISTICS AS TRANSACTION` sets the default later ones begin with).
 /// - In an **untouched** transaction: re-begins the engine transaction at the requested level
 ///   (observably equivalent — nothing has run; the reference engine likewise requires this "before any query").
 ///   The session default is left alone, so a later transaction reverts, like the reference engine.
@@ -3428,7 +3427,6 @@ const fn isolation_guc_text(level: IsolationLevel) -> &'static str {
 ///   silently granting a writable "read-only" transaction would be worse than an error.
 fn set_transaction_txn(
     engine: &dyn StorageEngine,
-    settings: &std::sync::Mutex<HashMap<String, String>>,
     ts: &nusadb_sql::ast::TransactionSettings,
     state: TxnState,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
@@ -3493,21 +3491,54 @@ fn set_transaction_txn(
                 Err(e) => (Err(e.into()), TxnState::Auto),
             }
         },
-        TxnState::Auto => {
-            if let Some(level) = ts.isolation
-                && let Ok(mut store) = settings.lock()
-            {
-                store.insert(
-                    "default_transaction_isolation".to_owned(),
-                    isolation_guc_text(core_isolation(level)).to_owned(),
-                );
-            }
-            (
-                Ok(ExecutionResult::TransactionCharacteristicsSet),
-                TxnState::Auto,
-            )
-        },
+        TxnState::Auto => (
+            Err(nusadb_sql::Error::NoActiveTransaction(
+                "SET TRANSACTION can only be used inside a transaction; use SET SESSION \
+                 CHARACTERISTICS AS TRANSACTION to change the session's default"
+                    .to_owned(),
+            )),
+            TxnState::Auto,
+        ),
     }
+}
+
+/// `SET SESSION CHARACTERISTICS AS TRANSACTION ...` over the wire: records the isolation as the
+/// connection's `default_transaction_isolation`, so every later `BEGIN` / auto-committed statement
+/// begins at that level. An open transaction keeps its own. `READ ONLY` is refused, as for
+/// `SET TRANSACTION`.
+fn session_default(
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+    ts: &nusadb_sql::ast::TransactionSettings,
+    state: TxnState,
+) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
+    if let TxnState::Failed { .. } = state {
+        return (
+            Err(nusadb_sql::Error::TransactionAborted(
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .to_owned(),
+            )),
+            state,
+        );
+    }
+    if matches!(ts.access_mode, Some(nusadb_sql::ast::AccessMode::ReadOnly)) {
+        let err = nusadb_sql::Error::Unsupported(
+            "READ ONLY transactions are not supported over the wire protocol yet".to_owned(),
+        );
+        let new_state = match state {
+            TxnState::Active { txn, isolation, .. } => TxnState::Failed { txn, isolation },
+            other => other,
+        };
+        return (Err(err), new_state);
+    }
+    if let Some(level) = ts.isolation
+        && let Ok(mut store) = settings.lock()
+    {
+        store.insert(
+            "default_transaction_isolation".to_owned(),
+            isolation_guc_text(core_isolation(level)).to_owned(),
+        );
+    }
+    (Ok(ExecutionResult::TransactionCharacteristicsSet), state)
 }
 
 /// How the current transaction state treats a `NOTIFY` (see [`TxnState::notify_phase`]).
@@ -3844,9 +3875,10 @@ fn run_query_txn(
         Statement::BeginTransaction(ts) => begin_txn(engine, state, settings, &ts),
         Statement::Commit => commit_txn(engine, state, settings),
         Statement::Rollback => rollback_txn(engine, state, settings),
-        // `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`: session default in
-        // autocommit, re-begin in an untouched transaction, refused after any query.
-        Statement::SetTransaction(ts) => set_transaction_txn(engine, settings, &ts, state),
+        // `SET TRANSACTION ...`: re-begin in an untouched transaction, refused after any query
+        // or outside a transaction. `SET SESSION CHARACTERISTICS ...` sets the session default.
+        Statement::SetTransaction(ts) => set_transaction_txn(engine, &ts, state),
+        Statement::SetSessionCharacteristics(ts) => session_default(settings, &ts, state),
         savepoint @ (Statement::Savepoint(_)
         | Statement::RollbackToSavepoint(_)
         | Statement::ReleaseSavepoint(_)) => savepoint_txn(engine, &savepoint, state),
