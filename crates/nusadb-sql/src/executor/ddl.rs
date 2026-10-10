@@ -2089,6 +2089,15 @@ pub(super) fn run_alter_table(
 ) -> Result<ExecutionResult, Error> {
     let (table, op) = match plan {
         AlterTablePlan::Noop => return Ok(ExecutionResult::Altered),
+        // The column first, then its constraints, each validating the rows (with the column's
+        // DEFAULT backfilled). An error leaves nothing of the statement: the column goes with it.
+        AlterTablePlan::AddColumnWithConstraints { add, constraints } => {
+            run_alter_table(*add, engine, txn)?;
+            for constraint in constraints {
+                run_alter_table(constraint, engine, txn)?;
+            }
+            return Ok(ExecutionResult::Altered);
+        },
         // Row-level-security toggle: a SQL-layer catalog change, not a row rewrite.
         AlterTablePlan::SetRls {
             schema,
@@ -2411,6 +2420,11 @@ pub(super) fn run_alter_table(
         },
         AlterColumnOp::DropColumn { index } => {
             let name = column_name(&table, *index)?;
+            // The column's type-range checks go with it; left behind, they would name a column the
+            // next write cannot find.
+            for (check, _) in synthetic_type_checks_on_column(&table, &name, engine)? {
+                engine.drop_constraint(txn, table.id, &check)?;
+            }
             rewrite_drop_column(&table, *index, &old_types, engine, txn)?;
             // Clear any persisted default for the dropped column, so a later re-add of the same
             // name does not inherit the stale default (the catalog keys by column name).
@@ -2668,6 +2682,10 @@ pub(super) fn column_name(table: &TableSchema, index: usize) -> Result<String, E
 
 /// One-line `EXPLAIN` summary of an `ALTER TABLE` plan.
 pub(super) fn format_alter(plan: &AlterTablePlan) -> String {
+    let plan = match plan {
+        AlterTablePlan::AddColumnWithConstraints { add, .. } => add,
+        plan => plan,
+    };
     let AlterTablePlan::Apply { table, op } = plan else {
         return ": no-op".to_owned();
     };

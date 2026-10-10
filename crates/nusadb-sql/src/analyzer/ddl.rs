@@ -826,6 +826,7 @@ pub(super) fn analyze_alter_table(
         ast::AlterTableAction::AddColumn {
             column,
             if_not_exists,
+            constraints,
         } => {
             if column.primary_key {
                 return Err(Error::Unsupported(
@@ -840,7 +841,11 @@ pub(super) fn analyze_alter_table(
                 }
                 return Err(Error::DuplicateColumn { name: column.name });
             }
-            AlterColumnOp::AddColumn(column)
+            if constraints.is_empty() && !column.unique {
+                AlterColumnOp::AddColumn(column)
+            } else {
+                return analyze_add_column_with_constraints(table, column, constraints, catalog);
+            }
         },
         ast::AlterTableAction::DropColumn { name, if_exists } => {
             let Some(index) = table.columns.iter().position(|c| c.name == name) else {
@@ -1037,6 +1042,84 @@ fn analyze_rename_table(
         schema: schema.to_owned(),
         name,
         old: current_name.to_owned(),
+    })
+}
+
+/// `ADD COLUMN` with constraints of its own (an inline `CHECK`, `REFERENCES` or `UNIQUE`, and the
+/// column type's range check): each is analyzed as `ADD CONSTRAINT` against the table as it will be
+/// once the column exists. An unnamed one is named after the table and the column:
+/// `<table>_<column>_check[n]`, `_fkey`, `_key`.
+fn analyze_add_column_with_constraints(
+    table: TableSchema,
+    column: ast::ColumnDef,
+    mut constraints: Vec<ast::TableConstraint>,
+    catalog: &dyn Catalog,
+) -> Result<AlterTablePlan, Error> {
+    let name_base = super::qualified_display(&table.schema, &table.name);
+    let base = format!("{name_base}_{}", column.name);
+    if column.unique {
+        constraints.push(ast::TableConstraint::Unique {
+            name: Some(format!("{base}_key")),
+            columns: vec![column.name.clone()],
+            nulls_not_distinct: false,
+        });
+    }
+    let mut with_column = table.clone();
+    with_column.columns.push(nusadb_core::ColumnDef {
+        name: column.name.clone(),
+        ty: column.ty,
+        nullable: column.nullable,
+    });
+    let mut checks = 0;
+    let mut plans = Vec::with_capacity(constraints.len());
+    for constraint in constraints {
+        let constraint = match constraint {
+            ast::TableConstraint::Check {
+                name: None,
+                expr,
+                predicate_sql,
+            } => {
+                checks += 1;
+                let suffix = if checks == 1 {
+                    String::new()
+                } else {
+                    checks.to_string()
+                };
+                ast::TableConstraint::Check {
+                    name: Some(format!("{base}_check{suffix}")),
+                    expr,
+                    predicate_sql,
+                }
+            },
+            ast::TableConstraint::ForeignKey {
+                name: None,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+            } => ast::TableConstraint::ForeignKey {
+                name: Some(format!("{base}_fkey")),
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+            },
+            other => other,
+        };
+        plans.push(analyze_add_constraint(
+            with_column.clone(),
+            constraint,
+            catalog,
+        )?);
+    }
+    Ok(AlterTablePlan::AddColumnWithConstraints {
+        add: Box::new(AlterTablePlan::Apply {
+            table,
+            op: AlterColumnOp::AddColumn(column),
+        }),
+        constraints: plans,
     })
 }
 

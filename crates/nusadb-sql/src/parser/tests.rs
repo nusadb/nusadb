@@ -732,6 +732,7 @@ fn alter_table_add_column_with_and_without_keyword() {
     let ast::AlterTableAction::AddColumn {
         column,
         if_not_exists,
+        ..
     } = a.action
     else {
         panic!("expected AddColumn");

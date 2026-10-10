@@ -1232,6 +1232,16 @@ pub enum AlterTablePlan {
     },
     /// An `IF [NOT] EXISTS` guard made the statement a no-op.
     Noop,
+    /// `ADD COLUMN` with constraints of its own: the column is added (`add`), then each constraint
+    /// (`AddCheck` / `AddForeignKey` / `AddUniqueConstraint`, analyzed against the table with the
+    /// new column), all in the same statement, so a constraint the existing rows break leaves no
+    /// column behind.
+    AddColumnWithConstraints {
+        /// The `ADD COLUMN` itself.
+        add: Box<Self>,
+        /// The constraints, in declaration order.
+        constraints: Vec<Self>,
+    },
     /// `ENABLE`/`DISABLE ROW LEVEL SECURITY` — toggle the table's row-level-security flag in the
     /// SQL-layer catalog. Not a storage-engine schema change, so it does not flow through the
     /// `AlterOp` treaty path.

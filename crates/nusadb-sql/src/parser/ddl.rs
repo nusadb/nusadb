@@ -290,9 +290,7 @@ fn convert_partition_of(
 /// `ColumnDef` itself.
 ///
 /// `synth_type_checks` controls whether the synthetic type-bound CHECKs (a `VARCHAR(n)` length limit
-/// or a narrow-integer range) are lifted. `CREATE TABLE` passes `true`; `ALTER TABLE ADD COLUMN`
-/// passes `false`, since that path cannot atomically add a table constraint — so an added narrow
-/// column is stored without the desugared bound rather than rejecting the whole `ADD COLUMN`.
+/// or a narrow-integer range) are lifted.
 #[allow(
     clippy::too_many_lines,
     reason = "flat one-arm-per-column-option dispatch; length tracks the option set"
@@ -1327,19 +1325,13 @@ pub(super) fn convert_alter_op(
             if column_position.is_some() {
                 return unsupported("ALTER TABLE ADD COLUMN ... FIRST|AFTER");
             }
-            // `synth_type_checks = false`: ADD COLUMN cannot atomically add a table constraint, so a
-            // narrow-int / VARCHAR(n) column is added without its desugared bound rather than being
-            // rejected outright. A *user-written* column CHECK/REFERENCES is still lifted and refused.
-            let (column, lifted) = convert_column_def(&column_def, false)?;
-            // ALTER ADD COLUMN cannot also introduce a table-level CHECK/FK in one action.
-            if !lifted.is_empty() {
-                return unsupported(
-                    "ALTER TABLE ADD COLUMN with an inline CHECK / REFERENCES constraint",
-                );
-            }
+            // The column's CHECK / REFERENCES and its type-range check (a narrow integer's bounds, a
+            // VARCHAR(n) length) travel with it and are added in the same statement.
+            let (column, constraints) = convert_column_def(&column_def, true)?;
             Ok(ast::AlterTableAction::AddColumn {
                 column,
                 if_not_exists,
+                constraints,
             })
         },
         Op::DropColumn {

@@ -241,3 +241,200 @@ fn add_foreign_key_validates_and_enforces() {
         .is_err()
     );
 }
+
+fn column_names(engine: &dyn StorageEngine, table: &str) -> Vec<String> {
+    engine
+        .lookup_table(table)
+        .unwrap()
+        .unwrap()
+        .columns
+        .into_iter()
+        .map(|c| c.name)
+        .collect()
+}
+
+#[test]
+fn add_column_with_inline_check_validates_existing_rows() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY)");
+    exec(engine, &mut session, "INSERT INTO t VALUES (1), (2)");
+    // The DEFAULT fills the existing rows and breaks the CHECK: the statement leaves no column.
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "ALTER TABLE t ADD COLUMN n INT NOT NULL DEFAULT 0 CHECK (n > 0)"
+        )
+        .is_err()
+    );
+    assert_eq!(column_names(engine, "t"), ["id"]);
+    exec(
+        engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN n INT NOT NULL DEFAULT 1 CHECK (n > 0)",
+    );
+    assert!(try_exec(engine, &mut session, "INSERT INTO t VALUES (3, 0)").is_err());
+    exec(engine, &mut session, "INSERT INTO t VALUES (3, 5)");
+    // Named after the table and the column.
+    let names: Vec<String> = engine
+        .list_constraints(engine.lookup_table("t").unwrap().unwrap().id)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert!(names.contains(&"t_n_check".to_owned()), "{names:?}");
+}
+
+#[test]
+fn add_column_with_inline_references_is_enforced_and_cascades() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE p (id INT PRIMARY KEY)");
+    exec(engine, &mut session, "INSERT INTO p VALUES (1)");
+    exec(engine, &mut session, "CREATE TABLE c (id INT PRIMARY KEY)");
+    exec(engine, &mut session, "INSERT INTO c VALUES (10)");
+    // An existing row would reference a missing parent: refused, no column left behind.
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "ALTER TABLE c ADD COLUMN p INT DEFAULT 9 REFERENCES p (id) ON DELETE CASCADE"
+        )
+        .is_err()
+    );
+    assert_eq!(column_names(engine, "c"), ["id"]);
+    exec(
+        engine,
+        &mut session,
+        "ALTER TABLE c ADD COLUMN p INT REFERENCES p (id) ON DELETE CASCADE",
+    );
+    assert!(try_exec(engine, &mut session, "INSERT INTO c VALUES (11, 9)").is_err());
+    exec(engine, &mut session, "INSERT INTO c VALUES (11, 1)");
+    exec(engine, &mut session, "DELETE FROM p");
+    let ExecutionResult::Rows { rows, .. } =
+        exec(engine, &mut session, "SELECT id FROM c ORDER BY id")
+    else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 1, "the referencing row cascaded away: {rows:?}");
+}
+
+#[test]
+fn add_column_with_inline_unique_is_enforced() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY)");
+    exec(
+        engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN u INT UNIQUE",
+    );
+    exec(engine, &mut session, "INSERT INTO t VALUES (1, 5)");
+    assert!(try_exec(engine, &mut session, "INSERT INTO t VALUES (2, 5)").is_err());
+    // A DEFAULT that gives the existing rows equal values refuses the column; without one the
+    // rows hold NULLs, which do not collide.
+    exec(engine, &mut session, "INSERT INTO t VALUES (2, 6)");
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "ALTER TABLE t ADD COLUMN x INT DEFAULT 1 UNIQUE"
+        )
+        .is_err()
+    );
+    assert_eq!(column_names(engine, "t"), ["id", "u"]);
+    exec(
+        engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN x INT UNIQUE",
+    );
+    exec(engine, &mut session, "INSERT INTO t VALUES (3, 7, 2)");
+    assert!(try_exec(engine, &mut session, "INSERT INTO t VALUES (4, 8, 2)").is_err());
+}
+
+#[test]
+fn add_column_smallint_and_integer_keep_range_bounds() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE t (id INT PRIMARY KEY)");
+    exec(engine, &mut session, "ALTER TABLE t ADD COLUMN s SMALLINT");
+    exec(engine, &mut session, "ALTER TABLE t ADD COLUMN i INTEGER");
+    exec(
+        engine,
+        &mut session,
+        "ALTER TABLE t ADD COLUMN c VARCHAR(3)",
+    );
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "INSERT INTO t (id, s) VALUES (1, 100000)"
+        )
+        .is_err()
+    );
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "INSERT INTO t (id, i) VALUES (2, 10000000000)"
+        )
+        .is_err()
+    );
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "INSERT INTO t (id, c) VALUES (3, 'abcdef')"
+        )
+        .is_err()
+    );
+    exec(
+        engine,
+        &mut session,
+        "INSERT INTO t VALUES (4, 32767, 2147483647, 'abc')",
+    );
+    // A DEFAULT outside the type's range refuses the column.
+    assert!(
+        try_exec(
+            engine,
+            &mut session,
+            "ALTER TABLE t ADD COLUMN z SMALLINT DEFAULT 40000"
+        )
+        .is_err()
+    );
+    assert_eq!(column_names(engine, "t"), ["id", "s", "i", "c"]);
+}
+
+#[test]
+fn dropping_a_ranged_column_drops_its_range_check() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE t (id INT, s SMALLINT)");
+    exec(engine, &mut session, "ALTER TABLE t ADD COLUMN i INTEGER");
+    exec(engine, &mut session, "ALTER TABLE t DROP COLUMN i");
+    exec(engine, &mut session, "ALTER TABLE t DROP COLUMN s");
+    exec(engine, &mut session, "INSERT INTO t VALUES (1)");
+    exec(engine, &mut session, "ALTER TABLE t ADD COLUMN s TEXT");
+    exec(
+        engine,
+        &mut session,
+        "INSERT INTO t VALUES (2, 'not a number')",
+    );
+}
+
+#[test]
+fn explain_names_an_added_ranged_column() {
+    let engine: &'static BtreeEngine = Box::leak(Box::new(BtreeEngine::new()));
+    let mut session = Session::new(engine);
+    exec(engine, &mut session, "CREATE TABLE t (id INT)");
+    let ExecutionResult::Rows { rows, .. } = exec(
+        engine,
+        &mut session,
+        "EXPLAIN ALTER TABLE t ADD COLUMN s SMALLINT",
+    ) else {
+        panic!("expected EXPLAIN rows");
+    };
+    let text = format!("{rows:?}");
+    assert!(text.contains("ADD COLUMN s"), "{text}");
+}

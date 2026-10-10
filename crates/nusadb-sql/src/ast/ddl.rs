@@ -903,6 +903,10 @@ pub enum AlterTableAction {
         column: ColumnDef,
         /// Whether `IF NOT EXISTS` was specified.
         if_not_exists: bool,
+        /// The column's own constraints that are table constraints underneath: an inline `CHECK`
+        /// or `REFERENCES`, and the type-range check of a narrow integer or `VARCHAR(n)` column.
+        /// They are added with the column, in the same statement.
+        constraints: Vec<TableConstraint>,
     },
     /// `DROP [COLUMN] [IF EXISTS] name` (implicit `RESTRICT`).
     DropColumn {

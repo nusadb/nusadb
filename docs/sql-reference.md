@@ -585,6 +585,8 @@ One action per `ALTER TABLE` statement.
 ```sql
 ALTER TABLE orders ADD COLUMN note TEXT;
 ALTER TABLE orders ADD COLUMN channel TEXT DEFAULT 'web' NOT NULL;
+ALTER TABLE orders ADD COLUMN qty INT NOT NULL DEFAULT 1 CHECK (qty > 0);
+ALTER TABLE orders ADD COLUMN region INT REFERENCES regions (id);
 ALTER TABLE orders ALTER COLUMN note SET DEFAULT '';
 ALTER TABLE orders ALTER COLUMN note DROP DEFAULT;
 ALTER TABLE orders ALTER COLUMN note SET NOT NULL;
@@ -609,6 +611,12 @@ Enabling or disabling row-level security is reserved to a superuser, even for th
 the toggle governs whose rows every role can see, so it is administered centrally rather than left
 to whoever happens to own the table. A non-superuser owner is refused with `42501`.
 
+A column added with inline constraints (`CHECK`, `REFERENCES`, `UNIQUE`) gets them
+as if each had been added with `ADD CONSTRAINT` right after the column: the existing rows, with the
+column's `DEFAULT` filled in, must satisfy them, or the statement leaves nothing behind. An added
+column keeps the limits of its type, as a column declared in `CREATE TABLE` does: the range of a
+`TINYINT`, `SMALLINT`, `MEDIUMINT` or `INTEGER`, and the length of a `VARCHAR(n)` or `CHAR(n)`.
+
 `ALTER TABLE t DISABLE TRIGGER name` and `ENABLE TRIGGER name` are shown under [Triggers](#triggers).
 
 `RENAME COLUMN` carries the column's own `DEFAULT` (including a `SERIAL` sentinel — the backing
@@ -626,10 +634,10 @@ or trigger body spells the table's name, while an incrementally maintained view 
 is built on it, or while it is a partition, a partitioned parent, or part of an inheritance chain:
 those find the table by name and would stop resolving. Drop that object, rename, and recreate it.
 
-Not accepted: `ADD COLUMN ... FIRST | AFTER`, an inline `CHECK` or `REFERENCES` on `ADD COLUMN`,
-`DROP COLUMN ... CASCADE`, dropping several columns in one statement, `ADD CONSTRAINT ... NOT VALID`,
-`ALTER COLUMN ... TYPE ... USING <expr>`, `ALTER COLUMN ... ADD GENERATED AS IDENTITY`, and a
-comma-separated list of actions.
+Not accepted: `ADD COLUMN ... FIRST | AFTER`, `ADD COLUMN ... PRIMARY KEY` (add the column, then
+`ADD CONSTRAINT ... PRIMARY KEY`), `DROP COLUMN ... CASCADE`, dropping several columns in one
+statement, `ADD CONSTRAINT ... NOT VALID`, `ALTER COLUMN ... TYPE ... USING <expr>`,
+`ALTER COLUMN ... ADD GENERATED AS IDENTITY`, and a comma-separated list of actions.
 
 ### Indexes
 
