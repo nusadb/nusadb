@@ -1,6 +1,6 @@
-//! `ON DELETE` referential actions follow the foreign keys of the rows they delete, to any depth:
-//! a cascade into a table whose rows are themselves referenced applies *those* foreign keys'
-//! actions too, the way a chain of `ON DELETE CASCADE` keys promises.
+//! `ON DELETE` and `ON UPDATE` referential actions follow the foreign keys of the rows they change,
+//! to any depth: an action on a table whose rows are themselves referenced applies *those* foreign
+//! keys' actions too, the way a chain of `CASCADE` keys promises.
 
 #![allow(
     clippy::unwrap_used,
@@ -353,4 +353,163 @@ fn two_set_null_keys_on_one_row_both_take_effect() {
         ),
         1
     );
+}
+
+/// Each row of `sql`'s single-column result, as integers (NULL as `-1`).
+fn column(engine: &'static BtreeEngine, session: &mut Session, sql: &str) -> Vec<i64> {
+    match run(engine, session, sql).unwrap() {
+        ExecutionResult::Rows { rows, .. } => rows
+            .into_iter()
+            .map(|r| match r.first() {
+                Some(Value::Int(n)) => *n,
+                Some(Value::Null) => -1,
+                other => panic!("expected an integer, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// A key change that cascades into a row whose own key others reference carries on to them.
+#[test]
+fn an_update_cascade_carries_down_the_chain() {
+    let (engine, mut session) = fresh();
+    for sql in [
+        "CREATE TABLE ua (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE ub (id BIGINT PRIMARY KEY REFERENCES ua (id) ON UPDATE CASCADE)",
+        "CREATE TABLE uc (id BIGINT PRIMARY KEY, b BIGINT REFERENCES ub (id) ON UPDATE CASCADE)",
+        "INSERT INTO ua VALUES (1), (2)",
+        "INSERT INTO ub VALUES (1), (2)",
+        "INSERT INTO uc VALUES (10, 1), (20, 2)",
+        "UPDATE ua SET id = 5 WHERE id = 1",
+    ] {
+        ok(engine, &mut session, sql);
+    }
+    assert_eq!(ids(engine, &mut session, "ub"), [2, 5]);
+    assert_eq!(
+        column(engine, &mut session, "SELECT b FROM uc ORDER BY id"),
+        [5, 2]
+    );
+}
+
+/// The same through composite keys, where the cascaded column is part of the next key.
+#[test]
+fn an_update_cascade_carries_through_composite_keys() {
+    let (engine, mut session) = fresh();
+    for sql in [
+        "CREATE TABLE cp (a BIGINT, b BIGINT, PRIMARY KEY (a, b))",
+        "CREATE TABLE cc (a BIGINT, b BIGINT, c BIGINT, PRIMARY KEY (a, b, c), \
+         FOREIGN KEY (a, b) REFERENCES cp (a, b) ON UPDATE CASCADE)",
+        "CREATE TABLE cg (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, c BIGINT, \
+         FOREIGN KEY (a, b, c) REFERENCES cc (a, b, c) ON UPDATE CASCADE)",
+        "INSERT INTO cp VALUES (1, 1)",
+        "INSERT INTO cc VALUES (1, 1, 5)",
+        "INSERT INTO cg VALUES (1, 1, 1, 5)",
+        "UPDATE cp SET a = 2",
+    ] {
+        ok(engine, &mut session, sql);
+    }
+    assert_eq!(column(engine, &mut session, "SELECT a FROM cg"), [2]);
+}
+
+/// A grandchild that may not follow refuses the whole update; one set to NULL follows.
+#[test]
+fn an_update_cascade_stops_where_the_next_key_may_not_change() {
+    for (action, refused) in [("NO ACTION", true), ("RESTRICT", true), ("SET NULL", false)] {
+        let (engine, mut session) = fresh();
+        for sql in [
+            "CREATE TABLE ra (id BIGINT PRIMARY KEY)".to_owned(),
+            "CREATE TABLE rb (id BIGINT PRIMARY KEY REFERENCES ra (id) ON UPDATE CASCADE)"
+                .to_owned(),
+            format!(
+                "CREATE TABLE rc (id BIGINT PRIMARY KEY, b BIGINT REFERENCES rb (id) ON UPDATE \
+                 {action})"
+            ),
+            "INSERT INTO ra VALUES (1)".to_owned(),
+            "INSERT INTO rb VALUES (1)".to_owned(),
+            "INSERT INTO rc VALUES (10, 1)".to_owned(),
+        ] {
+            ok(engine, &mut session, &sql);
+        }
+        let result = run(engine, &mut session, "UPDATE ra SET id = 5");
+        assert_eq!(result.is_err(), refused, "{action}: {result:?}");
+        let (a, b, c) = if refused { (1, 1, 1) } else { (5, 5, -1) };
+        assert_eq!(ids(engine, &mut session, "ra"), [a], "{action}");
+        assert_eq!(ids(engine, &mut session, "rb"), [b], "{action}");
+        assert_eq!(
+            column(engine, &mut session, "SELECT b FROM rc"),
+            [c],
+            "{action}"
+        );
+    }
+}
+
+/// A tall tree whose reference is part of its key carries a key change down every level without
+/// a deep stack.
+#[test]
+fn an_update_cascade_down_a_tall_tree_does_not_exhaust_the_stack() {
+    let (engine, mut session) = fresh();
+    ok(
+        engine,
+        &mut session,
+        "CREATE TABLE tree (tn BIGINT, id BIGINT, p BIGINT, PRIMARY KEY (tn, id), \
+         FOREIGN KEY (tn, p) REFERENCES tree (tn, id) ON UPDATE CASCADE)",
+    );
+    ok(engine, &mut session, "INSERT INTO tree VALUES (1, 0, NULL)");
+    ok(
+        engine,
+        &mut session,
+        "INSERT INTO tree SELECT 1, g, g - 1 FROM generate_series(1, 3000) AS g",
+    );
+    ok(engine, &mut session, "UPDATE tree SET tn = 9 WHERE id = 0");
+    assert_eq!(
+        column(
+            engine,
+            &mut session,
+            "SELECT count(*) FROM tree WHERE tn = 9"
+        ),
+        [3001]
+    );
+}
+
+/// An action that comes back round to a row the statement updates is refused, not overwritten.
+#[test]
+fn an_update_cascade_back_into_the_updated_row_is_refused() {
+    let (engine, mut session) = fresh();
+    for sql in [
+        "CREATE TABLE ct (id BIGINT PRIMARY KEY, r BIGINT UNIQUE)",
+        "CREATE TABLE cu (id BIGINT PRIMARY KEY REFERENCES ct (id) ON UPDATE CASCADE)",
+        "ALTER TABLE ct ADD CONSTRAINT ct_r FOREIGN KEY (r) REFERENCES cu (id) ON UPDATE CASCADE",
+        "INSERT INTO ct VALUES (1, NULL)",
+        "INSERT INTO cu VALUES (1)",
+        "UPDATE ct SET r = 1",
+    ] {
+        ok(engine, &mut session, sql);
+    }
+    let err = run(engine, &mut session, "UPDATE ct SET id = 5 WHERE id = 1").unwrap_err();
+    assert!(
+        err.to_string().contains("this statement also updates"),
+        "{err}"
+    );
+    assert_eq!(ids(engine, &mut session, "ct"), [1]);
+    assert_eq!(ids(engine, &mut session, "cu"), [1]);
+    assert_eq!(column(engine, &mut session, "SELECT r FROM ct"), [1]);
+}
+
+/// A key a delete's SET NULL clears passes the change on to the rows that reference it.
+#[test]
+fn a_delete_set_null_on_a_referenced_key_carries_on() {
+    let (engine, mut session) = fresh();
+    for sql in [
+        "CREATE TABLE na (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE nb (id BIGINT PRIMARY KEY, a BIGINT UNIQUE REFERENCES na (id) ON DELETE SET NULL)",
+        "CREATE TABLE nc (id BIGINT PRIMARY KEY, b BIGINT REFERENCES nb (a) ON UPDATE SET NULL)",
+        "INSERT INTO na VALUES (1)",
+        "INSERT INTO nb VALUES (10, 1)",
+        "INSERT INTO nc VALUES (100, 1)",
+        "DELETE FROM na",
+    ] {
+        ok(engine, &mut session, sql);
+    }
+    assert_eq!(column(engine, &mut session, "SELECT b FROM nc"), [-1]);
 }

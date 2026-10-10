@@ -3489,9 +3489,23 @@ fn cascade_delete_children(
 fn cascade_update_children(
     child: &TableSchema,
     changes: Vec<(Tid, Row, Row)>,
+    statement_rows: &HashSet<(nusadb_core::TableId, Tid)>,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<Vec<(Tid, Row, Row)>, Error> {
+    // A row the statement itself rewrites would be written again by the statement after this
+    // action, discarding the action's change: refuse rather than leave its reference behind.
+    if changes
+        .iter()
+        .any(|(tid, _, _)| statement_rows.contains(&(child.id, *tid)))
+    {
+        return Err(nusadb_core::Error::ConstraintViolation(format!(
+            "an ON UPDATE action would change a row of \"{}\" that this statement also \
+             updates; give that row its new values in this statement instead",
+            child.name
+        ))
+        .into());
+    }
     let triggers = super::trigger::load_table_triggers(
         &child.schema,
         &child.name,
@@ -3508,8 +3522,8 @@ fn cascade_update_children(
     } else {
         Vec::new()
     };
-    let mut olds: Vec<Row> = Vec::with_capacity(changes.len());
-    let mut news: Vec<Row> = Vec::with_capacity(changes.len());
+    // Each rewritten row at its new address, for the child's own foreign keys below.
+    let mut written: Vec<(Tid, Row, Row)> = Vec::with_capacity(changes.len());
     for (tid, old, mut new) in changes {
         let computed = triggers.has_before_row().then(|| new.clone());
         if triggers.fire_row_before(child, Some(&old), Some(&mut new), engine, txn)?
@@ -3544,13 +3558,15 @@ fn cascade_update_children(
         if triggers.has_after_row() {
             triggers.fire_row_after(child, Some(&old), Some(&new), engine, txn)?;
         }
-        olds.push(old);
-        news.push(new);
+        written.push((new_tid, old, new));
     }
     // Incremental view maintenance: apply the cascade rewrite's delta to any view over
     // the child, so a materialized view does not go stale after a cascade.
+    let olds: Vec<Row> = written.iter().map(|(_, old, _)| old.clone()).collect();
+    let news: Vec<Row> = written.iter().map(|(_, _, new)| new.clone()).collect();
     super::ivm::maintain_on_change(&child.name, &news, &olds, engine, txn)?;
-    Ok(())
+    // The caller carries on with these: the rewrite may change a key other rows reference.
+    Ok(written)
 }
 
 /// Build the `(tid, old, new)` triples for a `SET NULL` cascade: each `new` image is the referencing
@@ -3780,8 +3796,12 @@ impl DeleteWalk {
                 },
             }
         }
+        // A key a SET NULL rewrites may be referenced in turn: its own ON UPDATE actions run.
+        let no_statement_rows = HashSet::new();
         for (child, changes) in by_table {
-            cascade_update_children(&child, changes, engine, txn)?;
+            let written =
+                cascade_update_children(&child, changes, &no_statement_rows, engine, txn)?;
+            carry_update_actions(vec![(child, written)], &no_statement_rows, engine, txn)?;
         }
         for (child, rows) in cascades {
             cascade_delete_children(&child, rows, engine, txn)?;
@@ -3888,13 +3908,53 @@ fn enforce_fk_on_parent_update(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
+    let statement_rows: HashSet<(nusadb_core::TableId, Tid)> =
+        changes.iter().map(|(tid, _, _)| (table.id, *tid)).collect();
+    let first = parent_update_step(table, changes, &statement_rows, engine, txn)?;
+    carry_update_actions(first, &statement_rows, engine, txn)
+}
+
+/// Carry `ON UPDATE` actions on down from rows an action already rewrote: each batch may change
+/// keys other rows reference in turn, whose own actions then run, until no key moves. A worklist,
+/// not recursion, so a deep chain (a tall self-referencing tree) needs no deep stack.
+fn carry_update_actions(
+    batches: Vec<RewriteBatch>,
+    statement_rows: &HashSet<(nusadb_core::TableId, Tid)>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let mut work: std::collections::VecDeque<RewriteBatch> = batches.into();
+    while let Some((child, written)) = work.pop_front() {
+        work.extend(parent_update_step(
+            &child,
+            &written,
+            statement_rows,
+            engine,
+            txn,
+        )?);
+    }
+    Ok(())
+}
+
+/// One step of [`enforce_fk_on_parent_update`]: apply the `ON UPDATE` actions of the foreign keys
+/// pointing at `table` to the keys `changes` move, and return the rows those actions rewrote, by
+/// table, for the next step. `statement_rows` are the rows the statement itself writes, which an
+/// action may not change under it.
+fn parent_update_step(
+    table: &TableSchema,
+    changes: &[(Tid, Row, Row)],
+    statement_rows: &HashSet<(nusadb_core::TableId, Tid)>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<RewriteBatch>, Error> {
+    let mut rewritten = Vec::new();
     let fks: Vec<_> = engine
         .list_foreign_keys(table.id)?
         .into_iter()
         .filter(|fk| fk.parent_table == table.id)
         .collect();
     if fks.is_empty() {
-        return Ok(());
+        return Ok(rewritten);
     }
     for fk in &fks {
         // The parent key this FK references (a non-PK UNIQUE or the PRIMARY KEY) — resolved per FK,
@@ -3984,11 +4044,15 @@ fn enforce_fk_on_parent_update(
                         }
                         changes.push((tid, crow, updated));
                     }
-                    cascade_update_children(&child, changes, engine, txn)?;
+                    let written =
+                        cascade_update_children(&child, changes, statement_rows, engine, txn)?;
+                    rewritten.push((child.clone(), written));
                 },
                 nusadb_core::FkAction::SetNull => {
                     let changes = null_fk_changes(referencing, &child_ordinals)?;
-                    cascade_update_children(&child, changes, engine, txn)?;
+                    let written =
+                        cascade_update_children(&child, changes, statement_rows, engine, txn)?;
+                    rewritten.push((child.clone(), written));
                 },
                 nusadb_core::FkAction::SetDefault => {
                     return Err(Error::Unsupported(format!(
@@ -3999,7 +4063,7 @@ fn enforce_fk_on_parent_update(
             }
         }
     }
-    Ok(())
+    Ok(rewritten)
 }
 
 // === Secondary index maintenance =================================
