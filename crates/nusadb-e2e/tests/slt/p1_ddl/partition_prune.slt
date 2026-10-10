@@ -284,3 +284,98 @@ DROP TABLE y25
 
 statement ok
 DROP TABLE e
+
+# The WHERE's simple conditions also reach each partition kept after pruning, so a partition's own
+# index can serve them; the result is the same as without.
+statement ok
+CREATE TABLE pd (k INT NOT NULL, v INT, note TEXT) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE pd_1 PARTITION OF pd FOR VALUES FROM (0) TO (1000)
+
+statement ok
+CREATE TABLE pd_2 PARTITION OF pd FOR VALUES FROM (1000) TO (2000)
+
+statement ok
+CREATE INDEX pd_1_v ON pd_1 (v)
+
+statement ok
+INSERT INTO pd SELECT g, g % 97, CASE WHEN g % 5 = 0 THEN NULL ELSE 'n' END FROM generate_series(0, 1999) AS g
+
+statement ok
+ANALYZE pd_1
+
+query T
+EXPLAIN SELECT k FROM pd WHERE v = 3 AND k < 1000
+----
+Project (1 column(s))
+  Filter
+    Project (3 column(s))
+      SetOperation
+        Union ALL
+          Project (3 column(s))
+            Filter
+              SeqScan: pd
+          Project (3 column(s))
+            Filter
+              IndexScan: pd_1 using pd_1_v
+
+query I
+SELECT count(*) FROM pd WHERE v = 3 AND k < 1000
+----
+11
+
+query I
+SELECT count(*) FROM pd AS p WHERE p.v IN (3, 4) AND p.k BETWEEN 0 AND 1500
+----
+32
+
+query I
+SELECT count(*) FROM pd WHERE note IS NULL AND v <> k
+----
+380
+
+query I
+SELECT count(*) FROM pd WHERE NOT (note IS NOT NULL) AND v > 90
+----
+24
+
+# Under a join nothing is copied down: an outer join must still see the unmatched rows.
+statement ok
+CREATE TABLE pdj (k INT)
+
+statement ok
+INSERT INTO pdj VALUES (1), (2000)
+
+query II
+SELECT pdj.k, pd.k FROM pd RIGHT JOIN pdj ON pd.k = pdj.k WHERE pd.k IS NULL
+----
+2000 NULL
+
+# A condition on the enclosing query's row stays where it is.
+statement ok
+INSERT INTO pdj VALUES (3)
+
+query I
+SELECT count(*) FROM pdj WHERE EXISTS (SELECT 1 FROM pd WHERE pd.v = pdj.k AND pd.k > 500)
+----
+2
+
+# A sample is drawn before the WHERE applies: the same seed keeps the same rows as an unpartitioned
+# copy of the data.
+statement ok
+CREATE TABLE pd_plain (k INT NOT NULL, v INT, note TEXT)
+
+statement ok
+INSERT INTO pd_plain SELECT k, v, note FROM pd ORDER BY k
+
+statement ok
+CREATE TABLE pd_sampled (n BIGINT)
+
+statement ok
+INSERT INTO pd_sampled SELECT count(*) FROM pd TABLESAMPLE BERNOULLI (50) REPEATABLE (7) WHERE v < 10
+
+query B
+SELECT n = (SELECT count(*) FROM pd_plain TABLESAMPLE BERNOULLI (50) REPEATABLE (7) WHERE v < 10) FROM pd_sampled
+----
+1

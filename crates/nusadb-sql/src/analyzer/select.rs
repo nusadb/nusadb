@@ -236,10 +236,15 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
 fn expand_inheritance(
     parent: &TableSchema,
     descendants: &[String],
+    branch_filter: Option<&ast::Expr>,
     catalog: &dyn Catalog,
 ) -> Result<SelectPlan, Error> {
     let cols: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
-    let branch = |table: &str| ast::SelectBody::Select(Box::new(inheritance_branch(&cols, table)));
+    let branch = |table: &str| {
+        let mut select = inheritance_branch(&cols, table);
+        select.filter = branch_filter.cloned();
+        ast::SelectBody::Select(Box::new(select))
+    };
     // Every branch takes a schema-qualified key (bare = `public`) so a descendant living in another
     // schema resolves to exactly the recorded table, not a search-path lookalike.
     let mut body = branch(&super::qualified_display(&parent.schema, &parent.name));
@@ -260,6 +265,117 @@ fn expand_inheritance(
         },
         catalog,
     )
+}
+
+/// The conjuncts of `filter` (the query's `WHERE`) that each branch of an inheritance expansion can
+/// apply to its own table: a column of `parent` compared with a constant or another of its columns,
+/// tested with `IN` against constants, `BETWEEN` constants, or `IS [NOT] NULL`. Such a conjunct
+/// reads only the row, raises no error the full `WHERE` would not, and calls nothing, so repeating
+/// it below the union keeps the result while letting a branch use an index (the caller leaves out a
+/// sampled or joined parent, where filtering earlier would change which rows reach the rest).
+/// `qualifier` is the name the query gives the parent; references through it become bare column
+/// names in the branch.
+fn branch_filter(
+    filter: Option<&ast::Expr>,
+    qualifier: &str,
+    parent: &TableSchema,
+) -> Option<ast::Expr> {
+    fn conjuncts<'e>(expr: &'e ast::Expr, out: &mut Vec<&'e ast::Expr>) {
+        if let ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::And,
+            right,
+        } = expr
+        {
+            conjuncts(left, out);
+            conjuncts(right, out);
+        } else {
+            out.push(expr);
+        }
+    }
+    let column = |expr: &ast::Expr| -> Option<ast::Expr> {
+        let name = match expr {
+            ast::Expr::Column(name) => name,
+            ast::Expr::QualifiedColumn { table, column } if table == qualifier => column,
+            _ => return None,
+        };
+        parent
+            .columns
+            .iter()
+            .any(|c| &c.name == name)
+            .then(|| ast::Expr::Column(name.clone()))
+    };
+    let constant = |expr: &ast::Expr| -> bool {
+        match expr {
+            ast::Expr::Literal(_) | ast::Expr::Parameter(_) => true,
+            ast::Expr::Cast { expr, .. } | ast::Expr::Unary { expr, .. } => {
+                matches!(**expr, ast::Expr::Literal(_) | ast::Expr::Parameter(_))
+            },
+            _ => false,
+        }
+    };
+    let operand = |expr: &ast::Expr| -> Option<ast::Expr> {
+        column(expr).or_else(|| constant(expr).then(|| expr.clone()))
+    };
+    let mut parts = Vec::new();
+    conjuncts(filter?, &mut parts);
+    parts
+        .into_iter()
+        .filter_map(|part| match part {
+            ast::Expr::Binary { left, op, right }
+                if matches!(
+                    op,
+                    ast::BinaryOp::Eq
+                        | ast::BinaryOp::NotEq
+                        | ast::BinaryOp::Lt
+                        | ast::BinaryOp::LtEq
+                        | ast::BinaryOp::Gt
+                        | ast::BinaryOp::GtEq
+                ) =>
+            {
+                let (l, r) = (operand(left)?, operand(right)?);
+                // At least one side reads the row; two constants say nothing about it.
+                (matches!(l, ast::Expr::Column(_)) || matches!(r, ast::Expr::Column(_))).then(
+                    || ast::Expr::Binary {
+                        left: Box::new(l),
+                        op: *op,
+                        right: Box::new(r),
+                    },
+                )
+            },
+            ast::Expr::InList {
+                expr,
+                list,
+                negated,
+            } if list.iter().all(constant) => Some(ast::Expr::InList {
+                expr: Box::new(column(expr)?),
+                list: list.clone(),
+                negated: *negated,
+            }),
+            ast::Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+                symmetric,
+            } if constant(low) && constant(high) => Some(ast::Expr::Between {
+                expr: Box::new(column(expr)?),
+                low: low.clone(),
+                high: high.clone(),
+                negated: *negated,
+                symmetric: *symmetric,
+            }),
+            ast::Expr::IsNull { expr, negated } => Some(ast::Expr::IsNull {
+                expr: Box::new(column(expr)?),
+                negated: *negated,
+            }),
+            _ => None,
+        })
+        .reduce(|acc, next| ast::Expr::Binary {
+            left: Box::new(acc),
+            op: ast::BinaryOp::And,
+            right: Box::new(next),
+        })
 }
 
 /// One `SELECT col1, col2, ... FROM ONLY <table>` branch of an inheritance-expansion union. `table`
@@ -608,7 +724,7 @@ fn resolve_join_input(
         let descendants = catalog
             .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
         if !descendants.is_empty() {
-            let plan = expand_inheritance(&schema, &descendants, catalog)?;
+            let plan = expand_inheritance(&schema, &descendants, None, catalog)?;
             return Ok((schema, Some(Box::new(plan))));
         }
     }
@@ -683,7 +799,7 @@ pub(super) fn resolve_aux_relation(
             let descendants = catalog
                 .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
             if !descendants.is_empty() {
-                let plan = expand_inheritance(&schema, &descendants, catalog)?;
+                let plan = expand_inheritance(&schema, &descendants, None, catalog)?;
                 return Ok((schema, Some(plan)));
             }
         }
@@ -804,7 +920,22 @@ pub(super) fn resolve_from(
                             expanded_lock_tables.push(resolved);
                         }
                     }
-                    Some(expand_inheritance(&schema, &kept, catalog)?)
+                    // The WHERE's simple conditions on the parent's columns are repeated in each
+                    // branch, so a partition's own indexes can serve them (the WHERE still applies
+                    // above the union). Not under a join, where a condition copied below it could
+                    // change which rows come out NULL-extended, nor under TABLESAMPLE, which samples
+                    // the rows before the WHERE narrows them.
+                    let pushed = if from.joins.is_empty() && from.base.sample.is_none() {
+                        branch_filter(filter, base_qual, &schema)
+                    } else {
+                        None
+                    };
+                    Some(expand_inheritance(
+                        &schema,
+                        &kept,
+                        pushed.as_ref(),
+                        catalog,
+                    )?)
                 }
             } else {
                 None
