@@ -623,7 +623,8 @@ their rows stay readable through it. A partition takes all its columns from its 
 dropping, renaming or retyping one on the partition is refused (`42P16`). An inheritance child may
 add columns of its own, but cannot drop, rename or retype one its parent has, and neither kind of
 child can drop a `NOT NULL` its parent declares. A column in a partition key (at any level) cannot
-be dropped, renamed or retyped.
+be dropped or retyped; renaming it renames it in the key too, unless the key is an expression
+that names it.
 
 `ALTER TABLE t DISABLE TRIGGER name` and `ENABLE TRIGGER name` are shown under [Triggers](#triggers).
 

@@ -110,14 +110,68 @@ ALTER TABLE pa DROP COLUMN k
 statement error part of the partition key
 ALTER TABLE pa ALTER COLUMN d TYPE BIGINT
 
-statement error part of the partition key
-ALTER TABLE pa RENAME COLUMN d TO day
-
 statement ok
 CREATE TABLE empty_p (k INT NOT NULL, v INT) PARTITION BY LIST (k)
 
 statement error part of the partition key
 ALTER TABLE empty_p DROP COLUMN k
+
+# A key column can be renamed: the tables go on partitioning by it under the new name, at every
+# level, and routing and pruning follow.
+statement ok
+ALTER TABLE pa RENAME COLUMN d TO day
+
+statement ok
+INSERT INTO pa (k, day, c) VALUES (2, 12, 1)
+
+query II
+SELECT k, day FROM pa_2_lo WHERE day = 12
+----
+2 12
+
+statement error no partition
+INSERT INTO pa (k, day, c) VALUES (2, 500, 1)
+
+query I
+SELECT count(*) FROM pa WHERE k = 2 AND day < 100
+----
+4
+
+statement ok
+ALTER TABLE pa RENAME COLUMN k TO kind
+
+statement ok
+INSERT INTO pa (kind, day, c) VALUES (1, 13, 1)
+
+query I
+SELECT count(*) FROM pa_1 WHERE day = 13
+----
+1
+
+# A rename rolled back leaves the key as it was.
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE pa RENAME COLUMN day TO dd
+
+statement ok
+ROLLBACK
+
+statement ok
+INSERT INTO pa (kind, day, c) VALUES (2, 14, 1)
+
+query I
+SELECT count(*) FROM pa_2_lo WHERE day = 14
+----
+1
+
+# An expression key names the column in its stored SQL: renaming that column is refused.
+statement ok
+CREATE TABLE px (k INT NOT NULL) PARTITION BY RANGE ((k * 2))
+
+statement error part of the partition key
+ALTER TABLE px RENAME COLUMN k TO k2
 
 # A partition takes its columns from its parent.
 statement error cannot add column

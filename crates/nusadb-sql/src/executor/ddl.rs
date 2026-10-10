@@ -2412,9 +2412,24 @@ pub(super) fn run_alter_table(
     // them too: their rows are read through it, so their columns must stay its columns.
     refuse_inherited_column_change(&table, &op, engine, txn)?;
     let below = column_change_descendants(&table, &op, engine, txn)?;
+    let renamed = match &op {
+        AlterColumnOp::RenameColumn { index, to } => {
+            Some((column_name(&table, *index)?, to.clone()))
+        },
+        _ => None,
+    };
     apply_column_op(&table, &op, engine, txn)?;
     for (child, child_op) in &below {
         apply_column_op(child, child_op, engine, txn)?;
+    }
+    // A renamed partition-key column keeps partitioning its tables under the new name.
+    if let Some((from, to)) = renamed
+        && super::partition::has_any(engine, txn)?
+    {
+        for tree_table in std::iter::once(&table).chain(below.iter().map(|(child, _)| child)) {
+            let key = crate::analyzer::qualified_display(&tree_table.schema, &tree_table.name);
+            super::partition::rename_key_column(engine, txn, &key, &from, &to)?;
+        }
     }
     Ok(ExecutionResult::Altered)
 }
@@ -2684,8 +2699,9 @@ fn column_change_descendants(
             | AlterColumnOp::SetType { .. }
     );
     // The table's own partition key, even before it has partitions.
+    let renaming = matches!(op, AlterColumnOp::RenameColumn { .. });
     if reshapes && let Some(name) = &name {
-        refuse_partition_key_column(&key, name, engine, txn)?;
+        refuse_partition_key_column(&key, name, renaming, engine, txn)?;
     }
     if !super::inheritance::has_any(engine, txn)? {
         return Ok(Vec::new());
@@ -2696,7 +2712,7 @@ fn column_change_descendants(
     }
     if reshapes && let Some(name) = &name {
         for partitioned in &below {
-            refuse_partition_key_column(partitioned, name, engine, txn)?;
+            refuse_partition_key_column(partitioned, name, renaming, engine, txn)?;
         }
     }
     let mut out = Vec::with_capacity(below.len());
@@ -2764,14 +2780,17 @@ fn column_change_descendants(
 fn refuse_partition_key_column(
     key: &str,
     column: &str,
+    renaming: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
     let Some(parts) = super::partition::parent_key_parts(engine, txn, key)? else {
         return Ok(());
     };
+    // A rename carries a plain key column along (the recorded key is renamed with it); only an
+    // expression key, whose stored SQL names the column, stands in its way.
     let named = parts.iter().any(|part| match part {
-        super::partition::KeyPart::Column(c) => c == column,
+        super::partition::KeyPart::Column(c) => !renaming && c == column,
         super::partition::KeyPart::Expression(sql) => sql_mentions_column(sql, column),
     });
     if named {

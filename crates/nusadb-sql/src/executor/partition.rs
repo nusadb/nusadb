@@ -366,6 +366,61 @@ pub(super) fn remove_partition_entry(
     Ok(())
 }
 
+/// Rename the plain key column `from` of the partitioned table `table` to `to` in its recorded
+/// partition key, after the column itself was renamed. A table that does not partition by `from`
+/// is left alone. (An expression key naming the column is refused before the rename: its stored
+/// SQL would need rewriting.)
+pub(super) fn rename_key_column(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, PARTITION_CATALOG)? else {
+        return Ok(());
+    };
+    let mut found = None;
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &PARTITION_CATALOG_SCHEMA)?;
+        if field(&row, 0) == "parent" && field(&row, 1) == table {
+            found = Some((tid, row));
+            break;
+        }
+    }
+    drop(scan);
+    let Some((tid, mut row)) = found else {
+        return Ok(());
+    };
+    let parts: Vec<KeyPart> = field(&row, 2).split(KEY_SEP).map(KeyPart::decode).collect();
+    if !parts
+        .iter()
+        .any(|part| matches!(part, KeyPart::Column(name) if name == from))
+    {
+        return Ok(());
+    }
+    let aux = parts
+        .into_iter()
+        .map(|part| match part {
+            KeyPart::Column(name) if name == from => KeyPart::Column(to.to_owned()),
+            other => other,
+        })
+        .map(|part| part.encode())
+        .collect::<Vec<_>>()
+        .join(&KEY_SEP.to_string());
+    if let Some(slot) = row.get_mut(2) {
+        *slot = text(&aux);
+    }
+    engine.update(
+        txn,
+        cat.id,
+        tid,
+        &row::encode(&row, &PARTITION_CATALOG_SCHEMA)?,
+    )?;
+    Ok(())
+}
+
 /// Remove every partition-catalog row naming `table` (as parent or partition), on DROP.
 pub(super) fn remove_for(engine: &dyn StorageEngine, txn: TxnId, table: &str) -> Result<(), Error> {
     let Some(cat) = engine.lookup_table_as_of(txn, PARTITION_CATALOG)? else {
