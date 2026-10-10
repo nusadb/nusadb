@@ -601,11 +601,20 @@ CREATE TRIGGER seen BEFORE DELETE ON rcas FOR EACH ROW EXECUTE FUNCTION seen()
 statement ok
 BEGIN
 
+statement ok
+SAVEPOINT before_delete
+
 statement error violates foreign key
 DELETE FROM rpar
 
+statement ok
+ROLLBACK TO before_delete
+
 statement error violates foreign key
 MERGE INTO rpar USING (VALUES (2)) AS s (id) ON rpar.id = s.id WHEN MATCHED THEN DELETE
+
+statement ok
+ROLLBACK TO before_delete
 
 statement ok
 COMMIT
