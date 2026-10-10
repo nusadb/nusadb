@@ -117,20 +117,8 @@ pub(super) fn analyze_create_table(
     let foreign_keys = resolve_foreign_keys(&ct, &name_base)?;
     let check_constraints = resolve_check_constraints(&ct, &name_base, catalog)?;
     let defaults = resolve_column_defaults(&ct, &name_base, catalog)?;
-    // A CHECK / FOREIGN KEY on a partitioned parent would need cross-partition enforcement, which
-    // NusaDB does not propagate yet — refuse loudly rather than mis-accept. The synthetic
-    // type-range checks (a narrow integer's bound) are excluded: each partition regenerates them
-    // from its copied columns, so they are enforced where the rows actually live.
-    let explicit_check = check_constraints
-        .iter()
-        .any(|c| !c.name.starts_with(SYNTHETIC_TYPE_CHECK_PREFIX));
-    if partition_by.is_some() && (!foreign_keys.is_empty() || explicit_check) {
-        return Err(Error::Unsupported(
-            "a CHECK / FOREIGN KEY constraint on a partitioned table is not supported yet (it \
-             would not be enforced across partitions)"
-                .to_owned(),
-        ));
-    }
+    // A CHECK / FOREIGN KEY on a partitioned parent is declared on the parent and copied onto each
+    // partition as it joins (the executor), where the rows live.
     // A PRIMARY KEY / UNIQUE on the parent IS supported when it includes every partition-key
     // column: equal keys then always route to the same partition, so per-partition enforcement
     // (the executor copies the constraint onto each partition) is globally sound — the reference

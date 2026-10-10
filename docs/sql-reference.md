@@ -529,6 +529,14 @@ rows route to their partition first, then the upsert action runs against that le
 that would move the row out of its partition is refused; a plain `UPDATE` through the parent
 moves it (see the partitioning section).
 
+A `CHECK` or `FOREIGN KEY` on a partitioned parent holds for every partition the same way,
+declared in `CREATE TABLE` or added later with `ALTER TABLE ... ADD CONSTRAINT`, which also checks
+the rows already in the partitions (and refuses the statement when one breaks it). Each partition
+carries a copy named after it (`fact_v_check` on `fact` is `fact_01_v_check` on `fact_01`): the
+copy cannot be dropped on its own (`42P16`), dropping the constraint on the parent drops every
+copy, and a partition that is detached keeps its copies as its own constraints. A key added this
+way that is `UNIQUE` or `PRIMARY KEY` must include every partition-key column too (`0A000`).
+
 A range bound element may be `MINVALUE` or `MAXVALUE` to leave that side open —
 `FROM (MINVALUE) TO (0)` holds every key below zero, `FROM (10) TO (MAXVALUE)` everything from
 ten up, and a multi-column bound can pin the leading column and leave the rest open
@@ -542,9 +550,8 @@ stable (a volatile key would route the same row differently each time; `42P17`),
 reads must be provided in the `INSERT` (routing does not evaluate defaults), and a unique
 constraint can never cover an expression key, so declaring one on such a parent is refused.
 
-Not accepted: `LIST` with more than one key column,
-non-literal bounds, a partition declaring its own columns, and
-`CHECK` / `FOREIGN KEY` on a partitioned parent (they would not span partitions).
+Not accepted: `LIST` with more than one key column, non-literal bounds, a partition declaring
+its own columns, and a `FOREIGN KEY` that references a partitioned table.
 
 ### Inherited tables
 

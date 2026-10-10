@@ -1,0 +1,299 @@
+# Constraints on a partitioned table hold for every row, and the rows live in the partitions: a
+# CHECK, FOREIGN KEY, PRIMARY KEY or UNIQUE declared on the parent (at CREATE TABLE or by ALTER
+# TABLE ADD CONSTRAINT) applies to every partition, existing or created or attached later.
+
+statement ok
+CREATE TABLE ws (ws INT PRIMARY KEY)
+
+statement ok
+INSERT INTO ws VALUES (1), (2)
+
+statement ok
+CREATE TABLE fact (ws INT NOT NULL REFERENCES ws (ws) ON DELETE CASCADE, d DATE NOT NULL, v BIGINT NOT NULL CHECK (v >= 0), PRIMARY KEY (ws, d)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE fact_01 PARTITION OF fact FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement error violates check constraint
+INSERT INTO fact VALUES (1, '2026-01-10', -5)
+
+statement error violates foreign key
+INSERT INTO fact VALUES (9, '2026-01-10', 5)
+
+statement error violates check constraint
+INSERT INTO fact_01 VALUES (1, '2026-01-11', -1)
+
+statement ok
+INSERT INTO fact VALUES (1, '2026-01-10', 5), (2, '2026-01-10', 6)
+
+statement error duplicate key
+INSERT INTO fact VALUES (1, '2026-01-10', 7)
+
+# A table attached later is checked against them, and refused when a row breaks one.
+statement ok
+CREATE TABLE fact_02 (ws INT NOT NULL, d DATE NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (ws, d))
+
+statement ok
+INSERT INTO fact_02 VALUES (1, '2026-02-05', -3)
+
+statement error violated by an existing row
+ALTER TABLE fact ATTACH PARTITION fact_02 FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+
+statement ok
+UPDATE fact_02 SET v = 3
+
+statement ok
+INSERT INTO fact_02 VALUES (7, '2026-02-06', 1)
+
+statement error foreign key
+ALTER TABLE fact ATTACH PARTITION fact_02 FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+
+statement ok
+DELETE FROM fact_02 WHERE ws = 7
+
+statement ok
+ALTER TABLE fact ATTACH PARTITION fact_02 FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+
+statement error violates check constraint
+INSERT INTO fact VALUES (2, '2026-02-07', -1)
+
+# The referenced row's delete cascades into every partition.
+statement ok
+DELETE FROM ws WHERE ws = 1
+
+query IT
+SELECT ws, d FROM fact ORDER BY d, ws
+----
+2 2026-01-10
+
+# A detached partition keeps the constraints as its own.
+statement ok
+ALTER TABLE fact DETACH PARTITION fact_02
+
+statement error violates check constraint
+INSERT INTO fact_02 VALUES (2, '2026-02-20', -9)
+
+# Sub-partitions: the constraint reaches the leaves.
+statement ok
+CREATE TABLE fact_03 PARTITION OF fact FOR VALUES FROM ('2026-03-01') TO ('2026-04-01') PARTITION BY LIST (ws)
+
+statement ok
+CREATE TABLE fact_03_a PARTITION OF fact_03 FOR VALUES IN (2)
+
+statement error violates check constraint
+INSERT INTO fact VALUES (2, '2026-03-02', -2)
+
+statement error violates check constraint
+INSERT INTO fact_03_a VALUES (2, '2026-03-02', -2)
+
+# ALTER TABLE ADD CONSTRAINT on a partitioned table reaches the partitions it already has,
+# including sub-partitions, and checks their rows.
+statement ok
+CREATE TABLE rf (k INT PRIMARY KEY)
+
+statement ok
+INSERT INTO rf VALUES (1), (2)
+
+statement ok
+CREATE TABLE ev (k INT NOT NULL, d DATE NOT NULL, v BIGINT NOT NULL) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE ev_01 PARTITION OF ev FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement ok
+CREATE TABLE ev_02 PARTITION OF ev FOR VALUES FROM ('2026-02-01') TO ('2026-03-01') PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE ev_02_a PARTITION OF ev_02 FOR VALUES IN (1, 2)
+
+statement ok
+INSERT INTO ev VALUES (1, '2026-01-10', 5), (2, '2026-02-10', -5)
+
+# An existing row breaks the check: the statement is refused and nothing of it remains.
+statement error violated by an existing row
+ALTER TABLE ev ADD CONSTRAINT ev_v_ck CHECK (v >= 0)
+
+statement ok
+INSERT INTO ev VALUES (1, '2026-01-11', -7)
+
+statement ok
+DELETE FROM ev WHERE v < 0
+
+statement ok
+ALTER TABLE ev ADD CONSTRAINT ev_v_ck CHECK (v >= 0)
+
+statement ok
+ALTER TABLE ev ADD CONSTRAINT ev_k_fk FOREIGN KEY (k) REFERENCES rf (k) ON DELETE CASCADE
+
+statement ok
+ALTER TABLE ev ADD CONSTRAINT ev_uq UNIQUE (d, k)
+
+statement error violates check constraint
+INSERT INTO ev VALUES (1, '2026-01-12', -1)
+
+statement error violates check constraint
+INSERT INTO ev VALUES (2, '2026-02-12', -1)
+
+statement error violates foreign key
+INSERT INTO ev VALUES (9, '2026-01-12', 1)
+
+statement ok
+INSERT INTO ev VALUES (2, '2026-02-12', 1)
+
+statement error duplicate key
+INSERT INTO ev VALUES (2, '2026-02-12', 3)
+
+# The copy on the sub-partition cascades too.
+statement ok
+INSERT INTO rf VALUES (3)
+
+statement ok
+CREATE TABLE ev_02_b PARTITION OF ev_02 FOR VALUES IN (3)
+
+statement ok
+INSERT INTO ev VALUES (3, '2026-02-20', 1)
+
+statement ok
+DELETE FROM rf WHERE k = 3
+
+query I
+SELECT count(*) FROM ev WHERE k = 3
+----
+0
+
+# A unique key must include the partition key, as at CREATE TABLE.
+statement error must include all partitioning columns
+ALTER TABLE ev ADD CONSTRAINT ev_v_uq UNIQUE (v)
+
+# The partition's copy belongs to the parent: it cannot be dropped on the partition.
+statement error cannot drop inherited constraint
+ALTER TABLE ev_01 DROP CONSTRAINT ev_01_v_ck
+
+# Dropping it on the parent drops it everywhere.
+statement ok
+ALTER TABLE ev DROP CONSTRAINT ev_v_ck
+
+statement ok
+INSERT INTO ev VALUES (1, '2026-01-13', -1), (2, '2026-02-13', -1)
+
+statement ok
+ALTER TABLE ev DROP CONSTRAINT ev_k_fk
+
+statement ok
+INSERT INTO ev VALUES (9, '2026-01-14', 1)
+
+query I
+SELECT count(*) FROM ev
+----
+5
+
+# A foreign key cannot reference a partitioned table itself (it holds no rows of its own).
+statement error references the partitioned table
+CREATE TABLE refs (r INT REFERENCES fact (ws))
+
+statement ok
+CREATE TABLE refs (r INT)
+
+statement error references the partitioned table
+ALTER TABLE refs ADD CONSTRAINT refs_r FOREIGN KEY (r) REFERENCES ev (k)
+
+# An attached table that is itself partitioned: its partitions hold the rows, so they are checked
+# and take the constraints.
+statement ok
+CREATE TABLE sp (k INT NOT NULL, d DATE NOT NULL, v BIGINT NOT NULL CHECK (v >= 0)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE sp_01 (k INT NOT NULL, d DATE NOT NULL, v BIGINT NOT NULL) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE sp_01_a PARTITION OF sp_01 FOR VALUES IN (1, 2)
+
+statement ok
+INSERT INTO sp_01 VALUES (1, '2026-01-03', -4)
+
+statement error violated by an existing row
+ALTER TABLE sp ATTACH PARTITION sp_01 FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement ok
+DELETE FROM sp_01
+
+statement ok
+ALTER TABLE sp ATTACH PARTITION sp_01 FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement error violates check constraint
+INSERT INTO sp_01_a VALUES (1, '2026-01-03', -4)
+
+# A partition's own constraint that already enforces the parent's rule stands in for the copy, so
+# it cannot be dropped either.
+statement ok
+CREATE TABLE own (k INT NOT NULL, v BIGINT NOT NULL, CONSTRAINT own_v CHECK (v >= 0)) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE own_1 (k INT NOT NULL, v BIGINT NOT NULL, CONSTRAINT mine CHECK (v >= 0))
+
+statement ok
+ALTER TABLE own ATTACH PARTITION own_1 FOR VALUES IN (1)
+
+statement error cannot drop inherited constraint
+ALTER TABLE own_1 DROP CONSTRAINT mine
+
+statement error violates check constraint
+INSERT INTO own VALUES (1, -1)
+
+# Outside the public schema: unnamed constraints are copied and dropped with the parent's.
+statement ok
+CREATE SCHEMA app
+
+statement ok
+CREATE TABLE app.f (k INT NOT NULL, v BIGINT NOT NULL CHECK (v >= 0)) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE app.f_1 PARTITION OF app.f FOR VALUES IN (1)
+
+statement error violates check constraint
+INSERT INTO app.f VALUES (1, -1)
+
+statement error cannot drop inherited constraint
+ALTER TABLE app.f_1 DROP CONSTRAINT "app.f_1_check1"
+
+statement ok
+ALTER TABLE app.f DROP CONSTRAINT "app.f_check1"
+
+statement ok
+INSERT INTO app.f VALUES (1, -1)
+
+# A unique key must also include the partition key of every sub-partitioned partition below the
+# table, or equal keys could sit in two leaves: refused when the key is added, when such a
+# partition is created, and when one is attached.
+statement ok
+CREATE TABLE uq (k INT NOT NULL, d INT NOT NULL) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE uq_1 PARTITION OF uq FOR VALUES FROM (0) TO (100) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE uq_1_a PARTITION OF uq_1 FOR VALUES IN (1)
+
+statement error must include all partitioning columns
+ALTER TABLE uq ADD CONSTRAINT uq_d UNIQUE (d)
+
+statement ok
+ALTER TABLE uq ADD CONSTRAINT uq_dk UNIQUE (d, k)
+
+statement ok
+CREATE TABLE pk (k INT NOT NULL, d INT NOT NULL, PRIMARY KEY (d)) PARTITION BY RANGE (d)
+
+statement error must include all partitioning columns
+CREATE TABLE pk_1 PARTITION OF pk FOR VALUES FROM (0) TO (100) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE pk_2 (k INT NOT NULL, d INT NOT NULL) PARTITION BY LIST (k)
+
+statement error must include all partitioning columns
+ALTER TABLE pk ATTACH PARTITION pk_2 FOR VALUES FROM (100) TO (200)
+
+statement ok
+CREATE TABLE pk_3 (k INT NOT NULL, d INT NOT NULL) PARTITION BY RANGE (d)
+
+statement ok
+ALTER TABLE pk ATTACH PARTITION pk_3 FOR VALUES FROM (100) TO (200)

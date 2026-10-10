@@ -300,33 +300,43 @@ pub(super) fn run_create_table(
     }
     if let Some(part) = &plan.partition_of {
         register_partition(&def, part, engine, txn)?;
-        propagate_parent_unique_constraints(&def, id, part, false, engine, txn)?;
+        propagate_parent_constraints(
+            &def,
+            id,
+            &part.parent_schema,
+            &part.parent,
+            false,
+            engine,
+            txn,
+        )?;
     }
     Ok(ExecutionResult::Created(id))
 }
 
-/// Register a `PARTITION OF parent FOR VALUES ...` partition: the parent must be partitioned, the
-/// bound's kind must match the parent's strategy, its values are coerced to the key column's type and
-/// validated (range `lo < hi` + non-overlap; list values not already claimed; hash modulus/remainder
-/// consistent), and the partition joins the parent's inheritance set so a query on the parent reads
-/// its rows.
-/// Copy the partitioned parent's `PRIMARY KEY` / `UNIQUE` constraints onto a partition joining
-/// it (at `CREATE TABLE ... PARTITION OF` or `ATTACH PARTITION`). The analyzer only admits a
-/// parent constraint that includes every partition-key column, so equal keys always route to the
-/// same partition and per-partition enforcement is globally sound. The copy takes the partition's
-/// name prefix (`orders_pkey` on parent `orders` becomes `orders_q1_pkey` on partition
-/// `orders_q1`). `validate` is set on ATTACH, whose partition may already hold rows — they must
-/// satisfy the constraint before it is declared; a partition that already declares an equivalent
-/// constraint (same columns, kind, and NULLS treatment) keeps its own.
-fn propagate_parent_unique_constraints(
+/// Copy a partitioned parent's constraints onto a partition joining it (at `CREATE TABLE ...
+/// PARTITION OF` or `ATTACH PARTITION`), or onto an existing partition when the parent gains one
+/// (`ALTER TABLE parent ADD CONSTRAINT`): `PRIMARY KEY` / `UNIQUE`, `CHECK` and `FOREIGN KEY`. A
+/// constraint on a partitioned table holds for every row, and its rows live in the partitions.
+///
+/// A `PRIMARY KEY` / `UNIQUE` must include every partition-key column of the parent and, when the
+/// partition is itself partitioned, of the partition too, so equal keys always route to the same
+/// leaf and per-leaf enforcement is globally sound. A copy takes the partition's name prefix
+/// (`orders_pkey` on parent `orders` becomes `orders_q1_pkey` on partition `orders_q1`; see
+/// [`partition_constraint_name`]).
+/// `validate` is set when the partition may already hold rows: they must satisfy the constraint
+/// before it is declared. A partition that already declares an equivalent constraint keeps its own.
+/// The synthetic type-range checks are not copied: each partition regenerates them from its own
+/// columns.
+fn propagate_parent_constraints(
     def: &nusadb_core::TableDef,
     id: nusadb_core::TableId,
-    part: &crate::planner::PartitionOfPlan,
+    parent_schema: &str,
+    parent_name: &str,
     validate: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let Some(parent) = engine.lookup_table_as_of_in(txn, &part.parent_schema, &part.parent)? else {
+    let Some(parent) = engine.lookup_table_as_of_in(txn, parent_schema, parent_name)? else {
         return Ok(());
     };
     let existing = engine.list_constraints(id)?;
@@ -335,6 +345,14 @@ fn propagate_parent_unique_constraints(
         if !(primary || matches!(c.kind, nusadb_core::ConstraintKind::Unique)) {
             continue;
         }
+        refuse_unique_without_partition_key(
+            &def.schema,
+            &def.name,
+            &c.name,
+            &c.columns,
+            engine,
+            txn,
+        )?;
         let already = existing.iter().any(|e| {
             e.kind == c.kind
                 && e.columns == c.columns
@@ -376,13 +394,11 @@ fn propagate_parent_unique_constraints(
                 txn,
             )?;
         }
-        let renamed = c
-            .name
-            .strip_prefix(&format!("{}_", parent.name))
-            .map_or_else(
-                || format!("{}_{}", def.name, c.name),
-                |rest| format!("{}_{rest}", def.name),
-            );
+        let renamed = partition_constraint_name(
+            &crate::analyzer::qualified_display(&def.schema, &def.name),
+            &crate::analyzer::qualified_display(&parent.schema, &parent.name),
+            &c.name,
+        );
         let index = engine.add_unique_constraint(
             txn,
             id,
@@ -420,9 +436,364 @@ fn propagate_parent_unique_constraints(
             }
         }
     }
+    propagate_parent_checks(def, id, &parent, validate, engine, txn)?;
+    propagate_parent_foreign_keys(def, id, &parent, validate, engine, txn)
+}
+
+/// The name a partition's copy of its parent's constraint `name` takes: the parent's name prefix
+/// replaced by the partition's (`orders_pkey` on `orders` → `orders_q1_pkey` on `orders_q1`), or
+/// the partition's name prepended when the constraint does not start with the parent's. Both are
+/// given as schema-qualified keys (bare in `public`), the base `CREATE TABLE` names constraints by,
+/// so same-named partitions in two schemas do not collide.
+fn partition_constraint_name(partition: &str, parent: &str, name: &str) -> String {
+    name.strip_prefix(&format!("{parent}_")).map_or_else(
+        || format!("{partition}_{name}"),
+        |rest| format!("{partition}_{rest}"),
+    )
+}
+
+/// The `CHECK` half of [`propagate_parent_constraints`].
+fn propagate_parent_checks(
+    def: &nusadb_core::TableDef,
+    id: nusadb_core::TableId,
+    parent: &TableSchema,
+    validate: bool,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let existing = engine.list_constraints(id)?;
+    let partition_key = crate::analyzer::qualified_display(&def.schema, &def.name);
+    let parent_key = crate::analyzer::qualified_display(&parent.schema, &parent.name);
+    let schema = if validate {
+        Some(
+            engine
+                .lookup_table_as_of_in(txn, &def.schema, &def.name)?
+                .ok_or_else(|| Error::TableNotFound {
+                    name: def.name.clone(),
+                })?,
+        )
+    } else {
+        None
+    };
+    for c in engine.list_constraints(parent.id)? {
+        if c.kind != nusadb_core::ConstraintKind::Check
+            || c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+        {
+            continue;
+        }
+        let Some(expr) = c.expr else { continue };
+        if existing
+            .iter()
+            .any(|e| e.kind == nusadb_core::ConstraintKind::Check && e.expr.as_ref() == Some(&expr))
+        {
+            continue;
+        }
+        let renamed = partition_constraint_name(&partition_key, &parent_key, &c.name);
+        if let Some(schema) = &schema {
+            let sql = String::from_utf8(expr.clone()).map_err(|_| {
+                nusadb_core::Error::ConstraintViolation(format!(
+                    "check constraint \"{}\" has a corrupt (non-UTF-8) predicate",
+                    c.name
+                ))
+            })?;
+            let predicate =
+                crate::analyzer::analyze_check_predicate(&sql, schema, &dml::EmptyCatalog)?;
+            for row in &scan_rows(schema, engine, txn)? {
+                if matches!(eval::eval(&predicate, row)?, ast::Value::Bool(false)) {
+                    return Err(nusadb_core::Error::ConstraintViolation(format!(
+                        "check constraint \"{}\" is violated by an existing row in \"{}\"",
+                        c.name, def.name
+                    ))
+                    .into());
+                }
+            }
+        }
+        engine.add_check_constraint(txn, id, &renamed, &expr)?;
+    }
     Ok(())
 }
 
+/// The `FOREIGN KEY` half of [`propagate_parent_constraints`]: the keys the parent declares as the
+/// referencing side.
+fn propagate_parent_foreign_keys(
+    def: &nusadb_core::TableDef,
+    id: nusadb_core::TableId,
+    parent: &TableSchema,
+    validate: bool,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let existing = engine.list_foreign_keys(id)?;
+    for fk in engine.list_foreign_keys(parent.id)? {
+        if fk.child_table != parent.id {
+            continue;
+        }
+        let already = existing.iter().any(|e| {
+            e.child_table == id
+                && e.child_columns == fk.child_columns
+                && e.parent_table == fk.parent_table
+                && e.parent_columns == fk.parent_columns
+        });
+        if already {
+            continue;
+        }
+        engine.add_foreign_key(
+            txn,
+            &nusadb_core::ForeignKeyDef {
+                name: partition_constraint_name(
+                    &crate::analyzer::qualified_display(&def.schema, &def.name),
+                    &crate::analyzer::qualified_display(&parent.schema, &parent.name),
+                    &fk.name,
+                ),
+                child_table: id,
+                ..fk
+            },
+        )?;
+        if validate {
+            let schema = engine
+                .lookup_table_as_of_in(txn, &def.schema, &def.name)?
+                .ok_or_else(|| Error::TableNotFound {
+                    name: def.name.clone(),
+                })?;
+            let rows = scan_rows(&schema, engine, txn)?;
+            dml::enforce_fk_on_child_write(&schema, &rows, &[], engine, txn)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `PRIMARY KEY` / `UNIQUE` on a partitioned table that leaves out a partition-key column:
+/// equal keys could then land in different partitions, where no single index sees both (the rule
+/// `CREATE TABLE` applies).
+fn refuse_unique_without_partition_key(
+    schema: &str,
+    table: &str,
+    name: &str,
+    columns: &[String],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if !super::partition::has_any(engine, txn)? {
+        return Ok(());
+    }
+    let key = crate::analyzer::qualified_display(schema, table);
+    let Some(parts) = super::partition::parent_key_parts(engine, txn, &key)? else {
+        return Ok(());
+    };
+    let missing = parts.iter().find_map(|part| match part {
+        super::partition::KeyPart::Column(column) => {
+            (!columns.contains(column)).then_some(column.as_str())
+        },
+        super::partition::KeyPart::Expression(sql) => Some(sql.as_str()),
+    });
+    if let Some(missing) = missing {
+        return Err(Error::Coded {
+            message: format!(
+                "unique constraint on partitioned table must include all partitioning columns: \
+                 \"{missing}\" is part of the partition key but not of the constraint \"{name}\""
+            ),
+            sqlstate: "0A000",
+        });
+    }
+    Ok(())
+}
+
+/// The partitions below `table` (nearest first) as `(schema, name, direct parent key)`, the key
+/// schema-qualified (bare in `public`).
+fn partitions_below(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, String, String)>, Error> {
+    let mut out = Vec::new();
+    if !super::partition::has_any(engine, txn)? {
+        return Ok(out);
+    }
+    let edges = super::partition::partition_edges(engine, txn)?;
+    let mut level = vec![crate::analyzer::qualified_display(
+        &table.schema,
+        &table.name,
+    )];
+    while !level.is_empty() && out.len() <= edges.len() {
+        let mut next = Vec::new();
+        for above in &level {
+            for (child, _) in edges.iter().filter(|(_, p)| p == above) {
+                let (child_schema, child_name) = crate::analyzer::split_qualified(child);
+                out.push((
+                    child_schema
+                        .unwrap_or(nusadb_core::PUBLIC_SCHEMA)
+                        .to_owned(),
+                    child_name.to_owned(),
+                    above.clone(),
+                ));
+                next.push(child.clone());
+            }
+        }
+        level = next;
+    }
+    Ok(out)
+}
+
+/// Drop the partitions' copies of the constraint `name` being dropped from the partitioned table
+/// `table`: a constraint on a partitioned table exists only as those copies' source.
+fn drop_partition_copies(
+    table: nusadb_core::TableId,
+    name: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(schema) = schema_by_id(engine, table)? else {
+        return Ok(());
+    };
+    // Each level's copy is named after its own parent's: walk down renaming as the copies did.
+    let mut names: Vec<(String, String)> = vec![(
+        crate::analyzer::qualified_display(&schema.schema, &schema.name),
+        name.to_owned(),
+    )];
+    for (child_schema, child, parent) in partitions_below(&schema, engine, txn)? {
+        let Some(parent_copy) = names
+            .iter()
+            .find(|(t, _)| *t == parent)
+            .map(|(_, n)| n.clone())
+        else {
+            continue;
+        };
+        let child_key = crate::analyzer::qualified_display(&child_schema, &child);
+        let copy = partition_constraint_name(&child_key, &parent, &parent_copy);
+        if let Some(child_table) = engine.lookup_table_as_of_in(txn, &child_schema, &child)? {
+            let has = engine
+                .list_constraints(child_table.id)?
+                .iter()
+                .any(|c| c.name == copy)
+                || engine
+                    .list_foreign_keys(child_table.id)?
+                    .iter()
+                    .any(|fk| fk.name == copy && fk.child_table == child_table.id);
+            if has {
+                engine.drop_constraint(txn, child_table.id, &copy)?;
+            }
+        }
+        names.push((child_key, copy));
+    }
+    Ok(())
+}
+
+/// Refuse dropping, on a partition, the copy of a constraint its partitioned parent declares: the
+/// parent's constraint holds for every partition (drop it on the parent instead).
+fn refuse_dropping_inherited_constraint(
+    table: nusadb_core::TableId,
+    name: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if !super::partition::has_any(engine, txn)? {
+        return Ok(());
+    }
+    let Some(schema) = schema_by_id(engine, table)? else {
+        return Ok(());
+    };
+    let key = crate::analyzer::qualified_display(&schema.schema, &schema.name);
+    let Some(parent_key) = super::partition::partition_parent(engine, txn, &key)? else {
+        return Ok(());
+    };
+    let (parent_schema, parent_name) = crate::analyzer::split_qualified(&parent_key);
+    let Some(parent) = engine.lookup_table_as_of_in(
+        txn,
+        parent_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+        parent_name,
+    )?
+    else {
+        return Ok(());
+    };
+    let parent_key = crate::analyzer::qualified_display(&parent.schema, &parent.name);
+    let parent_constraints = engine.list_constraints(parent.id)?;
+    let parent_fks: Vec<_> = engine
+        .list_foreign_keys(parent.id)?
+        .into_iter()
+        .filter(|fk| fk.child_table == parent.id)
+        .collect();
+    // The partition's copy of a parent constraint, by name.
+    let copy = parent_constraints
+        .iter()
+        .map(|c| c.name.as_str())
+        .chain(parent_fks.iter().map(|fk| fk.name.as_str()))
+        .any(|parent_constraint| {
+            partition_constraint_name(&key, &parent_key, parent_constraint) == name
+        });
+    // Or a constraint of the partition's own that stands in for one: the copy is not made when
+    // the partition already declares the same rule, so this one is what enforces the parent's.
+    let own = engine.list_constraints(table)?;
+    let standing_in = own.iter().filter(|c| c.name == name).any(|c| {
+        parent_constraints.iter().any(|p| {
+            p.kind == c.kind
+                && match c.kind {
+                    nusadb_core::ConstraintKind::Check => {
+                        p.expr == c.expr && !p.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+                    },
+                    _ => p.columns == c.columns && p.nulls_not_distinct == c.nulls_not_distinct,
+                }
+        })
+    }) || engine
+        .list_foreign_keys(table)?
+        .iter()
+        .filter(|fk| fk.name == name && fk.child_table == table)
+        .any(|fk| {
+            parent_fks.iter().any(|p| {
+                p.child_columns == fk.child_columns
+                    && p.parent_table == fk.parent_table
+                    && p.parent_columns == fk.parent_columns
+            })
+        });
+    let inherited = copy || standing_in;
+    if inherited {
+        return Err(Error::Coded {
+            message: format!(
+                "cannot drop inherited constraint \"{name}\" of relation \"{}\"; drop it on \
+                 \"{}\" instead",
+                schema.name, parent.name
+            ),
+            sqlstate: "42P16", // invalid_table_definition
+        });
+    }
+    Ok(())
+}
+
+/// Apply the constraints of the partitioned table `parent` to every partition below it, nearest
+/// first, validating their rows: `ALTER TABLE parent ADD CONSTRAINT` on a table whose rows already
+/// live in partitions.
+fn propagate_to_existing_partitions(
+    parent: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    for (schema, name, above) in partitions_below(parent, engine, txn)? {
+        let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)? else {
+            continue;
+        };
+        let def = TableDef {
+            schema: table.schema.clone(),
+            name: table.name.clone(),
+            columns: table.columns.clone(),
+        };
+        let (above_schema, above_name) = crate::analyzer::split_qualified(&above);
+        propagate_parent_constraints(
+            &def,
+            table.id,
+            above_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+            above_name,
+            true,
+            engine,
+            txn,
+        )?;
+    }
+    Ok(())
+}
+
+/// Register a `PARTITION OF parent FOR VALUES ...` partition: the parent must be partitioned, the
+/// bound's kind must match the parent's strategy, its values are coerced to the key column's type and
+/// validated (range `lo < hi` + non-overlap; list values not already claimed; hash modulus/remainder
+/// consistent), and the partition joins the parent's inheritance set so a query on the parent reads
+/// its rows.
 #[allow(
     clippy::too_many_lines,
     reason = "one cohesive per-strategy validation match (range/list/hash); splitting would scatter \
@@ -1261,6 +1632,22 @@ pub(super) fn register_foreign_key(
     txn: TxnId,
 ) -> Result<(), Error> {
     let parent = resolve_parent_table(child_schema, &fk.parent_table, engine, txn)?;
+    // A partitioned table holds no rows of its own (they live in its partitions), and the key's
+    // checks read the referenced table itself: refuse rather than reject every reference.
+    if super::partition::has_any(engine, txn)?
+        && super::partition::parent_key_parts(
+            engine,
+            txn,
+            &crate::analyzer::qualified_display(&parent.schema, &parent.name),
+        )?
+        .is_some()
+    {
+        return Err(Error::Unsupported(format!(
+            "foreign key \"{}\" references the partitioned table \"{}\"; a foreign key can \
+             reference one of its partitions, not the partitioned table itself",
+            fk.name, parent.name
+        )));
+    }
     let parent_constraints = engine.list_constraints(parent.id)?;
     // The referenced parent columns: an explicit `REFERENCES parent (cols)` list, else the parent's
     // PRIMARY KEY (the unqualified `REFERENCES parent` form).
@@ -1750,6 +2137,14 @@ pub(super) fn run_alter_table(
             primary,
             nulls_not_distinct,
         } => {
+            refuse_unique_without_partition_key(
+                &table.schema,
+                &table.name,
+                &name,
+                &columns,
+                engine,
+                txn,
+            )?;
             validate_add_unique_constraint(
                 &table,
                 &columns,
@@ -1792,6 +2187,7 @@ pub(super) fn run_alter_table(
                     )?;
                 }
             }
+            propagate_to_existing_partitions(&table, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // ADD FOREIGN KEY: register it, then validate the table's existing rows reference
@@ -1801,6 +2197,7 @@ pub(super) fn run_alter_table(
             let existing = scan_rows(&table, engine, txn)?;
             // Validating rows already in the table when a key is added: nothing is pending.
             dml::enforce_fk_on_child_write(&table, &existing, &[], engine, txn)?;
+            propagate_to_existing_partitions(&table, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // RENAME TO: a catalog-only rename, no row rewrite — but the engine's catalog is not the
@@ -1861,6 +2258,8 @@ pub(super) fn run_alter_table(
             if !present && if_exists {
                 return Ok(ExecutionResult::Altered);
             }
+            refuse_dropping_inherited_constraint(table, &name, engine, txn)?;
+            drop_partition_copies(table, &name, engine, txn)?;
             engine.drop_constraint(txn, table, &name)?;
             return Ok(ExecutionResult::Altered);
         },
@@ -1883,6 +2282,7 @@ pub(super) fn run_alter_table(
                 }
             }
             engine.add_check_constraint(txn, table.id, &name, predicate_sql.as_bytes())?;
+            propagate_to_existing_partitions(&table, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // ATTACH PARTITION: validate + record the bound and the child→parent edge (via the same
@@ -1942,7 +2342,18 @@ pub(super) fn run_alter_table(
             )?;
             register_partition(&def, &part, engine, txn)?;
             validate_attach_rows(&parent, &partition, engine, txn)?;
-            propagate_parent_unique_constraints(&def, partition.id, &part, true, engine, txn)?;
+            propagate_parent_constraints(
+                &def,
+                partition.id,
+                &part.parent_schema,
+                &part.parent,
+                true,
+                engine,
+                txn,
+            )?;
+            // An attached table that is itself partitioned holds no rows: its partitions do, and
+            // they take the constraints (checked against their rows) from it in turn.
+            propagate_to_existing_partitions(&partition, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // DETACH PARTITION: confirm the child really is a partition of this parent, then sever just

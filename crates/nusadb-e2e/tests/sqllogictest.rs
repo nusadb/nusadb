@@ -532,6 +532,11 @@ fn slt_p1_partition_triggers() {
 }
 
 #[test]
+fn slt_p1_partition_constraints() {
+    run_slt("tests/slt/p1_ddl/partition_constraints.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }
