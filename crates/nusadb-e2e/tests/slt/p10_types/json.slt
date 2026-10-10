@@ -907,6 +907,25 @@ SELECT id FROM jidx WHERE j = CAST('{"b":2,"a":1}' AS JSONB)
 ----
 1
 
+# An untyped literal compared with a JSON column is read as a document, through the index too.
+query I
+SELECT id FROM jidx WHERE j = '{"b":2,"a":1}'
+----
+1
+
+query I
+SELECT id FROM jidx WHERE '[1,2]' = j
+----
+2
+
+query I
+SELECT count(*) FROM jidx WHERE j IN ('[1, 2]', '{"a":1,"b":2}')
+----
+2
+
+statement error
+SELECT id FROM jidx WHERE j = '{not json'
+
 query I
 SELECT id FROM jidx ORDER BY j
 ----

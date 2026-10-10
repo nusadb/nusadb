@@ -4826,8 +4826,12 @@ pub(super) fn coerce_unknown_literal(operand: TypedExpr, anchor: ColumnType) -> 
     // A temporal / `UUID` / `VECTOR` anchor keeps its exact type (`'[1,0,0]'` is the same literal form
     // an `INSERT` accepts for a `VECTOR` column). A numeric or boolean anchor coerces to its physical
     // type, which always has a text-parsing cast — so `int` / `smallint` / `numeric` / `real` / `bool`
-    // all accept an unknown literal, matching how the reference engine resolves it.
-    let target = if is_temporal_or_uuid(anchor) || matches!(anchor, ColumnType::Vector(_)) {
+    // all accept an unknown literal, matching how the reference engine resolves it. A JSON / JSONB
+    // anchor takes the literal as the document it spells, so `j = '{"a": 1}'` compares documents.
+    let target = if is_temporal_or_uuid(anchor)
+        || matches!(anchor, ColumnType::Vector(_))
+        || anchor.physical() == ColumnType::Json
+    {
         Some(anchor)
     } else if matches!(
         anchor.physical(),
