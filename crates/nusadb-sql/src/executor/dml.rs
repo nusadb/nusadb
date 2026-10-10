@@ -52,7 +52,7 @@ pub(super) fn run_insert(
     }
     // `ON CONFLICT DO UPDATE` upserts; everything else (plain INSERT, `DO NOTHING`) inserts.
     let full_rows = if let Some(key_cols) = &partition_key {
-        route_partitioned_insert(plan, key_cols, value_rows, engine, txn)?
+        route_partitioned_insert(plan, key_cols, value_rows, engine, txn, true)?
     } else {
         match &plan.on_conflict {
             Some(OnConflictPlan::DoUpdate {
@@ -282,6 +282,7 @@ fn route_partitioned_insert(
     value_rows: Vec<Vec<Option<ast::Value>>>,
     engine: &dyn StorageEngine,
     txn: TxnId,
+    fire_statement_triggers: bool,
 ) -> Result<Vec<Row>, Error> {
     const MAX_DEPTH: usize = 64;
     /// One routing work item: a parent, its key parts, the rows routed to it, and its depth.
@@ -368,7 +369,8 @@ fn route_partitioned_insert(
         }
     }
     // The statement names the parent: the parent's statement-level triggers fire, once (an upsert
-    // also fires its UPDATE ones), and the leaves' own stay silent.
+    // also fires its UPDATE ones), and the leaves' own stay silent. A caller that writes in batches
+    // (COPY) fires them itself, around the whole statement.
     let upsert = matches!(plan.on_conflict, Some(OnConflictPlan::DoUpdate { .. }));
     let insert_triggers = super::trigger::load_table_triggers(
         &plan.table.schema,
@@ -376,15 +378,19 @@ fn route_partitioned_insert(
         ast::TriggerEvent::Insert,
         engine,
         txn,
-    )?;
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     let update_triggers = if upsert {
-        Some(super::trigger::load_table_triggers(
-            &plan.table.schema,
-            &plan.table.name,
-            ast::TriggerEvent::Update,
-            engine,
-            txn,
-        )?)
+        Some(
+            super::trigger::load_table_triggers(
+                &plan.table.schema,
+                &plan.table.name,
+                ast::TriggerEvent::Update,
+                engine,
+                txn,
+            )?
+            .statement_triggers_if(fire_statement_triggers),
+        )
     } else {
         None
     };
@@ -2168,6 +2174,43 @@ fn copy_partition_target(
     Ok((partition_key, target_is_partition, as_insert))
 }
 
+/// The records of a `COPY ... FROM` payload, one at a time, in its text or CSV format.
+fn copy_records<'a>(
+    copy: &'a ast::Copy,
+    data: &'a str,
+) -> Box<dyn Iterator<Item = Result<Vec<Option<String>>, Error>> + 'a> {
+    // Records stream one at a time (text splits on newlines, CSV parses quote-aware, where a quoted
+    // field may span newlines), so a multi-million-row load never materializes every parsed row up
+    // front, preserving the bounded-memory batching of `run_copy_from`.
+    match copy.format.kind {
+        ast::CopyFormatKind::Text => {
+            Box::new(copy_data_lines(data, copy.format.header).map(|line| {
+                Ok(crate::copy::parse_text_row(
+                    line,
+                    copy.format.delimiter,
+                    &copy.format.null,
+                ))
+            }))
+        },
+        ast::CopyFormatKind::Csv => Box::new(
+            crate::copy::CsvRecords::new(
+                data,
+                copy.format.delimiter,
+                copy.format.quote,
+                copy.format.escape,
+                &copy.format.null,
+            )
+            .skip(usize::from(copy.format.header))
+            .map(|record| {
+                record.map_err(|message| Error::Coded {
+                    message,
+                    sqlstate: "22P04", // bad_copy_file_format
+                })
+            }),
+        ),
+    }
+}
+
 /// Execute `COPY <table> FROM STDIN`: resolve the target columns, tokenize the text-format
 /// `data` into rows, parse each field into a value of the column's type, and bulk-insert them all
 /// under `txn`. Returns the number of rows inserted. The whole load is one transaction at the
@@ -2197,13 +2240,24 @@ pub(super) fn run_copy_from(
     let mut unique = DeferredUnique::load(&table, engine)?;
     let (partition_key, target_is_partition, as_insert) =
         copy_partition_target(&table, &columns, engine, txn)?;
+    // The load is one statement however many batches it takes: its statement-level triggers fire
+    // once, around all of them (each batch leaves them out).
+    let statement_triggers = super::trigger::load_table_triggers(
+        &table.schema,
+        &table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?;
+    statement_triggers.fire_stmt_before(&table, engine, txn)?;
     let mut batch: Vec<Vec<Option<ast::Value>>> = Vec::with_capacity(INSERT_SELECT_BATCH);
     let mut flush = |batch: &mut Vec<Vec<Option<ast::Value>>>,
                      unique: &mut DeferredUnique|
      -> Result<(), Error> {
         let rows = std::mem::replace(batch, Vec::with_capacity(INSERT_SELECT_BATCH));
         if let Some(key_parts) = &partition_key {
-            inserted += route_partitioned_insert(&as_insert, key_parts, rows, engine, txn)?.len();
+            inserted +=
+                route_partitioned_insert(&as_insert, key_parts, rows, engine, txn, false)?.len();
             return Ok(());
         }
         if target_is_partition {
@@ -2222,43 +2276,13 @@ pub(super) fn run_copy_from(
             engine,
             txn,
             Some(unique),
-            true,
+            false,
         )?
         .0
         .len();
         Ok(())
     };
-    // Records stream one at a time — text splits on newlines, CSV parses quote-aware (a quoted field
-    // may span newlines) — so a multi-million-row load never materializes every parsed row up front,
-    // preserving the bounded-memory batching below.
-    let records: Box<dyn Iterator<Item = Result<Vec<Option<String>>, Error>> + '_> =
-        match copy.format.kind {
-            ast::CopyFormatKind::Text => {
-                Box::new(copy_data_lines(data, copy.format.header).map(|line| {
-                    Ok(crate::copy::parse_text_row(
-                        line,
-                        copy.format.delimiter,
-                        &copy.format.null,
-                    ))
-                }))
-            },
-            ast::CopyFormatKind::Csv => Box::new(
-                crate::copy::CsvRecords::new(
-                    data,
-                    copy.format.delimiter,
-                    copy.format.quote,
-                    copy.format.escape,
-                    &copy.format.null,
-                )
-                .skip(usize::from(copy.format.header))
-                .map(|record| {
-                    record.map_err(|message| Error::Coded {
-                        message,
-                        sqlstate: "22P04", // bad_copy_file_format
-                    })
-                }),
-            ),
-        };
+    let records = copy_records(copy, data);
     for (record_no, record) in records.enumerate() {
         // Honor a statement timeout / cancel request at row granularity on a long load.
         crate::cancel::check()?;
@@ -2298,6 +2322,7 @@ pub(super) fn run_copy_from(
     // Every inserted key lock is held; one committed-visibility pass closes the concurrent-committer
     // window (see `DeferredUnique`).
     unique.finish(&table, engine, txn)?;
+    statement_triggers.fire_stmt_after(&table, engine, txn)?;
     Ok(inserted)
 }
 

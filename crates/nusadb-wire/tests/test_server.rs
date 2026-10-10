@@ -5813,6 +5813,47 @@ async fn copy_into_a_partitioned_table_routes_rows_to_partitions() {
         Some(b"0".to_vec())
     );
 
+    // A load of many batches is one statement: its statement triggers fire once each, on a
+    // partitioned table and on a plain one alike.
+    for sql in [
+        "CREATE TABLE stmt_log (tbl TEXT, timing TEXT)",
+        "CREATE TABLE g (k INT)",
+        "CREATE FUNCTION log_stmt() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN \
+         INSERT INTO stmt_log VALUES (TG_TABLE_NAME, TG_WHEN); END $$",
+        "CREATE TRIGGER f_stmt BEFORE INSERT ON f FOR EACH STATEMENT EXECUTE FUNCTION log_stmt()",
+        "CREATE TRIGGER f_stmt_after AFTER INSERT ON f FOR EACH STATEMENT EXECUTE FUNCTION log_stmt()",
+        "CREATE TRIGGER g_stmt BEFORE INSERT ON g FOR EACH STATEMENT EXECUTE FUNCTION log_stmt()",
+        "CREATE TRIGGER g_stmt_after AFTER INSERT ON g FOR EACH STATEMENT EXECUTE FUNCTION log_stmt()",
+        "CREATE TABLE f3 PARTITION OF f FOR VALUES FROM (20) TO (5000)",
+        "DELETE FROM f",
+    ] {
+        assert!(!failed(&run(&mut conn, sql).await), "{sql}");
+    }
+    let rows: String = (0..3000).map(|i| (i % 20).to_string() + "\n").collect();
+    let keys: String = (0..3000).map(|i: u32| i.to_string() + "\n").collect();
+    assert_eq!(
+        copy(&mut conn, "COPY f FROM STDIN", keys.as_bytes()).await,
+        vec![cc("COPY 3000")]
+    );
+    assert_eq!(
+        copy(&mut conn, "COPY g FROM STDIN", rows.as_bytes()).await,
+        vec![cc("COPY 3000")]
+    );
+    for (table, timing) in [
+        ("f", "BEFORE"),
+        ("f", "AFTER"),
+        ("g", "BEFORE"),
+        ("g", "AFTER"),
+    ] {
+        let sql =
+            format!("SELECT count(*) FROM stmt_log WHERE tbl = '{table}' AND timing = '{timing}'");
+        assert_eq!(
+            count(&run(&mut conn, &sql).await),
+            Some(b"1".to_vec()),
+            "{table} {timing}"
+        );
+    }
+
     conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
         .await
         .unwrap();
