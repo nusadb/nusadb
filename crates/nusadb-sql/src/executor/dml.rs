@@ -1565,9 +1565,8 @@ fn insert_rows_with_unique(
         None => enforce_unique_on_insert(table, &full_rows, engine, txn)?,
     }
     // The statement's own rows are offered as parent material, so a child may reference a parent
-    // arriving beside it. Checking here, before anything is written, is what keeps a refused
-    // statement from leaving rows behind — there is no statement-level undo inside an explicit
-    // transaction to fall back on.
+    // arriving beside it. Checking before anything is written spares the statement savepoint the
+    // work of undoing a refused batch.
     enforce_fk_on_child_write(table, &full_rows, &full_rows, engine, txn)?;
     enforce_check_on_write(table, &full_rows, engine)?;
 
@@ -5367,7 +5366,6 @@ fn run_delete_single(
         txn,
     )?;
     let deleted_rows: Vec<Row> = to_delete.iter().map(|(_, row)| row.clone()).collect();
-    enforce_fk_on_parent_delete(&plan.table, &to_delete, engine, txn)?;
 
     // RETURNING projects each deleted row's *pre-delete* values.
     let mut returned: Vec<Row> = Vec::new();
@@ -5381,6 +5379,9 @@ fn run_delete_single(
         // a frozen snapshot can still reach the pre-delete row through the index until then.
         engine.delete(txn, plan.table.id, *tid)?;
     }
+    // The foreign key actions run once the rows are gone, so a trigger a cascade fires on a
+    // referencing row sees its parent already deleted.
+    enforce_fk_on_parent_delete(&plan.table, &to_delete, engine, txn)?;
     // AFTER triggers: row-level for each deleted row, then statement-level once.
     if triggers.has_after_row() {
         for (_, row) in &to_delete {
@@ -6061,10 +6062,11 @@ fn commit_merge_deletes(
     let staged = deletes.len();
     triggers.fire_rows_before(table, deletes, |(_, row)| (Some(row), None), engine, txn)?;
     let deleted_rows: Vec<Row> = deletes.iter().map(|(_, r)| r.clone()).collect();
-    enforce_fk_on_parent_delete(table, deletes, engine, txn)?;
     for (tid, _) in deletes.iter() {
         engine.delete(txn, table.id, *tid)?;
     }
+    // After the deletes, as for a plain DELETE.
+    enforce_fk_on_parent_delete(table, deletes, engine, txn)?;
     if triggers.has_after_row() {
         for (_, row) in deletes.iter() {
             triggers.fire_row_after(table, Some(row), None, engine, txn)?;
