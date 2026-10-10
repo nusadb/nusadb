@@ -140,6 +140,14 @@ pub(super) fn run_create_trigger(
             table: plan.table.clone(),
         });
     }
+    check_partition_trigger_name(
+        &plan.schema,
+        &plan.table,
+        &plan.name,
+        matches!(plan.for_each, ast::TriggerForEach::Row),
+        engine,
+        txn,
+    )?;
     // `INSTEAD OF` attaches to a VIEW (it replaces the write), is row-level only, and takes no
     // `WHEN` guard; `BEFORE`/`AFTER` attach to a real table — the reference engine's rules.
     let view_key = crate::analyzer::qualified_display(&plan.schema, &plan.table);
@@ -219,6 +227,11 @@ pub(super) fn run_alter_trigger(
             name: plan.new_name.clone(),
             table: plan.table.clone(),
         });
+    }
+    refuse_inherited_trigger(&plan.schema, &plan.table, &plan.name, "rename", engine, txn)?;
+    if plan.new_name != plan.name {
+        let row = has_row_trigger(engine, txn, &plan.schema, &plan.table, &plan.name)?;
+        check_partition_trigger_name(&plan.schema, &plan.table, &plan.new_name, row, engine, txn)?;
     }
     let cat = ensure_trigger_catalog(engine, txn)?;
     let mut renamed = false;
@@ -304,6 +317,7 @@ pub(super) fn run_drop_trigger(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
+    refuse_inherited_trigger(&plan.schema, &plan.table, &plan.name, "drop", engine, txn)?;
     let removed = delete_trigger_row(engine, txn, &plan.schema, &plan.table, &plan.name)?;
     if !removed && !plan.if_exists {
         return Err(Error::TriggerNotFound {
@@ -547,6 +561,19 @@ impl TriggerSet {
         fire_each(&self.before_stmt, table, None, None, engine, txn)
     }
 
+    /// This set, keeping its statement-level triggers only when `keep` is set. A statement that
+    /// names a partitioned or inheritance parent fires the parent's statement triggers only, not
+    /// those of the descendants its rows land in: those parts load their triggers with `keep`
+    /// false (their row-level triggers still run).
+    #[must_use]
+    pub(super) fn statement_triggers_if(mut self, keep: bool) -> Self {
+        if !keep {
+            self.before_stmt.clear();
+            self.after_stmt.clear();
+        }
+        self
+    }
+
     /// Fire the `AFTER ... FOR EACH STATEMENT` triggers (once).
     pub(super) fn fire_stmt_after(
         &self,
@@ -637,11 +664,33 @@ pub(super) fn load_table_triggers(
     let Some(cat) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? else {
         return Ok(set);
     };
+    // A partition also runs the row-level triggers of every partitioned table above it: a trigger
+    // declared on a partitioned parent applies to each row whichever partition holds it, including
+    // a partition attached after the trigger was created. Statement-level triggers are not
+    // inherited, and neither is anything across a plain INHERITS edge.
+    let ancestors = partition_ancestors(schema, table, engine, txn)?;
     let mut scan = engine.scan(txn, cat.id)?;
     while let Some((_, bytes)) = scan.try_next()? {
         let row = decode_catalog_row(&bytes)?;
-        let Some(trig) = decode_trigger(&row, schema, table)? else {
-            continue;
+        let trig = if let Some(trig) = decode_trigger(&row, schema, table)? {
+            trig
+        } else {
+            let mut inherited = None;
+            for (ancestor_schema, ancestor) in &ancestors {
+                if let Some(trig) = decode_trigger(&row, ancestor_schema, ancestor)? {
+                    inherited = Some(trig);
+                    break;
+                }
+            }
+            match inherited {
+                Some(trig)
+                    if trig.for_each == ast::TriggerForEach::Row
+                        && trig.timing != ast::TriggerTiming::InsteadOf =>
+                {
+                    trig
+                },
+                _ => continue,
+            }
         };
         // A disabled trigger stays in the catalog but never fires
         // (`ALTER TABLE ... DISABLE TRIGGER`).
@@ -676,6 +725,197 @@ pub(super) fn load_table_triggers(
         bucket.sort_by(|a, b| a.name.cmp(&b.name));
     }
     Ok(set)
+}
+
+/// The partitioned tables above `schema.table`, nearest first, as `(schema, name)`; empty for a
+/// table that is not a partition (one cheap probe when the database has no partitioning at all).
+pub(super) fn partition_ancestors(
+    schema: &str,
+    table: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, String)>, Error> {
+    const MAX_DEPTH: usize = 64;
+    let mut out = Vec::new();
+    if !super::partition::has_any(engine, txn)? {
+        return Ok(out);
+    }
+    let edges = super::partition::partition_edges(engine, txn)?;
+    let mut key = crate::analyzer::qualified_display(schema, table);
+    // The depth cap guards a hand-edited catalog with a cycle; DDL cannot create one.
+    while out.len() < MAX_DEPTH {
+        let Some((_, parent)) = edges.iter().find(|(child, _)| *child == key) else {
+            break;
+        };
+        let (parent_schema, parent_name) = crate::analyzer::split_qualified(parent);
+        out.push((
+            parent_schema
+                .unwrap_or(nusadb_core::PUBLIC_SCHEMA)
+                .to_owned(),
+            parent_name.to_owned(),
+        ));
+        key.clone_from(parent);
+    }
+    Ok(out)
+}
+
+/// Every partition below `schema.table`, at any depth, as `(schema, name)`.
+fn partition_descendants(
+    schema: &str,
+    table: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut out = Vec::new();
+    if !super::partition::has_any(engine, txn)? {
+        return Ok(out);
+    }
+    let edges = super::partition::partition_edges(engine, txn)?;
+    let mut keys = vec![crate::analyzer::qualified_display(schema, table)];
+    while let Some(key) = keys.pop() {
+        for (child, _) in edges.iter().filter(|(_, parent)| *parent == key) {
+            // A guard against a hand-edited catalog with a cycle; DDL cannot create one.
+            if out.len() > edges.len() {
+                return Ok(out);
+            }
+            let (child_schema, child_name) = crate::analyzer::split_qualified(child);
+            out.push((
+                child_schema
+                    .unwrap_or(nusadb_core::PUBLIC_SCHEMA)
+                    .to_owned(),
+                child_name.to_owned(),
+            ));
+            keys.push(child.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Refuse a trigger named `name` on `schema.table` that would share its name with a trigger it runs
+/// or that runs on a partition below it: a partition runs the row-level triggers of the tables above
+/// it, so it cannot have one of their names, and a row-level trigger (`row`) on a partitioned table
+/// runs on every partition below it, so the name must be free on each of them.
+fn check_partition_trigger_name(
+    schema: &str,
+    table: &str,
+    name: &str,
+    row: bool,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    for (ancestor_schema, ancestor) in partition_ancestors(schema, table, engine, txn)? {
+        if has_row_trigger(engine, txn, &ancestor_schema, &ancestor, name)? {
+            return Err(Error::TriggerExists {
+                name: name.to_owned(),
+                table: table.to_owned(),
+            });
+        }
+    }
+    if row {
+        for (sub_schema, sub) in partition_descendants(schema, table, engine, txn)? {
+            if trigger_exists(engine, txn, &sub_schema, &sub, name)? {
+                return Err(Error::TriggerExists {
+                    name: name.to_owned(),
+                    table: sub,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse changing (`action`: drop, rename) a trigger named `name` on the partition `schema.table`
+/// when the partition only runs it because a table above it has it.
+fn refuse_inherited_trigger(
+    schema: &str,
+    table: &str,
+    name: &str,
+    action: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if trigger_exists(engine, txn, schema, table, name)? {
+        return Ok(());
+    }
+    for (ancestor_schema, ancestor) in partition_ancestors(schema, table, engine, txn)? {
+        if has_row_trigger(engine, txn, &ancestor_schema, &ancestor, name)? {
+            return Err(Error::Coded {
+                message: format!(
+                    "cannot {action} trigger \"{name}\" on table \"{table}\" because trigger \
+                     \"{name}\" on table \"{ancestor}\" requires it; {action} it on \"{ancestor}\" \
+                     instead"
+                ),
+                sqlstate: "2BP01", // dependent_objects_still_exist
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `schema.table` has a row-level trigger named `name`.
+fn has_row_trigger(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+    name: &str,
+) -> Result<bool, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? else {
+        return Ok(false);
+    };
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = decode_catalog_row(&bytes)?;
+        if let Some(trig) = decode_trigger(&row, schema, table)?
+            && trig.name == name
+            && trig.for_each == ast::TriggerForEach::Row
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Refuse to make `child` (and the partitions under it) a partition of `parent` when one of them
+/// has a trigger named like a row-level trigger of `parent` or a table above it: the partition
+/// would run both under one name.
+pub(super) fn check_attach_trigger_names(
+    parent_schema: &str,
+    parent: &str,
+    child_schema: &str,
+    child: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, TRIGGER_CATALOG)? else {
+        return Ok(());
+    };
+    let mut above = vec![(parent_schema.to_owned(), parent.to_owned())];
+    above.extend(partition_ancestors(parent_schema, parent, engine, txn)?);
+    let mut below = vec![(child_schema.to_owned(), child.to_owned())];
+    below.extend(partition_descendants(child_schema, child, engine, txn)?);
+    let mut inherited: Vec<String> = Vec::new();
+    let mut own: Vec<(String, String)> = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = decode_catalog_row(&bytes)?;
+        for (s, t) in &above {
+            if let Some(trig) = decode_trigger(&row, s, t)?
+                && trig.for_each == ast::TriggerForEach::Row
+            {
+                inherited.push(trig.name);
+            }
+        }
+        for (s, t) in &below {
+            if let Some(trig) = decode_trigger(&row, s, t)? {
+                own.push((trig.name, t.clone()));
+            }
+        }
+    }
+    if let Some((name, table)) = own.into_iter().find(|(name, _)| inherited.contains(name)) {
+        return Err(Error::TriggerExists { name, table });
+    }
+    Ok(())
 }
 
 /// Decode one catalog row into a [`StoredTrigger`] if it belongs to `table`; `None` otherwise.

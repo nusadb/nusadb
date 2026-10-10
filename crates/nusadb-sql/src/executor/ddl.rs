@@ -1932,6 +1932,14 @@ pub(super) fn run_alter_table(
                 parent_schema: parent.schema.clone(),
                 bound,
             };
+            super::trigger::check_attach_trigger_names(
+                &parent.schema,
+                &parent.name,
+                &partition.schema,
+                &partition.name,
+                engine,
+                txn,
+            )?;
             register_partition(&def, &part, engine, txn)?;
             validate_attach_rows(&parent, &partition, engine, txn)?;
             propagate_parent_unique_constraints(&def, partition.id, &part, true, engine, txn)?;

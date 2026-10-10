@@ -1,0 +1,390 @@
+# Triggers on a partitioned table. A row-level trigger declared on the parent runs for every row of
+# every partition below it (including partitions created or attached later), whether the statement
+# names the parent or the partition. A statement-level trigger fires only for the table the
+# statement names: a write through the parent fires the parent's statement triggers once, never the
+# partitions'.
+
+statement ok
+CREATE TABLE log (seq SERIAL PRIMARY KEY, what TEXT NOT NULL)
+
+statement ok
+CREATE TABLE fact (d DATE NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (d)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE fact_01 PARTITION OF fact FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement ok
+CREATE TRIGGER parent_row AFTER INSERT OR UPDATE OR DELETE ON fact FOR EACH ROW INSERT INTO log (what) VALUES ('parent-row')
+
+statement ok
+CREATE TRIGGER parent_stmt AFTER INSERT OR UPDATE OR DELETE ON fact FOR EACH STATEMENT INSERT INTO log (what) VALUES ('parent-stmt')
+
+statement ok
+CREATE TRIGGER part_stmt AFTER INSERT OR UPDATE OR DELETE ON fact_01 FOR EACH STATEMENT INSERT INTO log (what) VALUES ('partition-stmt')
+
+statement ok
+CREATE TRIGGER parent_before BEFORE INSERT ON fact FOR EACH STATEMENT INSERT INTO log (what) VALUES ('parent-before')
+
+# Created after the parent's trigger: it runs the parent's row trigger too.
+statement ok
+CREATE TABLE fact_02 PARTITION OF fact FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+
+# 1) INSERT through the parent, one row in each partition.
+statement ok
+INSERT INTO fact VALUES ('2026-01-15', 1), ('2026-02-15', 2)
+
+query TI
+SELECT what, count(*) FROM log GROUP BY what ORDER BY what
+----
+parent-before 1
+parent-row 2
+parent-stmt 1
+
+statement ok
+DELETE FROM log
+
+# 2) UPDATE through the parent.
+statement ok
+UPDATE fact SET v = v + 10
+
+query TI
+SELECT what, count(*) FROM log GROUP BY what ORDER BY what
+----
+parent-row 2
+parent-stmt 1
+
+statement ok
+DELETE FROM log
+
+# 3) INSERT naming the partition: the parent's row trigger, the partition's statement trigger.
+statement ok
+INSERT INTO fact_01 VALUES ('2026-01-20', 3)
+
+query TI
+SELECT what, count(*) FROM log GROUP BY what ORDER BY what
+----
+parent-row 1
+partition-stmt 1
+
+statement ok
+DELETE FROM log
+
+# 4) DELETE through the parent.
+statement ok
+DELETE FROM fact
+
+query TI
+SELECT what, count(*) FROM log GROUP BY what ORDER BY what
+----
+parent-row 3
+parent-stmt 1
+
+statement ok
+DELETE FROM log
+
+# An append-only guard on the parent protects every partition.
+statement ok
+CREATE TABLE ledger (d DATE NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (d)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE ledger_01 PARTITION OF ledger FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement ok
+INSERT INTO ledger VALUES ('2026-01-15', 1)
+
+statement ok
+CREATE FUNCTION ledger_ro() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN RAISE 'ledger is append-only'; END $$
+
+statement ok
+CREATE TRIGGER ledger_ro BEFORE UPDATE OR DELETE ON ledger FOR EACH ROW EXECUTE FUNCTION ledger_ro()
+
+statement error append-only
+UPDATE ledger SET v = 9
+
+statement error append-only
+DELETE FROM ledger
+
+statement error append-only
+UPDATE ledger_01 SET v = 9
+
+query I
+SELECT v FROM ledger
+----
+1
+
+# A partition attached later runs the parent's row triggers; once detached it no longer does.
+statement ok
+CREATE TABLE ledger_02 (d DATE NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (d))
+
+statement ok
+INSERT INTO ledger_02 VALUES ('2026-02-10', 5)
+
+statement ok
+ALTER TABLE ledger ATTACH PARTITION ledger_02 FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+
+statement error append-only
+DELETE FROM ledger_02
+
+statement ok
+ALTER TABLE ledger DETACH PARTITION ledger_02
+
+statement ok
+DELETE FROM ledger_02
+
+# Disabling, then dropping, the trigger on the parent applies to every partition.
+statement ok
+ALTER TABLE ledger DISABLE TRIGGER ledger_ro
+
+statement ok
+UPDATE ledger SET v = 2
+
+statement ok
+ALTER TABLE ledger ENABLE TRIGGER ledger_ro
+
+statement error append-only
+UPDATE ledger SET v = 3
+
+# The partition runs the trigger, but it belongs to the parent.
+statement error requires it
+DROP TRIGGER ledger_ro ON ledger_01
+
+statement ok
+DROP TRIGGER ledger_ro ON ledger
+
+statement ok
+UPDATE ledger SET v = 4
+
+query I
+SELECT v FROM ledger
+----
+4
+
+# Trigger names: a parent's row trigger and a partition's trigger cannot share a name.
+statement ok
+CREATE TRIGGER mine AFTER INSERT ON ledger_01 FOR EACH ROW INSERT INTO log (what) VALUES ('mine')
+
+statement error already exists
+CREATE TRIGGER mine AFTER INSERT ON ledger FOR EACH ROW INSERT INTO log (what) VALUES ('parent')
+
+statement ok
+CREATE TRIGGER guard AFTER INSERT ON ledger FOR EACH ROW INSERT INTO log (what) VALUES ('guard')
+
+statement error already exists
+CREATE TRIGGER guard AFTER INSERT ON ledger_01 FOR EACH ROW INSERT INTO log (what) VALUES ('own')
+
+statement ok
+CREATE TABLE ledger_03 (d DATE NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (d))
+
+statement ok
+CREATE TRIGGER guard AFTER INSERT ON ledger_03 FOR EACH ROW INSERT INTO log (what) VALUES ('own')
+
+statement error already exists
+ALTER TABLE ledger ATTACH PARTITION ledger_03 FOR VALUES FROM ('2026-03-01') TO ('2026-04-01')
+
+# A statement-level trigger of the same name as a partition's is allowed (it is not inherited).
+statement ok
+CREATE TRIGGER mine AFTER INSERT ON ledger FOR EACH STATEMENT INSERT INTO log (what) VALUES ('stmt')
+
+statement ok
+DELETE FROM log
+
+# Row triggers of the parent and of the partition run together, in name order.
+statement ok
+CREATE TABLE ord (k INT NOT NULL, PRIMARY KEY (k)) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE ord_1 PARTITION OF ord FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TRIGGER a_first AFTER INSERT ON ord FOR EACH ROW INSERT INTO log (what) VALUES ('a')
+
+statement ok
+CREATE TRIGGER b_second AFTER INSERT ON ord_1 FOR EACH ROW INSERT INTO log (what) VALUES ('b')
+
+statement ok
+CREATE TRIGGER c_third AFTER INSERT ON ord FOR EACH ROW INSERT INTO log (what) VALUES ('c')
+
+statement ok
+INSERT INTO ord VALUES (1)
+
+query T
+SELECT what FROM log ORDER BY seq
+----
+a
+b
+c
+
+statement ok
+DELETE FROM log
+
+# The parent's AFTER STATEMENT trigger runs once every partition's rows are written.
+statement ok
+CREATE TABLE seen (n BIGINT)
+
+statement ok
+CREATE TRIGGER count_after AFTER INSERT ON ord FOR EACH STATEMENT INSERT INTO seen SELECT count(*) FROM ord
+
+statement ok
+CREATE TABLE ord_2 PARTITION OF ord FOR VALUES FROM (100) TO (200)
+
+statement ok
+INSERT INTO ord VALUES (2), (150), (160)
+
+query I
+SELECT n FROM seen
+----
+4
+
+# Moving a row between partitions runs the parent's DELETE and INSERT row triggers.
+statement ok
+CREATE TRIGGER moved_out AFTER DELETE ON ord FOR EACH ROW INSERT INTO log (what) VALUES ('out')
+
+statement ok
+DELETE FROM log
+
+statement ok
+UPDATE ord SET k = 120 WHERE k = 2
+
+# `b_second` belongs to the source partition `ord_1`, so the insert into `ord_2` does not run it;
+# no partition's INSERT statement trigger runs either, the statement being the UPDATE.
+statement ok
+CREATE TRIGGER ord_2_stmt AFTER INSERT ON ord_2 FOR EACH STATEMENT INSERT INTO log (what) VALUES ('ord_2-stmt')
+
+statement ok
+DELETE FROM log
+
+statement ok
+UPDATE ord SET k = 130 WHERE k = 1
+
+query T
+SELECT what FROM log ORDER BY seq
+----
+out
+a
+c
+
+# A foreign-key cascade into a partition runs the parent's row trigger.
+statement ok
+CREATE TABLE owner_t (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE owned (id INT NOT NULL, o INT, PRIMARY KEY (id)) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE owned_1 PARTITION OF owned FOR VALUES FROM (0) TO (100)
+
+statement ok
+ALTER TABLE owned_1 ADD CONSTRAINT owned_1_o FOREIGN KEY (o) REFERENCES owner_t (id) ON DELETE CASCADE
+
+statement ok
+CREATE TRIGGER owned_gone AFTER DELETE ON owned FOR EACH ROW INSERT INTO log (what) VALUES ('owned-gone')
+
+statement ok
+INSERT INTO owner_t VALUES (1)
+
+statement ok
+INSERT INTO owned_1 VALUES (5, 1), (6, 1)
+
+statement ok
+DELETE FROM log
+
+statement ok
+DELETE FROM owner_t
+
+query TI
+SELECT what, count(*) FROM log GROUP BY what
+----
+owned-gone 2
+
+# Only partition edges carry triggers. Across a plain INHERITS edge a statement on the parent
+# fires the parent's statement triggers only, and the parent's row triggers stay its own.
+statement ok
+CREATE TABLE base_t (id INT, v INT)
+
+statement ok
+CREATE TABLE child_t (extra INT) INHERITS (base_t)
+
+statement ok
+INSERT INTO child_t VALUES (1, 1, 1)
+
+statement ok
+CREATE TRIGGER base_row AFTER UPDATE ON base_t FOR EACH ROW INSERT INTO log (what) VALUES ('base-row')
+
+statement ok
+CREATE TRIGGER child_stmt AFTER UPDATE ON child_t FOR EACH STATEMENT INSERT INTO log (what) VALUES ('child-stmt')
+
+statement ok
+CREATE TRIGGER base_stmt AFTER UPDATE ON base_t FOR EACH STATEMENT INSERT INTO log (what) VALUES ('base-stmt')
+
+statement ok
+DELETE FROM log
+
+statement ok
+UPDATE base_t SET v = 2
+
+query T
+SELECT what FROM log ORDER BY seq
+----
+base-stmt
+
+# A statement a trigger body runs is a statement of its own: one naming a partition fires that
+# partition's statement triggers even while the outer statement (through the parent) keeps them
+# silent. Here each inserted row's trigger inserts into the partition directly, twice in a chain
+# (the second insert selects no row but is still a statement).
+statement ok
+CREATE TABLE nest (k INT NOT NULL, PRIMARY KEY (k)) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE nest_1 PARTITION OF nest FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TRIGGER nest_chain AFTER INSERT ON nest FOR EACH ROW INSERT INTO nest_1 SELECT NEW.k + 1 WHERE NEW.k = 1
+
+statement ok
+CREATE TRIGGER nest_1_stmt AFTER INSERT ON nest_1 FOR EACH STATEMENT INSERT INTO log (what) VALUES ('nest_1-stmt')
+
+statement ok
+DELETE FROM log
+
+statement ok
+INSERT INTO nest VALUES (1)
+
+query I
+SELECT k FROM nest ORDER BY k
+----
+1
+2
+
+query TI
+SELECT what, count(*) FROM log GROUP BY what
+----
+nest_1-stmt 2
+
+statement ok
+CREATE TABLE fx (k INT NOT NULL, v INT, PRIMARY KEY (k)) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE fx_1 PARTITION OF fx FOR VALUES FROM (0) TO (100)
+
+# Renaming follows the same name rules: a partition cannot take a parent row trigger's name, a
+# parent row trigger cannot take a partition's, and the parent's trigger is renamed on the parent.
+statement ok
+CREATE TRIGGER pr AFTER UPDATE ON fx FOR EACH ROW INSERT INTO log (what) VALUES ('pr')
+
+statement ok
+CREATE TRIGGER own AFTER UPDATE ON fx_1 FOR EACH ROW INSERT INTO log (what) VALUES ('own')
+
+statement error already exists
+ALTER TRIGGER own ON fx_1 RENAME TO pr
+
+statement error already exists
+ALTER TRIGGER pr ON fx RENAME TO own
+
+statement error requires it
+ALTER TRIGGER pr ON fx_1 RENAME TO other
+
+statement ok
+ALTER TRIGGER pr ON fx RENAME TO pr2
+
+statement ok
+ALTER TRIGGER own ON fx_1 RENAME TO pr

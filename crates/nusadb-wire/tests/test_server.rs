@@ -5689,3 +5689,184 @@ async fn a_leading_comment_does_not_change_how_a_statement_runs() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// `COPY` into a partitioned table routes each row to its partition (refusing a row no partition
+/// accepts, and the whole load with it), and `COPY` into a partition refuses a row outside its
+/// bound. Nothing is ever stored in the partitioned table itself.
+#[tokio::test]
+async fn copy_into_a_partitioned_table_routes_rows_to_partitions() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    async fn run<S: AsyncRead + AsyncWrite + Unpin>(
+        conn: &mut Connection<S>,
+        sql: &str,
+    ) -> Vec<BackendMessage> {
+        query(conn, sql).await;
+        let mut got = Vec::new();
+        loop {
+            match next(conn).await {
+                BackendMessage::ReadyForQuery(_) => return got,
+                other => got.push(other),
+            }
+        }
+    }
+    async fn copy<S: AsyncRead + AsyncWrite + Unpin>(
+        conn: &mut Connection<S>,
+        sql: &str,
+        data: &[u8],
+    ) -> Vec<BackendMessage> {
+        query(conn, sql).await;
+        assert!(matches!(
+            next(conn).await,
+            BackendMessage::CopyInResponse { .. }
+        ));
+        conn.write_frame(
+            &FrontendMessage::CopyData {
+                data: data.to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        conn.write_frame(&FrontendMessage::CopyDone.encode().unwrap())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        loop {
+            match next(conn).await {
+                BackendMessage::ReadyForQuery(_) => return got,
+                other => got.push(other),
+            }
+        }
+    }
+    fn count(messages: &[BackendMessage]) -> Option<Vec<u8>> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::DataRow { values } => values.first().cloned().flatten(),
+            _ => None,
+        })
+    }
+    fn failed(messages: &[BackendMessage]) -> bool {
+        messages
+            .iter()
+            .any(|m| matches!(m, BackendMessage::Error { .. }))
+    }
+
+    run(
+        &mut conn,
+        "CREATE TABLE f (k INT NOT NULL, PRIMARY KEY (k)) PARTITION BY RANGE (k)",
+    )
+    .await;
+    run(
+        &mut conn,
+        "CREATE TABLE f1 PARTITION OF f FOR VALUES FROM (0) TO (10)",
+    )
+    .await;
+    run(
+        &mut conn,
+        "CREATE TABLE f2 PARTITION OF f FOR VALUES FROM (10) TO (20)",
+    )
+    .await;
+
+    // 99 belongs to no partition: the whole load is refused.
+    assert!(failed(
+        &copy(&mut conn, "COPY f FROM STDIN", b"1\n15\n99\n").await
+    ));
+    assert_eq!(
+        copy(&mut conn, "COPY f FROM STDIN", b"1\n15\n").await,
+        vec![cc("COPY 2")]
+    );
+    assert!(failed(
+        &copy(&mut conn, "COPY f1 FROM STDIN", b"16\n").await
+    ));
+    assert_eq!(
+        copy(&mut conn, "COPY f1 FROM STDIN", b"5\n").await,
+        vec![cc("COPY 1")]
+    );
+    assert_eq!(
+        count(&run(&mut conn, "SELECT count(*) FROM f1").await),
+        Some(b"2".to_vec())
+    );
+    assert_eq!(
+        count(&run(&mut conn, "SELECT count(*) FROM f2").await),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(
+        count(&run(&mut conn, "SELECT count(*) FROM ONLY f").await),
+        Some(b"0".to_vec())
+    );
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// A statement a function runs is a statement of its own: called from an expression of a write
+/// through a partitioned parent, its `INSERT` into a partition still fires that partition's
+/// statement triggers (only the descendant parts of the outer write leave theirs out).
+#[tokio::test]
+async fn a_function_statement_inside_a_partitioned_write_fires_its_triggers() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    async fn run<S: AsyncRead + AsyncWrite + Unpin>(
+        conn: &mut Connection<S>,
+        sql: &str,
+    ) -> Vec<BackendMessage> {
+        query(conn, sql).await;
+        let mut got = Vec::new();
+        loop {
+            match next(conn).await {
+                BackendMessage::ReadyForQuery(_) => return got,
+                other => got.push(other),
+            }
+        }
+    }
+
+    for sql in [
+        "CREATE TABLE log (what TEXT)",
+        "CREATE TABLE f (k INT NOT NULL, v INT, PRIMARY KEY (k)) PARTITION BY RANGE (k)",
+        "CREATE TABLE f1 PARTITION OF f FOR VALUES FROM (0) TO (100)",
+        "INSERT INTO f VALUES (1, 0)",
+        "CREATE TRIGGER f1_ins AFTER INSERT ON f1 FOR EACH STATEMENT \
+         INSERT INTO log VALUES ('f1-ins-stmt')",
+        "CREATE TRIGGER f1_upd AFTER UPDATE ON f1 FOR EACH STATEMENT \
+         INSERT INTO log VALUES ('f1-upd-stmt')",
+        "CREATE FUNCTION side() RETURNS INT LANGUAGE nusascript AS $$ \
+         BEGIN INSERT INTO f1 VALUES (50, 0); RETURN 7; END $$",
+    ] {
+        let got = run(&mut conn, sql).await;
+        assert!(
+            !got.iter()
+                .any(|m| matches!(m, BackendMessage::Error { .. })),
+            "{sql}: {got:?}"
+        );
+    }
+    run(&mut conn, "UPDATE f SET v = side() WHERE k = 1").await;
+    let got = run(&mut conn, "SELECT what FROM log ORDER BY what").await;
+    let rows: Vec<Option<Vec<u8>>> = got
+        .iter()
+        .filter_map(|m| match m {
+            BackendMessage::DataRow { values } => values.first().cloned(),
+            _ => None,
+        })
+        .collect();
+    // The function's INSERT names f1: its statement trigger fires. The UPDATE names the parent:
+    // f1's UPDATE statement trigger does not.
+    assert_eq!(rows, vec![Some(b"f1-ins-stmt".to_vec())]);
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

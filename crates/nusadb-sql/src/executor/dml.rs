@@ -69,6 +69,7 @@ pub(super) fn run_insert(
                 filter.as_ref(),
                 engine,
                 txn,
+                true,
             )?,
             other => {
                 // A `DO NOTHING` with a stated target must name a real unique/primary-key arbiter — the
@@ -90,6 +91,7 @@ pub(super) fn run_insert(
                     matches!(other, Some(OnConflictPlan::DoNothing { .. })),
                     engine,
                     txn,
+                    true,
                 )?
             },
         }
@@ -364,6 +366,31 @@ fn route_partitioned_insert(
             }
         }
     }
+    // The statement names the parent: the parent's statement-level triggers fire, once (an upsert
+    // also fires its UPDATE ones), and the leaves' own stay silent.
+    let upsert = matches!(plan.on_conflict, Some(OnConflictPlan::DoUpdate { .. }));
+    let insert_triggers = super::trigger::load_table_triggers(
+        &plan.table.schema,
+        &plan.table.name,
+        ast::TriggerEvent::Insert,
+        engine,
+        txn,
+    )?;
+    let update_triggers = if upsert {
+        Some(super::trigger::load_table_triggers(
+            &plan.table.schema,
+            &plan.table.name,
+            ast::TriggerEvent::Update,
+            engine,
+            txn,
+        )?)
+    } else {
+        None
+    };
+    insert_triggers.fire_stmt_before(&plan.table, engine, txn)?;
+    if let Some(triggers) = &update_triggers {
+        triggers.fire_stmt_before(&plan.table, engine, txn)?;
+    }
     let mut inserted = Vec::new();
     for (part_name, rows) in leaves {
         // The leaf's bucket key is schema-qualified; split it back into the table's coordinates.
@@ -398,6 +425,7 @@ fn route_partitioned_insert(
                 filter.as_ref(),
                 engine,
                 txn,
+                false,
             )?,
             other => {
                 if let Some(OnConflictPlan::DoNothing {
@@ -416,10 +444,15 @@ fn route_partitioned_insert(
                     matches!(other, Some(OnConflictPlan::DoNothing { .. })),
                     engine,
                     txn,
+                    false,
                 )?
             },
         };
         inserted.extend(routed);
+    }
+    insert_triggers.fire_stmt_after(&plan.table, engine, txn)?;
+    if let Some(triggers) = &update_triggers {
+        triggers.fire_stmt_after(&plan.table, engine, txn)?;
     }
     Ok(inserted)
 }
@@ -1152,6 +1185,7 @@ fn insert_select_streaming(
             engine,
             txn,
             Some(unique),
+            true,
         )?
         .0
         .len();
@@ -1269,6 +1303,7 @@ pub(super) fn insert_rows(
     conflict_do_nothing: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
+    fire_statement_triggers: bool,
 ) -> Result<Vec<Row>, Error> {
     insert_rows_with_unique(
         table,
@@ -1281,6 +1316,7 @@ pub(super) fn insert_rows(
         engine,
         txn,
         None,
+        fire_statement_triggers,
     )
     .map(|(rows, _)| rows)
 }
@@ -1364,6 +1400,7 @@ fn insert_rows_with_unique(
     engine: &dyn StorageEngine,
     txn: TxnId,
     mut deferred: Option<&mut DeferredUnique>,
+    fire_statement_triggers: bool,
 ) -> Result<(Vec<Row>, Vec<Tid>), Error> {
     // Column DEFAULTs / SERIAL: a column omitted from the target list — or written as
     // an explicit `DEFAULT` cell (`None`) — is filled by its default expression or its sequence (if
@@ -1477,7 +1514,8 @@ fn insert_rows_with_unique(
         ast::TriggerEvent::Insert,
         engine,
         txn,
-    )?;
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     triggers.fire_stmt_before(table, engine, txn)?;
     if triggers.has_before_row() {
         for full in &full_rows {
@@ -1615,6 +1653,7 @@ fn upsert_rows(
     filter: Option<&crate::planner::TypedExpr>,
     engine: &dyn StorageEngine,
     txn: TxnId,
+    fire_statement_triggers: bool,
 ) -> Result<Vec<Row>, Error> {
     // Column DEFAULT / SERIAL fills for a column omitted from the proposed insert or
     // written as an explicit `DEFAULT` cell.
@@ -1812,14 +1851,16 @@ fn upsert_rows(
         ast::TriggerEvent::Insert,
         engine,
         txn,
-    )?;
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     let update_triggers = super::trigger::load_table_triggers(
         &table.schema,
         &table.name,
         ast::TriggerEvent::Update,
         engine,
         txn,
-    )?;
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     // A DO UPDATE assignment may not move the row out of its partition's bound either — the same
     // stranding the plain-UPDATE guard refuses (the reference engine refuses the move here too).
     {
@@ -1981,6 +2022,39 @@ fn lookup_copy_table(
     })
 }
 
+/// How a `COPY` load meets partitioning. A partitioned parent stores no rows of its own: each loaded
+/// row goes to the partition its key selects, exactly as an INSERT through the parent does, and a
+/// partition takes only rows inside its bound. Returns the parent's key parts (when `table` is a
+/// partitioned parent), whether `table` is a partition, and the INSERT plan equivalent to the load,
+/// through which the INSERT path's routing and bound check are reused.
+fn copy_partition_target(
+    table: &TableSchema,
+    columns: &[usize],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(Option<Vec<super::partition::KeyPart>>, bool, InsertPlan), Error> {
+    let (partition_key, target_is_partition) = if super::partition::has_any(engine, txn)? {
+        let table_key = crate::analyzer::qualified_display(&table.schema, &table.name);
+        (
+            super::partition::parent_key_parts(engine, txn, &table_key)?,
+            super::partition::partition_parent(engine, txn, &table_key)?.is_some(),
+        )
+    } else {
+        (None, false)
+    };
+    let as_insert = InsertPlan {
+        table: table.clone(),
+        columns: columns.to_vec(),
+        source: InsertSource::Values(Vec::new()),
+        returning: Vec::new(),
+        rls_check: None,
+        view_check: None,
+        overriding: None,
+        on_conflict: None,
+    };
+    Ok((partition_key, target_is_partition, as_insert))
+}
+
 /// Execute `COPY <table> FROM STDIN`: resolve the target columns, tokenize the text-format
 /// `data` into rows, parse each field into a value of the column's type, and bulk-insert them all
 /// under `txn`. Returns the number of rows inserted. The whole load is one transaction at the
@@ -2008,11 +2082,20 @@ pub(super) fn run_copy_from(
     // per-batch immediate check would not see prior batches' still-uncommitted keys.
     let mut inserted = 0_usize;
     let mut unique = DeferredUnique::load(&table, engine)?;
+    let (partition_key, target_is_partition, as_insert) =
+        copy_partition_target(&table, &columns, engine, txn)?;
     let mut batch: Vec<Vec<Option<ast::Value>>> = Vec::with_capacity(INSERT_SELECT_BATCH);
     let mut flush = |batch: &mut Vec<Vec<Option<ast::Value>>>,
                      unique: &mut DeferredUnique|
      -> Result<(), Error> {
         let rows = std::mem::replace(batch, Vec::with_capacity(INSERT_SELECT_BATCH));
+        if let Some(key_parts) = &partition_key {
+            inserted += route_partitioned_insert(&as_insert, key_parts, rows, engine, txn)?.len();
+            return Ok(());
+        }
+        if target_is_partition {
+            enforce_partition_bound(&as_insert, &rows, engine, txn)?;
+        }
         // COPY runs only for a superuser on an RLS table (the wire layer refuses it otherwise), so
         // there is no per-row WITH CHECK to apply here; nor does COPY target a view or carry OVERRIDING.
         inserted += insert_rows_with_unique(
@@ -2026,6 +2109,7 @@ pub(super) fn run_copy_from(
             engine,
             txn,
             Some(unique),
+            true,
         )?
         .0
         .len();
@@ -4225,11 +4309,37 @@ pub(super) fn run_update(
     // The movement registry keeps a row this statement moved between partitions from being
     // re-matched by a later branch's scan (each row is visited once, like the reference engine).
     let _moves = super::move_skip::scope();
-    let mut result = run_update_single(plan, engine, txn)?;
-    for sub in &plan.propagate {
-        result = combine_write_results(result, run_update_single(sub, engine, txn)?)?;
+    if plan.propagate.is_empty() {
+        return run_update_single(plan, engine, txn, true);
     }
-    Ok(result)
+    // The statement names the parent, so only the parent's statement-level triggers fire, once,
+    // around every row the statement changes in any descendant.
+    over_parent_statement(&plan.table, ast::TriggerEvent::Update, engine, txn, || {
+        let mut result = run_update_single(plan, engine, txn, false)?;
+        for sub in &plan.propagate {
+            result = combine_write_results(result, run_update_single(sub, engine, txn, false)?)?;
+        }
+        Ok(result)
+    })
+}
+
+/// Run `write`, a statement naming the parent `table` whose rows land in its descendants, between
+/// the parent's `BEFORE` and `AFTER` statement-level triggers for `event`. The descendants' own
+/// statement triggers are the caller's to leave out (see
+/// [`super::trigger::TriggerSet::statement_triggers_if`]).
+fn over_parent_statement<T>(
+    table: &TableSchema,
+    event: ast::TriggerEvent,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    write: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let triggers =
+        super::trigger::load_table_triggers(&table.schema, &table.name, event, engine, txn)?;
+    triggers.fire_stmt_before(table, engine, txn)?;
+    let out = write()?;
+    triggers.fire_stmt_after(table, engine, txn)?;
+    Ok(out)
 }
 
 #[allow(
@@ -4240,6 +4350,7 @@ fn run_update_single(
     plan: &UpdatePlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
+    fire_statement_triggers: bool,
 ) -> Result<ExecutionResult, Error> {
     let schema = column_types(&plan.table);
     // Find the target rows through the backing index when the `WHERE` is a unique point lookup
@@ -4293,7 +4404,8 @@ fn run_update_single(
         ast::TriggerEvent::Update,
         engine,
         txn,
-    )?;
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     // Track each matched row's pre-update value when a changed PRIMARY KEY must propagate to FK
     // children, its old secondary-index entries must be removed, a row trigger binds
     // `OLD`, or an IVM view over this table needs the delete side of the delta.
@@ -4768,6 +4880,12 @@ fn move_rows_across_partitions(
             delete_triggers.fire_row_before(source, Some(old), None, engine, txn)?;
         }
         engine.delete(txn, source.id, *tid)?;
+        // The move is a delete and then an insert: the delete's AFTER row triggers run first.
+        if delete_triggers.has_after_row()
+            && let Some(old) = old
+        {
+            delete_triggers.fire_row_after(source, Some(old), None, engine, txn)?;
+        }
         // Route the new image from the root; the accepting leaf runs the ordinary insert path.
         let leaf_key = route_row_to_leaf(&root, new_row, engine, txn)?;
         let (leaf_schema, leaf_name) = crate::analyzer::split_qualified(&leaf_key);
@@ -4785,6 +4903,7 @@ fn move_rows_across_partitions(
         // needs; the returned tid feeds the movement registry so a later branch of this same
         // statement does not re-match the row.
         let value_row: Vec<Option<ast::Value>> = new_row.iter().cloned().map(Some).collect();
+        // The statement is the UPDATE: the destination's INSERT statement triggers do not fire.
         let (_, tids) = insert_rows_with_unique(
             &leaf,
             &all_columns,
@@ -4796,14 +4915,10 @@ fn move_rows_across_partitions(
             engine,
             txn,
             None,
+            false,
         )?;
         for new_tid in tids {
             super::move_skip::record(leaf.id, new_tid);
-        }
-        if delete_triggers.has_after_row()
-            && let Some(old) = old
-        {
-            delete_triggers.fire_row_after(source, Some(old), None, engine, txn)?;
         }
     }
     Ok(())
@@ -4864,17 +4979,24 @@ pub(super) fn run_delete(
     // A `DELETE` on an inheritance/partition parent (without `ONLY`) also deletes from every
     // descendant: run the parent's own (`ONLY`) delete, then each descendant sub-plan, combining the
     // row counts (or `RETURNING` rows). The common non-parent case has an empty `propagate`.
-    let mut result = run_delete_single(plan, engine, txn)?;
-    for sub in &plan.propagate {
-        result = combine_write_results(result, run_delete_single(sub, engine, txn)?)?;
+    if plan.propagate.is_empty() {
+        return run_delete_single(plan, engine, txn, true);
     }
-    Ok(result)
+    // As for UPDATE: the parent's statement-level triggers, once, around every descendant's rows.
+    over_parent_statement(&plan.table, ast::TriggerEvent::Delete, engine, txn, || {
+        let mut result = run_delete_single(plan, engine, txn, false)?;
+        for sub in &plan.propagate {
+            result = combine_write_results(result, run_delete_single(sub, engine, txn, false)?)?;
+        }
+        Ok(result)
+    })
 }
 
 fn run_delete_single(
     plan: &DeletePlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
+    fire_statement_triggers: bool,
 ) -> Result<ExecutionResult, Error> {
     // Find the target rows through the backing index when the `WHERE` is a unique point lookup
     // (`DELETE FROM t WHERE pk = const`) — `O(log n)` instead of a full-table `scan_table`. Only for
@@ -4938,7 +5060,8 @@ fn run_delete_single(
         ast::TriggerEvent::Delete,
         engine,
         txn,
-    )?;
+    )?
+    .statement_triggers_if(fire_statement_triggers);
     triggers.fire_stmt_before(&plan.table, engine, txn)?;
     if triggers.has_before_row() {
         for (_, row) in &to_delete {
@@ -5560,6 +5683,7 @@ pub(super) fn run_merge(
             false,
             engine,
             txn,
+            true,
         )?;
     }
     Ok(ExecutionResult::Merged(count))

@@ -805,7 +805,8 @@ table (optionally with a column list) or a `(query)`; the query form is `TO STDO
 the caller's privileges and row policies like any `SELECT`, and resolves unqualified names in the
 default schema, so qualify names from other schemas. Load takes a table only, and binary format is
 not available. A load larger than `--copy-max-bytes` is refused rather than buffered without
-bound.
+bound. Loading into a partitioned table sends each row to its partition, and a row no partition
+accepts refuses the whole load; loading into a partition refuses a row outside its bound.
 
 ---
 
@@ -1250,6 +1251,17 @@ available throughout the body, a `RETURN` only ends it, and a `BEFORE` trigger c
 skip the row either way. Function arguments in the trigger (`EXECUTE FUNCTION f('x')`) are not
 accepted. The action runs in the same transaction as the triggering statement; an error in it
 aborts that statement. Cascading triggers are bounded by a depth limit (`54001`).
+
+On a partitioned table, a row-level trigger runs for the rows of every partition below it,
+whether the statement names the parent or the partition, and also for a partition created or
+attached later. A partition that is detached stops running it. Disabling or dropping the trigger on
+the parent applies to every partition; dropping it on a partition is refused (`2BP01`), and a
+partition cannot have a trigger with the same name as one of its parent's row triggers (`42710`).
+A statement-level trigger fires for the table the statement names: an `INSERT`, `UPDATE` or
+`DELETE` through the parent fires the parent's statement triggers once, after every row in every
+partition is written, and not the partitions' own. Moving a row between partitions with an
+`UPDATE` runs the `DELETE` row triggers of the old partition and then the `INSERT` row triggers of
+the new one. A plain `INHERITS` child does not run its parent's triggers.
 
 `INSTEAD OF` triggers attach to a view and REPLACE the write: DML on the view fires the trigger
 per row (with `NEW` as the proposed view row and `OLD` as the current one) and touches nothing

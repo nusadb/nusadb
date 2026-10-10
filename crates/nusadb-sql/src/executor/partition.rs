@@ -309,6 +309,19 @@ pub(super) fn partition_bound(
     Ok(None)
 }
 
+/// Every `(partition, parent)` edge (schema-qualified keys), read in one pass without decoding
+/// bounds.
+pub(super) fn partition_edges(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, String)>, Error> {
+    Ok(rows(engine, txn)?
+        .into_iter()
+        .filter(|row| field(row, 0) == "part")
+        .map(|row| (field(&row, 1).to_owned(), field(&row, 2).to_owned()))
+        .collect())
+}
+
 /// Every partition of `parent`, decoded at `key_tys`.
 pub(super) fn partitions_of(
     engine: &dyn StorageEngine,

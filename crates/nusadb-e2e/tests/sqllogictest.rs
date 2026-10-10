@@ -527,6 +527,11 @@ fn slt_p1_partition_upsert() {
 }
 
 #[test]
+fn slt_p1_partition_triggers() {
+    run_slt("tests/slt/p1_ddl/partition_triggers.slt");
+}
+
+#[test]
 fn slt_p1_drop_cascade() {
     run_slt("tests/slt/p1_ddl/drop_cascade.slt");
 }
