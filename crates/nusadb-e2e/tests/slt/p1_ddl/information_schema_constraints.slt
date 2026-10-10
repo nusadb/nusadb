@@ -45,3 +45,52 @@ SELECT non_unique, seq_in_index, column_name FROM information_schema.statistics
 WHERE table_name = 'emp' AND index_name = 'idx_emp_age'
 ----
 1 1 age
+
+# Constraints of a table outside `public` are listed under the table's own schema, and a foreign
+# key names the schema of the key it references. A column constraint keeps the name it was given.
+statement ok
+CREATE SCHEMA sales
+
+statement ok
+CREATE TABLE sales.region (id INT PRIMARY KEY, name TEXT CONSTRAINT region_name_ck CHECK (name <> ''))
+
+statement ok
+CREATE TABLE sales.store (id INT PRIMARY KEY, region INT CONSTRAINT store_region_fk REFERENCES sales.region (id))
+
+# A same-named table in `public` with no constraints does not stand in for the one in `sales`.
+statement ok
+CREATE TABLE region (id INT)
+
+query TTTT rowsort
+SELECT constraint_schema, table_schema, table_name, constraint_type FROM information_schema.table_constraints WHERE table_schema = 'sales'
+----
+sales sales region CHECK
+sales sales region PRIMARY KEY
+sales sales store FOREIGN KEY
+sales sales store PRIMARY KEY
+
+query TT rowsort
+SELECT table_name, column_name FROM information_schema.key_column_usage WHERE table_schema = 'sales'
+----
+region id
+store id
+store region
+
+query TT
+SELECT constraint_schema, unique_constraint_schema FROM information_schema.referential_constraints WHERE constraint_name = 'store_region_fk'
+----
+sales sales
+
+query T
+SELECT constraint_schema FROM information_schema.check_constraints WHERE constraint_name = 'region_name_ck'
+----
+sales
+
+statement error violates check constraint "region_name_ck"
+INSERT INTO sales.region VALUES (1, '')
+
+statement ok
+ALTER TABLE sales.region DROP CONSTRAINT region_name_ck
+
+statement ok
+INSERT INTO sales.region VALUES (1, '')

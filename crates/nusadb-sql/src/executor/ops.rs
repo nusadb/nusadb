@@ -3524,11 +3524,12 @@ fn info_schema_referential_constraints(
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
-    for name in &engine.list_tables_as_of(txn)? {
+    // Every table, in its own schema: a constraint is reported under its table's namespace.
+    for (namespace, name) in &engine.list_tables_qualified_as_of(txn)? {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
-        let Some(schema) = engine.lookup_table(name)? else {
+        let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
         for fk in engine.list_foreign_keys(schema.id)? {
@@ -3551,12 +3552,15 @@ fn info_schema_referential_constraints(
                     ) && c.columns == fk.parent_columns
                 })
                 .map(|c| c.name);
+            // The referenced key lives in the parent table's schema.
+            let unique_schema = super::dml::schema_by_id(engine, fk.parent_table)?
+                .map_or_else(|| namespace.clone(), |parent| parent.schema);
             rows.push(vec![
                 ast::Value::Text("nusadb".to_owned()),
-                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(namespace.clone()),
                 ast::Value::Text(fk.name),
                 ast::Value::Text("nusadb".to_owned()),
-                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(unique_schema),
                 unique_name.map_or(ast::Value::Null, ast::Value::Text),
                 ast::Value::Text("NONE".to_owned()),
                 ast::Value::Text(fk_rule_text(fk.on_update).to_owned()),
@@ -3575,11 +3579,12 @@ fn info_schema_check_constraints(
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
-    for name in &engine.list_tables_as_of(txn)? {
+    // Every table, in its own schema: a constraint is reported under its table's namespace.
+    for (namespace, name) in &engine.list_tables_qualified_as_of(txn)? {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
-        let Some(schema) = engine.lookup_table(name)? else {
+        let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
         for c in engine.list_constraints(schema.id)? {
@@ -3595,7 +3600,7 @@ fn info_schema_check_constraints(
                 .unwrap_or_default();
             rows.push(vec![
                 ast::Value::Text("nusadb".to_owned()),
-                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(namespace.clone()),
                 ast::Value::Text(c.name),
                 ast::Value::Text(clause),
             ]);
@@ -3754,11 +3759,12 @@ fn info_schema_table_constraints(
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
-    for name in &engine.list_tables_as_of(txn)? {
+    // Every table, in its own schema: a constraint is reported under its table's namespace.
+    for (namespace, name) in &engine.list_tables_qualified_as_of(txn)? {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
-        let Some(schema) = engine.lookup_table(name)? else {
+        let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
         for c in engine.list_constraints(schema.id)? {
@@ -3770,10 +3776,10 @@ fn info_schema_table_constraints(
             }
             rows.push(vec![
                 ast::Value::Text("nusadb".to_owned()),
-                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(namespace.clone()),
                 ast::Value::Text(c.name),
                 ast::Value::Text("nusadb".to_owned()),
-                ast::Value::Text("public".to_owned()),
+                ast::Value::Text(namespace.clone()),
                 ast::Value::Text(name.clone()),
                 ast::Value::Text(constraint_type_name(c.kind).to_owned()),
             ]);
@@ -3787,21 +3793,22 @@ fn info_schema_table_constraints(
 /// appear. Backs JDBC `getPrimaryKeys`.
 fn info_schema_key_column_usage(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
-    for name in &engine.list_tables_as_of(txn)? {
+    // Every table, in its own schema: a constraint is reported under its table's namespace.
+    for (namespace, name) in &engine.list_tables_qualified_as_of(txn)? {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
             continue;
         }
-        let Some(schema) = engine.lookup_table(name)? else {
+        let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
         for c in engine.list_constraints(schema.id)? {
             for (pos, col) in c.columns.iter().enumerate() {
                 rows.push(vec![
                     ast::Value::Text("nusadb".to_owned()),
-                    ast::Value::Text("public".to_owned()),
+                    ast::Value::Text(namespace.clone()),
                     ast::Value::Text(c.name.clone()),
                     ast::Value::Text("nusadb".to_owned()),
-                    ast::Value::Text("public".to_owned()),
+                    ast::Value::Text(namespace.clone()),
                     ast::Value::Text(name.clone()),
                     ast::Value::Text(col.clone()),
                     ast::Value::Int(i64::try_from(pos + 1).unwrap_or(0)),

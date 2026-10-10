@@ -328,6 +328,8 @@ pub(super) fn convert_column_def(
     let mut generated = None;
     let mut lifted = Vec::new();
     for opt in &col.options {
+        // `CONSTRAINT name` before a column constraint names the CHECK / REFERENCES it becomes.
+        let constraint_name = opt.name.as_ref().map(fold_ident);
         match &opt.option {
             sql::ColumnOption::NotNull => nullable = false,
             sql::ColumnOption::Null => {},
@@ -352,7 +354,7 @@ pub(super) fn convert_column_def(
                     return unsupported("CHECK constraint with ENFORCED / NOT ENFORCED");
                 }
                 lifted.push(ast::TableConstraint::Check {
-                    name: None,
+                    name: constraint_name,
                     predicate_sql: check.expr.to_string(),
                     expr: convert_expr((*check.expr).clone())?,
                 });
@@ -364,7 +366,7 @@ pub(super) fn convert_column_def(
                     return unsupported("REFERENCES ... MATCH FULL/PARTIAL/SIMPLE");
                 }
                 lifted.push(ast::TableConstraint::ForeignKey {
-                    name: None,
+                    name: constraint_name,
                     columns: vec![name.clone()],
                     foreign_table: referenced_table_name(&fk.foreign_table)?,
                     referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
