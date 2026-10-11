@@ -292,28 +292,33 @@ pub struct MergeInsert {
 
 /// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR <query>`.
 ///
-/// NusaDB materializes the query's rows at declaration (a stable snapshot) and keeps the cursor for
-/// the session, so `scroll`/`hold` are accepted for fidelity but every cursor is scrollable and
-/// holdable in practice.
+/// NusaDB materializes the query's rows at declaration (a stable snapshot), so every cursor is
+/// scrollable whether or not `SCROLL` was written. `WITH HOLD` decides the cursor's lifetime: without
+/// it the cursor closes when the transaction that declared it ends, and it can only be declared
+/// inside a transaction block; with it the cursor stays open after that transaction commits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeclareCursor {
     /// The cursor's name.
     pub name: String,
     /// `SCROLL` was requested (backward fetches are always available regardless).
     pub scroll: bool,
-    /// `WITH HOLD` was requested (every NusaDB cursor outlives its transaction regardless).
+    /// `WITH HOLD` was requested: the cursor outlives the transaction that declared it, if that
+    /// transaction commits.
     pub hold: bool,
     /// The query whose rows the cursor returns.
     pub query: Box<Select>,
 }
 
-/// `FETCH <direction> [FROM | IN] name`.
+/// `FETCH <direction> [FROM | IN] name`, or `MOVE <direction> [FROM | IN] name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchCursor {
     /// The cursor's name.
     pub name: String,
     /// The fetch direction / count.
     pub direction: FetchDir,
+    /// `MOVE` rather than `FETCH`: reposition the cursor exactly as the fetch would, but return no
+    /// rows, only how many the fetch would have returned.
+    pub is_move: bool,
 }
 
 /// A `FETCH`/`MOVE` direction. A positive count fetches forward, a negative one backward; the named

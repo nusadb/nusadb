@@ -769,6 +769,11 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_alter_partition(sql) {
         return result;
     }
+    // `FETCH` / `MOVE`: sqlparser has no `MOVE` statement and reads a direction count as an unsigned
+    // number, refusing `ABSOLUTE -1`. Both share one direction grammar, parsed here.
+    if let Some(result) = recognize_fetch_or_move(sql) {
+        return result;
+    }
     let dialect = NusaParserDialect;
     // `WITH x AS [NOT] MATERIALIZED (...)`: sqlparser only parses the CTE materialization keyword for
     // one specific built-in dialect (a hardcoded `dialect_of!` check a custom `Dialect` cannot opt
@@ -4424,6 +4429,7 @@ fn convert_fetch(
     Ok(ast::Statement::FetchCursor(ast::FetchCursor {
         name: fold_ident(name),
         direction: convert_fetch_direction(direction)?,
+        is_move: false,
     }))
 }
 
@@ -4459,6 +4465,135 @@ fn convert_fetch_direction(direction: sql::FetchDirection) -> Result<ast::FetchD
             ast::FetchDir::Backward(limit.as_ref().map(fetch_count).transpose()?)
         },
         F::BackwardAll => ast::FetchDir::BackwardAll,
+    })
+}
+
+/// Recognize `FETCH [<direction>] [FROM | IN] name` and `MOVE` with the same shape.
+///
+/// The direction is one of `NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `n`, `ALL`,
+/// `FORWARD [n | ALL]` or `BACKWARD [n | ALL]`, and every count may carry a sign. With no direction
+/// the statement means `NEXT`. The cursor name is always the last word, so the `FROM`/`IN` keyword
+/// may be left out. Returns `None` for any statement that does not start with either keyword.
+fn recognize_fetch_or_move(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    let head: String = sql
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    let is_move = head.eq_ignore_ascii_case("move");
+    if !is_move && !head.eq_ignore_ascii_case("fetch") {
+        return None;
+    }
+    Some(parse_fetch_or_move(sql, is_move))
+}
+
+/// The words that start a `FETCH`/`MOVE` direction.
+const DIRECTION_WORDS: [&str; 9] = [
+    "next", "prior", "first", "last", "absolute", "relative", "all", "forward", "backward",
+];
+
+/// Parse a statement [`recognize_fetch_or_move`] accepted. See there for the grammar.
+fn parse_fetch_or_move(sql: &str, is_move: bool) -> Result<ast::Statement, Error> {
+    let keyword = if is_move { "MOVE" } else { "FETCH" };
+    let mut tokens: Vec<Token> = Tokenizer::new(&NusaParserDialect, sql)
+        .tokenize()
+        .map_err(|e| Error::Syntax(e.to_string()))?
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    while matches!(tokens.last(), Some(Token::SemiColon)) {
+        tokens.pop();
+    }
+    let is_word = |t: &Token, kw: &str| matches!(t, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(kw));
+    if !is_move && tokens.iter().any(|t| is_word(t, "into")) {
+        return unsupported("FETCH ... INTO is not supported");
+    }
+    // The first token is the statement keyword and the last one names the cursor.
+    let (name, mut direction) = match tokens.split_last() {
+        Some((last @ Token::Word(w), [_, between @ ..]))
+            if !is_word(last, "from") && !is_word(last, "in") =>
+        {
+            let name = if w.quote_style.is_some() {
+                w.value.clone()
+            } else {
+                w.value.to_lowercase()
+            };
+            (name, between)
+        },
+        _ => return Err(Error::Syntax(format!("{keyword} requires a cursor name"))),
+    };
+    if let Some((last, rest)) = direction.split_last()
+        && (is_word(last, "from") || is_word(last, "in"))
+    {
+        direction = rest;
+    } else if let Some(Token::Word(w)) = tokens.last()
+        && w.quote_style.is_none()
+        && DIRECTION_WORDS
+            .iter()
+            .any(|kw| w.value.eq_ignore_ascii_case(kw))
+    {
+        // `FETCH NEXT` names no cursor: a direction word is a name only after FROM/IN or quoted.
+        return Err(Error::Syntax(format!("{keyword} requires a cursor name")));
+    }
+    Ok(ast::Statement::FetchCursor(ast::FetchCursor {
+        name,
+        direction: fetch_direction_from_tokens(direction, keyword)?,
+        is_move,
+    }))
+}
+
+/// The direction part of a `FETCH`/`MOVE` (the tokens between the keyword and `FROM`/`IN`).
+fn fetch_direction_from_tokens(tokens: &[Token], keyword: &str) -> Result<ast::FetchDir, Error> {
+    let word = |t: &Token| match t {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_lowercase()),
+        _ => None,
+    };
+    let Some((first, rest)) = tokens.split_first() else {
+        return Ok(ast::FetchDir::Next);
+    };
+    let bad = || Error::Syntax(format!("unrecognized {keyword} direction"));
+    let Some(first_word) = word(first) else {
+        return Ok(ast::FetchDir::Count(signed_count(tokens, keyword)?));
+    };
+    let rest_word = rest.first().and_then(word);
+    Ok(match (first_word.as_str(), rest.is_empty()) {
+        ("next", true) => ast::FetchDir::Next,
+        ("prior", true) => ast::FetchDir::Prior,
+        ("first", true) => ast::FetchDir::First,
+        ("last", true) => ast::FetchDir::Last,
+        ("all", true) => ast::FetchDir::All,
+        ("absolute", false) => ast::FetchDir::Absolute(signed_count(rest, keyword)?),
+        ("relative", false) => ast::FetchDir::Relative(signed_count(rest, keyword)?),
+        ("forward", true) => ast::FetchDir::Forward(None),
+        ("backward", true) => ast::FetchDir::Backward(None),
+        ("forward", false) if rest.len() == 1 && rest_word.as_deref() == Some("all") => {
+            ast::FetchDir::ForwardAll
+        },
+        ("backward", false) if rest.len() == 1 && rest_word.as_deref() == Some("all") => {
+            ast::FetchDir::BackwardAll
+        },
+        ("forward", false) => ast::FetchDir::Forward(Some(signed_count(rest, keyword)?)),
+        ("backward", false) => ast::FetchDir::Backward(Some(signed_count(rest, keyword)?)),
+        _ => return Err(bad()),
+    })
+}
+
+/// A `FETCH`/`MOVE` count: an integer literal with an optional leading `+` or `-`.
+fn signed_count(tokens: &[Token], keyword: &str) -> Result<i64, Error> {
+    let (negative, digits) = match tokens {
+        [Token::Number(n, _)] | [Token::Plus, Token::Number(n, _)] => (false, n),
+        [Token::Minus, Token::Number(n, _)] => (true, n),
+        _ => {
+            return Err(Error::Syntax(format!("{keyword} expects an integer count")));
+        },
+    };
+    let text = if negative {
+        format!("-{digits}")
+    } else {
+        digits.clone()
+    };
+    text.parse::<i64>().map_err(|_| {
+        Error::InvalidStatement(format!("{keyword} count `{text}` is not a valid integer"))
     })
 }
 

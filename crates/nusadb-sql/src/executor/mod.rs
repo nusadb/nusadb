@@ -290,6 +290,9 @@ pub enum ExecutionResult {
     CursorDeclared,
     /// `CLOSE` — one or all cursors were discarded.
     CursorClosed,
+    /// `MOVE`: a cursor was repositioned. Carries the number of rows a `FETCH` with the same
+    /// direction would have returned.
+    CursorMoved(usize),
     /// `CREATE SCHEMA` succeeded (or `IF NOT EXISTS` made it a no-op).
     SchemaCreated,
     /// `DROP SCHEMA` succeeded (or `IF EXISTS` made it a no-op).
@@ -785,14 +788,23 @@ pub const fn is_cursor_plan(plan: &PhysicalPlan) -> bool {
 ///
 /// A non-cursor plan is handed to [`execute_in_txn_as_streaming_with_settings`] unchanged. A cursor
 /// plan is served from `store`: `DECLARE` runs its query in `txn` and materializes the rows, `FETCH`
-/// replays the requested rows into `sink` (typed when the cursor knows its column types), and `CLOSE`
-/// discards. `txn` is caller-managed, exactly like the delegate — never committed or rolled back here.
+/// replays the requested rows into `sink` (typed when the cursor knows its column types), `MOVE`
+/// repositions, and `CLOSE` discards. `txn` is caller-managed, exactly like the delegate: it is
+/// never committed or rolled back here.
+///
+/// `in_transaction_block` says whether `txn` is an explicit transaction (`BEGIN ... COMMIT`) rather
+/// than a single auto-committed statement; a `DECLARE` without `WITH HOLD` is refused outside one.
+/// A declared cursor is recorded as belonging to `txn`, so the caller must call
+/// [`CursorStore::end_transaction`] when `txn` commits or rolls back, auto-commit included.
 ///
 /// # Errors
 /// Propagates execution errors and any error returned by `sink`.
 #[allow(
     clippy::implicit_hasher,
-    reason = "the wire server's per-connection GUC store is a default-hasher HashMap"
+    clippy::too_many_arguments,
+    reason = "the wire server's per-connection GUC store is a default-hasher HashMap; the arguments \
+              are the statement's execution context plus the connection's cursor store and whether \
+              the transaction is an explicit block, each a separate concern"
 )]
 pub fn execute_in_txn_as_streaming_with_cursors(
     plan: PhysicalPlan,
@@ -801,6 +813,7 @@ pub fn execute_in_txn_as_streaming_with_cursors(
     user: &str,
     settings: &HashMap<String, String>,
     store: &mut CursorStore,
+    in_transaction_block: bool,
     sink: &mut dyn RowSink,
 ) -> Result<StreamOutcome, Error> {
     if !is_cursor_plan(&plan) {
@@ -808,7 +821,10 @@ pub fn execute_in_txn_as_streaming_with_cursors(
     }
     session_ctx::set_session_user_with_settings(user, settings);
     match plan {
-        PhysicalPlan::DeclareCursor { name, query, .. } => {
+        PhysicalPlan::DeclareCursor {
+            name, hold, query, ..
+        } => {
+            store.check_declare(&name, hold, in_transaction_block)?;
             // Types before the plan is consumed, then materialize the rows in this transaction.
             let col_types = describe_column_types(&query);
             let (columns, rows) = if let PhysicalPlan::Select(op, _) = &*query
@@ -830,10 +846,25 @@ pub fn execute_in_txn_as_streaming_with_cursors(
                 };
                 (columns, CursorData::Memory(rows))
             };
-            store.declare(name, columns, col_types, rows);
+            let declared = DeclaredCursor {
+                columns,
+                col_types,
+                rows,
+                hold,
+            };
+            store.declare(name, declared, true);
             Ok(StreamOutcome::Other(ExecutionResult::CursorDeclared))
         },
-        PhysicalPlan::FetchCursor { name, direction } => {
+        PhysicalPlan::FetchCursor {
+            name,
+            direction,
+            is_move: true,
+        } => Ok(StreamOutcome::Other(ExecutionResult::CursorMoved(
+            store.move_cursor(&name, direction)?,
+        ))),
+        PhysicalPlan::FetchCursor {
+            name, direction, ..
+        } => {
             let fetched = store.fetch(&name, direction)?;
             // Advertise the cursor's column types when it has them, else fall back to names only —
             // the same typed/untyped choice `replay_into_sink` makes for a buffered row set.
@@ -1117,7 +1148,8 @@ pub struct Session<'engine> {
     prepared: PreparedStore,
     /// Cursors opened in this session via `DECLARE ... CURSOR`. Each holds the query's rows
     /// materialized at declaration (a stable snapshot) and a position; `FETCH` reads from it and
-    /// `CLOSE` discards it. Cursors are session-lived — every NusaDB cursor behaves like `WITH HOLD`.
+    /// `CLOSE` discards it. A cursor without `WITH HOLD` closes when its transaction ends; a held one
+    /// stays open after its transaction commits.
     cursors: CursorStore,
     /// Result cache: maps `(user, plan)` to the data-version it was computed at plus its
     /// rows. A cached entry is served only in auto-commit, only while the engine's `data_version` is
@@ -1226,6 +1258,11 @@ struct Cursor {
     /// The last-returned row index: `-1` before the first row, `i` on row `i` (`0`-based), and
     /// `rows.len()` after the last row.
     pos: i64,
+    /// Declared `WITH HOLD`: kept open after the declaring transaction commits.
+    hold: bool,
+    /// Declared in a transaction that has not ended yet. A rollback closes such a cursor even when
+    /// it is held, since its declaration is undone with the rest of the transaction.
+    pending: bool,
 }
 
 /// A cursor's captured rows: in memory, or (past the work-memory budget, with spill configured)
@@ -1260,6 +1297,24 @@ fn check_cancel_every(collected: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// The rows one cursor movement passes over: `count` rows starting at index `first` and stepping by
+/// `step` (`1` forward, `-1` backward). `FETCH` reads them; `MOVE` only reports `count`.
+#[derive(Debug, Clone, Copy)]
+struct Visited {
+    first: i64,
+    count: i64,
+    step: i64,
+}
+
+impl Visited {
+    /// A movement that passes over no row.
+    const NONE: Self = Self {
+        first: 0,
+        count: 0,
+        step: 1,
+    };
+}
+
 impl Cursor {
     /// The row count as a signed index bound (a cursor never holds more than `i64::MAX` rows).
     fn len(&self) -> i64 {
@@ -1274,113 +1329,108 @@ impl Cursor {
         }
     }
 
-    /// Step forward up to `count` rows, stopping (positioned after the last row) at the end.
-    fn forward(&mut self, count: i64) -> Result<Vec<Row>, Error> {
-        let mut out = Vec::new();
-        for _ in 0..count {
-            check_cancel_every(out.len())?;
-            if let Some(row) = self.clone_row(self.pos + 1)? {
-                self.pos += 1;
-                out.push(row);
-            } else {
-                self.pos = self.len();
-                break;
-            }
+    /// Step forward over up to `count` rows. The cursor stops on the last row it passed, or after
+    /// the last row when fewer than `count` remained.
+    fn forward(&mut self, count: i64) -> Visited {
+        let start = self.pos;
+        let available = (self.len() - 1 - start).max(0);
+        let taken = count.min(available);
+        self.pos = if count > available {
+            self.len()
+        } else {
+            start + taken
+        };
+        Visited {
+            first: start + 1,
+            count: taken,
+            step: 1,
         }
-        Ok(out)
     }
 
-    /// Step backward up to `count` rows (nearest-first), stopping (positioned before the first row)
-    /// at the start.
-    fn backward(&mut self, count: i64) -> Result<Vec<Row>, Error> {
-        let mut out = Vec::new();
-        for _ in 0..count {
-            check_cancel_every(out.len())?;
-            if let Some(row) = self.clone_row(self.pos - 1)? {
-                self.pos -= 1;
-                out.push(row);
-            } else {
-                self.pos = -1;
-                break;
-            }
+    /// Step backward over up to `count` rows (nearest first). The cursor stops on the last row it
+    /// passed, or before the first row when fewer than `count` remained.
+    fn backward(&mut self, count: i64) -> Visited {
+        let start = self.pos;
+        let available = start.clamp(0, self.len());
+        let taken = count.min(available);
+        self.pos = if count > available { -1 } else { start - taken };
+        Visited {
+            first: start - 1,
+            count: taken,
+            step: -1,
         }
-        Ok(out)
     }
 
-    /// Every remaining row forward; the cursor ends up *after* the last row (unlike a count fetch,
-    /// which stops *on* its last returned row).
-    fn forward_all(&mut self) -> Result<Vec<Row>, Error> {
-        let mut out = Vec::new();
-        while let Some(row) = self.clone_row(self.pos + 1)? {
-            check_cancel_every(out.len())?;
-            self.pos += 1;
-            out.push(row);
-        }
-        self.pos = self.len();
-        Ok(out)
-    }
-
-    /// Every remaining row backward (nearest-first); the cursor ends up before the first row.
-    fn backward_all(&mut self) -> Result<Vec<Row>, Error> {
-        let mut out = Vec::new();
-        while let Some(row) = self.clone_row(self.pos - 1)? {
-            check_cancel_every(out.len())?;
-            self.pos -= 1;
-            out.push(row);
-        }
-        self.pos = -1;
-        Ok(out)
-    }
-
-    /// Land on signed 0-based index `idx`, returning that one row (or nothing when out of range).
-    fn land(&mut self, idx: i64) -> Result<Vec<Row>, Error> {
-        if let Some(row) = self.clone_row(idx)? {
+    /// Land on signed 0-based index `idx`, passing over that one row. Out of range, the cursor ends
+    /// up before the first row (negative `idx`) or after the last row, and passes over nothing.
+    fn land(&mut self, idx: i64) -> Visited {
+        if (0..self.len()).contains(&idx) {
             self.pos = idx;
-            Ok(vec![row])
+            Visited {
+                first: idx,
+                count: 1,
+                step: 1,
+            }
         } else {
             self.pos = if idx < 0 { -1 } else { self.len() };
-            Ok(Vec::new())
+            Visited::NONE
         }
     }
 
-    /// `ABSOLUTE n`: 1-based from the start, or from the end when negative; `0` sits before the first
-    /// row and returns nothing.
-    fn absolute(&mut self, n: i64) -> Result<Vec<Row>, Error> {
+    /// `ABSOLUTE n`: 1-based from the start, or from the end when negative (`-1` is the last row);
+    /// `0` sits before the first row and passes over nothing.
+    fn absolute(&mut self, n: i64) -> Visited {
         match n.cmp(&0) {
             std::cmp::Ordering::Greater => self.land(n - 1),
             std::cmp::Ordering::Less => self.land(self.len() + n),
             std::cmp::Ordering::Equal => {
                 self.pos = -1;
-                Ok(Vec::new())
+                Visited::NONE
             },
         }
     }
 
-    /// Apply a `FETCH` direction, returning the rows it yields and advancing the position. Backward
-    /// directions yield rows in reverse (nearest-first), matching the reference engine.
-    fn fetch(&mut self, direction: ast::FetchDir) -> Result<Vec<Row>, Error> {
+    /// Apply a `FETCH`/`MOVE` direction to the position and return the rows it passes over.
+    /// Backward directions pass over rows nearest first, which is the order `FETCH` returns them.
+    fn reposition(&mut self, direction: ast::FetchDir) -> Visited {
         use ast::FetchDir as D;
-        let last = self.len() - 1;
         match direction {
+            // A zero count re-reads the current row, exactly like `RELATIVE 0`.
+            D::Count(0) | D::Forward(Some(0)) | D::Backward(Some(0)) | D::Relative(0) => {
+                self.land(self.pos)
+            },
             D::Next | D::Forward(None) => self.forward(1),
             D::Prior | D::Backward(None) => self.backward(1),
-            D::First => self.land(0),
-            D::Last => self.land(last),
-            D::All | D::ForwardAll => self.forward_all(),
-            D::BackwardAll => self.backward_all(),
-            D::Count(n) | D::Forward(Some(n)) if n >= 0 => self.forward(n),
-            // A negative `FETCH n` / `FETCH FORWARD n` counts backward, like the reference engine.
-            // `saturating_neg` keeps `n == i64::MIN` from overflowing (a scan that big stops at the
-            // start long before the count is reached anyway).
+            D::First => self.absolute(1),
+            D::Last => self.absolute(-1),
+            D::All | D::ForwardAll => self.forward(i64::MAX),
+            D::BackwardAll => self.backward(i64::MAX),
+            D::Count(n) | D::Forward(Some(n)) if n > 0 => self.forward(n),
+            // A negative `FETCH n` / `FETCH FORWARD n` counts backward. `saturating_neg` keeps
+            // `n == i64::MIN` from overflowing (no cursor holds that many rows anyway).
             D::Count(n) | D::Forward(Some(n)) => self.backward(n.saturating_neg()),
-            D::Backward(Some(n)) if n >= 0 => self.backward(n),
+            D::Backward(Some(n)) if n > 0 => self.backward(n),
             D::Backward(Some(n)) => self.forward(n.saturating_neg()),
             D::Absolute(n) => self.absolute(n),
-            // `RELATIVE n`: `n` positions from the current row; `0` re-reads the current row.
-            // `saturating_add` turns an absurd offset into a past-the-end/before-the-start landing
-            // (empty), rather than an arithmetic overflow.
+            // `RELATIVE n`: `n` positions from the current row. `saturating_add` turns an absurd
+            // offset into a landing before the start or past the end rather than an overflow.
             D::Relative(n) => self.land(self.pos.saturating_add(n)),
         }
+    }
+
+    /// Read the rows a movement passed over, in that order.
+    fn read(&mut self, visited: Visited) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::new();
+        let mut idx = visited.first;
+        for _ in 0..visited.count {
+            check_cancel_every(out.len())?;
+            let row = self
+                .clone_row(idx)?
+                .ok_or_else(|| Error::Internal(format!("cursor row {idx} is out of range")))?;
+            out.push(row);
+            idx += visited.step;
+        }
+        Ok(out)
     }
 }
 
@@ -1398,8 +1448,10 @@ pub struct CursorRows {
 /// A per-connection (or per-session) set of open cursors.
 ///
 /// Owns each cursor's materialized rows and scan position; `DECLARE` inserts, `FETCH` reads and
-/// advances, `CLOSE` discards. Held behind the wire server's per-connection lock so cursors are
-/// private to one connection and survive across the statements on it.
+/// advances, `MOVE` advances, `CLOSE` discards. Held behind the wire server's per-connection lock so
+/// cursors are private to one connection and survive across the statements on it. Whoever owns the
+/// transaction calls [`end_transaction`](Self::end_transaction) when it ends, which closes the
+/// cursors that do not outlive it.
 #[derive(Debug, Default)]
 pub struct CursorStore {
     cursors: HashMap<String, Cursor>,
@@ -1412,38 +1464,65 @@ impl CursorStore {
         Self::default()
     }
 
-    /// Open (or replace) a cursor over an already-materialized row set, positioned before the first
-    /// row.
-    fn declare(
-        &mut self,
-        name: String,
-        columns: Vec<String>,
-        col_types: Vec<ColumnType>,
-        rows: CursorData,
-    ) {
+    /// Refuse a `DECLARE` before its query runs: a cursor without `WITH HOLD` needs an explicit
+    /// transaction to belong to (`25P01` otherwise), and the name must not already be open (`42P03`).
+    /// The open cursor of that name is left as it was.
+    fn check_declare(&self, name: &str, hold: bool, in_transaction: bool) -> Result<(), Error> {
+        if !hold && !in_transaction {
+            return Err(Error::NoActiveTransaction(
+                "DECLARE CURSOR can only be used in transaction blocks (declare it WITH HOLD to \
+                 use it outside one)"
+                    .to_owned(),
+            ));
+        }
+        if self.cursors.contains_key(name) {
+            return Err(Error::DuplicateCursor(format!(
+                "cursor \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Open a cursor over an already-materialized row set, positioned before the first row.
+    /// `pending` marks a cursor whose declaring transaction is still open.
+    fn declare(&mut self, name: String, cursor: DeclaredCursor, pending: bool) {
         self.cursors.insert(
             name,
             Cursor {
-                columns,
-                col_types,
-                rows,
+                columns: cursor.columns,
+                col_types: cursor.col_types,
+                rows: cursor.rows,
                 pos: -1,
+                hold: cursor.hold,
+                pending,
             },
         );
     }
 
+    /// The named open cursor. `Err(CursorNotFound)` when it is not open.
+    fn cursor(&mut self, name: &str) -> Result<&mut Cursor, Error> {
+        self.cursors
+            .get_mut(name)
+            .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))
+    }
+
     /// Apply a `FETCH` to the named cursor. `Err(CursorNotFound)` when it is not open.
     fn fetch(&mut self, name: &str, direction: ast::FetchDir) -> Result<CursorRows, Error> {
-        let cursor = self
-            .cursors
-            .get_mut(name)
-            .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))?;
-        let rows = cursor.fetch(direction)?;
+        let cursor = self.cursor(name)?;
+        let visited = cursor.reposition(direction);
+        let rows = cursor.read(visited)?;
         Ok(CursorRows {
             columns: cursor.columns.clone(),
             col_types: cursor.col_types.clone(),
             rows,
         })
+    }
+
+    /// Apply a `MOVE` to the named cursor: the same repositioning as `FETCH`, returning how many
+    /// rows the fetch would have returned. `Err(CursorNotFound)` when it is not open.
+    fn move_cursor(&mut self, name: &str, direction: ast::FetchDir) -> Result<usize, Error> {
+        let visited = self.cursor(name)?.reposition(direction);
+        Ok(usize::try_from(visited.count).unwrap_or(0))
     }
 
     /// Close one cursor (`Err(CursorNotFound)` when it is not open) or, for `ALL`, every cursor.
@@ -1460,6 +1539,25 @@ impl CursorStore {
         }
         Ok(())
     }
+
+    /// Settle the cursors at the end of a transaction. Every cursor declared without `WITH HOLD`
+    /// closes. On commit the held cursors stay open; on rollback the held cursors declared in that
+    /// transaction close too, and only those declared by an earlier, committed transaction remain.
+    pub fn end_transaction(&mut self, committed: bool) {
+        self.cursors
+            .retain(|_, cursor| cursor.hold && (committed || !cursor.pending));
+        for cursor in self.cursors.values_mut() {
+            cursor.pending = false;
+        }
+    }
+}
+
+/// A cursor's materialized query, ready to be stored by [`CursorStore::declare`].
+struct DeclaredCursor {
+    columns: Vec<String>,
+    col_types: Vec<ColumnType>,
+    rows: CursorData,
+    hold: bool,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -1705,8 +1803,19 @@ impl<'engine> Session<'engine> {
             PhysicalPlan::Execute { name, args } => self.execute_prepared(&name, &args),
             // Cursors live in the session (like prepared statements): DECLARE materializes the query,
             // FETCH reads from the stored snapshot, CLOSE discards it.
-            PhysicalPlan::DeclareCursor { name, query, .. } => self.declare_cursor(name, *query),
-            PhysicalPlan::FetchCursor { name, direction } => self.fetch_cursor(&name, direction),
+            PhysicalPlan::DeclareCursor {
+                name, hold, query, ..
+            } => self.declare_cursor(name, hold, *query),
+            PhysicalPlan::FetchCursor {
+                name,
+                direction,
+                is_move: true,
+            } => Ok(ExecutionResult::CursorMoved(
+                self.cursors.move_cursor(&name, direction)?,
+            )),
+            PhysicalPlan::FetchCursor {
+                name, direction, ..
+            } => self.fetch_cursor(&name, direction),
             PhysicalPlan::CloseCursor(target) => {
                 self.cursors.close(&target)?;
                 Ok(ExecutionResult::CursorClosed)
@@ -1801,12 +1910,16 @@ impl<'engine> Session<'engine> {
     }
 
     /// `DECLARE ... CURSOR`: run the query now (in this session's transaction context) and store its
-    /// rows as a session cursor positioned before the first row. A same-named cursor is replaced.
+    /// rows as a session cursor positioned before the first row. A name that is already open is
+    /// refused (`42P03`), and so is a cursor without `WITH HOLD` outside a transaction (`25P01`).
     fn declare_cursor(
         &mut self,
         name: String,
+        hold: bool,
         query: PhysicalPlan,
     ) -> Result<ExecutionResult, Error> {
+        let in_transaction = self.current_txn.is_some();
+        self.cursors.check_declare(&name, hold, in_transaction)?;
         let col_types = describe_column_types(&query);
         if matches!(query, PhysicalPlan::Select(..)) {
             // Pin the session context first: the spill threshold is the session's `work_mem`.
@@ -1820,8 +1933,13 @@ impl<'engine> Session<'engine> {
                 let _exec_ctx = eval::bind_exec_context(self.engine, txn);
                 capture_cursor_rows(op, &config, self.engine, txn)
             })?;
-            self.cursors
-                .declare(name, output_columns(op), col_types, rows);
+            let declared = DeclaredCursor {
+                columns: output_columns(op),
+                col_types,
+                rows,
+                hold,
+            };
+            self.cursors.declare(name, declared, in_transaction);
             return Ok(ExecutionResult::CursorDeclared);
         }
         let ExecutionResult::Rows { columns, rows, .. } = self.run_within_txn(query)? else {
@@ -1829,8 +1947,14 @@ impl<'engine> Session<'engine> {
                 "a cursor's query did not produce a row set".to_owned(),
             ));
         };
-        self.cursors
-            .declare(name, columns, col_types, CursorData::Memory(rows));
+        let declared = DeclaredCursor {
+            columns,
+            col_types,
+            rows: CursorData::Memory(rows),
+            hold,
+        };
+        // Outside a transaction the statement has already committed, so the cursor is settled.
+        self.cursors.declare(name, declared, in_transaction);
         Ok(ExecutionResult::CursorDeclared)
     }
 
@@ -2319,10 +2443,12 @@ impl<'engine> Session<'engine> {
             let _ = self.engine.rollback(txn);
             self.txn_read_only = false;
             self.end_txn_gucs(false);
+            self.cursors.end_transaction(false);
             return Err(e.into());
         }
         self.txn_read_only = false;
         self.end_txn_gucs(true);
+        self.cursors.end_transaction(true);
         Ok(ExecutionResult::TransactionCommitted)
     }
 
@@ -2330,6 +2456,9 @@ impl<'engine> Session<'engine> {
         let txn = self.current_txn.take().ok_or_else(|| {
             Error::NoActiveTransaction("ROLLBACK without an active transaction".to_owned())
         })?;
+        // The cursors close with the transaction even if the engine reports a failed rollback:
+        // the session leaves the transaction either way.
+        self.cursors.end_transaction(false);
         self.engine.rollback(txn)?;
         self.txn_read_only = false;
         self.end_txn_gucs(false);

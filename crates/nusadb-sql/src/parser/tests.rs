@@ -6221,3 +6221,87 @@ fn moderate_nesting_is_accepted() {
     // A handful of nested subqueries.
     parse("SELECT (SELECT (SELECT (SELECT 1)))").expect("four nested subqueries parse");
 }
+
+// --- FETCH / MOVE -------------------------------------------------------
+
+/// The cursor statement `sql` parses to, as `(name, direction, is_move)`.
+fn cursor_stmt(sql: &str) -> (String, ast::FetchDir, bool) {
+    let ast::Statement::FetchCursor(f) = ok(sql) else {
+        panic!("expected FetchCursor for {sql}");
+    };
+    (f.name, f.direction, f.is_move)
+}
+
+#[test]
+fn fetch_and_move_accept_every_direction_with_signed_counts() {
+    use ast::FetchDir as D;
+    let cases = [
+        ("FETCH NEXT FROM c", D::Next),
+        ("FETCH PRIOR IN c", D::Prior),
+        ("FETCH FIRST FROM c", D::First),
+        ("FETCH LAST FROM c", D::Last),
+        ("FETCH ABSOLUTE -1 FROM c", D::Absolute(-1)),
+        ("FETCH ABSOLUTE +3 FROM c", D::Absolute(3)),
+        ("FETCH RELATIVE -2 FROM c", D::Relative(-2)),
+        ("FETCH -4 FROM c", D::Count(-4)),
+        ("FETCH 4 FROM c", D::Count(4)),
+        ("FETCH ALL FROM c", D::All),
+        ("FETCH FORWARD FROM c", D::Forward(None)),
+        ("FETCH FORWARD -2 FROM c", D::Forward(Some(-2))),
+        ("FETCH FORWARD ALL FROM c", D::ForwardAll),
+        ("FETCH BACKWARD FROM c", D::Backward(None)),
+        ("FETCH BACKWARD 7 IN c", D::Backward(Some(7))),
+        ("FETCH BACKWARD ALL FROM c", D::BackwardAll),
+        ("FETCH c", D::Next),
+        ("FETCH FROM c;", D::Next),
+        (
+            "FETCH ABSOLUTE -9223372036854775808 FROM c",
+            D::Absolute(i64::MIN),
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(cursor_stmt(sql), ("c".to_owned(), want, false), "{sql}");
+        let moved = sql.replacen("FETCH", "MOVE", 1);
+        assert_eq!(cursor_stmt(&moved), ("c".to_owned(), want, true), "{moved}");
+    }
+    // Names fold like any identifier; a quoted name keeps its case.
+    assert_eq!(cursor_stmt("move relative -2 in Cur").0, "cur");
+    assert_eq!(cursor_stmt("FETCH NEXT FROM \"Cur\"").0, "Cur");
+    // A direction word names a cursor after FROM/IN, or quoted.
+    assert_eq!(cursor_stmt("FETCH FROM next").0, "next");
+    assert_eq!(cursor_stmt("MOVE \"all\"").0, "all");
+    // A comment before the keyword changes nothing.
+    assert_eq!(
+        cursor_stmt("/* back */ MOVE RELATIVE -2 IN c"),
+        ("c".to_owned(), D::Relative(-2), true)
+    );
+    assert_eq!(
+        cursor_stmt("-- last row\nFETCH ABSOLUTE -1 FROM c"),
+        ("c".to_owned(), D::Absolute(-1), false)
+    );
+}
+
+#[test]
+fn malformed_fetch_and_move_are_syntax_errors() {
+    for sql in [
+        "MOVE",
+        "MOVE FORWARD 2",
+        "MOVE NEXT FROM",
+        "FETCH SIDEWAYS 2 FROM c",
+        "FETCH ABSOLUTE FROM c",
+        "MOVE RELATIVE - FROM c",
+        "FETCH 1.5 FROM c",
+        "MOVE 99999999999999999999 FROM c",
+        "FETCH NEXT",
+        "MOVE ALL",
+        "fetch backward",
+        "FETCH ABSOLUTE 2 FROM",
+    ] {
+        let err = parse(sql).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42601", "{sql}: {err}");
+    }
+    assert!(matches!(
+        parse("FETCH NEXT FROM c INTO x"),
+        Err(Error::Unsupported(_))
+    ));
+}

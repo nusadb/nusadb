@@ -332,7 +332,7 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `TRUNCATE` | `TRUNCATE TABLE` |
 | `LOCK TABLE` | `LOCK TABLE` |
 | `PREPARE` / `DEALLOCATE` | `PREPARE` / `DEALLOCATE` (embedded API only — see §14) |
-| `DECLARE` / `CLOSE`, `FETCH` | `DECLARE CURSOR` / `CLOSE CURSOR` / `FETCH <rowcount>` (embedded API only — see §14) |
+| `DECLARE` / `CLOSE`, `FETCH`, `MOVE` | `DECLARE CURSOR` / `CLOSE CURSOR` / `FETCH <rowcount>` / `MOVE <count>` (the rows the same `FETCH` would have returned) |
 | `VACUUM` / `ANALYZE` / `COMMENT` | `VACUUM` / `ANALYZE` / `COMMENT` |
 | `REINDEX` / `CHECKPOINT` | `REINDEX` / `CHECKPOINT` |
 | `CLUSTER` (accepted, no-op) | `CLUSTER` |
@@ -575,11 +575,11 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
   | `27` | triggered data change violation | `27000` a `BEFORE` trigger skipped or re-keyed a row a referential action writes |
   | `2B` | dependent objects still exist | `2BP01` — resolve with `CASCADE` |
   | `2F` | SQL routine exception | `2F005` a function body finished without returning a value |
-  | `34` | invalid cursor name | `34000` no such portal |
+  | `34` | invalid cursor name | `34000` no such portal, or no such open cursor |
   | `3D` | invalid catalog (database) name | `3D000` |
   | `3F` | invalid schema name | `3F000` |
   | `40` | transaction rollback — **retryable** | `40001` serialization failure, `40P01` deadlock |
-  | `42` | syntax error or access rule violation | `42601` syntax or a malformed statement, `42501` permission denied. **Not there:** `42P01` table, `42703` column, `42704` other named object (role, type, text-search configuration), `42883` function *or no form of it with these arguments*, `42P02` a `$n` never bound. **There but wrong:** `42809` right name, wrong kind of object, `42846` a cast between types with no conversion, `42P10` an invalid column reference, `42P16` an invalid table definition, `428C9` a value supplied for a `GENERATED ALWAYS` column. **Already there:** `42P07` table, `42701` column, `42710`/`42723` other object. **Wrong type or shape:** `42804` a type the context cannot take, `42P18` a type that cannot be inferred, `42803` an aggregate where the grouping does not allow one. Also `42602` an invalid name and `42P04` a database that already exists |
+  | `42` | syntax error or access rule violation | `42601` syntax or a malformed statement, `42501` permission denied. **Not there:** `42P01` table, `42703` column, `42704` other named object (role, type, text-search configuration), `42883` function *or no form of it with these arguments*, `42P02` a `$n` never bound. **There but wrong:** `42809` right name, wrong kind of object, `42846` a cast between types with no conversion, `42P10` an invalid column reference, `42P16` an invalid table definition, `428C9` a value supplied for a `GENERATED ALWAYS` column. **Already there:** `42P07` table, `42701` column, `42710`/`42723` other object, `42P03` an open cursor of that name. **Wrong type or shape:** `42804` a type the context cannot take, `42P18` a type that cannot be inferred, `42803` an aggregate where the grouping does not allow one. Also `42602` an invalid name and `42P04` a database that already exists |
   | `44` | WITH CHECK OPTION violation | `44000` a row written through a view breaks its `CHECK OPTION` |
   | `53` | insufficient resources — **back off and retry** | `53300` too many connections; the server closes the connection after sending it |
   | `54` | program limit exceeded — the request must get smaller | `54000` a built-in limit (row cap, nesting depth, value size), `54001` recursion limit |

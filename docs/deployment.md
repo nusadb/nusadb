@@ -213,7 +213,7 @@ falls back to holding the result when the query reads the target table, has a su
 target has triggers, foreign keys or incrementally maintained views). `REFRESH MATERIALIZED VIEW`
 keeps the new rows in a spill file until the old ones are replaced. A cursor over a `SELECT` whose
 result is larger than `--work-mem` keeps its rows in a spill file, which `FETCH` reads by position
-in any direction and `CLOSE` removes. `UPDATE`, `DELETE` and `MERGE` read their target table as a
+in any direction and `CLOSE`, or the end of the cursor's transaction, removes. `UPDATE`, `DELETE` and `MERGE` read their target table as a
 stream, and the source of an `UPDATE ... FROM`, `DELETE ... USING` or `MERGE` that outgrows
 `--work-mem` is spilled:
 split by the join's equality key into partitions joined one at a time, or read from disk for each

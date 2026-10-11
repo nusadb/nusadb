@@ -397,6 +397,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::Deleted(n)
         | ExecutionResult::Merged(n)
         | ExecutionResult::MaterializedViewRefreshed(n)
+        | ExecutionResult::CursorMoved(n)
         | ExecutionResult::Vacuumed(n) => DBOutput::StatementComplete(n as u64),
         ExecutionResult::Rows { rows, .. } => {
             let types = rows

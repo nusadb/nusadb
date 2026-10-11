@@ -45,7 +45,7 @@ A quick map from the statement you are looking for to the section that shows it.
 | `CREATE FUNCTION`, `CREATE PROCEDURE`, `CALL`, `DO` | [Routines and triggers](#routines-and-triggers) |
 | `CREATE` / `ALTER` / `DROP TRIGGER` | [Triggers](#triggers) |
 | `PREPARE`, `EXECUTE`, `DEALLOCATE`, parameters `$1..$n` | [Prepared statements](#prepared-statements) |
-| `DECLARE`, `FETCH`, `CLOSE` | [Cursors](#cursors) |
+| `DECLARE`, `FETCH`, `MOVE`, `CLOSE` | [Cursors](#cursors) |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `SET TRANSACTION` | [Transactions and locking](#transactions-and-locking) |
 | `SELECT ... FOR UPDATE`, `LOCK TABLE` | [Row and table locks](#row-and-table-locks) |
 | `LISTEN`, `UNLISTEN`, `NOTIFY` | [Notifications](#notifications) |
@@ -1388,11 +1388,54 @@ CLOSE c;
 COMMIT;
 ```
 
-A cursor is session-scoped: it may be declared with or without an open transaction, and it stays
-open across `COMMIT` and `ROLLBACK` until an explicit `CLOSE` (or the session ends) — it is not
-bound to the transaction that declared it. A `SCROLL` cursor fetches in any direction (`NEXT`,
-`PRIOR`, `FIRST`, `LAST`, `ABSOLUTE`, `RELATIVE`, `FORWARD`/`BACKWARD`). Fetching from an unknown
-cursor is `34000`.
+`MOVE` takes the same directions as `FETCH` and positions the cursor exactly as that `FETCH` would,
+but returns no rows. Its command tag is `MOVE <count>`, where the count is the number of rows the
+`FETCH` would have returned.
+
+```sql
+MOVE FORWARD 100 IN c;   -- skip ahead; the tag says how many rows were passed over
+MOVE ABSOLUTE 0 IN c;    -- back to before the first row
+```
+
+The directions are `NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, a bare count `n`,
+`ALL`, `FORWARD [n | ALL]` and `BACKWARD [n | ALL]`. With no direction the statement means `NEXT`,
+and the `FROM` or `IN` before the cursor name may be left out. Every cursor can move in any
+direction, whether or not it was declared `SCROLL`.
+
+Counts are signed:
+
+- `ABSOLUTE n` goes to the n-th row from the start; a negative `n` counts from the end, so
+  `ABSOLUTE -1` is the last row and `ABSOLUTE -2` the one before it. `ABSOLUTE 0` goes to before
+  the first row and returns nothing.
+- `RELATIVE n` moves `n` rows from the current one, backward when `n` is negative.
+- A negative count in `FETCH n` or `FORWARD n` reads backward, and a negative `BACKWARD n` reads
+  forward. A count of `0` (and `RELATIVE 0`) re-reads the current row.
+- Asking for a row before the first or after the last returns nothing and leaves the cursor
+  before the first row or after the last one; the next `FETCH NEXT` or `FETCH PRIOR` starts from
+  there. A count that runs off either end returns the rows it found and stops in the same place.
+
+Backward reads return rows nearest first.
+
+A cursor belongs to the transaction that declares it:
+
+- Without `WITH HOLD`, the cursor closes when that transaction ends, by `COMMIT` or `ROLLBACK`,
+  and fetching from it afterwards is `34000`. Such a cursor can only be declared inside
+  `BEGIN ... COMMIT`; outside a transaction block `DECLARE` is refused with `25P01`.
+- With `WITH HOLD`, the cursor stays open after its transaction commits, until `CLOSE` or the end of
+  the session. It may be declared outside a transaction block. If its transaction rolls back, the
+  cursor is closed with it.
+
+```sql
+DECLARE recent CURSOR WITH HOLD FOR SELECT id FROM orders ORDER BY id DESC;
+FETCH 50 FROM recent;
+CLOSE recent;
+```
+
+Declaring a name that is already open is refused with `42P03`, and the open cursor keeps its rows
+and position. Fetching from, moving or closing an unknown cursor is `34000`.
+
+A `DECLARE` sent through the extended query protocol may use `$n` parameters in its query. The bound
+values are substituted when the cursor is declared, so the rows it returns are fixed then.
 
 ---
 
@@ -1863,12 +1906,12 @@ on the message text.
 | `23505` | unique violation | |
 | `23514` | check violation | also a row that fits no partition, or the wrong partition |
 | `25001` | active transaction | `SET TRANSACTION` after the first query |
-| `25P01` | no active transaction | `SAVEPOINT` outside `BEGIN` |
+| `25P01` | no active transaction | `SAVEPOINT`, or `DECLARE` without `WITH HOLD`, outside `BEGIN` |
 | `25P02` | transaction aborted | `ROLLBACK`, then start again |
 | `26000` | unknown prepared statement | `PREPARE` it again |
 | `2BP01` | dependent objects exist | drop them, or use `CASCADE` |
 | `2F005` | function ended without `RETURN` | give every path through the body a `RETURN <value>` |
-| `34000` | unknown cursor | |
+| `34000` | unknown cursor | also a cursor its transaction's end has closed |
 | `3F000` | schema does not exist | |
 | `40001` | serialization failure | retry the whole transaction |
 | `40P01` | deadlock detected | retry the whole transaction |
@@ -1883,6 +1926,7 @@ on the message text.
 | `42883` | undefined function, or no matching signature | also an `EXECUTE` with the wrong argument count |
 | `428C9` | writing a `GENERATED ALWAYS` column | use `OVERRIDING SYSTEM VALUE`, or omit the column |
 | `42P01` / `42P07` | undefined / duplicate table | |
+| `42P03` | duplicate cursor | `CLOSE` the open cursor, or pick another name |
 | `44000` | row violates a view's `WITH CHECK OPTION` | |
 | `53300` | too many connections | only with `--reject-excess-connections`; back off and retry |
 | `54000` | program limit exceeded | the request must get smaller |

@@ -1,15 +1,18 @@
-# p5_advanced/cursors — DECLARE ... CURSOR / FETCH / CLOSE.
+# p5_advanced/cursors: DECLARE ... CURSOR / FETCH / MOVE / CLOSE.
 # The cursor's query is materialized at declaration (a stable snapshot), so every FETCH direction —
 # forward, backward, absolute, relative — is available. Every expected result here is what the
 # reference engine returns for the same sequence. Order matters, so no sort mode.
 #
-# Note: the `FROM` / `IN` keyword before the cursor name is required (`FETCH 2 FROM cur`).
+# A cursor without WITH HOLD belongs to its transaction, so most of this file runs inside one.
 
 statement ok
 CREATE TABLE c (n INT)
 
 statement ok
 INSERT INTO c VALUES (1), (2), (3), (4), (5)
+
+statement ok
+BEGIN
 
 statement ok
 DECLARE cur SCROLL CURSOR FOR SELECT n FROM c ORDER BY n
@@ -94,17 +97,230 @@ query I
 FETCH RELATIVE 9223372036854775807 FROM cur
 ----
 
+# Signed counts. ABSOLUTE counts from the end when negative: -1 is the last row.
+query I
+FETCH ABSOLUTE -1 FROM cur
+----
+5
+
+query I
+FETCH ABSOLUTE -2 FROM cur
+----
+4
+
+query I
+FETCH RELATIVE -1 FROM cur
+----
+3
+
+# A negative FORWARD count reads backward, a negative BACKWARD count forward.
+query I
+FETCH FORWARD -2 FROM cur
+----
+2
+1
+
+query I
+FETCH BACKWARD -2 FROM cur
+----
+2
+3
+
+query I
+FETCH +1 FROM cur
+----
+4
+
+# Out of range in either direction returns nothing and parks the cursor before the first row or
+# after the last one.
+query I
+FETCH ABSOLUTE -6 FROM cur
+----
+
+query I
+FETCH NEXT FROM cur
+----
+1
+
+query I
+FETCH ABSOLUTE 6 FROM cur
+----
+
+query I
+FETCH PRIOR FROM cur
+----
+5
+
+query I
+FETCH RELATIVE -10 FROM cur
+----
+
+query I
+FETCH NEXT FROM cur
+----
+1
+
+# A zero count re-reads the current row, like RELATIVE 0.
+query I
+FETCH 0 FROM cur
+----
+1
+
+query I
+FETCH FORWARD 0 FROM cur
+----
+1
+
+query I
+FETCH BACKWARD 0 IN cur
+----
+1
+
+# FROM / IN may be left out.
+query I
+FETCH cur
+----
+2
+
+query I
+FETCH NEXT cur
+----
+3
+
+# MOVE repositions exactly like FETCH and reports how many rows the FETCH would have returned.
+statement count 0
+MOVE ABSOLUTE 0 IN cur
+
+query I
+FETCH NEXT FROM cur
+----
+1
+
+statement count 2
+MOVE FORWARD 2 IN cur
+
+query I
+FETCH NEXT FROM cur
+----
+4
+
+statement count 1
+MOVE RELATIVE -2 IN cur
+
+query I
+FETCH NEXT FROM cur
+----
+3
+
+# Only two rows remain past row 3, and the cursor ends up after the last row.
+statement count 2
+MOVE FORWARD 100 IN cur
+
+query I
+FETCH PRIOR FROM cur
+----
+5
+
+statement count 4
+MOVE BACKWARD ALL FROM cur
+
+query I
+FETCH NEXT FROM cur
+----
+1
+
+statement count 1
+MOVE LAST IN cur
+
+statement count 0
+MOVE NEXT FROM cur
+
+statement count 1
+MOVE -1 FROM cur
+
+query I
+FETCH PRIOR FROM cur
+----
+4
+
+statement count 1
+MOVE cur
+
+statement count 3
+MOVE BACKWARD 3 FROM cur
+
+query I
+FETCH PRIOR FROM cur
+----
+1
+
+statement count 4
+MOVE ALL IN cur
+
+statement count 1
+MOVE ABSOLUTE -1 IN cur
+
+statement count 0
+MOVE RELATIVE 1 IN cur
+
+statement count 1
+MOVE FIRST FROM cur
+
+statement count 0
+MOVE PRIOR FROM cur
+
+statement count 5
+MOVE FORWARD ALL FROM cur
+
+statement count 0
+MOVE FORWARD FROM cur
+
+statement count 1
+MOVE BACKWARD FROM cur
+
+query I
+FETCH 0 FROM cur
+----
+5
+
 statement ok
 CLOSE cur
 
+statement ok
+COMMIT
+
 # A closed (or never-declared) cursor is a loud error, not an empty result.
-statement error
+statement error does not exist
 FETCH NEXT FROM cur
 
-statement error
+statement error does not exist
 CLOSE cur
 
+# --- re-declaring an open cursor name fails and leaves the open cursor alone ---
+statement ok
+DECLARE dup CURSOR WITH HOLD FOR SELECT n FROM c ORDER BY n
+
+query I
+FETCH 2 FROM dup
+----
+1
+2
+
+statement error already exists
+DECLARE dup CURSOR WITH HOLD FOR SELECT n FROM c WHERE n > 100
+
+query I
+FETCH NEXT FROM dup
+----
+3
+
+statement ok
+CLOSE dup
+
 # --- an empty result set fetches nothing in either direction ---
+statement ok
+BEGIN
+
 statement ok
 DECLARE ec SCROLL CURSOR FOR SELECT n FROM c WHERE n > 99
 
@@ -115,6 +331,9 @@ FETCH ALL FROM ec
 query I
 FETCH BACKWARD ALL FROM ec
 ----
+
+statement count 0
+MOVE ALL FROM ec
 
 statement ok
 CLOSE ec
@@ -129,8 +348,86 @@ DECLARE k2 CURSOR FOR SELECT n FROM c
 statement ok
 CLOSE ALL
 
-statement error
+statement ok
+COMMIT
+
+statement error does not exist
 FETCH NEXT FROM k1
+
+# --- the transaction decides a cursor's lifetime ---
+
+# Without WITH HOLD a cursor needs a transaction block to belong to.
+statement error transaction blocks
+DECLARE nt CURSOR FOR SELECT n FROM c
+
+# WITH HOLD may be declared on its own; it is committed at once and stays open.
+statement ok
+DECLARE solo CURSOR WITH HOLD FOR SELECT n FROM c ORDER BY n
+
+query I
+FETCH 2 FROM solo
+----
+1
+2
+
+# A plain cursor closes at COMMIT; a held one survives it, keeping its position.
+statement ok
+BEGIN
+
+statement ok
+DECLARE plain CURSOR FOR SELECT n FROM c ORDER BY n
+
+statement ok
+DECLARE held CURSOR WITH HOLD FOR SELECT n FROM c ORDER BY n
+
+query I
+FETCH NEXT FROM held
+----
+1
+
+statement ok
+COMMIT
+
+statement error does not exist
+FETCH NEXT FROM plain
+
+query I
+FETCH NEXT FROM held
+----
+2
+
+# A rollback closes every cursor its transaction declared, held or not. Held cursors from earlier,
+# committed transactions stay open.
+statement ok
+BEGIN
+
+statement ok
+DECLARE plain2 CURSOR FOR SELECT n FROM c ORDER BY n
+
+statement ok
+DECLARE held2 CURSOR WITH HOLD FOR SELECT n FROM c ORDER BY n
+
+statement ok
+ROLLBACK
+
+statement error does not exist
+FETCH NEXT FROM plain2
+
+statement error does not exist
+FETCH NEXT FROM held2
+
+query I
+FETCH NEXT FROM held
+----
+3
+
+query I
+FETCH NEXT FROM solo
+----
+3
+
+statement ok
+CLOSE ALL
 
 statement ok
 DROP TABLE c

@@ -6114,3 +6114,141 @@ async fn a_function_statement_inside_a_partitioned_write_fires_its_triggers() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// What one simple query produced: its data rows (first column, as text), then the command tag or
+/// the SQLSTATE, then the transaction status `ReadyForQuery` reported.
+async fn simple_outcome(
+    conn: &mut Connection<tokio::io::DuplexStream>,
+    sql: &str,
+) -> (Vec<String>, Result<String, String>, TxnStatus) {
+    query(conn, sql).await;
+    let mut rows = Vec::new();
+    let mut outcome = Err("no reply".to_owned());
+    loop {
+        match next(conn).await {
+            BackendMessage::DataRow { values } => {
+                let first = values.into_iter().next().flatten().unwrap_or_default();
+                rows.push(String::from_utf8(first).unwrap());
+            },
+            BackendMessage::CommandComplete { tag } => outcome = Ok(tag),
+            BackendMessage::Error { code, .. } => outcome = Err(code),
+            BackendMessage::ReadyForQuery(status) => return (rows, outcome, status),
+            _ => {},
+        }
+    }
+}
+
+/// A `DECLARE` sent through `Parse`/`Bind`/`Execute` takes its `$1` from `Bind`, and the value is
+/// fixed when the cursor is declared: the rows it fetches later are the ones the bound value chose.
+#[tokio::test]
+async fn declare_cursor_takes_its_parameters_from_bind() {
+    let (mut conn, handle) = seeded_three_rows().await;
+    let (_, tag, status) = simple_outcome(&mut conn, "BEGIN").await;
+    assert_eq!(
+        (tag, status),
+        (Ok("BEGIN".to_owned()), TxnStatus::InTransaction)
+    );
+
+    parse_bind_text(
+        &mut conn,
+        "DECLARE c CURSOR FOR SELECT id FROM t WHERE id > $1 ORDER BY id",
+        vec![Some(b"1".to_vec())],
+    )
+    .await;
+    execute_sync(&mut conn, 0).await;
+    assert_eq!(next(&mut conn).await, cc("DECLARE CURSOR"));
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::ReadyForQuery(TxnStatus::InTransaction)
+    );
+
+    // Rows inserted after the DECLARE are not in the cursor: its query ran at declaration.
+    let (_, tag, _) = simple_outcome(&mut conn, "INSERT INTO t VALUES (4)").await;
+    assert_eq!(tag, Ok("INSERT 1".to_owned()));
+    let (rows, tag, status) = simple_outcome(&mut conn, "FETCH ALL FROM c").await;
+    assert_eq!(rows, ["2", "3"]);
+    assert_eq!(tag, Ok("FETCH 2".to_owned()));
+    assert_eq!(status, TxnStatus::InTransaction);
+
+    let (_, tag, status) = simple_outcome(&mut conn, "COMMIT").await;
+    assert_eq!((tag, status), (Ok("COMMIT".to_owned()), TxnStatus::Idle));
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
+/// Cursor lifetime and the refusals a driver branches on, over a real connection: `MOVE` reports
+/// its count in the tag, a re-declared name is `42P03`, a cursor without `WITH HOLD` outside a
+/// transaction is `25P01`, and a plain cursor is gone after `COMMIT` (`34000`) while a held one
+/// survives it.
+#[tokio::test]
+async fn cursor_lifetime_and_refusals_over_the_wire() {
+    let (mut conn, handle) = seeded_three_rows().await;
+
+    let (_, tag, _) = simple_outcome(&mut conn, "DECLARE c CURSOR FOR SELECT id FROM t").await;
+    assert_eq!(tag, Err("25P01".to_owned()));
+
+    let (_, tag, _) = simple_outcome(&mut conn, "BEGIN").await;
+    assert_eq!(tag, Ok("BEGIN".to_owned()));
+    let (_, tag, _) = simple_outcome(
+        &mut conn,
+        "DECLARE plain CURSOR FOR SELECT id FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(tag, Ok("DECLARE CURSOR".to_owned()));
+    let (_, tag, _) = simple_outcome(
+        &mut conn,
+        "DECLARE held CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(tag, Ok("DECLARE CURSOR".to_owned()));
+    let (_, tag, _) = simple_outcome(&mut conn, "MOVE FORWARD 100 IN plain").await;
+    assert_eq!(tag, Ok("MOVE 3".to_owned()));
+    let (rows, tag, _) = simple_outcome(&mut conn, "FETCH ABSOLUTE -1 FROM held").await;
+    assert_eq!(
+        (rows, tag),
+        (vec!["3".to_owned()], Ok("FETCH 1".to_owned()))
+    );
+    let (_, tag, _) = simple_outcome(&mut conn, "COMMIT").await;
+    assert_eq!(tag, Ok("COMMIT".to_owned()));
+
+    let (_, tag, status) = simple_outcome(&mut conn, "FETCH NEXT FROM plain").await;
+    assert_eq!((tag, status), (Err("34000".to_owned()), TxnStatus::Idle));
+    let (rows, tag, _) = simple_outcome(&mut conn, "FETCH RELATIVE -1 FROM held").await;
+    assert_eq!(
+        (rows, tag),
+        (vec!["2".to_owned()], Ok("FETCH 1".to_owned()))
+    );
+
+    // A re-declared name is refused and the open cursor keeps its position.
+    let (_, tag, _) = simple_outcome(
+        &mut conn,
+        "DECLARE held CURSOR WITH HOLD FOR SELECT id FROM t WHERE id > 100",
+    )
+    .await;
+    assert_eq!(tag, Err("42P03".to_owned()));
+    let (rows, _, _) = simple_outcome(&mut conn, "FETCH NEXT FROM held").await;
+    assert_eq!(rows, ["3"]);
+
+    // A held cursor declared in a transaction that rolls back is gone with it.
+    let (_, tag, _) = simple_outcome(&mut conn, "BEGIN").await;
+    assert_eq!(tag, Ok("BEGIN".to_owned()));
+    let (_, tag, _) = simple_outcome(
+        &mut conn,
+        "DECLARE gone CURSOR WITH HOLD FOR SELECT id FROM t",
+    )
+    .await;
+    assert_eq!(tag, Ok("DECLARE CURSOR".to_owned()));
+    let (_, tag, _) = simple_outcome(&mut conn, "ROLLBACK").await;
+    assert_eq!(tag, Ok("ROLLBACK".to_owned()));
+    let (_, tag, _) = simple_outcome(&mut conn, "FETCH NEXT FROM gone").await;
+    assert_eq!(tag, Err("34000".to_owned()));
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

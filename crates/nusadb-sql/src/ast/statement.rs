@@ -425,7 +425,8 @@ pub enum Statement {
     CommentOn(CommentOn),
     /// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR <query>` — open a cursor over a query.
     DeclareCursor(DeclareCursor),
-    /// `FETCH <direction> [FROM | IN] name` — read rows from an open cursor.
+    /// `FETCH <direction> [FROM | IN] name` reads rows from an open cursor; `MOVE` with the same
+    /// shape repositions it without returning them.
     FetchCursor(FetchCursor),
     /// `CLOSE {name | ALL}` — discard an open cursor, or all of them.
     CloseCursor(CloseTarget),

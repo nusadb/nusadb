@@ -436,12 +436,14 @@ pub enum LogicalPlan {
         /// The cursor's query (a [`LogicalPlan::Select`]).
         query: Box<Self>,
     },
-    /// `FETCH` from an open cursor.
+    /// `FETCH` from an open cursor, or `MOVE` it.
     FetchCursor {
         /// The cursor's name.
         name: String,
         /// The direction / count.
         direction: crate::ast::FetchDir,
+        /// `MOVE`: reposition only, returning the row count instead of the rows.
+        is_move: bool,
     },
     /// `CLOSE` an open cursor, or all of them.
     CloseCursor(crate::ast::CloseTarget),
@@ -2719,12 +2721,14 @@ pub enum PhysicalPlan {
         /// The cursor's query plan.
         query: Box<Self>,
     },
-    /// `FETCH` from an open cursor.
+    /// `FETCH` from an open cursor, or `MOVE` it.
     FetchCursor {
         /// The cursor's name.
         name: String,
         /// The direction / count.
         direction: crate::ast::FetchDir,
+        /// `MOVE`: reposition only, returning the row count instead of the rows.
+        is_move: bool,
     },
     /// `CLOSE` an open cursor, or all of them.
     CloseCursor(crate::ast::CloseTarget),

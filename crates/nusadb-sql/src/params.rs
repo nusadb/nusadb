@@ -200,6 +200,7 @@ fn count_stmt(stmt: &ast::Statement, max: &mut usize) {
         },
         ast::Statement::Merge(merge) => count_merge(merge, max),
         ast::Statement::Explain(inner, _) => count_stmt(inner, max),
+        ast::Statement::DeclareCursor(declare) => count_select(&declare.query, max),
         // A nested `CALL`'s arguments may reference the enclosing procedure's `$n`.
         ast::Statement::Call(call) => {
             for arg in &call.args {
@@ -668,6 +669,8 @@ fn substitute_stmt(stmt: &mut ast::Statement, params: &[ast::Expr]) -> Result<()
         },
         ast::Statement::Merge(merge) => substitute_merge(merge, params),
         ast::Statement::Explain(inner, _) => substitute_stmt(inner, params),
+        // A cursor's query is bound now, so the values are fixed when it is declared.
+        ast::Statement::DeclareCursor(declare) => substitute_select(&mut declare.query, params),
         // A nested `CALL`'s arguments may reference the enclosing procedure's `$n`.
         ast::Statement::Call(call) => {
             for arg in &mut call.args {

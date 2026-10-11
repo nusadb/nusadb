@@ -142,9 +142,11 @@ transaction; the other modes are refused.
 ## Cursors
 
 A cursor reads a large result in pieces without holding it all on the client. Its rows are captured
-when the cursor is declared, and it is session-scoped: it may be declared with or without an open
-transaction and stays open across `COMMIT` and `ROLLBACK` until an explicit `CLOSE` (or the session
-ends), rather than being closed when the transaction ends.
+when the cursor is declared. A cursor declared without `WITH HOLD` belongs to its transaction: it
+can only be declared inside `BEGIN ... COMMIT` (`25P01` otherwise) and closes when the transaction
+commits or rolls back. A `WITH HOLD` cursor stays open after its transaction commits, until `CLOSE`
+or the end of the session, and is closed if that transaction rolls back. See
+[the SQL reference](sql-reference.md#cursors) for `FETCH` and `MOVE`.
 
 ```sql
 BEGIN;

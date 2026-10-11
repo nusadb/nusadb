@@ -137,8 +137,14 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             hold,
             query: Box::new(plan(*query)),
         },
-        LogicalPlan::FetchCursor { name, direction } => {
-            PhysicalPlan::FetchCursor { name, direction }
+        LogicalPlan::FetchCursor {
+            name,
+            direction,
+            is_move,
+        } => PhysicalPlan::FetchCursor {
+            name,
+            direction,
+            is_move,
         },
         LogicalPlan::CloseCursor(target) => PhysicalPlan::CloseCursor(target),
         LogicalPlan::CreateSchema(p) => PhysicalPlan::CreateSchema(p),

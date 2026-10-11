@@ -858,8 +858,9 @@ where
     let mut plan_cache = nusadb_sql::PlanCache::new();
     // Per-connection open cursors (`DECLARE ... CURSOR`). Behind an `Arc<Mutex>` like `settings` so it
     // can be shared into each statement's `spawn_blocking` task; statements on one connection run
-    // serially, so the lock is never contended. Scoped to this connection — cursors are private to it
-    // and outlive individual transactions (every NusaDB cursor behaves like `WITH HOLD`).
+    // serially, so the lock is never contended. Private to this connection. A cursor without
+    // `WITH HOLD` closes when its transaction ends (`settle_cursors_after_stmt`); a held one stays
+    // open after its transaction commits.
     let cursors: Arc<std::sync::Mutex<nusadb_sql::CursorStore>> =
         Arc::new(std::sync::Mutex::new(nusadb_sql::CursorStore::new()));
     // Per-connection prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE` as SQL). Shared into each
@@ -1037,6 +1038,7 @@ where
                     .await?;
                     txn_state = new_state;
                     plan_cache = new_cache;
+                    settle_cursors_after_stmt(&cursors, control.as_ref(), ok, old_state, new_state);
                     // Fire any temporary-table ON COMMIT actions this commit triggered, before the
                     // `ReadyForQuery` boundary so a following statement observes the effect.
                     let on_commit_fire = on_commit_after_stmt(
@@ -1245,6 +1247,13 @@ where
                     .await?;
                     txn_state = new_state;
                     plan_cache = new_cache;
+                    settle_cursors_after_stmt(
+                        &cursors,
+                        on_commit_control.as_ref(),
+                        ok,
+                        old_state,
+                        new_state,
+                    );
                     let on_commit_fire = on_commit_after_stmt(
                         &mut on_commit,
                         on_commit_create,
@@ -1306,6 +1315,13 @@ where
                 )
                 .await;
                 txn_state = new_state;
+                settle_cursors_after_stmt(
+                    &cursors,
+                    on_commit_sql.as_deref().and_then(txn_control_kind).as_ref(),
+                    executed.is_ok(),
+                    old_state,
+                    new_state,
+                );
                 if let Some(sql) = on_commit_sql {
                     let on_commit_fire = on_commit_after_stmt(
                         &mut on_commit,
@@ -2783,6 +2799,7 @@ fn execute_streamed_with_session_state(
     physical: nusadb_sql::PhysicalPlan,
     engine: &dyn StorageEngine,
     txn: TxnId,
+    in_transaction_block: bool,
     user: &str,
     snapshot: &HashMap<String, String>,
     cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
@@ -2794,7 +2811,14 @@ fn execute_streamed_with_session_state(
             .lock()
             .map_err(|_| nusadb_sql::Error::Internal("cursor store lock poisoned".to_owned()))?;
         return nusadb_sql::execute_in_txn_as_streaming_with_cursors(
-            physical, engine, txn, user, snapshot, &mut store, sink,
+            physical,
+            engine,
+            txn,
+            user,
+            snapshot,
+            &mut store,
+            in_transaction_block,
+            sink,
         );
     }
     if nusadb_sql::is_prepare_plan(&physical) {
@@ -2861,7 +2885,7 @@ fn stream_stmt_in_state(
                 return StmtRun::Punt;
             }
             let outcome = execute_streamed_with_session_state(
-                physical, engine, txn, user, snapshot, cursors, prepared, sink,
+                physical, engine, txn, true, user, snapshot, cursors, prepared, sink,
             );
             match outcome {
                 Ok(o) => StmtRun::Done(
@@ -2961,12 +2985,19 @@ fn stream_stmt_autocommit(
             let _ = engine.rollback(txn);
             return StmtRun::Punt;
         }
+        // A cursor statement is settled with its one-statement transaction, so a `WITH HOLD`
+        // cursor declared by an attempt that then fails to commit does not linger (and does not make
+        // the retry below collide with its own name).
+        let settle = nusadb_sql::is_cursor_plan(&physical).then_some(cursors);
         let outcome = execute_streamed_with_session_state(
-            physical, engine, txn, user, snapshot, cursors, prepared, sink,
+            physical, engine, txn, false, user, snapshot, cursors, prepared, sink,
         );
         let failure = match outcome {
             Ok(o) => match engine.commit(txn) {
-                Ok(()) => return StmtRun::Done(Ok(o), TxnState::Auto),
+                Ok(()) => {
+                    end_cursor_transaction(settle, true);
+                    return StmtRun::Done(Ok(o), TxnState::Auto);
+                },
                 Err(e) => {
                     let _ = engine.rollback(txn);
                     e.into()
@@ -2977,6 +3008,7 @@ fn stream_stmt_autocommit(
                 err
             },
         };
+        end_cursor_transaction(settle, false);
         // A failure re-running cannot resolve, or one there is no attempt left for: reported exactly
         // as it arrived, so an application's own retry loop still sees its `40001`.
         if !nusadb_sql::retry::is_retryable_conflict(&failure) {
@@ -3658,6 +3690,38 @@ fn detect_on_commit_create(sql: &str, temp_schema: &str) -> Option<OnCommitEntry
             })
         },
         nusadb_sql::ast::OnCommit::PreserveRows => None,
+    }
+}
+
+/// Close the cursors that end with an explicit transaction. `old_state`/`new_state` bracket one
+/// statement: when it left the transaction block, the transaction committed only if it was active,
+/// the statement was a `COMMIT` and it succeeded. A `COMMIT` of a failed transaction, one the engine
+/// refused, and a `ROLLBACK` all roll back. Auto-commit statements settle their own cursors in
+/// [`stream_stmt_autocommit`].
+fn settle_cursors_after_stmt(
+    cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    control: Option<&TxnControl>,
+    ok: bool,
+    old_state: TxnState,
+    new_state: TxnState,
+) {
+    if !in_transaction_block(&old_state) || in_transaction_block(&new_state) {
+        return;
+    }
+    let committed = ok
+        && matches!(old_state, TxnState::Active { .. })
+        && matches!(control, Some(TxnControl::Commit));
+    end_cursor_transaction(Some(cursors), committed);
+}
+
+/// Apply [`CursorStore::end_transaction`](nusadb_sql::CursorStore::end_transaction) to `cursors`,
+/// when given. A poisoned lock is skipped: the connection is already being torn down.
+fn end_cursor_transaction(
+    cursors: Option<&std::sync::Mutex<nusadb_sql::CursorStore>>,
+    committed: bool,
+) {
+    if let Some(mut store) = cursors.and_then(|c| c.lock().ok()) {
+        store.end_transaction(committed);
     }
 }
 
@@ -5043,6 +5107,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::Deallocated => "DEALLOCATE".to_owned(),
         ExecutionResult::CursorDeclared => "DECLARE CURSOR".to_owned(),
         ExecutionResult::CursorClosed => "CLOSE CURSOR".to_owned(),
+        ExecutionResult::CursorMoved(count) => format!("MOVE {count}"),
         ExecutionResult::SchemaCreated => "CREATE SCHEMA".to_owned(),
         ExecutionResult::SchemaDropped => "DROP SCHEMA".to_owned(),
         ExecutionResult::DatabaseCreated => "CREATE DATABASE".to_owned(),

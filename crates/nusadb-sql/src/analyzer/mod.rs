@@ -1194,6 +1194,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::FetchCursor(fetch) => Ok(LogicalPlan::FetchCursor {
             name: fetch.name,
             direction: fetch.direction,
+            is_move: fetch.is_move,
         }),
         ast::Statement::CloseCursor(target) => Ok(LogicalPlan::CloseCursor(target)),
     }
