@@ -11,13 +11,16 @@
 //! 3. a **grant** exists for the privilege, held by any role the session effectively has —
 //!    itself, `PUBLIC`, or any role it inherits membership in, transitively.
 //!
+//! One grant to `PUBLIC` exists without a catalog row: `CREATE` on the `public` schema, which holds
+//! until it is revoked (see [`is_builtin_public_grant`]).
+//!
 //! Nothing else grants. Absence of a grant is a denial, so a corrupt or unreadable catalog row
 //! narrows access rather than widening it: every read path below skips rows it cannot decode
 //! instead of guessing at their meaning.
 //!
 //! # Storage
 //!
-//! Four catalog tables, created lazily on first write, following the same all-text shape as the
+//! Catalog tables, created lazily on first write, following the same all-text shape as the
 //! row-level-security catalogs. No `StorageEngine` treaty change: everything here is ordinary rows
 //! in ordinary tables, which also means grants are transactional and crash-safe for free —
 //! a `GRANT` inside a rolled-back transaction never took effect.
@@ -28,6 +31,7 @@
 //! | [`ROLE_MEMBER_CATALOG`] | `role`, `member`, `admin` |
 //! | [`PRIVILEGE_CATALOG`] | `grantee`, `kind`, `object`, `privilege`, `grantor`, `grantable` |
 //! | [`OWNER_CATALOG`] | `kind`, `object`, `owner` |
+//! | [`REVOKED_DEFAULT_CATALOG`] | `kind`, `object`, `privilege` |
 //!
 //! # Objects that predate this catalog
 //!
@@ -57,6 +61,8 @@ pub const PRIVILEGE_CATALOG: &str = "nusadb_privileges";
 pub const COLUMN_PRIVILEGE_CATALOG: &str = "nusadb_column_privileges";
 /// Object ownership.
 pub const OWNER_CATALOG: &str = "nusadb_owners";
+/// Built-in `PUBLIC` grants that have been revoked. See [`is_builtin_public_grant`].
+pub const REVOKED_DEFAULT_CATALOG: &str = "nusadb_revoked_defaults";
 
 /// `(name, superuser, login, createdb, createrole, inherit)`.
 const ROLE_SCHEMA: [ColumnType; 6] = [
@@ -89,6 +95,9 @@ const COLUMN_PRIVILEGE_SCHEMA: [ColumnType; 6] = [
 ];
 /// `(kind, object, owner)`.
 const OWNER_SCHEMA: [ColumnType; 3] = [ColumnType::Text, ColumnType::Text, ColumnType::Text];
+/// `(kind, object, privilege)`.
+const REVOKED_DEFAULT_SCHEMA: [ColumnType; 3] =
+    [ColumnType::Text, ColumnType::Text, ColumnType::Text];
 
 /// The boolean spelling used in the all-text catalogs.
 const TRUE: &str = "t";
@@ -702,7 +711,12 @@ impl ResolvedSession {
         }
         let owner = object_owner(engine, txn, kind, object)?;
         let grants = all_grants(engine, txn)?;
-        Ok(self.decide(&owner, &grants, kind, object, privilege, false))
+        if self.decide(&owner, &grants, kind, object, privilege, false) {
+            return Ok(true);
+        }
+        // A built-in grant to `PUBLIC` that no catalog row records holds until it is revoked.
+        Ok(is_builtin_public_grant(kind, object, privilege)
+            && !builtin_grant_revoked(engine, txn, kind, object, privilege)?)
     }
 
     /// Column-scoped decision over pre-fetched grants: a table-wide privilege on the object grants
@@ -1274,6 +1288,125 @@ pub fn downgrade_grant_option(
     record.grantable = false;
     insert_grant(engine, txn, &record)?;
     Ok(true)
+}
+
+// === Built-in grants =======================================================
+
+/// Whether `privilege` on `object` is held by `PUBLIC` out of the box, without a catalog row.
+///
+/// There is exactly one: `CREATE` on the `public` schema, so that every role can create tables in
+/// the default namespace as it always could. It stays in force until an operator runs `REVOKE
+/// CREATE ON SCHEMA public FROM PUBLIC`, which [`set_builtin_grant_revoked`] records. An explicit
+/// `GRANT ... TO PUBLIC` afterwards brings it back as an ordinary catalog row.
+#[must_use]
+pub fn is_builtin_public_grant(kind: ObjectKind, object: &str, privilege: Privilege) -> bool {
+    kind == ObjectKind::Schema
+        && privilege == Privilege::Create
+        && object == nusadb_core::PUBLIC_SCHEMA
+}
+
+/// Whether the built-in `PUBLIC` grant of `privilege` on `object` has been revoked.
+///
+/// The marker is kept when the object is dropped, so a `public` schema that is dropped and created
+/// again does not quietly hand `CREATE` back to every role.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn builtin_grant_revoked(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    kind: ObjectKind,
+    object: &str,
+    privilege: Privilege,
+) -> Result<bool, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, REVOKED_DEFAULT_CATALOG)? else {
+        return Ok(false);
+    };
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &REVOKED_DEFAULT_SCHEMA)?;
+        if let [
+            ast::Value::Text(k),
+            ast::Value::Text(o),
+            ast::Value::Text(p),
+        ] = row.as_slice()
+            && k == kind.as_str()
+            && o == object
+            && p == privilege.as_str()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Record (`revoked = true`) or clear the revocation of a built-in `PUBLIC` grant. A call for a
+/// privilege that is not built in does nothing.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn set_builtin_grant_revoked(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    kind: ObjectKind,
+    object: &str,
+    privilege: Privilege,
+    revoked: bool,
+) -> Result<(), Error> {
+    if !is_builtin_public_grant(kind, object, privilege) {
+        return Ok(());
+    }
+    clear_revoked_defaults(engine, txn, kind, object, Some(privilege))?;
+    if revoked {
+        let cat = ensure_catalog(
+            engine,
+            txn,
+            REVOKED_DEFAULT_CATALOG,
+            &["kind", "object", "privilege"],
+        )?;
+        let row = [
+            ast::Value::Text(kind.as_str().to_owned()),
+            ast::Value::Text(object.to_owned()),
+            ast::Value::Text(privilege.as_str().to_owned()),
+        ];
+        let bytes = row::encode(&row, &REVOKED_DEFAULT_SCHEMA)?;
+        engine.insert(txn, cat, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Remove revocation markers for an object, limited to `privilege` when given.
+fn clear_revoked_defaults(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    kind: ObjectKind,
+    object: &str,
+    privilege: Option<Privilege>,
+) -> Result<(), Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, REVOKED_DEFAULT_CATALOG)? else {
+        return Ok(());
+    };
+    let mut victims = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &REVOKED_DEFAULT_SCHEMA)?;
+        if let [
+            ast::Value::Text(k),
+            ast::Value::Text(o),
+            ast::Value::Text(p),
+        ] = row.as_slice()
+            && k == kind.as_str()
+            && o == object
+            && privilege.is_none_or(|want| p == want.as_str())
+        {
+            victims.push(tid);
+        }
+    }
+    drop(scan);
+    for tid in victims {
+        engine.delete(txn, cat.id, tid)?;
+    }
+    Ok(())
 }
 
 /// Remove every grant on an object — used when the object is dropped, so a later object reusing

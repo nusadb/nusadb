@@ -396,6 +396,9 @@ impl Catalog for RecordingCatalog<'_> {
     fn may_create_role(&self) -> Result<bool, Error> {
         self.inner.may_create_role()
     }
+    fn may_create_database(&self) -> Result<bool, Error> {
+        self.inner.may_create_database()
+    }
     fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
         self.inner.may_administer_role(role)
     }

@@ -1752,6 +1752,25 @@ grants are what restrict a role. A role that lacks a privilege is refused with `
 column outside its column grant is refused the same way even through `SELECT *`. The bootstrap
 superuser `nusadb-root` bypasses every check.
 
+Creating a table, view, materialized view, sequence, function, procedure, type or domain needs
+`CREATE` on the schema it lands in. A schema's owner (the role that created it) always has it, and
+other roles need a grant. Functions, procedures, types, domains and materialized views always live
+in `public`. Every role may create in `public` until that is revoked:
+
+```sql
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;   -- lock the default schema down
+GRANT CREATE ON SCHEMA public TO app;         -- let one role back in
+GRANT CREATE ON SCHEMA reporting TO analyst;
+CREATE TABLE evil (id BIGINT);                -- as a role without the grant:
+-- ERROR 42501: permission denied: CREATE on schema "public" is required to create objects in it
+```
+
+The revoke is stored in the catalog and survives a restart; `GRANT CREATE ON SCHEMA public TO
+PUBLIC` restores the default. Temporary tables need no grant. `CREATE INDEX` needs ownership of the
+table and `CREATE TRIGGER` the `TRIGGER` privilege on it. `CREATE SCHEMA` and `CREATE DATABASE` need
+the `CREATEDB` role attribute. `USAGE` on a schema can be granted and revoked but is not checked
+when a name is looked up.
+
 Row-level security restricts which rows a role sees or may write:
 
 ```sql

@@ -719,6 +719,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                         "schema-qualified MATERIALIZED VIEW".to_owned(),
                     ));
                 }
+                dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             } else {
                 // A plain view is keyed by name, like a sequence: a non-public schema qualifies the
                 // key (`dev.v`), a public one keeps the bare name, and an unqualified name resolves in
@@ -727,6 +728,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                     .schema
                     .clone()
                     .unwrap_or_else(|| catalog.current_schema());
+                dcl::require_schema_create(catalog, &schema)?;
                 cv.name = qualified_display(&schema, &cv.name);
             }
             analyze_create_materialized_view(cv, catalog)
@@ -759,6 +761,8 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         },
         // CREATE TYPE ... AS ENUM: validate the labels (at least one, distinct) and persist.
         ast::Statement::CreateEnum(ce) => {
+            // Type names are not schema-qualified; every type lives in `public`.
+            dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             if ce.labels.is_empty() {
                 return Err(Error::InvalidStatement(
                     "CREATE TYPE ... AS ENUM requires at least one label".to_owned(),
@@ -780,6 +784,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // registry write happen in the executor (which alone reads the type catalogs), mirroring the
         // deferred ENUM resolution.
         ast::Statement::CreateComposite(cc) => {
+            dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             if cc.fields.is_empty() {
                 return Err(Error::InvalidStatement(
                     "CREATE TYPE ... AS (...) requires at least one field".to_owned(),
@@ -798,7 +803,10 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE DOMAIN: the base type + CHECK predicates were validated to parse in the parser; a
         // predicate's meaning is checked against the base type when a column of the domain is created
         // (the injected CHECK is analyzed then), mirroring the deferred ENUM resolution.
-        ast::Statement::CreateDomain(cd) => Ok(LogicalPlan::CreateDomain(cd)),
+        ast::Statement::CreateDomain(cd) => {
+            dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
+            Ok(LogicalPlan::CreateDomain(cd))
+        },
         ast::Statement::DropDomain(dd) => Ok(LogicalPlan::DropDomain(dd)),
         // CREATE/DROP TRIGGER: validate the target table; the action + WHEN bodies
         // are kept as text and re-analyzed (with NEW/OLD bound) when the trigger fires.
@@ -827,6 +835,8 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // run (with `$n` bound to the call arguments) by the executor's procedure module.
         ast::Statement::CreateProcedure(cp) => {
             enforce_system_catalog(&cp.name, catalog)?;
+            // Routine names are not schema-qualified; every routine lives in `public`.
+            dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             let param_names: Vec<String> = cp
                 .params
                 .iter()
@@ -870,6 +880,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE/DROP FUNCTION: a SQL scalar function, inlined at call sites by the analyzer.
         ast::Statement::CreateFunction(cf) => {
             enforce_system_catalog(&cf.name, catalog)?;
+            dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             Ok(LogicalPlan::CreateFunction(CreateFunctionPlan {
                 name: cf.name,
                 or_replace: cf.or_replace,
@@ -991,6 +1002,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 .schema
                 .clone()
                 .unwrap_or_else(|| catalog.current_schema());
+            dcl::require_schema_create(catalog, &schema)?;
             cs.name = qualified_display(&schema, &cs.name);
             analyze_create_sequence(cs).map(LogicalPlan::CreateSequence)
         },
@@ -1273,6 +1285,7 @@ fn analyze_create_table_as(
     // Same rule as a plain `CREATE TABLE`: an explicit qualifier wins, otherwise the session's
     // current schema. Without this the statement created in `public` whatever it was told.
     let target_schema = ct.schema.unwrap_or_else(|| catalog.current_schema());
+    dcl::require_schema_create(catalog, &target_schema)?;
     let exists = catalog.lookup_table_in(&target_schema, &ct.name)?.is_some()
         || catalog.lookup_view(&ct.name)?.is_some();
     if exists && !ct.if_not_exists {

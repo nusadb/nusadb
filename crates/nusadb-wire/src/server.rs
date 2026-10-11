@@ -4933,6 +4933,12 @@ impl Catalog for EngineCatalog<'_> {
         nusadb_sql::rbac::may_create_role(self.engine, self.txn, self.user)
     }
 
+    fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
+        // Without this the trait's permissive default answered, and any login role could create
+        // a schema or database over the wire.
+        nusadb_sql::rbac::may_create_database(self.engine, self.txn, self.user)
+    }
+
     fn may_administer_role(&self, role: &str) -> Result<bool, nusadb_sql::Error> {
         nusadb_sql::rbac::may_administer_role(self.engine, self.txn, self.user, role)
     }

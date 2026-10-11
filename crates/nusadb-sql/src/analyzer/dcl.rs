@@ -214,6 +214,25 @@ pub(super) fn require_schema_ownership(
     )))
 }
 
+/// Creating an object inside `schema` needs `CREATE` on that schema: a superuser, the schema's
+/// owner, or a role holding the privilege directly, through a membership, or through `PUBLIC`.
+/// The `public` schema carries a built-in `CREATE` for `PUBLIC` until it is revoked (see
+/// [`crate::rbac::is_builtin_public_grant`]), so this only bites once an operator has locked it down.
+///
+/// # Errors
+/// [`Error::PermissionDenied`] when the session may not create in `schema`.
+pub(super) fn require_schema_create(catalog: &dyn Catalog, schema: &str) -> Result<(), Error> {
+    if catalog.is_superuser() {
+        return Ok(());
+    }
+    if catalog.has_privilege(ObjectKind::Schema, schema, Privilege::Create)? {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied(format!(
+        "CREATE on schema \"{schema}\" is required to create objects in it"
+    )))
+}
+
 /// Emptying the whole database (`DROP DATABASE`) is a cluster-level operation with no finer
 /// ownership model yet, so it is restricted to a superuser — fail-closed until a database-owner
 /// model exists.

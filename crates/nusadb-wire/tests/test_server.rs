@@ -2731,6 +2731,109 @@ async fn copy_is_refused_without_the_matching_table_privilege() {
     terminate_conn(su, su_handle).await;
 }
 
+/// `REVOKE CREATE ON SCHEMA public FROM PUBLIC` takes effect over the wire: a plain role can no
+/// longer create tables in `public` (42501), nor mint a schema of its own, while its temporary
+/// tables and a later explicit grant keep working.
+#[tokio::test]
+async fn schema_create_privilege_is_enforced_over_the_wire() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    /// Drain a statement, returning `(sqlstate, message)` if an error arrived.
+    async fn outcome(
+        conn: &mut Connection<tokio::io::DuplexStream>,
+        sql: &str,
+    ) -> Option<(String, String)> {
+        query(conn, sql).await;
+        let mut err = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { code, message } => err = Some((code, message)),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        err
+    }
+
+    let (mut su, su_handle) = connect(&engine, "nusadb-root").await;
+    for sql in [
+        "CREATE ROLE app LOGIN",
+        "GRANT USAGE ON SCHEMA public TO app",
+    ] {
+        assert_eq!(outcome(&mut su, sql).await, None, "{sql}");
+    }
+
+    let (mut app, app_handle) = connect(&engine, "app").await;
+    // The built-in default: creating in `public` works before anything is revoked.
+    assert_eq!(
+        outcome(&mut app, "CREATE TABLE early (id BIGINT)").await,
+        None
+    );
+
+    for sql in [
+        "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
+        "REVOKE CREATE ON SCHEMA public FROM app",
+    ] {
+        assert_eq!(outcome(&mut su, sql).await, None, "{sql}");
+    }
+
+    let (code, message) = outcome(&mut app, "CREATE TABLE evil (id BIGINT)")
+        .await
+        .expect("CREATE TABLE in a locked public schema must be refused");
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("schema \"public\""), "{message}");
+
+    let (code, message) = outcome(&mut app, "CREATE SCHEMA evil_schema")
+        .await
+        .expect("a role without CREATEDB must not create a schema");
+    assert_eq!(code, "42501", "{message}");
+
+    // A temporary table lives in the connection's own temp schema and needs no grant.
+    assert_eq!(
+        outcome(&mut app, "CREATE TEMP TABLE scratch (id BIGINT)").await,
+        None
+    );
+
+    assert_eq!(
+        outcome(&mut su, "GRANT CREATE ON SCHEMA public TO app").await,
+        None
+    );
+    assert_eq!(
+        outcome(&mut app, "CREATE TABLE fine (id BIGINT)").await,
+        None
+    );
+
+    terminate_conn(app, app_handle).await;
+    terminate_conn(su, su_handle).await;
+}
+
 /// `COPY (<query>) TO STDOUT` is gated by the query's own analysis, not by a flat table check.
 ///
 /// The query form carries no table name — the object it reads is whatever the inner SELECT names.

@@ -98,9 +98,13 @@ pub(super) fn analyze_create_table(
             )
         })?
     } else {
-        ct.schema
+        let schema = ct
+            .schema
             .clone()
-            .unwrap_or_else(|| catalog.current_schema())
+            .unwrap_or_else(|| catalog.current_schema());
+        // The session's own temp schema needs no grant; every other schema does.
+        super::dcl::require_schema_create(catalog, &schema)?;
+        schema
     };
     if !ct.if_not_exists && catalog.lookup_table_in(&target_schema, &ct.name)?.is_some() {
         return Err(Error::TableExists {

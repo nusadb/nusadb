@@ -74,6 +74,8 @@ fn is_access_control_catalog(name: &str) -> bool {
             | rbac::ROLE_MEMBER_CATALOG
             | rbac::PRIVILEGE_CATALOG
             | rbac::OWNER_CATALOG
+            | rbac::COLUMN_PRIVILEGE_CATALOG
+            | rbac::REVOKED_DEFAULT_CATALOG
     )
 }
 
@@ -120,6 +122,10 @@ pub(super) fn run_grant(
                         grantable: plan.with_grant_option,
                     },
                 )?;
+                // Granting a built-in `PUBLIC` privilege back to `PUBLIC` lifts an earlier revoke.
+                if *grantee == Grantee::Public {
+                    rbac::set_builtin_grant_revoked(engine, txn, kind, &object, privilege, false)?;
+                }
             }
         }
         // Column-scoped grants (all targets are tables — the analyzer validated this).
@@ -203,6 +209,12 @@ pub(super) fn run_revoke(
             for grantee in &plan.grantees {
                 let mut visited = std::collections::HashSet::new();
                 revoke_one(&target, grantee, &mut visited)?;
+                // A built-in `PUBLIC` privilege has no catalog row for the revoke to delete, so
+                // the revoke is recorded instead. Only the direct form counts: a cascade that
+                // happens to reach `PUBLIC` removes the rows it found and nothing more.
+                if *grantee == Grantee::Public && !plan.grant_option_for {
+                    rbac::set_builtin_grant_revoked(engine, txn, kind, &object, privilege, true)?;
+                }
             }
         }
         // Column-scoped revokes (all targets are tables — the analyzer validated this).

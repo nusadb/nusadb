@@ -1152,3 +1152,215 @@ fn a_column_grantee_cannot_regrant_without_grant_option() {
     // `clerk` holds the column privilege but not the grant option, so it may not pass it on.
     denied_as(&engine, "clerk", "GRANT SELECT (a) ON t TO app");
 }
+
+// === CREATE on a schema ====================================================
+
+/// Run `sql` as `user` and expect the schema-level `CREATE` refusal, with SQLSTATE 42501 and the
+/// schema named in the message.
+fn create_denied_as(engine: &BtreeEngine, user: &str, sql: &str, schema: &str) {
+    let stmt = parse(sql).unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"));
+    match analyze(stmt, &RbacCatalog { engine, user }) {
+        Err(err) => {
+            assert_eq!(err.sqlstate(), "42501", "`{sql}` as {user}: {err}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("schema \"{schema}\"")),
+                "`{sql}` as {user} should name schema {schema}, got: {msg}"
+            );
+        },
+        Ok(_) => panic!("`{sql}` as {user} should have been refused for schema {schema}"),
+    }
+}
+
+/// Lock `public` down the way an operator would.
+fn lock_public(engine: &BtreeEngine) {
+    root(engine, "GRANT USAGE ON SCHEMA public TO app");
+    root(engine, "REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    root(engine, "REVOKE CREATE ON SCHEMA public FROM app");
+}
+
+/// Out of the box every role may create objects in `public`, as it always could.
+#[test]
+fn public_schema_allows_create_by_default() {
+    let engine = fixture();
+    ok_as(&engine, "app", "CREATE TABLE mine (id BIGINT)");
+    ok_as(&engine, "app", "CREATE SEQUENCE mine_seq");
+    ok_as(&engine, "app", "CREATE VIEW mine_v AS SELECT 1 AS one");
+}
+
+/// After `REVOKE CREATE ON SCHEMA public FROM PUBLIC` a plain role can no longer create any
+/// schema-scoped object in `public`, and the refusal is a 42501 naming the schema.
+#[test]
+fn revoking_public_create_refuses_every_object_kind() {
+    let engine = fixture();
+    lock_public(&engine);
+    for sql in [
+        "CREATE TABLE evil (id BIGINT)",
+        "CREATE TABLE IF NOT EXISTS evil (id BIGINT)",
+        "CREATE TABLE evil2 AS SELECT 1 AS one",
+        "CREATE VIEW evil_v AS SELECT 1 AS one",
+        "CREATE MATERIALIZED VIEW evil_mv AS SELECT 1 AS one",
+        "CREATE SEQUENCE evil_seq",
+        "CREATE FUNCTION evil_f(x INT) RETURNS INT AS $$ SELECT $1 $$",
+        "CREATE PROCEDURE evil_p() AS $$ DELETE FROM orders $$",
+        "CREATE TYPE evil_mood AS ENUM ('sad')",
+        "CREATE TYPE evil_pair AS (a INT, b INT)",
+        "CREATE DOMAIN evil_d AS INT CHECK (VALUE > 0)",
+    ] {
+        create_denied_as(&engine, "app", sql, "public");
+    }
+    // Nothing was created behind the refusals.
+    assert!(engine.lookup_table("evil").unwrap().is_none());
+    // The superuser is never gated.
+    ok_as(&engine, ROOT, "CREATE TABLE root_t (id BIGINT)");
+}
+
+/// An explicit grant to the role (or back to `PUBLIC`) restores creation after the lock-down.
+#[test]
+fn granting_create_restores_it() {
+    let engine = fixture();
+    lock_public(&engine);
+    create_denied_as(&engine, "app", "CREATE TABLE t1 (id BIGINT)", "public");
+
+    root(&engine, "GRANT CREATE ON SCHEMA public TO app");
+    ok_as(&engine, "app", "CREATE TABLE t1 (id BIGINT)");
+    ok_as(&engine, "app", "CREATE SEQUENCE s1");
+
+    // Revoked from the role again: refused again. Then back to everyone through PUBLIC.
+    root(&engine, "REVOKE CREATE ON SCHEMA public FROM app");
+    create_denied_as(&engine, "app", "CREATE TABLE t2 (id BIGINT)", "public");
+    root(&engine, "GRANT CREATE ON SCHEMA public TO PUBLIC");
+    ok_as(&engine, "app", "CREATE TABLE t2 (id BIGINT)");
+
+    // Revoking from PUBLIC once more removes the explicit row and the built-in default alike.
+    root(&engine, "REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    create_denied_as(&engine, "app", "CREATE TABLE t3 (id BIGINT)", "public");
+}
+
+/// A grant through a role membership counts like a direct one.
+#[test]
+fn create_through_a_membership() {
+    let engine = fixture();
+    lock_public(&engine);
+    root(&engine, "CREATE ROLE builders");
+    root(&engine, "GRANT CREATE ON SCHEMA public TO builders");
+    create_denied_as(&engine, "app", "CREATE TABLE t (id BIGINT)", "public");
+    root(&engine, "GRANT builders TO app");
+    ok_as(&engine, "app", "CREATE TABLE t (id BIGINT)");
+}
+
+/// A rolled-back revoke leaves the default in place.
+#[test]
+fn a_rolled_back_revoke_keeps_the_default() {
+    let engine = fixture();
+    let mut session = Session::new(&engine);
+    for sql in [
+        "BEGIN",
+        "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
+        "ROLLBACK",
+    ] {
+        let logical = analyze(
+            parse(sql).unwrap(),
+            &RbacCatalog {
+                engine: &engine,
+                user: ROOT,
+            },
+        )
+        .unwrap();
+        session.execute(plan(logical)).unwrap();
+    }
+    ok_as(&engine, "app", "CREATE TABLE still_open (id BIGINT)");
+}
+
+/// The owner of a schema creates in it freely; anyone else needs a grant, which `PUBLIC` does not
+/// hold on a schema other than `public`.
+#[test]
+fn schema_owner_creates_others_need_a_grant() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE other LOGIN");
+    root(&engine, "ALTER ROLE app CREATEDB");
+    ok_as(&engine, "app", "CREATE SCHEMA app_ns");
+    // The creator owns it and may create every kind of object there.
+    ok_as(&engine, "app", "CREATE TABLE app_ns.t (id BIGINT)");
+    ok_as(&engine, "app", "CREATE SEQUENCE app_ns.s");
+    ok_as(&engine, "app", "CREATE VIEW app_ns.v AS SELECT 1 AS one");
+
+    // Another role is refused until the owner grants it CREATE.
+    create_denied_as(
+        &engine,
+        "other",
+        "CREATE TABLE app_ns.x (id BIGINT)",
+        "app_ns",
+    );
+    create_denied_as(&engine, "other", "CREATE SEQUENCE app_ns.xs", "app_ns");
+    create_denied_as(
+        &engine,
+        "other",
+        "CREATE VIEW app_ns.xv AS SELECT 1 AS one",
+        "app_ns",
+    );
+    // USAGE alone does not let a role create.
+    ok_as(&engine, "app", "GRANT USAGE ON SCHEMA app_ns TO other");
+    create_denied_as(
+        &engine,
+        "other",
+        "CREATE TABLE app_ns.x (id BIGINT)",
+        "app_ns",
+    );
+    ok_as(&engine, "app", "GRANT CREATE ON SCHEMA app_ns TO other");
+    ok_as(&engine, "other", "CREATE TABLE app_ns.x (id BIGINT)");
+
+    // A schema made by the superuser is closed to plain roles.
+    root(&engine, "CREATE SCHEMA ops");
+    create_denied_as(&engine, "app", "CREATE TABLE ops.t (id BIGINT)", "ops");
+    ok_as(&engine, ROOT, "CREATE TABLE ops.t (id BIGINT)");
+}
+
+/// An unqualified create lands in the current schema and is checked there.
+#[test]
+fn an_unqualified_create_is_checked_against_its_target_schema() {
+    let engine = fixture();
+    lock_public(&engine);
+    root(&engine, "CREATE SCHEMA ops");
+    // `public` is closed; a qualified create in a schema granted to the role is fine.
+    root(&engine, "GRANT CREATE ON SCHEMA ops TO app");
+    ok_as(&engine, "app", "CREATE TABLE ops.t (id BIGINT)");
+    create_denied_as(&engine, "app", "CREATE TABLE t (id BIGINT)", "public");
+}
+
+/// Granting or revoking CREATE on a schema is the owner's (or a superuser's) right.
+#[test]
+fn only_the_owner_may_grant_create_on_a_schema() {
+    let engine = fixture();
+    root(&engine, "CREATE ROLE other LOGIN");
+    denied_as(&engine, "app", "GRANT CREATE ON SCHEMA public TO app");
+    denied_as(&engine, "app", "REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    // The refused revoke left the default in place.
+    ok_as(&engine, "other", "CREATE TABLE t (id BIGINT)");
+}
+
+/// The lock-down and the grants that follow it are durable: they survive a reopen of the engine.
+#[test]
+fn schema_create_revoke_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("btree.wal");
+    {
+        let engine = BtreeEngine::open(&path).unwrap();
+        root(&engine, "CREATE ROLE app LOGIN");
+        root(&engine, "CREATE ROLE builder LOGIN");
+        lock_public(&engine);
+        root(&engine, "GRANT CREATE ON SCHEMA public TO builder");
+    } // no clean shutdown
+
+    let engine = BtreeEngine::open(&path).unwrap();
+    create_denied_as(&engine, "app", "CREATE TABLE evil (id BIGINT)", "public");
+    ok_as(&engine, "builder", "CREATE TABLE fine (id BIGINT)");
+}
+
+/// `CREATE SCHEMA` itself needs CREATEDB (or superuser), whatever is granted on `public`.
+#[test]
+fn create_schema_is_not_opened_by_a_schema_grant() {
+    let engine = fixture();
+    root(&engine, "GRANT CREATE ON SCHEMA public TO app");
+    denied_as(&engine, "app", "CREATE SCHEMA evil_schema");
+}
