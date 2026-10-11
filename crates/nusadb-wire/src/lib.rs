@@ -162,6 +162,17 @@ pub const fn column_type_name(tag: u8) -> &'static str {
         0x0E => "JSON",
         0x0F => "ARRAY",
         0x10 => "VECTOR",
+        0x11 => "MACADDR",
+        0x12 => "INET",
+        0x13 => "CIDR",
+        0x14 => "BIT",
+        0x15 => "VARBIT",
+        0x16 => "RANGE",
+        0x17 => "MACADDR8",
+        0x18 => "GEOMETRY",
+        0x19 => "TSVECTOR",
+        0x1A => "TSQUERY",
+        0x1B => "XML",
         _ => "UNKNOWN",
     }
 }
@@ -191,6 +202,47 @@ mod tag_tests {
             column_type_tag_v2(ColumnType::Int),
             column_type_tag(ColumnType::Int)
         );
+    }
+
+    /// Every tag the server sends has a name, and the names are the ones the protocol document
+    /// lists; the next unassigned tag is still unknown.
+    #[test]
+    fn every_sent_tag_has_its_name() {
+        let names: Vec<&str> = (0x01..=0x1B).map(column_type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "BOOL",
+                "INT",
+                "FLOAT",
+                "NUMERIC",
+                "TEXT",
+                "BYTES",
+                "DATE",
+                "TIME",
+                "TIMETZ",
+                "TIMESTAMP",
+                "TIMESTAMPTZ",
+                "INTERVAL",
+                "UUID",
+                "JSON",
+                "ARRAY",
+                "VECTOR",
+                "MACADDR",
+                "INET",
+                "CIDR",
+                "BIT",
+                "VARBIT",
+                "RANGE",
+                "MACADDR8",
+                "GEOMETRY",
+                "TSVECTOR",
+                "TSQUERY",
+                "XML",
+            ]
+        );
+        assert_eq!(column_type_name(0x1C), "UNKNOWN");
+        assert_eq!(column_type_name(column_type_tag(ColumnType::Inet)), "INET");
     }
 
     #[test]
