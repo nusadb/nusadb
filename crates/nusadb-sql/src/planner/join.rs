@@ -10,6 +10,9 @@ use super::*;
 /// columns, the other only right columns, both the same hashable type), and
 /// emits a [`PhysicalOperator::HashJoin`] when at least one key is found —
 /// otherwise a [`PhysicalOperator::NestedLoopJoin`] over the full predicate.
+///
+/// For an inner join, an `ON` conjunct holding a correlated subquery is evaluated per joined row:
+/// it is left out of the join and returned as a [`PhysicalOperator::Filter`] wrapping it.
 pub(super) fn build_join(
     left: PhysicalOperator,
     right: PhysicalOperator,
@@ -25,6 +28,14 @@ pub(super) fn build_join(
     let mut keys = Vec::new();
     let mut residual_conjuncts = Vec::new();
     for conjunct in conjuncts {
+        // A hash key is evaluated against one input row with nothing bound, so a conjunct carrying
+        // a correlated subquery stays out of the keys and is handled with the residual below.
+        if crate::executor::ops::contains_subquery(&conjunct)
+            && crate::executor::ops::expr_has_outer_column(&conjunct)
+        {
+            residual_conjuncts.push(conjunct);
+            continue;
+        }
         match classify_conjunct(conjunct, left_width) {
             Ok(key) => keys.push(key),
             Err(other) => residual_conjuncts.push(other),
@@ -44,13 +55,24 @@ pub(super) fn build_join(
     // nested scope).
     let mut left = left;
     let mut right = right;
+    // Conjuncts applied by a Filter above the join instead of inside it (INNER only, see below).
+    let mut above = Vec::new();
     if matches!(kind, ast::JoinKind::Inner) {
         let mut keep = Vec::new();
         let mut left_push = Vec::new();
         let mut right_push = Vec::new();
         for conjunct in residual_conjuncts {
             if crate::executor::ops::contains_subquery(&conjunct) {
-                keep.push(conjunct);
+                // A correlated subquery has to run once per joined row with that row bound as its
+                // enclosing scope. The join operators evaluate their predicate without binding
+                // anything, while a Filter does exactly that, so for an INNER join (where ON and
+                // WHERE agree) such a conjunct moves to a Filter over the join's output, whose rows
+                // have the same `[left ++ right]` layout the ON clause was resolved against.
+                if crate::executor::ops::expr_has_outer_column(&conjunct) {
+                    above.push(conjunct);
+                } else {
+                    keep.push(conjunct);
+                }
                 continue;
             }
             match column_side(&conjunct, left_width) {
@@ -78,15 +100,15 @@ pub(super) fn build_join(
         residual_conjuncts = keep;
     }
 
-    if keys.is_empty() {
+    let join = if keys.is_empty() {
         // No hashable equi-key: reassemble the full predicate for a nested loop.
-        // A real join always has at least one conjunct; the `true` fallback is
-        // only a defensive no-op for an (impossible) empty predicate.
+        // A join with no conjunct left (an empty predicate, or every conjunct moved above it)
+        // matches every pair; the `true` fallback says so.
         let predicate = rebuild_and(residual_conjuncts).unwrap_or(TypedExpr {
             kind: TypedExprKind::Literal(ast::Value::Bool(true)),
             ty: ColumnType::Bool,
         });
-        return PhysicalOperator::NestedLoopJoin {
+        PhysicalOperator::NestedLoopJoin {
             left: Box::new(left),
             right: Box::new(right),
             predicate,
@@ -94,17 +116,25 @@ pub(super) fn build_join(
             left_width,
             right_width,
             coalesce_pairs,
-        };
-    }
-    PhysicalOperator::HashJoin {
-        left: Box::new(left),
-        right: Box::new(right),
-        keys,
-        residual: rebuild_and(residual_conjuncts),
-        kind,
-        left_width,
-        right_width,
-        coalesce_pairs,
+        }
+    } else {
+        PhysicalOperator::HashJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            keys,
+            residual: rebuild_and(residual_conjuncts),
+            kind,
+            left_width,
+            right_width,
+            coalesce_pairs,
+        }
+    };
+    match rebuild_and(above) {
+        Some(predicate) => PhysicalOperator::Filter {
+            input: Box::new(join),
+            predicate,
+        },
+        None => join,
     }
 }
 

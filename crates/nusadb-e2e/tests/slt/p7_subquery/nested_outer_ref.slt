@@ -1,0 +1,227 @@
+# p7_subquery/nested_outer_ref: a subquery two or more levels deep that reads a column of the
+# outermost query, alone or next to references to the levels in between. Each expected result was
+# worked out by hand from the rows below.
+
+statement ok
+CREATE TABLE employee (id INT NOT NULL PRIMARY KEY, name TEXT)
+
+statement ok
+INSERT INTO employee VALUES (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, 'dave')
+
+statement ok
+CREATE TABLE company (id INT NOT NULL PRIMARY KEY, ceo_id INT, name TEXT)
+
+statement ok
+INSERT INTO company VALUES (10, 1, 'acme'), (20, 2, 'globex'), (30, NULL, 'initech')
+
+statement ok
+CREATE TABLE project (id INT NOT NULL PRIMARY KEY, company_id INT, lead_id INT, budget INT)
+
+statement ok
+INSERT INTO project VALUES (100, 10, 1, 50), (101, 10, 3, 70), (102, 20, 2, 30), (103, 30, 4, 20)
+
+# --- the middle query reads the outer row while its own nested subquery reads the middle row ---
+
+# The company each employee is CEO of, or NULL.
+query II
+SELECT employee.id, (SELECT V0.id FROM company V0 WHERE (V0.ceo_id IN (SELECT U0.id FROM employee U0 WHERE U0.id = (V0.ceo_id)) AND V0.ceo_id = (employee.id))) AS ceo_company FROM employee ORDER BY 1
+----
+1 10
+2 20
+3 NULL
+4 NULL
+
+query II
+SELECT employee.id, (SELECT V0.id FROM company V0 WHERE EXISTS (SELECT 1 FROM employee U0 WHERE U0.id = V0.ceo_id) AND V0.ceo_id = employee.id) FROM employee ORDER BY 1
+----
+1 10
+2 20
+3 NULL
+4 NULL
+
+# Same with the outer reference first and inside an expression (no index lookup on it).
+query II
+SELECT employee.id, (SELECT V0.id FROM company V0 WHERE V0.ceo_id + 0 = employee.id AND (SELECT U0.id FROM employee U0 WHERE U0.id = V0.ceo_id) IS NOT NULL) FROM employee ORDER BY 1
+----
+1 10
+2 20
+3 NULL
+4 NULL
+
+# Outer reference used at both the middle and the innermost level.
+query II
+SELECT e.id, (SELECT c.id FROM company c WHERE c.ceo_id = e.id AND EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id)) FROM employee e ORDER BY 1
+----
+1 10
+2 20
+3 NULL
+4 NULL
+
+query II
+SELECT e.id, (SELECT COUNT(*) FROM company c WHERE c.ceo_id = e.id AND c.id IN (SELECT p.company_id FROM project p WHERE p.lead_id <> c.ceo_id AND p.lead_id <> e.id)) FROM employee e ORDER BY 1
+----
+1 1
+2 0
+3 0
+4 0
+
+# --- a two-level reference in a scalar subquery, EXISTS and IN ---
+
+query II
+SELECT e.id, (SELECT c.id FROM company c WHERE EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id)) FROM employee e ORDER BY 1
+----
+1 10
+2 20
+3 10
+4 30
+
+query I
+SELECT e.id FROM employee e WHERE EXISTS (SELECT 1 FROM company c WHERE EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id AND p.budget > 40)) ORDER BY 1
+----
+1
+3
+
+query I
+SELECT e.id FROM employee e WHERE e.id IN (SELECT c.ceo_id FROM company c WHERE c.id IN (SELECT p.company_id FROM project p WHERE p.lead_id = e.id)) ORDER BY 1
+----
+1
+2
+
+query I
+SELECT e.id FROM employee e WHERE (SELECT COUNT(*) FROM company c WHERE EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id)) = 1 AND e.id NOT IN (SELECT c2.ceo_id FROM company c2 WHERE c2.ceo_id IS NOT NULL AND EXISTS (SELECT 1 FROM project p2 WHERE p2.company_id = c2.id AND p2.lead_id = e.id)) ORDER BY 1
+----
+3
+4
+
+# A scalar subquery in the middle query's SELECT list.
+query II
+SELECT e.id, (SELECT (SELECT c.name FROM company c WHERE c.id = p.company_id AND c.ceo_id = e.id) FROM project p WHERE p.lead_id = e.id) FROM employee e ORDER BY 1
+----
+1 acme
+2 globex
+3 NULL
+4 NULL
+
+# A correlated subquery in the middle query's ORDER BY.
+query II
+SELECT e.id, (SELECT p.id FROM project p ORDER BY (SELECT COUNT(*) FROM company c WHERE c.id = p.company_id AND c.ceo_id = e.id) DESC, p.id LIMIT 1) FROM employee e ORDER BY 1
+----
+1 100
+2 102
+3 100
+4 100
+
+# --- JOIN ON ---
+
+# A correlated subquery in a JOIN ON, one level and two levels deep.
+query II
+SELECT e.id, c.id FROM employee e JOIN company c ON EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id) ORDER BY 1, 2
+----
+1 10
+2 20
+3 10
+4 30
+
+query II
+SELECT e.id, c.id FROM employee e JOIN company c ON c.id = (SELECT p.company_id FROM project p WHERE p.lead_id = e.id) ORDER BY 1, 2
+----
+1 10
+2 20
+3 10
+4 30
+
+query II
+SELECT e.id, c.id FROM employee e JOIN company c ON EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND EXISTS (SELECT 1 FROM employee x WHERE x.id = p.lead_id AND x.id = e.id)) ORDER BY 1, 2
+----
+1 10
+2 20
+3 10
+4 30
+
+# The JOIN ON sits in the middle query and reads the outermost row directly or through a subquery.
+query II
+SELECT e.id, (SELECT c.id FROM company c JOIN project p ON p.company_id = c.id AND p.lead_id = e.id) FROM employee e ORDER BY 1
+----
+1 10
+2 20
+3 10
+4 30
+
+query II
+SELECT e.id, (SELECT c.id FROM company c JOIN project p ON p.company_id = c.id AND p.lead_id = (SELECT x.id FROM employee x WHERE x.id = e.id)) FROM employee e ORDER BY 1
+----
+1 10
+2 20
+3 10
+4 30
+
+query II
+SELECT e.id, (SELECT c.id FROM company c JOIN project p ON p.company_id = c.id AND EXISTS (SELECT 1 FROM employee x WHERE x.id = p.lead_id AND x.id = e.id)) FROM employee e ORDER BY 1
+----
+1 10
+2 20
+3 10
+4 30
+
+# --- three levels ---
+
+# The innermost query reads the project (one up), the company (two up) and the employee (three up).
+query I
+SELECT e.id FROM employee e WHERE EXISTS (SELECT 1 FROM company c WHERE EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND EXISTS (SELECT 1 FROM employee x WHERE x.id = p.lead_id AND x.name = e.name AND x.id <> c.ceo_id))) ORDER BY 1
+----
+3
+
+query II
+SELECT e.id, (SELECT COUNT(*) FROM company c WHERE EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND EXISTS (SELECT 1 FROM employee x WHERE x.id = p.lead_id AND x.id <> e.id AND x.id <> c.ceo_id))) FROM employee e ORDER BY 1
+----
+1 1
+2 1
+3 0
+4 1
+
+# --- aggregates ---
+
+query II
+SELECT e.id, (SELECT COUNT(*) FROM company c WHERE c.ceo_id <> e.id AND EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id)) FROM employee e ORDER BY 1
+----
+1 0
+2 0
+3 1
+4 0
+
+query II
+SELECT e.id, (SELECT SUM(p.budget) FROM project p WHERE p.company_id IN (SELECT c.id FROM company c WHERE c.ceo_id = e.id)) FROM employee e ORDER BY 1
+----
+1 120
+2 30
+3 NULL
+4 NULL
+
+query II
+SELECT e.id, (SELECT COUNT(*) FROM project p WHERE p.budget > (SELECT AVG(p2.budget) FROM project p2 WHERE p2.company_id = p.company_id AND p2.lead_id <> e.id)) FROM employee e ORDER BY 1
+----
+1 0
+2 1
+3 1
+4 1
+
+# HAVING in the middle query with a subquery reading both the group and the outermost row.
+query II
+SELECT e.id, (SELECT SUM(p.budget) FROM project p GROUP BY p.company_id HAVING p.company_id = (SELECT c.id FROM company c WHERE c.ceo_id = e.id AND c.id = p.company_id)) FROM employee e ORDER BY 1
+----
+1 120
+2 30
+3 NULL
+4 NULL
+
+# An equality whose one side mixes a join column with a correlated subquery is not a hash key.
+query II
+SELECT e.id, c.id FROM employee e JOIN company c ON e.id * 10 + (SELECT COUNT(*) FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id) = c.id + 1 ORDER BY 1, 2
+----
+1 10
+2 20
+
+# An outer join cannot move its ON clause into a filter, so a correlated subquery there is refused
+# rather than answered wrongly.
+statement error subquery in this position
+SELECT e.id, c.id FROM employee e LEFT JOIN company c ON EXISTS (SELECT 1 FROM project p WHERE p.company_id = c.id AND p.lead_id = e.id)

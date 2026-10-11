@@ -1103,6 +1103,11 @@ fn slt_p7_order_by_subquery() {
 }
 
 #[test]
+fn slt_p7_nested_outer_ref() {
+    run_slt("tests/slt/p7_subquery/nested_outer_ref.slt");
+}
+
+#[test]
 fn slt_p6_setops_null_dup() {
     run_slt("tests/slt/p6_setops/setops_null_dup.slt");
 }

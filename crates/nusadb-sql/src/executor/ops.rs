@@ -1133,7 +1133,7 @@ fn subquery_is_correlated(kind: &crate::planner::TypedExprKind) -> bool {
 
 /// Whether `expr`'s tree (descending into nested subquery plans) contains any
 /// [`TypedExprKind::OuterColumn`] — i.e. a correlated reference to an enclosing query.
-fn expr_has_outer_column(expr: &TypedExpr) -> bool {
+pub(crate) fn expr_has_outer_column(expr: &TypedExpr) -> bool {
     use crate::planner::TypedExprKind as K;
     match &expr.kind {
         K::OuterColumn { .. } => true,
@@ -1296,17 +1296,24 @@ pub(super) fn resolved_expr<'a>(
 
 /// Evaluate `expr` for one outer `row` when it carries a correlated subquery: bind the row
 /// as the enclosing scope, resolve the remaining (correlated) subqueries against it, then evaluate.
+///
+/// The binding is held only while the subqueries run. `expr` itself belongs to the query that
+/// produced `row`, so its own `OuterColumn` references point at the queries enclosing *that* one;
+/// evaluating it with `row` still bound would shift every level by one and read `row` where an
+/// enclosing row was meant.
 pub(super) fn eval_correlated(
     expr: &TypedExpr,
     row: &Row,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ast::Value, Error> {
-    let _outer = eval::bind_outer_row(row.clone());
     let mut resolved = expr.clone();
-    // The outer row is bound, so resolve every remaining subquery (none are deferred now).
-    let _defer = defer_correlated(false);
-    resolve_subqueries(&mut resolved, engine, txn)?;
+    {
+        let _outer = eval::bind_outer_row(row.clone());
+        // The outer row is bound, so resolve every remaining subquery (none are deferred now).
+        let _defer = defer_correlated(false);
+        resolve_subqueries(&mut resolved, engine, txn)?;
+    }
     eval::eval(&resolved, row)
 }
 
