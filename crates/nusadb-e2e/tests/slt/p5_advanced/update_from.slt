@@ -88,3 +88,28 @@ SELECT id, n FROM ut ORDER BY id
 ----
 1 100
 2 200
+
+# --- the target and the FROM source cannot share a name ---
+statement ok
+CREATE TABLE uf_dup (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO uf_dup VALUES (1, 10), (2, 20)
+
+statement error specified more than once
+UPDATE uf_dup SET v = 0 FROM uf_dup WHERE uf_dup.id = 1
+
+statement error specified more than once
+UPDATE uf_dup AS a SET v = 0 FROM uf_dup AS a WHERE a.id = 1
+
+statement ok
+UPDATE uf_dup SET v = b.v + 1 FROM uf_dup AS b WHERE b.id = 1 AND uf_dup.id = 2
+
+query II
+SELECT id, v FROM uf_dup ORDER BY id
+----
+1  10
+2  11
+
+statement ok
+DROP TABLE uf_dup

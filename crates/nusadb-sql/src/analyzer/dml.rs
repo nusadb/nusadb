@@ -868,6 +868,20 @@ fn require_where_returning_read(
     }
 }
 
+/// Refuse a secondary UPDATE/DELETE source that has the target's name: `name.col` would then mean
+/// either table. One of them needs an alias, as in a SELECT's FROM.
+fn reject_repeated_qualifier(target: &str, source: &str) -> Result<(), Error> {
+    if target == source {
+        return Err(Error::Coded {
+            message: format!(
+                "table name \"{source}\" specified more than once; give one of them an alias"
+            ),
+            sqlstate: "42712", // duplicate_alias
+        });
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "flat UPDATE analysis: RLS, assignment typing, FROM sources, RETURNING"
@@ -944,6 +958,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
                 schema.name
             )));
         }
+        reject_repeated_qualifier(upd.alias.as_deref().unwrap_or(&table.name), &qualifier)?;
         scope.extend(schema.columns.iter().map(|def| ScopedColumn {
             qualifier: qualifier.clone(),
             def: def.clone(),
@@ -1112,6 +1127,7 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
                 schema.name
             )));
         }
+        reject_repeated_qualifier(del.alias.as_deref().unwrap_or(&table.name), &qualifier)?;
         scope.extend(schema.columns.iter().map(|def| ScopedColumn {
             qualifier: qualifier.clone(),
             def: def.clone(),

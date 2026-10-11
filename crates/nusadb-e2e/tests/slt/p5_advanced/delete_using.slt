@@ -69,5 +69,22 @@ SELECT id, grp FROM sm ORDER BY id
 1  10
 3  20
 
+# The same name for the target and the USING source would make `sm.id` mean either table.
+statement error specified more than once
+DELETE FROM sm USING sm WHERE sm.id = 3
+
+statement error specified more than once
+DELETE FROM sm AS x USING sm AS x WHERE x.id = 3
+
+# An alias on either side is enough; the rows are unchanged by the refused statements.
+statement ok
+DELETE FROM sm USING sm AS b WHERE sm.grp = b.grp AND b.id < sm.id
+
+query II
+SELECT id, grp FROM sm ORDER BY id
+----
+1  10
+3  20
+
 statement ok
 DROP TABLE sm
