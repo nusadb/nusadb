@@ -364,7 +364,15 @@ dimension is not carried). Values a client does not recognise SHOULD be treated 
 | `0x05` | `TEXT`        | `0x0E` | `JSON`        |
 | `0x06` | `BYTES`       | `0x0F` | `ARRAY`       |
 | `0x07` | `DATE`        | `0x10` | `VECTOR`      |
-| `0x08` | `TIME`        |        |               |
+| `0x08` | `TIME`        | `0x11` | `MACADDR`     |
+| `0x12` | `INET`        | `0x13` | `CIDR`        |
+| `0x14` | `BIT`         | `0x15` | `VARBIT`      |
+| `0x16` | `RANGE`       | `0x17` | `MACADDR8`    |
+| `0x18` | `GEOMETRY`    | `0x19` | `TSVECTOR`    |
+| `0x1A` | `TSQUERY`     | `0x1B` | `XML`         |
+
+`RANGE` and `GEOMETRY` each use one tag for every subtype (an `INT4RANGE` and a `DATERANGE`, a
+`POINT` and a `POLYGON`); the value's text shows which it is.
 
 ARRAY element type (protocol 1.2, `minor >= 2`). For an `ARRAY` column the server sets the high
 bit and carries the element type in the low 7 bits: `type_tag = 0x80 | element_tag`, where
@@ -440,7 +448,9 @@ Each is bound by the type `Parse` declared for its placeholder:
 | --- | --- |
 | `TEXT` (`0x05`) | text, whatever the value looks like (`"00123"` stays `00123`) |
 | `INT` (`0x02`), `FLOAT` (`0x03`), `BOOL` (`0x01`) | exactly that type; a value that is not one (`"abc"` for `INT`) is refused with `22023` |
-| `NUMERIC`, `BYTES`, `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `JSON` | the value text cast to that type, exactly as `CAST('…' AS type)` would convert it |
+| `NUMERIC`, `BYTES`, `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `JSON`, `MACADDR`, `MACADDR8`, `INET`, `CIDR`, `TSVECTOR`, `TSQUERY`, `XML` | the value text cast to that type, exactly as `CAST('…' AS type)` would convert it |
+| `BIT`, `VARBIT` (`0x14`, `0x15`) | cast to `VARBIT` (the declared width is not in the tag) |
+| `RANGE` (`0x16`), `GEOMETRY` (`0x18`) | as with no tag: the subtype is not in the tag, so the value is typed where it is used |
 | `ARRAY` (`0x0F`, or `0x80 \| element`), `VECTOR` (`0x10`) | text, converted where it is used (an assignment to an array or vector column) |
 | none, or `0x00` | inferred from the text: integer, then float, then boolean (`true`/`t`/`TRUE`, `false`/`f`/`FALSE`), else text |
 

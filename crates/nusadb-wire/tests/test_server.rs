@@ -5612,6 +5612,93 @@ async fn declared_parameter_types_bind_as_declared() {
     handle.await.unwrap().unwrap();
 }
 
+/// The network, bit string, full-text, XML, range and geometric tags bind too: each value takes its
+/// declared type, so it works where only that type fits (an operator, a function argument).
+#[tokio::test]
+async fn network_text_search_and_range_parameter_tags_bind() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+
+    let cases: [(&str, Vec<u8>, &[&str], &str); 10] = [
+        (
+            "SELECT $1 >> $2",
+            vec![0x13, 0x12],
+            &["10.0.0.0/8", "10.1.2.3"],
+            "true",
+        ),
+        (
+            "SELECT $1 >> $2",
+            vec![0x13, 0x12],
+            &["10.0.0.0/8", "11.1.2.3"],
+            "false",
+        ),
+        (
+            "SELECT CAST($1 AS TEXT)",
+            vec![0x11],
+            &["08-00-2B-01-02-03"],
+            "08:00:2b:01:02:03",
+        ),
+        (
+            "SELECT CAST($1 AS TEXT)",
+            vec![0x17],
+            &["08:00:2b:01:02:03:04:05"],
+            "08:00:2b:01:02:03:04:05",
+        ),
+        ("SELECT $1 || $2", vec![0x14, 0x15], &["101", "01"], "10101"),
+        (
+            "SELECT $1 @@ $2",
+            vec![0x19, 0x1A],
+            &["fat cat", "cat"],
+            "true",
+        ),
+        (
+            "SELECT CAST($1 AS TEXT)",
+            vec![0x19],
+            &["cat fat cat"],
+            "'cat' 'fat'",
+        ),
+        (
+            "SELECT CAST($1 AS TEXT)",
+            vec![0x1B],
+            &["<a>1</a>"],
+            "<a>1</a>",
+        ),
+        ("SELECT $1::int4range @> 5", vec![0x16], &["[1,10)"], "true"),
+        (
+            "SELECT CAST($1::point AS TEXT)",
+            vec![0x18],
+            &["(1,2)"],
+            "(1,2)",
+        ),
+    ];
+    for (sql, types, values, want) in cases {
+        let answer = run_typed(&mut conn, sql, types, values).await;
+        assert!(
+            answer.contains(&BackendMessage::DataRow {
+                values: vec![Some(want.as_bytes().to_vec())]
+            }),
+            "{sql} with {values:?}: {answer:?}"
+        );
+    }
+
+    // A value that is not of its declared type is refused.
+    for (tag, value) in [(0x12, "not an address"), (0x11, "zz:zz"), (0x14, "102")] {
+        let answer = run_typed(&mut conn, "SELECT $1", vec![tag], &[value]).await;
+        assert!(
+            answer
+                .iter()
+                .any(|m| matches!(m, BackendMessage::Error { .. })),
+            "tag 0x{tag:02X} with {value:?}: {answer:?}"
+        );
+    }
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}
+
 /// Statements the connection loop classifies by their first word (transaction control, `COPY`,
 /// `LISTEN`/`NOTIFY`, a temporary table with `ON COMMIT`) behave the same with comments before them.
 #[tokio::test]

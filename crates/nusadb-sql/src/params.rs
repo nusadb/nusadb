@@ -100,6 +100,18 @@ fn bind_param(index: usize, raw: Option<&[u8]>, tag: u8) -> Result<ast::Expr, Er
         0x0C => cast(T::Interval),
         0x0D => cast(T::Uuid),
         0x0E => cast(T::Json),
+        0x11 => cast(T::Macaddr),
+        0x12 => cast(T::Inet),
+        0x13 => cast(T::Cidr),
+        // A bit string's declared width is not in the tag: it binds unbounded.
+        0x14 | 0x15 => cast(T::VarBit(None)),
+        0x17 => cast(T::Macaddr8),
+        0x19 => cast(T::Tsvector),
+        0x1A => cast(T::Tsquery),
+        0x1B => cast(T::Xml),
+        // A range's or a geometric value's subtype is not in the tag: it is typed where it is used,
+        // like an untagged parameter.
+        0x16 | 0x18 => return decode_param(Some(bytes)).map(ast::Expr::Literal),
         other => {
             return Err(Error::InvalidParameterValue(format!(
                 "parameter ${} has the unknown type tag 0x{other:02X}",
