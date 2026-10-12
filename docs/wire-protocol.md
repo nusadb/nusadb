@@ -486,37 +486,57 @@ A human-readable UTF-8 rendering:
 ### 11.2 Binary format (negotiated via `Bind` result-format `1`)
 A compact fixed layout, big-endian throughout. `NULL` carries no bytes (only its `Fields` marker).
 
-| type          | binary layout                                                             |
-| ------------- | ------------------------------------------------------------------------- |
-| `BOOL`        | 1 byte: `0x01` true, `0x00` false                                          |
-| `INT`         | `i64`, 8 bytes big-endian                                                  |
-| `FLOAT`       | IEEE-754 `f64` bit pattern, 8 bytes big-endian                            |
-| `NUMERIC`     | canonical decimal text, UTF-8 (lossless at arbitrary precision)        |
-| `DATE`        | `i32` days since 1970-01-01, 4 bytes big-endian                           |
-| `TIME`        | `i64` microseconds since midnight, 8 bytes big-endian                     |
-| `TIMETZ`      | `local micros:i64` ‖ `zone secs west of UTC:i32` (12 bytes, big-endian)  |
-| `TIMESTAMP`   | `i64` microseconds since the epoch, 8 bytes big-endian                    |
-| `TIMESTAMPTZ` | `i64` microseconds since the epoch (UTC), 8 bytes big-endian              |
-| `INTERVAL`    | `months:i32` ‖ `days:i32` ‖ `micros:i64` (16 bytes, each big-endian)      |
-| `UUID`        | the 16 bytes verbatim                                                      |
-| `TEXT`        | UTF-8 bytes verbatim (text and binary coincide)                           |
-| `JSON`        | canonical JSON text, UTF-8                                            |
-| `ARRAY`       | canonical `{...}` array text, UTF-8                                   |
-| `VECTOR`      | canonical `[..]` text, UTF-8                                          |
+| type           | binary layout                                                                                             |
+| -------------- | --------------------------------------------------------------------------------------------------------- |
+| `BOOL`         | 1 byte: `0x01` true, `0x00` false                                                                         |
+| `INT`          | `i64`, 8 bytes big-endian                                                                                 |
+| `FLOAT`        | IEEE-754 `f64` bit pattern, 8 bytes big-endian                                                            |
+| `NUMERIC`      | canonical decimal text, UTF-8 (lossless at arbitrary precision)                                           |
+| `DATE`         | `i32` days since 1970-01-01, 4 bytes big-endian                                                           |
+| `TIME`         | `i64` microseconds since midnight, 8 bytes big-endian                                                     |
+| `TIMETZ`       | `local micros:i64` ‖ `zone secs west of UTC:i32` (12 bytes, big-endian)                                   |
+| `TIMESTAMP`    | `i64` microseconds since the epoch, 8 bytes big-endian                                                    |
+| `TIMESTAMPTZ`  | `i64` microseconds since the epoch (UTC), 8 bytes big-endian                                              |
+| `INTERVAL`     | `months:i32` ‖ `days:i32` ‖ `micros:i64` (16 bytes, each big-endian)                                      |
+| `UUID`         | the 16 bytes verbatim                                                                                     |
+| `TEXT`         | UTF-8 bytes verbatim (text and binary coincide)                                                           |
+| `JSON`         | canonical JSON text, UTF-8                                                                                |
+| `ARRAY`        | canonical `{...}` array text, UTF-8                                                                       |
+| `VECTOR`       | canonical `[..]` text, UTF-8                                                                              |
+| `BYTES`        | the raw bytes                                                                                             |
+| `MACADDR`      | the 6 address bytes in transmission order                                                                 |
+| `MACADDR8`     | the 8 address bytes in transmission order                                                                 |
+| `INET`/`CIDR`  | `flags:u8` (bit 0 CIDR, bit 1 IPv6), `masklen:u8`, then 4 or 16 address bytes                             |
+| `BIT`/`VARBIT` | `bit count:u32` **little-endian**, then the bits packed most significant first, the last byte zero-padded |
+| `RANGE`        | `element kind:u8`, `flags:u8`, then each finite bound (see below)                                         |
+| `GEOMETRY`     | canonical text, UTF-8                                                                                     |
+| `TSVECTOR`     | canonical text, UTF-8                                                                                     |
+| `TSQUERY`      | canonical text, UTF-8                                                                                     |
+| `XML`          | canonical text, UTF-8                                                                                     |
+| enum           | the label text, UTF-8                                                                                     |
 
 `NUMERIC`, `JSON`, `ARRAY`, and `VECTOR` use their canonical text even in binary mode because they
 are arbitrary-precision / arbitrary-length: text is the lossless representation and avoids a
 precision- or shape-dependent layout. Because `RowDescription` + schema disambiguate the column
 type, the shared 8-byte layout of `TIME`/`TIMESTAMP`/`TIMESTAMPTZ` is unambiguous.
 
+A `RANGE` value's element kind is `0` int, `1` numeric, `2` date, `3` timestamp, `4` timestamptz.
+Its flags byte sets bit 0 for an empty range, bits 1 and 2 for an infinite lower and upper bound, and
+bits 3 and 4 for an inclusive lower and upper bound. An empty range has no bounds; otherwise each
+finite bound follows, lower first, in the storage layout of its element, which is
+**little-endian**: an `i64` for int, timestamp and timestamptz, an `i32` day count for date, and for
+numeric a 16-byte `i128` mantissa then a 1-byte scale. The `BIT` count and the range bounds are the
+two little-endian exceptions to this section.
+
 ## 12. COPY sub-protocol
 
-Triggered when a simple `Query` is `COPY … FROM STDIN` or `COPY … TO STDOUT`. All columns are
-text format. (`COPY` over an RLS-enabled table by a non-superuser is refused with an `Error` —
-fail-closed, no policy bypass.)
+Triggered when a simple `Query` is `COPY … FROM STDIN` or `COPY … TO STDOUT`. The stream is in
+the statement's format: text or CSV (`overall_format` `0`), or binary (`overall_format` `1`, §12.4)
+for `WITH (FORMAT binary)` or the keyword form `... STDIN BINARY`. (`COPY` over an RLS-enabled
+table by a non-superuser is refused with an `Error`: fail-closed, no policy bypass.)
 
 ### 12.1 `COPY … FROM STDIN` (client uploads)
-1. server → `CopyInResponse` (`G`): `[ overall_format:u8 = 0 ][ columns:u16 ]` (0 = text).
+1. server → `CopyInResponse` (`G`): `[ overall_format:u8 ][ columns:u16 ]` (0 = text, 1 = binary).
 2. client → zero or more `CopyData` (`d`): `[ raw bytes ]` — each may carry any number of whole
    or partial data lines; the server reassembles.
 3. client → `CopyDone` (`c`) to finish, or `CopyFail` (`f`): `[ message:Str ]` to abort.
@@ -527,7 +547,7 @@ overflow it stops buffering, frees what it held, and keeps reading until `CopyDo
 stay in protocol sync, then reports an `Error`. Split larger loads into multiple statements.
 
 ### 12.2 `COPY … TO STDOUT` (server downloads)
-1. server → `CopyOutResponse` (`H`): `[ overall_format:u8 = 0 ][ columns:u16 ]`.
+1. server → `CopyOutResponse` (`H`): `[ overall_format:u8 ][ columns:u16 ]` (0 = text, 1 = binary).
 2. server → one or more `CopyData` (`d`): `[ raw bytes ]`.
 3. server → `CopyDone` (`c`).
 4. server → `CommandComplete` (`COPY <count>`), then `ReadyForQuery`.
@@ -536,6 +556,54 @@ stay in protocol sync, then reports an `Error`. Split larger loads into multiple
 A `CopyData`/`CopyDone`/`CopyFail`/SASL message arriving outside its exchange is stray (a client
 bug) and is harmlessly ignored — every frame is length-delimited, so dropping one cannot desync the
 stream.
+
+### 12.4 Binary stream format
+A binary `COPY` carries one stream, the same in both directions. The `CopyData` frames are only
+transport: the stream may be cut into frames at any byte, and the server joins them before reading.
+All integers are big-endian.
+
+| part    | layout |
+| ------- | ------ |
+| header  | the 11-byte signature `4E 55 53 41 43 4F 50 59 FF 0D 0A` (`NUSACOPY`, then `0xFF`, `\r`, `\n`), then `flags:u32`, then `extension length:u32` followed by that many extension bytes |
+| row     | `field count:i16`, then for each field `length:i32` and that many bytes; length `-1` is SQL `NULL` and has no bytes |
+| trailer | `field count = -1` as an `i16`, the last two bytes of the stream |
+
+No flag is defined; the server writes `0` and refuses a stream with any flag bit set. It writes an
+empty header extension and skips one it reads. The `0xFF` byte and the `\r\n` pair in the signature
+expose a channel that strips the high bit or rewrites line endings.
+
+Each row has one field per column of the column list (all columns, in table order, when the
+statement names none; the projection's columns for `COPY (query) TO STDOUT`), in that order. A
+field's bytes are the value's §11.2 binary layout, so a client decodes a binary `COPY` field and a
+binary result column the same way. On load, each field is read at its target column's type: an
+`INT` column takes the 8-byte `i64` and a `DATE` column the 4-byte `i32`, while a type whose binary
+form is its canonical text is converted from that text as a text-format `COPY` would convert it.
+A column left out of the column list takes its default.
+
+The load refuses, before committing anything, with:
+
+- `22P04` a signature that does not match, a set flag bit, a stream that ends inside the header, a
+  row or a field, a row whose field count is not the column count, a negative length other than
+  `-1`, a fixed-width field of the wrong width, a stream with no trailer, or bytes after the trailer;
+- `22021` a text-form field that is not valid UTF-8;
+- `22008` a `TIME` or `TIMETZ` time of day outside one day, a zone offset of a day or more, or a
+  `DATE`, `TIMESTAMP` or `TIMESTAMPTZ` outside the range the text form accepts;
+- whatever a text-format load reports for a value its column refuses (`22P02` for a malformed
+  numeric text, `23505` for a duplicate key, and so on).
+
+A field is checked as strictly as the same value in text. A `RANGE` field is read back to its text
+form and parsed by the column, so bounds out of order are refused just as the text `[10,1]` is, and a
+discrete range sent as `(1,5]` is stored as `[2,6)`; a numeric bound whose scale byte is above 38
+(including the reserved `NaN` marker) is `22P04`. A `DATE`, `TIMESTAMP` or `TIMESTAMPTZ` the text
+form cannot spell (before year 0, for instance) is `22008`.
+
+The DELIMITER, NULL, HEADER, QUOTE and ESCAPE options do not apply to the binary format and are
+refused with it.
+
+Compatibility note for the Rust crate: `BackendMessage::CopyInResponse` and
+`BackendMessage::CopyOutResponse` gained a `format: u8` field carrying the overall-format byte (it
+was decoded and dropped before). Code that builds these variants, or matches them by naming
+`columns` without `..`, needs the new field; a match written `{ .. }` is unaffected.
 
 ## 13. Cancellation (out-of-band)
 
@@ -659,8 +727,8 @@ error.
 | `t`  | ParameterDescription  | `count:u16`                                                     |
 | `n`  | NoData                | —                                                               |
 | `z`  | PortalSuspended       | —                                                               |
-| `G`  | CopyInResponse        | `overall_format:u8(0), columns:u16`                            |
-| `H`  | CopyOutResponse       | `overall_format:u8(0), columns:u16`                            |
+| `G`  | CopyInResponse        | `overall_format:u8 (0 text, 1 binary), columns:u16`            |
+| `H`  | CopyOutResponse       | `overall_format:u8 (0 text, 1 binary), columns:u16`            |
 | `d`  | CopyData              | `data:bytes`                                                    |
 | `c`  | CopyDone              | —                                                               |
 
@@ -705,7 +773,8 @@ A conforming client/driver MUST exercise and pass:
 8. Parameters: positional `$n` binding in text format, including `NULL`.
 9. Result formats: request binary (`1`) and decode every type per §11.2; mixed/all/empty
    format lists.
-10. COPY: `FROM STDIN` (incl. `CopyFail` abort and the byte cap) and `TO STDOUT`.
+10. COPY: `FROM STDIN` (incl. `CopyFail` abort and the byte cap) and `TO STDOUT`, in text, CSV
+    and the §12.4 binary format.
 11. Cancellation: open a second connection and `CancelRequest` an in-flight statement using the
     first connection's `(pid, secret)`; verify the target aborts and a wrong secret does nothing.
 12. Errors & termination: decode `Error(code, message)`; `Terminate`; clean EOF.

@@ -1,11 +1,24 @@
-//! Text-format codec for the `COPY` sub-protocol.
+//! Stream codecs for the `COPY` sub-protocol: text, CSV, and binary.
 //!
-//! `COPY` streams rows as newline-separated *data lines*; within a line, fields are separated by a
-//! delimiter (default tab) and SQL `NULL` is written as a marker token (default `\N`). Special
-//! characters inside a field are backslash-escaped. This module is the single place that parses a
-//! data line into fields ([`parse_text_row`]) and renders a row back to a data line
+//! In the text format `COPY` streams rows as newline-separated *data lines*; within a line, fields
+//! are separated by a delimiter (default tab) and SQL `NULL` is written as a marker token (default
+//! `\N`). Special characters inside a field are backslash-escaped. This module is the single place
+//! that parses a data line into fields ([`parse_text_row`]) and renders a row back to a data line
 //! ([`format_text_row`]); the analyzer/executor and the wire server share it so load and export
-//! round-trip exactly.
+//! round-trip exactly. CSV has [`CsvRecords`] and [`format_csv_row`].
+//!
+//! The binary format frames rows with length prefixes instead of delimiters:
+//!
+//! ```text
+//! header   signature (11 bytes: "NUSACOPY" 0xFF '\r' '\n')
+//!          flags: u32 (0)  extension length: u32, then that many extension bytes
+//! row      field count: i16, then per field: length i32 (-1 = NULL) and that many bytes
+//! trailer  field count -1 as i16
+//! ```
+//!
+//! Every integer is big-endian. Each field's bytes are the value's binary layout
+//! ([`crate::binary`]), the same bytes a binary result column carries. [`BinaryRecords`] reads a
+//! stream and [`binary_header`] / [`push_binary_row`] / [`binary_trailer`] write one.
 
 /// Parse one text-format data line into its fields.
 ///
@@ -284,6 +297,176 @@ pub fn format_csv_row(
     out
 }
 
+/// The 11-byte signature that opens a binary `COPY` stream. The `0xFF` byte catches a channel that
+/// strips the high bit, and the `\r\n` pair one that rewrites line endings.
+pub const BINARY_SIGNATURE: [u8; 11] = *b"NUSACOPY\xff\r\n";
+
+/// Write the binary stream header: the signature, a zero flags word, and an empty header extension.
+pub fn binary_header(out: &mut Vec<u8>) {
+    out.extend_from_slice(&BINARY_SIGNATURE);
+    out.extend_from_slice(&0_u32.to_be_bytes()); // flags
+    out.extend_from_slice(&0_u32.to_be_bytes()); // header extension length
+}
+
+/// Append one binary row: the field count, then each field as a length and its bytes (`None` is
+/// SQL `NULL`, written as length `-1` with no bytes).
+///
+/// # Errors
+/// A message when the row has more fields than an `i16` count holds or a field is longer than an
+/// `i32` length holds. Nothing is appended in that case.
+pub fn push_binary_row(out: &mut Vec<u8>, fields: &[Option<Vec<u8>>]) -> Result<(), String> {
+    let count = i16::try_from(fields.len())
+        .map_err(|_| format!("a binary COPY row holds at most {} fields", i16::MAX))?;
+    let mut row = Vec::with_capacity(2 + fields.len() * 4);
+    row.extend_from_slice(&count.to_be_bytes());
+    for field in fields {
+        match field {
+            None => row.extend_from_slice(&(-1_i32).to_be_bytes()),
+            Some(bytes) => {
+                let len = i32::try_from(bytes.len())
+                    .map_err(|_| format!("a binary COPY field holds at most {} bytes", i32::MAX))?;
+                row.extend_from_slice(&len.to_be_bytes());
+                row.extend_from_slice(bytes);
+            },
+        }
+    }
+    out.extend_from_slice(&row);
+    Ok(())
+}
+
+/// Write the binary stream trailer: a field count of `-1`.
+pub fn binary_trailer(out: &mut Vec<u8>) {
+    out.extend_from_slice(&(-1_i16).to_be_bytes());
+}
+
+/// A streaming reader over the rows of a binary `COPY` payload.
+///
+/// [`BinaryRecords::new`] checks the header; each step then yields one row's fields as borrowed
+/// byte slices (`None` for SQL `NULL`), so a large load is decoded row by row. The stream must end
+/// with the trailer and nothing after it; a payload that stops early, a negative length other than
+/// `-1`, or a length running past the end is an error, after which the reader yields nothing more.
+#[derive(Debug, Clone)]
+pub struct BinaryRecords<'a> {
+    data: &'a [u8],
+    pos: usize,
+    done: bool,
+}
+
+impl<'a> BinaryRecords<'a> {
+    /// Check the header of `data` and position the reader at the first row.
+    ///
+    /// # Errors
+    /// A message when the signature does not match, the header is cut short, a flag bit is set
+    /// (none are defined), or the header extension runs past the end.
+    pub fn new(data: &'a [u8]) -> Result<Self, String> {
+        if data.get(..BINARY_SIGNATURE.len()) != Some(&BINARY_SIGNATURE[..]) {
+            return Err("binary COPY data does not start with the NUSACOPY signature".to_owned());
+        }
+        let mut reader = Self {
+            data,
+            pos: BINARY_SIGNATURE.len(),
+            done: false,
+        };
+        let flags = reader.u32("header flags")?;
+        if flags != 0 {
+            return Err(format!(
+                "binary COPY header has unknown flags 0x{flags:08X}"
+            ));
+        }
+        let extension = reader.u32("header extension length")?;
+        reader.read_bytes(
+            usize::try_from(extension).unwrap_or(usize::MAX),
+            "header extension",
+        )?;
+        Ok(reader)
+    }
+
+    /// Consume `n` bytes, or report what was cut short.
+    fn read_bytes(&mut self, n: usize, what: &str) -> Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.data.len());
+        let Some(end) = end else {
+            return Err(format!(
+                "binary COPY data ends inside the {what} at byte {}",
+                self.pos
+            ));
+        };
+        let bytes = self.data.get(self.pos..end).unwrap_or_default();
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self, what: &str) -> Result<u32, String> {
+        let bytes = self.read_bytes(4, what)?;
+        Ok(u32::from_be_bytes(bytes.try_into().unwrap_or_default()))
+    }
+
+    fn i32(&mut self, what: &str) -> Result<i32, String> {
+        let bytes = self.read_bytes(4, what)?;
+        Ok(i32::from_be_bytes(bytes.try_into().unwrap_or_default()))
+    }
+
+    fn i16(&mut self, what: &str) -> Result<i16, String> {
+        let bytes = self.read_bytes(2, what)?;
+        Ok(i16::from_be_bytes(bytes.try_into().unwrap_or_default()))
+    }
+
+    /// Read the next row, or `None` after the trailer.
+    fn row(&mut self) -> Result<Option<Vec<Option<&'a [u8]>>>, String> {
+        if self.pos == self.data.len() {
+            return Err("binary COPY data ends without its trailer".to_owned());
+        }
+        let count = self.i16("field count")?;
+        if count == -1 {
+            if self.pos != self.data.len() {
+                return Err(format!(
+                    "binary COPY data continues for {} byte(s) after its trailer",
+                    self.data.len() - self.pos
+                ));
+            }
+            return Ok(None);
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| format!("binary COPY row has a negative field count {count}"))?;
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = self.i32("field length")?;
+            fields.push(match len {
+                -1 => None,
+                len => {
+                    let len = usize::try_from(len)
+                        .map_err(|_| format!("binary COPY field has a negative length {len}"))?;
+                    Some(self.read_bytes(len, "field data")?)
+                },
+            });
+        }
+        Ok(Some(fields))
+    }
+}
+
+impl<'a> Iterator for BinaryRecords<'a> {
+    type Item = Result<Vec<Option<&'a [u8]>>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.row() {
+            Ok(Some(fields)) => Some(Ok(fields)),
+            Ok(None) => {
+                self.done = true;
+                None
+            },
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +662,90 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(back, vec![vec![Some("a,\"b\\c".into())]]);
+    }
+
+    // --- binary codec ----------------------------------------------------------------------------
+
+    /// A binary stream holding `rows`, with the header and trailer.
+    fn binary(rows: &[Vec<Option<Vec<u8>>>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        binary_header(&mut out);
+        for row in rows {
+            push_binary_row(&mut out, row).unwrap();
+        }
+        binary_trailer(&mut out);
+        out
+    }
+
+    #[test]
+    fn binary_round_trips_values_nulls_and_empty_fields() {
+        let rows = vec![
+            vec![Some(b"ab".to_vec()), None, Some(Vec::new())],
+            vec![None, Some(vec![0xFF]), None],
+        ];
+        let data = binary(&rows);
+        assert_eq!(&data[..11], b"NUSACOPY\xff\r\n");
+        let back: Vec<Vec<Option<Vec<u8>>>> = BinaryRecords::new(&data)
+            .unwrap()
+            .map(|r| {
+                r.unwrap()
+                    .into_iter()
+                    .map(|f| f.map(<[u8]>::to_vec))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(back, rows);
+    }
+
+    #[test]
+    fn binary_header_is_checked() {
+        let mut data = binary(&[]);
+        data[0] = b'X';
+        assert!(BinaryRecords::new(&data).is_err());
+        assert!(BinaryRecords::new(&BINARY_SIGNATURE[..5]).is_err());
+        let mut flagged = binary(&[]);
+        flagged[14] = 1; // low byte of the flags word
+        assert!(BinaryRecords::new(&flagged).is_err());
+    }
+
+    #[test]
+    fn binary_header_extension_is_skipped() {
+        let mut data = BINARY_SIGNATURE.to_vec();
+        data.extend_from_slice(&0_u32.to_be_bytes());
+        data.extend_from_slice(&3_u32.to_be_bytes());
+        data.extend_from_slice(b"xyz");
+        binary_trailer(&mut data);
+        assert_eq!(BinaryRecords::new(&data).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn binary_missing_trailer_and_trailing_bytes_are_errors() {
+        let mut data = binary(&[vec![Some(b"a".to_vec())]]);
+        data.truncate(data.len() - 2);
+        let mut it = BinaryRecords::new(&data).unwrap();
+        assert!(it.next().unwrap().is_ok());
+        assert!(it.next().unwrap().is_err());
+        assert!(it.next().is_none());
+
+        let mut data = binary(&[]);
+        data.push(0);
+        assert!(BinaryRecords::new(&data).unwrap().next().unwrap().is_err());
+    }
+
+    #[test]
+    fn binary_length_past_end_and_negative_length_are_errors() {
+        let mut data = Vec::new();
+        binary_header(&mut data);
+        data.extend_from_slice(&1_i16.to_be_bytes());
+        data.extend_from_slice(&10_i32.to_be_bytes());
+        data.extend_from_slice(b"abc");
+        assert!(BinaryRecords::new(&data).unwrap().next().unwrap().is_err());
+
+        let mut data = Vec::new();
+        binary_header(&mut data);
+        data.extend_from_slice(&1_i16.to_be_bytes());
+        data.extend_from_slice(&(-2_i32).to_be_bytes());
+        binary_trailer(&mut data);
+        assert!(BinaryRecords::new(&data).unwrap().next().unwrap().is_err());
     }
 }

@@ -4109,7 +4109,7 @@ fn recognize_copy(sql: &str) -> Option<Result<ast::Statement, Error>> {
 ///
 /// Driven through a `sqlparser` [`Parser`] (reusing its tokenizer + object-name handling) rather
 /// than the statement grammar, which expects an inline data block for `FROM STDIN`. Only the
-/// streaming STDIN/STDOUT text-format forms are accepted.
+/// streaming STDIN/STDOUT forms are accepted.
 fn parse_copy_stmt(sql: &str) -> Result<ast::Statement, Error> {
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::ParserError;
@@ -4228,8 +4228,8 @@ fn parse_copy_query_to(
     }))
 }
 
-/// Parse the optional `[WITH] ( FORMAT {text|csv}, DELIMITER 'c', NULL 's', HEADER [bool],
-/// QUOTE 'c', ESCAPE 'c' )` tail. Options may appear in any order; `DELIMITER`/`NULL` default to the
+/// Parse the optional `[WITH] [BINARY] ( FORMAT {text|csv|binary}, DELIMITER 'c', NULL 's',
+/// HEADER [bool], QUOTE 'c', ESCAPE 'c' )` tail. Options may appear in any order; `DELIMITER`/`NULL` default to the
 /// chosen format's convention (`\t`/`\N` for text, `,`/empty for CSV) when omitted.
 fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
     use sqlparser::keywords::Keyword;
@@ -4245,6 +4245,10 @@ fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
     let mut escape: Option<char> = None;
 
     let _ = parser.parse_keyword(Keyword::WITH);
+    // The older keyword spelling of the binary format: `... FROM STDIN [WITH] BINARY`.
+    if parser.parse_keyword(Keyword::BINARY) {
+        kind = ast::CopyFormatKind::Binary;
+    }
     if parser.consume_token(&Token::LParen) {
         loop {
             let key = match parser.next_token().token {
@@ -4267,10 +4271,12 @@ fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
                         ast::CopyFormatKind::Text
                     } else if name.eq_ignore_ascii_case("csv") {
                         ast::CopyFormatKind::Csv
+                    } else if name.eq_ignore_ascii_case("binary") {
+                        ast::CopyFormatKind::Binary
                     } else {
-                        return unsupported(
-                            "COPY supports FORMAT text or csv (binary is a follow-up)",
-                        );
+                        return Err(Error::InvalidStatement(format!(
+                            "COPY format `{name}` is not recognized (text, csv, binary)"
+                        )));
                     };
                 },
                 "DELIMITER" => delimiter = Some(copy_single_char(parser)?),
@@ -4297,6 +4303,9 @@ fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
     }
 
     match kind {
+        ast::CopyFormatKind::Binary => binary_copy_format(
+            delimiter.is_some() || null.is_some() || header || quote.is_some() || escape.is_some(),
+        ),
         ast::CopyFormatKind::Text => Ok(ast::CopyFormat {
             kind,
             delimiter: delimiter.unwrap_or('\t'),
@@ -4325,6 +4334,22 @@ fn parse_copy_options(parser: &mut Parser) -> Result<ast::CopyFormat, Error> {
             })
         },
     }
+}
+
+/// The format of a binary `COPY`. `text_options` says whether the statement gave any of the text
+/// and CSV options, which the binary format has no use for (no delimiters, NULL marker, header line,
+/// or quoting) and refuses.
+fn binary_copy_format(text_options: bool) -> Result<ast::CopyFormat, Error> {
+    if text_options {
+        return Err(Error::InvalidStatement(
+            "COPY DELIMITER, NULL, HEADER, QUOTE and ESCAPE cannot be used with FORMAT binary"
+                .to_owned(),
+        ));
+    }
+    Ok(ast::CopyFormat {
+        kind: ast::CopyFormatKind::Binary,
+        ..ast::CopyFormat::default()
+    })
 }
 
 /// Read a single-quoted string option value (e.g. `NULL '...'`).

@@ -5452,17 +5452,44 @@ fn copy_honors_text_format_options() {
 }
 
 #[test]
-fn copy_rejects_file_target_and_binary_format() {
+fn copy_rejects_file_target_and_unknown_format() {
     // A file target, not STDIN/STDOUT.
     assert!(matches!(
         parse("COPY users FROM 'data.csv'"),
         Err(Error::Unsupported(_))
     ));
-    // The binary format is still a follow-up.
     assert!(matches!(
-        parse("COPY users FROM STDIN WITH (FORMAT binary)"),
-        Err(Error::Unsupported(_))
+        parse("COPY users FROM STDIN WITH (FORMAT parquet)"),
+        Err(Error::InvalidStatement(_))
     ));
+}
+
+#[test]
+fn copy_parses_binary_format_in_both_spellings() {
+    for sql in [
+        "COPY users FROM STDIN WITH (FORMAT binary)",
+        "COPY users FROM STDIN (FORMAT BINARY)",
+        "COPY users FROM STDIN BINARY",
+        "COPY users (id) TO STDOUT WITH BINARY",
+        "COPY (SELECT 1) TO STDOUT (FORMAT binary)",
+    ] {
+        let ast::Statement::Copy(c) = ok(sql) else {
+            panic!("expected Copy for {sql}");
+        };
+        assert_eq!(c.format.kind, ast::CopyFormatKind::Binary, "{sql}");
+    }
+    // The text options have no meaning in the binary format.
+    for sql in [
+        "COPY users FROM STDIN (FORMAT binary, HEADER)",
+        "COPY users FROM STDIN (FORMAT binary, DELIMITER ',')",
+        "COPY users FROM STDIN (FORMAT binary, NULL '')",
+        "COPY users TO STDOUT BINARY (QUOTE '\"')",
+    ] {
+        assert!(
+            matches!(parse(sql), Err(Error::InvalidStatement(_))),
+            "{sql} should be refused"
+        );
+    }
 }
 
 #[test]

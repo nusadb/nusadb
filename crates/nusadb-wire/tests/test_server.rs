@@ -1413,7 +1413,10 @@ async fn copy_from_stdin_bulk_loads_rows() {
     query(&mut conn, "COPY t (id, name) FROM STDIN").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyInResponse { columns: 2 }
+        BackendMessage::CopyInResponse {
+            format: 0,
+            columns: 2
+        }
     );
 
     // Two chunks, split mid-line, to exercise reassembly. Row 3's name is `\N` (NULL).
@@ -1511,7 +1514,10 @@ async fn copy_from_stdin_bad_row_aborts_the_load() {
     query(&mut conn, "COPY t FROM STDIN").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyInResponse { columns: 0 }
+        BackendMessage::CopyInResponse {
+            format: 0,
+            columns: 0
+        }
     );
     // `oops` is not an integer → the load fails.
     conn.write_frame(
@@ -1593,7 +1599,10 @@ async fn copy_from_stdin_duplicate_key_reports_integrity_class() {
     query(&mut conn, "COPY u FROM STDIN").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyInResponse { columns: 0 }
+        BackendMessage::CopyInResponse {
+            format: 0,
+            columns: 0
+        }
     );
     // Loading id 1 again collides with the existing primary key.
     conn.write_frame(
@@ -1709,7 +1718,10 @@ async fn copy_to_stdout_streams_rows() {
     query(&mut conn, "COPY t (id, name) TO STDOUT").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyOutResponse { columns: 2 }
+        BackendMessage::CopyOutResponse {
+            format: 0,
+            columns: 2
+        }
     );
     assert_eq!(
         next(&mut conn).await,
@@ -1764,7 +1776,10 @@ async fn copy_to_stdout_renders_booleans_as_t_f() {
     query(&mut conn, "COPY flags (id, ok) TO STDOUT").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyOutResponse { columns: 2 }
+        BackendMessage::CopyOutResponse {
+            format: 0,
+            columns: 2
+        }
     );
     assert_eq!(
         next(&mut conn).await,
@@ -1824,7 +1839,10 @@ async fn copy_from_stdin_aborts_when_over_byte_cap() {
     query(&mut conn, "COPY t FROM STDIN").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyInResponse { columns: 0 }
+        BackendMessage::CopyInResponse {
+            format: 0,
+            columns: 0
+        }
     );
     // First chunk (6 bytes) is under the cap; the second pushes the cumulative total over 8.
     conn.write_frame(
@@ -3585,7 +3603,10 @@ async fn copy_from_stdin_loads_bigint_and_alias_columns() {
     query(&mut conn, "COPY big (id, small, r) FROM STDIN").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyInResponse { columns: 3 }
+        BackendMessage::CopyInResponse {
+            format: 0,
+            columns: 3
+        }
     );
     conn.write_frame(
         &FrontendMessage::CopyData {
@@ -5846,7 +5867,10 @@ async fn a_leading_comment_does_not_change_how_a_statement_runs() {
     query(&mut conn, "-- bulk load\nCOPY t FROM STDIN").await;
     assert_eq!(
         next(&mut conn).await,
-        BackendMessage::CopyInResponse { columns: 0 }
+        BackendMessage::CopyInResponse {
+            format: 0,
+            columns: 0
+        }
     );
     conn.write_frame(
         &FrontendMessage::CopyData {

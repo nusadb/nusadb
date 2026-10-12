@@ -94,15 +94,19 @@ pub enum CopyFormatKind {
     /// `csv`: comma-delimited, `"`-quoted fields (doubled quote to embed one), empty unquoted field
     /// for NULL. A quoted field may contain the delimiter, a newline, or a quote and is never NULL.
     Csv,
+    /// `binary`: a signature header, then length-prefixed fields in each value's binary layout,
+    /// then a trailer (see [`crate::copy::BinaryRecords`]). Takes none of the text options.
+    Binary,
 }
 
 /// Format options for [`Copy`](struct@Copy) (the subset NusaDB honors today).
 ///
 /// `quote`/`escape` apply only to [`CopyFormatKind::Csv`]; the parser fills `delimiter`/`null` with
 /// the format's defaults (`\t`/`\N` for text, `,`/empty for CSV) when they are not given explicitly.
+/// [`CopyFormatKind::Binary`] uses none of them; they keep the text defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFormat {
-    /// The encoding: `text` (default) or `csv`.
+    /// The encoding: `text` (default), `csv`, or `binary`.
     pub kind: CopyFormatKind,
     /// Field separator (default tab for text, comma for CSV).
     pub delimiter: char,

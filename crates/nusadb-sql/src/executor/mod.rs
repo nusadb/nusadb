@@ -512,21 +512,70 @@ pub fn copy_from_in(
     data: &str,
     txn: nusadb_core::TxnId,
 ) -> Result<usize, Error> {
+    run_copy_from(copy, data.as_bytes(), engine, txn)
+}
+
+/// [`copy_from_in`] over raw payload bytes, for any format. A binary `COPY` is read as its binary
+/// stream; a text or CSV payload must be valid UTF-8.
+///
+/// # Errors
+/// As [`copy_from_in`], plus `22P04` for a malformed binary stream and `22021` for a text payload
+/// that is not UTF-8. The caller owns rollback on error.
+pub fn copy_from_bytes_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    data: &[u8],
+    txn: nusadb_core::TxnId,
+) -> Result<usize, Error> {
     run_copy_from(copy, data, engine, txn)
 }
 
 /// `COPY <table> TO STDOUT` within a caller-owned transaction — the read-only counterpart of
-/// [`copy_from_in`].
+/// [`copy_from_in`]. Text and CSV only; [`copy_to_bytes_in`] serves every format.
 ///
 /// # Errors
-/// Propagates lookup and rendering errors. The caller owns rollback on error.
+/// Propagates lookup and rendering errors, and refuses a binary `COPY`, whose output is not text.
+/// The caller owns rollback on error.
 pub fn copy_to_in(
     engine: &dyn StorageEngine,
     copy: &ast::Copy,
     user: &str,
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, String), Error> {
+    text_copy_output(copy)?;
+    let (count, bytes) = run_copy_to(copy, user, engine, txn)?;
+    Ok((count, copy_output_text(bytes)?))
+}
+
+/// [`copy_to_in`] for any format, returning the payload as bytes (a binary `COPY` renders the
+/// complete binary stream).
+///
+/// # Errors
+/// Propagates lookup and rendering errors. The caller owns rollback on error.
+pub fn copy_to_bytes_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    user: &str,
+    txn: nusadb_core::TxnId,
+) -> Result<(usize, Vec<u8>), Error> {
     run_copy_to(copy, user, engine, txn)
+}
+
+/// Refuse a binary `COPY` where the caller can only take text output.
+fn text_copy_output(copy: &ast::Copy) -> Result<(), Error> {
+    if copy.format.kind == ast::CopyFormatKind::Binary {
+        return Err(Error::InvalidStatement(
+            "binary COPY output is not text; read it as bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The rendered text or CSV payload as a `String`. Every field is rendered from a `String`, so the
+/// conversion cannot fail in practice; a failure is reported rather than assumed away.
+fn copy_output_text(bytes: Vec<u8>) -> Result<String, Error> {
+    String::from_utf8(bytes)
+        .map_err(|_| Error::Internal("COPY text output is not valid UTF-8".to_owned()))
 }
 
 /// Execute `COPY <table> FROM STDIN`: bulk-load the text-format `data` into the table in a
@@ -539,7 +588,7 @@ pub fn copy_to_in(
 /// Propagates parse, type, and constraint errors; the transaction is rolled back on any failure.
 pub fn copy_from(engine: &dyn StorageEngine, copy: &ast::Copy, data: &str) -> Result<usize, Error> {
     let txn = engine.begin(IsolationLevel::default())?;
-    match run_copy_from(copy, data, engine, txn) {
+    match run_copy_from(copy, data.as_bytes(), engine, txn) {
         // A failed commit (e.g. ENOSPC appending CommitTxn) must roll back, or the transaction leaks
         // in `active` with its locks held and purge stalls forever. The `?`
         // that used to be here threw without rolling back.
@@ -569,8 +618,11 @@ pub fn copy_to(
     copy: &ast::Copy,
     user: &str,
 ) -> Result<(usize, String), Error> {
+    text_copy_output(copy)?;
     let txn = engine.begin(IsolationLevel::default())?;
-    match run_copy_to(copy, user, engine, txn) {
+    match run_copy_to(copy, user, engine, txn)
+        .and_then(|(count, bytes)| copy_output_text(bytes).map(|text| (count, text)))
+    {
         // A failed commit must roll back rather than leak the transaction,
         // mirroring `copy_from` above — even though a read-only COPY TO commits with an empty undo
         // set and so rarely reaches a failing durability point.

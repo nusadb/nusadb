@@ -1559,6 +1559,12 @@ where
     conn.write_frame(&frame.encode()?).await
 }
 
+/// The overall-format byte of a `CopyInResponse` / `CopyOutResponse`: `1` for a binary stream,
+/// `0` for text and CSV.
+fn copy_wire_format(copy: &nusadb_sql::ast::Copy) -> u8 {
+    u8::from(copy.format.kind == nusadb_sql::ast::CopyFormatKind::Binary)
+}
+
 /// Drive the `COPY ... FROM STDIN` sub-protocol: send `CopyInResponse`, gather the client's
 /// `CopyData` stream until `CopyDone` (or `CopyFail`), then bulk-load it. Returns the row count, or
 /// an error message to relay to the client. Wire I/O errors propagate; a load failure (bad row,
@@ -1583,7 +1589,8 @@ where
     // Advisory column count for the client; the real load arity is validated against the table in
     // `copy_from`, so an (implausible) >65535-column overflow harmlessly reports 0 here.
     let columns = u16::try_from(copy.columns.len()).unwrap_or(0);
-    conn.write_frame(&BackendMessage::CopyInResponse { columns }.encode()?)
+    let format = copy_wire_format(&copy);
+    conn.write_frame(&BackendMessage::CopyInResponse { format, columns }.encode()?)
         .await?;
 
     // Accumulate the client's `CopyData` stream, but cap the cumulative size: without a cap
@@ -1640,12 +1647,9 @@ where
         )));
     }
 
-    let Ok(data) = String::from_utf8(buf) else {
-        return Ok(Err((
-            "COPY data is not valid UTF-8".to_owned(),
-            "22021", // character_not_in_repertoire
-        )));
-    };
+    // The payload goes to the loader as bytes: a binary stream is length-framed, and a text or CSV
+    // one is checked for UTF-8 there (`22021`).
+    let data = buf;
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
     let result = tokio::task::spawn_blocking(move || {
@@ -1671,7 +1675,7 @@ where
         // A load failure — a value the column type rejects (`22P02`), a duplicate key (`23505`),
         // and so on — carries its own SQLSTATE, so the client sees the real class rather than the
         // generic internal-error code.
-        match nusadb_sql::copy_from_in(engine.as_ref(), &copy, &data, txn) {
+        match nusadb_sql::copy_from_bytes_in(engine.as_ref(), &copy, &data, txn) {
             Ok(count) => match engine.commit(txn) {
                 Ok(()) => Ok(count),
                 Err(e) => {
@@ -1704,6 +1708,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let columns = u16::try_from(copy.columns.len()).unwrap_or(0);
+    let format = copy_wire_format(&copy);
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
     let rendered = tokio::task::spawn_blocking(move || {
@@ -1731,7 +1736,7 @@ where
             let _ = engine.rollback(txn);
             return Err((msg, "42501")); // access-control refusal
         }
-        let out = nusadb_sql::copy_to_in(engine.as_ref(), &copy, &actor, txn)
+        let out = nusadb_sql::copy_to_bytes_in(engine.as_ref(), &copy, &actor, txn)
             .map_err(|e| (e.to_string(), e.sqlstate()));
         let _ = engine.rollback(txn); // read-only: nothing to commit
         out
@@ -1743,15 +1748,10 @@ where
         Ok(out) => out,
         Err(err) => return Ok(Err(err)),
     };
-    conn.write_frame(&BackendMessage::CopyOutResponse { columns }.encode()?)
+    conn.write_frame(&BackendMessage::CopyOutResponse { format, columns }.encode()?)
         .await?;
-    conn.write_frame(
-        &BackendMessage::CopyData {
-            data: payload.into_bytes(),
-        }
-        .encode()?,
-    )
-    .await?;
+    conn.write_frame(&BackendMessage::CopyData { data: payload }.encode()?)
+        .await?;
     conn.write_frame(&BackendMessage::CopyDone.encode()?)
         .await?;
     Ok(Ok(count))

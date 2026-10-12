@@ -1,0 +1,206 @@
+# A NULL written to a NOT NULL column is refused however it is written: INSERT with VALUES or
+# SELECT, UPDATE, both arms of ON CONFLICT DO UPDATE and of MERGE, a row routed to a partition, and
+# a foreign key action that sets the child's column to NULL. The check runs on the row as stored,
+# after its BEFORE triggers.
+
+statement ok
+CREATE TABLE nn (id INT PRIMARY KEY, v INT NOT NULL)
+
+statement ok
+CREATE TABLE src (id INT, v INT)
+
+statement ok
+INSERT INTO src VALUES (1, 10), (2, NULL)
+
+# INSERT ... VALUES with the NULL as a literal and as an expression.
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn VALUES (1, NULL)
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn VALUES (1, NULL::INT)
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn VALUES (1, CASE WHEN true THEN NULL ELSE 1 END)
+
+# INSERT ... SELECT.
+statement error NULL assigned to NOT NULL column `id`
+INSERT INTO nn SELECT NULL::INT, NULL::INT
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn SELECT id, v FROM src
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn (id, v) SELECT 5, NULL::INT
+
+query I
+SELECT count(*) FROM nn
+----
+0
+
+statement ok
+INSERT INTO nn SELECT id, v FROM src WHERE v IS NOT NULL
+
+# UPDATE: directly, through an expression, and through a subquery.
+statement error NULL assigned to NOT NULL column `v`
+UPDATE nn SET v = NULL
+
+statement error NULL assigned to NOT NULL column `v`
+UPDATE nn SET v = NULLIF(v, v)
+
+statement error NULL assigned to NOT NULL column `v`
+UPDATE nn SET v = (SELECT v FROM src WHERE id = 2)
+
+statement error NULL assigned to NOT NULL column `v`
+UPDATE nn SET v = src.v FROM src WHERE src.id = 2
+
+# ON CONFLICT DO UPDATE.
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = NULL
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = NULLIF(EXCLUDED.v, 5)
+
+# MERGE, both arms.
+statement error NULL assigned to NOT NULL column `v`
+MERGE INTO nn USING src ON nn.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v + NULL
+
+statement error NULL assigned to NOT NULL column `v`
+MERGE INTO nn USING src ON nn.id = src.id + 10 WHEN NOT MATCHED THEN INSERT VALUES (src.id + 10, src.v)
+
+query II
+SELECT id, v FROM nn ORDER BY id
+----
+1 10
+
+# A partition whose column is NOT NULL refuses a NULL routed to it through its parent, though the
+# parent's column allows NULL.
+statement ok
+CREATE TABLE pt (k INT NOT NULL, v INT) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE pt_1 PARTITION OF pt FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE pt_2 PARTITION OF pt FOR VALUES IN (2)
+
+statement ok
+ALTER TABLE pt_1 ALTER COLUMN v SET NOT NULL
+
+statement ok
+INSERT INTO pt VALUES (2, NULL)
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO pt VALUES (1, NULL)
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO pt SELECT 1, NULL::INT
+
+statement ok
+INSERT INTO pt VALUES (1, 3)
+
+statement error NULL assigned to NOT NULL column `v`
+UPDATE pt SET v = NULL WHERE k = 1
+
+query II
+SELECT k, v FROM pt ORDER BY k
+----
+1 3
+2 NULL
+
+# The insert arm of an upsert.
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO nn VALUES (8, CASE WHEN true THEN NULL ELSE 1 END) ON CONFLICT (id) DO UPDATE SET v = 1
+
+query I
+SELECT count(*) FROM nn WHERE id = 8
+----
+0
+
+# A foreign key action that sets NULL in a NOT NULL child column fails, and the statement that
+# triggered it is undone.
+statement ok
+CREATE TABLE parent (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE child_del (id INT PRIMARY KEY, p INT NOT NULL REFERENCES parent (id) ON DELETE SET NULL)
+
+statement ok
+CREATE TABLE child_upd (id INT PRIMARY KEY, p INT NOT NULL REFERENCES parent (id) ON UPDATE SET NULL)
+
+statement ok
+INSERT INTO parent VALUES (1), (2)
+
+statement ok
+INSERT INTO child_del VALUES (10, 1)
+
+statement ok
+INSERT INTO child_upd VALUES (20, 2)
+
+statement error NULL assigned to NOT NULL column `p`
+DELETE FROM parent WHERE id = 1
+
+statement error NULL assigned to NOT NULL column `p`
+UPDATE parent SET id = 3 WHERE id = 2
+
+query I
+SELECT id FROM parent ORDER BY id
+----
+1
+2
+
+query II
+SELECT c.id, c.p FROM child_del c UNION ALL SELECT u.id, u.p FROM child_upd u ORDER BY 1
+----
+10 1
+20 2
+
+# NOT NULL is checked after the BEFORE triggers: a trigger may repair a NULL the SET wrote, and a
+# trigger that writes a NULL is refused.
+statement ok
+CREATE TABLE tr (id INT PRIMARY KEY, v INT NOT NULL)
+
+statement ok
+INSERT INTO tr VALUES (1, 7)
+
+statement ok
+CREATE FUNCTION repair_v() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.v IS NULL THEN NEW.v := 42; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER repair BEFORE UPDATE ON tr FOR EACH ROW EXECUTE FUNCTION repair_v()
+
+statement ok
+UPDATE tr SET v = NULLIF(v, v)
+
+statement ok
+INSERT INTO tr VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET v = NULL
+
+statement ok
+MERGE INTO tr USING src ON tr.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v + NULL
+
+query II
+SELECT id, v FROM tr
+----
+1 42
+
+statement ok
+DROP TRIGGER repair ON tr
+
+statement ok
+CREATE FUNCTION null_v() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.v := NULL; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER breaker BEFORE UPDATE ON tr FOR EACH ROW EXECUTE FUNCTION null_v()
+
+statement error NULL assigned to NOT NULL column `v`
+UPDATE tr SET v = 5
+
+statement error NULL assigned to NOT NULL column `v`
+INSERT INTO tr VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET v = 6
+
+statement error NULL assigned to NOT NULL column `v`
+MERGE INTO tr USING src ON tr.id = src.id WHEN MATCHED THEN UPDATE SET v = 9
+
+query II
+SELECT id, v FROM tr
+----
+1 42

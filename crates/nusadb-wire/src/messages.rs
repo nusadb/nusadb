@@ -514,15 +514,18 @@ pub enum BackendMessage {
     PortalSuspended,
     /// COPY sub-protocol: the server is ready to receive `COPY ... FROM STDIN` data. The
     /// client replies with a stream of `CopyData` ending in `CopyDone` (or `CopyFail`). `columns`
-    /// is the number of target columns (text format for every column).
+    /// is the number of target columns.
     CopyInResponse {
+        /// Overall stream format: `0` text (text or CSV), `1` binary.
+        format: u8,
         /// Number of target columns.
         columns: u16,
     },
     /// COPY sub-protocol: the server will now stream `COPY ... TO STDOUT` rows. It follows
-    /// with `CopyData` messages and a final `CopyDone`. `columns` is the number of output columns
-    /// (text format for every column).
+    /// with `CopyData` messages and a final `CopyDone`. `columns` is the number of output columns.
     CopyOutResponse {
+        /// Overall stream format: `0` text (text or CSV), `1` binary.
+        format: u8,
         /// Number of output columns.
         columns: u16,
     },
@@ -638,14 +641,14 @@ impl BackendMessage {
             },
             Self::NoData => T_NO_DATA,
             Self::PortalSuspended => T_PORTAL_SUSPENDED,
-            Self::CopyInResponse { columns } => {
-                // Format byte 0 = text for the overall copy and every column (mirrored implicitly).
-                p.put_u8(0);
+            Self::CopyInResponse { format, columns } => {
+                // The overall format byte applies to every column (mirrored implicitly).
+                p.put_u8(*format);
                 p.put_u16(*columns);
                 T_COPY_IN_RESPONSE
             },
-            Self::CopyOutResponse { columns } => {
-                p.put_u8(0); // 0 = text format
+            Self::CopyOutResponse { format, columns } => {
+                p.put_u8(*format);
                 p.put_u16(*columns);
                 T_COPY_OUT_RESPONSE
             },
@@ -741,18 +744,14 @@ impl BackendMessage {
             }),
             T_NO_DATA => Ok(Self::NoData),
             T_PORTAL_SUSPENDED => Ok(Self::PortalSuspended),
-            T_COPY_IN_RESPONSE => {
-                let _format = get_u8(&mut p, T_COPY_IN_RESPONSE)?;
-                Ok(Self::CopyInResponse {
-                    columns: get_u16(&mut p, T_COPY_IN_RESPONSE)?,
-                })
-            },
-            T_COPY_OUT_RESPONSE => {
-                let _format = get_u8(&mut p, T_COPY_OUT_RESPONSE)?;
-                Ok(Self::CopyOutResponse {
-                    columns: get_u16(&mut p, T_COPY_OUT_RESPONSE)?,
-                })
-            },
+            T_COPY_IN_RESPONSE => Ok(Self::CopyInResponse {
+                format: get_u8(&mut p, T_COPY_IN_RESPONSE)?,
+                columns: get_u16(&mut p, T_COPY_IN_RESPONSE)?,
+            }),
+            T_COPY_OUT_RESPONSE => Ok(Self::CopyOutResponse {
+                format: get_u8(&mut p, T_COPY_OUT_RESPONSE)?,
+                columns: get_u16(&mut p, T_COPY_OUT_RESPONSE)?,
+            }),
             T_COPY_OUT_DATA => Ok(Self::CopyData { data: p.to_vec() }),
             T_COPY_OUT_DONE => Ok(Self::CopyDone),
             T_BACKEND_KEY_DATA => Ok(Self::BackendKeyData {

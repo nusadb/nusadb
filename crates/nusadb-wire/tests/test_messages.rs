@@ -120,8 +120,14 @@ fn copy_messages_roundtrip() {
     frontend_roundtrip(&FrontendMessage::CopyFail {
         message: "client aborted".to_owned(),
     });
-    backend_roundtrip(&BackendMessage::CopyInResponse { columns: 3 });
-    backend_roundtrip(&BackendMessage::CopyOutResponse { columns: 2 });
+    backend_roundtrip(&BackendMessage::CopyInResponse {
+        format: 0,
+        columns: 3,
+    });
+    backend_roundtrip(&BackendMessage::CopyOutResponse {
+        format: 0,
+        columns: 2,
+    });
     backend_roundtrip(&BackendMessage::CopyData {
         data: b"1\talice\n".to_vec(),
     });

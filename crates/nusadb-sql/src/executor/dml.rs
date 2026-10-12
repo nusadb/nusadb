@@ -765,7 +765,8 @@ fn reject_explicit_generated(
 /// from; generated columns reference only non-generated columns, so a single pass is correct, and a
 /// computed `NULL` on a `NOT NULL` column is a violation. Second, let a value whose type differs from
 /// its column's only by the time-zone facet adopt the column's type ([`row::adopt_column_type`]), so
-/// index keys and `RETURNING` see what a later read decodes.
+/// index keys and `RETURNING` see what a later read decodes. `NOT NULL` is not checked here: the
+/// row's `BEFORE` triggers have yet to run, and the caller checks once they have.
 fn finalize_updated_row(
     mut row: Row,
     fills: &[Option<super::coldefault::ColumnFill>],
@@ -819,8 +820,8 @@ impl ConformContext {
 }
 
 /// Bring a row a `BEFORE` trigger rewrote back to the table's stored form, as the statement's own
-/// rows were: generated columns recomputed from the new values, `NOT NULL`, lengths and enum labels
-/// enforced.
+/// rows were: generated columns recomputed from the new values, lengths and enum labels enforced.
+/// `NOT NULL` is left to the write path, which checks every row once its triggers have run.
 pub(super) fn conform_trigger_row(
     table: &TableSchema,
     row: Row,
@@ -828,11 +829,6 @@ pub(super) fn conform_trigger_row(
 ) -> Result<Row, Error> {
     let mut row = finalize_updated_row(row, &context.fills, table, &context.enum_info)?;
     for (value, column) in row.iter_mut().zip(&table.columns) {
-        if matches!(value, ast::Value::Null) && !column.nullable {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
         stored_form(value, column.ty)?;
     }
     Ok(row)
@@ -1534,6 +1530,10 @@ fn insert_rows_with_unique(
     .statement_triggers_if(fire_statement_triggers);
     triggers.fire_stmt_before(table, engine, txn)?;
     triggers.fire_rows_before(table, &mut full_rows, |row| (None, Some(row)), engine, txn)?;
+    // NOT NULL, on the rows as they will be written: whatever produced the value (a VALUES
+    // expression, a SELECT, a COPY field, a default, a BEFORE trigger), and against this table's own
+    // columns, so a partition reached through its parent applies its own NOT NULL.
+    enforce_not_null(table, &full_rows)?;
     // Row-level security WITH CHECK: every row a non-superuser writes must satisfy the
     // applicable policies. Checked before any tuple is written, so a violation aborts the whole
     // INSERT (the transaction rolls back). `None` for a superuser / RLS-free table.
@@ -1634,6 +1634,27 @@ fn insert_rows_with_unique(
     // table.
     super::ivm::maintain_on_change(&table.name, &full_rows, &[], engine, txn)?;
     Ok((full_rows, tids))
+}
+
+/// Refuse a row that holds `NULL` in a column `table` declares `NOT NULL`.
+///
+/// Every write path calls this once per row, on the row as it will be stored: after the row's
+/// `BEFORE` triggers have run (they may repair a NULL or introduce one) and against the written
+/// table's own columns (a partition's, not its parent's).
+fn enforce_not_null<'r>(
+    table: &TableSchema,
+    rows: impl IntoIterator<Item = &'r Row>,
+) -> Result<(), Error> {
+    for row in rows {
+        for (value, column) in row.iter().zip(&table.columns) {
+            if !column.nullable && matches!(value, ast::Value::Null) {
+                return Err(Error::NotNullViolation {
+                    column: column.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Turn a value supplied as text for a column of another type (an untyped literal such as
@@ -1925,6 +1946,8 @@ fn upsert_rows(
         engine,
         txn,
     )?;
+    // NOT NULL over every affected row, inserted or updated, as the BEFORE triggers left it.
+    enforce_not_null(table, &affected)?;
 
     // Row-level security WITH CHECK: every affected (inserted or updated) row must satisfy the
     // applicable policies. Checked before any write, so a violation aborts the whole statement.
@@ -2174,41 +2197,148 @@ fn copy_partition_target(
     Ok((partition_key, target_is_partition, as_insert))
 }
 
-/// The records of a `COPY ... FROM` payload, one at a time, in its text or CSV format.
+/// The records of a text (`csv` false) or CSV (`csv` true) `COPY ... FROM` payload, one at a time,
+/// as raw field text. The binary format has its own reader ([`crate::copy::BinaryRecords`]).
 fn copy_records<'a>(
-    copy: &'a ast::Copy,
+    format: &'a ast::CopyFormat,
     data: &'a str,
+    csv: bool,
 ) -> Box<dyn Iterator<Item = Result<Vec<Option<String>>, Error>> + 'a> {
     // Records stream one at a time (text splits on newlines, CSV parses quote-aware, where a quoted
     // field may span newlines), so a multi-million-row load never materializes every parsed row up
     // front, preserving the bounded-memory batching of `run_copy_from`.
-    match copy.format.kind {
-        ast::CopyFormatKind::Text => {
-            Box::new(copy_data_lines(data, copy.format.header).map(|line| {
-                Ok(crate::copy::parse_text_row(
-                    line,
-                    copy.format.delimiter,
-                    &copy.format.null,
-                ))
-            }))
-        },
-        ast::CopyFormatKind::Csv => Box::new(
-            crate::copy::CsvRecords::new(
-                data,
-                copy.format.delimiter,
-                copy.format.quote,
-                copy.format.escape,
-                &copy.format.null,
-            )
-            .skip(usize::from(copy.format.header))
-            .map(|record| {
-                record.map_err(|message| Error::Coded {
-                    message,
-                    sqlstate: "22P04", // bad_copy_file_format
-                })
-            }),
-        ),
+    if !csv {
+        return Box::new(copy_data_lines(data, format.header).map(|line| {
+            Ok(crate::copy::parse_text_row(
+                line,
+                format.delimiter,
+                &format.null,
+            ))
+        }));
     }
+    Box::new(
+        crate::copy::CsvRecords::new(
+            data,
+            format.delimiter,
+            format.quote,
+            format.escape,
+            &format.null,
+        )
+        .skip(usize::from(format.header))
+        .map(|record| {
+            record.map_err(|message| Error::Coded {
+                message,
+                sqlstate: "22P04", // bad_copy_file_format
+            })
+        }),
+    )
+}
+
+/// Decode one binary `COPY` field at its column's type, naming the row and column in a format error.
+fn decode_binary_copy_field(
+    bytes: &[u8],
+    ty: ColumnType,
+    record_no: usize,
+    name: &str,
+) -> Result<ast::Value, Error> {
+    crate::binary::decode_value(bytes, ty).map_err(|e| match e {
+        Error::Coded { message, sqlstate } => Error::Coded {
+            message: format!("COPY row {}, column {name}: {message}", record_no + 1),
+            sqlstate,
+        },
+        other => other,
+    })
+}
+
+/// A row of a `COPY ... FROM` payload, decoded to one value per target column.
+type CopyRow = Vec<Option<ast::Value>>;
+
+/// The rows of a binary `COPY ... FROM` payload, each checked by `arity` and decoded at `types`.
+fn binary_copy_rows<'a>(
+    data: &'a [u8],
+    types: &'a [ColumnType],
+    names: &'a [&'a str],
+    arity: impl Fn(usize, usize) -> Result<(), Error> + 'a,
+) -> Result<Box<dyn Iterator<Item = Result<CopyRow, Error>> + 'a>, Error> {
+    let records = crate::copy::BinaryRecords::new(data).map_err(|message| Error::Coded {
+        message,
+        sqlstate: "22P04", // bad_copy_file_format
+    })?;
+    Ok(Box::new(records.enumerate().map(
+        move |(record_no, record)| {
+            let fields = record.map_err(|message| Error::Coded {
+                message,
+                sqlstate: "22P04", // bad_copy_file_format
+            })?;
+            arity(record_no, fields.len())?;
+            fields
+                .into_iter()
+                .zip(types.iter().zip(names))
+                .map(|(field, (&ty, name))| {
+                    field.map_or(Ok(Some(ast::Value::Null)), |bytes| {
+                        decode_binary_copy_field(bytes, ty, record_no, name).map(Some)
+                    })
+                })
+                .collect()
+        },
+    )))
+}
+
+/// The rows of a `COPY ... FROM` payload in any format, one at a time, each checked for the
+/// column count and decoded at the target columns' types (`names` label errors).
+///
+/// Text and CSV fields go through [`parse_copy_field`]; a binary field is decoded from its binary
+/// layout by [`crate::binary::decode_value`], which hands text-form types on as text so they meet
+/// the same write-time coercion. Every row, whatever its format, then takes the same insert path.
+fn copy_rows<'a>(
+    copy: &'a ast::Copy,
+    data: &'a [u8],
+    types: &'a [ColumnType],
+    names: &'a [&'a str],
+) -> Result<Box<dyn Iterator<Item = Result<CopyRow, Error>> + 'a>, Error> {
+    // A line or row with the wrong number of fields is a badly formed COPY file, not a badly formed
+    // SQL statement, so it reports the same class as the record decoders.
+    let arity = move |record_no: usize, found: usize| -> Result<(), Error> {
+        if found == types.len() {
+            return Ok(());
+        }
+        Err(Error::Coded {
+            message: format!(
+                "COPY data line {}: expected {} value(s), found {found}",
+                record_no + 1,
+                types.len(),
+            ),
+            sqlstate: "22P04", // bad_copy_file_format
+        })
+    };
+    let csv = match copy.format.kind {
+        ast::CopyFormatKind::Text => false,
+        ast::CopyFormatKind::Csv => true,
+        ast::CopyFormatKind::Binary => return binary_copy_rows(data, types, names, arity),
+    };
+    let text = std::str::from_utf8(data).map_err(|_| Error::Coded {
+        message: "COPY data is not valid UTF-8".to_owned(),
+        sqlstate: "22021", // character_not_in_repertoire
+    })?;
+    Ok(Box::new(
+        copy_records(&copy.format, text, csv)
+            .enumerate()
+            .map(move |(record_no, record)| {
+                let fields = record?;
+                arity(record_no, fields.len())?;
+                // COPY names every column explicitly; an empty/NULL field is a concrete NULL, never a
+                // `DEFAULT` cell, so each value is `Some`.
+                fields
+                    .into_iter()
+                    .zip(types)
+                    .map(|(field, &ty)| {
+                        field.map_or(Ok(Some(ast::Value::Null)), |text| {
+                            parse_copy_field(&text, ty).map(Some)
+                        })
+                    })
+                    .collect()
+            }),
+    ))
 }
 
 /// Execute `COPY <table> FROM STDIN`: resolve the target columns, tokenize the text-format
@@ -2217,7 +2347,7 @@ fn copy_records<'a>(
 /// caller's level — a single bad row aborts it (all-or-nothing), matching a non-streamed batch.
 pub(super) fn run_copy_from(
     copy: &ast::Copy,
-    data: &str,
+    data: &[u8],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<usize, Error> {
@@ -2226,6 +2356,10 @@ pub(super) fn run_copy_from(
     let target_types: Vec<ColumnType> = columns
         .iter()
         .filter_map(|&i| table.columns.get(i).map(|c| c.ty))
+        .collect();
+    let target_names: Vec<&str> = columns
+        .iter()
+        .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
         .collect();
 
     // Stream the payload in INSERT_SELECT_BATCH-row batches rather than materializing every parsed
@@ -2282,35 +2416,10 @@ pub(super) fn run_copy_from(
         .len();
         Ok(())
     };
-    let records = copy_records(copy, data);
-    for (record_no, record) in records.enumerate() {
+    for row in copy_rows(copy, data, &target_types, &target_names)? {
         // Honor a statement timeout / cancel request at row granularity on a long load.
         crate::cancel::check()?;
-        let fields = record?;
-        if fields.len() != columns.len() {
-            // The same class the record decoder above reports: a line with the wrong number of
-            // fields is a badly formed COPY file, not a badly formed SQL statement. Answering one
-            // malformation with `bad_copy_file_format` and the other with `syntax_error` would
-            // leave a loader guessing which of its two errors it had.
-            return Err(Error::Coded {
-                message: format!(
-                    "COPY data line {}: expected {} value(s), found {}",
-                    record_no + 1,
-                    columns.len(),
-                    fields.len()
-                ),
-                sqlstate: "22P04", // bad_copy_file_format
-            });
-        }
-        let mut row = Vec::with_capacity(fields.len());
-        for (field, &ty) in fields.into_iter().zip(&target_types) {
-            // COPY names every column explicitly; an empty/NULL field is a concrete NULL, never a
-            // `DEFAULT` cell — so each value is `Some`.
-            row.push(Some(match field {
-                None => ast::Value::Null,
-                Some(text) => parse_copy_field(&text, ty)?,
-            }));
-        }
+        let row = row?;
         batch.push(row);
         if batch.len() >= INSERT_SELECT_BATCH {
             flush(&mut batch, &mut unique)?;
@@ -2336,76 +2445,109 @@ fn copy_value_text(value: &ast::Value) -> String {
     }
 }
 
-/// Execute `COPY <table> TO STDOUT`: render the table's visible rows in the text format,
-/// returning the row count and the rendered payload (newline-terminated lines). A leading header
-/// line of column names is emitted when `WITH (HEADER)` is set.
+/// A NULL to stand in for a column a short row lacks.
+static NULL_VALUE: ast::Value = ast::Value::Null;
+
+/// Render the rows of a `COPY ... TO` in its format: text or CSV data lines (newline-terminated,
+/// after a header line of `names` when `HEADER` is set), or a binary stream with its header and
+/// trailer.
+fn render_copy_output<'v>(
+    format: &ast::CopyFormat,
+    names: &[&str],
+    rows: impl Iterator<Item = Vec<&'v ast::Value>>,
+) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    if format.kind == ast::CopyFormatKind::Binary {
+        crate::copy::binary_header(&mut out);
+        for row in rows {
+            let fields: Vec<Option<Vec<u8>>> =
+                row.into_iter().map(crate::binary::encode_value).collect();
+            crate::copy::push_binary_row(&mut out, &fields).map_err(Error::LimitExceeded)?;
+        }
+        crate::copy::binary_trailer(&mut out);
+        return Ok(out);
+    }
+    // Render one row of fields in the requested format (text or CSV).
+    let format_row = |fields: &[Option<&str>]| -> String {
+        match format.kind {
+            ast::CopyFormatKind::Csv => crate::copy::format_csv_row(
+                fields,
+                format.delimiter,
+                format.quote,
+                format.escape,
+                &format.null,
+            ),
+            ast::CopyFormatKind::Text | ast::CopyFormatKind::Binary => {
+                crate::copy::format_text_row(fields, format.delimiter, &format.null)
+            },
+        }
+    };
+    if format.header {
+        let names: Vec<Option<&str>> = names.iter().copied().map(Some).collect();
+        out.extend_from_slice(format_row(&names).as_bytes());
+        out.push(b'\n');
+    }
+    for row in rows {
+        let fields: Vec<Option<String>> = row
+            .into_iter()
+            .map(|value| match value {
+                ast::Value::Null => None,
+                value => Some(copy_value_text(value)),
+            })
+            .collect();
+        let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
+        out.extend_from_slice(format_row(&refs).as_bytes());
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// Execute `COPY <table> TO STDOUT`: render the table's visible rows in the statement's format,
+/// returning the row count and the rendered payload (newline-terminated lines for text and CSV, a
+/// complete stream for binary). A leading header line of column names is emitted when
+/// `WITH (HEADER)` is set.
 pub(super) fn run_copy_to(
     copy: &ast::Copy,
     user: &str,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(usize, String), Error> {
-    // Render one row of fields in the requested format (text or CSV).
-    let format_row = |fields: &[Option<&str>]| -> String {
-        match copy.format.kind {
-            ast::CopyFormatKind::Text => {
-                crate::copy::format_text_row(fields, copy.format.delimiter, &copy.format.null)
-            },
-            ast::CopyFormatKind::Csv => crate::copy::format_csv_row(
-                fields,
-                copy.format.delimiter,
-                copy.format.quote,
-                copy.format.escape,
-                &copy.format.null,
-            ),
-        }
-    };
-
+) -> Result<(usize, Vec<u8>), Error> {
     // `COPY (<query>) TO STDOUT`: analyze + plan + run the query as the COPY user (so it is checked
     // for privileges and row-level security exactly like a direct SELECT), then render its result.
     if let Some(query) = &copy.query {
-        return run_copy_query_to(query, user, &format_row, copy.format.header, engine, txn);
+        return run_copy_query_to(query, user, &copy.format, engine, txn);
     }
 
     let table = lookup_copy_table(copy, engine, txn)?;
     let columns = resolve_copy_columns(copy, &table)?;
     let rows = scan_rows(&table, engine, txn)?;
-
-    let mut out = String::new();
-    if copy.format.header {
-        let names: Vec<Option<&str>> = columns
-            .iter()
-            .map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
-            .collect();
-        out.push_str(&format_row(&names));
-        out.push('\n');
-    }
-    for row in &rows {
-        let fields: Vec<Option<String>> = columns
-            .iter()
-            .map(|&i| match row.get(i) {
-                Some(ast::Value::Null) | None => None,
-                Some(value) => Some(copy_value_text(value)),
-            })
-            .collect();
-        let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
-        out.push_str(&format_row(&refs));
-        out.push('\n');
-    }
+    let names: Vec<&str> = columns
+        .iter()
+        .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
+        .collect();
+    let out = render_copy_output(
+        &copy.format,
+        &names,
+        rows.iter().map(|row| {
+            columns
+                .iter()
+                .map(|&i| row.get(i).unwrap_or(&NULL_VALUE))
+                .collect()
+        }),
+    )?;
     Ok((rows.len(), out))
 }
 
 /// `COPY (<query>) TO STDOUT`: analyze + plan + execute `query` as `user` under `txn`, then render its
-/// rows (all projected columns, in order) with `format_row`, prefixed by a header line of column names
-/// when `header` is set.
+/// rows (all projected columns, in order) in `format`, with a header line of column names when the
+/// format asks for one.
 fn run_copy_query_to(
     query: &ast::Select,
     user: &str,
-    format_row: &dyn Fn(&[Option<&str>]) -> String,
-    header: bool,
+    format: &ast::CopyFormat,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(usize, String), Error> {
+) -> Result<(usize, Vec<u8>), Error> {
     let catalog = super::SessionCatalog {
         engine,
         txn,
@@ -2429,25 +2571,8 @@ fn run_copy_query_to(
             "COPY (query) TO STDOUT: the query did not produce a row set".to_owned(),
         ));
     };
-
-    let mut out = String::new();
-    if header {
-        let names: Vec<Option<&str>> = columns.iter().map(|c| Some(c.as_str())).collect();
-        out.push_str(&format_row(&names));
-        out.push('\n');
-    }
-    for row in &rows {
-        let fields: Vec<Option<String>> = row
-            .iter()
-            .map(|value| match value {
-                ast::Value::Null => None,
-                value => Some(copy_value_text(value)),
-            })
-            .collect();
-        let refs: Vec<Option<&str>> = fields.iter().map(Option::as_deref).collect();
-        out.push_str(&format_row(&refs));
-        out.push('\n');
-    }
+    let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+    let out = render_copy_output(format, &names, rows.iter().map(|row| row.iter().collect()))?;
     Ok((rows.len(), out))
 }
 
@@ -3531,6 +3656,8 @@ fn cascade_update_children(
         {
             return Err(skipped_referential_action(child));
         }
+        // A SET NULL action, or a trigger, may leave NULL in a NOT NULL column of the child.
+        enforce_not_null(child, std::iter::once(&new))?;
         if let Some(computed) = computed
             && computed != new
         {
@@ -4873,6 +5000,8 @@ fn run_update_single(
                 .collect();
         }
     }
+    // NOT NULL on the new images, after the BEFORE triggers that may repair or introduce a NULL.
+    enforce_not_null(&plan.table, to_update.iter().map(|(_, _, new)| new))?;
     // Row movement: a SET whose new image leaves this partition's bound is performed as a DELETE
     // here plus an INSERT routed through the topmost parent (the reference engine's behavior) —
     // never an in-place write that would strand the row where the pruning layer misses it. Moved
@@ -6201,6 +6330,7 @@ fn commit_merge_updates(
         txn,
     )?;
     let new_rows: Vec<Row> = updates.iter().map(|(_, _, n)| n.clone()).collect();
+    enforce_not_null(table, &new_rows)?;
     // UNIQUE over the post-merge target state: deletes removed, updates applied (fresh inserts are
     // checked separately by `insert_rows` against the already-updated table).
     if needs_unique {
@@ -6279,12 +6409,7 @@ pub(super) fn apply_assignments(
 ) -> Result<Row, Error> {
     for assignment in assignments {
         let value = eval::eval(&assignment.value, &row)?;
-        let column = column_at(table, assignment.column)?;
-        if matches!(value, ast::Value::Null) && !column.nullable {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
+        column_at(table, assignment.column)?;
         set_at(&mut row, assignment.column, value)?;
     }
     Ok(row)
@@ -6302,12 +6427,7 @@ fn apply_assignments_ctx(
 ) -> Result<Row, Error> {
     for assignment in assignments {
         let value = eval::eval(&assignment.value, ctx)?;
-        let column = column_at(table, assignment.column)?;
-        if matches!(value, ast::Value::Null) && !column.nullable {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
+        column_at(table, assignment.column)?;
         set_at(&mut row, assignment.column, value)?;
     }
     Ok(row)

@@ -14,6 +14,7 @@
 pub mod analyzer;
 pub mod ast;
 pub mod batch;
+pub mod binary;
 pub mod bit;
 pub mod cancel;
 pub mod composite;
@@ -61,17 +62,18 @@ pub use executor::{
     StreamOutcome, auto_analyze_stale_tables, canonicalize_client_min_messages,
     canonicalize_timezone_setting, catalog_approx_row_count, catalog_approx_row_count_in,
     catalog_list_indexes, catalog_list_indexes_in, catalog_table_stats, catalog_table_stats_in,
-    check_settable_parameter, copy_from, copy_from_in, copy_to, copy_to_in, describe_column_types,
-    describe_columns, execute, execute_in_txn, execute_in_txn_as, execute_in_txn_as_streaming,
-    execute_in_txn_as_streaming_with_cursors, execute_in_txn_as_streaming_with_prepared,
-    execute_in_txn_as_streaming_with_settings, execute_in_txn_as_with_settings, inheritance_any,
-    inheritance_descendants, inheritance_partition_fingerprint, is_cursor_plan, is_prepare_plan,
-    lookup_composite, lookup_composite_column, lookup_enum, lookup_enum_column,
-    lookup_function_definition, lookup_policies_for, lookup_view_check_option, lookup_view_columns,
-    lookup_view_definition, maintenance_work_mem, parse_work_mem, partition_key_columns,
-    partitions_to_prune, pin_statement_timezone, purge_schema_catalogs, release_advisory_locks,
-    rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_work_mem,
-    show_session_variable, statement_tz_offset_secs, view_has_instead_of_trigger, work_mem,
+    check_settable_parameter, copy_from, copy_from_bytes_in, copy_from_in, copy_to,
+    copy_to_bytes_in, copy_to_in, describe_column_types, describe_columns, execute, execute_in_txn,
+    execute_in_txn_as, execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_cursors,
+    execute_in_txn_as_streaming_with_prepared, execute_in_txn_as_streaming_with_settings,
+    execute_in_txn_as_with_settings, inheritance_any, inheritance_descendants,
+    inheritance_partition_fingerprint, is_cursor_plan, is_prepare_plan, lookup_composite,
+    lookup_composite_column, lookup_enum, lookup_enum_column, lookup_function_definition,
+    lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
+    maintenance_work_mem, parse_work_mem, partition_key_columns, partitions_to_prune,
+    pin_statement_timezone, purge_schema_catalogs, release_advisory_locks, rls_table_enabled,
+    set_maintenance_work_mem, set_spill_config, set_work_mem, show_session_variable,
+    statement_tz_offset_secs, view_has_instead_of_trigger, work_mem,
 };
 
 /// The bootstrap database superuser, which bypasses row-level security.

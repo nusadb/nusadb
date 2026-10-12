@@ -17,94 +17,12 @@ use nusadb_sql::ast::Value;
 /// Encode a [`Value`] in the **binary** wire format.
 ///
 /// Returns `None` for SQL `NULL` (the field carries no bytes, only its NULL marker in the
-/// surrounding `DataRow`) and `Some(bytes)` otherwise. Byte layout per type:
-///
-/// | type          | layout                                                                |
-/// | ------------- | --------------------------------------------------------------------- |
-/// | `BOOL`        | 1 byte: `0x01` true, `0x00` false                                     |
-/// | `INT`         | `i64`, 8 bytes big-endian                                            |
-/// | `FLOAT`       | IEEE-754 `f64` bit pattern, 8 bytes big-endian                       |
-/// | `NUMERIC`     | canonical decimal text, UTF-8 (lossless across arbitrary precision)  |
-/// | `DATE`        | `i32` days since 1970-01-01, 4 bytes big-endian                      |
-/// | `TIME`        | `i64` microseconds since midnight, 8 bytes big-endian                |
-/// | `TIMETZ`      | `local micros:i64` ‖ `zone secs west of UTC:i32`, big-endian (12 B)  |
-/// | `TIMESTAMP`   | `i64` microseconds since the epoch, 8 bytes big-endian               |
-/// | `TIMESTAMPTZ` | `i64` microseconds since the epoch (UTC), 8 bytes big-endian          |
-/// | `INTERVAL`    | `months:i32` ‖ `days:i32` ‖ `micros:i64`, all big-endian (16 bytes)  |
-/// | `UUID`        | the 16 bytes verbatim                                                 |
-/// | `TEXT`        | UTF-8 bytes verbatim (text and binary coincide)                      |
-/// | `JSON`        | canonical JSON text, UTF-8                                            |
-/// | `ARRAY`       | canonical `{...}` array text, UTF-8                                  |
-/// | `VECTOR`      | canonical `[..]` vector text, UTF-8                                  |
-///
-/// `NUMERIC`, `JSON`, `ARRAY`, and `VECTOR` use their canonical text rather than a packed layout
-/// because the value is arbitrary-precision / arbitrary-length: text is the lossless representation
-/// and avoids
-/// a precision- or shape-dependent frame layout. The column's declared type (carried by
-/// `RowDescription`) tells the client how to read each field, so `TIME` / `TIMESTAMP` /
-/// `TIMESTAMPTZ` sharing an 8-byte big-endian layout is unambiguous.
+/// surrounding `DataRow`) and `Some(bytes)` otherwise. The layouts are defined once, in
+/// [`nusadb_sql::binary::encode_value`], so a binary result column and a binary `COPY` field carry
+/// the same bytes; see that function for the per-type table.
 #[must_use]
 pub fn encode_binary(value: &Value) -> Option<Vec<u8>> {
-    let bytes = match value {
-        Value::Null => return None,
-        Value::Bool(b) => vec![u8::from(*b)],
-        Value::Int(i) => i.to_be_bytes().to_vec(),
-        Value::Float(f) => f.to_bits().to_be_bytes().to_vec(),
-        Value::Numeric(d) => d.format().into_bytes(),
-        Value::Date(d) => d.to_be_bytes().to_vec(),
-        // TIME, TIMESTAMP, and TIMESTAMPTZ are each a microsecond count in an `i64`.
-        Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => t.to_be_bytes().to_vec(),
-        // TIMETZ carries its zone: local time-of-day micros + zone seconds west of
-        // UTC, mirroring the reference engine's binary timetz layout, so a typed client keeps the entered offset.
-        Value::TimeTz(packed) => {
-            let local = nusadb_sql::temporal::timetz_local_micros(*packed);
-            let zone_west = i32::try_from(-nusadb_sql::temporal::timetz_offset_east_secs(*packed))
-                .unwrap_or_default();
-            let mut buf = Vec::with_capacity(12);
-            buf.extend_from_slice(&local.to_be_bytes());
-            buf.extend_from_slice(&zone_west.to_be_bytes());
-            buf
-        },
-        Value::Uuid(u) => u.to_vec(),
-        // MACADDR is its six raw bytes in transmission order.
-        Value::Macaddr(m) => m.to_vec(),
-        // MACADDR8 is its eight raw bytes in transmission order.
-        Value::Macaddr8(m) => m.to_vec(),
-        // GEOMETRY is sent as its canonical text form (`(x,y)` / `(hx,hy),(lx,ly)`).
-        Value::Geometry(g) => nusadb_sql::geometry::format(g).into_bytes(),
-        // INET/CIDR: the self-describing `[flags, masklen, octets]` encoding (the tag tells the
-        // client it is a network address).
-        Value::Inet(a) => a.encode(),
-        // BIT/BIT VARYING: the self-describing `[len, packed bytes]` encoding.
-        Value::Bit(b) => nusadb_sql::bit::encode(b),
-        // RANGE: the element-kind tag then the self-describing flags-and-bounds encoding.
-        Value::Range(r) => {
-            let mut out = vec![r.kind.tag()];
-            out.extend_from_slice(&nusadb_sql::range::encode(r));
-            out
-        },
-        Value::Interval(iv) => {
-            let mut buf = Vec::with_capacity(16);
-            buf.extend_from_slice(&iv.months.to_be_bytes());
-            buf.extend_from_slice(&iv.days.to_be_bytes());
-            buf.extend_from_slice(&iv.micros.to_be_bytes());
-            buf
-        },
-        // Full-text values are sent as their canonical text form, like plain text.
-        Value::Text(s) | Value::Tsvector(s) | Value::Tsquery(s) | Value::Xml(s) => {
-            s.clone().into_bytes()
-        },
-        // An enum is sent as its label text (the ordinal is a server-side ordering detail).
-        Value::Enum { label, .. } => label.clone().into_bytes(),
-        // JSON is sent in the spaced display form (`{"a": 1}`), matching standard jsonb text output.
-        Value::Json(s) => nusadb_sql::json::display_form(s).into_bytes(),
-        Value::Array(items) => nusadb_sql::display::array_text(items).into_bytes(),
-        // VECTOR is sent as its canonical `[..]` text, like JSON/ARRAY (arbitrary length).
-        Value::Vector(v) => nusadb_sql::vector::format(v).into_bytes(),
-        // BYTEA is sent as its raw bytes in the binary format.
-        Value::Bytes(b) => b.clone(),
-    };
-    Some(bytes)
+    nusadb_sql::binary::encode_value(value)
 }
 
 #[cfg(test)]

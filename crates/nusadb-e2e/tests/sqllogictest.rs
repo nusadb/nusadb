@@ -498,6 +498,11 @@ fn run_slt(path: &str) {
 // `#[test]` line here.
 
 #[test]
+fn slt_p2_not_null_entry_points() {
+    run_slt("tests/slt/p2_dml/not_null_entry_points.slt");
+}
+
+#[test]
 fn slt_p1_create_drop() {
     run_slt("tests/slt/p1_ddl/create_drop.slt");
 }

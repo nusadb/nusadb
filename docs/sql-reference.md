@@ -821,14 +821,18 @@ nusadb-cli -c "COPY customers FROM STDIN WITH (DELIMITER '|', NULL '')" < rows.p
 nusadb-cli -c "COPY customers TO STDOUT" > out.tsv
 nusadb-cli -c "COPY customers (email, country) TO STDOUT WITH (FORMAT csv, HEADER)" > out.csv
 nusadb-cli -c "COPY (SELECT email FROM customers WHERE country = 'ID' ORDER BY email) TO STDOUT WITH (FORMAT csv)" > id.csv
+nusadb-cli -c "COPY customers TO STDOUT (FORMAT binary)" > customers.bin
+nusadb-cli -c "COPY customers FROM STDIN (FORMAT binary)" < customers.bin
 ```
 
-Options: `FORMAT text | csv`, `DELIMITER 'c'`, `NULL 'string'`, `HEADER`, and for CSV only
-`QUOTE 'c'` and `ESCAPE 'c'`. The text format is tab-delimited with `\N` for NULL. Export takes a
-table (optionally with a column list) or a `(query)`; the query form is `TO STDOUT` only, runs with
-the caller's privileges and row policies like any `SELECT`, and resolves unqualified names in the
-default schema, so qualify names from other schemas. Load takes a table only, and binary format is
-not available. A load larger than `--copy-max-bytes` is refused rather than buffered without
+Options: `FORMAT text | csv | binary`, `DELIMITER 'c'`, `NULL 'string'`, `HEADER`, and for CSV
+only `QUOTE 'c'` and `ESCAPE 'c'`. The text format is tab-delimited with `\N` for NULL. The binary
+format (also spelled `... FROM STDIN BINARY`) sends each value in its binary wire layout, framed by
+length, and takes none of the other options; its stream layout is in the wire protocol
+specification, section 12.4. Export takes a table (optionally with a column list) or a `(query)`;
+the query form is `TO STDOUT` only, runs with the caller's privileges and row policies like any
+`SELECT`, and resolves unqualified names in the default schema, so qualify names from other schemas.
+Load takes a table only. A load larger than `--copy-max-bytes` is refused rather than buffered without
 bound. Loading into a partitioned table sends each row to its partition, and a row no partition
 accepts refuses the whole load; loading into a partition refuses a row outside its bound.
 
@@ -2075,7 +2079,7 @@ Recognised and refused with `0A000` and a clear message rather than half-impleme
 - `LOCK TABLE` modes other than `ACCESS SHARE` and `ACCESS EXCLUSIVE`;
 - `SET NAMES`, and an IANA region name as the session time zone;
 - locale collations (only `"C"` / `"POSIX"`);
-- `COPY` to or from a file or program (only `STDIN` / `STDOUT`), and `COPY ... BINARY`;
+- `COPY` to or from a file or program (only `STDIN` / `STDOUT`);
 - `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY` over a connection;
 - full-text configurations other than `simple`, `english`, and `indonesian`, and full-text prefix matching;
 - `IGNORE NULLS` / `RESPECT NULLS` on window functions;
