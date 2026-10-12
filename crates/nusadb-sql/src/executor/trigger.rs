@@ -479,7 +479,7 @@ fn trigger_exists(
 }
 
 /// Remove the `(table, name)` trigger row, returning whether one was deleted.
-fn delete_trigger_row(
+pub(super) fn delete_trigger_row(
     engine: &dyn StorageEngine,
     txn: TxnId,
     schema: &str,

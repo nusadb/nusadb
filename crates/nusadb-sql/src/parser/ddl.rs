@@ -1359,9 +1359,9 @@ pub(super) fn convert_alter_op(
             if_exists,
             drop_behavior,
         } => {
-            if drop_behavior.is_some() {
-                return unsupported("ALTER TABLE DROP COLUMN ... CASCADE / RESTRICT");
-            }
+            // RESTRICT is the default: a column another object still needs is refused. CASCADE
+            // drops those objects with it.
+            let cascade = matches!(drop_behavior, Some(sql::DropBehavior::Cascade));
             // sqlparser 0.62 models a multi-column drop form; only the single-column
             // form is in surface.
             let [column_name] = column_names.as_slice() else {
@@ -1370,6 +1370,7 @@ pub(super) fn convert_alter_op(
             Ok(ast::AlterTableAction::DropColumn {
                 name: fold_ident(column_name),
                 if_exists,
+                cascade,
             })
         },
         Op::RenameColumn {
@@ -1411,10 +1412,11 @@ pub(super) fn convert_alter_op(
                 if_exists,
             })
         },
-        Op::AlterColumn { column_name, op } => Ok(ast::AlterTableAction::AlterColumn {
-            column: fold_ident(&column_name),
-            change: convert_column_change(op)?,
-        }),
+        Op::AlterColumn { column_name, op } => {
+            let column = fold_ident(&column_name);
+            let change = convert_column_change(&column, op)?;
+            Ok(ast::AlterTableAction::AlterColumn { column, change })
+        },
         // Row-level security toggles. `FORCE`/`NO FORCE ROW LEVEL SECURITY` are not modelled by
         // sqlparser 0.51 and are a follow-up.
         Op::EnableRowLevelSecurity => Ok(ast::AlterTableAction::EnableRowLevelSecurity),
@@ -1452,6 +1454,7 @@ fn trigger_toggle_target(name: &sql::Ident) -> Result<Option<String>, Error> {
 /// Lower an `ALTER [COLUMN]` modification. `SET DATA TYPE ... USING <expr>`
 /// (a conversion expression) and `ADD GENERATED ... AS IDENTITY` are rejected.
 pub(super) fn convert_column_change(
+    column: &str,
     op: sql::AlterColumnOperation,
 ) -> Result<ast::ColumnChange, Error> {
     use sql::AlterColumnOperation as Op;
@@ -1472,7 +1475,20 @@ pub(super) fn convert_column_change(
             if using.is_some() {
                 return unsupported("ALTER COLUMN SET DATA TYPE ... USING <expr>");
             }
-            Ok(ast::ColumnChange::SetType(convert_data_type(&data_type)?))
+            // The new type's width or length bound, enforced the way a column declared with that
+            // type enforces it.
+            // Each carries the code a row the bound rejects is reported with.
+            let checks = [
+                char_length_check(column, &data_type)?.map(|c| (c, "22001")),
+                int_range_check(column, &data_type)?.map(|c| (c, "22003")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            Ok(ast::ColumnChange::SetType {
+                ty: convert_data_type(&data_type)?,
+                checks,
+            })
         },
         Op::AddGenerated { .. } => unsupported("ALTER COLUMN ADD GENERATED ... AS IDENTITY"),
     }

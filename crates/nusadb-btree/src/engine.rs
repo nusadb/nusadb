@@ -431,6 +431,27 @@ struct SeqDomain {
     sequences: HashMap<u64, SequenceState>,
     seq_by_name: HashMap<String, u64>,
     next_sequence_id: u64,
+    /// Names whose sequence a transaction has dropped, with that transaction and how many of its
+    /// drops of the name are still undoable. While the transaction may still roll back, the name
+    /// is not free: a rollback puts the old sequence back under it. Another transaction creating
+    /// the name is refused (no-wait). An entry whose transaction has since committed is stale and
+    /// is cleared the next time the name is created; an abort clears it through the undo.
+    pending_drops: HashMap<String, (u64, usize)>,
+}
+
+impl SeqDomain {
+    /// Point `name` at `id`, unless another sequence already owns the name.
+    fn claim_name(&mut self, name: &str, id: u64) {
+        self.seq_by_name.entry(name.to_owned()).or_insert(id);
+    }
+
+    /// Unmap `name`, but only while it still names `id`: a later sequence that took the name
+    /// keeps it.
+    fn release_name(&mut self, name: &str, id: u64) {
+        if self.seq_by_name.get(name) == Some(&id) {
+            self.seq_by_name.remove(name);
+        }
+    }
 }
 
 /// The undo arena (rank 8): superseded row versions addressed by [`RowMeta::undo`]; `None` =
@@ -1538,6 +1559,12 @@ enum UndoOp {
     CreatedSequence {
         id: u64,
         name: String,
+    },
+    /// A sequence this transaction dropped, with its definition and counter, so a rollback puts
+    /// it back exactly as it was.
+    DroppedSequence {
+        id: u64,
+        state: SequenceState,
     },
     AlteredSchema {
         table: u64,
@@ -2857,7 +2884,9 @@ impl BtreeEngine {
                 cat.stats.remove(table);
             },
             LoggedOp::SeqCreate { id, def } => {
-                seqs.seq_by_name.insert(def.name.clone(), *id);
+                // The name stays with a sequence that still holds it: a create by a transaction
+                // that had dropped the holder and then rolled back must not take it over.
+                seqs.claim_name(&def.name, *id);
                 seqs.sequences.insert(
                     *id,
                     SequenceState {
@@ -2867,9 +2896,9 @@ impl BtreeEngine {
                 );
                 seqs.next_sequence_id = seqs.next_sequence_id.max(*id + 1);
             },
-            LoggedOp::SeqDrop { id } => {
+            LoggedOp::SeqDrop { id, .. } => {
                 if let Some(seq) = seqs.sequences.remove(id) {
-                    seqs.seq_by_name.remove(&seq.def.name);
+                    seqs.release_name(&seq.def.name, *id);
                 }
             },
             LoggedOp::SeqSet { id, value } => {
@@ -3335,7 +3364,21 @@ impl BtreeEngine {
                 ),
                 // A SeqCreate record replays unconditionally, so the undone create must be
                 // neutralized in the log too.
-                UndoOp::CreatedSequence { id, .. } => vec![LoggedOp::SeqDrop { id: *id }],
+                UndoOp::CreatedSequence { id, .. } => vec![LoggedOp::SeqDrop { txn: 0, id: *id }],
+                // The drop replays only if the transaction commits, and it still may: put the
+                // sequence back after it in the log, counter included. The re-create replays
+                // unconditionally, so the sequence is there after recovery whether or not the
+                // transaction commits.
+                UndoOp::DroppedSequence { id, state } => {
+                    let mut ops = vec![LoggedOp::SeqCreate {
+                        id: *id,
+                        def: state.def.clone(),
+                    }];
+                    if let Some(value) = state.current {
+                        ops.push(LoggedOp::SeqSet { id: *id, value });
+                    }
+                    ops
+                },
                 // Re-establish the pre-alter schema (the earlier AlterSchema record stays in the
                 // log; this reverts it on replay).
                 UndoOp::AlteredSchema {
@@ -7931,8 +7974,35 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
         }
+        // A name another transaction dropped is not free until that transaction ends: its
+        // rollback would put the old sequence back under it. Whether the dropper is still running
+        // is asked of the transaction domain, which ranks before the sequence latch, so the
+        // latch is let go for the question and the reservation re-read after.
+        let reserved_by = {
+            let seqs = self.seqs.lock().map_err(|_| poisoned())?;
+            seqs.pending_drops
+                .get(&def.name)
+                .map(|(owner, _)| *owner)
+                .filter(|owner| *owner != txn.0)
+        };
+        if let Some(owner) = reserved_by {
+            if self.txn_exists(owner)? {
+                return Err(Error::SerializationConflict { txn });
+            }
+            let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
+            if seqs.pending_drops.get(&def.name).map(|(o, _)| *o) == Some(owner) {
+                seqs.pending_drops.remove(&def.name);
+            }
+        }
         let id = {
             let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
+            if seqs
+                .pending_drops
+                .get(&def.name)
+                .is_some_and(|(owner, _)| *owner != txn.0)
+            {
+                return Err(Error::SerializationConflict { txn });
+            }
             if seqs.seq_by_name.contains_key(&def.name) {
                 return Err(sequence_error(&format!(
                     "sequence {} already exists",
@@ -7984,17 +8054,39 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
         }
-        let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
-        let name = seqs
-            .sequences
-            .get(&id.0)
-            .map(|seq| seq.def.name.clone())
-            .ok_or_else(|| sequence_not_found(id))?;
-        // Durable delete FIRST: if the append fails, memory is untouched, so a crash never
-        // leaves memory saying "dropped" while the log still replays the sequence.
-        self.log_durable(&LoggedOp::SeqDrop { id: id.0 }.to_record())?;
-        seqs.sequences.remove(&id.0);
-        seqs.seq_by_name.remove(&name);
+        let state = {
+            let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
+            let state = seqs
+                .sequences
+                .get(&id.0)
+                .cloned()
+                .ok_or_else(|| sequence_not_found(id))?;
+            // Transactional, unlike the create: the record carries the transaction, so recovery
+            // applies it only once the transaction committed, and a rollback restores the
+            // sequence from the undo below. A rolled-back `DROP TABLE` of a serial column would
+            // otherwise come back without the sequence its default draws from. Logged before
+            // memory changes, so a failed append leaves the sequence untouched.
+            self.log(
+                &LoggedOp::SeqDrop {
+                    txn: txn.0,
+                    id: id.0,
+                }
+                .to_record(),
+            )?;
+            seqs.sequences.remove(&id.0);
+            seqs.release_name(&state.def.name, id.0);
+            let entry = seqs
+                .pending_drops
+                .entry(state.def.name.clone())
+                .or_insert((txn.0, 0));
+            // A stale entry of a committed transaction is replaced by this one.
+            if entry.0 != txn.0 {
+                *entry = (txn.0, 0);
+            }
+            entry.1 += 1;
+            state
+        };
+        self.push_undo(txn.0, UndoOp::DroppedSequence { id: id.0, state })?;
         Ok(())
     }
 
@@ -9318,6 +9410,7 @@ impl BtreeEngine {
                     | UndoOp::IndexInserted { .. }
                     | UndoOp::IndexDeleted { .. }
                     | UndoOp::CreatedSequence { .. }
+                    | UndoOp::DroppedSequence { .. }
             )
         })
     }
@@ -9431,7 +9524,7 @@ impl BtreeEngine {
             eprintln!("nusadb-btree: WARN — could not log advisory AbortTxn for {txn:?}: {e}");
         }
         for id in created_sequences {
-            if let Err(e) = self.log_durable(&LoggedOp::SeqDrop { id }.to_record()) {
+            if let Err(e) = self.log_durable(&LoggedOp::SeqDrop { txn: 0, id }.to_record()) {
                 eprintln!(
                     "nusadb-btree: WARN — could not log SeqDrop compensation for sequence {id}: {e}"
                 );
@@ -9824,7 +9917,21 @@ impl BtreeEngine {
                 UndoOp::CreatedSequence { id, name } => {
                     let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
                     seqs.sequences.remove(&id);
-                    seqs.seq_by_name.remove(&name);
+                    seqs.release_name(&name, id);
+                },
+                UndoOp::DroppedSequence { id, state } => {
+                    let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
+                    let name = state.def.name.clone();
+                    if let Some((owner, depth)) = seqs.pending_drops.get_mut(&name)
+                        && *owner == txn
+                    {
+                        *depth -= 1;
+                        if *depth == 0 {
+                            seqs.pending_drops.remove(&name);
+                        }
+                    }
+                    seqs.claim_name(&name, id);
+                    seqs.sequences.insert(id, state);
                 },
                 UndoOp::AlteredSchema {
                     table,

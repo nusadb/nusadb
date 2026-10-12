@@ -235,7 +235,7 @@ pub(super) fn run_create_table(
                 max_value: i64::MAX,
                 cycle: false,
             };
-            engine.create_sequence(txn, &def)?;
+            create_sequence_named(engine, txn, &def)?;
             // Mirror it so `information_schema.sequences` lists serial-backing sequences too.
             super::seqcatalog::record(engine, txn, &def)?;
         }
@@ -1159,7 +1159,7 @@ fn copy_like_metadata(
                         cycle: false,
                     };
                     let _ = seq;
-                    engine.create_sequence(txn, &seq_def)?;
+                    create_sequence_named(engine, txn, &seq_def)?;
                     super::seqcatalog::record(engine, txn, &seq_def)?;
                     super::coldefault::set_default(
                         &new_key,
@@ -1229,20 +1229,9 @@ fn refuse_table_rename_with_dependents(
             }
         }
     }
-    for (catalog, what, widths) in [
-        (
-            super::function::FUNCTION_CATALOG,
-            "function",
-            &[4usize, 3][..],
-        ),
-        (super::procedure::PROCEDURE_CATALOG, "procedure", &[4][..]),
-    ] {
-        for row in scan_text_catalog(engine, txn, catalog, widths)? {
-            if let (Some(name), Some(body)) = (row.first(), row.last())
-                && mentions(body)
-            {
-                return Err(refuse(what, name));
-            }
+    for (what, name, body) in routine_bodies(engine, txn)? {
+        if mentions(&body) {
+            return Err(refuse(what, &name));
         }
     }
     // A predicate or body that spells the table's name breaks whether the policy or trigger is on
@@ -1289,100 +1278,28 @@ fn refuse_table_rename_with_dependents(
     Ok(())
 }
 
-/// Refuse to rename a column that something else records by name.
+/// Refuse to rename a column that an object outside the table's own catalog reads by name.
 ///
-/// A column name is written down in more places than the table's own schema: a constraint keeps its
-/// key columns and its `CHECK` body, a foreign key keeps the columns on both sides, an index keeps
-/// its key and predicate, and a default is filed under the column. Renaming moves only the schema
-/// entry, which leaves every one of those naming a column that no longer exists — the table stays
-/// readable and stops accepting writes, silently.
-///
-/// Until those references are carried across, the rename is refused and the error names what is in
-/// the way, so the operator can drop it, rename, and put it back. Refusing is worse than renaming
-/// but far better than the table quietly going read-only.
+/// The table's own indexes and constraints, foreign keys on either side, generated expressions,
+/// defaults, column grants and type tags are carried across to the new name by the rename itself.
+/// What remains is SQL text kept elsewhere and re-analyzed later: a view, materialized view,
+/// policy, trigger, function or procedure. Its text is not rewritten, so the rename is refused
+/// and the error names what is in the way.
 ///
 /// # Errors
-/// [`Error::Unsupported`] naming the first dependent found.
+/// [`Error::DependentObjects`] naming the first dependent found.
 fn refuse_rename_with_dependents(
     table: &TableSchema,
     column: &str,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let refuse = |what: &str, name: &str| -> Error {
-        // A generated check enforces the column's declared width and is not visible as a
-        // constraint, so telling the operator to drop and redeclare it would be telling them to
-        // drop the width enforcement they never wrote.
-        let remedy = if name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
-            "the column's declared type is enforced by a check the engine generated, so renaming \
-             is not yet supported for a column of this type"
-        } else {
-            "drop it, rename the column, then declare it again"
-        };
-        Error::DependentObjects(format!(
-            "cannot rename column \"{column}\" of \"{}\": {what} \"{name}\" refers to it by name \
-             and would stop resolving — {remedy}",
-            table.name
-        ))
-    };
-    for c in engine.list_constraints(table.id)? {
-        // The engine's own synthetic type-check (declared width / length enforcement) references the
-        // column by name, but the rename rewrites it for the new name rather than refusing — so it
-        // never blocks a rename. Every non-synthetic dependent below still does.
-        if c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
-            continue;
-        }
-        if c.columns.iter().any(|k| k == column) {
-            return Err(refuse("constraint", &c.name));
-        }
-        // A CHECK body is stored as SQL text; look for the column as a whole word so a longer name
-        // that merely contains it does not block the rename.
-        if let Some(bytes) = &c.expr
-            && let Ok(sql) = std::str::from_utf8(bytes)
-            && sql_mentions_column(sql, column)
-        {
-            return Err(refuse("check constraint", &c.name));
-        }
-    }
-    // The engine reports keys where this table is either side, so pin each column list to its own
-    // side before matching — the child columns of a key we merely parent belong to another table,
-    // and one of them sharing this column's name must not block the rename.
-    for fk in engine.list_foreign_keys(table.id)? {
-        let child_side = fk.child_table == table.id && fk.child_columns.iter().any(|k| k == column);
-        let parent_side =
-            fk.parent_table == table.id && fk.parent_columns.iter().any(|k| k == column);
-        if child_side || parent_side {
-            return Err(refuse("foreign key", &fk.name));
-        }
-    }
-    for def in engine.list_indexes(table.id)? {
-        let named = def.columns.iter().chain(&def.include).any(|k| k == column)
-            || def.key_exprs.iter().any(|e| sql_mentions_column(e, column))
-            || def
-                .predicate
-                .as_deref()
-                .is_some_and(|p| sql_mentions_column(p, column));
-        if named {
-            return Err(refuse("index", &def.name));
-        }
-    }
-    for (owner, sql) in super::coldefault::load_defaults(
-        &super::coldefault::catalog_key(&table.schema, &table.name),
-        engine,
-        txn,
-    )? {
-        // The column's own default is filed under the column name and moves with the rename (the
-        // caller re-files it); only a GENERATED expression elsewhere in the table that reads this
-        // column still blocks — that expression is re-evaluated on every write.
-        if owner != column
-            && let Some(expr) = super::coldefault::generated_expr(&sql)
-            && sql_mentions_column(expr, column)
-        {
-            return Err(refuse("generated column", &owner));
-        }
-    }
     if let Some((what, name)) = sql_dependent_naming(table, column, engine, txn)? {
-        return Err(refuse(what, &name));
+        return Err(Error::DependentObjects(format!(
+            "cannot rename column \"{column}\" of \"{}\": {what} \"{name}\" refers to it by name \
+             and would stop resolving; drop it, rename the column, then declare it again",
+            table.name
+        )));
     }
     Ok(())
 }
@@ -1478,21 +1395,11 @@ fn sql_dependent_naming(
     // A function or procedure body is re-analyzed when called, and may read the table through any
     // of the names that reach it. Both catalogs are `(name, …, body)` with the body last; the
     // function catalog has a legacy three-column layout from before parameter names were kept.
-    for (catalog, what, widths) in [
-        (
-            super::function::FUNCTION_CATALOG,
-            "function",
-            &[4usize, 3][..],
-        ),
-        (super::procedure::PROCEDURE_CATALOG, "procedure", &[4][..]),
-    ] {
-        for row in scan_text_catalog(engine, txn, catalog, widths)? {
-            if let (Some(name), Some(body)) = (row.first(), row.last())
-                && sql_mentions_column(body, column)
-                && reaches.iter().any(|n| sql_mentions_column(body, n))
-            {
-                return Ok(Some((what, name.clone())));
-            }
+    for (what, name, body) in routine_bodies(engine, txn)? {
+        if sql_mentions_column(&body, column)
+            && reaches.iter().any(|n| sql_mentions_column(&body, n))
+        {
+            return Ok(Some((what, name)));
         }
     }
     // (table, name, command, roles, using, check, permissive) — an orphaned policy fails closed,
@@ -1519,11 +1426,43 @@ fn sql_dependent_naming(
     Ok(None)
 }
 
+/// Every function and procedure body, as `(kind, name, body)`. The function catalog's rows are
+/// `(name, param_count, param_names, body, language, return_type)`, with older rows stopping after
+/// `body` or `language`, and the oldest being `(name, param_count, body)`; the procedure catalog's
+/// are `(name, in_param_count, out_params, param_names, body)`, older ones lacking `param_names`.
+pub(super) fn routine_bodies(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(&'static str, String, String)>, Error> {
+    let mut out = Vec::new();
+    for row in scan_text_catalog(
+        engine,
+        txn,
+        super::function::FUNCTION_CATALOG,
+        &[6, 5, 4, 3],
+    )? {
+        let body = if row.len() == 3 {
+            row.get(2)
+        } else {
+            row.get(3)
+        };
+        if let (Some(name), Some(body)) = (row.first(), body) {
+            out.push(("function", name.clone(), body.clone()));
+        }
+    }
+    for row in scan_text_catalog(engine, txn, super::procedure::PROCEDURE_CATALOG, &[5, 4])? {
+        if let (Some(name), Some(body)) = (row.first(), row.last()) {
+            out.push(("procedure", name.clone(), body.clone()));
+        }
+    }
+    Ok(out)
+}
+
 /// Scan an engine-scoped all-`TEXT` system catalog, yielding each row's columns as strings. A
 /// catalog that was never created yields nothing. `widths` lists the accepted column counts,
 /// current first, so a catalog with a legacy narrower layout still decodes; a row that decodes at
 /// no accepted width is reported rather than skipped — skipping would silently disarm a guard.
-fn scan_text_catalog(
+pub(super) fn scan_text_catalog(
     engine: &dyn StorageEngine,
     txn: TxnId,
     catalog: &str,
@@ -1794,19 +1733,12 @@ pub(super) fn run_drop_table(
                 engine.drop_constraint(txn, schema.id, &constraint.name)?;
             }
             engine.drop_table(txn, schema.id)?;
-            // Drop each SERIAL column's backing sequence, then the table's column DEFAULTs,
-            // so a later same-named table starts clean. The default catalog is keyed by the
-            // schema-qualified name so a non-public table's defaults are isolated.
+            // Drop the table's column DEFAULTs and the backing sequence of each SERIAL / identity
+            // column no other table's default still draws from, so a later same-named table
+            // starts clean. The default catalog is keyed by the schema-qualified name so a
+            // non-public table's defaults are isolated.
             let default_key = super::coldefault::catalog_key(&plan.schema, &plan.table);
-            for (_, sql) in super::coldefault::load_defaults(&default_key, engine, txn)? {
-                if let Some(seq) = super::coldefault::serial_sequence(&sql)
-                    && let Some(id) = engine.lookup_sequence(seq)?
-                {
-                    engine.drop_sequence(txn, id)?;
-                    super::seqcatalog::remove(engine, txn, seq)?;
-                }
-            }
-            super::coldefault::delete_defaults_for_table(&default_key, engine, txn)?;
+            super::coldefault::drop_defaults_and_sequences(&default_key, engine, txn)?;
             // Drop any `USING hnsw` vector index declared on the table, which
             // lives in the SQL-layer catalog rather than the engine's index namespace.
             super::delete_vector_indexes_for_table(engine, txn, &plan.table)?;
@@ -1901,6 +1833,16 @@ pub(super) fn run_drop_schema(
                     }
                 }
             }
+            // The member tables' column defaults and the sequences of their SERIAL and identity
+            // columns live outside the schema, so the engine's cascade does not reach them.
+            if plan.cascade {
+                for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
+                    if schema == plan.name {
+                        let key = super::coldefault::catalog_key(&schema, &name);
+                        super::coldefault::drop_defaults_and_sequences(&key, engine, txn)?;
+                    }
+                }
+            }
             engine.drop_schema(txn, id, plan.cascade)?;
             // The engine drops the tables; the SQL-layer catalogs live above it and kept their
             // rows, so recreating the schema inherited policies and triggers nobody declared.
@@ -1921,6 +1863,23 @@ pub(super) fn run_drop_schema(
 
 // === CREATE / DROP SEQUENCE =======================================
 
+/// Create the sequence `def`, reporting a name already taken as `42P07` (`duplicate_table`, the
+/// class a sequence shares with tables) rather than as the engine's internal error.
+fn create_sequence_named(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    def: &nusadb_core::engine::SequenceDef,
+) -> Result<(), Error> {
+    if engine.lookup_sequence(&def.name)?.is_some() {
+        return Err(Error::Coded {
+            message: format!("sequence \"{}\" already exists", def.name),
+            sqlstate: "42P07",
+        });
+    }
+    engine.create_sequence(txn, def)?;
+    Ok(())
+}
+
 pub(super) fn run_create_sequence(
     plan: &CreateSequencePlan,
     engine: &dyn StorageEngine,
@@ -1929,7 +1888,7 @@ pub(super) fn run_create_sequence(
     if plan.if_not_exists && engine.lookup_sequence(&plan.def.name)?.is_some() {
         return Ok(ExecutionResult::SequenceCreated);
     }
-    engine.create_sequence(txn, &plan.def)?;
+    create_sequence_named(engine, txn, &plan.def)?;
     // Mirror the definition so `information_schema.sequences` can enumerate it.
     super::seqcatalog::record(engine, txn, &plan.def)?;
     Ok(ExecutionResult::SequenceCreated)
@@ -2271,7 +2230,7 @@ pub(super) fn run_alter_table(
             return Ok(ExecutionResult::Altered);
         },
         // DROP CONSTRAINT [IF EXISTS]. A missing constraint is a no-op only with IF EXISTS;
-        // otherwise `drop_constraint` itself raises the engine's not-found error.
+        // otherwise it is `undefined_object`, the user's mistake rather than the engine's.
         AlterTablePlan::DropConstraint {
             table,
             name,
@@ -2281,8 +2240,15 @@ pub(super) fn run_alter_table(
                 .list_constraints(table)?
                 .iter()
                 .any(|c| c.name == name);
-            if !present && if_exists {
-                return Ok(ExecutionResult::Altered);
+            if !present {
+                if if_exists {
+                    return Ok(ExecutionResult::Altered);
+                }
+                let relation = dml::schema_by_id(engine, table)?
+                    .map_or_else(|| format!("#{}", table.0), |t| t.name);
+                return Err(Error::ObjectNotFound(format!(
+                    "constraint \"{name}\" of relation \"{relation}\" does not exist"
+                )));
             }
             refuse_dropping_inherited_constraint(table, &name, engine, txn)?;
             drop_partition_copies(table, &name, engine, txn)?;
@@ -2408,17 +2374,65 @@ pub(super) fn run_alter_table(
         },
         AlterTablePlan::Apply { table, op } => (table, op),
     };
+    run_column_change(&table, &op, engine, txn)?;
+    Ok(ExecutionResult::Altered)
+}
+
+/// Apply one column change to `table` and to the partitions and inheritance children below it.
+///
+/// A dropped column takes the generated columns computed from it along: each is dropped first,
+/// the way its own `DROP COLUMN` would drop it, and then the column itself.
+fn run_column_change(
+    table: &TableSchema,
+    op: &AlterColumnOp,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if let AlterColumnOp::DropColumn { index, cascade } = op {
+        let name = column_name(table, *index)?;
+        let generated = super::column_deps::generated_dependents(table, &name, engine, txn)?;
+        if !generated.is_empty() {
+            if generated.len() + 1 >= table.columns.len() {
+                return Err(Error::InvalidTableDefinition(format!(
+                    "dropping column \"{name}\" would also drop every generated column computed \
+                     from it and leave \"{}\" with no columns",
+                    table.name
+                )));
+            }
+            for column in generated.iter().chain(std::iter::once(&name)) {
+                let now = reread_table(table, engine, txn)?;
+                if let Some(index) = now.columns.iter().position(|c| &c.name == column) {
+                    let drop = AlterColumnOp::DropColumn {
+                        index,
+                        cascade: *cascade,
+                    };
+                    apply_column_change(&now, &drop, engine, txn)?;
+                }
+            }
+            return Ok(());
+        }
+    }
+    apply_column_change(table, op, engine, txn)
+}
+
+/// [`run_column_change`] for one column, with no generated columns to take along.
+fn apply_column_change(
+    table: &TableSchema,
+    op: &AlterColumnOp,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
     // A column change on a table with partitions or inheritance children applies to each of
     // them too: their rows are read through it, so their columns must stay its columns.
-    refuse_inherited_column_change(&table, &op, engine, txn)?;
-    let below = column_change_descendants(&table, &op, engine, txn)?;
-    let renamed = match &op {
+    refuse_inherited_column_change(table, op, engine, txn)?;
+    let below = column_change_descendants(table, op, engine, txn)?;
+    let renamed = match op {
         AlterColumnOp::RenameColumn { index, to } => {
-            Some((column_name(&table, *index)?, to.clone()))
+            Some((column_name(table, *index)?, to.clone()))
         },
         _ => None,
     };
-    apply_column_op(&table, &op, engine, txn)?;
+    apply_column_op(table, op, engine, txn)?;
     for (child, child_op) in &below {
         apply_column_op(child, child_op, engine, txn)?;
     }
@@ -2426,12 +2440,12 @@ pub(super) fn run_alter_table(
     if let Some((from, to)) = renamed
         && super::partition::has_any(engine, txn)?
     {
-        for tree_table in std::iter::once(&table).chain(below.iter().map(|(child, _)| child)) {
+        for tree_table in std::iter::once(table).chain(below.iter().map(|(child, _)| child)) {
             let key = crate::analyzer::qualified_display(&tree_table.schema, &tree_table.name);
             super::partition::rename_key_column(engine, txn, &key, &from, &to)?;
         }
     }
-    Ok(ExecutionResult::Altered)
+    Ok(())
 }
 
 /// Apply one column change to `table` alone.
@@ -2447,11 +2461,15 @@ fn apply_column_op(
             column,
             default_sql,
         } => {
-            super::coldefault::set_default(&table.name, column, default_sql, engine, txn)?;
+            let key = super::coldefault::catalog_key(&table.schema, &table.name);
+            super::coldefault::set_default(&key, column, default_sql, engine, txn)?;
             return Ok(());
         },
+        // Dropping the default of a SERIAL or identity column drops the sequence it drew from:
+        // nothing else records that the column owns it.
         AlterColumnOp::DropDefault { column } => {
-            super::coldefault::drop_default(&table.name, column, engine, txn)?;
+            let key = super::coldefault::catalog_key(&table.schema, &table.name);
+            super::coldefault::drop_default_and_sequence(&key, column, engine, txn)?;
             return Ok(());
         },
         _ => {},
@@ -2467,8 +2485,11 @@ fn apply_column_op(
                 nullable: column.nullable,
             })
         },
-        AlterColumnOp::DropColumn { index } => {
+        AlterColumnOp::DropColumn { index, cascade } => {
             let name = column_name(table, *index)?;
+            // What depends on the column: refused or dropped from outside the table, dropped
+            // from inside it.
+            super::column_deps::drop_column_dependents(table, *index, *cascade, engine, txn)?;
             // The column's type-range checks go with it; left behind, they would name a column the
             // next write cannot find.
             for (check, _) in synthetic_type_checks_on_column(table, &name, engine)? {
@@ -2476,59 +2497,33 @@ fn apply_column_op(
             }
             rewrite_drop_column(table, *index, &old_types, engine, txn)?;
             // Clear any persisted default for the dropped column, so a later re-add of the same
-            // name does not inherit the stale default (the catalog keys by column name).
-            super::coldefault::drop_default(&table.name, &name, engine, txn)?;
+            // name does not inherit the stale default (the catalog keys by column name), and the
+            // sequence of a SERIAL or identity column with it.
+            let key = super::coldefault::catalog_key(&table.schema, &table.name);
+            super::coldefault::drop_default_and_sequence(&key, &name, engine, txn)?;
             AlterOp::DropColumn { name }
         },
-        AlterColumnOp::SetType { index, ty } => {
+        AlterColumnOp::SetType { index, ty, checks } => {
+            let column = column_name(table, *index)?;
+            // The old type's width or length check goes; the new type's (if any) replaces it once
+            // the rows hold the new type.
+            for (check, _) in synthetic_type_checks_on_column(table, &column, engine)? {
+                engine.drop_constraint(txn, table.id, &check)?;
+            }
             rewrite_set_type(table, *index, *ty, &old_types, engine, txn)?;
-            AlterOp::AlterColumnType {
-                column: column_name(table, *index)?,
-                ty: *ty,
-            }
-        },
-        AlterColumnOp::RenameColumn { index, to } => {
-            let from = column_name(table, *index)?;
-            refuse_rename_with_dependents(table, &from, engine, txn)?;
-            // The engine's synthetic type-check(s) on this column name it in their predicate, so they
-            // must move with the rename. They cannot be regenerated from the column's runtime type
-            // (the declared width lives only in the predicate — every integer stores as i64), so the
-            // stored predicate is rewritten by re-quoting the new name. Drop before the rename, re-add
-            // after, all in this txn: drop clears the old dependency, the rename lands, the rewritten
-            // check re-enforces the same bound under the new name.
-            let synthetic = synthetic_type_checks_on_column(table, &from, engine)?;
-            for c in &synthetic {
-                engine.drop_constraint(txn, table.id, &c.0)?;
-            }
             engine.alter_table(
                 txn,
                 table.id,
-                &AlterOp::RenameColumn {
-                    from: from.clone(),
-                    to: to.clone(),
+                &AlterOp::AlterColumnType {
+                    column: column.clone(),
+                    ty: *ty,
                 },
             )?;
-            for (old_name, predicate) in &synthetic {
-                // Re-name by replacing only the column stem, so a per-check disambiguator suffix
-                // (`…_0`, `…_1` on a multi-CHECK DOMAIN column) is preserved and two checks on one
-                // renamed column cannot collide on the same new name.
-                let old_stem = format!("{}{from}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
-                let new_stem = format!("{}{to}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
-                let new_name = old_name.replacen(&old_stem, &new_stem, 1);
-                let new_predicate = predicate.replace(&format!("\"{from}\""), &format!("\"{to}\""));
-                engine.add_check_constraint(txn, table.id, &new_name, new_predicate.as_bytes())?;
-            }
-            // The column's own DEFAULT (or SERIAL / identity / generated sentinel) is filed under
-            // the column name — re-file it under the new name so an INSERT keeps filling it. A
-            // serial's backing sequence keeps its old name, exactly like the reference engine.
-            let key = super::coldefault::catalog_key(&table.schema, &table.name);
-            for (owner, sql) in super::coldefault::load_defaults(&key, engine, txn)? {
-                if owner == from {
-                    super::coldefault::drop_default(&key, &from, engine, txn)?;
-                    super::coldefault::set_default(&key, to, &sql, engine, txn)?;
-                }
-            }
+            add_type_checks(table, &column, checks, engine, txn)?;
             return Ok(());
+        },
+        AlterColumnOp::RenameColumn { index, to } => {
+            return rename_column(table, *index, to, engine, txn);
         },
         AlterColumnOp::SetNotNull { index } => {
             ensure_no_nulls(table, *index, engine, txn)?;
@@ -2547,6 +2542,116 @@ fn apply_column_op(
 
     engine.alter_table(txn, table.id, &core_op)?;
     Ok(())
+}
+
+/// `table` as the catalog has it now, after an earlier step of the same statement changed it.
+pub(super) fn reread_table(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<TableSchema, Error> {
+    engine
+        .lookup_table_as_of_in(txn, &table.schema, &table.name)?
+        .ok_or_else(|| Error::Internal(format!("table \"{}\" vanished mid-alter", table.name)))
+}
+
+/// Add the width or length checks `checks` (`(name, predicate SQL)`) of `column`'s new type to
+/// `table` after an `ALTER COLUMN ... TYPE`, once every row holds the new type. A row already
+/// holding a value the new type cannot hold refuses the change: `22003` for an integer out of the
+/// new range, `22001` for a string longer than the new length.
+fn add_type_checks(
+    table: &TableSchema,
+    column: &str,
+    checks: &[crate::planner::TypeCheck],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let current = reread_table(table, engine, txn)?;
+    let rows = scan_rows(&current, engine, txn)?;
+    for check in checks {
+        let predicate = crate::analyzer::analyze_check_predicate(
+            &check.predicate_sql,
+            &current,
+            &dml::EmptyCatalog,
+        )?;
+        for row in &rows {
+            if matches!(eval::eval(&predicate, row)?, ast::Value::Bool(false)) {
+                let sqlstate = check.sqlstate;
+                let what = if sqlstate == "22001" {
+                    "is too long"
+                } else {
+                    "is out of range"
+                };
+                return Err(Error::Coded {
+                    message: format!(
+                        "a value in column \"{column}\" of \"{}\" {what} for its new type",
+                        table.name
+                    ),
+                    sqlstate,
+                });
+            }
+        }
+        engine.add_check_constraint(txn, table.id, &check.name, check.predicate_sql.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// `RENAME COLUMN`: the column at `index` of `table` takes the name `to`, and everything the table
+/// files under the old name follows it.
+fn rename_column(
+    table: &TableSchema,
+    index: usize,
+    to: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let from = column_name(table, index)?;
+    refuse_rename_with_dependents(table, &from, engine, txn)?;
+    // The table's own indexes and constraints naming the column come off it here and go
+    // back on under the new name below.
+    let detached = super::column_deps::detach_for_rename(table, &from, engine, txn)?;
+    // The engine's synthetic type-check(s) on this column name it in their predicate, so they
+    // must move with the rename. They cannot be regenerated from the column's runtime type
+    // (the declared width lives only in the predicate; every integer stores as i64), so the
+    // stored predicate is rewritten by re-quoting the new name. Drop before the rename, re-add
+    // after, all in this txn: drop clears the old dependency, the rename lands, the rewritten
+    // check re-enforces the same bound under the new name.
+    let synthetic = synthetic_type_checks_on_column(table, &from, engine)?;
+    for c in &synthetic {
+        engine.drop_constraint(txn, table.id, &c.0)?;
+    }
+    engine.alter_table(
+        txn,
+        table.id,
+        &AlterOp::RenameColumn {
+            from: from.clone(),
+            to: to.to_owned(),
+        },
+    )?;
+    for (old_name, predicate) in &synthetic {
+        // Re-name by replacing only the column stem, so a per-check disambiguator suffix
+        // (`…_0`, `…_1` on a multi-CHECK DOMAIN column) is preserved and two checks on one
+        // renamed column cannot collide on the same new name.
+        let old_stem = format!("{}{from}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+        let new_stem = format!("{}{to}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+        let new_name = old_name.replacen(&old_stem, &new_stem, 1);
+        let new_predicate = predicate.replace(&format!("\"{from}\""), &format!("\"{to}\""));
+        engine.add_check_constraint(txn, table.id, &new_name, new_predicate.as_bytes())?;
+    }
+    // The column's own DEFAULT (or SERIAL / identity / generated sentinel) is filed under
+    // the column name; re-file it under the new name so an INSERT keeps filling it. A
+    // serial's backing sequence keeps its old name.
+    let key = super::coldefault::catalog_key(&table.schema, &table.name);
+    for (owner, sql) in super::coldefault::load_defaults(&key, engine, txn)? {
+        if owner == from {
+            super::coldefault::drop_default(&key, &from, engine, txn)?;
+            super::coldefault::set_default(&key, to, &sql, engine, txn)?;
+        }
+    }
+    super::column_deps::reattach_after_rename(detached, table, &from, to, engine, txn)
 }
 
 /// Add the type-range check `name` (`predicate_sql`) of a column just added to `table` to every
@@ -2599,7 +2704,7 @@ fn copy_type_check_below(
 fn changed_column(table: &TableSchema, op: &AlterColumnOp) -> Result<Option<String>, Error> {
     Ok(match op {
         AlterColumnOp::AddColumn(_) => None,
-        AlterColumnOp::DropColumn { index }
+        AlterColumnOp::DropColumn { index, .. }
         | AlterColumnOp::RenameColumn { index, .. }
         | AlterColumnOp::SetType { index, .. }
         | AlterColumnOp::SetNotNull { index }
@@ -2744,13 +2849,18 @@ fn column_change_descendants(
                 }
             },
             (_, None) => continue,
-            (AlterColumnOp::DropColumn { .. }, Some(index)) => AlterColumnOp::DropColumn { index },
+            (AlterColumnOp::DropColumn { cascade, .. }, Some(index)) => AlterColumnOp::DropColumn {
+                index,
+                cascade: *cascade,
+            },
             (AlterColumnOp::RenameColumn { to, .. }, Some(index)) => AlterColumnOp::RenameColumn {
                 index,
                 to: to.clone(),
             },
-            (AlterColumnOp::SetType { ty, .. }, Some(index)) => {
-                AlterColumnOp::SetType { index, ty: *ty }
+            (AlterColumnOp::SetType { ty, checks, .. }, Some(index)) => AlterColumnOp::SetType {
+                index,
+                ty: *ty,
+                checks: checks.clone(),
             },
             (AlterColumnOp::SetNotNull { .. }, Some(index)) => AlterColumnOp::SetNotNull { index },
             (AlterColumnOp::DropNotNull { .. }, Some(index)) => {
@@ -2996,13 +3106,14 @@ pub(super) fn format_alter(plan: &AlterTablePlan) -> String {
     };
     let detail = match op {
         AlterColumnOp::AddColumn(c) => format!("ADD COLUMN {}", c.name),
-        AlterColumnOp::DropColumn { index } => {
-            format!("DROP COLUMN {}", column_label(table, *index))
+        AlterColumnOp::DropColumn { index, cascade } => {
+            let behavior = if *cascade { " CASCADE" } else { "" };
+            format!("DROP COLUMN {}{behavior}", column_label(table, *index))
         },
         AlterColumnOp::RenameColumn { index, to } => {
             format!("RENAME COLUMN {} TO {to}", column_label(table, *index))
         },
-        AlterColumnOp::SetType { index, ty } => {
+        AlterColumnOp::SetType { index, ty, .. } => {
             format!("ALTER COLUMN {} TYPE {ty:?}", column_label(table, *index))
         },
         AlterColumnOp::SetNotNull { index } => {

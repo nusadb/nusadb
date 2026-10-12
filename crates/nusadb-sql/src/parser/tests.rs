@@ -850,11 +850,30 @@ fn alter_table_drop_column_plain_and_if_exists() {
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t DROP COLUMN c") else {
         panic!("expected AlterTable");
     };
-    let ast::AlterTableAction::DropColumn { name, if_exists } = a.action else {
+    let ast::AlterTableAction::DropColumn {
+        name,
+        if_exists,
+        cascade,
+    } = a.action
+    else {
         panic!("expected DropColumn");
     };
     assert_eq!(name, "c");
     assert!(!if_exists);
+    assert!(!cascade);
+
+    for (sql, expected) in [
+        ("ALTER TABLE t DROP COLUMN c CASCADE", true),
+        ("ALTER TABLE t DROP COLUMN c RESTRICT", false),
+    ] {
+        let ast::Statement::AlterTable(a) = ok(sql) else {
+            panic!("expected AlterTable");
+        };
+        let ast::AlterTableAction::DropColumn { cascade, .. } = a.action else {
+            panic!("expected DropColumn");
+        };
+        assert_eq!(cascade, expected, "{sql}");
+    }
 
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t DROP COLUMN IF EXISTS c") else {
         panic!("expected AlterTable");
@@ -1008,7 +1027,41 @@ fn alter_table_alter_column_type_and_default() {
         panic!("expected AlterColumn");
     };
     assert_eq!(column, "c");
-    assert_eq!(change, ast::ColumnChange::SetType(ColumnType::BigInt));
+    assert_eq!(
+        change,
+        ast::ColumnChange::SetType {
+            ty: ColumnType::BigInt,
+            checks: Vec::new(),
+        }
+    );
+
+    // A narrower type carries the range check a column declared with it gets.
+    let ast::Statement::AlterTable(a) = ok("ALTER TABLE t ALTER COLUMN c TYPE SMALLINT") else {
+        panic!("expected AlterTable");
+    };
+    let ast::AlterTableAction::AlterColumn {
+        change: ast::ColumnChange::SetType { checks, .. },
+        ..
+    } = a.action
+    else {
+        panic!("expected SetType");
+    };
+    let [
+        (
+            ast::TableConstraint::Check {
+                name,
+                predicate_sql,
+                ..
+            },
+            sqlstate,
+        ),
+    ] = checks.as_slice()
+    else {
+        panic!("expected one check, got {checks:?}");
+    };
+    assert_eq!(*sqlstate, "22003");
+    assert_eq!(name.as_deref(), Some("nusadb_typeck_c"));
+    assert_eq!(predicate_sql, "\"c\" BETWEEN -32768 AND 32767");
 
     // `SET DEFAULT <expr>`.
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t ALTER COLUMN c SET DEFAULT 0") else {

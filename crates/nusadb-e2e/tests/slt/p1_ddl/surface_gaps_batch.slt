@@ -48,9 +48,21 @@ SELECT num FROM ser WHERE v = 'b'
 statement ok
 DROP TABLE ser
 
-# A key column's rename is still refused loudly (the constraint records it by name).
-statement error refers to it by name
+# A key column renames too: the primary key moves to the new name and keeps enforcing, and the
+# SERIAL default keeps drawing from the same sequence.
+statement ok
 ALTER TABLE syn RENAME COLUMN id TO ident
+
+statement ok
+INSERT INTO syn (age) VALUES (2)
+
+query I
+SELECT ident FROM syn WHERE age = 2
+----
+2
+
+statement error duplicate key
+INSERT INTO syn (ident, age) VALUES (2, 3)
 
 statement ok
 CREATE TABLE t_idx (id INT, n TEXT, j JSONB)

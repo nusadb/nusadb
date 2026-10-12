@@ -1459,6 +1459,43 @@ pub fn delete_grants_on(
     Ok(())
 }
 
+/// Move the column grants on `object`'s column `from` to `to`, or remove them when `to` is `None`.
+///
+/// A renamed column passes its new name, a dropped one `None`. Left in place, a later column taking
+/// the old name would inherit them, and a renamed column would lose them.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn move_column_grants(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    object: &str,
+    from: &str,
+    to: Option<&str>,
+) -> Result<(), Error> {
+    let moving: Vec<ColumnGrantRecord> = all_column_grants(engine, txn)?
+        .into_iter()
+        .filter(|g| g.object == object && g.column == from)
+        .collect();
+    for record in &moving {
+        delete_column_grant(
+            engine,
+            txn,
+            &record.grantee,
+            object,
+            Some(from),
+            Some(record.privilege),
+        )?;
+    }
+    if let Some(to) = to {
+        for mut record in moving {
+            to.clone_into(&mut record.column);
+            insert_column_grant(engine, txn, &record)?;
+        }
+    }
+    Ok(())
+}
+
 /// Move an object's grants to a new name, so `ALTER ... RENAME` does not quietly drop permissions.
 ///
 /// # Errors

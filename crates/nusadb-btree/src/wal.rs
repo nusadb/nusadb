@@ -265,9 +265,14 @@ pub enum LoggedOp {
         /// The sequence definition.
         def: SequenceDef,
     },
-    /// Sequence `id` was dropped (or a rolled-back create was neutralized). Non-transactional,
-    /// replayed unconditionally.
+    /// Sequence `id` was dropped, or a rolled-back create was neutralized. A `DROP` carries its
+    /// transaction and replays only once that transaction committed, so a rolled-back `DROP`
+    /// leaves the sequence in place after recovery too. The neutralizing record of a rolled-back
+    /// create (and every record written before drops were transactional) carries the reserved
+    /// transaction 0 and replays unconditionally.
     SeqDrop {
+        /// Owning transaction of a `DROP`, or 0 for an unconditional record.
+        txn: u64,
         /// The dropped sequence id.
         id: u64,
     },
@@ -392,11 +397,11 @@ impl LoggedOp {
             | Self::ClearStats { txn, .. }
             | Self::AlterSchema { txn, .. }
             | Self::SchemaCreate { txn, .. }
-            | Self::SchemaDrop { txn, .. } => *txn,
+            | Self::SchemaDrop { txn, .. }
+            | Self::SeqDrop { txn, .. } => *txn,
             // Non-transactional records own no transaction: the reserved id 0 (never begun,
             // never committed) — replay applies them unconditionally instead.
             Self::SeqCreate { .. }
-            | Self::SeqDrop { .. }
             | Self::SeqSet { .. }
             | Self::SeqAlter { .. }
             | Self::TableRoot { .. }
@@ -413,7 +418,7 @@ impl LoggedOp {
         matches!(
             self,
             Self::SeqCreate { .. }
-                | Self::SeqDrop { .. }
+                | Self::SeqDrop { txn: 0, .. }
                 | Self::SeqSet { .. }
                 | Self::SeqAlter { .. }
                 | Self::TableRoot { .. }
@@ -584,8 +589,8 @@ impl LoggedOp {
                 push_key(&mut key, TAG_SEQ_CREATE, 0, *id, None);
                 encode_sequence_def(&mut value, def);
             },
-            Self::SeqDrop { id } => {
-                push_key(&mut key, TAG_SEQ_DROP, 0, *id, None);
+            Self::SeqDrop { txn, id } => {
+                push_key(&mut key, TAG_SEQ_DROP, *txn, *id, None);
             },
             Self::TableRoot {
                 table,
@@ -821,7 +826,7 @@ impl LoggedOp {
                 id: table,
                 def: decode_sequence_def(value)?,
             },
-            TAG_SEQ_DROP => Self::SeqDrop { id: table },
+            TAG_SEQ_DROP => Self::SeqDrop { txn, id: table },
             TAG_TABLE_ROOT => Self::TableRoot {
                 table,
                 root: read_u64(value, 0)?,
@@ -1519,6 +1524,20 @@ mod index_def_codec_tests {
 #[cfg(test)]
 mod image_record_tests {
     use super::{LoggedOp, roundtrip_check};
+
+    /// A sequence drop made by a transaction keeps that transaction through the log, so replay
+    /// gates it on the commit; the neutralizing record of a rolled-back create (and a record
+    /// written before drops carried one) has none and replays unconditionally.
+    #[test]
+    fn sequence_drop_carries_its_transaction() {
+        let dropped = LoggedOp::SeqDrop { txn: 42, id: 7 };
+        assert!(roundtrip_check(&dropped));
+        assert_eq!(dropped.txn(), 42);
+        assert!(!dropped.is_non_transactional());
+        let neutralized = LoggedOp::SeqDrop { txn: 0, id: 7 };
+        assert!(roundtrip_check(&neutralized));
+        assert!(neutralized.is_non_transactional());
+    }
 
     /// The image-only table root record round-trips through the log record shape, and names
     /// no transaction.

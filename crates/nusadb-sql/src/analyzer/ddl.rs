@@ -855,7 +855,11 @@ pub(super) fn analyze_alter_table(
                 return analyze_add_column_with_constraints(table, column, constraints, catalog);
             }
         },
-        ast::AlterTableAction::DropColumn { name, if_exists } => {
+        ast::AlterTableAction::DropColumn {
+            name,
+            if_exists,
+            cascade,
+        } => {
             let Some(index) = table.columns.iter().position(|c| c.name == name) else {
                 if if_exists {
                     return Ok(AlterTablePlan::Noop);
@@ -870,7 +874,7 @@ pub(super) fn analyze_alter_table(
                     "ALTER TABLE DROP COLUMN would leave the table with no columns".to_owned(),
                 ));
             }
-            AlterColumnOp::DropColumn { index }
+            AlterColumnOp::DropColumn { index, cascade }
         },
         ast::AlterTableAction::RenameColumn { from, to } => {
             let (index, _) = find_column(&table.columns, &from, &display)?;
@@ -882,7 +886,25 @@ pub(super) fn analyze_alter_table(
         ast::AlterTableAction::AlterColumn { column, change } => {
             let (index, _) = find_column(&table.columns, &column, &display)?;
             match change {
-                ast::ColumnChange::SetType(ty) => AlterColumnOp::SetType { index, ty },
+                ast::ColumnChange::SetType { ty, checks } => AlterColumnOp::SetType {
+                    index,
+                    ty,
+                    checks: checks
+                        .into_iter()
+                        .filter_map(|(c, sqlstate)| match c {
+                            ast::TableConstraint::Check {
+                                name: Some(name),
+                                predicate_sql,
+                                ..
+                            } => Some(crate::planner::TypeCheck {
+                                name,
+                                predicate_sql,
+                                sqlstate,
+                            }),
+                            _ => None,
+                        })
+                        .collect(),
+                },
                 ast::ColumnChange::SetNotNull => AlterColumnOp::SetNotNull { index },
                 ast::ColumnChange::DropNotNull => AlterColumnOp::DropNotNull { index },
                 // `SET DEFAULT <expr>`: type-check the default against an empty scope (it

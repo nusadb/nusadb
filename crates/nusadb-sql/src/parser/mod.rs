@@ -3325,6 +3325,167 @@ pub fn substitute_check_value(predicate_sql: &str, column: &str) -> Result<Strin
     Ok(out)
 }
 
+/// The positions in `tokens` that name the column `column` in an expression stored as SQL text: a
+/// bare or quoted identifier (alone, or as the last part of a qualified name) that is not a
+/// function name, a cast's target type, a qualifier of something else, or a field read out of a
+/// composite value. A bare word matches the column's folded name, a quoted one matches it exactly.
+/// String literals are separate tokens, so text inside them never counts.
+fn column_ref_positions(tokens: &[Token], column: &str) -> Vec<usize> {
+    let significant = |at: usize| !matches!(tokens.get(at), Some(Token::Whitespace(_)));
+    let next = |at: usize| (at + 1..tokens.len()).find(|&i| significant(i));
+    let prev = |at: usize| (0..at).rev().find(|&i| significant(i));
+    let mut out = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = token else {
+            continue;
+        };
+        let named = if word.quote_style.is_some() {
+            word.value == column
+        } else {
+            word.value.to_lowercase() == column
+        };
+        if !named {
+            continue;
+        }
+        let after = next(at).and_then(|i| tokens.get(i));
+        if matches!(after, Some(Token::LParen | Token::Period)) {
+            continue;
+        }
+        let before = prev(at);
+        match before.and_then(|i| tokens.get(i)) {
+            Some(Token::DoubleColon) => continue,
+            Some(Token::Period)
+                if matches!(
+                    before.and_then(prev).and_then(|i| tokens.get(i)),
+                    Some(Token::RParen)
+                ) =>
+            {
+                continue;
+            },
+            _ => {},
+        }
+        out.push(at);
+    }
+    out
+}
+
+/// Whether the expression text `sql` refers to the column `column` (see [`column_ref_positions`]).
+/// Text that does not tokenize counts as a reference when it contains the name at all, erring
+/// toward a dependency rather than away from one.
+pub(crate) fn sql_references_column(sql: &str, column: &str) -> bool {
+    Tokenizer::new(&NusaParserDialect, sql)
+        .tokenize()
+        .map_or_else(
+            |_| sql.to_lowercase().contains(&column.to_lowercase()),
+            |tokens| !column_ref_positions(&tokens, column).is_empty(),
+        )
+}
+
+/// Whether the query text `sql` reads every column of the tables it names without naming them: a
+/// `*` or `t.*` in a select list, or a `NATURAL` join, whose columns depend on what each table has
+/// right now. A `count(*)` does not count. Text that does not tokenize counts, erring toward a
+/// dependency.
+pub(crate) fn sql_reads_all_columns(sql: &str) -> bool {
+    use sqlparser::keywords::Keyword;
+    let Ok(tokens) = Tokenizer::new(&NusaParserDialect, sql).tokenize() else {
+        return true;
+    };
+    let significant: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    significant
+        .iter()
+        .enumerate()
+        .any(|(at, token)| match token {
+            Token::Word(w) => w.quote_style.is_none() && w.keyword == Keyword::NATURAL,
+            Token::Mul => match at.checked_sub(1).and_then(|i| significant.get(i)) {
+                Some(Token::Comma | Token::Period) => true,
+                Some(Token::Word(w)) => {
+                    w.quote_style.is_none()
+                        && matches!(
+                            w.keyword,
+                            Keyword::SELECT | Keyword::DISTINCT | Keyword::ALL
+                        )
+                },
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+/// Rewrite each reference to the column `from` in the expression text `sql` to the quoted name
+/// `to`, leaving every other character as it was, so the result re-parses to the same expression
+/// over the renamed column.
+///
+/// # Errors
+/// [`Error::Syntax`] when the text does not tokenize.
+pub(crate) fn rename_column_in_sql(sql: &str, from: &str, to: &str) -> Result<String, Error> {
+    let tokens = Tokenizer::new(&NusaParserDialect, sql)
+        .tokenize()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    let positions = column_ref_positions(&tokens, from);
+    if positions.is_empty() {
+        return Ok(sql.to_owned());
+    }
+    let quoted = format!("\"{}\"", to.replace('"', "\"\""));
+    let mut out = String::with_capacity(sql.len() + to.len());
+    for (at, token) in tokens.iter().enumerate() {
+        if positions.contains(&at) {
+            out.push_str(&quoted);
+        } else {
+            out.push_str(&token.to_string());
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod column_reference_tests {
+    use super::{rename_column_in_sql, sql_references_column};
+
+    #[test]
+    fn a_reference_is_an_identifier_not_a_literal_or_a_function() {
+        assert!(sql_references_column("b > 0", "b"));
+        assert!(sql_references_column("B > 0", "b"));
+        assert!(sql_references_column("\"b\" > 0", "b"));
+        assert!(sql_references_column("t.b > 0", "b"));
+        assert!(!sql_references_column("\"B\" > 0", "b"));
+        assert!(!sql_references_column("a <> 'b'", "b"));
+        assert!(!sql_references_column("bb > 0", "b"));
+        assert!(!sql_references_column("length(a) > 0", "length"));
+        assert!(!sql_references_column("a::text <> ''", "text"));
+        assert!(!sql_references_column("(a).b > 0", "b"));
+        assert!(!sql_references_column("b.a > 0", "b"));
+    }
+
+    #[test]
+    fn a_star_or_a_natural_join_reads_every_column() {
+        use super::sql_reads_all_columns as all;
+        assert!(all("SELECT * FROM t"));
+        assert!(all("SELECT DISTINCT * FROM t"));
+        assert!(all("SELECT a, * FROM t"));
+        assert!(all("SELECT t.* FROM t"));
+        assert!(all("SELECT id FROM t NATURAL JOIN w"));
+        assert!(!all("SELECT count(*) FROM t"));
+        assert!(!all("SELECT a * b FROM t"));
+        assert!(!all("SELECT 2 * a FROM t"));
+    }
+
+    #[test]
+    fn a_rename_rewrites_only_the_references() {
+        assert_eq!(
+            rename_column_in_sql("b > 0 AND a <> 'b'", "b", "c").unwrap(),
+            "\"c\" > 0 AND a <> 'b'"
+        );
+        assert_eq!(
+            rename_column_in_sql("lower(B) = t.b", "b", "New").unwrap(),
+            "lower(\"New\") = t.\"New\""
+        );
+        assert_eq!(rename_column_in_sql("bb > 0", "b", "c").unwrap(), "bb > 0");
+    }
+}
+
 #[cfg(test)]
 mod domain_rewrite_tests {
     use super::substitute_check_value;

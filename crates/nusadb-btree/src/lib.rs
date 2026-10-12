@@ -1738,6 +1738,141 @@ mod tests {
         );
     }
 
+    /// Dropping a sequence is transactional: a rollback (whole or to a savepoint) puts it back
+    /// with its counter, a commit removes it, and recovery agrees with the live engine in every
+    /// case, including a crash before the dropping transaction ended.
+    #[test]
+    fn sequence_drop_rolls_back_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.wal");
+        {
+            let engine = BtreeEngine::open(&path).unwrap();
+            let setup = engine.begin(RC).unwrap();
+            for name in ["kept", "partly", "gone", "crashed"] {
+                engine.create_sequence(setup, &seq_def(name)).unwrap();
+            }
+            engine.commit(setup).unwrap();
+            for name in ["kept", "partly", "gone", "crashed"] {
+                let id = engine.lookup_sequence(name).unwrap().unwrap();
+                assert_eq!(engine.sequence_next(id).unwrap(), 1);
+                assert_eq!(engine.sequence_next(id).unwrap(), 2);
+            }
+
+            // A whole-transaction rollback restores the sequence and its counter.
+            let id = engine.lookup_sequence("kept").unwrap().unwrap();
+            let txn = engine.begin(RC).unwrap();
+            engine.drop_sequence(txn, id).unwrap();
+            assert_eq!(engine.lookup_sequence("kept").unwrap(), None);
+            engine.rollback(txn).unwrap();
+            assert_eq!(engine.lookup_sequence("kept").unwrap(), Some(id));
+            assert_eq!(engine.sequence_next(id).unwrap(), 3);
+
+            // A rollback to a savepoint restores it inside a transaction that then commits.
+            let id = engine.lookup_sequence("partly").unwrap().unwrap();
+            let txn = engine.begin(RC).unwrap();
+            engine.savepoint(txn, "s").unwrap();
+            engine.drop_sequence(txn, id).unwrap();
+            engine.rollback_to(txn, "s").unwrap();
+            // A write after the savepoint, so the commit is logged and recovery replays the
+            // transaction (drop record included) rather than skipping a write-free commit.
+            engine.create_table(txn, &table_def("partly_t")).unwrap();
+            engine.commit(txn).unwrap();
+            assert_eq!(engine.lookup_sequence("partly").unwrap(), Some(id));
+
+            // A committed drop removes it.
+            let id = engine.lookup_sequence("gone").unwrap().unwrap();
+            let txn = engine.begin(RC).unwrap();
+            engine.drop_sequence(txn, id).unwrap();
+            engine.commit(txn).unwrap();
+            assert_eq!(engine.lookup_sequence("gone").unwrap(), None);
+
+            // A drop whose transaction never ends before the crash.
+            let id = engine.lookup_sequence("crashed").unwrap().unwrap();
+            let txn = engine.begin(RC).unwrap();
+            engine.drop_sequence(txn, id).unwrap();
+        }
+        let engine = BtreeEngine::open(&path).unwrap();
+        let kept = engine.lookup_sequence("kept").unwrap().unwrap();
+        assert_eq!(engine.sequence_next(kept).unwrap(), 4);
+        let partly = engine.lookup_sequence("partly").unwrap().unwrap();
+        assert_eq!(engine.sequence_next(partly).unwrap(), 3);
+        assert_eq!(engine.lookup_sequence("gone").unwrap(), None);
+        let crashed = engine.lookup_sequence("crashed").unwrap().unwrap();
+        assert_eq!(engine.sequence_next(crashed).unwrap(), 3);
+    }
+
+    /// While one transaction's drop of a sequence may still roll back, another transaction
+    /// cannot take the name (no-wait 40001): the rollback puts the old sequence back under it.
+    /// After a rollback or a commit of the drop, the live engine and a recovered one agree, with
+    /// and without a crash before the dropping transaction ended.
+    #[test]
+    fn a_name_whose_drop_is_pending_is_not_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.wal");
+        {
+            let engine = BtreeEngine::open(&path).unwrap();
+            let setup = engine.begin(RC).unwrap();
+            for name in ["rs", "cs", "xs"] {
+                engine.create_sequence(setup, &seq_def(name)).unwrap();
+            }
+            engine.commit(setup).unwrap();
+            let rs = engine.lookup_sequence("rs").unwrap().unwrap();
+            assert_eq!(engine.sequence_next(rs).unwrap(), 1);
+            assert_eq!(engine.sequence_next(rs).unwrap(), 2);
+
+            // A drops, B tries to take the name and is refused, A rolls back.
+            let a = engine.begin(RC).unwrap();
+            engine.drop_sequence(a, rs).unwrap();
+            let b = engine.begin(RC).unwrap();
+            assert!(matches!(
+                engine.create_sequence(b, &seq_def("rs")),
+                Err(nusadb_core::Error::SerializationConflict { .. })
+            ));
+            engine.rollback(b).unwrap();
+            engine.rollback(a).unwrap();
+            assert_eq!(engine.lookup_sequence("rs").unwrap(), Some(rs));
+            assert_eq!(engine.sequence_next(rs).unwrap(), 3);
+            assert_eq!(engine.sequence_next(rs).unwrap(), 4);
+
+            // A drops and commits; then the name is free for B.
+            let cs = engine.lookup_sequence("cs").unwrap().unwrap();
+            let a = engine.begin(RC).unwrap();
+            engine.drop_sequence(a, cs).unwrap();
+            let b = engine.begin(RC).unwrap();
+            assert!(engine.create_sequence(b, &seq_def("cs")).is_err());
+            engine.rollback(b).unwrap();
+            engine.commit(a).unwrap();
+            let b = engine.begin(RC).unwrap();
+            let fresh = engine.create_sequence(b, &seq_def("cs")).unwrap();
+            engine.commit(b).unwrap();
+            assert_ne!(fresh, cs);
+            assert_eq!(engine.sequence_next(fresh).unwrap(), 1);
+
+            // The dropping transaction itself may take the name back; its rollback restores the
+            // original.
+            let xs = engine.lookup_sequence("xs").unwrap().unwrap();
+            assert_eq!(engine.sequence_next(xs).unwrap(), 1);
+            let a = engine.begin(RC).unwrap();
+            engine.drop_sequence(a, xs).unwrap();
+            engine.create_sequence(a, &seq_def("xs")).unwrap();
+            engine.rollback(a).unwrap();
+            assert_eq!(engine.lookup_sequence("xs").unwrap(), Some(xs));
+
+            // A drop still pending at the crash.
+            let a = engine.begin(RC).unwrap();
+            engine.drop_sequence(a, rs).unwrap();
+            let b = engine.begin(RC).unwrap();
+            assert!(engine.create_sequence(b, &seq_def("rs")).is_err());
+        }
+        let engine = BtreeEngine::open(&path).unwrap();
+        let rs = engine.lookup_sequence("rs").unwrap().unwrap();
+        assert_eq!(engine.sequence_next(rs).unwrap(), 5);
+        let cs = engine.lookup_sequence("cs").unwrap().unwrap();
+        assert_eq!(engine.sequence_next(cs).unwrap(), 2);
+        let xs = engine.lookup_sequence("xs").unwrap().unwrap();
+        assert_eq!(engine.sequence_next(xs).unwrap(), 2);
+    }
+
     /// Two transactions requesting the same uniqueness-key
     /// lock — the second aborts immediately (no-wait 40001, never blocks); a different key does
     /// not conflict, and the key frees when the holder ends.
@@ -4083,7 +4218,7 @@ mod tests {
                     cycle: true,
                 },
             },
-            wal::LoggedOp::SeqDrop { id: 3 },
+            wal::LoggedOp::SeqDrop { txn: 0, id: 3 },
             wal::LoggedOp::SeqSet {
                 id: 3,
                 value: i64::MIN,

@@ -583,6 +583,11 @@ fn slt_p1_rename_column_guard() {
 }
 
 #[test]
+fn slt_p1_drop_column_dependents() {
+    run_slt("tests/slt/p1_ddl/drop_column_dependents.slt");
+}
+
+#[test]
 fn slt_p1_fk_cross_schema() {
     run_slt("tests/slt/p1_ddl/fk_cross_schema.slt");
 }

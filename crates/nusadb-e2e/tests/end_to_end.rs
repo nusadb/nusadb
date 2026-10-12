@@ -5944,15 +5944,17 @@ fn alter_table_rename_column_carries_the_synthetic_width_check() {
         "VARCHAR length must still be enforced under the renamed column",
     );
 
-    // A USER-defined dependent is still a hard refusal (only the engine's own synthetic check moves).
+    // A user-defined CHECK moves with the column too, and keeps enforcing under the new name.
     run(
         &engine,
         "CREATE TABLE u (id INT NOT NULL, CONSTRAINT ck CHECK (id > 0))",
     );
+    run(&engine, "ALTER TABLE u RENAME COLUMN id TO id2");
     assert!(
-        run_try(&engine, "ALTER TABLE u RENAME COLUMN id TO id2").is_err(),
-        "a user CHECK referencing the column must still block the rename",
+        run_try(&engine, "INSERT INTO u VALUES (-1)").is_err(),
+        "a user CHECK must keep enforcing under the renamed column",
     );
+    run(&engine, "INSERT INTO u VALUES (1)");
 }
 
 #[test]

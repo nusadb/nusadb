@@ -908,12 +908,15 @@ pub enum AlterTableAction {
         /// They are added with the column, in the same statement.
         constraints: Vec<TableConstraint>,
     },
-    /// `DROP [COLUMN] [IF EXISTS] name` (implicit `RESTRICT`).
+    /// `DROP [COLUMN] [IF EXISTS] name [RESTRICT | CASCADE]`.
     DropColumn {
         /// Name of the column to drop.
         name: String,
         /// Whether `IF EXISTS` was specified.
         if_exists: bool,
+        /// `CASCADE`: also drop the objects outside the table that depend on the column (another
+        /// table's foreign key, a view). `false` is the default `RESTRICT`, which refuses instead.
+        cascade: bool,
     },
     /// `RENAME COLUMN from TO to`.
     RenameColumn {
@@ -987,7 +990,15 @@ pub enum AlterTableAction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnChange {
     /// `[SET DATA] TYPE <type>`.
-    SetType(ColumnType),
+    SetType {
+        /// The new physical type.
+        ty: ColumnType,
+        /// The width or length check the new type implies (a narrow integer's range, a
+        /// `VARCHAR(n)` length), named and written as for a column declared with that type, each
+        /// with the SQLSTATE a value outside it is reported with (`22003` for a range, `22001`
+        /// for a length).
+        checks: Vec<(TableConstraint, &'static str)>,
+    },
     /// `SET DEFAULT <expr>` — carries the default expression and its canonical SQL text,
     /// like a column's `default_sql`, so the executor can persist + re-parse it.
     SetDefault {

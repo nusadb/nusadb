@@ -299,6 +299,79 @@ pub(super) fn rename_defaults_for_table(
     Ok(())
 }
 
+/// Drop the sequence `seq` that backed a `SERIAL` or identity column whose default was just
+/// removed, unless another column's default still draws from it: a table made with `LIKE ...
+/// INCLUDING DEFAULTS` shares its source's sequence, and a plain `DEFAULT nextval('seq')` names it. Without this the sequence outlives its
+/// column, and a later table taking the same name fails to create its own. A sequence that is
+/// already gone is a no-op. Transactional: a rollback brings the sequence back.
+pub(super) fn drop_owned_sequence(
+    seq: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if let Some(cat) = engine.lookup_table_as_of(txn, DEFAULT_CATALOG)? {
+        let mut scan = engine.scan(txn, cat.id)?;
+        while let Some((_, bytes)) = scan.try_next()? {
+            let row = row::decode(&bytes, &DEFAULT_CATALOG_SCHEMA)?;
+            if let Some(ast::Value::Text(sql)) = row.get(2)
+                && (serial_sequence(sql) == Some(seq) || names_sequence(sql, seq))
+            {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(id) = engine.lookup_sequence(seq)? {
+        engine.drop_sequence(txn, id)?;
+        super::seqcatalog::remove(engine, txn, seq)?;
+    }
+    Ok(())
+}
+
+/// Whether the default expression `sql` names the sequence `seq` as a string literal, bare or
+/// schema-qualified, the way `nextval('seq')` and `currval('app.seq')` do. Errs toward a match: a
+/// sequence kept alive by a false match costs nothing, a dropped one breaks every insert.
+fn names_sequence(sql: &str, seq: &str) -> bool {
+    let (sql, seq) = (sql.to_lowercase(), seq.to_lowercase());
+    sql.contains(&format!("'{seq}'")) || sql.contains(&format!(".{seq}'"))
+}
+
+/// Remove `column`'s default from the table filed under `table` (a [`catalog_key`]) and drop the
+/// sequence it drew from when it was a `SERIAL` or identity column (see [`drop_owned_sequence`]).
+pub(super) fn drop_default_and_sequence(
+    table: &str,
+    column: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let owned = load_defaults(table, engine, txn)?
+        .into_iter()
+        .find(|(c, _)| c == column)
+        .and_then(|(_, sql)| serial_sequence(&sql).map(str::to_owned));
+    drop_default(table, column, engine, txn)?;
+    if let Some(seq) = owned {
+        drop_owned_sequence(&seq, engine, txn)?;
+    }
+    Ok(())
+}
+
+/// Remove every default of the table filed under `table` (a [`catalog_key`]) and drop the
+/// sequences its `SERIAL` and identity columns drew from (see [`drop_owned_sequence`]).
+pub(super) fn drop_defaults_and_sequences(
+    table: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let owned: Vec<String> = load_defaults(table, engine, txn)?
+        .into_iter()
+        .filter_map(|(_, sql)| serial_sequence(&sql).map(str::to_owned))
+        .collect();
+    delete_defaults_for_table(table, engine, txn)?;
+    for seq in owned {
+        drop_owned_sequence(&seq, engine, txn)?;
+    }
+    Ok(())
+}
+
 /// Load `table`'s defaults as `(column, default SQL)` pairs. The fast path (no catalog, or no default
 /// for `table`) costs a single catalog lookup.
 pub(super) fn load_defaults(

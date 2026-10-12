@@ -1205,6 +1205,18 @@ pub struct ForeignKeySpec {
     pub on_update: nusadb_core::FkAction,
 }
 
+/// A width or length check a column's new type implies, added by `ALTER COLUMN ... TYPE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeCheck {
+    /// The check's (synthetic) constraint name.
+    pub name: String,
+    /// The predicate, as SQL over the column.
+    pub predicate_sql: String,
+    /// The code an existing row outside the bound is reported with: `22003` for an integer range,
+    /// `22001` for a string length.
+    pub sqlstate: &'static str,
+}
+
 /// `DROP TABLE` — validated for table existence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTablePlan {
@@ -1371,10 +1383,14 @@ pub enum AlterColumnOp {
     /// (`NULL`, or rejected at execution if the column is `NOT NULL` and the
     /// table is non-empty, since there is no default to backfill).
     AddColumn(ast::ColumnDef),
-    /// `DROP COLUMN` at ordinal `index`.
+    /// `DROP COLUMN` at ordinal `index`. The indexes and constraints of the table that involve
+    /// the column go with it.
     DropColumn {
         /// Ordinal of the column to remove.
         index: usize,
+        /// `CASCADE`: also drop what depends on the column from outside the table (another
+        /// table's foreign key, a view, a policy, a trigger); without it those refuse the drop.
+        cascade: bool,
     },
     /// `RENAME COLUMN` — catalog-only (no row rewrite).
     RenameColumn {
@@ -1390,6 +1406,8 @@ pub enum AlterColumnOp {
         index: usize,
         /// New physical type.
         ty: ColumnType,
+        /// The new type's width or length checks; they replace the ones the old type implied.
+        checks: Vec<TypeCheck>,
     },
     /// `ALTER COLUMN … SET NOT NULL` — validated (no existing `NULL`s) then a
     /// catalog-only flag change.

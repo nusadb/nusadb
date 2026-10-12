@@ -624,7 +624,8 @@ ALTER TABLE orders ALTER COLUMN note DROP NOT NULL;
 ALTER TABLE orders ALTER COLUMN note TYPE VARCHAR(200);
 ALTER TABLE orders RENAME COLUMN note TO memo;
 ALTER TABLE orders DROP COLUMN memo;
-ALTER TABLE orders DROP COLUMN channel;
+ALTER TABLE orders DROP COLUMN channel RESTRICT;   -- RESTRICT is the default
+ALTER TABLE orders DROP COLUMN region CASCADE;
 ALTER TABLE orders RENAME TO sales_orders;
 ALTER TABLE sales_orders RENAME TO orders;
 
@@ -632,6 +633,7 @@ ALTER TABLE orders DROP CONSTRAINT total_positive;
 ALTER TABLE orders ADD CONSTRAINT total_positive CHECK (total > 0);
 ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer) REFERENCES customers (id);
 ALTER TABLE orders DROP CONSTRAINT orders_customer_fk;
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_customer_fk;
 
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders DISABLE ROW LEVEL SECURITY;
@@ -658,11 +660,48 @@ that names it.
 
 `ALTER TABLE t DISABLE TRIGGER name` and `ENABLE TRIGGER name` are shown under [Triggers](#triggers).
 
-`RENAME COLUMN` carries the column's own `DEFAULT` (including a `SERIAL` sentinel — the backing
-sequence keeps its name) across the rename. It succeeds when nothing else records the column by
-name; if a user-defined check, foreign key, index, view, trigger or policy refers to it, the
-rename is refused and the error names what is in the way. Drop that object, rename, and recreate
-it.
+`DROP COLUMN` also drops what the table itself defines over the column, whether the column is
+its only one or one of several: indexes (including expression and partial indexes that read it),
+`PRIMARY KEY`, `UNIQUE` and `CHECK` constraints, foreign keys whose own columns include it, a
+`USING hnsw` vector index on it, its column-level grants, and generated columns computed from it.
+A `SERIAL` or identity column's sequence goes with it. Without `CASCADE` (or with `RESTRICT`),
+the drop is refused with `2BP01` while something outside the table still needs the column: a
+foreign key on another table (or a self-referencing one) that references it, or a view,
+materialized view, row-level-security policy or trigger (on this table or any other) whose SQL
+reads it. A view that reads the table through `*`, `t.*` or a `NATURAL` join counts as reading
+every column of it. With `CASCADE` those are dropped too; the referencing table itself and its rows
+stay. A function or procedure whose body reads the column refuses the drop even with `CASCADE`:
+replace or drop it first. Dropping the last column of a table, counting the generated columns that
+would go with it, is refused (`42P16`). A `USING hnsw` index on a later column of a table whose name
+also exists in another schema refuses the drop (`0A000`); drop that index first.
+
+`ALTER COLUMN ... DROP DEFAULT` on a `SERIAL` or identity column also drops the sequence it drew
+from, unless another column's default still uses it (a table made with `LIKE ... INCLUDING
+DEFAULTS` shares its source's sequence, and a `DEFAULT nextval('...')` names it).
+
+Dropping a sequence (directly or with its column or table) is transactional. Until the dropping
+transaction ends, another transaction creating a sequence of the same name is refused with
+`40001`, since a rollback would bring the dropped one back; retry once the dropper is done.
+
+`ALTER COLUMN ... TYPE` replaces the range or length the old type enforced with the new type's:
+widening `SMALLINT` to `INTEGER` or `BIGINT`, or `VARCHAR(10)` to `VARCHAR(50)` or `TEXT`, lifts
+the old bound. Narrowing checks the rows already there, and a value the new type cannot hold
+refuses the change (`22003` for an integer out of range, `22001` for a string that is too long).
+
+`RENAME COLUMN` carries everything the table records under the column's name to the new name: its
+`DEFAULT` (including a `SERIAL` or identity sentinel; the backing sequence keeps its name), its
+type-range check, its indexes (plain, multi-column, expression and partial), `PRIMARY KEY`,
+`UNIQUE` and `CHECK` constraints, foreign keys on either side, generated expressions that read
+it, column-level grants, and its enum or composite type. A view, materialized view, policy,
+trigger, function or procedure keeps its SQL as text, which the rename does not rewrite: while one
+of them names the column, the rename is refused (`2BP01`) and the error names it. Drop that
+object, rename, and recreate it.
+
+Every column change is transactional: a `ROLLBACK` (or a `ROLLBACK TO SAVEPOINT`) restores the
+column, its data and everything the change dropped or moved, sequences included.
+
+`DROP CONSTRAINT` of a constraint the table does not have is an error (`42704`); with `IF EXISTS`
+it does nothing.
 
 `RENAME TO` keeps the table's schema and takes everything filed under the table's name with it:
 ownership and grants (table- and column-level), row-level security and its policies, triggers,
@@ -674,8 +713,7 @@ is built on it, or while it is a partition, a partitioned parent, or part of an 
 those find the table by name and would stop resolving. Drop that object, rename, and recreate it.
 
 Not accepted: `ADD COLUMN ... FIRST | AFTER`, `ADD COLUMN ... PRIMARY KEY` (add the column, then
-`ADD CONSTRAINT ... PRIMARY KEY`), `DROP COLUMN ... CASCADE`, dropping several columns in one
-statement, `ADD CONSTRAINT ... NOT VALID`, `ALTER COLUMN ... TYPE ... USING <expr>`,
+`ADD CONSTRAINT ... PRIMARY KEY`), dropping several columns in one statement, `ADD CONSTRAINT ... NOT VALID`, `ALTER COLUMN ... TYPE ... USING <expr>`,
 `ALTER COLUMN ... ADD GENERATED AS IDENTITY`, and a comma-separated list of actions.
 
 ### Indexes
@@ -1972,7 +2010,7 @@ on the message text.
 | `42601` | syntax error | |
 | `42701` / `42703` | duplicate / undefined column | |
 | `42702` | ambiguous column | qualify it with the table name |
-| `42704` | undefined object | unknown parameter, sequence, index, trigger |
+| `42704` | undefined object | unknown parameter, sequence, index, trigger, constraint |
 | `42710` / `42723` | object / function already exists | |
 | `42804` | datatype mismatch | cast explicitly |
 | `42846` | cannot coerce | cast explicitly |

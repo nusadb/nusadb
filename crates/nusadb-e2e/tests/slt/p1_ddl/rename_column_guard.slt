@@ -1,11 +1,11 @@
-# p1_ddl/rename_column_guard — renaming a column that something else records by name is refused,
-# and the error says what is in the way.
+# p1_ddl/rename_column_guard: renaming a column carries what the table records under its name,
+# and refuses while SQL text kept elsewhere names it.
 #
 # A column name is written down in more places than the table's own schema: a constraint keeps its
-# key columns and its CHECK body, a foreign key keeps both sides, an index keeps its key, and a
-# default is filed under the column. Renaming moved only the schema entry, so a USER-defined one of
-# those would be left naming a column that no longer existed. Those are still refused. The engine's
-# OWN synthetic width check, however, is rewritten for the new name and carried across.
+# key columns and its CHECK body, a foreign key keeps both sides, an index keeps its key, a
+# generated column its expression, and a default is filed under the column. All of those move to
+# the new name with the rename. A view, policy or trigger keeps SQL text that is re-analyzed later
+# and is not rewritten, so it still refuses the rename and the error says what is in the way.
 
 # --- An INTEGER column carries a generated width check; RENAME now carries it to the new name. ---
 
@@ -51,13 +51,19 @@ SELECT c FROM plain WHERE a = 'x'
 ----
 y
 
-# --- Every kind of dependant blocks it. ---
+# --- The table's own dependants move with it. ---
 
 statement ok
 CREATE TABLE u (a INT, b TEXT UNIQUE)
 
-statement error
+statement ok
+INSERT INTO u VALUES (1, 'x')
+
+statement ok
 ALTER TABLE u RENAME COLUMN b TO c
+
+statement error duplicate key
+INSERT INTO u VALUES (2, 'x')
 
 statement ok
 CREATE TABLE ix (a TEXT, b TEXT)
@@ -65,8 +71,16 @@ CREATE TABLE ix (a TEXT, b TEXT)
 statement ok
 CREATE INDEX ix_b ON ix(b)
 
-statement error
+statement ok
+INSERT INTO ix VALUES ('k', 'v')
+
+statement ok
 ALTER TABLE ix RENAME COLUMN b TO c
+
+query T
+SELECT a FROM ix WHERE c = 'v'
+----
+k
 
 # A column's OWN default moves with the rename (it is filed under the column name); only a
 # reference from another object still blocks.
@@ -90,12 +104,24 @@ CREATE TABLE par (id INT PRIMARY KEY)
 statement ok
 CREATE TABLE chi (id INT PRIMARY KEY, pid INT REFERENCES par(id))
 
-# Blocked from the parent side and from the child side alike.
-statement error
+statement ok
+INSERT INTO par VALUES (1)
+
+statement ok
+INSERT INTO chi VALUES (1, 1)
+
+# Carried on the parent side and on the child side alike, and the key still holds.
+statement ok
 ALTER TABLE par RENAME COLUMN id TO k
 
-statement error
+statement ok
 ALTER TABLE chi RENAME COLUMN pid TO p
+
+statement error foreign key
+INSERT INTO chi VALUES (2, 9)
+
+statement error foreign key
+DELETE FROM par WHERE k = 1
 
 # --- A longer name that merely contains the column is not what blocks it. ---
 # `bb` starts with `b`, so a scan that resumed one character in would match on its tail.
@@ -125,17 +151,17 @@ CREATE TABLE uc (a BIGINT, b BIGINT, CHECK (B > 0))
 statement ok
 INSERT INTO uc VALUES (1, 5)
 
-statement error
+statement ok
 ALTER TABLE uc RENAME COLUMN b TO c
 
-# Refused, so the table is still writable — and the check still bites.
+# Renamed, so the table is still writable, and the check still bites under the new name.
 statement ok
 INSERT INTO uc VALUES (2, 7)
 
-statement error
+statement error check constraint
 INSERT INTO uc VALUES (3, -9)
 
-# --- A generated column reads other columns, and its expression is evaluated on every write. ---
+# --- A generated column reads other columns; its expression moves to the new name. ---
 
 statement ok
 CREATE TABLE g (a BIGINT, b BIGINT, s BIGINT GENERATED ALWAYS AS (a + b) STORED)
@@ -143,14 +169,14 @@ CREATE TABLE g (a BIGINT, b BIGINT, s BIGINT GENERATED ALWAYS AS (a + b) STORED)
 statement ok
 INSERT INTO g (a, b) VALUES (1, 2)
 
-statement error
+statement ok
 ALTER TABLE g RENAME COLUMN a TO x
 
 statement ok
-INSERT INTO g (a, b) VALUES (3, 4)
+INSERT INTO g (x, b) VALUES (3, 4)
 
 query I
-SELECT s FROM g WHERE a = 3
+SELECT s FROM g WHERE x = 3
 ----
 7
 

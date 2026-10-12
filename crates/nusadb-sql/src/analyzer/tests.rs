@@ -286,7 +286,13 @@ fn alter_drop_column_resolves_ordinal() {
     let AlterTablePlan::Apply { op, .. } = alter("ALTER TABLE users DROP COLUMN age") else {
         panic!("expected Apply");
     };
-    assert_eq!(op, AlterColumnOp::DropColumn { index: 2 });
+    assert_eq!(
+        op,
+        AlterColumnOp::DropColumn {
+            index: 2,
+            cascade: false
+        }
+    );
 }
 
 #[test]
@@ -340,6 +346,7 @@ fn alter_column_set_type_resolves() {
         AlterColumnOp::SetType {
             index: 2,
             ty: ColumnType::Text,
+            checks: Vec::new(),
         },
     );
 }

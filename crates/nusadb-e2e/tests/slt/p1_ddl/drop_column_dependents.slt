@@ -1,0 +1,233 @@
+# p1_ddl/drop_column_dependents: DROP COLUMN takes the table's own indexes and constraints that
+# involve the column, alone or with other columns; RESTRICT (the default) refuses while another
+# table's foreign key or a view still needs the column, and CASCADE drops those too. RENAME COLUMN
+# carries the same objects to the new name. Partitions and inheritance children follow their parent.
+
+statement ok
+CREATE TABLE p (k INT PRIMARY KEY, u INT UNIQUE)
+
+statement ok
+INSERT INTO p VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TABLE c1 (id INT PRIMARY KEY, c INT REFERENCES p(k), d INT, CHECK (c > 0), CHECK (c < d), UNIQUE (c, d))
+
+statement ok
+CREATE INDEX c1_c ON c1 (c)
+
+statement ok
+CREATE INDEX c1_part ON c1 (d) WHERE c > 0
+
+statement ok
+INSERT INTO c1 VALUES (1, 1, 5), (2, 2, 6)
+
+statement ok
+ALTER TABLE c1 DROP COLUMN c
+
+# The insert that used to fail with "constraint references unknown column".
+statement ok
+INSERT INTO c1 VALUES (3, 7)
+
+statement ok
+UPDATE c1 SET d = 8 WHERE id = 3
+
+query II rowsort
+SELECT id, d FROM c1
+----
+1 5
+2 6
+3 8
+
+statement error duplicate key
+INSERT INTO c1 VALUES (3, 9)
+
+# --- RESTRICT and CASCADE. ---
+
+statement ok
+CREATE TABLE c2 (id INT PRIMARY KEY, pk INT REFERENCES p(k))
+
+statement ok
+INSERT INTO c2 VALUES (1, 1)
+
+statement ok
+CREATE VIEW pv AS SELECT u FROM p
+
+statement error foreign key "c2_fkey\d*" depends on it
+ALTER TABLE p DROP COLUMN k
+
+statement error foreign key
+ALTER TABLE p DROP COLUMN k RESTRICT
+
+statement error view "pv" depends on it
+ALTER TABLE p DROP COLUMN u
+
+statement ok
+ALTER TABLE p DROP COLUMN u CASCADE
+
+statement error
+SELECT * FROM pv
+
+statement ok
+ALTER TABLE p ADD COLUMN note TEXT
+
+statement ok
+ALTER TABLE p DROP COLUMN k CASCADE
+
+# The referencing key went, its column and rows stayed.
+statement ok
+INSERT INTO c2 VALUES (2, 99)
+
+query I
+SELECT count(*) FROM c2
+----
+2
+
+# --- A rolled-back drop puts everything back. ---
+
+statement ok
+CREATE TABLE rp (k INT PRIMARY KEY, n TEXT)
+
+statement ok
+INSERT INTO rp VALUES (1, 'one')
+
+statement ok
+CREATE TABLE rc (id INT PRIMARY KEY, k INT REFERENCES rp(k), CHECK (k > 0))
+
+statement ok
+INSERT INTO rc VALUES (1, 1)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE rp DROP COLUMN k CASCADE
+
+statement ok
+ALTER TABLE rc DROP COLUMN k
+
+statement ok
+ROLLBACK
+
+statement error foreign key
+INSERT INTO rc VALUES (2, 5)
+
+statement error foreign key
+DELETE FROM rp WHERE k = 1
+
+statement ok
+INSERT INTO rp VALUES (2, 'two')
+
+statement ok
+INSERT INTO rc VALUES (2, 2)
+
+# --- Partitions and inheritance children follow the parent. ---
+
+statement ok
+CREATE TABLE pt (k INT PRIMARY KEY, v INT, w TEXT) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE pt2 PARTITION OF pt FOR VALUES FROM (100) TO (200)
+
+statement ok
+CREATE INDEX pt_v ON pt (v)
+
+statement ok
+ALTER TABLE pt ADD CONSTRAINT pt_vck CHECK (v > 0)
+
+statement ok
+INSERT INTO pt VALUES (1, 1, 'a'), (150, 2, 'b')
+
+statement ok
+ALTER TABLE pt DROP COLUMN v
+
+statement ok
+INSERT INTO pt VALUES (2, 'c'), (151, 'd')
+
+statement ok
+ALTER TABLE pt RENAME COLUMN k TO kk
+
+statement ok
+INSERT INTO pt VALUES (3, 'e')
+
+statement error duplicate key
+INSERT INTO pt VALUES (3, 'f')
+
+query IT rowsort
+SELECT kk, w FROM pt
+----
+1 a
+150 b
+151 d
+2 c
+3 e
+
+statement ok
+CREATE TABLE ih (a INT PRIMARY KEY, b INT UNIQUE)
+
+statement ok
+CREATE TABLE ic (c INT) INHERITS (ih)
+
+statement ok
+INSERT INTO ic VALUES (1, 2, 3)
+
+statement ok
+ALTER TABLE ih RENAME COLUMN b TO b2
+
+statement ok
+INSERT INTO ic VALUES (2, 3, 4)
+
+statement ok
+ALTER TABLE ih DROP COLUMN b2
+
+statement ok
+INSERT INTO ic VALUES (3, 4)
+
+query I
+SELECT count(*) FROM ih
+----
+3
+
+# --- A self-referencing key: the referenced column is needed by the key, so CASCADE drops it. ---
+
+statement ok
+CREATE TABLE sr (id INT PRIMARY KEY, parent INT REFERENCES sr(id))
+
+statement ok
+INSERT INTO sr VALUES (1, NULL), (2, 1)
+
+statement ok
+ALTER TABLE sr RENAME COLUMN id TO ident
+
+statement error foreign key
+INSERT INTO sr VALUES (3, 9)
+
+statement error foreign key
+ALTER TABLE sr DROP COLUMN ident
+
+statement ok
+ALTER TABLE sr DROP COLUMN ident CASCADE
+
+statement ok
+INSERT INTO sr VALUES (9)
+
+# --- A vector index on a later column follows it to its new position. ---
+
+statement ok
+CREATE TABLE vx (id INT PRIMARY KEY, emb VECTOR(3), z INT)
+
+statement ok
+CREATE INDEX vx_h ON vx USING hnsw (emb vector_l2_ops)
+
+statement ok
+ALTER TABLE vx DROP COLUMN id
+
+statement ok
+INSERT INTO vx VALUES ('[1,2,3]', 1), ('[9,9,9]', 2)
+
+query I
+SELECT z FROM vx ORDER BY emb <-> '[1,2,3]' LIMIT 1
+----
+1

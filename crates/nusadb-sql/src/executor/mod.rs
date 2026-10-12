@@ -123,6 +123,7 @@ mod stats;
 mod advisory;
 pub mod agg;
 pub(crate) mod coldefault;
+mod column_deps;
 mod dcl;
 mod ddl;
 mod dml;
@@ -6106,6 +6107,82 @@ pub(super) fn rename_column_type_tags(
             engine.delete(txn, cat.id, tid)?;
             store_view_def(engine, txn, catalog, &key, &value)?;
         }
+    }
+    Ok(())
+}
+
+/// Move the enum and composite type tags of column `from` of `(schema, table)` to `to` (`Some`)
+/// when the column is renamed, or remove them (`None`) when it is dropped, so the column keeps
+/// resolving its labels and fields and a later column taking the old name is not mis-tagged.
+pub(super) fn move_column_type_tags(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    table: &str,
+    from: &str,
+    to: Option<&str>,
+) -> Result<(), Error> {
+    let old_key = composite_column_key(schema, table, from);
+    for catalog in [ENUM_COLUMN_CATALOG, COMPOSITE_COLUMN_CATALOG] {
+        let Some(type_name) = load_view_def(engine, txn, catalog, &old_key)? else {
+            continue;
+        };
+        delete_view_def(engine, txn, catalog, &old_key)?;
+        if let Some(to) = to {
+            let new_key = composite_column_key(schema, table, to);
+            store_view_def(engine, txn, catalog, &new_key, &type_name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Keep the `USING hnsw` vector indexes of `table` pointing at the right column after the column
+/// at `dropped` (an ordinal) goes: an index on that column is dropped, and one on a later column
+/// follows it down one position, since the catalog records the column by ordinal.
+///
+/// The catalog records the table by its bare name. When tables of that name exist in more than one
+/// schema, an index recorded under it cannot be told apart, so the drop is refused rather than
+/// moving another schema's index.
+pub(super) fn shift_vector_indexes_for_drop(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: &str,
+    dropped: usize,
+) -> Result<(), Error> {
+    let affected: Vec<VectorIndexListing> = list_vector_indexes(engine, txn)?
+        .into_iter()
+        .filter(|index| index.table == table && index.column_ordinal >= dropped)
+        .collect();
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let namesakes = engine
+        .list_tables_qualified_as_of(txn)?
+        .into_iter()
+        .filter(|(_, name)| name == table)
+        .count();
+    if namesakes > 1
+        && let Some(index) = affected.first()
+    {
+        return Err(Error::Unsupported(format!(
+            "vector index \"{}\" is recorded under the table name \"{table}\", which more than \
+             one schema has, so it cannot follow this column change; drop the vector index first",
+            index.name
+        )));
+    }
+    for index in affected {
+        if index.column_ordinal == dropped {
+            delete_vector_index(engine, txn, &index.name)?;
+            continue;
+        }
+        let def = format!(
+            "{}\t{}\t{}\t{}",
+            index.table,
+            index.column_ordinal - 1,
+            index.dim,
+            index.metric.operator_class()
+        );
+        store_view_def(engine, txn, VECTOR_INDEX_CATALOG, &index.name, &def)?;
     }
     Ok(())
 }
