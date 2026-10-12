@@ -10086,8 +10086,13 @@ fn timestamptz_assigns_into_a_timestamp_column_end_to_end() {
         "got {both:?}"
     );
 
-    // The two types still do not compare without a cast — this widens assignment, not equality.
-    assert!(run_try(&engine, "SELECT made = seen FROM t").is_err());
+    // The two types also compare: the TIMESTAMP side is promoted to TIMESTAMPTZ in the session
+    // time zone, so row 3's wall-clock `seen` equals the same wall clock read as a timestamp.
+    let same = rows(run(
+        &engine,
+        "SELECT seen = TIMESTAMP '2026-08-04 10:11:12' FROM t WHERE id = 3",
+    ));
+    assert_eq!(same, vec![vec![Value::Bool(true)]]);
 }
 
 #[test]

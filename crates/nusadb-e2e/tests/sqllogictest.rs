@@ -1098,6 +1098,36 @@ fn slt_p10_timetz() {
 }
 
 #[test]
+fn slt_p10_int_bitwise_widths() {
+    run_slt("tests/slt/p10_types/int_bitwise_widths.slt");
+}
+
+#[test]
+fn slt_p10_interval_scale_aggregate() {
+    run_slt("tests/slt/p10_types/interval_scale_aggregate.slt");
+}
+
+#[test]
+fn slt_p10_untyped_null_operand() {
+    run_slt("tests/slt/p10_types/untyped_null_operand.slt");
+}
+
+#[test]
+fn slt_p10_temporal_unification() {
+    run_slt("tests/slt/p10_types/temporal_unification.slt");
+}
+
+#[test]
+fn slt_p10_temporal_input_forms() {
+    run_slt("tests/slt/p10_types/temporal_input_forms.slt");
+}
+
+#[test]
+fn slt_p10_json_scalar_cast() {
+    run_slt("tests/slt/p10_types/json_scalar_cast.slt");
+}
+
+#[test]
 fn slt_p7_subquery() {
     run_slt("tests/slt/p7_subquery/subquery.slt");
 }

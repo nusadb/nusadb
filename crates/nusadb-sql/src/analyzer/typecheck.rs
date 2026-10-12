@@ -125,6 +125,51 @@ pub(super) const fn wider_int(a: ColumnType, b: ColumnType) -> ColumnType {
     }
 }
 
+/// The common type two different date/time types promote to when they meet in a comparison or in
+/// a result-unifying construct (`CASE`, `COALESCE`, `NULLIF`, `GREATEST`/`LEAST`, `IN`, `BETWEEN`,
+/// set operations), or `None` when they have none.
+///
+/// The rule follows the implicit cast direction of the standard: `DATE` widens to `TIMESTAMP`
+/// (midnight), and `DATE` or `TIMESTAMP` widens to `TIMESTAMPTZ` (the wall clock read in the
+/// session time zone). The conversion is the ordinary cast, so it uses the same session zone as
+/// an explicit `::timestamptz`.
+pub(super) const fn temporal_common(a: ColumnType, b: ColumnType) -> Option<ColumnType> {
+    use ColumnType::{Date, Timestamp, TimestampTz};
+    match (a, b) {
+        (Date, Timestamp) | (Timestamp, Date) => Some(Timestamp),
+        (Date | Timestamp, TimestampTz) | (TimestampTz, Date | Timestamp) => Some(TimestampTz),
+        _ => None,
+    }
+}
+
+/// Promote `expr` to the date/time type `target` when [`temporal_common`] says it widens to it,
+/// by wrapping it in the implicit cast (a bare `NULL` is simply re-typed). Any other expression is
+/// returned unchanged, so this is safe to apply to every member of a unified construct.
+pub(super) fn promote_temporal(expr: TypedExpr, target: ColumnType) -> TypedExpr {
+    if expr.ty == target || temporal_common(expr.ty, target) != Some(target) {
+        return expr;
+    }
+    if is_null_literal(&expr) {
+        return TypedExpr { ty: target, ..expr };
+    }
+    TypedExpr {
+        kind: TypedExprKind::Cast(Box::new(expr), false),
+        ty: target,
+    }
+}
+
+/// Promote both operands of a comparison-shaped pair to their common date/time type, when they are
+/// two different date/time types that have one. Otherwise both are returned unchanged.
+pub(super) fn promote_temporal_pair(left: TypedExpr, right: TypedExpr) -> (TypedExpr, TypedExpr) {
+    match temporal_common(left.ty, right.ty) {
+        Some(common) => (
+            promote_temporal(left, common),
+            promote_temporal(right, common),
+        ),
+        None => (left, right),
+    }
+}
+
 /// Types whose value is parsed from a `TEXT` *literal* by the "unknown literal" coercion rule — the
 /// temporal types, `UUID`, `MACADDR`, the network types, the bit strings, the ranges, and the
 /// geometric types: everything with a canonical text form but no literal syntax of its own. A text

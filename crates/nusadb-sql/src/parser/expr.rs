@@ -100,7 +100,7 @@ pub(super) fn convert_typed_literal(
 ) -> Result<ast::Expr, Error> {
     let ty = convert_data_type(data_type)?;
     let parsed = match ty {
-        ColumnType::Date => crate::temporal::parse_date(&value).map(ast::Value::Date),
+        ColumnType::Date => crate::temporal::parse_date_input(&value).map(ast::Value::Date),
         ColumnType::Time => crate::temporal::parse_time(&value).map(ast::Value::Time),
         ColumnType::Timestamp => {
             crate::temporal::parse_timestamp(&value).map(ast::Value::Timestamp)

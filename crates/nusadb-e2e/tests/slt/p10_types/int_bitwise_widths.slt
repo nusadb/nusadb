@@ -1,0 +1,127 @@
+# Bitwise operators `&`, `|`, `#`, `<<`, `>>` and `~` over every integer width. `&`, `|` and `#`
+# over mixed widths promote to the wider type; a shift keeps the width of the shifted value and
+# drops the bits that leave it; the shift count wraps modulo that width.
+
+statement ok
+CREATE TABLE bw (id INT PRIMARY KEY, b BIGINT, i INT, s SMALLINT)
+
+statement ok
+INSERT INTO bw VALUES (1, 12, 10, 5), (2, NULL, NULL, NULL), (3, -9223372036854775808, -2147483648, -32768)
+
+query IIII
+SELECT CAST(7 AS bigint) & CAST(3 AS bigint), CAST(7 AS bigint) | CAST(8 AS bigint), CAST(7 AS bigint) # CAST(2 AS bigint), ~CAST(7 AS bigint)
+----
+3 15 5 -8
+
+query III
+SELECT CAST(6 AS smallint) & CAST(3 AS smallint), CAST(6 AS smallint) | 1, ~CAST(0 AS smallint)
+----
+2 7 -1
+
+query IIIIIIIIIII
+SELECT b & 4, b | i, b # s, i & s, b << 2, i << 2, s << 2, b >> 1, ~b, ~i, ~s FROM bw ORDER BY id
+----
+4 14 9 0 48 40 20 6 -13 -11 -6
+NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL
+0 -2147483648 9223372036854743040 -2147483648 0 0 0 -4611686018427387904 9223372036854775807 2147483647 32767
+
+# Mixed widths promote to the wider operand: the result then carries the wider bound in arithmetic.
+query II
+SELECT (CAST(1 AS smallint) | CAST(70000 AS int)) * 1, (CAST(1 AS smallint) | CAST(4294967296 AS bigint)) + 0
+----
+70001 4294967297
+
+query I
+SELECT (CAST(1 AS int) # CAST(4294967296 AS bigint)) * 2
+----
+8589934594
+
+# A shift keeps the shifted operand's width.
+statement error out of range
+SELECT (CAST(1 AS smallint) << 2) * CAST(10000 AS smallint)
+
+query I
+SELECT (CAST(1 AS bigint) << 2) * 10000
+----
+40000
+
+# Shift overflow: bits past the top of the width are dropped, and the count wraps modulo the width.
+query IIIII
+SELECT CAST(1 AS bigint) << 62, CAST(1 AS bigint) << 63, CAST(1 AS bigint) << 64, CAST(3 AS bigint) << 65, CAST(1 AS bigint) << -1
+----
+4611686018427387904 -9223372036854775808 1 6 -9223372036854775808
+
+query IIII
+SELECT CAST(1 AS int) << 31, CAST(1 AS int) << 32, CAST(1 AS smallint) << 15, CAST(1 AS smallint) << 16
+----
+-2147483648 1 -32768 0
+
+query IIII
+SELECT CAST(-1 AS bigint) >> 70, CAST(-9223372036854775808 AS bigint) >> 63, CAST(-2147483648 AS int) >> 31, CAST(-32768 AS smallint) >> 15
+----
+-1 -1 -1 -1
+
+query I
+SELECT 9223372036854775807 << 1
+----
+-2
+
+# NULL operands and an untyped NULL yield NULL.
+query IIII
+SELECT b & NULL, NULL | b, s << NULL, ~CAST(NULL AS bigint) FROM bw WHERE id = 1
+----
+NULL NULL NULL NULL
+
+# An INT- or SMALLINT-typed value that has outgrown its width (a SUM past 2^31 or 2^15) is refused
+# by every bitwise operator rather than truncated, as arithmetic refuses it.
+statement ok
+CREATE TABLE wide (x INT, sm SMALLINT)
+
+statement ok
+INSERT INTO wide VALUES (2000000000, 30000), (2000000000, 30000)
+
+statement error integer out of range
+SELECT SUM(x) >> 1 FROM wide
+
+statement error integer out of range
+SELECT SUM(x) << 1 FROM wide
+
+statement error integer out of range
+SELECT SUM(x) & 1 FROM wide
+
+statement error integer out of range
+SELECT 1 | SUM(x) FROM wide
+
+statement error integer out of range
+SELECT ~SUM(x) FROM wide
+
+statement error integer out of range
+SELECT SUM(sm) >> 0 FROM wide
+
+statement error integer out of range
+SELECT SUM(sm) & CAST(1 AS smallint) FROM wide
+
+# Against an INT the result is an INT, which 60000 fits.
+query I
+SELECT SUM(sm) & 1 FROM wide
+----
+0
+
+statement error integer out of range
+SELECT SUM(x) + 1 FROM wide
+
+# Cast to BIGINT for a 64-bit operation.
+query III
+SELECT CAST(SUM(x) AS bigint) >> 1, CAST(SUM(x) AS bigint) & 1, CAST(SUM(sm) AS bigint) >> 0 FROM wide
+----
+2000000000 0 60000
+
+# A value within its width still wraps the shifted result to that width.
+query II
+SELECT MIN(x) << 1, MIN(sm) << 2 FROM wide
+----
+-294967296 -11072
+
+# A non-integer operand is still a type error.
+statement error type mismatch
+SELECT CAST(1 AS bigint) & 1.5

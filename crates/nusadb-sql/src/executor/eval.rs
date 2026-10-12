@@ -212,6 +212,11 @@ pub(crate) fn eval(expr: &TypedExpr, row: &Row) -> Result<ast::Value, Error> {
         },
         TypedExprKind::Unary { op, expr: inner } => {
             let v = eval(inner, row)?;
+            // `~` complements within the operand's width, so an operand that already overflows that
+            // width (a `SUM(int)` past 2^31, say) is refused like the binary bitwise operators.
+            if *op == ast::UnaryOp::BitNot {
+                check_int_width(&v, expr.ty)?;
+            }
             apply_unary(*op, &v)
         },
         TypedExprKind::IsNull {
@@ -1689,16 +1694,29 @@ fn date_trunc_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> 
     use ast::Value as V;
     // A `timestamptz` truncates on the session-local wall clock (shift in, truncate, shift
     // back), so a day/hour boundary is the session zone's, not UTC's.
+    let unsupported =
+        || Error::InvalidParameterValue(format!("DATE_TRUNC field `{field}` is not supported"));
     let (micros, is_tz) = match src {
         V::Timestamp(m) => (*m, false),
         V::TimestampTz(m) => (*m, true),
+        // A TIME truncates as the interval since midnight, so it stays a time of day.
+        V::Time(t) => {
+            let iv = crate::interval::Interval {
+                months: 0,
+                days: 0,
+                micros: *t,
+            };
+            return iv
+                .trunc(field)
+                .map(|iv| V::Time(iv.micros))
+                .ok_or_else(unsupported);
+        },
+        V::Interval(iv) => return iv.trunc(field).map(V::Interval).ok_or_else(unsupported),
         _ => return Ok(V::Null),
     };
     let shift = if is_tz { session_zone_micros() } else { 0 };
     let truncated = crate::temporal::date_trunc_micros(field, micros.saturating_add(shift))
-        .ok_or_else(|| {
-            Error::InvalidParameterValue(format!("DATE_TRUNC field `{field}` is not supported"))
-        })?
+        .ok_or_else(unsupported)?
         .saturating_sub(shift);
     Ok(if is_tz {
         V::TimestampTz(truncated)
@@ -5015,6 +5033,18 @@ pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             }
             cast_value(ast::Value::Text(t.to_owned()), target)
         },
+        // A number or boolean casts to the JSON scalar it spells (`1::jsonb` is `1`,
+        // `true::jsonb` is `true`), the same scalar `to_json` builds. A non-finite float becomes
+        // the JSON string `"NaN"` / `"Infinity"`, as JSON has no number for it.
+        (
+            ast::Value::Int(_)
+            | ast::Value::Float(_)
+            | ast::Value::Numeric(_)
+            | ast::Value::Bool(_),
+            ColumnType::Json,
+        ) => Ok(ast::Value::Json(crate::json::to_text(
+            &crate::json::value_to_json(&value),
+        ))),
         _ => Err(Error::CannotCoerce(format!(
             "cannot cast from {:?} to {:?}",
             runtime_type(&value),
@@ -5104,7 +5134,7 @@ fn invalid_cast(s: &str, target: ColumnType) -> Error {
 /// `invalid_datetime_format` error (`22007`) — from a well-shaped but out-of-range one such as
 /// `2023-02-30`, which is a `datetime_field_overflow` (`22008`).
 pub(super) fn date_from_text(s: &str) -> Result<i32, Error> {
-    crate::temporal::parse_date(s).ok_or_else(|| {
+    crate::temporal::parse_date_input(s).ok_or_else(|| {
         if crate::temporal::is_date_field_out_of_range(s) {
             Error::DatetimeOverflow(format!("date/time field value out of range: \"{s}\""))
         } else {
@@ -6062,7 +6092,7 @@ fn apply_binary(
             apply_bit_op(op, left, right)
         },
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::ShiftLeft | Op::ShiftRight => {
-            Ok(apply_bitwise(op, left, right))
+            apply_bitwise(op, left, right, result_ty)
         },
         // Geometry predicates share `&&` (box overlap) and `@>`/`<@` (box↔point containment).
         Op::ArrayOverlap | Op::JsonContains | Op::JsonContainedBy
@@ -6595,28 +6625,77 @@ fn ts_and_op(left: &ast::Value, right: &ast::Value) -> Result<ast::Value, Error>
     }
 }
 
-/// Evaluate an integer bitwise operator `&` / `|` / `<<` / `>>`. A `NULL` operand yields
-/// `NULL`; otherwise both operands are `INT` (the analyzer enforces this). The shift amount is taken
-/// modulo 64 (the `i64` bit width) so a large or negative count is total rather than undefined,
-/// matching the wrapping shift of common SQL engines. `>>` is an arithmetic (sign-preserving) shift.
-fn apply_bitwise(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) -> ast::Value {
+/// Evaluate an integer bitwise operator `&` / `|` / `#` / `<<` / `>>`. A `NULL` operand yields
+/// `NULL`; otherwise both operands are integers (the analyzer enforces this), and an operand that
+/// does not fit the result width is an integer out-of-range error.
+///
+/// `&`, `|` and `#` act on the sign-extended 64-bit values, which gives the same bits at every
+/// width. A shift is done in the width of the result type (the shifted operand's type): 64 bits for
+/// `BIGINT`, 32 bits for `INT`, and 32 bits truncated to 16 for `SMALLINT`. The count is taken
+/// modulo that 64 or 32 bit width, so a large or negative count is total rather than undefined and
+/// bits shifted past the top are dropped (`1::bigint << 63` is the minimum `BIGINT`, `1::bigint << 64`
+/// is `1`). `>>` is an arithmetic (sign-preserving) shift.
+fn apply_bitwise(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+    result_ty: ColumnType,
+) -> Result<ast::Value, Error> {
     use ast::BinaryOp as Op;
     let (ast::Value::Int(a), ast::Value::Int(b)) = (left, right) else {
-        return ast::Value::Null;
+        return Ok(ast::Value::Null);
     };
-    // `rem_euclid(64)` is in `0..64`, so the `u32` conversion is exact and the shift is defined.
-    let shift = || u32::try_from(b.rem_euclid(64)).unwrap_or(0);
+    // Every bitwise operator works within the result width. An operand that does not fit that width
+    // (an INT-typed `SUM` past 2^31, say) is refused rather than silently truncated. A shift count
+    // is only a count, so only the shifted value is checked for a shift.
+    check_int_width(left, result_ty)?;
+    if !matches!(op, Op::ShiftLeft | Op::ShiftRight) {
+        check_int_width(right, result_ty)?;
+    }
+    let shift = |width: i64| u32::try_from(b.rem_euclid(width)).unwrap_or(0);
+    // The narrower widths shift in 32 bits; the truncating `as` casts are the intended wrap.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a shift wraps within the operand width by definition"
+    )]
+    let narrow = |a: i64, left_shift: bool| -> i64 {
+        let a = a as i32;
+        let shifted = if left_shift {
+            a.wrapping_shl(shift(32))
+        } else {
+            a.wrapping_shr(shift(32))
+        };
+        if result_ty == ColumnType::SmallInt {
+            i64::from(shifted as i16)
+        } else {
+            i64::from(shifted)
+        }
+    };
+    let wide = !matches!(result_ty, ColumnType::Int | ColumnType::SmallInt);
     let result = match op {
         Op::BitAnd => a & b,
         Op::BitOr => a | b,
         Op::BitXor => a ^ b,
-        Op::ShiftLeft => a.wrapping_shl(shift()),
-        Op::ShiftRight => a.wrapping_shr(shift()),
-        // Unreachable: only the four bitwise/shift ops are routed here. A NULL is a safe fallback
+        Op::ShiftLeft if wide => a.wrapping_shl(shift(64)),
+        Op::ShiftRight if wide => a.wrapping_shr(shift(64)),
+        Op::ShiftLeft => narrow(*a, true),
+        Op::ShiftRight => narrow(*a, false),
+        // Unreachable: only the bitwise/shift ops are routed here. A NULL is a safe fallback
         // (rather than silently applying a shift) should a future op be misrouted.
-        _ => return ast::Value::Null,
+        _ => return Ok(ast::Value::Null),
     };
-    ast::Value::Int(result)
+    Ok(ast::Value::Int(result))
+}
+
+/// Refuse an integer value that does not fit the width of `ty` (`SMALLINT`/`INT`; `BIGINT` and every
+/// other type always pass) with the integer out-of-range error.
+fn check_int_width(value: &ast::Value, ty: ColumnType) -> Result<(), Error> {
+    if let ast::Value::Int(i) = value
+        && int_value_bounds(ty).is_some_and(|(lo, hi)| *i < lo || *i > hi)
+    {
+        return Err(Error::IntegerOutOfRange);
+    }
+    Ok(())
 }
 
 /// Evaluate a MACADDR8 `&` / `|` operator — the byte-wise AND / OR of two eight-byte addresses. A
@@ -7449,6 +7528,56 @@ fn apply_comparison(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) ->
 /// Microseconds in a day (for DATE → micros promotion in interval arithmetic).
 const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
+/// `interval * number` (either order) and `interval / number`, or `None` when the operands are not
+/// such a pair. An integer factor scales each field exactly; a float or numeric factor, and every
+/// divisor, scales fractionally and carries the fractions down (`INTERVAL '1 month' * 1.5` is
+/// `1 mon 15 days`, see `Interval::checked_mul_f64`). `Some(Err(_))` reports an overflow or a zero
+/// divisor.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "an integer divisor past 2^53 loses only precision far below a microsecond"
+)]
+fn interval_scale_op(
+    op: ast::BinaryOp,
+    left: &ast::Value,
+    right: &ast::Value,
+) -> Option<Result<ast::Value, Error>> {
+    use ast::Value::{Float, Int, Interval, Numeric};
+    let overflow = || Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned());
+    if op == ast::BinaryOp::Multiply {
+        let (iv, factor) = match (left, right) {
+            (Interval(iv), Int(n)) | (Int(n), Interval(iv)) => {
+                return Some(iv.checked_mul(*n).map(Interval).ok_or_else(overflow));
+            },
+            (Interval(iv), Float(f)) | (Float(f), Interval(iv)) => (iv, *f),
+            (Interval(iv), Numeric(d)) | (Numeric(d), Interval(iv)) => (iv, d.to_f64()),
+            _ => return None,
+        };
+        return Some(
+            iv.checked_mul_f64(factor)
+                .map(Interval)
+                .ok_or_else(overflow),
+        );
+    }
+    let Interval(iv) = left else {
+        return None;
+    };
+    let divisor = match right {
+        Int(n) => *n as f64,
+        Float(f) => *f,
+        Numeric(d) => d.to_f64(),
+        _ => return None,
+    };
+    if divisor == 0.0 {
+        return Some(Err(Error::DivisionByZero));
+    }
+    Some(
+        iv.checked_div_f64(divisor)
+            .map(Interval)
+            .ok_or_else(overflow),
+    )
+}
+
 /// INTERVAL / temporal `+`/`-`: `interval ± interval`, and `temporal ± interval` (DATE
 /// promotes to TIMESTAMP via calendar-aware addition). Returns `None` for non-interval cases so the
 /// caller falls back to numeric arithmetic; `Some(Err(_))` when the interval arithmetic overflows
@@ -7460,21 +7589,8 @@ fn interval_arith(
 ) -> Option<Result<ast::Value, Error>> {
     use ast::Value::{Date, Int, Interval, Time, Timestamp, TimestampTz};
     let overflow = || Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned());
-    // `interval * number` (commutative) scales every component. An integer factor is exact; a float
-    // factor scales fractionally and cascades (`INTERVAL '1 month' * 1.5` → `1 mon 15 days`).
-    if matches!(op, ast::BinaryOp::Multiply) {
-        return match (left, right) {
-            (Interval(iv), Int(n)) | (Int(n), Interval(iv)) => {
-                Some(iv.checked_mul(*n).map(Interval).ok_or_else(overflow))
-            },
-            (Interval(iv), ast::Value::Float(f)) | (ast::Value::Float(f), Interval(iv)) => {
-                Some(Ok(Interval(iv.scale(*f))))
-            },
-            (Interval(iv), ast::Value::Numeric(d)) | (ast::Value::Numeric(d), Interval(iv)) => {
-                Some(Ok(Interval(iv.scale(d.to_f64()))))
-            },
-            _ => None,
-        };
+    if matches!(op, ast::BinaryOp::Multiply | ast::BinaryOp::Divide) {
+        return interval_scale_op(op, left, right);
     }
     let add = matches!(op, ast::BinaryOp::Plus);
     if !add && !matches!(op, ast::BinaryOp::Minus) {
@@ -7491,6 +7607,16 @@ fn interval_arith(
             .ok_or_else(date_overflow)
     };
     match (left, right) {
+        // `date + time` (either order) is the TIMESTAMP at that wall-clock time of the day.
+        (Date(d), Time(t)) | (Time(t), Date(d)) if add => {
+            return Some(
+                i64::from(*d)
+                    .checked_mul(MICROS_PER_DAY)
+                    .and_then(|midnight| midnight.checked_add(*t))
+                    .map(Timestamp)
+                    .ok_or_else(date_overflow),
+            );
+        },
         (Date(d), Int(n)) => {
             let days = if add { Some(*n) } else { n.checked_neg() };
             return Some(

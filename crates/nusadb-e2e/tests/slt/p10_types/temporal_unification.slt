@@ -1,0 +1,184 @@
+# DATE, TIMESTAMP and TIMESTAMPTZ mix implicitly: a DATE promotes to TIMESTAMP (midnight), and a
+# DATE or TIMESTAMP promotes to TIMESTAMPTZ, reading the wall clock in the session time zone. This
+# applies to comparisons, BETWEEN, IN, IS DISTINCT FROM, COALESCE, CASE, NULLIF, GREATEST/LEAST,
+# ARRAY[...], VALUES and set operations.
+
+statement ok
+SET TIME ZONE 'UTC'
+
+statement ok
+CREATE TABLE tu (id INT PRIMARY KEY, dt DATE, ts TIMESTAMP, tz TIMESTAMPTZ)
+
+statement ok
+INSERT INTO tu VALUES (1, DATE '2024-03-05', TIMESTAMP '2024-03-05 10:00:00', TIMESTAMPTZ '2024-03-05 10:00:00+00'), (2, DATE '2024-03-06', NULL, TIMESTAMPTZ '2024-03-04 23:00:00+00'), (3, NULL, TIMESTAMP '2024-03-06 00:00:00', NULL), (4, DATE '2024-03-07', TIMESTAMP '2024-03-07 00:00:00', TIMESTAMPTZ '2024-03-07 00:00:00+00')
+
+# COALESCE over an aggregate and CURRENT_TIMESTAMP (a TIMESTAMPTZ).
+query T
+SELECT COALESCE(MAX(ts), CURRENT_TIMESTAMP) FROM tu
+----
+2024-03-07 00:00:00+00
+
+query T
+SELECT COALESCE(MAX(ts), CURRENT_TIMESTAMP) > TIMESTAMPTZ '2020-01-01 00:00:00+00' FROM tu WHERE id > 100
+----
+1
+
+query ITTT
+SELECT id, COALESCE(ts, tz), COALESCE(dt, ts), COALESCE(dt, tz) FROM tu ORDER BY id
+----
+1 2024-03-05 10:00:00+00 2024-03-05 00:00:00 2024-03-05 00:00:00+00
+2 2024-03-04 23:00:00+00 2024-03-06 00:00:00 2024-03-06 00:00:00+00
+3 2024-03-06 00:00:00+00 2024-03-06 00:00:00 NULL
+4 2024-03-07 00:00:00+00 2024-03-07 00:00:00 2024-03-07 00:00:00+00
+
+query IT
+SELECT id, CASE WHEN id % 2 = 1 THEN dt ELSE tz END FROM tu ORDER BY id
+----
+1 2024-03-05 00:00:00+00
+2 2024-03-04 23:00:00+00
+3 NULL
+4 2024-03-07 00:00:00+00
+
+query IT
+SELECT id, CASE WHEN id = 1 THEN dt WHEN id = 2 THEN ts ELSE NULL END FROM tu ORDER BY id
+----
+1 2024-03-05 00:00:00
+2 NULL
+3 NULL
+4 NULL
+
+query ITT
+SELECT id, NULLIF(ts, dt), NULLIF(dt, tz) FROM tu ORDER BY id
+----
+1 2024-03-05 10:00:00 2024-03-05 00:00:00+00
+2 NULL 2024-03-06 00:00:00+00
+3 2024-03-06 00:00:00 NULL
+4 NULL NULL
+
+query ITT
+SELECT id, GREATEST(dt, ts, tz), LEAST(dt, ts, tz) FROM tu ORDER BY id
+----
+1 2024-03-05 10:00:00+00 2024-03-05 00:00:00+00
+2 2024-03-06 00:00:00+00 2024-03-04 23:00:00+00
+3 2024-03-06 00:00:00+00 2024-03-06 00:00:00+00
+4 2024-03-07 00:00:00+00 2024-03-07 00:00:00+00
+
+# Comparisons, BETWEEN, IN and IS DISTINCT FROM across the three types.
+query IIIIII
+SELECT id, ts = dt, ts < tz, dt < tz, dt >= ts, tz <> dt FROM tu ORDER BY id
+----
+1 0 0 1 0 1
+2 NULL NULL 0 NULL 1
+3 NULL NULL NULL NULL NULL
+4 1 0 0 1 0
+
+query I
+SELECT id FROM tu WHERE ts BETWEEN dt AND tz ORDER BY id
+----
+1
+4
+
+query I
+SELECT id FROM tu WHERE ts BETWEEN DATE '2024-03-05' AND DATE '2024-03-06' ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM tu WHERE ts BETWEEN DATE '2024-03-06' AND DATE '2024-03-08' ORDER BY id
+----
+3
+4
+
+query I
+SELECT id FROM tu WHERE dt NOT BETWEEN TIMESTAMP '2024-03-05 12:00:00' AND tz ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM tu WHERE dt IN (ts, TIMESTAMP '2024-03-06 00:00:00') ORDER BY id
+----
+2
+4
+
+query I
+SELECT id FROM tu WHERE ts IN (DATE '2024-03-06', DATE '2024-03-07') ORDER BY id
+----
+3
+4
+
+query IT
+SELECT id, ts IS DISTINCT FROM dt FROM tu ORDER BY id
+----
+1 1
+2 1
+3 1
+4 0
+
+query IT
+SELECT id, CASE dt WHEN ts THEN 'same' ELSE 'different' END FROM tu ORDER BY id
+----
+1 different
+2 different
+3 different
+4 same
+
+# Set operations, VALUES and ARRAY[...] unify the column / element type.
+query T
+SELECT dt FROM tu WHERE id = 1 UNION ALL SELECT ts FROM tu WHERE id = 1 UNION ALL SELECT tz FROM tu WHERE id = 1 ORDER BY 1
+----
+2024-03-05 00:00:00+00
+2024-03-05 10:00:00+00
+2024-03-05 10:00:00+00
+
+query T
+SELECT MAX(dt) FROM tu UNION SELECT MAX(ts) FROM tu ORDER BY 1
+----
+2024-03-07 00:00:00
+
+query T
+SELECT x FROM (VALUES (DATE '2024-01-01'), (TIMESTAMP '2024-01-01 12:00:00')) AS v(x) ORDER BY x
+----
+2024-01-01 00:00:00
+2024-01-01 12:00:00
+
+query T
+SELECT ARRAY[dt, ts] FROM tu WHERE id = 1
+----
+{"2024-03-05 00:00:00","2024-03-05 10:00:00"}
+
+# The TIMESTAMPTZ side of the unification uses the session time zone.
+statement ok
+SET TIME ZONE '+07'
+
+query IT
+SELECT id, COALESCE(ts, tz) FROM tu ORDER BY id
+----
+1 2024-03-05 10:00:00+07
+2 2024-03-05 06:00:00+07
+3 2024-03-06 00:00:00+07
+4 2024-03-07 00:00:00+07
+
+query II
+SELECT TIMESTAMP '2024-03-05 17:00:00' = tz, ts = tz FROM tu WHERE id = 1
+----
+1 0
+
+query I
+SELECT DATE '2024-03-05' = TIMESTAMPTZ '2024-03-04 17:00:00+00'
+----
+1
+
+query T
+SELECT dt FROM tu WHERE id = 1 UNION ALL SELECT tz FROM tu WHERE id = 1 ORDER BY 1
+----
+2024-03-05 00:00:00+07
+2024-03-05 17:00:00+07
+
+statement ok
+SET TIME ZONE 'UTC'
+
+# TIME does not mix with a date or timestamp.
+statement error type mismatch
+SELECT COALESCE(TIME '10:00:00', ts) FROM tu

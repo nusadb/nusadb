@@ -147,6 +147,21 @@ pub fn parse_date(s: &str) -> Option<i32> {
     i32::try_from(days_from_civil(y, m, d)).ok()
 }
 
+/// Parse a `DATE` input: a `YYYY-MM-DD` date, or a full timestamp text.
+///
+/// For a timestamp text (`'2024-01-01 10:00'`, `'2024-01-01T10:00:00+05'`) the date part is taken
+/// as written, its time and any zone offset ignored. The timestamp form must still be valid as a
+/// whole, so `'2024-01-01 25:00'` is refused.
+#[must_use]
+pub fn parse_date_input(s: &str) -> Option<i32> {
+    parse_date(s).or_else(|| {
+        let s = s.trim();
+        let (date, _) = s.split_once([' ', 'T'])?;
+        let date = parse_date(date)?;
+        (parse_timestamp(s).is_some() || parse_timestamptz(s).is_some()).then_some(date)
+    })
+}
+
 /// Whether `s` is a well-shaped `YYYY-MM-DD` that still won't parse — a field out of range.
 ///
 /// A three-field date with a two-digit month and day that fails to parse (`2023-02-30`,
@@ -261,7 +276,9 @@ pub fn format_time(micros: i64) -> String {
 
 fn parse_time_of_day(s: &str) -> Option<i64> {
     let mut it = s.splitn(3, ':');
-    let h = parse_fixed(it.next()?, 2)?;
+    // The hour may be written with one digit (`3:16:17`); minutes and seconds keep two.
+    let hour = it.next()?;
+    let h = parse_fixed(hour, 2).or_else(|| parse_fixed(hour, 1))?;
     let m = parse_fixed(it.next()?, 2)?;
     // Seconds are optional: `HH:MM` (and `HH:MM` inside a timestamp) defaults the seconds to 0, the
     // same as the reference engine. `HH:MM:SS[.ffffff]` keeps its explicit seconds and fractional part.

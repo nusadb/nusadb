@@ -125,7 +125,10 @@ fn analyze_values_table(
         let typed = row
             .iter()
             .zip(&col_types)
-            .map(|(cell, &ty)| analyze_expr(cell, &empty_scope, catalog, Some(ty)))
+            .map(|(cell, &ty)| {
+                analyze_expr(cell, &empty_scope, catalog, Some(ty))
+                    .map(|te| promote_temporal(te, ty))
+            })
             .collect::<Result<_, _>>()?;
         typed_rows.push(typed);
     }
@@ -1590,15 +1593,42 @@ pub(super) fn analyze_set_body(
             for (l, r) in cols.iter_mut().zip(&rcols) {
                 l.1 = unify_result_ty(Some(l.1), r.1, "set operation column")?;
             }
-            Ok((
-                SetOpTree::Node {
-                    op,
-                    all,
-                    left: Box::new(ltree),
-                    right: Box::new(rtree),
-                },
-                cols,
-            ))
+            let mut tree = SetOpTree::Node {
+                op,
+                all,
+                left: Box::new(ltree),
+                right: Box::new(rtree),
+            };
+            // A column whose branches mix date/time types is promoted to the unified type in every
+            // branch, so the combined rows carry one value type (DATE and TIMESTAMP rows of a
+            // TIMESTAMPTZ column all become instants).
+            for (idx, (_, ty)) in cols.iter().enumerate() {
+                promote_set_column(&mut tree, idx, *ty);
+            }
+            Ok((tree, cols))
+        },
+    }
+}
+
+/// Promote output column `idx` of every leaf in a set-operation tree to the date/time type `ty`
+/// (see [`promote_temporal`]); a leaf whose column already has that type is left as is.
+fn promote_set_column(tree: &mut SetOpTree<SelectPlan>, idx: usize, ty: ColumnType) {
+    match tree {
+        SetOpTree::Leaf(plan) => {
+            if let Some(p) = plan.projection.get_mut(idx)
+                && p.expr.ty != ty
+            {
+                let placeholder = TypedExpr {
+                    kind: TypedExprKind::Literal(ast::Value::Null),
+                    ty,
+                };
+                let expr = std::mem::replace(&mut p.expr, placeholder);
+                p.expr = promote_temporal(expr, ty);
+            }
+        },
+        SetOpTree::Node { left, right, .. } => {
+            promote_set_column(left, idx, ty);
+            promote_set_column(right, idx, ty);
         },
     }
 }
@@ -3906,9 +3936,15 @@ pub(super) fn analyze_aggregate(
             let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
             Ok((Some(typed), ColumnType::Int))
         },
-        // SUM(expr) / AVG(expr) — numeric only. SUM(Int)→Int, SUM(Float)→Float.
+        // SUM(expr) / AVG(expr) over a numeric or INTERVAL argument. SUM(Int)→Int, SUM(Float)→Float.
         (ast::AggregateFunc::Sum | ast::AggregateFunc::Avg, Some(arg)) => {
             let typed = analyze_expr_agg(arg, scope, catalog, None, aggregates.as_deref_mut())?;
+            // SUM and AVG over INTERVAL yield an INTERVAL: the sum adds each field (months, days,
+            // microseconds) separately, and the average divides that sum by the count with the
+            // carry rule of `interval / number`.
+            if typed.ty == ColumnType::Interval {
+                return Ok((Some(typed), ColumnType::Interval));
+            }
             if !is_numeric(typed.ty) {
                 return Err(Error::TypeMismatch {
                     context: format!("{func:?} requires a numeric argument"),

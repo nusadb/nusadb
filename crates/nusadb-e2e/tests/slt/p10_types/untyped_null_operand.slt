@@ -1,0 +1,71 @@
+# An untyped NULL beside a typed operand first takes that operand's type. When the operator has no
+# form for two values of that type (`timestamp + timestamp`), the NULL takes the type that makes the
+# operator resolve instead: INTERVAL first (so `ts + NULL` is `timestamp + interval`), then an
+# integer, then the other scalar types. The result is NULL of the resolved operator's type.
+
+statement ok
+CREATE TABLE nt (id INT PRIMARY KEY, dt DATE, tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, iv INTERVAL, n NUMERIC(10, 2), t TEXT, j JSONB)
+
+statement ok
+INSERT INTO nt VALUES (1, DATE '2024-01-02', TIME '10:00:00', TIMESTAMP '2024-01-02 10:00:00', TIMESTAMPTZ '2024-01-02 10:00:00+00', INTERVAL '1 day', 1.50, 'x', '{"a": 1}')
+
+query TTTTTTTT
+SELECT dt + NULL, NULL + dt, dt - NULL, NULL - dt, tm + NULL, NULL + tm, tm - NULL, NULL - tm FROM nt
+----
+NULL NULL NULL NULL NULL NULL NULL NULL
+
+query TTTTTTTT
+SELECT ts + NULL, NULL + ts, ts - NULL, NULL - ts, tz + NULL, NULL + tz, tz - NULL, NULL - tz FROM nt
+----
+NULL NULL NULL NULL NULL NULL NULL NULL
+
+query TTTTTTT
+SELECT iv + NULL, NULL + iv, iv - NULL, iv * NULL, NULL * iv, iv / NULL, n + NULL FROM nt
+----
+NULL NULL NULL NULL NULL NULL NULL
+
+query TTTT
+SELECT n - NULL, NULL * n, t || NULL, NULL || t FROM nt
+----
+NULL NULL NULL NULL
+
+# The resolved type shows through COALESCE, which needs one common type for its arguments.
+query TTTT
+SELECT COALESCE(dt + NULL, ts), COALESCE(dt - NULL, 7), COALESCE(tm + NULL, tm), COALESCE(tm - NULL, iv) FROM nt
+----
+2024-01-02 10:00:00 7 10:00:00 1 day
+
+query TTTT
+SELECT COALESCE(ts + NULL, ts), COALESCE(ts - NULL, iv), COALESCE(tz + NULL, tz), COALESCE(tz - NULL, iv) FROM nt
+----
+2024-01-02 10:00:00 1 day 2024-01-02 10:00:00+00 1 day
+
+query TT
+SELECT COALESCE(iv * NULL, iv), COALESCE(n + NULL, n) FROM nt
+----
+1 day 1.50
+
+# Comparisons with an untyped NULL are NULL for every type.
+query TTTTTTTT
+SELECT dt = NULL, tm < NULL, NULL > ts, tz <> NULL, iv >= NULL, n = NULL, NULL < t, j = NULL FROM nt
+----
+NULL NULL NULL NULL NULL NULL NULL NULL
+
+# COALESCE with a NULL argument on either side keeps the typed argument.
+query TTTTTTTT
+SELECT COALESCE(NULL, dt), COALESCE(tm, NULL), COALESCE(NULL, ts), COALESCE(tz, NULL), COALESCE(NULL, iv), COALESCE(n, NULL), COALESCE(NULL, t), COALESCE(j, NULL) FROM nt
+----
+2024-01-02 10:00:00 2024-01-02 10:00:00 2024-01-02 10:00:00+00 1 day 1.50 x {"a": 1}
+
+# JSON key operators take a key on the right, not a second document.
+query TT
+SELECT j - NULL, j -> NULL FROM nt
+----
+NULL NULL
+
+# An operator with no form for any type next to that operand stays an error.
+statement error type mismatch
+SELECT t + NULL FROM nt
+
+statement error type mismatch
+SELECT j * NULL FROM nt

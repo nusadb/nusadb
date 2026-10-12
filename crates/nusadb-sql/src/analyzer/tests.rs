@@ -1960,11 +1960,13 @@ fn temporal_and_uuid_columns_compare_in_between_in_and_case() {
 
 #[test]
 fn cross_type_temporal_comparison_is_still_rejected() {
-    // Widening `comparable` must not let genuinely different types through: a DATE vs TIMESTAMP
-    // BETWEEN/IN is still a TypeMismatch, exactly as `=`/`<` already reject it.
+    // Widening `comparable` must not let genuinely different types through: a TIME vs TIMESTAMP
+    // BETWEEN/IN is still a TypeMismatch, exactly as `=`/`<` already reject it. (DATE, TIMESTAMP and
+    // TIMESTAMPTZ do share a common type; see the test below.)
     let cat = MockCatalog::new().with(events());
     for sql in [
-        "SELECT * FROM events WHERE d BETWEEN ts AND ts",
+        "SELECT * FROM events WHERE t BETWEEN ts AND ts",
+        "SELECT * FROM events WHERE t = d",
         "SELECT * FROM events WHERE u IN (d)",
         "SELECT CASE d WHEN u THEN 1 ELSE 0 END FROM events",
     ] {
@@ -1973,6 +1975,39 @@ fn cross_type_temporal_comparison_is_still_rejected() {
             "should reject cross-type: {sql}"
         );
     }
+}
+
+#[test]
+fn date_timestamp_and_timestamptz_promote_to_a_common_type() {
+    // DATE widens to TIMESTAMP, and DATE or TIMESTAMP to TIMESTAMPTZ, wherever two of them meet; the
+    // narrower side is wrapped in the implicit cast so the executor compares one value type.
+    let cat = MockCatalog::new().with(events());
+    for sql in [
+        "SELECT * FROM events WHERE d BETWEEN ts AND tstz",
+        "SELECT * FROM events WHERE ts IN (d, tstz)",
+        "SELECT * FROM events WHERE d = ts AND ts < tstz",
+        "SELECT CASE d WHEN ts THEN 1 ELSE 0 END FROM events",
+    ] {
+        assert!(plan(sql, &cat).is_ok(), "should type-check: {sql}");
+    }
+    let projected = |sql: &str| {
+        let LogicalPlan::Select(p) = plan(sql, &cat).unwrap() else {
+            panic!("expected a Select plan: {sql}");
+        };
+        p.projection.first().map(|c| c.expr.ty)
+    };
+    assert_eq!(
+        projected("SELECT COALESCE(d, ts) FROM events"),
+        Some(ColumnType::Timestamp)
+    );
+    assert_eq!(
+        projected("SELECT COALESCE(ts, tstz) FROM events"),
+        Some(ColumnType::TimestampTz)
+    );
+    assert_eq!(
+        projected("SELECT GREATEST(d, ts, tstz) FROM events"),
+        Some(ColumnType::TimestampTz)
+    );
 }
 
 #[test]

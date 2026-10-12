@@ -6276,3 +6276,78 @@ async fn cursor_lifetime_and_refusals_over_the_wire() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// An `INT`-tagged parameter binds as a 64-bit integer, so it meets a `BIGINT` column in every
+/// operator (bitwise, shift, arithmetic, comparison) without a width mismatch, in either operand
+/// position and at a magnitude past 32 bits. `DATE`-tagged bounds compare against a `TIMESTAMP`
+/// column by reading each date at midnight.
+#[tokio::test]
+async fn int_and_date_tagged_parameters_meet_bigint_and_timestamp_columns() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    start_session(&mut conn).await;
+    query(
+        &mut conn,
+        "CREATE TABLE big (id INT, b BIGINT, ts TIMESTAMP)",
+    )
+    .await;
+    until_ready(&mut conn).await;
+    query(
+        &mut conn,
+        "INSERT INTO big VALUES (1, 6000000005, TIMESTAMP '2024-03-05 10:00:00')",
+    )
+    .await;
+    until_ready(&mut conn).await;
+
+    let cases: [(&str, &str, &str); 16] = [
+        ("SELECT b & $1 FROM big", "255", "5"),
+        ("SELECT $1 & b FROM big", "255", "5"),
+        ("SELECT b | $1 FROM big", "2", "6000000007"),
+        ("SELECT b # $1 FROM big", "1", "6000000004"),
+        ("SELECT b # $1 FROM big", "6000000005", "0"),
+        ("SELECT b << $1 FROM big", "1", "12000000010"),
+        ("SELECT b >> $1 FROM big", "1", "3000000002"),
+        ("SELECT b + $1 FROM big", "5", "6000000010"),
+        ("SELECT b - $1 FROM big", "5", "6000000000"),
+        ("SELECT b * $1 FROM big", "2", "12000000010"),
+        ("SELECT b / $1 FROM big", "5", "1200000001"),
+        ("SELECT b % $1 FROM big", "4", "1"),
+        ("SELECT b = $1 FROM big", "6000000005", "true"),
+        ("SELECT b < $1 FROM big", "1", "false"),
+        ("SELECT $1 | b FROM big", "8000000000", "8555789317"),
+        ("SELECT ~b & $1 FROM big", "255", "250"),
+    ];
+    for (sql, value, want) in cases {
+        let answer = run_typed(&mut conn, sql, vec![0x02], &[value]).await;
+        assert!(
+            answer.contains(&BackendMessage::DataRow {
+                values: vec![Some(want.as_bytes().to_vec())]
+            }),
+            "{sql} with {value}: {answer:?}"
+        );
+    }
+
+    for (low, high, want) in [
+        ("2024-03-05", "2024-03-06", "1"),
+        ("2024-03-04", "2024-03-05", "0"),
+    ] {
+        let answer = run_typed(
+            &mut conn,
+            "SELECT count(*) FROM big WHERE ts BETWEEN $1 AND $2",
+            vec![0x07, 0x07],
+            &[low, high],
+        )
+        .await;
+        assert!(
+            answer.contains(&BackendMessage::DataRow {
+                values: vec![Some(want.as_bytes().to_vec())]
+            }),
+            "BETWEEN {low} AND {high}: {answer:?}"
+        );
+    }
+
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

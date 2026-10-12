@@ -229,6 +229,10 @@ pub(crate) struct Acc {
     int_sum: i128,
     // Exact running sum for NUMERIC SUM/AVG; `None` until a numeric value is seen.
     dec_sum: Option<crate::numeric::Decimal>,
+    // Running field-wise sum for an INTERVAL SUM/AVG, and whether it overflowed (reported when the
+    // aggregate is finalized, so an overflowing group errors instead of wrapping).
+    iv_sum: crate::interval::Interval,
+    iv_overflow: bool,
     min: Option<ast::Value>,
     max: Option<ast::Value>,
     // MIN/MAX keep the first of equal values they meet (`1.0` and `1.00` compare equal); a fold
@@ -391,6 +395,19 @@ pub(crate) const fn is_integer(ty: ColumnType) -> bool {
     )
 }
 
+/// The error for an INTERVAL aggregate whose total does not fit an interval.
+fn interval_overflow() -> Error {
+    Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned())
+}
+
+/// The INTERVAL total an accumulator folded, or the overflow error if a field overflowed.
+fn interval_total(acc: &Acc) -> Result<ast::Value, Error> {
+    if acc.iv_overflow {
+        return Err(interval_overflow());
+    }
+    Ok(ast::Value::Interval(acc.iv_sum))
+}
+
 /// Produce the final value of one aggregate from its accumulator.
 #[allow(
     clippy::cast_precision_loss,
@@ -411,6 +428,8 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
         F::Sum => {
             if !acc.any_seen {
                 ast::Value::Null
+            } else if call.result_ty == ColumnType::Interval {
+                interval_total(&acc)?
             } else if matches!(call.result_ty, ColumnType::Numeric { .. }) {
                 // A NUMERIC-typed SUM is exact. SUM(BIGINT) promotes to NUMERIC so a total past the
                 // 64-bit range is the exact large number, not an overflow error; it reads the exact
@@ -432,6 +451,16 @@ pub(crate) fn finalize_aggregate(acc: Acc, call: &AggregateCall) -> Result<ast::
         F::Avg => {
             if acc.count == 0 {
                 ast::Value::Null
+            } else if call.result_ty == ColumnType::Interval {
+                // The field-wise total divided by the count, with the `interval / number` carry.
+                let ast::Value::Interval(total) = interval_total(&acc)? else {
+                    return Ok(ast::Value::Null);
+                };
+                ast::Value::Interval(
+                    total
+                        .checked_div_f64(acc.count as f64)
+                        .ok_or_else(interval_overflow)?,
+                )
             } else if matches!(call.result_ty, ColumnType::Numeric { .. }) {
                 // AVG over an exact type (Int / NUMERIC) is exact NUMERIC — `AVG(int)` divides the
                 // exact i128 sum, never an f64-accumulated one, so it stays exact past 2^53 and
@@ -1705,6 +1734,13 @@ pub(crate) fn fold_value(
             if let Some(d) = value_as_decimal(&value) {
                 let acc_dec = acc.dec_sum.unwrap_or(crate::numeric::Decimal::ZERO);
                 acc.dec_sum = acc_dec.checked_add(&d);
+            }
+            // Field-wise total for an INTERVAL-typed result.
+            if let ast::Value::Interval(iv) = &value {
+                match acc.iv_sum.checked_add(iv) {
+                    Some(total) => acc.iv_sum = total,
+                    None => acc.iv_overflow = true,
+                }
             }
             acc.count += 1;
         },

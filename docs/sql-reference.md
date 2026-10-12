@@ -139,7 +139,7 @@ SELECT TRUE AS t,
 | `TIME` / `TIME WITH TIME ZONE` | `TIME '14:30:00'` |
 | `TIMESTAMP` | `TIMESTAMP '2026-08-30 14:30:00'` |
 | `TIMESTAMPTZ` | `TIMESTAMPTZ '2026-08-30 14:30:00+07'` |
-| `INTERVAL` | `INTERVAL '1 day 2 hours'`, `INTERVAL '90 minutes'` |
+| `INTERVAL` | `INTERVAL '1 day 2 hours'`, `INTERVAL '90 minutes'`, `INTERVAL '250 ms'` |
 
 ```sql
 SELECT now()                                   AS instant,
@@ -149,6 +149,36 @@ SELECT now()                                   AS instant,
        age(TIMESTAMP '2026-08-30', TIMESTAMP '2020-01-01') AS elapsed,
        to_char(now(), 'YYYY-MM-DD HH24:MI')    AS formatted;
 ```
+
+An interval literal counts any of `year`, `month`, `week`, `day`, `hour`, `minute`, `second`,
+`millisecond` (`ms`, `msec`) and `microsecond` (`us`, `usec`), singular or plural, and an
+`HH:MM:SS` clock. A time may give its hour with one digit (`TIME '3:16:17'`). A `DATE` read from
+text that also carries a time of day (`'2024-01-01 10:00'`) keeps the date part.
+
+Date and time arithmetic:
+
+| Expression | Result |
+| --- | --- |
+| `date + integer`, `date - integer` | `DATE`, whole days later or earlier |
+| `date - date` | `INTEGER`, the number of days between |
+| `date + time` | `TIMESTAMP` at that time of day |
+| `date + interval`, `timestamp + interval` | `TIMESTAMP` (a `TIMESTAMPTZ` stays one) |
+| `timestamp - timestamp` | `INTERVAL` |
+| `time + interval`, `time - interval` | `TIME`, wrapping around midnight |
+| `interval * number`, `interval / number` | `INTERVAL` |
+
+Multiplying or dividing an interval by a fractional number carries the fractions down: the months
+truncate toward zero and the fractional month becomes days at 30 days per month, the days truncate
+and the fractional day becomes time at 24 hours per day, and the time rounds to the microsecond.
+Nothing carries upward. So `INTERVAL '1 mon' * 1.5` is `1 mon 15 days`, `INTERVAL '1 day' / 3` is
+`08:00:00`, and `INTERVAL '23:59:59' * 2` is `47:59:58`. `sum` adds intervals field by field, and
+`avg` divides that sum by the count with the same carry.
+
+`DATE`, `TIMESTAMP` and `TIMESTAMPTZ` mix without a cast. A `DATE` becomes a `TIMESTAMP` at
+midnight, and a `DATE` or `TIMESTAMP` becomes a `TIMESTAMPTZ` read in the session time zone, wherever
+two of them meet: comparisons, `BETWEEN`, `IN`, `CASE`, `COALESCE`, `NULLIF`, `greatest`/`least`,
+`ARRAY[...]`, `VALUES` and `UNION`/`INTERSECT`/`EXCEPT`. So `COALESCE(max(ts), CURRENT_TIMESTAMP)` is
+a `TIMESTAMPTZ`, and `ts BETWEEN $1 AND $2` takes `DATE` bounds as midnight.
 
 The session time zone defaults to UTC and can be changed with `SET TIME ZONE` (equivalently
 `SET timezone = ...`). Supported zones are `UTC`/`GMT` and fixed offsets: a bare `'+07'` means
@@ -1650,7 +1680,9 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 `EXTRACT` fields: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `dow`,
 `isodow`, `doy`, `isoyear`, `epoch`, `decade`, `century`, `millennium`, `microseconds`,
 `milliseconds`, `julian`, `timezone`, `timezone_hour`, `timezone_minute`. `date_trunc` accepts the
-units from `microseconds` up to `millennium`. `now()` is fixed for the whole statement.
+units from `microseconds` up to `millennium` and truncates a `TIMESTAMP`, `TIMESTAMPTZ`, `TIME` or
+`INTERVAL`, keeping its type (`week` is refused for a `TIME` or an `INTERVAL`). `now()` is fixed for
+the whole statement.
 
 ### JSON
 
@@ -1659,6 +1691,11 @@ Scalar: `json_typeof`, `json_array_length`, `to_json`, `to_jsonb`, `row_to_json`
 `json_insert`, `json_strip_nulls`, `json_pretty`, `json_extract_path`, `json_extract_path_text`,
 `json_path_exists`, `json_path_match`, `json_path_query_first`, `json_path_query_array`,
 `jsonb_exists`. Every `json_*` name has a `jsonb_*` twin.
+
+A bare `NULL` value in `json_build_object` or `json_build_array` becomes JSON `null`; a `NULL` key
+is refused. A number or a boolean casts to the JSON scalar it spells (`CAST(1 AS jsonb)` is `1`); a
+text value casts by parsing it as a JSON document, so a JSON string needs its quotes
+(`CAST('"x"' AS jsonb)`).
 
 Set-returning: `json_array_elements`, `json_array_elements_text`, `json_each`, `json_each_text`,
 `json_object_keys`, `json_path_query` (and their `jsonb_*` twins).
@@ -1748,7 +1785,7 @@ Every aggregate accepts `DISTINCT`, `FILTER (WHERE ...)` and an inner `ORDER BY`
 | --- | --- |
 | Comparison | `=` `<>` `!=` `<` `<=` `>` `>=` `BETWEEN` `IN` `IS [NOT] NULL` `IS [NOT] DISTINCT FROM` `IS [NOT] TRUE / FALSE / UNKNOWN` |
 | Logic | `AND` `OR` `NOT` |
-| Arithmetic | `+` `-` `*` `/` `%` `^` and integer `&` `\|` `<<` `>>` `~` |
+| Arithmetic | `+` `-` `*` `/` `%` `^` and integer `&` `\|` `#` `<<` `>>` `~` |
 | Text | `\|\|` `LIKE` `ILIKE` `SIMILAR TO` `~` `~*` `!~` `!~*` |
 | JSON | `->` `->>` `#>` `#>>` `@>` `<@` (`?` via `jsonb_exists`) |
 | Array | `@>` `<@` `&&` `\|\|` `= ANY(...)` `= ALL(...)` subscript `a[1]` |
@@ -1757,6 +1794,18 @@ Every aggregate accepts `DISTINCT`, `FILTER (WHERE ...)` and an inner `ORDER BY`
 | Vector | `<->` `<=>` `<#>` `<+>` |
 | Full text | `@@` |
 | Geometry | `@>` `<@` `&&` |
+
+The integer bitwise operators work on `SMALLINT`, `INTEGER` and `BIGINT`. `&`, `|` and `#` (XOR)
+over two widths give the wider type. A shift keeps the type of the value shifted: bits shifted past
+its width are dropped, and the shift count is taken modulo the width (64 for `BIGINT`, 32
+otherwise), so `CAST(1 AS bigint) << 63` is the smallest `BIGINT` and `CAST(1 AS bigint) << 64` is
+`1`. On an `INTEGER` the shift is 32-bit: `1 << 40` is `256`, so cast to `BIGINT` for a 64-bit shift
+(`CAST(1 AS bigint) << 40`). An operand that does not fit the result's width, such as a
+`sum(integer)` past 2^31, is refused with `22003` rather than truncated.
+
+A bare `NULL` operand takes the type of the other operand. When the operator has no form for two
+values of that type, it takes the type that makes the operator resolve instead: `ts + NULL` is a
+`NULL` timestamp (`timestamp + interval`), and `INTERVAL '1 day' * NULL` a `NULL` interval.
 
 ---
 
@@ -1985,12 +2034,15 @@ results, casts to text and array elements, so the three always agree.
 ### Assigning between `TIMESTAMP` and `TIMESTAMPTZ`
 
 A value of either type can be assigned to a column of the other and the instant passes through
-unchanged. Equality between the two types is still refused: this widened assignment, not comparison.
+unchanged. The two also compare and unify, the `TIMESTAMP` side read in the session time zone (see
+[Dates, times and intervals](#dates-times-and-intervals)).
 
 ### Type coercion is explicit
 
 The engine does not insert implicit coercions between unrelated types. Cast explicitly with
-`::TYPE` when mixing them.
+`::TYPE` when mixing them. The exceptions are the numeric widenings, `DATE` / `TIMESTAMP` /
+`TIMESTAMPTZ` mixing, a quoted literal taking the type it is compared with, and a bare `NULL` taking
+the type its operator needs.
 
 ### `SERIAL` columns are `integer`
 

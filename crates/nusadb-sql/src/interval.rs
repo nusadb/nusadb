@@ -16,7 +16,7 @@ const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
 const DAYS_PER_MONTH_EST: i64 = 30;
 
 /// A calendar duration: months + days + microseconds (each may be negative).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Interval {
     /// Whole months (years fold in as `12 * years`).
     pub months: i32,
@@ -116,20 +116,88 @@ impl Interval {
         }
     }
 
-    /// Scale every field by `factor`, cascading the fractional results the same way a fractional
-    /// literal does (`INTERVAL '1 month' * 1.5` is `1 mon 15 days`, `INTERVAL '2 hours' * 1.5` is
-    /// `03:00:00`).
+    /// Multiply by a fractional `factor` (`interval * 1.5`), or `None` when the result does not fit
+    /// or `factor` is not finite.
+    ///
+    /// The fractions carry down, never up: months truncate toward zero and the fractional month
+    /// becomes days at 30 days per month; days truncate and the fractional day becomes time at 24
+    /// hours per day; the time rounds to the nearest microsecond. So `'1 mon' * 1.5` is
+    /// `1 mon 15 days`.
     #[must_use]
+    pub fn checked_mul_f64(&self, factor: f64) -> Option<Self> {
+        if !factor.is_finite() {
+            return None;
+        }
+        self.scale_by(|x| x * factor)
+    }
+
+    /// Divide by `divisor` (`interval / 3`), or `None` when the result does not fit or `divisor` is
+    /// zero or not finite. Each field is divided directly rather than multiplied by `1 / divisor`,
+    /// so an exact quotient stays exact; the fractions carry down as in [`Self::checked_mul_f64`].
+    #[must_use]
+    pub fn checked_div_f64(&self, divisor: f64) -> Option<Self> {
+        if divisor == 0.0 || !divisor.is_finite() {
+            return None;
+        }
+        self.scale_by(|x| x / divisor)
+    }
+
+    /// Apply `f` (a multiply or divide by a number) to every field, carrying the fractions down:
+    ///
+    /// 1. months become `trunc(f(months))`; the fractional month spills into days at 30 days per
+    ///    month (that day count rounded to six decimal places);
+    /// 2. days become `trunc(f(days))` plus the whole spilled days; every fractional day left over
+    ///    (from the day field and from the month spill) spills into the time at 24 hours per day
+    ///    (those seconds rounded to six decimal places), and whole days that spill back out of
+    ///    that are kept as days;
+    /// 3. the time becomes `f(micros)` plus the spilled seconds, rounded to the nearest microsecond
+    ///    (ties to even).
+    ///
+    /// Truncation is toward zero, so a negative interval scales symmetrically with a positive one.
+    /// So `'1 mon' * 1.5` is `1 mon 15 days`, `'1 mon' / 7` is `4 days 06:51:25.6896`, and
+    /// `'1 day' / 3` is `08:00:00`.
     #[allow(
+        clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
-        reason = "micros as f64 for scaling; magnitudes beyond 2^53 lose sub-unit precision only, acceptable for a scaled interval"
+        reason = "each float field is range-checked before its saturating `as` cast; micros as f64 loses only sub-microsecond precision past 2^53"
     )]
-    pub fn scale(&self, factor: f64) -> Self {
-        Self::from_fractional(
-            f64::from(self.months) * factor,
-            f64::from(self.days) * factor,
-            self.micros as f64 * factor,
-        )
+    fn scale_by(&self, f: impl Fn(f64) -> f64) -> Option<Self> {
+        const SECS_PER_DAY: f64 = 86_400.0;
+        // Round to six decimals (microsecond precision), so float noise in a carried fraction
+        // does not leak a stray microsecond into the result.
+        let round6 = |x: f64| (x * 1e6).round() / 1e6;
+        let in_i32 = |x: f64| x.is_finite() && x >= f64::from(i32::MIN) && x <= f64::from(i32::MAX);
+        let months_f = f(f64::from(self.months));
+        let days_f = f(f64::from(self.days));
+        if !in_i32(months_f) || !in_i32(days_f) {
+            return None;
+        }
+        let months = months_f.trunc();
+        let days = days_f.trunc();
+        let month_rem_days = round6((months_f - months) * DAYS_PER_MONTH_EST as f64);
+        let mut sec_rem =
+            round6((days_f - days + month_rem_days - month_rem_days.trunc()) * SECS_PER_DAY);
+        let mut whole_days = days + month_rem_days.trunc();
+        if sec_rem.abs() >= SECS_PER_DAY {
+            let spill = (sec_rem / SECS_PER_DAY).trunc();
+            whole_days += spill;
+            sec_rem -= spill * SECS_PER_DAY;
+        }
+        let micros_f = sec_rem
+            .mul_add(MICROS_PER_SEC as f64, f(self.micros as f64))
+            .round_ties_even();
+        // `i64::MAX as f64` rounds up to 2^63, which is itself out of range.
+        if !in_i32(whole_days)
+            || !micros_f.is_finite()
+            || micros_f.abs() >= 9.223_372_036_854_776e18
+        {
+            return None;
+        }
+        Some(Self {
+            months: months as i32,
+            days: whole_days as i32,
+            micros: micros_f as i64,
+        })
     }
 
     /// A canonical microsecond estimate used for comparison/equality only (not for date math).
@@ -210,6 +278,38 @@ impl Interval {
         })
     }
 
+    /// `DATE_TRUNC(field, interval)`: zero every field finer than `field`, reading the interval as
+    /// years and months (from the month count), days, and hours, minutes, seconds and microseconds
+    /// (from the time part, hours unbounded). Each field truncates toward zero, so a negative
+    /// interval truncates symmetrically. `None` for an unknown unit and for `week`, which does not
+    /// divide a month.
+    #[must_use]
+    pub fn trunc(&self, field: &str) -> Option<Self> {
+        const MICROS_PER_MIN: i64 = 60 * MICROS_PER_SEC;
+        const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MIN;
+        let keep_time = |unit: i64| -> i64 { self.micros / unit * unit };
+        let (months, days, micros) = match field {
+            "microsecond" | "microseconds" => (self.months, self.days, self.micros),
+            "millisecond" | "milliseconds" => (self.months, self.days, keep_time(1_000)),
+            "second" => (self.months, self.days, keep_time(MICROS_PER_SEC)),
+            "minute" => (self.months, self.days, keep_time(MICROS_PER_MIN)),
+            "hour" => (self.months, self.days, keep_time(MICROS_PER_HOUR)),
+            "day" => (self.months, self.days, 0),
+            "month" => (self.months, 0, 0),
+            "quarter" => (self.months / 12 * 12 + self.months % 12 / 3 * 3, 0, 0),
+            "year" => (self.months / 12 * 12, 0, 0),
+            "decade" => (self.months / 120 * 120, 0, 0),
+            "century" => (self.months / 1_200 * 1_200, 0, 0),
+            "millennium" => (self.months / 12_000 * 12_000, 0, 0),
+            _ => return None,
+        };
+        Some(Self {
+            months,
+            days,
+            micros,
+        })
+    }
+
     /// Normalize so every 30 days rolls up into one month (`JUSTIFY_DAYS`); the day field keeps
     /// its sign in `[-29, 29]`. Overflow of the month field saturates rather than wrapping.
     #[must_use]
@@ -266,8 +366,8 @@ impl Interval {
     }
 
     /// Parse an interval literal: a sequence of `N unit` terms (`unit` is one of
-    /// `year`, `month`, `week`, `day`, `hour`, `minute`, `second` — abbreviations + plurals
-    /// accepted) and/or an `HH:MM:SS.ffffff` clock term. Examples: `1 day`, `2 hours`,
+    /// `year`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond`, `microsecond`;
+    /// abbreviations + plurals accepted) and/or an `HH:MM:SS.ffffff` clock term. Examples: `1 day`, `2 hours`,
     /// `1 year 2 months`, `1 day 03:04:05`, `-1 mon`.
     #[must_use]
     #[allow(
@@ -324,6 +424,13 @@ impl Interval {
                 },
                 "s" | "sec" | "secs" | "second" | "seconds" => {
                     add_time(whole, frac, MICROS_PER_SEC, &mut micros_whole)?;
+                },
+                "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => {
+                    add_time(whole, frac, 1_000, &mut micros_whole)?;
+                },
+                // A fractional microsecond rounds to the nearest whole one in the final cascade.
+                "us" | "usec" | "usecs" | "microsecond" | "microseconds" => {
+                    add_time(whole, frac, 1, &mut micros_whole)?;
                 },
                 _ => return None,
             }
@@ -501,6 +608,50 @@ mod tests {
         assert_eq!(p("2 days").checked_mul(-1).unwrap(), p("-2 days"));
         // Overflow (months exceeds i32) is reported as None, not wrapped.
         assert!(p("1 month").checked_mul(i64::MAX).is_none());
+    }
+
+    #[test]
+    fn fractional_scale_carries_fractions_down() {
+        let fields = |iv: Interval| (iv.months, iv.days, iv.micros);
+        let hour = 3_600 * MICROS_PER_SEC;
+        assert_eq!(fields(p("1 mon").checked_mul_f64(1.5).unwrap()), (1, 15, 0));
+        assert_eq!(
+            fields(p("-1 mon").checked_mul_f64(1.5).unwrap()),
+            (-1, -15, 0)
+        );
+        assert_eq!(
+            fields(p("1 day").checked_div_f64(3.0).unwrap()),
+            (0, 0, 8 * hour)
+        );
+        assert_eq!(
+            fields(p("1 day 3 hours").checked_div_f64(2.0).unwrap()),
+            (0, 0, 13 * hour + hour / 2)
+        );
+        // Nothing carries upward.
+        assert_eq!(
+            fields(p("23:59:59").checked_mul_f64(2.0).unwrap()),
+            (0, 0, 2 * (24 * hour - MICROS_PER_SEC))
+        );
+        // Half a microsecond rounds to even.
+        assert_eq!(fields(p("1 us").checked_div_f64(2.0).unwrap()), (0, 0, 0));
+        assert!(p("1 day").checked_div_f64(0.0).is_none());
+        assert!(p("1 day").checked_mul_f64(f64::NAN).is_none());
+        assert!(p("2000000000 days").checked_mul_f64(2.0).is_none());
+    }
+
+    #[test]
+    fn sub_second_units_and_trunc() {
+        assert_eq!(p("1 microsecond").micros, 1);
+        assert_eq!(p("3 milliseconds").micros, 3_000);
+        assert_eq!(p("2 msecs 4 usecs").micros, 2_004);
+        let iv = p("1 year 5 mons 3 days 04:05:06.789");
+        assert_eq!(iv.trunc("quarter").unwrap().months, 15);
+        assert_eq!(iv.trunc("hour").unwrap().micros, 4 * 3_600 * MICROS_PER_SEC);
+        assert_eq!(
+            iv.trunc("milliseconds").unwrap().micros % 1_000_000,
+            789_000
+        );
+        assert!(iv.trunc("week").is_none());
     }
 
     #[test]

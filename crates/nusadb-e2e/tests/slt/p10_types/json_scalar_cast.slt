@@ -1,0 +1,60 @@
+# Numbers and booleans cast to the JSON scalar they spell; a text value casts by parsing it as a
+# JSON document. JSON_BUILD_OBJECT / JSONB_BUILD_OBJECT / *_BUILD_ARRAY accept an untyped NULL
+# value and store it as JSON null.
+
+query TTTTTT
+SELECT CAST(1 AS jsonb), CAST(-42 AS json), CAST(9223372036854775807 AS jsonb), CAST(1.50 AS jsonb), CAST(true AS jsonb), CAST(false AS json)
+----
+1 -42 9223372036854775807 1.50 true false
+
+query TTT
+SELECT CAST(CAST(2.5 AS float) AS jsonb), CAST(CAST('NaN' AS float) AS jsonb), CAST(CAST(3 AS smallint) AS jsonb)
+----
+2.5 "NaN" 3
+
+query TT
+SELECT CAST(1 AS jsonb) = '1', jsonb_typeof(CAST(7 AS jsonb))
+----
+1 number
+
+query T
+SELECT CAST(NULL AS jsonb)
+----
+NULL
+
+# Text casts parse the text as a JSON document: a JSON string must be quoted.
+query TT
+SELECT CAST('"x"' AS jsonb), CAST('{"a": [1, true]}' AS jsonb)
+----
+"x" {"a": [1, true]}
+
+statement error invalid Json value
+SELECT CAST('x' AS jsonb)
+
+statement ok
+CREATE TABLE js (id INT PRIMARY KEY, n INT, b BOOL)
+
+statement ok
+INSERT INTO js VALUES (1, 5, true), (2, NULL, NULL)
+
+query ITT
+SELECT id, CAST(n AS jsonb), CAST(b AS json) FROM js ORDER BY id
+----
+1 5 true
+2 NULL NULL
+
+# An untyped NULL value in a JSON builder is JSON null.
+query TTTT
+SELECT JSONB_BUILD_OBJECT('a', NULL), JSON_BUILD_OBJECT('a', NULL, 'b', 2), JSON_BUILD_ARRAY(NULL, 1), JSONB_BUILD_ARRAY(NULL)
+----
+{"a": null} {"a": null, "b": 2} [null, 1] [null]
+
+query T
+SELECT JSONB_BUILD_OBJECT('k', n, 'v', NULL) FROM js ORDER BY id
+----
+{"k": 5, "v": null}
+{"k": null, "v": null}
+
+# A NULL key is still refused.
+statement error
+SELECT JSONB_BUILD_OBJECT(NULL, 1)

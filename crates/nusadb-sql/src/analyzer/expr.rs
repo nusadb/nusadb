@@ -687,7 +687,13 @@ pub(super) fn analyze_coalesce(
         }
     }
     Ok(TypedExpr {
-        kind: TypedExprKind::Coalesce(slots.into_iter().flatten().collect()),
+        kind: TypedExprKind::Coalesce(
+            slots
+                .into_iter()
+                .flatten()
+                .map(|arg| promote_temporal(arg, resolved))
+                .collect(),
+        ),
         ty: resolved,
     })
 }
@@ -1969,12 +1975,16 @@ fn analyze_json_construct(
     }
     // A bare NULL argument becomes JSON `null`, so its SQL type is immaterial — accept it without a
     // cast, the way the reference engine does, instead of rejecting it as an indeterminate NULL.
-    // Confined to the array/scalar forms: an object builder's *key* must not be null, so its
-    // arguments keep the ordinary typing that rejects a bare NULL there.
-    let allow_bare_null = matches!(func, F::ToJson | F::JsonBuildArray);
+    // An object builder's *key* (every even position) must not be null, so a bare NULL there keeps
+    // the ordinary typing that rejects it; its values (odd positions) accept one like the array form.
+    let allow_bare_null = |i: usize| match func {
+        F::ToJson | F::JsonBuildArray => true,
+        F::JsonBuildObject => i % 2 == 1,
+        _ => false,
+    };
     let mut typed = Vec::with_capacity(args.len());
-    for arg in args {
-        if allow_bare_null && matches!(arg, ast::Expr::Literal(ast::Value::Null)) {
+    for (i, arg) in args.iter().enumerate() {
+        if allow_bare_null(i) && matches!(arg, ast::Expr::Literal(ast::Value::Null)) {
             typed.push(TypedExpr {
                 kind: TypedExprKind::Literal(ast::Value::Null),
                 ty: ColumnType::Text,
@@ -2701,7 +2711,11 @@ fn analyze_conditional_function(
     Ok(TypedExpr {
         kind: TypedExprKind::ScalarFunction {
             func,
-            args: slots.into_iter().flatten().collect(),
+            args: slots
+                .into_iter()
+                .flatten()
+                .map(|arg| promote_temporal(arg, resolved))
+                .collect(),
         },
         ty: resolved,
     })
@@ -3115,6 +3129,10 @@ fn analyze_array_literal(
         let t = analyze_expr_agg(elem, scope, catalog, elem_ty, aggregates.as_deref_mut())?;
         elem_ty = Some(unify_result_ty(elem_ty, t.ty, "ARRAY element")?);
         typed.push(t);
+    }
+    // Mixed date/time elements are promoted to the unified element type.
+    if let Some(ty) = elem_ty {
+        typed = typed.into_iter().map(|t| promote_temporal(t, ty)).collect();
     }
     // An empty `ARRAY[]` has no element to infer from, so it takes the element type from an enclosing
     // type hint (e.g. `CAST(ARRAY[] AS INT[])` or assignment to an array column); without one its
@@ -3590,12 +3608,25 @@ fn analyze_temporal_function(
             } else {
                 source
             };
-            // EXTRACT accepts any temporal source; DATE_TRUNC truncates a timestamp.
+            // EXTRACT accepts any temporal source; DATE_TRUNC truncates a timestamp, a time of
+            // day, or an interval (each keeping its type).
             let ok_source = match func {
                 // EXTRACT/DATE_PART also read the fields of an INTERVAL (e.g. `epoch`, `day`, `hour`).
                 F::Extract | F::DatePart => is_temporal(source.ty) || source.ty == Interval,
-                _ => matches!(source.ty, Timestamp | TimestampTz),
+                _ => matches!(source.ty, Timestamp | TimestampTz | Time | Interval),
             };
+            // An interval (and a time of day, read as one) has no `week` field to truncate to: a
+            // week does not divide a month.
+            if func == F::DateTrunc && matches!(source.ty, Time | Interval) && field == "week" {
+                return Err(Error::Unsupported(format!(
+                    "{name}() field `week` is not supported for {}",
+                    if source.ty == Time {
+                        "TIME"
+                    } else {
+                        "INTERVAL"
+                    }
+                )));
+            }
             if !ok_source {
                 return Err(Error::TypeMismatch {
                     context: format!("{name}() source"),
@@ -4386,7 +4417,28 @@ pub(super) fn analyze_case(
     let default_typed = if null_default {
         Some(Box::new(make_null()))
     } else {
-        default_typed
+        default_typed.map(|d| Box::new(promote_temporal(*d, resolved_ty)))
+    };
+    // Mixed date/time results take the unified type; a simple-CASE operand and its WHEN values of
+    // different date/time types compare in their common type.
+    let when_common = operand_typed.as_ref().map(|op| {
+        typed_branches.iter().fold(op.ty, |acc, b| {
+            temporal_common(acc, b.when.ty).unwrap_or(acc)
+        })
+    });
+    let typed_branches: Vec<TypedCaseBranch> = typed_branches
+        .into_iter()
+        .map(|b| TypedCaseBranch {
+            when: match when_common {
+                Some(common) => promote_temporal(b.when, common),
+                None => b.when,
+            },
+            then: promote_temporal(b.then, resolved_ty),
+        })
+        .collect();
+    let operand_typed = match (operand_typed, when_common) {
+        (Some(op), Some(common)) => Some(promote_temporal(op, common)),
+        (op, _) => op,
     };
 
     Ok(TypedExpr {
@@ -4415,6 +4467,9 @@ pub(super) fn unify_result_ty(
         // So e.g. `CASE … THEN 0.5 ELSE 1.0::float END` and `SELECT 0.5 UNION SELECT 1`
         // must still unify rather than raise a spurious TypeMismatch.
         Some(prev) if is_numeric(prev) && is_numeric(next) => Ok(widen_numeric(prev, next)),
+        // Mixed date/time branches take their common type (DATE < TIMESTAMP < TIMESTAMPTZ); the
+        // caller promotes each member to it with `promote_temporal`.
+        Some(prev) if let Some(common) = temporal_common(prev, next) => Ok(common),
         Some(prev) => Err(Error::TypeMismatch {
             context: context.to_owned(),
             expected: prev,
@@ -4642,6 +4697,16 @@ pub(super) fn analyze_in_list(
         }
         typed_list.push(item_typed);
     }
+    // A probe and list items of different date/time types compare in their common type (a DATE
+    // probe against TIMESTAMP items reads the date at midnight), so promote every side to it.
+    let common = typed_list.iter().fold(expr_typed.ty, |acc, item| {
+        temporal_common(acc, item.ty).unwrap_or(acc)
+    });
+    let expr_typed = promote_temporal(expr_typed, common);
+    let typed_list = typed_list
+        .into_iter()
+        .map(|item| promote_temporal(item, common))
+        .collect();
     Ok(TypedExpr {
         kind: TypedExprKind::InList {
             expr: Box::new(expr_typed),
@@ -4691,6 +4756,16 @@ pub(super) fn analyze_between(
             });
         }
     }
+    // Date/time operands of different types compare in their common type (`ts BETWEEN $1 AND $2`
+    // with DATE bounds reads each bound at midnight), so promote all three to it.
+    let common = [low_typed.ty, high_typed.ty]
+        .into_iter()
+        .fold(expr_typed.ty, |acc, ty| {
+            temporal_common(acc, ty).unwrap_or(acc)
+        });
+    let expr_typed = promote_temporal(expr_typed, common);
+    let low_typed = promote_temporal(low_typed, common);
+    let high_typed = promote_temporal(high_typed, common);
     Ok(TypedExpr {
         kind: TypedExprKind::Between {
             expr: Box::new(expr_typed),
@@ -4800,7 +4875,7 @@ pub(super) fn comparable(a: ColumnType, b: ColumnType) -> bool {
     // UUID, JSON and arrays type-checked under `<`/`=` yet were spuriously rejected by
     // BETWEEN/IN/CASE — even though the executor already orders all of them. NUMERIC of
     // differing precision/scale still compares via the numeric arm even when `a != b`.
-    a == b || (is_numeric(a) && is_numeric(b))
+    a == b || (is_numeric(a) && is_numeric(b)) || temporal_common(a, b).is_some()
 }
 
 /// Implicit unknown-literal coercion for a comparison-shaped operand pair.
@@ -5111,30 +5186,10 @@ pub(super) fn analyze_binary(
         }
         right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
         left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
-        // A DATE compared to a TIMESTAMP / TIMESTAMPTZ widens to that type (the date read at
-        // midnight), so `d = TIMESTAMP '…'` type-checks instead of raising a mismatch — the same
-        // implicit widening `DATE + INTERVAL` already relies on.
-        if left_typed.ty == ColumnType::Date
-            && matches!(
-                right_typed.ty,
-                ColumnType::Timestamp | ColumnType::TimestampTz
-            )
-        {
-            left_typed = TypedExpr {
-                kind: TypedExprKind::Cast(Box::new(left_typed), false),
-                ty: right_typed.ty,
-            };
-        } else if right_typed.ty == ColumnType::Date
-            && matches!(
-                left_typed.ty,
-                ColumnType::Timestamp | ColumnType::TimestampTz
-            )
-        {
-            right_typed = TypedExpr {
-                kind: TypedExprKind::Cast(Box::new(right_typed), false),
-                ty: left_typed.ty,
-            };
-        }
+        // Two different date/time types compare in their common type: a DATE widens to TIMESTAMP
+        // (midnight), and a DATE or TIMESTAMP widens to TIMESTAMPTZ in the session time zone, so
+        // `d = ts_col` and `ts < CURRENT_TIMESTAMP` type-check instead of raising a mismatch.
+        (left_typed, right_typed) = promote_temporal_pair(left_typed, right_typed);
     }
     // The vector distance operators have only a `VECTOR <op> VECTOR` form, so a bare string literal
     // next to a `VECTOR` operand is unambiguous: coerce it to that operand's vector type, exactly
@@ -5192,7 +5247,36 @@ pub(super) fn analyze_binary(
     {
         right_typed.ty = key_ty;
     }
-    let ty = check_binary(op, left_typed.ty, right_typed.ty)?;
+    // An untyped `NULL` beside a typed operand first takes that operand's type. When the operator
+    // has no form for two values of that type (`timestamp + timestamp`, `interval * interval`), the
+    // `NULL` takes the first type from `NULL_OPERAND_FALLBACKS` that makes the operator resolve
+    // instead, so `ts + NULL` is a NULL timestamp (`timestamp + interval`) rather than an error.
+    let ty = match check_binary(op, left_typed.ty, right_typed.ty) {
+        Ok(ty) => ty,
+        Err(err) => {
+            let null_left = is_bare_null(left) && !is_bare_null(right);
+            let null_right = is_bare_null(right) && !is_bare_null(left);
+            let resolved = NULL_OPERAND_FALLBACKS.iter().find_map(|&candidate| {
+                let (l, r) = if null_left {
+                    (candidate, right_typed.ty)
+                } else {
+                    (left_typed.ty, candidate)
+                };
+                check_binary(op, l, r).ok().map(|ty| (candidate, ty))
+            });
+            match resolved {
+                Some((candidate, ty)) if null_left || null_right => {
+                    if null_left {
+                        left_typed.ty = candidate;
+                    } else {
+                        right_typed.ty = candidate;
+                    }
+                    ty
+                },
+                _ => return Err(err),
+            }
+        },
+    };
     Ok(TypedExpr {
         kind: TypedExprKind::Binary {
             left: Box::new(left_typed),
@@ -5202,6 +5286,26 @@ pub(super) fn analyze_binary(
         ty,
     })
 }
+
+/// The types an untyped `NULL` operand tries, in order, when taking its sibling's type leaves the
+/// binary operator unresolved. INTERVAL comes first so a `NULL` beside a date/time value resolves
+/// to the date/time arithmetic (`ts + NULL`, `time - NULL`), then the integer for the
+/// `interval * n` / `interval / n` forms, then the remaining scalar types.
+const NULL_OPERAND_FALLBACKS: [ColumnType; 10] = [
+    ColumnType::Interval,
+    ColumnType::Int,
+    ColumnType::Numeric {
+        precision: 0,
+        scale: 0,
+    },
+    ColumnType::Float,
+    ColumnType::Text,
+    ColumnType::Bool,
+    ColumnType::Date,
+    ColumnType::Time,
+    ColumnType::Timestamp,
+    ColumnType::TimestampTz,
+];
 
 /// The default operand type for a binary operator whose operands are *both* a bare `NULL`, or `None`
 /// when the operator leaves two unknowns genuinely ambiguous (arithmetic, bitwise, JSON, vector —
@@ -5249,6 +5353,7 @@ pub(super) fn analyze_is_distinct_from(
     // `=`), so `d IS DISTINCT FROM $1` (date bound as text) type-checks like `$1::date`.
     let right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
     let left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
+    let (left_typed, right_typed) = promote_temporal_pair(left_typed, right_typed);
     // Validate comparability (reuses the `=` type rule); the result type is always BOOL.
     check_comparison(left_typed.ty, right_typed.ty)?;
     Ok(TypedExpr {
@@ -5383,9 +5488,7 @@ pub(super) fn check_binary(
         // BIT strings: `&`/`|`/`#` combine two (equal-length) bit strings, `<<`/`>>` shift by an
         // `INT`, all yielding a bit string; `||` concatenates into a variable-length result.
         Op::BitAnd | Op::BitOr | Op::BitXor if is_bit_type(left) && is_bit_type(right) => Ok(left),
-        Op::ShiftLeft | Op::ShiftRight if is_bit_type(left) && matches!(right, ColumnType::Int) => {
-            Ok(left)
-        },
+        Op::ShiftLeft | Op::ShiftRight if is_bit_type(left) && is_integer_type(right) => Ok(left),
         // Full-text `tsvector || tsvector` concatenates into a `tsvector`. Checked before the
         // bit/array/string `||` arms below.
         Op::Concat if left == ColumnType::Tsvector && right == ColumnType::Tsvector => {
@@ -6014,8 +6117,10 @@ pub(super) fn check_comparison(left: ColumnType, right: ColumnType) -> Result<Co
 
 /// Type rule for INTERVAL / temporal arithmetic, or `None` if `op`/operands are not such a
 /// case (caller falls back to numeric). `+`: `interval+interval→interval`, `T+interval→T` /
-/// `interval+T→T` for a temporal `T` (DATE promotes to TIMESTAMP). `-`: `interval-interval→interval`,
-/// `T-interval→T`.
+/// `interval+T→T` for a temporal `T` (DATE promotes to TIMESTAMP), `date+time→timestamp`,
+/// `date+integer→date`. `-`: `interval-interval→interval`, `T-interval→T`, `date-date→integer`,
+/// `date-integer→date`. `*` and `/`: `interval * number` (either order) and `interval / number`
+/// yield an INTERVAL.
 pub(super) fn check_interval_arith(
     op: ast::BinaryOp,
     left: ColumnType,
@@ -6030,8 +6135,10 @@ pub(super) fn check_interval_arith(
             | (t @ (Timestamp | TimestampTz | Date), Interval) => Some(temporal_result(t)),
             // `time + interval` wraps within the 24-hour clock.
             (Time, Interval) | (Interval, Time) => Some(Time),
+            // `date + time` is the timestamp at that time of the day (commutative).
+            (Date, Time) | (Time, Date) => Some(Timestamp),
             // `date + integer` adds whole days and yields a DATE (commutative).
-            (Date, Int) | (Int, Date) => Some(Date),
+            (Date, n) | (n, Date) if is_integer_type(n) => Some(Date),
             _ => None,
         },
         ast::BinaryOp::Minus => match (left, right) {
@@ -6044,19 +6151,20 @@ pub(super) fn check_interval_arith(
             (Time, Interval) => Some(Time),
             (Time, Time) => Some(Interval),
             // `date - integer` subtracts whole days → DATE; `date - date` is the day count → INTEGER.
-            (Date, Int) => Some(Date),
+            (Date, n) if is_integer_type(n) => Some(Date),
             (Date, Date) => Some(Int),
             _ => None,
         },
-        // `interval * number` scales each component (commutative) → INTERVAL. An INT factor is exact;
-        // a FLOAT or NUMERIC factor scales fractionally (`INTERVAL '1 month' * 1.5`).
-        ast::BinaryOp::Multiply => {
-            let numeric =
-                |t: ColumnType| matches!(t, Int | ColumnType::Float | ColumnType::Numeric { .. });
-            match (left, right) {
-                (Interval, t) | (t, Interval) if numeric(t) => Some(Interval),
-                _ => None,
-            }
+        // `interval * number` scales each component (commutative) → INTERVAL. An integer factor is
+        // exact; a FLOAT or NUMERIC factor scales fractionally (`INTERVAL '1 month' * 1.5`).
+        ast::BinaryOp::Multiply => match (left, right) {
+            (Interval, t) | (t, Interval) if is_numeric(t) => Some(Interval),
+            _ => None,
+        },
+        // `interval / number` divides each component → INTERVAL.
+        ast::BinaryOp::Divide => match (left, right) {
+            (Interval, t) if is_numeric(t) => Some(Interval),
+            _ => None,
         },
         _ => None,
     }
@@ -6484,7 +6592,7 @@ pub(super) fn check_bitwise(
         _ => ">>",
     };
     for ty in [left, right] {
-        if ty != ColumnType::Int {
+        if !is_integer_type(ty) {
             return Err(Error::TypeMismatch {
                 context: format!("bitwise operator `{symbol}`"),
                 expected: ColumnType::Int,
@@ -6492,7 +6600,21 @@ pub(super) fn check_bitwise(
             });
         }
     }
-    Ok(ColumnType::Int)
+    // A shift keeps the width of the value being shifted (the count is only a count), so
+    // `bigint << int` is a BIGINT and `smallint << int` a SMALLINT. `&`/`|`/`#` over mixed widths
+    // promote to the wider one, like integer arithmetic.
+    Ok(match op {
+        ast::BinaryOp::ShiftLeft | ast::BinaryOp::ShiftRight => left,
+        _ => wider_int(left, right),
+    })
+}
+
+/// Whether `ty` is one of the integer widths (`SMALLINT`/`INT`/`BIGINT`).
+const fn is_integer_type(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::SmallInt | ColumnType::Int | ColumnType::BigInt
+    )
 }
 
 /// Type rule for array overlap `&&`: both operands must be arrays of the *same* element type; the
@@ -6566,7 +6688,12 @@ pub(super) fn analyze_unary(
         ast::UnaryOp::BitNot
             if matches!(
                 operand.ty,
-                ColumnType::Int | ColumnType::Macaddr | ColumnType::Macaddr8 | ColumnType::Bit(_)
+                ColumnType::SmallInt
+                    | ColumnType::Int
+                    | ColumnType::BigInt
+                    | ColumnType::Macaddr
+                    | ColumnType::Macaddr8
+                    | ColumnType::Bit(_)
             ) =>
         {
             operand.ty

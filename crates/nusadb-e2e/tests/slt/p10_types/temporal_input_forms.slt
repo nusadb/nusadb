@@ -1,0 +1,108 @@
+# Date/time input forms and arithmetic: sub-second INTERVAL units, a DATE read from text that also
+# carries a time, a one-digit hour, DATE_TRUNC over TIME and INTERVAL, and date + time.
+
+# Millisecond and microsecond interval units, spelled out, plural, or abbreviated.
+query TTTTTT
+SELECT INTERVAL '1 microsecond', INTERVAL '2 microseconds', INTERVAL '1 millisecond', INTERVAL '3 milliseconds', INTERVAL '5 ms', INTERVAL '7 us'
+----
+00:00:00.000001 00:00:00.000002 00:00:00.001 00:00:00.003 00:00:00.005 00:00:00.000007
+
+query TTTTT
+SELECT INTERVAL '1 day 2 hours 3 microseconds', INTERVAL '1 second 500 milliseconds', INTERVAL '1.5 ms', INTERVAL '-3 us', INTERVAL '2 msecs 4 usecs'
+----
+1 day 02:00:00.000003 00:00:01.5 00:00:00.0015 -00:00:00.000003 00:00:00.002004
+
+query TT
+SELECT CAST('250 msec' AS interval), CAST('1 usec' AS interval)
+----
+00:00:00.25 00:00:00.000001
+
+statement error invalid Interval value
+SELECT INTERVAL '1 microfortnight'
+
+# A DATE from text that carries a time of day takes the date part; the time and any offset are
+# ignored, and the text must still be a valid timestamp.
+query TTTT
+SELECT CAST('2024-01-01 10:00' AS date), CAST('2024-01-01T23:59:59' AS date), CAST('2024-01-01 10:00:00+05' AS date), DATE '2024-02-29 12:00:00'
+----
+2024-01-01 2024-01-01 2024-01-01 2024-02-29
+
+statement error invalid Date value
+SELECT CAST('2024-01-01 25:00' AS date)
+
+statement error invalid Date value
+SELECT CAST('2024-01-01 junk' AS date)
+
+# A one-digit hour.
+query TTT
+SELECT TIME '3:16:17', CAST('9:05' AS time), TIMESTAMP '2024-01-01 3:16:17'
+----
+03:16:17 09:05:00 2024-01-01 03:16:17
+
+statement error invalid Time value
+SELECT TIME '123:00:00'
+
+# DATE_TRUNC over a TIME keeps a TIME; over an INTERVAL it keeps an INTERVAL. Each field truncates
+# toward zero, so a negative interval truncates like a positive one.
+query TTTTT
+SELECT DATE_TRUNC('hour', TIME '10:42:13.5'), DATE_TRUNC('minute', TIME '10:42:13.5'), DATE_TRUNC('second', TIME '10:42:13.5'), DATE_TRUNC('milliseconds', TIME '10:42:13.123456'), DATE_TRUNC('day', TIME '10:42:13')
+----
+10:00:00 10:42:00 10:42:13 10:42:13.123 00:00:00
+
+query TTTTT
+SELECT DATE_TRUNC('year', INTERVAL '1 year 5 mons 3 days 04:05:06.789'), DATE_TRUNC('quarter', INTERVAL '1 year 5 mons 3 days 04:05:06.789'), DATE_TRUNC('month', INTERVAL '1 year 5 mons 3 days 04:05:06.789'), DATE_TRUNC('day', INTERVAL '1 year 5 mons 3 days 04:05:06.789'), DATE_TRUNC('hour', INTERVAL '1 year 5 mons 3 days 04:05:06.789')
+----
+1 year 1 year 3 mons 1 year 5 mons 1 year 5 mons 3 days 1 year 5 mons 3 days 04:00:00
+
+query TTTT
+SELECT DATE_TRUNC('minute', INTERVAL '1 day 04:05:06.789'), DATE_TRUNC('second', INTERVAL '04:05:06.789'), DATE_TRUNC('milliseconds', INTERVAL '00:00:06.789123'), DATE_TRUNC('hour', INTERVAL '100:30:00')
+----
+1 day 04:05:00 04:05:06 00:00:06.789 100:00:00
+
+query TTTT
+SELECT DATE_TRUNC('quarter', INTERVAL '-1 year -5 mons -3 days'), DATE_TRUNC('hour', INTERVAL '-04:05:06'), DATE_TRUNC('decade', INTERVAL '25 years 3 mons'), DATE_TRUNC('century', INTERVAL '250 years')
+----
+-1 years -3 mons -04:00:00 20 years 200 years
+
+query TT
+SELECT DATE_TRUNC('hour', CAST(NULL AS time)), DATE_TRUNC('hour', CAST(NULL AS interval))
+----
+NULL NULL
+
+statement error not supported
+SELECT DATE_TRUNC('week', INTERVAL '10 days')
+
+statement error not supported
+SELECT DATE_TRUNC('week', TIME '10:00:00')
+
+# date + time is the TIMESTAMP at that time of day; date - date is the day count; date +/- an
+# integer moves whole days; time +/- interval wraps around the clock.
+statement ok
+CREATE TABLE dtm (id INT PRIMARY KEY, d DATE, t TIME, n BIGINT)
+
+statement ok
+INSERT INTO dtm VALUES (1, DATE '2000-01-01', TIME '10:30:00', 40), (2, NULL, TIME '23:00:00', NULL)
+
+query TTT
+SELECT DATE '2000-01-01' + TIME '10:30:00', TIME '10:30:00' + DATE '2000-01-01', d + t FROM dtm WHERE id = 1
+----
+2000-01-01 10:30:00 2000-01-01 10:30:00 2000-01-01 10:30:00
+
+query TT
+SELECT d + t, t + d FROM dtm WHERE id = 2
+----
+NULL NULL
+
+query IITTTT
+SELECT DATE '2000-03-01' - DATE '2000-02-01', DATE '2000-01-01' - DATE '2000-03-01', DATE '2000-01-31' + 1, 1 + DATE '2000-01-31', DATE '2000-03-01' - 1, d + n FROM dtm WHERE id = 1
+----
+29 -60 2000-02-01 2000-02-01 2000-02-29 2000-02-10
+
+query TTTT
+SELECT TIME '23:30:00' + INTERVAL '1 hour', INTERVAL '90 minutes' + TIME '23:00:00', TIME '00:30:00' - INTERVAL '1 hour', t + INTERVAL '2 hours' FROM dtm ORDER BY id
+----
+00:30:00 00:30:00 23:30:00 12:30:00
+00:30:00 00:30:00 23:30:00 01:00:00
+
+statement error type mismatch
+SELECT DATE '2000-01-01' - TIME '10:00:00'
