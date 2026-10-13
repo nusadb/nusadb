@@ -849,6 +849,25 @@ impl TupleScan for MaterializedScan {
     }
 }
 
+/// A transaction made durable by `PREPARE TRANSACTION` and waiting for `COMMIT PREPARED` or
+/// `ROLLBACK PREPARED`, as [`StorageEngine::list_prepared`] reports it.
+///
+/// A prepared transaction belongs to no session: its writes stay invisible and its locks stay
+/// held until one of the two finishing statements names its global identifier, from any session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedTransaction {
+    /// The global transaction identifier given to `PREPARE TRANSACTION`.
+    pub gid: String,
+    /// The engine transaction id the prepared work runs under.
+    pub txn: TxnId,
+    /// The role that prepared it; it, or a superuser, may finish it.
+    pub owner: String,
+    /// The database it was prepared in.
+    pub database: String,
+    /// When it was prepared, in milliseconds since the Unix epoch.
+    pub prepared_at_unix_ms: u64,
+}
+
 /// The top-level port the SQL engine uses to drive the storage + transaction spine.
 ///
 /// One implementation is the production clustered B-link/B+tree engine in `nusadb-btree`
@@ -884,6 +903,25 @@ pub trait StorageEngine: Send + Sync {
     /// `SERIALIZABLE`, and simple engines / test doubles with no MVCC snapshots, implement it as an
     /// explicit `Ok(())`.
     fn begin_statement(&self, txn: TxnId) -> Result<()>;
+
+    /// Make `txn`'s reads see the latest committed state (plus its own writes) until the matching
+    /// [`end_fresh_reads`](Self::end_fresh_reads), whatever its isolation level: what a DDL
+    /// statement needs once it holds its exclusive table locks, to validate, rewrite or index rows.
+    /// Its statement snapshot was taken before the locks, so a writer that committed in between is
+    /// missing from it, and the lock no longer conflicts with a writer that has finished. Calls
+    /// nest: only the outermost `end_fresh_reads` puts the previous snapshot back.
+    ///
+    /// The default does nothing, which suits an engine with no snapshots.
+    fn begin_fresh_reads(&self, txn: TxnId) -> Result<()> {
+        let _ = txn;
+        Ok(())
+    }
+
+    /// End a [`begin_fresh_reads`](Self::begin_fresh_reads). The default does nothing.
+    fn end_fresh_reads(&self, txn: TxnId) -> Result<()> {
+        let _ = txn;
+        Ok(())
+    }
 
     /// The isolation level `txn` runs at, or `None` if the engine does not track it (or `txn` is
     /// unknown). The SQL layer consults this to avoid a secondary-index scan under a frozen
@@ -1620,6 +1658,57 @@ pub trait StorageEngine: Send + Sync {
         Ok(0)
     }
 
+    /// Prepare `txn` for a two-phase commit under the global identifier `gid`: its writes become
+    /// durable but stay invisible, its locks stay held, and it leaves the calling session, which
+    /// may then go on with other work. `owner` and `database` are recorded with it and reported by
+    /// [`list_prepared`](Self::list_prepared). A later
+    /// [`commit_prepared`](Self::commit_prepared) or [`rollback_prepared`](Self::rollback_prepared),
+    /// from any session and across a restart, finishes it.
+    ///
+    /// On any failure the engine rolls `txn` back before returning the error, as
+    /// [`commit`](Self::commit) does. A refusal is an [`Error::Io`] whose kind says why, so a
+    /// caller can map it to a SQLSTATE: [`std::io::ErrorKind::AlreadyExists`] for an identifier in
+    /// use, [`std::io::ErrorKind::InvalidData`] for one too long,
+    /// [`std::io::ErrorKind::Unsupported`] for a transaction that cannot be prepared (it changed
+    /// the schema, or wrote a temporary table), [`std::io::ErrorKind::InvalidInput`] when prepared
+    /// transactions are disabled, [`std::io::ErrorKind::QuotaExceeded`] when too many are waiting.
+    /// The default reports that the engine cannot prepare.
+    fn prepare_transaction(
+        &self,
+        txn: TxnId,
+        gid: &str,
+        owner: &str,
+        database: &str,
+    ) -> Result<()> {
+        let _ = (txn, gid, owner, database);
+        Err(unsupported("PREPARE TRANSACTION"))
+    }
+
+    /// Commit the prepared transaction named `gid`, making its writes visible and releasing its
+    /// locks. With `owner` given, only a transaction prepared by that role is finished, checked
+    /// atomically with the finish; `None` finishes it whoever prepared it (a superuser's call). An
+    /// unknown `gid` is an error of kind [`std::io::ErrorKind::NotFound`], another owner's
+    /// [`std::io::ErrorKind::PermissionDenied`]. The default reports that the engine cannot
+    /// prepare.
+    fn commit_prepared(&self, gid: &str, owner: Option<&str>) -> Result<()> {
+        let _ = (gid, owner);
+        Err(unsupported("COMMIT PREPARED"))
+    }
+
+    /// Roll back the prepared transaction named `gid`, discarding its writes and releasing its
+    /// locks. `owner` and the errors are as for [`commit_prepared`](Self::commit_prepared). The
+    /// default reports that the engine cannot prepare.
+    fn rollback_prepared(&self, gid: &str, owner: Option<&str>) -> Result<()> {
+        let _ = (gid, owner);
+        Err(unsupported("ROLLBACK PREPARED"))
+    }
+
+    /// Every transaction prepared and not yet finished, oldest first. The default, for an engine
+    /// that cannot prepare, is none.
+    fn list_prepared(&self) -> Result<Vec<PreparedTransaction>> {
+        Ok(Vec::new())
+    }
+
     /// Fold the durable log into a checkpoint image and truncate it, so recovery replays only the
     /// records written since — the operator-triggered counterpart of the engine's own maintenance.
     ///
@@ -1627,7 +1716,8 @@ pub trait StorageEngine: Send + Sync {
     /// the SQL layer's in-memory test double) says honestly that it has nothing to checkpoint; the
     /// durable engine overrides it. It requires a quiesced engine and may fail (e.g. with a
     /// would-block error) when a transaction is active, so a caller must be prepared for a
-    /// legitimate refusal.
+    /// legitimate refusal. A prepared transaction (see
+    /// [`prepare_transaction`](Self::prepare_transaction)) is not active in this sense.
     fn checkpoint(&self) -> Result<()> {
         Err(unsupported("checkpoint"))
     }

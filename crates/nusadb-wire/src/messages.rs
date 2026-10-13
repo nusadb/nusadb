@@ -77,6 +77,8 @@ const T_COPY_OUT_DONE: u8 = b'c';
 // listening connection between statements (when the connection is idle), carrying the notifying
 // backend's pid, the channel name, and its (possibly empty) payload.
 const T_NOTIFICATION_RESPONSE: u8 = b'A';
+/// A notice from the statement being run (protocol 1.3).
+const T_NOTICE_RESPONSE: u8 = b'N';
 
 /// What a [`FrontendMessage::Describe`] or [`FrontendMessage::Close`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,6 +558,17 @@ pub enum BackendMessage {
         /// The notification payload (empty string when `NOTIFY` carried none).
         payload: String,
     },
+    /// A notice raised by the statement being run (protocol 1.3): `DROP TABLE IF EXISTS` of a
+    /// missing table, a procedure's `RAISE NOTICE`. Sent only on a connection that negotiated
+    /// `minor >= 3`, ahead of the `CommandComplete` (or `Error`) of the statement that raised it.
+    NoticeResponse {
+        /// `NOTICE`, `WARNING` or `INFO`.
+        severity: String,
+        /// 5-character SQLSTATE (`00000` when it reports nothing wrong).
+        code: String,
+        /// Human-readable message.
+        message: String,
+    },
 }
 
 impl BackendMessage {
@@ -672,6 +685,16 @@ impl BackendMessage {
                 put_str(&mut p, payload)?;
                 T_NOTIFICATION_RESPONSE
             },
+            Self::NoticeResponse {
+                severity,
+                code,
+                message,
+            } => {
+                put_str(&mut p, severity)?;
+                put_str(&mut p, code)?;
+                put_str(&mut p, message)?;
+                T_NOTICE_RESPONSE
+            },
         };
         Ok(Frame::new(ty, p.freeze()))
     }
@@ -762,6 +785,11 @@ impl BackendMessage {
                 pid: get_u32(&mut p, T_NOTIFICATION_RESPONSE)?,
                 channel: get_str(&mut p, T_NOTIFICATION_RESPONSE)?,
                 payload: get_str(&mut p, T_NOTIFICATION_RESPONSE)?,
+            }),
+            T_NOTICE_RESPONSE => Ok(Self::NoticeResponse {
+                severity: get_str(&mut p, T_NOTICE_RESPONSE)?,
+                code: get_str(&mut p, T_NOTICE_RESPONSE)?,
+                message: get_str(&mut p, T_NOTICE_RESPONSE)?,
             }),
             other => Err(WireError::UnknownMessageType(other)),
         }

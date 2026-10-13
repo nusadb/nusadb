@@ -59,7 +59,7 @@ statement*, which is a different instruction:
 | --- | --- | --- |
 | `25P02` | a statement already failed, so the transaction is aborted and every later statement is refused | `ROLLBACK` (or roll back to a `SAVEPOINT` taken before the failure), then start again |
 | `25P01` | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` outside a transaction block | open a transaction first; there is no savepoint scope without one |
-| `25001` | `SET TRANSACTION ISOLATION LEVEL` after the transaction has already run a query | issue it before the transaction's first statement |
+| `25001` | `SET TRANSACTION ISOLATION LEVEL` after the transaction has already run a query, or `COMMIT PREPARED` / `ROLLBACK PREPARED` inside a transaction block | issue it before the transaction's first statement, or outside the block |
 
 Two things the server does **not** treat as errors, which a client should not code around:
 
@@ -156,6 +156,67 @@ FETCH NEXT FROM c;
 CLOSE c;
 COMMIT;
 ```
+
+## Two-phase commit
+
+`PREPARE TRANSACTION` is the first phase of a two-phase commit, for an external coordinator (an
+XA transaction manager, a saga runner) that must make a transaction durable before it decides its
+outcome. It ends the transaction on the connection without ending the transaction itself: the
+writes are durable but invisible to everyone, the rows it changed or locked stay locked, and it
+waits under its global identifier for the second phase, which any connection may run.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 7;
+PREPARE TRANSACTION 'transfer-42';   -- the connection is idle again
+
+-- later, from this or any other connection, after the coordinator decided
+COMMIT PREPARED 'transfer-42';       -- or ROLLBACK PREPARED 'transfer-42'
+```
+
+A prepared transaction survives a crash and a restart: after recovery it is still prepared, its
+writes still invisible and its locks held again, until it is finished. Checkpoints go on while it
+waits, and the log is truncated as usual; the checkpoint image carries the transaction. A standby
+applies it from the primary's log and shows it prepared; it is finished on the primary (or on the
+standby once promoted).
+
+`SELECT * FROM nusadb_prepared_xacts` lists the database's prepared transactions: `transaction`,
+`gid`, `prepared` (when it was prepared), `owner` (the role that prepared it) and `database`. A
+superuser sees every row, any other role its own.
+
+| Situation | SQLSTATE |
+| --- | --- |
+| `PREPARE TRANSACTION` with no transaction open (an error, not a warning, so a coordinator never believes it prepared a branch that does not exist) | `25P01` |
+| `PREPARE TRANSACTION` in a failed transaction: it is rolled back and the tag is `ROLLBACK` | none |
+| an identifier longer than 200 bytes | `22023` |
+| an identifier already in use | `42710` |
+| the transaction changed the schema, a sequence or statistics, wrote a temporary table, ran `LISTEN` / `UNLISTEN` / `NOTIFY`, or declared a cursor `WITH HOLD` | `0A000` |
+| `--max-prepared-transactions` reached | `53400` |
+| prepared transactions disabled (`--max-prepared-transactions 0`) | `55000` |
+| `COMMIT PREPARED` / `ROLLBACK PREPARED` of an unknown identifier | `42704` |
+| `COMMIT PREPARED` / `ROLLBACK PREPARED` inside a transaction block (the block is then failed) | `25001` |
+| finishing another role's prepared transaction without being a superuser | `42501` |
+| `DROP TABLE`, `TRUNCATE`, `ALTER TABLE` (adding a `CHECK`, `UNIQUE`, primary key or foreign key, or attaching or detaching a partition included), `CREATE INDEX`, `DROP INDEX`, `LOCK TABLE ... ACCESS EXCLUSIVE` or `DROP SCHEMA ... CASCADE` on a table a prepared transaction wrote; a foreign key added over existing rows also when it wrote the referenced table | `55006` |
+| `DROP DATABASE` of a database with a prepared transaction waiting in it | `55006` |
+
+A refused `PREPARE TRANSACTION` rolls the transaction back, whatever the reason. While a prepared
+transaction waits, the tables it wrote cannot be dropped, truncated, altered or (re)indexed, and its
+database cannot be dropped: such a statement fails at once with `55006` (object in use) rather than
+waiting, and succeeds after `COMMIT PREPARED` or `ROLLBACK PREPARED`. The same DDL next to an
+ordinary transaction that has written the table but not ended fails with the usual no-wait `40001`,
+because a statement that drops, reshapes, re-indexes or validates a table takes it exclusively. Once
+it holds the table, such a statement reads the latest committed rows (plus its own transaction's),
+not the snapshot its transaction or statement began with, whatever the isolation level: a writer
+that committed just before the lock was taken is therefore included when a constraint is validated
+(`ADD CHECK`, `SET NOT NULL`, `ADD UNIQUE`, `ADD FOREIGN KEY`, `ATTACH PARTITION`), when rows are
+rewritten (`ADD COLUMN ... DEFAULT`, a type change), and when an index is built. A
+DDL statement run outside a transaction block is retried like any other autocommit conflict
+(`max_autocommit_retries` attempts, 50 by default, with a growing back-off capped at 5 ms, so
+about a quarter of a second in all) and goes through if the writer ends meanwhile; past that, or
+inside a transaction block, the `40001` is reported for you to retry. A prepared
+transaction is not a long transaction to leave lying around: it keeps its locks and holds back the
+reclamation of old row versions until it is finished, so a coordinator should finish what it
+prepared, and an operator can list the leftovers in `nusadb_prepared_xacts` and roll them back.
 
 ## Timeouts and cancellation
 

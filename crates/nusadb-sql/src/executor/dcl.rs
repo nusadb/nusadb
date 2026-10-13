@@ -386,6 +386,7 @@ pub(super) fn run_create_role(
 ) -> Result<ExecutionResult, Error> {
     if rbac::lookup_role(engine, txn, &plan.name)?.is_some() {
         if plan.if_not_exists {
+            crate::notice::skipped_existing("42710", &format!("role \"{}\"", plan.name));
             return Ok(ExecutionResult::RoleCreated);
         }
         return Err(Error::ObjectExists(format!(
@@ -431,6 +432,7 @@ pub(super) fn run_drop_role(
     for name in &plan.names {
         if rbac::lookup_role(engine, txn, name)?.is_none() {
             if plan.if_exists {
+                crate::notice::skipped_missing(&format!("role \"{name}\""));
                 continue;
             }
             return Err(Error::ObjectNotFound(format!(

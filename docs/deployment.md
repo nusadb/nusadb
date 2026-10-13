@@ -50,6 +50,7 @@ the database.
 | `--backup-interval` | `86400` | Seconds between scheduled backups; the first is taken one interval after start-up. |
 | `--backup-keep` | `7` | How many complete scheduled backups to keep; older ones are removed after each new one. |
 | `--restore-database` / `--restore-to-time` / `--restore-to-lsn` / `--restore-live-log` | none | Offline: rebuild one database from its archive as of a moment or a log position, then exit. See [Point-in-time recovery](#point-in-time-recovery). |
+| `--max-prepared-transactions` | `64` | How many prepared transactions (`PREPARE TRANSACTION`) may wait at once in each database; one more is refused with `53400`. `0` disables two-phase commit (`55000`). A prepared transaction holds its locks and holds back version reclamation until it is finished, so the cap bounds what forgotten ones can pin. |
 | `--checkpoint-max-pause` | `2` | Once the log is past its threshold and three checks in a row found transactions active, hold new transactions for at most this many seconds (capped at 60) so the checkpoint can run. `0` never pauses. |
 | `--metrics-listen` | none | Serve Prometheus metrics on this address, for example `127.0.0.1:9100`. |
 | `--storage-engine` | `btree` | The only value. A data directory written by the removed `lsm` engine is refused with a migration hint. |
@@ -435,7 +436,11 @@ autocommit statement, never an error. A transaction held open longer than the pa
 as an idle client inside `BEGIN`, defeats the pause: the worker logs a warning with the active
 count, doubles the number of busy checks it waits before pausing again (up to about sixteen
 minutes between attempts), and the log keeps growing until that transaction ends. The pause is
-capped at 60 seconds. Each checkpoint writes the pages changed since the last one and the image's
+capped at 60 seconds. A prepared transaction (two-phase commit, see
+[transactions](transactions.md#two-phase-commit)) does not count as running here: it may wait
+on its coordinator indefinitely, so the checkpoint carries it into the new image instead of
+waiting for it, and the log is truncated as usual.
+Each checkpoint writes the pages changed since the last one and the image's
 page directory while the engine is paused, and now and then every page (see the page cache
 section above); on a large database, raise the threshold so the pause is paid less often. Watch the server log at `info` for
 `runtime checkpoint folded the log` and at `debug` for the busy retries. Set either flag to `0` to
@@ -724,6 +729,14 @@ moving that archive aside, or the two histories would meet in one archive.
 [Backup](#checkpoints-backup-and-restore)), replace the binary (or pull a newer image tag) and start
 the server again. Recovery replays the log, so a clean restart keeps every committed transaction.
 
+**Embedding the engine crates.** Code that links the Rust crates directly (rather than talking to
+the server) should note two changes in the release that adds two-phase commit. The
+`nusadb_core::Error` enum gains the variant `ObjectInUse` (SQLSTATE `55006`); the enum is not
+marked non-exhaustive, so a `match` over it with no wildcard arm stops compiling until it handles
+the new variant. The `StorageEngine` trait gains `prepare_transaction`, `commit_prepared`,
+`rollback_prepared` and `list_prepared`, all with default implementations, so an implementation
+of the trait keeps compiling unchanged.
+
 **Data format.** The files of a data directory are written in a numbered data format, and every
 directory records which one:
 
@@ -736,7 +749,7 @@ directory records which one:
 Each file also names the release that last wrote it, for example:
 
 ```text
-nusadb data format 1
+nusadb data format 2
 written by nusadb 0.1.0
 ```
 
@@ -755,6 +768,13 @@ happens depends on how the recorded format compares with the one the release wri
 
 A directory written before formats were recorded has no format files; it is format 1 and is stamped
 the first time a release that records formats opens it.
+
+Format 2 adds the log and checkpoint-image records of prepared transactions (two-phase commit).
+**The first time a release that writes format 2 opens a database, it records format 2 in that
+database's directory, whether or not two-phase commit is ever used. From then on a release that
+reads only format 1 refuses the directory: there is no downgrade.** Back up the data directory
+before the first start of such a release if you may need to go back. Nothing else on disk changes
+in the upgrade.
 
 **When the format changes.** A release that changes how anything on disk is written, in a way an
 older release cannot read, raises the format number, and its release notes say so. Patch releases

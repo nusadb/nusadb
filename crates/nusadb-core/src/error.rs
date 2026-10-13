@@ -136,6 +136,17 @@ pub enum Error {
     /// commit a write or advance a sequence (SQLSTATE `25006`).
     #[error("read-only engine: {0}")]
     ReadOnly(String),
+
+    /// The object is held by a prepared transaction (two-phase commit) that only a
+    /// `COMMIT PREPARED` or `ROLLBACK PREPARED` releases, so the statement is refused rather than
+    /// left to conflict forever: dropping, truncating, altering or indexing a table such a
+    /// transaction wrote, adding a constraint over its rows, or dropping its database (SQLSTATE
+    /// `55006`, object in use).
+    ///
+    /// Added with two-phase commit. The enum is not non-exhaustive, so code matching it with no
+    /// wildcard arm must handle this variant.
+    #[error("object in use: {0}")]
+    ObjectInUse(String),
 }
 
 impl Error {
@@ -153,6 +164,7 @@ impl Error {
             Self::Deadlock { .. } => "40P01",
             Self::DependentObjectsExist(_) => "2BP01",
             Self::ReadOnly(_) => "25006",
+            Self::ObjectInUse(_) => "55006",
             Self::ConstraintViolation(message) => constraint_sqlstate(message),
             _ => "XX000",
         }

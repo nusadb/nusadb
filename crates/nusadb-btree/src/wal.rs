@@ -62,6 +62,41 @@ const TAG_TABLE_ROOT: u8 = 24;
 const TAG_INDEX_ROOT: u8 = 25;
 const TAG_INDEX_IMAGE_ENTRY: u8 = 26;
 const TAG_FREE_AT_OPEN: u8 = 27;
+const TAG_PREPARE_BEGIN: u8 = 28;
+const TAG_PREPARE: u8 = 29;
+
+/// One lock a prepared transaction holds, as its [`LoggedOp::Prepare`] record carries it, so
+/// recovery takes the same lock again before anything can conflict with the transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedLock {
+    /// A row lock (`FOR UPDATE`/`FOR SHARE`, or the exclusive lock every row write takes).
+    Row {
+        /// The row's table.
+        table: u64,
+        /// The page half of the row address.
+        page: u64,
+        /// The slot half of the row address.
+        slot: u16,
+        /// Whether the hold is exclusive.
+        exclusive: bool,
+    },
+    /// A unique-key lock.
+    Key {
+        /// The key's table.
+        table: u64,
+        /// The key's hash.
+        hash: u64,
+        /// Whether the hold is exclusive.
+        exclusive: bool,
+    },
+    /// A table lock (`LOCK TABLE`, or the shared intention every row write takes).
+    Table {
+        /// The table.
+        table: u64,
+        /// Whether the hold is exclusive.
+        exclusive: bool,
+    },
+}
 
 /// One logical, replayable operation of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +392,32 @@ pub enum LoggedOp {
         /// The page ids to free.
         pages: Vec<u64>,
     },
+    /// The start of a prepared transaction's own records: the operations between this and the
+    /// [`LoggedOp::Prepare`] record of the same transaction are its whole effect, written again
+    /// at `PREPARE TRANSACTION` in a canonical form. Every earlier record of the transaction is
+    /// superseded by them, so replay ignores those.
+    PrepareBegin {
+        /// The prepared transaction.
+        txn: u64,
+    },
+    /// The transaction is prepared: its records since its [`LoggedOp::PrepareBegin`] are complete
+    /// and durable, and it waits for a `CommitTxn` (`COMMIT PREPARED`) or an `AbortTxn`
+    /// (`ROLLBACK PREPARED`). Without this record the begin and the operations after it are a
+    /// prepare that never finished, and the transaction never committed.
+    Prepare {
+        /// The prepared transaction.
+        txn: u64,
+        /// Its global identifier.
+        gid: String,
+        /// The role that prepared it.
+        owner: String,
+        /// The database it was prepared in.
+        database: String,
+        /// When it was prepared, in milliseconds since the Unix epoch.
+        prepared_at_ms: u64,
+        /// The locks it holds, taken again at recovery.
+        locks: Vec<PreparedLock>,
+    },
     /// Image only: an alive entry of index `index` too large for an index page, which the
     /// pages therefore do not hold. Replayed straight into the index's in-memory entries: the
     /// row-to-key map in the pages already names it.
@@ -398,6 +459,8 @@ impl LoggedOp {
             | Self::AlterSchema { txn, .. }
             | Self::SchemaCreate { txn, .. }
             | Self::SchemaDrop { txn, .. }
+            | Self::PrepareBegin { txn }
+            | Self::Prepare { txn, .. }
             | Self::SeqDrop { txn, .. } => *txn,
             // Non-transactional records own no transaction: the reserved id 0 (never begun,
             // never committed) — replay applies them unconditionally instead.
@@ -660,6 +723,29 @@ impl LoggedOp {
                 push_key(&mut key, TAG_SCHEMA_DROP, *txn, *id, None);
                 push_str(&mut value, name);
             },
+            Self::PrepareBegin { txn } => {
+                push_key(&mut key, TAG_PREPARE_BEGIN, *txn, 0, None);
+            },
+            Self::Prepare {
+                txn,
+                gid,
+                owner,
+                database,
+                prepared_at_ms,
+                locks,
+            } => {
+                push_key(&mut key, TAG_PREPARE, *txn, 0, None);
+                push_str(&mut value, gid);
+                push_str(&mut value, owner);
+                push_str(&mut value, database);
+                value.extend_from_slice(&prepared_at_ms.to_le_bytes());
+                value.extend_from_slice(
+                    &u32::try_from(locks.len()).unwrap_or(u32::MAX).to_le_bytes(),
+                );
+                for lock in locks {
+                    encode_prepared_lock(&mut value, *lock);
+                }
+            },
         }
         WalRecord::Put { key, value }
     }
@@ -897,6 +983,33 @@ impl LoggedOp {
                     name: read_str(value, &mut at)?,
                 }
             },
+            TAG_PREPARE_BEGIN => Self::PrepareBegin { txn },
+            TAG_PREPARE => {
+                let mut at = 0;
+                let gid = read_str(value, &mut at)?;
+                let owner = read_str(value, &mut at)?;
+                let database = read_str(value, &mut at)?;
+                let prepared_at_ms = read_u64(value, at)?;
+                at += 8;
+                let count = read_u32_at(value, at)?;
+                at += 4;
+                // No preallocation from the untrusted count.
+                let mut locks = Vec::new();
+                for _ in 0..count {
+                    locks.push(decode_prepared_lock(value, &mut at)?);
+                }
+                if at != value.len() {
+                    return None;
+                }
+                Self::Prepare {
+                    txn,
+                    gid,
+                    owner,
+                    database,
+                    prepared_at_ms,
+                    locks,
+                }
+            },
             _ => return None,
         })
     }
@@ -913,6 +1026,20 @@ fn push_key(key: &mut Vec<u8>, tag: u8, txn: u64, table: u64, row_id: Option<u64
 
 fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// The transaction a [`LoggedOp::Prepare`] record prepares, read from its key alone, or `None`
+/// for any other record: the cheap test a scan over a whole log makes before decoding anything.
+#[must_use]
+pub fn prepare_marker_txn(record: &WalRecord) -> Option<u64> {
+    let WalRecord::Put { key, .. } = record else {
+        return None;
+    };
+    let (&tag, rest) = key.split_first()?;
+    if tag != TAG_PREPARE {
+        return None;
+    }
+    read_u64(rest, 0)
 }
 
 /// Build the [`LoggedOp::InsertBatch`] record directly from borrowed tuples.
@@ -940,6 +1067,75 @@ pub fn insert_batch_record(
         value.extend_from_slice(tuple);
     }
     WalRecord::Put { key, value }
+}
+
+/// Encode one [`PreparedLock`]: a kind byte, an exclusive byte, then the kind's fields.
+fn encode_prepared_lock(out: &mut Vec<u8>, lock: PreparedLock) {
+    match lock {
+        PreparedLock::Row {
+            table,
+            page,
+            slot,
+            exclusive,
+        } => {
+            out.push(0);
+            out.push(u8::from(exclusive));
+            out.extend_from_slice(&table.to_le_bytes());
+            out.extend_from_slice(&page.to_le_bytes());
+            out.extend_from_slice(&slot.to_le_bytes());
+        },
+        PreparedLock::Key {
+            table,
+            hash,
+            exclusive,
+        } => {
+            out.push(1);
+            out.push(u8::from(exclusive));
+            out.extend_from_slice(&table.to_le_bytes());
+            out.extend_from_slice(&hash.to_le_bytes());
+        },
+        PreparedLock::Table { table, exclusive } => {
+            out.push(2);
+            out.push(u8::from(exclusive));
+            out.extend_from_slice(&table.to_le_bytes());
+        },
+    }
+}
+
+fn decode_prepared_lock(bytes: &[u8], at: &mut usize) -> Option<PreparedLock> {
+    let kind = *bytes.get(*at)?;
+    let exclusive = match *bytes.get(*at + 1)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    *at += 2;
+    let table = read_u64(bytes, *at)?;
+    *at += 8;
+    Some(match kind {
+        0 => {
+            let page = read_u64(bytes, *at)?;
+            let slot = u16::from_le_bytes(bytes.get(*at + 8..*at + 10)?.try_into().ok()?);
+            *at += 10;
+            PreparedLock::Row {
+                table,
+                page,
+                slot,
+                exclusive,
+            }
+        },
+        1 => {
+            let hash = read_u64(bytes, *at)?;
+            *at += 8;
+            PreparedLock::Key {
+                table,
+                hash,
+                exclusive,
+            }
+        },
+        2 => PreparedLock::Table { table, exclusive },
+        _ => return None,
+    })
 }
 
 fn read_u32_at(bytes: &[u8], at: usize) -> Option<u32> {

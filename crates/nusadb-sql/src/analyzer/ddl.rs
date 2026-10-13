@@ -781,7 +781,10 @@ pub(super) fn analyze_alter_table(
     let display = super::qualified_display_opt(at.schema.as_deref(), &at.name);
     let Some(table) = super::lookup_table_ref(at.schema.as_deref(), &at.name, catalog)? else {
         if at.if_exists {
-            return Ok(AlterTablePlan::Noop);
+            return Ok(AlterTablePlan::Noop {
+                code: crate::notice::SUCCESSFUL_COMPLETION,
+                message: format!("relation \"{}\" does not exist, skipping", at.name),
+            });
         }
         return Err(Error::TableNotFound { name: display });
     };
@@ -845,7 +848,13 @@ pub(super) fn analyze_alter_table(
             }
             if table.columns.iter().any(|c| c.name == column.name) {
                 if if_not_exists {
-                    return Ok(AlterTablePlan::Noop);
+                    return Ok(AlterTablePlan::Noop {
+                        code: "42701",
+                        message: format!(
+                            "column \"{}\" of relation \"{}\" already exists, skipping",
+                            column.name, table.name
+                        ),
+                    });
                 }
                 return Err(Error::DuplicateColumn { name: column.name });
             }
@@ -862,7 +871,13 @@ pub(super) fn analyze_alter_table(
         } => {
             let Some(index) = table.columns.iter().position(|c| c.name == name) else {
                 if if_exists {
-                    return Ok(AlterTablePlan::Noop);
+                    return Ok(AlterTablePlan::Noop {
+                        code: crate::notice::SUCCESSFUL_COMPLETION,
+                        message: format!(
+                            "column \"{name}\" of relation \"{}\" does not exist, skipping",
+                            table.name
+                        ),
+                    });
                 }
                 return Err(Error::ColumnNotFound {
                     table: display,

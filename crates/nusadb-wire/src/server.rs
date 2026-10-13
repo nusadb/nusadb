@@ -785,6 +785,9 @@ where
     // `minor >= 2` additionally carries an ARRAY column's element type in its tag (protocol 1.2), so a
     // client decodes the elements at their real type rather than as text.
     let array_element_types = client_minor.min(PROTOCOL_VERSION.1) >= 2;
+    // `minor >= 3` receives the notices a statement raises (protocol 1.3), each a `NoticeResponse`
+    // ahead of the statement's completion. An older client never sees one.
+    let notices_enabled = client_minor.min(PROTOCOL_VERSION.1) >= 3;
 
     // Register this connection's cancel token and hand the client its key. The token is
     // checked by the executor; the registration deregisters on drop at connection end.
@@ -930,6 +933,7 @@ where
                         statement_timeout,
                         typed: typed_row_description,
                         array_elements: array_element_types,
+                        notices: notices_enabled,
                         settings: &settings,
                         cursors: &cursors,
                         prepared: &prepared,
@@ -1046,6 +1050,13 @@ where
                         },
                     }
                 } else if let Some(stmt) = pubsub_statement(&sql) {
+                    // A transaction that ran LISTEN/UNLISTEN/NOTIFY cannot be prepared: its
+                    // effects belong to this connection, which the prepared transaction leaves.
+                    if in_transaction_block(&txn_state)
+                        && let Ok(mut store) = settings.lock()
+                    {
+                        store.insert(TXN_PUBSUB_SETTING.to_owned(), "1".to_owned());
+                    }
                     // LISTEN / UNLISTEN / NOTIFY (async pub/sub): intercepted here because the channel
                     // registry spans connections and lives in the wire server, not the SQL engine. The
                     // reply is a bare command tag; any actual notification arrives asynchronously via
@@ -1089,6 +1100,7 @@ where
                         txn_state,
                         typed_row_description,
                         array_element_types,
+                        notices_enabled,
                         plan_cache,
                         &settings,
                         &cursors,
@@ -1125,7 +1137,12 @@ where
                             },
                             // COMMIT of a failed transaction is a rollback; ROLLBACK and a fresh BEGIN
                             // both drop anything queued.
-                            Some(TxnControl::Commit | TxnControl::Rollback | TxnControl::Begin) => {
+                            Some(
+                                TxnControl::Commit
+                                | TxnControl::Rollback
+                                | TxnControl::Begin
+                                | TxnControl::Prepare,
+                            ) => {
                                 pending_notify.discard();
                             },
                             Some(TxnControl::Savepoint(name)) => pending_notify.savepoint(name),
@@ -1307,6 +1324,7 @@ where
                         txn_state,
                         typed_row_description,
                         array_element_types,
+                        notices_enabled,
                         plan_cache,
                         &settings,
                         &cursors,
@@ -1351,6 +1369,7 @@ where
                                 rows: VecDeque::new(),
                                 tag: String::new(),
                                 completed: true,
+                                notices: Vec::new(),
                             });
                         }
                     } else {
@@ -1370,7 +1389,7 @@ where
                     .then(|| portals.get(&portal).map(|p| p.sql.clone()))
                     .flatten();
                 let old_state = txn_state;
-                let (executed, new_state) = ensure_executed(
+                let (executed, new_state, raised) = ensure_executed(
                     &engine,
                     &cluster,
                     &database,
@@ -1382,9 +1401,15 @@ where
                     txn_state,
                     &settings,
                     &stores,
+                    notices_enabled,
                 )
                 .await;
                 txn_state = new_state;
+                // Only a failed statement's notices are left here, to go right before its error;
+                // a successful one's are sent by `drain_portal` right before its completion.
+                for notice in raised {
+                    conn.write_frame(&notice.encode()?).await?;
+                }
                 settle_cursors_after_stmt(
                     &cursors,
                     on_commit_sql.as_deref().and_then(txn_control_kind).as_ref(),
@@ -1955,6 +1980,9 @@ struct PortalResult {
     /// Set once the portal has been fully drained and its `CommandComplete` emitted, so a second
     /// `Execute` on the same portal does not replay rows or re-send the command tag.
     completed: bool,
+    /// The statement's notices (protocol 1.3), sent right before its `CommandComplete`: after its
+    /// last row, and so on the `Execute` that drains the portal.
+    notices: Vec<BackendMessage>,
 }
 
 /// The statement-effective timeout: a session `SET statement_timeout` overrides the server's
@@ -1999,7 +2027,12 @@ async fn run_blocking(
     state: TxnState,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     stores: &SessionStores,
-) -> (Result<ExecutionResult, (String, &'static str)>, TxnState) {
+    notices: bool,
+) -> (
+    Result<ExecutionResult, (String, &'static str)>,
+    TxnState,
+    Vec<BackendMessage>,
+) {
     // The per-connection cancel flag. Reset it for this statement: a cancel that
     // arrived between statements (when nothing was running) must not abort this one. It is tripped
     // by the statement-timeout timer below or by an out-of-band `CancelRequest` mid-statement.
@@ -2017,8 +2050,10 @@ async fn run_blocking(
     let database = database.to_owned();
     let settings = Arc::clone(settings);
     let stores = stores.clone();
-    let (result, new_state) = tokio::task::spawn_blocking(move || {
+    let (result, new_state, raised) = tokio::task::spawn_blocking(move || {
         let _cancel_guard = nusadb_sql::cancel::scope(cancel);
+        // A pool thread may hold notices an earlier statement left behind; this one's start clean.
+        nusadb_sql::notice::clear();
         let (outcome, new_state) = run_query_txn(
             engine.as_ref(),
             cluster.as_ref(),
@@ -2033,6 +2068,7 @@ async fn run_blocking(
         (
             outcome.map_err(|e| (e.to_string(), e.sqlstate())),
             new_state,
+            notice_messages(notices),
         )
     })
     .await
@@ -2040,6 +2076,7 @@ async fn run_blocking(
         (
             Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
             state,
+            Vec::new(),
         )
     });
 
@@ -2047,7 +2084,25 @@ async fn run_blocking(
     if let Some(timer) = timer {
         timer.abort();
     }
-    (result, new_state)
+    (result, new_state, raised)
+}
+
+/// Take the notices the statement just run on this thread raised, as `NoticeResponse` messages for
+/// a connection that negotiated protocol minor 3 (`enabled`); for an older one they are dropped,
+/// so its byte stream is exactly what it was before notices existed.
+fn notice_messages(enabled: bool) -> Vec<BackendMessage> {
+    let raised = nusadb_sql::notice::take();
+    if !enabled {
+        return Vec::new();
+    }
+    raised
+        .into_iter()
+        .map(|n| BackendMessage::NoticeResponse {
+            severity: n.severity.as_str().to_owned(),
+            code: n.code,
+            message: n.message,
+        })
+        .collect()
 }
 
 /// Compute a portal's output column names **without executing it**: parse → bind → analyze →
@@ -2163,7 +2218,12 @@ async fn ensure_executed(
     state: TxnState,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     stores: &SessionStores,
-) -> (Result<Vec<String>, (String, &'static str)>, TxnState) {
+    notices: bool,
+) -> (
+    Result<Vec<String>, (String, &'static str)>,
+    TxnState,
+    Vec<BackendMessage>,
+) {
     let job = match portals.get(name) {
         Some(p) if p.result.is_none() => {
             Some((p.sql.clone(), p.params.clone(), p.result_formats.clone()))
@@ -2173,13 +2233,15 @@ async fn ensure_executed(
             return (
                 Err((format!("unknown portal {name:?}"), INVALID_CURSOR_NAME)),
                 state,
+                Vec::new(),
             );
         },
     };
     let mut state = state;
+    let mut raised = Vec::new();
     if let Some((sql, params, formats)) = job {
         // The borrow on `portals` is dropped before this await (we cloned `sql`/`params`).
-        let (outcome, new_state) = run_blocking(
+        let (outcome, new_state, notices) = run_blocking(
             engine,
             cluster,
             database,
@@ -2191,17 +2253,21 @@ async fn ensure_executed(
             state,
             settings,
             stores,
+            notices,
         )
         .await;
         state = new_state;
+        raised = notices;
         match outcome {
             Ok(exec_result) => {
-                let result = into_portal_result(exec_result, &formats);
+                let mut result = into_portal_result(exec_result, &formats);
+                // Kept for the `Execute` that sends the completion; an error's go out with it.
+                result.notices = std::mem::take(&mut raised);
                 if let Some(p) = portals.get_mut(name) {
                     p.result = Some(result);
                 }
             },
-            Err(message) => return (Err(message), state),
+            Err(message) => return (Err(message), state, raised),
         }
     }
     let columns = portals
@@ -2209,7 +2275,7 @@ async fn ensure_executed(
         .and_then(|p| p.result.as_ref())
         .map(|r| r.columns.clone())
         .unwrap_or_default();
-    (Ok(columns), state)
+    (Ok(columns), state, raised)
 }
 
 /// Emit up to `max_rows` (`0` = all) buffered rows of `portal` as `DataRow`s, then either
@@ -2237,6 +2303,7 @@ fn drain_portal(portal: &mut Portal, max_rows: u32) -> Vec<BackendMessage> {
     }
     if result.rows.is_empty() {
         result.completed = true;
+        msgs.append(&mut result.notices);
         msgs.push(command_complete(&result.tag));
     } else {
         msgs.push(BackendMessage::PortalSuspended);
@@ -2261,12 +2328,14 @@ fn into_portal_result(result: ExecutionResult, result_formats: &[u16]) -> Portal
                 .collect(),
             tag,
             completed: false,
+            notices: Vec::new(),
         },
         _ => PortalResult {
             columns: Vec::new(),
             rows: VecDeque::new(),
             tag,
             completed: false,
+            notices: Vec::new(),
         },
     }
 }
@@ -2736,6 +2805,66 @@ fn run_query_streaming(
     state: TxnState,
     typed: bool,
     array_elements: bool,
+    notices: bool,
+    plan_cache: nusadb_sql::PlanCache,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+    cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
+    prepared: &std::sync::Mutex<nusadb_sql::PreparedStore>,
+    point_get_gate: bool,
+    bypass_cache: bool,
+) -> StreamedRun {
+    // A thread may hold notices an earlier statement left behind; this one's start clean.
+    nusadb_sql::notice::clear();
+    let run = run_statement_streaming(
+        engine,
+        cluster,
+        database,
+        sql,
+        stmt,
+        user,
+        tx,
+        state,
+        typed,
+        array_elements,
+        plan_cache,
+        settings,
+        cursors,
+        prepared,
+        point_get_gate,
+        bypass_cache,
+    );
+    match run {
+        // The notices go last in the buffered tail: after every row, before the completion.
+        StreamedRun::Done((outcome, mut tail, new_state, cache)) => {
+            tail.extend(notice_messages(notices));
+            StreamedRun::Done((outcome, tail, new_state, cache))
+        },
+        // Nothing ran that the pool will not run again.
+        StreamedRun::Punt(cache) => {
+            nusadb_sql::notice::clear();
+            StreamedRun::Punt(cache)
+        },
+    }
+}
+
+/// The body of [`run_query_streaming`], which wraps it with the statement's notices.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines,
+    reason = "the streaming statement's context, unchanged from the wrapper that passes it on"
+)]
+fn run_statement_streaming(
+    engine: &dyn StorageEngine,
+    cluster: &dyn DatabaseCluster,
+    database: &str,
+    sql: &str,
+    stmt: nusadb_sql::ast::Statement,
+    user: &str,
+    tx: SinkTx,
+    state: TxnState,
+    typed: bool,
+    array_elements: bool,
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &std::sync::Mutex<HashMap<String, String>>,
     cursors: &std::sync::Mutex<nusadb_sql::CursorStore>,
@@ -2771,6 +2900,29 @@ fn run_query_streaming(
         Statement::BeginTransaction(ts) => Some(begin_txn(engine, state, settings, ts)),
         Statement::Commit => Some(commit_txn(engine, state, settings)),
         Statement::Rollback => Some(rollback_txn(engine, state, settings)),
+        Statement::PrepareTransaction(gid) => Some(prepare_txn(
+            engine,
+            state,
+            settings,
+            Some(cursors),
+            gid,
+            &effective_user(user, settings),
+            database,
+        )),
+        Statement::CommitPrepared(gid) => Some(finish_prepared_txn(
+            engine,
+            state,
+            gid,
+            true,
+            &effective_user(user, settings),
+        )),
+        Statement::RollbackPrepared(gid) => Some(finish_prepared_txn(
+            engine,
+            state,
+            gid,
+            false,
+            &effective_user(user, settings),
+        )),
         Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
         // `SET TRANSACTION ...`: re-begin in an untouched transaction, refused after any query
         // or outside a transaction. `SET SESSION CHARACTERISTICS ...` sets the session default.
@@ -3137,6 +3289,8 @@ fn stream_stmt_autocommit(
     let mut current = stmt;
     let mut attempt = 0_u32;
     loop {
+        // A re-attempt reports only its own notices, not the abandoned attempt's.
+        nusadb_sql::notice::clear();
         let txn = match engine.begin(session_isolation(snapshot)) {
             Ok(txn) => txn,
             Err(e) => return StmtRun::Done(Err(e.into()), TxnState::Auto),
@@ -3233,6 +3387,7 @@ fn stream_stmt_autocommit(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
     reason = "a streaming simple-query handler threads connection, engine, statement, user, \
               cancellation, timeout, txn state, and the typed-RowDescription flag — each a distinct \
               concern not worth bundling into a parameter struct; the length is the linear \
@@ -3253,6 +3408,8 @@ async fn stream_query_to_conn<S>(
     state: TxnState,
     typed: bool,
     array_elements: bool,
+    // Protocol minor 3: the statement's notices are sent ahead of its completion.
+    notices: bool,
     mut plan_cache: nusadb_sql::PlanCache,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     cursors: &Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
@@ -3326,6 +3483,7 @@ where
                 state,
                 typed,
                 array_elements,
+                notices,
                 plan_cache,
                 settings,
                 cursors,
@@ -3393,6 +3551,7 @@ where
             state,
             typed,
             array_elements,
+            notices,
             plan_cache,
             &settings,
             &cursors,
@@ -3774,6 +3933,9 @@ enum TxnControl {
     Begin,
     Commit,
     Rollback,
+    /// `PREPARE TRANSACTION`: the transaction leaves the connection, committed or not, so what the
+    /// connection queued for it is dropped like a rollback's.
+    Prepare,
     Savepoint(String),
     Release(String),
     RollbackTo(String),
@@ -3794,6 +3956,7 @@ fn txn_control_kind(sql: &str) -> Option<TxnControl> {
         "abort",
         "savepoint",
         "release",
+        "prepare",
     ]
     .iter()
     .any(|kw| {
@@ -3810,6 +3973,7 @@ fn txn_control_kind(sql: &str) -> Option<TxnControl> {
         Statement::Savepoint(name) => Some(TxnControl::Savepoint(name)),
         Statement::ReleaseSavepoint(name) => Some(TxnControl::Release(name)),
         Statement::RollbackToSavepoint(name) => Some(TxnControl::RollbackTo(name)),
+        Statement::PrepareTransaction(_) => Some(TxnControl::Prepare),
         _ => None,
     }
 }
@@ -3938,7 +4102,7 @@ fn on_commit_after_stmt(
     // 2) End-of-explicit-transaction bookkeeping. A COMMIT of a *failed* transaction is a rollback.
     let explicit_commit =
         ok && old_active && matches!(control, Some(TxnControl::Commit)) && now_auto;
-    let explicit_abort = matches!(control, Some(TxnControl::Rollback))
+    let explicit_abort = matches!(control, Some(TxnControl::Rollback | TxnControl::Prepare))
         || (old_failed && matches!(control, Some(TxnControl::Commit)));
     if explicit_commit {
         reg.committed.append(&mut reg.pending);
@@ -4125,6 +4289,21 @@ fn run_query_txn(
         Statement::BeginTransaction(ts) => begin_txn(engine, state, settings, &ts),
         Statement::Commit => commit_txn(engine, state, settings),
         Statement::Rollback => rollback_txn(engine, state, settings),
+        Statement::PrepareTransaction(gid) => prepare_txn(
+            engine,
+            state,
+            settings,
+            Some(stores.cursors.as_ref()),
+            &gid,
+            &effective_user(user, settings),
+            database,
+        ),
+        Statement::CommitPrepared(gid) => {
+            finish_prepared_txn(engine, state, &gid, true, &effective_user(user, settings))
+        },
+        Statement::RollbackPrepared(gid) => {
+            finish_prepared_txn(engine, state, &gid, false, &effective_user(user, settings))
+        },
         // `SET TRANSACTION ...`: re-begin in an untouched transaction, refused after any query
         // or outside a transaction. `SET SESSION CHARACTERISTICS ...` sets the session default.
         Statement::SetTransaction(ts) => set_transaction_txn(engine, &ts, state),
@@ -4371,6 +4550,11 @@ fn run_session_stmt_in_state(
 /// parameter, so a client cannot reach it with `SET` and assume a role that way — the only writer
 /// is [`record_assumed_role`], reached only after the executor authorized the switch.
 const ASSUMED_ROLE_SETTING: &str = "nusadb.assumed_role";
+
+/// The reserved settings key marking that the open transaction ran `LISTEN`, `UNLISTEN` or
+/// `NOTIFY`, which `PREPARE TRANSACTION` then refuses. Set by the connection loop, cleared at
+/// `BEGIN`; the leading NUL keeps it out of reach of `SET`.
+const TXN_PUBSUB_SETTING: &str = "\u{0}txn_pubsub";
 
 /// The role this connection currently acts as, if `SET ROLE` switched it.
 fn assumed_role(settings: &std::sync::Mutex<HashMap<String, String>>) -> Option<String> {
@@ -4834,6 +5018,9 @@ fn begin_txn(
                 },
                 core_isolation,
             );
+            if let Ok(mut store) = settings.lock() {
+                store.remove(TXN_PUBSUB_SETTING);
+            }
             match engine.begin(level) {
                 Ok(txn) => (
                     Ok(ExecutionResult::TransactionBegun),
@@ -4890,6 +5077,91 @@ fn rollback_txn(
     }
     end_txn_gucs(settings, false);
     (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
+}
+
+/// `PREPARE TRANSACTION 'gid'`: the open transaction becomes a prepared transaction owned by
+/// `owner` and the connection returns to `Auto` whatever the outcome (a refused prepare rolls the
+/// transaction back). Outside a transaction block it is an error (`25P01`), not a warning: a
+/// coordinator that believes it prepared must not go on to `COMMIT PREPARED` a name that does not
+/// exist. In a failed transaction it rolls back and reports `ROLLBACK`, as `COMMIT` does there.
+fn prepare_txn(
+    engine: &dyn StorageEngine,
+    state: TxnState,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+    cursors: Option<&std::sync::Mutex<nusadb_sql::CursorStore>>,
+    gid: &str,
+    owner: &str,
+    database: &str,
+) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
+    match state {
+        TxnState::Auto => (
+            Err(nusadb_sql::Error::NoActiveTransaction(
+                "PREPARE TRANSACTION can only be used in transaction blocks".to_owned(),
+            )),
+            TxnState::Auto,
+        ),
+        TxnState::Failed { txn, .. } => {
+            let _ = engine.rollback(txn);
+            end_txn_gucs(settings, false);
+            (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
+        },
+        TxnState::Active { txn, .. } => {
+            let pubsub = settings
+                .lock()
+                .is_ok_and(|s| s.contains_key(TXN_PUBSUB_SETTING));
+            let hold = cursors
+                .and_then(|c| c.lock().ok())
+                .is_some_and(|c| c.has_pending_hold());
+            let refusal = if pubsub {
+                Some("executed LISTEN, UNLISTEN or NOTIFY")
+            } else if hold {
+                Some("declared a cursor WITH HOLD")
+            } else {
+                None
+            };
+            let result = refusal.map_or_else(
+                || nusadb_sql::two_phase::prepare(engine, txn, gid, owner, database),
+                |what| {
+                    let _ = engine.rollback(txn);
+                    Err(nusadb_sql::two_phase::session_refusal(what))
+                },
+            );
+            end_txn_gucs(settings, result.is_ok());
+            (result, TxnState::Auto)
+        },
+    }
+}
+
+/// `COMMIT PREPARED 'gid'` (`commit`) or `ROLLBACK PREPARED 'gid'`, run by `user`. Only outside a
+/// transaction block: inside one it is refused (`25001`) and, like any error there, fails the
+/// transaction.
+fn finish_prepared_txn(
+    engine: &dyn StorageEngine,
+    state: TxnState,
+    gid: &str,
+    commit: bool,
+    user: &str,
+) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
+    match state {
+        TxnState::Auto => (
+            nusadb_sql::two_phase::finish(engine, gid, commit, user),
+            TxnState::Auto,
+        ),
+        TxnState::Active { txn, isolation, .. } => (
+            Err(nusadb_sql::Error::ActiveTransaction(format!(
+                "{} PREPARED cannot run inside a transaction block",
+                if commit { "COMMIT" } else { "ROLLBACK" }
+            ))),
+            TxnState::Failed { txn, isolation },
+        ),
+        TxnState::Failed { .. } => (
+            Err(nusadb_sql::Error::TransactionAborted(
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .to_owned(),
+            )),
+            state,
+        ),
+    }
 }
 
 /// `CHECKPOINT` — fold the log into an image and truncate it. It runs *outside* any data
@@ -5049,6 +5321,8 @@ fn run_stmt_in_state(
             let mut current = stmt;
             let mut attempt = 0_u32;
             loop {
+                // A re-attempt reports only its own notices, not the abandoned attempt's.
+                nusadb_sql::notice::clear();
                 let txn = match engine.begin(session_isolation(&snapshot)) {
                     Ok(txn) => txn,
                     Err(e) => return (Err(e.into()), TxnState::Auto),
@@ -5410,6 +5684,12 @@ impl Catalog for EngineCatalog<'_> {
         self.user.to_owned()
     }
 
+    fn prepared_transactions(
+        &self,
+    ) -> Result<Vec<nusadb_core::PreparedTransaction>, nusadb_sql::Error> {
+        self.engine.list_prepared().map_err(Into::into)
+    }
+
     fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, nusadb_sql::Error> {
         // Row-level security: read the table's RLS flag under `txn`'s snapshot. Consulted only
         // for a non-superuser (`is_superuser` short-circuits first).
@@ -5440,6 +5720,8 @@ struct SimpleBatch<'a, S> {
     statement_timeout: Option<Duration>,
     typed: bool,
     array_elements: bool,
+    /// Protocol minor 3: each statement's notices go ahead of its completion.
+    notices: bool,
     settings: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     cursors: &'a Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
     prepared: &'a Arc<std::sync::Mutex<nusadb_sql::PreparedStore>>,
@@ -5517,12 +5799,17 @@ where
                 }
             },
             (
-                Some(TxnControl::Savepoint(_) | TxnControl::Release(_) | TxnControl::RollbackTo(_)),
+                Some(
+                    TxnControl::Savepoint(_)
+                    | TxnControl::Release(_)
+                    | TxnControl::RollbackTo(_)
+                    | TxnControl::Prepare,
+                ),
                 true,
             ) => {
-                let e = nusadb_sql::Error::NoActiveTransaction(
-                    "SAVEPOINT can only be used in transaction blocks".to_owned(),
-                );
+                // An implicit transaction is not a transaction block, so there is nothing to
+                // prepare, exactly as for a single `PREPARE TRANSACTION` outside one.
+                let e = needs_block(control.as_ref());
                 batch
                     .conn
                     .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
@@ -5536,7 +5823,10 @@ where
                     }
                     implicit = true;
                 }
-                let ends = matches!(control, Some(TxnControl::Commit | TxnControl::Rollback));
+                let ends = matches!(
+                    control,
+                    Some(TxnControl::Commit | TxnControl::Rollback | TxnControl::Prepare)
+                );
                 let ok = run_batch_statement(batch, piece, control).await?;
                 if ends {
                     implicit = false;
@@ -5558,6 +5848,17 @@ where
         end_implicit(batch, true).await?;
     }
     Ok(())
+}
+
+/// The `25P01` refusal of a savepoint statement or `PREPARE TRANSACTION` in the implicit
+/// transaction of a multi-statement query, which is not a transaction block.
+fn needs_block(control: Option<&TxnControl>) -> nusadb_sql::Error {
+    let what = if matches!(control, Some(TxnControl::Prepare)) {
+        "PREPARE TRANSACTION"
+    } else {
+        "SAVEPOINT"
+    };
+    nusadb_sql::Error::NoActiveTransaction(format!("{what} can only be used in transaction blocks"))
 }
 
 /// Open the implicit transaction of a multi-statement query. Returns whether it opened; on failure
@@ -5702,6 +6003,7 @@ where
         old_state,
         batch.typed,
         batch.array_elements,
+        batch.notices,
         cache,
         batch.settings,
         batch.cursors,
@@ -5733,7 +6035,9 @@ where
             Some(TxnControl::Commit) if was_active => {
                 batch.pending_notify.flush(batch.pid, batch.database);
             },
-            Some(TxnControl::Commit | TxnControl::Rollback | TxnControl::Begin) => {
+            Some(
+                TxnControl::Commit | TxnControl::Rollback | TxnControl::Begin | TxnControl::Prepare,
+            ) => {
                 batch.pending_notify.discard();
             },
             Some(TxnControl::Savepoint(name)) => batch.pending_notify.savepoint(name),
@@ -5782,6 +6086,9 @@ fn command_tag(result: &ExecutionResult) -> String {
         ExecutionResult::Merged(n) => format!("MERGE {n}"),
         ExecutionResult::TransactionBegun => "BEGIN".to_owned(),
         ExecutionResult::TransactionCommitted => "COMMIT".to_owned(),
+        ExecutionResult::TransactionPrepared => "PREPARE TRANSACTION".to_owned(),
+        ExecutionResult::PreparedCommitted => "COMMIT PREPARED".to_owned(),
+        ExecutionResult::PreparedRolledBack => "ROLLBACK PREPARED".to_owned(),
         // A full ROLLBACK and a ROLLBACK TO SAVEPOINT both report the standard `ROLLBACK` tag.
         ExecutionResult::TransactionRolledBack | ExecutionResult::RolledBackToSavepoint => {
             "ROLLBACK".to_owned()

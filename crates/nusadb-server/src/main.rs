@@ -207,6 +207,14 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     checkpoint_max_pause: u64,
 
+    /// How many prepared transactions (`PREPARE TRANSACTION`) may wait at once in each database
+    /// for their `COMMIT PREPARED` or `ROLLBACK PREPARED`. A prepared transaction keeps its locks
+    /// and holds back the reclamation of row versions it may still need until it is finished, so
+    /// the cap bounds what forgotten ones can pin. `0` disables two-phase commit: `PREPARE
+    /// TRANSACTION` is refused with SQLSTATE 55000. Defaults to 64.
+    #[arg(long, default_value_t = nusadb_btree::DEFAULT_MAX_PREPARED_TRANSACTIONS)]
+    max_prepared_transactions: usize,
+
     /// Archive every checkpoint's log segment and image under this directory, one subdirectory
     /// per database, so a database can later be restored to any moment the archive covers
     /// (`--restore-database`). Unset keeps no archive.
@@ -285,6 +293,7 @@ fn durability_options(args: &Args) -> database_manager::DurabilityOptions {
         ),
         wal_archive: args.wal_archive_dir.as_ref().map(std::path::PathBuf::from),
         standby: standby_config(args),
+        max_prepared_transactions: Some(args.max_prepared_transactions),
     }
 }
 

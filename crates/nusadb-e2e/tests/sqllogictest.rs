@@ -117,6 +117,12 @@ impl Catalog for SltCatalog<'_> {
         self.resolve(name)
     }
 
+    fn prepared_transactions(
+        &self,
+    ) -> Result<Vec<nusadb_core::PreparedTransaction>, nusadb_sql::Error> {
+        self.engine.list_prepared().map_err(Into::into)
+    }
+
     fn lookup_table_in(
         &self,
         schema: &str,
@@ -377,6 +383,9 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::TransactionBegun
         | ExecutionResult::TransactionCommitted
         | ExecutionResult::TransactionRolledBack
+        | ExecutionResult::TransactionPrepared
+        | ExecutionResult::PreparedCommitted
+        | ExecutionResult::PreparedRolledBack
         | ExecutionResult::TransactionCharacteristicsSet
         | ExecutionResult::SavepointCreated
         | ExecutionResult::RolledBackToSavepoint
@@ -1185,6 +1194,11 @@ fn slt_p12_isolation_levels() {
 #[test]
 fn slt_p12_savepoint_errors() {
     run_slt("tests/slt/p12_txn/savepoint_errors.slt");
+}
+
+#[test]
+fn slt_p12_two_phase() {
+    run_slt("tests/slt/p12_txn/two_phase.slt");
 }
 
 #[test]

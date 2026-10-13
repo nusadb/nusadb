@@ -307,7 +307,10 @@ fn alter_drop_missing_column_is_rejected() {
 fn alter_drop_missing_column_if_exists_is_noop() {
     assert_eq!(
         alter("ALTER TABLE users DROP COLUMN IF EXISTS ghost"),
-        AlterTablePlan::Noop,
+        AlterTablePlan::Noop {
+            code: "00000",
+            message: "column \"ghost\" of relation \"users\" does not exist, skipping".to_owned(),
+        },
     );
 }
 
@@ -401,7 +404,10 @@ fn alter_missing_table_is_rejected() {
 fn alter_missing_table_if_exists_is_noop() {
     assert_eq!(
         alter("ALTER TABLE IF EXISTS ghost ADD COLUMN x INT"),
-        AlterTablePlan::Noop,
+        AlterTablePlan::Noop {
+            code: "00000",
+            message: "relation \"ghost\" does not exist, skipping".to_owned(),
+        },
     );
 }
 

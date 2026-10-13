@@ -249,6 +249,12 @@ pub enum ExecutionResult {
     TransactionCommitted,
     /// `ROLLBACK` — the active transaction was rolled back.
     TransactionRolledBack,
+    /// `PREPARE TRANSACTION`: the active transaction is prepared and the session left it.
+    TransactionPrepared,
+    /// `COMMIT PREPARED`: a prepared transaction was committed.
+    PreparedCommitted,
+    /// `ROLLBACK PREPARED`: a prepared transaction was rolled back.
+    PreparedRolledBack,
     /// `SET TRANSACTION` — the session's default transaction characteristics were updated.
     TransactionCharacteristicsSet,
     /// `SET` / `RESET` — a session variable was set or reset.
@@ -431,6 +437,9 @@ pub fn execute(plan: PhysicalPlan, engine: &dyn StorageEngine) -> Result<Executi
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
+        | PhysicalPlan::PrepareTransaction(_)
+        | PhysicalPlan::CommitPrepared(_)
+        | PhysicalPlan::RollbackPrepared(_)
         | PhysicalPlan::SetTransaction(_)
         | PhysicalPlan::SetSessionCharacteristics(_) => Err(Error::Internal(
             "transaction-control plan reached an entry point with no session".to_owned(),
@@ -693,6 +702,9 @@ pub fn execute_in_txn(
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
+        | PhysicalPlan::PrepareTransaction(_)
+        | PhysicalPlan::CommitPrepared(_)
+        | PhysicalPlan::RollbackPrepared(_)
         | PhysicalPlan::SetTransaction(_)
         | PhysicalPlan::SetSessionCharacteristics(_) => Err(Error::Internal(
             "transaction-control plan reached an entry point with no session".to_owned(),
@@ -1275,6 +1287,9 @@ pub struct Session<'engine> {
     /// Whether this session has created its temporary schema (a `CREATE TEMP TABLE` succeeded), so
     /// [`drop_temp_schema`](Self::drop_temp_schema) knows there is one to drop on disconnect.
     temp_schema_created: bool,
+    /// Notices the session's statements raised and the caller has not taken yet
+    /// ([`take_notices`](Self::take_notices)).
+    notices: crate::notice::NoticeBuffer,
 }
 
 /// A [`Session`]'s transaction-scoped parameter state (see `Session::txn_gucs`).
@@ -1665,6 +1680,15 @@ impl CursorStore {
         Ok(())
     }
 
+    /// Whether the open transaction declared a cursor `WITH HOLD`: such a cursor outlives its
+    /// transaction, which a prepared transaction cannot promise, so `PREPARE TRANSACTION` refuses.
+    #[must_use]
+    pub fn has_pending_hold(&self) -> bool {
+        self.cursors
+            .values()
+            .any(|cursor| cursor.hold && cursor.pending)
+    }
+
     /// Settle the cursors at the end of a transaction. Every cursor declared without `WITH HOLD`
     /// closes. On commit the held cursors stay open; on rollback the held cursors declared in that
     /// transaction close too, and only those declared by an earlier, committed transaction remain.
@@ -1779,7 +1803,18 @@ impl<'engine> Session<'engine> {
             result_cache: HashMap::new(),
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             temp_schema_created: false,
+            notices: crate::notice::NoticeBuffer::new(),
         }
+    }
+
+    /// Take the notices the session's statements have raised since the last call, oldest first:
+    /// what a wire client at protocol minor 3 receives ahead of each statement's completion (for
+    /// example `table "t" does not exist, skipping` from `DROP TABLE IF EXISTS t`).
+    ///
+    /// At most [`MAX_NOTICES`](crate::notice::MAX_NOTICES) are kept between two calls; past that a
+    /// closing `WARNING` counts the ones dropped.
+    pub fn take_notices(&mut self) -> Vec<crate::notice::Notice> {
+        std::mem::take(&mut self.notices).into_vec()
     }
 
     /// This session's process-unique id.
@@ -1888,8 +1923,20 @@ impl<'engine> Session<'engine> {
         self.variables.get("timezone").cloned()
     }
 
-    /// Execute one plan in this session's transaction context.
+    /// Execute one plan in this session's transaction context. The notices it raises are kept
+    /// for [`take_notices`](Self::take_notices).
     pub fn execute(&mut self, plan: PhysicalPlan) -> Result<ExecutionResult, Error> {
+        // Whatever this thread raised before belongs to someone else: set it aside, keep only this
+        // statement's, and put the rest back.
+        let earlier = crate::notice::take_buffer();
+        let result = self.execute_plan(plan);
+        self.notices.absorb(crate::notice::take_buffer());
+        crate::notice::restore(earlier);
+        result
+    }
+
+    /// The body of [`execute`](Self::execute).
+    fn execute_plan(&mut self, plan: PhysicalPlan) -> Result<ExecutionResult, Error> {
         self.note_statement(&plan);
         // A read-only `SELECT` in auto-commit may be served from / stored in the result cache.
         if matches!(plan, PhysicalPlan::Select(..)) && self.current_txn.is_none() {
@@ -1899,6 +1946,9 @@ impl<'engine> Session<'engine> {
             PhysicalPlan::BeginTransaction(c) => self.begin(c),
             PhysicalPlan::Commit => self.commit(),
             PhysicalPlan::Rollback => self.rollback(),
+            PhysicalPlan::PrepareTransaction(gid) => self.prepare_transaction(&gid),
+            PhysicalPlan::CommitPrepared(gid) => self.finish_prepared(&gid, true),
+            PhysicalPlan::RollbackPrepared(gid) => self.finish_prepared(&gid, false),
             PhysicalPlan::SetTransaction(c) => self.set_transaction(c),
             PhysicalPlan::SetSessionCharacteristics(c) => Ok(self.set_session_characteristics(c)),
             PhysicalPlan::Savepoint(name) => self.savepoint(&name),
@@ -2590,6 +2640,47 @@ impl<'engine> Session<'engine> {
         Ok(ExecutionResult::TransactionRolledBack)
     }
 
+    /// `PREPARE TRANSACTION 'gid'`: the open transaction becomes a prepared transaction owned by the
+    /// session user, and the session returns to auto-commit whether or not it succeeds (a refused
+    /// prepare rolls the transaction back, as the standard has it).
+    fn prepare_transaction(&mut self, gid: &str) -> Result<ExecutionResult, Error> {
+        let txn = self.current_txn.take().ok_or_else(|| {
+            Error::NoActiveTransaction(
+                "PREPARE TRANSACTION can only be used in transaction blocks".to_owned(),
+            )
+        })?;
+        self.txn_read_only = false;
+        let prepared = if self.cursors.has_pending_hold() {
+            let _ = self.engine.rollback(txn);
+            Err(crate::two_phase::session_refusal(
+                "declared a cursor WITH HOLD",
+            ))
+        } else {
+            crate::two_phase::prepare(
+                self.engine,
+                txn,
+                gid,
+                &self.current_user,
+                &self.current_database,
+            )
+        };
+        let kept = prepared.is_ok();
+        self.end_txn_gucs(kept);
+        self.cursors.end_transaction(kept);
+        prepared
+    }
+
+    /// `COMMIT PREPARED` / `ROLLBACK PREPARED`: refused inside a transaction block (`25001`).
+    fn finish_prepared(&self, gid: &str, commit: bool) -> Result<ExecutionResult, Error> {
+        if self.current_txn.is_some() {
+            return Err(Error::ActiveTransaction(format!(
+                "{} PREPARED cannot run inside a transaction block",
+                if commit { "COMMIT" } else { "ROLLBACK" }
+            )));
+        }
+        crate::two_phase::finish(self.engine, gid, commit, &self.current_user)
+    }
+
     fn run_within_txn(&self, plan: PhysicalPlan) -> Result<ExecutionResult, Error> {
         // Pin this session's user and settings for the statement so every CURRENT_USER /
         // SESSION_USER / current_setting() it contains observes the same snapshot (statement
@@ -2643,6 +2734,8 @@ impl<'engine> Session<'engine> {
             let mut spare = (budget > 0).then(|| plan.clone());
             let mut current = plan;
             loop {
+                // A re-attempt reports only its own notices, not the abandoned attempt's.
+                crate::notice::clear();
                 let txn = self.engine.begin(self.default_isolation)?;
                 let failure = match dispatch(current, self.engine, txn) {
                     Ok(result) => match self.engine.commit(txn) {
@@ -3007,6 +3100,9 @@ fn dispatch(
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
+        | PhysicalPlan::PrepareTransaction(_)
+        | PhysicalPlan::CommitPrepared(_)
+        | PhysicalPlan::RollbackPrepared(_)
         | PhysicalPlan::SetTransaction(_)
         | PhysicalPlan::SetSessionCharacteristics(_)
         | PhysicalPlan::Savepoint(_)
@@ -3511,6 +3607,9 @@ fn format_plan(
         },
         PhysicalPlan::BeginTransaction(_) => vec![format!("{indent}BeginTransaction")],
         PhysicalPlan::Commit => vec![format!("{indent}Commit")],
+        PhysicalPlan::PrepareTransaction(gid) => vec![format!("{indent}PrepareTransaction: {gid}")],
+        PhysicalPlan::CommitPrepared(gid) => vec![format!("{indent}CommitPrepared: {gid}")],
+        PhysicalPlan::RollbackPrepared(gid) => vec![format!("{indent}RollbackPrepared: {gid}")],
         PhysicalPlan::Rollback => vec![format!("{indent}Rollback")],
         PhysicalPlan::SetTransaction(_) => vec![format!("{indent}SetTransaction")],
         PhysicalPlan::SetSessionCharacteristics(_) => {
@@ -5050,6 +5149,12 @@ fn run_drop_policy(
             p.name, p.table
         )));
     }
+    if !removed {
+        crate::notice::skipped_missing(&format!(
+            "policy \"{}\" for relation \"{}\"",
+            p.name, p.table
+        ));
+    }
     Ok(ExecutionResult::PolicyDropped)
 }
 
@@ -5272,6 +5377,10 @@ impl crate::Catalog for ExecCatalog<'_> {
 
     fn current_user(&self) -> String {
         self.user.clone()
+    }
+
+    fn prepared_transactions(&self) -> Result<Vec<nusadb_core::PreparedTransaction>, Error> {
+        self.engine.list_prepared().map_err(Into::into)
     }
 
     fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
@@ -5513,6 +5622,10 @@ impl crate::Catalog for SessionCatalog<'_> {
         self.user.to_owned()
     }
 
+    fn prepared_transactions(&self) -> Result<Vec<nusadb_core::PreparedTransaction>, Error> {
+        self.engine.list_prepared().map_err(Into::into)
+    }
+
     fn has_privilege(
         &self,
         kind: crate::ast::ObjectKind,
@@ -5637,11 +5750,13 @@ fn run_create_materialized_view(
     // table lookup below cannot see it) — otherwise the new backing table would silently shadow
     // the view (reads resolve tables before views).
     if p.if_not_exists && load_view_def(engine, txn, VIEW_CATALOG, &p.name)?.is_some() {
+        crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", p.name));
         return Ok(ExecutionResult::MaterializedViewCreated);
     }
     match engine.lookup_table_as_of(txn, &p.name)? {
         Some(existing) if p.or_replace => engine.drop_table(txn, existing.id)?,
         Some(_) if p.if_not_exists => {
+            crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", p.name));
             return Ok(ExecutionResult::MaterializedViewCreated);
         },
         Some(_) => return Err(Error::TableExists { name: p.name }),
@@ -5781,6 +5896,7 @@ fn run_create_table_as(
 ) -> Result<ExecutionResult, Error> {
     if let Some(existing) = engine.lookup_table_as_of_in(txn, &p.schema, &p.name)? {
         if p.if_not_exists {
+            crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", p.name));
             return Ok(ExecutionResult::Created(existing.id));
         }
         // The analyzer already rejected a name clash without IF NOT EXISTS; guard defensively in case
@@ -5836,6 +5952,7 @@ fn run_create_view(
         && (load_view_def(engine, txn, VIEW_CATALOG, &p.name)?.is_some()
             || engine.lookup_table_as_of(txn, &p.name)?.is_some())
     {
+        crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", p.name));
         return Ok(ExecutionResult::ViewCreated);
     }
     store_view_def(engine, txn, VIEW_CATALOG, &p.name, &p.definition_sql)?;
@@ -5956,6 +6073,9 @@ fn run_drop_view(
             name: p.name.clone(),
         });
     }
+    if !removed {
+        crate::notice::skipped_missing(&format!("view \"{}\"", p.name));
+    }
     Ok(ExecutionResult::ViewDropped)
 }
 
@@ -6032,6 +6152,9 @@ fn run_drop_type(
             "type {:?} does not exist",
             p.name
         )));
+    }
+    if !removed {
+        crate::notice::skipped_missing(&format!("type \"{}\"", p.name));
     }
     Ok(ExecutionResult::TypeDropped)
 }
@@ -6559,6 +6682,9 @@ fn run_drop_domain(
             "domain {:?} does not exist",
             p.name
         )));
+    }
+    if !removed {
+        crate::notice::skipped_missing(&format!("type \"{}\"", p.name));
     }
     Ok(ExecutionResult::DomainDropped)
 }

@@ -84,6 +84,18 @@ pub(crate) enum ScriptStmt {
     Perform(ast::Expr),
     /// `RAISE expr` — abort the procedure with the message `expr` evaluates to.
     Raise(ast::Expr),
+    /// `RAISE level 'format' [, arg ...]`: each `%` in `format` is replaced by the next argument's
+    /// value (`%%` is a literal `%`). `EXCEPTION` aborts the routine like `RAISE expr`; `NOTICE`,
+    /// `WARNING` and `INFO` send the message to the client as a notice and carry on; `LOG` and
+    /// `DEBUG` carry on without sending anything.
+    RaiseMessage {
+        /// The level.
+        level: RaiseLevel,
+        /// The format string.
+        format: String,
+        /// The values substituted for its `%` placeholders, in order.
+        args: Vec<ast::Expr>,
+    },
     /// `RETURN [expr]` — stop the routine. A procedure uses the bare `RETURN` (`None`); a function
     /// uses `RETURN expr` to yield its result value.
     Return(Option<ast::Expr>),
@@ -95,6 +107,23 @@ pub(crate) enum ScriptStmt {
     Sql(Box<ast::Statement>),
     /// A nested `BEGIN ... [EXCEPTION ...] END` block.
     Block(ScriptBlock),
+}
+
+/// The level of a `RAISE level 'format'` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaiseLevel {
+    /// `DEBUG`: not sent to the client.
+    Debug,
+    /// `LOG`: not sent to the client.
+    Log,
+    /// `INFO`: a notice of severity `INFO`.
+    Info,
+    /// `NOTICE`: a notice of severity `NOTICE`.
+    Notice,
+    /// `WARNING`: a notice of severity `WARNING`.
+    Warning,
+    /// `EXCEPTION`: an error (`P0001`) that aborts the routine.
+    Exception,
 }
 
 /// The row a trigger function returns: the (possibly modified) new row, the old row, or none
@@ -244,7 +273,7 @@ fn parse_one(parser: &mut Parser) -> Result<ScriptStmt, Error> {
         },
         Some("raise") => {
             parser.next_token();
-            Ok(ScriptStmt::Raise(parse_expr(parser)?))
+            parse_raise(parser)
         },
         Some("return") => {
             parser.next_token();
@@ -268,6 +297,42 @@ fn parse_one(parser: &mut Parser) -> Result<ScriptStmt, Error> {
             Ok(ScriptStmt::Sql(Box::new(convert_statement(stmt)?)))
         },
     }
+}
+
+/// The rest of a `RAISE`: `level 'format' [, arg ...]` when a level word is followed by a string
+/// literal, else the expression form `RAISE expr`.
+fn parse_raise(parser: &mut Parser) -> Result<ScriptStmt, Error> {
+    let level = match peek_word(parser).as_deref() {
+        Some("debug") => Some(RaiseLevel::Debug),
+        Some("log") => Some(RaiseLevel::Log),
+        Some("info") => Some(RaiseLevel::Info),
+        Some("notice") => Some(RaiseLevel::Notice),
+        Some("warning") => Some(RaiseLevel::Warning),
+        Some("exception") => Some(RaiseLevel::Exception),
+        _ => None,
+    };
+    let literal_follows = matches!(
+        parser.peek_nth_token_ref(1).token,
+        Token::SingleQuotedString(_)
+    );
+    let Some(level) = level.filter(|_| literal_follows) else {
+        return Ok(ScriptStmt::Raise(parse_expr(parser)?));
+    };
+    parser.next_token();
+    let Token::SingleQuotedString(format) = parser.next_token().token else {
+        return Err(Error::Syntax(
+            "RAISE expects a format string after its level".to_owned(),
+        ));
+    };
+    let mut args = Vec::new();
+    while parser.consume_token(&Token::Comma) {
+        args.push(parse_expr(parser)?);
+    }
+    Ok(ScriptStmt::RaiseMessage {
+        level,
+        format,
+        args,
+    })
 }
 
 /// `DECLARE name TYPE [DEFAULT expr]`.

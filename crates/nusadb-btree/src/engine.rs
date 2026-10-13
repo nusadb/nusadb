@@ -56,6 +56,10 @@ use crate::store::{PageFile, PagedStore};
 use crate::tree::ClusteredTree;
 use crate::wal::{self, LoggedOp};
 
+mod prepared;
+
+pub use prepared::{DEFAULT_MAX_PREPARED_TRANSACTIONS, MAX_GID_BYTES};
+
 /// Tuple bytes one batch-insert log record carries at most; a batch of larger total is logged as
 /// several records. Half the reader's record cap leaves room for framing and a row that does
 /// not compress.
@@ -265,6 +269,8 @@ pub struct BtreeEngine {
     /// clears when it fires, so recovery and later commits append normally.
     #[cfg(feature = "dst-fault")]
     dst_fail_next_wal_append: AtomicBool,
+    /// How many prepared transactions may wait at once (`0` refuses `PREPARE TRANSACTION`).
+    max_prepared: prepared::PreparedLimit,
 }
 
 /// The schema domain (rank 2): everything DDL-shaped. The `RwLock` around it is the
@@ -364,6 +370,12 @@ struct TxnDomain {
     /// Without this, a single stage-time map let a reader that began during a writer's fsync
     /// inherit the bump into its baseline while not seeing the rows, hiding a write-skew abort.
     table_write_versions_finished: HashMap<u64, u64>,
+    /// Prepared transactions by global identifier. Each is still in `active` and `txns` (its
+    /// writes stay invisible, its locks held, its view pinned against purge) but belongs to no
+    /// session. A `SERIALIZABLE` antidependency check counts it as committed, like a staged one.
+    prepared_gids: HashMap<String, u64>,
+    /// The order prepared transactions were prepared in, so listings and images keep it.
+    next_prepare_seq: u64,
 }
 
 impl UndoOp {
@@ -381,6 +393,12 @@ impl UndoOp {
 }
 
 impl TxnDomain {
+    /// Transactions begun and not yet ended that a session still runs: the active set less the
+    /// prepared transactions, which wait for no one and must not hold a checkpoint off.
+    fn running(&self) -> usize {
+        self.active.len().saturating_sub(self.prepared_gids.len())
+    }
+
     /// The tables whose ROW state `txn` mutated (per its undo), or empty for a reader.
     fn touched_tables(&self, txn: u64) -> std::collections::HashSet<u64> {
         self.txns
@@ -420,6 +438,8 @@ impl Default for TxnDomain {
             staged: HashSet::new(),
             table_write_versions_staged: HashMap::new(),
             table_write_versions_finished: HashMap::new(),
+            prepared_gids: HashMap::new(),
+            next_prepare_seq: 0,
         }
     }
 }
@@ -1475,6 +1495,22 @@ struct TxnState {
     /// [`BtreeEngine::with_max_txn_write_bytes`] ceiling is checked against. Always maintained; only
     /// consulted when a limit is configured. Discarded when the transaction ends (commit/abort).
     write_bytes: u64,
+    /// Set once `PREPARE TRANSACTION` made the transaction durable: it then belongs to no session
+    /// and waits for `COMMIT PREPARED` or `ROLLBACK PREPARED` (see [`prepared`]).
+    prepared: Option<Box<prepared::PreparedMeta>>,
+    /// While a DDL statement reads under [`begin_fresh_reads`](StorageEngine::begin_fresh_reads):
+    /// how deep the calls nest and the snapshot to put back when the outermost one ends.
+    fresh_reads: Option<(u32, ReadView)>,
+}
+
+impl TxnState {
+    /// The transaction's own snapshot: the one saved while it reads fresh for a DDL statement,
+    /// else the one it reads under.
+    fn snapshot(&self) -> &ReadView {
+        self.fresh_reads
+            .as_ref()
+            .map_or(&self.pinned, |(_, saved)| saved)
+    }
 }
 
 /// The inverse of one applied write, replayed newest-first on rollback. Row ops carry the whole
@@ -2494,6 +2530,18 @@ impl BtreeEngine {
     /// are no live snapshots, so versions collapse: every replayed row is a fresh single
     /// version stamped with its original (committed) transaction id, and a committed delete
     /// simply removes the entry — semantically identical to the pre-crash visible state.
+    ///
+    /// A prepared transaction is read from its prepare records alone (the operations between its
+    /// `PrepareBegin` and `Prepare` records; its earlier records are superseded by them). Committed
+    /// later, they replay in place like any committed operation; still waiting at the end of the
+    /// log, the transaction is set up again as prepared, its changes applied as uncommitted
+    /// versions and its locks taken (see `prepared`). On a standby, a commit or abort marker for
+    /// a transaction an earlier apply left prepared finishes it in memory where the marker stands.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one log-order pass: the committed set, the prepare bounds and the standby's \
+                  prepared transactions share the record cursor"
+    )]
     fn replay(&self, records: &[WalRecord]) -> Result<()> {
         // Abort always wins: a transaction counts as committed iff it has a `CommitTxn` marker AND
         // no `AbortTxn` marker, regardless of the order the two appear in the log. That corner
@@ -2503,6 +2551,8 @@ impl BtreeEngine {
         // makes the rule robust to any ordering, not just the monotonic one today's writer produces.
         let mut committed: HashSet<u64> = HashSet::new();
         let mut aborted: HashSet<u64> = HashSet::new();
+        // Transactions with a complete prepare (a `Prepare` record) among the records.
+        let mut prepared_here: HashSet<u64> = HashSet::new();
         for record in records {
             match record {
                 WalRecord::CommitTxn { txn, .. } => {
@@ -2511,19 +2561,45 @@ impl BtreeEngine {
                 WalRecord::AbortTxn { txn } => {
                     aborted.insert(txn.0);
                 },
-                _ => {},
+                _ => {
+                    if let Some(txn) = wal::prepare_marker_txn(record) {
+                        prepared_here.insert(txn);
+                    }
+                },
             }
         }
         committed.retain(|txn| !aborted.contains(txn));
+        // Transactions an earlier apply (a standby's) left prepared in memory: their changes are
+        // already applied, so only their ending is read here.
+        let mut live_prepared: HashSet<u64> = {
+            let t = self.txns.lock().map_err(|_| poisoned())?;
+            t.prepared_gids.values().copied().collect()
+        };
         // Recovery is single-threaded (the engine is not yet shared), so the domain guards are
         // taken once up front, in rank order.
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         let mut seqs = self.seqs.lock().map_err(|_| poisoned())?;
         let mut max_txn: u64 = 0;
+        // Prepared transactions whose prepare records are open (between the two bounds).
+        let mut program_open: HashSet<u64> = HashSet::new();
+        // The prepare records of transactions not ended among the records, collected until
+        // their `Prepare` record completes them.
+        let mut programs: HashMap<u64, Vec<LoggedOp>> = HashMap::new();
+        // Prepared transactions still waiting once the records are read, in prepare order.
+        let mut waiting: Vec<prepared::Recovered> = Vec::new();
         for record in records {
             match record {
                 WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } => {
                     max_txn = max_txn.max(txn.0);
+                    if live_prepared.remove(&txn.0) {
+                        // The sequence domain ranks after `txns`; let it go while the
+                        // transaction ends.
+                        drop(seqs);
+                        let commit = matches!(record, WalRecord::CommitTxn { .. })
+                            && !aborted.contains(&txn.0);
+                        self.finish_applied_prepared(&mut cat, txn.0, commit)?;
+                        seqs = self.seqs.lock().map_err(|_| poisoned())?;
+                    }
                 },
                 WalRecord::Put { .. } => {
                     let Some(op) = LoggedOp::from_record(record) else {
@@ -2532,10 +2608,51 @@ impl BtreeEngine {
                             "nusadb-btree: foreign or corrupt record in the engine WAL",
                         )));
                     };
-                    max_txn = max_txn.max(op.txn());
+                    let txn = op.txn();
+                    max_txn = max_txn.max(txn);
+                    if live_prepared.contains(&txn) {
+                        continue;
+                    }
+                    if prepared_here.contains(&txn) {
+                        match op {
+                            LoggedOp::PrepareBegin { .. } => {
+                                program_open.insert(txn);
+                            },
+                            LoggedOp::Prepare {
+                                gid,
+                                owner,
+                                database,
+                                prepared_at_ms,
+                                locks,
+                                ..
+                            } => {
+                                program_open.remove(&txn);
+                                if !committed.contains(&txn) && !aborted.contains(&txn) {
+                                    waiting.push(prepared::Recovered {
+                                        txn,
+                                        gid,
+                                        owner,
+                                        database,
+                                        prepared_at_ms,
+                                        locks,
+                                        ops: programs.remove(&txn).unwrap_or_default(),
+                                    });
+                                }
+                            },
+                            // Records written before the prepare are superseded by its own.
+                            _ if !program_open.contains(&txn) => {},
+                            _ if committed.contains(&txn) => {
+                                Self::replay_op(&mut cat, &mut seqs, &self.store, &op)?;
+                            },
+                            _ if aborted.contains(&txn) => {},
+                            // Still waiting: collected and applied, uncommitted, at the end.
+                            _ => programs.entry(txn).or_default().push(op),
+                        }
+                        continue;
+                    }
                     // Non-transactional records (sequence family) apply unconditionally — a
                     // counter advance is durable the moment it was fsynced, commit or not.
-                    if op.is_non_transactional() || committed.contains(&op.txn()) {
+                    if op.is_non_transactional() || committed.contains(&txn) {
                         Self::replay_op(&mut cat, &mut seqs, &self.store, &op)?;
                     }
                 },
@@ -2548,9 +2665,14 @@ impl BtreeEngine {
             }
         }
         drop(seqs);
+        {
+            let mut txns = self.txns.lock().map_err(|_| poisoned())?;
+            txns.next_txn_id = txns.next_txn_id.max(max_txn + 1);
+        }
+        // Every record is applied: the prepared transactions still waiting come back on top of
+        // the committed state, as uncommitted versions holding their locks.
+        self.restore_prepared(&cat, waiting)?;
         drop(cat);
-        let mut txns = self.txns.lock().map_err(|_| poisoned())?;
-        txns.next_txn_id = txns.next_txn_id.max(max_txn + 1);
         Ok(())
     }
 
@@ -2959,6 +3081,8 @@ impl BtreeEngine {
                 cat.namespaces.remove(id);
                 cat.ns_by_name.remove(name);
             },
+            // The bounds of a prepared transaction's records: `replay` reads them itself.
+            LoggedOp::PrepareBegin { .. } | LoggedOp::Prepare { .. } => {},
         }
         Ok(())
     }
@@ -3024,7 +3148,9 @@ impl BtreeEngine {
             | LoggedOp::SeqSet { .. }
             | LoggedOp::SeqAlter { .. }
             | LoggedOp::TableRoot { .. }
-            | LoggedOp::FreeAtOpen { .. } => true,
+            | LoggedOp::FreeAtOpen { .. }
+            | LoggedOp::PrepareBegin { .. }
+            | LoggedOp::Prepare { .. } => true,
         };
         if durable {
             self.log(&op.to_record())?;
@@ -3423,6 +3549,20 @@ impl BtreeEngine {
         }
         Ok(())
     }
+}
+
+/// A table's name for a message: `schema.name`, or the bare name in `public`; `#id` if unknown.
+fn table_label(cat: &Catalog, table: u64) -> String {
+    cat.tables.get(&table).map_or_else(
+        || format!("#{table}"),
+        |t| {
+            if t.schema.schema == nusadb_core::PUBLIC_SCHEMA {
+                t.schema.name.clone()
+            } else {
+                format!("{}.{}", t.schema.schema, t.schema.name)
+            }
+        },
+    )
 }
 
 /// Encode a row-id as the treaty's [`Tid`]: the id *is* the address (ADR 008 §D1 · stable across
@@ -5044,12 +5184,13 @@ impl BtreeEngine {
             t.admission_paused += 1;
             self.admission_paused_flag.store(true, Ordering::Release);
             loop {
-                if t.active.is_empty() {
+                // A prepared transaction waits for no one, and the checkpoint carries it.
+                if t.running() == 0 {
                     break 0;
                 }
                 let now = Instant::now();
                 if now >= deadline {
-                    break t.active.len();
+                    break t.running();
                 }
                 let (guard, _) = self
                     .txn_ended
@@ -5068,7 +5209,8 @@ impl BtreeEngine {
     /// Stop-the-world: every domain is locked for the duration and the engine must be fully
     /// quiesced — any active transaction refuses the checkpoint (its already-logged operations
     /// would be truncated away while its commit marker lands after, silently losing the
-    /// transaction). The in-memory engine (no log) also refuses.
+    /// transaction). A prepared transaction does not: the image carries it (see `prepared`). The
+    /// in-memory engine (no log) also refuses.
     ///
     /// The durability order is load-bearing and must never be reordered:
     ///
@@ -5206,6 +5348,36 @@ impl BtreeEngine {
         // Rank order: commit_gate -> catalog(write) -> txns -> seqs -> wal.
         let _gate = self.commit_gate.lock().map_err(|_| poisoned())?;
         let cat = self.catalog.write().map_err(|_| poisoned())?;
+        // A prepared transaction may wait indefinitely, so it cannot hold a checkpoint off the
+        // way a running one does. Its changes are taken out of memory for the length of the
+        // image, which then holds the committed state only, and the image carries the
+        // transaction itself as its prepare records (see `prepared`). Refused here, before
+        // anything changes, while a transaction still runs.
+        let parked = self.park_prepared(&cat)?;
+        let written = self.checkpoint_quiesced(&cat, stamp, &parked);
+        // Whatever the image's fate, the prepared transactions come back exactly as they were:
+        // the log or the new image still holds them. A failure here leaves memory without them,
+        // so it stops the engine and a restart rebuilds them from disk.
+        let restored = self.unpark_prepared(&cat, parked);
+        let restored = self.guarded(restored);
+        written.and(restored)
+    }
+
+    /// The body of [`checkpoint_stamped`](Self::checkpoint_stamped), with the commit gate and the
+    /// catalog held and every prepared transaction set aside as `parked`.
+    #[allow(
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        reason = "every guard IS the stop-the-world quiesce: all of them must be held until the \
+                  log truncate completes, or a transaction could slip in between the image and the \
+                  truncate and be silently dropped"
+    )]
+    fn checkpoint_quiesced(
+        &self,
+        cat: &Catalog,
+        stamp: u64,
+        parked: &[prepared::Parked],
+    ) -> Result<()> {
         // Trees and chains still queued for purge (a drop that committed after the reclamation
         // above): the image carries their pages, but nothing will own them after a restart, when
         // the queues are gone. Read here, between the catalog (which every push to the queues
@@ -5215,13 +5387,13 @@ impl BtreeEngine {
         // Again under the quiesce: a background pass that failed part way while this checkpoint
         // waited for the catalog has stopped the engine by now.
         self.ensure_healthy()?;
-        if !txns.active.is_empty() {
+        if txns.running() > 0 {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 format!(
                     "nusadb-btree: checkpoint requires a quiesced engine, {} transaction(s) \
                      still active",
-                    txns.active.len()
+                    txns.running()
                 ),
             )));
         }
@@ -5259,8 +5431,8 @@ impl BtreeEngine {
         let tmp = ckpt_tmp_path(&wal.path);
         let named = ckpt_path(&wal.path);
         let dir = pages_dir(&wal.path);
-        self.drop_all_dead_ranges(&cat)?;
-        let mut unowned = self.temporary_pages(&cat)?;
+        self.drop_all_dead_ranges(cat)?;
+        let mut unowned = self.temporary_pages(cat)?;
         unowned.extend(queued);
         unowned.sort_unstable();
         unowned.dedup();
@@ -5282,9 +5454,17 @@ impl BtreeEngine {
             write_segment_directory(&mut file, covered_lsn, page_count, &live, &plan)?;
             let file = file.into_inner().map_err(|e| Error::Io(e.into_error()))?;
             let mut writer = WalWriter::new(file);
-            Self::emit_image(&cat, &seqs, synthetic_txn, stamp, &unowned, &mut |record| {
+            Self::emit_image(cat, &seqs, synthetic_txn, stamp, &unowned, &mut |record| {
                 writer.append(record).map(|_| ())
             })?;
+            // The prepared transactions follow the committed state, each as its prepare
+            // records: replay keeps them prepared, or applies them once a later commit marker
+            // names them.
+            for p in parked {
+                for record in p.records() {
+                    writer.append(&record)?;
+                }
+            }
             // Drain the writer's append buffer to the file, then fsync — the image is durable
             // before its rename can make it authoritative.
             writer.flush()?;
@@ -5599,8 +5779,14 @@ struct Shipped {
 fn records_past(records: Vec<(nusadb_core::Lsn, WalRecord)>, applied: u64) -> Shipped {
     let mut ends: HashMap<u64, u64> = HashMap::new();
     for (lsn, record) in &records {
-        if let WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } = record {
-            let end = ends.entry(txn.0).or_insert(0);
+        // A prepare marker ends a transaction's records as a commit does: what follows for it is
+        // only its commit or abort marker, in this segment or a later one.
+        let ended = match record {
+            WalRecord::CommitTxn { txn, .. } | WalRecord::AbortTxn { txn } => Some(txn.0),
+            _ => wal::prepare_marker_txn(record),
+        };
+        if let Some(txn) = ended {
+            let end = ends.entry(txn).or_insert(0);
             *end = (*end).max(lsn.0);
         }
     }
@@ -5647,7 +5833,9 @@ fn warn_cut_off_transactions(records: &[WalRecord]) {
                 ended.insert(txn.0);
             },
             WalRecord::Put { .. } => {
-                if let Some(op) = LoggedOp::from_record(record)
+                if let Some(txn) = wal::prepare_marker_txn(record) {
+                    ended.insert(txn);
+                } else if let Some(op) = LoggedOp::from_record(record)
                     && !op.is_non_transactional()
                 {
                     open.insert(op.txn());
@@ -6377,6 +6565,41 @@ impl TxnDomain {
         }
     }
 
+    /// The exclusive table lock a DDL change that drops, rewrites or re-indexes `table` takes
+    /// before touching it, held until `txn` ends: it waits for no one (no-wait, like every lock),
+    /// so a concurrent writer's shared intention refuses it with `40001`. A prepared transaction's
+    /// intention refuses it with [`Error::ObjectInUse`] (`55006`) instead, since retrying cannot help
+    /// until someone finishes that transaction, and changing the table under it would leave its
+    /// prepare records pointing at a table or index that is gone or reshaped.
+    fn lock_table_for_ddl(&mut self, txn: u64, table: u64, label: &str) -> Result<()> {
+        let id = LockId::Table { table };
+        match self.acquire_lock(txn, id, true) {
+            Ok(()) => Ok(()),
+            Err(conflict) => {
+                let prepared = self.locks.get(&id).and_then(|h| {
+                    h.holders.keys().find_map(|holder| {
+                        self.txns
+                            .get(holder)
+                            .and_then(|s| s.prepared.as_ref())
+                            .map(|_| *holder)
+                    })
+                });
+                let gid = prepared.and_then(|holder| {
+                    self.prepared_gids
+                        .iter()
+                        .find(|(_, t)| **t == holder)
+                        .map(|(gid, _)| gid.clone())
+                });
+                Err(gid.map_or(conflict, |gid| {
+                    Error::ObjectInUse(format!(
+                        "table \"{label}\" is in use by prepared transaction \"{gid}\"; finish it \
+                         with COMMIT PREPARED or ROLLBACK PREPARED first"
+                    ))
+                }))
+            },
+        }
+    }
+
     /// The shared table-intention lock every row write and row/key lock takes first, so a
     /// concurrent `LOCK TABLE ACCESS EXCLUSIVE` genuinely excludes all table activity
     /// (multi-granularity the lock-table contract carried over from the predecessor engine).
@@ -6687,6 +6910,36 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         self.admission_paused_flag.load(Ordering::Acquire)
     }
 
+    fn begin_fresh_reads(&self, txn: TxnId) -> Result<()> {
+        let mut t = self.txns.lock().map_err(|_| poisoned())?;
+        let view = t.fresh_view(txn.0);
+        let state = t.txns.get_mut(&txn.0).ok_or_else(|| unknown_txn(txn))?;
+        let previous = std::mem::replace(&mut state.pinned, view);
+        state.fresh_reads = Some(match state.fresh_reads.take() {
+            Some((depth, saved)) => (depth + 1, saved),
+            None => (1, previous),
+        });
+        Ok(())
+    }
+
+    fn end_fresh_reads(&self, txn: TxnId) -> Result<()> {
+        let mut t = self.txns.lock().map_err(|_| poisoned())?;
+        let Some(state) = t.txns.get_mut(&txn.0) else {
+            return Ok(());
+        };
+        state.fresh_reads = match state.fresh_reads.take() {
+            Some((1, saved)) => {
+                // A `READ COMMITTED` transaction's next statement refreshes its snapshot anyway;
+                // a `REPEATABLE READ` / `SERIALIZABLE` one goes back to the one it began with.
+                state.pinned = saved;
+                None
+            },
+            Some((depth, saved)) => Some((depth - 1, saved)),
+            None => None,
+        };
+        Ok(())
+    }
+
     fn begin(&self, level: IsolationLevel) -> Result<TxnId> {
         self.ensure_healthy()?;
         let mut t = self.txns.lock().map_err(|_| poisoned())?;
@@ -6721,6 +6974,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 // levels that never validate reads.
                 write_versions_at_begin: write_versions,
                 write_bytes: 0,
+                prepared: None,
+                fresh_reads: None,
             },
         );
         Ok(TxnId(id))
@@ -6745,8 +7000,10 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let gate = self.commit_gate.lock().map_err(|_| poisoned())?;
         {
             let t = self.txns.lock().map_err(|_| poisoned())?;
-            if !t.txns.contains_key(&txn.0) {
-                return Err(unknown_txn(txn));
+            match t.txns.get(&txn.0) {
+                None => return Err(unknown_txn(txn)),
+                Some(state) if state.prepared.is_some() => return Err(prepared::is_prepared(txn)),
+                Some(_) => {},
             }
         }
         let gate = self.refuse_standby_write(txn, gate)?;
@@ -6899,6 +7156,10 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         self.finish_open_scans(txn);
         let state = {
             let mut t = self.txns.lock().map_err(|_| poisoned())?;
+            // A prepared transaction is finished only by name, from whichever session.
+            if t.txns.get(&txn.0).is_some_and(|s| s.prepared.is_some()) {
+                return Err(prepared::is_prepared(txn));
+            }
             t.txns.remove(&txn.0).ok_or_else(|| unknown_txn(txn))?
             // Still in `active`: the transaction leaves it only after the undo completes (see
             // `abort` — a ReadView equates "ended and present" with committed).
@@ -6954,6 +7215,28 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // so a later ROLLBACK TO this name fails.
         txn_state.savepoints.truncate(pos);
         Ok(())
+    }
+
+    fn prepare_transaction(
+        &self,
+        txn: TxnId,
+        gid: &str,
+        owner: &str,
+        database: &str,
+    ) -> Result<()> {
+        self.prepare_txn(txn, gid, owner, database)
+    }
+
+    fn commit_prepared(&self, gid: &str, owner: Option<&str>) -> Result<()> {
+        self.finish_prepared(gid, owner, true)
+    }
+
+    fn rollback_prepared(&self, gid: &str, owner: Option<&str>) -> Result<()> {
+        self.finish_prepared(gid, owner, false)
+    }
+
+    fn list_prepared(&self) -> Result<Vec<nusadb_core::PreparedTransaction>> {
+        self.prepared_list()
     }
 
     fn lock_row(&self, txn: TxnId, table: TableId, tid: Tid, mode: RowLockMode) -> Result<()> {
@@ -7049,18 +7332,24 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn lock_table(&self, txn: TxnId, table: TableId, mode: TableLockMode) -> Result<()> {
+        // The name, for a refusal's message, is read before `txns` (lock rank order).
+        let label = {
+            let cat = self.catalog.read().map_err(|_| poisoned())?;
+            table_label(&cat, table.0)
+        };
         let mut t = self.txns.lock().map_err(|_| poisoned())?;
         if !t.txns.contains_key(&txn.0) {
             return Err(unknown_txn(txn));
         }
         // `ACCESS SHARE` coexists with row/key activity (all shared holds); `ACCESS EXCLUSIVE`
         // requires sole ownership, so it conflicts with every concurrent intention (row writes,
-        // row/key locks) on the table.
-        t.acquire_lock(
-            txn.0,
-            LockId::Table { table: table.0 },
-            matches!(mode, TableLockMode::AccessExclusive),
-        )
+        // row/key locks) on the table, and a prepared transaction's refuses it with `55006`.
+        match mode {
+            TableLockMode::AccessShare => {
+                t.acquire_lock(txn.0, LockId::Table { table: table.0 }, false)
+            },
+            TableLockMode::AccessExclusive => t.lock_table_for_ddl(txn.0, table.0, &label),
+        }
     }
 
     fn create_table(&self, txn: TxnId, def: &TableDef) -> Result<TableId> {
@@ -7137,6 +7426,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
+        }
+        if cat.tables.contains_key(&table.0) {
+            self.lock_for_ddl(&cat, txn, table.0)?;
         }
         let state = cat
             .tables
@@ -7258,6 +7550,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
+        }
+        if cat.tables.contains_key(&table.0) {
+            self.lock_for_ddl(&cat, txn, table.0)?;
         }
         let (previous, previous_version) = {
             let t = cat
@@ -8271,6 +8566,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if !cat.tables.contains_key(&def.table.0) {
             return Err(table_not_found(def.table));
         }
+        // An index built while another transaction has unfinished writes on the table would miss
+        // them: the build only sees committed rows, and those writes were not indexed into it.
+        self.lock_for_ddl(&cat, txn, def.table.0)?;
         let id = cat.next_index_id;
         cat.next_index_id += 1;
         cat.idx_by_name.insert(def.name.clone(), id);
@@ -8301,6 +8599,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
         if !self.txn_exists(txn.0)? {
             return Err(unknown_txn(txn));
+        }
+        if let Some(table) = cat.indexes.get(&id.0).map(|i| i.def.table.0) {
+            self.lock_for_ddl(&cat, txn, table)?;
         }
         let state = cat
             .indexes
@@ -8677,6 +8978,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if !cat.tables.contains_key(&table.0) {
             return Err(table_not_found(table));
         }
+        // A check validated against the committed rows would miss another transaction's
+        // unfinished writes, which could then commit rows that violate it.
+        self.lock_for_ddl(&cat, txn, table.0)?;
         if cat
             .checks
             .get(&table.0)
@@ -8932,7 +9236,29 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                     def.name, def.parent_table.0
                 )));
             };
-            referenced.index
+            let parent_index = referenced.index;
+            // Rows already in the child are validated against the committed parent rows, so
+            // another transaction's unfinished change to the parent (a prepared delete, say) could
+            // commit after and orphan one: the parent is taken exclusively too. An empty child has
+            // nothing to validate, and its own exclusive lock (from its index) keeps it empty.
+            if def.parent_table != def.child_table {
+                let child = cat
+                    .tables
+                    .get(&def.child_table.0)
+                    .ok_or_else(|| table_not_found(def.child_table))?;
+                let mut populated = false;
+                ClusteredTree::open(&*self.store, child.root_id()).scan_from_stored_with(
+                    0,
+                    |_, _, _| {
+                        populated = true;
+                        Ok(false)
+                    },
+                )?;
+                if populated {
+                    self.lock_for_ddl(&cat, txn, def.parent_table.0)?;
+                }
+            }
+            parent_index
         };
         // The child-side (non-unique) index over the FK columns (re-acquires internally).
         let child_index = self.create_index(
@@ -9327,6 +9653,15 @@ impl BtreeEngine {
         }))
     }
 
+    /// [`TxnDomain::lock_table_for_ddl`] for `txn` on `table`, named for its message from `cat`.
+    fn lock_for_ddl(&self, cat: &Catalog, txn: TxnId, table: u64) -> Result<()> {
+        let label = table_label(cat, table);
+        self.txns
+            .lock()
+            .map_err(|_| poisoned())?
+            .lock_table_for_ddl(txn.0, table, &label)
+    }
+
     /// Whether `txn` is a known (begun, not yet ended) transaction — the guard every mutating
     /// call runs first.
     fn txn_exists(&self, txn: u64) -> Result<bool> {
@@ -9464,6 +9799,12 @@ impl BtreeEngine {
     /// Always ends the transaction: an undo that fails stops the engine instead (see
     /// [`fail_stop`](Self::fail_stop)), and the durable bookkeeping afterwards is best-effort.
     fn abort(&self, txn: TxnId, state: TxnState) {
+        self.abort_with(txn, state, true);
+    }
+
+    /// [`abort`](Self::abort), with the advisory `AbortTxn` marker left out when the caller has
+    /// already made one durable (`ROLLBACK PREPARED`).
+    fn abort_with(&self, txn: TxnId, state: TxnState, log_marker: bool) {
         let locks = state.locks;
         let undo = state.undo;
         // Capture which sequences need a durable `SeqDrop` compensation before `undo` is consumed.
@@ -9520,7 +9861,7 @@ impl BtreeEngine {
         if self.is_standby() {
             return;
         }
-        if let Err(e) = self.log(&WalRecord::AbortTxn { txn }) {
+        if log_marker && let Err(e) = self.log(&WalRecord::AbortTxn { txn }) {
             eprintln!("nusadb-btree: WARN — could not log advisory AbortTxn for {txn:?}: {e}");
         }
         for id in created_sequences {
@@ -9603,12 +9944,17 @@ impl BtreeEngine {
             if reads.is_empty() && predicate_reads.is_empty() {
                 return Ok(false);
             }
+            // A prepared transaction will commit unless someone rolls it back, so it counts as
+            // committed here, like a staged one (an abort it then sees was merely conservative).
+            let mut staged = txns.staged.clone();
+            staged.extend(txns.prepared_gids.values().copied());
+            // Judged by the snapshot the reads were made under (see `TxnState::snapshot`).
             (
                 reads,
                 predicate_reads,
-                state.pinned.clone(),
+                state.snapshot().clone(),
                 txns.active.clone(),
-                txns.staged.clone(),
+                staged,
             )
         };
         let undo = self.reclaim.read().map_err(|_| poisoned())?;
@@ -10037,6 +10383,13 @@ impl BtreeEngine {
     fn purge_snapshot(&self) -> Result<PurgeSnapshot> {
         let txns = self.txns.lock().map_err(|_| poisoned())?;
         let mut pinned: Vec<ReadView> = txns.txns.values().map(|t| t.pinned.clone()).collect();
+        // A transaction reading fresh for a DDL statement goes back to the snapshot it saved, so
+        // that snapshot is pinned too: what it sees must outlive the statement.
+        pinned.extend(
+            txns.txns
+                .values()
+                .filter_map(|t| t.fresh_reads.as_ref().map(|(_, saved)| saved.clone())),
+        );
         pinned.extend(self.scan_views.lock().map_err(|_| poisoned())?.pins());
         Ok(PurgeSnapshot {
             pinned,

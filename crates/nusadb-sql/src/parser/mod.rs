@@ -48,7 +48,9 @@ use ddl::*;
 use dml::*;
 use expr::*;
 use query::*;
-pub(crate) use script::{ScriptBlock, ScriptStmt, TriggerReturn, is_script, parse_script};
+pub(crate) use script::{
+    RaiseLevel, ScriptBlock, ScriptStmt, TriggerReturn, is_script, parse_script,
+};
 use select::*;
 
 /// NusaDB's SQL dialect — the documented identifier surface.
@@ -619,6 +621,11 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `CHECKPOINT` is not modelled by the generic tokenizer either; recognize the bare form here.
     if let Some(stmt) = recognize_checkpoint(sql) {
         return Ok(stmt);
+    }
+    // `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, `ROLLBACK PREPARED 'gid'`: two-phase
+    // commit; the generic grammar reads the first as a prepared statement and refuses the others.
+    if let Some(result) = recognize_two_phase(sql) {
+        return result;
     }
     // `COMMENT ON ...` is tokenized by `sqlparser` 0.51 but not modelled as a statement, so
     // (like `VACUUM`) recognize and parse it ourselves before the generic path.
@@ -2078,6 +2085,48 @@ fn recognize_checkpoint(sql: &str) -> Option<ast::Statement> {
     } else {
         None
     }
+}
+
+/// Recognize the two-phase commit statements: `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`
+/// and `ROLLBACK PREPARED 'gid'`, keywords in any case, the identifier a single-quoted string
+/// literal (`''` for a quote inside it). `PREPARE TRANSACTION` followed by anything but a literal is
+/// left alone, so a prepared statement that happens to be named `transaction` still parses as one;
+/// a `COMMIT PREPARED` / `ROLLBACK PREPARED` without a literal is a syntax error.
+fn recognize_two_phase(sql: &str) -> Option<Result<ast::Statement, Error>> {
+    // Comments are already blanked to spaces, so the words are split on runs of whitespace.
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    let (first, rest) = trimmed.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (second, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let tail = tail.trim();
+    let kind = if first.eq_ignore_ascii_case("prepare")
+        && second.eq_ignore_ascii_case("transaction")
+    {
+        0
+    } else if first.eq_ignore_ascii_case("commit") && second.eq_ignore_ascii_case("prepared") {
+        1
+    } else if first.eq_ignore_ascii_case("rollback") && second.eq_ignore_ascii_case("prepared") {
+        2
+    } else {
+        return None;
+    };
+    let gid = match parse_notify_payload(tail) {
+        Some(gid) => gid,
+        // Not a literal: `PREPARE transaction AS ...` is an ordinary prepared statement.
+        None if kind == 0 => return None,
+        None => {
+            return Some(Err(Error::Syntax(format!(
+                "{} {} expects a transaction identifier as a string literal",
+                first.to_ascii_uppercase(),
+                second.to_ascii_uppercase()
+            ))));
+        },
+    };
+    Some(Ok(match kind {
+        0 => ast::Statement::PrepareTransaction(gid),
+        1 => ast::Statement::CommitPrepared(gid),
+        _ => ast::Statement::RollbackPrepared(gid),
+    }))
 }
 
 /// Parse the text after the `VACUUM` keyword into [`ast::VacuumOptions`]. Accepts an empty tail, a

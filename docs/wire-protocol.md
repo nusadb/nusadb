@@ -1,12 +1,14 @@
 # Nusa Wire Protocol — Normative Specification
 
-> Status: `PROTOCOL_VERSION 1.2` (`major.minor = 1.2`). The 1.0 surface is frozen; 1.1 and 1.2 are
-> additive minor revisions. 1.1 adds one backend message, `RowDescriptionTyped` (§9/§16), sent only
-> when a connection negotiates `minor >= 1`; a `minor = 0` connection sees the exact 1.0 byte stream
-> (§2). 1.2 additionally encodes an `ARRAY` column's *element* type in its 1-byte type tag
+> Status: `PROTOCOL_VERSION 1.3` (`major.minor = 1.3`). The 1.0 surface is frozen; 1.1, 1.2 and 1.3
+> are additive minor revisions. 1.1 adds one backend message, `RowDescriptionTyped` (§9/§16), sent
+> only when a connection negotiates `minor >= 1`; a `minor = 0` connection sees the exact 1.0 byte
+> stream (§2). 1.2 additionally encodes an `ARRAY` column's *element* type in its 1-byte type tag
 > (`0x80 | element_tag`, §9.2) for a connection negotiating `minor >= 2`, so a client decodes the
-> elements at their real type; a `minor < 2` connection keeps the plain `ARRAY` tag (`0x0F`). All
-> earlier layouts are unchanged — old drivers do not break.
+> elements at their real type; a `minor < 2` connection keeps the plain `ARRAY` tag (`0x0F`). 1.3
+> adds one backend message, `NoticeResponse` (§9.4/§16), sent only when a connection negotiates
+> `minor >= 3`; a `minor < 3` connection never receives one. All earlier layouts are unchanged, so
+> old drivers do not break.
 > This document is the normative contract between a NusaDB server (`nusadb-wire`) and any
 > client/driver. It is the freeze point that lets driver development proceed in parallel
 > with engine work: as long as the engine keeps emitting these frames in these layouts, drivers do
@@ -51,14 +53,15 @@ byte and sub-code are NusaDB's own. Do not assume a third-party database driver 
 
 - Magic. Every `Startup` payload begins with the 4-byte magic `PROTOCOL_MAGIC = 0x4E55_5341`,
   ASCII `"NUSA"`. A server that reads any other value MUST reject the connection (`BadMagic`).
-- Version. `PROTOCOL_VERSION = (major, minor) = (1, 2)`. The `Startup` message carries the
+- Version. `PROTOCOL_VERSION = (major, minor) = (1, 3)`. The `Startup` message carries the
   client's requested `major:u16` and `minor:u16`.
   - Major identifies an incompatible change. The server rejects a `Startup` whose `major`
     differs from its own (it replies with an `Error` and closes — see §6).
   - Minor selects backward-compatible additions. The server uses the effective minor =
     `min(client_minor, server_minor)` for the connection and stores it (it is no longer
     ignored). A client requesting `minor >= 1` opts into the 1.1 additions (typed
-    `RowDescriptionTyped`, §9); `minor >= 2` additionally opts into element-typed `ARRAY` tags (§9.2).
+    `RowDescriptionTyped`, §9); `minor >= 2` additionally opts into element-typed `ARRAY` tags (§9.2);
+    `minor >= 3` additionally opts into `NoticeResponse` (§9.4).
     A client requesting `minor = 0` — or any client talking to a 1.0
     server, which ignores the field — sees the exact 1.0 byte stream. A 1.1-aware client need not
     know the server's minor in advance: the 1.1 additions are self-describing (a distinct
@@ -328,6 +331,7 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `CREATE` / `DROP` / `ALTER ROLE` | `CREATE ROLE` / `DROP ROLE` / `ALTER ROLE` |
 | `GRANT` / `REVOKE` | `GRANT` / `REVOKE` |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | `BEGIN` / `COMMIT` / `ROLLBACK` |
+| `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` (a `PREPARE TRANSACTION` of a failed transaction rolls it back and reports `ROLLBACK`) |
 | `SAVEPOINT` / `RELEASE` | `SAVEPOINT` / `RELEASE` |
 | `SET` (vars, `SET TRANSACTION`, `SET ROLE`) | `SET` |
 | `TRUNCATE` | `TRUNCATE TABLE` |
@@ -421,12 +425,47 @@ Transactions:
 - Statements that cannot run inside a transaction block (`CREATE DATABASE`, `DROP DATABASE`,
   `CHECKPOINT`) fail inside a multi-statement query for the same reason. Send them on their own.
 - A `NOTIFY` in an implicit transaction is delivered when it commits and dropped if it rolls back.
+- `PREPARE TRANSACTION` needs a transaction block too: in an implicit transaction it fails with
+  `25P01`. After a `BEGIN` in the same string it prepares the block and ends it, as on its own, and
+  the statements after it run in a new implicit transaction. `COMMIT PREPARED` and
+  `ROLLBACK PREPARED` cannot run inside a transaction block, so like `CHECKPOINT` they fail
+  (`25001`) inside a multi-statement query; send them on their own.
+- Each statement's notices (§9.4) come right before its own `CommandComplete` or `Error`.
 
 `COPY` cannot be one of several statements, because its data exchange (§12) needs a query of its
 own: such a query is refused with `0A000` and runs nothing.
 
 The extended protocol (§10) takes exactly one statement: a `Parse` of SQL holding more than one
 fails with `42601` when the statement is described or executed.
+
+### 9.4 Notices (protocol 1.3)
+A statement may send its client notices besides its result: `DROP TABLE IF EXISTS` of a table that
+is not there, `CREATE TABLE IF NOT EXISTS` of one that is, a procedure's `RAISE NOTICE`. On a
+connection that negotiated effective `minor >= 3` each one arrives as
+
+Backend → `NoticeResponse` (`N`): `[ severity:Str ][ code:Str ][ message:Str ]`
+
+with `Str` as in §4.2. `severity` is one of `NOTICE`, `WARNING` or `INFO`; `code` is a 5-character
+SQLSTATE: `00000` when the notice reports nothing wrong, `01000` for a `RAISE WARNING`, otherwise
+the code the statement would have failed with had it not been told to skip (`42P07` for a
+`CREATE TABLE IF NOT EXISTS` of an existing table, `42P06` for a schema, `42701` for a column).
+
+Ordering. A statement's notices come immediately before its own `CommandComplete`, after every
+`DataRow` it sends, or immediately before its `Error` when it fails after raising them. This holds
+on every path: a simple query, each statement of a multi-statement query (§9.3), and the extended
+protocol (§10), where they are sent by the `Execute` that completes the portal, so a paginated
+portal (`max_rows > 0`) delivers them with its last page, ahead of the `CommandComplete`. A
+statement that fails still enters the skip-until-`Sync` state after its notices. Notices never
+appear inside a COPY sub-protocol exchange (§12), between `CopyInResponse`/`CopyOutResponse` and the
+closing `CommandComplete`.
+
+One statement sends at most 1000 notices. Past that the rest are dropped and one closing
+`WARNING` (`01000`, `<n> more notices were dropped (at most 1000 are kept)`) says how many, so a
+`RAISE NOTICE` in a long loop cannot flood the connection.
+
+A connection at `minor < 3` never receives a `NoticeResponse`: its byte stream is exactly what it
+was before notices existed, and the notices are dropped. A client SHOULD surface notices to its user
+(a log line, a callback) and MUST NOT treat one as an error.
 
 ## 10. Extended query (prepared statements)
 
@@ -695,6 +734,8 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
 
   | Class | Meaning | Examples |
   | --- | --- | --- |
+  | `00` | successful completion (notices only, never an `Error`) | `00000` a `NoticeResponse` that reports nothing wrong (§9.4) |
+  | `01` | warning (notices only, never an `Error`) | `01000` a `RAISE WARNING` notice |
   | `08` | connection exception | `08006` the connection failed while the statement was running |
   | `0A` | the server has not built this feature | `0A000` — see the note below on what this does and does not mean |
   | `21` | cardinality violation | `21000` a subquery returned more than one row where one was required |
@@ -793,6 +834,8 @@ error.
 | `H`  | CopyOutResponse       | `overall_format:u8 (0 text, 1 binary), columns:u16`            |
 | `d`  | CopyData              | `data:bytes`                                                    |
 | `c`  | CopyDone              | —                                                               |
+| `A`  | NotificationResponse  | `pid:u32, channel:Str, payload:Str`                             |
+| `N`  | NoticeResponse²       | `severity:Str, code:Str(5), message:Str`                        |
 
 > Type bytes overlap across directions by design (`K`, `C`, `D`, `d`, `c`, `E`). A decoder always
 > knows its direction, so there is no ambiguity. `p`/`r` are SASL inbound; `S` is Startup inbound
@@ -801,6 +844,10 @@ error.
 > ¹ `RowDescriptionTyped` (`y`) is protocol 1.1: sent in place of `RowDescription`
 > only on a connection that negotiated effective `minor >= 1` (§2, §9.2). A `minor = 0` connection
 > never receives it, so the 1.0 byte stream is unchanged.
+>
+> ² `NoticeResponse` (`N`) is protocol 1.3: sent only on a connection that negotiated effective
+> `minor >= 3`, ahead of the completion of the statement that raised it (§9.4). A `minor < 3`
+> connection never receives it.
 
 ## 17. Limits & DoS guards (server defaults)
 

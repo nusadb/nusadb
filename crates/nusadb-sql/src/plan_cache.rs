@@ -411,6 +411,12 @@ impl Catalog for RecordingCatalog<'_> {
     fn current_user(&self) -> String {
         self.inner.current_user()
     }
+    fn prepared_transactions(&self) -> Result<Vec<nusadb_core::PreparedTransaction>, Error> {
+        // The view is read into the plan as it stands now, which no schema version tracks: a plan
+        // that read it is never cached.
+        self.saw_unversioned_dep.set(true);
+        self.inner.prepared_transactions()
+    }
     fn lookup_policies(&self, schema: &str, name: &str) -> Result<Vec<PolicyDef>, Error> {
         self.inner.lookup_policies(schema, name)
     }

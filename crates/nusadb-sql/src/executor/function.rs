@@ -251,6 +251,9 @@ pub(super) fn run_drop_function(
             name: plan.name.clone(),
         });
     }
+    if !removed {
+        crate::notice::skipped_missing(&format!("function {}()", plan.name));
+    }
     Ok(ExecutionResult::FunctionDropped)
 }
 

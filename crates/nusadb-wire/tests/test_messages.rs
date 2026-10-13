@@ -167,6 +167,14 @@ fn backend_messages_roundtrip() {
         channel: "cache_invalidate".to_owned(),
         payload: String::new(),
     });
+    // A notice (protocol 1.3): severity, code and message, each a `Str`, under type byte `N`.
+    let notice = BackendMessage::NoticeResponse {
+        severity: "NOTICE".to_owned(),
+        code: "00000".to_owned(),
+        message: "table \"t\" does not exist, skipping".to_owned(),
+    };
+    backend_roundtrip(&notice);
+    assert_eq!(notice.encode().unwrap().message_type, b'N');
 }
 
 #[test]

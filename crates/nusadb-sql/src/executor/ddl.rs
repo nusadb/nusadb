@@ -114,6 +114,7 @@ pub(super) fn run_create_table(
 ) -> Result<ExecutionResult, Error> {
     if let Some(existing) = engine.lookup_table_as_of_in(txn, &plan.schema, &plan.table)? {
         if plan.if_not_exists {
+            crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", plan.table));
             return Ok(ExecutionResult::Created(existing.id));
         }
         return Err(Error::TableExists {
@@ -339,6 +340,8 @@ fn propagate_parent_constraints(
     let Some(parent) = engine.lookup_table_as_of_in(txn, parent_schema, parent_name)? else {
         return Ok(());
     };
+    // The partition's rows are validated below: held (again, re-entrantly) and read fresh.
+    let _fresh = validate.then(|| hold_fresh(id, engine, txn)).transpose()?;
     let existing = engine.list_constraints(id)?;
     for c in engine.list_constraints(parent.id)? {
         let primary = matches!(c.kind, nusadb_core::ConstraintKind::PrimaryKey);
@@ -1768,15 +1771,91 @@ pub(super) fn run_drop_table(
             // Same for any partition metadata (parent key or partition bound).
             super::partition::remove_for(engine, txn, &table_key)?;
         },
-        None => {
-            if !plan.if_exists {
-                return Err(Error::TableNotFound {
-                    name: crate::analyzer::qualified_display(&plan.schema, &plan.table),
-                });
+        None => skip_missing(plan.if_exists, &format!("table \"{}\"", plan.table), || {
+            Error::TableNotFound {
+                name: crate::analyzer::qualified_display(&plan.schema, &plan.table),
             }
-        },
+        })?,
     }
     Ok(ExecutionResult::Dropped)
+}
+
+/// Take `table`, and every partition below it at any depth, exclusively before any of their
+/// existing rows are validated for a new constraint, a column change or a partition bound: the
+/// validation reads committed rows only, so another transaction's unfinished write could otherwise
+/// commit a row that breaks what was just validated. All of them are taken before any row is read,
+/// since the rows of a partitioned table are its partitions' rows. A running writer refuses it with
+/// the no-wait `40001`, a prepared transaction with `55006`. The returned guard keeps the reads
+/// fresh ([`FreshReads`]) for as long as the statement validates.
+fn lock_for_validation<'e>(
+    table: &TableSchema,
+    engine: &'e dyn StorageEngine,
+    txn: TxnId,
+) -> Result<FreshReads<'e>, Error> {
+    lock_one_for_validation(table.id, engine, txn)?;
+    for (schema, name, _) in partitions_below(table, engine, txn)? {
+        if let Some(partition) = engine.lookup_table_as_of_in(txn, &schema, &name)? {
+            lock_one_for_validation(partition.id, engine, txn)?;
+        }
+    }
+    fresh_reads(engine, txn)
+}
+
+/// While it lives, `txn` reads the latest committed rows plus its own writes, not its statement
+/// snapshot (see [`StorageEngine::begin_fresh_reads`]). Taken once a DDL statement holds its
+/// exclusive locks: the snapshot predates them, so a writer that committed in between, which the
+/// lock no longer conflicts with, would be missing from the rows the statement validates, rewrites
+/// or indexes.
+struct FreshReads<'e> {
+    engine: &'e dyn StorageEngine,
+    txn: TxnId,
+}
+
+impl Drop for FreshReads<'_> {
+    fn drop(&mut self) {
+        let _ = self.engine.end_fresh_reads(self.txn);
+    }
+}
+
+/// [`lock_one_for_validation`] then [`fresh_reads`]: one table held and read fresh.
+fn hold_fresh(
+    table: nusadb_core::TableId,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<FreshReads<'_>, Error> {
+    lock_one_for_validation(table, engine, txn)?;
+    fresh_reads(engine, txn)
+}
+
+/// Start [`FreshReads`] for `txn`. The caller holds the locks of every table it will read.
+fn fresh_reads(engine: &dyn StorageEngine, txn: TxnId) -> Result<FreshReads<'_>, Error> {
+    engine.begin_fresh_reads(txn)?;
+    Ok(FreshReads { engine, txn })
+}
+
+/// The exclusive lock [`lock_for_validation`] takes on one table.
+fn lock_one_for_validation(
+    table: nusadb_core::TableId,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    engine
+        .lock_table(
+            txn,
+            table,
+            nusadb_core::engine::TableLockMode::AccessExclusive,
+        )
+        .map_err(Into::into)
+}
+
+/// The `IF EXISTS` outcome for an object that is not there: its notice (`what` names it) when
+/// `if_exists`, else the error `missing` builds.
+fn skip_missing(if_exists: bool, what: &str, missing: impl FnOnce() -> Error) -> Result<(), Error> {
+    if !if_exists {
+        return Err(missing());
+    }
+    crate::notice::skipped_missing(what);
+    Ok(())
 }
 
 // === CREATE / DROP SCHEMA =========================================
@@ -1788,6 +1867,7 @@ pub(super) fn run_create_schema(
 ) -> Result<ExecutionResult, Error> {
     // `IF NOT EXISTS` makes a pre-existing schema a no-op; otherwise the engine rejects a duplicate.
     if plan.if_not_exists && engine.lookup_schema(&plan.name)?.is_some() {
+        crate::notice::skipped_existing("42P06", &format!("schema \"{}\"", plan.name));
         return Ok(ExecutionResult::SchemaCreated);
     }
     engine.create_schema(txn, &plan.name)?;
@@ -1850,13 +1930,11 @@ pub(super) fn run_drop_schema(
             crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
             crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
         },
-        None => {
-            if !plan.if_exists {
-                return Err(Error::SchemaNotFound {
-                    name: plan.name.clone(),
-                });
+        None => skip_missing(plan.if_exists, &format!("schema \"{}\"", plan.name), || {
+            Error::SchemaNotFound {
+                name: plan.name.clone(),
             }
-        },
+        })?,
     }
     Ok(ExecutionResult::SchemaDropped)
 }
@@ -1886,6 +1964,7 @@ pub(super) fn run_create_sequence(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     if plan.if_not_exists && engine.lookup_sequence(&plan.def.name)?.is_some() {
+        crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", plan.def.name));
         return Ok(ExecutionResult::SequenceCreated);
     }
     create_sequence_named(engine, txn, &plan.def)?;
@@ -1904,13 +1983,13 @@ pub(super) fn run_drop_sequence(
             engine.drop_sequence(txn, id)?;
             super::seqcatalog::remove(engine, txn, &plan.name)?;
         },
-        None => {
-            if !plan.if_exists {
-                return Err(Error::SequenceNotFound {
-                    name: plan.name.clone(),
-                });
-            }
-        },
+        None => skip_missing(
+            plan.if_exists,
+            &format!("sequence \"{}\"", plan.name),
+            || Error::SequenceNotFound {
+                name: plan.name.clone(),
+            },
+        )?,
     }
     Ok(ExecutionResult::SequenceDropped)
 }
@@ -1925,13 +2004,13 @@ pub(super) fn run_alter_sequence(
             engine.alter_sequence(txn, id, &plan.change)?;
             super::seqcatalog::apply_change(engine, txn, &plan.name, &plan.change)?;
         },
-        None => {
-            if !plan.if_exists {
-                return Err(Error::SequenceNotFound {
-                    name: plan.name.clone(),
-                });
-            }
-        },
+        None => skip_missing(
+            plan.if_exists,
+            &format!("relation \"{}\"", plan.name),
+            || Error::SequenceNotFound {
+                name: plan.name.clone(),
+            },
+        )?,
     }
     Ok(ExecutionResult::SequenceAltered)
 }
@@ -1957,6 +2036,7 @@ pub(super) fn run_create_index(
             || engine.lookup_index(&spec.name)?.is_some();
         if name_taken {
             if plan.if_not_exists {
+                crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", spec.name));
                 return Ok(ExecutionResult::IndexCreated);
             }
             return Err(nusadb_core::Error::IndexExists {
@@ -1983,9 +2063,13 @@ pub(super) fn run_create_index(
         return Ok(ExecutionResult::IndexCreated);
     }
     if plan.if_not_exists && engine.lookup_index(&plan.def.name)?.is_some() {
+        crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", plan.def.name));
         return Ok(ExecutionResult::IndexCreated);
     }
     engine.create_index(txn, &plan.def)?;
+    // The index holds the table now: the backfill reads every committed row, not the snapshot
+    // taken before the lock, which would miss a writer that committed in between.
+    let _fresh = fresh_reads(engine, txn)?;
     // Backfill existing rows so an index created on a populated table is not missing them (which
     // would make a later index scan return wrong results).
     if let (Some(id), Some(table)) = (
@@ -2019,6 +2103,9 @@ pub(super) fn run_drop_index(
                 name: plan.name.clone(),
             });
         }
+        if !dropped {
+            crate::notice::skipped_missing(&format!("index \"{}\"", plan.name));
+        }
     }
     Ok(ExecutionResult::IndexDropped)
 }
@@ -2047,7 +2134,10 @@ pub(super) fn run_alter_table(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let (table, op) = match plan {
-        AlterTablePlan::Noop => return Ok(ExecutionResult::Altered),
+        AlterTablePlan::Noop { code, message } => {
+            crate::notice::raise(crate::notice::Severity::Notice, code, message);
+            return Ok(ExecutionResult::Altered);
+        },
         // The column first, then its constraints, each validating the rows (with the column's
         // DEFAULT backfilled). An error leaves nothing of the statement: the column goes with it.
         AlterTablePlan::AddColumnWithConstraints { add, constraints } => {
@@ -2122,6 +2212,9 @@ pub(super) fn run_alter_table(
             primary,
             nulls_not_distinct,
         } => {
+            // Taken before the rows are validated, so no other transaction's unfinished write can
+            // slip a duplicate past the check (a prepared one refuses it with 55006).
+            let _fresh = lock_for_validation(&table, engine, txn)?;
             refuse_unique_without_partition_key(
                 &table.schema,
                 &table.name,
@@ -2178,7 +2271,10 @@ pub(super) fn run_alter_table(
         // ADD FOREIGN KEY: register it, then validate the table's existing rows reference
         // live parent rows. A violation errors and the rollback-aware DDL unwinds the registration.
         AlterTablePlan::AddForeignKey { table, fk } => {
+            let _held = lock_for_validation(&table, engine, txn)?;
+            // Registering takes the parent too; the reads are refreshed once both are held.
             register_foreign_key(table.id, &table.schema, &fk, engine, txn)?;
+            let _fresh = fresh_reads(engine, txn)?;
             let existing = scan_rows(&table, engine, txn)?;
             // Validating rows already in the table when a key is added: nothing is pending.
             dml::enforce_fk_on_child_write(&table, &existing, &[], engine, txn)?;
@@ -2241,11 +2337,14 @@ pub(super) fn run_alter_table(
                 .iter()
                 .any(|c| c.name == name);
             if !present {
-                if if_exists {
-                    return Ok(ExecutionResult::Altered);
-                }
                 let relation = dml::schema_by_id(engine, table)?
                     .map_or_else(|| format!("#{}", table.0), |t| t.name);
+                if if_exists {
+                    crate::notice::skipped_missing(&format!(
+                        "constraint \"{name}\" of relation \"{relation}\""
+                    ));
+                    return Ok(ExecutionResult::Altered);
+                }
                 return Err(Error::ObjectNotFound(format!(
                     "constraint \"{name}\" of relation \"{relation}\" does not exist"
                 )));
@@ -2264,6 +2363,7 @@ pub(super) fn run_alter_table(
             predicate_sql,
             predicate,
         } => {
+            let _fresh = lock_for_validation(&table, engine, txn)?;
             for row in &scan_rows(&table, engine, txn)? {
                 if matches!(eval::eval(&predicate, row)?, ast::Value::Bool(false)) {
                     return Err(nusadb_core::Error::ConstraintViolation(format!(
@@ -2333,6 +2433,7 @@ pub(super) fn run_alter_table(
                 txn,
             )?;
             register_partition(&def, &part, engine, txn)?;
+            let _fresh = lock_for_validation(&partition, engine, txn)?;
             validate_attach_rows(&parent, &partition, engine, txn)?;
             propagate_parent_constraints(
                 &def,
@@ -2367,6 +2468,13 @@ pub(super) fn run_alter_table(
                         "table \"{partition}\" is not a partition of \"{parent}\""
                     )));
                 },
+            }
+            // Leaving the parent changes which rows the parent holds, so the partition is taken
+            // exclusively like any change to its shape (a prepared transaction's refuses it).
+            if let Some(detached) =
+                engine.lookup_table_as_of_in(txn, &partition_schema, &partition)?
+            {
+                lock_one_for_validation(detached.id, engine, txn)?;
             }
             super::partition::remove_partition_entry(engine, txn, &partition_key)?;
             super::inheritance::remove_edge(engine, txn, &partition_key, &parent_key)?;
@@ -2426,6 +2534,14 @@ fn apply_column_change(
     // them too: their rows are read through it, so their columns must stay its columns.
     refuse_inherited_column_change(table, op, engine, txn)?;
     let below = column_change_descendants(table, op, engine, txn)?;
+    // Every table the change reaches is held before any of their rows is checked or rewritten
+    // (`SET NOT NULL`, a type change): a writer's row committed between the check and the change
+    // would otherwise escape it.
+    lock_one_for_validation(table.id, engine, txn)?;
+    for (child, _) in &below {
+        lock_one_for_validation(child.id, engine, txn)?;
+    }
+    let _fresh = fresh_reads(engine, txn)?;
     let renamed = match op {
         AlterColumnOp::RenameColumn { index, to } => {
             Some((column_name(table, *index)?, to.clone()))

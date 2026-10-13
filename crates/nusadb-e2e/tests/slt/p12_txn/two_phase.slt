@@ -1,0 +1,84 @@
+# p12_txn/two_phase: PREPARE TRANSACTION, COMMIT PREPARED, ROLLBACK PREPARED on one connection.
+# A prepared transaction's writes stay invisible until it is committed, and the connection is back
+# in autocommit as soon as it is prepared. Finishing it from another connection, the locks it keeps
+# and its crash recovery are covered by the e2e, wire and engine tests.
+
+statement ok
+CREATE TABLE tp (id INT PRIMARY KEY, v TEXT)
+
+statement ok
+INSERT INTO tp VALUES (1, 'a')
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE tp SET v = 'b' WHERE id = 1
+
+statement ok
+INSERT INTO tp VALUES (2, 'c')
+
+statement ok
+PREPARE TRANSACTION 'slt-one'
+
+query IT
+SELECT id, v FROM tp ORDER BY id
+----
+1 a
+
+query T
+SELECT gid FROM nusadb_prepared_xacts
+----
+slt-one
+
+statement ok
+COMMIT PREPARED 'slt-one'
+
+query IT
+SELECT id, v FROM tp ORDER BY id
+----
+1 b
+2 c
+
+query I
+SELECT count(*) FROM nusadb_prepared_xacts
+----
+0
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM tp
+
+statement ok
+PREPARE TRANSACTION 'slt-two'
+
+query I
+SELECT count(*) FROM tp
+----
+2
+
+statement ok
+ROLLBACK PREPARED 'slt-two'
+
+query I
+SELECT count(*) FROM tp
+----
+2
+
+statement error does not exist
+COMMIT PREPARED 'slt-two'
+
+statement error transaction blocks
+PREPARE TRANSACTION 'nothing-open'
+
+# A name may be used again once its transaction is finished.
+statement ok
+BEGIN
+
+statement ok
+PREPARE TRANSACTION 'slt-one'
+
+statement ok
+ROLLBACK PREPARED 'slt-one'

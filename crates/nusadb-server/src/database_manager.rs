@@ -100,6 +100,9 @@ pub(crate) struct DatabaseManager {
     /// Set when this server is a standby following a primary's archive: every database is
     /// read-only, seeded from `<root>/<database>/` and kept up to date by its apply scheduler.
     standby: Option<StandbyConfig>,
+    /// The prepared-transaction ceiling applied to every database's engine as it opens; `None`
+    /// keeps the engine's default.
+    max_prepared_transactions: Option<usize>,
     state: Mutex<ManagerState>,
 }
 
@@ -113,6 +116,30 @@ impl std::fmt::Debug for DatabaseManager {
 }
 
 impl DatabaseManager {
+    /// The refusal for dropping `name` while prepared transactions wait in it, from a private open
+    /// of its log; `None` when there are none or the database cannot be opened here. The caller
+    /// holds the cluster state with the database's engine out of the cache.
+    fn prepared_in(&self, name: &str) -> Result<Option<ClusterError>, ClusterError> {
+        let wal = database_wal(&self.root, self.legacy_root, &self.default_name, name);
+        if !wal.exists() && !wal.with_extension("wal.ckpt").exists() {
+            return Ok(None);
+        }
+        let Ok(engine) = BtreeEngine::open_with_archive(&wal, self.archive_dir(name)) else {
+            return Ok(None);
+        };
+        let waiting = engine
+            .list_prepared()
+            .map_err(|e| ClusterError::Io(e.to_string()))?;
+        Ok(waiting.first().map(|first| {
+            ClusterError::Protected(format!(
+                "cannot drop database \"{name}\": {} prepared transaction(s) are waiting in it \
+                 (\"{}\" first); finish them with COMMIT PREPARED or ROLLBACK PREPARED",
+                waiting.len(),
+                first.gid
+            ))
+        }))
+    }
+
     /// Open (or bootstrap) a cluster rooted at `data_dir`. On a fresh directory this creates the
     /// `global/` catalog and the default database `default_name`.
     pub(crate) fn open(
@@ -127,6 +154,7 @@ impl DatabaseManager {
             checkpoint,
             wal_archive,
             standby,
+            max_prepared_transactions,
         } = durability;
         let root = data_dir.as_ref().to_path_buf();
         let default_name = default_name.into();
@@ -194,6 +222,7 @@ impl DatabaseManager {
             checkpoint,
             wal_archive,
             standby,
+            max_prepared_transactions,
             state: Mutex::new(ManagerState {
                 databases,
                 engines: HashMap::new(),
@@ -341,8 +370,13 @@ impl DatabaseManager {
                 // ceilings AFTER open() means recovery (which does not go through `insert`) always
                 // replays the full committed log even when the data exceeds the resident ceiling.
                 .map(|e| {
-                    e.with_max_txn_write_bytes(self.max_txn_write_bytes)
-                        .with_max_total_resident_bytes(self.max_resident_bytes)
+                    let e = e
+                        .with_max_txn_write_bytes(self.max_txn_write_bytes)
+                        .with_max_total_resident_bytes(self.max_resident_bytes);
+                    if let Some(limit) = self.max_prepared_transactions {
+                        e.set_max_prepared_transactions(limit);
+                    }
+                    e
                 })
                 .map_err(|e| {
                     // Surface a refused open (e.g. a corrupt WAL mid-log hole) in the SERVER log,
@@ -656,6 +690,10 @@ pub(crate) struct DurabilityOptions {
     pub(crate) wal_archive: Option<PathBuf>,
     /// Follow a primary's archive as a read-only standby; `None` serves as a primary.
     pub(crate) standby: Option<StandbyConfig>,
+    /// How many prepared transactions may wait at once in each database
+    /// (`--max-prepared-transactions`; `0` refuses `PREPARE TRANSACTION`). `None` keeps the
+    /// engine's default.
+    pub(crate) max_prepared_transactions: Option<usize>,
 }
 
 /// Policy for the background runtime checkpoint: fold the log into a checkpoint image once it
@@ -1106,6 +1144,15 @@ impl DatabaseCluster for DatabaseManager {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        // A prepared transaction waits in the database's own log for a COMMIT PREPARED or
+        // ROLLBACK PREPARED; dropping the database would silently decide it. Asked here, with the
+        // cluster state held and no engine of it left in memory, so nothing can prepare between
+        // the answer and the drop: its log is recovered by a private open and let go again. One
+        // that cannot be opened (another process holds it, or it is damaged) is left to the lock
+        // below, which refuses the first and lets the second be dropped.
+        if let Some(first) = self.prepared_in(name)? {
+            return Err(first);
+        }
         // The database's lock before anything changes: a process outside this server that has it
         // open keeps it, and the drop is refused with the catalog and the directory untouched.
         let dir = base_dir(&self.root, name);
@@ -1431,6 +1478,35 @@ mod tests {
         assert!(!base_dir(dir.path(), "shop").exists());
     }
 
+    /// `DROP DATABASE` would decide a prepared transaction waiting in the database, so it is refused
+    /// while one waits, also after the server restarts, and allowed once it is finished.
+    #[test]
+    fn dropping_a_database_with_a_prepared_transaction_is_refused() {
+        use nusadb_core::engine::IsolationLevel;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = manager(dir.path());
+            assert!(m.create("shop", false).unwrap());
+            let engine = m.open("shop").unwrap().expect("shop engine");
+            let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+            engine.prepare_transaction(txn, "g", "u", "shop").unwrap();
+            drop(engine);
+            let err = m.drop_database("shop", false, "nusadb").unwrap_err();
+            assert!(matches!(err, ClusterError::Protected(_)), "{err:?}");
+            assert_eq!(err.sqlstate(), "55006");
+        }
+        // A new server over the same directory finds it prepared again and refuses again.
+        let m = manager(dir.path());
+        let err = m.drop_database("shop", false, "nusadb").unwrap_err();
+        assert!(matches!(err, ClusterError::Protected(_)), "{err:?}");
+        assert!(base_dir(dir.path(), "shop").exists());
+        let engine = m.open("shop").unwrap().expect("shop engine");
+        engine.rollback_prepared("g", None).unwrap();
+        drop(engine);
+        assert!(m.drop_database("shop", false, "nusadb").unwrap());
+        assert!(!base_dir(dir.path(), "shop").exists());
+    }
+
     #[test]
     fn purge_cadence_speeds_up_under_backlog_but_never_slower_than_the_base() {
         // A pass that reclaimed a batch-plus of work keeps the fast cadence so churn cannot outrun
@@ -1455,6 +1531,37 @@ mod tests {
             let delay = next_purge_delay(reclaimed);
             assert!(delay >= PURGE_MIN_INTERVAL && delay <= PURGE_INTERVAL);
         }
+    }
+
+    #[test]
+    fn open_threads_the_prepared_transaction_limit_to_each_database_engine() {
+        use nusadb_core::engine::IsolationLevel;
+        // The --max-prepared-transactions wiring: a limit of 0 reaches the engine, which then
+        // refuses PREPARE TRANSACTION; no limit keeps the engine's default, which allows it.
+        let prepare = |limit: Option<usize>| {
+            let tmp = tempfile::tempdir().unwrap();
+            let manager = DatabaseManager::open(
+                tmp.path(),
+                "nusadb",
+                None,
+                None,
+                NO_AUTOANALYZE,
+                DurabilityOptions {
+                    max_prepared_transactions: limit,
+                    ..DurabilityOptions::default()
+                },
+            )
+            .expect("open cluster");
+            let engine = manager.open("nusadb").unwrap().expect("default engine");
+            let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+            engine.prepare_transaction(txn, "g", "u", "nusadb")
+        };
+        let refused = prepare(Some(0)).unwrap_err();
+        assert!(
+            matches!(&refused, nusadb_core::Error::Io(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "{refused:?}"
+        );
+        prepare(None).unwrap();
     }
 
     #[test]
@@ -1690,6 +1797,7 @@ mod tests {
                 checkpoint: None,
                 wal_archive: Some(archive_root.clone()),
                 standby: None,
+                max_prepared_transactions: None,
             },
         )
         .expect("open primary");
@@ -1727,6 +1835,7 @@ mod tests {
                 checkpoint: None,
                 wal_archive: None,
                 standby: Some(cfg.clone()),
+                max_prepared_transactions: None,
             },
         )
         .expect("open standby");
@@ -1795,6 +1904,7 @@ mod tests {
                 checkpoint: None,
                 wal_archive: Some(archive_root.clone()),
                 standby: None,
+                max_prepared_transactions: None,
             },
         )
         .expect("open cluster");

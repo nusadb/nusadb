@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::parser::{ScriptBlock, ScriptStmt, TriggerReturn};
+use crate::parser::{RaiseLevel, ScriptBlock, ScriptStmt, TriggerReturn};
 
 /// Maximum `WHILE` iterations before a loop is aborted as non-terminating.
 const MAX_LOOP_ITERS: u64 = 1_000_000;
@@ -242,6 +242,11 @@ fn exec_one(
             let value = eval_value(expr, env, params, engine, txn)?;
             Err(Error::Raised(message_text(&value)))
         },
+        ScriptStmt::RaiseMessage {
+            level,
+            format,
+            args,
+        } => raise_message(*level, format, args, env, params, engine, txn),
         ScriptStmt::Return(expr) => {
             let value = match expr {
                 Some(expr) => Some(eval_value(expr, env, params, engine, txn)?),
@@ -328,6 +333,64 @@ fn wrap_select(expr: ast::Expr) -> ast::Statement {
         offset: None,
         lock: None,
     })
+}
+
+/// `RAISE level 'format', args`: an error for `EXCEPTION`, nothing for `LOG`/`DEBUG`, a notice
+/// for the rest.
+fn raise_message(
+    level: RaiseLevel,
+    format: &str,
+    args: &[ast::Expr],
+    env: &Env,
+    params: &[ast::Value],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Flow, Error> {
+    let values = args
+        .iter()
+        .map(|arg| eval_value(arg, env, params, engine, txn))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let message = format_raise(format, &values)?;
+    let (severity, code) = match level {
+        RaiseLevel::Exception => return Err(Error::Raised(message)),
+        // Server-side levels: nothing reaches the client.
+        RaiseLevel::Debug | RaiseLevel::Log => return Ok(Flow::Normal),
+        RaiseLevel::Info => (crate::notice::Severity::Info, "00000"),
+        RaiseLevel::Notice => (crate::notice::Severity::Notice, "00000"),
+        RaiseLevel::Warning => (crate::notice::Severity::Warning, "01000"),
+    };
+    crate::notice::raise(severity, code, message);
+    Ok(Flow::Normal)
+}
+
+/// Fill a `RAISE` format: each `%` takes the next value (`NULL` shows as `<NULL>`), `%%` is a
+/// literal `%`. The number of `%` must match the number of values.
+fn format_raise(format: &str, values: &[ast::Value]) -> Result<String, Error> {
+    let mut out = String::with_capacity(format.len());
+    let mut next = values.iter();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+        } else if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+        } else {
+            let value = next.next().ok_or_else(|| {
+                Error::InvalidStatement("too few parameters specified for RAISE".to_owned())
+            })?;
+            match value {
+                ast::Value::Null => out.push_str("<NULL>"),
+                other => out.push_str(&message_text(other)),
+            }
+        }
+    }
+    if next.next().is_some() {
+        return Err(Error::InvalidStatement(
+            "too many parameters specified for RAISE".to_owned(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Render a value as the text of a `RAISE` message.

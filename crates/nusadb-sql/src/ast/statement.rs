@@ -344,6 +344,14 @@ pub enum Statement {
     RollbackToSavepoint(String),
     /// `RELEASE [SAVEPOINT] name` — discard a named savepoint.
     ReleaseSavepoint(String),
+    /// `PREPARE TRANSACTION 'gid'`: make the open transaction durable as a prepared transaction
+    /// named `gid` and leave it, for a later `COMMIT PREPARED` or `ROLLBACK PREPARED` from any
+    /// session.
+    PrepareTransaction(String),
+    /// `COMMIT PREPARED 'gid'`: commit the prepared transaction named `gid`.
+    CommitPrepared(String),
+    /// `ROLLBACK PREPARED 'gid'`: roll back the prepared transaction named `gid`.
+    RollbackPrepared(String),
     /// `SET TRANSACTION ...`: set characteristics for the current transaction, before its first
     /// statement.
     SetTransaction(TransactionSettings),

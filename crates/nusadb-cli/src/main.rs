@@ -136,6 +136,9 @@ where
             sink: Some(&mut stdout),
         };
         let result = collect_result_with_copy(conn, &stmt, copy).await?;
+        for notice in &result.notices {
+            eprintln!("{notice}");
+        }
         stdin_unread &= !result.copied_in;
         all_ok &= result.error.is_none();
         for line in format_result(&result, format) {
@@ -231,6 +234,9 @@ where
         for stmt in split_statements(&sql_owned) {
             match collect_result(conn, &stmt).await {
                 Ok(result) => {
+                    for notice in &result.notices {
+                        eprintln!("{notice}");
+                    }
                     for line in format_result(&result, format) {
                         println!("{line}");
                     }

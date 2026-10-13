@@ -390,6 +390,12 @@ pub enum LogicalPlan {
     Commit,
     /// `ROLLBACK` — abort the explicit transaction.
     Rollback,
+    /// `PREPARE TRANSACTION 'gid'`: prepare the explicit transaction for a two-phase commit.
+    PrepareTransaction(String),
+    /// `COMMIT PREPARED 'gid'`: commit a prepared transaction.
+    CommitPrepared(String),
+    /// `ROLLBACK PREPARED 'gid'`: roll back a prepared transaction.
+    RollbackPrepared(String),
     /// `SET TRANSACTION`: set the current transaction's characteristics, before its first
     /// statement.
     SetTransaction(TxnCharacteristics),
@@ -1279,8 +1285,14 @@ pub enum AlterTablePlan {
         /// The single operation to apply.
         op: AlterColumnOp,
     },
-    /// An `IF [NOT] EXISTS` guard made the statement a no-op.
-    Noop,
+    /// An `IF [NOT] EXISTS` guard made the statement a no-op. The executor raises the notice
+    /// that says so: `code` and `message` as [`crate::notice`] sends them.
+    Noop {
+        /// The notice's SQLSTATE (`00000` for a missing object, `42701` for an existing column).
+        code: &'static str,
+        /// The notice's text.
+        message: String,
+    },
     /// `ADD COLUMN` with constraints of its own: the column is added (`add`), then each constraint
     /// (`AddCheck` / `AddForeignKey` / `AddUniqueConstraint`, analyzed against the table with the
     /// new column), all in the same statement, so a constraint the existing rows break leaves no
@@ -2694,6 +2706,12 @@ pub enum PhysicalPlan {
     Commit,
     /// `ROLLBACK` — abort the explicit transaction.
     Rollback,
+    /// `PREPARE TRANSACTION 'gid'`: prepare the explicit transaction for a two-phase commit.
+    PrepareTransaction(String),
+    /// `COMMIT PREPARED 'gid'`: commit a prepared transaction.
+    CommitPrepared(String),
+    /// `ROLLBACK PREPARED 'gid'`: roll back a prepared transaction.
+    RollbackPrepared(String),
     /// `SET TRANSACTION`: set the current transaction's characteristics, before its first
     /// statement.
     SetTransaction(TxnCharacteristics),

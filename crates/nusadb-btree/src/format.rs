@@ -25,7 +25,11 @@ use std::path::{Path, PathBuf};
 use nusadb_core::{Error, Result};
 
 /// The data format this release writes.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Format 2 adds the records of prepared transactions (`PREPARE TRANSACTION`) to the log and
+/// the checkpoint image. A format-1 directory is a valid format-2 one, so its upgrade only
+/// records the new number.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// One step bringing a directory from format `from` to `from + 1`, given its log path.
 pub(crate) struct Upgrade {
@@ -33,8 +37,22 @@ pub(crate) struct Upgrade {
     pub(crate) run: fn(&Path) -> Result<()>,
 }
 
-/// The upgrade steps, in order. Format 1 is the first, so there are none yet.
-pub(crate) const UPGRADES: &[Upgrade] = &[];
+/// The upgrade steps, in order.
+pub(crate) const UPGRADES: &[Upgrade] = &[Upgrade {
+    from: 1,
+    run: upgrade_1_to_2,
+}];
+
+/// Format 1 to 2: nothing on disk changes. Format 2 only adds record kinds, which a format-1
+/// directory does not contain; the number is raised so that a release reading format 1 alone
+/// refuses a directory that may now hold them.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "an upgrade step's signature is fallible"
+)]
+const fn upgrade_1_to_2(_: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// The format file beside the log: `<wal>.format`.
 pub(crate) fn format_path(wal: &Path) -> PathBuf {

@@ -325,6 +325,12 @@ pub(super) fn run_drop_trigger(
             table: plan.table.clone(),
         });
     }
+    if !removed {
+        crate::notice::skipped_missing(&format!(
+            "trigger \"{}\" for relation \"{}\"",
+            plan.name, plan.table
+        ));
+    }
     Ok(ExecutionResult::TriggerDropped)
 }
 
@@ -1688,6 +1694,12 @@ fn sub_script_stmt(stmt: &mut ScriptStmt, refs: &RowRefs<'_>) -> Result<(), Erro
             sub_script_stmts(body, refs)
         },
         ScriptStmt::Perform(expr) | ScriptStmt::Raise(expr) => sub_expr(expr, refs),
+        ScriptStmt::RaiseMessage { args, .. } => {
+            for arg in args {
+                sub_expr(arg, refs)?;
+            }
+            Ok(())
+        },
         // Rewritten above.
         ScriptStmt::Return(_) | ScriptStmt::ReturnRow(_) => Ok(()),
         ScriptStmt::Sql(stmt) => substitute_row_refs(stmt, refs),

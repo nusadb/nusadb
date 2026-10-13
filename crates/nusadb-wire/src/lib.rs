@@ -49,8 +49,10 @@ pub const PROTOCOL_MAGIC: u32 = 0x4E55_5341;
 /// [`RowDescriptionTyped`](messages::BackendMessage::RowDescriptionTyped) message, sent only when
 /// the connection negotiated `minor >= 1`. **1.2** carries the *element* type of an `ARRAY` column in
 /// its type tag (`0x80 | element_tag`) so a client decodes the elements at their real type rather than
-/// as text; a `minor < 2` connection keeps the plain `ARRAY` tag (`0x0F`).
-pub const PROTOCOL_VERSION: (u16, u16) = (1, 2);
+/// as text; a `minor < 2` connection keeps the plain `ARRAY` tag (`0x0F`). **1.3** adds the
+/// [`NoticeResponse`](messages::BackendMessage::NoticeResponse) message, sent only when the
+/// connection negotiated `minor >= 3`, ahead of the completion of the statement that raised it.
+pub const PROTOCOL_VERSION: (u16, u16) = (1, 3);
 
 /// The high bit marking an element-typed `ARRAY` tag (protocol 1.2).
 ///

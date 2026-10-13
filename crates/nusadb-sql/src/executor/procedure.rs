@@ -112,6 +112,9 @@ pub(super) fn run_drop_procedure(
             name: plan.name.clone(),
         });
     }
+    if !removed {
+        crate::notice::skipped_missing(&format!("procedure {}()", plan.name));
+    }
     Ok(ExecutionResult::ProcedureDropped)
 }
 

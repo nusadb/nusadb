@@ -331,6 +331,13 @@ pub trait Catalog {
         "nusadb-root".to_owned()
     }
 
+    /// The prepared transactions of the database, for the `nusadb_prepared_xacts` view (see
+    /// [`crate::two_phase`]). The default, for a catalog with no engine behind it, is none; the
+    /// production adapters ask the engine.
+    fn prepared_transactions(&self) -> Result<Vec<nusadb_core::PreparedTransaction>, Error> {
+        Ok(Vec::new())
+    }
+
     /// The row-level-security policies defined on base table `name`. Default empty so a
     /// minimal catalog has none; the production adapter reads the policy catalog. Consulted only for
     /// a non-superuser whose query targets a single RLS-enabled base table.
@@ -665,6 +672,9 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
     // and render zone-dependent temporal values in the SAME zone, or a folded constant would
     // disagree with its per-row evaluation.
     crate::executor::pin_statement_timezone(catalog.session_timezone().as_deref());
+    let mut stmt = stmt;
+    // The prepared-transaction view is the engine's live state, read into the query here.
+    crate::two_phase::rewrite_view(&mut stmt, catalog)?;
     match stmt {
         ast::Statement::CreateTable(ct) => {
             analyze_create_table(ct, catalog).map(LogicalPlan::CreateTable)
@@ -1106,6 +1116,11 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         )),
         ast::Statement::Commit => Ok(LogicalPlan::Commit),
         ast::Statement::Rollback => Ok(LogicalPlan::Rollback),
+        // Two-phase commit needs the session (which transaction is open, who runs it), so it is
+        // checked and run by whoever holds it (see `crate::two_phase`).
+        ast::Statement::PrepareTransaction(gid) => Ok(LogicalPlan::PrepareTransaction(gid)),
+        ast::Statement::CommitPrepared(gid) => Ok(LogicalPlan::CommitPrepared(gid)),
+        ast::Statement::RollbackPrepared(gid) => Ok(LogicalPlan::RollbackPrepared(gid)),
         // Savepoints: the engine implements savepoint / rollback_to / release_savepoint, so
         // carry the name through to the executor, which runs it against the active transaction.
         ast::Statement::Savepoint(name) => Ok(LogicalPlan::Savepoint(name)),

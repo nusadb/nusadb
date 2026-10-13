@@ -25,8 +25,8 @@ pub mod traits;
 
 pub use engine::{
     AlterOp, ArrayElem, ColumnDef, ColumnStats, ColumnType, Constraint, ConstraintKind, FkAction,
-    ForeignKeyDef, IndexDef, IndexKind, IsolationLevel, PUBLIC_SCHEMA, SharedTuple, StorageEngine,
-    TableDef, TableSchema, TableStats, Tid, Tuple, TupleScan,
+    ForeignKeyDef, IndexDef, IndexKind, IsolationLevel, PUBLIC_SCHEMA, PreparedTransaction,
+    SharedTuple, StorageEngine, TableDef, TableSchema, TableStats, Tid, Tuple, TupleScan,
 };
 pub use error::{Error, Result};
 pub use ids::{IndexId, Lsn, PageId, SchemaId, SequenceId, SlotIdx, TableId, TxnId};

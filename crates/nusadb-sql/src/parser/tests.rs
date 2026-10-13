@@ -6385,3 +6385,33 @@ fn malformed_fetch_and_move_are_syntax_errors() {
         Err(Error::Unsupported(_))
     ));
 }
+
+#[test]
+fn two_phase_statements_parse_with_any_spacing_and_comments() {
+    for sql in [
+        "PREPARE TRANSACTION 'g1'",
+        "prepare   transaction\t'g1' ;",
+        "/* coordinator */ PREPARE\n  TRANSACTION 'g1'",
+        "-- branch one\nPREPARE TRANSACTION 'g1'",
+    ] {
+        assert_eq!(
+            parse(sql).unwrap(),
+            ast::Statement::PrepareTransaction("g1".to_owned()),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        parse("COMMIT   PREPARED  'it''s'").unwrap(),
+        ast::Statement::CommitPrepared("it's".to_owned())
+    );
+    assert_eq!(
+        parse("rollback prepared 'x'").unwrap(),
+        ast::Statement::RollbackPrepared("x".to_owned())
+    );
+    assert!(matches!(parse("COMMIT PREPARED g1"), Err(Error::Syntax(_))));
+    // Not a literal: still an ordinary prepared statement named `transaction`.
+    assert!(matches!(
+        parse("PREPARE transaction AS SELECT 1").unwrap(),
+        ast::Statement::Prepare { .. }
+    ));
+}

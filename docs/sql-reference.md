@@ -47,6 +47,7 @@ A quick map from the statement you are looking for to the section that shows it.
 | `PREPARE`, `EXECUTE`, `DEALLOCATE`, parameters `$1..$n` | [Prepared statements](#prepared-statements) |
 | `DECLARE`, `FETCH`, `MOVE`, `CLOSE` | [Cursors](#cursors) |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `SET TRANSACTION` | [Transactions and locking](#transactions-and-locking) |
+| `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED` | [Transactions and locking](#transactions-and-locking) |
 | `SELECT ... FOR UPDATE`, `LOCK TABLE` | [Row and table locks](#row-and-table-locks) |
 | `LISTEN`, `UNLISTEN`, `NOTIFY` | [Notifications](#notifications) |
 | `ANALYZE`, `VACUUM`, `REINDEX`, `CLUSTER`, `CHECKPOINT`, `CREATE EXTENSION` | [Maintenance](#maintenance) |
@@ -1334,6 +1335,28 @@ SQL data statement. An `EXCEPTION WHEN OTHERS THEN` handler rolls the body's wri
 savepoint and runs in their place. Variables may be referenced by name inside embedded SQL; a
 column of the same name wins. `LANGUAGE SQL` is the only language.
 
+`RAISE level 'format' [, value ...]` fills each `%` in the format with the next value (`%%` is a
+literal `%`, `NULL` shows as `<NULL>`, and the counts must match, `42601` otherwise). `EXCEPTION`
+aborts like `RAISE 'message'`; `NOTICE`, `INFO` and `WARNING` send the message to the client as a
+notice and carry on; `LOG` and `DEBUG` carry on and send nothing.
+
+```sql
+DO $$
+BEGIN
+  RAISE NOTICE 'archived % rows into %', 12, 'audit_2026';
+  RAISE WARNING 'quota at %%: %', 95;    -- WARNING: quota at %: 95
+END
+$$;
+```
+
+Notices reach a client that negotiated protocol 1.3 (see the
+[wire protocol](wire-protocol.md#94-notices-protocol-13)); an embedded session returns them from
+`Session::take_notices`. At most 1000 are kept per statement (and, in an embedded session, between
+two calls to `take_notices`); the rest are dropped and counted by one closing `WARNING`. Besides
+`RAISE`, the server sends one for every `IF EXISTS` that found nothing to drop
+(`NOTICE: table "t" does not exist, skipping`) and every `IF NOT EXISTS` that found the object
+already there (`NOTICE: relation "t" already exists, skipping`, code `42P07`).
+
 ### `DO` blocks
 
 The same body grammar, run once without parameters:
@@ -1581,6 +1604,10 @@ COMMIT;                                            -- or END
 ROLLBACK;
 
 SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE;   -- session default
+
+PREPARE TRANSACTION 'gid';      -- two-phase commit: keep the transaction, prepared
+COMMIT PREPARED 'gid';          -- from any connection, outside a transaction block
+ROLLBACK PREPARED 'gid';
 ```
 
 The default isolation level is `READ COMMITTED`. A statement outside `BEGIN` runs in its own
@@ -1588,7 +1615,8 @@ transaction. `SET TRANSACTION` configures the open transaction and must come bef
 statement (`25001` after it); outside a transaction it is refused (`25P01`).
 `SET SESSION CHARACTERISTICS AS TRANSACTION` sets the default for transactions begun later.
 After an error inside a transaction, every further statement is refused with `25P02` until
-`ROLLBACK` (or `ROLLBACK TO SAVEPOINT`).
+`ROLLBACK` (or `ROLLBACK TO SAVEPOINT`). Two-phase commit, its error codes and the
+`nusadb_prepared_xacts` view are described in [transactions](transactions.md#two-phase-commit).
 
 Several statements sent as one simple query (`INSERT ...; UPDATE ...`) run as one transaction
 unless they are already inside one: an error rolls back all of them. A `BEGIN` among them opens an
@@ -1712,6 +1740,7 @@ FROM   information_schema.attributes;                 -- fields of composite typ
 SELECT * FROM information_schema.user_defined_types;  -- composite types
 
 SELECT * FROM nusadb_databases;       -- every database in this server
+SELECT * FROM nusadb_prepared_xacts;  -- prepared transactions (transaction, gid, prepared, owner, database)
 SELECT * FROM nusadb_triggers;        -- likewise nusadb_roles, nusadb_policies, nusadb_procedures,
                                       -- nusadb_functions, nusadb_matviews
 
@@ -1727,7 +1756,9 @@ SELECT nusadb_typeof(1.5), nusadb_typeof(now());
 param_names, body, language, return_type)`, `nusadb_matviews (name, def)`,
 `nusadb_partitions (role, table, aux, lo, hi)`, `nusadb_inheritance (child, parent, seq)`,
 `nusadb_sequences`, `nusadb_databases (name)`. Only a superuser may read a `nusadb_*` catalog; every other role uses
-`information_schema`. A catalog that has never been written to may not exist yet, in which case
+`information_schema`. Two are views every role may read: `nusadb_databases`, and
+`nusadb_prepared_xacts`, which shows a superuser every prepared transaction of the database and
+any other role its own. A catalog that has never been written to may not exist yet, in which case
 selecting from it reports `42P01`.
 
 In `nusadb-cli`, `\dt` runs `SHOW TABLES`, `\d name` runs `SHOW COLUMNS FROM name`, and `\l` lists

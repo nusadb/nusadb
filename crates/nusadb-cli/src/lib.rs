@@ -219,6 +219,10 @@ pub struct QueryResult {
     /// Set when this statement read the caller's source stream to feed `COPY … FROM STDIN`. A
     /// single stream serves one load, so a caller running a batch knows not to offer it again.
     pub copied_in: bool,
+    /// The notices the statement raised, rendered `<SEVERITY>:  <message>` (protocol 1.3). They
+    /// are diagnostics, not part of the result: [`format_result`] leaves them out and the shell
+    /// writes them to stderr.
+    pub notices: Vec<String>,
 }
 
 /// Stream `source` to the server as `CopyData` frames, then `CopyDone`. A read failure sends
@@ -408,6 +412,9 @@ where
             | BackendMessage::ParameterStatus { .. }
             | BackendMessage::NotificationResponse { .. }
             | BackendMessage::BackendKeyData { .. } => {},
+            BackendMessage::NoticeResponse {
+                severity, message, ..
+            } => result.notices.push(format!("{severity}:  {message}")),
         }
     }
 }
