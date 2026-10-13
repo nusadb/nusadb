@@ -3509,7 +3509,61 @@ pub(super) fn run_info_schema(
         V::CheckConstraints => info_schema_check_constraints(engine, txn),
         V::Routines => info_schema_routines(engine, txn),
         V::Sequences => info_schema_sequences(engine, txn),
+        V::UserDefinedTypes => info_schema_user_defined_types(engine, txn),
+        V::Attributes => info_schema_attributes(engine, txn),
     }
+}
+
+/// `information_schema.user_defined_types`: one row per composite type. Types carry no privileges
+/// in this engine, so every role sees every type, exactly as it can use every type in a `CREATE
+/// TABLE` or a cast.
+fn info_schema_user_defined_types(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    Ok(super::all_composites(engine, txn)?
+        .into_iter()
+        .map(|(name, _)| {
+            vec![
+                ast::Value::Text("nusadb".to_owned()),
+                ast::Value::Text(nusadb_core::engine::PUBLIC_SCHEMA.to_owned()),
+                ast::Value::Text(name),
+                ast::Value::Text("STRUCTURED".to_owned()),
+                ast::Value::Text("YES".to_owned()),
+                ast::Value::Text("YES".to_owned()),
+            ]
+        })
+        .collect())
+}
+
+/// `information_schema.attributes`: one row per field of every composite type, numbered from 1 in
+/// declared order. A field of a built-in type reports its standard `data_type` name; a field of a
+/// nested composite or an enum reports `USER-DEFINED`, with its type named in `attribute_udt_name`.
+fn info_schema_attributes(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row>, Error> {
+    let nullable_int =
+        |v: Option<u32>| v.map_or(ast::Value::Null, |n| ast::Value::Int(i64::from(n)));
+    let mut rows = Vec::new();
+    for (type_name, fields) in super::all_composites(engine, txn)? {
+        for (pos, (field, type_sql)) in fields.into_iter().enumerate() {
+            let ty = crate::parser::parse_column_type(&type_sql).ok();
+            let data_type = ty.map_or("USER-DEFINED", info_schema_data_type);
+            rows.push(vec![
+                ast::Value::Text("nusadb".to_owned()),
+                ast::Value::Text(nusadb_core::engine::PUBLIC_SCHEMA.to_owned()),
+                ast::Value::Text(type_name.clone()),
+                ast::Value::Text(field),
+                ast::Value::Int(i64::try_from(pos + 1).unwrap_or(0)),
+                ast::Value::Null,
+                ast::Value::Text("YES".to_owned()),
+                ast::Value::Text(data_type.to_owned()),
+                nullable_int(ty.and_then(char_max_length)),
+                nullable_int(ty.and_then(numeric_precision)),
+                nullable_int(ty.and_then(numeric_scale)),
+                ast::Value::Text(type_sql),
+            ]);
+        }
+    }
+    Ok(rows)
 }
 
 /// The standard `information_schema` rule text for a referential action.

@@ -552,13 +552,19 @@ pub(super) fn convert_expr(expr: sql::Expr) -> Result<ast::Expr, Error> {
                     },
                     sql::AccessExpr::Dot(field) => {
                         // `(expr).field` — composite field access. The field must be a plain
-                        // identifier (`(x).*` and other dotted forms are out of surface).
+                        // identifier. `(x).*` reaches here as an unquoted word `*`, which no
+                        // tokenized input can produce (see `rewrite_composite_star`); a quoted
+                        // `"*"` stays an ordinary field name.
                         let sql::Expr::Identifier(ident) = field else {
                             return unsupported(&format!("composite field access `.{field}`"));
                         };
-                        ast::Expr::FieldAccess {
-                            base: Box::new(base),
-                            field: fold_ident(&ident),
+                        if ident.quote_style.is_none() && ident.value == "*" {
+                            ast::Expr::AllFields(Box::new(base))
+                        } else {
+                            ast::Expr::FieldAccess {
+                                base: Box::new(base),
+                                field: fold_ident(&ident),
+                            }
                         }
                     },
                 };

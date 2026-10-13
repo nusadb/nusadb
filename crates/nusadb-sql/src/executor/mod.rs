@@ -544,7 +544,7 @@ pub fn copy_to_in(
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, String), Error> {
     text_copy_output(copy)?;
-    let (count, bytes) = run_copy_to(copy, user, engine, txn)?;
+    let (count, _, bytes) = run_copy_to(copy, user, engine, txn)?;
     Ok((count, copy_output_text(bytes)?))
 }
 
@@ -559,7 +559,34 @@ pub fn copy_to_bytes_in(
     user: &str,
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, Vec<u8>), Error> {
+    run_copy_to(copy, user, engine, txn).map(|(count, _, bytes)| (count, bytes))
+}
+
+/// [`copy_to_bytes_in`] that also reports how many columns each copied row carries, which the
+/// wire protocol announces before the data.
+///
+/// # Errors
+/// As [`copy_to_bytes_in`]. The caller owns rollback on error.
+pub fn copy_to_bytes_with_columns_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    user: &str,
+    txn: nusadb_core::TxnId,
+) -> Result<(usize, usize, Vec<u8>), Error> {
     run_copy_to(copy, user, engine, txn)
+}
+
+/// The number of columns a table-form `COPY ... FROM STDIN` loads: the listed columns, or every
+/// column of the target table when none are listed.
+///
+/// # Errors
+/// `42P01` for an unknown table, and the errors of an invalid column list.
+pub fn copy_column_count_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    txn: nusadb_core::TxnId,
+) -> Result<usize, Error> {
+    dml::copy_table_column_count(copy, engine, txn)
 }
 
 /// Refuse a binary `COPY` where the caller can only take text output.
@@ -622,7 +649,7 @@ pub fn copy_to(
     text_copy_output(copy)?;
     let txn = engine.begin(IsolationLevel::default())?;
     match run_copy_to(copy, user, engine, txn)
-        .and_then(|(count, bytes)| copy_output_text(bytes).map(|text| (count, text)))
+        .and_then(|(count, _, bytes)| copy_output_text(bytes).map(|text| (count, text)))
     {
         // A failed commit must roll back rather than leak the transaction,
         // mirroring `copy_from` above — even though a read-only COPY TO commits with an empty undo
@@ -1023,6 +1050,39 @@ pub fn execute_in_txn_as_streaming_with_prepared(
         },
         _ => unreachable!("is_prepare_plan admits only PREPARE / EXECUTE / DEALLOCATE"),
     }
+}
+
+/// A statement's output shape: its column names and, parallel to them, their types.
+pub type ColumnShape = (Vec<String>, Vec<ColumnType>);
+
+/// The output column names and types of an `EXECUTE` plan, without running it: the prepared
+/// statement bound to the plan's arguments, analyzed under `catalog` and planned. `None` for any
+/// other plan.
+///
+/// # Errors
+/// The errors `EXECUTE` itself would raise before running: an unknown prepared statement, a wrong
+/// argument count, and analysis errors of the bound statement.
+pub fn describe_prepared_execute(
+    plan: &PhysicalPlan,
+    store: &PreparedStore,
+    catalog: &dyn crate::analyzer::Catalog,
+) -> Result<Option<ColumnShape>, Error> {
+    let PhysicalPlan::Execute { name, args } = plan else {
+        return Ok(None);
+    };
+    let (statement, param_count) = store.lookup(name)?;
+    if args.len() != param_count {
+        return Err(Error::FunctionArgs(format!(
+            "prepared statement \"{name}\" expects {param_count} parameter(s), got {}",
+            args.len()
+        )));
+    }
+    let bound = crate::params::substitute_values(statement, args)?;
+    let physical = crate::plan(crate::analyze(bound, catalog)?);
+    Ok(Some((
+        describe_columns(&physical),
+        describe_column_types(&physical),
+    )))
 }
 
 /// Replay a finished [`ExecutionResult`] into `sink` for a non-streamed statement: a row result
@@ -1550,6 +1610,18 @@ impl CursorStore {
                 pending,
             },
         );
+    }
+
+    /// The output column names and types of the named open cursor, without moving it: what a
+    /// `FETCH` from it returns. The types are empty when the cursor does not know them.
+    ///
+    /// # Errors
+    /// [`Error::CursorNotFound`] when no cursor of that name is open.
+    pub fn describe(&self, name: &str) -> Result<(Vec<String>, Vec<ColumnType>), Error> {
+        self.cursors
+            .get(name)
+            .map(|c| (c.columns.clone(), c.col_types.clone()))
+            .ok_or_else(|| Error::CursorNotFound(format!("cursor \"{name}\" does not exist")))
     }
 
     /// The named open cursor. `Err(CursorNotFound)` when it is not open.
@@ -6028,6 +6100,38 @@ pub fn lookup_composite(
         }
     }
     Ok(Some(fields))
+}
+
+/// A composite type's fields as stored: `(field_name, declared_type_sql)` in declared order.
+pub(super) type CompositeFields = Vec<(String, String)>;
+
+/// Every user-defined composite type, sorted by name, with its fields. Backs
+/// `information_schema.attributes` and `information_schema.user_defined_types`.
+pub(super) fn all_composites(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, CompositeFields)>, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, COMPOSITE_CATALOG)? else {
+        return Ok(Vec::new());
+    };
+    let mut types = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &VIEW_CATALOG_SCHEMA)?;
+        if let [ast::Value::Text(name), ast::Value::Text(def)] = row.as_slice() {
+            let parts: Vec<&str> = def.split(ENUM_LABEL_SEP).collect();
+            let fields = parts
+                .chunks_exact(2)
+                .filter_map(|pair| match pair {
+                    [field, type_sql] => Some(((*field).to_owned(), (*type_sql).to_owned())),
+                    _ => None,
+                })
+                .collect();
+            types.push((name.clone(), fields));
+        }
+    }
+    types.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(types)
 }
 
 /// Record that base-table column `(schema, table, column)` is of composite type `type_name`.

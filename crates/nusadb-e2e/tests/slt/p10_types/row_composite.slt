@@ -112,3 +112,126 @@ DROP TABLE rt
 
 statement ok
 DROP TABLE ct
+
+# `(x).*` expands a composite value into one column per field, named after the field.
+statement ok
+CREATE TYPE pt AS (x INT, y TEXT)
+
+statement ok
+CREATE TABLE cs (id INT, p pt)
+
+statement ok
+INSERT INTO cs VALUES (1, ROW(3, 'three')::pt), (2, ROW(4, 'four')::pt)
+
+query IIT rowsort
+SELECT id, (p).* FROM cs
+----
+1 3 three
+2 4 four
+
+query IT
+SELECT (CAST('(5,five)' AS pt)).*
+----
+5 five
+
+query IT
+SELECT (ROW(6, 'six')).*
+----
+6 six
+
+statement error SELECT-list item
+SELECT id FROM cs WHERE (p).* IS NULL
+
+statement error cannot take an alias
+SELECT (p).* AS z FROM cs
+
+statement error known composite type
+SELECT (id).* FROM cs
+
+# Composite type definitions are listed in information_schema, fields numbered in declared order.
+query TTITT
+SELECT udt_schema, attribute_name, ordinal_position, data_type, is_nullable FROM information_schema.attributes WHERE udt_name = 'pt' ORDER BY ordinal_position
+----
+public x 1 integer YES
+public y 2 text YES
+
+query TTT
+SELECT user_defined_type_schema, user_defined_type_name, user_defined_type_category FROM information_schema.user_defined_types WHERE user_defined_type_name = 'pt'
+----
+public pt STRUCTURED
+
+statement ok
+DROP TABLE cs
+
+statement ok
+DROP TYPE pt
+
+query I
+SELECT count(*) FROM information_schema.attributes WHERE udt_name = 'pt'
+----
+0
+
+# A field literally named `*` is reached with the quoted `(v)."*"`, an ordinary field access in a
+# SELECT list and anywhere else; only the unquoted `(v).*` expands.
+statement ok
+CREATE TYPE star AS ("*" INT, b INT)
+
+statement ok
+CREATE TABLE st (id INT, v star)
+
+statement ok
+INSERT INTO st VALUES (1, ROW(7, 8)::star), (2, ROW(9, 10)::star)
+
+query I
+SELECT (v)."*" FROM st ORDER BY id
+----
+7
+9
+
+query I
+SELECT id FROM st WHERE (v)."*" = 9
+----
+2
+
+query II
+SELECT (v).* FROM st WHERE id = 1
+----
+7 8
+
+statement ok
+DROP TABLE st
+
+statement ok
+DROP TYPE star
+
+# A positional ORDER BY counts output columns, after `(p).*` has expanded. A positional GROUP BY
+# counts SELECT-list items as written, so it reaches the unexpanded `(p).*` and is refused.
+statement ok
+CREATE TYPE gq AS (x INT, y INT)
+
+statement ok
+CREATE TABLE gt (k INT, p gq)
+
+statement ok
+INSERT INTO gt VALUES (1, ROW(1,2)::gq), (2, ROW(3,4)::gq)
+
+statement error SELECT-list item
+SELECT (p).*, count(*) FROM gt GROUP BY 1
+
+query III
+SELECT gt.k, (p).* FROM gt ORDER BY 2 DESC
+----
+2 3 4
+1 1 2
+
+query III
+SELECT (p).*, gt.k FROM gt ORDER BY 2 DESC
+----
+3 4 2
+1 2 1
+
+statement ok
+DROP TABLE gt
+
+statement ok
+DROP TYPE gq

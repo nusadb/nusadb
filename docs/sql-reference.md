@@ -306,6 +306,10 @@ SELECT B'1011' & B'1101'  AS and_,
        length(B'1011')    AS len;
 ```
 
+A bit string of any width can be stored in a bit column, and its length is checked against the
+column then: `BIT(n)` takes exactly `n` bits and `BIT VARYING(n)` at most `n`, otherwise the write
+fails with `22P02`. Bit strings of different widths compare by value.
+
 ### Geometric types
 
 `POINT`, `BOX`, `CIRCLE`, `LSEG`, `LINE`, `PATH`, `POLYGON`.
@@ -387,6 +391,22 @@ SELECT id, (p).x, (p).y FROM cpx ORDER BY id;
 UPDATE cpx SET p = ROW(70, 'seventy')::pair WHERE (p).x = 7;
 DELETE FROM cpx WHERE (p).x = 8;
 ```
+
+`(value).*` expands a composite value into one column per field, named after the field. It is a
+`SELECT`-list item only and takes no alias. A positional `ORDER BY n` counts the expanded columns;
+a positional `GROUP BY n` counts the items as written, so it cannot name a `(value).*` item:
+
+```sql
+SELECT id, (p).* FROM cpx ORDER BY id;
+--  id | x | y
+-- ----+---+-------
+--   1 | 7 | seven
+```
+
+The fields of every composite type are listed in `information_schema.attributes` (`udt_name`,
+`attribute_name`, `ordinal_position`, `data_type`, and the length, precision and scale columns),
+and the types themselves in `information_schema.user_defined_types`. Types carry no privileges, so
+every role can read both.
 
 A bare `ROW(a, b)` with no cast is an anonymous record: it renders in the canonical text form
 (`(1,"a b")`), compares field by field, and its fields are read as `.f1 .. .fN`:
@@ -1507,7 +1527,9 @@ Declaring a name that is already open is refused with `42P03`, and the open curs
 and position. Fetching from, moving or closing an unknown cursor is `34000`.
 
 A `DECLARE` sent through the extended query protocol may use `$n` parameters in its query. The bound
-values are substituted when the cursor is declared, so the rows it returns are fixed then.
+values are substituted when the cursor is declared, so the rows it returns are fixed then. Over that
+protocol a `FETCH` is described with its cursor's columns, and it can be read in pieces with a row
+limit or in binary result format like any other query.
 
 ---
 
@@ -1647,6 +1669,9 @@ SELECT routine_name, routine_type, data_type, external_language
 FROM   information_schema.routines;                   -- functions and procedures
 SELECT sequence_name, start_value, increment, cycle_option
 FROM   information_schema.sequences;
+SELECT udt_name, attribute_name, ordinal_position, data_type
+FROM   information_schema.attributes;                 -- fields of composite types
+SELECT * FROM information_schema.user_defined_types;  -- composite types
 
 SELECT * FROM nusadb_databases;       -- every database in this server
 SELECT * FROM nusadb_triggers;        -- likewise nusadb_roles, nusadb_policies, nusadb_procedures,

@@ -1516,7 +1516,7 @@ async fn copy_from_stdin_bad_row_aborts_the_load() {
         next(&mut conn).await,
         BackendMessage::CopyInResponse {
             format: 0,
-            columns: 0
+            columns: 1
         }
     );
     // `oops` is not an integer → the load fails.
@@ -1601,7 +1601,7 @@ async fn copy_from_stdin_duplicate_key_reports_integrity_class() {
         next(&mut conn).await,
         BackendMessage::CopyInResponse {
             format: 0,
-            columns: 0
+            columns: 1
         }
     );
     // Loading id 1 again collides with the existing primary key.
@@ -1841,7 +1841,7 @@ async fn copy_from_stdin_aborts_when_over_byte_cap() {
         next(&mut conn).await,
         BackendMessage::CopyInResponse {
             format: 0,
-            columns: 0
+            columns: 1
         }
     );
     // First chunk (6 bytes) is under the cap; the second pushes the cumulative total over 8.
@@ -5869,7 +5869,7 @@ async fn a_leading_comment_does_not_change_how_a_statement_runs() {
         next(&mut conn).await,
         BackendMessage::CopyInResponse {
             format: 0,
-            columns: 0
+            columns: 1
         }
     );
     conn.write_frame(

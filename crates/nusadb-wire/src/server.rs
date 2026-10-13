@@ -868,6 +868,11 @@ where
     // the SQL-level spelling of the extended-query protocol's per-connection Parse/Bind store.
     let prepared: Arc<std::sync::Mutex<nusadb_sql::PreparedStore>> =
         Arc::new(std::sync::Mutex::new(nusadb_sql::PreparedStore::new()));
+    // Both stores together, for the extended-query paths that describe and buffer statements.
+    let stores = SessionStores {
+        cursors: Arc::clone(&cursors),
+        prepared: Arc::clone(&prepared),
+    };
     // LISTEN/NOTIFY (async pub/sub): this connection's notification mailbox. `LISTEN` subscribes its
     // pid in the process-global registry; a `NOTIFY` from any connection in the same database pushes a
     // `Notification` here, which the loop below drains and writes as a `NotificationResponse` while the
@@ -1154,6 +1159,8 @@ where
                                             PROGRAM_LIMIT_EXCEEDED,
                                         )
                                         .await?;
+                                        // Like any Describe error, it fails an open block.
+                                        txn_state = txn_state.aborted();
                                         continue;
                                     }
                                 },
@@ -1174,6 +1181,7 @@ where
                     DescribeTarget::Portal => match describe_portal(
                         &engine,
                         &portals,
+                        &stores,
                         &name,
                         &effective_user(&user, &settings),
                         &settings.lock().map(|g| g.clone()).unwrap_or_default(),
@@ -1204,6 +1212,11 @@ where
                             fail_coded(&mut conn, &mut failed, &msg, code).await?;
                         },
                     },
+                }
+                // A Describe that failed inside a transaction block aborts the block, exactly as a
+                // failed Execute does: the client saw an error, so later statements must not run.
+                if failed {
+                    txn_state = txn_state.aborted();
                 }
             },
             FrontendMessage::Execute { portal, max_rows } => {
@@ -1312,6 +1325,7 @@ where
                     statement_timeout,
                     txn_state,
                     &settings,
+                    &stores,
                 )
                 .await;
                 txn_state = new_state;
@@ -1586,9 +1600,7 @@ async fn handle_copy_in<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Advisory column count for the client; the real load arity is validated against the table in
-    // `copy_from`, so an (implausible) >65535-column overflow harmlessly reports 0 here.
-    let columns = u16::try_from(copy.columns.len()).unwrap_or(0);
+    let columns = copy_in_column_count(engine, &copy).await;
     let format = copy_wire_format(&copy);
     conn.write_frame(&BackendMessage::CopyInResponse { format, columns }.encode()?)
         .await?;
@@ -1694,6 +1706,33 @@ where
     Ok(result)
 }
 
+/// The advisory column count a `CopyInResponse` announces: the listed columns, or the target
+/// table's width. The real load arity is validated against the table in `copy_from`, so a table
+/// that cannot be read here (its error is reported by the load) or an implausible >65535-column
+/// overflow reports 0.
+async fn copy_in_column_count(
+    engine: &Arc<dyn StorageEngine>,
+    copy: &nusadb_sql::ast::Copy,
+) -> u16 {
+    let columns = if copy.columns.is_empty() {
+        let engine = Arc::clone(engine);
+        let probe = copy.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = engine.begin(IsolationLevel::default()).ok()?;
+            let count = nusadb_sql::copy_column_count_in(engine.as_ref(), &probe, txn).ok();
+            let _ = engine.rollback(txn);
+            count
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    } else {
+        copy.columns.len()
+    };
+    u16::try_from(columns).unwrap_or(0)
+}
+
 /// Drive the `COPY ... TO STDOUT` sub-protocol: render the rows, then stream them as
 /// `CopyOutResponse` + one `CopyData` + `CopyDone`. Returns the row count, or an error message to
 /// relay (sent before any copy-out frame, so a failed render never starts a half-stream).
@@ -1707,7 +1746,6 @@ async fn handle_copy_out<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let columns = u16::try_from(copy.columns.len()).unwrap_or(0);
     let format = copy_wire_format(&copy);
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
@@ -1736,7 +1774,7 @@ where
             let _ = engine.rollback(txn);
             return Err((msg, "42501")); // access-control refusal
         }
-        let out = nusadb_sql::copy_to_bytes_in(engine.as_ref(), &copy, &actor, txn)
+        let out = nusadb_sql::copy_to_bytes_with_columns_in(engine.as_ref(), &copy, &actor, txn)
             .map_err(|e| (e.to_string(), e.sqlstate()));
         let _ = engine.rollback(txn); // read-only: nothing to commit
         out
@@ -1744,10 +1782,13 @@ where
     .await
     .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR)));
 
-    let (count, payload) = match rendered {
+    let (count, columns, payload) = match rendered {
         Ok(out) => out,
         Err(err) => return Ok(Err(err)),
     };
+    // The number of columns each copied row carries (the listed ones, the table's, or the query's
+    // output); an implausible >65535-column overflow reports 0.
+    let columns = u16::try_from(columns).unwrap_or(0);
     conn.write_frame(&BackendMessage::CopyOutResponse { format, columns }.encode()?)
         .await?;
     conn.write_frame(&BackendMessage::CopyData { data: payload }.encode()?)
@@ -1854,7 +1895,8 @@ fn effective_statement_timeout(
 #[allow(
     clippy::too_many_arguments,
     reason = "threads engine, cluster, database, statement, params, user, cancellation, timeout, \
-              txn state, and the per-connection GUC store — each a distinct per-statement concern"
+              txn state, and the per-connection GUC and session stores, each a distinct \
+              per-statement concern"
 )]
 async fn run_blocking(
     engine: &Arc<dyn StorageEngine>,
@@ -1867,6 +1909,7 @@ async fn run_blocking(
     statement_timeout: Option<Duration>,
     state: TxnState,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    stores: &SessionStores,
 ) -> (Result<ExecutionResult, (String, &'static str)>, TxnState) {
     // The per-connection cancel flag. Reset it for this statement: a cancel that
     // arrived between statements (when nothing was running) must not abort this one. It is tripped
@@ -1884,6 +1927,7 @@ async fn run_blocking(
     let cluster = Arc::clone(cluster);
     let database = database.to_owned();
     let settings = Arc::clone(settings);
+    let stores = stores.clone();
     let (result, new_state) = tokio::task::spawn_blocking(move || {
         let _cancel_guard = nusadb_sql::cancel::scope(cancel);
         let (outcome, new_state) = run_query_txn(
@@ -1895,6 +1939,7 @@ async fn run_blocking(
             &user,
             state,
             &settings,
+            &stores,
         );
         (
             outcome.map_err(|e| (e.to_string(), e.sqlstate())),
@@ -1922,6 +1967,7 @@ async fn run_blocking(
 async fn describe_portal(
     engine: &Arc<dyn StorageEngine>,
     portals: &HashMap<String, Portal>,
+    stores: &SessionStores,
     name: &str,
     acting_user: &str,
     settings: &HashMap<String, String>,
@@ -1939,6 +1985,7 @@ async fn describe_portal(
         },
     };
     let engine = Arc::clone(engine);
+    let stores = stores.clone();
     let acting_user = acting_user.to_owned();
     let settings = settings.clone();
     tokio::task::spawn_blocking(move || {
@@ -1950,16 +1997,31 @@ async fn describe_portal(
         // are carried so column visibility and search-path resolution match execution exactly —
         // otherwise Describe would report columns of tables the acting role cannot read.
         let txn = engine.begin(IsolationLevel::default())?;
-        let result = analyze(
-            stmt,
-            &EngineCatalog::new(engine.as_ref(), txn, &acting_user, &settings),
-        )
-        .map(|logical| {
+        let catalog = EngineCatalog::new(engine.as_ref(), txn, &acting_user, &settings);
+        let result = analyze(stmt, &catalog).and_then(|logical| {
             let physical = plan(logical);
-            (
+            // A `FETCH` returns the rows of a cursor declared by an earlier statement, so its shape
+            // is the cursor's, read from this connection's cursor store. `MOVE` returns no rows.
+            if let nusadb_sql::PhysicalPlan::FetchCursor {
+                name,
+                is_move: false,
+                ..
+            } = &physical
+            {
+                return stores.cursors()?.describe(name);
+            }
+            // An `EXECUTE` returns the rows of a statement stored by an earlier `PREPARE`.
+            let prepared_shape = {
+                let prepared = stores.prepared()?;
+                nusadb_sql::describe_prepared_execute(&physical, &prepared, &catalog)?
+            };
+            if let Some(shape) = prepared_shape {
+                return Ok(shape);
+            }
+            Ok((
                 describe_columns(&physical),
                 describe_column_types(&physical),
-            )
+            ))
         });
         let _ = engine.rollback(txn);
         result
@@ -1981,7 +2043,7 @@ async fn describe_portal(
 #[allow(
     clippy::too_many_arguments,
     reason = "per-connection context threaded into the portal execution (engine, cluster, database, \
-              portals, portal name, user, cancellation, timeout, txn state, GUC store)"
+              portals, portal name, user, cancellation, timeout, txn state, GUC and session stores)"
 )]
 async fn ensure_executed(
     engine: &Arc<dyn StorageEngine>,
@@ -1994,6 +2056,7 @@ async fn ensure_executed(
     statement_timeout: Option<Duration>,
     state: TxnState,
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    stores: &SessionStores,
 ) -> (Result<Vec<String>, (String, &'static str)>, TxnState) {
     let job = match portals.get(name) {
         Some(p) if p.result.is_none() => {
@@ -2021,6 +2084,7 @@ async fn ensure_executed(
             statement_timeout,
             state,
             settings,
+            stores,
         )
         .await;
         state = new_state;
@@ -3367,6 +3431,14 @@ impl TxnState {
         }
     }
 
+    /// The state after an error: an open transaction block becomes failed, anything else is kept.
+    const fn aborted(self) -> Self {
+        match self {
+            Self::Active { txn, isolation, .. } => Self::Failed { txn, isolation },
+            other => other,
+        }
+    }
+
     /// The open transaction (if any) — used to roll back at connection teardown.
     const fn open_txn(self) -> Option<TxnId> {
         match self {
@@ -3909,7 +3981,8 @@ impl PendingNotifications {
 /// runs in the open transaction (no commit) or, in `Auto`, in its own auto-committed transaction.
 #[allow(
     clippy::too_many_arguments,
-    reason = "per-connection context (engine, cluster, database, user, settings) threaded verbatim"
+    reason = "per-connection context (engine, cluster, database, user, settings, session stores) \
+              threaded verbatim"
 )]
 fn run_query_txn(
     engine: &dyn StorageEngine,
@@ -3920,6 +3993,7 @@ fn run_query_txn(
     user: &str,
     state: TxnState,
     settings: &std::sync::Mutex<HashMap<String, String>>,
+    stores: &SessionStores,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     use nusadb_sql::ast::Statement;
     let mut stmt = match parse(sql).and_then(|s| params.bind(s)) {
@@ -3969,9 +4043,204 @@ fn run_query_txn(
             }
             (result, state)
         },
+        // Cursor and SQL-level prepared statements need this connection's session stores, which the
+        // plain path lacks.
+        session @ (Statement::DeclareCursor(_)
+        | Statement::FetchCursor(_)
+        | Statement::CloseCursor(_)
+        | Statement::Prepare { .. }
+        | Statement::Execute { .. }
+        | Statement::Deallocate(_)) => {
+            let acting = effective_user(user, settings);
+            run_session_stmt_in_state(engine, database, session, &acting, state, settings, stores)
+        },
         other => {
             let acting = effective_user(user, settings);
             run_stmt_in_state(engine, database, other, &acting, state, settings)
+        },
+    }
+}
+
+/// Collects a cursor statement's output rows for the buffered extended-query path, which encodes
+/// them per the portal's result formats once the statement has run.
+#[derive(Default)]
+struct CollectSink {
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+}
+
+impl RowSink for CollectSink {
+    fn columns(&mut self, columns: &[String]) -> Result<(), nusadb_sql::Error> {
+        self.columns = columns.to_vec();
+        Ok(())
+    }
+
+    fn row(&mut self, row: &[Value]) -> Result<(), nusadb_sql::Error> {
+        self.rows.push(row.to_vec());
+        Ok(())
+    }
+}
+
+/// A connection's cursor and SQL-level prepared-statement stores, shared into each statement's
+/// blocking task.
+#[derive(Clone)]
+struct SessionStores {
+    cursors: Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
+    prepared: Arc<std::sync::Mutex<nusadb_sql::PreparedStore>>,
+}
+
+impl SessionStores {
+    fn cursors(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, nusadb_sql::CursorStore>, nusadb_sql::Error> {
+        self.cursors
+            .lock()
+            .map_err(|_| nusadb_sql::Error::Internal("cursor store lock poisoned".to_owned()))
+    }
+
+    fn prepared(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, nusadb_sql::PreparedStore>, nusadb_sql::Error> {
+        self.prepared
+            .lock()
+            .map_err(|_| nusadb_sql::Error::Internal("prepared store lock poisoned".to_owned()))
+    }
+}
+
+/// Plan and run one cursor or prepared-statement command in `txn` against `stores`, collecting its
+/// rows. `in_block` says whether `txn` is an explicit transaction block.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the statement's execution context plus the connection's session stores"
+)]
+fn run_session_stmt_once(
+    engine: &dyn StorageEngine,
+    stmt: nusadb_sql::ast::Statement,
+    txn: TxnId,
+    in_block: bool,
+    user: &str,
+    snapshot: &HashMap<String, String>,
+    stores: &SessionStores,
+) -> Result<ExecutionResult, nusadb_sql::Error> {
+    let physical = plan(analyze(
+        stmt,
+        &EngineCatalog::new(engine, txn, user, snapshot),
+    )?);
+    let mut sink = CollectSink::default();
+    let outcome = if nusadb_sql::is_prepare_plan(&physical) {
+        let mut store = stores.prepared()?;
+        nusadb_sql::execute_in_txn_as_streaming_with_prepared(
+            physical, engine, txn, user, snapshot, &mut store, &mut sink,
+        )
+    } else {
+        let mut store = stores.cursors()?;
+        nusadb_sql::execute_in_txn_as_streaming_with_cursors(
+            physical, engine, txn, user, snapshot, &mut store, in_block, &mut sink,
+        )
+    }?;
+    Ok(match outcome {
+        StreamOutcome::Rows { command, .. } => ExecutionResult::Rows {
+            columns: sink.columns,
+            rows: sink.rows,
+            command,
+        },
+        StreamOutcome::Other(result) => result,
+    })
+}
+
+/// [`run_stmt_in_state`] for `DECLARE` / `FETCH` / `MOVE` / `CLOSE` and SQL-level `PREPARE` /
+/// `EXECUTE` / `DEALLOCATE`: the statement is served from this connection's session stores, and its
+/// rows are collected so the caller can apply a row limit or binary result formats. In auto-commit
+/// the statement runs in its own transaction, retried on a serialization conflict like any other
+/// buffered statement, and a cursor statement settles the cursors with it, so a `WITH HOLD` cursor
+/// outlives it and any other cursor does not.
+fn run_session_stmt_in_state(
+    engine: &dyn StorageEngine,
+    database: &str,
+    stmt: nusadb_sql::ast::Statement,
+    user: &str,
+    state: TxnState,
+    settings: &std::sync::Mutex<HashMap<String, String>>,
+    stores: &SessionStores,
+) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
+    use nusadb_sql::ast::Statement;
+    let mut snapshot = settings_snapshot(settings, database);
+    stamp_transaction_isolation(&mut snapshot, state);
+    match state {
+        TxnState::Failed { .. } => (
+            Err(nusadb_sql::Error::TransactionAborted(
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .to_owned(),
+            )),
+            state,
+        ),
+        TxnState::Active { txn, isolation, .. } => {
+            match run_session_stmt_once(engine, stmt, txn, true, user, &snapshot, stores) {
+                Ok(result) => (
+                    Ok(result),
+                    TxnState::Active {
+                        txn,
+                        dirty: true,
+                        isolation,
+                    },
+                ),
+                Err(e) => (Err(e), TxnState::Failed { txn, isolation }),
+            }
+        },
+        TxnState::Auto => {
+            let settles_cursors = matches!(
+                stmt,
+                Statement::DeclareCursor(_) | Statement::FetchCursor(_) | Statement::CloseCursor(_)
+            )
+            .then_some(&*stores.cursors);
+            let budget = nusadb_sql::retry::budget(
+                snapshot
+                    .get(nusadb_sql::retry::MAX_AUTOCOMMIT_RETRIES)
+                    .map(String::as_str),
+            );
+            let mut spare = (budget > 0).then(|| stmt.clone());
+            let mut current = stmt;
+            let mut attempt = 0_u32;
+            loop {
+                let txn = match engine.begin(session_isolation(&snapshot)) {
+                    Ok(txn) => txn,
+                    Err(e) => return (Err(e.into()), TxnState::Auto),
+                };
+                let outcome =
+                    run_session_stmt_once(engine, current, txn, false, user, &snapshot, stores)
+                        .and_then(|result| {
+                            engine
+                                .commit(txn)
+                                .map(|()| result)
+                                .map_err(nusadb_sql::Error::from)
+                        });
+                // A failed statement, or a commit that did not go through, leaves the transaction
+                // to roll back.
+                let failure = match outcome {
+                    Ok(result) => {
+                        end_cursor_transaction(settles_cursors, true);
+                        return (Ok(result), TxnState::Auto);
+                    },
+                    Err(e) => {
+                        let _ = engine.rollback(txn);
+                        end_cursor_transaction(settles_cursors, false);
+                        e
+                    },
+                };
+                if !nusadb_sql::retry::is_retryable_conflict(&failure) {
+                    return (Err(failure), TxnState::Auto);
+                }
+                let Some(next) = spare.take() else {
+                    return (Err(failure), TxnState::Auto);
+                };
+                if let Err(cancelled) = nusadb_sql::cancel::check() {
+                    return (Err(cancelled), TxnState::Auto);
+                }
+                attempt += 1;
+                spare = (attempt < budget).then(|| next.clone());
+                current = next;
+                nusadb_sql::retry::back_off(attempt);
+            }
         },
     }
 }

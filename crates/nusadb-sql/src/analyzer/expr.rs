@@ -459,6 +459,11 @@ pub(super) fn analyze_expr_agg(
         ast::Expr::FieldAccess { base, field } => {
             analyze_field_access(base, field, scope, catalog, aggregates)
         },
+        // `(expr).*` stands for several columns, so it has a meaning only where a SELECT list
+        // expands it (`analyze_projection`); as a single value it is refused.
+        ast::Expr::AllFields(_) => Err(Error::InvalidStatement(
+            "`(expr).*` is allowed only as a SELECT-list item".to_owned(),
+        )),
         // `expr::T` where `T` is a user-defined (composite) type name.
         ast::Expr::CastNamed {
             expr,
@@ -4163,6 +4168,31 @@ fn analyze_field_access(
     })
 }
 
+/// The field names `(base).*` expands to, in declared order: `f1..fN` for an anonymous `ROW(...)`,
+/// else the fields of `base`'s composite type.
+///
+/// # Errors
+/// [`Error::InvalidStatement`] when `base` has no statically known composite type.
+pub(super) fn composite_field_names(
+    base: &ast::Expr,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+) -> Result<Vec<String>, Error> {
+    if let ast::Expr::Row(items) = base {
+        return Ok((1..=items.len()).map(|n| format!("f{n}")).collect());
+    }
+    composite_type_of(base, scope, catalog)?.map_or_else(
+        || {
+            Err(Error::InvalidStatement(
+                "`(expr).*` requires an operand of a known composite type (a composite column or \
+                 a cast to a composite type)"
+                    .to_owned(),
+            ))
+        },
+        |fields| Ok(fields.into_iter().map(|(name, _)| name).collect()),
+    )
+}
+
 /// `expr::T` where `T` is a user-defined type name. Only a composite type is in surface; an enum /
 /// domain / unknown name is rejected loudly (they have no composite cast path). `ROW(...)::T` builds
 /// the composite from its field expressions; any other operand is treated as a text value parsed
@@ -6104,7 +6134,12 @@ pub(super) fn check_concat(left: ColumnType, right: ColumnType) -> Result<Column
 }
 
 pub(super) fn check_comparison(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
-    if left == right || (is_numeric(left) && is_numeric(right)) {
+    // Bit strings compare across widths (`BIT(4)` against an unbounded `BIT VARYING` parameter, say):
+    // their values order bit by bit, then by length, whatever width each side was declared with.
+    if left == right
+        || (is_numeric(left) && is_numeric(right))
+        || (is_bit_type(left) && is_bit_type(right))
+    {
         Ok(ColumnType::Bool)
     } else {
         Err(Error::TypeMismatch {

@@ -42,6 +42,10 @@ pub enum InfoSchemaView {
     Routines,
     /// `information_schema.sequences` — one row per sequence with its bounds and increment.
     Sequences,
+    /// `information_schema.user_defined_types`: one row per composite type (`CREATE TYPE ... AS`).
+    UserDefinedTypes,
+    /// `information_schema.attributes`: one row per field of a composite type, in declared order.
+    Attributes,
 }
 
 impl InfoSchemaView {
@@ -63,6 +67,8 @@ impl InfoSchemaView {
             Self::CheckConstraints => "check_constraints",
             Self::Routines => "routines",
             Self::Sequences => "sequences",
+            Self::UserDefinedTypes => "user_defined_types",
+            Self::Attributes => "attributes",
         }
     }
 
@@ -206,6 +212,30 @@ impl InfoSchemaView {
                 text("increment"),
                 text("cycle_option"),
             ],
+            Self::UserDefinedTypes => vec![
+                text("user_defined_type_catalog"),
+                text("user_defined_type_schema"),
+                text("user_defined_type_name"),
+                text("user_defined_type_category"),
+                text("is_instantiable"),
+                text("is_final"),
+            ],
+            Self::Attributes => vec![
+                text("udt_catalog"),
+                text("udt_schema"),
+                text("udt_name"),
+                text("attribute_name"),
+                int("ordinal_position"),
+                text("attribute_default"),
+                text("is_nullable"),
+                text("data_type"),
+                int("character_maximum_length"),
+                int("numeric_precision"),
+                int("numeric_scale"),
+                // The field's declared type as written in `CREATE TYPE`, which names the type for a
+                // field whose `data_type` is `USER-DEFINED` (a nested composite or an enum).
+                text("attribute_udt_name"),
+            ],
         };
         TableSchema {
             schema: "public".to_owned(),
@@ -234,6 +264,8 @@ impl InfoSchemaView {
             "information_schema.check_constraints" => Some(Self::CheckConstraints),
             "information_schema.routines" => Some(Self::Routines),
             "information_schema.sequences" => Some(Self::Sequences),
+            "information_schema.user_defined_types" => Some(Self::UserDefinedTypes),
+            "information_schema.attributes" => Some(Self::Attributes),
             _ => None,
         }
     }

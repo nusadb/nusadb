@@ -423,7 +423,9 @@ fn count_expr(expr: &ast::Expr, max: &mut usize) {
             count_expr(base, max);
             count_expr(index, max);
         },
-        ast::Expr::FieldAccess { base: inner, .. } | ast::Expr::CastNamed { expr: inner, .. } => {
+        ast::Expr::FieldAccess { base: inner, .. }
+        | ast::Expr::AllFields(inner)
+        | ast::Expr::CastNamed { expr: inner, .. } => {
             count_expr(inner, max);
         },
         ast::Expr::ArraySlice { base, lower, upper } => {
@@ -594,7 +596,9 @@ pub(crate) fn substitute_param_exprs(
             substitute_param_exprs(base, args, param_names);
             substitute_param_exprs(index, args, param_names);
         },
-        ast::Expr::FieldAccess { base: inner, .. } | ast::Expr::CastNamed { expr: inner, .. } => {
+        ast::Expr::FieldAccess { base: inner, .. }
+        | ast::Expr::AllFields(inner)
+        | ast::Expr::CastNamed { expr: inner, .. } => {
             substitute_param_exprs(inner, args, param_names);
         },
         ast::Expr::ArraySlice { base, lower, upper } => {
@@ -907,9 +911,9 @@ fn substitute_expr(expr: &mut ast::Expr, params: &[ast::Expr]) -> Result<(), Err
             substitute_expr(base, params)?;
             substitute_expr(index, params)
         },
-        ast::Expr::FieldAccess { base: inner, .. } | ast::Expr::CastNamed { expr: inner, .. } => {
-            substitute_expr(inner, params)
-        },
+        ast::Expr::FieldAccess { base: inner, .. }
+        | ast::Expr::AllFields(inner)
+        | ast::Expr::CastNamed { expr: inner, .. } => substitute_expr(inner, params),
         ast::Expr::ArraySlice { base, lower, upper } => {
             substitute_expr(base, params)?;
             for bound in [lower, upper].into_iter().flatten() {

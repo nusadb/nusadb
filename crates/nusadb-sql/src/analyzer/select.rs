@@ -3649,6 +3649,26 @@ pub(super) fn analyze_projection(
                     name: alias.unwrap_or_else(|| default_name.to_owned()),
                 });
             },
+            // `(expr).*` expands to one column per field of the composite value, each named after
+            // its field, exactly as if every `(expr).field` had been written out.
+            ast::SelectItem::Expr {
+                expr: ast::Expr::AllFields(base),
+                alias,
+            } => {
+                if alias.is_some() {
+                    return Err(Error::InvalidStatement(
+                        "`(expr).*` expands to several columns and cannot take an alias".to_owned(),
+                    ));
+                }
+                for name in composite_field_names(&base, scope, catalog)? {
+                    let access = ast::Expr::FieldAccess {
+                        base: base.clone(),
+                        field: name.clone(),
+                    };
+                    let typed = analyze_projection_expr(&access, scope, catalog, aggregates)?;
+                    projection.push(Projection { expr: typed, name });
+                }
+            },
             ast::SelectItem::Expr { expr, alias } => {
                 let typed = analyze_projection_expr(&expr, scope, catalog, aggregates)?;
                 projection.push(Projection {

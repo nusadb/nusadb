@@ -58,13 +58,14 @@ pub use batch::{
 };
 pub use error::{Error, INTERNAL_ERROR};
 pub use executor::{
-    CursorStore, ExecutionResult, PreparedStore, Row, RowSink, RowsCommand, Session, SpillConfig,
-    StreamOutcome, auto_analyze_stale_tables, canonicalize_client_min_messages,
+    ColumnShape, CursorStore, ExecutionResult, PreparedStore, Row, RowSink, RowsCommand, Session,
+    SpillConfig, StreamOutcome, auto_analyze_stale_tables, canonicalize_client_min_messages,
     canonicalize_timezone_setting, catalog_approx_row_count, catalog_approx_row_count_in,
     catalog_list_indexes, catalog_list_indexes_in, catalog_table_stats, catalog_table_stats_in,
-    check_settable_parameter, copy_from, copy_from_bytes_in, copy_from_in, copy_to,
-    copy_to_bytes_in, copy_to_in, describe_column_types, describe_columns, execute, execute_in_txn,
-    execute_in_txn_as, execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_cursors,
+    check_settable_parameter, copy_column_count_in, copy_from, copy_from_bytes_in, copy_from_in,
+    copy_to, copy_to_bytes_in, copy_to_bytes_with_columns_in, copy_to_in, describe_column_types,
+    describe_columns, describe_prepared_execute, execute, execute_in_txn, execute_in_txn_as,
+    execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_cursors,
     execute_in_txn_as_streaming_with_prepared, execute_in_txn_as_streaming_with_settings,
     execute_in_txn_as_with_settings, inheritance_any, inheritance_descendants,
     inheritance_partition_fingerprint, is_cursor_plan, is_prepare_plan, lookup_composite,

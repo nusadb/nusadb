@@ -223,3 +223,43 @@ query TI
 SELECT B'1011' || X'0', length(B'1011')
 ----
 10110000 4
+
+# A bit string of another declared width assigns into a bit column; the column's width is checked
+# when the row is written, exactly as for a literal.
+statement ok
+CREATE TABLE bw (id INT NOT NULL, f BIT(4), v BIT VARYING(6))
+
+statement ok
+INSERT INTO bw VALUES (1, CAST('1010' AS BIT VARYING), CAST('101' AS BIT VARYING))
+
+statement ok
+INSERT INTO bw (id, f) SELECT 2, v FROM bw WHERE id = 1 AND length(v) = 4
+
+statement ok
+INSERT INTO bw (id, f, v) SELECT 3, CAST('0110' AS BIT VARYING(10)), f FROM bw WHERE id = 1
+
+statement ok
+UPDATE bw SET f = CAST('0001' AS BIT VARYING) WHERE id = 3
+
+query ITT rowsort
+SELECT id, f, v FROM bw
+----
+1 1010 101
+3 0001 1010
+
+statement error invalid
+INSERT INTO bw (id, f) VALUES (4, CAST('10101' AS BIT VARYING))
+
+statement error invalid
+INSERT INTO bw (id, v) VALUES (5, CAST('1010101' AS BIT VARYING))
+
+# Bit strings of different declared widths compare by value.
+query I
+SELECT id FROM bw WHERE f = CAST('1010' AS BIT VARYING)
+----
+1
+
+query II
+SELECT B'101' = CAST('101' AS BIT VARYING(8)), B'101' < B'1010'
+----
+1 1

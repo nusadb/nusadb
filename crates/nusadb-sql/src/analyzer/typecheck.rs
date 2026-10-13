@@ -21,9 +21,11 @@ pub(super) fn check_assignable(column: &ColumnDef, value: &TypedExpr) -> Result<
 
 /// Whether a `source`-typed value may be stored into a `target`-typed column by `INSERT`/`UPDATE`:
 /// [`assignable`], plus the assignment casts a write performs that an expression context does not
-/// (a function argument, say): a `DATE` into a timestamp column (midnight), and a `NUMERIC` or
-/// `FLOAT` into an integer column (rounded, range-checked). The write converts the value in
-/// `row::adopt_column_type`.
+/// (a function argument, say): a `DATE` into a timestamp column (midnight), a `NUMERIC` or
+/// `FLOAT` into an integer column (rounded, range-checked), and a bit string of any width into a
+/// `BIT(n)` / `BIT VARYING(n)` column. The write converts the value in `row::adopt_column_type`;
+/// a bit string's length is checked against the column's width when the row is encoded, exactly
+/// as for a bit-string literal.
 pub(super) fn assignable_to_column(target: ColumnType, source: ColumnType) -> bool {
     assignable(target, source)
         || matches!(
@@ -34,6 +36,9 @@ pub(super) fn assignable_to_column(target: ColumnType, source: ColumnType) -> bo
             ) | (
                 ColumnType::Int,
                 ColumnType::Numeric { .. } | ColumnType::Float
+            ) | (
+                ColumnType::Bit(_) | ColumnType::VarBit(_),
+                ColumnType::Bit(_) | ColumnType::VarBit(_)
             )
         )
 }

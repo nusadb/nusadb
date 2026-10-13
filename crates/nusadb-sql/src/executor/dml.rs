@@ -2503,15 +2503,15 @@ fn render_copy_output<'v>(
 }
 
 /// Execute `COPY <table> TO STDOUT`: render the table's visible rows in the statement's format,
-/// returning the row count and the rendered payload (newline-terminated lines for text and CSV, a
-/// complete stream for binary). A leading header line of column names is emitted when
-/// `WITH (HEADER)` is set.
+/// returning the row count, the number of columns copied, and the rendered payload
+/// (newline-terminated lines for text and CSV, a complete stream for binary). A leading header line
+/// of column names is emitted when `WITH (HEADER)` is set.
 pub(super) fn run_copy_to(
     copy: &ast::Copy,
     user: &str,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(usize, Vec<u8>), Error> {
+) -> Result<(usize, usize, Vec<u8>), Error> {
     // `COPY (<query>) TO STDOUT`: analyze + plan + run the query as the COPY user (so it is checked
     // for privileges and row-level security exactly like a direct SELECT), then render its result.
     if let Some(query) = &copy.query {
@@ -2535,19 +2535,33 @@ pub(super) fn run_copy_to(
                 .collect()
         }),
     )?;
-    Ok((rows.len(), out))
+    Ok((rows.len(), names.len(), out))
+}
+
+/// The number of columns a table-form `COPY` transfers: the listed columns, or every column of the
+/// table when none are listed.
+///
+/// # Errors
+/// [`Error::TableNotFound`] for an unknown table, and the column-list errors of the load itself.
+pub(super) fn copy_table_column_count(
+    copy: &ast::Copy,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<usize, Error> {
+    let table = lookup_copy_table(copy, engine, txn)?;
+    Ok(resolve_copy_columns(copy, &table)?.len())
 }
 
 /// `COPY (<query>) TO STDOUT`: analyze + plan + execute `query` as `user` under `txn`, then render its
 /// rows (all projected columns, in order) in `format`, with a header line of column names when the
-/// format asks for one.
+/// format asks for one. Returns the row count, the column count, and the payload.
 fn run_copy_query_to(
     query: &ast::Select,
     user: &str,
     format: &ast::CopyFormat,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(usize, Vec<u8>), Error> {
+) -> Result<(usize, usize, Vec<u8>), Error> {
     let catalog = super::SessionCatalog {
         engine,
         txn,
@@ -2573,7 +2587,7 @@ fn run_copy_query_to(
     };
     let names: Vec<&str> = columns.iter().map(String::as_str).collect();
     let out = render_copy_output(format, &names, rows.iter().map(|row| row.iter().collect()))?;
-    Ok((rows.len(), out))
+    Ok((rows.len(), names.len(), out))
 }
 
 /// Resolve a `COPY`'s column list to table ordinals (empty = all columns, table order).

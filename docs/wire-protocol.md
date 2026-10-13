@@ -418,11 +418,20 @@ Backend replies: `ParseComplete` (`1`), `BindComplete` (`2`), `CloseComplete` (`
    - `target = 'S'` (Statement): server replies `ParameterDescription` (number of `$n`
      placeholders) then `NoData` (row shape is reported per-portal).
    - `target = 'P'` (Portal): server replies `RowDescription` (row-returning) or `NoData`.
+     A portal over `FETCH` is described with the columns of the cursor it reads, so the cursor
+     must already be declared; `DECLARE`, `MOVE` and `CLOSE` describe as `NoData`. A portal over a
+     SQL-level `EXECUTE name(...)` is described with the columns of the statement `PREPARE` stored.
+   - An error while describing behaves like any other extended-query error (§10.2), and inside a
+     transaction block it also fails the block (`ReadyForQuery` status `E`).
 4. `Execute` runs the portal (lazily, exactly once — caching the result) and streams up to
    `max_rows` `DataRow`s (`max_rows = 0` = all). If the cap is hit with rows remaining, the server
    sends `PortalSuspended`; a later `Execute` on the same portal resumes draining. When the
    portal drains fully the server sends `CommandComplete`. `Execute` does not repeat
-   `RowDescription` — that comes from `Describe`.
+   `RowDescription`; that comes from `Describe`. Cursor statements (`DECLARE`, `FETCH`, `MOVE`,
+   `CLOSE`) and SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE` use the connection's cursors and
+   prepared statements whatever the `max_rows` and result formats: a `FETCH` or `EXECUTE` honours
+   both like any row-returning statement, and the formats given for a statement that returns no
+   rows (`DECLARE`, say) are ignored.
 5. `Sync` ends the pipeline; the server replies `ReadyForQuery`. `Sync` also clears the failed
    state (§10.2).
 6. `Close` frees a statement (`'S'`) or portal (`'P'`); the server replies `CloseComplete`.
@@ -449,7 +458,7 @@ Each is bound by the type `Parse` declared for its placeholder:
 | `TEXT` (`0x05`) | text, whatever the value looks like (`"00123"` stays `00123`) |
 | `INT` (`0x02`), `FLOAT` (`0x03`), `BOOL` (`0x01`) | exactly that type; a value that is not one (`"abc"` for `INT`) is refused with `22023` |
 | `NUMERIC`, `BYTES`, `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `JSON`, `MACADDR`, `MACADDR8`, `INET`, `CIDR`, `TSVECTOR`, `TSQUERY`, `XML` | the value text cast to that type, exactly as `CAST('…' AS type)` would convert it |
-| `BIT`, `VARBIT` (`0x14`, `0x15`) | cast to `VARBIT` (the declared width is not in the tag) |
+| `BIT`, `VARBIT` (`0x14`, `0x15`) | cast to `VARBIT` (the declared width is not in the tag). It assigns into a `BIT(n)` or `BIT VARYING(n)` column and compares with one; the column's width is checked when the row is written, as for a literal (`22P02` when it does not fit) |
 | `RANGE` (`0x16`), `GEOMETRY` (`0x18`) | as with no tag: the subtype is not in the tag, so the value is typed where it is used |
 | `ARRAY` (`0x0F`, or `0x80 \| element`), `VECTOR` (`0x10`) | text, converted where it is used (an assignment to an array or vector column) |
 | none, or `0x00` | inferred from the text: integer, then float, then boolean (`true`/`t`/`TRUE`, `false`/`f`/`FALSE`), else text |
@@ -537,6 +546,8 @@ table by a non-superuser is refused with an `Error`: fail-closed, no policy bypa
 
 ### 12.1 `COPY … FROM STDIN` (client uploads)
 1. server → `CopyInResponse` (`G`): `[ overall_format:u8 ][ columns:u16 ]` (0 = text, 1 = binary).
+   `columns` is the number of columns each row loads: the listed columns, else the table's. It is
+   `0` when the table cannot be resolved; the load then reports the error after `CopyDone`.
 2. client → zero or more `CopyData` (`d`): `[ raw bytes ]` — each may carry any number of whole
    or partial data lines; the server reassembles.
 3. client → `CopyDone` (`c`) to finish, or `CopyFail` (`f`): `[ message:Str ]` to abort.
@@ -548,6 +559,8 @@ stay in protocol sync, then reports an `Error`. Split larger loads into multiple
 
 ### 12.2 `COPY … TO STDOUT` (server downloads)
 1. server → `CopyOutResponse` (`H`): `[ overall_format:u8 ][ columns:u16 ]` (0 = text, 1 = binary).
+   `columns` is the number of columns each row carries: the listed columns, the table's, or the
+   query's output for `COPY (query) TO STDOUT`.
 2. server → one or more `CopyData` (`d`): `[ raw bytes ]`.
 3. server → `CopyDone` (`c`).
 4. server → `CommandComplete` (`COPY <count>`), then `ReadyForQuery`.

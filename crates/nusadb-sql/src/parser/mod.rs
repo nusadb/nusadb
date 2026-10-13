@@ -797,6 +797,10 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `ORDER BY <key> USING <op>`: sqlparser has no operator field on its sort key (only ASC/DESC),
     // so rewrite `USING <` / `USING >` to the equivalent `ASC` / `DESC` keyword before parsing.
     rewrite_order_by_using(&mut tokens);
+    // `(expr).*`: sqlparser accepts only an identifier after the `.` of a parenthesized operand, so
+    // turn the `*` into an unquoted word (one the tokenizer never produces itself) that the
+    // converter builds into the field expansion.
+    rewrite_composite_star(&mut tokens);
     // `<expr> BETWEEN [NOT] {SYMMETRIC|ASYMMETRIC} <low> AND <high>`: sqlparser has no grammar for the
     // symmetry keyword. Wrap the lower bound in a marker function so the node parses, and flag it in
     // conversion; `ASYMMETRIC` (the default) is simply dropped.
@@ -1126,6 +1130,38 @@ fn rewrite_order_by_using(tokens: &mut Vec<TokenWithSpan>) {
             }
         }
         i += 1;
+    }
+}
+
+/// Rewrite the `*` of `(expr).*` into an unquoted word `*`, so the generic parser reads it as a
+/// field access, which conversion turns into [`ast::Expr::AllFields`]. The tokenizer never yields
+/// such a word itself (a bare `*` is always the multiplication token and a quoted `"*"` keeps its
+/// quotes), so a field really named `*` is not mistaken for the expansion. Only a `*` that
+/// directly follows `).` is touched; a `table.*` wildcard, a multiplication, and `COUNT(*)` keep
+/// their meaning.
+fn rewrite_composite_star(tokens: &mut [TokenWithSpan]) {
+    let meaningful: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+    for window in meaningful.windows(3) {
+        let [paren, dot, star] = window else {
+            continue;
+        };
+        let shape = (
+            tokens.get(*paren).map(|t| &t.token),
+            tokens.get(*dot).map(|t| &t.token),
+            tokens.get(*star).map(|t| &t.token),
+        );
+        if matches!(
+            shape,
+            (Some(Token::RParen), Some(Token::Period), Some(Token::Mul))
+        ) && let Some(t) = tokens.get_mut(*star)
+        {
+            t.token = Token::make_word("*", None);
+        }
     }
 }
 
