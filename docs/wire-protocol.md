@@ -280,7 +280,8 @@ Every `ReadyForQuery` carries a 1-byte transaction status:
 
 ## 9. Simple query
 
-Frontend → `Query` (type `Q`): `[ sql : Str ]` — one SQL string.
+Frontend → `Query` (type `Q`): `[ sql : Str ]`, one SQL string holding one statement or
+several separated by `;` (§9.3).
 
 The server responds with a sequence ending in `ReadyForQuery`:
 
@@ -387,6 +388,46 @@ appear are the array-element scalars (`BOOL`, `INT`, `FLOAT`, `TEXT`, `DATE`, `T
 The type metadata for an extended-query statement is reported by `Describe(Portal)` the same way
 (§10): `RowDescriptionTyped` at `minor >= 1`, otherwise `RowDescription`.
 
+### 9.3 Several statements in one query
+
+A `Query` may hold several statements separated by `;`. A `;` inside a string, a quoted
+identifier, a dollar-quoted body or a comment does not separate statements, and an empty statement
+(`;;`, or a trailing `;`) is ignored. A query holding no statement at all (empty, only `;`, or only
+comments) is an error, `42601`. Otherwise the server:
+
+1. parses every statement first. If any fails to parse, it sends that `Error` and `ReadyForQuery`
+   and runs nothing.
+2. runs the statements in order. Each sends its own result as in §9 (`RowDescription`, `DataRow`s,
+   `CommandComplete`). The first statement that fails sends its `Error`, and the statements after it
+   do not run.
+3. sends one `ReadyForQuery` at the end.
+
+Transactions:
+
+- Outside a transaction block, the statements run in one implicit transaction, committed after the
+  last one succeeds. An error rolls back everything the query ran, so either all of it takes effect
+  or none of it does.
+- `BEGIN` in the string turns the implicit transaction into an ordinary transaction block, which
+  keeps the statements already run and stays open after the query (status `T`) until a `COMMIT` or
+  `ROLLBACK`. `BEGIN` with options (`ISOLATION LEVEL`, `READ ONLY`) after another statement is
+  refused with `25001`, because the transaction has already started; put it first.
+- `COMMIT` or `ROLLBACK` in the string ends the implicit transaction at that point; the statements
+  after it run in a new implicit transaction.
+- `SAVEPOINT`, `RELEASE SAVEPOINT` and `ROLLBACK TO SAVEPOINT` need a transaction block, so in an
+  implicit transaction they fail with `25P01`. After a `BEGIN` in the same string they work as usual.
+- Inside a transaction block (opened by an earlier query or earlier in the string), the statements
+  run in that block, and an error leaves it failed (status `E`), exactly as a single statement's
+  error would.
+- Statements that cannot run inside a transaction block (`CREATE DATABASE`, `DROP DATABASE`,
+  `CHECKPOINT`) fail inside a multi-statement query for the same reason. Send them on their own.
+- A `NOTIFY` in an implicit transaction is delivered when it commits and dropped if it rolls back.
+
+`COPY` cannot be one of several statements, because its data exchange (§12) needs a query of its
+own: such a query is refused with `0A000` and runs nothing.
+
+The extended protocol (§10) takes exactly one statement: a `Parse` of SQL holding more than one
+fails with `42601` when the statement is described or executed.
+
 ## 10. Extended query (prepared statements)
 
 The extended-query protocol separates parse, bind, and execute, enabling prepared statements,
@@ -423,6 +464,9 @@ Backend replies: `ParseComplete` (`1`), `BindComplete` (`2`), `CloseComplete` (`
      SQL-level `EXECUTE name(...)` is described with the columns of the statement `PREPARE` stored.
    - An error while describing behaves like any other extended-query error (§10.2), and inside a
      transaction block it also fails the block (`ReadyForQuery` status `E`).
+   - Inside a transaction block the portal is described in that block's transaction, so it sees
+     what the block has done and not yet committed (a table it created, the owner and grants that
+     come with it), exactly as `Execute` will. In a failed block, `Describe` fails with `25P02`.
 4. `Execute` runs the portal (lazily, exactly once — caching the result) and streams up to
    `max_rows` `DataRow`s (`max_rows = 0` = all). If the cap is hit with rows remaining, the server
    sends `PortalSuspended`; a later `Execute` on the same portal resumes draining. When the
@@ -458,7 +502,7 @@ Each is bound by the type `Parse` declared for its placeholder:
 | `TEXT` (`0x05`) | text, whatever the value looks like (`"00123"` stays `00123`) |
 | `INT` (`0x02`), `FLOAT` (`0x03`), `BOOL` (`0x01`) | exactly that type; a value that is not one (`"abc"` for `INT`) is refused with `22023` |
 | `NUMERIC`, `BYTES`, `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `JSON`, `MACADDR`, `MACADDR8`, `INET`, `CIDR`, `TSVECTOR`, `TSQUERY`, `XML` | the value text cast to that type, exactly as `CAST('…' AS type)` would convert it |
-| `BIT`, `VARBIT` (`0x14`, `0x15`) | cast to `VARBIT` (the declared width is not in the tag). It assigns into a `BIT(n)` or `BIT VARYING(n)` column and compares with one; the column's width is checked when the row is written, as for a literal (`22P02` when it does not fit) |
+| `BIT`, `VARBIT` (`0x14`, `0x15`) | cast to `VARBIT` (the declared width is not in the tag). It assigns into a `BIT(n)` or `BIT VARYING(n)` column and compares with one; the column's width is checked when the row is written, as for a literal (`22026` for a `BIT(n)` length mismatch, `22001` for a `BIT VARYING(n)` overflow) |
 | `RANGE` (`0x16`), `GEOMETRY` (`0x18`) | as with no tag: the subtype is not in the tag, so the value is typed where it is used |
 | `ARRAY` (`0x0F`, or `0x80 \| element`), `VECTOR` (`0x10`) | text, converted where it is used (an assignment to an array or vector column) |
 | none, or `0x00` | inferred from the text: integer, then float, then boolean (`true`/`t`/`TRUE`, `false`/`f`/`FALSE`), else text |
@@ -543,6 +587,11 @@ Triggered when a simple `Query` is `COPY … FROM STDIN` or `COPY … TO STDOUT`
 the statement's format: text or CSV (`overall_format` `0`), or binary (`overall_format` `1`, §12.4)
 for `WITH (FORMAT binary)` or the keyword form `... STDIN BINARY`. (`COPY` over an RLS-enabled
 table by a non-superuser is refused with an `Error`: fail-closed, no policy bypass.)
+
+Inside a transaction block, `COPY` runs in the block's transaction like any other statement: it
+sees tables the block created, its rows are undone by the block's `ROLLBACK`, and a failed `COPY`
+leaves the block failed. In a failed block it is refused with `25P02` before any data is exchanged.
+Outside a block each `COPY` commits on its own.
 
 ### 12.1 `COPY … FROM STDIN` (client uploads)
 1. server → `CopyInResponse` (`G`): `[ overall_format:u8 ][ columns:u16 ]` (0 = text, 1 = binary).

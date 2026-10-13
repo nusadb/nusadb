@@ -1,0 +1,83 @@
+# Assigning one kind of bit string to the other.
+#
+# A BIT(n) value stores into BIT VARYING(m) when n <= m, and into BIT(m) only when n = m. A
+# BIT VARYING value stores into BIT(m) only when it has exactly m bits. An assignment never pads or
+# truncates (an explicit cast does): a BIT length mismatch is 22026, a BIT VARYING overflow 22001.
+
+statement ok
+CREATE TABLE vb (v VARBIT(8), f BIT(3), u VARBIT)
+
+statement ok
+INSERT INTO vb (v) VALUES (B'101')
+
+statement ok
+INSERT INTO vb (v) VALUES (B'10101010')
+
+statement error bit string too long for type bit varying\(8\)
+INSERT INTO vb (v) VALUES (B'101010101')
+
+statement ok
+INSERT INTO vb (f) VALUES (B'110')
+
+statement error bit string length 4 does not match type bit\(3\)
+INSERT INTO vb (f) VALUES (B'1010')
+
+statement error bit string length 2 does not match type bit\(3\)
+INSERT INTO vb (f) VALUES (B'10')
+
+statement ok
+INSERT INTO vb (f) VALUES (B'011'::varbit)
+
+statement error bit string length 2 does not match type bit\(3\)
+INSERT INTO vb (f) VALUES ('11'::varbit)
+
+statement ok
+INSERT INTO vb (u) VALUES (B'1100110011')
+
+statement ok
+INSERT INTO vb (v) VALUES ('1111')
+
+statement error bit string too long for type bit varying\(8\)
+INSERT INTO vb (v) VALUES ('111111111')
+
+# UPDATE follows the same rule, in both directions.
+statement ok
+UPDATE vb SET v = f WHERE f IS NOT NULL
+
+statement error bit string length 4 does not match type bit\(3\)
+UPDATE vb SET f = v WHERE v = B'1111'
+
+statement error bit string too long for type bit varying\(8\)
+UPDATE vb SET v = u WHERE u IS NOT NULL
+
+query TTT
+SELECT v, f, u FROM vb ORDER BY v, u
+----
+011 011 NULL
+101 NULL NULL
+10101010 NULL NULL
+110 110 NULL
+1111 NULL NULL
+NULL NULL 1100110011
+
+# The two kinds compare with each other whatever their declared lengths.
+query I
+SELECT count(*) WHERE B'101' <> B'1010' AND B'101' < B'1010' AND B'101'::varbit(8) = B'101'
+----
+1
+
+query T
+SELECT v FROM vb WHERE v = B'101'
+----
+101
+
+query I
+SELECT count(*) WHERE B'101' IN (B'1', B'101'::varbit)
+----
+1
+
+# An explicit cast still pads or truncates.
+query TTT
+SELECT B'10101'::bit(3), B'1'::bit(3), B'101'::varbit(2)
+----
+101 100 10

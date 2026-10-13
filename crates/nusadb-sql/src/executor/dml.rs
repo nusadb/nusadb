@@ -2361,6 +2361,17 @@ pub(super) fn run_copy_from(
         .iter()
         .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
         .collect();
+    // A composite column is stored as text, so the load checks each value against its composite
+    // type here, as an INSERT would, and stores the canonical form.
+    let mut composite_targets = Vec::with_capacity(target_names.len());
+    for name in &target_names {
+        let fields = match lookup_composite_column(engine, txn, &table.schema, &table.name, name)? {
+            Some(type_name) => lookup_composite(engine, txn, &type_name)?
+                .map(|fields| crate::composite::field_types(&fields)),
+            None => None,
+        };
+        composite_targets.push(fields);
+    }
 
     // Stream the payload in INSERT_SELECT_BATCH-row batches rather than materializing every parsed
     // row up front: a multi-million-row COPY otherwise builds a Vec holding
@@ -2419,7 +2430,15 @@ pub(super) fn run_copy_from(
     for row in copy_rows(copy, data, &target_types, &target_names)? {
         // Honor a statement timeout / cancel request at row granularity on a long load.
         crate::cancel::check()?;
-        let row = row?;
+        let mut row = row?;
+        for (value, fields) in row.iter_mut().zip(&composite_targets) {
+            if let (Some(ast::Value::Text(text)), Some(fields)) = (value.as_mut(), fields) {
+                let parsed = crate::composite::parse(text, fields).ok_or_else(|| {
+                    Error::InvalidParameterValue(format!("malformed composite value {text:?}"))
+                })?;
+                *text = parsed.format();
+            }
+        }
         batch.push(row);
         if batch.len() >= INSERT_SELECT_BATCH {
             flush(&mut batch, &mut unique)?;

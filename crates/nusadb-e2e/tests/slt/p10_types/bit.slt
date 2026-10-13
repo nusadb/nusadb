@@ -247,10 +247,10 @@ SELECT id, f, v FROM bw
 1 1010 101
 3 0001 1010
 
-statement error invalid
+statement error bit string length 5 does not match type bit\(4\)
 INSERT INTO bw (id, f) VALUES (4, CAST('10101' AS BIT VARYING))
 
-statement error invalid
+statement error bit string too long for type bit varying\(6\)
 INSERT INTO bw (id, v) VALUES (5, CAST('1010101' AS BIT VARYING))
 
 # Bit strings of different declared widths compare by value.

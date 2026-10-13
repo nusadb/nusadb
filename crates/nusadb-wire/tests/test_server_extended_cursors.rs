@@ -428,15 +428,26 @@ async fn bit_tagged_parameters_assign_into_bit_columns() {
             "{sql} with tag {tag:#04x}: {msgs:?}"
         );
     }
-    for (sql, tag, value) in [
-        ("INSERT INTO b (id, f) VALUES (5, $1)", 0x14, "10101"),
-        ("INSERT INTO b (id, f) VALUES (6, $1)", 0x15, "101"),
-        ("INSERT INTO b (id, v) VALUES (7, $1)", 0x15, "1010101"),
+    // A BIT length mismatch is 22026 and a BIT VARYING overflow 22001, as for a literal.
+    for (sql, tag, value, code) in [
+        (
+            "INSERT INTO b (id, f) VALUES (5, $1)",
+            0x14,
+            "10101",
+            "22026",
+        ),
+        ("INSERT INTO b (id, f) VALUES (6, $1)", 0x15, "101", "22026"),
+        (
+            "INSERT INTO b (id, v) VALUES (7, $1)",
+            0x15,
+            "1010101",
+            "22001",
+        ),
     ] {
         let msgs = Ext::new(sql).param(tag, value).run(&mut conn).await;
         assert_eq!(
             error_code(&msgs).as_deref(),
-            Some("22P02"),
+            Some(code),
             "{sql} with {value}"
         );
     }

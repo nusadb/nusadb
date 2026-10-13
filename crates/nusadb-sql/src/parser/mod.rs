@@ -36,7 +36,7 @@ use crate::ast;
 use crate::error::Error;
 
 mod comments;
-pub use comments::skip_leading_comments;
+pub use comments::{skip_leading_comments, split_statements};
 mod dcl;
 mod ddl;
 mod dml;
@@ -3211,9 +3211,19 @@ fn convert_create_composite(
             return unsupported("CREATE TYPE field with COLLATE is not supported");
         }
         // Validate the field type is a supported built-in, then keep its canonical SQL text so the
-        // registry can re-parse it via `parse_column_type`.
-        ddl::convert_data_type(&attr.data_type)?;
-        fields.push((fold_ident(&attr.name), attr.data_type.to_string()));
+        // registry can re-parse it via `parse_column_type`. A plain name that is no built-in may be
+        // another composite type; it is kept folded, and the executor checks that it exists.
+        let type_sql = match ddl::convert_data_type(&attr.data_type) {
+            Ok(_) => attr.data_type.to_string(),
+            Err(Error::ObjectNotFound(msg)) => match &attr.data_type {
+                sql::DataType::Custom(n, args) if args.is_empty() && n.0.len() == 1 => {
+                    object_name(n)?
+                },
+                _ => return Err(Error::ObjectNotFound(msg)),
+            },
+            Err(e) => return Err(e),
+        };
+        fields.push((fold_ident(&attr.name), type_sql));
     }
     Ok(ast::Statement::CreateComposite(ast::CreateComposite {
         name: object_name(name)?,

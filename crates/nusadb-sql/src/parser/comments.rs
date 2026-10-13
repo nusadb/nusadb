@@ -77,6 +77,54 @@ pub fn skip_leading_comments(sql: &str) -> &str {
     }
 }
 
+/// Split a string of SQL into its statements at each top-level `;`.
+///
+/// A `;` inside a string (`'…'` with `''` doubling, `E'…'` with backslash escapes), a quoted
+/// identifier (`"…"`), a dollar-quoted body (`$$ … $$`, `$tag$ … $tag$`) or a comment (`-- …`, or
+/// `/* … */`, which nests) does not split. Each returned statement is a slice of `sql` without its
+/// terminating `;`. A piece holding only whitespace and comments is dropped, so `SELECT 1;` is one
+/// statement and an empty string is none. An unterminated block comment or quote runs to the end of
+/// the input, leaving the parser to report it.
+///
+/// This is how a multi-statement simple query is divided before each statement is parsed on its
+/// own; [`parse`](super::parse) itself still accepts exactly one statement.
+#[must_use]
+pub fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut push = |from: usize, to: usize| {
+        if let Some(piece) = sql.get(from..to)
+            && !skip_leading_comments(piece).trim().is_empty()
+        {
+            out.push(piece);
+        }
+    };
+    while let Some(&b) = bytes.get(i) {
+        let next = bytes.get(i + 1).copied();
+        i = match b {
+            b'\'' => skip_quoted(bytes, i, b'\'', is_escape_string(bytes, i)),
+            b'"' => skip_quoted(bytes, i, b'"', false),
+            b'$' if !follows_identifier(bytes, i) => skip_dollar_quoted(bytes, i),
+            b'-' if next == Some(b'-') => bytes
+                .iter()
+                .skip(i)
+                .position(|&c| c == b'\n')
+                .map_or(bytes.len(), |p| i + p),
+            b'/' if next == Some(b'*') => block_comment_end(bytes, i).unwrap_or(bytes.len()),
+            b';' => {
+                push(start, i);
+                start = i + 1;
+                i + 1
+            },
+            _ => i + 1,
+        };
+    }
+    push(start, bytes.len());
+    out
+}
+
 /// Overwrite `out[start..end]` with spaces, keeping line breaks.
 fn blank(out: &mut [u8], start: usize, end: usize) {
     for byte in out.iter_mut().take(end).skip(start) {
@@ -148,9 +196,9 @@ fn skip_quoted(bytes: &[u8], start: usize, quote: u8, backslash_escapes: bool) -
     bytes.len()
 }
 
-/// The offset just past the dollar-quoted body opened at `start` (`$$` or `$tag$`, the tag an
-/// identifier that does not start with a digit, so `$1` is a parameter), or `start + 1` when no
-/// dollar quote opens there.
+/// The offset just past the dollar-quoted body opened at `start` (`$$` or `$tag$`), or `start + 1`
+/// when no dollar quote opens there. The tag rule is the tokenizer's: any run of letters, digits
+/// and `_` closed by a `$`, so `$1$ … $1$` is a string while `$1` (no closing `$`) is a parameter.
 fn skip_dollar_quoted(bytes: &[u8], start: usize) -> usize {
     let tag_len = bytes
         .iter()
@@ -160,8 +208,7 @@ fn skip_dollar_quoted(bytes: &[u8], start: usize) -> usize {
         return start + 1;
     };
     let close = start + 1 + tag_len;
-    let starts_with_digit = bytes.get(start + 1).is_some_and(u8::is_ascii_digit);
-    if bytes.get(close) != Some(&b'$') || (tag_len > 0 && starts_with_digit) {
+    if bytes.get(close) != Some(&b'$') {
         return start + 1;
     }
     let Some(delimiter) = bytes.get(start..=close) else {
@@ -176,7 +223,7 @@ fn skip_dollar_quoted(bytes: &[u8], start: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{blank_comments, skip_leading_comments};
+    use super::{blank_comments, skip_leading_comments, split_statements};
     use crate::parse;
 
     #[test]
@@ -216,6 +263,52 @@ mod tests {
         assert_eq!(
             blank_comments("SELECT name'x' -- c").trim_end(),
             "SELECT name'x'"
+        );
+    }
+
+    #[test]
+    fn split_statements_cuts_only_at_top_level_semicolons() {
+        assert_eq!(
+            split_statements("SELECT 1; SELECT 2"),
+            ["SELECT 1", " SELECT 2"]
+        );
+        assert_eq!(split_statements("SELECT 1;"), ["SELECT 1"]);
+        assert_eq!(split_statements("SELECT 1;;  ; -- c\n"), ["SELECT 1"]);
+        assert!(split_statements("").is_empty());
+        assert!(split_statements(" ; /* only */ ;").is_empty());
+        for one in [
+            "SELECT 'a;b'",
+            "SELECT 'it''s; x'",
+            "SELECT E'\\'; x'",
+            "SELECT \"a;b\" FROM t",
+            "SELECT 1 -- a; b",
+            "SELECT 1 /* a; /* b; */ c; */",
+            "CREATE FUNCTION f() RETURNS INT AS $$ SELECT 1; SELECT 2 $$",
+            "CREATE FUNCTION f() RETURNS INT AS $fn$ SELECT '$$'; $fn$",
+            "SELECT 1 /* never closed; SELECT 2",
+            "SELECT 'never closed; SELECT 2",
+        ] {
+            assert_eq!(split_statements(one), [one], "{one}");
+        }
+        // `$1` is a parameter and `a$b` an identifier, so neither opens a dollar-quoted body.
+        assert_eq!(
+            split_statements("SELECT $1; SELECT a$b$; SELECT 3").len(),
+            3
+        );
+        // A tag may start with a digit, as the tokenizer reads it: `$1$ … $1$` is one string.
+        let digit_tag = "SELECT $1$; SELECT 2; SELECT $1$";
+        assert_eq!(split_statements(digit_tag), [digit_tag]);
+        assert!(parse(digit_tag).is_ok());
+        assert_eq!(
+            blank_comments("SELECT $1$ -- kept $1$"),
+            "SELECT $1$ -- kept $1$"
+        );
+        assert_eq!(
+            split_statements("-- head\nCREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);"),
+            [
+                "-- head\nCREATE TABLE t (id INT)",
+                "\nINSERT INTO t VALUES (1)"
+            ]
         );
     }
 

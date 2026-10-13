@@ -421,16 +421,8 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             out.extend_from_slice(&crate::range::encode(r));
         },
         // BIT(n) requires exactly n bits; BIT VARYING(n) at most n (unbounded when None).
-        (ast::Value::Bit(b), ColumnType::Bit(n)) => {
-            if b.len() != n as usize {
-                return Err(invalid(ty, &crate::bit::format(b)));
-            }
-            out.extend_from_slice(&crate::bit::encode(b));
-        },
-        (ast::Value::Bit(b), ColumnType::VarBit(max)) => {
-            if max.is_some_and(|n| b.len() > n as usize) {
-                return Err(invalid(ty, &crate::bit::format(b)));
-            }
+        (ast::Value::Bit(b), ColumnType::Bit(_) | ColumnType::VarBit(_)) => {
+            check_bit_length(b.len(), ty)?;
             out.extend_from_slice(&crate::bit::encode(b));
         },
         // Implicit string coercion ("unknown literal" rule): a text value assigned to a
@@ -490,18 +482,9 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             let g = crate::geometry::parse(s, kind).ok_or_else(|| invalid(ty, s))?;
             write_geometry_text(&crate::geometry::format(&g), out)?;
         },
-        (ast::Value::Text(s), ColumnType::Bit(n)) => {
+        (ast::Value::Text(s), ColumnType::Bit(_) | ColumnType::VarBit(_)) => {
             let bits = crate::bit::parse(s).ok_or_else(|| invalid(ty, s))?;
-            if bits.len() != n as usize {
-                return Err(invalid(ty, s));
-            }
-            out.extend_from_slice(&crate::bit::encode(&bits));
-        },
-        (ast::Value::Text(s), ColumnType::VarBit(max)) => {
-            let bits = crate::bit::parse(s).ok_or_else(|| invalid(ty, s))?;
-            if max.is_some_and(|n| bits.len() > n as usize) {
-                return Err(invalid(ty, s));
-            }
+            check_bit_length(bits.len(), ty)?;
             out.extend_from_slice(&crate::bit::encode(&bits));
         },
         // NUMERIC: the value (or a coercible Int/Float/Text) rescaled to the column's
@@ -824,6 +807,23 @@ fn put_bytes(b: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(b);
     Ok(())
+}
+
+/// The length rule for storing a bit string of `len` bits into a column of type `ty`: `BIT(n)` takes
+/// exactly `n` bits (`22026` otherwise) and `BIT VARYING(n)` at most `n` (`22001` otherwise). An
+/// assignment never pads or truncates; only an explicit cast does.
+fn check_bit_length(len: usize, ty: ColumnType) -> Result<(), Error> {
+    match ty {
+        ColumnType::Bit(n) if len != n as usize => Err(Error::Coded {
+            message: format!("bit string length {len} does not match type bit({n})"),
+            sqlstate: "22026", // string_data_length_mismatch
+        }),
+        ColumnType::VarBit(Some(n)) if len > n as usize => Err(Error::Coded {
+            message: format!("bit string too long for type bit varying({n})"),
+            sqlstate: "22001", // string_data_right_truncation
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Build an `InvalidValue` error for a string literal that does not parse as `ty`.

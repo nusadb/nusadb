@@ -79,7 +79,7 @@ impl Catalog for EngineCatalog<'_> {
     fn lookup_composite(
         &self,
         name: &str,
-    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, nusadb_sql::Error> {
+    ) -> Result<Option<Vec<(String, nusadb_sql::composite::FieldType)>>, nusadb_sql::Error> {
         // Read the composite type registry under a fresh read snapshot, like the production catalog.
         let txn = self.0.begin(nusadb_core::IsolationLevel::default())?;
         let out = nusadb_sql::lookup_composite(self.0, txn, name);

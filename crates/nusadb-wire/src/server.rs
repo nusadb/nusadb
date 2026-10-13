@@ -917,6 +917,35 @@ where
         match FrontendMessage::decode(&frame).map_err(io::Error::other)? {
             FrontendMessage::Query { sql } => {
                 failed = false; // a simple query abandons any half-built extended pipeline
+                let pieces = nusadb_sql::split_statements(&sql);
+                if pieces.len() > 1 {
+                    let mut batch = SimpleBatch {
+                        conn: &mut conn,
+                        engine: &engine,
+                        cluster: &cluster,
+                        database: &database,
+                        user: &user,
+                        pid: key.pid,
+                        cancel: &cancel_token,
+                        statement_timeout,
+                        typed: typed_row_description,
+                        array_elements: array_element_types,
+                        settings: &settings,
+                        cursors: &cursors,
+                        prepared: &prepared,
+                        temp_schema: &temp_schema_name,
+                        metrics: metrics.as_ref(),
+                        txn_state: &mut txn_state,
+                        plan_cache: &mut plan_cache,
+                        on_commit: &mut on_commit,
+                        pending_notify: &mut pending_notify,
+                    };
+                    run_simple_batch(&mut batch, &pieces).await?;
+                    conn.write_frame(&BackendMessage::ReadyForQuery(txn_state.status()).encode()?)
+                        .await?;
+                    idle = true;
+                    continue;
+                }
                 if let Some(copy) = copy_statement(&sql) {
                     // COPY ... FROM STDIN / TO STDOUT drives the COPY sub-protocol. The table form
                     // does not pass through the RLS-aware analyzer, so refuse it on an RLS-enabled
@@ -928,23 +957,34 @@ where
                     // Checked as the role the session currently acts as, so a `SET ROLE` does not
                     // leave COPY evaluating against the login role's privileges.
                     let copy_actor = effective_user(&user, &settings);
+                    // Inside a transaction block COPY runs in the block's transaction, so it sees
+                    // what the block created and is undone by its ROLLBACK.
+                    let copy_txn = txn_state.open_txn();
                     // The gate opens a short read transaction; while the engine holds new
                     // transactions back for a checkpoint, take it on the blocking pool rather
                     // than parking this reactor thread.
-                    let gate = if copy.query.is_some() {
+                    let gate = if copy.query.is_some() || matches!(txn_state, TxnState::Failed { .. })
+                    {
                         None
                     } else if engine.admission_paused() {
                         let (engine, copy, actor) =
                             (Arc::clone(&engine), copy.clone(), copy_actor.clone());
                         tokio::task::spawn_blocking(move || {
-                            copy_rls_block(engine.as_ref(), &copy, &actor, copy.direction)
+                            copy_rls_block(engine.as_ref(), &copy, &actor, copy.direction, copy_txn)
                         })
                         .await
                         .unwrap_or_else(|_| Some("could not verify access for COPY".to_owned()))
                     } else {
-                        copy_rls_block(engine.as_ref(), &copy, &copy_actor, copy.direction)
+                        copy_rls_block(engine.as_ref(), &copy, &copy_actor, copy.direction, copy_txn)
                     };
-                    let outcome = if let Some(msg) = gate {
+                    let outcome = if matches!(txn_state, TxnState::Failed { .. }) {
+                        Err((
+                            "current transaction is aborted, commands ignored until end of \
+                             transaction block"
+                                .to_owned(),
+                            "25P02",
+                        ))
+                    } else if let Some(msg) = gate {
                         // The COPY access gate refuses on privilege / RLS / reserved-namespace
                         // grounds — an access-control refusal (`42501`), not an engine fault.
                         Err((msg, "42501"))
@@ -962,6 +1002,7 @@ where
                                     settings_snapshot(&settings, &database)
                                         .get("timezone")
                                         .cloned(),
+                                    copy_txn,
                                 )
                                 .await?
                             },
@@ -972,6 +1013,7 @@ where
                                     copy,
                                     &copy_actor,
                                     settings_snapshot(&settings, &database).get("timezone").cloned(),
+                                    copy_txn,
                                 )
                                 .await?
                             },
@@ -979,6 +1021,19 @@ where
                     };
                     if let Some(m) = &metrics {
                         m.query(outcome.is_ok());
+                    }
+                    // A COPY inside a transaction block is one of its statements: it dirties the
+                    // block, and a failure aborts it like any other statement's would.
+                    if let TxnState::Active { txn, isolation, .. } = txn_state {
+                        txn_state = if outcome.is_ok() {
+                            TxnState::Active {
+                                txn,
+                                dirty: true,
+                                isolation,
+                            }
+                        } else {
+                            TxnState::Failed { txn, isolation }
+                        };
                     }
                     match outcome {
                         Ok(count) => {
@@ -1185,6 +1240,7 @@ where
                         &name,
                         &effective_user(&user, &settings),
                         &settings.lock().map(|g| g.clone()).unwrap_or_default(),
+                        txn_state,
                     )
                     .await
                     {
@@ -1596,11 +1652,12 @@ async fn handle_copy_in<S>(
     max_bytes: Option<usize>,
     actor: &str,
     timezone: Option<String>,
+    open_txn: Option<nusadb_core::TxnId>,
 ) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let columns = copy_in_column_count(engine, &copy).await;
+    let columns = copy_in_column_count(engine, &copy, open_txn).await;
     let format = copy_wire_format(&copy);
     conn.write_frame(&BackendMessage::CopyInResponse { format, columns }.encode()?)
         .await?;
@@ -1670,10 +1727,9 @@ where
         nusadb_sql::pin_statement_timezone(timezone.as_deref());
         // The access check runs in the SAME transaction as the load, so a REVOKE that lands after
         // the pre-upload fast-fail check still bites — there is no window between "allowed" and
-        // "written" for a concurrent change to slip through.
-        let txn = engine
-            .begin(IsolationLevel::default())
-            .map_err(|e| (e.to_string(), e.sqlstate()))?;
+        // "written" for a concurrent change to slip through. Inside a transaction block that is
+        // the block's transaction, left open for the block to commit or roll back.
+        let (txn, owned) = copy_transaction(engine.as_ref(), open_txn)?;
         if let Some(msg) = copy_access_verdict(
             engine.as_ref(),
             txn,
@@ -1681,13 +1737,16 @@ where
             &actor,
             nusadb_sql::ast::CopyDirection::From,
         ) {
-            let _ = engine.rollback(txn);
+            if owned {
+                let _ = engine.rollback(txn);
+            }
             return Err((msg, "42501")); // access-control refusal
         }
         // A load failure — a value the column type rejects (`22P02`), a duplicate key (`23505`),
         // and so on — carries its own SQLSTATE, so the client sees the real class rather than the
         // generic internal-error code.
         match nusadb_sql::copy_from_bytes_in(engine.as_ref(), &copy, &data, txn) {
+            Ok(count) if !owned => Ok(count),
             Ok(count) => match engine.commit(txn) {
                 Ok(()) => Ok(count),
                 Err(e) => {
@@ -1696,7 +1755,9 @@ where
                 },
             },
             Err(e) => {
-                let _ = engine.rollback(txn);
+                if owned {
+                    let _ = engine.rollback(txn);
+                }
                 Err((e.to_string(), e.sqlstate()))
             },
         }
@@ -1709,15 +1770,20 @@ where
 /// The advisory column count a `CopyInResponse` announces: the listed columns, or the target
 /// table's width. The real load arity is validated against the table in `copy_from`, so a table
 /// that cannot be read here (its error is reported by the load) or an implausible >65535-column
-/// overflow reports 0.
+/// overflow reports 0. Inside a transaction block the table is read in the block's transaction,
+/// so a table the block created reports its real width.
 async fn copy_in_column_count(
     engine: &Arc<dyn StorageEngine>,
     copy: &nusadb_sql::ast::Copy,
+    open_txn: Option<TxnId>,
 ) -> u16 {
     let columns = if copy.columns.is_empty() {
         let engine = Arc::clone(engine);
         let probe = copy.clone();
         tokio::task::spawn_blocking(move || {
+            if let Some(txn) = open_txn {
+                return nusadb_sql::copy_column_count_in(engine.as_ref(), &probe, txn).ok();
+            }
             let txn = engine.begin(IsolationLevel::default()).ok()?;
             let count = nusadb_sql::copy_column_count_in(engine.as_ref(), &probe, txn).ok();
             let _ = engine.rollback(txn);
@@ -1733,6 +1799,25 @@ async fn copy_in_column_count(
     u16::try_from(columns).unwrap_or(0)
 }
 
+/// The transaction a `COPY` runs in, and whether the `COPY` owns it: inside a transaction block
+/// the block's own (with a new statement begun in it, so a `READ COMMITTED` block sees what has
+/// committed since its last statement), otherwise a fresh one the caller commits or rolls back.
+fn copy_transaction(
+    engine: &dyn StorageEngine,
+    open_txn: Option<TxnId>,
+) -> Result<(TxnId, bool), (String, &'static str)> {
+    open_txn
+        .map_or_else(
+            || {
+                engine
+                    .begin(IsolationLevel::default())
+                    .map(|txn| (txn, true))
+            },
+            |txn| engine.begin_statement(txn).map(|()| (txn, false)),
+        )
+        .map_err(|e| (e.to_string(), e.sqlstate()))
+}
+
 /// Drive the `COPY ... TO STDOUT` sub-protocol: render the rows, then stream them as
 /// `CopyOutResponse` + one `CopyData` + `CopyDone`. Returns the row count, or an error message to
 /// relay (sent before any copy-out frame, so a failed render never starts a half-stream).
@@ -1742,6 +1827,7 @@ async fn handle_copy_out<S>(
     copy: nusadb_sql::ast::Copy,
     actor: &str,
     timezone: Option<String>,
+    open_txn: Option<nusadb_core::TxnId>,
 ) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1754,10 +1840,9 @@ where
         // `timestamptz` fields render on the session-local wall clock like every other output.
         nusadb_sql::pin_statement_timezone(timezone.as_deref());
         // Check and render in one transaction, so the rows streamed out are exactly the ones the
-        // access check was evaluated against.
-        let txn = engine
-            .begin(IsolationLevel::default())
-            .map_err(|e| (e.to_string(), e.sqlstate()))?;
+        // access check was evaluated against. Inside a transaction block that is the block's
+        // transaction, so the rows include what the block wrote and it stays open.
+        let (txn, owned) = copy_transaction(engine.as_ref(), open_txn)?;
         // The table form's SELECT-privilege check is raised here because table COPY never reaches the
         // analyzer. The query form (`COPY (<query>) TO STDOUT`) DOES go through analysis — which
         // enforces per-table privileges and row-level security as the COPY user — so the flat
@@ -1771,12 +1856,16 @@ where
                 nusadb_sql::ast::CopyDirection::To,
             )
         {
-            let _ = engine.rollback(txn);
+            if owned {
+                let _ = engine.rollback(txn);
+            }
             return Err((msg, "42501")); // access-control refusal
         }
         let out = nusadb_sql::copy_to_bytes_with_columns_in(engine.as_ref(), &copy, &actor, txn)
             .map_err(|e| (e.to_string(), e.sqlstate()));
-        let _ = engine.rollback(txn); // read-only: nothing to commit
+        if owned {
+            let _ = engine.rollback(txn); // read-only: nothing to commit
+        }
         out
     })
     .await
@@ -1971,6 +2060,7 @@ async fn describe_portal(
     name: &str,
     acting_user: &str,
     settings: &HashMap<String, String>,
+    state: TxnState,
 ) -> Result<(Vec<String>, Vec<nusadb_core::ColumnType>), (String, &'static str)> {
     let (sql, params) = match portals.get(name) {
         // A portal already executed (its rows are cached) reuses the executed column names. Types are
@@ -1991,12 +2081,26 @@ async fn describe_portal(
     tokio::task::spawn_blocking(move || {
         let stmt = params.bind(parse(&sql)?)?;
         // Describe resolves the row shape without running the statement, but analysis still
-        // needs a transaction to resolve schema visibility. Use a short read-only
-        // transaction and roll it back — Describe must have no side effects. The **acting** user
-        // (the assumed role after `SET ROLE`, not the login role) and the connection's settings
-        // are carried so column visibility and search-path resolution match execution exactly —
-        // otherwise Describe would report columns of tables the acting role cannot read.
-        let txn = engine.begin(IsolationLevel::default())?;
+        // needs a transaction to resolve schema visibility. Inside an open transaction block that
+        // is the block's own transaction: Execute analyzes there too, so Describe must see the
+        // same catalog, including tables, owners and grants the block created but has not yet
+        // committed. A fresh transaction would not see them and would refuse what Execute allows.
+        // Analysis only reads, so it leaves the block's transaction as it was. Outside a block, use
+        // a short transaction and roll it back. The **acting** user (the assumed role after
+        // `SET ROLE`, not the login role) and the connection's settings are carried so column
+        // visibility and search-path resolution match execution exactly; otherwise Describe would
+        // report columns of tables the acting role cannot read.
+        let (txn, owned) = match state {
+            TxnState::Active { txn, .. } => (txn, false),
+            TxnState::Failed { .. } => {
+                return Err(nusadb_sql::Error::TransactionAborted(
+                    "current transaction is aborted, commands ignored until end of transaction \
+                     block"
+                        .to_owned(),
+                ));
+            },
+            TxnState::Auto => (engine.begin(IsolationLevel::default())?, true),
+        };
         let catalog = EngineCatalog::new(engine.as_ref(), txn, &acting_user, &settings);
         let result = analyze(stmt, &catalog).and_then(|logical| {
             let physical = plan(logical);
@@ -2023,7 +2127,9 @@ async fn describe_portal(
                 describe_column_types(&physical),
             ))
         });
-        let _ = engine.rollback(txn);
+        if owned {
+            let _ = engine.rollback(txn);
+        }
         result
     })
     .await
@@ -2340,7 +2446,13 @@ fn copy_rls_block(
     copy: &nusadb_sql::ast::Copy,
     user: &str,
     direction: nusadb_sql::ast::CopyDirection,
+    open_txn: Option<nusadb_core::TxnId>,
 ) -> Option<String> {
+    // Inside a transaction block, check under the block's own transaction: the table, its owner
+    // and its grants may have been created there and not committed yet.
+    if let Some(txn) = open_txn {
+        return copy_access_verdict(engine, txn, copy, user, direction);
+    }
     let Ok(txn) = engine.begin(IsolationLevel::default()) else {
         return Some("could not verify access for COPY".to_owned());
     };
@@ -5172,7 +5284,7 @@ impl Catalog for EngineCatalog<'_> {
     fn lookup_composite(
         &self,
         name: &str,
-    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, nusadb_sql::Error> {
+    ) -> Result<Option<Vec<(String, nusadb_sql::composite::FieldType)>>, nusadb_sql::Error> {
         nusadb_sql::lookup_composite(self.engine, self.txn, name)
     }
 
@@ -5313,6 +5425,324 @@ impl Catalog for EngineCatalog<'_> {
         // non-superuser whose query targets this RLS-enabled table.
         nusadb_sql::lookup_policies_for(self.engine, self.txn, schema, name)
     }
+}
+
+/// The per-connection state a multi-statement simple query reads and updates, borrowed from the
+/// connection loop for the length of one `Query` message.
+struct SimpleBatch<'a, S> {
+    conn: &'a mut Connection<S>,
+    engine: &'a Arc<dyn StorageEngine>,
+    cluster: &'a Arc<dyn DatabaseCluster>,
+    database: &'a str,
+    user: &'a str,
+    pid: u32,
+    cancel: &'a nusadb_sql::cancel::CancelToken,
+    statement_timeout: Option<Duration>,
+    typed: bool,
+    array_elements: bool,
+    settings: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
+    cursors: &'a Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
+    prepared: &'a Arc<std::sync::Mutex<nusadb_sql::PreparedStore>>,
+    temp_schema: &'a str,
+    metrics: Option<&'a Arc<Metrics>>,
+    txn_state: &'a mut TxnState,
+    plan_cache: &'a mut nusadb_sql::PlanCache,
+    on_commit: &'a mut OnCommitRegistry,
+    pending_notify: &'a mut PendingNotifications,
+}
+
+/// Run a simple query that holds more than one statement.
+///
+/// The statements run in order and each sends its own result frames; the caller sends the one
+/// `ReadyForQuery` that ends the message. Every statement is parsed before any runs, so a syntax
+/// error anywhere runs nothing. `COPY` is refused in a multi-statement query: its data sub-protocol
+/// needs a query of its own.
+///
+/// Outside a transaction block the statements share one implicit transaction, committed after the
+/// last one. The first error stops the query and rolls the implicit transaction back. Inside the
+/// string, `BEGIN` turns the implicit transaction into an ordinary transaction block that keeps the
+/// statements already run; `COMMIT` or `ROLLBACK` ends the implicit transaction early, and the
+/// statements after it start a new one. `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` need a transaction
+/// block and fail in an implicit transaction. Inside an explicit transaction block the statements
+/// simply run in it, and an error leaves the block failed, as a single statement's would.
+async fn run_simple_batch<S>(batch: &mut SimpleBatch<'_, S>, pieces: &[&str]) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Refuse COPY and any syntax error before running anything.
+    for piece in pieces {
+        if copy_statement(piece).is_some() {
+            let msg = "COPY cannot be combined with other statements in one simple query; send it \
+                       as a query of its own";
+            batch
+                .conn
+                .write_frame(&error_response_coded(msg, "0A000").encode()?)
+                .await?;
+            return Ok(());
+        }
+        if let Err(e) = parse(piece) {
+            batch
+                .conn
+                .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+                .await?;
+            return Ok(());
+        }
+    }
+    let mut implicit = false;
+    for piece in pieces {
+        let control = txn_control_kind(piece);
+        let ok = match (&control, implicit) {
+            // `BEGIN` inside an implicit transaction makes it a transaction block. Its
+            // characteristics could only apply before the first statement, which has run.
+            (Some(TxnControl::Begin), true) => {
+                let plain = matches!(
+                    parse(piece),
+                    Ok(nusadb_sql::ast::Statement::BeginTransaction(s)) if s.is_default()
+                );
+                if plain {
+                    implicit = false;
+                    batch
+                        .conn
+                        .write_frame(&command_complete("BEGIN").encode()?)
+                        .await?;
+                    true
+                } else {
+                    let msg = "transaction characteristics must be set before any statement; put \
+                               BEGIN with options first in the query";
+                    batch
+                        .conn
+                        .write_frame(&error_response_coded(msg, "25001").encode()?)
+                        .await?;
+                    false
+                }
+            },
+            (
+                Some(TxnControl::Savepoint(_) | TxnControl::Release(_) | TxnControl::RollbackTo(_)),
+                true,
+            ) => {
+                let e = nusadb_sql::Error::NoActiveTransaction(
+                    "SAVEPOINT can only be used in transaction blocks".to_owned(),
+                );
+                batch
+                    .conn
+                    .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+                    .await?;
+                false
+            },
+            _ => {
+                if control.is_none() && matches!(batch.txn_state, TxnState::Auto) {
+                    if !begin_implicit(batch).await? {
+                        break;
+                    }
+                    implicit = true;
+                }
+                let ends = matches!(control, Some(TxnControl::Commit | TxnControl::Rollback));
+                let ok = run_batch_statement(batch, piece, control).await?;
+                if ends {
+                    implicit = false;
+                }
+                ok
+            },
+        };
+        if let Some(m) = batch.metrics {
+            m.query(ok);
+        }
+        if !ok {
+            if implicit {
+                end_implicit(batch, false).await?;
+            }
+            return Ok(());
+        }
+    }
+    if implicit {
+        end_implicit(batch, true).await?;
+    }
+    Ok(())
+}
+
+/// Open the implicit transaction of a multi-statement query. Returns whether it opened; on failure
+/// the error has been sent.
+async fn begin_implicit<S>(batch: &mut SimpleBatch<'_, S>) -> io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let engine = Arc::clone(batch.engine);
+    let settings = Arc::clone(batch.settings);
+    let state = *batch.txn_state;
+    let (result, new_state) = tokio::task::spawn_blocking(move || {
+        begin_txn(
+            engine.as_ref(),
+            state,
+            &settings,
+            &nusadb_sql::ast::TransactionSettings::default(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_join| {
+        (
+            Err(nusadb_sql::Error::Unsupported(
+                "internal execution error".to_owned(),
+            )),
+            state,
+        )
+    });
+    *batch.txn_state = new_state;
+    if let Err(e) = result {
+        batch
+            .conn
+            .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+            .await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Commit (or roll back) the implicit transaction of a multi-statement query, with the same
+/// cursor, `ON COMMIT` and `NOTIFY` bookkeeping an explicit `COMMIT` or `ROLLBACK` gets. Nothing is
+/// sent for it unless the commit fails.
+async fn end_implicit<S>(batch: &mut SimpleBatch<'_, S>, commit: bool) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let old_state = *batch.txn_state;
+    let engine = Arc::clone(batch.engine);
+    let settings = Arc::clone(batch.settings);
+    let (result, new_state) = tokio::task::spawn_blocking(move || {
+        if commit {
+            commit_txn(engine.as_ref(), old_state, &settings)
+        } else {
+            rollback_txn(engine.as_ref(), old_state, &settings)
+        }
+    })
+    .await
+    .unwrap_or_else(|_join| {
+        (
+            Err(nusadb_sql::Error::Unsupported(
+                "internal execution error".to_owned(),
+            )),
+            TxnState::Auto,
+        )
+    });
+    *batch.txn_state = new_state;
+    let committed = commit && result.is_ok() && matches!(old_state, TxnState::Active { .. });
+    let control = if committed {
+        TxnControl::Commit
+    } else {
+        TxnControl::Rollback
+    };
+    settle_cursors_after_stmt(batch.cursors, Some(&control), true, old_state, new_state);
+    let fire = on_commit_after_stmt(
+        batch.on_commit,
+        None,
+        Some(&control),
+        true,
+        old_state,
+        new_state,
+    );
+    fire_on_commit_actions(
+        batch.engine,
+        batch.database,
+        &effective_user(batch.user, batch.settings),
+        batch.settings,
+        fire,
+    )
+    .await;
+    if committed {
+        batch.pending_notify.flush(batch.pid, batch.database);
+    } else {
+        batch.pending_notify.discard();
+    }
+    if let Err(e) = result {
+        batch
+            .conn
+            .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Run one statement of a multi-statement query exactly as a single-statement simple query runs
+/// it, with its cursor, `ON COMMIT` and `NOTIFY` bookkeeping. Returns whether it succeeded.
+async fn run_batch_statement<S>(
+    batch: &mut SimpleBatch<'_, S>,
+    piece: &str,
+    control: Option<TxnControl>,
+) -> io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Some(stmt) = pubsub_statement(piece) {
+        let ok = !(matches!(stmt, nusadb_sql::ast::Statement::Notify { .. })
+            && matches!(batch.txn_state, TxnState::Failed { .. }));
+        handle_pubsub(
+            batch.conn,
+            batch.pid,
+            batch.database,
+            batch.txn_state.notify_phase(),
+            batch.pending_notify,
+            stmt,
+        )
+        .await?;
+        return Ok(ok);
+    }
+    let was_active = matches!(batch.txn_state, TxnState::Active { .. });
+    let old_state = *batch.txn_state;
+    let on_commit_create = detect_on_commit_create(piece, batch.temp_schema);
+    let cache = std::mem::replace(batch.plan_cache, nusadb_sql::PlanCache::new());
+    let (ok, new_state, new_cache) = stream_query_to_conn(
+        batch.conn,
+        batch.engine,
+        batch.cluster,
+        batch.database,
+        piece.to_owned(),
+        &BoundParams::default(),
+        batch.user.to_owned(),
+        Arc::clone(batch.cancel),
+        batch.statement_timeout,
+        old_state,
+        batch.typed,
+        batch.array_elements,
+        cache,
+        batch.settings,
+        batch.cursors,
+        batch.prepared,
+        false,
+    )
+    .await?;
+    *batch.txn_state = new_state;
+    *batch.plan_cache = new_cache;
+    settle_cursors_after_stmt(batch.cursors, control.as_ref(), ok, old_state, new_state);
+    let fire = on_commit_after_stmt(
+        batch.on_commit,
+        on_commit_create,
+        control.as_ref(),
+        ok,
+        old_state,
+        new_state,
+    );
+    fire_on_commit_actions(
+        batch.engine,
+        batch.database,
+        &effective_user(batch.user, batch.settings),
+        batch.settings,
+        fire,
+    )
+    .await;
+    if ok {
+        match control {
+            Some(TxnControl::Commit) if was_active => {
+                batch.pending_notify.flush(batch.pid, batch.database);
+            },
+            Some(TxnControl::Commit | TxnControl::Rollback | TxnControl::Begin) => {
+                batch.pending_notify.discard();
+            },
+            Some(TxnControl::Savepoint(name)) => batch.pending_notify.savepoint(name),
+            Some(TxnControl::Release(name)) => batch.pending_notify.release(&name),
+            Some(TxnControl::RollbackTo(name)) => batch.pending_notify.rollback_to(&name),
+            None => {},
+        }
+    }
+    Ok(ok)
 }
 
 /// The `CommandComplete` tag for a result (e.g. `SELECT 3`, `INSERT 1`, `CREATE TABLE`).

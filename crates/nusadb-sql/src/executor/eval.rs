@@ -440,7 +440,24 @@ fn eval_composite(op: &CompositeExpr, row: &Row) -> Result<ast::Value, Error> {
         } => {
             let mut values = Vec::with_capacity(fields.len());
             for (field, want) in fields.iter().zip(field_types) {
-                values.push(cast_value(eval(field, row)?, *want)?);
+                let value = eval(field, row)?;
+                values.push(match want.nested_fields() {
+                    // A nested composite field takes the nested value's text form, checked against
+                    // the nested type and kept in its canonical spelling.
+                    Some(nested) => match value {
+                        ast::Value::Null => ast::Value::Null,
+                        ast::Value::Text(text) => {
+                            let nested = crate::composite::field_types(nested);
+                            let parsed = crate::composite::parse(&text, &nested)
+                                .ok_or_else(|| malformed_composite(&text))?;
+                            ast::Value::Text(parsed.format())
+                        },
+                        other => {
+                            return Err(malformed_composite(&crate::display::value_text(&other)));
+                        },
+                    },
+                    None => cast_value(value, want.column_type())?,
+                });
             }
             Ok(ast::Value::Text(CompositeVal::new(values).format()))
         },
@@ -494,7 +511,7 @@ fn eval_composite(op: &CompositeExpr, row: &Row) -> Result<ast::Value, Error> {
                 .ok_or_else(|| malformed_composite(&lt))?;
             let rv = crate::composite::parse(&rt, field_types)
                 .ok_or_else(|| malformed_composite(&rt))?;
-            let ord = lv.compare(&rv);
+            let ord = lv.compare_typed(&rv, field_types);
             Ok(ast::Value::Bool(match op {
                 ast::BinaryOp::Eq => ord == Ordering::Equal,
                 ast::BinaryOp::NotEq => ord != Ordering::Equal,
@@ -4683,7 +4700,7 @@ fn eval_cast(
     clippy::too_many_lines,
     reason = "one arm per (value, target) type pair; flatter than dispatching to per-type helpers"
 )]
-pub(super) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::Value, Error> {
+pub(crate) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::Value, Error> {
     if matches!(value, ast::Value::Null) {
         return Ok(ast::Value::Null);
     }

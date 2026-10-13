@@ -1,0 +1,223 @@
+# Composite types with fields of other composite types, and fields whose text form needs quoting.
+#
+# A field may be of another composite type. Its value is the nested value's own canonical text form,
+# quoted inside the outer one, so `outer_t` with `y inner_t` reads and writes as `("(1,a)",2)`. Field
+# access chains through the levels: `(v).y.x`. Text input is checked against every level.
+
+statement ok
+CREATE TYPE inner_t AS (x INT, t TEXT)
+
+statement ok
+CREATE TYPE outer_t AS (y inner_t, z INT)
+
+statement ok
+CREATE TYPE deep_t AS (o outer_t)
+
+statement error type `nosuch_t` does not exist
+CREATE TYPE bad_t AS (q nosuch_t)
+
+statement ok
+CREATE TABLE ot (id INT, v outer_t)
+
+statement ok
+INSERT INTO ot VALUES (1, ROW(ROW(1, 'a b')::inner_t, 2)::outer_t)
+
+statement ok
+INSERT INTO ot VALUES (2, '("(10,x)",3)')
+
+statement ok
+INSERT INTO ot VALUES (3, ROW(ROW(9, 'q'), 5)::outer_t)
+
+statement error malformed composite value
+INSERT INTO ot VALUES (4, '("(abc,x)",3)')
+
+statement error malformed composite value
+INSERT INTO ot VALUES (4, '("(1)",3)')
+
+query ITTITI
+SELECT id, v, (v).y, (v).y.x, (v).y.t, (v).z FROM ot ORDER BY id
+----
+1 ("(1,""a b"")",2) (1,"a b") 1 a b 2
+2 ("(10,x)",3) (10,x) 10 x 3
+3 ("(9,q)",5) (9,q) 9 q 5
+
+# A nested field compares by its own fields, not by its text: 9 < 10.
+query II
+SELECT a.id, b.id FROM ot a, ot b WHERE a.v < b.v ORDER BY 1, 2
+----
+1 2
+1 3
+3 2
+
+query I
+SELECT id FROM ot WHERE (v).y.x > 5 ORDER BY id
+----
+2
+3
+
+query I
+SELECT ('("(""(1,a)"",2)")'::deep_t).o.y.x
+----
+1
+
+query I
+SELECT (ROW(ROW(4, 'w')::inner_t, 2)::outer_t).y.x
+----
+4
+
+# A type another type is built from cannot be dropped while that type exists.
+statement error cannot drop type "inner_t" because field "y" of type "outer_t" depends on it
+DROP TYPE inner_t
+
+# Fields of types whose text form is quoted inside the composite: bytea, interval, an array.
+statement ok
+CREATE TYPE cx AS (b BYTEA, i INTERVAL, a INT[])
+
+statement ok
+CREATE TABLE cxt (id INT, v cx)
+
+statement ok
+INSERT INTO cxt VALUES (1, ROW('\x01'::bytea, INTERVAL '1 day', ARRAY[1, 2])::cx)
+
+statement ok
+INSERT INTO cxt VALUES (2, '("\\x02","2 days","{3,4}")')
+
+statement ok
+INSERT INTO cxt VALUES (3, '("\\x03","3 days","{5}")'::cx)
+
+query TTTT
+SELECT v, (v).b, (v).i, (v).a FROM cxt ORDER BY id
+----
+("\\x01","1 day","{1,2}") \x01 1 day {1,2}
+("\\x02","2 days","{3,4}") \x02 2 days {3,4}
+("\\x03","3 days",{5}) \x03 3 days {5}
+
+# The text output reads back as the same value.
+query I
+SELECT count(*) FROM cxt WHERE v = (v::text)::cx
+----
+3
+
+# Nesting is capped at 32 levels below a type. CREATE TYPE refuses exactly where a lookup of the new
+# type would, so every type that exists can be used and dropped.
+statement ok
+CREATE TYPE l0 AS (x INT)
+
+statement ok
+CREATE TYPE l1 AS (f l0)
+
+statement ok
+CREATE TYPE l2 AS (f l1)
+
+statement ok
+CREATE TYPE l3 AS (f l2)
+
+statement ok
+CREATE TYPE l4 AS (f l3)
+
+statement ok
+CREATE TYPE l5 AS (f l4)
+
+statement ok
+CREATE TYPE l6 AS (f l5)
+
+statement ok
+CREATE TYPE l7 AS (f l6)
+
+statement ok
+CREATE TYPE l8 AS (f l7)
+
+statement ok
+CREATE TYPE l9 AS (f l8)
+
+statement ok
+CREATE TYPE l10 AS (f l9)
+
+statement ok
+CREATE TYPE l11 AS (f l10)
+
+statement ok
+CREATE TYPE l12 AS (f l11)
+
+statement ok
+CREATE TYPE l13 AS (f l12)
+
+statement ok
+CREATE TYPE l14 AS (f l13)
+
+statement ok
+CREATE TYPE l15 AS (f l14)
+
+statement ok
+CREATE TYPE l16 AS (f l15)
+
+statement ok
+CREATE TYPE l17 AS (f l16)
+
+statement ok
+CREATE TYPE l18 AS (f l17)
+
+statement ok
+CREATE TYPE l19 AS (f l18)
+
+statement ok
+CREATE TYPE l20 AS (f l19)
+
+statement ok
+CREATE TYPE l21 AS (f l20)
+
+statement ok
+CREATE TYPE l22 AS (f l21)
+
+statement ok
+CREATE TYPE l23 AS (f l22)
+
+statement ok
+CREATE TYPE l24 AS (f l23)
+
+statement ok
+CREATE TYPE l25 AS (f l24)
+
+statement ok
+CREATE TYPE l26 AS (f l25)
+
+statement ok
+CREATE TYPE l27 AS (f l26)
+
+statement ok
+CREATE TYPE l28 AS (f l27)
+
+statement ok
+CREATE TYPE l29 AS (f l28)
+
+statement ok
+CREATE TYPE l30 AS (f l29)
+
+statement ok
+CREATE TYPE l31 AS (f l30)
+
+statement ok
+CREATE TYPE l32 AS (f l31)
+
+statement error composite type "l33" nests more than 32 levels deep
+CREATE TYPE l33 AS (f l32)
+
+statement ok
+CREATE TABLE deepest (v l32)
+
+query I
+SELECT count(*) FROM deepest
+----
+0
+
+statement ok
+DROP TABLE deepest
+
+statement ok
+DROP TYPE l32
+
+statement ok
+CREATE TYPE l33 AS (f l31)
+
+statement ok
+DROP TYPE l33

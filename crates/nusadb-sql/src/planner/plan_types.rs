@@ -2344,7 +2344,7 @@ pub enum CompositeExpr {
         /// The field expressions, in declared order (already checked assignable to `field_types`).
         fields: Vec<TypedExpr>,
         /// The declared field types, in order.
-        field_types: Vec<ColumnType>,
+        field_types: Vec<crate::composite::FieldType>,
     },
     /// `'(a,b)'::T` — a text-literal cast to a composite type: parse the text form against
     /// `field_types`, then re-emit the canonical form. The enclosing [`TypedExpr::ty`] is `Text`.
@@ -2352,7 +2352,7 @@ pub enum CompositeExpr {
         /// The text-valued operand.
         expr: Box<TypedExpr>,
         /// The declared field types, in order.
-        field_types: Vec<ColumnType>,
+        field_types: Vec<crate::composite::FieldType>,
     },
     /// `(expr).field` — extract one field of a composite value. `base` evaluates to the canonical
     /// text form; the executor parses it and returns field `index`. The enclosing [`TypedExpr::ty`]
@@ -2361,7 +2361,7 @@ pub enum CompositeExpr {
         /// The composite-typed operand (evaluates to the canonical text form).
         base: Box<TypedExpr>,
         /// The declared field types of the composite, in order.
-        field_types: Vec<ColumnType>,
+        field_types: Vec<crate::composite::FieldType>,
         /// The zero-based ordinal of the selected field.
         index: usize,
     },
@@ -2377,7 +2377,7 @@ pub enum CompositeExpr {
         /// The comparison operator (one of `=`, `<>`, `<`, `<=`, `>`, `>=`).
         op: ast::BinaryOp,
         /// The declared field types of the composite, in order.
-        field_types: Vec<ColumnType>,
+        field_types: Vec<crate::composite::FieldType>,
     },
 }
 

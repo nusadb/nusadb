@@ -3893,15 +3893,25 @@ pub(super) fn analyze_cast(
 }
 
 /// The declared fields of the composite type an expression denotes, or `None` if the expression is
-/// not a value of a statically known composite type. Only a cast to a composite type (`x::T`) and a
-/// composite base-table column are recognised — a bare `f(...)` returning composite, a nested field,
-/// or any other operand has no statically known composite type (out of first-cut scope), so it
-/// returns `None` and the caller rejects it loudly rather than mis-typing it.
+/// not a value of a statically known composite type. A cast to a composite type (`x::T`), a
+/// composite base-table column, and a composite-typed field of either (`(v).y`, nested as deep as
+/// the types nest) are recognised. A bare `f(...)` returning composite or any other operand has no
+/// statically known composite type, so it returns `None` and the caller rejects it loudly rather
+/// than mis-typing it.
 fn composite_type_of(
     expr: &ast::Expr,
     scope: &[ScopedColumn],
     catalog: &dyn Catalog,
-) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
+    if let ast::Expr::FieldAccess { base, field } = expr {
+        let Some(fields) = composite_type_of(base, scope, catalog)? else {
+            return Ok(None);
+        };
+        return Ok(fields
+            .into_iter()
+            .find(|(name, _)| name == field)
+            .and_then(|(_, ty)| ty.nested_fields().map(<[_]>::to_vec)));
+    }
     let type_name = match expr {
         ast::Expr::CastNamed { type_name, .. } => Some(type_name.clone()),
         ast::Expr::Column(name) => super::scoped_composite_type(scope, None, name),
@@ -4081,7 +4091,7 @@ fn analyze_row_constructor(
         } else {
             analyze_expr_agg(item, scope, catalog, None, aggregates.as_deref_mut())?
         };
-        field_types.push(field.ty);
+        field_types.push(crate::composite::FieldType::Scalar(field.ty));
         fields.push(field);
     }
     Ok(TypedExpr {
@@ -4127,7 +4137,7 @@ fn analyze_field_access(
             })?;
         let field_ty = field_types
             .get(index)
-            .copied()
+            .map(crate::composite::FieldType::column_type)
             .ok_or_else(|| Error::Internal("record field index out of range".to_owned()))?;
         return Ok(TypedExpr {
             kind: TypedExprKind::Composite(Box::new(CompositeExpr::Field {
@@ -4152,9 +4162,9 @@ fn analyze_field_access(
         })?;
     let field_ty = fields
         .get(index)
-        .map(|(_, ty)| *ty)
+        .map(|(_, ty)| ty.column_type())
         .ok_or_else(|| Error::Internal("composite field index out of range".to_owned()))?;
-    let field_types: Vec<ColumnType> = fields.iter().map(|(_, ty)| *ty).collect();
+    let field_types = crate::composite::field_types(&fields);
     // The operand evaluates to the canonical text form (a composite column is stored as `TEXT`; a
     // composite cast produces the text form), so analyze it normally with no hint.
     let base_typed = analyze_expr_agg(base, scope, catalog, None, aggregates)?;
@@ -4245,7 +4255,7 @@ fn analyze_cast_named(
             "type \"{type_name}\" does not exist or is not a composite type"
         )));
     };
-    let field_types: Vec<ColumnType> = fields.iter().map(|(_, ty)| *ty).collect();
+    let field_types = crate::composite::field_types(&fields);
     if let ast::Expr::Row(items) = expr {
         if items.len() != field_types.len() {
             return Err(Error::InvalidStatement(format!(
@@ -4256,14 +4266,15 @@ fn analyze_cast_named(
         }
         let mut typed = Vec::with_capacity(items.len());
         for (item, want) in items.iter().zip(&field_types) {
+            let want = want.column_type();
             let field =
-                analyze_expr_agg(item, scope, catalog, Some(*want), aggregates.as_deref_mut())?;
+                analyze_expr_agg(item, scope, catalog, Some(want), aggregates.as_deref_mut())?;
             // A `NULL` field is always allowed; otherwise it must be assignable to the declared type
             // (the executor coerces it to that type before formatting the canonical text form).
-            if !is_null_literal(&field) && !assignable(*want, field.ty) {
+            if !is_null_literal(&field) && !assignable(want, field.ty) {
                 return Err(Error::TypeMismatch {
                     context: format!("field of composite type \"{type_name}\""),
-                    expected: *want,
+                    expected: want,
                     found: field.ty,
                 });
             }
@@ -4905,7 +4916,10 @@ pub(super) fn comparable(a: ColumnType, b: ColumnType) -> bool {
     // UUID, JSON and arrays type-checked under `<`/`=` yet were spuriously rejected by
     // BETWEEN/IN/CASE — even though the executor already orders all of them. NUMERIC of
     // differing precision/scale still compares via the numeric arm even when `a != b`.
-    a == b || (is_numeric(a) && is_numeric(b)) || temporal_common(a, b).is_some()
+    a == b
+        || (is_numeric(a) && is_numeric(b))
+        || (is_bit_type(a) && is_bit_type(b))
+        || temporal_common(a, b).is_some()
 }
 
 /// Implicit unknown-literal coercion for a comparison-shaped operand pair.
@@ -5135,8 +5149,8 @@ pub(super) fn analyze_binary(
         let right_fields = composite_type_of(right, scope, catalog)?;
         match (left_fields, right_fields) {
             (Some(lf), Some(rf)) => {
-                let lt: Vec<ColumnType> = lf.iter().map(|(_, ty)| *ty).collect();
-                let rt: Vec<ColumnType> = rf.iter().map(|(_, ty)| *ty).collect();
+                let lt = crate::composite::field_types(&lf);
+                let rt = crate::composite::field_types(&rf);
                 if lt != rt {
                     return Err(Error::InvalidStatement(
                         "cannot compare values of different composite types".to_owned(),

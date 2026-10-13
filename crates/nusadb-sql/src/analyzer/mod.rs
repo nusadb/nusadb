@@ -263,7 +263,10 @@ pub trait Catalog {
     /// order, or `None` if no such composite type exists. Default `None` so a minimal catalog has no
     /// composite types; the production adapter reads the composite type registry. Used to type
     /// composite construction, field access, and comparison.
-    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
         let _ = name;
         Ok(None)
     }

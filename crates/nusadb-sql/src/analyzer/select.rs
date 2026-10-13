@@ -2894,7 +2894,10 @@ impl Catalog for CteCatalog<'_> {
         self.inner.approx_row_count_in(schema, name)
     }
 
-    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
         // Composite types are engine-global; delegate so a CTE term resolves them.
         self.inner.lookup_composite(name)
     }

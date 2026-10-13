@@ -309,7 +309,7 @@ impl Catalog for RecordingCatalog<'_> {
     fn lookup_composite(
         &self,
         name: &str,
-    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, Error> {
+    ) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
         self.inner.lookup_composite(name)
     }
     fn lookup_composite_column(

@@ -5233,7 +5233,10 @@ impl crate::Catalog for ExecCatalog<'_> {
         partitions_to_prune(self.engine, self.txn, parent, constraints)
     }
 
-    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
         lookup_composite(self.engine, self.txn, name)
     }
 
@@ -5469,7 +5472,10 @@ impl crate::Catalog for SessionCatalog<'_> {
         partitions_to_prune(self.engine, self.txn, parent, constraints)
     }
 
-    fn lookup_composite(&self, name: &str) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+    fn lookup_composite(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
         lookup_composite(self.engine, self.txn, name)
     }
 
@@ -5992,11 +5998,19 @@ fn run_drop_type(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     // A composite type still used by a column cannot be dropped — report the first dependent column.
-    if lookup_composite(engine, txn, &p.name)?.is_some()
+    // Read the stored definition only: resolving the whole nested type is not needed to drop it.
+    if composite_defined(engine, txn, &p.name)?
         && let Some((table, column)) = first_composite_dependent(engine, txn, &p.name)?
     {
         return Err(Error::DependentObjects(format!(
             "cannot drop type \"{}\" because column \"{column}\" of table \"{table}\" depends on it",
+            p.name
+        )));
+    }
+    // Nor one that is the type of another composite type's field.
+    if let Some((owner, field)) = first_composite_field_dependent(engine, txn, &p.name)? {
+        return Err(Error::DependentObjects(format!(
+            "cannot drop type \"{}\" because field \"{field}\" of type \"{owner}\" depends on it",
             p.name
         )));
     }
@@ -6054,7 +6068,7 @@ fn run_create_composite(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    if lookup_composite(engine, txn, &p.name)?.is_some()
+    if composite_defined(engine, txn, &p.name)?
         || lookup_enum(engine, txn, &p.name)?.is_some()
         || lookup_domain(engine, txn, &p.name)?.is_some()
         || engine.lookup_table_as_of(txn, &p.name)?.is_some()
@@ -6063,6 +6077,17 @@ fn run_create_composite(
             "type {:?} already exists",
             p.name
         )));
+    }
+    // A field type that is not a built-in must name an existing composite type: the parser lets
+    // such a name through because only the catalog knows the user-defined types. The field is
+    // resolved one level below the new type, exactly as a later lookup of the new type resolves it,
+    // so a type that would nest too deeply is refused here rather than created unusable.
+    for (_, type_sql) in &p.fields {
+        if let Err(e) = crate::parser::parse_column_type(type_sql)
+            && lookup_composite_at(engine, txn, &p.name, type_sql, 1)?.is_none()
+        {
+            return Err(e);
+        }
     }
     // Encode the fields as alternating name / type-SQL, separated by the unit separator.
     let mut parts = Vec::with_capacity(p.fields.len() * 2);
@@ -6078,12 +6103,43 @@ fn run_create_composite(
 /// The fields of a user-defined composite type, or `None` if none exists.
 ///
 /// Returns `(field_name, type)` in declared order. Each field's type SQL is re-parsed via
-/// [`crate::parser::parse_column_type`].
+/// [`crate::parser::parse_column_type`]; a field whose type is another composite type is resolved
+/// to that type's own fields, recursively.
 pub fn lookup_composite(
     engine: &dyn StorageEngine,
     txn: TxnId,
     name: &str,
-) -> Result<Option<Vec<(String, ColumnType)>>, Error> {
+) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
+    lookup_composite_at(engine, txn, name, name, 0)
+}
+
+/// Whether a composite type named `name` is stored, read from its definition alone (its nested
+/// field types are not resolved).
+fn composite_defined(engine: &dyn StorageEngine, txn: TxnId, name: &str) -> Result<bool, Error> {
+    Ok(load_view_def(engine, txn, COMPOSITE_CATALOG, name)?.is_some())
+}
+
+/// How deeply composite types may nest inside one another. `CREATE TYPE` only accepts a field of a
+/// composite type that already exists, so the nesting cannot form a cycle; the bound keeps a
+/// damaged catalog from recursing without end.
+const MAX_COMPOSITE_NESTING: usize = 32;
+
+/// [`lookup_composite`] of `name`, found `depth` composite levels below the type `root` that was
+/// looked up (`depth` 0 is `root` itself). Past [`MAX_COMPOSITE_NESTING`] levels the lookup fails,
+/// naming `root`.
+fn lookup_composite_at(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    root: &str,
+    name: &str,
+    depth: usize,
+) -> Result<Option<Vec<(String, crate::composite::FieldType)>>, Error> {
+    use crate::composite::FieldType;
+    if depth > MAX_COMPOSITE_NESTING {
+        return Err(Error::LimitExceeded(format!(
+            "composite type \"{root}\" nests more than {MAX_COMPOSITE_NESTING} levels deep"
+        )));
+    }
     let Some(def) = load_view_def(engine, txn, COMPOSITE_CATALOG, name)? else {
         return Ok(None);
     };
@@ -6093,10 +6149,17 @@ pub fn lookup_composite(
     let mut fields = Vec::with_capacity(parts.len() / 2);
     for pair in parts.chunks_exact(2) {
         if let [name, type_sql] = pair {
-            fields.push((
-                (*name).to_owned(),
-                crate::parser::parse_column_type(type_sql)?,
-            ));
+            let ty = match crate::parser::parse_column_type(type_sql) {
+                Ok(ty) => FieldType::Scalar(ty),
+                Err(e) => match lookup_composite_at(engine, txn, root, type_sql, depth + 1)? {
+                    Some(nested) => FieldType::Composite {
+                        name: (*type_sql).to_owned(),
+                        fields: nested,
+                    },
+                    None => return Err(e),
+                },
+            };
+            fields.push(((*name).to_owned(), ty));
         }
     }
     Ok(Some(fields))
@@ -6132,6 +6195,23 @@ pub(super) fn all_composites(
     }
     types.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(types)
+}
+
+/// The first composite type with a field of composite type `name`, as `(type, field)`, or `None`
+/// when no composite type uses it. `DROP TYPE` refuses to drop a type another one is built from.
+fn first_composite_field_dependent(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<Option<(String, String)>, Error> {
+    Ok(all_composites(engine, txn)?
+        .into_iter()
+        .find_map(|(owner, fields)| {
+            fields
+                .into_iter()
+                .find(|(_, type_sql)| type_sql == name)
+                .map(|(field, _)| (owner, field))
+        }))
 }
 
 /// Record that base-table column `(schema, table, column)` is of composite type `type_name`.

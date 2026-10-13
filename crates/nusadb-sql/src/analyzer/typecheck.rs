@@ -21,11 +21,10 @@ pub(super) fn check_assignable(column: &ColumnDef, value: &TypedExpr) -> Result<
 
 /// Whether a `source`-typed value may be stored into a `target`-typed column by `INSERT`/`UPDATE`:
 /// [`assignable`], plus the assignment casts a write performs that an expression context does not
-/// (a function argument, say): a `DATE` into a timestamp column (midnight), a `NUMERIC` or
-/// `FLOAT` into an integer column (rounded, range-checked), and a bit string of any width into a
-/// `BIT(n)` / `BIT VARYING(n)` column. The write converts the value in `row::adopt_column_type`;
-/// a bit string's length is checked against the column's width when the row is encoded, exactly
-/// as for a bit-string literal.
+/// (a function argument, say): a `DATE` into a timestamp column (midnight), and a `NUMERIC` or
+/// `FLOAT` into an integer column (rounded, range-checked). The write converts the value in
+/// `row::adopt_column_type`. (A bit string of any kind and width is already [`assignable`] to a bit
+/// column; its length is checked against the column's width when the row is encoded.)
 pub(super) fn assignable_to_column(target: ColumnType, source: ColumnType) -> bool {
     assignable(target, source)
         || matches!(
@@ -36,9 +35,6 @@ pub(super) fn assignable_to_column(target: ColumnType, source: ColumnType) -> bo
             ) | (
                 ColumnType::Int,
                 ColumnType::Numeric { .. } | ColumnType::Float
-            ) | (
-                ColumnType::Bit(_) | ColumnType::VarBit(_),
-                ColumnType::Bit(_) | ColumnType::VarBit(_)
             )
         )
 }
@@ -92,6 +88,9 @@ pub(super) fn assignable(target: ColumnType, source: ColumnType) -> bool {
         // An ENUM column accepts a text value: the label is resolved to its declaration-order
         // ordinal on write (an unknown label is rejected there).
         || (target == ColumnType::Enum && source == ColumnType::Text)
+        // A bit string of either kind assigns to either kind; the length rule of the target
+        // (`BIT(n)` exactly n bits, `BIT VARYING(n)` at most n) is checked when the value is stored.
+        || (is_bit_type(target) && is_bit_type(source))
 }
 
 pub(super) const fn is_numeric(ty: ColumnType) -> bool {

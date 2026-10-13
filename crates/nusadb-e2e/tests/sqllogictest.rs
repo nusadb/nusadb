@@ -204,7 +204,7 @@ impl Catalog for SltCatalog<'_> {
     fn lookup_composite(
         &self,
         name: &str,
-    ) -> Result<Option<Vec<(String, nusadb_core::ColumnType)>>, nusadb_sql::Error> {
+    ) -> Result<Option<Vec<(String, nusadb_sql::composite::FieldType)>>, nusadb_sql::Error> {
         if let Some(txn) = self.txn {
             nusadb_sql::lookup_composite(self.engine, txn, name)
         } else {
@@ -930,6 +930,16 @@ fn slt_p10_bool_cast() {
 #[test]
 fn slt_p10_row_composite() {
     run_slt("tests/slt/p10_types/row_composite.slt");
+}
+
+#[test]
+fn slt_p10_composite_nested() {
+    run_slt("tests/slt/p10_types/composite_nested.slt");
+}
+
+#[test]
+fn slt_p10_bit_assignment() {
+    run_slt("tests/slt/p10_types/bit_assignment.slt");
 }
 
 #[test]

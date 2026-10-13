@@ -306,9 +306,17 @@ SELECT B'1011' & B'1101'  AS and_,
        length(B'1011')    AS len;
 ```
 
-A bit string of any width can be stored in a bit column, and its length is checked against the
-column then: `BIT(n)` takes exactly `n` bits and `BIT VARYING(n)` at most `n`, otherwise the write
-fails with `22P02`. Bit strings of different widths compare by value.
+A bit string of either kind can be stored in a column of either kind. `BIT(n)` takes exactly `n`
+bits (`22026` otherwise) and `BIT VARYING(n)` at most `n` (`22001` otherwise); storing a value never
+pads or truncates it. An explicit cast does: `B'10101'::bit(3)` is `101`, `B'1'::bit(3)` is `100`.
+The two kinds compare with each other whatever their lengths.
+
+```sql
+CREATE TABLE flags (v BIT VARYING(8), f BIT(3));
+INSERT INTO flags (v) VALUES (B'101');       -- ok
+INSERT INTO flags (f) VALUES (B'1010');      -- ERROR 22026
+INSERT INTO flags (v) VALUES (B'101010101'); -- ERROR 22001
+```
 
 ### Geometric types
 
@@ -422,6 +430,30 @@ SELECT (ROW(1, 'a')).f3;
 
 A row value can be compared (`ROW(a, b) = ROW(1, 'x')`) and counted, but not aggregated by
 `sum` / `min` / `max`.
+
+A field can be of another composite type. In the text form the nested value is quoted like any
+text, and field access chains through the levels:
+
+```sql
+CREATE TYPE inner_t AS (x INT, t TEXT);
+CREATE TYPE outer_t AS (y inner_t, z INT);
+CREATE TABLE nested (v outer_t);
+INSERT INTO nested VALUES (ROW(ROW(1, 'a b')::inner_t, 2)::outer_t), ('("(10,x)",3)');
+
+SELECT v, (v).y.x FROM nested;
+--          v          | x
+-- --------------------+----
+--  ("(1,""a b"")",2)  |  1
+--  ("(10,x)",3)       | 10
+```
+
+Text input is checked against every level (`'("(abc,x)",3)'` is refused), a comparison orders a
+nested field by its own fields, and a type another composite type uses cannot be dropped (`2BP01`).
+A field can also be any built-in type whose text form needs quoting, such as `BYTEA`, `INTERVAL` or
+an array: `'("\\x01","1 day","{1,2}")'::cx` reads back as it was written. Arrays of a composite
+type are not supported yet.
+
+`ORDER BY` a composite column sorts by its text form, not field by field.
 
 ---
 
@@ -1558,6 +1590,12 @@ statement (`25001` after it); outside a transaction it is refused (`25P01`).
 After an error inside a transaction, every further statement is refused with `25P02` until
 `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`).
 
+Several statements sent as one simple query (`INSERT ...; UPDATE ...`) run as one transaction
+unless they are already inside one: an error rolls back all of them. A `BEGIN` among them opens an
+ordinary transaction block instead. The full rules are in the
+[wire protocol](wire-protocol.md) §9.3. `COPY` inside a transaction block is part of it and is
+undone by its `ROLLBACK`.
+
 ### Row and table locks
 
 Locks never wait. A row someone else has locked fails immediately with `40001`, so `NOWAIT` is
@@ -2011,7 +2049,8 @@ on the message text.
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `0A000` | feature not supported | the statement is recognised but not built; see [Not accepted](#not-accepted) |
-| `22001` | string too long for `VARCHAR(n)` | shorten the value or widen the column |
+| `22001` | string too long for `VARCHAR(n)`, or a bit string too long for `BIT VARYING(n)` | shorten the value or widen the column |
+| `22026` | a bit string whose length does not match `BIT(n)` | give exactly `n` bits, or cast explicitly |
 | `22003` | numeric value out of range | integer overflow or a value outside a function's domain |
 | `22007` | invalid date/time format | fix the literal |
 | `22012` | division by zero | |

@@ -10,13 +10,61 @@
 //! composite *values* with `NULL` in the same field are equal. [`CompositeVal::compare`] implements
 //! the composite rule; the three-valued form stays in the row-comparison desugaring.
 //!
-//! This module is groundwork: the value, its text form, and its ordering live here; wiring it into
-//! the SQL surface (a column type, `CREATE TYPE`, `ROW(…)` as a value, and field access) is separate.
+//! A field may itself be of a composite type ([`FieldType::Composite`]). Such a field holds the
+//! nested value's own canonical text form, which the outer form quotes like any other text, so
+//! `outer_t` with one field `y inner_t` reads and writes as `("(1)")`.
 
 use nusadb_core::engine::ColumnType;
 
 use crate::ast;
 use crate::executor::eval::compare as compare_scalar;
+
+/// The declared type of one field of a composite type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldType {
+    /// A built-in type.
+    Scalar(ColumnType),
+    /// Another composite type. The nested value is carried as its canonical text form.
+    Composite {
+        /// The nested composite type's name.
+        name: String,
+        /// The nested type's fields, as `(name, type)` in declared order.
+        fields: Vec<(String, Self)>,
+    },
+}
+
+impl FieldType {
+    /// The type a value of this field has as an expression: the scalar type itself, or `TEXT` for a
+    /// nested composite (carried as its canonical text form).
+    #[must_use]
+    pub const fn column_type(&self) -> ColumnType {
+        match self {
+            Self::Scalar(ty) => *ty,
+            Self::Composite { .. } => ColumnType::Text,
+        }
+    }
+
+    /// The nested type's fields when this field is itself composite.
+    #[must_use]
+    pub fn nested_fields(&self) -> Option<&[(String, Self)]> {
+        match self {
+            Self::Scalar(_) => None,
+            Self::Composite { fields, .. } => Some(fields),
+        }
+    }
+}
+
+impl From<ColumnType> for FieldType {
+    fn from(ty: ColumnType) -> Self {
+        Self::Scalar(ty)
+    }
+}
+
+/// The types of a composite's fields, without their names.
+#[must_use]
+pub fn field_types(fields: &[(String, FieldType)]) -> Vec<FieldType> {
+    fields.iter().map(|(_, ty)| ty.clone()).collect()
+}
 
 /// A composite value: one entry per field of its type, in declaration order. A field that is SQL
 /// `NULL` is [`ast::Value::Null`].
@@ -71,6 +119,35 @@ impl CompositeVal {
         }
         self.fields.len().cmp(&other.fields.len())
     }
+
+    /// [`compare`](Self::compare), with a nested composite field ordered by its own fields rather
+    /// than by its text form (which would put `(10)` before `(9)`). `types` are the field types of
+    /// both values; a nested value that does not parse falls back to its text order.
+    #[must_use]
+    pub fn compare_typed(&self, other: &Self, types: &[FieldType]) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        for (i, (a, b)) in self.fields.iter().zip(&other.fields).enumerate() {
+            let ord = match (a, b) {
+                (ast::Value::Null, ast::Value::Null) => Ordering::Equal,
+                (ast::Value::Null, _) => Ordering::Greater,
+                (_, ast::Value::Null) => Ordering::Less,
+                (ast::Value::Text(x), ast::Value::Text(y)) => types
+                    .get(i)
+                    .and_then(FieldType::nested_fields)
+                    .map(field_types)
+                    .and_then(|nested| {
+                        let (xv, yv) = (parse(x, &nested)?, parse(y, &nested)?);
+                        Some(xv.compare_typed(&yv, &nested))
+                    })
+                    .unwrap_or_else(|| compare_scalar(a, b)),
+                _ => compare_scalar(a, b),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        self.fields.len().cmp(&other.fields.len())
+    }
 }
 
 /// Quote a rendered field if any of its characters would otherwise be read as composite
@@ -101,7 +178,7 @@ fn quote_field(s: &str) -> String {
 /// count does not match `field_types` — a composite is a fixed shape, so a short or long literal is
 /// a real error rather than something to pad or truncate.
 #[must_use]
-pub fn parse(s: &str, field_types: &[ColumnType]) -> Option<CompositeVal> {
+pub fn parse(s: &str, field_types: &[FieldType]) -> Option<CompositeVal> {
     let t = s.trim();
     let body = t.strip_prefix('(')?.strip_suffix(')')?;
     let raw = split_fields(body)?;
@@ -113,7 +190,7 @@ pub fn parse(s: &str, field_types: &[ColumnType]) -> Option<CompositeVal> {
         fields.push(match text {
             // An unquoted empty field is NULL; a quoted one is the empty string.
             None => ast::Value::Null,
-            Some(v) => parse_field(v, *ty)?,
+            Some(v) => parse_field(v, ty)?,
         });
     }
     Some(CompositeVal { fields })
@@ -162,8 +239,15 @@ fn split_fields(body: &str) -> Option<Vec<Option<String>>> {
     Some(out)
 }
 
-/// Parse one field's text as `ty`.
-fn parse_field(s: &str, ty: ColumnType) -> Option<ast::Value> {
+/// Parse one field's text as `ty`. A nested composite field is parsed against its own fields and
+/// kept as its canonical text form; a built-in type takes the same text input its cast accepts.
+fn parse_field(s: &str, ty: &FieldType) -> Option<ast::Value> {
+    let ty = match ty {
+        FieldType::Composite { fields, .. } => {
+            return parse(s, &field_types(fields)).map(|v| ast::Value::Text(v.format()));
+        },
+        FieldType::Scalar(ty) => *ty,
+    };
     Some(match ty.physical() {
         // The same boolean spellings a text cast accepts.
         ColumnType::Bool => ast::Value::Bool(match s.trim().to_ascii_lowercase().as_str() {
@@ -193,8 +277,20 @@ fn parse_field(s: &str, ty: ColumnType) -> Option<ast::Value> {
         ColumnType::Tsvector => ast::Value::Tsvector(crate::fts::parse_tsvector(s).ok()?),
         ColumnType::Tsquery => ast::Value::Tsquery(crate::fts::parse_tsquery(s).ok()?),
         ColumnType::Range(kind) => ast::Value::Range(Box::new(crate::range::parse(s, kind)?)),
-        // A field type with no text form of its own is not something a literal can spell.
-        _ => return None,
+        // A bit-string field follows the assignment rule, not the padding cast: `BIT(n)` takes
+        // exactly n bits and `BIT VARYING(n)` at most n.
+        ColumnType::Bit(n) => {
+            let bits = crate::bit::parse(s).filter(|b| b.len() == n as usize)?;
+            ast::Value::Bit(bits)
+        },
+        ColumnType::VarBit(max) => {
+            let bits =
+                crate::bit::parse(s).filter(|b| max.is_none_or(|n| b.len() <= n as usize))?;
+            ast::Value::Bit(bits)
+        },
+        // Every other type (bytea, interval, arrays, ...) takes the text input of its
+        // cast, so a field reads exactly what `'text'::type` would.
+        _ => crate::executor::eval::cast_value(ast::Value::Text(s.to_owned()), ty).ok()?,
     })
 }
 
@@ -210,7 +306,10 @@ mod tests {
         ast::Value::Text(s.to_owned())
     }
 
-    const T_INT_TEXT: &[ColumnType] = &[ColumnType::Int, ColumnType::Text];
+    const T_INT_TEXT: &[FieldType] = &[
+        FieldType::Scalar(ColumnType::Int),
+        FieldType::Scalar(ColumnType::Text),
+    ];
 
     #[test]
     fn format_writes_null_as_nothing_and_quotes_what_needs_it() {
@@ -294,6 +393,40 @@ mod tests {
         assert_eq!(b("(1, x)"), Some(text(" x")));
         assert_eq!(b("(1,x )"), Some(text("x ")));
         assert_eq!(b("(1, )"), Some(text(" ")));
+    }
+
+    #[test]
+    fn fields_of_quoted_types_and_nested_composites_parse() {
+        use nusadb_core::engine::ArrayElem;
+        let types = [
+            FieldType::Scalar(ColumnType::Bytes),
+            FieldType::Scalar(ColumnType::Interval),
+            FieldType::Scalar(ColumnType::Array(ArrayElem::Int)),
+        ];
+        let v = parse("(\"\\\\x01\",\"1 day\",\"{1,2}\")", &types).expect("parses");
+        assert_eq!(v.fields.first(), Some(&ast::Value::Bytes(vec![1])));
+        assert_eq!(parse(&v.format(), &types), Some(v));
+
+        let inner = vec![
+            ("x".to_owned(), FieldType::Scalar(ColumnType::Int)),
+            ("t".to_owned(), FieldType::Scalar(ColumnType::Text)),
+        ];
+        let outer = [
+            FieldType::Composite {
+                name: "inner_t".to_owned(),
+                fields: inner,
+            },
+            FieldType::Scalar(ColumnType::Int),
+        ];
+        // The nested value is checked against its own fields and kept in canonical form.
+        let v = parse("(\"(1, a)\",2)", &outer).expect("parses");
+        assert_eq!(v.fields.first(), Some(&text("(1,\" a\")")));
+        assert_eq!(parse("(\"(x,a)\",2)", &outer), None);
+        assert_eq!(parse("(\"(1)\",2)", &outer), None);
+        // A nested field orders by its fields, so 9 sorts before 10.
+        let nine = parse("(\"(9,a)\",1)", &outer).expect("parses");
+        let ten = parse("(\"(10,a)\",1)", &outer).expect("parses");
+        assert_eq!(nine.compare_typed(&ten, &outer), std::cmp::Ordering::Less);
     }
 
     #[test]
