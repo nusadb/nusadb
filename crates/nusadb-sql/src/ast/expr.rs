@@ -560,6 +560,10 @@ pub enum ScalarFunc {
     /// `STATEMENT_TIMESTAMP()` — the current statement's start instant as `TIMESTAMPTZ`. In this
     /// engine `NOW()`/`CURRENT_TIMESTAMP` are already statement-scoped, so it is the same instant.
     StatementTimestamp,
+    /// `CLOCK_TIMESTAMP()`: the wall clock at the moment of the call, as `TIMESTAMPTZ`. Unlike
+    /// [`NOW()`](Self::Now) it is read afresh on every evaluation, so it advances within a statement
+    /// and differs from row to row. Niladic; volatile.
+    ClockTimestamp,
     /// `LOCALTIMESTAMP` — the statement instant as a `TIMESTAMP` (no time zone); the same instant as
     /// `CURRENT_TIMESTAMP` but without the zone (the session zone is UTC).
     LocalTimestamp,
@@ -904,6 +908,17 @@ pub enum ScalarFunc {
     /// `GEN_RANDOM_UUID()` / `UUID_GENERATE_V4()` — a random UUID v4 as `UUID`. Niladic;
     /// a fresh value per call. Both spellings parse to this variant.
     UuidGenerateV4,
+    /// `UUIDV7([shift INTERVAL])`: a time-ordered UUID version 7 as `UUID`: a 48-bit Unix millisecond
+    /// timestamp, a 12-bit sub-millisecond fraction and 62 random bits. Successive calls in the same
+    /// process return strictly increasing values. The optional `shift` moves the embedded timestamp.
+    /// Volatile.
+    UuidGenerateV7,
+    /// `UUID_EXTRACT_TIMESTAMP(uuid)`: the timestamp embedded in a version 1 or version 7 UUID, as
+    /// `TIMESTAMPTZ`; `NULL` for any other version or variant.
+    UuidExtractTimestamp,
+    /// `UUID_EXTRACT_VERSION(uuid)`: the version field of a UUID of the standard variant, as
+    /// `SMALLINT`; `NULL` for any other variant.
+    UuidExtractVersion,
     /// `VERSION()` — the NusaDB server version string as `TEXT`. Niladic.
     Version,
     /// `NUSADB_TYPEOF(expr)` — the SQL type name of `expr` as `TEXT` (e.g. `integer`, `text`,
@@ -1140,6 +1155,7 @@ impl ScalarFunc {
             Self::RegexpSplitToArray => "regexp_split_to_array",
             Self::Now => "now",
             Self::StatementTimestamp => "statement_timestamp",
+            Self::ClockTimestamp => "clock_timestamp",
             Self::LocalTimestamp => "localtimestamp",
             Self::CurrentTimestamp => "current_timestamp",
             Self::CurrentDate => "current_date",
@@ -1280,6 +1296,9 @@ impl ScalarFunc {
             Self::RangeLowerInf => "lower_inf",
             Self::RangeUpperInf => "upper_inf",
             Self::UuidGenerateV4 => "uuid_generate_v4",
+            Self::UuidGenerateV7 => "uuidv7",
+            Self::UuidExtractTimestamp => "uuid_extract_timestamp",
+            Self::UuidExtractVersion => "uuid_extract_version",
             Self::Version => "version",
             Self::NusadbTypeof => "nusadb_typeof",
             Self::CurrentDatabase => "current_database",

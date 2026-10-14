@@ -1247,6 +1247,20 @@ fn eval_scalar_function(
         },
         // RANDOM() is volatile — a fresh value per row; SETSEED(x) pins the generator seed.
         (F::Random, []) => ast::Value::Float(super::rng::next_f64()),
+        // CLOCK_TIMESTAMP() reads the wall clock on every call, so it advances within a statement.
+        (F::ClockTimestamp, []) => ast::Value::TimestampTz(super::clock::wall_clock_micros()),
+        // UUIDV7([shift]) is volatile and strictly increasing per process; see `executor::uuid`.
+        (F::UuidGenerateV7, []) => ast::Value::Uuid(super::uuid::uuid_v7(None)?),
+        (F::UuidGenerateV7, [ast::Value::Interval(shift)]) => {
+            ast::Value::Uuid(super::uuid::uuid_v7(Some(shift))?)
+        },
+        (F::UuidExtractTimestamp, [ast::Value::Uuid(u)]) => {
+            super::uuid::extract_timestamp_micros(u)
+                .map_or(ast::Value::Null, ast::Value::TimestampTz)
+        },
+        (F::UuidExtractVersion, [ast::Value::Uuid(u)]) => {
+            super::uuid::extract_version(u).map_or(ast::Value::Null, Int)
+        },
         // The argument is a FLOAT, or an INT/NUMERIC that coerces to one (a plain decimal
         // literal like `SETSEED(0.5)` now types as NUMERIC).
         (

@@ -1232,6 +1232,11 @@ fn slt_p13_uuid_gen() {
 }
 
 #[test]
+fn slt_p13_uuidv7() {
+    run_slt("tests/slt/p13_functions/uuidv7.slt");
+}
+
+#[test]
 fn slt_p13_system() {
     run_slt("tests/slt/p13_functions/system.slt");
 }

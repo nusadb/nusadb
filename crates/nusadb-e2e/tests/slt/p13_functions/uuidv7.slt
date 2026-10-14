@@ -1,0 +1,102 @@
+# uuidv7([shift]), uuidv4(), uuid_extract_version(uuid), uuid_extract_timestamp(uuid)
+# uuidv7() builds a time-ordered version 7 UUID; values only grow within a process.
+
+# Version 7, standard variant, canonical text form.
+query I
+SELECT uuidv7()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+----
+1
+
+# Two calls in one statement are distinct and ordered.
+query I
+SELECT uuidv7() < uuidv7()
+----
+1
+
+# uuidv4() is a short name for gen_random_uuid().
+query I
+SELECT uuidv4()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+----
+1
+
+query I
+SELECT uuid_extract_version(uuidv7())
+----
+7
+
+query I
+SELECT uuid_extract_version(gen_random_uuid())
+----
+4
+
+# The embedded timestamp is the current time, to the millisecond.
+query I
+SELECT abs(extract(epoch FROM uuid_extract_timestamp(uuidv7()) - now())) < 5
+----
+1
+
+# A version 4 UUID carries no timestamp.
+query I
+SELECT uuid_extract_timestamp(gen_random_uuid()) IS NULL
+----
+1
+
+# Fixed values: a version 7 UUID and the version 1 example from RFC 9562.
+query T
+SELECT uuid_extract_timestamp('017f22e2-79b0-7cc3-98c4-dc0c0c07398f')::text
+----
+2022-02-22 19:22:22+00
+
+query T
+SELECT uuid_extract_timestamp('c232ab00-9414-11ec-b3c8-9f6bdeced846')::text
+----
+2022-02-22 19:22:22+00
+
+query I
+SELECT uuid_extract_version('c232ab00-9414-11ec-b3c8-9f6bdeced846')
+----
+1
+
+# A UUID outside the standard variant has no version.
+query I
+SELECT uuid_extract_version('00000000-0000-7000-c000-000000000000') IS NULL
+----
+1
+
+# A shift moves the embedded timestamp.
+query I
+SELECT abs(extract(epoch FROM uuid_extract_timestamp(uuidv7(INTERVAL '1 day')) - now()) - 86400) < 5
+----
+1
+
+query I
+SELECT uuidv7(NULL::interval) IS NULL
+----
+1
+
+statement error out of range
+SELECT uuidv7(INTERVAL '-100 years')
+
+# Usable as a primary key default; rows inserted later sort later.
+statement ok
+CREATE TABLE events (id UUID PRIMARY KEY DEFAULT uuidv7(), n INT)
+
+statement ok
+INSERT INTO events (n) SELECT g FROM generate_series(1, 500) AS g
+
+statement ok
+INSERT INTO events (n) VALUES (501)
+
+statement ok
+INSERT INTO events (n) VALUES (502)
+
+query I
+SELECT count(DISTINCT id) FROM events
+----
+502
+
+# Ordering by the key gives insertion order.
+query I
+SELECT count(*) FROM (SELECT n, row_number() OVER (ORDER BY id) AS r FROM events) s WHERE n <> r
+----
+0

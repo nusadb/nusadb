@@ -47,9 +47,10 @@ pub(super) fn day_start_micros(days: i32) -> Option<i64> {
     i64::from(days).checked_mul(MICROS_PER_DAY)
 }
 
-/// The wall clock as microseconds since the Unix epoch. A clock reading before the epoch clamps to
-/// `0`; a reading beyond `i64::MAX` micros (year ~294247) saturates — neither can panic.
-fn wall_clock_micros() -> i64 {
+/// The wall clock as microseconds since the Unix epoch, read now rather than pinned per statement
+/// (`CLOCK_TIMESTAMP()`). A clock reading before the epoch clamps to `0`; a reading beyond
+/// `i64::MAX` micros (year ~294247) saturates. Neither can panic.
+pub(super) fn wall_clock_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {

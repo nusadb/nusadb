@@ -129,6 +129,7 @@ and a tagged form can contain `$$` itself.
 SELECT TRUE AS t,
        'f'::BOOLEAN                              AS parsed,
        gen_random_uuid()                         AS fresh,
+       uuidv7()                                  AS time_ordered,
        '5b8f0b3e-2c4d-4f7a-9d1e-1a2b3c4d5e6f'::UUID AS fixed;
 ```
 
@@ -1802,8 +1803,8 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 
 ### Date and time
 
-`now`, `transaction_timestamp`, `statement_timestamp`, `current_timestamp`, `current_date`,
-`current_time`, `localtimestamp`, `date_trunc`, `date_part`, `EXTRACT(field FROM x)`, `date_bin`,
+`now`, `transaction_timestamp`, `statement_timestamp`, `clock_timestamp`, `current_timestamp`,
+`current_date`, `current_time`, `localtimestamp`, `date_trunc`, `date_part`, `EXTRACT(field FROM x)`, `date_bin`,
 `age`, `to_char`, `to_date`, `to_timestamp`, `make_date`, `make_time`, `make_timestamp`,
 `make_timestamptz`, `make_interval` (positional or named: `make_interval(days => 5)`),
 `justify_days`, `justify_hours`, `justify_interval`,
@@ -1815,6 +1816,16 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 units from `microseconds` up to `millennium` and truncates a `TIMESTAMP`, `TIMESTAMPTZ`, `TIME` or
 `INTERVAL`, keeping its type (`week` is refused for a `TIME` or an `INTERVAL`). `now()` is fixed for
 the whole statement.
+
+`clock_timestamp()` reads the wall clock each time it is evaluated, so it changes within a
+statement and from row to row. It is never folded into a constant or served from the result
+cache, and a partition key that uses it is refused. The same holds for `uuidv7()`.
+
+```sql
+SELECT now() AS statement_start,
+       clock_timestamp() AS at_call;
+SELECT g, clock_timestamp() FROM generate_series(1, 3) AS g;  -- a later value on each row
+```
 
 ### JSON
 
@@ -1880,7 +1891,25 @@ Aggregates: `json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`.
 
 `md5` (hex text), `sha224`, `sha256`, `sha384`, `sha512` (binary digests; wrap in `encode(..., 'hex')`
 for text), `encrypt(value, key)` and `decrypt(value, key)` (deterministic AES-256-GCM-SIV, hex
-ciphertext), `gen_random_uuid`, `uuid_generate_v4`.
+ciphertext), `gen_random_uuid` (also `uuidv4` and `uuid_generate_v4`), `uuidv7`,
+`uuid_extract_timestamp`, `uuid_extract_version`.
+
+`uuidv7()` returns a version 7 UUID: a 48-bit Unix millisecond timestamp, a 12-bit fraction of the
+millisecond, and 62 random bits from the operating system's secure random source. Values sort by
+creation time, which keeps a `UUID PRIMARY KEY DEFAULT uuidv7()` index append-friendly. Each call
+returns a value greater than every earlier call in the server process, so values grow within a
+statement, a transaction and a session, even within one millisecond: when the clock has not moved
+on, the 12-bit fraction is counted up instead, carrying into the millisecond field if it fills.
+`uuidv7(shift)` moves the embedded timestamp by an interval (`uuidv7(INTERVAL '-1 hour')`); a
+shift outside the range a UUID can hold is an error. `uuid_extract_timestamp(u)` returns the
+timestamp of a version 1 or version 7 UUID as `TIMESTAMPTZ` (millisecond precision for version 7)
+and NULL for other versions. `uuid_extract_version(u)` returns the version number as `SMALLINT`,
+or NULL when the UUID is not of the standard variant.
+
+```sql
+CREATE TABLE events (id UUID PRIMARY KEY DEFAULT uuidv7(), body TEXT);
+SELECT uuid_extract_timestamp(id), uuid_extract_version(id) FROM events ORDER BY id;
+```
 
 ```sql
 SELECT encode(sha256('secret'), 'hex') AS digest,

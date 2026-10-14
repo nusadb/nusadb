@@ -1714,7 +1714,8 @@ pub(super) fn analyze_scalar_function(
             unreachable!("text-polymorphic functions are handled before the signature table")
         },
         // Niladic clock built-ins resolved from the statement's wall clock.
-        F::Now | F::CurrentTimestamp | F::StatementTimestamp => {
+        // CLOCK_TIMESTAMP reads the wall clock per call instead of the statement instant.
+        F::Now | F::CurrentTimestamp | F::StatementTimestamp | F::ClockTimestamp => {
             ScalarSig::Fixed(&[], &[], ColumnType::TimestampTz)
         },
         F::CurrentDate => ScalarSig::Fixed(&[], &[], ColumnType::Date),
@@ -1731,6 +1732,12 @@ pub(super) fn analyze_scalar_function(
         // SETSEED(x: FLOAT) → BOOL.
         // UUID_GENERATE_V4() → UUID (niladic, volatile).
         F::UuidGenerateV4 => ScalarSig::Fixed(&[], &[], ColumnType::Uuid),
+        // UUIDV7([shift INTERVAL]) → UUID (volatile).
+        F::UuidGenerateV7 => ScalarSig::Fixed(&[], &[ColumnType::Interval], ColumnType::Uuid),
+        F::UuidExtractTimestamp => {
+            ScalarSig::Fixed(&[ColumnType::Uuid], &[], ColumnType::TimestampTz)
+        },
+        F::UuidExtractVersion => ScalarSig::Fixed(&[ColumnType::Uuid], &[], ColumnType::SmallInt),
         F::Setseed => ScalarSig::Fixed(&[ColumnType::Float], &[], ColumnType::Bool),
         // MAKE_DATE/MAKE_TIME/MAKE_TIMESTAMP build a temporal value from integer fields.
         F::MakeDate => ScalarSig::Fixed(&[Int, Int, Int], &[], ColumnType::Date),

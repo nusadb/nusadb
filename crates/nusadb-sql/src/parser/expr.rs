@@ -1427,6 +1427,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         // `transaction_timestamp()` is a synonym for `now()` — both give the transaction start time.
         "now" | "transaction_timestamp" => F::Now,
         "statement_timestamp" => F::StatementTimestamp,
+        "clock_timestamp" => F::ClockTimestamp,
         "localtimestamp" => F::LocalTimestamp,
         "current_timestamp" => F::CurrentTimestamp,
         "current_date" => F::CurrentDate,
@@ -1591,8 +1592,12 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "upper_inc" => F::RangeUpperInc,
         "lower_inf" => F::RangeLowerInf,
         "upper_inf" => F::RangeUpperInf,
-        // UUID generation: both the modern built-in name and the alternative spelling.
-        "gen_random_uuid" | "uuid_generate_v4" => F::UuidGenerateV4,
+        // UUID generation: `gen_random_uuid`, its short form `uuidv4` and the alternative spelling all
+        // build a random version 4 UUID; `uuidv7` builds a time-ordered version 7 UUID.
+        "gen_random_uuid" | "uuidv4" | "uuid_generate_v4" => F::UuidGenerateV4,
+        "uuidv7" => F::UuidGenerateV7,
+        "uuid_extract_timestamp" => F::UuidExtractTimestamp,
+        "uuid_extract_version" => F::UuidExtractVersion,
         // System functions.
         "version" => F::Version,
         // `nusadb_typeof(expr)` — NusaDB's static type-introspection builtin; folded to the static

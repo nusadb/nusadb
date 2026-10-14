@@ -1550,6 +1550,7 @@ const fn is_volatile_scalar_func(func: ast::ScalarFunc) -> bool {
         func,
         F::Now
             | F::StatementTimestamp
+            | F::ClockTimestamp
             | F::LocalTimestamp
             | F::SequenceNext
             | F::SequenceCurrent
@@ -1571,6 +1572,7 @@ const fn is_volatile_scalar_func(func: ast::ScalarFunc) -> bool {
             | F::Random
             | F::Setseed
             | F::UuidGenerateV4
+            | F::UuidGenerateV7
             | F::Version
             | F::CurrentDatabase
             | F::CurrentSchema

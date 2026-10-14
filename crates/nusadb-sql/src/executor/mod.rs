@@ -38,6 +38,7 @@ pub mod eval;
 mod rng;
 pub mod row;
 mod session_ctx;
+mod uuid;
 
 /// The pinned session's temporary schema (`nusadb_temp_<id>`), or `None` if no session identity is
 /// pinned. Exposed for the analyzer's default [`Catalog::temp_schema`](crate::Catalog::temp_schema)
@@ -1732,7 +1733,7 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// `ScalarUdf`, so a genuine volatile call is never missed; an incidental match (e.g. a quoted
 /// identifier) only skips caching, which is always safe. Keep in step with the analyzer's
 /// `is_volatile_scalar_func`.
-const VOLATILE_PLAN_MARKERS: [&str; 23] = [
+const VOLATILE_PLAN_MARKERS: [&str; 25] = [
     "ScalarUdf",
     // Sequence built-ins advance / read engine + session state per call, so a memoized result would
     // hand out a stale (or duplicate) value — never cache a plan that mentions one.
@@ -1746,6 +1747,7 @@ const VOLATILE_PLAN_MARKERS: [&str; 23] = [
     "AdvisoryUnlockAll",
     "Now",
     "StatementTimestamp",
+    "ClockTimestamp",
     "LocalTimestamp",
     "CurrentTimestamp",
     "CurrentDate",
@@ -1756,6 +1758,7 @@ const VOLATILE_PLAN_MARKERS: [&str; 23] = [
     "Random",
     "Setseed",
     "UuidGenerateV4",
+    "UuidGenerateV7",
     "Version",
     "CurrentDatabase",
     "CurrentSchema",
