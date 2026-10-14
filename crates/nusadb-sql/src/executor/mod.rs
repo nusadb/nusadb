@@ -46,8 +46,9 @@ mod uuid;
 pub(crate) fn current_temp_schema() -> Option<String> {
     session_ctx::current_temp_schema()
 }
+pub use clock::{pin_transaction_start, wall_clock_micros};
 pub use session_ctx::check_settable_parameter;
-pub use session_ctx::{pin_statement_timezone, statement_tz_offset_secs};
+pub use session_ctx::{pin_statement_timezone, stamp_transaction_start, statement_tz_offset_secs};
 
 /// Release every advisory lock held by a session, by its `session_token`.
 ///
@@ -817,7 +818,7 @@ pub fn execute_in_txn_as_streaming(
         // here: keeping every protocol's reads on one statement snapshot is the whole point.
         return run_statement_atomically(engine, txn, || {
             // Mirror `dispatch`'s per-statement clock pin (bypassed here because we skip `dispatch`).
-            clock::set_statement_now();
+            let _clock = clock::enter_statement(txn);
             // Pin the engine + transaction for a NusaScript function call in the streamed
             // projection (this path skips `execute_in_txn`, where the buffered path pins it).
             let _exec_ctx = eval::bind_exec_context(engine, txn);
@@ -853,7 +854,7 @@ pub fn execute_in_txn_as_streaming_with_settings(
         // Streaming SELECT skips `execute_in_txn`, so it takes the statement snapshot and mark
         // here, keeping the extended-query streaming path on one snapshot.
         return run_statement_atomically(engine, txn, || {
-            clock::set_statement_now();
+            let _clock = clock::enter_statement(txn);
             // Pin the engine + transaction for a NusaScript function call in the streamed
             // projection (this path skips `execute_in_txn`, where the buffered path pins it).
             let _exec_ctx = eval::bind_exec_context(engine, txn);
@@ -924,7 +925,7 @@ pub fn execute_in_txn_as_streaming_with_cursors(
                 && let Some(config) = spill::spill_config()
             {
                 let rows = run_statement_atomically(engine, txn, || {
-                    clock::set_statement_now();
+                    let _clock = clock::enter_statement(txn);
                     let _exec_ctx = eval::bind_exec_context(engine, txn);
                     capture_cursor_rows(op, &config, engine, txn)
                 })?;
@@ -1249,6 +1250,10 @@ pub struct Session<'engine> {
     default_read_only: bool,
     /// Whether the currently-active explicit transaction is read-only (set at `BEGIN`).
     txn_read_only: bool,
+    /// When the currently-active explicit transaction began (microseconds since the Unix epoch),
+    /// the instant `NOW()` reports for every statement in it. Meaningful only while `current_txn`
+    /// is set.
+    txn_started_micros: i64,
     /// The transaction that has run a statement, if any: once the open transaction has,
     /// `SET TRANSACTION` is refused.
     used_txn: Option<TxnId>,
@@ -1733,7 +1738,7 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// `ScalarUdf`, so a genuine volatile call is never missed; an incidental match (e.g. a quoted
 /// identifier) only skips caching, which is always safe. Keep in step with the analyzer's
 /// `is_volatile_scalar_func`.
-const VOLATILE_PLAN_MARKERS: [&str; 25] = [
+const VOLATILE_PLAN_MARKERS: [&str; 26] = [
     "ScalarUdf",
     // Sequence built-ins advance / read engine + session state per call, so a memoized result would
     // hand out a stale (or duplicate) value — never cache a plan that mentions one.
@@ -1749,6 +1754,7 @@ const VOLATILE_PLAN_MARKERS: [&str; 25] = [
     "StatementTimestamp",
     "ClockTimestamp",
     "LocalTimestamp",
+    "LocalTime",
     "CurrentTimestamp",
     "CurrentDate",
     "CurrentTime",
@@ -1796,6 +1802,7 @@ impl<'engine> Session<'engine> {
             default_isolation: IsolationLevel::default(),
             default_read_only: false,
             txn_read_only: false,
+            txn_started_micros: 0,
             used_txn: None,
             variables: HashMap::new(),
             current_user: session_ctx::DEFAULT_USER.to_owned(),
@@ -2028,13 +2035,7 @@ impl<'engine> Session<'engine> {
         // Pin the session context up front (run_within_txn re-pins identically on a miss) so the
         // cache-hit path's work_mem enforcement below reads THIS statement's session settings —
         // not whatever the previous statement on this thread pinned.
-        session_ctx::set_session_context(
-            &self.current_user,
-            &self.variables,
-            &self.current_database,
-            &self.current_schema,
-            Some(&self.temp_schema_name()),
-        );
+        self.pin_statement_context();
         let Some(version) = self.engine.data_version() else {
             // The engine does not track a version, so caching cannot be invalidated safely.
             return self.run_within_txn(plan);
@@ -2106,8 +2107,8 @@ impl<'engine> Session<'engine> {
         if let PhysicalPlan::Select(op, _) = &query
             && let Some(config) = spill::spill_config()
         {
-            clock::set_statement_now();
             let rows = self.run_read(|txn| {
+                let _clock = clock::enter_statement(txn);
                 let _exec_ctx = eval::bind_exec_context(self.engine, txn);
                 capture_cursor_rows(op, &config, self.engine, txn)
             })?;
@@ -2154,13 +2155,7 @@ impl<'engine> Session<'engine> {
     /// mirroring [`run_within_txn`](Self::run_within_txn) but performing analysis inside the
     /// transaction with a user-aware catalog (RLS-correct) and enforcing READ ONLY.
     fn run_substituted(&self, stmt: ast::Statement) -> Result<ExecutionResult, Error> {
-        session_ctx::set_session_context(
-            &self.current_user,
-            &self.variables,
-            &self.current_database,
-            &self.current_schema,
-            Some(&self.temp_schema_name()),
-        );
+        self.pin_statement_context();
         if let Some(txn) = self.current_txn {
             let read_only = self.txn_read_only;
             run_statement_atomically(self.engine, txn, || {
@@ -2277,11 +2272,14 @@ impl<'engine> Session<'engine> {
         // Pin the session context + wall clock for the statement, exactly as `run_within_txn` /
         // `dispatch` do for the buffered path.
         self.pin_statement_context();
-        clock::set_statement_now();
-        self.run_read(|txn| stream_select_rows(op, self.engine, txn, sink))
+        self.run_read(|txn| {
+            let _clock = clock::enter_statement(txn);
+            stream_select_rows(op, self.engine, txn, sink)
+        })
     }
 
-    /// Pin this session's user, settings, database and schema for the statement about to run.
+    /// Pin this session's user, settings, database and schema for the statement about to run,
+    /// and the start of its open transaction block (if any) for `NOW()`.
     fn pin_statement_context(&self) {
         session_ctx::set_session_context(
             &self.current_user,
@@ -2290,6 +2288,7 @@ impl<'engine> Session<'engine> {
             &self.current_schema,
             Some(&self.temp_schema_name()),
         );
+        clock::pin_transaction_start(self.current_txn.map(|txn| (txn, self.txn_started_micros)));
     }
 
     /// Run a read-only `body` under the session's transaction context: inside an explicit
@@ -2548,6 +2547,7 @@ impl<'engine> Session<'engine> {
         let txn = self.engine.begin(isolation)?;
         self.current_txn = Some(txn);
         self.txn_read_only = read_only;
+        self.txn_started_micros = clock::wall_clock_micros();
         Ok(ExecutionResult::TransactionBegun)
     }
 
@@ -2687,14 +2687,8 @@ impl<'engine> Session<'engine> {
     fn run_within_txn(&self, plan: PhysicalPlan) -> Result<ExecutionResult, Error> {
         // Pin this session's user and settings for the statement so every CURRENT_USER /
         // SESSION_USER / current_setting() it contains observes the same snapshot (statement
-        // stability, mirroring the wall clock).
-        session_ctx::set_session_context(
-            &self.current_user,
-            &self.variables,
-            &self.current_database,
-            &self.current_schema,
-            Some(&self.temp_schema_name()),
-        );
+        // stability, mirroring the wall clock), and the transaction start `NOW()` reads.
+        self.pin_statement_context();
         // Enforce READ ONLY: reject data-modifying statements. Inside an explicit
         // transaction the flag is the one captured at BEGIN; in auto-commit it is the session
         // default carried by `SET TRANSACTION`.
@@ -3005,9 +2999,10 @@ fn dispatch(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
-    // Pin the wall clock for this statement so every NOW()/CURRENT_TIMESTAMP/CURRENT_DATE/
-    // CURRENT_TIME it contains observes the same instant (SQL statement stability).
-    clock::set_statement_now();
+    // Pin the clock for this statement so every NOW()/CURRENT_TIMESTAMP/STATEMENT_TIMESTAMP() it
+    // contains observes the same instants. A nested dispatch (a `Batch` child, a trigger, a
+    // procedure or function body) keeps the outer statement's clock.
+    let _clock = clock::enter_statement(txn);
     // Pin the engine + transaction so a NusaScript function call reached by the evaluator can run its
     // body against them. `dispatch` is the primitive every non-streaming path reaches (the streaming
     // SELECT path binds it separately); it is re-entered for `Batch` desugars and nested trigger /
@@ -3253,7 +3248,7 @@ fn run_explain(
                     .to_owned(),
             ));
         }
-        clock::set_statement_now();
+        let _clock = clock::enter_statement(txn);
         let started = std::time::Instant::now();
         let (actual_rows, actuals) = if let PhysicalPlan::Select(op, _est) = plan {
             let session = instrument::Session::begin();

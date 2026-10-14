@@ -1240,3 +1240,23 @@ fn slt_p13_uuidv7() {
 fn slt_p13_system() {
     run_slt("tests/slt/p13_functions/system.slt");
 }
+
+#[test]
+fn slt_p13_transaction_clock() {
+    run_slt("tests/slt/p13_functions/transaction_clock.slt");
+}
+
+#[test]
+fn slt_p1_volatility() {
+    run_slt("tests/slt/p1_ddl/volatility.slt");
+}
+
+#[test]
+fn slt_p10_datetime_overflow() {
+    run_slt("tests/slt/p10_types/datetime_overflow.slt");
+}
+
+#[test]
+fn slt_p1_add_column_generated() {
+    run_slt("tests/slt/p1_ddl/add_column_generated.slt");
+}

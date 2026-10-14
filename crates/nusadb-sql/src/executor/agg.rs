@@ -395,9 +395,10 @@ pub(crate) const fn is_integer(ty: ColumnType) -> bool {
     )
 }
 
-/// The error for an INTERVAL aggregate whose total does not fit an interval.
+/// The error for an INTERVAL aggregate whose total does not fit an interval (`22008`, like the
+/// same overflow in `interval + interval`).
 fn interval_overflow() -> Error {
-    Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned())
+    super::eval::interval_overflow()
 }
 
 /// The INTERVAL total an accumulator folded, or the overflow error if a field overflowed.

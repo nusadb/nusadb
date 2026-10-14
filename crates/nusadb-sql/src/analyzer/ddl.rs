@@ -468,7 +468,9 @@ fn validate_check_predicate(
             "a CHECK constraint may not contain a subquery".to_owned(),
         ));
     }
-    Ok(())
+    // Checked only for new DDL: a CHECK already in the catalog is re-read without this analysis,
+    // so an existing table keeps loading and enforcing it.
+    super::require_not_volatile_in_check(&typed)
 }
 
 /// Resolve the column `DEFAULT` expressions of a `CREATE TABLE`. Each default is type-checked
@@ -537,6 +539,7 @@ fn resolve_column_defaults(
                     "a GENERATED column expression may not contain a subquery".to_owned(),
                 ));
             }
+            super::require_immutable(&typed, "generation expression")?;
             let col = ColumnDef {
                 name: column.name.clone(),
                 ty: column.ty,
@@ -857,6 +860,45 @@ pub(super) fn analyze_alter_table(
                     });
                 }
                 return Err(Error::DuplicateColumn { name: column.name });
+            }
+            // A SERIAL or identity column needs a sequence created and drawn for every existing
+            // row; the ADD COLUMN rewrite does neither, so it is refused rather than leaving a
+            // column that rejects every later insert.
+            if column.serial {
+                return Err(Error::Unsupported(
+                    "ALTER TABLE ADD COLUMN with SERIAL or GENERATED AS IDENTITY".to_owned(),
+                ));
+            }
+            if let Some(generated) = &column.generated {
+                if !generated.stored {
+                    return Err(Error::Unsupported(
+                        "VIRTUAL generated columns are not supported; declare the column STORED"
+                            .to_owned(),
+                    ));
+                }
+                if column.default.is_some() {
+                    return Err(Error::InvalidTableDefinition(
+                        "a GENERATED column may not also have a DEFAULT".to_owned(),
+                    ));
+                }
+                let typed = analyze_expr(
+                    &generated.expr,
+                    &super::select::single_table_scope(&table),
+                    catalog,
+                    Some(column.ty),
+                )?;
+                if crate::executor::ops::contains_subquery(&typed) {
+                    return Err(Error::Unsupported(
+                        "a GENERATED column expression may not contain a subquery".to_owned(),
+                    ));
+                }
+                let col = ColumnDef {
+                    name: column.name.clone(),
+                    ty: column.ty,
+                    nullable: column.nullable,
+                };
+                super::typecheck::check_assignable(&col, &typed)?;
+                super::require_immutable(&typed, "generation expression")?;
             }
             if constraints.is_empty() && !column.unique {
                 AlterColumnOp::AddColumn(column)

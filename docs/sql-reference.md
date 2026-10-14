@@ -81,7 +81,9 @@ SELECT qty * price AS total FROM amounts;
 ```
 
 Integer arithmetic that overflows is an error (`22003`), not a silent wrap. Division by zero is
-`22012`.
+`22012`. Date and time arithmetic that leaves the representable range (a timestamp or date plus an
+interval, an interval sum or product whose months, days or time no longer fit) is an error too
+(`22008`), never a clamped or wrapped value.
 
 ### Auto-incrementing columns
 
@@ -630,7 +632,8 @@ ten up, and a multi-column bound can pin the leading column and leave the rest o
 
 A partition key part may also be a parenthesized expression — `PARTITION BY RANGE ((k % 10))`,
 `HASH ((a + b))`, or mixed with columns as in `RANGE (a, (b * 2))`. The expression must be
-stable (a volatile key would route the same row differently each time; `42P17`), every column it
+immutable (a key that can change would route the same row differently each time; `42P17`, see
+[Volatility](#volatility)), every column it
 reads must be provided in the `INSERT` (routing does not evaluate defaults), and a unique
 constraint can never cover an expression key, so declaring one on such a parent is refused.
 
@@ -671,6 +674,7 @@ ALTER TABLE orders ADD COLUMN note TEXT;
 ALTER TABLE orders ADD COLUMN channel TEXT DEFAULT 'web' NOT NULL;
 ALTER TABLE orders ADD COLUMN qty INT NOT NULL DEFAULT 1 CHECK (qty > 0);
 ALTER TABLE orders ADD COLUMN region INT REFERENCES regions (id);
+ALTER TABLE orders ADD COLUMN gross NUMERIC(12,2) GENERATED ALWAYS AS (total * 1.11) STORED;
 ALTER TABLE orders ALTER COLUMN note SET DEFAULT '';
 ALTER TABLE orders ALTER COLUMN note DROP DEFAULT;
 ALTER TABLE orders ALTER COLUMN note SET NOT NULL;
@@ -766,8 +770,15 @@ or trigger body spells the table's name, while an incrementally maintained view 
 is built on it, or while it is a partition, a partitioned parent, or part of an inheritance chain:
 those find the table by name and would stop resolving. Drop that object, rename, and recreate it.
 
+`ADD COLUMN ... GENERATED ALWAYS AS (expr) STORED` computes the column for every existing row as
+part of the statement, and every later insert or update recomputes it; an explicit value for it is
+refused (`428C9`). On a partitioned or inherited table the column is added to every partition and
+child the same way. The expression follows the same rules as in `CREATE TABLE`: it reads only the
+table's ordinary columns and calls only immutable functions.
+
 Not accepted: `ADD COLUMN ... FIRST | AFTER`, `ADD COLUMN ... PRIMARY KEY` (add the column, then
-`ADD CONSTRAINT ... PRIMARY KEY`), dropping several columns in one statement, `ADD CONSTRAINT ... NOT VALID`, `ALTER COLUMN ... TYPE ... USING <expr>`,
+`ADD CONSTRAINT ... PRIMARY KEY`), `ADD COLUMN` with `SERIAL` or `GENERATED AS IDENTITY` (`0A000`),
+dropping several columns in one statement, `ADD CONSTRAINT ... NOT VALID`, `ALTER COLUMN ... TYPE ... USING <expr>`,
 `ALTER COLUMN ... ADD GENERATED AS IDENTITY`, and a comma-separated list of actions.
 
 ### Indexes
@@ -796,12 +807,12 @@ An expression index serves a `WHERE` comparison against a constant on exactly th
 (`lower(email) = 'a@x.org'` uses `orders_lower` above; `upper(email) = ...` does not). There are no
 statistics on an expression, so an equality is assumed selective and takes the index, while a range
 on it is assumed to keep a third of the rows and, once the table is analyzed, runs as a sequential
-scan. An expression whose value depends on the session or the moment is never used to
-answer a query, because the key stored when a row was written need not be the value a later query
-computes: anything that reads the current time or a random value (`now()`, `random()`), and
-anything involving a `TIMESTAMPTZ` or `TIMETZ` value, which the session's `TimeZone` setting
-changes (`CAST(ts AS DATE)`, `extract(hour FROM ts)`). Index such a value through a stored
-generated column instead. A partial index keeps only the rows that satisfy its predicate,
+scan. A key expression or predicate that calls a function which is not immutable, such as `now()`,
+`random()` or `uuidv7()`, is refused when the index is created (`42P17`, see
+[Volatility](#volatility)). An expression involving a `TIMESTAMPTZ` or `TIMETZ` value is accepted
+but never used to answer a query, because the session's `TimeZone` setting changes its value
+(`CAST(ts AS DATE)`, `extract(hour FROM ts)`), so the key stored when a row was written need not be
+the value a later query computes. Index such a value through a stored generated column instead. A partial index keeps only the rows that satisfy its predicate,
 so it is maintained and enforces uniqueness but is never used to answer a query.
 
 ### Views, sequences, domains, schemas, databases
@@ -1804,7 +1815,7 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 ### Date and time
 
 `now`, `transaction_timestamp`, `statement_timestamp`, `clock_timestamp`, `current_timestamp`,
-`current_date`, `current_time`, `localtimestamp`, `date_trunc`, `date_part`, `EXTRACT(field FROM x)`, `date_bin`,
+`current_date`, `current_time`, `localtimestamp`, `localtime`, `date_trunc`, `date_part`, `EXTRACT(field FROM x)`, `date_bin`,
 `age`, `to_char`, `to_date`, `to_timestamp`, `make_date`, `make_time`, `make_timestamp`,
 `make_timestamptz`, `make_interval` (positional or named: `make_interval(days => 5)`),
 `justify_days`, `justify_hours`, `justify_interval`,
@@ -1814,18 +1825,57 @@ Regular expressions: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp
 `isodow`, `doy`, `isoyear`, `epoch`, `decade`, `century`, `millennium`, `microseconds`,
 `milliseconds`, `julian`, `timezone`, `timezone_hour`, `timezone_minute`. `date_trunc` accepts the
 units from `microseconds` up to `millennium` and truncates a `TIMESTAMP`, `TIMESTAMPTZ`, `TIME` or
-`INTERVAL`, keeping its type (`week` is refused for a `TIME` or an `INTERVAL`). `now()` is fixed for
-the whole statement.
+`INTERVAL`, keeping its type (`week` is refused for a `TIME` or an `INTERVAL`).
 
-`clock_timestamp()` reads the wall clock each time it is evaluated, so it changes within a
-statement and from row to row. It is never folded into a constant or served from the result
-cache, and a partition key that uses it is refused. The same holds for `uuidv7()`.
+The clock functions read three different instants:
+
+| Function | Instant |
+| --- | --- |
+| `now()`, `transaction_timestamp()`, `current_timestamp`, `current_date`, `current_time`, `localtimestamp`, `localtime` | the start of the current transaction, the same in every statement of it |
+| `statement_timestamp()` | the start of the current statement, the same for every row it touches and every trigger, procedure body or function it runs |
+| `clock_timestamp()` | the wall clock at the moment of the call |
+
+Outside an explicit transaction every statement is its own transaction, so `now()` and
+`statement_timestamp()` agree. Inside `BEGIN` ... `COMMIT`, or in one query string holding several
+statements (which run as one implicit transaction), `now()` keeps the transaction's start while
+`statement_timestamp()` moves on with each statement, so every row the transaction writes with
+`DEFAULT now()` carries the same time.
+
+`clock_timestamp()` changes within a statement and from row to row. It is never folded into a
+constant or served from the result cache. The same holds for `uuidv7()`.
 
 ```sql
-SELECT now() AS statement_start,
-       clock_timestamp() AS at_call;
+BEGIN;
+SELECT now() AS txn_start, statement_timestamp() AS stmt_start, clock_timestamp() AS at_call;
+SELECT now() AS txn_start, statement_timestamp() AS stmt_start;  -- same txn_start, later stmt_start
+COMMIT;
 SELECT g, clock_timestamp() FROM generate_series(1, 3) AS g;  -- a later value on each row
 ```
+
+#### Volatility
+
+Every built-in function belongs to one of three classes, which decide where it may be used:
+
+- **Immutable**: the same arguments always give the same result (`lower`, `abs`, `date_trunc`,
+  `age(end, start)` and most others).
+- **Stable**: fixed within a statement or transaction but not across them or across sessions: the
+  transaction clock (`now()`, `current_timestamp`, `current_date`, `current_time`, `localtimestamp`, `localtime`,
+  `statement_timestamp()`), `age(value)`, `current_user`, `session_user`, `current_setting`,
+  `current_database`, `current_schema`, `version()`.
+- **Volatile**: may change on every call: `clock_timestamp()`, `random()`, `setseed()`,
+  `gen_random_uuid()` and `uuid_generate_v4()`, `uuidv7()`, `nextval`, `currval`, `setval`, and the
+  advisory-lock functions.
+
+An index key expression, a partial-index `WHERE` predicate and a generated column may call only
+immutable built-ins; anything else is refused with `42P17`. A `CHECK` constraint may not call a
+volatile built-in (`42P17`), but it may call a stable one: `CHECK (placed <= now())` is accepted and
+tests each row against the time of the transaction that writes it. Such a check is not re-run
+later, so rows already stored stay valid as time moves on. User-defined functions carry no
+volatility marking and are not checked by these rules. A partition key is stricter: it accepts
+immutable built-ins only, and no user-defined functions.
+
+These rules apply when an object is created. An index, generated column or `CHECK` constraint that
+an earlier release accepted keeps loading and working as before.
 
 ### JSON
 
@@ -2113,6 +2163,7 @@ on the message text.
 | `22026` | a bit string whose length does not match `BIT(n)` | give exactly `n` bits, or cast explicitly |
 | `22003` | numeric value out of range | integer overflow or a value outside a function's domain |
 | `22007` | invalid date/time format | fix the literal |
+| `22008` | date/time value out of range | a timestamp, date or interval result past the representable range |
 | `22012` | division by zero | |
 | `22023` | invalid parameter value | for example a bad `SET` value |
 | `22P02` | invalid text representation | the text does not parse as the target type |
@@ -2140,6 +2191,7 @@ on the message text.
 | `42846` | cannot coerce | cast explicitly |
 | `42883` | undefined function, or no matching signature | also an `EXECUTE` with the wrong argument count |
 | `428C9` | writing a `GENERATED ALWAYS` column | use `OVERRIDING SYSTEM VALUE`, or omit the column |
+| `42P17` | invalid object definition | a function that is not immutable in an index, generated column or partition key, or a volatile one in a `CHECK`; see [Volatility](#volatility) |
 | `42P01` / `42P07` | undefined / duplicate table | |
 | `42P03` | duplicate cursor | `CLOSE` the open cursor, or pick another name |
 | `44000` | row violates a view's `WITH CHECK OPTION` | |

@@ -1,0 +1,47 @@
+# Index keys, index predicates and generated columns call only immutable functions; a CHECK may
+# not call a volatile one. A stable function such as now() is accepted in a CHECK.
+
+statement ok
+CREATE TABLE vt (x INT, t TIMESTAMPTZ, u UUID)
+
+statement error functions in index expression must be immutable, but uuidv7\(\) is not
+CREATE INDEX vt_u ON vt ((uuidv7()))
+
+statement error functions in index expression must be immutable, but clock_timestamp\(\) is not
+CREATE INDEX vt_c ON vt ((clock_timestamp()))
+
+statement error functions in index expression must be immutable, but random\(\) is not
+CREATE INDEX vt_r ON vt ((random()))
+
+statement error functions in index expression must be immutable, but now\(\) is not
+CREATE INDEX vt_n ON vt ((now()))
+
+statement error functions in index predicate must be immutable, but now\(\) is not
+CREATE INDEX vt_p ON vt (x) WHERE t < now()
+
+statement ok
+CREATE INDEX vt_ok ON vt ((abs(x))) WHERE x > 0
+
+statement error functions in generation expression must be immutable, but random\(\) is not
+CREATE TABLE vg (a INT, b FLOAT GENERATED ALWAYS AS (random()) STORED)
+
+statement error functions in generation expression must be immutable, but now\(\) is not
+CREATE TABLE vg (a INT, b TIMESTAMPTZ GENERATED ALWAYS AS (now()) STORED)
+
+statement error a CHECK constraint may not call the volatile function clock_timestamp\(\)
+CREATE TABLE vc (t TIMESTAMPTZ CHECK (t <= clock_timestamp()))
+
+statement error a CHECK constraint may not call the volatile function uuidv7\(\)
+CREATE TABLE vc (u UUID CHECK (u < uuidv7()))
+
+statement error a CHECK constraint may not call the volatile function random\(\)
+ALTER TABLE vt ADD CONSTRAINT vt_rand CHECK (x < random() * 10)
+
+statement ok
+CREATE TABLE vc (t TIMESTAMPTZ CHECK (t <= now()))
+
+statement ok
+INSERT INTO vc VALUES (now() - INTERVAL '1 hour')
+
+statement error violates check constraint
+INSERT INTO vc VALUES (now() + INTERVAL '1 hour')

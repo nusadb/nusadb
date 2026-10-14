@@ -77,6 +77,45 @@ pub(super) fn set_session_context(
         });
     });
     pin_statement_timezone(settings.get("timezone").map(String::as_str));
+    super::clock::pin_transaction_start(
+        settings
+            .get(crate::TRANSACTION_START_SETTING)
+            .and_then(|value| parse_transaction_start(value)),
+    );
+}
+
+/// Stamp the start of an open transaction block into a settings snapshot.
+///
+/// The value goes under [`TRANSACTION_START_SETTING`](crate::TRANSACTION_START_SETTING); the key
+/// is removed when the statement runs in autocommit (`None`).
+///
+/// A connection that keeps its own transaction state (the wire server) calls this for every
+/// statement snapshot, so `NOW()` reports the time the block began in each of its statements.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the wire server's per-connection GUC store is a default-hasher HashMap"
+)]
+pub fn stamp_transaction_start(
+    settings: &mut HashMap<String, String>,
+    open: Option<(nusadb_core::TxnId, i64)>,
+) {
+    match open {
+        Some((txn, started)) => {
+            settings.insert(
+                crate::TRANSACTION_START_SETTING.to_owned(),
+                format!("{}:{started}", txn.0),
+            );
+        },
+        None => {
+            settings.remove(crate::TRANSACTION_START_SETTING);
+        },
+    }
+}
+
+/// Read back a value written by [`stamp_transaction_start`].
+fn parse_transaction_start(value: &str) -> Option<(nusadb_core::TxnId, i64)> {
+    let (txn, started) = value.split_once(':')?;
+    Some((nusadb_core::TxnId(txn.parse().ok()?), started.parse().ok()?))
 }
 
 /// Pin the statement's session time zone from the canonical `timezone` setting.

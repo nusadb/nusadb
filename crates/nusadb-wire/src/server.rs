@@ -1006,7 +1006,7 @@ where
                                     settings_snapshot(&settings, &database)
                                         .get("timezone")
                                         .cloned(),
-                                    copy_txn,
+                                    txn_state.open_block(),
                                 )
                                 .await?
                             },
@@ -1017,7 +1017,7 @@ where
                                     copy,
                                     &copy_actor,
                                     settings_snapshot(&settings, &database).get("timezone").cloned(),
-                                    copy_txn,
+                                    txn_state.open_block(),
                                 )
                                 .await?
                             },
@@ -1028,15 +1028,16 @@ where
                     }
                     // A COPY inside a transaction block is one of its statements: it dirties the
                     // block, and a failure aborts it like any other statement's would.
-                    if let TxnState::Active { txn, isolation, .. } = txn_state {
+                    if let TxnState::Active { txn, isolation, started, .. } = txn_state {
                         txn_state = if outcome.is_ok() {
                             TxnState::Active {
                                 txn,
                                 dirty: true,
                                 isolation,
+                                started,
                             }
                         } else {
-                            TxnState::Failed { txn, isolation }
+                            TxnState::Failed { txn, isolation, started }
                         };
                     }
                     match outcome {
@@ -1677,11 +1678,12 @@ async fn handle_copy_in<S>(
     max_bytes: Option<usize>,
     actor: &str,
     timezone: Option<String>,
-    open_txn: Option<nusadb_core::TxnId>,
+    open_block: Option<(TxnId, i64)>,
 ) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let open_txn = open_block.map(|(txn, _)| txn);
     let columns = copy_in_column_count(engine, &copy, open_txn).await;
     let format = copy_wire_format(&copy);
     conn.write_frame(&BackendMessage::CopyInResponse { format, columns }.encode()?)
@@ -1750,6 +1752,8 @@ where
         // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
         // a `timestamptz` field with no explicit offset is read as session-local wall time.
         nusadb_sql::pin_statement_timezone(timezone.as_deref());
+        // ... and the block's start time, which a column DEFAULT `now()` reports.
+        nusadb_sql::pin_transaction_start(open_block);
         // The access check runs in the SAME transaction as the load, so a REVOKE that lands after
         // the pre-upload fast-fail check still bites — there is no window between "allowed" and
         // "written" for a concurrent change to slip through. Inside a transaction block that is
@@ -1852,11 +1856,12 @@ async fn handle_copy_out<S>(
     copy: nusadb_sql::ast::Copy,
     actor: &str,
     timezone: Option<String>,
-    open_txn: Option<nusadb_core::TxnId>,
+    open_block: Option<(TxnId, i64)>,
 ) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let open_txn = open_block.map(|(txn, _)| txn);
     let format = copy_wire_format(&copy);
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
@@ -1864,6 +1869,8 @@ where
         // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
         // `timestamptz` fields render on the session-local wall clock like every other output.
         nusadb_sql::pin_statement_timezone(timezone.as_deref());
+        // ... and the block's start time, which `now()` in a `COPY (query)` reports.
+        nusadb_sql::pin_transaction_start(open_block);
         // Check and render in one transaction, so the rows streamed out are exactly the ones the
         // access check was evaluated against. Inside a transaction block that is the block's
         // transaction, so the rows include what the block wrote and it stays open.
@@ -2982,7 +2989,7 @@ fn run_statement_streaming(
     // carries the connection database for `CURRENT_DATABASE()` and the effective
     // transaction isolation.
     let mut snapshot = settings_snapshot(settings, database);
-    stamp_transaction_isolation(&mut snapshot, state);
+    stamp_transaction_state(&mut snapshot, state);
     let mut sink = ChannelSink {
         buf: Vec::with_capacity(SINK_CHUNK),
         tx,
@@ -3036,7 +3043,7 @@ fn run_show_streaming(
     array_elements: bool,
 ) -> (Result<String, (String, &'static str)>, Vec<BackendMessage>) {
     let mut snapshot = settings.lock().map(|s| s.clone()).unwrap_or_default();
-    stamp_transaction_isolation(&mut snapshot, state);
+    stamp_transaction_state(&mut snapshot, state);
     let mut sink = ChannelSink {
         buf: Vec::with_capacity(SINK_CHUNK),
         tx,
@@ -3187,7 +3194,12 @@ fn stream_stmt_in_state(
             )),
             state,
         ),
-        TxnState::Active { txn, isolation, .. } => {
+        TxnState::Active {
+            txn,
+            isolation,
+            started,
+            ..
+        } => {
             // The RC/RU statement snapshot is refreshed at the execution choke-point
             // (`execute_in_txn_as_streaming_with_settings` → `execute_in_txn` / `stream_select_rows`),
             // identically for the simple- and extended-query paths, so no protocol can drift onto a
@@ -3203,7 +3215,16 @@ fn stream_stmt_in_state(
             ) {
                 Ok(physical) => physical,
                 // A plan error is reported identically on either path — no reason to punt.
-                Err(e) => return StmtRun::Done(Err(e), TxnState::Failed { txn, isolation }),
+                Err(e) => {
+                    return StmtRun::Done(
+                        Err(e),
+                        TxnState::Failed {
+                            txn,
+                            isolation,
+                            started,
+                        },
+                    );
+                },
             };
             // Inline point-get gate: admit only a bounded unique-key point lookup onto the reactor. The
             // check runs where the plan already exists, so an admitted statement pays ZERO
@@ -3222,9 +3243,17 @@ fn stream_stmt_in_state(
                         txn,
                         dirty: true,
                         isolation,
+                        started,
                     },
                 ),
-                Err(e) => StmtRun::Done(Err(e), TxnState::Failed { txn, isolation }),
+                Err(e) => StmtRun::Done(
+                    Err(e),
+                    TxnState::Failed {
+                        txn,
+                        isolation,
+                        started,
+                    },
+                ),
             }
         },
         TxnState::Auto => stream_stmt_autocommit(
@@ -3683,12 +3712,18 @@ enum TxnState {
         /// transaction_isolation` / `current_setting` report the level actually enforced,
         /// not the session default.
         isolation: IsolationLevel,
+        /// When the block began (`BEGIN`, or the first statement of a multi-statement query),
+        /// in microseconds since the Unix epoch: the instant `NOW()` reports in every statement
+        /// of the block. Kept when `SET TRANSACTION` re-begins the engine transaction.
+        started: i64,
     },
     Failed {
         txn: TxnId,
         /// Kept through failure so a `ROLLBACK TO SAVEPOINT` recovery (back to `Active`) and
         /// introspection still know the transaction's level.
         isolation: IsolationLevel,
+        /// The block's start time, kept so a `ROLLBACK TO SAVEPOINT` recovery still reports it.
+        started: i64,
     },
 }
 
@@ -3705,7 +3740,16 @@ impl TxnState {
     /// The state after an error: an open transaction block becomes failed, anything else is kept.
     const fn aborted(self) -> Self {
         match self {
-            Self::Active { txn, isolation, .. } => Self::Failed { txn, isolation },
+            Self::Active {
+                txn,
+                isolation,
+                started,
+                ..
+            } => Self::Failed {
+                txn,
+                isolation,
+                started,
+            },
             other => other,
         }
     }
@@ -3715,6 +3759,16 @@ impl TxnState {
         match self {
             Self::Auto => None,
             Self::Active { txn, .. } | Self::Failed { txn, .. } => Some(txn),
+        }
+    }
+
+    /// The open transaction block and the time it began, or `None` in autocommit.
+    const fn open_block(self) -> Option<(TxnId, i64)> {
+        match self {
+            Self::Auto => None,
+            Self::Active { txn, started, .. } | Self::Failed { txn, started, .. } => {
+                Some((txn, started))
+            },
         }
     }
 
@@ -3729,12 +3783,16 @@ impl TxnState {
     }
 }
 
-/// Stamp the connection's **effective** transaction isolation into a GUC snapshot:
-/// inside a transaction block, the level the engine transaction was begun
-/// with; in autocommit, the session default the next statement's transaction will use. Written
-/// after the store copy, so it always wins — `SHOW transaction_isolation` / `current_setting`
-/// cannot misreport the enforced level.
-fn stamp_transaction_isolation(snapshot: &mut HashMap<String, String>, state: TxnState) {
+/// Stamp the connection's transaction state into a GUC snapshot.
+///
+/// The **effective** isolation: inside a transaction block, the level the engine transaction was
+/// begun with; in autocommit, the session default the next statement's transaction will use.
+/// Written after the store copy, so it always wins: `SHOW transaction_isolation` /
+/// `current_setting` cannot misreport the enforced level.
+///
+/// The block's start time, so `NOW()` reports the same instant in every statement of the block;
+/// in autocommit the key is removed and `NOW()` reads the statement's own start.
+fn stamp_transaction_state(snapshot: &mut HashMap<String, String>, state: TxnState) {
     let level = match state {
         TxnState::Active { isolation, .. } | TxnState::Failed { isolation, .. } => isolation,
         TxnState::Auto => session_isolation(snapshot),
@@ -3743,6 +3801,7 @@ fn stamp_transaction_isolation(snapshot: &mut HashMap<String, String>, state: Tx
         "transaction_isolation".to_owned(),
         isolation_guc_text(level).to_owned(),
     );
+    nusadb_sql::stamp_transaction_start(snapshot, state.open_block());
 }
 
 /// The isolation level the connection's next transaction begins with: an explicit
@@ -3810,7 +3869,16 @@ fn set_transaction_txn(
             "READ ONLY transactions are not supported over the wire protocol yet".to_owned(),
         );
         let new_state = match state {
-            TxnState::Active { txn, isolation, .. } => TxnState::Failed { txn, isolation },
+            TxnState::Active {
+                txn,
+                isolation,
+                started,
+                ..
+            } => TxnState::Failed {
+                txn,
+                isolation,
+                started,
+            },
             other => other,
         };
         return (Err(err), new_state);
@@ -3827,18 +3895,24 @@ fn set_transaction_txn(
             txn,
             dirty: true,
             isolation,
+            started,
         } => (
             Err(nusadb_sql::Error::Coded {
                 message: "SET TRANSACTION ISOLATION LEVEL must be called before any query"
                     .to_owned(),
                 sqlstate: "25001", // active_sql_transaction
             }),
-            TxnState::Failed { txn, isolation },
+            TxnState::Failed {
+                txn,
+                isolation,
+                started,
+            },
         ),
         TxnState::Active {
             txn,
             dirty: false,
             isolation,
+            started,
         } => {
             // Nothing ran yet: an engine transaction at the new level is indistinguishable from
             // this one, so swap them. Without an isolation change there is nothing to do.
@@ -3849,6 +3923,7 @@ fn set_transaction_txn(
                         txn,
                         dirty: false,
                         isolation,
+                        started,
                     },
                 );
             };
@@ -3861,6 +3936,7 @@ fn set_transaction_txn(
                         txn: new_txn,
                         dirty: false,
                         isolation: level,
+                        started,
                     },
                 ),
                 Err(e) => (Err(e.into()), TxnState::Auto),
@@ -3900,7 +3976,16 @@ fn session_default(
             "READ ONLY transactions are not supported over the wire protocol yet".to_owned(),
         );
         let new_state = match state {
-            TxnState::Active { txn, isolation, .. } => TxnState::Failed { txn, isolation },
+            TxnState::Active {
+                txn,
+                isolation,
+                started,
+                ..
+            } => TxnState::Failed {
+                txn,
+                isolation,
+                started,
+            },
             other => other,
         };
         return (Err(err), new_state);
@@ -4320,7 +4405,7 @@ fn run_query_txn(
         },
         Statement::Show(name) => {
             let mut snapshot = settings.lock().map(|s| s.clone()).unwrap_or_default();
-            stamp_transaction_isolation(&mut snapshot, state);
+            stamp_transaction_state(&mut snapshot, state);
             (show_result(&name, &snapshot), state)
         },
         // `SET ROLE` is authorized against the role the connection *logged in as*, never against a
@@ -4456,7 +4541,7 @@ fn run_session_stmt_in_state(
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     use nusadb_sql::ast::Statement;
     let mut snapshot = settings_snapshot(settings, database);
-    stamp_transaction_isolation(&mut snapshot, state);
+    stamp_transaction_state(&mut snapshot, state);
     match state {
         TxnState::Failed { .. } => (
             Err(nusadb_sql::Error::TransactionAborted(
@@ -4465,18 +4550,29 @@ fn run_session_stmt_in_state(
             )),
             state,
         ),
-        TxnState::Active { txn, isolation, .. } => {
-            match run_session_stmt_once(engine, stmt, txn, true, user, &snapshot, stores) {
-                Ok(result) => (
-                    Ok(result),
-                    TxnState::Active {
-                        txn,
-                        dirty: true,
-                        isolation,
-                    },
-                ),
-                Err(e) => (Err(e), TxnState::Failed { txn, isolation }),
-            }
+        TxnState::Active {
+            txn,
+            isolation,
+            started,
+            ..
+        } => match run_session_stmt_once(engine, stmt, txn, true, user, &snapshot, stores) {
+            Ok(result) => (
+                Ok(result),
+                TxnState::Active {
+                    txn,
+                    dirty: true,
+                    isolation,
+                    started,
+                },
+            ),
+            Err(e) => (
+                Err(e),
+                TxnState::Failed {
+                    txn,
+                    isolation,
+                    started,
+                },
+            ),
         },
         TxnState::Auto => {
             let settles_cursors = matches!(
@@ -5028,6 +5124,7 @@ fn begin_txn(
                         txn,
                         dirty: false,
                         isolation: level,
+                        started: nusadb_sql::wall_clock_micros(),
                     },
                 ),
                 Err(e) => (Err(e.into()), TxnState::Auto),
@@ -5147,12 +5244,21 @@ fn finish_prepared_txn(
             nusadb_sql::two_phase::finish(engine, gid, commit, user),
             TxnState::Auto,
         ),
-        TxnState::Active { txn, isolation, .. } => (
+        TxnState::Active {
+            txn,
+            isolation,
+            started,
+            ..
+        } => (
             Err(nusadb_sql::Error::ActiveTransaction(format!(
                 "{} PREPARED cannot run inside a transaction block",
                 if commit { "COMMIT" } else { "ROLLBACK" }
             ))),
-            TxnState::Failed { txn, isolation },
+            TxnState::Failed {
+                txn,
+                isolation,
+                started,
+            },
         ),
         TxnState::Failed { .. } => (
             Err(nusadb_sql::Error::TransactionAborted(
@@ -5208,7 +5314,12 @@ fn savepoint_txn(
         )
     };
     match state {
-        TxnState::Active { txn, isolation, .. } => {
+        TxnState::Active {
+            txn,
+            isolation,
+            started,
+            ..
+        } => {
             let result = match stmt {
                 Statement::Savepoint(name) => engine
                     .savepoint(txn, name)
@@ -5229,11 +5340,16 @@ fn savepoint_txn(
                     txn,
                     dirty: true,
                     isolation,
+                    started,
                 },
             )
         },
         // A failed transaction can be recovered by rolling back to a savepoint taken before the error.
-        TxnState::Failed { txn, isolation } => match stmt {
+        TxnState::Failed {
+            txn,
+            isolation,
+            started,
+        } => match stmt {
             Statement::RollbackToSavepoint(name) => match engine.rollback_to(txn, name) {
                 Ok(()) => (
                     Ok(ExecutionResult::RolledBackToSavepoint),
@@ -5241,11 +5357,26 @@ fn savepoint_txn(
                         txn,
                         dirty: true,
                         isolation,
+                        started,
                     },
                 ),
-                Err(e) => (Err(e.into()), TxnState::Failed { txn, isolation }),
+                Err(e) => (
+                    Err(e.into()),
+                    TxnState::Failed {
+                        txn,
+                        isolation,
+                        started,
+                    },
+                ),
             },
-            _ => (Err(aborted()), TxnState::Failed { txn, isolation }),
+            _ => (
+                Err(aborted()),
+                TxnState::Failed {
+                    txn,
+                    isolation,
+                    started,
+                },
+            ),
         },
         TxnState::Auto => (
             Err(nusadb_sql::Error::NoActiveTransaction(
@@ -5273,7 +5404,7 @@ fn run_stmt_in_state(
     // transaction isolation stamped in. Cheap (the map is tiny); cloned so the
     // store lock is not held across execution.
     let mut snapshot = settings_snapshot(settings, database);
-    stamp_transaction_isolation(&mut snapshot, state);
+    stamp_transaction_state(&mut snapshot, state);
     // CHECKPOINT runs outside any data transaction (it needs a quiesced engine), so intercept it
     // before a statement transaction is opened — the same reason the streaming path routes it
     // through its control block. An open transaction on this connection makes the engine refuse.
@@ -5288,7 +5419,12 @@ fn run_stmt_in_state(
             )),
             state,
         ),
-        TxnState::Active { txn, isolation, .. } => {
+        TxnState::Active {
+            txn,
+            isolation,
+            started,
+            ..
+        } => {
             let outcome = analyze(stmt, &EngineCatalog::new(engine, txn, user, &snapshot))
                 .and_then(|logical| {
                     execute_in_txn_as_with_settings(plan(logical), engine, txn, user, &snapshot)
@@ -5300,10 +5436,18 @@ fn run_stmt_in_state(
                         txn,
                         dirty: true,
                         isolation,
+                        started,
                     },
                 ),
                 // A failed statement aborts the transaction until COMMIT/ROLLBACK.
-                Err(e) => (Err(e), TxnState::Failed { txn, isolation }),
+                Err(e) => (
+                    Err(e),
+                    TxnState::Failed {
+                        txn,
+                        isolation,
+                        started,
+                    },
+                ),
             }
         },
         TxnState::Auto => {

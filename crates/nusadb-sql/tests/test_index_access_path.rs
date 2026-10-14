@@ -993,8 +993,9 @@ fn an_expression_index_is_chosen_by_cost_once_the_table_is_analyzed() {
 #[test]
 fn an_expression_that_depends_on_the_session_or_the_moment_is_not_a_scan_path() {
     // A key computed under one session time zone is not the value a session in another zone
-    // computes for the same row, and `now()` / `random()` change between write and read: such an
-    // index is maintained but never scanned, so every zone reads the rows a scan reads.
+    // computes for the same row: such an index is maintained but never scanned, so every zone reads
+    // the rows a scan reads. An index on `now()` / `random()`, which change between write and read,
+    // cannot be created at all, and a query on them never picks an index.
     let (engine, mut session) = fresh();
     for table in ["tz", "tn"] {
         run(
@@ -1031,12 +1032,19 @@ fn an_expression_that_depends_on_the_session_or_the_moment_is_not_a_scan_path() 
         "localtimestamp",
     ];
     for (i, key) in keys.iter().enumerate() {
-        run(
+        let created = run(
             engine,
             &mut session,
             &format!("CREATE INDEX tz_k{i} ON tz (({key}))"),
-        )
-        .unwrap();
+        );
+        // A key calling a function that is not immutable is refused outright; one that depends on
+        // the session zone is accepted but never scanned.
+        if key.contains("random()") || key.contains("now()") || key.contains("localtimestamp") {
+            let err = created.expect_err(key);
+            assert_eq!(err.sqlstate(), "42P17", "{key}: {err}");
+        } else {
+            created.unwrap();
+        }
     }
     let predicates = [
         "CAST(ts AS DATE) = DATE '2024-01-05'",

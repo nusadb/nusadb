@@ -1,0 +1,45 @@
+# Date and time arithmetic past the representable range is an error, never a clamped value.
+
+statement error timestamp out of range
+SELECT now() + (make_interval(days => -2147483647) + INTERVAL '2562047788 hours')
+
+statement error out of range
+SELECT uuidv7(make_interval(days => -2147483647) + INTERVAL '2562047788 hours')
+
+statement error timestamp out of range
+SELECT TIMESTAMP '2000-01-01' + INTERVAL '300000 years'
+
+statement error timestamp out of range
+SELECT DATE '2000-01-01' - INTERVAL '300000 years'
+
+statement error timestamp out of range
+SELECT DATE '5874897-01-01' + INTERVAL '1 day'
+
+statement error timestamp out of range
+SELECT TIMESTAMP '294247-01-10 04:00:54.775807' + INTERVAL '1 microsecond'
+
+statement error INTERVAL arithmetic overflow
+SELECT INTERVAL '2147483647 months' + INTERVAL '1 month'
+
+statement error INTERVAL arithmetic overflow
+SELECT make_interval(years => 1000000000)
+
+statement error INTERVAL arithmetic overflow
+SELECT justify_days(make_interval(months => 2147483647, days => 30))
+
+# In range, calendar arithmetic is unchanged.
+query T
+SELECT (TIMESTAMP '2024-01-31' + INTERVAL '1 month')::text
+----
+2024-02-29 00:00:00
+
+query T
+SELECT (TIMESTAMP '294247-01-10 04:00:54.775806' + INTERVAL '1 microsecond')::text
+----
+294247-01-10 04:00:54.775807
+
+# A series stops at the end of the range instead of wrapping.
+query I
+SELECT count(*) FROM generate_series(TIMESTAMP '294247-01-08', TIMESTAMP '294247-01-10 04:00:54.775807', INTERVAL '1 day')
+----
+3

@@ -76,21 +76,23 @@ const fn days_in_month(y: i64, m: i64) -> i64 {
 /// Add an interval (`months` + `days` + `micros`) to a timestamp, calendar-aware.
 ///
 /// `ts` is microseconds since the epoch. Months advance the year/month and clamp the day to the new
-/// month's length; then whole days and the sub-day microseconds are added.
+/// month's length; then whole days and the sub-day microseconds are added. `None` when the result
+/// falls outside the timestamp range (`i64` microseconds since the epoch); the caller reports that
+/// as `22008`, never a clamped or wrapped instant.
 #[must_use]
-pub fn add_interval_to_micros(ts: i64, months: i32, days: i32, micros: i64) -> i64 {
+pub fn add_interval_to_micros(ts: i64, months: i32, days: i32, micros: i64) -> Option<i64> {
     let (day_count, tod) = (ts.div_euclid(MICROS_PER_DAY), ts.rem_euclid(MICROS_PER_DAY));
     let (y, m, d) = civil_from_days(day_count);
-    // Advance months (0-based month arithmetic), then clamp the day.
+    // Advance months (0-based month arithmetic), then clamp the day. `y` is within about 300 000
+    // years of the epoch and `months` within `i32`, so none of this can overflow `i64`.
     let total_months = y * 12 + (m - 1) + i64::from(months);
     let ny = total_months.div_euclid(12);
     let nm = total_months.rem_euclid(12) + 1;
     let nd = d.min(days_in_month(ny, nm));
     let new_days = days_from_civil(ny, nm, nd) + i64::from(days);
-    new_days
-        .saturating_mul(MICROS_PER_DAY)
-        .saturating_add(tod)
-        .saturating_add(micros)
+    let total =
+        i128::from(new_days) * i128::from(MICROS_PER_DAY) + i128::from(tod) + i128::from(micros);
+    i64::try_from(total).ok()
 }
 
 /// `DATE_BIN(stride, source, origin)` — snap the timestamp `source` down to its `stride`-wide bin
@@ -1186,7 +1188,9 @@ pub fn extract_decimal_timetz_field(field: &str, packed: i64) -> Option<crate::n
 }
 
 /// `DATE_TRUNC(field, ts)` — `ts` (epoch micros) floored to the start of the named precision.
-/// Returns `None` for an unrecognised field. `week` truncates to the preceding Monday 00:00.
+///
+/// Returns `None` for an unrecognised field, and when the start of the precision lies before the
+/// timestamp range. `week` truncates to the preceding Monday 00:00.
 #[must_use]
 pub fn date_trunc_micros(field: &str, micros: i64) -> Option<i64> {
     let unit = match field {
@@ -1218,7 +1222,8 @@ pub fn date_trunc_micros(field: &str, micros: i64) -> Option<i64> {
         "millennium" => days_from_civil((millennium_of(y) - 1) * 1000 + 1, 1, 1),
         _ => return None,
     };
-    Some(start_day.saturating_mul(MICROS_PER_DAY))
+    // The floor of the earliest timestamps (before about year -290 000) lies below the range.
+    start_day.checked_mul(MICROS_PER_DAY)
 }
 
 /// `AGE(end, start)` — the calendar interval `(months, days, micros)` such that

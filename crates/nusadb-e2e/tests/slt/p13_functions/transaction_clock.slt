@@ -1,0 +1,65 @@
+# now(), transaction_timestamp() and current_timestamp read the start of the transaction, the
+# same in every statement of it; statement_timestamp() reads the start of each statement.
+
+statement ok
+CREATE TABLE tclock (k TEXT, n TIMESTAMPTZ DEFAULT now(), s TIMESTAMPTZ DEFAULT statement_timestamp())
+
+# Autocommit: the transaction is the statement.
+query I
+SELECT now() = statement_timestamp() AND now() = transaction_timestamp() AND now() = current_timestamp
+----
+1
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tclock (k) VALUES ('a')
+
+query I
+SELECT count(*) FROM generate_series(1, 200000)
+----
+200000
+
+statement ok
+INSERT INTO tclock (k) VALUES ('b')
+
+# Both rows carry the transaction start; their statement times differ.
+query II
+SELECT count(DISTINCT n), count(DISTINCT s) FROM tclock
+----
+1 2
+
+query I
+SELECT min(n) = now() AND min(n) = transaction_timestamp() AND min(n) = current_timestamp FROM tclock
+----
+1
+
+query I
+SELECT statement_timestamp() > now()
+----
+1
+
+query I
+SELECT localtimestamp = now()::timestamp AND current_date = now()::date AND localtime = now()::time
+----
+1
+
+query T
+SELECT nusadb_typeof(localtime)
+----
+time without time zone
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM generate_series(1, 200000)
+----
+200000
+
+# The next transaction starts later.
+query I
+SELECT now() > max(n) FROM tclock
+----
+1

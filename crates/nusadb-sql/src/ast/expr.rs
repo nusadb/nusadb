@@ -554,24 +554,29 @@ pub enum ScalarFunc {
     /// `REGEXP_SPLIT_TO_ARRAY(s, pattern [, flags])` — split `s` on each match of `pattern`, as
     /// `TEXT[]`.
     RegexpSplitToArray,
-    /// `NOW()` — the statement's wall-clock instant as `TIMESTAMPTZ`. Niladic; stable for
-    /// every row of one statement.
+    /// `NOW()` (also `TRANSACTION_TIMESTAMP()`): the current transaction's start instant as
+    /// `TIMESTAMPTZ`. Niladic; the same value in every statement of the transaction.
     Now,
-    /// `STATEMENT_TIMESTAMP()` — the current statement's start instant as `TIMESTAMPTZ`. In this
-    /// engine `NOW()`/`CURRENT_TIMESTAMP` are already statement-scoped, so it is the same instant.
+    /// `STATEMENT_TIMESTAMP()`: the current client statement's start instant as `TIMESTAMPTZ`. It
+    /// equals [`NOW()`](Self::Now) in autocommit and moves on with each statement of a transaction
+    /// block.
     StatementTimestamp,
     /// `CLOCK_TIMESTAMP()`: the wall clock at the moment of the call, as `TIMESTAMPTZ`. Unlike
     /// [`NOW()`](Self::Now) it is read afresh on every evaluation, so it advances within a statement
     /// and differs from row to row. Niladic; volatile.
     ClockTimestamp,
-    /// `LOCALTIMESTAMP` — the statement instant as a `TIMESTAMP` (no time zone); the same instant as
-    /// `CURRENT_TIMESTAMP` but without the zone (the session zone is UTC).
+    /// `LOCALTIMESTAMP`: the transaction instant as a `TIMESTAMP` (no time zone), read as wall time
+    /// in the session zone.
     LocalTimestamp,
+    /// `LOCALTIME`: the transaction instant's time of day in the session zone, as `TIME` (no time
+    /// zone). Niladic.
+    LocalTime,
     /// `CURRENT_TIMESTAMP` — synonym for [`NOW()`](Self::Now), `TIMESTAMPTZ`. Niladic.
     CurrentTimestamp,
-    /// `CURRENT_DATE` — the statement instant's calendar date as `DATE`. Niladic.
+    /// `CURRENT_DATE`: the transaction instant's calendar date in the session zone, as `DATE`.
+    /// Niladic.
     CurrentDate,
-    /// `CURRENT_TIME` — the statement instant's time of day as `TIME`. Niladic.
+    /// `CURRENT_TIME`: the transaction instant's time of day in the session zone. Niladic.
     CurrentTime,
     /// `CURRENT_USER` / `USER` — the session user as `TEXT` (RLS). Niladic; read from the
     /// session, stable for every row of one statement.
@@ -1157,6 +1162,7 @@ impl ScalarFunc {
             Self::StatementTimestamp => "statement_timestamp",
             Self::ClockTimestamp => "clock_timestamp",
             Self::LocalTimestamp => "localtimestamp",
+            Self::LocalTime => "localtime",
             Self::CurrentTimestamp => "current_timestamp",
             Self::CurrentDate => "current_date",
             Self::CurrentTime => "current_time",
@@ -1295,7 +1301,7 @@ impl ScalarFunc {
             Self::RangeUpperInc => "upper_inc",
             Self::RangeLowerInf => "lower_inf",
             Self::RangeUpperInf => "upper_inf",
-            Self::UuidGenerateV4 => "uuid_generate_v4",
+            Self::UuidGenerateV4 => "gen_random_uuid",
             Self::UuidGenerateV7 => "uuidv7",
             Self::UuidExtractTimestamp => "uuid_extract_timestamp",
             Self::UuidExtractVersion => "uuid_extract_version",
@@ -1390,6 +1396,7 @@ impl ScalarFunc {
                 | Self::CurrentTimestamp
                 | Self::StatementTimestamp
                 | Self::LocalTimestamp
+                | Self::LocalTime
                 | Self::CurrentDate
                 | Self::CurrentTime
         )

@@ -50,16 +50,14 @@ static LAST_TICK: AtomicU64 = AtomicU64::new(0);
 /// the monotonic tick is taken, so values generated with one fixed shift keep their order.
 ///
 /// # Errors
+/// [`Error::DatetimeOverflow`] when the shift moves the timestamp outside the timestamp range,
 /// [`Error::InvalidParameterValue`] when the shifted timestamp falls outside what 48 bits of Unix
-/// milliseconds can hold, and an I/O error when the OS entropy source fails.
+/// milliseconds can hold or the clock has run past that limit, and an I/O error when the OS
+/// entropy source fails.
 pub(super) fn uuid_v7(shift: Option<&Interval>) -> Result<[u8; 16], Error> {
-    let mut tick = issue_tick();
+    let mut tick = issue_tick().ok_or_else(tick_out_of_range)?;
     if let Some(shift) = shift {
-        tick = shift_tick(tick, shift).ok_or_else(|| {
-            Error::InvalidParameterValue(
-                "uuidv7: the shifted timestamp is out of range for a UUID".to_owned(),
-            )
-        })?;
+        tick = shift_tick(tick, shift)?;
     }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes[8..]).map_err(|e| {
@@ -67,11 +65,20 @@ pub(super) fn uuid_v7(shift: Option<&Interval>) -> Result<[u8; 16], Error> {
             "entropy failure generating UUID: {e}"
         ))))
     })?;
-    Ok(encode_v7(tick, bytes))
+    encode_v7(tick, bytes).ok_or_else(tick_out_of_range)
+}
+
+/// A timestamp that a version 7 UUID cannot hold.
+fn tick_out_of_range() -> Error {
+    Error::InvalidParameterValue("uuidv7: the timestamp is out of range for a UUID".to_owned())
 }
 
 /// Lay out a version 7 UUID from a tick and a buffer whose bytes 8..16 already hold random data.
-fn encode_v7(tick: u64, mut bytes: [u8; 16]) -> [u8; 16] {
+/// `None` for a tick at or above [`TICK_LIMIT`], whose top bits the layout has no room for.
+fn encode_v7(tick: u64, mut bytes: [u8; 16]) -> Option<[u8; 16]> {
+    if tick >= TICK_LIMIT {
+        return None;
+    }
     let tick_bytes = (tick << 4).to_be_bytes();
     // The 48-bit millisecond count fills bytes 0..6.
     bytes[..6].copy_from_slice(&tick_bytes[..6]);
@@ -79,34 +86,37 @@ fn encode_v7(tick: u64, mut bytes: [u8; 16]) -> [u8; 16] {
     bytes[6] = 0x70 | (tick_bytes[6] >> 4);
     bytes[7] = (tick_bytes[6] << 4) | (tick_bytes[7] >> 4);
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
-    bytes
+    Some(bytes)
 }
 
 /// Take the next tick: the clock reading, or one past the last tick handed out when the clock has
-/// not moved beyond it.
-fn issue_tick() -> u64 {
+/// not moved beyond it. `None` once the next tick would reach [`TICK_LIMIT`]; the last tick is then
+/// left as it was, so no value is ever handed out twice.
+fn issue_tick() -> Option<u64> {
     let now = clock_tick();
     let mut last = LAST_TICK.load(Ordering::Acquire);
     loop {
-        let next = next_tick(last, now);
+        let next = next_tick(last, now).filter(|t| *t < TICK_LIMIT)?;
         match LAST_TICK.compare_exchange_weak(last, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return next,
+            Ok(_) => return Some(next),
             Err(current) => last = current,
         }
     }
 }
 
-/// The tick to hand out after `last` when the clock reads `now`: always strictly greater than `last`.
-const fn next_tick(last: u64, now: u64) -> u64 {
+/// The tick to hand out after `last` when the clock reads `now`: always strictly greater than
+/// `last`, or `None` when `last` is already the largest `u64`.
+const fn next_tick(last: u64, now: u64) -> Option<u64> {
     if now > last {
-        now
+        Some(now)
     } else {
-        last.saturating_add(1)
+        last.checked_add(1)
     }
 }
 
 /// The wall clock as a tick: milliseconds since the Unix epoch shifted left by [`FRACTION_BITS`],
-/// plus the sub-millisecond remainder scaled to that many bits. A clock before the epoch reads `0`.
+/// plus the sub-millisecond remainder scaled to that many bits. A clock before the epoch reads `0`;
+/// one too far ahead for a `u64` reads `u64::MAX`, which [`issue_tick`] refuses.
 fn clock_tick() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -118,22 +128,31 @@ fn clock_tick() -> u64 {
 
 /// Move `tick` by `shift`. Month and day parts follow the calendar from the tick's millisecond, and
 /// the change is applied in whole ticks so the fraction (and with it the order between values) is
-/// kept. `None` when the result does not fit in a UUID.
-fn shift_tick(tick: u64, shift: &Interval) -> Option<u64> {
+/// kept.
+///
+/// # Errors
+/// [`Error::DatetimeOverflow`] when the shifted instant leaves the timestamp range, and
+/// [`Error::InvalidParameterValue`] when it does not fit in a UUID.
+fn shift_tick(tick: u64, shift: &Interval) -> Result<u64, Error> {
     let base_micros = i64::try_from(tick >> FRACTION_BITS)
-        .ok()?
-        .checked_mul(1000)?;
+        .ok()
+        .and_then(|ms| ms.checked_mul(1000))
+        .ok_or_else(tick_out_of_range)?;
     let shifted_micros = crate::temporal::add_interval_to_micros(
         base_micros,
         shift.months,
         shift.days,
         shift.micros,
-    );
+    )
+    .ok_or_else(|| {
+        Error::DatetimeOverflow("uuidv7: the shifted timestamp is out of range".to_owned())
+    })?;
     let delta_micros = i128::from(shifted_micros) - i128::from(base_micros);
     let delta_ticks = (delta_micros * i128::from(1u16 << FRACTION_BITS)).div_euclid(1000);
     u64::try_from(i128::from(tick) + delta_ticks)
         .ok()
         .filter(|t| *t < TICK_LIMIT)
+        .ok_or_else(tick_out_of_range)
 }
 
 /// Whether `uuid` has the standard variant (`10` in the top bits of byte 8).
@@ -185,23 +204,23 @@ mod tests {
 
     #[test]
     fn next_tick_takes_the_clock_when_it_moved_forward() {
-        assert_eq!(next_tick(100, 250), 250);
+        assert_eq!(next_tick(100, 250), Some(250));
     }
 
     #[test]
     fn next_tick_counts_up_within_one_step() {
-        assert_eq!(next_tick(100, 100), 101);
+        assert_eq!(next_tick(100, 100), Some(101));
     }
 
     #[test]
     fn next_tick_counts_up_when_the_clock_moves_backwards() {
-        assert_eq!(next_tick(100, 40), 101);
+        assert_eq!(next_tick(100, 40), Some(101));
     }
 
     #[test]
     fn counter_carry_moves_into_the_millisecond_field() {
         let last = (5 << FRACTION_BITS) | 0x0fff;
-        let next = next_tick(last, last);
+        let next = next_tick(last, last).unwrap();
         assert_eq!(next >> FRACTION_BITS, 6);
         assert_eq!(next & 0x0fff, 0);
     }
@@ -209,7 +228,7 @@ mod tests {
     #[test]
     fn encode_lays_out_version_variant_and_fields() {
         let tick = (0x0123_4567_89ab << FRACTION_BITS) | 0x0cde;
-        let uuid = encode_v7(tick, [0xff; 16]);
+        let uuid = encode_v7(tick, [0xff; 16]).unwrap();
         assert_eq!(&uuid[..6], &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab]);
         assert_eq!(uuid[6], 0x7c);
         assert_eq!(uuid[7], 0xde);
@@ -278,8 +297,8 @@ mod tests {
             micros: 3_600_000_000,
         };
         assert_eq!(
-            shift_tick(tick, &hour),
-            Some(tick + (3_600_000 << FRACTION_BITS))
+            shift_tick(tick, &hour).unwrap(),
+            tick + (3_600_000 << FRACTION_BITS)
         );
         let back = Interval {
             months: 0,
@@ -287,8 +306,8 @@ mod tests {
             micros: 0,
         };
         assert_eq!(
-            shift_tick(tick, &back),
-            Some(tick - (86_400_000 << FRACTION_BITS))
+            shift_tick(tick, &back).unwrap(),
+            tick - (86_400_000 << FRACTION_BITS)
         );
     }
 
@@ -299,19 +318,19 @@ mod tests {
             days: 0,
             micros: 0,
         };
-        assert_eq!(shift_tick(1 << FRACTION_BITS, &far_back), None);
+        assert!(shift_tick(1 << FRACTION_BITS, &far_back).is_err());
         let far_ahead = Interval {
             months: 12 * 20_000,
             days: 0,
             micros: 0,
         };
-        assert_eq!(shift_tick(1 << FRACTION_BITS, &far_ahead), None);
+        assert!(shift_tick(1 << FRACTION_BITS, &far_ahead).is_err());
         assert!(uuid_v7(Some(&far_back)).is_err());
     }
 
     #[test]
     fn extract_reads_back_version_and_timestamp() {
-        let uuid = encode_v7((1_700_000_000_123 << FRACTION_BITS) | 0x0abc, [0; 16]);
+        let uuid = encode_v7((1_700_000_000_123 << FRACTION_BITS) | 0x0abc, [0; 16]).unwrap();
         assert_eq!(extract_version(&uuid), Some(7));
         assert_eq!(extract_timestamp_micros(&uuid), Some(1_700_000_000_123_000));
     }
@@ -334,9 +353,36 @@ mod tests {
         v4[8] = 0x80;
         assert_eq!(extract_version(&v4), Some(4));
         assert_eq!(extract_timestamp_micros(&v4), None);
-        let mut other_variant = encode_v7(1 << FRACTION_BITS, [0; 16]);
+        let mut other_variant = encode_v7(1 << FRACTION_BITS, [0; 16]).unwrap();
         other_variant[8] = 0xc0;
         assert_eq!(extract_version(&other_variant), None);
         assert_eq!(extract_timestamp_micros(&other_variant), None);
+    }
+
+    #[test]
+    fn a_tick_past_the_layout_is_refused() {
+        assert!(encode_v7(TICK_LIMIT - 1, [0; 16]).is_some());
+        assert_eq!(encode_v7(TICK_LIMIT, [0; 16]), None);
+        assert_eq!(encode_v7(u64::MAX, [0; 16]), None);
+    }
+
+    #[test]
+    fn the_counter_never_repeats_at_the_top_of_u64() {
+        // A clock stuck at the largest reading: the first call may take it, the next must refuse
+        // rather than hand out the same tick again.
+        assert_eq!(next_tick(u64::MAX - 1, u64::MAX), Some(u64::MAX));
+        assert_eq!(next_tick(u64::MAX, u64::MAX), None);
+        assert_eq!(next_tick(u64::MAX, 5), None);
+    }
+
+    #[test]
+    fn a_shift_that_overflows_the_timestamp_range_is_a_datetime_error() {
+        let huge = Interval {
+            months: 0,
+            days: -2_147_483_647,
+            micros: 9_223_369_036_800_000_000,
+        };
+        let err = shift_tick(1_700_000_000_000 << FRACTION_BITS, &huge).unwrap_err();
+        assert_eq!(err.sqlstate(), "22008");
     }
 }

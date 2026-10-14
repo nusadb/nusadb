@@ -1,0 +1,91 @@
+# ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (expr) STORED computes the column for every
+# existing row, recomputes it on every write, and refuses an explicit value.
+
+statement ok
+CREATE TABLE ag (id INT PRIMARY KEY, x INT)
+
+statement ok
+INSERT INTO ag VALUES (1, 5), (2, 7)
+
+statement ok
+ALTER TABLE ag ADD COLUMN g INT GENERATED ALWAYS AS (x * 2) STORED
+
+statement ok
+INSERT INTO ag (id, x) VALUES (3, 9)
+
+statement ok
+UPDATE ag SET x = 6 WHERE id = 1
+
+query III
+SELECT id, x, g FROM ag ORDER BY id
+----
+1 6 12
+2 7 14
+3 9 18
+
+statement error generated column
+INSERT INTO ag VALUES (4, 1, 1)
+
+statement error generated column
+UPDATE ag SET g = 0
+
+statement error unsupported SQL construct
+ALTER TABLE ag ADD COLUMN s SERIAL
+
+statement error unsupported SQL construct
+ALTER TABLE ag ADD COLUMN v INT GENERATED ALWAYS AS (x) VIRTUAL
+
+# A partitioned table: every partition gets the column, and reads through the parent see it.
+
+statement ok
+CREATE TABLE agp (k INT, v INT) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE agp1 PARTITION OF agp FOR VALUES FROM (0) TO (10)
+
+statement ok
+CREATE TABLE agp2 PARTITION OF agp FOR VALUES FROM (10) TO (20)
+
+statement ok
+INSERT INTO agp VALUES (1, 1), (15, 2)
+
+statement ok
+ALTER TABLE agp ADD COLUMN g INT GENERATED ALWAYS AS (v * 10) STORED
+
+statement ok
+INSERT INTO agp (k, v) VALUES (2, 3), (16, 4)
+
+query III
+SELECT k, v, g FROM agp ORDER BY k
+----
+1 1 10
+2 3 30
+15 2 20
+16 4 40
+
+# Inheritance: the child gets the column, computed for its rows too.
+
+statement ok
+CREATE TABLE agparent (a INT)
+
+statement ok
+CREATE TABLE agchild (b INT) INHERITS (agparent)
+
+statement ok
+INSERT INTO agparent VALUES (1)
+
+statement ok
+INSERT INTO agchild VALUES (2, 20)
+
+statement ok
+ALTER TABLE agparent ADD COLUMN g INT GENERATED ALWAYS AS (a + 1000) STORED
+
+statement ok
+INSERT INTO agchild (a, b) VALUES (3, 30)
+
+query II
+SELECT a, g FROM agparent ORDER BY a
+----
+1 1001
+2 1002
+3 1003

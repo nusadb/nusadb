@@ -3089,12 +3089,41 @@ pub(super) fn rewrite_add_column(
 ) -> Result<(), Error> {
     let mut new_types = old_types.to_vec();
     new_types.push(column.ty);
+    let key = super::coldefault::catalog_key(&table.schema, &table.name);
+    // A STORED generated column is computed from each row's other columns, so existing rows are
+    // backfilled row by row; every later write recomputes it from the sentinel persisted below.
+    if let Some(generated) = &column.generated {
+        let expr = generated_add_column_expr(table, column, &generated.sql, engine, txn)?;
+        super::coldefault::set_default(
+            &key,
+            &column.name,
+            &super::coldefault::generated_default_sql(&generated.sql),
+            engine,
+            txn,
+        )?;
+        let index_targets = dml::secondary_index_targets(table, engine)?;
+        for (tid, mut row) in scan_table(table, engine, txn)? {
+            row.push(ast::Value::Null);
+            let value = eval::eval(&expr, &row)?;
+            if !column.nullable && matches!(value, ast::Value::Null) {
+                return Err(Error::NotNullViolation {
+                    column: column.name.clone(),
+                });
+            }
+            if let Some(slot) = row.last_mut() {
+                *slot = value;
+            }
+            let bytes = row::encode(&row, &new_types)?;
+            let new_tid = engine.update(txn, table.id, tid, &bytes)?;
+            dml::insert_into_indexes(&index_targets, &row, new_tid, engine, txn)?;
+        }
+        return Ok(());
+    }
     // The value existing rows get for the new column: its `DEFAULT <expr>` evaluated once (a
     // default references no other column, so it is a constant across rows), else `NULL`
     // (the reference engine backfills existing rows with the default, e.g.
-    // `ADD COLUMN b INT DEFAULT 9` fills every old row with 9, not NULL). Generated / SERIAL
-    // columns use their own fields, mutually exclusive with an explicit `DEFAULT`, and are not
-    // reached here.
+    // `ADD COLUMN b INT DEFAULT 9` fills every old row with 9, not NULL). SERIAL columns are
+    // refused by the analyzer and never reach here.
     let backfill = match &column.default_sql {
         Some(sql) => {
             let typed =
@@ -3115,10 +3144,10 @@ pub(super) fn rewrite_add_column(
             column: column.name.clone(),
         });
     }
-    // Persist the default so a later `INSERT` that omits the column also gets it (parity with the reference engine), the
-    // same catalog the SET DEFAULT / CREATE TABLE paths use.
+    // Persist the default so a later `INSERT` that omits the column also gets it (parity with the
+    // reference engine), under the same schema-qualified key the insert path reads.
     if let Some(sql) = &column.default_sql {
-        super::coldefault::set_default(&table.name, &column.name, sql, engine, txn)?;
+        super::coldefault::set_default(&key, &column.name, sql, engine, txn)?;
     }
     // Re-index every rewritten row version: the rewrite supersedes each row under a new
     // tid, so without fresh entries every index of the table would lose all its rows to the
@@ -3131,6 +3160,47 @@ pub(super) fn rewrite_add_column(
         dml::insert_into_indexes(&index_targets, &row, new_tid, engine, txn)?;
     }
     Ok(())
+}
+
+/// The typed generation expression of a STORED generated column being added to `table`, analyzed
+/// against the table with the new column appended (so it evaluates over a row of the new width).
+/// As at `CREATE TABLE`, it may read only the table's ordinary columns: neither another generated
+/// column nor the new column itself.
+fn generated_add_column_expr(
+    table: &TableSchema,
+    column: &ast::ColumnDef,
+    expr_sql: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<crate::planner::TypedExpr, Error> {
+    let mut widened = table.clone();
+    widened.columns.push(ColumnDef {
+        name: column.name.clone(),
+        ty: column.ty,
+        nullable: column.nullable,
+    });
+    let expr = crate::analyzer::analyze_generated_expr(
+        expr_sql,
+        &widened,
+        column.ty,
+        &super::dml::EmptyCatalog,
+    )?;
+    let generated = super::coldefault::generated_column_ordinals(table, engine, txn)?;
+    let mut reads = Vec::new();
+    crate::planner::collect_columns(&expr, &mut reads);
+    if let Some(&bad) = reads
+        .iter()
+        .find(|&&ordinal| ordinal >= table.columns.len() || generated.contains(&ordinal))
+    {
+        return Err(Error::ColumnNotFound {
+            table: table.name.clone(),
+            column: widened
+                .columns
+                .get(bad)
+                .map_or_else(String::new, |c| c.name.clone()),
+        });
+    }
+    Ok(expr)
 }
 
 /// Drop the column at `index` from every stored row and re-encode under the

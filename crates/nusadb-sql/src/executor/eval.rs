@@ -595,20 +595,28 @@ fn eval_scalar_function(
                 "GROUPING is only allowed in an aggregated query with GROUP BY".to_owned(),
             ));
         },
-        F::Now | F::CurrentTimestamp | F::StatementTimestamp => {
+        // `NOW()`, `TRANSACTION_TIMESTAMP()` and `CURRENT_TIMESTAMP` read the transaction's start;
+        // `STATEMENT_TIMESTAMP()` reads the client statement's start.
+        F::Now | F::CurrentTimestamp => {
+            return Ok(ast::Value::TimestampTz(
+                super::clock::transaction_now_micros(),
+            ));
+        },
+        F::StatementTimestamp => {
             return Ok(ast::Value::TimestampTz(super::clock::statement_now_micros()));
         },
-        // The calendar-reading clock built-ins observe the session-local wall clock (the pinned
-        // instant shifted by the session zone); `CURRENT_TIME` carries the zone (a `timetz`).
+        // The calendar-reading clock built-ins observe the session-local wall clock (the
+        // transaction instant shifted by the session zone); `CURRENT_TIME` carries the zone (a
+        // `timetz`).
         F::CurrentDate => {
-            let wall = super::clock::statement_now_micros().saturating_add(session_zone_micros());
+            let wall = super::clock::transaction_now_micros().saturating_add(session_zone_micros());
             let days = wall.div_euclid(super::clock::MICROS_PER_DAY);
             return Ok(ast::Value::Date(
                 i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX }),
             ));
         },
         F::CurrentTime => {
-            let wall = super::clock::statement_now_micros().saturating_add(session_zone_micros());
+            let wall = super::clock::transaction_now_micros().saturating_add(session_zone_micros());
             return Ok(ast::Value::TimeTz(crate::temporal::pack_timetz(
                 wall.rem_euclid(super::clock::MICROS_PER_DAY),
                 super::statement_tz_offset_secs(),
@@ -616,7 +624,13 @@ fn eval_scalar_function(
         },
         F::LocalTimestamp => {
             return Ok(ast::Value::Timestamp(
-                super::clock::statement_now_micros().saturating_add(session_zone_micros()),
+                super::clock::transaction_now_micros().saturating_add(session_zone_micros()),
+            ));
+        },
+        F::LocalTime => {
+            let wall = super::clock::transaction_now_micros().saturating_add(session_zone_micros());
+            return Ok(ast::Value::Time(
+                wall.rem_euclid(super::clock::MICROS_PER_DAY),
             ));
         },
         // The niladic session-user built-ins read the statement's pinned session user.
@@ -1164,7 +1178,8 @@ fn eval_scalar_function(
         },
         (F::MakeTimestamptz, [Int(y), Int(mo), Int(d), Int(h), Int(mi), Int(s)]) => {
             crate::temporal::make_timestamp(*y, *mo, *d, *h, *mi, *s)
-                .map(|wall| ast::Value::TimestampTz(wall.saturating_sub(session_zone_micros())))
+                .and_then(|wall| wall.checked_sub(session_zone_micros()))
+                .map(ast::Value::TimestampTz)
                 .ok_or_else(|| {
                     Error::DatetimeOverflow(format!(
                         "make_timestamptz(): {y}-{mo}-{d} {h}:{mi}:{s} is not valid"
@@ -1183,22 +1198,29 @@ fn eval_scalar_function(
             // The seconds field is FLOAT, but a coerced INT or a NUMERIC literal (e.g. `1.5`) can also
             // reach here since both widen to FLOAT at the call site without an inserted cast.
             let secs = fields.get(6).map_or(0.0, to_f64);
-            ast::Value::Interval(crate::interval::Interval::make(
-                int_at(0),
-                int_at(1),
-                int_at(2),
-                int_at(3),
-                int_at(4),
-                int_at(5),
-                secs,
-            ))
+            ast::Value::Interval(
+                crate::interval::Interval::make(
+                    int_at(0),
+                    int_at(1),
+                    int_at(2),
+                    int_at(3),
+                    int_at(4),
+                    int_at(5),
+                    secs,
+                )
+                .ok_or_else(interval_overflow)?,
+            )
         },
         // JUSTIFY_DAYS / JUSTIFY_HOURS / JUSTIFY_INTERVAL(interval) — roll 30 days → 1 month and/or
         // 24 hours → 1 day, keeping each lower field signed and in range.
-        (F::JustifyDays, [ast::Value::Interval(iv)]) => ast::Value::Interval(iv.justify_days()),
-        (F::JustifyHours, [ast::Value::Interval(iv)]) => ast::Value::Interval(iv.justify_hours()),
+        (F::JustifyDays, [ast::Value::Interval(iv)]) => {
+            ast::Value::Interval(iv.justify_days().ok_or_else(interval_overflow)?)
+        },
+        (F::JustifyHours, [ast::Value::Interval(iv)]) => {
+            ast::Value::Interval(iv.justify_hours().ok_or_else(interval_overflow)?)
+        },
         (F::JustifyInterval, [ast::Value::Interval(iv)]) => {
-            ast::Value::Interval(iv.justify_interval())
+            ast::Value::Interval(iv.justify_interval().ok_or_else(interval_overflow)?)
         },
         // SCALE / MIN_SCALE(numeric) → int; TRIM_SCALE(numeric) → numeric. An INT argument
         // coerces to a scale-0 decimal, so all three are zero-scale for it.
@@ -1746,9 +1768,18 @@ fn date_trunc_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> 
         _ => return Ok(V::Null),
     };
     let shift = if is_tz { session_zone_micros() } else { 0 };
-    let truncated = crate::temporal::date_trunc_micros(field, micros.saturating_add(shift))
-        .ok_or_else(unsupported)?
-        .saturating_sub(shift);
+    let wall = micros.checked_add(shift).ok_or_else(timestamp_overflow)?;
+    let truncated = crate::temporal::date_trunc_micros(field, wall)
+        .ok_or_else(|| {
+            // A field that truncates the epoch is a known one: the instant itself is out of range.
+            if crate::temporal::date_trunc_micros(field, 0).is_some() {
+                timestamp_overflow()
+            } else {
+                unsupported()
+            }
+        })?
+        .checked_sub(shift)
+        .ok_or_else(timestamp_overflow)?;
     Ok(if is_tz {
         V::TimestampTz(truncated)
     } else {
@@ -1756,20 +1787,20 @@ fn date_trunc_value(field: &str, src: &ast::Value) -> Result<ast::Value, Error> 
     })
 }
 
-/// `AGE(end, start)` → `end - start`; `AGE(value)` → statement date (midnight) `- value`. The
+/// `AGE(end, start)` → `end - start`; `AGE(value)` → current date (midnight) `- value`. The
 /// result is a calendar `Interval`.
 fn age_value(end: &ast::Value, start: Option<&ast::Value>) -> Result<ast::Value, Error> {
     let (end_micros, start_micros) = if let Some(start) = start {
         (temporal_to_micros(end)?, temporal_to_micros(start)?)
     } else {
         // "Today" is the session zone's calendar day (like CURRENT_DATE), at its midnight.
-        let wall_now = super::clock::statement_now_micros().saturating_add(session_zone_micros());
+        let wall_now = super::clock::transaction_now_micros().saturating_add(session_zone_micros());
         let today = {
             let days = wall_now.div_euclid(super::clock::MICROS_PER_DAY);
             i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX })
         };
         let today_midnight = super::clock::day_start_micros(today).ok_or_else(|| {
-            Error::DatetimeOverflow("AGE(): statement date out of range".to_owned())
+            Error::DatetimeOverflow("AGE(): current date out of range".to_owned())
         })?;
         (today_midnight, temporal_to_micros(end)?)
     };
@@ -1871,7 +1902,9 @@ fn temporal_to_micros(v: &ast::Value) -> Result<i64, Error> {
             .ok_or_else(|| Error::DatetimeOverflow("AGE(): date out of range".to_owned())),
         V::Timestamp(m) => Ok(*m),
         // An instant is read on the session-local wall clock — AGE compares calendar fields.
-        V::TimestampTz(m) => Ok(m.saturating_add(session_zone_micros())),
+        V::TimestampTz(m) => m
+            .checked_add(session_zone_micros())
+            .ok_or_else(timestamp_overflow),
         _ => Err(Error::FunctionArgs(
             "AGE() requires a date or timestamp argument".to_owned(),
         )),
@@ -2223,9 +2256,10 @@ fn to_timestamp_value(text: &str, fmt: &str) -> Result<ast::Value, Error> {
             ty: nusadb_core::ColumnType::TimestampTz,
             value: text.to_owned(),
         })?;
-    Ok(ast::Value::TimestampTz(
-        micros.saturating_sub(session_zone_micros()),
-    ))
+    micros
+        .checked_sub(session_zone_micros())
+        .map(ast::Value::TimestampTz)
+        .ok_or_else(timestamp_overflow)
 }
 
 /// `to_timestamp(epoch_seconds)` — a UNIX epoch (seconds since 1970-01-01 UTC, fractional allowed)
@@ -4917,18 +4951,22 @@ pub(crate) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         // TIMESTAMP ↔ TIMESTAMPTZ move through the session-local wall clock: an instant becomes
         // the wall time the session zone shows for it, and a wall time is read as being in the
         // session zone. Under the default UTC both are the identity.
-        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => Ok(ast::Value::Timestamp(
-            t.saturating_add(session_zone_micros()),
-        )),
-        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => Ok(ast::Value::TimestampTz(
-            t.saturating_sub(session_zone_micros()),
-        )),
+        (ast::Value::TimestampTz(t), ColumnType::Timestamp) => t
+            .checked_add(session_zone_micros())
+            .map(ast::Value::Timestamp)
+            .ok_or_else(timestamp_overflow),
+        (ast::Value::Timestamp(t), ColumnType::TimestampTz) => t
+            .checked_sub(session_zone_micros())
+            .map(ast::Value::TimestampTz)
+            .ok_or_else(timestamp_overflow),
         (ast::Value::Timestamp(t), ColumnType::Date) => i32::try_from(t.div_euclid(MICROS_PER_DAY))
             .map(ast::Value::Date)
             .map_err(|_| invalid_cast(&t.to_string(), ColumnType::Date)),
         // An instant's date / time-of-day are its session-local wall-clock fields.
         (ast::Value::TimestampTz(t), ColumnType::Date) => {
-            let wall = t.saturating_add(session_zone_micros());
+            let wall = t
+                .checked_add(session_zone_micros())
+                .ok_or_else(timestamp_overflow)?;
             i32::try_from(wall.div_euclid(MICROS_PER_DAY))
                 .map(ast::Value::Date)
                 .map_err(|_| invalid_cast(&wall.to_string(), ColumnType::Date))
@@ -4936,17 +4974,18 @@ pub(crate) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
         (ast::Value::Timestamp(t), ColumnType::Time) => {
             Ok(ast::Value::Time(t.rem_euclid(MICROS_PER_DAY)))
         },
-        (ast::Value::TimestampTz(t), ColumnType::Time) => Ok(ast::Value::Time(
-            t.saturating_add(session_zone_micros())
-                .rem_euclid(MICROS_PER_DAY),
-        )),
+        (ast::Value::TimestampTz(t), ColumnType::Time) => t
+            .checked_add(session_zone_micros())
+            .map(|wall| ast::Value::Time(wall.rem_euclid(MICROS_PER_DAY)))
+            .ok_or_else(timestamp_overflow),
         (ast::Value::Date(d), ColumnType::Timestamp) => i64::from(*d)
             .checked_mul(MICROS_PER_DAY)
             .map(ast::Value::Timestamp)
             .ok_or_else(|| invalid_cast(&crate::temporal::format_date(*d), ColumnType::Timestamp)),
         (ast::Value::Date(d), ColumnType::TimestampTz) => i64::from(*d)
             .checked_mul(MICROS_PER_DAY)
-            .map(|midnight| ast::Value::TimestampTz(midnight.saturating_sub(session_zone_micros())))
+            .and_then(|midnight| midnight.checked_sub(session_zone_micros()))
+            .map(ast::Value::TimestampTz)
             .ok_or_else(|| {
                 invalid_cast(&crate::temporal::format_date(*d), ColumnType::TimestampTz)
             }),
@@ -7559,6 +7598,16 @@ fn apply_comparison(op: ast::BinaryOp, left: &ast::Value, right: &ast::Value) ->
 /// Microseconds in a day (for DATE → micros promotion in interval arithmetic).
 const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
+/// A temporal result outside the timestamp range (`22008`).
+fn timestamp_overflow() -> Error {
+    Error::DatetimeOverflow("timestamp out of range".to_owned())
+}
+
+/// An interval result whose months, days or microseconds do not fit their field (`22008`).
+pub(super) fn interval_overflow() -> Error {
+    Error::DatetimeOverflow("INTERVAL arithmetic overflow".to_owned())
+}
+
 /// `interval * number` (either order) and `interval / number`, or `None` when the operands are not
 /// such a pair. An integer factor scales each field exactly; a float or numeric factor, and every
 /// divisor, scales fractionally and carries the fractions down (`INTERVAL '1 month' * 1.5` is
@@ -7574,7 +7623,7 @@ fn interval_scale_op(
     right: &ast::Value,
 ) -> Option<Result<ast::Value, Error>> {
     use ast::Value::{Float, Int, Interval, Numeric};
-    let overflow = || Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned());
+    let overflow = interval_overflow;
     if op == ast::BinaryOp::Multiply {
         let (iv, factor) = match (left, right) {
             (Interval(iv), Int(n)) | (Int(n), Interval(iv)) => {
@@ -7619,7 +7668,7 @@ fn interval_arith(
     right: &ast::Value,
 ) -> Option<Result<ast::Value, Error>> {
     use ast::Value::{Date, Int, Interval, Time, Timestamp, TimestampTz};
-    let overflow = || Error::ArgumentOutOfDomain("INTERVAL arithmetic overflow".to_owned());
+    let overflow = interval_overflow;
     if matches!(op, ast::BinaryOp::Multiply | ast::BinaryOp::Divide) {
         return interval_scale_op(op, left, right);
     }
@@ -7671,16 +7720,22 @@ fn interval_arith(
         },
         _ => {},
     }
-    // The interval applied to a temporal, with sign per `op` (negation can itself overflow).
+    // The interval applied to a temporal, with sign per `op` (negation can itself overflow). A
+    // result outside the timestamp range is an error, never a clamped instant.
     let apply = |ts: i64, iv: &crate::interval::Interval| -> Result<i64, Error> {
         let iv = if add {
             *iv
         } else {
             iv.checked_neg().ok_or_else(overflow)?
         };
-        Ok(crate::temporal::add_interval_to_micros(
-            ts, iv.months, iv.days, iv.micros,
-        ))
+        crate::temporal::add_interval_to_micros(ts, iv.months, iv.days, iv.micros)
+            .ok_or_else(timestamp_overflow)
+    };
+    // A DATE operand is taken at its midnight.
+    let midnight = |d: i32| -> Result<i64, Error> {
+        i64::from(d)
+            .checked_mul(MICROS_PER_DAY)
+            .ok_or_else(timestamp_overflow)
     };
     match (left, right) {
         (Interval(a), Interval(b)) => Some(
@@ -7694,12 +7749,12 @@ fn interval_arith(
         ),
         (Timestamp(t), Interval(iv)) => Some(apply(*t, iv).map(Timestamp)),
         (TimestampTz(t), Interval(iv)) => Some(apply(*t, iv).map(TimestampTz)),
-        (Date(d), Interval(iv)) => Some(apply(i64::from(*d) * MICROS_PER_DAY, iv).map(Timestamp)),
+        (Date(d), Interval(iv)) => Some(midnight(*d).and_then(|ts| apply(ts, iv)).map(Timestamp)),
         // `interval + temporal` (commutative; only for `+`).
         (Interval(iv), Timestamp(t)) if add => Some(apply(*t, iv).map(Timestamp)),
         (Interval(iv), TimestampTz(t)) if add => Some(apply(*t, iv).map(TimestampTz)),
         (Interval(iv), Date(d)) if add => {
-            Some(apply(i64::from(*d) * MICROS_PER_DAY, iv).map(Timestamp))
+            Some(midnight(*d).and_then(|ts| apply(ts, iv)).map(Timestamp))
         },
         // `time ± interval` wraps within the 24-hour clock, using only the interval's sub-day
         // microseconds — a whole-day (or month) component contributes nothing to a clock time,
@@ -9096,7 +9151,7 @@ mod tests {
 
     #[test]
     fn now_returns_a_timestamptz() {
-        super::super::clock::set_statement_now();
+        let _clock = super::super::clock::enter_statement(nusadb_core::TxnId(1));
         let v = eval(
             &scalar(ScalarFunc::Now, vec![], ColumnType::TimestampTz),
             &vec![],
@@ -9115,7 +9170,7 @@ mod tests {
         // agree on one instant (SQL statement stability). Pin the default UTC zone: another test
         // on this thread may have left a non-zero session-zone pin behind.
         super::super::session_ctx::pin_statement_timezone(None);
-        super::super::clock::set_statement_now();
+        let _clock = super::super::clock::enter_statement(nusadb_core::TxnId(1));
         let now1 = eval(
             &scalar(ScalarFunc::Now, vec![], ColumnType::TimestampTz),
             &vec![],

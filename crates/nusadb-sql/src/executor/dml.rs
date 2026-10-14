@@ -2351,6 +2351,9 @@ pub(super) fn run_copy_from(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<usize, Error> {
+    // A column DEFAULT such as `now()` reads the statement clock, which COPY pins like any
+    // statement (it runs outside `dispatch`).
+    let _clock = super::clock::enter_statement(txn);
     let table = lookup_copy_table(copy, engine, txn)?;
     let columns = resolve_copy_columns(copy, &table)?;
     let target_types: Vec<ColumnType> = columns
@@ -2531,6 +2534,7 @@ pub(super) fn run_copy_to(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(usize, usize, Vec<u8>), Error> {
+    let _clock = super::clock::enter_statement(txn);
     // `COPY (<query>) TO STDOUT`: analyze + plan + run the query as the COPY user (so it is checked
     // for privileges and row-level security exactly like a direct SELECT), then render its result.
     if let Some(query) = &copy.query {

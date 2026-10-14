@@ -363,6 +363,8 @@ pub(super) fn analyze_create_index(
                 "a partial index predicate may not contain a subquery".to_owned(),
             ));
         }
+        // Only new DDL is checked: an index already in the catalog keeps loading and working.
+        super::require_immutable(&typed, "index predicate")?;
     }
     let vector = if ci.using.as_deref() == Some("hnsw") {
         Some(analyze_hnsw_index(&ci, &table)?)
@@ -435,7 +437,10 @@ fn validate_index_key_expr(
             "a functional index key may not contain a subquery".to_owned(),
         ));
     }
-    Ok(())
+    // A key must map a row to the same value whenever it is computed, or a lookup misses the entry
+    // written for it. Checked only here, at `CREATE INDEX`: an index already in the catalog keeps
+    // loading and being maintained.
+    super::require_immutable(&typed, "index expression")
 }
 
 /// Validate a `USING hnsw` vector index: exactly one `VECTOR(n)` key column, no `UNIQUE`,

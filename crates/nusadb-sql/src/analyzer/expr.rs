@@ -1722,6 +1722,7 @@ pub(super) fn analyze_scalar_function(
         // CURRENT_TIME carries the session zone (a `timetz`), like the reference engine.
         F::CurrentTime => ScalarSig::Fixed(&[], &[], ColumnType::TimeTz),
         F::LocalTimestamp => ScalarSig::Fixed(&[], &[], ColumnType::Timestamp),
+        F::LocalTime => ScalarSig::Fixed(&[], &[], ColumnType::Time),
         // Niladic session-user / system built-ins → TEXT. `current_setting` is grouped
         // above with the string functions.
         F::CurrentUser | F::SessionUser | F::Version | F::CurrentDatabase | F::CurrentSchema => {

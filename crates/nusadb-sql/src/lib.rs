@@ -74,9 +74,10 @@ pub use executor::{
     lookup_composite_column, lookup_enum, lookup_enum_column, lookup_function_definition,
     lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
     maintenance_work_mem, parse_work_mem, partition_key_columns, partitions_to_prune,
-    pin_statement_timezone, purge_schema_catalogs, release_advisory_locks, rls_table_enabled,
-    set_maintenance_work_mem, set_spill_config, set_work_mem, show_session_variable,
-    statement_tz_offset_secs, view_has_instead_of_trigger, work_mem,
+    pin_statement_timezone, pin_transaction_start, purge_schema_catalogs, release_advisory_locks,
+    rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_work_mem,
+    show_session_variable, stamp_transaction_start, statement_tz_offset_secs,
+    view_has_instead_of_trigger, wall_clock_micros, work_mem,
 };
 
 /// The bootstrap database superuser, which bypasses row-level security.
@@ -104,6 +105,15 @@ pub const CONNECTION_DATABASE_SETTING: &str = "\u{0}conn_database";
 /// connection owns. The leading NUL keeps the key out of normal identifier space, so a client `SET`
 /// can never forge or read it.
 pub const CONNECTION_TEMP_SCHEMA_SETTING: &str = "\u{0}conn_temp_schema";
+
+/// The reserved settings-snapshot key carrying the start of the connection's open transaction
+/// block, written by [`stamp_transaction_start`].
+///
+/// `NOW()`, `CURRENT_TIMESTAMP` and the other transaction-time functions report this instant in
+/// every statement of the block. The value names the transaction it belongs to, and a statement
+/// running under any other transaction ignores it. The leading NUL keeps the key out of reach of a
+/// client `SET`.
+pub const TRANSACTION_START_SETTING: &str = "\u{0}txn_start";
 
 /// The ordered list of schemas an unqualified name resolves through, derived from a `search_path`
 /// GUC value — the heart of search-path name resolution.

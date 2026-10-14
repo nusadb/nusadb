@@ -1503,7 +1503,9 @@ fn expr_all(expr: &TypedExpr, ok: &dyn Fn(&TypedExpr) -> bool) -> bool {
         | K::Exists { .. }
         | K::InSubquery { .. }
         | K::QuantifiedSubquery { .. } => false,
-        K::ScalarFunction { func, args } => !is_volatile_scalar_func(*func) && args.iter().all(all),
+        K::ScalarFunction { func, args } => {
+            !is_volatile_scalar_func(*func, args.len()) && args.iter().all(all)
+        },
         K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {
             all(left) && all(right)
         },
@@ -1541,42 +1543,167 @@ fn expr_all(expr: &TypedExpr, ok: &dyn Fn(&TypedExpr) -> bool) -> bool {
     }
 }
 
-/// Whether a scalar built-in is volatile (a fresh/contextual value per evaluation), so a view using
-/// it cannot be incrementally maintained and an index keyed on it cannot answer a lookup. The same
-/// built-ins the result cache refuses to memoize (`VOLATILE_PLAN_MARKERS` in the executor).
-const fn is_volatile_scalar_func(func: ast::ScalarFunc) -> bool {
+/// How far a built-in's result can move between two calls with the same arguments.
+///
+/// Ordered from most to least predictable, so the volatility of an expression is the maximum over
+/// the functions it calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Volatility {
+    /// The same arguments always give the same result, in every session and forever. Only these
+    /// may appear in an index key, an index predicate or a generated column.
+    Immutable,
+    /// Fixed for the duration of a statement or transaction, but may differ between transactions
+    /// or sessions: the transaction clock (`now()`, `current_date`), the session user and
+    /// settings, the one-argument `age()`.
+    Stable,
+    /// May change on every call: `random()`, `clock_timestamp()`, the UUID generators, the
+    /// sequence and advisory-lock functions.
+    Volatile,
+}
+
+/// The [`Volatility`] of built-in `func` called with `arity` arguments.
+pub(crate) const fn scalar_func_volatility(func: ast::ScalarFunc, arity: usize) -> Volatility {
     use ast::ScalarFunc as F;
-    matches!(
-        func,
+    match func {
+        F::ClockTimestamp
+        | F::Random
+        | F::Setseed
+        | F::UuidGenerateV4
+        | F::UuidGenerateV7
+        | F::SequenceNext
+        | F::SequenceCurrent
+        | F::SequenceSet
+        | F::TryAdvisoryLock
+        | F::AdvisoryUnlock
+        | F::AdvisoryUnlockAll => Volatility::Volatile,
         F::Now
-            | F::StatementTimestamp
-            | F::ClockTimestamp
-            | F::LocalTimestamp
-            | F::SequenceNext
-            | F::SequenceCurrent
-            | F::SequenceSet
-            | F::TryAdvisoryLock
-            | F::AdvisoryUnlock
-            | F::AdvisoryUnlockAll
-            | F::CurrentTimestamp
-            | F::CurrentDate
-            | F::CurrentTime
-            // `AGE(value)` (one-argument) is relative to the current date, so a view projecting it
-            // cannot be incrementally maintained: stored rows would keep the age computed at insert
-            // time and drift stale across days. Mirrors the result-cache volatility list so the two
-            // denylists do not disagree.
-            | F::Age
-            | F::CurrentUser
-            | F::SessionUser
-            | F::CurrentSetting
-            | F::Random
-            | F::Setseed
-            | F::UuidGenerateV4
-            | F::UuidGenerateV7
-            | F::Version
-            | F::CurrentDatabase
-            | F::CurrentSchema
-    )
+        | F::StatementTimestamp
+        | F::LocalTimestamp
+        | F::LocalTime
+        | F::CurrentTimestamp
+        | F::CurrentDate
+        | F::CurrentTime
+        | F::CurrentUser
+        | F::SessionUser
+        | F::CurrentSetting
+        | F::Version
+        | F::CurrentDatabase
+        | F::CurrentSchema => Volatility::Stable,
+        // `AGE(value)` measures from the current date; `AGE(end, start)` reads only its arguments.
+        F::Age if arity == 1 => Volatility::Stable,
+        _ => Volatility::Immutable,
+    }
+}
+
+/// Whether a scalar built-in is anything but immutable, so a view using it cannot be incrementally
+/// maintained and an index keyed on it cannot answer a lookup. Kept in step with the result cache's
+/// `VOLATILE_PLAN_MARKERS` in the executor.
+const fn is_volatile_scalar_func(func: ast::ScalarFunc, arity: usize) -> bool {
+    !matches!(scalar_func_volatility(func, arity), Volatility::Immutable)
+}
+
+/// The least predictable built-in `expr` calls, and its name: `None` when every built-in in it is
+/// immutable. User-defined functions carry no volatility marking and are not counted.
+pub(crate) fn expr_volatility(expr: &TypedExpr) -> Option<(Volatility, &'static str)> {
+    use crate::planner::TypedExprKind as K;
+    let mut worst: Option<(Volatility, &'static str)> = None;
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        if let K::ScalarFunction { func, args } = &node.kind {
+            let class = scalar_func_volatility(*func, args.len());
+            if class != Volatility::Immutable && worst.is_none_or(|(w, _)| class > w) {
+                worst = Some((class, func.name()));
+            }
+        }
+        push_children(node, &mut stack);
+    }
+    worst
+}
+
+/// Push every direct child expression of `node` onto `stack` (subquery bodies excluded: they are
+/// refused wherever volatility is checked).
+fn push_children<'e>(node: &'e TypedExpr, stack: &mut Vec<&'e TypedExpr>) {
+    use crate::planner::TypedExprKind as K;
+    match &node.kind {
+        K::Literal(_)
+        | K::Column(_)
+        | K::OuterColumn { .. }
+        | K::AggregateRef(_)
+        | K::ScalarSubquery(_)
+        | K::Exists { .. } => {},
+        K::Binary { left, right, .. } | K::IsDistinctFrom { left, right, .. } => {
+            stack.extend([&**left, &**right]);
+        },
+        K::Unary { expr, .. }
+        | K::IsNull { expr, .. }
+        | K::IsJson { operand: expr, .. }
+        | K::IsBool { expr, .. }
+        | K::Cast(expr, _)
+        | K::InSubquery { expr, .. }
+        | K::QuantifiedSubquery { expr, .. } => stack.push(expr),
+        K::InList { expr, list, .. } => {
+            stack.push(expr);
+            stack.extend(list);
+        },
+        K::Between {
+            expr, low, high, ..
+        } => stack.extend([&**expr, &**low, &**high]),
+        K::Overlaps { s1, e1, s2, e2 } => stack.extend([&**s1, &**e1, &**s2, &**e2]),
+        K::Like { expr, pattern, .. }
+        | K::SimilarTo { expr, pattern, .. }
+        | K::RegexMatch { expr, pattern, .. } => stack.extend([&**expr, &**pattern]),
+        K::Case {
+            operand,
+            branches,
+            default,
+        } => {
+            stack.extend(operand.as_deref());
+            for branch in branches {
+                stack.extend([&branch.when, &branch.then]);
+            }
+            stack.extend(default.as_deref());
+        },
+        K::Coalesce(args)
+        | K::ArrayLiteral(args)
+        | K::ScalarFunction { args, .. }
+        | K::ScalarUdf { args, .. }
+        | K::NusaCall { args, .. }
+        | K::SetReturning { args, .. } => stack.extend(args),
+        K::Crypto { value, key, .. } => stack.extend([&**value, &**key]),
+        K::Subscript { base, index } => stack.extend([&**base, &**index]),
+        K::ArraySlice { base, lower, upper } => {
+            stack.push(base);
+            stack.extend(lower.as_deref());
+            stack.extend(upper.as_deref());
+        },
+        K::QuantifiedArray { expr, array, .. } => stack.extend([&**expr, &**array]),
+        K::Composite(op) => stack.extend(op.children()),
+    }
+}
+
+/// Refuse `expr` in an index key, an index predicate or a generated column (`what`) unless every
+/// built-in it calls is immutable: `42P17`, as for a partition key.
+pub(crate) fn require_immutable(expr: &TypedExpr, what: &str) -> Result<(), Error> {
+    match expr_volatility(expr) {
+        None => Ok(()),
+        Some((_, name)) => Err(Error::Coded {
+            message: format!("functions in {what} must be immutable, but {name}() is not"),
+            sqlstate: "42P17", // invalid_object_definition
+        }),
+    }
+}
+
+/// Refuse a volatile built-in in a `CHECK` predicate (`42P17`). A stable one such as `now()` or
+/// `current_user` is accepted: the row is checked against the value current when it is written,
+/// and is not re-checked later.
+pub(crate) fn require_not_volatile_in_check(expr: &TypedExpr) -> Result<(), Error> {
+    match expr_volatility(expr) {
+        Some((Volatility::Volatile, name)) => Err(Error::Coded {
+            message: format!("a CHECK constraint may not call the volatile function {name}()"),
+            sqlstate: "42P17", // invalid_object_definition
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Translate parsed `BEGIN` / `SET TRANSACTION` characteristics into the plan-level

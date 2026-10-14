@@ -3435,8 +3435,8 @@ fn temporal_micros(v: &ast::Value) -> Option<i64> {
 /// `GENERATE_SERIES(start, stop, interval step)` over a temporal range → one timestamp per row.
 /// The step direction is the sign of one applied interval (a month-bearing step is
 /// non-uniform, so the direction is taken from its effect on `start`); a step that does not advance is
-/// an error. Row count is capped like the integer series, and the walk stops if a step stops advancing
-/// (saturating overflow).
+/// an error. Row count is capped like the integer series, and the walk stops when the next step would
+/// leave the timestamp range (it is then past `stop`, which lies inside the range).
 fn generate_series_temporal(
     start: i64,
     stop: i64,
@@ -3446,12 +3446,16 @@ fn generate_series_temporal(
     const MAX_ROWS: usize = 10_000_000;
     let next_of =
         |t: i64| crate::temporal::add_interval_to_micros(t, step.months, step.days, step.micros);
-    if next_of(start) == start {
-        return Err(Error::InvalidParameterValue(
-            "generate_series: step must not be zero".to_owned(),
-        ));
-    }
-    let forward = next_of(start) > start;
+    let forward = match next_of(start) {
+        Some(next) if next == start => {
+            return Err(Error::InvalidParameterValue(
+                "generate_series: step must not be zero".to_owned(),
+            ));
+        },
+        Some(next) => next > start,
+        // The first step already leaves the range: its direction is the step's own sign.
+        None => step.estimate_micros() > 0,
+    };
     let wrap = |t: i64| {
         if tzaware {
             ast::Value::TimestampTz(t)
@@ -3472,7 +3476,9 @@ fn generate_series_temporal(
             )));
         }
         out.push(wrap(cur));
-        let next = next_of(cur);
+        let Some(next) = next_of(cur) else {
+            break;
+        };
         if (forward && next <= cur) || (!forward && next >= cur) {
             break;
         }
@@ -4593,7 +4599,7 @@ pub(super) fn range_boundary(
                 let iv = if subtract { iv.checked_neg()? } else { *iv };
                 Some(RangeKey::Int(crate::temporal::add_interval_to_micros(
                     k, iv.months, iv.days, iv.micros,
-                )))
+                )?))
             },
             _ => None,
         },

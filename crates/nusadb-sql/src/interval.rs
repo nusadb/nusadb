@@ -44,12 +44,12 @@ impl Interval {
 
     /// Build an interval from the individual `MAKE_INTERVAL(years, months, weeks, days, hours, mins,
     /// secs)` fields. Years fold into months and weeks into days; hours/minutes/seconds fold
-    /// into microseconds. Every fold uses saturating arithmetic and clamps the month/day totals to
-    /// `i32`, so even absurd field values stay panic-free.
+    /// into microseconds. `None` when a total does not fit its field (months and days are `i32`,
+    /// the time part `i64` microseconds) or `secs` is not finite.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "secs*1e6 is rounded then saturatingly cast to i64; the f64->i64 `as` saturates"
+        reason = "secs*1e6 is range-checked before the rounded f64->i64 `as` cast"
     )]
     pub fn make(
         years: i64,
@@ -59,47 +59,40 @@ impl Interval {
         hours: i64,
         mins: i64,
         secs: f64,
-    ) -> Self {
-        fn clamp_i32(v: i64) -> i32 {
-            i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
-        }
-        let total_months = years.saturating_mul(12).saturating_add(months);
-        let total_days = weeks.saturating_mul(7).saturating_add(days);
+    ) -> Option<Self> {
+        let total_months = years.checked_mul(12)?.checked_add(months)?;
+        let total_days = weeks.checked_mul(7)?.checked_add(days)?;
         let hm_micros = hours
-            .saturating_mul(3_600_000_000)
-            .saturating_add(mins.saturating_mul(60_000_000));
-        let sec_micros = (secs * 1_000_000.0).round() as i64;
-        Self {
-            months: clamp_i32(total_months),
-            days: clamp_i32(total_days),
-            micros: hm_micros.saturating_add(sec_micros),
+            .checked_mul(3_600_000_000)?
+            .checked_add(mins.checked_mul(60_000_000)?)?;
+        let sec_micros = (secs * 1_000_000.0).round();
+        // `i64::MAX as f64` rounds up to 2^63, which is itself out of range.
+        if !sec_micros.is_finite() || sec_micros.abs() >= 9.223_372_036_854_776e18 {
+            return None;
         }
+        Some(Self {
+            months: i32::try_from(total_months).ok()?,
+            days: i32::try_from(total_days).ok()?,
+            micros: hm_micros.checked_add(sec_micros as i64)?,
+        })
     }
 
     /// Build an interval from possibly-fractional month/day/microsecond amounts, cascading each
     /// fraction down to the next-finer field the way the reference engine does: a fractional month is
     /// `30 * frac` days, a fractional day is `24 h * frac` microseconds. So `1.5 months` is
     /// `1 mon 15 days`, `1.5 days` is `1 day 12:00:00`, and `1.5 hours` (given as `micros`) is
-    /// `01:30:00`. The whole-field totals saturate into `i32`/`i64`, staying panic-free.
+    /// `01:30:00`. `None` when a whole-field total does not fit (`i32` months and days, `i64`
+    /// microseconds).
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
-        reason = "fractional carries are rounded then saturatingly cast; the f64->int `as` saturates, and the small int consts (30, micros/day) lose no precision as f64"
+        reason = "each field is range-checked before its f64->int `as` cast, and the small int consts (30, micros/day) lose no precision as f64"
     )]
-    fn from_fractional(months: f64, days: f64, micros: f64) -> Self {
-        fn clamp_i32(v: f64) -> i32 {
-            if v >= f64::from(i32::MAX) {
-                i32::MAX
-            } else if v <= f64::from(i32::MIN) {
-                i32::MIN
-            } else {
-                v as i32
-            }
-        }
-        const fn clamp_i64(v: f64) -> i64 {
-            // `as` already saturates f64->i64 (and maps NaN to 0), which is the behaviour wanted.
-            v as i64
+    fn from_fractional(months: f64, days: f64, micros: f64) -> Option<Self> {
+        fn to_i32(v: f64) -> Option<i32> {
+            (v.is_finite() && v >= f64::from(i32::MIN) && v <= f64::from(i32::MAX))
+                .then_some(v as i32)
         }
         let whole_months = months.trunc();
         let frac_months = months - whole_months;
@@ -108,12 +101,16 @@ impl Interval {
         let whole_days = days_total.trunc();
         let frac_days = days_total - whole_days;
         // Carry the fractional day into microseconds (24-hour day), added to the micro amount.
-        let micros_total = frac_days.mul_add(MICROS_PER_DAY as f64, micros);
-        Self {
-            months: clamp_i32(whole_months),
-            days: clamp_i32(whole_days),
-            micros: clamp_i64(micros_total.round()),
+        let micros_total = frac_days.mul_add(MICROS_PER_DAY as f64, micros).round();
+        // `i64::MAX as f64` rounds up to 2^63, which is itself out of range.
+        if !micros_total.is_finite() || micros_total.abs() >= 9.223_372_036_854_776e18 {
+            return None;
         }
+        Some(Self {
+            months: to_i32(whole_months)?,
+            days: to_i32(whole_days)?,
+            micros: micros_total as i64,
+        })
     }
 
     /// Multiply by a fractional `factor` (`interval * 1.5`), or `None` when the result does not fit
@@ -311,43 +308,42 @@ impl Interval {
     }
 
     /// Normalize so every 30 days rolls up into one month (`JUSTIFY_DAYS`); the day field keeps
-    /// its sign in `[-29, 29]`. Overflow of the month field saturates rather than wrapping.
+    /// its sign in `[-29, 29]`. `None` when the month field overflows.
     #[must_use]
-    pub const fn justify_days(&self) -> Self {
-        Self {
-            months: self.months.saturating_add(self.days / 30),
+    pub const fn justify_days(&self) -> Option<Self> {
+        let Some(months) = self.months.checked_add(self.days / 30) else {
+            return None;
+        };
+        Some(Self {
+            months,
             days: self.days % 30,
             micros: self.micros,
-        }
+        })
     }
 
     /// Normalize so every 24 hours rolls up into one day (`JUSTIFY_HOURS`); the micro field
-    /// keeps its sign in `(-24h, 24h)`. Overflow of the day field saturates rather than wrapping.
+    /// keeps its sign in `(-24h, 24h)`. `None` when the day field overflows.
     #[must_use]
-    pub fn justify_hours(&self) -> Self {
-        const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+    pub fn justify_hours(&self) -> Option<Self> {
         let extra_days = self.micros / MICROS_PER_DAY;
-        let days = i64::from(self.days)
-            .saturating_add(extra_days)
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
-        Self {
+        let days = i32::try_from(i64::from(self.days).checked_add(extra_days)?).ok()?;
+        Some(Self {
             months: self.months,
-            // `days` is clamped to the `i32` range above, so the conversion never fails.
-            days: i32::try_from(days).unwrap_or(self.days),
+            days,
             micros: self.micros % MICROS_PER_DAY,
-        }
+        })
     }
 
     /// Apply both [`Self::justify_hours`] and [`Self::justify_days`] so days land in `[-29, 29]` and
     /// the time part in `(-24h, 24h)`, then reconcile signs so all three fields point the same way
     /// (`JUSTIFY_INTERVAL`). The sign pass is what turns `1 month -1 hour` into `29 days
     /// 23:00:00` instead of leaving a positive month beside a negative hour: a field that disagrees
-    /// with the larger one borrows a whole unit from it.
+    /// with the larger one borrows a whole unit from it. `None` when a field overflows.
     #[must_use]
-    pub fn justify_interval(&self) -> Self {
-        let mut r = self.justify_hours().justify_days();
-        // `days`/`months` are bounded by the two justify passes, so these `± 30` / `± 1` adjustments
-        // (guarded by the sign checks) cannot overflow.
+    pub fn justify_interval(&self) -> Option<Self> {
+        let mut r = self.justify_hours()?.justify_days()?;
+        // `days` and `micros` are bounded by the two justify passes and a month is only borrowed
+        // toward zero, so the adjustments below cannot overflow.
         if r.months > 0 && (r.days < 0 || (r.days == 0 && r.micros < 0)) {
             r.days += 30;
             r.months -= 1;
@@ -362,7 +358,7 @@ impl Interval {
             r.micros -= MICROS_PER_DAY;
             r.days += 1;
         }
-        r
+        Some(r)
     }
 
     /// Parse an interval literal: a sequence of `N unit` terms (`unit` is one of
@@ -441,7 +437,7 @@ impl Interval {
         }
         // Cascade the fractional month/day carries (and any fractional sub-second) into micros, then
         // fold in the exact whole micros.
-        let cascade = Self::from_fractional(months, days, micros_frac);
+        let cascade = Self::from_fractional(months, days, micros_frac)?;
         Some(Self {
             micros: cascade.micros.checked_add(micros_whole)?,
             ..cascade
@@ -698,38 +694,70 @@ mod tests {
     #[test]
     fn justify_rolls_days_and_hours_into_higher_units() {
         // JUSTIFY_DAYS: 35 days → 1 month 5 days.
-        let jd = p("35 days").justify_days();
+        let jd = p("35 days").justify_days().unwrap();
         assert_eq!((jd.months, jd.days, jd.micros), (1, 5, 0));
         // JUSTIFY_HOURS: 49 hours → 2 days 1 hour.
-        let jh = p("49 hours").justify_hours();
+        let jh = p("49 hours").justify_hours().unwrap();
         assert_eq!((jh.months, jh.days, jh.micros), (0, 2, 3_600 * 1_000_000));
         // JUSTIFY_INTERVAL applies both: 35 days + 49 h → 1 mon 7 days 1 h.
-        let ji = p("35 days 49 hours").justify_interval();
+        let ji = p("35 days 49 hours").justify_interval().unwrap();
         assert_eq!((ji.months, ji.days, ji.micros), (1, 7, 3_600 * 1_000_000));
         // Negative components keep their sign in range.
-        let neg = p("-35 days").justify_days();
+        let neg = p("-35 days").justify_days().unwrap();
         assert_eq!((neg.months, neg.days, neg.micros), (-1, -5, 0));
     }
 
     #[test]
     fn justify_interval_reconciles_mixed_signs() {
         // A positive month beside a negative hour is borrowed down: 1 mon -1 h → 29 days 23 h.
-        let a = p("1 month -1 hour").justify_interval();
+        let a = p("1 month -1 hour").justify_interval().unwrap();
         assert_eq!(
             (a.months, a.days, a.micros),
             (0, 29, 23 * 3_600 * 1_000_000)
         );
         // Symmetric on the negative side: -1 mon 1 h → -29 days -23 h.
-        let b = p("-1 month 1 hour").justify_interval();
+        let b = p("-1 month 1 hour").justify_interval().unwrap();
         assert_eq!(
             (b.months, b.days, b.micros),
             (0, -29, -23 * 3_600 * 1_000_000)
         );
         // A positive day beside a negative time borrows a day: 1 day -1 h → 23 h.
-        let c = p("1 day -1 hour").justify_interval();
+        let c = p("1 day -1 hour").justify_interval().unwrap();
         assert_eq!((c.months, c.days, c.micros), (0, 0, 23 * 3_600 * 1_000_000));
         // Already-consistent signs are untouched.
-        let d = p("1 month 1 day 1 hour").justify_interval();
+        let d = p("1 month 1 day 1 hour").justify_interval().unwrap();
         assert_eq!((d.months, d.days, d.micros), (1, 1, 3_600 * 1_000_000));
+    }
+
+    #[test]
+    fn out_of_range_fields_are_refused_not_clamped() {
+        assert!(Interval::make(i64::MAX, 0, 0, 0, 0, 0, 0.0).is_none());
+        assert!(Interval::make(0, 0, 0, 3_000_000_000, 0, 0, 0.0).is_none());
+        assert!(Interval::make(0, 0, 0, 0, i64::MAX / 1_000, 0, 0.0).is_none());
+        assert!(Interval::make(0, 0, 0, 0, 0, 0, f64::INFINITY).is_none());
+        assert!(Interval::make(0, 0, 0, 0, 0, 0, 1e300).is_none());
+        assert_eq!(
+            Interval::make(1, 1, 1, 1, 1, 1, 1.5),
+            Some(Interval {
+                months: 13,
+                days: 8,
+                micros: 3_661_500_000,
+            })
+        );
+        assert!(Interval::parse("3000000000 days").is_none());
+        assert!(Interval::parse("300000000 years").is_none());
+        let max_days = Interval {
+            months: i32::MAX,
+            days: 30,
+            micros: 0,
+        };
+        assert!(max_days.justify_days().is_none());
+        assert!(max_days.justify_interval().is_none());
+        let max_hours = Interval {
+            months: 0,
+            days: i32::MAX,
+            micros: 86_400_000_000,
+        };
+        assert!(max_hours.justify_hours().is_none());
     }
 }
