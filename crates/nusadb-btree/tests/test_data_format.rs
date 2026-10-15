@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use nusadb_btree::BtreeEngine;
-use nusadb_btree::format::{FORMAT_VERSION, read_format};
+use nusadb_btree::format::{FORMAT_VERSION, PLAIN_FORMAT_VERSION, read_format};
 use nusadb_core::engine::{ColumnDef, TableDef};
 use nusadb_core::{ColumnType, IsolationLevel, StorageEngine};
 
@@ -96,11 +96,11 @@ fn a_new_database_records_the_format_and_the_release() {
     assert_eq!(
         text,
         format!(
-            "nusadb data format {FORMAT_VERSION}\nwritten by nusadb {}\n",
+            "nusadb data format {PLAIN_FORMAT_VERSION}\nwritten by nusadb {}\n",
             env!("CARGO_PKG_VERSION")
         )
     );
-    assert_eq!(read_format(&wal).unwrap(), Some(FORMAT_VERSION));
+    assert_eq!(read_format(&wal).unwrap(), Some(PLAIN_FORMAT_VERSION));
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn a_database_from_before_the_format_was_recorded_is_format_1_and_is_stamped() {
     assert_eq!(read_format(&wal).unwrap(), Some(1));
     let engine = BtreeEngine::open(&wal).unwrap();
     assert_eq!(rows(&engine), vec![b"row".to_vec()]);
-    assert_eq!(read_format(&wal).unwrap(), Some(FORMAT_VERSION));
+    assert_eq!(read_format(&wal).unwrap(), Some(PLAIN_FORMAT_VERSION));
 }
 
 #[test]
@@ -179,10 +179,10 @@ fn a_checkpoint_image_in_a_newer_version_is_refused_as_newer_not_corrupt() {
     let mut image_path = wal.as_os_str().to_owned();
     image_path.push(".ckpt");
     let mut image = std::fs::read(&image_path).unwrap();
-    image[4..8].copy_from_slice(&4_u32.to_le_bytes());
+    image[4..8].copy_from_slice(&5_u32.to_le_bytes());
     std::fs::write(&image_path, &image).unwrap();
     let err = refused(&wal);
-    assert!(err.contains("image version 4"), "{err}");
+    assert!(err.contains("image version 5"), "{err}");
     assert!(err.contains("newer release"), "{err}");
 
     image[4..8].copy_from_slice(&0_u32.to_le_bytes());
@@ -211,7 +211,7 @@ fn an_archive_records_its_format_and_one_in_a_newer_format_is_refused() {
     assert_eq!(
         std::fs::read_to_string(&stamp).unwrap(),
         format!(
-            "nusadb data format {FORMAT_VERSION}\nwritten by nusadb {}\n",
+            "nusadb data format {PLAIN_FORMAT_VERSION}\nwritten by nusadb {}\n",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -231,7 +231,7 @@ fn an_archive_records_its_format_and_one_in_a_newer_format_is_refused() {
     let seeded_wal = seeded.path().join("btree.wal");
     nusadb_btree::seed_standby(archive.path(), &seeded_wal).unwrap();
     for (dir, wal) in [(&restored, &restored_wal), (&seeded, &seeded_wal)] {
-        assert_eq!(read_format(wal).unwrap(), Some(FORMAT_VERSION));
+        assert_eq!(read_format(wal).unwrap(), Some(PLAIN_FORMAT_VERSION));
         assert!(format_file(wal).exists());
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()

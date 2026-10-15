@@ -33,5 +33,18 @@ tpcc-bench      = "test -p nusadb-btree --release --test test_tpcc tpcc_perf_bas
 # Use lld for faster link times on Linux dev/CI
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
+# AES and carry-less multiply instructions for the at-rest cipher (AES-256-GCM-SIV) on 64-bit
+# ARM. The RustCrypto crates use them only behind these flags there, and still check the CPU at
+# run time, falling back to the portable code. On x86-64 they are detected without a flag.
+# Measured: a cold scan of 200,000 encrypted rows takes 42 ms with them and 219 ms without.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
 [net]
 git-fetch-with-cli = true

@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use super::codec;
+use super::{codec, seal};
 use crate::ast;
 use crate::error::Error;
 use crate::executor::row::Row;
@@ -48,17 +48,7 @@ impl SpillWriter {
     /// [`Error::Core`] wrapping the underlying I/O error.
     pub(in crate::executor) fn write_row(&mut self, row: &[ast::Value]) -> Result<(), Error> {
         let bytes = codec::encode_row(row)?;
-        let len = u32::try_from(bytes.len()).map_err(|_| {
-            Error::Core(nusadb_core::Error::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "spilled row exceeds 4 GiB",
-            )))
-        })?;
-        self.writer
-            .write_all(&len.to_le_bytes())
-            .map_err(io_error)?;
-        self.writer.write_all(&bytes).map_err(io_error)?;
-        Ok(())
+        self.write_bytes(&bytes).map(|_| ())
     }
 
     /// Append one opaque length-prefixed record (bytes the caller already encoded — e.g. a sorted
@@ -66,7 +56,18 @@ impl SpillWriter {
     ///
     /// # Errors
     /// [`Error::Core`] wrapping the underlying I/O error, or if the record exceeds 4 GiB.
-    pub(in crate::executor) fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    pub(in crate::executor) fn write_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        // Sealed when data at rest is encrypted: a spill holds rows.
+        let sealed;
+        let bytes = match seal::active() {
+            Some(key) => {
+                sealed = key
+                    .seal(bytes)
+                    .ok_or_else(|| io_error(io::Error::other("sealing a spilled record failed")))?;
+                sealed.as_slice()
+            },
+            None => bytes,
+        };
         let len = u32::try_from(bytes.len()).map_err(|_| {
             Error::Core(nusadb_core::Error::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -77,7 +78,7 @@ impl SpillWriter {
             .write_all(&len.to_le_bytes())
             .map_err(io_error)?;
         self.writer.write_all(bytes).map_err(io_error)?;
-        Ok(())
+        Ok(4 + bytes.len() as u64)
     }
 
     /// Flush the buffered writes and reopen the file for reading. The returned [`SpillReader`] takes
@@ -167,7 +168,20 @@ fn read_row_from(reader: &mut BufReader<File>) -> Result<Option<Row>, Error> {
     let len = u32::from_le_bytes(len_buf) as usize;
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes).map_err(io_error)?;
-    Ok(Some(codec::decode_row(&bytes)?))
+    Ok(Some(codec::decode_row(&unseal(bytes)?)?))
+}
+
+/// A record as written, opened when spill files are sealed.
+fn unseal(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
+    match seal::active() {
+        Some(key) => key.open(&bytes).ok_or_else(|| {
+            io_error(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a spilled record fails authentication",
+            ))
+        }),
+        None => Ok(bytes),
+    }
 }
 
 impl Drop for SpillWriter {
@@ -216,7 +230,7 @@ impl SpillReader {
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut bytes = vec![0u8; len];
         self.reader.read_exact(&mut bytes).map_err(io_error)?;
-        Ok(Some(bytes))
+        Ok(Some(unseal(bytes)?))
     }
 }
 
@@ -255,12 +269,12 @@ impl RandomSpillWriter {
     /// [`Error::Core`] wrapping the underlying I/O error.
     pub(in crate::executor) fn write_row(&mut self, row: &[ast::Value]) -> Result<(), Error> {
         let bytes = codec::encode_row(row)?;
-        self.data.write_bytes(&bytes)?;
+        let written = self.data.write_bytes(&bytes)?;
         self.offsets
             .writer
             .write_all(&self.at.to_le_bytes())
             .map_err(io_error)?;
-        self.at += 4 + bytes.len() as u64;
+        self.at += written;
         self.len += 1;
         Ok(())
     }

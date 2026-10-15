@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use nusadb_btree::BtreeEngine;
+use nusadb_btree::crypt::MasterKey;
+use nusadb_btree::{BtreeEngine, OpenOptions};
 use nusadb_core::StorageEngine;
 use nusadb_wire::{ClusterError, DatabaseCluster, is_valid_database_name};
 
@@ -103,6 +104,9 @@ pub(crate) struct DatabaseManager {
     /// The prepared-transaction ceiling applied to every database's engine as it opens; `None`
     /// keeps the engine's default.
     max_prepared_transactions: Option<usize>,
+    /// The master key every database is encrypted under (`--encryption-key-file`); `None` for
+    /// an unencrypted cluster.
+    master_key: Option<Arc<MasterKey>>,
     state: Mutex<ManagerState>,
 }
 
@@ -124,7 +128,7 @@ impl DatabaseManager {
         if !wal.exists() && !wal.with_extension("wal.ckpt").exists() {
             return Ok(None);
         }
-        let Ok(engine) = BtreeEngine::open_with_archive(&wal, self.archive_dir(name)) else {
+        let Ok(engine) = BtreeEngine::open_with(&wal, self.open_options(name)) else {
             return Ok(None);
         };
         let waiting = engine
@@ -155,6 +159,7 @@ impl DatabaseManager {
             wal_archive,
             standby,
             max_prepared_transactions,
+            master_key,
         } = durability;
         let root = data_dir.as_ref().to_path_buf();
         let default_name = default_name.into();
@@ -165,12 +170,24 @@ impl DatabaseManager {
         // running on it.
         let cluster_lock = lock_cluster(&root)?;
         check_cluster_format(&root)?;
+        // A database an interrupted `--encrypt-from` left unfinished, registered or not, stops
+        // the start (only the copy itself may go on, and it does not open the target this way):
+        // otherwise a fresh catalog could register it as the default database and serve it empty.
+        refuse_unfinished_copies(&root)?;
         let mut databases = load_catalog(&root)?;
         // Every database's data format is checked now, so a release older than the data is refused
         // at start-up rather than at the first connection to each database, and before this
         // release records itself anywhere.
         for name in &databases {
             check_database_format(&database_wal(&root, legacy_root, &default_name, name))?;
+        }
+        // Likewise every database's encryption, against the key given or its absence: a server
+        // started with the wrong key, without the key of encrypted data, or with a key over
+        // unencrypted data refuses to start, naming the database, with nothing changed.
+        for name in &databases {
+            let wal = database_wal(&root, legacy_root, &default_name, name);
+            nusadb_btree::crypt::check_database(&wal, master_key.as_deref())
+                .map_err(|e| io::Error::other(format!("database {name}: {e}")))?;
         }
         stamp_cluster_format(&root)?;
         std::fs::create_dir_all(root.join("base"))?;
@@ -187,8 +204,12 @@ impl DatabaseManager {
                 let wal = base_dir(&root, &name).join("btree.wal");
                 if !wal.exists() && !wal.with_extension("wal.ckpt").exists() {
                     std::fs::create_dir_all(base_dir(&root, &name))?;
-                    let covered = nusadb_btree::seed_standby(&cfg.root.join(&name), &wal)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let covered = nusadb_btree::seed_standby_with_key(
+                        &cfg.root.join(&name),
+                        &wal,
+                        master_key.as_deref(),
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                     tracing::info!(database = %name, position = covered, "standby seeded from the primary's archive");
                 }
                 databases.insert(name);
@@ -223,12 +244,31 @@ impl DatabaseManager {
             wal_archive,
             standby,
             max_prepared_transactions,
+            master_key,
             state: Mutex::new(ManagerState {
                 databases,
                 engines: HashMap::new(),
                 health: HashMap::new(),
             }),
         })
+    }
+
+    /// How database `name`'s engine opens: its archive, standby mode and the master key.
+    fn open_options(&self, name: &str) -> OpenOptions {
+        OpenOptions {
+            archive: if self.is_standby() {
+                None
+            } else {
+                self.archive_dir(name)
+            },
+            standby: self.is_standby(),
+            master_key: self.master_key.clone(),
+        }
+    }
+
+    /// The master key the cluster is encrypted under, if it is.
+    pub(crate) fn master_key(&self) -> Option<&MasterKey> {
+        self.master_key.as_deref()
     }
 
     /// Whether this server is a standby (read-only, following a primary's archive).
@@ -359,11 +399,7 @@ impl DatabaseManager {
             // The archive goes in with the open: recovery may checkpoint before returning, and
             // that checkpoint must archive the segment it truncates like any other. A standby
             // opens as one from the first moment for the same reason.
-            if self.is_standby() {
-                BtreeEngine::open_standby(wal)
-            } else {
-                BtreeEngine::open_with_archive(wal, self.archive_dir(name))
-            }
+            BtreeEngine::open_with(wal, self.open_options(name))
                 // Apply the per-transaction and global resident write ceilings as the engine opens;
                 // `None` leaves each unbounded (the pre-flag behavior). Both checks short-circuit
                 // before any locking when unset, so an unconfigured server pays nothing. Applying the
@@ -398,7 +434,7 @@ impl DatabaseManager {
         }
         // A standby applies what the primary archives and commits nothing of its own.
         if let Some(cfg) = &self.standby {
-            spawn_standby_scheduler(&engine, name, cfg);
+            spawn_standby_scheduler(&engine, name, cfg, self.master_key.clone());
         }
         state
             .health
@@ -559,7 +595,12 @@ enum StandbyTick {
 }
 
 /// One poll: apply, in order, every segment archived past the standby's position.
-fn standby_tick(engine: &BtreeEngine, archive: &Path, max_pause: Duration) -> StandbyTick {
+fn standby_tick(
+    engine: &BtreeEngine,
+    archive: &Path,
+    max_pause: Duration,
+    master_key: Option<&MasterKey>,
+) -> StandbyTick {
     let position = match engine.wal_last_lsn() {
         Ok(Some(position)) => position,
         Ok(None) => {
@@ -587,6 +628,11 @@ fn standby_tick(engine: &BtreeEngine, archive: &Path, max_pause: Duration) -> St
             Err(error) => StandbyTick::Failed { error },
         };
     }
+    // The segments are sealed under the primary's data key, named by the archive's envelope.
+    let archive_key = match nusadb_btree::crypt::archive_key(archive, master_key) {
+        Ok(key) => key,
+        Err(error) => return StandbyTick::Failed { error },
+    };
     let mut applied_segments = 0;
     let mut applied_records = 0;
     let mut position = position;
@@ -599,7 +645,7 @@ fn standby_tick(engine: &BtreeEngine, archive: &Path, max_pause: Duration) -> St
                 };
             },
         };
-        match engine.apply_shipped_segment(&bytes, max_pause) {
+        match engine.apply_shipped_segment_with_key(&bytes, max_pause, archive_key.as_ref()) {
             Ok(nusadb_btree::ShipOutcome::Applied { records, last, .. }) => {
                 applied_segments += 1;
                 applied_records += records;
@@ -625,7 +671,12 @@ fn standby_tick(engine: &BtreeEngine, archive: &Path, max_pause: Duration) -> St
 
 /// Follow the primary's archive for one database: a detached thread holding only a weak handle,
 /// so it ends when the engine is dropped.
-fn spawn_standby_scheduler(engine: &Arc<BtreeEngine>, db: &str, cfg: &StandbyConfig) {
+fn spawn_standby_scheduler(
+    engine: &Arc<BtreeEngine>,
+    db: &str,
+    cfg: &StandbyConfig,
+    master_key: Option<Arc<MasterKey>>,
+) {
     let weak = Arc::downgrade(engine);
     let db = db.to_owned();
     let archive = cfg.root.join(&db);
@@ -639,7 +690,7 @@ fn spawn_standby_scheduler(engine: &Arc<BtreeEngine>, db: &str, cfg: &StandbyCon
             loop {
                 std::thread::sleep(poll);
                 let Some(engine) = weak.upgrade() else { break };
-                match standby_tick(&engine, &archive, max_pause) {
+                match standby_tick(&engine, &archive, max_pause, master_key.as_deref()) {
                     StandbyTick::Idle { position } => {
                         tracing::trace!(db = %db, position, "standby tick: nothing new");
                     },
@@ -694,6 +745,8 @@ pub(crate) struct DurabilityOptions {
     /// (`--max-prepared-transactions`; `0` refuses `PREPARE TRANSACTION`). `None` keeps the
     /// engine's default.
     pub(crate) max_prepared_transactions: Option<usize>,
+    /// The master key every database is encrypted under; `None` for an unencrypted cluster.
+    pub(crate) master_key: Option<Arc<MasterKey>>,
 }
 
 /// Policy for the background runtime checkpoint: fold the log into a checkpoint image once it
@@ -1037,8 +1090,8 @@ fn check_engine_marker(dir: &Path) -> io::Result<()> {
             ),
         ));
     }
-    if !path.exists() {
-        std::fs::write(&path, EngineKind::Btree.as_str())?;
+    if std::fs::symlink_metadata(&path).is_err() {
+        write_fresh(&path, EngineKind::Btree.as_str().as_bytes())?;
     }
     Ok(())
 }
@@ -1241,11 +1294,770 @@ fn remove_locked_database_dir(dir: &Path, lock: std::fs::File) -> io::Result<()>
     std::fs::remove_dir_all(dir)
 }
 
+/// A point of the copy at which a test can stop it, as a crash would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyStep {
+    /// The journal of a new copy is written; nothing else of the copy is.
+    Journaled,
+    /// The target of the named database is marked incomplete; nothing is registered yet.
+    Marked,
+    /// Every target is marked and the catalog lists exactly the source's databases.
+    Registered,
+    /// The named database left over from an earlier run (the source no longer has it) is
+    /// removed from the target.
+    Removed,
+    /// The named database is copied and its marker removed.
+    Copied,
+}
+
+/// The journal of an `--encrypt-from` copy in progress: `<target>/global/encrypt-copy`. Written
+/// before anything else of the copy, removed only once every database is finished and checked.
+fn copy_journal_path(target: &Path) -> PathBuf {
+    target.join("global").join("encrypt-copy")
+}
+
+/// The first line of a copy journal.
+const COPY_JOURNAL_HEADER: &str = "nusadb encrypted copy 3";
+
+/// A copy journal: the source it copies, the check value of the master key it writes under
+/// ([`MasterKey::copy_check`]), and every database the copy has created in the target. Only
+/// those may be written again or removed by a later run.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CopyJournal {
+    source: String,
+    key: String,
+    created: BTreeSet<String>,
+}
+
+impl CopyJournal {
+    /// The journal in `target`, `None` when no copy is in progress there.
+    fn read(target: &Path) -> io::Result<Option<Self>> {
+        let path = copy_journal_path(target);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let damaged = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is not a readable copy journal; remove the target data directory and \
+                     copy again",
+                    path.display()
+                ),
+            )
+        };
+        let mut lines = text.lines();
+        if lines.next() != Some(COPY_JOURNAL_HEADER) {
+            return Err(damaged());
+        }
+        let source = lines
+            .next()
+            .and_then(|l| l.strip_prefix("source "))
+            .ok_or_else(damaged)?
+            .to_owned();
+        let key = lines
+            .next()
+            .and_then(|l| l.strip_prefix("key "))
+            .ok_or_else(damaged)?
+            .to_owned();
+        let mut created = BTreeSet::new();
+        for line in lines {
+            let name = line.strip_prefix("created ").ok_or_else(damaged)?;
+            if !is_valid_database_name(name) {
+                return Err(damaged());
+            }
+            created.insert(name.to_owned());
+        }
+        Ok(Some(Self {
+            source,
+            key,
+            created,
+        }))
+    }
+
+    /// Write the journal to `target`, atomically and durably.
+    fn write(&self, target: &Path) -> io::Result<()> {
+        use std::fmt::Write as _;
+        let mut text = format!(
+            "{COPY_JOURNAL_HEADER}\nsource {}\nkey {}\n",
+            self.source, self.key
+        );
+        for name in &self.created {
+            let _ = writeln!(text, "created {name}");
+        }
+        let path = copy_journal_path(target);
+        let scratch = path.with_extension("tmp");
+        write_fresh(&scratch, text.as_bytes())?;
+        std::fs::rename(&scratch, &path)?;
+        sync_dir(&target.join("global"))
+    }
+}
+
+/// Write `bytes` to `path` as a new file of its own, durably: a link there is replaced, never
+/// written through, and a hard link keeps its contents ([`nusadb_btree::crypt::write_fresh`]).
+fn write_fresh(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    nusadb_btree::crypt::write_fresh(path, bytes).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Make a directory's entries durable, where the platform lets a directory be synced.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Copy every database of the data directory `source` (unencrypted, or encrypted under
+/// `source_key`) into the data directory `target`, encrypted under `key`. Returns each database
+/// with the log position its copy covers.
+///
+/// A new copy needs a fresh target: its catalog names no database the source does not have, and
+/// each directory under `base/` is empty but for an empty lock file. The copy first writes its
+/// journal ([`copy_journal_path`]) naming the source and the key, records in it every database
+/// before creating it, marks every target database incomplete, and only then registers them, so
+/// at no moment is a database registered that holds neither its mark nor a finished copy; a
+/// server started on the target refuses while the journal or a mark is there.
+///
+/// A run after an interruption must name the same source and key, and copies every database
+/// again from scratch: what an earlier run finished may no longer match the source, whose log
+/// position says nothing of its contents (a database dropped and created again, or another data
+/// directory put at the same path). A database the journal records as created by the copy that
+/// the source no longer has is removed, provided its directory holds only database files;
+/// anything else the target holds that the source does not have stops the run with nothing
+/// removed. The journal goes only once the target lists exactly the source's databases, each a
+/// finished copy under `key`, and no mark is left. A finished target (no journal) is refused.
+///
+/// # Errors
+/// Refusals as above, the copy's errors, and I/O errors.
+pub(crate) fn encrypt_cluster(
+    target: &Path,
+    source: &Path,
+    key: &Arc<MasterKey>,
+    source_key: Option<&Arc<MasterKey>>,
+    autoanalyze: AutoAnalyzeConfig,
+) -> io::Result<Vec<(String, u64)>> {
+    encrypt_cluster_stepped(target, source, key, source_key, autoanalyze, &mut |_, _| {
+        Ok(())
+    })
+}
+
+/// Refuse a `--encrypt-from` source that is not a data directory, before anything is opened
+/// or created there.
+fn check_copy_source(source: &Path) -> io::Result<()> {
+    if !source.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the source data directory {} does not exist; nothing was changed",
+                source.display()
+            ),
+        ));
+    }
+    let global = source.join("global");
+    if !global.join("format").is_file() && !global.join("databases").is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a nusadb data directory (it has no global/format); name the data \
+                 directory of the cluster to copy. Nothing was changed",
+                source.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// [`encrypt_cluster`], telling `step` each point reached; an error from it stops the copy
+/// there, as a crash would.
+fn encrypt_cluster_stepped(
+    target: &Path,
+    source: &Path,
+    key: &Arc<MasterKey>,
+    source_key: Option<&Arc<MasterKey>>,
+    autoanalyze: AutoAnalyzeConfig,
+    step: &mut dyn FnMut(CopyStep, &str) -> io::Result<()>,
+) -> io::Result<Vec<(String, u64)>> {
+    check_copy_source(source)?;
+    let source_id = std::fs::canonicalize(source)?
+        .to_string_lossy()
+        .into_owned();
+    if source_id.contains(['\n', '\r']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the source path {source_id:?} contains a line break; move or link the source to \
+                 a path without one. Nothing was changed"
+            ),
+        ));
+    }
+    let source_manager = DatabaseManager::open(
+        source,
+        nusadb_wire::cluster::DEFAULT_DATABASE,
+        None,
+        None,
+        autoanalyze,
+        DurabilityOptions {
+            master_key: source_key.cloned(),
+            ..DurabilityOptions::default()
+        },
+    )?;
+    let names = source_manager.database_names();
+    let mut sources = Vec::with_capacity(names.len());
+    for name in &names {
+        let from = source_manager
+            .registered_wal_path(name)
+            .ok_or_else(|| io::Error::other(format!("database {name} vanished from the source")))?;
+        sources.push((name.clone(), from));
+    }
+    // A new copy into a target that is not fresh is refused before anything is created there;
+    // the check is made again under the target's lock.
+    if !copy_journal_path(target).exists() {
+        let wanted: BTreeSet<String> = names.iter().cloned().collect();
+        check_fresh_target(target, &wanted)?;
+    }
+    check_target_layout(target)?;
+    std::fs::create_dir_all(target.join("global"))?;
+    // Held for the whole copy: no server may start on the target meanwhile.
+    let _lock = lock_cluster(target)?;
+    prepare_encrypted_targets(target, &source_id, &key.copy_check(), &sources, step)?;
+    let mut done = Vec::with_capacity(sources.len());
+    for (name, from) in sources {
+        let to = base_dir(target, &name).join("btree.wal");
+        let covered = BtreeEngine::copy_encrypted(&from, source_key.map(AsRef::as_ref), &to, key)
+            .map_err(|e| io::Error::other(format!("database {name}: {e}")))?;
+        tracing::info!(database = %name, position = covered, "database copied, encrypted");
+        step(CopyStep::Copied, &name)?;
+        done.push((name, covered));
+    }
+    check_finished_copy(target, &names, key)?;
+    std::fs::remove_file(copy_journal_path(target))?;
+    sync_dir(&target.join("global"))?;
+    Ok(done)
+}
+
+/// Refuse a data directory where an `--encrypt-from` copy has not finished: its journal, or a
+/// database marked incomplete, is still there.
+fn refuse_unfinished_copies(root: &Path) -> io::Result<()> {
+    let mut found: Vec<String> = Vec::new();
+    let journal = copy_journal_path(root);
+    if journal.exists() {
+        found.push(journal.display().to_string());
+    }
+    found.extend(
+        incomplete_marks(root)
+            .into_iter()
+            .map(|m| m.display().to_string()),
+    );
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "an encrypted copy (--encrypt-from) into {} has not finished: {} is still there. Run the \
+         same --encrypt-from command again to finish it. If this directory was never the target \
+         of --encrypt-from, the file is stray and can be removed. Nothing was changed",
+        root.display(),
+        found.join(", ")
+    )))
+}
+
+/// Every `btree.wal.incomplete` marker under `<root>/base/`, sorted.
+fn incomplete_marks(root: &Path) -> Vec<PathBuf> {
+    let mut marks: Vec<PathBuf> = std::fs::read_dir(root.join("base"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| nusadb_btree::crypt::incomplete_path(&e.path().join("btree.wal")))
+                .filter(|m| m.exists())
+                .collect()
+        })
+        .unwrap_or_default();
+    marks.sort();
+    marks
+}
+
+/// The names of the entries under `<root>/base/` (directories, and links or files in their
+/// place), sorted. An entry whose name is no valid database name is not a database's, and is
+/// left out.
+fn base_dir_names(root: &Path) -> io::Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    let entries = match std::fs::read_dir(root.join("base")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_valid_database_name(&name) {
+            out.insert(name);
+        }
+    }
+    Ok(out)
+}
+
+/// Refuse a target a new copy may not write into: one whose catalog names a database the source
+/// does not have, or whose `base/` holds anything but directories that are empty but for an
+/// empty lock file (what a server started once on a new data directory leaves).
+fn check_fresh_target(target: &Path, wanted: &BTreeSet<String>) -> io::Result<()> {
+    let refuse = |what: String| {
+        io::Error::other(format!(
+            "{} already holds {what}; copy into an empty data directory, or remove this one \
+             first. Nothing was changed",
+            target.display()
+        ))
+    };
+    let foreign: Vec<String> = load_catalog(target)?
+        .into_iter()
+        .filter(|name| !wanted.contains(name))
+        .collect();
+    if !foreign.is_empty() {
+        return Err(refuse(format!(
+            "databases the source does not have ({})",
+            foreign.join(", ")
+        )));
+    }
+    let entries = match std::fs::read_dir(target.join("base")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            return Err(refuse(format!("{} under base/", path.display())));
+        }
+        for inner in std::fs::read_dir(&path)? {
+            let inner = inner?;
+            let empty_lock = inner.file_name() == "btree.wal.lock"
+                && inner.file_type()?.is_file()
+                && inner.metadata()?.len() == 0;
+            if !empty_lock {
+                return Err(refuse(format!(
+                    "databases or other files ({} among them)",
+                    inner.path().display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The files a database of this engine keeps in its directory beside the page segments:
+/// its log, the files named after it, and the `engine` marker.
+const DATABASE_FILES: [&str; 11] = [
+    "engine",
+    "btree.wal",
+    "btree.wal.lock",
+    "btree.wal.ckpt",
+    "btree.wal.ckpt.tmp",
+    "btree.wal.key",
+    "btree.wal.key.tmp",
+    "btree.wal.incomplete",
+    "btree.wal.spill",
+    "btree.wal.format",
+    "btree.wal.format.tmp",
+];
+
+/// The directory of a database's page segments, inside its directory.
+const DATABASE_PAGES_DIR: &str = "btree.wal.pages";
+
+/// Whether `name` is the file name of a page segment: `<20 digits>-<hex stamp>[-full].seg`.
+fn is_segment_file_name(name: &str) -> bool {
+    let Some(base) = name.strip_suffix(".seg") else {
+        return false;
+    };
+    let base = base.strip_suffix("-full").unwrap_or(base);
+    let Some((position, stamp)) = base.split_once('-') else {
+        return false;
+    };
+    position.len() == 20
+        && position.bytes().all(|b| b.is_ascii_digit())
+        && !stamp.is_empty()
+        && stamp.len() <= 16
+        && stamp.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether `<target>/base/<name>` exists, refusing it unless it is a real directory: a link is
+/// never followed, so a copy can neither write nor remove anything outside the target.
+fn is_real_database_dir(target: &Path, name: &str) -> io::Result<bool> {
+    let dir = base_dir(target, name);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(io::Error::other(format!(
+            "{} is a link or a file, not a database directory; nothing was changed. Move it out \
+             of the data directory and run the same --encrypt-from command again",
+            dir.display()
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Refuse a target whose `global/` or `base/` is a link or a file: everything the copy writes
+/// stays inside the target.
+fn check_target_layout(target: &Path) -> io::Result<()> {
+    for part in ["global", "base"] {
+        let path = target.join(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => {},
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "{} is a link or a file, not a directory; copy into a data directory that \
+                     holds its own. Nothing was changed",
+                    path.display()
+                )));
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a database directory `dir` about to be written where a database file
+/// ([`DATABASE_FILES`]) or the page segments directory is a link: the copy never writes through
+/// one.
+fn refuse_linked_database_files(dir: &Path) -> io::Result<()> {
+    for name in DATABASE_FILES.iter().chain([&DATABASE_PAGES_DIR]) {
+        let path = dir.join(name);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(io::Error::other(format!(
+                "{} is a link; the copy never writes through one. Nothing was changed. Remove \
+                 it and run the same --encrypt-from command again",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to remove the database directory `dir` unless it holds only what a database of this
+/// engine keeps there ([`DATABASE_FILES`], each a plain file, and a [`DATABASE_PAGES_DIR`] of
+/// plain segment files). Nothing is followed through a link.
+fn check_only_database_files(dir: &Path) -> io::Result<()> {
+    let foreign = |path: &Path| {
+        io::Error::other(format!(
+            "{} is not a file of a database; {} was left in place. Move it out and run the same \
+             --encrypt-from command again",
+            path.display(),
+            dir.display()
+        ))
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let kind = entry.file_type()?;
+        if name == DATABASE_PAGES_DIR && kind.is_dir() {
+            for segment in std::fs::read_dir(&path)? {
+                let segment = segment?;
+                let plain = segment.file_type()?.is_file();
+                if !plain
+                    || !segment
+                        .file_name()
+                        .to_str()
+                        .is_some_and(is_segment_file_name)
+                {
+                    return Err(foreign(&segment.path()));
+                }
+            }
+        } else if !(kind.is_file() && DATABASE_FILES.iter().any(|f| name == *f)) {
+            return Err(foreign(&path));
+        }
+    }
+    Ok(())
+}
+
+/// Remove the database directory `<target>/base/<name>`, which the copy created: its lock is
+/// taken first, then its entries are checked ([`check_only_database_files`]), and only those
+/// named there are removed, the directories last with `remove_dir`, so a file that appears
+/// meanwhile makes the removal fail instead of being deleted.
+fn remove_copied_database_dir(target: &Path, name: &str) -> io::Result<()> {
+    if !is_real_database_dir(target, name)? {
+        return Ok(());
+    }
+    let dir = base_dir(target, name);
+    let lock = lock_database_dir(&dir, name)
+        .map_err(|e| io::Error::other(format!("database {name}: {e}")))?;
+    check_only_database_files(&dir)?;
+    let pages = dir.join(DATABASE_PAGES_DIR);
+    if std::fs::symlink_metadata(&pages).is_ok_and(|m| m.file_type().is_dir()) {
+        for segment in std::fs::read_dir(&pages)? {
+            let segment = segment?;
+            if segment.file_type()?.is_file()
+                && segment
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_segment_file_name)
+            {
+                std::fs::remove_file(segment.path())?;
+            }
+        }
+        std::fs::remove_dir(&pages)?;
+    }
+    for file in DATABASE_FILES {
+        if file == "btree.wal.lock" {
+            continue;
+        }
+        let path = dir.join(file);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    // The lock file goes once its handle is closed; some systems refuse to delete an open file.
+    drop(lock);
+    let _ = std::fs::remove_file(dir.join("btree.wal.lock"));
+    std::fs::remove_dir(&dir)
+}
+
+/// Prepare `target` (its cluster lock held) for a copy of `sources` (each database and its log)
+/// from the source `source_id` under the key whose [`MasterKey::copy_check`] is `key_check`:
+/// check it may be written, write or check the journal, record and mark every database to copy,
+/// register exactly them, and remove what an earlier run created of databases the source no
+/// longer has. See [`encrypt_cluster`].
+fn prepare_encrypted_targets(
+    target: &Path,
+    source_id: &str,
+    key_check: &str,
+    sources: &[(String, PathBuf)],
+    step: &mut dyn FnMut(CopyStep, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    check_cluster_format(target)?;
+    if target.join("nusadb.wal").exists() {
+        return Err(io::Error::other(
+            "the target data directory has the legacy single-database layout; copy into a new \
+             data directory",
+        ));
+    }
+    check_target_layout(target)?;
+    let wanted: BTreeSet<String> = sources.iter().map(|(name, _)| name.clone()).collect();
+    let mut journal = match CopyJournal::read(target)? {
+        Some(journal) if journal.source != source_id => {
+            return Err(io::Error::other(format!(
+                "{} holds an unfinished copy from {}, not from {source_id}; finish it with that \
+                 source, or copy into an empty data directory. Nothing was changed",
+                target.display(),
+                journal.source
+            )));
+        },
+        Some(journal) if journal.key != key_check => {
+            return Err(io::Error::other(format!(
+                "{} holds an unfinished copy under another encryption key than the one given; \
+                 run the same command with the key it was started with, or copy into an empty \
+                 data directory. Nothing was changed",
+                target.display(),
+            )));
+        },
+        Some(journal) => journal,
+        None => {
+            check_fresh_target(target, &wanted)?;
+            let journal = CopyJournal {
+                source: source_id.to_owned(),
+                key: key_check.to_owned(),
+                created: BTreeSet::new(),
+            };
+            journal.write(target)?;
+            step(CopyStep::Journaled, "")?;
+            journal
+        },
+    };
+    // What the target holds that the source does not have. Only a database this copy created
+    // may go, and only when its directory holds nothing but database files; anything else stops
+    // the run before it changes anything.
+    let leftovers: BTreeSet<String> = load_catalog(target)?
+        .into_iter()
+        .chain(base_dir_names(target)?)
+        .filter(|name| !wanted.contains(name))
+        .collect();
+    let foreign: Vec<&str> = leftovers
+        .iter()
+        .filter(|name| !journal.created.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !foreign.is_empty() {
+        return Err(io::Error::other(format!(
+            "{} holds databases this copy did not create and the source does not have ({}); \
+             nothing was removed. Move them out of the data directory (and out of \
+             global/databases), or remove the data directory and copy again",
+            target.display(),
+            foreign.join(", ")
+        )));
+    }
+    // Before anything is marked or changed: every directory the copy will write or remove is a
+    // real directory (never a link out of the target), and every one it will remove holds only
+    // database files.
+    for name in wanted.iter().chain(&leftovers) {
+        if !is_real_database_dir(target, name)? {
+            continue;
+        }
+        if leftovers.contains(name) {
+            check_only_database_files(&base_dir(target, name))?;
+        } else {
+            refuse_linked_database_files(&base_dir(target, name))?;
+        }
+    }
+    stamp_cluster_format(target)?;
+    // Every database is recorded as the copy's own, durably, before anything of it is created.
+    if !wanted.is_subset(&journal.created) {
+        journal.created.extend(wanted.iter().cloned());
+        journal.write(target)?;
+    }
+    // Every database is copied afresh, so each is marked before the catalog may name it.
+    for (name, _) in sources {
+        nusadb_btree::crypt::mark_incomplete(&base_dir(target, name).join("btree.wal"))
+            .map_err(|e| io::Error::other(format!("database {name}: {e}")))?;
+        step(CopyStep::Marked, name)?;
+    }
+    // Registered, and the leftovers unregistered, in one atomic catalog write.
+    save_catalog(target, &wanted)?;
+    step(CopyStep::Registered, "")?;
+    // No longer registered: their storage goes. A crash part way leaves directories the catalog
+    // does not name, under the journal, which the next run removes.
+    for name in leftovers {
+        remove_copied_database_dir(target, &name)?;
+        tracing::info!(database = %name, "removed from the target: the source no longer has it");
+        step(CopyStep::Removed, &name)?;
+    }
+    sync_dir(&target.join("base"))?;
+    Ok(())
+}
+
+/// Check that the copy into `target` is complete before its journal goes: the catalog and the
+/// directories under `base/` name exactly `names`, no database is marked incomplete, and each is
+/// a finished copy under `key`.
+fn check_finished_copy(target: &Path, names: &[String], key: &MasterKey) -> io::Result<()> {
+    let wanted: BTreeSet<String> = names.iter().cloned().collect();
+    let unfinished = |what: String| {
+        io::Error::other(format!(
+            "the encrypted copy into {} is not complete: {what}. Run the same --encrypt-from \
+             command again",
+            target.display()
+        ))
+    };
+    let catalog = load_catalog(target)?;
+    if catalog != wanted {
+        return Err(unfinished(format!(
+            "the catalog lists {catalog:?}, the source {wanted:?}"
+        )));
+    }
+    let dirs = base_dir_names(target)?;
+    if dirs != wanted {
+        return Err(unfinished(format!(
+            "the databases stored are {dirs:?}, the source's {wanted:?}"
+        )));
+    }
+    let marks = incomplete_marks(target);
+    if !marks.is_empty() {
+        return Err(unfinished(format!("{marks:?} remain")));
+    }
+    for name in names {
+        let wal = base_dir(target, name).join("btree.wal");
+        if !BtreeEngine::is_finished_encrypted_copy(&wal, key)
+            .map_err(|e| io::Error::other(format!("database {name}: {e}")))?
+        {
+            return Err(unfinished(format!(
+                "database {name} is not a finished copy"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What [`rotate_master_key`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rotation {
+    /// Envelopes sealed again under the new key.
+    pub(crate) rewrapped: usize,
+    /// Envelopes already under the new key (a rotation run again after an interruption).
+    pub(crate) already: usize,
+}
+
+/// Seal every data key under `new` instead of `old`: the envelope of each database under the
+/// data directory `root`, and every envelope found under `extra` (the checkpoint archive root,
+/// the backup directory). Holds the cluster lock, so no server may run on `root` meanwhile. Each
+/// envelope is replaced atomically and the data is not rewritten; an interrupted rotation is
+/// finished by running it again with the same keys.
+///
+/// # Errors
+/// Another server holds the data directory, an envelope opens with neither key (named in the
+/// error; the envelopes before it were rotated), or I/O errors.
+pub(crate) fn rotate_master_key(
+    root: &Path,
+    extra: &[PathBuf],
+    old: &MasterKey,
+    new: &MasterKey,
+) -> io::Result<Rotation> {
+    std::fs::create_dir_all(root.join("global"))?;
+    let _lock = lock_cluster(root)?;
+    let mut rotation = Rotation::default();
+    let mut envelopes = Vec::new();
+    for dir in std::iter::once(root.to_path_buf()).chain(extra.iter().cloned()) {
+        find_envelopes(&dir, &mut envelopes)?;
+    }
+    for path in envelopes {
+        match nusadb_btree::crypt::rewrap(&path, old, new)
+            .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?
+        {
+            nusadb_btree::crypt::Rewrapped::Done => rotation.rewrapped += 1,
+            nusadb_btree::crypt::Rewrapped::Already => rotation.already += 1,
+        }
+        tracing::info!(envelope = %path.display(), "data key sealed under the new master key");
+    }
+    Ok(rotation)
+}
+
+/// Every key envelope under `dir`, recursively: a file named `key` or `*.key` that starts with
+/// the envelope header. Directories that cannot be read are skipped. A link at an envelope's
+/// name, or to a directory, is refused: the rotation would otherwise pass over what it hides.
+fn find_envelopes(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let envelope_name = name == "key" || name.ends_with(".key");
+        if kind.is_symlink() && (envelope_name || path.is_dir()) {
+            // Not followed, and not passed over either: an envelope behind it would stay sealed
+            // under the old key, lost with it once the old key is destroyed.
+            return Err(io::Error::other(format!(
+                "{} is a link; a rotation does not follow links, and would leave any key \
+                 envelope behind it under the old key. Replace it with the file or directory \
+                 itself and rotate again. Nothing was changed",
+                path.display()
+            )));
+        }
+        if kind.is_dir() {
+            find_envelopes(&path, out)?;
+        } else if kind.is_file() && envelope_name && nusadb_btree::crypt::is_envelope(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// Take the exclusive lock on `<root>/global/cluster.lock`, creating the file if needed.
 /// Refused when another server holds it: two servers on one data directory would rewrite each
 /// other's catalog and write the same databases.
 fn lock_cluster(root: &Path) -> io::Result<std::fs::File> {
     let path = root.join("global").join("cluster.lock");
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a link; a lock file is never followed. Remove it. Nothing was changed",
+                path.display()
+            ),
+        ));
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1337,8 +2149,7 @@ fn stamp_cluster_format(root: &Path) -> io::Result<()> {
     let text = cluster_format_text();
     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         let scratch = path.with_extension("tmp");
-        std::fs::write(&scratch, &text)?;
-        std::fs::File::open(&scratch)?.sync_all()?;
+        write_fresh(&scratch, text.as_bytes())?;
         std::fs::rename(&scratch, &path)?;
         #[cfg(unix)]
         std::fs::File::open(root.join("global"))?.sync_all()?;
@@ -1390,8 +2201,8 @@ fn load_catalog(root: &Path) -> io::Result<BTreeSet<String>> {
     }
 }
 
-/// Persist the database names, one per line. Writes a temp file and renames it over the catalog so a
-/// crash mid-write cannot truncate the list.
+/// Persist the database names, one per line. Writes a temp file, syncs it and renames it over the
+/// catalog, then syncs the directory, so a crash cannot truncate the list or lose the change.
 fn save_catalog(root: &Path, databases: &BTreeSet<String>) -> io::Result<()> {
     let path = catalog_path(root);
     let tmp = path.with_extension("tmp");
@@ -1400,8 +2211,9 @@ fn save_catalog(root: &Path, databases: &BTreeSet<String>) -> io::Result<()> {
         body.push_str(db);
         body.push('\n');
     }
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)
+    write_fresh(&tmp, body.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    sync_dir(&root.join("global"))
 }
 
 #[cfg(test)]
@@ -1414,6 +2226,949 @@ mod tests {
         scale: 0.1,
         base: 50,
     };
+
+    use nusadb_core::IsolationLevel;
+
+    /// A source cluster of three databases, each with table `t` holding rows `0..rows`.
+    fn three_databases(dir: &Path, rows: u32) {
+        three_databases_from(dir, 0..rows);
+    }
+
+    /// A source cluster of three databases, each with table `t` holding rows `values`.
+    fn three_databases_from(dir: &Path, values: std::ops::Range<u32>) {
+        let m = manager(dir);
+        for db in ["nusadb", "db2", "db3"] {
+            if db != "nusadb" {
+                m.create(db, false).unwrap();
+            }
+            fill(&m, db, values.clone());
+        }
+    }
+
+    /// Create table `t` in database `db` and insert rows `values`, in one transaction.
+    fn fill(m: &DatabaseManager, db: &str, values: std::ops::Range<u32>) {
+        let engine = m.open(db).unwrap().unwrap();
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let table = engine
+            .create_table(
+                txn,
+                &nusadb_core::engine::TableDef {
+                    schema: "public".to_owned(),
+                    name: "t".to_owned(),
+                    columns: vec![nusadb_core::ColumnDef {
+                        name: "v".to_owned(),
+                        ty: nusadb_core::ColumnType::Bytes,
+                        nullable: false,
+                    }],
+                },
+            )
+            .unwrap();
+        for i in values {
+            engine.insert(txn, table, &i.to_be_bytes()).unwrap();
+        }
+        engine.commit(txn).unwrap();
+    }
+
+    fn open_encrypted(dir: &Path, key: &Arc<MasterKey>) -> io::Result<DatabaseManager> {
+        DatabaseManager::open(
+            dir,
+            "nusadb",
+            None,
+            None,
+            NO_AUTOANALYZE,
+            DurabilityOptions {
+                master_key: Some(Arc::clone(key)),
+                ..DurabilityOptions::default()
+            },
+        )
+    }
+
+    /// Every file under `dir` but the lock files, with its contents.
+    fn files_of(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_none_or(|x| x != "lock") {
+                    let bytes = std::fs::read(&p).unwrap();
+                    out.insert(p, bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// No database is registered in `dir` that has neither its marker nor a finished copy.
+    fn every_registered_target_is_marked_or_finished(dir: &Path, key: &MasterKey) {
+        for name in load_catalog(dir).unwrap() {
+            let wal = base_dir(dir, &name).join("btree.wal");
+            assert!(
+                nusadb_btree::crypt::incomplete_path(&wal).exists()
+                    || BtreeEngine::is_finished_encrypted_copy(&wal, key).unwrap(),
+                "{name} is registered with neither a marker nor a finished copy"
+            );
+        }
+    }
+
+    /// The target at `dir` is a finished copy serving exactly `dbs`: no journal, no marker, a
+    /// catalog of `dbs` and nothing else stored, and a normal start accepts it.
+    fn assert_finished_target(dir: &Path, key: &Arc<MasterKey>, dbs: &[&str]) -> DatabaseManager {
+        assert!(!copy_journal_path(dir).exists());
+        assert_eq!(incomplete_marks(dir), Vec::<PathBuf>::new());
+        let wanted: BTreeSet<String> = dbs.iter().map(|d| (*d).to_owned()).collect();
+        assert_eq!(load_catalog(dir).unwrap(), wanted);
+        assert_eq!(base_dir_names(dir).unwrap(), wanted);
+        let m = open_encrypted(dir, key).unwrap();
+        assert_eq!(
+            m.list(),
+            dbs.iter().map(|d| (*d).to_owned()).collect::<Vec<_>>()
+        );
+        m
+    }
+
+    #[test]
+    fn an_interrupted_encrypted_copy_of_several_databases_is_refused_and_a_rerun_finishes_it() {
+        let key = Arc::new(MasterKey::from_text(&"3c".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 150);
+        // Where to stop, and an extra crash artifact to leave behind there.
+        let points: [(CopyStep, &str, bool); 6] = [
+            (CopyStep::Journaled, "", false),
+            (CopyStep::Marked, "db2", false),
+            (CopyStep::Marked, "db3", false),
+            (CopyStep::Registered, "", false),
+            // Mid-segment: db2's copy died after its data key and part of its segment.
+            (CopyStep::Registered, "", true),
+            // Databases are copied in name order: db2 is done, db3 and nusadb are not.
+            (CopyStep::Copied, "db2", false),
+        ];
+        for (at, name, mid_segment) in points {
+            let target = tempfile::tempdir().unwrap();
+            let stopped = encrypt_cluster_stepped(
+                target.path(),
+                source.path(),
+                &key,
+                None,
+                NO_AUTOANALYZE,
+                &mut |step, db| {
+                    if step == at && db == name {
+                        Err(io::Error::other("stopped here"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(stopped.is_err(), "{at:?} {name}");
+            if mid_segment {
+                let dir = base_dir(target.path(), "db2");
+                let other = tempfile::tempdir().unwrap();
+                let envelope = other.path().join("k");
+                nusadb_btree::crypt::DataKey::create(&envelope, &key).unwrap();
+                std::fs::copy(&envelope, dir.join("btree.wal.key")).unwrap();
+                std::fs::create_dir_all(dir.join("btree.wal.pages")).unwrap();
+                std::fs::write(
+                    dir.join("btree.wal.pages")
+                        .join("00000000000000000001-1-full.seg"),
+                    [7u8; 9000],
+                )
+                .unwrap();
+            }
+            every_registered_target_is_marked_or_finished(target.path(), &key);
+            // A normal start refuses, and changes nothing.
+            let before = files_of(target.path());
+            let err = open_encrypted(target.path(), &key).unwrap_err().to_string();
+            assert!(err.contains("has not finished"), "{at:?} {name}: {err}");
+            assert_eq!(files_of(target.path()), before, "{at:?} {name}");
+            // The run again copies every database afresh.
+            let done = run_copy(target.path(), source.path(), &key).unwrap();
+            assert_eq!(
+                done.iter().map(|(db, _)| db.as_str()).collect::<Vec<_>>(),
+                ["db2", "db3", "nusadb"]
+            );
+            let m = assert_finished_target(target.path(), &key, &["db2", "db3", "nusadb"]);
+            for db in ["nusadb", "db2", "db3"] {
+                assert_eq!(
+                    rows_in(&m, db),
+                    (0..150).collect::<Vec<_>>(),
+                    "{at:?} {name}: {db}"
+                );
+            }
+            drop(m);
+            // The copy is complete: a further run is refused, whatever the source did since.
+            let before = files_of(target.path());
+            let err = run_copy(target.path(), source.path(), &key)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("already holds databases"), "{err}");
+            assert_eq!(files_of(target.path()), before);
+        }
+    }
+
+    fn run_copy(
+        target: &Path,
+        source: &Path,
+        key: &Arc<MasterKey>,
+    ) -> io::Result<Vec<(String, u64)>> {
+        encrypt_cluster(target, source, key, None, NO_AUTOANALYZE)
+    }
+
+    /// Stop a copy at `at` for database `db`, as a crash there would.
+    fn copy_until_step(target: &Path, source: &Path, key: &Arc<MasterKey>, at: CopyStep, db: &str) {
+        let stopped =
+            encrypt_cluster_stepped(target, source, key, None, NO_AUTOANALYZE, &mut |step, d| {
+                if step == at && d == db {
+                    Err(io::Error::other("stopped here"))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(stopped.is_err());
+    }
+
+    /// Stop a copy just after database `db` is finished.
+    fn copy_until(target: &Path, source: &Path, key: &Arc<MasterKey>, db: &str) {
+        copy_until_step(target, source, key, CopyStep::Copied, db);
+    }
+
+    /// Rows in table `t` of database `db` of the cluster at `dir`.
+    fn rows_in(m: &DatabaseManager, db: &str) -> Vec<u32> {
+        let engine = m.open(db).unwrap().unwrap();
+        let table = engine.lookup_table("t").unwrap().unwrap().id;
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let mut scan = engine.scan(txn, table).unwrap();
+        let mut out = Vec::new();
+        while let Some((_, tuple)) = scan.try_next().unwrap() {
+            out.push(u32::from_be_bytes(tuple[..4].try_into().unwrap()));
+        }
+        drop(scan);
+        engine.commit(txn).unwrap();
+        out.sort_unstable();
+        out
+    }
+
+    /// Add rows `from..to` to table `t` of `db` in the unencrypted cluster at `dir`, and delete
+    /// row 0.
+    fn change_source(dir: &Path, db: &str, from: u32, to: u32) {
+        let m = manager(dir);
+        let engine = m.open(db).unwrap().unwrap();
+        let table = engine.lookup_table("t").unwrap().unwrap().id;
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        for i in from..to {
+            engine.insert(txn, table, &i.to_be_bytes()).unwrap();
+        }
+        let mut scan = engine.scan(txn, table).unwrap();
+        let mut zero = None;
+        while let Some((tid, tuple)) = scan.try_next().unwrap() {
+            if tuple[..4] == 0u32.to_be_bytes() {
+                zero = Some(tid);
+            }
+        }
+        drop(scan);
+        engine.delete(txn, table, zero.unwrap()).unwrap();
+        engine.commit(txn).unwrap();
+    }
+
+    /// The log position database `db` of the unencrypted cluster at `dir` stands at.
+    fn position_of(dir: &Path, db: &str) -> u64 {
+        let engine =
+            BtreeEngine::open_with(base_dir(dir, db).join("btree.wal"), OpenOptions::default())
+                .unwrap();
+        engine.wal_last_lsn().unwrap().unwrap_or(0)
+    }
+
+    #[test]
+    fn a_copy_resumes_only_from_the_same_source_and_copies_everything_again() {
+        let key = Arc::new(MasterKey::from_text(&"4d".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 100);
+
+        // Another source with the same database names, and the same key: an interrupted copy
+        // from the first is not finished from the second, and nothing is changed.
+        let other = tempfile::tempdir().unwrap();
+        three_databases(other.path(), 7);
+        let target = tempfile::tempdir().unwrap();
+        copy_until(target.path(), source.path(), &key, "db2");
+        let before = files_of(target.path());
+        let err = run_copy(target.path(), other.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unfinished copy from"), "{err}");
+        assert_eq!(files_of(target.path()), before);
+
+        // The source moved on after db2 was copied: the rerun holds the source's latest rows.
+        change_source(source.path(), "db2", 100, 130);
+        run_copy(target.path(), source.path(), &key).unwrap();
+        let m = assert_finished_target(target.path(), &key, &["db2", "db3", "nusadb"]);
+        assert_eq!(rows_in(&m, "db2"), (1..130).collect::<Vec<_>>());
+        assert_eq!(rows_in(&m, "db3"), (0..100).collect::<Vec<_>>());
+        drop(m);
+
+        // A finished copy of another source in the target: refused, never kept.
+        let err = run_copy(target.path(), other.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already holds databases"), "{err}");
+    }
+
+    #[test]
+    fn a_rerun_copies_again_a_database_recreated_at_the_same_log_position() {
+        let key = Arc::new(MasterKey::from_text(&"5e".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 100);
+        let target = tempfile::tempdir().unwrap();
+        copy_until(target.path(), source.path(), &key, "db2");
+        // db2 dropped and created again with other rows, by the same statements: its log
+        // stands where the finished copy's did, though its contents differ.
+        let was = position_of(source.path(), "db2");
+        let m = manager(source.path());
+        m.drop_database("db2", false, "nusadb").unwrap();
+        m.create("db2", false).unwrap();
+        fill(&m, "db2", 500..600);
+        drop(m);
+        assert_eq!(position_of(source.path(), "db2"), was);
+
+        run_copy(target.path(), source.path(), &key).unwrap();
+        let m = assert_finished_target(target.path(), &key, &["db2", "db3", "nusadb"]);
+        assert_eq!(rows_in(&m, "db2"), (500..600).collect::<Vec<_>>());
+        assert_eq!(rows_in(&m, "db3"), (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_rerun_from_another_cluster_put_at_the_source_path_copies_only_it() {
+        let key = Arc::new(MasterKey::from_text(&"6f".repeat(32)).unwrap());
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("data");
+        three_databases(&source, 100);
+        let target = tempfile::tempdir().unwrap();
+        copy_until(target.path(), &source, &key, "db2");
+        // The directory is replaced by another cluster built the same way, with other rows.
+        std::fs::rename(&source, parent.path().join("old")).unwrap();
+        three_databases_from(&source, 1000..1100);
+
+        run_copy(target.path(), &source, &key).unwrap();
+        let m = assert_finished_target(target.path(), &key, &["db2", "db3", "nusadb"]);
+        for db in ["nusadb", "db2", "db3"] {
+            assert_eq!(rows_in(&m, db), (1000..1100).collect::<Vec<_>>(), "{db}");
+        }
+    }
+
+    #[test]
+    fn a_database_the_source_dropped_is_removed_from_the_target_on_the_rerun() {
+        let key = Arc::new(MasterKey::from_text(&"7a".repeat(32)).unwrap());
+        // db2 finished before the source dropped it; db3 was still marked when the source
+        // dropped it. Either way the rerun leaves exactly the source's databases.
+        for dropped in ["db2", "db3"] {
+            let source = tempfile::tempdir().unwrap();
+            three_databases(source.path(), 50);
+            let target = tempfile::tempdir().unwrap();
+            copy_until(target.path(), source.path(), &key, "db2");
+            manager(source.path())
+                .drop_database(dropped, false, "nusadb")
+                .unwrap();
+            let kept: Vec<&str> = ["db2", "db3", "nusadb"]
+                .into_iter()
+                .filter(|d| *d != dropped)
+                .collect();
+
+            // A rerun that stops after the catalog no longer names it, before its directory
+            // goes: still refused by a normal start, and finished by the next run.
+            copy_until_step(target.path(), source.path(), &key, CopyStep::Registered, "");
+            assert!(base_dir(target.path(), dropped).exists());
+            assert!(!load_catalog(target.path()).unwrap().contains(dropped));
+            let err = open_encrypted(target.path(), &key).unwrap_err().to_string();
+            assert!(err.contains("has not finished"), "{err}");
+
+            let done = run_copy(target.path(), source.path(), &key).unwrap();
+            assert_eq!(
+                done.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(),
+                kept
+            );
+            let m = assert_finished_target(target.path(), &key, &kept);
+            assert!(m.open(dropped).unwrap().is_none(), "{dropped} is served");
+            assert!(!base_dir(target.path(), dropped).exists());
+            for db in &kept {
+                assert_eq!(rows_in(&m, db), (0..50).collect::<Vec<_>>(), "{db}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_that_does_not_end_consistent_keeps_its_journal() {
+        let key = Arc::new(MasterKey::from_text(&"8b".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 20);
+        let target = tempfile::tempdir().unwrap();
+        // A marker appears under the target while the copy runs: the run does not claim success,
+        // the journal stays, and a normal start refuses.
+        let stray = base_dir(target.path(), "zz").join("btree.wal");
+        let err = encrypt_cluster_stepped(
+            target.path(),
+            source.path(),
+            &key,
+            None,
+            NO_AUTOANALYZE,
+            &mut |step, db| {
+                if step == CopyStep::Copied && db == "nusadb" {
+                    nusadb_btree::crypt::mark_incomplete(&stray)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not complete"), "{err}");
+        assert!(copy_journal_path(target.path()).exists());
+        assert!(open_encrypted(target.path(), &key).is_err());
+        // The copy did not create it, so the rerun leaves it and stops; once it is moved out,
+        // the rerun finishes.
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not create"), "{err}");
+        assert!(nusadb_btree::crypt::incomplete_path(&stray).exists());
+        std::fs::remove_dir_all(base_dir(target.path(), "zz")).unwrap();
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db2", "db3", "nusadb"],
+        ));
+    }
+
+    #[test]
+    fn a_new_copy_refuses_a_target_holding_anything_but_empty_database_directories() {
+        let key = Arc::new(MasterKey::from_text(&"91".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 20);
+
+        // A file that is no database's, in a directory under base/: refused, kept.
+        let target = tempfile::tempdir().unwrap();
+        let photos = target.path().join("base").join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        std::fs::write(photos.join("IMPORTANT.txt"), b"keep me").unwrap();
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already holds"), "{err}");
+        assert_eq!(
+            std::fs::read(photos.join("IMPORTANT.txt")).unwrap(),
+            b"keep me"
+        );
+        assert!(!target.path().join("global").exists(), "nothing is created");
+
+        // A plain file directly under base/: refused too.
+        let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(target.path().join("base")).unwrap();
+        std::fs::write(target.path().join("base").join("notes"), b"x").unwrap();
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already holds"), "{err}");
+        assert!(target.path().join("base").join("notes").exists());
+
+        // A stopped cluster with an empty database of its own: refused, the database kept.
+        let target = tempfile::tempdir().unwrap();
+        manager(target.path()).create("app", false).unwrap();
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the source does not have (app)"), "{err}");
+        assert!(load_catalog(target.path()).unwrap().contains("app"));
+        assert!(base_dir(target.path(), "app").is_dir());
+        assert!(!copy_journal_path(target.path()).exists());
+
+        // A data directory a server was started on once, with nothing written: a fresh target.
+        let target = tempfile::tempdir().unwrap();
+        drop(manager(target.path()));
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db2", "db3", "nusadb"],
+        ));
+    }
+
+    #[test]
+    fn a_rerun_removes_only_databases_the_copy_created_and_only_their_files() {
+        let key = Arc::new(MasterKey::from_text(&"92".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 20);
+
+        // Stopped right after the journal was first written; then a directory of files and an
+        // empty database appear in the target. The rerun removes neither, and keeps its journal.
+        let target = tempfile::tempdir().unwrap();
+        copy_until_step(target.path(), source.path(), &key, CopyStep::Journaled, "");
+        let photos = target.path().join("base").join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        std::fs::write(photos.join("IMPORTANT.txt"), b"keep me").unwrap();
+        let app = base_dir(target.path(), "app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("btree.wal.lock"), b"").unwrap();
+        save_catalog(target.path(), &BTreeSet::from(["app".to_owned()])).unwrap();
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not create"), "{err}");
+        assert!(err.contains("app") && err.contains("photos"), "{err}");
+        assert_eq!(
+            std::fs::read(photos.join("IMPORTANT.txt")).unwrap(),
+            b"keep me"
+        );
+        assert!(app.is_dir());
+        assert!(load_catalog(target.path()).unwrap().contains("app"));
+        assert!(copy_journal_path(target.path()).exists());
+        // Moved out, the same command finishes.
+        std::fs::remove_dir_all(&photos).unwrap();
+        std::fs::remove_dir_all(&app).unwrap();
+        save_catalog(target.path(), &BTreeSet::new()).unwrap();
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db2", "db3", "nusadb"],
+        ));
+
+        // A database the copy created, dropped on the source, holding a file that is no
+        // database's: left in place, with the journal.
+        let target = tempfile::tempdir().unwrap();
+        copy_until(target.path(), source.path(), &key, "db2");
+        manager(source.path())
+            .drop_database("db2", false, "nusadb")
+            .unwrap();
+        let notes = base_dir(target.path(), "db2").join("notes.txt");
+        std::fs::write(&notes, b"mine").unwrap();
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a file of a database"), "{err}");
+        assert_eq!(std::fs::read(&notes).unwrap(), b"mine");
+        assert!(copy_journal_path(target.path()).exists());
+        std::fs::remove_file(&notes).unwrap();
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db3", "nusadb"],
+        ));
+    }
+
+    #[test]
+    fn a_missing_source_or_one_that_is_no_data_directory_is_refused_creating_nothing() {
+        let key = Arc::new(MasterKey::from_text(&"93".repeat(32)).unwrap());
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        let missing = parent.path().join("missing");
+        let err = run_copy(&target, &missing, &key).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!missing.exists());
+        assert!(!target.exists());
+
+        let plain = parent.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("file"), b"x").unwrap();
+        let err = run_copy(&target, &plain, &key).unwrap_err().to_string();
+        assert!(err.contains("is not a nusadb data directory"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&plain).unwrap().count(),
+            1,
+            "nothing is created in the source"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_rerun_under_another_key_is_refused() {
+        let key = Arc::new(MasterKey::from_text(&"94".repeat(32)).unwrap());
+        let other = Arc::new(MasterKey::from_text(&"95".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 20);
+        let target = tempfile::tempdir().unwrap();
+        copy_until(target.path(), source.path(), &key, "db2");
+        let journal = std::fs::read_to_string(copy_journal_path(target.path())).unwrap();
+        assert!(
+            !journal.contains(&"94".repeat(32)),
+            "the key itself is never stored"
+        );
+        assert!(!journal.contains(&key.fingerprint()));
+        let before = files_of(target.path());
+        let err = run_copy(target.path(), source.path(), &other)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another encryption key"), "{err}");
+        assert_eq!(files_of(target.path()), before);
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db2", "db3", "nusadb"],
+        ));
+    }
+
+    /// A directory outside any target holding what a database keeps: the link's victim.
+    #[cfg(unix)]
+    fn victim() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("btree.wal"), b"victim log").unwrap();
+        std::fs::write(dir.path().join("btree.wal.ckpt"), b"victim image").unwrap();
+        std::fs::create_dir_all(dir.path().join("btree.wal.pages")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("btree.wal.pages")
+                .join("00000000000000000007-1-full.seg"),
+            b"victim pages",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Put a link to `to` at `<target>/base/<name>`, in place of whatever is there.
+    #[cfg(unix)]
+    fn link_database_dir(target: &Path, name: &str, to: &Path) {
+        let at = base_dir(target, name);
+        if std::fs::symlink_metadata(&at).is_ok() {
+            std::fs::remove_dir_all(&at).unwrap();
+        }
+        std::os::unix::fs::symlink(to, &at).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_never_writes_through_a_database_directory_replaced_by_a_link() {
+        let key = Arc::new(MasterKey::from_text(&"96".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 20);
+        let target = tempfile::tempdir().unwrap();
+        // Stopped once the journal names every database as the copy's own; db3 is not marked yet.
+        copy_until_step(target.path(), source.path(), &key, CopyStep::Marked, "db2");
+        assert!(
+            std::fs::read_to_string(copy_journal_path(target.path()))
+                .unwrap()
+                .contains("created db3")
+        );
+        let victim = victim();
+        let intact = files_of(victim.path());
+        link_database_dir(target.path(), "db3", victim.path());
+        let before = files_of(target.path());
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a link or a file"), "{err}");
+        assert_eq!(files_of(victim.path()), intact, "the victim is untouched");
+        assert!(!victim.path().join("btree.wal.incomplete").exists());
+        assert!(!victim.path().join("btree.wal.lock").exists());
+        assert!(
+            std::fs::symlink_metadata(base_dir(target.path(), "db3"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(files_of(target.path()).len(), before.len());
+        // The link moved out, the same command finishes.
+        std::fs::remove_file(base_dir(target.path(), "db3")).unwrap();
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db2", "db3", "nusadb"],
+        ));
+        assert_eq!(files_of(victim.path()), intact);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_never_removes_through_a_dropped_database_directory_replaced_by_a_link() {
+        let key = Arc::new(MasterKey::from_text(&"97".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 20);
+        let target = tempfile::tempdir().unwrap();
+        copy_until_step(target.path(), source.path(), &key, CopyStep::Registered, "");
+        assert!(load_catalog(target.path()).unwrap().contains("db2"));
+        manager(source.path())
+            .drop_database("db2", false, "nusadb")
+            .unwrap();
+        let victim = victim();
+        let intact = files_of(victim.path());
+        link_database_dir(target.path(), "db2", victim.path());
+        let catalog = load_catalog(target.path()).unwrap();
+        let err = run_copy(target.path(), source.path(), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a link or a file"), "{err}");
+        assert_eq!(files_of(victim.path()), intact, "the victim is untouched");
+        assert!(!victim.path().join("btree.wal.lock").exists());
+        assert_eq!(
+            load_catalog(target.path()).unwrap(),
+            catalog,
+            "nothing was changed"
+        );
+        assert!(copy_journal_path(target.path()).exists());
+        std::fs::remove_file(base_dir(target.path(), "db2")).unwrap();
+        run_copy(target.path(), source.path(), &key).unwrap();
+        drop(assert_finished_target(
+            target.path(),
+            &key,
+            &["db3", "nusadb"],
+        ));
+        assert_eq!(files_of(victim.path()), intact);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_into_a_target_whose_base_or_global_is_a_link_is_refused() {
+        let key = Arc::new(MasterKey::from_text(&"98".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 5);
+        for part in ["base", "global"] {
+            let target = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), target.path().join(part)).unwrap();
+            let err = run_copy(target.path(), source.path(), &key)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is a link or a file"), "{part}: {err}");
+            assert_eq!(
+                std::fs::read_dir(elsewhere.path()).unwrap().count(),
+                0,
+                "{part}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_named_database_files_are_removed_from_a_created_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = base_dir(dir.path(), "db9");
+        std::fs::create_dir_all(db.join("btree.wal.pages")).unwrap();
+        for f in [
+            "btree.wal",
+            "btree.wal.ckpt",
+            "btree.wal.key",
+            "btree.wal.incomplete",
+        ] {
+            std::fs::write(db.join(f), b"x").unwrap();
+        }
+        std::fs::write(
+            db.join("btree.wal.pages")
+                .join("00000000000000000001-a-full.seg"),
+            b"x",
+        )
+        .unwrap();
+        // A file with a database-like name that is not one of the database's: kept, refused.
+        std::fs::write(db.join("btree.wal.backup"), b"mine").unwrap();
+        let err = remove_copied_database_dir(dir.path(), "db9")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a file of a database"), "{err}");
+        assert_eq!(std::fs::read(db.join("btree.wal.backup")).unwrap(), b"mine");
+        assert!(db.join("btree.wal").exists());
+        // So is a page file that is not a segment.
+        std::fs::remove_file(db.join("btree.wal.backup")).unwrap();
+        std::fs::write(db.join("btree.wal.pages").join("notes"), b"mine").unwrap();
+        assert!(remove_copied_database_dir(dir.path(), "db9").is_err());
+        assert!(db.join("btree.wal.pages").join("notes").exists());
+        std::fs::remove_file(db.join("btree.wal.pages").join("notes")).unwrap();
+        remove_copied_database_dir(dir.path(), "db9").unwrap();
+        assert!(!db.exists());
+    }
+
+    /// A file outside every data directory with known contents, and a path beside it that does
+    /// not exist.
+    #[cfg(unix)]
+    fn victim_file(dir: &Path) -> (PathBuf, PathBuf) {
+        let file = dir.join("victim");
+        std::fs::write(&file, b"victim bytes").unwrap();
+        (file, dir.join("nowhere"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_copy_never_writes_its_scratch_files_through_a_link() {
+        let key = Arc::new(MasterKey::from_text(&"99".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 5);
+        for scratch in ["encrypt-copy.tmp", "databases.tmp", "format.tmp"] {
+            for dangling in [false, true] {
+                let outside = tempfile::tempdir().unwrap();
+                let (file, nowhere) = victim_file(outside.path());
+                let target = tempfile::tempdir().unwrap();
+                std::fs::create_dir_all(target.path().join("global")).unwrap();
+                let to = if dangling { &nowhere } else { &file };
+                std::os::unix::fs::symlink(to, target.path().join("global").join(scratch)).unwrap();
+                run_copy(target.path(), source.path(), &key).unwrap();
+                assert_eq!(std::fs::read(&file).unwrap(), b"victim bytes", "{scratch}");
+                assert!(!nowhere.exists(), "{scratch}");
+                drop(assert_finished_target(
+                    target.path(),
+                    &key,
+                    &["db2", "db3", "nusadb"],
+                ));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_refuses_a_link_at_a_database_file_name_before_changing_anything() {
+        let key = Arc::new(MasterKey::from_text(&"9a".repeat(32)).unwrap());
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 5);
+        for name in [
+            "btree.wal.incomplete",
+            "btree.wal.key.tmp",
+            "btree.wal.lock",
+            "btree.wal.pages",
+        ] {
+            for dangling in [false, true] {
+                let outside = tempfile::tempdir().unwrap();
+                let (file, nowhere) = victim_file(outside.path());
+                let target = tempfile::tempdir().unwrap();
+                copy_until(target.path(), source.path(), &key, "db2");
+                let at = base_dir(target.path(), "db3").join(name);
+                if std::fs::symlink_metadata(&at).is_ok() {
+                    std::fs::remove_file(&at).unwrap();
+                }
+                let to = if dangling { &nowhere } else { &file };
+                std::os::unix::fs::symlink(to, &at).unwrap();
+                let catalog = load_catalog(target.path()).unwrap();
+                let err = run_copy(target.path(), source.path(), &key)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("is a link"), "{name}: {err}");
+                assert_eq!(std::fs::read(&file).unwrap(), b"victim bytes", "{name}");
+                assert!(!nowhere.exists(), "{name}");
+                assert_eq!(load_catalog(target.path()).unwrap(), catalog, "{name}");
+                std::fs::remove_file(&at).unwrap();
+                run_copy(target.path(), source.path(), &key).unwrap();
+                drop(assert_finished_target(
+                    target.path(),
+                    &key,
+                    &["db2", "db3", "nusadb"],
+                ));
+                assert_eq!(std::fs::read(&file).unwrap(), b"victim bytes", "{name}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_never_writes_an_envelope_scratch_file_through_a_link() {
+        let key = Arc::new(MasterKey::from_text(&"9b".repeat(32)).unwrap());
+        let new = MasterKey::from_text(&"9c".repeat(32)).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 5);
+        let target = tempfile::tempdir().unwrap();
+        run_copy(target.path(), source.path(), &key).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (file, nowhere) = victim_file(outside.path());
+        std::os::unix::fs::symlink(
+            &file,
+            base_dir(target.path(), "db2").join("btree.wal.key.tmp"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            &nowhere,
+            base_dir(target.path(), "db3").join("btree.wal.key.tmp"),
+        )
+        .unwrap();
+        std::fs::hard_link(
+            &file,
+            base_dir(target.path(), "nusadb").join("btree.wal.key.tmp"),
+        )
+        .unwrap();
+        let done = rotate_master_key(target.path(), &[], &key, &new).unwrap();
+        assert_eq!(done.rewrapped, 3);
+        assert_eq!(std::fs::read(&file).unwrap(), b"victim bytes");
+        assert!(!nowhere.exists());
+        drop(assert_finished_target(
+            target.path(),
+            &Arc::new(new),
+            &["db2", "db3", "nusadb"],
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_that_is_a_link_is_refused_and_creates_nothing() {
+        let outside = tempfile::tempdir().unwrap();
+        let (_, nowhere) = victim_file(outside.path());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("global")).unwrap();
+        std::os::unix::fs::symlink(&nowhere, dir.path().join("global").join("cluster.lock"))
+            .unwrap();
+        let err = lock_cluster(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("is a link"), "{err}");
+        std::os::unix::fs::symlink(&nowhere, dir.path().join("btree.wal.lock")).unwrap();
+        let err = nusadb_btree::lock_database(&dir.path().join("btree.wal"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a link"), "{err}");
+        assert!(!nowhere.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_refuses_a_linked_envelope_before_rewrapping_anything() {
+        let key = Arc::new(MasterKey::from_text(&"9d".repeat(32)).unwrap());
+        let new = MasterKey::from_text(&"9e".repeat(32)).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        three_databases(source.path(), 5);
+        let outside = tempfile::tempdir().unwrap();
+        for linked in ["envelope", "directory"] {
+            let target = tempfile::tempdir().unwrap();
+            run_copy(target.path(), source.path(), &key).unwrap();
+            let (from, to) = if linked == "envelope" {
+                (
+                    base_dir(target.path(), "db2").join("btree.wal.key"),
+                    outside.path().join("db2.key"),
+                )
+            } else {
+                (base_dir(target.path(), "db2"), outside.path().join("db2"))
+            };
+            std::fs::rename(&from, &to).unwrap();
+            std::os::unix::fs::symlink(&to, &from).unwrap();
+            let before = files_of(target.path());
+            let outside_before = files_of(outside.path());
+            let err = rotate_master_key(target.path(), &[], &key, &new)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("is a link") && err.contains("db2"),
+                "{linked}: {err}"
+            );
+            assert_eq!(
+                files_of(target.path()),
+                before,
+                "{linked}: nothing rewrapped"
+            );
+            assert_eq!(files_of(outside.path()), outside_before, "{linked}");
+            std::fs::remove_file(&from).unwrap();
+            std::fs::rename(&to, &from).unwrap();
+            // Put back, the rotation goes through every envelope.
+            assert_eq!(
+                rotate_master_key(target.path(), &[], &key, &new)
+                    .unwrap()
+                    .rewrapped,
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn a_journal_with_a_line_break_in_its_source_is_refused_as_damaged() {
+        let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(target.path().join("global")).unwrap();
+        std::fs::write(
+            copy_journal_path(target.path()),
+            format!("{COPY_JOURNAL_HEADER}\nsource /a\n/b\nkey 00\n"),
+        )
+        .unwrap();
+        let err = CopyJournal::read(target.path()).unwrap_err().to_string();
+        assert!(err.contains("not a readable copy journal"), "{err}");
+    }
 
     fn manager(dir: &Path) -> DatabaseManager {
         DatabaseManager::open(
@@ -1794,10 +3549,8 @@ mod tests {
             None,
             NO_AUTOANALYZE,
             DurabilityOptions {
-                checkpoint: None,
                 wal_archive: Some(archive_root.clone()),
-                standby: None,
-                max_prepared_transactions: None,
+                ..DurabilityOptions::default()
             },
         )
         .expect("open primary");
@@ -1832,10 +3585,8 @@ mod tests {
             None,
             NO_AUTOANALYZE,
             DurabilityOptions {
-                checkpoint: None,
-                wal_archive: None,
                 standby: Some(cfg.clone()),
-                max_prepared_transactions: None,
+                ..DurabilityOptions::default()
             },
         )
         .expect("open standby");
@@ -1865,7 +3616,7 @@ mod tests {
         btree.set_standby(true);
         assert_eq!(rows(&btree), vec![b"one".to_vec()]);
         assert!(matches!(
-            standby_tick(&btree, &archive_root.join("shop"), cfg.max_pause),
+            standby_tick(&btree, &archive_root.join("shop"), cfg.max_pause, None),
             StandbyTick::Idle { .. }
         ));
         // The primary writes on and checkpoints; one tick brings the standby level.
@@ -1874,7 +3625,7 @@ mod tests {
         engine.commit(txn).unwrap();
         engine.checkpoint().unwrap();
         assert!(matches!(
-            standby_tick(&btree, &archive_root.join("shop"), cfg.max_pause),
+            standby_tick(&btree, &archive_root.join("shop"), cfg.max_pause, None),
             StandbyTick::Applied { segments: 1, .. }
         ));
         assert_eq!(rows(&btree), vec![b"one".to_vec(), b"two".to_vec()]);
@@ -1901,10 +3652,8 @@ mod tests {
             None,
             NO_AUTOANALYZE,
             DurabilityOptions {
-                checkpoint: None,
                 wal_archive: Some(archive_root.clone()),
-                standby: None,
-                max_prepared_transactions: None,
+                ..DurabilityOptions::default()
             },
         )
         .expect("open cluster");

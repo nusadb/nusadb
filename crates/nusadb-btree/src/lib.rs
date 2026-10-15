@@ -63,6 +63,7 @@
 //! entries for dropped tables and indexes so replay never resurrects them empty). A tuple too
 //! large for a leaf goes to an overflow page chain. Purge scheduling is the caller's.
 
+pub mod crypt;
 mod engine;
 pub mod format;
 pub mod keytree;
@@ -74,8 +75,9 @@ pub mod wal;
 
 pub use engine::{
     BackupInfo, BtreeEngine, CheckpointOutcome, DEFAULT_MAX_PREPARED_TRANSACTIONS, MAX_GID_BYTES,
-    MAX_USER_TUPLE, PruneStats, PurgeStats, RecoveryTarget, ShipOutcome, VersionMetadata,
-    lock_database, newest_archived_image, prune_archive, seed_standby, shipped_segments_after,
+    MAX_USER_TUPLE, OpenOptions, PruneStats, PurgeStats, RecoveryTarget, ShipOutcome,
+    VersionMetadata, lock_database, newest_archived_image, prune_archive, seed_standby,
+    seed_standby_with_key, shipped_segments_after,
 };
 
 #[cfg(test)]

@@ -19,6 +19,10 @@ bytemuck    = { workspace = true }
 crc32fast   = { workspace = true }
 lz4_flex    = { workspace = true }
 aes-gcm-siv = { workspace = true }
+getrandom   = { workspace = true }
+# Only to turn on its `zeroize` feature (see the workspace manifest).
+aes         = { workspace = true }
+zeroize     = { workspace = true }
 parking_lot = { workspace = true }
 tracing     = { workspace = true }
 

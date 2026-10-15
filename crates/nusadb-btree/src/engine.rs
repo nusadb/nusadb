@@ -50,6 +50,7 @@ use nusadb_core::{
 };
 use nusadb_wal::{WalRecord, WalWriter};
 
+use crate::crypt::{DataKey, KeyCheck, MasterKey};
 use crate::keytree::{self, KeyTree};
 use crate::mvcc::{self, ReadView, RowMeta, UndoVersion};
 use crate::store::{PageFile, PagedStore};
@@ -271,6 +272,23 @@ pub struct BtreeEngine {
     dst_fail_next_wal_append: AtomicBool,
     /// How many prepared transactions may wait at once (`0` refuses `PREPARE TRANSACTION`).
     max_prepared: prepared::PreparedLimit,
+    /// The database's data key when it is encrypted: the log, the image and the page segments
+    /// are sealed under it (see [`crate::crypt`]). `None` for an unencrypted database and the
+    /// in-memory engine.
+    data_key: Option<Arc<DataKey>>,
+}
+
+/// How [`BtreeEngine::open_with`] opens a database.
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    /// The checkpoint archive (see [`BtreeEngine::open_with_archive`]).
+    pub archive: Option<std::path::PathBuf>,
+    /// Open as a standby (see [`BtreeEngine::open_standby`]).
+    pub standby: bool,
+    /// The master key: an encrypted database opens only with the key its data key was sealed
+    /// under, a database that holds nothing yet is created encrypted, and an unencrypted one
+    /// that holds data is refused. `None` opens unencrypted databases only.
+    pub master_key: Option<Arc<MasterKey>>,
 }
 
 /// The schema domain (rank 2): everything DDL-shaped. The `RwLock` around it is the
@@ -1723,6 +1741,23 @@ impl BtreeEngine {
     /// Refused on a writable engine, on a corrupt segment, on a gap, or after an earlier apply
     /// could not make its records durable; propagates replay and log errors.
     pub fn apply_shipped_segment(&self, bytes: &[u8], max_wait: Duration) -> Result<ShipOutcome> {
+        let key = self.data_key.clone();
+        self.apply_shipped_segment_with_key(bytes, max_wait, key.as_deref())
+    }
+
+    /// [`apply_shipped_segment`](Self::apply_shipped_segment) for a segment sealed under `key`,
+    /// the data key of the primary's archive (`None`: an unencrypted archive). The records are
+    /// sealed again under this engine's own key as they are appended to its log.
+    ///
+    /// # Errors
+    /// As [`apply_shipped_segment`](Self::apply_shipped_segment); a record that fails
+    /// authentication refuses the segment.
+    pub fn apply_shipped_segment_with_key(
+        &self,
+        bytes: &[u8],
+        max_wait: Duration,
+        key: Option<&DataKey>,
+    ) -> Result<ShipOutcome> {
         let refuse =
             |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
         if !self.is_standby() {
@@ -1737,11 +1772,27 @@ impl BtreeEngine {
                 "nusadb-btree: the in-memory engine has no log to ship into",
             )));
         };
-        let prefix = nusadb_wal::recover_prefix(bytes).map_err(|hole| {
-            refuse(format!(
-                "nusadb-btree: the shipped segment is corrupt at byte {}",
-                hole.at
-            ))
+        if key.is_some() != self.data_key.is_some() {
+            return Err(refuse(
+                "nusadb-btree: the shipped segment and this standby disagree on encryption; \
+                 both or neither must be encrypted"
+                    .to_owned(),
+            ));
+        }
+        let seal = key.map(DataKey::log_seal);
+        let prefix = nusadb_wal::recover_sealed_prefix(bytes, seal.as_ref()).map_err(|hole| {
+            if hole.forged {
+                refuse(format!(
+                    "nusadb-btree: the shipped segment's record at byte {} fails \
+                     authentication (altered, or sealed under another key)",
+                    hole.at
+                ))
+            } else {
+                refuse(format!(
+                    "nusadb-btree: the shipped segment is corrupt at byte {}",
+                    hole.at
+                ))
+            }
         })?;
         if usize::try_from(prefix.good_bytes).is_ok_and(|good| good < bytes.len()) {
             // A torn tail: a segment still being copied in. Applying its prefix could split a
@@ -1863,13 +1914,49 @@ impl BtreeEngine {
     /// # Errors
     /// Propagates file I/O errors and reports an undecodable foreign record loudly.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None, false)
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None, false, None)
+    }
+
+    /// [`open`](Self::open) with every option: an archive, standby mode, and the master key of
+    /// an encrypted database (see [`OpenOptions`]).
+    ///
+    /// # Errors
+    /// As [`open`](Self::open); an encrypted database without its key or with another one, and
+    /// an unencrypted database that holds data when a key is given, are refused before anything
+    /// of the database is written.
+    pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
+        Self::open_impl(
+            path.as_ref(),
+            RecoveryTarget::Latest,
+            options.archive,
+            options.standby,
+            options.master_key.as_deref(),
+        )
+    }
+
+    /// Whether the database is encrypted.
+    pub const fn is_encrypted(&self) -> bool {
+        self.data_key.is_some()
+    }
+
+    /// The data format of the database's files: format 3 when it is encrypted, 2 otherwise.
+    const fn data_format(&self) -> u32 {
+        if self.data_key.is_some() {
+            crate::format::ENCRYPTED_FORMAT_VERSION
+        } else {
+            crate::format::PLAIN_FORMAT_VERSION
+        }
+    }
+
+    /// How the live log's records are sealed, when the database is encrypted.
+    fn log_seal(&self) -> Option<nusadb_wal::RecordSeal> {
+        self.data_key.as_ref().map(|key| key.log_seal())
     }
 
     /// [`open`](Self::open) as a standby: the engine is read-only from the first moment, so the
     /// checkpoint recovery may take at open is stamped like every other standby image.
     pub fn open_standby(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None, true)
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, None, true, None)
     }
 
     /// [`open`](Self::open) with a checkpoint archive: every checkpoint, the one recovery may
@@ -1883,7 +1970,7 @@ impl BtreeEngine {
         path: impl AsRef<Path>,
         archive: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, archive, false)
+        Self::open_impl(path.as_ref(), RecoveryTarget::Latest, archive, false, None)
     }
 
     /// [`open`](Self::open), replaying the log only up to `target`: every record past a log
@@ -1893,30 +1980,77 @@ impl BtreeEngine {
     /// exactly that state and the later records are gone. An image already past the target is
     /// refused; a restore then starts from an older archived image.
     pub fn open_until(path: impl AsRef<Path>, target: RecoveryTarget) -> Result<Self> {
-        Self::open_impl(path.as_ref(), target, None, false)
+        Self::open_impl(path.as_ref(), target, None, false, None)
     }
 
+    /// [`open_until`](Self::open_until) for a database that may be encrypted under `master_key`.
+    ///
+    /// # Errors
+    /// As [`open_until`](Self::open_until) and [`open_with`](Self::open_with).
+    pub fn open_until_with_key(
+        path: impl AsRef<Path>,
+        target: RecoveryTarget,
+        master_key: Option<&MasterKey>,
+    ) -> Result<Self> {
+        Self::open_impl(path.as_ref(), target, None, false, master_key)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "recovery reads as one sequence: lock, key, format, image, log, writer, archive"
+    )]
     fn open_impl(
         path: &Path,
         target: RecoveryTarget,
         archive: Option<std::path::PathBuf>,
         standby: bool,
+        master_key: Option<&MasterKey>,
     ) -> Result<Self> {
         // First, before any file of the database is read, created or removed: nobody else may
         // have it open.
         let dir_lock = lock_database(path)?;
+        // Then the key, before anything is written: an encrypted database without its key or
+        // with another one, or an unencrypted database with data while a key is given, is
+        // refused with every file as it was.
+        let key_check = crate::crypt::check_database(path, master_key)?;
+        let data_key = match key_check {
+            KeyCheck::Plain => None,
+            KeyCheck::Encrypted(key) => Some(Arc::new(key)),
+            KeyCheck::New => {
+                let master = master_key.ok_or_else(|| {
+                    Error::Io(std::io::Error::other("nusadb-btree: no master key"))
+                })?;
+                // The envelope first: a directory with it and no data opens as an empty
+                // encrypted database, never as an unencrypted one.
+                Some(Arc::new(DataKey::create(
+                    &crate::crypt::envelope_path(path),
+                    master,
+                )?))
+            },
+        };
         // Then the data format, before anything else of the database is read: a directory written
         // in a newer format is refused untouched (an older release would mistake log records it
         // does not know for a torn tail and cut them off).
-        crate::format::check_format(path)?;
+        crate::format::check_format(path, data_key.is_some())?;
         let mut engine = Self::new();
         // The store holds it: it lives as long as anything can still reach the database's files.
         engine.store.hold_lock(dir_lock)?;
         engine.standby = AtomicBool::new(standby);
-        engine.store.enable_spill(open_spill_file(path)?)?;
+        engine.data_key = data_key;
+        if engine.data_key.is_some() {
+            // Changed pages that leave memory are sealed under a key that never leaves the
+            // process: the spill is scratch space, never read after the process ends.
+            engine
+                .store
+                .enable_sealed_spill(open_spill_file(path)?, nusadb_wal::Sealer::ephemeral()?)?;
+        } else {
+            engine.store.enable_spill(open_spill_file(path)?)?;
+        }
         if let Some(dir) = &archive {
-            // An archive this engine will write to records the format of what it holds.
-            crate::format::stamp_archive(dir)?;
+            // An archive this engine will write to records the format of what it holds, and the
+            // key envelope of an encrypted database.
+            adopt_archive(dir, path, engine.data_key.as_deref())?;
+            crate::format::stamp_archive(dir, engine.data_format())?;
             settle_pending_fork(dir)?;
         }
         engine.wal_archive = archive;
@@ -1928,7 +2062,7 @@ impl BtreeEngine {
             mut records,
             covered_lsn,
             pages,
-        } = read_checkpoint_image(&ckpt_path(path))?;
+        } = read_checkpoint_image(&ckpt_path(path), engine.data_key.as_deref())?;
         engine.attach_image_pages(path, pages)?;
         let image_time = image_commit_time(&records);
         if let Some(image_time) = image_time
@@ -1957,8 +2091,9 @@ impl BtreeEngine {
         // only truncates a torn/garbage tail with no valid record following. A CRC that now covers
         // the header (lsn + len) makes a zeroed bad sector or a corrupted length fail validation
         // instead of masquerading as a valid record and desyncing the scan.
+        let log_seal = engine.log_seal();
         match std::fs::read(path) {
-            Ok(buf) => match nusadb_wal::recover_prefix(&buf) {
+            Ok(buf) => match nusadb_wal::recover_sealed_prefix(&buf, log_seal.as_ref()) {
                 Ok(prefix) => {
                     // Records at or before the image's watermark are already inside the image
                     // (a crash between the image rename and the log truncation leaves them
@@ -2015,7 +2150,10 @@ impl BtreeEngine {
         let sync = Arc::new(file.try_clone()?);
         let mut writer_file = file;
         writer_file.seek(std::io::SeekFrom::End(0))?;
-        let writer = WalWriter::resume(writer_file, nusadb_core::Lsn(last_lsn + 1));
+        let mut writer = WalWriter::resume(writer_file, nusadb_core::Lsn(last_lsn + 1));
+        if let Some(seal) = log_seal {
+            writer = writer.with_seal(seal);
+        }
         engine.recovered_up_to = accepted_up_to;
         engine.recovered_commit_ms = accepted_commit_ms;
         engine.wal = Some(Mutex::new(Wal {
@@ -2062,8 +2200,12 @@ impl BtreeEngine {
             if let PageLayout::Segments { names, .. } = &pages.layout {
                 keep.clone_from(names);
             }
-            self.store
-                .attach(open_page_file(&ckpt_path(path), &dir, pages)?)?;
+            self.store.attach(open_page_file(
+                &ckpt_path(path),
+                &dir,
+                pages,
+                self.data_key.clone(),
+            )?)?;
         }
         // A segment the published image does not read from was left by a checkpoint that
         // failed or crashed before naming it, or belongs to an image already replaced.
@@ -2335,6 +2477,24 @@ impl BtreeEngine {
         out_wal: &Path,
         live_log: Option<&Path>,
     ) -> Result<()> {
+        Self::restore_from_archive_with_key(archive, target, out_wal, live_log, None)
+    }
+
+    /// [`restore_from_archive`](Self::restore_from_archive) for an archive that may be
+    /// encrypted: an encrypted archive needs the master key its data key is sealed under, and
+    /// the restored database is encrypted under the same data key (its envelope is copied in).
+    ///
+    /// # Errors
+    /// As [`restore_from_archive`](Self::restore_from_archive); an encrypted archive without
+    /// its key or with another one, or an unencrypted archive with a key, is refused before
+    /// anything is written.
+    pub fn restore_from_archive_with_key(
+        archive: &Path,
+        target: RecoveryTarget,
+        out_wal: &Path,
+        live_log: Option<&Path>,
+        master_key: Option<&MasterKey>,
+    ) -> Result<()> {
         let refuse =
             |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
         // Held until the restore is published: no server may open the database meanwhile.
@@ -2361,14 +2521,26 @@ impl BtreeEngine {
         let _ = std::fs::remove_file(ckpt_tmp_path(&scratch));
         let _ = std::fs::remove_dir_all(pages_dir(&scratch));
         remove_format_files(&scratch);
+        // The key, before anything of the archive or the destination changes.
+        let archive_key = crate::crypt::archive_key(archive, master_key)?;
         // A restore that crashed between moving its pages into place and its image leaves
         // segments no image names.
+        let _ = std::fs::remove_file(crate::crypt::envelope_path(&scratch));
         let _ = std::fs::remove_dir_all(pages_dir(out_wal));
         crate::format::check_archive(archive)?;
         // A fork an earlier restore left unfinished is settled before the archive is read.
         settle_pending_fork(archive)?;
-        let outcome = Self::restore_into(archive, target, &scratch, out_wal, live_log);
+        let outcome = Self::restore_into(
+            archive,
+            target,
+            &scratch,
+            out_wal,
+            live_log,
+            master_key,
+            archive_key.as_ref(),
+        );
         if outcome.is_err() {
+            let _ = std::fs::remove_file(crate::crypt::envelope_path(&scratch));
             // A half-built destination would be refused by the next attempt; leave it empty,
             // and leave the archive either forked or untouched, never in between.
             let _ = std::fs::remove_file(&scratch);
@@ -2384,18 +2556,35 @@ impl BtreeEngine {
 
     /// The body of [`restore_from_archive`](Self::restore_from_archive): build the restored
     /// database at `scratch`, fork the archive, then publish it at `out_wal`.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the restore's paths and target, plus the keys of an encrypted archive; the steps \
+                  read as one journaled sequence"
+    )]
     fn restore_into(
         archive: &Path,
         target: RecoveryTarget,
         scratch: &Path,
         out_wal: &Path,
         live_log: Option<&Path>,
+        master_key: Option<&MasterKey>,
+        archive_key: Option<&DataKey>,
     ) -> Result<()> {
         let refuse =
             |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
         let (images, segments) = list_archive(archive)?;
         let forks = fork_records(archive)?;
-        let (base, target) = choose_base_image(archive, target, &images, &forks)?;
+        let (base, target) = choose_base_image(archive, target, &images, &forks, archive_key)?;
+        if archive_key.is_some() {
+            // The restored database is sealed under the archive's data key, and is in the
+            // encrypted format from the start.
+            crate::crypt::copy_envelope(
+                &crate::crypt::archive_envelope_path(archive),
+                &crate::crypt::envelope_path(scratch),
+            )?;
+            crate::format::write_format(scratch, crate::format::ENCRYPTED_FORMAT_VERSION)?;
+        }
         let base_image = archive.join(format!("{base:020}.ckpt"));
         link_segments(
             &archive.join(ARCHIVE_PAGES),
@@ -2403,7 +2592,16 @@ impl BtreeEngine {
             &pages_dir(scratch),
         )?;
         std::fs::copy(base_image, ckpt_path(scratch))?;
-        let chain = assemble_log(archive, target, scratch, base, &segments, live_log)?;
+        let log_seal = archive_key.map(DataKey::log_seal);
+        let chain = assemble_log(
+            archive,
+            target,
+            scratch,
+            base,
+            &segments,
+            live_log,
+            log_seal.as_ref(),
+        )?;
         if !chain.reached {
             // An image past where the chain ends means the history went on but the segments
             // that carry it are gone (pruned, or lost); stopping short would restore less than
@@ -2435,7 +2633,7 @@ impl BtreeEngine {
                 },
             }
         }
-        let engine = Self::open_impl(scratch, target, None, false)?;
+        let engine = Self::open_impl(scratch, target, None, false, master_key)?;
         let cut = engine.recovered_up_to();
         // Seal the target state into one image whose position lies past every position the
         // archive names, so the restored database's history can never be chained onto by a
@@ -2493,7 +2691,14 @@ impl BtreeEngine {
                 sync_dir(dir)?;
             }
         }
-        // The format file before the image, so the published database never lacks it.
+        // The key envelope and the format file before the image, so the published database
+        // never lacks them.
+        if archive_key.is_some() {
+            std::fs::rename(
+                crate::crypt::envelope_path(scratch),
+                crate::crypt::envelope_path(out_wal),
+            )?;
+        }
         std::fs::rename(
             crate::format::format_path(scratch),
             crate::format::format_path(out_wal),
@@ -3748,6 +3953,11 @@ const CKPT_VERSION: u32 = 2;
 /// it reads from, where each live page lies in them, then the same logical records. The pages
 /// themselves live in immutable segment files in the pages directory beside the log.
 const CKPT_VERSION_SEGMENTED: u32 = 3;
+/// The sealed segmented image an encrypted database writes: a v3 header (with this version), the
+/// segment names and their CRC32 in the clear, then the page directory sealed under the data key
+/// with the header and names as its AAD, then the records, each sealed. The names stay readable
+/// without the key so archive pruning and copies can find the segments an image needs.
+const CKPT_VERSION_SEALED: u32 = 4;
 /// The checksummed part of a v3 header: the v2 fields plus the number of segments it names.
 const CKPT_V3_HEADER_CHECKSUMMED_LEN: usize = 40;
 /// Full v3 header length.
@@ -3812,6 +4022,7 @@ fn write_segment_directory(
     plan: &SegmentPlan,
 ) -> Result<()> {
     out.write_all(&ckpt_v3_header_bytes(
+        CKPT_VERSION_SEGMENTED,
         covered_lsn,
         page_count,
         live.len() as u64,
@@ -3836,6 +4047,48 @@ fn write_segment_directory(
         out.write_all(&entry)?;
     }
     out.write_all(&hasher.finalize().to_le_bytes())?;
+    Ok(())
+}
+
+/// Write a sealed image's header, segment names with their CRC32, and the page directory sealed
+/// under `key` (see [`CKPT_VERSION_SEALED`]).
+fn write_sealed_directory(
+    out: &mut impl std::io::Write,
+    covered_lsn: u64,
+    page_count: u64,
+    live: &[u64],
+    plan: &SegmentPlan,
+    key: &DataKey,
+) -> Result<()> {
+    let header = ckpt_v3_header_bytes(
+        CKPT_VERSION_SEALED,
+        covered_lsn,
+        page_count,
+        live.len() as u64,
+        plan.names.len() as u64,
+    );
+    let mut names = Vec::new();
+    for name in &plan.names {
+        let len = u16::try_from(name.len())
+            .map_err(|_| Error::Io(std::io::Error::other("nusadb-btree: segment name too long")))?;
+        names.extend_from_slice(&len.to_le_bytes());
+        names.extend_from_slice(name.as_bytes());
+    }
+    let mut entries = Vec::with_capacity(live.len() * CKPT_V3_ENTRY_LEN);
+    for ((id, location), crc) in live.iter().zip(&plan.locations).zip(&plan.checksums) {
+        entries.extend_from_slice(&id.to_le_bytes());
+        entries.extend_from_slice(&location.segment.to_le_bytes());
+        entries.extend_from_slice(&location.slot.to_le_bytes());
+        entries.extend_from_slice(&crc.to_le_bytes());
+    }
+    let sealed = key
+        .sealer()
+        .seal(&sealed_directory_aad(&header, &names), &entries)?;
+    out.write_all(&header)?;
+    out.write_all(&names)?;
+    out.write_all(&crc32fast::hash(&names).to_le_bytes())?;
+    out.write_all(&(sealed.len() as u64).to_le_bytes())?;
+    out.write_all(&sealed)?;
     Ok(())
 }
 
@@ -3963,7 +4216,32 @@ fn write_segment_list(archive: &Path, names: &[String], covered_lsn: u64) -> Res
 /// The segments the image at `image` reads from; empty for an image that holds its own pages
 /// or none.
 fn image_segment_names(image: &Path) -> Result<Vec<String>> {
-    Ok(match read_checkpoint_image(image)?.pages {
+    use std::io::Read;
+    // A sealed image names its segments in the clear, so no key is needed.
+    let mut file = File::open(image)?;
+    let mut header = [0u8; CKPT_V3_HEADER_LEN];
+    if file.read_exact(&mut header).is_ok()
+        && header.get(0..4) == Some(CKPT_MAGIC.as_slice())
+        && header.get(4..8) == Some(CKPT_VERSION_SEALED.to_le_bytes().as_slice())
+    {
+        let corrupt = |what: &str| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "nusadb-btree: checkpoint image {} is invalid ({what})",
+                    image.display()
+                ),
+            ))
+        };
+        let (checksummed, crc) = header.split_at(CKPT_V3_HEADER_CHECKSUMMED_LEN);
+        if crc32fast::hash(checksummed).to_le_bytes().as_slice() != crc {
+            return Err(corrupt("header checksum mismatch"));
+        }
+        let len = file.metadata()?.len();
+        return Ok(read_sealed_names(&mut file, &header, len, &corrupt)?.0);
+    }
+    drop(file);
+    Ok(match read_checkpoint_image(image, None)?.pages {
         Some(ImagePages {
             layout: PageLayout::Segments { names, .. },
             ..
@@ -3986,6 +4264,7 @@ enum PageLayout {
 /// The v3 header: `NCKP` + version + covered LSN + page id space + live pages + segment count +
 /// CRC32 of the fields before it.
 fn ckpt_v3_header_bytes(
+    version: u32,
     covered_lsn: u64,
     page_count: u64,
     live: u64,
@@ -3993,7 +4272,7 @@ fn ckpt_v3_header_bytes(
 ) -> [u8; CKPT_V3_HEADER_LEN] {
     let mut header = [0u8; CKPT_V3_HEADER_LEN];
     header[0..4].copy_from_slice(CKPT_MAGIC);
-    header[4..8].copy_from_slice(&CKPT_VERSION_SEGMENTED.to_le_bytes());
+    header[4..8].copy_from_slice(&version.to_le_bytes());
     header[8..16].copy_from_slice(&covered_lsn.to_le_bytes());
     header[16..24].copy_from_slice(&page_count.to_le_bytes());
     header[24..32].copy_from_slice(&live.to_le_bytes());
@@ -4020,6 +4299,24 @@ fn stopped_error(reason: &str) -> Error {
     )))
 }
 
+/// Refuse `path` when it is a link: a lock file is never followed, so taking a lock cannot create
+/// or touch a file outside the database's directory.
+fn refuse_link(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "nusadb-btree: {} is a link; a lock file is never followed. Remove it",
+                path.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// How long [`lock_database`] keeps trying a lock it found held before refusing.
+const LOCK_RETRY: Duration = Duration::from_millis(250);
+
 /// Take the exclusive lock on the database whose log is `wal`.
 ///
 /// The lock is the file `<wal>.lock`, created if needed (its directory must exist). It is refused
@@ -4029,17 +4326,35 @@ fn stopped_error(reason: &str) -> Error {
 /// An engine takes it when it opens; anything else that changes or removes a database's files (a
 /// restore, a seed, removing a dropped database's directory) takes it first.
 ///
+/// A lock found held is tried again for up to a quarter of a second before it is refused. Starting a
+/// child process copies every open file of the parent into the child until the child's program
+/// replaces it, so a lock its holder has just released can stay held for that moment by a
+/// process that never meant to hold it (measured on macOS: 60 of 20,000 releases made during
+/// another thread's process starts). A holder that really has the database open still holds it
+/// after the wait.
+///
+/// A lock file that is a link is refused, never followed.
+///
 /// # Errors
 /// Refused as above; propagates I/O errors.
 pub fn lock_database(wal: &Path) -> Result<File> {
     let path = lock_path(wal);
+    refuse_link(&path)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(&path)?;
-    match file.try_lock() {
+    let started = Instant::now();
+    let mut outcome = file.try_lock();
+    while matches!(outcome, Err(std::fs::TryLockError::WouldBlock))
+        && started.elapsed() < LOCK_RETRY
+    {
+        std::thread::sleep(Duration::from_millis(5));
+        outcome = file.try_lock();
+    }
+    match outcome {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
@@ -4064,6 +4379,7 @@ fn remove_leftover_scratch(path: &Path) {
     let _ = std::fs::remove_file(ckpt_path(&scratch));
     let _ = std::fs::remove_dir_all(pages_dir(&scratch));
     let _ = std::fs::remove_file(lock_path(&scratch));
+    let _ = std::fs::remove_file(crate::crypt::envelope_path(&scratch));
     remove_format_files(&scratch);
     let _ = std::fs::remove_file(scratch);
 }
@@ -4286,7 +4602,11 @@ fn ckpt_tmp_path(wal: &Path) -> std::path::PathBuf {
 /// validation failure here is bit-rot or tampering — and by the time an image exists the log
 /// prefix it covers is gone, so falling back to the log would silently lose everything the
 /// image holds. Refuse loudly instead, the same stance recovery takes on a mid-log hole.
-fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one validation sequence over the header, the page section and the records"
+)]
+fn read_checkpoint_image(path: &Path, key: Option<&DataKey>) -> Result<ImageContents> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -4320,13 +4640,15 @@ fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
     let (checksummed_len, header_len) = match version {
         CKPT_VERSION_LOGICAL => (CKPT_HEADER_CHECKSUMMED_LEN, CKPT_HEADER_LEN),
         CKPT_VERSION => (CKPT_V2_HEADER_CHECKSUMMED_LEN, CKPT_V2_HEADER_LEN),
-        CKPT_VERSION_SEGMENTED => (CKPT_V3_HEADER_CHECKSUMMED_LEN, CKPT_V3_HEADER_LEN),
-        newer if newer > CKPT_VERSION_SEGMENTED => {
+        CKPT_VERSION_SEGMENTED | CKPT_VERSION_SEALED => {
+            (CKPT_V3_HEADER_CHECKSUMMED_LEN, CKPT_V3_HEADER_LEN)
+        },
+        newer if newer > CKPT_VERSION_SEALED => {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "nusadb-btree: checkpoint image {} is in image version {newer}, written by a \
-                     newer release; this release reads image versions {CKPT_VERSION_SEGMENTED} \
+                     newer release; this release reads image versions {CKPT_VERSION_SEALED} \
                      and older. Open the database with the release that wrote it or a newer one",
                     path.display()
                 ),
@@ -4334,6 +4656,21 @@ fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
         },
         _ => return Err(corrupt("unsupported format version")),
     };
+    // An encrypted database reads sealed images only, and a sealed image needs the key: a
+    // plain image put in place of a sealed one would otherwise be read as the database.
+    match (version == CKPT_VERSION_SEALED, key.is_some()) {
+        (true, false) => {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "nusadb-btree: checkpoint image {} is encrypted; open it with its key",
+                    path.display()
+                ),
+            )));
+        },
+        (false, true) => return Err(corrupt("an encrypted database's image is not sealed")),
+        _ => {},
+    }
     let mut header = vec![0u8; header_len];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)
@@ -4370,12 +4707,27 @@ fn read_checkpoint_image(path: &Path) -> Result<ImageContents> {
         Some(read_segment_directory(
             &mut file, len, page_count, live, segments, &corrupt,
         )?)
+    } else if version == CKPT_VERSION_SEALED {
+        let page_count = field(16).ok_or_else(|| corrupt("short header"))?;
+        let live = field(24).ok_or_else(|| corrupt("short header"))?;
+        let segments = field(32).ok_or_else(|| corrupt("short header"))?;
+        let key = key.ok_or_else(|| corrupt("no key"))?;
+        Some(read_sealed_directory(
+            &mut file, &header, len, page_count, live, segments, key, &corrupt,
+        )?)
     } else {
         None
     };
     let mut body = Vec::new();
     file.read_to_end(&mut body)?;
-    let prefix = nusadb_wal::recover_prefix(&body).map_err(|_| corrupt("corrupt record body"))?;
+    let seal = key.map(|key| key.image_seal(covered_lsn));
+    let prefix = nusadb_wal::recover_sealed_prefix(&body, seal.as_ref()).map_err(|hole| {
+        if hole.forged {
+            corrupt("a record fails authentication: altered, or sealed under another key")
+        } else {
+            corrupt("corrupt record body")
+        }
+    })?;
     // A torn tail is a valid state for a crash-interrupted LOG; an image was fsynced complete
     // before it got its name, so trailing garbage is corruption, not a crash artifact.
     if prefix.good_bytes != body.len() as u64 {
@@ -4534,6 +4886,164 @@ fn read_segment_directory(
     })
 }
 
+/// Read a segment name table of `segments` names, returning the names and the raw bytes read.
+fn read_segment_names(
+    file: &mut File,
+    len: u64,
+    segments: u64,
+    corrupt: &dyn Fn(&str) -> Error,
+) -> Result<(Vec<String>, Vec<u8>)> {
+    use std::io::Read;
+    if segments.saturating_mul(2) > len {
+        return Err(corrupt("segment table larger than the image"));
+    }
+    let mut raw = Vec::new();
+    let mut names = Vec::with_capacity(usize::try_from(segments).unwrap_or(0));
+    for _ in 0..segments {
+        let mut len_bytes = [0u8; 2];
+        file.read_exact(&mut len_bytes)
+            .map_err(|_| corrupt("truncated segment table"))?;
+        raw.extend_from_slice(&len_bytes);
+        let mut name = vec![0u8; usize::from(u16::from_le_bytes(len_bytes))];
+        file.read_exact(&mut name)
+            .map_err(|_| corrupt("truncated segment table"))?;
+        raw.extend_from_slice(&name);
+        let name = String::from_utf8(name).map_err(|_| corrupt("segment name"))?;
+        if !is_segment_name(&name) {
+            return Err(corrupt("segment name"));
+        }
+        names.push(name);
+    }
+    Ok((names, raw))
+}
+
+/// The segment names of a sealed image, read without its key: the header, then the names and
+/// their CRC32, all in the clear.
+fn read_sealed_names(
+    file: &mut File,
+    header: &[u8],
+    len: u64,
+    corrupt: &dyn Fn(&str) -> Error,
+) -> Result<(Vec<String>, Vec<u8>)> {
+    use std::io::Read;
+    let segments = header
+        .get(32..40)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| corrupt("short header"))?;
+    let (names, raw) = read_segment_names(file, len, segments, corrupt)?;
+    let mut stored = [0u8; 4];
+    file.read_exact(&mut stored)
+        .map_err(|_| corrupt("truncated segment table"))?;
+    if crc32fast::hash(&raw) != u32::from_le_bytes(stored) {
+        return Err(corrupt("segment table checksum mismatch"));
+    }
+    Ok((names, raw))
+}
+
+/// The AAD of a sealed image's page directory: its domain, the image header and the raw segment
+/// name table, so the directory cannot be paired with another image's header or names.
+fn sealed_directory_aad(header: &[u8], names: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(1 + header.len() + names.len());
+    aad.push(crate::crypt::DOMAIN_DIRECTORY);
+    aad.extend_from_slice(header);
+    aad.extend_from_slice(names);
+    aad
+}
+
+/// Read a sealed image's segment names and page directory, opening the directory with `key`,
+/// and leave `file` positioned at the sealed records that follow.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the header fields are passed as read, beside the file and the key"
+)]
+fn read_sealed_directory(
+    file: &mut File,
+    header: &[u8],
+    len: u64,
+    page_count: u64,
+    live: u64,
+    segments: u64,
+    key: &DataKey,
+    corrupt: &dyn Fn(&str) -> Error,
+) -> Result<ImagePages> {
+    use std::io::Read;
+    let (names, raw_names) = read_sealed_names(file, header, len, corrupt)?;
+    if names.len() as u64 != segments {
+        return Err(corrupt("segment table"));
+    }
+    let mut sealed_len = [0u8; 8];
+    file.read_exact(&mut sealed_len)
+        .map_err(|_| corrupt("truncated page directory"))?;
+    let sealed_len = u64::from_le_bytes(sealed_len);
+    let expected = live
+        .checked_mul(CKPT_V3_ENTRY_LEN as u64)
+        .and_then(|b| b.checked_add(nusadb_wal::crypto::SEAL_OVERHEAD as u64))
+        .filter(|&b| b == sealed_len && b <= len)
+        .ok_or_else(|| corrupt("page directory size"))?;
+    let mut sealed = vec![0u8; usize::try_from(expected).map_err(|_| corrupt("page directory"))?];
+    file.read_exact(&mut sealed)
+        .map_err(|_| corrupt("truncated page directory"))?;
+    let raw = key
+        .sealer()
+        .open(&sealed_directory_aad(header, &raw_names), &sealed)
+        .ok_or_else(|| {
+            corrupt("the page directory fails authentication: altered, or sealed under another key")
+        })?;
+    let (directory, locations, checksums) = parse_directory_entries(&raw, names.len(), corrupt)?;
+    if !directory.is_sorted_by(|a, b| a < b) || directory.last().is_some_and(|&id| id >= page_count)
+    {
+        return Err(corrupt("page directory out of order or out of range"));
+    }
+    Ok(ImagePages {
+        page_count,
+        directory,
+        checksums,
+        layout: PageLayout::Segments { names, locations },
+    })
+}
+
+/// The entries of a v3 or sealed page directory: page ids, locations and CRC32s.
+type DirectoryEntries = (Vec<u64>, Vec<crate::store::Location>, Vec<u32>);
+
+/// Parse page directory entries, each naming one of `segments` segments.
+fn parse_directory_entries(
+    raw: &[u8],
+    segments: usize,
+    corrupt: &dyn Fn(&str) -> Error,
+) -> Result<DirectoryEntries> {
+    let mut directory = Vec::with_capacity(raw.len() / CKPT_V3_ENTRY_LEN);
+    let mut locations = Vec::with_capacity(raw.len() / CKPT_V3_ENTRY_LEN);
+    let mut checksums = Vec::with_capacity(raw.len() / CKPT_V3_ENTRY_LEN);
+    for entry in raw.chunks_exact(CKPT_V3_ENTRY_LEN) {
+        let word = |at: usize, n: usize| entry.get(at..at + n);
+        let id = word(0, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes);
+        let segment = word(8, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes);
+        let slot = word(12, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes);
+        let crc = word(16, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes);
+        let (Some(id), Some(segment), Some(slot), Some(crc)) = (id, segment, slot, crc) else {
+            return Err(corrupt("page directory entry"));
+        };
+        if segment as usize >= segments {
+            return Err(corrupt(
+                "page directory names a segment the image does not list",
+            ));
+        }
+        directory.push(id);
+        locations.push(crate::store::Location { segment, slot });
+        checksums.push(crc);
+    }
+    Ok((directory, locations, checksums))
+}
+
 /// Whether `name` is one this engine gives a segment: a log position, a dash, a hex stamp, and
 /// an optional `-full` mark. Nothing else is ever read or removed as a segment.
 fn is_segment_name(name: &str) -> bool {
@@ -4550,7 +5060,12 @@ fn is_segment_name(name: &str) -> bool {
 
 /// Open the pages of an image whose single-file pages lie in `image`, or whose segments lie in
 /// `dir`.
-fn open_page_file(image: &Path, dir: &Path, pages: ImagePages) -> Result<PageFile> {
+fn open_page_file(
+    image: &Path,
+    dir: &Path,
+    pages: ImagePages,
+    key: Option<Arc<DataKey>>,
+) -> Result<PageFile> {
     match pages.layout {
         PageLayout::Inline { offset } => PageFile::open(
             image,
@@ -4566,6 +5081,7 @@ fn open_page_file(image: &Path, dir: &Path, pages: ImagePages) -> Result<PageFil
             pages.directory,
             locations,
             pages.checksums,
+            key,
         ),
     }
 }
@@ -4849,7 +5365,7 @@ impl BtreeEngine {
             }
         };
         #[cfg(unix)]
-        let early = match open_page_file(tmp, dir, pages) {
+        let early = match open_page_file(tmp, dir, pages, self.data_key.clone()) {
             Ok(pages) => Some(pages),
             Err(e) => {
                 discard();
@@ -4885,7 +5401,7 @@ impl BtreeEngine {
         #[cfg(not(unix))]
         let pages = match early {
             Some(pages) => pages,
-            None => open_page_file(named, dir, pages)?,
+            None => open_page_file(named, dir, pages, self.data_key.clone())?,
         };
         #[cfg(unix)]
         let Some(pages) = pages else {
@@ -5056,9 +5572,18 @@ impl BtreeEngine {
                 .create_new(true)
                 .open(&path)?,
         );
-        let checksums =
-            self.store
-                .write_pages_to(&mut out, &ids, &crate::node::clear_undo_links)?;
+        let checksums = match self.data_key.as_deref() {
+            Some(key) => self.store.write_sealed_pages_to(
+                &mut out,
+                &ids,
+                &crate::node::clear_undo_links,
+                key,
+                name,
+            )?,
+            None => self
+                .store
+                .write_pages_to(&mut out, &ids, &crate::node::clear_undo_links)?,
+        };
         let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
         file.sync_all()?;
         sync_dir(dir)?;
@@ -5297,7 +5822,7 @@ impl BtreeEngine {
                 std::io::copy(&mut image, &mut out)?;
                 out.sync_all()?;
             }
-            let contents = read_checkpoint_image(&scratch)?;
+            let contents = read_checkpoint_image(&scratch, self.data_key.as_deref())?;
             let names = match &contents.pages {
                 Some(ImagePages {
                     layout: PageLayout::Segments { names, .. },
@@ -5306,7 +5831,13 @@ impl BtreeEngine {
                 _ => Vec::new(),
             };
             link_segments(&pages_dir(&wal), &names, &pages_dir(out_wal))?;
-            crate::format::write_format(out_wal, crate::format::FORMAT_VERSION)?;
+            if self.data_key.is_some() {
+                crate::crypt::copy_envelope(
+                    &crate::crypt::envelope_path(&wal),
+                    &crate::crypt::envelope_path(out_wal),
+                )?;
+            }
+            crate::format::write_format(out_wal, self.data_format())?;
             std::fs::rename(&scratch, ckpt_path(out_wal))?;
             if let Some(dir) = out_wal.parent().filter(|d| !d.as_os_str().is_empty()) {
                 sync_dir(dir)?;
@@ -5322,8 +5853,187 @@ impl BtreeEngine {
             let _ = std::fs::remove_file(&scratch);
             let _ = std::fs::remove_dir_all(pages_dir(out_wal));
             let _ = std::fs::remove_file(crate::format::format_path(out_wal));
+            let _ = std::fs::remove_file(crate::crypt::envelope_path(out_wal));
         }
         copied
+    }
+
+    /// Copy the database at `source` (unencrypted, or encrypted under `source_key`) into a new
+    /// database at `out_wal`, encrypted under a new data key sealed with `out_key`. The source is
+    /// opened (recovering it as any open does) and checkpointed; the copy is its image with every
+    /// page and record sealed, and an empty log. Returns the log position the copy covers.
+    ///
+    /// This is how an existing database becomes encrypted, and how its data key is replaced.
+    /// Nothing of the source changes beyond what opening and checkpointing it does. The copy is
+    /// built beside its final name and appears only once complete, when its image is renamed into
+    /// place: an interrupted copy leaves a directory that holds no database, which a second run
+    /// clears and fills again.
+    ///
+    /// # Errors
+    /// Refused when `out_wal` already holds a database; propagates the source's open and
+    /// checkpoint errors and I/O errors.
+    pub fn copy_encrypted(
+        source: &Path,
+        source_key: Option<&MasterKey>,
+        out_wal: &Path,
+        out_key: &MasterKey,
+    ) -> Result<u64> {
+        let engine = Self::open_impl(source, RecoveryTarget::Latest, None, false, source_key)?;
+        engine.checkpoint()?;
+        if let Some(dir) = out_wal.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
+        }
+        let _out_lock = lock_database(out_wal)?;
+        // A copy interrupted after its image was named but before its marker was removed is
+        // incomplete all the same, and is written again.
+        let interrupted = crate::crypt::incomplete_path(out_wal).exists();
+        if !interrupted && (out_wal.exists() || ckpt_path(out_wal).exists()) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "nusadb-btree: {} already holds a database; copy into an empty directory",
+                    out_wal.display()
+                ),
+            )));
+        }
+        // What an interrupted copy left (no image names any of it). The marker says the
+        // directory is a copy in progress: until it is removed, nothing opens the database.
+        let marker = crate::crypt::incomplete_path(out_wal);
+        crate::crypt::mark_incomplete(out_wal)?;
+        let _ = std::fs::remove_file(out_wal);
+        let _ = std::fs::remove_file(ckpt_path(out_wal));
+        let _ = std::fs::remove_file(ckpt_tmp_path(out_wal));
+        let _ = std::fs::remove_dir_all(pages_dir(out_wal));
+        let _ = std::fs::remove_file(crate::crypt::envelope_path(out_wal));
+        remove_format_files(out_wal);
+        let built = Self::write_encrypted_copy(&engine, source, out_wal, out_key);
+        if built.is_err() {
+            // The marker stays until this is cleared: a crash in between leaves it, and the
+            // next open refuses the directory.
+            let _ = std::fs::remove_file(ckpt_path(out_wal));
+            let _ = std::fs::remove_file(ckpt_tmp_path(out_wal));
+            let _ = std::fs::remove_dir_all(pages_dir(out_wal));
+            let _ = std::fs::remove_file(crate::crypt::envelope_path(out_wal));
+            remove_format_files(out_wal);
+        }
+        let covered = built?;
+        std::fs::remove_file(&marker)?;
+        if let Some(parent) = out_wal.parent().filter(|d| !d.as_os_str().is_empty()) {
+            sync_dir(parent)?;
+        }
+        Ok(covered)
+    }
+
+    /// Whether the database at `wal` is a finished encrypted copy under `key`: no
+    /// [`incomplete`](crate::crypt::incomplete_path) marker, data format 3, a key envelope that
+    /// opens with `key`, and a sealed checkpoint image that opens with its data key. Nothing is
+    /// written.
+    ///
+    /// # Errors
+    /// The envelope opens with another key only, or is damaged; a sealed image that fails to open;
+    /// I/O errors.
+    pub fn is_finished_encrypted_copy(wal: &Path, key: &MasterKey) -> Result<bool> {
+        if crate::crypt::incomplete_path(wal).exists()
+            || !ckpt_path(wal).exists()
+            || crate::format::read_format(wal)? != Some(crate::format::ENCRYPTED_FORMAT_VERSION)
+        {
+            return Ok(false);
+        }
+        match crate::crypt::check_database(wal, Some(key))? {
+            KeyCheck::Encrypted(data) => {
+                read_checkpoint_image(&ckpt_path(wal), Some(&data))?;
+                Ok(true)
+            },
+            KeyCheck::Plain | KeyCheck::New => Ok(false),
+        }
+    }
+
+    /// The body of [`copy_encrypted`](Self::copy_encrypted), with the source checkpointed.
+    fn write_encrypted_copy(
+        engine: &Self,
+        source: &Path,
+        out_wal: &Path,
+        out_key: &MasterKey,
+    ) -> Result<u64> {
+        let contents = read_checkpoint_image(&ckpt_path(source), engine.data_key.as_deref())?;
+        let covered_lsn = contents.covered_lsn;
+        let (page_count, live) = contents
+            .pages
+            .as_ref()
+            .map_or((0, Vec::new()), |p| (p.page_count, p.directory.clone()));
+        let pages = contents
+            .pages
+            .map(|p| {
+                open_page_file(
+                    &ckpt_path(source),
+                    &pages_dir(source),
+                    p,
+                    engine.data_key.clone(),
+                )
+            })
+            .transpose()?;
+        let key = DataKey::create(&crate::crypt::envelope_path(out_wal), out_key)?;
+        let dir = pages_dir(out_wal);
+        let mut plan = SegmentPlan {
+            names: Vec::new(),
+            locations: Vec::with_capacity(live.len()),
+            checksums: Vec::with_capacity(live.len()),
+            to_write: Vec::new(),
+            new_name: None,
+        };
+        if let Some(pages) = &pages
+            && !live.is_empty()
+        {
+            std::fs::create_dir_all(&dir)?;
+            let name = new_segment_name(covered_lsn, true, &dir, None);
+            let mut out = std::io::BufWriter::with_capacity(
+                1 << 20,
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(crate::store::segment_path(&dir, &name))?,
+            );
+            let mut sealed = Vec::with_capacity(crate::crypt::SEALED_PAGE_SIZE);
+            for (n, &id) in live.iter().enumerate() {
+                let slot = u32::try_from(n).map_err(|_| {
+                    Error::Io(std::io::Error::other(
+                        "nusadb-btree: too many pages for one segment",
+                    ))
+                })?;
+                let page = pages.read(id)?;
+                sealed.clear();
+                key.seal_page(id, slot, &name, &page, &mut sealed)?;
+                std::io::Write::write_all(&mut out, &sealed)?;
+                plan.locations
+                    .push(crate::store::Location { segment: 0, slot });
+                plan.checksums.push(crc32fast::hash(&page));
+            }
+            let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+            file.sync_all()?;
+            sync_dir(&dir)?;
+            plan.names.push(name);
+        }
+        let tmp = ckpt_tmp_path(out_wal);
+        let mut file =
+            std::io::BufWriter::with_capacity(1 << 20, crate::crypt::create_fresh(&tmp)?);
+        write_sealed_directory(&mut file, covered_lsn, page_count, &live, &plan, &key)?;
+        let file = file.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+        let mut writer = WalWriter::new(file).with_seal(key.image_seal(covered_lsn));
+        for record in &contents.records {
+            writer.append(record)?;
+        }
+        writer.flush()?;
+        writer.get_mut().sync_all()?;
+        drop(writer);
+        crate::format::write_format(out_wal, crate::format::ENCRYPTED_FORMAT_VERSION)?;
+        // The image last: with it, the directory holds the database.
+        std::fs::rename(&tmp, ckpt_path(out_wal))?;
+        if let Some(parent) = out_wal.parent().filter(|d| !d.as_os_str().is_empty()) {
+            sync_dir(parent)?;
+        }
+        Ok(covered_lsn)
     }
 
     /// [`checkpoint`](Self::checkpoint) with the image's commit marker stamped `stamp` rather
@@ -5450,10 +6160,19 @@ impl BtreeEngine {
         let mut plan = self.plan_segments(&live, covered_lsn, &dir)?;
         let written: Result<()> = (|| {
             self.write_new_segment(&dir, &live, &mut plan)?;
-            let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
-            write_segment_directory(&mut file, covered_lsn, page_count, &live, &plan)?;
+            let mut file =
+                std::io::BufWriter::with_capacity(1 << 20, crate::crypt::create_fresh(&tmp)?);
+            match self.data_key.as_deref() {
+                Some(key) => {
+                    write_sealed_directory(&mut file, covered_lsn, page_count, &live, &plan, key)?;
+                },
+                None => write_segment_directory(&mut file, covered_lsn, page_count, &live, &plan)?,
+            }
             let file = file.into_inner().map_err(|e| Error::Io(e.into_error()))?;
             let mut writer = WalWriter::new(file);
+            if let Some(key) = &self.data_key {
+                writer = writer.with_seal(key.image_seal(covered_lsn));
+            }
             Self::emit_image(cat, &seqs, synthetic_txn, stamp, &unowned, &mut |record| {
                 writer.append(record).map(|_| ())
             })?;
@@ -5582,6 +6301,22 @@ pub fn newest_archived_image(archive: &Path) -> Result<Option<u64>> {
 /// Refused when the directory already holds a log or an image, or when the archive holds no
 /// readable image; propagates copy errors.
 pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
+    seed_standby_with_key(archive, out_wal, None)
+}
+
+/// [`seed_standby`] for an archive that may be encrypted.
+///
+/// The archive's envelope is checked against `master_key` first and copied in with the image, so
+/// the standby's database is sealed under the primary's data key.
+///
+/// # Errors
+/// As [`seed_standby`]; an encrypted archive without its key or with another one, or an
+/// unencrypted one with a key, is refused before anything is written.
+pub fn seed_standby_with_key(
+    archive: &Path,
+    out_wal: &Path,
+    master_key: Option<&MasterKey>,
+) -> Result<u64> {
     let refuse =
         |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     // Held until the seed is in place: no server may open the database meanwhile.
@@ -5598,13 +6333,20 @@ pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
             out_wal.display()
         )));
     }
+    let archive_key = crate::crypt::archive_key(archive, master_key)?;
     // The seeded directory is in the archive's format; opening it upgrades it if that is older.
     let format = crate::format::archive_format(archive)?;
     let (images, _) = list_archive_readonly(archive)?;
     for &lsn in images.iter().rev() {
         let image = archive.join(format!("{lsn:020}.ckpt"));
         if let Ok(names) = image_segment_names(&image) {
-            // The format, then the segments: an image in place always finds them.
+            // The envelope, the format, then the segments: an image in place always finds them.
+            if archive_key.is_some() {
+                crate::crypt::copy_envelope(
+                    &crate::crypt::archive_envelope_path(archive),
+                    &crate::crypt::envelope_path(out_wal),
+                )?;
+            }
             crate::format::write_format(out_wal, format)?;
             link_segments(&archive.join(ARCHIVE_PAGES), &names, &pages_dir(out_wal))?;
             copy_file(&image, &ckpt_path(out_wal))?;
@@ -5619,6 +6361,45 @@ pub fn seed_standby(archive: &Path, out_wal: &Path) -> Result<u64> {
         "nusadb-btree: no readable image in {} to seed a standby from",
         archive.display()
     )))
+}
+
+/// Make sure the archive at `dir` holds the history of the database at `wal` under the same
+/// encryption: an encrypted database's archive carries a copy of its key envelope (written here
+/// when the archive holds nothing yet), and an unencrypted database's archive carries none.
+fn adopt_archive(dir: &Path, wal: &Path, key: Option<&DataKey>) -> Result<()> {
+    let refuse =
+        |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    let archived = crate::crypt::archive_envelope_path(dir);
+    let archived_id = crate::crypt::DataKey::id_at(&archived)?;
+    match (key, archived_id) {
+        (Some(key), Some(id)) if id == key.id() => Ok(()),
+        (Some(_), Some(_)) => Err(refuse(format!(
+            "nusadb-btree: the archive {} holds history sealed under another data key; it \
+             belongs to another database. Move it aside",
+            dir.display()
+        ))),
+        (Some(_), None) => {
+            let holds_history = dir.is_dir() && {
+                let (images, segments) = list_archive_readonly(dir)?;
+                !images.is_empty() || !segments.is_empty()
+            };
+            if holds_history {
+                return Err(refuse(format!(
+                    "nusadb-btree: the archive {} holds unencrypted history and this database is \
+                     encrypted; move the archive aside so a new one starts",
+                    dir.display()
+                )));
+            }
+            std::fs::create_dir_all(dir)?;
+            crate::crypt::copy_envelope(&crate::crypt::envelope_path(wal), &archived)
+        },
+        (None, Some(_)) => Err(refuse(format!(
+            "nusadb-btree: the archive {} is encrypted and this database is not; move the \
+             archive aside so a new one starts",
+            dir.display()
+        ))),
+        (None, None) => Ok(()),
+    }
 }
 
 /// The archived images and log segments in `dir`, each as its covered log position, sorted,
@@ -5742,6 +6523,18 @@ impl RecoveryTarget {
 /// The refusal for corruption in the middle of a log: truncating there would silently lose
 /// every committed transaction past it.
 fn mid_log_hole_error(path: &Path, hole: &nusadb_wal::MidLogHole) -> Error {
+    if hole.forged {
+        return Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "nusadb-btree: the log record at byte {} of {} fails authentication: it was \
+                 altered, or sealed under another data key. Refusing to open; nothing was \
+                 changed. Restore the database from a backup or the archive",
+                hole.at,
+                path.display()
+            ),
+        ));
+    }
     let after = hole.next_valid_at.map_or_else(
         || {
             "no valid record prefix at all (an incompatible/older WAL format, or corruption \
@@ -5980,6 +6773,7 @@ fn choose_base_image(
     target: RecoveryTarget,
     images: &[u64],
     forks: &[ForkRecord],
+    key: Option<&DataKey>,
 ) -> Result<(u64, RecoveryTarget)> {
     for &lsn in images.iter().rev() {
         let image = archive.join(format!("{lsn:020}.ckpt"));
@@ -5988,7 +6782,7 @@ fn choose_base_image(
                 .iter()
                 .any(|fork| fork.sealed == lsn && fork.cut <= bound)
         };
-        match read_checkpoint_image(&image) {
+        match read_checkpoint_image(&image, key) {
             Ok(contents) => {
                 let (records, covered) = (contents.records, contents.covered_lsn);
                 let time = image_commit_time(&records).unwrap_or(0);
@@ -6037,11 +6831,14 @@ fn assemble_log(
     base: u64,
     segments: &[u64],
     live_log: Option<&Path>,
+    seal: Option<&nusadb_wal::RecordSeal>,
 ) -> Result<AssembledChain> {
     let refuse =
         |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     let corrupt = |source: &Path, hole: nusadb_wal::MidLogHole| {
-        let after = if hole.next_valid_at.is_some() {
+        let after = if hole.forged {
+            "with a record that fails authentication (altered, or sealed under another key)"
+        } else if hole.next_valid_at.is_some() {
             "with records after it"
         } else {
             "with no valid record at all"
@@ -6074,7 +6871,8 @@ fn assemble_log(
         }
         let bytes = std::fs::read(&source)?;
         let is_live = live_log.is_some_and(|live| live == source);
-        let Some(span) = log_span(&bytes, target).map_err(|hole| corrupt(&source, hole))? else {
+        let Some(span) = log_span(&bytes, target, seal).map_err(|hole| corrupt(&source, hole))?
+        else {
             continue; // an empty segment covers nothing
         };
         if is_live {
@@ -6114,7 +6912,7 @@ fn assemble_log(
         && live_last == 0
     {
         let bytes = std::fs::read(live)?;
-        if let Some(span) = log_span(&bytes, target).map_err(|hole| corrupt(live, hole))? {
+        if let Some(span) = log_span(&bytes, target, seal).map_err(|hole| corrupt(live, hole))? {
             live_last = span.last;
         }
     }
@@ -6393,8 +7191,9 @@ struct LogSpan {
 fn log_span(
     bytes: &[u8],
     target: RecoveryTarget,
+    seal: Option<&nusadb_wal::RecordSeal>,
 ) -> core::result::Result<Option<LogSpan>, nusadb_wal::MidLogHole> {
-    let prefix = nusadb_wal::recover_prefix(bytes)?;
+    let prefix = nusadb_wal::recover_sealed_prefix(bytes, seal)?;
     let Some(first) = prefix.records.first().map(|(lsn, _)| lsn.0) else {
         return Ok(None);
     };

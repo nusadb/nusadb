@@ -26,6 +26,7 @@ mimalloc = ["dep:mimalloc"]
 nusadb-core = { workspace = true }
 nusadb-sql  = { workspace = true }
 nusadb-btree = { workspace = true }
+zeroize = { workspace = true }
 nusadb-wire = { workspace = true }
 # `signal` (unioned onto the workspace tokio features) for graceful Ctrl-C shutdown.
 tokio       = { workspace = true, features = ["signal"] }

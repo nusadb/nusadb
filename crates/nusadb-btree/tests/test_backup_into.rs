@@ -96,7 +96,7 @@ fn a_backup_opens_as_the_state_of_the_image_and_leaves_the_database_alone() {
     assert_eq!(numbers(&restored), (0..300).collect::<Vec<_>>());
     assert_eq!(
         nusadb_btree::format::read_format(&copy).unwrap(),
-        Some(nusadb_btree::format::FORMAT_VERSION)
+        Some(nusadb_btree::format::PLAIN_FORMAT_VERSION)
     );
 }
 

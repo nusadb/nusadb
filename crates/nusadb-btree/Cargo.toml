@@ -21,6 +21,8 @@ dst-fault = []
 nusadb-core = { workspace = true }
 nusadb-wal  = { workspace = true }
 crc32fast   = { workspace = true }
+sha2        = { workspace = true }
+zeroize     = { workspace = true }
 tracing     = { workspace = true }
 
 [dev-dependencies]

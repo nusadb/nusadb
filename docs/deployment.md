@@ -11,6 +11,7 @@ the database.
 - [Running the container image](#running-the-container-image)
 - [Running on a Linux VM with systemd](#running-on-a-linux-vm-with-systemd)
 - [TLS](#tls)
+- [Encryption at rest](#encryption-at-rest)
 - [Metrics](#metrics)
 - [Checkpoints, backup and restore](#checkpoints-backup-and-restore)
 - [Upgrades](#upgrades)
@@ -53,6 +54,11 @@ the database.
 | `--max-prepared-transactions` | `64` | How many prepared transactions (`PREPARE TRANSACTION`) may wait at once in each database; one more is refused with `53400`. `0` disables two-phase commit (`55000`). A prepared transaction holds its locks and holds back version reclamation until it is finished, so the cap bounds what forgotten ones can pin. |
 | `--checkpoint-max-pause` | `2` | Once the log is past its threshold and three checks in a row found transactions active, hold new transactions for at most this many seconds (capped at 60) so the checkpoint can run. `0` never pauses. |
 | `--metrics-listen` | none | Serve Prometheus metrics on this address, for example `127.0.0.1:9100`. |
+| `--encryption-key-file` | none | Encrypt every database at rest under the master key in this file (see [Encryption at rest](#encryption-at-rest)). The file must not be readable by others nor writable by group or others. |
+| `NUSADB_ENCRYPTION_KEY_FILE` / `NUSADB_ENCRYPTION_KEY` (environment) | none | The same as `--encryption-key-file`, or the key itself as 64 hex digits. Give the key in one place only. Prefer the file: a key in the environment stays readable for the life of the process to anyone who can read its environment. |
+| `--generate-encryption-key PATH` | none | Write a new random master key to `PATH`, readable by its owner only, and exit. An existing file is never overwritten. |
+| `--rotate-encryption-key PATH` | none | Offline: seal every database's data key under the key in `PATH` instead of the current one, in the data directory, `--wal-archive-dir` and `--backup-dir`, then exit. |
+| `--encrypt-from DIR` / `--encrypt-from-key-file` | none | Offline: copy every database of the data directory `DIR` into `--data-dir`, encrypted, then exit. |
 | `--storage-engine` | `btree` | The only value. A data directory written by the removed `lsm` engine is refused with a migration hint. |
 
 `RUST_LOG` sets log verbosity (`tracing` filter syntax, for example `RUST_LOG=info` or
@@ -260,6 +266,20 @@ docker run -d --name nusadb \
 - Connect from inside: `docker exec -it nusadb nusadb-cli --user app`. The password is read from
   `NUSADB_PASSWORD`, which the container already has.
 - The image exposes `5678` and `9100`; publish `9100` only on a private interface.
+- For [encryption at rest](#encryption-at-rest), mount the key file read-only outside the data
+  volume and point `NUSADB_ENCRYPTION_KEY_FILE` at it. The server reads the variable itself, so the
+  first-start initialisation runs encrypted too. The file inside the container must belong to
+  the server's user (uid 10001) or its group and must not be readable by others (`chmod 600` or
+  `640`):
+
+  ```bash
+  docker run -d --name nusadb -p 5678:5678 \
+    -v nusadb-data:/var/lib/nusadb \
+    -v /etc/nusadb/master.key:/run/secrets/nusadb_master_key:ro \
+    -e NUSADB_ENCRYPTION_KEY_FILE=/run/secrets/nusadb_master_key \
+    -e NUSADB_USER=app -e NUSADB_PASSWORD=change-me \
+    nusadb/nusadb:latest
+  ```
 
 ```bash
 docker run -d --name nusadb \
@@ -390,6 +410,143 @@ CA, in addition to SCRAM authentication.
 
 ---
 
+## Encryption at rest
+
+With `--encryption-key-file`, everything the server writes that holds row values, names or keys
+is encrypted with AES-256-GCM-SIV: each database's log, checkpoint image and page segments, the
+scratch file for changed pages under `--max-resident-bytes`, the spill files of large sorts and
+joins, and every copy of them (the `--wal-archive-dir` archive, `--backup-dir` backups, a
+standby's copy). Encryption is checked as well as applied: a page or log record that was altered,
+moved to another place, or written under another key is refused, never read as data.
+
+**Keys.** The key file holds the master key, 32 random bytes as 64 hex digits. Generate one:
+
+```bash
+nusadb-server --generate-encryption-key /etc/nusadb/master.key
+```
+
+It is created with mode `600` and its fingerprint is printed. The server refuses a key file that
+others can read or that group or others can write (`640` is accepted, to let a service group read
+it). Keep a copy of the key somewhere safe and apart from the data: without it the data cannot be
+read by anyone, and there is no recovery path.
+
+The master key never touches the data directory. Each database gets its own random data key when
+it is created; that key encrypts the database's files and is stored beside them, sealed under the
+master key, in `base/<db>/btree.wal.key`. The archive and every backup carry a copy of it
+(`<archive>/<db>/key`, `<backup>/base/<db>/btree.wal.key`), so they open with the same master key.
+
+**Starting.** Encryption is a property of the whole data directory and is decided when a database
+is created:
+
+```bash
+nusadb-server --data-dir /var/lib/nusadb --encryption-key-file /etc/nusadb/master.key
+```
+
+A fresh data directory starts encrypted, and every database created later is encrypted. At
+start-up the server checks every database against the key before it reads or writes anything, and
+refuses to start, naming the database, when
+
+- a database is encrypted and no key was given, or the key is not the one it was encrypted with
+  (the message shows the fingerprint of the key given);
+- a key was given and a database holds data that is not encrypted (it would stay readable on disk
+  while the server claims encryption);
+- a key file (`btree.wal.key`) lies beside data that is not encrypted, for example one copied in
+  from another database: it does not belong there, and the database opens again once it is
+  removed;
+- a database is an `--encrypt-from` copy that never finished (it has a `btree.wal.incomplete`
+  file): run the copy again.
+
+Nothing in the data directory changes on a refused start. A database directory that lost its
+`btree.wal.key` cannot be opened at all; restore the file from a backup.
+
+**Encrypting an existing data directory.** An unencrypted database is never converted in place.
+Copy it into a new data directory instead, with no server running on the old one:
+
+```bash
+nusadb-server --data-dir /var/lib/nusadb-encrypted --encryption-key-file /etc/nusadb/master.key \
+  --encrypt-from /var/lib/nusadb
+```
+
+Every database of the old directory is opened (recovering it), checkpointed, and written into the
+new directory with its pages and records encrypted; the command then exits. The old directory keeps
+working unencrypted, so it can be checked against the new one before it is removed. Start the
+server on the new directory, start a new `--wal-archive-dir` (the old archive is unencrypted and
+is refused), take a fresh backup, and then destroy the old directory, its archive and its backups:
+they hold the data in the clear.
+
+The source must be an existing data directory, and the target a new one: its catalog may name
+no database the source does not have, and each directory under `base/` must be empty (a server
+started once on a new directory leaves an empty lock file there, which is accepted). Anything
+else is refused with nothing changed. The command first writes `global/encrypt-copy` in the
+target, naming the source, a check value of the key (never the key itself) and each database it
+is about to create, then marks each database with a `btree.wal.incomplete` file before
+registering it. Once every database is written, the target lists exactly the source's databases
+and no marker is left, the file is removed and the command exits with success. A server started
+on a directory where a copy stopped part way refuses to start and names these files. Run the same
+command again, with the same source path and the same key: it copies every database again from
+the start, since the source may have changed in the meantime, and removes from the target a
+database it created that the source no longer has. It never removes anything it did not create,
+nor a directory holding files that are not a database's: it stops instead, names them, and keeps
+its journal, so the command can be run again once they are moved out. A rerun from another
+source path or under another key is refused, as is a run into a directory holding a finished
+copy: copy into an empty directory, or remove it first. A source path containing a line break is
+refused. Do not edit `global/encrypt-copy`: every database it lists as created is treated as the
+copy's own, and a rerun may remove it. A database directory under `base/` that is a link, or a
+`base/` or `global/` that is one, is refused rather than followed, and so is a link at one of a
+database's file names; scratch files, markers and the journal are always written as new files,
+never through a link. Nothing else may change the target while the command runs: a link put
+there during the run is outside what it guards against. The same command with
+`--encrypt-from-key-file OLD_KEY` copies an encrypted directory under new data keys.
+
+**Rotating the master key.** With the server stopped:
+
+```bash
+nusadb-server --generate-encryption-key /etc/nusadb/master-2.key
+nusadb-server --data-dir /var/lib/nusadb --wal-archive-dir /srv/nusadb-archive \
+  --backup-dir /srv/nusadb-backups \
+  --encryption-key-file /etc/nusadb/master.key --rotate-encryption-key /etc/nusadb/master-2.key
+```
+
+It seals each data key found in the data directory, the archive and the backups under the new
+master key, replacing each `key` file atomically, and reports how many it changed. The data is not
+rewritten, so it takes milliseconds. If it stops part way, run it again with the same two keys: it
+finishes the rest. Then start the server with the new key. Copies kept elsewhere (an off-site
+backup) still need the old key; keep it until they age out. Rotating the master key does not
+change the data keys; to replace those, copy the data directory with `--encrypt-from` and
+`--encrypt-from-key-file`.
+
+**Backups, restore and standby.** Copy `btree.wal.key` together with the image and its segments
+(see [Backup](#checkpoints-backup-and-restore)); scheduled backups and the archive include it.
+`--restore-database` and `--standby-from` need the same `--encryption-key-file` as the primary.
+An encrypted archive is refused without the key, and an unencrypted archive is refused with one.
+
+**Cost.** Each page read from disk and each log record is decrypted and checked, and each written
+is encrypted: a sealed page takes 8,220 bytes on disk instead of 8,192, a log record 28 more bytes.
+Pages in the cache are held decrypted, so a query over cached data costs the same.
+
+The spill files of large sorts and joins are sealed under a key drawn when the server starts and
+never written anywhere, so a spill file left by a crash cannot be read by anyone. Their records
+are not bound to a position within the file; they are scratch, read only by the query that wrote
+them.
+
+**What it does not protect.**
+
+- Memory. Pages in the cache, rows being processed and the keys are in the server's memory in the
+  clear, as is anything in a core dump.
+- A key file kept on the same disk as the data. Keep it on a separate mount or a secrets volume
+  (`/run/secrets` in a container), or anyone who copies the disk has both.
+- Which copy a page belongs to, between a database, a database restored from its archive and its
+  standbys: they share one data key, so the files of one can be put in place of another's.
+- Metadata: file names and sizes, database names (they are directory names and are listed in
+  `global/databases`), how much was written and when, and the log positions in file names.
+- The order and completeness of the log. Each record and page is authenticated where it lies, but
+  someone who can write the files can cut the end off the log (as a crash would) or put back an
+  older complete copy of a database.
+- The network: use [TLS](#tls) for that. The server log does not hold row values unless a
+  statement or an error message includes them.
+
+---
+
 ## Metrics
 
 With `--metrics-listen` set, the server answers Prometheus scrapes in the text exposition format.
@@ -500,6 +657,8 @@ NUSADB_PASSWORD=... nusadb-cli --user nusadb-root -d shop -c "CHECKPOINT"
 snap=/data/snapshots/shop-$(date +%F)       # on the same file system as $DATA_DIR
 mkdir -p "$snap/btree.wal.pages"
 ln "$DATA_DIR/base/shop/btree.wal.format" "$snap/btree.wal.format"
+# an encrypted database: its data key, sealed under the master key
+[ -e "$DATA_DIR/base/shop/btree.wal.key" ] && ln "$DATA_DIR/base/shop/btree.wal.key" "$snap/btree.wal.key"
 ln "$DATA_DIR/base/shop/btree.wal.ckpt" "$snap/btree.wal.ckpt"
 ln "$DATA_DIR/base/shop/btree.wal.pages/"*.seg "$snap/btree.wal.pages/"
 cp -r "$snap" /backups/                     # then copy it anywhere
@@ -522,10 +681,14 @@ and start the server. It opens the image with an empty log tail.
 
 ```bash
 rm -rf "$DATA_DIR/base/shop/btree.wal" "$DATA_DIR/base/shop/btree.wal.ckpt" \
-  "$DATA_DIR/base/shop/btree.wal.pages" "$DATA_DIR/base/shop/btree.wal.format"
+  "$DATA_DIR/base/shop/btree.wal.pages" "$DATA_DIR/base/shop/btree.wal.format" \
+  "$DATA_DIR/base/shop/btree.wal.key"
 cp -r /backups/shop-2026-09-26/btree.wal.pages "$DATA_DIR/base/shop/"
 cp /backups/shop-2026-09-26/btree.wal.ckpt "$DATA_DIR/base/shop/btree.wal.ckpt"
 cp /backups/shop-2026-09-26/btree.wal.format "$DATA_DIR/base/shop/btree.wal.format"
+# an encrypted database: copy its key file too, and start with the same --encryption-key-file
+[ -e /backups/shop-2026-09-26/btree.wal.key ] && \
+  cp /backups/shop-2026-09-26/btree.wal.key "$DATA_DIR/base/shop/btree.wal.key"
 nusadb-server --data-dir "$DATA_DIR"
 ```
 
@@ -548,6 +711,7 @@ DIR/20261007T020000Z/
   base/<db>/btree.wal.ckpt    each database's checkpoint image,
   base/<db>/btree.wal.pages/  the page segments it reads from,
   base/<db>/btree.wal.format  and its data format
+  base/<db>/btree.wal.key     an encrypted database's data key, sealed under the master key
 ```
 
 For each database the server first takes a checkpoint, holding new transactions for at most
@@ -743,7 +907,7 @@ directory records which one:
 | File | Holds |
 | --- | --- |
 | `global/format` | the cluster format: the `global/` and `base/<db>/` layout and the database catalog |
-| `base/<db>/btree.wal.format` | the data format of that database: its log, checkpoint image, page segments, and page and row layouts |
+| `base/<db>/btree.wal.format` | the data format of that database: its log, checkpoint image, page segments, and page and row layouts (format 3 for an encrypted database) |
 | `<archive>/<db>/format` | the data format of a `--wal-archive-dir` archive |
 
 Each file also names the release that last wrote it, for example:
@@ -775,6 +939,12 @@ database's directory, whether or not two-phase commit is ever used. From then on
 reads only format 1 refuses the directory: there is no downgrade.** Back up the data directory
 before the first start of such a release if you may need to go back. Nothing else on disk changes
 in the upgrade.
+
+Format 3 is format 2 with every file of the database encrypted (see
+[Encryption at rest](#encryption-at-rest)). Only an encrypted database is recorded as format 3, and
+a database is encrypted only when it is created, so an unencrypted database stays in format 2 and a
+release that reads format 2 keeps opening it. A release that reads only format 2 refuses an
+encrypted database by its format number, with nothing changed.
 
 **When the format changes.** A release that changes how anything on disk is written, in a way an
 older release cannot read, raises the format number, and its release notes say so. Patch releases

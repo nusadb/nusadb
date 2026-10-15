@@ -14,7 +14,7 @@ use std::path::Path;
 
 use nusadb_core::{Lsn, Result};
 
-use crate::crypto::WalCipher;
+use crate::crypto::RecordSeal;
 use crate::record::WalRecord;
 
 /// Frame body kind (the first byte of every record body, inside the CRC/AEAD coverage): the
@@ -40,8 +40,10 @@ const APPEND_BUF_CAP: usize = 64 * 1024;
 pub struct WalWriter<W: Write> {
     inner: W,
     next_lsn: u64,
-    /// When set, each record's payload is sealed with AES-256-GCM-SIV before framing.
-    cipher: Option<WalCipher>,
+    /// When set, each record's body is sealed with AES-256-GCM-SIV before framing.
+    seal: Option<RecordSeal>,
+    /// Reused across appends to hold the sealed body.
+    sealed: Vec<u8>,
     /// Reused across appends to hold the encoded (uncompressed) record payload — avoids a fresh
     /// allocation per record on the hot durability path.
     scratch: Vec<u8>,
@@ -63,7 +65,8 @@ impl<W: Write> WalWriter<W> {
         Self {
             inner,
             next_lsn: 1,
-            cipher: None,
+            seal: None,
+            sealed: Vec::new(),
             scratch: Vec::new(),
             body: Vec::new(),
             frame: Vec::new(),
@@ -71,20 +74,19 @@ impl<W: Write> WalWriter<W> {
         }
     }
 
-    /// Wrap `inner` for **encrypted** records, assigning LSNs starting at 1. Each
-    /// record's lz4-compressed payload is sealed under `key` before framing; recovery needs the
-    /// same key (see [`WalReader::new_encrypted`](crate::WalReader::new_encrypted)).
+    /// Seal every record appended from now on with `seal` (see [`crate::crypto`]): the body is
+    /// compressed, then sealed under an AAD naming the seal's domain and scope and the record's
+    /// position, and the frame's CRC32 covers the sealed bytes. A reader needs the same seal
+    /// ([`WalReader::with_seal`](crate::WalReader::with_seal)).
     #[must_use]
-    pub fn new_encrypted(inner: W, key: &[u8; 32]) -> Self {
-        Self {
-            inner,
-            next_lsn: 1,
-            cipher: Some(WalCipher::new(key)),
-            scratch: Vec::new(),
-            body: Vec::new(),
-            frame: Vec::new(),
-            append_buf: Vec::new(),
-        }
+    pub fn with_seal(mut self, seal: RecordSeal) -> Self {
+        self.seal = Some(seal);
+        self
+    }
+
+    /// Whether records are sealed.
+    pub const fn is_sealed(&self) -> bool {
+        self.seal.is_some()
     }
 
     /// Leave every position at or below `lsn` behind: the next record is numbered past it. A
@@ -101,7 +103,8 @@ impl<W: Write> WalWriter<W> {
         Self {
             inner,
             next_lsn: start.0.max(1),
-            cipher: None,
+            seal: None,
+            sealed: Vec::new(),
             scratch: Vec::new(),
             body: Vec::new(),
             frame: Vec::new(),
@@ -149,13 +152,15 @@ impl<W: Write> WalWriter<W> {
         // Compress-then-encrypt: seal the body, then CRC + frame the ciphertext so a bit-flip is
         // still caught by the CRC and a wrong key / tamper by the AEAD tag. The body kind
         // byte is inside the sealed/CRC'd region, so it cannot be tampered undetected.
-        let sealed = match &self.cipher {
-            Some(cipher) => Some(cipher.seal(lsn.0, &self.body).map_err(|()| {
-                nusadb_core::Error::Io(std::io::Error::other("WAL record encryption failed"))
-            })?),
-            None => None,
+        let body: &[u8] = match &self.seal {
+            Some(seal) => {
+                self.sealed.clear();
+                seal.sealer
+                    .seal_into(&seal.aad(lsn.0), &self.body, &mut self.sealed)?;
+                &self.sealed
+            },
+            None => &self.body,
         };
-        let body = sealed.as_deref().unwrap_or(&self.body);
         // A body the reader would refuse as an implausible length must never reach the log: it
         // would be written fine and then stall or fail every later recovery at that frame.
         if body.len() > crate::reader::MAX_RECORD_BYTES {

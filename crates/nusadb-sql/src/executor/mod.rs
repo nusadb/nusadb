@@ -167,7 +167,7 @@ pub use ops::{
     maintenance_work_mem, parse_work_mem, set_maintenance_work_mem, set_work_mem, work_mem,
 };
 pub use row::Row;
-pub use spill::{SpillConfig, set_spill_config};
+pub use spill::{SpillConfig, set_spill_config, set_spill_encryption};
 
 /// Whether spill-to-disk is configured for this process. Crate-visible so the vectorized
 /// group-by routing can defer to the row path's bounded-memory sort-based group-by whenever spill

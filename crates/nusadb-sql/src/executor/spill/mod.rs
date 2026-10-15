@@ -20,8 +20,10 @@ mod budget;
 mod codec;
 mod context;
 mod file;
+mod seal;
 
 pub use context::{SpillConfig, set_spill_config};
+pub use seal::set_spill_encryption;
 
 // Consumed by the spilling operators (`join.rs` grace join, `spill_sort.rs` external sort);
 // re-exported to the executor module so siblings can reach them without the longer

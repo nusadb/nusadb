@@ -22,6 +22,9 @@ ahash          = { workspace = true }
 smallvec       = { workspace = true }
 tracing        = { workspace = true }
 aes-gcm-siv    = { workspace = true }
+# Only to turn on its `zeroize` feature (see the workspace manifest).
+aes            = { workspace = true }
+zeroize        = { workspace = true }
 sha2           = { workspace = true }
 # JSON / JSONB value type + operators.
 serde_json     = { workspace = true }

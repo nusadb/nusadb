@@ -21,9 +21,11 @@ pub mod reader;
 pub mod record;
 pub mod writer;
 
+pub use crypto::{RecordSeal, Sealer};
 pub use group_commit::GroupCommit;
 pub use reader::{
     MAX_RECORD_BYTES, MidLogHole, ReadOutcome, RecoveredPrefix, WalReader, recover_prefix,
+    recover_sealed_prefix,
 };
 pub use record::WalRecord;
 pub use writer::WalWriter;

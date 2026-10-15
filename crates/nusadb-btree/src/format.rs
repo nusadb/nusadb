@@ -24,12 +24,24 @@ use std::path::{Path, PathBuf};
 
 use nusadb_core::{Error, Result};
 
-/// The data format this release writes.
+/// The newest data format this release reads and writes.
+pub const FORMAT_VERSION: u32 = ENCRYPTED_FORMAT_VERSION;
+
+/// The data format of an unencrypted directory.
 ///
 /// Format 2 adds the records of prepared transactions (`PREPARE TRANSACTION`) to the log and
 /// the checkpoint image. A format-1 directory is a valid format-2 one, so its upgrade only
 /// records the new number.
-pub const FORMAT_VERSION: u32 = 2;
+pub const PLAIN_FORMAT_VERSION: u32 = 2;
+
+/// The data format of an encrypted directory (see [`crate::crypt`]).
+///
+/// Format 3 is format 2 with every file sealed: the log and image records, the image's page
+/// directory and the page segments, with the data key's envelope beside the log. An unencrypted
+/// directory stays in format 2, so a release that reads format 2 keeps opening it; only an
+/// encrypted directory is out of its reach, and it refuses it by number instead of misreading it.
+/// A directory is encrypted only when it is created, so no directory is ever upgraded from 2 to 3.
+pub const ENCRYPTED_FORMAT_VERSION: u32 = 3;
 
 /// One step bringing a directory from format `from` to `from + 1`, given its log path.
 pub(crate) struct Upgrade {
@@ -126,12 +138,51 @@ pub fn read_format(wal: &Path) -> Result<Option<u32>> {
 
 /// Check the directory of the log at `wal` before anything else of it is read: refuse a format
 /// newer than this release writes, upgrade an older one step by step, and record the format and
-/// this release as its writer. The caller holds the database lock.
+/// this release as its writer. `encrypted` says whether the directory is encrypted (the caller
+/// has checked its key envelope): it is then recorded as format 3, which only a directory that
+/// holds no data yet can become. The caller holds the database lock.
 ///
 /// # Errors
 /// A newer format, an unreadable format file, a failed upgrade step, or an I/O error.
-pub(crate) fn check_format(wal: &Path) -> Result<()> {
-    check_with(wal, FORMAT_VERSION, UPGRADES)
+pub(crate) fn check_format(wal: &Path, encrypted: bool) -> Result<()> {
+    if encrypted {
+        return check_encrypted(wal);
+    }
+    if read_format(wal)? == Some(ENCRYPTED_FORMAT_VERSION) {
+        return Err(invalid(format!(
+            "nusadb-btree: the database at {} is in data format {ENCRYPTED_FORMAT_VERSION} \
+             (encrypted) but its key envelope {} is missing; restore the envelope from a backup",
+            wal.display(),
+            crate::crypt::envelope_path(wal).display()
+        )));
+    }
+    check_with(wal, PLAIN_FORMAT_VERSION, UPGRADES)
+}
+
+/// [`check_format`] for an encrypted directory: format 3, recorded as such.
+fn check_encrypted(wal: &Path) -> Result<()> {
+    let found = read_format(wal)?;
+    if let Some(version) = found
+        && version > FORMAT_VERSION
+    {
+        // Let the general check word the refusal.
+        return check_with(wal, FORMAT_VERSION, UPGRADES);
+    }
+    // Only a directory that holds nothing yet becomes format 3: data written in an older format
+    // is unencrypted, and recording it as encrypted would make it unreadable.
+    if found != Some(ENCRYPTED_FORMAT_VERSION) && crate::crypt::holds_data(wal) {
+        return Err(invalid(format!(
+            "nusadb-btree: the database at {} holds data in format {}, which is not encrypted; \
+             it cannot become encrypted in place. Nothing was changed",
+            wal.display(),
+            found.unwrap_or(1)
+        )));
+    }
+    let text = format_text(ENCRYPTED_FORMAT_VERSION);
+    if std::fs::read_to_string(format_path(wal)).ok().as_deref() != Some(text.as_str()) {
+        write_format(wal, ENCRYPTED_FORMAT_VERSION)?;
+    }
+    Ok(())
 }
 
 /// [`check_format`] for a release that writes format `current` with upgrade `steps`.
@@ -139,14 +190,15 @@ fn check_with(wal: &Path, current: u32, steps: &[Upgrade]) -> Result<()> {
     let path = format_path(wal);
     let found = read_format(wal)?;
     let version = found.unwrap_or(current);
-    if version > current {
+    let newest = current.max(FORMAT_VERSION);
+    if version > newest {
         let writer = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| parse(&text).and_then(|(_, w)| w.map(str::to_owned)))
             .unwrap_or_else(|| "a newer release".to_owned());
         return Err(invalid(format!(
             "nusadb-btree: the database at {} is in data format {version}, written by {writer}; \
-             this release (nusadb {}) reads data format {current} and older. Open it with \
+             this release (nusadb {}) reads data format {newest} and older. Open it with \
              the release that wrote it or a newer one; its files were left untouched",
             wal.display(),
             env!("CARGO_PKG_VERSION"),
@@ -224,16 +276,16 @@ pub(crate) fn archive_format(archive: &Path) -> Result<u32> {
     }
 }
 
-/// Check a checkpoint archive an engine is about to write to and record this release's format in
-/// it.
+/// Check a checkpoint archive an engine is about to write to and record the format of what it
+/// will hold, `version`.
 ///
 /// # Errors
 /// As [`check_archive`], or an I/O error writing the file.
-pub(crate) fn stamp_archive(archive: &Path) -> Result<()> {
+pub(crate) fn stamp_archive(archive: &Path, version: u32) -> Result<()> {
     check_archive(archive)?;
     std::fs::create_dir_all(archive)?;
     let path = archive_format_path(archive);
-    let text = format_text(FORMAT_VERSION);
+    let text = format_text(version);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         write_file(&path, &text)?;
     }
@@ -245,14 +297,13 @@ pub(crate) fn write_format(wal: &Path, version: u32) -> Result<()> {
     write_file(&format_path(wal), &format_text(version))
 }
 
-/// Write `text` to `path` atomically: a scratch file, synced, renamed over it.
+/// Write `text` to `path` atomically: a scratch file of its own, synced, renamed over it.
 fn write_file(path: &Path, text: &str) -> Result<()> {
     let path = path.to_path_buf();
     let mut scratch = path.clone().into_os_string();
     scratch.push(".tmp");
     let scratch = PathBuf::from(scratch);
-    std::fs::write(&scratch, text)?;
-    std::fs::File::open(&scratch)?.sync_all()?;
+    crate::crypt::write_fresh(&scratch, text.as_bytes())?;
     std::fs::rename(&scratch, &path)?;
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         #[cfg(unix)]
@@ -291,6 +342,21 @@ mod tests {
 
     fn failing_step_2(_: &Path) -> Result<()> {
         Err(invalid("step 2 failed".to_owned()))
+    }
+
+    #[test]
+    fn unencrypted_data_is_never_recorded_as_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("btree.wal");
+        std::fs::write(&wal, b"records").unwrap();
+        write_format(&wal, PLAIN_FORMAT_VERSION).unwrap();
+        let err = check_format(&wal, true).unwrap_err().to_string();
+        assert!(err.contains("cannot become encrypted"), "{err}");
+        assert_eq!(read_format(&wal).unwrap(), Some(PLAIN_FORMAT_VERSION));
+        // An empty directory may.
+        let empty = dir.path().join("empty.wal");
+        check_format(&empty, true).unwrap();
+        assert_eq!(read_format(&empty).unwrap(), Some(ENCRYPTED_FORMAT_VERSION));
     }
 
     #[test]

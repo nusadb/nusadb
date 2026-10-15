@@ -75,8 +75,8 @@ pub use executor::{
     lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
     maintenance_work_mem, parse_work_mem, partition_key_columns, partitions_to_prune,
     pin_statement_timezone, pin_transaction_start, purge_schema_catalogs, release_advisory_locks,
-    rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_work_mem,
-    show_session_variable, stamp_transaction_start, statement_tz_offset_secs,
+    rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_spill_encryption,
+    set_work_mem, show_session_variable, stamp_transaction_start, statement_tz_offset_secs,
     view_has_instead_of_trigger, wall_clock_micros, work_mem,
 };
 

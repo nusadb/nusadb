@@ -81,6 +81,9 @@ sha2           = "0.10"
 # CSPRNG for data-key + key-wrap nonce generation (A-enc.03). Already in the tree
 # transitively; pure-OS-entropy interface, deny.toml-compliant.
 getrandom      = "0.3"
+# Not used directly: named so its `zeroize` feature is on, which wipes the AES round keys of the
+# at-rest cipher (aes-gcm-siv) when a cipher is dropped.
+aes            = { version = "0.8", features = ["zeroize"] }
 # JSON / JSONB value type + operators. Already in the tree transitively;
 # ubiquitous, deny.toml-compliant. Default features (BTreeMap maps => canonical sorted keys).
 serde_json     = { version = "1", features = ["arbitrary_precision"] }

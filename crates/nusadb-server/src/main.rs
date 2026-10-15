@@ -279,6 +279,97 @@ struct Args {
     /// segment can be applied. Defaults to 2 seconds.
     #[arg(long, default_value_t = 2, requires = "standby_from")]
     standby_max_pause: u64,
+
+    /// Encrypt every database at rest under the master key in this file (64 hex digits; create
+    /// one with `--generate-encryption-key`). The file must not be readable by others nor
+    /// writable by group or others. The `NUSADB_ENCRYPTION_KEY_FILE` environment variable is the
+    /// same; `NUSADB_ENCRYPTION_KEY` may hold the hex key itself. Every database of the data
+    /// directory must then be encrypted under this key: one that is not, or a key that does not
+    /// match, stops the server at start-up with nothing changed.
+    #[arg(long, value_name = "PATH")]
+    encryption_key_file: Option<String>,
+
+    /// Instead of serving: write a new random master key to this file (created readable by its
+    /// owner only, never overwritten) and exit.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["encrypt_from", "rotate_encryption_key"])]
+    generate_encryption_key: Option<String>,
+
+    /// Instead of serving: seal the data key of every database under the master key in this
+    /// file instead of the current one (`--encryption-key-file`), in the data directory, the
+    /// `--wal-archive-dir` and the `--backup-dir`, then exit. The data itself is not rewritten.
+    /// Run it with the server stopped; run it again with the same keys to finish an interrupted
+    /// rotation.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["encrypt_from", "restore_database", "standby_from"])]
+    rotate_encryption_key: Option<String>,
+
+    /// Instead of serving: copy every database of this data directory (with no server running on
+    /// it) into `--data-dir`, encrypted under `--encryption-key-file`, then exit. `--data-dir` must
+    /// be new or empty, or be the target of an interrupted copy from the same source under the
+    /// same key, which is then written again in full. The source is checkpointed but otherwise
+    /// left as it was.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["restore_database", "standby_from"])]
+    encrypt_from: Option<String>,
+
+    /// The master key of the `--encrypt-from` data directory when it is itself encrypted: the
+    /// copy then gets new data keys under `--encryption-key-file`.
+    #[arg(long, value_name = "PATH", requires = "encrypt_from")]
+    encrypt_from_key_file: Option<String>,
+}
+
+/// The master key the flags and the environment name: `--encryption-key-file`, else
+/// `NUSADB_ENCRYPTION_KEY_FILE`, else the hex key in `NUSADB_ENCRYPTION_KEY`. `None` when none
+/// is set. Pure apart from reading the file, so the precedence is unit-testable.
+fn resolve_master_key(
+    flag: Option<&str>,
+    env_file: Option<String>,
+    env_key: Option<String>,
+) -> Result<Option<nusadb_btree::crypt::MasterKey>, String> {
+    // The key text is wiped when it goes out of scope (the environment keeps its own copy).
+    let env_key = env_key.map(zeroize::Zeroizing::new);
+    let file = flag.map(str::to_owned).or(env_file);
+    match (file, env_key) {
+        (Some(_), Some(_)) => Err(
+            "give the encryption key once: a key file (--encryption-key-file or \
+             NUSADB_ENCRYPTION_KEY_FILE) or NUSADB_ENCRYPTION_KEY, not both"
+                .to_owned(),
+        ),
+        (Some(path), None) => {
+            nusadb_btree::crypt::MasterKey::from_file(std::path::Path::new(&path))
+                .map(Some)
+                .map_err(|e| e.to_string())
+        },
+        (None, Some(hex)) => nusadb_btree::crypt::MasterKey::from_text(hex.as_str())
+            .map(Some)
+            .map_err(|e| format!("NUSADB_ENCRYPTION_KEY: {e}")),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Copy every database of the `--encrypt-from` data directory into `--data-dir`, encrypted.
+fn encrypt_from(
+    source: &str,
+    args: &Args,
+    master_key: Option<Arc<nusadb_btree::crypt::MasterKey>>,
+    autoanalyze: database_manager::AutoAnalyzeConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = master_key
+        .ok_or("--encrypt-from needs --encryption-key-file: the key to encrypt the copy under")?;
+    let source_key = args
+        .encrypt_from_key_file
+        .as_deref()
+        .map(|path| nusadb_btree::crypt::MasterKey::from_file(std::path::Path::new(path)))
+        .transpose()?
+        .map(Arc::new);
+    let done = database_manager::encrypt_cluster(
+        std::path::Path::new(&args.data_dir),
+        std::path::Path::new(source),
+        &key,
+        source_key.as_ref(),
+        autoanalyze,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("{} database(s) copied, encrypted", done.len());
+    Ok(())
 }
 
 /// The log-bounding, archiving and standby settings the flags describe: the runtime checkpoint
@@ -294,6 +385,7 @@ fn durability_options(args: &Args) -> database_manager::DurabilityOptions {
         wal_archive: args.wal_archive_dir.as_ref().map(std::path::PathBuf::from),
         standby: standby_config(args),
         max_prepared_transactions: Some(args.max_prepared_transactions),
+        master_key: None,
     }
 }
 
@@ -337,11 +429,12 @@ fn restore_database(
     if let Some(parent) = wal.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    nusadb_btree::BtreeEngine::restore_from_archive(
+    nusadb_btree::BtreeEngine::restore_from_archive_with_key(
         &archive,
         target,
         &wal,
         args.restore_live_log.as_deref().map(std::path::Path::new),
+        manager.master_key(),
     )?;
     tracing::info!(
         database = name,
@@ -790,6 +883,7 @@ fn open_cluster(
     args: &Args,
     ceilings: &MemoryCeilings,
     autoanalyze: database_manager::AutoAnalyzeConfig,
+    master_key: Option<Arc<nusadb_btree::crypt::MasterKey>>,
 ) -> database_manager::DatabaseManager {
     match database_manager::DatabaseManager::open(
         &args.data_dir,
@@ -797,7 +891,10 @@ fn open_cluster(
         ceilings.max_txn_write_bytes,
         ceilings.max_resident_bytes,
         autoanalyze,
-        durability_options(args),
+        database_manager::DurabilityOptions {
+            master_key,
+            ..durability_options(args)
+        },
     ) {
         Ok(manager) => manager,
         Err(e) => {
@@ -808,6 +905,82 @@ fn open_cluster(
     }
 }
 
+/// Run `--generate-encryption-key` or `--rotate-encryption-key` when one is given; `true` when
+/// one ran and the process should exit.
+fn run_key_command(
+    args: &Args,
+    master_key: Option<&nusadb_btree::crypt::MasterKey>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(path) = &args.generate_encryption_key {
+        let key = nusadb_btree::crypt::MasterKey::generate_file(std::path::Path::new(path))?;
+        println!(
+            "wrote a new encryption key to {path} (fingerprint {}); keep a copy apart from the \
+             data: without it the data cannot be read",
+            key.fingerprint()
+        );
+        return Ok(true);
+    }
+    if let Some(new) = &args.rotate_encryption_key {
+        let old = master_key
+            .ok_or("--rotate-encryption-key needs the current key (--encryption-key-file)")?;
+        let new = nusadb_btree::crypt::MasterKey::from_file(std::path::Path::new(new))?;
+        let extra: Vec<std::path::PathBuf> = [&args.wal_archive_dir, &args.backup_dir]
+            .into_iter()
+            .flatten()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let rotation = database_manager::rotate_master_key(
+            std::path::Path::new(&args.data_dir),
+            &extra,
+            old,
+            &new,
+        )?;
+        println!(
+            "data keys sealed under the key with fingerprint {}: {} rewrapped, {} already done",
+            new.fingerprint(),
+            rotation.rewrapped,
+            rotation.already
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Read the master key and run a key command when one is given. `None` when a command ran and
+/// the process should exit; otherwise the key to serve with, if any, with spill sealing turned on
+/// when there is one.
+#[allow(
+    clippy::option_option,
+    reason = "the outer option says whether to go on serving, the inner whether there is a key"
+)]
+fn encryption_setup(
+    args: &Args,
+) -> Result<Option<Option<Arc<nusadb_btree::crypt::MasterKey>>>, Box<dyn std::error::Error>> {
+    // A new key needs no key of its own: generated before any key is read.
+    if args.generate_encryption_key.is_some() {
+        run_key_command(args, None)?;
+        return Ok(None);
+    }
+    let master_key = resolve_master_key(
+        args.encryption_key_file.as_deref(),
+        std::env::var("NUSADB_ENCRYPTION_KEY_FILE").ok(),
+        std::env::var("NUSADB_ENCRYPTION_KEY").ok(),
+    )?
+    .map(Arc::new);
+    if run_key_command(args, master_key.as_deref())? {
+        return Ok(None);
+    }
+    if let Some(key) = &master_key {
+        // Spill files hold rows too: seal them under a key that never leaves the process.
+        nusadb_sql::set_spill_encryption()?;
+        tracing::info!(
+            key_fingerprint = %key.fingerprint(),
+            "encryption at rest on: databases, their archive and backups, and spill files are sealed"
+        );
+    }
+    Ok(Some(master_key))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -816,7 +989,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    std::fs::create_dir_all(&args.data_dir)?;
+    let Some(master_key) = encryption_setup(&args)? else {
+        return Ok(());
+    };
+
     // Apply process-global memory config once (per-query work_mem + spill-to-disk), and resolve the
     // per-transaction and global resident write ceilings every database's engine will enforce.
     let ceilings = apply_memory_config(&args)?;
@@ -832,7 +1008,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The physical multi-database cluster: each database is its own engine under `base/<db>/`,
     // bootstrapping the default database on a fresh data directory. Dead-version reclamation is
     // the per-database purge scheduler the manager wires as each engine opens.
-    let manager = open_cluster(&args, &ceilings, autoanalyze);
+    // Offline migration: copy another data directory's databases in, encrypted, and exit.
+    // Done before the cluster opens, so no database is registered here before it is marked.
+    if let Some(source) = &args.encrypt_from {
+        encrypt_from(source, &args, master_key, autoanalyze)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(&args.data_dir)?;
+    let manager = open_cluster(&args, &ceilings, autoanalyze, master_key);
     // Offline restore: rebuild one database from its archive and exit without serving.
     if let Some(name) = &args.restore_database {
         restore_database(&manager, name, &args)?;
@@ -1009,6 +1192,32 @@ mod tests {
     fn only_one_env_var_set_is_an_error() {
         assert!(resolve_auth_pairs(&[], Some("alice".to_owned()), None).is_err());
         assert!(resolve_auth_pairs(&[], None, Some("secret".to_owned())).is_err());
+    }
+
+    #[test]
+    fn the_encryption_key_comes_from_one_place_only() {
+        let hex = "ab".repeat(32);
+        assert!(
+            super::resolve_master_key(None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        let key = super::resolve_master_key(None, None, Some(hex.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            key.fingerprint(),
+            nusadb_btree::crypt::MasterKey::from_text(&hex)
+                .unwrap()
+                .fingerprint()
+        );
+        assert!(super::resolve_master_key(Some("/k"), None, Some(hex.clone())).is_err());
+        assert!(super::resolve_master_key(None, Some("/k".to_owned()), Some(hex)).is_err());
+        assert!(super::resolve_master_key(None, None, Some("short".to_owned())).is_err());
+        let err = super::resolve_master_key(Some("/no/such/key/file"), None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("cannot read"), "{err}");
     }
 
     #[test]

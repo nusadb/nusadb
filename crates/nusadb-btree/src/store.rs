@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use nusadb_core::traits::Page;
 use nusadb_core::{PAGE_SIZE, PageId, PageStore, Result};
+use nusadb_wal::Sealer;
+
+use crate::crypt::{DataKey, SEALED_PAGE_SIZE, spill_aad};
 
 /// One page slot: its own latch, shared out of the directory by `Arc` so a page operation never
 /// holds the directory lock across the 8 KiB copy.
@@ -157,6 +160,8 @@ pub struct PageFile {
     locations: Vec<Location>,
     /// CRC32 of each page, in directory order: a page whose bytes no longer match is refused.
     checksums: Vec<u32>,
+    /// The data key the pages are sealed under; `None` for an unencrypted database.
+    key: Option<Arc<DataKey>>,
 }
 
 /// One file of pages.
@@ -170,6 +175,8 @@ struct Segment {
     base: u64,
     /// Slots the file holds.
     slots: u64,
+    /// Bytes per slot: a page, or a sealed page.
+    slot_bytes: u64,
 }
 
 /// Where one page of an image is: a segment and the slot within it.
@@ -224,16 +231,18 @@ impl PageFile {
                 file: File::open(path)?,
                 base: offset,
                 slots,
+                slot_bytes: PAGE_SIZE as u64,
             }],
             page_count,
             directory,
             locations,
             checksums,
+            key: None,
         })
     }
 
     /// Open the pages of a segmented image: `names` are segment files in `dir`, and the `n`-th
-    /// page of `directory` sits at `locations[n]`.
+    /// page of `directory` sits at `locations[n]`. With `key`, every page is sealed under it.
     ///
     /// # Errors
     /// Fails when a named segment is missing (the image cannot be served without it) or on
@@ -245,7 +254,13 @@ impl PageFile {
         directory: Vec<u64>,
         locations: Vec<Location>,
         checksums: Vec<u32>,
+        key: Option<Arc<DataKey>>,
     ) -> Result<Self> {
+        let slot_bytes = if key.is_some() {
+            SEALED_PAGE_SIZE as u64
+        } else {
+            PAGE_SIZE as u64
+        };
         let mut segments = Vec::with_capacity(names.len());
         for name in names {
             let path = segment_path(dir, name);
@@ -263,13 +278,14 @@ impl PageFile {
                     e.into()
                 }
             })?;
-            let slots = file.metadata()?.len() / PAGE_SIZE as u64;
+            let slots = file.metadata()?.len() / slot_bytes;
             segments.push(Segment {
                 path,
                 name: Some(name.clone()),
                 file,
                 base: 0,
                 slots,
+                slot_bytes,
             });
         }
         Ok(Self {
@@ -278,6 +294,7 @@ impl PageFile {
             directory,
             locations,
             checksums,
+            key,
         })
     }
 
@@ -287,12 +304,13 @@ impl PageFile {
             segments: self
                 .segments
                 .into_iter()
-                .map(|s| (s.path, s.name, s.base, s.slots))
+                .map(|s| (s.path, s.name, s.base, s.slots, s.slot_bytes))
                 .collect(),
             page_count: self.page_count,
             directory: self.directory,
             locations: self.locations,
             checksums: self.checksums,
+            key: self.key,
         }
     }
 
@@ -331,7 +349,7 @@ impl PageFile {
         })
     }
 
-    fn read(&self, id: u64) -> Result<Page> {
+    pub(crate) fn read(&self, id: u64) -> Result<Page> {
         let n = self
             .directory
             .binary_search(&id)
@@ -343,10 +361,27 @@ impl PageFile {
             .ok_or_else(|| bad_page(PageId(id)))?;
         let mut page = [0u8; PAGE_SIZE];
         let at = u64::from(location.slot)
-            .checked_mul(PAGE_SIZE as u64)
+            .checked_mul(segment.slot_bytes)
             .and_then(|rel| segment.base.checked_add(rel))
             .ok_or_else(|| bad_page(PageId(id)))?;
-        read_exact_at(&segment.file, &mut page, at)?;
+        if let Some(key) = &self.key {
+            let mut sealed = vec![0u8; SEALED_PAGE_SIZE];
+            read_exact_at(&segment.file, &mut sealed, at)?;
+            let name = segment.name.as_deref().unwrap_or_default();
+            if !key.open_page(id, location.slot, name, &sealed, &mut page) {
+                return Err(nusadb_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "nusadb-btree: page {id} in the segment {} fails authentication: it was \
+                         altered, moved, or written under another key. Restore the database \
+                         from a backup or the archive",
+                        segment.path.display()
+                    ),
+                )));
+            }
+        } else {
+            read_exact_at(&segment.file, &mut page, at)?;
+        }
         let expected = self.checksums.get(n).copied();
         if expected != Some(crc32fast::hash(&page)) {
             return Err(nusadb_core::Error::Io(std::io::Error::new(
@@ -369,11 +404,12 @@ pub fn segment_path(dir: &Path, name: &str) -> std::path::PathBuf {
 /// A page section's layout without its open files: see [`PageFile::reopen_spec`].
 #[derive(Debug)]
 pub struct PageFileSpec {
-    segments: Vec<(std::path::PathBuf, Option<String>, u64, u64)>,
+    segments: Vec<(std::path::PathBuf, Option<String>, u64, u64, u64)>,
     page_count: u64,
     directory: Vec<u64>,
     locations: Vec<Location>,
     checksums: Vec<u32>,
+    key: Option<Arc<DataKey>>,
 }
 
 impl PageFileSpec {
@@ -383,13 +419,14 @@ impl PageFileSpec {
     /// Propagates the open error.
     pub fn open(self) -> Result<PageFile> {
         let mut segments = Vec::with_capacity(self.segments.len());
-        for (path, name, base, slots) in self.segments {
+        for (path, name, base, slots, slot_bytes) in self.segments {
             segments.push(Segment {
                 file: File::open(&path)?,
                 path,
                 name,
                 base,
                 slots,
+                slot_bytes,
             });
         }
         Ok(PageFile {
@@ -398,6 +435,7 @@ impl PageFileSpec {
             directory: self.directory,
             locations: self.locations,
             checksums: self.checksums,
+            key: self.key,
         })
     }
 }
@@ -440,6 +478,9 @@ struct Spill {
     next_generation: u64,
     /// The last write failed: the warning is logged once per run of failures, not per page.
     failing: bool,
+    /// Seals every page written, under a key that exists only in this process; `None` writes
+    /// pages as they are.
+    seal: Option<Sealer>,
 }
 
 /// Where the current copy of a page is, as `locate` found it.
@@ -467,6 +508,17 @@ impl Spill {
         let Some(file) = &self.file else {
             return Err(std::io::Error::other("no spill file"));
         };
+        let generation = self.next_generation + 1;
+        let sealed;
+        let bytes: &[u8] = match &self.seal {
+            Some(sealer) => {
+                sealed = sealer
+                    .seal(&spill_aad(id, generation), page)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                &sealed
+            },
+            None => page,
+        };
         let existing = self.slots.get(&id).map(|&(slot, _)| slot);
         let slot = match existing {
             Some(slot) => slot,
@@ -476,7 +528,7 @@ impl Spill {
                 slot
             }),
         };
-        if let Err(e) = write_all_at(file, page, slot * PAGE_SIZE as u64) {
+        if let Err(e) = write_all_at(file, bytes, slot * self.slot_bytes()) {
             // A slot taken for this write goes back, so a failed write leaks no file space.
             if existing.is_none() {
                 self.free_slots.push(slot);
@@ -492,9 +544,18 @@ impl Spill {
             return Err(e);
         }
         self.failing = false;
-        self.next_generation += 1;
-        self.slots.insert(id, (slot, self.next_generation));
+        self.next_generation = generation;
+        self.slots.insert(id, (slot, generation));
         Ok(())
+    }
+
+    /// Bytes per slot: a page, or a sealed page.
+    const fn slot_bytes(&self) -> u64 {
+        if self.seal.is_some() {
+            SEALED_PAGE_SIZE as u64
+        } else {
+            PAGE_SIZE as u64
+        }
     }
 
     /// The spilled copy of `id` and its generation, if there is one.
@@ -503,7 +564,20 @@ impl Spill {
             return Ok(None);
         };
         let mut page = [0u8; PAGE_SIZE];
-        read_exact_at(file, &mut page, slot * PAGE_SIZE as u64)?;
+        let at = slot * self.slot_bytes();
+        match &self.seal {
+            Some(sealer) => {
+                let mut sealed = vec![0u8; SEALED_PAGE_SIZE];
+                read_exact_at(file, &mut sealed, at)?;
+                if !sealer.open_into(&spill_aad(id, generation), &sealed, &mut page) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("page {id} in the spill file fails authentication"),
+                    ));
+                }
+            },
+            None => read_exact_at(file, &mut page, at)?,
+        }
         Ok(Some((page, generation)))
     }
 
@@ -734,6 +808,23 @@ impl PagedStore {
         Ok(())
     }
 
+    /// [`enable_spill`](Self::enable_spill), sealing every page written to `file` with
+    /// `sealer` (a key that never leaves the process: the spill is never read after it ends).
+    ///
+    /// # Errors
+    /// Fails only on a poisoned lock.
+    pub fn enable_sealed_spill(&self, file: File, sealer: Sealer) -> Result<()> {
+        let mut spill = self.spill.lock().map_err(|_| poisoned())?;
+        if !spill.slots.is_empty() {
+            return Err(nusadb_core::Error::Io(std::io::Error::other(
+                "nusadb-btree: the spill already holds pages",
+            )));
+        }
+        spill.file = Some(file);
+        spill.seal = Some(sealer);
+        Ok(())
+    }
+
     /// Keep changed pages in memory from now on (they stay until the next checkpoint). Has no
     /// effect once a page has been spilled, since the spill then holds its only copy.
     ///
@@ -894,9 +985,51 @@ impl PagedStore {
         ids: &[u64],
         fix: &dyn Fn(&mut Page),
     ) -> Result<Vec<u32>> {
+        self.each_page(ids, fix, &mut |_, _, page| {
+            out.write_all(page)?;
+            Ok(())
+        })
+    }
+
+    /// [`write_pages_to`](Self::write_pages_to) for a new segment of an encrypted database:
+    /// the `n`-th page is sealed under `key` for slot `n` of the segment `segment`. The CRC32s
+    /// returned are of the plain pages.
+    ///
+    /// # Errors
+    /// As [`write_pages_to`](Self::write_pages_to).
+    pub fn write_sealed_pages_to(
+        &self,
+        out: &mut impl std::io::Write,
+        ids: &[u64],
+        fix: &dyn Fn(&mut Page),
+        key: &DataKey,
+        segment: &str,
+    ) -> Result<Vec<u32>> {
+        let mut sealed = Vec::with_capacity(SEALED_PAGE_SIZE);
+        self.each_page(ids, fix, &mut |n, id, page| {
+            let slot = u32::try_from(n).map_err(|_| {
+                nusadb_core::Error::Io(std::io::Error::other(
+                    "nusadb-btree: too many pages for one segment",
+                ))
+            })?;
+            sealed.clear();
+            key.seal_page(id, slot, segment, page, &mut sealed)?;
+            out.write_all(&sealed)?;
+            Ok(())
+        })
+    }
+
+    /// Hand each page named by `ids` to `emit` in order, with its position and id, after `fix`
+    /// (see [`write_pages_to`](Self::write_pages_to)); returns each page's CRC32.
+    fn each_page(
+        &self,
+        ids: &[u64],
+        fix: &dyn Fn(&mut Page),
+        emit: &mut dyn FnMut(usize, u64, &Page) -> Result<()>,
+    ) -> Result<Vec<u32>> {
         let file = self.file.read().map_err(|_| poisoned())?;
         let mut checksums = Vec::with_capacity(ids.len());
-        for &id in ids {
+        for (n, &id) in ids.iter().enumerate() {
             let mut page = match self.locate(id)? {
                 Located::Resident(frame) => *frame.data.read().map_err(|_| poisoned())?,
                 Located::Spilled(page, _) => *page,
@@ -907,7 +1040,7 @@ impl PagedStore {
             };
             fix(&mut page);
             checksums.push(crc32fast::hash(&page));
-            out.write_all(&page)?;
+            emit(n, id, &page)?;
         }
         Ok(checksums)
     }
@@ -1198,6 +1331,52 @@ mod tests {
             let id = store.allocate_page().unwrap();
             store.write_page(id, &page_of(0xEE)).unwrap();
         }
+    }
+
+    /// A sealed spill holds no page in the clear, reads every page back, and refuses a slot
+    /// that was altered.
+    #[test]
+    fn a_sealed_spill_holds_nothing_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spill");
+        let store = PagedStore::default();
+        store.set_capacity_bytes(Some(4 * PAGE_SIZE as u64));
+        store
+            .enable_sealed_spill(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap(),
+                Sealer::ephemeral().unwrap(),
+            )
+            .unwrap();
+        let mut page = page_of(0);
+        page[..16].copy_from_slice(b"ZEBRA-SPILL-ROW!");
+        let mut ids = Vec::new();
+        for _ in 0..16 {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, &page).unwrap();
+            ids.push(id);
+        }
+        assert!(store.spilled_bytes() > 0);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(!bytes.windows(16).any(|w| w == b"ZEBRA-SPILL-ROW!"));
+        assert_eq!(bytes.len() % SEALED_PAGE_SIZE, 0);
+        for &id in &ids {
+            assert_eq!(store.read_page(id).unwrap(), page);
+        }
+        // Spill some again, then alter every slot: a spilled page no longer reads.
+        crowd_out(&store, 8);
+        let mut bytes = std::fs::read(&path).unwrap();
+        for slot in 0..bytes.len() / SEALED_PAGE_SIZE {
+            bytes[slot * SEALED_PAGE_SIZE + 40] ^= 1;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ids.iter().any(|&id| store.read_page(id).is_err()));
     }
 
     /// A copy loaded before the page was changed and spilled again is refused, as is an image

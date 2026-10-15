@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read};
 
 use nusadb_core::{Lsn, Result};
 
-use crate::crypto::WalCipher;
+use crate::crypto::RecordSeal;
 use crate::record::WalRecord;
 
 /// The largest record body the reader accepts.
@@ -44,28 +44,24 @@ pub enum ReadOutcome {
 #[derive(Debug)]
 pub struct WalReader<R: Read> {
     inner: R,
-    /// When set, each record's framed body is decrypted before decompression.
-    cipher: Option<WalCipher>,
+    /// When set, each record's framed body is opened before decompression.
+    seal: Option<RecordSeal>,
 }
 
 impl<R: Read> WalReader<R> {
     /// Wrap a readable WAL source positioned at the first record.
     pub const fn new(inner: R) -> Self {
-        Self {
-            inner,
-            cipher: None,
-        }
+        Self { inner, seal: None }
     }
 
-    /// Wrap an **encrypted** WAL source (written by
-    /// [`WalWriter::new_encrypted`](crate::WalWriter::new_encrypted)) with the data-encryption
-    /// `key`. Each record is decrypted after the CRC check and before decompression; a
-    /// wrong key fails the AEAD tag and is treated as the end of the durable log.
-    pub fn new_encrypted(inner: R, key: &[u8; 32]) -> Self {
-        Self {
-            inner,
-            cipher: Some(WalCipher::new(key)),
-        }
+    /// Read records sealed with `seal` (written by
+    /// [`WalWriter::with_seal`](crate::WalWriter::with_seal)). Each record is opened after the CRC
+    /// check and before decompression; one that fails its tag (a wrong key, or a record moved or
+    /// altered) reads as corrupt.
+    #[must_use]
+    pub fn with_seal(mut self, seal: RecordSeal) -> Self {
+        self.seal = Some(seal);
+        self
     }
 
     /// Read the next valid record, or `Ok(None)` at the end of the durable log
@@ -136,10 +132,10 @@ impl<R: Read> WalReader<R> {
         // Decrypt before interpreting the body when the log is encrypted. A failed tag
         // check (wrong key, or a torn trailing record that still happened to match its CRC) ends
         // replay.
-        let body = match &self.cipher {
+        let body = match &self.seal {
             None => body,
-            Some(cipher) => {
-                let Ok(plain) = cipher.open(lsn.0, &body) else {
+            Some(seal) => {
+                let Some(plain) = seal.sealer.open(&seal.aad(lsn.0), &body) else {
                     tracing::warn!(?lsn, "WAL record failed to decrypt");
                     return Ok(ReadOutcome::Corrupt);
                 };
@@ -217,14 +213,19 @@ enum FrameParse {
     Record(Lsn, WalRecord, usize),
     /// Fewer than a full frame's bytes remain (a torn tail at EOF): the reader cannot advance.
     Incomplete,
+    /// A sealed frame whose CRC is intact failed its authentication tag: a wrong key, or bytes
+    /// written with a valid checksum by someone without the key. A crash cannot produce this, so
+    /// it is never mistaken for a torn tail.
+    Forged,
     /// A full frame's worth of bytes was present but failed validation (CRC / decode), OR the length
     /// field was implausible (`> MAX_RECORD_BYTES`) so the true frame length is unknown. Either way
     /// the parser cannot be trusted to skip to the next frame — the caller must resync by scanning.
     Corrupt,
 }
 
-/// Parse the frame beginning at `off` in a buffered WAL image (unencrypted).
-fn parse_frame(buf: &[u8], off: usize) -> FrameParse {
+/// Parse the frame beginning at `off` in a buffered WAL image, opening its body with `seal` when
+/// the log is sealed.
+fn parse_frame(buf: &[u8], off: usize, seal: Option<&RecordSeal>) -> FrameParse {
     let Some(header) = buf.get(off..off + 16) else {
         return FrameParse::Incomplete; // torn header at EOF
     };
@@ -242,6 +243,17 @@ fn parse_frame(buf: &[u8], off: usize) -> FrameParse {
     if frame_crc(&header[0..12], body) != crc {
         return FrameParse::Corrupt;
     }
+    let opened;
+    let body = match seal {
+        None => body,
+        Some(seal) => match seal.sealer.open(&seal.aad(lsn.0), body) {
+            Some(plain) => {
+                opened = plain;
+                opened.as_slice()
+            },
+            None => return FrameParse::Forged,
+        },
+    };
     decode_plain_body(body).map_or(FrameParse::Corrupt, |record| {
         FrameParse::Record(lsn, record, body_start + len)
     })
@@ -267,6 +279,9 @@ pub struct MidLogHole {
     /// mid-log hole; `None` when the whole file has no valid prefix, e.g. an incompatible/older WAL
     /// format or corruption from byte 0).
     pub next_valid_at: Option<u64>,
+    /// The record at `at` has an intact checksum but failed its authentication tag: the wrong
+    /// key, or a record altered or moved by someone without the key.
+    pub forged: bool,
 }
 
 /// Recover the valid prefix of a fully-buffered (unencrypted) WAL image, distinguishing a torn tail
@@ -285,12 +300,26 @@ pub struct MidLogHole {
 /// # Errors
 /// Returns [`MidLogHole`] when the file must not be truncated.
 pub fn recover_prefix(buf: &[u8]) -> core::result::Result<RecoveredPrefix, MidLogHole> {
+    recover_sealed_prefix(buf, None)
+}
+
+/// [`recover_prefix`] for a log whose records are sealed with `seal` (none: unsealed).
+///
+/// A sealed record whose checksum is intact but whose tag fails is refused wherever it lies, the
+/// tail included: a crash cannot produce one, so it is a wrong key or tampering, never a torn tail.
+///
+/// # Errors
+/// Returns [`MidLogHole`] when the file must not be truncated.
+pub fn recover_sealed_prefix(
+    buf: &[u8],
+    seal: Option<&RecordSeal>,
+) -> core::result::Result<RecoveredPrefix, MidLogHole> {
     let mut off = 0usize;
     let mut good_bytes = 0u64;
     let mut last_lsn = 0u64;
     let mut records = Vec::new();
     loop {
-        match parse_frame(buf, off) {
+        match parse_frame(buf, off, seal) {
             FrameParse::Record(lsn, record, next) => {
                 records.push((lsn, record));
                 last_lsn = lsn.0;
@@ -300,9 +329,16 @@ pub fn recover_prefix(buf: &[u8]) -> core::result::Result<RecoveredPrefix, MidLo
             // A clean end, or a torn tail at EOF with no corruption in the middle: the valid prefix
             // is everything so far. Safe to truncate to `good_bytes`.
             FrameParse::Incomplete => break,
+            FrameParse::Forged => {
+                return Err(MidLogHole {
+                    at: off as u64,
+                    next_valid_at: None,
+                    forged: true,
+                });
+            },
             // Corruption at `off`. Resync forward: is there any valid record after it?
             FrameParse::Corrupt => {
-                let next_valid = find_valid_after(buf, off + 1, last_lsn);
+                let next_valid = find_valid_after(buf, off + 1, last_lsn, seal);
                 if next_valid.is_some() || good_bytes == 0 {
                     // Either a genuine mid-log hole (valid data survives past the corruption), or a
                     // non-empty file with no valid prefix at all (older format / corruption from the
@@ -310,6 +346,7 @@ pub fn recover_prefix(buf: &[u8]) -> core::result::Result<RecoveredPrefix, MidLo
                     return Err(MidLogHole {
                         at: off as u64,
                         next_valid_at: next_valid,
+                        forged: false,
                     });
                 }
                 // No valid record follows and we have a valid prefix: a torn/garbage tail. Truncate.
@@ -326,10 +363,15 @@ pub fn recover_prefix(buf: &[u8]) -> core::result::Result<RecoveredPrefix, MidLo
 
 /// Scan forward from `start` for the first frame that validates AND carries an LSN strictly greater
 /// than `last_lsn` (a real, later record — the resync anchor). `None` if none exists before EOF.
-fn find_valid_after(buf: &[u8], start: usize, last_lsn: u64) -> Option<u64> {
+fn find_valid_after(
+    buf: &[u8],
+    start: usize,
+    last_lsn: u64,
+    seal: Option<&RecordSeal>,
+) -> Option<u64> {
     let mut cand = start;
     while cand < buf.len() {
-        if let FrameParse::Record(lsn, _, _) = parse_frame(buf, cand)
+        if let FrameParse::Record(lsn, _, _) = parse_frame(buf, cand, seal)
             && lsn.0 > last_lsn
         {
             return Some(cand as u64);

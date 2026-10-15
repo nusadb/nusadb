@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -1080,8 +1081,10 @@ dependencies = [
  "nusadb-btree",
  "nusadb-core",
  "nusadb-wal",
+ "sha2",
  "tempfile",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1157,6 +1160,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1175,6 +1179,7 @@ dependencies = [
 name = "nusadb-sql"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm-siv",
  "ahash",
  "bytes",
@@ -1193,6 +1198,7 @@ dependencies = [
  "sqlparser",
  "thiserror 2.0.18",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1225,11 +1231,13 @@ dependencies = [
 name = "nusadb-wal"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm-siv",
  "bytemuck",
  "bytes",
  "crc32fast",
  "criterion",
+ "getrandom 0.3.4",
  "lz4_flex",
  "nusadb-core",
  "nusadb-test-utils",
@@ -1238,6 +1246,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
