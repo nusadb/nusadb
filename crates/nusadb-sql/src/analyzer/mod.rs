@@ -815,9 +815,11 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         },
         // CREATE DOMAIN: the base type + CHECK predicates were validated to parse in the parser; a
         // predicate's meaning is checked against the base type when a column of the domain is created
-        // (the injected CHECK is analyzed then), mirroring the deferred ENUM resolution.
+        // (the injected CHECK is analyzed then), mirroring the deferred ENUM resolution. The
+        // volatility rule of a table CHECK is enforced here, at definition time.
         ast::Statement::CreateDomain(cd) => {
             dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
+            ddl::refuse_volatile_domain_checks(&cd, catalog)?;
             Ok(LogicalPlan::CreateDomain(cd))
         },
         ast::Statement::DropDomain(dd) => Ok(LogicalPlan::DropDomain(dd)),
@@ -1602,17 +1604,17 @@ const fn is_volatile_scalar_func(func: ast::ScalarFunc, arity: usize) -> bool {
     !matches!(scalar_func_volatility(func, arity), Volatility::Immutable)
 }
 
-/// The least predictable built-in `expr` calls, and its name: `None` when every built-in in it is
-/// immutable. User-defined functions carry no volatility marking and are not counted.
-pub(crate) fn expr_volatility(expr: &TypedExpr) -> Option<(Volatility, &'static str)> {
+/// The least predictable built-in `expr` calls, and that function: `None` when every built-in in it
+/// is immutable. User-defined functions carry no volatility marking and are not counted.
+pub(crate) fn expr_volatility(expr: &TypedExpr) -> Option<(Volatility, ast::ScalarFunc)> {
     use crate::planner::TypedExprKind as K;
-    let mut worst: Option<(Volatility, &'static str)> = None;
+    let mut worst: Option<(Volatility, ast::ScalarFunc)> = None;
     let mut stack = vec![expr];
     while let Some(node) = stack.pop() {
         if let K::ScalarFunction { func, args } = &node.kind {
             let class = scalar_func_volatility(*func, args.len());
             if class != Volatility::Immutable && worst.is_none_or(|(w, _)| class > w) {
-                worst = Some((class, func.name()));
+                worst = Some((class, *func));
             }
         }
         push_children(node, &mut stack);
@@ -1686,8 +1688,11 @@ fn push_children<'e>(node: &'e TypedExpr, stack: &mut Vec<&'e TypedExpr>) {
 pub(crate) fn require_immutable(expr: &TypedExpr, what: &str) -> Result<(), Error> {
     match expr_volatility(expr) {
         None => Ok(()),
-        Some((_, name)) => Err(Error::Coded {
-            message: format!("functions in {what} must be immutable, but {name}() is not"),
+        Some((_, func)) => Err(Error::Coded {
+            message: format!(
+                "functions in {what} must be immutable, but {} is not",
+                func.call_label()
+            ),
             sqlstate: "42P17", // invalid_object_definition
         }),
     }
@@ -1698,8 +1703,11 @@ pub(crate) fn require_immutable(expr: &TypedExpr, what: &str) -> Result<(), Erro
 /// and is not re-checked later.
 pub(crate) fn require_not_volatile_in_check(expr: &TypedExpr) -> Result<(), Error> {
     match expr_volatility(expr) {
-        Some((Volatility::Volatile, name)) => Err(Error::Coded {
-            message: format!("a CHECK constraint may not call the volatile function {name}()"),
+        Some((Volatility::Volatile, func)) => Err(Error::Coded {
+            message: format!(
+                "a CHECK constraint may not call the volatile function {}",
+                func.call_label()
+            ),
             sqlstate: "42P17", // invalid_object_definition
         }),
         _ => Ok(()),

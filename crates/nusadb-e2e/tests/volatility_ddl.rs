@@ -310,3 +310,68 @@ fn a_catalog_holding_volatile_objects_still_opens_and_works() {
     let engine = BtreeEngine::open(&path).expect("third open");
     exercise_legacy_objects(&engine, 20);
 }
+
+#[test]
+fn domain_checks_follow_the_check_rule_and_existing_domains_keep_working() {
+    let engine = BtreeEngine::new();
+    refused(
+        &engine,
+        "CREATE DOMAIN d_rand AS INT CHECK (VALUE > random())",
+        "random()",
+    );
+    refused(
+        &engine,
+        "CREATE DOMAIN d_uuid AS UUID CHECK (VALUE <> gen_random_uuid())",
+        "gen_random_uuid()",
+    );
+    run(
+        &engine,
+        "CREATE DOMAIN d_past AS TIMESTAMPTZ CHECK (VALUE <= now())",
+    );
+
+    // A domain an earlier release stored with a volatile CHECK still resolves and enforces.
+    let LogicalPlan::CreateDomain(mut domain) = analyze_sql(
+        &engine,
+        "CREATE DOMAIN d_legacy AS FLOAT CHECK (VALUE > abs(-2))",
+    )
+    .expect("analyze") else {
+        panic!("not a CREATE DOMAIN plan");
+    };
+    for check in &mut domain.checks {
+        *check = check.replace("abs(-2)", "random() - 2");
+    }
+    execute(plan(LogicalPlan::CreateDomain(domain)), &engine).expect("store the legacy domain");
+    run(&engine, "CREATE TABLE uses_legacy (v d_legacy)");
+    run(&engine, "INSERT INTO uses_legacy VALUES (0.5)");
+    let err = run_try(&engine, "INSERT INTO uses_legacy VALUES (-5)").expect_err("check holds");
+    assert_eq!(err.sqlstate(), "23514", "{err}");
+}
+
+#[test]
+fn keyword_functions_are_named_without_parentheses() {
+    let engine = BtreeEngine::new();
+    run(&engine, "CREATE TABLE kw (x TEXT, d DATE)");
+    for (sql, shown) in [
+        (
+            "CREATE INDEX k1 ON kw ((x || current_user))",
+            "but current_user is not",
+        ),
+        (
+            "CREATE INDEX k2 ON kw ((d - current_date))",
+            "but current_date is not",
+        ),
+        (
+            "CREATE INDEX k3 ON kw ((localtime))",
+            "but localtime is not",
+        ),
+        (
+            "CREATE INDEX k4 ON kw ((x || session_user))",
+            "but session_user is not",
+        ),
+        ("CREATE INDEX k5 ON kw ((random()))", "but random() is not"),
+    ] {
+        let err = analyze_sql(&engine, sql).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42P17", "{sql}: {err}");
+        assert!(err.to_string().contains(shown), "{sql}: {err}");
+    }
+}

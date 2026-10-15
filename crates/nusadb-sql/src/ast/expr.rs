@@ -1409,6 +1409,28 @@ impl ScalarFunc {
     pub const fn is_session_user(self) -> bool {
         matches!(self, Self::CurrentUser | Self::SessionUser)
     }
+
+    /// How a call to this function is written in a message: the ones SQL spells as bare keywords
+    /// (`current_user`, `current_date`, `localtime`, ...) take no argument list, every other one
+    /// is shown as `name()`.
+    #[must_use]
+    pub fn call_label(self) -> String {
+        let keyword = matches!(
+            self,
+            Self::CurrentTimestamp
+                | Self::LocalTimestamp
+                | Self::LocalTime
+                | Self::CurrentDate
+                | Self::CurrentTime
+                | Self::CurrentUser
+                | Self::SessionUser
+        );
+        if keyword {
+            self.name().to_owned()
+        } else {
+            format!("{}()", self.name())
+        }
+    }
 }
 
 /// An ordered-set aggregate call: `func(args) WITHIN GROUP (ORDER BY ...)`.

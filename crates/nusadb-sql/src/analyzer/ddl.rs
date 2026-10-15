@@ -473,6 +473,47 @@ fn validate_check_predicate(
     super::require_not_volatile_in_check(&typed)
 }
 
+/// Refuse a `CREATE DOMAIN` whose `CHECK` calls a volatile built-in (`42P17`), the rule a table's
+/// `CHECK` follows: each column of the domain enforces the predicate on every write, so a value it
+/// accepts must stay accepted. A stable function such as `now()` is allowed.
+///
+/// Each predicate is analyzed with `VALUE` bound to a column of the base type. One that does not
+/// analyze yet (an unknown base type, a type error) is left to the existing check when a column of
+/// the domain is created. A domain already in the catalog is never re-checked, so it keeps loading.
+pub(super) fn refuse_volatile_domain_checks(
+    cd: &ast::CreateDomain,
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    const VALUE_COLUMN: &str = "value";
+    let Ok(ty) = crate::parser::parse_column_type(&cd.base_type_sql) else {
+        return Ok(());
+    };
+    let table = TableSchema {
+        id: nusadb_core::TableId(0),
+        schema: nusadb_core::PUBLIC_SCHEMA.to_owned(),
+        name: cd.name.clone(),
+        columns: vec![ColumnDef {
+            name: VALUE_COLUMN.to_owned(),
+            ty,
+            nullable: true,
+        }],
+    };
+    let scope = single_table_scope(&table);
+    for check in &cd.checks {
+        let Ok(sql) = crate::parser::substitute_check_value(check, VALUE_COLUMN) else {
+            continue;
+        };
+        let Ok(expr) = crate::parser::parse_expression(&sql) else {
+            continue;
+        };
+        let Ok(typed) = analyze_expr(&expr, &scope, catalog, Some(ColumnType::Bool)) else {
+            continue;
+        };
+        super::require_not_volatile_in_check(&typed)?;
+    }
+    Ok(())
+}
+
 /// Resolve the column `DEFAULT` expressions of a `CREATE TABLE`. Each default is type-checked
 /// against an **empty** scope — a default references no other column — must be assignable to its
 /// column's type, and must be subquery-free. Its canonical SQL text is carried `(column, sql)` for the

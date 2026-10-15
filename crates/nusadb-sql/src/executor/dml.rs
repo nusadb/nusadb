@@ -80,7 +80,7 @@ pub(super) fn run_insert(
                     target: Some(target),
                 }) = other
                 {
-                    resolve_arbiter(&plan.table, target, engine)?;
+                    resolve_arbiter(&plan.table, target, engine, txn)?;
                 }
                 insert_rows(
                     &plan.table,
@@ -439,7 +439,7 @@ fn route_partitioned_insert(
                     target: Some(target),
                 }) = other
                 {
-                    resolve_arbiter(&part, target, engine)?;
+                    resolve_arbiter(&part, target, engine, txn)?;
                 }
                 insert_rows(
                     &part,
@@ -932,9 +932,9 @@ struct DeferredUnique {
 impl DeferredUnique {
     /// Load the target's PK/UNIQUE constraints; a table without any yields an empty (free)
     /// collector.
-    fn load(table: &TableSchema, engine: &dyn StorageEngine) -> Result<Self, Error> {
+    fn load(table: &TableSchema, engine: &dyn StorageEngine, txn: TxnId) -> Result<Self, Error> {
         let constraints: Vec<DeferredConstraint> = engine
-            .list_constraints(table.id)?
+            .list_constraints_as_of(txn, table.id)?
             .into_iter()
             .filter_map(|c| {
                 let kind = match c.kind {
@@ -1110,7 +1110,7 @@ fn insert_select_can_stream(
         return Ok(false);
     }
     if engine
-        .list_foreign_keys(table.id)?
+        .list_foreign_keys_as_of(txn, table.id)?
         .iter()
         .any(|fk| fk.child_table == table.id)
     {
@@ -1210,7 +1210,7 @@ fn insert_select_streaming(
     let mut source = super::stream::stream_op(op, engine, txn)?;
     let mut inserted = 0_usize;
     // PK/UNIQUE targets stream with deferred enforcement (free for a table without any).
-    let mut unique = DeferredUnique::load(&plan.table, engine)?;
+    let mut unique = DeferredUnique::load(&plan.table, engine, txn)?;
     let mut batch: Vec<Vec<Option<ast::Value>>> = Vec::with_capacity(INSERT_SELECT_BATCH);
     let mut flush = |batch: &mut Vec<Vec<Option<ast::Value>>>,
                      unique: &mut DeferredUnique|
@@ -1574,7 +1574,7 @@ fn insert_rows_with_unique(
     // arriving beside it. Checking before anything is written spares the statement savepoint the
     // work of undoing a refused batch.
     enforce_fk_on_child_write(table, &full_rows, &full_rows, engine, txn)?;
-    enforce_check_on_write(table, &full_rows, engine)?;
+    enforce_check_on_write(table, &full_rows, engine, txn)?;
 
     let index_targets = secondary_index_targets(table, engine)?;
     // A bulk insert — COPY or a streamed INSERT ... SELECT, the callers that pass a cross-batch
@@ -1849,7 +1849,7 @@ fn upsert_rows(
         proposed.push(full);
     }
 
-    let key_ordinals = resolve_arbiter(table, target, engine)?;
+    let key_ordinals = resolve_arbiter(table, target, engine, txn)?;
     let existing = scan_table(table, engine, txn)?;
     let index_targets = secondary_index_targets(table, engine)?;
 
@@ -1996,7 +1996,7 @@ fn upsert_rows(
                 .map(|(_, row)| row.clone())
                 .collect();
             full_result.extend(written.iter().cloned());
-            enforce_unique_over_rows(table, &full_result, engine)?;
+            enforce_unique_over_rows(table, &full_result, engine, txn)?;
             enforce_new_keys_vs_committed(
                 table,
                 &updated_tids,
@@ -2010,7 +2010,7 @@ fn upsert_rows(
     // Every affected row validates FOREIGN KEY and CHECK. As with a plain insert, the statement's
     // own rows count as parent material for a key pointing back at this table.
     enforce_fk_on_child_write(table, &affected, &affected, engine, txn)?;
-    enforce_check_on_write(table, &affected, engine)?;
+    enforce_check_on_write(table, &affected, engine, txn)?;
 
     // A DO UPDATE assignment may not move the row out of its partition's bound either — the same
     // stranding the plain-UPDATE guard refuses (the reference engine refuses the move here too).
@@ -2092,9 +2092,10 @@ fn resolve_arbiter(
     table: &TableSchema,
     target: &ConflictArbiter,
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<Vec<usize>, Error> {
     let constraints: Vec<_> = engine
-        .list_constraints(table.id)?
+        .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| {
             matches!(
@@ -2355,6 +2356,7 @@ pub(super) fn run_copy_from(
     // statement (it runs outside `dispatch`).
     let _clock = super::clock::enter_statement(txn);
     let table = lookup_copy_table(copy, engine, txn)?;
+    super::claim_write_target(engine, txn, table.id)?;
     let columns = resolve_copy_columns(copy, &table)?;
     let target_types: Vec<ColumnType> = columns
         .iter()
@@ -2385,7 +2387,7 @@ pub(super) fn run_copy_from(
     // enforced with the same deferred mechanism `INSERT ... SELECT` streaming uses — a naive
     // per-batch immediate check would not see prior batches' still-uncommitted keys.
     let mut inserted = 0_usize;
-    let mut unique = DeferredUnique::load(&table, engine)?;
+    let mut unique = DeferredUnique::load(&table, engine, txn)?;
     let (partition_key, target_is_partition, as_insert) =
         copy_partition_target(&table, &columns, engine, txn)?;
     // The load is one statement however many batches it takes: its statement-level triggers fire
@@ -2705,7 +2707,7 @@ fn enforce_unique_on_insert(
     // concurrent writer of the same key.
     let mut all = scan_rows_committed(table, engine, txn)?;
     all.extend_from_slice(new_rows);
-    enforce_unique_over_rows(table, &all, engine)
+    enforce_unique_over_rows(table, &all, engine, txn)
 }
 
 /// O(log n) uniqueness check: for each `PRIMARY KEY`/`UNIQUE` constraint, probe its backing index for
@@ -2734,7 +2736,7 @@ fn try_unique_by_index_probe(
         index: nusadb_core::IndexId,
     }
     let mut probes: Vec<Probe> = Vec::new();
-    for constraint in engine.list_constraints(table.id)? {
+    for constraint in engine.list_constraints_as_of(txn, table.id)? {
         if !matches!(
             constraint.kind,
             nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
@@ -2837,7 +2839,7 @@ fn lock_unique_keys(
     txn: TxnId,
 ) -> Result<(), Error> {
     let constraints: Vec<(Vec<String>, Vec<usize>, bool)> = engine
-        .list_constraints(table.id)?
+        .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| {
             matches!(
@@ -2910,7 +2912,7 @@ fn keep_non_conflicting(
     }
     // The key-column ordinals of each PK/UNIQUE constraint, plus its NULLS-NOT-DISTINCT flag.
     let constraints: Vec<(Vec<usize>, bool)> = engine
-        .list_constraints(table.id)?
+        .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| {
             matches!(
@@ -2978,8 +2980,9 @@ fn enforce_unique_over_rows(
     table: &TableSchema,
     rows: &[Row],
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<(), Error> {
-    let constraints = engine.list_constraints(table.id)?;
+    let constraints = engine.list_constraints_as_of(txn, table.id)?;
     for constraint in &constraints {
         if !matches!(
             constraint.kind,
@@ -3042,7 +3045,7 @@ fn enforce_new_keys_vs_committed(
     // Per PK/UNIQUE constraint, the (sorted) keys the rewritten rows held before this statement, plus
     // its NULLS-NOT-DISTINCT flag (so a NULL old key matches under that mode).
     let constraints: Vec<(Vec<usize>, bool)> = engine
-        .list_constraints(table.id)?
+        .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| {
             matches!(
@@ -3080,7 +3083,7 @@ fn enforce_new_keys_vs_committed(
         .map(|(_, row)| row)
         .collect();
     universe.extend_from_slice(new_rows);
-    enforce_unique_over_rows(table, &universe, engine)
+    enforce_unique_over_rows(table, &universe, engine, txn)
 }
 
 /// O(log n) uniqueness re-check for an UPDATE/MERGE: probe each PK/UNIQUE constraint's backing index
@@ -3115,7 +3118,7 @@ fn try_update_unique_by_index_probe(
         index: nusadb_core::IndexId,
     }
     let mut probes: Vec<Probe> = Vec::new();
-    for constraint in engine.list_constraints(table.id)? {
+    for constraint in engine.list_constraints_as_of(txn, table.id)? {
         if !matches!(
             constraint.kind,
             nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
@@ -3228,8 +3231,9 @@ fn update_touches_unique_columns(
     table: &TableSchema,
     set_cols: &HashSet<usize>,
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<bool, Error> {
-    for constraint in engine.list_constraints(table.id)? {
+    for constraint in engine.list_constraints_as_of(txn, table.id)? {
         if !matches!(
             constraint.kind,
             nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
@@ -3314,16 +3318,15 @@ pub(super) fn constraint_ordinals(
 
 // === FOREIGN KEY enforcement ======================================
 
-/// The current schema of a table by id (FK enforcement scans the *other* table, which the caller
-/// only knows by [`TableId`]). Composes the catalog's current-version + version→schema lookups.
+/// The schema of a table by id as `txn` sees it (FK enforcement scans the *other* table, which the
+/// caller only knows by [`TableId`]). Another transaction's uncommitted change to that table is not
+/// visible, so its committed rows are decoded under the layout they were written in.
 pub(super) fn schema_by_id(
     engine: &dyn StorageEngine,
+    txn: TxnId,
     table: nusadb_core::TableId,
 ) -> Result<Option<TableSchema>, Error> {
-    match engine.current_schema_version(table)? {
-        Some(version) => Ok(engine.schema_for_version(table, version)?),
-        None => Ok(None),
-    }
+    Ok(engine.lookup_table_by_id_as_of(txn, table)?)
 }
 
 /// The ordinals of a table's `PRIMARY KEY` columns (a foreign key references the parent's PK), or
@@ -3331,9 +3334,10 @@ pub(super) fn schema_by_id(
 fn primary_key_ordinals(
     table: &TableSchema,
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<Option<Vec<usize>>, Error> {
     let pk = engine
-        .list_constraints(table.id)?
+        .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .find(|c| matches!(c.kind, nusadb_core::ConstraintKind::PrimaryKey));
     match pk {
@@ -3350,9 +3354,10 @@ fn fk_parent_ordinals(
     parent: &TableSchema,
     fk: &nusadb_core::ForeignKeyDef,
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<Option<Vec<usize>>, Error> {
     if fk.parent_columns.is_empty() {
-        primary_key_ordinals(parent, engine)
+        primary_key_ordinals(parent, engine, txn)
     } else {
         Ok(Some(constraint_ordinals(parent, &fk.parent_columns)?))
     }
@@ -3426,19 +3431,19 @@ pub(super) fn enforce_fk_on_child_write(
     txn: TxnId,
 ) -> Result<(), Error> {
     let fks: Vec<_> = engine
-        .list_foreign_keys(table.id)?
+        .list_foreign_keys_as_of(txn, table.id)?
         .into_iter()
         .filter(|fk| fk.child_table == table.id)
         .collect();
     for fk in fks {
         let child_ordinals = constraint_ordinals(table, &fk.child_columns)?;
-        let parent = schema_by_id(engine, fk.parent_table)?.ok_or_else(|| {
+        let parent = schema_by_id(engine, txn, fk.parent_table)?.ok_or_else(|| {
             nusadb_core::Error::ConstraintViolation(format!(
                 "foreign key \"{}\": parent table is missing",
                 fk.name
             ))
         })?;
-        let Some(parent_key) = fk_parent_ordinals(&parent, &fk, engine)? else {
+        let Some(parent_key) = fk_parent_ordinals(&parent, &fk, engine, txn)? else {
             return Err(nusadb_core::Error::ConstraintViolation(format!(
                 "foreign key \"{}\": parent table \"{}\" has no referenced key",
                 fk.name, parent.name
@@ -3539,9 +3544,10 @@ pub(super) fn enforce_check_on_write(
     table: &TableSchema,
     rows: &[Row],
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<(), Error> {
     let checks: Vec<(String, crate::planner::TypedExpr)> = engine
-        .list_constraints(table.id)?
+        .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| c.kind == nusadb_core::engine::ConstraintKind::Check)
         .map(|c| {
@@ -3591,14 +3597,18 @@ fn skipped_referential_action(child: &TableSchema) -> Error {
 }
 
 /// The columns of `table` in a foreign key it declares or in a unique key.
-fn key_columns(table: &TableSchema, engine: &dyn StorageEngine) -> Result<Vec<usize>, Error> {
+fn key_columns(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<usize>, Error> {
     let mut columns = Vec::new();
-    for fk in engine.list_foreign_keys(table.id)? {
+    for fk in engine.list_foreign_keys_as_of(txn, table.id)? {
         if fk.child_table == table.id {
             columns.extend(constraint_ordinals(table, &fk.child_columns)?);
         }
     }
-    for c in engine.list_constraints(table.id)? {
+    for c in engine.list_constraints_as_of(txn, table.id)? {
         if matches!(
             c.kind,
             nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
@@ -3680,7 +3690,7 @@ fn cascade_update_children(
     // A BEFORE trigger may change other columns of the row the action writes, but not its keys:
     // the action computed the foreign key values, and no uniqueness check runs here.
     let keys = if triggers.has_before_row() {
-        key_columns(child, engine)?
+        key_columns(child, engine, txn)?
     } else {
         Vec::new()
     };
@@ -3708,7 +3718,7 @@ fn cascade_update_children(
                     sqlstate: "27000",
                 });
             }
-            enforce_check_on_write(child, std::slice::from_ref(&new), engine)?;
+            enforce_check_on_write(child, std::slice::from_ref(&new), engine, txn)?;
         }
         let bytes = row::encode(&new, &child_types)?;
         let new_tid = engine.update(txn, child.id, tid, &bytes)?;
@@ -3778,7 +3788,7 @@ fn enforce_fk_on_parent_delete(
     txn: TxnId,
 ) -> Result<(), Error> {
     // Most tables are referenced by nothing: then a delete owes no foreign key any work.
-    if deleting.is_empty() || !table_is_fk_parent(table, engine)? {
+    if deleting.is_empty() || !table_is_fk_parent(table, engine, txn)? {
         return Ok(());
     }
     let mut walk = DeleteWalk {
@@ -3830,14 +3840,14 @@ impl DeleteWalk {
     ) -> Result<Vec<CascadeBatch>, Error> {
         let mut cascades = Vec::new();
         let fks: Vec<_> = engine
-            .list_foreign_keys(table.id)?
+            .list_foreign_keys_as_of(txn, table.id)?
             .into_iter()
             .filter(|fk| fk.parent_table == table.id)
             .collect();
         for fk in fks {
             // The parent key this FK references (a non-PK UNIQUE or the PRIMARY KEY), resolved per
             // FK, since different FKs pointing at this table may reference different parent keys.
-            let Some(parent_ordinals) = fk_parent_ordinals(table, &fk, engine)? else {
+            let Some(parent_ordinals) = fk_parent_ordinals(table, &fk, engine, txn)? else {
                 continue; // This FK references the PK, but the parent has none.
             };
             let deleted_keys: Vec<Vec<ast::Value>> = removed
@@ -3848,7 +3858,7 @@ impl DeleteWalk {
                 continue;
             }
             lock_removed_keys(table, &parent_ordinals, &deleted_keys, engine, txn)?;
-            let child = schema_by_id(engine, fk.child_table)?.ok_or_else(|| {
+            let child = schema_by_id(engine, txn, fk.child_table)?.ok_or_else(|| {
                 nusadb_core::Error::ConstraintViolation(format!(
                     "foreign key \"{}\": child table is missing",
                     fk.name
@@ -3976,9 +3986,13 @@ impl DeleteWalk {
 
 /// Whether any foreign key in the catalog points at `table` (i.e. `table` is an FK parent). Lets
 /// the UPDATE path skip per-row PK-change tracking when nothing can reference this table.
-fn table_is_fk_parent(table: &TableSchema, engine: &dyn StorageEngine) -> Result<bool, Error> {
+fn table_is_fk_parent(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<bool, Error> {
     Ok(engine
-        .list_foreign_keys(table.id)?
+        .list_foreign_keys_as_of(txn, table.id)?
         .iter()
         .any(|fk| fk.parent_table == table.id))
 }
@@ -4113,7 +4127,7 @@ fn parent_update_step(
 ) -> Result<Vec<RewriteBatch>, Error> {
     let mut rewritten = Vec::new();
     let fks: Vec<_> = engine
-        .list_foreign_keys(table.id)?
+        .list_foreign_keys_as_of(txn, table.id)?
         .into_iter()
         .filter(|fk| fk.parent_table == table.id)
         .collect();
@@ -4123,10 +4137,10 @@ fn parent_update_step(
     for fk in &fks {
         // The parent key this FK references (a non-PK UNIQUE or the PRIMARY KEY) — resolved per FK,
         // since different FKs pointing at this table may reference different parent keys.
-        let Some(parent_ordinals) = fk_parent_ordinals(table, fk, engine)? else {
+        let Some(parent_ordinals) = fk_parent_ordinals(table, fk, engine, txn)? else {
             continue;
         };
-        let child = schema_by_id(engine, fk.child_table)?.ok_or_else(|| {
+        let child = schema_by_id(engine, txn, fk.child_table)?.ok_or_else(|| {
             nusadb_core::Error::ConstraintViolation(format!(
                 "foreign key \"{}\": child table is missing",
                 fk.name
@@ -4892,8 +4906,8 @@ fn run_update_single(
         )?);
     }
     let needs_unique = table_has_unique_constraint(&plan.table, engine)?
-        && update_touches_unique_columns(&plan.table, &set_cols, engine)?;
-    let is_fk_parent = table_is_fk_parent(&plan.table, engine)?;
+        && update_touches_unique_columns(&plan.table, &set_cols, engine, txn)?;
+    let is_fk_parent = table_is_fk_parent(&plan.table, engine, txn)?;
     let mut index_targets = secondary_index_targets(&plan.table, engine)?;
     index_targets.retain(|target| index_target_touched_by_set(target, &set_cols));
     // Track each matched row's pre-update value when a changed PRIMARY KEY must propagate to FK
@@ -5121,7 +5135,7 @@ fn run_update_single(
             } else {
                 &result_rows
             };
-            enforce_unique_over_rows(&plan.table, result_rows, engine)?;
+            enforce_unique_over_rows(&plan.table, result_rows, engine, txn)?;
             enforce_new_keys_vs_committed(
                 &plan.table,
                 &rewritten,
@@ -5133,7 +5147,7 @@ fn run_update_single(
         }
     }
     enforce_fk_on_child_write(&plan.table, &updated_rows, &updated_rows, engine, txn)?;
-    enforce_check_on_write(&plan.table, &updated_rows, engine)?;
+    enforce_check_on_write(&plan.table, &updated_rows, engine, txn)?;
     // …and a changed parent key must be propagated to its children (ON UPDATE) before any write.
     if is_fk_parent {
         let fk_changes: Vec<(Tid, Row, Row)> = to_update
@@ -5707,7 +5721,7 @@ pub(super) fn run_truncate(
         }
         let mut visited = HashSet::new();
         let mut order = Vec::new();
-        collect_cascade_closure(root.id, engine, &mut visited, &mut order)?;
+        collect_cascade_closure(root.id, engine, txn, &mut visited, &mut order)?;
         order
     } else {
         vec![root.id]
@@ -5730,7 +5744,7 @@ pub(super) fn run_truncate(
     // freely. A self-reference is fine: the referencing table *is* being truncated.
     let member_ids: HashSet<nusadb_core::TableId> = members.iter().map(|t| t.id).collect();
     for table in &members {
-        for fk in engine.list_foreign_keys(table.id)? {
+        for fk in engine.list_foreign_keys_as_of(txn, table.id)? {
             if fk.parent_table == table.id && !member_ids.contains(&fk.child_table) {
                 // Error path only: worth a catalog walk to name the referencing table.
                 let child = table_name_by_id(engine, txn, fk.child_table)?
@@ -5825,7 +5839,7 @@ fn truncate_rebuild(
     txn: TxnId,
 ) -> Result<(), Error> {
     // Pass 0: read every definition before touching anything.
-    let saved = truncate_snapshot(members, engine)?;
+    let saved = truncate_snapshot(members, engine, txn)?;
     // Drop every foreign key first, then the rest, then the tables.
     for (table, s) in members.iter().zip(&saved) {
         for fk in &s.fks {
@@ -5908,12 +5922,13 @@ struct TruncateSaved {
 fn truncate_snapshot(
     members: &[&TableSchema],
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<Vec<TruncateSaved>, Error> {
     let mut saved = Vec::with_capacity(members.len());
     for table in members {
-        let constraints = engine.list_constraints(table.id)?;
+        let constraints = engine.list_constraints_as_of(txn, table.id)?;
         let fks: Vec<_> = engine
-            .list_foreign_keys(table.id)?
+            .list_foreign_keys_as_of(txn, table.id)?
             .into_iter()
             .filter(|fk| fk.child_table == table.id)
             .collect();
@@ -6009,15 +6024,16 @@ fn restart_serial_sequences(
 fn collect_cascade_closure(
     table: nusadb_core::TableId,
     engine: &dyn StorageEngine,
+    txn: TxnId,
     visited: &mut HashSet<nusadb_core::TableId>,
     order: &mut Vec<nusadb_core::TableId>,
 ) -> Result<(), Error> {
     if !visited.insert(table) {
         return Ok(());
     }
-    for fk in engine.list_foreign_keys(table)? {
+    for fk in engine.list_foreign_keys_as_of(txn, table)? {
         if fk.parent_table == table && fk.child_table != table {
-            collect_cascade_closure(fk.child_table, engine, visited, order)?;
+            collect_cascade_closure(fk.child_table, engine, txn, visited, order)?;
         }
     }
     order.push(table);
@@ -6207,7 +6223,7 @@ pub(super) fn run_merge(
         )?);
     }
     let needs_unique = table_has_unique_constraint(&plan.table, engine)?
-        && update_touches_unique_columns(&plan.table, &set_cols, engine)?;
+        && update_touches_unique_columns(&plan.table, &set_cols, engine, txn)?;
 
     // Apply DELETE, then UPDATE, then INSERT — so the inserts' constraint checks see the updated
     // state (a not-matched insert never collides with a row a matched clause just changed/removed).
@@ -6391,7 +6407,7 @@ fn commit_merge_updates(
                     .map_or_else(|| row.clone(), |new| (*new).clone()),
             );
         }
-        enforce_unique_over_rows(table, &result_rows, engine)?;
+        enforce_unique_over_rows(table, &result_rows, engine, txn)?;
         // Also reject a new key that collides with a row another txn committed after a frozen
         // RR/SER snapshot — the snapshot-based check above cannot see it. The rewritten set is the
         // matched UPDATE *and* DELETE tids (their old keys no longer occupy the space).
@@ -6405,8 +6421,8 @@ fn commit_merge_updates(
         enforce_new_keys_vs_committed(table, &rewritten, &old_images, &new_rows, engine, txn)?;
     }
     enforce_fk_on_child_write(table, &new_rows, &new_rows, engine, txn)?;
-    enforce_check_on_write(table, &new_rows, engine)?;
-    if table_is_fk_parent(table, engine)? {
+    enforce_check_on_write(table, &new_rows, engine, txn)?;
+    if table_is_fk_parent(table, engine, txn)? {
         enforce_fk_on_parent_update(table, updates, engine, txn)?;
     }
     for (tid, old, new) in updates.iter() {

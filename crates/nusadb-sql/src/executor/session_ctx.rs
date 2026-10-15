@@ -225,6 +225,10 @@ pub(super) fn current_temp_schema() -> Option<String> {
 /// honest built-in default (kept consistent with `SHOW name`). `current_setting(name)` maps `None`
 /// to SQL `NULL`.
 pub(super) fn setting(name: &str) -> Option<String> {
+    // The server's own connection state is not a parameter a statement may read.
+    if crate::is_reserved_setting(name) {
+        return None;
+    }
     // Parameter names are case-insensitive and stored folded, so fold the lookup too — only when
     // it would change anything, to keep the common all-lower-case call allocation-free.
     let folded;

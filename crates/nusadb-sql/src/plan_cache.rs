@@ -121,7 +121,8 @@ impl PlanCache {
 /// through [`Catalog::lookup_table`]; views and functions are flagged so their plans are never cached.
 struct RecordingCatalog<'a> {
     inner: &'a dyn Catalog,
-    tables: RefCell<Vec<TableId>>,
+    /// Every base table the analysis resolved, as the catalog showed it to this transaction.
+    tables: RefCell<Vec<TableSchema>>,
     saw_view: Cell<bool>,
     saw_function: Cell<bool>,
     /// Set if the plan may bake an index choice or a row-level-security predicate. Index DDL
@@ -160,7 +161,7 @@ impl Catalog for RecordingCatalog<'_> {
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         let schema = self.inner.lookup_table(name)?;
         if let Some(s) = &schema {
-            self.tables.borrow_mut().push(s.id);
+            self.tables.borrow_mut().push(s.clone());
         }
         Ok(schema)
     }
@@ -168,7 +169,7 @@ impl Catalog for RecordingCatalog<'_> {
     fn lookup_table_in(&self, schema: &str, name: &str) -> Result<Option<TableSchema>, Error> {
         let resolved = self.inner.lookup_table_in(schema, name)?;
         if let Some(s) = &resolved {
-            self.tables.borrow_mut().push(s.id);
+            self.tables.borrow_mut().push(s.clone());
         }
         Ok(resolved)
     }
@@ -460,13 +461,23 @@ fn fingerprint_unchanged(engine: &dyn StorageEngine, fingerprint: &[(TableId, u3
 /// A fingerprint from the recorded tables, or `None` if any table has no tracked version — then the
 /// plan cannot be safely invalidated and must not be cached (e.g. an engine that does not version
 /// schemas, which keeps the cache disabled rather than risking a stale plan).
-fn build_fingerprint(engine: &dyn StorageEngine, ids: &[TableId]) -> Option<Vec<(TableId, u32)>> {
-    let mut fingerprint = Vec::with_capacity(ids.len());
-    for &id in ids {
-        match engine.current_schema_version(id) {
-            Ok(Some(version)) => fingerprint.push((id, version)),
-            _ => return None,
+///
+/// The version is the engine's current one, which includes a change another transaction has not
+/// committed, while the analysis saw the committed schema. A plan whose tables do not match the
+/// schema their current version names was planned against a schema that version does not describe,
+/// so it is not cached: recording that version would serve the plan unchanged once the other
+/// transaction commits.
+fn build_fingerprint(
+    engine: &dyn StorageEngine,
+    tables: &[TableSchema],
+) -> Option<Vec<(TableId, u32)>> {
+    let mut fingerprint = Vec::with_capacity(tables.len());
+    for seen in tables {
+        let version = engine.current_schema_version(seen.id).ok()??;
+        if engine.schema_for_version(seen.id, version).ok()?.as_ref() != Some(seen) {
+            return None;
         }
+        fingerprint.push((seen.id, version));
     }
     fingerprint.sort_unstable();
     fingerprint.dedup();
@@ -556,10 +567,10 @@ pub fn plan_cached(
     } else {
         None
     };
-    let ids = recorder.tables.into_inner();
+    let tables = recorder.tables.into_inner();
     if cacheable
-        && !ids.is_empty()
-        && let Some(fingerprint) = build_fingerprint(engine, &ids)
+        && !tables.is_empty()
+        && let Some(fingerprint) = build_fingerprint(engine, &tables)
     {
         if cache.entries.len() >= MAX_PLAN_CACHE_ENTRIES {
             cache.entries.clear();

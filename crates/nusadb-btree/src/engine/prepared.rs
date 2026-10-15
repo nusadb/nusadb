@@ -1068,6 +1068,7 @@ impl BtreeEngine {
                         write_versions_at_begin: HashMap::new(),
                         write_bytes: 0,
                         fresh_reads: None,
+                        statements: 0,
                         prepared: Some(Box::new(PreparedMeta {
                             gid: r.gid.clone(),
                             owner: r.owner.clone(),

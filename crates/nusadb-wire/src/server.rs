@@ -4914,6 +4914,17 @@ fn show_result(
     name: &str,
     snapshot: &HashMap<String, String>,
 ) -> Result<ExecutionResult, nusadb_sql::Error> {
+    // The reserved keys stamped into the snapshot (transaction start, temp schema, database) are
+    // the server's own state; a quoted name with a leading NUL must not read them.
+    if nusadb_sql::is_reserved_setting(name) {
+        return Err(nusadb_sql::Error::Coded {
+            message: format!(
+                "unrecognized configuration parameter \"{}\"",
+                name.escape_default()
+            ),
+            sqlstate: "42704", // undefined_object
+        });
+    }
     if name.eq_ignore_ascii_case("databases") {
         return Err(nusadb_sql::Error::Coded {
             message: format!(
@@ -5554,6 +5565,11 @@ impl<'a> EngineCatalog<'a> {
             .get(nusadb_sql::CONNECTION_TEMP_SCHEMA_SETTING)
             .cloned();
         let timezone = settings.get("timezone").cloned();
+        // A catalog is built once per statement, before it is analyzed: mark the start of the
+        // statement so the engine can tell this statement's table resolutions from the previous
+        // statement's (the snapshot is refreshed again when the statement runs). A failure only
+        // costs that distinction, which the engine then makes conservatively.
+        let _ = engine.begin_statement(txn);
         Self {
             engine,
             txn,

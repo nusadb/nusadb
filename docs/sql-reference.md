@@ -872,7 +872,7 @@ an older release appears there after its first `ALTER SEQUENCE`). Sequence funct
 are evaluated exactly once: a `SELECT` without `FROM`, a `VALUES` row, or a column default.
 
 `CREATE DOMAIN` accepts a base type and a `CHECK`; a `DEFAULT` or `COLLATE` on a domain is not
-accepted yet.
+accepted yet. A domain's `CHECK` follows the same [volatility](#volatility) rule as a table's.
 
 ### Comments
 
@@ -1867,15 +1867,17 @@ Every built-in function belongs to one of three classes, which decide where it m
   advisory-lock functions.
 
 An index key expression, a partial-index `WHERE` predicate and a generated column may call only
-immutable built-ins; anything else is refused with `42P17`. A `CHECK` constraint may not call a
-volatile built-in (`42P17`), but it may call a stable one: `CHECK (placed <= now())` is accepted and
+immutable built-ins; anything else is refused with `42P17`. A `CHECK` constraint, on a table or a
+domain, may not call a volatile built-in (`42P17`), but it may call a stable one: `CHECK (placed <= now())` is accepted and
 tests each row against the time of the transaction that writes it. Such a check is not re-run
 later, so rows already stored stay valid as time moves on. User-defined functions carry no
 volatility marking and are not checked by these rules. A partition key is stricter: it accepts
 immutable built-ins only, and no user-defined functions.
 
-These rules apply when an object is created. An index, generated column or `CHECK` constraint that
-an earlier release accepted keeps loading and working as before.
+These rules apply when an object is created. An index, generated column, `CHECK` constraint or
+domain that an earlier release accepted keeps loading and working as before. The error names a
+function the way it is written: `current_user`, `current_date`, `localtime` and the other keyword
+forms without parentheses, everything else as `random()`.
 
 ### JSON
 
@@ -2138,6 +2140,10 @@ RESET ALL;
 | `client_encoding`, `datestyle`, `standard_conforming_strings` | accepted and echoed back; the engine is UTF-8, ISO dates |
 | `server_version`, `server_encoding`, `integer_datetimes` | read-only (`55P02` on `SET`) |
 | `<class>.<name>` | application-defined; any dotted name |
+
+The server keeps some per-connection state in settings whose names start with a NUL character.
+They are not parameters: `SET` refuses such a name (`55P02`), `SHOW` reports it as unknown
+(`42704`), and `current_setting` returns `NULL` for it.
 
 An unrecognised parameter name is an error (`42704`) rather than a silent no-op, and a bad value
 for a known parameter is `22023`. `SET NAMES` is not accepted.

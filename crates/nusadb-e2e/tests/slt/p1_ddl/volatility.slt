@@ -45,3 +45,35 @@ INSERT INTO vc VALUES (now() - INTERVAL '1 hour')
 
 statement error violates check constraint
 INSERT INTO vc VALUES (now() + INTERVAL '1 hour')
+
+# A function SQL spells as a keyword is named without parentheses.
+statement error functions in index expression must be immutable, but current_user is not
+CREATE INDEX vt_cu ON vt ((x::text || current_user))
+
+statement error functions in index expression must be immutable, but current_date is not
+CREATE INDEX vt_cd ON vt ((current_date))
+
+statement error functions in index expression must be immutable, but localtime is not
+CREATE INDEX vt_lt ON vt ((localtime))
+
+statement error functions in index predicate must be immutable, but current_timestamp is not
+CREATE INDEX vt_ct ON vt (x) WHERE t < current_timestamp
+
+# A domain's CHECK follows the same rule as a table's.
+statement error a CHECK constraint may not call the volatile function random\(\)
+CREATE DOMAIN d_rand AS INT CHECK (VALUE > random())
+
+statement error a CHECK constraint may not call the volatile function clock_timestamp\(\)
+CREATE DOMAIN d_clock AS TIMESTAMPTZ NOT NULL CHECK (VALUE IS NOT NULL) CHECK (VALUE <= clock_timestamp())
+
+statement ok
+CREATE DOMAIN d_past AS TIMESTAMPTZ CHECK (VALUE <= now())
+
+statement ok
+CREATE TABLE vd (t d_past)
+
+statement ok
+INSERT INTO vd VALUES (now() - INTERVAL '1 hour')
+
+statement error violates check constraint
+INSERT INTO vd VALUES (now() + INTERVAL '1 hour')

@@ -901,6 +901,14 @@ the new variant. The `StorageEngine` trait gains `prepare_transaction`, `commit_
 `rollback_prepared` and `list_prepared`, all with default implementations, so an implementation
 of the trait keeps compiling unchanged.
 
+Code that analyzes statements itself and runs them in a transaction should call
+`StorageEngine::begin_statement` before analyzing each statement, as the server does. The engine
+uses it to tell one statement's table lookups from the previous statement's; without it, a
+`READ COMMITTED` transaction can get one extra `40001` on its first read of a table after another
+session commits a change that rewrote the table or built an index on it. The trait also gains
+`list_indexes_as_of`, `list_constraints_as_of`, `list_foreign_keys_as_of` and
+`lookup_table_by_id_as_of`, with default implementations.
+
 **Data format.** The files of a data directory are written in a numbered data format, and every
 directory records which one:
 
@@ -953,6 +961,26 @@ may; after 1.0 only a major release does. A new release always reads the formats
 before it, upgrading them in place, unless its release notes name a format it no longer reads; such
 a directory is then refused with a message saying so, and is moved by exporting it with a release
 that reads it (`COPY table TO STDOUT`) and loading it into a fresh `--data-dir`.
+
+**Column defaults outside `public`.** Earlier releases stored the default of a column
+added with `ALTER TABLE schema.table ADD COLUMN ... DEFAULT ...` under the bare table name, so an
+insert into `schema.table` left the column `NULL`, and a table of the same name in `public` with a
+column of that name used the default instead. The first time a newer release opens such a
+database, it moves each of these defaults to its table, in one transaction, and logs each move at
+`WARN`: the stored entry names no schema, so a default left behind by a `schema.table` that was
+later dropped and re-created is attached to the new table too, and the log line says how to check
+and remove it. When `public` holds a table of that name with that column too, or several schemas
+do, the entry may be either table's, so it is left in place and logged at `WARN` with the default
+and the candidate schemas. Decide which table owns it, then run, for example:
+
+```sql
+ALTER TABLE app.e ALTER COLUMN flag SET DEFAULT 99;   -- on the table that owns it
+ALTER TABLE public.e ALTER COLUMN flag DROP DEFAULT;  -- if public.e should not have it
+```
+
+The repair runs once per database; `information_schema.columns` shows the defaults each table has.
+The server prints log lines only for the levels `RUST_LOG` enables, so start it with, for example,
+`RUST_LOG=info` (or `RUST_LOG=warn`) to see these messages.
 
 A database directory written by the removed `lsm` engine is refused the same way rather than
 misread; migrate it by exporting from the last release that shipped that engine and reloading into

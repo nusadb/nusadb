@@ -422,6 +422,11 @@ impl DatabaseManager {
                     io::Error::other(e.to_string())
                 })?,
         );
+        // Before any session reaches it: file column defaults an older build stored under a bare
+        // table name. A standby gets the primary's repair through the log.
+        if !self.is_standby() {
+            repair_column_defaults(&engine, name);
+        }
         spawn_purge_scheduler(&engine, name);
         // Keep this database's planner statistics fresh in the background (no-op if disabled).
         // (A standby cannot write statistics; ANALYZE is a write, refused like any other.)
@@ -2216,6 +2221,61 @@ fn save_catalog(root: &Path, databases: &BTreeSet<String>) -> io::Result<()> {
     sync_dir(&root.join("global"))
 }
 
+/// Run the one-time column-default repair on a database as it opens (see
+/// [`repair_misfiled_column_defaults`](nusadb_sql::repair_misfiled_column_defaults)) and log what
+/// it did. A default it cannot attribute is logged with the manual fix; a failure is logged and the
+/// database still opens, and the repair runs again at the next open.
+fn repair_column_defaults(engine: &BtreeEngine, db: &str) {
+    let report = match nusadb_sql::repair_misfiled_column_defaults(engine) {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::warn!(db, error = %e, "column default repair failed; it runs again at the next open");
+            return;
+        },
+    };
+    // A move is logged as a warning: the entry names no schema, so one left behind when an
+    // earlier {schema}.{table} was dropped would be attached to a table re-created under that name
+    // just the same, and only the operator can tell.
+    for (schema, table, column) in &report.moved {
+        tracing::warn!(
+            db,
+            "column default of {schema}.{table}.{column} was stored under the bare name {table}; \
+             moved to {schema}.{table}. If {schema}.{table} was dropped and re-created since that \
+             default was set, check it with SELECT column_default FROM information_schema.columns \
+             WHERE table_schema = '{schema}' AND table_name = '{table}' AND column_name = \
+             '{column}' and remove it with ALTER TABLE {schema}.{table} ALTER COLUMN {column} DROP \
+             DEFAULT if it does not belong there"
+        );
+    }
+    for entry in &report.ambiguous {
+        let (table, column) = (&entry.table, &entry.column);
+        let (in_use, drop_hint) = if entry
+            .schemas
+            .iter()
+            .any(|s| s == nusadb_core::PUBLIC_SCHEMA)
+        {
+            (
+                format!(" (an insert into public.{table} uses it)"),
+                format!(
+                    "; if public.{table} should not have it, run ALTER TABLE public.{table} ALTER \
+                     COLUMN {column} DROP DEFAULT"
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        tracing::warn!(
+            db,
+            "column default {sql:?} stored under the bare name {table} for column {column} could \
+             belong to the table {table} in any of the schemas {schemas:?}, so it was left in \
+             place{in_use}. On the table that owns it run ALTER TABLE <schema>.{table} ALTER \
+             COLUMN {column} SET DEFAULT {sql}{drop_hint}",
+            sql = entry.default_sql,
+            schemas = entry.schemas,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3477,6 +3537,26 @@ mod tests {
         // The default resolves to an engine; an unknown name does not.
         assert!(m.open("nusadb").unwrap().is_some());
         assert!(m.open("ghost").unwrap().is_none());
+    }
+
+    /// Opening a database written by a build that filed column defaults under bare table names
+    /// repairs it before any session runs: the repair finds nothing left to do afterwards.
+    #[test]
+    fn opening_a_database_repairs_misfiled_column_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(manager(tmp.path()));
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../nusadb-e2e/tests/fixtures/misfiled_column_defaults.wal"),
+            base_dir(tmp.path(), "nusadb").join("btree.wal"),
+        )
+        .unwrap();
+        let m = manager(tmp.path());
+        let engine = m.open("nusadb").unwrap().unwrap();
+        let report = nusadb_sql::repair_misfiled_column_defaults(&*engine).unwrap();
+        assert!(!report.ran, "the open already repaired it: {report:?}");
+        let app_e = engine.lookup_table_in("app", "e").unwrap().unwrap();
+        assert!(app_e.columns.iter().any(|c| c.name == "flag"));
     }
 
     #[test]

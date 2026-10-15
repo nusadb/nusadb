@@ -149,6 +149,25 @@ pub(super) enum ColumnFill {
     Generated(crate::planner::TypedExpr),
 }
 
+/// The catalog row that records that every default in [`DEFAULT_CATALOG`] is filed under its
+/// table's [`catalog_key`]: written when this build creates the catalog, and by
+/// [`repair_misfiled_column_defaults`] once it has repaired a catalog an older build wrote. Its
+/// table key starts with a NUL, which no default lookup is ever made with.
+const KEYED_BY_SCHEMA_MARKER: (&str, &str, &str) = ("\u{0}catalog", "keyed_by_schema", "1");
+
+/// The [`DEFAULT_CATALOG`] row for [`KEYED_BY_SCHEMA_MARKER`], encoded.
+fn marker_row() -> Result<Vec<u8>, Error> {
+    let (table, column, value) = KEYED_BY_SCHEMA_MARKER;
+    row::encode(
+        &[
+            ast::Value::Text(table.to_owned()),
+            ast::Value::Text(column.to_owned()),
+            ast::Value::Text(value.to_owned()),
+        ],
+        &DEFAULT_CATALOG_SCHEMA,
+    )
+}
+
 /// Look up the column-default catalog, creating it lazily if it does not exist yet.
 fn ensure_default_catalog(
     engine: &dyn StorageEngine,
@@ -170,7 +189,10 @@ fn ensure_default_catalog(
         name: DEFAULT_CATALOG.to_owned(),
         columns,
     };
-    Ok(engine.create_table(txn, &def)?)
+    let id = engine.create_table(txn, &def)?;
+    // A catalog this build creates never holds a misfiled default, so mark it as already repaired.
+    engine.insert(txn, id, &marker_row()?)?;
+    Ok(id)
 }
 
 /// Persist `defaults` (each `(column, default SQL)`) for `table`, first removing any prior rows for it
@@ -450,4 +472,176 @@ pub(super) fn column_fills(
         }
     }
     Ok(fills)
+}
+
+/// What [`repair_misfiled_column_defaults`] found and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DefaultRepair {
+    /// Whether the repair ran. `false` when the catalog was already repaired, was created by a
+    /// build that files every default correctly, or does not exist.
+    pub ran: bool,
+    /// Each default moved to the table it belongs to, as `(schema, table, column)`.
+    pub moved: Vec<(String, String, String)>,
+    /// Each default left where it is because more than one table could own it.
+    pub ambiguous: Vec<AmbiguousDefault>,
+}
+
+/// A default [`repair_misfiled_column_defaults`] could not attribute to one table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousDefault {
+    /// The bare table name it is stored under.
+    pub table: String,
+    /// The column it is the default of.
+    pub column: String,
+    /// The default expression, as stored.
+    pub default_sql: String,
+    /// Every schema holding a table of that name with that column and no default of its own for
+    /// it, `public` first when present (an insert into `public.<table>` uses the entry today).
+    pub schemas: Vec<String>,
+}
+
+/// One row of [`DEFAULT_CATALOG`] as the repair reads it.
+struct StoredDefault {
+    tid: nusadb_core::engine::Tid,
+    key: String,
+    column: String,
+    sql: String,
+}
+
+/// Move column defaults that an older build filed under a bare table name onto the table they
+/// belong to, once per catalog.
+///
+/// Builds before this one stored the default of `ALTER TABLE s.t ADD COLUMN c ... DEFAULT ...` (and
+/// earlier, of `ALTER TABLE s.t ALTER COLUMN c SET DEFAULT ...`) under the bare name `t` instead of
+/// the key `s.t`. Inserts into `s.t` then missed the default, and a table `public.t` with a column
+/// `c` picked it up. Nothing in the entry says which schema it came from, so ownership is decided
+/// from the catalog as it stands:
+///
+/// - a bare entry `(t, c)` is moved to `s.t` when `s.t` is the only table named `t` outside
+///   `public` that has a column `c` and no default of its own for it, and `public.t` either does not
+///   exist or has no column `c`;
+/// - when `public.t` has a column `c` as well, or several schemas qualify, the entry is left alone
+///   and reported in [`DefaultRepair::ambiguous`]: it may be `public.t`'s own default, and guessing
+///   wrong would move a default off the table it belongs to;
+/// - an entry no table can own is left alone.
+///
+/// The moves and the marker that records the repair commit in one transaction, so a crash leaves
+/// either the old catalog (and the repair runs again at the next open) or the repaired one. Run it
+/// before any session uses the engine; the server does so when it opens a database. A standby
+/// must not run it: it receives the primary's repair through the log.
+///
+/// # Errors
+/// Propagates storage errors; the transaction is rolled back and nothing changes.
+pub fn repair_misfiled_column_defaults(engine: &dyn StorageEngine) -> Result<DefaultRepair, Error> {
+    let txn = engine.begin(IsolationLevel::default())?;
+    match repair_in(engine, txn) {
+        Ok(report) => {
+            engine.commit(txn)?;
+            Ok(report)
+        },
+        Err(e) => {
+            // The original error is what the caller needs; a failed rollback changes nothing.
+            let _ = engine.rollback(txn);
+            Err(e)
+        },
+    }
+}
+
+/// The body of [`repair_misfiled_column_defaults`], inside `txn`.
+fn repair_in(engine: &dyn StorageEngine, txn: TxnId) -> Result<DefaultRepair, Error> {
+    let Some(cat) = engine.lookup_table_as_of(txn, DEFAULT_CATALOG)? else {
+        return Ok(DefaultRepair::default());
+    };
+    let mut stored = Vec::new();
+    let mut scan = engine.scan(txn, cat.id)?;
+    while let Some((tid, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &DEFAULT_CATALOG_SCHEMA)?;
+        if let (
+            Some(ast::Value::Text(key)),
+            Some(ast::Value::Text(column)),
+            Some(ast::Value::Text(sql)),
+        ) = (row.first(), row.get(1), row.get(2))
+        {
+            stored.push(StoredDefault {
+                tid,
+                key: key.clone(),
+                column: column.clone(),
+                sql: sql.clone(),
+            });
+        }
+    }
+    drop(scan);
+    let (marker_table, marker_column, _) = KEYED_BY_SCHEMA_MARKER;
+    if stored
+        .iter()
+        .any(|d| d.key == marker_table && d.column == marker_column)
+    {
+        return Ok(DefaultRepair::default());
+    }
+    let filed: HashSet<(String, String)> = stored
+        .iter()
+        .map(|d| (d.key.clone(), d.column.clone()))
+        .collect();
+    // Every table by name, with the schemas it exists in and their columns.
+    let mut tables: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
+    for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
+        if let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)? {
+            let columns = table.columns.into_iter().map(|c| c.name).collect();
+            tables.entry(name).or_default().push((schema, columns));
+        }
+    }
+    let mut report = DefaultRepair {
+        ran: true,
+        ..DefaultRepair::default()
+    };
+    for entry in &stored {
+        // A schema-qualified key, or the marker, is already where it belongs.
+        let Some(same_named) = tables.get(&entry.key) else {
+            continue;
+        };
+        let has_column = |columns: &[String]| columns.contains(&entry.column);
+        let public_claims = same_named
+            .iter()
+            .any(|(schema, columns)| schema == nusadb_core::PUBLIC_SCHEMA && has_column(columns));
+        let owners: Vec<&str> = same_named
+            .iter()
+            .filter(|(schema, columns)| {
+                schema != nusadb_core::PUBLIC_SCHEMA
+                    && has_column(columns)
+                    && !filed.contains(&(catalog_key(schema, &entry.key), entry.column.clone()))
+            })
+            .map(|(schema, _)| schema.as_str())
+            .collect();
+        match (owners.as_slice(), public_claims) {
+            ([], _) => {},
+            ([schema], false) => {
+                engine.delete(txn, cat.id, entry.tid)?;
+                let row = [
+                    ast::Value::Text(catalog_key(schema, &entry.key)),
+                    ast::Value::Text(entry.column.clone()),
+                    ast::Value::Text(entry.sql.clone()),
+                ];
+                engine.insert(txn, cat.id, &row::encode(&row, &DEFAULT_CATALOG_SCHEMA)?)?;
+                report.moved.push((
+                    (*schema).to_owned(),
+                    entry.key.clone(),
+                    entry.column.clone(),
+                ));
+            },
+            (schemas, public_claims) => {
+                let mut candidates: Vec<String> = schemas.iter().map(|s| (*s).to_owned()).collect();
+                if public_claims {
+                    candidates.insert(0, nusadb_core::PUBLIC_SCHEMA.to_owned());
+                }
+                report.ambiguous.push(AmbiguousDefault {
+                    table: entry.key.clone(),
+                    column: entry.column.clone(),
+                    default_sql: entry.sql.clone(),
+                    schemas: candidates,
+                });
+            },
+        }
+    }
+    engine.insert(txn, cat.id, &marker_row()?)?;
+    Ok(report)
 }

@@ -1028,7 +1028,8 @@ pub trait StorageEngine: Send + Sync {
     /// Resolve a table name to its schema **as visible to `txn`'s snapshot**, or `Ok(None)`
     /// if no such table is visible to it. A table created by an uncommitted *other* transaction is
     /// not visible; one the calling transaction created (even before commit) is; one dropped by an
-    /// uncommitted other transaction is still visible until that drop commits.
+    /// uncommitted other transaction is still visible until that drop commits; one altered or
+    /// renamed by an uncommitted other transaction keeps its committed schema and name.
     ///
     /// The default implementation ignores `txn` and falls back to [`lookup_table`](
     /// Self::lookup_table) (latest-committed) — correct for single-transaction callers and
@@ -1308,6 +1309,17 @@ pub trait StorageEngine: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The indexes on `table` that `txn` may plan with: [`list_indexes`](Self::list_indexes)
+    /// without the ones another transaction created and has not committed. Such an index holds
+    /// entries only that transaction can see, so a scan through it would miss rows.
+    ///
+    /// The default ignores `txn` and returns [`list_indexes`](Self::list_indexes), which suits an
+    /// engine without concurrent DDL; the MVCC engine overrides it.
+    fn list_indexes_as_of(&self, txn: TxnId, table: TableId) -> Result<Vec<IndexDef>> {
+        let _ = txn;
+        self.list_indexes(table)
+    }
+
     /// Whether `index` **covers** its table — every live row has an entry — so an index scan is a
     /// safe superset of a sequential scan. The planner catalogs consult this and only offer
     /// complete indexes as scan candidates; an incomplete one (e.g. recovered from a data dir
@@ -1507,6 +1519,18 @@ pub trait StorageEngine: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The constraints on `table` as `txn` sees them: [`list_constraints`](Self::list_constraints)
+    /// as it was before another transaction that has not committed added or dropped any. Every
+    /// write checks these, so a constraint (or the column check of a column) another transaction
+    /// is still adding must not reject it.
+    ///
+    /// The default ignores `txn` and returns [`list_constraints`](Self::list_constraints); the MVCC
+    /// engine overrides it.
+    fn list_constraints_as_of(&self, txn: TxnId, table: TableId) -> Result<Vec<Constraint>> {
+        let _ = txn;
+        self.list_constraints(table)
+    }
+
     /// Whether `table` has any `PRIMARY KEY` / `UNIQUE` constraint — the cheap existence check the
     /// SQL layer makes before every INSERT/UPDATE (to decide whether a uniqueness scan is needed at
     /// all), without materialising and cloning the whole constraint list. The default derives the
@@ -1529,6 +1553,16 @@ pub trait StorageEngine: Send + Sync {
     fn list_foreign_keys(&self, table: TableId) -> Result<Vec<ForeignKeyDef>> {
         let _ = table;
         Ok(Vec::new())
+    }
+
+    /// The foreign keys of `table` as `txn` sees them: [`list_foreign_keys`](Self::list_foreign_keys)
+    /// without the ones another transaction has added and not committed.
+    ///
+    /// The default ignores `txn` and returns [`list_foreign_keys`](Self::list_foreign_keys); the
+    /// MVCC engine overrides it.
+    fn list_foreign_keys_as_of(&self, txn: TxnId, table: TableId) -> Result<Vec<ForeignKeyDef>> {
+        let _ = txn;
+        self.list_foreign_keys(table)
     }
 
     /// Declare a `FOREIGN KEY` on `def.child_table` referencing `def.parent_table`.
@@ -1646,6 +1680,18 @@ pub trait StorageEngine: Send + Sync {
     fn current_schema_version(&self, table: TableId) -> Result<Option<u32>> {
         let _ = table;
         Ok(None)
+    }
+
+    /// The schema of `table` by id as `txn` sees it, or `None` if `txn` sees no such table.
+    ///
+    /// Like [`lookup_table_as_of`](Self::lookup_table_as_of), a change another transaction has
+    /// made and not committed is not visible: a table it altered reports the committed schema and
+    /// one it created is absent. The default ignores `txn` and returns the schema at
+    /// [`current_schema_version`](Self::current_schema_version); the MVCC engine overrides it.
+    fn lookup_table_by_id_as_of(&self, txn: TxnId, table: TableId) -> Result<Option<TableSchema>> {
+        let _ = txn;
+        self.current_schema_version(table)?
+            .map_or(Ok(None), |version| self.schema_for_version(table, version))
     }
 
     /// Reclaim row versions no longer visible to any live or future transaction (MVCC

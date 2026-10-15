@@ -342,8 +342,8 @@ fn propagate_parent_constraints(
     };
     // The partition's rows are validated below: held (again, re-entrantly) and read fresh.
     let _fresh = validate.then(|| hold_fresh(id, engine, txn)).transpose()?;
-    let existing = engine.list_constraints(id)?;
-    for c in engine.list_constraints(parent.id)? {
+    let existing = engine.list_constraints_as_of(txn, id)?;
+    for c in engine.list_constraints_as_of(txn, parent.id)? {
         let primary = matches!(c.kind, nusadb_core::ConstraintKind::PrimaryKey);
         if !(primary || matches!(c.kind, nusadb_core::ConstraintKind::Unique)) {
             continue;
@@ -464,7 +464,7 @@ fn propagate_parent_checks(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let existing = engine.list_constraints(id)?;
+    let existing = engine.list_constraints_as_of(txn, id)?;
     let partition_key = crate::analyzer::qualified_display(&def.schema, &def.name);
     let parent_key = crate::analyzer::qualified_display(&parent.schema, &parent.name);
     let schema = if validate {
@@ -478,7 +478,7 @@ fn propagate_parent_checks(
     } else {
         None
     };
-    for c in engine.list_constraints(parent.id)? {
+    for c in engine.list_constraints_as_of(txn, parent.id)? {
         if c.kind != nusadb_core::ConstraintKind::Check
             || c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
         {
@@ -526,8 +526,8 @@ fn propagate_parent_foreign_keys(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let existing = engine.list_foreign_keys(id)?;
-    for fk in engine.list_foreign_keys(parent.id)? {
+    let existing = engine.list_foreign_keys_as_of(txn, id)?;
+    for fk in engine.list_foreign_keys_as_of(txn, parent.id)? {
         if fk.child_table != parent.id {
             continue;
         }
@@ -645,7 +645,7 @@ fn drop_partition_copies(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let Some(schema) = schema_by_id(engine, table)? else {
+    let Some(schema) = schema_by_id(engine, txn, table)? else {
         return Ok(());
     };
     // Each level's copy is named after its own parent's: walk down renaming as the copies did.
@@ -665,11 +665,11 @@ fn drop_partition_copies(
         let copy = partition_constraint_name(&child_key, &parent, &parent_copy);
         if let Some(child_table) = engine.lookup_table_as_of_in(txn, &child_schema, &child)? {
             let has = engine
-                .list_constraints(child_table.id)?
+                .list_constraints_as_of(txn, child_table.id)?
                 .iter()
                 .any(|c| c.name == copy)
                 || engine
-                    .list_foreign_keys(child_table.id)?
+                    .list_foreign_keys_as_of(txn, child_table.id)?
                     .iter()
                     .any(|fk| fk.name == copy && fk.child_table == child_table.id);
             if has {
@@ -692,7 +692,7 @@ fn refuse_dropping_inherited_constraint(
     if !super::partition::has_any(engine, txn)? {
         return Ok(());
     }
-    let Some(schema) = schema_by_id(engine, table)? else {
+    let Some(schema) = schema_by_id(engine, txn, table)? else {
         return Ok(());
     };
     let key = crate::analyzer::qualified_display(&schema.schema, &schema.name);
@@ -709,9 +709,9 @@ fn refuse_dropping_inherited_constraint(
         return Ok(());
     };
     let parent_key = crate::analyzer::qualified_display(&parent.schema, &parent.name);
-    let parent_constraints = engine.list_constraints(parent.id)?;
+    let parent_constraints = engine.list_constraints_as_of(txn, parent.id)?;
     let parent_fks: Vec<_> = engine
-        .list_foreign_keys(parent.id)?
+        .list_foreign_keys_as_of(txn, parent.id)?
         .into_iter()
         .filter(|fk| fk.child_table == parent.id)
         .collect();
@@ -725,7 +725,7 @@ fn refuse_dropping_inherited_constraint(
         });
     // Or a constraint of the partition's own that stands in for one: the copy is not made when
     // the partition already declares the same rule, so this one is what enforces the parent's.
-    let own = engine.list_constraints(table)?;
+    let own = engine.list_constraints_as_of(txn, table)?;
     let standing_in = own.iter().filter(|c| c.name == name).any(|c| {
         parent_constraints.iter().any(|p| {
             p.kind == c.kind
@@ -737,7 +737,7 @@ fn refuse_dropping_inherited_constraint(
                 }
         })
     }) || engine
-        .list_foreign_keys(table)?
+        .list_foreign_keys_as_of(txn, table)?
         .iter()
         .filter(|fk| fk.name == name && fk.child_table == table)
         .any(|fk| {
@@ -1096,7 +1096,7 @@ fn copy_like_metadata(
             .map_or_else(|| name.to_owned(), |rest| format!("{}_{rest}", def.name))
     };
     let mut backing = std::collections::HashSet::new();
-    for c in engine.list_constraints(src.id)? {
+    for c in engine.list_constraints_as_of(txn, src.id)? {
         if let Some(index) = c.index {
             backing.insert(index);
         }
@@ -1126,7 +1126,7 @@ fn copy_like_metadata(
         }
     }
     if options.indexes {
-        for index in engine.list_indexes(src.id)? {
+        for index in engine.list_indexes_as_of(txn, src.id)? {
             // Constraint-backing indexes were re-created by the PK/UNIQUE declarations above.
             if engine
                 .lookup_index(&index.name)?
@@ -1317,9 +1317,10 @@ fn synthetic_type_checks_on_column(
     table: &TableSchema,
     column: &str,
     engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
-    for c in engine.list_constraints(table.id)? {
+    for c in engine.list_constraints_as_of(txn, table.id)? {
         if !c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
             continue;
         }
@@ -1590,7 +1591,7 @@ pub(super) fn register_foreign_key(
             fk.name, parent.name
         )));
     }
-    let parent_constraints = engine.list_constraints(parent.id)?;
+    let parent_constraints = engine.list_constraints_as_of(txn, parent.id)?;
     // The referenced parent columns: an explicit `REFERENCES parent (cols)` list, else the parent's
     // PRIMARY KEY (the unqualified `REFERENCES parent` form).
     let parent_columns: Vec<String> = if fk.referred_columns.is_empty() {
@@ -1695,7 +1696,7 @@ pub(super) fn run_drop_table(
             // self-referencing FK (child == parent) does not block — it drops with the table.
             // CASCADE drops those referencing constraints instead — the standard's
             // semantics: the dependent CONSTRAINT goes, never the child table or its rows.
-            let table_fks = engine.list_foreign_keys(schema.id)?;
+            let table_fks = engine.list_foreign_keys_as_of(txn, schema.id)?;
             for fk in &table_fks {
                 if fk.parent_table == schema.id && fk.child_table != schema.id {
                     if plan.cascade {
@@ -1722,7 +1723,7 @@ pub(super) fn run_drop_table(
             // ("index `<t>_pkey` already exists"), breaking idempotent migrations / redeploys. A
             // PRIMARY KEY/UNIQUE/FK constraint's drop also drops its backing index, so only the
             // *secondary* (non-backing) indexes are dropped directly here — avoiding a double drop.
-            let constraints = engine.list_constraints(schema.id)?;
+            let constraints = engine.list_constraints_as_of(txn, schema.id)?;
             let backing: std::collections::HashSet<_> =
                 constraints.iter().filter_map(|c| c.index).collect();
             for def in engine.list_indexes(schema.id)? {
@@ -2074,7 +2075,7 @@ pub(super) fn run_create_index(
     // would make a later index scan return wrong results).
     if let (Some(id), Some(table)) = (
         engine.lookup_index(&plan.def.name)?,
-        dml::schema_by_id(engine, plan.def.table)?,
+        dml::schema_by_id(engine, txn, plan.def.table)?,
     ) && let Some(target) = dml::build_index_target(id, &table, &plan.def)
     {
         // Backfill through the same maintenance path DML writes take (a functional/expression key
@@ -2333,11 +2334,11 @@ pub(super) fn run_alter_table(
             if_exists,
         } => {
             let present = engine
-                .list_constraints(table)?
+                .list_constraints_as_of(txn, table)?
                 .iter()
                 .any(|c| c.name == name);
             if !present {
-                let relation = dml::schema_by_id(engine, table)?
+                let relation = dml::schema_by_id(engine, txn, table)?
                     .map_or_else(|| format!("#{}", table.0), |t| t.name);
                 if if_exists {
                     crate::notice::skipped_missing(&format!(
@@ -2608,7 +2609,7 @@ fn apply_column_op(
             super::column_deps::drop_column_dependents(table, *index, *cascade, engine, txn)?;
             // The column's type-range checks go with it; left behind, they would name a column the
             // next write cannot find.
-            for (check, _) in synthetic_type_checks_on_column(table, &name, engine)? {
+            for (check, _) in synthetic_type_checks_on_column(table, &name, engine, txn)? {
                 engine.drop_constraint(txn, table.id, &check)?;
             }
             rewrite_drop_column(table, *index, &old_types, engine, txn)?;
@@ -2623,7 +2624,7 @@ fn apply_column_op(
             let column = column_name(table, *index)?;
             // The old type's width or length check goes; the new type's (if any) replaces it once
             // the rows hold the new type.
-            for (check, _) in synthetic_type_checks_on_column(table, &column, engine)? {
+            for (check, _) in synthetic_type_checks_on_column(table, &column, engine, txn)? {
                 engine.drop_constraint(txn, table.id, &check)?;
             }
             rewrite_set_type(table, *index, *ty, &old_types, engine, txn)?;
@@ -2735,7 +2736,7 @@ fn rename_column(
     // stored predicate is rewritten by re-quoting the new name. Drop before the rename, re-add
     // after, all in this txn: drop clears the old dependency, the rename lands, the rewritten
     // check re-enforces the same bound under the new name.
-    let synthetic = synthetic_type_checks_on_column(table, &from, engine)?;
+    let synthetic = synthetic_type_checks_on_column(table, &from, engine, txn)?;
     for c in &synthetic {
         engine.drop_constraint(txn, table.id, &c.0)?;
     }
@@ -2794,7 +2795,7 @@ fn copy_type_check_below(
             continue;
         };
         if engine
-            .list_constraints(child.id)?
+            .list_constraints_as_of(txn, child.id)?
             .iter()
             .any(|c| c.name == name)
         {

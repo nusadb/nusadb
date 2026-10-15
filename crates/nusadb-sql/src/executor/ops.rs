@@ -3599,7 +3599,7 @@ fn info_schema_referential_constraints(
         let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
-        for fk in engine.list_foreign_keys(schema.id)? {
+        for fk in engine.list_foreign_keys_as_of(txn, schema.id)? {
             // `list_foreign_keys` reports keys touching the table from either side; keep only the
             // ones this table declares (child side) so each constraint appears once.
             if fk.child_table != schema.id {
@@ -3609,7 +3609,7 @@ fn info_schema_referential_constraints(
             // referenced columns. NULL when it cannot be resolved (defensive; the engine required it
             // at ADD FOREIGN KEY time).
             let unique_name = engine
-                .list_constraints(fk.parent_table)?
+                .list_constraints_as_of(txn, fk.parent_table)?
                 .into_iter()
                 .find(|c| {
                     matches!(
@@ -3620,7 +3620,7 @@ fn info_schema_referential_constraints(
                 })
                 .map(|c| c.name);
             // The referenced key lives in the parent table's schema.
-            let unique_schema = super::dml::schema_by_id(engine, fk.parent_table)?
+            let unique_schema = super::dml::schema_by_id(engine, txn, fk.parent_table)?
                 .map_or_else(|| namespace.clone(), |parent| parent.schema);
             rows.push(vec![
                 ast::Value::Text("nusadb".to_owned()),
@@ -3654,7 +3654,7 @@ fn info_schema_check_constraints(
         let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
-        for c in engine.list_constraints(schema.id)? {
+        for c in engine.list_constraints_as_of(txn, schema.id)? {
             if !matches!(c.kind, nusadb_core::engine::ConstraintKind::Check)
                 || c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
             {
@@ -3834,7 +3834,7 @@ fn info_schema_table_constraints(
         let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
-        for c in engine.list_constraints(schema.id)? {
+        for c in engine.list_constraints_as_of(txn, schema.id)? {
             // Synthetic type-bound checks (a VARCHAR(n) length or narrow-int range) are an
             // implementation detail of the declared type, not a user constraint — enforced on every
             // write but hidden from introspection.
@@ -3868,7 +3868,7 @@ fn info_schema_key_column_usage(engine: &dyn StorageEngine, txn: TxnId) -> Resul
         let Some(schema) = engine.lookup_table_as_of_in(txn, namespace, name)? else {
             continue;
         };
-        for c in engine.list_constraints(schema.id)? {
+        for c in engine.list_constraints_as_of(txn, schema.id)? {
             for (pos, col) in c.columns.iter().enumerate() {
                 rows.push(vec![
                     ast::Value::Text("nusadb".to_owned()),
@@ -3910,7 +3910,7 @@ fn info_schema_statistics(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<
         let Some(schema) = engine.lookup_table_as_of_in(txn, schema_name, name)? else {
             continue;
         };
-        for idx in engine.list_indexes(schema.id)? {
+        for idx in engine.list_indexes_as_of(txn, schema.id)? {
             let non_unique = i64::from(!idx.unique);
             for (pos, col) in idx.columns.iter().enumerate() {
                 rows.push(stat_row(
@@ -3988,7 +3988,11 @@ fn info_schema_columns(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Row
         };
         // The column DEFAULT expressions live in the `nusadb_column_defaults` catalog, keyed by
         // (table, column) — not in the schema's ColumnDef.
-        let defaults = crate::executor::coldefault::load_defaults(name, engine, txn)?;
+        let defaults = crate::executor::coldefault::load_defaults(
+            &crate::executor::coldefault::catalog_key(schema_name, name),
+            engine,
+            txn,
+        )?;
         for (pos, col) in schema.columns.iter().enumerate() {
             // Standard `information_schema.columns.data_type` name (e.g. `integer`, `character
             // varying`) so driver/ORM reflection maps the type correctly — distinct from the

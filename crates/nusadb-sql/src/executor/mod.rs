@@ -125,6 +125,7 @@ mod stats;
 mod advisory;
 pub mod agg;
 pub(crate) mod coldefault;
+pub use coldefault::{AmbiguousDefault, DefaultRepair, repair_misfiled_column_defaults};
 mod column_deps;
 mod dcl;
 mod ddl;
@@ -771,8 +772,11 @@ pub fn execute_in_txn_as_with_settings(
     reason = "the wire server's per-connection GUC store is a default-hasher HashMap"
 )]
 pub fn show_session_variable(name: &str, settings: &HashMap<String, String>) -> ExecutionResult {
+    // A reserved key holds the server's own connection state, never a client-visible parameter:
+    // it reads as unset whatever the snapshot carries.
     let value = settings
         .get(name)
+        .filter(|_| !crate::is_reserved_setting(name))
         .cloned()
         .or_else(|| match name {
             "transaction_isolation" | "default_transaction_isolation" => {
@@ -2447,6 +2451,7 @@ impl<'engine> Session<'engine> {
         let value = self
             .variables
             .get(name)
+            .filter(|_| !crate::is_reserved_setting(name))
             .cloned()
             .or_else(|| self.builtin_guc_default(name))
             .unwrap_or_default();
@@ -2848,6 +2853,19 @@ impl Drop for StatementMark<'_> {
     }
 }
 
+/// Take the shared table lock every row write of `table` takes, before the statement evaluates
+/// anything. A transaction that is changing the table's definition holds it exclusively, so the
+/// write fails at once with a serialization conflict (`40001`) instead of running defaults,
+/// constraints or triggers against a definition that may still change, and the shared lock then
+/// keeps such a change off the table until this transaction ends.
+fn claim_write_target(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    table: nusadb_core::TableId,
+) -> Result<(), Error> {
+    Ok(engine.lock_table(txn, table, nusadb_core::engine::TableLockMode::AccessShare)?)
+}
+
 /// Run one statement atomically inside `txn`: refresh the statement snapshot, mark a savepoint,
 /// and when the statement fails roll the transaction back to that mark before returning the
 /// error. A refused statement then leaves nothing behind — no heap rows, index entries, trigger
@@ -3054,12 +3072,24 @@ fn dispatch(
         PhysicalPlan::CreatePolicy(p) => run_create_policy(&p, engine, txn),
         PhysicalPlan::DropPolicy(p) => run_drop_policy(&p, engine, txn),
         PhysicalPlan::AlterTable(p) => run_alter_table(p, engine, txn),
-        PhysicalPlan::Insert(p) => run_insert(&p, engine, txn),
+        PhysicalPlan::Insert(p) => {
+            claim_write_target(engine, txn, p.table.id)?;
+            run_insert(&p, engine, txn)
+        },
         PhysicalPlan::Select(op, est_scan_rows) => run_select(&op, est_scan_rows, engine, txn),
-        PhysicalPlan::Update(p) => run_update(&p, engine, txn),
-        PhysicalPlan::Delete(p) => run_delete(&p, engine, txn),
+        PhysicalPlan::Update(p) => {
+            claim_write_target(engine, txn, p.table.id)?;
+            run_update(&p, engine, txn)
+        },
+        PhysicalPlan::Delete(p) => {
+            claim_write_target(engine, txn, p.table.id)?;
+            run_delete(&p, engine, txn)
+        },
         PhysicalPlan::TruncateCascade(p) => run_truncate(&p, engine, txn),
-        PhysicalPlan::Merge(p) => dml::run_merge(&p, engine, txn),
+        PhysicalPlan::Merge(p) => {
+            claim_write_target(engine, txn, p.table.id)?;
+            dml::run_merge(&p, engine, txn)
+        },
         PhysicalPlan::Explain(inner, options) => run_explain(&inner, options, engine, txn),
         PhysicalPlan::Vacuum(options) => run_vacuum(options, engine, txn),
         // REINDEX is a no-op: NusaDB's B-tree indexes are always consistent (MVCC + purge).
@@ -4152,7 +4182,7 @@ pub fn catalog_list_indexes(
     let Some(schema) = engine.lookup_table_as_of(txn, name)? else {
         return Ok(Vec::new());
     };
-    scannable_indexes_of(engine, &schema)
+    scannable_indexes_of(engine, txn, &schema)
 }
 
 /// [`catalog_list_indexes`] for the table identified as `(schema, name)`: the key the analyzer
@@ -4169,16 +4199,18 @@ pub fn catalog_list_indexes_in(
     let Some(table) = engine.lookup_table_as_of_in(txn, schema, name)? else {
         return Ok(Vec::new());
     };
-    scannable_indexes_of(engine, &table)
+    scannable_indexes_of(engine, txn, &table)
 }
 
-/// The indexes of `schema` the planner may scan through.
+/// The indexes of `schema` the planner may scan through. An index another transaction created
+/// and has not committed is left out: its entries are visible only to that transaction.
 fn scannable_indexes_of(
     engine: &dyn StorageEngine,
+    txn: TxnId,
     schema: &TableSchema,
 ) -> Result<Vec<crate::IndexInfo>, Error> {
     let mut out = Vec::new();
-    for def in engine.list_indexes(schema.id)? {
+    for def in engine.list_indexes_as_of(txn, schema.id)? {
         let Some(id) = engine.lookup_index(&def.name)? else {
             continue;
         };
@@ -5722,7 +5754,7 @@ fn replace_rows(
     // without re-indexing, an index scan would miss every refreshed row. (The deleted versions'
     // entries stay until VACUUM; stale-extra entries are visibility-filtered, only missing ones
     // lose rows.)
-    let index_targets = match dml::schema_by_id(engine, table_id)? {
+    let index_targets = match dml::schema_by_id(engine, txn, table_id)? {
         Some(table) => dml::secondary_index_targets(&table, engine)?,
         None => Vec::new(),
     };

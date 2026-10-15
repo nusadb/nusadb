@@ -139,6 +139,47 @@ COMMIT;
 `LOCK TABLE name IN ACCESS SHARE MODE` and `IN ACCESS EXCLUSIVE MODE` are available inside a
 transaction; the other modes are refused.
 
+## Schema changes inside a transaction
+
+DDL is transactional, and until it commits only its own transaction sees it. Every other session
+keeps resolving tables, columns and indexes as they were last committed, whatever its isolation
+level:
+
+- a table another transaction created is not there yet (`42P01`), and creating one with the same
+  name fails with `40001` until that transaction ends;
+- a table another transaction altered keeps its committed columns, so `SELECT *` returns the
+  committed shape and an `INSERT` without a column list counts the committed columns;
+- a table another transaction renamed answers to its committed name only;
+- a table another transaction dropped still exists, and reading or writing it fails with `40001`
+  until the drop commits or rolls back;
+- an index another transaction created is not used by the planner;
+- constraints another transaction added or dropped (a `CHECK`, `UNIQUE`, primary key or foreign
+  key) keep their committed state: `information_schema` lists the committed ones, and a foreign key
+  still being added is not enforced against writes elsewhere.
+
+`INSERT`, `UPDATE`, `DELETE`, `MERGE` and `COPY ... FROM` take the target table's shared lock before
+they evaluate anything, so a write to a table another transaction is altering (a column, a
+constraint, an index, a rename or a drop) fails at once with `40001`, even when no row matches,
+rather than checking defaults or constraints against a definition that is not settled. The shared
+lock is then held until the writing transaction ends, so DDL on that table from another session
+fails with `40001` meanwhile (see [Two-phase commit](#two-phase-commit) for what the exclusive lock
+covers). Dropping a foreign key also takes its referenced table exclusively.
+
+Once the DDL commits, the next statement of every session sees it. Table definitions are not part
+of a snapshot, so a transaction that began earlier still resolves the new definition. When the
+change rewrote the table's rows (adding, dropping or retyping a column) or built an index on it, a
+read of that table under a snapshot that does not see the change fails with `40001` instead of
+returning rows of the wrong shape or an incomplete index result:
+
+- a `REPEATABLE READ` or `SERIALIZABLE` transaction whose snapshot is older than such a change gets
+  `40001` the next time it reads the table, and should be retried;
+- a `READ COMMITTED` statement that resolved the table just before such a change committed and
+  read it just after is retried automatically outside a transaction block, and reports `40001`
+  inside one.
+
+A rename, `SET NOT NULL`, `DROP NOT NULL` or a constraint change does not rewrite rows and does not
+cause this.
+
 ## Cursors
 
 A cursor reads a large result in pieces without holding it all on the client. Its rows are captured

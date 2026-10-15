@@ -58,6 +58,7 @@ use crate::tree::ClusteredTree;
 use crate::wal::{self, LoggedOp};
 
 mod prepared;
+mod uncommitted;
 
 pub use prepared::{DEFAULT_MAX_PREPARED_TRANSACTIONS, MAX_GID_BYTES};
 
@@ -332,6 +333,21 @@ struct Catalog {
     /// Namespace ids created as session temp schemas (non-durable), with the same WAL/checkpoint
     /// exclusion as [`Self::nondurable_tables`].
     nondurable_namespaces: HashSet<u64>,
+    /// The DDL of transactions that have not ended, so every other transaction keeps resolving
+    /// the committed catalog (see [`uncommitted`]).
+    uncommitted: Mutex<uncommitted::UncommittedDdl>,
+    /// Whether `uncommitted` may hold an entry, so resolution skips its lock when no DDL is in
+    /// flight.
+    has_uncommitted: AtomicBool,
+    /// Whether `uncommitted` may hold a change of a running transaction to mask from others (as
+    /// opposed to only the history reads are checked against), so name resolution skips the
+    /// lock while nothing is being changed.
+    has_pending_ddl: AtomicBool,
+    /// The highest schema version each altered table has been given since the engine opened.
+    /// A rolled-back `ALTER` puts the table back on its previous version, and the next `ALTER`
+    /// numbers past this mark instead of reusing the abandoned number, so a version always names
+    /// one schema and a plan cached against it cannot be served for a different one.
+    version_high_water: HashMap<u64, u32>,
 }
 
 impl Catalog {
@@ -1519,6 +1535,10 @@ struct TxnState {
     /// While a DDL statement reads under [`begin_fresh_reads`](StorageEngine::begin_fresh_reads):
     /// how deep the calls nest and the snapshot to put back when the outermost one ends.
     fresh_reads: Option<(u32, ReadView)>,
+    /// How many times [`begin_statement`](StorageEngine::begin_statement) has run for the
+    /// transaction: tells apart the table resolutions of one statement from those of an earlier
+    /// one (see `uncommitted`).
+    statements: u64,
 }
 
 impl TxnState {
@@ -3786,6 +3806,83 @@ const fn row_id_of(tid: Tid) -> u64 {
 
 const fn unknown_txn(txn: TxnId) -> Error {
     Error::UnknownTransaction { txn }
+}
+
+/// The constraints declared on `table` in the live catalog.
+fn constraints_of(cat: &Catalog, table: TableId) -> Vec<Constraint> {
+    let mut out: Vec<Constraint> = cat.constraints.get(&table.0).map_or_else(Vec::new, |cs| {
+        cs.iter()
+            .map(|c| Constraint {
+                name: c.name.clone(),
+                table,
+                columns: c.columns.clone(),
+                kind: if c.primary {
+                    ConstraintKind::PrimaryKey
+                } else {
+                    ConstraintKind::Unique
+                },
+                index: Some(IndexId(c.index)),
+                expr: None,
+                nulls_not_distinct: c.nulls_not_distinct,
+            })
+            .collect()
+    });
+    for fk in cat
+        .foreign_keys
+        .values()
+        .filter(|f| f.child_table == table.0)
+    {
+        out.push(Constraint {
+            name: fk.name.clone(),
+            table,
+            columns: fk.child_columns.clone(),
+            kind: ConstraintKind::ForeignKey,
+            index: Some(IndexId(fk.child_index)),
+            expr: None,
+            nulls_not_distinct: false,
+        });
+    }
+    if let Some(cs) = cat.checks.get(&table.0) {
+        for c in cs {
+            out.push(Constraint {
+                name: c.name.clone(),
+                table,
+                columns: Vec::new(),
+                kind: ConstraintKind::Check,
+                index: None,
+                expr: Some(c.expr.clone()),
+                nulls_not_distinct: false,
+            });
+        }
+    }
+    out
+}
+
+/// The foreign keys whose child or parent is `table` in the live catalog.
+fn foreign_keys_of(cat: &Catalog, table: TableId) -> Vec<ForeignKeyDef> {
+    cat.foreign_keys
+        .values()
+        .filter(|f| f.child_table == table.0 || f.parent_table == table.0)
+        .map(|f| {
+            // Report the columns of the actual referenced key (which may be a non-PK
+            // UNIQUE), resolved through the parent's backing index.
+            let parent_columns = cat
+                .constraints
+                .get(&f.parent_table)
+                .and_then(|cs| cs.iter().find(|c| c.index == f.parent_index))
+                .map(|c| c.columns.clone())
+                .unwrap_or_default();
+            ForeignKeyDef {
+                name: f.name.clone(),
+                child_table: TableId(f.child_table),
+                child_columns: f.child_columns.clone(),
+                parent_table: TableId(f.parent_table),
+                parent_columns,
+                on_delete: f.on_delete,
+                on_update: f.on_update,
+            }
+        })
+        .collect()
 }
 
 fn table_not_found(table: TableId) -> Error {
@@ -7688,6 +7785,9 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     fn begin_statement(&self, txn: TxnId) -> Result<()> {
         self.ensure_healthy()?;
         let mut t = self.txns.lock().map_err(|_| poisoned())?;
+        if let Some(state) = t.txns.get_mut(&txn.0) {
+            state.statements += 1;
+        }
         // Refresh the statement snapshot for READ COMMITTED / READ UNCOMMITTED so this statement's
         // reads see a fresh, consistent view. REPEATABLE READ / SERIALIZABLE
         // keep the BEGIN-pinned snapshot. An unknown/ended txn is tolerated (a no-op), matching the
@@ -7775,6 +7875,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 write_bytes: 0,
                 prepared: None,
                 fresh_reads: None,
+                statements: 0,
             },
         );
         Ok(TxnId(id))
@@ -8090,7 +8191,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
         let row_id = row_id_of(tid);
         let tree = ClusteredTree::open(&*self.store, t.root_id());
         let Some((stored, overflow)) = tree.get_stored(row_id)? else {
@@ -8169,6 +8270,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             )));
         }
         let key = (def.schema.clone(), def.name.clone());
+        // A name another transaction is creating, renaming away or dropping is decided by that
+        // transaction's outcome: retry rather than answer "exists" or take it from under a
+        // rollback that would bring the old table back.
+        if self.name_held_by_other(&cat, txn, &def.schema, &def.name)? {
+            self.store.deallocate_page(tree.root())?;
+            return Err(Error::SerializationConflict { txn });
+        }
         if cat.by_name.contains_key(&key) {
             self.store.deallocate_page(tree.root())?;
             return Err(Error::TableExists {
@@ -8205,6 +8313,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if !durable {
             cat.nondurable_tables.insert(id);
         }
+        Self::note_table_change(&cat, txn, id, None)?;
         self.push_undo(txn.0, UndoOp::CreatedTable { table: id })?;
         // Logged under the catalog write guard: DDL log order equals catalog apply order. `log_op`
         // is the single durability gate — it skips the WAL entirely for a non-durable (temp) table,
@@ -8229,12 +8338,24 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         if cat.tables.contains_key(&table.0) {
             self.lock_for_ddl(&cat, txn, table.0)?;
         }
+        if let Some(t) = cat.tables.get(&table.0) {
+            Self::note_table_change(&cat, txn, table.0, Some(&t.schema))?;
+        }
         let state = cat
             .tables
             .remove(&table.0)
             .ok_or_else(|| table_not_found(table))?;
         cat.by_name
             .remove(&(state.schema.schema.clone(), state.schema.name.clone()));
+        // Forget the version marks of tables that are gone for good: ids are never reused, and a
+        // table whose drop may still roll back (this one included) is still recorded as changed
+        // by a running transaction.
+        let changed = Self::tables_with_uncommitted_ddl(&cat)?;
+        let catalog = &mut *cat;
+        let live = &catalog.tables;
+        catalog
+            .version_high_water
+            .retain(|id, _| live.contains_key(id) || changed.contains(id));
         // The table's ANALYZE statistics go with it. Without this a dropped table's stats stay
         // in `cat.stats` under its (never-reused) id forever — and since checkpointing they are
         // baked into every image, so a `TRUNCATE` of an analyzed table (drop + recreate) accretes
@@ -8307,17 +8428,21 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         Ok(names)
     }
 
-    fn list_tables_qualified_as_of(&self, _txn: TxnId) -> Result<Vec<(String, String)>> {
-        // The btree catalog is not versioned (see `list_tables`), so the map already mirrors
-        // `lookup_table`'s visibility. Each table reports its real `(schema, name)`.
-        let cat = self.catalog.read().map_err(|_| poisoned())?;
-        let mut pairs: Vec<(String, String)> = cat
-            .tables
-            .values()
-            .map(|t| (t.schema.schema.clone(), t.schema.name.clone()))
+    fn list_tables_as_of(&self, txn: TxnId) -> Result<Vec<String>> {
+        let mut names: Vec<String> = self
+            .list_tables_qualified_as_of(txn)?
+            .into_iter()
+            .map(|(_, name)| name)
             .collect();
-        pairs.sort();
-        Ok(pairs)
+        names.sort();
+        Ok(names)
+    }
+
+    fn list_tables_qualified_as_of(&self, txn: TxnId) -> Result<Vec<(String, String)>> {
+        // The live map, less what other running transactions created, altered or dropped (see
+        // `uncommitted`). Each table reports its real `(schema, name)`.
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        self.tables_for(&cat, txn)
     }
 
     fn lookup_table_in(&self, schema: &str, name: &str) -> Result<Option<TableSchema>> {
@@ -8330,8 +8455,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
     }
 
     fn lookup_table_as_of(&self, txn: TxnId, name: &str) -> Result<Option<TableSchema>> {
-        let _ = txn;
-        self.lookup_table(name)
+        self.lookup_table_as_of_in(txn, nusadb_core::PUBLIC_SCHEMA, name)
     }
 
     fn lookup_table_as_of_in(
@@ -8340,8 +8464,15 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         schema: &str,
         name: &str,
     ) -> Result<Option<TableSchema>> {
-        let _ = txn;
-        self.lookup_table_in(schema, name)
+        // The catalog maps change in place at DDL time, so a change another transaction has not
+        // committed is masked here with the committed state it replaced (see `uncommitted`).
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        self.resolve_table_for(&cat, txn, schema, name)
+    }
+
+    fn lookup_table_by_id_as_of(&self, txn: TxnId, table: TableId) -> Result<Option<TableSchema>> {
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        self.table_by_id_for(&cat, txn, table.0)
     }
 
     fn alter_table(&self, txn: TxnId, table: TableId, op: &AlterOp) -> Result<()> {
@@ -8363,8 +8494,13 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // Compute + validate the new schema (errors here leave state untouched).
         let mut new_schema = previous.clone();
         apply_alter(&mut new_schema, op)?;
-        // A rename must not collide with another table in the same namespace.
-        if (new_schema.name != previous.name || new_schema.schema != previous.schema)
+        // A rename must not collide with another table in the same namespace, nor take a name
+        // another transaction has not finished with.
+        let renamed = new_schema.name != previous.name || new_schema.schema != previous.schema;
+        if renamed && self.name_held_by_other(&cat, txn, &new_schema.schema, &new_schema.name)? {
+            return Err(Error::SerializationConflict { txn });
+        }
+        if renamed
             && cat
                 .by_name
                 .contains_key(&(new_schema.schema.clone(), new_schema.name.clone()))
@@ -8383,10 +8519,21 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 table.0,
             );
         }
-        // Advance the schema version; the old version stays in the history.
+        // Advance the schema version past any number a rolled-back ALTER already used; the old
+        // version stays in the history.
         let new_version = previous_version
+            .max(cat.version_high_water.get(&table.0).copied().unwrap_or(0))
             .checked_add(1)
             .ok_or_else(|| alter_error("schema version overflow"))?;
+        cat.version_high_water.insert(table.0, new_version);
+        Self::note_table_change(&cat, txn, table.0, Some(&previous))?;
+        // Adding, dropping or retyping a column rewrites every row in the SQL layer.
+        if matches!(
+            op,
+            AlterOp::AddColumn(_) | AlterOp::DropColumn { .. } | AlterOp::AlterColumnType { .. }
+        ) {
+            self.note_layout_change(&cat, txn, table.0)?;
+        }
         if let Some(t) = cat.tables.get_mut(&table.0) {
             t.schema = new_schema.clone();
             t.schema_version = new_version;
@@ -8581,7 +8728,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
         {
             let mut txns = self.txns.lock().map_err(|_| poisoned())?;
             if !txns.txns.contains_key(&txn.0) {
@@ -8666,7 +8813,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
         {
             // A row write holds the shared table intention, so `LOCK TABLE ACCESS EXCLUSIVE`
             // genuinely excludes concurrent writers.
@@ -8719,7 +8866,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
         {
             // A row write holds the shared table intention — and the row's EXCLUSIVE lock, the
             // same lock an explicit `FOR UPDATE` takes. Without it a writer would sail past a
@@ -8816,7 +8963,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
         {
             // A row write holds the shared table intention — and the row's exclusive lock, for
             // the same reason as `update`: a held `FOR UPDATE` lock must make a concurrent
@@ -8893,7 +9040,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
+        self.check_read_snapshot(&cat, txn, table.0)?;
         let (view, serializable, registration) = {
             let txns = self.txns.lock().map_err(|_| poisoned())?;
             let level = txns
@@ -9011,7 +9159,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let t = cat
             .tables
             .get(&table.0)
-            .ok_or_else(|| table_not_found(table))?;
+            .ok_or_else(|| self.missing_table(&cat, txn, table))?;
         // A uniqueness/constraint check must see the LATEST committed state plus this
         // transaction's own writes — never its frozen snapshot: under REPEATABLE READ /
         // SERIALIZABLE a snapshot scan would miss a row a concurrent transaction committed after
@@ -9371,6 +9519,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         let id = cat.next_index_id;
         cat.next_index_id += 1;
         cat.idx_by_name.insert(def.name.clone(), id);
+        Self::note_index_created(&cat, txn, id)?;
+        self.note_layout_change(&cat, txn, def.table.0)?;
         cat.indexes.insert(
             id,
             IndexState {
@@ -9442,6 +9592,11 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .filter(|i| i.def.table == table)
             .map(|i| i.def.clone())
             .collect())
+    }
+
+    fn list_indexes_as_of(&self, txn: TxnId, table: TableId) -> Result<Vec<IndexDef>> {
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        self.indexes_for(&cat, txn, table)
     }
 
     fn index_is_complete(&self, index: IndexId) -> Result<bool> {
@@ -9730,6 +9885,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 table.0
             )));
         }
+        Self::note_constraint_change(&cat, txn, table.0)?;
         cat.constraints
             .entry(table.0)
             .or_default()
@@ -9789,6 +9945,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 "check constraint {name} already exists on this table"
             )));
         }
+        Self::note_constraint_change(&cat, txn, table.0)?;
         cat.checks.entry(table.0).or_default().push(CheckState {
             name: name.to_owned(),
             expr: expr.to_vec(),
@@ -9820,6 +9977,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             if !self.txn_exists(txn.0)? {
                 return Err(unknown_txn(txn));
             }
+            self.claim_for_constraint_drop(&cat, txn, table, name)?;
             let removed_check = cat.checks.get_mut(&table.0).and_then(|list| {
                 list.iter()
                     .position(|c| c.name == name)
@@ -9916,52 +10074,12 @@ impl nusadb_core::StorageEngine for BtreeEngine {
 
     fn list_constraints(&self, table: TableId) -> Result<Vec<Constraint>> {
         let cat = self.catalog.read().map_err(|_| poisoned())?;
-        let mut out: Vec<Constraint> = cat.constraints.get(&table.0).map_or_else(Vec::new, |cs| {
-            cs.iter()
-                .map(|c| Constraint {
-                    name: c.name.clone(),
-                    table,
-                    columns: c.columns.clone(),
-                    kind: if c.primary {
-                        ConstraintKind::PrimaryKey
-                    } else {
-                        ConstraintKind::Unique
-                    },
-                    index: Some(IndexId(c.index)),
-                    expr: None,
-                    nulls_not_distinct: c.nulls_not_distinct,
-                })
-                .collect()
-        });
-        for fk in cat
-            .foreign_keys
-            .values()
-            .filter(|f| f.child_table == table.0)
-        {
-            out.push(Constraint {
-                name: fk.name.clone(),
-                table,
-                columns: fk.child_columns.clone(),
-                kind: ConstraintKind::ForeignKey,
-                index: Some(IndexId(fk.child_index)),
-                expr: None,
-                nulls_not_distinct: false,
-            });
-        }
-        if let Some(cs) = cat.checks.get(&table.0) {
-            for c in cs {
-                out.push(Constraint {
-                    name: c.name.clone(),
-                    table,
-                    columns: Vec::new(),
-                    kind: ConstraintKind::Check,
-                    index: None,
-                    expr: Some(c.expr.clone()),
-                    nulls_not_distinct: false,
-                });
-            }
-        }
-        Ok(out)
+        Ok(constraints_of(&cat, table))
+    }
+
+    fn list_constraints_as_of(&self, txn: TxnId, table: TableId) -> Result<Vec<Constraint>> {
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        self.constraints_for(&cat, txn, table)
     }
 
     fn has_unique_constraint(&self, table: TableId) -> Result<bool> {
@@ -9974,32 +10092,18 @@ impl nusadb_core::StorageEngine for BtreeEngine {
 
     fn list_foreign_keys(&self, table: TableId) -> Result<Vec<ForeignKeyDef>> {
         let cat = self.catalog.read().map_err(|_| poisoned())?;
-        Ok(cat
-            .foreign_keys
-            .values()
-            .filter(|f| f.child_table == table.0 || f.parent_table == table.0)
-            .map(|f| {
-                // Report the columns of the actual referenced key (which may be a non-PK
-                // UNIQUE), resolved through the parent's backing index.
-                let parent_columns = cat
-                    .constraints
-                    .get(&f.parent_table)
-                    .and_then(|cs| cs.iter().find(|c| c.index == f.parent_index))
-                    .map(|c| c.columns.clone())
-                    .unwrap_or_default();
-                ForeignKeyDef {
-                    name: f.name.clone(),
-                    child_table: TableId(f.child_table),
-                    child_columns: f.child_columns.clone(),
-                    parent_table: TableId(f.parent_table),
-                    parent_columns,
-                    on_delete: f.on_delete,
-                    on_update: f.on_update,
-                }
-            })
-            .collect())
+        Ok(foreign_keys_of(&cat, table))
     }
 
+    fn list_foreign_keys_as_of(&self, txn: TxnId, table: TableId) -> Result<Vec<ForeignKeyDef>> {
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        self.foreign_keys_for(&cat, txn, table)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one validate, build and record sequence under a single catalog guard per step"
+    )]
     fn add_foreign_key(&self, txn: TxnId, def: &ForeignKeyDef) -> Result<IndexId> {
         self.ensure_healthy()?;
         // Validate under a brief read guard before creating the backing index.
@@ -10074,6 +10178,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             },
         )?;
         let mut cat = self.catalog.write().map_err(|_| poisoned())?;
+        Self::note_foreign_key_added(&cat, txn, def)?;
         cat.foreign_keys.insert(
             def.name.clone(),
             FkState {
@@ -10280,10 +10385,15 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // Fast path: an initialized counter is a single atomic load under the shared catalog guard.
         let cached = {
             let cat = self.catalog.read().map_err(|_| poisoned())?;
-            cat.tables
-                .get(&table.0)
-                .ok_or_else(|| table_not_found(table))?
-                .approx_rows_raw()
+            let Some(t) = cat.tables.get(&table.0) else {
+                // A table another transaction is dropping still resolves for everyone else, so
+                // their planners ask for its size; any read of it is refused when it runs.
+                if self.dropped_by_running(&cat, table)? {
+                    return Ok(0);
+                }
+                return Err(table_not_found(table));
+            };
+            t.approx_rows_raw()
         };
         if cached != TableState::APPROX_UNINIT {
             return Ok(cached);
@@ -10341,6 +10451,7 @@ impl BtreeEngine {
             .get(&index.0)
             .ok_or_else(|| index_not_found(index))?;
         let table_id = idx.def.table.0;
+        self.check_read_snapshot(&cat, txn, table_id)?;
         let t = cat
             .tables
             .get(&table_id)
@@ -10977,6 +11088,7 @@ impl BtreeEngine {
                 UndoOp::CreatedIndex { index } => {
                     let cat = cat.get_mut()?;
                     if let Some(state) = cat.indexes.remove(&index) {
+                        Self::forget_layout_change(cat, txn, state.def.table.0)?;
                         cat.idx_by_name.remove(&state.def.name);
                         // Its trees go the way an aborted CREATE TABLE's does: queued, freed by
                         // purge once the transaction settles.
@@ -11085,6 +11197,7 @@ impl BtreeEngine {
                     new_version,
                 } => {
                     let cat = cat.get_mut()?;
+                    Self::forget_layout_change(cat, txn, table)?;
                     if let Some(t) = cat.tables.get_mut(&table) {
                         let current_name = t.schema.name.clone();
                         let current_schema = t.schema.schema.clone();

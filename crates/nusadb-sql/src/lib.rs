@@ -60,13 +60,14 @@ pub use batch::{
 };
 pub use error::{Error, INTERNAL_ERROR};
 pub use executor::{
-    ColumnShape, CursorStore, ExecutionResult, PreparedStore, Row, RowSink, RowsCommand, Session,
-    SpillConfig, StreamOutcome, auto_analyze_stale_tables, canonicalize_client_min_messages,
-    canonicalize_timezone_setting, catalog_approx_row_count, catalog_approx_row_count_in,
-    catalog_list_indexes, catalog_list_indexes_in, catalog_table_stats, catalog_table_stats_in,
-    check_settable_parameter, copy_column_count_in, copy_from, copy_from_bytes_in, copy_from_in,
-    copy_to, copy_to_bytes_in, copy_to_bytes_with_columns_in, copy_to_in, describe_column_types,
-    describe_columns, describe_prepared_execute, execute, execute_in_txn, execute_in_txn_as,
+    AmbiguousDefault, ColumnShape, CursorStore, DefaultRepair, ExecutionResult, PreparedStore, Row,
+    RowSink, RowsCommand, Session, SpillConfig, StreamOutcome, auto_analyze_stale_tables,
+    canonicalize_client_min_messages, canonicalize_timezone_setting, catalog_approx_row_count,
+    catalog_approx_row_count_in, catalog_list_indexes, catalog_list_indexes_in,
+    catalog_table_stats, catalog_table_stats_in, check_settable_parameter, copy_column_count_in,
+    copy_from, copy_from_bytes_in, copy_from_in, copy_to, copy_to_bytes_in,
+    copy_to_bytes_with_columns_in, copy_to_in, describe_column_types, describe_columns,
+    describe_prepared_execute, execute, execute_in_txn, execute_in_txn_as,
     execute_in_txn_as_streaming, execute_in_txn_as_streaming_with_cursors,
     execute_in_txn_as_streaming_with_prepared, execute_in_txn_as_streaming_with_settings,
     execute_in_txn_as_with_settings, inheritance_any, inheritance_descendants,
@@ -75,9 +76,9 @@ pub use executor::{
     lookup_policies_for, lookup_view_check_option, lookup_view_columns, lookup_view_definition,
     maintenance_work_mem, parse_work_mem, partition_key_columns, partitions_to_prune,
     pin_statement_timezone, pin_transaction_start, purge_schema_catalogs, release_advisory_locks,
-    rls_table_enabled, set_maintenance_work_mem, set_spill_config, set_spill_encryption,
-    set_work_mem, show_session_variable, stamp_transaction_start, statement_tz_offset_secs,
-    view_has_instead_of_trigger, wall_clock_micros, work_mem,
+    repair_misfiled_column_defaults, rls_table_enabled, set_maintenance_work_mem, set_spill_config,
+    set_spill_encryption, set_work_mem, show_session_variable, stamp_transaction_start,
+    statement_tz_offset_secs, view_has_instead_of_trigger, wall_clock_micros, work_mem,
 };
 
 /// The bootstrap database superuser, which bypasses row-level security.
@@ -91,8 +92,8 @@ pub const BOOTSTRAP_SUPERUSER: &str = "nusadb-root";
 /// Read by the session so `CURRENT_DATABASE()` reflects which physical database the connection is in.
 /// A client cannot make `current_database()` lie: the wire re-stamps this key with the real
 /// connection database into a fresh per-statement snapshot *after* cloning the GUC store, so any
-/// value a `SET` might have placed there is overwritten before the session reads it. The leading NUL
-/// also keeps the key out of normal identifier space.
+/// value a `SET` might have placed there is overwritten before the session reads it. Like every
+/// [reserved setting](is_reserved_setting), a client can neither `SET` nor read it.
 pub const CONNECTION_DATABASE_SETTING: &str = "\u{0}conn_database";
 
 /// The reserved settings-snapshot key the wire stamps with the connection's temporary schema name
@@ -102,8 +103,8 @@ pub const CONNECTION_DATABASE_SETTING: &str = "\u{0}conn_database";
 /// there before the `search_path`. The wire stamps this key into the connection's GUC store so both
 /// analysis (via [`Catalog::temp_schema`], read from the catalog's
 /// settings) and execution (via the pinned session context) agree on which temp schema this
-/// connection owns. The leading NUL keeps the key out of normal identifier space, so a client `SET`
-/// can never forge or read it.
+/// connection owns. Like every [reserved setting](is_reserved_setting), a client can neither `SET`
+/// nor read it.
 pub const CONNECTION_TEMP_SCHEMA_SETTING: &str = "\u{0}conn_temp_schema";
 
 /// The reserved settings-snapshot key carrying the start of the connection's open transaction
@@ -111,9 +112,21 @@ pub const CONNECTION_TEMP_SCHEMA_SETTING: &str = "\u{0}conn_temp_schema";
 ///
 /// `NOW()`, `CURRENT_TIMESTAMP` and the other transaction-time functions report this instant in
 /// every statement of the block. The value names the transaction it belongs to, and a statement
-/// running under any other transaction ignores it. The leading NUL keeps the key out of reach of a
-/// client `SET`.
+/// running under any other transaction ignores it. Like every [reserved
+/// setting](is_reserved_setting), a client can neither `SET` nor read it.
 pub const TRANSACTION_START_SETTING: &str = "\u{0}txn_start";
+
+/// Whether `name` is a reserved settings key: one the server keeps for its own connection state,
+/// marked by a leading NUL.
+///
+/// A leading NUL keeps these keys out of ordinary identifier space, but a quoted identifier can
+/// still carry one (`SHOW "<NUL>txn_start"`), so the name alone protects nothing. Every client
+/// path checks this instead: `SET` refuses such a name, and `SHOW` and `current_setting` treat it
+/// as an unknown parameter, so a client can neither forge nor read the connection's state.
+#[must_use]
+pub fn is_reserved_setting(name: &str) -> bool {
+    name.starts_with('\u{0}')
+}
 
 /// The ordered list of schemas an unqualified name resolves through, derived from a `search_path`
 /// GUC value — the heart of search-path name resolution.

@@ -244,7 +244,7 @@ pub(super) fn drop_column_dependents(
     txn: TxnId,
 ) -> Result<(), Error> {
     let column = column_name(table, index)?;
-    let fks = engine.list_foreign_keys(table.id)?;
+    let fks = engine.list_foreign_keys_as_of(txn, table.id)?;
     // A key on this table whose own columns include this one goes with it below. Any other key
     // referencing the column, from another table or this one, is a dependent from outside.
     let own_fk =
@@ -299,7 +299,7 @@ pub(super) fn drop_column_dependents(
     }
     // Secondary indexes before constraints: the set of backing indexes is read while every
     // remaining constraint still has its own.
-    let constraints = engine.list_constraints(table.id)?;
+    let constraints = engine.list_constraints_as_of(txn, table.id)?;
     let backing = backing_indexes(&constraints);
     for def in engine.list_indexes(table.id)? {
         if let Some(id) = engine.lookup_index(&def.name)?
@@ -359,7 +359,7 @@ pub(super) fn detach_for_rename(
     txn: TxnId,
 ) -> Result<Detached, Error> {
     let mut detached = Detached::default();
-    for fk in engine.list_foreign_keys(table.id)? {
+    for fk in engine.list_foreign_keys_as_of(txn, table.id)? {
         let child_side = fk.child_table == table.id && fk.child_columns.iter().any(|c| c == column);
         let parent_side =
             fk.parent_table == table.id && fk.parent_columns.iter().any(|c| c == column);
@@ -368,7 +368,7 @@ pub(super) fn detach_for_rename(
             detached.fks.push(fk);
         }
     }
-    let constraints = engine.list_constraints(table.id)?;
+    let constraints = engine.list_constraints_as_of(txn, table.id)?;
     for c in &constraints {
         if matches!(c.kind, ConstraintKind::Check)
             && !c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
@@ -483,7 +483,7 @@ pub(super) fn reattach_after_rename(
         let child = if fk.child_table == table.id {
             Some(renamed.clone())
         } else {
-            dml::schema_by_id(engine, fk.child_table)?
+            dml::schema_by_id(engine, txn, fk.child_table)?
         };
         if let Some(child) = child {
             backfill_named_index(&child, &fk.name, engine, txn)?;
