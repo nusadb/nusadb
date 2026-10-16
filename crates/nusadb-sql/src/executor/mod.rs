@@ -127,6 +127,7 @@ pub mod agg;
 pub(crate) mod coldefault;
 pub use coldefault::{AmbiguousDefault, DefaultRepair, repair_misfiled_column_defaults};
 mod column_deps;
+mod comment;
 mod dcl;
 mod ddl;
 mod dml;
@@ -3122,9 +3123,7 @@ fn dispatch(
         PhysicalPlan::CreateIndex(p) => run_create_index(&p, engine, txn),
         PhysicalPlan::DropIndex(p) => run_drop_index(&p, engine, txn),
         PhysicalPlan::SetOperation(p) => run_set_operation(&p, engine, txn),
-        // The analyzer already resolved the target's existence. Persisting the comment in catalog
-        // metadata is optional treaty work, so accept it as a metadata no-op for now.
-        PhysicalPlan::Comment(_) => Ok(ExecutionResult::Commented),
+        PhysicalPlan::Comment(p) => comment::run_comment(&p, engine, txn),
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
@@ -3699,13 +3698,7 @@ fn format_plan(
             crate::ast::CloseTarget::All => vec![format!("{indent}Close: ALL")],
             crate::ast::CloseTarget::Name(name) => vec![format!("{indent}Close: {name}")],
         },
-        PhysicalPlan::Comment(p) => {
-            let target = p
-                .column
-                .as_ref()
-                .map_or_else(|| p.table.clone(), |c| format!("{}.{c}", p.table));
-            vec![format!("{indent}Comment: {target}")]
-        },
+        PhysicalPlan::Comment(p) => vec![format!("{indent}Comment: {}", p.target.describe())],
         PhysicalPlan::CreateSchema(p) => vec![format!("{indent}CreateSchema: {}", p.name)],
         PhysicalPlan::DropSchema(p) => vec![format!("{indent}DropSchema: {}", p.name)],
         PhysicalPlan::CreateDatabase(p) => vec![format!("{indent}CreateDatabase: {}", p.name)],
@@ -4744,7 +4737,8 @@ pub fn purge_schema_catalogs(
             engine.delete(txn, cat.id, tid)?;
         }
     }
-    Ok(())
+    // The schema's own comment, and those on the tables it held.
+    comment::forget_schema(engine, txn, schema)
 }
 
 /// Engine-scoped system catalog of tables with row-level security enabled. Two text columns
@@ -6090,6 +6084,8 @@ fn run_drop_view(
         engine.drop_table(txn, schema.id)?;
         delete_view_def(engine, txn, MATVIEW_CATALOG, &p.name)?;
         ivm::unregister_ivm_view(engine, txn, &p.name)?;
+        comment::forget(engine, txn, &comment::matview_key(&p.name))?;
+        comment::forget_table(engine, txn, &schema.schema, &schema.name)?;
         return Ok(ExecutionResult::MaterializedViewDropped);
     }
     // No backing table — it may be a non-materialized view (catalog entry only).
@@ -6098,6 +6094,7 @@ fn run_drop_view(
     delete_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name)?;
     // Forget any `WITH CHECK OPTION` flag (no-op if the view had none).
     delete_view_def(engine, txn, VIEW_CHECK_CATALOG, &p.name)?;
+    comment::forget(engine, txn, &comment::view_key(&p.name))?;
     if !removed && !p.if_exists {
         return Err(Error::TableNotFound {
             name: p.name.clone(),
@@ -6177,6 +6174,7 @@ fn run_drop_type(
     }
     let removed = delete_view_def(engine, txn, ENUM_CATALOG, &p.name)?
         | delete_view_def(engine, txn, COMPOSITE_CATALOG, &p.name)?;
+    comment::forget(engine, txn, &comment::type_key(&p.name))?;
     if !removed && !p.if_exists {
         return Err(Error::ObjectNotFound(format!(
             "type {:?} does not exist",
@@ -6707,6 +6705,7 @@ fn run_drop_domain(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let removed = delete_view_def(engine, txn, DOMAIN_CATALOG, &p.name)?;
+    comment::forget(engine, txn, &comment::domain_key(&p.name))?;
     if !removed && !p.if_exists {
         return Err(Error::ObjectNotFound(format!(
             "domain {:?} does not exist",

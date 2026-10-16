@@ -345,6 +345,7 @@ pub(super) fn drop_owned_sequence(
     if let Some(id) = engine.lookup_sequence(seq)? {
         engine.drop_sequence(txn, id)?;
         super::seqcatalog::remove(engine, txn, seq)?;
+        super::comment::forget(engine, txn, &super::comment::sequence_key(seq))?;
     }
     Ok(())
 }

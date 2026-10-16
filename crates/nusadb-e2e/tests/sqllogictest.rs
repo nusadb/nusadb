@@ -677,6 +677,11 @@ fn slt_p1_information_schema_extra() {
 }
 
 #[test]
+fn slt_p1_comment_on() {
+    run_slt("tests/slt/p1_ddl/comment_on.slt");
+}
+
+#[test]
 fn slt_p1_information_schema() {
     run_slt("tests/slt/p1_ddl/information_schema.slt");
 }

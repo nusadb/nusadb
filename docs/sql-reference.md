@@ -879,10 +879,70 @@ accepted yet. A domain's `CHECK` follows the same [volatility](#volatility) rule
 ```sql
 COMMENT ON TABLE orders IS 'One row per checkout';
 COMMENT ON COLUMN orders.total IS 'Gross, including tax';
+COMMENT ON COLUMN sales.orders.total IS 'Schema-qualified';
+COMMENT ON CONSTRAINT orders_total_check ON orders IS 'No negative totals';
+COMMENT ON INDEX orders_placed_idx IS 'Serves the daily report';
+COMMENT ON TRIGGER orders_audit ON orders IS 'Writes the audit log';
+COMMENT ON FUNCTION net_total(numeric) IS 'Total without tax';
+COMMENT ON PROCEDURE close_day IS 'Run at midnight';
+COMMENT ON VIEW sales.big_orders IS 'Orders over 1000';
+COMMENT ON MATERIALIZED VIEW daily_totals IS 'Refreshed hourly';
+COMMENT ON SCHEMA sales IS 'Order data';
+COMMENT ON SEQUENCE sales.invoice_no IS 'Invoice numbers';
+COMMENT ON TYPE order_state IS 'Lifecycle of an order';
+COMMENT ON DOMAIN positive_amount IS 'Amounts above zero';
 COMMENT ON TABLE orders IS NULL;        -- remove
 ```
 
-Only table and column targets are accepted.
+Names resolve the way the object's own statements resolve them: a table (and the table of a
+column, constraint or trigger) through the search path or an explicit schema, a view or sequence
+in the current schema unless qualified, and functions, procedures, materialized views, types and
+domains in `public`. An object that does not exist is refused with the SQLSTATE its `DROP` would
+report: `42P01` for a table or view, `42703` for a column, `42704` for a constraint, index,
+trigger, sequence, type or domain, `42883` for a function or procedure and `3F000` for a schema.
+`IS NULL` or `IS ''` removes a comment, and setting one again replaces it. A materialized view
+has one comment: `COMMENT ON TABLE` and `COMMENT ON MATERIALIZED VIEW` write the same one.
+
+Commenting on an object needs its owner or a superuser. Tables (and their columns, constraints,
+indexes and triggers), materialized views and schemas record an owner, and commenting on them
+follows the same rule as dropping them. Plain views and sequences read as owned by the bootstrap
+superuser, and functions, procedures, types and domains record no owner, so only a superuser
+comments on those, even where another role may drop them. Nobody
+comments on another session's temporary objects.
+
+Function and procedure names are unique, so the name alone identifies one. An argument list, when
+given, must have as many entries as the routine has parameters (a procedure may be named by its
+`IN` parameters or by all of them); otherwise the statement names a routine that does not exist
+and fails with `42883`. Parameter types are not recorded, so only the count is compared.
+`COMMENT ON TYPE` also accepts a domain; the comment is the domain's under either statement.
+
+A comment is part of the object. Renaming a table, a column or a trigger keeps it; dropping the
+object removes it, including drops that happen by cascade (a dropped column takes the comments of
+the indexes and constraints on it, `DROP TABLE` those of its columns, constraints, indexes and
+triggers, `DROP SCHEMA ... CASCADE` those of its tables and the schema's own). Comments are
+transactional: one written in an open transaction is invisible to other sessions until it
+commits, and a rollback discards it. They are stored durably and survive a restart. Two
+transactions writing the comment of one object, or one commenting on an object while another
+drops or alters it, conflict: the second fails with `40001` and can retry.
+
+Comments are read back from `information_schema.nusadb_comments`, one row per comment. A comment on
+another session's temporary object is never listed, and a comment on a table, or on anything that
+belongs to one, is listed only to a session that owns the table, holds a privilege on it, or is a
+superuser:
+
+| Column | Meaning |
+|---|---|
+| `object_type` | `TABLE`, `COLUMN`, `CONSTRAINT`, `INDEX`, `TRIGGER`, `FUNCTION`, `PROCEDURE`, `VIEW`, `MATERIALIZED VIEW`, `SCHEMA`, `SEQUENCE`, `TYPE` or `DOMAIN` |
+| `object_schema` | the schema the object lives in (`public` for functions, procedures, materialized views, types and domains) |
+| `table_name` | the table a column, constraint, index or trigger belongs to (the table itself for a table comment), otherwise `NULL` |
+| `object_name` | the object's own name (the column's name for a column comment) |
+| `description` | the comment text |
+
+```sql
+SELECT object_name, description
+FROM   information_schema.nusadb_comments
+WHERE  object_type = 'CONSTRAINT' AND table_name = 'orders';
+```
 
 ---
 
@@ -1750,6 +1810,7 @@ FROM   information_schema.sequences;
 SELECT udt_name, attribute_name, ordinal_position, data_type
 FROM   information_schema.attributes;                 -- fields of composite types
 SELECT * FROM information_schema.user_defined_types;  -- composite types
+SELECT * FROM information_schema.nusadb_comments;     -- COMMENT ON comments
 
 SELECT * FROM nusadb_databases;       -- every database in this server
 SELECT * FROM nusadb_prepared_xacts;  -- prepared transactions (transaction, gid, prepared, owner, database)

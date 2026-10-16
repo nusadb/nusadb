@@ -4291,10 +4291,12 @@ fn recognize_comment(sql: &str) -> Option<Result<ast::Statement, Error>> {
     None
 }
 
-/// Parse `COMMENT ON {TABLE | COLUMN} <object> IS {'text' | NULL}`.
+/// Parse `COMMENT ON <object> IS {'text' | NULL}`, where `<object>` is one of `TABLE`,
+/// `COLUMN`, `CONSTRAINT ... ON`, `TRIGGER ... ON`, `INDEX`, `FUNCTION`, `PROCEDURE`, `VIEW`,
+/// `MATERIALIZED VIEW`, `SCHEMA`, `SEQUENCE`, `TYPE` or `DOMAIN`.
 ///
 /// `sqlparser` 0.51 tokenizes the `COMMENT` keyword but does not model the statement-level
-/// grammar, so we drive a `sqlparser` [`Parser`] manually — reusing its tokenizer and
+/// grammar, so we drive a `sqlparser` [`Parser`] manually, reusing its tokenizer and
 /// object-name handling (quoted identifiers, schema qualification) rather than splitting strings.
 fn parse_comment_on(sql: &str) -> Result<ast::Statement, Error> {
     use sqlparser::keywords::Keyword;
@@ -4308,17 +4310,7 @@ fn parse_comment_on(sql: &str) -> Result<ast::Statement, Error> {
     parser.expect_keyword(Keyword::COMMENT).map_err(syntax)?;
     parser.expect_keyword(Keyword::ON).map_err(syntax)?;
 
-    let target = if parser.parse_keyword(Keyword::TABLE) {
-        let name = parser.parse_object_name(false).map_err(syntax)?;
-        let (schema, table) = table_ref_name(&name)?;
-        ast::CommentTarget::Table { schema, table }
-    } else if parser.parse_keyword(Keyword::COLUMN) {
-        let name = parser.parse_object_name(false).map_err(syntax)?;
-        let (table, column) = table_and_column(&name)?;
-        ast::CommentTarget::Column { table, column }
-    } else {
-        return unsupported("COMMENT ON only supports TABLE and COLUMN targets");
-    };
+    let target = parse_comment_target(&mut parser)?;
 
     parser.expect_keyword(Keyword::IS).map_err(syntax)?;
     let comment = if parser.parse_keyword(Keyword::NULL) {
@@ -4346,6 +4338,137 @@ fn parse_comment_on(sql: &str) -> Result<ast::Statement, Error> {
         target,
         comment,
     }))
+}
+
+/// The object of a `COMMENT ON` statement, up to (not including) its `IS`.
+fn parse_comment_target(parser: &mut Parser<'_>) -> Result<ast::CommentTarget, Error> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::parser::ParserError;
+
+    let syntax = |e: ParserError| Error::Syntax(e.to_string());
+    // `name ON [schema.]table`, shared by CONSTRAINT and TRIGGER.
+    let named_on_table =
+        |parser: &mut Parser<'_>| -> Result<(String, Option<String>, String), Error> {
+            let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+            parser.expect_keyword(Keyword::ON).map_err(syntax)?;
+            let (schema, table) =
+                table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+            Ok((name, schema, table))
+        };
+    let target = if parser.parse_keyword(Keyword::TABLE) {
+        let (schema, table) = table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::Table { schema, table }
+    } else if parser.parse_keyword(Keyword::COLUMN) {
+        let name = parser.parse_object_name(false).map_err(syntax)?;
+        let (schema, table, column) = table_and_column(&name)?;
+        ast::CommentTarget::Column {
+            schema,
+            table,
+            column,
+        }
+    } else if parser.parse_keyword(Keyword::CONSTRAINT) {
+        let (name, schema, table) = named_on_table(parser)?;
+        ast::CommentTarget::Constraint {
+            name,
+            schema,
+            table,
+        }
+    } else if parser.parse_keyword(Keyword::TRIGGER) {
+        let (name, schema, table) = named_on_table(parser)?;
+        ast::CommentTarget::Trigger {
+            name,
+            schema,
+            table,
+        }
+    } else if parser.parse_keyword(Keyword::INDEX) {
+        let (schema, name) = table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::Index { schema, name }
+    } else if parser.parse_keyword(Keyword::FUNCTION) {
+        let name = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        let args = parse_comment_arg_types(parser)?;
+        ast::CommentTarget::Function { name, args }
+    } else if parser.parse_keyword(Keyword::PROCEDURE) {
+        let name = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        let args = parse_comment_arg_types(parser)?;
+        ast::CommentTarget::Procedure { name, args }
+    } else if parser.parse_keywords(&[Keyword::MATERIALIZED, Keyword::VIEW]) {
+        let name = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::MaterializedView { name }
+    } else if parser.parse_keyword(Keyword::VIEW) {
+        let (schema, name) = table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::View { schema, name }
+    } else if parser.parse_keyword(Keyword::SCHEMA) {
+        let name = fold_ident(&parser.parse_identifier().map_err(syntax)?);
+        ast::CommentTarget::Schema { name }
+    } else if parser.parse_keyword(Keyword::SEQUENCE) {
+        let (schema, name) = table_ref_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::Sequence { schema, name }
+    } else if parser.parse_keyword(Keyword::TYPE) {
+        let name = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::Type { name }
+    } else if parser.parse_keyword(Keyword::DOMAIN) {
+        let name = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+        ast::CommentTarget::Domain { name }
+    } else {
+        return unsupported(
+            "COMMENT ON supports TABLE, COLUMN, CONSTRAINT, INDEX, TRIGGER, FUNCTION, PROCEDURE, \
+             VIEW, MATERIALIZED VIEW, SCHEMA, SEQUENCE, TYPE and DOMAIN targets",
+        );
+    };
+    Ok(target)
+}
+
+/// The optional `(argtypes)` list after a routine name in `COMMENT ON FUNCTION` /
+/// `COMMENT ON PROCEDURE`: `None` when absent, otherwise one entry per argument with its tokens
+/// joined by a space (`numeric(10, 2)` stays one argument). The entries are kept as written, for
+/// the arity check and the error message.
+fn parse_comment_arg_types(parser: &mut Parser<'_>) -> Result<Option<Vec<String>>, Error> {
+    use sqlparser::tokenizer::Token;
+
+    if !parser.consume_token(&Token::LParen) {
+        return Ok(None);
+    }
+    let mut args = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    loop {
+        let token = parser.next_token().token;
+        match token {
+            Token::RParen if depth == 0 => break,
+            Token::Comma if depth == 0 => {
+                if current.is_empty() {
+                    return Err(Error::Syntax(
+                        "empty argument type in a routine signature".to_owned(),
+                    ));
+                }
+                args.push(current.join(" "));
+                current.clear();
+            },
+            Token::EOF => {
+                return Err(Error::Syntax(
+                    "unterminated argument list in a routine signature".to_owned(),
+                ));
+            },
+            Token::LParen => {
+                depth += 1;
+                current.push(token.to_string());
+            },
+            Token::RParen => {
+                depth -= 1;
+                current.push(token.to_string());
+            },
+            Token::Whitespace(_) => {},
+            other => current.push(other.to_string().to_lowercase()),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current.join(" "));
+    } else if !args.is_empty() {
+        return Err(Error::Syntax(
+            "empty argument type in a routine signature".to_owned(),
+        ));
+    }
+    Ok(Some(args))
 }
 
 /// Recognize a leading `COPY` so we can hand-parse it (see [`parse_copy_stmt`]).
@@ -4648,20 +4771,21 @@ fn copy_optional_bool(parser: &mut Parser) -> bool {
     true
 }
 
-/// Split a `COMMENT ON COLUMN` object name into `(table, column)`. The column must be spelled
-/// `table.column`; a bare `column` has no table to resolve against.
-fn table_and_column(name: &sql::ObjectName) -> Result<(String, String), Error> {
+/// Split a `COMMENT ON COLUMN` object name into `(schema, table, column)`. The column must be
+/// spelled `table.column` or `schema.table.column`; a bare `column` has no table to resolve
+/// against.
+fn table_and_column(name: &sql::ObjectName) -> Result<(Option<String>, String, String), Error> {
     match name.0.as_slice() {
-        [table, column] => Ok((fold_part(table)?, fold_part(column)?)),
-        // `schema.table.column` has exactly one reading and is a legitimate thing to write — it is
-        // simply not plumbed through here yet, while `COMMENT ON TABLE` does resolve a qualifier.
-        // Saying so beats the old message, which told a user whose name *was* table-qualified that
-        // it was not.
-        [_, _, _] => unsupported(
-            "a schema qualifier on COMMENT ON COLUMN (name the column as `table.column`; \
-             COMMENT ON TABLE does take a schema)",
+        [table, column] => Ok((None, fold_part(table)?, fold_part(column)?)),
+        [schema, table, column] => Ok((
+            Some(fold_part(schema)?),
+            fold_part(table)?,
+            fold_part(column)?,
+        )),
+        _ => unsupported(
+            "COMMENT ON COLUMN requires a table-qualified column name (table.column or \
+             schema.table.column)",
         ),
-        _ => unsupported("COMMENT ON COLUMN requires a table-qualified column name (table.column)"),
     }
 }
 

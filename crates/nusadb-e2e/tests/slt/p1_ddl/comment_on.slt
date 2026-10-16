@@ -1,0 +1,304 @@
+# COMMENT ON for every supported object kind, read back through
+# information_schema.nusadb_comments. Covers IS NULL, missing objects, routine signatures,
+# renames that keep a comment, drops that remove it, and schema-qualified names.
+
+statement ok
+CREATE SCHEMA app
+
+statement ok
+CREATE TABLE app.orders (id INT, qty INT, CONSTRAINT orders_pk PRIMARY KEY (id), CONSTRAINT qty_pos CHECK (qty > 0))
+
+statement ok
+CREATE INDEX orders_qty_idx ON app.orders (qty)
+
+statement ok
+CREATE TABLE log (what TEXT)
+
+# CREATE / ALTER / DROP TRIGGER take an unqualified table, resolved through the search path.
+statement ok
+SET search_path = app, public
+
+statement ok
+CREATE TRIGGER orders_audit AFTER INSERT ON orders FOR EACH ROW INSERT INTO public.log (what) VALUES ('ins')
+
+statement ok
+SET search_path = public
+
+statement ok
+CREATE FUNCTION add_one(x INT) RETURNS INT AS 'SELECT x + 1' LANGUAGE SQL
+
+statement ok
+CREATE PROCEDURE touch() AS $$ INSERT INTO log VALUES ('touch') $$
+
+statement ok
+CREATE VIEW app.big_orders AS SELECT id FROM app.orders WHERE qty > 10
+
+statement ok
+CREATE MATERIALIZED VIEW qty_total AS SELECT SUM(qty) AS total FROM app.orders
+
+statement ok
+CREATE SEQUENCE app.order_seq
+
+statement ok
+CREATE TYPE mood AS ENUM ('ok', 'sad')
+
+statement ok
+CREATE DOMAIN positive AS INT CHECK (VALUE > 0)
+
+statement ok
+COMMENT ON TABLE app.orders IS 'customer orders'
+
+statement ok
+COMMENT ON COLUMN app.orders.qty IS 'units ordered'
+
+statement ok
+COMMENT ON CONSTRAINT qty_pos ON app.orders IS 'no empty orders'
+
+statement ok
+COMMENT ON CONSTRAINT orders_pk ON app.orders IS 'order key'
+
+statement ok
+COMMENT ON INDEX app.orders_qty_idx IS 'by quantity'
+
+statement ok
+COMMENT ON TRIGGER orders_audit ON app.orders IS 'audit trail'
+
+statement ok
+COMMENT ON FUNCTION add_one(INT) IS 'increments'
+
+statement ok
+COMMENT ON PROCEDURE touch() IS 'writes a log line'
+
+statement ok
+COMMENT ON VIEW app.big_orders IS 'large orders'
+
+statement ok
+COMMENT ON MATERIALIZED VIEW qty_total IS 'total quantity'
+
+statement ok
+COMMENT ON SCHEMA app IS 'application schema'
+
+statement ok
+COMMENT ON SEQUENCE app.order_seq IS 'order numbers'
+
+statement ok
+COMMENT ON TYPE mood IS 'how it went'
+
+statement ok
+COMMENT ON DOMAIN positive IS 'strictly positive'
+
+query TTTTT rowsort
+SELECT object_type, object_schema, table_name, object_name, description FROM information_schema.nusadb_comments
+----
+COLUMN app orders qty units ordered
+CONSTRAINT app orders orders_pk order key
+CONSTRAINT app orders qty_pos no empty orders
+DOMAIN public NULL positive strictly positive
+FUNCTION public NULL add_one increments
+INDEX app orders orders_qty_idx by quantity
+MATERIALIZED VIEW public NULL qty_total total quantity
+PROCEDURE public NULL touch writes a log line
+SCHEMA app NULL app application schema
+SEQUENCE app NULL order_seq order numbers
+TABLE app orders orders customer orders
+TRIGGER app orders orders_audit audit trail
+TYPE public NULL mood how it went
+VIEW app NULL big_orders large orders
+
+# A second comment replaces the first; IS NULL removes it.
+statement ok
+COMMENT ON CONSTRAINT qty_pos ON app.orders IS 'quantity must be positive'
+
+statement ok
+COMMENT ON FUNCTION add_one IS NULL
+
+query TT rowsort
+SELECT object_type, description FROM information_schema.nusadb_comments WHERE object_type IN ('CONSTRAINT', 'FUNCTION')
+----
+CONSTRAINT order key
+CONSTRAINT quantity must be positive
+
+# An empty comment removes it too.
+statement ok
+COMMENT ON TYPE mood IS ''
+
+query I
+SELECT COUNT(*) FROM information_schema.nusadb_comments WHERE object_type = 'TYPE'
+----
+0
+
+statement ok
+COMMENT ON TYPE mood IS 'how it went'
+
+# A materialized view carries one comment, whether it is written as a table or as the view.
+statement ok
+COMMENT ON TABLE qty_total IS 'via table'
+
+query TT
+SELECT object_type, description FROM information_schema.nusadb_comments WHERE object_name = 'qty_total'
+----
+MATERIALIZED VIEW via table
+
+statement ok
+COMMENT ON MATERIALIZED VIEW qty_total IS 'total quantity'
+
+# The default schema can be commented on.
+statement ok
+COMMENT ON SCHEMA public IS 'default schema'
+
+statement ok
+COMMENT ON SCHEMA public IS NULL
+
+# Missing objects are refused, whatever their kind.
+statement error
+COMMENT ON CONSTRAINT nope ON app.orders IS 'x'
+
+statement error
+COMMENT ON CONSTRAINT qty_pos ON orders IS 'x'
+
+statement error
+COMMENT ON INDEX nope IS 'x'
+
+statement error
+COMMENT ON INDEX public.orders_qty_idx IS 'x'
+
+statement error
+COMMENT ON TRIGGER nope ON app.orders IS 'x'
+
+statement error
+COMMENT ON FUNCTION nope IS 'x'
+
+statement error
+COMMENT ON PROCEDURE nope IS 'x'
+
+statement error
+COMMENT ON VIEW nope IS 'x'
+
+statement error
+COMMENT ON SCHEMA nope IS 'x'
+
+statement error
+COMMENT ON SEQUENCE order_seq IS 'x'
+
+statement error
+COMMENT ON TYPE nope IS 'x'
+
+statement error
+COMMENT ON DOMAIN mood IS 'x'
+
+# A signature has to describe the function: a wrong argument count names no function.
+statement error
+COMMENT ON FUNCTION add_one(INT, INT) IS 'x'
+
+statement error
+COMMENT ON PROCEDURE touch(INT) IS 'x'
+
+# Dropping a view drops its comment. (The views go first: they name the columns renamed below.)
+statement ok
+DROP VIEW app.big_orders
+
+statement ok
+DROP MATERIALIZED VIEW qty_total
+
+query I
+SELECT COUNT(*) FROM information_schema.nusadb_comments WHERE object_type IN ('VIEW', 'MATERIALIZED VIEW')
+----
+0
+
+# Renames keep the comment under the new name.
+statement ok
+ALTER TABLE app.orders RENAME COLUMN qty TO quantity
+
+statement ok
+SET search_path = app, public
+
+statement ok
+ALTER TRIGGER orders_audit ON orders RENAME TO orders_log
+
+statement ok
+SET search_path = public
+
+statement ok
+ALTER TABLE app.orders RENAME TO purchases
+
+query TTT rowsort
+SELECT object_type, table_name, object_name FROM information_schema.nusadb_comments WHERE object_schema = 'app' AND table_name IS NOT NULL
+----
+COLUMN purchases quantity
+CONSTRAINT purchases orders_pk
+CONSTRAINT purchases qty_pos
+INDEX purchases orders_qty_idx
+TABLE purchases purchases
+TRIGGER purchases orders_log
+
+# Dropping an object drops its comment.
+statement ok
+DROP INDEX orders_qty_idx
+
+statement ok
+ALTER TABLE app.purchases DROP CONSTRAINT qty_pos
+
+statement ok
+SET search_path = app, public
+
+statement ok
+DROP TRIGGER orders_log ON purchases
+
+statement ok
+SET search_path = public
+
+statement ok
+DROP PROCEDURE touch
+
+statement ok
+DROP SEQUENCE app.order_seq
+
+statement ok
+DROP TYPE mood
+
+statement ok
+DROP DOMAIN positive
+
+query TT rowsort
+SELECT object_type, object_name FROM information_schema.nusadb_comments
+----
+COLUMN quantity
+CONSTRAINT orders_pk
+SCHEMA app
+TABLE purchases
+
+# Dropping the schema takes its tables, their comments and its own.
+statement ok
+DROP SCHEMA app CASCADE
+
+query I
+SELECT COUNT(*) FROM information_schema.nusadb_comments
+----
+0
+
+# A table recreated under a dropped name starts without a comment.
+statement ok
+CREATE SCHEMA app
+
+statement ok
+CREATE TABLE app.purchases (id INT PRIMARY KEY)
+
+query I
+SELECT COUNT(*) FROM information_schema.nusadb_comments
+----
+0
+
+# A comment written in a transaction that rolls back is gone.
+statement ok
+BEGIN
+
+statement ok
+COMMENT ON TABLE app.purchases IS 'temporary'
+
+statement ok
+ROLLBACK
+
+query I
+SELECT COUNT(*) FROM information_schema.nusadb_comments
+----
+0

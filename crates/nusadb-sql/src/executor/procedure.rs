@@ -107,6 +107,7 @@ pub(super) fn run_drop_procedure(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let removed = delete_procedure_row(engine, txn, &plan.name)?;
+    super::comment::forget(engine, txn, &super::comment::procedure_key(&plan.name))?;
     if !removed && !plan.if_exists {
         return Err(Error::ProcedureNotFound {
             name: plan.name.clone(),
@@ -288,6 +289,15 @@ pub(super) fn all_procedures(
         out.push((proc.name, proc.body));
     }
     Ok(out)
+}
+
+/// The `(IN, OUT)` parameter counts of procedure `name`, or `None` when there is no such procedure.
+pub(super) fn procedure_arity(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<Option<(usize, usize)>, Error> {
+    Ok(load_procedure(engine, txn, name)?.map(|p| (p.param_count, p.out_params.len())))
 }
 
 /// Whether a procedure named `name` exists.

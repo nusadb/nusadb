@@ -428,8 +428,9 @@ pub enum Statement {
         /// The requested lock mode.
         mode: LockMode,
     },
-    /// `COMMENT ON {TABLE | COLUMN} <object> IS {'text' | NULL}` — attach (or with
-    /// `IS NULL`, clear) a human-readable description on a table or column.
+    /// `COMMENT ON <object> IS {'text' | NULL}`: attach (or with `IS NULL`, clear) a
+    /// human-readable description on a table, column, constraint, index, trigger, routine, view,
+    /// schema, sequence or type.
     CommentOn(CommentOn),
     /// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR <query>` — open a cursor over a query.
     DeclareCursor(DeclareCursor),
@@ -495,7 +496,7 @@ pub struct SetVariable {
     pub local: bool,
 }
 
-/// `COMMENT ON {TABLE | COLUMN} <object> IS {'text' | NULL}`.
+/// `COMMENT ON <object> IS {'text' | NULL}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentOn {
     /// What the comment is attached to.
@@ -504,22 +505,98 @@ pub struct CommentOn {
     pub comment: Option<String>,
 }
 
-/// The object a [`CommentOn`] targets.
+/// The object a [`CommentOn`] targets. A `schema` of `None` means the statement named no schema,
+/// so the analyzer resolves the name the way the object's own `CREATE` / `DROP` statement does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentTarget {
-    /// `COMMENT ON TABLE <table>`.
+    /// `COMMENT ON TABLE [schema.]table`.
     Table {
         /// Schema qualifier, when the statement carried one.
         schema: Option<String>,
         /// Target table name.
         table: String,
     },
-    /// `COMMENT ON COLUMN <table>.<column>`.
+    /// `COMMENT ON COLUMN [schema.]table.column`.
     Column {
+        /// Schema qualifier of the table, when the statement carried one.
+        schema: Option<String>,
         /// Table owning the column.
         table: String,
         /// Target column name.
         column: String,
+    },
+    /// `COMMENT ON CONSTRAINT name ON [schema.]table`.
+    Constraint {
+        /// Constraint name.
+        name: String,
+        /// Schema qualifier of the table, when the statement carried one.
+        schema: Option<String>,
+        /// Table the constraint belongs to.
+        table: String,
+    },
+    /// `COMMENT ON TRIGGER name ON [schema.]table`.
+    Trigger {
+        /// Trigger name.
+        name: String,
+        /// Schema qualifier of the table, when the statement carried one.
+        schema: Option<String>,
+        /// Table the trigger is attached to.
+        table: String,
+    },
+    /// `COMMENT ON INDEX [schema.]name`.
+    Index {
+        /// Schema qualifier, when the statement carried one.
+        schema: Option<String>,
+        /// Index name.
+        name: String,
+    },
+    /// `COMMENT ON FUNCTION name[(argtypes)]`.
+    Function {
+        /// Function name.
+        name: String,
+        /// The argument types as written, or `None` when the statement gave no list.
+        args: Option<Vec<String>>,
+    },
+    /// `COMMENT ON PROCEDURE name[(argtypes)]`.
+    Procedure {
+        /// Procedure name.
+        name: String,
+        /// The argument types as written, or `None` when the statement gave no list.
+        args: Option<Vec<String>>,
+    },
+    /// `COMMENT ON VIEW [schema.]name`.
+    View {
+        /// Schema qualifier, when the statement carried one.
+        schema: Option<String>,
+        /// View name.
+        name: String,
+    },
+    /// `COMMENT ON MATERIALIZED VIEW name`.
+    MaterializedView {
+        /// Materialized view name.
+        name: String,
+    },
+    /// `COMMENT ON SCHEMA name`.
+    Schema {
+        /// Schema name.
+        name: String,
+    },
+    /// `COMMENT ON SEQUENCE [schema.]name`.
+    Sequence {
+        /// Schema qualifier, when the statement carried one.
+        schema: Option<String>,
+        /// Sequence name.
+        name: String,
+    },
+    /// `COMMENT ON TYPE name`: an enum, composite or domain type.
+    Type {
+        /// Type name.
+        name: String,
+    },
+    /// `COMMENT ON DOMAIN name`.
+    Domain {
+        /// Domain name.
+        name: String,
     },
 }
 

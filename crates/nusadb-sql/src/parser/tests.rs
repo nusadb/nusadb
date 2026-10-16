@@ -5401,13 +5401,12 @@ fn comment_on_table() {
 
 #[test]
 fn comment_on_column_folds_case() {
-    // A bare `table.column` folds case to (users, name). (A schema-qualified
-    // `schema.table.column` is rejected instead of silently dropping the schema — see
-    // `comment_on_schema_qualified_column_is_rejected`)
+    // A bare `table.column` folds case to (users, name).
     let c = comment("COMMENT ON COLUMN Users.Name IS 'display name'");
     assert_eq!(
         c.target,
         ast::CommentTarget::Column {
+            schema: None,
             table: "users".to_owned(),
             column: "name".to_owned(),
         }
@@ -5427,6 +5426,7 @@ fn comment_quoted_identifier_preserves_case() {
     assert_eq!(
         c.target,
         ast::CommentTarget::Column {
+            schema: None,
             table: "T".to_owned(),
             column: "C".to_owned(),
         }
@@ -5445,9 +5445,127 @@ fn comment_on_bare_column_is_rejected() {
 #[test]
 fn comment_on_unsupported_target_is_rejected() {
     assert!(matches!(
-        parse("COMMENT ON SCHEMA public IS 'x'"),
+        parse("COMMENT ON ROLE admin IS 'x'"),
         Err(Error::Unsupported(_))
     ));
+}
+
+#[test]
+fn comment_on_table_scoped_targets() {
+    assert_eq!(
+        comment("COMMENT ON CONSTRAINT Pk ON app.Users IS 'key'").target,
+        ast::CommentTarget::Constraint {
+            name: "pk".to_owned(),
+            schema: Some("app".to_owned()),
+            table: "users".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON TRIGGER audit ON users IS 'x'").target,
+        ast::CommentTarget::Trigger {
+            name: "audit".to_owned(),
+            schema: None,
+            table: "users".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON INDEX app.idx IS 'x'").target,
+        ast::CommentTarget::Index {
+            schema: Some("app".to_owned()),
+            name: "idx".to_owned(),
+        }
+    );
+    // `ON` is required after a constraint or trigger name.
+    assert!(matches!(
+        parse("COMMENT ON CONSTRAINT pk users IS 'x'"),
+        Err(Error::Syntax(_))
+    ));
+}
+
+#[test]
+fn comment_on_routines_carries_the_argument_list() {
+    assert_eq!(
+        comment("COMMENT ON FUNCTION f IS 'x'").target,
+        ast::CommentTarget::Function {
+            name: "f".to_owned(),
+            args: None,
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON FUNCTION public.f() IS 'x'").target,
+        ast::CommentTarget::Function {
+            name: "f".to_owned(),
+            args: Some(Vec::new()),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON FUNCTION f(INT, NUMERIC(10, 2), text) IS 'x'").target,
+        ast::CommentTarget::Function {
+            name: "f".to_owned(),
+            args: Some(vec![
+                "int".to_owned(),
+                "numeric ( 10 , 2 )".to_owned(),
+                "text".to_owned(),
+            ]),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON PROCEDURE p(int) IS NULL").target,
+        ast::CommentTarget::Procedure {
+            name: "p".to_owned(),
+            args: Some(vec!["int".to_owned()]),
+        }
+    );
+    assert!(matches!(
+        parse("COMMENT ON FUNCTION f(int IS 'x'"),
+        Err(Error::Syntax(_))
+    ));
+    assert!(matches!(
+        parse("COMMENT ON FUNCTION f(int,) IS 'x'"),
+        Err(Error::Syntax(_))
+    ));
+}
+
+#[test]
+fn comment_on_other_object_kinds() {
+    assert_eq!(
+        comment("COMMENT ON VIEW app.v IS 'x'").target,
+        ast::CommentTarget::View {
+            schema: Some("app".to_owned()),
+            name: "v".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON MATERIALIZED VIEW mv IS 'x'").target,
+        ast::CommentTarget::MaterializedView {
+            name: "mv".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON SCHEMA App IS 'x'").target,
+        ast::CommentTarget::Schema {
+            name: "app".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON SEQUENCE app.s IS 'x'").target,
+        ast::CommentTarget::Sequence {
+            schema: Some("app".to_owned()),
+            name: "s".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON TYPE mood IS 'x'").target,
+        ast::CommentTarget::Type {
+            name: "mood".to_owned(),
+        }
+    );
+    assert_eq!(
+        comment("COMMENT ON DOMAIN public.pos IS 'x'").target,
+        ast::CommentTarget::Domain {
+            name: "pos".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -5744,22 +5862,20 @@ fn create_table_clustered_by_is_rejected() {
 }
 
 #[test]
-fn comment_on_schema_qualified_column_is_rejected() {
-    // `schema.table.column` must not silently collapse to `table.column`.
-    // The message, not just the variant. Matching `Unsupported(_)` cannot tell the three-part arm
-    // from the catch-all it was split out of, so the wording — which is the whole point of that
-    // arm — would go untested, and a mangled string in it would pass a full suite.
-    let Err(Error::Unsupported(message)) = parse("COMMENT ON COLUMN app.users.id IS 'x'") else {
-        panic!("a schema-qualified column name is not resolved here yet");
-    };
-    assert!(
-        message.contains("a schema qualifier on COMMENT ON COLUMN"),
-        "refused by the wrong arm, or the wording drifted: {message}"
+fn comment_on_schema_qualified_column() {
+    // `schema.table.column` keeps its schema rather than collapsing to `table.column`.
+    assert_eq!(
+        comment("COMMENT ON COLUMN app.users.id IS 'x'").target,
+        ast::CommentTarget::Column {
+            schema: Some("app".to_owned()),
+            table: "users".to_owned(),
+            column: "id".to_owned(),
+        }
     );
-    assert!(
-        !message.contains("  "),
-        "the message carries a run of spaces, which is how a generated line continuation          reaches a user: {message}"
-    );
+    assert!(matches!(
+        parse("COMMENT ON COLUMN db.app.users.id IS 'x'"),
+        Err(Error::Unsupported(_))
+    ));
 }
 
 // --- decimal literals are exact NUMERIC, not f64 ------------------

@@ -46,6 +46,9 @@ pub enum InfoSchemaView {
     UserDefinedTypes,
     /// `information_schema.attributes`: one row per field of a composite type, in declared order.
     Attributes,
+    /// `information_schema.nusadb_comments`: one row per `COMMENT ON` comment, with the kind,
+    /// schema, owning table (for a table-scoped object) and name of the object it describes.
+    NusadbComments,
 }
 
 impl InfoSchemaView {
@@ -69,6 +72,7 @@ impl InfoSchemaView {
             Self::Sequences => "sequences",
             Self::UserDefinedTypes => "user_defined_types",
             Self::Attributes => "attributes",
+            Self::NusadbComments => "nusadb_comments",
         }
     }
 
@@ -236,6 +240,15 @@ impl InfoSchemaView {
                 // field whose `data_type` is `USER-DEFINED` (a nested composite or an enum).
                 text("attribute_udt_name"),
             ],
+            Self::NusadbComments => vec![
+                text("object_type"),
+                text("object_schema"),
+                // The table a column, constraint, index or trigger belongs to (the table itself
+                // for a table comment); NULL for every other kind.
+                text("table_name"),
+                text("object_name"),
+                text("description"),
+            ],
         };
         TableSchema {
             schema: "public".to_owned(),
@@ -266,6 +279,7 @@ impl InfoSchemaView {
             "information_schema.sequences" => Some(Self::Sequences),
             "information_schema.user_defined_types" => Some(Self::UserDefinedTypes),
             "information_schema.attributes" => Some(Self::Attributes),
+            "information_schema.nusadb_comments" => Some(Self::NusadbComments),
             _ => None,
         }
     }
@@ -691,18 +705,169 @@ pub struct AlterDatabasePlan {
     pub name: String,
 }
 
-/// `COMMENT ON {TABLE | COLUMN}` — target resolved (existence-checked) against the catalog.
+/// `COMMENT ON <object> IS {'text' | NULL}`, its target resolved as far as the analyzer reaches.
 ///
-/// Persisting the comment in catalog metadata is optional (treaty work); the executor
-/// validates and reports success as a metadata no-op for now.
+/// A table (and with it a column's table, a constraint's and a trigger's) is resolved and
+/// existence-checked here; the objects only the engine-side catalogs know (constraints, triggers,
+/// indexes, routines, views, schemas, sequences, types) are checked by the executor, under the
+/// statement's transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentPlan {
-    /// Resolved target table name.
-    pub table: String,
-    /// Resolved target column, or `None` when the comment targets the table itself.
-    pub column: Option<String>,
+    /// The object the comment is attached to.
+    pub target: CommentObject,
     /// The comment text; `None` for `IS NULL` (clear the comment).
     pub comment: Option<String>,
+}
+
+/// The object a [`CommentPlan`] targets, with names resolved to the keys the object's own catalog
+/// uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentObject {
+    /// A table (or a materialized view's backing table), resolved.
+    Table {
+        /// The schema the table lives in.
+        schema: String,
+        /// Table name.
+        table: String,
+    },
+    /// A column of a resolved table; the column was checked to exist.
+    Column {
+        /// The schema the table lives in.
+        schema: String,
+        /// Table name.
+        table: String,
+        /// Column name.
+        column: String,
+    },
+    /// A constraint of a resolved table.
+    Constraint {
+        /// The schema the table lives in.
+        schema: String,
+        /// Table name.
+        table: String,
+        /// Constraint name.
+        name: String,
+    },
+    /// A trigger on a resolved table.
+    Trigger {
+        /// The schema the table lives in.
+        schema: String,
+        /// Table name.
+        table: String,
+        /// Trigger name.
+        name: String,
+    },
+    /// An index, by name, optionally restricted to one schema.
+    Index {
+        /// The schema the statement named, if any.
+        schema: Option<String>,
+        /// Index name.
+        name: String,
+    },
+    /// A function, with the argument types the statement gave (if any).
+    Function {
+        /// Function name.
+        name: String,
+        /// Argument types as written, or `None` when no list was given.
+        args: Option<Vec<String>>,
+    },
+    /// A procedure, with the argument types the statement gave (if any).
+    Procedure {
+        /// Procedure name.
+        name: String,
+        /// Argument types as written, or `None` when no list was given.
+        args: Option<Vec<String>>,
+    },
+    /// A plain view, by its view-catalog key (`schema.name` outside `public`).
+    View {
+        /// The view-catalog key.
+        key: String,
+    },
+    /// A materialized view.
+    MaterializedView {
+        /// Materialized view name.
+        name: String,
+    },
+    /// A schema.
+    Schema {
+        /// Schema name.
+        name: String,
+    },
+    /// A sequence, by its catalog key (`schema.name` outside `public`).
+    Sequence {
+        /// The sequence key.
+        key: String,
+    },
+    /// A user-defined enum, composite or domain type.
+    Type {
+        /// Type name.
+        name: String,
+    },
+    /// A domain.
+    Domain {
+        /// Domain name.
+        name: String,
+    },
+}
+
+impl CommentObject {
+    /// A short `KIND name` rendering for `EXPLAIN`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let routine = |kind: &str, name: &str, args: Option<&Vec<String>>| {
+            args.map_or_else(
+                || format!("{kind} {name}"),
+                |args| format!("{kind} {name}({})", args.join(", ")),
+            )
+        };
+        match self {
+            Self::Table { schema, table } => {
+                format!(
+                    "TABLE {}",
+                    crate::analyzer::qualified_display(schema, table)
+                )
+            },
+            Self::Column {
+                schema,
+                table,
+                column,
+            } => format!(
+                "COLUMN {}.{column}",
+                crate::analyzer::qualified_display(schema, table)
+            ),
+            Self::Constraint {
+                schema,
+                table,
+                name,
+            } => format!(
+                "CONSTRAINT {name} ON {}",
+                crate::analyzer::qualified_display(schema, table)
+            ),
+            Self::Trigger {
+                schema,
+                table,
+                name,
+            } => format!(
+                "TRIGGER {name} ON {}",
+                crate::analyzer::qualified_display(schema, table)
+            ),
+            Self::Index { schema, name } => format!(
+                "INDEX {}",
+                schema.as_deref().map_or_else(
+                    || name.clone(),
+                    |s| crate::analyzer::qualified_display(s, name)
+                )
+            ),
+            Self::Function { name, args } => routine("FUNCTION", name, args.as_ref()),
+            Self::Procedure { name, args } => routine("PROCEDURE", name, args.as_ref()),
+            Self::View { key } => format!("VIEW {key}"),
+            Self::MaterializedView { name } => format!("MATERIALIZED VIEW {name}"),
+            Self::Schema { name } => format!("SCHEMA {name}"),
+            Self::Sequence { key } => format!("SEQUENCE {key}"),
+            Self::Type { name } => format!("TYPE {name}"),
+            Self::Domain { name } => format!("DOMAIN {name}"),
+        }
+    }
 }
 
 /// `ANALYZE` — table resolved, target columns resolved to ordinals.
@@ -2776,7 +2941,7 @@ pub enum PhysicalPlan {
     },
     /// `DEALLOCATE` — discard a prepared statement, or all of them.
     Deallocate(crate::ast::DeallocateTarget),
-    /// `COMMENT ON` — target resolved; a metadata no-op at execution.
+    /// `COMMENT ON`: the comment is stored in (or, for `IS NULL`, removed from) the comment catalog.
     Comment(CommentPlan),
     /// `DECLARE ... CURSOR` — run the inner query and materialize it as a session cursor.
     DeclareCursor {

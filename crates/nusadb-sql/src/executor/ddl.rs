@@ -1701,6 +1701,17 @@ pub(super) fn run_drop_table(
                 if fk.parent_table == schema.id && fk.child_table != schema.id {
                     if plan.cascade {
                         engine.drop_constraint(txn, fk.child_table, &fk.name)?;
+                        if let Some(child) = engine.lookup_table_by_id_as_of(txn, fk.child_table)? {
+                            super::comment::forget(
+                                engine,
+                                txn,
+                                &super::comment::constraint_key(
+                                    &child.schema,
+                                    &child.name,
+                                    &fk.name,
+                                ),
+                            )?;
+                        }
                         continue;
                     }
                     return Err(Error::DependentObjects(format!(
@@ -1760,6 +1771,8 @@ pub(super) fn run_drop_table(
             // Triggers were not cascaded at all, so their rows outlived the table and a later
             // same-named one inherited them.
             super::trigger::delete_triggers_for_table(engine, txn, &plan.schema, &plan.table)?;
+            // The comments on the table and on everything that belonged to it.
+            super::comment::forget_table(engine, txn, &plan.schema, &plan.table)?;
             // Ownership and grants go with the table. Leaving them behind would hand a later table
             // that reused the name the old one's permissions.
             let owned = format!("{}.{}", plan.schema, plan.table);
@@ -1983,6 +1996,7 @@ pub(super) fn run_drop_sequence(
         Some(id) => {
             engine.drop_sequence(txn, id)?;
             super::seqcatalog::remove(engine, txn, &plan.name)?;
+            super::comment::forget(engine, txn, &super::comment::sequence_key(&plan.name))?;
         },
         None => skip_missing(
             plan.if_exists,
@@ -2093,6 +2107,8 @@ pub(super) fn run_drop_index(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
+    // The table the index is on, whose comments are re-checked once the index is gone.
+    let owners = super::comment::index_owners(engine, txn, None, &plan.name)?;
     if let Some(id) = engine.lookup_index(&plan.name)? {
         engine.drop_index(txn, id)?;
     } else {
@@ -2107,6 +2123,9 @@ pub(super) fn run_drop_index(
         if !dropped {
             crate::notice::skipped_missing(&format!("index \"{}\"", plan.name));
         }
+    }
+    for (schema, table) in owners {
+        super::comment::prune_table(engine, txn, &schema, &table)?;
     }
     Ok(ExecutionResult::IndexDropped)
 }
@@ -2324,6 +2343,8 @@ pub(super) fn run_alter_table(
                 txn,
             )?;
             super::rename_column_type_tags(engine, txn, &schema, &old, &name)?;
+            // The comments on the table and on its columns, constraints, indexes and triggers.
+            super::comment::rename_table(engine, txn, &schema, &old, &name)?;
             return Ok(ExecutionResult::Altered);
         },
         // DROP CONSTRAINT [IF EXISTS]. A missing constraint is a no-op only with IF EXISTS;
@@ -2353,6 +2374,13 @@ pub(super) fn run_alter_table(
             refuse_dropping_inherited_constraint(table, &name, engine, txn)?;
             drop_partition_copies(table, &name, engine, txn)?;
             engine.drop_constraint(txn, table, &name)?;
+            // The comment of the constraint, and of its copies on the partitions below.
+            if let Some(owner) = dml::schema_by_id(engine, txn, table)? {
+                super::comment::prune_table(engine, txn, &owner.schema, &owner.name)?;
+                for (schema, name, _) in partitions_below(&owner, engine, txn)? {
+                    super::comment::prune_table(engine, txn, &schema, &name)?;
+                }
+            }
             return Ok(ExecutionResult::Altered);
         },
         // ADD CHECK: validate the existing rows satisfy the predicate (NULL/TRUE pass,
@@ -2552,6 +2580,12 @@ fn apply_column_change(
     apply_column_op(table, op, engine, txn)?;
     for (child, child_op) in &below {
         apply_column_op(child, child_op, engine, txn)?;
+    }
+    // A dropped column takes its comment, and those of the indexes and constraints on it.
+    if matches!(op, AlterColumnOp::DropColumn { .. }) {
+        for t in std::iter::once(table).chain(below.iter().map(|(child, _)| child)) {
+            super::comment::prune_table(engine, txn, &t.schema, &t.name)?;
+        }
     }
     // A renamed partition-key column keeps partitioning its tables under the new name.
     if let Some((from, to)) = renamed
@@ -2768,6 +2802,7 @@ fn rename_column(
             super::coldefault::set_default(&key, to, &sql, engine, txn)?;
         }
     }
+    super::comment::rename_column(engine, txn, &table.schema, &table.name, &from, to)?;
     super::column_deps::reattach_after_rename(detached, table, &from, to, engine, txn)
 }
 

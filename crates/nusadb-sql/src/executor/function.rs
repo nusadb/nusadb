@@ -246,6 +246,7 @@ pub(super) fn run_drop_function(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     let removed = delete_function_row(engine, txn, &plan.name)?;
+    super::comment::forget(engine, txn, &super::comment::function_key(&plan.name))?;
     if !removed && !plan.if_exists {
         return Err(Error::FunctionNotFound {
             name: plan.name.clone(),

@@ -27,17 +27,17 @@ use crate::ast;
 use crate::error::Error;
 use crate::planner::{
     AggregateCall, AlterColumnOp, AlterDatabasePlan, AlterSequencePlan, AlterTablePlan,
-    AlterTriggerPlan, AnalyzePlan, Assignment, CallPlan, CheckSpec, CommentPlan, CompositeExpr,
-    ConflictArbiter, CreateDatabasePlan, CreateFunctionPlan, CreateIndexPlan, CreatePlainViewPlan,
-    CreatePolicyPlan, CreateProcedurePlan, CreateSchemaPlan, CreateSequencePlan, CreateTableAsPlan,
-    CreateTablePlan, CreateTriggerPlan, CryptoOp, DeletePlan, DropDatabasePlan, DropFunctionPlan,
-    DropIndexPlan, DropPolicyPlan, DropProcedurePlan, DropSchemaPlan, DropSequencePlan,
-    DropTablePlan, DropTriggerPlan, DropViewPlan, ForeignKeySpec, FrameBound, IndexMeta,
-    InsertPlan, InsertSource, JoinPlan, LogicalPlan, MaterializedViewPlan, MergeMatchedAction,
-    MergePlan, MergeWhen, ModifyingCteDef, OnConflictPlan, OrderByKey, OrderedSetKey, Projection,
-    RecursiveCteDef, SelectPlan, SetOpPlan, SetOpTree, TruncateCascadePlan, TxnCharacteristics,
-    TypedCaseBranch, TypedExpr, TypedExprKind, UniqueConstraintSpec, UpdatePlan, VectorIndexSpec,
-    WindowExpr, WindowFrame,
+    AlterTriggerPlan, AnalyzePlan, Assignment, CallPlan, CheckSpec, CommentObject, CommentPlan,
+    CompositeExpr, ConflictArbiter, CreateDatabasePlan, CreateFunctionPlan, CreateIndexPlan,
+    CreatePlainViewPlan, CreatePolicyPlan, CreateProcedurePlan, CreateSchemaPlan,
+    CreateSequencePlan, CreateTableAsPlan, CreateTablePlan, CreateTriggerPlan, CryptoOp,
+    DeletePlan, DropDatabasePlan, DropFunctionPlan, DropIndexPlan, DropPolicyPlan,
+    DropProcedurePlan, DropSchemaPlan, DropSequencePlan, DropTablePlan, DropTriggerPlan,
+    DropViewPlan, ForeignKeySpec, FrameBound, IndexMeta, InsertPlan, InsertSource, JoinPlan,
+    LogicalPlan, MaterializedViewPlan, MergeMatchedAction, MergePlan, MergeWhen, ModifyingCteDef,
+    OnConflictPlan, OrderByKey, OrderedSetKey, Projection, RecursiveCteDef, SelectPlan, SetOpPlan,
+    SetOpTree, TruncateCascadePlan, TxnCharacteristics, TypedCaseBranch, TypedExpr, TypedExprKind,
+    UniqueConstraintSpec, UpdatePlan, VectorIndexSpec, WindowExpr, WindowFrame,
 };
 
 mod dcl;
@@ -1735,29 +1735,101 @@ fn txn_characteristics(settings: &ast::TransactionSettings) -> TxnCharacteristic
     }
 }
 
-/// Resolve a `COMMENT ON` target against the catalog: the table (and, for a column comment, the
-/// column) must exist. The comment text itself needs no validation. Persisting the comment is
-/// optional treaty work, so the resolved plan carries only the target names + text.
+/// Resolve a `COMMENT ON` target against the catalog.
+///
+/// A table target, and the table a column, constraint or trigger target hangs off, resolves here
+/// the way any statement's table reference does (search path, reserved-catalog rule, RLS gate), and
+/// a column is checked to exist. Names of objects kept in engine-side catalogs are turned into the
+/// keys those catalogs use (a view or sequence outside `public` is keyed `schema.name`, as its
+/// `DROP` keys it); whether such an object exists is checked by the executor, under the statement's
+/// transaction.
 fn analyze_comment(c: ast::CommentOn, catalog: &dyn Catalog) -> Result<CommentPlan, Error> {
-    let (qualifier, table_name, column) = match c.target {
-        ast::CommentTarget::Table { schema, table } => (schema, table, None),
-        // `COMMENT ON COLUMN` spells its target `table.column`, so a schema would make it three
-        // parts — a distinct decision from this one, and left refused rather than guessed at.
-        ast::CommentTarget::Column { table, column } => (None, table, Some(column)),
+    let target = match c.target {
+        ast::CommentTarget::Table { schema, table } => {
+            let resolved = resolve_table(schema.as_deref(), &table, catalog)?;
+            CommentObject::Table {
+                schema: resolved.schema,
+                table: resolved.name,
+            }
+        },
+        ast::CommentTarget::Column {
+            schema,
+            table,
+            column,
+        } => {
+            let resolved = resolve_table(schema.as_deref(), &table, catalog)?;
+            if !resolved.columns.iter().any(|c| c.name == column) {
+                return Err(Error::ColumnNotFound { table, column });
+            }
+            CommentObject::Column {
+                schema: resolved.schema,
+                table: resolved.name,
+                column,
+            }
+        },
+        ast::CommentTarget::Constraint {
+            name,
+            schema,
+            table,
+        } => {
+            let resolved = resolve_table(schema.as_deref(), &table, catalog)?;
+            CommentObject::Constraint {
+                schema: resolved.schema,
+                table: resolved.name,
+                name,
+            }
+        },
+        ast::CommentTarget::Trigger {
+            name,
+            schema,
+            table,
+        } => {
+            let resolved = resolve_table(schema.as_deref(), &table, catalog)?;
+            CommentObject::Trigger {
+                schema: resolved.schema,
+                table: resolved.name,
+                name,
+            }
+        },
+        ast::CommentTarget::Index { schema, name } => {
+            enforce_system_catalog(&name, catalog)?;
+            CommentObject::Index { schema, name }
+        },
+        ast::CommentTarget::Function { name, args } => CommentObject::Function { name, args },
+        ast::CommentTarget::Procedure { name, args } => CommentObject::Procedure { name, args },
+        ast::CommentTarget::View { schema, name } => {
+            // The key `DROP VIEW` would drop: an explicit schema names it, a bare name is the
+            // current schema's view when there is one there, else the `public` one.
+            let key = if let Some(schema) = &schema {
+                qualified_display(schema, &name)
+            } else {
+                let current = qualified_display(&catalog.current_schema(), &name);
+                if current != name && catalog.lookup_view(&current)?.is_some() {
+                    current
+                } else {
+                    name
+                }
+            };
+            enforce_system_catalog(&key, catalog)?;
+            CommentObject::View { key }
+        },
+        ast::CommentTarget::MaterializedView { name } => {
+            enforce_system_catalog(&name, catalog)?;
+            CommentObject::MaterializedView { name }
+        },
+        ast::CommentTarget::Schema { name } => CommentObject::Schema { name },
+        ast::CommentTarget::Sequence { schema, name } => {
+            // Keyed exactly as CREATE / DROP SEQUENCE key it.
+            let schema = schema.unwrap_or_else(|| catalog.current_schema());
+            CommentObject::Sequence {
+                key: qualified_display(&schema, &name),
+            }
+        },
+        ast::CommentTarget::Type { name } => CommentObject::Type { name },
+        ast::CommentTarget::Domain { name } => CommentObject::Domain { name },
     };
-    // `resolve_table` enforces the reserved-catalog rule (and the RLS gate) itself.
-    let schema = resolve_table(qualifier.as_deref(), &table_name, catalog)?;
-    if let Some(column) = &column
-        && !schema.columns.iter().any(|c| &c.name == column)
-    {
-        return Err(Error::ColumnNotFound {
-            table: table_name,
-            column: column.clone(),
-        });
-    }
     Ok(CommentPlan {
-        table: table_name,
-        column,
+        target,
         comment: c.comment,
     })
 }

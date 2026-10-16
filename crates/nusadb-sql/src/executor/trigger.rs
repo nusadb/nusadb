@@ -256,6 +256,14 @@ pub(super) fn run_alter_trigger(
             table: plan.table.clone(),
         });
     }
+    super::comment::rename_trigger(
+        engine,
+        txn,
+        &plan.schema,
+        &plan.table,
+        &plan.name,
+        &plan.new_name,
+    )?;
     Ok(ExecutionResult::TriggerAltered)
 }
 
@@ -319,6 +327,11 @@ pub(super) fn run_drop_trigger(
 ) -> Result<ExecutionResult, Error> {
     refuse_inherited_trigger(&plan.schema, &plan.table, &plan.name, "drop", engine, txn)?;
     let removed = delete_trigger_row(engine, txn, &plan.schema, &plan.table, &plan.name)?;
+    super::comment::forget(
+        engine,
+        txn,
+        &super::comment::trigger_key(&plan.schema, &plan.table, &plan.name),
+    )?;
     if !removed && !plan.if_exists {
         return Err(Error::TriggerNotFound {
             name: plan.name.clone(),
@@ -464,7 +477,7 @@ pub(super) fn rename_triggers_for_table(
 }
 
 /// Whether a trigger named `name` exists on `table`.
-fn trigger_exists(
+pub(super) fn trigger_exists(
     engine: &dyn StorageEngine,
     txn: TxnId,
     schema: &str,

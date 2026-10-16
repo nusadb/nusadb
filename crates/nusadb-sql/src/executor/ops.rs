@@ -3517,6 +3517,7 @@ pub(super) fn run_info_schema(
         V::Sequences => info_schema_sequences(engine, txn),
         V::UserDefinedTypes => info_schema_user_defined_types(engine, txn),
         V::Attributes => info_schema_attributes(engine, txn),
+        V::NusadbComments => super::comment::info_schema_rows(engine, txn),
     }
 }
 

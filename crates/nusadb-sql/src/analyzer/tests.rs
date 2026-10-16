@@ -1,6 +1,6 @@
 use super::{Catalog, analyze};
 use crate::error::Error;
-use crate::planner::{InsertSource, LogicalPlan, TypedExprKind};
+use crate::planner::{CommentObject, InsertSource, LogicalPlan, TypedExprKind};
 use nusadb_core::{ColumnDef, ColumnType, TableId, TableSchema};
 
 /// An in-memory [`Catalog`] for analyzer tests — no storage engine.
@@ -1865,8 +1865,13 @@ fn comment_on_table_resolves() {
     else {
         panic!("expected Comment plan");
     };
-    assert_eq!(p.table, "users");
-    assert_eq!(p.column, None);
+    assert_eq!(
+        p.target,
+        CommentObject::Table {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+        }
+    );
     assert_eq!(p.comment.as_deref(), Some("accounts"));
 }
 
@@ -1876,8 +1881,91 @@ fn comment_on_column_resolves() {
     else {
         panic!("expected Comment plan");
     };
-    assert_eq!(p.column.as_deref(), Some("name"));
+    assert_eq!(
+        p.target,
+        CommentObject::Column {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            column: "name".to_owned(),
+        }
+    );
     assert!(p.comment.is_none());
+}
+
+#[test]
+fn comment_on_table_scoped_objects_resolves_the_table() {
+    let LogicalPlan::Comment(p) = plan(
+        "COMMENT ON CONSTRAINT users_pkey ON users IS 'key'",
+        &catalog(),
+    )
+    .unwrap() else {
+        panic!("expected Comment plan");
+    };
+    assert_eq!(
+        p.target,
+        CommentObject::Constraint {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            name: "users_pkey".to_owned(),
+        }
+    );
+    let LogicalPlan::Comment(p) = plan(
+        "COMMENT ON TRIGGER audit ON public.users IS 'x'",
+        &catalog(),
+    )
+    .unwrap() else {
+        panic!("expected Comment plan");
+    };
+    assert_eq!(
+        p.target,
+        CommentObject::Trigger {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            name: "audit".to_owned(),
+        }
+    );
+    // The table a constraint or trigger hangs off must exist.
+    assert!(matches!(
+        plan("COMMENT ON CONSTRAINT c ON ghost IS 'x'", &catalog()),
+        Err(Error::TableNotFound { .. }),
+    ));
+    assert!(matches!(
+        plan("COMMENT ON TRIGGER t ON ghost IS 'x'", &catalog()),
+        Err(Error::TableNotFound { .. }),
+    ));
+}
+
+#[test]
+fn comment_on_sequence_and_view_use_their_catalog_keys() {
+    let LogicalPlan::Comment(p) = plan("COMMENT ON SEQUENCE app.s IS 'x'", &catalog()).unwrap()
+    else {
+        panic!("expected Comment plan");
+    };
+    assert_eq!(
+        p.target,
+        CommentObject::Sequence {
+            key: "app.s".to_owned(),
+        }
+    );
+    let LogicalPlan::Comment(p) = plan("COMMENT ON SEQUENCE public.s IS 'x'", &catalog()).unwrap()
+    else {
+        panic!("expected Comment plan");
+    };
+    assert_eq!(
+        p.target,
+        CommentObject::Sequence {
+            key: "s".to_owned()
+        }
+    );
+    let LogicalPlan::Comment(p) = plan("COMMENT ON VIEW app.v IS 'x'", &catalog()).unwrap() else {
+        panic!("expected Comment plan");
+    };
+    assert_eq!(
+        p.target,
+        CommentObject::View {
+            key: "app.v".to_owned(),
+        }
+    );
 }
 
 #[test]

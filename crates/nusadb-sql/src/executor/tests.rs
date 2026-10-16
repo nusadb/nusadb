@@ -745,7 +745,103 @@ fn explain_comment_renders_target() {
     let engine = setup();
     let (_, rows) = rows_of(run("EXPLAIN COMMENT ON COLUMN users.name IS 'x'", &engine).unwrap());
     let plan = format!("{rows:?}");
-    assert!(plan.contains("Comment: users.name"), "{plan}");
+    assert!(plan.contains("Comment: COLUMN users.name"), "{plan}");
+}
+
+/// The rows of `information_schema.nusadb_comments`, as text, in the view's order.
+fn comments(engine: &MockEngine) -> Vec<Vec<String>> {
+    let (_, rows) = rows_of(
+        run(
+            "SELECT object_type, object_schema, table_name, object_name, description \
+             FROM information_schema.nusadb_comments",
+            engine,
+        )
+        .unwrap(),
+    );
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|v| match v {
+                    Value::Text(s) => s,
+                    Value::Null => "NULL".to_owned(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn texts(row: &[&str]) -> Vec<String> {
+    row.iter().map(|s| (*s).to_owned()).collect()
+}
+
+#[test]
+fn comments_are_stored_replaced_and_cleared() {
+    let engine = setup();
+    assert!(comments(&engine).is_empty());
+    run("COMMENT ON TABLE users IS 'accounts'", &engine).unwrap();
+    run("COMMENT ON COLUMN users.name IS 'display name'", &engine).unwrap();
+    assert_eq!(
+        comments(&engine),
+        vec![
+            texts(&["COLUMN", "public", "users", "name", "display name"]),
+            texts(&["TABLE", "public", "users", "users", "accounts"]),
+        ]
+    );
+    // A second comment replaces the first; `IS NULL` removes it.
+    run("COMMENT ON TABLE users IS 'people'", &engine).unwrap();
+    run("COMMENT ON COLUMN users.name IS NULL", &engine).unwrap();
+    assert_eq!(
+        comments(&engine),
+        vec![texts(&["TABLE", "public", "users", "users", "people"])]
+    );
+    // Clearing a comment that was never set is not an error.
+    run("COMMENT ON COLUMN users.age IS NULL", &engine).unwrap();
+}
+
+#[test]
+fn comment_follows_table_and_column_renames_and_drops() {
+    let engine = setup();
+    run("COMMENT ON TABLE users IS 'accounts'", &engine).unwrap();
+    run("COMMENT ON COLUMN users.name IS 'display name'", &engine).unwrap();
+    run("ALTER TABLE users RENAME COLUMN name TO full_name", &engine).unwrap();
+    run("ALTER TABLE users RENAME TO people", &engine).unwrap();
+    assert_eq!(
+        comments(&engine),
+        vec![
+            texts(&["COLUMN", "public", "people", "full_name", "display name"]),
+            texts(&["TABLE", "public", "people", "people", "accounts"]),
+        ]
+    );
+    run("ALTER TABLE people DROP COLUMN full_name", &engine).unwrap();
+    assert_eq!(
+        comments(&engine),
+        vec![texts(&["TABLE", "public", "people", "people", "accounts"])]
+    );
+    run("DROP TABLE people", &engine).unwrap();
+    assert!(comments(&engine).is_empty());
+    // A new table under the old name starts without a comment.
+    run("CREATE TABLE people (id INT)", &engine).unwrap();
+    assert!(comments(&engine).is_empty());
+}
+
+#[test]
+fn comment_on_missing_objects_reports_each_kind() {
+    let engine = setup();
+    let code = |sql: &str| run(sql, &engine).unwrap_err().sqlstate();
+    assert_eq!(code("COMMENT ON CONSTRAINT nope ON users IS 'x'"), "42704");
+    assert_eq!(code("COMMENT ON TRIGGER nope ON users IS 'x'"), "42704");
+    assert_eq!(code("COMMENT ON INDEX nope IS 'x'"), "42704");
+    assert_eq!(code("COMMENT ON FUNCTION nope IS 'x'"), "42883");
+    assert_eq!(code("COMMENT ON PROCEDURE nope IS 'x'"), "42883");
+    assert_eq!(code("COMMENT ON VIEW nope IS 'x'"), "42P01");
+    assert_eq!(code("COMMENT ON MATERIALIZED VIEW nope IS 'x'"), "42P01");
+    assert_eq!(code("COMMENT ON SCHEMA nope IS 'x'"), "3F000");
+    assert_eq!(code("COMMENT ON SEQUENCE nope IS 'x'"), "42704");
+    assert_eq!(code("COMMENT ON TYPE nope IS 'x'"), "42704");
+    assert_eq!(code("COMMENT ON DOMAIN nope IS 'x'"), "42704");
+    // A table is not a view.
+    assert_eq!(code("COMMENT ON VIEW users IS 'x'"), "42809");
 }
 
 #[test]
