@@ -145,10 +145,52 @@ fn exclude_equality_constraint_rewrites_to_unique() {
     assert_eq!(name.as_deref(), Some("u"));
     assert_eq!(columns, vec!["a".to_owned(), "b".to_owned()]);
 
-    // Forms the equality reduction cannot express are refused, not silently accepted.
-    assert!(parse("CREATE TABLE t (a INT, EXCLUDE USING gist (a WITH &&))").is_err());
+    // Forms the equality reduction cannot express become a general exclusion constraint.
+    let exclusion = |sql: &str| -> (Option<String>, ast::ExclusionDecl) {
+        let ast::Statement::CreateTable(ct) = ok(sql) else {
+            panic!("expected CreateTable");
+        };
+        ct.constraints
+            .iter()
+            .find_map(|c| match c {
+                ast::TableConstraint::Exclusion { name, decl } => {
+                    Some((name.clone(), decl.clone()))
+                },
+                _ => None,
+            })
+            .expect("an Exclusion constraint")
+    };
+    let (name, decl) = exclusion(
+        "CREATE TABLE h (k INT, a TIMESTAMPTZ, b TIMESTAMPTZ, CONSTRAINT h_x EXCLUDE USING gist \
+         (k WITH =, tstzrange(a, b) WITH &&))",
+    );
+    assert_eq!(name.as_deref(), Some("h_x"));
+    assert_eq!(
+        decl.definition(),
+        "EXCLUDE USING gist (k WITH =, tstzrange(a, b) WITH &&)"
+    );
+    let (_, decl) = exclusion("CREATE TABLE t (a INT, EXCLUDE (a WITH =) WHERE (a > 0))");
+    assert_eq!(
+        decl.definition(),
+        "EXCLUDE USING gist (a WITH =) WHERE (a > 0)"
+    );
+    let (_, decl) = exclusion("CREATE TABLE t (s TEXT, EXCLUDE USING btree ((lower(s)) WITH =))");
+    assert_eq!(decl.elements.len(), 1);
+    assert_eq!(decl.method, "btree");
+    // ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE.
+    let ast::Statement::AlterTable(alter) =
+        ok("ALTER TABLE t ADD CONSTRAINT x EXCLUDE USING gist (r WITH &&)")
+    else {
+        panic!("expected AlterTable");
+    };
+    assert!(format!("{alter:?}").contains("Exclusion"));
+
+    // Operators other than `=` / `&&`, other access methods and malformed elements are refused.
     assert!(parse("CREATE TABLE t (a INT, EXCLUDE (a WITH <>))").is_err());
-    assert!(parse("CREATE TABLE t (a INT, EXCLUDE (a WITH =) WHERE (a > 0))").is_err());
+    assert!(parse("CREATE TABLE t (a INT4RANGE, EXCLUDE USING hash (a WITH &&))").is_err());
+    assert!(parse("CREATE TABLE t (a INT, EXCLUDE (a WITH =) WHERE a > 0)").is_err());
+    assert!(parse("CREATE TABLE t (a INT, EXCLUDE (WITH =))").is_err());
+    assert!(parse("CREATE TABLE t (a INT, EXCLUDE (a WITH))").is_err());
 }
 
 #[test]

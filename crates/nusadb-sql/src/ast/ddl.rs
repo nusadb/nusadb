@@ -1068,6 +1068,102 @@ pub enum TableConstraint {
         /// the executor can re-parse and enforce it per row on later `INSERT`/`UPDATE`.
         predicate_sql: String,
     },
+    /// `[CONSTRAINT name] EXCLUDE [USING method] (element WITH op, ...) [WHERE (predicate)]` with
+    /// at least one `&&` element, expression element or `WHERE` clause. (The all-plain-column `=`
+    /// form without `WHERE` is exactly a `UNIQUE` constraint and parses as [`Self::Unique`].)
+    Exclusion {
+        /// Optional constraint name.
+        name: Option<String>,
+        /// The elements, operators and optional predicate.
+        decl: ExclusionDecl,
+    },
+}
+
+/// The operator of one exclusion-constraint element: two rows conflict when every element's
+/// operator holds between their values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionOp {
+    /// `WITH =`: the values are equal.
+    Equal,
+    /// `WITH &&`: the range values overlap.
+    Overlap,
+}
+
+impl ExclusionOp {
+    /// The operator as written in SQL.
+    #[must_use]
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::Overlap => "&&",
+        }
+    }
+}
+
+/// One element of an exclusion constraint: an expression over the row and its operator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExclusionElement {
+    /// The column or expression.
+    pub expr: Expr,
+    /// The expression's SQL text, for messages and the constraint's definition.
+    pub sql: String,
+    /// The operator compared with.
+    pub op: ExclusionOp,
+}
+
+/// A parsed exclusion constraint (`EXCLUDE ... (element WITH op, ...) [WHERE (predicate)]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExclusionDecl {
+    /// The access-method name as written (`gist` or `btree`; `gist` when omitted). Informational:
+    /// the constraint is enforced the same way whatever the name.
+    pub method: String,
+    /// The index the constraint created for itself over its `=` columns, if any. Only this index
+    /// is ever dropped or skipped on the constraint's behalf.
+    pub index: Option<String>,
+    /// The elements, in declaration order; never empty.
+    pub elements: Vec<ExclusionElement>,
+    /// The partial-constraint predicate: only rows for which it is true take part.
+    pub predicate: Option<Expr>,
+    /// The predicate's SQL text.
+    pub predicate_sql: Option<String>,
+    /// The canonical stored form persisted in the constraint catalog (see
+    /// `parser::exclusion`), re-parsed by the executor to enforce the constraint.
+    pub spec_sql: String,
+}
+
+impl ExclusionDecl {
+    /// The stored form of this declaration (see `parser::exclusion`), recording `index` as the
+    /// index the constraint owns.
+    #[must_use]
+    pub fn stored_form(&self, index: Option<&str>) -> String {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut args = vec![quote(&self.method), quote(index.unwrap_or_default())];
+        for element in &self.elements {
+            args.push(element.sql.clone());
+            args.push(quote(element.op.as_sql()));
+        }
+        if let Some(predicate) = &self.predicate_sql {
+            args.push(format!("({predicate})"));
+        }
+        format!("__nusadb_exclude({})", args.join(", "))
+    }
+
+    /// The constraint's definition as SQL: `EXCLUDE USING gist (a WITH =, r WITH &&) WHERE (p)`.
+    #[must_use]
+    pub fn definition(&self) -> String {
+        let elements: Vec<String> = self
+            .elements
+            .iter()
+            .map(|e| format!("{} WITH {}", e.sql, e.op.as_sql()))
+            .collect();
+        let mut out = format!("EXCLUDE USING {} ({})", self.method, elements.join(", "));
+        if let Some(predicate) = &self.predicate_sql {
+            out.push_str(" WHERE (");
+            out.push_str(predicate);
+            out.push(')');
+        }
+        out
+    }
 }
 
 /// A referential action for a foreign key's `ON DELETE` / `ON UPDATE` clause.

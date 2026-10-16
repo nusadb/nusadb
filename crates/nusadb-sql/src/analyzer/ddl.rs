@@ -119,7 +119,17 @@ pub(super) fn analyze_create_table(
     let name_base = super::qualified_display(&target_schema, &ct.name);
     let unique_constraints = resolve_unique_constraints(&ct, &name_base)?;
     let foreign_keys = resolve_foreign_keys(&ct, &name_base)?;
-    let check_constraints = resolve_check_constraints(&ct, &name_base, catalog)?;
+    let mut check_constraints = resolve_check_constraints(&ct, &name_base, catalog)?;
+    let exclusions = resolve_exclusion_constraints(&ct, &name_base, catalog)?;
+    if !exclusions.is_empty() && partition_by.is_some() {
+        return Err(Error::Unsupported(
+            "an EXCLUDE constraint on a partitioned table is not supported (declare it on each \
+             partition)"
+                .to_owned(),
+        ));
+    }
+    // An exclusion constraint is persisted like a CHECK, its stored form telling it apart.
+    check_constraints.extend(exclusions);
     let defaults = resolve_column_defaults(&ct, &name_base, catalog)?;
     // A CHECK / FOREIGN KEY on a partitioned parent is declared on the parent and copied onto each
     // partition as it joins (the executor), where the rows live.
@@ -448,6 +458,86 @@ fn resolve_check_constraints(
     Ok(specs)
 }
 
+/// Resolve the `EXCLUDE` constraints of a `CREATE TABLE` (see [`validate_exclusion`]). Each one is
+/// carried as a [`CheckSpec`] whose text is the constraint's tagged stored form: the constraint
+/// catalog holds both kinds, and only the tag (which no SQL text can carry) tells them apart.
+fn resolve_exclusion_constraints(
+    ct: &ast::CreateTable,
+    name_base: &str,
+    catalog: &dyn Catalog,
+) -> Result<Vec<CheckSpec>, Error> {
+    let scope = create_table_scope(ct);
+    let mut specs = Vec::new();
+    let mut seq = 0;
+    for constraint in &ct.constraints {
+        let ast::TableConstraint::Exclusion { name, decl } = constraint else {
+            continue;
+        };
+        validate_exclusion(decl, &scope, catalog)?;
+        let name = name.clone().unwrap_or_else(|| {
+            seq += 1;
+            if seq == 1 {
+                format!("{name_base}_excl")
+            } else {
+                format!("{name_base}_excl{seq}")
+            }
+        });
+        specs.push(CheckSpec {
+            name,
+            // Tagged: the executor registers it as an exclusion constraint, never as a CHECK.
+            predicate_sql: crate::parser::tag_exclusion_spec(&decl.spec_sql),
+        });
+    }
+    Ok(specs)
+}
+
+/// Type-check an exclusion constraint against `scope`: every `&&` element must be a range, every
+/// element and the `WHERE` predicate must be free of subqueries and call only immutable functions
+/// (they are re-evaluated on every write), and the predicate must be boolean.
+pub(super) fn validate_exclusion(
+    decl: &ast::ExclusionDecl,
+    scope: &[ScopedColumn],
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    for element in &decl.elements {
+        let typed = analyze_expr(&element.expr, scope, catalog, None)?;
+        if element.op == ast::ExclusionOp::Overlap && !matches!(typed.ty, ColumnType::Range(_)) {
+            return Err(Error::Coded {
+                message: format!(
+                    "EXCLUDE element {} WITH && needs a range value, found {:?}",
+                    element.sql, typed.ty
+                ),
+                sqlstate: "42804",
+            });
+        }
+        if crate::executor::ops::contains_subquery(&typed) {
+            return Err(Error::Unsupported(
+                "an exclusion constraint element may not contain a subquery".to_owned(),
+            ));
+        }
+        // Each write re-evaluates the elements of the existing rows it compares with, so their
+        // value must never change: immutable functions only (42P17), as for an index key.
+        super::require_immutable(&typed, "an exclusion constraint")?;
+    }
+    if let Some(predicate) = &decl.predicate {
+        let typed = analyze_expr(predicate, scope, catalog, Some(ColumnType::Bool))?;
+        if typed.ty != ColumnType::Bool {
+            return Err(Error::TypeMismatch {
+                context: "exclusion constraint WHERE predicate".to_owned(),
+                expected: ColumnType::Bool,
+                found: typed.ty,
+            });
+        }
+        if crate::executor::ops::contains_subquery(&typed) {
+            return Err(Error::Unsupported(
+                "an exclusion constraint WHERE predicate may not contain a subquery".to_owned(),
+            ));
+        }
+        super::require_immutable(&typed, "an exclusion constraint WHERE predicate")?;
+    }
+    Ok(())
+}
+
 /// Type-check a `CHECK` predicate against `scope`: it must be boolean and subquery-free (the
 /// executor re-checks it against a row-only scope on every write, where a subquery cannot resolve).
 fn validate_check_predicate(
@@ -756,9 +846,11 @@ fn resolve_unique_constraints(
                     nulls_not_distinct,
                 });
             },
-            // Foreign keys / CHECK are resolved separately (`resolve_foreign_keys` /
-            // `resolve_check_constraints`).
-            ast::TableConstraint::ForeignKey { .. } | ast::TableConstraint::Check { .. } => {},
+            // Foreign keys / CHECK / EXCLUDE are resolved separately (`resolve_foreign_keys` /
+            // `resolve_check_constraints` / `resolve_exclusion_constraints`).
+            ast::TableConstraint::ForeignKey { .. }
+            | ast::TableConstraint::Check { .. }
+            | ast::TableConstraint::Exclusion { .. } => {},
         }
     }
 
@@ -1303,6 +1395,15 @@ fn analyze_add_constraint(
                 name: name.unwrap_or_else(|| format!("{name_base}_check")),
                 predicate_sql,
                 predicate,
+                table,
+            });
+        },
+        ast::TableConstraint::Exclusion { name, decl } => {
+            let scope = single_table_scope(&table);
+            validate_exclusion(&decl, &scope, catalog)?;
+            return Ok(AlterTablePlan::AddExclusion {
+                name: name.unwrap_or_else(|| format!("{name_base}_excl")),
+                spec_sql: decl.spec_sql,
                 table,
             });
         },

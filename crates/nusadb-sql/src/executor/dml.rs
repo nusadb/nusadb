@@ -927,6 +927,8 @@ struct DeferredUnique {
     /// a constraint without a backing index), the O(N) key set + one end-of-stream scan below is used
     /// instead, because an ineligible probe would degrade to an O(table) scan *per batch* — quadratic.
     eligible: bool,
+    /// The statement's exclusion-constraint check, run once at the end of the stream.
+    exclusion: super::exclusion::Deferred,
 }
 
 impl DeferredUnique {
@@ -976,6 +978,7 @@ impl DeferredUnique {
             seen,
             inserted: HashSet::new(),
             eligible,
+            exclusion: super::exclusion::Deferred::load(table, engine, txn)?,
         })
     }
 
@@ -1023,6 +1026,7 @@ impl DeferredUnique {
     /// Record a written row's tid so [`finish`](Self::finish) does not count the statement's own
     /// rows as duplicates.
     fn record_inserted(&mut self, tid: Tid) {
+        self.exclusion.record(tid);
         // Only the end-of-stream scan (the ineligible path) needs to exclude our own rows by tid; the
         // index-probe path runs no such scan, so it records nothing (keeping its memory O(batch)).
         if !self.constraints.is_empty() && !self.eligible {
@@ -1038,6 +1042,7 @@ impl DeferredUnique {
         engine: &dyn StorageEngine,
         txn: TxnId,
     ) -> Result<(), Error> {
+        self.exclusion.finish(table, engine, txn)?;
         // The index-probe path (`eligible`) checked every batch against the backing index as it
         // streamed, so there is nothing left to verify; only the accumulating path needs this scan.
         if self.constraints.is_empty() || self.eligible {
@@ -1561,13 +1566,18 @@ fn insert_rows_with_unique(
     // `ON CONFLICT DO NOTHING`: drop the rows that would violate a UNIQUE/PRIMARY KEY
     // constraint (against existing rows or an earlier row in this batch) so the rest still insert.
     let full_rows = if conflict_do_nothing {
-        keep_non_conflicting(table, full_rows, engine, txn)?
+        let kept = keep_non_conflicting(table, full_rows, engine, txn)?;
+        // ... and the rows that would violate an exclusion constraint.
+        super::exclusion::keep_non_conflicting(table, kept, engine, txn)?
     } else {
         full_rows
     };
 
     match deferred.as_deref_mut() {
-        Some(collector) => collector.admit_batch(table, &full_rows, engine, txn)?,
+        Some(collector) => {
+            collector.admit_batch(table, &full_rows, engine, txn)?;
+            collector.exclusion.admit(table, &full_rows, engine, txn)?;
+        },
         None => enforce_unique_on_insert(table, &full_rows, engine, txn)?,
     }
     // The statement's own rows are offered as parent material, so a child may reference a parent
@@ -1575,6 +1585,10 @@ fn insert_rows_with_unique(
     // work of undoing a refused batch.
     enforce_fk_on_child_write(table, &full_rows, &full_rows, engine, txn)?;
     enforce_check_on_write(table, &full_rows, engine, txn)?;
+    // A batched statement checks its exclusion constraints once, at the end of the stream.
+    if deferred.is_none() {
+        super::exclusion::enforce_on_write(table, &full_rows, &HashSet::new(), &[], engine, txn)?;
+    }
 
     let index_targets = secondary_index_targets(table, engine)?;
     // A bulk insert — COPY or a streamed INSERT ... SELECT, the callers that pass a cross-batch
@@ -2011,6 +2025,18 @@ fn upsert_rows(
     // own rows count as parent material for a key pointing back at this table.
     enforce_fk_on_child_write(table, &affected, &affected, engine, txn)?;
     enforce_check_on_write(table, &affected, engine, txn)?;
+    {
+        let updated_tids: HashSet<Tid> = updates.iter().map(|(tid, _, _)| *tid).collect();
+        let old_images: Vec<Row> = updates.iter().map(|(_, old, _)| old.clone()).collect();
+        super::exclusion::enforce_on_write(
+            table,
+            &affected,
+            &updated_tids,
+            &old_images,
+            engine,
+            txn,
+        )?;
+    }
 
     // A DO UPDATE assignment may not move the row out of its partition's bound either — the same
     // stranding the plain-UPDATE guard refuses (the reference engine refuses the move here too).
@@ -2874,7 +2900,7 @@ fn lock_unique_keys(
 /// their debug strings would let two cross-representation writers of the same key skip the lock.
 /// Any residual collision only *over*-serializes (the real uniqueness scan still runs); it never
 /// mis-enforces, so a coarse-but-consistent hash is safe.
-fn unique_key_hash(table: &TableSchema, columns: &[String], key: &[ast::Value]) -> u64 {
+pub(super) fn unique_key_hash(table: &TableSchema, columns: &[String], key: &[ast::Value]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     table.id.0.hash(&mut hasher);
@@ -3549,7 +3575,10 @@ pub(super) fn enforce_check_on_write(
     let checks: Vec<(String, crate::planner::TypedExpr)> = engine
         .list_constraints_as_of(txn, table.id)?
         .into_iter()
-        .filter(|c| c.kind == nusadb_core::engine::ConstraintKind::Check)
+        .filter(|c| {
+            c.kind == nusadb_core::engine::ConstraintKind::Check
+                && !super::exclusion::is_exclusion(c)
+        })
         .map(|c| {
             let bytes = c.expr.ok_or_else(|| {
                 nusadb_core::Error::ConstraintViolation(format!(
@@ -3694,6 +3723,12 @@ fn cascade_update_children(
     } else {
         Vec::new()
     };
+    // The child's exclusion constraints, checked per row after its BEFORE triggers. Every row the
+    // action rewrites has its old version left out by Tid; the rows already rewritten are compared
+    // through their new versions (this transaction's own writes), so two rewritten rows that come
+    // to conflict are caught too.
+    let exclusions = super::exclusion::load(child, engine, txn)?;
+    let rewritten: HashSet<Tid> = changes.iter().map(|(tid, _, _)| *tid).collect();
     // Each rewritten row at its new address, for the child's own foreign keys below.
     let mut written: Vec<(Tid, Row, Row)> = Vec::with_capacity(changes.len());
     for (tid, old, mut new) in changes {
@@ -3720,6 +3755,15 @@ fn cascade_update_children(
             }
             enforce_check_on_write(child, std::slice::from_ref(&new), engine, txn)?;
         }
+        super::exclusion::enforce_compiled(
+            &exclusions,
+            child,
+            std::slice::from_ref(&new),
+            &rewritten,
+            std::slice::from_ref(&old),
+            engine,
+            txn,
+        )?;
         let bytes = row::encode(&new, &child_types)?;
         let new_tid = engine.update(txn, child.id, tid, &bytes)?;
         // Maintain the child's secondary indexes for the rewritten row version, as `run_update`
@@ -4916,7 +4960,10 @@ fn run_update_single(
     let has_ivm = super::ivm::has_views_for_base(engine, txn, &plan.table.name)?;
     // An update through a partitioned parent may move a row, which fires the source partition's
     // DELETE row triggers with the old row.
+    // An exclusion constraint compares the old images too (an unchanged row is not re-checked).
+    let has_exclusion = super::exclusion::table_has_exclusion(&plan.table, engine, txn)?;
     let track_old = is_fk_parent
+        || has_exclusion
         || !index_targets.is_empty()
         || triggers.needs_old_image()
         || has_ivm
@@ -5148,6 +5195,21 @@ fn run_update_single(
     }
     enforce_fk_on_child_write(&plan.table, &updated_rows, &updated_rows, engine, txn)?;
     enforce_check_on_write(&plan.table, &updated_rows, engine, txn)?;
+    if has_exclusion {
+        let rewritten: HashSet<Tid> = to_update.iter().map(|(tid, _, _)| *tid).collect();
+        let olds: Vec<Row> = to_update
+            .iter()
+            .filter_map(|(_, old, _)| old.clone())
+            .collect();
+        super::exclusion::enforce_on_write(
+            &plan.table,
+            &updated_rows,
+            &rewritten,
+            &olds,
+            engine,
+            txn,
+        )?;
+    }
     // …and a changed parent key must be propagated to its children (ON UPDATE) before any write.
     if is_fk_parent {
         let fk_changes: Vec<(Tid, Row, Row)> = to_update
@@ -6422,6 +6484,19 @@ fn commit_merge_updates(
     }
     enforce_fk_on_child_write(table, &new_rows, &new_rows, engine, txn)?;
     enforce_check_on_write(table, &new_rows, engine, txn)?;
+    {
+        let rewritten: HashSet<Tid> = updates
+            .iter()
+            .map(|(tid, _, _)| *tid)
+            .chain(deletes.iter().map(|(tid, _)| *tid))
+            .collect();
+        let olds: Vec<Row> = updates
+            .iter()
+            .map(|(_, old, _)| old.clone())
+            .chain(deletes.iter().map(|(_, old)| old.clone()))
+            .collect();
+        super::exclusion::enforce_on_write(table, &new_rows, &rewritten, &olds, engine, txn)?;
+    }
     if table_is_fk_parent(table, engine, txn)? {
         enforce_fk_on_parent_update(table, updates, engine, txn)?;
     }

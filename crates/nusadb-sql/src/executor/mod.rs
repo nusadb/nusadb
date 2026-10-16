@@ -132,6 +132,7 @@ mod dcl;
 mod ddl;
 mod dml;
 mod dml_join;
+mod exclusion;
 mod function;
 mod index_key;
 mod inheritance;

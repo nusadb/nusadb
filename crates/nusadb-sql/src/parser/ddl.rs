@@ -369,6 +369,7 @@ pub(super) fn convert_column_def(
                 if check.enforced.is_some() {
                     return unsupported("CHECK constraint with ENFORCED / NOT ENFORCED");
                 }
+                super::exclusion::refuse_marker_check(&check.expr)?;
                 lifted.push(ast::TableConstraint::Check {
                     name: constraint_name,
                     predicate_sql: check.expr.to_string(),
@@ -1566,6 +1567,13 @@ pub(super) fn convert_table_constraint(
         T::Check(check) => {
             if check.enforced.is_some() {
                 return unsupported("CHECK constraint with ENFORCED / NOT ENFORCED");
+            }
+            // An `EXCLUDE` constraint arrives as a `CHECK` around the pre-parse marker call.
+            if let Some(decl) = super::exclusion::classify_check(&check.expr)? {
+                return Ok(ast::TableConstraint::Exclusion {
+                    name: check.name.as_ref().map(fold_ident),
+                    decl,
+                });
             }
             Ok(ast::TableConstraint::Check {
                 name: check.name.as_ref().map(fold_ident),

@@ -202,7 +202,10 @@ fn index_names_column(def: &IndexDef, column: &str) -> bool {
 fn check_names_column(c: &Constraint, column: &str) -> bool {
     c.expr
         .as_deref()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|bytes| {
+            // An exclusion constraint's text is its stored form behind a tag.
+            crate::parser::untag_exclusion_spec(bytes).or_else(|| std::str::from_utf8(bytes).ok())
+        })
         .is_some_and(|sql| crate::parser::sql_references_column(sql, column))
 }
 
@@ -320,6 +323,11 @@ pub(super) fn drop_column_dependents(
         };
         if goes {
             engine.drop_constraint(txn, table.id, &c.name)?;
+            // An exclusion constraint's backing index goes with it (unless it already went with
+            // the column above).
+            if let Some(spec) = super::exclusion::stored_spec(c) {
+                super::exclusion::drop_owned_index(table, spec, engine, txn)?;
+            }
         }
     }
     super::shift_vector_indexes_for_drop(engine, txn, &table.name, index)?;
@@ -469,7 +477,13 @@ pub(super) fn reattach_after_rename(
         backfill_named_index(&renamed, &def.name, engine, txn)?;
     }
     for (name, sql) in detached.checks {
-        let sql = crate::parser::rename_column_in_sql(&sql, from, to)?;
+        // An exclusion constraint's stored form is renamed inside its tag.
+        let sql = match crate::parser::untag_exclusion_spec(sql.as_bytes()) {
+            Some(spec) => crate::parser::tag_exclusion_spec(&crate::parser::rename_column_in_sql(
+                spec, from, to,
+            )?),
+            None => crate::parser::rename_column_in_sql(&sql, from, to)?,
+        };
         engine.add_check_constraint(txn, table.id, &name, sql.as_bytes())?;
     }
     for mut fk in detached.fks {

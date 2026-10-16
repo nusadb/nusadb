@@ -1,7 +1,7 @@
 # EXCLUDE constraint (equality form): `EXCLUDE (a WITH =)` rejects two rows whose a values are equal
 # — exactly a UNIQUE constraint, including that NULLs do not conflict. NusaDB reduces the equality
-# form to UNIQUE; operators other than `=` (which would need an overlap index), a USING method other
-# than btree, and a WHERE partial predicate are refused rather than mishandled.
+# form to UNIQUE. The overlap and partial forms are covered by exclude_overlap.slt; an operator other
+# than `=` / `&&`, or `&&` on a non-range, is refused rather than mishandled.
 
 statement ok
 CREATE TABLE t (a INT, EXCLUDE (a WITH =))
@@ -50,12 +50,19 @@ INSERT INTO t3 VALUES (5)
 statement error duplicate key
 INSERT INTO t3 VALUES (5)
 
-# Non-equality / overlap / partial forms are refused loudly.
+# `&&` on a non-range and an unsupported operator are refused loudly.
 statement error
 CREATE TABLE g (a INT, EXCLUDE USING gist (a WITH &&))
 
 statement error
 CREATE TABLE n (a INT, EXCLUDE (a WITH <>))
 
-statement error
+# A partial equality form is a general exclusion constraint: only rows matching WHERE take part.
+statement ok
 CREATE TABLE w (a INT, EXCLUDE (a WITH =) WHERE (a > 0))
+
+statement ok
+INSERT INTO w VALUES (-1), (-1), (1)
+
+statement error exclusion constraint
+INSERT INTO w VALUES (1)

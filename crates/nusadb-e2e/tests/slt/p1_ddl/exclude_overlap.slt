@@ -1,0 +1,684 @@
+# EXCLUDE constraints with range overlap: no two rows may have every element's operator hold
+# between them. Elements mix `=` (columns or expressions) and `&&` (range overlap). A row with a
+# NULL element, or an empty range, never conflicts; bound inclusivity is respected.
+
+# The history-table shape: per key, validity intervals must not overlap.
+statement ok
+CREATE TABLE hist (hist_id uuid PRIMARY KEY, k int NOT NULL, valid_from timestamptz NOT NULL, valid_to timestamptz, CONSTRAINT hist_no_overlap EXCLUDE USING gist (k WITH =, tstzrange(valid_from, valid_to) WITH &&))
+
+statement ok
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000001', 1, '2024-01-01 00:00:00+00', '2024-02-01 00:00:00+00')
+
+# Adjacent `[)` intervals do not overlap.
+statement ok
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000002', 1, '2024-02-01 00:00:00+00', NULL)
+
+# An open-ended interval overlaps everything after its start.
+statement error conflicting key value violates exclusion constraint "hist_no_overlap"
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000003', 1, '2030-01-01 00:00:00+00', '2030-02-01 00:00:00+00')
+
+# Overlapping a closed row is refused too.
+statement error exclusion constraint "hist_no_overlap"
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000004', 1, '2024-01-15 00:00:00+00', '2024-01-20 00:00:00+00')
+
+# Another key is independent.
+statement ok
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000005', 2, '2024-01-15 00:00:00+00', '2024-01-20 00:00:00+00')
+
+# Closing the open row then opening the next version: the SCD-2 step.
+statement ok
+UPDATE hist SET valid_to = '2024-06-01 00:00:00+00' WHERE hist_id = '00000000-0000-0000-0000-000000000002'
+
+statement ok
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000006', 1, '2024-06-01 00:00:00+00', NULL)
+
+# Moving an interval onto another row's is refused; the row itself is not a conflict.
+statement error exclusion constraint
+UPDATE hist SET valid_from = '2024-05-01 00:00:00+00' WHERE hist_id = '00000000-0000-0000-0000-000000000006'
+
+statement ok
+UPDATE hist SET valid_from = '2024-06-02 00:00:00+00' WHERE hist_id = '00000000-0000-0000-0000-000000000006'
+
+# Two conflicting rows in one statement.
+statement error exclusion constraint
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000007', 3, '2024-01-01 00:00:00+00', '2024-03-01 00:00:00+00'), ('00000000-0000-0000-0000-000000000008', 3, '2024-02-01 00:00:00+00', '2024-04-01 00:00:00+00')
+
+query I
+SELECT count(*) FROM hist
+----
+4
+
+query TT
+SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'hist' ORDER BY constraint_name
+----
+hist_no_overlap EXCLUDE
+hist_pkey PRIMARY KEY
+
+# Not a CHECK constraint.
+query I
+SELECT count(*) FROM information_schema.check_constraints WHERE constraint_name = 'hist_no_overlap'
+----
+0
+
+# The backing index over the `=` column.
+query T
+SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 'hist' AND index_name = 'hist_no_overlap'
+----
+hist_no_overlap
+
+# DROP CONSTRAINT lifts the rule and drops its index.
+statement ok
+ALTER TABLE hist DROP CONSTRAINT hist_no_overlap
+
+statement ok
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000009', 1, '2024-01-15 00:00:00+00', '2024-01-20 00:00:00+00')
+
+query I
+SELECT count(*) FROM information_schema.statistics WHERE index_name = 'hist_no_overlap'
+----
+0
+
+# ALTER TABLE ... ADD CONSTRAINT validates the existing rows.
+statement error exclusion constraint "hist_no_overlap2"
+ALTER TABLE hist ADD CONSTRAINT hist_no_overlap2 EXCLUDE USING gist (k WITH =, tstzrange(valid_from, valid_to) WITH &&)
+
+statement ok
+DELETE FROM hist WHERE hist_id = '00000000-0000-0000-0000-000000000009'
+
+statement ok
+ALTER TABLE hist ADD CONSTRAINT hist_no_overlap2 EXCLUDE USING gist (k WITH =, tstzrange(valid_from, valid_to) WITH &&)
+
+statement error exclusion constraint "hist_no_overlap2"
+INSERT INTO hist VALUES ('00000000-0000-0000-0000-000000000010', 1, '2024-01-15 00:00:00+00', '2024-01-20 00:00:00+00')
+
+# Every range kind, and bound inclusivity.
+statement ok
+CREATE TABLE r4 (r int4range, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+INSERT INTO r4 VALUES ('[1,5)'), ('[5,9)')
+
+statement error exclusion constraint
+INSERT INTO r4 VALUES ('[4,6)')
+
+# Discrete ranges canonicalize: (4,5] is [5,6), which meets [5,9).
+statement error exclusion constraint
+INSERT INTO r4 VALUES ('(4,5]')
+
+statement ok
+INSERT INTO r4 VALUES ('(8,10)'), ('[10,10]')
+
+statement error exclusion constraint
+INSERT INTO r4 VALUES ('[10,11)')
+
+# Empty ranges and NULLs never conflict.
+statement ok
+INSERT INTO r4 VALUES ('empty'), ('empty'), (NULL), (NULL)
+
+statement ok
+CREATE TABLE r8 (r int8range, EXCLUDE (r WITH &&))
+
+statement ok
+INSERT INTO r8 VALUES (int8range(1, 10)), (int8range(10, 20))
+
+statement error exclusion constraint
+INSERT INTO r8 VALUES (int8range(19, 30))
+
+statement ok
+CREATE TABLE rn (r numrange, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+INSERT INTO rn VALUES ('[1.5,2.5)'), ('[2.5,3.5]')
+
+statement error exclusion constraint
+INSERT INTO rn VALUES ('(3.5,4)'), ('[3.5,4)')
+
+statement ok
+INSERT INTO rn VALUES ('(3.5,4)')
+
+statement ok
+CREATE TABLE rd (k text, r daterange, EXCLUDE USING gist (k WITH =, r WITH &&))
+
+statement ok
+INSERT INTO rd VALUES ('a', '[2024-01-01,2024-01-31]'), ('a', '[2024-02-01,2024-02-28]'), ('b', '[2024-01-01,2024-12-31]')
+
+statement error exclusion constraint
+INSERT INTO rd VALUES ('a', '[2024-01-31,2024-02-01)')
+
+statement ok
+CREATE TABLE rt (r tsrange, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+INSERT INTO rt VALUES ('[2024-01-01 10:00,2024-01-01 11:00)'), ('[2024-01-01 11:00,2024-01-01 12:00)')
+
+statement error exclusion constraint
+INSERT INTO rt VALUES ('(2024-01-01 10:59,2024-01-01 11:01)')
+
+statement ok
+CREATE TABLE rtz (r tstzrange, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+INSERT INTO rtz VALUES ('[2024-01-01 10:00+00,2024-01-01 11:00+00)')
+
+# The same instant written in another zone still overlaps.
+statement error exclusion constraint
+INSERT INTO rtz VALUES ('[2024-01-01 12:30+02,2024-01-01 12:45+02)')
+
+# Upsert: ON CONFLICT DO NOTHING skips a row that would violate the exclusion constraint.
+statement ok
+INSERT INTO r4 VALUES ('[100,110)'), ('[105,120)') ON CONFLICT DO NOTHING
+
+query T
+SELECT r FROM r4 WHERE r && '[100,200)' ORDER BY r
+----
+[100,110)
+
+# A partial constraint: only rows matching WHERE take part.
+statement ok
+CREATE TABLE booking (room int, during int4range, cancelled bool NOT NULL DEFAULT false, EXCLUDE USING gist (room WITH =, during WITH &&) WHERE (NOT cancelled))
+
+statement ok
+INSERT INTO booking VALUES (1, '[1,10)', false), (1, '[5,15)', true)
+
+statement error exclusion constraint
+INSERT INTO booking VALUES (1, '[8,12)', false)
+
+statement ok
+UPDATE booking SET cancelled = true WHERE during = '[1,10)'
+
+statement ok
+INSERT INTO booking VALUES (1, '[8,12)', false)
+
+# Un-cancelling a booking that now overlaps is refused.
+statement error exclusion constraint
+UPDATE booking SET cancelled = false WHERE during = '[1,10)'
+
+# An expression element WITH =.
+statement ok
+CREATE TABLE ci (name text, r int4range, EXCLUDE USING gist (lower(name) WITH =, r WITH &&))
+
+statement ok
+INSERT INTO ci VALUES ('Ann', '[1,5)')
+
+statement error exclusion constraint
+INSERT INTO ci VALUES ('ANN', '[3,4)')
+
+statement ok
+INSERT INTO ci VALUES ('Bob', '[3,4)')
+
+# Refused forms: && on a non-range, another operator, another access method.
+statement error range
+CREATE TABLE bad1 (a int, EXCLUDE USING gist (a WITH &&))
+
+statement error not supported
+CREATE TABLE bad2 (r int4range, EXCLUDE USING gist (r WITH <>))
+
+statement error not supported
+CREATE TABLE bad3 (r int4range, EXCLUDE USING hash (r WITH &&))
+
+# TRUNCATE keeps the constraint.
+statement ok
+TRUNCATE r8
+
+statement ok
+INSERT INTO r8 VALUES (int8range(1, 10))
+
+statement error exclusion constraint
+INSERT INTO r8 VALUES (int8range(5, 6))
+
+# RENAME COLUMN carries the constraint over to the new name.
+statement ok
+ALTER TABLE rd RENAME COLUMN r TO period
+
+statement error exclusion constraint
+INSERT INTO rd VALUES ('b', '[2024-06-01,2024-06-02)')
+
+# DROP COLUMN drops the constraint that uses it.
+statement ok
+ALTER TABLE rd DROP COLUMN period
+
+statement ok
+INSERT INTO rd VALUES ('b')
+
+query I
+SELECT count(*) FROM information_schema.table_constraints WHERE table_name = 'rd'
+----
+0
+
+# Deferrable exclusion constraints and INCLUDE are refused.
+statement error deferrable EXCLUDE constraint is not supported
+CREATE TABLE bad4 (r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED)
+
+statement error deferrable EXCLUDE constraint is not supported
+CREATE TABLE bad5 (r int4range, EXCLUDE USING gist (r WITH &&) WHERE (r IS NOT NULL) INITIALLY IMMEDIATE)
+
+statement error INCLUDE
+CREATE TABLE bad6 (r int4range, x int, EXCLUDE USING gist (r WITH &&) INCLUDE (x))
+
+# A partitioned table is refused (declare the constraint on each partition).
+statement error partitioned
+CREATE TABLE pt (k int, r int4range, EXCLUDE USING gist (k WITH =, r WITH &&)) PARTITION BY RANGE (k)
+
+# ALTER COLUMN TYPE re-checks the constraint: 1.4 and 1.2 both become 1 as int.
+statement ok
+CREATE TABLE act (k numeric, r numrange, EXCLUDE (k WITH =, r WITH &&))
+
+statement ok
+INSERT INTO act VALUES (1.4, '[1,5)'), (1.2, '[2,3)')
+
+statement error 23P01|exclusion constraint
+ALTER TABLE act ALTER COLUMN k TYPE int
+
+query T
+SELECT k FROM act ORDER BY k
+----
+1.2
+1.4
+
+statement ok
+CREATE TABLE act2 (k text, r int4range, EXCLUDE (k WITH =, r WITH &&))
+
+statement ok
+INSERT INTO act2 VALUES ('a', '[1,5)'), ('a  ', '[2,3)')
+
+statement error exclusion constraint
+ALTER TABLE act2 ALTER COLUMN k TYPE char(1)
+
+# A type change that keeps the rows apart is fine.
+statement ok
+ALTER TABLE act2 ALTER COLUMN k TYPE varchar(10)
+
+# DROP CONSTRAINT never drops a user's index that shares the constraint's name.
+statement ok
+CREATE TABLE ad2 (k int, r int4range)
+
+statement ok
+CREATE INDEX ad2_x ON ad2 (k)
+
+statement ok
+ALTER TABLE ad2 ADD CONSTRAINT ad2_x EXCLUDE (k WITH =, r WITH &&)
+
+statement ok
+INSERT INTO ad2 VALUES (1, '[1,5)')
+
+statement error exclusion constraint "ad2_x"
+INSERT INTO ad2 VALUES (1, '[4,6)')
+
+statement ok
+ALTER TABLE ad2 DROP CONSTRAINT ad2_x
+
+query T
+SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 'ad2'
+----
+ad2_x
+
+# A user's index of the same name also survives DROP COLUMN of a range column.
+statement ok
+ALTER TABLE ad2 ADD CONSTRAINT ad2_x EXCLUDE (k WITH =, r WITH &&)
+
+statement ok
+ALTER TABLE ad2 DROP COLUMN r
+
+query T
+SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 'ad2'
+----
+ad2_x
+
+# NaN in a floating-point `=` element: no automatic index, NaN equals NaN as in the executor's
+# total order.
+statement ok
+CREATE TABLE fl (f float8, r int4range, CONSTRAINT fl_x EXCLUDE (f WITH =, r WITH &&))
+
+statement ok
+INSERT INTO fl VALUES ('NaN', '[1,5)'), (1.5, '[1,5)')
+
+statement error exclusion constraint "fl_x"
+INSERT INTO fl VALUES ('NaN', '[2,3)')
+
+query I
+SELECT count(*) FROM information_schema.statistics WHERE table_name = 'fl'
+----
+0
+
+# Elements and the predicate must be immutable.
+statement error 42P17|must be immutable
+CREATE TABLE vol1 (t timestamptz, EXCLUDE USING gist (tstzrange(t, now()) WITH &&))
+
+statement error must be immutable
+CREATE TABLE vol2 (r int4range, t timestamptz, EXCLUDE USING gist (r WITH &&) WHERE (t < now()))
+
+statement error exclusion constraint WHERE predicate
+CREATE TABLE vol3 (r int4range, EXCLUDE USING gist (r WITH &&) WHERE (1))
+
+# The exclusion constraint's internal marker name is reserved: a CHECK cannot pose as an
+# exclusion constraint, and no function or procedure may take that name.
+statement error reserved name
+CREATE TABLE fake (r int4range, CHECK (__nusadb_exclude('gist', '', r, '&&')))
+
+statement error reserved name
+CREATE TABLE fake1 (r int4range, CONSTRAINT c CHECK (__NUSADB_EXCLUDE('gist', '', r, '&&')))
+
+# Outside a CHECK the name is an ordinary (here unknown) function.
+statement error unknown function
+SELECT __nusadb_exclude(1)
+
+# A column-level CHECK calling it is refused too.
+statement error reserved name
+CREATE TABLE fake2 (r int4range CHECK (__nusadb_exclude('gist', '', r, '&&')))
+
+statement error reserved name
+CREATE FUNCTION __nusadb_exclude(a int) RETURNS int AS 'SELECT 1' LANGUAGE SQL
+
+statement error reserved name
+CREATE PROCEDURE __nusadb_exclude() AS 'SELECT 1'
+
+# Only that exact name is reserved: other `__nusadb_` names keep working.
+statement ok
+CREATE FUNCTION __nusadb_f(a int) RETURNS int AS 'SELECT $1 + 1' LANGUAGE SQL
+
+query T
+SELECT routine_name FROM information_schema.routines WHERE routine_name = '__nusadb_f'
+----
+__nusadb_f
+
+statement ok
+CREATE TABLE __nusadb_x (a int, b int)
+
+statement ok
+INSERT INTO __nusadb_x (a, b) VALUES (1, 2)
+
+query II
+SELECT a, b FROM __nusadb_x
+----
+1 2
+
+# Views keep their stored BETWEEN SYMMETRIC (re-parsed from stored text on every use).
+statement ok
+CREATE TABLE sym (x int)
+
+statement ok
+INSERT INTO sym VALUES (1), (5), (9)
+
+statement ok
+CREATE VIEW sym_v AS SELECT x FROM sym WHERE x BETWEEN SYMMETRIC 6 AND 2
+
+query I
+SELECT x FROM sym_v
+----
+5
+
+statement ok
+CREATE VIEW sym_vv AS SELECT x FROM sym_v WHERE x BETWEEN SYMMETRIC 10 AND 0
+
+query I
+SELECT x FROM sym_vv
+----
+5
+
+statement ok
+CREATE MATERIALIZED VIEW sym_mv AS SELECT x FROM sym WHERE x BETWEEN SYMMETRIC 10 AND 4
+
+query I
+SELECT x FROM sym_mv ORDER BY x
+----
+5
+9
+
+statement ok
+INSERT INTO sym VALUES (7)
+
+statement ok
+REFRESH MATERIALIZED VIEW sym_mv
+
+query I
+SELECT x FROM sym_mv ORDER BY x
+----
+5
+7
+9
+
+# A renamed column reads bare in the message.
+statement ok
+CREATE TABLE rn2 (k int, r int4range, EXCLUDE (k WITH =, r WITH &&))
+
+statement ok
+ALTER TABLE rn2 RENAME COLUMN r TO validity
+
+statement ok
+INSERT INTO rn2 VALUES (1, '[1,5)')
+
+statement error key .k, validity.=
+INSERT INTO rn2 VALUES (1, '[2,3)')
+
+# LIKE ... INCLUDING ALL copies a user's same-named index and the constraint, without a clash;
+# the copy keeps enforcing.
+statement ok
+CREATE TABLE lsrc (k int, r int4range)
+
+statement ok
+CREATE INDEX lsrc_x ON lsrc (k)
+
+statement ok
+ALTER TABLE lsrc ADD CONSTRAINT lsrc_x EXCLUDE (k WITH =, r WITH &&)
+
+statement ok
+CREATE TABLE ldst (LIKE lsrc INCLUDING ALL)
+
+statement ok
+INSERT INTO ldst VALUES (1, '[1,5)')
+
+statement error exclusion constraint "ldst_x"
+INSERT INTO ldst VALUES (1, '[3,4)')
+
+statement ok
+ALTER TABLE ldst DROP CONSTRAINT ldst_x
+
+query T
+SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 'ldst'
+----
+ldst_x
+
+# A LIKE copy of a constraint that owns its index gets its own index, dropped with it.
+statement ok
+CREATE TABLE lsrc2 (k int, r int4range, CONSTRAINT lsrc2_x EXCLUDE (k WITH =, r WITH &&))
+
+statement ok
+CREATE TABLE ldst2 (LIKE lsrc2 INCLUDING ALL)
+
+query T
+SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_name = 'ldst2'
+----
+ldst2_x
+
+statement ok
+ALTER TABLE ldst2 DROP CONSTRAINT ldst2_x
+
+query I
+SELECT count(*) FROM information_schema.statistics WHERE table_name = 'ldst2'
+----
+0
+
+# A streamed INSERT ... SELECT is checked across its batches and against existing rows.
+statement ok
+CREATE TABLE big (k int, r int4range, EXCLUDE (k WITH =, r WITH &&))
+
+statement ok
+INSERT INTO big SELECT g % 3, int4range(g * 10, g * 10 + 5) FROM generate_series(1, 5000) g
+
+statement error exclusion constraint
+INSERT INTO big SELECT 1, int4range(g, g + 1) FROM generate_series(4000, 4001) g
+
+statement ok
+CREATE TABLE big2 (k int, r int4range, EXCLUDE (k WITH =, r WITH &&))
+
+statement error exclusion constraint
+INSERT INTO big2 SELECT 1, CASE WHEN g = 3000 THEN int4range(2, 3) ELSE int4range(g * 2, g * 2 + 1) END FROM generate_series(1, 3000) g
+
+query I
+SELECT count(*) FROM big2
+----
+0
+
+statement ok
+INSERT INTO big2 SELECT 1, int4range(g * 2, g * 2 + 1) FROM generate_series(1, 3000) g
+
+query I
+SELECT count(*) FROM big2
+----
+3000
+
+# A domain CHECK is a predicate: one calling the name is an ordinary CHECK (an unknown function
+# here), never an exclusion constraint. ALTER DOMAIN is not supported at all.
+statement ok
+CREATE DOMAIN dq AS int4range CHECK (__nusadb_exclude('gist', '', VALUE, '&&'))
+
+statement ok
+CREATE TABLE dt (r dq)
+
+statement error unknown function
+INSERT INTO dt VALUES ('[1,5)')
+
+query I
+SELECT count(*) FROM information_schema.table_constraints WHERE table_name = 'dt' AND constraint_type = 'EXCLUDE'
+----
+0
+
+statement error
+ALTER DOMAIN dq ADD CHECK (__nusadb_exclude('gist', '', VALUE, '='))
+
+statement error reserved name
+ALTER TABLE sym ADD CHECK (__nusadb_exclude('gist', '', x, '='))
+
+# The name inside a string literal or a comment is not a call.
+query T
+SELECT '__nusadb_exclude(1)' /* __nusadb_exclude(2) */
+----
+__nusadb_exclude(1)
+
+# An ordinary domain CHECK is untouched.
+statement ok
+CREATE DOMAIN dpos AS int CHECK (VALUE > 0)
+
+statement ok
+CREATE TABLE dpt (a dpos, r int4range, EXCLUDE (a WITH =, r WITH &&))
+
+statement ok
+INSERT INTO dpt VALUES (1, '[1,5)'), (2, '[3,8)')
+
+statement error
+INSERT INTO dpt VALUES (-1, '[1,5)')
+
+statement error exclusion constraint
+INSERT INTO dpt VALUES (1, '[4,6)')
+
+# Inside a routine, DO or trigger body a CHECK calling the name is the ordinary CHECK an older
+# build stored it as: the routine is accepted, and running it type-checks the CHECK like any other
+# (here no such function exists, so 42883, never 42939). It never becomes an exclusion constraint,
+# since only the EXCLUDE rewrite makes one. With the function present (a data dir from an older
+# build), the CHECK is created: see the e2e legacy test.
+statement ok
+CREATE PROCEDURE inj1() AS $$ BEGIN CREATE TABLE inj (r int4range, CHECK (__nusadb_exclude('gist', '', r, '&&'))); END $$
+
+statement error unknown function
+CALL inj1()
+
+statement ok
+CREATE PROCEDURE inj2() AS $$ BEGIN ALTER TABLE sym ADD CHECK (__nusadb_exclude('gist', '', x, '=')); END $$
+
+statement error unknown function
+CALL inj2()
+
+statement error unknown function
+DO $$ BEGIN CREATE TABLE inj_do (r int4range, CHECK (__nusadb_exclude('hash', '', r, '&&'))); END $$
+
+statement ok
+CREATE TABLE inj_src (a int)
+
+statement ok
+CREATE FUNCTION inj_tf() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN CREATE TABLE inj_trg (r int4range, CHECK (public.__nusadb_exclude('gist', '', r, '&&'))); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER inj_tg AFTER INSERT ON inj_src FOR EACH ROW EXECUTE FUNCTION inj_tf()
+
+statement error unknown function
+INSERT INTO inj_src VALUES (1)
+
+query I
+SELECT count(*) FROM information_schema.table_constraints WHERE constraint_type = 'EXCLUDE' AND table_name LIKE 'inj%'
+----
+0
+
+# A real EXCLUDE inside a NusaScript procedure goes through the rewrite and is enforced.
+statement ok
+CREATE PROCEDURE mk_ex() AS $$ BEGIN CREATE TABLE sx_proc (k int, r int4range, CONSTRAINT sx_proc_x EXCLUDE USING gist (k WITH =, r WITH &&)); END $$
+
+statement ok
+CALL mk_ex()
+
+statement ok
+INSERT INTO sx_proc VALUES (1, '[1,5)')
+
+statement error exclusion constraint "sx_proc_x"
+INSERT INTO sx_proc VALUES (1, '[2,3)')
+
+query TT
+SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'sx_proc'
+----
+sx_proc_x EXCLUDE
+
+# And from a trigger function, fired by a write.
+statement ok
+CREATE TABLE fire_src (a int)
+
+statement ok
+CREATE FUNCTION mk_ex_tf() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN CREATE TABLE sx_trig (r int4range, CONSTRAINT sx_trig_x EXCLUDE (r WITH &&)); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER mk_ex_tg AFTER INSERT ON fire_src FOR EACH ROW EXECUTE FUNCTION mk_ex_tf()
+
+statement ok
+INSERT INTO fire_src VALUES (1)
+
+statement ok
+INSERT INTO sx_trig VALUES ('[1,5)')
+
+statement error exclusion constraint "sx_trig_x"
+INSERT INTO sx_trig VALUES ('[4,6)')
+
+# ADD COLUMN with a type that does not exist is refused, as CREATE TABLE and ALTER COLUMN TYPE are.
+statement ok
+CREATE TABLE addcol (a int)
+
+statement error does not exist
+ALTER TABLE addcol ADD COLUMN b no_such_type
+
+statement error does not exist
+CREATE TABLE addcol2 (b no_such_type)
+
+statement ok
+ALTER TABLE addcol ADD COLUMN c dpos
+
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_name = 'addcol'
+----
+2
+
+# A column-level EXCLUDE is refused with a clear message, in every column position.
+statement error EXCLUDE is a table constraint
+CREATE TABLE l1 (r int4range EXCLUDE USING gist (r WITH &&))
+
+statement error EXCLUDE is a table constraint
+CREATE TABLE l2 (r int4range CONSTRAINT x EXCLUDE USING gist (r WITH &&))
+
+statement error EXCLUDE is a table constraint
+ALTER TABLE addcol ADD COLUMN d int4range EXCLUDE USING gist (d WITH &&)
+
+statement error EXCLUDE is a table constraint
+ALTER TABLE addcol ALTER COLUMN a SET DEFAULT EXCLUDE USING gist (a WITH =)
+
+# The table-constraint positions still work, named and unnamed.
+statement ok
+CREATE TABLE l3 (EXCLUDE USING gist (r WITH &&), r int4range, CONSTRAINT l3_y EXCLUDE (r WITH &&))
+
+statement ok
+ALTER TABLE addcol ADD CONSTRAINT addcol_x EXCLUDE (a WITH =) WHERE (a > 0)

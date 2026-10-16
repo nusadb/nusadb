@@ -40,6 +40,7 @@ pub use comments::{skip_leading_comments, split_statements};
 mod dcl;
 mod ddl;
 mod dml;
+mod exclusion;
 mod expr;
 mod query;
 mod script;
@@ -593,6 +594,8 @@ fn recognize_vector_distance_op(parser: &Parser) -> Option<(&'static str, usize)
     reason = "a flat chain of statement recognizers; length tracks the number of statement forms               custom-parsed, not branching depth"
 )]
 pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
+    // This parse's `EXCLUDE` rewrites, and only they, may produce an exclusion constraint.
+    let _exclusion_scope = exclusion::RewriteScope::enter(true);
     // A comment before, after or inside the statement must not change which statement it is: the
     // recognizers below read its first and last words.
     let blanked = comments::blank_comments(sql);
@@ -1172,13 +1175,27 @@ fn rewrite_composite_star(tokens: &mut [TokenWithSpan]) {
     }
 }
 
-/// Rewrite an `EXCLUDE` table constraint into the equivalent `UNIQUE` constraint when every operator
-/// is `=` (`EXCLUDE (a WITH =, b WITH =)` ≡ `UNIQUE (a, b)`, matching the reference engine's row-
-/// conflict and NULL semantics). sqlparser has no grammar for `EXCLUDE`, so this runs pre-parse.
-/// Anything the equality reduction cannot express — a non-`=` operator (needs an overlap index), a
-/// `USING` method other than `btree`, a `WHERE` partial predicate, or an expression element — is
-/// refused loudly rather than silently mishandled. The constraint form is told apart from a window
-/// `EXCLUDE` (already stripped) and a SELECT-item `EXCLUDE` by the `WITH` inside its parentheses.
+/// Rewrite an `EXCLUDE` table constraint, which sqlparser has no grammar for, before parsing.
+///
+/// Two shapes come out of it:
+///
+/// - Every element a plain column `WITH =` and no `WHERE` clause: the constraint is exactly a
+///   `UNIQUE` constraint over those columns (same row-conflict and NULL semantics), so it is rewritten
+///   to `UNIQUE (a, b)` and enforced by a unique index.
+/// - Anything else (a `&&` element, an expression element, a `WHERE` predicate): the constraint is
+///   rewritten to `CHECK (__nusadb_exclude('<method>', <expr>, '<op>', ..., [(<predicate>)]))`. The
+///   marker call is a plain function-call expression, so sqlparser parses each element and the
+///   predicate as ordinary expressions; conversion (`parser::exclusion`) turns the marker back into
+///   an exclusion constraint.
+///
+/// Only the `=` and `&&` operators and the `btree` / `gist` access-method names are accepted;
+/// anything else is refused with `0A000` rather than mishandled. The constraint form is told apart
+/// from a window `EXCLUDE` (already stripped) and a SELECT-item `EXCLUDE` by the `WITH` inside its
+/// parentheses.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scan locating the method, element list, WHERE clause and refused suffixes"
+)]
 fn rewrite_exclude_constraint(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
     use sqlparser::keywords::Keyword;
     if !tokens.iter().any(|t| word_ci(Some(t), "exclude")) {
@@ -1210,133 +1227,345 @@ fn rewrite_exclude_constraint(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Err
             i += 1;
             continue;
         }
-        // Find the matching `)` and whether a `WITH` appears at the list's top level.
-        let mut depth = 0i32;
-        let mut close = None;
-        let mut has_with = false;
-        for (k, tok) in tokens.iter().enumerate().skip(open) {
-            match &tok.token {
-                Token::LParen => depth += 1,
-                Token::RParen => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(k);
-                        break;
-                    }
-                },
-                Token::Word(w) if depth == 1 && w.keyword == Keyword::WITH => has_with = true,
-                _ => {},
-            }
-        }
-        let Some(close) = close else {
+        let Some(close) = matching_paren(tokens, open) else {
             i += 1;
             continue;
         };
+        let has_with = depth_one_tokens(tokens, open, close)
+            .any(|t| matches!(&t.token, Token::Word(w) if w.keyword == Keyword::WITH));
         if !has_with {
             // A SELECT-item `EXCLUDE (col, ...)` has no `WITH` — leave it for the ordinary parser.
             i += 1;
             continue;
         }
-        if let Some(m) = method
-            && !word_ci(tokens.get(m), "btree")
-        {
+        // Only a table constraint is rewritten: one opening a table's element list or following a
+        // comma in it (`(`, `,`), or added by `ALTER TABLE ... ADD`, each optionally named with
+        // `CONSTRAINT name`. Anywhere else (after a column's type, as a column default) it is
+        // refused here, so the rewrite's marker never reaches the statement.
+        if !exclude_in_table_constraint_position(tokens, i) {
             return Err(Error::Unsupported(
-                "EXCLUDE USING <method> other than btree is not supported (only the `=` form, \
-                 which is equivalent to a UNIQUE constraint)"
+                "EXCLUDE is a table constraint: declare it in the table's constraint list \
+                 (CREATE TABLE t (..., EXCLUDE ...)) or with ALTER TABLE t ADD [CONSTRAINT name] \
+                 EXCLUDE ..., not on a column"
                     .to_owned(),
             ));
         }
+        let method_name = match method {
+            None => "gist".to_owned(),
+            Some(m) => {
+                let name = match tokens.get(m).map(|t| &t.token) {
+                    Some(Token::Word(w)) => w.value.to_lowercase(),
+                    _ => String::new(),
+                };
+                if name != "btree" && name != "gist" {
+                    return Err(Error::Unsupported(format!(
+                        "EXCLUDE USING {name} is not supported (the access method must be btree \
+                         or gist)"
+                    )));
+                }
+                name
+            },
+        };
+        // An optional `WHERE (predicate)` partial-constraint clause after the element list.
+        let mut end = close;
+        let mut predicate: Option<(usize, usize)> = None;
         if let Some(w) = nonws(tokens, close)
             && word_ci(tokens.get(w), "where")
         {
-            return Err(Error::Unsupported(
-                "a partial EXCLUDE constraint (WHERE ...) is not supported".to_owned(),
-            ));
+            let p_open = nonws(tokens, w)
+                .filter(|&p| matches!(tokens.get(p).map(|t| &t.token), Some(Token::LParen)))
+                .ok_or_else(|| {
+                    Error::Syntax(
+                        "an EXCLUDE constraint's WHERE predicate must be parenthesized".to_owned(),
+                    )
+                })?;
+            let p_close = matching_paren(tokens, p_open).ok_or_else(|| {
+                Error::Syntax("unbalanced parentheses in an EXCLUDE WHERE predicate".to_owned())
+            })?;
+            predicate = Some((p_open, p_close));
+            end = p_close;
         }
-        let cols = parse_exclude_elements(tokens, open, close)?;
-        // Build `UNIQUE ( <cols> )`, copying the original column tokens (preserving any quoting).
-        let mut repl = Vec::with_capacity(cols.len() * 2 + 3);
-        repl.push(TokenWithSpan::wrap(Token::make_word("UNIQUE", None)));
-        repl.push(TokenWithSpan::wrap(Token::LParen));
-        for (idx, col) in cols.into_iter().enumerate() {
-            if idx > 0 {
-                repl.push(TokenWithSpan::wrap(Token::Comma));
+        // Constraint characteristics (`DEFERRABLE`, `INITIALLY ...`) and `INCLUDE` are not
+        // supported: an exclusion constraint is checked when each statement writes its rows.
+        if let Some(next) = nonws(tokens, end) {
+            let deferral = ["deferrable", "initially"]
+                .iter()
+                .any(|w| word_ci(tokens.get(next), w))
+                || (word_ci(tokens.get(next), "not")
+                    && nonws(tokens, next).is_some_and(|d| word_ci(tokens.get(d), "deferrable")));
+            if deferral {
+                return Err(Error::Unsupported(
+                    "a deferrable EXCLUDE constraint is not supported (it is checked when each \
+                     statement writes its rows)"
+                        .to_owned(),
+                ));
             }
-            repl.push(col);
+            if word_ci(tokens.get(next), "include") {
+                return Err(Error::Unsupported(
+                    "EXCLUDE ... INCLUDE (...) is not supported".to_owned(),
+                ));
+            }
         }
-        repl.push(TokenWithSpan::wrap(Token::RParen));
+        let elements = parse_exclude_elements(tokens, open, close)?;
+        let all_plain_eq = elements.iter().all(|(expr, op)| {
+            op == "="
+                && expr.len() == 1
+                && matches!(expr.first().map(|t| &t.token), Some(Token::Word(_)))
+        });
+        let predicate_tokens: Option<Vec<TokenWithSpan>> = predicate
+            .map(|(p_open, p_close)| tokens.get(p_open..=p_close).unwrap_or_default().to_vec());
+        let repl = exclude_replacement(all_plain_eq, method_name, elements, predicate_tokens);
         let n = repl.len();
-        let _: Vec<TokenWithSpan> = tokens.splice(i..=close, repl).collect();
+        let _: Vec<TokenWithSpan> = tokens.splice(i..=end, repl).collect();
         i += n;
     }
     Ok(())
 }
 
-/// Extract the column tokens of an `EXCLUDE` element list (`open`..`close` are the enclosing parens),
-/// requiring each element to be exactly `<column> WITH =`. A non-`=` operator or an expression element
-/// is refused (only the equality reduction to `UNIQUE` is supported).
+/// The tokens an `EXCLUDE` constraint is rewritten to (see [`rewrite_exclude_constraint`]): `UNIQUE
+/// (<cols>)` for the plain-column equality form, otherwise `CHECK (__nusadb_exclude('<method>',
+/// <expr>, '<op>', ..., [(<predicate>)]))`.
+fn exclude_replacement(
+    all_plain_eq: bool,
+    method: String,
+    elements: Vec<(Vec<TokenWithSpan>, String)>,
+    predicate: Option<Vec<TokenWithSpan>>,
+) -> Vec<TokenWithSpan> {
+    let wrap = TokenWithSpan::wrap;
+    let mut repl: Vec<TokenWithSpan> = Vec::new();
+    if all_plain_eq && predicate.is_none() {
+        repl.push(wrap(Token::make_word("UNIQUE", None)));
+        repl.push(wrap(Token::LParen));
+        for (idx, (expr, _)) in elements.into_iter().enumerate() {
+            if idx > 0 {
+                repl.push(wrap(Token::Comma));
+            }
+            repl.extend(expr);
+        }
+        repl.push(wrap(Token::RParen));
+        return repl;
+    }
+    repl.push(wrap(Token::make_keyword("CHECK")));
+    repl.push(wrap(Token::LParen));
+    repl.push(wrap(Token::make_word(&exclusion::rewrite_marker(), None)));
+    repl.push(wrap(Token::LParen));
+    repl.push(wrap(Token::SingleQuotedString(method)));
+    // The owned index, filled in when the constraint is registered.
+    repl.push(wrap(Token::Comma));
+    repl.push(wrap(Token::SingleQuotedString(String::new())));
+    for (expr, op) in elements {
+        repl.push(wrap(Token::Comma));
+        repl.extend(expr);
+        repl.push(wrap(Token::Comma));
+        repl.push(wrap(Token::SingleQuotedString(op)));
+    }
+    if let Some(predicate) = predicate {
+        repl.push(wrap(Token::Comma));
+        repl.extend(predicate);
+    }
+    repl.push(wrap(Token::RParen));
+    repl.push(wrap(Token::RParen));
+    repl
+}
+
+/// Whether a constraint's stored expression bytes are an exclusion constraint's stored form (see
+/// `parser::exclusion`) rather than a `CHECK` predicate.
+pub(crate) fn is_exclusion_spec(stored: &[u8]) -> bool {
+    exclusion::is_exclusion_spec(stored)
+}
+
+/// The catalog text of an exclusion constraint whose stored form is `spec` (tagged; see
+/// `parser::exclusion`).
+pub(crate) fn tag_exclusion_spec(spec: &str) -> String {
+    exclusion::tag(spec)
+}
+
+/// The stored form inside an exclusion constraint's tagged catalog text; `None` for untagged text.
+pub(crate) fn untag_exclusion_spec(stored: &[u8]) -> Option<&str> {
+    exclusion::untag(stored)
+}
+
+/// Whether `name` is the exclusion constraint's internal marker, reserved from user SQL.
+pub(crate) const fn is_reserved_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(exclusion::EXCLUSION_MARKER)
+}
+
+/// The `42939` error for a user-written use of the reserved exclusion-constraint marker name.
+pub(crate) fn reserved_name_error(name: &str) -> Error {
+    Error::Coded {
+        message: format!("\"{name}\" is a reserved name (an internal marker)"),
+        sqlstate: "42939",
+    }
+}
+
+/// `sql` with every double-quoted identifier that needs no quoting (lowercase, a plain word, not a
+/// keyword) written bare, for messages: a column renamed by `ALTER TABLE ... RENAME COLUMN` reads
+/// `period`, not `"period"`. Text that does not tokenize is returned unchanged.
+pub(crate) fn display_identifiers(sql: &str) -> String {
+    let Ok(tokens) = Tokenizer::new(&NusaParserDialect, sql).tokenize() else {
+        return sql.to_owned();
+    };
+    let plain = |s: &str| {
+        s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    tokens
+        .iter()
+        .map(|t| match t {
+            Token::Word(w)
+                if w.quote_style == Some('"')
+                    && plain(&w.value)
+                    && matches!(Token::make_word(&w.value, None), Token::Word(ref bare) if bare.keyword == Keyword::NoKeyword) =>
+            {
+                w.value.clone()
+            },
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// Parse an exclusion constraint's stored form back into its declaration.
+pub(crate) fn parse_exclusion_spec(stored: &str) -> Result<ast::ExclusionDecl, Error> {
+    exclusion::parse_spec(stored)
+}
+
+/// Whether the `EXCLUDE` at `at` stands where a table constraint does: right after `(`, `,` or
+/// `ADD`, with an optional `CONSTRAINT name` in between.
+fn exclude_in_table_constraint_position(tokens: &[TokenWithSpan], at: usize) -> bool {
+    let mut before = tokens
+        .get(..at)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)));
+    let mut prev = before.next();
+    // `CONSTRAINT <name> EXCLUDE`: look past the name.
+    if let (Some(Token::Word(_)), Some(constraint)) =
+        (prev.map(|t| &t.token), before.clone().next())
+        && word_ci(Some(constraint), "constraint")
+    {
+        before.next();
+        prev = before.next();
+    }
+    match prev.map(|t| &t.token) {
+        Some(Token::LParen | Token::Comma) => true,
+        Some(Token::Word(_)) => word_ci(prev, "add"),
+        _ => false,
+    }
+}
+
+/// The index of the `)` that closes the `(` at `open`, if any.
+fn matching_paren(tokens: &[TokenWithSpan], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (k, tok) in tokens.iter().enumerate().skip(open) {
+        match &tok.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// The tokens directly inside the parentheses `open`..`close` (nesting depth one).
+fn depth_one_tokens(
+    tokens: &[TokenWithSpan],
+    open: usize,
+    close: usize,
+) -> impl Iterator<Item = &TokenWithSpan> {
+    let mut depth = 0i32;
+    tokens.iter().take(close).skip(open + 1).filter(move |tok| {
+        let at_top = depth == 0;
+        match &tok.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {},
+        }
+        at_top
+    })
+}
+
+/// Split an `EXCLUDE` element list (`open`..`close` are the enclosing parens) into its elements, each
+/// `<expression> WITH <operator>`: the expression's tokens (whitespace trimmed) and the operator text.
+/// Only the `=` and `&&` operators are accepted.
 fn parse_exclude_elements(
     tokens: &[TokenWithSpan],
     open: usize,
     close: usize,
-) -> Result<Vec<TokenWithSpan>, Error> {
+) -> Result<Vec<(Vec<TokenWithSpan>, String)>, Error> {
     use sqlparser::keywords::Keyword;
     let malformed = || {
-        Error::Syntax("malformed EXCLUDE constraint element (expected `column WITH =`)".to_owned())
-    };
-    let not_eq = || {
-        Error::Unsupported(
-            "EXCLUDE supports only the `=` operator (equivalent to UNIQUE); an overlap or inequality \
-             operator needs index support NusaDB does not have"
+        Error::Syntax(
+            "malformed EXCLUDE constraint element (expected `<column or expression> WITH <operator>`)"
                 .to_owned(),
         )
     };
-    let mut cols: Vec<TokenWithSpan> = Vec::new();
-    let mut col: Option<TokenWithSpan> = None;
-    let mut seen_with = false;
-    let mut seen_op = false;
-    for (k, tok) in tokens.iter().enumerate().take(close).skip(open + 1) {
-        let _ = k;
+    let mut elements = Vec::new();
+    let mut expr: Vec<TokenWithSpan> = Vec::new();
+    let mut op: Option<String> = None;
+    let mut depth = 0i32;
+    let mut finish = |expr: &mut Vec<TokenWithSpan>, op: &mut Option<String>| {
+        let op = op.take().ok_or_else(malformed)?;
+        let body: Vec<TokenWithSpan> = std::mem::take(expr)
+            .into_iter()
+            .skip_while(|t| matches!(t.token, Token::Whitespace(_)))
+            .collect();
+        let trimmed_len = body.len()
+            - body
+                .iter()
+                .rev()
+                .take_while(|t| matches!(t.token, Token::Whitespace(_)))
+                .count();
+        let body: Vec<TokenWithSpan> = body.into_iter().take(trimmed_len).collect();
+        if body.is_empty() || op.is_empty() {
+            return Err(malformed());
+        }
+        if op != "=" && op != "&&" {
+            return Err(Error::Unsupported(format!(
+                "EXCLUDE operator {op} is not supported (only = and && are)"
+            )));
+        }
+        elements.push((body, op));
+        Ok(())
+    };
+    for tok in tokens.iter().take(close).skip(open + 1) {
         match &tok.token {
-            Token::Whitespace(_) => {},
-            // Elements are simple `column WITH =`; a parenthesized (expression) element is not.
-            Token::LParen | Token::RParen => {
-                return Err(Error::Unsupported(
-                    "EXCLUDE on an expression is not supported (only simple columns)".to_owned(),
-                ));
-            },
-            Token::Comma => {
-                if col.is_none() || !seen_with || !seen_op {
-                    return Err(malformed());
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {},
+        }
+        if depth == 0 {
+            match &tok.token {
+                Token::Comma => {
+                    finish(&mut expr, &mut op)?;
+                    continue;
+                },
+                Token::Word(w) if w.keyword == Keyword::WITH && op.is_none() => {
+                    op = Some(String::new());
+                    continue;
+                },
+                _ => {},
+            }
+        }
+        match op.as_mut() {
+            Some(text) => {
+                if !matches!(tok.token, Token::Whitespace(_)) {
+                    text.push_str(&tok.token.to_string());
                 }
-                cols.push(col.take().ok_or_else(malformed)?);
-                seen_with = false;
-                seen_op = false;
             },
-            _ if col.is_none() => match &tok.token {
-                Token::Word(_) => col = Some(tok.clone()),
-                _ => return Err(malformed()),
-            },
-            _ if !seen_with => match &tok.token {
-                Token::Word(w) if w.keyword == Keyword::WITH => seen_with = true,
-                _ => return Err(malformed()),
-            },
-            _ if !seen_op => match &tok.token {
-                Token::Eq => seen_op = true,
-                _ => return Err(not_eq()),
-            },
-            _ => return Err(malformed()),
+            None => expr.push(tok.clone()),
         }
     }
-    match (col, seen_with, seen_op) {
-        (Some(c), true, true) => cols.push(c),
-        (None, false, false) => {},
-        _ => return Err(malformed()),
-    }
-    if cols.is_empty() {
-        return Err(malformed());
-    }
-    Ok(cols)
+    finish(&mut expr, &mut op)?;
+    Ok(elements)
 }
 
 /// The marker function the [`rewrite_between_symmetric`] pre-parse wraps a `BETWEEN SYMMETRIC` lower
@@ -3838,11 +4067,26 @@ fn recognize_call(sql: &str) -> Option<Result<ast::Statement, Error>> {
 /// stored-procedure body. Uses the generic parser (the body holds plain data statements).
 pub(crate) fn parse_statements(sql: &str) -> Result<Vec<ast::Statement>, Error> {
     let dialect = NusaParserDialect;
-    Parser::parse_sql(&dialect, sql)
+    let _exclusion_scope = exclusion::RewriteScope::enter(false);
+    let tokens = embedded_tokens(sql)?;
+    Parser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
         .map_err(|e| Error::Syntax(e.to_string()))?
         .into_iter()
         .map(convert_statement)
         .collect()
+}
+
+/// The tokens of a body of statements written by a user (a procedure or NusaScript body), with an
+/// `EXCLUDE` table constraint rewritten for the caller's [`exclusion::RewriteScope`], the way
+/// [`parse`] treats a statement.
+pub(super) fn embedded_tokens(sql: &str) -> Result<Vec<TokenWithSpan>, Error> {
+    let mut tokens = Tokenizer::new(&NusaParserDialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| Error::Syntax(e.to_string()))?;
+    rewrite_exclude_constraint(&mut tokens)?;
+    Ok(tokens)
 }
 
 /// Whether `stmt` is a statement a procedure body may contain: data statements, or a nested `CALL`
@@ -4224,6 +4468,23 @@ fn parse_drop_function(sql: &str) -> Result<ast::Statement, Error> {
     parser.expect_keyword(Keyword::FUNCTION).map_err(syntax)?;
     let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
     let name = object_name(&parser.parse_object_name(false).map_err(syntax)?)?;
+    // An argument-type list (`DROP FUNCTION f(int, text)`) is accepted and skipped: a function is
+    // identified by its name alone.
+    if parser.consume_token(&Token::LParen) {
+        let mut depth = 1u32;
+        while depth > 0 {
+            match parser.next_token().token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::EOF => {
+                    return Err(Error::Syntax(
+                        "unterminated argument list in DROP FUNCTION".to_owned(),
+                    ));
+                },
+                _ => {},
+            }
+        }
+    }
     expect_statement_end(&mut parser)?;
     Ok(ast::Statement::DropFunction(ast::DropFunction {
         name,

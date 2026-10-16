@@ -3658,6 +3658,7 @@ fn info_schema_check_constraints(
         for c in engine.list_constraints_as_of(txn, schema.id)? {
             if !matches!(c.kind, nusadb_core::engine::ConstraintKind::Check)
                 || c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+                || super::exclusion::is_exclusion(&c)
             {
                 continue;
             }
@@ -3842,6 +3843,12 @@ fn info_schema_table_constraints(
             if c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) {
                 continue;
             }
+            // An exclusion constraint is cataloged as a CHECK but reported as what it is.
+            let kind = if super::exclusion::is_exclusion(&c) {
+                "EXCLUDE"
+            } else {
+                constraint_type_name(c.kind)
+            };
             rows.push(vec![
                 ast::Value::Text("nusadb".to_owned()),
                 ast::Value::Text(namespace.clone()),
@@ -3849,7 +3856,7 @@ fn info_schema_table_constraints(
                 ast::Value::Text("nusadb".to_owned()),
                 ast::Value::Text(namespace.clone()),
                 ast::Value::Text(name.clone()),
-                ast::Value::Text(constraint_type_name(c.kind).to_owned()),
+                ast::Value::Text(kind.to_owned()),
             ]);
         }
     }

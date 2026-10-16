@@ -502,22 +502,91 @@ copy, so the table simply keeps full durability — queries behave identically.
 
 Constraints available: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY ... REFERENCES`
 with `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT`, `NO ACTION`; each
-can be written at column or table level. Generated columns are `STORED`. Two more unique forms:
+can be written at column or table level. Generated columns are `STORED`. A unique form that
+treats NULLs as equal:
 
 ```sql
 CREATE TABLE nnd (a INT, b TEXT, UNIQUE NULLS NOT DISTINCT (a));
 INSERT INTO nnd (a) VALUES (NULL);
 INSERT INTO nnd (a) VALUES (NULL);
 -- ERROR 23505: with NULLS NOT DISTINCT, NULLs count as equal; plain UNIQUE allows both
-
-CREATE TABLE bookings (room INT, day DATE, EXCLUDE (room WITH =, day WITH =));
 ```
 
 `UNIQUE NULLS NOT DISTINCT` treats NULL keys as equal, so at most one NULL row exists per key; it
-also works through `ALTER TABLE ... ADD`. An `EXCLUDE` constraint is accepted in its equality form
-(every element `column WITH =`), where it is exactly `UNIQUE` on those columns; another operator,
-`USING` a method other than btree, a `WHERE` clause, or an expression element is refused, because
-those need index support the engine does not have.
+also works through `ALTER TABLE ... ADD`.
+
+### Exclusion constraints
+
+An `EXCLUDE` constraint says that no two rows may have every listed operator hold between them.
+Each element is a column or an expression with `WITH =` (equal) or `WITH &&` (range overlap,
+for `int4range`, `int8range`, `numrange`, `daterange`, `tsrange` and `tstzrange` values):
+
+```sql
+CREATE TABLE hist (
+  hist_id    UUID PRIMARY KEY,
+  k          INT NOT NULL,
+  valid_from TIMESTAMPTZ NOT NULL,
+  valid_to   TIMESTAMPTZ,
+  CONSTRAINT hist_no_overlap
+    EXCLUDE USING gist (k WITH =, tstzrange(valid_from, valid_to) WITH &&)
+);
+INSERT INTO hist VALUES (gen_random_uuid(), 1, '2024-01-01', '2024-02-01');
+INSERT INTO hist VALUES (gen_random_uuid(), 1, '2024-02-01', NULL);   -- ok: [) bounds only touch
+INSERT INTO hist VALUES (gen_random_uuid(), 1, '2024-01-15', '2024-01-20');
+-- ERROR 23P01: conflicting key value violates exclusion constraint "hist_no_overlap": ...
+
+-- Partial: only rows matching the parenthesized WHERE take part.
+CREATE TABLE booking (room INT, during INT4RANGE, cancelled BOOL NOT NULL DEFAULT false,
+  EXCLUDE (room WITH =, during WITH &&) WHERE (NOT cancelled));
+
+ALTER TABLE booking ADD CONSTRAINT one_per_room EXCLUDE (room WITH =, during WITH &&);
+```
+
+The rules:
+
+- A row with a NULL element, or an empty range, never conflicts. Bounds are respected: `[1,5)`
+  and `[5,9)` do not overlap.
+- `USING gist` and `USING btree` are both accepted and behave the same; `gist` is the default.
+- The check runs on `INSERT`, `UPDATE`, `MERGE`, `COPY` and both upsert arms. `ON CONFLICT DO
+  NOTHING` skips a row that would conflict with an existing row or with an earlier row of the same
+  statement, as it does for a `UNIQUE` key; `ON CONFLICT ... DO UPDATE` needs a `UNIQUE` arbiter,
+  and a row that still violates the exclusion constraint fails with `23P01`. An `UPDATE` that moves
+  a row's range is checked against every other row.
+- `ALTER COLUMN ... TYPE` checks the constraint again over the converted rows, since the new type
+  can make distinct values equal (`1.4` and `1.2` as `INT`); a conflict refuses the change with
+  `23P01`.
+- `ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE` checks the rows already in the table and fails with
+  `23P01` if two of them conflict. `DROP CONSTRAINT` removes it.
+- The check sees every committed row, whatever the isolation level. Two transactions writing rows
+  with the same `=` values at the same time cannot both succeed: the second fails at once with the
+  retryable `40001` (also when their ranges would not have overlapped), or with `23P01` once the
+  first has committed. A constraint with no `=` element lets one writer at a time through. An
+  `UPDATE` that changes a row's `=` values locks only the new values: the row's old version stays
+  visible to everyone else until the update commits, so a writer conflicting with it is still
+  refused.
+- Elements and the `WHERE` predicate may call only immutable functions (`42P17` otherwise).
+- Cost: the rows a statement writes are grouped by their `=` values and, with one `&&` element,
+  swept in range order, so a group of `n` rows costs `O(n log n)` (with several `&&` elements a
+  group is compared pairwise). When every `=` element is a plain column, a b-tree index over those
+  columns, named after the constraint, is created with it and dropped with it, and each distinct
+  `=` group of a statement reads only its own rows (all of them: the index narrows by `=` value,
+  not by range, so writing into one very large group costs time in proportion to the group). `COPY` and a streamed `INSERT ... SELECT`
+  take their locks batch by batch and check the whole statement once at the end, holding one key
+  per written row in memory. Without such an index (a `=` element that is an
+  expression or a floating-point or `NUMERIC` column, which may hold `NaN`, or no `=` element at
+  all) each writing statement reads the whole table once. If an index of the constraint's name
+  already exists, the constraint leaves it alone and creates none (an index on exactly the `=`
+  columns is still used).
+- `information_schema.table_constraints` lists it with `constraint_type` `EXCLUDE`.
+- When every element is a plain column `WITH =` and there is no `WHERE`, the constraint is exactly
+  `UNIQUE` on those columns and is created as one:
+
+```sql
+CREATE TABLE bookings (room INT, day DATE, EXCLUDE (room WITH =, day WITH =));
+```
+
+Other operators, other access methods, `INCLUDE`, `DEFERRABLE` / `INITIALLY`, and an `EXCLUDE`
+on a partitioned table (declare it on each partition) are refused with `0A000`.
 
 Temporary tables belong to the session that made them, are invisible to others, and disappear when
 the session ends. `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` are accepted.
@@ -2405,7 +2474,7 @@ disk. See [deployment](deployment.md) for what still has to fit in memory.
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
 - `LIST` partitioning over several columns;
-- `EXCLUDE` constraints with an operator other than `=`;
+- `EXCLUDE` constraints with an operator other than `=` or `&&`, deferrable ones, and ones on a partitioned table;
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;
 - aggregating a row value with anything but `count`;

@@ -202,7 +202,13 @@ pub(super) fn run_create_table(
     // Register each CHECK constraint: the canonical predicate SQL is persisted opaquely so
     // INSERT/UPDATE/COPY can re-parse and evaluate it per row.
     for chk in &plan.check_constraints {
-        engine.add_check_constraint(txn, id, &chk.name, chk.predicate_sql.as_bytes())?;
+        if let Some(spec) = crate::parser::untag_exclusion_spec(chk.predicate_sql.as_bytes()) {
+            // An EXCLUDE constraint: cataloged the same way, plus its backing index.
+            let schema = reread_table_by_id(id, &def, engine, txn)?;
+            super::exclusion::register(&schema, &chk.name, spec, engine, txn)?;
+        } else {
+            engine.add_check_constraint(txn, id, &chk.name, chk.predicate_sql.as_bytes())?;
+        }
     }
     // A DOMAIN column's CHECKs (already rewritten from `VALUE` to the column name) enforce on write
     // through the same machinery; the synthetic prefix hides them from introspection.
@@ -481,6 +487,7 @@ fn propagate_parent_checks(
     for c in engine.list_constraints_as_of(txn, parent.id)? {
         if c.kind != nusadb_core::ConstraintKind::Check
             || c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+            || super::exclusion::is_exclusion(&c)
         {
             continue;
         }
@@ -1075,6 +1082,10 @@ fn overlap_err(partition: &str, existing: &str) -> Error {
 /// like the reference engine), a `GENERATED ... AS IDENTITY` column under `IDENTITY` with a FRESH
 /// backing sequence, and a `GENERATED ALWAYS AS (...) STORED` expression under `GENERATED` (it
 /// references this table's own columns, so the text is valid verbatim).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass per LIKE option over the source's constraints, indexes and defaults"
+)]
 fn copy_like_metadata(
     like_source: Option<&str>,
     options: ast::LikeOptions,
@@ -1096,11 +1107,28 @@ fn copy_like_metadata(
             .map_or_else(|| name.to_owned(), |rest| format!("{}_{rest}", def.name))
     };
     let mut backing = std::collections::HashSet::new();
+    // The indexes the source's exclusion constraints own; the copied constraints make their own.
+    let mut exclusion_indexes = std::collections::HashSet::new();
+    // The exclusion constraints to copy, registered after the user's indexes are copied: a copied
+    // index then keeps its name, and a constraint whose own index name it takes owns none.
+    let mut exclusions: Vec<(String, String)> = Vec::new();
     for c in engine.list_constraints_as_of(txn, src.id)? {
         if let Some(index) = c.index {
             backing.insert(index);
         }
+        if let Some(index) = super::exclusion::owned_index(&c) {
+            exclusion_indexes.insert(index);
+        }
         match c.kind {
+            // An exclusion constraint is index-backed, so it is copied with the indexes (like a
+            // UNIQUE constraint), under the new table's name.
+            nusadb_core::ConstraintKind::Check if super::exclusion::is_exclusion(&c) => {
+                if options.indexes
+                    && let Some(spec) = super::exclusion::stored_spec(&c)
+                {
+                    exclusions.push((renamed(&c.name), spec.to_owned()));
+                }
+            },
             nusadb_core::ConstraintKind::Check => {
                 let synthetic = c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX);
                 if (synthetic || options.constraints)
@@ -1127,10 +1155,12 @@ fn copy_like_metadata(
     }
     if options.indexes {
         for index in engine.list_indexes_as_of(txn, src.id)? {
-            // Constraint-backing indexes were re-created by the PK/UNIQUE declarations above.
-            if engine
-                .lookup_index(&index.name)?
-                .is_some_and(|iid| backing.contains(&iid))
+            // Constraint-backing indexes were re-created by the PK/UNIQUE/EXCLUDE declarations
+            // above.
+            if exclusion_indexes.contains(&index.name)
+                || engine
+                    .lookup_index(&index.name)?
+                    .is_some_and(|iid| backing.contains(&iid))
             {
                 continue;
             }
@@ -1142,6 +1172,12 @@ fn copy_like_metadata(
                     ..index
                 },
             )?;
+        }
+    }
+    if !exclusions.is_empty() {
+        let schema = reread_table_by_id(id, def, engine, txn)?;
+        for (name, spec) in &exclusions {
+            super::exclusion::register(&schema, name, spec, engine, txn)?;
         }
     }
     if options.defaults || options.identity || options.generated {
@@ -2373,8 +2409,21 @@ pub(super) fn run_alter_table(
             }
             refuse_dropping_inherited_constraint(table, &name, engine, txn)?;
             drop_partition_copies(table, &name, engine, txn)?;
+            // An exclusion constraint's backing index goes with it.
+            let exclusion_spec = engine
+                .list_constraints_as_of(txn, table)?
+                .iter()
+                .find(|c| c.name == name)
+                .and_then(super::exclusion::stored_spec)
+                .map(str::to_owned);
             engine.drop_constraint(txn, table, &name)?;
-            // The comment of the constraint, and of its copies on the partitions below.
+            if let Some(spec) = exclusion_spec
+                && let Some(schema) = dml::schema_by_id(engine, txn, table)?
+            {
+                super::exclusion::drop_owned_index(&schema, &spec, engine, txn)?;
+            }
+            // The comment of the constraint (and of an index it owned), and of its copies on the
+            // partitions below.
             if let Some(owner) = dml::schema_by_id(engine, txn, table)? {
                 super::comment::prune_table(engine, txn, &owner.schema, &owner.name)?;
                 for (schema, name, _) in partitions_below(&owner, engine, txn)? {
@@ -2404,6 +2453,27 @@ pub(super) fn run_alter_table(
             }
             engine.add_check_constraint(txn, table.id, &name, predicate_sql.as_bytes())?;
             propagate_to_existing_partitions(&table, engine, txn)?;
+            return Ok(ExecutionResult::Altered);
+        },
+        // ADD EXCLUDE: hold the table, check that no two existing rows conflict (23P01), then
+        // persist the constraint and build its backing index.
+        AlterTablePlan::AddExclusion {
+            table,
+            name,
+            spec_sql,
+        } => {
+            let key = crate::analyzer::qualified_display(&table.schema, &table.name);
+            if super::partition::has_any(engine, txn)?
+                && super::partition::parent_key_parts(engine, txn, &key)?.is_some()
+            {
+                return Err(Error::Unsupported(
+                    "an EXCLUDE constraint on a partitioned table is not supported (declare it \
+                     on each partition)"
+                        .to_owned(),
+                ));
+            }
+            let _fresh = lock_for_validation(&table, engine, txn)?;
+            super::exclusion::add_to_existing(&table, &name, &spec_sql, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // ATTACH PARTITION: validate + record the bound and the child→parent edge (via the same
@@ -2629,6 +2699,17 @@ fn apply_column_op(
     let old_types = column_types(table);
     let core_op = match op {
         AlterColumnOp::AddColumn(column) => {
+            // A user-defined type name the parser deferred must name a type that exists, as
+            // `CREATE TABLE` requires: an unknown one is `42704`, not a silently untyped column.
+            if let Some(udt) = &column.udt_name
+                && super::lookup_enum(engine, txn, udt)?.is_none()
+                && super::lookup_composite(engine, txn, udt)?.is_none()
+                && super::lookup_domain(engine, txn, udt)?.is_none()
+            {
+                return Err(Error::ObjectNotFound(format!(
+                    "type \"{udt}\" does not exist"
+                )));
+            }
             rewrite_add_column(table, column, &old_types, engine, txn)?;
             AlterOp::AddColumn(ColumnDef {
                 name: column.name.clone(),
@@ -2671,6 +2752,11 @@ fn apply_column_op(
                 },
             )?;
             add_type_checks(table, &column, checks, engine, txn)?;
+            // The new type can make distinct values equal (`1.4` and `1.2` as `int`, `'ab'` and
+            // `'ac'` as `char(1)`), so the exclusion constraints are checked again over the
+            // rewritten rows (the caller holds the table and reads fresh): 23P01 refuses the change.
+            let altered = reread_table(table, engine, txn)?;
+            super::exclusion::revalidate_table(&altered, engine, txn)?;
             return Ok(());
         },
         AlterColumnOp::RenameColumn { index, to } => {
@@ -2693,6 +2779,19 @@ fn apply_column_op(
 
     engine.alter_table(txn, table.id, &core_op)?;
     Ok(())
+}
+
+/// The schema of the table `def` just created as `id`.
+fn reread_table_by_id(
+    id: nusadb_core::TableId,
+    def: &nusadb_core::TableDef,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<TableSchema, Error> {
+    engine
+        .lookup_table_as_of_in(txn, &def.schema, &def.name)?
+        .filter(|t| t.id == id)
+        .ok_or_else(|| Error::Internal(format!("table \"{}\" vanished mid-create", def.name)))
 }
 
 /// `table` as the catalog has it now, after an earlier step of the same statement changed it.

@@ -1528,6 +1528,16 @@ pub enum AlterTablePlan {
         /// The type-checked predicate, evaluated against each existing row to validate the ADD.
         predicate: TypedExpr,
     },
+    /// `ADD [CONSTRAINT name] EXCLUDE ...`: the executor validates that no two existing rows
+    /// conflict, then persists the constraint's stored form (see `parser::exclusion`).
+    AddExclusion {
+        /// Target table schema.
+        table: TableSchema,
+        /// The constraint name (generated if the user gave none).
+        name: String,
+        /// The constraint's stored form, persisted in the constraint catalog.
+        spec_sql: String,
+    },
     /// `DROP CONSTRAINT [IF EXISTS] name` — drop a named constraint and its backing index.
     DropConstraint {
         /// Target table id.

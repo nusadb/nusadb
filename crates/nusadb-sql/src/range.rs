@@ -226,6 +226,30 @@ impl RangeVal {
             }
     }
 
+    /// Order the lower bounds of two non-empty ranges: −infinity first, and at an equal value an
+    /// inclusive `[` before an exclusive `(`.
+    #[must_use]
+    pub fn lower_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_lower(
+            self.lower.as_ref(),
+            self.lower_inc,
+            other.lower.as_ref(),
+            other.lower_inc,
+        )
+    }
+
+    /// Order the upper bounds of two non-empty ranges: +infinity last, and at an equal value an
+    /// exclusive `)` before an inclusive `]`.
+    #[must_use]
+    pub fn upper_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_upper(
+            self.upper.as_ref(),
+            self.upper_inc,
+            other.upper.as_ref(),
+            other.upper_inc,
+        )
+    }
+
     /// Whether the two ranges share at least one point (`&&`).
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {

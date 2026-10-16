@@ -512,6 +512,11 @@ fn slt_p2_not_null_entry_points() {
 }
 
 #[test]
+fn slt_p1_exclude_overlap() {
+    run_slt("tests/slt/p1_ddl/exclude_overlap.slt");
+}
+
+#[test]
 fn slt_p1_create_drop() {
     run_slt("tests/slt/p1_ddl/create_drop.slt");
 }

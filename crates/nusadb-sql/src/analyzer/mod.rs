@@ -850,6 +850,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // run (with `$n` bound to the call arguments) by the executor's procedure module.
         ast::Statement::CreateProcedure(cp) => {
             enforce_system_catalog(&cp.name, catalog)?;
+            refuse_reserved_routine_name(&cp.name)?;
             // Routine names are not schema-qualified; every routine lives in `public`.
             dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             let param_names: Vec<String> = cp
@@ -895,6 +896,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         // CREATE/DROP FUNCTION: a SQL scalar function, inlined at call sites by the analyzer.
         ast::Statement::CreateFunction(cf) => {
             enforce_system_catalog(&cf.name, catalog)?;
+            refuse_reserved_routine_name(&cf.name)?;
             dcl::require_schema_create(catalog, nusadb_core::PUBLIC_SCHEMA)?;
             Ok(LogicalPlan::CreateFunction(CreateFunctionPlan {
                 name: cf.name,
@@ -1850,6 +1852,15 @@ pub const SYSTEM_TABLE_PREFIX: &str = "nusadb_";
 /// checks are still enforced on every write but hidden from constraint introspection
 /// (`information_schema.table_constraints`).
 pub const SYNTHETIC_TYPE_CHECK_PREFIX: &str = "nusadb_typeck_";
+
+/// Refuse a function or procedure named like the exclusion-constraint marker (`42939`): a call of
+/// it is that constraint's stored form.
+fn refuse_reserved_routine_name(name: &str) -> Result<(), Error> {
+    if crate::parser::is_reserved_name(name) {
+        return Err(crate::parser::reserved_name_error(name));
+    }
+    Ok(())
+}
 
 /// Reserve the `nusadb_*` system-catalog namespace to superusers.
 ///

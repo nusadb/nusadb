@@ -149,7 +149,11 @@ pub(crate) fn is_script(body: &str) -> bool {
 /// Parse a NusaScript `BEGIN <statements> [EXCEPTION ...] END` block.
 pub(crate) fn parse_script(sql: &str) -> Result<ScriptBlock, Error> {
     let dialect = NusaParserDialect;
-    let mut parser = Parser::new(&dialect).try_with_sql(sql).map_err(syntax)?;
+    // The embedded statements are user SQL: the same `EXCLUDE` rewrite as a top-level statement,
+    // with this parse's own rewrite scope.
+    let _exclusion_scope = super::exclusion::RewriteScope::enter(false);
+    let tokens = super::embedded_tokens(sql)?;
+    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
     let block = parse_block(&mut parser)?;
     eat_semicolons(&mut parser);
     if !matches!(parser.peek_token().token, Token::EOF) {
