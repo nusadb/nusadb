@@ -439,6 +439,18 @@ pub enum Statement {
     FetchCursor(FetchCursor),
     /// `CLOSE {name | ALL}` — discard an open cursor, or all of them.
     CloseCursor(CloseTarget),
+    /// `SET CONSTRAINTS {ALL | name [, ...]} {DEFERRED | IMMEDIATE}`: choose, for the rest of the
+    /// transaction, whether deferrable constraints are checked at commit or by each statement.
+    SetConstraints(SetConstraints),
+}
+
+/// `SET CONSTRAINTS {ALL | name [, ...]} {DEFERRED | IMMEDIATE}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetConstraints {
+    /// The named constraints as `(schema qualifier, name)`; `None` for `ALL`.
+    pub names: Option<Vec<(Option<String>, String)>>,
+    /// `DEFERRED` (`true`) or `IMMEDIATE` (`false`).
+    pub deferred: bool,
 }
 
 /// Transaction characteristics for `BEGIN ...` and `SET TRANSACTION ...`.

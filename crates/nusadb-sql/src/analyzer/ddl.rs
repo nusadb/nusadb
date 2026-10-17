@@ -453,6 +453,7 @@ fn resolve_check_constraints(
         specs.push(CheckSpec {
             name,
             predicate_sql: predicate_sql.clone(),
+            deferral: ast::Deferral::IMMEDIATE,
         });
     }
     Ok(specs)
@@ -470,7 +471,12 @@ fn resolve_exclusion_constraints(
     let mut specs = Vec::new();
     let mut seq = 0;
     for constraint in &ct.constraints {
-        let ast::TableConstraint::Exclusion { name, decl } = constraint else {
+        let ast::TableConstraint::Exclusion {
+            name,
+            decl,
+            deferral,
+        } = constraint
+        else {
             continue;
         };
         validate_exclusion(decl, &scope, catalog)?;
@@ -486,6 +492,7 @@ fn resolve_exclusion_constraints(
             name,
             // Tagged: the executor registers it as an exclusion constraint, never as a CHECK.
             predicate_sql: crate::parser::tag_exclusion_spec(&decl.spec_sql),
+            deferral: *deferral,
         });
     }
     Ok(specs)
@@ -740,6 +747,7 @@ fn resolve_foreign_keys(
             referred_columns,
             on_delete,
             on_update,
+            deferral,
         } = constraint
         else {
             continue;
@@ -762,6 +770,7 @@ fn resolve_foreign_keys(
             referred_columns: referred_columns.clone(),
             on_delete: referential_action(*on_delete),
             on_update: referential_action(*on_update),
+            deferral: *deferral,
         });
     }
     Ok(specs)
@@ -800,6 +809,7 @@ fn resolve_unique_constraints(
                 columns: vec![column.name.clone()],
                 primary: true,
                 nulls_not_distinct: false,
+                deferral: ast::Deferral::IMMEDIATE,
             });
         }
         if column.unique {
@@ -810,6 +820,7 @@ fn resolve_unique_constraints(
                 columns: vec![column.name.clone()],
                 primary: false,
                 nulls_not_distinct: false,
+                deferral: ast::Deferral::IMMEDIATE,
             });
         }
     }
@@ -817,8 +828,17 @@ fn resolve_unique_constraints(
     // Table-level constraints.
     for constraint in &ct.constraints {
         match constraint {
-            ast::TableConstraint::PrimaryKey { name, columns }
-            | ast::TableConstraint::Unique { name, columns, .. } => {
+            ast::TableConstraint::PrimaryKey {
+                name,
+                columns,
+                deferral,
+            }
+            | ast::TableConstraint::Unique {
+                name,
+                columns,
+                deferral,
+                ..
+            } => {
                 let (primary, nulls_not_distinct) = match constraint {
                     ast::TableConstraint::PrimaryKey { .. } => (true, false),
                     ast::TableConstraint::Unique {
@@ -844,6 +864,7 @@ fn resolve_unique_constraints(
                     columns: columns.clone(),
                     primary,
                     nulls_not_distinct,
+                    deferral: *deferral,
                 });
             },
             // Foreign keys / CHECK / EXCLUDE are resolved separately (`resolve_foreign_keys` /
@@ -950,6 +971,14 @@ pub(super) fn analyze_alter_table(
         // Trigger toggles are SQL-layer trigger-catalog changes, not column rewrites. The named
         // trigger's existence is checked by the executor against the trigger catalog (like
         // DROP TRIGGER); the table itself was resolved above.
+        // The constraint's existence and kind are checked by the executor, which holds the table.
+        ast::AlterTableAction::AlterConstraint { name, deferral } => {
+            return Ok(AlterTablePlan::AlterConstraint {
+                table,
+                name,
+                deferral,
+            });
+        },
         ast::AlterTableAction::EnableTrigger { name } => {
             return Ok(AlterTablePlan::SetTriggerEnabled {
                 schema: table.schema.clone(),
@@ -1282,6 +1311,7 @@ fn analyze_add_column_with_constraints(
             name: Some(format!("{base}_key")),
             columns: vec![column.name.clone()],
             nulls_not_distinct: false,
+            deferral: ast::Deferral::IMMEDIATE,
         });
     }
     let mut with_column = table.clone();
@@ -1318,6 +1348,7 @@ fn analyze_add_column_with_constraints(
                 referred_columns,
                 on_delete,
                 on_update,
+                deferral,
             } => ast::TableConstraint::ForeignKey {
                 name: Some(format!("{base}_fkey")),
                 columns,
@@ -1325,6 +1356,7 @@ fn analyze_add_column_with_constraints(
                 referred_columns,
                 on_delete,
                 on_update,
+                deferral,
             },
             other => other,
         };
@@ -1355,13 +1387,18 @@ fn analyze_add_constraint(
     // public schema, `schema.name` otherwise) so two same-named tables in different schemas do not
     // collide on `t_pkey`/`t_<col>_key`/… — exactly as `CREATE TABLE` qualifies its auto-names.
     let name_base = super::qualified_display(&table.schema, &table.name);
-    let (name, columns, primary, nulls_not_distinct) = match constraint {
-        ast::TableConstraint::PrimaryKey { name, columns } => (name, columns, true, false),
+    let (name, columns, primary, nulls_not_distinct, deferral) = match constraint {
+        ast::TableConstraint::PrimaryKey {
+            name,
+            columns,
+            deferral,
+        } => (name, columns, true, false, deferral),
         ast::TableConstraint::Unique {
             name,
             columns,
             nulls_not_distinct,
-        } => (name, columns, false, nulls_not_distinct),
+            deferral,
+        } => (name, columns, false, nulls_not_distinct, deferral),
         ast::TableConstraint::ForeignKey {
             name,
             columns,
@@ -1369,6 +1406,7 @@ fn analyze_add_constraint(
             referred_columns,
             on_delete,
             on_update,
+            deferral,
         } => {
             for column in &columns {
                 find_column(&table.columns, column, &name_base)?;
@@ -1380,6 +1418,7 @@ fn analyze_add_constraint(
                 referred_columns,
                 on_delete: referential_action(on_delete),
                 on_update: referential_action(on_update),
+                deferral,
             };
             return Ok(AlterTablePlan::AddForeignKey { table, fk });
         },
@@ -1398,13 +1437,18 @@ fn analyze_add_constraint(
                 table,
             });
         },
-        ast::TableConstraint::Exclusion { name, decl } => {
+        ast::TableConstraint::Exclusion {
+            name,
+            decl,
+            deferral,
+        } => {
             let scope = single_table_scope(&table);
             validate_exclusion(&decl, &scope, catalog)?;
             return Ok(AlterTablePlan::AddExclusion {
                 name: name.unwrap_or_else(|| format!("{name_base}_excl")),
                 spec_sql: decl.spec_sql,
                 table,
+                deferral,
             });
         },
     };
@@ -1425,6 +1469,7 @@ fn analyze_add_constraint(
         columns,
         primary,
         nulls_not_distinct,
+        deferral,
     })
 }
 

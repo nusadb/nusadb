@@ -153,7 +153,7 @@ fn exclude_equality_constraint_rewrites_to_unique() {
         ct.constraints
             .iter()
             .find_map(|c| match c {
-                ast::TableConstraint::Exclusion { name, decl } => {
+                ast::TableConstraint::Exclusion { name, decl, .. } => {
                     Some((name.clone(), decl.clone()))
                 },
                 _ => None,
@@ -954,8 +954,11 @@ fn alter_table_add_primary_key_named_and_anonymous() {
     else {
         panic!("expected AlterTable");
     };
-    let ast::AlterTableAction::AddConstraint(ast::TableConstraint::PrimaryKey { name, columns }) =
-        a.action
+    let ast::AlterTableAction::AddConstraint(ast::TableConstraint::PrimaryKey {
+        name,
+        columns,
+        ..
+    }) = a.action
     else {
         panic!("expected PrimaryKey constraint");
     };
@@ -966,8 +969,11 @@ fn alter_table_add_primary_key_named_and_anonymous() {
     let ast::Statement::AlterTable(a) = ok("ALTER TABLE t ADD PRIMARY KEY (a, b)") else {
         panic!("expected AlterTable");
     };
-    let ast::AlterTableAction::AddConstraint(ast::TableConstraint::PrimaryKey { name, columns }) =
-        a.action
+    let ast::AlterTableAction::AddConstraint(ast::TableConstraint::PrimaryKey {
+        name,
+        columns,
+        ..
+    }) = a.action
     else {
         panic!("expected PrimaryKey constraint");
     };
@@ -984,6 +990,7 @@ fn alter_table_add_unique_constraint() {
         name,
         columns,
         nulls_not_distinct: _,
+        ..
     }) = a.action
     else {
         panic!("expected Unique constraint");
@@ -1007,6 +1014,7 @@ fn alter_table_add_foreign_key_with_referential_actions() {
         referred_columns,
         on_delete,
         on_update,
+        ..
     }) = a.action
     else {
         panic!("expected ForeignKey constraint");

@@ -980,6 +980,14 @@ pub enum AlterTableAction {
         /// The partition to detach.
         partition: String,
     },
+    /// `ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]`: change
+    /// when a `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `EXCLUDE` constraint is checked.
+    AlterConstraint {
+        /// The constraint to change.
+        name: String,
+        /// Its new timing.
+        deferral: Deferral,
+    },
 }
 
 /// A modification applied to an existing column by `ALTER [COLUMN]`.
@@ -1015,13 +1023,34 @@ pub enum ColumnChange {
     DropNotNull,
 }
 
+/// When a constraint is checked: `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]`.
+///
+/// The default is `NOT DEFERRABLE`: the constraint is checked by each statement that writes. A
+/// `DEFERRABLE` constraint may have its check moved to the end of the transaction, either from the
+/// start (`INITIALLY DEFERRED`) or by `SET CONSTRAINTS ... DEFERRED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Deferral {
+    /// `DEFERRABLE`: the check may be deferred to the end of the transaction.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: a transaction starts with the check deferred. Implies `deferrable`.
+    pub initially_deferred: bool,
+}
+
+impl Deferral {
+    /// `NOT DEFERRABLE`, the default.
+    pub const IMMEDIATE: Self = Self {
+        deferrable: false,
+        initially_deferred: false,
+    };
+}
+
 /// A table-level constraint, as carried by `ADD CONSTRAINT` (and, in future,
 /// the table-constraint clause of `CREATE TABLE`).
 ///
-/// Only the four standard constraint kinds are modelled. Index hints
-/// (`USING <method>`, `KEY`/`INDEX` display, index options) and
-/// deferrable-constraint characteristics are out of scope and rejected by the
-/// parser with [`Error::Unsupported`](crate::error::Error::Unsupported).
+/// Only the four standard constraint kinds and `EXCLUDE` are modelled. Index hints
+/// (`USING <method>`, `KEY`/`INDEX` display, index options) are out of scope and rejected by the
+/// parser with [`Error::Unsupported`](crate::error::Error::Unsupported). `PRIMARY KEY`, `UNIQUE`,
+/// `FOREIGN KEY` and `EXCLUDE` carry their [`Deferral`]; a `CHECK` is never deferrable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableConstraint {
     /// `[CONSTRAINT name] PRIMARY KEY (columns)`.
@@ -1030,6 +1059,8 @@ pub enum TableConstraint {
         name: Option<String>,
         /// Key columns in declaration order; always non-empty.
         columns: Vec<String>,
+        /// `[NOT] DEFERRABLE [INITIALLY ...]`.
+        deferral: Deferral,
     },
     /// `[CONSTRAINT name] UNIQUE [NULLS [NOT] DISTINCT] (columns)`.
     Unique {
@@ -1040,6 +1071,8 @@ pub enum TableConstraint {
         /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (at most one
         /// NULL row). `false` is the standard `NULLS DISTINCT`.
         nulls_not_distinct: bool,
+        /// `[NOT] DEFERRABLE [INITIALLY ...]`.
+        deferral: Deferral,
     },
     /// `[CONSTRAINT name] FOREIGN KEY (columns) REFERENCES table (referred)
     /// [ON DELETE action] [ON UPDATE action]`.
@@ -1057,6 +1090,8 @@ pub enum TableConstraint {
         on_delete: Option<ReferentialAction>,
         /// `ON UPDATE` action, if specified.
         on_update: Option<ReferentialAction>,
+        /// `[NOT] DEFERRABLE [INITIALLY ...]`.
+        deferral: Deferral,
     },
     /// `[CONSTRAINT name] CHECK (expr)`.
     Check {
@@ -1076,6 +1111,8 @@ pub enum TableConstraint {
         name: Option<String>,
         /// The elements, operators and optional predicate.
         decl: ExclusionDecl,
+        /// `[NOT] DEFERRABLE [INITIALLY ...]`.
+        deferral: Deferral,
     },
 }
 

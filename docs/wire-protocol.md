@@ -333,6 +333,7 @@ The tag is a human-readable completion string. Known forms (1.0):
 | `BEGIN` / `COMMIT` / `ROLLBACK` | `BEGIN` / `COMMIT` / `ROLLBACK` |
 | `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` | `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` (a `PREPARE TRANSACTION` of a failed transaction rolls it back and reports `ROLLBACK`) |
 | `SAVEPOINT` / `RELEASE` | `SAVEPOINT` / `RELEASE` |
+| `SET CONSTRAINTS` | `SET CONSTRAINTS` |
 | `SET` (vars, `SET TRANSACTION`, `SET ROLE`) | `SET` |
 | `TRUNCATE` | `TRUNCATE TABLE` |
 | `LOCK TABLE` | `LOCK TABLE` |

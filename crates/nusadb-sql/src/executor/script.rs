@@ -130,16 +130,16 @@ fn exec_block(
         return exec_stmts(&block.body, env, params, engine, txn);
     };
     let savepoint = next_savepoint();
-    engine.savepoint(txn, &savepoint)?;
+    super::deferred::savepoint(engine, txn, &savepoint)?;
     match exec_stmts(&block.body, env, params, engine, txn) {
         Ok(flow) => {
-            engine.release_savepoint(txn, &savepoint)?;
+            super::deferred::release_savepoint(engine, txn, &savepoint)?;
             Ok(flow)
         },
         Err(Error::Cancelled) => Err(Error::Cancelled),
         Err(_caught) => {
             // Undo the body's partial writes, then run the handler in their place.
-            engine.rollback_to(txn, &savepoint)?;
+            super::deferred::rollback_to(engine, txn, &savepoint)?;
             exec_stmts(handler, env, params, engine, txn)
         },
     }

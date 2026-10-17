@@ -19,6 +19,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use nusadb_core::{IsolationLevel, StorageEngine, TableSchema, TxnId};
 use nusadb_sql::ast::Value;
+use nusadb_sql::executor::deferred;
 use nusadb_sql::{
     Catalog, ExecutionResult, INTERNAL_ERROR, IndexInfo, RowSink, RowsCommand, StreamOutcome,
     analyze, bind_parameters_typed, describe_column_types, describe_columns,
@@ -1502,7 +1503,7 @@ where
     // `BEGIN ... ` does not leak it in the engine.
     if let Some(txn) = txn_state.open_txn() {
         let engine = Arc::clone(&engine);
-        let _ = tokio::task::spawn_blocking(move || engine.rollback(txn)).await;
+        let _ = tokio::task::spawn_blocking(move || deferred::rollback(engine.as_ref(), txn)).await;
     }
     // Drop this connection's temporary schema (and every table in it) if a `CREATE TEMP TABLE` ever
     // created one. Best-effort on a blocking thread: a disconnect cleanup must never fail teardown,
@@ -1526,7 +1527,7 @@ where
 /// and swallowed: a connection teardown must not surface a failure, and a leaked non-durable schema
 /// is reclaimed on the next restart regardless (it never reaches the WAL or checkpoint).
 fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) {
-    let result = (|| -> Result<(), nusadb_core::Error> {
+    let result = (|| -> Result<(), nusadb_sql::Error> {
         let Some(id) = engine.lookup_schema(name)? else {
             return Ok(());
         };
@@ -1535,15 +1536,15 @@ fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) {
         // from a counter that restarts with the process — so a trigger left behind here can be
         // inherited by a later session handed the same name.
         if let Err(e) = nusadb_sql::purge_schema_catalogs(engine, txn, name) {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(&*engine, txn);
             tracing::warn!(schema = %name, error = %e, "failed to purge temporary schema catalogs");
             return Ok(());
         }
         match engine.drop_schema(txn, id, true) {
-            Ok(()) => engine.commit(txn),
+            Ok(()) => deferred::commit(engine, txn),
             Err(e) => {
-                let _ = engine.rollback(txn);
-                Err(e)
+                let _ = deferred::rollback(engine, txn);
+                Err(e.into())
             },
         }
     })();
@@ -1767,7 +1768,7 @@ where
             nusadb_sql::ast::CopyDirection::From,
         ) {
             if owned {
-                let _ = engine.rollback(txn);
+                let _ = deferred::rollback(&*engine, txn);
             }
             return Err((msg, "42501")); // access-control refusal
         }
@@ -1776,16 +1777,16 @@ where
         // generic internal-error code.
         match nusadb_sql::copy_from_bytes_in(engine.as_ref(), &copy, &data, txn) {
             Ok(count) if !owned => Ok(count),
-            Ok(count) => match engine.commit(txn) {
+            Ok(count) => match deferred::commit(engine.as_ref(), txn) {
                 Ok(()) => Ok(count),
                 Err(e) => {
-                    let _ = engine.rollback(txn);
+                    let _ = deferred::rollback(&*engine, txn);
                     Err((e.to_string(), e.sqlstate()))
                 },
             },
             Err(e) => {
                 if owned {
-                    let _ = engine.rollback(txn);
+                    let _ = deferred::rollback(&*engine, txn);
                 }
                 Err((e.to_string(), e.sqlstate()))
             },
@@ -1815,7 +1816,7 @@ async fn copy_in_column_count(
             }
             let txn = engine.begin(IsolationLevel::default()).ok()?;
             let count = nusadb_sql::copy_column_count_in(engine.as_ref(), &probe, txn).ok();
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(&*engine, txn);
             count
         })
         .await
@@ -1842,7 +1843,10 @@ fn copy_transaction(
                     .begin(IsolationLevel::default())
                     .map(|txn| (txn, true))
             },
-            |txn| engine.begin_statement(txn).map(|()| (txn, false)),
+            |txn| {
+                deferred::new_statement();
+                engine.begin_statement(txn).map(|()| (txn, false))
+            },
         )
         .map_err(|e| (e.to_string(), e.sqlstate()))
 }
@@ -1889,14 +1893,14 @@ where
             )
         {
             if owned {
-                let _ = engine.rollback(txn);
+                let _ = deferred::rollback(&*engine, txn);
             }
             return Err((msg, "42501")); // access-control refusal
         }
         let out = nusadb_sql::copy_to_bytes_with_columns_in(engine.as_ref(), &copy, &actor, txn)
             .map_err(|e| (e.to_string(), e.sqlstate()));
         if owned {
-            let _ = engine.rollback(txn); // read-only: nothing to commit
+            let _ = deferred::rollback(&*engine, txn); // read-only: nothing to commit
         }
         out
     })
@@ -2190,7 +2194,7 @@ async fn describe_portal(
             ))
         });
         if owned {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(&*engine, txn);
         }
         result
     })
@@ -2533,7 +2537,7 @@ fn copy_rls_block(
         return Some("could not verify access for COPY".to_owned());
     };
     let verdict = copy_access_verdict(engine, txn, copy, user, direction);
-    let _ = engine.rollback(txn);
+    let _ = deferred::rollback(engine, txn);
     verdict
 }
 
@@ -2931,6 +2935,9 @@ fn run_statement_streaming(
             &effective_user(user, settings),
         )),
         Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
+        Statement::SetConstraints(_) if !in_transaction_block(&state) => {
+            Some((Ok(set_constraints_outside_block()), state))
+        },
         // `SET TRANSACTION ...`: re-begin in an untouched transaction, refused after any query
         // or outside a transaction. `SET SESSION CHARACTERISTICS ...` sets the session default.
         Statement::SetTransaction(ts) => Some(set_transaction_txn(engine, ts, state)),
@@ -3334,14 +3341,14 @@ fn stream_stmt_autocommit(
         ) {
             Ok(physical) => physical,
             Err(e) => {
-                let _ = engine.rollback(txn);
+                let _ = deferred::rollback(engine, txn);
                 return StmtRun::Done(Err(e), TxnState::Auto);
             },
         };
         // Inline point-get (see the Active arm): plan-only so far — roll the probe transaction back
         // and punt with no visible effect.
         if point_get_gate && !nusadb_sql::plan_is_inline_point_get(&physical) {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(engine, txn);
             return StmtRun::Punt;
         }
         // A cursor statement is settled with its one-statement transaction, so a `WITH HOLD`
@@ -3352,18 +3359,18 @@ fn stream_stmt_autocommit(
             physical, engine, txn, false, user, snapshot, cursors, prepared, sink,
         );
         let failure = match outcome {
-            Ok(o) => match engine.commit(txn) {
+            Ok(o) => match deferred::commit(engine, txn) {
                 Ok(()) => {
                     end_cursor_transaction(settle, true);
                     return StmtRun::Done(Ok(o), TxnState::Auto);
                 },
                 Err(e) => {
-                    let _ = engine.rollback(txn);
-                    e.into()
+                    let _ = deferred::rollback(engine, txn);
+                    e
                 },
             },
             Err(err) => {
-                let _ = engine.rollback(txn);
+                let _ = deferred::rollback(engine, txn);
                 err
             },
         };
@@ -3927,7 +3934,7 @@ fn set_transaction_txn(
                     },
                 );
             };
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(engine, txn);
             let level = core_isolation(level);
             match engine.begin(level) {
                 Ok(new_txn) => (
@@ -4389,6 +4396,9 @@ fn run_query_txn(
         Statement::RollbackPrepared(gid) => {
             finish_prepared_txn(engine, state, &gid, false, &effective_user(user, settings))
         },
+        Statement::SetConstraints(_) if !in_transaction_block(&state) => {
+            (Ok(set_constraints_outside_block()), state)
+        },
         // `SET TRANSACTION ...`: re-begin in an untouched transaction, refused after any query
         // or outside a transaction. `SET SESSION CHARACTERISTICS ...` sets the session default.
         Statement::SetTransaction(ts) => set_transaction_txn(engine, &ts, state),
@@ -4595,12 +4605,7 @@ fn run_session_stmt_in_state(
                 };
                 let outcome =
                     run_session_stmt_once(engine, current, txn, false, user, &snapshot, stores)
-                        .and_then(|result| {
-                            engine
-                                .commit(txn)
-                                .map(|()| result)
-                                .map_err(nusadb_sql::Error::from)
-                        });
+                        .and_then(|result| deferred::commit(engine, txn).map(|()| result));
                 // A failed statement, or a commit that did not go through, leaves the transaction
                 // to roll back.
                 let failure = match outcome {
@@ -4609,7 +4614,7 @@ fn run_session_stmt_in_state(
                         return (Ok(result), TxnState::Auto);
                     },
                     Err(e) => {
-                        let _ = engine.rollback(txn);
+                        let _ = deferred::rollback(engine, txn);
                         end_cursor_transaction(settles_cursors, false);
                         e
                     },
@@ -5153,25 +5158,36 @@ fn commit_txn(
     settings: &std::sync::Mutex<HashMap<String, String>>,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     match state {
-        TxnState::Active { txn, .. } => match engine.commit(txn) {
+        TxnState::Active { txn, .. } => match deferred::commit(engine, txn) {
             Ok(()) => {
                 end_txn_gucs(settings, true);
                 (Ok(ExecutionResult::TransactionCommitted), TxnState::Auto)
             },
             Err(e) => {
-                let _ = engine.rollback(txn);
+                let _ = deferred::rollback(engine, txn);
                 end_txn_gucs(settings, false);
-                (Err(e.into()), TxnState::Auto)
+                (Err(e), TxnState::Auto)
             },
         },
         // Committing a failed transaction rolls it back — parameters revert with it.
         TxnState::Failed { txn, .. } => {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(engine, txn);
             end_txn_gucs(settings, false);
             (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
         },
         TxnState::Auto => (Ok(ExecutionResult::TransactionCommitted), TxnState::Auto),
     }
+}
+
+/// `SET CONSTRAINTS` outside a transaction block: there is no transaction for it to apply to, so it
+/// warns and does nothing. Inside one it runs in the transaction like any other statement.
+fn set_constraints_outside_block() -> ExecutionResult {
+    nusadb_sql::notice::raise(
+        nusadb_sql::notice::Severity::Warning,
+        "25P01",
+        "SET CONSTRAINTS can only be used in transaction blocks",
+    );
+    ExecutionResult::ConstraintsSet
 }
 
 /// `ROLLBACK`: roll back any open transaction; no-op in `Auto`.
@@ -5181,7 +5197,7 @@ fn rollback_txn(
     settings: &std::sync::Mutex<HashMap<String, String>>,
 ) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
     if let Some(txn) = state.open_txn() {
-        let _ = engine.rollback(txn);
+        let _ = deferred::rollback(engine, txn);
     }
     end_txn_gucs(settings, false);
     (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
@@ -5209,7 +5225,7 @@ fn prepare_txn(
             TxnState::Auto,
         ),
         TxnState::Failed { txn, .. } => {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(engine, txn);
             end_txn_gucs(settings, false);
             (Ok(ExecutionResult::TransactionRolledBack), TxnState::Auto)
         },
@@ -5230,7 +5246,7 @@ fn prepare_txn(
             let result = refusal.map_or_else(
                 || nusadb_sql::two_phase::prepare(engine, txn, gid, owner, database),
                 |what| {
-                    let _ = engine.rollback(txn);
+                    let _ = deferred::rollback(&*engine, txn);
                     Err(nusadb_sql::two_phase::session_refusal(what))
                 },
             );
@@ -5332,14 +5348,11 @@ fn savepoint_txn(
             ..
         } => {
             let result = match stmt {
-                Statement::Savepoint(name) => engine
-                    .savepoint(txn, name)
+                Statement::Savepoint(name) => deferred::savepoint(engine, txn, name)
                     .map(|()| ExecutionResult::SavepointCreated),
-                Statement::ReleaseSavepoint(name) => engine
-                    .release_savepoint(txn, name)
+                Statement::ReleaseSavepoint(name) => deferred::release_savepoint(engine, txn, name)
                     .map(|()| ExecutionResult::SavepointReleased),
-                Statement::RollbackToSavepoint(name) => engine
-                    .rollback_to(txn, name)
+                Statement::RollbackToSavepoint(name) => deferred::rollback_to(engine, txn, name)
                     .map(|()| ExecutionResult::RolledBackToSavepoint),
                 _ => unreachable!("savepoint_txn called with a non-savepoint statement"),
             };
@@ -5361,24 +5374,26 @@ fn savepoint_txn(
             isolation,
             started,
         } => match stmt {
-            Statement::RollbackToSavepoint(name) => match engine.rollback_to(txn, name) {
-                Ok(()) => (
-                    Ok(ExecutionResult::RolledBackToSavepoint),
-                    TxnState::Active {
-                        txn,
-                        dirty: true,
-                        isolation,
-                        started,
-                    },
-                ),
-                Err(e) => (
-                    Err(e.into()),
-                    TxnState::Failed {
-                        txn,
-                        isolation,
-                        started,
-                    },
-                ),
+            Statement::RollbackToSavepoint(name) => {
+                match deferred::rollback_to(engine, txn, name) {
+                    Ok(()) => (
+                        Ok(ExecutionResult::RolledBackToSavepoint),
+                        TxnState::Active {
+                            txn,
+                            dirty: true,
+                            isolation,
+                            started,
+                        },
+                    ),
+                    Err(e) => (
+                        Err(e.into()),
+                        TxnState::Failed {
+                            txn,
+                            isolation,
+                            started,
+                        },
+                    ),
+                }
             },
             _ => (
                 Err(aborted()),
@@ -5487,15 +5502,15 @@ fn run_stmt_in_state(
                         execute_in_txn_as_with_settings(plan(logical), engine, txn, user, &snapshot)
                     });
                 let failure = match outcome {
-                    Ok(result) => match engine.commit(txn) {
+                    Ok(result) => match deferred::commit(engine, txn) {
                         Ok(()) => return (Ok(result), TxnState::Auto),
                         Err(e) => {
-                            let _ = engine.rollback(txn);
-                            e.into()
+                            let _ = deferred::rollback(engine, txn);
+                            e
                         },
                     },
                     Err(err) => {
-                        let _ = engine.rollback(txn);
+                        let _ = deferred::rollback(engine, txn);
                         err
                     },
                 };
@@ -5570,6 +5585,7 @@ impl<'a> EngineCatalog<'a> {
         // statement's (the snapshot is refreshed again when the statement runs). A failure only
         // costs that distinction, which the engine then makes conservatively.
         let _ = engine.begin_statement(txn);
+        deferred::new_statement();
         Self {
             engine,
             txn,
@@ -6259,6 +6275,7 @@ fn command_tag(result: &ExecutionResult) -> String {
         },
         ExecutionResult::SavepointCreated => "SAVEPOINT".to_owned(),
         ExecutionResult::SavepointReleased => "RELEASE".to_owned(),
+        ExecutionResult::ConstraintsSet => "SET CONSTRAINTS".to_owned(),
         // The reference engine's `VACUUM` tag carries no count, regardless of how many tables ran.
         ExecutionResult::Vacuumed(_) => "VACUUM".to_owned(),
         ExecutionResult::Reindexed => "REINDEX".to_owned(),

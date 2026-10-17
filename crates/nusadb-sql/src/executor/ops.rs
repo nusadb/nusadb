@@ -3828,6 +3828,8 @@ fn info_schema_table_constraints(
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
+    let deferral = super::deferred::all_rows(engine, txn)?;
+    let yes_no = |b: bool| ast::Value::Text(if b { "YES" } else { "NO" }.to_owned());
     // Every table, in its own schema: a constraint is reported under its table's namespace.
     for (namespace, name) in &engine.list_tables_qualified_as_of(txn)? {
         if name.starts_with(crate::SYSTEM_TABLE_PREFIX) {
@@ -3837,6 +3839,10 @@ fn info_schema_table_constraints(
             continue;
         };
         for c in engine.list_constraints_as_of(txn, schema.id)? {
+            let declared = deferral
+                .iter()
+                .find(|r| (r.table, r.name.as_str()) == (schema.id, c.name.as_str()))
+                .map_or(ast::Deferral::IMMEDIATE, |r| r.deferral);
             // Synthetic type-bound checks (a VARCHAR(n) length or narrow-int range) are an
             // implementation detail of the declared type, not a user constraint — enforced on every
             // write but hidden from introspection.
@@ -3857,6 +3863,9 @@ fn info_schema_table_constraints(
                 ast::Value::Text(namespace.clone()),
                 ast::Value::Text(name.clone()),
                 ast::Value::Text(kind.to_owned()),
+                yes_no(declared.deferrable),
+                yes_no(declared.initially_deferred),
+                yes_no(true),
             ]);
         }
     }

@@ -45,6 +45,7 @@ mod expr;
 mod query;
 mod script;
 mod select;
+mod set_constraints;
 use ddl::*;
 use dml::*;
 use expr::*;
@@ -635,6 +636,13 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     if let Some(result) = recognize_comment(sql) {
         return result;
     }
+    // `SET CONSTRAINTS ...` and `ALTER TABLE ... ALTER CONSTRAINT ...`: no generic grammar.
+    if let Some(result) = set_constraints::recognize_set_constraints(sql) {
+        return result;
+    }
+    if let Some(result) = set_constraints::recognize_alter_constraint(sql) {
+        return result;
+    }
     // Access control. `SET ROLE` / `RESET ROLE` must be recognized before the generic `SET`/`RESET`
     // handling below, which would otherwise file `role` away as an ordinary session variable and
     // report success while the session's privileges stayed exactly as they were.
@@ -818,6 +826,10 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `EXCLUDE (col WITH =, ...)` table constraint: sqlparser has no grammar for it. Rewrite the
     // equality form to the equivalent `UNIQUE (col, ...)`; other operators are refused.
     rewrite_exclude_constraint(&mut tokens)?;
+    // `CHECK (...) DEFERRABLE` / `NOT NULL DEFERRABLE`: refused with `0A000`, the timing words that
+    // change nothing (`NOT DEFERRABLE`, `INITIALLY IMMEDIATE`) dropped. After the `EXCLUDE` rewrite,
+    // which consumes its own constraint's words.
+    strip_check_characteristics(&mut tokens)?;
     // `CREATE VIEW ... WITH [LOCAL|CASCADED] CHECK OPTION`: sqlparser (0.62) has no grammar for the
     // trailing check-option clause, so strip it here and remember it — the flag is re-attached to the
     // parsed `CreateView` below (a statement-level property, applied after conversion).
@@ -1285,27 +1297,17 @@ fn rewrite_exclude_constraint(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Err
             predicate = Some((p_open, p_close));
             end = p_close;
         }
-        // Constraint characteristics (`DEFERRABLE`, `INITIALLY ...`) and `INCLUDE` are not
-        // supported: an exclusion constraint is checked when each statement writes its rows.
-        if let Some(next) = nonws(tokens, end) {
-            let deferral = ["deferrable", "initially"]
-                .iter()
-                .any(|w| word_ci(tokens.get(next), w))
-                || (word_ci(tokens.get(next), "not")
-                    && nonws(tokens, next).is_some_and(|d| word_ci(tokens.get(d), "deferrable")));
-            if deferral {
-                return Err(Error::Unsupported(
-                    "a deferrable EXCLUDE constraint is not supported (it is checked when each \
-                     statement writes its rows)"
-                        .to_owned(),
-                ));
-            }
-            if word_ci(tokens.get(next), "include") {
-                return Err(Error::Unsupported(
-                    "EXCLUDE ... INCLUDE (...) is not supported".to_owned(),
-                ));
-            }
+        // `INCLUDE` is not supported. Constraint characteristics (`[NOT] DEFERRABLE`, `INITIALLY
+        // {DEFERRED | IMMEDIATE}`) are read here: the `UNIQUE` form leaves them for the ordinary
+        // grammar, the marker form carries them in its call (see `exclusion::rewrite_method`).
+        if let Some(next) = nonws(tokens, end)
+            && word_ci(tokens.get(next), "include")
+        {
+            return Err(Error::Unsupported(
+                "EXCLUDE ... INCLUDE (...) is not supported".to_owned(),
+            ));
         }
+        let (deferral, characteristics_end) = exclude_characteristics(tokens, end)?;
         let elements = parse_exclude_elements(tokens, open, close)?;
         let all_plain_eq = elements.iter().all(|(expr, op)| {
             op == "="
@@ -1314,12 +1316,128 @@ fn rewrite_exclude_constraint(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Err
         });
         let predicate_tokens: Option<Vec<TokenWithSpan>> = predicate
             .map(|(p_open, p_close)| tokens.get(p_open..=p_close).unwrap_or_default().to_vec());
+        let unique_form = all_plain_eq && predicate_tokens.is_none();
+        if !unique_form {
+            end = characteristics_end;
+        }
+        let method_name = exclusion::rewrite_method(&method_name, deferral);
         let repl = exclude_replacement(all_plain_eq, method_name, elements, predicate_tokens);
         let n = repl.len();
         let _: Vec<TokenWithSpan> = tokens.splice(i..=end, repl).collect();
         i += n;
     }
     Ok(())
+}
+
+/// Constraint characteristics after a `CHECK (...)` or a `NOT NULL` constraint, which the generic
+/// grammar has no place for. Such a constraint is checked by each statement and cannot be deferred:
+/// `DEFERRABLE` / `INITIALLY DEFERRED` is refused with `0A000`; `NOT DEFERRABLE` and
+/// `INITIALLY IMMEDIATE`, which say exactly that, are dropped.
+fn strip_check_characteristics(tokens: &mut Vec<TokenWithSpan>) -> Result<(), Error> {
+    let starts = |t: Option<&TokenWithSpan>| {
+        ["deferrable", "initially", "not"]
+            .iter()
+            .any(|w| word_ci(t, w))
+    };
+    let nonws = |toks: &[TokenWithSpan], from: usize| -> Option<usize> {
+        (from + 1..toks.len())
+            .find(|&j| !matches!(toks.get(j).map(|t| &t.token), Some(Token::Whitespace(_))))
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        // The token a constraint's characteristics would follow, and the constraint's kind.
+        let found = if word_ci(tokens.get(i), "check") {
+            nonws(tokens, i)
+                .filter(|&open| matches!(tokens.get(open).map(|t| &t.token), Some(Token::LParen)))
+                .and_then(|open| matching_paren(tokens, open))
+                .map(|close| (close, "CHECK"))
+        } else if word_ci(tokens.get(i), "not") {
+            nonws(tokens, i)
+                .filter(|&n| word_ci(tokens.get(n), "null"))
+                .map(|n| (n, "NOT NULL"))
+        } else {
+            None
+        };
+        let Some((end, kind)) = found else {
+            i += 1;
+            continue;
+        };
+        if !nonws(tokens, end).is_some_and(|n| starts(tokens.get(n))) {
+            i = end + 1;
+            continue;
+        }
+        let (deferral, last) = exclude_characteristics(tokens, end)?;
+        if deferral.deferrable {
+            return Err(Error::Unsupported(format!(
+                "{kind} constraints cannot be marked DEFERRABLE"
+            )));
+        }
+        if last > end {
+            let _: Vec<TokenWithSpan> = tokens.drain(end + 1..=last).collect();
+        }
+        i = end + 1;
+    }
+    Ok(())
+}
+
+/// The constraint characteristics following an `EXCLUDE` constraint that ends at token `end`:
+/// `[NOT] DEFERRABLE` and `INITIALLY {DEFERRED | IMMEDIATE}`, each at most once and in either order.
+/// Returns the timing and the index of the last characteristics token (`end` when there are none).
+/// `NOT DEFERRABLE INITIALLY DEFERRED` is a syntax error, as it is for every other constraint.
+fn exclude_characteristics(
+    tokens: &[TokenWithSpan],
+    end: usize,
+) -> Result<(ast::Deferral, usize), Error> {
+    let nonws = |from: usize| -> Option<usize> {
+        (from + 1..tokens.len())
+            .find(|&j| !matches!(tokens.get(j).map(|t| &t.token), Some(Token::Whitespace(_))))
+    };
+    let mut last = end;
+    let mut deferrable: Option<bool> = None;
+    let mut initially_deferred: Option<bool> = None;
+    while let Some(next) = nonws(last) {
+        if deferrable.is_none() && word_ci(tokens.get(next), "deferrable") {
+            deferrable = Some(true);
+            last = next;
+        } else if deferrable.is_none()
+            && word_ci(tokens.get(next), "not")
+            && let Some(d) = nonws(next).filter(|&d| word_ci(tokens.get(d), "deferrable"))
+        {
+            deferrable = Some(false);
+            last = d;
+        } else if initially_deferred.is_none() && word_ci(tokens.get(next), "initially") {
+            let Some(mode) = nonws(next) else {
+                return Err(Error::Syntax(
+                    "expected DEFERRED or IMMEDIATE after INITIALLY".to_owned(),
+                ));
+            };
+            initially_deferred = Some(if word_ci(tokens.get(mode), "deferred") {
+                true
+            } else if word_ci(tokens.get(mode), "immediate") {
+                false
+            } else {
+                return Err(Error::Syntax(
+                    "expected DEFERRED or IMMEDIATE after INITIALLY".to_owned(),
+                ));
+            });
+            last = mode;
+        } else {
+            break;
+        }
+    }
+    let initially_deferred = initially_deferred.unwrap_or(false);
+    if deferrable == Some(false) && initially_deferred {
+        return Err(Error::Syntax(
+            "constraint declared INITIALLY DEFERRED must be DEFERRABLE".to_owned(),
+        ));
+    }
+    Ok((
+        ast::Deferral {
+            deferrable: deferrable.unwrap_or(initially_deferred),
+            initially_deferred,
+        },
+        last,
+    ))
 }
 
 /// The tokens an `EXCLUDE` constraint is rewritten to (see [`rewrite_exclude_constraint`]): `UNIQUE

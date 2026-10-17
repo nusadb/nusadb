@@ -335,27 +335,33 @@ pub(super) fn convert_column_def(
             sql::ColumnOption::NotNull => nullable = false,
             sql::ColumnOption::Null => {},
             // `PRIMARY KEY` implies `NOT NULL`; a bare `UNIQUE` does not. (sqlparser 0.62 models
-            // these as dedicated constraint structs; index hints / characteristics on a
-            // column-level key were ignored in 0.51 and still are.)
-            // A named key becomes a table constraint carrying the name; an unnamed one stays a
-            // column flag, named by the table's default rule.
-            sql::ColumnOption::PrimaryKey(_) => {
+            // these as dedicated constraint structs; index hints on a column-level key are ignored.)
+            // A named or deferrable key becomes a table constraint carrying the name and timing;
+            // an unnamed immediate one stays a column flag. Either way an unnamed key is named by
+            // the table's default rule, which is the same for both forms.
+            sql::ColumnOption::PrimaryKey(pk) => {
                 nullable = false;
+                let deferral = convert_characteristics(pk.characteristics.as_ref())?;
                 match constraint_name.take() {
-                    Some(key_name) => lifted.push(ast::TableConstraint::PrimaryKey {
-                        name: Some(key_name),
+                    None if !deferral.deferrable => primary_key = true,
+                    key_name => lifted.push(ast::TableConstraint::PrimaryKey {
+                        name: key_name,
                         columns: vec![name.clone()],
+                        deferral,
                     }),
-                    None => primary_key = true,
                 }
             },
-            sql::ColumnOption::Unique(_) => match constraint_name.take() {
-                Some(key_name) => lifted.push(ast::TableConstraint::Unique {
-                    name: Some(key_name),
-                    columns: vec![name.clone()],
-                    nulls_not_distinct: false,
-                }),
-                None => unique = true,
+            sql::ColumnOption::Unique(u) => {
+                let deferral = convert_characteristics(u.characteristics.as_ref())?;
+                match constraint_name.take() {
+                    None if !deferral.deferrable => unique = true,
+                    key_name => lifted.push(ast::TableConstraint::Unique {
+                        name: key_name,
+                        columns: vec![name.clone()],
+                        nulls_not_distinct: false,
+                        deferral,
+                    }),
+                }
             },
             // `DEFAULT <expr>`. Capture the canonical SQL text too (like CHECK's
             // `predicate_sql`) so the executor can persist + re-parse it per write.
@@ -378,7 +384,7 @@ pub(super) fn convert_column_def(
             },
             // Column-level `REFERENCES t (cols)` → a single-column table FK.
             sql::ColumnOption::ForeignKey(fk) => {
-                reject_characteristics(fk.characteristics.as_ref())?;
+                let deferral = convert_characteristics(fk.characteristics.as_ref())?;
                 if fk.match_kind.is_some() {
                     return unsupported("REFERENCES ... MATCH FULL/PARTIAL/SIMPLE");
                 }
@@ -389,6 +395,7 @@ pub(super) fn convert_column_def(
                     referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
                     on_delete: fk.on_delete.map(convert_referential_action),
                     on_update: fk.on_update.map(convert_referential_action),
+                    deferral,
                 });
             },
             // `GENERATED ALWAYS AS (<expr>) [STORED|VIRTUAL]` — a computed column.
@@ -1522,10 +1529,11 @@ pub(super) fn convert_table_constraint(
                 pk.index_type.as_ref(),
                 &pk.index_options,
             )?;
-            reject_characteristics(pk.characteristics.as_ref())?;
+            let deferral = convert_characteristics(pk.characteristics.as_ref())?;
             Ok(ast::TableConstraint::PrimaryKey {
                 name: pk.name.as_ref().map(fold_ident),
                 columns: constraint_column_names(&pk.columns)?,
+                deferral,
             })
         },
         T::Unique(u) => {
@@ -1540,11 +1548,12 @@ pub(super) fn convert_table_constraint(
                 u.index_type.as_ref(),
                 &u.index_options,
             )?;
-            reject_characteristics(u.characteristics.as_ref())?;
+            let deferral = convert_characteristics(u.characteristics.as_ref())?;
             Ok(ast::TableConstraint::Unique {
                 name: u.name.as_ref().map(fold_ident),
                 columns: constraint_column_names(&u.columns)?,
                 nulls_not_distinct,
+                deferral,
             })
         },
         T::ForeignKey(fk) => {
@@ -1554,7 +1563,7 @@ pub(super) fn convert_table_constraint(
             if fk.match_kind.is_some() {
                 return unsupported("FOREIGN KEY ... MATCH FULL/PARTIAL/SIMPLE");
             }
-            reject_characteristics(fk.characteristics.as_ref())?;
+            let deferral = convert_characteristics(fk.characteristics.as_ref())?;
             Ok(ast::TableConstraint::ForeignKey {
                 name: fk.name.as_ref().map(fold_ident),
                 columns: fk.columns.iter().map(fold_ident).collect(),
@@ -1562,6 +1571,7 @@ pub(super) fn convert_table_constraint(
                 referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
                 on_delete: fk.on_delete.map(convert_referential_action),
                 on_update: fk.on_update.map(convert_referential_action),
+                deferral,
             })
         },
         T::Check(check) => {
@@ -1569,10 +1579,11 @@ pub(super) fn convert_table_constraint(
                 return unsupported("CHECK constraint with ENFORCED / NOT ENFORCED");
             }
             // An `EXCLUDE` constraint arrives as a `CHECK` around the pre-parse marker call.
-            if let Some(decl) = super::exclusion::classify_check(&check.expr)? {
+            if let Some((decl, deferral)) = super::exclusion::classify_check(&check.expr)? {
                 return Ok(ast::TableConstraint::Exclusion {
                     name: check.name.as_ref().map(fold_ident),
                     decl,
+                    deferral,
                 });
             }
             Ok(ast::TableConstraint::Check {
@@ -1627,14 +1638,31 @@ pub(super) fn reject_index_hints(
     Ok(())
 }
 
-/// Reject deferrable-constraint characteristics (`DEFERRABLE`, `INITIALLY ...`).
-pub(super) fn reject_characteristics(
+/// Lower constraint characteristics (`[NOT] DEFERRABLE`, `INITIALLY {DEFERRED | IMMEDIATE}`,
+/// `[NOT] ENFORCED`) to the constraint's [`ast::Deferral`].
+///
+/// `INITIALLY DEFERRED` implies `DEFERRABLE`; `NOT DEFERRABLE INITIALLY DEFERRED` contradicts itself
+/// and is a syntax error (`42601`). `ENFORCED` is the only behaviour there is and is accepted;
+/// `NOT ENFORCED` is refused (`0A000`).
+pub(super) fn convert_characteristics(
     characteristics: Option<&sql::ConstraintCharacteristics>,
-) -> Result<(), Error> {
-    if characteristics.is_some() {
-        return unsupported("constraint characteristics (DEFERRABLE / INITIALLY ...)");
+) -> Result<ast::Deferral, Error> {
+    let Some(c) = characteristics else {
+        return Ok(ast::Deferral::IMMEDIATE);
+    };
+    if c.enforced == Some(false) {
+        return unsupported("NOT ENFORCED constraints");
     }
-    Ok(())
+    let initially_deferred = matches!(c.initially, Some(sql::DeferrableInitial::Deferred));
+    if c.deferrable == Some(false) && initially_deferred {
+        return Err(Error::Syntax(
+            "constraint declared INITIALLY DEFERRED must be DEFERRABLE".to_owned(),
+        ));
+    }
+    Ok(ast::Deferral {
+        deferrable: c.deferrable.unwrap_or(initially_deferred),
+        initially_deferred,
+    })
 }
 
 /// Map a sqlparser referential action onto the AST's own enum.

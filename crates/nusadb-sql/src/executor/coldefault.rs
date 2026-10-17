@@ -537,12 +537,12 @@ pub fn repair_misfiled_column_defaults(engine: &dyn StorageEngine) -> Result<Def
     let txn = engine.begin(IsolationLevel::default())?;
     match repair_in(engine, txn) {
         Ok(report) => {
-            engine.commit(txn)?;
+            super::deferred::commit(engine, txn)?;
             Ok(report)
         },
         Err(e) => {
             // The original error is what the caller needs; a failed rollback changes nothing.
-            let _ = engine.rollback(txn);
+            let _ = super::deferred::rollback(engine, txn);
             Err(e)
         },
     }

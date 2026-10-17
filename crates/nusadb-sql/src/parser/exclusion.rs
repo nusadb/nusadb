@@ -101,20 +101,40 @@ fn current_rewrite_marker() -> Option<String> {
 /// form. A new `CHECK` calling the stored-form marker in a statement from a client is refused
 /// (`42939`) for clarity; inside a routine, `DO` or trigger body it stays an ordinary `CHECK`, as
 /// older builds stored it, so their routines keep running.
-pub(super) fn classify_check(expr: &sql::Expr) -> Result<Option<ast::ExclusionDecl>, Error> {
+///
+/// The rewrite carries the constraint's `[NOT] DEFERRABLE [INITIALLY ...]` in the method argument
+/// of its marker call (see [`rewrite_method`]); it is returned beside the declaration and never
+/// reaches the stored form, which the deferral catalog does not share.
+pub(super) fn classify_check(
+    expr: &sql::Expr,
+) -> Result<Option<(ast::ExclusionDecl, ast::Deferral)>, Error> {
     if let Some(name) = top_level_call_name(expr) {
         refuse_marker_call(name)?;
         if let Some(marker) = current_rewrite_marker()
             && name == marker
         {
-            let mut decl = from_sql_expr_named(expr, &marker)?
+            let (mut decl, deferral) = from_sql_expr_named(expr, &marker, true)?
                 .ok_or_else(|| Error::Syntax("malformed EXCLUDE constraint".to_owned()))?;
             // Persist under the stored-form marker, never the per-parse name.
             decl.spec_sql = decl.stored_form(None);
-            return Ok(Some(decl));
+            return Ok(Some((decl, deferral)));
         }
     }
     Ok(None)
+}
+
+/// The method argument the `EXCLUDE` rewrite writes into its marker call: the access method, then
+/// `deferrable` and `deferred` words for the constraint's timing. Only [`classify_check`] reads the
+/// words back; a stored form never carries them.
+pub(super) fn rewrite_method(method: &str, deferral: ast::Deferral) -> String {
+    let mut out = method.to_owned();
+    if deferral.deferrable {
+        out.push_str(" deferrable");
+    }
+    if deferral.initially_deferred {
+        out.push_str(" deferred");
+    }
+    out
 }
 
 /// Refuse a column-level `CHECK` that calls the stored-form marker (`42939`), in a statement from
@@ -180,17 +200,23 @@ pub(super) fn parse_spec(stored: &str) -> Result<ast::ExclusionDecl, Error> {
     if !matches!(parser.peek_token().token, Token::EOF) {
         return Err(malformed());
     }
-    from_sql_expr_named(&expr, EXCLUSION_MARKER)?.ok_or_else(malformed)
+    from_sql_expr_named(&expr, EXCLUSION_MARKER, false)?
+        .map(|(decl, _)| decl)
+        .ok_or_else(malformed)
 }
 
 /// If `expr` is a call of the marker named `marker`, its declaration; `None` for any other
 /// expression. The declaration must obey the rules the `EXCLUDE` grammar enforces (a `btree` or
 /// `gist` method, at least one element, `=` / `&&` operators), so a stored form can never carry
 /// anything the grammar refuses, whichever path wrote it.
+///
+/// With `rewritten` (the rewrite's own call, see [`rewrite_method`]) the method argument may carry
+/// the timing words; a stored form never does.
 fn from_sql_expr_named(
     expr: &sql::Expr,
     marker: &str,
-) -> Result<Option<ast::ExclusionDecl>, Error> {
+    rewritten: bool,
+) -> Result<Option<(ast::ExclusionDecl, ast::Deferral)>, Error> {
     let sql::Expr::Function(func) = expr else {
         return Ok(None);
     };
@@ -214,7 +240,17 @@ fn from_sql_expr_named(
     let [method, index, rest @ ..] = args.as_slice() else {
         return Err(malformed());
     };
-    let method = string_literal(method).ok_or_else(malformed)?.to_lowercase();
+    let method_arg = string_literal(method).ok_or_else(malformed)?.to_lowercase();
+    let mut words = method_arg.split(' ');
+    let method = words.next().unwrap_or_default().to_owned();
+    let mut deferral = ast::Deferral::IMMEDIATE;
+    for word in words {
+        match word {
+            "deferrable" if rewritten => deferral.deferrable = true,
+            "deferred" if rewritten => deferral.initially_deferred = true,
+            _ => return Err(malformed()),
+        }
+    }
     if method != "gist" && method != "btree" {
         return Err(Error::Unsupported(format!(
             "EXCLUDE USING {method} is not supported (the access method must be btree or gist)"
@@ -261,14 +297,17 @@ fn from_sql_expr_named(
         },
         None => (None, None),
     };
-    Ok(Some(ast::ExclusionDecl {
-        method,
-        index,
-        elements,
-        predicate,
-        predicate_sql,
-        spec_sql: expr.to_string(),
-    }))
+    Ok(Some((
+        ast::ExclusionDecl {
+            method,
+            index,
+            elements,
+            predicate,
+            predicate_sql,
+            spec_sql: expr.to_string(),
+        },
+        deferral,
+    )))
 }
 
 /// The text of a single-quoted string literal argument.

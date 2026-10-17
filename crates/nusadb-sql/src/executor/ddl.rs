@@ -194,6 +194,17 @@ pub(super) fn run_create_table(
             constraint.primary,
             constraint.nulls_not_distinct,
         )?;
+        if constraint.deferral.deferrable {
+            super::deferred::declare(
+                engine,
+                txn,
+                super::deferred::Kind::Unique,
+                id,
+                &constraint.name,
+                None,
+                constraint.deferral,
+            )?;
+        }
     }
     // Register each FOREIGN KEY.
     for fk in &plan.foreign_keys {
@@ -206,6 +217,17 @@ pub(super) fn run_create_table(
             // An EXCLUDE constraint: cataloged the same way, plus its backing index.
             let schema = reread_table_by_id(id, &def, engine, txn)?;
             super::exclusion::register(&schema, &chk.name, spec, engine, txn)?;
+            if chk.deferral.deferrable {
+                super::deferred::declare(
+                    engine,
+                    txn,
+                    super::deferred::Kind::Exclusion,
+                    id,
+                    &chk.name,
+                    None,
+                    chk.deferral,
+                )?;
+            }
         } else {
             engine.add_check_constraint(txn, id, &chk.name, chk.predicate_sql.as_bytes())?;
         }
@@ -334,6 +356,10 @@ pub(super) fn run_create_table(
 /// before it is declared. A partition that already declares an equivalent constraint keeps its own.
 /// The synthetic type-range checks are not copied: each partition regenerates them from its own
 /// columns.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass per constraint kind over the parent's keys, each validated, copied and timed"
+)]
 fn propagate_parent_constraints(
     def: &nusadb_core::TableDef,
     id: nusadb_core::TableId,
@@ -415,6 +441,18 @@ fn propagate_parent_constraints(
             &c.columns,
             primary,
             c.nulls_not_distinct,
+        )?;
+        // The copy is checked when its parent's constraint is, and `SET CONSTRAINTS` naming the
+        // parent's reaches it.
+        let (deferral, origin) = super::deferred::declared(engine, txn, parent.id, &c.name)?;
+        super::deferred::declare(
+            engine,
+            txn,
+            super::deferred::Kind::Unique,
+            id,
+            &renamed,
+            Some(&origin),
+            deferral,
         )?;
         // Backfill the backing index with the partition's existing rows (ATTACH may bring a
         // populated table), exactly like ALTER TABLE ADD CONSTRAINT: the index is the uniqueness
@@ -547,17 +585,28 @@ fn propagate_parent_foreign_keys(
         if already {
             continue;
         }
+        let renamed = partition_constraint_name(
+            &crate::analyzer::qualified_display(&def.schema, &def.name),
+            &crate::analyzer::qualified_display(&parent.schema, &parent.name),
+            &fk.name,
+        );
+        let (deferral, origin) = super::deferred::declared(engine, txn, parent.id, &fk.name)?;
         engine.add_foreign_key(
             txn,
             &nusadb_core::ForeignKeyDef {
-                name: partition_constraint_name(
-                    &crate::analyzer::qualified_display(&def.schema, &def.name),
-                    &crate::analyzer::qualified_display(&parent.schema, &parent.name),
-                    &fk.name,
-                ),
+                name: renamed.clone(),
                 child_table: id,
                 ..fk
             },
+        )?;
+        super::deferred::declare(
+            engine,
+            txn,
+            super::deferred::Kind::ForeignKey,
+            id,
+            &renamed,
+            Some(&origin),
+            deferral,
         )?;
         if validate {
             let schema = engine
@@ -566,7 +615,7 @@ fn propagate_parent_foreign_keys(
                     name: def.name.clone(),
                 })?;
             let rows = scan_rows(&schema, engine, txn)?;
-            dml::enforce_fk_on_child_write(&schema, &rows, &[], engine, txn)?;
+            dml::validate_fk_child_rows(&schema, &rows, engine, txn)?;
         }
     }
     Ok(())
@@ -652,10 +701,24 @@ fn drop_partition_copies(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
+    for (child_table, copy) in partition_copies(table, name, engine, txn)? {
+        engine.drop_constraint(txn, child_table, &copy)?;
+    }
+    Ok(())
+}
+
+/// The copies the partitions below `table` hold of its constraint `name`, as `(partition, copy
+/// name)`, top-down. Each level's copy is named after its own parent's.
+fn partition_copies(
+    table: nusadb_core::TableId,
+    name: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(nusadb_core::TableId, String)>, Error> {
+    let mut out = Vec::new();
     let Some(schema) = schema_by_id(engine, txn, table)? else {
-        return Ok(());
+        return Ok(out);
     };
-    // Each level's copy is named after its own parent's: walk down renaming as the copies did.
     let mut names: Vec<(String, String)> = vec![(
         crate::analyzer::qualified_display(&schema.schema, &schema.name),
         name.to_owned(),
@@ -680,10 +743,90 @@ fn drop_partition_copies(
                     .iter()
                     .any(|fk| fk.name == copy && fk.child_table == child_table.id);
             if has {
-                engine.drop_constraint(txn, child_table.id, &copy)?;
+                out.push((child_table.id, copy.clone()));
             }
         }
         names.push((child_key, copy));
+    }
+    Ok(out)
+}
+
+/// `ALTER TABLE t ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY ...]`: record the new timing
+/// of a `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `EXCLUDE` constraint of `table`, and of the
+/// copies its partitions hold. The caller holds the table. A transaction that already queued keys
+/// for it still checks them at its commit; the change governs the writes after it.
+///
+/// # Errors
+/// `42704` for a constraint the table does not have, `42809` for a `CHECK` (which is never
+/// deferrable).
+fn alter_constraint(
+    table: &TableSchema,
+    name: &str,
+    deferral: ast::Deferral,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let kind = if engine
+        .list_foreign_keys_as_of(txn, table.id)?
+        .iter()
+        .any(|fk| fk.name == name && fk.child_table == table.id)
+    {
+        super::deferred::Kind::ForeignKey
+    } else {
+        match engine
+            .list_constraints_as_of(txn, table.id)?
+            .iter()
+            .find(|c| c.name == name)
+        {
+            Some(c) if super::exclusion::is_exclusion(c) => super::deferred::Kind::Exclusion,
+            Some(c)
+                if matches!(
+                    c.kind,
+                    nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
+                ) =>
+            {
+                super::deferred::Kind::Unique
+            },
+            Some(c) if !c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX) => {
+                return Err(Error::Coded {
+                    message: format!(
+                        "constraint \"{name}\" of relation \"{}\" is a CHECK constraint, which \
+                         cannot be deferrable",
+                        table.name
+                    ),
+                    sqlstate: "42809", // wrong_object_type
+                });
+            },
+            _ => {
+                return Err(Error::ObjectNotFound(format!(
+                    "constraint \"{name}\" of relation \"{}\" does not exist",
+                    table.name
+                )));
+            },
+        }
+    };
+    let (_, origin) = super::deferred::declared(engine, txn, table.id, name)?;
+    let origin = (origin != name).then_some(origin);
+    super::deferred::declare(
+        engine,
+        txn,
+        kind,
+        table.id,
+        name,
+        origin.as_deref(),
+        deferral,
+    )?;
+    for (copy_table, copy) in partition_copies(table.id, name, engine, txn)? {
+        lock_one_for_validation(copy_table, engine, txn)?;
+        super::deferred::declare(
+            engine,
+            txn,
+            kind,
+            copy_table,
+            &copy,
+            Some(origin.as_deref().unwrap_or(name)),
+            deferral,
+        )?;
     }
     Ok(())
 }
@@ -693,6 +836,28 @@ fn drop_partition_copies(
 fn refuse_dropping_inherited_constraint(
     table: nusadb_core::TableId,
     name: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    refuse_changing_inherited_constraint(table, name, InheritedChange::Drop, engine, txn)
+}
+
+/// What a statement tries to do to a partition's copy of its parent's constraint.
+#[derive(Clone, Copy)]
+enum InheritedChange {
+    /// `DROP CONSTRAINT`.
+    Drop,
+    /// `ALTER CONSTRAINT`: the copy is checked when the parent's is, so its timing cannot
+    /// diverge from the parent's.
+    Alter,
+}
+
+/// Refuse a `change` to the constraint `name` of `table` when `table` is a partition and the
+/// constraint is its copy of (or stands in for) one its partitioned parent declares.
+fn refuse_changing_inherited_constraint(
+    table: nusadb_core::TableId,
+    name: &str,
+    change: InheritedChange,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -756,13 +921,23 @@ fn refuse_dropping_inherited_constraint(
         });
     let inherited = copy || standing_in;
     if inherited {
-        return Err(Error::Coded {
-            message: format!(
-                "cannot drop inherited constraint \"{name}\" of relation \"{}\"; drop it on \
-                 \"{}\" instead",
-                schema.name, parent.name
-            ),
-            sqlstate: "42P16", // invalid_table_definition
+        return Err(match change {
+            InheritedChange::Drop => Error::Coded {
+                message: format!(
+                    "cannot drop inherited constraint \"{name}\" of relation \"{}\"; drop it \
+                     on \"{}\" instead",
+                    schema.name, parent.name
+                ),
+                sqlstate: "42P16", // invalid_table_definition
+            },
+            InheritedChange::Alter => Error::Coded {
+                message: format!(
+                    "cannot alter constraint \"{name}\" of relation \"{}\": it is inherited \
+                     from partitioned table \"{}\"; alter the constraint on \"{}\" instead",
+                    schema.name, parent.name, parent.name
+                ),
+                sqlstate: "42809", // wrong_object_type
+            },
         });
     }
     Ok(())
@@ -1679,6 +1854,15 @@ pub(super) fn register_foreign_key(
             on_update: fk.on_update,
         },
     )?;
+    super::deferred::declare(
+        engine,
+        txn,
+        super::deferred::Kind::ForeignKey,
+        child_id,
+        &fk.name,
+        None,
+        fk.deferral,
+    )?;
     Ok(())
 }
 
@@ -1737,6 +1921,7 @@ pub(super) fn run_drop_table(
                 if fk.parent_table == schema.id && fk.child_table != schema.id {
                     if plan.cascade {
                         engine.drop_constraint(txn, fk.child_table, &fk.name)?;
+                        super::deferred::forget_constraint(engine, txn, fk.child_table, &fk.name)?;
                         if let Some(child) = engine.lookup_table_by_id_as_of(txn, fk.child_table)? {
                             super::comment::forget(
                                 engine,
@@ -1784,6 +1969,7 @@ pub(super) fn run_drop_table(
                 engine.drop_constraint(txn, schema.id, &constraint.name)?;
             }
             engine.drop_table(txn, schema.id)?;
+            super::deferred::forget_table(engine, txn, schema.id)?;
             // Drop the table's column DEFAULTs and the backing sequence of each SERIAL / identity
             // column no other table's default still draws from, so a later same-named table
             // starts clean. The default catalog is keyed by the schema-qualified name so a
@@ -2267,6 +2453,7 @@ pub(super) fn run_alter_table(
             columns,
             primary,
             nulls_not_distinct,
+            deferral,
         } => {
             // Taken before the rows are validated, so no other transaction's unfinished write can
             // slip a duplicate past the check (a prepared one refuses it with 55006).
@@ -2294,6 +2481,17 @@ pub(super) fn run_alter_table(
                 &columns,
                 primary,
                 nulls_not_distinct,
+            )?;
+            // Recorded (or a stale row of an earlier same-named constraint cleared) before the
+            // partitions below copy it.
+            super::deferred::declare(
+                engine,
+                txn,
+                super::deferred::Kind::Unique,
+                table.id,
+                &name,
+                None,
+                deferral,
             )?;
             // Backfill the constraint's backing index with the existing rows: the backing
             // index is a scannable access path now, so on a populated table it must cover every
@@ -2332,8 +2530,9 @@ pub(super) fn run_alter_table(
             register_foreign_key(table.id, &table.schema, &fk, engine, txn)?;
             let _fresh = fresh_reads(engine, txn)?;
             let existing = scan_rows(&table, engine, txn)?;
-            // Validating rows already in the table when a key is added: nothing is pending.
-            dml::enforce_fk_on_child_write(&table, &existing, &[], engine, txn)?;
+            // Validating rows already in the table when a key is added: nothing is pending, and the
+            // check is immediate whatever the key's timing.
+            dml::validate_fk_child_rows(&table, &existing, engine, txn)?;
             propagate_to_existing_partitions(&table, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
@@ -2408,7 +2607,11 @@ pub(super) fn run_alter_table(
                 )));
             }
             refuse_dropping_inherited_constraint(table, &name, engine, txn)?;
+            for (copy_table, copy) in partition_copies(table, &name, engine, txn)? {
+                super::deferred::forget_constraint(engine, txn, copy_table, &copy)?;
+            }
             drop_partition_copies(table, &name, engine, txn)?;
+            super::deferred::forget_constraint(engine, txn, table, &name)?;
             // An exclusion constraint's backing index goes with it.
             let exclusion_spec = engine
                 .list_constraints_as_of(txn, table)?
@@ -2461,6 +2664,7 @@ pub(super) fn run_alter_table(
             table,
             name,
             spec_sql,
+            deferral,
         } => {
             let key = crate::analyzer::qualified_display(&table.schema, &table.name);
             if super::partition::has_any(engine, txn)?
@@ -2474,6 +2678,31 @@ pub(super) fn run_alter_table(
             }
             let _fresh = lock_for_validation(&table, engine, txn)?;
             super::exclusion::add_to_existing(&table, &name, &spec_sql, engine, txn)?;
+            super::deferred::declare(
+                engine,
+                txn,
+                super::deferred::Kind::Exclusion,
+                table.id,
+                &name,
+                None,
+                deferral,
+            )?;
+            return Ok(ExecutionResult::Altered);
+        },
+        AlterTablePlan::AlterConstraint {
+            table,
+            name,
+            deferral,
+        } => {
+            let _held = lock_for_validation(&table, engine, txn)?;
+            refuse_changing_inherited_constraint(
+                table.id,
+                &name,
+                InheritedChange::Alter,
+                engine,
+                txn,
+            )?;
+            alter_constraint(&table, &name, deferral, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // ATTACH PARTITION: validate + record the bound and the child→parent edge (via the same

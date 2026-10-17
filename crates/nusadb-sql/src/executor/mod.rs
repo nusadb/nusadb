@@ -130,6 +130,7 @@ mod column_deps;
 mod comment;
 mod dcl;
 mod ddl;
+pub mod deferred;
 mod dml;
 mod dml_join;
 mod exclusion;
@@ -270,6 +271,9 @@ pub enum ExecutionResult {
     RolledBackToSavepoint,
     /// `RELEASE SAVEPOINT` — a savepoint was released from the active transaction.
     SavepointReleased,
+    /// `SET CONSTRAINTS`: the transaction's constraint timing was set (and, for `IMMEDIATE`, what
+    /// it had queued was checked).
+    ConstraintsSet,
     /// `VACUUM` — the number of dead row versions reclaimed.
     Vacuumed(usize),
     /// `REINDEX` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
@@ -502,10 +506,10 @@ pub fn auto_analyze_stale_tables(
         let Ok(txn) = engine.begin(IsolationLevel::default()) else {
             continue;
         };
-        match run_analyze(plan, engine, txn).and_then(|_| engine.commit(txn).map_err(Into::into)) {
+        match run_analyze(plan, engine, txn).and_then(|_| deferred::commit(engine, txn)) {
             Ok(()) => analysed.push(name),
             Err(e) => {
-                let _ = engine.rollback(txn);
+                let _ = deferred::rollback(engine, txn);
                 tracing::warn!(table = %name, error = %e, "auto-analyze skipped a table");
             },
         }
@@ -634,15 +638,15 @@ pub fn copy_from(engine: &dyn StorageEngine, copy: &ast::Copy, data: &str) -> Re
         // A failed commit (e.g. ENOSPC appending CommitTxn) must roll back, or the transaction leaks
         // in `active` with its locks held and purge stalls forever. The `?`
         // that used to be here threw without rolling back.
-        Ok(count) => match engine.commit(txn) {
+        Ok(count) => match deferred::commit(engine, txn) {
             Ok(()) => Ok(count),
             Err(err) => {
-                let _ = engine.rollback(txn);
-                Err(err.into())
+                let _ = deferred::rollback(engine, txn);
+                Err(err)
             },
         },
         Err(err) => {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(engine, txn);
             Err(err)
         },
     }
@@ -668,15 +672,15 @@ pub fn copy_to(
         // A failed commit must roll back rather than leak the transaction,
         // mirroring `copy_from` above — even though a read-only COPY TO commits with an empty undo
         // set and so rarely reaches a failing durability point.
-        Ok(out) => match engine.commit(txn) {
+        Ok(out) => match deferred::commit(engine, txn) {
             Ok(()) => Ok(out),
             Err(err) => {
-                let _ = engine.rollback(txn);
-                Err(err.into())
+                let _ = deferred::rollback(engine, txn);
+                Err(err)
             },
         },
         Err(err) => {
-            let _ = engine.rollback(txn);
+            let _ = deferred::rollback(engine, txn);
             Err(err)
         },
     }
@@ -1860,9 +1864,9 @@ impl<'engine> Session<'engine> {
             };
             let txn = self.engine.begin(IsolationLevel::default())?;
             match self.engine.drop_schema(txn, id, true) {
-                Ok(()) => self.engine.commit(txn).map_err(Into::into),
+                Ok(()) => deferred::commit(self.engine, txn),
                 Err(e) => {
-                    let _ = self.engine.rollback(txn);
+                    let _ = deferred::rollback(self.engine, txn);
                     Err(e.into())
                 },
             }
@@ -1970,6 +1974,16 @@ impl<'engine> Session<'engine> {
             PhysicalPlan::Savepoint(name) => self.savepoint(&name),
             PhysicalPlan::RollbackToSavepoint(name) => self.rollback_to_savepoint(&name),
             PhysicalPlan::ReleaseSavepoint(name) => self.release_savepoint(&name),
+            // Outside a transaction block there is nothing for the setting to apply to: warn and
+            // do nothing, as the standard says.
+            PhysicalPlan::SetConstraints(_) if self.current_txn.is_none() => {
+                crate::notice::raise(
+                    crate::notice::Severity::Warning,
+                    "25P01",
+                    "SET CONSTRAINTS can only be used in transaction blocks".to_owned(),
+                );
+                Ok(ExecutionResult::ConstraintsSet)
+            },
             PhysicalPlan::SetVariable { name, value, local } => {
                 self.set_variable(name, value, local)
             },
@@ -2181,18 +2195,18 @@ impl<'engine> Session<'engine> {
                 let txn = self.engine.begin(self.default_isolation)?;
                 let failure = match self.analyze_plan_dispatch(current, txn, self.default_read_only)
                 {
-                    Ok(result) => match self.engine.commit(txn) {
+                    Ok(result) => match deferred::commit(self.engine, txn) {
                         Ok(()) => return Ok(result),
                         // A failed auto-commit fsync must roll the transaction back, not leak it
                         // Otherwise its view pins purge forever and its locks
                         // are never released.
                         Err(e) => {
-                            let _ = self.engine.rollback(txn);
-                            Error::from(e)
+                            let _ = deferred::rollback(self.engine, txn);
+                            e
                         },
                     },
                     Err(err) => {
-                        let _ = self.engine.rollback(txn);
+                        let _ = deferred::rollback(self.engine, txn);
                         err
                     },
                 };
@@ -2306,16 +2320,16 @@ impl<'engine> Session<'engine> {
         } else {
             let txn = self.engine.begin(self.default_isolation)?;
             match body(txn) {
-                Ok(outcome) => match self.engine.commit(txn) {
+                Ok(outcome) => match deferred::commit(self.engine, txn) {
                     Ok(()) => Ok(outcome),
                     // A failed auto-commit must roll the transaction back, not leak it.
                     Err(e) => {
-                        let _ = self.engine.rollback(txn);
-                        Err(e.into())
+                        let _ = deferred::rollback(self.engine, txn);
+                        Err(e)
                     },
                 },
                 Err(err) => {
-                    let _ = self.engine.rollback(txn);
+                    let _ = deferred::rollback(self.engine, txn);
                     Err(err)
                 },
             }
@@ -2485,19 +2499,19 @@ impl<'engine> Session<'engine> {
 
     fn savepoint(&self, name: &str) -> Result<ExecutionResult, Error> {
         let txn = self.active_txn("SAVEPOINT")?;
-        self.engine.savepoint(txn, name)?;
+        deferred::savepoint(self.engine, txn, name)?;
         Ok(ExecutionResult::SavepointCreated)
     }
 
     fn rollback_to_savepoint(&self, name: &str) -> Result<ExecutionResult, Error> {
         let txn = self.active_txn("ROLLBACK TO SAVEPOINT")?;
-        self.engine.rollback_to(txn, name)?;
+        deferred::rollback_to(self.engine, txn, name)?;
         Ok(ExecutionResult::RolledBackToSavepoint)
     }
 
     fn release_savepoint(&self, name: &str) -> Result<ExecutionResult, Error> {
         let txn = self.active_txn("RELEASE SAVEPOINT")?;
-        self.engine.release_savepoint(txn, name)?;
+        deferred::release_savepoint(self.engine, txn, name)?;
         Ok(ExecutionResult::SavepointReleased)
     }
 
@@ -2591,7 +2605,7 @@ impl<'engine> Session<'engine> {
             ));
         }
         if let Some(isolation) = characteristics.isolation {
-            self.engine.rollback(txn)?;
+            deferred::rollback(self.engine, txn)?;
             self.current_txn = None;
             self.current_txn = Some(self.engine.begin(isolation)?);
         }
@@ -2624,12 +2638,12 @@ impl<'engine> Session<'engine> {
         // the engine releases it and its locks and purge is not blocked forever
         // `current_txn` is already cleared, so the session returns to
         // auto-commit either way.
-        if let Err(e) = self.engine.commit(txn) {
-            let _ = self.engine.rollback(txn);
+        if let Err(e) = deferred::commit(self.engine, txn) {
+            let _ = deferred::rollback(self.engine, txn);
             self.txn_read_only = false;
             self.end_txn_gucs(false);
             self.cursors.end_transaction(false);
-            return Err(e.into());
+            return Err(e);
         }
         self.txn_read_only = false;
         self.end_txn_gucs(true);
@@ -2644,7 +2658,7 @@ impl<'engine> Session<'engine> {
         // The cursors close with the transaction even if the engine reports a failed rollback:
         // the session leaves the transaction either way.
         self.cursors.end_transaction(false);
-        self.engine.rollback(txn)?;
+        deferred::rollback(self.engine, txn)?;
         self.txn_read_only = false;
         self.end_txn_gucs(false);
         Ok(ExecutionResult::TransactionRolledBack)
@@ -2661,7 +2675,7 @@ impl<'engine> Session<'engine> {
         })?;
         self.txn_read_only = false;
         let prepared = if self.cursors.has_pending_hold() {
-            let _ = self.engine.rollback(txn);
+            let _ = deferred::rollback(self.engine, txn);
             Err(crate::two_phase::session_refusal(
                 "declared a cursor WITH HOLD",
             ))
@@ -2742,18 +2756,18 @@ impl<'engine> Session<'engine> {
                 crate::notice::clear();
                 let txn = self.engine.begin(self.default_isolation)?;
                 let failure = match dispatch(current, self.engine, txn) {
-                    Ok(result) => match self.engine.commit(txn) {
+                    Ok(result) => match deferred::commit(self.engine, txn) {
                         Ok(()) => return Ok(result),
                         // A failed auto-commit fsync must roll the transaction back, not leak it
                         // Otherwise its view pins purge forever and its locks
                         // are never released.
                         Err(e) => {
-                            let _ = self.engine.rollback(txn);
-                            Error::from(e)
+                            let _ = deferred::rollback(self.engine, txn);
+                            e
                         },
                     },
                     Err(err) => {
-                        let _ = self.engine.rollback(txn);
+                        let _ = deferred::rollback(self.engine, txn);
                         err
                     },
                 };
@@ -2785,7 +2799,7 @@ impl Drop for Session<'_> {
         if let Some(txn) = self.current_txn.take() {
             // Best-effort rollback: a session dropped mid-transaction would
             // otherwise leak the txn inside the engine.
-            let _ = self.engine.rollback(txn);
+            let _ = deferred::rollback(self.engine, txn);
         }
         // Release any advisory locks this session held, so they never outlive it. Keyed by the
         // session's temporary-schema name, the same token the lock functions use.
@@ -2849,8 +2863,8 @@ struct StatementMark<'a> {
 impl Drop for StatementMark<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.engine.rollback_to(self.txn, STATEMENT_SAVEPOINT);
-            let _ = self.engine.release_savepoint(self.txn, STATEMENT_SAVEPOINT);
+            let _ = deferred::rollback_to(self.engine, self.txn, STATEMENT_SAVEPOINT);
+            let _ = deferred::release_savepoint(self.engine, self.txn, STATEMENT_SAVEPOINT);
         }
     }
 }
@@ -2886,10 +2900,11 @@ fn run_statement_atomically<T>(
 ) -> Result<T, Error> {
     let level = StatementDepthGuard::enter();
     engine.begin_statement(txn)?;
+    deferred::new_statement();
     if !level.outermost {
         return body();
     }
-    engine.savepoint(txn, STATEMENT_SAVEPOINT)?;
+    deferred::savepoint(engine, txn, STATEMENT_SAVEPOINT)?;
     let mut mark = StatementMark {
         engine,
         txn,
@@ -2899,7 +2914,7 @@ fn run_statement_atomically<T>(
     mark.armed = false;
     match outcome {
         Ok(value) => {
-            engine.release_savepoint(txn, STATEMENT_SAVEPOINT)?;
+            deferred::release_savepoint(engine, txn, STATEMENT_SAVEPOINT)?;
             Ok(value)
         },
         Err(error) => {
@@ -2907,13 +2922,13 @@ fn run_statement_atomically<T>(
             // transaction is no worse than before this mark existed and the caller still learns
             // the statement failed; a real undo failure is logged so it is never silent, while a
             // transaction the engine has already ended has nothing left to undo.
-            match engine.rollback_to(txn, STATEMENT_SAVEPOINT) {
+            match deferred::rollback_to(engine, txn, STATEMENT_SAVEPOINT) {
                 Ok(()) | Err(nusadb_core::Error::UnknownTransaction { .. }) => {},
                 Err(undo) => {
                     tracing::warn!(error = %undo, "could not undo a failed statement's writes");
                 },
             }
-            if let Err(release) = engine.release_savepoint(txn, STATEMENT_SAVEPOINT) {
+            if let Err(release) = deferred::release_savepoint(engine, txn, STATEMENT_SAVEPOINT) {
                 tracing::debug!(error = %release, "statement savepoint release failed");
             }
             Err(error)
@@ -3125,6 +3140,7 @@ fn dispatch(
         PhysicalPlan::DropIndex(p) => run_drop_index(&p, engine, txn),
         PhysicalPlan::SetOperation(p) => run_set_operation(&p, engine, txn),
         PhysicalPlan::Comment(p) => comment::run_comment(&p, engine, txn),
+        PhysicalPlan::SetConstraints(s) => deferred::set_constraints(&s, engine, txn),
         PhysicalPlan::BeginTransaction(_)
         | PhysicalPlan::Commit
         | PhysicalPlan::Rollback
@@ -3648,6 +3664,7 @@ fn format_plan(
             vec![format!("{indent}RollbackToSavepoint {name}")]
         },
         PhysicalPlan::ReleaseSavepoint(name) => vec![format!("{indent}ReleaseSavepoint {name}")],
+        PhysicalPlan::SetConstraints(_) => vec![format!("{indent}SetConstraints")],
         PhysicalPlan::SetVariable { name, .. } => vec![format!("{indent}SetVariable {name}")],
         PhysicalPlan::ShowVariable(name) => vec![format!("{indent}ShowVariable {name}")],
         PhysicalPlan::ShowTables => vec![format!("{indent}ShowTables")],
@@ -4738,6 +4755,8 @@ pub fn purge_schema_catalogs(
             engine.delete(txn, cat.id, tid)?;
         }
     }
+    // The timing of the constraints of the tables it held.
+    deferred::prune_missing_tables(engine, txn)?;
     // The schema's own comment, and those on the tables it held.
     comment::forget_schema(engine, txn, schema)
 }

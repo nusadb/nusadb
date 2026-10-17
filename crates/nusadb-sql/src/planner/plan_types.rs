@@ -145,6 +145,11 @@ impl InfoSchemaView {
                 text("table_schema"),
                 text("table_name"),
                 text("constraint_type"),
+                // `YES` / `NO`: declared DEFERRABLE, and INITIALLY DEFERRED.
+                text("is_deferrable"),
+                text("initially_deferred"),
+                // Always `YES`: every constraint is enforced.
+                text("enforced"),
             ],
             Self::KeyColumnUsage => vec![
                 text("constraint_catalog"),
@@ -421,6 +426,9 @@ pub enum LogicalPlan {
     RollbackToSavepoint(String),
     /// `RELEASE [SAVEPOINT] name` — discard a named savepoint, keeping its writes.
     ReleaseSavepoint(String),
+    /// `SET CONSTRAINTS {ALL | name, ...} {DEFERRED | IMMEDIATE}`: choose when the transaction's
+    /// deferrable constraints are checked.
+    SetConstraints(ast::SetConstraints),
     /// `SET [LOCAL] name = value` (`value: Some`) / `RESET name` (`value: None`) — a session
     /// variable.
     SetVariable {
@@ -994,6 +1002,9 @@ pub struct CheckSpec {
     pub name: String,
     /// The predicate as canonical SQL text.
     pub predicate_sql: String,
+    /// When the constraint is checked. Only an `EXCLUDE` constraint (a tagged
+    /// [`predicate_sql`](Self::predicate_sql)) may be deferrable; a `CHECK` never is.
+    pub deferral: ast::Deferral,
 }
 
 /// `CREATE MATERIALIZED VIEW name AS <select>` (logical).
@@ -1386,6 +1397,8 @@ pub struct UniqueConstraintSpec {
     /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (at most one NULL
     /// row). Always `false` for a `PRIMARY KEY` (its columns are `NOT NULL`).
     pub nulls_not_distinct: bool,
+    /// When the constraint is checked.
+    pub deferral: ast::Deferral,
 }
 
 /// A resolved `FOREIGN KEY` constraint to declare at `CREATE TABLE`. The child columns
@@ -1406,6 +1419,8 @@ pub struct ForeignKeySpec {
     pub on_delete: nusadb_core::FkAction,
     /// Action when a referenced parent key is updated.
     pub on_update: nusadb_core::FkAction,
+    /// When the constraint is checked.
+    pub deferral: ast::Deferral,
 }
 
 /// A width or length check a column's new type implies, added by `ALTER COLUMN ... TYPE`.
@@ -1506,6 +1521,8 @@ pub enum AlterTablePlan {
         /// `UNIQUE ... NULLS NOT DISTINCT` — `NULL` key values are treated as equal (`false` for a
         /// `PRIMARY KEY`).
         nulls_not_distinct: bool,
+        /// When the constraint is checked.
+        deferral: ast::Deferral,
     },
     /// `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent (...)` — the executor
     /// registers the FK, then validates that the table's existing rows reference live parent rows.
@@ -1537,6 +1554,18 @@ pub enum AlterTablePlan {
         name: String,
         /// The constraint's stored form, persisted in the constraint catalog.
         spec_sql: String,
+        /// When the constraint is checked.
+        deferral: ast::Deferral,
+    },
+    /// `ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY ...]`: change when a `PRIMARY KEY`,
+    /// `UNIQUE`, `FOREIGN KEY` or `EXCLUDE` constraint is checked (and its partition copies').
+    AlterConstraint {
+        /// Target table schema.
+        table: TableSchema,
+        /// The constraint name.
+        name: String,
+        /// The new timing.
+        deferral: ast::Deferral,
     },
     /// `DROP CONSTRAINT [IF EXISTS] name` — drop a named constraint and its backing index.
     DropConstraint {
@@ -2898,6 +2927,9 @@ pub enum PhysicalPlan {
     RollbackToSavepoint(String),
     /// `RELEASE [SAVEPOINT] name` — discard a named savepoint, keeping its writes.
     ReleaseSavepoint(String),
+    /// `SET CONSTRAINTS {ALL | name, ...} {DEFERRED | IMMEDIATE}`: choose when the transaction's
+    /// deferrable constraints are checked.
+    SetConstraints(ast::SetConstraints),
     /// `SET [LOCAL] name = value` / `RESET name` — a session variable.
     SetVariable {
         /// Variable name, folded to lowercase.

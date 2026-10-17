@@ -929,14 +929,16 @@ struct DeferredUnique {
     eligible: bool,
     /// The statement's exclusion-constraint check, run once at the end of the stream.
     exclusion: super::exclusion::Deferred,
+    /// Whether the transaction defers some PK/UNIQUE constraint of the table: each batch then
+    /// still takes its key locks, which queue the deferred constraints' keys.
+    defers_some: bool,
 }
 
 impl DeferredUnique {
     /// Load the target's PK/UNIQUE constraints; a table without any yields an empty (free)
     /// collector.
     fn load(table: &TableSchema, engine: &dyn StorageEngine, txn: TxnId) -> Result<Self, Error> {
-        let constraints: Vec<DeferredConstraint> = engine
-            .list_constraints_as_of(txn, table.id)?
+        let constraints: Vec<DeferredConstraint> = checked_unique_constraints(table, engine, txn)?
             .into_iter()
             .filter_map(|c| {
                 let kind = match c.kind {
@@ -973,12 +975,21 @@ impl DeferredUnique {
             }
         }
         let seen = constraints.iter().map(|_| HashMap::new()).collect();
+        let deferral = super::deferred::table_state(engine, txn, table.id)?;
+        let defers_some = !deferral.is_empty()
+            && engine
+                .list_constraints_as_of(txn, table.id)?
+                .iter()
+                .any(|c| {
+                    deferral.defers(&super::deferred::ConstraintRef::unique(table.id, &c.name))
+                });
         Ok(Self {
             constraints,
             seen,
             inserted: HashSet::new(),
             eligible,
             exclusion: super::exclusion::Deferred::load(table, engine, txn)?,
+            defers_some,
         })
     }
 
@@ -992,6 +1003,9 @@ impl DeferredUnique {
         txn: TxnId,
     ) -> Result<(), Error> {
         if self.constraints.is_empty() {
+            if self.defers_some {
+                lock_unique_keys(table, rows, engine, txn)?;
+            }
             return Ok(());
         }
         if self.eligible {
@@ -2130,6 +2144,20 @@ fn resolve_arbiter(
             )
         })
         .collect();
+    // A deferrable constraint cannot arbitrate: whether a row conflicts would depend on rows the
+    // transaction has not checked yet.
+    let deferral = super::deferred::table_state(engine, txn, table.id)?;
+    let deferrable = |c: &nusadb_core::Constraint| {
+        deferral.deferrable(&super::deferred::ConstraintRef::unique(table.id, &c.name))
+    };
+    let refuse_deferrable = |c: &nusadb_core::Constraint| Error::Coded {
+        message: format!(
+            "ON CONFLICT does not support deferrable unique constraints as arbiters (\"{}\" on \
+             \"{}\")",
+            c.name, table.name
+        ),
+        sqlstate: "0A000",
+    };
     match target {
         ConflictArbiter::Constraint(name) => {
             let constraint = constraints
@@ -2142,17 +2170,28 @@ fn resolve_arbiter(
                     ),
                     sqlstate: "42704", // undefined_object
                 })?;
+            if deferrable(constraint) {
+                return Err(refuse_deferrable(constraint));
+            }
             constraint_ordinals(table, &constraint.columns)
         },
         ConflictArbiter::Columns(ordinals) => {
             let mut wanted = ordinals.clone();
             wanted.sort_unstable();
+            let mut deferrable_match = None;
             for constraint in &constraints {
                 let mut got = constraint_ordinals(table, &constraint.columns)?;
                 got.sort_unstable();
                 if got == wanted {
+                    if deferrable(constraint) {
+                        deferrable_match.get_or_insert(constraint);
+                        continue;
+                    }
                     return constraint_ordinals(table, &constraint.columns);
                 }
+            }
+            if let Some(constraint) = deferrable_match {
+                return Err(refuse_deferrable(constraint));
             }
             Err(Error::Coded {
                 message: format!(
@@ -2762,13 +2801,7 @@ fn try_unique_by_index_probe(
         index: nusadb_core::IndexId,
     }
     let mut probes: Vec<Probe> = Vec::new();
-    for constraint in engine.list_constraints_as_of(txn, table.id)? {
-        if !matches!(
-            constraint.kind,
-            nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
-        ) {
-            continue;
-        }
+    for constraint in checked_unique_constraints(table, engine, txn)? {
         // A NULLS NOT DISTINCT constraint must also detect NULL-key collisions; the backing index
         // does not index NULL keys, so an index probe cannot see them — take the scan path, which
         // evaluates NULL equality via `enforce_unique_over_rows`.
@@ -2836,7 +2869,7 @@ fn try_unique_by_index_probe(
 
 /// The `PRIMARY KEY`/`UNIQUE` duplicate-key error — shared by the scan path
 /// ([`enforce_unique_over_rows`]) and the index-probe path so both raise a byte-identical message.
-fn unique_violation_error(
+pub(super) fn unique_violation_error(
     kind: nusadb_core::ConstraintKind,
     name: &str,
     columns: &[String],
@@ -2858,13 +2891,27 @@ fn unique_violation_error(
 /// this closes the duplicate-key race at every isolation level: overlapping writers conflict on the
 /// lock (the second aborts no-wait), and a writer that starts after another commits sees that row in
 /// its own snapshot. A `NULL` key column does not participate (SQL treats `NULL` as distinct).
+///
+/// Every write of a key passes here, so this is also where a constraint the transaction defers
+/// queues the keys for its commit-time check (`executor::deferred`): the lock is taken all the
+/// same, and held to the end of the transaction, which is what makes that later check sound.
 fn lock_unique_keys(
     table: &TableSchema,
     rows: &[Row],
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let constraints: Vec<(Vec<String>, Vec<usize>, bool)> = engine
+    let deferral = super::deferred::table_state(engine, txn, table.id)?;
+    #[allow(
+        clippy::type_complexity,
+        reason = "a local tuple of the per-constraint lock inputs, read once below"
+    )]
+    let constraints: Vec<(
+        Vec<String>,
+        Vec<usize>,
+        bool,
+        Option<super::deferred::ConstraintRef>,
+    )> = engine
         .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| {
@@ -2874,11 +2921,18 @@ fn lock_unique_keys(
             )
         })
         .map(|c| {
-            constraint_ordinals(table, &c.columns).map(|ord| (c.columns, ord, c.nulls_not_distinct))
+            let r = super::deferred::ConstraintRef::unique(table.id, &c.name);
+            let deferred = deferral.defers(&r).then_some(r);
+            constraint_ordinals(table, &c.columns)
+                .map(|ord| (c.columns, ord, c.nulls_not_distinct, deferred))
         })
         .collect::<Result<_, _>>()?;
+    let mut queued: Vec<Vec<super::deferred::Pending>> =
+        constraints.iter().map(|_| Vec::new()).collect();
     for row in rows {
-        for (columns, ordinals, nulls_not_distinct) in &constraints {
+        for ((columns, ordinals, nulls_not_distinct, deferred), queue) in
+            constraints.iter().zip(&mut queued)
+        {
             if let Some(key) = unique_key(row, ordinals, *nulls_not_distinct) {
                 let key_hash = unique_key_hash(table, columns, &key);
                 engine.lock_key(
@@ -2887,10 +2941,38 @@ fn lock_unique_keys(
                     key_hash,
                     nusadb_core::engine::RowLockMode::Exclusive,
                 )?;
+                if deferred.is_some() {
+                    queue.push(super::deferred::Pending::Key(key));
+                }
             }
         }
     }
+    for ((_, _, _, deferred), queue) in constraints.iter().zip(queued) {
+        if let Some(r) = deferred {
+            super::deferred::defer_keys(engine, txn, r, queue);
+        }
+    }
     Ok(())
+}
+
+/// The `PRIMARY KEY` / `UNIQUE` constraints of `table` a write must check now: every one but those
+/// the transaction defers (whose keys [`lock_unique_keys`] queues instead).
+fn checked_unique_constraints(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<nusadb_core::Constraint>, Error> {
+    let deferral = super::deferred::table_state(engine, txn, table.id)?;
+    Ok(engine
+        .list_constraints_as_of(txn, table.id)?
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.kind,
+                nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
+            ) && !deferral.defers(&super::deferred::ConstraintRef::unique(table.id, &c.name))
+        })
+        .collect())
 }
 
 /// A stable hash of a unique key (constraint identity + key values) for [`StorageEngine::lock_key`].
@@ -2936,7 +3018,10 @@ fn keep_non_conflicting(
     if !table_has_unique_constraint(table, engine)? {
         return Ok(new_rows);
     }
-    // The key-column ordinals of each PK/UNIQUE constraint, plus its NULLS-NOT-DISTINCT flag.
+    // The key-column ordinals of each PK/UNIQUE constraint, plus its NULLS-NOT-DISTINCT flag. A
+    // deferrable constraint is no arbiter: the kept rows are checked against it as usual (queued
+    // for commit, when deferred), so a conflict on it is reported rather than skipped.
+    let deferral = super::deferred::table_state(engine, txn, table.id)?;
     let constraints: Vec<(Vec<usize>, bool)> = engine
         .list_constraints_as_of(txn, table.id)?
         .into_iter()
@@ -2944,10 +3029,13 @@ fn keep_non_conflicting(
             matches!(
                 c.kind,
                 nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
-            )
+            ) && !deferral.deferrable(&super::deferred::ConstraintRef::unique(table.id, &c.name))
         })
         .map(|c| constraint_ordinals(table, &c.columns).map(|ord| (ord, c.nulls_not_distinct)))
         .collect::<Result<_, _>>()?;
+    if constraints.is_empty() {
+        return Ok(new_rows);
+    }
     // Per constraint, a sorted set of the keys already present (existing rows + accepted rows), so a
     // collision is a binary search under the total order.
     let existing = scan_rows(table, engine, txn)?;
@@ -3008,14 +3096,7 @@ fn enforce_unique_over_rows(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let constraints = engine.list_constraints_as_of(txn, table.id)?;
-    for constraint in &constraints {
-        if !matches!(
-            constraint.kind,
-            nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
-        ) {
-            continue;
-        }
+    for constraint in &checked_unique_constraints(table, engine, txn)? {
         let ordinals = constraint_ordinals(table, &constraint.columns)?;
         // Gather the participating key tuples, sort by the total order, then any two equal keys are
         // adjacent. Under NULLS NOT DISTINCT a NULL row participates (NULL equals NULL); otherwise a
@@ -3068,19 +3149,15 @@ fn enforce_new_keys_vs_committed(
     if !table_has_unique_constraint(table, engine)? {
         return Ok(());
     }
-    // Per PK/UNIQUE constraint, the (sorted) keys the rewritten rows held before this statement, plus
-    // its NULLS-NOT-DISTINCT flag (so a NULL old key matches under that mode).
-    let constraints: Vec<(Vec<usize>, bool)> = engine
-        .list_constraints_as_of(txn, table.id)?
+    // Per PK/UNIQUE constraint checked now, the (sorted) keys the rewritten rows held before this
+    // statement, plus its NULLS-NOT-DISTINCT flag (so a NULL old key matches under that mode).
+    let constraints: Vec<(Vec<usize>, bool)> = checked_unique_constraints(table, engine, txn)?
         .into_iter()
-        .filter(|c| {
-            matches!(
-                c.kind,
-                nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
-            )
-        })
         .map(|c| constraint_ordinals(table, &c.columns).map(|ord| (ord, c.nulls_not_distinct)))
         .collect::<Result<_, _>>()?;
+    if constraints.is_empty() {
+        return Ok(());
+    }
     let old_keys: Vec<Vec<Vec<ast::Value>>> = constraints
         .iter()
         .map(|(ordinals, nnd)| {
@@ -3144,13 +3221,7 @@ fn try_update_unique_by_index_probe(
         index: nusadb_core::IndexId,
     }
     let mut probes: Vec<Probe> = Vec::new();
-    for constraint in engine.list_constraints_as_of(txn, table.id)? {
-        if !matches!(
-            constraint.kind,
-            nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
-        ) {
-            continue;
-        }
+    for constraint in checked_unique_constraints(table, engine, txn)? {
         // A NULLS NOT DISTINCT constraint needs NULL-key collision detection the backing index cannot
         // probe → take the scan path.
         if constraint.nulls_not_distinct {
@@ -3302,7 +3373,7 @@ pub(super) fn unique_key(
 }
 
 /// Equality of two non-NULL key tuples, using the executor's total-order comparison.
-fn unique_key_eq(a: &[ast::Value], b: &[ast::Value]) -> bool {
+pub(super) fn unique_key_eq(a: &[ast::Value], b: &[ast::Value]) -> bool {
     a.len() == b.len() && unique_key_cmp(a, b) == std::cmp::Ordering::Equal
 }
 
@@ -3376,7 +3447,7 @@ fn primary_key_ordinals(
 /// `UNIQUE`/`PRIMARY KEY` columns the engine recorded, or the parent's `PRIMARY KEY` when none were
 /// recorded. `None` only when the parent has no primary key and the FK named no columns —
 /// nothing can reference such a parent.
-fn fk_parent_ordinals(
+pub(super) fn fk_parent_ordinals(
     parent: &TableSchema,
     fk: &nusadb_core::ForeignKeyDef,
     engine: &dyn StorageEngine,
@@ -3395,7 +3466,7 @@ fn fk_parent_ordinals(
 /// wait, so of a child write and a parent change racing on one key, whichever locks second fails
 /// with a serialization conflict and neither commits beside the other. Writes that do not touch the
 /// key (a child of another parent, a parent update of other columns) take no conflicting lock.
-fn lock_referenced_key(
+pub(super) fn lock_referenced_key(
     parent: &TableSchema,
     ordinals: &[usize],
     key: &[ast::Value],
@@ -3449,10 +3520,35 @@ fn lock_removed_keys(
 /// each batch sees only its own rows, so a child separated from its parent by a batch boundary is
 /// still refused. `INSERT ... SELECT` into such a table is buffered whole rather than streamed, so
 /// it does not have that seam.
+///
+/// A foreign key the transaction defers takes the same shared parent-key locks, then queues the
+/// rows' keys for its commit-time check instead of looking for the parents now.
 pub(super) fn enforce_fk_on_child_write(
     table: &TableSchema,
     rows: &[Row],
     pending: &[Row],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    check_fk_children(table, rows, pending, true, engine, txn)
+}
+
+/// [`enforce_fk_on_child_write`] for the rows a table already holds when a foreign key is added
+/// to it or copied onto it: always checked now, deferrable or not.
+pub(super) fn validate_fk_child_rows(
+    table: &TableSchema,
+    rows: &[Row],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    check_fk_children(table, rows, &[], false, engine, txn)
+}
+
+fn check_fk_children(
+    table: &TableSchema,
+    rows: &[Row],
+    pending: &[Row],
+    honour_deferral: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
@@ -3461,6 +3557,14 @@ pub(super) fn enforce_fk_on_child_write(
         .into_iter()
         .filter(|fk| fk.child_table == table.id)
         .collect();
+    if fks.is_empty() {
+        return Ok(());
+    }
+    let deferral = if honour_deferral {
+        super::deferred::table_state(engine, txn, table.id)?
+    } else {
+        super::deferred::TableDeferral::default()
+    };
     for fk in fks {
         let child_ordinals = constraint_ordinals(table, &fk.child_columns)?;
         let parent = schema_by_id(engine, txn, fk.parent_table)?.ok_or_else(|| {
@@ -3480,6 +3584,9 @@ pub(super) fn enforce_fk_on_child_write(
         // state rather than this transaction's snapshot: a parent deleted after the snapshot was
         // taken is gone, and once the key is held no other transaction can remove it before this
         // one ends.
+        let constraint = super::deferred::ConstraintRef::foreign_key(table.id, &fk.name);
+        let deferred = deferral.defers(&constraint);
+        let mut queued = Vec::new();
         for row in rows {
             if let Some(key) = unique_key(row, &child_ordinals, false) {
                 lock_referenced_key(
@@ -3490,7 +3597,14 @@ pub(super) fn enforce_fk_on_child_write(
                     engine,
                     txn,
                 )?;
+                if deferred {
+                    queued.push(super::deferred::Pending::Key(key));
+                }
             }
+        }
+        if deferred {
+            super::deferred::defer_keys(engine, txn, &constraint, queued);
+            continue;
         }
         let parent_rows = scan_rows_committed(&parent, engine, txn)?;
         // Rows this statement is adding to the parent table count as parents. They only can be
@@ -3875,6 +3989,10 @@ struct DeleteWalk {
 impl DeleteWalk {
     /// The foreign keys pointing at `table`, for its rows in `removed`. Returns the cascade
     /// deletes found, to be walked on from.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per referential action, the deferred NO ACTION among them"
+    )]
     fn step(
         &mut self,
         table: &TableSchema,
@@ -3935,6 +4053,23 @@ impl DeleteWalk {
             match fk.on_delete {
                 nusadb_core::FkAction::Restrict => {
                     return Err(nusadb_core::Error::ConstraintViolation(violation()).into());
+                },
+                // A deferred key settles at commit: queue the keys that are still referenced.
+                nusadb_core::FkAction::NoAction
+                    if super::deferred::table_state(engine, txn, child.id)?.defers(
+                        &super::deferred::ConstraintRef::foreign_key(child.id, &fk.name),
+                    ) =>
+                {
+                    let removed = referencing
+                        .iter()
+                        .filter_map(|(_, crow)| unique_key(crow, &child_ordinals, false))
+                        .map(super::deferred::Pending::RemovedParentKey);
+                    super::deferred::defer_keys(
+                        engine,
+                        txn,
+                        &super::deferred::ConstraintRef::foreign_key(child.id, &fk.name),
+                        removed,
+                    );
                 },
                 nusadb_core::FkAction::NoAction => {
                     let message = self.messages.len();
@@ -4162,6 +4297,10 @@ fn carry_update_actions(
 /// pointing at `table` to the keys `changes` move, and return the rows those actions rewrote, by
 /// table, for the next step. `statement_rows` are the rows the statement itself writes, which an
 /// action may not change under it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per referential action, the deferred NO ACTION among them"
+)]
 fn parent_update_step(
     table: &TableSchema,
     changes: &[(Tid, Row, Row)],
@@ -4237,6 +4376,19 @@ fn parent_update_step(
                 &referencing,
                 &post,
             )?;
+            let deferred_ref = super::deferred::ConstraintRef::foreign_key(child.id, &fk.name);
+            if fk.on_update == nusadb_core::FkAction::NoAction
+                && super::deferred::table_state(engine, txn, child.id)?.defers(&deferred_ref)
+            {
+                // Settled at commit: the old key needs a parent again, or no child holding it.
+                super::deferred::defer_keys(
+                    engine,
+                    txn,
+                    &deferred_ref,
+                    std::iter::once(super::deferred::Pending::RemovedParentKey(old_key.clone())),
+                );
+                continue;
+            }
             match fk.on_update {
                 nusadb_core::FkAction::NoAction | nusadb_core::FkAction::Restrict => {
                     return Err(nusadb_core::Error::ConstraintViolation(format!(
@@ -5927,6 +6079,8 @@ fn truncate_rebuild(
         let new_id = engine.create_table(txn, &s.def)?;
         new_ids.insert(s.old_id, new_id);
         created.push(new_id);
+        // The constraints keep their timing.
+        super::deferred::retarget_table(engine, txn, s.old_id, new_id)?;
     }
     // Declare everything again over the empty tables. An empty unique index over an empty table
     // is correct by construction — the hazard a rebuild has on a populated table is absent here.

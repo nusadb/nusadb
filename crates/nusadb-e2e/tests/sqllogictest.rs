@@ -390,6 +390,7 @@ fn to_slt_output(result: ExecutionResult) -> DBOutput<DefaultColumnType> {
         | ExecutionResult::SavepointCreated
         | ExecutionResult::RolledBackToSavepoint
         | ExecutionResult::SavepointReleased
+        | ExecutionResult::ConstraintsSet
         | ExecutionResult::TableLocked
         | ExecutionResult::Prepared
         | ExecutionResult::Deallocated
@@ -509,6 +510,11 @@ fn run_slt(path: &str) {
 #[test]
 fn slt_p2_not_null_entry_points() {
     run_slt("tests/slt/p2_dml/not_null_entry_points.slt");
+}
+
+#[test]
+fn slt_p12_deferrable_constraints() {
+    run_slt("tests/slt/p12_txn/deferrable_constraints.slt");
 }
 
 #[test]

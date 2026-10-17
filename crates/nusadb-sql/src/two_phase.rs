@@ -94,9 +94,12 @@ pub fn prepare(
     database: &str,
 ) -> Result<ExecutionResult, Error> {
     if let Err(e) = check_gid(gid) {
-        let _ = engine.rollback(txn);
+        let _ = crate::executor::deferred::rollback(engine, txn);
         return Err(e);
     }
+    // The deferred constraint checks run first: a prepared transaction owes none, so a restart
+    // while it waits for COMMIT PREPARED has nothing to replay. A violation rolls it back.
+    crate::executor::deferred::prepare(engine, txn)?;
     engine
         .prepare_transaction(txn, gid, owner, database)
         .map(|()| ExecutionResult::TransactionPrepared)
@@ -134,7 +137,7 @@ pub fn finish(
 fn is_superuser(engine: &dyn StorageEngine, user: &str) -> Result<bool, Error> {
     let txn = engine.begin(IsolationLevel::ReadCommitted)?;
     let resolved = crate::rbac::ResolvedSession::resolve(engine, txn, user);
-    let _ = engine.rollback(txn);
+    let _ = crate::executor::deferred::rollback(engine, txn);
     Ok(resolved?.is_superuser())
 }
 

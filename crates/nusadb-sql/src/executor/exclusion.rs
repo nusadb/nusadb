@@ -58,10 +58,12 @@
 //!
 //! # Timing
 //!
-//! The check is immediate: each writing statement checks its rows before writing them, against
-//! each other and against the committed state. `DEFERRABLE` / `INITIALLY ...` are refused when the
-//! constraint is declared. [`check_key_against_committed`] is the per-row primitive (lock, read,
-//! compare) a later re-check, such as one at commit time, can call for each written row.
+//! By default the check is immediate: each writing statement checks its rows before writing them,
+//! against each other and against the committed state. A `DEFERRABLE` constraint in deferred mode
+//! (see `executor::deferred`) is not checked by the statement: the statement takes the same key
+//! locks, and queues the keys it wrote; at commit [`recheck`] reads each queued key's `=` group
+//! (latest committed plus this transaction's own rows) and refuses any two live rows that
+//! conflict. `ON CONFLICT DO NOTHING` does not use a deferrable constraint to find conflicts.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -139,6 +141,10 @@ pub(super) struct Exclusion {
     overlap_elements: usize,
     /// The table's column types, to bring a row about to be written into its stored form.
     types: Vec<ColumnType>,
+    /// Declared `DEFERRABLE`.
+    deferrable: bool,
+    /// Deferred in the loading transaction right now: writes queue their keys instead of checking.
+    deferred: bool,
 }
 
 impl Exclusion {
@@ -201,7 +207,47 @@ impl Exclusion {
             },
             overlap_elements: overlap_positions.len(),
             types: column_types(table),
+            deferrable: false,
+            deferred: false,
         })
+    }
+
+    /// The constraint's name.
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The entry this constraint's deferred keys are queued under.
+    fn deferral_ref(&self, table: &TableSchema) -> super::deferred::ConstraintRef {
+        super::deferred::ConstraintRef::exclusion(table.id, &self.name)
+    }
+
+    /// Lock the `=` groups of `keys` and queue them for the commit-time check.
+    fn defer(
+        &self,
+        table: &TableSchema,
+        keys: &[&[ast::Value]],
+        lock: bool,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<(), Error> {
+        if lock {
+            let mut sorted: Vec<&[ast::Value]> = keys.to_vec();
+            sorted.sort_by(|a, b| self.cmp_eq(a, b));
+            for group in self.groups(&sorted, |k| k) {
+                if let Some(first) = group.first() {
+                    self.lock(table, first, engine, txn)?;
+                }
+            }
+        }
+        super::deferred::defer_keys(
+            engine,
+            txn,
+            &self.deferral_ref(table),
+            keys.iter()
+                .map(|k| super::deferred::Pending::Key(k.to_vec())),
+        );
+        Ok(())
     }
 
     /// [`Self::key`] of a row about to be written. Such a row may still hold a value in its input
@@ -459,6 +505,7 @@ pub(super) fn load(
     txn: TxnId,
 ) -> Result<Vec<Exclusion>, Error> {
     let mut out = Vec::new();
+    let mut deferral: Option<super::deferred::TableDeferral> = None;
     for c in engine.list_constraints_as_of(txn, table.id)? {
         if !is_exclusion(&c) {
             continue;
@@ -469,7 +516,15 @@ pub(super) fn load(
                 c.name
             ))
         })?;
-        out.push(Exclusion::compile(table, &c.name, spec)?);
+        let mut compiled = Exclusion::compile(table, &c.name, spec)?;
+        let state = match &mut deferral {
+            Some(state) => state,
+            None => deferral.insert(super::deferred::table_state(engine, txn, table.id)?),
+        };
+        let r = compiled.deferral_ref(table);
+        compiled.deferrable = state.deferrable(&r);
+        compiled.deferred = state.defers(&r);
+        out.push(compiled);
     }
     Ok(out)
 }
@@ -523,7 +578,9 @@ pub(super) fn enforce_compiled(
             continue;
         }
         let refs: Vec<&[ast::Value]> = new_keys.iter().map(Vec::as_slice).collect();
-        if let Some((a, b)) = c.conflict_among(&refs) {
+        if !c.deferred
+            && let Some((a, b)) = c.conflict_among(&refs)
+        {
             return Err(c.violation(a, b));
         }
         let mut old_keys = Vec::with_capacity(old_rows.len());
@@ -539,30 +596,59 @@ pub(super) fn enforce_compiled(
             .copied()
             .filter(|k| !old_keys.contains(k))
             .collect();
+        if c.deferred {
+            c.defer(table, &pending, true, engine, txn)?;
+            continue;
+        }
         check_against_committed(c, table, &pending, rewritten, &old_keys, engine, txn)?;
     }
     Ok(())
 }
 
-/// Check one taking-part `key` of constraint `c` against the committed state (latest committed
-/// rows plus this transaction's own writes), taking the key lock first. `rewritten` are row
-/// versions that no longer count (the rows being replaced, or the row that holds `key` itself),
-/// `old_keys` the keys those rows held.
+/// The commit-time check of a deferred constraint `c`: no two live rows (latest committed plus
+/// this transaction's own) may conflict within the `=` group of any of the queued `keys`; with
+/// `None`, within the whole table. The writes that queued the keys hold the groups' key locks, so
+/// the read races no other writer of them. Only rows that are live now are compared, so a key a
+/// later statement made stale (its row deleted or changed back) raises nothing.
 ///
-/// This is the per-row form of the immediate check, and the hook for a re-check that runs later
-/// than the writing statement: pass the written row's own `Tid` in `rewritten`.
-#[allow(dead_code, reason = "the entry point a later, deferred re-check calls")]
-pub(super) fn check_key_against_committed(
+/// # Errors
+/// `23P01` for a conflicting pair.
+pub(super) fn recheck(
     c: &Exclusion,
     table: &TableSchema,
-    key: &[ast::Value],
-    rewritten: &HashSet<Tid>,
-    old_keys: &[Key],
+    keys: Option<&[Key]>,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let old_keys = KeySet::new(old_keys.to_vec());
-    check_against_committed(c, table, &[key], rewritten, &old_keys, engine, txn)
+    let rows = match keys {
+        None => scan::scan_table_committed(table, engine, txn)?,
+        Some(keys) => {
+            let mut sorted: Vec<&[ast::Value]> = keys.iter().map(Vec::as_slice).collect();
+            sorted.sort_by(|a, b| c.cmp_eq(a, b));
+            let representatives: Vec<&[ast::Value]> = c
+                .groups(&sorted, |k| k)
+                .filter_map(|group| group.first().copied())
+                .collect();
+            if representatives.is_empty() {
+                return Ok(());
+            }
+            for key in &representatives {
+                c.lock(table, key, engine, txn)?;
+            }
+            candidates(c, table, &representatives, engine, txn)?
+        },
+    };
+    let mut live = Vec::with_capacity(rows.len());
+    for (_, row) in rows {
+        if let Some(key) = c.key(&row)? {
+            live.push(key);
+        }
+    }
+    let refs: Vec<&[ast::Value]> = live.iter().map(Vec::as_slice).collect();
+    match c.conflict_among(&refs) {
+        Some((a, b)) => Err(c.violation(a, b)),
+        None => Ok(()),
+    }
 }
 
 /// Check the `pending` keys of constraint `c` against the committed state: lock each distinct `=`
@@ -699,6 +785,11 @@ impl Deferred {
                 continue;
             }
             let refs: Vec<&[ast::Value]> = keys.iter().map(Vec::as_slice).collect();
+            if c.deferred {
+                // `admit` already took the key locks.
+                c.defer(table, &refs, false, engine, txn)?;
+                continue;
+            }
             if let Some((a, b)) = c.conflict_among(&refs) {
                 return Err(c.violation(a, b));
             }
@@ -719,7 +810,12 @@ pub(super) fn keep_non_conflicting(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<Vec<Row>, Error> {
-    let constraints = load(table, engine, txn)?;
+    // A deferrable constraint is no arbiter: it is checked as usual (queued, when deferred) once
+    // the kept rows are written.
+    let constraints: Vec<Exclusion> = load(table, engine, txn)?
+        .into_iter()
+        .filter(|c| !c.deferrable)
+        .collect();
     if constraints.is_empty() {
         return Ok(rows);
     }

@@ -47,6 +47,7 @@ A quick map from the statement you are looking for to the section that shows it.
 | `PREPARE`, `EXECUTE`, `DEALLOCATE`, parameters `$1..$n` | [Prepared statements](#prepared-statements) |
 | `DECLARE`, `FETCH`, `MOVE`, `CLOSE` | [Cursors](#cursors) |
 | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `SET TRANSACTION` | [Transactions and locking](#transactions-and-locking) |
+| `DEFERRABLE`, `INITIALLY DEFERRED`, `SET CONSTRAINTS`, `ALTER CONSTRAINT` | [Deferrable constraints](#deferrable-constraints) |
 | `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED` | [Transactions and locking](#transactions-and-locking) |
 | `SELECT ... FOR UPDATE`, `LOCK TABLE` | [Row and table locks](#row-and-table-locks) |
 | `LISTEN`, `UNLISTEN`, `NOTIFY` | [Notifications](#notifications) |
@@ -585,8 +586,75 @@ The rules:
 CREATE TABLE bookings (room INT, day DATE, EXCLUDE (room WITH =, day WITH =));
 ```
 
-Other operators, other access methods, `INCLUDE`, `DEFERRABLE` / `INITIALLY`, and an `EXCLUDE`
-on a partitioned table (declare it on each partition) are refused with `0A000`.
+Other operators, other access methods, `INCLUDE`, and an `EXCLUDE` on a partitioned table
+(declare it on each partition) are refused with `0A000`. An exclusion constraint can be
+`DEFERRABLE` (see [Deferrable constraints](#deferrable-constraints)).
+
+### Deferrable constraints
+
+A `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `EXCLUDE` constraint may be declared `DEFERRABLE`, at
+column or table level. Its check can then wait until the transaction commits, so a transaction may
+pass through states that break the constraint as long as the state it commits keeps it:
+
+```sql
+CREATE TABLE slot (
+  n    INT CONSTRAINT slot_n UNIQUE DEFERRABLE INITIALLY DEFERRED,
+  name TEXT
+);
+INSERT INTO slot VALUES (1, 'a'), (2, 'b');
+BEGIN;
+UPDATE slot SET n = 2 WHERE name = 'a';   -- two rows hold 2 for now
+UPDATE slot SET n = 1 WHERE name = 'b';
+COMMIT;                                   -- checked here: fine
+
+-- A key that points at its own table: the row it needs may arrive later in the transaction.
+CREATE TABLE version (
+  id   INT PRIMARY KEY,
+  prev INT REFERENCES version (id) DEFERRABLE INITIALLY DEFERRED
+);
+```
+
+- `NOT DEFERRABLE` (the default) checks the constraint in each statement that writes.
+  `DEFERRABLE INITIALLY IMMEDIATE` does the same until the transaction defers it;
+  `DEFERRABLE INITIALLY DEFERRED` (or just `INITIALLY DEFERRED`) starts each transaction deferred.
+  `NOT DEFERRABLE INITIALLY DEFERRED` is a syntax error (`42601`). `CHECK` and `NOT NULL` are
+  never deferrable. `ENFORCED` is accepted; `NOT ENFORCED` is refused with `0A000`.
+- `SET CONSTRAINTS {ALL | name [, ...]} {DEFERRED | IMMEDIATE}` changes the mode for the rest of
+  the transaction. A later name overrides an earlier `ALL`, and a later `ALL` replaces every
+  earlier name. A name may be schema-qualified; without a qualifier it is looked up in the schemas
+  of the `search_path`, and the name of a partitioned table's constraint reaches the copies on its
+  partitions. An unknown name is `42704`, a constraint that is not deferrable `55000`. Outside a
+  transaction block the statement only raises a warning.
+- `SET CONSTRAINTS ... IMMEDIATE` checks what the named constraints deferred so far, at once. A
+  violation fails the statement (and the transaction block, until `ROLLBACK` or `ROLLBACK TO
+  SAVEPOINT`).
+- A deferred check runs at `COMMIT` (and `END`), at `PREPARE TRANSACTION`, and at the end of an
+  auto-committed statement. A violation then rolls the whole transaction back and reports the
+  constraint's usual code: `23505` for a key, `23503` for a foreign key, `23P01` for an exclusion
+  constraint. The check reads the state being committed, so a duplicate a later statement removed
+  again, or a child whose parent arrived later, is fine.
+- `ROLLBACK TO SAVEPOINT` forgets what was deferred after the savepoint and restores the
+  `SET CONSTRAINTS` mode the savepoint had.
+- For a foreign key, only the `NO ACTION` check is deferred: a child row may wait for its parent,
+  and a parent `DELETE` or key `UPDATE` may leave children that a later statement fixes. `RESTRICT`
+  is always checked at once, and the `CASCADE`, `SET NULL` and `SET DEFAULT` actions run when the
+  parent row changes.
+- `ON CONFLICT` cannot use a deferrable constraint as its arbiter (`0A000`). A bare
+  `ON CONFLICT DO NOTHING` does not skip rows on account of a deferrable constraint: such a row is
+  written, and the constraint checks it as usual.
+- Concurrency is the same as for an immediate check: a deferred write takes its key locks when it
+  writes, and keeps them to the end of the transaction. A second transaction writing the same key
+  fails at once with `40001`; one that committed first is seen by the check at `COMMIT`. A child
+  row holds its parent key, so a concurrent delete of that parent (or an insert of it) fails with
+  `40001` until the child's transaction ends. `40001` can also be the answer to `COMMIT`.
+- Cost: a deferred write keeps each key it wrote in memory until the transaction ends; past
+  100,000 keys for one constraint it checks the whole table once at commit instead. At commit, each
+  key is looked up through the constraint's index when there is one.
+- `ALTER TABLE t ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]`
+  changes the declared mode of a key, foreign key or exclusion constraint (and of its copies on a
+  partitioned table's partitions). A `CHECK` is refused with `42809`.
+- `information_schema.table_constraints` reports `is_deferrable` and `initially_deferred`
+  (`YES` / `NO`) and `enforced` (always `YES`).
 
 Temporary tables belong to the session that made them, are invisible to others, and disappear when
 the session ends. `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` are accepted.
@@ -758,6 +826,7 @@ ALTER TABLE sales_orders RENAME TO orders;
 
 ALTER TABLE orders DROP CONSTRAINT total_positive;
 ALTER TABLE orders ADD CONSTRAINT total_positive CHECK (total > 0);
+ALTER TABLE orders ALTER CONSTRAINT orders_customer_fkey DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer) REFERENCES customers (id);
 ALTER TABLE orders DROP CONSTRAINT orders_customer_fk;
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_customer_fk;
@@ -1741,6 +1810,7 @@ SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;   -- before the transaction's f
 SAVEPOINT s1;
 ROLLBACK TO SAVEPOINT s1;
 RELEASE SAVEPOINT s1;
+SET CONSTRAINTS ALL DEFERRED;                      -- see Deferrable constraints
 COMMIT;                                            -- or END
 ROLLBACK;
 

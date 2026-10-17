@@ -1,0 +1,566 @@
+# Deferrable constraints: `[NOT] DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]` on PRIMARY KEY,
+# UNIQUE, FOREIGN KEY and EXCLUDE, `SET CONSTRAINTS`, `ALTER CONSTRAINT`, and the checks that run
+# at COMMIT. A deferred violation is reported at COMMIT and rolls the whole transaction back.
+
+# --- Declaring -------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t (id INT CONSTRAINT t_pk PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v TEXT)
+
+# A column-level, unnamed UNIQUE DEFERRABLE keeps its timing (and its usual name).
+statement ok
+CREATE TABLE u (id INT, a INT UNIQUE DEFERRABLE, b INT UNIQUE)
+
+statement ok
+CREATE TABLE w (id INT, a INT, b INT, CONSTRAINT w_ab UNIQUE (a, b) DEFERRABLE INITIALLY IMMEDIATE)
+
+query TTTTT rowsort
+SELECT table_name, constraint_name, constraint_type, is_deferrable, initially_deferred
+FROM information_schema.table_constraints WHERE table_name IN ('t', 'u', 'w')
+----
+t t_pk PRIMARY KEY YES YES
+u u_a_key UNIQUE YES NO
+u u_b_key UNIQUE NO NO
+w w_ab UNIQUE YES NO
+
+query T
+SELECT DISTINCT enforced FROM information_schema.table_constraints WHERE table_name = 't'
+----
+YES
+
+statement error INITIALLY DEFERRED must be DEFERRABLE
+CREATE TABLE bad1 (a INT UNIQUE NOT DEFERRABLE INITIALLY DEFERRED)
+
+statement error NOT ENFORCED
+CREATE TABLE bad2 (a INT, UNIQUE (a) NOT ENFORCED)
+
+# --- A unique swap inside one transaction ----------------------------------------------------
+
+statement ok
+INSERT INTO t VALUES (1, 'one'), (2, 'two')
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE t SET id = 2 WHERE v = 'one'
+
+statement ok
+UPDATE t SET id = 1 WHERE v = 'two'
+
+statement ok
+COMMIT
+
+query IT rowsort
+SELECT id, v FROM t
+----
+1 two
+2 one
+
+# --- A violation still pending at COMMIT rolls the transaction back --------------------------
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (3, 'three')
+
+statement ok
+INSERT INTO t VALUES (1, 'dup')
+
+statement error duplicate key violates primary key constraint "t_pk"
+COMMIT
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+# In auto-commit, a deferred check runs when the statement's transaction commits.
+statement error duplicate key violates primary key constraint "t_pk"
+INSERT INTO t VALUES (1, 'again')
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+# A duplicate that a later statement removes again is fine.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'temp')
+
+statement ok
+DELETE FROM t WHERE v = 'temp'
+
+statement ok
+COMMIT
+
+# --- SET CONSTRAINTS -------------------------------------------------------------------------
+
+# DEFERRABLE INITIALLY IMMEDIATE: checked by each statement until deferred.
+statement ok
+INSERT INTO w (a, b) VALUES (1, 1)
+
+statement error duplicate key violates unique constraint "w_ab"
+INSERT INTO w (a, b) VALUES (1, 1)
+
+statement ok
+BEGIN
+
+statement ok
+SET CONSTRAINTS w_ab DEFERRED
+
+statement ok
+INSERT INTO w VALUES (2, 1, 1)
+
+statement ok
+UPDATE w SET b = 2 WHERE id = 2
+
+statement ok
+COMMIT
+
+query II rowsort
+SELECT a, b FROM w
+----
+1 1
+1 2
+
+# IMMEDIATE checks what is pending now. Its failure fails the block; ROLLBACK TO a savepoint taken
+# before recovers it, with the mode the savepoint had.
+statement ok
+BEGIN
+
+statement ok
+SET CONSTRAINTS ALL DEFERRED
+
+statement ok
+INSERT INTO w VALUES (3, 1, 1)
+
+statement ok
+SAVEPOINT s
+
+statement error duplicate key violates unique constraint "w_ab"
+SET CONSTRAINTS ALL IMMEDIATE
+
+statement ok
+ROLLBACK TO SAVEPOINT s
+
+statement ok
+DELETE FROM w WHERE id = 3
+
+statement ok
+SET CONSTRAINTS ALL IMMEDIATE
+
+# Immediate again: the next duplicate fails at once.
+statement error duplicate key violates unique constraint "w_ab"
+INSERT INTO w (a, b) VALUES (1, 2)
+
+statement ok
+ROLLBACK
+
+# A later per-name setting overrides ALL.
+statement ok
+BEGIN
+
+statement ok
+SET CONSTRAINTS ALL DEFERRED
+
+statement ok
+SET CONSTRAINTS w_ab IMMEDIATE
+
+statement error duplicate key violates unique constraint "w_ab"
+INSERT INTO w (a, b) VALUES (1, 1)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement error constraint "nope" does not exist
+SET CONSTRAINTS nope DEFERRED
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement error constraint "u_b_key" is not deferrable
+SET CONSTRAINTS u_b_key DEFERRED
+
+statement ok
+ROLLBACK
+
+# Outside a transaction block it only warns.
+statement ok
+SET CONSTRAINTS ALL DEFERRED
+
+# --- ROLLBACK TO SAVEPOINT drops what was queued after it --------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (1, 'dup')
+
+statement ok
+ROLLBACK TO SAVEPOINT a
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+# ... and restores the SET CONSTRAINTS mode it had.
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT b
+
+statement ok
+SET CONSTRAINTS w_ab DEFERRED
+
+statement ok
+ROLLBACK TO SAVEPOINT b
+
+statement error duplicate key violates unique constraint "w_ab"
+INSERT INTO w (a, b) VALUES (1, 1)
+
+statement ok
+ROLLBACK
+
+# --- ON CONFLICT does not arbitrate on a deferrable constraint ---------------------------------
+
+statement error does not support deferrable
+INSERT INTO t VALUES (1, 'x') ON CONFLICT (id) DO NOTHING
+
+statement error does not support deferrable
+INSERT INTO t VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET v = 'y'
+
+# A bare DO NOTHING does not use it to skip the row: the deferred check still sees the duplicate.
+statement error duplicate key violates primary key constraint "t_pk"
+INSERT INTO t VALUES (1, 'x') ON CONFLICT DO NOTHING
+
+# --- Foreign keys ----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE parent (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED)
+
+# A child may arrive before its parent.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO child VALUES (1, 10)
+
+statement ok
+INSERT INTO parent VALUES (10)
+
+statement ok
+COMMIT
+
+# A missing parent at COMMIT is a 23503 and nothing commits.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO parent VALUES (20)
+
+statement ok
+INSERT INTO child VALUES (2, 99)
+
+statement error violates foreign key
+COMMIT
+
+query I
+SELECT count(*) FROM parent
+----
+1
+
+# NO ACTION on the parent side is deferred too: delete and re-create the parent.
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM parent WHERE id = 10
+
+statement ok
+INSERT INTO parent VALUES (10)
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM parent WHERE id = 10
+
+statement error violates foreign key
+COMMIT
+
+query I
+SELECT count(*) FROM parent
+----
+1
+
+# RESTRICT is never deferred.
+statement ok
+CREATE TABLE rchild (pid INT REFERENCES parent (id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED)
+
+statement ok
+INSERT INTO rchild VALUES (10)
+
+statement ok
+BEGIN
+
+statement error violates foreign key
+DELETE FROM parent WHERE id = 10
+
+statement ok
+ROLLBACK
+
+statement ok
+DROP TABLE rchild
+
+# A self-referencing key swapped between versions (an "active version" pointer).
+statement ok
+CREATE TABLE version (id INT PRIMARY KEY, prev INT, CONSTRAINT version_prev FOREIGN KEY (prev) REFERENCES version (id) DEFERRABLE INITIALLY DEFERRED)
+
+statement ok
+INSERT INTO version VALUES (1, NULL), (2, 1)
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE version SET prev = 3 WHERE id = 2
+
+statement ok
+INSERT INTO version VALUES (3, 1)
+
+statement ok
+COMMIT
+
+query II rowsort
+SELECT id, prev FROM version
+----
+1 NULL
+2 3
+3 1
+
+# --- ALTER CONSTRAINT ------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE u ALTER CONSTRAINT u_b_key DEFERRABLE INITIALLY DEFERRED
+
+query TT
+SELECT is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE constraint_name = 'u_b_key'
+----
+YES YES
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO u VALUES (1, NULL, 5), (2, NULL, 5)
+
+statement ok
+UPDATE u SET b = 6 WHERE id = 2
+
+statement ok
+COMMIT
+
+statement ok
+ALTER TABLE u ALTER CONSTRAINT u_b_key NOT DEFERRABLE
+
+statement error duplicate key violates unique constraint "u_b_key"
+INSERT INTO u VALUES (3, NULL, 5)
+
+statement error does not exist
+ALTER TABLE u ALTER CONSTRAINT nope DEFERRABLE
+
+statement ok
+CREATE TABLE ck (a INT CONSTRAINT ck_pos CHECK (a > 0))
+
+statement error cannot be deferrable
+ALTER TABLE ck ALTER CONSTRAINT ck_pos DEFERRABLE
+
+# --- EXCLUDE ---------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE booking (room INT, during int4range, CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, during WITH &&) DEFERRABLE INITIALLY DEFERRED)
+
+statement ok
+INSERT INTO booking VALUES (1, '[1,5)'), (1, '[5,9)')
+
+# Move two bookings past each other: overlapping in between, not at COMMIT.
+statement ok
+BEGIN
+
+statement ok
+UPDATE booking SET during = '[3,9)' WHERE lower(during) = 5
+
+statement ok
+UPDATE booking SET during = '[1,3)' WHERE lower(during) = 1
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO booking VALUES (1, '[2,4)')
+
+statement error conflicting key value violates exclusion constraint "no_overlap"
+COMMIT
+
+query I
+SELECT count(*) FROM booking
+----
+2
+
+query TT
+SELECT is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE constraint_name = 'no_overlap'
+----
+YES YES
+
+# --- Partitioned tables: the partitions' copies follow the parent's constraint -----------------
+
+statement ok
+CREATE TABLE pt (id INT, region INT, tag TEXT, CONSTRAINT pt_pk PRIMARY KEY (id, region) DEFERRABLE) PARTITION BY LIST (region)
+
+statement ok
+CREATE TABLE pt_a PARTITION OF pt FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pt VALUES (1, 1, 'first')
+
+query TTT
+SELECT constraint_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name = 'pt_a' AND constraint_type = 'PRIMARY KEY'
+----
+pt_a_pk YES NO
+
+statement error duplicate key
+INSERT INTO pt VALUES (1, 1, 'dup')
+
+# SET CONSTRAINTS with the parent's name reaches the copy.
+statement ok
+BEGIN
+
+statement ok
+SET CONSTRAINTS pt_pk DEFERRED
+
+statement ok
+INSERT INTO pt VALUES (1, 1, 'dup')
+
+statement ok
+UPDATE pt SET id = 2 WHERE tag = 'dup'
+
+statement ok
+COMMIT
+
+# ALTER CONSTRAINT on the parent changes the copies; a partition attached later copies the timing.
+statement ok
+ALTER TABLE pt ALTER CONSTRAINT pt_pk DEFERRABLE INITIALLY DEFERRED
+
+statement ok
+CREATE TABLE pt_b (id INT NOT NULL, region INT NOT NULL, tag TEXT)
+
+statement ok
+ALTER TABLE pt ATTACH PARTITION pt_b FOR VALUES IN (2)
+
+query TTT rowsort
+SELECT constraint_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name IN ('pt', 'pt_a', 'pt_b') AND constraint_type = 'PRIMARY KEY'
+----
+pt_a_pk YES YES
+pt_b_pk YES YES
+pt_pk YES YES
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO pt VALUES (5, 2, 'x'), (5, 2, 'y')
+
+statement error duplicate key violates primary key constraint "pt_b_pk"
+COMMIT
+
+# A partition's copy follows its parent: it is altered on the parent, not on its own.
+statement error alter the constraint on "pt" instead
+ALTER TABLE pt_a ALTER CONSTRAINT pt_a_pk NOT DEFERRABLE
+
+statement ok
+BEGIN
+
+statement ok
+SET CONSTRAINTS pt_pk IMMEDIATE
+
+statement error duplicate key violates primary key constraint "pt_a_pk"
+INSERT INTO pt VALUES (1, 1, 'again')
+
+statement ok
+ROLLBACK
+
+# --- TRUNCATE rebuilding referenced tables keeps the timing ------------------------------------
+
+statement ok
+TRUNCATE parent CASCADE
+
+statement ok
+TRUNCATE version
+
+query TT rowsort
+SELECT is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name IN ('child', 'version') AND constraint_type = 'FOREIGN KEY'
+----
+YES YES
+YES YES
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO version VALUES (2, 1)
+
+statement ok
+INSERT INTO child VALUES (1, 10)
+
+statement ok
+INSERT INTO version VALUES (1, NULL)
+
+statement ok
+INSERT INTO parent VALUES (10)
+
+statement ok
+COMMIT
+
+# --- Dropping a constraint forgets its timing; a new one of the same name starts afresh --------
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT t_pk
+
+statement ok
+ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (id)
+
+query TT
+SELECT is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE constraint_name = 't_pk'
+----
+NO NO
+
+statement error duplicate key violates primary key constraint "t_pk"
+INSERT INTO t VALUES (1, 'dup')

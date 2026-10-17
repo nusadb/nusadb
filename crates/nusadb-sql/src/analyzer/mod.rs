@@ -1130,6 +1130,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
         ast::Statement::Savepoint(name) => Ok(LogicalPlan::Savepoint(name)),
         ast::Statement::RollbackToSavepoint(name) => Ok(LogicalPlan::RollbackToSavepoint(name)),
         ast::Statement::ReleaseSavepoint(name) => Ok(LogicalPlan::ReleaseSavepoint(name)),
+        ast::Statement::SetConstraints(s) => Ok(LogicalPlan::SetConstraints(s)),
         // LISTEN / UNLISTEN / NOTIFY (async pub/sub): the channel registry spans connections and lives
         // in the wire server, which intercepts these before analysis. They have no engine-level plan,
         // so reaching the analyzer means an execution path that does not intercept them (e.g. inside a

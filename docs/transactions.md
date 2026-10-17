@@ -122,6 +122,39 @@ COMMIT;
 `ROLLBACK TO SAVEPOINT` is also the way out of an aborted transaction (`25P02`) when the work before
 the savepoint is worth keeping.
 
+## Deferred constraint checks
+
+A `DEFERRABLE` key, foreign key or exclusion constraint in deferred mode is checked when the
+transaction commits instead of by each statement (declaring them and `SET CONSTRAINTS`:
+[SQL reference](sql-reference.md#deferrable-constraints)). For an application that means:
+
+- `COMMIT` (or `END`, or the end of an auto-committed statement) can fail with a constraint code:
+  `23505`, `23503` or `23P01`. The transaction is then rolled back, exactly as for any failed
+  `COMMIT`; nothing of it is kept. `PREPARE TRANSACTION` runs the same checks first, so a prepared
+  transaction never fails one later, also not across a restart.
+- `SET CONSTRAINTS ... IMMEDIATE` checks what is pending at that point. A violation there fails the
+  transaction block like any failed statement: `ROLLBACK TO SAVEPOINT` to a savepoint taken before
+  the offending writes recovers it.
+
+```sql
+BEGIN;
+SAVEPOINT before_load;
+INSERT INTO slot VALUES (1, 'clash');      -- deferred: accepted for now
+SET CONSTRAINTS slot_n IMMEDIATE;          -- 23505: the block is failed
+ROLLBACK TO SAVEPOINT before_load;         -- the insert, its pending check and the mode are undone
+COMMIT;
+```
+
+- `ROLLBACK TO SAVEPOINT` drops the checks deferred after the savepoint, and restores the
+  `SET CONSTRAINTS` mode it had.
+- Deferring a check does not defer its locks. A deferred write takes the same key locks an
+  immediate one does, when it writes, and holds them until the transaction ends, so the commit-time
+  check cannot race another writer: a concurrent writer of the same key fails at once with
+  `40001`, and one that committed earlier is seen by the check. A transaction holding a deferred
+  child row also holds its parent key, so another transaction deleting that parent, or inserting
+  it, fails with `40001` until the first one ends. As always, `40001` means retry (see the retry
+  loop above); it can be the answer to `COMMIT` too.
+
 ## Row and table locks
 
 Locks never wait, so `SELECT ... FOR UPDATE` on a row another transaction has locked fails at once
@@ -229,6 +262,7 @@ superuser sees every row, any other role its own.
 | --- | --- |
 | `PREPARE TRANSACTION` with no transaction open (an error, not a warning, so a coordinator never believes it prepared a branch that does not exist) | `25P01` |
 | `PREPARE TRANSACTION` in a failed transaction: it is rolled back and the tag is `ROLLBACK` | none |
+| a deferred constraint is violated: it is rolled back (see [Deferred constraint checks](#deferred-constraint-checks)) | `23505` / `23503` / `23P01` |
 | an identifier longer than 200 bytes | `22023` |
 | an identifier already in use | `42710` |
 | the transaction changed the schema, a sequence or statistics, wrote a temporary table, ran `LISTEN` / `UNLISTEN` / `NOTIFY`, or declared a cursor `WITH HOLD` | `0A000` |
