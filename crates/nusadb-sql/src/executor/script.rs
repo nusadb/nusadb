@@ -50,8 +50,133 @@ impl Flow {
     }
 }
 
-/// The variable environment: declared name → current value.
-pub(super) type Env = HashMap<String, ast::Value>;
+/// The variable environment: declared name → current value, plus the column type of each variable
+/// that stands for a table column (a trigger function's `NEW.col` fields).
+///
+/// The type matters only while the value is `NULL`. A non-null value is bound as a literal, and a
+/// `NULL` of a typed variable is bound the way [`column_null`] binds it for that column type, so it
+/// is never stricter than the column's non-null values (see [`Env::bound`]).
+#[derive(Debug, Default)]
+pub(super) struct Env {
+    values: HashMap<String, ast::Value>,
+    types: HashMap<String, ColumnType>,
+}
+
+impl Env {
+    /// An empty environment.
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current value of variable `name`.
+    pub(super) fn get(&self, name: &str) -> Option<&ast::Value> {
+        self.values.get(name)
+    }
+
+    /// Set variable `name` to `value`.
+    pub(super) fn insert(&mut self, name: String, value: ast::Value) {
+        self.values.insert(name, value);
+    }
+
+    /// Set variable `name`, which stands for a column of type `ty`, to `value`.
+    pub(super) fn insert_typed(&mut self, name: String, value: ast::Value, ty: ColumnType) {
+        // A column whose NULL stays bare (see `column_null`) binds like an untyped variable, so its
+        // type need not be kept.
+        if null_type(ty).is_some() {
+            self.types.insert(name.clone(), ty);
+        }
+        self.values.insert(name, value);
+    }
+
+    /// The expression variable `name` is bound to, or `None` if no such variable is in scope: its
+    /// value as a literal, except that a `NULL` in a typed variable is bound by [`column_null`].
+    fn bound(&self, name: &str) -> Option<ast::Expr> {
+        let value = self.values.get(name)?;
+        Some(match (value, self.types.get(name)) {
+            (ast::Value::Null, Some(&ty)) => column_null(ty),
+            (value, _) => ast::Expr::Literal(value.clone()),
+        })
+    }
+}
+
+impl<const N: usize> From<[(String, ast::Value); N]> for Env {
+    fn from(values: [(String, ast::Value); N]) -> Self {
+        Self {
+            values: HashMap::from(values),
+            types: HashMap::new(),
+        }
+    }
+}
+
+/// The expression a `NULL` in a column of type `ty` is bound as. The rule is that a `NULL` must never
+/// type-check more strictly than the column's non-null values, which are bound as literals.
+///
+/// A bare `NULL` has no type, so it cannot take part in an operator chosen by operand type
+/// (`NULL + INTERVAL '1 day'`, `NULL - NULL`). For a column whose non-null value is always bound as a
+/// literal of one fixed type, the `NULL` is bound as `CAST(NULL AS t)` with that same type `t`
+/// ([`null_type`]). Every other column keeps a bare `NULL`, as before.
+pub(super) fn column_null(ty: ColumnType) -> ast::Expr {
+    let null = ast::Expr::Literal(ast::Value::Null);
+    match null_type(ty) {
+        Some(target) => ast::Expr::Cast {
+            expr: Box::new(null),
+            target,
+            try_cast: false,
+        },
+        None => null,
+    }
+}
+
+/// The type a `NULL` in a column of type `ty` is cast to, or `None` to bind it as a bare `NULL`.
+///
+/// A type is listed only when its non-null value is always bound as a literal of that type, from a
+/// stored row and from the value an `INSERT` computed alike, and the cast `NULL` is accepted wherever
+/// that literal is. The cast is to the type the literal itself has: an integer column (`SMALLINT`,
+/// `INT`, `BIGINT`) gives `INT`, not its declared width; `REAL` gives `FLOAT` and `JSONB` gives
+/// `JSON`; a `NUMERIC(p, s)` gives an unconstrained `NUMERIC`.
+///
+/// The rest stay bare. A `TEXT`/`VARCHAR`/`CHAR` value (and a composite, stored as text) is a string
+/// literal that takes the type it meets (`'123'` into a `BIGINT` column, `= 1`). So, in an `INSERT`,
+/// is the value of a type written as a string (`INET`, `CIDR`, ranges, arrays, `POINT`, `VECTOR`,
+/// `TSVECTOR`, `TSQUERY`, `XML`, `BYTEA`, `BIT`, `BIT VARYING`), since `NEW` there carries the value before it is converted
+/// to the column's type. A typed `NULL` for those would be stricter than their values.
+const fn null_type(ty: ColumnType) -> Option<ColumnType> {
+    match ty {
+        ColumnType::Int | ColumnType::SmallInt | ColumnType::BigInt => Some(ColumnType::Int),
+        ColumnType::Float | ColumnType::Real => Some(ColumnType::Float),
+        ColumnType::Json | ColumnType::Jsonb => Some(ColumnType::Json),
+        ColumnType::Numeric { .. } => Some(ColumnType::Numeric {
+            precision: 0,
+            scale: 0,
+        }),
+        ColumnType::Bool
+        | ColumnType::Date
+        | ColumnType::Time
+        | ColumnType::TimeTz
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz
+        | ColumnType::Interval
+        | ColumnType::Uuid
+        | ColumnType::Enum
+        | ColumnType::Macaddr
+        | ColumnType::Macaddr8 => Some(ty),
+        ColumnType::Text
+        | ColumnType::VarChar(_)
+        | ColumnType::Char(_)
+        | ColumnType::Bytes
+        | ColumnType::Bit(_)
+        | ColumnType::VarBit(_)
+        | ColumnType::Inet
+        | ColumnType::Cidr
+        | ColumnType::Range(_)
+        | ColumnType::Array(_)
+        | ColumnType::Vector(_)
+        | ColumnType::Geometry(_)
+        | ColumnType::Tsvector
+        | ColumnType::Tsquery
+        | ColumnType::Xml => None,
+    }
+}
 
 /// Run a parsed NusaScript block with the call's `$n` arguments, returning the final
 /// variable environment (so the caller can read back `OUT` parameter values).
@@ -695,9 +820,9 @@ fn bind_vars_expr(
             // A bare identifier that names a table column in scope is a column reference, not a
             // variable — leave it for the analyzer to resolve (the column shadows the variable).
             if !shadowed.contains(name)
-                && let Some(value) = ctx.env.get(name)
+                && let Some(bound) = ctx.env.bound(name)
             {
-                *expr = ast::Expr::Literal(value.clone());
+                *expr = bound;
             }
         },
         ast::Expr::Literal(_) | ast::Expr::QualifiedColumn { .. } | ast::Expr::Parameter(_) => {},

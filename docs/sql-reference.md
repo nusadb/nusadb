@@ -1586,7 +1586,15 @@ $$;
 ### Triggers
 
 A trigger runs one SQL statement when a table is written. `NEW.col` and `OLD.col` refer to the
-affected row.
+affected row. A `NULL` there is never stricter than the column's values. For a date/time,
+interval, boolean, numeric, floating-point, `UUID`, enum, `JSON`/`JSONB` or MAC address
+column, and a domain over one, the `NULL` has the type the values have, so `NEW.a + INTERVAL '1
+day'` on a `TIMESTAMPTZ` column is a `NULL` timestamp when `a` is `NULL`, not a type error. An
+integer column's `NULL` is an `INT` whatever its declared width, as its values are. Any other
+column gives an untyped `NULL`, which takes the type it meets: a `TEXT`, `VARCHAR` or `CHAR` value
+is a string literal that does the same (`NEW.code = 1`, or inserting it into a `BIGINT` column), and
+so, in an `INSERT`, is a value written as a string for a column such as `INET`, a range or an
+array.
 
 ```sql
 CREATE TABLE stock (sku TEXT PRIMARY KEY, qty INT);
@@ -1632,7 +1640,8 @@ trigger is created, not on first fire. `EXECUTE PROCEDURE` is a synonym. Functio
 the trigger (`EXECUTE FUNCTION f('x')`) are not accepted.
 
 Inside the body, `OLD.col` and `NEW.col` read the rows of the firing; the row an event does not
-have (`OLD` in an `INSERT`, `NEW` in a `DELETE`, both in a statement trigger) reads as `NULL`.
+have (`OLD` in an `INSERT`, `NEW` in a `DELETE`, both in a statement trigger) reads as `NULL`,
+typed by the same rule. So does a `NEW` field the body sets to `NULL`.
 These variables describe the firing:
 
 | Variable | Value |

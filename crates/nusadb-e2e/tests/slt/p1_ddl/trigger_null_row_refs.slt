@@ -1,0 +1,362 @@
+# A NEW.col / OLD.col that is NULL is never stricter inside a trigger than the column's values. For a
+# date/time column it keeps the column's type, so an expression over it type-checks as it does when
+# the column holds a value. Before, a NULL was bound as an untyped NULL and
+# `NEW.a + NEW.n * INTERVAL '1 day'` failed only for rows where `a` happened to be NULL.
+
+statement ok
+CREATE TABLE t (id BIGINT NOT NULL, a TIMESTAMPTZ, b TIMESTAMPTZ, n BIGINT NOT NULL, CONSTRAINT t_pkey PRIMARY KEY (id))
+
+statement ok
+INSERT INTO t VALUES (1, TIMESTAMPTZ '2024-01-01 00:00:00+00', TIMESTAMPTZ '2024-01-01 00:00:00+00', 30)
+
+statement ok
+UPDATE t SET a = NULL WHERE id = 1
+
+statement ok
+CREATE FUNCTION t_fn() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.b < NEW.a + NEW.n * INTERVAL '1 day' THEN RAISE 'not reached'; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER t_trg BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION t_fn()
+
+# The comparison is NULL, so the IF is not taken and the update goes through.
+statement ok
+UPDATE t SET b = TIMESTAMPTZ '2024-02-01 00:00:00+00' WHERE id = 1
+
+query TT
+SELECT CAST(a AS TEXT), CAST(b AS TEXT) FROM t
+----
+NULL 2024-02-01 00:00:00+00
+
+# The same expression guarded by IS NULL, which used to fail at analysis anyway.
+statement ok
+CREATE FUNCTION t_fn_or() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.a IS NULL OR NEW.b < NEW.a + NEW.n * INTERVAL '1 day' THEN NEW.n := NEW.n + 1; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER t_trg_or BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION t_fn_or()
+
+statement ok
+UPDATE t SET b = TIMESTAMPTZ '2024-03-01 00:00:00+00' WHERE id = 1
+
+query I
+SELECT n FROM t
+----
+31
+
+# A non-NULL value still takes the branch it took before: b (2024-03-01) is before a + 31 days.
+statement error not reached
+UPDATE t SET a = TIMESTAMPTZ '2024-02-15 00:00:00+00' WHERE id = 1
+
+statement ok
+DROP TRIGGER t_trg ON t
+
+statement ok
+DROP TRIGGER t_trg_or ON t
+
+statement ok
+UPDATE t SET a = TIMESTAMPTZ '2024-02-15 00:00:00+00' WHERE id = 1
+
+# NEW.a - NEW.b with both NULL, COALESCE, and IS DISTINCT FROM against OLD, in a trigger function.
+statement ok
+CREATE TABLE tlog (tag TEXT, gap INTERVAL, at TIMESTAMPTZ, moved BOOLEAN)
+
+statement ok
+CREATE FUNCTION t_log() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO tlog VALUES ('fn', NEW.a - NEW.b, COALESCE(NEW.a + INTERVAL '1 day', TIMESTAMPTZ '2000-01-01 00:00:00+00'), NEW.a IS DISTINCT FROM OLD.a); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER t_log BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION t_log()
+
+statement ok
+UPDATE t SET a = NULL, b = NULL WHERE id = 1
+
+statement ok
+UPDATE t SET n = 40 WHERE id = 1
+
+query TTTT
+SELECT tag, CAST(gap AS TEXT), CAST(at AS TEXT), CAST(moved AS TEXT) FROM tlog ORDER BY moved DESC
+----
+fn NULL 2000-01-01 00:00:00+00 true
+fn NULL 2000-01-01 00:00:00+00 false
+
+# A NEW field the body sets to NULL is still typed when read back.
+statement ok
+CREATE FUNCTION t_reset() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN NEW.b := NULL; NEW.a := COALESCE(NEW.b + INTERVAL '2 days', TIMESTAMPTZ '2001-01-01 00:00:00+00'); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER t_reset BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION t_reset()
+
+statement ok
+UPDATE t SET b = TIMESTAMPTZ '2024-01-01 00:00:00+00' WHERE id = 1
+
+query TT
+SELECT CAST(a AS TEXT), CAST(b AS TEXT) FROM t
+----
+2001-01-01 00:00:00+00 NULL
+
+statement ok
+DROP TRIGGER t_reset ON t
+
+statement ok
+DROP TRIGGER t_log ON t
+
+# A plain SQL action: OLD in an AFTER trigger, and a WHEN clause over a NULL column.
+statement ok
+DELETE FROM tlog
+
+statement ok
+UPDATE t SET a = NULL, b = NULL WHERE id = 1
+
+statement ok
+CREATE TRIGGER t_after AFTER UPDATE ON t FOR EACH ROW INSERT INTO tlog VALUES ('after', OLD.b - OLD.a, COALESCE(OLD.a + OLD.n * INTERVAL '1 day', TIMESTAMPTZ '2002-01-01 00:00:00+00'), OLD.a IS DISTINCT FROM NEW.a)
+
+statement ok
+CREATE TRIGGER t_when AFTER UPDATE ON t FOR EACH ROW WHEN (NEW.a + INTERVAL '1 day' > NEW.b) INSERT INTO tlog VALUES ('when', NULL, NEW.a, NULL)
+
+statement ok
+UPDATE t SET n = 41 WHERE id = 1
+
+query TTTT
+SELECT tag, CAST(gap AS TEXT), CAST(at AS TEXT), CAST(moved AS TEXT) FROM tlog ORDER BY tag
+----
+after NULL 2002-01-01 00:00:00+00 false
+
+# Once both columns hold values the WHEN guard is true and the second trigger fires.
+statement ok
+UPDATE t SET a = TIMESTAMPTZ '2024-01-01 00:00:00+00', b = TIMESTAMPTZ '2024-01-01 12:00:00+00' WHERE id = 1
+
+query TT
+SELECT tag, CAST(at AS TEXT) FROM tlog ORDER BY tag, at
+----
+after 2002-01-01 00:00:00+00
+after 2002-01-01 00:00:00+00
+when 2024-01-01 00:00:00+00
+
+# A row the event lacks reads as a typed NULL in a trigger function shared by several events.
+statement ok
+CREATE TABLE ins (id INT PRIMARY KEY, a TIMESTAMPTZ)
+
+statement ok
+CREATE TABLE inslog (op TEXT, gap INTERVAL)
+
+statement ok
+CREATE FUNCTION ins_fn() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO inslog VALUES (TG_OP, NEW.a - OLD.a); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER ins_trg AFTER INSERT OR DELETE ON ins FOR EACH ROW EXECUTE FUNCTION ins_fn()
+
+statement ok
+INSERT INTO ins VALUES (1, TIMESTAMPTZ '2024-01-01 00:00:00+00')
+
+statement ok
+DELETE FROM ins
+
+query TT
+SELECT op, CAST(gap AS TEXT) FROM inslog ORDER BY op
+----
+DELETE NULL
+INSERT NULL
+
+# Each column type accepts its NULL wherever it accepts its value.
+statement ok
+CREATE DOMAIN posint AS INT CHECK (VALUE > 0)
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
+
+statement ok
+CREATE TYPE pair AS (x INT, y TEXT)
+
+statement ok
+CREATE TABLE ty (id INT PRIMARY KEY, d posint, e mood, c pair, arr INT[], r INT4RANGE, j JSONB, u UUID, iv INTERVAL, num NUMERIC(10,2), vc VARCHAR(5), dt DATE, bo BOOLEAN, tt TEXT)
+
+statement ok
+CREATE TABLE tylog (id INT, what TEXT, v TEXT)
+
+statement ok
+CREATE FUNCTION ty_fn() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO tylog VALUES (NEW.id, 'd', CAST(NEW.d + 1 AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'e', CAST(NEW.e = OLD.e AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'c', CAST(NEW.c AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'arr', CAST(NEW.arr || ARRAY[1] AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'r', CAST(NEW.r * int4range(1, 5) AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'j', CAST(NEW.j -> 'k' AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'u', CAST(NEW.u = OLD.u AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'iv', CAST(NEW.iv + NEW.iv AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'num', CAST(NEW.num * 2 AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'vc', NEW.vc || 'x'); INSERT INTO tylog VALUES (NEW.id, 'dt', CAST(NEW.dt - OLD.dt AS TEXT)); INSERT INTO tylog VALUES (NEW.id, 'bo', CAST(NEW.bo AND true AS TEXT)); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER ty_trg BEFORE UPDATE ON ty FOR EACH ROW EXECUTE FUNCTION ty_fn()
+
+statement ok
+INSERT INTO ty (id) VALUES (1)
+
+statement ok
+INSERT INTO ty VALUES (2, 3, 'ok', ROW(1, 'a'), ARRAY[2], int4range(2, 4), '{"k": 1}', '00000000-0000-0000-0000-000000000001', INTERVAL '1 day', 1.25, 'ab', DATE '2020-01-02', true, 't')
+
+statement ok
+UPDATE ty SET tt = 'z'
+
+query ITT
+SELECT id, what, v FROM tylog ORDER BY id, what
+----
+1 arr NULL
+1 bo NULL
+1 c NULL
+1 d NULL
+1 dt NULL
+1 e NULL
+1 iv NULL
+1 j NULL
+1 num NULL
+1 r NULL
+1 u NULL
+1 vc NULL
+2 arr {2,1}
+2 bo true
+2 c (1,a)
+2 d 4
+2 dt 0
+2 e true
+2 iv 2 days
+2 j 1
+2 num 2.50
+2 r [2,4)
+2 u true
+2 vc abx
+
+# A TEXT, VARCHAR or CHAR value is bound as a string literal, which takes the type it meets, so a
+# NULL in such a column stays just as flexible: into a BIGINT column, compared with an integer, in a
+# CASE over integers, as a numeric argument, and in a WHEN guard. The value '123' and NULL behave
+# alike. (A simple `CASE '123' WHEN 123` and `abs('123')` are refused for a string value, so those
+# forms are checked on the NULL row only, which accepts them as before.)
+statement ok
+CREATE TABLE sx (id INT PRIMARY KEY, tx TEXT, vc VARCHAR(10), ch CHAR(3))
+
+statement ok
+CREATE TABLE sxlog (id INT, src TEXT, b BIGINT, eq BOOLEAN, cs INT, ab NUMERIC)
+
+statement ok
+CREATE FUNCTION sx_fn() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO sxlog VALUES (NEW.id, 'tx', NEW.tx, NEW.tx = 123, CASE WHEN NEW.tx = 123 THEN 1 ELSE 0 END, NULL); INSERT INTO sxlog VALUES (NEW.id, 'vc', NEW.vc, NEW.vc = 123, CASE WHEN NEW.vc = 123 THEN 1 ELSE 0 END, NULL); INSERT INTO sxlog VALUES (NEW.id, 'ch', NEW.ch, NEW.ch = 123, CASE WHEN NEW.ch = 123 THEN 1 ELSE 0 END, NULL); IF NEW.tx = 1 THEN RAISE 'not reached'; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER sx_fn AFTER INSERT ON sx FOR EACH ROW EXECUTE FUNCTION sx_fn()
+
+statement ok
+CREATE TRIGGER sx_sql AFTER INSERT ON sx FOR EACH ROW INSERT INTO sxlog VALUES (NEW.id, 'sql', NEW.tx, NEW.vc = 1, NULL, NULL)
+
+statement ok
+CREATE TRIGGER sx_when AFTER INSERT ON sx FOR EACH ROW WHEN (NEW.tx = 1 OR NEW.vc = 1 OR NEW.ch = 1 OR NEW.tx IS NULL) INSERT INTO sxlog VALUES (NEW.id, 'when', NULL, NULL, NULL, NULL)
+
+statement ok
+CREATE TRIGGER sx_case AFTER INSERT ON sx FOR EACH ROW WHEN (NEW.tx IS NULL) INSERT INTO sxlog VALUES (NEW.id, 'case', NULL, NULL, CASE NEW.tx WHEN 1 THEN 1 ELSE 0 END + CASE NEW.vc WHEN 1 THEN 1 ELSE 0 END + CASE NEW.ch WHEN 1 THEN 1 ELSE 0 END, abs(NEW.tx) + abs(NEW.vc) + abs(NEW.ch))
+
+statement ok
+INSERT INTO sx VALUES (1, '123', '123', '123')
+
+statement ok
+INSERT INTO sx VALUES (2, NULL, NULL, NULL)
+
+query ITTTTT
+SELECT id, src, CAST(b AS TEXT), CAST(eq AS TEXT), CAST(cs AS TEXT), CAST(ab AS TEXT) FROM sxlog ORDER BY id, src
+----
+1 ch 123 true 1 NULL
+1 sql 123 false NULL NULL
+1 tx 123 true 1 NULL
+1 vc 123 true 1 NULL
+2 case NULL NULL 0 NULL
+2 ch NULL NULL 0 NULL
+2 sql NULL NULL NULL NULL
+2 tx NULL NULL 0 NULL
+2 vc NULL NULL 0 NULL
+2 when NULL NULL NULL NULL
+
+# A NULL is never stricter than the column's non-NULL values. In an INSERT, NEW carries the value as
+# written, so a string written for an INET, range, array, XML or POINT column is still a string
+# literal, and those columns keep a bare NULL. An integer column's NULL is an INT, the type its values
+# have, whatever the declared width. Each statement below runs for a row of values and a row of
+# NULLs, and behaves the same way as for the values.
+statement ok
+CREATE TABLE rq (id INT PRIMARY KEY, ip INET, ir INT4RANGE, ta TEXT[], x XML, pt POINT, tx TEXT, bi BIGINT, si SMALLINT, nm NUMERIC(5,2), bo BOOLEAN, tz TIMESTAMPTZ)
+
+statement ok
+CREATE TABLE rq_text (id INT, src TEXT, v TEXT)
+
+statement ok
+CREATE TRIGGER rq_act AFTER INSERT ON rq FOR EACH ROW INSERT INTO rq_text VALUES (NEW.id, 'act_ip', NEW.ip)
+
+statement ok
+CREATE TRIGGER rq_when AFTER INSERT ON rq FOR EACH ROW WHEN (NEW.ip = '10.0.0.1' OR NEW.ir = '[1,5)' OR NEW.ta = '{a,b}' OR NEW.tx = 1 OR NEW.bi = 5 OR NEW.si = 2 OR NEW.nm > 1 OR NEW.bo OR NEW.tz < TIMESTAMPTZ '2030-01-01 00:00:00+00' OR NEW.ip IS NULL) INSERT INTO rq_text VALUES (NEW.id, 'when', NULL)
+
+statement ok
+CREATE FUNCTION rq_fn() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO rq_text VALUES (NEW.id, 'ip', NEW.ip); INSERT INTO rq_text VALUES (NEW.id, 'ir', NEW.ir); INSERT INTO rq_text VALUES (NEW.id, 'ta', NEW.ta); INSERT INTO rq_text VALUES (NEW.id, 'x', NEW.x); INSERT INTO rq_text VALUES (NEW.id, 'pt', NEW.pt); INSERT INTO rq_text VALUES (NEW.id, 'bi', substr('abcdef', NEW.bi)); INSERT INTO rq_text VALUES (NEW.id, 'si', repeat('a', NEW.si)); INSERT INTO rq_text VALUES (NEW.id, 'nm', CAST(NEW.nm * 2 AS TEXT)); INSERT INTO rq_text VALUES (NEW.id, 'bo', CAST(NEW.bo AND true AS TEXT)); INSERT INTO rq_text VALUES (NEW.id, 'tz', CAST(NEW.tz + INTERVAL '1 day' AS TEXT)); IF NEW.ip = '10.0.0.9' OR NEW.bi = 1 OR NEW.tz > TIMESTAMPTZ '2030-01-01 00:00:00+00' THEN RAISE 'not reached'; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER rq_fn AFTER INSERT ON rq FOR EACH ROW EXECUTE FUNCTION rq_fn()
+
+statement ok
+INSERT INTO rq VALUES (1, '10.0.0.1', '[1,5)', '{a,b}', '<a/>', '(1,2)', 't', 5, 2, 1.25, true, '2024-01-01 00:00:00+00')
+
+statement ok
+INSERT INTO rq VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+
+query ITT
+SELECT id, src, v FROM rq_text ORDER BY id, src
+----
+1 act_ip 10.0.0.1
+1 bi ef
+1 bo true
+1 ip 10.0.0.1
+1 ir [1,5)
+1 nm 2.50
+1 pt (1,2)
+1 si aa
+1 ta {a,b}
+1 tz 2024-01-02 00:00:00+00
+1 when NULL
+1 x <a/>
+2 act_ip NULL
+2 bi NULL
+2 bo NULL
+2 ip NULL
+2 ir NULL
+2 nm NULL
+2 pt NULL
+2 si NULL
+2 ta NULL
+2 tz NULL
+2 when NULL
+2 x NULL
+
+# OLD of a stored row: an integer column's NULL is an INT there too.
+statement ok
+DELETE FROM rq_text
+
+statement ok
+CREATE TRIGGER rq_old AFTER UPDATE ON rq FOR EACH ROW INSERT INTO rq_text VALUES (OLD.id, 'old', substr('abcdef', OLD.bi) || repeat('a', OLD.si))
+
+statement ok
+UPDATE rq SET tx = 'u'
+
+query ITT
+SELECT id, src, v FROM rq_text ORDER BY id
+----
+1 old efaa
+2 old NULL
+
+# A bit-string value written as a string reaches NEW as a string literal, so its NULL is untyped
+# too: concatenating it with text, and LIKE in a WHEN guard, accept the NULL row as they accept
+# the value.
+statement ok
+CREATE TABLE rb (id INT PRIMARY KEY, c BIT(3), v VARBIT(8))
+
+statement ok
+CREATE TABLE rb_log (id INT, s TEXT)
+
+statement ok
+CREATE TRIGGER rb_cat AFTER INSERT ON rb FOR EACH ROW INSERT INTO rb_log VALUES (NEW.id, NEW.c || 'x')
+
+statement ok
+CREATE TRIGGER rb_like AFTER INSERT ON rb FOR EACH ROW WHEN (NEW.v LIKE '1%') INSERT INTO rb_log VALUES (NEW.id, 'like')
+
+statement ok
+INSERT INTO rb VALUES (1, '101', '10')
+
+statement ok
+INSERT INTO rb VALUES (2, NULL, NULL)
+
+query IT
+SELECT id, s FROM rb_log ORDER BY id, s
+----
+1 101x
+1 like
+2 NULL

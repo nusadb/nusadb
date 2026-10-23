@@ -568,6 +568,11 @@ fn slt_p1_trigger_functions() {
 }
 
 #[test]
+fn slt_p1_trigger_null_row_refs() {
+    run_slt("tests/slt/p1_ddl/trigger_null_row_refs.slt");
+}
+
+#[test]
 fn slt_p1_partition_alter_columns() {
     run_slt("tests/slt/p1_ddl/partition_alter_columns.slt");
 }

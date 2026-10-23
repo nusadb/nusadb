@@ -8,10 +8,10 @@
 //! bound) or once per statement (`FOR EACH STATEMENT`).
 //!
 //! `NEW.col` / `OLD.col` references in the action and `WHEN` bodies are bound by substituting them
-//! with the affected row's literal values ([`substitute_row_refs`]) before the body is analyzed and
-//! run re-entrantly in the same transaction. A thread-local depth guard ([`DepthGuard`]) bounds
-//! cascading triggers so a (possibly mutual) self-firing trigger aborts rather than overflowing the
-//! stack.
+//! with the affected row's literal values ([`substitute_row_refs`]; a `NULL` as `column_null` binds
+//! it) before the body is analyzed and run re-entrantly in the same transaction. A
+//! thread-local depth guard ([`DepthGuard`]) bounds cascading triggers so a (possibly mutual)
+//! self-firing trigger aborts rather than overflowing the stack.
 #![allow(clippy::wildcard_imports)]
 
 use std::cell::Cell;
@@ -1188,7 +1188,8 @@ fn fire_trigger_function(
     let mut env = trigger_variables(trig, event, refs.schema);
     if let Some(new) = refs.new {
         for (column, value) in refs.schema.columns.iter().zip(new) {
-            env.insert(new_field(&column.name), value.clone());
+            // A field read while NULL is bound like a NULL of its column (`column_null`).
+            env.insert_typed(new_field(&column.name), value.clone(), column.ty);
         }
     }
     let (env, returned) = super::script::run_trigger_block(&block, env, engine, txn)?;
@@ -1291,7 +1292,8 @@ fn eval_when(
 
 /// The `NEW`/`OLD` row binding for one firing: resolves `new.col` / `old.col` to literal values,
 /// or, in a trigger function's body (`function_body`), `new.col` to the variable the body may
-/// assign and a row the event lacks to null.
+/// assign and a row the event lacks to null. A `NULL` is bound by `column_null`, never more strictly
+/// than the column's non-null literals.
 struct RowRefs<'a> {
     schema: &'a TableSchema,
     old: Option<&'a [ast::Value]>,
@@ -1308,11 +1310,12 @@ impl RowRefs<'_> {
             "old" => (self.old, "OLD"),
             _ => return Ok(None),
         };
-        let index = self
+        let (index, def) = self
             .schema
             .columns
             .iter()
-            .position(|c| c.name == column)
+            .enumerate()
+            .find(|(_, c)| c.name == column)
             .ok_or_else(|| Error::ColumnNotFound {
                 table: self.schema.name.clone(),
                 column: column.to_owned(),
@@ -1321,20 +1324,24 @@ impl RowRefs<'_> {
             // A trigger function shared by several events reads the row its event lacks (`OLD`
             // in an INSERT, `NEW` in a DELETE) as null, so a branch on `TG_OP` can name both.
             if self.function_body {
-                return Ok(Some(ast::Expr::Literal(ast::Value::Null)));
+                return Ok(Some(super::script::column_null(def.ty)));
             }
             return Err(Error::InvalidStatement(format!(
                 "{which} is not available in this trigger event"
             )));
         };
-        let value = row
-            .get(index)
-            .cloned()
-            .ok_or_else(|| internal_index(index))?;
         if self.function_body && which == "NEW" {
+            // Bound when the body runs, to the field's current value (typed even when NULL).
             return Ok(Some(ast::Expr::Column(new_field(column))));
         }
-        Ok(Some(ast::Expr::Literal(value)))
+        // A value is bound as its literal; a NULL as `column_null` binds it for the column's type,
+        // never more strictly than the column's non-null values: typed where those always are
+        // (`NEW.a + INTERVAL '1 day'` on a TIMESTAMPTZ column), bare otherwise (`NEW.tx = 1`).
+        let value = row.get(index).ok_or_else(|| internal_index(index))?;
+        Ok(Some(match value {
+            ast::Value::Null => super::script::column_null(def.ty),
+            value => ast::Expr::Literal(value.clone()),
+        }))
     }
 }
 
