@@ -1581,6 +1581,8 @@ fn insert_rows_with_unique(
     // constraint (against existing rows or an earlier row in this batch) so the rest still insert.
     let full_rows = if conflict_do_nothing {
         let kept = keep_non_conflicting(table, full_rows, engine, txn)?;
+        // ... the rows that would collide on a unique index ...
+        let kept = super::unique_index::keep_non_conflicting(table, kept, engine, txn)?;
         // ... and the rows that would violate an exclusion constraint.
         super::exclusion::keep_non_conflicting(table, kept, engine, txn)?
     } else {
@@ -1633,7 +1635,8 @@ fn insert_rows_with_unique(
             let mut entries: Vec<(Vec<u8>, Tid)> = Vec::with_capacity(deferred_tids.len());
             for (full, &tid) in full_rows.iter().zip(&deferred_tids) {
                 if row_is_indexed(target, full)? {
-                    entries.push((index_key_for(full, &target.keys)?, tid));
+                    guard_unique_entry(target, full, tid, engine, txn)?;
+                    entries.push((entry_key(target, full, tid)?, tid));
                 }
             }
             engine.index_insert_batch(txn, target.id, entries)?;
@@ -1877,7 +1880,7 @@ fn upsert_rows(
         proposed.push(full);
     }
 
-    let key_ordinals = resolve_arbiter(table, target, engine, txn)?;
+    let arbiter = resolve_arbiter(table, target, engine, txn)?;
     let existing = scan_table(table, engine, txn)?;
     let index_targets = secondary_index_targets(table, engine)?;
 
@@ -1896,8 +1899,9 @@ fn upsert_rows(
         // ON CONFLICT arbiter matching treats a NULL key as distinct (standard `NULLS DISTINCT`); a
         // NULLS-NOT-DISTINCT arbiter's NULL duplicate is still caught by the NULL-aware uniqueness
         // enforcement on the resulting insert.
-        let Some(key) = unique_key(&prow, &key_ordinals, false) else {
-            // A NULL arbiter key never collides (NULLs are distinct) → plain insert.
+        let Some(key) = arbiter.key(&prow)? else {
+            // A NULL arbiter key never collides (NULLs are distinct), and a row a partial index's
+            // predicate rejects is not in it → plain insert.
             order.push((false, inserts.len()));
             inserts.push(prow);
             continue;
@@ -1909,9 +1913,16 @@ fn upsert_rows(
             ))
             .into());
         }
-        let hit = existing.iter().find(|(_, erow)| {
-            unique_key(erow, &key_ordinals, false).is_some_and(|ekey| unique_key_eq(&ekey, &key))
-        });
+        let mut hit = None;
+        for (tid, erow) in &existing {
+            if arbiter
+                .key(erow)?
+                .is_some_and(|ekey| unique_key_eq(&ekey, &key))
+            {
+                hit = Some((tid, erow));
+                break;
+            }
+        }
         if let Some((tid, erow)) = hit {
             // Evaluate SET / WHERE against `existing ++ EXCLUDED(proposed)`.
             let mut combined = erow.clone();
@@ -2125,15 +2136,15 @@ fn upsert_rows(
     Ok(affected)
 }
 
-/// Resolve an `ON CONFLICT` arbiter to the key-column ordinals of the matching `PRIMARY KEY`/`UNIQUE`
-/// constraint. Errors if no such constraint exists — an upsert needs a unique arbiter so that
+/// Resolve an `ON CONFLICT` arbiter to the key of the matching `PRIMARY KEY`/`UNIQUE` constraint,
+/// or of a unique index the target infers. Errors if there is none: an upsert needs a unique arbiter so that
 /// at most one existing row collides.
 fn resolve_arbiter(
     table: &TableSchema,
     target: &ConflictArbiter,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<Vec<usize>, Error> {
+) -> Result<super::unique_index::ArbiterKey, Error> {
     let constraints: Vec<_> = engine
         .list_constraints_as_of(txn, table.id)?
         .into_iter()
@@ -2174,8 +2185,9 @@ fn resolve_arbiter(
                 return Err(refuse_deferrable(constraint));
             }
             constraint_ordinals(table, &constraint.columns)
+                .map(super::unique_index::ArbiterKey::columns)
         },
-        ConflictArbiter::Columns(ordinals) => {
+        ConflictArbiter::Columns(ordinals) | ConflictArbiter::ColumnsWhere(ordinals, _) => {
             let mut wanted = ordinals.clone();
             wanted.sort_unstable();
             let mut deferrable_match = None;
@@ -2187,8 +2199,20 @@ fn resolve_arbiter(
                         deferrable_match.get_or_insert(constraint);
                         continue;
                     }
-                    return constraint_ordinals(table, &constraint.columns);
+                    return constraint_ordinals(table, &constraint.columns)
+                        .map(super::unique_index::ArbiterKey::columns);
                 }
+            }
+            // No key constraint: a unique index over the columns (a partial one only when the
+            // target's WHERE implies its predicate).
+            let inference = match target {
+                ConflictArbiter::ColumnsWhere(_, predicate) => Some(predicate.as_str()),
+                _ => None,
+            };
+            if let Some(arbiter) =
+                super::unique_index::infer_arbiter(table, &wanted, inference, engine, txn)?
+            {
+                return Ok(arbiter);
             }
             if let Some(constraint) = deferrable_match {
                 return Err(refuse_deferrable(constraint));
@@ -4454,7 +4478,15 @@ pub(super) fn secondary_index_targets(
     engine: &dyn StorageEngine,
 ) -> Result<Vec<IndexTarget>, Error> {
     let mut targets = Vec::new();
-    for def in engine.list_indexes(table.id)? {
+    let defs = engine.list_indexes(table.id)?;
+    // A unique index that backs no constraint is checked on each write (see
+    // `executor::unique_index`); the backing ones are read only when the table has a unique index.
+    let backing = if defs.iter().any(|d| d.unique) {
+        super::unique_index::backing_index_ids(table, engine)?
+    } else {
+        HashSet::new()
+    };
+    for def in defs {
         let Some(id) = engine.lookup_index(&def.name)? else {
             continue;
         };
@@ -4463,7 +4495,8 @@ pub(super) fn secondary_index_targets(
         // skip it, mirroring the analyzer's plan-time skip, which also keeps such an index from
         // ever being offered as a scan candidate.
         if let Some(target) = build_index_target(id, table, &def) {
-            targets.push(target);
+            let guard = super::unique_index::guard_for(&def, id, table, &backing);
+            targets.push(target.with_guard(guard));
         }
     }
     Ok(targets)
@@ -4484,6 +4517,27 @@ pub(super) struct IndexTarget {
     id: nusadb_core::IndexId,
     keys: IndexKeys,
     predicate: Option<TypedExpr>,
+    /// Set for a unique index that backs no constraint: each new entry is checked against the
+    /// latest committed rows under a key lock, and under `NULLS DISTINCT` an entry whose key holds a
+    /// `NULL` carries its row's address, so it never collides (see `executor::unique_index`).
+    guard: Option<super::unique_index::Guard>,
+}
+
+impl IndexTarget {
+    /// This target with its unique-index guard (`None` for none).
+    pub(super) fn with_guard(mut self, guard: Option<super::unique_index::Guard>) -> Self {
+        self.guard = guard;
+        self
+    }
+
+    /// Whether `row`'s entry carries the row's address: a `NULLS DISTINCT` guarded index and a key
+    /// that holds a `NULL`.
+    fn suffixes(&self, row: &Row) -> Result<bool, Error> {
+        match &self.guard {
+            Some(guard) if !guard.nulls_not_distinct => key_has_null(row, &self.keys),
+            _ => Ok(false),
+        }
+    }
 }
 
 /// Whether an `UPDATE` whose assigned columns are `set_cols` can change `target`'s entries. A plain
@@ -4511,7 +4565,7 @@ pub(super) fn build_index_target(
     table: &TableSchema,
     def: &nusadb_core::IndexDef,
 ) -> Option<IndexTarget> {
-    let predicate = match &def.predicate {
+    let predicate = match super::unique_index::split_predicate(def).0 {
         Some(sql) => {
             Some(crate::analyzer::analyze_check_predicate(sql, table, &EmptyCatalog).ok()?)
         },
@@ -4530,6 +4584,7 @@ pub(super) fn build_index_target(
         id,
         keys,
         predicate,
+        guard: None,
     })
 }
 
@@ -4547,6 +4602,89 @@ pub(super) fn index_key_for(row: &Row, keys: &IndexKeys) -> Result<Vec<u8>, Erro
             .collect::<Result<_, _>>()?,
     };
     index_key::encode_index_key(&values)
+}
+
+/// The entry key `row`@`tid` is stored under in `target`: [`index_key_for`], plus the row's address
+/// when `target` treats NULL keys as distinct and this key holds one.
+fn entry_key(target: &IndexTarget, row: &Row, tid: Tid) -> Result<Vec<u8>, Error> {
+    let mut key = index_key_for(row, &target.keys)?;
+    if target.suffixes(row)? {
+        key.extend_from_slice(&super::unique_index::null_suffix(tid));
+    }
+    Ok(key)
+}
+
+/// Check the entry `row`@`tid` is about to get in a guarded unique index: lock its key (no-wait,
+/// held to the end of the transaction), then refuse it when another live row already holds the
+/// key, reading the latest committed rows plus this transaction's own. A key that cannot collide
+/// (a `NULL` under `NULLS DISTINCT`) is neither locked nor checked.
+fn guard_unique_entry(
+    target: &IndexTarget,
+    row: &Row,
+    tid: Tid,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(guard) = &target.guard else {
+        return Ok(());
+    };
+    if target.suffixes(row)? {
+        return Ok(());
+    }
+    let key = index_key_for(row, &target.keys)?;
+    lock_unique_index_key(target, guard, &key, engine, txn)?;
+    let mut scan = engine.index_scan_committed(
+        txn,
+        target.id,
+        std::ops::Bound::Included(key.clone()),
+        std::ops::Bound::Included(key.clone()),
+    )?;
+    while let Some((other, tuple)) = scan.try_next()? {
+        if other == tid {
+            continue;
+        }
+        // The entry may belong to an older version of the row: count it only when the version the
+        // probe sees still holds the key.
+        let held = row::decode(&tuple, &guard.types)?;
+        if row_is_indexed(target, &held)? && index_key_for(&held, &target.keys)? == key {
+            return Err(super::unique_index::duplicate(&guard.name));
+        }
+    }
+    Ok(())
+}
+
+/// Take the exclusive key lock on `key` of guarded index `target`.
+fn lock_unique_index_key(
+    target: &IndexTarget,
+    guard: &super::unique_index::Guard,
+    key: &[u8],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    engine.lock_key(
+        txn,
+        guard.table,
+        super::unique_index::lock_hash(target.id, key),
+        nusadb_core::engine::RowLockMode::Exclusive,
+    )?;
+    Ok(())
+}
+
+/// Whether `row`'s key under `keys` holds a NULL.
+fn key_has_null(row: &Row, keys: &IndexKeys) -> Result<bool, Error> {
+    Ok(match keys {
+        IndexKeys::Columns(ordinals) => ordinals
+            .iter()
+            .any(|&o| matches!(row.get(o), None | Some(ast::Value::Null))),
+        IndexKeys::Exprs(exprs) => {
+            for e in exprs {
+                if matches!(eval::eval(e, row)?, ast::Value::Null) {
+                    return Ok(true);
+                }
+            }
+            false
+        },
+    })
 }
 
 /// Whether `row` is indexed by `target` — a partial index skips rows whose predicate is not true
@@ -4571,7 +4709,8 @@ pub(super) fn insert_into_indexes(
         if !row_is_indexed(target, row)? {
             continue;
         }
-        engine.index_insert(txn, target.id, &index_key_for(row, &target.keys)?, tid)?;
+        guard_unique_entry(target, row, tid, engine, txn)?;
+        engine.index_insert(txn, target.id, &entry_key(target, row, tid)?, tid)?;
     }
     Ok(())
 }
@@ -4604,7 +4743,7 @@ pub(super) fn backfill_index_streaming(
         }
         let row = row::decode(&tuple, &schema)?;
         if row_is_indexed(target, &row)? {
-            let key = index_key_for(&row, &target.keys)?;
+            let key = entry_key(target, &row, tid)?;
             buffered += key.len() + std::mem::size_of::<(Vec<u8>, Tid)>();
             entries.push((key, tid));
             // Flush once the buffered entries reach the budget, so the build stays bounded in bytes.
@@ -4760,7 +4899,7 @@ fn backfill_index_external_sort(
         }
         let row = row::decode(&tuple, &schema)?;
         if row_is_indexed(target, &row)? {
-            let key = index_key_for(&row, &target.keys)?;
+            let key = entry_key(target, &row, tid)?;
             buffered += key.len() + std::mem::size_of::<(Vec<u8>, Tid)>();
             buf.push((key, tid));
             if buffered >= budget {
@@ -4830,13 +4969,33 @@ pub(super) fn remove_departed_index_entries(
     txn: TxnId,
 ) -> Result<(), Error> {
     for target in targets {
+        // A row leaving a key of a guarded unique index keeps the key locked until this
+        // transaction ends, so no other one can take the key while this one may still roll back.
+        if let Some(guard) = &target.guard
+            && row_is_indexed(target, old_row)?
+            && !target.suffixes(old_row)?
+        {
+            let old_key = index_key_for(old_row, &target.keys)?;
+            let leaves = !row_is_indexed(target, new_row)?
+                || index_key_for(new_row, &target.keys)? != old_key;
+            if leaves {
+                lock_unique_index_key(target, guard, &old_key, engine, txn)?;
+            }
+        }
         // Only partial indexes can shed a row without a compensating insert.
         if target.predicate.is_none() {
             continue;
         }
         if row_is_indexed(target, old_row)? && !row_is_indexed(target, new_row)? {
-            let key = index_key_for(old_row, &target.keys)?;
+            let key = entry_key(target, old_row, old_tid)?;
             engine.index_delete(txn, target.id, &key, old_tid)?;
+            if target.guard.is_some() {
+                // An entry written before the suffix existed carries the bare key.
+                let bare = index_key_for(old_row, &target.keys)?;
+                if bare != key {
+                    engine.index_delete(txn, target.id, &bare, old_tid)?;
+                }
+            }
         }
     }
     Ok(())

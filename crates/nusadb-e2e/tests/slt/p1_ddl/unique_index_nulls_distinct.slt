@@ -1,0 +1,445 @@
+# CREATE UNIQUE INDEX ... [NULLS [NOT] DISTINCT] [WHERE pred].
+# NULLS DISTINCT (the default): NULL keys never collide. NULLS NOT DISTINCT: two NULL keys
+# collide. A partial index only counts the rows its predicate accepts.
+
+# --- Default: NULLS DISTINCT ------------------------------------------------------------------
+
+statement ok
+CREATE TABLE d (id INT PRIMARY KEY, b TEXT)
+
+statement ok
+CREATE UNIQUE INDEX d_b ON d (b)
+
+statement ok
+INSERT INTO d VALUES (1, NULL), (2, NULL), (3, 'k')
+
+statement ok
+INSERT INTO d VALUES (4, NULL)
+
+statement error duplicate key
+INSERT INTO d VALUES (5, 'k')
+
+statement ok
+CREATE UNIQUE INDEX d_b_explicit ON d (b) NULLS DISTINCT
+
+statement ok
+UPDATE d SET b = NULL WHERE id = 3
+
+statement ok
+UPDATE d SET b = 'k' WHERE id = 1
+
+statement error duplicate key
+UPDATE d SET b = 'k' WHERE id = 2
+
+query IT
+SELECT id, b FROM d ORDER BY id
+----
+1 k
+2 NULL
+3 NULL
+4 NULL
+
+# Lookups through the index are unaffected by NULL keys.
+query I
+SELECT id FROM d WHERE b = 'k'
+----
+1
+
+query I
+SELECT count(*) FROM d WHERE b IS NULL
+----
+3
+
+# A composite key with one NULL part does not collide either.
+statement ok
+CREATE TABLE d2 (a INT, b INT)
+
+statement ok
+CREATE UNIQUE INDEX d2_ab ON d2 (a, b)
+
+statement ok
+INSERT INTO d2 VALUES (1, NULL), (1, NULL), (1, 2)
+
+statement error duplicate key
+INSERT INTO d2 VALUES (1, 2)
+
+query I
+SELECT count(*) FROM d2 WHERE a = 1
+----
+3
+
+# --- NULLS NOT DISTINCT -----------------------------------------------------------------------
+
+statement ok
+CREATE TABLE n (id INT PRIMARY KEY, b TEXT)
+
+statement ok
+CREATE UNIQUE INDEX n_b ON n (b) NULLS NOT DISTINCT
+
+statement ok
+INSERT INTO n VALUES (1, NULL)
+
+statement error duplicate key
+INSERT INTO n VALUES (2, NULL)
+
+statement error duplicate key
+INSERT INTO n VALUES (2, 'x'), (3, NULL)
+
+statement ok
+INSERT INTO n VALUES (2, 'x')
+
+statement error duplicate key
+UPDATE n SET b = NULL WHERE id = 2
+
+statement error duplicate key
+INSERT INTO n SELECT 9, NULL
+
+query IT
+SELECT id, b FROM n ORDER BY id
+----
+1 NULL
+2 x
+
+# The setting needs a unique index.
+statement error only allowed on a UNIQUE index
+CREATE INDEX n_bad ON n (b) NULLS NOT DISTINCT
+
+# CREATE INDEX validates the rows already present.
+statement ok
+CREATE TABLE pre (id INT, b TEXT)
+
+statement ok
+INSERT INTO pre VALUES (1, NULL), (2, NULL)
+
+statement ok
+CREATE UNIQUE INDEX pre_ok ON pre (b)
+
+statement error duplicate key
+CREATE UNIQUE INDEX pre_nnd ON pre (b) NULLS NOT DISTINCT
+
+statement ok
+DELETE FROM pre WHERE id = 2
+
+statement ok
+CREATE UNIQUE INDEX pre_nnd ON pre (b) NULLS NOT DISTINCT
+
+statement error duplicate key
+INSERT INTO pre VALUES (3, NULL)
+
+statement ok
+DROP INDEX pre_nnd
+
+statement ok
+INSERT INTO pre VALUES (3, NULL)
+
+# --- Partial NULLS NOT DISTINCT: one active row per key, the key may be NULL --------------------
+
+statement ok
+CREATE TABLE p (a INT NOT NULL, b TEXT, s TEXT NOT NULL, CONSTRAINT p_pkey PRIMARY KEY (a))
+
+statement ok
+CREATE UNIQUE INDEX p_b_uidx ON p (b) NULLS NOT DISTINCT WHERE s = 'active'
+
+statement ok
+INSERT INTO p VALUES (1, NULL, 'active'), (2, NULL, 'done'), (3, NULL, 'done'), (4, 'k', 'active')
+
+statement error duplicate key
+INSERT INTO p VALUES (5, NULL, 'active')
+
+statement error duplicate key
+INSERT INTO p VALUES (5, 'k', 'active')
+
+statement ok
+INSERT INTO p VALUES (5, 'k', 'done')
+
+# A row moving into the predicate is checked; one moving out frees its key.
+statement error duplicate key
+UPDATE p SET s = 'active' WHERE a = 2
+
+statement ok
+UPDATE p SET s = 'done' WHERE a = 1
+
+statement ok
+UPDATE p SET s = 'active' WHERE a = 2
+
+statement error duplicate key
+UPDATE p SET s = 'active' WHERE a = 3
+
+# A key change inside the predicate.
+statement error duplicate key
+UPDATE p SET b = NULL WHERE a = 4
+
+statement ok
+UPDATE p SET b = 'm' WHERE a = 4
+
+statement ok
+INSERT INTO p VALUES (6, 'k', 'active')
+
+query ITT
+SELECT a, b, s FROM p ORDER BY a
+----
+1 NULL done
+2 NULL active
+3 NULL done
+4 m active
+5 k done
+6 k active
+
+# Upsert: the arbiter is inferred from the index's columns plus its predicate.
+statement ok
+INSERT INTO p VALUES (7, NULL, 'active') ON CONFLICT (b) WHERE s = 'active' DO UPDATE SET s = 'replaced'
+
+query IT
+SELECT a, s FROM p WHERE a IN (2, 7) ORDER BY a
+----
+2 replaced
+
+statement ok
+INSERT INTO p VALUES (8, 'm', 'active') ON CONFLICT (b) WHERE s = 'active' DO NOTHING
+
+statement ok
+INSERT INTO p VALUES (8, 'z', 'active') ON CONFLICT (b) WHERE s = 'active' DO NOTHING
+
+query IT
+SELECT a, b FROM p WHERE s = 'active' ORDER BY a
+----
+4 m
+6 k
+8 z
+
+# A predicate that only partly matches the index's does not infer it.
+statement error no unique or primary key constraint matching
+INSERT INTO p VALUES (9, 'q', 'active') ON CONFLICT (b) DO NOTHING
+
+statement error no unique or primary key constraint matching
+INSERT INTO p VALUES (9, 'q', 'active') ON CONFLICT (b) WHERE s = 'other' DO NOTHING
+
+# A predicate with more conjuncts still implies the index's.
+statement ok
+INSERT INTO p VALUES (9, 'z', 'active') ON CONFLICT (b) WHERE s = 'active' AND a > 0 DO UPDATE SET b = 'zz'
+
+query IT
+SELECT a, b FROM p WHERE a IN (8, 9) ORDER BY a
+----
+8 zz
+
+# A bare DO NOTHING skips a collision on any unique index.
+statement ok
+INSERT INTO p VALUES (10, 'k', 'active'), (11, 'new', 'active') ON CONFLICT DO NOTHING
+
+query I
+SELECT a FROM p WHERE a >= 10 ORDER BY a
+----
+11
+
+# MERGE goes through the same check.
+statement ok
+CREATE TABLE src (a INT, b TEXT, s TEXT)
+
+statement ok
+INSERT INTO src VALUES (20, 'k', 'active')
+
+statement error duplicate key
+MERGE INTO p USING src ON p.a = src.a WHEN NOT MATCHED THEN INSERT VALUES (src.a, src.b, src.s)
+
+statement ok
+UPDATE src SET b = 'fresh'
+
+statement ok
+MERGE INTO p USING src ON p.a = src.a WHEN NOT MATCHED THEN INSERT VALUES (src.a, src.b, src.s)
+
+statement error duplicate key
+MERGE INTO p USING src ON p.a = 6 WHEN MATCHED THEN UPDATE SET b = 'fresh'
+
+# A foreign-key cascade that writes the indexed column is checked too.
+statement ok
+CREATE TABLE parent (k TEXT PRIMARY KEY)
+
+statement ok
+INSERT INTO parent VALUES ('x'), ('y')
+
+statement ok
+CREATE TABLE child (id INT PRIMARY KEY, k TEXT REFERENCES parent (k) ON UPDATE CASCADE ON DELETE SET NULL)
+
+statement ok
+CREATE UNIQUE INDEX child_k ON child (k) NULLS NOT DISTINCT
+
+statement ok
+INSERT INTO child VALUES (1, 'x'), (2, 'y')
+
+statement error duplicate key
+DELETE FROM parent
+
+statement ok
+DELETE FROM parent WHERE k = 'x'
+
+query IT
+SELECT id, k FROM child ORDER BY id
+----
+1 NULL
+2 y
+
+statement error duplicate key
+DELETE FROM parent WHERE k = 'y'
+
+# --- Uncommitted DDL and rollback ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE r (b TEXT)
+
+statement ok
+BEGIN
+
+statement ok
+CREATE UNIQUE INDEX r_b ON r (b) NULLS NOT DISTINCT
+
+statement ok
+INSERT INTO r VALUES (NULL)
+
+statement error duplicate key
+INSERT INTO r VALUES (NULL)
+
+statement ok
+ROLLBACK
+
+statement ok
+INSERT INTO r VALUES (NULL), (NULL)
+
+# --- Renaming an indexed column keeps the setting and the predicate ------------------------------
+
+statement ok
+CREATE TABLE rn (b TEXT, s TEXT)
+
+statement ok
+CREATE UNIQUE INDEX rn_b ON rn (b) NULLS NOT DISTINCT WHERE s = 'on'
+
+statement ok
+ALTER TABLE rn RENAME COLUMN s TO state
+
+statement ok
+INSERT INTO rn VALUES (NULL, 'on'), (NULL, 'off')
+
+statement error duplicate key
+INSERT INTO rn VALUES (NULL, 'on')
+
+statement ok
+REINDEX TABLE rn
+
+statement error duplicate key
+INSERT INTO rn VALUES (NULL, 'on')
+
+# --- ON CONFLICT (cols) WHERE pred outside a top-level INSERT ------------------------------------
+
+statement ok
+CREATE TABLE w (id INT PRIMARY KEY, b TEXT, s TEXT)
+
+statement ok
+CREATE UNIQUE INDEX w_b ON w (b) NULLS NOT DISTINCT WHERE s = 'active'
+
+statement ok
+INSERT INTO w VALUES (1, NULL, 'active')
+
+statement ok
+EXPLAIN INSERT INTO w VALUES (2, NULL, 'active') ON CONFLICT (b) WHERE s = 'active' DO NOTHING
+
+# It parses; EXPLAIN ANALYZE then refuses any data-modifying statement, as without the WHERE.
+statement error EXPLAIN ANALYZE on a data-modifying statement is not supported
+EXPLAIN ANALYZE INSERT INTO w VALUES (2, NULL, 'active') ON CONFLICT (b) WHERE s = 'active' DO NOTHING
+
+statement ok
+PREPARE up AS INSERT INTO w VALUES ($1, NULL, 'active') ON CONFLICT (b) WHERE s = 'active' DO UPDATE SET id = EXCLUDED.id
+
+statement ok
+EXECUTE up (3)
+
+query IT
+SELECT id, s FROM w ORDER BY id
+----
+3 active
+
+query I
+WITH ins AS (INSERT INTO w VALUES (4, NULL, 'active') ON CONFLICT (b) WHERE s = 'active' DO NOTHING RETURNING id) SELECT count(*) FROM ins
+----
+0
+
+query I
+WITH ins AS (INSERT INTO w VALUES (5, 'v', 'active') ON CONFLICT (b) WHERE s = 'active' DO NOTHING RETURNING id) SELECT count(*) FROM ins
+----
+1
+
+# --- A partitioned parent cannot carry a unique index --------------------------------------------
+
+statement ok
+CREATE TABLE pt (k INT, b TEXT) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE pt_1 PARTITION OF pt FOR VALUES FROM (0) TO (100)
+
+statement error a unique index cannot be created on partitioned table
+CREATE UNIQUE INDEX pt_b ON pt (b) NULLS NOT DISTINCT
+
+statement error a unique index cannot be created on partitioned table
+CREATE UNIQUE INDEX pt_b ON pt (b)
+
+statement ok
+CREATE INDEX pt_b ON pt (b)
+
+statement ok
+CREATE UNIQUE INDEX pt_1_b ON pt_1 (b) NULLS NOT DISTINCT
+
+statement ok
+INSERT INTO pt VALUES (1, NULL)
+
+statement error duplicate key
+INSERT INTO pt VALUES (2, NULL)
+
+# --- Only an INSERT's ON CONFLICT is read as an upsert -------------------------------------------
+
+statement ok
+CREATE TABLE conflict (a INT, s TEXT)
+
+statement ok
+CREATE INDEX ci ON conflict (a) WHERE a > 0
+
+statement ok
+CREATE UNIQUE INDEX cu ON conflict (a) WHERE s = 'x'
+
+statement ok
+INSERT INTO conflict VALUES (1, 'x'), (1, 'y')
+
+statement ok
+INSERT INTO conflict VALUES (1, 'x') ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO conflict VALUES (1, 'x') ON CONFLICT (a) WHERE s = 'x' DO NOTHING
+
+query I
+SELECT count(*) FROM conflict
+----
+2
+
+# In a procedure body too.
+statement ok
+CREATE PROCEDURE up_w(i INT) LANGUAGE sql AS $$ INSERT INTO w VALUES ($1, NULL, 'active') ON CONFLICT (b) WHERE s = 'active' DO UPDATE SET id = EXCLUDED.id $$
+
+statement ok
+CALL up_w(30)
+
+query I
+SELECT id FROM w WHERE b IS NULL
+----
+30
+
+statement ok
+CREATE PROCEDURE add_c(i INT) LANGUAGE sql AS $$ INSERT INTO conflict VALUES ($1, 'x') ON CONFLICT DO NOTHING; INSERT INTO conflict VALUES ($1, 'z') ON CONFLICT (a) WHERE s = 'x' DO NOTHING $$
+
+statement ok
+CALL add_c(2)
+
+query IT
+SELECT a, s FROM conflict ORDER BY a, s
+----
+1 x
+1 y
+2 x
+2 z

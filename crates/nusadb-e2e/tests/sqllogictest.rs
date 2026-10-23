@@ -623,6 +623,11 @@ fn slt_p1_unique_nulls_not_distinct() {
 }
 
 #[test]
+fn slt_p1_unique_index_nulls_distinct() {
+    run_slt("tests/slt/p1_ddl/unique_index_nulls_distinct.slt");
+}
+
+#[test]
 fn slt_p1_inheritance() {
     run_slt("tests/slt/p1_ddl/inheritance.slt");
 }

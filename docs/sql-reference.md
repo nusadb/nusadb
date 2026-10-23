@@ -930,6 +930,7 @@ CREATE INDEX orders_desc     ON orders (total DESC);
 CREATE INDEX IF NOT EXISTS orders_total ON orders (total) INCLUDE (customer);
 CREATE INDEX orders_btree ON orders USING btree (customer);      -- btree is the default anyway
 CREATE INDEX orders_nulls ON orders (total DESC NULLS FIRST);
+CREATE UNIQUE INDEX orders_ref ON orders (ref) NULLS NOT DISTINCT;  -- at most one NULL ref
 DROP INDEX IF EXISTS orders_desc;
 ```
 
@@ -952,6 +953,54 @@ but never used to answer a query, because the session's `TimeZone` setting chang
 (`CAST(ts AS DATE)`, `extract(hour FROM ts)`), so the key stored when a row was written need not be
 the value a later query computes. Index such a value through a stored generated column instead. A partial index keeps only the rows that satisfy its predicate,
 so it is maintained and enforces uniqueness but is never used to answer a query.
+
+#### Unique indexes and NULL keys
+
+A unique index treats NULL keys as distinct by default (`NULLS DISTINCT`): any number of rows may
+have a NULL in a key column, and only rows whose whole key is non-NULL can collide. With
+`NULLS NOT DISTINCT`, NULL counts as a value like any other, so two rows with the same key collide
+even when it holds a NULL. Combined with a `WHERE` predicate, only the rows the predicate accepts
+take part. That gives "one active row per key, where the key may be NULL":
+
+```sql
+CREATE TABLE subscriptions (id UUID PRIMARY KEY, account TEXT, state TEXT NOT NULL);
+CREATE UNIQUE INDEX subscriptions_one_active ON subscriptions (account)
+  NULLS NOT DISTINCT WHERE state = 'active';
+
+INSERT INTO subscriptions VALUES (gen_random_uuid(), NULL, 'active');
+INSERT INTO subscriptions VALUES (gen_random_uuid(), NULL, 'ended');   -- fine: not active
+INSERT INTO subscriptions VALUES (gen_random_uuid(), NULL, 'active');
+-- ERROR 23505: duplicate key violates unique index subscriptions_one_active
+
+INSERT INTO subscriptions VALUES (gen_random_uuid(), NULL, 'active')
+ON CONFLICT (account) WHERE state = 'active' DO UPDATE SET state = 'replaced';
+```
+
+- A unique index created by an earlier release allowed only one NULL per key. It now follows
+  `NULLS DISTINCT` like any other, so it accepts several NULLs. If you rely on a single NULL,
+  drop the index and recreate it with `CREATE UNIQUE INDEX ... NULLS NOT DISTINCT`.
+- `NULLS [NOT] DISTINCT` is only accepted on a `UNIQUE` index (`42601` otherwise).
+- A unique index cannot be created on a partitioned table (`0A000`), because it could not see a
+  duplicate across partitions. Declare a `UNIQUE` constraint on the partitioned table instead (it
+  must include the partition key), or create the unique index on each partition.
+- The index is checked on every write: `INSERT`, `INSERT ... SELECT`, `COPY`, `UPDATE` (including a
+  row moving into or out of the predicate), `MERGE`, both upsert arms and foreign-key cascades.
+  `CREATE UNIQUE INDEX` over existing rows refuses with `23505` when they already hold a duplicate.
+- Each writer of a key takes a key lock held to the end of its transaction, so two transactions
+  writing the same key never both commit, at any isolation level: the second one fails at once with
+  `40001` (retry it) or, when the first has already committed, with `23505`. A row that leaves a key
+  (its key changes, it leaves the predicate) keeps the key locked until its transaction ends, and a
+  row deleted by a transaction still in progress keeps its key taken, so a rollback can never
+  restore a duplicate.
+- `ON CONFLICT (cols)` infers a full unique index over exactly those columns when no `PRIMARY KEY`
+  or `UNIQUE` constraint matches. A partial unique index is inferred only from
+  `ON CONFLICT (cols) WHERE pred`, when each `AND`-ed condition of the index's predicate also appears
+  in `pred`. This works wherever the `INSERT` appears, including `PREPARE ... AS` and a
+  data-modifying `WITH`. A bare `ON CONFLICT DO NOTHING` skips a row that would collide on any
+  unique index.
+  `ON CONFLICT ON CONSTRAINT` names a constraint, not an index.
+- The setting is kept across restarts and dropped with `DROP INDEX`. `information_schema.statistics`
+  lists the index with `non_unique = 0`; the setting itself is not shown there, as for a constraint.
 
 ### Views, sequences, domains, schemas, databases
 

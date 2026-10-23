@@ -154,6 +154,7 @@ mod spill_setop;
 mod spill_sort;
 mod spill_window;
 mod trigger;
+mod unique_index;
 // Spill-to-disk subsystem: a bounded memory budget, then temp-file runs for the operators that
 // would otherwise hold their whole input.
 mod spill;
@@ -4232,7 +4233,7 @@ fn scannable_indexes_of(
         // miss rows: it is maintained (and enforces uniqueness) but not offered as a scan path. An
         // index keyed on expressions is offered; the planner uses it only for a predicate on the
         // same expression.
-        if def.predicate.is_some() {
+        if unique_index::split_predicate(&def).0.is_some() {
             continue;
         }
         out.push(crate::IndexInfo {

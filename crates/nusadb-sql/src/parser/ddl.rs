@@ -898,9 +898,18 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
             });
         },
     };
-    if ci.nulls_distinct.is_some() {
-        return unsupported("CREATE INDEX ... NULLS [NOT] DISTINCT");
-    }
+    // `NULLS [NOT] DISTINCT` decides whether NULL keys conflict, which only means something for a
+    // unique index.
+    let nulls_not_distinct = match ci.nulls_distinct {
+        None => false,
+        Some(_) if !ci.unique => {
+            return Err(Error::InvalidStatement(
+                "NULLS [NOT] DISTINCT is only allowed on a UNIQUE index".to_owned(),
+            ));
+        },
+        // sqlparser records `NULLS DISTINCT` as `true` and `NULLS NOT DISTINCT` as `false`.
+        Some(distinct) => !distinct,
+    };
     if !ci.with.is_empty() {
         return unsupported("CREATE INDEX ... WITH (...)");
     }
@@ -965,6 +974,7 @@ pub(super) fn convert_create_index(ci: sql::CreateIndex) -> Result<ast::CreateIn
         using,
         operator_class,
         unique: ci.unique,
+        nulls_not_distinct,
         if_not_exists: ci.if_not_exists,
     })
 }

@@ -148,6 +148,14 @@ pub struct OnConflict {
 pub enum ConflictTarget {
     /// `ON CONFLICT (col1, col2, ...)` — the conflicting columns.
     Columns(Vec<String>),
+    /// `ON CONFLICT (col1, ...) WHERE pred`: the conflicting columns plus an inference predicate,
+    /// which lets a partial unique index whose predicate it implies serve as the arbiter.
+    ColumnsWhere {
+        /// The conflicting columns.
+        columns: Vec<String>,
+        /// The inference predicate, as SQL text.
+        predicate: String,
+    },
     /// `ON CONFLICT ON CONSTRAINT name`.
     Constraint(String),
 }

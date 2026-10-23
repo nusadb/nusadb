@@ -1746,6 +1746,11 @@ pub enum ConflictArbiter {
     /// `ON CONFLICT (col, ...)` — the target columns' ordinals; the executor checks they form a
     /// declared `PRIMARY KEY`/`UNIQUE` key.
     Columns(Vec<usize>),
+    /// `ON CONFLICT (col, ...) WHERE pred`: the target columns' ordinals plus the inference
+    /// predicate (SQL text, type-checked against the table). The executor picks a unique index over
+    /// those columns whose own predicate the inference predicate implies (a full unique index or
+    /// key constraint over them also qualifies).
+    ColumnsWhere(Vec<usize>, String),
     /// `ON CONFLICT ON CONSTRAINT name` — a named constraint the executor looks up.
     Constraint(String),
 }

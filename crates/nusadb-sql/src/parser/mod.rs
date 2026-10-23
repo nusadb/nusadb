@@ -46,6 +46,7 @@ mod query;
 mod script;
 mod select;
 mod set_constraints;
+mod unique_index;
 use ddl::*;
 use dml::*;
 use expr::*;
@@ -800,6 +801,8 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     let mut tokens = Tokenizer::new(&dialect, sql)
         .tokenize_with_location()
         .map_err(|e| Error::Syntax(e.to_string()))?;
+    // Before any rewrite mints a marker: no user-written name may pass for one.
+    unique_index::refuse_forged_markers(&tokens)?;
     strip_cte_materialized_hint(&mut tokens);
     // `OVER ( ... EXCLUDE {CURRENT ROW|GROUP|TIES|NO OTHERS} )`: sqlparser does not parse the frame
     // `EXCLUDE` clause (its `WindowFrame` records no exclusion), so strip it here, capture the mode,
@@ -848,6 +851,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `LIKE src {INCLUDING | EXCLUDING} <option>`: sqlparser cannot parse the option list in the
     // parenthesized form, so strip it here and re-attach the collected options after parsing.
     let like_options = strip_like_including(&mut tokens)?;
+    // `ON CONFLICT (cols) WHERE pred`: sqlparser has no grammar for the inference predicate, so
+    // carry it in a marker the `ON CONFLICT` conversion takes back out.
+    unique_index::rewrite_conflict_where(&mut tokens);
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -1496,6 +1502,27 @@ pub(crate) fn is_exclusion_spec(stored: &[u8]) -> bool {
 /// `parser::exclusion`).
 pub(crate) fn tag_exclusion_spec(spec: &str) -> String {
     exclusion::tag(spec)
+}
+
+/// The predicate text a `CREATE INDEX` is cataloged with, carrying `NULLS NOT DISTINCT` behind a
+/// tag (see `parser::unique_index`).
+pub(crate) fn tag_index_predicate(
+    predicate: Option<String>,
+    nulls_not_distinct: bool,
+) -> Option<String> {
+    unique_index::tag_index_predicate(predicate, nulls_not_distinct)
+}
+
+/// A cataloged index predicate split into the partial-index predicate and whether the index is
+/// `NULLS NOT DISTINCT`.
+pub(crate) fn untag_index_predicate(stored: Option<&str>) -> (Option<&str>, bool) {
+    unique_index::untag_index_predicate(stored)
+}
+
+/// The top-level `AND` conjuncts of the boolean expression `sql`, so two spellings of one predicate
+/// compare equal.
+pub(crate) fn predicate_conjuncts(sql: &str) -> Result<Vec<ast::Expr>, Error> {
+    unique_index::predicate_conjuncts(sql)
 }
 
 /// The stored form inside an exclusion constraint's tagged catalog text; `None` for untagged text.
@@ -4203,7 +4230,9 @@ pub(super) fn embedded_tokens(sql: &str) -> Result<Vec<TokenWithSpan>, Error> {
     let mut tokens = Tokenizer::new(&NusaParserDialect, sql)
         .tokenize_with_location()
         .map_err(|e| Error::Syntax(e.to_string()))?;
+    unique_index::refuse_forged_markers(&tokens)?;
     rewrite_exclude_constraint(&mut tokens)?;
+    unique_index::rewrite_conflict_where(&mut tokens);
     Ok(tokens)
 }
 

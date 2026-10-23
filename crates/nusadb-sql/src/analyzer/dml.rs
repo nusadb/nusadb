@@ -246,6 +246,25 @@ fn resolve_conflict_target(
             }
             Ok(Some(ConflictArbiter::Columns(ordinals)))
         },
+        Some(ast::ConflictTarget::ColumnsWhere { columns, predicate }) => {
+            let mut ordinals = Vec::with_capacity(columns.len());
+            for name in &columns {
+                let (index, _) = find_column(&table.columns, name, &table.name)?;
+                ordinals.push(index);
+            }
+            // One complete expression, nothing after it.
+            crate::parser::predicate_conjuncts(&predicate)?;
+            // The inference predicate reads only the target row: a boolean over its columns.
+            let typed = super::analyze_check_predicate(&predicate, table, &IndexExprCatalog)?;
+            if typed.ty != ColumnType::Bool {
+                return Err(Error::TypeMismatch {
+                    context: "ON CONFLICT (columns) WHERE".to_owned(),
+                    expected: ColumnType::Bool,
+                    found: typed.ty,
+                });
+            }
+            Ok(Some(ConflictArbiter::ColumnsWhere(ordinals, predicate)))
+        },
         Some(ast::ConflictTarget::Constraint(name)) => Ok(Some(ConflictArbiter::Constraint(name))),
     }
 }
@@ -325,6 +344,24 @@ pub(super) fn analyze_create_index(
         })?;
     // Adding an index restructures the table — the owner's right, like ALTER and DROP.
     super::dcl::require_table_ownership(catalog, &table, "create an index on")?;
+    // A unique index lives on one table, and a partitioned parent holds no rows of its own, so it
+    // could not see a duplicate across partitions. Refuse it rather than accept an index that never
+    // rejects anything.
+    if ci.unique
+        && catalog
+            .partition_key_columns(&super::qualified_display(&table.schema, &table.name))?
+            .is_some()
+    {
+        return Err(Error::Coded {
+            message: format!(
+                "a unique index cannot be created on partitioned table \"{}\"; declare a UNIQUE \
+                 constraint on it (which must include the partition key) or create the unique \
+                 index on each partition",
+                table.name
+            ),
+            sqlstate: "0A000",
+        });
+    }
     // Every plain key column and every INCLUDE column must exist (find_column reports
     // ColumnNotFound). Expression keys are validated below by type-checking them against the table.
     for column in ci.columns.iter().chain(&ci.include) {
@@ -398,7 +435,12 @@ pub(super) fn analyze_create_index(
             table: table.id,
             columns: ci.columns,
             key_exprs: ci.key_exprs,
-            predicate: ci.predicate,
+            // `NULLS NOT DISTINCT` rides in the stored predicate (the index catalog has no field
+            // for it); see `parser::tag_index_predicate`.
+            predicate: crate::parser::tag_index_predicate(
+                ci.predicate,
+                ci.unique && ci.nulls_not_distinct,
+            ),
             include: ci.include,
             kind,
             unique: ci.unique,

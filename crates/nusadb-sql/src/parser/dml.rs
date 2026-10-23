@@ -104,9 +104,14 @@ pub(super) fn convert_on_insert(
     };
     let target = match conflict.conflict_target {
         None => None,
-        Some(sql::ConflictTarget::Columns(cols)) => Some(ast::ConflictTarget::Columns(
-            cols.iter().map(fold_ident).collect(),
-        )),
+        Some(sql::ConflictTarget::Columns(mut cols)) => {
+            let predicate = super::unique_index::take_conflict_where(&mut cols);
+            let columns = cols.iter().map(fold_ident).collect();
+            Some(match predicate {
+                Some(predicate) => ast::ConflictTarget::ColumnsWhere { columns, predicate },
+                None => ast::ConflictTarget::Columns(columns),
+            })
+        },
         Some(sql::ConflictTarget::OnConstraint(name)) => {
             Some(ast::ConflictTarget::Constraint(object_name(&name)?))
         },

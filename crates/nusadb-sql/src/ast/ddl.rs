@@ -1223,8 +1223,9 @@ pub enum ReferentialAction {
 /// Supports plain-column keys, **functional/expression** keys (`(lower(s))`, `((a + b))`, in
 /// `key_exprs`), and a **partial-index** `WHERE` predicate. Per-column `ASC`/`DESC` are accepted as
 /// no-ops: the B-tree is built ascending and the planner serves a descending `ORDER BY` by scanning
-/// it backward, so the direction changes no result. Per-column `NULLS FIRST`/`NULLS LAST`, `WITH
-/// (...)`, `NULLS DISTINCT`, `CONCURRENTLY`, and operator classes are rejected. `USING <method>` is
+/// it backward, so the direction changes no result. A `UNIQUE` index may say `NULLS [NOT] DISTINCT`.
+/// Per-column `NULLS FIRST`/`NULLS LAST`, `WITH (...)`, `CONCURRENTLY`, and operator classes are
+/// rejected. `USING <method>` is
 /// accepted only for the `hnsw` vector access method. An anonymous index (no name) is rejected —
 /// names are required so the downstream catalog has a stable handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1259,6 +1260,9 @@ pub struct CreateIndex {
     pub operator_class: Option<String>,
     /// Whether `UNIQUE` was specified.
     pub unique: bool,
+    /// `UNIQUE ... NULLS NOT DISTINCT`: NULL key values count as equal, so at most one row may hold
+    /// a NULL key. `false` is the default `NULLS DISTINCT`, under which NULL keys never conflict.
+    pub nulls_not_distinct: bool,
     /// Whether `IF NOT EXISTS` was specified.
     pub if_not_exists: bool,
 }

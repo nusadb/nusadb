@@ -192,9 +192,8 @@ fn index_names_column(def: &IndexDef, column: &str) -> bool {
             .key_exprs
             .iter()
             .any(|e| crate::parser::sql_references_column(e, column))
-        || def
-            .predicate
-            .as_deref()
+        || super::unique_index::split_predicate(def)
+            .0
             .is_some_and(|p| crate::parser::sql_references_column(p, column))
 }
 
@@ -426,7 +425,9 @@ fn backfill_named_index(
         return Ok(());
     };
     if let Some(target) = dml::build_index_target(id, table, &def) {
-        dml::backfill_index(&target, table, engine, txn)?;
+        let backing = super::unique_index::backing_index_ids(table, engine)?;
+        let guard = super::unique_index::guard_for(&def, id, table, &backing);
+        dml::backfill_index(&target.with_guard(guard), table, engine, txn)?;
     }
     Ok(())
 }
@@ -468,11 +469,13 @@ pub(super) fn reattach_after_rename(
             .iter()
             .map(|e| crate::parser::rename_column_in_sql(e, from, to))
             .collect::<Result<_, _>>()?;
-        def.predicate = def
-            .predicate
-            .as_deref()
-            .map(|p| crate::parser::rename_column_in_sql(p, from, to))
-            .transpose()?;
+        let (predicate, nulls_not_distinct) = super::unique_index::split_predicate(&def);
+        def.predicate = crate::parser::tag_index_predicate(
+            predicate
+                .map(|p| crate::parser::rename_column_in_sql(p, from, to))
+                .transpose()?,
+            nulls_not_distinct,
+        );
         engine.create_index(txn, &def)?;
         backfill_named_index(&renamed, &def.name, engine, txn)?;
     }

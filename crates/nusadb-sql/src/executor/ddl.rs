@@ -2314,6 +2314,13 @@ pub(super) fn run_create_index(
         dml::schema_by_id(engine, txn, plan.def.table)?,
     ) && let Some(target) = dml::build_index_target(id, &table, &plan.def)
     {
+        // A new index backs no constraint: a unique one is guarded like on any later write.
+        let target = target.with_guard(super::unique_index::guard_for(
+            &plan.def,
+            id,
+            &table,
+            &std::collections::HashSet::new(),
+        ));
         // Backfill through the same maintenance path DML writes take (a functional/expression key
         // is evaluated and a partial predicate skips non-matching rows exactly as on later inserts).
         // The build streams the table and applies key-sorted entries — via an external merge sort
