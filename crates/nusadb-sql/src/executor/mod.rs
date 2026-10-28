@@ -147,6 +147,7 @@ pub mod deferred;
 mod dml;
 mod dml_join;
 mod exclusion;
+mod fk_set_columns;
 mod function;
 mod global_unique;
 mod index_key;

@@ -622,6 +622,7 @@ fn propagate_parent_foreign_keys(
             &fk.name,
         );
         let (deferral, origin) = super::deferred::declared(engine, txn, parent.id, &fk.name)?;
+        let fk_name = fk.name.clone();
         engine.add_foreign_key(
             txn,
             &nusadb_core::ForeignKeyDef {
@@ -639,6 +640,7 @@ fn propagate_parent_foreign_keys(
             Some(&origin),
             deferral,
         )?;
+        super::fk_set_columns::copy(engine, txn, &fk_name, &renamed)?;
         if validate {
             let schema = engine
                 .lookup_table_as_of_in(txn, &def.schema, &def.name)?
@@ -1884,6 +1886,7 @@ pub(super) fn register_foreign_key(
         None,
         fk.deferral,
     )?;
+    super::fk_set_columns::declare(engine, txn, &fk.name, &fk.on_delete_set_columns)?;
     Ok(())
 }
 
@@ -1943,6 +1946,7 @@ pub(super) fn run_drop_table(
                     if plan.cascade {
                         engine.drop_constraint(txn, fk.child_table, &fk.name)?;
                         super::deferred::forget_constraint(engine, txn, fk.child_table, &fk.name)?;
+                        super::fk_set_columns::forget(engine, txn, &fk.name)?;
                         if let Some(child) = engine.lookup_table_by_id_as_of(txn, fk.child_table)? {
                             super::comment::forget(
                                 engine,
@@ -1969,6 +1973,7 @@ pub(super) fn run_drop_table(
             for fk in &table_fks {
                 if fk.child_table == schema.id {
                     engine.drop_constraint(txn, schema.id, &fk.name)?;
+                    super::fk_set_columns::forget(engine, txn, &fk.name)?;
                 }
             }
             // Drop the table's indexes and constraints so the global index/constraint namespace is
@@ -2670,9 +2675,11 @@ pub(super) fn run_alter_table(
             refuse_dropping_inherited_constraint(table, &name, engine, txn)?;
             for (copy_table, copy) in partition_copies(table, &name, engine, txn)? {
                 super::deferred::forget_constraint(engine, txn, copy_table, &copy)?;
+                super::fk_set_columns::forget(engine, txn, &copy)?;
             }
             drop_partition_copies(table, &name, engine, txn)?;
             super::deferred::forget_constraint(engine, txn, table, &name)?;
+            super::fk_set_columns::forget(engine, txn, &name)?;
             // An exclusion constraint's backing index goes with it.
             let exclusion_spec = engine
                 .list_constraints_as_of(txn, table)?

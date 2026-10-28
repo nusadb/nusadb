@@ -4091,7 +4091,19 @@ pub(super) fn enforce_check_on_write(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(), Error> {
-    let checks: Vec<(String, crate::planner::TypedExpr)> = engine
+    let checks = compile_checks(table, engine, txn)?;
+    enforce_compiled_checks(&checks, table, rows)
+}
+
+/// The `CHECK` constraints of `table`, each with its predicate analyzed against the table's
+/// columns, for [`enforce_compiled_checks`]: a write path that checks rows one at a time compiles
+/// them once.
+pub(super) fn compile_checks(
+    table: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(String, crate::planner::TypedExpr)>, Error> {
+    engine
         .list_constraints_as_of(txn, table.id)?
         .into_iter()
         .filter(|c| {
@@ -4114,12 +4126,17 @@ pub(super) fn enforce_check_on_write(
             let typed = crate::analyzer::analyze_check_predicate(&sql, table, &EmptyCatalog)?;
             Ok::<_, Error>((c.name, typed))
         })
-        .collect::<Result<_, _>>()?;
-    if checks.is_empty() {
-        return Ok(());
-    }
+        .collect()
+}
+
+/// [`enforce_check_on_write`] with the checks [`compile_checks`] returned.
+pub(super) fn enforce_compiled_checks(
+    checks: &[(String, crate::planner::TypedExpr)],
+    table: &TableSchema,
+    rows: &[Row],
+) -> Result<(), Error> {
     for row in rows {
-        for (name, predicate) in &checks {
+        for (name, predicate) in checks {
             if matches!(eval::eval(predicate, row)?, ast::Value::Bool(false)) {
                 return Err(nusadb_core::Error::ConstraintViolation(format!(
                     "new row for \"{}\" violates check constraint \"{}\"",
@@ -4265,6 +4282,7 @@ fn cascade_update_children(
     // through their new versions (this transaction's own writes), so two rewritten rows that come
     // to conflict are caught too.
     let exclusions = super::exclusion::load(child, engine, txn)?;
+    let checks = compile_checks(child, engine, txn)?;
     let rewritten: HashSet<Tid> = changes.iter().map(|(tid, _, _)| *tid).collect();
     // Each rewritten row at its new address, for the child's own foreign keys below.
     let mut written: Vec<(Tid, Row, Row)> = Vec::with_capacity(changes.len());
@@ -4279,19 +4297,19 @@ fn cascade_update_children(
         enforce_not_null(child, std::iter::once(&new))?;
         if let Some(computed) = computed
             && computed != new
+            && keys.iter().any(|&i| computed.get(i) != new.get(i))
         {
-            if keys.iter().any(|&i| computed.get(i) != new.get(i)) {
-                return Err(Error::Coded {
-                    message: format!(
-                        "a BEFORE trigger on \"{}\" changed a key of a row a referential action \
-                         writes",
-                        child.name
-                    ),
-                    sqlstate: "27000",
-                });
-            }
-            enforce_check_on_write(child, std::slice::from_ref(&new), engine, txn)?;
+            return Err(Error::Coded {
+                message: format!(
+                    "a BEFORE trigger on \"{}\" changed a key of a row a referential action \
+                     writes",
+                    child.name
+                ),
+                sqlstate: "27000",
+            });
         }
+        // The action's new values (and a trigger's) must satisfy the child's CHECK constraints.
+        enforce_compiled_checks(&checks, child, std::slice::from_ref(&new))?;
         super::exclusion::enforce_compiled(
             &exclusions,
             child,
@@ -4587,16 +4605,22 @@ impl DeleteWalk {
                     cascades.push((child, referencing));
                 },
                 nusadb_core::FkAction::SetNull => {
+                    // `SET NULL (cols)` sets only the listed columns.
+                    let null_ordinals = super::fk_set_columns::set_null_ordinals(
+                        &fk,
+                        &child_ordinals,
+                        engine,
+                        txn,
+                    )?;
                     for (tid, row) in referencing {
                         let key = (child.id, tid);
                         if let Some(&at) = self.null_index.get(&key) {
                             if let Some((_, _, _, columns)) = self.nulls.get_mut(at) {
-                                columns.extend(&child_ordinals);
+                                columns.extend(&null_ordinals);
                             }
                         } else {
                             self.null_index.insert(key, self.nulls.len());
-                            self.nulls
-                                .push((child.id, tid, row, child_ordinals.clone()));
+                            self.nulls.push((child.id, tid, row, null_ordinals.clone()));
                         }
                     }
                     self.null_tables.entry(child.id).or_insert(child);

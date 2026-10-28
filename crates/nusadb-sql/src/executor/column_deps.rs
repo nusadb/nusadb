@@ -275,6 +275,7 @@ pub(super) fn drop_column_dependents(
     }
     for fk in &referencing {
         engine.drop_constraint(txn, fk.child_table, &fk.name)?;
+        super::fk_set_columns::forget(engine, txn, &fk.name)?;
     }
     for dep in &text {
         match (dep.kind, &dep.on) {
@@ -298,6 +299,7 @@ pub(super) fn drop_column_dependents(
     }
     for fk in fks.iter().filter(|fk| own_fk(fk)) {
         engine.drop_constraint(txn, table.id, &fk.name)?;
+        super::fk_set_columns::forget(engine, txn, &fk.name)?;
     }
     // Secondary indexes before constraints: the set of backing indexes is read while every
     // remaining constraint still has its own.
@@ -492,6 +494,7 @@ pub(super) fn reattach_after_rename(
     for mut fk in detached.fks {
         if fk.child_table == table.id {
             fk.child_columns = rename(&fk.child_columns);
+            super::fk_set_columns::rename_column(engine, txn, &fk.name, from, to)?;
         }
         if fk.parent_table == table.id {
             fk.parent_columns = rename(&fk.parent_columns);

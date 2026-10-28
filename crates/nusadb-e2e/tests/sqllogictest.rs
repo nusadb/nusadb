@@ -1291,3 +1291,8 @@ fn slt_p10_datetime_overflow() {
 fn slt_p1_add_column_generated() {
     run_slt("tests/slt/p1_ddl/add_column_generated.slt");
 }
+
+#[test]
+fn slt_p1_fk_set_null_columns() {
+    run_slt("tests/slt/p1_ddl/fk_set_null_columns.slt");
+}

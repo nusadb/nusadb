@@ -42,6 +42,7 @@ mod ddl;
 mod dml;
 mod exclusion;
 mod expr;
+mod fk_set_columns;
 mod query;
 mod script;
 mod select;
@@ -803,6 +804,7 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
         .map_err(|e| Error::Syntax(e.to_string()))?;
     // Before any rewrite mints a marker: no user-written name may pass for one.
     unique_index::refuse_forged_markers(&tokens)?;
+    fk_set_columns::refuse_forged_marker(&tokens)?;
     strip_cte_materialized_hint(&mut tokens);
     // `OVER ( ... EXCLUDE {CURRENT ROW|GROUP|TIES|NO OTHERS} )`: sqlparser does not parse the frame
     // `EXCLUDE` clause (its `WindowFrame` records no exclusion), so strip it here, capture the mode,
@@ -854,6 +856,9 @@ pub fn parse(sql: &str) -> Result<ast::Statement, Error> {
     // `ON CONFLICT (cols) WHERE pred`: sqlparser has no grammar for the inference predicate, so
     // carry it in a marker the `ON CONFLICT` conversion takes back out.
     unique_index::rewrite_conflict_where(&mut tokens);
+    // `ON DELETE SET NULL (cols)`: sqlparser has no grammar for the column list, so carry it in a
+    // marker inside the referenced column list the foreign key conversion splits back out.
+    fk_set_columns::rewrite_set_columns(&mut tokens)?;
     let mut statements = Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
@@ -4297,8 +4302,10 @@ pub(super) fn embedded_tokens(sql: &str) -> Result<Vec<TokenWithSpan>, Error> {
         .tokenize_with_location()
         .map_err(|e| Error::Syntax(e.to_string()))?;
     unique_index::refuse_forged_markers(&tokens)?;
+    fk_set_columns::refuse_forged_marker(&tokens)?;
     rewrite_exclude_constraint(&mut tokens)?;
     unique_index::rewrite_conflict_where(&mut tokens);
+    fk_set_columns::rewrite_set_columns(&mut tokens)?;
     Ok(tokens)
 }
 

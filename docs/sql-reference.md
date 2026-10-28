@@ -525,6 +525,37 @@ INSERT INTO nnd (a) VALUES (NULL);
 `UNIQUE NULLS NOT DISTINCT` treats NULL keys as equal, so at most one NULL row exists per key; it
 also works through `ALTER TABLE ... ADD`.
 
+`ON DELETE SET NULL` may name the referencing columns it sets. The other columns of the key keep
+their values, which suits a composite key that pairs a tenant column with a row id:
+
+```sql
+CREATE TABLE dept (org INT NOT NULL, d_id INT NOT NULL, name TEXT NOT NULL,
+  PRIMARY KEY (d_id), UNIQUE (org, d_id, name));
+CREATE TABLE vendor (v_id INT PRIMARY KEY, org INT NOT NULL, d_id INT, name TEXT,
+  CONSTRAINT vendor_dept_fkey FOREIGN KEY (org, d_id, name)
+    REFERENCES dept (org, d_id, name) ON DELETE SET NULL (d_id));
+DELETE FROM dept WHERE d_id = 1;
+-- each vendor of department 1 keeps org and name; only d_id becomes NULL
+```
+
+The list works at column level (`d_id INT REFERENCES dept ON DELETE SET NULL (d_id)`), at table
+level and in `ALTER TABLE ... ADD CONSTRAINT`. Every listed column must be one of the key's
+referencing columns (`42P10` otherwise, `42703` for a column the table lacks, `42701` for one named
+twice). A column list is accepted on `ON DELETE` only; on `ON UPDATE` it is refused with `0A000`,
+because setting part of a changed key would leave the rest pointing at a key that is gone. The
+`SET DEFAULT (cols)` form is refused with `0A000` as well. A listed `NOT NULL` column fails the
+delete with `23502`. The rewritten rows must satisfy the table's `CHECK` constraints and its unique
+keys, including `UNIQUE NULLS NOT DISTINCT` constraints and unique indexes (`23505`, or at commit
+for a deferred key), its row triggers fire, a partitioned table's partitions all follow the list,
+and foreign keys that reference the rewritten columns run their `ON UPDATE` actions. A child left
+with a NULL in its key references nothing, as with plain `SET NULL`.
+`information_schema.referential_constraints.delete_rule` reports `SET NULL`. The list is kept
+across restarts, follows a `RENAME COLUMN`, and goes with the key when one of its columns is
+dropped.
+
+`ON DELETE SET DEFAULT` and `ON UPDATE SET DEFAULT` are accepted in a definition, but a delete or
+update that would run them is refused (`0A000`).
+
 ### Exclusion constraints
 
 An `EXCLUDE` constraint says that no two rows may have every listed operator hold between them.

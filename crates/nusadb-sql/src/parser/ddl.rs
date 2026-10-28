@@ -396,12 +396,15 @@ pub(super) fn convert_column_def(
                 if fk.match_kind.is_some() {
                     return unsupported("REFERENCES ... MATCH FULL/PARTIAL/SIMPLE");
                 }
+                let (referred_columns, on_delete_set_columns) =
+                    super::fk_set_columns::split_referred_columns(&fk.referred_columns);
                 lifted.push(ast::TableConstraint::ForeignKey {
                     name: constraint_name,
                     columns: vec![name.clone()],
                     foreign_table: referenced_table_name(&fk.foreign_table)?,
-                    referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
+                    referred_columns,
                     on_delete: fk.on_delete.map(convert_referential_action),
+                    on_delete_set_columns,
                     on_update: fk.on_update.map(convert_referential_action),
                     deferral,
                 });
@@ -1582,12 +1585,15 @@ pub(super) fn convert_table_constraint(
                 return unsupported("FOREIGN KEY ... MATCH FULL/PARTIAL/SIMPLE");
             }
             let deferral = convert_characteristics(fk.characteristics.as_ref())?;
+            let (referred_columns, on_delete_set_columns) =
+                super::fk_set_columns::split_referred_columns(&fk.referred_columns);
             Ok(ast::TableConstraint::ForeignKey {
                 name: fk.name.as_ref().map(fold_ident),
                 columns: fk.columns.iter().map(fold_ident).collect(),
                 foreign_table: referenced_table_name(&fk.foreign_table)?,
-                referred_columns: fk.referred_columns.iter().map(fold_ident).collect(),
+                referred_columns,
                 on_delete: fk.on_delete.map(convert_referential_action),
+                on_delete_set_columns,
                 on_update: fk.on_update.map(convert_referential_action),
                 deferral,
             })

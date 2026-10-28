@@ -723,6 +723,7 @@ fn resolve_foreign_keys(
             foreign_table,
             referred_columns,
             on_delete,
+            on_delete_set_columns,
             on_update,
             deferral,
         } = constraint
@@ -737,6 +738,13 @@ fn resolve_foreign_keys(
                 });
             }
         }
+        let set_columns = validate_set_columns(
+            &ct.name,
+            &|name| ct.columns.iter().any(|c| c.name == name),
+            columns,
+            *on_delete,
+            on_delete_set_columns,
+        )?;
         seq += 1;
         specs.push(ForeignKeySpec {
             name: name
@@ -746,11 +754,61 @@ fn resolve_foreign_keys(
             parent_table: foreign_table.clone(),
             referred_columns: referred_columns.clone(),
             on_delete: referential_action(*on_delete),
+            on_delete_set_columns: set_columns,
             on_update: referential_action(*on_update),
             deferral: *deferral,
         });
     }
     Ok(specs)
+}
+
+/// Validate the column list of an `ON DELETE SET NULL (cols)` action: every column must exist on
+/// the table (`42703`), be one of the foreign key's referencing `columns` (`42P10`) and be named
+/// once (`42701`). The list goes with `SET NULL` only: `ON DELETE SET DEFAULT (cols)` is refused
+/// (`0A000`) like the plain `SET DEFAULT` action's delete. Returns the list, empty for none.
+fn validate_set_columns(
+    table: &str,
+    exists: &dyn Fn(&str) -> bool,
+    columns: &[String],
+    on_delete: Option<ast::ReferentialAction>,
+    set_columns: &[String],
+) -> Result<Vec<String>, Error> {
+    if set_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    if on_delete == Some(ast::ReferentialAction::SetDefault) {
+        return Err(Error::Coded {
+            message: "ON DELETE SET DEFAULT with a column list is not supported (ON DELETE SET \
+                      DEFAULT is not supported yet); use ON DELETE SET NULL (columns)"
+                .to_owned(),
+            sqlstate: "0A000",
+        });
+    }
+    let mut seen: Vec<&String> = Vec::with_capacity(set_columns.len());
+    for column in set_columns {
+        if !exists(column) {
+            return Err(Error::ColumnNotFound {
+                table: table.to_owned(),
+                column: column.clone(),
+            });
+        }
+        if !columns.contains(column) {
+            return Err(Error::Coded {
+                message: format!(
+                    "column \"{column}\" referenced in ON DELETE SET action must be part of the \
+                     foreign key"
+                ),
+                sqlstate: "42P10",
+            });
+        }
+        if seen.contains(&column) {
+            return Err(Error::DuplicateColumn {
+                name: column.clone(),
+            });
+        }
+        seen.push(column);
+    }
+    Ok(set_columns.to_vec())
 }
 
 /// Map a parsed [`ast::ReferentialAction`] (or its absence) to the engine's [`FkAction`]. An
@@ -1324,6 +1382,7 @@ fn analyze_add_column_with_constraints(
                 foreign_table,
                 referred_columns,
                 on_delete,
+                on_delete_set_columns,
                 on_update,
                 deferral,
             } => ast::TableConstraint::ForeignKey {
@@ -1332,6 +1391,7 @@ fn analyze_add_column_with_constraints(
                 foreign_table,
                 referred_columns,
                 on_delete,
+                on_delete_set_columns,
                 on_update,
                 deferral,
             },
@@ -1382,18 +1442,27 @@ fn analyze_add_constraint(
             foreign_table,
             referred_columns,
             on_delete,
+            on_delete_set_columns,
             on_update,
             deferral,
         } => {
             for column in &columns {
                 find_column(&table.columns, column, &name_base)?;
             }
+            let set_columns = validate_set_columns(
+                &name_base,
+                &|name| table.columns.iter().any(|c| c.name == name),
+                &columns,
+                on_delete,
+                &on_delete_set_columns,
+            )?;
             let fk = ForeignKeySpec {
                 name: name.unwrap_or_else(|| format!("{name_base}_fkey")),
                 columns,
                 parent_table: foreign_table,
                 referred_columns,
                 on_delete: referential_action(on_delete),
+                on_delete_set_columns: set_columns,
                 on_update: referential_action(on_update),
                 deferral,
             };

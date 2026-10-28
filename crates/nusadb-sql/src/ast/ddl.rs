@@ -1075,7 +1075,7 @@ pub enum TableConstraint {
         deferral: Deferral,
     },
     /// `[CONSTRAINT name] FOREIGN KEY (columns) REFERENCES table (referred)
-    /// [ON DELETE action] [ON UPDATE action]`.
+    /// [ON DELETE action [(set columns)]] [ON UPDATE action]`.
     ForeignKey {
         /// Optional constraint name.
         name: Option<String>,
@@ -1088,6 +1088,10 @@ pub enum TableConstraint {
         referred_columns: Vec<String>,
         /// `ON DELETE` action, if specified.
         on_delete: Option<ReferentialAction>,
+        /// The column list of `ON DELETE SET NULL (cols)` / `ON DELETE SET DEFAULT (cols)`: the
+        /// referencing columns the action sets. Empty means every referencing column (the plain
+        /// form, and every other action).
+        on_delete_set_columns: Vec<String>,
         /// `ON UPDATE` action, if specified.
         on_update: Option<ReferentialAction>,
         /// `[NOT] DEFERRABLE [INITIALLY ...]`.

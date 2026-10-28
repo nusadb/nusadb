@@ -1417,6 +1417,9 @@ pub struct ForeignKeySpec {
     pub referred_columns: Vec<String>,
     /// Action when a referenced parent row is deleted.
     pub on_delete: nusadb_core::FkAction,
+    /// The referencing columns an `ON DELETE SET NULL (cols)` action sets, validated to be a
+    /// subset of [`columns`](Self::columns). Empty means every referencing column.
+    pub on_delete_set_columns: Vec<String>,
     /// Action when a referenced parent key is updated.
     pub on_update: nusadb_core::FkAction,
     /// When the constraint is checked.
