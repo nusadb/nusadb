@@ -2404,14 +2404,10 @@ fn recognize_vacuum(sql: &str) -> Option<ast::Statement> {
 }
 
 /// Recognize `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } [CONCURRENTLY] name` (with an
-/// optional leading `( ... )` option list) and accept it as a no-op. sqlparser does not model
-/// `REINDEX` as a statement, so — like `VACUUM` — it is recognized here before the generic parser.
-///
-/// NusaDB's clustered B-tree indexes are always consistent (MVCC + background purge), so there is
-/// nothing to rebuild; accepting the command rather than rejecting it keeps the migration tools and
-/// ORM health-checks that emit `REINDEX` working. Requires a non-empty target after the keyword so a
-/// bare `REINDEX` or a glued token like `reindexes` is not mistaken for it (those fall through to the
-/// generic parser, which rejects them).
+/// optional leading `( ... )` option list). sqlparser does not model `REINDEX` as a statement, so,
+/// like `VACUUM`, it is recognized here before the generic parser. Requires a target after the
+/// keyword so a bare `REINDEX` or a glued token like `reindexes` is not mistaken for it (those fall
+/// through to the generic parser, which rejects them); a name may be schema-qualified and quoted.
 fn recognize_reindex(sql: &str) -> Option<ast::Statement> {
     let trimmed = sql.trim().trim_end_matches(';');
     let after = trimmed
@@ -2422,7 +2418,77 @@ fn recognize_reindex(sql: &str) -> Option<ast::Statement> {
     if !(after.starts_with(' ') || after.starts_with('(')) || after.trim().is_empty() {
         return None;
     }
-    Some(ast::Statement::Reindex)
+    let mut rest = after.trim_start();
+    // A leading `( option, ... )` list.
+    if let Some(inner) = rest.strip_prefix('(') {
+        let close = inner.find(')')?;
+        rest = inner.get(close + 1..)?.trim_start();
+    }
+    let (kind, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let mut tail = tail.trim();
+    if let Some(after_concurrently) = tail
+        .get(..12)
+        .filter(|w| w.eq_ignore_ascii_case("concurrently"))
+        .and_then(|_| tail.get(12..))
+        && (after_concurrently.is_empty() || after_concurrently.starts_with(char::is_whitespace))
+    {
+        tail = after_concurrently.trim();
+    }
+    let target = if kind.eq_ignore_ascii_case("index") {
+        let (schema, name) = reindex_name(tail)?;
+        ast::ReindexTarget::Index { schema, name }
+    } else if kind.eq_ignore_ascii_case("table") {
+        let (schema, name) = reindex_name(tail)?;
+        ast::ReindexTarget::Table { schema, name }
+    } else if kind.eq_ignore_ascii_case("schema") {
+        let (None, name) = reindex_name(tail)? else {
+            return None;
+        };
+        ast::ReindexTarget::Schema(name)
+    } else if kind.eq_ignore_ascii_case("database") || kind.eq_ignore_ascii_case("system") {
+        if tail.is_empty() {
+            ast::ReindexTarget::Database(None)
+        } else {
+            let (None, name) = reindex_name(tail)? else {
+                return None;
+            };
+            ast::ReindexTarget::Database(Some(name))
+        }
+    } else {
+        return None;
+    };
+    Some(ast::Statement::Reindex(target))
+}
+
+/// A `REINDEX` target name, `[schema.]name`, each part optionally double-quoted (a quoted part
+/// keeps its case and may hold a dot; an unquoted one is folded to lower case).
+fn reindex_name(text: &str) -> Option<(Option<String>, String)> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            },
+            '"' => quoted = !quoted,
+            '.' if !quoted => parts.push(std::mem::take(&mut current)),
+            c if c.is_whitespace() && !quoted => return None,
+            c if quoted => current.push(c),
+            c => current.push(c.to_ascii_lowercase()),
+        }
+    }
+    if quoted || current.is_empty() {
+        return None;
+    }
+    parts.push(current);
+    match parts.as_slice() {
+        [name] => Some((None, name.clone())),
+        [schema, name] => Some((Some(schema.clone()), name.clone())),
+        _ => None,
+    }
 }
 
 /// Recognize `CLUSTER [VERBOSE] [table [USING index]]` (all forms, incl. the bare recluster-all) and

@@ -503,8 +503,17 @@ copy, so the table simply keeps full durability — queries behave identically.
 
 Constraints available: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY ... REFERENCES`
 with `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT`, `NO ACTION`; each
-can be written at column or table level. Generated columns are `STORED`. A unique form that
-treats NULLs as equal:
+can be written at column or table level. A `PRIMARY KEY` makes its columns `NOT NULL`, whether
+declared with the column, as a table constraint, or added later with `ALTER TABLE ... ADD`
+(which refuses the key while a row holds a NULL in one of them, on a partitioned table in any of
+its partitions); the columns stay `NOT NULL` after the key is dropped, until `ALTER COLUMN ...
+DROP NOT NULL`. A `CHAR(n)` value is stored without its trailing blanks, so as a key `'x'` and
+`'x  '` are the same value on every write path (`INSERT`, `COPY`, `UPDATE`, `MERGE`, upserts and
+the rows a foreign key action rewrites), including against keys written by earlier releases (see
+[Indexes over CHAR columns from earlier releases](#indexes-over-char-columns-from-earlier-releases)).
+`CHECK` constraints, generated columns, triggers and `RETURNING` see the stored value, without
+the blanks.
+Generated columns are `STORED`. A unique form that treats NULLs as equal:
 
 ```sql
 CREATE TABLE nnd (a INT, b TEXT, UNIQUE NULLS NOT DISTINCT (a));
@@ -743,22 +752,89 @@ Worth knowing:
 - `DROP TABLE` on the parent drops the whole partition tree with it.
 - Parent and partitions may live in different schemas; qualified names work everywhere.
 
-A partitioned parent may declare a `PRIMARY KEY` / `UNIQUE` constraint when it includes every
-partition-key column (equal keys always route to the same partition, so per-partition enforcement
-is globally sound); each partition inherits it at `CREATE TABLE ... PARTITION OF` and at
-`ATTACH PARTITION` (existing rows are validated first, and a nullable primary-key column in the
-attached table is refused). With that in place, `INSERT ... ON CONFLICT` works on the parent:
-rows route to their partition first, then the upsert action runs against that leaf. A `DO UPDATE`
-that would move the row out of its partition is refused; a plain `UPDATE` through the parent
-moves it (see the partitioning section).
+A partitioned parent may declare a `PRIMARY KEY` / `UNIQUE` constraint. Each partition inherits it
+at `CREATE TABLE ... PARTITION OF` and at `ATTACH PARTITION` (existing rows are validated first,
+and a nullable primary-key column in the attached table is refused). When the key includes every
+partition-key column, equal keys always route to the same partition and each partition's copy
+enforces it alone. `INSERT ... ON CONFLICT` works on the parent: rows route to their partition
+first, then the upsert action runs against that leaf. A `DO UPDATE` that would move the row out of
+its partition is refused; a plain `UPDATE` through the parent moves it (see the partitioning
+section).
+
+#### Keys across partitions
+
+A key that leaves out a partition-key column (or any key of a table partitioned by an expression)
+is accepted too, and enforced across every partition below the table: no two rows of any of its
+partitions may share the key. Creating such a key raises a notice, because of what it costs: every
+write of the key looks it up in every partition.
+
+```sql
+CREATE TABLE events (
+  id         UUID PRIMARY KEY,
+  created_at TIMESTAMP NOT NULL,
+  payload    TEXT
+) PARTITION BY RANGE (created_at);
+-- NOTICE: unique constraint "events_pkey" on partitioned table "events" does not include every
+--         partitioning column, so it is enforced across all of its partitions: every write of
+--         its key probes every partition
+CREATE TABLE events_2026_01 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE events_2026_02 PARTITION OF events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+INSERT INTO events VALUES ('6f1c8a52-0d0e-4d33-9a51-1f6b2a0c9e11', '2026-01-05', 'a');
+INSERT INTO events VALUES ('6f1c8a52-0d0e-4d33-9a51-1f6b2a0c9e11', '2026-02-05', 'b');
+-- ERROR 23505: duplicate key violates primary key constraint "events_pkey" on (id)
+```
+
+- Every way of writing a row is checked: `INSERT` through the parent or into a partition,
+  `INSERT ... SELECT`, `COPY`, `MERGE` into a partition, an `UPDATE` that changes the key or moves
+  the row to another partition, a foreign key's `ON UPDATE CASCADE` or `ON DELETE SET NULL` that
+  rewrites the key, and statements inside functions, procedures and triggers.
+- The check runs when the statement ends, so one statement may move keys between partitions: an
+  `UPDATE` that swaps two keys held in different partitions succeeds when the result is valid. A
+  statement inside a function or procedure is checked when it ends, so an `EXCEPTION` block catches
+  the error.
+- `ON CONFLICT DO NOTHING` skips a row whose key another partition holds. `ON CONFLICT (key) DO
+  UPDATE` on such a key updates the conflicting row in the partition that holds it, through the
+  parent or when the statement names a partition. The key columns must be written by the statement
+  for the conflict to be found there; a key filled by a default is checked like a plain insert.
+  A conflicting row the statement's snapshot cannot see (one committed after the snapshot, which
+  under `REPEATABLE READ` and `SERIALIZABLE` is the transaction's) is never updated: the statement
+  fails, with `23505` when that row sits in the partition the new row routes to, exactly as on a
+  table that is not partitioned, and with `40001` when it sits in another partition. Either way
+  the statement can be retried.
+- `ALTER TABLE ... ADD` such a key checks the rows of all partitions together. `ATTACH PARTITION`
+  checks the attached table's keys against the other partitions (and fails with `40001` while
+  another transaction is writing one of them). `DETACH PARTITION` needs no check: the detached
+  table keeps its own copy of the key.
+- Sub-partitioned tables are covered: a key that includes the top-level partition key but not the
+  key of a partition that is itself partitioned is enforced across that partition's partitions.
+- `DEFERRABLE` works as for any key (see [Deferrable constraints](#deferrable-constraints)): a
+  deferred key is checked across the partitions at `COMMIT` or `SET CONSTRAINTS ... IMMEDIATE`.
+- Refused with `0A000`: such a key over a column the index cannot hold exactly (`FLOAT`, `REAL`
+  and `NUMERIC`, whose equal values can differ in the index, and `INTERVAL`, array, `VECTOR`,
+  `INET`, `CIDR`, `BIT`, `BIT VARYING`, range, geometry, `TSVECTOR`, `TSQUERY` and `XML`, which
+  have no index form), and `NULLS NOT DISTINCT`. Rows with a NULL key column never conflict. A
+  `FOREIGN KEY` still cannot reference a partitioned table.
+
+Concurrent writers are kept apart by a lock on the key, taken for the whole partitioned table and
+held to the end of the writer's transaction. A second transaction writing the same key into any
+partition fails at once with `40001`, and one that committed first is seen by the check at every
+isolation level, including in a partition created or attached after a `REPEATABLE READ`
+transaction began.
+
+The price is one index lookup per partition for each key written, plus one read of the partition
+list per statement; a statement that writes many keys into a small partition reads that partition
+once instead. A key that includes the partition key costs nothing extra, and neither does a table
+that is not partitioned.
 
 A `CHECK` or `FOREIGN KEY` on a partitioned parent holds for every partition the same way,
 declared in `CREATE TABLE` or added later with `ALTER TABLE ... ADD CONSTRAINT`, which also checks
 the rows already in the partitions (and refuses the statement when one breaks it). Each partition
 carries a copy named after it (`fact_v_check` on `fact` is `fact_01_v_check` on `fact_01`): the
 copy cannot be dropped on its own (`42P16`), dropping the constraint on the parent drops every
-copy, and a partition that is detached keeps its copies as its own constraints. A key added this
-way that is `UNIQUE` or `PRIMARY KEY` must include every partition-key column too (`0A000`).
+copy, and a partition that is detached keeps its copies as its own constraints. A `UNIQUE` or
+`PRIMARY KEY` added this way that leaves out a partition-key column is enforced across the
+partitions, as above.
 
 A range bound element may be `MINVALUE` or `MAXVALUE` to leave that side open —
 `FROM (MINVALUE) TO (0)` holds every key below zero, `FROM (10) TO (MAXVALUE)` everything from
@@ -772,7 +848,8 @@ A partition key part may also be a parenthesized expression — `PARTITION BY RA
 immutable (a key that can change would route the same row differently each time; `42P17`, see
 [Volatility](#volatility)), every column it
 reads must be provided in the `INSERT` (routing does not evaluate defaults), and a unique
-constraint can never cover an expression key, so declaring one on such a parent is refused.
+constraint never covers an expression key, so one declared on such a parent is enforced across its
+partitions.
 
 Not accepted: `LIST` with more than one key column, non-literal bounds, a partition declaring
 its own columns, and a `FOREIGN KEY` that references a partitioned table.
@@ -1187,7 +1264,7 @@ DROP TABLE stock;
 ```
 
 `UPDATE ... FROM`, `DELETE ... USING` and `MERGE ... USING` take a single named table as the
-extra source.
+extra source. `MERGE` into a partitioned table is refused (`0A000`); merge into its partitions.
 
 ### Bulk load and export
 
@@ -1965,11 +2042,56 @@ ANALYZE customers;        -- refresh planner statistics for one table
 ANALYZE;                  -- every table
 VACUUM;                   -- reclaim row versions no snapshot can see
 VACUUM (FULL, ANALYZE) orders;
-REINDEX TABLE orders;     -- accepted for compatibility; indexes are always consistent, so it is a no-op
+REINDEX TABLE orders;     -- rebuild the indexes an earlier release built over CHAR columns (see below)
 CLUSTER orders;           -- accepted for compatibility; rows are already clustered by row id, so it is a no-op
 CREATE EXTENSION IF NOT EXISTS vector;   -- accepted for compatibility; installs nothing, every type is built in
 CHECKPOINT;               -- fold the log into an image and truncate it; needs a quiet engine
 ```
+
+### Indexes over CHAR columns from earlier releases
+
+An index whose key or `WHERE` clause reads a `CHAR(n)` column holds each value without its
+trailing blanks, as the row stores it. Earlier releases wrote the value as the statement gave it,
+so an index they built may hold `'x  '` for a row that reads back as `'x'`. Such an index stays
+correct with this release: every uniqueness, foreign key and exclusion check, and every query
+that reads through the index, still finds a key however it was written. It is slower, though: a
+lookup tries each way the value may have been padded, an ordered read through it with `LIMIT`
+keeps only the rows it returns, and a unique index keyed on an expression over such a column, or
+with a `WHERE` clause that reads one, is checked against the table's rows (read once per
+statement). A query does not use an expression index over such a column at all until it is
+rebuilt.
+
+Rebuilding the index makes it as fast as one built by this release:
+
+```sql
+REINDEX INDEX orders_code_key;   -- one index
+REINDEX TABLE orders;            -- every index of a table, and of the partitions below it
+REINDEX SCHEMA app;              -- every table of a schema
+REINDEX DATABASE mydb;           -- every table of the database
+```
+
+`REINDEX INDEX` and `REINDEX TABLE` need the table's owner (or a superuser), as `CREATE INDEX`
+does; `REINDEX SCHEMA` and `REINDEX DATABASE` rebuild the tables the role owns and skip the others
+(a superuser's covers every table). `REINDEX DATABASE name` must name the connection's database,
+and `REINDEX SYSTEM` is the same as `REINDEX DATABASE`. Only those older indexes are rebuilt; any
+other index is left alone. A rebuild streams the table's rows (the index of a `PRIMARY KEY` or
+`UNIQUE` constraint reads them a second time, to check that no key is held twice), and keeps
+everything the index was declared with: its key, `WHERE` clause, `NULLS [NOT] DISTINCT`, the
+constraint it backs with its timing, the foreign keys that reference it, and comments.
+
+`REINDEX INDEX` and `REINDEX TABLE` run in one transaction, and may run inside a transaction
+block; `REINDEX SCHEMA` and `REINDEX DATABASE` commit each table on its own, so they are refused
+inside a transaction block (`25001`), and stopping one part way keeps the tables already done.
+Either way an interrupted rebuild leaves that index as it was. A rebuild needs its table to itself:
+while another transaction is writing it, `REINDEX TABLE` and `REINDEX INDEX` fail at once with
+`40001` (retry when the table is quiet), and `REINDEX SCHEMA` and `REINDEX DATABASE` retry each
+table a few times before giving up with the same error. When a server opens such a database it
+logs how many of these indexes there are.
+
+An earlier release could let two rows hold one key of a unique index or constraint once trailing
+blanks are ignored (`'a  '` and `'a'`). `REINDEX` then fails with `23505`, naming the key (its
+value only for a role that may read the table), and leaves the index as it was, still enforced;
+remove one of the rows and run it again.
 
 A background worker re-analyzes tables whose statistics have gone stale, so `ANALYZE` by hand
 matters mainly right after a large load. Version reclamation also runs in the background;

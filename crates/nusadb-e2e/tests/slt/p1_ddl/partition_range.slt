@@ -52,8 +52,8 @@ CREATE TABLE ev_bad PARTITION OF ev FOR VALUES FROM (50) TO (120)
 statement error
 CREATE TABLE ev_bad PARTITION OF ev FOR VALUES IN (5)
 
-# A constraint on a partitioned parent (which would not be enforced across partitions) is refused.
-statement error
+# A key on a partitioned parent that leaves out the partition key is enforced across partitions.
+statement ok
 CREATE TABLE c (id INT PRIMARY KEY, r INT) PARTITION BY RANGE (r)
 
 # UPDATE/DELETE through a partitioned parent propagate to the partitions holding the rows.

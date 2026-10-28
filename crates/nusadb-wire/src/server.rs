@@ -685,6 +685,8 @@ async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // The database this connection reaches may be new to the process.
+    deferred::session_started();
     let mut conn = Connection::new(stream);
 
     // --- Startup + authentication (bounded by `handshake_timeout`) ---
@@ -779,6 +781,7 @@ where
             return Ok(());
         },
     };
+    deferred::connection_bound(&*engine);
     // Effective protocol minor for this connection: the lower of what the client asked for and what
     // this server supports. `typed >= 1` opts the client into the typed `RowDescriptionTyped`
     // metadata; `minor = 0` keeps the byte-identical 1.0 surface.
@@ -2935,6 +2938,16 @@ fn run_statement_streaming(
             &effective_user(user, settings),
         )),
         Statement::Checkpoint => Some(checkpoint_txn(engine, state)),
+        Statement::Reindex(
+            target @ (nusadb_sql::ast::ReindexTarget::Database(_)
+            | nusadb_sql::ast::ReindexTarget::Schema(_)),
+        ) => Some(reindex_each_table_txn(
+            engine,
+            target,
+            &effective_user(user, settings),
+            &settings_snapshot(settings, database),
+            state,
+        )),
         Statement::SetConstraints(_) if !in_transaction_block(&state) => {
             Some((Ok(set_constraints_outside_block()), state))
         },
@@ -5297,6 +5310,24 @@ fn finish_prepared_txn(
     }
 }
 
+/// `REINDEX DATABASE` / `REINDEX SCHEMA`: rebuilt table by table, each in a transaction of its own,
+/// so it is refused inside a transaction block (`25001`).
+fn reindex_each_table_txn(
+    engine: &dyn StorageEngine,
+    target: &nusadb_sql::ast::ReindexTarget,
+    user: &str,
+    settings: &HashMap<String, String>,
+    state: TxnState,
+) -> (Result<ExecutionResult, nusadb_sql::Error>, TxnState) {
+    if in_transaction_block(&state) {
+        return (Err(nusadb_sql::reindex_in_block()), state);
+    }
+    (
+        nusadb_sql::reindex_each_table(engine, target, Some((user, settings))),
+        state,
+    )
+}
+
 /// `CHECKPOINT` — fold the log into an image and truncate it. It runs *outside* any data
 /// transaction (the engine's checkpoint needs a quiesced engine), so it is intercepted here rather
 /// than executed against a statement transaction. If this connection holds an open transaction the
@@ -5436,6 +5467,13 @@ fn run_stmt_in_state(
     // through its control block. An open transaction on this connection makes the engine refuse.
     if matches!(stmt, nusadb_sql::ast::Statement::Checkpoint) {
         return checkpoint_txn(engine, state);
+    }
+    if let nusadb_sql::ast::Statement::Reindex(
+        target @ (nusadb_sql::ast::ReindexTarget::Database(_)
+        | nusadb_sql::ast::ReindexTarget::Schema(_)),
+    ) = &stmt
+    {
+        return reindex_each_table_txn(engine, target, user, &snapshot, state);
     }
     match state {
         TxnState::Failed { .. } => (

@@ -448,8 +448,8 @@ pub enum LogicalPlan {
     /// `VACUUM [FULL] [ANALYZE]` — reclaim dead row versions across all tables (and, for `ANALYZE`,
     /// recompute every table's statistics).
     Vacuum(crate::ast::VacuumOptions),
-    /// `REINDEX ...` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
-    Reindex,
+    /// `REINDEX ...`: rebuild the target's indexes an earlier release built over `CHAR(n)` columns.
+    Reindex(crate::ast::ReindexTarget),
     /// `CLUSTER ...` — accepted as a no-op (NusaDB has no user-visible physical row order to change).
     Cluster,
     /// `CHECKPOINT` — fold the durable log into an image and truncate it. Requires quiescence.
@@ -2953,8 +2953,8 @@ pub enum PhysicalPlan {
     /// `VACUUM [FULL] [ANALYZE]` — reclaim dead row versions across all tables (and, for `ANALYZE`,
     /// recompute every table's statistics).
     Vacuum(crate::ast::VacuumOptions),
-    /// `REINDEX ...` — accepted as a no-op (NusaDB's B-tree indexes are always consistent).
-    Reindex,
+    /// `REINDEX ...`: rebuild the target's indexes an earlier release built over `CHAR(n)` columns.
+    Reindex(crate::ast::ReindexTarget),
     /// `CLUSTER ...` — accepted as a no-op (NusaDB has no user-visible physical row order to change).
     Cluster,
     /// `CHECKPOINT` — fold the durable log into an image and truncate it. Requires quiescence.

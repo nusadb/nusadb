@@ -74,6 +74,11 @@ pub(super) struct Guard {
     pub(super) types: Vec<ColumnType>,
     /// Whether two `NULL` keys collide.
     pub(super) nulls_not_distinct: bool,
+    /// Whether the index reads a `CHAR(n)` column, so that an index an earlier release built may
+    /// hold an entry with trailing blanks (`executor::char_canon`).
+    pub(super) reads_char: bool,
+    /// Whether its predicate reads a `CHAR(n)` column.
+    pub(super) predicate_reads_char: bool,
 }
 
 /// The [`Guard`] of index `def` (id `id`) on `table`, or `None` when it is not unique or backs a
@@ -89,6 +94,13 @@ pub(super) fn guard_for(
         table: table.id,
         types: column_types(table),
         nulls_not_distinct: split_predicate(def).1,
+        reads_char: super::char_canon::reads_char(def, table),
+        predicate_reads_char: split_predicate(def).0.is_some_and(|sql| {
+            crate::analyzer::analyze_check_predicate(sql, table, &dml::EmptyCatalog)
+                .map_or(true, |typed| {
+                    super::char_canon::typed_reads_char(&typed, table)
+                })
+        }),
     })
 }
 
@@ -244,20 +256,27 @@ pub(super) fn keep_non_conflicting(
         return Ok(rows);
     }
     let types = column_types(table);
+    let legacy: Vec<bool> = indexes
+        .iter()
+        .map(|(def, id, _)| super::char_canon::needs_legacy_probe(engine, txn, *id, def, table))
+        .collect::<Result<_, _>>()?;
     // Per index, the encoded keys of the rows kept so far.
     let mut kept_keys: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); indexes.len()];
     let mut kept = Vec::with_capacity(rows.len());
     'rows: for row in rows {
         let mut keys = Vec::with_capacity(indexes.len());
-        for ((_, id, index), taken) in indexes.iter().zip(&kept_keys) {
+        for (((_, id, index), taken), &legacy) in indexes.iter().zip(&kept_keys).zip(&legacy) {
             let Some(key) = index.key(&row)? else {
                 keys.push(None);
                 continue;
             };
             let encoded = index_key::encode_index_key(&key)?;
-            if taken.contains(&encoded)
-                || held_by_a_row(*id, index, &encoded, &key, &types, engine, txn)?
-            {
+            let held = if legacy {
+                held_by_a_row_legacy(table, *id, index, &key, &types, engine, txn)?
+            } else {
+                held_by_a_row(*id, index, &encoded, &key, &types, engine, txn)?
+            };
+            if taken.contains(&encoded) || held {
                 continue 'rows;
             }
             keys.push(Some(encoded));
@@ -270,6 +289,62 @@ pub(super) fn keep_non_conflicting(
         kept.push(row);
     }
     Ok(kept)
+}
+
+/// [`held_by_a_row`] for an index an earlier release built over a `CHAR(n)` column, whose entries
+/// may hold a value with trailing blanks: every spelling of a plain-column key is probed, and a
+/// partial index whose predicate reads such a column is matched against the table's keys, read
+/// once per statement.
+fn held_by_a_row_legacy(
+    table: &TableSchema,
+    id: nusadb_core::IndexId,
+    index: &ArbiterKey,
+    key: &[ast::Value],
+    types: &[ColumnType],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<bool, Error> {
+    let holds = |row: &Row| -> Result<bool, Error> {
+        Ok(index.key(row)?.is_some_and(|k| dml::unique_key_eq(&k, key)))
+    };
+    let predicate_reads_char = index
+        .predicate
+        .as_ref()
+        .is_some_and(|p| super::char_canon::typed_reads_char(p, table));
+    if !predicate_reads_char {
+        // The key's spellings, each row read checked against the key and the predicate.
+        let key_types = dml::ordinal_types(table, &index.ordinals);
+        for (_, tuple) in super::global_unique::key_entries(engine, txn, id, key, &key_types)? {
+            if holds(&row::decode(&tuple, types)?)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // A predicate over a CHAR column: entries an earlier release wrote may follow the predicate as it
+    // read the padded value. A row written since has a canonical entry; the others are matched
+    // against the statement's map of the table's keys.
+    let encoded = index_key::encode_index_key(key)?;
+    if held_by_a_row(id, index, &encoded, key, types, engine, txn)? {
+        return Ok(true);
+    }
+    let key_of = |row: &Row| -> Result<Option<Vec<u8>>, Error> {
+        index
+            .key(row)?
+            .map(|k| index_key::encode_index_key(&k))
+            .transpose()
+    };
+    super::global_unique::legacy_key_held(
+        engine,
+        txn,
+        id,
+        table.id,
+        types,
+        &encoded,
+        None,
+        &key_of,
+        &|_, row| holds(row),
+    )
 }
 
 /// Whether a live row already holds `key` (encoded `encoded`) in unique index `id`.

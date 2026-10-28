@@ -1,0 +1,960 @@
+# A PRIMARY KEY / UNIQUE on a partitioned table that leaves out a partitioning column is enforced
+# across every partition below the table: no two rows of any partitions may share a key.
+
+# --- The fact table: a uuid key over a table partitioned by time -----------------------------
+
+statement ok
+CREATE TABLE ev (id UUID PRIMARY KEY, created_at TIMESTAMP NOT NULL, v TEXT) PARTITION BY RANGE (created_at)
+
+statement ok
+CREATE TABLE ev_01 PARTITION OF ev FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+
+statement ok
+CREATE TABLE ev_02 PARTITION OF ev FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+
+statement ok
+CREATE TABLE ev_def PARTITION OF ev DEFAULT
+
+statement ok
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000001', '2026-01-05', 'a')
+
+# The same key in another partition, through the parent or directly.
+statement error duplicate key violates primary key constraint "ev_pkey"
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000001', '2026-02-05', 'b')
+
+statement error duplicate key violates primary key constraint "ev_pkey"
+INSERT INTO ev_02 VALUES ('00000000-0000-0000-0000-000000000001', '2026-02-05', 'b')
+
+statement error duplicate key violates primary key constraint "ev_pkey"
+INSERT INTO ev_def VALUES ('00000000-0000-0000-0000-000000000001', '2027-01-01', 'b')
+
+# Two rows of one statement routed to different partitions.
+statement error duplicate key violates primary key constraint "ev_pkey"
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000002', '2026-01-05', 'x'), ('00000000-0000-0000-0000-000000000002', '2026-02-05', 'y')
+
+query I
+SELECT count(*) FROM ev
+----
+1
+
+statement ok
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000002', '2026-02-05', 'b'), ('00000000-0000-0000-0000-000000000003', '2026-03-05', 'c')
+
+# --- UPDATE ---------------------------------------------------------------------------------------
+
+# Onto a key held in another partition.
+statement error duplicate key violates primary key constraint "ev_pkey"
+UPDATE ev SET id = '00000000-0000-0000-0000-000000000001' WHERE v = 'b'
+
+# A row moved to another partition keeps its key.
+statement ok
+UPDATE ev SET created_at = '2026-02-10' WHERE v = 'a'
+
+query T
+SELECT v FROM ev_02 ORDER BY v
+----
+a
+b
+
+statement ok
+UPDATE ev SET created_at = '2026-01-10' WHERE v = 'a'
+
+# Two keys swapped across partitions in one statement: the final state is valid.
+statement ok
+UPDATE ev SET id = CASE id WHEN '00000000-0000-0000-0000-000000000001'::uuid THEN '00000000-0000-0000-0000-000000000003'::uuid WHEN '00000000-0000-0000-0000-000000000003'::uuid THEN '00000000-0000-0000-0000-000000000001'::uuid END WHERE v IN ('a', 'c')
+
+query TT rowsort
+SELECT id, v FROM ev
+----
+00000000-0000-0000-0000-000000000001 c
+00000000-0000-0000-0000-000000000002 b
+00000000-0000-0000-0000-000000000003 a
+
+# --- ON CONFLICT ----------------------------------------------------------------------------------
+
+# DO NOTHING skips a key held in another partition.
+statement ok
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000001', '2026-01-20', 'skip') ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000009', '2026-01-20', 'n1'), ('00000000-0000-0000-0000-000000000009', '2026-02-20', 'n2') ON CONFLICT DO NOTHING
+
+query TT rowsort
+SELECT id, v FROM ev WHERE v IN ('skip', 'n1', 'n2')
+----
+00000000-0000-0000-0000-000000000009 n1
+
+# DO UPDATE updates the conflicting row in the partition that holds it.
+statement ok
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000001', '2026-01-20', 'up') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v || '-' || ev.v
+
+query TT
+SELECT created_at, v FROM ev WHERE id = '00000000-0000-0000-0000-000000000001'
+----
+2026-03-05 00:00:00 up-c
+
+query I
+SELECT count(*) FROM ev
+----
+4
+
+# Directly into a partition, the conflict is found in a sibling too.
+statement ok
+INSERT INTO ev_01 VALUES ('00000000-0000-0000-0000-000000000002', '2026-01-21', 'up2') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+
+query TT
+SELECT created_at, v FROM ev WHERE id = '00000000-0000-0000-0000-000000000002'
+----
+2026-02-05 00:00:00 up2
+
+statement error cannot affect one row a second time
+INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000002', '2026-01-21', 'p'), ('00000000-0000-0000-0000-000000000002', '2026-02-21', 'q') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+
+# --- MERGE and INSERT ... SELECT ------------------------------------------------------------------
+
+statement ok
+CREATE TABLE src (id UUID, created_at TIMESTAMP, v TEXT)
+
+statement ok
+INSERT INTO src VALUES ('00000000-0000-0000-0000-000000000003', '2026-02-25', 'dup')
+
+statement error duplicate key violates primary key constraint "ev_pkey"
+INSERT INTO ev SELECT * FROM src
+
+# MERGE targets a partition (a partitioned table itself is refused): the key is checked across
+# the siblings.
+statement error duplicate key violates primary key constraint "ev_pkey"
+MERGE INTO ev_02 USING src ON ev_02.id = src.id WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.created_at, src.v)
+
+statement error MERGE into the partitioned table "ev" is not supported
+MERGE INTO ev USING src ON ev.id = src.id WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.created_at, src.v)
+
+# --- A function body: the check runs at its own statement, so EXCEPTION catches it ---------------
+
+statement ok
+CREATE TABLE log (msg TEXT)
+
+statement ok
+CREATE PROCEDURE try_dup() AS $$
+BEGIN
+  INSERT INTO ev VALUES ('00000000-0000-0000-0000-000000000003', '2026-02-26', 'f');
+  INSERT INTO log VALUES ('inserted');
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO log VALUES ('caught');
+END
+$$
+
+statement ok
+CALL try_dup()
+
+query T
+SELECT msg FROM log
+----
+caught
+
+# --- Sub-partitions ----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE sp (k INT NOT NULL, d INT NOT NULL, r TEXT NOT NULL, CONSTRAINT sp_k UNIQUE (k)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE sp_1 PARTITION OF sp FOR VALUES FROM (0) TO (100) PARTITION BY LIST (r)
+
+statement ok
+CREATE TABLE sp_1_a PARTITION OF sp_1 FOR VALUES IN ('a')
+
+statement ok
+CREATE TABLE sp_1_b PARTITION OF sp_1 FOR VALUES IN ('b')
+
+statement ok
+CREATE TABLE sp_2 PARTITION OF sp FOR VALUES FROM (100) TO (200)
+
+statement ok
+INSERT INTO sp VALUES (1, 10, 'a')
+
+statement error duplicate key violates unique constraint "sp_k"
+INSERT INTO sp VALUES (1, 10, 'b')
+
+statement error duplicate key violates unique constraint "sp_k"
+INSERT INTO sp VALUES (1, 150, 'z')
+
+statement ok
+INSERT INTO sp VALUES (2, 150, 'z')
+
+# A key covering the top level but not a sub-partitioned level is enforced across that level.
+statement ok
+CREATE TABLE pk (k INT NOT NULL, d INT NOT NULL, PRIMARY KEY (d)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE pk_1 PARTITION OF pk FOR VALUES FROM (0) TO (100) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE pk_1_a PARTITION OF pk_1 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE pk_1_b PARTITION OF pk_1 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO pk VALUES (1, 5)
+
+statement error duplicate key violates primary key constraint
+INSERT INTO pk VALUES (2, 5)
+
+# --- ALTER TABLE ADD, ATTACH, DETACH --------------------------------------------------------------
+
+statement ok
+CREATE TABLE ad (k INT NOT NULL, d INT NOT NULL) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE ad_1 PARTITION OF ad FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE ad_2 PARTITION OF ad FOR VALUES FROM (100) TO (200)
+
+statement ok
+INSERT INTO ad VALUES (1, 10), (1, 110)
+
+statement error existing rows violate|duplicate key
+ALTER TABLE ad ADD CONSTRAINT ad_k UNIQUE (k)
+
+statement ok
+DELETE FROM ad WHERE d = 110
+
+statement ok
+ALTER TABLE ad ADD CONSTRAINT ad_k UNIQUE (k)
+
+statement error duplicate key violates unique constraint "ad_k"
+INSERT INTO ad VALUES (1, 120)
+
+statement ok
+CREATE TABLE ad_3 (k INT NOT NULL, d INT NOT NULL)
+
+statement ok
+INSERT INTO ad_3 VALUES (1, 210)
+
+statement error duplicate key violates unique constraint "ad_k"
+ALTER TABLE ad ATTACH PARTITION ad_3 FOR VALUES FROM (200) TO (300)
+
+statement ok
+UPDATE ad_3 SET k = 3
+
+statement ok
+ALTER TABLE ad ATTACH PARTITION ad_3 FOR VALUES FROM (200) TO (300)
+
+statement error duplicate key violates unique constraint "ad_k"
+INSERT INTO ad VALUES (3, 20)
+
+# A detached table keeps its own key; its rows no longer count for the parent's.
+statement ok
+ALTER TABLE ad DETACH PARTITION ad_3
+
+statement ok
+INSERT INTO ad VALUES (3, 20)
+
+statement error duplicate key
+INSERT INTO ad_3 VALUES (3, 999)
+
+# --- Refused key types --------------------------------------------------------------------------
+
+statement error not supported for the floating-point or NUMERIC column
+CREATE TABLE bf (k FLOAT NOT NULL, d INT NOT NULL, UNIQUE (k)) PARTITION BY RANGE (d)
+
+statement error not supported for the floating-point or NUMERIC column
+CREATE TABLE bn (k NUMERIC NOT NULL, d INT NOT NULL, UNIQUE (k)) PARTITION BY RANGE (d)
+
+statement error not supported with NULLS NOT DISTINCT
+CREATE TABLE bnd (k INT, d INT NOT NULL, UNIQUE NULLS NOT DISTINCT (k)) PARTITION BY RANGE (d)
+
+# A covering key with those types stays allowed.
+statement ok
+CREATE TABLE bok (k NUMERIC NOT NULL, d INT NOT NULL, UNIQUE (k, d)) PARTITION BY RANGE (d)
+
+# NULL keys never conflict.
+statement ok
+CREATE TABLE nk (k INT, d INT NOT NULL, UNIQUE (k)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE nk_1 PARTITION OF nk FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE nk_2 PARTITION OF nk FOR VALUES FROM (100) TO (200)
+
+statement ok
+INSERT INTO nk VALUES (NULL, 1), (NULL, 101)
+
+
+# Every key type the index cannot encode is refused for a key across partitions.
+
+statement error not supported for the INTERVAL column
+CREATE TABLE bt0 (k INTERVAL, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the array column
+CREATE TABLE bt1 (k INT[], d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the array column
+CREATE TABLE bt2 (k TEXT[], d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the INET or CIDR column
+CREATE TABLE bt3 (k INET, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the INET or CIDR column
+CREATE TABLE bt4 (k CIDR, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the BIT column
+CREATE TABLE bt5 (k BIT(3), d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the BIT column
+CREATE TABLE bt6 (k VARBIT, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the range column
+CREATE TABLE bt7 (k INT4RANGE, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the XML column
+CREATE TABLE bt8 (k XML, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the full-text column
+CREATE TABLE bt9 (k TSVECTOR, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the full-text column
+CREATE TABLE bt10 (k TSQUERY, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement error not supported for the floating-point or NUMERIC column
+CREATE TABLE bt11 (k REAL, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE bta (k INET, d INT NOT NULL) PARTITION BY LIST (d)
+
+statement error not supported for the INET or CIDR column
+ALTER TABLE bta ADD CONSTRAINT bta_k UNIQUE (k)
+
+# Every supported key type: the same value written in two partitions (once as an untyped literal,
+# once in another spelling) is a duplicate.
+
+statement ok
+CREATE TABLE ok0 (k BOOLEAN, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok0_1 PARTITION OF ok0 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok0_2 PARTITION OF ok0 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok0 VALUES ('t', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok0 VALUES (true, 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok0_2 VALUES ('t', 2)
+
+statement ok
+CREATE TABLE ok1 (k SMALLINT, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok1_1 PARTITION OF ok1 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok1_2 PARTITION OF ok1 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok1 VALUES ('7', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok1 VALUES (7, 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok1_2 VALUES ('7', 2)
+
+statement ok
+CREATE TABLE ok2 (k INT, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok2_1 PARTITION OF ok2 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok2_2 PARTITION OF ok2 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok2 VALUES ('7', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok2 VALUES (7, 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok2_2 VALUES ('7', 2)
+
+statement ok
+CREATE TABLE ok3 (k BIGINT, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok3_1 PARTITION OF ok3 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok3_2 PARTITION OF ok3 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok3 VALUES ('7', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok3 VALUES (7, 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok3_2 VALUES ('7', 2)
+
+statement ok
+CREATE TABLE ok4 (k TEXT, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok4_1 PARTITION OF ok4 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok4_2 PARTITION OF ok4 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok4 VALUES ('a', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok4 VALUES ('a', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok4_2 VALUES ('a', 2)
+
+statement ok
+CREATE TABLE ok5 (k VARCHAR(5), d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok5_1 PARTITION OF ok5 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok5_2 PARTITION OF ok5 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok5 VALUES ('a', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok5 VALUES ('a', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok5_2 VALUES ('a', 2)
+
+statement ok
+CREATE TABLE ok6 (k CHAR(3), d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok6_1 PARTITION OF ok6 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok6_2 PARTITION OF ok6 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok6 VALUES ('a', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok6 VALUES ('a', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok6_2 VALUES ('a', 2)
+
+statement ok
+CREATE TABLE ok7 (k BYTEA, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok7_1 PARTITION OF ok7 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok7_2 PARTITION OF ok7 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok7 VALUES ('\x0102', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok7 VALUES ('\x0102', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok7_2 VALUES ('\x0102', 2)
+
+statement ok
+CREATE TABLE ok8 (k DATE, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok8_1 PARTITION OF ok8 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok8_2 PARTITION OF ok8 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok8 VALUES ('2026-01-02', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok8 VALUES (DATE '2026-01-02', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok8_2 VALUES ('2026-01-02', 2)
+
+statement ok
+CREATE TABLE ok9 (k TIME, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok9_1 PARTITION OF ok9 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok9_2 PARTITION OF ok9 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok9 VALUES ('10:00', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok9 VALUES (TIME '10:00:00', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok9_2 VALUES ('10:00', 2)
+
+statement ok
+CREATE TABLE ok10 (k TIMESTAMP, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok10_1 PARTITION OF ok10 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok10_2 PARTITION OF ok10 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok10 VALUES ('2026-01-02 03:04', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok10 VALUES (TIMESTAMP '2026-01-02 03:04:00', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok10_2 VALUES ('2026-01-02 03:04', 2)
+
+statement ok
+CREATE TABLE ok11 (k TIMESTAMPTZ, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok11_1 PARTITION OF ok11 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok11_2 PARTITION OF ok11 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok11 VALUES ('2026-01-02 03:04+00', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok11 VALUES (TIMESTAMPTZ '2026-01-02 03:04:00+00', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok11_2 VALUES ('2026-01-02 03:04+00', 2)
+
+statement ok
+CREATE TABLE ok12 (k UUID, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok12_1 PARTITION OF ok12 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok12_2 PARTITION OF ok12 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok12 VALUES ('00000000-0000-0000-0000-00000000000a', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok12 VALUES ('00000000-0000-0000-0000-00000000000A'::uuid, 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok12_2 VALUES ('00000000-0000-0000-0000-00000000000a', 2)
+
+statement ok
+CREATE TABLE ok13 (k MACADDR, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok13_1 PARTITION OF ok13 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok13_2 PARTITION OF ok13 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok13 VALUES ('08:00:2b:01:02:03', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok13 VALUES ('08-00-2b-01-02-03', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok13_2 VALUES ('08:00:2b:01:02:03', 2)
+
+statement ok
+CREATE TABLE ok14 (k JSONB, d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ok14_1 PARTITION OF ok14 FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ok14_2 PARTITION OF ok14 FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ok14 VALUES ('[1,2]', 1)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok14 VALUES ('[1, 2]', 2)
+
+statement error duplicate key violates unique constraint
+INSERT INTO ok14_2 VALUES ('[1,2]', 2)
+
+# --- ON UPDATE CASCADE / ON DELETE SET NULL rewrite a unique key -------------------------------
+
+# A composite key with a NULL part references nothing, so another row may hold a value the
+# cascade then copies into the unique column.
+statement ok
+CREATE TABLE cpar (a INT, b INT, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO cpar VALUES (1, 1)
+
+# A key across partitions.
+statement ok
+CREATE TABLE cch (a INT, b INT, d INT NOT NULL, UNIQUE (a), FOREIGN KEY (a, b) REFERENCES cpar (a, b) ON UPDATE CASCADE) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE cch_1 PARTITION OF cch FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE cch_2 PARTITION OF cch FOR VALUES IN (2)
+
+statement ok
+INSERT INTO cch VALUES (1, 1, 1), (2, NULL, 2)
+
+statement error duplicate key violates unique constraint
+UPDATE cpar SET a = 2 WHERE a = 1
+
+statement ok
+UPDATE cpar SET a = 10 WHERE a = 1
+
+query III rowsort
+SELECT a, b, d FROM cch
+----
+10 1 1
+2 NULL 2
+
+# The same on a plain table.
+statement ok
+CREATE TABLE lch (a INT, b INT, UNIQUE (a), FOREIGN KEY (a, b) REFERENCES cpar (a, b) ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO lch VALUES (10, 1), (3, NULL)
+
+statement error duplicate key violates unique constraint
+UPDATE cpar SET a = 3 WHERE a = 10
+
+query II rowsort
+SELECT a, b FROM lch
+----
+10 1
+3 NULL
+
+# A deferred child key that a cascade then duplicates.
+statement ok
+CREATE TABLE dpar (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO dpar VALUES (1)
+
+statement ok
+CREATE TABLE dch (k INT, ref INT REFERENCES dpar (id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED, d INT NOT NULL, UNIQUE (ref)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE dch_1 PARTITION OF dch FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE dch_2 PARTITION OF dch FOR VALUES IN (2)
+
+statement ok
+INSERT INTO dch VALUES (1, 1, 1)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO dch VALUES (2, 2, 2)
+
+statement error duplicate key violates unique constraint
+UPDATE dpar SET id = 2 WHERE id = 1
+
+statement ok
+ROLLBACK
+
+query II
+SELECT k, ref FROM dch
+----
+1 1
+
+statement ok
+CREATE TABLE ldch (k INT, ref INT REFERENCES dpar (id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED, UNIQUE (ref))
+
+statement ok
+INSERT INTO ldch VALUES (1, 1)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO ldch VALUES (2, 2)
+
+statement error duplicate key violates unique constraint
+UPDATE dpar SET id = 2 WHERE id = 1
+
+statement ok
+ROLLBACK
+
+# ON DELETE SET NULL onto a unique column: NULL keys never conflict.
+statement ok
+CREATE TABLE npar (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO npar VALUES (1), (2)
+
+statement ok
+CREATE TABLE nch (ref INT REFERENCES npar (id) ON DELETE SET NULL, d INT NOT NULL, UNIQUE (ref)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE nch_1 PARTITION OF nch FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE nch_2 PARTITION OF nch FOR VALUES IN (2)
+
+statement ok
+INSERT INTO nch VALUES (1, 1), (2, 2)
+
+statement ok
+DELETE FROM npar
+
+query I
+SELECT count(*) FROM nch WHERE ref IS NULL
+----
+2
+
+# --- A table-level PRIMARY KEY makes its columns NOT NULL, on the parent and its partitions ------
+
+statement ok
+CREATE TABLE pp (id INT, d INT NOT NULL, PRIMARY KEY (id))
+
+statement error NOT NULL
+INSERT INTO pp VALUES (NULL, 1)
+
+statement ok
+CREATE TABLE pn (id INT, d INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pn_1 PARTITION OF pn FOR VALUES IN (1)
+
+statement error NOT NULL
+INSERT INTO pn VALUES (NULL, 1)
+
+statement error NOT NULL
+INSERT INTO pn_1 VALUES (NULL, 1)
+
+statement ok
+CREATE TABLE pa (id INT, d INT NOT NULL) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pa_1 PARTITION OF pa FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pa VALUES (NULL, 1)
+
+statement error column "id" contains NULL values; cannot add PRIMARY KEY
+ALTER TABLE pa ADD PRIMARY KEY (id)
+
+statement ok
+DELETE FROM pa
+
+statement ok
+ALTER TABLE pa ADD PRIMARY KEY (id)
+
+statement error NOT NULL
+INSERT INTO pa VALUES (NULL, 1)
+
+query T
+SELECT is_nullable FROM information_schema.columns WHERE table_name = 'pa_1' AND column_name = 'id'
+----
+NO
+
+statement ok
+CREATE TABLE pq (id INT, d INT NOT NULL)
+
+statement ok
+ALTER TABLE pq ADD PRIMARY KEY (id)
+
+statement error NOT NULL
+INSERT INTO pq VALUES (NULL, 1)
+
+# --- CHAR(n): trailing blanks are not significant, however the value was written --------------
+
+statement ok
+CREATE TABLE ck (k CHAR(3), d INT NOT NULL, UNIQUE (k)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ck_1 PARTITION OF ck FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE ck_2 PARTITION OF ck FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ck VALUES ('x  ', 1)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+INSERT INTO ck VALUES ('x  ', 2)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+INSERT INTO ck VALUES ('x ', 2)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+INSERT INTO ck VALUES ('x', 2)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+INSERT INTO ck_2 VALUES ('x'::char(3), 2)
+
+statement ok
+INSERT INTO ck VALUES ('v', 1)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+INSERT INTO ck VALUES ('v  ', 2)
+
+statement ok
+INSERT INTO ck VALUES ('w  ', 2)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+INSERT INTO ck VALUES ('w', 1)
+
+statement ok
+INSERT INTO ck VALUES ('q', 2)
+
+statement error duplicate key violates unique constraint "ck_k_key"
+UPDATE ck SET k = 'q  ' WHERE k = 'x'
+
+statement ok
+INSERT INTO ck VALUES ('q  ', 1) ON CONFLICT DO NOTHING
+
+query T rowsort
+SELECT k || '|' FROM ck
+----
+q|
+v|
+w|
+x|
+
+# The same holds on a table that is not partitioned, on every write path.
+statement ok
+CREATE TABLE u2 (k CHAR(4) UNIQUE, n INT)
+
+statement ok
+INSERT INTO u2 VALUES ('x', 1), ('y', 2)
+
+statement error duplicate key violates unique constraint "u2_k_key"
+UPDATE u2 SET k = 'y  ' WHERE k = 'x'
+
+statement error duplicate key violates unique constraint "u2_k_key"
+INSERT INTO u2 VALUES ('x   ', 3)
+
+statement ok
+UPDATE u2 SET k = 'z  ' WHERE k = 'x'
+
+query TI rowsort
+SELECT k || '|', n FROM u2
+----
+y| 2
+z| 1
+
+# CHECK constraints see the stored value on INSERT and on UPDATE alike.
+statement ok
+CREATE TABLE u3 (k CHAR(4), CHECK (k || '|' = 'x|'))
+
+statement ok
+INSERT INTO u3 VALUES ('x  ')
+
+statement ok
+UPDATE u3 SET k = 'x '
+
+statement error check
+UPDATE u3 SET k = 'y'
+
+# Generated columns are computed from the stored value too, on INSERT and on UPDATE.
+statement ok
+CREATE TABLE u4 (id INT, k CHAR(4), g TEXT GENERATED ALWAYS AS (k || '|') STORED)
+
+statement ok
+INSERT INTO u4 (id, k) VALUES (1, 'ab  '), (2, 'ab')
+
+statement ok
+UPDATE u4 SET k = 'cd  ' WHERE id = 2
+
+query ITT rowsort
+SELECT id, k || '|', g FROM u4
+----
+1 ab| ab|
+2 cd| cd|
+
+# --- A foreign key still cannot reference the partitioned table ----------------------------------
+
+statement error references the partitioned table
+CREATE TABLE evref (r UUID REFERENCES ev (id))
+
+# --- Deferrable ------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE dk (k INT NOT NULL, d INT NOT NULL, CONSTRAINT dk_k UNIQUE (k) DEFERRABLE INITIALLY DEFERRED) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE dk_1 PARTITION OF dk FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE dk_2 PARTITION OF dk FOR VALUES FROM (100) TO (200)
+
+statement ok
+INSERT INTO dk VALUES (1, 10), (2, 110)
+
+# A swap across partitions in two statements, valid at COMMIT.
+statement ok
+BEGIN
+
+statement ok
+UPDATE dk SET k = 2 WHERE d = 10
+
+statement ok
+UPDATE dk SET k = 1 WHERE d = 110
+
+statement ok
+COMMIT
+
+query II rowsort
+SELECT k, d FROM dk
+----
+1 110
+2 10
+
+# A duplicate still there at COMMIT fails it.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO dk VALUES (1, 20)
+
+statement error duplicate key violates unique constraint "dk_k"
+COMMIT
+
+query I
+SELECT count(*) FROM dk
+----
+2
+
+# SET CONSTRAINTS ... IMMEDIATE checks what is queued.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO dk VALUES (1, 30)
+
+statement error duplicate key violates unique constraint "dk_k"
+SET CONSTRAINTS dk_k IMMEDIATE
+
+statement ok
+ROLLBACK

@@ -2222,12 +2222,16 @@ fn vacuum_executes_as_recognized_statement() {
 
 #[test]
 fn reindex_executes_as_a_noop() {
-    // REINDEX is accepted and runs as a no-op (NusaDB's B-tree indexes are always consistent).
+    // REINDEX of a database with no index from an earlier release has nothing to rebuild.
     let engine = MockEngine::new();
     assert!(matches!(
-        run("REINDEX TABLE t", &engine).unwrap(),
+        run("REINDEX DATABASE nusadb", &engine).unwrap(),
         ExecutionResult::Reindexed,
     ));
+    // Only the open database can be named.
+    assert!(run("REINDEX DATABASE d", &engine).is_err());
+    // A table that does not exist is an error.
+    assert!(run("REINDEX TABLE t", &engine).is_err());
 }
 
 #[test]

@@ -100,10 +100,11 @@ pub fn prepare(
     // The deferred constraint checks run first: a prepared transaction owes none, so a restart
     // while it waits for COMMIT PREPARED has nothing to replay. A violation rolls it back.
     crate::executor::deferred::prepare(engine, txn)?;
-    engine
-        .prepare_transaction(txn, gid, owner, database)
-        .map(|()| ExecutionResult::TransactionPrepared)
-        .map_err(engine_error)
+    crate::executor::deferred::end_outside(engine, Some(txn), || {
+        engine.prepare_transaction(txn, gid, owner, database)
+    })
+    .map(|()| ExecutionResult::TransactionPrepared)
+    .map_err(engine_error)
 }
 
 /// `COMMIT PREPARED 'gid'` (`commit`) or `ROLLBACK PREPARED 'gid'`, run by `user` outside any
@@ -121,15 +122,17 @@ pub fn finish(
     // A superuser finishes anyone's; any other role only its own, which the engine checks in the
     // same step that finishes it.
     let owner = (!is_superuser(engine, user)?).then_some(user);
-    let finished = if commit {
-        engine
-            .commit_prepared(gid, owner)
-            .map(|()| ExecutionResult::PreparedCommitted)
-    } else {
-        engine
-            .rollback_prepared(gid, owner)
-            .map(|()| ExecutionResult::PreparedRolledBack)
-    };
+    let finished = crate::executor::deferred::end_outside(engine, None, || {
+        if commit {
+            engine
+                .commit_prepared(gid, owner)
+                .map(|()| ExecutionResult::PreparedCommitted)
+        } else {
+            engine
+                .rollback_prepared(gid, owner)
+                .map(|()| ExecutionResult::PreparedRolledBack)
+        }
+    });
     finished.map_err(engine_error)
 }
 

@@ -124,7 +124,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::ShowTables => PhysicalPlan::ShowTables,
         LogicalPlan::ShowColumns(schema) => PhysicalPlan::ShowColumns(schema),
         LogicalPlan::Vacuum(options) => PhysicalPlan::Vacuum(options),
-        LogicalPlan::Reindex => PhysicalPlan::Reindex,
+        LogicalPlan::Reindex(target) => PhysicalPlan::Reindex(target),
         LogicalPlan::Cluster => PhysicalPlan::Cluster,
         LogicalPlan::Checkpoint => PhysicalPlan::Checkpoint,
         LogicalPlan::Analyze(p) => PhysicalPlan::Analyze(p),

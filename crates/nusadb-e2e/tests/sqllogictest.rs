@@ -558,6 +558,11 @@ fn slt_p1_partition_triggers() {
 }
 
 #[test]
+fn slt_p1_partition_global_unique() {
+    run_slt("tests/slt/p1_ddl/partition_global_unique.slt");
+}
+
+#[test]
 fn slt_p1_partition_constraints() {
     run_slt("tests/slt/p1_ddl/partition_constraints.slt");
 }

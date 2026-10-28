@@ -183,6 +183,26 @@ pub(super) fn run_create_table(
         columns,
     };
     let id = engine.create_table(txn, &def)?;
+    // A key of a partitioned table that leaves out a partitioning column is enforced across the
+    // partitions; the key types its checks cannot handle are refused.
+    if let Some(pb) = &plan.partition_by {
+        let created = reread_table_by_id(id, &def, engine, txn)?;
+        for constraint in &plan.unique_constraints {
+            let covered = pb.keys.iter().all(|k| match k {
+                ast::PartitionKey::Column(name) => constraint.columns.contains(name),
+                ast::PartitionKey::Expression { .. } => false,
+            });
+            if !covered {
+                super::global_unique::refuse_unsupported(
+                    &created,
+                    &constraint.name,
+                    &constraint.columns,
+                    constraint.nulls_not_distinct,
+                )?;
+                super::global_unique::notice_created(&constraint.name, &def.name);
+            }
+        }
+    }
     // Register each resolved PRIMARY KEY / UNIQUE constraint so INSERT/UPDATE enforce its
     // uniqueness (the analyzer collected them from column-level + table-level declarations).
     for constraint in &plan.unique_constraints {
@@ -347,9 +367,10 @@ pub(super) fn run_create_table(
 /// (`ALTER TABLE parent ADD CONSTRAINT`): `PRIMARY KEY` / `UNIQUE`, `CHECK` and `FOREIGN KEY`. A
 /// constraint on a partitioned table holds for every row, and its rows live in the partitions.
 ///
-/// A `PRIMARY KEY` / `UNIQUE` must include every partition-key column of the parent and, when the
-/// partition is itself partitioned, of the partition too, so equal keys always route to the same
-/// leaf and per-leaf enforcement is globally sound. A copy takes the partition's name prefix
+/// A `PRIMARY KEY` / `UNIQUE` that includes every partition-key column is enforced by each leaf's
+/// copy alone; one that leaves a partition-key column out (of the parent or, when the partition is
+/// itself partitioned, of the partition) is enforced across the partitions as well
+/// (`global_unique`), from the same copies. A copy takes the partition's name prefix
 /// (`orders_pkey` on parent `orders` becomes `orders_q1_pkey` on partition `orders_q1`; see
 /// [`partition_constraint_name`]).
 /// `validate` is set when the partition may already hold rows: they must satisfy the constraint
@@ -380,11 +401,18 @@ fn propagate_parent_constraints(
         if !(primary || matches!(c.kind, nusadb_core::ConstraintKind::Unique)) {
             continue;
         }
-        refuse_unique_without_partition_key(
-            &def.schema,
-            &def.name,
+        // A partition that is itself partitioned by a column the key leaves out spreads equal
+        // keys over its own partitions: the key is enforced across them.
+        let partition_schema = engine
+            .lookup_table_as_of_in(txn, &def.schema, &def.name)?
+            .ok_or_else(|| Error::TableNotFound {
+                name: def.name.clone(),
+            })?;
+        let global = unique_is_global_on(
+            &partition_schema,
             &c.name,
             &c.columns,
+            c.nulls_not_distinct,
             engine,
             txn,
         )?;
@@ -395,6 +423,9 @@ fn propagate_parent_constraints(
         });
         if already {
             continue;
+        }
+        if global {
+            super::global_unique::notice_created(&c.name, &def.name);
         }
         if validate {
             let schema = engine
@@ -621,40 +652,30 @@ fn propagate_parent_foreign_keys(
     Ok(())
 }
 
-/// Refuse a `PRIMARY KEY` / `UNIQUE` on a partitioned table that leaves out a partition-key column:
-/// equal keys could then land in different partitions, where no single index sees both (the rule
-/// `CREATE TABLE` applies).
-fn refuse_unique_without_partition_key(
-    schema: &str,
-    table: &str,
+/// Whether a `PRIMARY KEY` / `UNIQUE` over `columns` on `table` leaves out a partition-key column
+/// of `table` (or `table` is partitioned by an expression): equal keys can then land in different
+/// partitions, so the key is enforced across them (`global_unique`). Such a key is refused
+/// (`0A000`) where its checks cannot run soundly.
+fn unique_is_global_on(
+    table: &TableSchema,
     name: &str,
     columns: &[String],
+    nulls_not_distinct: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     if !super::partition::has_any(engine, txn)? {
-        return Ok(());
+        return Ok(false);
     }
-    let key = crate::analyzer::qualified_display(schema, table);
+    let key = crate::analyzer::qualified_display(&table.schema, &table.name);
     let Some(parts) = super::partition::parent_key_parts(engine, txn, &key)? else {
-        return Ok(());
+        return Ok(false);
     };
-    let missing = parts.iter().find_map(|part| match part {
-        super::partition::KeyPart::Column(column) => {
-            (!columns.contains(column)).then_some(column.as_str())
-        },
-        super::partition::KeyPart::Expression(sql) => Some(sql.as_str()),
-    });
-    if let Some(missing) = missing {
-        return Err(Error::Coded {
-            message: format!(
-                "unique constraint on partitioned table must include all partitioning columns: \
-                 \"{missing}\" is part of the partition key but not of the constraint \"{name}\""
-            ),
-            sqlstate: "0A000",
-        });
+    if super::global_unique::covers(&parts, columns) {
+        return Ok(false);
     }
-    Ok(())
+    super::global_unique::refuse_unsupported(table, name, columns, nulls_not_distinct)?;
+    Ok(true)
 }
 
 /// The partitions below `table` (nearest first) as `(schema, name, direct parent key)`, the key
@@ -2465,14 +2486,10 @@ pub(super) fn run_alter_table(
             // Taken before the rows are validated, so no other transaction's unfinished write can
             // slip a duplicate past the check (a prepared one refuses it with 55006).
             let _fresh = lock_for_validation(&table, engine, txn)?;
-            refuse_unique_without_partition_key(
-                &table.schema,
-                &table.name,
-                &name,
-                &columns,
-                engine,
-                txn,
-            )?;
+            if unique_is_global_on(&table, &name, &columns, nulls_not_distinct, engine, txn)? {
+                super::global_unique::notice_created(&name, &table.name);
+            }
+            let added = name.clone();
             validate_add_unique_constraint(
                 &table,
                 &columns,
@@ -2481,6 +2498,41 @@ pub(super) fn run_alter_table(
                 engine,
                 txn,
             )?;
+            // A primary key's columns are NOT NULL from now on, here and on every partition. A
+            // partitioned table's rows live in its partitions: they are checked for NULLs here,
+            // with the message a table holding its own rows gives.
+            if primary {
+                for (schema, name, _) in partitions_below(&table, engine, txn)? {
+                    let Some(partition) = engine.lookup_table_as_of_in(txn, &schema, &name)? else {
+                        continue;
+                    };
+                    let ordinals = dml::constraint_ordinals(&partition, &columns)?;
+                    for row in scan_rows(&partition, engine, txn)? {
+                        for (&ordinal, column) in ordinals.iter().zip(&columns) {
+                            if matches!(row.get(ordinal), Some(ast::Value::Null) | None) {
+                                return Err(nusadb_core::Error::ConstraintViolation(format!(
+                                    "column \"{column}\" contains NULL values; cannot add PRIMARY KEY"
+                                ))
+                                .into());
+                            }
+                        }
+                    }
+                }
+                for column in &columns {
+                    if let Some(index) = table
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == column && c.nullable)
+                    {
+                        run_column_change(
+                            &table,
+                            &AlterColumnOp::SetNotNull { index },
+                            engine,
+                            txn,
+                        )?;
+                    }
+                }
+            }
             let index = engine.add_unique_constraint(
                 txn,
                 table.id,
@@ -2527,6 +2579,8 @@ pub(super) fn run_alter_table(
                 }
             }
             propagate_to_existing_partitions(&table, engine, txn)?;
+            // A key enforced across partitions holds over all of their rows together.
+            super::global_unique::validate_added(&table, &added, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // ADD FOREIGN KEY: register it, then validate the table's existing rows reference
@@ -2782,6 +2836,9 @@ pub(super) fn run_alter_table(
             // An attached table that is itself partitioned holds no rows: its partitions do, and
             // they take the constraints (checked against their rows) from it in turn.
             propagate_to_existing_partitions(&partition, engine, txn)?;
+            // A key the parent enforces across its partitions: the attached rows' keys must not
+            // meet an equal key in another partition.
+            super::global_unique::validate_attached(&partition, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // DETACH PARTITION: confirm the child really is a partition of this parent, then sever just

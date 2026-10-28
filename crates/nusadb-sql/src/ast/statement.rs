@@ -29,6 +29,30 @@ pub struct ExplainOptions {
     pub format: ExplainFormat,
 }
 
+/// What a `REINDEX` rebuilds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReindexTarget {
+    /// `REINDEX INDEX [schema.]name`.
+    Index {
+        /// The schema, when qualified.
+        schema: Option<String>,
+        /// The index name.
+        name: String,
+    },
+    /// `REINDEX TABLE [schema.]name` (and the partitions below it).
+    Table {
+        /// The schema, when qualified.
+        schema: Option<String>,
+        /// The table name.
+        name: String,
+    },
+    /// `REINDEX SCHEMA name`.
+    Schema(String),
+    /// `REINDEX DATABASE [name]` / `REINDEX SYSTEM [name]`: every table of the database (the name,
+    /// when given, must be the connection's database).
+    Database(Option<String>),
+}
+
 /// Options on a `VACUUM` statement.
 ///
 /// `FULL` requests an aggressive rewrite (treated as the standard reclaim for now; deep compaction
@@ -384,11 +408,11 @@ pub enum Statement {
     /// `VACUUM [FULL] [ANALYZE]` — reclaim dead row versions across all tables; `ANALYZE` also
     /// recomputes statistics for every table. The bare, table-less form (any options) is supported.
     Vacuum(VacuumOptions),
-    /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } name` — accepted as a no-op. NusaDB's
-    /// clustered B-tree indexes are kept consistent by MVCC and background purge, so there is nothing
-    /// to rebuild; but migration tools and ORM health-checks emit `REINDEX`, so it is accepted rather
-    /// than rejected (which would break their scripts).
-    Reindex,
+    /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } name`: rebuild the target's indexes
+    /// that an earlier release built over `CHAR(n)` columns, so their entries are in the form this
+    /// release writes (see `executor::char_canon`). Any other index is always consistent and is
+    /// left alone.
+    Reindex(ReindexTarget),
     /// `CLUSTER [VERBOSE] [table [USING index]]` — accepted as a no-op. `CLUSTER` physically reorders a
     /// heap to an index's order; NusaDB stores rows in a clustered B-tree keyed by an engine-minted
     /// row-id (no user-visible physical order to change), so there is nothing to do — but migration

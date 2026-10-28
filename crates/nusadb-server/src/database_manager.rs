@@ -426,6 +426,7 @@ impl DatabaseManager {
         // table name. A standby gets the primary's repair through the log.
         if !self.is_standby() {
             repair_column_defaults(&engine, name);
+            note_legacy_char_indexes(&engine, name);
         }
         spawn_purge_scheduler(&engine, name);
         // Keep this database's planner statistics fresh in the background (no-op if disabled).
@@ -2219,6 +2220,27 @@ fn save_catalog(root: &Path, databases: &BTreeSet<String>) -> io::Result<()> {
     write_fresh(&tmp, body.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
     sync_dir(&root.join("global"))
+}
+
+/// Record, once per database and from the catalogs alone, which indexes over `CHAR(n)` columns an
+/// earlier release built (see
+/// [`note_legacy_char_indexes`](nusadb_sql::note_legacy_char_indexes)), and say how to rebuild them
+/// when there are any. No row is read, so it costs nothing at open; a failure is logged and those
+/// indexes stay on their slower but correct path.
+fn note_legacy_char_indexes(engine: &BtreeEngine, db: &str) {
+    match nusadb_sql::note_legacy_char_indexes(engine) {
+        Ok(0) => {},
+        Ok(count) => tracing::warn!(
+            db,
+            indexes = count,
+            "{count} index(es) over CHAR columns were built by an earlier release and are \
+             checked through a slower path until rebuilt; run REINDEX DATABASE (or REINDEX TABLE / \
+             REINDEX INDEX) to rebuild them"
+        ),
+        Err(e) => {
+            tracing::warn!(db, error = %e, "could not record the indexes built by an earlier release");
+        },
+    }
 }
 
 /// Run the one-time column-default repair on a database as it opens (see

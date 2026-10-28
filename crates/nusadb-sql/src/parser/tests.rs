@@ -4912,7 +4912,7 @@ fn reindex_is_accepted_as_a_noop() {
         "REINDEX (VERBOSE) TABLE t",
     ] {
         assert!(
-            matches!(parse(sql), Ok(ast::Statement::Reindex)),
+            matches!(parse(sql), Ok(ast::Statement::Reindex(_))),
             "should accept: {sql}"
         );
     }

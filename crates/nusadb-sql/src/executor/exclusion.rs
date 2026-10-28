@@ -939,16 +939,25 @@ fn candidates(
             probes.sort_by(|a, b| dml::unique_key_cmp(a, b));
             probes.dedup_by(|a, b| dml::unique_key_cmp(a, b) == Ordering::Equal);
             let schema = column_types(table);
+            // The index columns' types, for the range that holds every spelling of a key (see
+            // `global_unique::probe_ranges`); the rows read are compared by the caller.
+            let probe_types: Vec<ColumnType> = c
+                .eq_columns
+                .as_deref()
+                .map(|eq| {
+                    order
+                        .iter()
+                        .filter_map(|&i| eq.get(i))
+                        .filter_map(|name| table.columns.iter().find(|col| &col.name == name))
+                        .map(|col| col.ty)
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut rows: HashMap<Tid, Row> = HashMap::new();
             for probe in probes {
-                let encoded = index_key::encode_index_key(&probe)?;
-                let mut scan = engine.index_scan_committed(
-                    txn,
-                    index,
-                    std::ops::Bound::Included(encoded.clone()),
-                    std::ops::Bound::Included(encoded),
-                )?;
-                while let Some((tid, tuple)) = scan.try_next()? {
+                for (tid, tuple) in
+                    super::global_unique::key_entries(engine, txn, index, &probe, &probe_types)?
+                {
                     crate::cancel::check()?;
                     if let std::collections::hash_map::Entry::Vacant(slot) = rows.entry(tid) {
                         slot.insert(row::decode(&tuple, &schema)?);

@@ -125,7 +125,20 @@ mod stats;
 mod advisory;
 pub mod agg;
 pub(crate) mod coldefault;
+pub use char_canon::{note_legacy_char_indexes, reindex_each_table};
+
+/// The refusal of `REINDEX DATABASE` / `REINDEX SCHEMA` inside a transaction block: it commits
+/// table by table.
+#[must_use]
+pub fn reindex_in_block() -> Error {
+    Error::Coded {
+        message: "REINDEX DATABASE and REINDEX SCHEMA cannot run inside a transaction block"
+            .to_owned(),
+        sqlstate: "25001",
+    }
+}
 pub use coldefault::{AmbiguousDefault, DefaultRepair, repair_misfiled_column_defaults};
+mod char_canon;
 mod column_deps;
 mod comment;
 mod dcl;
@@ -135,6 +148,7 @@ mod dml;
 mod dml_join;
 mod exclusion;
 mod function;
+mod global_unique;
 mod index_key;
 mod inheritance;
 mod instrument;
@@ -1806,6 +1820,8 @@ pub(crate) fn rendered_plan_is_volatile(rendered: &str) -> bool {
 impl<'engine> Session<'engine> {
     /// Open a new session with no active transaction.
     pub fn new(engine: &'engine dyn StorageEngine) -> Self {
+        deferred::session_started();
+        char_canon::ensure_snapshot(engine);
         Self {
             engine,
             current_txn: None,
@@ -1989,6 +2005,15 @@ impl<'engine> Session<'engine> {
                 self.set_variable(name, value, local)
             },
             PhysicalPlan::ShowVariable(name) => Ok(self.show_variable(&name)),
+            // A whole schema or database is rebuilt table by table, each in its own transaction.
+            PhysicalPlan::Reindex(
+                target @ (ast::ReindexTarget::Database(_) | ast::ReindexTarget::Schema(_)),
+            ) => {
+                if self.current_txn.is_some() {
+                    return Err(reindex_in_block());
+                }
+                char_canon::reindex_each_table(self.engine, &target, None)
+            },
             // Prepared-statement control needs the session's statement store.
             PhysicalPlan::Prepare {
                 name,
@@ -3026,10 +3051,6 @@ fn capture_cursor_rows(
     Ok(CursorData::Spilled(writer.finish()?))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one flat arm per PhysicalPlan variant; length tracks the plan grammar, not complexity"
-)]
 fn dispatch(
     plan: PhysicalPlan,
     engine: &dyn StorageEngine,
@@ -3044,6 +3065,45 @@ fn dispatch(
     // SELECT path binds it separately); it is re-entered for `Batch` desugars and nested trigger /
     // procedure / DO / function bodies, which re-bind the same context and restore it on return.
     let _exec_ctx = eval::bind_exec_context(engine, txn);
+    // A statement other than a plain data write may change the partition tree or a table's
+    // constraints: what the global-key cache learned is not reused after it.
+    let changes_definitions = !matches!(
+        plan,
+        PhysicalPlan::Insert(_)
+            | PhysicalPlan::Update(_)
+            | PhysicalPlan::Delete(_)
+            | PhysicalPlan::Merge(_)
+            | PhysicalPlan::Select(..)
+            | PhysicalPlan::SetOperation(_)
+            | PhysicalPlan::Batch(_)
+            | PhysicalPlan::Explain(..)
+            | PhysicalPlan::SetVariable { .. }
+            | PhysicalPlan::ShowVariable(_)
+            | PhysicalPlan::ShowTables
+            | PhysicalPlan::ShowColumns(_)
+            | PhysicalPlan::SetRole(_)
+            | PhysicalPlan::SetConstraints(_)
+            | PhysicalPlan::LockTable { .. }
+    );
+    // The keys the statement writes under a unique key enforced across partitions are checked
+    // when it finishes (`global_unique`).
+    let outcome = global_unique::statement(engine, txn, || dispatch_plan(plan, engine, txn));
+    if changes_definitions {
+        global_unique::invalidate();
+    }
+    outcome
+}
+
+/// The body of [`dispatch`]: run one plan.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat arm per PhysicalPlan variant; length tracks the plan grammar, not complexity"
+)]
+fn dispatch_plan(
+    plan: PhysicalPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
     match plan {
         // The multi-object DDL desugar: children run in order within this same statement
         // transaction (so `DROP TABLE a, b` is atomic); the first error aborts the rest and
@@ -3111,7 +3171,7 @@ fn dispatch(
         PhysicalPlan::Explain(inner, options) => run_explain(&inner, options, engine, txn),
         PhysicalPlan::Vacuum(options) => run_vacuum(options, engine, txn),
         // REINDEX is a no-op: NusaDB's B-tree indexes are always consistent (MVCC + purge).
-        PhysicalPlan::Reindex => Ok(ExecutionResult::Reindexed),
+        PhysicalPlan::Reindex(target) => char_canon::run_reindex(&target, engine, txn),
         // CLUSTER is a no-op: NusaDB has no user-visible physical row order to reorganize.
         PhysicalPlan::Cluster => Ok(ExecutionResult::Clustered),
         // CHECKPOINT is normally intercepted before a data transaction is opened (it needs a
@@ -3677,7 +3737,7 @@ fn format_plan(
             if options.full { " FULL" } else { "" },
             if options.analyze { " ANALYZE" } else { "" }
         )],
-        PhysicalPlan::Reindex => vec![format!("{indent}Reindex (no-op)")],
+        PhysicalPlan::Reindex(_) => vec![format!("{indent}Reindex")],
         PhysicalPlan::Cluster => vec![format!("{indent}Cluster (no-op)")],
         PhysicalPlan::Checkpoint => vec![format!("{indent}Checkpoint")],
         PhysicalPlan::Analyze(p) => vec![format!(
@@ -4234,6 +4294,15 @@ fn scannable_indexes_of(
         // index keyed on expressions is offered; the planner uses it only for a predicate on the
         // same expression.
         if unique_index::split_predicate(&def).0.is_some() {
+            continue;
+        }
+        // An index an earlier release built over a CHAR(n) column may hold a value with trailing
+        // blanks its row no longer has. A column index is scanned through every spelling of the
+        // key (`scan::legacy_index_entries`); an expression over such a column cannot be spelled,
+        // so that index is not offered until REINDEX.
+        if !def.key_exprs.is_empty()
+            && char_canon::needs_legacy_probe(engine, txn, id, &def, schema)?
+        {
             continue;
         }
         out.push(crate::IndexInfo {

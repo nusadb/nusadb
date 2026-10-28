@@ -79,6 +79,10 @@ pub(super) enum Kind {
     ForeignKey,
     /// `EXCLUDE`.
     Exclusion,
+    /// A `PRIMARY KEY` / `UNIQUE` enforced across the partitions of a partitioned table
+    /// (`executor::global_unique`), recorded on that table. Never cataloged: whether such a key is
+    /// deferred follows the partition's own copy of the constraint.
+    GlobalUnique,
 }
 
 impl Kind {
@@ -87,6 +91,7 @@ impl Kind {
             Self::Unique => "u",
             Self::ForeignKey => "f",
             Self::Exclusion => "x",
+            Self::GlobalUnique => "g",
         }
     }
 
@@ -95,15 +100,16 @@ impl Kind {
             "u" => Some(Self::Unique),
             "f" => Some(Self::ForeignKey),
             "x" => Some(Self::Exclusion),
+            "g" => Some(Self::GlobalUnique),
             _ => None,
         }
     }
 }
 
 /// One constraint whose check a transaction can defer: its kind, the table it is declared on (the
-/// referencing table, for a foreign key), and its name. Further kinds of deferred check (a unique
-/// key enforced across the partitions of a table, say) take a variant of [`Kind`] and of
-/// [`Pending`] of their own.
+/// referencing table, for a foreign key; the partitioned table, for a key enforced across its
+/// partitions), and its name. Further kinds of deferred check take a variant of [`Kind`] and,
+/// when they queue something other than a key, of [`Pending`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ConstraintRef {
     pub(super) kind: Kind,
@@ -124,6 +130,14 @@ impl ConstraintRef {
         Self {
             kind: Kind::ForeignKey,
             table: child,
+            name: name.to_owned(),
+        }
+    }
+
+    pub(super) fn global_unique(table: TableId, name: &str) -> Self {
+        Self {
+            kind: Kind::GlobalUnique,
+            table,
             name: name.to_owned(),
         }
     }
@@ -402,10 +416,10 @@ pub fn commit(engine: &dyn StorageEngine, txn: TxnId) -> Result<(), Error> {
         && !state.entries.is_empty()
         && let Err(e) = check_entries(engine, txn, &state.entries)
     {
-        let _ = engine.rollback(txn);
+        let _ = super::global_unique::around_end(engine, txn, || engine.rollback(txn));
         return Err(e);
     }
-    engine.commit(txn).map_err(Into::into)
+    super::global_unique::around_end(engine, txn, || engine.commit(txn)).map_err(Into::into)
 }
 
 /// Roll `txn` back, forgetting its deferred state. Every rollback of a transaction that ran SQL
@@ -415,7 +429,7 @@ pub fn commit(engine: &dyn StorageEngine, txn: TxnId) -> Result<(), Error> {
 /// The engine's rollback failure.
 pub fn rollback(engine: &dyn StorageEngine, txn: TxnId) -> nusadb_core::Result<()> {
     forget(engine, txn);
-    engine.rollback(txn)
+    super::global_unique::around_end(engine, txn, || engine.rollback(txn))
 }
 
 /// Run `txn`'s deferred checks before `PREPARE TRANSACTION`.
@@ -430,10 +444,37 @@ pub fn prepare(engine: &dyn StorageEngine, txn: TxnId) -> Result<(), Error> {
         && !state.entries.is_empty()
         && let Err(e) = check_entries(engine, txn, &state.entries)
     {
-        let _ = engine.rollback(txn);
+        let _ = super::global_unique::around_end(engine, txn, || engine.rollback(txn));
         return Err(e);
     }
     Ok(())
+}
+
+/// Run `finish`, which ends a transaction outside the usual wrappers.
+///
+/// That is `PREPARE TRANSACTION` of `txn`, or (`txn` `None`) `COMMIT PREPARED` /
+/// `ROLLBACK PREPARED` of a transaction prepared earlier. What the SQL layer caches about the
+/// partition tree is dropped around it when the transaction may have changed that tree.
+pub fn end_outside<T>(
+    engine: &dyn StorageEngine,
+    txn: Option<TxnId>,
+    finish: impl FnOnce() -> T,
+) -> T {
+    match txn {
+        Some(txn) => super::global_unique::around_end(engine, txn, finish),
+        None => super::global_unique::invalidating(finish),
+    }
+}
+
+/// A session or connection starts on `engine` (see `executor::global_unique`).
+pub fn session_started() {
+    super::global_unique::session_started();
+}
+
+/// A connection is bound to `engine`: record, if no session of this build has yet, which of its
+/// indexes predate this release (`executor::char_canon`). A catalog lookup once recorded.
+pub fn connection_bound(engine: &dyn StorageEngine) {
+    super::char_canon::ensure_snapshot(engine);
 }
 
 /// `SAVEPOINT name` in `txn`, remembering the queue length and mode for [`rollback_to`].
@@ -676,6 +717,7 @@ thread_local! {
 /// on this thread: no catalog read cached before it is used again.
 pub fn new_statement() {
     CACHE.with(|c| c.borrow_mut().take());
+    super::global_unique::new_statement();
 }
 
 /// Drop this thread's cached reads when they belong to `txn`.
@@ -1028,6 +1070,24 @@ pub(super) fn set_constraints(
         None => None,
         Some(names) => Some(resolve_names(names, engine, txn)?),
     };
+    // The keys a named unique constraint queued across a partitioned table's partitions are queued
+    // under that table's scope: switching the constraint (or a partition's copy of it) to
+    // IMMEDIATE checks them too.
+    let scopes: Vec<ConstraintRef> = match &targets {
+        None => Vec::new(),
+        Some(targets) => {
+            let mut scopes = Vec::new();
+            for t in targets.iter().filter(|t| t.kind == Kind::Unique) {
+                if let Some(table) = engine.lookup_table_by_id_as_of(txn, t.table)?
+                    && let Some(scope) =
+                        super::global_unique::scope_of(&table, &t.name, engine, txn)?
+                {
+                    scopes.push(scope.deferral_ref());
+                }
+            }
+            scopes
+        },
+    };
     with_state(engine, txn, |state| match &targets {
         None => {
             state.mode.all = Some(stmt.deferred);
@@ -1043,7 +1103,11 @@ pub(super) fn set_constraints(
         return Ok(ExecutionResult::ConstraintsSet);
     }
     // IMMEDIATE: check what the switched constraints queued, then drop those entries.
-    let selected = |e: &Entry| targets.as_ref().is_none_or(|t| t.contains(&e.constraint));
+    let selected = |e: &Entry| {
+        targets
+            .as_ref()
+            .is_none_or(|t| t.contains(&e.constraint) || scopes.contains(&e.constraint))
+    };
     let due: Vec<Entry> = with_state(engine, txn, |state| {
         state
             .entries
@@ -1163,6 +1227,9 @@ fn constraint_exists(
             .list_constraints_as_of(txn, c.table)?
             .iter()
             .any(|k| k.name == c.name && super::exclusion::is_exclusion(k)),
+        Kind::GlobalUnique => {
+            super::global_unique::constraint_exists(c.table, &c.name, engine, txn)?
+        },
     })
 }
 
@@ -1222,6 +1289,14 @@ fn check_entries(engine: &dyn StorageEngine, txn: TxnId, entries: &[Entry]) -> R
             Kind::Unique => check_unique(engine, txn, &c, group)?,
             Kind::ForeignKey => check_foreign_key(engine, txn, &c, group)?,
             Kind::Exclusion => check_exclusion(engine, txn, &c, &group)?,
+            Kind::GlobalUnique => super::global_unique::check_deferred(
+                c.table,
+                &c.name,
+                group.keys,
+                group.whole,
+                engine,
+                txn,
+            )?,
         }
     }
     Ok(())
@@ -1272,16 +1347,13 @@ fn check_unique(
         .all(|k| k.iter().all(super::ops::is_hash_safe_value));
     if let (Some(index), true) = (index, probe_safe) {
         let types = column_types(&table);
+        let key_types = super::dml::ordinal_types(&table, &ordinals);
         for key in &keys {
-            let encoded = index_key::encode_index_key(key)?;
-            let mut scan = engine.index_scan_committed(
-                txn,
-                index,
-                std::ops::Bound::Included(encoded.clone()),
-                std::ops::Bound::Included(encoded),
-            )?;
             let mut holders: HashSet<Tid> = HashSet::new();
-            while let Some((tid, tuple)) = scan.try_next()? {
+            // Every spelling an entry may hold the key in (see `global_unique::probe_ranges`).
+            for (tid, tuple) in
+                super::global_unique::key_entries(engine, txn, index, key, &key_types)?
+            {
                 crate::cancel::check()?;
                 let row = row::decode(&tuple, &types)?;
                 if unique_key(&row, &ordinals, nnd).is_some_and(|k| unique_key_eq(&k, key)) {
@@ -1360,15 +1432,16 @@ impl Lookup {
             Self::Index(index, order) => {
                 let probe: Vec<ast::Value> =
                     order.iter().filter_map(|&i| key.get(i).cloned()).collect();
-                let encoded = index_key::encode_index_key(&probe)?;
-                let mut scan = engine.index_scan_committed(
-                    txn,
-                    *index,
-                    std::ops::Bound::Included(encoded.clone()),
-                    std::ops::Bound::Included(encoded),
-                )?;
+                let probe_types: Vec<ColumnType> = order
+                    .iter()
+                    .filter_map(|&i| ordinals.get(i))
+                    .filter_map(|&o| table.columns.get(o).map(|c| c.ty))
+                    .collect();
                 let types = column_types(table);
-                while let Some((_, tuple)) = scan.try_next()? {
+                // Every spelling an entry may hold the key in (see `global_unique::probe_ranges`).
+                for (_, tuple) in
+                    super::global_unique::key_entries(engine, txn, *index, &probe, &probe_types)?
+                {
                     crate::cancel::check()?;
                     let row = row::decode(&tuple, &types)?;
                     if unique_key(&row, ordinals, false).is_some_and(|k| unique_key_eq(&k, key)) {
@@ -1974,15 +2047,15 @@ mod tests {
         let allowed = [
             (
                 "executor/deferred.rs",
-                "let_=engine.rollback(txn);returnErr(e);",
+                "around_end(engine,txn,||engine.rollback(txn));returnErr(e);",
             ),
             (
                 "executor/deferred.rs",
-                "engine.commit(txn).map_err(Into::into)",
+                "around_end(engine,txn,||engine.commit(txn)).map_err(Into::into)",
             ),
             (
                 "executor/deferred.rs",
-                "forget(engine,txn);engine.rollback(txn)",
+                "around_end(engine,txn,||engine.rollback(txn))}pubfnprepare",
             ),
             ("executor/deferred.rs", "engine.savepoint(txn,name)?;"),
             ("executor/deferred.rs", "engine.rollback_to(txn,name)?;"),
@@ -1992,7 +2065,7 @@ mod tests {
             ),
             (
                 "two_phase.rs",
-                "deferred::prepare(engine,txn)?;engine.prepare_transaction(txn,gid,owner,database)",
+                "end_outside(engine,Some(txn),||{engine.prepare_transaction(txn,gid,owner,database)}",
             ),
         ];
         let offenders = boundary_offenders(&sources, &allowed);

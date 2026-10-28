@@ -1167,7 +1167,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             Ok(LogicalPlan::ShowColumns(schema))
         },
         ast::Statement::Vacuum(options) => Ok(LogicalPlan::Vacuum(options)),
-        ast::Statement::Reindex => Ok(LogicalPlan::Reindex),
+        ast::Statement::Reindex(target) => Ok(LogicalPlan::Reindex(target)),
         ast::Statement::Cluster => Ok(LogicalPlan::Cluster),
         ast::Statement::Checkpoint => Ok(LogicalPlan::Checkpoint),
         ast::Statement::Analyze(an) => analyze_analyze(an, catalog),

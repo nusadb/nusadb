@@ -355,8 +355,8 @@ pub(super) fn analyze_create_index(
         return Err(Error::Coded {
             message: format!(
                 "a unique index cannot be created on partitioned table \"{}\"; declare a UNIQUE \
-                 constraint on it (which must include the partition key) or create the unique \
-                 index on each partition",
+                 constraint on it (enforced across its partitions) or create the unique index on \
+                 each partition",
                 table.name
             ),
             sqlstate: "0A000",

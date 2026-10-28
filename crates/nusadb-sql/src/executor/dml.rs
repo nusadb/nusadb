@@ -55,6 +55,21 @@ pub(super) fn run_insert(
         route_partitioned_insert(plan, key_cols, value_rows, engine, txn, true)?
     } else {
         match &plan.on_conflict {
+            // A partition written directly may find a conflict on a key enforced across its
+            // partitioned table in a sibling: that row's upsert runs there.
+            Some(OnConflictPlan::DoUpdate {
+                target,
+                assignments,
+                filter,
+            }) if target_is_partition => upsert_into_partition(
+                plan,
+                value_rows,
+                target,
+                assignments,
+                filter.as_ref(),
+                engine,
+                txn,
+            )?,
             Some(OnConflictPlan::DoUpdate {
                 target,
                 assignments,
@@ -123,6 +138,44 @@ pub(super) fn run_insert(
             command: RowsCommand::Insert,
         })
     }
+}
+
+/// `INSERT INTO <partition> ... ON CONFLICT DO UPDATE`: a key enforced across the partitioned
+/// table may find its conflict in a sibling partition, where that row's upsert then runs.
+fn upsert_into_partition(
+    plan: &InsertPlan,
+    value_rows: Vec<Vec<Option<ast::Value>>>,
+    target: &ConflictArbiter,
+    assignments: &[(usize, crate::planner::TypedExpr)],
+    filter: Option<&crate::planner::TypedExpr>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    let buckets = send_upserts_to_global_conflicts(
+        &plan.columns,
+        target,
+        vec![(plan.table.clone(), value_rows)],
+        engine,
+        txn,
+    )?;
+    let mut affected = Vec::new();
+    for (table, rows) in buckets {
+        let own = table.id == plan.table.id;
+        affected.extend(upsert_rows(
+            &table,
+            &plan.columns,
+            rows,
+            plan.rls_check.as_ref(),
+            plan.overriding,
+            target,
+            assignments,
+            filter,
+            engine,
+            txn,
+            own,
+        )?);
+    }
+    Ok(affected)
 }
 
 /// A compiled partition-key slot against an `INSERT`'s value tuple (`plan.columns` order): a
@@ -398,7 +451,7 @@ fn route_partitioned_insert(
     if let Some(triggers) = &update_triggers {
         triggers.fire_stmt_before(&plan.table, engine, txn)?;
     }
-    let mut inserted = Vec::new();
+    let mut resolved = Vec::with_capacity(leaves.len());
     for (part_name, rows) in leaves {
         // The leaf's bucket key is schema-qualified; split it back into the table's coordinates.
         let (leaf_schema, leaf_name) = crate::analyzer::split_qualified(&part_name);
@@ -411,11 +464,20 @@ fn route_partitioned_insert(
             .ok_or_else(|| Error::TableNotFound {
                 name: part_name.clone(),
             })?;
+        resolved.push((part, rows));
+    }
+    // An arbiter that leaves out a partitioning column may find its conflict in another
+    // partition than the one the row routes to: the row then goes to that partition's upsert.
+    if let Some(OnConflictPlan::DoUpdate { target, .. }) = &plan.on_conflict {
+        resolved = send_upserts_to_global_conflicts(&plan.columns, target, resolved, engine, txn)?;
+    }
+    let mut inserted = Vec::new();
+    for (part, rows) in resolved {
         // Route first, then run the statement's INSERT / upsert action against the leaf the rows
         // landed in: the parent's key constraints exist on every partition (propagated at
-        // partition create/attach), so the conflict arbiter resolves locally — and because the
-        // arbiter includes the partition key, a conflicting row can only ever live in the same
-        // leaf the new row routes to.
+        // partition create/attach), so the conflict arbiter resolves locally. An arbiter that
+        // includes the partition key can only conflict within the leaf the row routes to; one
+        // that does not was sent to its conflict's leaf above.
         let routed = match &plan.on_conflict {
             Some(OnConflictPlan::DoUpdate {
                 target,
@@ -462,6 +524,187 @@ fn route_partitioned_insert(
         triggers.fire_stmt_after(&plan.table, engine, txn)?;
     }
     Ok(inserted)
+}
+
+/// Where an upsert key was placed: scope table, scope constraint, key hash.
+type PlacedSlot = (nusadb_core::TableId, String, u64);
+
+/// The value rows of an upsert, per partition.
+type UpsertBuckets = Vec<(TableSchema, Vec<Vec<Option<ast::Value>>>)>;
+
+/// `ON CONFLICT DO UPDATE` whose arbiter is a key enforced across the partitions of a partitioned
+/// table (`global_unique`): move each row whose key a live row of another partition holds into
+/// that partition's bucket, so its upsert updates the row where it lives. A second row of the
+/// statement with the same key follows the first, so the upsert reports it as affecting one row
+/// twice. The keys are locked in their scope first and the conflicting row itself is locked, so
+/// it cannot go away before the upsert reaches it. A conflicting row this transaction's snapshot
+/// does not see (committed after the snapshot) is never updated: when it sits in another
+/// partition the statement fails here with `40001`; when it sits in the routed partition the
+/// upsert's own path cannot see it either and the insert it tries fails with `23505`, as on a
+/// table that is not partitioned.
+///
+/// A row whose arbiter key is not supplied by the statement (a default) keeps its routing: its key
+/// is still checked across the partitions when the statement ends.
+fn send_upserts_to_global_conflicts(
+    columns: &[usize],
+    target: &ConflictArbiter,
+    buckets: UpsertBuckets,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<UpsertBuckets, Error> {
+    let mut out: UpsertBuckets = Vec::with_capacity(buckets.len());
+    // The keys seen so far, with the bucket they went to, bucketed by scope and key hash (a
+    // collision only costs a comparison).
+    let mut placed: HashMap<PlacedSlot, Vec<(Vec<ast::Value>, nusadb_core::TableId)>> =
+        HashMap::new();
+    let mut pending: Vec<(TableSchema, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
+    for (leaf, rows) in buckets {
+        // Only a key constraint is enforced across partitions; a unique index arbiter (full or
+        // partial) is the partition's own.
+        let arbiter = resolve_arbiter(&leaf, target, engine, txn)?;
+        let mut wanted = arbiter.ordinals.clone();
+        wanted.sort_unstable();
+        let globals = super::global_unique::leaf_globals(&leaf, engine, txn)?;
+        let global = globals.iter().find(|g| {
+            let mut ordinals = g.ordinals.clone();
+            ordinals.sort_unstable();
+            arbiter.predicate.is_none() && ordinals == wanted
+        });
+        let Some(g) = global else {
+            pending.push((leaf, rows));
+            continue;
+        };
+        // The key of each row, when the statement supplies every key column.
+        let keys = rows
+            .iter()
+            .map(|row| {
+                supplied_key(row, columns, &g.ordinals, &leaf)?
+                    .map(|key| g.stored(&key))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        for key in keys.iter().flatten() {
+            g.scope.lock(key, engine, txn)?;
+        }
+        let leaves = super::global_unique::ScopeLeaves::load(&g.scope, engine, txn)?;
+        let mut stay = Vec::with_capacity(rows.len());
+        for (row, key) in rows.into_iter().zip(keys) {
+            let Some(key) = key else {
+                stay.push(row);
+                continue;
+            };
+            let slot = (
+                g.scope.table.id,
+                g.scope.constraint.clone(),
+                unique_key_hash(&g.scope.table, &g.scope.columns, &key),
+            );
+            let earlier = placed
+                .get(&slot)
+                .and_then(|bucket| bucket.iter().find(|(k, _)| unique_key_eq(k, &key)))
+                .map(|(_, to)| *to);
+            let destination = if let Some(to) = earlier {
+                Some(to)
+            } else {
+                match leaves.holder(&key, engine, txn)? {
+                    Some((holder, tid)) if holder.id != leaf.id => {
+                        if conflict_still_there(&holder, tid, engine, txn)? {
+                            let id = holder.id;
+                            if !pending.iter().any(|(t, _)| t.id == id)
+                                && !out.iter().any(|(t, _)| t.id == id)
+                            {
+                                pending.push((holder, Vec::new()));
+                            }
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    },
+                    _ => None,
+                }
+            };
+            placed
+                .entry(slot)
+                .or_default()
+                .push((key, destination.unwrap_or(leaf.id)));
+            match destination {
+                Some(to) if to != leaf.id => {
+                    if let Some((_, bucket)) = pending
+                        .iter_mut()
+                        .chain(out.iter_mut())
+                        .find(|(t, _)| t.id == to)
+                    {
+                        bucket.push(row);
+                    }
+                },
+                _ => stay.push(row),
+            }
+        }
+        out.push((leaf, stay));
+    }
+    // Merge the buckets of tables that appear twice (a partition first reached as a conflict's
+    // home, then as a routed bucket of its own).
+    let mut merged: UpsertBuckets = Vec::with_capacity(out.len() + pending.len());
+    for (table, rows) in out.into_iter().chain(pending) {
+        match merged.iter_mut().find(|(t, _)| t.id == table.id) {
+            Some((_, bucket)) => bucket.extend(rows),
+            None => merged.push((table, rows)),
+        }
+    }
+    merged.retain(|(_, rows)| !rows.is_empty());
+    Ok(merged)
+}
+
+/// The arbiter key of an upsert's value row (`columns` order) at `ordinals` of `leaf`, in its
+/// stored form, or `None` when the statement does not supply every key column (or one is NULL).
+fn supplied_key(
+    row: &[Option<ast::Value>],
+    columns: &[usize],
+    ordinals: &[usize],
+    leaf: &TableSchema,
+) -> Result<Option<Vec<ast::Value>>, Error> {
+    let mut key = Vec::with_capacity(ordinals.len());
+    for &ordinal in ordinals {
+        let ty = leaf.columns.get(ordinal).map(|c| c.ty);
+        let value = columns
+            .iter()
+            .position(|&c| c == ordinal)
+            .and_then(|pos| row.get(pos))
+            .and_then(Clone::clone);
+        match (value, ty) {
+            (Some(v), Some(ty)) if !matches!(v, ast::Value::Null) => {
+                let mut v = eval::cast_value(v, ty)?;
+                row::adopt_column_type(&mut v, ty)?;
+                stored_form(&mut v, ty)?;
+                key.push(v);
+            },
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(key))
+}
+
+/// Lock the conflicting row `tid` of `holder` for the upsert that will update it: `true` when it
+/// is still there as this statement's snapshot reads it, `false` when it was deleted since. A row
+/// the snapshot does not see (written after it) is a serialization failure (`40001`): the upsert
+/// could not update the version it reads.
+fn conflict_still_there(
+    holder: &TableSchema,
+    tid: Tid,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<bool, Error> {
+    match engine.lock_row_current(
+        txn,
+        holder.id,
+        tid,
+        nusadb_core::engine::RowLockMode::Exclusive,
+    )? {
+        nusadb_core::engine::LockedRow::Unchanged => Ok(true),
+        nusadb_core::engine::LockedRow::Deleted => Ok(false),
+        nusadb_core::engine::LockedRow::Updated(_) => {
+            Err(nusadb_core::Error::SerializationConflict { txn }.into())
+        },
+    }
 }
 
 /// A direct `INSERT` into a partition must land within that partition's bound — and, under
@@ -773,6 +1016,8 @@ fn finalize_updated_row(
     table: &TableSchema,
     enum_info: &[Option<(String, Vec<String>)>],
 ) -> Result<Row, Error> {
+    // Generated columns are computed from the values as they will be stored.
+    strip_char_blanks(&mut row, table.columns.iter().map(|c| c.ty));
     for (index, fill) in fills.iter().enumerate() {
         let Some(super::coldefault::ColumnFill::Generated(expr)) = fill else {
             continue;
@@ -796,6 +1041,9 @@ fn finalize_updated_row(
         if let Some((enum_type, labels)) = enum_info.get(index).and_then(Option::as_ref) {
             row::coerce_enum(value, labels, enum_type)?;
         }
+        // The stored form, as INSERT writes it: the uniqueness checks, CHECK constraints and
+        // triggers see the value a later read returns.
+        stored_form(value, column.ty)?;
     }
     Ok(row)
 }
@@ -827,11 +1075,7 @@ pub(super) fn conform_trigger_row(
     row: Row,
     context: &ConformContext,
 ) -> Result<Row, Error> {
-    let mut row = finalize_updated_row(row, &context.fills, table, &context.enum_info)?;
-    for (value, column) in row.iter_mut().zip(&table.columns) {
-        stored_form(value, column.ty)?;
-    }
-    Ok(row)
+    finalize_updated_row(row, &context.fills, table, &context.enum_info)
 }
 
 /// After inserting `full_rows`, advance each `SERIAL`/`IDENTITY` column's sequence past the largest
@@ -1518,6 +1762,8 @@ fn insert_rows_with_unique(
                 row_covered.insert(col_idx);
             }
         }
+        // Generated columns are computed from the values as they will be stored.
+        strip_char_blanks(&mut full, schema.iter().copied());
         apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
         // A `timestamptz` written to a `timestamp` column (or the reverse) adopts the column's own
         // type here, before uniqueness/RLS/`RETURNING` ever see the row — so all three agree with
@@ -1688,6 +1934,18 @@ fn enforce_not_null<'r>(
     Ok(())
 }
 
+/// Drop the trailing blanks of every `CHAR(n)` text value of `row` (`types` its column types), as
+/// storing it does: what generated columns, `CHECK` constraints and triggers compute from is then
+/// the value a later read returns.
+fn strip_char_blanks(row: &mut [ast::Value], types: impl IntoIterator<Item = ColumnType>) {
+    for (value, ty) in row.iter_mut().zip(types) {
+        if let (ColumnType::Char(_), ast::Value::Text(text)) = (ty, &mut *value) {
+            let kept = text.trim_end_matches(' ').len();
+            text.truncate(kept);
+        }
+    }
+}
+
 /// Turn a value supplied as text for a column of another type (an untyped literal such as
 /// `'2026-09-15'` for a `DATE`, or a text parameter) into the column's own type: the value it reads
 /// back as once stored. Without this the row would only take its column's type when encoded,
@@ -1696,10 +1954,15 @@ fn enforce_not_null<'r>(
 ///
 /// Only the types whose values have an index-key encoding are converted. Any other type keeps its
 /// text until it is stored, as before: its typed values cannot be index keys yet.
+///
+/// A `CHAR(n)` value loses its trailing blanks here, as it does when stored: they are not
+/// significant, and an index entry made from the row must be the entry a lookup of the stored
+/// value finds (`'x  '` and `'x'` are one key).
 fn stored_form(value: &mut ast::Value, ty: ColumnType) -> Result<(), Error> {
     let keyable = matches!(
         ty,
-        ColumnType::Bool
+        ColumnType::Char(_)
+            | ColumnType::Bool
             | ColumnType::Int
             | ColumnType::SmallInt
             | ColumnType::BigInt
@@ -1866,6 +2129,7 @@ fn upsert_rows(
                 row_covered.insert(col_idx);
             }
         }
+        strip_char_blanks(&mut full, schema.iter().copied());
         apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
         // Each value in its column's own type, exactly as a plain INSERT prepares it, so the
         // conflict probe and the uniqueness checks below compare it with the stored rows.
@@ -2444,6 +2708,23 @@ pub(super) fn run_copy_from(
     // A column DEFAULT such as `now()` reads the statement clock, which COPY pins like any
     // statement (it runs outside `dispatch`).
     let _clock = super::clock::enter_statement(txn);
+    // The load is one statement: the keys it writes under a unique key enforced across
+    // partitions are checked once, when it ends.
+    super::global_unique::new_statement();
+    super::global_unique::statement(engine, txn, || copy_from_body(copy, data, engine, txn))
+}
+
+/// The body of [`run_copy_from`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "one streaming load: column resolution, batching, partition routing, uniqueness"
+)]
+fn copy_from_body(
+    copy: &ast::Copy,
+    data: &[u8],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<usize, Error> {
     let table = lookup_copy_table(copy, engine, txn)?;
     super::claim_write_target(engine, txn, table.id)?;
     let columns = resolve_copy_columns(copy, &table)?;
@@ -2858,33 +3139,37 @@ fn try_unique_by_index_probe(
         }
     }
     // Probe. New rows are not yet in any index (enforcement runs before `insert_into_indexes`), so an
-    // index hit is always a distinct committed row.
+    // index hit holding the key is always a distinct committed row. The probe covers every spelling
+    // an index entry may hold the key in (a `CHAR(n)` entry written with its trailing blanks, see
+    // `global_unique::probe_ranges`), so each row read is compared with the key.
+    let schema = column_types(table);
     for probe in &probes {
+        let key_types = ordinal_types(table, &probe.ordinals);
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row in new_rows {
             let Some(key) = unique_key(row, &probe.ordinals, false) else {
                 continue; // a NULL key column: the row does not participate (NULL is distinct)
             };
             let encoded = index_key::encode_index_key(&key)?;
-            if !seen.insert(encoded.clone()) {
+            if !seen.insert(encoded) {
                 return Err(unique_violation_error(
                     probe.kind,
                     &probe.name,
                     &probe.columns,
                 ));
             }
-            let mut scan = engine.index_scan_committed(
-                txn,
-                probe.index,
-                std::ops::Bound::Included(encoded.clone()),
-                std::ops::Bound::Included(encoded),
-            )?;
-            if scan.try_next()?.is_some() {
-                return Err(unique_violation_error(
-                    probe.kind,
-                    &probe.name,
-                    &probe.columns,
-                ));
+            for (_, tuple) in
+                super::global_unique::key_entries(engine, txn, probe.index, &key, &key_types)?
+            {
+                let hit = row::decode(&tuple, &schema)?;
+                if unique_key(&hit, &probe.ordinals, false).is_some_and(|k| unique_key_eq(&k, &key))
+                {
+                    return Err(unique_violation_error(
+                        probe.kind,
+                        &probe.name,
+                        &probe.columns,
+                    ));
+                }
             }
         }
     }
@@ -2976,6 +3261,26 @@ fn lock_unique_keys(
             super::deferred::defer_keys(engine, txn, r, queue);
         }
     }
+    // A key enforced across the partitions of a partitioned table is also locked in that table's
+    // namespace, and checked when the statement ends (or at commit, when deferred).
+    let globals = super::global_unique::leaf_globals(table, engine, txn)?;
+    for g in globals.iter() {
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(key) = g.key_of(row)? {
+                g.scope.lock(&key, engine, txn)?;
+                keys.push(key);
+            }
+        }
+        if deferral.defers(&super::deferred::ConstraintRef::unique(
+            table.id,
+            &g.leaf_constraint,
+        )) {
+            super::global_unique::defer(&g.scope, keys, engine, txn);
+        } else {
+            super::global_unique::record(&g.scope, keys, engine, txn);
+        }
+    }
     Ok(())
 }
 
@@ -3042,6 +3347,71 @@ fn keep_non_conflicting(
     if !table_has_unique_constraint(table, engine)? {
         return Ok(new_rows);
     }
+    let kept = keep_locally_non_conflicting(table, new_rows, engine, txn)?;
+    keep_globally_non_conflicting(table, kept, engine, txn)
+}
+
+/// The part of [`keep_non_conflicting`] for the keys enforced across the partitions of a
+/// partitioned table: a row whose key a live row of another partition (or an earlier row of the
+/// statement, already written) holds is dropped. Each key is locked in its scope before the
+/// partitions are read, so the read is not racing a writer of the same key.
+fn keep_globally_non_conflicting(
+    table: &TableSchema,
+    rows: Vec<Row>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
+    let globals = super::global_unique::leaf_globals(table, engine, txn)?;
+    if globals.is_empty() || rows.is_empty() {
+        return Ok(rows);
+    }
+    // A deferrable key is no arbiter (as for a key of one table).
+    let deferral = super::deferred::table_state(engine, txn, table.id)?;
+    let arbiters: Vec<&super::global_unique::LeafGlobal> = globals
+        .iter()
+        .filter(|g| {
+            !deferral.deferrable(&super::deferred::ConstraintRef::unique(
+                table.id,
+                &g.leaf_constraint,
+            ))
+        })
+        .collect();
+    if arbiters.is_empty() {
+        return Ok(rows);
+    }
+    // Lock every key first, then list the partitions once and look the keys up.
+    let mut probes = Vec::with_capacity(arbiters.len());
+    for g in &arbiters {
+        for row in &rows {
+            if let Some(key) = g.key_of(row)? {
+                g.scope.lock(&key, engine, txn)?;
+            }
+        }
+        probes.push(super::global_unique::ScopeLeaves::load(
+            &g.scope, engine, txn,
+        )?);
+    }
+    let mut kept = Vec::with_capacity(rows.len());
+    'rows: for row in rows {
+        for (g, leaves) in arbiters.iter().zip(&probes) {
+            if let Some(key) = g.key_of(&row)?
+                && leaves.holder(&key, engine, txn)?.is_some()
+            {
+                continue 'rows;
+            }
+        }
+        kept.push(row);
+    }
+    Ok(kept)
+}
+
+/// The part of [`keep_non_conflicting`] that compares the rows with `table`'s own.
+fn keep_locally_non_conflicting(
+    table: &TableSchema,
+    new_rows: Vec<Row>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Row>, Error> {
     // The key-column ordinals of each PK/UNIQUE constraint, plus its NULLS-NOT-DISTINCT flag. A
     // deferrable constraint is no arbiter: the kept rows are checked against it as usual (queued
     // for commit, when deferred), so a conflict on it is reported rather than skipped.
@@ -3296,30 +3666,33 @@ fn try_update_unique_by_index_probe(
     };
     let schema = column_types(table);
     for probe in &probes {
+        let key_types = ordinal_types(table, &probe.ordinals);
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row in new_rows {
             let Some(key) = unique_key(row, &probe.ordinals, false) else {
                 continue;
             };
             let encoded = index_key::encode_index_key(&key)?;
-            if !seen.insert(encoded.clone()) {
+            if !seen.insert(encoded) {
                 return Err(unique_violation_error(
                     probe.kind,
                     &probe.name,
                     &probe.columns,
                 ));
             }
-            let mut scan = engine.index_scan_committed(
-                txn,
-                probe.index,
-                std::ops::Bound::Included(encoded.clone()),
-                std::ops::Bound::Included(encoded),
-            )?;
-            while let Some((tid, tuple)) = scan.try_next()? {
+            // Every spelling an entry may hold the key in (see `global_unique::probe_ranges`).
+            for (tid, tuple) in
+                super::global_unique::key_entries(engine, txn, probe.index, &key, &key_types)?
+            {
                 if rewritten.contains(&tid) {
                     continue; // the version this statement is itself rewriting
                 }
                 let hit = row::decode(&tuple, &schema)?;
+                if !unique_key(&hit, &probe.ordinals, false)
+                    .is_some_and(|k| unique_key_eq(&k, &key))
+                {
+                    continue; // another key the range holds
+                }
                 if holds_a_rewritten_key(&hit) {
                     continue; // a concurrently-reversioned copy of a row being rewritten
                 }
@@ -3332,6 +3705,14 @@ fn try_update_unique_by_index_probe(
         }
     }
     Ok(true)
+}
+
+/// The types of `table`'s columns at `ordinals`, in that order.
+pub(super) fn ordinal_types(table: &TableSchema, ordinals: &[usize]) -> Vec<ColumnType> {
+    ordinals
+        .iter()
+        .filter_map(|&i| table.columns.get(i).map(|c| c.ty))
+        .collect()
 }
 
 /// Whether `table` has any `PRIMARY KEY` / `UNIQUE` constraint to enforce (avoids a needless scan).
@@ -3855,12 +4236,30 @@ fn cascade_update_children(
     let child_types = column_types(child);
     let index_targets = secondary_index_targets(child, engine)?;
     // A BEFORE trigger may change other columns of the row the action writes, but not its keys:
-    // the action computed the foreign key values, and no uniqueness check runs here.
+    // the action computed the foreign key values.
     let keys = if triggers.has_before_row() {
         key_columns(child, engine, txn)?
     } else {
         Vec::new()
     };
+    // The child's unique key columns: a rewritten row whose key changes is locked (and queued,
+    // for a deferred or partition-spanning key) before it is written, and checked once every row
+    // of the action is written, so keys the action moves between rows do not count twice.
+    let unique_columns: Vec<usize> = if table_has_unique_constraint(child, engine)? {
+        let mut columns = Vec::new();
+        for c in engine.list_constraints_as_of(txn, child.id)? {
+            if matches!(
+                c.kind,
+                nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
+            ) {
+                columns.extend(constraint_ordinals(child, &c.columns)?);
+            }
+        }
+        columns
+    } else {
+        Vec::new()
+    };
+    let mut key_changed: Vec<Row> = Vec::new();
     // The child's exclusion constraints, checked per row after its BEFORE triggers. Every row the
     // action rewrites has its old version left out by Tid; the rows already rewritten are compared
     // through their new versions (this transaction's own writes), so two rewritten rows that come
@@ -3902,6 +4301,10 @@ fn cascade_update_children(
             engine,
             txn,
         )?;
+        if unique_columns.iter().any(|&i| old.get(i) != new.get(i)) {
+            lock_unique_keys(child, std::slice::from_ref(&new), engine, txn)?;
+            key_changed.push(new.clone());
+        }
         let bytes = row::encode(&new, &child_types)?;
         let new_tid = engine.update(txn, child.id, tid, &bytes)?;
         // Maintain the child's secondary indexes for the rewritten row version, as `run_update`
@@ -3916,6 +4319,7 @@ fn cascade_update_children(
         }
         written.push((new_tid, old, new));
     }
+    check_written_unique_keys(child, &key_changed, engine, txn)?;
     // Incremental view maintenance: apply the cascade rewrite's delta to any view over
     // the child, so a materialized view does not go stale after a cascade.
     let olds: Vec<Row> = written.iter().map(|(_, old, _)| old.clone()).collect();
@@ -3923,6 +4327,79 @@ fn cascade_update_children(
     super::ivm::maintain_on_change(&child.name, &news, &olds, engine, txn)?;
     // The caller carries on with these: the rewrite may change a key other rows reference.
     Ok(written)
+}
+
+/// After `rows` were written into `table` (their key locks already held): no key one of them holds
+/// under a `PRIMARY KEY` / `UNIQUE` constraint checked now may be held by any other live row. The
+/// rows are already in place, so a holder count above one is the duplicate. A deferred constraint
+/// queued the keys when they were locked and is checked at commit.
+fn check_written_unique_keys(
+    table: &TableSchema,
+    rows: &[Row],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let types = column_types(table);
+    for c in checked_unique_constraints(table, engine, txn)? {
+        let ordinals = constraint_ordinals(table, &c.columns)?;
+        let nnd = c.nulls_not_distinct;
+        let violation = || unique_violation_error(c.kind, &c.name, &c.columns);
+        let key_types = ordinal_types(table, &ordinals);
+        let mut keys: Vec<Vec<ast::Value>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(key) = unique_key(row, &ordinals, nnd) {
+                // In the form a read of the stored row returns, to compare with the rows read back.
+                keys.push(row::decode(&row::encode(&key, &key_types)?, &key_types)?);
+            }
+        }
+        keys.sort_by(|a, b| unique_key_cmp(a, b));
+        keys.dedup_by(|a, b| unique_key_cmp(a, b) == std::cmp::Ordering::Equal);
+        if keys.is_empty() {
+            continue;
+        }
+        let index = if nnd {
+            None
+        } else {
+            engine.lookup_index(&c.name)?
+        };
+        let probe = index.is_some()
+            && keys
+                .iter()
+                .all(|k| k.iter().all(super::ops::is_hash_safe_value));
+        if let (Some(index), true) = (index, probe) {
+            for key in &keys {
+                let mut holders: HashSet<Tid> = HashSet::new();
+                for (tid, tuple) in
+                    super::global_unique::key_entries(engine, txn, index, key, &key_types)?
+                {
+                    let row = row::decode(&tuple, &types)?;
+                    if unique_key(&row, &ordinals, nnd).is_some_and(|k| unique_key_eq(&k, key)) {
+                        holders.insert(tid);
+                    }
+                }
+                if holders.len() > 1 {
+                    return Err(violation());
+                }
+            }
+            continue;
+        }
+        let mut holders = vec![0_usize; keys.len()];
+        for (_, row) in scan_table_committed(table, engine, txn)? {
+            if let Some(k) = unique_key(&row, &ordinals, nnd)
+                && let Ok(i) = keys.binary_search_by(|p| unique_key_cmp(p, &k))
+                && let Some(h) = holders.get_mut(i)
+            {
+                *h += 1;
+                if *h > 1 {
+                    return Err(violation());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the `(tid, old, new)` triples for a `SET NULL` cascade: each `new` image is the referencing
@@ -4633,6 +5110,9 @@ fn guard_unique_entry(
     }
     let key = index_key_for(row, &target.keys)?;
     lock_unique_index_key(target, guard, &key, engine, txn)?;
+    if guard.reads_char && super::global_unique::canon_state(engine, txn)?.is_legacy(target.id) {
+        return guard_legacy_unique_entry(target, guard, row, tid, &key, engine, txn);
+    }
     let mut scan = engine.index_scan_committed(
         txn,
         target.id,
@@ -4649,6 +5129,85 @@ fn guard_unique_entry(
         if row_is_indexed(target, &held)? && index_key_for(&held, &target.keys)? == key {
             return Err(super::unique_index::duplicate(&guard.name));
         }
+    }
+    Ok(())
+}
+
+/// [`guard_unique_entry`] for a unique index an earlier release built over a `CHAR(n)` column, whose
+/// entries may hold a value with trailing blanks (`executor::char_canon`): a plain-column key is
+/// probed under every spelling it may have been written in (a predicate that reads no `CHAR(n)`
+/// column is rechecked on each row read); a key on expressions, or a predicate over such a column,
+/// is matched against the table's keys, read once per statement
+/// ([`super::global_unique::legacy_key_held`]).
+fn guard_legacy_unique_entry(
+    target: &IndexTarget,
+    guard: &super::unique_index::Guard,
+    row: &Row,
+    tid: Tid,
+    key: &[u8],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let holds = |other: Tid, held: &Row| -> Result<bool, Error> {
+        Ok(other != tid
+            && row_is_indexed(target, held)?
+            && index_key_for(held, &target.keys)? == key)
+    };
+    let duplicate = || super::unique_index::duplicate(&guard.name);
+    if let (IndexKeys::Columns(ordinals), false) = (&target.keys, guard.predicate_reads_char) {
+        // A plain-column key: its spellings, each row read checked against the key and the
+        // predicate (which reads no CHAR column, so it means for an old row what it means now).
+        let values: Vec<ast::Value> = ordinals
+            .iter()
+            .map(|&o| row.get(o).cloned().unwrap_or(ast::Value::Null))
+            .collect();
+        let types: Vec<ColumnType> = ordinals
+            .iter()
+            .filter_map(|&o| guard.types.get(o).copied())
+            .collect();
+        for (other, tuple) in
+            super::global_unique::key_entries(engine, txn, target.id, &values, &types)?
+        {
+            if holds(other, &row::decode(&tuple, &guard.types)?)? {
+                return Err(duplicate());
+            }
+        }
+        return Ok(());
+    }
+    // An expression key, or a predicate over a CHAR column: a row written since has a canonical
+    // entry, found by the exact probe; the older rows are matched against the statement's map of
+    // the table's keys (one pass over the table per statement).
+    let mut probe = engine.index_scan_committed(
+        txn,
+        target.id,
+        std::ops::Bound::Included(key.to_vec()),
+        std::ops::Bound::Included(key.to_vec()),
+    )?;
+    while let Some((other, tuple)) = probe.try_next()? {
+        if holds(other, &row::decode(&tuple, &guard.types)?)? {
+            return Err(duplicate());
+        }
+    }
+    drop(probe);
+    let key_of = |held: &Row| -> Result<Option<Vec<u8>>, Error> {
+        if row_is_indexed(target, held)? {
+            index_key_for(held, &target.keys).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    if super::global_unique::legacy_key_held(
+        engine,
+        txn,
+        target.id,
+        guard.table,
+        &guard.types,
+        key,
+        Some(tid),
+        &key_of,
+        &holds,
+    )? {
+        return Err(duplicate());
     }
     Ok(())
 }
@@ -4694,6 +5253,24 @@ fn row_is_indexed(target: &IndexTarget, row: &Row) -> Result<bool, Error> {
         Some(pred) => Ok(matches!(eval::eval(pred, row)?, ast::Value::Bool(true))),
         None => Ok(true),
     }
+}
+
+/// [`insert_into_indexes`] without the unique-index check (tests that write entries the way an
+/// earlier release did).
+#[cfg(test)]
+pub(super) fn insert_into_indexes_unchecked(
+    targets: &[IndexTarget],
+    row: &Row,
+    tid: Tid,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    for target in targets {
+        if row_is_indexed(target, row)? {
+            engine.index_insert(txn, target.id, &entry_key(target, row, tid)?, tid)?;
+        }
+    }
+    Ok(())
 }
 
 /// Add `row`@`tid` to every secondary index that indexes it (partial indexes skip non-matching
@@ -6438,6 +7015,26 @@ pub(super) fn run_merge(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     use crate::planner::MergeWhen;
+    // A partitioned table holds no rows of its own: a MERGE into it would match nothing and write
+    // its inserts into the parent itself, outside every partition (and every partition's keys).
+    // Refused until MERGE routes through partitions; a partition can be its target.
+    if super::partition::has_any(engine, txn)?
+        && super::partition::parent_key_parts(
+            engine,
+            txn,
+            &crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name),
+        )?
+        .is_some()
+    {
+        return Err(Error::Coded {
+            message: format!(
+                "MERGE into the partitioned table \"{}\" is not supported; merge into its \
+                 partitions",
+                plan.table.name
+            ),
+            sqlstate: "0A000",
+        });
+    }
     // The source: a derived `USING (VALUES ...)` / `USING (SELECT ...)` runs its inlined plan, a
     // named source is scanned; held in memory while it fits the work budget, else spilled.
     let source = join_source(plan.source_plan.as_deref(), Some(&plan.source), engine, txn)?

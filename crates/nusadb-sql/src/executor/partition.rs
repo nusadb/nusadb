@@ -13,6 +13,7 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -201,6 +202,7 @@ pub(super) fn record_parent(
         text(strategy_str(strategy)),
         text(""),
     ];
+    super::global_unique::catalog_written(engine, txn);
     engine.insert(txn, cat, &row::encode(&row, &PARTITION_CATALOG_SCHEMA)?)?;
     Ok(())
 }
@@ -223,6 +225,7 @@ pub(super) fn record_partition(
         text(kind),
         text(&payload),
     ];
+    super::global_unique::catalog_written(engine, txn);
     engine.insert(txn, cat, &row::encode(&row, &PARTITION_CATALOG_SCHEMA)?)?;
     Ok(())
 }
@@ -360,6 +363,9 @@ pub(super) fn remove_partition_entry(
             victims.push(tid);
         }
     }
+    if !victims.is_empty() {
+        super::global_unique::catalog_written(engine, txn);
+    }
     for tid in victims {
         engine.delete(txn, cat.id, tid)?;
     }
@@ -412,6 +418,7 @@ pub(super) fn rename_key_column(
     if let Some(slot) = row.get_mut(2) {
         *slot = text(&aux);
     }
+    super::global_unique::catalog_written(engine, txn);
     engine.update(
         txn,
         cat.id,
@@ -433,6 +440,9 @@ pub(super) fn remove_for(engine: &dyn StorageEngine, txn: TxnId, table: &str) ->
         if field(&row, 1) == table || (field(&row, 0) == "part" && field(&row, 2) == table) {
             victims.push(tid);
         }
+    }
+    if !victims.is_empty() {
+        super::global_unique::catalog_written(engine, txn);
     }
     for tid in victims {
         engine.delete(txn, cat.id, tid)?;
@@ -722,6 +732,121 @@ fn rows(engine: &dyn StorageEngine, txn: TxnId) -> Result<Vec<Vec<ast::Value>>, 
     Ok(out)
 }
 
+/// The partition tree as committed now (plus `txn`'s own catalog writes), not as `txn`'s snapshot
+/// shows it: what a check that must not miss a partition attached or created after a
+/// `REPEATABLE READ` transaction began reads (see `executor::global_unique`).
+pub(super) struct CommittedTree {
+    /// Each partitioned table's key parts, by schema-qualified name.
+    parents: HashMap<String, Vec<KeyPart>>,
+    /// Each partition's direct parent, by schema-qualified name.
+    parent_of: HashMap<String, String>,
+}
+
+impl CommittedTree {
+    /// Whether no table is partitioned at all.
+    pub(super) fn is_empty(&self) -> bool {
+        self.parents.is_empty()
+    }
+
+    /// The key parts of `table` when it is a partitioned table.
+    pub(super) fn key_parts(&self, table: &str) -> Option<&[KeyPart]> {
+        self.parents.get(table).map(Vec::as_slice)
+    }
+
+    /// The direct parent of `table` when it is a partition.
+    pub(super) fn parent(&self, table: &str) -> Option<&str> {
+        self.parent_of.get(table).map(String::as_str)
+    }
+
+    /// Every table below `table` at any depth, partitioned or not.
+    pub(super) fn tables_below(&self, table: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut level = vec![table.to_owned()];
+        let mut budget = self.parent_of.len() + 1;
+        while !level.is_empty() && budget > 0 {
+            budget -= 1;
+            let mut next = Vec::new();
+            for above in &level {
+                for (child, parent) in &self.parent_of {
+                    if parent == above {
+                        out.push(child.clone());
+                        next.push(child.clone());
+                    }
+                }
+            }
+            level = next;
+        }
+        out.sort();
+        out
+    }
+
+    /// The tables below `table` at any depth that are not partitioned themselves (the ones that
+    /// hold rows), in a stable order.
+    pub(super) fn leaves_below(&self, table: &str) -> Vec<String> {
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (child, parent) in &self.parent_of {
+            children
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+        for list in children.values_mut() {
+            list.sort_unstable();
+        }
+        let mut out = Vec::new();
+        let mut level = vec![table];
+        // A cycle cannot be created by DDL; the bound keeps a hand-edited catalog from looping.
+        let mut budget = self.parent_of.len() + 1;
+        while !level.is_empty() && budget > 0 {
+            budget -= 1;
+            let mut next = Vec::new();
+            for above in level {
+                for &child in children.get(above).map_or(&[][..], Vec::as_slice) {
+                    if self.parents.contains_key(child) {
+                        next.push(child);
+                    } else {
+                        out.push(child.to_owned());
+                    }
+                }
+            }
+            level = next;
+        }
+        out
+    }
+}
+
+/// Read the [`CommittedTree`].
+pub(super) fn committed_tree(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<CommittedTree, Error> {
+    let mut tree = CommittedTree {
+        parents: HashMap::new(),
+        parent_of: HashMap::new(),
+    };
+    let Some(cat) = engine.lookup_table_as_of(txn, PARTITION_CATALOG)? else {
+        return Ok(tree);
+    };
+    let mut scan = engine.scan_committed(txn, cat.id)?;
+    while let Some((_, bytes)) = scan.try_next()? {
+        let row = row::decode(&bytes, &PARTITION_CATALOG_SCHEMA)?;
+        match field(&row, 0) {
+            "parent" => {
+                tree.parents.insert(
+                    field(&row, 1).to_owned(),
+                    field(&row, 2).split(KEY_SEP).map(KeyPart::decode).collect(),
+                );
+            },
+            "part" => {
+                tree.parent_of
+                    .insert(field(&row, 1).to_owned(), field(&row, 2).to_owned());
+            },
+            _ => {},
+        }
+    }
+    Ok(tree)
+}
+
 /// Encode a bound to `(kind, payload)`. A range payload is `hex(lo tuple)|hex(hi tuple)` (each side's
 /// values row-encoded together, so they survive in a text column and decode back to the exact typed
 /// tuple); a list payload is the pipe-separated hex of each single-column value; a hash payload is
@@ -871,5 +996,6 @@ fn ensure_catalog(engine: &dyn StorageEngine, txn: TxnId) -> Result<nusadb_core:
         name: PARTITION_CATALOG.to_owned(),
         columns,
     };
+    super::global_unique::catalog_written(engine, txn);
     Ok(engine.create_table(txn, &def)?)
 }

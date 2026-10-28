@@ -123,6 +123,14 @@ pub(super) fn convert_create_table(ct: sql::CreateTable) -> Result<ast::Statemen
     for constraint in ct.constraints {
         constraints.push(convert_table_constraint(constraint)?);
     }
+    // A table-level `PRIMARY KEY (a, b)` makes its columns NOT NULL, as the column-level form does.
+    for constraint in &constraints {
+        if let ast::TableConstraint::PrimaryKey { columns: keys, .. } = constraint {
+            for column in columns.iter_mut().filter(|c| keys.contains(&c.name)) {
+                column.nullable = false;
+            }
+        }
+    }
     let inherits = ct
         .inherits
         .into_iter()

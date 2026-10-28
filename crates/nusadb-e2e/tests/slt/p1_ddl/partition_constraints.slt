@@ -161,9 +161,12 @@ SELECT count(*) FROM ev WHERE k = 3
 ----
 0
 
-# A unique key must include the partition key, as at CREATE TABLE.
-statement error must include all partitioning columns
+# A unique key that leaves out the partition key holds across the partitions.
+statement ok
 ALTER TABLE ev ADD CONSTRAINT ev_v_uq UNIQUE (v)
+
+statement ok
+ALTER TABLE ev DROP CONSTRAINT ev_v_uq
 
 # The partition's copy belongs to the parent: it cannot be dropped on the partition.
 statement error cannot drop inherited constraint
@@ -262,9 +265,9 @@ ALTER TABLE app.f DROP CONSTRAINT "app.f_check1"
 statement ok
 INSERT INTO app.f VALUES (1, -1)
 
-# A unique key must also include the partition key of every sub-partitioned partition below the
-# table, or equal keys could sit in two leaves: refused when the key is added, when such a
-# partition is created, and when one is attached.
+# A unique key that leaves out the partition key of a sub-partitioned partition below the table
+# holds across that partition's leaves: accepted when the key is added, when such a partition is
+# created, and when one is attached.
 statement ok
 CREATE TABLE uq (k INT NOT NULL, d INT NOT NULL) PARTITION BY RANGE (d)
 
@@ -274,7 +277,7 @@ CREATE TABLE uq_1 PARTITION OF uq FOR VALUES FROM (0) TO (100) PARTITION BY LIST
 statement ok
 CREATE TABLE uq_1_a PARTITION OF uq_1 FOR VALUES IN (1)
 
-statement error must include all partitioning columns
+statement ok
 ALTER TABLE uq ADD CONSTRAINT uq_d UNIQUE (d)
 
 statement ok
@@ -283,17 +286,17 @@ ALTER TABLE uq ADD CONSTRAINT uq_dk UNIQUE (d, k)
 statement ok
 CREATE TABLE pk (k INT NOT NULL, d INT NOT NULL, PRIMARY KEY (d)) PARTITION BY RANGE (d)
 
-statement error must include all partitioning columns
+statement ok
 CREATE TABLE pk_1 PARTITION OF pk FOR VALUES FROM (0) TO (100) PARTITION BY LIST (k)
 
 statement ok
 CREATE TABLE pk_2 (k INT NOT NULL, d INT NOT NULL) PARTITION BY LIST (k)
 
-statement error must include all partitioning columns
+statement ok
 ALTER TABLE pk ATTACH PARTITION pk_2 FOR VALUES FROM (100) TO (200)
 
 statement ok
 CREATE TABLE pk_3 (k INT NOT NULL, d INT NOT NULL) PARTITION BY RANGE (d)
 
 statement ok
-ALTER TABLE pk ATTACH PARTITION pk_3 FOR VALUES FROM (100) TO (200)
+ALTER TABLE pk ATTACH PARTITION pk_3 FOR VALUES FROM (200) TO (300)

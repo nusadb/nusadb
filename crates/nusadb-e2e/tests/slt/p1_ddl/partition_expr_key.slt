@@ -93,9 +93,21 @@ SELECT count(*) FROM emix1
 statement error
 CREATE TABLE ev (k INT) PARTITION BY RANGE ((k + (random() * 0)::INT))
 
-# A unique constraint can never cover an expression key.
-statement error
+# A unique constraint can never cover an expression key: it is enforced across the partitions.
+statement ok
 CREATE TABLE eu (k INT PRIMARY KEY) PARTITION BY RANGE ((k % 10))
+
+statement ok
+CREATE TABLE eu_0 PARTITION OF eu FOR VALUES FROM (0) TO (5)
+
+statement ok
+CREATE TABLE eu_1 PARTITION OF eu FOR VALUES FROM (5) TO (10)
+
+statement ok
+INSERT INTO eu VALUES (1), (7)
+
+statement error duplicate key
+INSERT INTO eu VALUES (1)
 
 statement ok
 DROP TABLE ek, eh, emix CASCADE

@@ -1,7 +1,8 @@
 # INSERT ... ON CONFLICT into a partitioned table: rows route to their partition first, then the
-# statement's upsert action runs against that leaf. The parent may declare a PRIMARY KEY / UNIQUE
-# that includes every partition-key column (equal keys route identically, so per-partition
-# enforcement is globally sound); each partition inherits it at CREATE PARTITION OF / ATTACH.
+# statement's upsert action runs against that leaf. A PRIMARY KEY / UNIQUE that includes every
+# partition-key column is enforced by each partition alone (equal keys route identically); each
+# partition inherits it at CREATE PARTITION OF / ATTACH. One that leaves a partition-key column
+# out is enforced across the partitions (see partition_global_unique.slt).
 
 statement ok
 CREATE TABLE up (id INT PRIMARY KEY, v TEXT) PARTITION BY RANGE (id)
@@ -12,9 +13,9 @@ CREATE TABLE up_lo PARTITION OF up FOR VALUES FROM (0) TO (100)
 statement ok
 CREATE TABLE up_hi PARTITION OF up FOR VALUES FROM (100) TO (200)
 
-# The parent constraint must include the partition key.
-statement error must include all partitioning columns
-CREATE TABLE bad (id INT, k INT, PRIMARY KEY (id)) PARTITION BY RANGE (k)
+# A parent key that leaves out the partition key is accepted (enforced across partitions).
+statement ok
+CREATE TABLE across (id INT, k INT, PRIMARY KEY (id)) PARTITION BY RANGE (k)
 
 statement ok
 INSERT INTO up VALUES (1, 'a'), (150, 'x')

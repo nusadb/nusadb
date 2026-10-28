@@ -133,33 +133,10 @@ pub(super) fn analyze_create_table(
     let defaults = resolve_column_defaults(&ct, &name_base, catalog)?;
     // A CHECK / FOREIGN KEY on a partitioned parent is declared on the parent and copied onto each
     // partition as it joins (the executor), where the rows live.
-    // A PRIMARY KEY / UNIQUE on the parent IS supported when it includes every partition-key
-    // column: equal keys then always route to the same partition, so per-partition enforcement
-    // (the executor copies the constraint onto each partition) is globally sound — the reference
-    // engine's rule and error class for the excluded case.
-    if let Some(pb) = &partition_by {
-        for uc in &unique_constraints {
-            // An expression key can never be a constraint column, so any unique constraint on an
-            // expression-keyed parent is refused with the same class.
-            let missing = pb.keys.iter().find_map(|k| match k {
-                ast::PartitionKey::Column(name) => {
-                    (!uc.columns.contains(name)).then_some(name.as_str())
-                },
-                ast::PartitionKey::Expression { sql, .. } => Some(sql.as_str()),
-            });
-            if let Some(missing) = missing {
-                return Err(Error::Coded {
-                    message: format!(
-                        "unique constraint on partitioned table must include all partitioning \
-                         columns — \"{missing}\" is part of the partition key but not of the \
-                         constraint \"{}\"",
-                        uc.name
-                    ),
-                    sqlstate: "0A000",
-                });
-            }
-        }
-    }
+    // A PRIMARY KEY / UNIQUE on the parent that includes every partition-key column is enforced
+    // by each partition's copy alone (equal keys route to the same partition); one that leaves a
+    // partitioning column out is enforced across the partitions (the executor's
+    // `global_unique`, which also refuses the key types it cannot check soundly).
     Ok(CreateTablePlan {
         schema: target_schema,
         table: ct.name,
