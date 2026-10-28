@@ -1729,7 +1729,10 @@ fn insert_on_conflict_do_update_set() {
     };
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].column, "v");
-    assert_eq!(assignments[0].value, ast::Expr::Literal(ast::Value::Int(9)));
+    assert_eq!(
+        assignments[0].value,
+        Some(ast::Expr::Literal(ast::Value::Int(9)))
+    );
     assert!(filter.is_none());
 }
 
@@ -1744,10 +1747,10 @@ fn insert_on_conflict_do_update_references_excluded() {
     };
     assert_eq!(
         assignments[0].value,
-        ast::Expr::QualifiedColumn {
+        Some(ast::Expr::QualifiedColumn {
             table: "excluded".to_owned(),
             column: "v".to_owned(),
-        }
+        })
     );
 }
 
@@ -2583,7 +2586,7 @@ fn update_with_assignments_and_filter() {
     assert_eq!(u.assignments[0].column, "a");
     assert_eq!(
         u.assignments[0].value,
-        ast::Expr::Literal(ast::Value::Int(1))
+        Some(ast::Expr::Literal(ast::Value::Int(1)))
     );
     assert!(u.filter.is_some());
     assert!(u.from.is_none());

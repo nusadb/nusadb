@@ -173,3 +173,38 @@ DROP TABLE t
 
 statement ok
 DROP TABLE bt
+
+# SET v = DEFAULT through an auto-updatable view assigns the view column's default, and a view
+# column has none: the base column gets NULL, not its own default. A NOT NULL base column refuses
+# that NULL, and a generated base column takes DEFAULT as its computed value.
+statement ok
+CREATE TABLE vdb (id INT, v INT DEFAULT 5, nn INT NOT NULL DEFAULT 3, g INT GENERATED ALWAYS AS (id * 2) STORED)
+
+statement ok
+CREATE VIEW vdv AS SELECT * FROM vdb
+
+statement ok
+INSERT INTO vdb (id, v) VALUES (1, 9)
+
+statement ok
+UPDATE vdv SET v = DEFAULT
+
+statement error NULL
+UPDATE vdv SET nn = DEFAULT
+
+statement error generated column
+UPDATE vdv SET g = DEFAULT
+
+query IIII
+SELECT id, v, nn, g FROM vdb
+----
+1 NULL 3 2
+
+# On the table itself, DEFAULT is the column's default.
+statement ok
+UPDATE vdb SET v = DEFAULT
+
+query I
+SELECT v FROM vdb
+----
+5

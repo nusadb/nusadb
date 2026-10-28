@@ -78,6 +78,9 @@ pub(super) enum KeySlot {
     Expression {
         typed: crate::planner::TypedExpr,
         ty: ColumnType,
+        /// The columns the expression reads whose values are not text, with their types: a row
+        /// about to be written may still hold them as the text it was given.
+        typed_inputs: Vec<(usize, ColumnType)>,
     },
 }
 
@@ -105,7 +108,22 @@ pub(super) fn compile_key_for_row(
                 let typed =
                     crate::analyzer::analyze_index_key_expr(sql, table, &super::dml::EmptyCatalog)?;
                 let ty = typed.ty;
-                slots.push(KeySlot::Expression { typed, ty });
+                let mut refs = Vec::new();
+                crate::planner::collect_columns(&typed, &mut refs);
+                refs.sort_unstable();
+                refs.dedup();
+                let typed_inputs = refs
+                    .into_iter()
+                    .filter_map(|at| {
+                        let column_ty = table.columns.get(at)?.ty;
+                        (column_ty.physical() != ColumnType::Text).then_some((at, column_ty))
+                    })
+                    .collect();
+                slots.push(KeySlot::Expression {
+                    typed,
+                    ty,
+                    typed_inputs,
+                });
             },
         }
     }
@@ -122,15 +140,48 @@ pub(super) fn slot_types(slots: &[KeySlot]) -> Vec<ColumnType> {
         .collect()
 }
 
-/// The key tuple of one full-width row under the compiled slots.
+/// The key tuple of one full-width row under the compiled slots. A row about to be written may
+/// still hold the text it was given for a column whose type keeps text until it is stored (an
+/// untyped literal for an `INTERVAL` key, say): such a value is read in its column's type, so the
+/// key compares with the bounds the way the stored value will.
 pub(super) fn key_of_row(slots: &[KeySlot], row: &Row) -> Result<Vec<ast::Value>, Error> {
     slots
         .iter()
         .map(|s| match s {
-            KeySlot::Column { pos, .. } => Ok(row.get(*pos).cloned().unwrap_or(ast::Value::Null)),
-            KeySlot::Expression { typed, .. } => super::eval::eval(typed, row),
+            KeySlot::Column { pos, ty } => in_column_type(row.get(*pos), *ty),
+            KeySlot::Expression {
+                typed,
+                typed_inputs,
+                ..
+            } => {
+                let still_text = typed_inputs
+                    .iter()
+                    .any(|(at, _)| matches!(row.get(*at), Some(ast::Value::Text(_))));
+                if !still_text {
+                    return super::eval::eval(typed, row);
+                }
+                let mut read = row.clone();
+                for &(at, ty) in typed_inputs {
+                    if let Some(cell) = read.get_mut(at) {
+                        *cell = in_column_type(Some(cell), ty)?;
+                    }
+                }
+                super::eval::eval(typed, &read)
+            },
         })
         .collect()
+}
+
+/// `value` read in its column's type `ty`: a text value of a column that is not text is cast,
+/// any other value is kept.
+fn in_column_type(value: Option<&ast::Value>, ty: ColumnType) -> Result<ast::Value, Error> {
+    match value {
+        Some(ast::Value::Text(text)) if ty.physical() != ColumnType::Text => {
+            super::eval::cast_value(ast::Value::Text(text.clone()), ty)
+        },
+        Some(value) => Ok(value.clone()),
+        None => Ok(ast::Value::Null),
+    }
 }
 
 /// One element of a range bound tuple: a concrete value, or an unbounded marker. `Min`

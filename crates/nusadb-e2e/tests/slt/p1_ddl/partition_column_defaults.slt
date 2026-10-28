@@ -1,0 +1,694 @@
+# A partition created with CREATE TABLE ... PARTITION OF takes everything its parent declares about
+# each column: defaults, SERIAL and identity sequences (one series for the whole table), generated
+# expressions, enum and composite types, and the checks of a column's declared type (integer width,
+# VARCHAR(n), a domain's CHECK). Rows written through the parent are built under the parent's rules
+# before they are routed, so an insert into a partitioned table behaves like one into a plain table
+# whichever way it is written: through the parent or straight into a partition.
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'happy', 'ok')
+
+# --- defaults and SERIAL, every insert form ---------------------------------------------------
+
+statement ok
+CREATE TABLE pd (id INT, d INT NOT NULL, x INT DEFAULT 7, s SERIAL, t TEXT DEFAULT 'dflt') PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pd1 PARTITION OF pd FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE pd2 PARTITION OF pd FOR VALUES IN (2)
+
+statement ok
+INSERT INTO pd (id, d) VALUES (1, 1)
+
+statement ok
+INSERT INTO pd1 (id, d) VALUES (2, 1)
+
+statement ok
+INSERT INTO pd VALUES (3, 2, DEFAULT, DEFAULT, DEFAULT)
+
+statement ok
+INSERT INTO pd2 VALUES (4, 2, DEFAULT, DEFAULT, DEFAULT)
+
+statement ok
+INSERT INTO pd (id, d) SELECT 5, 1
+
+statement ok
+INSERT INTO pd1 (id, d) SELECT 6, 1
+
+query IIT
+INSERT INTO pd (id, d) VALUES (7, 2) RETURNING x, s, t
+----
+7 7 dflt
+
+# One sequence serves every partition.
+query IIIIT
+SELECT id, d, x, s, t FROM pd ORDER BY id
+----
+1 1 7 1 dflt
+2 1 7 2 dflt
+3 2 7 3 dflt
+4 2 7 4 dflt
+5 1 7 5 dflt
+6 1 7 6 dflt
+7 2 7 7 dflt
+
+# DEFAULT VALUES, through the parent and into the partition; the key itself may be defaulted.
+statement ok
+CREATE TABLE pdv (d INT DEFAULT 1, x INT DEFAULT 5, s SERIAL) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pdv1 PARTITION OF pdv FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pdv DEFAULT VALUES
+
+statement ok
+INSERT INTO pdv1 DEFAULT VALUES
+
+query III
+SELECT d, x, s FROM pdv ORDER BY s
+----
+1 5 1
+1 5 2
+
+# A defaulted key routes through a sub-partitioned parent, and is bound-checked on a partition.
+statement ok
+CREATE TABLE pk (id INT, k INT DEFAULT 1, d INT DEFAULT 3) PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE pk_1 PARTITION OF pk FOR VALUES IN (1) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE pk_1_a PARTITION OF pk_1 FOR VALUES FROM (0) TO (10)
+
+statement ok
+INSERT INTO pk (id) VALUES (1)
+
+statement ok
+INSERT INTO pk_1 (id) VALUES (2)
+
+statement ok
+INSERT INTO pk DEFAULT VALUES
+
+query III
+SELECT id, k, d FROM pk_1_a ORDER BY id
+----
+1 1 3
+2 1 3
+NULL 1 3
+
+# An expression key reads defaulted columns too.
+statement ok
+CREATE TABLE pek (k INT DEFAULT 13, v TEXT) PARTITION BY RANGE ((k % 10))
+
+statement ok
+CREATE TABLE pek_lo PARTITION OF pek FOR VALUES FROM (0) TO (5)
+
+statement ok
+CREATE TABLE pek_hi PARTITION OF pek FOR VALUES FROM (5) TO (10)
+
+statement ok
+INSERT INTO pek (v) VALUES ('a')
+
+query IT
+SELECT k, v FROM pek_lo
+----
+13 a
+
+# --- UPDATE ... SET col = DEFAULT and row movement ---------------------------------------------
+
+statement ok
+UPDATE pd SET x = 100 WHERE id IN (1, 3)
+
+statement ok
+UPDATE pd SET x = DEFAULT WHERE id = 1
+
+statement ok
+UPDATE pd2 SET x = DEFAULT WHERE id = 3
+
+query II
+SELECT id, x FROM pd WHERE id IN (1, 3) ORDER BY id
+----
+1 7
+3 7
+
+# A row moved to another partition keeps its values; SET s = DEFAULT draws the shared sequence.
+statement ok
+UPDATE pd SET d = 2 WHERE id = 2
+
+statement ok
+UPDATE pd SET d = 2, s = DEFAULT, x = DEFAULT WHERE id = 5
+
+query IIII
+SELECT id, d, x, s FROM pd2 WHERE id IN (2, 5) ORDER BY id
+----
+2 2 7 2
+5 2 7 8
+
+# A direct UPDATE on a partition may not move the row out of it.
+statement error violates partition constraint
+UPDATE pd1 SET d = 2 WHERE id = 1
+
+# --- ON CONFLICT, both arms, through the parent and on the partition ---------------------------
+
+statement ok
+CREATE TABLE pu (id INT, d INT NOT NULL, x INT DEFAULT 7, s SERIAL, m mood DEFAULT 'ok', PRIMARY KEY (id, d)) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pu1 PARTITION OF pu FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pu (id, d) VALUES (1, 1) ON CONFLICT (id, d) DO UPDATE SET x = excluded.x + 1
+
+statement ok
+INSERT INTO pu (id, d, m) VALUES (1, 1, 'happy') ON CONFLICT (id, d) DO UPDATE SET x = excluded.x + 1, m = excluded.m
+
+statement ok
+INSERT INTO pu1 (id, d) VALUES (2, 1) ON CONFLICT (id, d) DO UPDATE SET x = excluded.x + 10
+
+statement ok
+INSERT INTO pu1 (id, d, m) VALUES (2, 1, 'sad') ON CONFLICT (id, d) DO UPDATE SET x = excluded.x + 10, m = excluded.m
+
+statement ok
+INSERT INTO pu (id, d) VALUES (3, 1) ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO pu (id, d) VALUES (3, 1) ON CONFLICT DO NOTHING
+
+query IIIT
+INSERT INTO pu (id, d) VALUES (4, 1) RETURNING id, x, s, m
+----
+4 7 7 ok
+
+query IIIIT
+SELECT id, d, x, s, m FROM pu ORDER BY id
+----
+1 1 8 1 happy
+2 1 17 3 sad
+3 1 7 5 ok
+4 1 7 7 ok
+
+# DEFAULT in ON CONFLICT DO UPDATE SET is not supported yet.
+statement error DEFAULT in ON CONFLICT
+INSERT INTO pu (id, d) VALUES (4, 1) ON CONFLICT (id, d) DO UPDATE SET x = DEFAULT
+
+# --- MERGE into a partition --------------------------------------------------------------------
+
+statement ok
+CREATE TABLE pm (id INT, d INT NOT NULL, x INT DEFAULT 7, s SERIAL, m mood DEFAULT 'ok') PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pm1 PARTITION OF pm FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE pm2 PARTITION OF pm FOR VALUES IN (2)
+
+statement ok
+MERGE INTO pm1 t USING (SELECT 1 AS id) src ON t.id = src.id WHEN NOT MATCHED THEN INSERT (id, d) VALUES (src.id, 1)
+
+statement ok
+MERGE INTO pm1 t USING (SELECT 2 AS id) src ON t.id = src.id WHEN NOT MATCHED THEN INSERT (id, d, m) VALUES (src.id, 1, 'happy')
+
+statement ok
+MERGE INTO pm1 t USING (SELECT 1 AS id) src ON t.id = src.id WHEN MATCHED THEN UPDATE SET x = 100
+
+statement ok
+MERGE INTO pm1 t USING (SELECT 1 AS id) src ON t.id = src.id WHEN MATCHED THEN UPDATE SET x = DEFAULT
+
+# A row outside the partition's bound is refused, as an INSERT into the partition refuses it.
+statement error does not belong
+MERGE INTO pm1 t USING (SELECT 9 AS id) src ON t.id = src.id WHEN NOT MATCHED THEN INSERT (id, d) VALUES (src.id, 2)
+
+statement error is not supported
+MERGE INTO pm t USING (SELECT 1 AS id) src ON t.id = src.id WHEN NOT MATCHED THEN INSERT (id, d) VALUES (src.id, 1)
+
+query IIIIT
+SELECT id, d, x, s, m FROM pm ORDER BY id
+----
+1 1 7 1 ok
+2 1 7 2 happy
+
+# --- ALTER ... SET / DROP DEFAULT and ATTACH --------------------------------------------------
+# A partition attached from a standalone table keeps its own defaults: they apply to a row written
+# straight into it, while a row written through the parent takes the parent's. SET / DROP DEFAULT
+# on the parent reaches every partition, the attached one included.
+
+statement ok
+CREATE TABLE pa (id INT, d INT NOT NULL, x INT DEFAULT 7, s SERIAL) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pa_s (id INT, d INT NOT NULL, x INT DEFAULT 99, s INT NOT NULL DEFAULT -1)
+
+statement ok
+ALTER TABLE pa ATTACH PARTITION pa_s FOR VALUES IN (5)
+
+statement ok
+CREATE TABLE pa1 PARTITION OF pa FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pa (id, d) VALUES (1, 5)
+
+statement ok
+INSERT INTO pa_s (id, d) VALUES (2, 5)
+
+statement ok
+INSERT INTO pa VALUES (3, 5, DEFAULT, DEFAULT)
+
+statement ok
+INSERT INTO pa_s VALUES (4, 5, DEFAULT, DEFAULT)
+
+statement ok
+UPDATE pa SET x = DEFAULT WHERE id = 2
+
+statement ok
+UPDATE pa_s SET x = DEFAULT WHERE id = 1
+
+query IIII
+SELECT id, d, x, s FROM pa ORDER BY id
+----
+1 5 99 1
+2 5 7 -1
+3 5 7 2
+4 5 99 -1
+
+statement ok
+ALTER TABLE pa ALTER COLUMN x SET DEFAULT 8
+
+statement ok
+INSERT INTO pa (id, d) VALUES (5, 5)
+
+statement ok
+INSERT INTO pa_s (id, d) VALUES (6, 5)
+
+statement ok
+INSERT INTO pa1 (id, d) VALUES (7, 1)
+
+# A partition created after the change takes the new default.
+statement ok
+CREATE TABLE pa2 PARTITION OF pa FOR VALUES IN (2)
+
+statement ok
+INSERT INTO pa2 (id, d) VALUES (8, 2)
+
+statement ok
+ALTER TABLE pa ALTER COLUMN x DROP DEFAULT
+
+statement ok
+INSERT INTO pa (id, d) VALUES (9, 5)
+
+statement ok
+INSERT INTO pa_s (id, d) VALUES (10, 5)
+
+statement ok
+INSERT INTO pa1 (id, d) VALUES (11, 1)
+
+statement ok
+INSERT INTO pa2 (id, d) VALUES (12, 2)
+
+query IIII
+SELECT id, d, x, s FROM pa ORDER BY id
+----
+1 5 99 1
+2 5 7 -1
+3 5 7 2
+4 5 99 -1
+5 5 8 3
+6 5 8 -1
+7 1 8 4
+8 2 8 5
+9 5 NULL 6
+10 5 NULL -1
+11 1 NULL 7
+12 2 NULL 8
+
+# A detached partition keeps drawing the shared sequence, and dropping it leaves the sequence to
+# the parent.
+statement ok
+ALTER TABLE pa DETACH PARTITION pa2
+
+statement ok
+INSERT INTO pa2 (id, d) VALUES (13, 2)
+
+query II
+SELECT id, s FROM pa2 ORDER BY id
+----
+8 5
+12 8
+13 9
+
+statement ok
+DROP TABLE pa2
+
+statement ok
+INSERT INTO pa (id, d) VALUES (14, 1)
+
+query II
+SELECT id, s FROM pa1 ORDER BY id
+----
+7 4
+11 7
+14 10
+
+# --- sub-partitions -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ps (id SERIAL, k INT NOT NULL, d INT NOT NULL, note TEXT DEFAULT 'n') PARTITION BY LIST (k)
+
+statement ok
+CREATE TABLE ps_1 PARTITION OF ps FOR VALUES IN (1) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE ps_1_lo PARTITION OF ps_1 FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE ps_2 PARTITION OF ps FOR VALUES IN (2)
+
+statement ok
+INSERT INTO ps (k, d) VALUES (1, 5), (2, 6)
+
+statement ok
+INSERT INTO ps_1 (k, d) VALUES (1, 7)
+
+statement ok
+INSERT INTO ps_1_lo (k, d) VALUES (1, 8)
+
+statement ok
+INSERT INTO ps_2 (k, d) VALUES (2, 9)
+
+statement error no partition of relation
+INSERT INTO ps_1 (k, d) VALUES (1, 500)
+
+statement error does not belong
+INSERT INTO ps_1_lo (k, d) VALUES (2, 8)
+
+query IIIT
+SELECT id, k, d, note FROM ps ORDER BY id
+----
+1 1 5 n
+2 2 6 n
+3 1 7 n
+4 1 8 n
+5 2 9 n
+
+# --- enum, composite and domain columns ---------------------------------------------------------
+
+statement ok
+CREATE TABLE pe (id INT, d INT NOT NULL, m mood DEFAULT 'ok') PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pe1 PARTITION OF pe FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pe VALUES (1, 1, 'happy')
+
+statement ok
+INSERT INTO pe1 VALUES (2, 1, 'sad')
+
+statement ok
+INSERT INTO pe (id, d) VALUES (3, 1)
+
+statement ok
+INSERT INTO pe VALUES (4, 1, 'happy'::mood)
+
+statement error invalid input value for enum
+INSERT INTO pe VALUES (5, 1, 'angry')
+
+statement error invalid input value for enum
+INSERT INTO pe1 VALUES (5, 1, 'angry')
+
+statement ok
+UPDATE pe SET m = 'sad' WHERE id = 1
+
+statement ok
+UPDATE pe1 SET m = DEFAULT WHERE id = 2
+
+# Enum values order by declaration, in every partition.
+query IT
+SELECT id, m FROM pe ORDER BY m, id
+----
+1 sad
+4 happy
+2 ok
+3 ok
+
+query I
+SELECT id FROM pe WHERE m > 'sad' ORDER BY id
+----
+2
+3
+4
+
+statement ok
+CREATE TYPE pair AS (a INT, b TEXT)
+
+statement ok
+CREATE DOMAIN posint AS INT CHECK (VALUE > 0)
+
+statement ok
+CREATE TABLE pc (id INT, d INT NOT NULL, c pair, p posint) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pc1 PARTITION OF pc FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pc VALUES (1, 1, ROW(1, 'x'), 3)
+
+statement ok
+INSERT INTO pc1 VALUES (2, 1, '(2,y)', 4)
+
+statement error violates check constraint
+INSERT INTO pc1 VALUES (3, 1, '(2,y)', 0)
+
+statement error violates check constraint
+INSERT INTO pc VALUES (3, 1, '(2,y)', 0)
+
+query IITI
+SELECT id, (c).a, (c).b, p FROM pc ORDER BY id
+----
+1 1 x 3
+2 2 y 4
+
+# --- generated columns, CHECK and NOT NULL ------------------------------------------------------
+
+statement ok
+CREATE TABLE pg (v INT, d INT NOT NULL, w INT, g INT GENERATED ALWAYS AS (w * 2) STORED, c INT CHECK (c < 10), nn TEXT NOT NULL DEFAULT 'z') PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pg1 PARTITION OF pg FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pg (v, d, w) VALUES (3, 1, 3)
+
+statement ok
+INSERT INTO pg1 (v, d, w) VALUES (4, 1, 4)
+
+statement error generated column
+INSERT INTO pg (v, d, g) VALUES (5, 1, 10)
+
+statement error generated column
+INSERT INTO pg1 (v, d, g) VALUES (5, 1, 10)
+
+statement error check
+INSERT INTO pg (v, d, c) VALUES (5, 1, 10)
+
+statement error check
+INSERT INTO pg1 (v, d, c) VALUES (5, 1, 10)
+
+statement error NULL
+INSERT INTO pg (v, d, nn) VALUES (5, 1, NULL)
+
+statement error NULL
+INSERT INTO pg1 (v, d, nn) VALUES (5, 1, NULL)
+
+statement ok
+UPDATE pg SET w = 6 WHERE v = 3
+
+statement ok
+UPDATE pg SET g = DEFAULT, w = 7 WHERE v = 4
+
+query IIIIT
+SELECT v, w, g, c, nn FROM pg ORDER BY v
+----
+3 6 12 NULL z
+4 7 14 NULL z
+
+# --- the checks of a column's declared type, and coercion of untyped literals --------------------
+
+statement ok
+CREATE TABLE pt (d INT NOT NULL, i INT, dt DATE, u UUID, j JSON, n NUMERIC(5,2), vc VARCHAR(3), ch CHAR(3), iv INTERVAL) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pt1 PARTITION OF pt FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pt VALUES (1, 1, '2026-01-02', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{"a":1}', 1.234, 'abc', 'ab', '1 day')
+
+statement ok
+INSERT INTO pt1 VALUES (1, 2, '2026-01-03', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', '[1]', 2.345, 'xy ', 'x', '2 days')
+
+statement error nusadb_typeck_i
+INSERT INTO pt (d, i) VALUES (1, 3000000000)
+
+statement error nusadb_typeck_i
+INSERT INTO pt1 (d, i) VALUES (1, 3000000000)
+
+statement error value too long for type VARCHAR\(3\)
+INSERT INTO pt (d, vc) VALUES (1, 'abcd')
+
+statement error value too long for type VARCHAR\(3\)
+INSERT INTO pt1 (d, vc) VALUES (1, 'abcd')
+
+statement error value too long for type CHAR\(3\)
+INSERT INTO pt (d, ch) VALUES (1, 'abcd')
+
+statement error invalid Numeric
+INSERT INTO pt1 (d, n) VALUES (1, 12345.6)
+
+statement error invalid Date value
+INSERT INTO pt (d, dt) VALUES (1, 'notadate')
+
+statement error invalid Uuid value
+INSERT INTO pt1 (d, u) VALUES (1, 'bad-uuid')
+
+query ITTRTTT
+SELECT i, dt, u, n, vc, iv, j FROM pt ORDER BY i
+----
+1 2026-01-02 a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 1.23 abc 1 day {"a": 1}
+2 2026-01-03 a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12 2.35 xy  2 days [1]
+
+query I
+SELECT count(*) FROM pt WHERE dt = '2026-01-02' AND n = 1.23 AND iv = INTERVAL '1 day'
+----
+1
+
+# An untyped literal for a non-text partition key is read in the key's type.
+statement ok
+CREATE TABLE pdk (at DATE NOT NULL, v INT) PARTITION BY RANGE (at)
+
+statement ok
+CREATE TABLE pdk_2026 PARTITION OF pdk FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')
+
+statement ok
+INSERT INTO pdk VALUES ('2026-05-05', 1)
+
+statement error no partition of relation
+INSERT INTO pdk VALUES ('2025-05-05', 2)
+
+query I
+SELECT v FROM pdk_2026
+----
+1
+
+# --- identity columns share the parent's sequence -------------------------------------------------
+
+statement ok
+CREATE TABLE pid (id INT GENERATED ALWAYS AS IDENTITY, d INT NOT NULL, b INT GENERATED BY DEFAULT AS IDENTITY) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE pid1 PARTITION OF pid FOR VALUES IN (1)
+
+statement ok
+INSERT INTO pid (d) VALUES (1)
+
+statement ok
+INSERT INTO pid1 (d) VALUES (1)
+
+statement error GENERATED ALWAYS
+INSERT INTO pid VALUES (5, 1, 5)
+
+statement error GENERATED ALWAYS
+INSERT INTO pid1 VALUES (5, 1, 5)
+
+statement ok
+INSERT INTO pid OVERRIDING SYSTEM VALUE VALUES (50, 1, 50)
+
+statement ok
+INSERT INTO pid (d, b) OVERRIDING USER VALUE VALUES (1, 99)
+
+query III
+SELECT id, d, b FROM pid ORDER BY id
+----
+1 1 1
+2 1 2
+50 1 50
+51 1 51
+
+# --- a partitioned table in another schema -------------------------------------------------------
+
+statement ok
+CREATE SCHEMA app
+
+statement ok
+CREATE TABLE app.q (id SERIAL, d INT NOT NULL, x TEXT DEFAULT 'q', m mood DEFAULT 'sad') PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE app.q1 PARTITION OF app.q FOR VALUES IN (1)
+
+statement ok
+INSERT INTO app.q (d) VALUES (1)
+
+statement ok
+INSERT INTO app.q1 (d, m) VALUES (1, 'happy')
+
+statement error invalid input value for enum
+INSERT INTO app.q1 (d, m) VALUES (1, 'angry')
+
+query IITT
+SELECT id, d, x, m FROM app.q ORDER BY id
+----
+1 1 q sad
+2 1 q happy
+
+# --- ATTACH and generated columns -----------------------------------------------------------------
+# A table attached as a partition must compute the same columns as its parent: generated in one and
+# not in the other is refused. It may compute one from an expression of its own, which its rows use
+# however they are written.
+
+statement ok
+CREATE TABLE ag (a INT, d INT NOT NULL, g INT) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE ag_g (a INT, d INT NOT NULL, g INT GENERATED ALWAYS AS (a * 2) STORED)
+
+statement error must not be a generated column
+ALTER TABLE ag ATTACH PARTITION ag_g FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE bg (a INT, d INT NOT NULL, g INT GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY LIST (d)
+
+statement ok
+CREATE TABLE bg1 PARTITION OF bg FOR VALUES IN (1)
+
+statement ok
+CREATE TABLE bg_n (a INT, d INT NOT NULL, g INT)
+
+statement error must be a generated column
+ALTER TABLE bg ATTACH PARTITION bg_n FOR VALUES IN (2)
+
+statement ok
+CREATE TABLE bg_x (a INT, d INT NOT NULL, g INT GENERATED ALWAYS AS (a * 3) STORED)
+
+statement ok
+ALTER TABLE bg ATTACH PARTITION bg_x FOR VALUES IN (2)
+
+statement ok
+INSERT INTO bg (a, d) VALUES (4, 2), (4, 1)
+
+statement ok
+INSERT INTO bg_x (a, d) VALUES (5, 2)
+
+statement error generated column
+INSERT INTO bg (a, d, g) VALUES (4, 2, 1)
+
+# A row moved into bg_x takes bg_x's expression.
+statement ok
+UPDATE bg SET d = 2 WHERE d = 1
+
+query III
+SELECT a, d, g FROM bg ORDER BY a, g
+----
+4 2 12
+4 2 12
+5 2 15

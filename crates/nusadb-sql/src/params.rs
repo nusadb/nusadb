@@ -187,7 +187,9 @@ fn count_stmt(stmt: &ast::Statement, max: &mut usize) {
         },
         ast::Statement::Update(update) => {
             for assignment in &update.assignments {
-                count_expr(&assignment.value, max);
+                if let Some(value) = &assignment.value {
+                    count_expr(value, max);
+                }
             }
             count_from(update.from.as_ref(), max);
             count_opt(update.filter.as_ref(), max);
@@ -220,7 +222,9 @@ fn count_merge(merge: &ast::Merge, max: &mut usize) {
                 count_opt(pred.as_ref(), max);
                 if let ast::MatchedAction::Update { assignments } = action {
                     for assignment in assignments {
-                        count_expr(&assignment.value, max);
+                        if let Some(value) = &assignment.value {
+                            count_expr(value, max);
+                        }
                     }
                 }
             },
@@ -660,7 +664,9 @@ fn substitute_stmt(stmt: &mut ast::Statement, params: &[ast::Expr]) -> Result<()
         },
         ast::Statement::Update(update) => {
             for assignment in &mut update.assignments {
-                substitute_expr(&mut assignment.value, params)?;
+                if let Some(value) = &mut assignment.value {
+                    substitute_expr(value, params)?;
+                }
             }
             substitute_from(update.from.as_mut(), params)?;
             substitute_opt(update.filter.as_mut(), params)?;
@@ -696,7 +702,9 @@ fn substitute_merge(merge: &mut ast::Merge, params: &[ast::Expr]) -> Result<(), 
                 substitute_opt(pred.as_mut(), params)?;
                 if let ast::MatchedAction::Update { assignments } = action {
                     for assignment in assignments {
-                        substitute_expr(&mut assignment.value, params)?;
+                        if let Some(value) = &mut assignment.value {
+                            substitute_expr(value, params)?;
+                        }
                     }
                 }
             },

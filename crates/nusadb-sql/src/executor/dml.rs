@@ -45,31 +45,21 @@ pub(super) fn run_insert(
     }
     // Each source produces one value tuple per row, in target-`columns` order.
     let value_rows = insert_value_rows(plan, engine, txn)?;
-    // A direct insert into a partition must land within that partition's bound chain — including a
-    // sub-partitioned mid-level parent, whose own bounds apply before it routes downward.
-    if target_is_partition {
-        enforce_partition_bound(plan, &value_rows, engine, txn)?;
-    }
-    // `ON CONFLICT DO UPDATE` upserts; everything else (plain INSERT, `DO NOTHING`) inserts.
-    let full_rows = if let Some(key_cols) = &partition_key {
-        route_partitioned_insert(plan, key_cols, value_rows, engine, txn, true)?
+    // A partitioned table or a partition: the rows are built under the target's rules, then
+    // checked against its bound or routed down to their leaves.
+    let full_rows = if partition_key.is_some() || target_is_partition {
+        insert_into_partition_tree(
+            plan,
+            partition_key.as_deref(),
+            value_rows,
+            engine,
+            txn,
+            true,
+            None,
+        )?
     } else {
+        // `ON CONFLICT DO UPDATE` upserts; everything else (plain INSERT, `DO NOTHING`) inserts.
         match &plan.on_conflict {
-            // A partition written directly may find a conflict on a key enforced across its
-            // partitioned table in a sibling: that row's upsert runs there.
-            Some(OnConflictPlan::DoUpdate {
-                target,
-                assignments,
-                filter,
-            }) if target_is_partition => upsert_into_partition(
-                plan,
-                value_rows,
-                target,
-                assignments,
-                filter.as_ref(),
-                engine,
-                txn,
-            )?,
             Some(OnConflictPlan::DoUpdate {
                 target,
                 assignments,
@@ -79,7 +69,7 @@ pub(super) fn run_insert(
                 &plan.columns,
                 value_rows,
                 plan.rls_check.as_ref(),
-                plan.overriding,
+                RowSource::Statement(plan.overriding),
                 target,
                 assignments,
                 filter.as_ref(),
@@ -103,7 +93,7 @@ pub(super) fn run_insert(
                     value_rows,
                     plan.rls_check.as_ref(),
                     plan.view_check.as_ref(),
-                    plan.overriding,
+                    RowSource::Statement(plan.overriding),
                     matches!(other, Some(OnConflictPlan::DoNothing { .. })),
                     engine,
                     txn,
@@ -140,224 +130,188 @@ pub(super) fn run_insert(
     }
 }
 
-/// `INSERT INTO <partition> ... ON CONFLICT DO UPDATE`: a key enforced across the partitioned
-/// table may find its conflict in a sibling partition, where that row's upsert then runs.
-fn upsert_into_partition(
-    plan: &InsertPlan,
-    value_rows: Vec<Vec<Option<ast::Value>>>,
-    target: &ConflictArbiter,
-    assignments: &[(usize, crate::planner::TypedExpr)],
-    filter: Option<&crate::planner::TypedExpr>,
-    engine: &dyn StorageEngine,
-    txn: TxnId,
-) -> Result<Vec<Row>, Error> {
-    let buckets = send_upserts_to_global_conflicts(
-        &plan.columns,
-        target,
-        vec![(plan.table.clone(), value_rows)],
-        engine,
-        txn,
-    )?;
-    let mut affected = Vec::new();
-    for (table, rows) in buckets {
-        let own = table.id == plan.table.id;
-        affected.extend(upsert_rows(
-            &table,
-            &plan.columns,
-            rows,
-            plan.rls_check.as_ref(),
-            plan.overriding,
-            target,
-            assignments,
-            filter,
-            engine,
-            txn,
-            own,
-        )?);
-    }
-    Ok(affected)
-}
-
-/// A compiled partition-key slot against an `INSERT`'s value tuple (`plan.columns` order): a
-/// column key's value position, or an expression key's typed evaluator (which runs over a
-/// synthetic full-width row assembled from the provided values).
-enum ValueKeySlot {
-    Column {
-        value_pos: usize,
-        ty: ColumnType,
-    },
-    Expression {
-        typed: crate::planner::TypedExpr,
-        ty: ColumnType,
-        /// The table ordinals the expression reads — each must be provided by the statement.
-        refs: Vec<usize>,
-    },
-}
-
-/// The key column types of compiled value slots.
-fn value_slot_types(slots: &[ValueKeySlot]) -> Vec<ColumnType> {
-    slots
-        .iter()
-        .map(|s| match s {
-            ValueKeySlot::Column { ty, .. } | ValueKeySlot::Expression { ty, .. } => *ty,
-        })
-        .collect()
-}
-
-/// Compile the key parts against an `INSERT`'s provided-value layout. A column key must be
-/// provided explicitly (loud, as before); an expression key requires every column it references
-/// to be provided — routing does not evaluate defaults.
-fn compile_value_key(
-    table: &TableSchema,
-    columns: &[usize],
-    key_parts: &[super::partition::KeyPart],
-) -> Result<Vec<ValueKeySlot>, Error> {
-    let mut slots = Vec::with_capacity(key_parts.len());
-    for part in key_parts {
-        match part {
-            super::partition::KeyPart::Column(key_col) => {
-                let ordinal = table
-                    .columns
-                    .iter()
-                    .position(|c| &c.name == key_col)
-                    .ok_or_else(|| internal_index(0))?;
-                let ty = table
-                    .columns
-                    .get(ordinal)
-                    .map(|c| c.ty)
-                    .ok_or_else(|| internal_index(ordinal))?;
-                let value_pos =
-                    columns
-                        .iter()
-                        .position(|&o| o == ordinal)
-                        .ok_or_else(|| Error::Coded {
-                            message: format!(
-                                "the partition key \"{key_col}\" must be provided (a defaulted or \
-                             omitted key is not yet routed)"
-                            ),
-                            sqlstate: "0A000",
-                        })?;
-                slots.push(ValueKeySlot::Column { value_pos, ty });
-            },
-            super::partition::KeyPart::Expression(sql) => {
-                let typed = crate::analyzer::analyze_index_key_expr(sql, table, &EmptyCatalog)?;
-                let mut refs = Vec::new();
-                crate::planner::collect_columns(&typed, &mut refs);
-                refs.sort_unstable();
-                refs.dedup();
-                if let Some(&missing) = refs.iter().find(|r| !columns.contains(r)) {
-                    let col = table.columns.get(missing).map_or("?", |c| c.name.as_str());
-                    return Err(Error::Coded {
-                        message: format!(
-                            "the partition key expression {sql} references column \"{col}\", \
-                             which must be provided (a defaulted or omitted key input is not yet \
-                             routed)"
-                        ),
-                        sqlstate: "0A000",
-                    });
-                }
-                let ty = typed.ty;
-                slots.push(ValueKeySlot::Expression { typed, ty, refs });
-            },
-        }
-    }
-    Ok(slots)
-}
-
-/// The key tuple of one `INSERT` value row under compiled [`ValueKeySlot`]s. `fill` maps each
-/// value position to its table ordinal (`plan.columns`); a full-width row is assembled only when
-/// an expression slot needs one. A referenced value that is a per-row `DEFAULT` placeholder is
-/// refused loudly (routing does not evaluate defaults).
-fn value_key_of_row(
-    slots: &[ValueKeySlot],
-    row: &[Option<ast::Value>],
-    table: &TableSchema,
-    fill: &[usize],
-) -> Result<Vec<ast::Value>, Error> {
-    let mut full: Option<Row> = None;
-    slots
-        .iter()
-        .map(|slot| match slot {
-            ValueKeySlot::Column { value_pos, ty } => row
-                .get(*value_pos)
-                .and_then(Clone::clone)
-                .map_or(Ok(ast::Value::Null), |v| super::eval::cast_value(v, *ty)),
-            ValueKeySlot::Expression { typed, refs, .. } => {
-                if let Some(&hole) = refs.iter().find(|&&r| {
-                    fill.iter()
-                        .position(|&o| o == r)
-                        .and_then(|vp| row.get(vp))
-                        .is_none_or(Option::is_none)
-                }) {
-                    let col = table.columns.get(hole).map_or("?", |c| c.name.as_str());
-                    return Err(Error::Coded {
-                        message: format!(
-                            "the partition key expression references column \"{col}\", whose \
-                             value is DEFAULT here (routing does not evaluate defaults)"
-                        ),
-                        sqlstate: "0A000",
-                    });
-                }
-                if full.is_none() {
-                    let mut assembled = vec![ast::Value::Null; table.columns.len()];
-                    for (value_pos, &ordinal) in fill.iter().enumerate() {
-                        if let Some(Some(v)) = row.get(value_pos)
-                            && let Some(cell) = assembled.get_mut(ordinal)
-                        {
-                            let ty = table
-                                .columns
-                                .get(ordinal)
-                                .map_or(ColumnType::Text, |c| c.ty);
-                            *cell = super::eval::cast_value(v.clone(), ty)?;
-                        }
-                    }
-                    full = Some(assembled);
-                }
-                full.as_ref().map_or(Ok(ast::Value::Null), |assembled| {
-                    super::eval::eval(typed, assembled)
-                })
-            },
-        })
-        .collect()
-}
-
-/// Route each row of an `INSERT` into a range-partitioned parent to the partition whose `[lo, hi)`
-/// bound contains its key, then insert into those partitions (the parent stores nothing itself). A
-/// row whose key matches no partition, or an omitted key, is refused. `ON CONFLICT` on a partitioned
-/// table is not supported. Returns the inserted full rows (for `RETURNING` / the row count).
+/// An `INSERT` (or a `COPY` batch, or a `MERGE` insert) whose target is a partitioned table or a
+/// partition. The rows are first built under the target's own rules, exactly as a plain table
+/// builds them: defaults, sequences, generated columns and each value's type, so a defaulted or
+/// coerced partition key routes like a written one and an insert through the parent takes the
+/// parent's defaults. A partition target then checks the rows against its bound chain; a
+/// partitioned target routes each row down to the leaf partition whose bound holds its key. Each
+/// leaf finally runs the statement's insert or upsert over its complete rows. Returns the
+/// inserted (or upserted) full rows, for `RETURNING` and the row count.
+///
+/// The parent's statement-level triggers fire once around a routed statement (an upsert also
+/// fires its UPDATE ones) and the leaves' stay silent; a partition target fires its own. A caller
+/// that writes in batches (COPY) passes `fire_statement_triggers = false` and fires them itself.
+/// `deferred` is the streaming load's cross-batch uniqueness collector, honoured when the target
+/// is itself the leaf.
 #[allow(
     clippy::too_many_lines,
-    reason = "one cohesive routing worklist: per-level bucketing, catch-all fallback, leaf insert"
+    reason = "one write through a partition tree: build, bound check, route, triggers, leaf writes"
 )]
-fn route_partitioned_insert(
+fn insert_into_partition_tree(
     plan: &InsertPlan,
-    key_parts: &[super::partition::KeyPart],
+    key_parts: Option<&[super::partition::KeyPart]>,
     value_rows: Vec<Vec<Option<ast::Value>>>,
     engine: &dyn StorageEngine,
     txn: TxnId,
     fire_statement_triggers: bool,
+    deferred: Option<&mut DeferredUnique>,
 ) -> Result<Vec<Row>, Error> {
+    let rows = prepare_insert_rows(
+        &plan.table,
+        &plan.columns,
+        value_rows,
+        RowSource::Statement(plan.overriding),
+        engine,
+        txn,
+    )?
+    .rows;
+    // A direct insert into a partition must land within that partition's bound chain, including
+    // a sub-partitioned mid-level parent, whose own bounds apply before it routes downward.
+    if partition_bound_violations(&plan.table, &rows.iter().collect::<Vec<_>>(), engine, txn)?
+        .contains(&true)
+    {
+        return Err(Error::Coded {
+            message: format!(
+                "the inserted row does not belong to partition \"{}\"",
+                plan.table.name
+            ),
+            sqlstate: "23514",
+        });
+    }
+    let routed = key_parts.is_some();
+    let leaves = match key_parts {
+        Some(parts) => route_rows_to_leaves(&plan.table, parts, rows, engine, txn)?,
+        None => vec![(plan.table.clone(), rows)],
+    };
+    // The statement names the parent: the parent's statement-level triggers fire, once (an upsert
+    // also fires its UPDATE ones), and the leaves' own stay silent.
+    let upsert = matches!(plan.on_conflict, Some(OnConflictPlan::DoUpdate { .. }));
+    let parent_triggers = |event| -> Result<super::trigger::TriggerSet, Error> {
+        Ok(super::trigger::load_table_triggers(
+            &plan.table.schema,
+            &plan.table.name,
+            event,
+            engine,
+            txn,
+        )?
+        .statement_triggers_if(routed && fire_statement_triggers))
+    };
+    let insert_triggers = parent_triggers(ast::TriggerEvent::Insert)?;
+    let update_triggers = upsert
+        .then(|| parent_triggers(ast::TriggerEvent::Update))
+        .transpose()?;
+    insert_triggers.fire_stmt_before(&plan.table, engine, txn)?;
+    if let Some(triggers) = &update_triggers {
+        triggers.fire_stmt_before(&plan.table, engine, txn)?;
+    }
+    // Every leaf takes its rows whole: one value per column, in column order.
+    let all_columns: Vec<usize> = (0..plan.table.columns.len()).collect();
+    let as_values = |rows: Vec<Row>| -> Vec<Vec<Option<ast::Value>>> {
+        rows.into_iter()
+            .map(|row| row.into_iter().map(Some).collect())
+            .collect()
+    };
+    let mut buckets: UpsertBuckets = leaves
+        .into_iter()
+        .map(|(leaf, rows)| (leaf, as_values(rows)))
+        .collect();
+    // An arbiter that leaves out a partitioning column may find its conflict in another
+    // partition than the one the row routes to: the row then goes to that partition's upsert.
+    if let Some(OnConflictPlan::DoUpdate { target, .. }) = &plan.on_conflict {
+        buckets = send_upserts_to_global_conflicts(&all_columns, target, buckets, engine, txn)?;
+    }
+    let mut deferred = deferred;
+    let mut inserted = Vec::new();
+    for (leaf, rows) in buckets {
+        // The leaf the statement names fires its own statement triggers; a leaf reached by
+        // routing, or a sibling holding an upsert's conflict, stays silent.
+        let own_triggers = !routed && fire_statement_triggers && leaf.id == plan.table.id;
+        // The parent's key constraints exist on every partition (propagated at partition
+        // create/attach), so the conflict arbiter resolves locally. An arbiter that includes the
+        // partition key can only conflict within the leaf the row routes to; one that does not
+        // was sent to its conflict's leaf above.
+        let written = match &plan.on_conflict {
+            Some(OnConflictPlan::DoUpdate {
+                target,
+                assignments,
+                filter,
+            }) => upsert_rows(
+                &leaf,
+                &all_columns,
+                rows,
+                plan.rls_check.as_ref(),
+                RowSource::Complete,
+                target,
+                assignments,
+                filter.as_ref(),
+                engine,
+                txn,
+                own_triggers,
+            )?,
+            other => {
+                // A `DO NOTHING` with a stated target must name a real unique/primary-key arbiter.
+                if let Some(OnConflictPlan::DoNothing {
+                    target: Some(target),
+                }) = other
+                {
+                    resolve_arbiter(&leaf, target, engine, txn)?;
+                }
+                insert_rows_with_unique(
+                    &leaf,
+                    &all_columns,
+                    rows,
+                    plan.rls_check.as_ref(),
+                    plan.view_check.as_ref(),
+                    RowSource::Complete,
+                    matches!(other, Some(OnConflictPlan::DoNothing { .. })),
+                    engine,
+                    txn,
+                    if leaf.id == plan.table.id {
+                        deferred.as_deref_mut()
+                    } else {
+                        None
+                    },
+                    own_triggers,
+                )?
+                .0
+            },
+        };
+        inserted.extend(written);
+    }
+    insert_triggers.fire_stmt_after(&plan.table, engine, txn)?;
+    if let Some(triggers) = &update_triggers {
+        triggers.fire_stmt_after(&plan.table, engine, txn)?;
+    }
+    Ok(inserted)
+}
+
+/// Route complete rows of the partitioned table `table` to the leaf partitions whose bounds hold
+/// their keys, level by level: bucket the rows under each parent, then re-bucket any bucket whose
+/// target is itself a sub-partitioned parent until every bucket is a leaf table. Every level
+/// shares the top parent's column list (a partition takes its parent's columns), so the key of
+/// each level resolves against `table`. A row whose key matches no partition goes to the
+/// catch-all partition when there is one, and is refused otherwise. The depth cap is a defensive
+/// backstop: DDL cannot create a partition cycle (ATTACH refuses one), but a hand-edited catalog
+/// could.
+fn route_rows_to_leaves(
+    table: &TableSchema,
+    key_parts: &[super::partition::KeyPart],
+    rows: Vec<Row>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<(TableSchema, Vec<Row>)>, Error> {
     const MAX_DEPTH: usize = 64;
     /// One routing work item: a parent, its key parts, the rows routed to it, and its depth.
-    type RouteLevel = (
-        String,
-        Vec<super::partition::KeyPart>,
-        Vec<Vec<Option<ast::Value>>>,
-        usize,
-    );
+    type RouteLevel = (String, Vec<super::partition::KeyPart>, Vec<Row>, usize);
 
-    // Route level by level: bucket the rows under this parent, then re-bucket any bucket whose
-    // target is itself a sub-partitioned parent until every bucket is a leaf table. Every level
-    // shares the top parent's column list (a partition takes its parent's columns verbatim), so key
-    // positions resolve against `plan.table` at any depth. The depth cap is a defensive backstop —
-    // DDL cannot create a partition cycle (ATTACH refuses one), but a hand-edited catalog could.
     let mut work: Vec<RouteLevel> = vec![(
-        crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name),
+        crate::analyzer::qualified_display(&table.schema, &table.name),
         key_parts.to_vec(),
-        value_rows,
+        rows,
         0,
     )];
-    let mut leaves: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
+    let mut leaves: Vec<(String, Vec<Row>)> = Vec::new();
     while let Some((parent_name, level_parts, rows, depth)) = work.pop() {
         if depth >= MAX_DEPTH {
             return Err(Error::Internal(format!(
@@ -365,8 +319,13 @@ fn route_partitioned_insert(
                  partition metadata?)"
             )));
         }
-        let slots = compile_value_key(&plan.table, &plan.columns, &level_parts)?;
-        let key_tys = value_slot_types(&slots);
+        let slots =
+            super::partition::compile_key_for_row(&level_parts, table)?.ok_or_else(|| {
+                Error::Internal(format!(
+                    "the partition key of \"{parent_name}\" names a column its rows do not have"
+                ))
+            })?;
+        let key_tys = super::partition::slot_types(&slots);
         let partitions = super::partition::partitions_of(engine, txn, &parent_name, &key_tys)?;
         // The catch-all partition (if any) receives every row that matches no other partition's
         // bound, including a key with a NULL element that no range/hash partition can hold.
@@ -375,12 +334,9 @@ fn route_partitioned_insert(
             .find(|p| super::partition::is_default(&p.bound))
             .map(|p| p.table.clone());
         // Bucket the rows by target partition, preserving input order within each bucket.
-        let mut buckets: Vec<(String, Vec<Vec<Option<ast::Value>>>)> = Vec::new();
+        let mut buckets: Vec<(String, Vec<Row>)> = Vec::new();
         for row in rows {
-            // Build the key tuple (an omitted/NULL element stays NULL). A matching non-default
-            // partition wins; otherwise the row falls to the catch-all — a key no bound matches (a
-            // NULL element included) routes there when one exists.
-            let key = value_key_of_row(&slots, &row, &plan.table, &plan.columns)?;
+            let key = super::partition::key_of_row(&slots, &row)?;
             let matched = partitions
                 .iter()
                 .find(|p| super::partition::accepts(&key, &p.bound, &key_tys))
@@ -421,36 +377,6 @@ fn route_partitioned_insert(
             }
         }
     }
-    // The statement names the parent: the parent's statement-level triggers fire, once (an upsert
-    // also fires its UPDATE ones), and the leaves' own stay silent. A caller that writes in batches
-    // (COPY) fires them itself, around the whole statement.
-    let upsert = matches!(plan.on_conflict, Some(OnConflictPlan::DoUpdate { .. }));
-    let insert_triggers = super::trigger::load_table_triggers(
-        &plan.table.schema,
-        &plan.table.name,
-        ast::TriggerEvent::Insert,
-        engine,
-        txn,
-    )?
-    .statement_triggers_if(fire_statement_triggers);
-    let update_triggers = if upsert {
-        Some(
-            super::trigger::load_table_triggers(
-                &plan.table.schema,
-                &plan.table.name,
-                ast::TriggerEvent::Update,
-                engine,
-                txn,
-            )?
-            .statement_triggers_if(fire_statement_triggers),
-        )
-    } else {
-        None
-    };
-    insert_triggers.fire_stmt_before(&plan.table, engine, txn)?;
-    if let Some(triggers) = &update_triggers {
-        triggers.fire_stmt_before(&plan.table, engine, txn)?;
-    }
     let mut resolved = Vec::with_capacity(leaves.len());
     for (part_name, rows) in leaves {
         // The leaf's bucket key is schema-qualified; split it back into the table's coordinates.
@@ -466,64 +392,7 @@ fn route_partitioned_insert(
             })?;
         resolved.push((part, rows));
     }
-    // An arbiter that leaves out a partitioning column may find its conflict in another
-    // partition than the one the row routes to: the row then goes to that partition's upsert.
-    if let Some(OnConflictPlan::DoUpdate { target, .. }) = &plan.on_conflict {
-        resolved = send_upserts_to_global_conflicts(&plan.columns, target, resolved, engine, txn)?;
-    }
-    let mut inserted = Vec::new();
-    for (part, rows) in resolved {
-        // Route first, then run the statement's INSERT / upsert action against the leaf the rows
-        // landed in: the parent's key constraints exist on every partition (propagated at
-        // partition create/attach), so the conflict arbiter resolves locally. An arbiter that
-        // includes the partition key can only conflict within the leaf the row routes to; one
-        // that does not was sent to its conflict's leaf above.
-        let routed = match &plan.on_conflict {
-            Some(OnConflictPlan::DoUpdate {
-                target,
-                assignments,
-                filter,
-            }) => upsert_rows(
-                &part,
-                &plan.columns,
-                rows,
-                plan.rls_check.as_ref(),
-                plan.overriding,
-                target,
-                assignments,
-                filter.as_ref(),
-                engine,
-                txn,
-                false,
-            )?,
-            other => {
-                if let Some(OnConflictPlan::DoNothing {
-                    target: Some(target),
-                }) = other
-                {
-                    resolve_arbiter(&part, target, engine, txn)?;
-                }
-                insert_rows(
-                    &part,
-                    &plan.columns,
-                    rows,
-                    plan.rls_check.as_ref(),
-                    plan.view_check.as_ref(),
-                    plan.overriding,
-                    matches!(other, Some(OnConflictPlan::DoNothing { .. })),
-                    engine,
-                    txn,
-                    false,
-                )?
-            },
-        };
-        inserted.extend(routed);
-    }
-    insert_triggers.fire_stmt_after(&plan.table, engine, txn)?;
-    if let Some(triggers) = &update_triggers {
-        triggers.fire_stmt_after(&plan.table, engine, txn)?;
-    }
-    Ok(inserted)
+    Ok(resolved)
 }
 
 /// Where an upsert key was placed: scope table, scope constraint, key hash.
@@ -707,19 +576,16 @@ fn conflict_still_there(
     }
 }
 
-/// A direct `INSERT` into a partition must land within that partition's bound — and, under
-/// sub-partitioning, within every ancestor's bound too — the reference engine refuses a row that
-/// belongs to a different partition. A no-op for a non-partition target.
-/// `UPDATE` guard against silent row loss: refuse a new row image whose partition key leaves the
-/// target partition's bound (walking the whole ancestor chain, like the INSERT-side check). The
-/// reference engine would move the row to the accepting sibling; accepting the write here instead
-/// would strand the row in a partition whose bound the pruning layer trusts — a query whose
-/// `WHERE` constrains the key would then prune the very partition holding the row and silently
-/// lose it. A row in the catch-all DEFAULT partition is refused only when a non-default sibling
-/// claims its new key (the catch-all legitimately holds everything else).
+/// Which of `new_rows` (full rows of `table`) fall outside the partition constraint of `table`:
+/// its own bound and, under sub-partitioning, every ancestor's bound too (each level may key on
+/// different columns). All `false` when `table` is not a partition.
 ///
-/// # Errors
-/// `23514` naming the partition, when any post-update row violates the constraint.
+/// A direct `INSERT` into a partition refuses a row that belongs to a different partition, as
+/// the reference engine does. An `UPDATE` uses it as a guard against silent row loss: a new row
+/// image whose key leaves the partition's bound moves to the accepting sibling when the statement
+/// names the parent, and is refused otherwise; accepting the write in place would strand the row in
+/// a partition whose bound the pruning layer trusts. A row in the catch-all DEFAULT partition is
+/// outside only when a non-default sibling claims its key (the catch-all holds everything else).
 fn partition_bound_violations(
     table: &TableSchema,
     new_rows: &[&Row],
@@ -772,66 +638,6 @@ fn partition_bound_violations(
         current = parent;
     }
     Ok(mask)
-}
-
-fn enforce_partition_bound(
-    plan: &InsertPlan,
-    value_rows: &[Vec<Option<ast::Value>>],
-    engine: &dyn StorageEngine,
-    txn: TxnId,
-) -> Result<(), Error> {
-    // A partition's key columns and types come from its parent. Walk the WHOLE ancestor chain: under
-    // sub-partitioning a leaf's rows must satisfy its own bound AND every ancestor's (each level may
-    // key on different columns), exactly as the reference engine's partition constraint does. The
-    // depth cap mirrors the routing backstop (DDL cannot create a cycle; a hand-edited catalog could).
-    const MAX_DEPTH: usize = 64;
-    // Partition metadata is keyed by the schema-qualified name; the chain stays in key space.
-    let mut current = crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name);
-    for _ in 0..MAX_DEPTH {
-        let Some(parent) = super::partition::partition_parent(engine, txn, &current)? else {
-            return Ok(());
-        };
-        let Some(key_parts) = super::partition::parent_key_parts(engine, txn, &parent)? else {
-            return Ok(());
-        };
-        let slots = compile_value_key(&plan.table, &plan.columns, &key_parts)?;
-        let key_tys = value_slot_types(&slots);
-        let Some((_, bound)) = super::partition::partition_bound(engine, txn, &current, &key_tys)?
-        else {
-            return Ok(());
-        };
-        // For a direct insert into the catch-all, the row must belong to NO sibling — a row that
-        // fits another partition's bound belongs there, not the default.
-        let siblings = if super::partition::is_default(&bound) {
-            super::partition::partitions_of(engine, txn, &parent, &key_tys)?
-        } else {
-            Vec::new()
-        };
-        for row in value_rows {
-            let key = value_key_of_row(&slots, row, &plan.table, &plan.columns)?;
-            let ok = if super::partition::is_default(&bound) {
-                !siblings
-                    .iter()
-                    .any(|s| super::partition::accepts(&key, &s.bound, &key_tys))
-            } else {
-                super::partition::accepts(&key, &bound, &key_tys)
-            };
-            if !ok {
-                return Err(Error::Coded {
-                    message: format!(
-                        "the inserted row does not belong to partition \"{}\"",
-                        plan.table.name
-                    ),
-                    sqlstate: "23514",
-                });
-            }
-        }
-        current = parent;
-    }
-    Err(Error::Internal(format!(
-        "partition ancestry exceeded {MAX_DEPTH} levels above \"{}\" (cyclic partition metadata?)",
-        plan.table.name
-    )))
 }
 
 /// Fill each column omitted from the INSERT target list (`!covered`) of `full` from its `DEFAULT`
@@ -1485,7 +1291,7 @@ fn insert_select_streaming(
             rows,
             plan.rls_check.as_ref(),
             plan.view_check.as_ref(),
-            plan.overriding,
+            RowSource::Statement(plan.overriding),
             false,
             engine,
             txn,
@@ -1604,7 +1410,7 @@ pub(super) fn insert_rows(
     value_rows: Vec<Vec<Option<ast::Value>>>,
     rls_check: Option<&crate::planner::TypedExpr>,
     view_check: Option<&crate::planner::ViewCheck>,
-    overriding: Option<ast::Overriding>,
+    source: RowSource,
     conflict_do_nothing: bool,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -1616,7 +1422,7 @@ pub(super) fn insert_rows(
         value_rows,
         rls_check,
         view_check,
-        overriding,
+        source,
         conflict_do_nothing,
         engine,
         txn,
@@ -1685,65 +1491,96 @@ fn enum_columns_info(
         .collect()
 }
 
-/// [`insert_rows`] with the uniqueness mode explicit: `None` validates against the committed
-/// table now (every whole-statement path); `Some(collector)` is the streaming `INSERT ... SELECT`
-/// path — per-batch key locks + key collection now, one committed re-scan at end of stream
-/// ([`DeferredUnique::finish`]).
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "insert_rows' shared batch context plus the one uniqueness-mode knob"
-)]
-fn insert_rows_with_unique(
+/// Where the value rows handed to an insert come from, which decides how the target's defaults
+/// and identity rules apply to them.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RowSource {
+    /// Written by the statement: an omitted column or a `DEFAULT` cell takes the target's default,
+    /// sequence or NULL, an explicit value for a generated or `GENERATED ALWAYS` identity column is
+    /// refused, and the statement's `OVERRIDING` clause applies.
+    Statement(Option<ast::Overriding>),
+    /// Complete rows, one value per column of the target: rows a partitioned table already built
+    /// under its own defaults before routing them to this partition, or a row an `UPDATE` moves
+    /// here from a sibling partition. Every value is kept as given except the generated columns,
+    /// which the target computes again from its own expressions.
+    Complete,
+}
+
+/// The rows of an insert in their final form, with what built them.
+struct Prepared {
+    /// One full-width row per value row, in the target's column order.
+    rows: Vec<Row>,
+    /// The target's column fills (defaults, sequences, generated columns).
+    fills: Vec<Option<super::coldefault::ColumnFill>>,
+    /// The columns some row gave a concrete value, which push a sequence past them.
+    explicit: HashSet<usize>,
+}
+
+/// Build the full rows of an insert into `table` from `value_rows` (each in `columns` order):
+/// fill each omitted column and `DEFAULT` cell from the column's default, sequence or NULL,
+/// compute the generated columns, and bring every value to its column's stored form (time zone
+/// facet, `CHAR(n)`/`VARCHAR(n)` length, enum label, keyable text). Every insert path takes its
+/// rows through here, on a plain table, a partitioned table and a partition alike, so they all
+/// treat a row the same way.
+fn prepare_insert_rows(
     table: &TableSchema,
     columns: &[usize],
     value_rows: Vec<Vec<Option<ast::Value>>>,
-    rls_check: Option<&crate::planner::TypedExpr>,
-    view_check: Option<&crate::planner::ViewCheck>,
-    overriding: Option<ast::Overriding>,
-    conflict_do_nothing: bool,
+    source: RowSource,
     engine: &dyn StorageEngine,
     txn: TxnId,
-    mut deferred: Option<&mut DeferredUnique>,
-    fire_statement_triggers: bool,
-) -> Result<(Vec<Row>, Vec<Tid>), Error> {
+) -> Result<Prepared, Error> {
     // Column DEFAULTs / SERIAL: a column omitted from the target list — or written as
     // an explicit `DEFAULT` cell (`None`) — is filled by its default expression or its sequence (if
     // any) rather than NULL. Loaded once for the batch.
     let fills = super::coldefault::column_fills(table, engine, txn)?;
-    // `OVERRIDING USER VALUE`: blank supplied values for GENERATED BY DEFAULT identity columns so they
-    // auto-fill from their sequence.
     let mut value_rows = value_rows;
-    apply_overriding_user_value(overriding, columns, &fills, &mut value_rows);
-    // Columns the statement supplies a *concrete* value for in at least one row (an explicit `DEFAULT`
-    // cell does not count): the basis for the GENERATED-ALWAYS reject and the post-insert serial bump.
-    let any_explicit = explicitly_supplied_columns(columns, &value_rows);
-    // `OVERRIDING SYSTEM VALUE` allows an explicit value for a GENERATED ALWAYS identity, so skip the
-    // reject that otherwise forbids it.
-    if !overriding_system_value(overriding) {
-        reject_explicit_identity_always(table, &fills, &any_explicit)?;
-    }
-    reject_explicit_generated(table, &fills, &any_explicit)?;
-    // Static NOT-NULL coverage: a non-nullable column missing from the target list AND without a
-    // default/serial fill would be written as NULL. A `DEFAULT` cell on such a column is caught
-    // per-row by `apply_column_fills` below.
-    let covered: HashSet<usize> = columns.iter().copied().collect();
-    for ((index, column), fill) in table.columns.iter().enumerate().zip(&fills) {
-        if !column.nullable && !covered.contains(&index) && fill.is_none() {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
-    }
+    let explicit = match source {
+        RowSource::Statement(overriding) => {
+            // `OVERRIDING USER VALUE`: blank supplied values for GENERATED BY DEFAULT identity
+            // columns so they auto-fill from their sequence.
+            apply_overriding_user_value(overriding, columns, &fills, &mut value_rows);
+            // Columns the statement supplies a *concrete* value for in at least one row (an
+            // explicit `DEFAULT` cell does not count): the basis for the GENERATED-ALWAYS reject
+            // and the post-insert serial bump.
+            let any_explicit = explicitly_supplied_columns(columns, &value_rows);
+            // `OVERRIDING SYSTEM VALUE` allows an explicit value for a GENERATED ALWAYS identity,
+            // so skip the reject that otherwise forbids it.
+            if !overriding_system_value(overriding) {
+                reject_explicit_identity_always(table, &fills, &any_explicit)?;
+            }
+            reject_explicit_generated(table, &fills, &any_explicit)?;
+            // Static NOT-NULL coverage: a non-nullable column missing from the target list AND
+            // without a default/serial fill would be written as NULL. A `DEFAULT` cell on such a
+            // column is caught per-row by `apply_column_fills` below.
+            let covered: HashSet<usize> = columns.iter().copied().collect();
+            for ((index, column), fill) in table.columns.iter().enumerate().zip(&fills) {
+                if !column.nullable && !covered.contains(&index) && fill.is_none() {
+                    return Err(Error::NotNullViolation {
+                        column: column.name.clone(),
+                    });
+                }
+            }
+            any_explicit
+        },
+        // Complete rows were checked where they were written; each value counts as given.
+        RowSource::Complete => columns.iter().copied().collect(),
+    };
 
     let schema = column_types(table);
     // For each enum column, its `(type name, ordered labels)` — so a text value can be resolved to
     // its declaration-order ordinal on write (an unknown label is rejected with 22P02). Resolved
     // once for the batch; `None` for every non-enum column.
     let enum_info = enum_columns_info(table, engine, txn)?;
-    // Build every full row first so PRIMARY KEY / UNIQUE constraints validate the whole batch
-    // before any tuple is written.
-    let mut full_rows: Vec<Row> = Vec::with_capacity(value_rows.len());
+    // Complete rows laid out in column order need no per-row placement: only their generated
+    // columns, if any, are computed again.
+    let complete_in_order = matches!(source, RowSource::Complete)
+        && columns.len() == table.columns.len()
+        && columns.iter().enumerate().all(|(i, &c)| i == c);
+    let has_generated = fills
+        .iter()
+        .any(|f| matches!(f, Some(super::coldefault::ColumnFill::Generated(_))));
+    let mut rows: Vec<Row> = Vec::with_capacity(value_rows.len());
     for values in value_rows {
         if values.len() != columns.len() {
             return Err(Error::ArityMismatch {
@@ -1752,19 +1589,32 @@ fn insert_rows_with_unique(
                 found: values.len(),
             });
         }
-        let mut full = vec![ast::Value::Null; table.columns.len()];
-        // A `DEFAULT` (`None`) cell leaves its column uncovered for this row so the per-row fill
-        // below supplies the default/serial/NULL — exactly as for an omitted column.
-        let mut row_covered: HashSet<usize> = HashSet::with_capacity(columns.len());
-        for (value, &col_idx) in values.into_iter().zip(columns) {
-            if let Some(value) = value {
-                set_at(&mut full, col_idx, value)?;
-                row_covered.insert(col_idx);
+        let mut full = if complete_in_order {
+            let mut full: Row = values
+                .into_iter()
+                .map(|v| v.unwrap_or(ast::Value::Null))
+                .collect();
+            strip_char_blanks(&mut full, schema.iter().copied());
+            if has_generated {
+                apply_column_fills(&mut full, &fills, &explicit, table, engine)?;
             }
-        }
-        // Generated columns are computed from the values as they will be stored.
-        strip_char_blanks(&mut full, schema.iter().copied());
-        apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
+            full
+        } else {
+            let mut full = vec![ast::Value::Null; table.columns.len()];
+            // A `DEFAULT` (`None`) cell leaves its column uncovered for this row so the per-row
+            // fill below supplies the default/serial/NULL, exactly as for an omitted column.
+            let mut row_covered: HashSet<usize> = HashSet::with_capacity(columns.len());
+            for (value, &col_idx) in values.into_iter().zip(columns) {
+                if let Some(value) = value {
+                    set_at(&mut full, col_idx, value)?;
+                    row_covered.insert(col_idx);
+                }
+            }
+            // Generated columns are computed from the values as they will be stored.
+            strip_char_blanks(&mut full, schema.iter().copied());
+            apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
+            full
+        };
         // A `timestamptz` written to a `timestamp` column (or the reverse) adopts the column's own
         // type here, before uniqueness/RLS/`RETURNING` ever see the row — so all three agree with
         // what a later read decodes.
@@ -1780,8 +1630,43 @@ fn insert_rows_with_unique(
             }
             stored_form(value, *ty)?;
         }
-        full_rows.push(full);
+        rows.push(full);
     }
+    Ok(Prepared {
+        rows,
+        fills,
+        explicit,
+    })
+}
+
+/// [`insert_rows`] with the uniqueness mode explicit: `None` validates against the committed
+/// table now (every whole-statement path); `Some(collector)` is the streaming `INSERT ... SELECT`
+/// path: per-batch key locks + key collection now, one committed re-scan at end of stream
+/// ([`DeferredUnique::finish`]).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "insert_rows' shared batch context plus the one uniqueness-mode knob"
+)]
+fn insert_rows_with_unique(
+    table: &TableSchema,
+    columns: &[usize],
+    value_rows: Vec<Vec<Option<ast::Value>>>,
+    rls_check: Option<&crate::planner::TypedExpr>,
+    view_check: Option<&crate::planner::ViewCheck>,
+    source: RowSource,
+    conflict_do_nothing: bool,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    mut deferred: Option<&mut DeferredUnique>,
+    fire_statement_triggers: bool,
+) -> Result<(Vec<Row>, Vec<Tid>), Error> {
+    let Prepared {
+        rows: mut full_rows,
+        fills,
+        explicit: any_explicit,
+    } = prepare_insert_rows(table, columns, value_rows, source, engine, txn)?;
+    let schema = column_types(table);
     // Triggers: load the INSERT triggers once, fire statement- and row-level BEFORE triggers (a
     // row trigger may rewrite or skip a row, so they run before the checks below), then (after the
     // writes) the AFTER triggers. Firing happens here so `COPY FROM` triggers too.
@@ -2070,7 +1955,7 @@ fn upsert_rows(
     columns: &[usize],
     value_rows: Vec<Vec<Option<ast::Value>>>,
     rls_check: Option<&crate::planner::TypedExpr>,
-    overriding: Option<ast::Overriding>,
+    source: RowSource,
     target: &ConflictArbiter,
     assignments: &[(usize, crate::planner::TypedExpr)],
     filter: Option<&crate::planner::TypedExpr>,
@@ -2078,71 +1963,22 @@ fn upsert_rows(
     txn: TxnId,
     fire_statement_triggers: bool,
 ) -> Result<Vec<Row>, Error> {
-    // Column DEFAULT / SERIAL fills for a column omitted from the proposed insert or
-    // written as an explicit `DEFAULT` cell.
-    let fills = super::coldefault::column_fills(table, engine, txn)?;
-    let enum_info = enum_columns_info(table, engine, txn)?;
-    // `OVERRIDING USER VALUE`: blank supplied values for GENERATED BY DEFAULT identity columns.
-    let mut value_rows = value_rows;
-    apply_overriding_user_value(overriding, columns, &fills, &mut value_rows);
-    // Columns supplied a concrete value by some row (an explicit `DEFAULT` cell does not count).
-    let any_explicit = explicitly_supplied_columns(columns, &value_rows);
-    // `OVERRIDING SYSTEM VALUE` allows an explicit value for a GENERATED ALWAYS identity.
-    if !overriding_system_value(overriding) {
-        reject_explicit_identity_always(table, &fills, &any_explicit)?;
-    }
-    reject_explicit_generated(table, &fills, &any_explicit)?;
+    // The proposed rows, built exactly as a plain INSERT builds them (defaults, sequences,
+    // generated columns, each value in its column's own type), so the conflict probe and the
+    // uniqueness checks below compare them with the stored rows.
+    let Prepared {
+        rows: proposed,
+        fills,
+        explicit: covered,
+    } = prepare_insert_rows(table, columns, value_rows, source, engine, txn)?;
+    let schema = column_types(table);
     // The DO UPDATE may not SET a generated column either; it is recomputed after the other SETs below.
     reject_explicit_generated(
         table,
         &fills,
         &assignments.iter().map(|(ordinal, _)| *ordinal).collect(),
     )?;
-    // Any non-nullable column missing from the target list AND without a default/serial fill would be
-    // written as NULL on insert; a `DEFAULT` cell on such a column is caught per-row below.
-    let covered: HashSet<usize> = columns.iter().copied().collect();
-    for ((index, column), fill) in table.columns.iter().enumerate().zip(&fills) {
-        if !column.nullable && !covered.contains(&index) && fill.is_none() {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
-    }
-    let schema = column_types(table);
-    // Materialize the proposed rows in full-table layout.
-    let mut proposed: Vec<Row> = Vec::with_capacity(value_rows.len());
-    for values in value_rows {
-        if values.len() != columns.len() {
-            return Err(Error::ArityMismatch {
-                context: "INSERT".to_owned(),
-                expected: columns.len(),
-                found: values.len(),
-            });
-        }
-        let mut full = vec![ast::Value::Null; table.columns.len()];
-        // A `DEFAULT` (`None`) cell leaves its column uncovered for this row so the per-row fill
-        // supplies the default/serial/NULL, as for an omitted column.
-        let mut row_covered: HashSet<usize> = HashSet::with_capacity(columns.len());
-        for (value, &col_idx) in values.into_iter().zip(columns) {
-            if let Some(value) = value {
-                set_at(&mut full, col_idx, value)?;
-                row_covered.insert(col_idx);
-            }
-        }
-        strip_char_blanks(&mut full, schema.iter().copied());
-        apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
-        // Each value in its column's own type, exactly as a plain INSERT prepares it, so the
-        // conflict probe and the uniqueness checks below compare it with the stored rows.
-        for (idx, (value, ty)) in full.iter_mut().zip(&schema).enumerate() {
-            row::adopt_column_type(value, *ty)?;
-            row::coerce_char_length(value, *ty)?;
-            if let Some((enum_type, labels)) = enum_info.get(idx).and_then(Option::as_ref) {
-                row::coerce_enum(value, labels, enum_type)?;
-            }
-            stored_form(value, *ty)?;
-        }
-        proposed.push(full);
-    }
+    let enum_info = enum_columns_info(table, engine, txn)?;
 
     let arbiter = resolve_arbiter(table, target, engine, txn)?;
     let existing = scan_table(table, engine, txn)?;
@@ -2775,13 +2611,20 @@ fn copy_from_body(
                      unique: &mut DeferredUnique|
      -> Result<(), Error> {
         let rows = std::mem::replace(batch, Vec::with_capacity(INSERT_SELECT_BATCH));
-        if let Some(key_parts) = &partition_key {
-            inserted +=
-                route_partitioned_insert(&as_insert, key_parts, rows, engine, txn, false)?.len();
+        // A partitioned table routes each row to its leaf, a partition checks its bound; both
+        // build the rows under the target's rules first, as an INSERT through it does.
+        if partition_key.is_some() || target_is_partition {
+            inserted += insert_into_partition_tree(
+                &as_insert,
+                partition_key.as_deref(),
+                rows,
+                engine,
+                txn,
+                false,
+                Some(unique),
+            )?
+            .len();
             return Ok(());
-        }
-        if target_is_partition {
-            enforce_partition_bound(&as_insert, &rows, engine, txn)?;
         }
         // COPY runs only for a superuser on an RLS table (the wire layer refuses it otherwise), so
         // there is no per-row WITH CHECK to apply here; nor does COPY target a view or carry OVERRIDING.
@@ -2791,7 +2634,7 @@ fn copy_from_body(
             rows,
             None,
             None,
-            None,
+            RowSource::Statement(None),
             false,
             engine,
             txn,
@@ -5767,14 +5610,19 @@ pub(super) fn run_update(
     // re-matched by a later branch's scan (each row is visited once, like the reference engine).
     let _moves = super::move_skip::scope();
     if plan.propagate.is_empty() {
-        return run_update_single(plan, engine, txn, true);
+        return run_update_single(plan, &plan.table, engine, txn, true);
     }
     // The statement names the parent, so only the parent's statement-level triggers fire, once,
     // around every row the statement changes in any descendant.
     over_parent_statement(&plan.table, ast::TriggerEvent::Update, engine, txn, || {
-        let mut result = run_update_single(plan, engine, txn, false)?;
+        let mut result = run_update_single(plan, &plan.table, engine, txn, false)?;
         for sub in &plan.propagate {
-            result = combine_write_results(result, run_update_single(sub, engine, txn, false)?)?;
+            // A row reached through the parent takes the parent's default for `SET x = DEFAULT`,
+            // as the statement names the parent.
+            result = combine_write_results(
+                result,
+                run_update_single(sub, &plan.table, engine, txn, false)?,
+            )?;
         }
         Ok(result)
     })
@@ -5805,6 +5653,7 @@ fn over_parent_statement<T>(
 )]
 fn run_update_single(
     plan: &UpdatePlan,
+    named: &TableSchema,
     engine: &dyn StorageEngine,
     txn: TxnId,
     fire_statement_triggers: bool,
@@ -5918,9 +5767,21 @@ fn run_update_single(
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
     let enum_info = enum_columns_info(&plan.table, engine, txn)?;
     {
-        let set_cols: HashSet<usize> = assignments.iter().map(|a| a.column).collect();
+        let set_cols: HashSet<usize> = assignments
+            .iter()
+            .filter(|a| !a.default)
+            .map(|a| a.column)
+            .collect();
         reject_explicit_generated(&plan.table, &fills, &set_cols)?;
     }
+    // `SET x = DEFAULT` takes the default of the table the statement names: a partitioned
+    // parent's for a row reached through it, the target's own otherwise.
+    let named_fills = if !assignments.iter().any(|a| a.default) || named.id == plan.table.id {
+        None
+    } else {
+        Some(defaults_by_name(&plan.table, named, engine, txn)?)
+    };
+    let defaults = named_fills.as_deref().unwrap_or(&fills);
     if let Some(from_rows) = from_rows {
         // Join: each target row takes the first FROM row matching the WHERE over the concatenated
         // row and applies the SET against that combined row. No match leaves the row unchanged.
@@ -5939,17 +5800,15 @@ fn run_update_single(
                     combined.extend(frow.iter().cloned());
                     if predicate_matches(filter.as_ref(), &combined)? {
                         let old = track_old.then(|| row.clone());
-                        let new_row = finalize_updated_row(
-                            apply_assignments_ctx(
-                                &assignments,
-                                &plan.table,
-                                row.clone(),
-                                &combined,
-                            )?,
-                            &fills,
+                        let mut assigned = apply_assignments_ctx(
+                            &assignments,
                             &plan.table,
-                            &enum_info,
+                            row.clone(),
+                            &combined,
                         )?;
+                        apply_default_assignments(&mut assigned, &assignments, defaults, engine)?;
+                        let new_row =
+                            finalize_updated_row(assigned, &fills, &plan.table, &enum_info)?;
                         if needs_unique {
                             result_rows.push(new_row.clone());
                             old_for_unique.push(row);
@@ -5976,12 +5835,9 @@ fn run_update_single(
                 if needs_unique {
                     old_for_unique.push(row.clone());
                 }
-                let new_row = finalize_updated_row(
-                    apply_assignments(&assignments, &plan.table, row)?,
-                    &fills,
-                    &plan.table,
-                    &enum_info,
-                )?;
+                let mut assigned = apply_assignments(&assignments, &plan.table, row)?;
+                apply_default_assignments(&mut assigned, &assignments, defaults, engine)?;
+                let new_row = finalize_updated_row(assigned, &fills, &plan.table, &enum_info)?;
                 if needs_unique {
                     result_rows.push(new_row.clone());
                 }
@@ -6448,7 +6304,7 @@ fn move_rows_across_partitions(
             vec![value_row],
             rls_check,
             None,
-            None,
+            RowSource::Complete,
             false,
             engine,
             txn,
@@ -7042,14 +6898,9 @@ pub(super) fn run_merge(
     // A partitioned table holds no rows of its own: a MERGE into it would match nothing and write
     // its inserts into the parent itself, outside every partition (and every partition's keys).
     // Refused until MERGE routes through partitions; a partition can be its target.
-    if super::partition::has_any(engine, txn)?
-        && super::partition::parent_key_parts(
-            engine,
-            txn,
-            &crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name),
-        )?
-        .is_some()
-    {
+    let has_partitions = super::partition::has_any(engine, txn)?;
+    let table_key = crate::analyzer::qualified_display(&plan.table.schema, &plan.table.name);
+    if has_partitions && super::partition::parent_key_parts(engine, txn, &table_key)?.is_some() {
         return Err(Error::Coded {
             message: format!(
                 "MERGE into the partitioned table \"{}\" is not supported; merge into its \
@@ -7059,6 +6910,8 @@ pub(super) fn run_merge(
             sqlstate: "0A000",
         });
     }
+    let target_is_partition =
+        has_partitions && super::partition::partition_parent(engine, txn, &table_key)?.is_some();
     // The source: a derived `USING (VALUES ...)` / `USING (SELECT ...)` runs its inlined plan, a
     // named source is scanned; held in memory while it fits the work budget, else spilled.
     let source = join_source(plan.source_plan.as_deref(), Some(&plan.source), engine, txn)?
@@ -7115,6 +6968,7 @@ pub(super) fn run_merge(
                     &trow,
                     &combined,
                     &mut ops.borrow_mut(),
+                    engine,
                 )?;
                 count.set(count.get() + 1);
                 break;
@@ -7173,6 +7027,7 @@ pub(super) fn run_merge(
                 &trow,
                 &combined,
                 &mut ops.borrow_mut(),
+                engine,
             )?;
             count.set(count.get() + 1);
             break;
@@ -7241,18 +7096,34 @@ pub(super) fn run_merge(
             .map(|r| r.into_iter().map(Some).collect())
             .collect();
         let offered = value_rows.len();
-        let inserted = insert_rows(
-            &plan.table,
-            &columns,
-            value_rows,
-            None,
-            None,
-            None,
-            false,
-            engine,
-            txn,
-            true,
-        )?;
+        // A partition target takes only rows inside its bound, built under its rules exactly as
+        // an INSERT into it builds them.
+        let inserted = if target_is_partition {
+            let as_insert = InsertPlan {
+                table: plan.table.clone(),
+                columns,
+                source: InsertSource::Values(Vec::new()),
+                returning: Vec::new(),
+                rls_check: None,
+                view_check: None,
+                overriding: None,
+                on_conflict: None,
+            };
+            insert_into_partition_tree(&as_insert, None, value_rows, engine, txn, true, None)?
+        } else {
+            insert_rows(
+                &plan.table,
+                &columns,
+                value_rows,
+                None,
+                None,
+                RowSource::Statement(None),
+                false,
+                engine,
+                txn,
+                true,
+            )?
+        };
         count -= offered - inserted.len();
     }
     Ok(ExecutionResult::Merged(count))
@@ -7285,20 +7156,22 @@ fn stage_merge_matched_action(
     trow: &Row,
     combined: &Row,
     ops: &mut MergeOps,
+    engine: &dyn StorageEngine,
 ) -> Result<(), Error> {
     match action {
         crate::planner::MergeMatchedAction::Update { assignments } => {
             reject_explicit_generated(
                 table,
                 fills,
-                &assignments.iter().map(|a| a.column).collect(),
+                &assignments
+                    .iter()
+                    .filter(|a| !a.default)
+                    .map(|a| a.column)
+                    .collect(),
             )?;
-            let new = finalize_updated_row(
-                apply_assignments_ctx(assignments, table, trow.clone(), combined)?,
-                fills,
-                table,
-                enum_info,
-            )?;
+            let mut assigned = apply_assignments_ctx(assignments, table, trow.clone(), combined)?;
+            apply_default_assignments(&mut assigned, assignments, fills, engine)?;
+            let new = finalize_updated_row(assigned, fills, table, enum_info)?;
             ops.updates.push((tid, trow.clone(), new));
         },
         crate::planner::MergeMatchedAction::Delete => ops.deletes.push((tid, trow.clone())),
@@ -7493,6 +7366,53 @@ fn apply_assignments_ctx(
         set_at(&mut row, assignment.column, value)?;
     }
     Ok(row)
+}
+
+/// Assign each `SET column = DEFAULT` of `assignments` in `row` from `defaults` (column fills
+/// indexed by `row`'s column ordinals): the default expression's value, the sequence's next value
+/// (taken once per row), or NULL for a column with no default. A generated column is left to
+/// [`finalize_updated_row`], which computes it from the updated row.
+fn apply_default_assignments(
+    row: &mut Row,
+    assignments: &[Assignment],
+    defaults: &[Option<super::coldefault::ColumnFill>],
+    engine: &dyn StorageEngine,
+) -> Result<(), Error> {
+    for assignment in assignments.iter().filter(|a| a.default) {
+        let value = match defaults.get(assignment.column).and_then(Option::as_ref) {
+            Some(super::coldefault::ColumnFill::Expr(expr)) => eval::eval(expr, &Vec::new())?,
+            Some(super::coldefault::ColumnFill::Serial { id, .. }) => {
+                ast::Value::Int(engine.sequence_next(*id)?)
+            },
+            Some(super::coldefault::ColumnFill::Generated(_)) => continue,
+            None => ast::Value::Null,
+        };
+        set_at(row, assignment.column, value)?;
+    }
+    Ok(())
+}
+
+/// The column fills of `named`, laid out by the columns of `table` (matched by name): the
+/// defaults a statement naming `named` applies to a row of its partition or child `table`.
+fn defaults_by_name(
+    table: &TableSchema,
+    named: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Vec<Option<super::coldefault::ColumnFill>>, Error> {
+    let mut named_fills = super::coldefault::column_fills(named, engine, txn)?;
+    Ok(table
+        .columns
+        .iter()
+        .map(|column| {
+            named
+                .columns
+                .iter()
+                .position(|c| c.name == column.name)
+                .and_then(|at| named_fills.get_mut(at))
+                .and_then(Option::take)
+        })
+        .collect())
 }
 
 pub(super) fn predicate_matches(

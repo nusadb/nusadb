@@ -1,7 +1,6 @@
 # Expression partition keys: PARTITION BY RANGE ((k % 10)) routes by the expression's value,
-# re-evaluated on UPDATE (row movement). Every column an expression reads must be provided in
-# the INSERT (routing does not evaluate defaults), a volatile expression is refused, and a
-# unique constraint can never cover an expression key.
+# re-evaluated on UPDATE (row movement). The expression reads the row with its defaults filled in,
+# a volatile expression is refused, and a unique constraint can never cover an expression key.
 
 statement ok
 CREATE TABLE ek (k INT, v TEXT) PARTITION BY RANGE ((k % 10))

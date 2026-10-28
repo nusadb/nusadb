@@ -1369,7 +1369,9 @@ fn substitute_row_refs(stmt: &mut ast::Statement, refs: &RowRefs<'_>) -> Result<
         },
         ast::Statement::Update(update) => {
             for assignment in &mut update.assignments {
-                sub_expr(&mut assignment.value, refs)?;
+                if let Some(value) = &mut assignment.value {
+                    sub_expr(value, refs)?;
+                }
             }
             sub_from(update.from.as_mut(), refs)?;
             sub_opt(update.filter.as_mut(), refs)?;

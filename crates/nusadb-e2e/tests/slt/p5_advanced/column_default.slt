@@ -175,3 +175,60 @@ query I
 SELECT n FROM up WHERE id = 1
 ----
 100
+
+# --- UPDATE ... SET col = DEFAULT ---
+statement ok
+CREATE TABLE ud (id INT, x INT DEFAULT 7, s SERIAL, t TEXT, g INT GENERATED ALWAYS AS (x * 2) STORED)
+
+statement ok
+INSERT INTO ud (id, x, t) VALUES (1, 100, 'a'), (2, 200, 'b')
+
+# A default expression, the next value of a sequence per row, NULL for a column with none, and the
+# generated column computed again.
+statement ok
+UPDATE ud SET x = DEFAULT, s = DEFAULT, t = DEFAULT
+
+query IIITI
+SELECT id, x, s, t, g FROM ud ORDER BY id
+----
+1 7 3 NULL 14
+2 7 4 NULL 14
+
+# DEFAULT is the one value a generated column may be set to.
+statement ok
+UPDATE ud SET g = DEFAULT, x = 8 WHERE id = 1
+
+statement error generated column
+UPDATE ud SET g = 1
+
+query II
+SELECT id, g FROM ud ORDER BY id
+----
+1 16
+2 14
+
+# UPDATE ... FROM and MERGE take DEFAULT too.
+statement ok
+UPDATE ud SET x = DEFAULT FROM (VALUES (1)) AS v(k) WHERE ud.id = v.k
+
+statement ok
+MERGE INTO ud USING (SELECT 2 AS id) src ON ud.id = src.id WHEN MATCHED THEN UPDATE SET x = 50
+
+statement ok
+MERGE INTO ud USING (SELECT 2 AS id) src ON ud.id = src.id WHEN MATCHED THEN UPDATE SET x = DEFAULT, s = DEFAULT
+
+query III
+SELECT id, x, s FROM ud ORDER BY id
+----
+1 7 3
+2 7 5
+
+# A NOT NULL column whose default is NULL refuses it.
+statement ok
+CREATE TABLE udn (id INT, n INT NOT NULL)
+
+statement ok
+INSERT INTO udn VALUES (1, 1)
+
+statement error NULL
+UPDATE udn SET n = DEFAULT

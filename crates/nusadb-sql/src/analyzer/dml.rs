@@ -201,7 +201,12 @@ fn analyze_on_conflict(
                 name: assignment.column.clone(),
             });
         }
-        let value = analyze_expr(&assignment.value, &scope, catalog, Some(column.ty))?;
+        let Some(expr) = &assignment.value else {
+            return Err(Error::Unsupported(
+                "DEFAULT in ON CONFLICT DO UPDATE SET".to_owned(),
+            ));
+        };
+        let value = analyze_expr(expr, &scope, catalog, Some(column.ty))?;
         check_assignable(column, &value)?;
         reject_conflict_subquery(&value)?;
         typed.push((index, value));
@@ -1029,7 +1034,12 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
                 name: assignment.column.clone(),
             });
         }
-        let value = analyze_expr(&assignment.value, &scope, catalog, Some(column.ty))?;
+        // `SET column = DEFAULT`: the executor assigns the column's default for each row.
+        let Some(expr) = &assignment.value else {
+            assignments.push(Assignment::default_of(index, column.ty));
+            continue;
+        };
+        let value = analyze_expr(expr, &scope, catalog, Some(column.ty))?;
         if !column.nullable && is_null_literal(&value) {
             return Err(Error::NotNullViolation {
                 column: column.name.clone(),
@@ -1039,6 +1049,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         assignments.push(Assignment {
             column: index,
             value,
+            default: false,
         });
     }
     let mut filter = analyze_predicate(upd.filter, &scope, catalog)?;
@@ -1387,11 +1398,16 @@ fn analyze_merge_matched_action(
                 if !seen.insert(index) {
                     return Err(Error::DuplicateColumn { name: a.column });
                 }
-                let value = analyze_expr(&a.value, scope, catalog, Some(column.ty))?;
+                let Some(expr) = &a.value else {
+                    typed.push(Assignment::default_of(index, column.ty));
+                    continue;
+                };
+                let value = analyze_expr(expr, scope, catalog, Some(column.ty))?;
                 check_assignable(column, &value)?;
                 typed.push(Assignment {
                     column: index,
                     value,
+                    default: false,
                 });
             }
             Ok(MergeMatchedAction::Update { assignments: typed })
@@ -1545,7 +1561,12 @@ pub(super) fn analyze_instead_of_update(
             });
         };
         let ty = schema.columns.get(pos).map_or(ColumnType::Text, |c| c.ty);
-        let value = super::analyze_expr(&assignment.value, &scope, catalog, Some(ty))?;
+        let Some(expr) = &assignment.value else {
+            return Err(Error::Unsupported(
+                "DEFAULT in an UPDATE of a view with an INSTEAD OF trigger".to_owned(),
+            ));
+        };
+        let value = super::analyze_expr(expr, &scope, catalog, Some(ty))?;
         assignments.push((pos, value));
     }
     let returning = analyze_returning(&upd.returning, &schema, catalog)?;
@@ -1851,6 +1872,13 @@ fn update_through_view(
     require_full_identity_view(&view, view_name, catalog)?;
     let check_option = view.check_option;
     let view_filter = view.filter.clone();
+    // `SET v = DEFAULT` assigns the view column's default, and a view column has none: the value
+    // is NULL, as for a column an INSERT through the view leaves out, not the base column's default.
+    for assignment in &mut upd.assignments {
+        if assignment.value.is_none() {
+            assignment.value = Some(ast::Expr::Literal(ast::Value::Null));
+        }
+    }
     upd.filter = and_filters(upd.filter.take(), view.filter);
     upd.schema = view.base_schema;
     upd.table = view.base_table;

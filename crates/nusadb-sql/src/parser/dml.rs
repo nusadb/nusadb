@@ -210,9 +210,10 @@ pub(super) fn convert_assignment(assignment: sql::Assignment) -> Result<ast::Ass
             return unsupported("multi-column assignment (`SET (a, b) = ...`)");
         },
     };
+    // A bare `DEFAULT` assigns the column's default, as a `DEFAULT` cell of `VALUES` does.
     Ok(ast::Assignment {
         column,
-        value: convert_expr(assignment.value)?,
+        value: convert_values_cell(assignment.value)?,
     })
 }
 

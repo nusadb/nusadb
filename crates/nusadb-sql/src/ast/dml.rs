@@ -207,8 +207,9 @@ pub struct Update {
 pub struct Assignment {
     /// Column being assigned.
     pub column: String,
-    /// New value expression.
-    pub value: Expr,
+    /// New value expression; `None` for `SET column = DEFAULT`, which assigns the column's
+    /// default (its sequence's next value, its generated value, or NULL).
+    pub value: Option<Expr>,
 }
 
 /// `DELETE FROM table [USING ...] [WHERE ...] [RETURNING ...]`.

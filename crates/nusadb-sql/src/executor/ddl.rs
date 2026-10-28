@@ -349,6 +349,7 @@ pub(super) fn run_create_table(
     }
     if let Some(part) = &plan.partition_of {
         register_partition(&def, part, engine, txn)?;
+        copy_parent_column_metadata(&def, id, &part.parent_schema, &part.parent, engine, txn)?;
         propagate_parent_constraints(
             &def,
             id,
@@ -360,6 +361,111 @@ pub(super) fn run_create_table(
         )?;
     }
     Ok(ExecutionResult::Created(id))
+}
+
+/// Refuse attaching `partition` to `parent` when a column is generated in one and not in the
+/// other (`42804`): a row written through the parent is built under the parent's rules, so the two
+/// must agree on which columns are computed. A partition may compute a generated column from an
+/// expression of its own, as in the reference engine; its rows, however written, use it.
+fn check_attach_generated_columns(
+    parent: &TableSchema,
+    partition: &TableSchema,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let generated_of = |table: &TableSchema| -> Result<HashMap<String, String>, Error> {
+        Ok(super::coldefault::load_defaults(
+            &super::coldefault::catalog_key(&table.schema, &table.name),
+            engine,
+            txn,
+        )?
+        .into_iter()
+        .filter_map(|(column, sql)| {
+            super::coldefault::generated_expr(&sql).map(|expr| (column, expr.to_owned()))
+        })
+        .collect())
+    };
+    let in_parent = generated_of(parent)?;
+    let in_partition = generated_of(partition)?;
+    for column in &parent.columns {
+        let message = match (in_parent.get(&column.name), in_partition.get(&column.name)) {
+            (Some(_), None) => "must be a generated column",
+            (None, Some(_)) => "must not be a generated column",
+            _ => continue,
+        };
+        return Err(Error::Coded {
+            message: format!(
+                "column \"{}\" in child table \"{}\" {message}",
+                column.name, partition.name
+            ),
+            sqlstate: "42804", // datatype_mismatch
+        });
+    }
+    Ok(())
+}
+
+/// Give a partition created by `CREATE TABLE ... PARTITION OF` everything its parent declares
+/// about each column beyond the physical type: the defaults (a `SERIAL` or identity column shares
+/// the parent's sequence, so the whole table draws one series), the generated-column expressions,
+/// the enum and composite type tags, and the checks that come with a column's declared type (an
+/// integer width, a `VARCHAR(n)` length, a domain's `CHECK`s). The partition then takes a row
+/// written to it directly exactly as its parent takes one, and a write through the parent finds
+/// the same rules on the leaf it lands in. A table that joins by `ATTACH PARTITION` keeps its own,
+/// as in the reference engine.
+fn copy_parent_column_metadata(
+    def: &nusadb_core::TableDef,
+    id: nusadb_core::TableId,
+    parent_schema: &str,
+    parent_name: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some(parent) = engine.lookup_table_as_of_in(txn, parent_schema, parent_name)? else {
+        return Ok(());
+    };
+    let own_key = super::coldefault::catalog_key(&def.schema, &def.name);
+    for (column, sql) in super::coldefault::load_defaults(
+        &super::coldefault::catalog_key(&parent.schema, &parent.name),
+        engine,
+        txn,
+    )? {
+        super::coldefault::set_default(&own_key, &column, &sql, engine, txn)?;
+    }
+    for column in &parent.columns {
+        if let Some(type_name) =
+            super::lookup_enum_column(engine, txn, &parent.schema, &parent.name, &column.name)?
+        {
+            super::store_enum_column(
+                engine,
+                txn,
+                &def.schema,
+                &def.name,
+                &column.name,
+                &type_name,
+            )?;
+        }
+        if let Some(type_name) =
+            super::lookup_composite_column(engine, txn, &parent.schema, &parent.name, &column.name)?
+        {
+            super::store_composite_column(
+                engine,
+                txn,
+                &def.schema,
+                &def.name,
+                &column.name,
+                &type_name,
+            )?;
+        }
+    }
+    for c in engine.list_constraints_as_of(txn, parent.id)? {
+        if c.kind == nusadb_core::ConstraintKind::Check
+            && c.name.starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+            && let Some(expr) = &c.expr
+        {
+            engine.add_check_constraint(txn, id, &c.name, expr)?;
+        }
+    }
+    Ok(())
 }
 
 /// Copy a partitioned parent's constraints onto a partition joining it (at `CREATE TABLE ...
@@ -2828,6 +2934,7 @@ pub(super) fn run_alter_table(
                 engine,
                 txn,
             )?;
+            check_attach_generated_columns(&parent, &partition, engine, txn)?;
             register_partition(&def, &part, engine, txn)?;
             let _fresh = lock_for_validation(&partition, engine, txn)?;
             validate_attach_rows(&parent, &partition, engine, txn)?;

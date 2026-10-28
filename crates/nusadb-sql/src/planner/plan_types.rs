@@ -2103,8 +2103,27 @@ pub struct ViewCheck {
 pub struct Assignment {
     /// Ordinal (into the table's columns) of the column being assigned.
     pub column: usize,
-    /// The new value (type-checked against the column's type).
+    /// The new value (type-checked against the column's type). A typed NULL for a `DEFAULT`
+    /// assignment, whose value the executor takes from the column's default.
     pub value: TypedExpr,
+    /// `SET column = DEFAULT`: the column takes its default for each row (the next value of its
+    /// sequence, its generated value, or NULL when it has none).
+    pub default: bool,
+}
+
+impl Assignment {
+    /// The `SET column = DEFAULT` assignment of the column at `column`, of type `ty`.
+    #[must_use]
+    pub const fn default_of(column: usize, ty: ColumnType) -> Self {
+        Self {
+            column,
+            value: TypedExpr {
+                kind: TypedExprKind::Literal(ast::Value::Null),
+                ty,
+            },
+            default: true,
+        }
+    }
 }
 
 /// `DELETE` — table resolved, predicate type-checked.

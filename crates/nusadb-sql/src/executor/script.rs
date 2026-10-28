@@ -635,7 +635,9 @@ fn bind_vars_stmt(
             let mut scope = with_table(shadowed, &update.table, ctx)?;
             scope.extend(from_columns(update.from.as_ref(), ctx)?);
             for assignment in &mut update.assignments {
-                bind_vars_expr(&mut assignment.value, ctx, &scope)?;
+                if let Some(value) = &mut assignment.value {
+                    bind_vars_expr(value, ctx, &scope)?;
+                }
             }
             bind_vars_from(update.from.as_mut(), ctx, &scope)?;
             bind_vars_opt(update.filter.as_mut(), ctx, &scope)?;
