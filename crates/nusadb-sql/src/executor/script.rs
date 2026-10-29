@@ -387,7 +387,56 @@ fn exec_one(
             super::dispatch(crate::plan(logical), engine, txn)?;
             Ok(Flow::Normal)
         },
+        ScriptStmt::SelectInto {
+            query,
+            targets,
+            strict,
+        } => select_into(query, targets, *strict, env, params, engine, txn),
     }
+}
+
+/// `SELECT ... INTO [STRICT] targets`: run the query and assign its first row's columns to the
+/// targets in order. Every target must already be a variable, so a misspelled name is an error
+/// rather than a silently created one, and nothing runs when one is not.
+fn select_into(
+    query: &ast::Statement,
+    targets: &[String],
+    strict: bool,
+    env: &mut Env,
+    params: &[ast::Value],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Flow, Error> {
+    if let Some(unknown) = targets.iter().find(|t| env.get(t).is_none()) {
+        return Err(Error::Coded {
+            message: format!("\"{unknown}\" is not a known variable"),
+            sqlstate: "42601",
+        });
+    }
+    let bound = bind(query.clone(), env, params, engine, txn)?;
+    let logical = crate::analyze(bound, &ExecCatalog::new(engine, txn))?;
+    let rows = match super::dispatch(crate::plan(logical), engine, txn)? {
+        ExecutionResult::Rows { rows, .. } => rows,
+        _ => Vec::new(),
+    };
+    if strict && rows.len() != 1 {
+        return Err(if rows.is_empty() {
+            Error::Coded {
+                message: "query returned no rows".to_owned(),
+                sqlstate: "P0002",
+            }
+        } else {
+            Error::Coded {
+                message: "query returned more than one row".to_owned(),
+                sqlstate: "P0003",
+            }
+        });
+    }
+    let mut row = rows.into_iter().next().unwrap_or_default().into_iter();
+    for target in targets {
+        env.insert(target.clone(), row.next().unwrap_or(ast::Value::Null));
+    }
+    Ok(Flow::Normal)
 }
 
 /// Evaluate a scalar expression with the current variables + parameters bound, by running

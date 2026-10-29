@@ -1762,10 +1762,34 @@ the caller's statement fails.
 NusaScript statements: `DECLARE name TYPE [DEFAULT expr]`, `SET name = expr` (or `name := expr`),
 `IF ... THEN ... [ELSIF ...] [ELSE ...] END IF`, `WHILE cond LOOP ... END LOOP`,
 `FOR i IN low TO high LOOP ... END LOOP`, `RAISE 'message'` (reported as `P0001`), `RETURN`,
-`PERFORM expr` (evaluate and discard, for a call made for its side effects), and any
-SQL data statement. An `EXCEPTION WHEN OTHERS THEN` handler rolls the body's writes back to a
-savepoint and runs in their place. Variables may be referenced by name inside embedded SQL; a
-column of the same name wins. `LANGUAGE SQL` is the only language.
+`PERFORM expr` (evaluate and discard, for a call made for its side effects),
+`SELECT ... INTO [STRICT] target [, ...]`, and any SQL data statement. An `EXCEPTION WHEN OTHERS
+THEN` handler rolls the body's writes back to a savepoint and runs in their place. Variables may
+be referenced by name inside embedded SQL; a column of the same name wins. `LANGUAGE SQL` is the
+only language.
+
+Inside a block, `SELECT ... INTO` assigns the columns of the query's first row to the targets in
+order; it does not create a table, as it does at the top level. The clause may come right after
+the select list or at the end of the query. A target is a declared variable, a parameter, or a
+`NEW.col` field in a trigger function; any other name fails with `42601` (`"x" is not a known
+variable`) before the query runs. No row sets every target to `NULL`, and more than one row takes
+the first. A target past the last column is set to `NULL`, and a column past the last target is
+ignored. With `STRICT`, no row fails with `P0002` and more than one with `P0003`. The value is
+assigned as the query returned it; the variable's declared type is not applied.
+
+```sql
+CREATE FUNCTION order_total(o INT) RETURNS NUMERIC LANGUAGE nusascript AS $$
+BEGIN
+  DECLARE total NUMERIC;
+  DECLARE n INT;
+  SELECT sum(amount), count(*) INTO total, n FROM order_lines WHERE order_id = o;
+  IF n = 0 THEN
+    RAISE 'order has no lines';
+  END IF;
+  RETURN total;
+END
+$$;
+```
 
 `RAISE level 'format' [, value ...]` fills each `%` in the format with the next value (`%%` is a
 literal `%`, `NULL` shows as `<NULL>`, and the counts must match, `42601` otherwise). `EXCEPTION`

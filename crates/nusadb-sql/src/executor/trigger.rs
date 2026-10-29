@@ -1725,6 +1725,15 @@ fn sub_script_stmt(stmt: &mut ScriptStmt, refs: &RowRefs<'_>) -> Result<(), Erro
         // Rewritten above.
         ScriptStmt::Return(_) | ScriptStmt::ReturnRow(_) => Ok(()),
         ScriptStmt::Sql(stmt) => substitute_row_refs(stmt, refs),
+        ScriptStmt::SelectInto { query, targets, .. } => {
+            // An `INTO NEW.col` target must name a column of the row, like `NEW.col := ...`.
+            for target in targets.iter() {
+                if let Some(column) = target.strip_prefix("new.") {
+                    refs.resolve("new", column)?;
+                }
+            }
+            substitute_row_refs(query, refs)
+        },
         ScriptStmt::Block(block) => sub_script_block(block, refs),
     }
 }

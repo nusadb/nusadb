@@ -157,6 +157,20 @@ impl Catalog for SltCatalog<'_> {
         self.scannable_indexes(&table)
     }
 
+    fn lookup_function(
+        &self,
+        name: &str,
+    ) -> Result<Option<nusadb_sql::FunctionDef>, nusadb_sql::Error> {
+        if let Some(txn) = self.txn {
+            nusadb_sql::lookup_function_definition(self.engine, txn, name)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out = nusadb_sql::lookup_function_definition(self.engine, txn, name);
+            let _ = self.engine.commit(txn);
+            out
+        }
+    }
+
     fn any_inheritance(&self) -> Result<bool, nusadb_sql::Error> {
         if let Some(txn) = self.txn {
             nusadb_sql::inheritance_any(self.engine, txn)
@@ -1305,4 +1319,9 @@ fn slt_p1_add_column_generated() {
 #[test]
 fn slt_p1_fk_set_null_columns() {
     run_slt("tests/slt/p1_ddl/fk_set_null_columns.slt");
+}
+
+#[test]
+fn slt_p5_nusascript_select_into() {
+    run_slt("tests/slt/p5_advanced/nusascript_select_into.slt");
 }

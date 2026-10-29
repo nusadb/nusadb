@@ -105,6 +105,19 @@ pub(crate) enum ScriptStmt {
     /// An embedded SQL data statement (`INSERT`/`UPDATE`/`DELETE`/`SELECT`/`CALL`). Boxed because an
     /// [`ast::Statement`] is far larger than the other variants.
     Sql(Box<ast::Statement>),
+    /// `SELECT ... INTO [STRICT] target [, target ...] ...`: run the query and assign the columns of
+    /// its first row to the targets, in order. Inside a block, `INTO` names variables (or a trigger
+    /// function's `NEW.col` fields), never a new table. No row sets every target to `NULL`; a
+    /// target past the last column is set to `NULL` and a column past the last target is ignored.
+    /// With `STRICT` the query must return exactly one row.
+    SelectInto {
+        /// The query, with its `INTO` clause removed.
+        query: Box<ast::Statement>,
+        /// The target names (folded; `record.field` for a qualified target), in order.
+        targets: Vec<String>,
+        /// Whether `STRICT` was given.
+        strict: bool,
+    },
     /// A nested `BEGIN ... [EXCEPTION ...] END` block.
     Block(ScriptBlock),
 }
@@ -295,12 +308,123 @@ fn parse_one(parser: &mut Parser) -> Result<ScriptStmt, Error> {
         },
         // `name := expr` / `record.field := expr`.
         Some(_) if is_walrus_assignment(parser) => parse_assign(parser),
+        // A query whose `INTO` names variables to assign, else an ordinary query.
+        Some("select" | "with") => parse_select_into(parser)?.map_or_else(|| parse_sql(parser), Ok),
         // Anything else is an embedded SQL data statement.
-        _ => {
-            let stmt = parser.parse_statement().map_err(syntax)?;
-            Ok(ScriptStmt::Sql(Box::new(convert_statement(stmt)?)))
-        },
+        _ => parse_sql(parser),
     }
+}
+
+/// An embedded SQL data statement.
+fn parse_sql(parser: &mut Parser) -> Result<ScriptStmt, Error> {
+    let stmt = parser.parse_statement().map_err(syntax)?;
+    Ok(ScriptStmt::Sql(Box::new(convert_statement(stmt)?)))
+}
+
+/// A query with an `INTO` clause at the current position, as a [`ScriptStmt::SelectInto`]. Returns
+/// `None`, consuming nothing, when the statement is not a query or its `INTO` is not at the top level
+/// of the query.
+///
+/// The `INTO` clause may sit anywhere in the query (`SELECT a INTO x FROM t` or `SELECT a FROM t
+/// INTO x`). Its tokens are cut out and the rest is parsed as an ordinary statement.
+fn parse_select_into(parser: &mut Parser) -> Result<Option<ScriptStmt>, Error> {
+    use sqlparser::keywords::Keyword;
+    // The statement's tokens up to its `;` (or the end of input). The statement's verb is the first
+    // top-level one: in `WITH c AS (...) INSERT INTO t ...` it is `INSERT`, and that `INTO` is its own.
+    let mut tokens = Vec::new();
+    let mut depth = 0usize;
+    let mut verb = None;
+    let mut into_at = None;
+    loop {
+        let token = parser.peek_nth_token_ref(tokens.len());
+        match &token.token {
+            Token::EOF => break,
+            Token::SemiColon if depth == 0 => break,
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth = depth.saturating_sub(1),
+            Token::Word(w) if depth == 0 && w.quote_style.is_none() => match w.keyword {
+                Keyword::SELECT
+                | Keyword::INSERT
+                | Keyword::UPDATE
+                | Keyword::DELETE
+                | Keyword::MERGE
+                | Keyword::VALUES
+                | Keyword::TABLE
+                    if verb.is_none() =>
+                {
+                    verb = Some(w.keyword);
+                },
+                Keyword::INTO if verb == Some(Keyword::SELECT) && into_at.is_none() => {
+                    into_at = Some(tokens.len());
+                },
+                _ => {},
+            },
+            _ => {},
+        }
+        tokens.push(token.clone());
+    }
+    let Some(into_at) = into_at else {
+        return Ok(None);
+    };
+
+    // `[STRICT] target [, target ...]`.
+    let after_into: Vec<_> = tokens.split_off(into_at).into_iter().skip(1).collect();
+    let mut target_parser =
+        Parser::new(&NusaParserDialect).with_tokens_with_locations(after_into.clone());
+    let strict = eat_word(&mut target_parser, "strict");
+    let mut targets = Vec::new();
+    loop {
+        let mut name = fold_ident(&target_parser.parse_identifier().map_err(syntax)?);
+        if target_parser.consume_token(&Token::Period) {
+            let field = fold_ident(&target_parser.parse_identifier().map_err(syntax)?);
+            name = format!("{name}.{field}");
+        }
+        targets.push(name);
+        if !target_parser.consume_token(&Token::Comma) {
+            break;
+        }
+    }
+    let targets_len = consumed(&target_parser, after_into.len());
+    let into_len = 1 + targets_len;
+
+    // The query without its `INTO` clause.
+    tokens.extend(after_into.into_iter().skip(targets_len));
+    let query_len = tokens.len();
+    let mut query_parser = Parser::new(&NusaParserDialect).with_tokens_with_locations(tokens);
+    let stmt = query_parser.parse_statement().map_err(syntax)?;
+    let consumed = consumed(&query_parser, query_len);
+    if consumed < into_at {
+        return Err(Error::Syntax(
+            "INTO must be part of the query in a NusaScript block".to_owned(),
+        ));
+    }
+    // Move past the statement, its `INTO` clause included.
+    for _ in 0..consumed + into_len {
+        parser.next_token();
+    }
+    let query = convert_statement(stmt)?;
+    if !matches!(
+        query,
+        ast::Statement::Select(_) | ast::Statement::SetOperation(_)
+    ) {
+        return Err(Error::Syntax(
+            "INTO in a NusaScript block must follow a query".to_owned(),
+        ));
+    }
+    Ok(Some(ScriptStmt::SelectInto {
+        query: Box::new(query),
+        targets,
+        strict,
+    }))
+}
+
+/// How many of a parser's `total` tokens (none of them whitespace) it has consumed.
+fn consumed(parser: &Parser, total: usize) -> usize {
+    let mut rest = 0;
+    while !matches!(parser.peek_nth_token_ref(rest).token, Token::EOF) {
+        rest += 1;
+    }
+    total - rest
 }
 
 /// The rest of a `RAISE`: `level 'format' [, arg ...]` when a level word is followed by a string

@@ -1,0 +1,197 @@
+# Inside a NusaScript block, `SELECT ... INTO` assigns the first row's columns to variables. It never
+# creates a table there; a top-level `SELECT ... INTO t` still does.
+
+statement ok
+CREATE TABLE si (id INT PRIMARY KEY, v INT NOT NULL, w TEXT)
+
+statement ok
+INSERT INTO si VALUES (1, 42, 'a'), (2, 43, 'b')
+
+statement ok
+CREATE FUNCTION si_one() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE x INT; SELECT v INTO x FROM si WHERE id = 1; RETURN x; END $$
+
+query I
+SELECT si_one()
+----
+42
+
+# No table named after the variable was created.
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'x'
+----
+0
+
+# Several targets, in column order.
+statement ok
+CREATE FUNCTION si_two() RETURNS TEXT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; DECLARE b TEXT; SELECT v, w INTO a, b FROM si WHERE id = 2; RETURN a || b; END $$
+
+query T
+SELECT si_two()
+----
+43b
+
+# The INTO clause may also follow the rest of the query.
+statement ok
+CREATE FUNCTION si_end() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; SELECT v FROM si WHERE id = 1 INTO a; RETURN a; END $$
+
+query I
+SELECT si_end()
+----
+42
+
+# No row sets the target to NULL.
+statement ok
+CREATE FUNCTION si_zero() RETURNS TEXT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT DEFAULT 5; SELECT v INTO a FROM si WHERE id = 99; RETURN coalesce(a::TEXT, 'null'); END $$
+
+query T
+SELECT si_zero()
+----
+null
+
+# More than one row: the first one is taken.
+statement ok
+CREATE FUNCTION si_many() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; SELECT v INTO a FROM si ORDER BY id DESC; RETURN a; END $$
+
+query I
+SELECT si_many()
+----
+43
+
+# Fewer targets than columns ignores the rest; more targets than columns sets the extra ones to NULL.
+statement ok
+CREATE FUNCTION si_fewer() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; SELECT v, w INTO a FROM si WHERE id = 1; RETURN a; END $$
+
+query I
+SELECT si_fewer()
+----
+42
+
+statement ok
+CREATE FUNCTION si_more() RETURNS TEXT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; DECLARE b TEXT DEFAULT 'keep'; SELECT v INTO a, b FROM si WHERE id = 1; RETURN a || coalesce(b, 'NULL'); END $$
+
+query T
+SELECT si_more()
+----
+42NULL
+
+# STRICT wants exactly one row.
+statement ok
+CREATE FUNCTION si_strict(k INT) RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; SELECT v INTO STRICT a FROM si WHERE id >= k; RETURN a; END $$
+
+query I
+SELECT si_strict(2)
+----
+43
+
+statement error query returned no rows
+SELECT si_strict(3)
+
+statement error query returned more than one row
+SELECT si_strict(1)
+
+# A parameter is a target too.
+statement ok
+CREATE FUNCTION si_param(p INT) RETURNS INT LANGUAGE nusascript AS $$ BEGIN SELECT v INTO p FROM si WHERE id = 1; RETURN p; END $$
+
+query I
+SELECT si_param(0)
+----
+42
+
+# WITH and set operations.
+statement ok
+CREATE FUNCTION si_with() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; WITH c AS (SELECT v FROM si WHERE id = 2) SELECT v INTO a FROM c; RETURN a; END $$
+
+query I
+SELECT si_with()
+----
+43
+
+statement ok
+CREATE FUNCTION si_union() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; SELECT v INTO a FROM si WHERE id = 2 UNION ALL SELECT 1; RETURN a; END $$
+
+query I
+SELECT si_union()
+----
+43
+
+# A WITH ... INSERT keeps its own INTO.
+statement ok
+CREATE TABLE si_log (id INT, v INT)
+
+statement ok
+CREATE PROCEDURE si_cte_insert() AS $$ BEGIN WITH c AS (SELECT 9 AS v) INSERT INTO si_log SELECT -9, v FROM c; END $$
+
+statement ok
+CALL si_cte_insert()
+
+# A target that is not a variable is an error, and nothing is created.
+statement ok
+CREATE FUNCTION si_bad() RETURNS INT LANGUAGE nusascript AS $$ BEGIN DECLARE a INT; SELECT v INTO nosuch FROM si WHERE id = 1; RETURN a; END $$
+
+statement error "nosuch" is not a known variable
+SELECT si_bad()
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'nosuch'
+----
+0
+
+# Procedures, DO blocks and trigger functions.
+statement ok
+CREATE PROCEDURE si_proc() AS $$ BEGIN DECLARE a INT; SELECT v INTO a FROM si WHERE id = 1; INSERT INTO si_log VALUES (-2, a); END $$
+
+statement ok
+CALL si_proc()
+
+statement ok
+DO $$ BEGIN DECLARE a INT; SELECT v INTO a FROM si WHERE id = 2; INSERT INTO si_log VALUES (-1, a); END $$
+
+statement ok
+CREATE FUNCTION si_trg() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN DECLARE m INT; SELECT max(v) INTO m FROM si; INSERT INTO si_log VALUES (NEW.id, m); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER si_t AFTER INSERT ON si FOR EACH ROW EXECUTE FUNCTION si_trg()
+
+statement ok
+INSERT INTO si VALUES (3, 50, 'c')
+
+query II
+SELECT id, v FROM si_log ORDER BY id
+----
+-9 9
+-2 42
+-1 43
+3 50
+
+# A BEFORE trigger may select into a NEW field.
+statement ok
+CREATE TABLE si_n (id INT, v INT)
+
+statement ok
+CREATE FUNCTION si_fill() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN SELECT v INTO NEW.v FROM si WHERE id = 1; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER si_fill BEFORE INSERT ON si_n FOR EACH ROW EXECUTE FUNCTION si_fill()
+
+statement ok
+INSERT INTO si_n VALUES (1, NULL)
+
+query II
+SELECT id, v FROM si_n
+----
+1 42
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name IN ('a', 'b', 'm', 'p')
+----
+0
+
+# At the top level, SELECT ... INTO still creates a table.
+statement ok
+SELECT v INTO si_copy FROM si WHERE id = 1
+
+query I
+SELECT v FROM si_copy
+----
+42
