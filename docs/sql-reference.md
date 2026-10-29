@@ -1109,8 +1109,8 @@ ON CONFLICT (account) WHERE state = 'active' DO UPDATE SET state = 'replaced';
   drop the index and recreate it with `CREATE UNIQUE INDEX ... NULLS NOT DISTINCT`.
 - `NULLS [NOT] DISTINCT` is only accepted on a `UNIQUE` index (`42601` otherwise).
 - A unique index cannot be created on a partitioned table (`0A000`), because it could not see a
-  duplicate across partitions. Declare a `UNIQUE` constraint on the partitioned table instead (it
-  must include the partition key), or create the unique index on each partition.
+  duplicate across partitions. Declare a `UNIQUE` constraint on the partitioned table instead (it is
+  enforced across all partitions, see [Keys across partitions](#keys-across-partitions)), or create the unique index on each partition.
 - The index is checked on every write: `INSERT`, `INSERT ... SELECT`, `COPY`, `UPDATE` (including a
   row moving into or out of the predicate), `MERGE`, both upsert arms and foreign-key cascades.
   `CREATE UNIQUE INDEX` over existing rows refuses with `23505` when they already hold a duplicate.
@@ -2820,7 +2820,7 @@ disk. See [deployment](deployment.md) for what still has to fit in memory.
 Recognised and refused with `0A000` and a clear message rather than half-implemented:
 
 - `LIST` partitioning over several columns;
-- `EXCLUDE` constraints with an operator other than `=` or `&&`, deferrable ones, and ones on a partitioned table;
+- `EXCLUDE` constraints with an operator other than `=` or `&&`, and ones on a partitioned table;
 - a multi-column `CYCLE` clause, or its `TO ... DEFAULT ...` marker form;
 - `EXECUTE ... USING`, and arguments to a trigger function;
 - aggregating a row value with anything but `count`;
