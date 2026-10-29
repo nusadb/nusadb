@@ -631,6 +631,42 @@ fn read_exact_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// How many clock entries one eviction looks at for a clean page before it spills a changed
+/// one instead (when a spill is enabled).
+const SWEEP_LIMIT: usize = 512;
+
+/// How many times one eviction tries again after its victim was taken or changed meanwhile.
+const EVICT_RETRIES: u32 = 8;
+
+/// What a clock sweep does with an unreferenced changed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyPolicy {
+    /// Pass it by: only a clean frame may leave.
+    Skip,
+    /// Keep the first one to spill if the sweep finds no clean frame.
+    Fallback,
+    /// Take it: every resident frame is changed.
+    Take,
+}
+
+/// A frame a sweep picked to leave the cache, and whether it leaves by spilling.
+#[derive(Debug, Clone, Copy)]
+struct Victim {
+    id: u64,
+    spill: bool,
+}
+
+/// How one eviction attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eviction {
+    /// The frame left (or was gone already).
+    Done,
+    /// The frame was latched or changed after it was picked; it stays.
+    Busy,
+    /// Writing the frame to the spill failed; it stays.
+    SpillFailed,
+}
+
 /// A resident page: its own latch, whether it differs from the image's copy, and the clock's
 /// second-chance bit.
 #[derive(Debug)]
@@ -645,16 +681,17 @@ struct Frame {
 ///
 /// A page not resident is loaded from the image on first use; a page that differs from the image
 /// (dirty) stays out of the image until the next checkpoint publishes one that holds it, after
-/// which every page is clean again. Under a capacity, clean pages are evicted by the clock
-/// (second-chance) rule to make room. When every resident page is dirty, a dirty page is written
-/// to the spill file, if one is enabled, and leaves memory; it comes back from there as a dirty
-/// page. The spill is scratch space, never durable and never read by recovery. The store itself
-/// never refuses a page: a tree operation (a split writes several pages) must never stop half
-/// way, so without a spill a cache full of dirty pages simply grows past its capacity, and the
-/// engine refuses new writes at an operation boundary instead, from what cannot be evicted.
-/// Without a capacity, nothing is evicted and the store behaves like an in-memory one that
-/// merely loads lazily. Without an image (the in-memory
-/// engine, or a database before its first checkpoint) every page is resident.
+/// which every page is clean again. Under a capacity, pages are evicted by the clock
+/// (second-chance) rule to make room. A clean page simply leaves; when a short sweep finds none
+/// and a spill file is enabled, a dirty page is written there and leaves memory; it comes back
+/// from there as a dirty page. Without a spill file only clean pages leave. The spill is scratch
+/// space, never durable and never read by recovery. The store itself never refuses a page: a
+/// tree operation (a split writes several pages) must never stop half way, so without a spill a
+/// cache full of dirty pages simply grows past its capacity, and the engine refuses new writes
+/// at an operation boundary instead, from what cannot be evicted. Without a capacity, nothing is
+/// evicted and the store behaves like an in-memory one that merely loads lazily. Without an
+/// image (the in-memory engine, or a database before its first checkpoint) every page is
+/// resident.
 ///
 /// Latching mirrors [`MemPageStore`]: the frame directory is read-locked for the lookup, each
 /// frame carries its own latch, so distinct pages proceed in parallel and a same-page read and
@@ -663,8 +700,8 @@ struct Frame {
 /// Eviction against writes: a writer takes the frame latch and then confirms the frame is still
 /// the one registered for its id (retrying from the lookup if not), and marks it dirty under
 /// that latch; the evictor removes a frame only while holding its latch without waiting for it
-/// (`try_write`) and only if it is still clean. So a write never lands in a frame that has left
-/// the cache. Lock order: the frame latch may be held while the directory is read-locked, never
+/// (`try_write`) and only if it is still clean, or after writing it to the spill when it was
+/// picked to spill. So a write never lands in a frame that has left the cache. Lock order: the frame latch may be held while the directory is read-locked, never
 /// the other way round with a wait (the evictor's latch attempt does not block), and the clock
 /// is never taken while the directory is write-locked.
 #[derive(Debug, Default)]
@@ -1129,69 +1166,155 @@ impl PagedStore {
         Ok(frames.get(&id).is_some_and(|f| Arc::ptr_eq(f, frame)))
     }
 
-    /// Evict clean pages by the clock rule until one frame is free under the capacity, or until
+    /// Evict pages by the clock rule until one frame is free under the capacity, or until
     /// nothing evictable remains.
+    ///
+    /// With a working spill a sweep looks at most [`SWEEP_LIMIT`] frames for a clean page and
+    /// otherwise spills the first changed page it passed, so a cache full of changed pages costs
+    /// a short sweep per miss rather than a walk of the whole clock. Without a spill (or while
+    /// its writes fail) only a clean page can leave, so the sweep covers the whole clock, and a
+    /// changed page is spilled only once every resident page is changed. The victim is picked
+    /// with the directory read-locked; the write lock is taken only to remove it.
     fn make_room(&self) -> Result<()> {
         let capacity = self.capacity_frames.load(Ordering::Acquire);
         if capacity == 0 {
             return Ok(());
         }
+        let mut retries = 0;
+        let mut spill_failed = false;
         loop {
             let len = self.frames.read().map_err(|_| poisoned())?.len() as u64;
             if len < capacity {
                 return Ok(());
             }
-            // While every resident page is dirty, only spilling can make room.
-            let spill_dirty = self.dirty_frames.load(Ordering::Acquire) >= len;
-            if spill_dirty && !self.can_spill() {
-                return Ok(());
-            }
+            let (spill_on, spill_failing) = {
+                let spill = self.spill.lock().map_err(|_| poisoned())?;
+                (spill.file.is_some(), spill.failing)
+            };
             let mut clock = self.clock.lock().map_err(|_| poisoned())?;
-            let mut sweeps = clock.len().saturating_mul(2).saturating_add(1);
-            let mut evicted = false;
-            let mut frames = self.frames.write().map_err(|_| poisoned())?;
-            while sweeps > 0 {
-                sweeps -= 1;
-                let Some(id) = clock.pop_front() else { break };
-                let Some(frame) = frames.get(&id).cloned() else {
-                    continue; // evicted or freed already
-                };
-                let dirty = frame.dirty.load(Ordering::Acquire);
-                if (dirty && !spill_dirty) || frame.referenced.swap(false, Ordering::AcqRel) {
-                    clock.push_back(id);
-                    continue;
+            let bounded = spill_on && !spill_failing && !spill_failed;
+            let (limit, policy) = if bounded {
+                (SWEEP_LIMIT, DirtyPolicy::Fallback)
+            } else {
+                // While every resident page is dirty, only spilling can make room.
+                let all_dirty = self.dirty_frames.load(Ordering::Acquire) >= len;
+                if all_dirty && (!spill_on || spill_failed) {
+                    return Ok(());
                 }
-                // Evict only a frame no one is reading or writing right now, and only if it is
-                // still clean under its latch: a writer marks dirty while holding it.
-                let Ok(latch) = frame.data.try_write() else {
-                    clock.push_back(id);
-                    continue;
-                };
-                if frame.dirty.load(Ordering::Acquire) {
-                    if !spill_dirty {
-                        clock.push_back(id);
-                        continue;
-                    }
-                    // Write the page out and register it before the frame leaves the directory,
-                    // so whoever looks next finds it in the spill. A failed write keeps it
-                    // resident: the store never fails a caller because of the spill.
-                    let spilled = self.spill.lock().map_err(|_| poisoned())?.put(id, &latch);
-                    if spilled.is_err() {
-                        clock.push_back(id);
-                        break;
-                    }
-                    self.dirty_frames.fetch_sub(1, Ordering::AcqRel);
-                }
-                frames.remove(&id);
-                evicted = true;
-                break;
-            }
-            drop(frames);
+                let whole = clock.len().saturating_mul(2).saturating_add(1);
+                (
+                    whole,
+                    if all_dirty {
+                        DirtyPolicy::Take
+                    } else {
+                        DirtyPolicy::Skip
+                    },
+                )
+            };
+            let outcome = match self.pick_victim(&mut clock, limit, policy)? {
+                Some(victim) => self.evict(&mut clock, victim)?,
+                // A short sweep can pass only referenced or latched frames; it cleared their
+                // bits, so the next one finds a victim. A whole sweep that found none means
+                // nothing is evictable.
+                None if bounded => Eviction::Busy,
+                None => return Ok(()),
+            };
             drop(clock);
-            if !evicted {
-                return Ok(());
+            match outcome {
+                Eviction::Done => {},
+                // Racing users of the cache: let the frame in over the bound rather than spin;
+                // the next miss evicts down to the capacity again.
+                Eviction::Busy => {
+                    retries += 1;
+                    if retries > EVICT_RETRIES {
+                        return Ok(());
+                    }
+                },
+                // The store never fails a caller because of the spill: look for a clean page
+                // the way a store without one does.
+                Eviction::SpillFailed if bounded => spill_failed = true,
+                Eviction::SpillFailed => return Ok(()),
             }
         }
+    }
+
+    /// Sweep at most `limit` clock entries for a victim: an unreferenced frame no one holds,
+    /// clean, or changed as `policy` allows. Referenced frames lose their bit and go to the back.
+    fn pick_victim(
+        &self,
+        clock: &mut VecDeque<u64>,
+        limit: usize,
+        policy: DirtyPolicy,
+    ) -> Result<Option<Victim>> {
+        let frames = self.frames.read().map_err(|_| poisoned())?;
+        let mut fallback = None;
+        for _ in 0..limit {
+            let Some(id) = clock.pop_front() else { break };
+            let Some(frame) = frames.get(&id) else {
+                continue; // evicted or freed already
+            };
+            let dirty = frame.dirty.load(Ordering::Acquire);
+            if (dirty && policy == DirtyPolicy::Skip)
+                || frame.referenced.swap(false, Ordering::AcqRel)
+            {
+                clock.push_back(id);
+                continue;
+            }
+            // A frame someone is reading or writing right now cannot leave.
+            if frame.data.try_write().is_err() {
+                clock.push_back(id);
+                continue;
+            }
+            if !dirty || policy == DirtyPolicy::Take {
+                if let Some(passed) = fallback {
+                    clock.push_front(passed);
+                }
+                return Ok(Some(Victim { id, spill: dirty }));
+            }
+            if fallback.is_none() {
+                fallback = Some(id);
+            } else {
+                clock.push_back(id);
+            }
+        }
+        Ok(fallback.map(|id| Victim { id, spill: true }))
+    }
+
+    /// Remove `victim` from the directory if it is still evictable: not latched, and clean
+    /// unless it was picked to spill. A spilled page is written out and registered before its
+    /// frame leaves the directory, both under the directory write lock, so `locate` never misses
+    /// a page in transit.
+    fn evict(&self, clock: &mut VecDeque<u64>, victim: Victim) -> Result<Eviction> {
+        let mut frames = self.frames.write().map_err(|_| poisoned())?;
+        let Some(frame) = frames.get(&victim.id).cloned() else {
+            return Ok(Eviction::Done); // freed meanwhile: its frame is gone already
+        };
+        // Evict only a frame no one is reading or writing right now, and only if it is still
+        // clean under its latch (a writer marks dirty while holding it) or picked to spill.
+        let Ok(latch) = frame.data.try_write() else {
+            clock.push_back(victim.id);
+            return Ok(Eviction::Busy);
+        };
+        if frame.dirty.load(Ordering::Acquire) {
+            if !victim.spill {
+                clock.push_back(victim.id);
+                return Ok(Eviction::Busy);
+            }
+            // A failed write keeps the page resident.
+            let spilled = self
+                .spill
+                .lock()
+                .map_err(|_| poisoned())?
+                .put(victim.id, &latch);
+            if spilled.is_err() {
+                clock.push_back(victim.id);
+                return Ok(Eviction::SpillFailed);
+            }
+            self.dirty_frames.fetch_sub(1, Ordering::AcqRel);
+        }
+        drop(latch);
+        frames.remove(&victim.id);
+        Ok(Eviction::Done)
     }
 }
 
@@ -1473,5 +1596,317 @@ mod tests {
             spilled_before - PAGE_SIZE as u64,
             "a freed page keeps no spilled copy"
         );
+    }
+
+    /// A store over an image of `count` pages (page `id` filled with `id`), bounded to
+    /// `capacity` frames.
+    fn imaged(dir: &Path, count: u64, capacity: u64) -> PagedStore {
+        let path = dir.join("image");
+        let mut bytes = Vec::new();
+        let mut checksums = Vec::new();
+        for id in 0..count {
+            let page = page_of(id as u8);
+            checksums.push(crc32fast::hash(&page));
+            bytes.extend_from_slice(&page);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let store = PagedStore::default();
+        let pages = PageFile::open(&path, 0, count, (0..count).collect(), checksums).unwrap();
+        store.attach(pages).unwrap();
+        store.set_capacity_bytes(Some(capacity * PAGE_SIZE as u64));
+        store
+    }
+
+    /// Clear every second-chance bit, so the next sweep picks by clock position alone.
+    fn settle(store: &PagedStore) {
+        for frame in store.frames.read().unwrap().values() {
+            frame.referenced.store(false, Ordering::Release);
+        }
+    }
+
+    fn is_resident(store: &PagedStore, id: u64) -> bool {
+        store.frames.read().unwrap().contains_key(&id)
+    }
+
+    fn frame_count(store: &PagedStore) -> u64 {
+        store.frames.read().unwrap().len() as u64
+    }
+
+    /// The dirty count agrees with the frames that are dirty.
+    fn assert_dirty_count(store: &PagedStore) {
+        let dirty = store
+            .frames
+            .read()
+            .unwrap()
+            .values()
+            .filter(|f| f.dirty.load(Ordering::Acquire))
+            .count() as u64;
+        assert_eq!(store.dirty_frames.load(Ordering::Acquire), dirty);
+    }
+
+    /// Fill a bounded cache over a one-page image: `before` changed pages, then image page 0
+    /// (clean), then changed pages up to the capacity, every second-chance bit cleared.
+    fn one_clean_frame_at(store: &PagedStore, before: u64, capacity: u64) -> Vec<PageId> {
+        let mut ids: Vec<PageId> = (0..before)
+            .map(|i| {
+                let id = store.allocate_page().unwrap();
+                store.write_page(id, &page_of(i as u8)).unwrap();
+                id
+            })
+            .collect();
+        assert_eq!(store.read_page(PageId(0)).unwrap(), page_of(0));
+        while frame_count(store) < capacity {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, &page_of(ids.len() as u8)).unwrap();
+            ids.push(id);
+        }
+        settle(store);
+        ids
+    }
+
+    /// A cache of changed pages only stays within its bound by spilling, and every page reads
+    /// back as last written.
+    #[test]
+    fn a_cache_of_changed_pages_spills_within_its_bound() {
+        let store = spilling(64);
+        let mut ids = Vec::new();
+        for i in 0..3000_u64 {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, &page_of(i as u8)).unwrap();
+            ids.push(id);
+            assert!(frame_count(&store) <= 64, "{} frames", frame_count(&store));
+        }
+        assert!(store.spilled_bytes() >= (3000 - 64) * PAGE_SIZE as u64);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.read_page(*id).unwrap(), page_of(i as u8));
+        }
+        assert_dirty_count(&store);
+    }
+
+    /// A clean page in the sweep's reach leaves before any changed page is spilled, and reads
+    /// back from the image.
+    #[test]
+    fn a_clean_page_leaves_before_a_changed_one_spills() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = imaged(dir.path(), 1, 1000);
+        store.enable_spill(tempfile::tempfile().unwrap()).unwrap();
+        one_clean_frame_at(&store, 0, 1000);
+        crowd_out(&store, 1);
+        assert!(!is_resident(&store, 0));
+        assert_eq!(store.spilled_bytes(), 0);
+        assert_eq!(frame_count(&store), 1000);
+        assert_eq!(store.read_page(PageId(0)).unwrap(), page_of(0));
+    }
+
+    /// With a spill, the one clean page far down the clock is not searched for: the first
+    /// changed page swept is spilled instead, and the cache stays within its bound.
+    #[test]
+    fn a_short_sweep_spills_rather_than_search_the_whole_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = imaged(dir.path(), 1, 1000);
+        store.enable_spill(tempfile::tempfile().unwrap()).unwrap();
+        let ids = one_clean_frame_at(&store, SWEEP_LIMIT as u64 + 100, 1000);
+        crowd_out(&store, 1);
+        assert!(is_resident(&store, 0), "the clean page lies past the sweep");
+        assert_eq!(store.spilled_bytes(), PAGE_SIZE as u64);
+        assert!(
+            !is_resident(&store, ids[0].0),
+            "the first page swept was spilled"
+        );
+        assert_eq!(frame_count(&store), 1000);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.read_page(*id).unwrap(), page_of(i as u8));
+        }
+        assert_dirty_count(&store);
+    }
+
+    /// Without a spill the whole clock is searched: the one clean page leaves wherever it is,
+    /// and once only changed pages remain the cache grows past its bound instead of failing.
+    #[test]
+    fn without_a_spill_the_whole_clock_is_searched_for_a_clean_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = imaged(dir.path(), 1, 1000);
+        let ids = one_clean_frame_at(&store, SWEEP_LIMIT as u64 + 100, 1000);
+        crowd_out(&store, 1);
+        assert!(!is_resident(&store, 0));
+        assert_eq!(frame_count(&store), 1000);
+        crowd_out(&store, 5);
+        assert_eq!(
+            frame_count(&store),
+            1005,
+            "changed pages stay without a spill"
+        );
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.read_page(*id).unwrap(), page_of(i as u8));
+        }
+        assert_eq!(store.read_page(PageId(0)).unwrap(), page_of(0));
+        assert_dirty_count(&store);
+    }
+
+    /// A spill write that fails sends the sweep after a clean page the way a store without a
+    /// spill does, leaks no slot, and with only changed pages left the cache grows instead.
+    #[test]
+    fn a_failing_spill_falls_back_to_a_clean_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = imaged(dir.path(), 1, 1000);
+        let path = dir.path().join("spill");
+        std::fs::write(&path, b"").unwrap();
+        // Opened read-only: every spill write fails.
+        store.enable_spill(File::open(&path).unwrap()).unwrap();
+        let ids = one_clean_frame_at(&store, SWEEP_LIMIT as u64 + 100, 1000);
+        crowd_out(&store, 1);
+        assert!(!is_resident(&store, 0), "the clean page left instead");
+        assert_eq!(frame_count(&store), 1000);
+        crowd_out(&store, 5);
+        assert_eq!(frame_count(&store), 1005);
+        assert_eq!(store.spilled_bytes(), 0);
+        let (next_slot, free_slots) = {
+            let spill = store.spill.lock().unwrap();
+            (spill.next_slot, spill.free_slots.clone())
+        };
+        assert_eq!(next_slot, 1, "only one slot was ever taken");
+        assert_eq!(free_slots, vec![0], "and it went back");
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(store.read_page(*id).unwrap(), page_of(i as u8));
+        }
+        assert_dirty_count(&store);
+    }
+
+    /// Page `id` at `version`: both stamped in front, the rest filled from them, so a torn or
+    /// misplaced copy is caught.
+    fn stamped(id: u64, version: u64) -> Page {
+        let mut page = [(id ^ version) as u8; PAGE_SIZE];
+        page[..8].copy_from_slice(&id.to_le_bytes());
+        page[8..16].copy_from_slice(&version.to_le_bytes());
+        page
+    }
+
+    /// The version a page read for `id` carries, after checking it is whole.
+    fn version_of(id: u64, page: &Page) -> u64 {
+        let got = u64::from_le_bytes(page[..8].try_into().unwrap());
+        assert_eq!(got, id, "page {id} came back holding page {got}");
+        let version = u64::from_le_bytes(page[8..16].try_into().unwrap());
+        assert_eq!(*page, stamped(id, version), "page {id} came back torn");
+        version
+    }
+
+    /// Writers, readers and a thread that allocates and frees pages, all over a small cache
+    /// that evicts and spills constantly: every read finds the page (never in transit between
+    /// memory and the spill), whole and no older than its writer last wrote, and the counts
+    /// stay consistent.
+    fn eviction_races(store: &PagedStore, image_pages: u64, capacity: u64) {
+        const WRITERS: u64 = 4;
+        const OWNED: u64 = 48;
+        let owned: Vec<Vec<PageId>> = (0..WRITERS)
+            .map(|_| {
+                (0..OWNED)
+                    .map(|_| {
+                        let id = store.allocate_page().unwrap();
+                        store.write_page(id, &stamped(id.0, 0)).unwrap();
+                        id
+                    })
+                    .collect()
+            })
+            .collect();
+        let latest: Vec<Vec<std::sync::atomic::AtomicU64>> = (0..WRITERS)
+            .map(|_| (0..OWNED).map(|_| AtomicU64::new(0)).collect())
+            .collect();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for (w, ids) in owned.iter().enumerate() {
+                let latest = &latest[w];
+                writers.push(scope.spawn(move || {
+                    let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ w as u64;
+                    for version in 1..=20_000_u64 {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let n = (state % OWNED) as usize;
+                        let id = ids[n];
+                        store.write_page(id, &stamped(id.0, version)).unwrap();
+                        latest[n].store(version, Ordering::Release);
+                        let page = store.read_page(id).unwrap();
+                        assert_eq!(version_of(id.0, &page), version);
+                    }
+                }));
+            }
+            for r in 0..4_u64 {
+                let owned = &owned;
+                let latest = &latest;
+                let done = &done;
+                scope.spawn(move || {
+                    let mut state = 0xD1B5_4A32_D192_ED03_u64 ^ r;
+                    while !done.load(Ordering::Acquire) {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        if state.is_multiple_of(3) {
+                            let id = state % image_pages;
+                            assert_eq!(store.read_page(PageId(id)).unwrap(), page_of(id as u8));
+                            continue;
+                        }
+                        let w = (state % WRITERS) as usize;
+                        let n = ((state >> 8) % OWNED) as usize;
+                        let id = owned[w][n];
+                        let floor = latest[w][n].load(Ordering::Acquire);
+                        let version = store.with_page(id, |page| version_of(id.0, page)).unwrap();
+                        assert!(version >= floor, "page {} went back in time", id.0);
+                    }
+                });
+            }
+            let done = &done;
+            scope.spawn(move || {
+                let mut version = 0;
+                while !done.load(Ordering::Acquire) {
+                    version += 1;
+                    let id = store.allocate_page().unwrap();
+                    store.write_page(id, &stamped(id.0, version)).unwrap();
+                    crowd_out(store, 2);
+                    assert_eq!(version_of(id.0, &store.read_page(id).unwrap()), version);
+                    store.deallocate_page(id).unwrap();
+                }
+            });
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            done.store(true, Ordering::Release);
+        });
+        for (w, ids) in owned.iter().enumerate() {
+            for (n, id) in ids.iter().enumerate() {
+                let page = store.read_page(*id).unwrap();
+                assert_eq!(
+                    version_of(id.0, &page),
+                    latest[w][n].load(Ordering::Acquire)
+                );
+            }
+        }
+        assert_dirty_count(store);
+        // A racing miss may let its frame in over the bound; the next miss evicts down again.
+        crowd_out(store, 4);
+        assert!(
+            frame_count(store) <= capacity + 4,
+            "{} frames",
+            frame_count(store)
+        );
+    }
+
+    #[test]
+    fn eviction_races_with_readers_and_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = imaged(dir.path(), 200, 64);
+        store.enable_spill(tempfile::tempfile().unwrap()).unwrap();
+        eviction_races(&store, 200, 64);
+        assert!(store.spilled_bytes() > 0);
+    }
+
+    #[test]
+    fn eviction_races_with_readers_and_writers_over_a_sealed_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = imaged(dir.path(), 200, 64);
+        store
+            .enable_sealed_spill(tempfile::tempfile().unwrap(), Sealer::ephemeral().unwrap())
+            .unwrap();
+        eviction_races(&store, 200, 64);
     }
 }

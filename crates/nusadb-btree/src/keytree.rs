@@ -311,12 +311,6 @@ struct Interior {
     separators: Vec<Separator>,
 }
 
-impl Interior {
-    fn children(&self) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(self.leftmost).chain(self.separators.iter().map(|s| s.child))
-    }
-}
-
 fn decode_leaf(page: &Page) -> Result<Leaf> {
     if !is_leaf(page)? {
         return Err(corrupt("expected a leaf"));
@@ -337,6 +331,20 @@ fn decode_leaf(page: &Page) -> Result<Leaf> {
         next: get_u64(page, OFF_NEXT)?,
         entries,
     })
+}
+
+/// The children of an interior node, leftmost first, read without copying its separators.
+fn interior_children(page: &Page) -> Result<Vec<u64>> {
+    if is_leaf(page)? {
+        return Err(corrupt("expected an interior node"));
+    }
+    let count = get_u16(page, OFF_COUNT)?;
+    let mut children = Vec::with_capacity(count + 1);
+    children.push(get_u64(page, OFF_LEFTMOST)?);
+    for i in 0..count {
+        children.push(child_of(page, slot(page, INTERIOR_HEADER, i)?)?);
+    }
+    Ok(children)
 }
 
 fn decode_interior(page: &Page) -> Result<Interior> {
@@ -828,19 +836,56 @@ impl<'s> KeyTree<'s> {
 
     /// Every page of the tree.
     ///
+    /// Every leaf of a B+tree sits at the same depth, so once the leftmost path has shown how
+    /// deep the leaves are, the children of a node one level above them are named without being
+    /// read: only interior pages (and that one leaf) are loaded, which keeps a walk of a large
+    /// index from pulling all of its leaves through the page cache.
+    ///
     /// # Errors
-    /// Propagates page-store errors.
+    /// Propagates page-store errors; a malformed page is an error.
     pub fn pages(&self) -> Result<Vec<PageId>> {
+        let leaf_level = self.leaf_level()?;
         let mut out = Vec::new();
-        let mut stack = vec![self.root];
-        while let Some(id) = stack.pop() {
+        let mut stack = vec![(self.root, 0usize)];
+        while let Some((id, level)) = stack.pop() {
             out.push(id);
-            let page = self.store.read_page(id)?;
-            if !is_leaf(&page)? {
-                stack.extend(decode_interior(&page)?.children().map(PageId));
+            if level == leaf_level {
+                continue;
+            }
+            let children = self.store.with_page(id, interior_children)??;
+            if level + 1 == leaf_level {
+                #[cfg(debug_assertions)]
+                for &child in &children {
+                    let leaf = self.store.with_page(PageId(child), is_leaf)??;
+                    debug_assert!(leaf, "page {child} breaks the uniform leaf depth");
+                }
+                out.extend(children.into_iter().map(PageId));
+            } else {
+                stack.extend(children.into_iter().map(|c| (PageId(c), level + 1)));
             }
         }
         Ok(out)
+    }
+
+    /// How many levels lie above the leaves: `0` when the root is a leaf.
+    fn leaf_level(&self) -> Result<usize> {
+        let mut level = 0;
+        let mut id = self.root;
+        loop {
+            let child = self.store.with_page(id, |page| -> Result<Option<u64>> {
+                if is_leaf(page)? {
+                    return Ok(None);
+                }
+                Ok(Some(get_u64(page, OFF_LEFTMOST)?))
+            })??;
+            match child {
+                Some(child) => {
+                    id = PageId(child);
+                    level += 1;
+                },
+                None => return Ok(level),
+            }
+        }
     }
 
     /// Descend to the leaf for `target`, returning the interior pages passed on the way (root
@@ -1130,6 +1175,76 @@ mod tests {
         }
         assert_eq!(tree.pages().unwrap().len(), 1);
         assert_eq!(store.live_pages().unwrap(), 1);
+    }
+
+    /// Every page of the tree found by reading each one: the walk `pages` must agree with.
+    fn pages_read_one_by_one(tree: &KeyTree<'_>) -> Vec<PageId> {
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            let page = tree.store.read_page(id).unwrap();
+            if !is_leaf(&page).unwrap() {
+                let node = decode_interior(&page).unwrap();
+                stack.push(PageId(node.leftmost));
+                stack.extend(node.separators.iter().map(|s| PageId(s.child)));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The walk that names leaves without reading them finds exactly the pages a walk reading
+    /// every page finds, from a single leaf to several levels, while the tree grows and drains.
+    #[test]
+    fn the_page_walk_matches_reading_every_page() {
+        let store = PagedStore::default();
+        let mut tree = KeyTree::create(&store).unwrap();
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let check = |tree: &KeyTree<'_>| {
+            let mut fast = tree.pages().unwrap();
+            fast.sort_unstable();
+            assert_eq!(fast, pages_read_one_by_one(tree));
+            assert_eq!(fast.len(), store.live_pages().unwrap());
+        };
+        check(&tree);
+        let mut present: Vec<u64> = Vec::new();
+        for round in 0..6_u64 {
+            // Grow by an uneven amount with uneven key sizes, then delete a random share.
+            for _ in 0..=(round * 9_000) {
+                let i = next() % 1_000_000;
+                tree.put(&key(i, 12 + (i % 5) as usize * 90), 0, b"v")
+                    .unwrap();
+                present.push(i);
+            }
+            check(&tree);
+            present.sort_unstable();
+            present.dedup();
+            present.retain(|&i| {
+                if next() % 3 == 0 {
+                    assert!(tree.delete(&key(i, 12 + (i % 5) as usize * 90), 0).unwrap());
+                    false
+                } else {
+                    true
+                }
+            });
+            check(&tree);
+        }
+        assert!(
+            tree.leaf_level().unwrap() >= 2,
+            "the test must reach three levels"
+        );
+        for i in present {
+            assert!(tree.delete(&key(i, 12 + (i % 5) as usize * 90), 0).unwrap());
+        }
+        check(&tree);
+        assert_eq!(tree.pages().unwrap().len(), 1);
     }
 
     /// Exclusive and inclusive bounds on one key, an early stop, and an empty tree.

@@ -36,7 +36,7 @@ use std::io::Seek;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use nusadb_core::engine::{
@@ -594,6 +594,13 @@ struct TableState {
     /// both count. Consumed by auto-analyze to decide when the planner's histogram/MCV statistics
     /// have gone stale. A hint only: a slightly stale value never affects correctness.
     churn_since_analyze: AtomicU64,
+    /// Counts row changes: every row mutation but purge's own bumps it after the change (see
+    /// [`write_rows`](TableState::write_rows)).
+    purge_gen: AtomicU64,
+    /// The [`purge_gen`](TableState::purge_gen) at the start of the last purge sweep that read
+    /// every row and left nothing for a later pass. While the two are equal the rows hold nothing
+    /// to purge and a pass skips reading them. Starts at `u64::MAX`, so the first pass sweeps.
+    purge_clean_gen: AtomicU64,
     /// Rank 3 — the per-table writer latch: tree mutations, row-id minting, and the WAL append
     /// of each row op run under it, so same-table writes (and their log records) are totally
     /// ordered while different tables proceed in parallel.
@@ -610,6 +617,22 @@ impl TableState {
     /// [`approx_rows`](TableState::approx_rows) sentinel: not yet initialized (no row-count walk has
     /// run). `u64::MAX` is unreachable as a real live-row count, so it is an unambiguous marker.
     const APPROX_UNINIT: u64 = u64::MAX;
+
+    /// Take the writer latch to change rows. Releasing it records the change for purge (see
+    /// [`purge_gen`](TableState::purge_gen)), so every row mutation takes the latch through here.
+    /// Only purge, whose changes leave nothing more to purge, and readers of `next_row_id`, which
+    /// change no row, take [`write`](TableState::write) directly.
+    fn write_rows(&self) -> Result<RowWrite<'_>> {
+        Ok(RowWrite {
+            guard: self.write.lock().map_err(|_| poisoned())?,
+            purge_gen: &self.purge_gen,
+        })
+    }
+
+    /// Record a row change made without the latch (log replay owns the catalog exclusively).
+    fn rows_changed(&self) {
+        self.purge_gen.fetch_add(1, Ordering::Release);
+    }
 
     /// The tree's current root as a [`nusadb_core::PageId`].
     fn root_id(&self) -> nusadb_core::PageId {
@@ -701,6 +724,33 @@ impl Orphan {
         match self {
             Self::Constraint { name, .. } | Self::Index { name, .. } => name,
         }
+    }
+}
+
+/// The writer latch held for a row mutation ([`TableState::write_rows`]): dropping it bumps the
+/// table's purge generation while still latched, after whatever the holder changed.
+struct RowWrite<'a> {
+    guard: MutexGuard<'a, TableWrite>,
+    purge_gen: &'a AtomicU64,
+}
+
+impl std::ops::Deref for RowWrite<'_> {
+    type Target = TableWrite;
+
+    fn deref(&self) -> &TableWrite {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for RowWrite<'_> {
+    fn deref_mut(&mut self) -> &mut TableWrite {
+        &mut self.guard
+    }
+}
+
+impl Drop for RowWrite<'_> {
+    fn drop(&mut self) {
+        self.purge_gen.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -3139,6 +3189,8 @@ impl BtreeEngine {
                         root: AtomicU64::new(tree.root().0),
                         approx_rows: AtomicU64::new(TableState::APPROX_UNINIT),
                         churn_since_analyze: AtomicU64::new(0),
+                        purge_gen: AtomicU64::new(0),
+                        purge_clean_gen: AtomicU64::new(u64::MAX),
                         write: Mutex::new(TableWrite { next_row_id }),
                         schema_version: 0,
                         schema_history: std::iter::once((0, schema)).collect(),
@@ -3170,6 +3222,7 @@ impl BtreeEngine {
                     let mut tree = ClusteredTree::open(store, t.root_id());
                     tree.insert(*row_id, &value)?;
                     t.set_root(tree.root());
+                    t.rows_changed();
                     let w = t.write.get_mut().map_err(|_| poisoned())?;
                     w.next_row_id = w.next_row_id.max(*row_id + 1);
                 }
@@ -3197,6 +3250,7 @@ impl BtreeEngine {
                         tree.insert(first_row_id + i as u64, &value)?;
                     }
                     t.set_root(tree.root());
+                    t.rows_changed();
                     let w = t.write.get_mut().map_err(|_| poisoned())?;
                     w.next_row_id = w.next_row_id.max(end);
                 }
@@ -3222,6 +3276,7 @@ impl BtreeEngine {
                         w.next_row_id = w.next_row_id.max(*row_id + 1);
                     }
                     t.set_root(tree.root());
+                    t.rows_changed();
                 }
             },
             LoggedOp::Delete {
@@ -3238,6 +3293,7 @@ impl BtreeEngine {
                         }
                     }
                     t.set_root(tree.root());
+                    t.rows_changed();
                 }
             },
             LoggedOp::IndexRoot {
@@ -8500,6 +8556,8 @@ impl nusadb_core::StorageEngine for BtreeEngine {
                 root: AtomicU64::new(tree.root().0),
                 approx_rows: AtomicU64::new(TableState::APPROX_UNINIT),
                 churn_since_analyze: AtomicU64::new(0),
+                purge_gen: AtomicU64::new(0),
+                purge_clean_gen: AtomicU64::new(u64::MAX),
                 write: Mutex::new(TableWrite::default()),
                 schema_version: 0,
                 schema_history: std::iter::once((0, schema)).collect(),
@@ -8942,7 +9000,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // One writer-latch acquisition and one log record for the whole batch — the two per-row
         // costs the attribution measured largest on bulk loads. Row ids are minted consecutively,
         // so the clustered tree receives an ascending key run.
-        let mut w = t.write.lock().map_err(|_| poisoned())?;
+        let mut w = t.write_rows()?;
         let first_row_id = w.next_row_id;
         w.next_row_id += tuples.len() as u64;
         let mut tree = ClusteredTree::open(&*self.store, t.root_id());
@@ -9028,7 +9086,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         }
         // The per-table writer latch spans mint → tree write → undo push → WAL append, so
         // same-table row ops are totally ordered and the log mirrors that order.
-        let mut w = t.write.lock().map_err(|_| poisoned())?;
+        let mut w = t.write_rows()?;
         let row_id = w.next_row_id;
         w.next_row_id += 1;
         let value = mvcc::encode_row(RowMeta::fresh(txn.0), tuple);
@@ -9095,7 +9153,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         // Under the table latch: read the newest version, admit, park, install, log — one
         // atomic same-table step (two admitted writers over one row are impossible). The tree
         // opens AFTER the latch: only latch holders move the root, so it cannot go stale here.
-        let _w = t.write.lock().map_err(|_| poisoned())?;
+        let _w = t.write_rows()?;
         let mut tree = ClusteredTree::open(&*self.store, t.root_id());
         let old_value = tree.get(row_id)?.ok_or_else(|| tuple_not_found(tid))?;
         let (old_meta, old_tuple) =
@@ -9188,7 +9246,7 @@ impl nusadb_core::StorageEngine for BtreeEngine {
         }
         let row_id = row_id_of(tid);
         // The tree opens AFTER the latch: only latch holders move the root (see `update`).
-        let _w = t.write.lock().map_err(|_| poisoned())?;
+        let _w = t.write_rows()?;
         let tree = ClusteredTree::open(&*self.store, t.root_id());
         let old_value = tree.get(row_id)?.ok_or_else(|| tuple_not_found(tid))?;
         let (meta, old_tuple) = mvcc::decode_row(&old_value).ok_or_else(|| corrupt_row(row_id))?;
@@ -11201,7 +11259,7 @@ impl BtreeEngine {
             match op {
                 UndoOp::Inserted { table, row_id } => {
                     if let Some(t) = cat.get().tables.get(&table) {
-                        let _w = t.write.lock().map_err(|_| poisoned())?;
+                        let _w = t.write_rows()?;
                         let tree = ClusteredTree::open(store, t.root_id());
                         if let Some(retired) = tree.delete(row_id)? {
                             self.retire_pages(txn, retired)?;
@@ -11216,7 +11274,7 @@ impl BtreeEngine {
                     undo_idx,
                 } => {
                     if let Some(t) = cat.get().tables.get(&table) {
-                        let _w = t.write.lock().map_err(|_| poisoned())?;
+                        let _w = t.write_rows()?;
                         let mut tree = ClusteredTree::open(store, t.root_id());
                         let retired = tree.update(row_id, &old)?;
                         t.set_root(tree.root());
@@ -11234,7 +11292,7 @@ impl BtreeEngine {
                 },
                 UndoOp::Deleted { table, row_id, old } => {
                     if let Some(t) = cat.get().tables.get(&table) {
-                        let _w = t.write.lock().map_err(|_| poisoned())?;
+                        let _w = t.write_rows()?;
                         let tree = ClusteredTree::open(store, t.root_id());
                         // The delete only stamped `xmax`; clear it again. The undo pointer is
                         // taken from the header as it is NOW, not from `old`: purge may have
@@ -11575,9 +11633,24 @@ impl BtreeEngine {
             // have moved the root) and resumes at the next row-id via `scan_from_with`; a row that a
             // writer changed in the gap is simply seen fresh in a later batch (its new stamp is not
             // settled by this pass's snapshot, so it is left for the next pass).
+            //
+            // A table whose rows have not changed since a sweep that read them all and left
+            // nothing for later holds nothing to purge, so its rows are not read again. The
+            // generation is read before the sweep: a change it misses bumps the generation
+            // past it, and the next pass sweeps again.
+            let swept_gen = t.purge_gen.load(Ordering::Acquire);
+            let sweep = t.purge_clean_gen.load(Ordering::Acquire) != swept_gen;
+            if sweep {
+                stats.tables_swept += 1;
+            }
+            let mut left_for_later = false;
+            let mut swept_all = false;
             let mut cursor = 0u64;
             let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(PURGE_ROW_BATCH);
             loop {
+                if !sweep {
+                    break;
+                }
                 // Checked before a batch as well as after one, so a pass under pressure never
                 // dirties another batch.
                 if self.page_cache_needs_checkpoint() {
@@ -11630,10 +11703,17 @@ impl BtreeEngine {
                             );
                             tree.update_prefix(*row_id, &header)?;
                         }
+                        // A delete or an older version some view may still need: a later
+                        // pass has work here.
+                        left_for_later |= (meta.xmax != mvcc::NO_XMAX && !settled(meta.xmax))
+                            || (meta.xmax == mvcc::NO_XMAX
+                                && meta.undo != mvcc::NO_UNDO
+                                && !settled(meta.xmin));
                     }
                 } // release the writer latch + reclamation gate — writers interleave here
                 // A short batch means `scan_from_with` reached the end of the tree.
                 if batch.len() < PURGE_ROW_BATCH {
+                    swept_all = true;
                     break;
                 }
                 if self.page_cache_needs_checkpoint() {
@@ -11644,6 +11724,9 @@ impl BtreeEngine {
                     Some(k) => cursor = k.saturating_add(1),
                     None => break,
                 }
+            }
+            if swept_all && !left_for_later {
+                t.purge_clean_gen.store(swept_gen, Ordering::Release);
             }
             for idx in cat.indexes.values().filter(|i| i.def.table.0 == table) {
                 // A range is reclaimed with its removed row, or once its dead-stamp is settled
@@ -11858,6 +11941,9 @@ pub struct PurgeStats {
     pub tables_reclaimed: usize,
     /// Pages returned to the store's free list from reclaimed trees.
     pub pages_reclaimed: usize,
+    /// Tables whose rows the pass read. A table whose rows have not changed since a pass read
+    /// them all and found nothing left to purge later is not read again.
+    pub tables_swept: usize,
 }
 
 #[cfg(test)]
@@ -12054,5 +12140,180 @@ mod tests {
         rewrite(10);
         let after = segments();
         assert!(after.len() < pinned.len(), "{pinned:?} -> {after:?}");
+    }
+
+    /// How many tables a purge pass reads the rows of.
+    fn swept(engine: &BtreeEngine) -> usize {
+        engine.purge().unwrap().tables_swept
+    }
+
+    /// A table with `rows` committed rows, purged until clean.
+    fn clean_table(
+        engine: &BtreeEngine,
+        name: &str,
+        rows: u32,
+    ) -> (TableId, Vec<nusadb_core::Tid>) {
+        let txn = engine.begin(IsolationLevel::ReadCommitted).unwrap();
+        let def = TableDef {
+            name: name.to_owned(),
+            ..t_def()
+        };
+        let table = engine.create_table(txn, &def).unwrap();
+        let tids = (0..rows)
+            .map(|i| {
+                engine
+                    .insert(txn, table, format!("row-{i}").as_bytes())
+                    .unwrap()
+            })
+            .collect();
+        engine.commit(txn).unwrap();
+        assert_eq!(swept(engine), 1, "a new table is swept");
+        assert_eq!(swept(engine), 0, "and then left alone");
+        (table, tids)
+    }
+
+    /// Each kind of row change, committed or rolled back, makes the next pass read the table
+    /// again, and the pass after that leaves it alone.
+    #[test]
+    fn every_row_change_brings_the_purge_sweep_back() {
+        let rc = IsolationLevel::ReadCommitted;
+        let engine = BtreeEngine::new();
+        let (table, tids) = clean_table(&engine, "t", 50);
+        let (other, _) = clean_table(&engine, "other", 5);
+        let resweep = |what: &str, stats: PurgeStats| {
+            assert_eq!(
+                stats.tables_swept, 1,
+                "{what}: only the changed table is read"
+            );
+            assert_eq!(swept(&engine), 0, "{what}: clean again");
+            stats
+        };
+
+        let txn = engine.begin(rc).unwrap();
+        engine.insert(txn, table, b"one more").unwrap();
+        engine.commit(txn).unwrap();
+        resweep("insert", engine.purge().unwrap());
+
+        let txn = engine.begin(rc).unwrap();
+        engine
+            .insert_batch(txn, table, &[b"a".to_vec(), b"b".to_vec()])
+            .unwrap();
+        engine.commit(txn).unwrap();
+        resweep("insert batch", engine.purge().unwrap());
+
+        let txn = engine.begin(rc).unwrap();
+        engine.update(txn, table, tids[0], b"changed").unwrap();
+        engine.commit(txn).unwrap();
+        let stats = resweep("update", engine.purge().unwrap());
+        assert_eq!(stats.versions_reclaimed, 1);
+
+        let txn = engine.begin(rc).unwrap();
+        engine.delete(txn, table, tids[1]).unwrap();
+        engine.commit(txn).unwrap();
+        let stats = resweep("delete", engine.purge().unwrap());
+        assert_eq!(stats.rows_removed, 1);
+
+        // Rolled back: the undo steps change rows too. A pass while the transaction is open
+        // reads the table (its change bumped it) and, for an update or a delete, finds work
+        // left for later, so the table is read again until the rollback settles.
+        let txn = engine.begin(rc).unwrap();
+        engine.insert(txn, table, b"never").unwrap();
+        assert_eq!(swept(&engine), 1);
+        engine.rollback(txn).unwrap();
+        resweep("rolled-back insert", engine.purge().unwrap());
+
+        let txn = engine.begin(rc).unwrap();
+        engine.update(txn, table, tids[2], b"never").unwrap();
+        assert_eq!(swept(&engine), 1);
+        assert_eq!(swept(&engine), 1, "an open update leaves work for later");
+        engine.rollback(txn).unwrap();
+        resweep("rolled-back update", engine.purge().unwrap());
+
+        let txn = engine.begin(rc).unwrap();
+        engine.delete(txn, table, tids[3]).unwrap();
+        assert_eq!(swept(&engine), 1);
+        assert_eq!(swept(&engine), 1, "an open delete leaves work for later");
+        engine.rollback(txn).unwrap();
+        let stats = resweep("rolled-back delete", engine.purge().unwrap());
+        assert_eq!(stats.rows_removed, 0);
+
+        let txn = engine.begin(rc).unwrap();
+        engine.savepoint(txn, "s").unwrap();
+        engine.update(txn, table, tids[4], b"undone").unwrap();
+        engine.rollback_to(txn, "s").unwrap();
+        engine.commit(txn).unwrap();
+        resweep("savepoint rollback", engine.purge().unwrap());
+
+        // The other table was never touched, and every row still reads.
+        let txn = engine.begin(rc).unwrap();
+        let mut scan = engine.scan(txn, other).unwrap();
+        let mut n = 0;
+        while scan.try_next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 5);
+        let mut scan = engine.scan(txn, table).unwrap();
+        let mut n = 0;
+        while scan.try_next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 52, "50 + 1 + 2 inserted, 1 deleted");
+        engine.commit(txn).unwrap();
+    }
+
+    /// A delete and an update that a long-running snapshot still needs keep the table pending:
+    /// every pass reads it again, with no further change, until the snapshot ends and a pass
+    /// reclaims both.
+    #[test]
+    fn a_long_snapshot_keeps_the_table_pending_until_it_is_swept_clean() {
+        let rc = IsolationLevel::ReadCommitted;
+        let engine = BtreeEngine::new();
+        let (table, tids) = clean_table(&engine, "t", 20);
+        let reader = engine.begin(IsolationLevel::RepeatableRead).unwrap();
+        let mut scan = engine.scan(reader, table).unwrap();
+        assert!(scan.try_next().unwrap().is_some());
+        drop(scan);
+        let txn = engine.begin(rc).unwrap();
+        engine.delete(txn, table, tids[0]).unwrap();
+        engine.update(txn, table, tids[1], b"newer").unwrap();
+        engine.commit(txn).unwrap();
+        for _ in 0..3 {
+            let stats = engine.purge().unwrap();
+            assert_eq!(stats.tables_swept, 1, "still pending");
+            assert_eq!(stats.rows_removed, 0, "the reader still sees the row");
+            assert_eq!(stats.versions_reclaimed, 0, "and the old version");
+        }
+        engine.commit(reader).unwrap();
+        let stats = engine.purge().unwrap();
+        assert_eq!(stats.tables_swept, 1);
+        assert_eq!(stats.rows_removed, 1);
+        assert!(stats.versions_reclaimed >= 1);
+        assert_eq!(swept(&engine), 0, "swept clean");
+    }
+
+    /// Rows replayed from the log at open are swept by the first pass, like every table at
+    /// open, and replay itself counts as a change.
+    #[test]
+    fn rows_replayed_at_open_are_swept_by_the_first_pass() {
+        let rc = IsolationLevel::ReadCommitted;
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("btree.wal");
+        {
+            let engine = BtreeEngine::open(&wal).unwrap();
+            let (table, tids) = clean_table(&engine, "t", 30);
+            let txn = engine.begin(rc).unwrap();
+            engine.delete(txn, table, tids[0]).unwrap();
+            engine.commit(txn).unwrap();
+        }
+        let engine = BtreeEngine::open(&wal).unwrap();
+        let cat = engine.catalog.read().unwrap();
+        let t = cat.tables.values().next().unwrap();
+        assert!(
+            t.purge_gen.load(Ordering::Acquire) > 0,
+            "replay counts as a change"
+        );
+        drop(cat);
+        assert_eq!(swept(&engine), 1);
+        assert_eq!(swept(&engine), 0);
     }
 }

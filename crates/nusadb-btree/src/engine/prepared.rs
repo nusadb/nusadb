@@ -794,7 +794,7 @@ impl BtreeEngine {
                     .tables
                     .get(table)
                     .ok_or_else(|| table_not_found(TableId(*table)))?;
-                let mut w = t.write.lock().map_err(|_| poisoned())?;
+                let mut w = t.write_rows()?;
                 let mut tree = ClusteredTree::open(&*self.store, t.root_id());
                 tree.insert(*row_id, &mvcc::encode_row(RowMeta::fresh(txn), tuple))?;
                 t.set_root(tree.root());
@@ -818,7 +818,7 @@ impl BtreeEngine {
                     .tables
                     .get(table)
                     .ok_or_else(|| table_not_found(TableId(*table)))?;
-                let w = t.write.lock().map_err(|_| poisoned())?;
+                let w = t.write_rows()?;
                 let mut tree = ClusteredTree::open(&*self.store, t.root_id());
                 let old = tree
                     .get(*row_id)?
@@ -870,7 +870,7 @@ impl BtreeEngine {
                     .tables
                     .get(table)
                     .ok_or_else(|| table_not_found(TableId(*table)))?;
-                let w = t.write.lock().map_err(|_| poisoned())?;
+                let w = t.write_rows()?;
                 let tree = ClusteredTree::open(&*self.store, t.root_id());
                 let old = tree
                     .get(*row_id)?

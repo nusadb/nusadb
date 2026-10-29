@@ -641,3 +641,47 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// Rows a standby applies count as changes to its purge: a table it had swept clean is read
+/// again by the next pass after a segment lands, and left alone after that.
+#[test]
+fn applied_rows_bring_the_standby_purge_sweep_back() {
+    let p = primary();
+    let (_dir, standby) = standby_of(&p);
+    standby.purge().unwrap();
+    assert_eq!(standby.purge().unwrap().tables_swept, 0);
+    insert(&p.engine, p.table, b"p3-a");
+    p.engine.checkpoint().unwrap();
+    catch_up(&standby, &p);
+    assert_eq!(standby.purge().unwrap().tables_swept, 1);
+    assert_eq!(standby.purge().unwrap().tables_swept, 0);
+    assert_eq!(payloads(&standby, p.table), payloads(&p.engine, p.table));
+}
+
+/// A prepared transaction's rows, applied on a standby from its prepare records, count as
+/// changes to its purge too: once the commit lands the deleted row is reclaimed there.
+#[test]
+fn a_prepared_delete_applied_on_a_standby_is_purged_once_committed() {
+    let p = primary();
+    let (_dir, standby) = standby_of(&p);
+    standby.purge().unwrap();
+    assert_eq!(standby.purge().unwrap().tables_swept, 0);
+    let txn = p.engine.begin(RC).unwrap();
+    let tid = {
+        let mut scan = p.engine.scan(txn, p.table).unwrap();
+        scan.try_next().unwrap().unwrap().0
+    };
+    p.engine.delete(txn, p.table, tid).unwrap();
+    p.engine
+        .prepare_transaction(txn, "g", "alice", "db")
+        .unwrap();
+    p.engine.checkpoint().unwrap();
+    catch_up(&standby, &p);
+    assert_eq!(standby.purge().unwrap().rows_removed, 0, "still prepared");
+    p.engine.commit_prepared("g", None).unwrap();
+    p.engine.checkpoint().unwrap();
+    catch_up(&standby, &p);
+    assert_eq!(standby.purge().unwrap().rows_removed, 1);
+    assert_eq!(standby.purge().unwrap().tables_swept, 0);
+    assert_eq!(payloads(&standby, p.table), payloads(&p.engine, p.table));
+}
