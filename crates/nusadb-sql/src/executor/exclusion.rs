@@ -1019,7 +1019,13 @@ pub(super) fn register(
 ) -> Result<(), Error> {
     let compiled = Exclusion::compile(table, name, spec)?;
     let owned = match &compiled.eq_columns {
-        Some(columns) if compiled.auto_index && engine.lookup_index(name)?.is_none() => {
+        // An `=` column whose type has no index key encoding gets no index: the constraint is then
+        // checked by scanning the table, as it is for one that owns none.
+        Some(columns)
+            if compiled.auto_index
+                && engine.lookup_index(name)?.is_none()
+                && super::index_key::require_key_types(table, columns, &[]).is_ok() =>
+        {
             let def = nusadb_core::IndexDef {
                 name: name.to_owned(),
                 table: table.id,

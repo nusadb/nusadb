@@ -205,6 +205,12 @@ pub(super) fn run_create_table(
     }
     // Register each resolved PRIMARY KEY / UNIQUE constraint so INSERT/UPDATE enforce its
     // uniqueness (the analyzer collected them from column-level + table-level declarations).
+    if !plan.unique_constraints.is_empty() {
+        let schema = reread_table_by_id(id, &def, engine, txn)?;
+        for constraint in &plan.unique_constraints {
+            index_key::require_key_types(&schema, &constraint.columns, &[])?;
+        }
+    }
     for constraint in &plan.unique_constraints {
         engine.add_unique_constraint(
             txn,
@@ -530,6 +536,7 @@ fn propagate_parent_constraints(
         if already {
             continue;
         }
+        index_key::require_key_types(&partition_schema, &c.columns, &[])?;
         if global {
             super::global_unique::notice_created(&c.name, &def.name);
         }
@@ -1444,6 +1451,7 @@ fn copy_like_metadata(
             nusadb_core::ConstraintKind::PrimaryKey | nusadb_core::ConstraintKind::Unique
                 if options.indexes =>
             {
+                index_key::require_key_types(&src, &c.columns, &[])?;
                 engine.add_unique_constraint(
                     txn,
                     id,
@@ -1468,6 +1476,7 @@ fn copy_like_metadata(
             {
                 continue;
             }
+            index_key::require_key_types(&src, &index.columns, &index.key_exprs)?;
             engine.create_index(
                 txn,
                 &nusadb_core::engine::IndexDef {
@@ -2757,6 +2766,9 @@ pub(super) fn run_create_index(
         crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", plan.def.name));
         return Ok(ExecutionResult::IndexCreated);
     }
+    if let Some(table) = dml::schema_by_id(engine, txn, plan.def.table)? {
+        index_key::require_key_types(&table, &plan.def.columns, &plan.def.key_exprs)?;
+    }
     engine.create_index(txn, &plan.def)?;
     // The index holds the table now: the backfill reads every committed row, not the snapshot
     // taken before the lock, which would miss a writer that committed in between.
@@ -2922,6 +2934,8 @@ pub(super) fn run_alter_table(
             if unique_is_global_on(&table, &name, &columns, nulls_not_distinct, engine, txn)? {
                 super::global_unique::notice_created(&name, &table.name);
             }
+            // The schema as it is now: `ADD COLUMN ... UNIQUE` added the column after analysis.
+            index_key::require_key_types(&reread_table(&table, engine, txn)?, &columns, &[])?;
             let added = name.clone();
             validate_add_unique_constraint(
                 &table,
@@ -3466,6 +3480,7 @@ fn apply_column_op(
         },
         AlterColumnOp::SetType { index, ty, checks } => {
             let column = column_name(table, *index)?;
+            require_key_types_after_set_type(table, *index, *ty, engine, txn)?;
             // The old type's width or length check goes; the new type's (if any) replaces it once
             // the rows hold the new type.
             for (check, _) in synthetic_type_checks_on_column(table, &column, engine, txn)? {
@@ -3507,6 +3522,29 @@ fn apply_column_op(
     };
 
     engine.alter_table(txn, table.id, &core_op)?;
+    Ok(())
+}
+
+/// Refuse `ALTER COLUMN ... TYPE ty` on column `index` of `table` when it would give an index of
+/// the table a key type [`index_key::encode_index_key`] cannot encode. An index whose key could not
+/// be encoded before the change is left alone.
+fn require_key_types_after_set_type(
+    table: &TableSchema,
+    index: usize,
+    ty: ColumnType,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let mut altered = table.clone();
+    let Some(column) = altered.columns.get_mut(index) else {
+        return Ok(());
+    };
+    column.ty = ty;
+    for def in engine.list_indexes_as_of(txn, table.id)? {
+        if index_key::require_key_types(table, &def.columns, &def.key_exprs).is_ok() {
+            index_key::require_key_types(&altered, &def.columns, &def.key_exprs)?;
+        }
+    }
     Ok(())
 }
 

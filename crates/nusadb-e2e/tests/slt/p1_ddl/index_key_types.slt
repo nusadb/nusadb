@@ -1,0 +1,155 @@
+# A key type the index cannot encode (INTERVAL, arrays, VECTOR, INET, CIDR, BIT, ranges, GEOMETRY,
+# TSVECTOR, TSQUERY, XML) is refused when the index is declared, whether or not the table has rows.
+# The table stays writable afterwards.
+
+statement ok
+CREATE TABLE kt_empty (id INT PRIMARY KEY, tags TEXT[] NOT NULL, iv INTERVAL, r INT4RANGE, ip INET, b BIT(3), x XML)
+
+statement ok
+CREATE TABLE kt_full (id INT PRIMARY KEY, tags TEXT[] NOT NULL, iv INTERVAL)
+
+statement ok
+INSERT INTO kt_full VALUES (1, ARRAY['a'], INTERVAL '1 day')
+
+statement error ARRAY column "tags" cannot yet be an index key
+CREATE INDEX kt_empty_gin ON kt_empty USING gin (tags)
+
+statement error ARRAY column "tags" cannot yet be an index key
+CREATE INDEX kt_full_gin ON kt_full USING gin (tags)
+
+statement error ARRAY column "tags" cannot yet be an index key
+CREATE INDEX kt_empty_tags ON kt_empty (tags)
+
+statement error ARRAY column "tags" cannot yet be an index key
+CREATE UNIQUE INDEX kt_empty_tags_u ON kt_empty (tags)
+
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE INDEX kt_empty_multi ON kt_empty (id, iv)
+
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE INDEX kt_full_multi ON kt_full (id, iv)
+
+statement error RANGE column "r" cannot yet be an index key
+CREATE INDEX kt_empty_gist ON kt_empty USING gist (r)
+
+statement error INET column "ip" cannot yet be an index key
+CREATE INDEX kt_empty_ip ON kt_empty (ip)
+
+statement error BIT column "b" cannot yet be an index key
+CREATE INDEX kt_empty_bit ON kt_empty (b)
+
+statement error XML column "x" cannot yet be an index key
+CREATE INDEX kt_empty_xml ON kt_empty (x)
+
+# An expression key is judged by the type of its value.
+statement error an index expression of type ARRAY cannot yet be an index key
+CREATE INDEX kt_empty_expr ON kt_empty ((tags || 'z'::TEXT))
+
+statement ok
+CREATE INDEX kt_empty_first_tag ON kt_empty ((tags[1]))
+
+# A generated TSVECTOR column.
+statement ok
+CREATE TABLE kt_doc (id INT PRIMARY KEY, body TEXT, tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED)
+
+statement error TSVECTOR column "tsv" cannot yet be an index key
+CREATE INDEX kt_doc_tsv ON kt_doc USING gin (tsv)
+
+# Nothing was left behind: every table still takes rows.
+statement ok
+INSERT INTO kt_empty VALUES (1, ARRAY['a'], INTERVAL '1 day', '[1,5)', '10.0.0.1', B'101', '<a/>')
+
+statement ok
+INSERT INTO kt_full VALUES (2, ARRAY['b'], INTERVAL '2 days')
+
+statement ok
+INSERT INTO kt_doc (id, body) VALUES (1, 'a b')
+
+query T
+SELECT tags[1] FROM kt_empty
+----
+a
+
+# An unsupported column is fine as a non-key INCLUDE column.
+statement ok
+CREATE INDEX kt_full_id ON kt_full (id) INCLUDE (iv)
+
+# PRIMARY KEY and UNIQUE in CREATE TABLE, inline or at table level.
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE TABLE kt_pk (iv INTERVAL PRIMARY KEY)
+
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE TABLE kt_uq (id INT, iv INTERVAL UNIQUE)
+
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE TABLE kt_pk2 (a INT, iv INTERVAL, PRIMARY KEY (a, iv))
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name IN ('kt_pk', 'kt_uq', 'kt_pk2')
+----
+0
+
+# ALTER TABLE ADD CONSTRAINT, and ADD COLUMN with a UNIQUE clause.
+statement error INTERVAL column "iv" cannot yet be an index key
+ALTER TABLE kt_full ADD CONSTRAINT kt_full_iv UNIQUE (iv)
+
+statement error ARRAY column "ar" cannot yet be an index key
+ALTER TABLE kt_full ADD COLUMN ar INT[] UNIQUE
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'kt_full' ORDER BY ordinal_position
+----
+id
+tags
+iv
+
+# Changing an indexed column to such a type.
+statement ok
+CREATE TABLE kt_alter (id INT, a TEXT)
+
+statement ok
+CREATE INDEX kt_alter_a ON kt_alter (a)
+
+statement error INTERVAL column "a" cannot yet be an index key
+ALTER TABLE kt_alter ALTER COLUMN a TYPE INTERVAL
+
+statement ok
+ALTER TABLE kt_alter ALTER COLUMN a TYPE VARCHAR(10)
+
+# A partitioned parent: an index on it, and a unique key that its partitions would copy.
+statement ok
+CREATE TABLE kt_part (id INT, iv INTERVAL) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE kt_part_1 PARTITION OF kt_part FOR VALUES FROM (0) TO (10)
+
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE INDEX kt_part_iv ON kt_part (iv)
+
+statement error INTERVAL column "iv" cannot yet be an index key
+CREATE TABLE kt_part_u (id INT, iv INTERVAL, UNIQUE (id, iv)) PARTITION BY RANGE (id)
+
+statement ok
+INSERT INTO kt_part VALUES (1, INTERVAL '1 day')
+
+# An exclusion constraint keeps working over ranges, and over an `=` column of such a type.
+statement ok
+CREATE TABLE kt_excl (id INT, r INT4RANGE, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+INSERT INTO kt_excl VALUES (1, '[1,5)')
+
+statement error conflicting key value violates exclusion constraint
+INSERT INTO kt_excl VALUES (2, '[3,8)')
+
+statement ok
+CREATE TABLE kt_excl_eq (iv INTERVAL, r INT4RANGE, EXCLUDE USING gist (iv WITH =, r WITH &&))
+
+statement ok
+INSERT INTO kt_excl_eq VALUES (INTERVAL '1 day', '[1,3)')
+
+statement ok
+INSERT INTO kt_excl_eq VALUES (INTERVAL '2 days', '[1,3)')
+
+statement error conflicting key value violates exclusion constraint
+INSERT INTO kt_excl_eq VALUES (INTERVAL '1 day', '[2,3)')

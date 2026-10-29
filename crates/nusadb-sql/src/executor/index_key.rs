@@ -11,10 +11,12 @@
 //! `tid`, so an index key is never decoded back into values.
 //!
 //! `NULL` sorts before every non-`NULL` value (a `0x00` field tag vs `0x01`). Types without a clean
-//! order-preserving byte form — `NUMERIC`, `JSON`, `INTERVAL`, `ARRAY`, and `NaN` floats — are
-//! rejected as index keys for v1.
+//! order-preserving byte form ([`unencodable_key_type`]) and `NaN` floats are rejected as index
+//! keys; an index over such a type is refused when it is declared ([`require_key_types`]).
 //!
 //! [`index_scan`]: nusadb_core::StorageEngine::index_scan
+
+use nusadb_core::{ColumnType, TableSchema};
 
 use crate::ast;
 use crate::error::Error;
@@ -33,6 +35,81 @@ pub(super) fn encode_index_key(values: &[ast::Value]) -> Result<Vec<u8>, Error> 
         encode_field(value, &mut out)?;
     }
     Ok(out)
+}
+
+/// The name of a column type whose values [`encode_index_key`] cannot encode, or `None` for a type
+/// that can be an index key. Kept in step with the refusal in `encode_non_null`.
+pub(super) const fn unencodable_key_type(ty: ColumnType) -> Option<&'static str> {
+    match ty {
+        ColumnType::Interval => Some("INTERVAL"),
+        ColumnType::Array(_) => Some("ARRAY"),
+        ColumnType::Vector(_) => Some("VECTOR"),
+        ColumnType::Inet => Some("INET"),
+        ColumnType::Cidr => Some("CIDR"),
+        ColumnType::Bit(_) => Some("BIT"),
+        ColumnType::VarBit(_) => Some("BIT VARYING"),
+        ColumnType::Range(_) => Some("RANGE"),
+        ColumnType::Geometry(_) => Some("GEOMETRY"),
+        ColumnType::Tsvector => Some("TSVECTOR"),
+        ColumnType::Tsquery => Some("TSQUERY"),
+        ColumnType::Xml => Some("XML"),
+        ColumnType::Bool
+        | ColumnType::Int
+        | ColumnType::SmallInt
+        | ColumnType::BigInt
+        | ColumnType::Float
+        | ColumnType::Real
+        | ColumnType::Text
+        | ColumnType::VarChar(_)
+        | ColumnType::Char(_)
+        | ColumnType::Bytes
+        | ColumnType::Timestamp
+        | ColumnType::Date
+        | ColumnType::Time
+        | ColumnType::TimestampTz
+        | ColumnType::TimeTz
+        | ColumnType::Uuid
+        | ColumnType::Numeric { .. }
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Enum
+        | ColumnType::Macaddr
+        | ColumnType::Macaddr8 => None,
+    }
+}
+
+/// Refuse an index on `table` keyed by `columns` and `key_exprs` when a key column, or the value
+/// of a key expression, has a type [`encode_index_key`] cannot encode. Called where an index is
+/// declared, so the statement fails whether or not the table has rows, instead of every later
+/// write to the table failing. An expression that does not analyze is left to the code that builds
+/// the index.
+pub(super) fn require_key_types(
+    table: &TableSchema,
+    columns: &[String],
+    key_exprs: &[String],
+) -> Result<(), Error> {
+    for column in columns {
+        if let Some(def) = table.columns.iter().find(|c| &c.name == column)
+            && let Some(ty) = unencodable_key_type(def.ty)
+        {
+            return Err(Error::Unsupported(format!(
+                "{ty} column \"{column}\" cannot yet be an index key"
+            )));
+        }
+    }
+    for sql in key_exprs {
+        let Ok(typed) =
+            crate::analyzer::analyze_index_key_expr(sql, table, &super::dml::EmptyCatalog)
+        else {
+            continue;
+        };
+        if let Some(ty) = unencodable_key_type(typed.ty) {
+            return Err(Error::Unsupported(format!(
+                "an index expression of type {ty} cannot yet be an index key"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Encode one key field: a `0x00` tag for `NULL` (sorts first), else `0x01` + the value's

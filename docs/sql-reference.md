@@ -614,8 +614,9 @@ The rules:
   not by range, so writing into one very large group costs time in proportion to the group). `COPY` and a streamed `INSERT ... SELECT`
   take their locks batch by batch and check the whole statement once at the end, holding one key
   per written row in memory. Without such an index (a `=` element that is an
-  expression or a floating-point or `NUMERIC` column, which may hold `NaN`, or no `=` element at
-  all) each writing statement reads the whole table once. If an index of the constraint's name
+  expression or a floating-point or `NUMERIC` column, which may hold `NaN`, a column of a type that
+  cannot be an index key (see [Indexes](#indexes)), or no `=` element at all) each writing statement
+  reads the whole table once. If an index of the constraint's name
   already exists, the constraint leaves it alone and creates none (an index on exactly the `=`
   columns is still used).
 - `information_schema.table_constraints` lists it with `constraint_type` `EXCLUDE`.
@@ -1069,6 +1070,22 @@ default tree; `USING hnsw` selects the vector index. An unknown method is an err
 query whose ordering column is nullable is served by an explicit sort that follows the query's own
 `NULLS` clause. The planner picks an index from
 collected statistics, so run `ANALYZE` after a large load (see [Maintenance](#maintenance)).
+
+Some types cannot be an index key yet: `INTERVAL`, arrays, `VECTOR` (except under `USING hnsw`),
+`INET`, `CIDR`, `BIT`, `BIT VARYING`, ranges, geometric types, `TSVECTOR`, `TSQUERY` and `XML`, and
+a domain over one of them. An index whose key column, or whose key expression's value, has such a
+type is refused with `0A000` when it is declared, whatever the access method and whether or not the
+table has rows. That covers `CREATE INDEX`, a `PRIMARY KEY` or `UNIQUE` constraint in `CREATE TABLE`
+or `ALTER TABLE` (with `ADD COLUMN ... UNIQUE` the column is not added either), `ALTER COLUMN ...
+TYPE` on an indexed column, a partition taking its parent's key, and `LIKE ... INCLUDING INDEXES`.
+Such a column may still be an `INCLUDE` column, and an exclusion constraint may still use it (see
+[Exclusion constraints](#exclusion-constraints)). Earlier releases accepted these indexes on an empty
+table. A database holding one still opens and reads normally, but the index is neither maintained
+nor enforced reliably: a write whose value has its type when it is indexed (an `INTERVAL`, or a
+value such as `ARRAY[1]` or `B'101'`) fails with `0A000`, while a value written as a string for an
+`INET`, range, bit-string or array column is indexed under that text, so a unique index or primary
+key on it does not stop a duplicate. Drop such an index, or the `PRIMARY KEY` or `UNIQUE` constraint
+it backs, and the table takes writes normally.
 
 An expression index serves a `WHERE` comparison against a constant on exactly the same expression
 (`lower(email) = 'a@x.org'` uses `orders_lower` above; `upper(email) = ...` does not). There are no

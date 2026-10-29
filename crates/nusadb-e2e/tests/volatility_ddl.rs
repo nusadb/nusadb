@@ -86,7 +86,7 @@ fn index_keys_and_predicates_must_be_immutable() {
         "CREATE INDEX ok1 ON t ((abs(x)))",
         "CREATE INDEX ok2 ON t ((uuid_extract_timestamp(u)))",
         "CREATE INDEX ok3 ON t (x) WHERE x > 0",
-        "CREATE INDEX ok4 ON t ((age(TIMESTAMP '2030-01-01', TIMESTAMP '2020-01-01')))",
+        "CREATE INDEX ok4 ON t ((extract(year FROM age(TIMESTAMP '2030-01-01', TIMESTAMP '2020-01-01'))))",
     ] {
         run(&engine, sql);
     }

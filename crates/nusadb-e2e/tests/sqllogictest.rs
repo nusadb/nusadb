@@ -1325,3 +1325,8 @@ fn slt_p1_fk_set_null_columns() {
 fn slt_p5_nusascript_select_into() {
     run_slt("tests/slt/p5_advanced/nusascript_select_into.slt");
 }
+
+#[test]
+fn slt_p1_index_key_types() {
+    run_slt("tests/slt/p1_ddl/index_key_types.slt");
+}
