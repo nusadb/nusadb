@@ -1160,6 +1160,42 @@ CREATE DATABASE app;                    -- a separate physical database; connect
 DROP DATABASE app;
 ```
 
+`DROP SCHEMA` without `CASCADE` (or with `RESTRICT`) refuses a schema that still holds a table,
+view or sequence, with SQLSTATE `2BP01`. `DROP SCHEMA ... CASCADE` drops each object in the schema
+the way its own `DROP ... CASCADE` would:
+
+- every table, with its indexes, constraints, column defaults, triggers, policies, comments,
+  ownership and grants, and the sequences of its `SERIAL` and identity columns;
+- foreign keys that cross the schema boundary, in either direction. A table outside the schema
+  that references a dropped table keeps its rows and loses only that foreign key, and a table
+  outside the schema that a dropped table referenced no longer carries the dropped key;
+- the partitions of a partitioned table in the schema, wherever they live, and a partition in the
+  schema whose partitioned parent lives elsewhere (the parent stays, without that partition);
+- the views and the standalone sequences created in the schema. A view or sequence of the
+  default schema whose own name holds a dot (`CREATE VIEW public."z.v"`) is never treated as a
+  member of schema `z`.
+
+A view or materialized view outside the schema that reads a dropped table is not dropped, the same
+as for `DROP TABLE`: it fails with "table not found" when read until it is dropped or redefined.
+
+The whole statement is one transaction step: inside `BEGIN`, a `ROLLBACK` restores the schema and
+everything in it. Dropping a foreign key takes the referenced table's lock without waiting, so a
+transaction that is writing to a table outside the schema that a member table references makes
+`DROP SCHEMA ... CASCADE` fail with `40001`; retry it once that transaction ends. A table another
+session commits into the schema while the drop runs is dropped with the rest; one it has created
+and not yet committed makes the drop fail with `40001` instead.
+
+A data directory written by an earlier release may still hold foreign keys, constraints and
+indexes of tables dropped through `DROP SCHEMA ... CASCADE`. The server removes them when it opens
+the database (it reads the catalog only, so this costs nothing on a clean database) and logs each
+removed foreign key at `WARN`. Until then, a foreign key whose table on the other end no longer
+exists is skipped, with a `WARN` log line, instead of refusing the statement. Views and sequences
+such a release left under a dropped schema are not removed automatically: that release did not
+record which schema a dotted name belongs to, so such a name may be a default-schema object named
+with a dot. Each is logged at `WARN` at open with the `DROP VIEW` or `DROP SEQUENCE` statement that
+removes it. For the same reason, a view or sequence that release created in a schema that still
+exists is not dropped by `DROP SCHEMA ... CASCADE` (nor counted by `RESTRICT`); drop it by name.
+
 A view over a single table with no aggregate is auto-updatable: `INSERT`, `UPDATE` and `DELETE`
 through it reach the base table. With `WITH CHECK OPTION`, a row written through the view must stay
 visible through it:

@@ -67,6 +67,13 @@ pub(super) struct UncommittedDdl {
     /// Reads and resolutions since the last [`collect`](Self::collect) on their path: they
     /// collect only now and then, which is enough to bound what is kept.
     ticks: u32,
+    /// The transactions that own an entry of `tables`, `indexes`, `constraints` or
+    /// `foreign_keys`, and the `(table, owner)` pairs of `tables` and of `constraints`. They let
+    /// the per-call checks look the set up instead of walking it, so one transaction dropping
+    /// thousands of tables does not pay for every earlier drop on each later call.
+    owners: HashSet<u64>,
+    table_keys: HashSet<(u64, u64)>,
+    constraint_keys: HashSet<(u64, u64)>,
 }
 
 impl UncommittedDdl {
@@ -96,11 +103,23 @@ impl UncommittedDdl {
     /// undone, and must not mask it.
     fn drop_ended_changes(&mut self, txns: &super::TxnDomain) {
         let active = &txns.active;
+        if self.owners.iter().all(|owner| active.contains(owner)) {
+            return;
+        }
         self.tables.retain(|c| active.contains(&c.owner));
         self.indexes.retain(|c| active.contains(&c.owner));
         self.constraints.retain(|c| active.contains(&c.owner));
         self.foreign_keys
             .retain(|(_, owner)| active.contains(owner));
+        self.owners.retain(|owner| active.contains(owner));
+        self.table_keys.retain(|(_, owner)| active.contains(owner));
+        self.constraint_keys
+            .retain(|(_, owner)| active.contains(owner));
+    }
+
+    /// Whether every entry belongs to `txn`, so nothing is hidden from it.
+    fn only_owner_is(&self, txn: u64) -> bool {
+        self.owners.iter().all(|&owner| owner == txn)
     }
 
     /// [`collect`](Self::collect) on every 32nd call: the read and resolution paths run per
@@ -279,11 +298,8 @@ impl BtreeEngine {
     ) -> Result<()> {
         {
             let mut pending = cat.uncommitted.lock().map_err(|_| poisoned())?;
-            if !pending
-                .tables
-                .iter()
-                .any(|c| c.table == table && c.owner == txn.0)
-            {
+            if pending.table_keys.insert((table, txn.0)) {
+                pending.owners.insert(txn.0);
                 pending.tables.push(TableChange {
                     table,
                     owner: txn.0,
@@ -301,11 +317,8 @@ impl BtreeEngine {
     pub(super) fn note_constraint_change(cat: &Catalog, txn: TxnId, table: u64) -> Result<()> {
         {
             let mut pending = cat.uncommitted.lock().map_err(|_| poisoned())?;
-            if !pending
-                .constraints
-                .iter()
-                .any(|c| c.table == table && c.owner == txn.0)
-            {
+            if pending.constraint_keys.insert((table, txn.0)) {
+                pending.owners.insert(txn.0);
                 pending.constraints.push(ConstraintChange {
                     table,
                     owner: txn.0,
@@ -355,6 +368,7 @@ impl BtreeEngine {
         Self::note_constraint_change(cat, txn, def.child_table.0)?;
         Self::note_constraint_change(cat, txn, def.parent_table.0)?;
         let mut pending = cat.uncommitted.lock().map_err(|_| poisoned())?;
+        pending.owners.insert(txn.0);
         pending.foreign_keys.push((def.name.clone(), txn.0));
         pending.publish(cat);
         Ok(())
@@ -531,6 +545,7 @@ impl BtreeEngine {
     /// Record that `txn` created `index`. Called under the catalog write guard.
     pub(super) fn note_index_created(cat: &Catalog, txn: TxnId, index: u64) -> Result<()> {
         let mut pending = cat.uncommitted.lock().map_err(|_| poisoned())?;
+        pending.owners.insert(txn.0);
         pending.indexes.push(IndexChange {
             index,
             owner: txn.0,
@@ -553,7 +568,7 @@ impl BtreeEngine {
             pending.collect_now_and_then(&txns);
         }
         pending.publish(cat);
-        if pending.no_pending_ddl() {
+        if pending.no_pending_ddl() || pending.only_owner_is(txn.0) {
             return Ok(None);
         }
         let hidden = Hidden {

@@ -713,6 +713,11 @@ fn slt_p1_comment_on() {
 }
 
 #[test]
+fn slt_p1_drop_schema_cascade() {
+    run_slt("tests/slt/p1_ddl/drop_schema_cascade.slt");
+}
+
+#[test]
 fn slt_p1_information_schema() {
     run_slt("tests/slt/p1_ddl/information_schema.slt");
 }

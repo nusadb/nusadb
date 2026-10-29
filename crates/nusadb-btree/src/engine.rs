@@ -681,6 +681,29 @@ struct TableWrite {
     next_row_id: u64,
 }
 
+/// A catalog entry naming a table that no longer exists (see
+/// [`BtreeEngine::repair_orphaned_catalog`]).
+#[derive(Debug)]
+enum Orphan {
+    /// A foreign key, `CHECK`, `PRIMARY KEY` or `UNIQUE` constraint, by the table it is filed
+    /// under; `what` names its kind for the log.
+    Constraint {
+        table: u64,
+        name: String,
+        what: &'static str,
+    },
+    /// An index of a dropped table that no constraint owns.
+    Index { index: u64, name: String },
+}
+
+impl Orphan {
+    fn name(&self) -> &str {
+        match self {
+            Self::Constraint { name, .. } | Self::Index { name, .. } => name,
+        }
+    }
+}
+
 /// A dropped table's tree, or a dropped index's two trees, queued for purge: pages are only
 /// reclaimed once the dropping transaction is settled (committed and visible to every view).
 #[derive(Debug)]
@@ -2196,6 +2219,12 @@ impl BtreeEngine {
         // design — recovery has already succeeded, so this is pure optimization. A failure here
         // (disk full, a read-only forensic mount, a Windows AV lock on the new file) must never
         // turn a fully recovered database into one that refuses to open; log it and carry on.
+        // Catalog entries an earlier build left pointing at a dropped table are removed before
+        // anything else can trip over them. It reads the catalog maps only, so it costs nothing
+        // when there is nothing to repair. A standby receives the primary's repair through the log.
+        if !standby {
+            engine.repair_orphaned_catalog();
+        }
         if last_good >= AUTO_CHECKPOINT_ON_OPEN_BYTES
             && let Err(e) = engine.checkpoint()
         {
@@ -2208,6 +2237,173 @@ impl BtreeEngine {
             engine.checkpoint_stamped(engine.seal_stamp())?;
         }
         Ok(engine)
+    }
+
+    /// Remove the catalog entries that name a table which no longer exists: foreign keys whose
+    /// referencing or referenced table is gone, and the `CHECK`, `PRIMARY KEY` / `UNIQUE`
+    /// constraints and indexes of a gone table.
+    ///
+    /// Dropping a table through the SQL layer removes all of these first. An earlier build's
+    /// `DROP SCHEMA ... CASCADE` dropped the member tables without them, so a foreign key into a
+    /// dropped table refused every later delete from (or insert into) the table on its other end,
+    /// and the dropped table's index names stayed taken. The removal runs as one logged
+    /// transaction, so it is durable and the trees of the removed indexes are reclaimed like any
+    /// dropped index's.
+    ///
+    /// Best-effort: it is skipped while a prepared transaction is pending (its catalog changes are
+    /// not settled yet), and a failure is logged and rolled back, to be retried at the next open.
+    fn repair_orphaned_catalog(&self) {
+        let orphans = match self.orphaned_catalog_entries() {
+            Ok(orphans) => orphans,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not inspect the catalog for orphaned entries");
+                return;
+            },
+        };
+        if orphans.is_empty() {
+            return;
+        }
+        let pending_prepared = self
+            .txns
+            .lock()
+            .is_ok_and(|txns| !txns.prepared_gids.is_empty());
+        if pending_prepared {
+            tracing::warn!(
+                entries = orphans.len(),
+                "catalog entries of dropped tables are left in place while a prepared transaction \
+                 is pending; they are removed at the next open"
+            );
+            return;
+        }
+        let result = (|| -> Result<()> {
+            let txn = nusadb_core::StorageEngine::begin(self, IsolationLevel::default())?;
+            let outcome = (|| -> Result<()> {
+                for orphan in &orphans {
+                    match orphan {
+                        Orphan::Constraint { table, name, .. } => {
+                            nusadb_core::StorageEngine::drop_constraint(
+                                self,
+                                txn,
+                                TableId(*table),
+                                name,
+                            )?;
+                        },
+                        Orphan::Index { index, .. } => {
+                            // A constraint's drop above also drops its backing index.
+                            if self
+                                .catalog
+                                .read()
+                                .map_err(|_| poisoned())?
+                                .indexes
+                                .contains_key(index)
+                            {
+                                nusadb_core::StorageEngine::drop_index(self, txn, IndexId(*index))?;
+                            }
+                        },
+                    }
+                }
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => nusadb_core::StorageEngine::commit(self, txn),
+                Err(e) => {
+                    let _ = nusadb_core::StorageEngine::rollback(self, txn);
+                    Err(e)
+                },
+            }
+        })();
+        match result {
+            Ok(()) => {
+                // Each foreign key by name: it is what refused the statements on its other end.
+                // The rest are the dropped tables' own constraints and indexes, summed up.
+                let mut rest = 0usize;
+                for orphan in &orphans {
+                    match orphan {
+                        Orphan::Constraint {
+                            name,
+                            what: "foreign key",
+                            ..
+                        } => tracing::warn!(
+                            constraint = %name,
+                            "removed foreign key \"{name}\": a table it belonged to or \
+                             referenced no longer exists"
+                        ),
+                        _ => rest += 1,
+                    }
+                }
+                if rest > 0 {
+                    tracing::warn!(
+                        entries = rest,
+                        "removed {rest} constraint(s) and index(es) left behind by dropped tables"
+                    );
+                }
+            },
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not remove the catalog entries of dropped tables; retried at the next open"
+            ),
+        }
+    }
+
+    /// The catalog entries [`Self::repair_orphaned_catalog`] removes, in a safe drop order:
+    /// foreign keys first (a key constraint they reference cannot go before them), then checks
+    /// and key constraints, then the remaining indexes.
+    fn orphaned_catalog_entries(&self) -> Result<Vec<Orphan>> {
+        let cat = self.catalog.read().map_err(|_| poisoned())?;
+        let live = |table: &u64| cat.tables.contains_key(table);
+        let mut fks: Vec<Orphan> = cat
+            .foreign_keys
+            .values()
+            .filter(|fk| !live(&fk.child_table) || !live(&fk.parent_table))
+            .map(|fk| Orphan::Constraint {
+                table: fk.child_table,
+                name: fk.name.clone(),
+                what: "foreign key",
+            })
+            .collect();
+        fks.sort_by(|a, b| a.name().cmp(b.name()));
+        let mut rest = Vec::new();
+        for (table, checks) in cat.checks.iter().filter(|(t, _)| !live(t)) {
+            rest.extend(checks.iter().map(|c| Orphan::Constraint {
+                table: *table,
+                name: c.name.clone(),
+                what: "check constraint",
+            }));
+        }
+        for (table, keys) in cat.constraints.iter().filter(|(t, _)| !live(t)) {
+            rest.extend(keys.iter().map(|c| Orphan::Constraint {
+                table: *table,
+                name: c.name.clone(),
+                what: "constraint",
+            }));
+        }
+        rest.sort_by(|a, b| a.name().cmp(b.name()));
+        // An index a removed constraint owns goes with that constraint.
+        let owned: HashSet<u64> = cat
+            .foreign_keys
+            .values()
+            .filter(|fk| !live(&fk.child_table) || !live(&fk.parent_table))
+            .map(|fk| fk.child_index)
+            .chain(
+                cat.constraints
+                    .iter()
+                    .filter(|(t, _)| !live(t))
+                    .flat_map(|(_, keys)| keys.iter().map(|c| c.index)),
+            )
+            .collect();
+        let mut indexes: Vec<Orphan> = cat
+            .indexes
+            .iter()
+            .filter(|(id, i)| !live(&i.def.table.0) && !owned.contains(id))
+            .map(|(id, i)| Orphan::Index {
+                index: *id,
+                name: i.def.name.clone(),
+            })
+            .collect();
+        indexes.sort_by(|a, b| a.name().cmp(b.name()));
+        fks.extend(rest);
+        fks.extend(indexes);
+        Ok(fks)
     }
 
     /// Back the store with a physical image's page section, when the image has one: replay of
@@ -8349,13 +8545,20 @@ impl nusadb_core::StorageEngine for BtreeEngine {
             .remove(&(state.schema.schema.clone(), state.schema.name.clone()));
         // Forget the version marks of tables that are gone for good: ids are never reused, and a
         // table whose drop may still roll back (this one included) is still recorded as changed
-        // by a running transaction.
-        let changed = Self::tables_with_uncommitted_ddl(&cat)?;
-        let catalog = &mut *cat;
-        let live = &catalog.tables;
-        catalog
+        // by a running transaction. The marks are few (one per altered table), so they are
+        // checked first and the set of changed tables is only built when one may go.
+        if cat
             .version_high_water
-            .retain(|id, _| live.contains_key(id) || changed.contains(id));
+            .keys()
+            .any(|id| !cat.tables.contains_key(id))
+        {
+            let changed = Self::tables_with_uncommitted_ddl(&cat)?;
+            let catalog = &mut *cat;
+            let live = &catalog.tables;
+            catalog
+                .version_high_water
+                .retain(|id, _| live.contains_key(id) || changed.contains(id));
+        }
         // The table's ANALYZE statistics go with it. Without this a dropped table's stats stay
         // in `cat.stats` under its (never-reused) id forever — and since checkpointing they are
         // baked into every image, so a `TRUNCATE` of an analyzed table (drop + recreate) accretes

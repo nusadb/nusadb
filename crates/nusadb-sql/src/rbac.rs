@@ -944,6 +944,21 @@ pub fn clear_owner(
     kind: ObjectKind,
     object: &str,
 ) -> Result<bool, Error> {
+    clear_owners_where(engine, txn, kind, |o| o == object)
+}
+
+/// Forget the owner of every `kind` object whose name satisfies `pick`, in one pass over the
+/// catalog: how a statement dropping many objects at once clears them. Returns whether any was
+/// recorded.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn clear_owners_where(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    kind: ObjectKind,
+    pick: impl Fn(&str) -> bool,
+) -> Result<bool, Error> {
     let Some(cat) = engine.lookup_table_as_of(txn, OWNER_CATALOG)? else {
         return Ok(false);
     };
@@ -953,11 +968,12 @@ pub fn clear_owner(
         let row = row::decode(&bytes, &OWNER_SCHEMA)?;
         if matches!((row.first(), row.get(1)),
             (Some(ast::Value::Text(k)), Some(ast::Value::Text(o)))
-                if k == kind.as_str() && o == object)
+                if k == kind.as_str() && pick(o))
         {
             victims.push(tid);
         }
     }
+    drop(scan);
     let present = !victims.is_empty();
     for tid in victims {
         engine.delete(txn, cat.id, tid)?;
@@ -1420,6 +1436,20 @@ pub fn delete_grants_on(
     kind: ObjectKind,
     object: &str,
 ) -> Result<(), Error> {
+    delete_grants_where(engine, txn, kind, |o| o == object)
+}
+
+/// Remove every grant on each `kind` object whose name satisfies `pick`, in one pass over each
+/// privilege catalog: how a statement dropping many objects at once removes them.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn delete_grants_where(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    kind: ObjectKind,
+    pick: impl Fn(&str) -> bool,
+) -> Result<(), Error> {
     if let Some(cat) = engine.lookup_table_as_of(txn, PRIVILEGE_CATALOG)? {
         let mut victims = Vec::new();
         let mut scan = engine.scan(txn, cat.id)?;
@@ -1427,7 +1457,7 @@ pub fn delete_grants_on(
             let row = row::decode(&bytes, &PRIVILEGE_SCHEMA)?;
             if matches!((row.get(1), row.get(2)),
                 (Some(ast::Value::Text(k)), Some(ast::Value::Text(o)))
-                    if k == kind.as_str() && o == object)
+                    if k == kind.as_str() && pick(o))
             {
                 victims.push(tid);
             }
@@ -1447,7 +1477,7 @@ pub fn delete_grants_on(
         let mut scan = engine.scan(txn, cat.id)?;
         while let Some((tid, bytes)) = scan.try_next()? {
             let row = row::decode(&bytes, &COLUMN_PRIVILEGE_SCHEMA)?;
-            if matches!(row.get(1), Some(ast::Value::Text(o)) if o == object) {
+            if matches!(row.get(1), Some(ast::Value::Text(o)) if pick(o)) {
                 victims.push(tid);
             }
         }

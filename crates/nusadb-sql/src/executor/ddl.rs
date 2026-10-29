@@ -2001,6 +2001,22 @@ pub(super) fn run_drop_table(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
+    drop_table_with(plan, engine, txn, false)
+}
+
+/// [`run_drop_table`], skipping the ownership and grant cleanup of the table itself when
+/// `rbac_cleared` (the caller removed them for many tables in one pass). The tables dropped with
+/// it (partitions, inheritance children) are always cleaned in full.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one teardown sequence: dependents, foreign keys, indexes, the table, its catalog rows"
+)]
+fn drop_table_with(
+    plan: &DropTablePlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    rbac_cleared: bool,
+) -> Result<ExecutionResult, Error> {
     match engine.lookup_table_as_of_in(txn, &plan.schema, &plan.table)? {
         Some(schema) => {
             // Child tables (partitions and INHERITS children), checked before any teardown so a
@@ -2129,9 +2145,11 @@ pub(super) fn run_drop_table(
             super::comment::forget_table(engine, txn, &plan.schema, &plan.table)?;
             // Ownership and grants go with the table. Leaving them behind would hand a later table
             // that reused the name the old one's permissions.
-            let owned = format!("{}.{}", plan.schema, plan.table);
-            crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
-            crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
+            if !rbac_cleared {
+                let owned = format!("{}.{}", plan.schema, plan.table);
+                crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
+                crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Table, &owned)?;
+            }
             // Remove this table's inheritance edges (as a child of its own parents) so a later
             // same-named table does not inherit stale parent links. Edges are keyed by the
             // schema-qualified name (`table_key`, computed above).
@@ -2256,48 +2274,7 @@ pub(super) fn run_drop_schema(
     txn: TxnId,
 ) -> Result<ExecutionResult, Error> {
     match engine.lookup_schema(&plan.name)? {
-        // RESTRICT (default) refuses a non-empty schema; CASCADE drops its member tables too.
-        Some(id) => {
-            // The engine's cascade drops member tables directly, bypassing `run_drop_table`'s
-            // owner/grant cleanup — so clear each member's owner and grants first, then the
-            // schema's own owner. Otherwise a later same-named table (or schema) silently
-            // inherits the dropped one's permissions.
-            if plan.cascade {
-                for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
-                    if schema == plan.name {
-                        let owned = format!("{schema}.{name}");
-                        crate::rbac::clear_owner(
-                            engine,
-                            txn,
-                            crate::ast::ObjectKind::Table,
-                            &owned,
-                        )?;
-                        crate::rbac::delete_grants_on(
-                            engine,
-                            txn,
-                            crate::ast::ObjectKind::Table,
-                            &owned,
-                        )?;
-                    }
-                }
-            }
-            // The member tables' column defaults and the sequences of their SERIAL and identity
-            // columns live outside the schema, so the engine's cascade does not reach them.
-            if plan.cascade {
-                for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
-                    if schema == plan.name {
-                        let key = super::coldefault::catalog_key(&schema, &name);
-                        super::coldefault::drop_defaults_and_sequences(&key, engine, txn)?;
-                    }
-                }
-            }
-            engine.drop_schema(txn, id, plan.cascade)?;
-            // The engine drops the tables; the SQL-layer catalogs live above it and kept their
-            // rows, so recreating the schema inherited policies and triggers nobody declared.
-            super::purge_schema_catalogs(engine, txn, &plan.name)?;
-            crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
-            crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Schema, &plan.name)?;
-        },
+        Some(id) => drop_schema_with(engine, txn, &plan.name, id, plan.cascade)?,
         None => skip_missing(plan.if_exists, &format!("schema \"{}\"", plan.name), || {
             Error::SchemaNotFound {
                 name: plan.name.clone(),
@@ -2305,6 +2282,343 @@ pub(super) fn run_drop_schema(
         })?,
     }
     Ok(ExecutionResult::SchemaDropped)
+}
+
+/// Drop the schema `name` and everything in it, as `DROP SCHEMA name CASCADE` does.
+///
+/// Runs inside `txn`. A schema that does not exist is a no-op. This is also how a session's
+/// temporary schema is torn down when the session ends.
+///
+/// # Errors
+/// Propagates storage errors and the errors dropping a member raises (a concurrent writer's
+/// `40001`, say); the caller rolls `txn` back, which restores everything.
+pub fn drop_schema_cascade(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+) -> Result<(), Error> {
+    engine
+        .lookup_schema(name)?
+        .map_or(Ok(()), |id| drop_schema_with(engine, txn, name, id, true))
+}
+
+/// Drop the temporary schema `name` in a transaction of its own, as a session ends.
+///
+/// A no-op when it does not exist. A temporary table's foreign key into a permanent table is
+/// dropped with it, and that takes the permanent table's lock without waiting; a writer holding it
+/// refuses the drop with `40001`, so the teardown is retried with a growing pause, for about four
+/// seconds in all, before it gives up and reports the error. A temporary schema that still could
+/// not be dropped is never written to disk, so it is gone after the next restart.
+///
+/// # Errors
+/// The last attempt's error; its transaction is rolled back, so nothing changed.
+pub fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) -> Result<(), Error> {
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        if engine.lookup_schema(name)?.is_none() {
+            return Ok(());
+        }
+        let txn = engine.begin(nusadb_core::IsolationLevel::default())?;
+        let result = match drop_schema_cascade(engine, txn, name) {
+            Ok(()) => super::deferred::commit(engine, txn),
+            Err(e) => {
+                let _ = super::deferred::rollback(engine, txn);
+                Err(e)
+            },
+        };
+        match result {
+            Err(e) if e.sqlstate() == "40001" && attempt < ATTEMPTS => {
+                let pause = (25 * u64::from(attempt)).min(250);
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+            },
+            other => return other,
+        }
+    }
+}
+
+/// A view or sequence filed under a schema that does not exist (see [`orphaned_schema_objects`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedSchemaObject {
+    /// `VIEW` or `SEQUENCE`: the keyword its `DROP` takes.
+    pub kind: &'static str,
+    /// Its catalog key, `schema.name`, which is also what its `DROP` takes.
+    pub name: String,
+}
+
+/// The views and sequences filed under a schema that does not exist.
+///
+/// An earlier release's `DROP SCHEMA ... CASCADE` dropped a schema's tables and left its views and
+/// standalone sequences behind, so re-creating the schema found their names taken. They are
+/// reported, never dropped: a view or sequence of the default schema may itself be named with a
+/// dot (`CREATE VIEW "a.b"`), and an earlier release recorded nothing that tells its key apart from
+/// one left behind in a dropped schema `a`. An object whose schema is recorded as the default one
+/// is never reported. Each is removed with `DROP VIEW` / `DROP SEQUENCE` and the reported name. This reads
+/// the view and sequence catalogs only, so it is cheap enough to run as a database opens.
+///
+/// # Errors
+/// Propagates storage errors.
+pub fn orphaned_schema_objects(
+    engine: &dyn StorageEngine,
+) -> Result<Vec<OrphanedSchemaObject>, Error> {
+    let txn = engine.begin(nusadb_core::IsolationLevel::default())?;
+    let result = (|| -> Result<Vec<OrphanedSchemaObject>, Error> {
+        let live: std::collections::HashSet<String> = engine
+            .list_schemas()?
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        let attributed = super::object_schema::load(engine, txn)?;
+        // A recorded schema is the object's own; a dotted key with none (an earlier release's)
+        // is reported when the schema its prefix names is gone.
+        let orphaned = |kind: &str, key: &str| {
+            super::object_schema::schema_of(&attributed, kind, key).map_or_else(
+                || match crate::analyzer::split_qualified(key) {
+                    (Some(schema), _) => !live.contains(schema),
+                    (None, _) => false,
+                },
+                |schema| schema != nusadb_core::PUBLIC_SCHEMA && !live.contains(schema),
+            )
+        };
+        let mut views = Vec::new();
+        if let Some(cat) = engine.lookup_table_as_of(txn, super::VIEW_CATALOG)? {
+            let mut scan = engine.scan(txn, cat.id)?;
+            while let Some((_, bytes)) = scan.try_next()? {
+                let row = row::decode(&bytes, &super::VIEW_CATALOG_SCHEMA)?;
+                if let Some(ast::Value::Text(name)) = row.first()
+                    && orphaned(super::object_schema::VIEW, name)
+                {
+                    views.push(name.clone());
+                }
+            }
+        }
+        views.sort();
+        views.dedup();
+        let mut sequences: Vec<String> = super::seqcatalog::list(engine, txn)?
+            .into_iter()
+            .map(|def| def.name)
+            .filter(|name| orphaned(super::object_schema::SEQUENCE, name))
+            .collect();
+        sequences.sort();
+        sequences.dedup();
+        Ok(views
+            .into_iter()
+            .map(|name| OrphanedSchemaObject { kind: "VIEW", name })
+            .chain(sequences.into_iter().map(|name| OrphanedSchemaObject {
+                kind: "SEQUENCE",
+                name,
+            }))
+            .collect())
+    })();
+    // Read-only: ending the transaction either way changes nothing.
+    let _ = super::deferred::rollback(engine, txn);
+    result
+}
+
+/// The objects filed under one schema, by the names their own `DROP` takes.
+struct SchemaMembers {
+    /// Table names, unqualified.
+    tables: Vec<String>,
+    /// View keys (`schema.view`).
+    views: Vec<String>,
+    /// Sequence keys (`schema.sequence`).
+    sequences: Vec<String>,
+}
+
+impl SchemaMembers {
+    const fn is_empty(&self) -> bool {
+        self.tables.is_empty() && self.views.is_empty() && self.sequences.is_empty()
+    }
+
+    /// `3 table(s), 1 view(s)`, naming only the kinds present.
+    fn describe(&self) -> String {
+        [
+            (self.tables.len(), "table(s)"),
+            (self.views.len(), "view(s)"),
+            (self.sequences.len(), "sequence(s)"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, kind)| format!("{n} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+/// What `schema` holds under `txn`'s snapshot.
+///
+/// A view or sequence is a member when its recorded schema is `schema` (see
+/// [`super::object_schema`]); the dot in its key is never taken as a schema qualifier on its own,
+/// so a default-schema `"a.b"` is not a member of `a`. A dotted key an earlier release filed has no
+/// recorded schema: it is not counted and not dropped, and the server names it when the database
+/// opens if its schema is gone. A sequence is found through the sequence catalog that backs
+/// `information_schema.sequences`.
+fn schema_members(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+) -> Result<SchemaMembers, Error> {
+    let mut tables: Vec<String> = engine
+        .list_tables_qualified_as_of(txn)?
+        .into_iter()
+        .filter(|(s, _)| s == schema)
+        .map(|(_, name)| name)
+        .collect();
+    tables.sort();
+    // Nothing outside the default schema is filed under a key without a dot, so only the
+    // recorded dotted keys can be members of any other schema.
+    let attributed = super::object_schema::load(engine, txn)?;
+    let member = |kind: &str, key: &str| {
+        super::object_schema::schema_of(&attributed, kind, key) == Some(schema)
+    };
+    let mut views = Vec::new();
+    if let Some(cat) = engine.lookup_table_as_of(txn, super::VIEW_CATALOG)? {
+        let mut scan = engine.scan(txn, cat.id)?;
+        while let Some((_, bytes)) = scan.try_next()? {
+            let row = row::decode(&bytes, &super::VIEW_CATALOG_SCHEMA)?;
+            if let Some(ast::Value::Text(name)) = row.first()
+                && member(super::object_schema::VIEW, name)
+            {
+                views.push(name.clone());
+            }
+        }
+    }
+    views.sort();
+    views.dedup();
+    let mut sequences: Vec<String> = super::seqcatalog::list(engine, txn)?
+        .into_iter()
+        .map(|def| def.name)
+        .filter(|name| member(super::object_schema::SEQUENCE, name))
+        .collect();
+    sequences.sort();
+    sequences.dedup();
+    Ok(SchemaMembers {
+        tables,
+        views,
+        sequences,
+    })
+}
+
+/// How many times `DROP SCHEMA ... CASCADE` lists the schema again for members another session
+/// committed while it was dropping the first ones.
+const MEMBER_RELISTS: usize = 8;
+
+/// Drop `members` of `schema`, each the way its own `DROP ... CASCADE` would.
+fn drop_members(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    schema: &str,
+    members: &SchemaMembers,
+) -> Result<(), Error> {
+    // The ownership and grants of every member table in one pass over each catalog, rather than
+    // one pass per table: they hold a row per table, so the per-table cleanup grew with the
+    // square of the schema's size.
+    let owned: std::collections::HashSet<String> = members
+        .tables
+        .iter()
+        .map(|t| format!("{schema}.{t}"))
+        .collect();
+    if !owned.is_empty() {
+        let kind = crate::ast::ObjectKind::Table;
+        crate::rbac::clear_owners_where(engine, txn, kind, |o| owned.contains(o))?;
+        crate::rbac::delete_grants_where(engine, txn, kind, |o| owned.contains(o))?;
+    }
+    for table in &members.tables {
+        // `if_exists`: a member may already be gone, dropped with a partitioned or inherited
+        // parent listed before it.
+        drop_table_with(
+            &DropTablePlan {
+                schema: schema.to_owned(),
+                table: table.clone(),
+                if_exists: true,
+                cascade: true,
+            },
+            engine,
+            txn,
+            true,
+        )?;
+    }
+    for view in &members.views {
+        super::run_drop_view(
+            &DropViewPlan {
+                name: view.clone(),
+                if_exists: true,
+            },
+            engine,
+            txn,
+        )?;
+    }
+    for sequence in &members.sequences {
+        // A SERIAL or identity column's sequence went with its table above.
+        if engine.lookup_sequence(sequence)?.is_some() {
+            run_drop_sequence(
+                &DropSequencePlan {
+                    name: sequence.clone(),
+                    if_exists: true,
+                },
+                engine,
+                txn,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The body of `DROP SCHEMA`: RESTRICT refuses a schema that holds anything; CASCADE drops each
+/// member the way its own `DROP ... CASCADE` would, so the foreign keys between a member and a
+/// table outside the schema (either direction), partitions and inheritance children, column
+/// defaults and their sequences, triggers, comments, ownership and grants all go with it. Then the
+/// namespace itself and the SQL-layer catalog rows still filed under its name.
+fn drop_schema_with(
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    name: &str,
+    id: nusadb_core::SchemaId,
+    cascade: bool,
+) -> Result<(), Error> {
+    let members = schema_members(engine, txn, name)?;
+    if !cascade && !members.is_empty() {
+        return Err(Error::DependentObjects(format!(
+            "cannot drop schema \"{name}\": it holds {} (drop them first or use DROP SCHEMA ... \
+             CASCADE)",
+            members.describe()
+        )));
+    }
+    if cascade {
+        drop_members(engine, txn, name, &members)?;
+        // Another session may have committed a table into the schema since it was listed. Drop
+        // those the same way, until a listing comes back empty; the namespace removal below
+        // refuses anything still there rather than dropping it bare.
+        for _ in 0..MEMBER_RELISTS {
+            let late = schema_members(engine, txn, name)?;
+            if late.is_empty() {
+                break;
+            }
+            drop_members(engine, txn, name, &late)?;
+        }
+    }
+    // Always RESTRICT at the engine: every member was dropped above with its foreign keys and
+    // catalog rows, and an engine cascade would drop a member that appeared since (one another
+    // transaction has not committed yet, say) without them.
+    match engine.drop_schema(txn, id, false) {
+        Err(e) if cascade && matches!(e, nusadb_core::Error::DependentObjectsExist(_)) => {
+            return Err(Error::Coded {
+                message: format!(
+                    "could not drop schema \"{name}\": another transaction is creating objects \
+                     in it; retry the statement"
+                ),
+                sqlstate: "40001",
+            });
+        },
+        other => other?,
+    }
+    // The policies, RLS markers and triggers still filed under the schema's name (a temporary
+    // schema's, say), and the schema's own comment.
+    super::purge_schema_catalogs(engine, txn, name)?;
+    crate::rbac::clear_owner(engine, txn, crate::ast::ObjectKind::Schema, name)?;
+    crate::rbac::delete_grants_on(engine, txn, crate::ast::ObjectKind::Schema, name)?;
+    Ok(())
 }
 
 // === CREATE / DROP SEQUENCE =======================================
@@ -2338,6 +2652,13 @@ pub(super) fn run_create_sequence(
     create_sequence_named(engine, txn, &plan.def)?;
     // Mirror the definition so `information_schema.sequences` can enumerate it.
     super::seqcatalog::record(engine, txn, &plan.def)?;
+    super::object_schema::record(
+        engine,
+        txn,
+        super::object_schema::SEQUENCE,
+        &plan.def.name,
+        &plan.schema,
+    )?;
     Ok(ExecutionResult::SequenceCreated)
 }
 
@@ -2350,6 +2671,7 @@ pub(super) fn run_drop_sequence(
         Some(id) => {
             engine.drop_sequence(txn, id)?;
             super::seqcatalog::remove(engine, txn, &plan.name)?;
+            super::object_schema::forget(engine, txn, super::object_schema::SEQUENCE, &plan.name)?;
             super::comment::forget(engine, txn, &super::comment::sequence_key(&plan.name))?;
         },
         None => skip_missing(

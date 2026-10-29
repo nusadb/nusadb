@@ -157,6 +157,7 @@ mod ivm;
 pub mod join;
 mod lock_skip;
 mod move_skip;
+mod object_schema;
 pub mod ops;
 mod partition;
 mod procedure;
@@ -177,6 +178,9 @@ mod spill;
 mod stream;
 use agg::*;
 use ddl::*;
+pub use ddl::{
+    OrphanedSchemaObject, drop_schema_cascade, drop_temp_schema, orphaned_schema_objects,
+};
 use dml::*;
 use join::*;
 use ops::*;
@@ -1876,19 +1880,7 @@ impl<'engine> Session<'engine> {
             return;
         }
         let name = self.temp_schema_name();
-        let result = (|| -> Result<(), Error> {
-            let Some(id) = self.engine.lookup_schema(&name)? else {
-                return Ok(());
-            };
-            let txn = self.engine.begin(IsolationLevel::default())?;
-            match self.engine.drop_schema(txn, id, true) {
-                Ok(()) => deferred::commit(self.engine, txn),
-                Err(e) => {
-                    let _ = deferred::rollback(self.engine, txn);
-                    Err(e.into())
-                },
-            }
-        })();
+        let result = drop_temp_schema(self.engine, &name);
         if let Err(e) = result {
             tracing::warn!(schema = %name, error = %e, "failed to drop temporary schema on disconnect");
         }
@@ -6071,6 +6063,8 @@ fn run_create_view(
         return Ok(ExecutionResult::ViewCreated);
     }
     store_view_def(engine, txn, VIEW_CATALOG, &p.name, &p.definition_sql)?;
+    // Which schema the key is in, for a key the name alone cannot say it of.
+    object_schema::record(engine, txn, object_schema::VIEW, &p.name, &p.schema)?;
     // Record (or, under OR REPLACE, clear) the explicit column-name list. Always remove the prior
     // entry first so replacing a `VIEW v(a,b)` with a plain `VIEW v` drops the stale rename.
     if p.columns.is_empty() {
@@ -6181,6 +6175,7 @@ fn run_drop_view(
     }
     // No backing table — it may be a non-materialized view (catalog entry only).
     let removed = delete_view_def(engine, txn, VIEW_CATALOG, &p.name)?;
+    object_schema::forget(engine, txn, object_schema::VIEW, &p.name)?;
     // Forget any explicit column-name list (no-op if the view declared none).
     delete_view_def(engine, txn, VIEW_COLUMNS_CATALOG, &p.name)?;
     // Forget any `WITH CHECK OPTION` flag (no-op if the view had none).

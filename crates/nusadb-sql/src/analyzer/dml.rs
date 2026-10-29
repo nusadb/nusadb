@@ -575,7 +575,11 @@ pub(super) fn analyze_create_sequence(
     let min_value = min_value.unwrap_or(1);
     let max_value = max_value.unwrap_or(i64::MAX);
     let start = start.unwrap_or(min_value);
+    let schema = cs
+        .schema
+        .unwrap_or_else(|| nusadb_core::PUBLIC_SCHEMA.to_owned());
     Ok(CreateSequencePlan {
+        schema,
         def: SequenceDef {
             name: cs.name,
             start,

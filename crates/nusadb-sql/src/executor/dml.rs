@@ -3792,6 +3792,18 @@ pub(super) fn validate_fk_child_rows(
     check_fk_children(table, rows, &[], false, engine, txn)
 }
 
+/// A foreign key whose `side` (`referencing` or `referenced`) table no longer exists constrains
+/// nothing: no row can be on that end. Such a key is left by an earlier build's
+/// `DROP SCHEMA ... CASCADE`; it is skipped, and the engine removes it the next time the database
+/// opens.
+fn dangling_foreign_key(name: &str, side: &str) {
+    tracing::warn!(
+        constraint = %name,
+        "foreign key \"{name}\" is skipped: its {side} table no longer exists; it is removed the \
+         next time the database opens"
+    );
+}
+
 fn check_fk_children(
     table: &TableSchema,
     rows: &[Row],
@@ -3815,12 +3827,10 @@ fn check_fk_children(
     };
     for fk in fks {
         let child_ordinals = constraint_ordinals(table, &fk.child_columns)?;
-        let parent = schema_by_id(engine, txn, fk.parent_table)?.ok_or_else(|| {
-            nusadb_core::Error::ConstraintViolation(format!(
-                "foreign key \"{}\": parent table is missing",
-                fk.name
-            ))
-        })?;
+        let Some(parent) = schema_by_id(engine, txn, fk.parent_table)? else {
+            dangling_foreign_key(&fk.name, "referenced");
+            continue;
+        };
         let Some(parent_key) = fk_parent_ordinals(&parent, &fk, engine, txn)? else {
             return Err(nusadb_core::Error::ConstraintViolation(format!(
                 "foreign key \"{}\": parent table \"{}\" has no referenced key",
@@ -4382,12 +4392,10 @@ impl DeleteWalk {
                 continue;
             }
             lock_removed_keys(table, &parent_ordinals, &deleted_keys, engine, txn)?;
-            let child = schema_by_id(engine, txn, fk.child_table)?.ok_or_else(|| {
-                nusadb_core::Error::ConstraintViolation(format!(
-                    "foreign key \"{}\": child table is missing",
-                    fk.name
-                ))
-            })?;
+            let Some(child) = schema_by_id(engine, txn, fk.child_table)? else {
+                dangling_foreign_key(&fk.name, "referencing");
+                continue;
+            };
             let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
             // The latest committed children, not the snapshot's: a child committed after this
             // transaction's snapshot still references the key.
@@ -4691,12 +4699,10 @@ fn parent_update_step(
         let Some(parent_ordinals) = fk_parent_ordinals(table, fk, engine, txn)? else {
             continue;
         };
-        let child = schema_by_id(engine, txn, fk.child_table)?.ok_or_else(|| {
-            nusadb_core::Error::ConstraintViolation(format!(
-                "foreign key \"{}\": child table is missing",
-                fk.name
-            ))
-        })?;
+        let Some(child) = schema_by_id(engine, txn, fk.child_table)? else {
+            dangling_foreign_key(&fk.name, "referencing");
+            continue;
+        };
         let child_ordinals = constraint_ordinals(&child, &fk.child_columns)?;
         // For a self-referencing key, the post-statement image of every row this statement moves.
         let post: HashMap<Tid, &Row> = if fk.child_table == table.id {

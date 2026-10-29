@@ -426,6 +426,7 @@ impl DatabaseManager {
         // table name. A standby gets the primary's repair through the log.
         if !self.is_standby() {
             repair_column_defaults(&engine, name);
+            note_orphaned_schema_objects(&engine, name);
             note_legacy_char_indexes(&engine, name);
         }
         spawn_purge_scheduler(&engine, name);
@@ -2240,6 +2241,31 @@ fn note_legacy_char_indexes(engine: &BtreeEngine, db: &str) {
         Err(e) => {
             tracing::warn!(db, error = %e, "could not record the indexes built by an earlier release");
         },
+    }
+}
+
+/// Name the views and sequences an earlier release left filed under a dropped schema (see
+/// [`orphaned_schema_objects`](nusadb_sql::orphaned_schema_objects)), each with the statement that
+/// removes it. Only the view and sequence catalogs are read; a failure is logged and the database
+/// still opens.
+fn note_orphaned_schema_objects(engine: &BtreeEngine, db: &str) {
+    match nusadb_sql::orphaned_schema_objects(engine) {
+        Ok(objects) => {
+            for object in objects {
+                let (kind, name) = (object.kind, &object.name);
+                tracing::warn!(
+                    db,
+                    "{kind} {name} is filed under a schema that no longer exists (left by DROP \
+                     SCHEMA ... CASCADE in an earlier release); unless it is a {kind} named \
+                     \"{name}\" on purpose, remove it with DROP {kind} {name}"
+                );
+            }
+        },
+        Err(e) => tracing::warn!(
+            db,
+            error = %e,
+            "could not look for views and sequences of dropped schemas"
+        ),
     }
 }
 

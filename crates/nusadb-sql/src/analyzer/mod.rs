@@ -743,6 +743,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                     .unwrap_or_else(|| catalog.current_schema());
                 dcl::require_schema_create(catalog, &schema)?;
                 cv.name = qualified_display(&schema, &cv.name);
+                cv.schema = Some(schema);
             }
             analyze_create_materialized_view(cv, catalog)
         },
@@ -1021,6 +1022,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
                 .unwrap_or_else(|| catalog.current_schema());
             dcl::require_schema_create(catalog, &schema)?;
             cs.name = qualified_display(&schema, &cs.name);
+            cs.schema = Some(schema);
             analyze_create_sequence(cs).map(LogicalPlan::CreateSequence)
         },
         ast::Statement::AlterSequence(mut a) => {
@@ -1381,6 +1383,9 @@ fn analyze_create_materialized_view(
         }
         return Ok(LogicalPlan::CreateView(CreatePlainViewPlan {
             name: cv.name,
+            schema: cv
+                .schema
+                .unwrap_or_else(|| nusadb_core::PUBLIC_SCHEMA.to_owned()),
             or_replace: cv.or_replace,
             if_not_exists: cv.if_not_exists,
             definition_sql: cv.definition_sql,

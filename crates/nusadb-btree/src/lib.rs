@@ -3785,6 +3785,97 @@ mod tests {
         engine.commit(txn).unwrap();
     }
 
+    /// A table dropped without its constraints first (the way an earlier build's
+    /// `DROP SCHEMA ... CASCADE` dropped member tables) leaves foreign keys, key constraints,
+    /// checks and indexes naming it. The next open removes them in one logged transaction: the
+    /// table on the other end of each foreign key works again, the names are free, and the
+    /// removal survives a further reopen.
+    #[test]
+    fn open_removes_catalog_entries_of_dropped_tables() {
+        use nusadb_core::{FkAction, ForeignKeyDef};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("orphans.wal");
+        let fk = |name: &str, child, parent| ForeignKeyDef {
+            name: name.to_owned(),
+            child_table: child,
+            child_columns: vec!["v".to_owned()],
+            parent_table: parent,
+            parent_columns: Vec::new(),
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::NoAction,
+        };
+        let (users, outside) = {
+            let engine = BtreeEngine::open(&wal).unwrap();
+            let txn = engine.begin(RC).unwrap();
+            let users = engine.create_table(txn, &table_def("users")).unwrap();
+            let gone_child = engine.create_table(txn, &table_def("gone_child")).unwrap();
+            let gone_parent = engine.create_table(txn, &table_def("gone_parent")).unwrap();
+            let outside = engine.create_table(txn, &table_def("outside")).unwrap();
+            engine
+                .add_unique_constraint(txn, users, "users_pkey", &["v".to_owned()], true, false)
+                .unwrap();
+            engine
+                .add_unique_constraint(txn, gone_parent, "gp_pkey", &["v".to_owned()], true, false)
+                .unwrap();
+            engine
+                .add_unique_constraint(txn, gone_child, "gc_pkey", &["v".to_owned()], true, false)
+                .unwrap();
+            engine
+                .add_check_constraint(txn, gone_child, "gc_ck", b"v > 0")
+                .unwrap();
+            engine
+                .create_index(
+                    txn,
+                    &nusadb_core::IndexDef {
+                        name: "gc_idx".to_owned(),
+                        table: gone_child,
+                        columns: vec!["v".to_owned()],
+                        key_exprs: Vec::new(),
+                        predicate: None,
+                        include: Vec::new(),
+                        kind: nusadb_core::IndexKind::BTree,
+                        unique: false,
+                    },
+                )
+                .unwrap();
+            engine
+                .add_foreign_key(txn, &fk("into_users", gone_child, users))
+                .unwrap();
+            engine
+                .add_foreign_key(txn, &fk("into_gone", outside, gone_parent))
+                .unwrap();
+            engine.drop_table(txn, gone_child).unwrap();
+            engine.drop_table(txn, gone_parent).unwrap();
+            engine.commit(txn).unwrap();
+            assert_eq!(engine.list_foreign_keys(users).unwrap().len(), 1);
+            assert_eq!(engine.list_foreign_keys(outside).unwrap().len(), 1);
+            (users, outside)
+        };
+        for _ in 0..2 {
+            let engine = BtreeEngine::open(&wal).unwrap();
+            assert!(engine.list_foreign_keys(users).unwrap().is_empty());
+            assert!(engine.list_foreign_keys(outside).unwrap().is_empty());
+            for name in ["gc_pkey", "gc_idx", "gp_pkey", "into_users", "into_gone"] {
+                assert_eq!(engine.lookup_index(name).unwrap(), None, "{name}");
+            }
+            assert!(engine.lookup_index("users_pkey").unwrap().is_some());
+            // The names can be taken again.
+            let txn = engine.begin(RC).unwrap();
+            let again = engine.create_table(txn, &table_def("gone_child")).unwrap();
+            engine
+                .add_unique_constraint(txn, again, "gc_pkey", &["v".to_owned()], true, false)
+                .unwrap();
+            engine
+                .add_check_constraint(txn, again, "gc_ck", b"v > 0")
+                .unwrap();
+            engine
+                .add_foreign_key(txn, &fk("into_users", again, users))
+                .unwrap();
+            engine.rollback(txn).unwrap();
+        }
+    }
+
     /// Rollback and savepoint semantics for the catalog family: an aborted transaction leaves
     /// no constraint behind; a savepoint-rolled-back drop restores the records.
     #[test]

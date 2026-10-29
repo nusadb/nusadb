@@ -639,6 +639,8 @@ pub struct DropIndexPlan {
 pub struct CreateSequencePlan {
     /// Resolved sequence definition (name + start/increment/bounds/cycle).
     pub def: SequenceDef,
+    /// The schema the sequence is created in (`def.name` is its catalog key).
+    pub schema: String,
     /// Whether `IF NOT EXISTS` was given.
     pub if_not_exists: bool,
 }
@@ -1370,8 +1372,10 @@ pub struct SetRolePlan {
 /// there is no backing table and no derived schema to carry here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePlainViewPlan {
-    /// View name.
+    /// View name: its catalog key, schema-qualified outside the default schema.
     pub name: String,
+    /// The schema the view is created in.
+    pub schema: String,
     /// Whether `OR REPLACE` was given.
     pub or_replace: bool,
     /// Whether `IF NOT EXISTS` was given: an existing view/table of the name makes this a no-op.

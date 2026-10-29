@@ -1530,28 +1530,11 @@ where
 /// and swallowed: a connection teardown must not surface a failure, and a leaked non-durable schema
 /// is reclaimed on the next restart regardless (it never reaches the WAL or checkpoint).
 fn drop_temp_schema(engine: &dyn StorageEngine, name: &str) {
-    let result = (|| -> Result<(), nusadb_sql::Error> {
-        let Some(id) = engine.lookup_schema(name)? else {
-            return Ok(());
-        };
-        let txn = engine.begin(nusadb_core::IsolationLevel::default())?;
-        // The SQL-layer catalogs are not reached by `drop_schema`, and a temp schema name is minted
-        // from a counter that restarts with the process — so a trigger left behind here can be
-        // inherited by a later session handed the same name.
-        if let Err(e) = nusadb_sql::purge_schema_catalogs(engine, txn, name) {
-            let _ = deferred::rollback(&*engine, txn);
-            tracing::warn!(schema = %name, error = %e, "failed to purge temporary schema catalogs");
-            return Ok(());
-        }
-        match engine.drop_schema(txn, id, true) {
-            Ok(()) => deferred::commit(engine, txn),
-            Err(e) => {
-                let _ = deferred::rollback(engine, txn);
-                Err(e.into())
-            },
-        }
-    })();
-    if let Err(e) = result {
+    // The same teardown as `DROP SCHEMA ... CASCADE`: every temporary table with its foreign keys
+    // (one into a permanent table included), triggers, policies and other catalog rows. A temp
+    // schema name is minted from a counter that restarts with the process, so a row left behind
+    // here could be inherited by a later session handed the same name.
+    if let Err(e) = nusadb_sql::drop_temp_schema(engine, name) {
         tracing::warn!(schema = %name, error = %e, "failed to drop temporary schema on disconnect");
     }
 }
