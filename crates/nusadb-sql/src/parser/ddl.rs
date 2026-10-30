@@ -452,6 +452,9 @@ pub(super) fn convert_column_def(
         if let Some(check) = int_range_check(&name, &col.data_type)? {
             lifted.push(check);
         }
+        if let Some(check) = array_element_check(&name, &col.data_type)? {
+            lifted.push(check);
+        }
     }
     let column = ast::ColumnDef {
         name,
@@ -546,6 +549,58 @@ fn int_range_check(
         _ => return Ok(None),
     };
     let predicate_sql = format!("\"{}\" BETWEEN {lo} AND {hi}", name.replace('"', "\"\""));
+    let expr = super::parse_expression(&predicate_sql)?;
+    Ok(Some(ast::TableConstraint::Check {
+        // A reserved synthetic name so introspection can hide this type-bound check (it is still
+        // enforced); the column name keeps it unique within the table.
+        name: Some(format!("{}{name}", crate::SYNTHETIC_TYPE_CHECK_PREFIX)),
+        predicate_sql,
+        expr,
+    }))
+}
+
+/// Desugar an array column whose declared element is narrower than the element an array keeps
+/// (`SMALLINT[]` and `INTEGER[]` keep 64-bit integers, `NUMERIC(p, s)[]` an unconstrained `NUMERIC`)
+/// into a synthetic `CHECK (nusadb_array_fits("col", 'type'))`. A write brings each element to the
+/// declared type first (rounding a `NUMERIC` to its scale) and refuses one out of its range with
+/// `22003`; the check names the declared type for it and guards every row.
+fn array_element_check(
+    name: &str,
+    data_type: &sql::DataType,
+) -> Result<Option<ast::TableConstraint>, Error> {
+    use sql::DataType as D;
+    let D::Array(elem) = data_type else {
+        return Ok(None);
+    };
+    let mut elem = elem;
+    // `INT[][]` declares the same element as `INT[]`.
+    let leaf = loop {
+        let ty = match elem {
+            sql::ArrayElemTypeDef::AngleBracket(ty)
+            | sql::ArrayElemTypeDef::SquareBracket(ty, _)
+            | sql::ArrayElemTypeDef::Parenthesis(ty) => ty,
+            sql::ArrayElemTypeDef::None => return Ok(None),
+        };
+        match ty.as_ref() {
+            D::Array(inner) => elem = inner,
+            other => break other,
+        }
+    };
+    let declared = match leaf {
+        D::SmallInt(_) | D::Int2(_) => "smallint".to_owned(),
+        D::Int(_) | D::Int4(_) | D::Integer(_) => "integer".to_owned(),
+        D::Numeric(_) | D::Decimal(_) | D::Dec(_) => match convert_data_type(leaf)? {
+            ColumnType::Numeric { precision, scale } if precision > 0 => {
+                format!("numeric({precision}, {scale})")
+            },
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let predicate_sql = format!(
+        "nusadb_array_fits(\"{}\", '{declared}')",
+        name.replace('"', "\"\"")
+    );
     let expr = super::parse_expression(&predicate_sql)?;
     Ok(Some(ast::TableConstraint::Check {
         // A reserved synthetic name so introspection can hide this type-bound check (it is still
@@ -1510,6 +1565,7 @@ pub(super) fn convert_column_change(
             let checks = [
                 char_length_check(column, &data_type)?.map(|c| (c, "22001")),
                 int_range_check(column, &data_type)?.map(|c| (c, "22003")),
+                array_element_check(column, &data_type)?.map(|c| (c, "22003")),
             ]
             .into_iter()
             .flatten()

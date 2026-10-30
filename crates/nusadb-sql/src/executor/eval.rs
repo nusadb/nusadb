@@ -1453,6 +1453,13 @@ fn eval_scalar_function(
                 Text(dims_text)
             }
         },
+        // NUSADB_ARRAY_FITS(arr, 'type'): every element fits the narrower element type, or the
+        // first one that does not is an out-of-range error.
+        (F::ArrayFits, [array @ ast::Value::Array(_), Text(ty)]) => {
+            let mut value = array.clone();
+            super::row::fit_array_elements(&mut value, super::row::narrowed_element_type(ty)?)?;
+            ast::Value::Bool(true)
+        },
         // ARRAY_NDIMS(arr): the number of dimensions — 2 for `[[1,2],[3,4]]`, 1 for a flat array,
         // NULL for an empty array (which has no dimensions); a NULL array already returned NULL above.
         (F::ArrayNdims, [ast::Value::Array(items)]) => {

@@ -797,7 +797,7 @@ fn finalize_updated_row(
     mut row: Row,
     fills: &[Option<super::coldefault::ColumnFill>],
     table: &TableSchema,
-    enum_info: &[Option<(String, Vec<String>)>],
+    coercions: &[ColumnCoercion],
 ) -> Result<Row, Error> {
     // Generated columns are computed from the values as they will be stored.
     strip_char_blanks(&mut row, table.columns.iter().map(|c| c.ty));
@@ -820,9 +820,10 @@ fn finalize_updated_row(
         row::adopt_column_type(value, column.ty)?;
         // Enforce the `VARCHAR(n)`/`CHAR(n)` length after the SET assignments, matching INSERT.
         row::coerce_char_length(value, column.ty)?;
-        // Resolve a text value assigned to an enum column into its ordinal (22P02 if unknown).
-        if let Some((enum_type, labels)) = enum_info.get(index).and_then(Option::as_ref) {
-            row::coerce_enum(value, labels, enum_type)?;
+        // Resolve a text value assigned to an enum column into its ordinal (22P02 if unknown), and
+        // bring an array's elements to the declared element type.
+        if let Some(coercion) = coercions.get(index) {
+            coercion.apply(value, column.ty)?;
         }
         // The stored form, as INSERT writes it: the uniqueness checks, CHECK constraints and
         // triggers see the value a later read returns.
@@ -834,7 +835,7 @@ fn finalize_updated_row(
 /// What [`conform_trigger_row`] needs of a table, loaded once per statement.
 pub(super) struct ConformContext {
     fills: Vec<Option<super::coldefault::ColumnFill>>,
-    enum_info: Vec<Option<(String, Vec<String>)>>,
+    coercions: Vec<ColumnCoercion>,
 }
 
 impl ConformContext {
@@ -845,7 +846,7 @@ impl ConformContext {
     ) -> Result<Self, Error> {
         Ok(Self {
             fills: super::coldefault::column_fills(table, engine, txn)?,
-            enum_info: enum_columns_info(table, engine, txn)?,
+            coercions: column_coercions(table, engine, txn)?,
         })
     }
 }
@@ -858,7 +859,7 @@ pub(super) fn conform_trigger_row(
     row: Row,
     context: &ConformContext,
 ) -> Result<Row, Error> {
-    finalize_updated_row(row, &context.fills, table, &context.enum_info)
+    finalize_updated_row(row, &context.fills, table, &context.coercions)
 }
 
 /// After inserting `full_rows`, advance each `SERIAL`/`IDENTITY` column's sequence past the largest
@@ -1438,34 +1439,121 @@ fn insert_encoded_batch(
     Ok(tids)
 }
 
-/// Per-column enum resolution table: for each column, `Some((enum type name, ordered labels))` when
-/// the column is of an enum type, else `None`. Indexed by column ordinal.
-type EnumColumnsInfo = Vec<Option<(String, Vec<String>)>>;
+/// What a write does to a column's value beyond converting it to the column's stored type.
+#[derive(Debug, Default)]
+pub(super) struct ColumnCoercion {
+    /// For an enum column, its `(type name, ordered labels)`: a text value resolves to its ordinal.
+    enum_type: Option<(String, Vec<String>)>,
+    /// For an array column declared with an element narrower than the one an array keeps
+    /// (`SMALLINT[]`, `INTEGER[]`, `NUMERIC(p, s)[]`), that element type: each element is brought to
+    /// it ([`row::fit_array_elements`]).
+    array_element: Option<ColumnType>,
+}
 
-/// For each column of `table`, its enum `(type name, ordered labels)` when the column is of an enum
-/// type, else `None`. The per-column enum catalog gives the type name; the enum type registry gives
-/// the labels. Used to resolve a text value assigned to an enum column into its ordinal on write.
-fn enum_columns_info(
+impl ColumnCoercion {
+    /// Apply the coercion to `value`, a value of a column of type `ty` about to be written.
+    fn apply(&self, value: &mut ast::Value, ty: ColumnType) -> Result<(), Error> {
+        if let Some((enum_type, labels)) = &self.enum_type {
+            row::coerce_enum(value, labels, enum_type)?;
+        }
+        if let Some(elem) = self.array_element {
+            // An array still in the text it was written as is first read as its column would store
+            // it.
+            if matches!(value, ast::Value::Text(_)) {
+                let schema = [ty];
+                let stored =
+                    row::decode(&row::encode(std::slice::from_ref(value), &schema)?, &schema)?;
+                if let Some(array) = stored.into_iter().next() {
+                    *value = array;
+                }
+            }
+            row::fit_array_elements(value, elem)?;
+        }
+        Ok(())
+    }
+}
+
+/// For each column of `table` (indexed by ordinal), what a write does to its value: an enum
+/// column's type and labels (the per-column enum catalog gives the type name, the enum type registry
+/// the labels), and the declared element of an array column narrower than the array keeps (named by
+/// the column's synthetic `nusadb_array_fits` check).
+fn column_coercions(
     table: &TableSchema,
     engine: &dyn StorageEngine,
     txn: TxnId,
-) -> Result<EnumColumnsInfo, Error> {
-    table
-        .columns
-        .iter()
-        .map(|col| -> Result<Option<(String, Vec<String>)>, Error> {
-            if col.ty != nusadb_core::ColumnType::Enum {
-                return Ok(None);
-            }
-            let Some(name) =
+) -> Result<Vec<ColumnCoercion>, Error> {
+    let mut coercions = Vec::with_capacity(table.columns.len());
+    for col in &table.columns {
+        let mut coercion = ColumnCoercion::default();
+        if col.ty == ColumnType::Enum
+            && let Some(name) =
                 super::lookup_enum_column(engine, txn, &table.schema, &table.name, &col.name)?
-            else {
-                return Ok(None);
-            };
+        {
             let labels = super::lookup_enum(engine, txn, &name)?.unwrap_or_default();
-            Ok(Some((name, labels)))
-        })
-        .collect()
+            coercion.enum_type = Some((name, labels));
+        }
+        coercions.push(coercion);
+    }
+    let narrowable = table.columns.iter().any(|c| {
+        matches!(
+            c.ty,
+            ColumnType::Array(
+                nusadb_core::engine::ArrayElem::Int | nusadb_core::engine::ArrayElem::Numeric
+            )
+        )
+    });
+    if narrowable {
+        for constraint in engine.list_constraints_as_of(txn, table.id)? {
+            let Some((column, elem)) = narrowed_array_column(&constraint)? else {
+                continue;
+            };
+            if let Some(at) = table.columns.iter().position(|c| c.name == column)
+                && let Some(coercion) = coercions.get_mut(at)
+            {
+                coercion.array_element = Some(elem);
+            }
+        }
+    }
+    Ok(coercions)
+}
+
+/// The array column and declared element type a synthetic `nusadb_array_fits("col", 'type')` check
+/// names, or `None` for any other constraint.
+fn narrowed_array_column(
+    constraint: &nusadb_core::engine::Constraint,
+) -> Result<Option<(String, ColumnType)>, Error> {
+    if constraint.kind != nusadb_core::ConstraintKind::Check
+        || !constraint
+            .name
+            .starts_with(crate::SYNTHETIC_TYPE_CHECK_PREFIX)
+    {
+        return Ok(None);
+    }
+    let Some(sql) = constraint
+        .expr
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+    else {
+        return Ok(None);
+    };
+    if !sql.starts_with("nusadb_array_fits(") {
+        return Ok(None);
+    }
+    let ast::Expr::ScalarFunction {
+        func: ast::ScalarFunc::ArrayFits,
+        args,
+    } = crate::parser::parse_expression(sql)?
+    else {
+        return Ok(None);
+    };
+    let [
+        ast::Expr::Column(column),
+        ast::Expr::Literal(ast::Value::Text(ty)),
+    ] = args.as_slice()
+    else {
+        return Ok(None);
+    };
+    Ok(Some((column.clone(), row::narrowed_element_type(ty)?)))
 }
 
 /// Where the value rows handed to an insert come from, which decides how the target's defaults
@@ -1539,7 +1627,7 @@ fn prepare_insert_rows(
     // For each enum column, its `(type name, ordered labels)` — so a text value can be resolved to
     // its declaration-order ordinal on write (an unknown label is rejected with 22P02). Resolved
     // once for the batch; `None` for every non-enum column.
-    let enum_info = enum_columns_info(table, engine, txn)?;
+    let coercions = column_coercions(table, engine, txn)?;
     // Complete rows laid out in column order need no per-row placement: only their generated
     // columns, if any, are computed again.
     let complete_in_order = matches!(source, RowSource::Complete)
@@ -1592,9 +1680,10 @@ fn prepare_insert_rows(
             // the row is written, unless the overflow is all trailing blanks (then it is truncated).
             row::coerce_char_length(value, *ty)?;
             // An enum column resolves its text value to a declaration-order ordinal (22P02 if the
-            // label is unknown), so what is stored and compared carries the ordinal.
-            if let Some((enum_type, labels)) = enum_info.get(idx).and_then(Option::as_ref) {
-                row::coerce_enum(value, labels, enum_type)?;
+            // label is unknown), so what is stored and compared carries the ordinal; an array's
+            // elements are brought to the declared element type (22003 when one is out of range).
+            if let Some(coercion) = coercions.get(idx) {
+                coercion.apply(value, *ty)?;
             }
             stored_form(value, *ty)?;
         }
@@ -1946,7 +2035,7 @@ fn upsert_rows(
         &fills,
         &assignments.iter().map(|(ordinal, _)| *ordinal).collect(),
     )?;
-    let enum_info = enum_columns_info(table, engine, txn)?;
+    let coercions = column_coercions(table, engine, txn)?;
 
     let arbiter = resolve_arbiter(table, target, engine, txn)?;
     let existing = scan_table(table, engine, txn)?;
@@ -2017,7 +2106,7 @@ fn upsert_rows(
                 set_at(&mut new_row, *ordinal, value)?;
             }
             // Recompute generated columns against the updated row, like plain UPDATE.
-            let new_row = finalize_updated_row(new_row, &fills, table, &enum_info)?;
+            let new_row = finalize_updated_row(new_row, &fills, table, &coercions)?;
             affected_keys.push(key);
             order.push((true, updates.len()));
             updates.push((*tid, erow.clone(), new_row));
@@ -5750,7 +5839,7 @@ fn run_update_single(
     // Generated columns: SET-ting one is an error; any other SET recomputes them against the
     // new row (`finalize_updated_row` per updated row below). `fills` is a no-op when none are generated.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
-    let enum_info = enum_columns_info(&plan.table, engine, txn)?;
+    let coercions = column_coercions(&plan.table, engine, txn)?;
     {
         let set_cols: HashSet<usize> = assignments
             .iter()
@@ -5793,7 +5882,7 @@ fn run_update_single(
                         )?;
                         apply_default_assignments(&mut assigned, &assignments, defaults, engine)?;
                         let new_row =
-                            finalize_updated_row(assigned, &fills, &plan.table, &enum_info)?;
+                            finalize_updated_row(assigned, &fills, &plan.table, &coercions)?;
                         if needs_unique {
                             result_rows.push(new_row.clone());
                             old_for_unique.push(row);
@@ -5822,7 +5911,7 @@ fn run_update_single(
                 }
                 let mut assigned = apply_assignments(&assignments, &plan.table, row)?;
                 apply_default_assignments(&mut assigned, &assignments, defaults, engine)?;
-                let new_row = finalize_updated_row(assigned, &fills, &plan.table, &enum_info)?;
+                let new_row = finalize_updated_row(assigned, &fills, &plan.table, &coercions)?;
                 if needs_unique {
                     result_rows.push(new_row.clone());
                 }
@@ -6921,7 +7010,7 @@ pub(super) fn run_merge(
         .any(|w| matches!(w, MergeWhen::NotMatchedBySource { .. }));
     // Generated columns: a matched UPDATE recomputes them; `fills` is a no-op when none exist.
     let fills = super::coldefault::column_fills(&plan.table, engine, txn)?;
-    let enum_info = enum_columns_info(&plan.table, engine, txn)?;
+    let coercions = column_coercions(&plan.table, engine, txn)?;
 
     // A source row with the first target row its ON condition matched: the first matching WHEN
     // MATCHED clause acts on that target row; with no match, the first matching WHEN NOT MATCHED
@@ -6948,7 +7037,7 @@ pub(super) fn run_merge(
                     action,
                     &plan.table,
                     &fills,
-                    &enum_info,
+                    &coercions,
                     tid,
                     &trow,
                     &combined,
@@ -7007,7 +7096,7 @@ pub(super) fn run_merge(
                 action,
                 &plan.table,
                 &fills,
-                &enum_info,
+                &coercions,
                 tid,
                 &trow,
                 &combined,
@@ -7136,7 +7225,7 @@ fn stage_merge_matched_action(
     action: &crate::planner::MergeMatchedAction,
     table: &TableSchema,
     fills: &[Option<super::coldefault::ColumnFill>],
-    enum_info: &[Option<(String, Vec<String>)>],
+    coercions: &[ColumnCoercion],
     tid: Tid,
     trow: &Row,
     combined: &Row,
@@ -7156,7 +7245,7 @@ fn stage_merge_matched_action(
             )?;
             let mut assigned = apply_assignments_ctx(assignments, table, trow.clone(), combined)?;
             apply_default_assignments(&mut assigned, assignments, fills, engine)?;
-            let new = finalize_updated_row(assigned, fills, table, enum_info)?;
+            let new = finalize_updated_row(assigned, fills, table, coercions)?;
             ops.updates.push((tid, trow.clone(), new));
         },
         crate::planner::MergeMatchedAction::Delete => ops.deletes.push((tid, trow.clone())),

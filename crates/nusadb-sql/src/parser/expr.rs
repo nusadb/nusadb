@@ -1558,6 +1558,7 @@ fn scalar_func_by_name(name: &str) -> Option<ast::ScalarFunc> {
         "array_replace" => F::ArrayReplace,
         "array_positions" => F::ArrayPositions,
         "array_ndims" => F::ArrayNdims,
+        "nusadb_array_fits" => F::ArrayFits,
         // Vector distance functions.
         "l2_distance" => F::L2Distance,
         "cosine_distance" => F::CosineDistance,

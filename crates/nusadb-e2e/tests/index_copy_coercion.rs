@@ -114,3 +114,31 @@ fn copy_loaded_numeric_rows_are_found_through_the_index() {
     );
     assert_eq!(via_index, via_seq, "index and sequential scan must agree");
 }
+
+/// `COPY` stores an array column's elements as the declared element type: a `NUMERIC(5, 2)[]`
+/// element is rounded to two places, and an `INTEGER[]` element out of range refuses the load.
+#[test]
+fn copy_fits_array_elements_to_the_declared_type() {
+    let engine = BtreeEngine::new();
+    let mut session = Session::new(&engine);
+    exec(
+        &mut session,
+        &engine,
+        "CREATE TABLE a (id INT, ia INT[], na NUMERIC(5,2)[])",
+    );
+    let Statement::Copy(copy) = parse("COPY a FROM STDIN").expect("parse copy") else {
+        panic!("expected COPY");
+    };
+    let n = copy_from(&engine, &copy, "1\t{1,2}\t{1.2345}\n").expect("copy");
+    assert_eq!(n, 1);
+    let err = copy_from(&engine, &copy, "2\t{9000000000}\t{1}\n").expect_err("out of range");
+    assert_eq!(err.sqlstate(), "22003", "{err}");
+    let stmt = parse("SELECT CAST(na AS TEXT) FROM a").expect("parse");
+    let logical = analyze(stmt, &EngineCatalog(&engine)).expect("analyze");
+    match session.execute(plan(logical)).expect("execute") {
+        ExecutionResult::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Text("{1.23}".to_owned())]]);
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}

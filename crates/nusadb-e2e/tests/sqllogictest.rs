@@ -1340,3 +1340,13 @@ fn slt_p2_not_null_before_trigger() {
 fn slt_p2_insert_select_null() {
     run_slt("tests/slt/p2_dml/insert_select_null.slt");
 }
+
+#[test]
+fn slt_p10_array_element_widths() {
+    run_slt("tests/slt/p10_types/array_element_widths.slt");
+}
+
+#[test]
+fn slt_p10_array_element_storage() {
+    run_slt("tests/slt/p10_types/array_element_storage.slt");
+}

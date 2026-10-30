@@ -829,6 +829,10 @@ pub enum ScalarFunc {
     /// `ARRAY_NDIMS(arr)` — the number of array dimensions (always `1` here for a non-empty array;
     /// `NULL` for an empty array), as `INT`.
     ArrayNdims,
+    /// `NUSADB_ARRAY_FITS(arr, 'type')` — `TRUE` when every element of `arr` can be stored as the
+    /// scalar `type` (`smallint`, `integer`, `numeric(p, s)`), else an out-of-range error (`22003`).
+    /// The check behind an array column declared with a narrower element than the array keeps.
+    ArrayFits,
     /// `L2_DISTANCE(a, b)` — Euclidean distance between two `VECTOR(n)`s, as `FLOAT`.
     L2Distance,
     /// `COSINE_DISTANCE(a, b)` — cosine distance `1 − cosθ` between two `VECTOR(n)`s, as `FLOAT`;
@@ -1268,6 +1272,7 @@ impl ScalarFunc {
             Self::ArrayReplace => "array_replace",
             Self::ArrayPositions => "array_positions",
             Self::ArrayNdims => "array_ndims",
+            Self::ArrayFits => "nusadb_array_fits",
             Self::L2Distance => "l2_distance",
             Self::CosineDistance => "cosine_distance",
             Self::InnerProduct => "inner_product",

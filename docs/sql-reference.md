@@ -272,6 +272,20 @@ SELECT ARRAY[['1','2']]::INT[][];    -- a cast converts every leaf
 Element search, append, overlap, containment and `= ANY` are defined over one dimension
 and are refused on a multidimensional operand.
 
+In an expression, an array element has the stored type of the declared element, not its width
+or precision: a `SMALLINT[]`, `INT[]` and `BIGINT[]` array all hold integers, and a
+`NUMERIC(10,2)[]` array holds `NUMERIC` values. So a `BIGINT` value works with an `INT[]` or
+`BIGINT[]` array in `||`, `= ANY` / `ALL`, `array_append`, `array_prepend`, `array_position`,
+`array_remove` and `array_replace`, as does a `NUMERIC(10,4)` value with a `NUMERIC(5,2)[]` array,
+and the result is not limited (`ia || 9000000000` is `{1,2,9000000000}`).
+
+Stored into a column, each element takes the column's declared element type, on every write path
+(`INSERT`, `COPY`, `UPDATE`, `MERGE`, upserts): in a `SMALLINT[]` or `INTEGER[]` column an element
+out of range is refused with `22003`, and in a `NUMERIC(p, s)[]` column each element is rounded to
+`s` places, `22003` when it then needs more than `p` digits. `ALTER COLUMN ... TYPE` to such a type
+checks the existing elements the same way. An array column created by an earlier release, and the
+length of a `VARCHAR(n)[]` element, are not checked.
+
 ### Ranges
 
 `INT4RANGE`, `INT8RANGE`, `NUMRANGE`, `DATERANGE`, `TSRANGE`, `TSTZRANGE`.

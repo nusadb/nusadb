@@ -1,0 +1,149 @@
+# An array column declared with an element narrower than the one an array keeps (SMALLINT[],
+# INTEGER[], NUMERIC(p, s)[]) stores each element as that type: out of range is 22003 and a NUMERIC
+# element is rounded to the declared scale, on every write path. Reading is not limited.
+
+statement ok
+CREATE TABLE ar (id INT PRIMARY KEY, ia INT[], sa SMALLINT[], na NUMERIC(5,2)[], m INT[][], b BIGINT, n NUMERIC(10,4))
+
+statement ok
+INSERT INTO ar VALUES (1, '{1,2}', '{1}', '{1.5}', '{{1,2},{3,4}}', 9000000000, 1.23456)
+
+# Refused: integer out of range
+statement error out of range
+UPDATE ar SET ia = array_append(ia, b)
+
+# Refused: integer out of range
+statement error out of range
+UPDATE ar SET ia = ia || 9000000000
+
+statement ok
+UPDATE ar SET na = array_append(na, n)
+
+# Refused: smallint out of range
+statement error out of range
+UPDATE ar SET sa = sa || 70000
+
+query TT
+SELECT (ia || b)::TEXT, (na || n)::TEXT FROM ar WHERE id = 1
+----
+{1,2,9000000000} {1.50,1.23,1.2346}
+
+# Refused: integer out of range
+statement error out of range
+INSERT INTO ar (id, ia) VALUES (2, ARRAY[9000000000])
+
+# Refused: value "100000" is out of range for type smallint
+statement error out of range
+INSERT INTO ar (id, sa) VALUES (3, '{100000}')
+
+statement ok
+INSERT INTO ar (id, na) VALUES (4, '{123.456}')
+
+# Refused: numeric field overflow
+statement error numeric field overflow
+INSERT INTO ar (id, na) VALUES (5, ARRAY[12345.6])
+
+# Refused: value "9000000000" is out of range for type integer
+statement error out of range
+INSERT INTO ar (id, m) VALUES (6, '{{1,9000000000}}')
+
+# Refused: integer out of range
+statement error out of range
+INSERT INTO ar (id, m) VALUES (6, ARRAY[[1,2],[3,9000000000]])
+
+# Refused: integer out of range
+statement error out of range
+INSERT INTO ar (id, ia) SELECT 7, ARRAY[g::BIGINT * 1000000000] FROM generate_series(3, 3) AS g
+
+statement ok
+INSERT INTO ar (id, na) SELECT 8, ARRAY[1.005, 2.994]
+
+# Refused: integer out of range
+statement error out of range
+INSERT INTO ar (id, ia) VALUES (1, '{5}') ON CONFLICT (id) DO UPDATE SET ia = ar.ia || 9000000000
+
+statement ok
+INSERT INTO ar (id, na) VALUES (1, '{5}') ON CONFLICT (id) DO UPDATE SET na = ARRAY[3.14159]
+
+# Refused: smallint out of range
+statement error out of range
+MERGE INTO ar USING (SELECT 1 AS id) AS s ON ar.id = s.id WHEN MATCHED THEN UPDATE SET sa = ARRAY[40000]
+
+statement ok
+MERGE INTO ar USING (SELECT 9 AS id) AS s ON ar.id = s.id WHEN NOT MATCHED THEN INSERT (id, na) VALUES (9, ARRAY[9.999])
+
+statement ok
+ALTER TABLE ar ADD COLUMN xa SMALLINT[]
+
+# Refused: smallint out of range
+statement error out of range
+UPDATE ar SET xa = ARRAY[70000] WHERE id = 1
+
+statement ok
+ALTER TABLE ar RENAME COLUMN sa TO sa2
+
+# Refused: smallint out of range
+statement error out of range
+UPDATE ar SET sa2 = ARRAY[70000] WHERE id = 1
+
+query TTTTTT
+SELECT id, ia::TEXT, sa2::TEXT, na::TEXT, m::TEXT, xa::TEXT FROM ar ORDER BY id
+----
+1 {1,2} {1} {3.14} {{1,2},{3,4}} NULL
+4 NULL NULL {123.46} NULL NULL
+8 NULL NULL {1.01,2.99} NULL NULL
+9 NULL NULL {10.00} NULL NULL
+
+statement ok
+CREATE TABLE al (id INT, v INT[])
+
+statement ok
+INSERT INTO al VALUES (1, ARRAY[70000])
+
+# Refused: smallint out of range
+statement error out of range
+ALTER TABLE al ALTER COLUMN v TYPE SMALLINT[]
+
+statement ok
+ALTER TABLE al ALTER COLUMN v TYPE BIGINT[]
+
+statement ok
+INSERT INTO al VALUES (2, ARRAY[9000000000])
+
+query TT
+SELECT id, v::TEXT FROM al ORDER BY id
+----
+1 {70000}
+2 {9000000000}
+
+statement ok
+CREATE TABLE pa (id INT, v INT[]) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE pa1 PARTITION OF pa FOR VALUES FROM (0) TO (10)
+
+# Refused: integer out of range
+statement error out of range
+INSERT INTO pa VALUES (1, ARRAY[9000000000])
+
+statement ok
+CREATE TABLE lk (LIKE ar)
+
+statement ok
+INSERT INTO lk (id, na) VALUES (1, ARRAY[1.239])
+
+query TT
+SELECT id, na::TEXT FROM lk
+----
+1 {1.24}
+
+statement ok
+CREATE TABLE big (v BIGINT[], n NUMERIC[])
+
+statement ok
+INSERT INTO big VALUES (ARRAY[9000000000], ARRAY[1.23456])
+
+query TT
+SELECT v::TEXT, n::TEXT FROM big
+----
+{9000000000} {1.23456}

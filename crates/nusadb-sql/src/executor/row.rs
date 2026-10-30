@@ -141,6 +141,60 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) -> Resul
     Ok(())
 }
 
+/// The element type an array column was declared with, from the name its synthetic check gives it
+/// (`smallint`, `integer`, `numeric(p, s)`): the element types narrower than the one an array keeps.
+///
+/// # Errors
+/// Any other name.
+pub(crate) fn narrowed_element_type(name: &str) -> Result<ColumnType, Error> {
+    match crate::parser::parse_column_type(name)? {
+        ty @ (ColumnType::SmallInt | ColumnType::Int) => Ok(ty),
+        ty @ ColumnType::Numeric { precision, .. } if precision > 0 => Ok(ty),
+        _ => Err(Error::InvalidStatement(format!(
+            "nusadb_array_fits() does not narrow array elements to {name}"
+        ))),
+    }
+}
+
+/// Bring every element of the array `value` (nested arrays included) to the element type `elem`
+/// it was declared with ([`narrowed_element_type`]), in place. A `NUMERIC(p, s)` element is rounded
+/// to scale `s`; an element out of range for its type is an error (`22003`). A non-array value is
+/// left alone.
+///
+/// # Errors
+/// An element out of range.
+pub(crate) fn fit_array_elements(value: &mut ast::Value, elem: ColumnType) -> Result<(), Error> {
+    let ast::Value::Array(items) = value else {
+        return Ok(());
+    };
+    for item in items {
+        match item {
+            ast::Value::Array(_) => fit_array_elements(item, elem)?,
+            ast::Value::Null => {},
+            ast::Value::Int(i) => match elem {
+                ColumnType::SmallInt if i16::try_from(*i).is_err() => {
+                    return Err(Error::Coded {
+                        message: "smallint out of range".to_owned(),
+                        sqlstate: "22003",
+                    });
+                },
+                ColumnType::Int if i32::try_from(*i).is_err() => {
+                    return Err(Error::IntegerOutOfRange);
+                },
+                ColumnType::Numeric { .. } => {
+                    *item = super::eval::cast_value(item.clone(), elem)?;
+                },
+                _ => {},
+            },
+            other if matches!(elem, ColumnType::Numeric { .. }) => {
+                *other = super::eval::cast_value(other.clone(), elem)?;
+            },
+            _ => {},
+        }
+    }
+    Ok(())
+}
+
 /// Apply a `VARCHAR(n)` / `CHAR(n)` column's declared length to a text value about to be written,
 /// in place. Every non-text value and every unbounded/non-character type is left untouched.
 ///

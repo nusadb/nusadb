@@ -1,0 +1,114 @@
+# An array keeps only its element's stored type: an integer array holds integers of any width and a
+# NUMERIC array holds NUMERIC(p, s) values. So a BIGINT, SMALLINT or NUMERIC(p, s) value works with an
+# array of the same declared type in every array operator and function.
+
+statement ok
+CREATE TABLE aw0 (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, ar BIGINT[] NOT NULL)
+
+statement ok
+INSERT INTO aw0 VALUES (1, 2, ARRAY[1::BIGINT]), (2, 1, ARRAY[1::BIGINT, 2::BIGINT])
+
+query TTTT
+SELECT (ar || k)::TEXT, (k || ar)::TEXT, array_append(ar, k)::TEXT, array_prepend(k, ar)::TEXT FROM aw0 ORDER BY id
+----
+{1,2} {2,1} {1,2} {2,1}
+{1,2,1} {1,1,2} {1,2,1} {1,1,2}
+
+query TTT
+SELECT array_cat(ar, ARRAY[k])::TEXT, array_remove(ar, k)::TEXT, array_replace(ar, ar[1], k)::TEXT FROM aw0 ORDER BY id
+----
+{1,2} {1} {2}
+{1,2,1} {2} {1,2}
+
+query TTTTTT
+SELECT (k = ANY(ar))::TEXT, (k = ALL(ar))::TEXT, (k <> ALL(ar))::TEXT, (ar @> ARRAY[k])::TEXT, (ARRAY[k] <@ ar)::TEXT, (ar && ARRAY[k])::TEXT FROM aw0 ORDER BY id
+----
+false false true false false false
+true false false true true true
+
+query TTT
+SELECT ar[1]::TEXT, (ar[1] = k)::TEXT, array_position(ar, k)::TEXT FROM aw0 ORDER BY id
+----
+1 false NULL
+1 true 1
+
+query TT
+SELECT x::TEXT, (x = k)::TEXT FROM aw0, unnest(ar) AS x ORDER BY id, x
+----
+1 false
+1 true
+2 false
+
+statement ok
+CREATE TABLE aw1 (id BIGINT PRIMARY KEY, k SMALLINT NOT NULL, ar SMALLINT[] NOT NULL)
+
+statement ok
+INSERT INTO aw1 VALUES (1, 2, ARRAY[1::SMALLINT]), (2, 1, ARRAY[1::SMALLINT, 2::SMALLINT])
+
+query TTTT
+SELECT (ar || k)::TEXT, (k || ar)::TEXT, array_append(ar, k)::TEXT, array_prepend(k, ar)::TEXT FROM aw1 ORDER BY id
+----
+{1,2} {2,1} {1,2} {2,1}
+{1,2,1} {1,1,2} {1,2,1} {1,1,2}
+
+query TTT
+SELECT array_cat(ar, ARRAY[k])::TEXT, array_remove(ar, k)::TEXT, array_replace(ar, ar[1], k)::TEXT FROM aw1 ORDER BY id
+----
+{1,2} {1} {2}
+{1,2,1} {2} {1,2}
+
+query TTTTTT
+SELECT (k = ANY(ar))::TEXT, (k = ALL(ar))::TEXT, (k <> ALL(ar))::TEXT, (ar @> ARRAY[k])::TEXT, (ARRAY[k] <@ ar)::TEXT, (ar && ARRAY[k])::TEXT FROM aw1 ORDER BY id
+----
+false false true false false false
+true false false true true true
+
+query TTT
+SELECT ar[1]::TEXT, (ar[1] = k)::TEXT, array_position(ar, k)::TEXT FROM aw1 ORDER BY id
+----
+1 false NULL
+1 true 1
+
+query TT
+SELECT x::TEXT, (x = k)::TEXT FROM aw1, unnest(ar) AS x ORDER BY id, x
+----
+1 false
+1 true
+2 false
+
+statement ok
+CREATE TABLE aw2 (id BIGINT PRIMARY KEY, k NUMERIC(10,2) NOT NULL, ar NUMERIC(10,2)[] NOT NULL)
+
+statement ok
+INSERT INTO aw2 VALUES (1, 2.5, ARRAY[1.5::NUMERIC(10,2)]), (2, 1.5, ARRAY[1.5::NUMERIC(10,2), 2.5::NUMERIC(10,2)])
+
+query TTTT
+SELECT (ar || k)::TEXT, (k || ar)::TEXT, array_append(ar, k)::TEXT, array_prepend(k, ar)::TEXT FROM aw2 ORDER BY id
+----
+{1.50,2.50} {2.50,1.50} {1.50,2.50} {2.50,1.50}
+{1.50,2.50,1.50} {1.50,1.50,2.50} {1.50,2.50,1.50} {1.50,1.50,2.50}
+
+query TTT
+SELECT array_cat(ar, ARRAY[k])::TEXT, array_remove(ar, k)::TEXT, array_replace(ar, ar[1], k)::TEXT FROM aw2 ORDER BY id
+----
+{1.50,2.50} {1.50} {2.50}
+{1.50,2.50,1.50} {2.50} {1.50,2.50}
+
+query TTTTTT
+SELECT (k = ANY(ar))::TEXT, (k = ALL(ar))::TEXT, (k <> ALL(ar))::TEXT, (ar @> ARRAY[k])::TEXT, (ARRAY[k] <@ ar)::TEXT, (ar && ARRAY[k])::TEXT FROM aw2 ORDER BY id
+----
+false false true false false false
+true false false true true true
+
+query TTT
+SELECT ar[1]::TEXT, (ar[1] = k)::TEXT, array_position(ar, k)::TEXT FROM aw2 ORDER BY id
+----
+1.50 false NULL
+1.50 true 1
+
+query TT
+SELECT x::TEXT, (x = k)::TEXT FROM aw2, unnest(ar) AS x ORDER BY id, x
+----
+1.50 false
+1.50 true
+2.50 false

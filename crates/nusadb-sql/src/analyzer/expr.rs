@@ -400,7 +400,7 @@ pub(super) fn analyze_expr_agg(
                 });
             };
             let elem_ty = elem.column_type();
-            if probe.ty != elem_ty && !is_null_literal(&probe) {
+            if !is_array_element(probe.ty, elem) && !is_null_literal(&probe) {
                 return Err(Error::TypeMismatch {
                     context: "ANY/ALL comparison against an array element".to_owned(),
                     expected: probe.ty,
@@ -1255,6 +1255,42 @@ pub(super) fn analyze_scalar_function(
             ty: if func == F::ArrayDims { Text } else { Int },
         });
     }
+    // NUSADB_ARRAY_FITS(arr, 'type'): an array of any element type and a literal naming a scalar
+    // element type an array element can be narrowed to.
+    if func == F::ArrayFits {
+        let [arr_expr, ty_expr] = args else {
+            return Err(Error::FunctionArgs(format!(
+                "nusadb_array_fits() expects 2 arguments, got {}",
+                args.len()
+            )));
+        };
+        let arr = analyze_expr_agg(arr_expr, scope, catalog, None, aggregates.as_deref_mut())?;
+        if !matches!(arr.ty, ColumnType::Array(_)) && !is_null_literal(&arr) {
+            return Err(Error::FunctionArgs(format!(
+                "nusadb_array_fits() expects an array argument, got {:?}",
+                arr.ty
+            )));
+        }
+        let ast::Expr::Literal(ast::Value::Text(ty_text)) = ty_expr else {
+            return Err(Error::FunctionArgs(
+                "nusadb_array_fits() expects a type name literal".to_owned(),
+            ));
+        };
+        crate::executor::row::narrowed_element_type(ty_text)?;
+        return Ok(TypedExpr {
+            kind: TypedExprKind::ScalarFunction {
+                func,
+                args: vec![
+                    arr,
+                    TypedExpr {
+                        kind: TypedExprKind::Literal(ast::Value::Text(ty_text.clone())),
+                        ty: Text,
+                    },
+                ],
+            },
+            ty: ColumnType::Bool,
+        });
+    }
     // ISFINITE(value) accepts a NUMERIC or temporal value of any of several types, so it is not
     // expressible with the fixed table; it always yields BOOL.
     if matches!(func, F::IsFinite) {
@@ -1845,6 +1881,7 @@ pub(super) fn analyze_scalar_function(
         | F::JsonExtractPathText
         | F::XmlConcat
         | F::ArrayNdims
+        | F::ArrayFits
         | F::L2Distance
         | F::CosineDistance
         | F::InnerProduct
@@ -2229,7 +2266,12 @@ fn analyze_array_mutate(
         array_elem.column_type()
     };
     let other = analyze_expr_agg(other_expr, scope, catalog, Some(expected), aggregates)?;
-    if other.ty != expected && !is_null_literal(&other) {
+    let fits = if func == F::ArrayCat {
+        other.ty == expected
+    } else {
+        is_array_element(other.ty, array_elem)
+    };
+    if !fits && !is_null_literal(&other) {
         return Err(Error::TypeMismatch {
             context: format!("{name}() {elem_label}"),
             expected,
@@ -2404,7 +2446,7 @@ fn analyze_array_replace(
             Some(elem_ty),
             aggregates.as_deref_mut(),
         )?;
-        if v.ty != elem_ty && !is_null_literal(&v) {
+        if !is_array_element(v.ty, array_elem) && !is_null_literal(&v) {
             return Err(Error::TypeMismatch {
                 context: format!("{name}() {label} element"),
                 expected: elem_ty,
@@ -6124,6 +6166,14 @@ pub(super) const fn textout_scalar(ty: ColumnType) -> bool {
     )
 }
 
+/// Whether a value of scalar type `ty` is an element of an array of `elem`. An array element keeps
+/// only the stored type, so an integer of any width is an element of an integer array, a
+/// `NUMERIC(p, s)` of a `NUMERIC` array, a `VARCHAR(n)` of a `TEXT` array and a `REAL` of a
+/// floating-point array.
+pub(super) fn is_array_element(ty: ColumnType, elem: nusadb_core::engine::ArrayElem) -> bool {
+    nusadb_core::engine::ArrayElem::from_column_type(ty) == Some(elem)
+}
+
 pub(super) fn check_concat(left: ColumnType, right: ColumnType) -> Result<ColumnType, Error> {
     use ColumnType::Array;
     match (left, right) {
@@ -6140,8 +6190,8 @@ pub(super) fn check_concat(left: ColumnType, right: ColumnType) -> Result<Column
         // Array concatenation: same element type on both sides.
         (Array(a), Array(b)) if a == b => Ok(Array(a)),
         // Append/prepend an element to an array: the scalar must be the array's element type.
-        (Array(a), elem) if a.column_type() == elem => Ok(Array(a)),
-        (elem, Array(b)) if b.column_type() == elem => Ok(Array(b)),
+        (Array(a), elem) if is_array_element(elem, a) => Ok(Array(a)),
+        (elem, Array(b)) if is_array_element(elem, b) => Ok(Array(b)),
         // One TEXT side coerces the other scalar to its text output (the
         // reference's text-any concatenation): `'x' || 5` = `'x5'`. BYTEA keeps its own `||`,
         // JSON stays reserved (a future json-concat operator), arrays follow the rules above.
