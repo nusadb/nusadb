@@ -1335,3 +1335,8 @@ fn slt_p1_index_key_types() {
 fn slt_p2_not_null_before_trigger() {
     run_slt("tests/slt/p2_dml/not_null_before_trigger.slt");
 }
+
+#[test]
+fn slt_p2_insert_select_null() {
+    run_slt("tests/slt/p2_dml/insert_select_null.slt");
+}

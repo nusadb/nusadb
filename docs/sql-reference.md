@@ -1369,6 +1369,19 @@ DROP TABLE shipment;
 DROP TABLE stock;
 ```
 
+The source of `INSERT ... SELECT` may be a set operation (`INSERT INTO t SELECT ... UNION ALL
+SELECT ...`). A bare `NULL` in the select list takes the type of the column it goes into, as in
+`VALUES`, so `INSERT INTO t (id, parent) SELECT g, NULL FROM generate_series(1, 3) AS g` works on a
+`BIGINT` column. In a set operation a bare `NULL` in one branch takes the other branch's type
+(`SELECT NULL UNION ALL SELECT 5` is an integer column). A `NULL` that something else has already
+typed is `TEXT`: one inside `CASE` or `COALESCE` with no typed branch, a scalar subquery, the column
+of a derived table or CTE, and a set-operation column that is `NULL` in both branches. It goes
+wherever a `TEXT` value may be stored: a column of an integer, floating-point or boolean type
+refuses it with `42804`, while a column that takes a text value, such as a date/time, `INTERVAL`,
+`NUMERIC`, `UUID`, `JSON`, array or range column, accepts it and stores `NULL` (a text value there
+is read as that type, so `SELECT 1, NULL UNION SELECT 2, '2024-02-02'` into a `DATE` column also
+works). Cast the `NULL` (`NULL::BIGINT`) to give it a type.
+
 `SET column = DEFAULT` in an `UPDATE` or a `MERGE ... THEN UPDATE` assigns the column's default:
 its expression, the next value of its sequence, NULL for a column without one, and for a generated
 column (the only value it may be set to) its computed value. Through an auto-updatable view it

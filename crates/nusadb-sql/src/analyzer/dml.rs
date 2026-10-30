@@ -108,7 +108,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         // INSERT ... SELECT: analyze the subquery, then check that its output columns match
         // the target columns one-for-one (arity + per-column assignability).
         ast::InsertSource::Select(select) => {
-            let plan = analyze_select(*select, catalog)?;
+            let mut plan = analyze_select(*select, catalog)?;
             if plan.projection.len() != target_columns.len() {
                 return Err(Error::ArityMismatch {
                     context: "INSERT ... SELECT".to_owned(),
@@ -116,7 +116,13 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
                     found: plan.projection.len(),
                 });
             }
-            for (proj, column) in plan.projection.iter().zip(&target_columns) {
+            for (proj, column) in plan.projection.iter_mut().zip(&target_columns) {
+                // A bare `NULL` in the select list has no type of its own: it takes the target
+                // column's, as it does in `INSERT ... VALUES`. A `NULL` inside an expression
+                // (`CASE`, `COALESCE`, a subquery) has already been typed by that expression.
+                if is_null_literal(&proj.expr) {
+                    proj.expr.ty = column.ty;
+                }
                 if !super::typecheck::assignable_to_column(column.ty, proj.expr.ty) {
                     return Err(Error::TypeMismatch {
                         context: format!("INSERT ... SELECT into column `{}`", column.name),

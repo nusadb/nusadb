@@ -1,0 +1,143 @@
+# A bare NULL in the select list of INSERT ... SELECT takes the target column's type, as it does in
+# INSERT ... VALUES. A NULL inside an expression is typed by that expression first.
+
+statement ok
+CREATE TABLE ns (id BIGINT NOT NULL, scope_id BIGINT, CONSTRAINT ns_pkey PRIMARY KEY (id))
+
+statement ok
+INSERT INTO ns SELECT g, NULL FROM generate_series(1, 3) AS g
+
+statement ok
+INSERT INTO ns (id, scope_id) SELECT g, NULL FROM generate_series(4, 5) AS g
+
+statement ok
+INSERT INTO ns (scope_id, id) SELECT NULL, 6
+
+statement ok
+INSERT INTO ns SELECT g, NULL FROM generate_series(7, 8) AS g GROUP BY g
+
+statement ok
+INSERT INTO ns SELECT g, NULL FROM generate_series(9, 10) AS g LIMIT 1
+
+statement ok
+INSERT INTO ns SELECT 11, CASE WHEN true THEN NULL ELSE 1 END
+
+statement ok
+INSERT INTO ns SELECT 12, NULLIF(1, 1)
+
+query II
+SELECT id, scope_id FROM ns ORDER BY id
+----
+1 NULL
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+11 NULL
+12 NULL
+
+# Every column type.
+statement ok
+CREATE TABLE ns_types (id INT, t TIMESTAMPTZ, u UUID, j JSONB, n NUMERIC(10,2), b BOOL, d DATE, iv INTERVAL, a INT[], tx TEXT)
+
+statement ok
+INSERT INTO ns_types SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+
+query I
+SELECT count(*) FROM ns_types WHERE t IS NULL AND u IS NULL AND j IS NULL AND n IS NULL AND b IS NULL AND d IS NULL AND iv IS NULL AND a IS NULL AND tx IS NULL
+----
+1
+
+# A NULL typed by its expression, a subquery or a derived table is TEXT, which a BIGINT column
+# refuses.
+statement error type mismatch in INSERT \.\.\. SELECT into column `scope_id`
+INSERT INTO ns SELECT 20, CASE WHEN true THEN NULL END
+
+statement error type mismatch in INSERT \.\.\. SELECT into column `scope_id`
+INSERT INTO ns SELECT 20, COALESCE(NULL, NULL)
+
+statement error type mismatch in INSERT \.\.\. SELECT into column `scope_id`
+INSERT INTO ns SELECT 20, (SELECT NULL)
+
+statement error type mismatch in INSERT \.\.\. SELECT into column `scope_id`
+INSERT INTO ns SELECT * FROM (SELECT 20, NULL) AS s
+
+statement error type mismatch in INSERT \.\.\. SELECT into column `scope_id`
+INSERT INTO ns SELECT 20, NULL::TEXT
+
+# NOT NULL still applies.
+statement error NULL assigned to NOT NULL column `id`
+INSERT INTO ns SELECT NULL, 1
+
+# A set operation as the source. A bare NULL in one branch takes the other branch's type; a column
+# that is NULL in both branches is TEXT.
+statement ok
+INSERT INTO ns (id, scope_id) SELECT 30, NULL UNION ALL SELECT 31, 5
+
+statement ok
+INSERT INTO ns SELECT 32, 6 UNION ALL SELECT 33, NULL
+
+statement ok
+INSERT INTO ns SELECT * FROM (SELECT 34, NULL UNION ALL SELECT 35, 7) AS s
+
+statement ok
+INSERT INTO ns SELECT 36, 1 UNION SELECT 36, 1
+
+statement ok
+INSERT INTO ns (id) SELECT 38 UNION ALL SELECT 37 ORDER BY 1 LIMIT 1
+
+statement error type mismatch in INSERT \.\.\. SELECT into column `scope_id`
+INSERT INTO ns (id, scope_id) SELECT 40, NULL UNION ALL SELECT 41, NULL
+
+statement error type mismatch in set operation column
+INSERT INTO ns SELECT 40, NULL UNION SELECT 41, NULL UNION SELECT 42, 7
+
+query II
+SELECT id, scope_id FROM ns WHERE id >= 30 ORDER BY id
+----
+30 NULL
+31 5
+32 6
+33 NULL
+34 NULL
+35 7
+36 1
+37 NULL
+
+# The same rule outside INSERT.
+query I
+SELECT NULL UNION ALL SELECT 5 ORDER BY 1
+----
+5
+NULL
+
+query I
+SELECT 5 UNION ALL SELECT NULL ORDER BY 1
+----
+5
+NULL
+
+# A NULL already typed as TEXT goes where a TEXT value may be stored: a DATE column takes it, a
+# BOOLEAN column refuses it.
+statement ok
+CREATE TABLE ns_text (id INT, d DATE, b BOOL)
+
+statement ok
+INSERT INTO ns_text (id, d) SELECT 1, (SELECT NULL)
+
+statement ok
+INSERT INTO ns_text (id, d) SELECT 2, NULL UNION SELECT 3, '2024-02-02'
+
+statement error type mismatch in INSERT \.\.\. SELECT into column `b`
+INSERT INTO ns_text (id, b) SELECT 4, (SELECT NULL)
+
+query IT
+SELECT id, d FROM ns_text ORDER BY id
+----
+1 NULL
+2 NULL
+3 2024-02-02

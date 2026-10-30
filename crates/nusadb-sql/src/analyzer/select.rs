@@ -1589,9 +1589,18 @@ pub(super) fn analyze_set_body(
             // Unify each column's type across the two branches (names come from the left), so mixed
             // numeric branches widen — `SELECT 1 UNION SELECT 2.5` yields a NUMERIC column rather than
             // a spurious type mismatch — matching the standard. Incompatible types still error.
+            // A column that is a bare `NULL` in one branch has no type of its own and takes the
+            // other branch's (`SELECT NULL UNION SELECT 5` is an integer column).
             let mut cols = lcols;
-            for (l, r) in cols.iter_mut().zip(&rcols) {
-                l.1 = unify_result_ty(Some(l.1), r.1, "set operation column")?;
+            for (idx, (l, r)) in cols.iter_mut().zip(&rcols).enumerate() {
+                l.1 = match (
+                    column_is_untyped(&ltree, idx),
+                    column_is_untyped(&rtree, idx),
+                ) {
+                    (true, false) => r.1,
+                    (false, true) => l.1,
+                    _ => unify_result_ty(Some(l.1), r.1, "set operation column")?,
+                };
             }
             let mut tree = SetOpTree::Node {
                 op,
@@ -1610,14 +1619,32 @@ pub(super) fn analyze_set_body(
     }
 }
 
+/// Whether output column `idx` of a set-operation operand is untyped: a bare `NULL` in a single
+/// `SELECT`. A nested set operation has resolved its columns already (two untyped branches give
+/// `TEXT`), so it never is.
+fn column_is_untyped(tree: &SetOpTree<SelectPlan>, idx: usize) -> bool {
+    match tree {
+        SetOpTree::Leaf(plan) => plan
+            .projection
+            .get(idx)
+            .is_some_and(|p| super::typecheck::is_null_literal(&p.expr)),
+        SetOpTree::Node { .. } => false,
+    }
+}
+
 /// Promote output column `idx` of every leaf in a set-operation tree to the date/time type `ty`
-/// (see [`promote_temporal`]); a leaf whose column already has that type is left as is.
+/// (see [`promote_temporal`]); a leaf whose column already has that type is left as is, and a bare
+/// `NULL` takes the type `ty`.
 fn promote_set_column(tree: &mut SetOpTree<SelectPlan>, idx: usize, ty: ColumnType) {
     match tree {
         SetOpTree::Leaf(plan) => {
             if let Some(p) = plan.projection.get_mut(idx)
                 && p.expr.ty != ty
             {
+                if super::typecheck::is_null_literal(&p.expr) {
+                    p.expr.ty = ty;
+                    return;
+                }
                 let placeholder = TypedExpr {
                     kind: TypedExprKind::Literal(ast::Value::Null),
                     ty,

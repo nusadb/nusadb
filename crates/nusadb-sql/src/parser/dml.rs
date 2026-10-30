@@ -34,6 +34,23 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<ast::Insert, Error> 
         });
     };
     let query = *query;
+    // `INSERT INTO t SELECT ... UNION SELECT ...`: the insert reads every column of the set
+    // operation, as a derived table.
+    if matches!(*query.body, sql::SetExpr::SetOperation { .. }) {
+        let ast::Statement::SetOperation(set_op) = convert_query(query)? else {
+            return unsupported("INSERT from a set operation that could not be lowered");
+        };
+        return Ok(ast::Insert {
+            schema,
+            table,
+            columns,
+            // Set by `parse` when a stripped `OVERRIDING {SYSTEM|USER} VALUE` was present.
+            overriding: None,
+            source: ast::InsertSource::Select(Box::new(select_all_from(set_op))),
+            on_conflict: convert_on_insert(insert.on)?,
+            returning: convert_returning(insert.returning)?,
+        });
+    }
     let source = match *query.body {
         sql::SetExpr::Values(values) => {
             let rows: Vec<Vec<Option<ast::Expr>>> = values
@@ -72,6 +89,40 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<ast::Insert, Error> 
         on_conflict,
         returning,
     })
+}
+
+/// `SELECT * FROM (<set_op>) AS set_op_source`.
+fn select_all_from(set_op: ast::SetOperation) -> ast::Select {
+    let name = "set_op_source".to_owned();
+    ast::Select {
+        with: Vec::new(),
+        distinct: None,
+        projection: vec![ast::SelectItem::Wildcard],
+        from: Some(ast::FromClause {
+            base: ast::TableRef {
+                schema: None,
+                name: name.clone(),
+                alias: Some(name),
+                subquery: None,
+                values: None,
+                set_op: Some(Box::new(set_op)),
+                lateral: false,
+                column_aliases: Vec::new(),
+                with_ordinality: false,
+                only: false,
+                sample: None,
+            },
+            joins: Vec::new(),
+        }),
+        filter: None,
+        group_by: ast::GroupBy::Expressions(Vec::new()),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        limit_with_ties: false,
+        offset: None,
+        lock: None,
+    }
 }
 
 /// Lower one cell of a `VALUES` row. A bare `DEFAULT` keyword (which sqlparser
