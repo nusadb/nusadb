@@ -1927,6 +1927,14 @@ later trigger fires for it. In a `DELETE`, `NEW` is null, so `RETURN NEW` also s
 body that ends, or stops at a bare `RETURN`, without naming a row goes on with `NEW` as assigned
 (for a `DELETE`, the row is deleted). A rewritten row is checked like any written row: generated
 columns are recomputed, and `NOT NULL`, `CHECK`, unique and foreign keys apply to the new values.
+The order is: column defaults are filled, the `BEFORE` triggers run, then `NOT NULL` and `CHECK`
+are checked once, on the row the triggers return. So a trigger may fill a `NOT NULL` column that
+the statement left out or set to `NULL`, in an `INSERT` (with `VALUES` or `SELECT`), `COPY FROM`,
+an `UPDATE`, either arm of `ON CONFLICT DO UPDATE`, and a row routed into a partition. A row that
+is still `NULL` there after the triggers is refused with `23502`. In `ON CONFLICT`, a proposed row
+that conflicts with an existing one is not inserted and its `BEFORE INSERT` triggers do not run,
+but it is still checked against `NOT NULL` and `CHECK` as proposed, whatever the `WHERE` of `DO
+UPDATE` decides.
 Returning anything else is an error (`42804`). The return value of an `AFTER` or statement
 trigger is ignored. A `BEFORE` trigger on a referencing table may change other columns of a row
 an `ON DELETE` or `ON UPDATE` action writes (its `CHECK` constraints still apply), but skipping

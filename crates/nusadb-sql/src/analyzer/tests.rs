@@ -530,10 +530,12 @@ fn insert_string_literal_coerces_and_bad_type_is_rejected() {
 }
 
 #[test]
-fn insert_null_into_not_null_column_is_rejected() {
+fn insert_null_into_not_null_column_is_left_to_the_executor() {
+    // A BEFORE trigger may replace the NULL, so NOT NULL is checked when the row is written, after
+    // the triggers have run, not when the statement is analyzed.
     assert!(matches!(
         plan("INSERT INTO users (id) VALUES (NULL)", &catalog()),
-        Err(Error::NotNullViolation { .. }),
+        Ok(LogicalPlan::Insert(_)),
     ));
 }
 

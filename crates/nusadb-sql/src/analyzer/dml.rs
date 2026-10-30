@@ -671,11 +671,8 @@ pub(super) fn analyze_insert_value(
 ) -> Result<TypedExpr, Error> {
     // `INSERT ... VALUES` expressions cannot reference columns: empty scope.
     let typed = analyze_expr(value, &[], catalog, Some(column.ty))?;
-    if !column.nullable && is_null_literal(&typed) {
-        return Err(Error::NotNullViolation {
-            column: column.name.clone(),
-        });
-    }
+    // A `NULL` for a `NOT NULL` column is refused by the executor, after the row's `BEFORE`
+    // triggers, which may replace it.
     // A bare string literal is "unknown"-typed and adopts an integer / float / boolean target, so
     // `INSERT INTO t(int_col) VALUES ('123')` stores `123` and `VALUES ('xyz')` loud-rejects at
     // evaluation. (A genuinely TEXT-typed value into a non-text column still stays a real mismatch;
@@ -1043,12 +1040,9 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
             assignments.push(Assignment::default_of(index, column.ty));
             continue;
         };
+        // A `NULL` for a `NOT NULL` column is refused by the executor, after the row's `BEFORE`
+        // triggers, which may replace it.
         let value = analyze_expr(expr, &scope, catalog, Some(column.ty))?;
-        if !column.nullable && is_null_literal(&value) {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
         check_assignable(column, &value)?;
         assignments.push(Assignment {
             column: index,

@@ -10,8 +10,8 @@
 
 use nusadb_btree::BtreeEngine;
 use nusadb_core::{StorageEngine, TableSchema};
-use nusadb_sql::ast::Value;
-use nusadb_sql::{Catalog, Error, ExecutionResult, analyze, execute, parse, plan};
+use nusadb_sql::ast::{Statement, Value};
+use nusadb_sql::{Catalog, Error, ExecutionResult, analyze, copy_from, execute, parse, plan};
 
 /// Minimal catalog over the engine — `lookup_table` is the only required method; the rest default.
 struct EngineCatalog<'a>(&'a dyn StorageEngine);
@@ -801,6 +801,51 @@ fn a_skipped_merge_delete_leaves_the_row_and_the_count() {
         ExecutionResult::Rows { rows, .. } => {
             assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
         },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// `COPY FROM` runs the BEFORE triggers before `NOT NULL` is checked, like `INSERT`: a trigger may
+/// fill a `NOT NULL` column the data leaves out or gives as `\N`, and a row it leaves `NULL` is
+/// refused.
+#[test]
+fn copy_from_checks_not_null_after_before_triggers() {
+    let engine = BtreeEngine::new();
+    run(
+        &engine,
+        "CREATE TABLE coded (id INT PRIMARY KEY, code TEXT NOT NULL)",
+    );
+    run(
+        &engine,
+        "CREATE FUNCTION fill_code() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN \
+         IF NEW.code IS NULL AND NEW.id < 100 THEN NEW.code := 'C' || NEW.id; END IF; \
+         RETURN NEW; END $$",
+    );
+    run(
+        &engine,
+        "CREATE TRIGGER fill_code BEFORE INSERT ON coded FOR EACH ROW EXECUTE FUNCTION fill_code()",
+    );
+    let copy = |sql: &str| match parse(sql).expect("parse") {
+        Statement::Copy(copy) => copy,
+        other => panic!("expected COPY, got {other:?}"),
+    };
+    let loaded = copy_from(&engine, &copy("COPY coded (id) FROM STDIN"), "7\n8\n").expect("copy");
+    assert_eq!(loaded, 2);
+    let loaded = copy_from(&engine, &copy("COPY coded FROM STDIN"), "9\t\\N\n").expect("copy");
+    assert_eq!(loaded, 1);
+    assert!(matches!(
+        copy_from(&engine, &copy("COPY coded (id) FROM STDIN"), "100\n"),
+        Err(Error::NotNullViolation { .. })
+    ));
+    match run(&engine, "SELECT id, code FROM coded ORDER BY id") {
+        ExecutionResult::Rows { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(7), Value::Text("C7".to_owned())],
+                vec![Value::Int(8), Value::Text("C8".to_owned())],
+                vec![Value::Int(9), Value::Text("C9".to_owned())],
+            ]
+        ),
         other => panic!("expected rows, got {other:?}"),
     }
 }

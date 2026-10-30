@@ -1,0 +1,176 @@
+# NOT NULL is checked once, after the row's BEFORE triggers: defaults are filled first, then the
+# triggers run and may fill a NOT NULL column, then NOT NULL and CHECK constraints apply. A row a
+# trigger leaves NULL is still refused.
+
+statement ok
+CREATE TABLE coded (id INT PRIMARY KEY, code TEXT NOT NULL, d TEXT NOT NULL DEFAULT 'dflt', n INT CHECK (n > 0))
+
+statement ok
+CREATE TABLE seen (id INT, code TEXT, d TEXT, n INT)
+
+statement ok
+CREATE FUNCTION fill_code() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO seen VALUES (NEW.id, NEW.code, NEW.d, NEW.n); IF NEW.code IS NULL AND NEW.id < 100 THEN NEW.code := 'C' || NEW.id; END IF; IF NEW.n IS NULL THEN SET NEW.n = NEW.id; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER fill_code BEFORE INSERT OR UPDATE ON coded FOR EACH ROW EXECUTE FUNCTION fill_code()
+
+# An omitted column, an explicit NULL, a DEFAULT cell on a column without a default, several rows,
+# and INSERT ... SELECT.
+statement ok
+INSERT INTO coded (id) VALUES (7)
+
+statement ok
+INSERT INTO coded VALUES (8, NULL, DEFAULT, NULL)
+
+statement ok
+INSERT INTO coded (id, code) VALUES (9, DEFAULT), (10, NULL)
+
+statement ok
+INSERT INTO coded (id) SELECT g FROM generate_series(11, 12) AS g
+
+# The trigger saw the column default already filled and the NOT NULL column still NULL.
+query ITTI
+SELECT id, code, d, n FROM seen ORDER BY id
+----
+7 NULL dflt NULL
+8 NULL dflt NULL
+9 NULL dflt NULL
+10 NULL dflt NULL
+11 NULL dflt NULL
+12 NULL dflt NULL
+
+query ITTI
+SELECT id, code, d, n FROM coded ORDER BY id
+----
+7 C7 dflt 7
+8 C8 dflt 8
+9 C9 dflt 9
+10 C10 dflt 10
+11 C11 dflt 11
+12 C12 dflt 12
+
+# A row the trigger leaves NULL is refused, and so is a CHECK the trigger's row fails.
+statement error NULL assigned to NOT NULL column `code`
+INSERT INTO coded (id) VALUES (100)
+
+statement error NULL assigned to NOT NULL column `code`
+INSERT INTO coded VALUES (100, NULL, DEFAULT, 1)
+
+statement error violates check constraint
+INSERT INTO coded (id, n) VALUES (13, -5)
+
+# UPDATE and ON CONFLICT DO UPDATE writing a NULL the trigger repairs.
+statement ok
+UPDATE coded SET code = NULL WHERE id = 8
+
+statement ok
+INSERT INTO coded (id, code) VALUES (7, 'x') ON CONFLICT (id) DO UPDATE SET code = NULL
+
+statement error NULL assigned to NOT NULL column `code`
+UPDATE coded SET code = NULL, id = 101 WHERE id = 9
+
+statement error violates check constraint
+UPDATE coded SET n = -1 WHERE id = 10
+
+query IT
+SELECT id, code FROM coded WHERE id IN (7, 8, 9, 10) ORDER BY id
+----
+7 C7
+8 C8
+9 C9
+10 C10
+
+# A row routed into a partition.
+statement ok
+CREATE TABLE coded_p (id INT, code TEXT NOT NULL) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE coded_p1 PARTITION OF coded_p FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE FUNCTION fill_p() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.code IS NULL THEN NEW.code := 'P' || NEW.id; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER fill_p BEFORE INSERT ON coded_p FOR EACH ROW EXECUTE FUNCTION fill_p()
+
+statement ok
+INSERT INTO coded_p (id) VALUES (5)
+
+query IT
+SELECT id, code FROM coded_p
+----
+5 P5
+
+# A trigger that skips the row: nothing is written and nothing is refused.
+statement ok
+CREATE TABLE skipped (id INT, code TEXT NOT NULL)
+
+statement ok
+CREATE FUNCTION skip_null() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN IF NEW.code IS NULL THEN RETURN NULL; END IF; RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER skip_null BEFORE INSERT ON skipped FOR EACH ROW EXECUTE FUNCTION skip_null()
+
+statement ok
+INSERT INTO skipped (id) VALUES (1)
+
+query I
+SELECT count(*) FROM skipped
+----
+0
+
+# Without a trigger, NOT NULL is refused as before.
+statement ok
+CREATE TABLE plain (id INT, code TEXT NOT NULL)
+
+statement error NULL assigned to NOT NULL column `code`
+INSERT INTO plain (id) VALUES (1)
+
+statement error NULL assigned to NOT NULL column `code`
+INSERT INTO plain VALUES (1, NULL)
+
+statement error NULL assigned to NOT NULL column `code`
+INSERT INTO plain (id, code) VALUES (1, DEFAULT)
+
+statement ok
+INSERT INTO plain VALUES (1, 'a')
+
+statement error NULL assigned to NOT NULL column `code`
+UPDATE plain SET code = NULL
+
+# ON CONFLICT DO UPDATE: a proposed row that conflicts is not inserted, but it is still checked
+# against NOT NULL and CHECK, whatever the WHERE decides. A proposed row that does not conflict is
+# inserted, after its BEFORE triggers.
+statement ok
+CREATE TABLE up (id INT PRIMARY KEY, c TEXT NOT NULL, d INT NOT NULL DEFAULT 5, k INT CHECK (k > 0))
+
+statement ok
+INSERT INTO up VALUES (7, 'x', 1, 1)
+
+statement error NULL assigned to NOT NULL column `c`
+INSERT INTO up VALUES (7, NULL, 1, 1) ON CONFLICT (id) DO UPDATE SET c = 'z'
+
+statement error NULL assigned to NOT NULL column `c`
+INSERT INTO up (id, d) VALUES (7, 1) ON CONFLICT (id) DO UPDATE SET c = 'w'
+
+statement error violates check constraint
+INSERT INTO up VALUES (7, 'q', 1, -1) ON CONFLICT (id) DO UPDATE SET c = 'v'
+
+statement error NULL assigned to NOT NULL column `c`
+INSERT INTO up VALUES (7, NULL, 1, 1) ON CONFLICT (id) DO NOTHING
+
+statement ok
+INSERT INTO up VALUES (7, 'q', 1, 1) ON CONFLICT (id) DO UPDATE SET c = 'ok' WHERE false
+
+query ITII
+SELECT id, c, d, k FROM up
+----
+7 x 1 1
+
+statement ok
+INSERT INTO coded (id) VALUES (50) ON CONFLICT (id) DO UPDATE SET code = 'never'
+
+query IT
+SELECT id, code FROM coded WHERE id = 50
+----
+50 C50

@@ -643,47 +643,32 @@ fn partition_bound_violations(
 /// Fill each column omitted from the INSERT target list (`!covered`) of `full` from its `DEFAULT`
 /// expression or `SERIAL` sequence, in place. A `DEFAULT` evaluates against an empty
 /// row (it references no other column) and is re-evaluated per row so a volatile default
-/// (`now()`/`random()`) is fresh each time; a `SERIAL` advances its sequence once per row. A fill that
-/// produces `NULL` on a `NOT NULL` column is a violation, like an explicit `NULL`. Shared by `INSERT`
-/// and `INSERT ... ON CONFLICT DO UPDATE`.
+/// (`now()`/`random()`) is fresh each time; a `SERIAL` advances its sequence once per row. A column
+/// with no fill stays `NULL`. `NOT NULL` is not checked here: the row's `BEFORE` triggers may still
+/// fill such a column, and the caller checks once they have run. Shared by `INSERT` and
+/// `INSERT ... ON CONFLICT DO UPDATE`.
 fn apply_column_fills(
     full: &mut Row,
     fills: &[Option<super::coldefault::ColumnFill>],
     covered: &HashSet<usize>,
-    table: &TableSchema,
     engine: &dyn StorageEngine,
 ) -> Result<(), Error> {
     let empty_row: Row = Vec::new();
     // Pass 1: fill omitted DEFAULT / SERIAL columns. GENERATED columns are deferred to pass 2 — their
     // expression references the row's other columns, which must all be populated first.
-    for (index, (fill, column)) in fills.iter().zip(&table.columns).enumerate() {
+    for (index, fill) in fills.iter().enumerate() {
         if covered.contains(&index) {
             continue;
         }
         let value = match fill {
-            // No default/serial: the column stays NULL. That is a violation on a NOT NULL column —
-            // an omitted such column is already rejected by the caller's static pre-check, but a
-            // per-cell `DEFAULT` reaches here uncovered (it is in the target list), so guard it too.
-            None => {
-                if !column.nullable {
-                    return Err(Error::NotNullViolation {
-                        column: column.name.clone(),
-                    });
-                }
-                continue;
-            },
             Some(super::coldefault::ColumnFill::Expr(expr)) => eval::eval(expr, &empty_row)?,
             Some(super::coldefault::ColumnFill::Serial { id, .. }) => {
                 ast::Value::Int(engine.sequence_next(*id)?)
             },
-            // Computed in pass 2 below, once the columns it references are populated.
-            Some(super::coldefault::ColumnFill::Generated(_)) => continue,
+            // No default/serial: the column stays NULL. A generated column is computed in pass 2
+            // below, once the columns it references are populated.
+            None | Some(super::coldefault::ColumnFill::Generated(_)) => continue,
         };
-        if matches!(value, ast::Value::Null) && !column.nullable {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
         set_at(full, index, value)?;
     }
     // Pass 2: compute every GENERATED column against the now-populated row. Always applied
@@ -694,14 +679,6 @@ fn apply_column_fills(
             continue;
         };
         let value = eval::eval(expr, &*full)?;
-        if matches!(value, ast::Value::Null)
-            && let Some(column) = table.columns.get(index)
-            && !column.nullable
-        {
-            return Err(Error::NotNullViolation {
-                column: column.name.clone(),
-            });
-        }
         set_at(full, index, value)?;
     }
     Ok(())
@@ -1550,17 +1527,8 @@ fn prepare_insert_rows(
                 reject_explicit_identity_always(table, &fills, &any_explicit)?;
             }
             reject_explicit_generated(table, &fills, &any_explicit)?;
-            // Static NOT-NULL coverage: a non-nullable column missing from the target list AND
-            // without a default/serial fill would be written as NULL. A `DEFAULT` cell on such a
-            // column is caught per-row by `apply_column_fills` below.
-            let covered: HashSet<usize> = columns.iter().copied().collect();
-            for ((index, column), fill) in table.columns.iter().enumerate().zip(&fills) {
-                if !column.nullable && !covered.contains(&index) && fill.is_none() {
-                    return Err(Error::NotNullViolation {
-                        column: column.name.clone(),
-                    });
-                }
-            }
+            // A `NOT NULL` column left `NULL` here (omitted, with no default) is not refused yet:
+            // a `BEFORE` trigger may fill it, and the caller checks the rows once they have run.
             any_explicit
         },
         // Complete rows were checked where they were written; each value counts as given.
@@ -1596,7 +1564,7 @@ fn prepare_insert_rows(
                 .collect();
             strip_char_blanks(&mut full, schema.iter().copied());
             if has_generated {
-                apply_column_fills(&mut full, &fills, &explicit, table, engine)?;
+                apply_column_fills(&mut full, &fills, &explicit, engine)?;
             }
             full
         } else {
@@ -1612,7 +1580,7 @@ fn prepare_insert_rows(
             }
             // Generated columns are computed from the values as they will be stored.
             strip_char_blanks(&mut full, schema.iter().copied());
-            apply_column_fills(&mut full, &fills, &row_covered, table, engine)?;
+            apply_column_fills(&mut full, &fills, &row_covered, engine)?;
             full
         };
         // A `timestamptz` written to a `timestamp` column (or the reverse) adopts the column's own
@@ -1994,6 +1962,8 @@ fn upsert_rows(
     // Keys already updated/inserted this statement — a second proposed row on the same key is an
     // error (a single upsert may not affect one row twice), matching the standard upsert semantics.
     let mut affected_keys: Vec<Vec<ast::Value>> = Vec::new();
+    // The table's CHECK constraints, compiled when the first proposed row conflicts.
+    let mut hit_checks = None;
 
     for prow in proposed {
         // ON CONFLICT arbiter matching treats a NULL key as distinct (standard `NULLS DISTINCT`); a
@@ -2024,6 +1994,15 @@ fn upsert_rows(
             }
         }
         if let Some((tid, erow)) = hit {
+            // The proposed row is checked against NOT NULL and CHECK even though it is not
+            // inserted, as it would be before an insert, whatever the WHERE decides.
+            enforce_not_null(table, std::iter::once(&prow))?;
+            if hit_checks.is_none() {
+                hit_checks = Some(compile_checks(table, engine, txn)?);
+            }
+            if let Some(checks) = &hit_checks {
+                enforce_compiled_checks(checks, table, std::slice::from_ref(&prow))?;
+            }
             // Evaluate SET / WHERE against `existing ++ EXCLUDED(proposed)`.
             let mut combined = erow.clone();
             combined.extend(prow.iter().cloned());
